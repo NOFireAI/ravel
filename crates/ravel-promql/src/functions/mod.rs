@@ -180,6 +180,24 @@ pub(crate) fn eval_call(
         FunctionKind::RangeVector(f) => {
             let arg = matrix_arg(&call.args.args[0])?;
             let window = range_window(arg, eval_ts_ns, ctx)?;
+            // The `*_over_time` family has no native-histogram reduction
+            // semantics: reject matched histogram data instead of silently
+            // reducing nothing (issue #525). A subquery argument is not
+            // checked here -- `eval_subquery_matrix` already guards it
+            // upstream.
+            if let MatrixArg::Selector(ms) = arg {
+                let matchers = crate::eval::build_matchers(&ms.vs)?;
+                if crate::eval::has_histogram_samples(
+                    source,
+                    &matchers,
+                    ravel_types::TimeRange {
+                        start_ns: window.start_ns,
+                        end_ns: window.end_ns,
+                    },
+                )? {
+                    return Err(crate::eval::range_vector_function_over_native_histograms_error());
+                }
+            }
             let keep_name = range_vector_keeps_metric_name(call.func.name);
             // Aggregation-pushdown fast path (ADR-0103 amendment): for a
             // `count_over_time` over a literal matrix selector, ask the source
@@ -227,6 +245,21 @@ pub(crate) fn eval_call(
             let arg = matrix_arg(&call.args.args[0])?;
             let t = scalar_arg(evaluator, source, &call.args.args[1], eval_ts_ns, ctx)?;
             let window = range_window(arg, eval_ts_ns, ctx)?;
+            // Same guard as `RangeVector` above: `quantile_over_time` has no
+            // native-histogram reduction semantics (issue #525).
+            if let MatrixArg::Selector(ms) = arg {
+                let matchers = crate::eval::build_matchers(&ms.vs)?;
+                if crate::eval::has_histogram_samples(
+                    source,
+                    &matchers,
+                    ravel_types::TimeRange {
+                        start_ns: window.start_ns,
+                        end_ns: window.end_ns,
+                    },
+                )? {
+                    return Err(crate::eval::range_vector_function_over_native_histograms_error());
+                }
+            }
             let matrix = eval_matrix_arg(evaluator, source, arg, eval_ts_ns, ctx)?;
             Ok(Value::Vector(apply_reduce(
                 matrix,
@@ -285,6 +318,21 @@ pub(crate) fn eval_call(
             let q = scalar_arg(evaluator, source, &call.args.args[0], eval_ts_ns, ctx)?;
             let arg = matrix_arg(&call.args.args[1])?;
             let window = range_window(arg, eval_ts_ns, ctx)?;
+            // `quantile_over_time` has no native-histogram reduction
+            // semantics (issue #525), same guard as `RangeVector` above.
+            if let MatrixArg::Selector(ms) = arg {
+                let matchers = crate::eval::build_matchers(&ms.vs)?;
+                if crate::eval::has_histogram_samples(
+                    source,
+                    &matchers,
+                    ravel_types::TimeRange {
+                        start_ns: window.start_ns,
+                        end_ns: window.end_ns,
+                    },
+                )? {
+                    return Err(crate::eval::range_vector_function_over_native_histograms_error());
+                }
+            }
             let matrix = eval_matrix_arg(evaluator, source, arg, eval_ts_ns, ctx)?;
             // `quantile_over_time` clamps a q outside [0, 1] to +-Inf and warns,
             // exactly like `quantile()`/`histogram_quantile` (Prometheus'
@@ -304,11 +352,26 @@ pub(crate) fn eval_call(
         }
         FunctionKind::AbsentOverTime => {
             let arg = matrix_arg(&call.args.args[0])?;
+            let window = range_window(arg, eval_ts_ns, ctx)?;
+            let histogram_present = if let MatrixArg::Selector(ms) = arg {
+                let matchers = crate::eval::build_matchers(&ms.vs)?;
+                crate::eval::has_histogram_samples(
+                    source,
+                    &matchers,
+                    ravel_types::TimeRange {
+                        start_ns: window.start_ns,
+                        end_ns: window.end_ns,
+                    },
+                )?
+            } else {
+                false
+            };
             let matrix = eval_matrix_arg(evaluator, source, arg, eval_ts_ns, ctx)?;
             Ok(Value::Vector(over_time::absent_over_time_instant(
                 over_time::matrix_arg_absent_labels(arg),
                 matrix,
                 eval_ts_ns,
+                histogram_present,
             )))
         }
         FunctionKind::VectorMap(f) => {

@@ -1016,15 +1016,15 @@ conformance_table`; regenerate that same command with
 `RAVEL_UPDATE_CONFORMANCE_TABLE=1`. Do not edit the block between
 the markers by hand.
 
-Surface: 132 constructs over 221 corpus entries in 10 corpus files.
+Surface: 134 constructs over 226 corpus entries in 10 corpus files.
 
 | State | Constructs |
 | --- | --- |
 | supported | 124 |
-| intentionally rejected | 6 |
+| intentionally rejected | 8 |
 | accepted divergence | 2 |
 | unclassified | 0 |
-| **score** (supported + intentionally rejected + accepted divergence / total) | **132/132 = 100%** |
+| **score** (supported + intentionally rejected + accepted divergence / total) | **134/134 = 100%** |
 
 | Construct | Category | State | Evidence |
 | --- | --- | --- | --- |
@@ -1055,6 +1055,8 @@ Surface: 132 constructs over 221 corpus entries in 10 corpus files.
 | negative offset | modifier | supported | `corpus/selectors.txt`, 1 entry |
 | `offset` | modifier | supported | `corpus/selectors.txt`, 4 entries |
 | `on` | modifier | supported | `corpus/binop.txt`, 7 entries |
+| range query over native histograms | modifier | intentionally rejected | `Unsupported: range query over native histograms (422 execution)`; rejection verified; a bare selector or a compound top-level expression (the `RangeCore::Generic` per-step closure in `eval.rs`) whose range result carries histogram-typed samples is refused before the grid reducer's float-only accumulator can silently drop them (issue #525); an instant query for the same selector still returns real histogram data, so this is specific to the range-query stepped grid, not a general histogram limitation |
+| range-vector function over native histograms | modifier | intentionally rejected | `Unsupported: range-vector function over native histograms (422 execution)`; rejection verified; `count_over_time`/`quantile_over_time`/`predict_linear`/`rate`/`increase`/`delta` and friends read a matrix argument through the same float-only reducer at both the instant and the range endpoint (issue #525); the guard fires wherever the underlying selector carries histogram samples, so the instant endpoint was equally silently wrong before this fix, not just range queries. `absent_over_time` is the one exception in this family: instead of refusing, it now correctly reports live histogram data as not absent, matching Prometheus, so it carries no rejected-construct row of its own |
 | subquery over native histograms | modifier | intentionally rejected | `Unsupported: subquery over native histograms (422 execution)`; rejection verified; the subquery grid reducer keeps only each step's float value, so a histogram element would be silently dropped; the trigger is matched histogram data, not the syntactic shape |
 | vector matching fill values | modifier | intentionally rejected | `Unsupported: vector matching fill-in values (422 execution)`; rejection verified; `fill`/`fill_left`/`fill_right` are a promql-parser dialect extension with no Prometheus counterpart; ravel-promql's `binop` refuses the modifier rather than evaluating it as plain matching |
 | `without` | modifier | supported | `corpus/aggregate.txt`, 1 entry |

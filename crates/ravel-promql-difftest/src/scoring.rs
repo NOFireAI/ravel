@@ -588,6 +588,32 @@ pub static REGISTRY: &[Construct] = &[
          itself succeeds here, so this is a real capability gap, not a \
          shared limitation",
     ),
+    rejected_modifier(
+        "range query over native histograms",
+        "Unsupported: range query over native histograms (422 execution)",
+        "a bare selector or a compound top-level expression (the \
+         `RangeCore::Generic` per-step closure in `eval.rs`) whose range \
+         result carries histogram-typed samples is refused before the \
+         grid reducer's float-only accumulator can silently drop them \
+         (issue #525); an instant query for the same selector still \
+         returns real histogram data, so this is specific to the \
+         range-query stepped grid, not a general histogram limitation",
+    ),
+    rejected_modifier(
+        "range-vector function over native histograms",
+        "Unsupported: range-vector function over native histograms (422 \
+         execution)",
+        "`count_over_time`/`quantile_over_time`/`predict_linear`/`rate`/\
+         `increase`/`delta` and friends read a matrix argument through the \
+         same float-only reducer at both the instant and the range \
+         endpoint (issue #525); the guard fires wherever the underlying \
+         selector carries histogram samples, so the instant endpoint was \
+         equally silently wrong before this fix, not just range queries. \
+         `absent_over_time` is the one exception in this family: instead \
+         of refusing, it now correctly reports live histogram data as not \
+         absent, matching Prometheus, so it carries no rejected-construct \
+         row of its own",
+    ),
     // ---- Binary operators ----
     binop("+", corpus("corpus/binop.txt")),
     binop("-", corpus("corpus/binop.txt")),
@@ -799,6 +825,20 @@ pub static REJECTION_CASES: &[RejectionCase] = &[
         eval: RejectionEval::Instant,
         time_offset_ms: 0,
         message_contains: "binary operator over native histograms",
+    },
+    RejectionCase {
+        construct: "range query over native histograms",
+        query: "diff_native_hist",
+        eval: RejectionEval::Range,
+        time_offset_ms: 300_000,
+        message_contains: "range query over native histograms",
+    },
+    RejectionCase {
+        construct: "range-vector function over native histograms",
+        query: "count_over_time(diff_native_hist[5m])",
+        eval: RejectionEval::Range,
+        time_offset_ms: 300_000,
+        message_contains: "range-vector function over native histograms",
     },
 ];
 

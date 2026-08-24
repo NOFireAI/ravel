@@ -155,3 +155,64 @@ start: +300s
 end: +600s
 step: 60s
 mode: unordered
+
+# Range evaluation over native histograms (#525): the range-query per-step
+# reducer (eval_range_selector's bare-selector path, eval_range_matrix_
+# reduction's shared range-vector-function path, and the RangeCore::Generic
+# per-step closure for a compound top-level expression) keeps only each
+# grid point's plain float value, so a histogram-typed result would be
+# silently dropped exactly like the subquery grid reducer's histogram gap
+# above. These entries pin the typed rejection instead: Ravel errors,
+# Prometheus succeeds and returns real histogram data, and
+# `mode: ravel_error_prom_success` (the same one-sided-divergence shape
+# binop.txt's #524 entries use) asserts exactly that.
+#
+# `absent_over_time` is different: it is a correctness FIX, not a guard.
+# Before #525 a live histogram matrix argument was indistinguishable from
+# an empty one to the absence check, so `absent_over_time` over data that
+# is actually present would have reported it absent -- a false liveness
+# alert, the opposite failure shape from the silent-drop the other guards
+# above prevent. Ravel now agrees with Prometheus that live histogram data
+# is not absent, so this entry is a normal bit-exact `mode: unordered`
+# comparison, not a rejection.
+
+name: error_bare_selector_range_over_native_histogram
+query: diff_native_hist
+kind: range
+start: +300s
+end: +600s
+step: 60s
+mode: ravel_error_prom_success
+
+name: error_rate_range_over_native_histogram
+query: rate(diff_native_hist[5m])
+kind: range
+start: +300s
+end: +600s
+step: 60s
+mode: ravel_error_prom_success
+
+name: error_sum_rate_range_over_native_histogram
+query: sum(rate(diff_native_hist[5m]))
+kind: range
+start: +300s
+end: +600s
+step: 60s
+mode: ravel_error_prom_success
+
+name: error_count_over_time_range_over_native_histogram
+query: count_over_time(diff_native_hist[5m])
+kind: range
+start: +300s
+end: +600s
+step: 60s
+mode: ravel_error_prom_success
+
+name: absent_over_time_range_with_native_histogram_data_present
+query: absent_over_time(diff_native_hist[15m])
+kind: range
+start: +300s
+end: +600s
+step: 60s
+mode: unordered
+expect: empty

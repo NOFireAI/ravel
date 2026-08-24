@@ -726,7 +726,20 @@ impl Evaluator {
                 let matrix =
                     crate::functions::eval_instant_over_grid(start_ns, end_ns, step_ns, |t| {
                         ctx.check_deadline()?;
-                        self.eval_expr(source, e, t, &ctx)
+                        let value = self.eval_expr(source, e, t, &ctx)?;
+                        // An aggregate or binary expression re-evaluated per
+                        // grid step (issue #525, mirroring the subquery
+                        // guard above): `eval_instant_over_grid` keeps only
+                        // each step's float `value`, so a histogram element
+                        // in the per-step result would be silently dropped
+                        // into a matrix of zeros. Detect actual matched
+                        // histogram data and reject instead.
+                        if let Value::Vector(ref v) = value
+                            && v.iter().any(|s| s.histogram.is_some())
+                        {
+                            return Err(range_over_native_histograms_error());
+                        }
+                        Ok(value)
                     })?;
                 Value::Matrix(matrix)
             }
@@ -1066,6 +1079,18 @@ impl Evaluator {
             end_ns: max_sel_ts,
         };
 
+        // A bare selector as a top-level range query (`h` with no wrapping
+        // function/aggregate) only ever fetches float series below: unlike
+        // the instant path (`eval_vector_selector`), which merges float and
+        // histogram results, there is no range-mode histogram matrix to
+        // merge in. Silently returning the float-only (possibly empty)
+        // result would answer wrong for a purely-histogram series, and
+        // silently drop a histogram series matched alongside a float one
+        // under the same matchers -- reject instead (issue #525).
+        if has_histogram_samples(source, &selector_matchers, window)? {
+            return Err(range_over_native_histograms_error());
+        }
+
         let series = source.query(&selector_matchers, window)?;
         let mut out = Vec::with_capacity(series.len());
         for s in series {
@@ -1149,6 +1174,18 @@ impl Evaluator {
             start_ns: min_window_start,
             end_ns: max_sel_ts,
         };
+
+        // Shared range-mode reduction for every range-vector function
+        // (`*_over_time`, and `rate`/`increase`/`delta`'s float-only range
+        // path): only the plain float series below is fetched. Matched
+        // histogram data has no range-mode reduction here yet, so reject
+        // instead of silently reducing nothing (issue #525) -- this also
+        // closes the documented instant/range asymmetry for
+        // `rate`/`increase`/`delta` (the instant path already merges
+        // histogram data via `eval_histogram_matrix_selector`).
+        if has_histogram_samples(source, &selector_matchers, window)? {
+            return Err(range_vector_function_over_native_histograms_error());
+        }
 
         let series = source.query(&selector_matchers, window)?;
         let mut out = Vec::with_capacity(series.len());
@@ -1553,6 +1590,47 @@ pub(crate) fn build_matchers(
         });
     }
     Ok(out)
+}
+
+/// Whether any native-histogram sample matches `matchers` strictly after
+/// `window.start_ns` and no later than `window.end_ns` -- the same
+/// left-open window rule every float matrix/lookback read path in this
+/// file applies (see e.g. [`Evaluator::eval_matrix_selector`]'s comment on
+/// why the exclusive lower bound is enforced after fetch, not in the
+/// `TimeRange` passed to storage). Callers must pass the identical
+/// `window` they already computed for their own `source.query` call, so
+/// this can never disagree with the real read path at a boundary sample
+/// (issue #525).
+pub(crate) fn has_histogram_samples(
+    source: &dyn SeriesSource,
+    matchers: &[LabelMatcher],
+    window: TimeRange,
+) -> Result<bool, Error> {
+    Ok(source.query_histograms(matchers, window)?.iter().any(|s| {
+        s.samples
+            .iter()
+            .any(|sample| sample.ts_ns > window.start_ns)
+    }))
+}
+
+/// A whole top-level range query (a bare selector, or an aggregate/binary
+/// expression re-evaluated per grid step) matched native-histogram data
+/// with no range-mode histogram matrix to merge it into (issue #525).
+fn range_over_native_histograms_error() -> Error {
+    Error::Unsupported {
+        construct: "range query over native histograms".to_string(),
+    }
+}
+
+/// A range-vector function (`avg_over_time`, `count_over_time`, ... or
+/// `rate`/`increase`/`delta`'s float-only range reduction) matched
+/// native-histogram data it has no reduction semantics for (issue #525).
+/// Distinct from [`range_over_native_histograms_error`]: this names a
+/// specific function's argument, not the whole query.
+pub(crate) fn range_vector_function_over_native_histograms_error() -> Error {
+    Error::Unsupported {
+        construct: "range-vector function over native histograms".to_string(),
+    }
 }
 
 /// Signed nanosecond shift for a selector's `offset`: positive for `offset
@@ -2524,6 +2602,224 @@ mod tests {
             .instant(&source, r#"rate({job="a"}[10m:1m])"#, 0)
             .expect_err("a mixed subquery must be rejected");
         expect_unsupported(err, r#"rate({job="a"}[10m:1m])"#);
+    }
+
+    fn expect_unsupported_containing(err: Error, expected: &str, query: &str) {
+        let Error::Unsupported { construct } = err else {
+            panic!("expected Unsupported for {query:?}, got {err:?}");
+        };
+        assert!(
+            construct.contains(expected),
+            "construct {construct:?} should contain {expected:?} for {query:?}"
+        );
+    }
+
+    // ---- Issue #525: range evaluation over native histograms ----
+
+    #[test]
+    fn bare_selector_range_query_over_native_histogram_is_rejected() {
+        // Unlike the instant path (`eval_vector_selector`, which merges
+        // float and histogram results), a bare selector as a top-level
+        // range query only ever fetches the float series. Must reject, not
+        // silently return empty.
+        let source = TestSource::new()
+            .with_histogram_series(&[("__name__", "h"), ("job", "a")], &[(0, nh(6.0, 42.0))])
+            .expect("valid histogram series");
+        let err = Evaluator::new()
+            .range(&source, "h", 0, minutes(1), minutes(1))
+            .expect_err("a bare histogram selector as a range query must be rejected");
+        expect_unsupported_containing(err, "range query over native histograms", "h (range)");
+    }
+
+    #[test]
+    fn mixed_float_and_histogram_bare_selector_range_query_is_rejected() {
+        // The mixed-selector case for the bare-selector guard: a float
+        // series alone would produce a non-empty result, so the guard must
+        // fire on histogram presence regardless of the float match, not on
+        // the float result being empty.
+        let source = TestSource::new()
+            .with_series(&[("__name__", "f"), ("job", "a")], &[(0, 2.0)])
+            .expect("valid float series")
+            .with_histogram_series(&[("__name__", "h"), ("job", "a")], &[(0, nh(6.0, 42.0))])
+            .expect("valid histogram series");
+        let err = Evaluator::new()
+            .range(&source, r#"{job="a"}"#, 0, minutes(1), minutes(1))
+            .expect_err("a selector matching both float and histogram series must be rejected");
+        expect_unsupported_containing(
+            err,
+            "range query over native histograms",
+            r#"{job="a"} (range, mixed)"#,
+        );
+    }
+
+    #[test]
+    fn top_level_aggregate_range_query_over_native_histogram_is_rejected() {
+        // `sum(h)` re-evaluates per grid step (RangeCore::Generic); the
+        // instant result carries a histogram element (aggregate.rs handles
+        // histogram aggregation), which `eval_instant_over_grid` would
+        // otherwise silently reduce to a matrix of zeros.
+        let source = TestSource::new()
+            .with_histogram_series(&[("__name__", "h"), ("job", "a")], &[(0, nh(6.0, 42.0))])
+            .expect("valid histogram series");
+        let err = Evaluator::new()
+            .range(&source, "sum(h)", 0, minutes(1), minutes(1))
+            .expect_err("a top-level aggregate over a histogram must be rejected as a range query");
+        expect_unsupported_containing(err, "range query over native histograms", "sum(h) (range)");
+    }
+
+    #[test]
+    fn instant_histogram_quantile_of_sum_survives_the_range_generic_guard() {
+        // The one shape the issue names as already working: by the time
+        // `histogram_quantile` runs, the per-step result is a plain float
+        // (a quantile value), so the new RangeCore::Generic guard above
+        // must not fire for it.
+        let source = TestSource::new()
+            .with_histogram_series(&[("__name__", "h"), ("job", "a")], &[(0, nh(6.0, 42.0))])
+            .expect("valid histogram series");
+        let result = Evaluator::new()
+            .range(
+                &source,
+                "histogram_quantile(0.5, sum(h))",
+                0,
+                minutes(1),
+                minutes(1),
+            )
+            .expect("the already-working shape must keep working");
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn count_over_time_over_histogram_is_rejected_instant_and_range() {
+        // Item 3: the whole `*_over_time` family has no native-histogram
+        // reduction. Both endpoints must reject, not silently return
+        // empty (this was also broken on the instant endpoint, not just
+        // range, despite the issue's title -- same root cause, same fix).
+        let source = TestSource::new()
+            .with_histogram_series(&[("__name__", "h"), ("job", "a")], &[(0, nh(6.0, 42.0))])
+            .expect("valid histogram series");
+        let instant_err = Evaluator::new()
+            .instant(&source, "count_over_time(h[5m])", minutes(1))
+            .expect_err("count_over_time over a histogram must be rejected (instant)");
+        expect_unsupported_containing(
+            instant_err,
+            "range-vector function over native histograms",
+            "count_over_time(h[5m])",
+        );
+        let range_err = Evaluator::new()
+            .range(&source, "count_over_time(h[5m])", 0, minutes(1), minutes(1))
+            .expect_err("count_over_time over a histogram must be rejected (range)");
+        expect_unsupported_containing(
+            range_err,
+            "range-vector function over native histograms",
+            "count_over_time(h[5m]) (range)",
+        );
+    }
+
+    #[test]
+    fn quantile_over_time_and_predict_linear_over_histogram_are_rejected() {
+        // `ScalarRangeVector` (`quantile_over_time`) and `RangeVectorScalar`
+        // (`predict_linear`) share the same guard as `RangeVector`
+        // (issue #525); this pins that the guard was actually wired into
+        // both arms, not just `count_over_time`'s.
+        let source = TestSource::new()
+            .with_histogram_series(&[("__name__", "h"), ("job", "a")], &[(0, nh(6.0, 42.0))])
+            .expect("valid histogram series");
+        let quantile_err = Evaluator::new()
+            .instant(&source, "quantile_over_time(0.5, h[5m])", minutes(1))
+            .expect_err("quantile_over_time over a histogram must be rejected");
+        expect_unsupported_containing(
+            quantile_err,
+            "range-vector function over native histograms",
+            "quantile_over_time(0.5, h[5m])",
+        );
+        let predict_err = Evaluator::new()
+            .instant(&source, "predict_linear(h[5m], 10)", minutes(1))
+            .expect_err("predict_linear over a histogram must be rejected");
+        expect_unsupported_containing(
+            predict_err,
+            "range-vector function over native histograms",
+            "predict_linear(h[5m], 10)",
+        );
+    }
+
+    #[test]
+    fn rate_over_histogram_range_query_no_longer_diverges_from_instant() {
+        // The issue's named asymmetry: `rate(h[5m])` already returns data
+        // on the instant endpoint (merges float+histogram matrix
+        // selectors) but silently returned empty on the range endpoint.
+        // Both must now be the same class of answer: the instant endpoint
+        // keeps returning data, and the range endpoint returns a typed
+        // error instead of a silent empty.
+        let source = TestSource::new()
+            .with_histogram_series(
+                &[("__name__", "h"), ("job", "a")],
+                &[(0, nh(6.0, 42.0)), (minutes(1), nh(7.0, 50.0))],
+            )
+            .expect("valid histogram series");
+        let instant = Evaluator::new()
+            .instant(&source, "rate(h[5m])", minutes(2))
+            .expect("rate over a histogram must still evaluate on the instant endpoint");
+        assert!(
+            !instant.is_empty(),
+            "instant endpoint must not have regressed to empty"
+        );
+
+        let range_err = Evaluator::new()
+            .range(&source, "rate(h[5m])", 0, minutes(1), minutes(1))
+            .expect_err(
+                "rate over a histogram as a range query must be rejected, not silently empty",
+            );
+        expect_unsupported_containing(
+            range_err,
+            "range-vector function over native histograms",
+            "rate(h[5m]) (range)",
+        );
+    }
+
+    #[test]
+    fn absent_over_time_with_histogram_data_flowing_is_never_absent() {
+        // The issue's worst-case: a liveness alert on a purely-histogram
+        // series must not report absent (1) while data is flowing. This is
+        // a presence fix, not a rejection: the correct answer is empty
+        // (the series is not absent), never 1, and never a typed error.
+        let source = TestSource::new()
+            .with_histogram_series(&[("__name__", "h"), ("job", "a")], &[(0, nh(6.0, 42.0))])
+            .expect("valid histogram series");
+
+        let instant = Evaluator::new()
+            .instant(&source, "absent_over_time(h[15m])", 0)
+            .expect("must evaluate, not error");
+        assert!(
+            instant.is_empty(),
+            "must not report absent while histogram data is flowing: {instant:?}"
+        );
+
+        let range = Evaluator::new()
+            .range(
+                &source,
+                "absent_over_time(h[15m])",
+                0,
+                minutes(1),
+                minutes(1),
+            )
+            .expect("must evaluate, not error");
+        assert!(
+            range.is_empty(),
+            "must not report absent while histogram data is flowing (range): {range:?}"
+        );
+    }
+
+    #[test]
+    fn absent_over_time_still_reports_absent_when_truly_absent() {
+        // Regression guard for the presence fix above: a query matching no
+        // data at all (float or histogram) must still report absent (1),
+        // exactly like before this change.
+        let source = TestSource::new();
+        let instant = Evaluator::new()
+            .instant(&source, "absent_over_time(nosuch[15m])", 0)
+            .expect("must evaluate");
+        assert_eq!(instant.len(), 1);
+        assert_eq!(instant[0].value.to_bits(), 1.0_f64.to_bits());
     }
 
     #[test]

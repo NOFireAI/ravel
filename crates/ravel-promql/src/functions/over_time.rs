@@ -238,12 +238,22 @@ pub(crate) fn kahan_sum_inc(inc: f64, sum: f64, c: f64) -> (f64, f64) {
 /// whether the whole range vector argument matched nothing at all, and if
 /// so synthesizes exactly one output series from `labels`
 /// ([`matrix_arg_absent_labels`]).
+/// `histogram_present`: whether native-histogram data also matched the
+/// same window (issue #525). `matrix` only ever carries float samples
+/// (`eval_matrix_arg`'s `Selector` case is float-only), so without this a
+/// series reporting purely through native histograms would look absent and
+/// fire a false liveness alert while its data keeps flowing -- wrong under
+/// either of #524's two policies (typed rejection would ALSO be wrong
+/// here: a liveness check that errors on live histogram data is just as
+/// broken as one that misreports it absent), so this is a presence fix,
+/// not a guard.
 pub(crate) fn absent_over_time_instant(
     labels: LabelSet,
     matrix: RangeMatrix,
     eval_ts_ns: i64,
+    histogram_present: bool,
 ) -> InstantVector {
-    if !matrix.is_empty() {
+    if !matrix.is_empty() || histogram_present {
         return Vec::new();
     }
     vec![InstantSample {
@@ -278,11 +288,30 @@ pub(crate) fn absent_over_time_range(
     let mut out_samples = Vec::new();
     let mut t = start_ns;
     while t <= end_ns {
-        let matrix = match arg {
-            MatrixArg::Selector(ms) => evaluator.eval_matrix_selector(source, ms, t, ctx)?,
-            MatrixArg::Subquery(sq) => evaluator.eval_subquery_matrix(source, sq, t, ctx)?,
+        // `histogram_present`: see `absent_over_time_instant`'s doc comment
+        // (issue #525) -- native-histogram data at this step's window
+        // counts as present, never as absent, regardless of whether the
+        // (float-only) `matrix` below matched anything.
+        let (matrix, histogram_present) = match arg {
+            MatrixArg::Selector(ms) => {
+                let matrix = evaluator.eval_matrix_selector(source, ms, t, ctx)?;
+                let matchers = crate::eval::build_matchers(&ms.vs)?;
+                let sel_ts_ns = crate::eval::selector_eval_ts(&ms.vs, t, ctx)?;
+                let range_ns = crate::eval::duration_to_ns(ms.range)?;
+                let window_start = sel_ts_ns.checked_sub(range_ns).ok_or(Error::TimeOverflow)?;
+                let histogram_present = crate::eval::has_histogram_samples(
+                    source,
+                    &matchers,
+                    ravel_types::TimeRange {
+                        start_ns: window_start,
+                        end_ns: sel_ts_ns,
+                    },
+                )?;
+                (matrix, histogram_present)
+            }
+            MatrixArg::Subquery(sq) => (evaluator.eval_subquery_matrix(source, sq, t, ctx)?, false),
         };
-        if matrix.is_empty() {
+        if matrix.is_empty() && !histogram_present {
             out_samples.push(Sample {
                 ts_ns: t,
                 value: 1.0,
