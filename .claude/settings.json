@@ -6,5 +6,20 @@
   "skillOverrides": {
     "claude-in-chrome": "off",
     "dataviz": "off"
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Edit|Write|MultiEdit|ScheduleWakeup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PROJECT_DIR:-.}/.claude/guards/pretooluse.mjs\"",
+            "timeout": 10,
+            "statusMessage": "Checking guards"
+          }
+        ]
+      }
+    ]
   }
 }
