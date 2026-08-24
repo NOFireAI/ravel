@@ -318,7 +318,7 @@ async fn handle_query_range(
     // request's resolved `[start, end]` range.
     let exec = state
         .engine
-        .range_with_stats_annotated(
+        .range_hist_with_stats_annotated(
             tenant_hash,
             query,
             start_ms,

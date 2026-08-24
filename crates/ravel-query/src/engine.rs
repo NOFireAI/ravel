@@ -14,8 +14,8 @@ use ravel_catalog::{Catalog, SegmentRef, ShardGeneration, Snapshot};
 use ravel_object_store::{ObjectStoreBackend, StoreError};
 use ravel_promql::{
     Annotations, Evaluator, FloatHistogram, HistogramSeriesData, LabelMatcher, MatchOp, PlanAnchor,
-    SelectorPlan, SeriesData, SeriesSource, SourceError, Span, Value, from_ast_matchers,
-    has_or_group, matches_series, ms_to_ns, plan_selectors,
+    RangeValue, SelectorPlan, SeriesData, SeriesSource, SourceError, Span, Value,
+    from_ast_matchers, has_or_group, matches_series, ms_to_ns, plan_selectors,
 };
 use ravel_proto::queryfrag::v1 as pb;
 use ravel_segment::ReaderLimits;
@@ -537,6 +537,39 @@ impl QueryEngine {
         now_ns: i64,
         deadline: Duration,
     ) -> Result<(Value, Annotations, QueryStats), QueryError> {
+        let (value, annotations, stats) = self
+            .range_hist_with_stats_annotated(
+                tenant_hash,
+                query,
+                start_ms,
+                end_ms,
+                step_ms,
+                min_tokens,
+                now_ns,
+                deadline,
+            )
+            .await?;
+        Ok((range_value_into_value(value), annotations, stats))
+    }
+
+    /// Same as [`Self::range_with_stats_annotated`], but the matrix result is a
+    /// histogram-aware [`RangeValue`] carrying per-step native-histogram
+    /// elements alongside floats (ADR-0108 decision 9), the form the HTTP
+    /// range renderer needs to emit Prometheus' `histograms` field. The
+    /// float-only [`Self::range_with_stats_annotated`] is the thin wrapper that
+    /// projects histogram elements away for callers that only render floats.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn range_hist_with_stats_annotated(
+        &self,
+        tenant_hash: TenantHash,
+        query: &str,
+        start_ms: i64,
+        end_ms: i64,
+        step_ms: i64,
+        min_tokens: &[CommitToken],
+        now_ns: i64,
+        deadline: Duration,
+    ) -> Result<(RangeValue, Annotations, QueryStats), QueryError> {
         let eval_deadline = Instant::now() + deadline;
         let outcome = tokio::time::timeout(
             deadline,
@@ -566,7 +599,7 @@ impl QueryEngine {
         min_tokens: &[CommitToken],
         now_ns: i64,
         eval_deadline: Instant,
-    ) -> Result<(Value, Annotations, QueryStats), QueryError> {
+    ) -> Result<(RangeValue, Annotations, QueryStats), QueryError> {
         if step_ms <= 0 {
             return Err(QueryError::NonPositiveStep { step_ms });
         }
@@ -590,7 +623,7 @@ impl QueryEngine {
             .with_deadline(eval_deadline);
         let (value, annotations) =
             tracing::debug_span!("evaluate", eval_kind = "range").in_scope(|| {
-                evaluator.eval_range_annotated(&source, query, start_ms, end_ms, step_ms)
+                evaluator.eval_range_hist_annotated(&source, query, start_ms, end_ms, step_ms)
             })?;
         Ok((value, annotations, stats))
     }
@@ -1786,6 +1819,39 @@ pub(crate) fn bytes_scanned_exceeded(
 /// the case that actually demonstrates early interruption. Both are the
 /// same condition from a caller's perspective, so both collapse to the one
 /// variant already documented and tested against.
+/// Project a histogram-aware [`RangeValue`] down to the float-only [`Value`]
+/// the non-histogram range callers (`range`, `range_with_stats`) consume:
+/// histogram elements are dropped rather than rendered as a `0.0` float
+/// (ADR-0108's forbidden silent zeros), and a series left with no float
+/// element is omitted entirely. Mirrors `RangeValue::into_value` in
+/// `ravel-promql`, replicated here because that projection is crate-private.
+fn range_value_into_value(value: RangeValue) -> Value {
+    match value {
+        RangeValue::Scalar(v) => Value::Scalar(v),
+        RangeValue::String(s) => Value::String(s),
+        RangeValue::Matrix(matrix) => Value::Matrix(
+            matrix
+                .into_iter()
+                .filter_map(|(labels, samples)| {
+                    let floats: Vec<Sample> = samples
+                        .into_iter()
+                        .filter(|s| s.histogram.is_none())
+                        .map(|s| Sample {
+                            ts_ns: s.ts_ns,
+                            value: s.value,
+                        })
+                        .collect();
+                    if floats.is_empty() {
+                        None
+                    } else {
+                        Some((labels, floats))
+                    }
+                })
+                .collect(),
+        ),
+    }
+}
+
 fn unify_deadline<T>(
     outcome: Result<Result<T, QueryError>, tokio::time::error::Elapsed>,
     deadline: Duration,

@@ -161,3 +161,232 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
         .merge(compat)
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::too_many_arguments)]
+mod tests {
+    //! Endpoint-level reachability proof for native-histogram range results:
+    //! a real RSEG v5 segment carrying histogram samples is published to a
+    //! `MemoryStore`, queried through the production axum router via
+    //! `tower::ServiceExt::oneshot`, and the rendered `histograms` field is
+    //! asserted in full. A unit test on the encoder alone cannot show that a
+    //! range request actually reaches it; this does.
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use ravel_catalog::{Catalog, CatalogConfig};
+    use ravel_commit::publish::RetryPolicy;
+    use ravel_commit::record::NewCommitRecord;
+    use ravel_commit::{keys, publish, record};
+    use ravel_object_store::ObjectStoreBackend;
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_segment::{
+        HistogramCounts, HistogramSample, HistogramSpan, HistogramValue, IngestBounds, ResetHint,
+        SegmentIdentity, SegmentWriter, SeriesInputV3, SeriesValues, WrittenSegment,
+    };
+    use ravel_types::{Label, LabelSet, SeriesId, Signal, TenantId};
+    use serde_json::Value as JsonValue;
+    use tower::ServiceExt;
+    use uuid::Uuid;
+
+    use super::{AppState, StaticBearerTokenResolver, router};
+    use crate::{EngineConfig, QueryEngine};
+
+    const NS_PER_SEC: i64 = 1_000_000_000;
+    const NS_PER_MIN: i64 = 60 * NS_PER_SEC;
+    const NS_PER_HOUR: i64 = 60 * NS_PER_MIN;
+
+    fn now_ns() -> i64 {
+        let dur = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch");
+        let secs = i64::try_from(dur.as_secs()).expect("seconds fit i64");
+        secs * NS_PER_SEC
+    }
+
+    /// The native histogram both samples carry: total count 9 (zero_count 4,
+    /// one positive bucket count 2, one negative bucket count 3), sum 4.5. With
+    /// `scale = 0` the positive span at offset 1 is the bucket `(1, 2]`, the
+    /// negative span at offset 1 is `(-2, -1]`, and `zero_threshold = 0.5`
+    /// makes the zero bucket `(-0.5, 0.5]`. Matches the instant-path element in
+    /// `json::tests::instant_vector_renders_native_histogram_element`, so both
+    /// endpoints are proven to render the same shape.
+    fn histogram_value() -> HistogramValue {
+        HistogramValue {
+            scale: 0,
+            zero_threshold: 0.5,
+            sum: Some(4.5),
+            custom_values: None,
+            positive_spans: vec![HistogramSpan {
+                offset: 1,
+                length: 1,
+            }],
+            negative_spans: vec![HistogramSpan {
+                offset: 1,
+                length: 1,
+            }],
+            counts: HistogramCounts::Int {
+                zero_count: 4,
+                count: 9,
+                positive: vec![2],
+                negative: vec![3],
+            },
+            reset_hint: ResetHint::Unknown,
+        }
+    }
+
+    #[tokio::test]
+    async fn range_query_endpoint_serves_native_histogram_matrices() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant_id = TenantId::new("tenant-hist".to_string());
+        let tenant_hash = tenant_id.hash();
+        // Floor to a whole minute so every grid instant is a whole-second
+        // (and whole-minute) value the step assertions can name exactly.
+        let now = (now_ns() / NS_PER_MIN) * NS_PER_MIN;
+        let hour_bucket = u32::try_from(now / NS_PER_HOUR).expect("hour bucket");
+
+        let metric = "req_latency";
+        let labels = LabelSet::new(vec![Label {
+            name: "__name__".to_string(),
+            value: metric.to_string(),
+        }])
+        .expect("valid labels");
+        let series_id = SeriesId::compute(&tenant_id, metric, &labels).expect("series id");
+        let series = vec![SeriesInputV3 {
+            series_id,
+            labels,
+            values: SeriesValues::Histogram(vec![
+                HistogramSample {
+                    ts_ns: now - 4 * NS_PER_MIN,
+                    value: histogram_value(),
+                },
+                HistogramSample {
+                    ts_ns: now - 2 * NS_PER_MIN,
+                    value: histogram_value(),
+                },
+            ]),
+        }];
+
+        let writer_id = Uuid::new_v4();
+        let identity = SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard: 0,
+            writer_id: writer_id.to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 0,
+        };
+        let written: WrittenSegment =
+            SegmentWriter::write_histograms(series, identity, bounds).expect("write segment");
+
+        let new_record = NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            object_size: written.bytes.len() as u64,
+            content_hash: written.summary.blake3,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns: written.summary.min_event_ts_ns,
+            max_ingest_ts_ns: written.summary.max_event_ts_ns,
+            segment_format_version: 1,
+            created_unix_ns: now,
+            ingest_hour_bucket: hour_bucket,
+        };
+        let rec = record::build(new_record).expect("valid commit record");
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+        publish::put_data_object(backend.as_ref(), &data_key, written.bytes)
+            .await
+            .expect("put data object");
+        publish::publish(backend.as_ref(), &rec, &RetryPolicy::default())
+            .await
+            .expect("publish");
+
+        let mut tokens = HashMap::new();
+        tokens.insert("secret-hist".to_string(), tenant_id.clone());
+        let catalog =
+            Arc::new(Catalog::new(backend.clone(), CatalogConfig::default()).expect("catalog"));
+        let engine = Arc::new(QueryEngine::new(catalog, backend, EngineConfig::default()));
+        let state = AppState::new(engine, Arc::new(StaticBearerTokenResolver::new(tokens)));
+        let app: Router = router(state);
+
+        let start = (now - 4 * NS_PER_MIN) / NS_PER_SEC;
+        let end = (now - NS_PER_MIN) / NS_PER_SEC;
+        let uri = format!("/api/v1/query_range?query={metric}&start={start}&end={end}&step=60s");
+        let request = Request::builder()
+            .method("GET")
+            .uri(&uri)
+            .header("authorization", "Bearer secret-hist")
+            .body(Body::empty())
+            .expect("build request");
+        let response = match app.oneshot(request).await {
+            Ok(response) => response,
+            Err(never) => match never {},
+        };
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json: JsonValue = serde_json::from_slice(&body).expect("parse json");
+
+        assert_eq!(status, StatusCode::OK, "body: {json}");
+        assert_eq!(json["status"], "success", "body: {json}");
+        assert_eq!(json["data"]["resultType"], "matrix");
+        let results = json["data"]["result"]
+            .as_array()
+            .expect("matrix result array");
+        assert_eq!(results.len(), 1, "one series, body: {json}");
+        let elem = &results[0];
+        assert_eq!(elem["metric"]["__name__"], "req_latency");
+        // The float `values` array is absent on a histogram-only series.
+        assert!(
+            elem.get("values").is_none(),
+            "no values field on a histogram-only series, body: {json}"
+        );
+        let hists = elem["histograms"]
+            .as_array()
+            .expect("histograms array present");
+        // The two source samples (at -4min and -2min) carry across the whole
+        // [-4min, -1min] grid by lookback, so every one of the four 60s steps
+        // renders a histogram element.
+        let expected_ts: Vec<i64> = (1..=4)
+            .rev()
+            .map(|k| (now - k * NS_PER_MIN) / NS_PER_SEC)
+            .collect();
+        assert_eq!(hists.len(), 4, "one histogram per grid step, body: {json}");
+        // Every rendered step carries the exact shape the source samples encode:
+        // its own grid timestamp, count/sum as strings, and the three buckets
+        // in cumulative order.
+        for (step, want_ts) in hists.iter().zip(expected_ts) {
+            assert_eq!(
+                step[0].as_i64().expect("integer step timestamp"),
+                want_ts,
+                "step timestamp, body: {json}"
+            );
+            assert_eq!(step[1]["count"], "9");
+            assert_eq!(step[1]["sum"], "4.5");
+            assert_eq!(
+                step[1]["buckets"],
+                serde_json::json!([
+                    [1, "-2", "-1", "3"],
+                    [3, "-0.5", "0.5", "4"],
+                    [0, "1", "2", "2"],
+                ]),
+                "bucket contents, body: {json}"
+            );
+        }
+    }
+}
