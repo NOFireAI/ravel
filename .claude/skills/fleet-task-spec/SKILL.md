@@ -30,6 +30,8 @@ just the unattended one.
 ## Template
 
 ```
+EXPECTS_REF: yes
+
 HARNESS REQUIREMENT (overrides CLAUDE.md's workspace-isolation section for
 you specifically -- you are a fleet executor, not a local subagent sharing
 someone else's session tree): commit directly on this dispatched checkout's
@@ -106,6 +108,26 @@ commit:
   flipped line in your report. A test that cannot fail proves nothing.
 - **Stray files**: nothing staged that the deliverables do not name
   (scratch scripts, logs, `__pycache__/`, editor droppings).
+
+## Commit before the slow gates, not after
+
+A task is killed mid-run more often than it fails: over one four-day
+window, 27 of 165 dispatched tasks died, and 13 of those were account
+rate limits that kill the agent at provisioning or mid-stream with no
+warning and no result ref. Only committed work survives. So the spec
+orders the work commit-first:
+
+1. Format in place, then make the change compile and pass the scoped
+   tests.
+2. `git commit -s` the working state.
+3. Run the full gate list. Amend or add a fixup commit if a gate fails.
+
+A kill during step 3 then costs a re-run of the gates, not a re-run of
+the whole task. Two tasks in that window were lost the other way round.
+
+Never tell an executor to start a long gate in the background and wait
+for a notification: the task ends when the agent's turn ends, and a task
+that ended waiting for a background test run pushed nothing.
 
 ## Executor test scope
 
@@ -245,9 +267,20 @@ Record the returned task_id, arm the watch command from the dispatch
 response as a persistent Monitor, and merge with the merge-fleet-result
 skill when it lands. `fleet_status` needs the full task UUID; an 8-char
 short form returns "not found". Result branches appear at
-refs/heads/task/<task-id>/result; a done status with no result ref means
-the agent never committed, and the workdir is already gone. Re-dispatch;
-do not try to recover.
+refs/heads/task/<task-id>/result.
+
+**Every spec declares, in its first line, whether it produces a branch:**
+`EXPECTS_REF: yes` for an implementation task, `EXPECTS_REF: no` for a
+read-only review, audit, or research task. Without that declaration a
+missing result ref is ambiguous, and the ambiguity is not rare: over one
+four-day window, 30 of the 33 no-ref tasks were reviews that produce no
+branch by design, so a blanket "no ref means lost" rule generates 30
+false alarms and trains the orchestrator to ignore the real ones. With
+the declaration:
+
+- `EXPECTS_REF: yes` and no ref = the agent never committed and the
+  workdir is gone. Re-dispatch; do not try to recover.
+- `EXPECTS_REF: no` and no ref = expected. The deliverable is the report.
 
 Do not trust `fleet_status`'s text at face value: it has printed a
 `result at refs/heads/task/<id>/result` line even when that ref was never
