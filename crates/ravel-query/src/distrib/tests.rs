@@ -1210,6 +1210,235 @@ fn coordinator_reenforces_bytes_budget_over_lying_worker() {
     });
 }
 
+// --- byte budget scoped by actual slice count (issue #588) -----------------
+
+/// A [`SliceFetcher`] double that records every `request.budgets` it receives
+/// (so a test can assert what each dispatched slice was actually authorized
+/// for) and answers with an empty, successful response.
+struct RecordingBudgetWorker {
+    seen: Arc<std::sync::Mutex<Vec<pb::Budgets>>>,
+}
+
+#[async_trait::async_trait]
+impl SliceFetcher for RecordingBudgetWorker {
+    async fn fetch(&self, request: pb::FetchRequest) -> Result<SliceResponse, DistribError> {
+        if let Some(budgets) = request.budgets {
+            self.seen.lock().expect("lock").push(budgets);
+        }
+        Ok(SliceResponse {
+            scalar: Vec::new(),
+            histogram: Vec::new(),
+            partials: Vec::new(),
+            accounting: QueryAccounting::new().snapshot(),
+            stats: crate::fetcher::FetchStats::default(),
+            series_returned: 0,
+            samples_returned: 0,
+            status: pb::status::Code::Ok,
+            status_message: String::new(),
+        })
+    }
+}
+
+async fn sharded_snapshot(store: &MemoryStore, shard_count: u32) -> Snapshot {
+    let mut segments = Vec::new();
+    for shard in 0..shard_count {
+        segments.push(
+            write_segment(
+                store,
+                u64::from(shard),
+                shard,
+                100,
+                &[SeriesDesc {
+                    metric: format!("m{shard}"),
+                    samples: vec![(NS, 1.0f64.to_bits())],
+                }],
+            )
+            .await,
+        );
+    }
+    Snapshot {
+        segments,
+        segments_pruned: 0,
+        pending_erasure: Vec::new(),
+    }
+}
+
+/// ADR-0071 (issue #588): every slice used to carry the tenant's FULL byte
+/// budget verbatim, so a `max_parallel_slices`-wide fan-out could authorize
+/// up to Nx the configured budget before the coordinator's post-merge
+/// re-check observed anything. Three shards at cap 3 dispatch three slices;
+/// each must be authorized for exactly a third of the query's byte budget,
+/// summing to no more than the configured total. `max_series`/
+/// `max_samples`/`max_segments` stay unscoped (deliberately, per the fix's
+/// doc comment): each slice still carries the full count-based caps.
+///
+/// Mutation proof: reverting `encode_budgets` in `mod.rs` to the pre-fix
+/// `max_bytes_scanned: n` (no division) makes the per-slice assertion below
+/// fail with `900`, not `300`.
+#[test]
+fn distrib_fetch_scopes_byte_budget_by_actual_slice_count() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let store = MemoryStore::new();
+        let snapshot = sharded_snapshot(&store, 3).await;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let distributed = Distributed::new(
+            Arc::new(RecordingBudgetWorker {
+                seen: Arc::clone(&seen),
+            }),
+            DistribThresholds {
+                min_store_bytes: 0,
+                min_segments: 0,
+                max_parallel_slices: 3,
+            },
+        );
+        let config = EngineConfig {
+            max_bytes_scanned: crate::config::ByteLimit::Bounded(900),
+            max_series: 42,
+            max_samples: 43,
+            max_segments: 44,
+            ..EngineConfig::default()
+        };
+        let accounting = QueryAccounting::new();
+        distributed
+            .fetch(
+                TENANT,
+                Signal::Metrics,
+                &snapshot,
+                &[],
+                &[],
+                &accounting,
+                &config,
+                i64::MAX,
+                None,
+            )
+            .await
+            .expect("fetch succeeds");
+
+        let recorded = seen.lock().expect("lock");
+        assert_eq!(recorded.len(), 3, "all three slices dispatched once");
+        for budgets in recorded.iter() {
+            assert_eq!(
+                budgets.max_bytes_scanned, 300,
+                "each of 3 slices gets a third of the 900-byte budget, not the whole thing"
+            );
+            assert_eq!(budgets.max_series, 42, "count-based caps stay unscoped");
+            assert_eq!(budgets.max_samples, 43, "count-based caps stay unscoped");
+            assert_eq!(budgets.max_segments, 44, "count-based caps stay unscoped");
+        }
+        let total: u64 = recorded.iter().map(|b| b.max_bytes_scanned).sum();
+        assert!(
+            total <= 900,
+            "the sum of every slice's share must never exceed the configured budget"
+        );
+    });
+}
+
+/// The division must scope to how many slices `partition_snapshot` actually
+/// produced, not the configured `max_parallel_slices` cap: two shards at cap
+/// 8 dispatch only two slices, so each must get half the budget, not an
+/// eighth. Dividing by the cap instead of the real count would starve every
+/// slice with a spurious budget far below what the query is actually
+/// entitled to.
+#[test]
+fn distrib_fetch_scopes_byte_budget_by_real_not_configured_slice_count() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let store = MemoryStore::new();
+        let snapshot = sharded_snapshot(&store, 2).await;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let distributed = Distributed::new(
+            Arc::new(RecordingBudgetWorker {
+                seen: Arc::clone(&seen),
+            }),
+            DistribThresholds {
+                min_store_bytes: 0,
+                min_segments: 0,
+                max_parallel_slices: 8,
+            },
+        );
+        let config = EngineConfig {
+            max_bytes_scanned: crate::config::ByteLimit::Bounded(1_000),
+            ..EngineConfig::default()
+        };
+        let accounting = QueryAccounting::new();
+        distributed
+            .fetch(
+                TENANT,
+                Signal::Metrics,
+                &snapshot,
+                &[],
+                &[],
+                &accounting,
+                &config,
+                i64::MAX,
+                None,
+            )
+            .await
+            .expect("fetch succeeds");
+
+        let recorded = seen.lock().expect("lock");
+        assert_eq!(recorded.len(), 2, "only two shards, so only two slices");
+        for budgets in recorded.iter() {
+            assert_eq!(
+                budgets.max_bytes_scanned, 500,
+                "two real slices split the budget in half, not by the cap of 8"
+            );
+        }
+    });
+}
+
+/// `Unlimited` stays the wire's `0` sentinel regardless of slice count: a
+/// query with no configured byte cap must not have one manufactured by
+/// dividing `0` (or crashing on it).
+#[test]
+fn distrib_fetch_unlimited_byte_budget_stays_the_zero_sentinel_across_slices() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let store = MemoryStore::new();
+        let snapshot = sharded_snapshot(&store, 3).await;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let distributed = Distributed::new(
+            Arc::new(RecordingBudgetWorker {
+                seen: Arc::clone(&seen),
+            }),
+            DistribThresholds {
+                min_store_bytes: 0,
+                min_segments: 0,
+                max_parallel_slices: 3,
+            },
+        );
+        let config = EngineConfig {
+            max_bytes_scanned: crate::config::ByteLimit::Unlimited,
+            ..EngineConfig::default()
+        };
+        let accounting = QueryAccounting::new();
+        distributed
+            .fetch(
+                TENANT,
+                Signal::Metrics,
+                &snapshot,
+                &[],
+                &[],
+                &accounting,
+                &config,
+                i64::MAX,
+                None,
+            )
+            .await
+            .expect("fetch succeeds");
+
+        let recorded = seen.lock().expect("lock");
+        assert_eq!(recorded.len(), 3);
+        for budgets in recorded.iter() {
+            assert_eq!(
+                budgets.max_bytes_scanned, 0,
+                "unlimited stays the 0 sentinel"
+            );
+        }
+    });
+}
+
 // --- snapshot invalidation collapses to one retryable error ----------------
 
 /// A [`SliceFetcher`] double that returns a `SnapshotInvalidated` summary for

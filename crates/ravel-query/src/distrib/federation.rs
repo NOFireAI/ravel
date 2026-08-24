@@ -212,7 +212,12 @@ impl Federation {
 
         let encoded_matchers = codec::encode_matchers(&matchers);
         let encoded_erasure = codec::encode_erasure(&erasure);
-        let budgets = encode_budgets(&config);
+        // Not a slice fan-out: each remote cluster resolves its own snapshot
+        // and enforces its own admission independently (ADR-0071), so its
+        // request carries the tenant's whole byte budget, not a scoped-down
+        // fraction of it (issue #588's fix is specific to `mod.rs`'s local
+        // slice fan-out, where every slice shares one snapshot's budget).
+        let budgets = encode_budgets(&config, 1);
         let tenant_bytes = tenant_hash.0.to_vec();
         let signal_disc = codec::signal_to_u32(signal);
 
