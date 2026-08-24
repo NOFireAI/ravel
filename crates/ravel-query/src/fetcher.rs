@@ -143,7 +143,20 @@ pub enum FetchError {
 #[derive(Debug, Clone)]
 pub enum CacheFetchError {
     Store(std::sync::Arc<StoreError>),
-    EtagChanged { key: String },
+    EtagChanged {
+        key: String,
+    },
+    /// The bytes a live GET inside the closure returned failed the checksum the
+    /// admitting funnel verifies before admitting them: RLOG's per-block
+    /// `block_crc32c` (`log_fetcher.rs`'s block-range funnel, ADR-0107 decision
+    /// 3). Its own variant so a single-flight follower sees the same hard
+    /// corruption error the leader did, rather than a transient store error it
+    /// would retry. The RSEG closure below verifies nothing inside
+    /// `get_or_fetch` and never produces this.
+    Corrupt {
+        key: String,
+        message: String,
+    },
 }
 
 /// Lets a `get_or_fetch` closure use `?` directly on a `store.get(..)` call
@@ -619,6 +632,22 @@ impl SegmentFetcher {
                 },
                 SingleFlightError::Upstream(CacheFetchError::EtagChanged { key }) => {
                     FetchError::EtagChanged { key }
+                }
+                // Unreachable from this closure: the RSEG path verifies page
+                // checksums when it decodes, not inside `get_or_fetch`, so it
+                // never constructs `Corrupt`. Handled explicitly rather than
+                // through a wildcard so adding an in-closure integrity check
+                // here cannot silently fall through as a store error.
+                // `FetchError::Corrupt` carries a `ravel_segment::SegmentError`,
+                // which this channel's string message cannot reconstruct.
+                SingleFlightError::Upstream(CacheFetchError::Corrupt { key, message }) => {
+                    FetchError::Store {
+                        key,
+                        source: StoreError::Transient(format!(
+                            "cache single-flight closure reported corrupt bytes, which the RSEG \
+                             funnel never produces: {message}"
+                        )),
+                    }
                 }
                 SingleFlightError::LeaderLost => FetchError::Store {
                     key: key.to_string(),

@@ -17,8 +17,16 @@ The cache stores byte ranges read from two kinds of objects:
 - **Metric segments (RSEG).** A metric query reads a segment's footer,
   then the catalog sections it needs, then only the page ranges that match
   the query. Each of these byte ranges is cached separately.
-- **Log objects (RLOG).** A log query reads a whole RLOG object at once,
-  so the cached unit is the whole object.
+- **Log objects (RLOG).** Which unit is cached depends on the object's
+  size, against `--logs-block-range-threshold` (512 KiB by default). A log
+  query reads a smaller object whole, so the cached unit is the whole
+  object. For a larger one it reads only the blocks time and predicate
+  pruning kept: a probe of the object's tail, the directory sections it
+  needs, and the candidate blocks (adjacent ones fetched together in one
+  request). Each of those is cached separately, one entry per block, so a
+  later query whose blocks partly overlap reuses what it can. Set the
+  threshold to `18446744073709551615` to read every log object whole, as
+  before this split existed.
 
 Both PromQL queries and SQL queries over the `samples` table use the
 metric path. SQL queries over the `logs` table use the log path.
@@ -56,6 +64,7 @@ attach a RAM cache. See "Known gaps" below.
 | `--cache-max-bytes <n>` | `268435456` (256 MiB) | Maximum bytes the RAM tier holds. Bounds **every** ADR-0046 cache in the process from one number: the fetcher cache and the catalog's byte cache both. Read once at startup; there is no live resize. |
 | `--cache-dir <path>` | none | Reserved for the disk tier. Setting it fails startup today (see "Known gaps"). |
 | `--disable-cache` | off | Turns **every** ADR-0046 cache off: the fetcher cache and the catalog's byte cache both. No cache is constructed at all, so query *results* are byte-for-byte the same as a build with no cache code, and the process holds no read-cache memory. This is the flag to set in a memory-constrained container. |
+| `--logs-block-range-threshold <bytes>` | `524288` (512 KiB) | Log-object size above which a `logs` query reads only the pruning-relevant blocks (a tail probe plus per-block ranges, cached per block) instead of the whole object. Set it to `18446744073709551615` to read every log object whole, the shape before this split existed; set it to `0` to use the block-range path for every object. Read once at startup. |
 
 ### Disk-tier max-age sweep
 

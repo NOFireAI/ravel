@@ -17,6 +17,13 @@
 //!    corrupt live fetch (ADR-0046 §4).
 //! 5. GET-count: the block-range GET count and byte volume are proportional to
 //!    the candidate fraction, not the object size.
+//!
+//! Tests 1-5 all force the ranged path on a small fixture
+//! (`with_whole_object_threshold(0)`) or run without a cache. Tests 6-8 at the
+//! end of this file are the counterpart at PRODUCTION defaults: an object above
+//! the real 512 KiB threshold, a cache attached, and several partitions striping
+//! one segment -- the configuration ADR-0102 decision 1's fan-out gate grants,
+//! whose single-flight premise the block-range path has to keep true.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -601,4 +608,423 @@ async fn block_range_get_count_is_proportional_to_candidate_fraction() {
     assert_eq!(stats.probe_gets, 1);
     assert_eq!(stats.metadata_gets, 2);
     assert!(!stats.whole_object);
+}
+
+// ---- Tests 6-8: production defaults, cached, multi-partition ---------------
+//
+// Everything below runs at the REAL 512 KiB `block_range_threshold` with a real
+// cache attached, on an object big enough to route there on its own. Tests 1-5
+// above all avoid that configuration (threshold 0, or no cache), which is
+// exactly the configuration ADR-0102 decision 1's fan-out gate grants: several
+// partitions striping ONE segment, coalescing onto one request each through
+// ADR-0046's single-flight.
+
+/// Records whose bodies are high-entropy enough that zstd level 3 cannot shrink
+/// the object back under the 512 KiB threshold: 24 KiB of 64-alphabet noise per
+/// record, one record per block. Deterministic (a fixed LCG), so the object's
+/// size and layout are the same on every run.
+fn big_records(count: i64) -> Vec<LogRecord> {
+    const ALPHABET: &[u8; 64] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/";
+    let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+    (0..count)
+        .map(|ts| {
+            let mut body = String::with_capacity(24 * 1024);
+            for i in 0..24 * 1024 {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                // A space every 16 bytes keeps the body tokenizable rather than
+                // one enormous term, without lowering entropy meaningfully.
+                if i % 16 == 15 {
+                    body.push(' ');
+                } else {
+                    body.push(ALPHABET[(state >> 33) as usize % 64] as char);
+                }
+            }
+            record("api", ts, &body)
+        })
+        .collect()
+}
+
+/// An object above the production 512 KiB threshold: 40 one-record blocks of
+/// ~24 KiB each. Returns the records and the object bytes.
+fn large_object() -> (Vec<LogRecord>, Vec<u8>) {
+    let records = big_records(40);
+    let bytes = build_object(&records);
+    (records, bytes)
+}
+
+/// Non-BLOCKS sections the probe window `[total - suffix, total)` does NOT
+/// already cover: one metadata GET each.
+fn uncovered_sections(bytes: &[u8], suffix: u64) -> u64 {
+    let footer = footer::open(bytes).expect("footer");
+    let total = bytes.len() as u64;
+    let probe_start = total.saturating_sub(suffix);
+    footer
+        .sections
+        .iter()
+        .filter(|s| s.kind != kind::BLOCKS)
+        .filter(|s| s.offset < probe_start || s.offset + s.len > total)
+        .count() as u64
+}
+
+/// Coalesced runs among candidate extents at a gap threshold: the exact number
+/// of block-range GETs the fetcher issues for them.
+fn coalesced_runs(mut ext: Vec<(u64, u64, u32)>, gap: u64) -> u64 {
+    ext.sort_by_key(|e| e.0);
+    let mut runs = 0u64;
+    let mut prev_end: Option<u64> = None;
+    for (start, len, _) in ext {
+        match prev_end {
+            Some(end) if start <= end + gap => {}
+            _ => runs += 1,
+        }
+        prev_end = Some(prev_end.map_or(start + len, |e| e.max(start + len)));
+    }
+    runs
+}
+
+/// The whole fixed cost of one segment's block-range read at production
+/// defaults: the etag-establishing probe, one GET per non-BLOCKS section the
+/// probe missed, and one GET per coalesced candidate run. Asserts along the way
+/// that the fixture really exercises the path under test (above the threshold,
+/// candidates outside the probe window, coverage under the crossover).
+fn expected_segment_gets(bytes: &[u8], ts_min: i64, ts_max: i64) -> u64 {
+    let total = bytes.len() as u64;
+    assert!(
+        total > ravel_query::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+        "fixture must be above the production threshold, got {total} bytes"
+    );
+    let suffix = ravel_query::DEFAULT_LOG_SUFFIX_LEN;
+    let cands = candidate_extents(bytes, ts_min, ts_max);
+    assert!(
+        cands.len() > 1 && cands.len() < 40,
+        "candidates must be a strict nontrivial subset, got {}",
+        cands.len()
+    );
+    // No candidate may fall inside the probe window: a probe-covered block costs
+    // no GET, and the oracle below counts one GET per run.
+    let probe_start = total - suffix;
+    assert!(
+        cands
+            .iter()
+            .all(|(start, len, _)| start + len <= probe_start),
+        "fixture must select blocks outside the probe window"
+    );
+    // Under the coverage crossover, so the ranged path (not a whole-object GET)
+    // is what runs.
+    let footer = footer::open(bytes).expect("footer");
+    let blocks = footer.section(kind::BLOCKS).expect("BLOCKS");
+    let candidate_bytes: u64 = cands.iter().map(|(_, len, _)| *len).sum();
+    let coverage = candidate_bytes as f64 / blocks.len as f64;
+    assert!(
+        coverage < ravel_query::DEFAULT_LOG_COVERAGE_THRESHOLD,
+        "fixture must stay under the coverage crossover, got {coverage}"
+    );
+    1 + uncovered_sections(bytes, suffix)
+        + coalesced_runs(cands, ravel_query::DEFAULT_LOG_COALESCE_GAP)
+}
+
+/// [`CountingStore`] with a real object store's latency (a few ms per GET, far
+/// below S3's 15-80 ms). Concurrency tests need it: with a zero-latency store a
+/// leader can finish its whole fetch before a peer even asks, and
+/// `Cache::get_or_fetch` releases its in-flight slot just before it admits the
+/// bytes, so a peer landing in that microsecond window becomes a second leader
+/// for the same key and the request count stops being a function of the fetch
+/// protocol. Under any latency at all, concurrent callers for one key subscribe
+/// while the leader is still in flight, which is the behavior ADR-0046's
+/// single-flight exists to provide and the one this test is asserting about.
+struct SlowCountingStore {
+    inner: Arc<MemoryStore>,
+    gets: AtomicU64,
+}
+
+impl SlowCountingStore {
+    fn new(inner: Arc<MemoryStore>) -> Self {
+        SlowCountingStore {
+            inner,
+            gets: AtomicU64::new(0),
+        }
+    }
+    fn get_count(&self) -> u64 {
+        self.gets.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl ObjectStoreBackend for SlowCountingStore {
+    async fn put(
+        &self,
+        key: &str,
+        data: bytes::Bytes,
+        opts: PutOptions,
+    ) -> Result<PutOutcome, StoreError> {
+        self.inner.put(key, data, opts).await
+    }
+    async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+        self.gets.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        self.inner.get(key, range).await
+    }
+    async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+        self.inner.head(key).await
+    }
+    async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
+        self.inner.list(prefix, page).await
+    }
+    async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+        self.inner.list_delimited(prefix).await
+    }
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.inner.delete(key).await
+    }
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            multipart: false,
+            ..self.inner.capabilities()
+        }
+    }
+}
+
+fn big_cache() -> Arc<Cache<ravel_query::CacheFetchError>> {
+    // Far larger than the fixture, so nothing is evicted mid-test: an eviction
+    // would turn a cache hit into a real GET and make the count nondeterministic
+    // for a reason that has nothing to do with single-flight.
+    Arc::new(Cache::new(CacheLimits::new(1 << 26, 1 << 23, 1 << 26)))
+}
+
+/// Test 6: the production shape ADR-0102 decision 1 ships -- one shared
+/// `plan_segment` (the `OnceCell` in `LogsScanExec::compute_plan_counts`),
+/// then N partitions each draining its own stripe of the same segment's
+/// surviving blocks -- costs the SAME number of store GETs for any N.
+///
+/// The count asserted is exact, not "fewer than before": one etag-establishing
+/// probe, one GET per non-BLOCKS section the probe did not cover, and one GET
+/// per coalesced candidate run. Every partition after the planning read finds
+/// each of those extents already resident under its own cache key and issues
+/// nothing.
+///
+/// Prove-the-test: this fails on the pre-fix fetcher on the probe alone. The
+/// etag-establishing suffix GET was never cache-checked, so every partition and
+/// every `plan_segment` call paid one unconditionally: the count was
+/// `expected + N` rather than `expected`, and differed between N = 2 and N = 8.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cached_partitions_striping_one_large_segment_cost_a_partition_independent_get_count() {
+    let (records, bytes) = large_object();
+    let (ts_min, ts_max) = (2, 11);
+    let expected = expected_segment_gets(&bytes, ts_min, ts_max);
+
+    let mut counts = Vec::new();
+    for partitions in [2usize, 8] {
+        let mem = Arc::new(MemoryStore::new());
+        mem.put("logs/big.rlog", bytes.clone().into(), PutOptions::default())
+            .await
+            .expect("put");
+        let counting = Arc::new(CountingStore::new(mem));
+        let store: Arc<dyn ObjectStoreBackend> = counting.clone();
+        let seg = seg_ref("logs/big.rlog", bytes.len() as u64, &records);
+        let query = LogQuery::new(ts_min, ts_max);
+
+        // Production defaults throughout: no threshold override, no probe-length
+        // override, no coverage override. Only the cache is wired, exactly as
+        // `build_sql_state` wires it.
+        let fetcher = LogSegmentFetcher::new(store).with_cache(big_cache());
+        assert!(
+            fetcher.has_cache(),
+            "the ADR-0102 fan-out gate this test stands in for reads has_cache()"
+        );
+
+        // The shared planning read, then the per-partition stripes.
+        let accounting = QueryAccounting::new();
+        let (surviving, _stats) = fetcher
+            .plan_segment(&seg, TENANT, &query, &accounting)
+            .await
+            .expect("plan")
+            .expect("in range");
+        assert!(
+            surviving > partitions,
+            "the stripe must be nontrivial: {surviving} surviving blocks over {partitions} \
+             partitions"
+        );
+
+        let mut tasks = Vec::new();
+        for p in 0..partitions {
+            let indices: Vec<usize> = (p..surviving).step_by(partitions).collect();
+            let fetcher = fetcher.clone();
+            let seg = seg.clone();
+            let query = query.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut scan = fetcher
+                    .scan_accounted_with_tenant_subset(
+                        &seg,
+                        TENANT,
+                        &query,
+                        &ravel_logseg::ColumnSelection::all(),
+                        &indices,
+                        &QueryAccounting::new(),
+                    )
+                    .await
+                    .expect("subset scan")
+                    .expect("in range");
+                let mut rows = 0usize;
+                while let Some(block) = scan.next_block().expect("decode") {
+                    rows += block.len();
+                }
+                rows
+            }));
+        }
+        let mut rows = 0usize;
+        for task in tasks {
+            rows += task.await.expect("partition task");
+        }
+        assert_eq!(
+            rows,
+            (ts_max - ts_min + 1) as usize,
+            "the partitions together must return every matching row exactly once"
+        );
+
+        assert_eq!(
+            counting.get_count(),
+            expected,
+            "{partitions} partitions striping one segment must cost probe(1) + uncovered \
+             sections + coalesced runs = {expected} store GETs, independent of the partition count"
+        );
+        counts.push(counting.get_count());
+    }
+    assert_eq!(
+        counts[0], counts[1],
+        "the store GET count must not grow with the partition count"
+    );
+}
+
+/// Test 7: the same segment read by N partitions CONCURRENTLY from a cold
+/// cache, with no planning read to warm it. Nothing but ADR-0046's single-flight
+/// can hold the request count down here: every partition resolves the same
+/// probe, the same sections, and the same candidate run at the same moment.
+///
+/// The asserted count is exact and identical to test 6's: one GET per distinct
+/// extent, for any number of concurrent partitions. The pre-fix figure is
+/// `N * expected`. The store carries a few ms of latency per GET
+/// ([`SlowCountingStore`]) so the count is a function of the fetch protocol
+/// rather than of who happened to win a microsecond race on a zero-latency
+/// store; see that type's doc.
+///
+/// This also pins the per-partition memory shape the docs quote: each partition
+/// assembles its OWN object-sized buffer, so resident raw bytes above the
+/// threshold are `N * object_size`, not one shared object (the whole-object path
+/// below the threshold hands every partition a clone of one `Bytes`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_cold_partitions_collapse_onto_one_get_per_extent() {
+    let (records, bytes) = large_object();
+    let (ts_min, ts_max) = (2, 11);
+    let expected = expected_segment_gets(&bytes, ts_min, ts_max);
+    const PARTITIONS: usize = 8;
+
+    let mem = Arc::new(MemoryStore::new());
+    mem.put(
+        "logs/cold.rlog",
+        bytes.clone().into(),
+        PutOptions::default(),
+    )
+    .await
+    .expect("put");
+    let counting = Arc::new(SlowCountingStore::new(mem));
+    let store: Arc<dyn ObjectStoreBackend> = counting.clone();
+    let seg = seg_ref("logs/cold.rlog", bytes.len() as u64, &records);
+
+    let br = BlockRangeFetcher::new(store).with_cache(big_cache());
+    let mut tasks = Vec::new();
+    for _ in 0..PARTITIONS {
+        let br = br.clone();
+        let seg = seg.clone();
+        tasks.push(tokio::spawn(async move {
+            br.fetch_object(&seg, TENANT, ts_min, ts_max, &QueryAccounting::new())
+                .await
+                .expect("concurrent block-range fetch")
+        }));
+    }
+    let mut resident_bytes = 0u64;
+    for task in tasks {
+        let (assembled, stats) = task.await.expect("partition task");
+        assert!(
+            !stats.whole_object,
+            "the fixture must take the ranged path, not a crossover"
+        );
+        assert_eq!(
+            assembled.len() as u64,
+            bytes.len() as u64,
+            "every partition assembles its own object-sized buffer"
+        );
+        resident_bytes += assembled.len() as u64;
+    }
+
+    assert_eq!(
+        counting.get_count(),
+        expected,
+        "{PARTITIONS} concurrent cold fetches of one segment must issue exactly one GET per \
+         distinct extent ({expected}: probe + uncovered sections + coalesced runs); \
+         un-coalesced the same work is {}",
+        expected * PARTITIONS as u64
+    );
+    assert_eq!(
+        resident_bytes,
+        bytes.len() as u64 * PARTITIONS as u64,
+        "resident raw bytes above the threshold are one object-sized buffer per partition"
+    );
+}
+
+/// Test 8: the per-block corrupt-hit gate (test 4's property) at production
+/// defaults, with ONLY the block entries resident.
+///
+/// Test 4 populates the whole cache and reads it back corrupted, which after
+/// probe caching (ADR-0107 + this fix) can trip at the probe's own decode rather
+/// than at the block gate. This one leaves the probe and the sections as misses
+/// -- `get_or_fetch` returns the leader's live bytes, which the corrupting cache
+/// never touches -- and pre-admits exactly the candidate blocks, so the ONLY
+/// corrupted hit is a block and the gate under test is the block gate.
+///
+/// Prove-the-test: with the cache-hit `verify_block_crc` removed from
+/// `fetch_blocks`, the corrupted block bytes are placed into the assembled
+/// buffer and this returns `Ok`.
+#[tokio::test]
+async fn corrupt_block_hit_fails_closed_with_only_blocks_resident() {
+    let (records, bytes) = large_object();
+    let (ts_min, ts_max) = (2, 11);
+    let cands = candidate_extents(&bytes, ts_min, ts_max);
+
+    let mem = Arc::new(MemoryStore::new());
+    mem.put("logs/cb.rlog", bytes.clone().into(), PutOptions::default())
+        .await
+        .expect("put");
+    let seg = seg_ref("logs/cb.rlog", bytes.len() as u64, &records);
+    let store: Arc<dyn ObjectStoreBackend> = mem;
+
+    let cache: Arc<Cache<ravel_query::CacheFetchError>> = Arc::new(Cache::with_corruption(
+        CacheLimits::new(1 << 26, 1 << 23, 1 << 26),
+    ));
+    // Pre-admit the candidate blocks (clean bytes, their real keys) and nothing
+    // else. `Cache::with_corruption` corrupts what a `get` serves, so each of
+    // these is a genuine corrupted per-block hit.
+    for (start, len, _) in &cands {
+        let (s, e) = (*start as usize, (*start + *len) as usize);
+        cache.insert(
+            ravel_cache::CacheKey::new(TENANT.0, CONTENT_HASH, *start, *len),
+            bytes::Bytes::copy_from_slice(&bytes[s..e]),
+        );
+    }
+
+    let err = LogSegmentFetcher::new(store)
+        .with_cache(cache)
+        .fetch_accounted_with_tenant(
+            &seg,
+            TENANT,
+            &LogQuery::new(ts_min, ts_max),
+            &QueryAccounting::new(),
+        )
+        .await
+        .expect_err("a corrupted per-block cache hit must fail closed");
+    assert!(
+        matches!(err, LogFetchError::Corrupt { .. }),
+        "expected Corrupt from the per-block gate, got {err:?}"
+    );
 }
