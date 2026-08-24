@@ -76,13 +76,27 @@ naming both `--s3-auth instance-role` and the offending flag if either is set
 (an exported `RAVEL_S3_ACCESS_KEY` counts).
 
 The same `--s3-*` flags and `RAVEL_S3_*` env vars, including `--s3-auth`, work
-identically on `ravel-cli`.
+the same on `ravel-cli`, with one gap: `ravel-cli` has no `--s3-kms-key` and
+never sets `kms_key_id`.
 
 Note: the real S3 env var flags are `RAVEL_S3_ACCESS_KEY` and
 `RAVEL_S3_SECRET_KEY`, above; use those.
 `allow_http` and `force_path_style` are not configurable at all. The code
 derives `allow_http` from whether `--s3-endpoint` is set, and it always passes
 `force_path_style: true`.
+
+### Running on EC2 with an instance role
+
+Attach an IAM role to the instance granting S3 access to the bucket (plus
+`kms:GenerateDataKey` and `kms:Decrypt` on the key when SSE-KMS routing is
+on), then start the server with no credential flags at all:
+
+    ravel-server --store s3 --s3-bucket my-bucket --s3-region us-east-1 --s3-auth instance-role
+
+Credentials come from the instance metadata service at startup and refresh
+before expiry. No static key is stored on the instance, in the environment,
+or in logs; a missing or misconfigured role fails startup with a typed error
+rather than failing the first request.
 
 ## Admission limits file
 
