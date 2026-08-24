@@ -101,7 +101,7 @@ the reservation commit that used to work around it.
 | [0090](0090-typed-attribute-columns-logs-sql.md) | Typed attribute columns for the logs SQL table | Accepted |
 | [0091](0091-maintainer-gated-coderabbit-reviews.md) | Maintainer-gated CodeRabbit reviews: a workflow started by hand or by a `/coderabbit review` comment, which verifies `role_name` is maintain or admin, keeps the credential behind a main-only protected environment, loads policy from main by absolute path, and never executes pull-request code | Proposed |
 | [0092](0092-run-merged-l1-and-rseg-v7.md) | Run-merged L1 compaction and RSEG v7: per-sample dedup provenance columns, first timestamp as a delta from the run minimum, no alignment pad on single-sample raw value pages, and three measured page encodings, landed as one version bump | Accepted |
-| [0093](0093-typed-column-pushdown-logs.md) | Skip-index and postings pushdown for declared typed logs columns | Claimed |
+| [0093](0093-typed-column-pushdown-logs.md) | Skip-index and postings pushdown for declared typed logs columns: one resolver dispatching to two existing prune primitives (NumRange for I64/Bool, POSTINGS Equals for Str/Bytes), envelope-range IN, allowlist-only extraction | Proposed |
 | [0094](0094-parallel-final-aggregation-exact-typed.md) | Parallel final aggregation for exact-typed inputs | Proposed |
 | [0095](0095-numstat-crosstype-declared-column-agreement.md) | NumStat cross-type resolution fix and RLOG v3 | Accepted |
 | [0096](0096-queryfrag-per-sample-provenance-and-histograms.md) | Query fan-out frame carries per-sample provenance and histograms | Accepted |
