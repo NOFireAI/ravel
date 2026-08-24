@@ -1041,6 +1041,7 @@ fn map_log_fetch_error(err: LogFetchError) -> (pb::status::Code, String) {
         } => (pb::status::Code::SnapshotInvalidated, err.to_string()),
         LogFetchError::Store { .. } => (pb::status::Code::Unavailable, err.to_string()),
         LogFetchError::Corrupt { .. } => (pb::status::Code::Corrupt, err.to_string()),
+        LogFetchError::EtagChanged { .. } => (pb::status::Code::Corrupt, err.to_string()),
     }
 }
 

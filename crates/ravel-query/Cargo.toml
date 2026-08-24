@@ -45,6 +45,12 @@ serde_json = { workspace = true }
 promql-parser = { workspace = true }
 humantime = { workspace = true }
 bytes = { workspace = true }
+# Independent per-block crc32c verification in the RLOG block-range fetcher
+# (ADR-0107 decision 3): the admitting funnel verifies each block's stored
+# `block_crc32c` before admission and re-verifies it on a cache hit. Already a
+# workspace dependency (ravel-logseg, ravel-segment, ravel-cache use it);
+# promoted to a direct dependency of this crate, not a new external one.
+crc32c = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 thiserror = { workspace = true }

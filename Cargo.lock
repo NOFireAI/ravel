@@ -4936,6 +4936,7 @@ dependencies = [
  "axum",
  "blake3",
  "bytes",
+ "crc32c",
  "criterion",
  "futures",
  "humantime",

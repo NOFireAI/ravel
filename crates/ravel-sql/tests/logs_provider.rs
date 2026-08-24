@@ -1322,3 +1322,110 @@ async fn like_matrix_plans_without_cast_and_matches_rows() {
         "LIKE's matched argument must be the bare dictionary column, not a CAST; plan was:\n{text}"
     );
 }
+
+/// Reachability of the RLOG block-range fetcher (ADR-0107) from a real `logs`
+/// SQL query: the same ts + `has_word` scan as
+/// `scan_prunes_by_ts_and_word_returns_exact_rows`, but with a
+/// `LogSegmentFetcher` whose block-range path is forced on (threshold 0) and
+/// configured to genuinely range-fetch (a tiny probe suffix so the front
+/// metadata and the candidate blocks are fetched by range, pruned blocks left as
+/// zeroed gaps, coverage crossover disabled). The scan's output must still equal
+/// the record-by-record oracle exactly, proving the block-range assembly decodes
+/// correctly through the whole SQL scan pipeline, not only a unit test.
+#[tokio::test]
+async fn logs_scan_over_block_range_fetcher_returns_exact_rows() {
+    let store = MemoryStore::new();
+
+    let obj_a: Vec<LogRecord> = (100..=110)
+        .map(|ts| {
+            record(
+                "api",
+                ts,
+                if ts == 105 {
+                    "connection timeout"
+                } else {
+                    "ok"
+                },
+            )
+        })
+        .collect();
+    let obj_b: Vec<LogRecord> = (1000..=1010)
+        .map(|ts| {
+            record(
+                "worker",
+                ts,
+                if ts == 1005 { "request timeout" } else { "ok" },
+            )
+        })
+        .collect();
+    let obj_c: Vec<LogRecord> = (200..=205)
+        .map(|ts| {
+            let body = match ts {
+                202 => "gateway timeout",
+                204 => "timed out",
+                _ => "ok",
+            };
+            record("api", ts, body)
+        })
+        .collect();
+
+    let ref_a = write_object(&store, "logs/a.rlog", &obj_a).await;
+    let ref_b = write_object(&store, "logs/b.rlog", &obj_b).await;
+    let ref_c = write_object(&store, "logs/c.rlog", &obj_c).await;
+
+    let snapshot = Snapshot {
+        segments: vec![ref_a, ref_b, ref_c],
+        segments_pruned: 0,
+        pending_erasure: Vec::new(),
+    };
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+
+    // Force the block-range path on for every object, with a tiny probe suffix
+    // (genuine range fetches, zeroed gaps for pruned blocks) and the coverage
+    // crossover disabled.
+    let block_range = ravel_query::BlockRangeFetcher::new(Arc::clone(&store))
+        .with_whole_object_threshold(0)
+        .with_suffix_len(64)
+        .with_coverage_threshold(2.0);
+    let fetcher = LogSegmentFetcher::new(Arc::clone(&store))
+        .with_block_range_threshold(0)
+        .with_block_range(block_range);
+
+    let provider = LogsTableProvider::new(
+        snapshot,
+        TenantHash([7u8; 16]),
+        fetcher,
+        QueryAccounting::new(),
+    );
+
+    let (lo, hi) = (100i64, 250i64);
+    let filters = vec![
+        col("ts").gt_eq(ts_lit(lo)),
+        col("ts").lt_eq(ts_lit(hi)),
+        has_word_udf().call(vec![col("body"), lit("timeout")]),
+    ];
+    let plan = provider.plan_filters(4, &filters).expect("build plan");
+    let batches = collect_plan(plan).await;
+    let got = batches_to_rows(&batches);
+
+    let mut want = BTreeSet::new();
+    for records in [&obj_a, &obj_b, &obj_c] {
+        for r in records {
+            if r.ts_ns >= lo && r.ts_ns <= hi && body_has_word(&r.body, "timeout") {
+                want.insert((r.ts_ns, r.body.clone()));
+            }
+        }
+    }
+    assert_eq!(
+        want,
+        BTreeSet::from([
+            (105, "connection timeout".to_string()),
+            (202, "gateway timeout".to_string()),
+        ]),
+        "oracle sanity"
+    );
+    assert_eq!(
+        got, want,
+        "block-range SQL scan output must equal the oracle exactly"
+    );
+}
