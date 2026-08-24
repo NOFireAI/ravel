@@ -1297,9 +1297,6 @@ mod tests {
         assert!(all.str_col_fused(COL_BODY).is_some());
     }
 
-    /// A filter never weakens the integrity checks: the block crc still covers
-    /// the whole block, so a corrupted byte inside a *skipped* column's page is
-    /// still caught.
     /// `page_bytes_fetched`/`page_bytes_decoded` split each block's page bytes
     /// by the column filter (ADR-0107 decision 4). Every dynamic column here is
     /// present in every row, so each maps to exactly one page and the byte
@@ -1404,6 +1401,9 @@ mod tests {
         );
     }
 
+    /// A filter never weakens the integrity checks: the block crc still covers
+    /// the whole block, so a corrupted byte inside a *skipped* column's page is
+    /// still caught.
     #[test]
     fn column_filter_still_verifies_the_whole_block_crc() {
         let plans = vec![ColumnPlan {
