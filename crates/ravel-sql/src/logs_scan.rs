@@ -28,26 +28,32 @@
 //!
 //! # Object-store request count, and the cache gate
 //!
-//! The whole object is still fetched with one whole-object GET (ADR-0087
-//! decision 3: no ranged block reader here), so every partition that owns
-//! blocks in a segment issues its own whole-object read at that segment's key.
-//! What those reads cost depends on the cache, and so does how many partitions
-//! are planned:
+//! Every partition that owns blocks in a segment opens that segment itself, so
+//! it issues its own read sequence at that segment's key. The shape of that
+//! sequence depends on the object's size (ADR-0107,
+//! [`LogSegmentFetcher::with_block_range_threshold`], 512 KiB by default): at or
+//! below the threshold it is one whole-object GET; above it, a suffix probe, one
+//! GET per directory section, and coalesced GETs for the candidate blocks
+//! skip-index pruning kept. What those reads cost depends on the cache, and so
+//! does how many partitions are planned:
 //!
 //! - **Un-cached fetcher.** The partition count is capped at the segment count,
 //!   so the request count stops responding to `target_partitions` once that cap
 //!   binds. It is the pre-ADR-0102 whole-segment count only when the plan
 //!   collapses to a single partition; with `n > 1` partitions, every segment
 //!   holding at least `n` surviving blocks is opened by all `n` of them, so the
-//!   scan costs up to `n` whole-object reads per segment, and planning's prune
+//!   scan costs up to `n` read sequences per segment, and planning's prune
 //!   (`compute_plan_counts`) adds one more per relevant segment. The cap
 //!   bounds that multiplier by the segment count instead of letting
 //!   `target_partitions` set it; it does not remove it. `ravel-bench`'s
 //!   `logs_scan_scaling` report measures both.
 //! - **Cache-wired fetcher.** The partition count is `target_partitions`, so
-//!   several partitions can stripe one segment's blocks. The read cache keys the
-//!   whole object, so those reads coalesce onto one GET via single-flight, and
-//!   on the bench fixture the request count is flat across the whole
+//!   several partitions can stripe one segment's blocks. Every GET of either
+//!   shape is keyed by the extent it fetched and routed through the cache's
+//!   single-flight -- the whole object below the threshold, and the probe, each
+//!   section, and each block above it -- so the partitions striping one segment
+//!   coalesce onto one request per distinct extent rather than one sequence
+//!   each, and on the bench fixture the request count is flat across the whole
 //!   `target_partitions` sweep (planning's prune coalesces with them too).
 //!   Coalescing is not free of request count in general, though: a read that
 //!   misses the in-flight window, or finds its key already evicted, issues its
@@ -56,8 +62,11 @@
 //!   for the cache absorbing the repeat reads and for the extra scan
 //!   parallelism.
 //!
-//! A future ranged (per-block) reader would remove the trade entirely by making
-//! each partition's fetch cover only its own blocks.
+//! Above the threshold each partition's read already covers only the pruned
+//! candidate blocks rather than every byte of the segment, so bytes on the wire
+//! are pruning-proportional; what stays per-partition is the object-sized
+//! assembly buffer each one builds
+//! (`crates/ravel-query/tests/log_block_range.rs` measures both).
 //!
 //! Any "no amplification" or "flat request count" figure reported for this path
 //! (here, in `ravel-bench`'s `logs_scan_scaling` report, or in that bench's
@@ -577,15 +586,16 @@ impl LogsScanExec {
         //
         // Striping past the segment count is gated on the fetcher carrying
         // ADR-0046's read cache, which is the precondition ADR-0102 decision 1
-        // names for it: the fetch unit here is the whole object
-        // (`GetRange::Full`, no ranged block reader -- ADR-0087 decision 3), so K
-        // partitions sharing one segment issue K whole-object reads at the same
-        // key. With the cache those coalesce onto one GET through single-flight;
-        // without it each is a real request, and requesting more partitions than
-        // there are segments would multiply object-store GETs for no reason. So
-        // an un-cached fetcher falls back to the pre-ADR-0102 bound,
-        // `min(target_partitions, segment_count)`, and never plans a partition
-        // whose extra GETs nothing absorbs.
+        // names for it: K partitions sharing one segment each open it
+        // themselves, so each issues its own read sequence at that key -- one
+        // whole-object GET at or below the ADR-0107 block-range threshold, and a
+        // probe plus section and candidate-block ranges above it. With the cache
+        // every GET of either shape is keyed by its extent and coalesces onto one
+        // request through single-flight; without it each is a real request, and
+        // requesting more partitions than there are segments would multiply
+        // object-store GETs for no reason. So an un-cached fetcher falls back to
+        // the pre-ADR-0102 bound, `min(target_partitions, segment_count)`, and
+        // never plans a partition whose extra GETs nothing absorbs.
         let declared_partitions = if fetcher.has_cache() {
             target_partitions.max(1)
         } else {
@@ -809,8 +819,9 @@ fn plan_counts_future(
 
 /// Prune every segment once (no block decode) to build the shared block plan.
 /// Sequential on purpose: the reads are single-flight coalesced with the
-/// per-partition scans that follow, and this runs once per query, not per
-/// partition.
+/// per-partition scans that follow -- on the whole object's key below the
+/// ADR-0107 block-range threshold, and per extent (probe, sections, blocks)
+/// above it -- and this runs once per query, not per partition.
 async fn compute_plan_counts(
     ctx: &PartitionCtx,
     segments: &[SegmentRef],

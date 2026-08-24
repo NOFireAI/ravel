@@ -154,6 +154,19 @@ pub struct EngineConfig {
     pub fetch_concurrency: usize,
     /// Step for a subquery that does not specify its own (`expr[5m:]`).
     pub default_evaluation_interval: Duration,
+    /// Object size above which a logs scan reads only the pruning-relevant
+    /// blocks of an RLOG object instead of the whole object (ADR-0107), i.e.
+    /// [`crate::LogSegmentFetcher::with_block_range_threshold`]. Not an engine
+    /// limit like the fields above: it rides here because this is the one config
+    /// the server folds its query flags into and hands to every fetcher it
+    /// constructs (`services/ravel-server/src/query.rs`'s `build_sql_state`),
+    /// which is where the logs fetcher is built.
+    ///
+    /// Defaults to [`crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD`] (512 KiB).
+    /// `u64::MAX` reads every object whole, the pre-ADR-0107 behavior and the
+    /// mitigation for an operator who hits a regression on the block-range path;
+    /// `0` sends every object through it.
+    pub logs_block_range_threshold: u64,
 }
 
 impl Default for EngineConfig {
@@ -170,6 +183,7 @@ impl Default for EngineConfig {
             deadline: DEFAULT_DEADLINE,
             fetch_concurrency: DEFAULT_FETCH_CONCURRENCY,
             default_evaluation_interval: DEFAULT_EVALUATION_INTERVAL,
+            logs_block_range_threshold: crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
         }
     }
 }

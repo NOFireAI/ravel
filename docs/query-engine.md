@@ -928,8 +928,13 @@ fields: `s3_requests`/`s3_bytes` on `catalog_resolve`, `segment_open`, and
 `page_fetch`; `segments_pruned` on `catalog_resolve`; `series_matched` on
 `catalog_decode`; `decompressed_bytes` on `decode`. The log-signal path
 (`LogSegmentFetcher::fetch_accounted` and the production
-`fetch_accounted_with_tenant`) carries the same `page_fetch` (recording
-its one whole-object GET, or zero on a cache hit) and `decode` span names.
+`fetch_accounted_with_tenant`) carries the same `page_fetch` and `decode`
+span names. What `page_fetch` records there depends on the object's size
+(ADR-0107): at or below the block-range threshold, its one whole-object GET,
+or zero on a cache hit; above it, the total store GETs the block-range
+sequence issued (probe, directory sections, coalesced candidate-block
+ranges) and the bytes they moved, again zero when every extent was a cache
+hit.
 
 Span fields otherwise carry only bounded values — `tenant_hash` as a hex
 string, `object_size`, matcher/series counts, and fixed-set kind strings
@@ -1309,25 +1314,43 @@ is the precondition ADR-0102 decision 1 names for it:
   `with_cache`): the scan declares `min(target_partitions, segment_count)`, the
   pre-ADR-0102 bound.
 
-The reason is the fetch unit. There is no ranged block reader on the SQL read
-path, so each partition that owns blocks in a segment fetches that segment's
-whole object. With the cache, those reads coalesce through single-flight on one
-key; without it, each is a real object-store GET, and partitions beyond the
-segment count would multiply GETs with nothing absorbing them. Note what the cap
-does and does not buy: it stops `target_partitions` from setting the multiplier,
-but below the cap a plan with `n` partitions still opens each sufficiently-blocky
-segment `n` times, and the planning prune that counts surviving blocks adds one
-more read per segment. `ravel-bench`'s `logs_scan_scaling` report measures the
-cached and un-cached request counts side by side; its figures describe that
-fixture (a `MemoryStore`, a cache sized to hold the whole dataset), not striping
-in general.
+The reason is the fetch unit. Each partition that owns blocks in a segment opens
+that segment itself, so each issues its own read sequence at that key. Which
+sequence depends on the object's size (ADR-0107,
+`--logs-block-range-threshold`, 512 KiB by default): at or below the threshold
+one whole-object GET; above it a suffix probe, one GET per directory section,
+and coalesced GETs covering only the candidate blocks skip-index pruning kept.
+With the cache, every GET of either shape is keyed by the extent it fetched and
+coalesces through single-flight — the whole object below the threshold, and the
+probe, each section, and each block above it — so `n` partitions striping one
+segment cost one request per distinct extent rather than `n` sequences. Without
+a cache each is a real object-store GET, and partitions beyond the segment count
+would multiply GETs with nothing absorbing them. Note what the cap does and does
+not buy: it stops `target_partitions` from setting the multiplier, but below the
+cap a plan with `n` partitions still opens each sufficiently-blocky segment `n`
+times, and the planning prune that counts surviving blocks adds one more read
+per segment. `ravel-bench`'s `logs_scan_scaling` report measures the cached and
+un-cached request counts side by side; its figures describe that fixture (a
+`MemoryStore`, a cache sized to hold the whole dataset), not striping in
+general. `crates/ravel-query/tests/log_block_range.rs` pins the above-threshold
+cached case exactly: on its 906,791-byte fixture, 2 partitions and 8 partitions
+striping one segment both cost 6 store GETs (one probe, four directory
+sections, one coalesced candidate run), and 8 concurrent cold partitions cost
+the same 6.
 
-The peak-memory consequence follows the same gate. Concurrently-held scan memory
-is bounded by block size times the number of partitions decoding at once, so
-only the cached configuration raises that bound above the old
+The peak-memory consequence follows the same gate, with a second term above the
+block-range threshold. Concurrently-held *decoded* memory is bounded by block
+size times the number of partitions decoding at once, so only the cached
+configuration raises that bound above the old
 `min(target_partitions, segment_count)` one — an un-cached deployment's bound is
-unchanged by ADR-0102. The per-query DataFusion pool enforces it either way:
-a partition count that would exceed the budget fails the query rather than
+unchanged by ADR-0102. Raw bytes behave differently on the two read shapes: at
+or below the threshold every partition shares one cached whole-object `Bytes`
+(a cheap clone), while above it each partition assembles its own object-sized
+buffer with only the fetched extents populated, so resident raw bytes are
+`n × object_size` even though bytes on the wire are pruning-proportional. The
+same test measures it: 8 partitions × 906,791 bytes = 7,254,328 resident bytes
+for one segment. The per-query DataFusion pool enforces the decoded bound either
+way: a partition count that would exceed the budget fails the query rather than
 spilling (ADR-0013).
 
 Two consequences an operator and a plan reader both see:
@@ -1575,9 +1598,13 @@ arrival order varies.
 ## Caching note
 
 ADR-0046 added a content-addressed RAM read-cache tier (`ravel-cache`,
-S3-FIFO eviction, single-flighted) consulted at three funnels:
-`SegmentFetcher::guarded_get`, `Catalog::guarded_get`, and
-`LogSegmentFetcher::fetch`. Cache keys are `(tenant_hash, content_hash, offset,
+S3-FIFO eviction, single-flighted) consulted at four funnels:
+`SegmentFetcher::guarded_get`, `Catalog::guarded_get`,
+`LogSegmentFetcher::fetch`, and — for an RLOG object above the block-range
+threshold — `BlockRangeFetcher` (ADR-0107), which routes its suffix probe, each
+directory section, and each candidate block through the cache on that extent's
+own key, admitting one entry per verified block and never a coalesced range.
+Cache keys are `(tenant_hash, content_hash, offset,
 len)`, so entries survive object-key churn and two writers producing
 identical bytes share one entry. Each funnel credits its own hit/miss and
 byte counters to `QueryAccounting` (ADR-0044), so a query's `EXPLAIN
