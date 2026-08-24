@@ -317,7 +317,7 @@ impl RlogWriter {
         // used count is what `columns` ends with; the overflow is the rest, the
         // pairs that fold into `attrs_raw` (docs/adrs/0100 decision 1).
         let distinct_total = distinct.len();
-        let mut column_of: HashMap<(String, u8), u32> = HashMap::new();
+        let mut column_of: ColumnIndex = HashMap::new();
         let mut columns: Vec<(String, FieldType, u32)> = Vec::new();
         for (idx, (name, ty_byte)) in distinct.into_iter().enumerate() {
             if idx >= self.cfg.max_dynamic_columns {
@@ -325,7 +325,10 @@ impl RlogWriter {
             }
             let column_id = FIRST_DYNAMIC_COL + idx as u32;
             let ty = FieldType::from_u8(ty_byte).unwrap_or(FieldType::Bytes);
-            column_of.insert((name.clone(), ty_byte), column_id);
+            column_of
+                .entry(ty_byte)
+                .or_default()
+                .insert(name.clone(), column_id);
             columns.push((name, ty, column_id));
         }
         let dynamic_columns_used = columns.len() as u32;
@@ -720,6 +723,25 @@ impl RlogWriter {
 /// resolved view of it ([`resolved_tracked_values`]).
 type TrackedValues = Vec<(String, (u8, ColumnValue))>;
 
+/// Dynamic-column index: type byte to (attribute name to column id). Nesting the
+/// map this way (rather than keying one map on an owned `(String, u8)`) lets the
+/// hot per-attribute probe in [`resolve_row`] borrow the name as `&str` through
+/// `String: Borrow<str>`, so a lookup allocates nothing and hashes the name once.
+/// Keying a single `(String, u8)` map instead forces an owned key -- a String
+/// clone and heap allocation -- on every probe, which a ClickBench load
+/// (105 attributes per row over 2M rows, 200M+ probes) spent ~8.3% of all CPU on
+/// (issue #570). The outer map has at most one entry per [`FieldType`] variant,
+/// so its lookup is effectively free.
+type ColumnIndex = HashMap<u8, HashMap<String, u32>>;
+
+/// Resolves one `(name, type byte)` pair to its dynamic column id, borrowing the
+/// name rather than cloning it. `None` when the pair took no in-budget column
+/// (overflowed, or never given one). This is the read half of [`ColumnIndex`];
+/// keep every probe going through it so no call site reconstructs an owned key.
+fn column_lookup(column_of: &ColumnIndex, name: &str, ty_byte: u8) -> Option<u32> {
+    column_of.get(&ty_byte).and_then(|m| m.get(name)).copied()
+}
+
 /// Resolves one record into storage form: dense stream ref, dynamic columns
 /// split by type, overflow attributes canonicalized into `attrs_raw`, the
 /// merged-view POSTINGS terms this record contributes
@@ -733,7 +755,7 @@ type TrackedValues = Vec<(String, (u8, ColumnValue))>;
 fn resolve_row(
     r: &LogRecord,
     ref_of: &HashMap<LogStreamId, u32>,
-    column_of: &HashMap<(String, u8), u32>,
+    column_of: &ColumnIndex,
     indexed_names: &std::collections::HashSet<&str>,
     numstat_names: &std::collections::HashSet<&str>,
     stream_tracked: &HashMap<LogStreamId, TrackedValues>,
@@ -759,15 +781,15 @@ fn resolve_row(
     for (k, v) in &r.attrs {
         let (ty, cv) = resolve_value(v);
         let tracked = indexed_names.contains(k.as_str()) || numstat_names.contains(k.as_str());
-        match column_of.get(&(k.clone(), ty.to_u8())) {
-            Some(cid) if !cols.contains_key(cid) => {
+        match column_lookup(column_of, k, ty.to_u8()) {
+            Some(cid) if !cols.contains_key(&cid) => {
                 if tracked {
                     tracked_cols
                         .entry(k.clone())
                         .or_default()
                         .push((ty.to_u8(), cv.clone()));
                 }
-                cols.insert(*cid, cv);
+                cols.insert(cid, cv);
             }
             // Overflow column, or a duplicate (name,type) already columnar this
             // row: fold into attrs_raw so no value is lost.
@@ -875,7 +897,7 @@ fn resolved_tracked_values(
 fn stat_winner_columns(
     resolved: &[(String, (u8, ColumnValue))],
     numstat_names: &std::collections::HashSet<&str>,
-    column_of: &HashMap<(String, u8), u32>,
+    column_of: &ColumnIndex,
 ) -> Vec<(u32, ColumnValue)> {
     let mut out: Vec<(u32, ColumnValue)> = Vec::new();
     let mut seen: BTreeSet<&str> = BTreeSet::new();
@@ -889,7 +911,7 @@ fn stat_winner_columns(
         ) {
             continue;
         }
-        if let Some(&cid) = column_of.get(&(name.clone(), *ty_byte)) {
+        if let Some(cid) = column_lookup(column_of, name, *ty_byte) {
             out.push((cid, cv.clone()));
         }
     }
@@ -923,14 +945,14 @@ fn stat_winner_columns(
 fn indexed_term_columns(
     resolved: &[(String, (u8, ColumnValue))],
     indexed_names: &std::collections::HashSet<&str>,
-    column_of: &HashMap<(String, u8), u32>,
+    column_of: &ColumnIndex,
 ) -> Vec<(u32, ColumnValue)> {
     let mut out = Vec::with_capacity(resolved.len());
     for (name, (ty_byte, cv)) in resolved {
         if !indexed_names.contains(name.as_str()) {
             continue;
         }
-        if let Some(&cid) = column_of.get(&(name.clone(), *ty_byte)) {
+        if let Some(cid) = column_lookup(column_of, name, *ty_byte) {
             out.push((cid, cv.clone()));
         }
     }
@@ -1825,6 +1847,254 @@ mod tests {
                 assert!(
                     attr_eq(read, value),
                     "record {rec} attribute {name}: read {read:?} != written {value:?}"
+                );
+            }
+        }
+    }
+
+    /// Differential/content-stability guard for the `column_lookup` refactor
+    /// (issue #570): every per-record attribute is routed to its dynamic column
+    /// purely by the lookup, so a wrong probe result would misfile or drop a
+    /// value. Building a multi-row object over five distinct `(name, type)`
+    /// columns and reading every value back exactly -- plus asserting the build
+    /// is byte-stable -- proves the change is a pure performance change, not a
+    /// behavior change. Reverting `column_lookup` to ignore the type byte (e.g.
+    /// `column_of.values().find_map(|m| m.get(name)).copied()`) misroutes a
+    /// value to another type's column and fails the read-back below.
+    #[test]
+    fn lookup_refactor_preserves_column_content() {
+        let blob = empty_stream_blob();
+        let nan = f64::from_bits(0x7ff8_0000_0000_0abc);
+        // Five distinct names, one per type, each carried by every record so
+        // each column holds a real per-row value. Read-back stays unambiguous
+        // because no record carries a name twice.
+        let attrs_for = |rec: i64| -> Vec<(String, AttrValue)> {
+            vec![
+                ("a_str".into(), AttrValue::Str(format!("s{rec}"))),
+                ("b_i64".into(), AttrValue::I64(rec * 7 - 3)),
+                ("c_bool".into(), AttrValue::Bool(rec % 2 == 0)),
+                (
+                    "d_f64".into(),
+                    AttrValue::F64(if rec == 4 { nan } else { rec as f64 - 0.5 }),
+                ),
+                (
+                    "e_bytes".into(),
+                    AttrValue::Bytes(vec![rec as u8, 0x00, 0xff]),
+                ),
+            ]
+        };
+        let build = || {
+            let mut w = RlogWriter::new(RlogConfig::default(), identity());
+            for rec in 0..8i64 {
+                let mut r = base_record(0, rec);
+                r.stream_attrs = blob.clone();
+                r.attrs = attrs_for(rec);
+                w.push(r).expect("push");
+            }
+            w.finish().expect("finish")
+        };
+        let obj = build();
+        assert_eq!(obj, build(), "identical input must stay byte-identical");
+
+        let footer = open(&obj).expect("open");
+        let fd = read_field_dir(&obj, &footer);
+        assert_eq!(fd.len(), 5, "one column per distinct (name, type)");
+        for (name, ty) in [
+            ("a_str", FieldType::Str),
+            ("b_i64", FieldType::I64),
+            ("c_bool", FieldType::Bool),
+            ("d_f64", FieldType::F64),
+            ("e_bytes", FieldType::Bytes),
+        ] {
+            let col = fd
+                .column(name, ty)
+                .unwrap_or_else(|| panic!("{name} column"));
+            // Every record populates every column: a value that failed to route
+            // to its column would fold into `attrs_raw` and leave the column
+            // all-null, so a null here catches a misrouting lookup even though
+            // the reader's merged view would still surface the overflowed value.
+            assert_eq!(col.null_count, 0, "{name} column populated by every row");
+        }
+
+        let reader = RlogReader::new(&obj, &RlogConfig::default()).expect("open reader");
+        let (rows, _) = reader.scan(&Predicate::And(Vec::new())).expect("scan");
+        assert_eq!(rows.len(), 8);
+        for rec in 0..8i64 {
+            let row = rows
+                .iter()
+                .find(|r| r.ts_ns == rec)
+                .unwrap_or_else(|| panic!("record ts {rec}"));
+            let got: HashMap<&str, &AttrValue> =
+                row.attrs.iter().map(|(k, v)| (k.as_str(), v)).collect();
+            for (name, value) in &attrs_for(rec) {
+                let read = got
+                    .get(name.as_str())
+                    .unwrap_or_else(|| panic!("record {rec} attribute {name} read back"));
+                assert!(
+                    attr_eq(read, value),
+                    "record {rec} attribute {name}: read {read:?} != written {value:?}"
+                );
+            }
+        }
+    }
+
+    /// The "new column first seen mid-object" path (issue #570): a `(name, type)`
+    /// pair introduced only by a LATER row must get its own column, never alias
+    /// onto an earlier column with a similar name or the same name under a
+    /// different type.
+    ///
+    /// Rows 0..5 carry `("col", Str)`. Rows 5..10 carry `("col", I64)` (same name,
+    /// new type, first seen late) and `("cola", Str)` (adjacent name, first seen
+    /// late). All three must be distinct columns, and every row must read back
+    /// the value it actually wrote. If `column_lookup` aliased `("col", I64)`
+    /// onto `("col", Str)` or `("cola", Str)`, the late I64 rows would misroute
+    /// and the read-back fails.
+    #[test]
+    fn later_row_first_seen_column_gets_fresh_index() {
+        let blob = empty_stream_blob();
+        let mut w = RlogWriter::new(RlogConfig::default(), identity());
+        for rec in 0..10i64 {
+            let mut r = base_record(0, rec);
+            r.stream_attrs = blob.clone();
+            if rec < 5 {
+                r.attrs = vec![("col".into(), AttrValue::Str(format!("early{rec}")))];
+            } else {
+                r.attrs = vec![
+                    ("col".into(), AttrValue::I64(rec * 11)),
+                    ("cola".into(), AttrValue::Str(format!("late{rec}"))),
+                ];
+            }
+            w.push(r).expect("push");
+        }
+        let obj = w.finish().expect("finish");
+
+        let footer = open(&obj).expect("open");
+        let fd = read_field_dir(&obj, &footer);
+        let col_str = fd
+            .column("col", FieldType::Str)
+            .expect("(col, Str)")
+            .column_id;
+        let col_i64 = fd
+            .column("col", FieldType::I64)
+            .expect("(col, I64)")
+            .column_id;
+        let cola_str = fd
+            .column("cola", FieldType::Str)
+            .expect("(cola, Str)")
+            .column_id;
+        assert_eq!(fd.len(), 3, "three distinct columns");
+        assert_ne!(
+            col_str, col_i64,
+            "same name, different type: distinct columns"
+        );
+        assert_ne!(col_str, cola_str, "adjacent names: distinct columns");
+        assert_ne!(col_i64, cola_str);
+
+        let reader = RlogReader::new(&obj, &RlogConfig::default()).expect("open reader");
+        let (rows, _) = reader.scan(&Predicate::And(Vec::new())).expect("scan");
+        assert_eq!(rows.len(), 10);
+        for rec in 0..10i64 {
+            let row = rows
+                .iter()
+                .find(|r| r.ts_ns == rec)
+                .unwrap_or_else(|| panic!("record ts {rec}"));
+            let got: HashMap<&str, &AttrValue> =
+                row.attrs.iter().map(|(k, v)| (k.as_str(), v)).collect();
+            if rec < 5 {
+                assert_eq!(
+                    got.get("col"),
+                    Some(&&AttrValue::Str(format!("early{rec}"))),
+                    "early row {rec} keeps its Str col"
+                );
+                assert!(!got.contains_key("cola"), "cola absent from early rows");
+            } else {
+                assert_eq!(
+                    got.get("col"),
+                    Some(&&AttrValue::I64(rec * 11)),
+                    "late row {rec} col is the newly-columned I64"
+                );
+                assert_eq!(
+                    got.get("cola"),
+                    Some(&&AttrValue::Str(format!("late{rec}"))),
+                    "late row {rec} cola read back"
+                );
+            }
+        }
+    }
+
+    /// No two distinct `(name, type)` pairs ever collapse onto one column under
+    /// the nested-map lookup (issue #570), even for adjacent short names and for
+    /// one name carried under three different type tags. Ten `("kN", Str)`
+    /// columns plus `("k0", I64)` and `("k0", Bool)` must be twelve distinct
+    /// columns, each reading back its own value.
+    #[test]
+    fn distinct_names_and_types_never_alias_to_one_column() {
+        let blob = empty_stream_blob();
+        let mut w = RlogWriter::new(RlogConfig::default(), identity());
+        // Row r carries k0..k9 as Str; rows also carry k0 as I64 (even rows) and
+        // k0 as Bool (odd rows), so k0 splits into three columns across rows.
+        for rec in 0..6i64 {
+            let mut r = base_record(0, rec);
+            r.stream_attrs = blob.clone();
+            let mut attrs: Vec<(String, AttrValue)> = (0..10)
+                .map(|n| (format!("k{n}"), AttrValue::Str(format!("k{n}_v{rec}"))))
+                .collect();
+            if rec % 2 == 0 {
+                attrs.push(("k0".into(), AttrValue::I64(rec)));
+            } else {
+                attrs.push(("k0".into(), AttrValue::Bool(true)));
+            }
+            r.attrs = attrs;
+            w.push(r).expect("push");
+        }
+        let obj = w.finish().expect("finish");
+
+        let footer = open(&obj).expect("open");
+        let fd = read_field_dir(&obj, &footer);
+        // 10 Str columns (k0..k9) + (k0, I64) + (k0, Bool) = 12.
+        assert_eq!(
+            fd.len(),
+            12,
+            "every distinct (name, type) gets its own column"
+        );
+        let mut ids: BTreeSet<u32> = BTreeSet::new();
+        for n in 0..10 {
+            let name = format!("k{n}");
+            ids.insert(
+                fd.column(&name, FieldType::Str)
+                    .unwrap_or_else(|| panic!("({name}, Str)"))
+                    .column_id,
+            );
+        }
+        ids.insert(
+            fd.column("k0", FieldType::I64)
+                .expect("(k0, I64)")
+                .column_id,
+        );
+        ids.insert(
+            fd.column("k0", FieldType::Bool)
+                .expect("(k0, Bool)")
+                .column_id,
+        );
+        assert_eq!(ids.len(), 12, "no two columns share a column_id");
+
+        // Every Str value reads back on every row: proves no adjacent-name probe
+        // aliased onto a neighbour.
+        let reader = RlogReader::new(&obj, &RlogConfig::default()).expect("open reader");
+        let (rows, _) = reader.scan(&Predicate::And(Vec::new())).expect("scan");
+        assert_eq!(rows.len(), 6);
+        for rec in 0..6i64 {
+            let row = rows
+                .iter()
+                .find(|r| r.ts_ns == rec)
+                .unwrap_or_else(|| panic!("record ts {rec}"));
+            for n in 0..10 {
+                let name = format!("k{n}");
+                let want = AttrValue::Str(format!("k{n}_v{rec}"));
+                let found = row.attrs.iter().any(|(k, v)| k == &name && v == &want);
+                assert!(
+                    found,
+                    "record {rec} attribute {name} read back as its own value"
                 );
             }
         }
