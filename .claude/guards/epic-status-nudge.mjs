@@ -33,16 +33,47 @@ const NUDGE_THRESHOLD = 8;
 // Matches an ad hoc reconciliation read: `gh issue view`, `gh pr view`, `gh
 // issue list`. Not `gh issue create`/`comment`/`close` and not `gh pr
 // create`/`merge` -- those are real actions, not a stand-in for
-// epic-status.sh.
-const RECONCILE_CALL = /\bgh\s+(issue|pr)\s+(view|list)\b/;
-const EPIC_STATUS_RUN = /\bscripts\/epic-status\.sh\b/;
+// epic-status.sh. Anchored to the START of a command fragment (see
+// commandFragments) rather than searched anywhere in the string, so a commit
+// message or echo that merely mentions either phrase doesn't move the
+// counter -- only an actual invocation does.
+const RECONCILE_CALL = /^gh\s+(issue|pr)\s+(view|list)\b/;
+const EPIC_STATUS_RUN = /^(\.\/)?scripts\/epic-status\.sh\b/;
+
+// Splits a shell command on real command separators and strips a leading
+// `cd ... &&` or env-var assignment from each piece, so "cd x && gh issue
+// view 1" and "FOO=bar gh issue view 1" still match at the START of their
+// fragment. Mirrors pretooluse.mjs's HARMLESS_PREFIX approach, scaled down:
+// this only needs to avoid false positives/negatives on a soft nudge, not
+// close every shell-quoting escape hatch a security gate would.
+const CMD_SEPARATOR = /&&|\|\||[;|\n]/;
+const HARMLESS_PREFIX =
+  /^(\s*(cd\s+[^&;|]+&&|[A-Za-z_][A-Za-z0-9_]*=\S+)\s*)+/;
+
+function commandFragments(command) {
+  return command
+    .split(CMD_SEPARATOR)
+    .map((fragment) => fragment.replace(HARMLESS_PREFIX, "").trim())
+    .filter(Boolean);
+}
+
+function nonNegativeInt(value) {
+  return Number.isInteger(value) && value >= 0 ? value : 0;
+}
 
 function readState() {
   try {
     const parsed = JSON.parse(readFileSync(STATE_PATH, "utf8"));
-    return typeof parsed?.count === "number" ? parsed : { count: 0 };
+    return {
+      count: nonNegativeInt(parsed?.count),
+      // Count value at which nudge() last actually emitted a reminder, so a
+      // session that ignores it isn't re-reminded on every single following
+      // prompt -- only once it has accumulated another threshold's worth of
+      // hand-rolled calls past the last reminder.
+      lastNudgedAt: nonNegativeInt(parsed?.lastNudgedAt),
+    };
   } catch {
-    return { count: 0 };
+    return { count: 0, lastNudgedAt: 0 };
   }
 }
 
@@ -66,26 +97,30 @@ function readStdinJSON() {
 function track() {
   const command = readStdinJSON()?.tool_input?.command;
   if (typeof command !== "string") return;
+  const fragments = commandFragments(command);
   const state = readState();
-  if (EPIC_STATUS_RUN.test(command)) {
-    state.count = 0;
-    writeState(state);
-  } else if (RECONCILE_CALL.test(command)) {
-    state.count = (state.count ?? 0) + 1;
-    writeState(state);
+  if (fragments.some((fragment) => EPIC_STATUS_RUN.test(fragment))) {
+    writeState({ count: 0, lastNudgedAt: 0 });
+  } else if (fragments.some((fragment) => RECONCILE_CALL.test(fragment))) {
+    writeState({ ...state, count: state.count + 1 });
   }
 }
 
 function nudge() {
-  const { count } = readState();
-  if (count >= NUDGE_THRESHOLD) {
-    process.stdout.write(
-      `${count} hand-rolled \`gh issue/pr view\`-style calls since the ` +
-        "last `scripts/epic-status.sh` run (issue #613). If you're " +
-        "tracking an epic, run epic-status.sh instead of continuing to " +
-        "poll by hand.",
-    );
+  const state = readState();
+  if (
+    state.count < NUDGE_THRESHOLD ||
+    state.count < state.lastNudgedAt + NUDGE_THRESHOLD
+  ) {
+    return;
   }
+  process.stdout.write(
+    `${state.count} hand-rolled \`gh issue/pr view\`-style calls since the ` +
+      "last `scripts/epic-status.sh` run (issue #613). If you're " +
+      "tracking an epic, run epic-status.sh instead of continuing to " +
+      "poll by hand.",
+  );
+  writeState({ ...state, lastNudgedAt: state.count });
 }
 
 const mode = process.argv[2];

@@ -28,7 +28,7 @@
           {
             "type": "command",
             "command": "node \"${CLAUDE_PROJECT_DIR:-.}/.claude/guards/epic-status-nudge.mjs\" track",
-            "timeout": 5000
+            "timeout": 5
           }
         ]
       }
@@ -39,7 +39,7 @@
           {
             "type": "command",
             "command": "node \"${CLAUDE_PROJECT_DIR:-.}/.claude/guards/epic-status-nudge.mjs\" nudge",
-            "timeout": 5000
+            "timeout": 5
           }
         ]
       }
