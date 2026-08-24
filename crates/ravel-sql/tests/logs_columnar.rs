@@ -346,6 +346,8 @@ struct ScanRun {
     batches: Vec<RecordBatch>,
     columnar_batches: usize,
     rowpath_batches: usize,
+    pages_decoded: usize,
+    pages_skipped: usize,
 }
 
 /// Execute a `LogsScanExec` directly over `segments` with the given projection,
@@ -396,6 +398,8 @@ async fn run_scan(
     ScanRun {
         columnar_batches: count("columnar_batches"),
         rowpath_batches: count("rowpath_batches"),
+        pages_decoded: count("pages_decoded"),
+        pages_skipped: count("pages_skipped"),
         batches,
     }
 }
@@ -954,8 +958,8 @@ async fn a_later_block_with_attrs_raw_falls_back_without_losing_or_repeating_row
 
     let projection = vec![0usize, FIRST_DECLARED_COL];
     let run = run_scan(
-        store,
-        vec![seg],
+        Arc::clone(&store),
+        vec![seg.clone()],
         declared.clone(),
         Some(projection.clone()),
         Vec::new(),
@@ -986,6 +990,49 @@ async fn a_later_block_with_attrs_raw_falls_back_without_losing_or_repeating_row
         got, want,
         "every row exactly once across the columnar/row switch, spilled values \
          included"
+    );
+
+    // Issue #474: pages_decoded/pages_skipped must count the abandoned
+    // columnar cursor's partial decode of this same segment, not just the
+    // re-opened row scan's own pass. A row-path-only run of the identical
+    // segment (forced ineligible via a non-matching erasure predicate, same
+    // pattern the eligibility tests above use) decodes every block exactly
+    // once and is the true single-pass floor; the fallback run does strictly
+    // more decode work (block 0's abandoned columnar pass, plus whatever of
+    // block 1 the columnar cursor decoded before detecting the overflow
+    // page), so its published pages_decoded must be strictly greater, not
+    // equal to the floor.
+    let baseline = run_scan(
+        store,
+        vec![seg],
+        declared.clone(),
+        Some(projection.clone()),
+        Vec::new(),
+        no_match_erasure(),
+    )
+    .await;
+    assert_eq!(
+        baseline.columnar_batches, 0,
+        "the forced baseline must take the row path only"
+    );
+    assert!(
+        run.pages_decoded > baseline.pages_decoded,
+        "the fallback run's pages_decoded ({}) must exceed the single-pass \
+         row-only baseline ({}): the abandoned columnar cursor's decode work \
+         must be counted, not dropped",
+        run.pages_decoded,
+        baseline.pages_decoded
+    );
+    // The projection excludes `filler` (the dynamic column that won the one
+    // available slot), so block 0's clean columnar pass skips its page; the
+    // abandoned pass's skip count is subject to the same drop this fix
+    // addresses.
+    assert!(
+        run.pages_skipped > baseline.pages_skipped,
+        "the fallback run's pages_skipped ({}) must exceed the single-pass \
+         row-only baseline ({}) for the same reason",
+        run.pages_skipped,
+        baseline.pages_skipped
     );
 }
 
@@ -1240,10 +1287,22 @@ async fn block_striping_is_row_identical_to_single_partition() {
         baseline.blocks_total, under.blocks_total,
         "blocks_total stays stable under heavy striping"
     );
-    // Every surviving block is decoded exactly once across all partitions.
-    assert_eq!(
-        baseline.blocks_scanned, under.blocks_scanned,
-        "each surviving block is decoded exactly once whatever the partitioning"
+    // NOT partition-count-invariant once an attrs_raw fallback is involved
+    // (issue #474): each partition that independently hits a spilled block
+    // within its own owned subset abandons its own columnar cursor and
+    // re-decodes its own blocks from the start, so finer striping can create
+    // MORE independent fallback points than a single partition ever would,
+    // each paying its own one-time double-decode. `blocks_scanned` now
+    // counts that work honestly (record_scan publishes the abandoned
+    // cursor's stats before it is dropped), so `under`, striped far finer
+    // than `baseline`, can only ever report as much or more real decode
+    // work, never less.
+    assert!(
+        under.blocks_scanned >= baseline.blocks_scanned,
+        "finer striping can only add fallback-driven re-decode work, never \
+         remove it: under={} baseline={}",
+        under.blocks_scanned,
+        baseline.blocks_scanned
     );
 }
 
