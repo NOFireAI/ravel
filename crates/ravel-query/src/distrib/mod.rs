@@ -165,7 +165,7 @@ impl Distributed {
 
         let encoded_matchers = codec::encode_matchers(matchers);
         let encoded_erasure = codec::encode_erasure(erasure);
-        let budgets = encode_budgets(config);
+        let budgets = encode_budgets(config, slices.len());
         let tenant_bytes = tenant_hash.0.to_vec();
         let signal_disc = codec::signal_to_u32(signal);
         // One query id for the whole query (ADR-0071 amendment, decision 2): the
@@ -459,7 +459,7 @@ impl Distributed {
 
         let encoded_matchers = codec::encode_matchers(matchers);
         let encoded_erasure = codec::encode_erasure(erasure);
-        let budgets = encode_budgets(config);
+        let budgets = encode_budgets(config, slices.len());
         let tenant_bytes = tenant_hash.0.to_vec();
         let signal_disc = codec::signal_to_u32(signal);
         let query_id = query_id_bytes(&tenant_bytes, signal_disc, deadline_unix_ns, snapshot);
@@ -615,7 +615,7 @@ impl Distributed {
 
         let encoded_matchers = codec::encode_matchers(matchers);
         let encoded_erasure = codec::encode_erasure(erasure);
-        let budgets = encode_budgets(config);
+        let budgets = encode_budgets(config, slices.len());
         let tenant_bytes = tenant_hash.0.to_vec();
         let signal_disc = codec::signal_to_u32(signal);
         let query_id = query_id_bytes(&tenant_bytes, signal_disc, deadline_unix_ns, snapshot);
@@ -1018,15 +1018,36 @@ pub(crate) fn span_order_key(row: &SpanRow) -> SpanOrderKey {
     )
 }
 
-/// Maps a per-slice `Budgets` share from the engine config. `Unlimited` bytes
-/// map to `0`, the wire's "no cap" sentinel (a real query never scans zero
-/// bytes, so the value is unambiguous).
-fn encode_budgets(config: &EngineConfig) -> pb::Budgets {
+/// Maps a per-slice `Budgets` share from the engine config. `Unlimited`
+/// bytes map to `0`, the wire's "no cap" sentinel (a real query never scans
+/// zero bytes, so the value is unambiguous).
+///
+/// `max_bytes_scanned` is divided evenly across `slice_count` (issue #588):
+/// every slice used to carry the tenant's FULL byte budget verbatim, so a
+/// `max_parallel_slices`-wide fan-out (default 8) could authorize, fetch,
+/// and pay for up to 8x the configured budget before the coordinator's
+/// post-merge re-check observed anything -- final accounting and the
+/// refused outcome were correct, but the overspend already happened. Each
+/// local distrib call site passes the ACTUAL slice count `partition_snapshot`
+/// produced, not the configured cap, so the per-slice shares still sum to
+/// exactly the tenant's budget (up to floor-division slack) even when fewer
+/// slices are dispatched than `max_parallel_slices` allows. Federation's
+/// call site passes `1`: each remote cluster resolves its own snapshot and
+/// enforces its own admission independently (ADR-0071), so its request
+/// carries the tenant's whole budget by design, not a fraction of this
+/// coordinator's local fan-out.
+///
+/// `max_series`/`max_samples`/`max_segments` stay unscoped: those are
+/// count-based caps already re-checked per slice as results return
+/// (`QueryError::TooManySeries` etc.), unlike bytes, which was only
+/// re-checked after every slice's work had already been paid for. Dividing
+/// them too would only tighten an already-sound cap for no reason.
+fn encode_budgets(config: &EngineConfig, slice_count: usize) -> pb::Budgets {
     pb::Budgets {
         max_series: config.max_series as u64,
         max_samples: config.max_samples as u64,
         max_bytes_scanned: match config.max_bytes_scanned {
-            ByteLimit::Bounded(n) => n,
+            ByteLimit::Bounded(n) => n / (slice_count.max(1) as u64),
             ByteLimit::Unlimited => 0,
         },
         max_segments: config.max_segments as u64,
