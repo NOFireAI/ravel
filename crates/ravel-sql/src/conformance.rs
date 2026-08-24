@@ -892,6 +892,20 @@ three-state scheme below is the resolution: enumerate the claimed surface, score
 over the part with a deliberate verified position, and keep any unresolved
 construct visible as an actionable miss.
 
+## The `samples` table
+
+The `samples` table exposes exactly four columns -- `ts`, `value`, `series_id`,
+and `labels` -- where `value` is a single `Float64`
+(`crates/ravel-sql/src/schema.rs`, `public_fields`). It has no column that can
+represent a native histogram. Native-histogram samples are excluded from the
+`samples` table entirely: a histogram sample carries no scalar float `value`,
+so it is never materialized as a row and no query can observe it. `SELECT
+count(*) FROM samples`, and every other count or aggregation over the table,
+therefore undercount on tenants that ingest histograms -- the histogram samples
+are silently absent, not present with a zero or null `value` (#581). This is a
+property of the table shape, not of any construct in the conformance table
+below, so it holds for every row that reads `samples`.
+
 ## The three states
 
 1. **Supported and covered** -- implemented, with a passing test proving it.
