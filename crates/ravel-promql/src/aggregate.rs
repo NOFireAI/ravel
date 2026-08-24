@@ -419,6 +419,14 @@ fn eval_quantile(
     if !(0.0..=1.0).contains(&q) {
         ctx.warn(invalid_quantile_warning(q));
     }
+    // `quantile` has no defined native-histogram semantics in Prometheus
+    // (ADR-0108 decision 2): histogram elements are dropped, never treated as
+    // their meaningless `0.0` placeholder float. Filtering here keeps any float
+    // members of the same group and omits a group that held only histograms.
+    let input: InstantVector = input
+        .into_iter()
+        .filter(|s| s.histogram.is_none())
+        .collect();
     group_by(modifier, input, |s| s.value)
         .into_iter()
         .map(|(labels, values)| InstantSample {
@@ -537,6 +545,15 @@ fn eval_topk_bottomk(
         return Vec::new();
     }
     let k = k_raw as usize;
+
+    // `topk`/`bottomk` have no defined native-histogram semantics in Prometheus
+    // (ADR-0108 decision 2): a histogram element is dropped rather than ranked
+    // by its meaningless `0.0` placeholder float. Float members of the same
+    // group are kept and ranked as usual.
+    let input: InstantVector = input
+        .into_iter()
+        .filter(|s| s.histogram.is_none())
+        .collect();
 
     let mut out = Vec::new();
     for (_labels, members) in group_by(modifier, input, |s| s) {

@@ -152,6 +152,114 @@ pub type RangeMatrix = Vec<(LabelSet, Vec<Sample>)>;
 /// result rendering yet.
 pub(crate) type HistogramMatrix = Vec<(LabelSet, Vec<crate::histogram::TimedHistogram>)>;
 
+/// One evaluated step of a histogram-aware range series: a float or a native
+/// histogram, the range counterpart of [`InstantSample`]'s `value`/`histogram`
+/// pair carrying only the reported timestamp (a range result never needs
+/// `orig_sample_ts_ns`). When `histogram` is `Some`, `value` is a meaningless
+/// `0.0` placeholder exactly as on [`InstantSample`], and histogram-aware
+/// consumers read `histogram` instead.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RangeSample {
+    pub ts_ns: i64,
+    pub value: f64,
+    pub histogram: Option<crate::histogram::FloatHistogram>,
+}
+
+impl RangeSample {
+    /// A plain float element (`histogram: None`).
+    pub(crate) fn scalar(ts_ns: i64, value: f64) -> Self {
+        RangeSample {
+            ts_ns,
+            value,
+            histogram: None,
+        }
+    }
+
+    /// A native-histogram element, with a placeholder `value` of `0.0`.
+    pub(crate) fn histogram(ts_ns: i64, histogram: crate::histogram::FloatHistogram) -> Self {
+        RangeSample {
+            ts_ns,
+            value: 0.0,
+            histogram: Some(histogram),
+        }
+    }
+}
+
+/// A histogram-aware range matrix: one entry per matched series, each with one
+/// [`RangeSample`] per evaluated step at which the series had a value. The
+/// native-histogram-carrying counterpart of [`RangeMatrix`]. This is the
+/// internal channel range evaluation fills end to end (ADR-0108 decision 1);
+/// [`Value::Matrix`] and [`Evaluator::eval_range_annotated`] stay float-only
+/// (histogram elements are dropped, never rendered as `0.0`) until T3 (#579)
+/// teaches the HTTP layer to render the histogram elements
+/// [`Evaluator::eval_range_hist_annotated`] exposes.
+pub type HistogramAwareMatrix = Vec<(LabelSet, Vec<RangeSample>)>;
+
+/// A histogram-aware range value: the range counterpart of [`Value`] whose
+/// matrix carries per-step native-histogram elements alongside floats.
+/// Returned by [`Evaluator::eval_range_hist_annotated`]; scalar/string
+/// top-level results are constant across the grid and carried unchanged.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RangeValue {
+    Scalar(f64),
+    String(String),
+    Matrix(HistogramAwareMatrix),
+}
+
+impl RangeValue {
+    /// Project down to the float-only [`Value`] the current HTTP renderer
+    /// consumes: histogram elements are dropped (never emitted as a `0.0`
+    /// float, the silent-zeros defect ADR-0108 forbids), and a series left
+    /// with no float element is omitted.
+    pub(crate) fn into_value(self) -> Value {
+        match self {
+            RangeValue::Scalar(v) => Value::Scalar(v),
+            RangeValue::String(s) => Value::String(s),
+            RangeValue::Matrix(m) => Value::Matrix(hist_matrix_into_float(m)),
+        }
+    }
+}
+
+/// Wrap a float-only [`RangeMatrix`] into the histogram-aware form (every
+/// element a float, `histogram: None`). Used by range paths that produce only
+/// floats (top-level function calls) so their output joins the same channel as
+/// the selector and grid paths.
+pub(crate) fn float_matrix_into_hist(m: RangeMatrix) -> HistogramAwareMatrix {
+    m.into_iter()
+        .map(|(labels, samples)| {
+            let samples = samples
+                .into_iter()
+                .map(|s| RangeSample::scalar(s.ts_ns, s.value))
+                .collect();
+            (labels, samples)
+        })
+        .collect()
+}
+
+/// Project a [`HistogramAwareMatrix`] down to the float-only [`RangeMatrix`]
+/// [`Value::Matrix`] carries: histogram elements are dropped rather than
+/// rendered as a `0.0` float (ADR-0108's forbidden silent zeros), and a series
+/// left with no float element is omitted entirely.
+pub(crate) fn hist_matrix_into_float(m: HistogramAwareMatrix) -> RangeMatrix {
+    m.into_iter()
+        .filter_map(|(labels, samples)| {
+            let floats: Vec<Sample> = samples
+                .into_iter()
+                .filter(|s| s.histogram.is_none())
+                .map(|s| Sample {
+                    ts_ns: s.ts_ns,
+                    value: s.value,
+                })
+                .collect();
+            if floats.is_empty() {
+                None
+            } else {
+                Some((labels, floats))
+            }
+        })
+        .collect()
+}
+
 /// A typed evaluation result. Internal to `ravel-promql`: AST types from
 /// promql-parser still do not leak from the crate (ADR-0007 consequence).
 #[derive(Debug, Clone, PartialEq)]
@@ -659,6 +767,25 @@ impl Evaluator {
         end_ms: i64,
         step_ms: i64,
     ) -> Result<(Value, Annotations), Error> {
+        let (value, annotations) =
+            self.eval_range_hist_annotated(source, query, start_ms, end_ms, step_ms)?;
+        Ok((value.into_value(), annotations))
+    }
+
+    /// The histogram-aware form of [`Self::eval_range_annotated`]: identical
+    /// evaluation, but the matrix result is a [`HistogramAwareMatrix`] carrying
+    /// per-step native-histogram elements alongside floats (ADR-0108). This is
+    /// the seam T3 (#579) renders over HTTP; [`Self::eval_range_annotated`] is
+    /// the thin wrapper that projects histogram elements away for the current
+    /// float-only renderer (via [`RangeValue::into_value`]).
+    pub fn eval_range_hist_annotated(
+        &self,
+        source: &dyn SeriesSource,
+        query: &str,
+        start_ms: i64,
+        end_ms: i64,
+        step_ms: i64,
+    ) -> Result<(RangeValue, Annotations), Error> {
         if step_ms <= 0 {
             return Err(Error::NonPositiveStep { step_ms });
         }
@@ -703,13 +830,13 @@ impl Evaluator {
         // cursoring (ADR-0021 §1) becomes necessary; it is not needed yet.
         let (core, negate) = resolve_range_core(&expr)?;
         let value = match core {
-            RangeCore::Scalar(v) => Value::Scalar(if negate { -v } else { v }),
-            RangeCore::Str(s) => Value::String(s.to_string()),
+            RangeCore::Scalar(v) => RangeValue::Scalar(if negate { -v } else { v }),
+            RangeCore::Str(s) => RangeValue::String(s.to_string()),
             RangeCore::Selector(vs) => {
                 let matrix = self.eval_range_selector(
                     source, vs, start_ns, end_ns, step_ns, points, &ctx, negate,
                 )?;
-                Value::Matrix(matrix)
+                RangeValue::Matrix(matrix)
             }
             RangeCore::Call(call) => {
                 let matrix = crate::functions::eval_range_call(
@@ -720,7 +847,7 @@ impl Evaluator {
                 } else {
                     matrix
                 };
-                Value::Matrix(matrix)
+                RangeValue::Matrix(float_matrix_into_hist(matrix))
             }
             RangeCore::Generic(e) => {
                 let matrix =
@@ -728,7 +855,7 @@ impl Evaluator {
                         ctx.check_deadline()?;
                         self.eval_expr(source, e, t, &ctx)
                     })?;
-                Value::Matrix(matrix)
+                RangeValue::Matrix(matrix)
             }
         };
         Ok((value, ctx.annotations.into_inner()))
@@ -956,21 +1083,21 @@ impl Evaluator {
         }
         ctx.charge_budget(points, self.max_total_eval_points)?;
 
-        crate::functions::eval_instant_over_grid(start_ns, end_ns, step_ns, |t| {
+        let matrix = crate::functions::eval_instant_over_grid(start_ns, end_ns, step_ns, |t| {
             ctx.check_deadline()?;
             let value = self.eval_expr(source, &sq.expr, t, ctx)?;
             // Native-histogram series inside a subquery window are not yet
-            // supported. The subquery grid reducer (`eval_instant_over_grid`)
-            // keeps only the float value of each instant sample, so any
-            // histogram element the inner expression produces would be
-            // silently dropped and the subquery would return a wrong (empty)
-            // answer for that series. Detect the actual presence of matched
-            // histogram data and reject it as a typed `Error::Unsupported`
-            // (HTTP 422) instead. The trigger is real histogram data in the
-            // fetched window, not the subquery's syntactic shape: a float-only
-            // subquery (including `rate(x[5m:1m])` over float series) sees no
-            // histogram element here and keeps working exactly as before.
-            // Full histogram subquery support is not yet implemented.
+            // supported. The subquery grid reducer keeps only the float value
+            // of each instant sample below (`hist_matrix_into_float`), so any
+            // histogram element the inner expression produces would be silently
+            // dropped and the subquery would return a wrong (empty) answer for
+            // that series. Detect the actual presence of matched histogram data
+            // and reject it as a typed `Error::Unsupported` (HTTP 422) instead.
+            // The trigger is real histogram data in the fetched window, not the
+            // subquery's syntactic shape: a float-only subquery (including
+            // `rate(x[5m:1m])` over float series) sees no histogram element here
+            // and keeps working exactly as before. Full histogram subquery
+            // support is not yet implemented.
             if let Value::Vector(ref v) = value
                 && v.iter().any(|s| s.histogram.is_some())
             {
@@ -979,7 +1106,8 @@ impl Evaluator {
                 });
             }
             Ok(value)
-        })
+        })?;
+        Ok(hist_matrix_into_float(matrix))
     }
 
     /// The native-histogram counterpart of [`Self::eval_matrix_selector`] at
@@ -1026,6 +1154,15 @@ impl Evaluator {
     /// the whole grid, generalized to
     /// support `@` (which, when present, pins every step to the same
     /// instant rather than shifting with `t`).
+    ///
+    /// A native-histogram series matching the same selector is served from a
+    /// single `source.query_histograms` call over the same combined window
+    /// (ADR-0108 decision 3, fetch-boundedness): the read is issued once per
+    /// query window, never per grid step, so a bare histogram selector
+    /// produces a matrix of histogram elements instead of vanishing. Per step
+    /// the histogram is chosen with the same left-open `pick_histogram`
+    /// lookback rule the instant selector uses. A series is either float or
+    /// histogram in storage, so the two never collide.
     #[allow(clippy::too_many_arguments)]
     fn eval_range_selector(
         &self,
@@ -1037,7 +1174,7 @@ impl Evaluator {
         points: u64,
         ctx: &QueryWindow,
         negate: bool,
-    ) -> Result<RangeMatrix, Error> {
+    ) -> Result<HistogramAwareMatrix, Error> {
         let selector_matchers = build_matchers(vs)?;
         let offset_ns = signed_offset_ns(vs.offset.as_ref())?;
         let at_ts_ns = resolve_at(vs.at.as_ref(), ctx.start_ns, ctx.end_ns)?;
@@ -1074,10 +1211,41 @@ impl Evaluator {
                 if let Some((value, _orig_sample_ts_ns)) =
                     pick_sample(&s.samples, *sel_ts, self.lookback_delta_ns)
                 {
-                    samples.push(Sample {
-                        ts_ns: *reported_ts,
-                        value: if negate { -value } else { value },
-                    });
+                    samples.push(RangeSample::scalar(
+                        *reported_ts,
+                        if negate { -value } else { value },
+                    ));
+                }
+            }
+            if !samples.is_empty() {
+                let labels = if negate {
+                    drop_metric_name(s.labels)
+                } else {
+                    s.labels
+                };
+                out.push((labels, samples));
+            }
+        }
+
+        // Histogram series matching the same selector, one window fetch shared
+        // across every grid step.
+        let hist_series = source.query_histograms(&selector_matchers, window)?;
+        for s in hist_series {
+            let mut samples = Vec::new();
+            for (reported_ts, sel_ts) in &grid {
+                if let Some((histogram, _orig_sample_ts_ns)) =
+                    pick_histogram(&s.samples, *sel_ts, self.lookback_delta_ns)
+                {
+                    // Unary minus over a native-histogram element multiplies
+                    // every population by -1 (matching `negate_vector`).
+                    let histogram = if negate {
+                        let mut h = histogram;
+                        h.mul(-1.0);
+                        h
+                    } else {
+                        histogram
+                    };
+                    samples.push(RangeSample::histogram(*reported_ts, histogram));
                 }
             }
             if !samples.is_empty() {
@@ -2444,6 +2612,48 @@ mod tests {
             construct.contains("subquery over native histograms"),
             "construct {construct:?} should name the histogram-subquery construct for {query:?}"
         );
+    }
+
+    #[test]
+    fn range_selector_serves_native_histogram_elements() {
+        // A bare native-histogram range selector must produce a matrix of
+        // histogram elements, not vanish. Before the fix `eval_range_selector`
+        // issued `source.query` only (no `query_histograms` pass), so a
+        // histogram-only selector returned an empty matrix; the flipped
+        // assertion is `matrix.len() == 1`.
+        let source = TestSource::new()
+            .with_histogram_series(
+                &[("__name__", "h")],
+                &[(0, nh(2.0, 10.0)), (minutes(5) * 1_000_000, nh(4.0, 20.0))],
+            )
+            .expect("valid histogram series");
+        let (value, _annotations) = Evaluator::new()
+            .eval_range_hist_annotated(&source, "h", 0, minutes(5), minutes(1))
+            .expect("range evaluates");
+        let RangeValue::Matrix(matrix) = value else {
+            panic!("bare selector must be a matrix");
+        };
+        assert_eq!(matrix.len(), 1, "one histogram series");
+        let (_labels, samples) = &matrix[0];
+        // Grid steps at 0..=5 minutes: the t=0 sample is picked through 4m
+        // (inside the default 5m lookback), the 5m sample at 5m, so every step
+        // has a histogram element.
+        assert_eq!(samples.len(), 6, "one element per grid step");
+        for s in samples {
+            assert!(
+                s.histogram.is_some(),
+                "every element is a histogram, never a 0.0 float"
+            );
+        }
+        let first = samples[0].histogram.as_ref().expect("histogram element");
+        assert_eq!(first.count.to_bits(), 2.0_f64.to_bits());
+        assert_eq!(first.sum.to_bits(), 10.0_f64.to_bits());
+        let last = samples
+            .last()
+            .and_then(|s| s.histogram.as_ref())
+            .expect("histogram element");
+        assert_eq!(last.count.to_bits(), 4.0_f64.to_bits());
+        assert_eq!(last.sum.to_bits(), 20.0_f64.to_bits());
     }
 
     #[test]

@@ -22,9 +22,9 @@ mod transform;
 use ravel_types::{LabelSet, Sample};
 
 use crate::eval::{
-    Error, Evaluator, InstantSample, InstantVector, QueryWindow, RangeMatrix, Value,
-    drop_metric_name, duration_to_ns, invalid_quantile_warning, possible_non_counter_info,
-    resolve_eval_ts, selector_eval_ts,
+    Error, Evaluator, HistogramAwareMatrix, InstantSample, InstantVector, QueryWindow, RangeMatrix,
+    RangeSample, Value, drop_metric_name, duration_to_ns, hist_matrix_into_float,
+    invalid_quantile_warning, possible_non_counter_info, resolve_eval_ts, selector_eval_ts,
 };
 use crate::histogram::{FloatHistogram, TimedHistogram};
 use crate::source::SeriesSource;
@@ -455,12 +455,16 @@ pub(crate) fn eval_range_call(
         // at a range-query top level, matching what it already did nested in
         // an arithmetic identity.
         FunctionKind::HistogramQuantile(f) => {
+            // Quantile/fraction results are float-valued, so the grid produces
+            // only float elements; project down to the float matrix this range
+            // call returns.
             eval_instant_over_grid(start_ns, end_ns, step_ns, |t| {
                 ctx.check_deadline()?;
                 let phi = scalar_arg(evaluator, source, &call.args.args[0], t, ctx)?;
                 let vector = vector_arg(evaluator, source, &call.args.args[1], t, ctx)?;
                 Ok(Value::Vector(to_instant_vector(f(phi, vector, ctx), t)))
             })
+            .map(hist_matrix_into_float)
         }
         FunctionKind::HistogramFraction(f) => {
             eval_instant_over_grid(start_ns, end_ns, step_ns, |t| {
@@ -473,6 +477,7 @@ pub(crate) fn eval_range_call(
                     t,
                 )))
             })
+            .map(hist_matrix_into_float)
         }
         FunctionKind::ScalarRangeVector(f) => {
             let scalar_expr = &call.args.args[0];
@@ -531,15 +536,24 @@ pub(crate) fn eval_range_call(
                 evaluator, source, arg, start_ns, end_ns, step_ns, ctx,
             )
         }
+        // A top-level `VectorMap`/`Instant` function call is a float-only range
+        // result today: any histogram element the per-step evaluation carries
+        // is projected away rather than rendered as a `0.0` float (the grid
+        // path that preserves histograms is `RangeCore::Generic`, top-level
+        // aggregates and binary expressions, handled in `eval.rs`). Histogram
+        // semantics for these function families are ADR-0108 decisions 4/5,
+        // out of this task's scope.
         FunctionKind::VectorMap(f) => eval_instant_over_grid(start_ns, end_ns, step_ns, |t| {
             ctx.check_deadline()?;
             let v = vector_arg(evaluator, source, &call.args.args[0], t, ctx)?;
             Ok(Value::Vector(f(v)))
-        }),
+        })
+        .map(hist_matrix_into_float),
         FunctionKind::Instant(f) => eval_instant_over_grid(start_ns, end_ns, step_ns, |t| {
             ctx.check_deadline()?;
             f(evaluator, source, call, t, ctx)
-        }),
+        })
+        .map(hist_matrix_into_float),
     }
 }
 
@@ -560,33 +574,36 @@ pub(crate) fn eval_instant_over_grid(
     end_ns: i64,
     step_ns: i64,
     mut step_fn: impl FnMut(i64) -> Result<Value, Error>,
-) -> Result<RangeMatrix, Error> {
-    let mut series: Vec<(LabelSet, Vec<Sample>)> = Vec::new();
+) -> Result<HistogramAwareMatrix, Error> {
+    let mut series: Vec<(LabelSet, Vec<RangeSample>)> = Vec::new();
     let mut t = start_ns;
     while t <= end_ns {
         match step_fn(t)? {
             Value::Vector(v) => {
                 for s in v {
+                    // Preserve the element type per step: a histogram element
+                    // is materialized as a histogram range element, not
+                    // collapsed to its meaningless `0.0` placeholder float
+                    // (ADR-0108 decision 2, the silent-zeros fix). This keeps
+                    // the grid path (top-level aggregates and binary
+                    // expressions) faithful to the instant path it re-runs at
+                    // each step.
+                    let element = match s.histogram {
+                        Some(h) => RangeSample::histogram(t, h),
+                        None => RangeSample::scalar(t, s.value),
+                    };
                     match series.iter_mut().find(|(labels, _)| *labels == s.labels) {
-                        Some((_, samples)) => samples.push(Sample {
-                            ts_ns: t,
-                            value: s.value,
-                        }),
-                        None => series.push((
-                            s.labels,
-                            vec![Sample {
-                                ts_ns: t,
-                                value: s.value,
-                            }],
-                        )),
+                        Some((_, samples)) => samples.push(element),
+                        None => series.push((s.labels, vec![element])),
                     }
                 }
             }
             Value::Scalar(x) => {
                 let labels = LabelSet::default();
+                let element = RangeSample::scalar(t, x);
                 match series.iter_mut().find(|(l, _)| *l == labels) {
-                    Some((_, samples)) => samples.push(Sample { ts_ns: t, value: x }),
-                    None => series.push((labels, vec![Sample { ts_ns: t, value: x }])),
+                    Some((_, samples)) => samples.push(element),
+                    None => series.push((labels, vec![element])),
                 }
             }
             other => {
@@ -1497,5 +1514,149 @@ mod tests {
             samples[1].value.is_finite(),
             "second step: tm=5.0 is now in lookback, predict_linear must use this step's own duration"
         );
+    }
+
+    /// A simple scale-0 native histogram carrying `count`/`sum`, one positive
+    /// bucket, for the range-grid aggregation tests below.
+    fn nh(count: f64, sum: f64) -> FloatHistogram {
+        FloatHistogram {
+            counter_reset_hint: ResetHint::Unknown,
+            scale: 0,
+            zero_threshold: 0.0,
+            zero_count: 0.0,
+            count,
+            sum,
+            positive_spans: vec![Span {
+                offset: 1,
+                length: 1,
+            }],
+            negative_spans: Vec::new(),
+            positive_buckets: vec![count],
+            negative_buckets: Vec::new(),
+            custom_values: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn range_grid_keeps_histogram_elements_from_top_level_sum() {
+        // A top-level `sum` over native-histogram series is a `RangeCore::Generic`
+        // grid path. Before the fix `eval_instant_over_grid` collapsed each
+        // `InstantSample` into `Sample { ts_ns, value }`, discarding the
+        // histogram and emitting the meaningless `0.0` placeholder; the flipped
+        // assertion is `samples[0].histogram.is_some()` (it was `None`, value
+        // `0.0`, pre-fix).
+        let source = TestSource::new()
+            .with_histogram_series(&[("__name__", "h"), ("i", "1")], &[(0, nh(2.0, 10.0))])
+            .expect("valid histogram series")
+            .with_histogram_series(&[("__name__", "h"), ("i", "2")], &[(0, nh(2.0, 10.0))])
+            .expect("valid histogram series");
+        let (value, _annotations) = Evaluator::new()
+            .eval_range_hist_annotated(&source, "sum(h)", 0, 60_000, 60_000)
+            .expect("range evaluates");
+        let crate::eval::RangeValue::Matrix(matrix) = value else {
+            panic!("sum over histograms must be a matrix");
+        };
+        assert_eq!(matrix.len(), 1, "one aggregated group");
+        let samples = &matrix[0].1;
+        assert!(!samples.is_empty(), "at least one grid step");
+        for s in samples {
+            let h = s
+                .histogram
+                .as_ref()
+                .expect("sum over histograms yields a histogram element, not a 0.0 float");
+            assert_eq!(h.count.to_bits(), 4.0_f64.to_bits(), "2 + 2 populations");
+            assert_eq!(h.sum.to_bits(), 20.0_f64.to_bits(), "10 + 10 sums");
+        }
+    }
+
+    #[test]
+    fn range_grid_count_yields_floats_for_histogram_inputs() {
+        // `count` over histogram inputs is a float, per the ADR-0108 per-operator
+        // table. The float value (2) was already correct pre-fix; what the new
+        // histogram-aware channel makes assertable is that this element is a
+        // float element (`histogram: None`), never routed through histogram
+        // aggregation. The flipped line is `samples[0].histogram.is_none()`
+        // alongside the value: it is only observable through
+        // `eval_range_hist_annotated`, which did not exist pre-fix.
+        let source = TestSource::new()
+            .with_histogram_series(&[("__name__", "h"), ("i", "1")], &[(0, nh(2.0, 10.0))])
+            .expect("valid histogram series")
+            .with_histogram_series(&[("__name__", "h"), ("i", "2")], &[(0, nh(3.0, 12.0))])
+            .expect("valid histogram series");
+        let (value, _annotations) = Evaluator::new()
+            .eval_range_hist_annotated(&source, "count(h)", 0, 60_000, 60_000)
+            .expect("range evaluates");
+        let crate::eval::RangeValue::Matrix(matrix) = value else {
+            panic!("count over histograms must be a matrix");
+        };
+        assert_eq!(matrix.len(), 1, "one group");
+        let samples = &matrix[0].1;
+        assert!(!samples.is_empty(), "at least one grid step");
+        for s in samples {
+            assert!(
+                s.histogram.is_none(),
+                "count is a float element, never a histogram"
+            );
+            assert_eq!(
+                s.value.to_bits(),
+                2.0_f64.to_bits(),
+                "two histogram members"
+            );
+        }
+    }
+
+    #[test]
+    fn range_grid_undefined_aggregations_drop_histogram_inputs() {
+        // `quantile` has no defined native-histogram semantics: Prometheus drops
+        // histogram elements. Before the fix `eval_quantile` grouped on the
+        // meaningless `0.0` placeholder float of each histogram element, so a
+        // histogram-only group produced a bogus `0.0` float series; the flipped
+        // assertion is `matrix.is_empty()` (it had one `0.0`-valued series
+        // pre-fix).
+        let source = TestSource::new()
+            .with_histogram_series(&[("__name__", "h"), ("i", "1")], &[(0, nh(2.0, 10.0))])
+            .expect("valid histogram series")
+            .with_histogram_series(&[("__name__", "h"), ("i", "2")], &[(0, nh(3.0, 12.0))])
+            .expect("valid histogram series");
+        let (value, _annotations) = Evaluator::new()
+            .eval_range_hist_annotated(&source, "quantile(0.5, h)", 0, 60_000, 60_000)
+            .expect("range evaluates");
+        let crate::eval::RangeValue::Matrix(matrix) = value else {
+            panic!("quantile must be a matrix");
+        };
+        assert!(
+            matrix.is_empty(),
+            "a histogram-only quantile group is dropped, not emitted as a 0.0 float: {matrix:?}"
+        );
+    }
+
+    #[test]
+    fn grouping_by_preserves_histogram_element_type() {
+        // `sum by (i)` over histogram series keeps each group's element a
+        // histogram end to end (through both grid materialization and the
+        // grouping rebuild). Before the fix the grid dropped the histogram
+        // field, so every group's element was a `0.0` float; the flipped
+        // assertion is `samples[0].histogram.is_some()` for each group.
+        let source = TestSource::new()
+            .with_histogram_series(&[("__name__", "h"), ("i", "1")], &[(0, nh(2.0, 10.0))])
+            .expect("valid histogram series")
+            .with_histogram_series(&[("__name__", "h"), ("i", "2")], &[(0, nh(5.0, 25.0))])
+            .expect("valid histogram series");
+        let (value, _annotations) = Evaluator::new()
+            .eval_range_hist_annotated(&source, "sum by (i) (h)", 0, 60_000, 60_000)
+            .expect("range evaluates");
+        let crate::eval::RangeValue::Matrix(matrix) = value else {
+            panic!("grouped sum must be a matrix");
+        };
+        assert_eq!(matrix.len(), 2, "one group per distinct i label");
+        for (labels, samples) in &matrix {
+            assert!(!samples.is_empty(), "each group has at least one grid step");
+            for s in samples {
+                assert!(
+                    s.histogram.is_some(),
+                    "group {labels:?} preserves its histogram element type"
+                );
+            }
+        }
     }
 }

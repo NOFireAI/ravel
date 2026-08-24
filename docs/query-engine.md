@@ -321,6 +321,27 @@ data, not the syntactic shape: a float-only subquery, including
 `rate(x[5m:1m])` over float series, is unaffected. Real histogram subquery
 support is future work.
 
+Range evaluation carries native-histogram elements end to end inside the
+evaluator (ADR-0108, issue #577). The internal range result is a
+histogram-aware matrix (`RangeSample`, a per-step float-or-histogram element
+mirroring the instant `InstantSample`), filled by three paths: a bare
+histogram selector fetches its series once per query window via
+`query_histograms` and picks a histogram per grid step under the same
+left-open lookback rule the instant selector uses; the grid path
+(`RangeCore::Generic`, top-level aggregates and binary expressions)
+materializes each step's histogram element instead of collapsing it to a
+`0.0` placeholder float, so range output stays faithful to the instant path
+per step. Per-operator aggregation follows Prometheus 3.x: `sum`/`avg` over
+histogram elements produce histogram elements, `count` a float, and the
+operators Prometheus leaves undefined for histograms (`min`, `max`,
+`stddev`, `stdvar`, `quantile`, `topk`, `bottomk`) drop the histogram
+elements. `by`/`without` grouping preserves element type. The
+histogram-aware result is exposed by `Evaluator::eval_range_hist_annotated`;
+`Evaluator::eval_range_annotated` (and the current HTTP renderer) still
+project histogram elements away rather than render them as `0.0` floats, so
+the standard `histograms` field on range responses is future work (issue
+#579).
+
 The max-samples budget is **count-yielded**: samples are counted as the
 lazy k-way merge emits them (post-dedup), and the budget trips at exactly
 `max + 1`. It does not count a fully materialized per-timestamp window
