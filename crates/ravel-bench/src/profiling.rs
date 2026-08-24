@@ -34,6 +34,47 @@
 //! worse than the real latencies. Read the flamegraph for CPU *attribution*
 //! only; quote latency numbers from an unprofiled run, never from a profiled
 //! one.
+//!
+//! # Known instability under repeated execution
+//!
+//! A single [`ProfileSession`] holds one `pprof::ProfilerGuard` live across the
+//! whole measured region. When that region runs each statement more than once
+//! (`sql_latency_bench --runs N` with `N > 1`, where the guard brackets every
+//! run of every corpus entry), the profiled process has been observed to
+//! segfault; `--runs 1`, and any run with profiling off, is stable (issue
+//! #616).
+//!
+//! The cause is upstream in the sampler, not in this crate's measurement loop
+//! or in the SQL engine under test. `pprof` is a signal sampler: each `SIGPROF`
+//! delivery unwinds the interrupted thread's stack from inside the signal
+//! handler, and that unwind goes through the platform unwinder
+//! (`backtrace::trace_unsynchronized`, i.e. libgcc's `_Unwind_Backtrace`),
+//! which is not async-signal-safe. `pprof`'s own documentation carries the
+//! gperftools warning verbatim: libgcc's unwind "is not safe to use from signal
+//! handlers", and a tick that lands while a thread is mid-unwind or holds the
+//! loader lock can deadlock or fault. The blocklist passed to the guard
+//! mitigates but cannot close this: it only suppresses samples whose
+//! interrupted instruction pointer is already inside a blocklisted segment, not
+//! one that faults while unwinding out of application code.
+//!
+//! Why `--runs 3` crosses a line `--runs 1` does not: the plan, the data, and
+//! the per-statement work are identical between the two. The only thing more
+//! runs change is how long the guard stays armed, and therefore how many
+//! async-signal-unsafe unwinds occur. The crash is probabilistic in that count,
+//! so more executions raise the odds of one tick landing in the unsafe window.
+//! That also means it is not deterministic on every host: it did not reproduce
+//! under this crate's own repeated attempts on an aarch64 Linux box (default
+//! and widened corpora, `--runs` up to 10, sampling frequency raised well past
+//! the default), which is consistent with a probability that varies with
+//! architecture, core count, and glibc rather than a fixed trigger. Do not read
+//! a clean profiled `--runs 3` on one host as evidence the hazard is absent.
+//!
+//! Operational guidance: for a profiled pass, use `--runs 1`. One execution per
+//! statement already produces a dense CPU flamegraph (the sampler accrues a
+//! stack every ~1 ms of on-CPU time), and the latency numbers from a profiled
+//! run are unusable anyway (see the section above), so the extra runs buy the
+//! profile nothing while adding the exposure that risks the crash. Take latency
+//! from a separate unprofiled multi-run pass.
 
 /// Environment variable naming the flamegraph SVG output path. When it is set
 /// and the crate was built with the `profiling` feature, a bench core wraps its

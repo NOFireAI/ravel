@@ -190,6 +190,28 @@ cargo run -p ravel-bench --features sql-latency --bin sql_latency_bench -- \
   past the default 24 hours (relative to `--now-secs`, default the wall clock),
   or the catalog resolve will not see the segments.
 
+#### CPU flamegraph pass (use `--runs 1`)
+
+To capture a CPU flamegraph of the corpus, build with `--features
+sql-latency,profiling` and set `RAVEL_BENCH_PROFILE_SVG` to the output path.
+For a profiled pass, run it with **`--runs 1`**, not `--runs 3`:
+
+```sh
+RAVEL_BENCH_PROFILE_SVG=/tmp/sql_latency.svg \
+cargo run -p ravel-bench --features sql-latency,profiling --bin sql_latency_bench -- \
+  --tenant clickbench --store s3 \
+  --corpus benchmarks/clickbench/hits.corpus.json \
+  --runs 1 --compaction pre --window-hours 200000
+```
+
+The profiler is a signal sampler, and running each statement more than once
+under a live sampler has been observed to segfault the process (issue #616);
+`--runs 1` is stable. This costs nothing for a profile: one execution already
+yields a dense flamegraph, and profiled latency numbers are inflated by the
+sampler and not usable anyway. Take latency from a separate unprofiled `--runs
+3` pass, and read the flamegraph for CPU attribution only. See
+`crates/ravel-bench/src/profiling.rs` for the mechanism.
+
 ### How to read the report
 
 The bench prints the full report as JSON, then a human table. Per statement:
