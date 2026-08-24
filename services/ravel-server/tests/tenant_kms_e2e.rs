@@ -148,16 +148,36 @@ struct RecordedPut {
     sse_kms_key_id: Option<String>,
 }
 
+/// A multipart initiate (`POST /{bucket}/{key}?uploads`). SSE-KMS is a
+/// property of the upload session, so the encryption header rides this request
+/// and never the per-part PUTs; this is the request whose `sse_kms_key_id` the
+/// multipart tests assert on, mirroring how [`RecordedPut`] captures it for a
+/// single-shot PUT.
+#[derive(Debug, Clone)]
+struct RecordedInitiate {
+    key: String,
+    sse_kms_key_id: Option<String>,
+}
+
 #[derive(Default)]
 struct MockS3State {
     objects: Mutex<HashMap<String, (Bytes, String)>>,
     puts: Mutex<Vec<RecordedPut>>,
+    initiates: Mutex<Vec<RecordedInitiate>>,
     next_etag: AtomicU64,
+    next_upload_id: AtomicU64,
 }
 
 impl MockS3State {
     fn new_etag(&self) -> String {
         format!("\"etag-{}\"", self.next_etag.fetch_add(1, Ordering::SeqCst))
+    }
+
+    fn new_upload_id(&self) -> String {
+        format!(
+            "upload-{}",
+            self.next_upload_id.fetch_add(1, Ordering::SeqCst)
+        )
     }
 }
 
@@ -179,8 +199,65 @@ async fn mock_s3_handler(
             .expect("build response");
     };
     let key = key.to_string();
+    let query = uri.query().unwrap_or("");
 
     match method {
+        // Multipart initiate: `POST /{bucket}/{key}?uploads`. The `uploads`
+        // query key (distinct from `uploadId` on complete: "uploadId" has no
+        // trailing `s`) marks it. SSE-KMS rides this request, so it is the one
+        // whose encryption header the multipart tests assert on.
+        Method::POST if query.contains("uploads") => {
+            let sse_kms_key_id = headers
+                .get(SSE_KMS_KEY_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            mock.initiates
+                .lock()
+                .expect("mock initiates lock")
+                .push(RecordedInitiate {
+                    key: key.clone(),
+                    sse_kms_key_id,
+                });
+            let upload_id = mock.new_upload_id();
+            let xml = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                 <InitiateMultipartUploadResult>\
+                 <Bucket>{BUCKET}</Bucket><Key>{key}</Key><UploadId>{upload_id}</UploadId>\
+                 </InitiateMultipartUploadResult>"
+            );
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/xml")
+                .body(Body::from(xml))
+                .expect("build response")
+        }
+        // Multipart complete: `POST /{bucket}/{key}?uploadId={id}` with an XML
+        // part list. The parts' bytes are not reassembled here; the tests read
+        // no object back, only the initiate's encryption header.
+        Method::POST => {
+            let etag = mock.new_etag();
+            let xml = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                 <CompleteMultipartUploadResult>\
+                 <Location>{base}/{BUCKET}/{key}</Location>\
+                 <Bucket>{BUCKET}</Bucket><Key>{key}</Key><ETag>{etag}</ETag>\
+                 </CompleteMultipartUploadResult>",
+                base = "http://mock-s3",
+            );
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/xml")
+                .body(Body::from(xml))
+                .expect("build response")
+        }
+        // Multipart part upload: `PUT /{bucket}/{key}?partNumber={n}&uploadId={id}`.
+        // Per the real API this never carries the SSE-KMS header, so nothing to
+        // record; only an ETag is owed back.
+        Method::PUT if query.contains("uploadId") => Response::builder()
+            .status(StatusCode::OK)
+            .header("ETag", mock.new_etag())
+            .body(Body::empty())
+            .expect("build response"),
         Method::GET | Method::HEAD => {
             let objects = mock.objects.lock().expect("mock objects lock");
             match objects.get(&key) {
@@ -541,6 +618,127 @@ async fn no_tenant_kms_config_routes_no_puts_through_any_kms_key() {
     assert!(
         all_puts.iter().all(|p| p.sse_kms_key_id.is_none()),
         "a non-KMS server must carry no SSE-KMS key header on any PUT: {all_puts:?}"
+    );
+
+    mock.stop().await;
+}
+
+/// The multipart companion to the single-shot PUT tests above, for
+/// `--tenant-kms-config`. `KmsRoutingStore::put_multipart` already routes a
+/// configured tenant's upload to that tenant's per-tenant `S3Store`; this
+/// proves the SSE-KMS header actually reaches the wire on the multipart
+/// *initiate* request (where the real S3 API carries it -- never the per-part
+/// PUTs), the same shape the single-shot assertion checks. A single part is
+/// always legal and final, so one `put_part` before `complete` is enough.
+#[tokio::test]
+async fn multipart_puts_carry_the_configured_tenant_kms_key_on_initiate() {
+    let mock = MockS3Server::start().await;
+
+    let acme_key = "arn:aws:kms:us-east-1:111122223333:key/acme-key";
+    let other_key = "arn:aws:kms:us-east-1:111122223333:key/other-key";
+    let kms_file = write_tenant_kms_file(&format!(
+        "[tenants]\nacme = \"{acme_key}\"\nother = \"{other_key}\"\n"
+    ));
+
+    let cli = s3_cli(
+        &mock.base_url,
+        Some(kms_file.path().to_str().expect("temp path is utf-8")),
+    );
+
+    let ravel_server::store::BuiltStore {
+        foreground: store,
+        kms,
+        ..
+    } = build_store(&cli).expect("build_store succeeds against the mock S3 endpoint");
+    let kms = kms.expect("--tenant-kms-config must yield a KmsRoutingStore handle");
+
+    let tenant_kms_config = cli
+        .parse_tenant_kms_config()
+        .expect("tenant-kms-config file parses");
+    configure_tenant_kms(&kms, store.as_ref(), &tenant_kms_config, now_ns())
+        .await
+        .expect("tenant KMS bootstrap succeeds");
+
+    let acme_hash = TenantId::new("acme").hash();
+    let key = format!("t/{}/multipart-object.rseg", acme_hash.to_hex());
+
+    let mut upload = store
+        .put_multipart(&key)
+        .await
+        .expect("multipart upload begins against acme's per-tenant store");
+    upload
+        .put_part(Bytes::from_static(b"multipart part payload"), None)
+        .await
+        .expect("single final part uploads");
+    upload.complete().await.expect("multipart upload completes");
+
+    let initiates = mock
+        .state
+        .initiates
+        .lock()
+        .expect("mock initiates lock")
+        .clone();
+    let for_key: Vec<_> = initiates.iter().filter(|i| i.key == key).collect();
+    assert_eq!(
+        for_key.len(),
+        1,
+        "exactly one multipart initiate expected for {key}, got: {initiates:?}"
+    );
+    assert_eq!(
+        for_key[0].sse_kms_key_id.as_deref(),
+        Some(acme_key),
+        "the multipart initiate routed to acme's per-tenant store must carry acme's KMS key ARN"
+    );
+
+    mock.stop().await;
+}
+
+/// The multipart companion for the OTHER mechanism, `--s3-kms-key`: a single
+/// deployment-wide key on the default `S3Store`, with no per-tenant routing.
+/// The initiate must carry that key just as every single-shot PUT does.
+#[tokio::test]
+async fn multipart_puts_carry_the_single_s3_kms_key_on_initiate() {
+    let mock = MockS3Server::start().await;
+    let key_arn = "arn:aws:kms:us-east-1:111122223333:key/deployment-key";
+    let cli = s3_cli_with_single_kms_key(&mock.base_url, key_arn);
+
+    let ravel_server::store::BuiltStore {
+        foreground: store,
+        kms,
+        ..
+    } = build_store(&cli).expect("build_store succeeds against the mock S3 endpoint");
+    assert!(
+        kms.is_none(),
+        "--s3-kms-key alone must not construct a KmsRoutingStore; it is a plain S3Config field"
+    );
+
+    let key = "t/deadbeef/multipart-object.rseg".to_string();
+    let mut upload = store
+        .put_multipart(&key)
+        .await
+        .expect("multipart upload begins against the default store");
+    upload
+        .put_part(Bytes::from_static(b"multipart part payload"), None)
+        .await
+        .expect("single final part uploads");
+    upload.complete().await.expect("multipart upload completes");
+
+    let initiates = mock
+        .state
+        .initiates
+        .lock()
+        .expect("mock initiates lock")
+        .clone();
+    let for_key: Vec<_> = initiates.iter().filter(|i| i.key == key).collect();
+    assert_eq!(
+        for_key.len(),
+        1,
+        "exactly one multipart initiate expected for {key}, got: {initiates:?}"
+    );
+    assert_eq!(
+        for_key[0].sse_kms_key_id.as_deref(),
+        Some(key_arn),
+        "the multipart initiate must carry --s3-kms-key's deployment-wide ARN"
     );
 
     mock.stop().await;
