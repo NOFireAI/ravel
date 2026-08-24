@@ -1,0 +1,5 @@
+   Compiling ravel-codec v0.10.0 (/var/lib/fleet/work/39433d92-7dab-4038-811a-6b5073dce04b/crates/ravel-codec)
+   Compiling ravel-logseg v0.10.0 (/var/lib/fleet/work/39433d92-7dab-4038-811a-6b5073dce04b/crates/ravel-logseg)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.97s
+     Running unittests src/lib.rs (/var/lib/fleet/cache/cargo-target/39433d92-7dab-4038-811a-6b5073dce04b/debug/deps/ravel_logseg-efb1e5f1af998fd9)
+error: test failed, to rerun pass `-p ravel-logseg --lib`

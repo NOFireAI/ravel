@@ -1,0 +1,10 @@
+   Compiling zerocopy v0.8.55
+   Compiling num-traits v0.2.19
+   Compiling cc v1.4.0
+   Compiling blake3 v1.8.5
+   Compiling ppv-lite86 v0.2.21
+   Compiling rand_chacha v0.9.0
+   Compiling proptest v1.11.0
+   Compiling ravel-codec v0.10.0 (/var/lib/fleet/work/39433d92-7dab-4038-811a-6b5073dce04b/crates/ravel-codec)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.95s
+     Running unittests src/lib.rs (/var/lib/fleet/cache/cargo-target/39433d92-7dab-4038-811a-6b5073dce04b/debug/deps/ravel_codec-b4e154e919ce453b)

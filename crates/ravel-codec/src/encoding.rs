@@ -1236,6 +1236,28 @@ mod string_dict_proptests {
             prop_assert_eq!(got, vals);
         }
 
+        /// `encode_strings_dict` fed a dictionary and per-row ids produces the
+        /// exact bytes `encode_strings` produces over the fused per-row values,
+        /// across both sides of the dict-versus-plain threshold, with an
+        /// unreferenced dictionary entry and a dictionary carrying duplicate
+        /// values both present.
+        #[test]
+        fn encode_strings_dict_matches_encode_strings(
+            dict in proptest::collection::vec(
+                proptest::collection::vec(any::<u8>(), 0..6), 1..8),
+            ids in proptest::collection::vec(0u32..8, 0..400),
+        ) {
+            // Keep ids in range of the generated dictionary.
+            let ids: Vec<u32> = ids.iter().map(|&i| i % dict.len() as u32).collect();
+            let dref: Vec<&[u8]> = dict.iter().map(|v| v.as_slice()).collect();
+            let fused: Vec<&[u8]> = ids.iter().map(|&i| dref[i as usize]).collect();
+
+            let (want_enc, want_bytes) = encode_strings(&fused);
+            let (got_enc, got_bytes) = encode_strings_dict(&dref, &ids);
+            prop_assert_eq!(got_enc, want_enc);
+            prop_assert_eq!(got_bytes, want_bytes);
+        }
+
         #[test]
         fn f64_roundtrip_with_nan_payloads(
             vals in proptest::collection::vec(

@@ -2981,6 +2981,26 @@ mod tests {
             w.finish_with_stats().expect("columnar finish")
         }
 
+        /// Like [`columnar_object`], but attaches the dictionary shape to every
+        /// batch ([`ColumnarLogBatch::with_dictionaries`]) so the writer takes
+        /// the per-distinct dictionary encode and bloom path (ADR-0109
+        /// decision 3, #603).
+        fn columnar_object_dict(
+            cfg: RlogConfig,
+            recs: &[LogRecord],
+            nbatches: usize,
+        ) -> (Vec<u8>, WriteStats) {
+            let mut w = RlogWriter::new(cfg, identity()).with_indexed_fields(indexed());
+            for chunk in split(recs, nbatches) {
+                if chunk.is_empty() {
+                    continue;
+                }
+                w.push_columnar(ColumnarLogBatch::from_records(chunk).with_dictionaries())
+                    .expect("columnar push");
+            }
+            w.finish_with_stats().expect("columnar finish")
+        }
+
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(256))]
 
@@ -3004,6 +3024,50 @@ mod tests {
                 };
                 let (rb, rs) = row_object(cfg, &records);
                 let (cb, cs) = columnar_object(cfg, &records, nbatches);
+                prop_assert_eq!(rs, cs);
+                prop_assert!(rb == cb, "object bytes differ: row {} vs col {}", rb.len(), cb.len());
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+
+            /// The #603 anchor: pushing the same records through the row path and
+            /// through the columnar path with dictionary-shaped string columns
+            /// yields byte-identical objects and field-identical `WriteStats`.
+            ///
+            /// Each record gets three controlled string columns so the encoder's
+            /// dict-versus-plain threshold (`dict_is_worth_it`) is straddled
+            /// within a block: `same` is one identical value across every row
+            /// (distinct = 1, dictionary wins), `uniq` is a distinct value per
+            /// row (dictionary loses, plain wins), and `lc` draws from a 1-2
+            /// value pool (dictionary wins). `bin` is a low-cardinality `Bytes`
+            /// column (dictionary-encoded but never bloomed). The `arb_record`
+            /// attributes still bring `List`/`Map`-derived `Bytes` columns,
+            /// duplicate keys, per-type splitting, and overflow.
+            #[test]
+            fn dictionary_columns_match_row_build_byte_for_byte(
+                mut records in proptest::collection::vec(arb_record(), 1..25),
+                max_dyn in 6usize..16,
+                nbatches in 1usize..4,
+                lc_pool in proptest::collection::vec("[a-z]{1,3}", 1..3),
+            ) {
+                for (i, r) in records.iter_mut().enumerate() {
+                    r.attrs.push(("same".into(), AttrValue::Str("K".into())));
+                    r.attrs.push(("uniq".into(), AttrValue::Str(format!("u{i}"))));
+                    r.attrs
+                        .push(("lc".into(), AttrValue::Str(lc_pool[i % lc_pool.len()].clone())));
+                    r.attrs
+                        .push(("bin".into(), AttrValue::Bytes(vec![(i % 2) as u8])));
+                }
+                let cfg = RlogConfig {
+                    max_dynamic_columns: max_dyn,
+                    block_target_records: 5,
+                    block_max_bytes: 8192,
+                    ..RlogConfig::default()
+                };
+                let (rb, rs) = row_object(cfg, &records);
+                let (cb, cs) = columnar_object_dict(cfg, &records, nbatches);
                 prop_assert_eq!(rs, cs);
                 prop_assert!(rb == cb, "object bytes differ: row {} vs col {}", rb.len(), cb.len());
             }
