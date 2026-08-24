@@ -1252,3 +1252,51 @@ async fn corrupt_block_is_a_typed_error_through_the_columnar_pass_through() {
         .expect_err("the row exit must reject the corrupt block");
     assert!(matches!(err, LogFetchError::Corrupt { .. }), "{err:?}");
 }
+
+/// A scan abandoned before exhaustion (the reachable case: `GlobalLimitExec`
+/// dropping the stream once a `LIMIT` is satisfied) must still fold the
+/// partial decode work it already did into the query's accounting handle
+/// (#617). Draining to exhaustion is the only path that previously recorded
+/// anything -- `Drop` is what makes an early-abandoned scan record too.
+#[tokio::test]
+async fn dropping_a_scan_before_exhaustion_still_records_page_accounting() {
+    let tenant = TenantHash([13u8; 16]);
+    let mem = MemoryStore::new();
+    let records = columnar_records();
+    let seg_ref = write_object(&mem, "logs/abandoned.rlog", &records).await;
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(mem);
+    let fetcher = LogSegmentFetcher::new(store);
+    let query = LogQuery::new(0, 5000);
+    let accounting = QueryAccounting::new();
+
+    let mut scan = fetcher
+        .scan_accounted_with_tenant(
+            &seg_ref,
+            tenant,
+            &query,
+            &ColumnSelection::all(),
+            &accounting,
+        )
+        .await
+        .expect("open scan")
+        .expect("in range");
+
+    // One block only -- the fixture spans several (block_target_records: 3
+    // over 12 records), so this leaves surviving blocks undecoded.
+    scan.next_block().expect("first block").expect("a block");
+    assert!(
+        scan.remaining_blocks() > 0,
+        "the fixture must span more than one block for this to be a real abandonment"
+    );
+    drop(scan);
+
+    let snapshot = accounting.snapshot();
+    assert!(
+        snapshot.page_bytes_fetched > 0,
+        "the one decoded block's fetched bytes must reach accounting even though the scan never exhausted"
+    );
+    assert!(
+        snapshot.page_bytes_decoded > 0,
+        "the one decoded block's decoded bytes must reach accounting even though the scan never exhausted"
+    );
+}

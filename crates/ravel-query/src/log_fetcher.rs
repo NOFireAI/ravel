@@ -336,7 +336,8 @@ impl LogSegmentScan {
     }
 
     /// Records the scan's block counters on the `decode` span, exactly once,
-    /// when an exit reports exhaustion.
+    /// when an exit reports exhaustion or, failing that, when the scan is
+    /// dropped (see the `Drop` impl below).
     fn finish(&mut self) {
         if self.finished {
             return;
@@ -354,6 +355,18 @@ impl LogSegmentScan {
             .add_page_bytes_fetched(stats.page_bytes_fetched);
         self.accounting
             .add_page_bytes_decoded(stats.page_bytes_decoded);
+    }
+}
+
+impl Drop for LogSegmentScan {
+    /// A scan a caller abandons before exhaustion (`GlobalLimitExec` dropping
+    /// the stream once a `LIMIT` is satisfied is the reachable case) never
+    /// hits either `next_block` exit's exhaustion arm, so without this,
+    /// `finish` never runs and the partial decode work it already did is
+    /// missing from the query's accounting (#617). `finish` is idempotent, so
+    /// this is a no-op on the already-exhausted path.
+    fn drop(&mut self) {
+        self.finish();
     }
 }
 
