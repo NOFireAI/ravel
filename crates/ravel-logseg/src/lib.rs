@@ -14,6 +14,7 @@
 
 pub mod block;
 pub mod columnar;
+pub mod columnar_batch;
 pub mod columns;
 pub mod error;
 pub mod field_dir;
@@ -38,6 +39,7 @@ pub use ravel_codec::{bloom, bloom_section, encoding, tokenizer};
 // decoded block, so decision 4 can change how columns are stored without
 // touching a caller.
 pub use columnar::{AttrColumn, ColumnarBlockView, StrDictColumn};
+pub use columnar_batch::{Bitmap, ColumnarLogBatch, DynColumn, VarBytes};
 pub use columns::ColumnSelection;
 pub use error::LogSegError;
 pub use footer::{SuffixOutcome, open_from_suffix};

@@ -11,9 +11,10 @@
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use ravel_types::logstream::{LogStreamId, canonical_attr_bytes};
+use ravel_types::logstream::{AttrValue, LogStreamId, canonical_attr_bytes};
 
-use crate::block::{ColumnPlan, write_block};
+use crate::block::{ColumnPlan, ColumnarBlockInput, write_block, write_block_columnar};
+use crate::columnar_batch::ColumnarLogBatch;
 use crate::bloom::BloomBuilder;
 use crate::bloom_section::encode_bloom_section;
 use crate::error::LogSegError;
@@ -80,6 +81,10 @@ pub struct RlogWriter {
     cfg: RlogConfig,
     identity: ObjectIdentity,
     records: Vec<LogRecord>,
+    /// Accumulated columnar batches (ADR-0109). A writer is row-major or
+    /// columnar for its lifetime, never both (decision 5): `push` and
+    /// `push_columnar` each refuse if the other has already been used.
+    batches: Vec<ColumnarLogBatch>,
     indexed_fields: Vec<String>,
 }
 
@@ -136,6 +141,7 @@ impl RlogWriter {
             cfg,
             identity,
             records: Vec::new(),
+            batches: Vec::new(),
             indexed_fields: Vec::new(),
         }
     }
@@ -155,7 +161,29 @@ impl RlogWriter {
 
     /// Buffers one record.
     pub fn push(&mut self, rec: LogRecord) -> Result<(), LogSegError> {
+        if !self.batches.is_empty() {
+            return Err(LogSegError::LimitExceeded(
+                "row-major push into a columnar writer".into(),
+            ));
+        }
         self.records.push(rec);
+        Ok(())
+    }
+
+    /// Buffers one columnar batch (ADR-0109). Appending more than one batch into
+    /// one object is supported: the distinct dynamic-column union and the
+    /// STREAM_DIR merge span every appended batch, exactly as the row path's
+    /// span every `push`. A writer that has already taken a row-major `push`
+    /// refuses this (decision 5: a buffer is columnar or row, never both).
+    pub fn push_columnar(&mut self, batch: ColumnarLogBatch) -> Result<(), LogSegError> {
+        if !self.records.is_empty() {
+            return Err(LogSegError::LimitExceeded(
+                "columnar push into a row-major writer".into(),
+            ));
+        }
+        if !batch.is_empty() {
+            self.batches.push(batch);
+        }
         Ok(())
     }
 
@@ -170,6 +198,9 @@ impl RlogWriter {
     /// Like [`RlogWriter::finish`], but also returns counters
     /// ([`WriteStats`]) not otherwise recoverable from the object bytes.
     pub fn finish_with_stats(self) -> Result<(Vec<u8>, WriteStats), LogSegError> {
+        if !self.batches.is_empty() {
+            return self.build_object_columnar(0, Vec::new(), 0);
+        }
         self.build_object(0, Vec::new(), 0)
     }
 
@@ -205,6 +236,9 @@ impl RlogWriter {
         input_set_hash: Vec<u8>,
         part_index: u32,
     ) -> Result<(Vec<u8>, WriteStats), LogSegError> {
+        if !self.batches.is_empty() {
+            return self.build_object_columnar(level, input_set_hash, part_index);
+        }
         self.build_object(level, input_set_hash, part_index)
     }
 
@@ -698,6 +732,637 @@ impl RlogWriter {
             // (level 0, empty hash, part 0); `finish_compacted` passes the
             // compactor's real values. Stamped verbatim, checked nowhere here:
             // the footer round-trips whatever the caller set.
+            level,
+            input_set_hash,
+            part_index,
+        };
+        write_footer_and_trailer(&mut object, &footer);
+        Ok((
+            object,
+            WriteStats {
+                postings_capped_fields,
+                postings_bytes: postings_bytes_len,
+                postings_indexed_fields,
+                postings_distinct_total,
+                postings_distinct_max,
+                dynamic_columns_used,
+                dynamic_columns_overflowed,
+            },
+        ))
+    }
+
+    /// The columnar counterpart of [`RlogWriter::build_object`] (ADR-0109). It
+    /// consumes the accumulated [`ColumnarLogBatch`]es and produces the exact
+    /// same object bytes and [`WriteStats`] the row path produces for the same
+    /// records, with two structural differences the ADR requires:
+    ///
+    /// - Each dynamic attribute column is resolved to its column id **once**
+    ///   (per `(name, type)`, not per row): the batch already groups values by
+    ///   column, so the hot per-attribute `column_of` probe of the row path is
+    ///   gone.
+    /// - The block value pages are staged from contiguous per-column value
+    ///   arrays through [`write_block_columnar`], so the quadratic `row_column`
+    ///   gather the ADR exists to delete never runs.
+    ///
+    /// Every ordering-, budget-, overflow-, merged-view-, and stats-affecting
+    /// rule is reproduced from the same helpers the row path uses
+    /// (`record_level_winners`, `resolved_tracked_values`,
+    /// `indexed_term_columns`, `stat_winner_columns`, `canonical_attr_bytes`),
+    /// which is what makes the output byte-identical (decision 7). The
+    /// merged-view and `attrs_raw` derivations stay per row exactly as the row
+    /// path's do; only the value gather and the column-id probe change shape.
+    fn build_object_columnar(
+        self,
+        level: u32,
+        input_set_hash: Vec<u8>,
+        part_index: u32,
+    ) -> Result<(Vec<u8>, WriteStats), LogSegError> {
+        let batches = &self.batches;
+        let total_rows: usize = batches.iter().map(|b| b.num_rows).sum();
+        if total_rows == 0 {
+            return Err(LogSegError::LimitExceeded("empty object".into()));
+        }
+        let mut bases = Vec::with_capacity(batches.len());
+        {
+            let mut acc = 0usize;
+            for b in batches {
+                bases.push(acc);
+                acc += b.num_rows;
+            }
+        }
+
+        // Stream directory: distinct ids across every batch, id-sorted, each
+        // with the blob from the first batch that carried it; a second batch
+        // claiming the same id with different bytes fails the whole object.
+        let mut streams: BTreeMap<LogStreamId, &[u8]> = BTreeMap::new();
+        for b in batches {
+            for (id, blob) in b.stream_ids.iter().zip(b.stream_attrs.iter()) {
+                match streams.entry(*id) {
+                    Entry::Vacant(slot) => {
+                        slot.insert(blob.as_slice());
+                    }
+                    Entry::Occupied(slot) => {
+                        if *slot.get() != blob.as_slice() {
+                            return Err(LogSegError::InconsistentStreamAttrs(format!(
+                                "stream {} carries two different stream_attrs blobs ({} and {} bytes)",
+                                id.to_hex(),
+                                slot.get().len(),
+                                blob.len(),
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        let sorted_ids: Vec<LogStreamId> = streams.keys().copied().collect();
+        let mut ref_of: HashMap<LogStreamId, u32> = HashMap::with_capacity(sorted_ids.len());
+        for (i, id) in sorted_ids.iter().enumerate() {
+            ref_of.insert(*id, i as u32);
+        }
+
+        let indexed_names: std::collections::HashSet<&str> =
+            self.indexed_fields.iter().map(String::as_str).collect();
+
+        // Dynamic column assignment: distinct (name, type) over every batch's
+        // dynamic columns (each is one (name, type) pair), plus the
+        // stream-level-only columns build_object grants, sorted by
+        // (name bytes, type) and truncated at max_dynamic_columns.
+        let mut distinct: BTreeSet<(String, u8)> = BTreeSet::new();
+        for b in batches {
+            for c in &b.dyn_columns {
+                distinct.insert((c.name.clone(), c.field_type.to_u8()));
+            }
+        }
+        for blob in streams.values() {
+            for (k, v) in stream_attr_pairs(blob)? {
+                let (ty, _) = resolve_value(&v);
+                let eligible = indexed_names.contains(k.as_str())
+                    || matches!(ty, FieldType::I64 | FieldType::F64 | FieldType::Bool);
+                if eligible {
+                    distinct.insert((k, ty.to_u8()));
+                }
+            }
+        }
+        let distinct_total = distinct.len();
+        let mut column_of: ColumnIndex = HashMap::new();
+        let mut columns: Vec<(String, FieldType, u32)> = Vec::new();
+        for (idx, (name, ty_byte)) in distinct.into_iter().enumerate() {
+            if idx >= self.cfg.max_dynamic_columns {
+                break;
+            }
+            let column_id = FIRST_DYNAMIC_COL + idx as u32;
+            let ty = FieldType::from_u8(ty_byte).unwrap_or(FieldType::Bytes);
+            column_of
+                .entry(ty_byte)
+                .or_default()
+                .insert(name.clone(), column_id);
+            columns.push((name, ty, column_id));
+        }
+        let dynamic_columns_used = columns.len() as u32;
+        let dynamic_columns_overflowed = distinct_total.saturating_sub(columns.len()) as u32;
+        let ty_of_column: HashMap<u32, FieldType> =
+            columns.iter().map(|(_, ty, id)| (*id, *ty)).collect();
+        let plan_of_cid: HashMap<u32, usize> = columns
+            .iter()
+            .enumerate()
+            .map(|(i, (_, _, cid))| (*cid, i))
+            .collect();
+        let num_plans = columns.len();
+
+        let numstat_names: std::collections::HashSet<&str> = columns
+            .iter()
+            .filter(|(_, ty, _)| matches!(ty, FieldType::I64 | FieldType::F64 | FieldType::Bool))
+            .map(|(name, _, _)| name.as_str())
+            .collect();
+        let indexed_column_ids: BTreeSet<u32> = columns
+            .iter()
+            .filter(|(name, _, _)| indexed_names.contains(name.as_str()))
+            .map(|(_, _, cid)| *cid)
+            .collect();
+
+        let mut stream_tracked: HashMap<LogStreamId, TrackedValues> = HashMap::new();
+        if !indexed_names.is_empty() || !numstat_names.is_empty() {
+            for (id, blob) in &streams {
+                let mut pairs: TrackedValues = Vec::new();
+                for (k, v) in stream_attr_pairs(blob)? {
+                    if indexed_names.contains(k.as_str()) || numstat_names.contains(k.as_str()) {
+                        let (ty, cv) = resolve_value(&v);
+                        pairs.push((k, (ty.to_u8(), cv)));
+                    }
+                }
+                stream_tracked.insert(*id, pairs);
+            }
+        }
+
+        // Per-global-row fixed columns and derived data, built column by column
+        // (no per-row struct, no per-attribute column_of probe).
+        let mut g_ts: Vec<i64> = Vec::with_capacity(total_rows);
+        let mut g_obs: Vec<i64> = Vec::with_capacity(total_rows);
+        let mut g_sev: Vec<u8> = Vec::with_capacity(total_rows);
+        let mut g_flags: Vec<u32> = Vec::with_capacity(total_rows);
+        let mut g_sevtext: Vec<&[u8]> = Vec::with_capacity(total_rows);
+        let mut g_body: Vec<&[u8]> = Vec::with_capacity(total_rows);
+        let mut g_trace: Vec<Option<&[u8]>> = Vec::with_capacity(total_rows);
+        let mut g_span: Vec<Option<&[u8]>> = Vec::with_capacity(total_rows);
+        let mut g_stream_id: Vec<LogStreamId> = Vec::with_capacity(total_rows);
+        let mut g_stream_ref: Vec<u32> = Vec::with_capacity(total_rows);
+
+        for b in batches {
+            let mut trace_slot = 0usize;
+            let mut span_slot = 0usize;
+            for row in 0..b.num_rows {
+                g_ts.push(b.ts_ns[row]);
+                g_obs.push(b.observed_ts_ns[row]);
+                g_sev.push(b.severity_num[row]);
+                g_flags.push(b.flags[row]);
+                g_sevtext.push(b.severity_text.get(row));
+                g_body.push(b.body.get(row));
+                if b.trace_id_validity.get(row) {
+                    g_trace.push(Some(b.trace_id_at(trace_slot)));
+                    trace_slot += 1;
+                } else {
+                    g_trace.push(None);
+                }
+                if b.span_id_validity.get(row) {
+                    g_span.push(Some(b.span_id_at(span_slot)));
+                    span_slot += 1;
+                } else {
+                    g_span.push(None);
+                }
+                let sid = b.stream_ids[b.stream_refs[row] as usize];
+                g_stream_id.push(sid);
+                g_stream_ref.push(ref_of[&sid]);
+            }
+        }
+
+        // Per-plan, per-row value and stat arrays: contiguous per column, so a
+        // block's value page is an O(1) index per row, never a gather.
+        let mut col_values: Vec<Vec<Option<ColumnValue>>> =
+            vec![vec![None; total_rows]; num_plans];
+        let mut col_stat: Vec<Vec<Option<ColumnValue>>> = vec![vec![None; total_rows]; num_plans];
+
+        // Per-row in-budget columnar occurrences (row.columns), overflow
+        // attributes (attrs_raw source), and the tracked-name occurrences the
+        // merged view is resolved from.
+        let mut g_cols: Vec<Vec<(u32, ColumnValue)>> = vec![Vec::new(); total_rows];
+        let mut g_overflow: Vec<Vec<(String, AttrValue)>> = vec![Vec::new(); total_rows];
+        let mut tracked_cols: Vec<BTreeMap<String, Vec<(u8, ColumnValue)>>> =
+            vec![BTreeMap::new(); total_rows];
+        let mut tracked_overflow: Vec<BTreeMap<String, Vec<AttrValue>>> =
+            vec![BTreeMap::new(); total_rows];
+
+        for (bi, b) in batches.iter().enumerate() {
+            let base = bases[bi];
+            for c in &b.dyn_columns {
+                let ty_byte = c.field_type.to_u8();
+                let cid_opt = column_lookup(&column_of, &c.name, ty_byte);
+                let tracked = indexed_names.contains(c.name.as_str())
+                    || numstat_names.contains(c.name.as_str());
+                let mut slot = 0usize;
+                for row in 0..b.num_rows {
+                    if !c.validity.get(row) {
+                        continue;
+                    }
+                    let cell = &c.cells[slot];
+                    slot += 1;
+                    let grow = base + row;
+                    let (ty, cv) = resolve_value(cell);
+                    match cid_opt {
+                        Some(cid) => {
+                            let plan_idx = plan_of_cid[&cid];
+                            col_values[plan_idx][grow] = Some(cv.clone());
+                            g_cols[grow].push((cid, cv.clone()));
+                            if tracked {
+                                tracked_cols[grow]
+                                    .entry(c.name.clone())
+                                    .or_default()
+                                    .push((ty.to_u8(), cv));
+                            }
+                        }
+                        None => {
+                            g_overflow[grow].push((c.name.clone(), cell.clone()));
+                            if tracked {
+                                tracked_overflow[grow]
+                                    .entry(c.name.clone())
+                                    .or_default()
+                                    .push(cell.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            for (row, extras) in b.residual_attrs.iter().enumerate() {
+                let grow = base + row;
+                for (k, v) in extras {
+                    g_overflow[grow].push((k.clone(), v.clone()));
+                    let tracked =
+                        indexed_names.contains(k.as_str()) || numstat_names.contains(k.as_str());
+                    if tracked {
+                        tracked_overflow[grow]
+                            .entry(k.clone())
+                            .or_default()
+                            .push(v.clone());
+                    }
+                }
+            }
+        }
+
+        // Finish each row: sort its columnar occurrences by column id (matching
+        // the row path's BTreeMap collection), resolve the merged view, and
+        // project it into POSTINGS terms, NumStat winners, and attrs_raw.
+        let mut g_attrs_raw: Vec<Option<Vec<u8>>> = vec![None; total_rows];
+        let mut g_indexed_terms: Vec<Vec<(u32, ColumnValue)>> = vec![Vec::new(); total_rows];
+        let mut g_stat_winners: Vec<Vec<(u32, ColumnValue)>> = vec![Vec::new(); total_rows];
+        for grow in 0..total_rows {
+            g_cols[grow].sort_by_key(|(cid, _)| *cid);
+            if !g_overflow[grow].is_empty() {
+                g_attrs_raw[grow] = Some(canonical_attr_bytes(&g_overflow[grow]));
+            }
+            let winners = record_level_winners(&tracked_cols[grow], &tracked_overflow[grow]);
+            let seed = stream_tracked
+                .get(&g_stream_id[grow])
+                .map_or(&[][..], Vec::as_slice);
+            let resolved = resolved_tracked_values(seed, &winners);
+            g_indexed_terms[grow] = indexed_term_columns(&resolved, &indexed_names, &column_of);
+            let stat_winners = stat_winner_columns(&resolved, &numstat_names, &column_of);
+            for (cid, cv) in &stat_winners {
+                col_stat[plan_of_cid[cid]][grow] = Some(cv.clone());
+            }
+            g_stat_winners[grow] = stat_winners;
+        }
+
+        // Sort rows by (stream_ref, ts) exactly as the row path sorts
+        // ResolvedRows; `sort_by` is stable, so ties keep the appended order.
+        let mut perm: Vec<usize> = (0..total_rows).collect();
+        perm.sort_by(|&a, &b| {
+            g_stream_ref[a]
+                .cmp(&g_stream_ref[b])
+                .then_with(|| g_ts[a].cmp(&g_ts[b]))
+        });
+
+        // Chunk into blocks, reproducing chunk_blocks/row_estimate column-wise.
+        let row_estimate = |grow: usize| -> usize {
+            let mut est = 40usize;
+            est += g_body[grow].len();
+            est += g_sevtext[grow].len();
+            if let Some(raw) = &g_attrs_raw[grow] {
+                est += raw.len();
+            }
+            for (_, v) in &g_cols[grow] {
+                est += match v {
+                    ColumnValue::Str(b) | ColumnValue::Bytes(b) => b.len() + 2,
+                    _ => 8,
+                };
+            }
+            est
+        };
+        let mut spans: Vec<std::ops::Range<usize>> = Vec::new();
+        {
+            let mut start = 0usize;
+            let mut bytes = 0usize;
+            for i in 0..perm.len() {
+                let est = row_estimate(perm[i]);
+                let count = i - start;
+                if count > 0
+                    && (count >= self.cfg.block_target_records
+                        || bytes + est > self.cfg.block_max_bytes)
+                {
+                    spans.push(start..i);
+                    start = i;
+                    bytes = 0;
+                }
+                bytes += est;
+            }
+            if start < perm.len() {
+                spans.push(start..perm.len());
+            }
+        }
+
+        // Per-column present/blocks accounting for FIELD_DIR, per-stream block
+        // range, and the streamed section buffers.
+        let mut col_present: HashMap<u32, u64> = HashMap::new();
+        let mut col_blocks: HashMap<u32, u32> = HashMap::new();
+        let mut first_blk: HashMap<u32, u32> = HashMap::new();
+        let mut last_blk: HashMap<u32, u32> = HashMap::new();
+        let mut blocks_bytes: Vec<u8> = Vec::new();
+        let mut l0: Vec<Level0Entry> = Vec::new();
+        let mut bloom_entries: Vec<Vec<u8>> = Vec::new();
+        let mut postings_terms: BTreeMap<u32, BTreeMap<Vec<u8>, BTreeSet<u32>>> = BTreeMap::new();
+        let mut postings_capped: BTreeSet<u32> = BTreeSet::new();
+        let mut min_ts = i64::MAX;
+        let mut max_ts = i64::MIN;
+        let mut min_obs = i64::MAX;
+        let mut max_obs = i64::MIN;
+
+        for (blk_idx, span) in spans.iter().enumerate() {
+            let block_rows = &perm[span.clone()];
+            let blk_idx_u32 = blk_idx as u32;
+
+            let mut present_cols: BTreeSet<u32> = BTreeSet::new();
+            for &g in block_rows {
+                for (cid, _) in &g_cols[g] {
+                    present_cols.insert(*cid);
+                }
+            }
+            let mut plan_cols: BTreeSet<u32> = present_cols.clone();
+            for &g in block_rows {
+                for (cid, _) in &g_stat_winners[g] {
+                    plan_cols.insert(*cid);
+                }
+            }
+            let plans: Vec<ColumnPlan> = plan_cols
+                .iter()
+                .map(|cid| ColumnPlan {
+                    column_id: *cid,
+                    ty: ty_of_column[cid],
+                })
+                .collect();
+
+            // Column-major block inputs, gathered by the sort permutation.
+            let ts_v: Vec<i64> = block_rows.iter().map(|&g| g_ts[g]).collect();
+            let obs_v: Vec<i64> = block_rows.iter().map(|&g| g_obs[g]).collect();
+            let sref_v: Vec<u32> = block_rows.iter().map(|&g| g_stream_ref[g]).collect();
+            let sev_v: Vec<u8> = block_rows.iter().map(|&g| g_sev[g]).collect();
+            let flags_v: Vec<u32> = block_rows.iter().map(|&g| g_flags[g]).collect();
+            let sevtext_v: Vec<&[u8]> = block_rows.iter().map(|&g| g_sevtext[g]).collect();
+            let body_v: Vec<&[u8]> = block_rows.iter().map(|&g| g_body[g]).collect();
+            let trace_present_v: Vec<bool> =
+                block_rows.iter().map(|&g| g_trace[g].is_some()).collect();
+            let trace_vals_v: Vec<&[u8]> =
+                block_rows.iter().filter_map(|&g| g_trace[g]).collect();
+            let span_present_v: Vec<bool> =
+                block_rows.iter().map(|&g| g_span[g].is_some()).collect();
+            let span_vals_v: Vec<&[u8]> = block_rows.iter().filter_map(|&g| g_span[g]).collect();
+            let raw_present_v: Vec<bool> = block_rows
+                .iter()
+                .map(|&g| g_attrs_raw[g].is_some())
+                .collect();
+            let raw_vals_v: Vec<&[u8]> = block_rows
+                .iter()
+                .filter_map(|&g| g_attrs_raw[g].as_deref())
+                .collect();
+            let values_v: Vec<Vec<Option<ColumnValue>>> = plans
+                .iter()
+                .map(|p| {
+                    let plan_idx = plan_of_cid[&p.column_id];
+                    block_rows
+                        .iter()
+                        .map(|&g| col_values[plan_idx][g].clone())
+                        .collect()
+                })
+                .collect();
+            let stat_v: Vec<Vec<Option<ColumnValue>>> = plans
+                .iter()
+                .map(|p| {
+                    let plan_idx = plan_of_cid[&p.column_id];
+                    block_rows
+                        .iter()
+                        .map(|&g| col_stat[plan_idx][g].clone())
+                        .collect()
+                })
+                .collect();
+
+            let input = ColumnarBlockInput {
+                n: block_rows.len(),
+                ts: &ts_v,
+                observed_ts: &obs_v,
+                stream_ref: &sref_v,
+                severity_num: &sev_v,
+                flags: &flags_v,
+                severity_text: &sevtext_v,
+                body: &body_v,
+                trace_present: &trace_present_v,
+                trace_vals: &trace_vals_v,
+                span_present: &span_present_v,
+                span_vals: &span_vals_v,
+                attrs_raw_present: &raw_present_v,
+                attrs_raw_vals: &raw_vals_v,
+                plans: &plans,
+                values: &values_v,
+                stat_values: &stat_v,
+            };
+            let out = write_block_columnar(&input, self.cfg.zstd_level)?;
+
+            // Bloom over body, severity_text, and string columns; POSTINGS over
+            // each row's merged-view indexed terms.
+            let mut builder = BloomBuilder::new(self.cfg.bloom_seed);
+            for &g in block_rows {
+                insert_text(&mut builder, COL_BODY, g_body[g]);
+                insert_text(&mut builder, COL_SEVERITY_TEXT, g_sevtext[g]);
+                for (cid, v) in &g_cols[g] {
+                    if let ColumnValue::Str(bytes) = v {
+                        insert_text(&mut builder, *cid, bytes);
+                    }
+                }
+                for (cid, v) in &g_indexed_terms[g] {
+                    if postings_capped.contains(cid) {
+                        continue;
+                    }
+                    let field_map = postings_terms.entry(*cid).or_default();
+                    field_map
+                        .entry(term_key(v))
+                        .or_default()
+                        .insert(blk_idx_u32);
+                    if field_map.len() > self.cfg.postings_max_distinct {
+                        postings_terms.remove(cid);
+                        postings_capped.insert(*cid);
+                    }
+                }
+            }
+            bloom_entries.push(builder.finish());
+
+            for &g in block_rows {
+                min_ts = min_ts.min(g_ts[g]);
+                max_ts = max_ts.max(g_ts[g]);
+                min_obs = min_obs.min(g_obs[g]);
+                max_obs = max_obs.max(g_obs[g]);
+                first_blk.entry(g_stream_ref[g]).or_insert(blk_idx_u32);
+                last_blk.insert(g_stream_ref[g], blk_idx_u32);
+            }
+            for cid in &present_cols {
+                *col_blocks.entry(*cid).or_insert(0) += 1;
+            }
+            for &g in block_rows {
+                for (cid, _) in &g_cols[g] {
+                    *col_present.entry(*cid).or_insert(0) += 1;
+                }
+            }
+
+            let block_offset = blocks_bytes.len() as u64;
+            blocks_bytes.extend_from_slice(&out.bytes);
+            l0.push(Level0Entry {
+                block_offset,
+                block_len: out.bytes.len() as u64,
+                block_crc32c: out.crc32c,
+                record_count: out.record_count,
+                min_ts: out.min_ts,
+                max_ts: out.max_ts,
+                min_stream_ref: out.min_stream_ref,
+                max_stream_ref: out.max_stream_ref,
+                stats: out.stats,
+            });
+        }
+
+        // STREAM_DIR.
+        let total_blocks = spans.len() as u32;
+        let stream_entries: Vec<StreamEntry> = streams
+            .iter()
+            .enumerate()
+            .map(|(i, (id, blob))| {
+                let r = i as u32;
+                StreamEntry {
+                    stream_id: *id,
+                    blob: blob.to_vec(),
+                    first_blk: first_blk.get(&r).copied().unwrap_or(0),
+                    last_blk: last_blk
+                        .get(&r)
+                        .copied()
+                        .unwrap_or(total_blocks.saturating_sub(1)),
+                }
+            })
+            .collect();
+        let stream_dir = StreamDir::new(stream_entries);
+
+        // FIELD_DIR.
+        let field_entries: Vec<FieldEntry> = columns
+            .iter()
+            .map(|(name, ty, cid)| {
+                let present = col_present.get(cid).copied().unwrap_or(0);
+                let null_count = (total_rows as u64).saturating_sub(present);
+                FieldEntry {
+                    name: name.clone(),
+                    ty: *ty,
+                    column_id: *cid,
+                    present_blocks: col_blocks.get(cid).copied().unwrap_or(0),
+                    null_count,
+                }
+            })
+            .collect();
+        let field_dir = FieldDir::new(field_entries);
+
+        let skip = SkipIndex::build(l0);
+
+        let postings_capped_fields = postings_capped.len() as u32;
+        let mut postings_fields: BTreeMap<u32, FieldTerms> = BTreeMap::new();
+        let mut postings_indexed_fields: u32 = 0;
+        let mut postings_distinct_total: u64 = 0;
+        let mut postings_distinct_max: u32 = 0;
+        for &cid in &indexed_column_ids {
+            if postings_capped.contains(&cid) {
+                postings_fields.insert(cid, FieldTerms::Capped);
+            } else {
+                let map = postings_terms.remove(&cid).unwrap_or_default();
+                let distinct = map.len() as u32;
+                postings_indexed_fields += 1;
+                postings_distinct_total += u64::from(distinct);
+                postings_distinct_max = postings_distinct_max.max(distinct);
+                postings_fields.insert(cid, FieldTerms::Terms(map));
+            }
+        }
+
+        // Assemble sections in kind order.
+        let mut object = Vec::new();
+        let mut sections: Vec<SectionDesc> = Vec::new();
+        push_section(
+            &mut object,
+            &mut sections,
+            kind::STREAM_DIR,
+            &compress(&stream_dir.encode(), self.cfg.zstd_level)?,
+        );
+        push_section(
+            &mut object,
+            &mut sections,
+            kind::FIELD_DIR,
+            &compress(&field_dir.encode(), self.cfg.zstd_level)?,
+        );
+        push_section(
+            &mut object,
+            &mut sections,
+            kind::BLOCKS,
+            &Stored::raw(blocks_bytes),
+        );
+        push_section(
+            &mut object,
+            &mut sections,
+            kind::SKIP_IDX,
+            &compress(&skip.encode(), self.cfg.zstd_level)?,
+        );
+        push_section(
+            &mut object,
+            &mut sections,
+            kind::BLOOM,
+            &Stored::raw(encode_bloom_section(&bloom_entries)),
+        );
+        let mut postings_bytes_len: u64 = 0;
+        if !indexed_column_ids.is_empty() {
+            let postings_bytes = encode_postings_section(
+                &postings_fields,
+                self.cfg.postings_stride,
+                self.cfg.zstd_level,
+            )?;
+            postings_bytes_len = postings_bytes.len() as u64;
+            push_section(
+                &mut object,
+                &mut sections,
+                kind::POSTINGS,
+                &Stored::raw(postings_bytes),
+            );
+        }
+
+        let footer = LogFooter {
+            tenant_hash: self.identity.tenant_hash,
+            shard: self.identity.shard,
+            writer_id: self.identity.writer_id,
+            writer_epoch: self.identity.writer_epoch,
+            writer_seq: self.identity.writer_seq,
+            min_ts_ns: min_ts,
+            max_ts_ns: max_ts,
+            min_observed_ts_ns: min_obs,
+            max_observed_ts_ns: max_obs,
+            record_count: total_rows as u64,
+            block_count: u64::from(total_blocks),
+            stream_count: sorted_ids.len() as u64,
+            sections,
             level,
             input_set_hash,
             part_index,
@@ -2097,6 +2762,199 @@ mod tests {
                     "record {rec} attribute {name} read back as its own value"
                 );
             }
+        }
+    }
+
+    /// The ADR-0109 decision 7 acceptance anchor: the columnar build path
+    /// (`push_columnar` + `finish_with_stats`) produces byte-identical object
+    /// bytes and field-identical `WriteStats` to the row path
+    /// (`push` + `finish_with_stats`) for the same records.
+    mod columnar_differential {
+        use super::*;
+        use crate::columnar_batch::ColumnarLogBatch;
+        use proptest::prelude::*;
+
+        fn arb_attr_value() -> impl Strategy<Value = AttrValue> {
+            let leaf = prop_oneof![
+                any::<i64>().prop_map(AttrValue::I64),
+                any::<f64>().prop_map(AttrValue::F64),
+                any::<bool>().prop_map(AttrValue::Bool),
+                "[a-z]{0,4}".prop_map(AttrValue::Str),
+                proptest::collection::vec(any::<u8>(), 0..4).prop_map(AttrValue::Bytes),
+            ];
+            leaf.prop_recursive(2, 6, 3, |inner| {
+                prop_oneof![
+                    proptest::collection::vec(inner.clone(), 0..3).prop_map(AttrValue::List),
+                    proptest::collection::vec(("[a-z]{1,3}", inner), 0..3).prop_map(AttrValue::Map),
+                ]
+            })
+        }
+
+        fn arb_name() -> impl Strategy<Value = String> {
+            // A small pool so duplicate keys within a record and the same key
+            // with two value types across records both arise; `http.status` and
+            // `a` are also indexed below.
+            prop::sample::select(vec!["a", "b", "c", "dup", "http.status", "svc.k"])
+                .prop_map(String::from)
+        }
+
+        fn arb_record() -> impl Strategy<Value = LogRecord> {
+            (
+                0u8..3,
+                0i64..40,
+                0u8..30,
+                prop::sample::select(vec!["", "INFO", "ERROR"]),
+                prop::sample::select(vec!["", "hello", "a b c"]),
+                prop_oneof![Just(None), any::<[u8; 16]>().prop_map(Some)],
+                prop_oneof![Just(None), any::<[u8; 8]>().prop_map(Some)],
+                any::<u32>(),
+                proptest::collection::vec((arb_name(), arb_attr_value()), 0..6),
+            )
+                .prop_map(
+                    |(s, ts, sev, sevt, body, trace, span, flags, attrs)| LogRecord {
+                        stream_id: id(s),
+                        stream_attrs: attrs_blob(s),
+                        ts_ns: ts,
+                        observed_ts_ns: ts,
+                        severity_num: sev,
+                        severity_text: sevt.into(),
+                        body: body.into(),
+                        trace_id: trace,
+                        span_id: span,
+                        flags,
+                        attrs,
+                    },
+                )
+        }
+
+        fn split(recs: &[LogRecord], n: usize) -> Vec<&[LogRecord]> {
+            if n <= 1 || recs.is_empty() {
+                return vec![recs];
+            }
+            let chunk = recs.len().div_ceil(n).max(1);
+            recs.chunks(chunk).collect()
+        }
+
+        fn indexed() -> Vec<String> {
+            // `service.name` lives only on the resource (stream-level-only,
+            // indexed); `http.status`/`a` are per-record indexed keys.
+            vec![
+                "service.name".to_string(),
+                "http.status".to_string(),
+                "a".to_string(),
+            ]
+        }
+
+        fn row_object(cfg: RlogConfig, recs: &[LogRecord]) -> (Vec<u8>, WriteStats) {
+            let mut w = RlogWriter::new(cfg, identity()).with_indexed_fields(indexed());
+            for r in recs {
+                w.push(r.clone()).expect("row push");
+            }
+            w.finish_with_stats().expect("row finish")
+        }
+
+        fn columnar_object(
+            cfg: RlogConfig,
+            recs: &[LogRecord],
+            nbatches: usize,
+        ) -> (Vec<u8>, WriteStats) {
+            let mut w = RlogWriter::new(cfg, identity()).with_indexed_fields(indexed());
+            for chunk in split(recs, nbatches) {
+                if chunk.is_empty() {
+                    continue;
+                }
+                w.push_columnar(ColumnarLogBatch::from_records(chunk))
+                    .expect("columnar push");
+            }
+            w.finish_with_stats().expect("columnar finish")
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+
+            /// Byte-for-byte and field-for-field equality of the two paths over
+            /// a corpus reaching nulls in every optional column, `List`/`Map`
+            /// values, a key with two types across records, a duplicate key in
+            /// one record, all-null attribute columns, dynamic-column budget
+            /// overflow (`max_dyn` driven low), a resource-only indexed field,
+            /// and more than one batch merged into one object.
+            #[test]
+            fn columnar_build_matches_row_build_byte_for_byte(
+                records in proptest::collection::vec(arb_record(), 1..25),
+                max_dyn in 1usize..8,
+                nbatches in 1usize..4,
+            ) {
+                let cfg = RlogConfig {
+                    max_dynamic_columns: max_dyn,
+                    block_target_records: 5,
+                    block_max_bytes: 8192,
+                    ..RlogConfig::default()
+                };
+                let (rb, rs) = row_object(cfg, &records);
+                let (cb, cs) = columnar_object(cfg, &records, nbatches);
+                prop_assert_eq!(rs, cs);
+                prop_assert!(rb == cb, "object bytes differ: row {} vs col {}", rb.len(), cb.len());
+            }
+        }
+
+        /// `InconsistentStreamAttrs` fires on the columnar path for the same
+        /// input that triggers it on the row path. A `ColumnarLogBatch` keys its
+        /// `stream_attrs` by stream id, so one batch cannot carry two blobs for
+        /// one id; the conflict is expressed across two batches, and the
+        /// writer's cross-batch STREAM_DIR merge rejects it exactly as the row
+        /// path's cross-record merge does.
+        #[test]
+        fn inconsistent_stream_attrs_fires_on_columnar_path() {
+            let mut r1 = base_record(1, 0);
+            let mut r2 = base_record(1, 1);
+            r1.stream_attrs = attrs_blob(1);
+            r2.stream_attrs = attrs_blob(2); // same id(1), different blob
+
+            let cfg = RlogConfig::default();
+            let mut w = RlogWriter::new(cfg, identity());
+            w.push(r1.clone()).unwrap();
+            w.push(r2.clone()).unwrap();
+            assert!(matches!(
+                w.finish(),
+                Err(LogSegError::InconsistentStreamAttrs(_))
+            ));
+
+            let mut w2 = RlogWriter::new(cfg, identity());
+            w2.push_columnar(ColumnarLogBatch::from_records(std::slice::from_ref(&r1)))
+                .unwrap();
+            w2.push_columnar(ColumnarLogBatch::from_records(std::slice::from_ref(&r2)))
+                .unwrap();
+            assert!(matches!(
+                w2.finish(),
+                Err(LogSegError::InconsistentStreamAttrs(_))
+            ));
+        }
+
+        /// Both paths cut the same blocks: identical block count and identical
+        /// per-block record counts, asserted exactly (never `> 0`).
+        #[test]
+        fn columnar_cuts_identical_blocks() {
+            let cfg = RlogConfig {
+                block_target_records: 4,
+                block_max_bytes: 8192,
+                ..RlogConfig::default()
+            };
+            let mut records = Vec::new();
+            for i in 0..20i64 {
+                let mut r = base_record((i % 2) as u8, i);
+                r.attrs = vec![("a".into(), AttrValue::I64(i))];
+                records.push(r);
+            }
+            let (rb, _) = row_object(cfg, &records);
+            let (cb, _) = columnar_object(cfg, &records, 3);
+            assert_eq!(rb, cb, "object bytes must match");
+
+            let row_l0 = read_skip_index(&rb).l0;
+            let col_l0 = read_skip_index(&cb).l0;
+            let row_counts: Vec<u32> = row_l0.iter().map(|e| e.record_count).collect();
+            let col_counts: Vec<u32> = col_l0.iter().map(|e| e.record_count).collect();
+            assert!(row_counts.len() > 1, "expected multiple blocks");
+            assert_eq!(row_counts, col_counts);
         }
     }
 }
