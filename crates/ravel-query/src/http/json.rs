@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use ravel_promql::{FloatHistogram, Value, ms_to_ns};
+use ravel_promql::{FloatHistogram, RangeSample, RangeValue, Value, ms_to_ns};
 use ravel_types::accounting::AccountedOp;
 use ravel_types::{LabelSet, SeriesId};
 use serde::{Serialize, Serializer};
@@ -274,10 +274,20 @@ pub struct VectorResult {
     pub histogram: Option<(Timestamp, HistogramJson)>,
 }
 
+/// One range-vector (matrix) series. Prometheus renders float steps under a
+/// `values` array and native-histogram steps under a `histograms` array, per
+/// element type per timestamp; a series may carry either or both across its
+/// grid (a series that switches representation mid-range is float at some
+/// steps and histogram at others). Both are `omitempty`, matching
+/// Prometheus' `web/api/v1` matrix sample shape, so a float-only series omits
+/// `histograms` and a histogram-only series omits `values`.
 #[derive(Debug, Serialize)]
 pub struct MatrixResult {
     pub metric: HashMap<String, String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub values: Vec<(Timestamp, String)>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub histograms: Vec<(Timestamp, HistogramJson)>,
 }
 
 /// Prometheus' `model.SampleHistogram` JSON shape for a native (exponential)
@@ -442,6 +452,7 @@ pub fn instant_value_to_json(value: Value, time_ms: i64) -> Result<QueryData, Ap
                         .into_iter()
                         .map(|s| (ts_ns_to_seconds(s.ts_ns), format_value(s.value)))
                         .collect(),
+                    histograms: Vec::new(),
                 })
                 .collect(),
         )),
@@ -456,43 +467,50 @@ pub fn instant_value_to_json(value: Value, time_ms: i64) -> Result<QueryData, Ap
 /// that repetition, which `eval_range` deliberately defers to the wire
 /// format layer.
 pub fn range_value_to_json(
-    value: Value,
+    value: RangeValue,
     start_ms: i64,
     end_ms: i64,
     step_ms: i64,
 ) -> Result<QueryData, ApiError> {
     match value {
-        Value::Matrix(matrix) => Ok(QueryData::Matrix(
+        RangeValue::Matrix(matrix) => Ok(QueryData::Matrix(
             matrix
                 .into_iter()
-                .map(|(labels, samples)| MatrixResult {
-                    metric: labels_to_map(&labels),
-                    values: samples
-                        .into_iter()
-                        .map(|s| (ts_ns_to_seconds(s.ts_ns), format_value(s.value)))
-                        .collect(),
-                })
+                .map(|(labels, samples)| range_series_to_matrix_result(labels, samples))
                 .collect(),
         )),
-        Value::Scalar(v) => Ok(QueryData::Matrix(vec![repeated_matrix_result(
+        RangeValue::Scalar(v) => Ok(QueryData::Matrix(vec![repeated_matrix_result(
             start_ms,
             end_ms,
             step_ms,
             format_value(v),
         )?])),
-        Value::String(s) => Ok(QueryData::Matrix(vec![repeated_matrix_result(
+        RangeValue::String(s) => Ok(QueryData::Matrix(vec![repeated_matrix_result(
             start_ms, end_ms, step_ms, s,
         )?])),
-        // eval_range's own contract (crates/ravel-promql/src/eval.rs) never
-        // produces an instant vector from a range query; handled explicitly
-        // rather than left to panic if that contract ever changes.
-        Value::Vector(_) => Err(ApiError::BadData(
-            ravel_promql::Error::WrongType {
-                expected: "scalar, string, or range vector",
-                got: "instant vector",
-            }
-            .to_string(),
-        )),
+    }
+}
+
+/// Split one range-vector series' per-step [`RangeSample`]s into Prometheus'
+/// two per-element-type arrays: float steps under `values`, native-histogram
+/// steps under `histograms`. A histogram step's placeholder `0.0` float
+/// (`RangeSample::histogram`) is never emitted as a float; it renders as a
+/// histogram element through the same [`histogram_to_json`] encoder the
+/// instant path uses, keeping the two endpoints byte-compatible.
+fn range_series_to_matrix_result(labels: LabelSet, samples: Vec<RangeSample>) -> MatrixResult {
+    let mut values = Vec::new();
+    let mut histograms = Vec::new();
+    for s in samples {
+        let ts = ts_ns_to_seconds(s.ts_ns);
+        match s.histogram {
+            Some(h) => histograms.push((ts, histogram_to_json(&h))),
+            None => values.push((ts, format_value(s.value))),
+        }
+    }
+    MatrixResult {
+        metric: labels_to_map(&labels),
+        values,
+        histograms,
     }
 }
 
@@ -524,6 +542,7 @@ fn repeated_matrix_result(
     Ok(MatrixResult {
         metric: HashMap::new(),
         values,
+        histograms: Vec::new(),
     })
 }
 
@@ -620,7 +639,7 @@ mod tests {
     #[test]
     fn range_scalar_repeats_the_value_across_the_whole_grid() {
         let data = range_value_to_json(
-            Value::Scalar(3.0),
+            RangeValue::Scalar(3.0),
             1_700_000_000_000,
             1_700_000_002_000,
             1_000,
@@ -639,7 +658,7 @@ mod tests {
     #[test]
     fn range_string_repeats_the_value_across_the_whole_grid() {
         let data = range_value_to_json(
-            Value::String("idle".to_string()),
+            RangeValue::String("idle".to_string()),
             1_700_000_000_000,
             1_700_000_001_000,
             1_000,
@@ -849,6 +868,103 @@ mod tests {
     }
 
     #[test]
+    fn range_result_renders_native_histogram_field() {
+        // A range-vector series whose steps are native histograms renders each
+        // step under Prometheus' `histograms` array (not `values`), shaped
+        // `[ts, {count, sum, buckets}]` with the same per-element encoding the
+        // instant path uses. The float `values` array is absent (omitempty) on
+        // a histogram-only series. This histogram matches
+        // `instant_vector_renders_native_histogram_element`: a negative bucket
+        // (-2,-1] (boundaries 1), a zero bucket (-0.5,0.5] (boundaries 3), and
+        // a positive bucket (1,2] (boundaries 0).
+        use ravel_promql::{FloatHistogram, ResetHint, Span};
+        use ravel_types::{Label, LabelSet};
+
+        let make_hist = |sum: f64| FloatHistogram {
+            counter_reset_hint: ResetHint::Unknown,
+            scale: 0,
+            zero_threshold: 0.5,
+            zero_count: 4.0,
+            count: 9.0,
+            sum,
+            positive_spans: vec![Span {
+                offset: 1,
+                length: 1,
+            }],
+            negative_spans: vec![Span {
+                offset: 1,
+                length: 1,
+            }],
+            positive_buckets: vec![2.0],
+            negative_buckets: vec![3.0],
+            custom_values: Vec::new(),
+        };
+        let labels = LabelSet::new(vec![Label {
+            name: "__name__".to_string(),
+            value: "req_latency".to_string(),
+        }])
+        .expect("valid labels");
+        let matrix = vec![(
+            labels,
+            vec![
+                RangeSample {
+                    ts_ns: 1_700_000_000_000_000_000,
+                    value: 0.0,
+                    histogram: Some(make_hist(4.5)),
+                },
+                RangeSample {
+                    ts_ns: 1_700_000_060_000_000_000,
+                    value: 0.0,
+                    histogram: Some(make_hist(5.5)),
+                },
+            ],
+        )];
+
+        let data = range_value_to_json(
+            RangeValue::Matrix(matrix),
+            1_700_000_000_000,
+            1_700_000_060_000,
+            60_000,
+        )
+        .expect("histogram matrix renders");
+        let json = serde_json::to_value(&data).expect("serializes");
+        assert_eq!(json["resultType"], "matrix");
+        let elem = &json["result"][0];
+        assert_eq!(elem["metric"]["__name__"], "req_latency");
+        // A histogram-only series carries no float `values` array.
+        assert!(
+            elem.get("values").is_none(),
+            "no values field on a histogram-only series"
+        );
+        let hists = &elem["histograms"];
+        assert!(hists.is_array(), "histograms is an array");
+        assert_eq!(hists.as_array().expect("array").len(), 2, "one per step");
+        // First step: timestamp, count/sum as strings, buckets exact.
+        assert_eq!(hists[0][0], 1_700_000_000, "first step timestamp");
+        assert_eq!(hists[0][1]["count"], "9");
+        assert_eq!(hists[0][1]["sum"], "4.5");
+        assert_eq!(
+            hists[0][1]["buckets"],
+            serde_json::json!([
+                [1, "-2", "-1", "3"],
+                [3, "-0.5", "0.5", "4"],
+                [0, "1", "2", "2"],
+            ])
+        );
+        // Second step carries its own timestamp and sum.
+        assert_eq!(hists[1][0], 1_700_000_060, "second step timestamp");
+        assert_eq!(hists[1][1]["sum"], "5.5");
+        assert_eq!(
+            hists[1][1]["buckets"],
+            serde_json::json!([
+                [1, "-2", "-1", "3"],
+                [3, "-0.5", "0.5", "4"],
+                [0, "1", "2", "2"],
+            ])
+        );
+    }
+
+    #[test]
     fn instant_vector_renders_float_element_under_value_field() {
         // A plain float vector element keeps the `value` field and carries no
         // `histogram` field, so the two element shapes stay disjoint.
@@ -876,17 +992,5 @@ mod tests {
             elem.get("histogram").is_none(),
             "no histogram field on a float element"
         );
-    }
-
-    #[test]
-    fn range_vector_is_rejected_as_wrong_type() {
-        // eval_range's contract never produces a bare instant vector, but
-        // this defensive arm must still reject it rather than panic.
-        let err = range_value_to_json(Value::Vector(vec![]), 0, 1_000, 1_000)
-            .expect_err("vector must be rejected at range type-check");
-        match err {
-            ApiError::BadData(msg) => assert!(msg.contains("instant vector")),
-            other => panic!("expected BadData, got a different ApiError: {other:?}"),
-        }
     }
 }
