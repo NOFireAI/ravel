@@ -45,6 +45,13 @@ case "${mode}" in
     ticket="$1"
     ref_sha="$2"
 
+    # The ticket must be claimed (assigned) before any work is dispatched on
+    # it. Runs before the marker comment is posted, so a failed claim check
+    # leaves no dangling intent behind: a caller can fix the claim and retry
+    # without tripping the dangling-intent refusal below. set -e propagates the
+    # guard's own non-zero exit and its stderr message.
+    "${script_dir}/guards/assert-issue-claimed.sh" "${ticket}" >&2
+
     # A dangling intent = an intent comment for this ticket with no
     # matching record/failed comment. Scan the most recent 100 comments.
     comments=$(gh issue view "${epic}" --json comments \
