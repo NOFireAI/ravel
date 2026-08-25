@@ -84,7 +84,8 @@ use promql_parser::parser::{AggregateExpr, LabelModifier};
 use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL};
 
 use crate::eval::{
-    Error, Evaluator, InstantSample, InstantVector, QueryWindow, Value, invalid_quantile_warning,
+    Error, Evaluator, InstantSample, InstantVector, QueryWindow, Value,
+    histogram_ignored_in_aggregation_info, invalid_quantile_warning,
 };
 use crate::functions::label::is_valid_label_name;
 use crate::functions::over_time::{kahan_sum_inc, quantile};
@@ -122,6 +123,7 @@ pub(crate) fn eval_aggregate(
                 agg.modifier.as_ref(),
                 input,
                 eval_ts_ns,
+                ctx,
             )))
         }
         T_QUANTILE => {
@@ -140,6 +142,7 @@ pub(crate) fn eval_aggregate(
                 agg.modifier.as_ref(),
                 input,
                 eval_ts_ns,
+                ctx,
             )))
         }
         T_LIMITK | T_LIMIT_RATIO => {
@@ -239,12 +242,13 @@ fn eval_plain_aggregate(
     modifier: Option<&LabelModifier>,
     input: InstantVector,
     eval_ts_ns: i64,
+    ctx: &QueryWindow,
 ) -> InstantVector {
     // Group full samples (not just their float values) so `sum`/`avg` can see
     // native-histogram members.
     group_by(modifier, input, |s| s)
         .into_iter()
-        .filter_map(|(labels, members)| reduce_group_samples(op, labels, members, eval_ts_ns))
+        .filter_map(|(labels, members)| reduce_group_samples(op, labels, members, eval_ts_ns, ctx))
         .collect()
 }
 
@@ -260,6 +264,7 @@ fn reduce_group_samples(
     labels: LabelSet,
     members: Vec<InstantSample>,
     eval_ts_ns: i64,
+    ctx: &QueryWindow,
 ) -> Option<InstantSample> {
     match op {
         T_SUM | T_AVG => {
@@ -297,6 +302,13 @@ fn reduce_group_samples(
         )),
         T_GROUP => Some(InstantSample::scalar(labels, eval_ts_ns, eval_ts_ns, 1.0)),
         T_MIN | T_MAX | T_STDDEV | T_STDVAR => {
+            // Float-only in Prometheus (ADR-0108 decisions 2/6a): a histogram
+            // member is dropped and the drop is annotated
+            // (`HistogramIgnoredInAggregationInfo`), rather than silently
+            // ignored. A group of only histograms is omitted entirely.
+            if members.iter().any(|s| s.histogram.is_some()) {
+                ctx.info(histogram_ignored_in_aggregation_info(aggregation_name(op)));
+            }
             let values: Vec<f64> = members
                 .iter()
                 .filter(|s| s.histogram.is_none())
@@ -313,6 +325,18 @@ fn reduce_group_samples(
             ))
         }
         _ => unreachable!("reduce_group_samples called with non-plain aggregator {op}"),
+    }
+}
+
+/// The operator name Prometheus names in a `HistogramIgnoredInAggregationInfo`
+/// annotation, for the float-only aggregators that drop histogram members.
+fn aggregation_name(op: TokenId) -> &'static str {
+    match op {
+        T_MIN => "min",
+        T_MAX => "max",
+        T_STDDEV => "stddev",
+        T_STDVAR => "stdvar",
+        _ => unreachable!("aggregation_name called with a non-dropping aggregator {op}"),
     }
 }
 
@@ -421,8 +445,14 @@ fn eval_quantile(
     }
     // `quantile` has no defined native-histogram semantics in Prometheus
     // (ADR-0108 decision 2): histogram elements are dropped, never treated as
-    // their meaningless `0.0` placeholder float. Filtering here keeps any float
-    // members of the same group and omits a group that held only histograms.
+    // their meaningless `0.0` placeholder float. Prometheus annotates the drop
+    // (`HistogramIgnoredInAggregationInfo`), the difftest comparator checks for
+    // it, and the ADR pins drop-and-annotate (decision 6a). Filtering here
+    // keeps any float members of the same group and omits a group that held
+    // only histograms.
+    if input.iter().any(|s| s.histogram.is_some()) {
+        ctx.info(histogram_ignored_in_aggregation_info("quantile"));
+    }
     let input: InstantVector = input
         .into_iter()
         .filter(|s| s.histogram.is_none())
@@ -540,6 +570,7 @@ fn eval_topk_bottomk(
     modifier: Option<&LabelModifier>,
     input: InstantVector,
     eval_ts_ns: i64,
+    ctx: &QueryWindow,
 ) -> InstantVector {
     if k_raw.is_nan() || k_raw < 1.0 {
         return Vec::new();
@@ -548,8 +579,17 @@ fn eval_topk_bottomk(
 
     // `topk`/`bottomk` have no defined native-histogram semantics in Prometheus
     // (ADR-0108 decision 2): a histogram element is dropped rather than ranked
-    // by its meaningless `0.0` placeholder float. Float members of the same
-    // group are kept and ranked as usual.
+    // by its meaningless `0.0` placeholder float. Prometheus annotates the drop
+    // (`HistogramIgnoredInAggregationInfo`) and the ADR pins drop-and-annotate
+    // (decision 6a). Float members of the same group are kept and ranked as
+    // usual.
+    if input.iter().any(|s| s.histogram.is_some()) {
+        ctx.info(histogram_ignored_in_aggregation_info(if is_top {
+            "topk"
+        } else {
+            "bottomk"
+        }));
+    }
     let input: InstantVector = input
         .into_iter()
         .filter(|s| s.histogram.is_none())

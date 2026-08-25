@@ -23,8 +23,9 @@ use ravel_types::{LabelSet, Sample};
 
 use crate::eval::{
     Error, Evaluator, HistogramAwareMatrix, InstantSample, InstantVector, QueryWindow, RangeMatrix,
-    RangeSample, Value, drop_metric_name, duration_to_ns, hist_matrix_into_float,
-    invalid_quantile_warning, possible_non_counter_info, resolve_eval_ts, selector_eval_ts,
+    RangeSample, Value, drop_metric_name, duration_to_ns, float_matrix_into_hist,
+    hist_matrix_into_float, invalid_quantile_warning, possible_non_counter_info, resolve_eval_ts,
+    selector_eval_ts,
 };
 use crate::histogram::{FloatHistogram, TimedHistogram};
 use crate::source::SeriesSource;
@@ -216,24 +217,43 @@ pub(crate) fn eval_call(
                 }
             }
             let matrix = eval_matrix_arg(evaluator, source, arg, eval_ts_ns, ctx)?;
-            Ok(Value::Vector(apply_reduce(
-                matrix,
+            let mut out = apply_reduce(matrix, eval_ts_ns, keep_name, |samples| f(samples, window));
+            // Histogram-only series matching the same selector: reduced by the
+            // shared over_time histogram policy so the instant endpoint answers
+            // the same class as the range endpoint (ADR-0108 decision 5, the
+            // instant/range parity fix). Float-only members drop here exactly
+            // as the oracle does.
+            append_histogram_over_time(
+                evaluator,
+                source,
+                arg,
+                call.func.name,
                 eval_ts_ns,
                 keep_name,
-                |samples| f(samples, window),
-            )))
+                ctx,
+                &mut out,
+            )?;
+            Ok(Value::Vector(out))
         }
         FunctionKind::RangeVectorScalar(f) => {
             let arg = matrix_arg(&call.args.args[0])?;
             let t = scalar_arg(evaluator, source, &call.args.args[1], eval_ts_ns, ctx)?;
             let window = range_window(arg, eval_ts_ns, ctx)?;
             let matrix = eval_matrix_arg(evaluator, source, arg, eval_ts_ns, ctx)?;
-            Ok(Value::Vector(apply_reduce(
-                matrix,
+            let mut out = apply_reduce(matrix, eval_ts_ns, false, |samples| f(samples, window, t));
+            // `predict_linear`: float-only, so any histogram-only series is
+            // dropped by the shared policy (no annotation), matching the oracle.
+            append_histogram_over_time(
+                evaluator,
+                source,
+                arg,
+                call.func.name,
                 eval_ts_ns,
                 false,
-                |samples| f(samples, window, t),
-            )))
+                ctx,
+                &mut out,
+            )?;
+            Ok(Value::Vector(out))
         }
         FunctionKind::RangeVectorFloatOrHist { float, hist } => {
             let arg = matrix_arg(&call.args.args[0])?;
@@ -255,7 +275,7 @@ pub(crate) fn eval_call(
             // the histogram series here.
             if let MatrixArg::Selector(ms) = arg {
                 let hmatrix =
-                    evaluator.eval_histogram_matrix_selector(source, ms, eval_ts_ns, ctx)?;
+                    evaluator.eval_histogram_matrix_selector(source, ms, eval_ts_ns, ctx, false)?;
                 for (labels, samples) in hmatrix {
                     if let Some(h) = hist(&samples, window) {
                         out.push(InstantSample::histogram(labels, eval_ts_ns, eval_ts_ns, h));
@@ -292,24 +312,31 @@ pub(crate) fn eval_call(
             // sits inside the reduce closure so it fires once per matched series
             // (deduped by the annotation sink) and, like Prometheus, not at all
             // when no series matched.
-            Ok(Value::Vector(apply_reduce(
-                matrix,
+            let mut out = apply_reduce(matrix, eval_ts_ns, false, |samples| {
+                maybe_warn_invalid_quantile(q, ctx);
+                f(q, samples, window)
+            });
+            // `quantile_over_time`: float-only, so a histogram-only series is
+            // dropped by the shared policy with no annotation (its out-of-range
+            // `q` warning likewise fires only for float windows), matching the
+            // oracle's `len(Floats) == 0` early return.
+            append_histogram_over_time(
+                evaluator,
+                source,
+                arg,
+                call.func.name,
                 eval_ts_ns,
                 false,
-                |samples| {
-                    maybe_warn_invalid_quantile(q, ctx);
-                    f(q, samples, window)
-                },
-            )))
+                ctx,
+                &mut out,
+            )?;
+            Ok(Value::Vector(out))
         }
         FunctionKind::AbsentOverTime => {
             let arg = matrix_arg(&call.args.args[0])?;
-            let matrix = eval_matrix_arg(evaluator, source, arg, eval_ts_ns, ctx)?;
             Ok(Value::Vector(over_time::absent_over_time_instant(
-                over_time::matrix_arg_absent_labels(arg),
-                matrix,
-                eval_ts_ns,
-            )))
+                evaluator, source, arg, eval_ts_ns, ctx,
+            )?))
         }
         FunctionKind::VectorMap(f) => {
             let v = vector_arg(evaluator, source, &call.args.args[0], eval_ts_ns, ctx)?;
@@ -334,12 +361,13 @@ pub(crate) fn eval_range_call(
     step_ns: i64,
     points: u64,
     ctx: &QueryWindow,
-) -> Result<RangeMatrix, Error> {
+) -> Result<HistogramAwareMatrix, Error> {
     let def = lookup(call.func.name).ok_or_else(|| unregistered_function_error(call.func.name))?;
     match def.kind {
         FunctionKind::RangeVector(f) => {
             let arg = matrix_arg(&call.args.args[0])?;
             let keep_name = range_vector_keeps_metric_name(call.func.name);
+            let name = call.func.name;
             eval_matrix_arg_range_reduction(
                 evaluator,
                 source,
@@ -350,7 +378,16 @@ pub(crate) fn eval_range_call(
                 points,
                 ctx,
                 keep_name,
-                |samples, window_start_ns, sel_ts_ns, range_ns, reported_ts_ns| {
+                |samples, hists, window_start_ns, sel_ts_ns, range_ns, reported_ts_ns| {
+                    if !hists.is_empty() {
+                        // A histogram-only window: the float reducer `f` has no
+                        // histogram form, so route by member name to the shared
+                        // over_time histogram policy (ADR-0108 decision 5).
+                        return histogram_range_element(
+                            over_time::histogram_over_time(name, hists),
+                            reported_ts_ns,
+                        );
+                    }
                     f(
                         samples,
                         RangeWindow {
@@ -360,6 +397,7 @@ pub(crate) fn eval_range_call(
                             eval_ts_ns: reported_ts_ns,
                         },
                     )
+                    .map(|v| RangeSample::scalar(reported_ts_ns, v))
                 },
             )
         }
@@ -384,26 +422,29 @@ pub(crate) fn eval_range_call(
                 points,
                 ctx,
                 false,
-                |samples, window_start_ns, sel_ts_ns, range_ns, reported_ts_ns| match scalar_arg(
-                    evaluator,
-                    source,
-                    scalar_expr,
-                    reported_ts_ns,
-                    ctx,
-                ) {
-                    Ok(t) => f(
-                        samples,
-                        RangeWindow {
-                            start_ns: window_start_ns,
-                            end_ns: sel_ts_ns,
-                            range_ns,
-                            eval_ts_ns: reported_ts_ns,
-                        },
-                        t,
-                    ),
-                    Err(e) => {
-                        *err.borrow_mut() = Some(e);
-                        None
+                |samples, hists, window_start_ns, sel_ts_ns, range_ns, reported_ts_ns| {
+                    // `predict_linear` is float-only in Prometheus: a
+                    // histogram-only window takes its `len(Floats) == 0`
+                    // early return, dropping with no annotation.
+                    if !hists.is_empty() {
+                        return None;
+                    }
+                    match scalar_arg(evaluator, source, scalar_expr, reported_ts_ns, ctx) {
+                        Ok(t) => f(
+                            samples,
+                            RangeWindow {
+                                start_ns: window_start_ns,
+                                end_ns: sel_ts_ns,
+                                range_ns,
+                                eval_ts_ns: reported_ts_ns,
+                            },
+                            t,
+                        )
+                        .map(|v| RangeSample::scalar(reported_ts_ns, v)),
+                        Err(e) => {
+                            *err.borrow_mut() = Some(e);
+                            None
+                        }
                     }
                 },
             )?;
@@ -412,11 +453,11 @@ pub(crate) fn eval_range_call(
             }
             Ok(matrix)
         }
-        FunctionKind::RangeVectorFloatOrHist { float, hist: _ } => {
-            // Range queries reduce only the float series: a histogram-valued
-            // range result cannot be rendered by the HTTP JSON layer and no
-            // read path feeds native histograms into a range query yet.
-            // The float reduction is identical to `RangeVector`.
+        FunctionKind::RangeVectorFloatOrHist { float, hist } => {
+            // `rate`/`increase`/`delta`: the float reducer serves float series
+            // and the native-histogram reducer serves histogram series, exactly
+            // mirroring the instant arm's dispatch. A histogram window reduces
+            // to one histogram element (ADR-0108 decision 4).
             let arg = matrix_arg(&call.args.args[0])?;
             let result = eval_matrix_arg_range_reduction(
                 evaluator,
@@ -428,18 +469,22 @@ pub(crate) fn eval_range_call(
                 points,
                 ctx,
                 false,
-                |samples, window_start_ns, sel_ts_ns, range_ns, reported_ts_ns| {
-                    float(
-                        samples,
-                        RangeWindow {
-                            start_ns: window_start_ns,
-                            end_ns: sel_ts_ns,
-                            range_ns,
-                            eval_ts_ns: reported_ts_ns,
-                        },
-                    )
+                |samples, hists, window_start_ns, sel_ts_ns, range_ns, reported_ts_ns| {
+                    let window = RangeWindow {
+                        start_ns: window_start_ns,
+                        end_ns: sel_ts_ns,
+                        range_ns,
+                        eval_ts_ns: reported_ts_ns,
+                    };
+                    if !hists.is_empty() {
+                        hist(hists, window).map(|h| RangeSample::histogram(reported_ts_ns, h))
+                    } else {
+                        float(samples, window).map(|v| RangeSample::scalar(reported_ts_ns, v))
+                    }
                 },
             )?;
+            // Gated on the reduced output, matching the instant arm and
+            // Prometheus (the check follows the too-few-samples early return).
             maybe_info_non_counter_selector_name(call.func.name, arg, !result.is_empty(), ctx);
             Ok(result)
         }
@@ -456,15 +501,14 @@ pub(crate) fn eval_range_call(
         // an arithmetic identity.
         FunctionKind::HistogramQuantile(f) => {
             // Quantile/fraction results are float-valued, so the grid produces
-            // only float elements; project down to the float matrix this range
-            // call returns.
+            // only float elements; the histogram-aware matrix carries them
+            // unchanged.
             eval_instant_over_grid(start_ns, end_ns, step_ns, |t| {
                 ctx.check_deadline()?;
                 let phi = scalar_arg(evaluator, source, &call.args.args[0], t, ctx)?;
                 let vector = vector_arg(evaluator, source, &call.args.args[1], t, ctx)?;
                 Ok(Value::Vector(to_instant_vector(f(phi, vector, ctx), t)))
             })
-            .map(hist_matrix_into_float)
         }
         FunctionKind::HistogramFraction(f) => {
             eval_instant_over_grid(start_ns, end_ns, step_ns, |t| {
@@ -477,7 +521,6 @@ pub(crate) fn eval_range_call(
                     t,
                 )))
             })
-            .map(hist_matrix_into_float)
         }
         FunctionKind::ScalarRangeVector(f) => {
             let scalar_expr = &call.args.args[0];
@@ -499,29 +542,34 @@ pub(crate) fn eval_range_call(
                 points,
                 ctx,
                 false,
-                |samples, window_start_ns, sel_ts_ns, range_ns, reported_ts_ns| match scalar_arg(
-                    evaluator,
-                    source,
-                    scalar_expr,
-                    reported_ts_ns,
-                    ctx,
-                ) {
-                    Ok(q) => {
-                        maybe_warn_invalid_quantile(q, ctx);
-                        f(
-                            q,
-                            samples,
-                            RangeWindow {
-                                start_ns: window_start_ns,
-                                end_ns: sel_ts_ns,
-                                range_ns,
-                                eval_ts_ns: reported_ts_ns,
-                            },
-                        )
+                |samples, hists, window_start_ns, sel_ts_ns, range_ns, reported_ts_ns| {
+                    // `quantile_over_time` is float-only in Prometheus: a
+                    // histogram-only window takes its `len(Floats) == 0` early
+                    // return, dropping the series with no annotation. The
+                    // out-of-range-`q` warning fires there only after a float
+                    // element exists, so it is likewise skipped here.
+                    if !hists.is_empty() {
+                        return None;
                     }
-                    Err(e) => {
-                        *err.borrow_mut() = Some(e);
-                        None
+                    match scalar_arg(evaluator, source, scalar_expr, reported_ts_ns, ctx) {
+                        Ok(q) => {
+                            maybe_warn_invalid_quantile(q, ctx);
+                            f(
+                                q,
+                                samples,
+                                RangeWindow {
+                                    start_ns: window_start_ns,
+                                    end_ns: sel_ts_ns,
+                                    range_ns,
+                                    eval_ts_ns: reported_ts_ns,
+                                },
+                            )
+                            .map(|v| RangeSample::scalar(reported_ts_ns, v))
+                        }
+                        Err(e) => {
+                            *err.borrow_mut() = Some(e);
+                            None
+                        }
                     }
                 },
             )?;
@@ -535,6 +583,7 @@ pub(crate) fn eval_range_call(
             over_time::absent_over_time_range(
                 evaluator, source, arg, start_ns, end_ns, step_ns, ctx,
             )
+            .map(float_matrix_into_hist)
         }
         // A top-level `VectorMap`/`Instant` function call is a float-only range
         // result today: any histogram element the per-step evaluation carries
@@ -542,19 +591,72 @@ pub(crate) fn eval_range_call(
         // path that preserves histograms is `RangeCore::Generic`, top-level
         // aggregates and binary expressions, handled in `eval.rs`). Histogram
         // semantics for these function families are ADR-0108 decisions 4/5,
-        // out of this task's scope.
+        // out of this task's scope; the round-trip through
+        // `hist_matrix_into_float` drops the histogram elements explicitly
+        // rather than emitting them as `0.0` floats.
         FunctionKind::VectorMap(f) => eval_instant_over_grid(start_ns, end_ns, step_ns, |t| {
             ctx.check_deadline()?;
             let v = vector_arg(evaluator, source, &call.args.args[0], t, ctx)?;
             Ok(Value::Vector(f(v)))
         })
-        .map(hist_matrix_into_float),
+        .map(|m| float_matrix_into_hist(hist_matrix_into_float(m))),
         FunctionKind::Instant(f) => eval_instant_over_grid(start_ns, end_ns, step_ns, |t| {
             ctx.check_deadline()?;
             f(evaluator, source, call, t, ctx)
         })
-        .map(hist_matrix_into_float),
+        .map(|m| float_matrix_into_hist(hist_matrix_into_float(m))),
     }
+}
+
+/// Map a native-histogram [`over_time::HistOverTime`] outcome to a range
+/// element at `reported_ts_ns` (ADR-0108 decision 5): a float or histogram
+/// result becomes the matching [`RangeSample`], a drop becomes `None`.
+fn histogram_range_element(
+    outcome: over_time::HistOverTime,
+    reported_ts_ns: i64,
+) -> Option<RangeSample> {
+    match outcome {
+        over_time::HistOverTime::Float(v) => Some(RangeSample::scalar(reported_ts_ns, v)),
+        over_time::HistOverTime::Histogram(h) => Some(RangeSample::histogram(reported_ts_ns, h)),
+        over_time::HistOverTime::Drop => None,
+    }
+}
+
+/// Append native-histogram `_over_time` results to an instant range-vector
+/// function's output (ADR-0108 decision 5, the instant/range parity fix): a
+/// histogram-only series matching the same selector is reduced by the shared
+/// [`over_time::histogram_over_time`] policy so both endpoints answer the same
+/// class of value. Only a matrix selector can carry histograms into this
+/// family (a subquery over native histograms errors upstream in
+/// `eval_subquery_matrix`), so a subquery argument contributes nothing.
+#[allow(clippy::too_many_arguments)]
+fn append_histogram_over_time(
+    evaluator: &Evaluator,
+    source: &dyn SeriesSource,
+    arg: MatrixArg,
+    name: &str,
+    eval_ts_ns: i64,
+    keep_metric_name: bool,
+    ctx: &QueryWindow,
+    out: &mut InstantVector,
+) -> Result<(), Error> {
+    let MatrixArg::Selector(ms) = arg else {
+        return Ok(());
+    };
+    let hmatrix =
+        evaluator.eval_histogram_matrix_selector(source, ms, eval_ts_ns, ctx, keep_metric_name)?;
+    for (labels, samples) in hmatrix {
+        match over_time::histogram_over_time(name, &samples) {
+            over_time::HistOverTime::Float(v) => {
+                out.push(InstantSample::scalar(labels, eval_ts_ns, eval_ts_ns, v));
+            }
+            over_time::HistOverTime::Histogram(h) => {
+                out.push(InstantSample::histogram(labels, eval_ts_ns, eval_ts_ns, h));
+            }
+            over_time::HistOverTime::Drop => {}
+        }
+    }
+    Ok(())
 }
 
 /// Evaluate an [`FunctionKind::VectorMap`] or [`FunctionKind::Instant`]
@@ -638,8 +740,8 @@ fn eval_matrix_arg_range_reduction(
     points: u64,
     ctx: &QueryWindow,
     keep_metric_name: bool,
-    reduce: impl Fn(&[Sample], i64, i64, i64, i64) -> Option<f64>,
-) -> Result<RangeMatrix, Error> {
+    reduce: impl Fn(&[Sample], &[TimedHistogram], i64, i64, i64, i64) -> Option<RangeSample>,
+) -> Result<HistogramAwareMatrix, Error> {
     match arg {
         MatrixArg::Selector(ms) => evaluator.eval_range_matrix_reduction(
             source,
@@ -653,8 +755,12 @@ fn eval_matrix_arg_range_reduction(
             reduce,
         ),
         MatrixArg::Subquery(sq) => {
+            // A subquery yields only float samples: `eval_subquery_matrix`
+            // rejects native histograms upstream with `Error::Unsupported`
+            // rather than dropping them, so the histogram slice handed to
+            // `reduce` is always empty here.
             let range_ns = duration_to_ns(sq.range)?;
-            let mut series: Vec<(LabelSet, Vec<Sample>)> = Vec::new();
+            let mut series: Vec<(LabelSet, Vec<RangeSample>)> = Vec::new();
             let mut t = start_ns;
             while t <= end_ns {
                 ctx.check_deadline()?;
@@ -665,15 +771,17 @@ fn eval_matrix_arg_range_reduction(
                     if samples.is_empty() {
                         continue;
                     }
-                    if let Some(value) = reduce(&samples, window_start_ns, sel_ts_ns, range_ns, t) {
+                    if let Some(element) =
+                        reduce(&samples, &[], window_start_ns, sel_ts_ns, range_ns, t)
+                    {
                         let labels = if keep_metric_name {
                             labels
                         } else {
                             drop_metric_name(labels)
                         };
                         match series.iter_mut().find(|(l, _)| *l == labels) {
-                            Some((_, out)) => out.push(Sample { ts_ns: t, value }),
-                            None => series.push((labels, vec![Sample { ts_ns: t, value }])),
+                            Some((_, out)) => out.push(element),
+                            None => series.push((labels, vec![element])),
                         }
                     }
                 }
@@ -1631,12 +1739,52 @@ mod tests {
     }
 
     #[test]
+    fn range_grid_undefined_aggregations_annotate_the_drop() {
+        // The drop of a histogram element by `min`/`max`/`stddev`/`stdvar`/
+        // `quantile`/`topk`/`bottomk` must carry Prometheus'
+        // `HistogramIgnoredInAggregationInfo`, not be silent (ADR-0108
+        // decision 6a; the difftest comparator checks annotation presence).
+        // Before item 6a these drops emitted no annotation; the flipped
+        // assertion is the non-empty `infos()` naming the aggregation.
+        let source = TestSource::new()
+            .with_histogram_series(&[("__name__", "h"), ("i", "1")], &[(0, nh(2.0, 10.0))])
+            .expect("valid histogram series")
+            .with_histogram_series(&[("__name__", "h"), ("i", "2")], &[(0, nh(3.0, 12.0))])
+            .expect("valid histogram series");
+        for (op, expected) in [
+            ("min(h)", "ignored histogram in min aggregation"),
+            ("max(h)", "ignored histogram in max aggregation"),
+            ("stddev(h)", "ignored histogram in stddev aggregation"),
+            ("stdvar(h)", "ignored histogram in stdvar aggregation"),
+            (
+                "quantile(0.5, h)",
+                "ignored histogram in quantile aggregation",
+            ),
+            ("topk(1, h)", "ignored histogram in topk aggregation"),
+            ("bottomk(1, h)", "ignored histogram in bottomk aggregation"),
+        ] {
+            let (_value, annotations) = Evaluator::new()
+                .eval_range_hist_annotated(&source, op, 0, 60_000, 60_000)
+                .expect("range evaluates");
+            assert!(
+                annotations.infos().iter().any(|m| m == expected),
+                "{op} must annotate the histogram drop with {expected:?}, got {:?}",
+                annotations.infos()
+            );
+        }
+    }
+
+    #[test]
     fn grouping_by_preserves_histogram_element_type() {
         // `sum by (i)` over histogram series keeps each group's element a
         // histogram end to end (through both grid materialization and the
-        // grouping rebuild). Before the fix the grid dropped the histogram
-        // field, so every group's element was a `0.0` float; the flipped
-        // assertion is `samples[0].histogram.is_some()` for each group.
+        // grouping rebuild), AND carries the correct per-group population: each
+        // `i` label groups a single distinct series, so its summed histogram
+        // must be exactly that series' own `count`/`sum`, not a `0.0`
+        // placeholder and not another group's value. Before the fix the grid
+        // dropped the histogram field, so every group's element was a `0.0`
+        // float; the flipped assertions are `s.histogram.is_some()` and the
+        // exact `count`/`sum` bit-patterns per group.
         let source = TestSource::new()
             .with_histogram_series(&[("__name__", "h"), ("i", "1")], &[(0, nh(2.0, 10.0))])
             .expect("valid histogram series")
@@ -1650,11 +1798,38 @@ mod tests {
         };
         assert_eq!(matrix.len(), 2, "one group per distinct i label");
         for (labels, samples) in &matrix {
+            let i = labels
+                .iter()
+                .find(|l| l.name == "i")
+                .map(|l| l.value.clone())
+                .expect("group keeps its `i` label");
+            // `sum` drops `__name__`; the only surviving label is the group key.
+            assert!(
+                labels
+                    .iter()
+                    .all(|l| l.name != ravel_types::METRIC_NAME_LABEL),
+                "group {labels:?} drops __name__"
+            );
+            let (want_count, want_sum) = match i.as_str() {
+                "1" => (2.0_f64, 10.0_f64),
+                "2" => (5.0_f64, 25.0_f64),
+                other => panic!("unexpected group i={other}"),
+            };
             assert!(!samples.is_empty(), "each group has at least one grid step");
             for s in samples {
-                assert!(
-                    s.histogram.is_some(),
-                    "group {labels:?} preserves its histogram element type"
+                let h = s
+                    .histogram
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("group i={i} preserves its histogram element type"));
+                assert_eq!(
+                    h.count.to_bits(),
+                    want_count.to_bits(),
+                    "group i={i} keeps its own population count"
+                );
+                assert_eq!(
+                    h.sum.to_bits(),
+                    want_sum.to_bits(),
+                    "group i={i} keeps its own observation sum"
                 );
             }
         }
