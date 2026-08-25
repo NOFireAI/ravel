@@ -58,6 +58,9 @@ use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::physical_expr::expressions::col;
 use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, PhysicalSortExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::metrics::{
+    Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
+};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties, RecordBatchStream,
     SendableRecordBatchStream,
@@ -65,13 +68,22 @@ use datafusion::physical_plan::{
 use futures::Stream;
 use ravel_catalog::SegmentRef;
 use ravel_query::erasure::{ErasurePredicate, is_erased_span};
+use ravel_rspan::block::DecodedBlock;
+use ravel_rspan::record::{
+    COL_END_TS, COL_PARENT_SPAN_ID, COL_SPAN_ID, COL_START_TS, COL_STATUS_CODE, COL_STATUS_MESSAGE,
+    COL_TRACE_ID,
+};
 use ravel_rspan::{BloomPredicate, COL_NAME, COL_SERVICE_NAME, SpanQuery};
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
 
 use crate::error::SqlError;
 use crate::spans_fetcher::{SpanRow, SpanSegmentFetcher};
-use crate::spans_schema::{SPAN_ID_WIDTH, TRACE_ID_WIDTH, spans_schema};
+use crate::spans_schema::{
+    SPAN_COL_ATTRS, SPAN_COL_DURATION_NS, SPAN_COL_END_TS, SPAN_COL_NAME, SPAN_COL_PARENT_SPAN_ID,
+    SPAN_COL_SERVICE_NAME, SPAN_COL_SPAN_ID, SPAN_COL_START_TS, SPAN_COL_STATUS_CODE,
+    SPAN_COL_STATUS_MESSAGE, SPAN_COL_TRACE_ID, SPAN_ID_WIDTH, TRACE_ID_WIDTH, spans_schema,
+};
 
 /// Rows accumulated into one output batch before it is emitted.
 const BATCH_ROWS: usize = 8192;
@@ -81,6 +93,73 @@ const BATCH_ROWS: usize = 8192;
 const METRIC_COLUMNAR_BATCHES: &str = "columnar_batches";
 /// Metric name for the count of batches emitted by the row path fallback.
 const METRIC_ROWPATH_BATCHES: &str = "rowpath_batches";
+/// Metric name for the column pages the columnar decode decompressed.
+const METRIC_PAGES_DECODED: &str = "pages_decoded";
+/// Metric name for the column pages the columnar decode walked past because the
+/// projection excluded them: the page-level proof projection reached decode.
+const METRIC_PAGES_SKIPPED: &str = "pages_skipped";
+
+/// The query-shape half of the columnar fast-path eligibility rule (ADR-0110
+/// decision 3), decided once at plan time by the provider and re-derived by the
+/// scan. The fast path is taken only when this AND the per-block
+/// `has_attrs_raw_page() == false` check both hold; otherwise the row path runs
+/// unchanged.
+///
+/// Two clauses live here because they do not vary per block:
+///
+/// - **(a) the projection does not include the `attrs` map column.** `attrs`
+///   ([`SPAN_COL_ATTRS`]) is the only column needing the dynamic per-key
+///   columns, the `attrs_raw` overflow decode, and the `_events_raw`
+///   reconstruction, which is precisely the work the fast path avoids. A
+///   `None` (all columns) projection includes `attrs`, so it is ineligible.
+/// - **(b) no pending selective-erasure predicate applies.** `is_erased_span`
+///   matches against the merged attribute map, exactly the structure the fast
+///   path never builds, so a scan carrying an erasure predicate drains the row
+///   path. This clause fails closed on purpose: the failure mode of getting
+///   erasure wrong is an erased span served to a client, not a slow query.
+///   Erasure is a rare tenant state and columnar erasure evaluation is a
+///   separate change (ADR-0110 decision 3).
+pub(crate) fn columnar_static_eligible(
+    projection: Option<&Vec<usize>>,
+    erasure: &[ErasurePredicate],
+) -> bool {
+    erasure.is_empty() && projection.is_some_and(|p| !p.contains(&SPAN_COL_ATTRS))
+}
+
+/// The RSPAN column ids a columnar decode must materialize for `projection`
+/// (ADR-0110 decision 3): the union of the projected columns, the ordering key
+/// columns [`COL_TRACE_ID`]/[`COL_START_TS`] (needed for the stable interleave
+/// even when the query projects neither), and the per-row predicate columns
+/// (those two plus [`COL_END_TS`]). So `SELECT name` still decodes trace_id and
+/// start_ts; dropping them because the projection omits them would break the
+/// advertised `(trace_id asc, start_ts asc)` order.
+fn union_projected_columns(projection: &[usize]) -> Vec<u32> {
+    // Ordering + predicate columns are always decoded.
+    let mut cols = vec![COL_TRACE_ID, COL_START_TS, COL_END_TS];
+    let mut push = |c: u32| {
+        if !cols.contains(&c) {
+            cols.push(c);
+        }
+    };
+    for &idx in projection {
+        match idx {
+            SPAN_COL_TRACE_ID => push(COL_TRACE_ID),
+            SPAN_COL_SPAN_ID => push(COL_SPAN_ID),
+            SPAN_COL_PARENT_SPAN_ID => push(COL_PARENT_SPAN_ID),
+            SPAN_COL_NAME => push(COL_NAME),
+            SPAN_COL_START_TS => push(COL_START_TS),
+            SPAN_COL_END_TS => push(COL_END_TS),
+            SPAN_COL_STATUS_CODE => push(COL_STATUS_CODE),
+            SPAN_COL_STATUS_MESSAGE => push(COL_STATUS_MESSAGE),
+            SPAN_COL_SERVICE_NAME => push(COL_SERVICE_NAME),
+            // duration_ns is computed from start_ts/end_ts, both already in the
+            // set above; the `attrs` map is ruled out by eligibility, so no
+            // other index reaches here.
+            _ => {}
+        }
+    }
+    cols
+}
 
 /// Span segment scan producing per-partition `(trace_id, start_ts)`-ordered
 /// batches over the public `spans` schema.
@@ -112,12 +191,28 @@ pub struct SpansScanExec {
     /// [`is_erased_span`] immediately after `fetcher.fetch_accounted` returns, before
     /// rows are sorted or built into batches. A no-op when empty.
     erasure: Arc<Vec<ErasurePredicate>>,
+    /// The pushed-down column projection (ADR-0110 decision 4). `Some` for the
+    /// eligible fast path: the scan emits `schema` (already the projected
+    /// schema) and the provider adds no `ProjectionExec`. `None` reproduces the
+    /// pre-ADR-0110 behavior: the full eleven-column schema, with the provider
+    /// wrapping a `ProjectionExec` above the scan for any column selection.
+    projection: Option<Arc<Vec<usize>>>,
+    /// Whether this scan may attempt the columnar fast path: the query-shape
+    /// clauses of [`columnar_static_eligible`] (projection excludes `attrs`, no
+    /// pending erasure). The remaining per-block clause (no `attrs_raw` overflow
+    /// page) is checked as each block is decoded, in [`prepare_partition`].
+    columnar_eligible: bool,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
     /// This query's accounting handle (ADR-0044), threaded into every
     /// per-partition fetch so span fetches are recorded like every other
     /// funnel, mirroring `LogsScanExec`.
     accounting: QueryAccounting,
+    /// Partition metrics (ADR-0110 decision 5): `columnar_batches`/
+    /// `rowpath_batches` show which path a partition ran, and
+    /// `pages_decoded`/`pages_skipped` show projection reaching decode, so
+    /// `EXPLAIN ANALYZE` and a test can assert eligibility directly.
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl SpansScanExec {
@@ -137,6 +232,7 @@ impl SpansScanExec {
         duration_ns: Option<(i64, i64)>,
         status_mask: Option<u8>,
         erasure: Arc<Vec<ErasurePredicate>>,
+        projection: Option<Vec<usize>>,
         accounting: QueryAccounting,
     ) -> DFResult<Self> {
         let n = target_partitions.max(1).min(segments.len().max(1));
@@ -144,8 +240,25 @@ impl SpansScanExec {
         for (i, seg) in segments.iter().enumerate() {
             partitions[i % n].push(seg.clone());
         }
-        let schema = spans_schema();
-        let properties = Arc::new(Self::compute_properties(&schema, n)?);
+        let full = spans_schema();
+        // `Some(proj)` projects the schema so the scan emits the projected
+        // shape directly (ADR-0110 decision 4); `None` keeps the full schema
+        // and the provider's `ProjectionExec`.
+        let (schema, projection): (SchemaRef, Option<Arc<Vec<usize>>>) = match projection {
+            Some(p) => {
+                for &i in &p {
+                    if i >= full.fields().len() {
+                        return Err(DataFusionError::Internal(format!(
+                            "spans scan projection index {i} out of range"
+                        )));
+                    }
+                }
+                (Arc::new(full.project(&p)?), Some(Arc::new(p)))
+            }
+            None => (full, None),
+        };
+        let columnar_eligible = columnar_static_eligible(projection.as_deref(), &erasure);
+        let properties = Arc::new(Self::compute_properties(&schema, n, projection.as_deref())?);
         Ok(SpansScanExec {
             tenant_hash,
             fetcher,
@@ -156,9 +269,12 @@ impl SpansScanExec {
             duration_ns,
             status_mask,
             erasure,
+            projection,
+            columnar_eligible,
             schema,
             properties,
             accounting,
+            metrics: ExecutionPlanMetricsSet::new(),
         })
     }
 
@@ -169,19 +285,37 @@ impl SpansScanExec {
         self.query
     }
 
-    fn compute_properties(schema: &SchemaRef, n: usize) -> DFResult<PlanProperties> {
+    fn compute_properties(
+        schema: &SchemaRef,
+        n: usize,
+        projection: Option<&Vec<usize>>,
+    ) -> DFResult<PlanProperties> {
         let asc = SortOptions {
             descending: false,
             nulls_first: false,
         };
         // Declared order is (trace_id asc, start_ts asc): the object's native
-        // sort key (ADR-0041), preserved by this stage's stable sort.
-        let ordering = LexOrdering::new(vec![
-            PhysicalSortExpr::new(col("trace_id", schema)?, asc),
-            PhysicalSortExpr::new(col("start_ts", schema)?, asc),
-        ])
-        .ok_or_else(|| DataFusionError::Internal("empty spans scan ordering".into()))?;
-        let eq = EquivalenceProperties::new_with_orderings(Arc::clone(schema), vec![ordering]);
+        // sort key (ADR-0041), preserved by this stage's stable sort. Under a
+        // projection the scan still emits rows in that order, but DataFusion can
+        // only be told about columns present in the output: advertise the
+        // longest PREFIX of (trace_id, start_ts) the projection keeps. start_ts
+        // is a secondary key, so it can be advertised only when trace_id is too;
+        // dropping trace_id leaves the rows unsorted by start_ts alone. A `None`
+        // projection keeps both.
+        let has = |field: usize| projection.is_none_or(|p| p.contains(&field));
+        let mut exprs = Vec::new();
+        if has(SPAN_COL_TRACE_ID) {
+            exprs.push(PhysicalSortExpr::new(col("trace_id", schema)?, asc));
+            if has(SPAN_COL_START_TS) {
+                exprs.push(PhysicalSortExpr::new(col("start_ts", schema)?, asc));
+            }
+        }
+        let eq = match LexOrdering::new(exprs) {
+            Some(ordering) => {
+                EquivalenceProperties::new_with_orderings(Arc::clone(schema), vec![ordering])
+            }
+            None => EquivalenceProperties::new(Arc::clone(schema)),
+        };
         Ok(PlanProperties::new(
             eq,
             Partitioning::UnknownPartitioning(n),
@@ -232,6 +366,10 @@ impl ExecutionPlan for SpansScanExec {
         Ok(self)
     }
 
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+
     fn execute(
         &self,
         partition: usize,
@@ -255,21 +393,107 @@ impl ExecutionPlan for SpansScanExec {
             self.duration_ns,
             self.status_mask,
             Arc::clone(&self.erasure),
+            self.columnar_eligible,
+            self.projection.clone(),
             self.accounting.clone(),
         ));
         Ok(Box::pin(SpanScanStream {
             schema,
             reservation,
+            metrics: SpanScanMetrics::new(&self.metrics, partition),
             state: SpanScanState::Fetching(fut),
         }))
     }
 }
 
+/// The per-partition metrics this scan publishes (ADR-0110 decision 5). `Count`
+/// is a shared handle, so a clone written by the stream updates the same counter
+/// `SpansScanExec::metrics` exposes to `EXPLAIN ANALYZE`.
+#[derive(Clone)]
+struct SpanScanMetrics {
+    /// Column pages the columnar decode decompressed this partition.
+    pages_decoded: Count,
+    /// Column pages the columnar decode skipped because the projection excluded
+    /// them. Zero on the row path, which decodes every page.
+    pages_skipped: Count,
+    /// Output batches this partition built through the columnar fast path,
+    /// straight from a [`ravel_rspan::ColumnarBlockView`] with no `SpanRecord`
+    /// and no `SpanRow`. The two paths' output is identical by construction, so
+    /// this and [`Self::rowpath_batches`] are the only externally visible proof
+    /// of which path a query took.
+    columnar_batches: Count,
+    /// Output batches this partition built through the row path: an ineligible
+    /// query (`attrs` projected, a pending erasure predicate) or an eligible one
+    /// that hit a block carrying an `attrs_raw` overflow page.
+    rowpath_batches: Count,
+}
+
+impl SpanScanMetrics {
+    fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
+        SpanScanMetrics {
+            pages_decoded: MetricBuilder::new(metrics).counter(METRIC_PAGES_DECODED, partition),
+            pages_skipped: MetricBuilder::new(metrics).counter(METRIC_PAGES_SKIPPED, partition),
+            columnar_batches: MetricBuilder::new(metrics)
+                .counter(METRIC_COLUMNAR_BATCHES, partition),
+            rowpath_batches: MetricBuilder::new(metrics).counter(METRIC_ROWPATH_BATCHES, partition),
+        }
+    }
+}
+
+/// One decoded block held for the whole partition on the columnar fast path,
+/// with the ascending block-row indices that survived the query's ts/trace_id
+/// predicates. The columnar builder reads its columns through
+/// [`DecodedBlock::view`] and gathers them over `rows`.
+struct HeldBlock {
+    block: DecodedBlock,
+    rows: Vec<usize>,
+}
+
+/// The columnar fast path's materialized partition (ADR-0110 decisions 3, 6):
+/// every decoded block the partition owns, plus a stable `(trace_id, start_ts)`
+/// ordering over their surviving rows as `(block index, block row)` pairs. The
+/// stream chunks `order` into [`BATCH_ROWS`] batches and gathers each projected
+/// column out of the referenced block's view.
+struct ColumnarPartition {
+    blocks: Vec<HeldBlock>,
+    /// `(block index, block row)` for every surviving row, stably sorted by
+    /// `(trace_id, start_ts)` so the emitted batches carry the advertised order.
+    order: Vec<(usize, usize)>,
+    /// The projected schema indices, in output order.
+    projection: Arc<Vec<usize>>,
+    /// Aggregate page counts across the partition's blocks, for the
+    /// `pages_decoded`/`pages_skipped` metrics.
+    pages_decoded: usize,
+    pages_skipped: usize,
+}
+
+/// What one partition's fetch produced: either the columnar fast path's held
+/// blocks and ordering, or a row-path `Vec<SpanRow>` (the ineligible path, or
+/// an eligible one that fell back on an `attrs_raw` block). `projection` on the
+/// row variant is the pushed projection (`Some` on the eligible-fallback path,
+/// so the built batch matches the plan's projected schema; `None` on the
+/// ineligible path, where a `ProjectionExec` above the scan does the selection).
+enum Prepared {
+    Rows {
+        rows: Vec<SpanRow>,
+        projection: Option<Arc<Vec<usize>>>,
+    },
+    Columnar(ColumnarPartition),
+}
+
 /// Fetch every segment in this partition and return its rows in `(trace_id,
-/// start_ts)` order. Every fetched row already satisfies `query` exactly (the
-/// scan re-checks the ts overlap and trace_id per row); the
-/// `service_name`/`name` bloom probes only ever widened the block read set, so
-/// nothing here narrows beyond what the exact per-row check keeps.
+/// start_ts)` order, columnar (the fast path) or as `SpanRow`s (the row path).
+///
+/// Every fetched row already satisfies `query` exactly (the scan re-checks the
+/// ts overlap and trace_id per row); the `service_name`/`name` bloom probes only
+/// ever widened the block read set, so nothing here narrows beyond what the
+/// exact per-row check keeps.
+///
+/// When `attempt_columnar` (the query-shape clauses of
+/// [`columnar_static_eligible`] held at plan time) the partition drains the
+/// columnar exit. A block carrying an `attrs_raw` overflow page fails the last
+/// eligibility clause (ADR-0110 decision 3): the whole partition falls back to
+/// the row path so no `attrs_raw` block is ever served columnar.
 #[allow(clippy::too_many_arguments)]
 async fn prepare_partition(
     fetcher: SpanSegmentFetcher,
@@ -281,8 +505,10 @@ async fn prepare_partition(
     duration_ns: Option<(i64, i64)>,
     status_mask: Option<u8>,
     erasure: Arc<Vec<ErasurePredicate>>,
+    attempt_columnar: bool,
+    projection: Option<Arc<Vec<usize>>>,
     accounting: QueryAccounting,
-) -> DFResult<Vec<SpanRow>> {
+) -> DFResult<Prepared> {
     // The bloom predicates for this scan: one per pushed literal, field-scoped
     // to the column it names (ADR-0054). The same set applies to every segment.
     let mut predicates: Vec<BloomPredicate> = Vec::new();
@@ -297,6 +523,30 @@ async fn prepare_partition(
             field_id: COL_NAME,
             literal: n.as_str(),
         });
+    }
+
+    if attempt_columnar {
+        // `attempt_columnar` implies the provider pushed a projection.
+        let proj = projection
+            .clone()
+            .ok_or_else(|| DataFusionError::Internal("columnar scan without projection".into()))?;
+        if let Some(part) = prepare_columnar(
+            &fetcher,
+            tenant_hash,
+            &segs,
+            &query,
+            duration_ns,
+            status_mask,
+            &predicates,
+            &proj,
+            &accounting,
+        )
+        .await?
+        {
+            return Ok(Prepared::Columnar(part));
+        }
+        // A block carried an `attrs_raw` overflow page: fall through to the row
+        // path for the whole partition, still emitting the projected schema.
     }
 
     let mut out: Vec<SpanRow> = Vec::new();
@@ -332,14 +582,121 @@ async fn prepare_partition(
             .cmp(&b.record.trace_id)
             .then_with(|| a.record.start_ts_ns.cmp(&b.record.start_ts_ns))
     });
-    Ok(out)
+    Ok(Prepared::Rows {
+        rows: out,
+        projection,
+    })
 }
 
-type PrepareFuture = Pin<Box<dyn Future<Output = DFResult<Vec<SpanRow>>> + Send>>;
+/// Drain the columnar exit for the whole partition (ADR-0110 decisions 3, 6).
+/// Returns `None` when a block carries an `attrs_raw` overflow page, signalling
+/// the caller to fall back to the row path; otherwise the held blocks and the
+/// stable `(trace_id, start_ts)` ordering over their surviving rows.
+#[allow(clippy::too_many_arguments)]
+async fn prepare_columnar(
+    fetcher: &SpanSegmentFetcher,
+    tenant_hash: TenantHash,
+    segs: &[SegmentRef],
+    query: &SpanQuery,
+    duration_ns: Option<(i64, i64)>,
+    status_mask: Option<u8>,
+    predicates: &[BloomPredicate<'_>],
+    projection: &Arc<Vec<usize>>,
+    accounting: &QueryAccounting,
+) -> DFResult<Option<ColumnarPartition>> {
+    let union = union_projected_columns(projection);
+    let mut blocks: Vec<HeldBlock> = Vec::new();
+    let mut pages_decoded = 0usize;
+    let mut pages_skipped = 0usize;
+    for seg in segs {
+        let Some(mut scan) = fetcher
+            .fetch_accounted_columnar(
+                seg,
+                tenant_hash,
+                query,
+                duration_ns,
+                status_mask,
+                predicates,
+                &union,
+                accounting,
+            )
+            .await
+            .map_err(SqlError::from)?
+        else {
+            continue;
+        };
+        while let Some(cb) = scan.next_block().map_err(SqlError::from)? {
+            // Last eligibility clause (ADR-0110 decision 3): a block carrying an
+            // `attrs_raw` overflow page fails closed to the row path, answered
+            // from page descriptors without decoding the page.
+            if cb.block.has_attrs_raw_page() {
+                return Ok(None);
+            }
+            pages_decoded += cb.block.pages_decoded();
+            pages_skipped += cb.block.pages_skipped();
+            if !cb.rows.is_empty() {
+                blocks.push(HeldBlock {
+                    block: cb.block,
+                    rows: cb.rows,
+                });
+            }
+        }
+    }
+
+    // Build the (trace_id, start_ts) ordering. Blocks arrive in segment order,
+    // then block order, and each block's `rows` is ascending, matching the row
+    // path's extend order; a stable sort by (trace_id, start_ts) then keeps ties
+    // in that same order, so the two paths interleave identically.
+    let mut keyed: Vec<([u8; 16], i64, usize, usize)> = Vec::new();
+    for (bi, held) in blocks.iter().enumerate() {
+        let view = held.block.view();
+        let trace = view.fixed_column(COL_TRACE_ID).map_err(corrupt)?;
+        let start = view.i64_column(COL_START_TS).map_err(corrupt)?;
+        for &r in &held.rows {
+            let tid: [u8; 16] = trace
+                .value_at(r)
+                .ok_or_else(|| DataFusionError::Internal("missing trace_id in survivor".into()))?
+                .try_into()
+                .map_err(|_| DataFusionError::Internal("trace_id width".into()))?;
+            let ts = start
+                .value_at(r)
+                .ok_or_else(|| DataFusionError::Internal("missing start_ts in survivor".into()))?;
+            keyed.push((tid, ts, bi, r));
+        }
+    }
+    keyed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let order: Vec<(usize, usize)> = keyed.into_iter().map(|(_, _, bi, r)| (bi, r)).collect();
+
+    Ok(Some(ColumnarPartition {
+        blocks,
+        order,
+        projection: Arc::clone(projection),
+        pages_decoded,
+        pages_skipped,
+    }))
+}
+
+/// Map a [`ravel_rspan::SpanSegError`] from a view accessor into a DataFusion
+/// error. A `ColumnNotRequested` here is a caller bug (a column read that the
+/// union in [`union_projected_columns`] did not request); it surfaces loudly
+/// rather than as a silent all-`NULL` column.
+fn corrupt(e: ravel_rspan::SpanSegError) -> DataFusionError {
+    DataFusionError::Internal(format!("columnar spans view: {e}"))
+}
+
+type PrepareFuture = Pin<Box<dyn Future<Output = DFResult<Prepared>> + Send>>;
 
 enum SpanScanState {
     Fetching(PrepareFuture),
-    Emitting { records: Vec<SpanRow>, pos: usize },
+    EmittingRows {
+        rows: Vec<SpanRow>,
+        projection: Option<Arc<Vec<usize>>>,
+        pos: usize,
+    },
+    EmittingColumnar {
+        part: ColumnarPartition,
+        pos: usize,
+    },
     Done,
 }
 
@@ -347,11 +704,26 @@ enum SpanScanState {
 /// `(trace_id, start_ts)`-ordered bounded batches, growing the memory
 /// reservation by each batch's measured size so a byte-budget overrun surfaces
 /// as the pool's `ResourcesExhausted`. The reservation lives on the stream so
-/// it frees exactly once on drop.
+/// it frees exactly once on drop. The per-batch reservation charge
+/// (`batch.get_array_memory_size()`) is identical on both paths (ADR-0110
+/// decision 3).
 struct SpanScanStream {
     schema: SchemaRef,
     reservation: MemoryReservation,
+    metrics: SpanScanMetrics,
     state: SpanScanState,
+}
+
+impl SpanScanStream {
+    /// Charge `batch` against the reservation and hand it out, or fail the
+    /// stream if the byte budget is exceeded.
+    fn emit(&mut self, batch: RecordBatch) -> Poll<Option<DFResult<RecordBatch>>> {
+        if let Err(e) = self.reservation.try_grow(batch.get_array_memory_size()) {
+            self.state = SpanScanState::Done;
+            return Poll::Ready(Some(Err(e)));
+        }
+        Poll::Ready(Some(Ok(batch)))
+    }
 }
 
 impl Stream for SpanScanStream {
@@ -362,8 +734,17 @@ impl Stream for SpanScanStream {
         loop {
             match &mut this.state {
                 SpanScanState::Fetching(fut) => match fut.as_mut().poll(cx) {
-                    Poll::Ready(Ok(records)) => {
-                        this.state = SpanScanState::Emitting { records, pos: 0 };
+                    Poll::Ready(Ok(Prepared::Rows { rows, projection })) => {
+                        this.state = SpanScanState::EmittingRows {
+                            rows,
+                            projection,
+                            pos: 0,
+                        };
+                    }
+                    Poll::Ready(Ok(Prepared::Columnar(part))) => {
+                        this.metrics.pages_decoded.add(part.pages_decoded);
+                        this.metrics.pages_skipped.add(part.pages_skipped);
+                        this.state = SpanScanState::EmittingColumnar { part, pos: 0 };
                     }
                     Poll::Ready(Err(e)) => {
                         this.state = SpanScanState::Done;
@@ -371,13 +752,21 @@ impl Stream for SpanScanStream {
                     }
                     Poll::Pending => return Poll::Pending,
                 },
-                SpanScanState::Emitting { records, pos } => {
-                    if *pos >= records.len() {
+                SpanScanState::EmittingRows {
+                    rows,
+                    projection,
+                    pos,
+                } => {
+                    if *pos >= rows.len() {
                         this.state = SpanScanState::Done;
                         return Poll::Ready(None);
                     }
-                    let end = (*pos + BATCH_ROWS).min(records.len());
-                    let batch = match build_batch(&records[*pos..end], Arc::clone(&this.schema)) {
+                    let end = (*pos + BATCH_ROWS).min(rows.len());
+                    let batch = match build_row_batch(
+                        &rows[*pos..end],
+                        Arc::clone(&this.schema),
+                        projection.as_deref().map(Vec::as_slice),
+                    ) {
                         Ok(b) => b,
                         Err(e) => {
                             this.state = SpanScanState::Done;
@@ -385,11 +774,30 @@ impl Stream for SpanScanStream {
                         }
                     };
                     *pos = end;
-                    if let Err(e) = this.reservation.try_grow(batch.get_array_memory_size()) {
+                    this.metrics.rowpath_batches.add(1);
+                    return this.emit(batch);
+                }
+                SpanScanState::EmittingColumnar { part, pos } => {
+                    if *pos >= part.order.len() {
                         this.state = SpanScanState::Done;
-                        return Poll::Ready(Some(Err(e)));
+                        return Poll::Ready(None);
                     }
-                    return Poll::Ready(Some(Ok(batch)));
+                    let end = (*pos + BATCH_ROWS).min(part.order.len());
+                    let batch = match build_columnar_batch(
+                        &part.blocks,
+                        &part.order[*pos..end],
+                        Arc::clone(&this.schema),
+                        &part.projection,
+                    ) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            this.state = SpanScanState::Done;
+                            return Poll::Ready(Some(Err(e)));
+                        }
+                    };
+                    *pos = end;
+                    this.metrics.columnar_batches.add(1);
+                    return this.emit(batch);
                 }
                 SpanScanState::Done => return Poll::Ready(None),
             }
@@ -403,112 +811,344 @@ impl RecordBatchStream for SpanScanStream {
     }
 }
 
-/// Decode a slice of rows into one `spans`-schema [`RecordBatch`].
-fn build_batch(rows: &[SpanRow], schema: SchemaRef) -> DFResult<RecordBatch> {
-    let mut trace = FixedSizeBinaryBuilder::with_capacity(rows.len(), TRACE_ID_WIDTH);
-    for row in rows {
-        trace
-            .append_value(row.record.trace_id)
-            .map_err(|e| SqlError::Internal(format!("trace_id array build: {e}")))?;
-    }
-    let trace = trace.finish();
-
-    let mut span = FixedSizeBinaryBuilder::with_capacity(rows.len(), SPAN_ID_WIDTH);
-    for row in rows {
-        span.append_value(row.record.span_id)
-            .map_err(|e| SqlError::Internal(format!("span_id array build: {e}")))?;
-    }
-    let span = span.finish();
-
-    let mut parent = FixedSizeBinaryBuilder::with_capacity(rows.len(), SPAN_ID_WIDTH);
-    for row in rows {
-        match &row.record.parent_span_id {
-            Some(id) => parent
-                .append_value(id)
-                .map_err(|e| SqlError::Internal(format!("parent_span_id array build: {e}")))?,
-            None => parent.append_null(),
-        }
-    }
-    let parent = parent.finish();
-
-    let name = StringArray::from(
-        rows.iter()
-            .map(|row| row.record.name.as_str())
-            .collect::<Vec<_>>(),
-    );
-    let start_ts = TimestampNanosecondArray::from(
-        rows.iter()
-            .map(|row| row.record.start_ts_ns)
-            .collect::<Vec<_>>(),
-    );
-    let end_ts = TimestampNanosecondArray::from(
-        rows.iter()
-            .map(|row| row.record.end_ts_ns)
-            .collect::<Vec<_>>(),
-    );
-    let status_code = UInt8Array::from(
-        rows.iter()
-            .map(|row| row.record.status_code.to_u8())
-            .collect::<Vec<_>>(),
-    );
-    let status_message = StringArray::from(
-        rows.iter()
-            .map(|row| row.record.status_message.as_deref())
-            .collect::<Vec<_>>(),
-    );
-
-    // `attrs` map: RSPAN already merged resource+scope+span into `record.attrs`
-    // with unique, ascending keys, so it copies straight into the column with
-    // no decode or re-verification (unlike `logs`, whose merged view is rebuilt
-    // at scan time from a stream-identity blob). `service.name` is present here
-    // too: the reader re-inserts it into the record's attrs from the v3 column,
-    // so this map is the same one a v1 object would have produced.
-    let mut attrs = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
-    for row in rows {
-        for (k, v) in &row.record.attrs {
-            attrs.keys().append_value(k);
-            attrs.values().append_value(v);
-        }
-        attrs
-            .append(true)
-            .map_err(|e| SqlError::Internal(format!("attrs map build: {e}")))?;
-    }
-    let attrs = attrs.finish();
-
-    // service_name (v3, ADR-0054): read straight from the dictionary-encoded
-    // `COL_SERVICE_NAME` column by the fetcher and carried on each [`SpanRow`],
-    // not looked up by linear scan of the merged attrs map at build time. NULL
-    // when the span carried no `service.name`.
-    let service_name = StringArray::from(
-        rows.iter()
-            .map(|row| row.service_name.as_deref())
-            .collect::<Vec<_>>(),
-    );
-    // duration_ns is computed, never stored (ADR-0045 decision 5, rejected
-    // alternative 3). `saturating_sub` rather than a bare `-`: end_ts_ns >=
-    // start_ts_ns is a format invariant, not one this column should assume
-    // and panic on if corrupt or adversarial data ever violates it.
-    let duration_ns = Int64Array::from(
-        rows.iter()
-            .map(|row| row.record.end_ts_ns.saturating_sub(row.record.start_ts_ns))
-            .collect::<Vec<_>>(),
-    );
-
-    let columns: Vec<ArrayRef> = vec![
-        Arc::new(trace),
-        Arc::new(span),
-        Arc::new(parent),
-        Arc::new(name),
-        Arc::new(start_ts),
-        Arc::new(end_ts),
-        Arc::new(status_code),
-        Arc::new(status_message),
-        Arc::new(attrs),
-        Arc::new(service_name),
-        Arc::new(duration_ns),
+/// Build one `spans` [`RecordBatch`] from a slice of [`SpanRow`]s, the row path
+/// (ADR-0110's fallback and the ineligible path).
+///
+/// `projection` `None` builds the full eleven-column schema (the ineligible
+/// path, where a `ProjectionExec` above the scan does the column selection);
+/// `Some(indices)` builds exactly those schema columns in order, so an eligible
+/// query that fell back on an `attrs_raw` block still emits the projected schema
+/// the plan advertises. `schema` must match: the full schema for `None`, the
+/// projected schema for `Some`.
+fn build_row_batch(
+    rows: &[SpanRow],
+    schema: SchemaRef,
+    projection: Option<&[usize]>,
+) -> DFResult<RecordBatch> {
+    let all: [usize; 11] = [
+        SPAN_COL_TRACE_ID,
+        SPAN_COL_SPAN_ID,
+        SPAN_COL_PARENT_SPAN_ID,
+        SPAN_COL_NAME,
+        SPAN_COL_START_TS,
+        SPAN_COL_END_TS,
+        SPAN_COL_STATUS_CODE,
+        SPAN_COL_STATUS_MESSAGE,
+        SPAN_COL_ATTRS,
+        SPAN_COL_SERVICE_NAME,
+        SPAN_COL_DURATION_NS,
     ];
+    let indices = projection.unwrap_or(&all);
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(indices.len());
+    for &idx in indices {
+        columns.push(row_column(idx, rows)?);
+    }
     debug_assert_eq!(schema.fields().len(), columns.len());
     RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)
+}
+
+/// Build one `spans` column array for schema index `idx` from the row path's
+/// [`SpanRow`]s.
+fn row_column(idx: usize, rows: &[SpanRow]) -> DFResult<ArrayRef> {
+    Ok(match idx {
+        SPAN_COL_TRACE_ID => {
+            let mut b = FixedSizeBinaryBuilder::with_capacity(rows.len(), TRACE_ID_WIDTH);
+            for row in rows {
+                b.append_value(row.record.trace_id)
+                    .map_err(|e| SqlError::Internal(format!("trace_id array build: {e}")))?;
+            }
+            Arc::new(b.finish())
+        }
+        SPAN_COL_SPAN_ID => {
+            let mut b = FixedSizeBinaryBuilder::with_capacity(rows.len(), SPAN_ID_WIDTH);
+            for row in rows {
+                b.append_value(row.record.span_id)
+                    .map_err(|e| SqlError::Internal(format!("span_id array build: {e}")))?;
+            }
+            Arc::new(b.finish())
+        }
+        SPAN_COL_PARENT_SPAN_ID => {
+            let mut b = FixedSizeBinaryBuilder::with_capacity(rows.len(), SPAN_ID_WIDTH);
+            for row in rows {
+                match &row.record.parent_span_id {
+                    Some(id) => b.append_value(id).map_err(|e| {
+                        SqlError::Internal(format!("parent_span_id array build: {e}"))
+                    })?,
+                    None => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
+        SPAN_COL_NAME => Arc::new(StringArray::from(
+            rows.iter()
+                .map(|row| row.record.name.as_str())
+                .collect::<Vec<_>>(),
+        )),
+        SPAN_COL_START_TS => Arc::new(TimestampNanosecondArray::from(
+            rows.iter()
+                .map(|row| row.record.start_ts_ns)
+                .collect::<Vec<_>>(),
+        )),
+        SPAN_COL_END_TS => Arc::new(TimestampNanosecondArray::from(
+            rows.iter()
+                .map(|row| row.record.end_ts_ns)
+                .collect::<Vec<_>>(),
+        )),
+        SPAN_COL_STATUS_CODE => Arc::new(UInt8Array::from(
+            rows.iter()
+                .map(|row| row.record.status_code.to_u8())
+                .collect::<Vec<_>>(),
+        )),
+        SPAN_COL_STATUS_MESSAGE => Arc::new(StringArray::from(
+            rows.iter()
+                .map(|row| row.record.status_message.as_deref())
+                .collect::<Vec<_>>(),
+        )),
+        SPAN_COL_ATTRS => {
+            // `attrs` map: RSPAN already merged resource+scope+span into
+            // `record.attrs` with unique, ascending keys, so it copies straight
+            // into the column with no decode or re-verification (unlike `logs`,
+            // whose merged view is rebuilt at scan time from a stream-identity
+            // blob). `service.name` is present here too: the reader re-inserts
+            // it into the record's attrs from the v3 column, so this map is the
+            // same one a v1 object would have produced.
+            let mut attrs = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+            for row in rows {
+                for (k, v) in &row.record.attrs {
+                    attrs.keys().append_value(k);
+                    attrs.values().append_value(v);
+                }
+                attrs
+                    .append(true)
+                    .map_err(|e| SqlError::Internal(format!("attrs map build: {e}")))?;
+            }
+            Arc::new(attrs.finish())
+        }
+        // service_name (v3, ADR-0054): read straight from the dictionary-encoded
+        // `COL_SERVICE_NAME` column by the fetcher and carried on each
+        // [`SpanRow`], not looked up by linear scan of the merged attrs map at
+        // build time. NULL when the span carried no `service.name`.
+        SPAN_COL_SERVICE_NAME => Arc::new(StringArray::from(
+            rows.iter()
+                .map(|row| row.service_name.as_deref())
+                .collect::<Vec<_>>(),
+        )),
+        // duration_ns is computed, never stored (ADR-0045 decision 5, rejected
+        // alternative 3). `saturating_sub` rather than a bare `-`: end_ts_ns >=
+        // start_ts_ns is a format invariant, not one this column should assume
+        // and panic on if corrupt or adversarial data ever violates it.
+        SPAN_COL_DURATION_NS => Arc::new(Int64Array::from(
+            rows.iter()
+                .map(|row| row.record.end_ts_ns.saturating_sub(row.record.start_ts_ns))
+                .collect::<Vec<_>>(),
+        )),
+        other => {
+            return Err(DataFusionError::Internal(format!(
+                "spans row column index {other} out of range"
+            )));
+        }
+    })
+}
+
+/// Build one `spans` [`RecordBatch`] straight from the columnar view (ADR-0110
+/// decision 3), gathering each projected column out of the referenced block's
+/// view over `order` (`(block index, block row)` pairs in output order). No
+/// `SpanRecord` and no `SpanRow`. `attrs` is never among `projection` here (the
+/// fast path is not eligible when it is), so the dynamic attribute pages, the
+/// `attrs_raw` page, and the event pages are never touched.
+fn build_columnar_batch(
+    blocks: &[HeldBlock],
+    order: &[(usize, usize)],
+    schema: SchemaRef,
+    projection: &[usize],
+) -> DFResult<RecordBatch> {
+    let views: Vec<_> = blocks.iter().map(|h| h.block.view()).collect();
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(projection.len());
+    for &idx in projection {
+        columns.push(columnar_column(idx, &views, order)?);
+    }
+    debug_assert_eq!(schema.fields().len(), columns.len());
+    RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)
+}
+
+/// Build one `spans` column array for schema index `idx` by gathering the
+/// mapped RSPAN column out of each row's block view over `order`.
+fn columnar_column(
+    idx: usize,
+    views: &[ravel_rspan::ColumnarBlockView<'_>],
+    order: &[(usize, usize)],
+) -> DFResult<ArrayRef> {
+    // Every fixed/i64/str accessor is fallible only when the column was not
+    // requested by the decode; `union_projected_columns` requests every column
+    // any projected index reads, so a projected build never hits that error.
+    Ok(match idx {
+        SPAN_COL_TRACE_ID => {
+            let cols = fixed_cols(views, COL_TRACE_ID)?;
+            let mut b = FixedSizeBinaryBuilder::with_capacity(order.len(), TRACE_ID_WIDTH);
+            for &(bi, r) in order {
+                let v = cols[bi]
+                    .value_at(r)
+                    .ok_or_else(|| DataFusionError::Internal("missing trace_id".into()))?;
+                b.append_value(v)
+                    .map_err(|e| SqlError::Internal(format!("trace_id array build: {e}")))?;
+            }
+            Arc::new(b.finish())
+        }
+        SPAN_COL_SPAN_ID => {
+            let cols = fixed_cols(views, COL_SPAN_ID)?;
+            let mut b = FixedSizeBinaryBuilder::with_capacity(order.len(), SPAN_ID_WIDTH);
+            for &(bi, r) in order {
+                let v = cols[bi]
+                    .value_at(r)
+                    .ok_or_else(|| DataFusionError::Internal("missing span_id".into()))?;
+                b.append_value(v)
+                    .map_err(|e| SqlError::Internal(format!("span_id array build: {e}")))?;
+            }
+            Arc::new(b.finish())
+        }
+        SPAN_COL_PARENT_SPAN_ID => {
+            let cols = fixed_cols(views, COL_PARENT_SPAN_ID)?;
+            let mut b = FixedSizeBinaryBuilder::with_capacity(order.len(), SPAN_ID_WIDTH);
+            for &(bi, r) in order {
+                match cols[bi].value_at(r) {
+                    Some(v) => b.append_value(v).map_err(|e| {
+                        SqlError::Internal(format!("parent_span_id array build: {e}"))
+                    })?,
+                    None => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
+        SPAN_COL_NAME => {
+            let cols = str_cols(views, COL_NAME)?;
+            let mut b = StringBuilder::new();
+            for &(bi, r) in order {
+                let v = cols[bi]
+                    .value_at(r)
+                    .ok_or_else(|| DataFusionError::Internal("missing name".into()))?;
+                b.append_value(str_utf8(v)?);
+            }
+            Arc::new(b.finish())
+        }
+        SPAN_COL_START_TS => {
+            let cols = i64_cols(views, COL_START_TS)?;
+            Arc::new(TimestampNanosecondArray::from(gather_i64(
+                &cols, order, "start_ts",
+            )?))
+        }
+        SPAN_COL_END_TS => {
+            let cols = i64_cols(views, COL_END_TS)?;
+            Arc::new(TimestampNanosecondArray::from(gather_i64(
+                &cols, order, "end_ts",
+            )?))
+        }
+        SPAN_COL_STATUS_CODE => {
+            let cols = i64_cols(views, COL_STATUS_CODE)?;
+            let mut out: Vec<u8> = Vec::with_capacity(order.len());
+            for &(bi, r) in order {
+                let v = cols[bi]
+                    .value_at(r)
+                    .ok_or_else(|| DataFusionError::Internal("missing status_code".into()))?;
+                out.push(
+                    u8::try_from(v)
+                        .map_err(|_| DataFusionError::Internal("status_code range".into()))?,
+                );
+            }
+            Arc::new(UInt8Array::from(out))
+        }
+        SPAN_COL_STATUS_MESSAGE => {
+            let cols = str_cols(views, COL_STATUS_MESSAGE)?;
+            let mut b = StringBuilder::new();
+            for &(bi, r) in order {
+                match cols[bi].value_at(r) {
+                    Some(v) => b.append_value(str_utf8(v)?),
+                    None => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
+        SPAN_COL_SERVICE_NAME => {
+            let cols = str_cols(views, COL_SERVICE_NAME)?;
+            let mut b = StringBuilder::new();
+            for &(bi, r) in order {
+                match cols[bi].value_at(r) {
+                    Some(v) => b.append_value(str_utf8(v)?),
+                    None => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
+        SPAN_COL_DURATION_NS => {
+            // Computed exactly as the row path: end - start with saturating_sub
+            // (end >= start is a format invariant, not one this column panics on).
+            let starts = i64_cols(views, COL_START_TS)?;
+            let ends = i64_cols(views, COL_END_TS)?;
+            let mut out: Vec<i64> = Vec::with_capacity(order.len());
+            for &(bi, r) in order {
+                let s = starts[bi]
+                    .value_at(r)
+                    .ok_or_else(|| DataFusionError::Internal("missing start_ts".into()))?;
+                let e = ends[bi]
+                    .value_at(r)
+                    .ok_or_else(|| DataFusionError::Internal("missing end_ts".into()))?;
+                out.push(e.saturating_sub(s));
+            }
+            Arc::new(Int64Array::from(out))
+        }
+        other => {
+            // `attrs` (SPAN_COL_ATTRS) never reaches here: the fast path is
+            // ineligible when it is projected.
+            return Err(DataFusionError::Internal(format!(
+                "spans columnar column index {other} not supported on the fast path"
+            )));
+        }
+    })
+}
+
+/// Per-block fixed-column handles for `col`, one per view, in block order.
+fn fixed_cols<'a>(
+    views: &[ravel_rspan::ColumnarBlockView<'a>],
+    col: u32,
+) -> DFResult<Vec<ravel_rspan::BytesColumn<'a>>> {
+    views.iter().map(|v| v.fixed_column(col).map_err(corrupt)).collect()
+}
+
+/// Per-block string-column handles for `col`, one per view, in block order.
+fn str_cols<'a>(
+    views: &[ravel_rspan::ColumnarBlockView<'a>],
+    col: u32,
+) -> DFResult<Vec<ravel_rspan::BytesColumn<'a>>> {
+    views.iter().map(|v| v.str_column(col).map_err(corrupt)).collect()
+}
+
+/// Per-block i64-column handles for `col`, one per view, in block order.
+fn i64_cols<'a>(
+    views: &[ravel_rspan::ColumnarBlockView<'a>],
+    col: u32,
+) -> DFResult<Vec<ravel_rspan::I64Column<'a>>> {
+    views.iter().map(|v| v.i64_column(col).map_err(corrupt)).collect()
+}
+
+/// Gather a required i64 column over `order`, erroring on a missing cell.
+fn gather_i64(
+    cols: &[ravel_rspan::I64Column<'_>],
+    order: &[(usize, usize)],
+    what: &str,
+) -> DFResult<Vec<i64>> {
+    let mut out = Vec::with_capacity(order.len());
+    for &(bi, r) in order {
+        out.push(
+            cols[bi]
+                .value_at(r)
+                .ok_or_else(|| DataFusionError::Internal(format!("missing {what}")))?,
+        );
+    }
+    Ok(out)
+}
+
+/// Validate a byte column cell as UTF-8, mirroring the row path's `string_from`.
+fn str_utf8(bytes: &[u8]) -> DFResult<&str> {
+    std::str::from_utf8(bytes).map_err(|_| DataFusionError::Internal("value not utf-8".into()))
 }
 
 #[cfg(test)]
