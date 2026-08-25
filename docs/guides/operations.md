@@ -1139,7 +1139,11 @@ to either role's grant — Query and Admin are scoped to `kms:Decrypt` per the
 mapping above. A `--tenant-kms-config` deployment relying on those specific
 write paths for a KMS-routed tenant should treat this as an open gap, not a
 covered one, and grant `kms:GenerateDataKey*` to that role manually pending
-a follow-up.
+a follow-up. When the Admin role hits this on a reconstruct write,
+`ravel-cli commit reconstruct` now surfaces this specific condition in its
+own error text (naming the ADR-0055 limitation and pointing back to this
+section) rather than a generic write failure, so an operator is directed
+here straight from the CLI.
 
 **Known gap, not fixed by this change:** the `t/<hash>/enc` key-epoch
 record needs its own IAM read/write grant, which the shipped
