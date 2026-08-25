@@ -110,6 +110,8 @@ mod imp {
     impl ProfileSession {
         /// Starts a session iff [`PROFILE_ENV`] names a path; otherwise returns
         /// an inert session whose `finish` does nothing.
+        ///
+        /// See issue #680: the sampler must survive a concurrent query plan.
         pub fn from_env(label: &str) -> Self {
             match std::env::var_os(PROFILE_ENV) {
                 Some(p) if !p.is_empty() => Self::to_path(label, PathBuf::from(p)),
