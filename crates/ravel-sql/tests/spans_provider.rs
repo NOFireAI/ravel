@@ -20,6 +20,11 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+// The Flight SQL reachability test drives the shared in-process harness, which
+// only links under the `flight-sql` feature.
+#[cfg(feature = "flight-sql")]
+mod util;
+
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -490,4 +495,254 @@ async fn a_spans_scan_is_accounted() {
         expected_bytes,
         "the accounted GET records the whole object's transferred bytes"
     );
+}
+
+/// Reachability (ADR-0110 decisions 3-5): a `SELECT` over the `spans` table,
+/// driven through the real Flight SQL surface end to end (`GetFlightInfo` then
+/// `DoGet`), takes the columnar fast path.
+///
+/// The other tests in this file drive `SpansScanExec`/`SpansTableProvider`
+/// directly, which proves the code works; this proves a real caller on the
+/// shipping surface reaches it. The Flight round trip returns only record
+/// batches, not the scan's plan metrics, so "the columnar path ran" is asserted
+/// through the query's cost accounting instead: the columnar exit records
+/// `page_bytes_decoded` strictly below `page_bytes_fetched` whenever it skips a
+/// page (ADR-0110 decision 2), which the row path never does (it decodes every
+/// page, so the two are equal). A custom `QueryCostRecorder` captures the
+/// per-query snapshot the Flight service folds on stream end.
+///
+/// The fixture spans carry `service.name`, an extra dynamic attribute, and an
+/// event, so the attrs-excluding projection has attribute and event pages to
+/// skip; without them both paths decode the same pages and the metric proof is
+/// vacuous. Forcing the row path (making `columnar_static_eligible` return
+/// `false`, or projecting `attrs`) makes `page_bytes_decoded == page_bytes_fetched`
+/// and turns the metric assertion red.
+#[cfg(feature = "flight-sql")]
+mod flight_reachability {
+    use std::sync::{Arc, Mutex};
+
+    use datafusion::arrow::array::{Array, FixedSizeBinaryArray, Int64Array, StringArray};
+    use ravel_commit::keys;
+    use ravel_commit::publish::{self, RetryPolicy};
+    use ravel_commit::record::{self, NewCommitRecord};
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_object_store::{ObjectStoreBackend, PutOptions};
+    use ravel_rspan::{ObjectIdentity, RspanConfig, RspanWriter, SpanRecord, StatusCode};
+    use ravel_types::Signal;
+    use ravel_types::accounting::{
+        CostEstimate, QueryAccountingSnapshot, QueryCostRecorder, QueryWorkloadClass,
+    };
+    use ravel_types::{TenantHash, TenantId};
+    use uuid::Uuid;
+
+    use crate::util::SegSpec;
+    use crate::util::flight_harness::Harness;
+    use crate::util::tenant_id;
+
+    const QUERY: &str =
+        "SELECT trace_id, name, start_ts, duration_ns FROM spans ORDER BY trace_id, start_ts";
+
+    /// A `QueryCostRecorder` that keeps every recorded snapshot, so the test can
+    /// read the execution snapshot the `DoGet` stream folds on end.
+    #[derive(Default)]
+    struct CapturingRecorder {
+        snapshots: Mutex<Vec<QueryAccountingSnapshot>>,
+    }
+
+    impl QueryCostRecorder for CapturingRecorder {
+        fn record(
+            &self,
+            accounting: &QueryAccountingSnapshot,
+            _estimate: &CostEstimate,
+            _tenant_hash: TenantHash,
+            _workload_class: QueryWorkloadClass,
+        ) {
+            self.snapshots
+                .lock()
+                .expect("recorder lock")
+                .push(*accounting);
+        }
+    }
+
+    /// Length-delimited, hex-encoded `_events_raw` value carrying one event, the
+    /// grammar `ravel_rspan::record::parse_events` promotes into event columns,
+    /// so the block has an event page the attrs-excluding decode skips.
+    fn one_event_raw() -> String {
+        // uvarint length prefix (3) then a small verbatim payload.
+        let raw = [0x03u8, 0x08, 0x02, 0x01];
+        raw.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn span(trace: u8, span_id: u8, start: i64, name: &str) -> SpanRecord {
+        SpanRecord {
+            trace_id: [trace; 16],
+            span_id: [span_id; 8],
+            parent_span_id: None,
+            name: name.to_string(),
+            start_ts_ns: start,
+            end_ts_ns: start + 50,
+            status_code: StatusCode::Ok,
+            status_message: None,
+            attrs: vec![
+                ("service.name".to_string(), "checkout".to_string()),
+                ("http.method".to_string(), "GET".to_string()),
+                ("_events_raw".to_string(), one_event_raw()),
+            ],
+        }
+    }
+
+    /// Publish one RSPAN object as a real `Signal::Spans` commit record, so the
+    /// executor's `Catalog::resolve` finds it exactly as a production caller
+    /// would (no hand-built `Snapshot`).
+    async fn publish_spans_segment(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantId,
+        records: &[SpanRecord],
+    ) {
+        let tenant_hash = tenant.hash();
+        let identity = ObjectIdentity {
+            tenant_hash: tenant_hash.0,
+            shard: 0,
+            writer_id: [2u8; 16],
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let mut w = RspanWriter::new(RspanConfig::default(), identity);
+        for r in records {
+            w.push(r.clone());
+        }
+        let bytes = w.finish().expect("finish object");
+        let min = records
+            .iter()
+            .map(|r| r.start_ts_ns)
+            .min()
+            .expect("nonempty");
+        let max = records.iter().map(|r| r.end_ts_ns).max().expect("nonempty");
+        let content_hash = *blake3::hash(&bytes).as_bytes();
+        let new_record = NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Spans,
+            shard: 0,
+            writer_id: Uuid::from_u128(1),
+            writer_epoch: 1,
+            writer_seq: 1,
+            object_size: bytes.len() as u64,
+            content_hash,
+            sample_count: records.len() as u64,
+            series_count: 0,
+            min_event_ts_ns: min,
+            max_event_ts_ns: max,
+            min_ingest_ts_ns: min,
+            max_ingest_ts_ns: max,
+            segment_format_version: 1,
+            created_unix_ns: 0,
+            ingest_hour_bucket: 0,
+        };
+        let rec = record::build(new_record).expect("valid commit record");
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        store
+            .put(&data_key, bytes::Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("put data object");
+        publish::publish(store, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish");
+    }
+
+    #[tokio::test]
+    async fn flight_sql_spans_select_takes_the_columnar_path() {
+        let tenant = tenant_id("acme");
+        let recorder = Arc::new(CapturingRecorder::default());
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        // No metrics segments; the spans segment is published straight to the
+        // store the harness's catalog resolves against.
+        let no_specs: &[SegSpec] = &[];
+        let harness = Harness::build_with_recorder(
+            Arc::clone(&store),
+            &[(&tenant, no_specs)],
+            recorder.clone() as Arc<dyn QueryCostRecorder>,
+        )
+        .await;
+
+        // Two traces, two spans each, all carrying attributes and an event.
+        let records = vec![
+            span(0, 0, 100, "a-root"),
+            span(0, 1, 150, "a-child"),
+            span(1, 0, 200, "b-root"),
+            span(1, 1, 250, "b-child"),
+        ];
+        publish_spans_segment(harness.store.as_ref(), &tenant, &records).await;
+
+        let ticket = harness
+            .get_flight_info("acme", QUERY)
+            .await
+            .expect("flight info");
+        let batches = harness.do_get("acme", &ticket).await.expect("do get");
+
+        // The rows are correct: every span comes back, projected to
+        // (trace_id, name, start_ts, duration_ns) in (trace_id, start_ts) order.
+        let mut names = Vec::new();
+        let mut trace_ids = Vec::new();
+        for batch in &batches {
+            assert_eq!(batch.num_columns(), 4, "projected to four columns");
+            let trace = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .expect("trace_id column");
+            let name = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("name column");
+            let duration = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("duration_ns column");
+            for i in 0..batch.num_rows() {
+                let tid: [u8; 16] = trace.value(i).try_into().expect("16-byte trace");
+                trace_ids.push(tid);
+                names.push(name.value(i).to_string());
+                assert_eq!(duration.value(i), 50, "duration_ns is end - start");
+            }
+        }
+        assert_eq!(
+            names,
+            vec![
+                "a-root".to_string(),
+                "a-child".to_string(),
+                "b-root".to_string(),
+                "b-child".to_string(),
+            ],
+            "every span is returned once, in (trace_id, start_ts) order"
+        );
+        assert_eq!(
+            trace_ids,
+            vec![[0u8; 16], [0u8; 16], [1u8; 16], [1u8; 16]],
+            "rows are emitted in trace_id ascending order"
+        );
+
+        // The columnar path ran: the execution snapshot decoded strictly fewer
+        // page bytes than it fetched, because the attrs-excluding projection
+        // skipped the attribute and event pages. The row path decodes every
+        // page, so the two would be equal. `get_flight_info` also records a
+        // planning snapshot with zero page bytes; the execution snapshot is the
+        // one with page bytes fetched, so pick the maximum.
+        let snapshots = recorder.snapshots.lock().expect("recorder lock");
+        let execution = snapshots
+            .iter()
+            .max_by_key(|s| s.page_bytes_fetched)
+            .expect("at least one recorded query");
+        assert!(
+            execution.page_bytes_fetched > 0,
+            "the spans scan must have decoded at least one block"
+        );
+        assert!(
+            execution.page_bytes_decoded < execution.page_bytes_fetched,
+            "the columnar fast path must skip pages: decoded {} of {} fetched",
+            execution.page_bytes_decoded,
+            execution.page_bytes_fetched,
+        );
+    }
 }
