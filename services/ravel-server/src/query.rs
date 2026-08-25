@@ -289,8 +289,14 @@ pub fn build_sql_state(
     // `QueryBudgets::apply_to_engine`. This is the single wiring point for it, so
     // an operator who sets the flag to `u64::MAX` gets whole-object logs reads
     // (the pre-ADR-0107 shape) on every SQL logs scan this process serves.
+    // `--fetch-concurrency` is documented (ADR-0088) as the knob that bounds
+    // S3 GET concurrency; the logs fetcher keeps its own permit pool (ADR-0107
+    // decision 1, separate from RSEG's), so the bound has to be handed to it
+    // here or the pool stays at its compiled-in 16 whatever the flag says
+    // (issue #700).
     let mut logs_fetcher = LogSegmentFetcher::new(store.clone())
-        .with_block_range_threshold(config.engine.logs_block_range_threshold);
+        .with_block_range_threshold(config.engine.logs_block_range_threshold)
+        .with_max_concurrent_gets(config.engine.fetch_concurrency);
     // The spans fetcher (RSPAN) reads the same object store, with the default
     // RspanConfig (ADR-0045 decision 5). It attaches no fetcher cache: unlike
     // the RSEG/RLOG fetchers it has no `with_cache` seam, and none is wired
