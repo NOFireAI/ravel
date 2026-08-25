@@ -177,6 +177,7 @@ use datafusion::arrow::array::{
 };
 use datafusion::arrow::datatypes::{Int32Type, SchemaRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
+use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
@@ -187,7 +188,7 @@ use datafusion::physical_plan::metrics::{
 };
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties, RecordBatchStream,
-    SendableRecordBatchStream,
+    SendableRecordBatchStream, Statistics,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use ravel_catalog::SegmentRef;
@@ -653,6 +654,35 @@ impl LogsScanExec {
     /// than whole segments (ADR-0102) removes even the per-segment grouping a
     /// partition used to have, which only reinforces that no ordering can be
     /// declared. Downstream operators that need one get an explicit sort.
+    /// Whether the sum of the snapshot's `SegmentRef::sample_count` values is
+    /// the exact row count of this scan's output (issue #698). It is only when
+    /// nothing between the committed counts and the emitted rows can remove a
+    /// row:
+    ///
+    /// - no ts bound: `ts_min`/`ts_max` are the no-op sentinels a `None`
+    ///   `LogsPushdown::ts_lo`/`ts_hi` lower to (`i64::MIN`/`i64::MAX`);
+    /// - no content predicate (`LogsPushdown::content`, the `has_word` arms
+    ///   evaluated exactly per row);
+    /// - no attribute-equality prune predicate (`LogsPushdown::prune`); a prune
+    ///   is block-only and widen-safe, so it never changes the row count, but a
+    ///   present prune means a predicate was pushed, so treat it as not-exact
+    ///   too and only claim the count for a truly predicate-free query;
+    /// - no pending selective erasure (ADR-0064 decision 2): a pending erasure
+    ///   predicate removes rows the committed counts still include, so the sum
+    ///   overstates the answer. Fail closed.
+    ///
+    /// The projection is irrelevant to the count, so it is not consulted.
+    /// `LogsPushdown` has exactly these four fields (`ts_lo`, `ts_hi`,
+    /// `content`, `prune`); each is covered here, and `erasure` comes from the
+    /// resolved snapshot rather than the pushdown.
+    fn count_is_exact(&self) -> bool {
+        self.ts_min == i64::MIN
+            && self.ts_max == i64::MAX
+            && self.content.is_empty()
+            && self.prune.is_empty()
+            && self.erasure.is_empty()
+    }
+
     fn compute_properties(schema: &SchemaRef, n: usize) -> PlanProperties {
         let eq = EquivalenceProperties::new(Arc::clone(schema));
         PlanProperties::new(
@@ -715,6 +745,48 @@ impl ExecutionPlan for LogsScanExec {
 
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
+    }
+
+    /// Report the exact row count for a predicate-free, erasure-free
+    /// `COUNT(*)` straight from the catalog's committed row counts, so
+    /// DataFusion's `AggregateStatistics` physical-optimizer rule rewrites the
+    /// aggregate into a literal and never executes this scan (issue #698). On
+    /// the ClickBench tenant (issue #680) a scanning `count(*)` moved 23 GB
+    /// from object storage to add up 8424 numbers the resolve already had.
+    ///
+    /// `num_rows` is `Exact` only for the whole-plan request (`partition` is
+    /// `None`) and only when [`Self::count_is_exact`] holds; a per-partition
+    /// request gets `Absent`, because a partition's count is its lazily
+    /// resolved striped share of the blocks, not known here. `total_byte_size`
+    /// and every `column_statistics` stay `Absent` (ts min/max is a follow-up).
+    fn partition_statistics(&self, partition: Option<usize>) -> DFResult<Arc<Statistics>> {
+        // Validate the partition index exactly as the trait default does, so an
+        // out-of-range request is an internal error, never a silent answer.
+        if let Some(idx) = partition {
+            let partition_count = self.properties().partitioning.partition_count();
+            if idx >= partition_count {
+                return Err(DataFusionError::Internal(format!(
+                    "Invalid partition index: {idx}, the partition count is {partition_count}"
+                )));
+            }
+        }
+
+        let mut stats = Statistics::new_unknown(&self.schema());
+        if partition.is_none() && self.count_is_exact() {
+            // Sum in u64 with checked addition; overflow of either the sum or
+            // the usize conversion falls back to Absent rather than a wrong
+            // count or a panic.
+            let total: Option<u64> = self
+                .segments
+                .iter()
+                .try_fold(0u64, |acc, seg| acc.checked_add(seg.sample_count));
+            if let Some(total) = total
+                && let Ok(n) = usize::try_from(total)
+            {
+                stats.num_rows = Precision::Exact(n);
+            }
+        }
+        Ok(Arc::new(stats))
     }
 
     fn execute(
