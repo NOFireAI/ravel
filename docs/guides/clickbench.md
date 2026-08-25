@@ -31,6 +31,11 @@ report carries its own provenance (backend, region/endpoint, host logical cores,
 dataset id, runs). A latency table without its backend named will mislead the
 first person who compares two runs.
 
+Prior to #677 the `--tenant` lane resolved shard 0 only, so any earlier
+multi-shard report understates the dataset (it measured, and reported an object
+count for, one shard's slice of the data rather than the whole tenant); treat
+pre-#677 multi-shard tenant numbers as a lower bound, not the dataset.
+
 ## 0. Prerequisites
 
 - An object store both `ravel-cli` and `sql_latency_bench` can reach. The bench
@@ -196,6 +201,24 @@ cargo run -p ravel-bench --features sql-latency --bin sql_latency_bench -- \
   number for it. Pass a larger byte budget (for example `--sql-max-query-bytes
   1073741824` for 1 GiB) to measure it instead. Omitted, it defaults to
   ravel-sql's compiled-in 256 MiB, leaving the measured budget unchanged.
+- `--shards <N>` sets how many shards the resolve scans. Omitted, it reads the
+  tenant's durable provisioning record (the one `ravel-cli load` writes) and uses
+  that record's shard ceiling, so a tenant loaded with `--shards 4` is measured
+  over all four. Pass `--shards` explicitly only for a tenant loaded before
+  provisioning records existed (that tenant has no record; without the flag the
+  run refuses rather than guess). If both a `--shards` value and a record are
+  present and they disagree, the run errors rather than silently preferring one.
+- `--cache-bytes <N>` attaches an ADR-0046 read cache of `N` bytes to the query
+  fetcher, so a statement's repeat runs can serve from cache and the report's
+  `cache_hits`/`cache_misses`/`cache_bytes` become meaningful. Omitted (default
+  `0`), no cache is attached and the fetcher is byte-for-byte as before. The
+  configured budget is recorded in the report's provenance so a table states
+  whether a cache was on.
+- A resolve that finds **0 objects** is now an error naming the tenant, the
+  resolved shard count, the window, and `now_ns`, rather than a silent report
+  over an empty dataset. A wrong `--window-hours` (the event-time span the
+  data does not fall in) or a wrong tenant is therefore loud, not a table of
+  `0 objects, 0 rows` statements that all "passed" in a few milliseconds.
 
 #### CPU flamegraph pass (use `--runs 1`)
 
