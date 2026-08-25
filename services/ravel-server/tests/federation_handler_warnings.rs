@@ -161,7 +161,7 @@ fn dead_federation(name: &str, endpoint: &str) -> Federation {
 /// The PromQL router wired with a federation over one dead, skippable remote,
 /// exactly as `ravel_server::start` assembles it (through `build_app_state`).
 async fn promql_with_federation(store: Arc<dyn ObjectStoreBackend>, tenant: &TenantId) -> Router {
-    let catalog = build_catalog(store.clone(), 1, true, 0).expect("catalog");
+    let catalog = build_catalog(store.clone(), 1, true, 0, None).expect("catalog");
     let mut tokens = std::collections::HashMap::new();
     tokens.insert(TOKEN.to_string(), tenant.clone());
     let federation = Arc::new(dead_federation("west", &dead_endpoint().await));

@@ -173,17 +173,16 @@ impl From<StoreError> for CacheFetchError {
 /// tier alone or the RAM-over-disk [`TieredCache`], behind one interface the
 /// RSEG and RLOG read funnels consult without committing to a concrete tier.
 ///
-/// - [`ReadCache::Ram`] is today's exact behavior: the bare RAM [`Cache`] every
-///   existing caller constructs. A query node has no disk tier until #97 wires
-///   `--cache-dir`, so this is the only variant production builds; it writes no
-///   local files and needs no Tokio runtime to construct. Its
-///   [`Cache::get_or_fetch`] is miss-only and never re-peeks, so a caller may
-///   peek with [`ReadCache::get`] and then resolve a miss through
+/// - [`ReadCache::Ram`] is the RAM tier alone: the bare RAM [`Cache`]. It is
+///   what production builds with no `--cache-dir` (#97), byte-for-byte the
+///   pre-disk-tier behavior; it writes no local files and needs no Tokio runtime
+///   to construct. Its [`Cache::get_or_fetch`] is miss-only and never re-peeks,
+///   so a caller may peek with [`ReadCache::get`] and then resolve a miss through
 ///   [`ReadCache::fetch_peeked`] with the peek as the one accounted miss.
 /// - [`ReadCache::Tiered`] is the RAM-over-disk handle: a disk-served hit is
-///   single-flighted and corruption-gated per ADR-0046 decisions 3-5. It is
-///   constructed only by this crate's tests today (and #97's wiring later); the
-///   funnels route through it wherever it is present.
+///   single-flighted and corruption-gated per ADR-0046 decisions 3-5. Production
+///   builds it when `--cache-dir` is set (#97); the funnels route through it
+///   wherever it is present.
 ///
 /// This mirrors the precedent issue #96 set for `ravel-catalog`'s byte cache
 /// (`ByteCache`): a small tier-dispatching wrapper rather than committing each
@@ -310,6 +309,30 @@ impl ReadCache {
         match self {
             ReadCache::Ram(ram) => ram.get_or_fetch(key, fetch).await,
             ReadCache::Tiered(tiered) => tiered.resolve_peeked_miss(key, fetch).await,
+        }
+    }
+
+    /// The RAM tier's counters handle, whichever variant this is. The bare
+    /// [`Cache`]'s own [`Cache::metrics`] for [`ReadCache::Ram`], and the RAM
+    /// half of the [`TieredCache`] ([`TieredCache::ram_metrics`]) for
+    /// [`ReadCache::Tiered`]. `ravel-server`'s `/metrics` renderer reads this
+    /// for the `cache=fetch` family instead of matching the enum inline.
+    pub fn ram_metrics(&self) -> std::sync::Arc<ravel_cache::CacheMetrics> {
+        match self {
+            ReadCache::Ram(ram) => ram.metrics(),
+            ReadCache::Tiered(tiered) => tiered.ram_metrics(),
+        }
+    }
+
+    /// The disk tier's counters handle, or `None` for a RAM-only cache. `None`
+    /// for [`ReadCache::Ram`] (no disk tier exists), and
+    /// `Some(`[`TieredCache::disk_metrics`]`)` for [`ReadCache::Tiered`].
+    /// `ravel-server`'s `/metrics` renderer reads this for the disk-tier
+    /// (`tier=disk`) sample, which it emits only when this is `Some`.
+    pub fn disk_metrics(&self) -> Option<std::sync::Arc<ravel_cache::CacheMetrics>> {
+        match self {
+            ReadCache::Ram(_) => None,
+            ReadCache::Tiered(tiered) => Some(tiered.disk_metrics()),
         }
     }
 }

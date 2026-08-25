@@ -685,15 +685,20 @@ pub struct Cli {
     #[arg(long, default_value_t = DEFAULT_CACHE_MAX_BYTES)]
     pub cache_max_bytes: u64,
 
-    /// Directory for the ADR-0046 read cache's local-disk tier. Not yet
-    /// wired to anything: `ravel-query`'s `SegmentFetcher::with_cache` and
-    /// `LogSegmentFetcher::with_cache` (the read funnels this process calls,
-    /// already reviewed and merged) each accept only a RAM `Cache`, with no
-    /// parameter or builder method to attach a `DiskCache` at all. Setting
-    /// this flag fails startup rather than silently running with no disk
-    /// tier (see `Cli::validate`). Reported as a gap rather than worked
-    /// around: adding that attachment point means changing the fetcher
-    /// funnels, which is out of this task's scope.
+    /// Directory for the ADR-0046 read cache's local-disk tier (#97). Opt-in:
+    /// absent, only the RAM tier exists and behavior is exactly today's. Set,
+    /// both the query fetcher cache (`store::build_cache`) and the catalog byte
+    /// cache (`query::build_catalog`) gain a `DiskCache` at this path, each
+    /// bounded by `--cache-max-bytes` (there is no separate disk-tier capacity
+    /// flag). The directory is created lazily on first admission and is never
+    /// required to exist; a missing, full, or corrupt cache directory degrades
+    /// to a store read, never a query error.
+    ///
+    /// Encryption posture (ADR-0046 decision 6): bytes this process writes to
+    /// this directory are NOT encrypted by the SSE-KMS object-storage path.
+    /// SSE-KMS protects object bytes at rest in the store, not the local cache.
+    /// An operator who needs bytes-at-rest encryption for the cache directory
+    /// must provide it at the filesystem/volume layer (an encrypted volume).
     #[arg(long, value_name = "PATH")]
     pub cache_dir: Option<PathBuf>,
 
@@ -2278,20 +2283,12 @@ impl Cli {
         // validated, rather than at the first federated query.
         self.parse_remote_clusters()?;
 
-        // The disk tier has no attachment point in the fetcher funnels this
-        // process calls (`SegmentFetcher::with_cache` /
-        // `LogSegmentFetcher::with_cache` each take only a RAM `Cache`), so
-        // silently accepting `--cache-dir` and doing nothing with it would be
-        // exactly the "looks configured, is actually inert" regression this
-        // whole cache epic exists to avoid. Fail fast instead.
-        if self.cache_dir.is_some() {
-            anyhow::bail!(
-                "--cache-dir was set but the local-disk cache tier has no attachment point yet: \
-                 ravel-query's SegmentFetcher::with_cache and LogSegmentFetcher::with_cache each \
-                 accept only a RAM Cache. Drop --cache-dir; the RAM tier alone is configured by \
-                 --cache-max-bytes and --disable-cache."
-            );
-        }
+        // `--cache-dir` is wired end to end (#97): it attaches the ADR-0046
+        // local-disk cache tier to both the query fetcher cache and the catalog
+        // byte cache, each bounded by `--cache-max-bytes`. No validation is
+        // needed here; an unusable directory degrades to a store read rather
+        // than a startup failure. Bytes written there are not SSE-KMS encrypted
+        // (ADR-0046 decision 6, documented on the flag above).
 
         // A key file and the unkeyed opt-out are contradictory: one selects
         // the keyed derivation, the other refuses it. There is no meaningful

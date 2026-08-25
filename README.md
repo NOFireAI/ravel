@@ -176,6 +176,26 @@ The [operations guide](docs/guides/operations.md) documents every storage flag,
 including temporary session tokens and a rotating credentials file for
 non-EC2 deployments (ADR-0106, ADR-0072).
 
+### Read cache
+
+Every query byte comes from object storage, so Ravel has an ADR-0046 read cache
+in front of it. The RAM tier is always on (bounded by `--cache-max-bytes`, or
+turned off entirely with `--disable-cache`). Adding `--cache-dir <path>` attaches
+a second, local-disk tier at that directory, so a RAM eviction is served from
+disk instead of re-paying the S3 round trip:
+
+    ravel-server --store s3 --s3-bucket my-bucket --cache-dir /var/cache/ravel
+
+The disk tier is opt-in and disposable: with no `--cache-dir` behavior is exactly
+as before, and a missing, full, or corrupt cache directory degrades to a store
+read, never a query error. Bytes written to the cache directory are **not**
+encrypted by Ravel, even with SSE-KMS configured for object storage (ADR-0046
+decision 6): SSE-KMS protects object bytes at rest in the store, not the local
+cache. If you need bytes-at-rest encryption for the cache directory, provide it
+at the filesystem/volume layer. `/metrics` splits each cache's `ravel_cache_*`
+counters by a `tier="ram"`/`tier="disk"` label once a disk tier is configured.
+See the [caching guide](docs/guides/caching.md).
+
 ## How it fits together
 
 ![architecture](docs/diagrams/architecture.svg)

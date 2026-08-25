@@ -185,8 +185,13 @@ async fn cache_enabled_config_attaches_cache_to_the_log_path() {
 
     let cli = cache_enabled_cli();
     let cache = build_cache(&cli).expect("cache enabled by default in a cache-enabled config");
+    // The default CLI sets no --cache-dir, so this is the RAM-only variant; hold
+    // its concrete `Cache` handle to assert emptiness before and after the query.
+    let ravel_query::ReadCache::Ram(ram) = cache.clone() else {
+        unreachable!("default CLI has no --cache-dir, so build_cache returns ReadCache::Ram");
+    };
     assert!(
-        cache.is_empty(),
+        ram.is_empty(),
         "sanity: nothing has been fetched through this cache yet"
     );
 
@@ -197,6 +202,7 @@ async fn cache_enabled_config_attaches_cache_to_the_log_path() {
         1,
         cli.disable_cache,
         cli.cache_max_bytes,
+        cli.cache_dir.clone(),
     )
     .expect("catalog");
     let mut sql_state = build_sql_state(
@@ -227,7 +233,7 @@ async fn cache_enabled_config_attaches_cache_to_the_log_path() {
     assert_eq!(status, StatusCode::OK, "sql query failed: {body}");
 
     assert!(
-        !cache.is_empty(),
+        !ram.is_empty(),
         "a logs SQL query over a real RLOG object must populate the cache \
          attached via build_sql_state's with_cache call -- an empty cache \
          after a successful query means the log path never actually \

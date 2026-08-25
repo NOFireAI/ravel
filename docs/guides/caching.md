@@ -51,18 +51,33 @@ or not present at all.
 
 ## Two tiers
 
-The cache has a RAM tier and a local-disk tier. Only the RAM tier works
-today. The `--cache-dir` flag for the disk tier exists in the CLI, but
-setting it fails startup with an explicit error rather than silently
-doing nothing: the query fetchers this process calls only know how to
-attach a RAM cache. See "Known gaps" below.
+The cache has a RAM tier and a local-disk tier. The RAM tier is always on
+(unless `--disable-cache`). The disk tier is opt-in: `--cache-dir <path>`
+attaches a local-disk tier at that directory to both the query fetcher cache
+and the catalog byte cache, so a RAM eviction is served from local disk instead
+of re-paying the S3 round trip. With no `--cache-dir`, only the RAM tier exists
+and behavior is exactly as before.
+
+The disk tier is disposable. Its directory is created lazily on first admission
+and is never required to exist; a missing, full, or corrupt cache directory
+degrades to a store read, never a query error, so a node whose cache directory
+is deleted mid-flight answers every query correctly and only more slowly.
+Nothing durable is ever written there, and a cache directory from a previous
+release is discarded and rebuilt rather than repaired.
+
+**Encryption at rest (ADR-0046 decision 6).** Bytes written to the cache
+directory are **not** encrypted by Ravel, even with SSE-KMS configured for
+object storage. SSE-KMS protects object bytes at rest in the store, not the
+local cache. If you need bytes-at-rest encryption for the cache directory,
+provide it at the filesystem/volume layer (an encrypted volume mounted at
+`--cache-dir`).
 
 ## CLI flags
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--cache-max-bytes <n>` | `268435456` (256 MiB) | Maximum bytes the RAM tier holds. Bounds **every** ADR-0046 cache in the process from one number: the fetcher cache and the catalog's byte cache both. Read once at startup; there is no live resize. |
-| `--cache-dir <path>` | none | Reserved for the disk tier. Setting it fails startup today (see "Known gaps"). |
+| `--cache-dir <path>` | none | Directory for the local-disk tier. Set, both the fetcher cache and the catalog byte cache gain a disk tier at this path, each bounded by the same `--cache-max-bytes` number (there is no separate disk-tier capacity flag). Absent, only the RAM tier exists. Bytes written here are not SSE-KMS encrypted (see "Two tiers" above). |
 | `--disable-cache` | off | Turns **every** ADR-0046 cache off: the fetcher cache and the catalog's byte cache both. No cache is constructed at all, so query *results* are byte-for-byte the same as a build with no cache code, and the process holds no read-cache memory. This is the flag to set in a memory-constrained container. |
 | `--logs-block-range-threshold <bytes>` | `524288` (512 KiB) | Log-object size above which a `logs` query reads only the pruning-relevant blocks (a tail probe plus per-block ranges, cached per block) instead of the whole object. Set it to `18446744073709551615` to read every log object whole, the shape before this split existed; set it to `0` to use the block-range path for every object. Read once at startup. |
 
@@ -80,10 +95,10 @@ erasure sweep on a query node by more than a fixed window. Two knobs
 
 The worst-case residue of an idle entry is `max_entry_age_ns +
 sweep_interval_ns`; the defaults (23 h + 1 h) are tuned so that sum meets
-ADR-0064's 24 h bound exactly. These are configuration on the disk tier,
-not CLI flags yet: like `--cache-dir`, the disk tier is not wired into a
-running process (see "Known gaps"), so there is no flag to set them from
-today.
+ADR-0064's 24 h bound exactly. These are configuration on the disk tier
+(`CacheLimits`), not CLI flags: the disk tier is constructed with the shipped
+defaults, and there is no flag to override the max-age sweep from the command
+line today.
 
 ## Startup warmup
 
@@ -105,9 +120,12 @@ Warmup is best-effort:
 When a cache is on, `GET /metrics` reports these counters, labeled by
 `mode` and by `cache` (ADR-0044's label allowlist). The `cache` label names
 which ADR-0046 cache the sample belongs to: `cache="fetch"` for the fetcher
-cache, `cache="catalog"` for the catalog's byte cache. Each cache renders its
-own series, so the hit-rate formulas below can be computed per cache or summed
-across both:
+cache, `cache="catalog"` for the catalog's byte cache. When a disk tier is
+configured (`--cache-dir`), each cache's samples additionally carry a
+`tier="ram"`/`tier="disk"` label so the two tiers' hit rates are reported
+separately; with no `--cache-dir` no `tier=` label appears and the exposition
+is byte-for-byte as before. Each cache renders its own series, so the hit-rate
+formulas below can be computed per cache or summed across both:
 
 - `ravel_cache_hits_total` / `ravel_cache_misses_total`: read outcomes.
 - `ravel_cache_bytes_served_total`: bytes returned from the cache on a
@@ -119,9 +137,10 @@ across both:
   failing the query. Distinct from a normal miss (nothing was there);
   this counter means something was there and could not be trusted.
 
-  This counter is always 0 today. No disk tier is attached, because
-  `--cache-dir` fails startup (see the known gaps below). Do not alert on
-  it until a disk tier exists.
+  It is nonzero only when a disk tier is configured (`--cache-dir`) and that
+  tier is unhealthy: a `tier="disk"` sample above zero means the disk tier
+  found entries it could not trust, not merely that it was cold. A process with
+  no `--cache-dir` never emits it.
 - `ravel_cache_disk_entries_expired_max_age_total`: disk-tier entries
   dropped because they aged past the per-entry max-age (ADR-0064). Counts
   every drop point: a hit that found an over-age entry, the startup scan, and
@@ -129,8 +148,8 @@ across both:
   Distinct from an eviction (which makes room under the byte or entry bound):
   this is a time bound, not a capacity bound.
 
-  This counter is always 0 today, for the same reason as the one above: no
-  disk tier is attached. Do not alert on it until a disk tier exists.
+  It is nonzero only when a disk tier is configured (`--cache-dir`); a process
+  with no disk tier never emits it.
 
 With every cache off (`--disable-cache`), none of these samples appear on
 `/metrics` at all: neither `cache="fetch"` nor `cache="catalog"`.
@@ -179,10 +198,6 @@ example -- rather than reading it off a running server.
 
 ## Known gaps
 
-- **`--cache-dir` is not wired up.** The disk tier (`DiskCache`) exists
-  as a crate, but the query fetchers only accept a RAM cache today. Until
-  that attachment point is added, `--cache-dir` fails startup instead of
-  silently doing nothing.
 - **Spans have no cache path**, because span reads are not wired into the
   cache layer yet: the `spans` SQL table's fetcher has no `with_cache`
   seam, unlike the RSEG/RLOG fetchers.

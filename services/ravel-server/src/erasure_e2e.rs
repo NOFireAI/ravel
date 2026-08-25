@@ -63,6 +63,7 @@ use crate::Cli;
 use crate::maintain::{MaintenanceOwnershipMetrics, MaintenanceSafetyMetrics, run_tick_with_clock};
 use crate::query::{build_app_state, build_catalog};
 use crate::store::build_cache;
+use ravel_query::ReadCache;
 
 const NS_PER_HOUR: i64 = 3_600_000_000_000;
 /// The injected "now" every tick runs at: hour 10_000 (1971), far past the seal
@@ -357,7 +358,7 @@ async fn publish_metrics_bucket(
 /// it share one warm cache.
 fn build_metrics_app(
     store: Arc<dyn ObjectStoreBackend>,
-    cache: Arc<ravel_cache::Cache<ravel_query::CacheFetchError>>,
+    cache: ReadCache,
     tenant: &TenantId,
     shard_count: u32,
 ) -> Router {
@@ -367,6 +368,7 @@ fn build_metrics_app(
         shard_count,
         cli.disable_cache,
         cli.cache_max_bytes,
+        cli.cache_dir.clone(),
     )
     .expect("catalog");
     let mut tokens = std::collections::HashMap::new();
@@ -460,12 +462,12 @@ async fn metrics_erasure_reaches_query_cache_rewrite_and_physical_absence() {
 
     let cache = build_cache(&Cli::try_parse_from(["ravel-server"]).expect("cli"))
         .expect("cache enabled by default");
-    let app = build_metrics_app(
-        Arc::clone(&store),
-        Arc::clone(&cache),
-        &tenant_id,
-        SHARD_COUNT,
-    );
+    // The default CLI sets no --cache-dir, so this is the RAM-only variant; hold
+    // its concrete `Cache` handle to assert warming (is_empty / hit counters).
+    let ReadCache::Ram(ram) = cache.clone() else {
+        unreachable!("default CLI has no --cache-dir, so build_cache returns ReadCache::Ram");
+    };
+    let app = build_metrics_app(Arc::clone(&store), cache, &tenant_id, SHARD_COUNT);
 
     // Pre-erase: both subjects reachable in both shards, and the query warms the
     // read cache with the segment bytes (which include the subject's).
@@ -481,7 +483,7 @@ async fn metrics_erasure_reaches_query_cache_rewrite_and_physical_absence() {
         "the subject is present as a distinct series in both shards pre-erase"
     );
     assert!(
-        !cache.is_empty(),
+        !ram.is_empty(),
         "the pre-erase query must have warmed the read cache with the segment bytes"
     );
 
@@ -509,10 +511,10 @@ async fn metrics_erasure_reaches_query_cache_rewrite_and_physical_absence() {
     // served the segment bytes from the warm cache (not a re-fetch from store)
     // and STILL filtered the subject, direct evidence the ADR-0064 scan-time
     // filter runs after the cache, not that the cache was merely warm.
-    let hits_before = cache.metrics().snapshot().hits;
+    let hits_before = ram.metrics().snapshot().hits;
     let after = query_metric_subjects(&app).await;
     assert!(
-        cache.metrics().snapshot().hits > hits_before,
+        ram.metrics().snapshot().hits > hits_before,
         "the post-erase query must be served FROM the warm cache (a cache hit), not re-fetched \
          from store: only then does its exclusion of the subject prove the scan-time filter runs \
          post-cache"
@@ -734,7 +736,7 @@ mod logs {
 
     fn build_logs_app(
         store: Arc<dyn ObjectStoreBackend>,
-        cache: Arc<ravel_cache::Cache<ravel_query::CacheFetchError>>,
+        cache: ReadCache,
         tenant: &TenantId,
     ) -> Router {
         let cli = Cli::try_parse_from(["ravel-server"]).expect("default flags parse");
@@ -743,6 +745,7 @@ mod logs {
             1,
             cli.disable_cache,
             cli.cache_max_bytes,
+            cli.cache_dir.clone(),
         )
         .expect("catalog");
         let mut tokens = std::collections::HashMap::new();
@@ -818,7 +821,12 @@ mod logs {
 
         let cache = build_cache(&Cli::try_parse_from(["ravel-server"]).expect("cli"))
             .expect("cache enabled by default");
-        let app = build_logs_app(Arc::clone(&store), Arc::clone(&cache), &tenant_id);
+        // Default CLI: no --cache-dir, so the RAM-only variant; hold its concrete
+        // `Cache` handle to assert warming (is_empty / hit counters).
+        let ReadCache::Ram(ram) = cache.clone() else {
+            unreachable!("default CLI has no --cache-dir, so build_cache returns ReadCache::Ram");
+        };
+        let app = build_logs_app(Arc::clone(&store), cache, &tenant_id);
 
         // Pre-erase: both bodies reachable; the query warms the read cache.
         let before = query_log_bodies(&app).await;
@@ -828,7 +836,7 @@ mod logs {
             "pre-erase, both the subject and the bystander log lines are reachable"
         );
         assert!(
-            !cache.is_empty(),
+            !ram.is_empty(),
             "the pre-erase logs query must have warmed the read cache with the RLOG bytes"
         );
 
@@ -852,10 +860,10 @@ mod logs {
         // served the RLOG bytes from the warm cache (not a re-fetch) and STILL
         // filtered the subject, direct evidence the scan-time filter runs
         // post-cache.
-        let hits_before = cache.metrics().snapshot().hits;
+        let hits_before = ram.metrics().snapshot().hits;
         let after = query_log_bodies(&app).await;
         assert!(
-            cache.metrics().snapshot().hits > hits_before,
+            ram.metrics().snapshot().hits > hits_before,
             "the post-erase SQL query must be served FROM the warm cache (a cache hit), not \
              re-fetched from store: only then does its exclusion of the subject prove the \
              scan-time filter runs post-cache"
@@ -1035,8 +1043,14 @@ mod spans {
         tenant: &TenantHash,
     ) -> Vec<String> {
         let cli = Cli::try_parse_from(["ravel-server"]).expect("cli");
-        let catalog = build_catalog(Arc::clone(store), 1, cli.disable_cache, cli.cache_max_bytes)
-            .expect("catalog");
+        let catalog = build_catalog(
+            Arc::clone(store),
+            1,
+            cli.disable_cache,
+            cli.cache_max_bytes,
+            cli.cache_dir.clone(),
+        )
+        .expect("catalog");
         let snapshot = catalog
             .resolve(
                 tenant,
