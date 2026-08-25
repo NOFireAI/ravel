@@ -97,6 +97,8 @@ async fn l0_object_count_equals_distinct_data_object_keys() {
         continue_on_error: false,
         fetch_concurrency: DEFAULT_FETCH_CONCURRENCY,
         progress_jsonl: None,
+        tenant_max_bytes: ravel_bench::sql_latency::DEFAULT_TENANT_MAX_BYTES,
+        parallel_final_aggregation: false,
     };
     let report = run_generated(&cfg).await.expect("generated lane runs");
 

@@ -49,8 +49,8 @@ use ravel_query::{
     CacheFetchError, DEFAULT_FETCH_CONCURRENCY, EngineConfig, LogSegmentFetcher, SegmentFetcher,
 };
 use ravel_sql::{
-    DeclaredColumn, DeclaredType, SpanSegmentFetcher, SqlConfig, SqlExecutor, SqlRequest,
-    StaticDeclaredColumns,
+    DEFAULT_MAX_QUERY_BYTES, DeclaredColumn, DeclaredType, SpanSegmentFetcher, SqlConfig,
+    SqlExecutor, SqlRequest, StaticDeclaredColumns,
 };
 use ravel_types::accounting::AccountedOp;
 use ravel_types::logstream::log_stream_id;
@@ -67,6 +67,10 @@ use crate::sql_corpus::CorpusEntry;
 /// technique `flight_sql_egress` uses).
 const NS_PER_HOUR: i64 = 3_600_000_000_000;
 const NOW_NS: i64 = 4 * NS_PER_HOUR;
+
+/// The `SqlExecutor` tenant-accountant ceiling the bench used before it was a
+/// flag: 1 GiB, matching `ravel-server`'s own default.
+pub const DEFAULT_TENANT_MAX_BYTES: usize = 1 << 30;
 
 /// Anything the harness can fail on. Boxed so `?` composes over the executor,
 /// catalog, writer, publish, and tenant-config error types without a bespoke
@@ -176,6 +180,19 @@ pub struct Provenance {
     /// full-scan statement is latency-bound and moves nearly linearly with it.
     #[serde(default = "default_fetch_concurrency")]
     pub fetch_concurrency: usize,
+    /// The tenant accountant's ceiling for the run. A statement that failed
+    /// with `tenant memory budget exhausted` was refused by this, not by
+    /// `max_query_bytes`.
+    #[serde(default = "default_tenant_max_bytes")]
+    pub tenant_max_bytes: usize,
+    /// Whether final aggregations were allowed to repartition (ADR-0094).
+    #[serde(default)]
+    pub parallel_final_aggregation: bool,
+}
+
+/// The tenant ceiling every run used before the knob was configurable.
+fn default_tenant_max_bytes() -> usize {
+    DEFAULT_TENANT_MAX_BYTES
 }
 
 /// What every run used before the knob was configurable (issue #680); also
@@ -383,6 +400,17 @@ pub struct GenerateConfig {
     /// file as the run goes, flushed per line, so a run killed hours in still
     /// leaves every number it had measured. `None` writes nothing.
     pub progress_jsonl: Option<std::path::PathBuf>,
+    /// Per-tenant SQL memory ceiling, the `SqlExecutor`'s tenant accountant
+    /// limit (`ravel-server --sql-tenant-max-bytes`). Enforced across a
+    /// tenant's concurrent queries and SEPARATE from `max_query_bytes`: a
+    /// statement can clear the per-query pool and still be refused here, so
+    /// both have to be raised together to measure a heavy aggregate.
+    pub tenant_max_bytes: usize,
+    /// Whether an exact-typed query may repartition its final aggregation
+    /// (ADR-0094, `ravel-server --sql-parallel-final-aggregation`). Reaches
+    /// `SqlConfig::parallel_final_aggregation`; `false` is the compiled-in
+    /// default and what every earlier run used.
+    pub parallel_final_aggregation: bool,
 }
 
 /// Inputs for the loaded-tenant lane.
@@ -434,6 +462,17 @@ pub struct TenantConfigInput {
     /// file as the run goes, flushed per line, so a run killed hours in still
     /// leaves every number it had measured. `None` writes nothing.
     pub progress_jsonl: Option<std::path::PathBuf>,
+    /// Per-tenant SQL memory ceiling, the `SqlExecutor`'s tenant accountant
+    /// limit (`ravel-server --sql-tenant-max-bytes`). Enforced across a
+    /// tenant's concurrent queries and SEPARATE from `max_query_bytes`: a
+    /// statement can clear the per-query pool and still be refused here, so
+    /// both have to be raised together to measure a heavy aggregate.
+    pub tenant_max_bytes: usize,
+    /// Whether an exact-typed query may repartition its final aggregation
+    /// (ADR-0094, `ravel-server --sql-parallel-final-aggregation`). Reaches
+    /// `SqlConfig::parallel_final_aggregation`; `false` is the compiled-in
+    /// default and what every earlier run used.
+    pub parallel_final_aggregation: bool,
 }
 
 fn percentile(sorted_ns: &[u64], pct: f64) -> u64 {
@@ -515,14 +554,51 @@ fn build_read_cache(cache_bytes: u64) -> Arc<Cache<CacheFetchError>> {
 /// for every hour (ravel_catalog docs on `read_scan_generations`); the tenant
 /// lane resolves that count before calling here so a multi-shard tenant is no
 /// longer measured over shard 0 alone.
+/// The executor knobs a run configures, every one of them a flag that
+/// `ravel-server` also has. They travel together because they are only
+/// meaningful together: a statement refused by one ceiling says nothing about
+/// the others, and a table is comparable only when all of them match.
+#[derive(Clone, Copy, Debug)]
+pub struct ExecutorSettings {
+    /// Per-query DataFusion pool ceiling (`--sql-max-query-bytes`).
+    pub max_query_bytes: usize,
+    /// Shards the catalog resolve scans (issue #677).
+    pub shard_count: u32,
+    /// Scan partitions and in-flight segment fetches (`--fetch-concurrency`).
+    pub fetch_concurrency: usize,
+    /// Per-tenant ceiling across a tenant's concurrent queries
+    /// (`--sql-tenant-max-bytes`), a SECOND limit under `max_query_bytes`.
+    pub tenant_max_bytes: usize,
+    /// ADR-0094 repartitioned final aggregation
+    /// (`--sql-parallel-final-aggregation`).
+    pub parallel_final_aggregation: bool,
+}
+
+impl Default for ExecutorSettings {
+    fn default() -> Self {
+        ExecutorSettings {
+            max_query_bytes: DEFAULT_MAX_QUERY_BYTES,
+            shard_count: 1,
+            fetch_concurrency: DEFAULT_FETCH_CONCURRENCY,
+            tenant_max_bytes: DEFAULT_TENANT_MAX_BYTES,
+            parallel_final_aggregation: false,
+        }
+    }
+}
+
 fn cold_executor(
     store: &Arc<dyn ObjectStoreBackend>,
     declared: &[DeclaredColumn],
-    max_query_bytes: usize,
-    shard_count: u32,
     cache: Option<Arc<Cache<CacheFetchError>>>,
-    fetch_concurrency: usize,
+    settings: ExecutorSettings,
 ) -> Result<SqlExecutor, Error> {
+    let ExecutorSettings {
+        max_query_bytes,
+        shard_count,
+        fetch_concurrency,
+        tenant_max_bytes,
+        parallel_final_aggregation,
+    } = settings;
     let catalog = Arc::new(Catalog::new(
         Arc::clone(store),
         CatalogConfig {
@@ -550,9 +626,9 @@ fn cold_executor(
                 fetch_concurrency: fetch_concurrency.max(1),
                 ..EngineConfig::default()
             },
-            ..SqlConfig::default()
+            parallel_final_aggregation,
         },
-        1 << 30,
+        tenant_max_bytes.max(1),
     )
     .with_declared_column_source(Arc::new(StaticDeclaredColumns::new(declared.to_vec()))))
 }
@@ -575,13 +651,11 @@ pub async fn measure_corpus(
     runs: usize,
     window: TimeRange,
     now_ns: i64,
-    max_query_bytes: usize,
-    shard_count: u32,
     cache_bytes: u64,
     deadline: Duration,
     continue_on_error: bool,
-    fetch_concurrency: usize,
     progress_jsonl: Option<&std::path::Path>,
+    settings: ExecutorSettings,
 ) -> Result<(Vec<EntryReport>, Vec<SkippedEntry>, Vec<FailedEntry>), Error> {
     let runs = runs.max(1);
     let mut measured = Vec::new();
@@ -621,14 +695,7 @@ pub async fn measure_corpus(
         // across entries would warm one statement from another's reads over the
         // same segments.
         let cache = (cache_bytes > 0).then(|| build_read_cache(cache_bytes));
-        let executor = cold_executor(
-            store,
-            declared,
-            max_query_bytes,
-            shard_count,
-            cache,
-            fetch_concurrency,
-        )?;
+        let executor = cold_executor(store, declared, cache, settings)?;
         let req = SqlRequest {
             sql: entry.sql.clone(),
             window,
@@ -786,6 +853,13 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
         shard_count,
     )
     .await?;
+    let settings = ExecutorSettings {
+        max_query_bytes: cfg.max_query_bytes,
+        shard_count,
+        fetch_concurrency: cfg.fetch_concurrency,
+        tenant_max_bytes: cfg.tenant_max_bytes,
+        parallel_final_aggregation: cfg.parallel_final_aggregation,
+    };
     let (entries, skipped, failed) = measure_corpus(
         &cfg.store,
         tenant_hash,
@@ -794,13 +868,11 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
         cfg.runs,
         window,
         NOW_NS,
-        cfg.max_query_bytes,
-        shard_count,
         cfg.cache_bytes,
         cfg.deadline,
         cfg.continue_on_error,
-        cfg.fetch_concurrency,
         cfg.progress_jsonl.as_deref(),
+        settings,
     )
     .await?;
 
@@ -816,6 +888,8 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
             cache_bytes: cfg.cache_bytes,
             deadline_secs: cfg.deadline.as_secs(),
             fetch_concurrency: cfg.fetch_concurrency.max(1),
+            tenant_max_bytes: cfg.tenant_max_bytes.max(1),
+            parallel_final_aggregation: cfg.parallel_final_aggregation,
         },
         dataset,
         entries,
@@ -871,6 +945,13 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
         }
         .into());
     }
+    let settings = ExecutorSettings {
+        max_query_bytes: cfg.max_query_bytes,
+        shard_count,
+        fetch_concurrency: cfg.fetch_concurrency,
+        tenant_max_bytes: cfg.tenant_max_bytes,
+        parallel_final_aggregation: cfg.parallel_final_aggregation,
+    };
     let (entries, skipped, failed) = measure_corpus(
         &cfg.store,
         tenant_hash,
@@ -879,13 +960,11 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
         cfg.runs,
         cfg.window,
         cfg.now_ns,
-        cfg.max_query_bytes,
-        shard_count,
         cfg.cache_bytes,
         cfg.deadline,
         cfg.continue_on_error,
-        cfg.fetch_concurrency,
         cfg.progress_jsonl.as_deref(),
+        settings,
     )
     .await?;
 
@@ -901,6 +980,8 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
             cache_bytes: cfg.cache_bytes,
             deadline_secs: cfg.deadline.as_secs(),
             fetch_concurrency: cfg.fetch_concurrency.max(1),
+            tenant_max_bytes: cfg.tenant_max_bytes.max(1),
+            parallel_final_aggregation: cfg.parallel_final_aggregation,
         },
         dataset,
         entries,
@@ -1109,7 +1190,6 @@ mod tests {
     use crate::sql_corpus::Modification;
     use ravel_catalog::{AbsentPolicy, validate_or_adopt};
     use ravel_object_store::memory::MemoryStore;
-    use ravel_sql::DEFAULT_MAX_QUERY_BYTES;
 
     fn empty_store() -> Arc<dyn ObjectStoreBackend> {
         Arc::new(MemoryStore::new())
@@ -1211,6 +1291,8 @@ mod tests {
             continue_on_error: false,
             fetch_concurrency: DEFAULT_FETCH_CONCURRENCY,
             progress_jsonl: None,
+            tenant_max_bytes: DEFAULT_TENANT_MAX_BYTES,
+            parallel_final_aggregation: false,
         }
     }
 
@@ -1374,13 +1456,11 @@ mod tests {
             1,
             window,
             NOW_NS,
-            DEFAULT_MAX_QUERY_BYTES,
-            1,
             0,
             Duration::from_millis(20),
             true,
-            DEFAULT_FETCH_CONCURRENCY,
             None,
+            ExecutorSettings::default(),
         )
         .await
         .expect("run continues past the expiry");
@@ -1456,13 +1536,14 @@ mod tests {
                     1,
                     window,
                     NOW_NS,
-                    DEFAULT_MAX_QUERY_BYTES,
-                    1,
                     0,
                     Duration::from_secs(30),
                     true,
-                    FETCH_CONCURRENCY,
                     None,
+                    ExecutorSettings {
+                        fetch_concurrency: FETCH_CONCURRENCY,
+                        ..ExecutorSettings::default()
+                    },
                 )
                 .await
             }
@@ -1493,6 +1574,37 @@ mod tests {
             "in-flight GETs are bounded by fetch_concurrency"
         );
         run.abort();
+    }
+
+    /// `--sql-tenant-max-bytes` and `--sql-parallel-final-aggregation` must
+    /// reach the executor, not stop at parsed fields. The tenant ceiling is a
+    /// SECOND limit under `max_query_bytes`: raising only the per-query pool
+    /// leaves a heavy aggregate refused by the tenant accountant with a
+    /// different error (issue #680 hit exactly that on 18 ClickBench
+    /// statements). Restoring either compiled-in default fails this.
+    #[test]
+    fn cold_executor_threads_tenant_and_parallel_agg_overrides() {
+        let store = empty_store();
+        let custom_tenant = DEFAULT_TENANT_MAX_BYTES * 8;
+        assert_ne!(custom_tenant, DEFAULT_TENANT_MAX_BYTES);
+        let executor = cold_executor(
+            &store,
+            &[],
+            None,
+            ExecutorSettings {
+                tenant_max_bytes: custom_tenant,
+                parallel_final_aggregation: true,
+                ..ExecutorSettings::default()
+            },
+        )
+        .expect("build executor");
+        assert_eq!(executor.max_tenant_bytes(), custom_tenant);
+        assert!(executor.config().parallel_final_aggregation);
+
+        let executor =
+            cold_executor(&store, &[], None, ExecutorSettings::default()).expect("build executor");
+        assert_eq!(executor.max_tenant_bytes(), DEFAULT_TENANT_MAX_BYTES);
+        assert!(!executor.config().parallel_final_aggregation);
     }
 
     /// The deadline a run used is part of its provenance.
@@ -1693,29 +1805,15 @@ mod tests {
         // Fetcher cache ON: a fresh executor (cold catalog byte cache, cold
         // fetcher cache), one run.
         let cache = build_read_cache(64 << 20);
-        let cached = cold_executor(
-            &store,
-            &[],
-            DEFAULT_MAX_QUERY_BYTES,
-            1,
-            Some(cache),
-            DEFAULT_FETCH_CONCURRENCY,
-        )
-        .expect("build cached executor");
+        let cached = cold_executor(&store, &[], Some(cache), ExecutorSettings::default())
+            .expect("build cached executor");
         let on = cached.execute(th, &req).await.expect("cached run");
 
         // Fetcher cache OFF: a fresh executor (identical cold catalog byte cache,
         // no fetcher cache), one run. The catalog contribution is the same in
         // both, so any delta is the fetcher cache alone.
-        let uncached = cold_executor(
-            &store,
-            &[],
-            DEFAULT_MAX_QUERY_BYTES,
-            1,
-            None,
-            DEFAULT_FETCH_CONCURRENCY,
-        )
-        .expect("build uncached executor");
+        let uncached = cold_executor(&store, &[], None, ExecutorSettings::default())
+            .expect("build uncached executor");
         let off = uncached.execute(th, &req).await.expect("uncached run");
 
         let get_on = on.accounting.s3_requests(AccountedOp::Get);
@@ -1750,11 +1848,27 @@ mod tests {
         let store = empty_store();
         let custom = DEFAULT_FETCH_CONCURRENCY * 4;
         assert_ne!(custom, DEFAULT_FETCH_CONCURRENCY);
-        let executor = cold_executor(&store, &[], DEFAULT_MAX_QUERY_BYTES, 1, None, custom)
-            .expect("build executor");
+        let executor = cold_executor(
+            &store,
+            &[],
+            None,
+            ExecutorSettings {
+                fetch_concurrency: custom,
+                ..ExecutorSettings::default()
+            },
+        )
+        .expect("build executor");
         assert_eq!(executor.config().engine.fetch_concurrency, custom);
-        let executor = cold_executor(&store, &[], DEFAULT_MAX_QUERY_BYTES, 1, None, 0)
-            .expect("build executor");
+        let executor = cold_executor(
+            &store,
+            &[],
+            None,
+            ExecutorSettings {
+                fetch_concurrency: 0,
+                ..ExecutorSettings::default()
+            },
+        )
+        .expect("build executor");
         assert_eq!(
             executor.config().engine.fetch_concurrency,
             1,
@@ -1767,8 +1881,16 @@ mod tests {
         let store = empty_store();
         let custom = DEFAULT_MAX_QUERY_BYTES * 4;
         assert_ne!(custom, DEFAULT_MAX_QUERY_BYTES);
-        let executor = cold_executor(&store, &[], custom, 1, None, DEFAULT_FETCH_CONCURRENCY)
-            .expect("build executor");
+        let executor = cold_executor(
+            &store,
+            &[],
+            None,
+            ExecutorSettings {
+                max_query_bytes: custom,
+                ..ExecutorSettings::default()
+            },
+        )
+        .expect("build executor");
         assert_eq!(executor.config().max_query_bytes, custom);
     }
 
@@ -1779,15 +1901,8 @@ mod tests {
     #[test]
     fn cold_executor_defaults_to_compiled_in_budget() {
         let store = empty_store();
-        let executor = cold_executor(
-            &store,
-            &[],
-            DEFAULT_MAX_QUERY_BYTES,
-            1,
-            None,
-            DEFAULT_FETCH_CONCURRENCY,
-        )
-        .expect("build executor");
+        let executor =
+            cold_executor(&store, &[], None, ExecutorSettings::default()).expect("build executor");
         assert_eq!(executor.config().max_query_bytes, DEFAULT_MAX_QUERY_BYTES);
     }
 }

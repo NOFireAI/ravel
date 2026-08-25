@@ -270,6 +270,16 @@ cargo run -p ravel-bench --features sql-latency --bin sql_latency_bench -- \
   `"failed"`), flushed per line. The full report still goes to stdout at the
   end. Use it on every long run: a 43-statement pass over 100M rows takes
   hours, and without it a kill or a crash at statement 40 leaves nothing.
+- `--sql-tenant-max-bytes <N>` is the per-tenant SQL memory ceiling, the same
+  knob as `ravel-server --sql-tenant-max-bytes`, and it is a SECOND limit under
+  `--sql-max-query-bytes`: the per-query pool bounds one statement, this bounds
+  a tenant across its concurrent queries. A statement refused by it reports
+  `tenant memory budget exhausted`, not `query memory pool exhausted`, so a
+  heavy aggregate needs both raised together. Default 1 GiB, what every earlier
+  run used.
+- `--sql-parallel-final-aggregation` lets an exact-typed query repartition its
+  final aggregation (ADR-0094), the same knob as the server flag of that name.
+  Off by default; a `GROUP BY` over a high-cardinality key is where it shows.
 - A resolve that finds **0 objects** is now an error naming the tenant, the
   resolved shard count, the window, and `now_ns`, rather than a silent report
   over an empty dataset. A wrong `--window-hours` (the event-time span the
