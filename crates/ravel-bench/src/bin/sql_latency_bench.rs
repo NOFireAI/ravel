@@ -81,6 +81,11 @@ struct Args {
     /// catalog LIST fan-out; widen it for a tenant whose data is older.
     #[arg(long, default_value_t = 24)]
     window_hours: u64,
+    /// Shard count for the tenant's catalog. Defaults to the tenant's durable
+    /// provisioning record; pass it for a tenant loaded before those records
+    /// existed. Disagreeing with the record's ceiling is an error.
+    #[arg(long)]
+    shards: Option<u32>,
 }
 
 #[derive(Copy, Clone, Debug, clap::ValueEnum)]
