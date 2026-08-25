@@ -25,9 +25,7 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{
-    Array, FixedSizeBinaryArray, Int64Array, RecordBatch, StringArray,
-};
+use datafusion::arrow::array::{Array, FixedSizeBinaryArray, Int64Array, RecordBatch, StringArray};
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::ExecutionPlan;
 use futures::StreamExt;
@@ -374,7 +372,9 @@ async fn pending_erasure_forces_the_row_path() {
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .expect("name column");
-            (0..arr.len()).map(|i| arr.value(i).to_string()).collect::<Vec<_>>()
+            (0..arr.len())
+                .map(|i| arr.value(i).to_string())
+                .collect::<Vec<_>>()
         })
         .collect();
     assert_eq!(names, vec!["keep-me".to_string()], "the u1 span is erased");
@@ -392,7 +392,13 @@ async fn eligible_scan_emits_the_projected_schema_in_order() {
     // Deliberately out of schema order, and projecting duration_ns alone among
     // the ts-derived columns.
     let projection = vec![SPAN_COL_NAME, SPAN_COL_DURATION_NS];
-    let run = run_scan(Arc::clone(&store), segments, Some(projection.clone()), Vec::new()).await;
+    let run = run_scan(
+        Arc::clone(&store),
+        segments,
+        Some(projection.clone()),
+        Vec::new(),
+    )
+    .await;
     assert!(run.columnar_batches > 0, "must take the fast path");
 
     let expected = spans_schema().project(&projection).expect("project schema");
@@ -422,7 +428,9 @@ async fn eligible_scan_emits_the_projected_schema_in_order() {
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .expect("name column");
-            (0..arr.len()).map(|i| arr.value(i).to_string()).collect::<Vec<_>>()
+            (0..arr.len())
+                .map(|i| arr.value(i).to_string())
+                .collect::<Vec<_>>()
         })
         .collect();
     assert_eq!(names, vec!["a0", "b1", "a2", "b3", "a4", "b5"]);
