@@ -76,6 +76,12 @@ use crate::spans_schema::{SPAN_ID_WIDTH, TRACE_ID_WIDTH, spans_schema};
 /// Rows accumulated into one output batch before it is emitted.
 const BATCH_ROWS: usize = 8192;
 
+/// Metric name for the count of batches emitted by the columnar fast path, so
+/// `EXPLAIN ANALYZE` shows which path a partition ran (ADR-0110 decision 6).
+const METRIC_COLUMNAR_BATCHES: &str = "columnar_batches";
+/// Metric name for the count of batches emitted by the row path fallback.
+const METRIC_ROWPATH_BATCHES: &str = "rowpath_batches";
+
 /// Span segment scan producing per-partition `(trace_id, start_ts)`-ordered
 /// batches over the public `spans` schema.
 pub struct SpansScanExec {
