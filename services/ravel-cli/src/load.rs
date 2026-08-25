@@ -17,6 +17,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use arrow::array::AsArray;
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int8Array,
     Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, StringArray,
@@ -33,10 +34,13 @@ use ravel_ingest::LogStageSnapshot;
 use ravel_ingest::{
     Clock, IngestConfig, LogIngestMetricsSnapshot, LogIngestRouter, SystemClock, WriteMode,
 };
+use ravel_logseg::{
+    Bitmap, ColumnarLogBatch, DynColumn, FieldType, StrColumnDict, stream_attrs_bytes,
+};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_otlp::NormalizedLogRecord;
 use ravel_otlp::logs_limits::LogIngestLimits;
-use ravel_types::logstream::{AttrValue, log_stream_id};
+use ravel_types::logstream::{AttrValue, LogStreamId, log_stream_id};
 use ravel_types::{CommitToken, Signal, TenantId};
 use serde::Deserialize;
 
@@ -435,6 +439,12 @@ pub struct LoadReport {
     /// spread at or below the [`SKEW_WARN_DENOMINATOR`] threshold. `None` when
     /// the load never reached the check point or stayed above it.
     pub skew_warning: Option<String>,
+    /// Number of columnar batches this load built and drove through
+    /// `LogIngestRouter::write_columnar` (ADR-0109). Nonzero only on the columnar
+    /// fast path [`load`] uses; the row differential path leaves it 0. This is
+    /// the reachability signal a caller of the real entry point can observe to
+    /// prove the columnar path ran, not merely that its builder compiles.
+    pub columnar_batches_built: u64,
     /// The logs pipeline's per-stage timing breakdown (ADR-0104 decision 1),
     /// snapshotted once the load finished. Present only under the
     /// `stage-timing` feature; with it off this field does not exist, so a
@@ -559,6 +569,7 @@ pub async fn load(
         read_cursors,
         now_ns,
         clock,
+        LoadPath::Columnar,
         None,
     )
     .await
@@ -585,6 +596,7 @@ async fn load_instrumented(
     read_cursors: Option<usize>,
     now_ns: i64,
     clock: Arc<dyn Clock>,
+    path: LoadPath,
     on_build_start: Option<BuildStartHook>,
 ) -> Result<LoadReport, LoadError> {
     // Reject a zero batch size with a typed error rather than silently clamping
@@ -682,8 +694,18 @@ async fn load_instrumented(
         let mapping = Arc::clone(&mapping);
         let limits = limits.clone();
         let hook = on_build_start.clone();
-        tokio::task::spawn_blocking(move || {
-            decode_and_build_stride(state, mapping, limits, now_ns, batch_rows, hook.as_ref())
+        tokio::task::spawn_blocking(move || match path {
+            LoadPath::Row => {
+                decode_and_build_stride(state, mapping, limits, now_ns, batch_rows, hook.as_ref())
+            }
+            LoadPath::Columnar => decode_and_build_stride_columnar(
+                state,
+                mapping,
+                limits,
+                now_ns,
+                batch_rows,
+                hook.as_ref(),
+            ),
         })
     };
 
@@ -703,7 +725,7 @@ async fn load_instrumented(
             }
         };
 
-        let records = match built {
+        let built = match built {
             Prefetched::Done => break,
             Prefetched::BatchFailed { reason } => {
                 return Err(LoadError::BatchFailed {
@@ -718,29 +740,50 @@ async fn load_instrumented(
                     durable: report.tokens.clone(),
                 });
             }
-            Prefetched::Batch { records, .. } => records,
+            Prefetched::Batch(built) => built,
         };
 
-        if records.is_empty() {
+        let n = built.num_rows() as u64;
+        if n == 0 {
             // A zero-row batch writes nothing; advance and prefetch the next.
             pending = spawn_build(state);
             continue;
         }
 
-        let n = records.len() as u64;
         // Start (but do not yet await) this batch's write, then spawn the next
         // batch's decode/build so its CPU work overlaps this write's I/O wait.
         // Building the future does no work; the write begins when it is awaited
-        // below, by which point the prefetch task is already running.
-        let write_fut = router.write(
-            tenant_id.clone(),
-            records,
-            WriteMode::Strict,
-            WRITE_ACK_DEADLINE,
-        );
-        pending = spawn_build(state);
+        // below, by which point the prefetch task is already running. Both paths
+        // await exactly one write at a time, so the pipeline stays sequential in
+        // every observable way regardless of which path built the batch.
+        let receipt = match built {
+            Built::Row(records) => {
+                let write_fut = router.write(
+                    tenant_id.clone(),
+                    records,
+                    WriteMode::Strict,
+                    WRITE_ACK_DEADLINE,
+                );
+                pending = spawn_build(state);
+                write_fut.await
+            }
+            Built::Columnar(batch) => {
+                // Reachability signal (ADR-0109): count each batch actually
+                // driven through `write_columnar`, so a caller of the real entry
+                // point can prove the columnar path ran.
+                report.columnar_batches_built += 1;
+                let write_fut = router.write_columnar(
+                    tenant_id.clone(),
+                    *batch,
+                    WriteMode::Strict,
+                    WRITE_ACK_DEADLINE,
+                );
+                pending = spawn_build(state);
+                write_fut.await
+            }
+        };
 
-        let receipt = write_fut.await.map_err(|e| {
+        let receipt = receipt.map_err(|e| {
             // Earlier batches are already durable; append this batch's own
             // durably-acked shards, which `LogWriteError::durable_tokens`
             // recovers from a multi-shard partial failure (issue #296).
@@ -790,17 +833,48 @@ type BatchReader = parquet::arrow::arrow_reader::ParquetRecordBatchReader;
 enum Prefetched {
     /// Every stride cursor is exhausted; no batch was produced.
     Done,
-    /// A batch decoded and built into `records`, assembled from up to K
-    /// contiguous spans (one per live stride cursor, issue #560). Every
-    /// non-rejected row yields one record (a rejection returns `RowRejected`
-    /// instead of a partial batch), so `records.len()` is already the source
-    /// row count; no separate count is carried.
-    Batch { records: Vec<NormalizedLogRecord> },
+    /// A batch decoded and built, assembled from up to K contiguous spans (one
+    /// per live stride cursor, issue #560). Carries either the row-major records
+    /// (the differential-reference path) or the columnar batch (the fast path
+    /// `load` drives, ADR-0109). Every non-rejected row yields one record/one
+    /// batch row (a rejection returns `RowRejected` instead of a partial batch),
+    /// so the payload's own length is the source row count.
+    Batch(Built),
     /// The batch failed to read from Parquet or to resolve against the mapping.
     BatchFailed { reason: String },
     /// A row failed a kept admission check. `row` is the FILE-absolute row
     /// index, translated from whichever cursor's span produced it.
     RowRejected { row: u64, reason: String },
+}
+
+/// The built form of one prefetched batch, selected by [`LoadPath`]. The row
+/// form is kept as the differential reference (ADR-0109 decision 7); `load`
+/// drives the columnar form through `write_columnar`.
+enum Built {
+    Row(Vec<NormalizedLogRecord>),
+    Columnar(Box<ColumnarLogBatch>),
+}
+
+impl Built {
+    /// Row count of the built batch, the source row count for reporting.
+    fn num_rows(&self) -> usize {
+        match self {
+            Built::Row(records) => records.len(),
+            Built::Columnar(batch) => batch.num_rows,
+        }
+    }
+}
+
+/// Which build/write path a load drives. `load` uses [`LoadPath::Columnar`]
+/// (ADR-0109 decision 4); [`LoadPath::Row`] stays reachable so the byte-identity
+/// differential test can run the same file through the pre-ADR row path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadPath {
+    /// The differential-reference path, constructed only by the byte-identity
+    /// test; `load` never selects it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Row,
+    Columnar,
 }
 
 /// One of the K stride cursors' state (issue #560): its own file-backed
@@ -879,35 +953,43 @@ fn cursor_take(cur: &mut CursorState, want: usize) -> Result<Option<(RecordBatch
     }
 }
 
-/// Assemble one batch from every live cursor's contiguous share of
-/// `batch_rows` and build its records (issue #560). Each live cursor
-/// contributes up to its share as one contiguous run via [`cursor_take`]; the
-/// resulting spans keep their own `file_base` so a rejected row's reported
-/// index translates to its FILE-absolute position regardless of which cursor
-/// produced it.
+/// The spans making up one batch, or a terminal signal. Shared by the row and
+/// columnar decode paths so the K-cursor share dealing (issue #560) lives in
+/// exactly one place.
+enum SpanOutcome {
+    /// Every stride cursor is exhausted; no batch this round.
+    Done,
+    /// A cursor's Parquet read failed.
+    Failed(String),
+    /// Up to K contiguous spans, each with its own file-absolute base row. May
+    /// be empty (every dealt share came back empty), which the caller turns
+    /// into a zero-row batch.
+    Spans(Vec<(RecordBatch, u64)>),
+}
+
+/// Deal one batch's worth of rows across the live stride cursors (issue #560).
+/// Each live cursor contributes up to its share as one contiguous run via
+/// [`cursor_take`]; the resulting spans keep their own `file_base` so a rejected
+/// row's reported index translates to its FILE-absolute position regardless of
+/// which cursor produced it.
 ///
 /// Share sizing: `batch_rows` split evenly across the currently live cursor
-/// count, with the remainder distributed via a rotating window
-/// (`deal_offset`) rather than always to the same cursors. This *is* what
-/// "redistribute an exhausted cursor's share across the remaining cursors"
-/// means in practice: the denominator (live cursor count) shrinks as cursors
-/// exhaust, so each remaining cursor's share grows on its own with no
-/// separate redistribution step, and the rotation guarantees that even a
-/// pathological live-cursor count greater than `batch_rows` (some cursors get
-/// a zero share this round) eventually asks every live cursor for rows.
+/// count, with the remainder distributed via a rotating window (`deal_offset`)
+/// rather than always to the same cursors. The denominator (live cursor count)
+/// shrinks as cursors exhaust, so each remaining cursor's share grows on its own
+/// with no separate redistribution step, and the rotation guarantees that even a
+/// pathological live-cursor count greater than `batch_rows` (some cursors get a
+/// zero share this round) eventually asks every live cursor for rows.
 ///
 /// `on_build_start` fires once, before any row is built, whenever there is at
-/// least one live cursor (matching the pre-#560 hook timing of firing
-/// whenever `reader.next()` would yield `Some(_)`, regardless of whether that
-/// attempt goes on to decode or resolve cleanly).
-fn decode_and_build_stride(
-    mut state: StrideCursors,
-    mapping: Arc<Mapping>,
-    limits: LogIngestLimits,
-    now_ns: i64,
+/// least one live cursor (matching the pre-#560 hook timing of firing whenever
+/// `reader.next()` would yield `Some(_)`, regardless of whether that attempt
+/// goes on to decode or resolve cleanly).
+fn collect_spans(
+    state: &mut StrideCursors,
     batch_rows: usize,
     on_build_start: Option<&BuildStartHook>,
-) -> (StrideCursors, Prefetched) {
+) -> SpanOutcome {
     let live: Vec<usize> = state
         .cursors
         .iter()
@@ -916,7 +998,7 @@ fn decode_and_build_stride(
         .map(|(i, _)| i)
         .collect();
     if live.is_empty() {
-        return (state, Prefetched::Done);
+        return SpanOutcome::Done;
     }
     if let Some(hook) = on_build_start {
         hook();
@@ -936,21 +1018,30 @@ fn decode_and_build_stride(
         match cursor_take(&mut state.cursors[idx], share) {
             Ok(Some((batch, file_base))) if batch.num_rows() > 0 => spans.push((batch, file_base)),
             Ok(_) => {}
-            Err(reason) => return (state, Prefetched::BatchFailed { reason }),
+            Err(reason) => return SpanOutcome::Failed(reason),
         }
     }
     state.deal_offset = (state.deal_offset + extra) % l;
+    SpanOutcome::Spans(spans)
+}
+
+/// Assemble one batch's spans and build its records row by row (the
+/// differential-reference path, [`LoadPath::Row`]).
+fn decode_and_build_stride(
+    mut state: StrideCursors,
+    mapping: Arc<Mapping>,
+    limits: LogIngestLimits,
+    now_ns: i64,
+    batch_rows: usize,
+    on_build_start: Option<&BuildStartHook>,
+) -> (StrideCursors, Prefetched) {
+    let spans = match collect_spans(&mut state, batch_rows, on_build_start) {
+        SpanOutcome::Done => return (state, Prefetched::Done),
+        SpanOutcome::Failed(reason) => return (state, Prefetched::BatchFailed { reason }),
+        SpanOutcome::Spans(spans) => spans,
+    };
 
     let total_rows: usize = spans.iter().map(|(b, _)| b.num_rows()).sum();
-    if total_rows == 0 {
-        return (
-            state,
-            Prefetched::Batch {
-                records: Vec::new(),
-            },
-        );
-    }
-
     let mut records = Vec::with_capacity(total_rows);
     for (batch, file_base) in &spans {
         // Resolve column indices once per span (schema is stable across
@@ -975,7 +1066,32 @@ fn decode_and_build_stride(
             }
         }
     }
-    (state, Prefetched::Batch { records })
+    (state, Prefetched::Batch(Built::Row(records)))
+}
+
+/// Assemble one batch's spans and build a [`ColumnarLogBatch`] directly, column
+/// by column, without materializing a per-row struct (ADR-0109 decision 1, the
+/// path [`load`] drives). Byte-identical output to [`decode_and_build_stride`]
+/// on the same spans is the acceptance anchor (decision 7).
+fn decode_and_build_stride_columnar(
+    mut state: StrideCursors,
+    mapping: Arc<Mapping>,
+    limits: LogIngestLimits,
+    now_ns: i64,
+    batch_rows: usize,
+    on_build_start: Option<&BuildStartHook>,
+) -> (StrideCursors, Prefetched) {
+    let spans = match collect_spans(&mut state, batch_rows, on_build_start) {
+        SpanOutcome::Done => return (state, Prefetched::Done),
+        SpanOutcome::Failed(reason) => return (state, Prefetched::BatchFailed { reason }),
+        SpanOutcome::Spans(spans) => spans,
+    };
+
+    match build_columnar_batch(&spans, &mapping, &limits, now_ns) {
+        Ok(batch) => (state, Prefetched::Batch(Built::Columnar(Box::new(batch)))),
+        Err(ColBuildError::Batch(reason)) => (state, Prefetched::BatchFailed { reason }),
+        Err(ColBuildError::Row { row, reason }) => (state, Prefetched::RowRejected { row, reason }),
+    }
 }
 
 /// The early shard-skew warning checkpoint (issue #560): the number of data
@@ -1408,6 +1524,16 @@ fn read_string(arr: &ArrayRef, row: usize) -> Result<Option<String>, String> {
         DataType::LargeUtf8 => Ok(Some(
             downcast::<LargeStringArray>(arr)?.value(row).to_string(),
         )),
+        // A dictionary-encoded string column (Arrow reconstructs one from a
+        // Parquet file that carries Arrow dictionary schema metadata): resolve
+        // the row's key to its value and read that. The columnar fast path
+        // passes such a column through as a `StrColumnDict`; the row path here,
+        // its differential reference, must read the same values.
+        DataType::Dictionary(_, _) => {
+            let dict = arr.as_any_dictionary();
+            let key = dict.normalized_keys()[row];
+            read_string(dict.values(), key)
+        }
         other => Err(format!("expected a string column, found {other:?}")),
     }
 }
@@ -1423,6 +1549,13 @@ fn read_bytes(arr: &ArrayRef, row: usize) -> Result<Option<Vec<u8>>, String> {
         DataType::FixedSizeBinary(_) => Ok(Some(
             downcast::<FixedSizeBinaryArray>(arr)?.value(row).to_vec(),
         )),
+        // Dictionary-encoded binary column: resolve the key to its value, as in
+        // [`read_string`].
+        DataType::Dictionary(_, _) => {
+            let dict = arr.as_any_dictionary();
+            let key = dict.normalized_keys()[row];
+            read_bytes(dict.values(), key)
+        }
         other => Err(format!("expected a binary column, found {other:?}")),
     }
 }
@@ -1508,6 +1641,782 @@ fn downcast<A: 'static>(arr: &ArrayRef) -> Result<&A, String> {
     arr.as_any()
         .downcast_ref::<A>()
         .ok_or_else(|| "internal error: Arrow array downcast failed".to_string())
+}
+
+/// [`downcast`] as an `Option`, for the prepared column readers below: the
+/// datatype has already been matched, so a `None` here is an internal
+/// inconsistency the reader turns into a deferred error rather than a panic.
+fn downcast_opt<A: 'static>(arr: &ArrayRef) -> Option<&A> {
+    arr.as_any().downcast_ref::<A>()
+}
+
+/// The [`FieldType`] a mapped scalar column resolves to. Fixed by the mapping's
+/// declared [`ColType`], so it is resolved once per column, not per cell
+/// (ADR-0109 decision 6).
+fn field_type_of(ty: ColType) -> FieldType {
+    match ty {
+        ColType::Str => FieldType::Str,
+        ColType::I64 => FieldType::I64,
+        ColType::F64 => FieldType::F64,
+        ColType::Bool => FieldType::Bool,
+        ColType::Bytes => FieldType::Bytes,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Prepared per-column readers (ADR-0109 decision 6): the Arrow downcast and the
+// `ts` unit scaling are resolved ONCE when the reader is built, not per cell. A
+// column whose datatype the mapping cannot supply is captured as `Bad`, whose
+// reader returns `Ok(None)` for a null cell and the SAME typed error the per-cell
+// `read_*` helpers raise for a non-null one, so admission parity with the row
+// path (`build_record`) holds byte for byte, including which row a coercion error
+// is reported at.
+// ---------------------------------------------------------------------------
+
+/// An integer/date source resolved to a concrete Arrow array.
+enum IntSrc<'a> {
+    I8(&'a Int8Array),
+    I16(&'a Int16Array),
+    I32(&'a Int32Array),
+    I64(&'a Int64Array),
+    U8(&'a UInt8Array),
+    U16(&'a UInt16Array),
+    U32(&'a UInt32Array),
+    U64(&'a UInt64Array),
+    D32(&'a Date32Array),
+    D64(&'a Date64Array),
+    Bad(&'a ArrayRef),
+}
+
+fn int_src(arr: &ArrayRef) -> IntSrc<'_> {
+    match arr.data_type() {
+        DataType::Int8 => downcast_opt(arr).map_or(IntSrc::Bad(arr), IntSrc::I8),
+        DataType::Int16 => downcast_opt(arr).map_or(IntSrc::Bad(arr), IntSrc::I16),
+        DataType::Int32 => downcast_opt(arr).map_or(IntSrc::Bad(arr), IntSrc::I32),
+        DataType::Int64 => downcast_opt(arr).map_or(IntSrc::Bad(arr), IntSrc::I64),
+        DataType::UInt8 => downcast_opt(arr).map_or(IntSrc::Bad(arr), IntSrc::U8),
+        DataType::UInt16 => downcast_opt(arr).map_or(IntSrc::Bad(arr), IntSrc::U16),
+        DataType::UInt32 => downcast_opt(arr).map_or(IntSrc::Bad(arr), IntSrc::U32),
+        DataType::UInt64 => downcast_opt(arr).map_or(IntSrc::Bad(arr), IntSrc::U64),
+        DataType::Date32 => downcast_opt(arr).map_or(IntSrc::Bad(arr), IntSrc::D32),
+        DataType::Date64 => downcast_opt(arr).map_or(IntSrc::Bad(arr), IntSrc::D64),
+        _ => IntSrc::Bad(arr),
+    }
+}
+
+impl IntSrc<'_> {
+    fn get(&self, row: usize) -> Result<Option<i64>, String> {
+        match self {
+            IntSrc::I8(a) => Ok((!a.is_null(row)).then(|| a.value(row) as i64)),
+            IntSrc::I16(a) => Ok((!a.is_null(row)).then(|| a.value(row) as i64)),
+            IntSrc::I32(a) => Ok((!a.is_null(row)).then(|| a.value(row) as i64)),
+            IntSrc::I64(a) => Ok((!a.is_null(row)).then(|| a.value(row))),
+            IntSrc::U8(a) => Ok((!a.is_null(row)).then(|| a.value(row) as i64)),
+            IntSrc::U16(a) => Ok((!a.is_null(row)).then(|| a.value(row) as i64)),
+            IntSrc::U32(a) => Ok((!a.is_null(row)).then(|| a.value(row) as i64)),
+            IntSrc::U64(a) => {
+                if a.is_null(row) {
+                    return Ok(None);
+                }
+                i64::try_from(a.value(row))
+                    .map(Some)
+                    .map_err(|_| "u64 value does not fit in i64".to_string())
+            }
+            IntSrc::D32(a) => Ok((!a.is_null(row)).then(|| a.value(row) as i64)),
+            IntSrc::D64(a) => Ok((!a.is_null(row)).then(|| a.value(row))),
+            IntSrc::Bad(arr) => {
+                if arr.is_null(row) {
+                    Ok(None)
+                } else {
+                    Err(format!(
+                        "expected an integer or date column, found {:?}",
+                        arr.data_type()
+                    ))
+                }
+            }
+        }
+    }
+}
+
+/// A float source resolved to a concrete Arrow array.
+enum FloatSrc<'a> {
+    F32(&'a Float32Array),
+    F64(&'a Float64Array),
+    Bad(&'a ArrayRef),
+}
+
+fn float_src(arr: &ArrayRef) -> FloatSrc<'_> {
+    match arr.data_type() {
+        DataType::Float32 => downcast_opt(arr).map_or(FloatSrc::Bad(arr), FloatSrc::F32),
+        DataType::Float64 => downcast_opt(arr).map_or(FloatSrc::Bad(arr), FloatSrc::F64),
+        _ => FloatSrc::Bad(arr),
+    }
+}
+
+impl FloatSrc<'_> {
+    fn get(&self, row: usize) -> Result<Option<f64>, String> {
+        match self {
+            FloatSrc::F32(a) => Ok((!a.is_null(row)).then(|| a.value(row) as f64)),
+            FloatSrc::F64(a) => Ok((!a.is_null(row)).then(|| a.value(row))),
+            FloatSrc::Bad(arr) => {
+                if arr.is_null(row) {
+                    Ok(None)
+                } else {
+                    Err(format!(
+                        "expected a float column, found {:?}",
+                        arr.data_type()
+                    ))
+                }
+            }
+        }
+    }
+}
+
+/// A boolean source resolved to a concrete Arrow array.
+enum BoolSrc<'a> {
+    B(&'a BooleanArray),
+    Bad(&'a ArrayRef),
+}
+
+fn bool_src(arr: &ArrayRef) -> BoolSrc<'_> {
+    match arr.data_type() {
+        DataType::Boolean => downcast_opt(arr).map_or(BoolSrc::Bad(arr), BoolSrc::B),
+        _ => BoolSrc::Bad(arr),
+    }
+}
+
+impl BoolSrc<'_> {
+    fn get(&self, row: usize) -> Result<Option<bool>, String> {
+        match self {
+            BoolSrc::B(a) => Ok((!a.is_null(row)).then(|| a.value(row))),
+            BoolSrc::Bad(arr) => {
+                if arr.is_null(row) {
+                    Ok(None)
+                } else {
+                    Err(format!(
+                        "expected a boolean column, found {:?}",
+                        arr.data_type()
+                    ))
+                }
+            }
+        }
+    }
+}
+
+/// A UTF-8 source resolved to a concrete Arrow array. `Dict` carries a
+/// dictionary-encoded column (Arrow reconstructs one from a Parquet file that
+/// embeds Arrow dictionary schema metadata); its presence is what the columnar
+/// builder keys the `StrColumnDict` fast path on (ADR-0109 decision 3).
+enum StrSrc<'a> {
+    Utf8(&'a StringArray),
+    LargeUtf8(&'a LargeStringArray),
+    Dict {
+        arr: &'a ArrayRef,
+        values: &'a ArrayRef,
+        keys: Vec<usize>,
+    },
+    Bad(&'a ArrayRef),
+}
+
+fn str_src(arr: &ArrayRef) -> StrSrc<'_> {
+    match arr.data_type() {
+        DataType::Utf8 => downcast_opt(arr).map_or(StrSrc::Bad(arr), StrSrc::Utf8),
+        DataType::LargeUtf8 => downcast_opt(arr).map_or(StrSrc::Bad(arr), StrSrc::LargeUtf8),
+        DataType::Dictionary(_, value_ty)
+            if matches!(**value_ty, DataType::Utf8 | DataType::LargeUtf8) =>
+        {
+            let dict = arr.as_any_dictionary();
+            StrSrc::Dict {
+                arr,
+                values: dict.values(),
+                keys: dict.normalized_keys(),
+            }
+        }
+        _ => StrSrc::Bad(arr),
+    }
+}
+
+impl StrSrc<'_> {
+    fn get(&self, row: usize) -> Result<Option<String>, String> {
+        match self {
+            StrSrc::Utf8(a) => Ok((!a.is_null(row)).then(|| a.value(row).to_string())),
+            StrSrc::LargeUtf8(a) => Ok((!a.is_null(row)).then(|| a.value(row).to_string())),
+            StrSrc::Dict { arr, values, keys } => {
+                if arr.is_null(row) {
+                    return Ok(None);
+                }
+                read_string(values, keys[row])
+            }
+            StrSrc::Bad(arr) => {
+                if arr.is_null(row) {
+                    Ok(None)
+                } else {
+                    Err(format!(
+                        "expected a string column, found {:?}",
+                        arr.data_type()
+                    ))
+                }
+            }
+        }
+    }
+
+    fn is_dict(&self) -> bool {
+        matches!(self, StrSrc::Dict { .. })
+    }
+}
+
+/// A binary source resolved to a concrete Arrow array. `Dict` is the binary
+/// analogue of [`StrSrc::Dict`].
+enum BytesSrc<'a> {
+    Bin(&'a BinaryArray),
+    LargeBin(&'a LargeBinaryArray),
+    FixedBin(&'a FixedSizeBinaryArray),
+    Dict {
+        arr: &'a ArrayRef,
+        values: &'a ArrayRef,
+        keys: Vec<usize>,
+    },
+    Bad(&'a ArrayRef),
+}
+
+fn bytes_src(arr: &ArrayRef) -> BytesSrc<'_> {
+    match arr.data_type() {
+        DataType::Binary => downcast_opt(arr).map_or(BytesSrc::Bad(arr), BytesSrc::Bin),
+        DataType::LargeBinary => downcast_opt(arr).map_or(BytesSrc::Bad(arr), BytesSrc::LargeBin),
+        DataType::FixedSizeBinary(_) => {
+            downcast_opt(arr).map_or(BytesSrc::Bad(arr), BytesSrc::FixedBin)
+        }
+        DataType::Dictionary(_, value_ty)
+            if matches!(
+                **value_ty,
+                DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_)
+            ) =>
+        {
+            let dict = arr.as_any_dictionary();
+            BytesSrc::Dict {
+                arr,
+                values: dict.values(),
+                keys: dict.normalized_keys(),
+            }
+        }
+        _ => BytesSrc::Bad(arr),
+    }
+}
+
+impl BytesSrc<'_> {
+    fn get(&self, row: usize) -> Result<Option<Vec<u8>>, String> {
+        match self {
+            BytesSrc::Bin(a) => Ok((!a.is_null(row)).then(|| a.value(row).to_vec())),
+            BytesSrc::LargeBin(a) => Ok((!a.is_null(row)).then(|| a.value(row).to_vec())),
+            BytesSrc::FixedBin(a) => Ok((!a.is_null(row)).then(|| a.value(row).to_vec())),
+            BytesSrc::Dict { arr, values, keys } => {
+                if arr.is_null(row) {
+                    return Ok(None);
+                }
+                read_bytes(values, keys[row])
+            }
+            BytesSrc::Bad(arr) => {
+                if arr.is_null(row) {
+                    Ok(None)
+                } else {
+                    Err(format!(
+                        "expected a binary column, found {:?}",
+                        arr.data_type()
+                    ))
+                }
+            }
+        }
+    }
+
+    fn is_dict(&self) -> bool {
+        matches!(self, BytesSrc::Dict { .. })
+    }
+}
+
+/// A `ts` source with its unit scaling resolved once (ADR-0109 decision 6). A
+/// native Arrow `Timestamp` scales by its own unit; an integer column scales by
+/// the mapping's declared unit; a date column is rejected as an invalid ts
+/// source, exactly as [`read_ts`].
+enum TsSrc<'a> {
+    Sec(&'a TimestampSecondArray),
+    Milli(&'a TimestampMillisecondArray),
+    Micro(&'a TimestampMicrosecondArray),
+    Nano(&'a TimestampNanosecondArray),
+    Int { src: IntSrc<'a>, factor: i64 },
+    DateErr(&'a ArrayRef),
+}
+
+fn ts_src(arr: &ArrayRef, declared: TsUnit) -> TsSrc<'_> {
+    match arr.data_type() {
+        DataType::Timestamp(unit, _) => match unit {
+            TimeUnit::Second => downcast_opt(arr).map_or_else(
+                || TsSrc::Int {
+                    src: int_src(arr),
+                    factor: declared.factor(),
+                },
+                TsSrc::Sec,
+            ),
+            TimeUnit::Millisecond => downcast_opt(arr).map_or_else(
+                || TsSrc::Int {
+                    src: int_src(arr),
+                    factor: declared.factor(),
+                },
+                TsSrc::Milli,
+            ),
+            TimeUnit::Microsecond => downcast_opt(arr).map_or_else(
+                || TsSrc::Int {
+                    src: int_src(arr),
+                    factor: declared.factor(),
+                },
+                TsSrc::Micro,
+            ),
+            TimeUnit::Nanosecond => downcast_opt(arr).map_or_else(
+                || TsSrc::Int {
+                    src: int_src(arr),
+                    factor: declared.factor(),
+                },
+                TsSrc::Nano,
+            ),
+        },
+        DataType::Date32 | DataType::Date64 => TsSrc::DateErr(arr),
+        _ => TsSrc::Int {
+            src: int_src(arr),
+            factor: declared.factor(),
+        },
+    }
+}
+
+impl TsSrc<'_> {
+    fn get(&self, row: usize) -> Result<Option<i64>, String> {
+        let overflow = || "timestamp overflows i64 nanoseconds".to_string();
+        let scale = |raw: i64, factor: i64| raw.checked_mul(factor).map(Some).ok_or_else(overflow);
+        match self {
+            TsSrc::Sec(a) if a.is_null(row) => Ok(None),
+            TsSrc::Sec(a) => scale(a.value(row), 1_000_000_000),
+            TsSrc::Milli(a) if a.is_null(row) => Ok(None),
+            TsSrc::Milli(a) => scale(a.value(row), 1_000_000),
+            TsSrc::Micro(a) if a.is_null(row) => Ok(None),
+            TsSrc::Micro(a) => scale(a.value(row), 1_000),
+            TsSrc::Nano(a) if a.is_null(row) => Ok(None),
+            TsSrc::Nano(a) => scale(a.value(row), 1),
+            TsSrc::Int { src, factor } => match src.get(row)? {
+                Some(raw) => scale(raw, *factor),
+                None => Ok(None),
+            },
+            TsSrc::DateErr(arr) => {
+                if arr.is_null(row) {
+                    Ok(None)
+                } else {
+                    Err(format!(
+                        "ts column has date type {:?}; a date is not a valid ts source. Map it as \
+                         an i64 attribute instead (its value is days since the epoch for Date32, \
+                         milliseconds for Date64).",
+                        arr.data_type()
+                    ))
+                }
+            }
+        }
+    }
+}
+
+/// A trace/span id source: a hex string or a raw binary column, resolved once.
+/// The reader yields the candidate bytes (or `None` for a null cell or an
+/// undecodable hex string); the caller length-checks into `[u8; N]`, dropping a
+/// wrong length exactly as [`read_id`].
+enum IdSrc<'a> {
+    Hex(&'a ArrayRef),
+    Bin(&'a ArrayRef),
+    Bad(&'a ArrayRef),
+}
+
+fn id_src(arr: &ArrayRef) -> IdSrc<'_> {
+    match arr.data_type() {
+        DataType::Utf8 | DataType::LargeUtf8 => IdSrc::Hex(arr),
+        DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => IdSrc::Bin(arr),
+        _ => IdSrc::Bad(arr),
+    }
+}
+
+impl IdSrc<'_> {
+    fn get(&self, row: usize) -> Result<Option<Vec<u8>>, String> {
+        match self {
+            IdSrc::Hex(arr) => Ok(read_string(arr, row)?.and_then(|s| hex::decode(s).ok())),
+            IdSrc::Bin(arr) => read_bytes(arr, row),
+            IdSrc::Bad(arr) => {
+                if arr.is_null(row) {
+                    Ok(None)
+                } else {
+                    Err(format!(
+                        "expected a binary or string id column, found {:?}",
+                        arr.data_type()
+                    ))
+                }
+            }
+        }
+    }
+}
+
+/// One mapped scalar attribute column's source, resolved once to its declared
+/// [`ColType`]. Yields the typed [`AttrValue`] per present cell and exposes
+/// whether the Arrow column arrived dictionary-encoded (for the `StrColumnDict`
+/// fast path).
+enum AttrSrc<'a> {
+    Int(IntSrc<'a>),
+    Float(FloatSrc<'a>),
+    Bool(BoolSrc<'a>),
+    Str(StrSrc<'a>),
+    Bytes(BytesSrc<'a>),
+}
+
+fn attr_src(arr: &ArrayRef, ty: ColType) -> AttrSrc<'_> {
+    match ty {
+        ColType::Str => AttrSrc::Str(str_src(arr)),
+        ColType::I64 => AttrSrc::Int(int_src(arr)),
+        ColType::F64 => AttrSrc::Float(float_src(arr)),
+        ColType::Bool => AttrSrc::Bool(bool_src(arr)),
+        ColType::Bytes => AttrSrc::Bytes(bytes_src(arr)),
+    }
+}
+
+impl AttrSrc<'_> {
+    fn get(&self, row: usize) -> Result<Option<AttrValue>, String> {
+        Ok(match self {
+            AttrSrc::Int(s) => s.get(row)?.map(AttrValue::I64),
+            AttrSrc::Float(s) => s.get(row)?.map(AttrValue::F64),
+            AttrSrc::Bool(s) => s.get(row)?.map(AttrValue::Bool),
+            AttrSrc::Str(s) => s.get(row)?.map(AttrValue::Str),
+            AttrSrc::Bytes(s) => s.get(row)?.map(AttrValue::Bytes),
+        })
+    }
+
+    fn is_dict(&self) -> bool {
+        match self {
+            AttrSrc::Str(s) => s.is_dict(),
+            AttrSrc::Bytes(s) => s.is_dict(),
+            _ => false,
+        }
+    }
+}
+
+/// A columnar-build failure: a batch-level decode/resolve error, or a per-row
+/// admission rejection carrying its FILE-absolute index (#541).
+enum ColBuildError {
+    Batch(String),
+    Row { row: u64, reason: String },
+}
+
+/// The `StrColumnDict` for one Str/Bytes dynamic column, interned from its final
+/// dense cells (ADR-0109 decision 3). Distinct values are first-seen order; the
+/// writer sorts them to match `encode_strings`, so ordering here is free. The
+/// bytes are `resolve_value(cell).1` for a Str/Bytes value: the string/byte
+/// payload verbatim, so the writer's dict path re-interns to exactly the same
+/// per-object dictionary the plain path derives, and the object bytes match.
+fn str_column_dict_from_cells(cells: &[AttrValue]) -> StrColumnDict {
+    let mut interner: std::collections::HashMap<Vec<u8>, u32> = std::collections::HashMap::new();
+    let mut distinct: Vec<Vec<u8>> = Vec::new();
+    let mut ids: Vec<u32> = Vec::with_capacity(cells.len());
+    for cell in cells {
+        let bytes = match cell {
+            AttrValue::Str(s) => s.as_bytes().to_vec(),
+            AttrValue::Bytes(b) => b.clone(),
+            // A Str/Bytes column holds only Str/Bytes values; anything else is a
+            // mis-typed column that never reaches here.
+            _ => Vec::new(),
+        };
+        let next = distinct.len() as u32;
+        let id = *interner.entry(bytes.clone()).or_insert_with(|| {
+            distinct.push(bytes);
+            next
+        });
+        ids.push(id);
+    }
+    StrColumnDict { distinct, ids }
+}
+
+/// Build a [`ColumnarLogBatch`] directly from a batch's Arrow spans and the
+/// mapping (ADR-0109 decisions 1, 3, 6). Every downcast and the `ts` unit
+/// scaling are resolved once per column per span; stream identity is hashed once
+/// per distinct resource tuple; a mapped Str/Bytes column that arrived
+/// dictionary-encoded is carried as a `StrColumnDict` so the writer pays string
+/// encoding and token bloom per distinct value, not per row.
+///
+/// The result is byte-identical, once written, to
+/// [`ColumnarLogBatch::from_records`] over the [`NormalizedLogRecord`]s
+/// [`build_record`] would produce for the same spans (decision 7): the dynamic
+/// columns keep the same `(name, type)`-sorted order and first-occurrence
+/// winner/residual split, and the stream directory is the same id-ascending
+/// dense form. Admission rejections match `build_record`'s per-row check order
+/// and report the first failing row's FILE-absolute index.
+fn build_columnar_batch(
+    spans: &[(RecordBatch, u64)],
+    mapping: &Mapping,
+    limits: &LogIngestLimits,
+    now_ns: i64,
+) -> Result<ColumnarLogBatch, ColBuildError> {
+    use std::collections::{BTreeMap, HashMap, HashSet};
+
+    let total_rows: usize = spans.iter().map(|(b, _)| b.num_rows()).sum();
+    let mut batch = ColumnarLogBatch::new();
+    batch.num_rows = total_rows;
+    if total_rows == 0 {
+        return Ok(batch);
+    }
+
+    batch.ts_ns.reserve(total_rows);
+    batch.observed_ts_ns.reserve(total_rows);
+    batch.severity_num.reserve(total_rows);
+    batch.flags.reserve(total_rows);
+    batch.residual_attrs = vec![Vec::new(); total_rows];
+
+    // Dynamic columns, keyed by (name, type byte) as `from_records` keys them, so
+    // their materialized order matches. `col_dict` tracks whether every winning
+    // cell of a column came from a dictionary-encoded Arrow source.
+    let mut col_cells: BTreeMap<(String, u8), Vec<Option<AttrValue>>> = BTreeMap::new();
+    let mut col_dict: BTreeMap<(String, u8), bool> = BTreeMap::new();
+
+    // Stream identity: hashed once per distinct resource tuple, keyed by the
+    // STREAM_DIR blob (the canonical resource bytes) so the blake3 in
+    // `log_stream_id` runs once per distinct tuple rather than once per row
+    // (ADR-0109 decision 6). `stream_dir` is the id-ascending directory.
+    let mut row_stream_id: Vec<LogStreamId> = Vec::with_capacity(total_rows);
+    let mut stream_dir: BTreeMap<LogStreamId, Vec<u8>> = BTreeMap::new();
+    let mut stream_cache: HashMap<Vec<u8>, LogStreamId> = HashMap::new();
+
+    let mut grow = 0usize;
+    for (span, file_base) in spans {
+        let cols = ColumnIndex::resolve(span, mapping).map_err(ColBuildError::Batch)?;
+
+        // Prepare every reader once per span (downcast resolved here, not per
+        // cell).
+        let ts = ts_src(span.column(cols.ts), mapping.ts_unit);
+        let body = cols.body.map(|i| str_src(span.column(i)));
+        let sev_num = cols.severity_number.map(|i| int_src(span.column(i)));
+        let sev_text = cols.severity_text.map(|i| str_src(span.column(i)));
+        let trace = cols.trace_id.map(|i| id_src(span.column(i)));
+        let span_id_src = cols.span_id.map(|i| id_src(span.column(i)));
+        let resource: Vec<(usize, AttrSrc)> = cols
+            .resource
+            .iter()
+            .map(|(ci, mi)| {
+                (
+                    *mi,
+                    attr_src(
+                        span.column(*ci),
+                        mapping.resource_attributes[*mi].value_type,
+                    ),
+                )
+            })
+            .collect();
+        let record: Vec<(usize, AttrSrc)> = cols
+            .record
+            .iter()
+            .map(|(ci, mi)| {
+                (
+                    *mi,
+                    attr_src(span.column(*ci), mapping.attributes[*mi].value_type),
+                )
+            })
+            .collect();
+
+        for local in 0..span.num_rows() {
+            let file_row = file_base + local as u64;
+            let row_err = |reason: String| ColBuildError::Row {
+                row: file_row,
+                reason,
+            };
+
+            // 1. ts (required) and 2. future-skew bound, in build_record order.
+            let raw_ts = match ts.get(local).map_err(row_err)? {
+                Some(t) => t,
+                None => {
+                    return Err(row_err(format!(
+                        "ts column {:?} is null",
+                        mapping.ts_column
+                    )));
+                }
+            };
+            let skew_ns = raw_ts.saturating_sub(now_ns);
+            if skew_ns > limits.max_future_skew_ns {
+                return Err(row_err(format!(
+                    "timestamp is {skew_ns} ns ahead of load time, more than the max future skew \
+                     of {} ns",
+                    limits.max_future_skew_ns
+                )));
+            }
+
+            // 3. body (optional) and its length cap.
+            let body_val = match &body {
+                Some(s) => s.get(local).map_err(row_err)?.unwrap_or_default(),
+                None => String::new(),
+            };
+            if body_val.len() > limits.max_body_len {
+                return Err(row_err(format!(
+                    "body is {} bytes, more than the limit of {}",
+                    body_val.len(),
+                    limits.max_body_len
+                )));
+            }
+
+            // 4. severity number (out-of-u8 normalizes to 0) and severity text.
+            let severity_num = match &sev_num {
+                Some(s) => s
+                    .get(local)
+                    .map_err(row_err)?
+                    .and_then(|v| u8::try_from(v).ok())
+                    .unwrap_or(0),
+                None => 0,
+            };
+            let severity_text = match &sev_text {
+                Some(s) => s.get(local).map_err(row_err)?.unwrap_or_default(),
+                None => String::new(),
+            };
+
+            // 5. trace/span ids: exact length or absent.
+            let trace_id = match &trace {
+                Some(s) => s
+                    .get(local)
+                    .map_err(row_err)?
+                    .and_then(|b| <[u8; 16]>::try_from(b.as_slice()).ok()),
+                None => None,
+            };
+            let span_id = match &span_id_src {
+                Some(s) => s
+                    .get(local)
+                    .map_err(row_err)?
+                    .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok()),
+                None => None,
+            };
+
+            // 6. resource attributes (stream identity), checked in mapping order.
+            let mut resource_attrs: Vec<(String, AttrValue)> = Vec::with_capacity(resource.len());
+            for (mi, src) in &resource {
+                let spec = &mapping.resource_attributes[*mi];
+                if let Some(v) = src.get(local).map_err(row_err)? {
+                    check_attr(&spec.key, &v, limits).map_err(row_err)?;
+                    resource_attrs.push((spec.key.clone(), v));
+                }
+            }
+
+            // 7. record attributes: check, count for the per-record cap, and
+            // split first-occurrence winner vs within-record residual exactly as
+            // `from_records`.
+            let mut present_record = 0usize;
+            let mut taken: HashSet<(String, u8)> = HashSet::new();
+            for (mi, src) in &record {
+                let spec = &mapping.attributes[*mi];
+                if let Some(v) = src.get(local).map_err(row_err)? {
+                    check_attr(&spec.key, &v, limits).map_err(row_err)?;
+                    present_record += 1;
+                    let key = (spec.key.clone(), field_type_of(spec.value_type).to_u8());
+                    if taken.insert(key.clone()) {
+                        col_cells
+                            .entry(key.clone())
+                            .or_insert_with(|| vec![None; total_rows])[grow] = Some(v);
+                        let flag = col_dict.entry(key).or_insert(true);
+                        *flag &= src.is_dict();
+                    } else {
+                        batch.residual_attrs[grow].push((spec.key.clone(), v));
+                    }
+                }
+            }
+            if present_record > LOADER_MAX_ATTRIBUTES_PER_RECORD {
+                return Err(row_err(format!(
+                    "record has {present_record} attributes, more than the loader per-record cap \
+                     of {LOADER_MAX_ATTRIBUTES_PER_RECORD}"
+                )));
+            }
+
+            // 8. stream identity: hash once per distinct resource tuple.
+            let blob = stream_attrs_bytes(&resource_attrs, "", "", &[]);
+            let stream_id = match stream_cache.get(&blob) {
+                Some(id) => *id,
+                None => {
+                    let id = log_stream_id(&resource_attrs, "", "", &[]);
+                    stream_cache.insert(blob.clone(), id);
+                    id
+                }
+            };
+            stream_dir.entry(stream_id).or_insert_with(|| blob.clone());
+            row_stream_id.push(stream_id);
+
+            // Fixed columns, appended in row order.
+            batch.ts_ns.push(raw_ts);
+            batch.observed_ts_ns.push(raw_ts);
+            batch.severity_num.push(severity_num);
+            batch.flags.push(0);
+            batch.severity_text.push(severity_text.as_bytes());
+            batch.body.push(body_val.as_bytes());
+            match trace_id {
+                Some(t) => {
+                    batch.trace_id.extend_from_slice(&t);
+                    batch.trace_id_validity.push(true);
+                }
+                None => batch.trace_id_validity.push(false),
+            }
+            match span_id {
+                Some(s) => {
+                    batch.span_id.extend_from_slice(&s);
+                    batch.span_id_validity.push(true);
+                }
+                None => batch.span_id_validity.push(false),
+            }
+
+            grow += 1;
+        }
+    }
+
+    // Stream directory: id-ascending dense refs, matching `from_records`.
+    let mut ref_of: HashMap<LogStreamId, u32> = HashMap::with_capacity(stream_dir.len());
+    for (i, (id, blob)) in stream_dir.into_iter().enumerate() {
+        ref_of.insert(id, i as u32);
+        batch.stream_ids.push(id);
+        batch.stream_attrs.push(blob);
+    }
+    batch.stream_refs = row_stream_id.iter().map(|id| ref_of[id]).collect();
+
+    // Materialize dynamic columns in (name, type) order; attach a StrColumnDict
+    // to a Str/Bytes column whose every winning cell came from a dictionary
+    // source. If no column carries a dictionary, leave `dyn_col_dicts` empty (its
+    // default), so a plain load is byte-identical to `from_records` without
+    // `with_dictionaries`.
+    let mut dicts: Vec<Option<StrColumnDict>> = Vec::with_capacity(col_cells.len());
+    let mut any_dict = false;
+    for ((name, ty_byte), cells) in col_cells {
+        let field_type = FieldType::from_u8(ty_byte).unwrap_or(FieldType::Bytes);
+        let mut validity = Bitmap::new();
+        let mut dense = Vec::new();
+        for cell in cells {
+            match cell {
+                Some(v) => {
+                    validity.push(true);
+                    dense.push(v);
+                }
+                None => validity.push(false),
+            }
+        }
+        let use_dict = matches!(field_type, FieldType::Str | FieldType::Bytes)
+            && col_dict
+                .get(&(name.clone(), ty_byte))
+                .copied()
+                .unwrap_or(false);
+        if use_dict {
+            any_dict = true;
+            dicts.push(Some(str_column_dict_from_cells(&dense)));
+        } else {
+            dicts.push(None);
+        }
+        batch.dyn_columns.push(DynColumn {
+            name,
+            field_type,
+            cells: dense,
+            validity,
+        });
+    }
+    if any_dict {
+        batch.dyn_col_dicts = dicts;
+    }
+
+    Ok(batch)
 }
 
 #[cfg(test)]
@@ -2384,6 +3293,7 @@ type = "i64"
             None,
             NOW_NS,
             Arc::new(FixedClock(NOW_NS)),
+            LoadPath::Columnar,
             Some(hook),
         )
         .await
@@ -2829,6 +3739,404 @@ type = "i64"
         assert!(
             !emitted.contains("shard spread is at or below"),
             "an already-interleaved input must not warn: {emitted}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // ADR-0109 columnar fast path.
+    // ---------------------------------------------------------------------
+
+    fn to_logrecord(r: &NormalizedLogRecord) -> ravel_logseg::LogRecord {
+        ravel_logseg::LogRecord {
+            stream_id: r.stream_id,
+            stream_attrs: r.stream_attrs.clone(),
+            ts_ns: r.ts_ns,
+            observed_ts_ns: r.observed_ts_ns,
+            severity_num: r.severity_num,
+            severity_text: r.severity_text.clone(),
+            body: r.body.clone(),
+            trace_id: r.trace_id,
+            span_id: r.span_id,
+            flags: r.flags,
+            attrs: r.attrs.clone(),
+        }
+    }
+
+    /// The row differential-reference records for `batch` under `mapping`.
+    fn row_records(batch: &RecordBatch, mapping: &Mapping) -> Vec<NormalizedLogRecord> {
+        let cols = ColumnIndex::resolve(batch, mapping).expect("resolve columns");
+        (0..batch.num_rows())
+            .map(|r| {
+                build_record(
+                    batch,
+                    &cols,
+                    mapping,
+                    &LogIngestLimits::default(),
+                    NOW_NS,
+                    r,
+                )
+                .expect("build_record")
+            })
+            .collect()
+    }
+
+    /// Write `batch` to a Parquet file and read it back as one RecordBatch, so a
+    /// dictionary-encoded column exercises the real Parquet decode path (the
+    /// Arrow schema `ArrowWriter` embeds is what lets a `Dictionary` column
+    /// survive the round trip; a plain `BYTE_ARRAY` column comes back plain).
+    fn roundtrip_parquet(batch: &RecordBatch) -> RecordBatch {
+        use parquet::arrow::ArrowWriter;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pq = dir.path().join("rt.parquet");
+        let file = std::fs::File::create(&pq).expect("create parquet");
+        let mut w = ArrowWriter::try_new(file, batch.schema(), None).expect("arrow writer");
+        w.write(batch).expect("write batch");
+        w.close().expect("close writer");
+        let f = std::fs::File::open(&pq).expect("open parquet");
+        let reader = ParquetRecordBatchReaderBuilder::try_new(f)
+            .expect("reader builder")
+            .build()
+            .expect("reader");
+        let mut batches: Vec<RecordBatch> = reader.map(|b| b.expect("read batch")).collect();
+        assert_eq!(batches.len(), 1, "fixture fits one read batch");
+        batches.pop().expect("one batch")
+    }
+
+    /// A pinned object identity so two objects are comparable byte for byte: the
+    /// footer stamps `writer_id`/`epoch`/`seq` verbatim, so only a real drift in
+    /// the encoded records could move a byte.
+    fn fixed_identity() -> ravel_logseg::ObjectIdentity {
+        ravel_logseg::ObjectIdentity {
+            tenant_hash: [7u8; 16],
+            shard: 0,
+            writer_id: [9u8; 16],
+            writer_epoch: 1,
+            writer_seq: 0,
+        }
+    }
+
+    fn row_object(records: &[NormalizedLogRecord]) -> Vec<u8> {
+        let mut w =
+            ravel_logseg::RlogWriter::new(ravel_logseg::RlogConfig::default(), fixed_identity());
+        for r in records {
+            w.push(to_logrecord(r)).expect("push row record");
+        }
+        w.finish().expect("finish row object")
+    }
+
+    fn columnar_object(batch: ColumnarLogBatch) -> Vec<u8> {
+        let mut w =
+            ravel_logseg::RlogWriter::new(ravel_logseg::RlogConfig::default(), fixed_identity());
+        w.push_columnar(batch).expect("push columnar batch");
+        w.finish().expect("finish columnar object")
+    }
+
+    fn build_columnar_or_panic(batch: &RecordBatch, mapping: &Mapping) -> ColumnarLogBatch {
+        let spans = vec![(batch.clone(), 0u64)];
+        match build_columnar_batch(&spans, mapping, &LogIngestLimits::default(), NOW_NS) {
+            Ok(b) => b,
+            Err(ColBuildError::Batch(reason)) => panic!("columnar batch failed: {reason}"),
+            Err(ColBuildError::Row { row, reason }) => {
+                panic!("columnar row {row} rejected: {reason}")
+            }
+        }
+    }
+
+    /// Build `batch` through both the row path and the columnar builder and
+    /// assert (a) the columnar batch equals `from_records` of the row records
+    /// (ignoring the additive dictionary shapes), and (b) the encoded RLOG
+    /// objects are byte-for-byte identical (ADR-0109 decision 7). Returns the
+    /// columnar batch for further inspection (e.g. dictionary attachment).
+    fn assert_paths_match(batch: &RecordBatch, mapping: &Mapping) -> ColumnarLogBatch {
+        let records = row_records(batch, mapping);
+        let col = build_columnar_or_panic(batch, mapping);
+
+        let logrecords: Vec<ravel_logseg::LogRecord> = records.iter().map(to_logrecord).collect();
+        let expected = ColumnarLogBatch::from_records(&logrecords);
+        let mut col_no_dict = col.clone();
+        col_no_dict.dyn_col_dicts = Vec::new();
+        assert_eq!(
+            col_no_dict, expected,
+            "columnar builder must produce the same batch as from_records of the row records"
+        );
+
+        let row_bytes = row_object(&records);
+        let col_bytes = columnar_object(col.clone());
+        assert_eq!(
+            row_bytes, col_bytes,
+            "row and columnar RLOG objects must be byte-for-byte identical"
+        );
+        col
+    }
+
+    /// The end-to-end byte-identity anchor (ADR-0109 decision 7): the same
+    /// records, built row-wise and column-wise, encode to identical RLOG bytes
+    /// across a corpus of nulls in every mapped column, each `TsUnit`, an
+    /// out-of-`u8` severity number, an all-null attribute column, duplicate
+    /// mapped keys (winner plus residual), and both dictionary-encoded and plain
+    /// string columns.
+    ///
+    /// Prove-the-test: change `observed_ts_ns` to `push(0)` (instead of
+    /// `raw_ts`), or drop the `TsUnit` scaling in `TsSrc::get` (return the raw
+    /// value), or set `use_dict` to `false` unconditionally -- each flips a byte
+    /// and the `assert_eq!` on the objects fails. Confirmed by making the
+    /// `observed_ts_ns` flip: the objects diverged and the assertion tripped.
+    #[test]
+    fn columnar_load_matches_row_load_byte_for_byte() {
+        use arrow::array::DictionaryArray;
+        use arrow::datatypes::Int32Type;
+
+        // Each TsUnit: an integer ts column scaled by the declared unit must
+        // land identically on both paths.
+        for (unit, raw) in [
+            (TsUnit::Seconds, 1_700_000_000_i64),
+            (TsUnit::Millis, 1_700_000_000_000),
+            (TsUnit::Micros, 1_700_000_000_000_000),
+            (TsUnit::Nanos, 1_700_000_000_000_000_000),
+        ] {
+            let b = roundtrip_parquet(&batch(vec![
+                ("ts", i64_col(vec![raw, raw])),
+                ("a", str_col(vec!["v", "v"])),
+            ]));
+            let mut m = base_mapping();
+            m.ts_unit = unit;
+            m.attributes = vec![attr("a", "a", ColType::Str)];
+            assert_paths_match(&b, &m);
+        }
+
+        // A rich batch: nulls in every optional/attribute column, an out-of-u8
+        // severity, an all-null attribute column, duplicate mapped keys, and a
+        // dictionary column beside a plain one.
+        let ts = Arc::new(Int64Array::from(vec![
+            NOW_NS,
+            NOW_NS + 1,
+            NOW_NS + 2,
+            NOW_NS + 3,
+        ])) as ArrayRef;
+        let body = Arc::new(StringArray::from(vec![
+            Some("hello"),
+            None,
+            Some(""),
+            Some("world"),
+        ])) as ArrayRef;
+        // 300 is out of u8 range and must normalize to 0 on both paths; row 2 is
+        // null (also 0).
+        let sev = Arc::new(Int64Array::from(vec![
+            Some(9_i64),
+            Some(300),
+            None,
+            Some(0),
+        ])) as ArrayRef;
+        let svc = Arc::new(StringArray::from(vec![
+            Some("api"),
+            None,
+            Some("web"),
+            Some("api"),
+        ])) as ArrayRef;
+        let allnull = Arc::new(Int64Array::from(
+            vec![None, None, None, None] as Vec<Option<i64>>
+        )) as ArrayRef;
+        let dup_a =
+            Arc::new(Int64Array::from(vec![Some(1_i64), Some(2), None, Some(4)])) as ArrayRef;
+        let dup_b = Arc::new(Int64Array::from(vec![
+            Some(10_i64),
+            None,
+            Some(30),
+            Some(40),
+        ])) as ArrayRef;
+        let dictcol = Arc::new(
+            vec![Some("x"), Some("y"), None, Some("x")]
+                .into_iter()
+                .collect::<DictionaryArray<Int32Type>>(),
+        ) as ArrayRef;
+        let plaincol = Arc::new(StringArray::from(vec![
+            Some("p"),
+            None,
+            Some("q"),
+            Some("p"),
+        ])) as ArrayRef;
+
+        let rich = batch(vec![
+            ("ts", ts),
+            ("body", body),
+            ("sev", sev),
+            ("svc", svc),
+            ("allnull", allnull),
+            ("dupA", dup_a),
+            ("dupB", dup_b),
+            ("dictcol", dictcol),
+            ("plaincol", plaincol),
+        ]);
+        let rich = roundtrip_parquet(&rich);
+
+        // The Parquet round trip preserves the Arrow dictionary encoding (the
+        // report question): a column arrow-written as a Dictionary comes back a
+        // Dictionary, while the plain column stays plain.
+        let dict_idx = rich.schema().index_of("dictcol").expect("dictcol present");
+        assert!(
+            matches!(
+                rich.column(dict_idx).data_type(),
+                DataType::Dictionary(_, _)
+            ),
+            "an arrow-written dictionary column survives the Parquet round trip as a Dictionary"
+        );
+        let plain_idx = rich
+            .schema()
+            .index_of("plaincol")
+            .expect("plaincol present");
+        assert!(
+            matches!(rich.column(plain_idx).data_type(), DataType::Utf8),
+            "the plain string column arrives plain"
+        );
+
+        let mut m = base_mapping();
+        m.body_column = Some("body".to_string());
+        m.severity_number_column = Some("sev".to_string());
+        m.resource_attributes = vec![attr("service.name", "svc", ColType::Str)];
+        m.attributes = vec![
+            attr("allnull", "allnull", ColType::I64),
+            attr("dup", "dupA", ColType::I64),
+            attr("dup", "dupB", ColType::I64),
+            attr("dictkey", "dictcol", ColType::Str),
+            attr("plainkey", "plaincol", ColType::Str),
+        ];
+
+        let col = assert_paths_match(&rich, &m);
+
+        // The dictionary column reached the StrColumnDict fast path; the plain
+        // one did not.
+        assert!(
+            !col.dyn_col_dicts.is_empty(),
+            "at least one column carries a dictionary, so dyn_col_dicts is populated"
+        );
+        let dict_pos = col
+            .dyn_columns
+            .iter()
+            .position(|c| c.name == "dictkey")
+            .expect("dictkey column");
+        let plain_pos = col
+            .dyn_columns
+            .iter()
+            .position(|c| c.name == "plainkey")
+            .expect("plainkey column");
+        assert!(
+            col.dyn_col_dicts[dict_pos].is_some(),
+            "the dictionary-encoded column passes through as a StrColumnDict"
+        );
+        assert!(
+            col.dyn_col_dicts[plain_pos].is_none(),
+            "the plain string column stays plain, no dictionary attached"
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn load_row(
+        store: Arc<dyn ObjectStoreBackend>,
+        parquet_path: &Path,
+        tenant: &str,
+        mapping: &Mapping,
+        shards: u32,
+        batch_rows: usize,
+        read_cursors: Option<usize>,
+        now_ns: i64,
+        clock: Arc<dyn Clock>,
+    ) -> Result<LoadReport, LoadError> {
+        load_instrumented(
+            store,
+            parquet_path,
+            tenant,
+            mapping,
+            shards,
+            batch_rows,
+            read_cursors,
+            now_ns,
+            clock,
+            LoadPath::Row,
+            None,
+        )
+        .await
+    }
+
+    /// Reachability (the point of ADR-0109): the real `load` entry point drives
+    /// the columnar path, not merely a builder that compiles. A load of a
+    /// multi-batch file reports `columnar_batches_built > 0`, and the row
+    /// differential path over the same file reports 0 -- an observation the row
+    /// path cannot satisfy, evaluated at the point of reliance (each batch that
+    /// was handed to `write_columnar`).
+    ///
+    /// Prove-the-test: change `load`'s `LoadPath::Columnar` argument to
+    /// `LoadPath::Row`, and this fails at `columnar_batches_built > 0` (it reads
+    /// 0). Confirmed by performing the flip.
+    #[tokio::test]
+    async fn load_drives_the_columnar_path_end_to_end() {
+        use parquet::arrow::ArrowWriter;
+        use ravel_object_store::memory::MemoryStore;
+
+        let n_rows = 6usize;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pq = dir.path().join("reach.parquet");
+        let b = batch(vec![
+            ("ts", i64_col(vec![NOW_NS; n_rows])),
+            ("svc", str_col(vec!["api"; n_rows])),
+        ]);
+        let file = std::fs::File::create(&pq).expect("create parquet");
+        let mut writer = ArrowWriter::try_new(file, b.schema(), None).expect("arrow writer");
+        writer.write(&b).expect("write batch");
+        writer.close().expect("close writer");
+
+        let m = parse_mapping(
+            "ts_column = \"ts\"\nts_unit = \"nanos\"\n\n\
+             [[resource_attribute]]\nkey = \"service.name\"\ncolumn = \"svc\"\ntype = \"str\"\n",
+        )
+        .expect("valid mapping");
+
+        // One shard, batch_rows=2 over 6 rows: three columnar batches, three
+        // write_columnar calls.
+        let store_col: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let report_col = load(
+            Arc::clone(&store_col),
+            &pq,
+            "acme",
+            &m,
+            1,
+            2,
+            None,
+            NOW_NS,
+            Arc::new(FixedClock(NOW_NS)),
+        )
+        .await
+        .expect("columnar load succeeds");
+        assert_eq!(report_col.rows_processed, n_rows as u64);
+        assert!(
+            report_col.columnar_batches_built > 0,
+            "the real load entry point must drive the columnar path"
+        );
+        assert_eq!(
+            report_col.columnar_batches_built, 3,
+            "each of the three batches was built and driven through write_columnar"
+        );
+
+        // The row differential path over the same file never touches the
+        // columnar builder, so the counter stays 0 -- proof the signal is
+        // specific to the columnar path and not incremented incidentally.
+        let store_row: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let report_row = load_row(
+            Arc::clone(&store_row),
+            &pq,
+            "acme",
+            &m,
+            1,
+            2,
+            None,
+            NOW_NS,
+            Arc::new(FixedClock(NOW_NS)),
+        )
+        .await
+        .expect("row load succeeds");
+        assert_eq!(report_row.rows_processed, n_rows as u64);
+        assert_eq!(
+            report_row.columnar_batches_built, 0,
+            "the row path builds no columnar batch"
         );
     }
 }

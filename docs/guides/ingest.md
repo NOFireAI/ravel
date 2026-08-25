@@ -398,6 +398,30 @@ the server does at first touch) and writes with strict acknowledgement, awaiting
 every write before it exits, so a run that returns success has no
 buffered-but-unflushed data.
 
+### The columnar fast path (ADR-0109)
+
+The Parquet a load reads is already columnar, and the RLOG object it writes is
+columnar too. The loader builds the storage-native columnar batch directly from
+each Arrow `RecordBatch` and hands it to the router through `write_columnar`,
+skipping the per-row `NormalizedLogRecord` pivot the record path built and the
+per-row gather the writer used to undo it. Every Arrow downcast and the
+`ts_unit` scaling are resolved once per column, stream identity is hashed once
+per distinct resource-attribute tuple rather than once per row, and admission
+checks (future skew, the length caps) are applied over whole columns while still
+reporting a rejected row by its absolute file index. The commit protocol, object
+key layout, strict-ack contract, and the RLOG format itself are unchanged: this
+is a CPU path, and a columnar load writes byte-for-byte the same objects a
+record-path load would.
+
+When a mapped string column arrives **dictionary-encoded** -- an Arrow
+`Dictionary` column, which a Parquet file carries when its writer embedded Arrow
+dictionary schema metadata -- the loader passes the dictionary through so the
+writer pays string encoding and token-bloom cost once per distinct value instead
+of once per row. A plain `BYTE_ARRAY` string column (the common case for a
+Parquet file not written by Arrow, including a dictionary-page-encoded one whose
+file carries no Arrow schema) decodes to a plain Arrow string column and stays on
+the per-row string path; both produce identical output.
+
 ### The `--mapping` TOML
 
 The mapping declares how source Parquet columns become record fields. Resource
