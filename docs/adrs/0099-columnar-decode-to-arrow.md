@@ -389,3 +389,8 @@ flowchart LR
   the spans scan (`crates/ravel-sql/src/spans_scan.rs`), which has the same
   row-rebuild shape and is left for a follow-up rather than widened into this
   epic.
+
+  The spans scan is no longer deferred: ADR-0110 delivered it, following this
+  ADR's decisions 1 to 3 for RSPAN. Columnar erasure evaluation is still open,
+  and is what forces ADR-0110's eligibility rule to fail closed to the row path
+  whenever an erasure predicate is pending.
