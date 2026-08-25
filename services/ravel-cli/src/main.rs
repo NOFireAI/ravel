@@ -249,6 +249,22 @@ enum Command {
         /// sequential read. `0` is rejected.
         #[arg(long, value_name = "K")]
         read_cursors: Option<usize>,
+        /// Number of Strict writes allowed in flight at once. Each batch's
+        /// write is one S3 PUT round trip per involved shard; with depth `1`
+        /// (the default) the loader submits one write and waits for its ack
+        /// before building or submitting the next, so that round-trip latency
+        /// is serial. Raising the depth lets up to this many writes overlap,
+        /// hiding the PUT latency behind later batches' encode and I/O. The
+        /// cost is memory: each in-flight write keeps its built batch resident
+        /// until its ack, so the live working set scales by roughly the depth
+        /// (see docs/guides/clickbench.md for how this stacks with the
+        /// `--batch-rows` x `--shards` product). Results and ordering are
+        /// unchanged by the depth: the durable-token list a partial-load
+        /// failure reports is always the batches strictly before the failing
+        /// one, in submission order. `1` preserves today's one-write-at-a-time
+        /// behavior. `0` is rejected.
+        #[arg(long, default_value_t = 1)]
+        pipeline_depth: usize,
     },
 }
 
@@ -1187,6 +1203,7 @@ async fn main() -> anyhow::Result<()> {
             shards,
             batch_rows,
             read_cursors,
+            pipeline_depth,
         } => {
             let profile = ravel_cli::cli_profiling::ProfileSession::from_env("ravel-cli-load");
             let result = ravel_cli::load::run(
@@ -1197,6 +1214,7 @@ async fn main() -> anyhow::Result<()> {
                 shards,
                 batch_rows,
                 read_cursors,
+                pipeline_depth,
                 now_ns()?,
             )
             .await;

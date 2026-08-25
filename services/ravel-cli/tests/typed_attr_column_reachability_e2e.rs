@@ -154,6 +154,7 @@ type = "i64"
         1,
         10_000,
         None,
+        1,
         CLOCK_NS,
         Arc::new(AdvancingClock(Arc::new(AtomicI64::new(CLOCK_NS)))),
     )
