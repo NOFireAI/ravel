@@ -16,7 +16,7 @@
 #![allow(clippy::expect_used)]
 
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use ravel_bench::harness::{StoreKind, store_from_env};
@@ -93,6 +93,18 @@ struct Args {
     /// become meaningful.
     #[arg(long, default_value_t = 0)]
     cache_bytes: u64,
+    /// Per-statement wall deadline, in seconds. A statement that exceeds it
+    /// fails with `query exceeded its N ms wall deadline`; the default is the
+    /// budget every run used before the flag existed.
+    #[arg(long, default_value_t = 30)]
+    deadline_secs: u64,
+    /// Record a statement that fails to execute (deadline expiry, memory
+    /// budget, planning error) in the report's `failed` list and move on to
+    /// the next one, instead of aborting the run at the first failure. The
+    /// process still exits non-zero when any statement failed, after writing
+    /// the report, so a partial table is never mistaken for a complete one.
+    #[arg(long, default_value_t = false)]
+    continue_on_error: bool,
 }
 
 #[derive(Copy, Clone, Debug, clap::ValueEnum)]
@@ -145,7 +157,16 @@ async fn main() -> ExitCode {
                 }
             }
             print_human_table(&report);
-            ExitCode::SUCCESS
+            if report.failed.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                eprintln!(
+                    "sql_latency_bench: {} statement(s) failed to execute; the report above is \
+                     partial",
+                    report.failed.len()
+                );
+                ExitCode::FAILURE
+            }
         }
         Err(err) => {
             eprintln!("sql_latency_bench: {err}");
@@ -190,6 +211,8 @@ async fn run(args: &Args) -> Result<SqlLatencyReport, ravel_bench::sql_latency::
                 max_query_bytes: args.sql_max_query_bytes,
                 shards: args.shards,
                 cache_bytes: args.cache_bytes,
+                deadline: Duration::from_secs(args.deadline_secs),
+                continue_on_error: args.continue_on_error,
             };
             run_tenant(&cfg).await
         }
@@ -209,6 +232,8 @@ async fn run(args: &Args) -> Result<SqlLatencyReport, ravel_bench::sql_latency::
                 extra_attrs: args.extra_attrs,
                 max_query_bytes: args.sql_max_query_bytes,
                 cache_bytes: args.cache_bytes,
+                deadline: Duration::from_secs(args.deadline_secs),
+                continue_on_error: args.continue_on_error,
             };
             run_generated(&cfg).await
         }
@@ -230,6 +255,7 @@ fn print_human_table(report: &SqlLatencyReport) {
         d.object_count, d.stored_bytes, d.rows, d.layout, d.load_wall_ms
     );
     println!("  runs/query : {}", p.runs);
+    println!("  deadline   : {} s per statement", p.deadline_secs);
     if p.cache_bytes > 0 {
         println!("  read cache : {} bytes", p.cache_bytes);
     } else {
@@ -262,6 +288,12 @@ fn print_human_table(report: &SqlLatencyReport) {
         println!("\n  skipped (unsatisfied declared column):");
         for s in &report.skipped {
             println!("    {:<32} missing `{}`: {}", s.id, s.missing_key, s.reason);
+        }
+    }
+    if !report.failed.is_empty() {
+        println!("\n  failed (executed, no number):");
+        for f in &report.failed {
+            println!("    {:<32} run {}: {}", f.id, f.run, f.error);
         }
     }
 }

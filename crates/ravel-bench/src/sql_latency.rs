@@ -163,6 +163,18 @@ pub struct Provenance {
     /// whether a cache was on: the per-statement `cache_*` counters are only
     /// meaningful against this.
     pub cache_bytes: u64,
+    /// Per-statement wall deadline, in seconds, handed to every
+    /// [`SqlRequest`] the run issued. Recorded so a report states the budget
+    /// its statements ran under: a statement that exceeded it appears in
+    /// `failed`, not as a latency.
+    #[serde(default = "default_deadline_secs")]
+    pub deadline_secs: u64,
+}
+
+/// The deadline every run used before it became configurable (issue #688);
+/// also what a report written before the field existed deserializes to.
+fn default_deadline_secs() -> u64 {
+    30
 }
 
 /// The dataset as it sits in the object store, independent of any one query.
@@ -247,14 +259,32 @@ pub struct SkippedEntry {
     pub reason: String,
 }
 
-/// The full report: provenance, dataset shape, measured statements, and the
-/// statements skipped for an unsatisfied declared-column dependency.
+/// One statement that was run and failed (a wall-deadline expiry, a memory
+/// budget exhaustion, a planning error). Recorded only when the run was asked to
+/// continue past failures; otherwise the first failure aborts the run. Distinct
+/// from a skip: this statement was executed and produced no number.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FailedEntry {
+    /// The corpus entry id.
+    pub id: String,
+    /// Which execution failed (0 is the cold run). Earlier runs' latencies are
+    /// discarded: a partial min/median/max would read as a measurement.
+    pub run: usize,
+    /// The executor's error, verbatim.
+    pub error: String,
+}
+
+/// The full report: provenance, dataset shape, measured statements, the
+/// statements skipped for an unsatisfied declared-column dependency, and the
+/// statements that ran and failed.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SqlLatencyReport {
     pub provenance: Provenance,
     pub dataset: DatasetInfo,
     pub entries: Vec<EntryReport>,
     pub skipped: Vec<SkippedEntry>,
+    #[serde(default)]
+    pub failed: Vec<FailedEntry>,
 }
 
 /// Inputs for the generated lane.
@@ -287,6 +317,12 @@ pub struct GenerateConfig {
     /// (the default) attaches no cache, leaving the fetcher byte-for-byte as
     /// before; `> 0` builds a RAM tier of this size.
     pub cache_bytes: u64,
+    /// Per-statement wall deadline handed to every [`SqlRequest`].
+    pub deadline: Duration,
+    /// When `true`, a statement whose execution fails is recorded in
+    /// [`SqlLatencyReport::failed`] and the run moves on; when `false` the first
+    /// failure aborts the run with its error.
+    pub continue_on_error: bool,
 }
 
 /// Inputs for the loaded-tenant lane.
@@ -323,6 +359,12 @@ pub struct TenantConfigInput {
     /// (the default) attaches no cache; `> 0` builds a RAM tier of this size so
     /// the second and later runs of a statement can serve from cache.
     pub cache_bytes: u64,
+    /// Per-statement wall deadline handed to every [`SqlRequest`].
+    pub deadline: Duration,
+    /// When `true`, a statement whose execution fails is recorded in
+    /// [`SqlLatencyReport::failed`] and the run moves on; when `false` the first
+    /// failure aborts the run with its error.
+    pub continue_on_error: bool,
 }
 
 fn percentile(sorted_ns: &[u64], pct: f64) -> u64 {
@@ -457,10 +499,13 @@ pub async fn measure_corpus(
     max_query_bytes: usize,
     shard_count: u32,
     cache_bytes: u64,
-) -> Result<(Vec<EntryReport>, Vec<SkippedEntry>), Error> {
+    deadline: Duration,
+    continue_on_error: bool,
+) -> Result<(Vec<EntryReport>, Vec<SkippedEntry>, Vec<FailedEntry>), Error> {
     let runs = runs.max(1);
     let mut measured = Vec::new();
     let mut skipped = Vec::new();
+    let mut failed = Vec::new();
 
     // CPU flamegraph lane (issue #365's pattern; see crate::profiling). Covers
     // every entry's execution, both lanes (run_generated/run_tenant funnel
@@ -468,7 +513,7 @@ pub async fn measure_corpus(
     // full corpus rather than one statement in isolation.
     let profile = crate::profiling::ProfileSession::from_env("sql_latency_bench");
 
-    for entry in entries {
+    'entries: for entry in entries {
         // Verify the declared-column dependency before running anything. A
         // missing declared column reads NULL for every row, so an unsatisfied
         // entry must be skipped, not run: removing this guard lets the entry
@@ -496,7 +541,7 @@ pub async fn measure_corpus(
             window,
             min_tokens: Vec::new(),
             now_ns,
-            deadline: Duration::from_secs(30),
+            deadline,
         };
 
         let mut latencies_ns = Vec::with_capacity(runs);
@@ -517,10 +562,23 @@ pub async fn measure_corpus(
 
         for run in 0..runs {
             let start = Instant::now();
-            let outcome = executor
-                .execute(tenant_hash, &req)
-                .await
-                .map_err(|e| Error::from(format!("entry `{}` failed to execute: {e}", entry.id)))?;
+            let outcome = match executor.execute(tenant_hash, &req).await {
+                Ok(outcome) => outcome,
+                Err(e) if continue_on_error => {
+                    failed.push(FailedEntry {
+                        id: entry.id.clone(),
+                        run,
+                        error: e.to_string(),
+                    });
+                    continue 'entries;
+                }
+                Err(e) => {
+                    return Err(Error::from(format!(
+                        "entry `{}` failed to execute: {e}",
+                        entry.id
+                    )));
+                }
+            };
             let elapsed_ns = start.elapsed().as_nanos() as u64;
             latencies_ns.push(elapsed_ns);
             if run == 0 {
@@ -561,7 +619,7 @@ pub async fn measure_corpus(
 
     profile.finish();
 
-    Ok((measured, skipped))
+    Ok((measured, skipped, failed))
 }
 
 /// Resolve the dataset-level figures (bytes, object count, rows) from a
@@ -627,7 +685,7 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
         shard_count,
     )
     .await?;
-    let (entries, skipped) = measure_corpus(
+    let (entries, skipped, failed) = measure_corpus(
         &cfg.store,
         tenant_hash,
         &cfg.entries,
@@ -638,6 +696,8 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
         cfg.max_query_bytes,
         shard_count,
         cfg.cache_bytes,
+        cfg.deadline,
+        cfg.continue_on_error,
     )
     .await?;
 
@@ -651,10 +711,12 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
             dataset_id: tenant.as_str().to_string(),
             runs: cfg.runs.max(1),
             cache_bytes: cfg.cache_bytes,
+            deadline_secs: cfg.deadline.as_secs(),
         },
         dataset,
         entries,
         skipped,
+        failed,
     })
 }
 
@@ -705,7 +767,7 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
         }
         .into());
     }
-    let (entries, skipped) = measure_corpus(
+    let (entries, skipped, failed) = measure_corpus(
         &cfg.store,
         tenant_hash,
         &cfg.entries,
@@ -716,6 +778,8 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
         cfg.max_query_bytes,
         shard_count,
         cfg.cache_bytes,
+        cfg.deadline,
+        cfg.continue_on_error,
     )
     .await?;
 
@@ -729,10 +793,12 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
             dataset_id: cfg.tenant.clone(),
             runs: cfg.runs.max(1),
             cache_bytes: cfg.cache_bytes,
+            deadline_secs: cfg.deadline.as_secs(),
         },
         dataset,
         entries,
         skipped,
+        failed,
     })
 }
 
@@ -933,6 +999,7 @@ fn build_records(count: usize, extra_attrs: usize) -> Vec<LogRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql_corpus::Modification;
     use ravel_catalog::{AbsentPolicy, validate_or_adopt};
     use ravel_object_store::memory::MemoryStore;
     use ravel_sql::DEFAULT_MAX_QUERY_BYTES;
@@ -1023,7 +1090,153 @@ mod tests {
             max_query_bytes: DEFAULT_MAX_QUERY_BYTES,
             shards,
             cache_bytes,
+            deadline: Duration::from_secs(30),
+            continue_on_error: false,
         }
+    }
+
+    /// A corpus entry with no declared-column dependency, so the tenant lane
+    /// executes it rather than skipping it.
+    fn entry(id: &str, sql: &str) -> CorpusEntry {
+        CorpusEntry {
+            id: id.to_string(),
+            sql: sql.to_string(),
+            constructs: Vec::new(),
+            expected_rows: None,
+            upstream_id: None,
+            modified: Modification::Verbatim,
+            required_declarations: Vec::new(),
+        }
+    }
+
+    /// A 1-shard tenant with a provisioning record and two objects, for the
+    /// failure-path tests below.
+    async fn provisioned_tenant(store: &Arc<dyn ObjectStoreBackend>, name: &str) {
+        let tenant = TenantId::new(name);
+        write_shard_objects(store, &tenant, 0, 2).await;
+        validate_or_adopt(
+            store.as_ref(),
+            &tenant.hash(),
+            Signal::Logs,
+            1,
+            10,
+            AbsentPolicy::CreateFromConfig,
+        )
+        .await
+        .expect("write provisioning record");
+    }
+
+    /// With `continue_on_error`, a statement that fails to execute lands in
+    /// `failed` (id, run index, verbatim error) and the statements after it are
+    /// still measured. Without it, the same corpus aborts the run at the first
+    /// failure, which is the behaviour every run had before issue #688.
+    #[tokio::test]
+    async fn continue_on_error_records_failure_and_measures_later_entries() {
+        let store = empty_store();
+        provisioned_tenant(&store, "continue-tenant").await;
+        let entries = vec![
+            entry("broken", "SELECT no_such_column FROM logs"),
+            entry("fine", "SELECT body FROM logs"),
+        ];
+
+        let mut cfg = tenant_cfg(&store, "continue-tenant", None, 0);
+        cfg.entries = entries.clone();
+        cfg.continue_on_error = true;
+        let report = run_tenant(&cfg)
+            .await
+            .expect("run continues past the failure");
+        assert_eq!(report.failed.len(), 1, "exactly the broken entry failed");
+        assert_eq!(report.failed[0].id, "broken");
+        assert_eq!(report.failed[0].run, 0, "it failed on the cold run");
+        assert!(
+            !report.failed[0].error.is_empty(),
+            "the executor's error is carried verbatim"
+        );
+        assert_eq!(
+            report
+                .entries
+                .iter()
+                .map(|e| e.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fine"],
+            "the entry after the failure is measured, not dropped"
+        );
+        assert_eq!(report.entries[0].rows_returned, 2);
+
+        let mut cfg = tenant_cfg(&store, "continue-tenant", None, 0);
+        cfg.entries = entries;
+        cfg.continue_on_error = false;
+        let err = run_tenant(&cfg)
+            .await
+            .expect_err("without continue_on_error the first failure aborts the run");
+        assert!(
+            err.to_string().contains("entry `broken` failed to execute"),
+            "abort names the entry: {err}"
+        );
+    }
+
+    /// The configured deadline reaches the executor. `MemoryStore` answers
+    /// every read without yielding, so a statement over it can finish inside a
+    /// zero budget; a `FaultStore` gate that holds every GET makes the fetch
+    /// genuinely pending, and the configured deadline is what ends the wait.
+    #[tokio::test]
+    async fn deadline_is_threaded_to_the_executor() {
+        use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
+
+        let faulty = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&faulty) as Arc<dyn ObjectStoreBackend>;
+        let tenant = TenantId::new("deadline-tenant");
+        write_shard_objects(&store, &tenant, 0, 2).await;
+        let gate = faulty.hold(Op::Get, None, Occurrence::Always);
+
+        let window = TimeRange {
+            start_ns: 0,
+            end_ns: NOW_NS,
+        };
+        let (measured, skipped, failed) = measure_corpus(
+            &store,
+            tenant.hash(),
+            &[entry("q", "SELECT body FROM logs")],
+            &[],
+            1,
+            window,
+            NOW_NS,
+            DEFAULT_MAX_QUERY_BYTES,
+            1,
+            0,
+            Duration::from_millis(20),
+            true,
+        )
+        .await
+        .expect("run continues past the expiry");
+        assert!(measured.is_empty());
+        assert!(skipped.is_empty());
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].id, "q");
+        assert!(
+            failed[0].error.contains("20 ms wall deadline"),
+            "the statement expired under the configured budget: {}",
+            failed[0].error
+        );
+        assert!(
+            gate.held_count() >= 1,
+            "the expiry came from a GET the gate was holding, not from anything else"
+        );
+    }
+
+    /// The deadline a run used is part of its provenance.
+    #[tokio::test]
+    async fn deadline_is_recorded_in_provenance() {
+        let store = empty_store();
+        provisioned_tenant(&store, "deadline-prov-tenant").await;
+
+        let mut cfg = tenant_cfg(&store, "deadline-prov-tenant", None, 0);
+        cfg.entries = vec![entry("q", "SELECT body FROM logs")];
+        cfg.deadline = Duration::from_secs(7);
+        let report = run_tenant(&cfg).await.expect("tenant lane runs");
+        assert_eq!(report.provenance.deadline_secs, 7);
+        assert!(report.failed.is_empty());
+        assert_eq!(report.entries.len(), 1);
     }
 
     /// A 2-shard tenant with objects on shard 0 AND shard 1 is measured over

@@ -17,6 +17,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use ravel_bench::sql_corpus::{
     CorpusEntry, Modification, RequiredDeclaration, RequiredDeclaredType, checked_default_corpus,
@@ -47,6 +48,8 @@ fn small_generate_config(store: Arc<dyn ObjectStoreBackend>, runs: usize) -> Gen
         extra_attrs: 4,
         max_query_bytes: DEFAULT_MAX_QUERY_BYTES,
         cache_bytes: 0,
+        deadline: Duration::from_secs(30),
+        continue_on_error: false,
     }
 }
 
@@ -204,7 +207,7 @@ async fn an_entry_with_an_unsatisfied_required_declaration_is_skipped_with_the_k
         start_ns: 0,
         end_ns: NOW_NS,
     };
-    let (measured, skipped) = measure_corpus(
+    let (measured, skipped, failed) = measure_corpus(
         &store,
         tenant.hash(),
         std::slice::from_ref(&entry),
@@ -215,9 +218,12 @@ async fn an_entry_with_an_unsatisfied_required_declaration_is_skipped_with_the_k
         DEFAULT_MAX_QUERY_BYTES,
         1,
         0,
+        Duration::from_secs(30),
+        false,
     )
     .await
     .expect("measure_corpus runs");
+    assert!(failed.is_empty(), "a skip is not a failure");
 
     // The entry is skipped, with the missing key named, and is absent from the
     // measurement set.

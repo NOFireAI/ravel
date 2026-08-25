@@ -24,6 +24,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use prost::Message;
 use ravel_bench::sql_corpus::checked_default_corpus;
@@ -90,6 +91,8 @@ async fn l0_object_count_equals_distinct_data_object_keys() {
         extra_attrs: 4,
         max_query_bytes: DEFAULT_MAX_QUERY_BYTES,
         cache_bytes: 0,
+        deadline: Duration::from_secs(30),
+        continue_on_error: false,
     };
     let report = run_generated(&cfg).await.expect("generated lane runs");
 
