@@ -78,7 +78,10 @@ async fn main() {
         report.columnar.row_batches,
         report.columnar.columnar_batches,
     );
-    println!("  wall speedup     : {:.2}x (row / columnar)", report.wall_speedup());
+    println!(
+        "  wall speedup     : {:.2}x (row / columnar)",
+        report.wall_speedup()
+    );
     match report.pivot_cpu_share() {
         Some(share) => println!(
             "  pivot CPU share  : {:.1}% of the row-path WRITE cpu (not of end-to-end load cpu; \
