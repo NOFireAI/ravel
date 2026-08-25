@@ -942,15 +942,33 @@ impl RlogWriter {
         let mut col_values: Vec<Vec<Option<ColumnValue>>> = vec![vec![None; total_rows]; num_plans];
         let mut col_stat: Vec<Vec<Option<ColumnValue>>> = vec![vec![None; total_rows]; num_plans];
 
+        // Tracked names (indexed union numstat), interned once into a flat table
+        // so the per-row occurrence lists key by a small slot index instead of
+        // allocating a fresh `String` and a `BTreeMap` node per tracked cell
+        // (the small-allocation churn glibc never returns to the OS, #682). The
+        // table is name-sorted, so ascending slot order is ascending name order:
+        // [`record_level_winners_slot`] reproduces [`record_level_winners`]'s
+        // name-sorted output from it byte for byte.
+        let mut tracked_name_vec: Vec<&str> = indexed_names
+            .iter()
+            .chain(numstat_names.iter())
+            .copied()
+            .collect();
+        tracked_name_vec.sort_unstable();
+        tracked_name_vec.dedup();
+        let tracked_slot: HashMap<&str, u32> = tracked_name_vec
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (*n, i as u32))
+            .collect();
+
         // Per-row in-budget columnar occurrences (row.columns), overflow
         // attributes (attrs_raw source), and the tracked-name occurrences the
-        // merged view is resolved from.
+        // merged view is resolved from (keyed by tracked slot, not name).
         let mut g_cols: Vec<Vec<(u32, ColumnValue)>> = vec![Vec::new(); total_rows];
         let mut g_overflow: Vec<Vec<(String, AttrValue)>> = vec![Vec::new(); total_rows];
-        let mut tracked_cols: Vec<BTreeMap<String, Vec<(u8, ColumnValue)>>> =
-            vec![BTreeMap::new(); total_rows];
-        let mut tracked_overflow: Vec<BTreeMap<String, Vec<AttrValue>>> =
-            vec![BTreeMap::new(); total_rows];
+        let mut tracked_cols: Vec<Vec<(u32, u8, ColumnValue)>> = vec![Vec::new(); total_rows];
+        let mut tracked_overflow: Vec<Vec<(u32, AttrValue)>> = vec![Vec::new(); total_rows];
 
         for (bi, b) in batches.iter().enumerate() {
             let base = bases[bi];
@@ -974,19 +992,18 @@ impl RlogWriter {
                             col_values[plan_idx][grow] = Some(cv.clone());
                             g_cols[grow].push((cid, cv.clone()));
                             if tracked {
-                                tracked_cols[grow]
-                                    .entry(c.name.clone())
-                                    .or_default()
-                                    .push((ty.to_u8(), cv));
+                                tracked_cols[grow].push((
+                                    tracked_slot[c.name.as_str()],
+                                    ty.to_u8(),
+                                    cv,
+                                ));
                             }
                         }
                         None => {
                             g_overflow[grow].push((c.name.clone(), cell.clone()));
                             if tracked {
                                 tracked_overflow[grow]
-                                    .entry(c.name.clone())
-                                    .or_default()
-                                    .push(cell.clone());
+                                    .push((tracked_slot[c.name.as_str()], cell.clone()));
                             }
                         }
                     }
@@ -999,10 +1016,7 @@ impl RlogWriter {
                     let tracked =
                         indexed_names.contains(k.as_str()) || numstat_names.contains(k.as_str());
                     if tracked {
-                        tracked_overflow[grow]
-                            .entry(k.clone())
-                            .or_default()
-                            .push(v.clone());
+                        tracked_overflow[grow].push((tracked_slot[k.as_str()], v.clone()));
                     }
                 }
             }
@@ -1080,7 +1094,11 @@ impl RlogWriter {
             if !g_overflow[grow].is_empty() {
                 g_attrs_raw[grow] = Some(canonical_attr_bytes(&g_overflow[grow]));
             }
-            let winners = record_level_winners(&tracked_cols[grow], &tracked_overflow[grow]);
+            let winners = record_level_winners_slot(
+                &tracked_cols[grow],
+                &tracked_overflow[grow],
+                &tracked_name_vec,
+            );
             let seed = stream_tracked
                 .get(&g_stream_id[grow])
                 .map_or(&[][..], Vec::as_slice);
@@ -1799,6 +1817,58 @@ fn record_level_winners(
         }
         if let Some(winner) = combined.pop() {
             out.insert(name.clone(), winner);
+        }
+    }
+    out
+}
+
+/// The slot-keyed counterpart of [`record_level_winners`], used by the columnar
+/// path. `cols` and `overflow` are one record's tracked occurrences flattened
+/// (`(tracked slot, ...)`) rather than grouped in a per-record `BTreeMap`, so no
+/// name is cloned and no map node is allocated per cell (#682). `names` maps a
+/// slot back to its name; because the slot table is name-sorted, iterating slots
+/// ascending yields the same name order [`record_level_winners`] produces, and
+/// the winner rule (columnar occurrences ascending by type byte, then overflow
+/// occurrences ascending by canonical value bytes, last wins) is identical, so
+/// the returned map is byte-for-byte the same.
+fn record_level_winners_slot(
+    cols: &[(u32, u8, ColumnValue)],
+    overflow: &[(u32, ravel_types::logstream::AttrValue)],
+    names: &[&str],
+) -> BTreeMap<String, (u8, ColumnValue)> {
+    let mut slots: BTreeSet<u32> = BTreeSet::new();
+    for (slot, _, _) in cols {
+        slots.insert(*slot);
+    }
+    for (slot, _) in overflow {
+        slots.insert(*slot);
+    }
+
+    let mut out: BTreeMap<String, (u8, ColumnValue)> = BTreeMap::new();
+    for slot in slots {
+        let mut combined: Vec<(u8, ColumnValue)> = Vec::new();
+        // Columnar occurrences first, ascending by type byte.
+        let mut cs: Vec<(u8, ColumnValue)> = cols
+            .iter()
+            .filter(|(s, _, _)| *s == slot)
+            .map(|(_, ty, cv)| (*ty, cv.clone()))
+            .collect();
+        cs.sort_by_key(|(ty, _)| *ty);
+        combined.extend(cs);
+        // Overflow occurrences next, ascending by the canonical encoding of a
+        // one-entry value set (the same order `attrs_raw` stores them).
+        let mut keyed: Vec<(Vec<u8>, (u8, ColumnValue))> = overflow
+            .iter()
+            .filter(|(s, _)| *s == slot)
+            .map(|(_, v)| {
+                let (ty, cv) = resolve_value(v);
+                (canonical_value_bytes(v), (ty.to_u8(), cv))
+            })
+            .collect();
+        keyed.sort_by(|a, b| a.0.cmp(&b.0));
+        combined.extend(keyed.into_iter().map(|(_, entry)| entry));
+        if let Some(winner) = combined.pop() {
+            out.insert(names[slot as usize].to_string(), winner);
         }
     }
     out
