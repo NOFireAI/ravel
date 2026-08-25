@@ -54,6 +54,8 @@ fn small_generate_config(store: Arc<dyn ObjectStoreBackend>, runs: usize) -> Gen
         continue_on_error: false,
         fetch_concurrency: DEFAULT_FETCH_CONCURRENCY,
         progress_jsonl: None,
+        tenant_max_bytes: ravel_bench::sql_latency::DEFAULT_TENANT_MAX_BYTES,
+        parallel_final_aggregation: false,
     }
 }
 
@@ -219,13 +221,11 @@ async fn an_entry_with_an_unsatisfied_required_declaration_is_skipped_with_the_k
         1,
         window,
         NOW_NS,
-        DEFAULT_MAX_QUERY_BYTES,
-        1,
         0,
         Duration::from_secs(30),
         false,
-        DEFAULT_FETCH_CONCURRENCY,
         None,
+        ravel_bench::sql_latency::ExecutorSettings::default(),
     )
     .await
     .expect("measure_corpus runs");

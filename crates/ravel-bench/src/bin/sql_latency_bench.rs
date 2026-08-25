@@ -119,6 +119,20 @@ struct Args {
     /// survives a run killed hours in.
     #[arg(long, value_name = "PATH")]
     progress_jsonl: Option<std::path::PathBuf>,
+    /// Per-tenant SQL memory ceiling, the same knob as `ravel-server
+    /// --sql-tenant-max-bytes`. SEPARATE from `--sql-max-query-bytes`: the
+    /// per-query pool bounds one statement, this bounds a tenant across its
+    /// concurrent queries, and a statement refused here reports `tenant memory
+    /// budget exhausted` rather than `query memory pool exhausted`. Raise both
+    /// to measure a heavy aggregate. Defaults to the 1 GiB every earlier run
+    /// used.
+    #[arg(long, value_name = "BYTES", default_value_t = ravel_bench::sql_latency::DEFAULT_TENANT_MAX_BYTES)]
+    sql_tenant_max_bytes: usize,
+    /// Let an exact-typed query repartition its final aggregation (ADR-0094),
+    /// the same knob as `ravel-server --sql-parallel-final-aggregation`. Off by
+    /// default, which is what every earlier run measured.
+    #[arg(long, default_value_t = false)]
+    sql_parallel_final_aggregation: bool,
 }
 
 #[derive(Copy, Clone, Debug, clap::ValueEnum)]
@@ -229,6 +243,8 @@ async fn run(args: &Args) -> Result<SqlLatencyReport, ravel_bench::sql_latency::
                 continue_on_error: args.continue_on_error,
                 fetch_concurrency: args.fetch_concurrency,
                 progress_jsonl: args.progress_jsonl.clone(),
+                tenant_max_bytes: args.sql_tenant_max_bytes,
+                parallel_final_aggregation: args.sql_parallel_final_aggregation,
             };
             run_tenant(&cfg).await
         }
@@ -252,6 +268,8 @@ async fn run(args: &Args) -> Result<SqlLatencyReport, ravel_bench::sql_latency::
                 continue_on_error: args.continue_on_error,
                 fetch_concurrency: args.fetch_concurrency,
                 progress_jsonl: args.progress_jsonl.clone(),
+                tenant_max_bytes: args.sql_tenant_max_bytes,
+                parallel_final_aggregation: args.sql_parallel_final_aggregation,
             };
             run_generated(&cfg).await
         }
@@ -275,6 +293,10 @@ fn print_human_table(report: &SqlLatencyReport) {
     println!("  runs/query : {}", p.runs);
     println!("  deadline   : {} s per statement", p.deadline_secs);
     println!("  fetch conc : {}", p.fetch_concurrency);
+    println!(
+        "  tenant max : {} bytes  parallel final agg: {}",
+        p.tenant_max_bytes, p.parallel_final_aggregation
+    );
     if p.cache_bytes > 0 {
         println!("  read cache : {} bytes", p.cache_bytes);
     } else {
