@@ -307,17 +307,37 @@ fn instant_value(samples: &[Sample], is_rate: bool) -> Option<f64> {
 /// renderer already omits, so it is not reproduced here).
 ///
 /// The two samples are adjacent samples of the same series but can carry
-/// different schemas (RSEG down-converts a flush whose bucket count exceeds its
-/// limit, so two flushes of one series can persist at different scales), so
-/// both are aligned to the coarser schema before any index-map arithmetic,
-/// exactly as [`histogram::histogram_rate`] does across its whole window.
-/// `detect_reset` and `sub_assign` both assume a comparable schema, so the
-/// alignment happens before either. A custom-buckets operand cannot be
-/// rescaled, so [`FloatHistogram::copy_to_scale`] returns it unchanged and the
-/// subsequent arithmetic combines the index maps as-is, the same shape
-/// `histogram_rate` produces for that mismatch (this crate does not reproduce
-/// Prometheus' outright refusal to combine an exponential-schema histogram with
-/// a custom-buckets one).
+/// different schemas (RSEG down-converts a flush whose bucket count exceeds
+/// its limit, so two flushes of one series can persist at different scales).
+/// `irate`'s reset check is directional (oracle-verified against three
+/// adjacent-schema shapes, see `functions::rate::tests` and
+/// `tests/histogram_native.rs`): a schema INCREASE (`last.scale >
+/// previous.scale`) is always a reset, since Prometheus never risks
+/// comparing a coarser earlier histogram against newly-visible finer detail.
+/// A schema DECREASE is only a reset if the buckets, once aligned to the
+/// common coarser schema, actually shrank -- `FloatHistogram::detect_reset`'s
+/// own `self.scale != prev.scale` shortcut cannot be called directly on the
+/// unaligned pair for this direction (it would flag every decrease as a
+/// reset, which the oracle disproves), so the decrease path aligns first and
+/// lets `detect_reset` fall through to its real `bucket_shrank` check --
+/// safe post-alignment, since both operands then share one scale and
+/// `detect_reset`'s own scale-mismatch branch never fires. `idelta` has no
+/// reset escape at all (always aligns and subtracts) once a schema-type
+/// mismatch is ruled out; this increase/decrease asymmetry is irate-only.
+/// `histogram_rate` (rate/increase/delta) does not share this directional
+/// logic and keeps its own established behavior (histogram.rs) unchanged.
+///
+/// An exponential-schema sample paired with a custom-buckets one is a
+/// separate case `copy_to_scale` cannot bridge (a custom-buckets operand
+/// reports a schema sentinel far outside the exponential range, and rescaling
+/// the other operand to it overflows the bucket-index shift). Prometheus
+/// refuses to combine the two: `irate` treats the mismatch as a reset (`Sub`
+/// never runs, the later histogram is returned alone) and `idelta` (which
+/// always subtracts) has no reset escape, so it returns no value at all,
+/// alongside [`mixed_exponential_custom_schemas_warning`]. Detect this before
+/// `min_scale`/`copy_to_scale` are ever computed, not by hardening
+/// `copy_to_scale`'s shift arithmetic: even a bounded shift would silently
+/// combine bucket layouts Prometheus does not consider comparable.
 pub(crate) fn instant_value_hist(
     samples: &[TimedHistogram],
     is_rate: bool,
@@ -331,13 +351,47 @@ pub(crate) fn instant_value_hist(
     if sampled_interval_ns == 0 {
         return None;
     }
-    let min_scale = previous.scale.min(last.scale);
-    let last = last.copy_to_scale(min_scale);
-    let previous = previous.copy_to_scale(min_scale);
 
-    let mut result = last;
-    if !is_rate || !result.detect_reset(&previous) {
-        result.sub_assign(&previous);
+    let schema_type_mismatch = previous.uses_custom_buckets() != last.uses_custom_buckets();
+    if schema_type_mismatch && !is_rate {
+        // idelta cannot combine an exponential-schema histogram with a
+        // custom-buckets one and has no reset escape hatch; the warning is
+        // raised by instant_value_hist_type_warning's caller.
+        return None;
+    }
+
+    let mut result = last.clone();
+    if is_rate {
+        // irate's reset check is directional, oracle-verified against three
+        // adjacent-schema shapes (see the crate's checkpoint history for
+        // #650): a schema INCREASE (finer detail newly visible) is always a
+        // reset, matching `FloatHistogram::detect_reset`'s plain
+        // `self.scale != prev.scale` shortcut, which this deliberately does
+        // NOT call directly on unaligned operands for the decrease direction
+        // -- doing so was tried and is wrong (it flags every decrease as a
+        // reset, when Prometheus only does when a bucket actually shrank). A
+        // schema DECREASE (and the custom/exponential mismatch above) must
+        // instead align to the common coarser schema first and let
+        // `detect_reset` fall through to its real `bucket_shrank` check
+        // (safe to call post-alignment: both operands share the aligned
+        // scale, so `detect_reset`'s own scale-mismatch branch never fires).
+        let min_scale = previous.scale.min(last.scale);
+        let is_reset = schema_type_mismatch
+            || last.scale > previous.scale
+            || result
+                .copy_to_scale(min_scale)
+                .detect_reset(&previous.copy_to_scale(min_scale));
+        if !is_reset {
+            result = result.copy_to_scale(min_scale);
+            result.sub_assign(&previous.copy_to_scale(min_scale));
+        }
+    } else {
+        // idelta always subtracts (no reset escape at all) once a schema-type
+        // mismatch has been ruled out above; the schema-increase/decrease
+        // asymmetry above is irate-only.
+        let min_scale = previous.scale.min(last.scale);
+        result = result.copy_to_scale(min_scale);
+        result.sub_assign(&previous.copy_to_scale(min_scale));
     }
     result.counter_reset_hint = ResetHint::Gauge;
     if is_rate {
@@ -346,27 +400,38 @@ pub(crate) fn instant_value_hist(
     Some(result)
 }
 
-/// Which counter/gauge type mismatch an `irate`/`idelta` over a native-
-/// histogram pair triggers, mirroring Prometheus' `instantValue` histogram
-/// branch: `irate` (a counter operation) over a gauge-typed pair warns the
-/// metric is not a counter, and `idelta` (a gauge operation) over a pair that
-/// is not gauge-typed warns the metric is not a gauge.
+/// Which type-mismatch warning an `irate`/`idelta` over a native-histogram
+/// pair triggers, mirroring Prometheus' `instantValue` histogram branch:
+/// `irate` (a counter operation) over a gauge-typed pair warns the metric is
+/// not a counter; `idelta` (a gauge operation) over a pair that is not
+/// gauge-typed warns the metric is not a gauge; either function over a pair
+/// mixing an exponential-schema histogram with a custom-buckets one warns
+/// the schemas don't match (only reachable for `idelta` -- `irate` treats
+/// that mismatch as a silent reset, see [`instant_value_hist`]).
 pub(crate) enum InstantHistTypeWarning {
     /// `irate` was asked to treat a gauge-typed native histogram as a counter.
     NotCounter,
     /// `idelta` was asked to treat a non-gauge native histogram as a gauge.
     NotGauge,
+    /// One operand is custom-buckets and the other exponential-schema.
+    MixedSchemas,
 }
 
 /// Whether `irate`/`idelta` over the last two histograms in `samples` should
-/// raise a counter/gauge type-mismatch warning (Prometheus' `instantValue`
-/// histogram branch: `NativeHistogramNotCounter` for `irate` over a gauge-hinted
-/// pair, `NativeHistogramNotGauge` for `idelta` over a pair that is not both
-/// gauge-hinted). The check reads each histogram's own `counter_reset_hint` on
+/// raise a type-mismatch warning (Prometheus' `instantValue` histogram
+/// branch: [`InstantHistTypeWarning::MixedSchemas`] for an exponential/
+/// custom-buckets pair, `NativeHistogramNotCounter` for `irate` over a
+/// gauge-hinted pair, `NativeHistogramNotGauge` for `idelta` over a pair that
+/// is not both gauge-hinted). The schema-type check runs first since it is
+/// unrelated to counter/gauge hints and `irate` never warns on it (the
+/// mismatch is a silent reset there, not a value-suppressing warning). The
+/// counter/gauge check reads each histogram's own `counter_reset_hint` on
 /// entry, before [`instant_value_hist`] overwrites the result's hint with
-/// [`ResetHint::Gauge`]. Returns `None` when no result is produced (fewer than
-/// two samples, or a zero sampled interval), so the warning fires only
-/// alongside a value, exactly as Prometheus' own early returns gate it.
+/// [`ResetHint::Gauge`]. Returns `None` when no warning applies, or when no
+/// result is produced (fewer than two samples, or a zero sampled interval),
+/// so a warning fires only alongside a value or alongside `idelta`'s
+/// mismatch-driven empty result, exactly as Prometheus' own early returns
+/// gate it.
 pub(crate) fn instant_value_hist_type_warning(
     samples: &[TimedHistogram],
     is_rate: bool,
@@ -378,6 +443,13 @@ pub(crate) fn instant_value_hist_type_warning(
     let (prev_ts, previous) = &samples[samples.len() - 2];
     if last_ts - prev_ts == 0 {
         return None;
+    }
+    if previous.uses_custom_buckets() != last.uses_custom_buckets() {
+        return if is_rate {
+            None
+        } else {
+            Some(InstantHistTypeWarning::MixedSchemas)
+        };
     }
     let last_gauge = last.counter_reset_hint == ResetHint::Gauge;
     let prev_gauge = previous.counter_reset_hint == ResetHint::Gauge;
@@ -404,6 +476,13 @@ pub(crate) fn native_histogram_not_counter_warning() -> String {
 /// text convention as [`native_histogram_not_counter_warning`].
 pub(crate) fn native_histogram_not_gauge_warning() -> String {
     "this native histogram metric is not a gauge".to_string()
+}
+
+/// Prometheus' mixed-schema warning: an exponential-schema histogram and a
+/// custom-buckets one appear adjacent in one series' window. Same text
+/// convention as [`native_histogram_not_counter_warning`].
+pub(crate) fn mixed_exponential_custom_schemas_warning() -> String {
+    "vector contains a mix of histograms with exponential and custom buckets schemas".to_string()
 }
 
 /// `resets` over a native-histogram window (Prometheus' `funcResets` histogram

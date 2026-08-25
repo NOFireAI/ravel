@@ -587,3 +587,141 @@ fn histogram_fraction_native_over_a_selector() {
         .expect("evaluates");
     assert_eq!(floats(&got), vec![0.5]);
 }
+
+/// A one-bucket custom-buckets (NHCB) native histogram, for the
+/// exponential/custom-buckets mismatch tests. `scale: -53` is Prometheus'
+/// sentinel for custom boundaries (see [`FloatHistogram::uses_custom_buckets`]).
+fn custom_buckets_hist(count: f64, sum: f64) -> FloatHistogram {
+    FloatHistogram {
+        counter_reset_hint: ResetHint::Unknown,
+        scale: -53,
+        zero_threshold: 0.0,
+        zero_count: 0.0,
+        count,
+        sum,
+        positive_spans: vec![Span {
+            offset: 0,
+            length: 1,
+        }],
+        negative_spans: Vec::new(),
+        positive_buckets: vec![count],
+        negative_buckets: Vec::new(),
+        custom_values: vec![1.0, 2.0],
+    }
+}
+
+#[test]
+fn irate_treats_a_schema_increase_as_a_reset_even_without_bucket_shrink() {
+    // prev at scale 0 (count 3), last at scale 2 (count 10): every aligned
+    // bucket GROWS, so a structural bucket-shrink check alone would say "not a
+    // reset" -- but Prometheus always treats a schema INCREASE as a reset
+    // regardless of bucket population, since it cannot rule out a decrease
+    // hidden at the newly-visible finer resolution. Oracle-verified (pinned
+    // Prometheus 3.13.1): irate on this exact shape returns count 10/30, not
+    // (10-3)/30. This is the direction the second #650 checkpoint review
+    // found regressed by aligning-then-detect_reset (it made this case wrong
+    // while fixing the schema-decrease case) and the schema-increase
+    // direction had zero test coverage before this ticket. The flipped
+    // assertion is `h.count == 10.0/30.0`: a bucket-shrink-only check (no
+    // increase shortcut) would instead compute 7.0/30.0.
+    let src = TestSource::new()
+        .with_histogram_series(
+            &[("__name__", "h")],
+            &[
+                (sec_ns(270), hist_scale(0, 0, &[3.0], 6.0)),
+                (sec_ns(300), hist_scale(2, 0, &[10.0], 20.0)),
+            ],
+        )
+        .expect("valid series");
+    let got = Evaluator::new()
+        .instant(&src, "irate(h[5m])", 5 * 60_000)
+        .expect("evaluates");
+    assert_eq!(got.len(), 1);
+    let h = got[0]
+        .histogram
+        .as_ref()
+        .expect("irate over histograms yields a histogram element");
+    assert_eq!(h.scale, 2, "reset keeps the later histogram's own scale");
+    assert!(
+        (h.count - 10.0 / 30.0).abs() < 1e-12,
+        "schema increase is always a reset: last.count/30, not (last-prev)/30: {}",
+        h.count
+    );
+}
+
+#[test]
+fn irate_over_mismatched_exponential_and_custom_bucket_schemas_does_not_panic() {
+    // prev is custom-buckets (NHCB), last is exponential-schema: copy_to_scale
+    // cannot bridge the two (the custom-buckets sentinel scale is far outside
+    // the exponential range), so before this fix `min_scale`/`copy_to_scale`
+    // were computed unconditionally and this shift-overflowed in
+    // FloatHistogram::copy_to_scale, panicking in a dev/ci build (the flipped
+    // behavior: no panic, no subtraction, the later histogram alone divided
+    // by the interval, no warning -- Prometheus treats this mismatch as a
+    // reset for irate).
+    let src = TestSource::new()
+        .with_histogram_series(
+            &[("__name__", "h")],
+            &[
+                (sec_ns(270), custom_buckets_hist(3.0, 6.0)),
+                (sec_ns(300), hist_scale(0, 0, &[10.0], 20.0)),
+            ],
+        )
+        .expect("valid series");
+    let (value, annos) = Evaluator::new()
+        .eval_instant_annotated(&src, "irate(h[5m])", 5 * 60_000)
+        .expect("evaluates (must not panic)");
+    let Value::Vector(out) = value else {
+        panic!("irate is a vector");
+    };
+    assert_eq!(out.len(), 1, "mismatch is a reset, not a dropped element");
+    let h = out[0].histogram.as_ref().expect("histogram element");
+    assert!(
+        (h.count - 10.0 / 30.0).abs() < 1e-12,
+        "reset keeps the later histogram alone: {}",
+        h.count
+    );
+    assert!(
+        annos.warnings().is_empty(),
+        "irate does not warn on this mismatch, it silently resets: {:?}",
+        annos.warnings()
+    );
+}
+
+#[test]
+fn idelta_over_mismatched_exponential_and_custom_bucket_schemas_warns_and_drops() {
+    // Same mismatched pair as the irate test. idelta has no reset escape, so
+    // it cannot combine the two at all: Prometheus returns no value plus a
+    // mixed-schemas warning (before this fix, min_scale/copy_to_scale were
+    // computed unconditionally and this shift-overflowed and panicked instead
+    // of returning empty).
+    let src = TestSource::new()
+        .with_histogram_series(
+            &[("__name__", "h")],
+            &[
+                (sec_ns(270), custom_buckets_hist(3.0, 6.0)),
+                (sec_ns(300), hist_scale(0, 0, &[10.0], 20.0)),
+            ],
+        )
+        .expect("valid series");
+    let (value, annos) = Evaluator::new()
+        .eval_instant_annotated(&src, "idelta(h[5m])", 5 * 60_000)
+        .expect("evaluates (must not panic)");
+    let Value::Vector(out) = value else {
+        panic!("idelta is a vector");
+    };
+    assert_eq!(
+        out.len(),
+        0,
+        "idelta cannot combine mismatched schemas, so it drops rather than \
+         emitting a wrong value"
+    );
+    assert!(
+        annos
+            .warnings()
+            .iter()
+            .any(|w| w.contains("mix of histograms with exponential and custom buckets")),
+        "idelta over mismatched schemas must warn: {:?}",
+        annos.warnings()
+    );
+}
