@@ -179,7 +179,9 @@ fn harness(store: Arc<dyn ObjectStoreBackend>, configured: HashSet<TenantHash>) 
         merge_memory: None,
         scrub: None,
         cache_metrics: None,
+        cache_disk_metrics: None,
         catalog_cache_metrics,
+        catalog_cache_disk_metrics: None,
         admission: Arc::new(AdmissionController::new(
             Arc::new(SystemClock),
             AdmissionLimits::default(),

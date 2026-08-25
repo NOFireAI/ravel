@@ -46,7 +46,7 @@ All flags, verified against [services/ravel-server/src/config.rs](../../services
 | `--typed-attr-column-tenant TENANT:KEY:TYPE` | | none, repeatable | Per-tenant declaration override, as `TENANT:KEY:TYPE`. Repeating the flag for one tenant accumulates that tenant's ordered declaration. It replaces the default for that tenant outright rather than adding to it, the same way `--indexed-field-tenant` overrides `--indexed-field`. A tenant id may not contain `:`; an attribute key may (the type is split off the right). |
 | `--limits-file <path>` | | none (shipped defaults) | TOML admission-limits file (ADR-0051 section 3): `[defaults]` plus per-tenant `[tenants.<id>]` overrides. Parsed and validated at startup; an unparseable file, an unknown key, or a nonsensical limit (zero, or a burst set with no rate to pair it with) fails startup rather than falling back to defaults. See "Admission limits file" below. |
 | `--cache-max-bytes <n>` | | `268435456` (256 MiB) | Maximum resident bytes for the ADR-0046 read cache's RAM tier. Read once at startup; there is no live resize. Ignored when `--disable-cache` is set. See [guides/caching.md](caching.md). |
-| `--cache-dir <path>` | | none | Directory for the read cache's local-disk tier. Not wired to anything yet: the query fetchers only accept a RAM cache. Setting this flag fails startup rather than silently running with no disk tier. See [guides/caching.md](caching.md#known-gaps). |
+| `--cache-dir <path>` | | none | Directory for the read cache's local-disk tier (ADR-0046). Opt-in: absent, only the RAM tier exists and behavior is exactly as before. Set, both the query fetcher cache and the catalog byte cache gain a disk tier at this path, each bounded by `--cache-max-bytes` (there is no separate disk-tier capacity flag). The directory is created lazily and never required to exist; a missing, full, or corrupt cache directory degrades to a store read, never a query error. Bytes written here are **not** SSE-KMS encrypted (see below). See [guides/caching.md](caching.md). |
 | `--disable-cache` | | off | Disables the ADR-0046 read cache entirely. Query behavior becomes byte-for-byte identical to a build with no read cache wiring at all. |
 | `--metrics-tenant-labels` | | off | Emits real per-tenant `tenant_hash` labels on the `ravel_admission_*` family at `/metrics` (ADR-0051 section 6) instead of folding every tenant into `tenant_hash="other"`. A deliberate cardinality trade; off by default so `/metrics` cardinality never scales with tenant count unless an operator opts in. See "Admission usage" above. |
 | `--store-probe-interval <duration>` | | `30s` | How often the background store-reachability probe GETs `sys/tenancy` (ADR-0050 section 7), as a humantime duration, jittered. After four consecutive failures `/readyz` returns 503; one success recovers it. See "Store reachability probe and `/readyz`" below. |
@@ -97,6 +97,39 @@ Credentials come from the instance metadata service at startup and refresh
 before expiry. No static key is stored on the instance, in the environment,
 or in logs; a missing or misconfigured role fails startup with a typed error
 rather than failing the first request.
+
+## Read cache disk tier (ADR-0046)
+
+The read cache has a RAM tier (always on unless `--disable-cache`) and an
+opt-in local-disk tier. `--cache-dir <path>` attaches the disk tier at that
+directory to both the query fetcher cache and the catalog byte cache, so a RAM
+eviction is served from local disk instead of re-paying the S3 round trip:
+
+    ravel-server --store s3 --s3-bucket my-bucket --cache-dir /var/cache/ravel
+
+The disk tier is opt-in and disposable. With no `--cache-dir`, only the RAM
+tier exists and query behavior is exactly as before. The directory is created
+lazily on first admission and is never required to exist; a missing, full, or
+corrupt cache directory degrades to a store read, never a query error, so a
+node whose cache directory is deleted mid-flight answers every query correctly
+and only more slowly. There is no separate CLI flag for disk-tier capacity:
+each tier is bounded by the single `--cache-max-bytes` number.
+
+**Encryption at rest (ADR-0046 decision 6).** Bytes this process writes to the
+cache directory are **not** encrypted by the SSE-KMS object-storage path.
+SSE-KMS (`--s3-kms-key`, `--tenant-kms-config`) protects object bytes at rest
+in the store, not the bytes written to the local cache. An operator who needs
+bytes-at-rest encryption for the cache directory must provide it at the
+filesystem/volume layer, for example an encrypted volume mounted at
+`--cache-dir`. This mirrors ADR-0042's precedent of delegating encryption at
+rest to the platform rather than making Ravel a key-management system.
+
+**Metrics.** Once a disk tier is configured, each cache's `ravel_cache_*`
+counters gain a `tier="ram"`/`tier="disk"` label alongside the existing
+`cache="fetch"`/`cache="catalog"` label, so RAM-tier and disk-tier hit rates
+are reported separately. With no `--cache-dir`, no `tier=` label appears and
+the exposition is byte-for-byte as before. See
+[guides/caching.md](caching.md) for the full metric list.
 
 ## Admission limits file
 

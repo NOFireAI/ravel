@@ -364,6 +364,14 @@ pub struct ServerConfig {
     /// [`query::build_catalog`]) from one number. Ignored when
     /// `disable_cache` is set.
     pub cache_max_bytes: u64,
+    /// `--cache-dir`: the ADR-0046 local-disk cache tier's directory (#97),
+    /// `None` when the flag is unset. `main` sets it from `Cli::cache_dir`.
+    /// When `Some` and `disable_cache` is off, [`query::build_catalog`] attaches
+    /// a `DiskCache` to the catalog byte cache, and `store::build_cache` (reading
+    /// `Cli::cache_dir` directly) attaches one to the fetcher cache; each tier is
+    /// bounded by `cache_max_bytes`. `None` keeps the RAM-only path, byte-for-byte
+    /// today's behavior.
+    pub cache_dir: Option<std::path::PathBuf>,
     /// The process-wide in-flight ingest-request ceiling, from
     /// `--max-inflight-ingest-requests` (default `Bounded(1024)`, `0` maps to
     /// `Unlimited`). [`start`] builds one shared
@@ -636,7 +644,7 @@ pub async fn start(
     store: Arc<dyn ObjectStoreBackend>,
     store_background: Arc<dyn ObjectStoreBackend>,
     store_metrics: Arc<StoreMetrics>,
-    cache: Option<Arc<ravel_cache::Cache<ravel_query::CacheFetchError>>>,
+    cache: Option<ravel_query::ReadCache>,
 ) -> anyhow::Result<Running> {
     // Install the rustls process-level crypto provider before any TLS endpoint
     // is built (ADR-0071 amendment decision 1: the dedicated fragment listener
@@ -996,6 +1004,7 @@ pub async fn start(
         config.shard_count,
         config.disable_cache,
         config.cache_max_bytes,
+        config.cache_dir.clone(),
     )?;
     // Durable shard_count enforcement on the read path (ADR-0050 section 5).
     // The two cache flags reach the catalog byte cache here, not only the
@@ -1131,8 +1140,10 @@ pub async fn start(
         maintenance_ownership: maintenance_ownership_metrics.clone(),
         merge_memory: merge_memory_tracker.clone(),
         scrub: scrub_metrics.clone(),
-        cache_metrics: cache.as_ref().map(|c| c.metrics()),
+        cache_metrics: cache.as_ref().map(|c| c.ram_metrics()),
+        cache_disk_metrics: cache.as_ref().and_then(|c| c.disk_metrics()),
         catalog_cache_metrics: catalog.byte_cache_metrics(),
+        catalog_cache_disk_metrics: catalog.byte_cache_disk_metrics(),
         admission: admission.clone(),
         metrics_tenant_labels: config.metrics_tenant_labels,
         query_accounting: query_accounting.clone(),

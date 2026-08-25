@@ -22,6 +22,7 @@ use ravel_commit::record::NewCommitRecord;
 use ravel_commit::{keys, publish, record};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
+use ravel_query::ReadCache;
 use ravel_query::http::{StaticBearerTokenResolver, router};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
 use ravel_server::Cli;
@@ -157,8 +158,13 @@ async fn cache_enabled_config_attaches_cache_to_the_metric_path() {
 
     let cli = cache_enabled_cli();
     let cache = build_cache(&cli).expect("cache enabled by default in a cache-enabled config");
+    // The default CLI sets no --cache-dir, so this is the RAM-only variant; hold
+    // its concrete `Cache` handle to assert emptiness before and after the query.
+    let ReadCache::Ram(ram) = cache.clone() else {
+        unreachable!("default CLI has no --cache-dir, so build_cache returns ReadCache::Ram");
+    };
     assert!(
-        cache.is_empty(),
+        ram.is_empty(),
         "sanity: nothing has been fetched through this cache yet"
     );
 
@@ -166,8 +172,14 @@ async fn cache_enabled_config_attaches_cache_to_the_metric_path() {
     // Pass the same cache flags build_cache read above, so build_catalog wires
     // the catalog byte cache from the CLI too, not just the
     // fetcher cache. A cache-enabled Cli means the catalog byte cache exists.
-    let catalog =
-        build_catalog(backend.clone(), 1, cli.disable_cache, cli.cache_max_bytes).expect("catalog");
+    let catalog = build_catalog(
+        backend.clone(),
+        1,
+        cli.disable_cache,
+        cli.cache_max_bytes,
+        cli.cache_dir.clone(),
+    )
+    .expect("catalog");
     assert!(
         catalog.byte_cache_metrics().is_some(),
         "a cache-enabled config must attach the catalog byte cache too"
@@ -202,7 +214,7 @@ async fn cache_enabled_config_attaches_cache_to_the_metric_path() {
     assert_eq!(body["status"], "success");
 
     assert!(
-        !cache.is_empty(),
+        !ram.is_empty(),
         "an instant query over a real segment must populate the cache attached \
          via build_app_state's with_cache call -- an empty cache after a \
          successful query means the metric path never actually consulted it"

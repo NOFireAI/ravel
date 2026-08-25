@@ -2,6 +2,7 @@
 //! (docs/catalog-and-mvcc.md "Snapshot resolution", ADR-0003, ADR-0010 §2/§10).
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -10,7 +11,9 @@ use bytes::Bytes;
 use futures::stream::{self, StreamExt};
 use parking_lot::Mutex;
 use prost::Message;
-use ravel_cache::{Cache, CacheKey, CacheLimits, SingleFlightError, Source, TieredCache};
+use ravel_cache::{
+    Cache, CacheKey, CacheLimits, DiskCache, SingleFlightError, Source, TieredCache,
+};
 use ravel_commit::keys::BucketEntry;
 use ravel_commit::{erasure, keys, record, signal};
 use ravel_object_store::{GetOutcome, GetRange, ObjectMeta, ObjectStoreBackend, StoreError};
@@ -98,12 +101,10 @@ enum ByteCache {
     /// RAM tier only (no disk configured). The plain get-then-insert path.
     Ram(Cache<std::convert::Infallible>),
     /// RAM over local disk. The `get_or_fetch` read-through path. Constructed
-    /// today only under test (`set_tiered_byte_cache_for_test`, the acceptance
-    /// gate) and, once it lands, by #97's `--cache-dir` wiring; the read funnel
-    /// already routes through it wherever it is present, which is the whole of
-    /// this task. The `allow` is scoped to the non-test build, where nothing
-    /// constructs it yet, so a genuine dead variant is still caught under test.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// in production by [`Catalog::with_disk_byte_cache`] (the server's
+    /// `--cache-dir` wiring, #97) and under test by
+    /// `set_tiered_byte_cache_for_test`; the read funnel routes through it
+    /// wherever it is present.
     Tiered(TieredCache<Arc<StoreError>>),
 }
 
@@ -281,6 +282,62 @@ impl Catalog {
     pub fn with_provisioning_enforcement(mut self) -> Self {
         self.enforce_provisioning = true;
         self
+    }
+
+    /// Attach a local-disk tier to the byte cache (ADR-0046 decision 3), turning
+    /// the RAM-only [`ByteCache::Ram`] this catalog was built with into a
+    /// RAM-over-disk [`ByteCache::Tiered`]. The server's `--cache-dir` wiring
+    /// (#97) calls this on the constructed catalog, parallel to the
+    /// [`Catalog::with_provisioning_enforcement`] builder already chained beside
+    /// it in `ravel-server`'s `build_catalog`.
+    ///
+    /// # Ordering constraint
+    ///
+    /// This MUST be called immediately after [`Catalog::new`], before the
+    /// catalog serves any read. When the current byte cache is
+    /// [`ByteCache::Ram`], its `E` is [`std::convert::Infallible`] and cannot be
+    /// composed into a [`TieredCache`] whose upstream-fetch error is
+    /// `Arc<StoreError>` (the two must share one error type), so this discards
+    /// the existing RAM `Cache` and builds a fresh `Cache<Arc<StoreError>>` at
+    /// `ram_limits` for the RAM tier. Discarding it is safe only because nothing
+    /// has been admitted yet; calling this after the catalog has served reads
+    /// would silently drop a warm RAM tier.
+    ///
+    /// # Precedence
+    ///
+    /// The `byte_cache_max_bytes == 0` disabled sentinel always wins over a
+    /// configured disk dir: when the byte cache is `None` (disabled) this returns
+    /// `self` unchanged rather than building a cache the operator's
+    /// `--disable-cache` said not to build. An already-[`ByteCache::Tiered`]
+    /// cache is likewise left as is (idempotent). `ram_limits` is an explicit
+    /// parameter because [`Cache`] exposes no accessor for its own configured
+    /// [`CacheLimits`]; the caller passes the same limits [`Catalog::new`] built
+    /// the RAM tier from.
+    ///
+    /// [`DiskCache::new`] spawns the ADR-0064 background age-sweep and so must be
+    /// called inside a Tokio runtime.
+    pub fn with_disk_byte_cache(
+        mut self,
+        ram_limits: CacheLimits,
+        dir: PathBuf,
+        disk_limits: CacheLimits,
+    ) -> Self {
+        match self.byte_cache {
+            // Disabled sentinel wins over a disk dir: build nothing.
+            None => self,
+            // Already tiered: idempotent, leave it.
+            Some(ByteCache::Tiered(_)) => self,
+            Some(ByteCache::Ram(_)) => {
+                // The existing RAM `Cache<Infallible>` cannot be composed into a
+                // `TieredCache<Arc<StoreError>>` (different `E`), and it holds
+                // nothing yet (called before any read), so build a fresh RAM
+                // tier at the same limits and compose it over the disk tier.
+                let ram = Cache::<Arc<StoreError>>::new(ram_limits);
+                let disk = DiskCache::new(dir, disk_limits);
+                self.byte_cache = Some(ByteCache::Tiered(TieredCache::new(ram, disk)));
+                self
+            }
+        }
     }
 
     /// Validate the configured `shard_count` for one (tenant, signal) against
@@ -704,6 +761,20 @@ impl Catalog {
             // read; the disk tier keeps its own separate counters.
             ByteCache::Tiered(tiered) => tiered.ram_metrics(),
         })
+    }
+
+    /// The byte cache's disk-tier counters handle (ADR-0046), or `None` when the
+    /// byte cache is disabled or is RAM-only (no `--cache-dir`). The
+    /// counterpart to [`Catalog::byte_cache_metrics`] above: the server threads
+    /// this to `/metrics` so the catalog byte cache's disk tier renders under
+    /// `cache="catalog",tier="disk"`. `None` for [`ByteCache::Ram`] (there is no
+    /// disk tier) and `Some(`[`TieredCache::disk_metrics`]`)` for
+    /// [`ByteCache::Tiered`].
+    pub fn byte_cache_disk_metrics(&self) -> Option<Arc<ravel_cache::CacheMetrics>> {
+        match self.byte_cache.as_ref()? {
+            ByteCache::Ram(_) => None,
+            ByteCache::Tiered(tiered) => Some(tiered.disk_metrics()),
+        }
     }
 
     /// `pub(crate)`: exposed for `cache`'s own tests to inspect and seed the

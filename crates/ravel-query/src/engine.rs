@@ -28,8 +28,8 @@ use crate::config::{ByteLimit, EngineConfig, RequestLimit};
 use crate::erasure::ErasurePredicate;
 use crate::error::QueryError;
 use crate::fetcher::{
-    CacheFetchError, FetchError, FetchStats, FetchedHistogramSeries, FetchedSeriesSoa,
-    SamplePriority, SegmentFetcher,
+    FetchError, FetchStats, FetchedHistogramSeries, FetchedSeriesSoa, ReadCache, SamplePriority,
+    SegmentFetcher,
 };
 use crate::segment_admission;
 
@@ -358,8 +358,13 @@ impl QueryEngine {
     /// [`SegmentFetcher::with_cache`]. `QueryEngine::new` builds its fetcher
     /// privately, so this is the only seam a caller has to opt a `QueryEngine`
     /// into the cache after construction.
+    ///
+    /// Accepts either tier configuration through [`ReadCache`] (#97): a caller
+    /// passing a bare `Arc<Cache>` still works (it converts to
+    /// [`ReadCache::Ram`]), and a caller with a `--cache-dir` disk tier passes a
+    /// [`ReadCache::Tiered`] so the disk tier reaches this engine's fetcher.
     #[must_use]
-    pub fn with_cache(mut self, cache: Arc<ravel_cache::Cache<CacheFetchError>>) -> Self {
+    pub fn with_cache(mut self, cache: impl Into<ReadCache>) -> Self {
         self.fetcher = self.fetcher.with_cache(cache);
         self
     }

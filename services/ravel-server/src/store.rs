@@ -3,8 +3,9 @@
 
 use std::sync::Arc;
 
+use crate::config::{Cli, Mode, StoreKind};
 use bytes::Bytes;
-use ravel_cache::{Cache, CacheLimits};
+use ravel_cache::{Cache, CacheLimits, DiskCache, TieredCache};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::s3::{S3AuthMode, S3Config, S3Store};
 use ravel_object_store::{
@@ -12,9 +13,6 @@ use ravel_object_store::{
     KmsRoutingStore, ListPage, MultipartUpload, ObjectMeta, ObjectStoreBackend, PageToken,
     PutOptions, PutOutcome, SchedulerConfig, StoreError, StoreMetrics,
 };
-use ravel_query::CacheFetchError;
-
-use crate::config::{Cli, Mode, StoreKind};
 
 /// RAM cache single-entry cap (ADR-0046): comfortably larger than any one
 /// planned byte range this process fetches (`ravel_query::fetcher`'s
@@ -26,20 +24,49 @@ const CACHE_MAX_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
 /// not this count, is what drives eviction in practice.
 const CACHE_MAX_ENTRIES: usize = 1_000_000;
 
-/// Build the ADR-0046 RAM read cache from CLI config, or `None` when
-/// `--disable-cache` is set. `None` must leave query behavior byte-for-byte
-/// identical to a build with no cache wiring at all: callers pass it to
+/// Build the ADR-0046 read cache from CLI config as a [`ravel_query::ReadCache`]
+/// (RAM-only or RAM-over-disk), or `None` when `--disable-cache` is set. `None`
+/// must leave query behavior byte-for-byte identical to a build with no cache
+/// wiring at all: callers pass it to
 /// `SegmentFetcher`/`LogSegmentFetcher`/`QueryEngine`'s `with_cache` only when
 /// `Some`.
-pub fn build_cache(cli: &Cli) -> Option<Arc<Cache<CacheFetchError>>> {
+///
+/// With no `--cache-dir`, this returns [`ravel_query::ReadCache::Ram`], byte-for-byte
+/// the pre-#97 RAM-only cache (same `--cache-max-bytes` budget and the same
+/// [`CACHE_MAX_ENTRY_BYTES`]/[`CACHE_MAX_ENTRIES`] constants).
+///
+/// With `--cache-dir` set, this returns [`ravel_query::ReadCache::Tiered`]: the RAM
+/// tier at the exact same limits as the RAM-only path, over a [`DiskCache`] at
+/// `dir`. There is no dedicated CLI flag for disk-tier capacity, and this task
+/// adds none, so the disk tier's [`CacheLimits`] reuse the SAME
+/// `--cache-max-bytes` number and the SAME two constants as the RAM tier. A
+/// reader must not assume `--cache-max-bytes` bounds only RAM once a disk tier
+/// exists: it bounds each tier to that number independently.
+///
+/// [`DiskCache::new`] spawns the ADR-0064 background age-sweep and so must run
+/// inside a Tokio runtime; `build_store`'s caller (`main`) is `#[tokio::main]`,
+/// so this holds on every `--cache-dir` startup.
+pub fn build_cache(cli: &Cli) -> Option<ravel_query::ReadCache> {
     if cli.disable_cache {
         return None;
     }
-    Some(Arc::new(Cache::new(CacheLimits::new(
+    let ram_limits = CacheLimits::new(
         cli.cache_max_bytes,
         CACHE_MAX_ENTRIES,
         CACHE_MAX_ENTRY_BYTES,
-    ))))
+    );
+    match &cli.cache_dir {
+        None => Some(ravel_query::ReadCache::Ram(Arc::new(Cache::new(
+            ram_limits,
+        )))),
+        Some(dir) => {
+            // The disk tier mirrors the RAM tier's capacity from the same
+            // `--cache-max-bytes` number and the same two constants.
+            let disk = DiskCache::new(dir.clone(), ram_limits);
+            let tiered = TieredCache::new(Cache::new(ram_limits), disk);
+            Some(ravel_query::ReadCache::Tiered(Arc::new(tiered)))
+        }
+    }
 }
 
 /// A constructed backend under-reports a capability Ravel's commit protocol
@@ -192,10 +219,10 @@ pub struct BuiltStore {
     /// sits under the [`ClassedStore`], so it counts foreground and background
     /// traffic alike). Distinct from the per-class metrics on [`Self::classed`].
     pub metrics: Arc<StoreMetrics>,
-    /// The ADR-0046 read cache, `None` when `--disable-cache` is set. The caller
-    /// attaches it to the query fetchers via their existing `with_cache`
-    /// builders.
-    pub cache: Option<Arc<Cache<CacheFetchError>>>,
+    /// The ADR-0046 read cache (RAM-only, or RAM-over-disk when `--cache-dir` is
+    /// set), `None` when `--disable-cache` is set. The caller attaches it to the
+    /// query fetchers via their existing `with_cache` builders.
+    pub cache: Option<ravel_query::ReadCache>,
     /// A handle onto the live [`KmsRoutingStore`] embedded in the backend chain,
     /// `Some` only when `--tenant-kms-config` is set on `--store s3`.
     ///

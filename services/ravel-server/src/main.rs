@@ -461,6 +461,7 @@ async fn main() -> anyhow::Result<()> {
         typed_attr_columns,
         disable_cache: cli.disable_cache,
         cache_max_bytes: cli.cache_max_bytes,
+        cache_dir: cli.cache_dir.clone(),
         ingest_concurrency_limit: cli
             .parse_ingest_concurrency_limit()
             .context("failed to parse --max-inflight-ingest-requests")?,
