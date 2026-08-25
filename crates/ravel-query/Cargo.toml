@@ -97,6 +97,11 @@ ravel-cache = { workspace = true }
 # so this is acyclic.
 ravel-maintain = { path = "../ravel-maintain", version = "0.10.0" }
 proptest = { workspace = true }
+# The ADR-0046 disk cache tier (crates/ravel-query/src/cache_correctness.rs)
+# needs a real on-disk directory to construct a `ravel_cache::DiskCache`; the
+# acceptance and double-counting tests build one in a temp dir. Version from
+# [workspace.dependencies].
+tempfile = { workspace = true }
 tokio = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 uuid = { workspace = true }
