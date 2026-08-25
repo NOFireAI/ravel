@@ -40,15 +40,13 @@ use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-use ravel_ingest::{
-    Clock, IngestConfig, LogIngestRouter, SystemClock, WriteMode,
-};
+use ravel_ingest::{Clock, IngestConfig, LogIngestRouter, SystemClock, WriteMode};
 use ravel_logseg::{ColumnarLogBatch, LogRecord, stream_attrs_bytes};
-use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::ObjectStoreBackend;
+use ravel_object_store::memory::MemoryStore;
 use ravel_otlp::logs_normalize::NormalizedLogRecord;
-use ravel_types::logstream::{AttrValue, log_stream_id};
 use ravel_types::TenantId;
+use ravel_types::logstream::{AttrValue, log_stream_id};
 
 /// Ack deadline for each Strict write. Generous: the in-memory store never
 /// blocks, but a loaded host can still stretch a flush.
@@ -57,8 +55,10 @@ const WRITE_ACK_DEADLINE: Duration = Duration::from_secs(120);
 /// The fixed resource+scope identity every corpus record shares. A single
 /// stream keeps every row on one shard, so the row-vs-columnar differential is
 /// the write-path pivot alone and not a difference in shard fan-out.
-const RESOURCE_ATTRS: &[(&str, &str)] =
-    &[("service.name", "clickbench-local"), ("dataset", "hits-sample")];
+const RESOURCE_ATTRS: &[(&str, &str)] = &[
+    ("service.name", "clickbench-local"),
+    ("dataset", "hits-sample"),
+];
 
 /// Which write path a measurement drove. The row path
 /// ([`LogIngestRouter::write`]) is the differential reference; the columnar
@@ -131,7 +131,11 @@ pub struct CompareReport {
 impl CompareReport {
     /// Row-path wall divided by columnar-path wall.
     pub fn wall_speedup(&self) -> f64 {
-        self.columnar.wall.as_secs_f64().max(f64::MIN_POSITIVE).recip()
+        self.columnar
+            .wall
+            .as_secs_f64()
+            .max(f64::MIN_POSITIVE)
+            .recip()
             * self.row.wall.as_secs_f64()
     }
 
@@ -194,7 +198,9 @@ fn corpus_schema(shape: CorpusShape) -> SchemaRef {
 /// column, the shape a dictionary-encoded categorical export takes.
 fn corpus_batch(shape: CorpusShape, schema: &SchemaRef) -> RecordBatch {
     let n = shape.rows;
-    let ts: Vec<i64> = (0..n).map(|r| 1_700_000_000_000_000_000 + r as i64 * 1_000_000).collect();
+    let ts: Vec<i64> = (0..n)
+        .map(|r| 1_700_000_000_000_000_000 + r as i64 * 1_000_000)
+        .collect();
     let body: Vec<String> = (0..n)
         .map(|r| format!("request {} served in {}ms", r, r % 250))
         .collect();
@@ -204,13 +210,17 @@ fn corpus_batch(shape: CorpusShape, schema: &SchemaRef) -> RecordBatch {
     columns.push(Arc::new(StringArray::from(body)));
 
     for c in 0..shape.int_cols {
-        let col: Vec<i64> = (0..n).map(|r| (r as i64).wrapping_mul(31).wrapping_add(c as i64)).collect();
+        let col: Vec<i64> = (0..n)
+            .map(|r| (r as i64).wrapping_mul(31).wrapping_add(c as i64))
+            .collect();
         columns.push(Arc::new(Int64Array::from(col)));
     }
     for c in 0..shape.str_cols {
         // A small per-column alphabet (16 distinct values) so the column reads
         // like a low-cardinality categorical, the ClickBench-typical shape.
-        let col: Vec<String> = (0..n).map(|r| format!("s{c:02}_{}", (r + c) % 16)).collect();
+        let col: Vec<String> = (0..n)
+            .map(|r| format!("s{c:02}_{}", (r + c) % 16))
+            .collect();
         columns.push(Arc::new(StringArray::from(col)));
     }
 
@@ -240,7 +250,9 @@ pub fn decode_corpus(parquet_bytes: &[u8]) -> Result<Vec<NormalizedLogRecord>, C
     let bytes = bytes::Bytes::copy_from_slice(parquet_bytes);
     let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)
         .map_err(|e| CompareError::Parquet(e.to_string()))?;
-    let reader = builder.build().map_err(|e| CompareError::Parquet(e.to_string()))?;
+    let reader = builder
+        .build()
+        .map_err(|e| CompareError::Parquet(e.to_string()))?;
 
     let res: Vec<(String, AttrValue)> = RESOURCE_ATTRS
         .iter()
@@ -426,7 +438,12 @@ async fn measure_path(
                 report.columnar_batches += 1;
                 let n = batch.num_rows as u64;
                 let r = router
-                    .write_columnar(tenant.clone(), *batch, WriteMode::Strict, WRITE_ACK_DEADLINE)
+                    .write_columnar(
+                        tenant.clone(),
+                        *batch,
+                        WriteMode::Strict,
+                        WRITE_ACK_DEADLINE,
+                    )
                     .await
                     .map_err(|e| CompareError::Write {
                         path: "columnar",
