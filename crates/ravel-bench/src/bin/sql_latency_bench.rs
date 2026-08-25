@@ -86,6 +86,13 @@ struct Args {
     /// existed. Disagreeing with the record's ceiling is an error.
     #[arg(long)]
     shards: Option<u32>,
+    /// Read-cache byte budget (ADR-0046) attached to the query fetcher. `0`
+    /// (the default) attaches no cache, so measurement is byte-for-byte today's
+    /// fetcher; `> 0` builds a RAM tier of this size, so a statement's second
+    /// and later runs can serve from cache and the report's `cache_*` counters
+    /// become meaningful.
+    #[arg(long, default_value_t = 0)]
+    cache_bytes: u64,
 }
 
 #[derive(Copy, Clone, Debug, clap::ValueEnum)]
@@ -181,6 +188,8 @@ async fn run(args: &Args) -> Result<SqlLatencyReport, ravel_bench::sql_latency::
                 now_ns,
                 compaction: args.compaction.into(),
                 max_query_bytes: args.sql_max_query_bytes,
+                shards: args.shards,
+                cache_bytes: args.cache_bytes,
             };
             run_tenant(&cfg).await
         }
@@ -199,6 +208,7 @@ async fn run(args: &Args) -> Result<SqlLatencyReport, ravel_bench::sql_latency::
                 records_per_object: args.records_per_object,
                 extra_attrs: args.extra_attrs,
                 max_query_bytes: args.sql_max_query_bytes,
+                cache_bytes: args.cache_bytes,
             };
             run_generated(&cfg).await
         }
@@ -220,6 +230,11 @@ fn print_human_table(report: &SqlLatencyReport) {
         d.object_count, d.stored_bytes, d.rows, d.layout, d.load_wall_ms
     );
     println!("  runs/query : {}", p.runs);
+    if p.cache_bytes > 0 {
+        println!("  read cache : {} bytes", p.cache_bytes);
+    } else {
+        println!("  read cache : off");
+    }
     println!();
     println!(
         "  {:<32} | {:>9} | {:>9} | {:>9} | {:>9} | {:>7} | {:>7} | {:>7} | {:>7}",

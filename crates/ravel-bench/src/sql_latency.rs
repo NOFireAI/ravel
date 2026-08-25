@@ -33,7 +33,11 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ravel_catalog::{Catalog, CatalogConfig, DeclaredColumnType, read_config_values};
+use ravel_cache::{Cache, CacheLimits};
+use ravel_catalog::{
+    Catalog, CatalogConfig, DeclaredColumnType, read_config_values, read_generations_from_store,
+    shard_ceiling,
+};
 use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
 use ravel_commit::{keys, publish, record};
@@ -41,7 +45,7 @@ use ravel_logseg::{
     AttrValue, LogRecord, ObjectIdentity, RlogConfig, RlogWriter, stream_attrs_bytes,
 };
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
-use ravel_query::{LogSegmentFetcher, SegmentFetcher};
+use ravel_query::{CacheFetchError, LogSegmentFetcher, SegmentFetcher};
 use ravel_sql::{
     DeclaredColumn, DeclaredType, SpanSegmentFetcher, SqlConfig, SqlExecutor, SqlRequest,
     StaticDeclaredColumns,
@@ -66,6 +70,48 @@ const NOW_NS: i64 = 4 * NS_PER_HOUR;
 /// catalog, writer, publish, and tenant-config error types without a bespoke
 /// enum; a bench never needs to match on the variant.
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
+
+/// The tenant lane's fail-closed refusals (issue #677). Each names exactly what
+/// it resolved so a misdirected run (wrong `--window-hours`, wrong tenant, a
+/// tenant loaded before provisioning records existed, or a `--shards` that
+/// contradicts the durable record) is loud instead of silently measuring an
+/// empty or shard-0-only dataset. Boxed into [`Error`] like every other lane
+/// failure; tests downcast to the variant.
+#[derive(Debug, thiserror::Error)]
+pub enum TenantLaneError {
+    /// No `--shards` and no durable provisioning record: the tenant predates
+    /// provisioning records, so its shard count cannot be resolved.
+    #[error(
+        "tenant `{tenant}` has no shard-count provisioning record (loaded before provisioning \
+         records existed): pass --shards <N> to name its shard count"
+    )]
+    NoProvisioningRecord { tenant: String },
+    /// `--shards` disagrees with the record's shard ceiling. Refuse rather than
+    /// silently prefer one over the other.
+    #[error(
+        "--shards {requested} disagrees with tenant `{tenant}`'s provisioning record shard ceiling \
+         {ceiling}: refusing to measure over a shard count the record contradicts"
+    )]
+    ShardCountDisagreement {
+        tenant: String,
+        requested: u32,
+        ceiling: u32,
+    },
+    /// A full-window resolve found zero objects. A report over an empty dataset
+    /// is impossible to produce from the tenant lane.
+    #[error(
+        "tenant `{tenant}` resolved 0 objects over shard_count {shard_count}, window \
+         [{start_ns}, {end_ns}] ns, now_ns {now_ns}: refusing to report an empty dataset \
+         (check --window-hours, --shards, and the tenant id)"
+    )]
+    EmptyDataset {
+        tenant: String,
+        shard_count: u32,
+        start_ns: i64,
+        end_ns: i64,
+        now_ns: i64,
+    },
+}
 
 /// Whether the measured object layout is a freshly loaded tenant (many small
 /// objects) or one the maintenance machinery has compacted (fewer, larger).
@@ -112,6 +158,11 @@ pub struct Provenance {
     pub dataset_id: String,
     /// Executions per statement behind the min/median/max.
     pub runs: usize,
+    /// Configured read-cache byte budget (ADR-0046) attached to the query
+    /// fetcher, or `0` when no cache was wired. Recorded so a report states
+    /// whether a cache was on: the per-statement `cache_*` counters are only
+    /// meaningful against this.
+    pub cache_bytes: u64,
 }
 
 /// The dataset as it sits in the object store, independent of any one query.
@@ -232,6 +283,10 @@ pub struct GenerateConfig {
     /// [`ravel_sql::DEFAULT_MAX_QUERY_BYTES`], so an unset flag leaves the
     /// executor's budget byte-for-byte unchanged.
     pub max_query_bytes: usize,
+    /// Read-cache byte budget (ADR-0046) to attach to the query fetcher. `0`
+    /// (the default) attaches no cache, leaving the fetcher byte-for-byte as
+    /// before; `> 0` builds a RAM tier of this size.
+    pub cache_bytes: u64,
 }
 
 /// Inputs for the loaded-tenant lane.
@@ -259,6 +314,15 @@ pub struct TenantConfigInput {
     /// [`ravel_sql::DEFAULT_MAX_QUERY_BYTES`], so an unset flag leaves the
     /// executor's budget byte-for-byte unchanged.
     pub max_query_bytes: usize,
+    /// Operator-supplied shard count. `Some(n)` overrides the durable
+    /// provisioning record (and is required for a tenant that predates those
+    /// records); `None` resolves the count from the record's shard ceiling
+    /// (issue #677).
+    pub shards: Option<u32>,
+    /// Read-cache byte budget (ADR-0046) to attach to the query fetcher. `0`
+    /// (the default) attaches no cache; `> 0` builds a RAM tier of this size so
+    /// the second and later runs of a statement can serve from cache.
+    pub cache_bytes: u64,
 }
 
 fn percentile(sorted_ns: &[u64], pct: f64) -> u64 {
@@ -311,19 +375,57 @@ fn declaration_union(entries: &[CorpusEntry]) -> Vec<DeclaredColumn> {
     out
 }
 
-/// Build a fresh executor over `store` with `declared` installed. Fresh per
-/// corpus entry so the first run is genuinely cold: a shared executor would let
-/// one statement warm the next through the catalog and fetch caches.
+/// Build ADR-0046's RAM read cache sized to `cache_bytes` (never called for a
+/// `0` budget; that path attaches no cache at all).
+///
+/// `max_entry_bytes` is the whole budget so no RLOG object the bench measures is
+/// silently rejected as too large; the byte budget still bounds total
+/// residency. `max_entries` is derived rather than fixed: RLOG objects are tens
+/// of KiB or larger, so byte pressure, not entry count, should be the binding
+/// limit -- one entry per 4 KiB of budget, floored so a tiny budget stays
+/// usable, keeps the count well clear of that role.
+fn build_read_cache(cache_bytes: u64) -> Arc<Cache<CacheFetchError>> {
+    let max_entries = (cache_bytes / 4096).max(64) as usize;
+    Arc::new(Cache::new(CacheLimits::new(
+        cache_bytes,
+        max_entries,
+        cache_bytes,
+    )))
+}
+
+/// Build a fresh executor over `store` with `declared` installed, its catalog
+/// configured for `shard_count` shards, and `cache` (when present) attached to
+/// the log fetcher. Fresh per corpus entry so the first run is genuinely cold: a
+/// shared executor would let one statement warm the next through the catalog and
+/// fetch caches.
+///
+/// `shard_count` reaches the resolve because these direct-built catalogs run
+/// with provisioning enforcement off, where the scan set is `0..shard_count`
+/// for every hour (ravel_catalog docs on `read_scan_generations`); the tenant
+/// lane resolves that count before calling here so a multi-shard tenant is no
+/// longer measured over shard 0 alone.
 fn cold_executor(
     store: &Arc<dyn ObjectStoreBackend>,
     declared: &[DeclaredColumn],
     max_query_bytes: usize,
+    shard_count: u32,
+    cache: Option<Arc<Cache<CacheFetchError>>>,
 ) -> Result<SqlExecutor, Error> {
-    let catalog = Arc::new(Catalog::new(Arc::clone(store), CatalogConfig::default())?);
+    let catalog = Arc::new(Catalog::new(
+        Arc::clone(store),
+        CatalogConfig {
+            shard_count,
+            ..CatalogConfig::default()
+        },
+    )?);
+    let mut log_fetcher = LogSegmentFetcher::new(Arc::clone(store));
+    if let Some(cache) = cache {
+        log_fetcher = log_fetcher.with_cache(cache);
+    }
     Ok(SqlExecutor::new(
         catalog,
         SegmentFetcher::new(Arc::clone(store)),
-        LogSegmentFetcher::new(Arc::clone(store)),
+        log_fetcher,
         SpanSegmentFetcher::new(Arc::clone(store)),
         SqlConfig {
             max_query_bytes,
@@ -353,6 +455,8 @@ pub async fn measure_corpus(
     window: TimeRange,
     now_ns: i64,
     max_query_bytes: usize,
+    shard_count: u32,
+    cache_bytes: u64,
 ) -> Result<(Vec<EntryReport>, Vec<SkippedEntry>), Error> {
     let runs = runs.max(1);
     let mut measured = Vec::new();
@@ -381,7 +485,12 @@ pub async fn measure_corpus(
             continue;
         }
 
-        let executor = cold_executor(store, declared, max_query_bytes)?;
+        // A fresh cache per entry (not per run) so run 0 is genuinely cold while
+        // later runs of the SAME statement can serve from it; sharing one cache
+        // across entries would warm one statement from another's reads over the
+        // same segments.
+        let cache = (cache_bytes > 0).then(|| build_read_cache(cache_bytes));
+        let executor = cold_executor(store, declared, max_query_bytes, shard_count, cache)?;
         let req = SqlRequest {
             sql: entry.sql.clone(),
             window,
@@ -465,8 +574,15 @@ async fn dataset_info(
     now_ns: i64,
     load_wall_ms: f64,
     compaction: Compaction,
+    shard_count: u32,
 ) -> Result<DatasetInfo, Error> {
-    let catalog = Arc::new(Catalog::new(Arc::clone(store), CatalogConfig::default())?);
+    let catalog = Arc::new(Catalog::new(
+        Arc::clone(store),
+        CatalogConfig {
+            shard_count,
+            ..CatalogConfig::default()
+        },
+    )?);
     let snapshot = catalog
         .resolve(&tenant_hash, Signal::Logs, window, &[], now_ns)
         .await?;
@@ -498,6 +614,9 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
         end_ns: NOW_NS,
     };
     let declared = declaration_union(&cfg.entries);
+    // The generated lane writes shard 0 only by construction (see
+    // `generate_dataset`), so a single shard resolves the whole dataset.
+    let shard_count = 1;
     let dataset = dataset_info(
         &cfg.store,
         tenant_hash,
@@ -505,6 +624,7 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
         NOW_NS,
         load_wall_ms,
         Compaction::Pre,
+        shard_count,
     )
     .await?;
     let (entries, skipped) = measure_corpus(
@@ -516,6 +636,8 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
         window,
         NOW_NS,
         cfg.max_query_bytes,
+        shard_count,
+        cfg.cache_bytes,
     )
     .await?;
 
@@ -528,6 +650,7 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
             source: "generate".to_string(),
             dataset_id: tenant.as_str().to_string(),
             runs: cfg.runs.max(1),
+            cache_bytes: cfg.cache_bytes,
         },
         dataset,
         entries,
@@ -545,6 +668,15 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
     let tenant = TenantId::new(cfg.tenant.clone());
     let tenant_hash = tenant.hash();
 
+    // How many shards to resolve over. Before #677 this was implicitly 1
+    // (`CatalogConfig::default()`), so a multi-shard tenant was measured over
+    // shard 0 alone and any tenant whose data all sat on a higher shard read as
+    // empty. Resolve it up front, fail-closed, from the operator flag or the
+    // durable provisioning record.
+    let now_hour = (cfg.now_ns / NS_PER_HOUR).max(0) as u32;
+    let shard_count =
+        resolve_shard_count(&cfg.store, &tenant_hash, &cfg.tenant, cfg.shards, now_hour).await?;
+
     // The configuration under measurement: the tenant's real durable declared
     // columns, not a set this harness installs. An absent config, or a config
     // with no typed columns, means the tenant declared nothing.
@@ -557,8 +689,22 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
         cfg.now_ns,
         0.0,
         cfg.compaction,
+        shard_count,
     )
     .await?;
+    // Fail closed on an empty resolve: a report over zero objects is never a
+    // valid measurement, and silently producing one hides a wrong window,
+    // tenant, or shard count.
+    if dataset.object_count == 0 {
+        return Err(TenantLaneError::EmptyDataset {
+            tenant: cfg.tenant.clone(),
+            shard_count,
+            start_ns: cfg.window.start_ns,
+            end_ns: cfg.window.end_ns,
+            now_ns: cfg.now_ns,
+        }
+        .into());
+    }
     let (entries, skipped) = measure_corpus(
         &cfg.store,
         tenant_hash,
@@ -568,6 +714,8 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
         cfg.window,
         cfg.now_ns,
         cfg.max_query_bytes,
+        shard_count,
+        cfg.cache_bytes,
     )
     .await?;
 
@@ -580,11 +728,58 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
             source: "tenant".to_string(),
             dataset_id: cfg.tenant.clone(),
             runs: cfg.runs.max(1),
+            cache_bytes: cfg.cache_bytes,
         },
         dataset,
         entries,
         skipped,
     })
+}
+
+/// Resolve the shard count the tenant lane measures over (issue #677).
+///
+/// `override_shards` is the operator's `--shards`. The durable provisioning
+/// record (`ravel-cli load` writes it via `validate_or_adopt`) carries the
+/// shard-generation history; [`shard_ceiling`] over it at `now_hour` is the max
+/// shard count active at or before that hour, which a resolve over the window
+/// must scan. The four cases:
+///
+/// - flag and record present: they must agree, else refuse (never silently
+///   prefer one);
+/// - flag only (no record): trust the flag -- this is a tenant loaded before
+///   provisioning records existed;
+/// - record only (no flag): use the record's ceiling;
+/// - neither: refuse, naming the tenant and telling the operator to pass
+///   `--shards`.
+async fn resolve_shard_count(
+    store: &Arc<dyn ObjectStoreBackend>,
+    tenant_hash: &TenantHash,
+    tenant: &str,
+    override_shards: Option<u32>,
+    now_hour: u32,
+) -> Result<u32, Error> {
+    let generations =
+        read_generations_from_store(store.as_ref(), tenant_hash, Signal::Logs).await?;
+    match (override_shards, generations) {
+        (Some(requested), Some(gens)) => {
+            let ceiling = shard_ceiling(&gens, now_hour);
+            if requested != ceiling {
+                return Err(TenantLaneError::ShardCountDisagreement {
+                    tenant: tenant.to_string(),
+                    requested,
+                    ceiling,
+                }
+                .into());
+            }
+            Ok(requested)
+        }
+        (Some(requested), None) => Ok(requested),
+        (None, Some(gens)) => Ok(shard_ceiling(&gens, now_hour)),
+        (None, None) => Err(TenantLaneError::NoProvisioningRecord {
+            tenant: tenant.to_string(),
+        }
+        .into()),
+    }
 }
 
 /// Read the tenant's durable declared typed attribute columns from its
@@ -738,11 +933,307 @@ fn build_records(count: usize, extra_attrs: usize) -> Vec<LogRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ravel_catalog::{AbsentPolicy, validate_or_adopt};
     use ravel_object_store::memory::MemoryStore;
     use ravel_sql::DEFAULT_MAX_QUERY_BYTES;
 
     fn empty_store() -> Arc<dyn ObjectStoreBackend> {
         Arc::new(MemoryStore::new())
+    }
+
+    /// Write `objects` RLOG objects (one record each) on `shard` for `tenant`,
+    /// each with its own commit record, so a real `Catalog::resolve` over the
+    /// shard finds them. Mirrors [`generate_dataset`] but parameterized by shard
+    /// (distinct writer id per shard, so keys never collide) -- the generated
+    /// lane only ever writes shard 0.
+    async fn write_shard_objects(
+        store: &Arc<dyn ObjectStoreBackend>,
+        tenant: &TenantId,
+        shard: u32,
+        objects: usize,
+    ) {
+        let records = build_records(objects.max(1), 0);
+        let writer_id = Uuid::from_u128(0x5100_0100 + u128::from(shard));
+        for (obj_idx, rec) in records.iter().enumerate() {
+            let writer_seq = (obj_idx + 1) as u64;
+            let identity = ObjectIdentity {
+                tenant_hash: tenant.hash().0,
+                shard,
+                writer_id: *writer_id.as_bytes(),
+                writer_epoch: 1,
+                writer_seq,
+            };
+            let mut writer = RlogWriter::new(RlogConfig::default(), identity);
+            writer.push(rec.clone()).expect("push record");
+            let bytes = writer.finish().expect("finish object");
+            let new_record = NewCommitRecord {
+                tenant_hash: tenant.hash(),
+                signal: Signal::Logs,
+                shard,
+                writer_id,
+                writer_epoch: 1,
+                writer_seq,
+                object_size: bytes.len() as u64,
+                content_hash: [0u8; 32],
+                sample_count: 1,
+                series_count: 1,
+                min_event_ts_ns: rec.ts_ns,
+                max_event_ts_ns: rec.ts_ns,
+                min_ingest_ts_ns: rec.ts_ns,
+                max_ingest_ts_ns: rec.ts_ns,
+                segment_format_version: 1,
+                created_unix_ns: 10,
+                ingest_hour_bucket: 0,
+            };
+            let built = record::build(new_record).expect("build commit record");
+            let data_key = keys::reconstruct_data_key(&built).expect("data key");
+            store
+                .put(&data_key, bytes::Bytes::from(bytes), PutOptions::default())
+                .await
+                .expect("put object");
+            publish::publish(store.as_ref(), &built, &RetryPolicy::default())
+                .await
+                .expect("publish commit record");
+        }
+    }
+
+    /// A tenant-lane config for the shard/cache tests: memory provenance, no
+    /// corpus entries (these tests exercise resolution and fail-closed paths,
+    /// not statement timing).
+    fn tenant_cfg(
+        store: &Arc<dyn ObjectStoreBackend>,
+        tenant: &str,
+        shards: Option<u32>,
+        cache_bytes: u64,
+    ) -> TenantConfigInput {
+        TenantConfigInput {
+            store: Arc::clone(store),
+            store_backend: "memory".to_string(),
+            region: "n/a".to_string(),
+            endpoint: "n/a".to_string(),
+            tenant: tenant.to_string(),
+            entries: Vec::new(),
+            runs: 1,
+            window: TimeRange {
+                start_ns: 0,
+                end_ns: NOW_NS,
+            },
+            now_ns: NOW_NS,
+            compaction: Compaction::Pre,
+            max_query_bytes: DEFAULT_MAX_QUERY_BYTES,
+            shards,
+            cache_bytes,
+        }
+    }
+
+    /// A 2-shard tenant with objects on shard 0 AND shard 1 is measured over
+    /// both shards. The pre-#677 behaviour (a shard_count of 1, which is what
+    /// `CatalogConfig::default()` set) resolves shard 0 alone and undercounts;
+    /// the fix resolves the record's ceiling (2) and counts every object.
+    #[tokio::test]
+    async fn tenant_lane_object_count_spans_all_shards() {
+        let store = empty_store();
+        let tenant = TenantId::new("shard-span-tenant");
+        let th = tenant.hash();
+        write_shard_objects(&store, &tenant, 0, 3).await;
+        write_shard_objects(&store, &tenant, 1, 2).await;
+        validate_or_adopt(
+            store.as_ref(),
+            &th,
+            Signal::Logs,
+            2,
+            10,
+            AbsentPolicy::CreateFromConfig,
+        )
+        .await
+        .expect("write provisioning record");
+
+        let window = TimeRange {
+            start_ns: 0,
+            end_ns: NOW_NS,
+        };
+
+        // Pre-fix: shard_count 1 resolves shard 0 only.
+        let pre = dataset_info(&store, th, window, NOW_NS, 0.0, Compaction::Pre, 1)
+            .await
+            .expect("resolve at shard_count 1");
+        assert_eq!(
+            pre.object_count, 3,
+            "shard_count=1 sees only shard 0's 3 objects (the pre-#677 undercount)"
+        );
+
+        // Fix: shard_count 2 counts both shards.
+        let post = dataset_info(&store, th, window, NOW_NS, 0.0, Compaction::Pre, 2)
+            .await
+            .expect("resolve at shard_count 2");
+        assert_eq!(
+            post.object_count, 5,
+            "shard_count=2 counts shard 0's 3 plus shard 1's 2"
+        );
+
+        // End to end: run_tenant resolves the count from the record, so it too
+        // reports 5.
+        let cfg = tenant_cfg(&store, "shard-span-tenant", None, 0);
+        let report = run_tenant(&cfg).await.expect("tenant lane runs");
+        assert_eq!(
+            report.dataset.object_count, 5,
+            "run_tenant resolves both shards from the provisioning record"
+        );
+    }
+
+    /// A resolve that finds zero objects is a fail-closed error naming what it
+    /// resolved, never an `Ok` report over an empty dataset (the pre-#677
+    /// behaviour, which returned `object_count == 0` silently).
+    #[tokio::test]
+    async fn tenant_lane_empty_dataset_is_error() {
+        let store = empty_store();
+        let tenant = TenantId::new("empty-tenant");
+        let th = tenant.hash();
+        validate_or_adopt(
+            store.as_ref(),
+            &th,
+            Signal::Logs,
+            2,
+            10,
+            AbsentPolicy::CreateFromConfig,
+        )
+        .await
+        .expect("write provisioning record");
+        // No objects written.
+        let cfg = tenant_cfg(&store, "empty-tenant", None, 0);
+        let err = run_tenant(&cfg)
+            .await
+            .expect_err("a 0-object resolve must be an error");
+        match err.downcast_ref::<TenantLaneError>() {
+            Some(TenantLaneError::EmptyDataset {
+                tenant,
+                shard_count,
+                ..
+            }) => {
+                assert_eq!(tenant, "empty-tenant");
+                assert_eq!(*shard_count, 2);
+            }
+            other => panic!("expected EmptyDataset, got {other:?}"),
+        }
+    }
+
+    /// A tenant with no provisioning record and no `--shards` is refused: its
+    /// shard count is unknowable, so measuring it would silently fall back to
+    /// shard 0.
+    #[tokio::test]
+    async fn tenant_lane_missing_record_without_shards_is_error() {
+        let store = empty_store();
+        let cfg = tenant_cfg(&store, "no-record-tenant", None, 0);
+        let err = run_tenant(&cfg)
+            .await
+            .expect_err("a missing record with no --shards must be an error");
+        assert!(
+            matches!(
+                err.downcast_ref::<TenantLaneError>(),
+                Some(TenantLaneError::NoProvisioningRecord { .. })
+            ),
+            "expected NoProvisioningRecord, got {err}"
+        );
+    }
+
+    /// `--shards` that contradicts the record's shard ceiling is refused rather
+    /// than silently preferring one over the other.
+    #[tokio::test]
+    async fn tenant_lane_shards_disagreeing_with_record_is_error() {
+        let store = empty_store();
+        let tenant = TenantId::new("disagree-tenant");
+        let th = tenant.hash();
+        write_shard_objects(&store, &tenant, 0, 1).await;
+        write_shard_objects(&store, &tenant, 1, 1).await;
+        validate_or_adopt(
+            store.as_ref(),
+            &th,
+            Signal::Logs,
+            2,
+            10,
+            AbsentPolicy::CreateFromConfig,
+        )
+        .await
+        .expect("write provisioning record");
+        let cfg = tenant_cfg(&store, "disagree-tenant", Some(3), 0);
+        let err = run_tenant(&cfg)
+            .await
+            .expect_err("a --shards that disagrees with the record must error");
+        match err.downcast_ref::<TenantLaneError>() {
+            Some(TenantLaneError::ShardCountDisagreement {
+                requested, ceiling, ..
+            }) => {
+                assert_eq!((*requested, *ceiling), (3, 2));
+            }
+            other => panic!("expected ShardCountDisagreement, got {other:?}"),
+        }
+    }
+
+    /// The `--cache-bytes` cache is not inert: attaching it to the log fetcher
+    /// cuts object-store GETs and adds fetch-cache hits.
+    ///
+    /// Reachability (issue #677): the bench's SQL scan reaches the cache through
+    /// `LogSegmentFetcher::tenant_bytes` (via `plan_segment` +
+    /// `scan_accounted_with_tenant_subset` in `ravel_sql::logs_scan`), NOT the
+    /// `fetch_accounted_with_tenant` funnel the flag's ADR names. That path reads
+    /// each segment more than once per query (once to plan the surviving blocks,
+    /// once to scan them), so with the fetcher cache attached the scan is served
+    /// from the plan's fill within a single run. The catalog's own byte cache is
+    /// on under `CatalogConfig::default()` in both arms, so an isolated,
+    /// attributable comparison holds the catalog state identical (two FRESH
+    /// executors, one cold run each) and reads off the delta the fetcher cache
+    /// alone makes: strictly fewer store GETs, strictly more cache hits. This is
+    /// why the literal "warm hits == cold misses" identity does not hold and is
+    /// not asserted -- the cold run already hits, and the catalog cache
+    /// contributes hits of its own. Building the cached arm without `with_cache`
+    /// collapses both deltas to zero, which is what flips the assertions red.
+    #[tokio::test]
+    async fn cache_flag_cuts_store_gets_within_a_run() {
+        use ravel_types::accounting::AccountedOp;
+
+        let store = empty_store();
+        let tenant = TenantId::new("cache-tenant");
+        let th = tenant.hash();
+        write_shard_objects(&store, &tenant, 0, 1).await;
+        let req = SqlRequest {
+            sql: "SELECT body FROM logs".to_string(),
+            window: TimeRange {
+                start_ns: 0,
+                end_ns: NOW_NS,
+            },
+            min_tokens: Vec::new(),
+            now_ns: NOW_NS,
+            deadline: Duration::from_secs(30),
+        };
+
+        // Fetcher cache ON: a fresh executor (cold catalog byte cache, cold
+        // fetcher cache), one run.
+        let cache = build_read_cache(64 << 20);
+        let cached = cold_executor(&store, &[], DEFAULT_MAX_QUERY_BYTES, 1, Some(cache))
+            .expect("build cached executor");
+        let on = cached.execute(th, &req).await.expect("cached run");
+
+        // Fetcher cache OFF: a fresh executor (identical cold catalog byte cache,
+        // no fetcher cache), one run. The catalog contribution is the same in
+        // both, so any delta is the fetcher cache alone.
+        let uncached = cold_executor(&store, &[], DEFAULT_MAX_QUERY_BYTES, 1, None)
+            .expect("build uncached executor");
+        let off = uncached.execute(th, &req).await.expect("uncached run");
+
+        let get_on = on.accounting.s3_requests(AccountedOp::Get);
+        let get_off = off.accounting.s3_requests(AccountedOp::Get);
+        assert!(
+            get_on < get_off,
+            "the fetcher cache must cut store GETs within a run; got get_on={get_on} \
+             get_off={get_off}"
+        );
+        assert!(
+            on.accounting.cache_hits > off.accounting.cache_hits,
+            "the fetcher cache must add cache hits over the catalog-only baseline; got \
+             on={} off={}",
+            on.accounting.cache_hits,
+            off.accounting.cache_hits
+        );
     }
 
     /// The `--sql-max-query-bytes` value threaded through `GenerateConfig`/
@@ -757,7 +1248,7 @@ mod tests {
         let store = empty_store();
         let custom = DEFAULT_MAX_QUERY_BYTES * 4;
         assert_ne!(custom, DEFAULT_MAX_QUERY_BYTES);
-        let executor = cold_executor(&store, &[], custom).expect("build executor");
+        let executor = cold_executor(&store, &[], custom, 1, None).expect("build executor");
         assert_eq!(executor.config().max_query_bytes, custom);
     }
 
@@ -768,7 +1259,8 @@ mod tests {
     #[test]
     fn cold_executor_defaults_to_compiled_in_budget() {
         let store = empty_store();
-        let executor = cold_executor(&store, &[], DEFAULT_MAX_QUERY_BYTES).expect("build executor");
+        let executor =
+            cold_executor(&store, &[], DEFAULT_MAX_QUERY_BYTES, 1, None).expect("build executor");
         assert_eq!(executor.config().max_query_bytes, DEFAULT_MAX_QUERY_BYTES);
     }
 }

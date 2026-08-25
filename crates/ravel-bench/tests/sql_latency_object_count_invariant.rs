@@ -89,6 +89,7 @@ async fn l0_object_count_equals_distinct_data_object_keys() {
         records_per_object: 20,
         extra_attrs: 4,
         max_query_bytes: DEFAULT_MAX_QUERY_BYTES,
+        cache_bytes: 0,
     };
     let report = run_generated(&cfg).await.expect("generated lane runs");
 
