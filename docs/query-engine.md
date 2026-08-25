@@ -335,12 +335,33 @@ per step. Per-operator aggregation follows Prometheus 3.x: `sum`/`avg` over
 histogram elements produce histogram elements, `count` a float, and the
 operators Prometheus leaves undefined for histograms (`min`, `max`,
 `stddev`, `stdvar`, `quantile`, `topk`, `bottomk`) drop the histogram
-elements. `by`/`without` grouping preserves element type. The
-histogram-aware result is exposed by `Evaluator::eval_range_hist_annotated`;
-`Evaluator::eval_range_annotated` (and the current HTTP renderer) still
-project histogram elements away rather than render them as `0.0` floats, so
-the standard `histograms` field on range responses is future work (issue
-#579).
+elements and annotate the drop with an info
+(`HistogramIgnoredInAggregationInfo`, "ignored histogram in <op>
+aggregation"), never a silent drop. `by`/`without` grouping preserves
+element type.
+
+The range counter functions and the `_over_time` family carry histograms too
+(ADR-0108 decisions 4/5, issue #578). `rate`/`increase`/`delta` reduce a
+histogram window to a histogram element through the same
+`histogram_extrapolated_rate` reducer the instant arm uses.
+`sum_over_time`/`avg_over_time` produce a histogram element,
+`count_over_time` counts histogram samples as a float, `last_over_time`
+returns the newest histogram, and `present_over_time` is 1 for any non-empty
+window. The float-only members (`min`/`max`/`stddev`/`stdvar`/
+`quantile_over_time`, `predict_linear`, `irate`/`idelta`/`resets`/`changes`/
+`deriv`) drop a histogram-only window, matching the pinned Prometheus
+v3.13.1 binary exactly: its `if len(samples.Floats) == 0 { return }` early
+exit yields no element and, because that return precedes the
+histogram-ignored annotation, no annotation either. Both endpoints answer
+the same class of value: the instant dispatch fetches the histogram matrix
+alongside the float one, so a histogram-only series is no longer read as
+empty. `absent`/`absent_over_time` count a native-histogram sample as
+presence, so a histogram-only stream never reads as absent.
+
+The histogram-aware result is exposed by
+`Evaluator::eval_range_hist_annotated`; `Evaluator::eval_range_annotated`
+(and any float-only caller) projects histogram elements away rather than
+render them as `0.0` floats.
 
 The max-samples budget is **count-yielded**: samples are counted as the
 lazy k-way merge emits them (post-dedup), and the budget trips at exactly

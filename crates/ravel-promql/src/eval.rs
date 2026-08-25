@@ -53,6 +53,7 @@ use std::time::Instant;
 
 use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, TimeRange};
 
+use crate::histogram::TimedHistogram;
 use crate::matchers;
 use crate::source::{LabelMatcher, MatchOp, SeriesSource, SourceError};
 
@@ -388,6 +389,17 @@ pub(crate) fn possible_non_counter_info(metric_name: &str) -> String {
         "metric might not be a counter, name does not end in _total/_sum/_count/_bucket: \
          {metric_name:?}"
     )
+}
+
+/// Prometheus' `HistogramIgnoredInAggregationInfo` message: an aggregation
+/// with no defined native-histogram semantics
+/// (`min`/`max`/`stddev`/`stdvar`/`quantile`/`topk`/`bottomk`) encountered
+/// histogram members and dropped them (ADR-0108 decisions 2/6a). An info, not
+/// a warning, matching the pinned binary, which wraps `PromQLInfo`: any float
+/// members of the group still aggregate; only the histogram members are
+/// ignored. `aggregation` is the operator name (`"min"`, `"topk"`, ...).
+pub(crate) fn histogram_ignored_in_aggregation_info(aggregation: &str) -> String {
+    format!("ignored histogram in {aggregation} aggregation")
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -843,11 +855,11 @@ impl Evaluator {
                     self, source, call, start_ns, end_ns, step_ns, points, &ctx,
                 )?;
                 let matrix = if negate {
-                    negate_matrix(matrix)
+                    negate_hist_matrix(matrix)
                 } else {
                     matrix
                 };
-                RangeValue::Matrix(float_matrix_into_hist(matrix))
+                RangeValue::Matrix(matrix)
             }
             RangeCore::Generic(e) => {
                 let matrix =
@@ -1123,6 +1135,7 @@ impl Evaluator {
         ms: &promql_parser::parser::MatrixSelector,
         eval_ts_ns: i64,
         ctx: &QueryWindow,
+        keep_metric_name: bool,
     ) -> Result<HistogramMatrix, Error> {
         let selector_matchers = build_matchers(&ms.vs)?;
         let sel_ts_ns = selector_eval_ts(&ms.vs, eval_ts_ns, ctx)?;
@@ -1143,7 +1156,12 @@ impl Evaluator {
                 .map(|sample| (sample.ts_ns, sample.value))
                 .collect();
             if !samples.is_empty() {
-                out.push((drop_metric_name(s.labels), samples));
+                let labels = if keep_metric_name {
+                    s.labels
+                } else {
+                    drop_metric_name(s.labels)
+                };
+                out.push((labels, samples));
             }
         }
         Ok(out)
@@ -1284,8 +1302,8 @@ impl Evaluator {
         points: u64,
         ctx: &QueryWindow,
         keep_metric_name: bool,
-        reduce: impl Fn(&[Sample], i64, i64, i64, i64) -> Option<f64>,
-    ) -> Result<RangeMatrix, Error> {
+        reduce: impl Fn(&[Sample], &[TimedHistogram], i64, i64, i64, i64) -> Option<RangeSample>,
+    ) -> Result<HistogramAwareMatrix, Error> {
         let selector_matchers = build_matchers(&ms.vs)?;
         let offset_ns = signed_offset_ns(ms.vs.offset.as_ref())?;
         let at_ts_ns = resolve_at(ms.vs.at.as_ref(), ctx.start_ns, ctx.end_ns)?;
@@ -1345,17 +1363,63 @@ impl Evaluator {
                 if window_samples.is_empty() {
                     continue;
                 }
-                if let Some(value) = reduce(
+                if let Some(element) = reduce(
+                    window_samples,
+                    &[],
+                    *window_start,
+                    *sel_ts,
+                    range_ns,
+                    *reported_ts,
+                ) {
+                    out_samples.push(element);
+                }
+            }
+            if !out_samples.is_empty() {
+                let labels = if keep_metric_name {
+                    s.labels
+                } else {
+                    drop_metric_name(s.labels)
+                };
+                out.push((labels, out_samples));
+            }
+        }
+
+        // Native-histogram series matching the same selector, fetched once over
+        // the same combined window (ADR-0108 decisions 3/4/5: the histogram
+        // read channel rides alongside the float one, never per grid step). A
+        // series is either float or histogram in storage, so a histogram
+        // series never collides with a float series above; its window slice is
+        // reduced through the same closure with an empty float slice, letting
+        // each range-vector function pick its own histogram behavior (a
+        // histogram reduction, a float such as `count_over_time`, or a drop).
+        let hist_series = source.query_histograms(&selector_matchers, window)?;
+        for s in hist_series {
+            let live: Vec<TimedHistogram> =
+                s.samples.into_iter().map(|h| (h.ts_ns, h.value)).collect();
+
+            let mut lo = 0usize;
+            let mut hi = 0usize;
+            let mut out_samples = Vec::new();
+            for (reported_ts, sel_ts, window_start) in &grid {
+                while lo < live.len() && live[lo].0 <= *window_start {
+                    lo += 1;
+                }
+                while hi < live.len() && live[hi].0 <= *sel_ts {
+                    hi += 1;
+                }
+                let window_samples = &live[lo..hi];
+                if window_samples.is_empty() {
+                    continue;
+                }
+                if let Some(element) = reduce(
+                    &[],
                     window_samples,
                     *window_start,
                     *sel_ts,
                     range_ns,
                     *reported_ts,
                 ) {
-                    out_samples.push(Sample {
-                        ts_ns: *reported_ts,
-                        value,
-                    });
+                    out_samples.push(element);
                 }
             }
             if !out_samples.is_empty() {
@@ -1550,19 +1614,23 @@ fn negate_vector(v: InstantVector) -> InstantVector {
         .collect()
 }
 
-/// Negate every sample's value in a range matrix. Unlike [`negate_vector`],
-/// `__name__` is not dropped here: a function call's result labels already
-/// had it dropped unconditionally by
-/// [`Evaluator::eval_range_matrix_reduction`], before negation is even
-/// considered.
-fn negate_matrix(m: RangeMatrix) -> RangeMatrix {
+/// Negate every element of a [`HistogramAwareMatrix`], multiplying a
+/// native-histogram element's populations by -1 (exactly as [`negate_vector`]
+/// does per instant sample) and negating a float element's value. Unlike
+/// [`negate_vector`], `__name__` is left untouched: a function call's result
+/// labels already had it dropped unconditionally by
+/// [`Evaluator::eval_range_matrix_reduction`], before negation is considered.
+fn negate_hist_matrix(m: HistogramAwareMatrix) -> HistogramAwareMatrix {
     m.into_iter()
         .map(|(labels, samples)| {
             let negated = samples
                 .into_iter()
-                .map(|s| Sample {
-                    ts_ns: s.ts_ns,
-                    value: -s.value,
+                .map(|s| match s.histogram {
+                    Some(mut h) => {
+                        h.mul(-1.0);
+                        RangeSample::histogram(s.ts_ns, h)
+                    }
+                    None => RangeSample::scalar(s.ts_ns, -s.value),
                 })
                 .collect();
             (labels, negated)
