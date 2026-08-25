@@ -1110,7 +1110,10 @@ fn fixed_cols<'a>(
     views: &[ravel_rspan::ColumnarBlockView<'a>],
     col: u32,
 ) -> DFResult<Vec<ravel_rspan::BytesColumn<'a>>> {
-    views.iter().map(|v| v.fixed_column(col).map_err(corrupt)).collect()
+    views
+        .iter()
+        .map(|v| v.fixed_column(col).map_err(corrupt))
+        .collect()
 }
 
 /// Per-block string-column handles for `col`, one per view, in block order.
@@ -1118,7 +1121,10 @@ fn str_cols<'a>(
     views: &[ravel_rspan::ColumnarBlockView<'a>],
     col: u32,
 ) -> DFResult<Vec<ravel_rspan::BytesColumn<'a>>> {
-    views.iter().map(|v| v.str_column(col).map_err(corrupt)).collect()
+    views
+        .iter()
+        .map(|v| v.str_column(col).map_err(corrupt))
+        .collect()
 }
 
 /// Per-block i64-column handles for `col`, one per view, in block order.
@@ -1126,7 +1132,10 @@ fn i64_cols<'a>(
     views: &[ravel_rspan::ColumnarBlockView<'a>],
     col: u32,
 ) -> DFResult<Vec<ravel_rspan::I64Column<'a>>> {
-    views.iter().map(|v| v.i64_column(col).map_err(corrupt)).collect()
+    views
+        .iter()
+        .map(|v| v.i64_column(col).map_err(corrupt))
+        .collect()
 }
 
 /// Gather a required i64 column over `order`, erroring on a missing cell.
