@@ -115,7 +115,7 @@ node whose cache directory is deleted mid-flight answers every query correctly
 and only more slowly. There is no separate CLI flag for disk-tier capacity:
 each tier is bounded by the single `--cache-max-bytes` number.
 
-**Encryption at rest (ADR-0046 decision 6).** Bytes this process writes to the
+**Encryption at rest (ADR-0046 decision 7).** Bytes this process writes to the
 cache directory are **not** encrypted by the SSE-KMS object-storage path.
 SSE-KMS (`--s3-kms-key`, `--tenant-kms-config`) protects object bytes at rest
 in the store, not the bytes written to the local cache. An operator who needs

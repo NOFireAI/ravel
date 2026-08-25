@@ -190,7 +190,7 @@ The disk tier is opt-in and disposable: with no `--cache-dir` behavior is exactl
 as before, and a missing, full, or corrupt cache directory degrades to a store
 read, never a query error. Bytes written to the cache directory are **not**
 encrypted by Ravel, even with SSE-KMS configured for object storage (ADR-0046
-decision 6): SSE-KMS protects object bytes at rest in the store, not the local
+decision 7): SSE-KMS protects object bytes at rest in the store, not the local
 cache. If you need bytes-at-rest encryption for the cache directory, provide it
 at the filesystem/volume layer. `/metrics` splits each cache's `ravel_cache_*`
 counters by a `tier="ram"`/`tier="disk"` label once a disk tier is configured.

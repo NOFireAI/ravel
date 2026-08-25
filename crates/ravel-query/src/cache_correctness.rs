@@ -1043,13 +1043,14 @@ async fn rlog_the_same_tenant_reads_its_own_cached_bytes_without_consulting_the_
 // ---- ADR-0046 disk tier (issue #95) --------------------------------------
 //
 // The tests above wire a RAM-only `Cache` into each funnel through
-// `with_cache`, which is what every production caller builds today (a query
-// node has no disk tier until #97 wires `--cache-dir`). The tests below prove
-// the funnels are equally correct when `with_cache` is handed a `TieredCache`
-// (RAM over disk), the second configuration the `ReadCache` enum this task
-// introduced can hold. `SegmentFetcher`/`LogSegmentFetcher`/`BlockRangeFetcher`
-// accept either via `impl Into<ReadCache>`, so these construct the disk-backed
-// variant directly, exactly as #97's server wiring will.
+// `with_cache`, which is what a process with no `--cache-dir` builds (#97
+// wired the flag to attach a disk tier; absent, behavior is exactly this).
+// The tests below prove the funnels are equally correct when `with_cache` is
+// handed a `TieredCache` (RAM over disk), the second configuration the
+// `ReadCache` enum this task introduced can hold. `SegmentFetcher`/
+// `LogSegmentFetcher`/`BlockRangeFetcher` accept either via
+// `impl Into<ReadCache>`, so these construct the disk-backed variant
+// directly, exactly as #97's server wiring does.
 
 /// Generous limits: nothing this suite's fixtures produce is evicted or refused.
 fn generous_cache_limits() -> CacheLimits {

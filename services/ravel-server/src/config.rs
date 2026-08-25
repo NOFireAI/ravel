@@ -694,7 +694,7 @@ pub struct Cli {
     /// required to exist; a missing, full, or corrupt cache directory degrades
     /// to a store read, never a query error.
     ///
-    /// Encryption posture (ADR-0046 decision 6): bytes this process writes to
+    /// Encryption posture (ADR-0046 decision 7): bytes this process writes to
     /// this directory are NOT encrypted by the SSE-KMS object-storage path.
     /// SSE-KMS protects object bytes at rest in the store, not the local cache.
     /// An operator who needs bytes-at-rest encryption for the cache directory
@@ -2288,7 +2288,7 @@ impl Cli {
         // byte cache, each bounded by `--cache-max-bytes`. No validation is
         // needed here; an unusable directory degrades to a store read rather
         // than a startup failure. Bytes written there are not SSE-KMS encrypted
-        // (ADR-0046 decision 6, documented on the flag above).
+        // (ADR-0046 decision 7, documented on the flag above).
 
         // A key file and the unkeyed opt-out are contradictory: one selects
         // the keyed derivation, the other refuses it. There is no meaningful

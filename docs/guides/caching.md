@@ -65,7 +65,7 @@ is deleted mid-flight answers every query correctly and only more slowly.
 Nothing durable is ever written there, and a cache directory from a previous
 release is discarded and rebuilt rather than repaired.
 
-**Encryption at rest (ADR-0046 decision 6).** Bytes written to the cache
+**Encryption at rest (ADR-0046 decision 7).** Bytes written to the cache
 directory are **not** encrypted by Ravel, even with SSE-KMS configured for
 object storage. SSE-KMS protects object bytes at rest in the store, not the
 local cache. If you need bytes-at-rest encryption for the cache directory,
