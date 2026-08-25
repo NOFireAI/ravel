@@ -189,7 +189,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties, RecordBatchStream,
     SendableRecordBatchStream,
 };
-use futures::Stream;
+use futures::{Stream, StreamExt, TryStreamExt};
 use ravel_catalog::SegmentRef;
 use ravel_logseg::{
     AttrColumn, ColumnSelection, ColumnarBlockView, FieldSel, FieldType, LogRecord, Predicate,
@@ -748,13 +748,15 @@ impl ExecutionPlan for LogsScanExec {
 
         // The block-level assignment needs each segment's surviving-block count,
         // which a prune must produce (async). The first partition to poll runs
-        // that prune for every segment through the shared `counts` cell; the
-        // rest await its result. Building the future here (not awaiting it)
-        // keeps `execute` synchronous, as DataFusion requires.
+        // that prune for every segment through the shared `counts` cell, with
+        // as many prunes in flight as the scan has partitions; the rest await
+        // its result. Building the future here (not awaiting it) keeps
+        // `execute` synchronous, as DataFusion requires.
         let counts_fut = plan_counts_future(
             Arc::clone(&self.counts),
             Arc::clone(&ctx),
             Arc::clone(&self.segments),
+            self.target_partitions,
         );
 
         Ok(Box::pin(LogScanStream {
@@ -812,33 +814,54 @@ fn plan_counts_future(
     cell: Arc<OnceCell<Arc<PlanCounts>>>,
     ctx: Arc<PartitionCtx>,
     segments: Arc<Vec<SegmentRef>>,
+    plan_concurrency: usize,
 ) -> CountsFuture {
     Box::pin(async move {
         let counts = cell
-            .get_or_try_init(|| compute_plan_counts(&ctx, &segments))
+            .get_or_try_init(|| compute_plan_counts(&ctx, &segments, plan_concurrency))
             .await?;
         Ok(Arc::clone(counts))
     })
 }
 
 /// Prune every segment once (no block decode) to build the shared block plan.
-/// Sequential on purpose: the reads are single-flight coalesced with the
-/// per-partition scans that follow -- on the whole object's key below the
-/// ADR-0107 block-range threshold, and per extent (probe, sections, blocks)
-/// above it -- and this runs once per query, not per partition.
+///
+/// The prunes run `plan_concurrency` at a time (`buffered`, so `segs` keeps
+/// snapshot order and [`owned_work`] can index it by segment position). Every
+/// partition awaits this whole pass before it drains anything, so the plan
+/// phase sits alone on the query's critical path: run serially it costs one
+/// object-store round trip per segment in sequence (issue #691 measured about
+/// 20 minutes per statement on 8424 objects, one GET in flight for the whole
+/// time). Concurrency here changes only how many of those reads are in flight,
+/// never their count (still one plan read sequence per segment) or their
+/// semantics (the first error aborts the plan, and `get_or_try_init` does not
+/// cache it); the fetcher's own in-flight GET semaphore remains the global
+/// bound, so an oversized `plan_concurrency` is safe.
 async fn compute_plan_counts(
     ctx: &PartitionCtx,
     segments: &[SegmentRef],
+    plan_concurrency: usize,
 ) -> DFResult<Arc<PlanCounts>> {
+    // Not-yet-polled futures, one per segment, so `buffered` decides how many
+    // run at once. Built with a loop rather than a `map` closure: a closure
+    // returning a future that borrows its argument cannot satisfy the
+    // higher-ranked bound this `Send` boxed future needs.
+    let mut prunes = Vec::with_capacity(segments.len());
+    for seg in segments {
+        prunes.push(
+            ctx.fetcher
+                .plan_segment(seg, ctx.tenant_hash, &ctx.query, &ctx.accounting),
+        );
+    }
+    let planned: Vec<Option<(usize, ScanStats)>> = futures::stream::iter(prunes)
+        .buffered(plan_concurrency.max(1))
+        .map_err(SqlError::from)
+        .try_collect()
+        .await?;
     let mut segs = Vec::with_capacity(segments.len());
     let mut total_blocks = 0usize;
-    for seg in segments {
-        let planned = ctx
-            .fetcher
-            .plan_segment(seg, ctx.tenant_hash, &ctx.query, &ctx.accounting)
-            .await
-            .map_err(SqlError::from)?;
-        match planned {
+    for entry in planned {
+        match entry {
             Some((survivors, stats)) => {
                 total_blocks += survivors;
                 segs.push(Some(SegPlan { survivors, stats }));
