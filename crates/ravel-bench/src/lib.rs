@@ -3,6 +3,8 @@
 
 pub mod bench_env;
 pub mod codecs;
+#[cfg(feature = "parquet-baseline")]
+pub mod columnar_load;
 pub mod concurrent;
 pub mod distrib_crossover;
 pub mod e2e;
