@@ -24,12 +24,16 @@ original.
 
 The millisecond figures the harness prints **do not reproduce across hosts**:
 they depend on CPU, memory, and — by an order of magnitude — on the object-store
-backend (local filesystem vs MinIO vs S3). Only **ratios within one run** are
-comparable: query A versus query B, cold versus warm, pre- versus
-post-compaction, one `--batch-rows` layout versus another. That is why every
-report carries its own provenance (backend, region/endpoint, host logical cores,
-dataset id, runs). A latency table without its backend named will mislead the
-first person who compares two runs.
+backend (local filesystem vs MinIO vs S3). They do not reproduce across two
+instances of the same type either: issue #680 measured a 1.6x to 2x gap between
+two c6a.4xlarge boxes at identical settings. So the safe default is that only
+**ratios within one run** are comparable: query A versus query B, cold versus
+warm, pre- versus post-compaction, one `--batch-rows` layout versus another.
+Two reports go side by side only when they tick the comparability checklist in
+"Reading a report against ClickBench" below. That is why every report carries
+its own provenance (backend, region/endpoint, host logical cores, dataset id,
+runs, `cache_bytes`, `deadline_secs`, `fetch_concurrency`). A latency table
+without its backend named will mislead the first person who compares two runs.
 
 Prior to #677 the `--tenant` lane resolved shard 0 only, so any earlier
 multi-shard report understates the dataset (it measured, and reported an object
@@ -214,7 +218,9 @@ cargo run -p ravel-bench --features sql-latency --bin sql_latency_bench -- \
 - `--corpus benchmarks/clickbench/hits.corpus.json` runs the checked-in
   ClickBench suite instead of the default Ravel corpus. It is parse- and
   construct-gated before the first query, exactly like the checked-in set.
-- `--runs 3` is ClickBench's convention: three runs, first flagged cold.
+- `--runs 3` is ClickBench's convention: three runs, first flagged cold. How
+  those three map onto ClickBench's published cold and hot columns is in
+  "Reading a report against ClickBench" below.
 - `--compaction pre|post` labels which layout you measured (freshly loaded, or
   after the maintenance machinery compacted it). Both are legitimate; the delta
   between them is itself a finding, so the report states which one it is.
@@ -314,7 +320,8 @@ The bench prints the full report as JSON, then a human table. Per statement:
 
 - **min / median / max ms** over the `--runs` executions, and **cold ms** (the
   first run, against a fresh `Catalog` + `SqlExecutor` per statement so it is
-  genuinely cold). Ratios only — see the reproducibility note above.
+  genuinely cold). Ratios only, unless both runs tick the comparability
+  checklist below; see the reproducibility note above.
 - **rows returned.**
 - **scan diagnostics**, which say *where* the time went rather than only that it
   was slow: `segments`, `blocks_total`, `blocks_scanned`,
@@ -333,7 +340,51 @@ Dataset-level, independent of any one query:
 - **rows** and the **pre-/post-compaction layout label**.
 
 Provenance (backend, region, endpoint, host logical cores, source, dataset id,
-runs) is recorded beside the numbers so two runs are comparable or provably not.
+runs, `cache_bytes`, `deadline_secs`, `fetch_concurrency`) is recorded beside
+the numbers so two runs are comparable or provably not.
+
+## Reading a report against ClickBench
+
+ClickBench's published tables come from running each query three times on one
+node with a warm local disk, reporting all three. The table's "cold" column is
+run 1 and its "hot" column is the best of runs 2 and 3. Ravel's analogue is
+`--runs 3`: `cold_ms` is run 1 against a fresh executor, catalog, and fetcher
+cache, and the hot figure is `min_ms` taken over runs 2 and 3, which are served
+from the ADR-0046 read cache attached with `--cache-bytes`. State it plainly in
+the report: a run without `--cache-bytes` has no hot column at all, because
+every run re-reads the object store and the three numbers measure the cold path
+three times. A `--runs 1` report is a discovery pass, not a table.
+
+### Comparability checklist
+
+Tick every line before putting two reports side by side.
+
+- Same instance type and the same instance. Issue #680 measured a 1.6x to 2x
+  gap between two c6a.4xlarge boxes at identical settings, so a cross-box
+  comparison carries the box id or it carries nothing.
+- Same `fetch_concurrency`, `cache_bytes`, `deadline_secs`, and
+  `sql_max_query_bytes`. The first three are in the provenance; the last is the
+  DataFusion pool ceiling the run was given.
+- Same allocator. An `LD_PRELOAD` of tcmalloc against the default glibc changes
+  peak RSS by about 2x, and the allocator is not in the provenance, so it goes
+  in the report's caption.
+- Same dataset stanza: object count, rows, and the layout label from
+  `--compaction`.
+
+### Reading `failed`
+
+A `query memory budget exhausted` failure is a statement the DataFusion pool
+could not hold, not a scan failure, and that pool is `--sql-max-query-bytes`. A
+`wall deadline` failure is `--deadline-secs`. Neither is a number, and neither
+is omitted from the table: they stay as rows that say why there is no number.
+
+### The per-statement `scan` block
+
+`object_store_bytes` and `object_store_get_requests` are the cost the cold
+column paid. A full-window statement over an N-object tenant reads every
+object, because the plan phase reads the whole dataset; issues #693 and #699
+are the two open changes to that. So the figure to compare across runs is bytes
+per second at the reported `host_logical_cores`, not the statement's row count.
 
 ## Gap list: ClickBench statements the construct gate rejects
 
