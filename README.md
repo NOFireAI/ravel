@@ -278,8 +278,8 @@ hold Ravel to them:
   OTLP, OTAP and Remote Write decode, ingest actors, PromQL, the query engine,
   and DataFusion-backed SQL.
 - `services/` contains `ravel-server` (gateway, ingest, query, and maintain modes
-  in one binary), `ravel-cli` (a segment, commit, and catalog inspector), and the
-  Kubernetes operator.
+  in one binary), `ravel-cli` (a segment, commit, and catalog inspector, and the
+  Parquet bulk loader), and the Kubernetes operator.
 - `docs/` contains specs, decision records, diagrams, and guides.
 - `deploy/` contains the quickstart compose stack, the Collector and Grafana
   provisioning, and Kubernetes manifests.
