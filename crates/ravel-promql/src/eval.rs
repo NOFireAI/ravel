@@ -2683,6 +2683,41 @@ mod tests {
     }
 
     #[test]
+    fn range_rate_over_a_histogram_does_not_raise_the_non_counter_info() {
+        // A native histogram carries its own counter-reset hint, so Prometheus
+        // does not apply the metric-name heuristic to it: `rate()` over a
+        // histogram series raises no `PossibleNonCounterInfo` even though the
+        // name lacks a counter suffix. The instant arm gets this for free by
+        // reducing floats and histograms into separate values; the range arm
+        // puts both in one matrix, so it emitted the info for a
+        // histogram-only selector. Caught by #580's corpus on its first CI run
+        // as `native_histogram_rate_range`: prometheus=false ravel=true.
+        let source = TestSource::new()
+            .with_histogram_series(
+                &[("__name__", "diff_native_hist")],
+                &[
+                    (minutes(1) * NS_PER_MS, nh(2.0, 10.0)),
+                    (minutes(4) * NS_PER_MS, nh(6.0, 40.0)),
+                ],
+            )
+            .expect("valid histogram series");
+        let (_value, annotations) = Evaluator::new()
+            .eval_range_hist_annotated(
+                &source,
+                "rate(diff_native_hist[5m])",
+                minutes(5),
+                minutes(5),
+                minutes(1),
+            )
+            .expect("range evaluates");
+        assert!(
+            annotations.infos().is_empty(),
+            "no non-counter-name info for a histogram rate: {:?}",
+            annotations.infos()
+        );
+    }
+
+    #[test]
     fn range_selector_serves_native_histogram_elements() {
         // A bare native-histogram range selector must produce a matrix of
         // histogram elements, not vanish. Before the fix `eval_range_selector`
