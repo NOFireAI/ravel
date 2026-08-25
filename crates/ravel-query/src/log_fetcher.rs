@@ -42,8 +42,9 @@
 use std::sync::Arc;
 
 use crate::erasure::ErasurePredicate;
+use crate::fetcher::ReadCache;
 use bytes::Bytes;
-use ravel_cache::{Cache, CacheKey, SingleFlightError};
+use ravel_cache::{CacheKey, SingleFlightError, Source};
 use ravel_catalog::SegmentRef;
 use ravel_logseg::footer::{self, SectionDesc, kind};
 use ravel_logseg::skip_index::SkipIndex;
@@ -430,8 +431,10 @@ pub struct LogSegmentFetcher {
     /// needs. `fetch`/`fetch_accounted` never consult it and are unchanged by
     /// its presence: the one production `LogSegmentFetcher` is shared across
     /// all tenants (`services/ravel-server/src/query.rs`), so caching cannot
-    /// be wired into a method with no per-call tenant identity.
-    cache: Option<Arc<Cache<crate::fetcher::CacheFetchError>>>,
+    /// be wired into a method with no per-call tenant identity. Either tier
+    /// configuration (see [`ReadCache`]); every production caller builds the
+    /// RAM variant.
+    cache: Option<ReadCache>,
     /// Object size above which a tenant-aware fetch reads only the
     /// pruning-relevant blocks through [`Self::block_range`] instead of the
     /// whole object (ADR-0107). At or below it the whole-object path in
@@ -465,11 +468,15 @@ impl LogSegmentFetcher {
 
     /// Wires ADR-0046's read cache into
     /// [`fetch_accounted_with_tenant`](Self::fetch_accounted_with_tenant) and,
-    /// per block, into the block-range path (ADR-0107 decision 3).
+    /// per block, into the block-range path (ADR-0107 decision 3). Accepts
+    /// either tier configuration through [`ReadCache`] (an `Arc<Cache<..>>` or
+    /// an `Arc<TieredCache<..>>` both convert via [`From`]), so existing call
+    /// sites are unchanged.
     #[must_use]
-    pub fn with_cache(mut self, cache: Arc<Cache<crate::fetcher::CacheFetchError>>) -> Self {
-        self.cache = Some(cache.clone());
-        self.block_range = self.block_range.with_cache(cache);
+    pub fn with_cache(mut self, cache: impl Into<ReadCache>) -> Self {
+        let cache = cache.into();
+        self.block_range = self.block_range.with_cache(cache.clone());
+        self.cache = Some(cache);
         self
     }
 
@@ -960,42 +967,46 @@ impl LogSegmentFetcher {
         };
 
         let cache_key = CacheKey::new(tenant_hash.0, seg_ref.content_hash, 0, seg_ref.object_size);
-        let bytes = if let Some(bytes) = cache.get(&cache_key) {
-            accounting.record_cache_hit();
-            accounting.add_cache_bytes(bytes.len() as u64);
-            // Served from cache: no S3 GET on this call.
-            fetch_span.record("s3_requests", 0u64);
-            fetch_span.record("s3_bytes", 0u64);
-            bytes
-        } else {
-            accounting.record_cache_miss();
-            let bytes = async {
-                cache
-                    .get_or_fetch(cache_key, || async move {
-                        let got = self.store.get(key, GetRange::Full).await?;
-                        accounting.record_s3_request(AccountedOp::Get);
-                        accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
-                        Ok(got.data)
-                    })
-                    .await
+        // One read-through call, accounted from the returned [`Source`]: a
+        // single call avoids the peek-then-`get_or_fetch` double-count on the
+        // tiered tier (see [`ReadCache::get_or_fetch`]).
+        let (bytes, source) = async {
+            cache
+                .get_or_fetch(cache_key, || async move {
+                    let got = self.store.get(key, GetRange::Full).await?;
+                    accounting.record_s3_request(AccountedOp::Get);
+                    accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
+                    Ok(got.data)
+                })
+                .await
+        }
+        .instrument(fetch_span.clone())
+        .await
+        // Shared with the block-range path's mapping, which is the only one
+        // whose closure can produce the `EtagChanged`/`Corrupt` classes: this
+        // funnel's closure is one unconditional whole-object GET that
+        // verifies nothing, so those arms are unreachable here rather than
+        // wrong.
+        .map_err(|err| from_cache_error(key, err))?;
+        match source {
+            Source::Cache => {
+                accounting.record_cache_hit();
+                accounting.add_cache_bytes(bytes.len() as u64);
+                // Served from cache: no S3 GET on this call.
+                fetch_span.record("s3_requests", 0u64);
+                fetch_span.record("s3_bytes", 0u64);
             }
-            .instrument(fetch_span.clone())
-            .await
-            // Shared with the block-range path's mapping, which is the only one
-            // whose closure can produce the `EtagChanged`/`Corrupt` classes: this
-            // funnel's closure is one unconditional whole-object GET that
-            // verifies nothing, so those arms are unreachable here rather than
-            // wrong.
-            .map_err(|err| from_cache_error(key, err))?;
             // A miss issues one store GET for the resulting bytes. A
             // single-flight follower that rode another caller's GET is the
             // rare exception; recording one GET here still bounds this call's
             // own attribution and never under-counts the query total, which is
             // what the span is for.
-            fetch_span.record("s3_requests", 1u64);
-            fetch_span.record("s3_bytes", bytes.len() as u64);
-            bytes
-        };
+            Source::Upstream => {
+                accounting.record_cache_miss();
+                fetch_span.record("s3_requests", 1u64);
+                fetch_span.record("s3_bytes", bytes.len() as u64);
+            }
+        }
         Ok(Some(bytes))
     }
 
@@ -1328,8 +1339,9 @@ pub struct BlockRangeFetcher {
     store: Arc<dyn ObjectStoreBackend>,
     cfg: RlogConfig,
     /// ADR-0046's read cache, consulted per block (decision 3) and per directory
-    /// section. `None` sends every GET to the store.
-    cache: Option<Arc<Cache<crate::fetcher::CacheFetchError>>>,
+    /// section. `None` sends every GET to the store. Either tier configuration
+    /// (see [`ReadCache`]); every production caller builds the RAM variant.
+    cache: Option<ReadCache>,
     suffix_len: u64,
     coalesce_gap: u64,
     whole_object_threshold: u64,
@@ -1360,8 +1372,8 @@ impl BlockRangeFetcher {
     }
 
     #[must_use]
-    pub fn with_cache(mut self, cache: Arc<Cache<crate::fetcher::CacheFetchError>>) -> Self {
-        self.cache = Some(cache);
+    pub fn with_cache(mut self, cache: impl Into<ReadCache>) -> Self {
+        self.cache = Some(cache.into());
         self
     }
 
@@ -1501,13 +1513,11 @@ impl BlockRangeFetcher {
             return Ok((got.data, true));
         };
         let cache_key = CacheKey::new(tenant_hash.0, seg_ref.content_hash, start, len);
-        if let Some(bytes) = cache.get(&cache_key) {
-            accounting.record_cache_hit();
-            accounting.add_cache_bytes(bytes.len() as u64);
-            return Ok((bytes, false));
-        }
-        accounting.record_cache_miss();
-        let bytes = cache
+        // One read-through call, accounted from the returned [`Source`]: a single
+        // call avoids the peek-then-`get_or_fetch` double-count on the tiered
+        // tier (see [`ReadCache::get_or_fetch`]). The returned flag is `live`
+        // (this call crossed the network), which is [`Source::Upstream`].
+        let (bytes, source) = cache
             .get_or_fetch(cache_key, || async move {
                 let got = self
                     .store_get_pinned(key, range, pin, accounting)
@@ -1518,7 +1528,17 @@ impl BlockRangeFetcher {
             })
             .await
             .map_err(|err| from_cache_error(key, err))?;
-        Ok((bytes, true))
+        match source {
+            Source::Cache => {
+                accounting.record_cache_hit();
+                accounting.add_cache_bytes(bytes.len() as u64);
+                Ok((bytes, false))
+            }
+            Source::Upstream => {
+                accounting.record_cache_miss();
+                Ok((bytes, true))
+            }
+        }
     }
 
     /// Fetch one segment's object as an assembled, decode-ready buffer, reading
@@ -1967,8 +1987,17 @@ impl BlockRangeFetcher {
         // the fetch and already holds every block of the run; `None` means it
         // followed another caller's in-flight GET.
         let led: std::sync::OnceLock<(Vec<(u64, Bytes)>, u64)> = std::sync::OnceLock::new();
+        // `fetch_peeked`, not `get_or_fetch`: fetch_blocks already peeked every
+        // block of this run with `cache.get` (the one accounted miss), so a
+        // second read-through here would re-peek and double-count the miss on
+        // the tiered tier. The RAM tier's `fetch_peeked` is its miss-only
+        // `get_or_fetch` and keeps single-flight (concurrent partitions collapse
+        // onto one leader); the tiered tier runs the fetch and `insert`s with no
+        // second miss. Either way `led` is set inside the closure iff THIS call
+        // ran it, so `led.get().is_some()` still distinguishes leader from
+        // follower.
         let lead_bytes = cache
-            .get_or_fetch(lead_key, || async {
+            .fetch_peeked(lead_key, || async {
                 let got = self
                     .store_get_pinned(key, range, pin, accounting)
                     .await
@@ -2022,8 +2051,11 @@ impl BlockRangeFetcher {
                 continue;
             }
             accounting.record_cache_miss();
+            // `fetch_peeked` for the same reason as the lead above: this block
+            // was just peeked with `cache.get`, so the deferred fetch must not
+            // re-count the miss on the tiered tier.
             let bytes = cache
-                .get_or_fetch(block_key, || async {
+                .fetch_peeked(block_key, || async {
                     let got = self
                         .store_get_pinned(
                             key,

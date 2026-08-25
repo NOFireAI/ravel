@@ -4959,6 +4959,7 @@ dependencies = [
  "ravel-types",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "tonic",
