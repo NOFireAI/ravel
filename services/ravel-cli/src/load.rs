@@ -2147,6 +2147,7 @@ fn str_column_dict_from_cells(cells: &[AttrValue]) -> StrColumnDict {
 /// winner/residual split, and the stream directory is the same id-ascending
 /// dense form. Admission rejections match `build_record`'s per-row check order
 /// and report the first failing row's FILE-absolute index.
+/// Build one `ColumnarLogBatch` from decoded Parquet spans (issue #689).
 fn build_columnar_batch(
     spans: &[(RecordBatch, u64)],
     mapping: &Mapping,
