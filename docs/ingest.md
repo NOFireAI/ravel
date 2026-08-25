@@ -700,6 +700,72 @@ also visible and grows with shared-label cardinality. The only object-store
 work is the CRC32C over the in-memory PUT; a real S3 backend adds network
 I/O this in-memory profile omits.
 
+## CPU cost of the columnar load path vs the row path (measured)
+
+ADR-0109 replaced the bulk loader's per-row write path
+(`LogIngestRouter::write`, which pivots each row into columns inside the RLOG
+writer) with a columnar fast path (`LogIngestRouter::write_columnar`, which
+stages contiguous per-column arrays and skips the `write_block` gather and the
+per-attribute `column_of` probe). Decision 8 of that ADR *argued from a
+microbench ratio* that removing the pivot addresses roughly 78 points of load
+CPU; no end-to-end number had ever been measured. This is the first one
+(`ravel-bench`'s `columnar_load_compare` bin, issue #606).
+
+- Host: x86_64, AMD EPYC-Rome, 8 logical cores, ~15 GiB RAM. Build profile:
+  `release`.
+- Workload: a synthetic ClickBench-shaped Parquet sample (integer-heavy with a
+  string minority, values derived from row/column indices) decoded once and
+  loaded through both paths on a fresh in-process router and `MemoryStore`
+  each. `--shards 1` (whole corpus on one shard, so the differential is the
+  write-path pivot alone and not shard fan-out), `--batch-rows 10000`
+  (one RLOG object per batch, Strict acks).
+- CPU is process user+system time from `/proc/self/stat` across the write loop
+  only; the Parquet decode and the columnar-batch build both happen before the
+  timed region, exactly as the shipping loader builds its columnar batch in the
+  decode task off the flush critical path.
+
+Measured, at two column widths (three runs each at 100 columns, two at 300):
+
+| corpus | rows | row-path write CPU | columnar-path write CPU | pivot share of row write CPU |
+|---|---|---|---|---|
+| 100 attribute columns (ClickBench width) | 50,000 | ~7.0-7.5 s | ~7.3-7.5 s | **-4% to +1% (no measurable reduction)** |
+| 300 attribute columns (exaggerated width) | 20,000 | ~13.7-14.0 s | ~11.8-12.1 s | ~14-16% |
+
+At the ClickBench-representative ~100-column shape the columnar path is within
+run-to-run noise of the row path (if anything marginally slower); a reduction
+only becomes visible (~15%) at 300 columns, three times wider than ClickBench's
+~105. The saving scales super-linearly with column count, consistent with the
+removed cost being the quadratic gather, but that quadratic term is not yet a
+large share of the full object build at ClickBench width: the columnar path
+still pays the per-row merged-view/`attrs_raw` derivation `build_object_columnar`
+retains, plus block framing, compression, indexing, and the object PUT, none of
+which the pivot removal touches.
+
+What this measurement supports and what it does not:
+
+- **It is a local differential on a bounded synthetic sample, not the
+  ClickBench reference figure.** The reference-box run (c6a.4xlarge, full
+  `hits.parquet`, S3) is deliberately out of scope. Nothing here should be read
+  as the reference result.
+- **It measures the epic WITHOUT ADR-0109 decision 3 contributing.** The
+  columnar batch is built through `ColumnarLogBatch::from_records`, which
+  attaches no dictionaries, so the dictionary-preserving column and
+  dictionary-aware bloom path never engages -- exactly as it fails to engage on
+  ClickBench-shaped plain-`BYTE_ARRAY` Parquet (issue #660, arrow-rs fuses the
+  column's dictionary away on decode). Decision 8's arithmetic counted those
+  savings; this number does not include them.
+- **The store is in-memory.** S3 latency, multi-shard fan-out scaling, and real
+  PUT round trips are invisible to this harness; the CRC32C over the in-memory
+  PUT is the only object-store work timed. The differential also excludes the
+  Parquet decode (shared by both paths), so it reports the pivot's share of the
+  *write* CPU, not of end-to-end load CPU, which is lower again.
+- The isolated microbench decision 8 rests on is
+  `crates/ravel-logseg/benches/wide_gather.rs`: on this host (`--quick`) the
+  gather is ~23% of `write_block` at 10 columns and ~99% of it at 105
+  (gather 413 ms vs `write_block` 419 ms). The gather dominating the isolated
+  block encode does **not** translate into a proportional end-to-end write-path
+  saving at that width, which is the gap this measurement exposes.
+
 ## Metrics (self-observability)
 
 `IngestMetrics` (crates/ravel-ingest/src/metrics.rs) exposes process-global

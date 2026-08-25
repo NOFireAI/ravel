@@ -240,6 +240,15 @@ path = "src/bin/read_path_accounting.rs"
 required-features = ["parquet-baseline"]
 bench = false
 
+# ADR-0109 (#606) differential load bench: row path vs columnar fast path.
+# Behind `parquet-baseline` because it reads its bounded sample through the
+# arrow/parquet reader that feature gates.
+[[bin]]
+name = "columnar_load_compare"
+path = "src/bin/columnar_load_compare.rs"
+required-features = ["parquet-baseline"]
+bench = false
+
 [[bin]]
 name = "flight_sql_egress"
 path = "src/bin/flight_sql_egress.rs"
@@ -273,6 +282,15 @@ bench = false
 [[test]]
 name = "read_accounting"
 path = "tests/read_accounting.rs"
+bench = false
+
+# ADR-0109 (#606) acceptance test: the differential harness must drive both the
+# row and columnar paths over the same input, proven by the two reachability
+# counters. Behind `parquet-baseline` for the same reason as the bin above.
+[[test]]
+name = "columnar_load_compare"
+path = "tests/columnar_load_compare.rs"
+required-features = ["parquet-baseline"]
 bench = false
 
 [[test]]

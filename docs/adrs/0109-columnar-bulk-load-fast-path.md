@@ -259,6 +259,44 @@ not a production profile. Wave 1 lands that microbench as a permanent
 measurement is a before-and-after on the reference box, not this
 arithmetic.
 
+**Measured (issue #606): the arithmetic above does not hold at ClickBench
+width.** The first end-to-end differential between the two write paths
+contradicts the leap from the gather microbench ratio to "roughly 78 points of
+load CPU". It is a local figure (`ravel-bench`'s `columnar_load_compare`,
+x86_64 EPYC-Rome, 8 cores, release, in-memory `MemoryStore`, `--shards 1`) on a
+bounded synthetic ClickBench-shaped sample, not the reference-box result, and
+it deliberately excludes decision 3's dictionary path (which does not engage on
+plain-`BYTE_ARRAY` ClickBench Parquet anyway, issue #660) and all S3, multi-
+shard, and real-PUT cost:
+
+- At ~100 attribute columns (ClickBench's shape) the columnar path shows **no
+  measurable write-path CPU reduction** over the row path -- three runs at
+  50,000 rows landed between -4% and +1%, i.e. within run-to-run noise, the
+  columnar path if anything marginally slower.
+- A reduction appears only at 300 attribute columns (~14-16%, three times
+  wider than ClickBench). The saving scales super-linearly with column count,
+  consistent with the removed cost being the quadratic gather, but that term is
+  not a large share of the full object build at ClickBench width.
+
+The microbench this decision rests on is real and reproduces: on the same host
+`wide_gather` (`--quick`) puts the isolated gather at ~99% of `write_block` at
+105 columns (413 ms vs 419 ms) and ~23% at 10. What does not survive is the
+inference from that ratio to the end-to-end load. Two costs the arithmetic
+counted as removed are still paid on the landed columnar path: `resolve_row`'s
+per-row merged-view and `attrs_raw` derivation is reproduced per row inside
+`build_object_columnar` (only the `column_of` probe and the gather change
+shape), and the columnar block build materializes a dense per-column value
+matrix whose copies replace part of the gather it removes. The 25-35%-of-CPU
+remainder and the "under 10 minutes on 16 cores" wall-time target are therefore
+**not confirmed by this measurement**; whether they hold on the reference box
+with the full ClickBench corpus and decision 3 engaged remains the open
+before-and-after that measurement (still unpaid here) is meant to answer. This
+result is not evidence the fast path is worthless -- it removes a genuinely
+quadratic cost and it wins at high column counts -- but it is evidence that the
+specific magnitude decision 8 predicted does not appear at ClickBench width in
+the write path this harness can see. See docs/ingest.md ("CPU cost of the
+columnar load path vs the row path (measured)") for the full method and scope.
+
 ## Rejected alternatives
 
 **Bypass the router: have the CLI build and commit RLOG objects directly.**
