@@ -279,18 +279,25 @@ impl ReadCache {
     /// fetch): run `fetch` and admit the result, WITHOUT recording a second miss
     /// on top of the peek's.
     ///
+    /// Both tiers single-flight concurrent callers onto one `fetch` while
+    /// keeping the caller's earlier `get` as the one accounted miss, so
+    /// `BlockRangeFetcher`'s peek-then-defer pattern collapses concurrent
+    /// cross-partition misses of one extent onto a single upstream GET on either
+    /// variant (ADR-0102 decision 1, ADR-0046 decision 5).
+    ///
     /// The RAM tier uses its miss-only [`Cache::get_or_fetch`], which
     /// single-flights concurrent callers onto one `fetch` and never re-peeks, so
-    /// the caller's earlier `get` stays the one accounted miss while
-    /// cross-partition coordination is preserved (ADR-0102 decision 1). The
-    /// tiered tier cannot reuse `get_or_fetch` here: it peeks both tiers again,
-    /// which would record a SECOND miss for a key the caller already peeked
-    /// ([`TieredCache::get`]'s documented double-count pitfall). It therefore
-    /// runs `fetch` directly and admits via [`TieredCache::insert`] (no miss
-    /// recorded), the fetch-free discipline ADR-0046 prescribes for a
-    /// peeked-then-deferred key. `fetch`'s own coalescing -- `BlockRangeFetcher`
-    /// splits one range GET into per-block entries inside the closure -- is
-    /// unaffected either way.
+    /// the caller's earlier `get` stays the one accounted miss. The tiered tier
+    /// cannot reuse its own [`TieredCache::get_or_fetch`] here: that re-peeks
+    /// both tiers, recording a SECOND miss for a key the caller already peeked
+    /// ([`TieredCache::get`]'s documented double-count pitfall). It instead uses
+    /// [`TieredCache::resolve_peeked_miss`], which joins the same single-flight
+    /// as `get_or_fetch` (so concurrent callers coalesce onto one leader) but
+    /// skips the tier consultation and records no miss of its own, admitting the
+    /// fetched bytes to both tiers -- the fetch-free-on-peek discipline ADR-0046
+    /// prescribes for a peeked-then-deferred key. `fetch`'s own coalescing --
+    /// `BlockRangeFetcher` splits one range GET into per-block entries inside the
+    /// closure -- is unaffected either way.
     pub(crate) async fn fetch_peeked<F, Fut>(
         &self,
         key: CacheKey,
@@ -302,13 +309,7 @@ impl ReadCache {
     {
         match self {
             ReadCache::Ram(ram) => ram.get_or_fetch(key, fetch).await,
-            ReadCache::Tiered(tiered) => match fetch().await {
-                Ok(bytes) => {
-                    tiered.insert(key, bytes.clone());
-                    Ok(bytes)
-                }
-                Err(err) => Err(SingleFlightError::Upstream(err)),
-            },
+            ReadCache::Tiered(tiered) => tiered.resolve_peeked_miss(key, fetch).await,
         }
     }
 }
