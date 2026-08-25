@@ -36,6 +36,30 @@ fn hist(counts: &[f64], sum: f64) -> FloatHistogram {
     }
 }
 
+/// A positive-only histogram at an arbitrary `scale`, one span from
+/// `first_index`, `counts` consecutive buckets. Lets a test build two adjacent
+/// samples of one series at different schemas, the shape RSEG persists when a
+/// flush down-converts a scale to fit its bucket-count limit.
+fn hist_scale(scale: i32, first_index: i32, counts: &[f64], sum: f64) -> FloatHistogram {
+    let total: f64 = counts.iter().sum();
+    FloatHistogram {
+        counter_reset_hint: ResetHint::Unknown,
+        scale,
+        zero_threshold: 0.0,
+        zero_count: 0.0,
+        count: total,
+        sum,
+        positive_spans: vec![Span {
+            offset: first_index,
+            length: counts.len() as u32,
+        }],
+        negative_spans: Vec::new(),
+        positive_buckets: counts.to_vec(),
+        negative_buckets: Vec::new(),
+        custom_values: Vec::new(),
+    }
+}
+
 fn sec_ns(s: i64) -> i64 {
     s * 1_000_000_000
 }
@@ -352,6 +376,202 @@ fn deriv_over_a_pure_histogram_window_drops_with_no_annotation() {
     assert!(
         annos.is_empty(),
         "deriv's histogram drop carries no annotation: {annos:?}"
+    );
+}
+
+#[test]
+fn idelta_aligns_schemas_before_subtracting_adjacent_samples() {
+    // The two window samples carry DIFFERENT schemas: the earlier at scale 1
+    // (buckets at indices 1,2 = [1,2], which both fold into scale-0 index 1 for
+    // a rescaled total of 3), the later at scale 0 (index 1 = [10]). idelta must
+    // down-convert both to the coarser scale 0 before subtracting, so the result
+    // is the single bucket 10 - 3 = 7.
+    //
+    // The flipped assertion is `h.positive_buckets == [7.0]`: before the schema
+    // alignment fix, `sub_assign` combined the two operands' raw index maps with
+    // no rescale ({1:10} minus {1:1, 2:2}), producing the garbage two-bucket
+    // result [9.0, -2.0] instead.
+    let src = TestSource::new()
+        .with_histogram_series(
+            &[("__name__", "h")],
+            &[
+                (sec_ns(270), hist_scale(1, 1, &[1.0, 2.0], 3.0)),
+                (sec_ns(300), hist_scale(0, 1, &[10.0], 20.0)),
+            ],
+        )
+        .expect("valid series");
+    let got = Evaluator::new()
+        .instant(&src, "idelta(h[5m])", 5 * 60_000)
+        .expect("evaluates");
+    assert_eq!(got.len(), 1);
+    let h = got[0]
+        .histogram
+        .as_ref()
+        .expect("idelta over histograms yields a histogram element");
+    assert_eq!(h.scale, 0, "aligned to the coarser schema");
+    assert_eq!(
+        h.positive_buckets,
+        vec![7.0],
+        "schema-aligned single bucket 10 - 3, not the pre-fix garbage [9, -2]"
+    );
+    assert_eq!(
+        h.positive_spans,
+        vec![Span {
+            offset: 1,
+            length: 1
+        }]
+    );
+    assert_eq!(h.count, 7.0, "count 10 - 3");
+    assert_eq!(h.sum, 17.0, "sum 20 - 3");
+}
+
+#[test]
+fn irate_aligns_schemas_before_reset_detection_and_subtracting() {
+    // Same mismatched-schema pair as the idelta test, 30s apart. After aligning
+    // both to scale 0 the counts grow (3 -> 10) with no bucket shrink, so it is
+    // NOT a reset: irate subtracts (single bucket 10 - 3 = 7) and divides by the
+    // 30s interval, giving count 7/30.
+    //
+    // The flipped assertion is `h.count == 7/30`: before the fix, `detect_reset`
+    // was handed operands of different scales, which it treats as a schema
+    // change (a reset), so irate skipped the subtraction entirely and returned
+    // the later histogram alone divided by 30s, i.e. count 10/30.
+    let src = TestSource::new()
+        .with_histogram_series(
+            &[("__name__", "h")],
+            &[
+                (sec_ns(270), hist_scale(1, 1, &[1.0, 2.0], 3.0)),
+                (sec_ns(300), hist_scale(0, 1, &[10.0], 20.0)),
+            ],
+        )
+        .expect("valid series");
+    let got = Evaluator::new()
+        .instant(&src, "irate(h[5m])", 5 * 60_000)
+        .expect("evaluates");
+    assert_eq!(got.len(), 1);
+    let h = got[0]
+        .histogram
+        .as_ref()
+        .expect("irate over histograms yields a histogram element");
+    assert_eq!(h.scale, 0, "aligned to the coarser schema");
+    assert!(
+        (h.count - 7.0 / 30.0).abs() < 1e-12,
+        "count (10 - 3)/30, not the pre-fix reset-skipped 10/30: {}",
+        h.count
+    );
+    assert!(
+        (h.sum - 17.0 / 30.0).abs() < 1e-12,
+        "sum (20 - 3)/30: {}",
+        h.sum
+    );
+}
+
+/// A one-bucket native histogram at scale 0 with the given counter-reset hint,
+/// for the `irate`/`idelta` counter/gauge type-warning tests.
+fn hinted(hint: ResetHint, count: f64, sum: f64) -> FloatHistogram {
+    let mut h = hist(&[count], sum);
+    h.counter_reset_hint = hint;
+    h
+}
+
+#[test]
+fn idelta_over_a_counter_histogram_warns_not_gauge() {
+    // idelta is a gauge operation. Over a counter-hinted native histogram pair
+    // Prometheus raises NativeHistogramNotGauge. Before the #650 warning fix the
+    // histogram branch emitted no annotation, so this `warnings()` assertion
+    // flipped (it was empty). The result element is still produced.
+    let src = TestSource::new()
+        .with_histogram_series(
+            &[("__name__", "h")],
+            &[
+                (sec_ns(270), hinted(ResetHint::No, 2.0, 10.0)),
+                (sec_ns(300), hinted(ResetHint::No, 8.0, 40.0)),
+            ],
+        )
+        .expect("valid series");
+    let (value, annos) = Evaluator::new()
+        .eval_instant_annotated(&src, "idelta(h[5m])", 5 * 60_000)
+        .expect("evaluates");
+    let Value::Vector(out) = value else {
+        panic!("idelta is a vector");
+    };
+    assert_eq!(out.len(), 1, "idelta still yields a histogram element");
+    assert!(
+        annos.warnings().iter().any(|w| w.contains("not a gauge")),
+        "idelta over a counter histogram must warn it is not a gauge: {:?}",
+        annos.warnings()
+    );
+}
+
+#[test]
+fn irate_over_a_gauge_histogram_warns_not_counter() {
+    // irate is a counter operation. Over a gauge-hinted native histogram pair
+    // Prometheus raises NativeHistogramNotCounter. A gauge hint suppresses reset
+    // detection, so irate still subtracts and divides: the element is produced
+    // and the warning fires. The flipped assertion is the non-empty
+    // `warnings()`.
+    let src = TestSource::new()
+        .with_histogram_series(
+            &[("__name__", "h")],
+            &[
+                (sec_ns(270), hinted(ResetHint::Gauge, 2.0, 10.0)),
+                (sec_ns(300), hinted(ResetHint::Gauge, 8.0, 40.0)),
+            ],
+        )
+        .expect("valid series");
+    let (value, annos) = Evaluator::new()
+        .eval_instant_annotated(&src, "irate(h[5m])", 5 * 60_000)
+        .expect("evaluates");
+    let Value::Vector(out) = value else {
+        panic!("irate is a vector");
+    };
+    assert_eq!(out.len(), 1, "irate still yields a histogram element");
+    assert!(
+        annos.warnings().iter().any(|w| w.contains("not a counter")),
+        "irate over a gauge histogram must warn it is not a counter: {:?}",
+        annos.warnings()
+    );
+}
+
+#[test]
+fn irate_over_a_counter_histogram_and_idelta_over_a_gauge_do_not_warn() {
+    // The type-matched directions must NOT warn: irate over a counter-hinted
+    // pair, and idelta over a gauge-hinted pair. This guards against
+    // over-warning (a warning on the correct usage would be a false positive).
+    let counter = TestSource::new()
+        .with_histogram_series(
+            &[("__name__", "h")],
+            &[
+                (sec_ns(270), hinted(ResetHint::No, 2.0, 10.0)),
+                (sec_ns(300), hinted(ResetHint::No, 8.0, 40.0)),
+            ],
+        )
+        .expect("valid series");
+    let (_v, annos) = Evaluator::new()
+        .eval_instant_annotated(&counter, "irate(h[5m])", 5 * 60_000)
+        .expect("evaluates");
+    assert!(
+        annos.warnings().is_empty(),
+        "irate over a counter histogram must not warn: {:?}",
+        annos.warnings()
+    );
+
+    let gauge = TestSource::new()
+        .with_histogram_series(
+            &[("__name__", "h")],
+            &[
+                (sec_ns(270), hinted(ResetHint::Gauge, 2.0, 10.0)),
+                (sec_ns(300), hinted(ResetHint::Gauge, 8.0, 40.0)),
+            ],
+        )
+        .expect("valid series");
+    let (_v, annos) = Evaluator::new()
+        .eval_instant_annotated(&gauge, "idelta(h[5m])", 5 * 60_000)
+        .expect("evaluates");
+    assert!(
+        annos.warnings().is_empty(),
+        "idelta over a gauge histogram must not warn: {:?}",
+        annos.warnings()
     );
 }
 

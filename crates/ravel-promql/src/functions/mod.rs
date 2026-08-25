@@ -383,6 +383,13 @@ pub(crate) fn eval_range_call(
                         // A histogram-only window: the float reducer `f` has no
                         // histogram form, so route by member name to the shared
                         // over_time histogram policy (ADR-0108 decision 5).
+                        // `irate`/`idelta` over a histogram pair whose
+                        // counter/gauge typing does not match the operation
+                        // raises the same warning as the instant arm; the
+                        // annotation sink de-duplicates across grid steps.
+                        if let Some(warning) = maybe_hist_type_warning(name, hists) {
+                            ctx.warn(warning);
+                        }
                         return histogram_range_element(
                             over_time::histogram_over_time(name, hists),
                             reported_ts_ns,
@@ -616,6 +623,28 @@ pub(crate) fn eval_range_call(
     }
 }
 
+/// The counter/gauge type-mismatch warning `irate`/`idelta` over a native-
+/// histogram window raises (Prometheus' `instantValue` histogram branch), or
+/// `None` for any other function or a type-matched pair. Shared by the instant
+/// dispatch ([`append_histogram_over_time`]) and the range dispatch
+/// ([`eval_range_call`]'s `RangeVector` arm) so both endpoints annotate
+/// identically. Only `irate`/`idelta` reach this: every other range-vector
+/// member routes its histogram window through the same
+/// [`over_time::histogram_over_time`] policy without a counter/gauge assumption.
+fn maybe_hist_type_warning(name: &str, hists: &[TimedHistogram]) -> Option<String> {
+    let is_rate = match name {
+        "irate" => true,
+        "idelta" => false,
+        _ => return None,
+    };
+    match rate::instant_value_hist_type_warning(hists, is_rate)? {
+        rate::InstantHistTypeWarning::NotCounter => {
+            Some(rate::native_histogram_not_counter_warning())
+        }
+        rate::InstantHistTypeWarning::NotGauge => Some(rate::native_histogram_not_gauge_warning()),
+    }
+}
+
 /// Map a native-histogram [`over_time::HistOverTime`] outcome to a range
 /// element at `reported_ts_ns` (ADR-0108 decision 5): a float or histogram
 /// result becomes the matching [`RangeSample`], a drop becomes `None`.
@@ -654,6 +683,9 @@ fn append_histogram_over_time(
     let hmatrix =
         evaluator.eval_histogram_matrix_selector(source, ms, eval_ts_ns, ctx, keep_metric_name)?;
     for (labels, samples) in hmatrix {
+        if let Some(warning) = maybe_hist_type_warning(name, &samples) {
+            ctx.warn(warning);
+        }
         match over_time::histogram_over_time(name, &samples) {
             over_time::HistOverTime::Float(v) => {
                 out.push(InstantSample::scalar(labels, eval_ts_ns, eval_ts_ns, v));

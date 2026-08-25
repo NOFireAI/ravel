@@ -305,6 +305,19 @@ fn instant_value(samples: &[Sample], is_rate: bool) -> Option<f64> {
 /// result is marked gauge-typed, matching Prometheus' `Compact`-then-set-hint
 /// step (the trailing `Compact(0)` only removes empty buckets, which the JSON
 /// renderer already omits, so it is not reproduced here).
+///
+/// The two samples are adjacent samples of the same series but can carry
+/// different schemas (RSEG down-converts a flush whose bucket count exceeds its
+/// limit, so two flushes of one series can persist at different scales), so
+/// both are aligned to the coarser schema before any index-map arithmetic,
+/// exactly as [`histogram::histogram_rate`] does across its whole window.
+/// `detect_reset` and `sub_assign` both assume a comparable schema, so the
+/// alignment happens before either. A custom-buckets operand cannot be
+/// rescaled, so [`FloatHistogram::copy_to_scale`] returns it unchanged and the
+/// subsequent arithmetic combines the index maps as-is, the same shape
+/// `histogram_rate` produces for that mismatch (this crate does not reproduce
+/// Prometheus' outright refusal to combine an exponential-schema histogram with
+/// a custom-buckets one).
 pub(crate) fn instant_value_hist(
     samples: &[TimedHistogram],
     is_rate: bool,
@@ -318,15 +331,79 @@ pub(crate) fn instant_value_hist(
     if sampled_interval_ns == 0 {
         return None;
     }
-    let mut result = last.clone();
-    if !is_rate || !last.detect_reset(previous) {
-        result.sub_assign(previous);
+    let min_scale = previous.scale.min(last.scale);
+    let last = last.copy_to_scale(min_scale);
+    let previous = previous.copy_to_scale(min_scale);
+
+    let mut result = last;
+    if !is_rate || !result.detect_reset(&previous) {
+        result.sub_assign(&previous);
     }
     result.counter_reset_hint = ResetHint::Gauge;
     if is_rate {
         result.div(ms_to_seconds(ns_to_ms(sampled_interval_ns)));
     }
     Some(result)
+}
+
+/// Which counter/gauge type mismatch an `irate`/`idelta` over a native-
+/// histogram pair triggers, mirroring Prometheus' `instantValue` histogram
+/// branch: `irate` (a counter operation) over a gauge-typed pair warns the
+/// metric is not a counter, and `idelta` (a gauge operation) over a pair that
+/// is not gauge-typed warns the metric is not a gauge.
+pub(crate) enum InstantHistTypeWarning {
+    /// `irate` was asked to treat a gauge-typed native histogram as a counter.
+    NotCounter,
+    /// `idelta` was asked to treat a non-gauge native histogram as a gauge.
+    NotGauge,
+}
+
+/// Whether `irate`/`idelta` over the last two histograms in `samples` should
+/// raise a counter/gauge type-mismatch warning (Prometheus' `instantValue`
+/// histogram branch: `NativeHistogramNotCounter` for `irate` over a gauge-hinted
+/// pair, `NativeHistogramNotGauge` for `idelta` over a pair that is not both
+/// gauge-hinted). The check reads each histogram's own `counter_reset_hint` on
+/// entry, before [`instant_value_hist`] overwrites the result's hint with
+/// [`ResetHint::Gauge`]. Returns `None` when no result is produced (fewer than
+/// two samples, or a zero sampled interval), so the warning fires only
+/// alongside a value, exactly as Prometheus' own early returns gate it.
+pub(crate) fn instant_value_hist_type_warning(
+    samples: &[TimedHistogram],
+    is_rate: bool,
+) -> Option<InstantHistTypeWarning> {
+    if samples.len() < 2 {
+        return None;
+    }
+    let (last_ts, last) = &samples[samples.len() - 1];
+    let (prev_ts, previous) = &samples[samples.len() - 2];
+    if last_ts - prev_ts == 0 {
+        return None;
+    }
+    let last_gauge = last.counter_reset_hint == ResetHint::Gauge;
+    let prev_gauge = previous.counter_reset_hint == ResetHint::Gauge;
+    if is_rate {
+        (last_gauge || prev_gauge).then_some(InstantHistTypeWarning::NotCounter)
+    } else {
+        (!last_gauge || !prev_gauge).then_some(InstantHistTypeWarning::NotGauge)
+    }
+}
+
+/// Prometheus' `NativeHistogramNotCounterWarning` message: `irate` (a counter
+/// operation) was applied to a gauge-typed native histogram. Like Ravel's other
+/// ported annotations (`invalid_quantile_warning`,
+/// `mixed_floats_histograms_agg_warning`), this carries the core Prometheus
+/// wording without the `PromQL warning:` prefix, source position, or trailing
+/// metric-name clause Prometheus appends; the differential comparator matches
+/// annotation presence, not text.
+pub(crate) fn native_histogram_not_counter_warning() -> String {
+    "this native histogram metric is not a counter".to_string()
+}
+
+/// Prometheus' `NativeHistogramNotGaugeWarning` message: `idelta` (a gauge
+/// operation) was applied to a native histogram that is not gauge-typed. Same
+/// text convention as [`native_histogram_not_counter_warning`].
+pub(crate) fn native_histogram_not_gauge_warning() -> String {
+    "this native histogram metric is not a gauge".to_string()
 }
 
 /// `resets` over a native-histogram window (Prometheus' `funcResets` histogram

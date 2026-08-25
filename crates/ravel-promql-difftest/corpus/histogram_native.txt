@@ -15,11 +15,13 @@
 # `diff_native_hist` selector, or `sum(diff_native_hist_agg)` without a
 # `histogram_count`/`histogram_sum` wrapper) need a histogram-aware comparator,
 # still deferred. Entries that would make Prometheus emit a warning/info
-# annotation (mixed classic+native, float+histogram aggregation) are
-# deliberately excluded: the comparator matches annotation presence, so such
-# entries would mismatch on the annotation rather than the value. Those
-# behaviors are pinned by ravel-promql unit tests instead
-# (tests/histogram_native.rs) and listed in the P11 report.
+# annotation Ravel does NOT also emit (mixed classic+native, float+histogram
+# aggregation) are deliberately excluded: the comparator matches annotation
+# presence, so such entries would mismatch on the annotation rather than the
+# value. Those behaviors are pinned by ravel-promql unit tests instead
+# (tests/histogram_native.rs) and listed in the P11 report. An entry whose
+# warning Ravel now DOES emit is includable (the presence matches on both
+# sides); the idelta-over-a-counter entry below is the first such case (#650).
 #
 # NOT float-precision residue after all. The P11 report flagged two suspected
 # residues (bucket_bound arithmetic vs Prometheus' exponentialBounds tables for
@@ -271,11 +273,29 @@ expect: empty
 # 0 (no downward step) and changes counts every adjacent differing pair; each
 # used to answer empty over histogram data.
 #
-# irate/idelta are pinned by ravel-promql unit tests
-# (tests/histogram_native.rs) rather than corpus entries: idelta over a counter
-# histogram makes Prometheus emit a NativeHistogramNotGauge warning (an
-# annotation), which this corpus deliberately excludes (see the header), and
-# irate's histogram-valued result is pinned by unit test alongside it.
+# irate/idelta over histograms (#650). Ravel now raises the same counter/gauge
+# type-mismatch warnings Prometheus does (NativeHistogramNotCounter for irate
+# over a gauge, NativeHistogramNotGauge for idelta over a counter), so the two
+# counter-dataset directions can be pinned here: the comparator matches
+# annotation presence, and idelta over this counter histogram warns on both
+# sides while irate over it (a type-matched counter operation) warns on neither.
+# The two gauge-histogram directions (irate over a gauge -> NativeHistogramNot
+# Counter; idelta over a gauge -> no warning) need a GAUGE-hinted native
+# histogram series, which this dataset does not carry (generator.rs is out of
+# this task's scope); all four directions, including both gauge ones, are pinned
+# by ravel-promql unit tests (tests/histogram_native.rs).
+name: native_histogram_idelta_instant
+query: idelta(diff_native_hist[5m])
+kind: instant
+time: +600s
+mode: unordered
+
+name: native_histogram_irate_instant
+query: irate(diff_native_hist[5m])
+kind: instant
+time: +600s
+mode: unordered
+
 name: native_histogram_resets_range
 query: resets(diff_native_hist[5m])
 kind: range
