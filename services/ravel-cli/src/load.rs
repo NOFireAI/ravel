@@ -2100,6 +2100,7 @@ impl AttrSrc<'_> {
 
 /// A columnar-build failure: a batch-level decode/resolve error, or a per-row
 /// admission rejection carrying its FILE-absolute index (#541).
+#[derive(Debug)]
 enum ColBuildError {
     Batch(String),
     Row { row: u64, reason: String },
@@ -2154,7 +2155,7 @@ fn build_columnar_batch(
     limits: &LogIngestLimits,
     now_ns: i64,
 ) -> Result<ColumnarLogBatch, ColBuildError> {
-    use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::collections::{BTreeMap, HashMap};
 
     let total_rows: usize = spans.iter().map(|(b, _)| b.num_rows()).sum();
     let mut batch = ColumnarLogBatch::new();
@@ -2169,11 +2170,38 @@ fn build_columnar_batch(
     batch.flags.reserve(total_rows);
     batch.residual_attrs = vec![Vec::new(); total_rows];
 
-    // Dynamic columns, keyed by (name, type byte) as `from_records` keys them, so
-    // their materialized order matches. `col_dict` tracks whether every winning
-    // cell of a column came from a dictionary-encoded Arrow source.
-    let mut col_cells: BTreeMap<(String, u8), Vec<Option<AttrValue>>> = BTreeMap::new();
-    let mut col_dict: BTreeMap<(String, u8), bool> = BTreeMap::new();
+    // Dynamic-column slot table (issue #689). The destination column of every
+    // record attribute is fixed by the mapping, not the data, so resolve it once
+    // per batch instead of a String-keyed `BTreeMap` entry lookup per cell.
+    // Slots are the distinct (name, type byte) keys `from_records` produces, in
+    // the same sorted order the `BTreeMap` iterated, so the materialized column
+    // set and order stay byte-identical. `slot_dict[s]` is the AND of `is_dict`
+    // over slot `s`'s winning cells; `slot_seen_row[s]` is the row index that
+    // last claimed slot `s`, giving per-row first-occurrence dedup with no
+    // per-row allocation.
+    let mut slot_keys: Vec<(String, u8)> = mapping
+        .attributes
+        .iter()
+        .map(|a| (a.key.clone(), field_type_of(a.value_type).to_u8()))
+        .collect();
+    slot_keys.sort();
+    slot_keys.dedup();
+    let slot_of: HashMap<(String, u8), usize> = slot_keys
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(i, k)| (k, i))
+        .collect();
+    let attr_slot: Vec<usize> = mapping
+        .attributes
+        .iter()
+        .map(|a| slot_of[&(a.key.clone(), field_type_of(a.value_type).to_u8())])
+        .collect();
+    let num_slots = slot_keys.len();
+    let mut slot_cells: Vec<Option<Vec<Option<AttrValue>>>> =
+        (0..num_slots).map(|_| None).collect();
+    let mut slot_dict: Vec<bool> = vec![true; num_slots];
+    let mut slot_seen_row: Vec<u64> = vec![u64::MAX; num_slots];
 
     // Stream identity: hashed once per distinct resource tuple, keyed by the
     // STREAM_DIR blob (the canonical resource bytes) so the blake3 in
@@ -2302,19 +2330,18 @@ fn build_columnar_batch(
             // split first-occurrence winner vs within-record residual exactly as
             // `from_records`.
             let mut present_record = 0usize;
-            let mut taken: HashSet<(String, u8)> = HashSet::new();
+            let grow_u64 = grow as u64;
             for (mi, src) in &record {
                 let spec = &mapping.attributes[*mi];
                 if let Some(v) = src.get(local).map_err(row_err)? {
                     check_attr(&spec.key, &v, limits).map_err(row_err)?;
                     present_record += 1;
-                    let key = (spec.key.clone(), field_type_of(spec.value_type).to_u8());
-                    if taken.insert(key.clone()) {
-                        col_cells
-                            .entry(key.clone())
-                            .or_insert_with(|| vec![None; total_rows])[grow] = Some(v);
-                        let flag = col_dict.entry(key).or_insert(true);
-                        *flag &= src.is_dict();
+                    let slot = attr_slot[*mi];
+                    if slot_seen_row[slot] != grow_u64 {
+                        slot_seen_row[slot] = grow_u64;
+                        let cells = slot_cells[slot].get_or_insert_with(|| vec![None; total_rows]);
+                        cells[grow] = Some(v);
+                        slot_dict[slot] &= src.is_dict();
                     } else {
                         batch.residual_attrs[grow].push((spec.key.clone(), v));
                     }
@@ -2380,9 +2407,11 @@ fn build_columnar_batch(
     // source. If no column carries a dictionary, leave `dyn_col_dicts` empty (its
     // default), so a plain load is byte-identical to `from_records` without
     // `with_dictionaries`.
-    let mut dicts: Vec<Option<StrColumnDict>> = Vec::with_capacity(col_cells.len());
+    let mut dicts: Vec<Option<StrColumnDict>> = Vec::with_capacity(num_slots);
     let mut any_dict = false;
-    for ((name, ty_byte), cells) in col_cells {
+    for (slot, cells_opt) in slot_cells.into_iter().enumerate() {
+        let Some(cells) = cells_opt else { continue };
+        let (name, ty_byte) = slot_keys[slot].clone();
         let field_type = FieldType::from_u8(ty_byte).unwrap_or(FieldType::Bytes);
         let mut validity = Bitmap::new();
         let mut dense = Vec::new();
@@ -2395,11 +2424,7 @@ fn build_columnar_batch(
                 None => validity.push(false),
             }
         }
-        let use_dict = matches!(field_type, FieldType::Str | FieldType::Bytes)
-            && col_dict
-                .get(&(name.clone(), ty_byte))
-                .copied()
-                .unwrap_or(false);
+        let use_dict = matches!(field_type, FieldType::Str | FieldType::Bytes) && slot_dict[slot];
         if use_dict {
             any_dict = true;
             dicts.push(Some(str_column_dict_from_cells(&dense)));
@@ -2424,6 +2449,416 @@ fn build_columnar_batch(
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    /// A verbatim copy of `build_columnar_batch`'s body before issue #689
+    /// replaced the per-cell `BTreeMap<(String, u8), _>` entry lookup with a
+    /// per-batch slot table. Kept here so the differential proptest below can
+    /// assert the indexed path produces a byte-identical `ColumnarLogBatch`.
+    /// Do not "improve" this: its value is being the old behavior exactly.
+    fn build_columnar_batch_reference(
+        spans: &[(RecordBatch, u64)],
+        mapping: &Mapping,
+        limits: &LogIngestLimits,
+        now_ns: i64,
+    ) -> Result<ColumnarLogBatch, ColBuildError> {
+        use std::collections::{BTreeMap, HashMap, HashSet};
+
+        let total_rows: usize = spans.iter().map(|(b, _)| b.num_rows()).sum();
+        let mut batch = ColumnarLogBatch::new();
+        batch.num_rows = total_rows;
+        if total_rows == 0 {
+            return Ok(batch);
+        }
+
+        batch.ts_ns.reserve(total_rows);
+        batch.observed_ts_ns.reserve(total_rows);
+        batch.severity_num.reserve(total_rows);
+        batch.flags.reserve(total_rows);
+        batch.residual_attrs = vec![Vec::new(); total_rows];
+
+        let mut col_cells: BTreeMap<(String, u8), Vec<Option<AttrValue>>> = BTreeMap::new();
+        let mut col_dict: BTreeMap<(String, u8), bool> = BTreeMap::new();
+
+        let mut row_stream_id: Vec<LogStreamId> = Vec::with_capacity(total_rows);
+        let mut stream_dir: BTreeMap<LogStreamId, Vec<u8>> = BTreeMap::new();
+        let mut stream_cache: HashMap<Vec<u8>, LogStreamId> = HashMap::new();
+
+        let mut grow = 0usize;
+        for (span, file_base) in spans {
+            let cols = ColumnIndex::resolve(span, mapping).map_err(ColBuildError::Batch)?;
+
+            let ts = ts_src(span.column(cols.ts), mapping.ts_unit);
+            let body = cols.body.map(|i| str_src(span.column(i)));
+            let sev_num = cols.severity_number.map(|i| int_src(span.column(i)));
+            let sev_text = cols.severity_text.map(|i| str_src(span.column(i)));
+            let trace = cols.trace_id.map(|i| id_src(span.column(i)));
+            let span_id_src = cols.span_id.map(|i| id_src(span.column(i)));
+            let resource: Vec<(usize, AttrSrc)> = cols
+                .resource
+                .iter()
+                .map(|(ci, mi)| {
+                    (
+                        *mi,
+                        attr_src(
+                            span.column(*ci),
+                            mapping.resource_attributes[*mi].value_type,
+                        ),
+                    )
+                })
+                .collect();
+            let record: Vec<(usize, AttrSrc)> = cols
+                .record
+                .iter()
+                .map(|(ci, mi)| {
+                    (
+                        *mi,
+                        attr_src(span.column(*ci), mapping.attributes[*mi].value_type),
+                    )
+                })
+                .collect();
+
+            for local in 0..span.num_rows() {
+                let file_row = file_base + local as u64;
+                let row_err = |reason: String| ColBuildError::Row {
+                    row: file_row,
+                    reason,
+                };
+
+                let raw_ts = match ts.get(local).map_err(row_err)? {
+                    Some(t) => t,
+                    None => {
+                        return Err(row_err(format!(
+                            "ts column {:?} is null",
+                            mapping.ts_column
+                        )));
+                    }
+                };
+                let skew_ns = raw_ts.saturating_sub(now_ns);
+                if skew_ns > limits.max_future_skew_ns {
+                    return Err(row_err(format!(
+                        "timestamp is {skew_ns} ns ahead of load time, more than the max future \
+                         skew of {} ns",
+                        limits.max_future_skew_ns
+                    )));
+                }
+
+                let body_val = match &body {
+                    Some(s) => s.get(local).map_err(row_err)?.unwrap_or_default(),
+                    None => String::new(),
+                };
+                if body_val.len() > limits.max_body_len {
+                    return Err(row_err(format!(
+                        "body is {} bytes, more than the limit of {}",
+                        body_val.len(),
+                        limits.max_body_len
+                    )));
+                }
+
+                let severity_num = match &sev_num {
+                    Some(s) => s
+                        .get(local)
+                        .map_err(row_err)?
+                        .and_then(|v| u8::try_from(v).ok())
+                        .unwrap_or(0),
+                    None => 0,
+                };
+                let severity_text = match &sev_text {
+                    Some(s) => s.get(local).map_err(row_err)?.unwrap_or_default(),
+                    None => String::new(),
+                };
+
+                let trace_id = match &trace {
+                    Some(s) => s
+                        .get(local)
+                        .map_err(row_err)?
+                        .and_then(|b| <[u8; 16]>::try_from(b.as_slice()).ok()),
+                    None => None,
+                };
+                let span_id = match &span_id_src {
+                    Some(s) => s
+                        .get(local)
+                        .map_err(row_err)?
+                        .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok()),
+                    None => None,
+                };
+
+                let mut resource_attrs: Vec<(String, AttrValue)> =
+                    Vec::with_capacity(resource.len());
+                for (mi, src) in &resource {
+                    let spec = &mapping.resource_attributes[*mi];
+                    if let Some(v) = src.get(local).map_err(row_err)? {
+                        check_attr(&spec.key, &v, limits).map_err(row_err)?;
+                        resource_attrs.push((spec.key.clone(), v));
+                    }
+                }
+
+                let mut present_record = 0usize;
+                let mut taken: HashSet<(String, u8)> = HashSet::new();
+                for (mi, src) in &record {
+                    let spec = &mapping.attributes[*mi];
+                    if let Some(v) = src.get(local).map_err(row_err)? {
+                        check_attr(&spec.key, &v, limits).map_err(row_err)?;
+                        present_record += 1;
+                        let key = (spec.key.clone(), field_type_of(spec.value_type).to_u8());
+                        if taken.insert(key.clone()) {
+                            col_cells
+                                .entry(key.clone())
+                                .or_insert_with(|| vec![None; total_rows])[grow] = Some(v);
+                            let flag = col_dict.entry(key).or_insert(true);
+                            *flag &= src.is_dict();
+                        } else {
+                            batch.residual_attrs[grow].push((spec.key.clone(), v));
+                        }
+                    }
+                }
+                if present_record > LOADER_MAX_ATTRIBUTES_PER_RECORD {
+                    return Err(row_err(format!(
+                        "record has {present_record} attributes, more than the loader per-record \
+                         cap of {LOADER_MAX_ATTRIBUTES_PER_RECORD}"
+                    )));
+                }
+
+                let blob = stream_attrs_bytes(&resource_attrs, "", "", &[]);
+                let stream_id = match stream_cache.get(&blob) {
+                    Some(id) => *id,
+                    None => {
+                        let id = log_stream_id(&resource_attrs, "", "", &[]);
+                        stream_cache.insert(blob.clone(), id);
+                        id
+                    }
+                };
+                stream_dir.entry(stream_id).or_insert_with(|| blob.clone());
+                row_stream_id.push(stream_id);
+
+                batch.ts_ns.push(raw_ts);
+                batch.observed_ts_ns.push(raw_ts);
+                batch.severity_num.push(severity_num);
+                batch.flags.push(0);
+                batch.severity_text.push(severity_text.as_bytes());
+                batch.body.push(body_val.as_bytes());
+                match trace_id {
+                    Some(t) => {
+                        batch.trace_id.extend_from_slice(&t);
+                        batch.trace_id_validity.push(true);
+                    }
+                    None => batch.trace_id_validity.push(false),
+                }
+                match span_id {
+                    Some(s) => {
+                        batch.span_id.extend_from_slice(&s);
+                        batch.span_id_validity.push(true);
+                    }
+                    None => batch.span_id_validity.push(false),
+                }
+
+                grow += 1;
+            }
+        }
+
+        let mut ref_of: HashMap<LogStreamId, u32> = HashMap::with_capacity(stream_dir.len());
+        for (i, (id, blob)) in stream_dir.into_iter().enumerate() {
+            ref_of.insert(id, i as u32);
+            batch.stream_ids.push(id);
+            batch.stream_attrs.push(blob);
+        }
+        batch.stream_refs = row_stream_id.iter().map(|id| ref_of[id]).collect();
+
+        let mut dicts: Vec<Option<StrColumnDict>> = Vec::with_capacity(col_cells.len());
+        let mut any_dict = false;
+        for ((name, ty_byte), cells) in col_cells {
+            let field_type = FieldType::from_u8(ty_byte).unwrap_or(FieldType::Bytes);
+            let mut validity = Bitmap::new();
+            let mut dense = Vec::new();
+            for cell in cells {
+                match cell {
+                    Some(v) => {
+                        validity.push(true);
+                        dense.push(v);
+                    }
+                    None => validity.push(false),
+                }
+            }
+            let use_dict = matches!(field_type, FieldType::Str | FieldType::Bytes)
+                && col_dict
+                    .get(&(name.clone(), ty_byte))
+                    .copied()
+                    .unwrap_or(false);
+            if use_dict {
+                any_dict = true;
+                dicts.push(Some(str_column_dict_from_cells(&dense)));
+            } else {
+                dicts.push(None);
+            }
+            batch.dyn_columns.push(DynColumn {
+                name,
+                field_type,
+                cells: dense,
+                validity,
+            });
+        }
+        if any_dict {
+            batch.dyn_col_dicts = dicts;
+        }
+
+        Ok(batch)
+    }
+
+    /// Deterministic xorshift so the differential case generator needs no RNG
+    /// crate and no wall clock.
+    fn xs(mut x: u64) -> u64 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    }
+
+    /// The column type assigned to attribute column `c` in the generated case:
+    /// the four scalar kinds the mapping supplies, cycled so a batch mixes them.
+    fn gen_col_type(c: usize) -> ColType {
+        match c % 4 {
+            0 => ColType::Str,
+            1 => ColType::I64,
+            2 => ColType::F64,
+            _ => ColType::Bool,
+        }
+    }
+
+    /// The attribute key for column `c`. Mostly distinct, but every 7th column
+    /// (from the 4th on) reuses the key of the column four earlier, which shares
+    /// its type (types cycle mod 4), forcing a same-`(name, type)` slot
+    /// collision so the within-record dedup/residual path is exercised.
+    fn gen_col_key(c: usize) -> String {
+        if c >= 4 && c % 7 == 0 {
+            format!("k{}", c - 4)
+        } else {
+            format!("k{c}")
+        }
+    }
+
+    /// Build one differential case: a single-span batch of `n_rows` rows over
+    /// `n_cols` mixed-type attribute columns (plus the required `ts` column),
+    /// with each attribute cell null at roughly `null_pct` percent, and a
+    /// matching mapping. Values are finite (no NaN) so `AttrValue` equality is
+    /// well-defined for the assertion.
+    fn gen_case(
+        n_rows: usize,
+        n_cols: usize,
+        null_pct: u32,
+        seed: u64,
+    ) -> (Vec<(RecordBatch, u64)>, Mapping) {
+        let mut fields: Vec<(String, ArrayRef)> = Vec::with_capacity(n_cols + 1);
+        // ts: non-null, safely in the past so the future-skew bound never trips.
+        let ts_vals: Vec<i64> = (0..n_rows).map(|r| NOW_NS - 1_000_000 - r as i64).collect();
+        fields.push(("ts".to_string(), i64_col(ts_vals)));
+
+        for c in 0..n_cols {
+            let ty = gen_col_type(c);
+            let is_null =
+                |r: usize| (xs(seed ^ ((c as u64) << 32) ^ r as u64) % 100) < null_pct as u64;
+            let arr: ArrayRef = match ty {
+                ColType::Str => {
+                    let v: Vec<Option<String>> = (0..n_rows)
+                        .map(|r| (!is_null(r)).then(|| format!("s{}", xs(seed ^ r as u64) % 1000)))
+                        .collect();
+                    Arc::new(StringArray::from(v))
+                }
+                ColType::I64 => {
+                    let v: Vec<Option<i64>> = (0..n_rows)
+                        .map(|r| (!is_null(r)).then(|| (xs(seed ^ r as u64) % 1_000_000) as i64))
+                        .collect();
+                    Arc::new(Int64Array::from(v))
+                }
+                ColType::F64 => {
+                    let v: Vec<Option<f64>> = (0..n_rows)
+                        .map(|r| {
+                            (!is_null(r)).then(|| (xs(seed ^ r as u64) % 100_000) as f64 * 0.5)
+                        })
+                        .collect();
+                    Arc::new(Float64Array::from(v))
+                }
+                ColType::Bool => {
+                    let v: Vec<Option<bool>> = (0..n_rows)
+                        .map(|r| (!is_null(r)).then(|| xs(seed ^ r as u64) % 2 == 0))
+                        .collect();
+                    Arc::new(BooleanArray::from(v))
+                }
+                ColType::Bytes => unreachable!("gen_col_type never yields Bytes"),
+            };
+            fields.push((format!("c{c}"), arr));
+        }
+
+        let rb = batch(
+            fields
+                .iter()
+                .map(|(n, a)| (n.as_str(), a.clone()))
+                .collect(),
+        );
+        let mut mapping = base_mapping();
+        mapping.attributes = (0..n_cols)
+            .map(|c| attr(&gen_col_key(c), &format!("c{c}"), gen_col_type(c)))
+            .collect();
+        (vec![(rb, 0)], mapping)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+
+        /// The indexed slot table (issue #689) produces a `ColumnarLogBatch`
+        /// byte-for-byte identical to the pre-change `BTreeMap` construction,
+        /// across random row counts, column counts, and null densities.
+        #[test]
+        fn slot_table_matches_reference(
+            n_rows in 1usize..=4096,
+            n_cols in 1usize..=120,
+            null_pct in 0u32..=100,
+            seed in any::<u64>(),
+        ) {
+            let (spans, mapping) = gen_case(n_rows, n_cols, null_pct, seed);
+            let limits = LogIngestLimits::default();
+            let got = build_columnar_batch(&spans, &mapping, &limits, NOW_NS)
+                .expect("indexed build");
+            let want = build_columnar_batch_reference(&spans, &mapping, &limits, NOW_NS)
+                .expect("reference build");
+            prop_assert_eq!(got.dyn_columns.len(), want.dyn_columns.len());
+            for (g, w) in got.dyn_columns.iter().zip(want.dyn_columns.iter()) {
+                prop_assert_eq!(&g.name, &w.name);
+                prop_assert_eq!(g.field_type, w.field_type);
+                prop_assert_eq!(&g.cells, &w.cells);
+                prop_assert_eq!(&g.validity, &w.validity);
+            }
+            prop_assert_eq!(&got.residual_attrs, &want.residual_attrs);
+            prop_assert_eq!(&got.dyn_col_dicts, &want.dyn_col_dicts);
+            // The whole batch, as the strongest identity statement.
+            prop_assert_eq!(got, want);
+        }
+    }
+
+    /// Timing report, not an assertion (issue #689). Gated behind
+    /// `RAVEL_LOAD_BATCH_TIMING=1`; prints the reference and indexed wall times
+    /// on a 65,536-row x 105-column batch.
+    #[test]
+    fn build_columnar_batch_timing() {
+        if std::env::var("RAVEL_LOAD_BATCH_TIMING").as_deref() != Ok("1") {
+            return;
+        }
+        let (spans, mapping) = gen_case(65_536, 105, 15, 0x5eed_1234_abcd_ef01);
+        let limits = LogIngestLimits::default();
+
+        let t0 = std::time::Instant::now();
+        let want = build_columnar_batch_reference(&spans, &mapping, &limits, NOW_NS)
+            .expect("reference build");
+        let ref_dur = t0.elapsed();
+
+        let t1 = std::time::Instant::now();
+        let got = build_columnar_batch(&spans, &mapping, &limits, NOW_NS).expect("indexed build");
+        let new_dur = t1.elapsed();
+
+        assert_eq!(got, want, "timing inputs must still agree");
+        println!(
+            "build_columnar_batch timing (65536x105): reference={ref_dur:?} indexed={new_dur:?}"
+        );
+    }
 
     /// A fixed, plausible (post-2020) load-time anchor for the admission
     /// checks; the exact value only matters relative to the event timestamps.

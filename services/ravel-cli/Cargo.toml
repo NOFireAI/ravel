@@ -119,6 +119,10 @@ tower = { workspace = true }
 # exercise `--deployment-key-file`, not an in-memory key). Already a
 # workspace pin; adds no new external crate.
 tempfile = { workspace = true }
+# The issue #689 differential test proptests build_columnar_batch against a
+# verbatim copy of its pre-change body over random shapes. Already a workspace
+# pin; adds no new external crate.
+proptest = { workspace = true }
 
 [lints]
 workspace = true
