@@ -55,7 +55,6 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 use parking_lot::{Mutex, RwLock};
-use ravel_cache::Cache;
 use ravel_catalog::Catalog;
 use ravel_fleet::query_workers::{QueryWorkerRecord, QueryWorkers};
 use ravel_fleet::worker_set;
@@ -63,7 +62,7 @@ use ravel_ingest::Clock;
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::instrument::{LATENCY_BUCKET_BOUNDS_MICROS, LATENCY_BUCKET_COUNT};
 use ravel_proto::queryfrag::v1 as pb;
-use ravel_query::CacheFetchError;
+use ravel_query::ReadCache;
 use ravel_query::SegmentFetcher;
 use ravel_query::distrib::client::{
     DistribError, SliceFetcher, SliceResponse, decode_slice_frames,
@@ -490,7 +489,7 @@ struct FragmentServiceInner {
     admission: FragmentAdmission,
     catalog: Arc<Catalog>,
     store: Arc<dyn ObjectStoreBackend>,
-    cache: Option<Arc<Cache<CacheFetchError>>>,
+    cache: Option<ReadCache>,
     clock: Arc<dyn Clock>,
     metrics: Arc<FragmentMetrics>,
 }
@@ -507,7 +506,7 @@ impl FragmentService {
         admission: FragmentAdmission,
         catalog: Arc<Catalog>,
         store: Arc<dyn ObjectStoreBackend>,
-        cache: Option<Arc<Cache<CacheFetchError>>>,
+        cache: Option<ReadCache>,
         clock: Arc<dyn Clock>,
         metrics: Arc<FragmentMetrics>,
     ) -> Self {
@@ -796,7 +795,7 @@ impl FragmentService {
         };
         let mut fetcher = SegmentFetcher::new(self.inner.store.clone());
         if let Some(cache) = &self.inner.cache {
-            fetcher = fetcher.with_cache(Arc::clone(cache));
+            fetcher = fetcher.with_cache(cache.clone());
         }
         let service = SeriesFetchService::new(fetcher, resolver);
         match service.fetch(tonic::Request::new(request)).await {
@@ -2574,6 +2573,8 @@ mod tests {
             &Default::default(),
             &[],
             &crate::metrics::CatalogCountersSnapshot::default(),
+            None,
+            None,
             None,
             None,
             None,

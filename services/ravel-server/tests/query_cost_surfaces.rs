@@ -189,7 +189,9 @@ fn surfaces(store: Arc<dyn ObjectStoreBackend>, tenant: &TenantId) -> Surfaces {
         merge_memory: None,
         scrub: None,
         cache_metrics: None,
+        cache_disk_metrics: None,
         catalog_cache_metrics: None,
+        catalog_cache_disk_metrics: None,
         admission: Arc::new(AdmissionController::new(
             Arc::new(SystemClock),
             AdmissionLimits::default(),
@@ -590,7 +592,9 @@ mod flight {
             merge_memory: None,
             scrub: None,
             cache_metrics: None,
+            cache_disk_metrics: None,
             catalog_cache_metrics: None,
+            catalog_cache_disk_metrics: None,
             admission: Arc::new(AdmissionController::new(
                 Arc::new(SystemClock),
                 AdmissionLimits::default(),

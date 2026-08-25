@@ -12,11 +12,14 @@
 //!
 //! [`Label`] is the only way to attach a label to a rendered sample, and its
 //! variants are exhaustively `tenant_hash`, `signal`, `mode`, `op`,
-//! `error_kind`, `workload_class`, `level`, `reason`, and `cache` (ADR-0044
+//! `error_kind`, `workload_class`, `level`, `reason`, `cache`, and `tier`
+//! (ADR-0044
 //! section 4; `reason` added by ADR-0051 section 6 for the admission-rejection
 //! family and reused by ADR-0059 section 2 for the scrub seal-divergence family,
 //! `cache` to split the read-cache family into the
-//! fetcher and catalog byte caches). Every variant's payload is a closed enum
+//! fetcher and catalog byte caches, `tier` added by #97 to split each of those
+//! into its RAM and local-disk tiers when a disk tier is configured). Every
+//! variant's payload is a closed enum
 //! or [`TenantHash`]'s fixed-width hash, so there is no `String` or `&str`
 //! anywhere on this path an unlisted label could travel through, and adding a
 //! tenth variant is a compile error everywhere this module matches on `Label`
@@ -222,6 +225,7 @@ pub enum Label {
     RejectReason(RejectReason),
     ScrubReason(ScrubReason),
     Cache(CacheFamily),
+    CacheTier(CacheTier),
     MergeMemoryKind(MergeMemoryKind),
 }
 
@@ -266,6 +270,29 @@ impl CacheFamily {
     }
 }
 
+/// Which ADR-0046 cache tier a `ravel_cache_*` sample belongs to (#97), the
+/// second, orthogonal `tier=` label alongside `cache=`. Both caches (`fetch`,
+/// `catalog`) may carry a RAM tier and, when `--cache-dir` is set, a local-disk
+/// tier; this label tells the two tiers apart, the same one-name-split-by-a-
+/// closed-dimension discipline [`MergeMemoryKind`] uses. A process with no disk
+/// tier renders no `tier=` label at all (today's exact output); only when a
+/// disk tier exists for a family does that family's RAM sample gain `tier=ram`
+/// and its disk sample carry `tier=disk`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheTier {
+    Ram,
+    Disk,
+}
+
+impl CacheTier {
+    fn name(self) -> &'static str {
+        match self {
+            CacheTier::Ram => "ram",
+            CacheTier::Disk => "disk",
+        }
+    }
+}
+
 impl Label {
     fn key(&self) -> &'static str {
         match self {
@@ -279,6 +306,7 @@ impl Label {
             Label::RejectReason(_) => "reason",
             Label::ScrubReason(_) => "reason",
             Label::Cache(_) => "cache",
+            Label::CacheTier(_) => "tier",
             Label::MergeMemoryKind(_) => "kind",
         }
     }
@@ -295,6 +323,7 @@ impl Label {
             Label::RejectReason(reason) => reason.name().to_string(),
             Label::ScrubReason(reason) => reason.name().to_string(),
             Label::Cache(family) => family.name().to_string(),
+            Label::CacheTier(tier) => tier.name().to_string(),
             Label::MergeMemoryKind(kind) => kind.name().to_string(),
         }
     }
@@ -2019,21 +2048,58 @@ fn render_cache_family(
     out: &mut String,
     mode: Mode,
     fetch: Option<&CacheMetricsSnapshot>,
+    fetch_disk: Option<&CacheMetricsSnapshot>,
     catalog: Option<&CacheMetricsSnapshot>,
+    catalog_disk: Option<&CacheMetricsSnapshot>,
 ) {
-    let families = [(CacheFamily::Fetch, fetch), (CacheFamily::Catalog, catalog)];
+    // Per family: (cache label, RAM-tier snapshot, disk-tier snapshot). The disk
+    // snapshot is `Some` only when `--cache-dir` attached a disk tier to that
+    // family (#97).
+    let families = [
+        (CacheFamily::Fetch, fetch, fetch_disk),
+        (CacheFamily::Catalog, catalog, catalog_disk),
+    ];
 
-    // One metric name at a time: header once, then a sample per attached cache
-    // under its `cache=` label. `field` picks the counter this metric renders.
+    // One metric name at a time: header once, then a sample per attached tier.
+    // With NO disk tier for a family, its RAM sample carries only the `cache=`
+    // label, byte-for-byte the pre-#97 output. With a disk tier present, the RAM
+    // sample gains `tier=ram` and the disk sample carries `tier=disk`, so the two
+    // orthogonal labels (`cache=`, `tier=`) split the family. `field` picks the
+    // counter this metric renders.
     let mut emit = |name: &str, help: &str, field: fn(&CacheMetricsSnapshot) -> u64| {
         write_header(out, name, help, "counter");
-        for (family, snapshot) in families {
-            if let Some(snapshot) = snapshot {
+        for (family, ram, disk) in families {
+            if let Some(ram) = ram {
+                if disk.is_some() {
+                    write_sample(
+                        out,
+                        name,
+                        &[
+                            Label::Mode(mode),
+                            Label::Cache(family),
+                            Label::CacheTier(CacheTier::Ram),
+                        ],
+                        field(ram),
+                    );
+                } else {
+                    write_sample(
+                        out,
+                        name,
+                        &[Label::Mode(mode), Label::Cache(family)],
+                        field(ram),
+                    );
+                }
+            }
+            if let Some(disk) = disk {
                 write_sample(
                     out,
                     name,
-                    &[Label::Mode(mode), Label::Cache(family)],
-                    field(snapshot),
+                    &[
+                        Label::Mode(mode),
+                        Label::Cache(family),
+                        Label::CacheTier(CacheTier::Disk),
+                    ],
+                    field(disk),
                 );
             }
         }
@@ -2992,7 +3058,9 @@ pub fn render(
     merge_memory: Option<&ravel_maintain::MergeMemoryTracker>,
     scrub: Option<&ScrubSnapshot>,
     cache: Option<&CacheMetricsSnapshot>,
+    cache_disk: Option<&CacheMetricsSnapshot>,
     catalog_cache: Option<&CacheMetricsSnapshot>,
+    catalog_cache_disk: Option<&CacheMetricsSnapshot>,
     admission: &AdmissionCountersSnapshot,
     query_accounting: &[QueryAccountingRow],
     ingest_concurrency_shed_total: u64,
@@ -3049,8 +3117,19 @@ pub fn render(
     if let Some(snapshot) = scrub {
         render_scrub_family(&mut out, mode, snapshot);
     }
-    if cache.is_some() || catalog_cache.is_some() {
-        render_cache_family(&mut out, mode, cache, catalog_cache);
+    if cache.is_some()
+        || cache_disk.is_some()
+        || catalog_cache.is_some()
+        || catalog_cache_disk.is_some()
+    {
+        render_cache_family(
+            &mut out,
+            mode,
+            cache,
+            cache_disk,
+            catalog_cache,
+            catalog_cache_disk,
+        );
     }
     render_admission_family(&mut out, mode, admission);
     render_query_family(&mut out, mode, query_accounting);
@@ -3107,17 +3186,29 @@ pub struct MetricsState {
     /// `Some` only in [`Mode::Maintain`], alongside `maintenance_safety` above,
     /// the one mode that spawns the at-rest scrubber (ADR-0059).
     pub scrub: Option<Arc<crate::scrub::ScrubMetrics>>,
-    /// The ADR-0046 fetcher cache's counters handle, or
+    /// The ADR-0046 fetcher cache's RAM-tier counters handle, or
     /// `None` when `--disable-cache` leaves no fetcher cache constructed at all.
-    /// Rendered under `cache="fetch"`.
+    /// Rendered under `cache="fetch"` (with `tier="ram"` when a disk tier
+    /// coexists). Sourced from [`ravel_query::ReadCache::ram_metrics`].
     pub cache_metrics: Option<Arc<ravel_cache::CacheMetrics>>,
-    /// The ADR-0046 catalog byte cache's counters handle, or
+    /// The ADR-0046 fetcher cache's disk-tier counters handle (#97), or `None`
+    /// when the fetcher cache is RAM-only (no `--cache-dir`) or disabled.
+    /// Rendered under `cache="fetch",tier="disk"`. Sourced from
+    /// [`ravel_query::ReadCache::disk_metrics`].
+    pub cache_disk_metrics: Option<Arc<ravel_cache::CacheMetrics>>,
+    /// The ADR-0046 catalog byte cache's RAM-tier counters handle, or
     /// `None` when `--disable-cache` leaves no catalog byte cache constructed
-    /// at all. Rendered under `cache="catalog"`, the same family as the fetcher
+    /// at all. Rendered under `cache="catalog"` (with `tier="ram"` when a disk
+    /// tier coexists), the same family as the fetcher
     /// cache above, so the documented hit-rate formula covers every ADR-0046
     /// cache in the process, not just the fetcher one. Sourced from
     /// [`ravel_catalog::Catalog::byte_cache_metrics`].
     pub catalog_cache_metrics: Option<Arc<ravel_cache::CacheMetrics>>,
+    /// The ADR-0046 catalog byte cache's disk-tier counters handle (#97), or
+    /// `None` when the catalog byte cache is RAM-only (no `--cache-dir`) or
+    /// disabled. Rendered under `cache="catalog",tier="disk"`. Sourced from
+    /// [`ravel_catalog::Catalog::byte_cache_disk_metrics`].
+    pub catalog_cache_disk_metrics: Option<Arc<ravel_cache::CacheMetrics>>,
     /// The one process-wide admission controller (ADR-0051), shared with every
     /// ingest path. Always present (built in every mode); in a mode that
     /// serves no ingest its `usage_snapshot` is simply empty, so the admission
@@ -3258,8 +3349,16 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         .cache_metrics
         .as_ref()
         .map(|metrics| metrics.snapshot());
+    let cache_disk_snapshot = state
+        .cache_disk_metrics
+        .as_ref()
+        .map(|metrics| metrics.snapshot());
     let catalog_cache_snapshot = state
         .catalog_cache_metrics
+        .as_ref()
+        .map(|metrics| metrics.snapshot());
+    let catalog_cache_disk_snapshot = state
+        .catalog_cache_disk_metrics
         .as_ref()
         .map(|metrics| metrics.snapshot());
 
@@ -3345,7 +3444,9 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         state.merge_memory.as_ref(),
         scrub_snapshot.as_ref(),
         cache_snapshot.as_ref(),
+        cache_disk_snapshot.as_ref(),
         catalog_cache_snapshot.as_ref(),
+        catalog_cache_disk_snapshot.as_ref(),
         &admission_snapshot,
         &query_rows,
         ingest_concurrency_shed_total,
@@ -3419,6 +3520,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             &AdmissionCountersSnapshot::default(),
             &[],
             0,
@@ -3466,7 +3569,9 @@ mod tests {
         // eighth, added by ADR-0051 section 6 for the admission family; `cache`
         // is the ninth, added to split the read-cache family into
         // the fetcher and catalog byte caches; `kind` is the tenth, added by
-        // ADR-0065 decision 4 for the RLOG merge-memory gauge.
+        // ADR-0065 decision 4 for the RLOG merge-memory gauge; `tier` is the
+        // eleventh, added by #97 to split each read cache into its RAM and
+        // local-disk tiers.
         let one_of_each = [
             Label::TenantHash(TenantHashLabel::Other),
             Label::Signal(Signal::Metrics),
@@ -3478,6 +3583,7 @@ mod tests {
             Label::RejectReason(RejectReason::ByteRate),
             Label::ScrubReason(ScrubReason::Missing),
             Label::Cache(CacheFamily::Fetch),
+            Label::CacheTier(CacheTier::Ram),
             Label::MergeMemoryKind(MergeMemoryKind::Transient),
         ];
         let keys: Vec<&'static str> = one_of_each
@@ -3493,6 +3599,7 @@ mod tests {
                 Label::RejectReason(_) => "reason",
                 Label::ScrubReason(_) => "reason",
                 Label::Cache(_) => "cache",
+                Label::CacheTier(_) => "tier",
                 Label::MergeMemoryKind(_) => "kind",
             })
             .collect();
@@ -3512,16 +3619,17 @@ mod tests {
                 // to it.
                 "reason",
                 "cache",
+                "tier",
                 "kind",
             ],
             "ADR-0044 section 4's allowlist plus ADR-0051 section 6's `reason` (also reused by \
-             ADR-0059 section 2's scrub seal-divergence family), the `cache` label, and \
-             ADR-0065 decision 4's `kind`; `shard` must never appear here"
+             ADR-0059 section 2's scrub seal-divergence family), the `cache` label, #97's `tier` \
+             label, and ADR-0065 decision 4's `kind`; `shard` must never appear here"
         );
         assert_eq!(
             one_of_each.len(),
-            11,
-            "exactly 11 label variants, 10 distinct keys"
+            12,
+            "exactly 12 label variants, 11 distinct keys"
         );
     }
 
@@ -3551,6 +3659,8 @@ mod tests {
             &populated_store_snapshot(),
             &ingest,
             &CatalogCountersSnapshot::default(),
+            None,
+            None,
             None,
             None,
             None,
@@ -3628,6 +3738,8 @@ mod tests {
             &populated_store_snapshot(),
             &ingest,
             &CatalogCountersSnapshot::default(),
+            None,
+            None,
             None,
             None,
             None,
@@ -3760,6 +3872,8 @@ mod tests {
             &store,
             &ingest,
             &catalog,
+            None,
+            None,
             None,
             None,
             None,
@@ -3939,6 +4053,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             &AdmissionCountersSnapshot::default(),
             &[],
             0,
@@ -3994,6 +4110,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             &AdmissionCountersSnapshot::default(),
             &[],
             0,
@@ -4017,6 +4135,8 @@ mod tests {
             &StoreMetricsSnapshot::default(),
             &[],
             &CatalogCountersSnapshot::default(),
+            None,
+            None,
             None,
             None,
             None,
@@ -4086,6 +4206,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             &AdmissionCountersSnapshot::default(),
             &[],
             0,
@@ -4134,6 +4256,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             &AdmissionCountersSnapshot::default(),
             &[],
             0,
@@ -4167,6 +4291,8 @@ mod tests {
             &StoreMetricsSnapshot::default(),
             &[],
             &CatalogCountersSnapshot::default(),
+            None,
+            None,
             None,
             None,
             None,
@@ -4272,6 +4398,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             &AdmissionCountersSnapshot::default(),
             &[],
             0,
@@ -4312,6 +4440,8 @@ mod tests {
             &StoreMetricsSnapshot::default(),
             &[],
             &CatalogCountersSnapshot::default(),
+            None,
+            None,
             None,
             None,
             None,
@@ -4365,6 +4495,8 @@ mod tests {
             &CatalogCountersSnapshot::default(),
             None,
             Some(&snapshot),
+            None,
+            None,
             None,
             None,
             None,
@@ -4456,6 +4588,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             &AdmissionCountersSnapshot::default(),
             &[],
             0,
@@ -4525,6 +4659,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             &AdmissionCountersSnapshot::default(),
             &[],
             0,
@@ -4572,6 +4708,8 @@ mod tests {
             None,
             None,
             Some(&snapshot),
+            None,
+            None,
             None,
             None,
             &AdmissionCountersSnapshot::default(),
@@ -4655,6 +4793,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             &AdmissionCountersSnapshot::default(),
             &[],
             0,
@@ -4699,6 +4839,8 @@ mod tests {
             &CatalogCountersSnapshot::default(),
             None,
             Some(&snapshot),
+            None,
+            None,
             None,
             None,
             None,
@@ -4779,7 +4921,9 @@ mod tests {
             None,
             None,
             Some(&fetch),
+            None,
             Some(&catalog),
+            None,
             &AdmissionCountersSnapshot::default(),
             &[],
             0,
@@ -4868,6 +5012,120 @@ mod tests {
         );
     }
 
+    /// #97: with NO disk tier configured for either cache, the `ravel_cache_*`
+    /// family renders byte-for-byte the pre-#97 output -- every sample carries
+    /// only `mode=`/`cache=`, and no `tier=` label appears anywhere. Pinned as a
+    /// byte-for-byte fixture so an accidental unconditional `tier=` label (or any
+    /// other shape drift) breaks this compile-independent contract loudly.
+    #[test]
+    fn no_disk_tier_renders_pre_task_output_byte_for_byte() {
+        let fetch = CacheMetricsSnapshot {
+            hits: 10,
+            misses: 4,
+            bytes_served: 2048,
+            bytes_admitted: 1024,
+            evictions: 2,
+            disk_errors_degraded_to_misses: 3,
+            disk_entries_expired_max_age: 7,
+            ..Default::default()
+        };
+        let catalog = CacheMetricsSnapshot {
+            hits: 70,
+            misses: 5,
+            bytes_served: 4096,
+            bytes_admitted: 8192,
+            evictions: 6,
+            ..Default::default()
+        };
+        let mut out = String::new();
+        // No disk snapshot for either family: the pre-#97 shape.
+        render_cache_family(
+            &mut out,
+            Mode::Gateway,
+            Some(&fetch),
+            None,
+            Some(&catalog),
+            None,
+        );
+
+        const EXPECTED: &str = "\
+# HELP ravel_cache_hits_total Read-cache lookups served from the cache.
+# TYPE ravel_cache_hits_total counter
+ravel_cache_hits_total{mode=\"gateway\",cache=\"fetch\"} 10
+ravel_cache_hits_total{mode=\"gateway\",cache=\"catalog\"} 70
+# HELP ravel_cache_misses_total Read-cache lookups not found in the cache.
+# TYPE ravel_cache_misses_total counter
+ravel_cache_misses_total{mode=\"gateway\",cache=\"fetch\"} 4
+ravel_cache_misses_total{mode=\"gateway\",cache=\"catalog\"} 5
+# HELP ravel_cache_bytes_served_total Bytes served from the cache on a hit.
+# TYPE ravel_cache_bytes_served_total counter
+ravel_cache_bytes_served_total{mode=\"gateway\",cache=\"fetch\"} 2048
+ravel_cache_bytes_served_total{mode=\"gateway\",cache=\"catalog\"} 4096
+# HELP ravel_cache_bytes_admitted_total Bytes admitted into the cache after a miss.
+# TYPE ravel_cache_bytes_admitted_total counter
+ravel_cache_bytes_admitted_total{mode=\"gateway\",cache=\"fetch\"} 1024
+ravel_cache_bytes_admitted_total{mode=\"gateway\",cache=\"catalog\"} 8192
+# HELP ravel_cache_evictions_total Entries evicted from the read cache by its S3-FIFO policy.
+# TYPE ravel_cache_evictions_total counter
+ravel_cache_evictions_total{mode=\"gateway\",cache=\"fetch\"} 2
+ravel_cache_evictions_total{mode=\"gateway\",cache=\"catalog\"} 6
+# HELP ravel_cache_disk_errors_degraded_to_misses_total Disk-tier reads that found an entry at its canonical path but discarded it (short read, bad header, key mismatch, or a failed crc32c check) rather than a clean miss. Nonzero here means the disk tier is unhealthy, not merely cold.
+# TYPE ravel_cache_disk_errors_degraded_to_misses_total counter
+ravel_cache_disk_errors_degraded_to_misses_total{mode=\"gateway\",cache=\"fetch\"} 3
+ravel_cache_disk_errors_degraded_to_misses_total{mode=\"gateway\",cache=\"catalog\"} 0
+# HELP ravel_cache_disk_entries_expired_max_age_total Disk-tier entries dropped because their stamped write time aged past the configured max-age (ADR-0064), by a read, the startup scan, or the periodic sweep. This is an expiry, not corruption: the bytes of an erased subject are physically removed from local disk within the max-age bound.
+# TYPE ravel_cache_disk_entries_expired_max_age_total counter
+ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"fetch\"} 7
+ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\"} 0
+";
+        assert_eq!(
+            out, EXPECTED,
+            "with no disk tier the cache family must render byte-for-byte its pre-#97 shape, with \
+             no tier= label anywhere"
+        );
+        assert!(
+            !out.contains("tier="),
+            "no --cache-dir means no tier= label on any cache sample:\n{out}"
+        );
+    }
+
+    /// #97: once a disk tier exists for a family, that family's RAM sample gains
+    /// `tier="ram"` and its disk sample carries `tier="disk"`, the two orthogonal
+    /// labels splitting the family. The counterpart to the pinned no-disk fixture
+    /// above: this is the shape the `tier=` label is allowed to appear in.
+    #[test]
+    fn disk_tier_present_splits_the_family_by_tier_label() {
+        let fetch = CacheMetricsSnapshot {
+            hits: 10,
+            ..Default::default()
+        };
+        let fetch_disk = CacheMetricsSnapshot {
+            hits: 3,
+            ..Default::default()
+        };
+        let mut out = String::new();
+        render_cache_family(
+            &mut out,
+            Mode::Gateway,
+            Some(&fetch),
+            Some(&fetch_disk),
+            None,
+            None,
+        );
+        assert!(
+            out.contains(
+                "ravel_cache_hits_total{mode=\"gateway\",cache=\"fetch\",tier=\"ram\"} 10"
+            ),
+            "the RAM sample must carry tier=ram when a disk tier coexists:\n{out}"
+        );
+        assert!(
+            out.contains(
+                "ravel_cache_hits_total{mode=\"gateway\",cache=\"fetch\",tier=\"disk\"} 3"
+            ),
+            "the disk sample must carry tier=disk:\n{out}"
+        );
+    }
+
     #[test]
     fn only_the_attached_cache_family_renders() {
         // The fetcher cache is off (None) but the catalog byte cache is on:
@@ -4887,7 +5145,9 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some(&catalog),
+            None,
             &AdmissionCountersSnapshot::default(),
             &[],
             0,
@@ -4916,6 +5176,8 @@ mod tests {
             &StoreMetricsSnapshot::default(),
             &[],
             &CatalogCountersSnapshot::default(),
+            None,
+            None,
             None,
             None,
             None,
@@ -5010,6 +5272,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             &snapshot,
             &[],
             0,
@@ -5078,6 +5342,8 @@ mod tests {
             &StoreMetricsSnapshot::default(),
             &[],
             &CatalogCountersSnapshot::default(),
+            None,
+            None,
             None,
             None,
             None,
@@ -5159,6 +5425,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             &snapshot,
             &[],
             0,
@@ -5202,6 +5470,8 @@ mod tests {
             &StoreMetricsSnapshot::default(),
             &[],
             &CatalogCountersSnapshot::default(),
+            None,
+            None,
             None,
             None,
             None,
@@ -5416,6 +5686,8 @@ mod tests {
             &StoreMetricsSnapshot::default(),
             &[],
             &CatalogCountersSnapshot::default(),
+            None,
+            None,
             None,
             None,
             None,

@@ -30,7 +30,7 @@ use std::time::Duration;
 use ravel_catalog::{Catalog, SegmentRef};
 use ravel_ingest::Clock;
 use ravel_object_store::ObjectStoreBackend;
-use ravel_query::{CacheFetchError, LogQuery, LogSegmentFetcher, SegmentFetcher};
+use ravel_query::{LogQuery, LogSegmentFetcher, ReadCache, SegmentFetcher};
 use ravel_types::{Signal, TenantHash, TimeRange};
 
 /// Per (tenant, signal), the number of most-recent parts warmed.
@@ -56,7 +56,7 @@ const WARM_LOOKBACK_NS: i64 = 24 * 60 * 60 * 1_000_000_000;
 pub async fn warm_cache(
     store: Arc<dyn ObjectStoreBackend>,
     catalog: Arc<Catalog>,
-    cache: Arc<ravel_cache::Cache<CacheFetchError>>,
+    cache: ReadCache,
     clock: &dyn Clock,
 ) {
     let now_ns = clock.now_ns();
@@ -80,7 +80,7 @@ pub async fn warm_cache(
 async fn warm_cache_inner(
     store: Arc<dyn ObjectStoreBackend>,
     catalog: Arc<Catalog>,
-    cache: Arc<ravel_cache::Cache<CacheFetchError>>,
+    cache: ReadCache,
     now_ns: i64,
 ) {
     let tenants = match ravel_maintain::discover_tenants(store.as_ref()).await {
@@ -292,8 +292,14 @@ mod tests {
     }
 
     fn catalog_for(store: Arc<dyn ObjectStoreBackend>) -> Arc<Catalog> {
-        crate::query::build_catalog(store, 1, false, ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES)
-            .expect("catalog")
+        crate::query::build_catalog(
+            store,
+            1,
+            false,
+            ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES,
+            None,
+        )
+        .expect("catalog")
     }
 
     #[tokio::test]
@@ -312,7 +318,13 @@ mod tests {
         )));
         assert!(cache.is_empty(), "sanity: nothing fetched yet");
 
-        warm_cache(store, catalog, cache.clone(), &FixedClock(now)).await;
+        warm_cache(
+            store,
+            catalog,
+            ReadCache::Ram(cache.clone()),
+            &FixedClock(now),
+        )
+        .await;
 
         assert!(
             !cache.is_empty(),
@@ -331,7 +343,13 @@ mod tests {
             1024 * 1024,
         )));
 
-        warm_cache(store, catalog, cache.clone(), &FixedClock(now_ns())).await;
+        warm_cache(
+            store,
+            catalog,
+            ReadCache::Ram(cache.clone()),
+            &FixedClock(now_ns()),
+        )
+        .await;
 
         assert!(cache.is_empty(), "no tenants means nothing to warm");
     }
@@ -354,7 +372,13 @@ mod tests {
             1024 * 1024,
         )));
 
-        warm_cache(store.clone(), catalog, cache.clone(), &FixedClock(now_ns())).await;
+        warm_cache(
+            store.clone(),
+            catalog,
+            ReadCache::Ram(cache.clone()),
+            &FixedClock(now_ns()),
+        )
+        .await;
 
         assert!(
             cache.is_empty(),
@@ -426,7 +450,7 @@ mod tests {
         )));
 
         let warm = tokio::spawn(async move {
-            warm_cache(store, catalog, cache, &FixedClock(now_ns())).await;
+            warm_cache(store, catalog, ReadCache::Ram(cache), &FixedClock(now_ns())).await;
         });
 
         // No manual `advance()`: the child's own `WARM_DEADLINE` sleep is only

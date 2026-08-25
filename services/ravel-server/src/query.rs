@@ -1,13 +1,14 @@
 //! Builds the `ravel-query` `AppState` (catalog + engine) mounted at `/api/v1/*`,
 //! and, behind the `sql` feature, the `SqlState` for `/api/v1/sql`.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use ravel_cache::Cache;
+use ravel_cache::CacheLimits;
 use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_query::http::{AppState, TenantResolver};
-use ravel_query::{CacheFetchError, EngineConfig, QueryAdmissionController, QueryEngine};
+use ravel_query::{EngineConfig, QueryAdmissionController, QueryEngine, ReadCache};
 use ravel_types::accounting::{AccountedOp, CostEstimate, QueryAccountingSnapshot};
 
 /// The per-query `stats` object attached beside a query response's data
@@ -93,11 +94,21 @@ pub fn fragments_json(entries: &[crate::distrib::FragmentStatEntry]) -> serde_js
 /// byte cache; otherwise `cache_max_bytes` is the catalog byte cache's total
 /// budget, sharing one number with the fetcher cache. The other two byte-cache
 /// bounds keep their catalog defaults (the CLI has no flag for them).
+///
+/// `cache_dir` is the CLI's `--cache-dir` (#97). When present and the byte cache
+/// is not disabled, the catalog byte cache gains an ADR-0046 local-disk tier at
+/// that path. Its [`CacheLimits`] reuse the SAME `cache_max_bytes` number for
+/// both the RAM and disk tiers (there is no separate disk-tier capacity flag),
+/// with this crate's own byte-cache entry-count/max-entry-bytes defaults, so the
+/// disk tier shares the one `--cache-max-bytes` number the fetcher cache and the
+/// catalog RAM tier already share. `--disable-cache` (the `0` sentinel) wins
+/// over a configured `cache_dir`: no cache of either tier is built.
 pub fn build_catalog(
     store: Arc<dyn ObjectStoreBackend>,
     shard_count: u32,
     disable_cache: bool,
     cache_max_bytes: u64,
+    cache_dir: Option<PathBuf>,
 ) -> anyhow::Result<Arc<Catalog>> {
     // `0` is the byte cache's disabled sentinel (ravel_catalog::CatalogConfig):
     // Catalog::new then constructs no byte cache. Mirrors how build_cache turns
@@ -117,6 +128,23 @@ pub fn build_catalog(
     let catalog = Catalog::new(store, catalog_config)
         .map_err(|err| anyhow::anyhow!("failed to build catalog: {err}"))?
         .with_provisioning_enforcement();
+    // #97: attach the ADR-0046 disk tier to the byte cache when --cache-dir is
+    // set and the byte cache is enabled. Both tiers reuse the same
+    // cache_max_bytes number and this crate's byte-cache entry/entry-byte
+    // defaults, not the ravel-server fetcher constants (a different cache).
+    // `with_disk_byte_cache` is a no-op when the byte cache is disabled, so the
+    // `byte_cache_max_bytes != 0` guard here matches its own disabled-wins rule.
+    let catalog = match cache_dir {
+        Some(dir) if byte_cache_max_bytes != 0 => {
+            let limits = CacheLimits::new(
+                cache_max_bytes,
+                ravel_catalog::DEFAULT_BYTE_CACHE_MAX_ENTRIES,
+                ravel_catalog::DEFAULT_BYTE_CACHE_MAX_ENTRY_BYTES,
+            );
+            catalog.with_disk_byte_cache(limits, dir, limits)
+        }
+        _ => catalog,
+    };
     Ok(Arc::new(catalog))
 }
 
@@ -130,7 +158,7 @@ pub fn build_app_state(
     catalog: Arc<Catalog>,
     store: Arc<dyn ObjectStoreBackend>,
     tenant_resolver: Arc<dyn TenantResolver>,
-    cache: Option<Arc<Cache<CacheFetchError>>>,
+    cache: Option<ReadCache>,
     engine_config: EngineConfig,
     query_accounting: Arc<crate::metrics::QueryAccountingMetrics>,
     query_admission: Arc<QueryAdmissionController>,
@@ -235,7 +263,7 @@ pub fn build_sql_state(
     catalog: Arc<Catalog>,
     store: Arc<dyn ObjectStoreBackend>,
     tenant_resolver: Arc<dyn TenantResolver>,
-    cache: Option<Arc<Cache<CacheFetchError>>>,
+    cache: Option<ReadCache>,
     engine_config: EngineConfig,
     max_query_bytes: usize,
     max_tenant_bytes: usize,
@@ -335,6 +363,7 @@ mod catalog_cache_tests {
             1,
             false,
             ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES,
+            None,
         )
         .expect("catalog");
         let engine_config = EngineConfig {
@@ -369,8 +398,14 @@ mod catalog_cache_tests {
     #[test]
     fn build_catalog_disable_cache_constructs_no_byte_cache() {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-        let catalog = build_catalog(store, 1, true, ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES)
-            .expect("catalog builds");
+        let catalog = build_catalog(
+            store,
+            1,
+            true,
+            ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES,
+            None,
+        )
+        .expect("catalog builds");
         assert!(
             catalog.byte_cache_metrics().is_none(),
             "--disable-cache must leave the catalog with no byte cache constructed"
@@ -427,7 +462,7 @@ mod catalog_cache_tests {
     fn build_catalog_wires_cache_max_bytes_through_to_the_byte_cache() {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let budget = 7 * 1024 * 1024;
-        let catalog = build_catalog(store, 1, false, budget).expect("catalog builds");
+        let catalog = build_catalog(store, 1, false, budget, None).expect("catalog builds");
         assert_eq!(
             catalog.config().byte_cache_max_bytes,
             budget,
@@ -461,6 +496,7 @@ mod tests {
             1,
             false,
             ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES,
+            None,
         )
         .expect("catalog");
         let tenant_resolver: Arc<dyn TenantResolver> =
@@ -514,6 +550,7 @@ mod tests {
             1,
             false,
             ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES,
+            None,
         )
         .expect("catalog");
         let engine_config = EngineConfig {
@@ -556,6 +593,7 @@ mod tests {
             1,
             false,
             ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES,
+            None,
         )
         .expect("catalog");
         let budgets = crate::Cli::try_parse_from(argv)
