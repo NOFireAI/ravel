@@ -562,7 +562,7 @@ mod tests {
         let controller = AdmissionController::new(clock.clone(), count_only_limits(100));
         controller.set_tenant_limits(tenant.clone(), count_only_limits(100));
         for i in 0..10u8 {
-            controller.admit_series(&tenant, [series(i)], clock.now_ns());
+            controller.admit_series(&tenant, &[series(i)], clock.now_ns());
         }
 
         // The SECOND LIST under the admission prefix faults; the first passes.
@@ -640,7 +640,7 @@ mod tests {
         let clock = TestClock::new(500 * R_NS);
         let controller = AdmissionController::new(clock.clone(), count_only_limits(100));
         controller.set_tenant_limits(tenant.clone(), count_only_limits(100));
-        controller.admit_series(&tenant, [series(1), series(2)], clock.now_ns());
+        controller.admit_series(&tenant, &[series(1), series(2)], clock.now_ns());
 
         let store = Arc::new(MemoryStore::new());
         reconcile_once(&controller, store.as_ref(), R, clock.now_ns()).await;

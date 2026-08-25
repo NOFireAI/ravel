@@ -374,7 +374,7 @@ async fn write_batch(
         .map_err(IngestRequestError::Admission)?;
     let admission = ingest
         .admission
-        .admit_series(tenant, candidate_series, ingest_ts_ns);
+        .admit_series(tenant, &candidate_series, ingest_ts_ns);
     let points_before = points.len();
     if !admission.rejected.is_empty() {
         let admitted: HashSet<SeriesId> = admission.admitted.into_iter().collect();

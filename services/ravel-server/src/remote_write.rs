@@ -402,7 +402,9 @@ async fn remote_write(
         state.metrics.record_request_rejected();
         return admission_rejection_response(rejection);
     }
-    let admission = state.admission.admit_series(&tenant, candidate_series, now);
+    let admission = state
+        .admission
+        .admit_series(&tenant, &candidate_series, now);
     if !admission.rejected.is_empty() {
         let admitted: HashSet<SeriesId> = admission.admitted.into_iter().collect();
         ingest_points.retain(|p| admitted.contains(&p.series_id));

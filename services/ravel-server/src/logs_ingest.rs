@@ -239,7 +239,7 @@ pub async fn handle_export_logs(
         .map_err(LogIngestRequestError::Admission)?;
     let admission = state
         .admission
-        .admit_streams(&tenant, candidate_streams, ingest_ts_ns);
+        .admit_streams(&tenant, &candidate_streams, ingest_ts_ns);
     let stream_cap_rejected = admission.rejected.len();
     if stream_cap_rejected > 0 {
         let admitted: HashSet<LogStreamId> = admission.admitted.into_iter().collect();

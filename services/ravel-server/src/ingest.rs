@@ -199,7 +199,7 @@ pub async fn handle_export(
         .map_err(IngestRequestError::Admission)?;
     let admission = state
         .admission
-        .admit_series(&tenant, candidate_series, ingest_ts_ns);
+        .admit_series(&tenant, &candidate_series, ingest_ts_ns);
     let series_cap_rejected = admission.rejected.len();
     if series_cap_rejected > 0 {
         let admitted: HashSet<SeriesId> = admission.admitted.into_iter().collect();
