@@ -228,6 +228,15 @@ cargo run -p ravel-bench --features sql-latency --bin sql_latency_bench -- \
   so a partial table cannot pass for a complete one. Pair it with `--runs 1`
   and a generous `--deadline-secs` for the first pass over a new dataset, then
   choose the deadline for the `--runs 3` table from what that pass measured.
+- `--fetch-concurrency <N>` is the executor's `fetch_concurrency` (ADR-0088),
+  the same knob as `ravel-server --fetch-concurrency`: the logs scan's
+  partition count and the bound on in-flight segment fetches per query. Default
+  8, ravel-query's compiled-in value and what every earlier run used. A
+  full-scan statement's cold time is latency-bound at the object store (a few
+  hundred KB per GET, a few MB/s per connection), so it moves nearly linearly
+  with this up to the host's cores; the value is recorded in the report's
+  provenance as `fetch_concurrency`, and two tables at different values are
+  not comparable without it.
 - A resolve that finds **0 objects** is now an error naming the tenant, the
   resolved shard count, the window, and `now_ns`, rather than a silent report
   over an empty dataset. A wrong `--window-hours` (the event-time span the

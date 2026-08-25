@@ -45,7 +45,9 @@ use ravel_logseg::{
     AttrValue, LogRecord, ObjectIdentity, RlogConfig, RlogWriter, stream_attrs_bytes,
 };
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
-use ravel_query::{CacheFetchError, LogSegmentFetcher, SegmentFetcher};
+use ravel_query::{
+    CacheFetchError, DEFAULT_FETCH_CONCURRENCY, EngineConfig, LogSegmentFetcher, SegmentFetcher,
+};
 use ravel_sql::{
     DeclaredColumn, DeclaredType, SpanSegmentFetcher, SqlConfig, SqlExecutor, SqlRequest,
     StaticDeclaredColumns,
@@ -169,6 +171,17 @@ pub struct Provenance {
     /// `failed`, not as a latency.
     #[serde(default = "default_deadline_secs")]
     pub deadline_secs: u64,
+    /// The executor's `fetch_concurrency` (logs scan partitions and in-flight
+    /// segment fetches per query). Recorded because the cold floor of a
+    /// full-scan statement is latency-bound and moves nearly linearly with it.
+    #[serde(default = "default_fetch_concurrency")]
+    pub fetch_concurrency: usize,
+}
+
+/// What every run used before the knob was configurable (issue #680); also
+/// what a report written before the field existed deserializes to.
+fn default_fetch_concurrency() -> usize {
+    DEFAULT_FETCH_CONCURRENCY
 }
 
 /// The deadline every run used before it became configurable (issue #688);
@@ -323,6 +336,11 @@ pub struct GenerateConfig {
     /// [`SqlLatencyReport::failed`] and the run moves on; when `false` the first
     /// failure aborts the run with its error.
     pub continue_on_error: bool,
+    /// [`EngineConfig::fetch_concurrency`] for the executor: the logs scan's
+    /// partition count and the bound on in-flight segment fetches per query
+    /// (ADR-0088's single coupled knob, `ravel-server --fetch-concurrency`).
+    /// Defaults to [`ravel_query::DEFAULT_FETCH_CONCURRENCY`].
+    pub fetch_concurrency: usize,
 }
 
 /// Inputs for the loaded-tenant lane.
@@ -365,6 +383,11 @@ pub struct TenantConfigInput {
     /// [`SqlLatencyReport::failed`] and the run moves on; when `false` the first
     /// failure aborts the run with its error.
     pub continue_on_error: bool,
+    /// [`EngineConfig::fetch_concurrency`] for the executor: the logs scan's
+    /// partition count and the bound on in-flight segment fetches per query
+    /// (ADR-0088's single coupled knob, `ravel-server --fetch-concurrency`).
+    /// Defaults to [`ravel_query::DEFAULT_FETCH_CONCURRENCY`].
+    pub fetch_concurrency: usize,
 }
 
 fn percentile(sorted_ns: &[u64], pct: f64) -> u64 {
@@ -452,6 +475,7 @@ fn cold_executor(
     max_query_bytes: usize,
     shard_count: u32,
     cache: Option<Arc<Cache<CacheFetchError>>>,
+    fetch_concurrency: usize,
 ) -> Result<SqlExecutor, Error> {
     let catalog = Arc::new(Catalog::new(
         Arc::clone(store),
@@ -471,6 +495,10 @@ fn cold_executor(
         SpanSegmentFetcher::new(Arc::clone(store)),
         SqlConfig {
             max_query_bytes,
+            engine: EngineConfig {
+                fetch_concurrency: fetch_concurrency.max(1),
+                ..EngineConfig::default()
+            },
             ..SqlConfig::default()
         },
         1 << 30,
@@ -501,6 +529,7 @@ pub async fn measure_corpus(
     cache_bytes: u64,
     deadline: Duration,
     continue_on_error: bool,
+    fetch_concurrency: usize,
 ) -> Result<(Vec<EntryReport>, Vec<SkippedEntry>, Vec<FailedEntry>), Error> {
     let runs = runs.max(1);
     let mut measured = Vec::new();
@@ -535,7 +564,14 @@ pub async fn measure_corpus(
         // across entries would warm one statement from another's reads over the
         // same segments.
         let cache = (cache_bytes > 0).then(|| build_read_cache(cache_bytes));
-        let executor = cold_executor(store, declared, max_query_bytes, shard_count, cache)?;
+        let executor = cold_executor(
+            store,
+            declared,
+            max_query_bytes,
+            shard_count,
+            cache,
+            fetch_concurrency,
+        )?;
         let req = SqlRequest {
             sql: entry.sql.clone(),
             window,
@@ -698,6 +734,7 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
         cfg.cache_bytes,
         cfg.deadline,
         cfg.continue_on_error,
+        cfg.fetch_concurrency,
     )
     .await?;
 
@@ -712,6 +749,7 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
             runs: cfg.runs.max(1),
             cache_bytes: cfg.cache_bytes,
             deadline_secs: cfg.deadline.as_secs(),
+            fetch_concurrency: cfg.fetch_concurrency.max(1),
         },
         dataset,
         entries,
@@ -780,6 +818,7 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
         cfg.cache_bytes,
         cfg.deadline,
         cfg.continue_on_error,
+        cfg.fetch_concurrency,
     )
     .await?;
 
@@ -794,6 +833,7 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
             runs: cfg.runs.max(1),
             cache_bytes: cfg.cache_bytes,
             deadline_secs: cfg.deadline.as_secs(),
+            fetch_concurrency: cfg.fetch_concurrency.max(1),
         },
         dataset,
         entries,
@@ -1092,6 +1132,7 @@ mod tests {
             cache_bytes,
             deadline: Duration::from_secs(30),
             continue_on_error: false,
+            fetch_concurrency: DEFAULT_FETCH_CONCURRENCY,
         }
     }
 
@@ -1206,6 +1247,7 @@ mod tests {
             0,
             Duration::from_millis(20),
             true,
+            DEFAULT_FETCH_CONCURRENCY,
         )
         .await
         .expect("run continues past the expiry");
@@ -1422,15 +1464,29 @@ mod tests {
         // Fetcher cache ON: a fresh executor (cold catalog byte cache, cold
         // fetcher cache), one run.
         let cache = build_read_cache(64 << 20);
-        let cached = cold_executor(&store, &[], DEFAULT_MAX_QUERY_BYTES, 1, Some(cache))
-            .expect("build cached executor");
+        let cached = cold_executor(
+            &store,
+            &[],
+            DEFAULT_MAX_QUERY_BYTES,
+            1,
+            Some(cache),
+            DEFAULT_FETCH_CONCURRENCY,
+        )
+        .expect("build cached executor");
         let on = cached.execute(th, &req).await.expect("cached run");
 
         // Fetcher cache OFF: a fresh executor (identical cold catalog byte cache,
         // no fetcher cache), one run. The catalog contribution is the same in
         // both, so any delta is the fetcher cache alone.
-        let uncached = cold_executor(&store, &[], DEFAULT_MAX_QUERY_BYTES, 1, None)
-            .expect("build uncached executor");
+        let uncached = cold_executor(
+            &store,
+            &[],
+            DEFAULT_MAX_QUERY_BYTES,
+            1,
+            None,
+            DEFAULT_FETCH_CONCURRENCY,
+        )
+        .expect("build uncached executor");
         let off = uncached.execute(th, &req).await.expect("uncached run");
 
         let get_on = on.accounting.s3_requests(AccountedOp::Get);
@@ -1456,12 +1512,34 @@ mod tests {
     /// reverting `cold_executor` to `SqlConfig::default()` makes this fail rather
     /// than pass on a coincidental default (its companion test covers the
     /// default itself).
+    /// `--fetch-concurrency` must land on `EngineConfig::fetch_concurrency`
+    /// (the logs scan's partition count and in-flight fetch bound), not stop at
+    /// a parsed field; reverting `cold_executor` to `EngineConfig::default()`
+    /// fails this on the distinct value.
+    #[test]
+    fn cold_executor_threads_fetch_concurrency_override() {
+        let store = empty_store();
+        let custom = DEFAULT_FETCH_CONCURRENCY * 4;
+        assert_ne!(custom, DEFAULT_FETCH_CONCURRENCY);
+        let executor = cold_executor(&store, &[], DEFAULT_MAX_QUERY_BYTES, 1, None, custom)
+            .expect("build executor");
+        assert_eq!(executor.config().engine.fetch_concurrency, custom);
+        let executor = cold_executor(&store, &[], DEFAULT_MAX_QUERY_BYTES, 1, None, 0)
+            .expect("build executor");
+        assert_eq!(
+            executor.config().engine.fetch_concurrency,
+            1,
+            "a zero is clamped to one partition, never a zero-partition plan"
+        );
+    }
+
     #[test]
     fn cold_executor_threads_max_query_bytes_override() {
         let store = empty_store();
         let custom = DEFAULT_MAX_QUERY_BYTES * 4;
         assert_ne!(custom, DEFAULT_MAX_QUERY_BYTES);
-        let executor = cold_executor(&store, &[], custom, 1, None).expect("build executor");
+        let executor = cold_executor(&store, &[], custom, 1, None, DEFAULT_FETCH_CONCURRENCY)
+            .expect("build executor");
         assert_eq!(executor.config().max_query_bytes, custom);
     }
 
@@ -1472,8 +1550,15 @@ mod tests {
     #[test]
     fn cold_executor_defaults_to_compiled_in_budget() {
         let store = empty_store();
-        let executor =
-            cold_executor(&store, &[], DEFAULT_MAX_QUERY_BYTES, 1, None).expect("build executor");
+        let executor = cold_executor(
+            &store,
+            &[],
+            DEFAULT_MAX_QUERY_BYTES,
+            1,
+            None,
+            DEFAULT_FETCH_CONCURRENCY,
+        )
+        .expect("build executor");
         assert_eq!(executor.config().max_query_bytes, DEFAULT_MAX_QUERY_BYTES);
     }
 }

@@ -26,6 +26,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use ravel_query::DEFAULT_FETCH_CONCURRENCY;
+
 use prost::Message;
 use ravel_bench::sql_corpus::checked_default_corpus;
 use ravel_bench::sql_latency::{GenerateConfig, run_generated};
@@ -93,6 +95,7 @@ async fn l0_object_count_equals_distinct_data_object_keys() {
         cache_bytes: 0,
         deadline: Duration::from_secs(30),
         continue_on_error: false,
+        fetch_concurrency: DEFAULT_FETCH_CONCURRENCY,
     };
     let report = run_generated(&cfg).await.expect("generated lane runs");
 
