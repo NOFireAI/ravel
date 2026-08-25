@@ -1,3 +1,5 @@
+//! Un-cached, over-threshold read amplification rows for issue #693.
+//!
 //! Intra-segment scan-partitioning core-count scaling benchmark (ADR-0102
 //! decision 1, epic #361 item 1).
 //!
