@@ -1525,6 +1525,59 @@ mod tests {
         assert!(matches!(err, LogSegError::Corrupted(_)), "got {err:?}");
     }
 
+    /// #693 part 2 premise: the write-time `LogFooter.block_count` counter
+    /// equals the read-time `ScanStats.blocks_total` and the unpruned survivor
+    /// count for a well-formed object, across a single block, a handful, and
+    /// enough blocks to span multiple skip-index level-1 groups (FANOUT = 64).
+    /// The predicate-free plan fast path substitutes the footer count for the
+    /// read-time count, so the two must agree on every object the writer emits.
+    ///
+    /// They are structurally tied: the writer stamps `block_count` from
+    /// `block_spans.len()` and pushes exactly one `Level0Entry` per span, and
+    /// `SkipIndex::encode`/`decode` round-trip that entry count, so
+    /// `blocks_total` (`skip.l0.len()`) reads back the same counter.
+    #[test]
+    fn footer_block_count_matches_unpruned_blocks_total() {
+        for n in [1usize, 5, 130] {
+            let cfg = RlogConfig {
+                block_target_records: 1,
+                ..RlogConfig::default()
+            };
+            // block_target_records=1 => one block per record, so n records span
+            // n blocks (n=130 > FANOUT spans 3 level-1 groups).
+            let recs: Vec<LogRecord> = (0..n as i64).map(|i| rec(0, i, "msg")).collect();
+            let obj = build(cfg, recs);
+
+            let footer = open(&obj).expect("open footer");
+            assert_eq!(
+                footer.block_count, n as u64,
+                "n={n}: writer stamps one block per record at block_target_records=1"
+            );
+
+            let reader = RlogReader::new(&obj, &cfg).expect("open reader");
+            let scan = reader
+                .scan_blocks(
+                    &Predicate::TsRange {
+                        min_ns: i64::MIN,
+                        max_ns: i64::MAX,
+                    },
+                    &[],
+                    &ColumnSelection::all(),
+                )
+                .expect("scan_blocks");
+            assert_eq!(
+                scan.stats().blocks_total,
+                footer.block_count as u32,
+                "n={n}: blocks_total == footer.block_count"
+            );
+            assert_eq!(
+                scan.remaining_blocks(),
+                footer.block_count as usize,
+                "n={n}: unpruned survivor count == footer.block_count"
+            );
+        }
+    }
+
     #[test]
     fn ts_range_prunes_to_three_blocks() {
         let cfg = RlogConfig {
