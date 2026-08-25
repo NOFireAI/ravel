@@ -147,6 +147,7 @@ type = "i64"
         4,
         10_000,
         None,
+        1,
         CLOCK_NS,
         Arc::new(FixedClock(CLOCK_NS)),
     )
@@ -271,6 +272,7 @@ type = "i64"
         4,
         10_000,
         None,
+        1,
         CLOCK_NS,
         Arc::new(FixedClock(CLOCK_NS)),
     )
@@ -375,6 +377,7 @@ type = "str"
         4,
         1, // one row per Strict flush
         None,
+        1,
         CLOCK_NS,
         Arc::new(FixedClock(CLOCK_NS)),
     )
@@ -430,6 +433,7 @@ type = "str"
         4,
         10_000,
         None,
+        1,
         CLOCK_NS,
         Arc::new(FixedClock(CLOCK_NS)),
     )
@@ -488,6 +492,7 @@ async fn attribute_columns_over_the_object_budget_fold_into_overflow_not_rejecte
         4,
         10_000,
         None,
+        1,
         CLOCK_NS,
         Arc::new(FixedClock(CLOCK_NS)),
     )

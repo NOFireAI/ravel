@@ -71,7 +71,8 @@ ravel-cli --store <your-store-flags> load \
   --mapping benchmarks/clickbench/hits.mapping.toml \
   --shards 4 \
   --batch-rows 40000 \
-  --read-cursors 4
+  --read-cursors 4 \
+  --pipeline-depth 1
 ```
 
 `--batch-rows` is the object-count lever. One batch is one Strict flush, which is
@@ -116,6 +117,33 @@ This `--batch-rows`-scales-with-`--shards` sizing floor still applies once
 assembled *from*, not how many rows in total each shard receives per batch, so
 the ~8192-rows-per-shard floor above is unchanged. Raising `--shards` still
 means raising `--batch-rows` to match, regardless of `--read-cursors`.
+
+`--pipeline-depth` is the write-latency lever, and it trades memory for it. Each
+batch's write is one S3 PUT round trip per involved shard; at the default depth
+`1` the loader submits one batch's write and waits for its ack before building or
+submitting the next, so on a fast encoder that PUT round trip is the serial term
+that dominates wall time. Raising the depth lets up to that many writes overlap:
+the loader keeps submitting later batches while earlier writes are still awaiting
+their acks, hiding the round-trip latency behind subsequent encode and I/O. The
+cost is memory. Each in-flight write keeps its built batch resident until its ack
+returns, so raising `--pipeline-depth` above `1` multiplies the live
+decoded-batch-plus-pending-write working set by roughly the depth. This cost is
+*in addition to* the `--batch-rows` x `--shards` product above, not a
+replacement for it: the per-batch resident size is still set by that product, and
+`--pipeline-depth` keeps that many built batches alive at once.
+
+As a concrete anchor (issue #682, measured at 8 shards, 80k rows, depth 1): live
+heap is about 6GB under a memory-returning allocator (tcmalloc) and scales close
+to linearly with `--batch-rows`; under the default glibc allocator the same
+geometry plateaus around 20GB because glibc's arenas retain freed blocks rather
+than returning them to the OS (arena retention, not a leak). Raising the depth
+scales that live working set by roughly the depth on top of whichever allocator
+you run. Because the real per-row cost is allocator-dependent by more than 3x,
+the loader does not compute or enforce a safe ceiling for you: size
+`--pipeline-depth` against your host's memory the same way you size the
+`--batch-rows` x `--shards` product, measuring on your own allocator rather than
+trusting a single baked-in per-row estimate. `1` reproduces today's
+one-write-at-a-time behavior exactly.
 
 The loader prints a completion summary to stdout — `rows processed`,
 `objects written`, and `elapsed` (the load wall-time ClickBench reports). It also
