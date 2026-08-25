@@ -187,6 +187,87 @@ where
         Ok((self.maybe_corrupt(bytes, from_cache), source))
     }
 
+    /// Read `key` through both tiers with **no** upstream fetch and **no**
+    /// single-flight: a plain hit-or-miss peek the caller owns entirely.
+    ///
+    /// RAM-first, falling through to disk on a RAM miss, in the exact
+    /// tier-consulting order [`TieredCache::get_or_fetch`] uses: the RAM tier's
+    /// [`Cache::get`] first and, only on its `None`, the disk tier's
+    /// [`DiskCache::get`]. A disk hit repopulates RAM read-through, identical to
+    /// `get_or_fetch`'s disk-hit branch, so the next read of `key` is a RAM hit
+    /// and this method leaves both tiers in the same state that path would.
+    ///
+    /// This is the behavioral difference from [`TieredCache::get_or_fetch`] a
+    /// future reader must not miss: `get_or_fetch` collapses a both-tier miss
+    /// onto a single-flight leader that runs the caller's upstream fetch, while
+    /// `get` runs no fetch and joins no single-flight. A `None` return is a
+    /// genuine miss in both tiers, and the caller owns all of its miss handling
+    /// (`BlockRangeFetcher` admits already-verified bytes via
+    /// [`TieredCache::insert`] with no fetch at all, and peeks a key with this
+    /// method to defer a miss to a later coalesced GET rather than fetch here).
+    /// Concurrent `get` calls for one key each consult disk independently
+    /// rather than riding one leader: single-flight exists only to protect the
+    /// upstream fetch this method never performs.
+    ///
+    /// In corruption mode (`ram` built with [`Cache::with_corruption`]) a hit
+    /// from either tier is corrupted at serve time exactly as a
+    /// [`Source::Cache`] `get_or_fetch` result is: a RAM hit through
+    /// [`Cache::get`]'s own transform, and a disk hit through the identical
+    /// [`maybe_corrupt`](Self::maybe_corrupt) call `get_or_fetch` applies. The
+    /// bytes admitted to either tier stay clean; corruption is a read-time
+    /// view. Without this, ADR-0046 decision 4's "correctness never depends on
+    /// cached state" gate would stop covering a disk-served hit read through
+    /// this new access path.
+    pub fn get(&self, key: &CacheKey) -> Option<Bytes> {
+        // Fast path: a RAM hit is served verbatim (already corrupted, in
+        // corruption mode, by `Cache::get`) and never consults disk, exactly
+        // like `get_or_fetch`'s RAM fast path.
+        if let Some(bytes) = self.ram.get(key) {
+            return Some(bytes);
+        }
+        // RAM miss: consult disk. A disk hit repopulates RAM read-through with
+        // the clean bytes, then is corrupted per-caller at serve time -- the
+        // same order `get_or_fetch`'s disk-hit branch uses, so the gate reaches
+        // a disk-served hit here identically.
+        let bytes = self.disk.get(key)?;
+        self.ram.insert(*key, bytes.clone());
+        Some(self.maybe_corrupt(bytes, true))
+    }
+
+    /// Admit `value` under `key` into **both** tiers with no upstream fetch,
+    /// matching `get_or_fetch`'s dual-tier admission policy on a fetch success
+    /// (ADR-0046 decision 3): the RAM tier via [`Cache::insert`] (which takes
+    /// [`Bytes`]) and the disk tier via [`DiskCache::insert`] (which takes a
+    /// borrowed slice). This is the plain-admission half a caller uses to cache
+    /// bytes it already fetched and verified elsewhere (`BlockRangeFetcher`),
+    /// so a later RAM eviction is served from disk rather than re-paying the S3
+    /// round trip the disk tier exists to remove. Like [`TieredCache::get`], it
+    /// touches no single-flight. `DiskCache::insert` silently declines bytes
+    /// whose length disagrees with `key.len`, so a well-formed funnel key
+    /// admits to both tiers cleanly.
+    pub fn insert(&self, key: CacheKey, value: Bytes) {
+        self.ram.insert(key, value.clone());
+        self.disk.insert(key, &value);
+    }
+
+    /// Whether the **RAM tier** holds no resident entry.
+    ///
+    /// "Empty" is defined as the RAM tier alone, not both tiers, because every
+    /// pre-existing caller of an `is_empty` on this cache (`cache_warm.rs`)
+    /// asks one question: did cache warming populate the in-RAM working set?
+    /// A warm goes through [`TieredCache::get_or_fetch`], which admits to both
+    /// tiers, so before any warm both tiers are empty and after one both are
+    /// populated -- the RAM-tier answer and the both-tier answer agree in that
+    /// caller's case. They diverge only when RAM is empty over a non-empty disk
+    /// tier (a fresh process reopening a populated cache directory, or a RAM
+    /// eviction), and there the caller's actual concern -- whether *this
+    /// process's* RAM warming did anything -- is answered by the RAM tier, not
+    /// by disk residue a prior process left. See [`Cache::is_empty`] and
+    /// [`DiskCache::is_empty`] for a single-tier check when a caller needs one.
+    pub fn is_empty(&self) -> bool {
+        self.ram.is_empty()
+    }
+
     /// Corrupts `bytes` iff they came from a cache tier and the RAM tier is in
     /// corruption mode, using the exact transform a RAM hit uses so the gate
     /// covers disk-served hits identically. Upstream (`from_cache == false`)
@@ -501,6 +582,171 @@ mod tests {
             after_disk.hits,
             before_disk.hits + 1,
             "the second read of A was a disk hit"
+        );
+    }
+
+    /// The plain `get` returns `None` on a genuine miss in BOTH tiers, and
+    /// runs no upstream fetch (it takes no fetch closure: a miss is the
+    /// caller's to handle). The disk tier is consulted, proven by its miss
+    /// counter, so the fall-through order matches `get_or_fetch`.
+    #[tokio::test]
+    async fn plain_get_double_miss_returns_none_without_fetching() {
+        let tmp = TempDir::new().unwrap();
+        let disk = DiskCache::new(tmp.path().to_path_buf(), generous_limits());
+        let disk_metrics = disk.metrics();
+        let ram: Cache<&'static str> = Cache::new(generous_limits());
+        let tiered = TieredCache::new(ram, disk);
+
+        let key = test_key(1, 5);
+        let before = disk_metrics.snapshot();
+        assert!(
+            tiered.get(&key).is_none(),
+            "a key resident in neither tier is a plain miss"
+        );
+        let after = disk_metrics.snapshot();
+        assert_eq!(
+            after.misses,
+            before.misses + 1,
+            "a RAM miss must fall through and consult the disk tier"
+        );
+        assert_eq!(after.hits, before.hits, "a double miss records no disk hit");
+    }
+
+    /// The plain `get` fast path: a RAM hit is served without consulting the
+    /// disk tier at all, mirroring `ram_hit_short_circuits_without_touching_disk`
+    /// but for the fetch-free `get`. Proven via the disk tier's own counters.
+    #[tokio::test]
+    async fn plain_get_ram_hit_short_circuits_without_touching_disk() {
+        let tmp = TempDir::new().unwrap();
+        let disk = DiskCache::new(tmp.path().to_path_buf(), generous_limits());
+        let disk_metrics = disk.metrics();
+        let ram: Cache<&'static str> = Cache::new(generous_limits());
+        let tiered = TieredCache::new(ram, disk);
+
+        let clean = Bytes::from_static(b"resident in RAM");
+        let key = test_key(1, clean.len() as u64);
+        tiered.ram.insert(key, clean.clone());
+
+        let before = disk_metrics.snapshot();
+        let served = tiered.get(&key);
+        assert_eq!(
+            served.as_deref(),
+            Some(clean.as_ref()),
+            "the RAM bytes are served verbatim"
+        );
+        let after = disk_metrics.snapshot();
+        assert_eq!(after.hits, before.hits, "a RAM hit reads no disk hit");
+        assert_eq!(
+            after.misses, before.misses,
+            "a RAM hit does not consult the disk tier at all"
+        );
+    }
+
+    /// The plain `get` on a disk-only key repopulates RAM read-through, exactly
+    /// as `get_or_fetch`'s disk-hit branch does: the next read of the key is a
+    /// RAM hit. Mirrors the `get_or_fetch` disk-repopulation proof.
+    #[tokio::test]
+    async fn plain_get_disk_only_key_repopulates_ram() {
+        let tmp = TempDir::new().unwrap();
+        let disk = DiskCache::new(tmp.path().to_path_buf(), generous_limits());
+        let ram: Cache<&'static str> = Cache::new(generous_limits());
+        let tiered = TieredCache::new(ram, disk);
+
+        let clean = Bytes::from_static(b"disk resident");
+        let key = test_key(1, clean.len() as u64);
+        // Populate disk only; RAM stays empty.
+        tiered.disk.insert(key, &clean);
+        assert!(
+            tiered.ram.get(&key).is_none(),
+            "precondition: the key is not in RAM"
+        );
+
+        let served = tiered.get(&key);
+        assert_eq!(
+            served.as_deref(),
+            Some(clean.as_ref()),
+            "a disk-only key is served from disk"
+        );
+        // Read-through: the disk hit repopulated RAM, so a direct RAM read now
+        // hits without any further disk consult.
+        assert_eq!(
+            tiered.ram.get(&key).as_deref(),
+            Some(clean.as_ref()),
+            "a disk hit must repopulate RAM so the next read is a RAM hit"
+        );
+    }
+
+    /// The plain `insert` admits to BOTH tiers (ADR-0046 decision 3's admission
+    /// policy, no upstream fetch involved). Proven by reading the disk tier
+    /// directly after the insert: the bytes are present there, not RAM alone.
+    #[tokio::test]
+    async fn plain_insert_populates_both_tiers() {
+        let tmp = TempDir::new().unwrap();
+        let disk = DiskCache::new(tmp.path().to_path_buf(), generous_limits());
+        let ram: Cache<&'static str> = Cache::new(generous_limits());
+        let tiered = TieredCache::new(ram, disk);
+
+        let value = Bytes::from_static(b"admitted to both");
+        let key = test_key(1, value.len() as u64);
+        tiered.insert(key, value.clone());
+
+        assert_eq!(
+            tiered.ram.get(&key).as_deref(),
+            Some(value.as_ref()),
+            "insert must admit to the RAM tier"
+        );
+        // Read the disk tier directly (RAM bypassed): the bytes must be there
+        // too, so a later RAM eviction is served from disk.
+        assert_eq!(
+            tiered.disk.get(&key).as_deref(),
+            Some(value.as_ref()),
+            "insert must admit to the disk tier, not RAM alone"
+        );
+    }
+
+    /// The corruption gate (ADR-0046 decision 4) reaches a disk-served hit read
+    /// through the fetch-free `get`, identically to the `get_or_fetch` proof at
+    /// module scope. A key resident only on disk, RAM in corruption mode: the
+    /// plain `get` must return corrupted bytes, not the clean disk bytes.
+    ///
+    /// To watch it bite, in `TieredCache::get`'s disk-hit branch replace
+    /// `Some(self.maybe_corrupt(bytes, true))` with `Some(bytes)`: the
+    /// `assert_ne!` below then fails because the clean disk bytes are served
+    /// through a path the acceptance gate must corrupt.
+    #[tokio::test]
+    async fn plain_get_disk_hit_is_corrupted_in_corruption_mode() {
+        let tmp = TempDir::new().unwrap();
+        let clean = Bytes::from_static(b"disk-resident payload; trust no cached byte");
+        let key = test_key(1, clean.len() as u64);
+
+        let disk = DiskCache::new(tmp.path().to_path_buf(), generous_limits());
+        disk.insert(key, &clean);
+        assert!(
+            disk.get(&key).is_some(),
+            "precondition: entry lives on disk"
+        );
+
+        let ram: Cache<&'static str> = Cache::with_corruption(generous_limits());
+        let tiered = TieredCache::new(ram, disk);
+
+        let served = tiered.get(&key).expect("a disk-resident key resolves");
+        assert_eq!(served.len(), clean.len(), "corruption preserves length");
+        assert_ne!(
+            served.as_ref(),
+            clean.as_ref(),
+            "a disk-served hit through the plain get must arrive corrupted, \
+             proving ADR-0046 decision 4's gate reaches this access path"
+        );
+
+        // The corruption an independent RAM tier in the same mode applies to
+        // the same bytes: proves the identical transform, not merely "some"
+        // mutation.
+        let ram_probe: Cache<&'static str> = Cache::with_corruption(generous_limits());
+        ram_probe.insert(key, clean.clone());
+        let ram_corrupted = ram_probe.get(&key).expect("probe RAM hit");
+        assert_eq!(
+            served, ram_corrupted,
+            "a disk-served hit must be corrupted exactly like a RAM hit"
         );
     }
 }
