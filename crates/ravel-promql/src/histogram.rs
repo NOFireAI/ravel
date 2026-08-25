@@ -646,9 +646,24 @@ fn fraction_rank(value: f64, h: &FloatHistogram) -> f64 {
 /// lation/per-second scaling factor is applied by the caller, exactly as
 /// Prometheus applies it in `extrapolatedRate` after `histogramRate` returns.
 /// Returns `None` for fewer than two samples (no defined rate), matching the
-/// float path.
+/// float path, and also for a window mixing an exponential-schema sample
+/// with a custom-buckets one: the custom-buckets sentinel scale sits far
+/// outside the exponential range, and rescaling an exponential operand
+/// toward it overflows `FloatHistogram::copy_to_scale`'s bucket-index shift
+/// (issue #678). Prometheus does not consider the two comparable at all, so
+/// refusing to combine them is conservative rather than a guessed
+/// approximation of its exact annotation for this window shape (unverified:
+/// the difftest generator cannot emit `custom_values`, so this case has no
+/// oracle-checkable fixture).
 pub fn histogram_rate(samples: &[TimedHistogram], is_counter: bool) -> Option<FloatHistogram> {
     if samples.len() < 2 {
+        return None;
+    }
+    let uses_custom = samples[0].1.uses_custom_buckets();
+    if samples
+        .iter()
+        .any(|(_, h)| h.uses_custom_buckets() != uses_custom)
+    {
         return None;
     }
     let prev0 = &samples[0].1;
@@ -681,13 +696,21 @@ pub fn histogram_rate(samples: &[TimedHistogram], is_counter: bool) -> Option<Fl
 /// Sum a group of native histograms into one, Prometheus' aggregation `sum`
 /// over histogram samples: fold with [`FloatHistogram::add_assign`] from the
 /// first member (down-converting each addend to the running schema so the
-/// bounds stay aligned). Returns `None` for an empty group.
+/// bounds stay aligned). Returns `None` for an empty group, or for a group
+/// mixing an exponential-schema member with a custom-buckets one -- the same
+/// unrescalable-schema-sentinel overflow [`histogram_rate`] guards against
+/// (issue #678), unverified here for the same reason (no generator support
+/// for `custom_values` fixtures).
 pub fn sum_histograms<'a>(
     mut group: impl Iterator<Item = &'a FloatHistogram>,
 ) -> Option<FloatHistogram> {
     let first = group.next()?;
+    let uses_custom = first.uses_custom_buckets();
     let mut acc = first.clone();
     for h in group {
+        if h.uses_custom_buckets() != uses_custom {
+            return None;
+        }
         let scale = acc.scale.min(h.scale);
         if scale < acc.scale {
             acc = acc.copy_to_scale(scale);
@@ -997,5 +1020,51 @@ mod tests {
         assert_eq!(coarse.scale, 0);
         let map = coarse.positive_index_map();
         assert_eq!(map.get(&1), Some(&7.0));
+    }
+
+    /// A one-bucket custom-buckets (NHCB) histogram: `scale: -53` is
+    /// Prometheus' sentinel for custom boundaries.
+    fn custom_buckets(count: f64, sum: f64) -> FloatHistogram {
+        FloatHistogram {
+            counter_reset_hint: ResetHint::Unknown,
+            scale: -53,
+            zero_threshold: 0.0,
+            zero_count: 0.0,
+            count,
+            sum,
+            positive_spans: vec![Span {
+                offset: 0,
+                length: 1,
+            }],
+            negative_spans: Vec::new(),
+            positive_buckets: vec![count],
+            negative_buckets: Vec::new(),
+            custom_values: vec![1.0, 2.0],
+        }
+    }
+
+    #[test]
+    fn histogram_rate_over_mismatched_exponential_and_custom_schemas_does_not_panic() {
+        // Before #678's fix, min_scale was computed unconditionally from the
+        // custom-buckets sentinel scale, and copy_to_scale's bucket-index
+        // shift overflowed. The flipped behavior: None instead of a panic.
+        let a = custom_buckets(3.0, 6.0);
+        let b = positive(0, 0, &[10.0], 20.0);
+        assert_eq!(
+            histogram_rate(&[(0, a), (30_000_000_000, b)], true),
+            None,
+            "a schema-type mismatch is not combinable, not a panic"
+        );
+    }
+
+    #[test]
+    fn sum_histograms_over_mismatched_exponential_and_custom_schemas_does_not_panic() {
+        let a = positive(0, 0, &[10.0], 20.0);
+        let b = custom_buckets(3.0, 6.0);
+        assert_eq!(
+            sum_histograms([&a, &b].into_iter()),
+            None,
+            "a schema-type mismatch is not combinable, not a panic"
+        );
     }
 }
