@@ -1071,15 +1071,6 @@ impl RlogWriter {
                 }
             }
         }
-        // Str plan column ids on the dict path: their per-row bloom tokens are
-        // set once per distinct value below, so the per-row loop skips them.
-        let dict_str_cids: HashSet<u32> = columns
-            .iter()
-            .enumerate()
-            .filter(|(pi, (_, ty, _))| plan_uses_dict[*pi] && matches!(ty, FieldType::Str))
-            .map(|(_, (_, _, cid))| *cid)
-            .collect();
-
         // Sort rows by (stream_ref, ts) exactly as the row path sorts
         // ResolvedRows; `sort_by` is stable, so ties keep the appended order.
         let mut perm: Vec<usize> = (0..total_rows).collect();
@@ -1202,10 +1193,13 @@ impl RlogWriter {
                 blk_cols.push(cols);
             }
 
+            // Present columns and their FIELD_DIR occurrence counts, read from
+            // the cids before the values are moved into the page below.
             let mut present_cols: BTreeSet<u32> = BTreeSet::new();
             for cols in &blk_cols {
                 for (cid, _) in cols {
                     present_cols.insert(*cid);
+                    *col_present.entry(*cid).or_insert(0) += 1;
                 }
             }
             let mut plan_cols: BTreeSet<u32> = present_cols.clone();
@@ -1250,8 +1244,10 @@ impl RlogWriter {
                 .filter_map(|&g| g_attrs_raw[g].as_deref())
                 .collect();
 
-            // Per-plan value pages, scattered from this block's materialized
-            // occurrences; dict-path plans carry their page below instead.
+            // Per-plan value pages, filled by moving each occurrence's value out
+            // of the materialized list (consumed here, never cloned): the bytes
+            // live in exactly one place, the page. Dict-path plans carry their
+            // page below instead, so their moved value is simply dropped.
             let mut values_v: Vec<Vec<Option<ColumnValue>>> = plans
                 .iter()
                 .map(|p| {
@@ -1262,18 +1258,18 @@ impl RlogWriter {
                     }
                 })
                 .collect();
-            for (li, cols) in blk_cols.iter().enumerate() {
+            for (li, cols) in blk_cols.into_iter().enumerate() {
                 for (cid, cv) in cols {
-                    if !plan_uses_dict[plan_of_cid[cid]] {
-                        values_v[plan_pos[cid]][li] = Some(cv.clone());
+                    if !plan_uses_dict[plan_of_cid[&cid]] {
+                        values_v[plan_pos[&cid]][li] = Some(cv);
                     }
                 }
             }
             let mut stat_v: Vec<Vec<Option<ColumnValue>>> =
                 plans.iter().map(|_| vec![None; n]).collect();
-            for (li, stat) in blk_stat.iter().enumerate() {
+            for (li, stat) in blk_stat.into_iter().enumerate() {
                 for (cid, cv) in stat {
-                    stat_v[plan_pos[cid]][li] = Some(cv.clone());
+                    stat_v[plan_pos[&cid]][li] = Some(cv);
                 }
             }
             // Owned per-block dict ids (one Option<index> per block row) for
@@ -1330,15 +1326,6 @@ impl RlogWriter {
             for (li, &g) in block_rows.iter().enumerate() {
                 insert_text(&mut builder, COL_BODY, g_body[g]);
                 insert_text(&mut builder, COL_SEVERITY_TEXT, g_sevtext[g]);
-                for (cid, v) in &blk_cols[li] {
-                    if let ColumnValue::Str(bytes) = v {
-                        // Dict-path Str columns are tokenized per distinct value
-                        // after this loop; skip their per-row occurrence here.
-                        if !dict_str_cids.contains(cid) {
-                            insert_text(&mut builder, *cid, bytes);
-                        }
-                    }
-                }
                 for (cid, v) in &blk_indexed[li] {
                     if postings_capped.contains(cid) {
                         continue;
@@ -1351,6 +1338,20 @@ impl RlogWriter {
                     if field_map.len() > self.cfg.postings_max_distinct {
                         postings_terms.remove(cid);
                         postings_capped.insert(*cid);
+                    }
+                }
+            }
+            // String-column bloom from the value pages. Bloom bit setting is
+            // idempotent, so plan-major insertion sets the same bits the per-row
+            // path did. Dict-path Str columns are tokenized per distinct value
+            // below instead (their page is empty here).
+            for (pos, p) in plans.iter().enumerate() {
+                if plan_uses_dict[plan_of_cid[&p.column_id]] || !matches!(p.ty, FieldType::Str) {
+                    continue;
+                }
+                for cell in &values_v[pos] {
+                    if let Some(ColumnValue::Str(bytes)) = cell {
+                        insert_text(&mut builder, p.column_id, bytes);
                     }
                 }
             }
@@ -1387,11 +1388,6 @@ impl RlogWriter {
             }
             for cid in &present_cols {
                 *col_blocks.entry(*cid).or_insert(0) += 1;
-            }
-            for cols in &blk_cols {
-                for (cid, _) in cols {
-                    *col_present.entry(*cid).or_insert(0) += 1;
-                }
             }
 
             let block_offset = blocks_bytes.len() as u64;
