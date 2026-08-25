@@ -259,17 +259,50 @@ async fn try_reconstruct_one(
     let checksum = UploadChecksum::Crc32c(crc32c::crc32c(&payload));
     let opts = PutOptions::create_if_absent().with_checksum(checksum);
 
-    match store.put(&commit_key, payload, opts).await {
-        Ok(_) => Ok(Outcome::Reconstructed {
-            data_key: meta.key.clone(),
+    let put_result = store.put(&commit_key, payload, opts).await.map(|_| ());
+    classify_put_result(put_result, &meta.key, commit_key)
+}
+
+/// Turn the `CreateIfAbsent` put result for a reconstructed commit record into
+/// an [`Outcome`] or a typed error.
+///
+/// The `AccessDenied` arm exists so ADR-0055's deliberate operational
+/// limitation is loud at the point an operator hits it, not silent behind a
+/// generic write failure: the Admin role is granted `kms:Decrypt` only, so a
+/// `commit reconstruct` write against a `--tenant-kms-config` tenant routes
+/// through the per-tenant key and is denied unless `kms:GenerateDataKey*` is
+/// also granted to that role. The original store `msg` is preserved so an
+/// operator debugging a genuinely different `AccessDenied` cause still sees the
+/// real S3/KMS error text. Every other error variant keeps the generic message.
+fn classify_put_result(
+    put_result: Result<(), StoreError>,
+    data_key: &str,
+    commit_key: String,
+) -> anyhow::Result<Outcome> {
+    match put_result {
+        Ok(()) => Ok(Outcome::Reconstructed {
+            data_key: data_key.to_string(),
             commit_key,
         }),
         // CreateIfAbsent refused: a record already exists at this key. Report
         // the conflict and skip; never overwrite (ADR-0058 decision 2 step 4).
         Err(StoreError::AlreadyExists) => Ok(Outcome::AlreadyPresent {
-            data_key: meta.key.clone(),
+            data_key: data_key.to_string(),
             commit_key,
         }),
+        // A KMS-permission denial on the PutObject surfaces here as a distinct
+        // variant (crates/ravel-object-store, S3 403 -> AccessDenied). This is
+        // the visible failure point of ADR-0055's Decrypt-only Admin posture,
+        // so name it explicitly while preserving the underlying message.
+        Err(StoreError::AccessDenied(msg)) => Err(anyhow::anyhow!(
+            "failed to write commit record {commit_key}: access denied: {msg}. This may be \
+             ADR-0055's known limitation: the Admin role is granted kms:Decrypt only, so a \
+             `commit reconstruct` write against a --tenant-kms-config tenant can be denied here \
+             because it routes through the per-tenant KMS key and needs kms:GenerateDataKey* \
+             granted to the Admin role. See the \"Per-tenant SSE-KMS routing\" section of \
+             docs/guides/operations.md (the Admin GetObject-only KMS grant) for the manual \
+             workaround."
+        )),
         Err(err) => Err(anyhow::anyhow!(
             "failed to write commit record {commit_key}: {err}"
         )),
@@ -603,5 +636,104 @@ mod tests {
         );
         // The record built from this input passes structural validation.
         record::build(input).expect("valid record");
+    }
+
+    /// A KMS-permission `AccessDenied` on the commit-record PUT is surfaced with
+    /// ADR-0055's known-limitation pointer AND the original store message, so an
+    /// operator hitting the Decrypt-only Admin limitation is sent straight to
+    /// docs/guides/operations.md instead of a generic write failure. This is the
+    /// exact arm a pre-fix generic catch-all swallowed: with only the catch-all,
+    /// the text was `failed to write commit record <key>: <msg>` and carried no
+    /// ADR-0055 pointer, so the `contains("ADR-0055")` assertion below failed.
+    #[test]
+    fn access_denied_put_names_adr_0055_and_preserves_message() {
+        let original = "User: arn:aws:sts::111122223333:assumed-role/ravel-admin/session is not \
+                        authorized to perform: kms:GenerateDataKey on resource: \
+                        arn:aws:kms:us-east-1:111122223333:key/abcd because no identity-based \
+                        policy allows the kms:GenerateDataKey action";
+        let err = classify_put_result(
+            Err(StoreError::AccessDenied(original.to_string())),
+            "t/x/m/l0/0003/o.rseg",
+            "c/x/m/0003/commit-key".to_string(),
+        )
+        .expect_err("AccessDenied must map to an error, not an Ok outcome");
+        let text = format!("{err:#}");
+
+        // The real S3/KMS text is preserved so a genuinely different
+        // AccessDenied cause is still debuggable.
+        assert!(
+            text.contains(original),
+            "must preserve the original AccessDenied message: {text}"
+        );
+        // The ADR-0055 / operations.md pointer is present.
+        assert!(text.contains("ADR-0055"), "must name ADR-0055: {text}");
+        assert!(
+            text.contains("kms:GenerateDataKey*"),
+            "must name the grant the write needs: {text}"
+        );
+        assert!(
+            text.contains("kms:Decrypt only"),
+            "must name the Decrypt-only Admin posture: {text}"
+        );
+        assert!(
+            text.contains("Per-tenant SSE-KMS routing"),
+            "must point at the operations.md section heading by name: {text}"
+        );
+        assert!(
+            text.contains("docs/guides/operations.md"),
+            "must point at the operations guide: {text}"
+        );
+    }
+
+    /// Every non-AccessDenied write error keeps the generic message and does NOT
+    /// carry the ADR-0055 pointer, so the two arms stay distinguishable and an
+    /// unrelated failure is never mislabeled as the KMS limitation.
+    #[test]
+    fn generic_put_error_omits_adr_0055_pointer() {
+        let err = classify_put_result(
+            Err(StoreError::Permanent(
+                "bucket policy forbids overwrite".to_string(),
+            )),
+            "t/x/m/l0/0003/o.rseg",
+            "c/x/m/0003/commit-key".to_string(),
+        )
+        .expect_err("a permanent write error must map to an error");
+        let text = format!("{err:#}");
+
+        assert!(
+            text.contains("failed to write commit record"),
+            "keeps the generic prefix: {text}"
+        );
+        assert!(
+            text.contains("bucket policy forbids overwrite"),
+            "keeps the underlying error text: {text}"
+        );
+        assert!(
+            !text.contains("ADR-0055"),
+            "a generic error must NOT carry the ADR-0055 pointer: {text}"
+        );
+        assert!(
+            !text.contains("Per-tenant SSE-KMS routing"),
+            "a generic error must NOT point at the KMS section: {text}"
+        );
+    }
+
+    /// The CreateIfAbsent refusal still maps to `AlreadyPresent` (conflict,
+    /// skipped, never clobbered), unchanged by the new AccessDenied arm.
+    #[test]
+    fn already_exists_still_maps_to_already_present() {
+        let outcome = classify_put_result(
+            Err(StoreError::AlreadyExists),
+            "t/x/m/l0/0003/o.rseg",
+            "c/x/m/0003/commit-key".to_string(),
+        )
+        .expect("AlreadyExists is a skipped conflict, not an error");
+        assert_eq!(
+            outcome,
+            Outcome::AlreadyPresent {
+                data_key: "t/x/m/l0/0003/o.rseg".to_string(),
+                commit_key: "c/x/m/0003/commit-key".to_string(),
+            }
+        );
     }
 }
