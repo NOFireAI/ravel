@@ -483,9 +483,17 @@ pub(crate) fn eval_range_call(
                     }
                 },
             )?;
-            // Gated on the reduced output, matching the instant arm and
-            // Prometheus (the check follows the too-few-samples early return).
-            maybe_info_non_counter_selector_name(call.func.name, arg, !result.is_empty(), ctx);
+            // Gated on the reduced FLOAT output, matching the instant arm and
+            // Prometheus (the check follows the too-few-samples early return,
+            // and lives in the float branch: a native histogram carries its own
+            // counter-reset hint, so the metric-name heuristic does not apply
+            // to it). The instant arm gets this for free because it reduces
+            // floats and histograms into separate values; here both land in one
+            // matrix, so the float elements have to be counted explicitly.
+            let produced_a_float = result
+                .iter()
+                .any(|(_, samples)| samples.iter().any(|s| s.histogram.is_none()));
+            maybe_info_non_counter_selector_name(call.func.name, arg, produced_a_float, ctx);
             Ok(result)
         }
         // `histogram_quantile`/`histogram_fraction` group and reduce a whole
