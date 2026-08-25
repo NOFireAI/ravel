@@ -443,6 +443,15 @@ pub fn instant_value_to_json(value: Value, time_ms: i64) -> Result<QueryData, Ap
             format_value(v),
         ))),
         Value::String(s) => Ok(QueryData::String((ms_to_seconds(time_ms)?, s))),
+        // An instant query's top-level `Value::Matrix` is float-only by
+        // construction: the histogram-aware channel is the range endpoint's
+        // `RangeValue` (ADR-0108), and the two instant shapes that reach this
+        // arm both keep histograms out of it -- a subquery over native
+        // histograms refuses upstream (`eval_subquery_matrix`), and a bare
+        // matrix selector matching histogram data refuses in
+        // `eval_expr`'s `MatrixSelector` arm (issue #643). So `histograms` is
+        // always empty here; a histogram-carrying instant range vector is a
+        // typed 422, never a silent HTTP 200 with the histograms dropped.
         Value::Matrix(matrix) => Ok(QueryData::Matrix(
             matrix
                 .into_iter()

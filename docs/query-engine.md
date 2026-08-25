@@ -191,6 +191,18 @@ The within-segment GET/byte model is the `selective_read_accounting` bench.
   `resultType: matrix`, and Ravel matches that. Such a matrix already
   carries its own per-series timestamps from the evaluator, so no grid
   repetition is synthesized.
+- Matrix rendering (both `/api/v1/query_range` and an instant query that
+  returns a matrix) carries native-histogram steps in a `histograms` array
+  alongside the float `values` array, per element type per timestamp, using
+  Prometheus' `[ts, {count, sum, buckets}]` encoding (ADR-0108); a
+  float-only series omits `histograms` and a histogram-only series omits
+  `values`. One exception on the instant endpoint: an instant query whose
+  top-level expression is a range vector *carrying native histograms* (a bare
+  histogram matrix selector such as `h[5m]`, or a subquery over histogram
+  data) is not rendered as a matrix with dropped histograms; it returns a
+  typed 422 `Unsupported` instead (ADR-0108 decision 8), because the instant
+  matrix channel is float-only. Range queries render histogram matrices
+  normally.
 
 ## Budgets (Phase 1: static config)
 
@@ -1063,7 +1075,7 @@ conformance_table`; regenerate that same command with
 `RAVEL_UPDATE_CONFORMANCE_TABLE=1`. Do not edit the block between
 the markers by hand.
 
-Surface: 132 constructs over 231 corpus entries in 10 corpus files.
+Surface: 132 constructs over 236 corpus entries in 10 corpus files.
 
 | State | Constructs |
 | --- | --- |
