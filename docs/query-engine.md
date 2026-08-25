@@ -89,6 +89,27 @@ and leaves it enumerable. The equivalent hop for the SQL logs, spans, and
 metrics surfaces in `ravel-sql` is not wired yet: those scans build their
 own queries and do not read `Snapshot::pending_erasure`.
 
+## Logs `COUNT(*)` from catalog row counts
+
+A predicate-free `SELECT COUNT(*) FROM logs` is answered from the catalog's
+committed row counts, not by reading any log object. `LogsScanExec` reports
+`num_rows = Precision::Exact(sum of SegmentRef::sample_count)` over the
+resolved snapshot, so DataFusion's `AggregateStatistics` physical-optimizer
+rule rewrites the aggregate into a literal and the scan is never executed:
+the plan contains no `LogsScanExec` and the query issues zero object-store
+GETs. Every `sample_count` is written by the commit record, so the sum is
+known the moment `Catalog::resolve` returns; before this, counting the full
+ClickBench tenant (issue #680, 8424 objects, 100M rows) took 142 s and moved
+23 GB from object storage to add up numbers the resolve already had. The scan
+falls back to the exact-count-by-scanning path (row count reported `Absent`,
+the rule does not fire, `LogsScanExec` stays in the plan) whenever the count
+of committed rows is not the query's answer: any pushed predicate at all (a
+`ts` bound, a `has_word` content predicate, or an attribute-equality prune),
+or any pending selective erasure in the snapshot (ADR-0064), which removes
+rows the committed counts still include. So an operator who sees a `COUNT(*)`
+answered with zero GETs is seeing the by-design fast path, and one predicate
+or one pending erasure is enough to put the read back on the scan.
+
 Staleness: the evaluator recognizes the Prometheus staleness marker (the
 exact NaN bit pattern `0x7ff0_0000_0000_0002`, compared via
 `f64::to_bits()`, never `is_nan()`). A selector whose newest in-window
