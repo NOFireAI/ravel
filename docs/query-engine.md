@@ -1718,9 +1718,11 @@ parts, postings), now with hit/miss/byte counters and a capacity bound on
 
 Deliberately not cached: a suffix GET (the footer-first read on segment
 open) always bypasses the byte cache, because a suffix has no total object
-size to key a `(offset, len)` entry on. A disk tier exists in
-`ravel-cache` but is not wired to any read funnel; passing `--cache-dir`
-fails startup rather than silently caching nothing.
+size to key a `(offset, len)` entry on. `ravel-cache`'s disk tier is wired
+to both the RSEG/RLOG fetcher cache and the catalog byte cache: passing
+`--cache-dir` attaches a RAM-over-disk `TieredCache` to each, single-
+flighted and corruption-gated per ADR-0046 decisions 3-5, instead of
+failing startup.
 
 See docs/guides/caching.md for CLI flags, metrics, and known gaps, and
 docs/adrs/0046-read-cache-tier.md for the funnel/keying/eviction design
