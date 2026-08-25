@@ -66,6 +66,13 @@ futures = { workspace = true, optional = true }
 # `[workspace.dependencies]`, so it is named by path here; every other dep
 # below reuses a workspace pin.
 ravel-sql = { path = "../ravel-sql", version = "0.10.0", optional = true, features = ["flight-sql"] }
+# Gated behind `sql-latency`. The spans-scan bench lane (`src/spans_scan.rs`)
+# writes its RSPAN corpus with the real span writer and drives `SpansScanExec`
+# directly, so it needs the writer/record types (`RspanWriter`, `SpanRecord`,
+# `SpanEvent`, `reconstruct_events_raw`) and `SpanQuery` that ravel-sql does not
+# re-export. Reuses the workspace pin; ravel-sql already links ravel-rspan, so
+# no second copy enters the workspace.
+ravel-rspan = { workspace = true, optional = true }
 arrow-flight = { workspace = true, optional = true }
 # Gated behind `sql-latency` (off by default). The groupby scaling bench reads
 # the real physical plan (`displayable`, `ExecutionPlan::output_partitioning`)
@@ -134,7 +141,7 @@ stage-timing = ["ravel-ingest/stage-timing"]
 # corpus gate reads `ravel_sql::conformance::registry()`, so it activates the
 # same optional `ravel-sql` entry `flight-egress` uses (no second entry, so no
 # second datafusion/arrow activation) and the plain gates never compile it.
-sql-latency = ["dep:ravel-sql", "dep:datafusion", "dep:ravel-cache", "dep:futures"]
+sql-latency = ["dep:ravel-sql", "dep:datafusion", "dep:ravel-cache", "dep:ravel-rspan", "dep:futures"]
 
 [dev-dependencies]
 criterion = { workspace = true }
@@ -254,6 +261,12 @@ bench = false
 [[bin]]
 name = "sql_latency_bench"
 path = "src/bin/sql_latency_bench.rs"
+required-features = ["sql-latency"]
+bench = false
+
+[[bin]]
+name = "spans_scan_bench"
+path = "src/bin/spans_scan_bench.rs"
 required-features = ["sql-latency"]
 bench = false
 
