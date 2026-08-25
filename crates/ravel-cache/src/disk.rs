@@ -782,6 +782,7 @@ mod tests {
         );
     }
 
+    /// Issue #703: every phase here must induce its failure at any uid.
     #[tokio::test]
     async fn every_disk_failure_degrades_to_a_miss() {
         let tmp = TempDir::new().unwrap();
