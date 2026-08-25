@@ -46,6 +46,7 @@ fn small_generate_config(store: Arc<dyn ObjectStoreBackend>, runs: usize) -> Gen
         records_per_object: 20,
         extra_attrs: 4,
         max_query_bytes: DEFAULT_MAX_QUERY_BYTES,
+        cache_bytes: 0,
     }
 }
 
@@ -212,6 +213,8 @@ async fn an_entry_with_an_unsatisfied_required_declaration_is_skipped_with_the_k
         window,
         NOW_NS,
         DEFAULT_MAX_QUERY_BYTES,
+        1,
+        0,
     )
     .await
     .expect("measure_corpus runs");
