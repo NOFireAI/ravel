@@ -26,7 +26,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use ravel_cache::{Cache, CacheKey, CacheLimits};
+use ravel_cache::{Cache, CacheKey, CacheLimits, DiskCache, TieredCache};
 use ravel_catalog::{SegmentLevel, SegmentRef};
 use ravel_logseg::writer::ObjectIdentity;
 use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
@@ -45,8 +45,8 @@ use uuid::Uuid;
 
 use crate::fetcher::FetchedHistogramSeries;
 use crate::{
-    FetchError, FetchStats, FetchedSeriesSoa, LogFetchError, LogFetchOutput, LogQuery,
-    LogSegmentFetcher, SegmentFetcher,
+    BlockRangeFetcher, FetchError, FetchStats, FetchedSeriesSoa, LogFetchError, LogFetchOutput,
+    LogQuery, LogSegmentFetcher, SegmentFetcher,
 };
 
 const RSEG_TENANT: TenantHash = TenantHash([13u8; 16]);
@@ -1037,5 +1037,358 @@ async fn rlog_the_same_tenant_reads_its_own_cached_bytes_without_consulting_the_
         fault_store.fault_count(Op::Get, FaultKind::Permanent),
         0,
         "a same-tenant cache hit must not consult the store at all"
+    );
+}
+
+// ---- ADR-0046 disk tier (issue #95) --------------------------------------
+//
+// The tests above wire a RAM-only `Cache` into each funnel through
+// `with_cache`, which is what every production caller builds today (a query
+// node has no disk tier until #97 wires `--cache-dir`). The tests below prove
+// the funnels are equally correct when `with_cache` is handed a `TieredCache`
+// (RAM over disk), the second configuration the `ReadCache` enum this task
+// introduced can hold. `SegmentFetcher`/`LogSegmentFetcher`/`BlockRangeFetcher`
+// accept either via `impl Into<ReadCache>`, so these construct the disk-backed
+// variant directly, exactly as #97's server wiring will.
+
+/// Generous limits: nothing this suite's fixtures produce is evicted or refused.
+fn generous_cache_limits() -> CacheLimits {
+    CacheLimits::new(16 * 1024 * 1024, 100, 16 * 1024 * 1024)
+}
+
+/// RAM limits that refuse every real-sized entry (max entry bytes 1), so the
+/// RAM tier of a `TieredCache` stays empty and every cache hit falls through to
+/// the disk tier -- the configuration ADR-0046 decision 4's disk-tier
+/// acceptance gate needs.
+/// [`evicted_entry_falls_back_to_store_and_produces_correct_result`] above
+/// proves a `CacheLimits::new(1, 1, 1)` cache admits nothing.
+fn ram_rejecting_limits() -> CacheLimits {
+    CacheLimits::new(1, 1, 1)
+}
+
+/// ADR-0046 decision 4's acceptance gate on the DISK tier specifically
+/// (issue #95): a disk-served hit returning deliberately corrupted bytes must
+/// never let a query return a wrong result. Mirrors
+/// [`corrupted_cache_hits_never_produce_wrong_results`] but wires a
+/// `TieredCache` whose RAM tier refuses admission (so every hit is served from
+/// disk, proven by the disk hit counter) and is in corruption mode (so the
+/// disk-served bytes arrive corrupted, through `TieredCache`'s serve-time
+/// transform). Both fixtures cache the whole object under one key, so the
+/// corruption lands on the footer/header and the read fails closed with a typed
+/// error rather than decoding wrong data.
+///
+/// Prove-the-test: change either RAM tier below from `Cache::with_corruption` to
+/// `Cache::new` and the disk-served hit returns clean bytes, so the second fetch
+/// succeeds and the `is_err()` assertions fire. That corruption mode is exactly
+/// what this gate depends on. (Demonstrated failing during development by that
+/// substitution.)
+#[tokio::test]
+async fn corrupted_disk_tier_hits_never_produce_wrong_results() {
+    let tmp = tempfile::TempDir::new().expect("temp dir for the disk cache tier");
+
+    // Uncached baselines.
+    let (rseg_store, rseg_ref) = write_rseg_segment().await;
+    let rseg_backend: Arc<dyn ObjectStoreBackend> = rseg_store;
+    let (truth_soa, _s, truth_hist) = SegmentFetcher::new(rseg_backend.clone())
+        .fetch_soa_and_histograms(RSEG_TENANT, &rseg_ref, &[])
+        .await
+        .expect("uncached RSEG baseline");
+
+    let (rlog_store, rlog_ref) = write_rlog_segment().await;
+    let rlog_backend: Arc<dyn ObjectStoreBackend> = rlog_store;
+    let query = LogQuery::new(0, 19);
+    let truth_log = LogSegmentFetcher::new(rlog_backend.clone())
+        .fetch_accounted_with_tenant(&rlog_ref, RLOG_TENANT, &query, &QueryAccounting::new())
+        .await
+        .expect("uncached RLOG baseline")
+        .expect("segment overlaps");
+
+    // Disk-backed, corruption-mode caches: RAM refuses admission (hits come from
+    // disk), disk is generous. One per funnel so each disk hit counter is clean.
+    let rseg_disk = DiskCache::new(tmp.path().join("rseg"), generous_cache_limits());
+    let rseg_disk_metrics = rseg_disk.metrics();
+    let rseg_cache = Arc::new(TieredCache::new(
+        Cache::<crate::fetcher::CacheFetchError>::with_corruption(ram_rejecting_limits()),
+        rseg_disk,
+    ));
+    let rlog_disk = DiskCache::new(tmp.path().join("rlog"), generous_cache_limits());
+    let rlog_disk_metrics = rlog_disk.metrics();
+    let rlog_cache = Arc::new(TieredCache::new(
+        Cache::<crate::fetcher::CacheFetchError>::with_corruption(ram_rejecting_limits()),
+        rlog_disk,
+    ));
+
+    let seg_fetcher = SegmentFetcher::new(rseg_backend).with_cache(rseg_cache.clone());
+    let log_fetcher = LogSegmentFetcher::new(rlog_backend).with_cache(rlog_cache.clone());
+
+    // First call per funnel: a genuine both-tier miss populating the disk tier
+    // with CLEAN bytes (corruption applies only on a hit). Must match truth.
+    let acc = QueryAccounting::new();
+    let rseg_miss = seg_fetcher
+        .fetch_soa_and_histograms_accounted(RSEG_TENANT, &rseg_ref, &[], &acc)
+        .await;
+    assert_soa_hist_matches_or_errors(rseg_miss, &truth_soa, &truth_hist);
+    let log_acc = QueryAccounting::new();
+    let log_miss = log_fetcher
+        .fetch_accounted_with_tenant(&rlog_ref, RLOG_TENANT, &query, &log_acc)
+        .await;
+    assert_log_matches_or_errors(log_miss, &truth_log);
+
+    let rseg_hits_before = rseg_disk_metrics.snapshot().hits;
+    let rlog_hits_before = rlog_disk_metrics.snapshot().hits;
+
+    // Second call per funnel: RAM is empty, so the whole object is served from
+    // the disk tier -- corrupted. The read must fail closed with a typed error.
+    let rseg_hit = seg_fetcher
+        .fetch_soa_and_histograms_accounted(RSEG_TENANT, &rseg_ref, &[], &acc)
+        .await;
+    assert!(
+        rseg_hit.is_err(),
+        "a corrupted whole-object disk hit must fail closed with a typed error, not decode wrong \
+         data; got Ok"
+    );
+    let log_hit = log_fetcher
+        .fetch_accounted_with_tenant(&rlog_ref, RLOG_TENANT, &query, &log_acc)
+        .await;
+    assert!(
+        log_hit.is_err(),
+        "a corrupted whole-object disk hit on the log funnel must fail closed with a typed error; \
+         got {log_hit:?}"
+    );
+
+    // The hits were served from the DISK tier, not RAM (RAM refused admission):
+    // the gate this test names would not otherwise reach the disk tier at all.
+    assert!(
+        rseg_disk_metrics.snapshot().hits > rseg_hits_before,
+        "the RSEG hit must have been served from the disk tier"
+    );
+    assert!(
+        rlog_disk_metrics.snapshot().hits > rlog_hits_before,
+        "the RLOG hit must have been served from the disk tier"
+    );
+    assert!(
+        rseg_cache.is_empty() && rlog_cache.is_empty(),
+        "the RAM tier must be empty, so every hit was disk-served"
+    );
+}
+
+/// Deliverable 5: the same correctness path the RAM-only
+/// [`cache_hit_returns_bit_identical_result_to_uncached_fetch`] exercises, but
+/// against a disk-backed tier configuration with the hit served from disk. A
+/// CLEAN disk-tier hit must be bit-identical (including the NaN sample) to the
+/// uncached fetch, proving the disk tier introduces no regression on the
+/// non-corrupt path.
+#[tokio::test]
+async fn clean_disk_tier_hit_is_bit_identical_to_uncached_fetch() {
+    let tmp = tempfile::TempDir::new().expect("temp dir for the disk cache tier");
+    let (store, seg_ref) = write_rseg_segment().await;
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+
+    let (mut truth, _s) = SegmentFetcher::new(backend.clone())
+        .fetch_soa(RSEG_TENANT, &seg_ref, &[])
+        .await
+        .expect("uncached fetch");
+    truth.sort_by_key(|s| s.series_id.0);
+
+    // RAM refuses admission so the hit is disk-served; no corruption.
+    let disk = DiskCache::new(tmp.path().join("clean"), generous_cache_limits());
+    let disk_metrics = disk.metrics();
+    let cache = Arc::new(TieredCache::new(
+        Cache::<crate::fetcher::CacheFetchError>::new(ram_rejecting_limits()),
+        disk,
+    ));
+    let fetcher = SegmentFetcher::new(backend).with_cache(cache.clone());
+
+    let (mut miss, _s) = fetcher
+        .fetch_soa(RSEG_TENANT, &seg_ref, &[])
+        .await
+        .expect("first fetch (both-tier miss)");
+    miss.sort_by_key(|s| s.series_id.0);
+    let hits_before = disk_metrics.snapshot().hits;
+    let (mut hit, _s) = fetcher
+        .fetch_soa(RSEG_TENANT, &seg_ref, &[])
+        .await
+        .expect("second fetch (disk-served hit)");
+    hit.sort_by_key(|s| s.series_id.0);
+
+    assert!(
+        disk_metrics.snapshot().hits > hits_before,
+        "the second fetch must be served from the disk tier"
+    );
+    assert!(
+        cache.is_empty(),
+        "RAM refused admission, so the hit was disk-served"
+    );
+    assert_eq!(miss.len(), truth.len());
+    assert_eq!(hit.len(), truth.len());
+    for (a, b) in miss.iter().zip(truth.iter()) {
+        assert!(
+            soa_bits_eq(a, b),
+            "disk-tier miss result must match uncached"
+        );
+    }
+    for (a, b) in hit.iter().zip(truth.iter()) {
+        assert!(
+            soa_bits_eq(a, b),
+            "clean disk-tier hit result must be bit-identical to uncached"
+        );
+    }
+}
+
+/// Deliverable 6: with NO disk tier configured -- the RAM-only `ReadCache::Ram`
+/// variant every production caller builds -- both funnels return results
+/// byte-for-byte identical to a fetch with no cache at all. This pins the
+/// "behavior is exactly today's" guarantee the enum change must preserve; the
+/// entire RAM suite above passing unchanged is the broader proof.
+#[tokio::test]
+async fn no_disk_tier_ram_only_matches_uncached_on_both_funnels() {
+    // RSEG.
+    let (rseg_store, rseg_ref) = write_rseg_segment().await;
+    let rseg_backend: Arc<dyn ObjectStoreBackend> = rseg_store;
+    let (mut truth_soa, _s) = SegmentFetcher::new(rseg_backend.clone())
+        .fetch_soa(RSEG_TENANT, &rseg_ref, &[])
+        .await
+        .expect("uncached RSEG fetch");
+    truth_soa.sort_by_key(|s| s.series_id.0);
+
+    let ram: Arc<Cache<crate::fetcher::CacheFetchError>> =
+        Arc::new(Cache::new(generous_cache_limits()));
+    let seg_fetcher = SegmentFetcher::new(rseg_backend).with_cache(ram);
+    // Miss then hit: both must equal the uncached truth.
+    for pass in ["ram miss", "ram hit"] {
+        let (mut got, _s) = seg_fetcher
+            .fetch_soa(RSEG_TENANT, &rseg_ref, &[])
+            .await
+            .unwrap_or_else(|e| panic!("RSEG {pass} fetch: {e:?}"));
+        got.sort_by_key(|s| s.series_id.0);
+        assert_eq!(got.len(), truth_soa.len(), "RSEG {pass} series count");
+        for (a, b) in got.iter().zip(truth_soa.iter()) {
+            assert!(
+                soa_bits_eq(a, b),
+                "RSEG {pass} must match uncached byte-for-byte"
+            );
+        }
+    }
+
+    // RLOG.
+    let (rlog_store, rlog_ref) = write_rlog_segment().await;
+    let rlog_backend: Arc<dyn ObjectStoreBackend> = rlog_store;
+    let query = LogQuery::new(0, 19);
+    let truth_log = LogSegmentFetcher::new(rlog_backend.clone())
+        .fetch_accounted_with_tenant(&rlog_ref, RLOG_TENANT, &query, &QueryAccounting::new())
+        .await
+        .expect("uncached RLOG fetch")
+        .expect("segment overlaps");
+
+    let ram: Arc<Cache<crate::fetcher::CacheFetchError>> =
+        Arc::new(Cache::new(generous_cache_limits()));
+    let log_fetcher = LogSegmentFetcher::new(rlog_backend).with_cache(ram);
+    for pass in ["ram miss", "ram hit"] {
+        let got = log_fetcher
+            .fetch_accounted_with_tenant(&rlog_ref, RLOG_TENANT, &query, &QueryAccounting::new())
+            .await
+            .unwrap_or_else(|e| panic!("RLOG {pass} fetch: {e:?}"))
+            .expect("segment overlaps");
+        assert_eq!(
+            got.records, truth_log.records,
+            "RLOG {pass} must match uncached byte-for-byte"
+        );
+    }
+}
+
+/// The double-counting discipline from ADR-0046's `TieredCache::get` docstring
+/// (issue #95, the "Read first" section): `BlockRangeFetcher`'s peek-then-defer
+/// pattern -- peek each candidate block with `ReadCache::get` (the one accounted
+/// miss) and resolve a miss through a later coalesced fetch -- must record
+/// exactly ONE miss per logical cache miss on the tiered tier's `CacheMetrics`,
+/// not two.
+///
+/// The RAM-only `Cache` is the oracle: its `get_or_fetch` is miss-only and never
+/// re-peeks, so a cold block-range fetch records exactly one miss per logical
+/// lookup -- the correct count. A `TieredCache` cold fetch of the same object
+/// with the same protocol must record the SAME number of misses on its RAM tier.
+/// The fetcher achieves this by resolving a peeked-then-deferred block through
+/// `ReadCache::fetch_peeked` (which `insert`s on the tiered tier rather than
+/// re-entering `TieredCache::get_or_fetch`, whose internal peek would count a
+/// second miss).
+///
+/// Prove-the-test: replace the two `cache.fetch_peeked(...)` calls in
+/// `BlockRangeFetcher::fetch_run` (log_fetcher.rs) with `cache.get_or_fetch(...)`
+/// and the tiered tier's miss count exceeds the oracle, so the final assertion
+/// fires. (Verified failing by that substitution during development.)
+#[tokio::test]
+async fn block_range_peek_then_defer_records_one_miss_per_logical_miss() {
+    let (store, seg_ref) = write_rlog_segment().await;
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+    let (ts_min, ts_max) = (0, 19);
+
+    // Force the true block-range path: whole-object crossover off (threshold 0),
+    // a 64-byte suffix probe that does not cover the front blocks (so they are
+    // genuinely fetched, not probe-resident), and the coverage crossover
+    // disabled (>1.0) so it does not fall back to a whole-object GET that would
+    // skip fetch_blocks' per-block peek entirely.
+    let configure = |br: BlockRangeFetcher| {
+        br.with_whole_object_threshold(0)
+            .with_suffix_len(64)
+            .with_coverage_threshold(2.0)
+    };
+
+    // Oracle: RAM-only cache. `Cache::get_or_fetch` is miss-only, so each logical
+    // miss is exactly one `CacheMetrics` miss.
+    let ram_only: Arc<Cache<crate::fetcher::CacheFetchError>> =
+        Arc::new(Cache::new(generous_cache_limits()));
+    let ram_metrics_oracle = ram_only.metrics();
+    let br_ram = configure(BlockRangeFetcher::new(backend.clone()).with_cache(ram_only));
+    let (_bytes, stats) = br_ram
+        .fetch_object(
+            &seg_ref,
+            RLOG_TENANT,
+            ts_min,
+            ts_max,
+            &QueryAccounting::new(),
+        )
+        .await
+        .expect("oracle block-range fetch");
+    let oracle_misses = ram_metrics_oracle.snapshot().misses;
+
+    // The path must be genuinely exercised, or the discipline is untested.
+    assert!(
+        !stats.whole_object,
+        "the fixture must take the ranged path, not a whole-object crossover"
+    );
+    assert!(
+        stats.candidate_blocks >= 1,
+        "at least one candidate block must be fetched through the peek-then-defer path"
+    );
+    assert!(
+        oracle_misses >= 1,
+        "the cold fetch must record at least one miss"
+    );
+
+    // Tiered cache: same object, same protocol, cold. The RAM tier's miss count
+    // must equal the oracle -- a double-count would inflate it.
+    let tmp = tempfile::TempDir::new().expect("temp dir for the disk cache tier");
+    let ram = Cache::<crate::fetcher::CacheFetchError>::new(generous_cache_limits());
+    let ram_metrics_tiered = ram.metrics();
+    let disk = DiskCache::new(tmp.path().to_path_buf(), generous_cache_limits());
+    let tiered = Arc::new(TieredCache::new(ram, disk));
+    let br_tiered = configure(BlockRangeFetcher::new(backend).with_cache(tiered));
+    br_tiered
+        .fetch_object(
+            &seg_ref,
+            RLOG_TENANT,
+            ts_min,
+            ts_max,
+            &QueryAccounting::new(),
+        )
+        .await
+        .expect("tiered block-range fetch");
+
+    assert_eq!(
+        ram_metrics_tiered.snapshot().misses,
+        oracle_misses,
+        "the tiered tier must record exactly one miss per logical cache miss (peek-then-defer), \
+         not two: a second miss layered on the deferred fetch would inflate this above the \
+         RAM-only oracle of {oracle_misses}"
     );
 }

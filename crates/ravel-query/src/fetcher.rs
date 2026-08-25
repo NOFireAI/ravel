@@ -4,7 +4,7 @@
 
 use bytes::Bytes;
 use futures::future::join_all;
-use ravel_cache::{Cache, CacheKey, SingleFlightError};
+use ravel_cache::{Cache, CacheKey, SingleFlightError, Source, TieredCache};
 use ravel_catalog::{SegmentLevel, SegmentRef};
 use ravel_object_store::{Etag, GetOutcome, GetRange, ObjectStoreBackend, StoreError, Version};
 use ravel_promql::{LabelMatcher, matches_series};
@@ -166,6 +166,150 @@ pub enum CacheFetchError {
 impl From<StoreError> for CacheFetchError {
     fn from(err: StoreError) -> Self {
         CacheFetchError::Store(std::sync::Arc::new(err))
+    }
+}
+
+/// The read-cache handle a fetcher holds (ADR-0046 decision 1), either the RAM
+/// tier alone or the RAM-over-disk [`TieredCache`], behind one interface the
+/// RSEG and RLOG read funnels consult without committing to a concrete tier.
+///
+/// - [`ReadCache::Ram`] is today's exact behavior: the bare RAM [`Cache`] every
+///   existing caller constructs. A query node has no disk tier until #97 wires
+///   `--cache-dir`, so this is the only variant production builds; it writes no
+///   local files and needs no Tokio runtime to construct. Its
+///   [`Cache::get_or_fetch`] is miss-only and never re-peeks, so a caller may
+///   peek with [`ReadCache::get`] and then resolve a miss through
+///   [`ReadCache::fetch_peeked`] with the peek as the one accounted miss.
+/// - [`ReadCache::Tiered`] is the RAM-over-disk handle: a disk-served hit is
+///   single-flighted and corruption-gated per ADR-0046 decisions 3-5. It is
+///   constructed only by this crate's tests today (and #97's wiring later); the
+///   funnels route through it wherever it is present.
+///
+/// This mirrors the precedent issue #96 set for `ravel-catalog`'s byte cache
+/// (`ByteCache`): a small tier-dispatching wrapper rather than committing each
+/// fetcher field to one concrete type, so a RAM-only caller never has to invent
+/// a disabled `DiskCache`. Both variants carry the same [`CacheFetchError`]
+/// upstream-fetch error (the tiered single-flight already requires a `Clone`
+/// error and `CacheFetchError` is), so unlike `ByteCache` the two share one
+/// error type.
+#[derive(Clone)]
+pub enum ReadCache {
+    /// RAM tier only (no disk configured): today's exact behavior.
+    Ram(std::sync::Arc<Cache<CacheFetchError>>),
+    /// RAM over local disk (ADR-0046 decision 3): disk-served hits are
+    /// single-flighted and corruption-gated.
+    Tiered(std::sync::Arc<TieredCache<CacheFetchError>>),
+}
+
+impl From<std::sync::Arc<Cache<CacheFetchError>>> for ReadCache {
+    fn from(ram: std::sync::Arc<Cache<CacheFetchError>>) -> Self {
+        ReadCache::Ram(ram)
+    }
+}
+
+impl From<std::sync::Arc<TieredCache<CacheFetchError>>> for ReadCache {
+    fn from(tiered: std::sync::Arc<TieredCache<CacheFetchError>>) -> Self {
+        ReadCache::Tiered(tiered)
+    }
+}
+
+impl ReadCache {
+    /// Peek every tier with no upstream fetch, serving a hit and returning
+    /// `None` on a genuine miss (recording its own hit/miss on the cache's
+    /// `CacheMetrics`). The fetch-free half a caller uses when its miss handling
+    /// cannot be expressed as one upstream-fetch closure: `BlockRangeFetcher`'s
+    /// per-block peek, which defers a miss to a later coalesced GET.
+    pub(crate) fn get(&self, key: &CacheKey) -> Option<Bytes> {
+        match self {
+            ReadCache::Ram(ram) => ram.get(key),
+            ReadCache::Tiered(tiered) => tiered.get(key),
+        }
+    }
+
+    /// Admit already-fetched, already-verified bytes into every tier with no
+    /// upstream fetch and no single-flight (`BlockRangeFetcher`'s per-block
+    /// admission, ADR-0107 decision 3). Records no miss, so it never layers a
+    /// second miss on top of one a prior [`get`](Self::get) peek already
+    /// recorded for the same key.
+    pub(crate) fn insert(&self, key: CacheKey, value: Bytes) {
+        match self {
+            ReadCache::Ram(ram) => ram.insert(key, value),
+            ReadCache::Tiered(tiered) => tiered.insert(key, value),
+        }
+    }
+
+    /// Read `key` through the cache, running `fetch` only on a genuine miss in
+    /// every tier, and reporting whether the bytes came from a tier
+    /// ([`Source::Cache`]) or from the fetch ([`Source::Upstream`]) so the caller
+    /// accounts for the hit/miss exactly once. This is the single-call
+    /// read-through the RSEG funnel ([`SegmentFetcher::cached_get`]) and the
+    /// block-range extent/probe funnel ([`BlockRangeFetcher::cached_extent`])
+    /// use; the caller must NOT also peek with [`get`](Self::get) first (that
+    /// would record the miss twice on the tiered tier).
+    ///
+    /// The tiered tier's [`TieredCache::get_or_fetch`] peeks both tiers
+    /// internally and returns the real [`Source`]. The RAM tier's
+    /// [`Cache::get_or_fetch`] is miss-only, so the RAM branch peeks once here (a
+    /// hit is [`Source::Cache`]) and runs the miss-only fetch on a miss (always
+    /// [`Source::Upstream`]); neither branch counts the miss twice.
+    pub(crate) async fn get_or_fetch<F, Fut>(
+        &self,
+        key: CacheKey,
+        fetch: F,
+    ) -> Result<(Bytes, Source), SingleFlightError<CacheFetchError>>
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: std::future::Future<Output = Result<Bytes, CacheFetchError>> + Send,
+    {
+        match self {
+            ReadCache::Tiered(tiered) => tiered.get_or_fetch(key, fetch).await,
+            ReadCache::Ram(ram) => {
+                if let Some(bytes) = ram.get(&key) {
+                    return Ok((bytes, Source::Cache));
+                }
+                ram.get_or_fetch(key, fetch)
+                    .await
+                    .map(|bytes| (bytes, Source::Upstream))
+            }
+        }
+    }
+
+    /// Resolve a key the caller ALREADY peeked-and-missed with
+    /// [`get`](Self::get) (`BlockRangeFetcher`'s peek-then-defer coalesced
+    /// fetch): run `fetch` and admit the result, WITHOUT recording a second miss
+    /// on top of the peek's.
+    ///
+    /// The RAM tier uses its miss-only [`Cache::get_or_fetch`], which
+    /// single-flights concurrent callers onto one `fetch` and never re-peeks, so
+    /// the caller's earlier `get` stays the one accounted miss while
+    /// cross-partition coordination is preserved (ADR-0102 decision 1). The
+    /// tiered tier cannot reuse `get_or_fetch` here: it peeks both tiers again,
+    /// which would record a SECOND miss for a key the caller already peeked
+    /// ([`TieredCache::get`]'s documented double-count pitfall). It therefore
+    /// runs `fetch` directly and admits via [`TieredCache::insert`] (no miss
+    /// recorded), the fetch-free discipline ADR-0046 prescribes for a
+    /// peeked-then-deferred key. `fetch`'s own coalescing -- `BlockRangeFetcher`
+    /// splits one range GET into per-block entries inside the closure -- is
+    /// unaffected either way.
+    pub(crate) async fn fetch_peeked<F, Fut>(
+        &self,
+        key: CacheKey,
+        fetch: F,
+    ) -> Result<Bytes, SingleFlightError<CacheFetchError>>
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: std::future::Future<Output = Result<Bytes, CacheFetchError>> + Send,
+    {
+        match self {
+            ReadCache::Ram(ram) => ram.get_or_fetch(key, fetch).await,
+            ReadCache::Tiered(tiered) => match fetch().await {
+                Ok(bytes) => {
+                    tiered.insert(key, bytes.clone());
+                    Ok(bytes)
+                }
+                Err(err) => Err(SingleFlightError::Upstream(err)),
+            },
+        }
     }
 }
 
@@ -374,10 +518,12 @@ pub struct SegmentFetcher {
     /// ADR-0046's read cache, consulted by `guarded_get` for every
     /// byte-range (and whole-object) GET. `None` -- the default from
     /// `new` -- reproduces exactly the pre-cache behavior: every GET goes
-    /// to the store. Shared across clones, and safe to share across
-    /// tenants: the cache key is derived per call from the caller-supplied
-    /// `tenant_hash`, never fixed on the fetcher itself.
-    cache: Option<std::sync::Arc<Cache<CacheFetchError>>>,
+    /// to the store. Either tier configuration (RAM-only or RAM-over-disk,
+    /// see [`ReadCache`]); every production caller builds the RAM variant.
+    /// Shared across clones, and safe to share across tenants: the cache key
+    /// is derived per call from the caller-supplied `tenant_hash`, never
+    /// fixed on the fetcher itself.
+    cache: Option<ReadCache>,
 }
 
 impl SegmentFetcher {
@@ -398,9 +544,14 @@ impl SegmentFetcher {
     /// Wires ADR-0046's read cache into every GET `guarded_get` issues
     /// (decision 1). A `SegmentFetcher` built with plain `new` and never
     /// given a cache behaves exactly as it did before this cache existed.
+    ///
+    /// Accepts either tier configuration through [`ReadCache`]: an
+    /// `Arc<Cache<CacheFetchError>>` (RAM-only, what every production caller
+    /// passes) or an `Arc<TieredCache<CacheFetchError>>` (RAM over disk) both
+    /// convert via [`From`], so existing call sites are unchanged.
     #[must_use]
-    pub fn with_cache(mut self, cache: std::sync::Arc<Cache<CacheFetchError>>) -> Self {
-        self.cache = Some(cache);
+    pub fn with_cache(mut self, cache: impl Into<ReadCache>) -> Self {
+        self.cache = Some(cache.into());
         self
     }
 
@@ -584,7 +735,7 @@ impl SegmentFetcher {
     #[allow(clippy::too_many_arguments)]
     async fn cached_get(
         &self,
-        cache: &std::sync::Arc<Cache<CacheFetchError>>,
+        cache: &ReadCache,
         seg_ref: &SegmentRef,
         tenant_hash: TenantHash,
         range: GetRange,
@@ -596,20 +747,15 @@ impl SegmentFetcher {
         let key = seg_ref.data_object_key.as_str();
         let cache_key = CacheKey::new(tenant_hash.0, seg_ref.content_hash, start, end - start);
 
-        if let Some(bytes) = cache.get(&cache_key) {
-            accounting.record_cache_hit();
-            accounting.add_cache_bytes(bytes.len() as u64);
-            // Bytes were resident in the cache before this call asked, so no
-            // store round trip happened and this call adds nothing to its
-            // span's S3 counts (ADR-0044 decision 5).
-            return Ok((
-                placeholder_outcome(bytes, seg_ref.object_size),
-                GetCost::default(),
-            ));
-        }
-        accounting.record_cache_miss();
-
-        let bytes = cache
+        // One read-through call, then account for it from the returned
+        // [`Source`]. A single call avoids the peek-then-`get_or_fetch`
+        // double-count on the tiered tier (see [`ReadCache::get_or_fetch`] and
+        // [`TieredCache::get`]): [`Source::Cache`] means the bytes were resident
+        // in a tier before this call asked (a hit, possibly disk-served -- no
+        // store round trip, so nothing added to this span's S3 counts), and
+        // [`Source::Upstream`] means the store GET inside the closure ran (a
+        // leader miss) or this call rode another's in-flight GET (a follower).
+        let (bytes, source) = cache
             .get_or_fetch(cache_key, || async move {
                 let got = self
                     .store_get(key, range, accounting)
@@ -656,19 +802,30 @@ impl SegmentFetcher {
                     ),
                 },
             })?;
-        // A miss issued one store GET for these bytes (leader), or rode another
-        // caller's in-flight GET (follower). Either way attribute one logical
-        // GET, as `log_fetcher.rs`'s `fetch_accounted_with_tenant` does: it does
-        // not try to distinguish the rare follower, since recording one GET
-        // bounds this call's own attribution and never under-counts the query
-        // total. `record_cache_hit` above (the only zero-cost path) is the sole
-        // case that came from cache, so this arm always crossed the network from
-        // this caller's point of view.
-        let cost = GetCost {
-            requests: 1,
-            bytes: bytes.len() as u64,
-        };
-        Ok((placeholder_outcome(bytes, seg_ref.object_size), cost))
+        match source {
+            Source::Cache => {
+                accounting.record_cache_hit();
+                accounting.add_cache_bytes(bytes.len() as u64);
+                Ok((
+                    placeholder_outcome(bytes, seg_ref.object_size),
+                    GetCost::default(),
+                ))
+            }
+            // A miss issued one store GET for these bytes (leader), or rode
+            // another caller's in-flight GET (follower). Either way attribute one
+            // logical GET, as `log_fetcher.rs`'s `fetch_accounted_with_tenant`
+            // does: it does not try to distinguish the rare follower, since
+            // recording one GET bounds this call's own attribution and never
+            // under-counts the query total.
+            Source::Upstream => {
+                accounting.record_cache_miss();
+                let cost = GetCost {
+                    requests: 1,
+                    bytes: bytes.len() as u64,
+                };
+                Ok((placeholder_outcome(bytes, seg_ref.object_size), cost))
+            }
+        }
     }
 
     async fn ensure_ranges(
