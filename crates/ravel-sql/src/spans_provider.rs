@@ -43,7 +43,7 @@ use crate::distributed_rlog::{
 };
 use crate::spans_fetcher::SpanSegmentFetcher;
 use crate::spans_pushdown::{SpansPushdown, extract_spans};
-use crate::spans_scan::SpansScanExec;
+use crate::spans_scan::{SpansScanExec, columnar_static_eligible};
 use crate::spans_schema::spans_schema;
 
 /// The `spans` table provider for one tenant over one pinned `Signal::Spans`
@@ -129,7 +129,7 @@ impl SpansTableProvider {
     /// preserving merge over the leaf's weaker order).
     #[cfg(feature = "flight-sql")]
     pub fn worker_fragment(&self, target_partitions: usize) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let scan = self.build_scan(target_partitions, &SpansPushdown::default())?;
+        let scan = self.build_scan(target_partitions, &SpansPushdown::default(), None)?;
         sort_slice_fragment(scan, &self.schema, SPAN_ORDER_COLS)
     }
 
@@ -162,7 +162,7 @@ impl SpansTableProvider {
     /// Exposed (like the logs provider's `plan`) so tests can execute the scan
     /// without a SQL front-end.
     pub fn plan(&self, target_partitions: usize) -> DFResult<Arc<dyn ExecutionPlan>> {
-        self.build_scan(target_partitions, &SpansPushdown::default())
+        self.build_scan(target_partitions, &SpansPushdown::default(), None)
     }
 
     /// Build the scan for a set of filters, extracting the pushdown from them.
@@ -175,7 +175,7 @@ impl SpansTableProvider {
         target_partitions: usize,
         filters: &[Expr],
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        self.build_scan(target_partitions, &extract_spans(filters))
+        self.build_scan(target_partitions, &extract_spans(filters), None)
     }
 
     /// Admission (the sealed-segment cap) is decided exactly once, at
@@ -191,6 +191,7 @@ impl SpansTableProvider {
         &self,
         target_partitions: usize,
         pushdown: &SpansPushdown,
+        projection: Option<Vec<usize>>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let segments = self.pruned_segments(pushdown);
         let scan = SpansScanExec::new(
@@ -204,6 +205,7 @@ impl SpansTableProvider {
             pushdown.duration_window(),
             pushdown.status_mask,
             Arc::clone(&self.erasure),
+            projection,
             self.accounting.clone(),
         )?;
         Ok(Arc::new(scan))
@@ -284,13 +286,21 @@ impl TableProvider for SpansTableProvider {
 
         let target_partitions = state.config().target_partitions();
         let pushdown = extract_spans(filters);
-        let plan = self.build_scan(target_partitions, &pushdown)?;
 
-        // Projection pushdown: column selection only. When a column is not
-        // projected DataFusion still receives every column from the scan and
-        // this ProjectionExec drops the rest; the fetch reads the whole object
-        // regardless (RSPAN's reader has no per-column page toggle at this
-        // layer), matching the logs/metrics providers' stance.
+        // Eligible fast path (ADR-0110 decision 4): the projection excludes the
+        // `attrs` map and no pending erasure predicate applies. Push the
+        // projection into the scan, which emits the projected schema directly
+        // and decodes only the pages that schema needs; add NO `ProjectionExec`.
+        if columnar_static_eligible(projection, &self.erasure) {
+            return self.build_scan(target_partitions, &pushdown, projection.cloned());
+        }
+
+        // Ineligible path, unchanged: the scan emits the full eleven-column
+        // schema and, for column selection, this `ProjectionExec` drops the
+        // rest. The fetch reads the whole object regardless (an `attrs`
+        // projection or a pending erasure predicate forces the row path, which
+        // has no per-column page toggle), matching the logs/metrics providers.
+        let plan = self.build_scan(target_partitions, &pushdown, None)?;
         match projection {
             Some(proj) => {
                 let exprs = proj
