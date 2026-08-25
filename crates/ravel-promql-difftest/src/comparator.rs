@@ -18,6 +18,23 @@
 //! project's `-0.0` bit-significance rule is a matter of principle, not
 //! magnitude, so the zero boundary is always exact-bit-compared.
 //!
+//! Native-histogram elements (ADR-0108 decision 10) compare by a canonical
+//! semantic form, never a byte layout: two engines can encode the same
+//! histogram with different internal span layouts, so the wire form is what is
+//! compared. A vector element carries either a float `value` or a native
+//! `histogram`; a matrix series carries float steps under `values` and
+//! histogram steps under `histograms`, either or both across its grid. Which
+//! channel an element uses is part of its series identity, so a series
+//! Prometheus returns as a histogram and Ravel returns as a float (or the
+//! reverse) is a mismatch, not a match. A histogram value's bucket structure
+//! (each bucket's interval-openness code and its lower/upper boundaries, in
+//! order) and its per-bucket counts compare exactly; the histogram's total
+//! `count` and `sum` compare under the same bit-exact-or-ULP value rule as any
+//! float, so an entry's `tolerance:` field reaches them because both engines
+//! compute extrapolated rates independently. Boundaries and counts are parsed
+//! from their Prometheus value strings and bit-compared, so a formatting
+//! difference over the same `f64` is never a divergence.
+//!
 //! A corpus entry may also opt into the one-sided
 //! [`ComparisonMode::RavelErrorPromSuccess`] mode (ADR-0030's allowlist):
 //! an accepted, per-entry, by-design divergence where Ravel rejects a query
@@ -136,19 +153,170 @@ fn label_key(metric: &Json) -> String {
         .join(",")
 }
 
+/// The channel an element carries: a float value (`value`/`values`), a native
+/// histogram (`histogram`/`histograms`), or both across a matrix series' grid.
+/// Part of a series' identity: a series Prometheus returns as a histogram and
+/// Ravel returns as a float for the same label set is a divergence, so the two
+/// must never sort into the same identity slot.
+fn element_channel(elem: &Json) -> &'static str {
+    let has_float = elem.get("value").is_some_and(|v| !v.is_null())
+        || elem
+            .get("values")
+            .and_then(Json::as_array)
+            .is_some_and(|a| !a.is_empty());
+    let has_hist = elem.get("histogram").is_some_and(|v| !v.is_null())
+        || elem
+            .get("histograms")
+            .and_then(Json::as_array)
+            .is_some_and(|a| !a.is_empty());
+    match (has_float, has_hist) {
+        (true, true) => "float+histogram",
+        (false, true) => "histogram",
+        (true, false) => "float",
+        (false, false) => "empty",
+    }
+}
+
+/// A result element's identity for order-insensitive comparison: its full
+/// label set plus the channel it uses. The `\u{1f}` unit separator keeps the
+/// two parts from colliding (no label name or value contains it).
+fn series_identity(elem: &Json) -> String {
+    format!("{}\u{1f}{}", label_key(&elem["metric"]), element_channel(elem))
+}
+
+/// A vector element's native `histogram` field, if present and non-null.
+fn histogram_field(elem: &Json) -> Option<&Json> {
+    elem.get("histogram").filter(|v| !v.is_null())
+}
+
+/// A named array field, or an empty slice when the field is absent (Prometheus
+/// omits `values`/`histograms` when a series has no steps of that channel).
+fn array_field<'a>(elem: &'a Json, field: &str) -> &'a [Json] {
+    elem.get(field)
+        .and_then(Json::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+/// One `SampleHistogram` bucket's field `i` as a Prometheus value string.
+fn bucket_str(arr: &[Json], i: usize) -> Result<&str, String> {
+    arr[i]
+        .as_str()
+        .ok_or_else(|| format!("histogram bucket field {i} is not a string"))
+}
+
+/// One histogram scalar field (`count`/`sum`) parsed to its `f64`.
+fn histogram_scalar(h: &Json, field: &str) -> Result<f64, String> {
+    let s = h
+        .get(field)
+        .and_then(Json::as_str)
+        .ok_or_else(|| format!("histogram missing string field '{field}'"))?;
+    parse_sample_value(s)
+}
+
+/// Compares one `[boundaries, lower, upper, count]` bucket tuple. The
+/// interval-openness code is an exact integer identity; the lower/upper
+/// boundaries and the per-bucket count are parsed from their value strings and
+/// bit-compared exactly. Bucket structure and counts do not take the entry's
+/// ULP tolerance: that applies only to the histogram's total `count`/`sum`.
+fn bucket_equal(a: &Json, b: &Json) -> Result<bool, String> {
+    let a_arr = a.as_array().ok_or("histogram bucket is not an array")?;
+    let b_arr = b.as_array().ok_or("histogram bucket is not an array")?;
+    if a_arr.len() != 4 || b_arr.len() != 4 {
+        return Err(format!(
+            "histogram bucket has {} / {} elements, expected 4",
+            a_arr.len(),
+            b_arr.len()
+        ));
+    }
+    if a_arr[0] != b_arr[0] {
+        return Ok(false);
+    }
+    for i in [1usize, 2, 3] {
+        let a_v = parse_sample_value(bucket_str(a_arr, i)?)?;
+        let b_v = parse_sample_value(bucket_str(b_arr, i)?)?;
+        if !values_equal(a_v, b_v, None) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Compares two Prometheus `SampleHistogram` JSON objects
+/// (`{count, sum, buckets}`) for semantic equality: the bucket structure and
+/// per-bucket counts exact, the total `count`/`sum` under the entry's
+/// bit-exact-or-ULP value rule.
+fn histogram_json_equal(a: &Json, b: &Json, tolerance_ulps: Option<u32>) -> Result<bool, String> {
+    if !values_equal(
+        histogram_scalar(a, "count")?,
+        histogram_scalar(b, "count")?,
+        tolerance_ulps,
+    ) {
+        return Ok(false);
+    }
+    if !values_equal(
+        histogram_scalar(a, "sum")?,
+        histogram_scalar(b, "sum")?,
+        tolerance_ulps,
+    ) {
+        return Ok(false);
+    }
+    let a_buckets = array_field(a, "buckets");
+    let b_buckets = array_field(b, "buckets");
+    if a_buckets.len() != b_buckets.len() {
+        return Ok(false);
+    }
+    for (ab, bb) in a_buckets.iter().zip(b_buckets.iter()) {
+        if !bucket_equal(ab, bb)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Compares one `[<ts>, <histogram>]` sample pair: the timestamp exact, the
+/// histogram object by [`histogram_json_equal`].
+fn histogram_pair_equal(a: &Json, b: &Json, tolerance_ulps: Option<u32>) -> Result<bool, String> {
+    let a_arr = a.as_array().ok_or("histogram sample is not a 2-element array")?;
+    let b_arr = b.as_array().ok_or("histogram sample is not a 2-element array")?;
+    if a_arr.len() != 2 || b_arr.len() != 2 {
+        return Err(format!(
+            "histogram sample has {} / {} elements, expected 2",
+            a_arr.len(),
+            b_arr.len()
+        ));
+    }
+    let a_ts = a_arr[0]
+        .as_f64()
+        .ok_or("histogram sample timestamp is not a number")?;
+    let b_ts = b_arr[0]
+        .as_f64()
+        .ok_or("histogram sample timestamp is not a number")?;
+    if a_ts != b_ts {
+        return Ok(false);
+    }
+    histogram_json_equal(&a_arr[1], &b_arr[1], tolerance_ulps)
+}
+
 fn vector_result_equal(a: &Json, b: &Json, tolerance_ulps: Option<u32>) -> Result<bool, String> {
     if a["metric"] != b["metric"] {
         return Ok(false);
     }
-    sample_pair_equal(&a["value"], &b["value"], tolerance_ulps)
+    match (histogram_field(a), histogram_field(b)) {
+        (Some(ah), Some(bh)) => histogram_pair_equal(ah, bh, tolerance_ulps),
+        (None, None) => sample_pair_equal(&a["value"], &b["value"], tolerance_ulps),
+        // Channel divergence: one engine returns a float element, the other a
+        // native histogram, for the same series. Never a match.
+        _ => Ok(false),
+    }
 }
 
 fn matrix_result_equal(a: &Json, b: &Json, tolerance_ulps: Option<u32>) -> Result<bool, String> {
     if a["metric"] != b["metric"] {
         return Ok(false);
     }
-    let a_values = a["values"].as_array().ok_or("matrix values not an array")?;
-    let b_values = b["values"].as_array().ok_or("matrix values not an array")?;
+    let a_values = array_field(a, "values");
+    let b_values = array_field(b, "values");
     if a_values.len() != b_values.len() {
         return Ok(false);
     }
@@ -157,12 +325,22 @@ fn matrix_result_equal(a: &Json, b: &Json, tolerance_ulps: Option<u32>) -> Resul
             return Ok(false);
         }
     }
+    let a_hist = array_field(a, "histograms");
+    let b_hist = array_field(b, "histograms");
+    if a_hist.len() != b_hist.len() {
+        return Ok(false);
+    }
+    for (av, bv) in a_hist.iter().zip(b_hist.iter()) {
+        if !histogram_pair_equal(av, bv, tolerance_ulps)? {
+            return Ok(false);
+        }
+    }
     Ok(true)
 }
 
-fn sort_by_label_key(results: &[Json]) -> Vec<Json> {
+fn sort_by_series_identity(results: &[Json]) -> Vec<Json> {
     let mut sorted: Vec<Json> = results.to_vec();
-    sorted.sort_by_key(|r| label_key(&r["metric"]));
+    sorted.sort_by_key(series_identity);
     sorted
 }
 
@@ -379,8 +557,8 @@ fn compare_series(
         ComparisonMode::Unordered
         | ComparisonMode::ExpectError
         | ComparisonMode::RavelErrorPromSuccess => (
-            sort_by_label_key(&prom_results),
-            sort_by_label_key(&ravel_results),
+            sort_by_series_identity(&prom_results),
+            sort_by_series_identity(&ravel_results),
         ),
     };
     for (index, (p, r)) in prom_ordered.iter().zip(ravel_ordered.iter()).enumerate() {
@@ -713,6 +891,241 @@ mod tests {
             compare(ComparisonMode::Unordered, None, &prom, &ravel),
             Verdict::Match
         );
+    }
+
+    // ---- Native-histogram elements (ADR-0108 decision 10) ----
+
+    /// A vector `/api/v1/query` envelope wrapping one native-histogram element.
+    fn histogram_vector(hist: Json) -> Json {
+        json!({
+            "status": "success",
+            "data": {
+                "resultType": "vector",
+                "result": [{"metric": {"__name__": "h"}, "histogram": [1.0, hist]}]
+            }
+        })
+    }
+
+    /// A matrix `/api/v1/query_range` envelope wrapping one native-histogram
+    /// series with a single step.
+    fn histogram_matrix(hist: Json) -> Json {
+        json!({
+            "status": "success",
+            "data": {
+                "resultType": "matrix",
+                "result": [{"metric": {"__name__": "h"}, "histograms": [[1.0, hist]]}]
+            }
+        })
+    }
+
+    /// A three-bucket schema-0 native histogram in Prometheus' JSON shape.
+    fn sample_histogram() -> Json {
+        json!({
+            "count": "6",
+            "sum": "16",
+            "buckets": [[0, "1", "2", "2"], [0, "2", "4", "3"], [0, "4", "8", "1"]]
+        })
+    }
+
+    #[test]
+    fn identical_histogram_vector_elements_match() {
+        let body = histogram_vector(sample_histogram());
+        assert_eq!(
+            compare(ComparisonMode::Unordered, None, &body, &body),
+            Verdict::Match
+        );
+    }
+
+    #[test]
+    fn identical_histogram_matrix_series_match() {
+        let body = histogram_matrix(sample_histogram());
+        assert_eq!(
+            compare(ComparisonMode::Unordered, None, &body, &body),
+            Verdict::Match
+        );
+    }
+
+    /// The silent-zeros shape (ADR-0108 context 1): the grid collapse dropped
+    /// the histogram and emitted a placeholder float. Prometheus returns the
+    /// histogram; pre-fix Ravel returns `value: "0"` for the same series. The
+    /// channel divergence is a mismatch. This is what a range
+    /// `sum(rate(h[5m]))` entry would have flipped red pre-fix.
+    #[test]
+    fn a_float_zero_where_prometheus_returns_a_histogram_is_caught() {
+        let prom = histogram_vector(sample_histogram());
+        let ravel = json!({
+            "status": "success",
+            "data": {
+                "resultType": "vector",
+                "result": [{"metric": {"__name__": "h"}, "value": [1.0, "0"]}]
+            }
+        });
+        assert!(matches!(
+            compare(ComparisonMode::Unordered, None, &prom, &ravel),
+            Verdict::Mismatch(_)
+        ));
+    }
+
+    /// The silent-zeros shape on the range endpoint: a matrix step Prometheus
+    /// returns as a histogram, pre-fix Ravel as an all-zero float step.
+    #[test]
+    fn a_float_zero_matrix_step_where_prometheus_returns_a_histogram_is_caught() {
+        let prom = histogram_matrix(sample_histogram());
+        let ravel = json!({
+            "status": "success",
+            "data": {
+                "resultType": "matrix",
+                "result": [{"metric": {"__name__": "h"}, "values": [[1.0, "0"]]}]
+            }
+        });
+        assert!(matches!(
+            compare(ComparisonMode::Unordered, None, &prom, &ravel),
+            Verdict::Mismatch(_)
+        ));
+    }
+
+    /// The silent-empties shape (ADR-0108 context 2): a bare histogram
+    /// selector or a histogram `rate` whose range arm dropped the histogram
+    /// input, so pre-fix Ravel returns an empty result where Prometheus
+    /// returns a histogram series. Caught as a result-length mismatch.
+    #[test]
+    fn a_dropped_histogram_series_where_prometheus_returns_one_is_caught() {
+        let prom = histogram_matrix(sample_histogram());
+        let ravel = json!({
+            "status": "success",
+            "data": {"resultType": "matrix", "result": []}
+        });
+        assert!(matches!(
+            compare(ComparisonMode::Unordered, None, &prom, &ravel),
+            Verdict::Mismatch(_)
+        ));
+    }
+
+    /// The false-absence shape (ADR-0108 context 3): `absent_over_time(h[15m])`
+    /// with histogram data flowing. Prometheus sees the data and returns empty;
+    /// pre-fix Ravel's float-only fetch sees nothing and returns 1. Caught as a
+    /// result-length mismatch.
+    #[test]
+    fn a_false_absence_marker_where_prometheus_returns_empty_is_caught() {
+        let prom = json!({
+            "status": "success",
+            "data": {"resultType": "vector", "result": []}
+        });
+        let ravel = json!({
+            "status": "success",
+            "data": {
+                "resultType": "vector",
+                "result": [{"metric": {}, "value": [1.0, "1"]}]
+            }
+        });
+        assert!(matches!(
+            compare(ComparisonMode::Unordered, None, &prom, &ravel),
+            Verdict::Mismatch(_)
+        ));
+    }
+
+    /// Two histograms differing only in one bucket's count are a mismatch even
+    /// under a generous total-count/sum tolerance: bucket counts are exact, so
+    /// a wrong bucket cannot hide behind a tolerance meant for the aggregate
+    /// floats.
+    #[test]
+    fn a_bucket_count_divergence_is_caught_even_under_tolerance() {
+        let prom = histogram_vector(sample_histogram());
+        let mut other = sample_histogram();
+        other["buckets"][1][3] = json!("4");
+        let ravel = histogram_vector(other);
+        assert!(matches!(
+            compare(ComparisonMode::Unordered, Some(u32::MAX), &prom, &ravel),
+            Verdict::Mismatch(_)
+        ));
+    }
+
+    /// A bucket boundary difference (a different schema/resolution) is a
+    /// mismatch: the bucket structure is compared exactly.
+    #[test]
+    fn a_bucket_boundary_divergence_is_caught() {
+        let prom = histogram_vector(sample_histogram());
+        let mut other = sample_histogram();
+        other["buckets"][2][2] = json!("16");
+        let ravel = histogram_vector(other);
+        assert!(matches!(
+            compare(ComparisonMode::Unordered, None, &prom, &ravel),
+            Verdict::Mismatch(_)
+        ));
+    }
+
+    /// The histogram's total `count`/`sum` take the entry's ULP tolerance,
+    /// because both engines compute extrapolated rates independently: a
+    /// few-ULP drift in `sum` matches under tolerance and mismatches without.
+    #[test]
+    fn a_histogram_sum_within_tolerance_matches_and_without_it_does_not() {
+        let base = 16.0_f64;
+        let drifted = f64::from_bits(base.to_bits() + 3);
+        let prom = histogram_vector(sample_histogram());
+        let mut other = sample_histogram();
+        other["sum"] = json!(drifted.to_string());
+        let ravel = histogram_vector(other);
+        assert_eq!(
+            compare(ComparisonMode::Unordered, Some(4), &prom, &ravel),
+            Verdict::Match
+        );
+        assert!(matches!(
+            compare(ComparisonMode::Unordered, None, &prom, &ravel),
+            Verdict::Mismatch(_)
+        ));
+    }
+
+    /// A histogram whose buckets are listed in a different order is not the
+    /// same histogram: bucket order is cumulative-ascending and structural.
+    #[test]
+    fn a_reordered_bucket_list_is_a_mismatch() {
+        let prom = histogram_vector(sample_histogram());
+        let reordered = json!({
+            "count": "6",
+            "sum": "16",
+            "buckets": [[0, "2", "4", "3"], [0, "1", "2", "2"], [0, "4", "8", "1"]]
+        });
+        let ravel = histogram_vector(reordered);
+        assert!(matches!(
+            compare(ComparisonMode::Unordered, None, &prom, &ravel),
+            Verdict::Mismatch(_)
+        ));
+    }
+
+    /// Two equal histograms whose boundary strings are formatted differently
+    /// for the same numeric value still match: boundaries are parsed and
+    /// bit-compared, not string-compared.
+    #[test]
+    fn equal_boundaries_formatted_differently_still_match() {
+        let prom = histogram_vector(sample_histogram());
+        let reformatted = json!({
+            "count": "6",
+            "sum": "16",
+            "buckets": [[0, "1.0", "2", "2"], [0, "2", "4", "3"], [0, "4", "8", "1"]]
+        });
+        let ravel = histogram_vector(reformatted);
+        assert_eq!(
+            compare(ComparisonMode::Unordered, None, &prom, &ravel),
+            Verdict::Match
+        );
+    }
+
+    /// A histogram element and a float element for the same label set are a
+    /// channel divergence, caught even when both sides carry one result.
+    #[test]
+    fn a_histogram_vs_float_channel_divergence_is_caught() {
+        let prom = histogram_vector(sample_histogram());
+        let ravel = json!({
+            "status": "success",
+            "data": {
+                "resultType": "vector",
+                "result": [{"metric": {"__name__": "h"}, "value": [1.0, "6"]}]
+            }
+        });
+        assert!(matches!(
+            compare(ComparisonMode::Unordered, None, &prom, &ravel),
+            Verdict::Mismatch(_)
+        ));
     }
 
     #[test]
