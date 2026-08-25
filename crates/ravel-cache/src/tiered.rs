@@ -45,6 +45,17 @@
 //! key must still account for exactly one miss per logical request; see
 //! [`TieredCache::get`]'s own docstring for the double-counting pitfall this
 //! crate has already shipped and fixed once on the closure-based path.
+//!
+//! **A third path resolves a peek-then-defer miss under single-flight.**
+//! [`TieredCache::resolve_peeked_miss`] is for a caller that already peeked
+//! both tiers with `get`, saw a confirmed miss, and now wants to resolve it --
+//! but coalesced, so concurrent callers for one key collapse onto a single
+//! upstream fetch. Unlike `get`/`insert` it joins the single-flight (the same
+//! field `get_or_fetch` uses), and unlike `get_or_fetch` it consults neither
+//! tier before fetching and records no miss of its own, because the caller's
+//! `get` already accounted the one miss. `BlockRangeFetcher`'s per-extent
+//! peek-then-defer uses it so N cross-partition callers striping one segment
+//! issue one GET, not N.
 
 use std::sync::Arc;
 
@@ -196,6 +207,93 @@ where
             Source::Upstream
         };
         Ok((self.maybe_corrupt(bytes, from_cache), source))
+    }
+
+    /// Resolve a miss the caller ALREADY confirmed with [`get`](Self::get):
+    /// run `fetch` once behind single-flight and admit its result to **both**
+    /// tiers, **without** re-consulting either tier and **without** recording a
+    /// miss of this method's own.
+    ///
+    /// This is the coalesced companion to [`get`](Self::get)'s peek-then-defer
+    /// discipline (ADR-0046 decision 5), and it exists apart from
+    /// [`get_or_fetch`](Self::get_or_fetch) for one reason: the caller has
+    /// already peeked both tiers with `get` and seen a confirmed both-tier miss,
+    /// so `get_or_fetch`'s internal tier consultation would be redundant work
+    /// here and, worse, would count a SECOND miss on a key `get` already
+    /// accounted for -- exactly the double-count [`get`](Self::get)'s docstring
+    /// warns a peek-then-defer caller against. `BlockRangeFetcher` is that
+    /// caller: it peeks each candidate block with `get`, defers the miss, and
+    /// then resolves the deferred run through this method so N concurrent
+    /// cross-partition callers striping one RSEG/RLOG extent collapse onto one
+    /// upstream fetch instead of each issuing its own.
+    ///
+    /// It joins the **same** [`single_flight`](Self::single_flight) field
+    /// `get_or_fetch` uses, not a second coordinator, so a concurrent
+    /// `get_or_fetch` and a `resolve_peeked_miss` on the same key still coalesce
+    /// onto each other correctly. The stored single-flight value is
+    /// `(clean_bytes, false)`: this method's own leader never serves from a tier
+    /// (`false` = "not from cache", so the bytes are the fresh upstream fetch and
+    /// are never corrupted). A follower may instead ride a concurrent
+    /// `get_or_fetch` leader that served from disk (`true`); that flag is honored
+    /// on the way out so a disk-served ride is corruption-gated identically to
+    /// `get_or_fetch`.
+    ///
+    /// Accounting discipline (the invariant this method depends on): it records
+    /// **no miss** on either tier -- the caller's earlier `get` already recorded
+    /// the one accounted miss for this logical request, and layering a second
+    /// here would corrupt the request-hit-rate SLI, the bug this crate shipped
+    /// and fixed once already (see [`get`](Self::get)'s docstring). It **does**
+    /// record a single-flight collapse when a caller rides another caller's
+    /// leader (`self.ram.metrics().record_collapse()`, the same counter
+    /// `get_or_fetch`'s follower branch feeds), since that is real coalescing
+    /// worth surfacing on the SLI.
+    ///
+    /// On a fetch success the leader admits to **both** tiers (decision 3) via
+    /// the same dual-tier admission [`insert`](Self::insert) uses, so a later RAM
+    /// eviction is served from disk rather than re-paying the S3 round trip.
+    pub async fn resolve_peeked_miss<F, Fut>(
+        &self,
+        key: CacheKey,
+        fetch: F,
+    ) -> Result<Bytes, SingleFlightError<E>>
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: std::future::Future<Output = Result<Bytes, E>> + Send,
+    {
+        // No tier consultation: the caller peeked both tiers with `get` and got
+        // a confirmed miss, so re-reading here would be redundant and could
+        // count a second, unaccounted miss. The leader runs the upstream fetch
+        // once and, on success, admits to BOTH tiers (decision 3). `false`
+        // records that these bytes are the fresh upstream fetch, never a cache
+        // serve, so they are never corrupted.
+        let (outcome, role) = self
+            .single_flight
+            .run(key, move || async move {
+                let bytes = fetch().await?;
+                self.ram.insert(key, bytes.clone());
+                self.disk.insert(key, &bytes);
+                Ok((bytes, false))
+            })
+            .await;
+
+        let (bytes, from_cache) = match outcome {
+            Ok(value) => value,
+            Err(err) => return Err(err),
+        };
+        if role == Role::Follower {
+            // A follower rode another caller's leader (this method's or a
+            // concurrent `get_or_fetch`'s -- both share `single_flight`): count
+            // the collapse on the same SLI `get_or_fetch` feeds. This is the
+            // ONLY `metrics()` call this method makes; it records no miss of its
+            // own, because the caller's earlier `get` already recorded the one
+            // accounted miss for this logical request.
+            self.ram.metrics().record_collapse();
+        }
+        // `from_cache` is `false` for this method's own leader (it consults no
+        // tier), but a follower may have ridden a concurrent `get_or_fetch`
+        // leader that served from disk (`true`); honor it so a disk-served ride
+        // is corruption-gated exactly as `get_or_fetch`'s is.
+        Ok(self.maybe_corrupt(bytes, from_cache))
     }
 
     /// Read `key` through both tiers with **no** upstream fetch and **no**
@@ -511,6 +609,94 @@ mod tests {
             tiered.ram_metrics().snapshot().single_flight_collapses,
             7,
             "the 7 followers each record one collapse"
+        );
+    }
+
+    /// Eight callers that each already peeked-and-missed the same key (via
+    /// `get`, the one accounted miss per caller) then resolve that miss through
+    /// [`TieredCache::resolve_peeked_miss`]: the upstream `fetch` runs exactly
+    /// once (they collapse onto one leader), every caller receives identical
+    /// bytes, the seven followers each record one collapse, and -- critically --
+    /// the method records NO miss of its own on either tier, so the peek stays
+    /// the single accounted miss. A successful resolve admits to both tiers.
+    ///
+    /// This is the crate-level proof of #662's contract. To watch single-flight
+    /// bite, revert `resolve_peeked_miss` to run `fetch().await` directly
+    /// without the `self.single_flight.run(...)` wrapper (the pre-fix
+    /// `ReadCache::fetch_peeked` Tiered behavior): `upstream_calls` then reads 8,
+    /// not 1, and the exactly-one-fetch assertion fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn resolve_peeked_miss_collapses_concurrent_callers_to_one_fetch() {
+        let tmp = TempDir::new().unwrap();
+        let disk = DiskCache::new(tmp.path().to_path_buf(), generous_limits());
+        let ram: Cache<&'static str> = Cache::new(generous_limits());
+        let ram_metrics = ram.metrics();
+        let tiered = Arc::new(TieredCache::new(ram, disk));
+
+        let payload = Bytes::from_static(b"resolved once");
+        let key = test_key(1, payload.len() as u64);
+
+        // Every caller peeks first and genuinely misses both tiers -- exactly
+        // the BlockRangeFetcher peek-then-defer entry condition. These `get`
+        // calls are the one accounted miss per caller.
+        const CALLERS: usize = 8;
+        for _ in 0..CALLERS {
+            assert!(
+                tiered.get(&key).is_none(),
+                "precondition: a caller peeks and misses both tiers"
+            );
+        }
+        let misses_after_peeks = ram_metrics.snapshot().misses;
+
+        let upstream_calls = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..CALLERS {
+            let tiered = tiered.clone();
+            let calls = upstream_calls.clone();
+            let payload = payload.clone();
+            handles.push(tokio::spawn(async move {
+                tiered
+                    .resolve_peeked_miss(key, move || {
+                        let calls = calls.clone();
+                        let payload = payload.clone();
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            // Hold the slot so the other callers arrive as
+                            // followers, not fresh leaders after the first
+                            // completes.
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            Ok::<Bytes, &'static str>(payload)
+                        }
+                    })
+                    .await
+            }));
+        }
+        for handle in handles {
+            let bytes = handle.await.unwrap().unwrap();
+            assert_eq!(
+                bytes, payload,
+                "every caller receives the one fetched value"
+            );
+        }
+
+        assert_eq!(
+            upstream_calls.load(Ordering::SeqCst),
+            1,
+            "8 concurrent resolve_peeked_miss callers on one key must produce exactly one fetch"
+        );
+        assert_eq!(
+            ram_metrics.snapshot().single_flight_collapses,
+            (CALLERS - 1) as u64,
+            "the 7 followers each record one collapse"
+        );
+        assert_eq!(
+            ram_metrics.snapshot().misses,
+            misses_after_peeks,
+            "resolve_peeked_miss records NO miss of its own: the peek was the one accounted miss"
+        );
+        assert!(
+            tiered.disk.get(&key).is_some(),
+            "a successful resolve admits to the disk tier, not RAM alone"
         );
     }
 

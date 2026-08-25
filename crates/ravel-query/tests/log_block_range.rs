@@ -31,7 +31,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use ravel_cache::{Cache, CacheLimits};
+use ravel_cache::{Cache, CacheLimits, DiskCache, TieredCache};
 use ravel_catalog::{SegmentLevel, SegmentRef};
 use ravel_logseg::footer::{self, kind};
 use ravel_logseg::skip_index::SkipIndex;
@@ -834,6 +834,18 @@ fn big_cache() -> Arc<Cache<ravel_query::CacheFetchError>> {
     Arc::new(Cache::new(CacheLimits::new(1 << 26, 1 << 23, 1 << 26)))
 }
 
+/// A `TieredCache` (RAM over a temp-dir `DiskCache`) sized like [`big_cache`] so
+/// nothing is evicted mid-test, constructed exactly as #97's server wiring will
+/// (and as `cache_correctness.rs`'s disk-tier tests already do). Both tiers are
+/// generous: the point of the tiered test below is the single-flight collapse,
+/// not eviction.
+fn big_tiered_cache(dir: &std::path::Path) -> Arc<TieredCache<ravel_query::CacheFetchError>> {
+    let limits = CacheLimits::new(1 << 26, 1 << 23, 1 << 26);
+    let ram = Cache::new(limits);
+    let disk = DiskCache::new(dir.to_path_buf(), limits);
+    Arc::new(TieredCache::new(ram, disk))
+}
+
 /// Test 6: the production shape ADR-0102 decision 1 ships -- one shared
 /// `plan_segment` (the `OnceCell` in `LogsScanExec::compute_plan_counts`),
 /// then N partitions each draining its own stripe of the same segment's
@@ -1011,6 +1023,80 @@ async fn concurrent_cold_partitions_collapse_onto_one_get_per_extent() {
         resident_bytes,
         bytes.len() as u64 * PARTITIONS as u64,
         "resident raw bytes above the threshold are one object-sized buffer per partition"
+    );
+}
+
+/// Test 7b (issue #662): the reachability proof for the tiered tier. The same
+/// property test 7 pins on a RAM-only cache -- N cold concurrent partitions
+/// striping one segment collapse onto exactly one GET per distinct extent --
+/// must hold when the fetcher's cache is a `ReadCache::Tiered` (RAM over a real
+/// disk `DiskCache`) instead. This is the disk-backed tier ADR-0046's
+/// single-flight (decision 5) has to span, and the funnel reaches it through
+/// `BlockRangeFetcher::fetch_run`'s `ReadCache::fetch_peeked` -- now
+/// `TieredCache::resolve_peeked_miss` -- exactly as the RAM branch reaches
+/// `Cache::get_or_fetch`.
+///
+/// The count asserted is identical to test 7's: one GET per distinct extent for
+/// any number of concurrent partitions. `SlowCountingStore`'s 50ms padding (per
+/// #618's flake history) keeps the count a function of the fetch protocol rather
+/// than of a microsecond race, exactly as in test 7.
+///
+/// Prove-the-test: this is the tiered-tier equivalent of test 7's proof. Revert
+/// `TieredCache::resolve_peeked_miss` to run `fetch().await` directly with no
+/// single-flight (the pre-#662 `ReadCache::fetch_peeked` Tiered arm), and the
+/// count becomes `N * expected` rather than `expected`, so this assertion fires.
+/// (Demonstrated failing by that revert during development.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_cold_partitions_collapse_onto_one_get_per_extent_tiered() {
+    let (records, bytes) = large_object();
+    let (ts_min, ts_max) = (2, 11);
+    let expected = expected_segment_gets(&bytes, ts_min, ts_max);
+    const PARTITIONS: usize = 8;
+
+    let mem = Arc::new(MemoryStore::new());
+    mem.put(
+        "logs/cold-tiered.rlog",
+        bytes.clone().into(),
+        PutOptions::default(),
+    )
+    .await
+    .expect("put");
+    let counting = Arc::new(SlowCountingStore::new(mem));
+    let store: Arc<dyn ObjectStoreBackend> = counting.clone();
+    let seg = seg_ref("logs/cold-tiered.rlog", bytes.len() as u64, &records);
+
+    let tmp = tempfile::TempDir::new().expect("temp dir for the disk cache tier");
+    let br = BlockRangeFetcher::new(store).with_cache(big_tiered_cache(tmp.path()));
+    let mut tasks = Vec::new();
+    for _ in 0..PARTITIONS {
+        let br = br.clone();
+        let seg = seg.clone();
+        tasks.push(tokio::spawn(async move {
+            br.fetch_object(&seg, TENANT, ts_min, ts_max, &QueryAccounting::new())
+                .await
+                .expect("concurrent tiered block-range fetch")
+        }));
+    }
+    for task in tasks {
+        let (assembled, stats) = task.await.expect("partition task");
+        assert!(
+            !stats.whole_object,
+            "the fixture must take the ranged path, not a crossover"
+        );
+        assert_eq!(
+            assembled.len() as u64,
+            bytes.len() as u64,
+            "every partition assembles its own object-sized buffer"
+        );
+    }
+
+    assert_eq!(
+        counting.get_count(),
+        expected,
+        "{PARTITIONS} concurrent cold fetches of one segment through a TIERED cache must issue \
+         exactly one GET per distinct extent ({expected}: probe + uncovered sections + coalesced \
+         runs); un-coalesced the same work is {}",
+        expected * PARTITIONS as u64
     );
 }
 
