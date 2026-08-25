@@ -62,7 +62,10 @@
 //! fetch. When its RAM tier is in [`Cache::with_corruption`] mode, a
 //! disk-served hit is corrupted by the identical transform a RAM hit uses, so
 //! ADR-0046 decision 4's acceptance gate reaches the disk tier the moment the
-//! funnels start using this handle.
+//! funnels start using this handle. A caller that cannot express its miss
+//! handling as one upstream-fetch closure instead has [`tiered::TieredCache::get`]
+//! and [`tiered::TieredCache::insert`]: the same read-through and dual-tier
+//! admission, with no fetch and no single-flight participation.
 
 mod cache;
 mod clock;
