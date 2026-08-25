@@ -181,7 +181,11 @@ fn element_channel(elem: &Json) -> &'static str {
 /// label set plus the channel it uses. The `\u{1f}` unit separator keeps the
 /// two parts from colliding (no label name or value contains it).
 fn series_identity(elem: &Json) -> String {
-    format!("{}\u{1f}{}", label_key(&elem["metric"]), element_channel(elem))
+    format!(
+        "{}\u{1f}{}",
+        label_key(&elem["metric"]),
+        element_channel(elem)
+    )
 }
 
 /// A vector element's native `histogram` field, if present and non-null.
@@ -277,8 +281,12 @@ fn histogram_json_equal(a: &Json, b: &Json, tolerance_ulps: Option<u32>) -> Resu
 /// Compares one `[<ts>, <histogram>]` sample pair: the timestamp exact, the
 /// histogram object by [`histogram_json_equal`].
 fn histogram_pair_equal(a: &Json, b: &Json, tolerance_ulps: Option<u32>) -> Result<bool, String> {
-    let a_arr = a.as_array().ok_or("histogram sample is not a 2-element array")?;
-    let b_arr = b.as_array().ok_or("histogram sample is not a 2-element array")?;
+    let a_arr = a
+        .as_array()
+        .ok_or("histogram sample is not a 2-element array")?;
+    let b_arr = b
+        .as_array()
+        .ok_or("histogram sample is not a 2-element array")?;
     if a_arr.len() != 2 || b_arr.len() != 2 {
         return Err(format!(
             "histogram sample has {} / {} elements, expected 2",
