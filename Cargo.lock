@@ -4525,6 +4525,7 @@ dependencies = [
  "ravel-promql",
  "ravel-proto",
  "ravel-query",
+ "ravel-rspan",
  "ravel-segment",
  "ravel-sql",
  "ravel-types",
