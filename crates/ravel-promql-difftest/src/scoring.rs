@@ -577,6 +577,19 @@ pub static REGISTRY: &[Construct] = &[
          matched histogram data, not the syntactic shape",
     ),
     rejected_modifier(
+        "instant matrix selector over native histograms",
+        "Unsupported: instant query returning a range vector of native \
+         histograms (422 execution)",
+        "a bare matrix selector is a valid instant query whose top-level \
+         result is a range vector; Ravel's instant `Value::Matrix` is \
+         float-only (the histogram-aware channel is the range endpoint's \
+         `RangeValue`, ADR-0108 decision 8), so a selector matching \
+         native-histogram data refuses in `eval_expr`'s `MatrixSelector` arm \
+         (issue #643) rather than silently dropping the histograms at HTTP \
+         200; distinct from the subquery-over-histograms refusal, which \
+         triggers inside `eval_subquery_matrix`",
+    ),
+    rejected_modifier(
         "binary operator over native histograms",
         "Unsupported: binary operator over native histograms (422 execution)",
         "the binop evaluator (`combine_value` and its callers) only ever \
@@ -799,6 +812,16 @@ pub static REJECTION_CASES: &[RejectionCase] = &[
         eval: RejectionEval::Instant,
         time_offset_ms: 0,
         message_contains: "binary operator over native histograms",
+    },
+    RejectionCase {
+        // +600s so the instant query's window matches the generated histogram
+        // series (its samples span the dataset's own range); a bare matrix
+        // selector matching histogram data is the #643 refusal.
+        construct: "instant matrix selector over native histograms",
+        query: "diff_native_hist[5m]",
+        eval: RejectionEval::Instant,
+        time_offset_ms: 600_000,
+        message_contains: "range vector of native histograms",
     },
 ];
 

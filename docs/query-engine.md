@@ -1075,15 +1075,15 @@ conformance_table`; regenerate that same command with
 `RAVEL_UPDATE_CONFORMANCE_TABLE=1`. Do not edit the block between
 the markers by hand.
 
-Surface: 132 constructs over 236 corpus entries in 10 corpus files.
+Surface: 133 constructs over 238 corpus entries in 10 corpus files.
 
 | State | Constructs |
 | --- | --- |
 | supported | 124 |
-| intentionally rejected | 6 |
+| intentionally rejected | 7 |
 | accepted divergence | 2 |
 | unclassified | 0 |
-| **score** (supported + intentionally rejected + accepted divergence / total) | **132/132 = 100%** |
+| **score** (supported + intentionally rejected + accepted divergence / total) | **133/133 = 100%** |
 
 | Construct | Category | State | Evidence |
 | --- | --- | --- | --- |
@@ -1106,6 +1106,7 @@ Surface: 132 constructs over 236 corpus entries in 10 corpus files.
 | `group_left` | modifier | supported | `corpus/binop.txt`, 2 entries |
 | `group_right` | modifier | supported | `corpus/binop.txt`, 1 entry |
 | `ignoring` | modifier | supported | `corpus/binop.txt`, 1 entry |
+| instant matrix selector over native histograms | modifier | intentionally rejected | `Unsupported: instant query returning a range vector of native histograms (422 execution)`; rejection verified; a bare matrix selector is a valid instant query whose top-level result is a range vector; Ravel's instant `Value::Matrix` is float-only (the histogram-aware channel is the range endpoint's `RangeValue`, ADR-0108 decision 8), so a selector matching native-histogram data refuses in `eval_expr`'s `MatrixSelector` arm (issue #643) rather than silently dropping the histograms at HTTP 200; distinct from the subquery-over-histograms refusal, which triggers inside `eval_subquery_matrix` |
 | label matcher != | modifier | supported | `corpus/selectors.txt`, 1 entry |
 | label matcher !~ | modifier | supported | `corpus/selectors.txt`, 1 entry |
 | label matcher = | modifier | supported | `corpus/selectors.txt`, 8 entries |
