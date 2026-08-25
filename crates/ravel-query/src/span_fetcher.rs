@@ -269,6 +269,13 @@ impl SpanSegmentFetcher {
         Ok(Some(output))
     }
 
+    // The columnar exit (ADR-0110 decision 2) is a sibling of the row scan
+    // below: it yields decoded blocks plus surviving row indices per block
+    // instead of materialized `SpanRow`s, so the SQL spans scan (T3) can consume
+    // decoded columns and skip pages outside its projection. It shares this same
+    // candidate-selection, bloom-probe and ts/trace_id primitive so both exits
+    // agree on which rows survive.
+
     /// Bloom-backed block scan over one whole-object's bytes. Kept a pure,
     /// store-free function so the block-level logic is unit-testable without an
     /// object store.
