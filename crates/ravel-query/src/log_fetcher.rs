@@ -194,6 +194,26 @@ impl LogQuery {
         self.erasure = predicates;
         self
     }
+
+    /// Whether this query carries no block-level predicate that could exclude a
+    /// block: no content filter, no prune-only arm, no stream-attribute
+    /// equality, and no pending erasure. The always-present ts range is not
+    /// consulted here; ts pruning is a separate span check the caller applies
+    /// (see [`LogSegmentFetcher::plan_segment`]).
+    ///
+    /// For such a query every block in a ts-contained segment survives pruning,
+    /// so the survivor count is the segment's total block count with no fetch or
+    /// decode work. Erasure is folded in and read fail-closed on purpose: it
+    /// filters rows, not blocks, so it never changes the survivor count, but
+    /// treating a query with pending erasure as predicate-free would let the
+    /// fast path fire in a state the plan phase should stay conservative about.
+    #[must_use]
+    pub fn is_block_predicate_free(&self) -> bool {
+        self.content.is_empty()
+            && self.prune.is_empty()
+            && self.stream_attrs.is_empty()
+            && self.erasure.is_empty()
+    }
 }
 
 /// The records matching one fetch, plus the reader's own scan pruning counters.
@@ -836,6 +856,27 @@ impl LogSegmentFetcher {
         query: &LogQuery,
         accounting: &QueryAccounting,
     ) -> Result<Option<(usize, ScanStats)>, LogFetchError> {
+        // Fast path (#693): a query with no block-level predicate whose ts
+        // window fully CONTAINS the segment's span prunes nothing -- every block
+        // survives -- so the survivor count is the footer's `block_count` and no
+        // block-range fetch or decode is needed. Only the ADR-0107 suffix probe
+        // runs, to read the footer. Containment is strictly stronger than
+        // `ts_range_relevant`'s overlap (a partially-overlapping window still
+        // needs real ts pruning), and it implies relevance, so the fast path
+        // never has to return the irrelevant-`None`. A zero object size cannot
+        // be range-probed (every extent, starting with the probe's cache key,
+        // is derived from it), so it falls through to the whole-object slow path.
+        if seg_ref.object_size > 0
+            && query.is_block_predicate_free()
+            && query.ts_min_ns <= seg_ref.min_event_ts_ns
+            && seg_ref.max_event_ts_ns <= query.ts_max_ns
+        {
+            return Ok(Some(
+                self.plan_segment_fast(seg_ref, tenant_hash, accounting)
+                    .await?,
+            ));
+        }
+
         let Some(bytes) = self
             .tenant_bytes(seg_ref, tenant_hash, query, accounting)
             .await?
@@ -846,6 +887,67 @@ impl LogSegmentFetcher {
         let span = decode_span();
         let scan = span.in_scope(|| self.open_scan(key, &bytes, query, &ColumnSelection::all()))?;
         Ok(Some((scan.remaining_blocks(), scan.stats())))
+    }
+
+    /// The predicate-free plan fast path (#693): read only the footer via the
+    /// ADR-0107 suffix probe and derive the whole-segment plan counts from
+    /// `footer.block_count` without fetching or decoding any block.
+    ///
+    /// For a genuinely predicate-free, ts-contained query these are exactly the
+    /// counts real pruning would compute: every block survives every stage, so
+    /// `blocks_total`/`blocks_after_skip`/`blocks_after_postings`/
+    /// `blocks_after_bloom` all equal the block count, nothing is scanned or
+    /// decoded, and neither pruning stage degrades. `footer.block_count` equals
+    /// the read-time `ScanStats.blocks_total` (`skip.l0.len()`) on every
+    /// well-formed object: both are stamped from the writer's one-entry-per-block
+    /// `block_spans` counter (see the `footer_block_count_matches_unpruned_\
+    /// blocks_total` round-trip proof in `ravel-logseg`).
+    async fn plan_segment_fast(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        accounting: &QueryAccounting,
+    ) -> Result<(usize, ScanStats), LogFetchError> {
+        // The `page_fetch` phase span the slow path also carries, so the trace
+        // shows the probe this path issues. `s3_bytes` reports block bytes only
+        // (zero here, matching the slow path's block-range branch convention);
+        // the probe's directory-overhead bytes are recorded in `accounting`.
+        let fetch_span = tracing::debug_span!(
+            "page_fetch",
+            signal = "logs",
+            s3_requests = tracing::field::Empty,
+            s3_bytes = tracing::field::Empty,
+        );
+        let (footer, stats) = async {
+            self.block_range
+                .fetch_footer(seg_ref, tenant_hash, accounting)
+                .await
+        }
+        .instrument(fetch_span.clone())
+        .await?;
+        let requests = stats.probe_gets + stats.metadata_gets + stats.block_range_gets;
+        fetch_span.record("s3_requests", requests);
+        fetch_span.record("s3_bytes", stats.block_bytes_fetched);
+
+        let n = usize::try_from(footer.block_count).map_err(|_| LogFetchError::Corrupt {
+            key: seg_ref.data_object_key.clone(),
+            source: LogSegError::Corrupted("footer block_count out of range".into()),
+        })?;
+        let blocks = footer.block_count as u32;
+        let plan_stats = ScanStats {
+            blocks_total: blocks,
+            blocks_after_skip: blocks,
+            blocks_after_postings: blocks,
+            blocks_after_bloom: blocks,
+            blocks_scanned: 0,
+            pages_decoded: 0,
+            pages_skipped: 0,
+            page_bytes_fetched: 0,
+            page_bytes_decoded: 0,
+            bloom_degraded: false,
+            postings_degraded: false,
+        };
+        Ok((n, plan_stats))
     }
 
     /// [`scan_accounted_with_tenant`](Self::scan_accounted_with_tenant),
@@ -1550,6 +1652,83 @@ impl BlockRangeFetcher {
                 Ok((bytes, true))
             }
         }
+    }
+
+    /// Fetch and parse just the [`LogFooter`](footer::LogFooter) via the
+    /// ADR-0107 etag-establishing suffix probe (plus one footer-range chase if
+    /// the suffix did not cover the whole footer), reading no block-range or
+    /// directory-section bytes. Returns the footer and the probe-only
+    /// [`BlockRangeStats`] (`probe_gets` set; the block counters stay zero).
+    ///
+    /// This is the read the predicate-free plan fast path
+    /// ([`LogSegmentFetcher::plan_segment`], #693) needs: the survivor count for
+    /// such a query is `footer.block_count`, so none of the object's blocks have
+    /// to move. The GET is cache-routed exactly like [`Self::fetch_object`]'s
+    /// probe, so a later block-range fetch of the same segment rides the same
+    /// pinned etag and cached probe extent rather than re-fetching it.
+    ///
+    /// The caller guarantees `seg_ref.object_size > 0`: every extent here, the
+    /// probe's cache key first, is derived from that size, so a zero size has no
+    /// range to probe (`fetch_object` reads such an object whole instead).
+    pub async fn fetch_footer(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        accounting: &QueryAccounting,
+    ) -> Result<(footer::LogFooter, BlockRangeStats), LogFetchError> {
+        let key = seg_ref.data_object_key.as_str();
+        let mut stats = BlockRangeStats::default();
+        let pin = EtagPin::default();
+        let total_size = seg_ref.object_size;
+
+        let suffix = self.suffix_len.min(total_size);
+        let probe_start = total_size - suffix;
+        let (probe_bytes, probe_live) = self
+            .cached_extent(
+                seg_ref,
+                tenant_hash,
+                probe_start,
+                suffix,
+                GetRange::Suffix(suffix),
+                &pin,
+                accounting,
+            )
+            .await?;
+        if probe_live {
+            stats.probe_gets = 1;
+        }
+
+        let footer = match open_from_suffix(&probe_bytes, total_size)
+            .map_err(|source| corrupt(key, source))?
+        {
+            SuffixOutcome::Ready(footer) => footer,
+            SuffixOutcome::NeedRange { offset, len } => {
+                let (bytes, live) = self
+                    .cached_extent(
+                        seg_ref,
+                        tenant_hash,
+                        offset,
+                        len,
+                        GetRange::Range(offset, offset + len),
+                        &pin,
+                        accounting,
+                    )
+                    .await?;
+                if live {
+                    stats.probe_gets += 1;
+                }
+                match open_from_suffix(&bytes, total_size).map_err(|source| corrupt(key, source))? {
+                    SuffixOutcome::Ready(footer) => footer,
+                    SuffixOutcome::NeedRange { .. } => {
+                        return Err(corrupt(
+                            key,
+                            LogSegError::Corrupted("footer not covered".into()),
+                        ));
+                    }
+                }
+            }
+        };
+        Ok((footer, stats))
     }
 
     /// Fetch one segment's object as an assembled, decode-ready buffer, reading
@@ -2351,5 +2530,285 @@ fn corrupt(key: &str, source: LogSegError) -> LogFetchError {
     LogFetchError::Corrupt {
         key: key.to_string(),
         source,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod plan_fast_path_tests {
+    //! Tests for the predicate-free plan fast path (#693 part 2): a query with
+    //! no block-level predicate whose ts window fully contains the segment span
+    //! is planned from `LogFooter.block_count` via the ADR-0107 suffix probe
+    //! alone, with no block-range fetch or decode.
+
+    use super::*;
+    use ravel_catalog::SegmentLevel;
+    use ravel_logseg::writer::ObjectIdentity;
+    use ravel_logseg::{FieldSel, RlogWriter, stream_attrs_bytes};
+    use ravel_object_store::PutOptions;
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_types::logstream::log_stream_id;
+    use uuid::Uuid;
+
+    const TENANT: TenantHash = TenantHash([7u8; 16]);
+    const CONTENT_HASH: [u8; 32] = [9u8; 32];
+    const KEY: &str = "t/seg.rlog";
+
+    fn identity() -> ObjectIdentity {
+        ObjectIdentity {
+            tenant_hash: [7u8; 16],
+            shard: 0,
+            writer_id: [2u8; 16],
+            writer_epoch: 1,
+            writer_seq: 1,
+        }
+    }
+
+    fn record(ts: i64) -> LogRecord {
+        let resource = vec![("service.name".to_string(), AttrValue::Str("svc".into()))];
+        LogRecord {
+            stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+            stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+            ts_ns: ts,
+            observed_ts_ns: ts,
+            severity_num: 9,
+            severity_text: "INFO".into(),
+            body: "hello world".into(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: vec![("request.id".to_string(), AttrValue::Str(format!("r{ts}")))],
+        }
+    }
+
+    /// One block per record, so `n` records span `n` blocks.
+    fn build_object(records: &[LogRecord]) -> Vec<u8> {
+        let cfg = RlogConfig {
+            block_target_records: 1,
+            ..RlogConfig::default()
+        };
+        let mut w = RlogWriter::new(cfg, identity());
+        for r in records {
+            w.push(r.clone()).expect("push");
+        }
+        w.finish().expect("finish")
+    }
+
+    fn seg_ref(size: u64, records: &[LogRecord]) -> SegmentRef {
+        let min = records.iter().map(|r| r.ts_ns).min().expect("nonempty");
+        let max = records.iter().map(|r| r.ts_ns).max().expect("nonempty");
+        SegmentRef {
+            data_object_key: KEY.to_string(),
+            object_size: size,
+            min_event_ts_ns: min,
+            max_event_ts_ns: max,
+            ingest_hour_bucket: 0,
+            sample_count: records.len() as u64,
+            series_count: 0,
+            shard: 0,
+            content_hash: CONTENT_HASH,
+            writer_id: Uuid::from_u128(1),
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+        }
+    }
+
+    /// Bytes after the BLOCKS section: SKIP_IDX/BLOOM/POSTINGS then footer and
+    /// trailer. A probe suffix of exactly this length covers the whole tail
+    /// (footer parses with no range chase) yet reaches no block byte.
+    fn tail_len(bytes: &[u8]) -> u64 {
+        let f = footer::open(bytes).expect("footer");
+        let b = f.section(kind::BLOCKS).expect("BLOCKS");
+        bytes.len() as u64 - (b.offset + b.len)
+    }
+
+    async fn store_with_object(bytes: Vec<u8>) -> Arc<MemoryStore> {
+        let store = Arc::new(MemoryStore::new());
+        store
+            .put(KEY, Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("put");
+        store
+    }
+
+    /// Fetcher whose suffix probe reads exactly the object tail, so the fast
+    /// path's footer read is measurable and the slow path (routed through the
+    /// block-range fetcher by `block_range_threshold = 0`) reads block bytes on
+    /// top of it.
+    fn fetcher(store: Arc<MemoryStore>, tail: u64) -> LogSegmentFetcher {
+        LogSegmentFetcher::new(store.clone())
+            .with_block_range_threshold(0)
+            .with_block_range(
+                BlockRangeFetcher::new(store)
+                    .with_suffix_len(tail)
+                    .with_whole_object_threshold(0),
+            )
+    }
+
+    /// (Test b) The fast path fires for a predicate-free, fully-contained query:
+    /// the returned count is the block count, the stats show nothing scanned,
+    /// and only the tail probe crossed the wire -- never a block-range fetch
+    /// sized to the object.
+    ///
+    /// Non-vacuity: deleting the fast-path branch in `plan_segment` (the
+    /// `if seg_ref.object_size > 0 && query.is_block_predicate_free() ...`
+    /// block that `return`s `plan_segment_fast(...)`) routes this same query
+    /// through the block-range slow path, whose all-block candidate set trips
+    /// the coverage crossover into a whole-object GET, so `total_s3_bytes` jumps
+    /// from `tail` to roughly `tail + object_size`. The `read == tail` assertion
+    /// then fails. The `predicate_present_cases_take_the_slow_path` test below
+    /// exercises exactly that slow path and shows the larger byte count directly.
+    #[tokio::test]
+    async fn fast_path_reads_only_footer_probe() {
+        const N: usize = 6;
+        let records: Vec<LogRecord> = (0..N as i64).map(record).collect();
+        let bytes = build_object(&records);
+        let total = bytes.len() as u64;
+        let tail = tail_len(&bytes);
+        assert!(
+            tail < total,
+            "the object must carry a nonempty BLOCKS section"
+        );
+
+        let seg = seg_ref(total, &records);
+        let store = store_with_object(bytes).await;
+        let f = fetcher(store, tail);
+        let acc = QueryAccounting::new();
+
+        // Predicate-free, ts window strictly contains [min, max].
+        let query = LogQuery::new(i64::MIN, i64::MAX);
+        let (count, stats) = f
+            .plan_segment(&seg, TENANT, &query, &acc)
+            .await
+            .expect("plan_segment")
+            .expect("relevant segment");
+
+        assert_eq!(count, N, "survivor count is the segment block count");
+        assert_eq!(stats.blocks_total, N as u32);
+        assert_eq!(stats.blocks_after_skip, N as u32);
+        assert_eq!(stats.blocks_after_postings, N as u32);
+        assert_eq!(stats.blocks_after_bloom, N as u32);
+        assert_eq!(stats.blocks_scanned, 0);
+        assert_eq!(stats.pages_decoded, 0);
+        assert!(!stats.bloom_degraded && !stats.postings_degraded);
+
+        let read = acc.snapshot().total_s3_bytes();
+        assert_eq!(
+            read, tail,
+            "fast path reads only the footer probe ({tail} B), not the {total} B object"
+        );
+    }
+
+    /// (Test b, boundary) Containment is inclusive: a ts window whose bounds
+    /// equal the segment span exactly still takes the fast path.
+    #[tokio::test]
+    async fn fast_path_fires_on_inclusive_boundary() {
+        const N: usize = 4;
+        let records: Vec<LogRecord> = (0..N as i64).map(record).collect();
+        let bytes = build_object(&records);
+        let total = bytes.len() as u64;
+        let tail = tail_len(&bytes);
+        let seg = seg_ref(total, &records);
+        let store = store_with_object(bytes).await;
+        let f = fetcher(store, tail);
+        let acc = QueryAccounting::new();
+
+        // Exact span bounds: ts_min == min_event_ts_ns, ts_max == max_event_ts_ns.
+        let query = LogQuery::new(seg.min_event_ts_ns, seg.max_event_ts_ns);
+        let (count, _stats) = f
+            .plan_segment(&seg, TENANT, &query, &acc)
+            .await
+            .expect("plan_segment")
+            .expect("relevant segment");
+        assert_eq!(count, N);
+        assert_eq!(acc.snapshot().total_s3_bytes(), tail, "fast path fired");
+    }
+
+    /// (Test c) Every case that is NOT predicate-free-and-contained goes through
+    /// the real block-range fetch and returns the same survivor count today's
+    /// code produces. Each asserts more than the tail was read (the block-range
+    /// path ran) and the expected survivor count.
+    #[tokio::test]
+    async fn predicate_present_cases_take_the_slow_path() {
+        const N: usize = 6;
+        let records: Vec<LogRecord> = (0..N as i64).map(record).collect();
+        let bytes = build_object(&records);
+        let total = bytes.len() as u64;
+        let tail = tail_len(&bytes);
+        let seg = seg_ref(total, &records);
+        let store = store_with_object(bytes).await;
+        let f = fetcher(store, tail);
+
+        // (i) A content predicate present. "hello" is in every block's body, so
+        // no block is pruned: same survivor count (N) as the fast path, but via
+        // the real fetch.
+        let q = LogQuery::new(i64::MIN, i64::MAX).with_content(Predicate::HasWord {
+            field: FieldSel::Body,
+            word: "hello".into(),
+        });
+        let acc = QueryAccounting::new();
+        let (count, _) = f
+            .plan_segment(&seg, TENANT, &q, &acc)
+            .await
+            .expect("plan")
+            .expect("relevant");
+        assert_eq!(count, N, "content: no block pruned");
+        assert!(
+            acc.snapshot().total_s3_bytes() > tail,
+            "content: block-range fetch ran"
+        );
+
+        // (ii) A stream-attribute filter present. All records share one stream,
+        // so all blocks survive: count N, via the real fetch.
+        let q = LogQuery::new(i64::MIN, i64::MAX).with_stream_attr(StreamAttrEquals::new(
+            "service.name",
+            AttrValue::Str("svc".into()),
+        ));
+        let acc = QueryAccounting::new();
+        let (count, _) = f
+            .plan_segment(&seg, TENANT, &q, &acc)
+            .await
+            .expect("plan")
+            .expect("relevant");
+        assert_eq!(count, N, "stream_attr: single stream, all blocks survive");
+        assert!(
+            acc.snapshot().total_s3_bytes() > tail,
+            "stream_attr: block-range fetch ran"
+        );
+
+        // (iii) A non-empty erasure list. Erasure filters rows, not blocks, so
+        // the survivor count is unchanged (N), but the fast path must decline.
+        let q = LogQuery::new(i64::MIN, i64::MAX).with_erasure(vec![ErasurePredicate::windowless(
+            vec![("request.id".into(), "r0".into())],
+        )]);
+        let acc = QueryAccounting::new();
+        let (count, _) = f
+            .plan_segment(&seg, TENANT, &q, &acc)
+            .await
+            .expect("plan")
+            .expect("relevant");
+        assert_eq!(count, N, "erasure: block count unchanged");
+        assert!(
+            acc.snapshot().total_s3_bytes() > tail,
+            "erasure: block-range fetch ran"
+        );
+
+        // (iv) A ts window that overlaps but does not fully contain the span:
+        // [2, +inf) drops blocks 0 and 1, so real block-level ts pruning must
+        // run and the survivor count is N-2, not N.
+        let q = LogQuery::new(2, i64::MAX);
+        let acc = QueryAccounting::new();
+        let (count, _) = f
+            .plan_segment(&seg, TENANT, &q, &acc)
+            .await
+            .expect("plan")
+            .expect("relevant");
+        assert_eq!(count, N - 2, "partial overlap: ts pruning ran");
+        assert!(
+            acc.snapshot().total_s3_bytes() > tail,
+            "partial overlap: block-range fetch ran"
+        );
     }
 }
