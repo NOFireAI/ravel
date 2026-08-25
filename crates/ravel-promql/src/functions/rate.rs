@@ -606,4 +606,84 @@ mod tests {
         let got = delta(&samples, window(0, 60_000, 60_000)).expect("2+ samples");
         assert_eq!(got, f64::INFINITY);
     }
+
+    /// A scale-0 counter native histogram carrying `count`/`sum` in one
+    /// positive bucket, for the range/instant parity test below.
+    fn nh_counter(count: f64, sum: f64) -> FloatHistogram {
+        use crate::histogram::{ResetHint, Span};
+        FloatHistogram {
+            counter_reset_hint: ResetHint::Unknown,
+            scale: 0,
+            zero_threshold: 0.0,
+            zero_count: 0.0,
+            count,
+            sum,
+            positive_spans: vec![Span {
+                offset: 1,
+                length: 1,
+            }],
+            negative_spans: Vec::new(),
+            positive_buckets: vec![count],
+            negative_buckets: Vec::new(),
+            custom_values: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn range_rate_over_native_histogram_matches_the_instant_arm() {
+        use crate::eval::{RangeValue, Value};
+        use crate::testsource::TestSource;
+
+        // A native-histogram counter with two increasing samples in the
+        // window. The instant arm already reduces it through
+        // `histogram_extrapolated_rate`; the range arm must dispatch to the
+        // same reducer over the same window and produce the bit-identical
+        // histogram element. Before item 1, the range arm ignored `hist: _`
+        // and the histogram series vanished, so the range matrix was empty:
+        // the flipped assertion is the `range_hist == instant_hist` equality
+        // (pre-fix the range side had no histogram element at all).
+        // Samples land inside the left-open window `(0, 120s]`: the 2m window
+        // at t=120s excludes an edge sample at exactly t=0.
+        let source = TestSource::new()
+            .with_histogram_series(
+                &[("__name__", "h")],
+                &[
+                    (ms(60_000), nh_counter(2.0, 10.0)),
+                    (ms(120_000), nh_counter(6.0, 30.0)),
+                ],
+            )
+            .expect("valid histogram series");
+        let evaluator = crate::eval::Evaluator::new();
+
+        let instant = evaluator
+            .eval_instant(&source, "rate(h[2m])", 120_000)
+            .expect("instant evaluates");
+        let Value::Vector(instant) = instant else {
+            panic!("rate is a vector");
+        };
+        assert_eq!(instant.len(), 1, "one histogram series");
+        let instant_hist = instant[0]
+            .histogram
+            .as_ref()
+            .expect("instant rate over a histogram yields a histogram element");
+
+        let (range, _annos) = evaluator
+            .eval_range_hist_annotated(&source, "rate(h[2m])", 120_000, 120_000, 60_000)
+            .expect("range evaluates");
+        let RangeValue::Matrix(matrix) = range else {
+            panic!("range rate is a matrix");
+        };
+        assert_eq!(matrix.len(), 1, "one histogram series");
+        let samples = &matrix[0].1;
+        assert_eq!(samples.len(), 1, "one grid step at t=120s");
+        let range_hist = samples[0]
+            .histogram
+            .as_ref()
+            .expect("range rate over a histogram yields a histogram element, not an empty series");
+
+        assert_eq!(
+            range_hist, instant_hist,
+            "the range arm must reduce through the same histogram reducer as the instant arm"
+        );
+    }
 }

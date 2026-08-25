@@ -20,9 +20,64 @@
 use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample};
 
 use crate::eval::{Error, Evaluator, InstantSample, InstantVector, QueryWindow, RangeMatrix};
+use crate::histogram::{FloatHistogram, TimedHistogram, avg_histograms, sum_histograms};
 use crate::source::SeriesSource;
 
 use super::{FunctionDef, FunctionKind, MatrixArg, RangeWindow};
+
+/// The outcome of reducing one `_over_time` window that holds native
+/// histograms rather than floats. In Ravel's storage model a series is
+/// purely float or purely histogram, so this is reached only for a
+/// histogram-only window and never mixes with the float reducers above.
+pub(crate) enum HistOverTime {
+    /// A float result (`count_over_time`'s sample count, `present_over_time`'s
+    /// constant 1).
+    Float(f64),
+    /// A native-histogram result (`sum`/`avg`/`last_over_time`).
+    Histogram(FloatHistogram),
+    /// This member has no defined native-histogram semantics in the pinned
+    /// Prometheus v3.13.1 binary, so the histogram window produces no output.
+    /// Matching the oracle exactly: for a histogram-only window every
+    /// float-only `_over_time` member takes Prometheus'
+    /// `if len(samples.Floats) == 0 { return }` early exit, which yields no
+    /// element and, because that return precedes the histogram-ignored
+    /// annotation, no annotation either.
+    Drop,
+}
+
+/// Reduce a native-histogram `_over_time` window per the pinned Prometheus
+/// v3.13.1 behavior for each member (ADR-0108 decision 5). `hists` is the
+/// window's histogram samples in ascending timestamp order and is never
+/// empty. Shared by the range dispatch (`eval_range_call`) and the instant
+/// dispatch (`eval_call`) so both endpoints answer identically.
+///
+/// - `sum_over_time`/`avg_over_time` fold the window with the same
+///   [`sum_histograms`]/[`avg_histograms`] helpers the `sum`/`avg`
+///   aggregations use.
+/// - `count_over_time` counts histogram samples exactly as it counts floats
+///   (Prometheus' `len(s.Floats) + len(s.Histograms)`).
+/// - `last_over_time` returns the newest histogram in the window.
+/// - `present_over_time` is 1 for any non-empty window regardless of type.
+/// - every other member (`min`/`max`/`stddev`/`stdvar`/`quantile_over_time`,
+///   `predict_linear`, `deriv`, `irate`/`idelta`/`resets`/`changes`) is
+///   float-only in Prometheus and drops the histogram window with no
+///   annotation, per [`HistOverTime::Drop`].
+pub(crate) fn histogram_over_time(name: &str, hists: &[TimedHistogram]) -> HistOverTime {
+    match name {
+        "sum_over_time" => match sum_histograms(hists.iter().map(|(_, h)| h)) {
+            Some(h) => HistOverTime::Histogram(h),
+            None => HistOverTime::Drop,
+        },
+        "avg_over_time" => match avg_histograms(hists.iter().map(|(_, h)| h)) {
+            Some(h) => HistOverTime::Histogram(h),
+            None => HistOverTime::Drop,
+        },
+        "count_over_time" => HistOverTime::Float(hists.len() as f64),
+        "last_over_time" => HistOverTime::Histogram(hists[hists.len() - 1].1.clone()),
+        "present_over_time" => HistOverTime::Float(1.0),
+        _ => HistOverTime::Drop,
+    }
+}
 
 pub(crate) const FUNCTIONS: &[FunctionDef] = &[
     FunctionDef {
@@ -234,25 +289,60 @@ pub(crate) fn kahan_sum_inc(inc: f64, sum: f64, c: f64) -> (f64, f64) {
 }
 
 /// `absent_over_time` at one instant: unlike every other function in this
-/// family, it is not a per-series reduction of `matrix`'s rows. It reports
-/// whether the whole range vector argument matched nothing at all, and if
-/// so synthesizes exactly one output series from `labels`
+/// family, it is not a per-series reduction of the argument's rows. It reports
+/// whether the whole range vector argument matched nothing at all, and if so
+/// synthesizes exactly one output series from the selector's matchers
 /// ([`matrix_arg_absent_labels`]).
+///
+/// Presence counts native-histogram samples as well as floats (ADR-0108
+/// decision 7): a histogram-only stream is live, so `absent_over_time` over it
+/// must return empty, not affirmatively 1. Reading only the float fetch was
+/// the false-positive liveness alert (issue #578) this fixes.
 pub(crate) fn absent_over_time_instant(
-    labels: LabelSet,
-    matrix: RangeMatrix,
+    evaluator: &Evaluator,
+    source: &dyn SeriesSource,
+    arg: MatrixArg,
     eval_ts_ns: i64,
-) -> InstantVector {
-    if !matrix.is_empty() {
-        return Vec::new();
+    ctx: &QueryWindow,
+) -> Result<InstantVector, Error> {
+    if matrix_arg_has_samples(evaluator, source, arg, eval_ts_ns, ctx)? {
+        return Ok(Vec::new());
     }
-    vec![InstantSample {
-        labels,
+    Ok(vec![InstantSample {
+        labels: matrix_arg_absent_labels(arg),
         ts_ns: eval_ts_ns,
         orig_sample_ts_ns: eval_ts_ns,
         value: 1.0,
         histogram: None,
-    }]
+    }])
+}
+
+/// Whether a matrix-typed argument matches any sample at `eval_ts_ns`, float
+/// or native histogram. A subquery yields only floats (`eval_subquery_matrix`
+/// rejects histograms upstream), so its histogram channel is skipped.
+fn matrix_arg_has_samples(
+    evaluator: &Evaluator,
+    source: &dyn SeriesSource,
+    arg: MatrixArg,
+    eval_ts_ns: i64,
+    ctx: &QueryWindow,
+) -> Result<bool, Error> {
+    match arg {
+        MatrixArg::Selector(ms) => {
+            if !evaluator
+                .eval_matrix_selector(source, ms, eval_ts_ns, ctx)?
+                .is_empty()
+            {
+                return Ok(true);
+            }
+            Ok(!evaluator
+                .eval_histogram_matrix_selector(source, ms, eval_ts_ns, ctx, false)?
+                .is_empty())
+        }
+        MatrixArg::Subquery(sq) => Ok(!evaluator
+            .eval_subquery_matrix(source, sq, eval_ts_ns, ctx)?
+            .is_empty()),
+    }
 }
 
 /// `absent_over_time` over a range query's grid: absence is evaluated
@@ -278,11 +368,10 @@ pub(crate) fn absent_over_time_range(
     let mut out_samples = Vec::new();
     let mut t = start_ns;
     while t <= end_ns {
-        let matrix = match arg {
-            MatrixArg::Selector(ms) => evaluator.eval_matrix_selector(source, ms, t, ctx)?,
-            MatrixArg::Subquery(sq) => evaluator.eval_subquery_matrix(source, sq, t, ctx)?,
-        };
-        if matrix.is_empty() {
+        // Absence at this step means the window held neither a float nor a
+        // native-histogram sample (ADR-0108 decision 7): a histogram-only
+        // stream is present, so the step must not report 1.
+        if !matrix_arg_has_samples(evaluator, source, arg, t, ctx)? {
             out_samples.push(Sample {
                 ts_ns: t,
                 value: 1.0,
@@ -663,5 +752,220 @@ mod tests {
             promql_parser::parser::Expr::Subquery(sq) => sq,
             other => panic!("expected a subquery, got {other:?}"),
         }
+    }
+
+    /// A scale-0 native histogram carrying `count`/`sum` in one positive
+    /// bucket, for the native-histogram `_over_time` tests below.
+    fn nh(count: f64, sum: f64) -> FloatHistogram {
+        use crate::histogram::{ResetHint, Span};
+        FloatHistogram {
+            counter_reset_hint: ResetHint::Unknown,
+            scale: 0,
+            zero_threshold: 0.0,
+            zero_count: 0.0,
+            count,
+            sum,
+            positive_spans: vec![Span {
+                offset: 1,
+                length: 1,
+            }],
+            negative_spans: Vec::new(),
+            positive_buckets: vec![count],
+            negative_buckets: Vec::new(),
+            custom_values: Vec::new(),
+        }
+    }
+
+    /// Three native-histogram samples of `h` at 0/60s/120s, the shared fixture
+    /// for the range/instant `_over_time` histogram tests. Populations are
+    /// distinct so a wrong reduction (summing the wrong members, or reading a
+    /// `0.0` placeholder) yields a different, detectable value.
+    fn histogram_source() -> crate::testsource::TestSource {
+        crate::testsource::TestSource::new()
+            .with_histogram_series(
+                &[("__name__", "h")],
+                &[
+                    (ms(0), nh(2.0, 10.0)),
+                    (ms(60_000), nh(3.0, 15.0)),
+                    (ms(120_000), nh(5.0, 25.0)),
+                ],
+            )
+            .expect("valid histogram series")
+    }
+
+    #[test]
+    fn sum_over_time_produces_native_histogram_elements() {
+        use crate::eval::{Evaluator, RangeValue};
+
+        // `sum_over_time(h[5m])` over a histogram-only window folds the three
+        // window histograms with `sum_histograms` into one histogram element
+        // (count 2+3+5=10, sum 10+15+25=50). Before item 2 the range arm
+        // fetched floats only and the histogram series vanished, leaving an
+        // empty matrix: the flipped assertion is `s.histogram` being `Some`
+        // with count 10 (pre-fix the matrix was empty).
+        let source = histogram_source();
+        let (value, _annos) = Evaluator::new()
+            .eval_range_hist_annotated(&source, "sum_over_time(h[5m])", 120_000, 120_000, 60_000)
+            .expect("range evaluates");
+        let RangeValue::Matrix(matrix) = value else {
+            panic!("sum_over_time is a matrix");
+        };
+        assert_eq!(matrix.len(), 1, "one histogram series");
+        let samples = &matrix[0].1;
+        assert_eq!(samples.len(), 1, "one grid step at t=120s");
+        let h = samples[0]
+            .histogram
+            .as_ref()
+            .expect("sum_over_time over histograms yields a histogram element");
+        assert_eq!(h.count.to_bits(), 10.0_f64.to_bits(), "2 + 3 + 5");
+        assert_eq!(h.sum.to_bits(), 50.0_f64.to_bits(), "10 + 15 + 25");
+    }
+
+    #[test]
+    fn count_over_time_counts_native_histogram_samples() {
+        use crate::eval::{Evaluator, RangeValue};
+
+        // `count_over_time(h[5m])` counts histogram samples exactly as it
+        // counts floats (Prometheus' `len(Floats) + len(Histograms)`): three
+        // samples in the window is a float `3`, never a histogram element.
+        // Before item 2 the histogram series vanished and the matrix was
+        // empty; the flipped assertion is the float value `3` with
+        // `histogram: None`.
+        let source = histogram_source();
+        let (value, _annos) = Evaluator::new()
+            .eval_range_hist_annotated(&source, "count_over_time(h[5m])", 120_000, 120_000, 60_000)
+            .expect("range evaluates");
+        let RangeValue::Matrix(matrix) = value else {
+            panic!("count_over_time is a matrix");
+        };
+        assert_eq!(matrix.len(), 1, "one series");
+        let samples = &matrix[0].1;
+        assert_eq!(samples.len(), 1, "one grid step");
+        assert!(
+            samples[0].histogram.is_none(),
+            "count_over_time is a float element, never a histogram"
+        );
+        assert_eq!(
+            samples[0].value.to_bits(),
+            3.0_f64.to_bits(),
+            "three histogram samples in the window"
+        );
+    }
+
+    #[test]
+    fn last_over_time_returns_the_native_histogram_element() {
+        use crate::eval::{Evaluator, RangeValue};
+
+        // `last_over_time(h[5m])` returns the newest histogram in the window
+        // verbatim (the 120s sample, count 5 sum 25), keeping every label
+        // including `__name__`. Before item 2 the histogram series vanished;
+        // the flipped assertion is the returned histogram's count 5.
+        let source = histogram_source();
+        let (value, _annos) = Evaluator::new()
+            .eval_range_hist_annotated(&source, "last_over_time(h[5m])", 120_000, 120_000, 60_000)
+            .expect("range evaluates");
+        let RangeValue::Matrix(matrix) = value else {
+            panic!("last_over_time is a matrix");
+        };
+        assert_eq!(matrix.len(), 1, "one series");
+        let (labels, samples) = &matrix[0];
+        assert!(
+            labels
+                .iter()
+                .any(|l| l.name == METRIC_NAME_LABEL && l.value == "h"),
+            "last_over_time keeps __name__: {labels:?}"
+        );
+        assert_eq!(samples.len(), 1, "one grid step");
+        let h = samples[0]
+            .histogram
+            .as_ref()
+            .expect("last_over_time over histograms returns the histogram element");
+        assert_eq!(h.count.to_bits(), 5.0_f64.to_bits(), "newest sample count");
+        assert_eq!(h.sum.to_bits(), 25.0_f64.to_bits(), "newest sample sum");
+    }
+
+    #[test]
+    fn absent_over_time_sees_native_histogram_presence() {
+        use crate::eval::Evaluator;
+
+        // `absent_over_time(h[5m])` must return empty while histogram data
+        // flows: a histogram-only stream is present. Before item 4 presence
+        // was read from the float fetch only, so this affirmatively returned
+        // 1 (the false-positive liveness alert). The flipped assertion is that
+        // the result is empty.
+        let source = histogram_source();
+        let present = Evaluator::new()
+            .instant(&source, "absent_over_time(h[5m])", 120_000)
+            .expect("evaluates");
+        assert!(
+            present.is_empty(),
+            "a live histogram stream is present, so absent_over_time is empty: {present:?}"
+        );
+
+        // Control: no series at all, so absence still reports 1.
+        let empty = crate::testsource::TestSource::new();
+        let absent = Evaluator::new()
+            .instant(&empty, "absent_over_time(h[5m])", 120_000)
+            .expect("evaluates");
+        assert_eq!(absent.len(), 1, "genuinely absent series reports 1");
+        assert_eq!(absent[0].value.to_bits(), 1.0_f64.to_bits());
+    }
+
+    #[test]
+    fn instant_count_over_time_counts_native_histogram_samples() {
+        use crate::eval::Evaluator;
+
+        // The instant endpoint must answer the same class as the range
+        // endpoint (item 5): `count_over_time(h[5m])` at an instant counts the
+        // three histogram samples as a float `3`. Before item 5 the instant
+        // matrix arg fetched floats only, so the histogram series read as
+        // empty and no series was returned. The flipped assertion is the
+        // single float `3`.
+        let source = histogram_source();
+        let out = Evaluator::new()
+            .instant(&source, "count_over_time(h[5m])", 120_000)
+            .expect("evaluates");
+        assert_eq!(out.len(), 1, "one series at the instant endpoint");
+        assert!(out[0].histogram.is_none(), "count is a float");
+        assert_eq!(
+            out[0].value.to_bits(),
+            3.0_f64.to_bits(),
+            "three histogram samples counted at the instant endpoint"
+        );
+    }
+
+    #[test]
+    fn instant_quantile_over_time_drops_histogram_inputs_like_the_oracle() {
+        use crate::eval::{Evaluator, Value};
+
+        // `quantile_over_time` is float-only in Prometheus v3.13.1: a
+        // histogram-only window takes its `if len(el.Floats) == 0 { return }`
+        // early exit, yielding no element and (because that return precedes
+        // the histogram-ignored annotation) no annotation. Ravel must drop the
+        // histogram series the same way, never emit a spurious value and never
+        // warn. The flipped assertion: forcing the `quantile_over_time` arm of
+        // `histogram_over_time` to return a `Float` instead of `Drop` makes
+        // this fail with a non-empty result.
+        let source = histogram_source();
+        let (value, annos) = Evaluator::new()
+            .eval_instant_annotated(&source, "quantile_over_time(0.5, h[5m])", 120_000)
+            .expect("evaluates");
+        let Value::Vector(out) = value else {
+            panic!("quantile_over_time is a vector");
+        };
+        assert!(
+            out.is_empty(),
+            "quantile_over_time drops histogram-only inputs like the oracle: {out:?}"
+        );
+        assert!(
+            annos.warnings().is_empty(),
+            "the oracle emits no annotation for a histogram-only quantile window: {:?}",
+            annos.warnings()
+        );
+        assert!(
+            annos.infos().is_empty(),
+            "no info annotation either for a pure-histogram quantile window: {:?}",
+            annos.infos()
+        );
     }
 }
