@@ -113,6 +113,12 @@ struct Args {
     /// earlier run used; recorded in the report's provenance.
     #[arg(long, default_value_t = ravel_query::DEFAULT_FETCH_CONCURRENCY)]
     fetch_concurrency: usize,
+    /// Append one JSON line per finished statement to this file as the run
+    /// goes (`{"outcome":"measured"|"skipped"|"failed", ...}`), flushed per
+    /// line. The full report still goes to stdout at the end; this is what
+    /// survives a run killed hours in.
+    #[arg(long, value_name = "PATH")]
+    progress_jsonl: Option<std::path::PathBuf>,
 }
 
 #[derive(Copy, Clone, Debug, clap::ValueEnum)]
@@ -222,6 +228,7 @@ async fn run(args: &Args) -> Result<SqlLatencyReport, ravel_bench::sql_latency::
                 deadline: Duration::from_secs(args.deadline_secs),
                 continue_on_error: args.continue_on_error,
                 fetch_concurrency: args.fetch_concurrency,
+                progress_jsonl: args.progress_jsonl.clone(),
             };
             run_tenant(&cfg).await
         }
@@ -244,6 +251,7 @@ async fn run(args: &Args) -> Result<SqlLatencyReport, ravel_bench::sql_latency::
                 deadline: Duration::from_secs(args.deadline_secs),
                 continue_on_error: args.continue_on_error,
                 fetch_concurrency: args.fetch_concurrency,
+                progress_jsonl: args.progress_jsonl.clone(),
             };
             run_generated(&cfg).await
         }

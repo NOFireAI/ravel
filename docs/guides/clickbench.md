@@ -265,6 +265,11 @@ cargo run -p ravel-bench --features sql-latency --bin sql_latency_bench -- \
   with this up to the host's cores; the value is recorded in the report's
   provenance as `fetch_concurrency`, and two tables at different values are
   not comparable without it.
+- `--progress-jsonl <PATH>` appends one JSON line per finished statement to
+  `PATH` as the run goes (`{"outcome":"measured",...}`, `"skipped"`,
+  `"failed"`), flushed per line. The full report still goes to stdout at the
+  end. Use it on every long run: a 43-statement pass over 100M rows takes
+  hours, and without it a kill or a crash at statement 40 leaves nothing.
 - A resolve that finds **0 objects** is now an error naming the tenant, the
   resolved shard count, the window, and `now_ns`, rather than a silent report
   over an empty dataset. A wrong `--window-hours` (the event-time span the

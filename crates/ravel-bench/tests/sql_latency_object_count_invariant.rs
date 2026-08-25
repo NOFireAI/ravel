@@ -96,6 +96,7 @@ async fn l0_object_count_equals_distinct_data_object_keys() {
         deadline: Duration::from_secs(30),
         continue_on_error: false,
         fetch_concurrency: DEFAULT_FETCH_CONCURRENCY,
+        progress_jsonl: None,
     };
     let report = run_generated(&cfg).await.expect("generated lane runs");
 

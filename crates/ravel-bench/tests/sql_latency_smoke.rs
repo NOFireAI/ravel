@@ -53,6 +53,7 @@ fn small_generate_config(store: Arc<dyn ObjectStoreBackend>, runs: usize) -> Gen
         deadline: Duration::from_secs(30),
         continue_on_error: false,
         fetch_concurrency: DEFAULT_FETCH_CONCURRENCY,
+        progress_jsonl: None,
     }
 }
 
@@ -224,6 +225,7 @@ async fn an_entry_with_an_unsatisfied_required_declaration_is_skipped_with_the_k
         Duration::from_secs(30),
         false,
         DEFAULT_FETCH_CONCURRENCY,
+        None,
     )
     .await
     .expect("measure_corpus runs");

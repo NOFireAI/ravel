@@ -287,6 +287,44 @@ pub struct FailedEntry {
     pub error: String,
 }
 
+/// One statement's outcome, emitted the moment it is known. This is what the
+/// progress stream carries: a run over a large dataset can take hours and the
+/// full [`SqlLatencyReport`] is only written at the end, so a crash or a kill
+/// late in the run would otherwise lose every number already measured.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum EntryEvent {
+    Measured(EntryReport),
+    Skipped(SkippedEntry),
+    Failed(FailedEntry),
+}
+
+/// An append-only JSON-lines sink for [`EntryEvent`]s, flushed after every
+/// line so the file is complete up to the last finished statement at any
+/// instant. `None` when no progress path was configured.
+struct ProgressSink {
+    file: std::fs::File,
+}
+
+impl ProgressSink {
+    fn open(path: &std::path::Path) -> Result<Self, Error> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|e| format!("open progress file {}: {e}", path.display()))?;
+        Ok(ProgressSink { file })
+    }
+
+    fn write(&mut self, event: &EntryEvent) -> Result<(), Error> {
+        use std::io::Write;
+        let line = serde_json::to_string(event)?;
+        writeln!(self.file, "{line}")?;
+        self.file.flush()?;
+        Ok(())
+    }
+}
+
 /// The full report: provenance, dataset shape, measured statements, the
 /// statements skipped for an unsatisfied declared-column dependency, and the
 /// statements that ran and failed.
@@ -341,6 +379,10 @@ pub struct GenerateConfig {
     /// (ADR-0088's single coupled knob, `ravel-server --fetch-concurrency`).
     /// Defaults to [`ravel_query::DEFAULT_FETCH_CONCURRENCY`].
     pub fetch_concurrency: usize,
+    /// Append one JSON line per finished statement ([`EntryEvent`]) to this
+    /// file as the run goes, flushed per line, so a run killed hours in still
+    /// leaves every number it had measured. `None` writes nothing.
+    pub progress_jsonl: Option<std::path::PathBuf>,
 }
 
 /// Inputs for the loaded-tenant lane.
@@ -388,6 +430,10 @@ pub struct TenantConfigInput {
     /// (ADR-0088's single coupled knob, `ravel-server --fetch-concurrency`).
     /// Defaults to [`ravel_query::DEFAULT_FETCH_CONCURRENCY`].
     pub fetch_concurrency: usize,
+    /// Append one JSON line per finished statement ([`EntryEvent`]) to this
+    /// file as the run goes, flushed per line, so a run killed hours in still
+    /// leaves every number it had measured. `None` writes nothing.
+    pub progress_jsonl: Option<std::path::PathBuf>,
 }
 
 fn percentile(sorted_ns: &[u64], pct: f64) -> u64 {
@@ -530,11 +576,13 @@ pub async fn measure_corpus(
     deadline: Duration,
     continue_on_error: bool,
     fetch_concurrency: usize,
+    progress_jsonl: Option<&std::path::Path>,
 ) -> Result<(Vec<EntryReport>, Vec<SkippedEntry>, Vec<FailedEntry>), Error> {
     let runs = runs.max(1);
     let mut measured = Vec::new();
     let mut skipped = Vec::new();
     let mut failed = Vec::new();
+    let mut progress = progress_jsonl.map(ProgressSink::open).transpose()?;
 
     // CPU flamegraph lane (issue #365's pattern; see crate::profiling). Covers
     // every entry's execution, both lanes (run_generated/run_tenant funnel
@@ -548,14 +596,18 @@ pub async fn measure_corpus(
         // entry must be skipped, not run: removing this guard lets the entry
         // execute and report a plausible-but-wrong latency.
         if let Some((missing_key, want)) = first_unsatisfied(entry, declared) {
-            skipped.push(SkippedEntry {
+            let skip = SkippedEntry {
                 id: entry.id.clone(),
                 missing_key: missing_key.clone(),
                 reason: format!(
                     "required declared column `{missing_key}` ({want:?}) is not satisfied by the \
                      dataset under measurement"
                 ),
-            });
+            };
+            if let Some(sink) = progress.as_mut() {
+                sink.write(&EntryEvent::Skipped(skip.clone()))?;
+            }
+            skipped.push(skip);
             continue;
         }
 
@@ -601,11 +653,15 @@ pub async fn measure_corpus(
             let outcome = match executor.execute(tenant_hash, &req).await {
                 Ok(outcome) => outcome,
                 Err(e) if continue_on_error => {
-                    failed.push(FailedEntry {
+                    let failure = FailedEntry {
                         id: entry.id.clone(),
                         run,
                         error: e.to_string(),
-                    });
+                    };
+                    if let Some(sink) = progress.as_mut() {
+                        sink.write(&EntryEvent::Failed(failure.clone()))?;
+                    }
+                    failed.push(failure);
                     continue 'entries;
                 }
                 Err(e) => {
@@ -642,7 +698,7 @@ pub async fn measure_corpus(
         let mut sorted = latencies_ns.clone();
         sorted.sort_unstable();
         let to_ms = |ns: u64| ns as f64 / 1e6;
-        measured.push(EntryReport {
+        let report = EntryReport {
             id: entry.id.clone(),
             min_ms: to_ms(*sorted.first().unwrap()),
             median_ms: to_ms(percentile(&sorted, 0.50)),
@@ -650,7 +706,11 @@ pub async fn measure_corpus(
             cold_ms: to_ms(cold_ns),
             rows_returned,
             scan,
-        });
+        };
+        if let Some(sink) = progress.as_mut() {
+            sink.write(&EntryEvent::Measured(report.clone()))?;
+        }
+        measured.push(report);
     }
 
     profile.finish();
@@ -735,6 +795,7 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
         cfg.deadline,
         cfg.continue_on_error,
         cfg.fetch_concurrency,
+        cfg.progress_jsonl.as_deref(),
     )
     .await?;
 
@@ -819,6 +880,7 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
         cfg.deadline,
         cfg.continue_on_error,
         cfg.fetch_concurrency,
+        cfg.progress_jsonl.as_deref(),
     )
     .await?;
 
@@ -1133,7 +1195,62 @@ mod tests {
             deadline: Duration::from_secs(30),
             continue_on_error: false,
             fetch_concurrency: DEFAULT_FETCH_CONCURRENCY,
+            progress_jsonl: None,
         }
+    }
+
+    /// Every statement outcome is appended to the progress file as a JSON
+    /// line the moment it is known, one line per statement in run order, so a
+    /// run cut short still leaves every finished number on disk. The final
+    /// report is built from the same values.
+    #[tokio::test]
+    async fn progress_jsonl_carries_every_outcome_in_order() {
+        let store = empty_store();
+        provisioned_tenant(&store, "progress-tenant").await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("progress.jsonl");
+
+        let mut cfg = tenant_cfg(&store, "progress-tenant", None, 0);
+        cfg.entries = vec![
+            entry("fine", "SELECT body FROM logs"),
+            entry("broken", "SELECT no_such_column FROM logs"),
+            entry("also_fine", "SELECT ts FROM logs"),
+        ];
+        cfg.continue_on_error = true;
+        cfg.progress_jsonl = Some(path.clone());
+        let report = run_tenant(&cfg).await.expect("tenant lane runs");
+
+        let lines: Vec<EntryEvent> = std::fs::read_to_string(&path)
+            .expect("progress file")
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("each line is an EntryEvent"))
+            .collect();
+        let ids: Vec<(&str, &str)> = lines
+            .iter()
+            .map(|e| match e {
+                EntryEvent::Measured(m) => ("measured", m.id.as_str()),
+                EntryEvent::Skipped(s) => ("skipped", s.id.as_str()),
+                EntryEvent::Failed(f) => ("failed", f.id.as_str()),
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                ("measured", "fine"),
+                ("failed", "broken"),
+                ("measured", "also_fine")
+            ],
+            "one line per statement, in run order, each with its outcome"
+        );
+        assert_eq!(report.entries.len(), 2);
+        assert_eq!(report.failed.len(), 1);
+        let EntryEvent::Measured(first) = &lines[0] else {
+            panic!("first line is the measured entry");
+        };
+        assert_eq!(
+            first.rows_returned, report.entries[0].rows_returned,
+            "the streamed line carries the same numbers the report does"
+        );
     }
 
     /// A corpus entry with no declared-column dependency, so the tenant lane
@@ -1248,6 +1365,7 @@ mod tests {
             Duration::from_millis(20),
             true,
             DEFAULT_FETCH_CONCURRENCY,
+            None,
         )
         .await
         .expect("run continues past the expiry");
