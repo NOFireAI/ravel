@@ -530,7 +530,12 @@ fn cold_executor(
             ..CatalogConfig::default()
         },
     )?);
-    let mut log_fetcher = LogSegmentFetcher::new(Arc::clone(store));
+    // The same wiring `ravel-server` does (issue #700): without it the logs
+    // fetcher's permit pool stays at its compiled-in 16 and a scan planned at
+    // more partitions than that queues on it, so the bench would measure a
+    // ceiling the flag cannot move.
+    let mut log_fetcher = LogSegmentFetcher::new(Arc::clone(store))
+        .with_max_concurrent_gets(fetch_concurrency.max(1));
     if let Some(cache) = cache {
         log_fetcher = log_fetcher.with_cache(cache);
     }
@@ -1121,7 +1126,17 @@ mod tests {
         shard: u32,
         objects: usize,
     ) {
-        let records = build_records(objects.max(1), 0);
+        write_records_as_objects(store, tenant, shard, &build_records(objects.max(1), 0)).await;
+    }
+
+    /// One RLOG object per record in `records`, each with its own commit
+    /// record, on `shard`.
+    async fn write_records_as_objects(
+        store: &Arc<dyn ObjectStoreBackend>,
+        tenant: &TenantId,
+        shard: u32,
+        records: &[LogRecord],
+    ) {
         let writer_id = Uuid::from_u128(0x5100_0100 + u128::from(shard));
         for (obj_idx, rec) in records.iter().enumerate() {
             let writer_seq = (obj_idx + 1) as u64;
@@ -1382,6 +1397,102 @@ mod tests {
             gate.held_count() >= 1,
             "the expiry came from a GET the gate was holding, not from anything else"
         );
+    }
+
+    /// `fetch_concurrency` bounds the in-flight GETs, not just the partition
+    /// count: with every GET held behind a gate, an executor built at 24
+    /// parks 24 of them. Before issue #700 the logs fetcher kept its own
+    /// compiled-in cap of 16 whatever the knob said, so this waited forever
+    /// at 16.
+    #[tokio::test]
+    async fn fetch_concurrency_bounds_in_flight_gets() {
+        use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
+
+        const FETCH_CONCURRENCY: usize = 24;
+        let faulty = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&faulty) as Arc<dyn ObjectStoreBackend>;
+        let tenant = TenantId::new("gets-tenant");
+        // The permit pool guards the block-range path only (objects above the
+        // ADR-0107 threshold); a small object is one whole-object GET that
+        // never takes a permit. So every object here carries a
+        // poorly-compressible body well above the threshold, making the pool
+        // the thing under test.
+        let mut records = build_records(40, 0);
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        for rec in &mut records {
+            let mut body = String::with_capacity(2 << 20);
+            while body.len() < (2 << 20) {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let sym = ((seed >> 58) as u8) % 62;
+                body.push(char::from(match sym {
+                    0..=25 => b'a' + sym,
+                    26..=51 => b'A' + (sym - 26),
+                    _ => b'0' + (sym - 52),
+                }));
+            }
+            rec.body = body;
+        }
+        write_records_as_objects(&store, &tenant, 0, &records).await;
+        // Hold data-object reads only: the catalog resolve's own GETs (`l/HEAD`,
+        // commit records) run before any partition exists, and holding those
+        // would stop the query before the pool is ever touched.
+        let gate = faulty.hold(Op::Get, Some("/l/l0/".to_string()), Occurrence::Always);
+
+        let window = TimeRange {
+            start_ns: 0,
+            end_ns: NOW_NS,
+        };
+        let run = tokio::spawn({
+            let store = Arc::clone(&store);
+            let th = tenant.hash();
+            async move {
+                measure_corpus(
+                    &store,
+                    th,
+                    &[entry("q", "SELECT body FROM logs")],
+                    &[],
+                    1,
+                    window,
+                    NOW_NS,
+                    DEFAULT_MAX_QUERY_BYTES,
+                    1,
+                    0,
+                    Duration::from_secs(30),
+                    true,
+                    FETCH_CONCURRENCY,
+                    None,
+                )
+                .await
+            }
+        });
+        if tokio::time::timeout(
+            Duration::from_secs(5),
+            gate.wait_until_held(FETCH_CONCURRENCY),
+        )
+        .await
+        .is_err()
+        {
+            panic!(
+                "fetch_concurrency GETs are in flight at once, not the compiled-in 16: held {} \
+                 of {} after 5 s; held keys: {:?}",
+                gate.held_count(),
+                FETCH_CONCURRENCY,
+                gate.held_details()
+                    .iter()
+                    .map(|(_, op, key)| format!("{op:?} {key}"))
+                    .take(4)
+                    .collect::<Vec<_>>()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            gate.held_count(),
+            FETCH_CONCURRENCY,
+            "in-flight GETs are bounded by fetch_concurrency"
+        );
+        run.abort();
     }
 
     /// The deadline a run used is part of its provenance.

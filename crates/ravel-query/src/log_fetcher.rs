@@ -494,6 +494,17 @@ impl LogSegmentFetcher {
         self
     }
 
+    /// Bounds the in-flight object-store GETs of the block-range path (ADR-0107
+    /// decision 1's permit pool, [`DEFAULT_LOG_MAX_CONCURRENT_GETS`] by
+    /// default). This is the seam `--fetch-concurrency` (ADR-0088) reaches the
+    /// logs signal through; a scan planned at more partitions than this pool
+    /// has permits queues on it (issue #700).
+    #[must_use]
+    pub fn with_max_concurrent_gets(mut self, n: usize) -> Self {
+        self.block_range = self.block_range.with_max_concurrent_gets(n);
+        self
+    }
+
     /// Replaces the block-range fetcher (ADR-0107) with a fully configured one,
     /// for callers and tests that need to set the coalescing gap, coverage
     /// crossover, or concurrency bound directly. The replacement keeps this

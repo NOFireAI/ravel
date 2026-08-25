@@ -294,3 +294,14 @@ flowchart LR
   introduced.
 - No frozen-format change, no version bump, no dual-reader window: RLOG's
   on-disk bytes are untouched. This ADR is fetch-path and accounting only.
+
+## Amendment 2026-08-26 (issue #700)
+
+"Sized independently for RLOG's call volume" in decision 1 means the RLOG
+permit pool is separate from RSEG's, not that it is fixed. Its size is
+`--fetch-concurrency` (ADR-0088), handed to the fetcher by
+`LogSegmentFetcher::with_max_concurrent_gets` at the two places that build
+one for queries (`ravel-server`'s query wiring and `sql_latency_bench`).
+Before this amendment nothing set it, so every logs scan ran at most 16
+GETs in flight regardless of the flag, and a 100M-row `count(*)` measured
+the same 160 s at `--fetch-concurrency` 16 and 32.
