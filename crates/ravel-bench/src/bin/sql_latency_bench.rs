@@ -105,6 +105,14 @@ struct Args {
     /// the report, so a partial table is never mistaken for a complete one.
     #[arg(long, default_value_t = false)]
     continue_on_error: bool,
+    /// The executor's `fetch_concurrency` (ADR-0088): logs scan partition count
+    /// and the bound on in-flight segment fetches per query, the same knob as
+    /// `ravel-server --fetch-concurrency`. A full-scan statement's cold time is
+    /// latency-bound at the object store, so it moves nearly linearly with
+    /// this. Defaults to ravel-query's compiled-in value (8), the number every
+    /// earlier run used; recorded in the report's provenance.
+    #[arg(long, default_value_t = ravel_query::DEFAULT_FETCH_CONCURRENCY)]
+    fetch_concurrency: usize,
 }
 
 #[derive(Copy, Clone, Debug, clap::ValueEnum)]
@@ -213,6 +221,7 @@ async fn run(args: &Args) -> Result<SqlLatencyReport, ravel_bench::sql_latency::
                 cache_bytes: args.cache_bytes,
                 deadline: Duration::from_secs(args.deadline_secs),
                 continue_on_error: args.continue_on_error,
+                fetch_concurrency: args.fetch_concurrency,
             };
             run_tenant(&cfg).await
         }
@@ -234,6 +243,7 @@ async fn run(args: &Args) -> Result<SqlLatencyReport, ravel_bench::sql_latency::
                 cache_bytes: args.cache_bytes,
                 deadline: Duration::from_secs(args.deadline_secs),
                 continue_on_error: args.continue_on_error,
+                fetch_concurrency: args.fetch_concurrency,
             };
             run_generated(&cfg).await
         }
@@ -256,6 +266,7 @@ fn print_human_table(report: &SqlLatencyReport) {
     );
     println!("  runs/query : {}", p.runs);
     println!("  deadline   : {} s per statement", p.deadline_secs);
+    println!("  fetch conc : {}", p.fetch_concurrency);
     if p.cache_bytes > 0 {
         println!("  read cache : {} bytes", p.cache_bytes);
     } else {
