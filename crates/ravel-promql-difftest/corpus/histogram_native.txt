@@ -155,3 +155,109 @@ start: +300s
 end: +600s
 step: 60s
 mode: unordered
+
+# Range evaluation over native histograms (ADR-0108, #580). Before #577/#578/
+# #579 the range path silently destroyed histogram data three ways: the grid
+# collapse dropped a histogram element to a placeholder float 0.0 (silent
+# zeros); the range selector and the range arms of rate/*_over_time fetched
+# floats only, so bare histogram selectors and their reductions vanished
+# (silent empties); and absent_over_time built its answer from the float-only
+# fetch and returned 1 while histogram data flowed (false absence). Each shape
+# below carries a histogram result end to end and is paired with an
+# instant-kind counterpart, proving both endpoints return the same class of
+# answer (the ADR-0108 asymmetry requirement). These entries also depend on
+# the histogram-aware comparator: they compare histogram-valued elements, which
+# the old float-only comparator could not read.
+#
+# No tolerance on the rate/increase entries: the existing instant entries
+# native_histogram_rate_count and native_histogram_increase_sum already match
+# Prometheus bit-for-bit on this schema-0 dataset (the extrapolated-rate math
+# takes no libm powf on schema 0), so the histogram these produce should match
+# bit-for-bit too. If a first real RAVEL_DIFFTEST run measures a per-bucket or
+# count/sum ULP gap, a measured tolerance is added per ADR-0025, never guessed.
+
+# Silent-zeros shape: a top-level aggregate over a histogram element. The grid
+# collapse used to emit an all-zero float series here.
+name: native_histogram_sum_rate_range
+query: sum(rate(diff_native_hist[5m]))
+kind: range
+start: +300s
+end: +600s
+step: 60s
+mode: unordered
+
+name: native_histogram_sum_rate_instant
+query: sum(rate(diff_native_hist[5m]))
+kind: instant
+time: +600s
+mode: unordered
+
+# Silent-empties shape: the range arm of rate over a histogram counter. Its
+# window reducer (histogram_extrapolated_rate) was ported but unwired on the
+# range arm, so this used to vanish.
+name: native_histogram_rate_range
+query: rate(diff_native_hist[5m])
+kind: range
+start: +300s
+end: +600s
+step: 60s
+mode: unordered
+
+name: native_histogram_rate_instant
+query: rate(diff_native_hist[5m])
+kind: instant
+time: +600s
+mode: unordered
+
+# Silent-empties shape: a bare native-histogram selector as a range query. The
+# range selector fetched floats only, so the whole series used to disappear.
+name: native_histogram_bare_selector_range
+query: diff_native_hist
+kind: range
+start: +300s
+end: +600s
+step: 60s
+mode: unordered
+
+name: native_histogram_bare_selector_instant
+query: diff_native_hist
+kind: instant
+time: +600s
+mode: unordered
+
+# Silent-empties shape in the *_over_time family: count_over_time reduces
+# histogram samples to a float count of how many landed in the window. The
+# family reduced floats only, so this used to answer empty over histogram data.
+name: native_histogram_count_over_time_range
+query: count_over_time(diff_native_hist[5m])
+kind: range
+start: +300s
+end: +600s
+step: 60s
+mode: unordered
+
+name: native_histogram_count_over_time_instant
+query: count_over_time(diff_native_hist[5m])
+kind: instant
+time: +600s
+mode: unordered
+
+# False-absence shape: absent_over_time over a window that has histogram data
+# must answer empty (the data is present). The float-only fetch used to see no
+# samples and return 1, a permanently inverted liveness signal. The 15m window
+# spans the whole 30s-step dataset, so every grid point sees data.
+name: native_histogram_absent_over_time_range
+query: absent_over_time(diff_native_hist[15m])
+kind: range
+start: +300s
+end: +600s
+step: 60s
+mode: unordered
+expect: empty
+
+name: native_histogram_absent_over_time_instant
+query: absent_over_time(diff_native_hist[15m])
+kind: instant
+time: +600s
+mode: unordered
+expect: empty
