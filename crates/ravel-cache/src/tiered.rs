@@ -34,6 +34,17 @@
 //! the moment the funnels started serving hits from it. Clean bytes freshly
 //! returned by an upstream fetch are never corrupted: they did not come from a
 //! cache tier, exactly as a store read is never corrupted.
+//!
+//! **A second, fetch-free access path exists for a caller that cannot
+//! express its miss handling as one upstream-fetch closure.**
+//! [`TieredCache::get`] and [`TieredCache::insert`] give the same RAM-then-
+//! disk read-through and dual-tier admission as `get_or_fetch`, but neither
+//! runs a fetch or joins single-flight -- `get` returns `None` on a genuine
+//! both-tier miss rather than fetching, and `insert` admits bytes the caller
+//! already holds. A caller mixing this path with `get_or_fetch` on the same
+//! key must still account for exactly one miss per logical request; see
+//! [`TieredCache::get`]'s own docstring for the double-counting pitfall this
+//! crate has already shipped and fixed once on the closure-based path.
 
 use std::sync::Arc;
 
@@ -208,6 +219,20 @@ where
     /// Concurrent `get` calls for one key each consult disk independently
     /// rather than riding one leader: single-flight exists only to protect the
     /// upstream fetch this method never performs.
+    ///
+    /// **A `None` from this method still records a real miss on both tiers'
+    /// [`CacheMetrics`]** ([`Cache::get`] and [`DiskCache::get`] each count
+    /// their own call). A caller using the peek-then-defer pattern above must
+    /// not also call `get_or_fetch` (or `get` again) for the same logical
+    /// miss expecting only one miss to be counted: that double-counts one
+    /// request as two misses, corrupting the request-hit-rate SLI ADR-0046
+    /// depends on -- this crate has shipped and fixed exactly this bug once
+    /// already (see [`TieredCache::get_or_fetch`]'s own docstring). A caller
+    /// that peeks with `get` and, on a miss, later resolves the value some
+    /// other way (a coalesced fetch elsewhere, as `BlockRangeFetcher` does)
+    /// should treat this method's miss as the query's ONLY accounted miss for
+    /// that key, not layer a second accounted miss on top when the deferred
+    /// fetch later runs.
     ///
     /// In corruption mode (`ram` built with [`Cache::with_corruption`]) a hit
     /// from either tier is corrupted at serve time exactly as a
