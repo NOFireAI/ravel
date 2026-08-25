@@ -908,11 +908,15 @@ impl RlogWriter {
         let mut g_span: Vec<Option<&[u8]>> = Vec::with_capacity(total_rows);
         let mut g_stream_id: Vec<LogStreamId> = Vec::with_capacity(total_rows);
         let mut g_stream_ref: Vec<u32> = Vec::with_capacity(total_rows);
+        // Source batch of each global row, so a block can map a scattered `grow`
+        // back to its source cells when it materializes its rows (#682).
+        let mut g_batch: Vec<u32> = Vec::with_capacity(total_rows);
 
-        for b in batches {
+        for (bi, b) in batches.iter().enumerate() {
             let mut trace_slot = 0usize;
             let mut span_slot = 0usize;
             for row in 0..b.num_rows {
+                g_batch.push(bi as u32);
                 g_ts.push(b.ts_ns[row]);
                 g_obs.push(b.observed_ts_ns[row]);
                 g_sev.push(b.severity_num[row]);
@@ -937,18 +941,12 @@ impl RlogWriter {
             }
         }
 
-        // Per-plan, per-row value and stat arrays: contiguous per column, so a
-        // block's value page is an O(1) index per row, never a gather.
-        let mut col_values: Vec<Vec<Option<ColumnValue>>> = vec![vec![None; total_rows]; num_plans];
-        let mut col_stat: Vec<Vec<Option<ColumnValue>>> = vec![vec![None; total_rows]; num_plans];
-
         // Tracked names (indexed union numstat), interned once into a flat table
-        // so the per-row occurrence lists key by a small slot index instead of
-        // allocating a fresh `String` and a `BTreeMap` node per tracked cell
-        // (the small-allocation churn glibc never returns to the OS, #682). The
-        // table is name-sorted, so ascending slot order is ascending name order:
-        // [`record_level_winners_slot`] reproduces [`record_level_winners`]'s
-        // name-sorted output from it byte for byte.
+        // so a row's tracked occurrences key by a small slot index instead of a
+        // fresh `String` and `BTreeMap` node per cell (#682). The table is
+        // name-sorted, so ascending slot order is ascending name order and
+        // [`record_level_winners_slot`] reproduces [`record_level_winners`]
+        // byte for byte.
         let mut tracked_name_vec: Vec<&str> = indexed_names
             .iter()
             .chain(numstat_names.iter())
@@ -962,21 +960,35 @@ impl RlogWriter {
             .map(|(i, n)| (*n, i as u32))
             .collect();
 
-        // Per-row in-budget columnar occurrences (row.columns), overflow
-        // attributes (attrs_raw source), and the tracked-name occurrences the
-        // merged view is resolved from (keyed by tracked slot, not name).
-        let mut g_cols: Vec<Vec<(u32, ColumnValue)>> = vec![Vec::new(); total_rows];
-        let mut g_overflow: Vec<Vec<(String, AttrValue)>> = vec![Vec::new(); total_rows];
-        let mut tracked_cols: Vec<Vec<(u32, u8, ColumnValue)>> = vec![Vec::new(); total_rows];
-        let mut tracked_overflow: Vec<Vec<(u32, AttrValue)>> = vec![Vec::new(); total_rows];
+        // Per (batch, column) word-level popcount prefix over the presence
+        // bitmap. A block materializes its rows from source (below), and this
+        // lets it find one (column, row)'s dense-cell slot in O(1) instead of
+        // holding every resolved value for the whole batch. At one u32 per 64
+        // rows per column it is a tiny fraction of one value copy; it is the
+        // only whole-batch structure the per-block path adds where the old path
+        // held `col_values`/`col_stat`/`g_cols` for the whole batch (#682).
+        let col_rank: Vec<Vec<Vec<u32>>> = batches
+            .iter()
+            .map(|b| {
+                b.dyn_columns
+                    .iter()
+                    .map(|c| presence_word_prefix(c.validity.bytes()))
+                    .collect()
+            })
+            .collect();
 
+        // `attrs_raw` (whole batch, overflow only) and the value part of each
+        // row's `row_estimate`. Both are needed before the block cut, so they
+        // are computed here in one source pass. Overflow attributes are gathered
+        // in the same order (dyn-column order, then residual order) the row path
+        // folds them, so `canonical_attr_bytes` reproduces it byte for byte; the
+        // estimate reads source cell sizes without copying any value.
+        let mut g_overflow: Vec<Vec<(String, AttrValue)>> = vec![Vec::new(); total_rows];
+        let mut g_est_dyn: Vec<usize> = vec![0; total_rows];
         for (bi, b) in batches.iter().enumerate() {
             let base = bases[bi];
             for c in &b.dyn_columns {
-                let ty_byte = c.field_type.to_u8();
-                let cid_opt = column_lookup(&column_of, &c.name, ty_byte);
-                let tracked = indexed_names.contains(c.name.as_str())
-                    || numstat_names.contains(c.name.as_str());
+                let in_budget = column_lookup(&column_of, &c.name, c.field_type.to_u8()).is_some();
                 let mut slot = 0usize;
                 for row in 0..b.num_rows {
                     if !c.validity.get(row) {
@@ -985,27 +997,10 @@ impl RlogWriter {
                     let cell = &c.cells[slot];
                     slot += 1;
                     let grow = base + row;
-                    let (ty, cv) = resolve_value(cell);
-                    match cid_opt {
-                        Some(cid) => {
-                            let plan_idx = plan_of_cid[&cid];
-                            col_values[plan_idx][grow] = Some(cv.clone());
-                            g_cols[grow].push((cid, cv.clone()));
-                            if tracked {
-                                tracked_cols[grow].push((
-                                    tracked_slot[c.name.as_str()],
-                                    ty.to_u8(),
-                                    cv,
-                                ));
-                            }
-                        }
-                        None => {
-                            g_overflow[grow].push((c.name.clone(), cell.clone()));
-                            if tracked {
-                                tracked_overflow[grow]
-                                    .push((tracked_slot[c.name.as_str()], cell.clone()));
-                            }
-                        }
+                    if in_budget {
+                        g_est_dyn[grow] += columnar_estimate(cell);
+                    } else {
+                        g_overflow[grow].push((c.name.clone(), cell.clone()));
                     }
                 }
             }
@@ -1013,22 +1008,24 @@ impl RlogWriter {
                 let grow = base + row;
                 for (k, v) in extras {
                     g_overflow[grow].push((k.clone(), v.clone()));
-                    let tracked =
-                        indexed_names.contains(k.as_str()) || numstat_names.contains(k.as_str());
-                    if tracked {
-                        tracked_overflow[grow].push((tracked_slot[k.as_str()], v.clone()));
-                    }
                 }
             }
         }
+        let mut g_attrs_raw: Vec<Option<Vec<u8>>> = vec![None; total_rows];
+        for grow in 0..total_rows {
+            if !g_overflow[grow].is_empty() {
+                g_attrs_raw[grow] = Some(canonical_attr_bytes(&g_overflow[grow]));
+            }
+        }
+        drop(g_overflow);
 
         // Dictionary fast path (ADR-0109 decision 3): for each Str/Bytes plan
         // column whose every contributing batch column arrived dictionary-
         // shaped, build one per-object distinct table and a per-global-row
         // index into it. The block string encode and the token bloom then run
         // per distinct value, not per row. A plan column with any plain
-        // contributor stays on the per-row `col_values` path built above,
-        // untouched, so byte-identity with the row path is preserved either way.
+        // contributor falls back to the per-block materialized value page, so
+        // byte-identity with the row path is preserved either way.
         let mut plan_uses_dict = vec![false; num_plans];
         let mut global_dict: Vec<Vec<Vec<u8>>> = vec![Vec::new(); num_plans];
         let mut col_dict_ids: Vec<Vec<Option<u32>>> = vec![Vec::new(); num_plans];
@@ -1083,34 +1080,6 @@ impl RlogWriter {
             .map(|(_, (_, _, cid))| *cid)
             .collect();
 
-        // Finish each row: sort its columnar occurrences by column id (matching
-        // the row path's BTreeMap collection), resolve the merged view, and
-        // project it into POSTINGS terms, NumStat winners, and attrs_raw.
-        let mut g_attrs_raw: Vec<Option<Vec<u8>>> = vec![None; total_rows];
-        let mut g_indexed_terms: Vec<Vec<(u32, ColumnValue)>> = vec![Vec::new(); total_rows];
-        let mut g_stat_winners: Vec<Vec<(u32, ColumnValue)>> = vec![Vec::new(); total_rows];
-        for grow in 0..total_rows {
-            g_cols[grow].sort_by_key(|(cid, _)| *cid);
-            if !g_overflow[grow].is_empty() {
-                g_attrs_raw[grow] = Some(canonical_attr_bytes(&g_overflow[grow]));
-            }
-            let winners = record_level_winners_slot(
-                &tracked_cols[grow],
-                &tracked_overflow[grow],
-                &tracked_name_vec,
-            );
-            let seed = stream_tracked
-                .get(&g_stream_id[grow])
-                .map_or(&[][..], Vec::as_slice);
-            let resolved = resolved_tracked_values(seed, &winners);
-            g_indexed_terms[grow] = indexed_term_columns(&resolved, &indexed_names, &column_of);
-            let stat_winners = stat_winner_columns(&resolved, &numstat_names, &column_of);
-            for (cid, cv) in &stat_winners {
-                col_stat[plan_of_cid[cid]][grow] = Some(cv.clone());
-            }
-            g_stat_winners[grow] = stat_winners;
-        }
-
         // Sort rows by (stream_ref, ts) exactly as the row path sorts
         // ResolvedRows; `sort_by` is stable, so ties keep the appended order.
         let mut perm: Vec<usize> = (0..total_rows).collect();
@@ -1120,7 +1089,8 @@ impl RlogWriter {
                 .then_with(|| g_ts[a].cmp(&g_ts[b]))
         });
 
-        // Chunk into blocks, reproducing chunk_blocks/row_estimate column-wise.
+        // Chunk into blocks, reproducing chunk_blocks/row_estimate. The dynamic
+        // part is precomputed in `g_est_dyn`; the rest is byte-identical.
         let row_estimate = |grow: usize| -> usize {
             let mut est = 40usize;
             est += g_body[grow].len();
@@ -1128,12 +1098,7 @@ impl RlogWriter {
             if let Some(raw) = &g_attrs_raw[grow] {
                 est += raw.len();
             }
-            for (_, v) in &g_cols[grow] {
-                est += match v {
-                    ColumnValue::Str(b) | ColumnValue::Bytes(b) => b.len() + 2,
-                    _ => 8,
-                };
-            }
+            est += g_est_dyn[grow];
             est
         };
         let mut spans: Vec<std::ops::Range<usize>> = Vec::new();
@@ -1178,15 +1143,74 @@ impl RlogWriter {
             let block_rows = &perm[span.clone()];
             let blk_idx_u32 = blk_idx as u32;
 
+            // Materialize only this block's rows from source: each row's
+            // in-budget columnar occurrences (cid-sorted) and its merged-view
+            // POSTINGS terms and NumStat winners. `attrs_raw` is already whole
+            // batch. This is the one copy of one block's cells that bounds the
+            // peak (#682); nothing built here is retained past the block.
+            let n = block_rows.len();
+            let mut blk_cols: Vec<Vec<(u32, ColumnValue)>> = Vec::with_capacity(n);
+            let mut blk_indexed: Vec<Vec<(u32, ColumnValue)>> = Vec::with_capacity(n);
+            let mut blk_stat: Vec<Vec<(u32, ColumnValue)>> = Vec::with_capacity(n);
+            for &grow in block_rows {
+                let bi = g_batch[grow] as usize;
+                let b = &batches[bi];
+                let local = grow - bases[bi];
+                let mut cols: Vec<(u32, ColumnValue)> = Vec::new();
+                let mut t_cols: Vec<(u32, u8, ColumnValue)> = Vec::new();
+                let mut t_over: Vec<(u32, AttrValue)> = Vec::new();
+                for (ci, c) in b.dyn_columns.iter().enumerate() {
+                    if !c.validity.get(local) {
+                        continue;
+                    }
+                    let slot = presence_rank(&col_rank[bi][ci], c.validity.bytes(), local);
+                    let cell = &c.cells[slot];
+                    let tracked = indexed_names.contains(c.name.as_str())
+                        || numstat_names.contains(c.name.as_str());
+                    let (ty, cv) = resolve_value(cell);
+                    match column_lookup(&column_of, &c.name, c.field_type.to_u8()) {
+                        Some(cid) => {
+                            if tracked {
+                                t_cols.push((
+                                    tracked_slot[c.name.as_str()],
+                                    ty.to_u8(),
+                                    cv.clone(),
+                                ));
+                            }
+                            cols.push((cid, cv));
+                        }
+                        None => {
+                            if tracked {
+                                t_over.push((tracked_slot[c.name.as_str()], cell.clone()));
+                            }
+                        }
+                    }
+                }
+                for (k, v) in &b.residual_attrs[local] {
+                    if indexed_names.contains(k.as_str()) || numstat_names.contains(k.as_str()) {
+                        t_over.push((tracked_slot[k.as_str()], v.clone()));
+                    }
+                }
+                cols.sort_by_key(|(cid, _)| *cid);
+                let winners = record_level_winners_slot(&t_cols, &t_over, &tracked_name_vec);
+                let seed = stream_tracked
+                    .get(&g_stream_id[grow])
+                    .map_or(&[][..], Vec::as_slice);
+                let resolved = resolved_tracked_values(seed, &winners);
+                blk_indexed.push(indexed_term_columns(&resolved, &indexed_names, &column_of));
+                blk_stat.push(stat_winner_columns(&resolved, &numstat_names, &column_of));
+                blk_cols.push(cols);
+            }
+
             let mut present_cols: BTreeSet<u32> = BTreeSet::new();
-            for &g in block_rows {
-                for (cid, _) in &g_cols[g] {
+            for cols in &blk_cols {
+                for (cid, _) in cols {
                     present_cols.insert(*cid);
                 }
             }
             let mut plan_cols: BTreeSet<u32> = present_cols.clone();
-            for &g in block_rows {
-                for (cid, _) in &g_stat_winners[g] {
+            for stat in &blk_stat {
+                for (cid, _) in stat {
                     plan_cols.insert(*cid);
                 }
             }
@@ -1197,8 +1221,13 @@ impl RlogWriter {
                     ty: ty_of_column[cid],
                 })
                 .collect();
+            let plan_pos: HashMap<u32, usize> = plans
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (p.column_id, i))
+                .collect();
 
-            // Column-major block inputs, gathered by the sort permutation.
+            // Column-major fixed inputs, gathered by the sort permutation.
             let ts_v: Vec<i64> = block_rows.iter().map(|&g| g_ts[g]).collect();
             let obs_v: Vec<i64> = block_rows.iter().map(|&g| g_obs[g]).collect();
             let sref_v: Vec<u32> = block_rows.iter().map(|&g| g_stream_ref[g]).collect();
@@ -1220,22 +1249,33 @@ impl RlogWriter {
                 .iter()
                 .filter_map(|&g| g_attrs_raw[g].as_deref())
                 .collect();
-            let values_v: Vec<Vec<Option<ColumnValue>>> = plans
+
+            // Per-plan value pages, scattered from this block's materialized
+            // occurrences; dict-path plans carry their page below instead.
+            let mut values_v: Vec<Vec<Option<ColumnValue>>> = plans
                 .iter()
                 .map(|p| {
-                    let plan_idx = plan_of_cid[&p.column_id];
-                    if plan_uses_dict[plan_idx] {
-                        // The dict path below carries this column's page; the
-                        // per-row value gather is skipped.
+                    if plan_uses_dict[plan_of_cid[&p.column_id]] {
                         Vec::new()
                     } else {
-                        block_rows
-                            .iter()
-                            .map(|&g| col_values[plan_idx][g].clone())
-                            .collect()
+                        vec![None; n]
                     }
                 })
                 .collect();
+            for (li, cols) in blk_cols.iter().enumerate() {
+                for (cid, cv) in cols {
+                    if !plan_uses_dict[plan_of_cid[cid]] {
+                        values_v[plan_pos[cid]][li] = Some(cv.clone());
+                    }
+                }
+            }
+            let mut stat_v: Vec<Vec<Option<ColumnValue>>> =
+                plans.iter().map(|_| vec![None; n]).collect();
+            for (li, stat) in blk_stat.iter().enumerate() {
+                for (cid, cv) in stat {
+                    stat_v[plan_pos[cid]][li] = Some(cv.clone());
+                }
+            }
             // Owned per-block dict ids (one Option<index> per block row) for
             // every dict-path plan, referenced by `str_dicts_v` below.
             let str_dict_ids_v: Vec<Option<Vec<Option<u32>>>> = plans
@@ -1259,16 +1299,6 @@ impl RlogWriter {
                         dict: &global_dict[plan_idx],
                         ids,
                     })
-                })
-                .collect();
-            let stat_v: Vec<Vec<Option<ColumnValue>>> = plans
-                .iter()
-                .map(|p| {
-                    let plan_idx = plan_of_cid[&p.column_id];
-                    block_rows
-                        .iter()
-                        .map(|&g| col_stat[plan_idx][g].clone())
-                        .collect()
                 })
                 .collect();
 
@@ -1297,10 +1327,10 @@ impl RlogWriter {
             // Bloom over body, severity_text, and string columns; POSTINGS over
             // each row's merged-view indexed terms.
             let mut builder = BloomBuilder::new(self.cfg.bloom_seed);
-            for &g in block_rows {
+            for (li, &g) in block_rows.iter().enumerate() {
                 insert_text(&mut builder, COL_BODY, g_body[g]);
                 insert_text(&mut builder, COL_SEVERITY_TEXT, g_sevtext[g]);
-                for (cid, v) in &g_cols[g] {
+                for (cid, v) in &blk_cols[li] {
                     if let ColumnValue::Str(bytes) = v {
                         // Dict-path Str columns are tokenized per distinct value
                         // after this loop; skip their per-row occurrence here.
@@ -1309,7 +1339,7 @@ impl RlogWriter {
                         }
                     }
                 }
-                for (cid, v) in &g_indexed_terms[g] {
+                for (cid, v) in &blk_indexed[li] {
                     if postings_capped.contains(cid) {
                         continue;
                     }
@@ -1358,8 +1388,8 @@ impl RlogWriter {
             for cid in &present_cols {
                 *col_blocks.entry(*cid).or_insert(0) += 1;
             }
-            for &g in block_rows {
-                for (cid, _) in &g_cols[g] {
+            for cols in &blk_cols {
+                for (cid, _) in cols {
                     *col_present.entry(*cid).or_insert(0) += 1;
                 }
             }
@@ -1872,6 +1902,61 @@ fn record_level_winners_slot(
         }
     }
     out
+}
+
+/// A per-64-row popcount prefix over a presence bitmap's bytes: `out[w]` is the
+/// number of set bits in the first `w` 8-byte words. Paired with
+/// [`presence_rank`] it turns a `(column, row)` lookup into the column's dense
+/// cell slot into an O(1) probe, so the columnar writer materializes a block's
+/// values from source instead of holding every value for the whole batch (#682).
+fn presence_word_prefix(bytes: &[u8]) -> Vec<u32> {
+    let num_words = bytes.len().div_ceil(8);
+    let mut prefix = Vec::with_capacity(num_words + 1);
+    let mut acc = 0u32;
+    prefix.push(0);
+    for w in 0..num_words {
+        let start = w * 8;
+        let end = (start + 8).min(bytes.len());
+        for &byte in &bytes[start..end] {
+            acc += byte.count_ones();
+        }
+        prefix.push(acc);
+    }
+    prefix
+}
+
+/// The dense-cell slot of present row `local`: the count of set presence bits
+/// before it, which is the number of present rows the column stored ahead of it.
+/// `prefix` is [`presence_word_prefix`] of the same `bytes`. The caller must have
+/// checked `local` is present.
+fn presence_rank(prefix: &[u32], bytes: &[u8], local: usize) -> usize {
+    let w = local / 64;
+    let mut rank = prefix[w] as usize;
+    let byte_start = w * 8;
+    let full_bytes = (local % 64) / 8;
+    for k in 0..full_bytes {
+        rank += bytes[byte_start + k].count_ones() as usize;
+    }
+    let rem = local % 8;
+    if rem != 0 {
+        rank += (bytes[byte_start + full_bytes] & ((1u8 << rem) - 1)).count_ones() as usize;
+    }
+    rank
+}
+
+/// The `row_estimate` contribution of one in-budget columnar cell, read from the
+/// source attribute without resolving (copying) its value. Matches the value
+/// sizing [`row_estimate`] applies to a [`ColumnValue`]: string/bytes columns
+/// count their byte length plus two, every numeric column a flat eight, and a
+/// `List`/`Map` its canonical `Bytes` encoding (the only case that must encode).
+fn columnar_estimate(cell: &ravel_types::logstream::AttrValue) -> usize {
+    use ravel_types::logstream::AttrValue;
+    match cell {
+        AttrValue::Str(s) => s.len() + 2,
+        AttrValue::Bytes(b) => b.len() + 2,
+        AttrValue::I64(_) | AttrValue::F64(_) | AttrValue::Bool(_) => 8,
+        other => canonical_value_bytes(other).len() + 2,
+    }
 }
 
 /// Splits row indices into block spans by record target and an estimated
