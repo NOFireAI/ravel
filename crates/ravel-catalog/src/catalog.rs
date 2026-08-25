@@ -10,7 +10,7 @@ use bytes::Bytes;
 use futures::stream::{self, StreamExt};
 use parking_lot::Mutex;
 use prost::Message;
-use ravel_cache::{Cache, CacheKey, CacheLimits};
+use ravel_cache::{Cache, CacheKey, CacheLimits, SingleFlightError, Source, TieredCache};
 use ravel_commit::keys::BucketEntry;
 use ravel_commit::{erasure, keys, record, signal};
 use ravel_object_store::{GetOutcome, GetRange, ObjectMeta, ObjectStoreBackend, StoreError};
@@ -69,6 +69,68 @@ const SNAPSHOT_WINDOW_REQUESTS_UPPER_BOUND: u64 = 3;
 /// as well or it stops being a true upper envelope.
 const PENDING_ERASURE_LIST_UPPER_BOUND: u64 = 1;
 
+/// The catalog's raw-byte cache (ADR-0046 decisions 1-3), in one of the two
+/// tier configurations `Catalog::fetch_content_addressed` reads through.
+///
+/// - [`ByteCache::Ram`] is the RAM tier alone, consulted with the plain
+///   get-then-insert idiom the five decoded caches use. This is the only
+///   configuration [`Catalog::new`] builds: with no local `--cache-dir` a
+///   query node has no disk tier (ADR-0046 decision 3), and building one here
+///   would both write files in production before #97 wires the flag and
+///   require a Tokio runtime at construction ([`ravel_cache::DiskCache::new`]),
+///   which `Catalog::new` does not promise.
+/// - [`ByteCache::Tiered`] is the RAM-over-disk [`TieredCache`] read through
+///   [`TieredCache::get_or_fetch`], so a disk-served hit is single-flighted and
+///   corruption-gated exactly as ADR-0046 decisions 3-5 require. A disk tier is
+///   attached here (in #97, and in this crate's tests today); the read funnel
+///   already routes through it the moment it is present.
+///
+/// The two variants carry different fetch-error types on purpose. The RAM path
+/// never constructs a fetch-closure error (it does its own get-then-insert), so
+/// its `E` stays `Infallible`, exactly as before this cache gained a disk tier.
+/// The tiered path's `get_or_fetch` closure runs the upstream store GET, whose
+/// error is `StoreError`; the tiered single-flight (like [`Cache`] itself)
+/// requires that error type to be `Clone` so one leader's error reaches every
+/// follower, and `StoreError` is deliberately not `Clone`, so it is threaded as
+/// `Arc<StoreError>` and `fetch_content_addressed` reconstructs the owned
+/// `StoreError` its callers match on before returning.
+enum ByteCache {
+    /// RAM tier only (no disk configured). The plain get-then-insert path.
+    Ram(Cache<std::convert::Infallible>),
+    /// RAM over local disk. The `get_or_fetch` read-through path. Constructed
+    /// today only under test (`set_tiered_byte_cache_for_test`, the acceptance
+    /// gate) and, once it lands, by #97's `--cache-dir` wiring; the read funnel
+    /// already routes through it wherever it is present, which is the whole of
+    /// this task. The `allow` is scoped to the non-test build, where nothing
+    /// constructs it yet, so a genuine dead variant is still caught under test.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Tiered(TieredCache<Arc<StoreError>>),
+}
+
+/// Reconstruct an owned [`StoreError`] from a borrowed one. The tiered byte
+/// cache threads its upstream fetch error as `Arc<StoreError>` because the
+/// single-flight requires a `Clone` error type and `StoreError` is not `Clone`;
+/// `fetch_content_addressed`'s callers match on an owned `StoreError`, so the
+/// shared error is rebuilt here rather than cloned. The exhaustive match is
+/// deliberate: a new `StoreError` variant is a compile error here, not a silent
+/// fall-through, so this stays a faithful copy of the taxonomy it mirrors.
+fn clone_store_error(err: &StoreError) -> StoreError {
+    match err {
+        StoreError::NotFound => StoreError::NotFound,
+        StoreError::AlreadyExists => StoreError::AlreadyExists,
+        StoreError::PreconditionFailed => StoreError::PreconditionFailed,
+        StoreError::AccessDenied(msg) => StoreError::AccessDenied(msg.clone()),
+        StoreError::Throttled { retry_after_ms } => StoreError::Throttled {
+            retry_after_ms: *retry_after_ms,
+        },
+        StoreError::Timeout => StoreError::Timeout,
+        StoreError::Corrupted(msg) => StoreError::Corrupted(msg.clone()),
+        StoreError::InvalidRange(msg) => StoreError::InvalidRange(msg.clone()),
+        StoreError::Transient(msg) => StoreError::Transient(msg.clone()),
+        StoreError::Permanent(msg) => StoreError::Permanent(msg.clone()),
+    }
+}
+
 /// Listing-based catalog over an object store backend (Phase 1, ADR-0003).
 /// A future compaction phase folds commit records into immutable snapshot
 /// objects behind a CAS'd HEAD pointer; this type's public API does not
@@ -81,14 +143,22 @@ pub struct Catalog {
     head_cache: HeadCache,
     part_cache: PartCache,
     postings_cache: PostingsCache,
-    /// The RAM byte cache (ADR-0046 decisions 1-2): raw bytes of
-    /// content-addressed objects (snapshot parts, postings), keyed by
+    /// The byte cache (ADR-0046 decisions 1-3): raw bytes of content-addressed
+    /// objects (snapshot parts, postings), keyed by
     /// `(tenant_hash, content_hash, offset, len)`, consulted at
-    /// [`Catalog::fetch_content_addressed`] before a store GET. `E` is
-    /// `Infallible` because this cache is never used through
-    /// `get_or_fetch`: every call site here does its own plain
-    /// get-then-insert, mirroring the five decoded caches' idiom, so no
-    /// upstream fetch-closure error type is ever constructed.
+    /// [`Catalog::fetch_content_addressed`] before a store GET. See
+    /// [`ByteCache`] for the two tier configurations. [`Catalog::new`] always
+    /// builds the RAM-only [`ByteCache::Ram`] variant; a disk tier
+    /// ([`ByteCache::Tiered`]) is attached separately (#97, and this crate's
+    /// tests). The RAM path is still the plain get-then-insert idiom the five
+    /// decoded caches use, so nothing about the not-yet-disk-configured path
+    /// changes from before this cache gained a disk tier.
+    ///
+    /// The catalog HEAD is structurally excluded from this cache in both
+    /// variants: `SnapshotHead` carries no content hash, so `read_head` has no
+    /// value to pass `fetch_content_addressed`, the one function that reaches
+    /// the byte cache, and never calls it. HEAD is CAS-written and must never
+    /// be admitted; keeping it out is the type's job, not a rule's.
     ///
     /// `None` when [`CatalogConfig::byte_cache_max_bytes`] is `0`: the byte
     /// cache is then absent entirely (not a zero-capacity cache), so
@@ -97,7 +167,7 @@ pub struct Catalog {
     /// a build with no byte-cache wiring would. This is how the server's
     /// `--disable-cache` disables the catalog byte cache alongside the fetcher
     /// cache.
-    byte_cache: Option<Cache<std::convert::Infallible>>,
+    byte_cache: Option<ByteCache>,
     /// Count of unlisted L0 records observed postdating a compaction record
     /// in their bucket (docs/catalog-and-mvcc.md step 3: an interlock
     /// breach, since a flush should have sealed before compaction ran). The
@@ -173,11 +243,11 @@ impl Catalog {
         // byte-cache accounting, byte-for-byte a build with no byte-cache
         // wiring. Any other value builds the cache at the configured limits.
         let byte_cache = (config.byte_cache_max_bytes != 0).then(|| {
-            Cache::new(CacheLimits::new(
+            ByteCache::Ram(Cache::new(CacheLimits::new(
                 config.byte_cache_max_bytes,
                 config.byte_cache_max_entries,
                 config.byte_cache_max_entry_bytes,
-            ))
+            )))
         });
         Ok(Catalog {
             store,
@@ -359,15 +429,59 @@ impl Catalog {
                 .data);
         };
         let cache_key = CacheKey::new(tenant.0, content_hash, 0, size);
-        if let Some(bytes) = byte_cache.get(&cache_key) {
-            accounting.record_cache_hit();
-            accounting.add_cache_bytes(bytes.len() as u64);
-            return Ok(bytes);
+        match byte_cache {
+            // RAM tier only: the plain get-then-insert path, unchanged. Its own
+            // hit/miss accounting brackets the store GET exactly as before.
+            ByteCache::Ram(ram) => {
+                if let Some(bytes) = ram.get(&cache_key) {
+                    accounting.record_cache_hit();
+                    accounting.add_cache_bytes(bytes.len() as u64);
+                    return Ok(bytes);
+                }
+                accounting.record_cache_miss();
+                let got = self.guarded_get(key, GetRange::Full, accounting).await?;
+                ram.insert(cache_key, got.data.clone());
+                Ok(got.data)
+            }
+            // RAM over disk: read through `get_or_fetch`. The upstream fetch is
+            // the same `guarded_get` the RAM path runs on a miss, moved into the
+            // single-flight closure so only one leader fetches a given key even
+            // when both tiers miss concurrently (ADR-0046 decision 5). The
+            // returned [`Source`] says whether a tier served the bytes (a hit,
+            // possibly disk-served) or the closure fetched them (a miss), so the
+            // same hit/miss accounting the RAM path records is preserved.
+            //
+            // The closure threads `Arc<StoreError>` (the single-flight requires
+            // a `Clone` error); the owned `StoreError` callers match on is
+            // reconstructed on the way out. `SingleFlightError::LeaderLost` --
+            // the leader's future was dropped or panicked before producing a
+            // result -- surfaces as a retryable transient, never a wrong result.
+            ByteCache::Tiered(tiered) => {
+                let (bytes, source) = tiered
+                    .get_or_fetch(cache_key, move || async move {
+                        let got = self
+                            .guarded_get(key, GetRange::Full, accounting)
+                            .await
+                            .map_err(Arc::new)?;
+                        Ok(got.data)
+                    })
+                    .await
+                    .map_err(|err| match err {
+                        SingleFlightError::Upstream(store_err) => clone_store_error(&store_err),
+                        SingleFlightError::LeaderLost => StoreError::Transient(
+                            "byte cache single-flight leader lost".to_string(),
+                        ),
+                    })?;
+                match source {
+                    Source::Cache => {
+                        accounting.record_cache_hit();
+                        accounting.add_cache_bytes(bytes.len() as u64);
+                    }
+                    Source::Upstream => accounting.record_cache_miss(),
+                }
+                Ok(bytes)
+            }
         }
-        accounting.record_cache_miss();
-        let got = self.guarded_get(key, GetRange::Full, accounting).await?;
-        byte_cache.insert(cache_key, got.data.clone());
-        Ok(got.data)
     }
 
     /// Prefix listing bounded by the same in-flight semaphore, draining every
@@ -584,22 +698,51 @@ impl Catalog {
     /// `--disable-cache` process renders no catalog cache family at all, the
     /// same absence a disabled fetcher cache produces.
     pub fn byte_cache_metrics(&self) -> Option<Arc<ravel_cache::CacheMetrics>> {
-        self.byte_cache.as_ref().map(|cache| cache.metrics())
+        self.byte_cache.as_ref().map(|cache| match cache {
+            ByteCache::Ram(ram) => ram.metrics(),
+            // The RAM tier's counters, the ones ADR-0046's hit/miss/byte SLIs
+            // read; the disk tier keeps its own separate counters.
+            ByteCache::Tiered(tiered) => tiered.ram_metrics(),
+        })
     }
 
     /// `pub(crate)`: exposed for `cache`'s own tests to inspect and seed the
-    /// byte cache directly (ADR-0046). Not used by `snapshot_resolve`, which
+    /// RAM byte cache directly (ADR-0046). Not used by `snapshot_resolve`, which
     /// only ever reaches the byte cache through
     /// [`Catalog::fetch_content_addressed`] -- hence `cfg(test)`, since no
     /// production code path needs this accessor. Panics if the byte cache is
     /// disabled; every caller builds a config with a non-zero byte-cache
     /// budget, so a `None` here is a test-setup bug, not a runtime state.
+    ///
+    /// RAM-only: it returns the [`ByteCache::Ram`] tier's `Cache`, the only
+    /// variant [`Catalog::new`] builds. A test that attaches a disk tier holds
+    /// the [`TieredCache`] it injected and asserts on that directly, so this
+    /// panics rather than pretend a disk-backed cache is a bare `Cache`.
     #[cfg(test)]
     #[allow(clippy::expect_used)]
     pub(crate) fn byte_cache(&self) -> &Cache<std::convert::Infallible> {
-        self.byte_cache
+        match self
+            .byte_cache
             .as_ref()
             .expect("byte_cache() called on a catalog built with the byte cache disabled")
+        {
+            ByteCache::Ram(ram) => ram,
+            ByteCache::Tiered(_) => {
+                panic!("byte_cache() is RAM-only; a tiered byte cache is asserted on directly")
+            }
+        }
+    }
+
+    /// `#[cfg(test)]`: replace the byte cache with a disk-backed
+    /// [`TieredCache`], for the acceptance test that proves a corrupt
+    /// disk-served hit falls back through this crate's read funnel exactly as a
+    /// corrupt store read does (ADR-0046 decision 4). Production attaches a disk
+    /// tier through its own wiring (#97); this is the in-test equivalent, which
+    /// is why the disk tier need not be reachable from the server yet for the
+    /// funnel to already handle it correctly.
+    #[cfg(test)]
+    pub(crate) fn set_tiered_byte_cache_for_test(&mut self, tiered: TieredCache<Arc<StoreError>>) {
+        self.byte_cache = Some(ByteCache::Tiered(tiered));
     }
 
     /// Resolve a query-time snapshot (docs/catalog-and-mvcc.md "Snapshot
@@ -2758,6 +2901,140 @@ mod tests {
         );
         assert_eq!(seg.shard, 0);
         assert_eq!(seg.content_hash.to_vec(), record.content_hash);
+    }
+
+    /// ADR-0046 decision 4, the disk-tier half of the acceptance gate: a
+    /// byte-cache hit served from the local disk tier that comes back corrupted
+    /// must fall back through this crate's read funnel exactly as a corrupt
+    /// store read does -- a typed degrade to full listing, never a wrong result
+    /// (compare `snapshot_resolve.rs`'s `corrupt_part_falls_back_to_full_listing`
+    /// and `load_one_part`'s hash-mismatch arm, the fallback precedent this
+    /// mirrors rather than inventing a new one).
+    ///
+    /// The hit is forced to be disk-served specifically: the disk tier is seeded
+    /// with the part's clean bytes while the RAM tier starts empty and in
+    /// corruption mode, so the read falls through RAM into disk, and
+    /// `TieredCache` corrupts the disk-served bytes at serve time. The disk
+    /// tier's own hit counter proves the corrupt bytes came from disk, not from
+    /// an upstream store GET.
+    ///
+    /// FLIP (pre-fix demonstration): in `fetch_content_addressed`, replace the
+    /// `ByteCache::Tiered` arm's `tiered.get_or_fetch(...)` body with a plain
+    /// `self.guarded_get(key, GetRange::Full, accounting).await?.data`, so the
+    /// funnel never consults the tiered cache. The resolve then reads the clean
+    /// part fresh from the store: the disk hit counter does not advance past
+    /// `disk_hits_before` (that assertion fails), and the clean part decodes and
+    /// is promoted into the decoded part cache (the `part_cache().is_none()`
+    /// assertion fails too). Both prove the corrupt disk-served hit only reaches
+    /// the funnel when it routes through the tiered handle.
+    #[tokio::test]
+    async fn corrupt_disk_backed_byte_cache_hit_falls_back_typed() {
+        use ravel_cache::DiskCache;
+
+        let store = Arc::new(MemoryStore::new());
+
+        // A sealed ingest hour so `fold` produces a real, content-addressed
+        // snapshot part (mirrors `fold.rs`/`cache.rs`'s own seal-time math).
+        let hour = 424_242u32;
+        let fold_margin = crate::DEFAULT_MAX_FLUSH_LIFETIME_NS
+            + crate::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS
+            + crate::DEFAULT_FOLD_SAFETY_MARGIN_NS;
+        let now_ns = (i64::from(hour) + 1) * NS_PER_HOUR + fold_margin;
+        let created = now_ns - NS_PER_HOUR;
+        let record = publish_segment(&store, 0, 1, hour, created, created - 1_000, created).await;
+
+        let fold_catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        fold_catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_ns,
+                &[],
+                None,
+            )
+            .await
+            .expect("fold produces a snapshot part");
+
+        // The one folded part's key and its real, clean bytes: the exact object
+        // the resolve path fetches through `fetch_content_addressed`.
+        let part_key = ravel_object_store::list_all(store.as_ref(), "t/")
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|meta| meta.key)
+            .find(|key| key.contains("/snap/"))
+            .expect("fold produced a snapshot part");
+        let part_bytes = store
+            .get(&part_key, GetRange::Full)
+            .await
+            .expect("get part")
+            .data;
+        let content_hash = *blake3::hash(&part_bytes).as_bytes();
+        let cache_key = CacheKey::new(tenant().0, content_hash, 0, part_bytes.len() as u64);
+
+        // Disk tier: seeded with the CLEAN part bytes. RAM tier: empty and in
+        // corruption mode, so any hit it serves -- including a disk hit read
+        // through it -- comes back corrupted (ADR-0046 decision 4). The read
+        // must fall through the empty RAM tier into disk to be served, so the
+        // hit is disk-served by construction.
+        let limits = CacheLimits::new(64 << 20, 10_000, 16 << 20);
+        let disk_dir =
+            std::env::temp_dir().join(format!("ravel-catalog-bytecache-{}", Uuid::new_v4()));
+        let disk = DiskCache::new(disk_dir.clone(), limits);
+        disk.insert(cache_key, part_bytes.as_ref());
+        assert!(
+            disk.get(&cache_key).is_some(),
+            "precondition: the part lives on the disk tier"
+        );
+        let ram: Cache<Arc<StoreError>> = Cache::with_corruption(limits);
+        let tiered = TieredCache::new(ram, disk);
+        let disk_metrics = tiered.disk_metrics();
+
+        // A fresh catalog with an empty decoded PartCache, so `load_one_part`
+        // must consult the byte cache; the disk-backed tiered handle is the byte
+        // cache. Production attaches its disk tier the same way in #97.
+        let mut catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        catalog.set_tiered_byte_cache_for_test(tiered);
+
+        let range = TimeRange {
+            start_ns: i64::from(hour) * NS_PER_HOUR,
+            end_ns: now_ns,
+        };
+        // Baseline the disk hit counter AFTER the precondition `get` above (which
+        // already recorded one hit), so the assertion below proves the resolve
+        // itself drew from disk, not that any read ever did.
+        let disk_hits_before = disk_metrics.snapshot().hits;
+        let snapshot = catalog
+            .resolve(&tenant(), Signal::Metrics, range, &[], now_ns)
+            .await
+            .expect("resolve degrades to listing rather than failing or returning wrong data");
+
+        assert_eq!(
+            snapshot.segments.len(),
+            1,
+            "listing fallback must still find the one published segment"
+        );
+        assert_eq!(
+            snapshot.segments[0].data_object_key,
+            keys::reconstruct_data_key(&record).expect("data key"),
+            "the fallback resolves the real segment, not the corrupted part's contents"
+        );
+        assert!(
+            disk_metrics.snapshot().hits > disk_hits_before,
+            "the resolve's corrupt bytes must have been served from the disk tier through the \
+             funnel, not fetched fresh from the store"
+        );
+        assert!(
+            catalog
+                .part_cache()
+                .get(&tenant(), &part_key, &QueryAccounting::new())
+                .is_none(),
+            "corrupted bytes must never be promoted into the decoded part cache"
+        );
+
+        drop(catalog);
+        let _ = std::fs::remove_dir_all(&disk_dir);
     }
 
     fn synthetic_head(tenant_hash: TenantHash) -> ravel_proto::catalog::v1::SnapshotHead {
