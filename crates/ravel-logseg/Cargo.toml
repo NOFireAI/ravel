@@ -18,6 +18,12 @@ prost = { workspace = true }
 [dev-dependencies]
 proptest = { workspace = true }
 criterion = { workspace = true }
+# Peak-live-bytes measurement for the columnar writer memory test. Pinned to
+# the same 0.1.10 the ravel-sql/ravel-otlp allocation tests already use; the
+# workspace forbids `unsafe_code`, so a hand-rolled counting allocator will not
+# compile and the instrumented global allocator this crate provides is used
+# instead (issue #682).
+stats_alloc = "0.1.10"
 
 [lints]
 workspace = true

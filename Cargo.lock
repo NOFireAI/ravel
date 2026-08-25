@@ -4758,6 +4758,7 @@ dependencies = [
  "ravel-codec",
  "ravel-proto",
  "ravel-types",
+ "stats_alloc",
  "thiserror",
  "zstd",
 ]
