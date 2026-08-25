@@ -22,6 +22,8 @@ pub mod report;
 pub mod section_accounting;
 pub mod segment_support;
 #[cfg(feature = "sql-latency")]
+pub mod spans_scan;
+#[cfg(feature = "sql-latency")]
 pub mod sql_corpus;
 #[cfg(feature = "sql-latency")]
 pub mod sql_latency;
