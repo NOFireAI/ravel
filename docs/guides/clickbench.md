@@ -214,6 +214,20 @@ cargo run -p ravel-bench --features sql-latency --bin sql_latency_bench -- \
   `0`), no cache is attached and the fetcher is byte-for-byte as before. The
   configured budget is recorded in the report's provenance so a table states
   whether a cache was on.
+- `--deadline-secs <N>` is the per-statement wall deadline (default `30`, the
+  budget every run used before the flag existed). At 100M rows the cold
+  `count(*)` alone exceeds 30 s, so a full-size run needs a larger budget; the
+  value is recorded in the report's provenance as `deadline_secs`.
+- `--continue-on-error` records a statement that fails to execute (deadline
+  expiry, `query memory budget exhausted`, a planning error) in the report's
+  `failed` list, with the run index and the error verbatim, and moves on to
+  the next statement. Omitted, the first failure aborts the run with no report
+  at all, which is the right default for a small corpus and the wrong one for
+  a discovery pass over a corpus whose magnitudes are unknown. The process
+  still exits non-zero when `failed` is non-empty, after writing the report,
+  so a partial table cannot pass for a complete one. Pair it with `--runs 1`
+  and a generous `--deadline-secs` for the first pass over a new dataset, then
+  choose the deadline for the `--runs 3` table from what that pass measured.
 - A resolve that finds **0 objects** is now an error naming the tenant, the
   resolved shard count, the window, and `now_ns`, rather than a silent report
   over an empty dataset. A wrong `--window-hours` (the event-time span the
