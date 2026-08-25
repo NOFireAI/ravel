@@ -623,14 +623,15 @@ pub(crate) fn eval_range_call(
     }
 }
 
-/// The counter/gauge type-mismatch warning `irate`/`idelta` over a native-
-/// histogram window raises (Prometheus' `instantValue` histogram branch), or
-/// `None` for any other function or a type-matched pair. Shared by the instant
-/// dispatch ([`append_histogram_over_time`]) and the range dispatch
+/// The type-mismatch warning `irate`/`idelta` over a native-histogram window
+/// raises (Prometheus' `instantValue` histogram branch), or `None` for any
+/// other function or a type-matched pair. Shared by the instant dispatch
+/// ([`append_histogram_over_time`]) and the range dispatch
 /// ([`eval_range_call`]'s `RangeVector` arm) so both endpoints annotate
 /// identically. Only `irate`/`idelta` reach this: every other range-vector
 /// member routes its histogram window through the same
-/// [`over_time::histogram_over_time`] policy without a counter/gauge assumption.
+/// [`over_time::histogram_over_time`] policy without a counter/gauge or
+/// schema-type assumption.
 fn maybe_hist_type_warning(name: &str, hists: &[TimedHistogram]) -> Option<String> {
     let is_rate = match name {
         "irate" => true,
@@ -642,6 +643,9 @@ fn maybe_hist_type_warning(name: &str, hists: &[TimedHistogram]) -> Option<Strin
             Some(rate::native_histogram_not_counter_warning())
         }
         rate::InstantHistTypeWarning::NotGauge => Some(rate::native_histogram_not_gauge_warning()),
+        rate::InstantHistTypeWarning::MixedSchemas => {
+            Some(rate::mixed_exponential_custom_schemas_warning())
+        }
     }
 }
 
