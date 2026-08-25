@@ -58,10 +58,18 @@ pub(crate) enum HistOverTime {
 ///   (Prometheus' `len(s.Floats) + len(s.Histograms)`).
 /// - `last_over_time` returns the newest histogram in the window.
 /// - `present_over_time` is 1 for any non-empty window regardless of type.
+/// - `irate`/`idelta` produce a native-histogram result over a histogram
+///   window (Prometheus' `instantValue` histogram branch, issue #650), via
+///   [`super::rate::instant_value_hist`]; `resets`/`changes` produce a float
+///   count of counter resets / value changes, via
+///   [`super::rate::resets_hist`]/[`super::rate::changes_hist`].
 /// - every other member (`min`/`max`/`stddev`/`stdvar`/`quantile_over_time`,
-///   `predict_linear`, `deriv`, `irate`/`idelta`/`resets`/`changes`) is
-///   float-only in Prometheus and drops the histogram window with no
-///   annotation, per [`HistOverTime::Drop`].
+///   `predict_linear`, `deriv`) is float-only in Prometheus and drops the
+///   histogram window with no annotation, per [`HistOverTime::Drop`]. `deriv`
+///   is included here deliberately: for a pure-histogram window its
+///   `len(Floats) == 0` early return drops with no annotation, so the drop IS
+///   the oracle-faithful behavior (issue #650's `deriv` framing is corrected in
+///   the fix report).
 pub(crate) fn histogram_over_time(name: &str, hists: &[TimedHistogram]) -> HistOverTime {
     match name {
         "sum_over_time" => match sum_histograms(hists.iter().map(|(_, h)| h)) {
@@ -75,6 +83,16 @@ pub(crate) fn histogram_over_time(name: &str, hists: &[TimedHistogram]) -> HistO
         "count_over_time" => HistOverTime::Float(hists.len() as f64),
         "last_over_time" => HistOverTime::Histogram(hists[hists.len() - 1].1.clone()),
         "present_over_time" => HistOverTime::Float(1.0),
+        "irate" => match super::rate::instant_value_hist(hists, true) {
+            Some(h) => HistOverTime::Histogram(h),
+            None => HistOverTime::Drop,
+        },
+        "idelta" => match super::rate::instant_value_hist(hists, false) {
+            Some(h) => HistOverTime::Histogram(h),
+            None => HistOverTime::Drop,
+        },
+        "resets" => HistOverTime::Float(super::rate::resets_hist(hists)),
+        "changes" => HistOverTime::Float(super::rate::changes_hist(hists)),
         _ => HistOverTime::Drop,
     }
 }

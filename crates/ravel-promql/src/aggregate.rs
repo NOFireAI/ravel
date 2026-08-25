@@ -86,6 +86,7 @@ use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL};
 use crate::eval::{
     Error, Evaluator, InstantSample, InstantVector, QueryWindow, Value,
     histogram_ignored_in_aggregation_info, invalid_quantile_warning,
+    mixed_floats_histograms_agg_warning,
 };
 use crate::functions::label::is_valid_label_name;
 use crate::functions::over_time::{kahan_sum_inc, quantile};
@@ -254,8 +255,9 @@ fn eval_plain_aggregate(
 
 /// Reduce one group to its output sample, or `None` to omit the group. `sum`
 /// and `avg` aggregate native histograms when the group holds them; a group
-/// mixing float and histogram members is dropped (Prometheus emits an
-/// "incompatible sample types" annotation and produces no output for it).
+/// mixing float and histogram members is dropped with a warning
+/// (`MixedFloatsHistogramsAggWarning`), matching Prometheus, which produces no
+/// output for such a group.
 /// `min`/`max`/`stddev`/`stdvar` ignore histogram members (float-only
 /// in Prometheus, with an annotation), omitting a group with no float member.
 /// `count` counts every member; `group` is always 1.
@@ -271,7 +273,14 @@ fn reduce_group_samples(
             let (hists, floats): (Vec<InstantSample>, Vec<InstantSample>) =
                 members.into_iter().partition(|s| s.histogram.is_some());
             if !hists.is_empty() && !floats.is_empty() {
-                // Mixed float/histogram group: dropped with an annotation.
+                // Mixed float/histogram group: Prometheus cannot combine the two
+                // types and drops the group with a warning
+                // (`MixedFloatsHistogramsAggWarning`), never silently (ADR-0108
+                // decision 6a, issue #649). The difftest comparator matches
+                // warning presence, so the drop must be annotated. This is a
+                // warning, distinct from the float-only aggregators' "ignored
+                // histogram" info: the whole group is dropped, not a member.
+                ctx.warn(mixed_floats_histograms_agg_warning());
                 return None;
             }
             if !hists.is_empty() {
