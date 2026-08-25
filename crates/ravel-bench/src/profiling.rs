@@ -75,6 +75,45 @@
 //! run are unusable anyway (see the section above), so the extra runs buy the
 //! profile nothing while adding the exposure that risks the crash. Take latency
 //! from a separate unprofiled multi-run pass.
+//!
+//! # Concurrent-query segfault and the query-lane sampling rate (issue #680)
+//!
+//! The same hazard fires without repeated runs once the measured region goes
+//! concurrent. On 2026-08-25 `sql_latency_bench` with `RAVEL_BENCH_PROFILE_SVG`
+//! set died with exit 139 (SIGSEGV, no Rust panic) after 42 s, the first time
+//! the logs scan lane ran eight segment prunes and eight scan partitions at
+//! once; the same sampler had survived a 600 s run while the plan phase was
+//! sequential, and the unprofiled run is fine. The mechanism is unchanged: each
+//! `SIGPROF` unwind goes through libgcc's async-signal-unsafe path, and the
+//! crash probability scales with the number of unwinds landing in the unsafe
+//! window per unit of wall-clock. Concurrency multiplies that count without
+//! multiplying the guard's lifetime, which is why sequential runs at the same
+//! sampling rate survived.
+//!
+//! The fix lowers the sampling frequency for the query lanes only, from 997 Hz
+//! to 199 Hz (`QUERY_SAMPLE_HZ`). This is the lever pprof's own documentation
+//! makes available: the signal frequency directly sets how many unsafe unwinds
+//! occur per second of on-CPU time, so cutting it about fivefold cuts the
+//! exposure by the same factor, while 199 Hz (still twice pprof's default of
+//! 99 Hz) keeps the flamegraph dense. The ingest lane keeps 997 Hz because its
+//! measured region was sequential when the crash was observed.
+//!
+//! Two heavier options were considered and rejected for this task. Switching
+//! pprof to its `frame-pointer` unwinder would sidestep libgcc entirely, but
+//! pprof's README documents that unwinder as nightly-only, requiring
+//! `cargo +nightly -Z build-std` to rebuild the standard library with correct
+//! frame pointers, and even then "it's also not possible to ensure the safety
+//! [...] the program will panic" on a bad frame pointer. That needs a
+//! `.cargo/config` and toolchain change outside this crate, and pprof does not
+//! document it as signal-safe, so it is not adopted here. Widening the blocklist
+//! only suppresses samples whose interrupted instruction pointer already sits in
+//! a blocklisted segment; it cannot suppress a fault while unwinding out of
+//! application code, and the crash produced no Rust stack to point at new
+//! libraries to add.
+//!
+//! When a flamegraph is needed for a workload that still faults under sampling,
+//! `perf record --call-graph dwarf` on the host is the fallback: it unwinds out
+//! of process and does not run inside the target's signal handler.
 
 /// Environment variable naming the flamegraph SVG output path. When it is set
 /// and the crate was built with the `profiling` feature, a bench core wraps its
@@ -82,16 +121,39 @@
 /// it is unset, no profiler is started even when the feature is compiled in.
 pub const PROFILE_ENV: &str = "RAVEL_BENCH_PROFILE_SVG";
 
-/// Sampling frequency in Hz. 997 (a prime near 1 kHz) avoids aliasing against
-/// any periodic timer in the workload.
+/// Sampling frequency in Hz for the ingest lane. 997 (a prime near 1 kHz)
+/// avoids aliasing against any periodic timer in the workload.
 #[cfg(feature = "profiling")]
 const SAMPLE_HZ: std::os::raw::c_int = 997;
+
+/// Sampling frequency in Hz for the query lanes (`sql_latency_bench`,
+/// `query_latency_bench`). Deliberately lower than the ingest lane; see the
+/// "Concurrent-query segfault" section of the module doc (issue #680). 199 is a
+/// prime near 200 Hz and still twice pprof's own default frequency of 99 Hz, so
+/// the flamegraph stays dense while the count of async-signal-unsafe unwinds per
+/// second of on-CPU time drops about fivefold.
+#[cfg(feature = "profiling")]
+const QUERY_SAMPLE_HZ: std::os::raw::c_int = 199;
 
 #[cfg(feature = "profiling")]
 mod imp {
     use std::path::PathBuf;
 
-    use super::{PROFILE_ENV, SAMPLE_HZ};
+    use super::{PROFILE_ENV, QUERY_SAMPLE_HZ, SAMPLE_HZ};
+
+    /// The query lanes run their statements across many worker threads
+    /// concurrently, and each `SIGPROF` tick unwinds through libgcc, which is
+    /// not async-signal-safe, so more concurrent unwinds per second of
+    /// wall-clock raise the odds of a fault (issue #680). Sample those lanes
+    /// slower. The ingest lane, whose measured region was sequential when the
+    /// crash was observed, keeps the higher rate.
+    fn sample_hz_for(label: &str) -> std::os::raw::c_int {
+        if label.contains("sql") || label.contains("query") {
+            QUERY_SAMPLE_HZ
+        } else {
+            SAMPLE_HZ
+        }
+    }
 
     /// An active (or inert) profiling session. Created via
     /// [`ProfileSession::from_env`] or [`ProfileSession::to_path`]; call
@@ -132,13 +194,14 @@ mod imp {
         /// environment. Used by the crate's own test and by any caller that has
         /// already resolved an output path.
         pub fn to_path(label: &str, path: PathBuf) -> Self {
+            let hz = sample_hz_for(label);
             match pprof::ProfilerGuardBuilder::default()
-                .frequency(SAMPLE_HZ)
+                .frequency(hz)
                 .blocklist(&["libc", "libgcc", "pthread", "vdso"])
                 .build()
             {
                 Ok(guard) => {
-                    eprintln!("profiling: sampling '{label}' at {SAMPLE_HZ} Hz");
+                    eprintln!("profiling: sampling '{label}' at {hz} Hz");
                     ProfileSession {
                         active: Some(Active {
                             guard,

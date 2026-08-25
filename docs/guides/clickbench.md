@@ -298,6 +298,17 @@ sampler and not usable anyway. Take latency from a separate unprofiled `--runs
 3` pass, and read the flamegraph for CPU attribution only. See
 `crates/ravel-bench/src/profiling.rs` for the mechanism.
 
+The same signal-safety hazard also fired once the corpus's logs scan lane ran
+its segment prunes and scan partitions concurrently, segfaulting even at
+`--runs 1` (issue #680). To keep the exposure down, the query lanes
+(`sql_latency_bench`, `query_latency_bench`) now sample at 199 Hz rather than
+the ingest lane's 997 Hz; this is the configuration the in-process sampler is
+known to survive on the ClickBench corpus. It is still a probabilistic hazard,
+not a proof of safety: if a profiled query run faults on your host, do not raise
+the rate. Fall back to `perf record --call-graph dwarf` on the box, which
+unwinds out of process instead of inside the target's signal handler; the load
+and query flamegraphs on issue #680 were produced that way.
+
 ### How to read the report
 
 The bench prints the full report as JSON, then a human table. Per statement:
