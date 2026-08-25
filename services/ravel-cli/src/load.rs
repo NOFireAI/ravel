@@ -32,7 +32,8 @@ use ravel_catalog::{AbsentPolicy, validate_or_adopt};
 #[cfg(feature = "stage-timing")]
 use ravel_ingest::LogStageSnapshot;
 use ravel_ingest::{
-    Clock, IngestConfig, LogIngestMetricsSnapshot, LogIngestRouter, SystemClock, WriteMode,
+    Clock, IngestConfig, LogIngestMetricsSnapshot, LogIngestRouter, LogWriteError, LogWriteReceipt,
+    SystemClock, WriteMode,
 };
 use ravel_logseg::{
     Bitmap, ColumnarLogBatch, DynColumn, FieldType, StrColumnDict, stream_attrs_bytes,
@@ -258,6 +259,7 @@ pub async fn run(
     shards: u32,
     batch_rows: usize,
     read_cursors: Option<usize>,
+    pipeline_depth: usize,
     now_ns: i64,
 ) -> anyhow::Result<()> {
     run_warning_to(
@@ -268,6 +270,7 @@ pub async fn run(
         shards,
         batch_rows,
         read_cursors,
+        pipeline_depth,
         now_ns,
         &mut std::io::stderr(),
     )
@@ -290,6 +293,7 @@ pub(crate) async fn run_warning_to(
     shards: u32,
     batch_rows: usize,
     read_cursors: Option<usize>,
+    pipeline_depth: usize,
     now_ns: i64,
     warnings: &mut dyn std::io::Write,
 ) -> anyhow::Result<()> {
@@ -309,6 +313,7 @@ pub(crate) async fn run_warning_to(
         shards,
         batch_rows,
         read_cursors,
+        pipeline_depth,
         now_ns,
         Arc::new(SystemClock),
     )
@@ -556,6 +561,7 @@ pub async fn load(
     shards: u32,
     batch_rows: usize,
     read_cursors: Option<usize>,
+    pipeline_depth: usize,
     now_ns: i64,
     clock: Arc<dyn Clock>,
 ) -> Result<LoadReport, LoadError> {
@@ -567,6 +573,7 @@ pub async fn load(
         shards,
         batch_rows,
         read_cursors,
+        pipeline_depth,
         now_ns,
         clock,
         LoadPath::Columnar,
@@ -594,6 +601,7 @@ async fn load_instrumented(
     shards: u32,
     batch_rows: usize,
     read_cursors: Option<usize>,
+    pipeline_depth: usize,
     now_ns: i64,
     clock: Arc<dyn Clock>,
     path: LoadPath,
@@ -606,6 +614,17 @@ async fn load_instrumented(
         return Err(LoadError::Setup(
             "--batch-rows must be at least 1 (each batch is one Strict flush per shard); 0 was \
              given"
+                .to_string(),
+        ));
+    }
+    // Same shape as the `batch_rows == 0` guard above: `--pipeline-depth` is the
+    // operator-facing lever bounding how many writes are in flight at once, so 0
+    // (a pipeline that can hold no write) is a rejected value, not a silent
+    // clamp to 1.
+    if pipeline_depth == 0 {
+        return Err(LoadError::Setup(
+            "--pipeline-depth must be at least 1 (the number of concurrent in-flight writes); 0 \
+             was given"
                 .to_string(),
         ));
     }
@@ -648,7 +667,12 @@ async fn load_instrumented(
     // one object per batch, `batch_rows` controls its size, and every write's
     // ack is durable with no lingering buffer. It also keeps flush timing off
     // the wall clock, so the object buckets by the flush-open reading directly.
-    let router = LogIngestRouter::new(
+    // `Arc` so each batch's write can be `tokio::spawn`ed onto its own task and
+    // run genuinely concurrently up to `pipeline_depth` (a constructed-but-
+    // unawaited future does no I/O until polled; spawning is what makes the S3
+    // PUT round trips overlap). `write`/`write_columnar` take `&self`, so this
+    // is the only change the router's own type needs.
+    let router = Arc::new(LogIngestRouter::new(
         IngestConfig {
             shard_count: shards,
             target_bytes: 1,
@@ -656,7 +680,7 @@ async fn load_instrumented(
         },
         Arc::clone(&store),
         clock,
-    );
+    ));
 
     let row_group_lens = row_group_row_counts(parquet_path)?;
     let cursor_count = resolve_read_cursors(read_cursors, shards, row_group_lens.len());
@@ -667,21 +691,34 @@ async fn load_instrumented(
     let mut shards_seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let mut data_batches_flushed: u64 = 0;
 
-    // Single-batch lookahead (issue #541). Batch N+1's decode/build (sync
-    // Parquet decode via `Iterator::next`, then the per-row `build_record`
-    // loop, both CPU-bound) runs on a `spawn_blocking` task started *before*
-    // batch N's `router.write` I/O is awaited, so N+1's CPU work overlaps N's
-    // I/O wait. The non-`Clone` `ParquetRecordBatchReader` is shuttled into and
-    // back out of the closure each iteration.
+    // The window of writes genuinely in flight, oldest (earliest-submitted)
+    // first. Bounded to `pipeline_depth`: after a new write is spawned, if the
+    // window is full the front (oldest) is popped and awaited before the next
+    // batch's write starts. Popping strictly oldest-first is what preserves the
+    // former loop's exact result ordering (same tokens, same first error) no
+    // matter which underlying PUT actually completes first.
+    let mut inflight: std::collections::VecDeque<(
+        u64,
+        tokio::task::JoinHandle<Result<LogWriteReceipt, LogWriteError>>,
+    )> = std::collections::VecDeque::with_capacity(pipeline_depth);
+
+    // Single-batch decode/build lookahead (issue #541), independent of the write
+    // window above. Batch N+1's decode/build (sync Parquet decode via
+    // `Iterator::next`, then the per-row `build_record` loop, both CPU-bound)
+    // runs on a `spawn_blocking` task started *before* batch N's write I/O is
+    // awaited, so N+1's CPU work overlaps the writes' I/O wait. The non-`Clone`
+    // `ParquetRecordBatchReader` is shuttled into and back out of the closure
+    // each iteration.
     //
-    // The loop stays sequential in every observable way: exactly one
-    // `router.write` is awaited at a time, N+1's decode is never started before
-    // N's has been consumed, and results are consumed in the same order as the
-    // former serial loop. In particular a build error for batch N+1 (discovered
-    // while N's write is still in flight) is only inspected after N's write
-    // result has been handled, so it surfaces in the same order and with the
-    // same `durable` tokens (those from batches strictly before it) as before;
-    // the prefetch changes only *when* (wall-clock) the decode/build happens.
+    // Result ordering stays strict-FIFO regardless of `pipeline_depth`: writes
+    // are recorded (and a write failure surfaced) only by consuming `inflight`
+    // oldest-first, so `report.tokens` grows in submission order, and a build
+    // error for a later batch is only reported after every earlier batch's write
+    // has been drained from the window. At `pipeline_depth == 1` the window
+    // holds at most one write, popped and awaited before the next batch's write
+    // starts, so the observable results and ordering match the pre-widening loop
+    // exactly (only the execution shape differs: the write now runs on a spawned
+    // task rather than inline).
     let mapping = Arc::new(mapping.clone());
     let state = StrideCursors {
         cursors,
@@ -716,8 +753,19 @@ async fn load_instrumented(
         let (state, built) = match pending.await {
             Ok(pair) => pair,
             // A panic in the decode/build task is a batch decode failure;
-            // earlier batches may already be durable.
+            // earlier batches' writes may still be in flight, so drain them
+            // first (oldest-first) so any already-durable earlier batch is
+            // reported and any earlier write failure surfaces ahead of this one,
+            // exactly as the former serial loop ordered them.
             Err(join_err) => {
+                drain_inflight(
+                    &mut inflight,
+                    &mut report,
+                    &mut shards_seen,
+                    &mut data_batches_flushed,
+                    shards,
+                )
+                .await?;
                 return Err(LoadError::BatchFailed {
                     reason: format!("Parquet decode/build task failed: {join_err}"),
                     durable: report.tokens.clone(),
@@ -728,12 +776,28 @@ async fn load_instrumented(
         let built = match built {
             Prefetched::Done => break,
             Prefetched::BatchFailed { reason } => {
+                drain_inflight(
+                    &mut inflight,
+                    &mut report,
+                    &mut shards_seen,
+                    &mut data_batches_flushed,
+                    shards,
+                )
+                .await?;
                 return Err(LoadError::BatchFailed {
                     reason,
                     durable: report.tokens.clone(),
                 });
             }
             Prefetched::RowRejected { row, reason } => {
+                drain_inflight(
+                    &mut inflight,
+                    &mut report,
+                    &mut shards_seen,
+                    &mut data_batches_flushed,
+                    shards,
+                )
+                .await?;
                 return Err(LoadError::RowRejected {
                     row,
                     reason,
@@ -750,59 +814,82 @@ async fn load_instrumented(
             continue;
         }
 
-        // Start (but do not yet await) this batch's write, then spawn the next
-        // batch's decode/build so its CPU work overlaps this write's I/O wait.
-        // Building the future does no work; the write begins when it is awaited
-        // below, by which point the prefetch task is already running. Both paths
-        // await exactly one write at a time, so the pipeline stays sequential in
-        // every observable way regardless of which path built the batch.
-        let receipt = match built {
+        // Spawn this batch's write onto its own task so it runs concurrently
+        // with the writes already in flight and with the next batch's
+        // decode/build, then prefetch that next batch. A `tokio::spawn`ed write
+        // begins executing immediately; a merely-constructed future would do no
+        // I/O until polled, which is why the window is built from join handles,
+        // not from unpolled futures.
+        let handle = match built {
             Built::Row(records) => {
-                let write_fut = router.write(
-                    tenant_id.clone(),
-                    records,
-                    WriteMode::Strict,
-                    WRITE_ACK_DEADLINE,
-                );
-                pending = spawn_build(state);
-                write_fut.await
+                let router = Arc::clone(&router);
+                let tenant = tenant_id.clone();
+                tokio::spawn(async move {
+                    router
+                        .write(tenant, records, WriteMode::Strict, WRITE_ACK_DEADLINE)
+                        .await
+                })
             }
             Built::Columnar(batch) => {
                 // Reachability signal (ADR-0109): count each batch actually
                 // driven through `write_columnar`, so a caller of the real entry
                 // point can prove the columnar path ran.
                 report.columnar_batches_built += 1;
-                let write_fut = router.write_columnar(
-                    tenant_id.clone(),
-                    *batch,
-                    WriteMode::Strict,
-                    WRITE_ACK_DEADLINE,
-                );
-                pending = spawn_build(state);
-                write_fut.await
+                let router = Arc::clone(&router);
+                let tenant = tenant_id.clone();
+                tokio::spawn(async move {
+                    router
+                        .write_columnar(tenant, *batch, WriteMode::Strict, WRITE_ACK_DEADLINE)
+                        .await
+                })
             }
         };
+        inflight.push_back((n, handle));
+        pending = spawn_build(state);
 
-        let receipt = receipt.map_err(|e| {
-            // Earlier batches are already durable; append this batch's own
-            // durably-acked shards, which `LogWriteError::durable_tokens`
-            // recovers from a multi-shard partial failure (issue #296).
-            let mut durable = report.tokens.clone();
-            durable.extend_from_slice(e.durable_tokens());
-            LoadError::Flush {
-                durable,
-                cause: e.to_string(),
+        // Bound true concurrency to `pipeline_depth`: once the window is full,
+        // resolve the oldest write before starting the next batch's write. This
+        // is the only place `report.tokens` grows during the loop, and it grows
+        // strictly oldest-first, so a later batch's write finishing early can
+        // never record its token ahead of an earlier one (or ahead of an earlier
+        // failure). On a write error, abort every still-queued write so an
+        // already-spawned later batch cannot keep running in the background past
+        // the failure the loader is about to return.
+        // Only one write is spawned per iteration, so the window exceeds its
+        // bound by at most one and this resolves exactly one oldest entry; the
+        // `while` + `let`-else form avoids unwrapping a `pop_front` that is
+        // always `Some` here (the bound is >= 1).
+        while inflight.len() >= pipeline_depth {
+            let Some(entry) = inflight.pop_front() else {
+                break;
+            };
+            if let Err(e) = resolve_write_entry(
+                entry,
+                &mut report,
+                &mut shards_seen,
+                &mut data_batches_flushed,
+                shards,
+            )
+            .await
+            {
+                for (_, handle) in inflight.drain(..) {
+                    handle.abort();
+                }
+                return Err(e);
             }
-        })?;
-        report.rows_processed += n;
-        shards_seen.extend(receipt.tokens.iter().map(|t| t.shard));
-        report.tokens.extend(receipt.tokens);
-
-        data_batches_flushed += 1;
-        if data_batches_flushed == SKEW_CHECK_AFTER_BATCHES && report.skew_warning.is_none() {
-            report.skew_warning = shard_skew_warning(shards_seen.len(), shards);
         }
     }
+
+    // The stream is exhausted; drain every write still in the window in the same
+    // oldest-first order before reporting success.
+    drain_inflight(
+        &mut inflight,
+        &mut report,
+        &mut shards_seen,
+        &mut data_batches_flushed,
+        shards,
+    )
+    .await?;
 
     // Strict acks already guarantee durability; flush_all is a defensive
     // no-op here (nothing is buffered after a Strict write returns).
@@ -818,6 +905,86 @@ async fn load_instrumented(
     }
     report.elapsed = started.elapsed();
     Ok(report)
+}
+
+/// Await one popped in-flight write and fold its outcome into the report, or
+/// turn its failure into a [`LoadError::Flush`]. Entries are always resolved
+/// oldest-first, so `report.tokens` (and the skew-warning checkpoint) advance in
+/// strict submission order: this is the only place the loop records a write's
+/// tokens.
+///
+/// On the write's own error, `durable` is `report.tokens` as it stands at this
+/// point (every batch strictly before this one, already recorded oldest-first)
+/// plus this batch's own durably-acked shards recovered from
+/// `LogWriteError::durable_tokens` (issue #296, a multi-shard write can
+/// partially succeed). A `JoinError` (the spawned write task panicked or was
+/// aborted) is itself a flush failure: it maps to [`LoadError::Flush`] with the
+/// tokens durable up to this point, never to a batch-build error.
+async fn resolve_write_entry(
+    entry: (
+        u64,
+        tokio::task::JoinHandle<Result<LogWriteReceipt, LogWriteError>>,
+    ),
+    report: &mut LoadReport,
+    shards_seen: &mut std::collections::HashSet<u32>,
+    data_batches_flushed: &mut u64,
+    shards: u32,
+) -> Result<(), LoadError> {
+    let (n, handle) = entry;
+    let receipt = match handle.await {
+        Ok(Ok(receipt)) => receipt,
+        Ok(Err(e)) => {
+            let mut durable = report.tokens.clone();
+            durable.extend_from_slice(e.durable_tokens());
+            return Err(LoadError::Flush {
+                durable,
+                cause: e.to_string(),
+            });
+        }
+        Err(join_err) => {
+            return Err(LoadError::Flush {
+                durable: report.tokens.clone(),
+                cause: format!("write task failed: {join_err}"),
+            });
+        }
+    };
+    report.rows_processed += n;
+    shards_seen.extend(receipt.tokens.iter().map(|t| t.shard));
+    report.tokens.extend(receipt.tokens);
+
+    *data_batches_flushed += 1;
+    if *data_batches_flushed == SKEW_CHECK_AFTER_BATCHES && report.skew_warning.is_none() {
+        report.skew_warning = shard_skew_warning(shards_seen.len(), shards);
+    }
+    Ok(())
+}
+
+/// Resolve every write still in the window, oldest-first. On the first write
+/// error it aborts every remaining (later) write before returning, so no
+/// already-spawned batch after the failure keeps running in the background once
+/// the loader has decided to fail: a detached `tokio::spawn`'d task is not
+/// cancelled by dropping its handle.
+async fn drain_inflight(
+    inflight: &mut std::collections::VecDeque<(
+        u64,
+        tokio::task::JoinHandle<Result<LogWriteReceipt, LogWriteError>>,
+    )>,
+    report: &mut LoadReport,
+    shards_seen: &mut std::collections::HashSet<u32>,
+    data_batches_flushed: &mut u64,
+    shards: u32,
+) -> Result<(), LoadError> {
+    while let Some(entry) = inflight.pop_front() {
+        if let Err(e) =
+            resolve_write_entry(entry, report, shards_seen, data_batches_flushed, shards).await
+        {
+            for (_, handle) in inflight.drain(..) {
+                handle.abort();
+            }
+            return Err(e);
+        }
+    }
+    Ok(())
 }
 
 /// The Parquet reader shuttled through each stride cursor's decode/build task.
@@ -2770,6 +2937,7 @@ type = "i64"
             4,
             10_000,
             None,
+            1,
             NOW_NS,
             Arc::new(FixedClock(NOW_NS)),
         )
@@ -2886,6 +3054,7 @@ type = "i64"
             4,
             10_000,
             None,
+            1,
             NOW_NS,
             &mut sink,
         )
@@ -2973,6 +3142,7 @@ type = "i64"
             4,
             0,
             None,
+            1,
             NOW_NS,
             Arc::new(FixedClock(NOW_NS)),
         )
@@ -3004,6 +3174,7 @@ type = "i64"
             4,
             10,
             Some(0),
+            1,
             NOW_NS,
             Arc::new(FixedClock(NOW_NS)),
         )
@@ -3112,6 +3283,7 @@ type = "i64"
             // Both rows in one batch, so one Strict write spans both shards.
             10,
             None,
+            1,
             NOW_NS,
             Arc::new(FixedClock(NOW_NS)),
         )
@@ -3291,6 +3463,7 @@ type = "i64"
             1,
             2,
             None,
+            1,
             NOW_NS,
             Arc::new(FixedClock(NOW_NS)),
             LoadPath::Columnar,
@@ -3378,6 +3551,7 @@ type = "i64"
             4,
             2,
             None,
+            1,
             NOW_NS,
             Arc::new(FixedClock(NOW_NS)),
         )
@@ -3429,6 +3603,7 @@ type = "i64"
             4,
             8,
             Some(4),
+            1,
             NOW_NS,
             Arc::new(FixedClock(NOW_NS)),
         )
@@ -3511,6 +3686,7 @@ type = "i64"
             shards,
             rows_per_group,
             Some(shards as usize),
+            1,
             NOW_NS,
             Arc::new(FixedClock(NOW_NS)),
         )
@@ -3532,6 +3708,7 @@ type = "i64"
             shards,
             rows_per_group,
             Some(1),
+            1,
             NOW_NS,
             Arc::new(FixedClock(NOW_NS)),
         )
@@ -3587,6 +3764,7 @@ type = "i64"
                 4,
                 5,
                 read_cursors,
+                1,
                 NOW_NS,
                 Arc::new(FixedClock(NOW_NS)),
             )
@@ -3666,6 +3844,7 @@ type = "i64"
             shards,
             batch_rows,
             Some(1),
+            1,
             NOW_NS,
             &mut sink,
         )
@@ -3691,6 +3870,7 @@ type = "i64"
             shards,
             batch_rows,
             Some(4),
+            1,
             NOW_NS,
             &mut sink,
         )
@@ -3730,6 +3910,7 @@ type = "i64"
             shards,
             batch_rows,
             Some(1),
+            1,
             NOW_NS,
             &mut sink,
         )
@@ -4049,6 +4230,7 @@ type = "i64"
             shards,
             batch_rows,
             read_cursors,
+            1,
             now_ns,
             clock,
             LoadPath::Row,
@@ -4101,6 +4283,7 @@ type = "i64"
             1,
             2,
             None,
+            1,
             NOW_NS,
             Arc::new(FixedClock(NOW_NS)),
         )
@@ -4137,6 +4320,383 @@ type = "i64"
         assert_eq!(
             report_row.columnar_batches_built, 0,
             "the row path builds no columnar batch"
+        );
+    }
+
+    /// A store wrapper that instruments data-object (`/l0/`) PUTs for the
+    /// `--pipeline-depth` tests: it can sleep a per-key-substring delay before a
+    /// PUT, track the maximum number of data-object PUTs concurrently in flight,
+    /// and count how many PUTs matching a watch prefix started versus completed.
+    /// Non-data PUTs (provisioning record, commit records) pass straight
+    /// through. Every other method delegates unchanged.
+    struct InstrumentedPutStore {
+        inner: Arc<dyn ObjectStoreBackend>,
+        /// `(key substring, delay)`; the first matching entry's delay is applied
+        /// before the PUT reaches `inner`.
+        delays: Vec<(&'static str, Duration)>,
+        /// Data-object PUTs currently sleeping-or-in-`inner`, and the running max.
+        in_flight: Arc<std::sync::atomic::AtomicUsize>,
+        max_in_flight: Arc<std::sync::atomic::AtomicUsize>,
+        /// PUTs whose key contains any of these are counted as started (before
+        /// the delay) and, separately, completed (only on a successful `inner`
+        /// PUT). A `.abort()`ed task never reaches the completion increment.
+        watch_prefixes: Vec<&'static str>,
+        watch_started: Arc<std::sync::atomic::AtomicUsize>,
+        watch_completed: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for InstrumentedPutStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: bytes::Bytes,
+            opts: ravel_object_store::PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, ravel_object_store::StoreError> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let is_data_object = key.contains("/l0/");
+            let watched = self.watch_prefixes.iter().any(|p| key.contains(p));
+            let delay = self
+                .delays
+                .iter()
+                .find(|(p, _)| key.contains(p))
+                .map(|(_, d)| *d);
+            if is_data_object {
+                let now = self.in_flight.fetch_add(1, SeqCst) + 1;
+                self.max_in_flight.fetch_max(now, SeqCst);
+            }
+            if watched {
+                self.watch_started.fetch_add(1, SeqCst);
+            }
+            if let Some(d) = delay {
+                tokio::time::sleep(d).await;
+            }
+            let result = self.inner.put(key, data, opts).await;
+            if is_data_object {
+                self.in_flight.fetch_sub(1, SeqCst);
+            }
+            if watched && result.is_ok() {
+                self.watch_completed.fetch_add(1, SeqCst);
+            }
+            result
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: ravel_object_store::GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, ravel_object_store::StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn put_multipart<'a>(
+            &'a self,
+            key: &str,
+        ) -> Result<Box<dyn ravel_object_store::MultipartUpload + 'a>, ravel_object_store::StoreError>
+        {
+            self.inner.put_multipart(key).await
+        }
+
+        async fn head(
+            &self,
+            key: &str,
+        ) -> Result<ravel_object_store::ObjectMeta, ravel_object_store::StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, ravel_object_store::StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, ravel_object_store::StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), ravel_object_store::StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// `--pipeline-depth` is load-bearing, not accepted-and-ignored: the same
+    /// stream run at depth 1 keeps at most one write outstanding, while at depth
+    /// 3 up to three writes are genuinely in flight at once. Each batch is a
+    /// single row routed to its own shard (so its flush runs on its own shard
+    /// actor, and distinct batches' data-object PUTs can overlap); every
+    /// data-object PUT sleeps 50ms while the store tracks the running maximum of
+    /// concurrently outstanding data-object PUTs. Four rows over four shards
+    /// split into four single-shard batches, submitted in turn.
+    ///
+    /// Non-vacuity (prove-the-test): the depth-1 arm asserts the observed max is
+    /// exactly 1 and the depth-3 arm asserts it reaches 3. An implementation
+    /// that accepted `--pipeline-depth` but still awaited each write inline
+    /// before starting the next (today's behavior) would leave the max at 1 for
+    /// both depths, failing the depth-3 assertion; confirmed by running the same
+    /// body at both depths — `max_d1` is 1 and `max_d3` reaches 3 only because
+    /// the write window is real.
+    #[tokio::test]
+    async fn pipeline_depth_bounds_concurrent_writes() {
+        use parquet::arrow::ArrowWriter;
+        use ravel_object_store::memory::MemoryStore;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        async fn max_concurrent_at_depth(depth: usize) -> usize {
+            let shards = 4u32;
+            // Each batch is one row on its own shard, so its flush runs on a
+            // distinct shard actor and can overlap the others.
+            let hosts: Vec<String> = (0..shards).map(|s| host_for_shard(s, shards)).collect();
+
+            let dir = tempfile::tempdir().expect("tempdir");
+            let pq = dir.path().join("depth.parquet");
+            let cols: Vec<(String, ArrayRef)> = vec![
+                ("ts".to_string(), i64_col(vec![NOW_NS; shards as usize])),
+                ("svc".to_string(), str_col(vec!["api"; shards as usize])),
+                (
+                    "host".to_string(),
+                    str_col(hosts.iter().map(|h| h.as_str()).collect()),
+                ),
+            ];
+            let b = RecordBatch::try_from_iter(cols).expect("record batch");
+            let file = std::fs::File::create(&pq).expect("create parquet");
+            let mut writer = ArrowWriter::try_new(file, b.schema(), None).expect("arrow writer");
+            writer.write(&b).expect("write batch");
+            writer.close().expect("close writer");
+
+            let m = parse_mapping(
+                "ts_column = \"ts\"\nts_unit = \"nanos\"\n\n\
+                 [[resource_attribute]]\nkey = \"service.name\"\ncolumn = \"svc\"\ntype = \"str\"\n\n\
+                 [[resource_attribute]]\nkey = \"host\"\ncolumn = \"host\"\ntype = \"str\"\n",
+            )
+            .expect("valid mapping");
+
+            let max_in_flight = Arc::new(AtomicUsize::new(0));
+            let store = Arc::new(InstrumentedPutStore {
+                inner: Arc::new(MemoryStore::new()),
+                delays: vec![("/l0/", Duration::from_millis(50))],
+                in_flight: Arc::new(AtomicUsize::new(0)),
+                max_in_flight: Arc::clone(&max_in_flight),
+                watch_prefixes: Vec::new(),
+                watch_started: Arc::new(AtomicUsize::new(0)),
+                watch_completed: Arc::new(AtomicUsize::new(0)),
+            });
+
+            let report = load(
+                store as Arc<dyn ObjectStoreBackend>,
+                &pq,
+                "acme",
+                &m,
+                shards,
+                1,
+                None,
+                depth,
+                NOW_NS,
+                Arc::new(FixedClock(NOW_NS)),
+            )
+            .await
+            .expect("the load succeeds");
+            assert_eq!(report.rows_processed, shards as u64, "every row is written");
+            max_in_flight.load(Ordering::SeqCst)
+        }
+
+        let max_d1 = max_concurrent_at_depth(1).await;
+        assert_eq!(
+            max_d1, 1,
+            "at --pipeline-depth 1 exactly one write is ever outstanding (today's behavior), \
+             got {max_d1}"
+        );
+
+        let max_d3 = max_concurrent_at_depth(3).await;
+        assert!(
+            max_d3 >= 3,
+            "at --pipeline-depth 3 the write window reaches three concurrently outstanding PUTs, \
+             got {max_d3}"
+        );
+    }
+
+    /// Durable-token correctness under a partial-window failure (the correctness
+    /// constraint this ticket turns on): with `--pipeline-depth 4` and a stream
+    /// of five single-shard batches, the data PUT for the *middle* batch (index
+    /// 2, shard 2) fails permanently. The batches strictly after it (indices 3
+    /// and 4, shards 3 and 4) have their PUTs held ~1s, so they are provably
+    /// still in flight at the instant the failure is detected, and — because the
+    /// loader routes each batch to its own shard actor and a shard actor's flush
+    /// is downstream of the write future the loader holds — they go on to commit
+    /// their objects *independently* even after the loader aborts their write
+    /// handles. That independent success is exactly the trap: the reported
+    /// durable list must still exclude them.
+    ///
+    /// Asserted: the reported durable list is exactly the tokens of the batches
+    /// strictly before the failing one (shards 0 and 1), in submission order; it
+    /// carries no token for the failing batch (a full single-shard PUT failure
+    /// has no partial survivor) and none for the later batches — even though
+    /// `watch_completed` reaching 2 after the wait proves batches 3 and 4's
+    /// writes did in fact succeed and commit. This is the "even if their own
+    /// write happens to succeed independently" clause made observable: the
+    /// durable list grows only by consuming the queue oldest-first, never by
+    /// whichever write finishes.
+    ///
+    /// Non-vacuity (prove-the-test): a wrong resolver that consumed the window
+    /// via `select_all`/whichever-finishes-first instead of strict FIFO
+    /// pop-front would, on this exact fixture, surface batch 2's *immediate*
+    /// permanent failure before batch 1's *artificially delayed* (~50ms) success
+    /// is ever recorded, returning a durable list missing shard 1 — the
+    /// `durable.len() == 2` / `durable[1].shard == 1` assertions reject that. The
+    /// ordering is deterministic because the FaultStore permanent error returns
+    /// effectively instantly while shard 1's PUT is held ~50ms, so the delayed
+    /// success can never win a race the FIFO resolver does not run. And the
+    /// `watch_started == 2` / `watch_completed == 0` snapshot taken the instant
+    /// `load` returns proves batches 3 and 4 were genuinely still outstanding
+    /// (not merely absent because they never ran), closing the "raced and did not
+    /// finish in time" loophole in the opposite direction: they had started but
+    /// had not committed, yet were correctly excluded, and later completing did
+    /// not resurrect them into the list.
+    #[tokio::test]
+    async fn partial_window_failure_reports_only_earlier_batches_never_later() {
+        use parquet::arrow::ArrowWriter;
+        use ravel_object_store::fault::{
+            FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+        };
+        use ravel_object_store::memory::MemoryStore;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let shards = 5;
+        // One row per batch (batch_rows = 1), each routed to its own shard, so
+        // batch k is the sole write to shard k's `/l0/000k/` object.
+        let hosts: Vec<String> = (0..shards).map(|s| host_for_shard(s, shards)).collect();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pq = dir.path().join("five_batches.parquet");
+        let cols: Vec<(String, ArrayRef)> = vec![
+            ("ts".to_string(), i64_col(vec![NOW_NS; shards as usize])),
+            ("svc".to_string(), str_col(vec!["api"; shards as usize])),
+            (
+                "host".to_string(),
+                str_col(hosts.iter().map(|h| h.as_str()).collect()),
+            ),
+        ];
+        let b = RecordBatch::try_from_iter(cols).expect("five-row batch");
+        let file = std::fs::File::create(&pq).expect("create parquet");
+        let mut writer = ArrowWriter::try_new(file, b.schema(), None).expect("arrow writer");
+        writer.write(&b).expect("write batch");
+        writer.close().expect("close writer");
+
+        let m = parse_mapping(
+            "ts_column = \"ts\"\nts_unit = \"nanos\"\n\n\
+             [[resource_attribute]]\nkey = \"service.name\"\ncolumn = \"svc\"\ntype = \"str\"\n\n\
+             [[resource_attribute]]\nkey = \"host\"\ncolumn = \"host\"\ntype = \"str\"\n",
+        )
+        .expect("valid mapping");
+
+        // Fail the middle batch's (shard 2) data PUT permanently; no retry, no
+        // sibling shard, so no partial survivor.
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Put,
+                ScriptedFault::Permanent("simulated permanent data-object PUT failure".into()),
+            )
+            .with_key_contains("/l0/0002/")
+            .with_occurrence(Occurrence::Always),
+        );
+        let fault = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+
+        let watch_started = Arc::new(AtomicUsize::new(0));
+        let watch_completed = Arc::new(AtomicUsize::new(0));
+        let store = Arc::new(InstrumentedPutStore {
+            inner: fault.clone() as Arc<dyn ObjectStoreBackend>,
+            // Shard 1 (before the failure) is delayed ~50ms so a whichever-
+            // finishes-first resolver would surface shard 2's instant failure
+            // ahead of it; shards 3 and 4 (after the failure) are held ~1s so
+            // they are still in flight at the failure yet commit after the wait.
+            delays: vec![
+                ("/l0/0001/", Duration::from_millis(50)),
+                ("/l0/0003/", Duration::from_millis(1000)),
+                ("/l0/0004/", Duration::from_millis(1000)),
+            ],
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            max_in_flight: Arc::new(AtomicUsize::new(0)),
+            watch_prefixes: vec!["/l0/0003/", "/l0/0004/"],
+            watch_started: Arc::clone(&watch_started),
+            watch_completed: Arc::clone(&watch_completed),
+        });
+
+        let err = load(
+            store as Arc<dyn ObjectStoreBackend>,
+            &pq,
+            "acme",
+            &m,
+            shards,
+            1,
+            None,
+            4,
+            NOW_NS,
+            Arc::new(FixedClock(NOW_NS)),
+        )
+        .await
+        .expect_err("the middle batch's permanent PUT failure fails the load");
+
+        // Snapshot the instant `load` returns: batches 3 and 4 had started their
+        // flush (their shard actors reached the PUT) but had not committed yet.
+        let started_at_return = watch_started.load(Ordering::SeqCst);
+        let completed_at_return = watch_completed.load(Ordering::SeqCst);
+
+        let durable = match &err {
+            LoadError::Flush { durable, .. } => durable.clone(),
+            other => panic!("expected LoadError::Flush, got {other:?}"),
+        };
+        assert_eq!(
+            durable.len(),
+            2,
+            "only the two batches strictly before the failing one are durable, got {durable:?}"
+        );
+        assert_eq!(
+            durable[0].shard, 0,
+            "first durable token is batch 0 (shard 0), in submission order"
+        );
+        assert_eq!(
+            durable[1].shard, 1,
+            "second durable token is batch 1 (shard 1), in submission order"
+        );
+        assert!(
+            durable.iter().all(|t| t.shard == 0 || t.shard == 1),
+            "no token from the failing batch (shard 2) or any later batch (shards 3, 4) is \
+             reported durable, got {durable:?}"
+        );
+
+        assert_eq!(
+            fault.fault_count(Op::Put, FaultKind::Permanent),
+            1,
+            "the permanent data-object PUT fault fired exactly once (shard 2, no retry)"
+        );
+
+        assert_eq!(
+            started_at_return, 2,
+            "both after-failure writes (batches 3 and 4) were outstanding at the failure"
+        );
+        assert_eq!(
+            completed_at_return, 0,
+            "neither after-failure write had committed at the instant the failure was reported, \
+             so their absence from the durable list is FIFO discipline, not a race that left them \
+             unfinished"
+        );
+
+        // Let the still-running shard actors finish their held PUTs: batches 3
+        // and 4 commit their objects independently of the aborted write futures.
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        assert_eq!(
+            watch_completed.load(Ordering::SeqCst),
+            2,
+            "batches 3 and 4's writes did in fact succeed and commit, yet were still excluded \
+             from the durable list above"
         );
     }
 }
