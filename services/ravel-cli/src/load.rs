@@ -852,9 +852,18 @@ async fn load_instrumented(
         // is the only place `report.tokens` grows during the loop, and it grows
         // strictly oldest-first, so a later batch's write finishing early can
         // never record its token ahead of an earlier one (or ahead of an earlier
-        // failure). On a write error, abort every still-queued write so an
-        // already-spawned later batch cannot keep running in the background past
-        // the failure the loader is about to return.
+        // failure). On a write error, abort every still-queued write's
+        // `JoinHandle`: this cancels the loader's own ack wait so it does not
+        // block returning on a write it has already decided to fail, but it
+        // does NOT stop the batch's underlying shard-actor flush (see
+        // `LogIngestRouter::write` in crates/ravel-ingest/src/log_router.rs --
+        // the actor holds only a channel `tx`, no join handle of its own). A
+        // later batch can therefore still commit its data object and publish
+        // its commit record in the background after the loader has returned an
+        // error; the durable-token accounting excludes it regardless (see
+        // `resolve_write_entry`/`drain_inflight` below), so the reported list
+        // stays correct, but the object itself may still land. Tracked as a
+        // known gap pending a `ravel-ingest` cancellation mechanism.
         // Only one write is spawned per iteration, so the window exceeds its
         // bound by at most one and this resolves exactly one oldest entry; the
         // `while` + `let`-else form avoids unwrapping a `pop_front` that is
@@ -960,10 +969,15 @@ async fn resolve_write_entry(
 }
 
 /// Resolve every write still in the window, oldest-first. On the first write
-/// error it aborts every remaining (later) write before returning, so no
-/// already-spawned batch after the failure keeps running in the background once
-/// the loader has decided to fail: a detached `tokio::spawn`'d task is not
-/// cancelled by dropping its handle.
+/// error it aborts every remaining (later) write's `JoinHandle` before
+/// returning. This only cancels the loader's own ack wait on those writes --
+/// it does not stop their underlying shard-actor flush, which has no join
+/// handle of its own to cancel (see the loop comment above and
+/// `crates/ravel-ingest/src/log_router.rs`) -- so a later batch can still
+/// commit independently in the background even after the loader has reported
+/// failure. The durable-token list is unaffected either way: it only ever
+/// grows from a popped, successfully-resolved entry strictly oldest-first, so
+/// an aborted entry's outcome (commit or not) is never consulted.
 async fn drain_inflight(
     inflight: &mut std::collections::VecDeque<(
         u64,
@@ -3191,6 +3205,42 @@ type = "i64"
         );
     }
 
+    /// `--pipeline-depth 0` is rejected with a typed [`LoadError::Setup`]
+    /// before any work, rather than silently clamped to 1, mirroring
+    /// `batch_rows_zero_is_rejected` above. A depth of 0 would also make the
+    /// main loop's `while inflight.len() >= pipeline_depth` true before any
+    /// write is ever spawned; the guard makes that unreachable rather than
+    /// relying on the `let`-else in the pop to save it.
+    #[tokio::test]
+    async fn pipeline_depth_zero_is_rejected() {
+        use ravel_object_store::memory::MemoryStore;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let m = base_mapping();
+        let err = load(
+            store,
+            Path::new("/nonexistent.parquet"),
+            "acme",
+            &m,
+            4,
+            10,
+            None,
+            0,
+            NOW_NS,
+            Arc::new(FixedClock(NOW_NS)),
+        )
+        .await
+        .expect_err("pipeline_depth of 0 is rejected");
+        assert!(
+            matches!(err, LoadError::Setup(_)),
+            "a typed setup error, got: {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("--pipeline-depth must be at least 1"),
+            "the error names the lever: {err}"
+        );
+    }
+
     /// The first host value (by an incrementing suffix) whose loader stream
     /// identity routes to `target` under `shards`. Uses the loader's own
     /// identity inputs -- resource attributes in mapping order, empty scope --
@@ -4526,40 +4576,47 @@ type = "i64"
     /// Durable-token correctness under a partial-window failure (the correctness
     /// constraint this ticket turns on): with `--pipeline-depth 4` and a stream
     /// of five single-shard batches, the data PUT for the *middle* batch (index
-    /// 2, shard 2) fails permanently. The batches strictly after it (indices 3
-    /// and 4, shards 3 and 4) have their PUTs held ~1s, so they are provably
-    /// still in flight at the instant the failure is detected, and — because the
-    /// loader routes each batch to its own shard actor and a shard actor's flush
-    /// is downstream of the write future the loader holds — they go on to commit
-    /// their objects *independently* even after the loader aborts their write
-    /// handles. That independent success is exactly the trap: the reported
-    /// durable list must still exclude them.
+    /// 2, shard 2) is held ~300ms before failing permanently. The batches
+    /// strictly after it (indices 3 and 4, shards 3 and 4) have no artificial
+    /// delay at all, so their shard actors race far ahead of shard 2's held PUT
+    /// and commit their objects *independently*, well before shard 2's failure
+    /// is even detected -- because the loader routes each batch to its own
+    /// shard actor and a shard actor's flush is downstream of the write future
+    /// the loader holds, aborting that future's `JoinHandle` does not stop the
+    /// shard actor already mid-PUT (see `LogIngestRouter::write` in
+    /// `crates/ravel-ingest/src/log_router.rs`: the actor has no join handle of
+    /// its own, only a channel). That independent, unstoppable success is
+    /// exactly the trap: the reported durable list must still exclude them, even
+    /// though the objects genuinely landed.
     ///
     /// Asserted: the reported durable list is exactly the tokens of the batches
     /// strictly before the failing one (shards 0 and 1), in submission order; it
     /// carries no token for the failing batch (a full single-shard PUT failure
-    /// has no partial survivor) and none for the later batches — even though
-    /// `watch_completed` reaching 2 after the wait proves batches 3 and 4's
-    /// writes did in fact succeed and commit. This is the "even if their own
-    /// write happens to succeed independently" clause made observable: the
-    /// durable list grows only by consuming the queue oldest-first, never by
-    /// whichever write finishes.
+    /// has no partial survivor) and none for the later batches -- even though
+    /// `watch_completed` reading 2 proves batches 3 and 4's writes did in fact
+    /// succeed and commit (the direct, non-inferred proof the spec requires:
+    /// their objects landed in the underlying store, not merely "absent from
+    /// the returned list"). This is the "even if their own write happens to
+    /// succeed independently" clause made observable: the durable list grows
+    /// only by consuming the queue oldest-first, never by whichever write
+    /// finishes, and it stays correct even though the loader's own abort of the
+    /// post-failure handles has no effect on whether those batches commit.
     ///
-    /// Non-vacuity (prove-the-test): a wrong resolver that consumed the window
-    /// via `select_all`/whichever-finishes-first instead of strict FIFO
-    /// pop-front would, on this exact fixture, surface batch 2's *immediate*
-    /// permanent failure before batch 1's *artificially delayed* (~50ms) success
-    /// is ever recorded, returning a durable list missing shard 1 — the
-    /// `durable.len() == 2` / `durable[1].shard == 1` assertions reject that. The
-    /// ordering is deterministic because the FaultStore permanent error returns
-    /// effectively instantly while shard 1's PUT is held ~50ms, so the delayed
-    /// success can never win a race the FIFO resolver does not run. And the
-    /// `watch_started == 2` / `watch_completed == 0` snapshot taken the instant
-    /// `load` returns proves batches 3 and 4 were genuinely still outstanding
-    /// (not merely absent because they never ran), closing the "raced and did not
-    /// finish in time" loophole in the opposite direction: they had started but
-    /// had not committed, yet were correctly excluded, and later completing did
-    /// not resurrect them into the list.
+    /// Non-vacuity (prove-the-test): the discriminating shape is the *failing*
+    /// batch being slow and a *post-failure* batch being fast, not the other way
+    /// around. A wrong resolver that consumed the window via
+    /// `select_all`/whichever-finishes-first instead of strict FIFO pop-front
+    /// would, on this exact fixture, resolve shard 3's (and shard 4's) zero-delay
+    /// success long before shard 2's ~300ms-delayed failure is ever observed --
+    /// recording a shard-3 (or shard-4) token as durable, which the
+    /// `durable.iter().all(|t| t.shard == 0 || t.shard == 1)` assertion rejects.
+    /// The ordering is deterministic because a zero-delay in-memory PUT
+    /// completes in microseconds while shard 2 is held 300ms: a 6000x margin
+    /// leaves no scheduling jitter that could invert it. (An earlier version of
+    /// this fixture delayed the *post-failure* batches instead of the failing
+    /// one; that shape is vacuous -- delaying batches 3/4 stops them finishing
+    /// early under any resolver, correct or not, so it can't distinguish FIFO
+    /// from `select_all`. The failing batch must be the slow one.)
     #[tokio::test]
     async fn partial_window_failure_reports_only_earlier_batches_never_later() {
         use parquet::arrow::ArrowWriter;
@@ -4613,15 +4670,15 @@ type = "i64"
         let watch_completed = Arc::new(AtomicUsize::new(0));
         let store = Arc::new(InstrumentedPutStore {
             inner: fault.clone() as Arc<dyn ObjectStoreBackend>,
-            // Shard 1 (before the failure) is delayed ~50ms so a whichever-
-            // finishes-first resolver would surface shard 2's instant failure
-            // ahead of it; shards 3 and 4 (after the failure) are held ~1s so
-            // they are still in flight at the failure yet commit after the wait.
-            delays: vec![
-                ("/l0/0001/", Duration::from_millis(50)),
-                ("/l0/0003/", Duration::from_millis(1000)),
-                ("/l0/0004/", Duration::from_millis(1000)),
-            ],
+            // Shard 2 (the failing batch) is held ~300ms before its permanent
+            // fault fires. Shards 3 and 4 (after the failure) get no artificial
+            // delay at all, so their zero-delay PUTs commit within microseconds
+            // of being spawned -- long before shard 2's held failure surfaces.
+            // This is the shape that discriminates FIFO from whichever-finishes-
+            // first: delaying the *post-failure* batches instead would stop them
+            // finishing early under any resolver and prove nothing (see the test
+            // doc comment).
+            delays: vec![("/l0/0002/", Duration::from_millis(300))],
             in_flight: Arc::new(AtomicUsize::new(0)),
             max_in_flight: Arc::new(AtomicUsize::new(0)),
             watch_prefixes: vec!["/l0/0003/", "/l0/0004/"],
@@ -4644,11 +4701,14 @@ type = "i64"
         .await
         .expect_err("the middle batch's permanent PUT failure fails the load");
 
-        // Snapshot the instant `load` returns: batches 3 and 4 had started their
-        // flush (their shard actors reached the PUT) but had not committed yet.
-        let started_at_return = watch_started.load(Ordering::SeqCst);
-        let completed_at_return = watch_completed.load(Ordering::SeqCst);
-
+        // Shards 3 and 4 have zero artificial delay, so by the time shard 2's
+        // ~300ms-held failure surfaces (and `load` returns it) both have already
+        // started AND completed their PUT -- a 6000x margin over a zero-delay
+        // in-memory write, leaving no scheduling-jitter window that could catch
+        // them mid-flight instead. This is the direct, non-inferred proof the
+        // spec requires: the objects genuinely landed in the underlying store,
+        // not merely "absent from the returned list" (which a lucky race could
+        // satisfy even under a wrong implementation).
         let durable = match &err {
             LoadError::Flush { durable, .. } => durable.clone(),
             other => panic!("expected LoadError::Flush, got {other:?}"),
@@ -4679,24 +4739,19 @@ type = "i64"
         );
 
         assert_eq!(
-            started_at_return, 2,
-            "both after-failure writes (batches 3 and 4) were outstanding at the failure"
+            watch_started.load(Ordering::SeqCst),
+            2,
+            "both after-failure writes (batches 3 and 4) reached their PUT"
         );
-        assert_eq!(
-            completed_at_return, 0,
-            "neither after-failure write had committed at the instant the failure was reported, \
-             so their absence from the durable list is FIFO discipline, not a race that left them \
-             unfinished"
-        );
-
-        // Let the still-running shard actors finish their held PUTs: batches 3
-        // and 4 commit their objects independently of the aborted write futures.
-        tokio::time::sleep(Duration::from_millis(1300)).await;
         assert_eq!(
             watch_completed.load(Ordering::SeqCst),
             2,
-            "batches 3 and 4's writes did in fact succeed and commit, yet were still excluded \
-             from the durable list above"
+            "batches 3 and 4's writes did in fact succeed and commit -- the loader's abort of \
+             their write handles only cancels its own ack wait, it does not stop the shard actor \
+             already mid-PUT -- yet both are still excluded from the durable list above. Operators \
+             resuming from a partial-window failure at depth > 1 must treat this as a known gap: \
+             see the --pipeline-depth documentation in clickbench.md and the ravel-ingest \
+             follow-up tracked from this test's discovery."
         );
     }
 }
