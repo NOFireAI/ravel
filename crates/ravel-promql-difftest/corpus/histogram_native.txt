@@ -261,3 +261,60 @@ kind: instant
 time: +600s
 mode: unordered
 expect: empty
+
+# Counter-family functions over native histograms (ADR-0108 decision 5, #650).
+# Before #650 irate/idelta/resets/changes routed a pure-histogram window to a
+# silent Drop (empty, no annotation), diverging from Prometheus v3.13.1, which
+# defines all four over histograms. resets/changes reduce a histogram window to
+# a FLOAT (a reset/change count), so the existing float comparator applies and
+# both endpoints are pinned here. Over the monotonic counter dataset resets is
+# 0 (no downward step) and changes counts every adjacent differing pair; each
+# used to answer empty over histogram data.
+#
+# irate/idelta are pinned by ravel-promql unit tests
+# (tests/histogram_native.rs) rather than corpus entries: idelta over a counter
+# histogram makes Prometheus emit a NativeHistogramNotGauge warning (an
+# annotation), which this corpus deliberately excludes (see the header), and
+# irate's histogram-valued result is pinned by unit test alongside it.
+name: native_histogram_resets_range
+query: resets(diff_native_hist[5m])
+kind: range
+start: +300s
+end: +600s
+step: 60s
+mode: unordered
+
+name: native_histogram_resets_instant
+query: resets(diff_native_hist[5m])
+kind: instant
+time: +600s
+mode: unordered
+
+name: native_histogram_changes_range
+query: changes(diff_native_hist[5m])
+kind: range
+start: +300s
+end: +600s
+step: 60s
+mode: unordered
+
+name: native_histogram_changes_instant
+query: changes(diff_native_hist[5m])
+kind: instant
+time: +600s
+mode: unordered
+
+# Instant query whose top-level result is a range vector carrying native
+# histograms (#643). Prometheus answers with a matrix carrying the histogram
+# steps; Ravel's instant Value::Matrix is float-only, so rather than drop the
+# histograms at HTTP 200 it refuses with a typed 422 Unsupported (ADR-0108
+# decision 8). This is a one-sided divergence, registered with the ADR-0030
+# comparator mode (comparator.rs compare_ravel_error_prom_success): it asserts
+# exactly that Ravel errors by design while Prometheus succeeds. The refusal is
+# also covered by a ravel-promql unit test
+# (instant_matrix_selector_over_native_histograms_refuses_rather_than_dropping).
+name: native_histogram_instant_matrix_selector_refused
+query: diff_native_hist[5m]
+kind: instant
+time: +600s
+mode: ravel_error_prom_success

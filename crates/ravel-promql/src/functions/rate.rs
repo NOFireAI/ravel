@@ -16,7 +16,7 @@
 
 use ravel_types::Sample;
 
-use crate::histogram::{self, FloatHistogram, TimedHistogram};
+use crate::histogram::{self, FloatHistogram, ResetHint, TimedHistogram};
 
 use super::{FunctionDef, FunctionKind, RangeWindow};
 
@@ -292,6 +292,69 @@ fn instant_value(samples: &[Sample], is_rate: bool) -> Option<f64> {
         result_value /= ms_to_seconds(ns_to_ms(sampled_interval_ns));
     }
     Some(result_value)
+}
+
+/// `irate`/`idelta` over a native-histogram window (Prometheus' `instantValue`
+/// histogram branch): only the last two histograms matter. `idelta`
+/// (`is_rate == false`) always takes the raw difference `last - previous`;
+/// `irate` (`is_rate == true`) skips the subtraction when the pair is a counter
+/// reset (leaving the later histogram, mirroring the float path where a reset
+/// makes the result the last value alone) and then divides by the sampled
+/// interval in seconds. Two samples at the same timestamp have no defined
+/// result and drop, exactly like the float path (`sampledInterval == 0`). The
+/// result is marked gauge-typed, matching Prometheus' `Compact`-then-set-hint
+/// step (the trailing `Compact(0)` only removes empty buckets, which the JSON
+/// renderer already omits, so it is not reproduced here).
+pub(crate) fn instant_value_hist(
+    samples: &[TimedHistogram],
+    is_rate: bool,
+) -> Option<FloatHistogram> {
+    if samples.len() < 2 {
+        return None;
+    }
+    let (last_ts, last) = &samples[samples.len() - 1];
+    let (prev_ts, previous) = &samples[samples.len() - 2];
+    let sampled_interval_ns = last_ts - prev_ts;
+    if sampled_interval_ns == 0 {
+        return None;
+    }
+    let mut result = last.clone();
+    if !is_rate || !last.detect_reset(previous) {
+        result.sub_assign(previous);
+    }
+    result.counter_reset_hint = ResetHint::Gauge;
+    if is_rate {
+        result.div(ms_to_seconds(ns_to_ms(sampled_interval_ns)));
+    }
+    Some(result)
+}
+
+/// `resets` over a native-histogram window (Prometheus' `funcResets` histogram
+/// path): count adjacent pairs where the later histogram is a counter reset
+/// relative to the earlier one ([`FloatHistogram::detect_reset`]). A float, not
+/// a histogram, exactly like the float `resets`.
+pub(crate) fn resets_hist(samples: &[TimedHistogram]) -> f64 {
+    let mut resets = 0i64;
+    for pair in samples.windows(2) {
+        if pair[1].1.detect_reset(&pair[0].1) {
+            resets += 1;
+        }
+    }
+    resets as f64
+}
+
+/// `changes` over a native-histogram window (Prometheus' `funcChanges`
+/// histogram path): count adjacent pairs of unequal histograms (Prometheus'
+/// data-equality `!Equals`, [`FloatHistogram::equals`]). A float, like the
+/// float `changes`.
+pub(crate) fn changes_hist(samples: &[TimedHistogram]) -> f64 {
+    let mut changes = 0i64;
+    for pair in samples.windows(2) {
+        if !pair[1].1.equals(&pair[0].1) {
+            changes += 1;
+        }
+    }
+    changes as f64
 }
 
 /// Port of Prometheus' `linearRegression`: ordinary least squares over the
@@ -685,5 +748,66 @@ mod tests {
             range_hist, instant_hist,
             "the range arm must reduce through the same histogram reducer as the instant arm"
         );
+    }
+
+    #[test]
+    fn irate_hist_takes_last_two_and_divides_by_interval() {
+        // Two histogram samples 30s apart, counts 2 then 8, no reset. irate
+        // takes the raw difference (count 6, sum 30) and divides by the 30s
+        // interval in seconds: 6/30 and 30/30. Result is gauge-typed.
+        let samples = [
+            (ms(0), nh_counter(2.0, 10.0)),
+            (ms(30_000), nh_counter(8.0, 40.0)),
+        ];
+        let got = instant_value_hist(&samples, true).expect("2 samples");
+        assert_eq!(got.count.to_bits(), (6.0_f64 / 30.0).to_bits());
+        assert_eq!(got.sum.to_bits(), (30.0_f64 / 30.0).to_bits());
+        assert_eq!(got.counter_reset_hint, histogram::ResetHint::Gauge);
+    }
+
+    #[test]
+    fn idelta_hist_is_the_raw_difference_without_division_or_reset_detection() {
+        // idelta does not divide and does not detect resets: last - previous,
+        // even when the counter went down.
+        let samples = [
+            (ms(0), nh_counter(8.0, 40.0)),
+            (ms(30_000), nh_counter(2.0, 10.0)),
+        ];
+        let got = instant_value_hist(&samples, false).expect("2 samples");
+        assert_eq!(got.count.to_bits(), (2.0_f64 - 8.0).to_bits());
+        assert_eq!(got.sum.to_bits(), (10.0_f64 - 40.0).to_bits());
+    }
+
+    #[test]
+    fn irate_idelta_hist_fewer_than_two_or_zero_interval_is_none() {
+        let one = [(ms(0), nh_counter(1.0, 1.0))];
+        assert!(instant_value_hist(&one, true).is_none());
+        let same_ts = [
+            (ms(10_000), nh_counter(1.0, 1.0)),
+            (ms(10_000), nh_counter(2.0, 2.0)),
+        ];
+        assert!(instant_value_hist(&same_ts, true).is_none());
+        assert!(instant_value_hist(&same_ts, false).is_none());
+    }
+
+    #[test]
+    fn resets_and_changes_over_histograms_count_transitions() {
+        // counts 2 -> 8 -> 5: one reset (the 8->5 shrink) and two changes (both
+        // adjacent pairs differ).
+        let samples = [
+            (ms(0), nh_counter(2.0, 10.0)),
+            (ms(30_000), nh_counter(8.0, 40.0)),
+            (ms(60_000), nh_counter(5.0, 25.0)),
+        ];
+        assert_eq!(resets_hist(&samples), 1.0, "one downward step 8->5");
+        assert_eq!(changes_hist(&samples), 2.0, "both adjacent pairs differ");
+
+        // A constant series has no resets and no changes.
+        let constant = [
+            (ms(0), nh_counter(3.0, 12.0)),
+            (ms(30_000), nh_counter(3.0, 12.0)),
+        ];
+        assert_eq!(resets_hist(&constant), 0.0);
+        assert_eq!(changes_hist(&constant), 0.0);
     }
 }

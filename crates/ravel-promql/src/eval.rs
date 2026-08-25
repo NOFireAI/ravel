@@ -402,6 +402,19 @@ pub(crate) fn histogram_ignored_in_aggregation_info(aggregation: &str) -> String
     format!("ignored histogram in {aggregation} aggregation")
 }
 
+/// Prometheus' `MixedFloatsHistogramsAggWarning` message: a `sum`/`avg` group
+/// held both float and native-histogram members, which cannot be combined, so
+/// Prometheus drops the group with this warning (ADR-0108 decision 6a, issue
+/// #649). A warning, not an info: unlike the float-only aggregators that merely
+/// ignore a histogram member of an otherwise-float group
+/// ([`histogram_ignored_in_aggregation_info`]), here a whole group is dropped
+/// because its members are type-incompatible. Verified against the pinned
+/// Prometheus v3.13.1 binary (`promql/engine.go` aggregation, `hasFloat &&
+/// hasHistogram` case) rather than the float-only "ignored histogram" info.
+pub(crate) fn mixed_floats_histograms_agg_warning() -> String {
+    "encountered a mix of histograms and floats for aggregation".to_string()
+}
+
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
@@ -927,9 +940,31 @@ impl Evaluator {
             Expr::VectorSelector(vs) => self
                 .eval_vector_selector(source, vs, eval_ts_ns, ctx)
                 .map(Value::Vector),
-            Expr::MatrixSelector(ms) => self
-                .eval_matrix_selector(source, ms, eval_ts_ns, ctx)
-                .map(Value::Matrix),
+            Expr::MatrixSelector(ms) => {
+                // A bare matrix selector is a valid instant query whose
+                // top-level result is a range vector (rendered as a matrix).
+                // Ravel's `Value::Matrix` is float-only (the histogram-aware
+                // channel is the range endpoint's `RangeValue`, ADR-0108), so a
+                // selector matching native-histogram data would silently drop
+                // it at HTTP 200. Refuse with a typed 422 instead (ADR-0108
+                // decision 8, issue #643); a float-only matrix selector is
+                // unaffected. This arm is reached only for a top-level (or
+                // paren/unary-wrapped) instant matrix selector: a range query
+                // rejects a top-level range vector in `resolve_range_core`, and
+                // a subquery over histograms already refuses upstream in
+                // `eval_subquery_matrix`.
+                if !self
+                    .eval_histogram_matrix_selector(source, ms, eval_ts_ns, ctx, false)?
+                    .is_empty()
+                {
+                    return Err(Error::Unsupported {
+                        construct: "instant query returning a range vector of native histograms"
+                            .to_string(),
+                    });
+                }
+                self.eval_matrix_selector(source, ms, eval_ts_ns, ctx)
+                    .map(Value::Matrix)
+            }
             Expr::Call(c) => crate::functions::eval_call(self, source, c, eval_ts_ns, ctx),
             Expr::Binary(b) => crate::binop::eval_binary(self, source, b, eval_ts_ns, ctx),
             Expr::Aggregate(a) => {
@@ -1816,6 +1851,60 @@ mod tests {
 
     fn minutes(m: i64) -> i64 {
         m * 60_000
+    }
+
+    #[test]
+    fn instant_matrix_selector_over_native_histograms_refuses_rather_than_dropping() {
+        use crate::histogram::{FloatHistogram, ResetHint, Span};
+        // ADR-0108 / issue #643: a bare matrix selector is a valid instant
+        // query whose top-level result is a range vector. Ravel's
+        // `Value::Matrix` is float-only, so a selector matching
+        // native-histogram data would silently drop it at HTTP 200; it must
+        // refuse with a typed `Error::Unsupported` (422) instead. Before this
+        // fix the histogram series simply vanished and the query returned an
+        // empty matrix with status 200. A float-only matrix selector is
+        // unaffected.
+        let h = FloatHistogram {
+            counter_reset_hint: ResetHint::Unknown,
+            scale: 0,
+            zero_threshold: 0.0,
+            zero_count: 0.0,
+            count: 2.0,
+            sum: 6.0,
+            positive_spans: vec![Span {
+                offset: 1,
+                length: 1,
+            }],
+            negative_spans: Vec::new(),
+            positive_buckets: vec![2.0],
+            negative_buckets: Vec::new(),
+            custom_values: Vec::new(),
+        };
+        let hist_src = TestSource::new()
+            .with_histogram_series(&[("__name__", "h")], &[(minutes(1), h)])
+            .expect("valid histogram series");
+        let err = Evaluator::new()
+            .eval_instant(&hist_src, "h[5m]", minutes(5))
+            .expect_err("instant matrix over histograms must refuse, not drop");
+        assert!(
+            matches!(err, Error::Unsupported { .. }),
+            "expected Error::Unsupported, got {err:?}"
+        );
+
+        let float_src = TestSource::new()
+            .with_series(
+                &[("__name__", "m")],
+                &[(minutes(1), 1.0), (minutes(2), 2.0)],
+            )
+            .expect("valid series");
+        let value = Evaluator::new()
+            .eval_instant(&float_src, "m[5m]", minutes(5))
+            .expect("a float-only matrix selector still evaluates");
+        assert!(
+            matches!(value, Value::Matrix(_)),
+            "float matrix selector still renders a matrix, got {}",
+            value.type_name()
+        );
     }
 
     // --- Warning/info annotations ---

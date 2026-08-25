@@ -125,11 +125,54 @@ impl FloatHistogram {
         }
     }
 
-    /// Divide by `scalar` (Prometheus' `FloatHistogram.Div`): implemented as
-    /// `mul(1/scalar)` exactly as Prometheus does, so the reciprocal rounding
-    /// matches.
+    /// Divide by `scalar` (Prometheus' `FloatHistogram.Div`): each population
+    /// (zero, count, sum, and every bucket) is divided by `scalar` directly,
+    /// field for field, exactly as Prometheus' `Div` does. This is NOT
+    /// `mul(1/scalar)`: for a non-power-of-two divisor the two round
+    /// differently, and only the direct division matches the pinned binary.
+    /// Ravel's only callers pass a positive scalar (`avg`'s group size,
+    /// `irate`'s sampled interval), so Prometheus' `scalar == 0`
+    /// bucket-clearing and `scalar < 0` gauge-hint special cases are
+    /// unreachable and not reproduced here.
     pub fn div(&mut self, scalar: f64) {
-        self.mul(1.0 / scalar);
+        self.zero_count /= scalar;
+        self.count /= scalar;
+        self.sum /= scalar;
+        for b in &mut self.positive_buckets {
+            *b /= scalar;
+        }
+        for b in &mut self.negative_buckets {
+            *b /= scalar;
+        }
+    }
+
+    /// Prometheus' `FloatHistogram.Equals`: *data* equality, not mathematical
+    /// equality, so `count`/`sum`/`zero_count` and every bucket compare by bit
+    /// pattern (`NaN`/`-0.0` are data-distinct), `scale`/`zero_threshold` by
+    /// value, and the span layouts exactly. `counter_reset_hint` is
+    /// deliberately not compared. Used by `changes` over native histograms,
+    /// which counts a change whenever two adjacent samples are not `Equals`.
+    pub fn equals(&self, other: &FloatHistogram) -> bool {
+        if self.scale != other.scale
+            || self.zero_threshold != other.zero_threshold
+            || self.zero_count.to_bits() != other.zero_count.to_bits()
+            || self.count.to_bits() != other.count.to_bits()
+            || self.sum.to_bits() != other.sum.to_bits()
+        {
+            return false;
+        }
+        if self.uses_custom_buckets() != other.uses_custom_buckets() {
+            return false;
+        }
+        if self.uses_custom_buckets()
+            && !float_buckets_match(&self.custom_values, &other.custom_values)
+        {
+            return false;
+        }
+        self.positive_spans == other.positive_spans
+            && self.negative_spans == other.negative_spans
+            && float_buckets_match(&self.positive_buckets, &other.positive_buckets)
+            && float_buckets_match(&self.negative_buckets, &other.negative_buckets)
     }
 
     /// `histogram_count`: the stored observation count.
@@ -348,6 +391,14 @@ fn bucket_shrank(prev: &BTreeMap<i32, f64>, curr: &BTreeMap<i32, f64>) -> bool {
         }
     }
     false
+}
+
+/// Per-element bit-pattern equality of two bucket (or custom-value) vectors,
+/// Prometheus' `floatBucketsMatch`: same length and every element equal by
+/// `f64::to_bits`, so `NaN`/`-0.0` are data-distinct, matching Prometheus'
+/// data-equality contract for [`FloatHistogram::equals`].
+fn float_buckets_match(a: &[f64], b: &[f64]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
 }
 
 /// Merge two side index maps with `self + sign*other` per bucket, keeping a
@@ -901,6 +952,40 @@ mod tests {
         let r = avg_histograms(list.iter()).expect("non-empty");
         assert_eq!(r.count, 3.0);
         assert_eq!(r.sum, 6.0);
+    }
+
+    #[test]
+    fn div_divides_each_field_directly_not_via_reciprocal() {
+        // Dividing by a non-power-of-two (3) is where direct division and
+        // `mul(1/3)` diverge in the last place. Prometheus' `Div` divides
+        // each field directly; the result must match `x / 3.0`, bit for bit,
+        // NOT `x * (1.0 / 3.0)`.
+        let mut h = positive(0, 1, &[10.0, 20.0], 30.0);
+        h.zero_count = 5.0;
+        h.count += 5.0; // 35 total
+        h.div(3.0);
+        assert_eq!(h.count.to_bits(), (35.0_f64 / 3.0).to_bits());
+        assert_eq!(h.sum.to_bits(), (30.0_f64 / 3.0).to_bits());
+        assert_eq!(h.zero_count.to_bits(), (5.0_f64 / 3.0).to_bits());
+        assert_eq!(h.positive_buckets[0].to_bits(), (10.0_f64 / 3.0).to_bits());
+        assert_eq!(h.positive_buckets[1].to_bits(), (20.0_f64 / 3.0).to_bits());
+    }
+
+    #[test]
+    fn equals_ignores_counter_reset_hint_but_compares_populations() {
+        let a = positive(0, 1, &[1.0, 2.0], 3.0);
+        let mut b = a.clone();
+        b.counter_reset_hint = ResetHint::Gauge;
+        assert!(
+            a.equals(&b),
+            "counter_reset_hint is not part of data equality"
+        );
+
+        let c = positive(0, 1, &[1.0, 3.0], 3.0);
+        assert!(!a.equals(&c), "a differing bucket population is not equal");
+
+        let d = positive(0, 1, &[1.0, 2.0], 4.0);
+        assert!(!a.equals(&d), "a differing sum is not equal");
     }
 
     #[test]

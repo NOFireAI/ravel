@@ -12,7 +12,7 @@
 
 use ravel_promql::histogram::{FloatHistogram, ResetHint, Span};
 use ravel_promql::testsource::TestSource;
-use ravel_promql::{Evaluator, InstantSample};
+use ravel_promql::{Evaluator, InstantSample, Value};
 
 /// A positive-only histogram at scale 0, one span from index 1, `counts`
 /// consecutive buckets. Bucket i (1-based) covers `(2^(i-1), 2^i]`.
@@ -196,6 +196,162 @@ fn rate_over_a_native_histogram_compensates_a_counter_reset() {
         (got[0].value - (5.0 * 1.5 / 300.0)).abs() < 1e-12,
         "got {}",
         got[0].value
+    );
+}
+
+#[test]
+fn mixed_float_and_histogram_group_warns_when_dropped_by_sum_and_avg() {
+    // A float series and a histogram series collapse into one group under
+    // sum()/avg(); the type-incompatible group is dropped WITH a warning
+    // (Prometheus' MixedFloatsHistogramsAggWarning), never silently. Before the
+    // #649 fix the group was dropped with no annotation at all, so this
+    // assertion on a non-empty `warnings()` failed. The annotation is a
+    // WARNING, not the float-only aggregators' "ignored histogram" info.
+    for op in ["sum", "avg"] {
+        let src = TestSource::new()
+            .with_series(&[("__name__", "m"), ("i", "1")], &[(0, 5.0)])
+            .expect("valid")
+            .with_histogram_series(&[("__name__", "m"), ("i", "2")], &[(0, hist(&[3.0], 3.0))])
+            .expect("valid");
+        let (value, annos) = Evaluator::new()
+            .eval_instant_annotated(&src, &format!("{op}(m)"), 0)
+            .expect("evaluates");
+        let Value::Vector(out) = value else {
+            panic!("{op} is a vector");
+        };
+        assert!(
+            out.is_empty(),
+            "{op}: mixed group must be dropped, got {out:?}"
+        );
+        assert!(
+            annos
+                .warnings()
+                .iter()
+                .any(|w| w.contains("mix of histograms and floats")),
+            "{op}: dropping a mixed group must warn, warnings={:?}",
+            annos.warnings()
+        );
+        assert!(
+            annos.infos().is_empty(),
+            "{op}: the drop is a warning, not an info: {:?}",
+            annos.infos()
+        );
+    }
+}
+
+#[test]
+fn irate_over_a_native_histogram_yields_a_histogram_element() {
+    // Two histogram samples 30s apart in the (0, 300s] window, counts 2 then 8,
+    // no reset. irate divides the raw difference (count 6, sum 30) by the 30s
+    // interval: count 0.2, sum 1.0. Before the #650 fix the histogram window
+    // routed to Drop and the query returned empty.
+    let src = TestSource::new()
+        .with_histogram_series(
+            &[("__name__", "h")],
+            &[
+                (sec_ns(270), hist(&[2.0], 10.0)),
+                (sec_ns(300), hist(&[8.0], 40.0)),
+            ],
+        )
+        .expect("valid series");
+    let got = Evaluator::new()
+        .instant(&src, "irate(h[5m])", 5 * 60_000)
+        .expect("evaluates");
+    assert_eq!(got.len(), 1);
+    let h = got[0]
+        .histogram
+        .as_ref()
+        .expect("irate over histograms yields a histogram element, not empty");
+    assert!((h.count - 0.2).abs() < 1e-12, "count {}", h.count);
+    assert!((h.sum - 1.0).abs() < 1e-12, "sum {}", h.sum);
+}
+
+#[test]
+fn idelta_over_a_native_histogram_yields_a_histogram_element() {
+    // idelta is the raw last-minus-previous difference with no per-second
+    // division (and no reset detection): counts 8 then 2 gives count -6,
+    // sum -30. Before the #650 fix this returned empty.
+    let src = TestSource::new()
+        .with_histogram_series(
+            &[("__name__", "h")],
+            &[
+                (sec_ns(270), hist(&[8.0], 40.0)),
+                (sec_ns(300), hist(&[2.0], 10.0)),
+            ],
+        )
+        .expect("valid series");
+    let got = Evaluator::new()
+        .instant(&src, "idelta(h[5m])", 5 * 60_000)
+        .expect("evaluates");
+    assert_eq!(got.len(), 1);
+    let h = got[0]
+        .histogram
+        .as_ref()
+        .expect("idelta over histograms yields a histogram element, not empty");
+    assert!((h.count - (-6.0)).abs() < 1e-12, "count {}", h.count);
+    assert!((h.sum - (-30.0)).abs() < 1e-12, "sum {}", h.sum);
+}
+
+#[test]
+fn resets_and_changes_over_a_native_histogram_are_floats() {
+    // counts 2 -> 8 -> 5 across three in-window samples: resets counts the one
+    // downward step (8->5) as a float 1; changes counts both differing adjacent
+    // pairs as a float 2. Both are floats, never histogram elements. Before the
+    // #650 fix each returned empty.
+    let src = TestSource::new()
+        .with_histogram_series(
+            &[("__name__", "h")],
+            &[
+                (sec_ns(60), hist(&[2.0], 10.0)),
+                (sec_ns(180), hist(&[8.0], 40.0)),
+                (sec_ns(300), hist(&[5.0], 25.0)),
+            ],
+        )
+        .expect("valid series");
+    let resets = Evaluator::new()
+        .instant(&src, "resets(h[5m])", 5 * 60_000)
+        .expect("evaluates");
+    assert_eq!(resets.len(), 1);
+    assert!(resets[0].histogram.is_none(), "resets is a float");
+    assert_eq!(resets[0].value, 1.0);
+
+    let changes = Evaluator::new()
+        .instant(&src, "changes(h[5m])", 5 * 60_000)
+        .expect("evaluates");
+    assert_eq!(changes.len(), 1);
+    assert!(changes[0].histogram.is_none(), "changes is a float");
+    assert_eq!(changes[0].value, 2.0);
+}
+
+#[test]
+fn deriv_over_a_pure_histogram_window_drops_with_no_annotation() {
+    // #650's deriv framing corrected: Prometheus' funcDeriv takes its
+    // `len(Floats) < 2` early return for a pure-histogram window, dropping with
+    // NO annotation. This matches Ravel's existing behavior, so deriv needs no
+    // code change. A single Ravel series is monotype (float OR histogram), so
+    // deriv can never see a mixed float+histogram window here at all.
+    let src = TestSource::new()
+        .with_histogram_series(
+            &[("__name__", "h")],
+            &[
+                (sec_ns(180), hist(&[2.0], 10.0)),
+                (sec_ns(300), hist(&[8.0], 40.0)),
+            ],
+        )
+        .expect("valid series");
+    let (value, annos) = Evaluator::new()
+        .eval_instant_annotated(&src, "deriv(h[5m])", 5 * 60_000)
+        .expect("evaluates");
+    let Value::Vector(out) = value else {
+        panic!("deriv is a vector");
+    };
+    assert!(
+        out.is_empty(),
+        "deriv drops a pure-histogram window: {out:?}"
+    );
+    assert!(
+        annos.is_empty(),
+        "deriv's histogram drop carries no annotation: {annos:?}"
     );
 }
 
