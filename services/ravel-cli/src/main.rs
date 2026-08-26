@@ -815,8 +815,9 @@ enum CatalogCommand {
         signal: SignalArg,
     },
     /// Re-list sealed commit records for one (tenant, signal) and diff against
-    /// that signal's snapshot; exits nonzero if the snapshot is missing or
-    /// mismatches sealed history.
+    /// that signal's snapshot; exits nonzero if the snapshot mismatches sealed
+    /// history. A missing snapshot is reported (nothing folded yet) and exits
+    /// zero.
     Verify {
         #[arg(long)]
         tenant: String,
