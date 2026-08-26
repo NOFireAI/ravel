@@ -62,6 +62,7 @@ pub mod flight;
 mod flight_ticket;
 mod group_keys;
 mod labels;
+mod late_materialization;
 mod like_udf;
 mod logs_provider;
 mod logs_pushdown;
@@ -98,7 +99,7 @@ pub use audit_pushdown::{AuditPushdown, extract_audit};
 pub use audit_schema::{
     AUDIT_COL_ATTRS, AUDIT_COL_BODY, AUDIT_COL_SEVERITY_TEXT, AUDIT_COL_TS, audit_schema,
 };
-pub use config::{DEFAULT_MAX_QUERY_BYTES, SqlConfig};
+pub use config::{DEFAULT_LATE_MATERIALIZATION_EXTRA_COLUMNS, DEFAULT_MAX_QUERY_BYTES, SqlConfig};
 pub use declared::{DeclaredColumn, DeclaredColumnSource, DeclaredType, StaticDeclaredColumns};
 #[cfg(feature = "flight-sql")]
 pub use distributed::{
@@ -127,6 +128,9 @@ pub use flight_ticket::{
     derive_ticket_key,
 };
 pub use group_keys::{DICTIONARY_GROUP_KEYS_RULE, DictionaryGroupKeysAsViews};
+pub use late_materialization::{
+    LogsRowFetchExec, ROW_REF_COLUMN, TOPK_LATE_MATERIALIZATION_RULE, TopKLateMaterialization,
+};
 pub use logs_provider::LogsTableProvider;
 pub use logs_pushdown::{LogsPushdown, extract_logs};
 pub use logs_scan::LogsScanExec;
