@@ -39,8 +39,8 @@ actionable finding (a walkthrough-only comment with zero findings counts
 as clean), then merge by hand once CI is green:
 
 ```sh
-scripts/pr-review-status.sh <pr-number>   # one-line CI + CodeRabbit status
-gh pr merge <pr-number> --rebase
+scripts/pr-review-status.sh <pr-number>   # one-line status; on clean, prints
+                                           # the exact merge command to run
 ```
 
 `FLEET_MERGE_AUTO=1` restores the old `gh pr merge --auto --rebase`
