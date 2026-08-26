@@ -155,7 +155,13 @@ impl ColumnSelection {
     /// Resolve to the concrete block column ids for one object, or `None` when
     /// every column is wanted (which [`crate::block::read_block_columns`] takes
     /// as "no filter").
-    pub(crate) fn resolve(&self, field_dir: &FieldDir) -> Option<HashSet<u32>> {
+    ///
+    /// Public because ADR-0699 decision 5 makes this selection a *fetch*
+    /// selection as well as a decode one: `ravel-query`'s version-4 fetcher
+    /// turns the resolved ids into the column chunks it reads by range, and it
+    /// must resolve them the same way the decode does or it would fetch a
+    /// different set of pages than the reader goes on to interpret.
+    pub fn resolve(&self, field_dir: &FieldDir) -> Option<HashSet<u32>> {
         if self.all {
             return None;
         }

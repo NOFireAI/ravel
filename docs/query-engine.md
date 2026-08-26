@@ -185,12 +185,15 @@ is resolved against the object's own FIELD_DIR
   surviving blocks before it weighs the coverage crossover, so a selective
   query reads only those blocks (and the crossover fires only when the
   survivors genuinely cover >= 75% of the BLOCKS section — the threshold is
-  unchanged). This is byte-identical to the unpruned read: the skip index's
+  unchanged). On a version-4 object the unit is the surviving blocks' pages in
+  the projected columns' chunks rather than whole blocks; see "Requests per
+  object on a version-4 object" below. This is byte-identical to the unpruned
+  read: the skip index's
   per-block bounds are conservative (ADR-0013), so a block dropped at fetch is
   one the decode-side prune would drop anyway, and the reader still runs the
   full skip/POSTINGS/bloom prune over the fetched buffer.
 - **Plan side.** `plan_segment` counts survivors from the skip index alone
-  (footer + SKIP_IDX via the 64 KiB suffix probe, plus the object's FIELD_DIR
+  (footer + SKIP_IDX via the 256 KiB suffix probe, plus the object's FIELD_DIR
   to resolve the arms) and fetches no block, carrying the footer forward so
   each per-partition subset open skips its own probe (#693 part 3). This is
   sound because for a query the skip index can decide — ts bounds and NumRange
@@ -209,21 +212,54 @@ segment at or below the block-range threshold counts there too: the fetch reads
 such an object whole in one GET regardless, so planning it from the skip index
 would cost a second read rather than save one.
 
-Reference figures on the 8,424-object ClickBench tenant. The plan phase reads,
-per segment, one 64 KiB suffix probe (footer + SKIP_IDX) plus one small
-FIELD_DIR range GET to resolve the arms — the FIELD_DIR is a front section, so
-it cannot be folded into the tail probe — and fetches no block. Bytes are
-dominated by the probes: q37-class drops from 19,690 GETs and 11.7 GB to
-between about 8,600 GETs (the ~8,424 probes plus coalesced reads of about 144
-surviving blocks, when the probe's cached suffix already covers FIELD_DIR) and
-about 17,000 GETs (a separate FIELD_DIR range GET on every object as well),
-at 0.65 to 0.9 GB either way; q20 from 29,614 GETs and 17.9 GB to about 4 to
-4.7 GB (each of its ~6,592 surviving blocks read once, never a whole-object
-re-read). GET counts stay near two to three per object, because the object
-count is the floor: the plan phase's probe and FIELD_DIR range are one each
-per relevant object however selective the predicate is, and only the
-surviving-block and directory reads scale with the predicate. These are
-predictions; the measured pass on the reference tenant replaces them.
+### Requests per object on a version-4 object
+
+A version-4 RLOG object (ADR-0699) stores each row group's pages column-major
+and lists every page in PAGE_DIR, so the fetch unit is a column chunk rather
+than a block. The request law for one statement over one such object:
+
+**One suffix probe, plus one coalesced range per surviving `(row group,
+projected column)`, plus a FIELD_DIR range only when the probe's cached suffix
+does not already cover it.** That is one to three GETs per object for a typical
+narrow projection over a small object, and it grows with `row_groups x
+projected_columns` rather than with the object's block count.
+
+The pieces, and why each is where it is:
+
+- The 256 KiB suffix probe brings the footer, SKIP_IDX and PAGE_DIR in one GET.
+  It was 64 KiB until issue #766: BLOOM (86 KB mean on the reference tenant)
+  sits between SKIP_IDX and the footer, so the shorter probe missed SKIP_IDX on
+  68.8% of above-threshold objects and cost 4,415 extra GETs per predicated
+  statement. A probe that still falls short costs one extra GET, not one per
+  section: SKIP_IDX and PAGE_DIR are adjacent and are fetched as one range, and
+  `BlockRangeStats::probe_misses` reports the residual rate.
+- STREAM_DIR and FIELD_DIR sit at the object's *front*, so no suffix probe of
+  any length reaches them. FIELD_DIR is read only when the query needs it (a
+  NumRange arm to resolve, or a projection narrower than every column), and it
+  is an extra GET only when the probe's cached suffix does not cover it — which
+  on a small object, where the probe spans the whole object, it does.
+- Chunk ranges: one per surviving `(row group, projected column)`, fewer when
+  adjacent chunks coalesce, and one for the whole group when the projection
+  keeps every column and every block of the group survives. Pruned blocks' pages
+  are the holes inside those runs, read through or split around by the
+  `coalesce_gap` policy.
+- The 75% coverage crossover still applies, now against the projected page
+  bytes: an all-columns read of every block takes a single whole-object GET
+  instead.
+
+Reference figures on the 8,424-object ClickBench tenant, at version 4. A
+single-column, predicate-free statement reads 8,424 probes plus about one
+coalesced range per object (these objects hold roughly two blocks, so one row
+group), moving on the order of `1/N` of each object for `N` columns of similar
+width — a few hundred MB against the 11.1 GB the version-3 whole-object reads
+moved for the same statement. A selective statement adds its FIELD_DIR range
+where the probe did not cover it and reads only the surviving blocks' pages:
+q37-class drops from 19,690 GETs and 11.7 GB, and q20-class from 29,614 GETs and
+17.9 GB, to between one and three GETs per relevant object either way. The
+object count is the floor in every case: the probe is one per relevant object
+however selective the predicate or narrow the projection, and only the chunk
+ranges scale with them. These are predictions; the measured pass on the
+reference tenant replaces them.
 
 Staleness: the evaluator recognizes the Prometheus staleness marker (the
 exact NaN bit pattern `0x7ff0_0000_0000_0002`, compared via

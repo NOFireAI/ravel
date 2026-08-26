@@ -346,21 +346,102 @@ does not supersede.
    groups so they pin it at the setting production runs with. Version 3 is
    unaffected: its group is one block, and it is the same code path.
 
-### Interim ravel-query reader (decision 5 not yet landed)
+### Decision 5 as built (2026-08-26): the ravel-query column-chunk fetcher
 
-Decision 5 (the PAGE_DIR-driven column-chunk fetcher) is not part of this
-change. Until it lands, every reader outside `ravel-logseg` that a version-4
-object reaches reads the object whole in one `GetRange::Full` GET rather than by
-block range: the ADR-0107 block-range protocol addresses a block by its SKIP_IDX
-byte range and verifies the block crc over exactly those bytes, and version 4
-makes neither hold (point 1 and point 3 above). A whole-object read is the same
-bytes and the same one GET the pre-ADR-0107 path used -- correct and no worse
-than before the version bump, strictly worse than decision 5 will be. This is a
-single guard in `LogSegmentFetcher::fetch_object_with_footer`, placed after the
-footer is resolved so it covers both the suffix-probe path and the plan-carried
-footer path (#693 part 3), and is pinned by
-`version_4_object_is_read_whole_until_the_page_dir_fetcher_lands` in
-`crates/ravel-query/tests/log_block_range.rs`. That test is what the decision-5
-fetcher half turns into its column-chunk assertion: the same fixture, asserting
-one coalesced ranged GET per surviving `(row group, projected column)` instead
-of one whole-object GET.
+Decision 5 landed in `crates/ravel-query/src/log_fetcher.rs`, replacing the
+interim guard that read a version-4 object whole. Five points the decision text
+left open were settled by the implementation; `docs/query-engine.md` states the
+resulting request law.
+
+5.1 **Where the version dispatch sits.** One branch in
+`BlockRangeFetcher::fetch_object_with_footer`, on `footer.section(PAGE_DIR)`,
+placed after the footer is resolved so it covers both the suffix-probe path and
+the plan-carried footer path (#693 part 3). PAGE_DIR's presence is only knowable
+from the footer, so no earlier placement is possible.
+
+5.2 **What the probe carries, and what a miss costs.**
+`DEFAULT_LOG_SUFFIX_LEN` rose from 64 KiB to 256 KiB (issue #766). The plan
+phase needs SKIP_IDX and the fetch phase needs PAGE_DIR, and both sit *before*
+BLOOM in the object, so a suffix probe reaches them only by spanning BLOOM too.
+Measured on a 32-block-group, 105-column object (7,168 pages, two full row
+groups): SKIP_IDX 31,082 B, PAGE_DIR 29,853 B, BLOOM 5,124 B, footer and trailer
+200 B, giving a 66,259 B tail -- 723 bytes past the old 64 KiB probe. On the
+reference ClickBench tenant BLOOM alone averages 86 KB, which is why that probe
+missed SKIP_IDX on 68.8% of above-threshold objects and cost 4,415 extra GETs
+per predicated statement. 256 KiB covers both shapes with headroom.
+
+A probe that still falls short costs ONE extra GET, not one per section: the
+writer emits PAGE_DIR immediately after SKIP_IDX, so the two are fetched as one
+coalesced range. `BlockRangeStats::probe_misses` counts, per object, how many of
+those tail sections the probe *window* failed to cover, so a report can show the
+residual miss rate. It is measured against the window rather than against cache
+residency, and it deliberately excludes STREAM_DIR and FIELD_DIR: those sit at
+the object's front, where no suffix probe of any length reaches them, so
+counting them would put a floor under the metric.
+
+The probe is a fixed per-object read that a narrow projection does not shrink.
+On a small object it can exceed the column chunks themselves; on the reference
+tenant's 1.3 MB objects it is 20%. It is cache-routed and shared by every
+partition and by both phases of one statement, so it is paid once per object per
+query, not once per read.
+
+5.3 **The coalescing rule for chunks, and the gap threshold this ADR left
+open.** The extents are per page, not per chunk: for each row group holding a
+surviving block, for each projected column's chunk, the pages the surviving
+blocks contribute. They are then merged by the same rule and the same
+`coalesce_gap` the version-3 block path uses (`coalesce_byte_extents` is the one
+implementation of the policy). A pruned block's pages are the holes in those
+runs. No separate whole-group case is needed: when the projection keeps every
+column and every block of a group survives, that group's pages are one
+contiguous span and coalesce into exactly one range.
+
+The "Consequences" section left the threshold across pruned blocks inside a
+chunk undecided until measured. The measurement, from the #761 fixture
+(`crates/ravel-sql/tests/logs_selective_scan_amplification.rs`): the hole
+between two wanted pages of one column is `(pruned blocks) x (page size)`, so
+the threshold's effect is a function of row-group geometry, not of object size.
+At the production shape -- 32-block groups, ~6 KB pages -- one surviving block
+in 32 leaves ~186 KB holes and the 64 KiB default splits them, which is the
+intended behaviour. At that fixture's shape -- one row group of six blocks,
+`body` pages of ~12.4 KB -- the hole between `body`'s surviving page and the
+next wanted chunk is ~61.8 KB, just under the default, so the default fuses the
+whole BLOCKS section into one range and returns the amplification #761 removed.
+The default is unchanged here (this ADR's rule is "ADR-0107's existing gap
+policy applies"), the fixture pins `with_coalesce_gap(0)` and says why, and the
+open question is now a measured one: a gap threshold expressed as an absolute
+byte count behaves differently at every row-group geometry, and the middle
+region (groups of roughly 4 to 10 blocks with pages of 6 to 16 KB) reads through
+every pruned page. Deciding a scale-relative rule is left to its own change.
+
+5.4 **The checksum rule for a projected read.** A projected fetch cannot verify
+the block crc and does not try: that crc covers the block's pages in `column_id`
+order (point 1 of the 2026-08-26 amendment), which a reader holding two of a
+hundred columns does not have. `decode_v4_block` verifies each page it reads
+against that page's own PAGE_DIR `crc32c` before decompressing it, and verifies
+the block crc as well exactly when the selection kept every one of the block's
+pages. Every byte the fetch brings and the reader interprets is therefore
+checksum-covered on its access path (ADR-0010 §4), and the holes inside a
+coalesced range are never interpreted at all. This is also what makes the
+coalesced range a legitimate cache unit despite spanning pruned pages: a corrupt
+cache hit fails at the first page crc the decode checks, exactly as a corrupt
+live fetch does. `docs/log-segment-format.md` ("BLOCKS") is the normative
+statement.
+
+5.5 **The crossover, and what the plan phase reads.** The coverage crossover is
+unchanged at 75%, but its numerator is now the projected page bytes rather than
+whole candidate blocks, still measured against the BLOCKS section's own size. A
+narrow projection therefore stays far below it even when every block survives,
+and an all-columns read of every block reaches ~1.0 and takes the single
+whole-object GET. On that branch no per-block cache entries are admitted, unlike
+the version-3 path: a version-4 block is not a contiguous extent, so there is no
+block-keyed entry a later ranged read would look for.
+
+`plan_segment` fetches no page on either of its version-4 branches. The
+predicate-free branch reads the footer alone; the skip-decidable branch reads
+footer, SKIP_IDX and FIELD_DIR, and brings PAGE_DIR alongside SKIP_IDX under the
+extent key the scan phase will use, so the scan finds it cached rather than
+paying a second round trip. A scan that carries a plan footer asks the cache for
+the probe extent itself (as a `Range` GET of the same bytes, so it keys
+identically), which places the footer, the trailer and every tail section at
+once for no GET; that is done only when a read cache is wired, because without
+one it would re-read the tail on the wire instead of the individual sections.
