@@ -37,11 +37,13 @@ static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
 
 const NUM_COLUMNS: usize = 105;
 
-/// BLAKE3 of the synthetic object at each batch size, computed against the
-/// PRE-FIX writer (before this change) and unchanged by every step of the fix.
-/// A mismatch means the fix altered an output byte, which it must never do.
-const HASH_8K: &str = "c13ffbb6ebb2f8aacd29302267f5a3c052ddc61c8332735d2afd7fc782c81071";
-const HASH_64K: &str = "0da2d9e1bf96a9c5ff9a79de9ec037dde78255ed2ef741887bd2f0243750017a";
+/// BLAKE3 of the synthetic object at each batch size. Regenerated when the
+/// default writer moved from RLOG version 3 to version 4 (ADR-0699): the object
+/// bytes are the version-4 row-group layout now, so these pins moved with the
+/// format bump. #682's invariant is unchanged -- the per-block cell
+/// materialization must not alter an output byte within a fixed writer version.
+const HASH_8K: &str = "570d3846e351527186b617b8e84f9127994da7c6e8c8122074a13b360d74e299";
+const HASH_64K: &str = "7cea4d5a46bf7f7c8df6538c77c131f589d0ebdd28d3e9549c0d58a04cf3799a";
 
 /// Peak-live-bytes bound as a multiple of the total cell payload `P`. Measured
 /// K = peak(65536) / P = 1.865 after the fix; rounded up to the next 0.5. The
