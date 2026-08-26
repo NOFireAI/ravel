@@ -136,15 +136,27 @@ async fn generated_lane_reports_per_query_min_median_max_and_scan_diagnostics() 
 
     // Scan diagnostics: at least one statement scans blocks over the durable
     // objects, proving the block counters are wired rather than always zero.
+    // Every in-process entry carries them; only the Flight lane reports `None`.
+    for e in &report.entries {
+        assert!(
+            e.scan.is_some(),
+            "the in-process lane reports scan diagnostics for `{}`",
+            e.id
+        );
+    }
+    let scans: Vec<&ravel_bench::sql_latency::ScanDiagnostics> = report
+        .entries
+        .iter()
+        .filter_map(|e| e.scan.as_ref())
+        .collect();
     assert!(
-        report.entries.iter().any(|e| e.scan.blocks_total > 0),
+        scans.iter().any(|s| s.blocks_total > 0),
         "at least one entry must report a non-zero blocks_total"
     );
     assert!(
-        report
-            .entries
+        scans
             .iter()
-            .any(|e| e.scan.segments == report.dataset.object_count),
+            .any(|s| s.segments == report.dataset.object_count),
         "a full-window statement sees every dataset segment"
     );
 
@@ -158,22 +170,23 @@ async fn generated_lane_reports_per_query_min_median_max_and_scan_diagnostics() 
     let scanning = report
         .entries
         .iter()
-        .filter(|e| e.scan.blocks_total > 0)
-        .max_by_key(|e| e.scan.object_store_get_requests)
+        .filter_map(|e| e.scan.as_ref().map(|s| (e, s)))
+        .filter(|(_, s)| s.blocks_total > 0)
+        .max_by_key(|(_, s)| s.object_store_get_requests)
         .expect("at least one entry scans blocks");
     assert!(
-        scanning.scan.object_store_get_requests >= report.dataset.object_count as u64,
+        scanning.1.object_store_get_requests >= report.dataset.object_count as u64,
         "entry `{}` charged {} GETs for a {}-object dataset: fewer GETs than \
          objects means the accounting is under-counting reads",
-        scanning.id,
-        scanning.scan.object_store_get_requests,
+        scanning.0.id,
+        scanning.1.object_store_get_requests,
         report.dataset.object_count
     );
     assert!(
-        scanning.scan.object_store_bytes >= 1_024,
+        scanning.1.object_store_bytes >= 1_024,
         "entry `{}` charged only {} object-store bytes across {} objects",
-        scanning.id,
-        scanning.scan.object_store_bytes,
+        scanning.0.id,
+        scanning.1.object_store_bytes,
         report.dataset.object_count
     );
 

@@ -26,6 +26,17 @@
 //!   so the query would return wrong numbers with a plausible latency instead
 //!   of an error.
 //!
+//! The tenant lane has a second mode, behind the `flight-lane` feature: with
+//! [`TenantConfigInput::flight`] set it executes each statement through a
+//! running `ravel-server`'s Flight SQL endpoint instead of an in-process
+//! executor, so the number a user would see (server planning, gRPC, Arrow IPC
+//! encode and decode, all of it) can be produced from the same corpus into the
+//! same report. It still resolves the dataset stanza and the declared-column
+//! set from the object store directly, because a Flight client cannot read the
+//! tenant's catalog and the skip check needs the declarations. What it loses is
+//! [`ScanDiagnostics`]: those come off the executor's own counters, which no
+//! Flight response carries, so its entries report `scan: None`.
+//!
 //! Report-only: like the rest of `ravel-bench`, this never changes library
 //! behavior, it only measures it.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -154,7 +165,7 @@ pub struct Provenance {
     pub endpoint: String,
     /// Logical cores on the measuring host.
     pub host_logical_cores: usize,
-    /// Which lane produced the run: `"generate"` or `"tenant"`.
+    /// Which lane produced the run: `"generate"`, `"tenant"`, or `"flight"`.
     pub source: String,
     /// The tenant the numbers describe (a generated run mints a unique id).
     pub dataset_id: String,
@@ -176,6 +187,12 @@ pub struct Provenance {
     /// full-scan statement is latency-bound and moves nearly linearly with it.
     #[serde(default = "default_fetch_concurrency")]
     pub fetch_concurrency: usize,
+    /// The Flight SQL endpoint (`host:port`) the statements were executed
+    /// against, or `None` for an in-process lane. Deliberately not `endpoint`
+    /// above: that one names the object store, and the two are different
+    /// machines in any deployment worth measuring.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flight_endpoint: Option<String>,
 }
 
 /// What every run used before the knob was configurable (issue #680); also
@@ -254,8 +271,12 @@ pub struct EntryReport {
     pub cold_ms: f64,
     /// Rows the statement returned.
     pub rows_returned: usize,
-    /// Where the time went.
-    pub scan: ScanDiagnostics,
+    /// Where the time went. `Some` for the in-process lanes, which read the
+    /// executor's own counters. `None` for the Flight lane: those counters are
+    /// executor-side state a Flight SQL response does not carry, and reporting
+    /// zeros would read as "nothing was scanned".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan: Option<ScanDiagnostics>,
 }
 
 /// One statement that was not run because the dataset does not satisfy its
@@ -385,6 +406,25 @@ pub struct GenerateConfig {
     pub progress_jsonl: Option<std::path::PathBuf>,
 }
 
+/// Where the Flight lane sends its statements.
+///
+/// Present unconditionally so [`TenantConfigInput`] has one shape under every
+/// feature set; only the code that *uses* it is behind `flight-lane`, and a
+/// binary built without that feature refuses a run that sets this rather than
+/// silently measuring in process.
+#[derive(Clone, Debug)]
+pub struct FlightTarget {
+    /// `host:port` of the server's gRPC listener (`ravel-server
+    /// --listen-grpc`, which carries Flight SQL when the server is built with
+    /// its `flight-sql` feature).
+    pub endpoint: String,
+    /// Bearer credential the server's tenant resolver maps to the tenant under
+    /// measurement, sent as `authorization: Bearer <token>`. `None` sends no
+    /// credential, which only reaches a server configured to resolve tenants
+    /// some other way.
+    pub token: Option<String>,
+}
+
 /// Inputs for the loaded-tenant lane.
 pub struct TenantConfigInput {
     pub store: Arc<dyn ObjectStoreBackend>,
@@ -434,6 +474,12 @@ pub struct TenantConfigInput {
     /// file as the run goes, flushed per line, so a run killed hours in still
     /// leaves every number it had measured. `None` writes nothing.
     pub progress_jsonl: Option<std::path::PathBuf>,
+    /// `Some` executes every statement through a running server's Flight SQL
+    /// endpoint instead of an in-process [`SqlExecutor`]. The dataset stanza
+    /// and the declared-column set are still resolved from `store` directly:
+    /// a Flight client cannot read the tenant's catalog, and the skip check
+    /// needs the declarations.
+    pub flight: Option<FlightTarget>,
 }
 
 fn percentile(sorted_ns: &[u64], pct: f64) -> u64 {
@@ -710,7 +756,7 @@ pub async fn measure_corpus(
             max_ms: to_ms(*sorted.last().unwrap()),
             cold_ms: to_ms(cold_ns),
             rows_returned,
-            scan,
+            scan: Some(scan),
         };
         if let Some(sink) = progress.as_mut() {
             sink.write(&EntryEvent::Measured(report.clone()))?;
@@ -721,6 +767,186 @@ pub async fn measure_corpus(
     profile.finish();
 
     Ok((measured, skipped, failed))
+}
+
+/// Measure `entries` by executing each statement through a running server's
+/// Flight SQL endpoint, the path an external client actually takes.
+///
+/// Same loop as [`measure_corpus`], same [`EntryReport`], same progress
+/// stream; the differences are forced by the wire. The skip check still runs
+/// off `declared`, which the caller resolved from the object store, because a
+/// Flight client cannot read the tenant's catalog. Every entry it produces
+/// carries `scan: None`: block counters, object-store request counts, and
+/// cache hits are executor-side state the Flight response does not carry.
+///
+/// The window travels in the request metadata (`x-ravel-start` /
+/// `x-ravel-end`, Unix float seconds), which is how ravel-sql's Flight service
+/// reads it -- the Flight SQL command itself carries no window. The deadline
+/// travels the same way as `x-ravel-timeout`, and the server clamps it to its
+/// own maximum.
+#[cfg(feature = "flight-lane")]
+async fn measure_over_flight(
+    target: &FlightTarget,
+    cfg: &TenantConfigInput,
+    declared: &[DeclaredColumn],
+) -> Result<(Vec<EntryReport>, Vec<SkippedEntry>, Vec<FailedEntry>), Error> {
+    use arrow_flight::sql::client::FlightSqlServiceClient;
+    use tonic::transport::Channel;
+
+    let runs = cfg.runs.max(1);
+    let mut measured = Vec::new();
+    let mut skipped = Vec::new();
+    let mut failed = Vec::new();
+    let mut progress = cfg
+        .progress_jsonl
+        .as_deref()
+        .map(ProgressSink::open)
+        .transpose()?;
+
+    let uri = format!("http://{}", target.endpoint);
+    let channel = Channel::from_shared(uri.clone())
+        .map_err(|e| format!("invalid Flight endpoint `{uri}`: {e}"))?;
+
+    'entries: for entry in &cfg.entries {
+        if let Some((missing_key, want)) = first_unsatisfied(entry, declared) {
+            let skip = SkippedEntry {
+                id: entry.id.clone(),
+                missing_key: missing_key.clone(),
+                reason: format!(
+                    "required declared column `{missing_key}` ({want:?}) is not satisfied by the \
+                     dataset under measurement"
+                ),
+            };
+            if let Some(sink) = progress.as_mut() {
+                sink.write(&EntryEvent::Skipped(skip.clone()))?;
+            }
+            skipped.push(skip);
+            continue;
+        }
+
+        // One client per entry, connected lazily. Lazily matters: an
+        // unreachable endpoint must surface as the statement's error inside the
+        // run loop, where `continue_on_error` governs it, rather than aborting
+        // the whole run before any entry has been attempted.
+        let mut client = FlightSqlServiceClient::new(channel.clone().connect_lazy());
+        if let Some(token) = &target.token {
+            client.set_header("authorization", format!("Bearer {token}"));
+        }
+        client.set_header("x-ravel-start", seconds_header(cfg.window.start_ns));
+        client.set_header("x-ravel-end", seconds_header(cfg.window.end_ns));
+        client.set_header("x-ravel-timeout", format!("{}", cfg.deadline.as_secs_f64()));
+
+        let mut latencies_ns = Vec::with_capacity(runs);
+        let mut cold_ns = 0u64;
+        let mut rows_returned = 0usize;
+
+        for run in 0..runs {
+            let start = Instant::now();
+            let rows = match execute_over_flight(&mut client, &entry.sql).await {
+                Ok(rows) => rows,
+                Err(e) if cfg.continue_on_error => {
+                    let failure = FailedEntry {
+                        id: entry.id.clone(),
+                        run,
+                        error: e.to_string(),
+                    };
+                    if let Some(sink) = progress.as_mut() {
+                        sink.write(&EntryEvent::Failed(failure.clone()))?;
+                    }
+                    failed.push(failure);
+                    continue 'entries;
+                }
+                Err(e) => {
+                    return Err(Error::from(format!(
+                        "entry `{}` failed to execute: {e}",
+                        entry.id
+                    )));
+                }
+            };
+            let elapsed_ns = start.elapsed().as_nanos() as u64;
+            latencies_ns.push(elapsed_ns);
+            if run == 0 {
+                cold_ns = elapsed_ns;
+                rows_returned = rows;
+            }
+        }
+
+        let mut sorted = latencies_ns.clone();
+        sorted.sort_unstable();
+        let to_ms = |ns: u64| ns as f64 / 1e6;
+        let report = EntryReport {
+            id: entry.id.clone(),
+            min_ms: to_ms(*sorted.first().unwrap()),
+            median_ms: to_ms(percentile(&sorted, 0.50)),
+            max_ms: to_ms(*sorted.last().unwrap()),
+            cold_ms: to_ms(cold_ns),
+            rows_returned,
+            scan: None,
+        };
+        if let Some(sink) = progress.as_mut() {
+            sink.write(&EntryEvent::Measured(report.clone()))?;
+        }
+        measured.push(report);
+    }
+
+    Ok((measured, skipped, failed))
+}
+
+/// Render a nanosecond instant as the Unix float seconds the window metadata
+/// keys are defined in.
+#[cfg(feature = "flight-lane")]
+fn seconds_header(ns: i64) -> String {
+    format!("{}", ns as f64 / 1e9)
+}
+
+/// One statement over Flight SQL: `GetFlightInfo` to plan and mint a ticket,
+/// then `DoGet` per endpoint to redeem it, draining every batch. Returns the
+/// rows the statement produced.
+#[cfg(feature = "flight-lane")]
+async fn execute_over_flight(
+    client: &mut arrow_flight::sql::client::FlightSqlServiceClient<tonic::transport::Channel>,
+    sql: &str,
+) -> Result<usize, Error> {
+    use futures::TryStreamExt;
+
+    let info = client
+        .execute(sql.to_string(), None)
+        .await
+        .map_err(|e| format!("GetFlightInfo: {e}"))?;
+
+    let mut rows = 0usize;
+    for endpoint in &info.endpoint {
+        let ticket = endpoint
+            .ticket
+            .clone()
+            .ok_or_else(|| "Flight endpoint carries no ticket".to_string())?;
+        let batches = client
+            .do_get(ticket)
+            .await
+            .map_err(|e| format!("DoGet: {e}"))?
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|e| format!("decode Flight batches: {e}"))?;
+        rows += batches.iter().map(|batch| batch.num_rows()).sum::<usize>();
+    }
+    Ok(rows)
+}
+
+/// Refusal for a binary built without the `flight-lane` feature: the Flight
+/// client is not linked, so the only honest answer is an error naming the
+/// feature. Measuring in process instead would silently answer a different
+/// question than the one `--flight` asked.
+#[cfg(not(feature = "flight-lane"))]
+async fn measure_over_flight(
+    target: &FlightTarget,
+    _cfg: &TenantConfigInput,
+    _declared: &[DeclaredColumn],
+) -> Result<(Vec<EntryReport>, Vec<SkippedEntry>, Vec<FailedEntry>), Error> {
+    Err(Error::from(format!(
+        "cannot execute against Flight SQL endpoint `{}`: this binary was built without the \
+         `flight-lane` feature (rebuild with --features sql-latency,flight-lane)",
+        target.endpoint
+    )))
 }
 
 /// Resolve the dataset-level figures (bytes, object count, rows) from a
@@ -816,6 +1042,7 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
             cache_bytes: cfg.cache_bytes,
             deadline_secs: cfg.deadline.as_secs(),
             fetch_concurrency: cfg.fetch_concurrency.max(1),
+            flight_endpoint: None,
         },
         dataset,
         entries,
@@ -871,23 +1098,31 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
         }
         .into());
     }
-    let (entries, skipped, failed) = measure_corpus(
-        &cfg.store,
-        tenant_hash,
-        &cfg.entries,
-        &declared,
-        cfg.runs,
-        cfg.window,
-        cfg.now_ns,
-        cfg.max_query_bytes,
-        shard_count,
-        cfg.cache_bytes,
-        cfg.deadline,
-        cfg.continue_on_error,
-        cfg.fetch_concurrency,
-        cfg.progress_jsonl.as_deref(),
-    )
-    .await?;
+    // The two lanes measure the same statements over the same dataset stanza
+    // and the same declared-column set; they differ only in what executes the
+    // SQL, in process or across a gRPC channel to a server.
+    let (entries, skipped, failed) = match &cfg.flight {
+        Some(target) => measure_over_flight(target, cfg, &declared).await?,
+        None => {
+            measure_corpus(
+                &cfg.store,
+                tenant_hash,
+                &cfg.entries,
+                &declared,
+                cfg.runs,
+                cfg.window,
+                cfg.now_ns,
+                cfg.max_query_bytes,
+                shard_count,
+                cfg.cache_bytes,
+                cfg.deadline,
+                cfg.continue_on_error,
+                cfg.fetch_concurrency,
+                cfg.progress_jsonl.as_deref(),
+            )
+            .await?
+        }
+    };
 
     Ok(SqlLatencyReport {
         provenance: Provenance {
@@ -895,12 +1130,16 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
             region: cfg.region.clone(),
             endpoint: cfg.endpoint.clone(),
             host_logical_cores: host_logical_cores(),
-            source: "tenant".to_string(),
+            source: match &cfg.flight {
+                Some(_) => "flight".to_string(),
+                None => "tenant".to_string(),
+            },
             dataset_id: cfg.tenant.clone(),
             runs: cfg.runs.max(1),
             cache_bytes: cfg.cache_bytes,
             deadline_secs: cfg.deadline.as_secs(),
             fetch_concurrency: cfg.fetch_concurrency.max(1),
+            flight_endpoint: cfg.flight.as_ref().map(|t| t.endpoint.clone()),
         },
         dataset,
         entries,
@@ -1211,6 +1450,7 @@ mod tests {
             continue_on_error: false,
             fetch_concurrency: DEFAULT_FETCH_CONCURRENCY,
             progress_jsonl: None,
+            flight: None,
         }
     }
 
