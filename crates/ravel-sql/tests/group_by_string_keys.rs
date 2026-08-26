@@ -400,16 +400,16 @@ async fn a_panicking_operator_surfaces_as_a_typed_error() {
         .await
         .expect("physical plan builds");
 
-    // The default hook would print the planted panic and its backtrace, which
-    // is correct in production and only noise here. Silence it for the poll,
-    // then put the previous hook back so a genuine test failure still reports.
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
+    // The panic surfaces as a typed error at the stream boundary, which is
+    // what the assertions below check; there is nothing to read off a panic
+    // hook. Leaving the global hook untouched matters: cargo test runs this
+    // binary's tests on parallel threads, so swapping it here would swallow a
+    // concurrent test's panic output for the duration of the poll. The default
+    // hook printing the planted panic's backtrace is harmless noise.
     let mut stream =
         PinnedStream::start(ctx, plan, schema, CeilingBreach::new()).expect("stream starts");
     let first = stream.next().await;
     let second = stream.next().await;
-    std::panic::set_hook(previous);
 
     let err = match first {
         Some(Err(err)) => err,
@@ -487,6 +487,12 @@ fn key_context(
         let values: Vec<String> = (next..end)
             .map(|i| {
                 let mut s = format!("https://example.test/{i:012}/");
+                assert!(
+                    key_len >= s.len(),
+                    "key_len ({key_len}) must be at least the built prefix length ({}) \
+                     so the padding subtraction cannot underflow",
+                    s.len()
+                );
                 s.push_str(&"p".repeat(key_len - s.len()));
                 s
             })
