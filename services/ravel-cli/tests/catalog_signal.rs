@@ -187,11 +187,13 @@ async fn fold_signal_logs_folds_the_logs_snapshot_and_a_logs_resolve_reads_no_co
     let tenant_hash = TenantId::new(tenant).hash();
     seed_logs_tenant(&inner, tenant).await;
 
-    let report = catalog::fold(
+    let (report, _printed) = catalog::fold(
         inner.clone() as Arc<dyn ObjectStoreBackend>,
         tenant,
         SHARD_COUNT,
         FOLD_SIGNAL,
+        None,
+        now_ns(),
     )
     .await
     .expect("cli fold succeeds");
@@ -284,6 +286,8 @@ async fn inspect_signal_logs_prints_the_signal_word() {
         tenant,
         SHARD_COUNT,
         SignalArg::Logs,
+        None,
+        now_ns(),
     )
     .await
     .expect("cli fold succeeds");
@@ -323,6 +327,8 @@ async fn verify_signal_logs_checks_the_logs_snapshot() {
         tenant,
         SHARD_COUNT,
         SignalArg::Logs,
+        None,
+        now_ns(),
     )
     .await
     .expect("cli fold succeeds");

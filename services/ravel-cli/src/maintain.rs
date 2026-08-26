@@ -47,28 +47,10 @@ fn wall_clock() -> anyhow::Result<FixedClock> {
     Ok(FixedClock::new(crate::now_ns()?))
 }
 
-/// Parse a `--max-flush-lifetime` value into nanoseconds.
-///
-/// Same grammar as ravel-server's `--gc-max-flush-lifetime`: a humantime
-/// duration string (`1h`, `30m`, `1h5m`), converted to `i64` nanoseconds. The
-/// server's parser is `parse_gc_duration_ns` in
-/// services/ravel-server/src/config.rs; it is private to a crate ravel-cli does
-/// not depend on at build time, so the grammar is copied here rather than
-/// shared. One deliberate difference: zero is accepted, because `0s` is the
-/// point of this override on a quiescent tenant (seal every bucket whose hour
-/// has ended, subject only to the clock-skew allowance). Negative values are
-/// unrepresentable in humantime, so the only rejections are an unparseable
-/// spelling and a value too large for `i64` nanoseconds.
-pub fn parse_max_flush_lifetime_ns(s: &str) -> Result<i64, String> {
-    let dur = humantime::parse_duration(s)
-        .map_err(|e| format!("invalid --max-flush-lifetime '{s}': {e}"))?;
-    i64::try_from(dur.as_nanos()).map_err(|_| format!("--max-flush-lifetime '{s}' is too large"))
-}
-
 /// The compactor config a `compact-bucket` / `compact-tenant` invocation runs
 /// with: defaults, plus the dry-run switch and the optional operator override
 /// of `max_flush_lifetime_ns` (which moves the seal margin, see
-/// [`parse_max_flush_lifetime_ns`]).
+/// [`crate::parse_max_flush_lifetime_ns`]).
 fn compactor_config(dry_run: bool, max_flush_lifetime_ns: Option<i64>) -> CompactorConfig {
     let mut config = CompactorConfig {
         dry_run,
