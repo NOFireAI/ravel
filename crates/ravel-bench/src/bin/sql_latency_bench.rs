@@ -391,6 +391,7 @@ fn print_human_table(report: &SqlLatencyReport) {
     println!("  fetch conc : {}", p.fetch_concurrency);
     let effective =
         parallel_final_aggregation_effective_label(p.parallel_final_aggregation_effective);
+    println!("  query max  : {} bytes", p.sql_max_query_bytes);
     println!(
         "  tenant max : {} bytes  parallel final agg: requested={} effective={}",
         p.tenant_max_bytes, p.parallel_final_aggregation_requested, effective

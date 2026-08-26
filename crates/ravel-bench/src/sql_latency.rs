@@ -193,6 +193,14 @@ pub struct Provenance {
     /// full-scan statement is latency-bound and moves nearly linearly with it.
     #[serde(default = "default_fetch_concurrency")]
     pub fetch_concurrency: usize,
+    /// The per-query DataFusion memory-pool ceiling for the run
+    /// (`ravel-server --sql-max-query-bytes`, ADR-0088). A statement that failed
+    /// with `query memory pool exhausted` was refused by this, not by
+    /// `tenant_max_bytes`. Recorded so a report states the per-query budget its
+    /// statements ran under; a report written before this field existed
+    /// deserializes to [`ravel_sql::DEFAULT_MAX_QUERY_BYTES`].
+    #[serde(default = "default_max_query_bytes")]
+    pub sql_max_query_bytes: usize,
     /// The tenant accountant's ceiling for the run. A statement that failed
     /// with `tenant memory budget exhausted` was refused by this, not by
     /// `max_query_bytes`.
@@ -241,6 +249,13 @@ pub struct Provenance {
 /// The tenant ceiling every run used before the knob was configurable.
 fn default_tenant_max_bytes() -> usize {
     DEFAULT_TENANT_MAX_BYTES
+}
+
+/// The per-query pool ceiling every run used before the knob was recorded in
+/// provenance (issue #615); also what a report written before the field existed
+/// deserializes to.
+fn default_max_query_bytes() -> usize {
+    DEFAULT_MAX_QUERY_BYTES
 }
 
 /// The engine segment ceiling every run used before the knob was configurable
@@ -1284,6 +1299,7 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
             cache_bytes: cfg.cache_bytes,
             deadline_secs: cfg.deadline.as_secs(),
             fetch_concurrency: cfg.fetch_concurrency.max(1),
+            sql_max_query_bytes: cfg.max_query_bytes,
             tenant_max_bytes: cfg.tenant_max_bytes.max(1),
             sql_max_segments: cfg.max_segments,
             parallel_final_aggregation_requested: cfg.parallel_final_aggregation,
@@ -1395,6 +1411,7 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
             cache_bytes: cfg.cache_bytes,
             deadline_secs: cfg.deadline.as_secs(),
             fetch_concurrency: cfg.fetch_concurrency.max(1),
+            sql_max_query_bytes: cfg.max_query_bytes,
             tenant_max_bytes: cfg.tenant_max_bytes.max(1),
             sql_max_segments: cfg.max_segments,
             parallel_final_aggregation_requested: cfg.parallel_final_aggregation,
@@ -2708,5 +2725,38 @@ mod tests {
         let executor =
             cold_executor(&store, &[], None, ExecutorSettings::default()).expect("build executor");
         assert_eq!(executor.config().max_query_bytes, DEFAULT_MAX_QUERY_BYTES);
+    }
+
+    /// The effective per-query pool ceiling is recorded in the run's provenance
+    /// block (issue #615): a run with a raised `--sql-max-query-bytes` records
+    /// exactly that value, and an unset flag records the compiled-in default.
+    /// Before the field existed the block carried no per-query budget at all, so
+    /// this assertion has nothing to read and fails to compile against the old
+    /// provenance; with the field present but unpopulated it would read the
+    /// serde default and the raised-value arm goes red.
+    #[tokio::test]
+    async fn provenance_records_effective_max_query_bytes() {
+        let store = empty_store();
+        provisioned_tenant(&store, "maxquerybytes-tenant").await;
+
+        let custom = DEFAULT_MAX_QUERY_BYTES * 4;
+        assert_ne!(custom, DEFAULT_MAX_QUERY_BYTES);
+        let mut cfg = tenant_cfg(&store, "maxquerybytes-tenant", None, 0);
+        cfg.entries = vec![entry("scan", "SELECT body FROM logs")];
+        cfg.max_query_bytes = custom;
+        let report = run_tenant(&cfg).await.expect("tenant lane runs");
+        assert_eq!(
+            report.provenance.sql_max_query_bytes, custom,
+            "the raised per-query pool ceiling is recorded in provenance"
+        );
+
+        // Unset flag (the config default): the block records the compiled-in
+        // budget byte-for-byte.
+        let cfg = tenant_cfg(&store, "maxquerybytes-tenant", None, 0);
+        let report = run_tenant(&cfg).await.expect("tenant lane runs");
+        assert_eq!(
+            report.provenance.sql_max_query_bytes, DEFAULT_MAX_QUERY_BYTES,
+            "an unset flag records the compiled-in per-query budget"
+        );
     }
 }
