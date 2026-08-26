@@ -119,6 +119,10 @@ struct Args {
     /// survives a run killed hours in.
     #[arg(long, value_name = "PATH")]
     progress_jsonl: Option<std::path::PathBuf>,
+    /// Execute each statement through a running `ravel-server`'s Flight SQL
+    /// endpoint (`host:port`) instead of the in-process executor.
+    #[arg(long, value_name = "HOST:PORT")]
+    flight: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, clap::ValueEnum)]
