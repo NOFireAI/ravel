@@ -385,23 +385,58 @@ async fn mixed_level_snapshot_sort_is_deterministic() {
     let start = range.start_ns;
 
     // An unlisted L0 (survives) plus a compaction record with two parts.
-    let unlisted = l0_record(Uuid::new_v4(), 0, 9, HOUR, start + 100, start, start + 100);
-    let input = l0_record(Uuid::new_v4(), 0, 1, HOUR, start + 100, start, start + 100);
+    //
+    // Both writer ids are pinned rather than drawn. The snapshot sort
+    // tie-breaks on writer_id, so with random ids the only order this test
+    // could state is "whatever the previous resolve produced" -- which is
+    // satisfied by a sort that varies from run to run, exactly the property
+    // the test name claims is impossible. Pinned, the expected sequence is
+    // written down below, so a change to the sort key fails here instead of
+    // silently reordering snapshots.
+    let unlisted = l0_record(
+        Uuid::from_u128(0x9),
+        0,
+        9,
+        HOUR,
+        start + 100,
+        start,
+        start + 100,
+    );
+    let input = l0_record(
+        Uuid::from_u128(0x1),
+        0,
+        1,
+        HOUR,
+        start + 100,
+        start,
+        start + 100,
+    );
     put_l0(store.as_ref(), &unlisted).await;
     put_l0(store.as_ref(), &input).await;
-    put_compaction_record(
+    let parts = vec![
+        part(0, start, start + 100, 7),
+        part(1, start, start + 100, 3),
+    ];
+    let (compaction, _) = put_compaction_record(
         store.as_ref(),
         0,
         HOUR,
         &[&input],
-        vec![
-            part(0, start, start + 100, 7),
-            part(1, start, start + 100, 3),
-        ],
+        parts.clone(),
         start + 100,
         b"set-1",
     )
     .await;
+
+    // The two L1 parts share the compaction record's created_unix_ns with the
+    // surviving L0, so the sort falls through to writer_epoch/writer_seq: the
+    // parts carry 0 and the L0 carries seq 9, putting both parts first, in
+    // part_index order, with the L0 last.
+    let expected = vec![
+        keys::reconstruct_l1_part_key(&compaction, &parts[0]).expect("part 0 key"),
+        keys::reconstruct_l1_part_key(&compaction, &parts[1]).expect("part 1 key"),
+        keys::reconstruct_data_key(&unlisted).expect("unlisted L0 data key"),
+    ];
 
     let first = catalog
         .resolve(&tenant(), Signal::Metrics, range, &[], now)
@@ -421,7 +456,12 @@ async fn mixed_level_snapshot_sort_is_deterministic() {
         .iter()
         .map(|s| s.data_object_key.clone())
         .collect();
-    assert_eq!(order1, order2, "sort is a deterministic total order");
+    assert_eq!(
+        order1, expected,
+        "the sort is a fixed total order over fixed inputs, not merely a \
+         repeatable one"
+    );
+    assert_eq!(order2, expected, "and it repeats across resolves");
     assert_eq!(first.segments.len(), 3);
 }
 
