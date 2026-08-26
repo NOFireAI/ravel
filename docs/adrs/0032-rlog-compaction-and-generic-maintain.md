@@ -305,11 +305,24 @@ order after loading, catalogs stay aligned to that order, and the merge
 is a deterministic k-way merge over it. A test asserts the parts are
 byte-identical at concurrency 1 and 8.
 
-### Not in scope
+### The erasure rewriter shares this merge (amended 2026-08-26)
 
-`build_rewrite_logs` (the ADR-0064 erasure rewriter for logs) still
-fetches every input object whole and pushes every survivor into a single
-`RlogWriter` with no size cap, by the deliberate scope reduction its own
-module documents. It has the same unbounded-writer shape this amendment
-removed from the compactor, and reaches it on the same tenant shape. It
-is not changed here; see the issue for the follow-up.
+As first written, this amendment left `build_rewrite_logs` (the ADR-0064
+erasure rewriter for logs) out of scope: it fetched every input object
+whole and pushed every survivor into a single `RlogWriter` with no size
+cap, the same unbounded-writer shape this amendment removed from the
+compactor, reached on the same tenant shape.
+
+That follow-up landed. `build_rewrite_logs` now runs the same k-way
+block-streaming merge, with the erasure predicate as a per-record filter
+and `input_read_concurrency` bounding its catalog loads, so it inherits
+every bound described above: one decoded block per input plus one
+in-progress part, never the bucket. A logs erasure rewrite therefore
+emits N parts, exactly as a compaction does, and for the same reason.
+Nothing downstream assumed one part: ADR-0064's conservation gate is
+already stated over `sum(output sample_count)`, the parts are already
+PUT under `part_index`-keyed content-addressed keys, and the catalog
+already unions every part of a `RewriteRecord`.
+
+The RSPAN erasure rewriter (`build_rewrite_spans`) still has the
+whole-object, single-writer shape; it was not part of that follow-up.

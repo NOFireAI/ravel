@@ -113,6 +113,18 @@
 //! section reader); [`ravel_logseg::open_from_suffix`] is now the RLOG analogue
 //! of `ravel_segment::open_from_suffix` and closed that raw-bytes gap.
 //!
+//! # One merge, two callers
+//!
+//! [`merge_catalogs`] is that merge, and both RLOG writers of L1 parts run
+//! through it: compaction ([`RlogCodec::build_parts`]) keeping every record,
+//! and the ADR-0064 selective-erasure rewrite
+//! (`erasure_rewrite::build_rewrite_logs`) keeping the records no pending
+//! request's matcher drops (issue #725). The rewrite used to have its own
+//! whole-object read and its own single unbounded writer, which is how it
+//! reached the pre-#711 peak on the same tenant shape. Sharing the driver
+//! bounds it and keeps the two from drifting on merge order, on where a part
+//! splits, or on the cross-object stream-identity invariant.
+//!
 //! # What a reader must tolerate after the split
 //!
 //! Two consecutive parts of one compaction may carry the same `stream_id`,
@@ -192,7 +204,15 @@ pub struct RlogInputCatalog {
     /// The dynamic attribute names this input carries a POSTINGS entry for, as
     /// recovered by [`input_indexed_fields`]. Only the *names* survive into the
     /// merge; no posting list from an input is ever read (ADR-0049 decision 6).
+    /// Empty when the caller asked for no recovery (see
+    /// [`load_catalog_from_object`]).
     pub indexed_fields: Vec<String>,
+    /// This input object's own footer `record_count`, retained from the footer
+    /// this load already read. The erasure rewrite's input-side conservation
+    /// gate (`erasure_rewrite::input_footer_cross_check`) needs it, and taking
+    /// it from here is what lets that gate keep working without the
+    /// whole-object GET it used to read the footer from.
+    pub record_count: u64,
 }
 
 /// The logs codec: implements the [`SegmentCodec`] seam for `.rlog` objects.
@@ -207,55 +227,7 @@ impl SegmentCodec for RlogCodec {
         input: &InputRecord,
     ) -> Result<Self::Catalog> {
         let object_key = keys::reconstruct_data_key(&input.record)?;
-        let cfg = RlogConfig::default();
-
-        // Locate the footer and section directory from a suffix probe: one
-        // ranged GET, growing to a second only if the probe missed the footer
-        // (the RLOG analogue of the RSEG read path).
-        let probe = store
-            .get(&object_key, GetRange::Suffix(config.footer_probe_bytes))
-            .await?;
-        let total = probe.total_size;
-        let ftr = match footer::open_from_suffix(&probe.data, total)? {
-            SuffixOutcome::Ready(f) => f,
-            SuffixOutcome::NeedRange { offset, len } => {
-                let tail = store
-                    .get(&object_key, GetRange::Range(offset, offset + len))
-                    .await?;
-                match footer::open_from_suffix(&tail.data, total)? {
-                    SuffixOutcome::Ready(f) => f,
-                    SuffixOutcome::NeedRange { .. } => {
-                        return Err(MaintainError::Invariant(
-                            "rlog footer not covered by ranged fetch".into(),
-                        ));
-                    }
-                }
-            }
-        };
-
-        // Fetch and decode the three whole-read directory sections by range.
-        // BLOCKS and BLOOM are never fetched here; the merge streams blocks by
-        // range one stream at a time. FIELD_DIR is decoded (and validated) even
-        // though the merge rebuilds it, so a corrupt input fails loud here.
-        let stream_dir_raw =
-            fetch_section(store, &object_key, &ftr, kind::STREAM_DIR, &cfg).await?;
-        let field_dir_raw = fetch_section(store, &object_key, &ftr, kind::FIELD_DIR, &cfg).await?;
-        let skip_idx_raw = fetch_section(store, &object_key, &ftr, kind::SKIP_IDX, &cfg).await?;
-
-        // Which fields this input had indexed. Recovered here, while the
-        // object's footer and FIELD_DIR bytes are already at hand, and reduced
-        // immediately to a name list: the POSTINGS bytes themselves are dropped
-        // before this function returns and never take part in the merge.
-        let indexed_fields =
-            input_indexed_fields(store, &object_key, &ftr, &field_dir_raw, &cfg).await?;
-
-        let reader =
-            RlogRangeReader::from_sections(&ftr, &stream_dir_raw, &field_dir_raw, &skip_idx_raw)?;
-        Ok(RlogInputCatalog {
-            object_key,
-            reader,
-            indexed_fields,
-        })
+        load_catalog_from_object(store, config, object_key, true).await
     }
 
     async fn build_parts(
@@ -271,66 +243,263 @@ impl SegmentCodec for RlogCodec {
                 "inputs and catalogs length mismatch".to_string(),
             ));
         }
+        // The output's indexed-field list: the union of the inputs' (see
+        // `input_indexed_fields`). Every part of this compaction gets the same
+        // list, so a field is indexed uniformly across the output.
+        let indexed_fields = merged_indexed_fields(&catalogs);
+        // Compaction drops nothing, so every merged record is kept and the
+        // counts the driver returns are the input count twice over; the
+        // compaction-side conservation gate reads `part.sample_count`, not
+        // these.
+        let merged = merge_catalogs(
+            store,
+            config,
+            bucket,
+            &catalogs,
+            input_set_hash,
+            indexed_fields,
+            config.dry_run,
+            &mut |_| Ok(true),
+        )
+        .await?;
+        Ok(merged.parts)
+    }
+}
 
-        // Global stream_ref remap + cross-object stream-identity check. The
-        // merged set is the sorted union of every input's STREAM_DIR; the dense
-        // merged stream_ref is the ordinal in this set (the writer re-derives it
-        // per part, so we need only the ordering here). Two inputs claiming the
-        // same stream_id with different blobs is a fatal invariant breach.
-        let mut merged: BTreeMap<LogStreamId, Vec<u8>> = BTreeMap::new();
-        for catalog in &catalogs {
-            for entry in catalog.reader.stream_dir().entries() {
-                match merged.entry(entry.stream_id) {
-                    std::collections::btree_map::Entry::Vacant(slot) => {
-                        slot.insert(entry.blob.clone());
-                    }
-                    std::collections::btree_map::Entry::Occupied(slot) => {
-                        if slot.get() != &entry.blob {
-                            return Err(MaintainError::StreamAttrsConflict {
-                                stream_id: entry.stream_id.to_hex(),
-                                a_len: slot.get().len(),
-                                b_len: entry.blob.len(),
-                            });
-                        }
+/// The object-key-parametrized core of [`RlogCodec::load_input_catalog`],
+/// generalized so a caller holding an object key from something other than an
+/// L0 [`InputRecord`] can decode a catalog too. The erasure rewrite is that
+/// caller: its live input set is a list of whole-object keys (L0 data objects,
+/// or the parts of the live compaction/rewrite record), never `InputRecord`s.
+///
+/// `recover_indexed_fields` chooses whether [`input_indexed_fields`] runs. The
+/// compactor wants the list (its output re-indexes what its inputs indexed);
+/// the erasure rewrite writes its parts with no indexed fields at all
+/// (`erasure_rewrite::build_rewrite_logs`'s doc says why), so recovering a list
+/// it would discard would cost one extra ranged GET per input carrying
+/// POSTINGS and nothing else.
+pub(crate) async fn load_catalog_from_object(
+    store: &dyn ObjectStoreBackend,
+    config: &CompactorConfig,
+    object_key: String,
+    recover_indexed_fields: bool,
+) -> Result<RlogInputCatalog> {
+    let cfg = RlogConfig::default();
+
+    // Locate the footer and section directory from a suffix probe: one
+    // ranged GET, growing to a second only if the probe missed the footer
+    // (the RLOG analogue of the RSEG read path).
+    let probe = store
+        .get(&object_key, GetRange::Suffix(config.footer_probe_bytes))
+        .await?;
+    let total = probe.total_size;
+    let ftr = match footer::open_from_suffix(&probe.data, total)? {
+        SuffixOutcome::Ready(f) => f,
+        SuffixOutcome::NeedRange { offset, len } => {
+            let tail = store
+                .get(&object_key, GetRange::Range(offset, offset + len))
+                .await?;
+            match footer::open_from_suffix(&tail.data, total)? {
+                SuffixOutcome::Ready(f) => f,
+                SuffixOutcome::NeedRange { .. } => {
+                    return Err(MaintainError::Invariant(
+                        "rlog footer not covered by ranged fetch".into(),
+                    ));
+                }
+            }
+        }
+    };
+
+    // Fetch and decode the three whole-read directory sections by range.
+    // BLOCKS and BLOOM are never fetched here; the merge streams blocks by
+    // range one stream at a time. FIELD_DIR is decoded (and validated) even
+    // though the merge rebuilds it, so a corrupt input fails loud here.
+    let stream_dir_raw = fetch_section(store, &object_key, &ftr, kind::STREAM_DIR, &cfg).await?;
+    let field_dir_raw = fetch_section(store, &object_key, &ftr, kind::FIELD_DIR, &cfg).await?;
+    let skip_idx_raw = fetch_section(store, &object_key, &ftr, kind::SKIP_IDX, &cfg).await?;
+
+    // Which fields this input had indexed. Recovered here, while the
+    // object's footer and FIELD_DIR bytes are already at hand, and reduced
+    // immediately to a name list: the POSTINGS bytes themselves are dropped
+    // before this function returns and never take part in the merge.
+    let indexed_fields = if recover_indexed_fields {
+        input_indexed_fields(store, &object_key, &ftr, &field_dir_raw, &cfg).await?
+    } else {
+        Vec::new()
+    };
+
+    let record_count = ftr.record_count;
+    let reader =
+        RlogRangeReader::from_sections(&ftr, &stream_dir_raw, &field_dir_raw, &skip_idx_raw)?;
+    Ok(RlogInputCatalog {
+        object_key,
+        reader,
+        indexed_fields,
+        record_count,
+    })
+}
+
+/// One catalog per object key, `input_read_concurrency` loads in flight.
+///
+/// `buffered`, not `buffer_unordered`: the returned catalogs stay aligned
+/// one-to-one with `object_keys` in canonical order, which is the k-way
+/// merge's tie-break on equal `ts_ns` (see [`merge_stream_into_parts`]).
+pub(crate) async fn load_catalogs_by_key(
+    store: &dyn ObjectStoreBackend,
+    config: &CompactorConfig,
+    object_keys: &[String],
+    recover_indexed_fields: bool,
+) -> Result<Vec<RlogInputCatalog>> {
+    let mut pending = Vec::with_capacity(object_keys.len());
+    for object_key in object_keys {
+        pending.push(load_catalog_from_object(
+            store,
+            config,
+            object_key.clone(),
+            recover_indexed_fields,
+        ));
+    }
+    stream_iter(pending)
+        .buffered(config.input_read_concurrency.max(1))
+        .try_collect()
+        .await
+}
+
+/// What one run of [`merge_catalogs`] produced: the parts, and the record
+/// counts the caller's conservation gates need.
+pub(crate) struct MergeOutput {
+    /// Every part built, in part-index order.
+    pub parts: Vec<BuiltPart>,
+    /// Records the merge read out of the inputs, kept and dropped alike.
+    pub input_record_count: u64,
+    /// Records the filter kept, so the ones actually pushed into a part.
+    pub output_record_count: u64,
+}
+
+/// The shared k-way block-streaming merge: every input's records, in global
+/// `(stream_id, ts)` order, filtered through `keep`, partitioned into parts of
+/// at most `max_l1_part_bytes`.
+///
+/// Both callers of the RLOG merge run through here. Compaction
+/// ([`RlogCodec::build_parts`]) keeps every record; the ADR-0064 erasure
+/// rewrite (`erasure_rewrite::build_rewrite_logs`) keeps the records no pending
+/// request's matcher drops. Sharing the driver is what gives the rewrite the
+/// same memory bound issue #711 gave compaction (issue #725): peak resident
+/// memory is one decoded block per input plus the in-progress part, never the
+/// bucket. It also means the two cannot drift on merge order, on where a part
+/// splits, or on the stream-identity invariant below.
+///
+/// `indexed_fields` is the POSTINGS field list every part is written with, and
+/// `dry_run` decides whether each part is PUT as it closes: compaction PUTs
+/// here, while the erasure rewrite defers every PUT to its own publish path,
+/// which writes parts only after its conservation gate passes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn merge_catalogs(
+    store: &dyn ObjectStoreBackend,
+    config: &CompactorConfig,
+    bucket: &Bucket,
+    catalogs: &[RlogInputCatalog],
+    input_set_hash: &[u8; 32],
+    indexed_fields: Vec<String>,
+    dry_run: bool,
+    keep: &mut (dyn FnMut(&LogRecord) -> Result<bool> + Send),
+) -> Result<MergeOutput> {
+    // Global stream_ref remap + cross-object stream-identity check. The
+    // merged set is the sorted union of every input's STREAM_DIR; the dense
+    // merged stream_ref is the ordinal in this set (the writer re-derives it
+    // per part, so we need only the ordering here). Two inputs claiming the
+    // same stream_id with different blobs is a fatal invariant breach.
+    let mut merged: BTreeMap<LogStreamId, Vec<u8>> = BTreeMap::new();
+    for catalog in catalogs {
+        for entry in catalog.reader.stream_dir().entries() {
+            match merged.entry(entry.stream_id) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(entry.blob.clone());
+                }
+                std::collections::btree_map::Entry::Occupied(slot) => {
+                    if slot.get() != &entry.blob {
+                        return Err(MaintainError::StreamAttrsConflict {
+                            stream_id: entry.stream_id.to_hex(),
+                            a_len: slot.get().len(),
+                            b_len: entry.blob.len(),
+                        });
                     }
                 }
             }
         }
+    }
 
-        // No whole-object fetch: the per-input ranged readers are already in the
-        // catalogs. Each stream's blocks are fetched by range one block at a
-        // time in the k-way merge below, so raw resident bytes stay bounded to
-        // one block per input, never a whole stream or the whole bucket.
-        let identity = compactor_identity(bucket, config);
-        // The output's indexed-field list: the union of the inputs' (see `input_indexed_fields`). Every part of this compaction gets
-        // the same list, so a field is indexed uniformly across the output.
-        let indexed_fields = merged_indexed_fields(&catalogs);
-        let tracker = config.merge_memory_tracker.as_ref();
-        let mut sink = PartSink {
+    // No whole-object fetch: the per-input ranged readers are already in the
+    // catalogs. Each stream's blocks are fetched by range one block at a
+    // time in the k-way merge below, so raw resident bytes stay bounded to
+    // one block per input, never a whole stream or the whole bucket.
+    let identity = compactor_identity(bucket, config);
+    let tracker = config.merge_memory_tracker.as_ref();
+    let mut sink = PartSink {
+        store,
+        bucket,
+        config,
+        input_set_hash,
+        identity,
+        indexed_fields,
+        tracker,
+        dry_run,
+        current: None,
+        parts: Vec::new(),
+        part_index: 0,
+    };
+    let mut counts = RecordCounts::default();
+
+    // Merge stream by stream in sorted stream_id order. Each stream is
+    // k-way merged from every input carrying it (ts-ascending, canonical
+    // input-order tie-break) straight into the current part's writer, and
+    // the part flushes the moment its accumulated record-heap estimate
+    // reaches `max_l1_part_bytes` -- mid-stream if that is where the cap
+    // falls (issue #711, ADR-0032 amendment 2026-08-26). No intermediate
+    // `Vec<LogRecord>` and no per-stream dedup: distinct submissions of
+    // identical content are distinct records (ADR-0032).
+    for stream_id in merged.keys() {
+        merge_stream_into_parts(
             store,
-            bucket,
-            config,
-            input_set_hash,
-            identity,
-            indexed_fields,
+            catalogs,
+            stream_id,
+            &mut sink,
             tracker,
-            current: None,
-            parts: Vec::new(),
-            part_index: 0,
-        };
+            keep,
+            &mut counts,
+        )
+        .await?;
+    }
+    let parts = sink.finish().await?;
+    Ok(MergeOutput {
+        parts,
+        input_record_count: counts.input,
+        output_record_count: counts.output,
+    })
+}
 
-        // Merge stream by stream in sorted stream_id order. Each stream is
-        // k-way merged from every input carrying it (ts-ascending, canonical
-        // input-order tie-break) straight into the current part's writer, and
-        // the part flushes the moment its accumulated record-heap estimate
-        // reaches `max_l1_part_bytes` -- mid-stream if that is where the cap
-        // falls (issue #711, ADR-0032 amendment 2026-08-26). No intermediate
-        // `Vec<LogRecord>` and no per-stream dedup: distinct submissions of
-        // identical content are distinct records (ADR-0032).
-        for stream_id in merged.keys() {
-            merge_stream_into_parts(store, &catalogs, stream_id, &mut sink, tracker).await?;
-        }
-        sink.finish().await
+/// The merge's running record tallies. Checked addition throughout: an
+/// overflowing tally is itself an invariant breach, never a silent wrap that
+/// could balance a caller's conservation gate against a wrong total.
+#[derive(Default)]
+struct RecordCounts {
+    input: u64,
+    output: u64,
+}
+
+impl RecordCounts {
+    fn add_input(&mut self) -> Result<()> {
+        self.input = self.input.checked_add(1).ok_or_else(|| {
+            MaintainError::Invariant("merged input record count overflowed u64".to_string())
+        })?;
+        Ok(())
+    }
+
+    fn add_output(&mut self) -> Result<()> {
+        self.output = self.output.checked_add(1).ok_or_else(|| {
+            MaintainError::Invariant("merged output record count overflowed u64".to_string())
+        })?;
+        Ok(())
     }
 }
 
@@ -359,6 +528,11 @@ struct PartSink<'a> {
     identity: ObjectIdentity,
     indexed_fields: Vec<String>,
     tracker: Option<&'a MergeMemoryTracker>,
+    /// Whether a closed part is encoded but not PUT. Not read from `config`:
+    /// the erasure rewrite defers every part PUT to its own publish path (which
+    /// writes them only after its conservation gate passes) while running with
+    /// a config whose `dry_run` is false.
+    dry_run: bool,
     current: Option<PartBuilder>,
     parts: Vec<BuiltPart>,
     part_index: u32,
@@ -395,7 +569,7 @@ impl PartSink<'_> {
                     self.bucket,
                     self.input_set_hash,
                     self.part_index,
-                    self.config.dry_run,
+                    self.dry_run,
                 )
                 .await?;
             self.parts.push(built);
@@ -668,10 +842,14 @@ async fn fetch_block(
 /// sort of the concatenation orders equal-`ts_ns` records by (input, position),
 /// exactly what selecting the minimum `(ts_ns, input_index)` head does here.
 ///
-/// Records go into `sink`, which closes the in-progress part and opens the next
-/// one the moment the size cap is reached -- possibly in the middle of this
-/// stream (issue #711). The merge order is unaffected: the sink is a pure
-/// partitioner over the sequence this function produces.
+/// Every merged record is tallied in `counts` and offered to `keep`; the ones
+/// it keeps go into `sink`, which closes the in-progress part and opens the
+/// next one the moment the size cap is reached -- possibly in the middle of
+/// this stream (issue #711). The merge order is unaffected: the sink is a pure
+/// partitioner over the sequence this function produces, and a dropped record
+/// shifts the split points without reordering anything. A record `keep`
+/// rejects is released here, so the ADR-0064 erasure rewrite's peak memory is
+/// bounded by its survivors' part, not by everything it read (issue #725).
 ///
 /// The cursors are opened concurrently (`input_read_concurrency` at a time):
 /// each open costs one ranged GET for the stream's first block, so a stream
@@ -683,6 +861,8 @@ async fn merge_stream_into_parts(
     stream_id: &LogStreamId,
     sink: &mut PartSink<'_>,
     tracker: Option<&MergeMemoryTracker>,
+    keep: &mut (dyn FnMut(&LogRecord) -> Result<bool> + Send),
+    counts: &mut RecordCounts,
 ) -> Result<()> {
     let concurrency = sink.config.input_read_concurrency.max(1);
     // Box each open-and-first-refill with an explicit `+ Send` bound before
@@ -721,7 +901,11 @@ async fn merge_stream_into_parts(
             break;
         };
         if let Some(rec) = cursors[bi].take_head() {
-            sink.push(rec).await?;
+            counts.add_input()?;
+            if keep(&rec)? {
+                counts.add_output()?;
+                sink.push(rec).await?;
+            }
         }
         cursors[bi].refill(store, tracker).await?;
     }
