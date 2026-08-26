@@ -629,25 +629,7 @@ impl<'a> RlogReader<'a> {
     /// through as bit patterns; the range is prune-only, so the exact residual
     /// stays the caller's (SQL layer's) job (ADR-0095 decision 6, ADR-0013).
     fn numeric_range_arms(&self, arms: &[&Predicate]) -> Vec<NumRangeArm> {
-        let mut out = Vec::new();
-        for a in arms {
-            if let Predicate::NumRange {
-                field: FieldSel::Attr(name),
-                ty,
-                min,
-                max,
-            } = a
-                && let Some(entry) = self.field_dir.column(name, *ty)
-            {
-                out.push(NumRangeArm {
-                    column_id: entry.column_id,
-                    ty: *ty,
-                    min_bits: *min,
-                    max_bits: *max,
-                });
-            }
-        }
-        out
+        self.field_dir.numeric_range_arms(arms)
     }
 
     /// Whether `name` has any dynamic column of a type other than `Str` in this

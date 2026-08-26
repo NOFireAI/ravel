@@ -47,8 +47,9 @@ use bytes::Bytes;
 use ravel_cache::{CacheKey, SingleFlightError, Source};
 use ravel_catalog::SegmentRef;
 use ravel_logseg::block::NumStat;
+use ravel_logseg::field_dir::FieldDir;
 use ravel_logseg::footer::{self, SectionDesc, kind};
-use ravel_logseg::skip_index::{Level0Entry, SkipIndex, merge_stats};
+use ravel_logseg::skip_index::{Level0Entry, NumRangeArm, SkipIndex, merge_stats};
 use ravel_logseg::stream_dir::StreamDir;
 use ravel_logseg::{
     AttrValue, BlockScan, ColumnSelection, ColumnarBlockView, LogRecord, LogSegError, LogStreamId,
@@ -1022,6 +1023,59 @@ impl LogSegmentFetcher {
             return Ok(Some((n, stats, Some(footer))));
         }
 
+        // Skip-index-only survivor count (#761): when every block-level predicate
+        // the query carries is decidable from the skip index alone -- ts bounds
+        // and prune-only NumRange arms, no text/content arm, no attribute-equality
+        // POSTINGS prune, no stream filter -- the surviving-block count is exactly
+        // `candidate_blocks` over those arms, with no BLOCKS byte fetched and no
+        // block decoded. The reader's full prune (skip, then POSTINGS, then bloom)
+        // reduces to the skip step for such a query, so this count equals the
+        // survivor list a subset open will stripe over, and the footer read here
+        // carries forward so those opens skip their own probe (#693 part 3).
+        //
+        // The relevance check is the one the fallback's `tenant_bytes` runs: it
+        // is what turns an out-of-window segment into the `None` the caller
+        // drops, and unlike the fast path's containment test this branch's
+        // guard does not imply it.
+        if seg_ref.object_size > self.block_range_threshold
+            && seg_ref.min_event_ts_ns <= seg_ref.max_event_ts_ns
+            && Self::ts_range_relevant(seg_ref, query.ts_min_ns, query.ts_max_ns)
+            && Self::plan_skip_decidable(query)
+        {
+            let (footer, skip, field_dir, _stats) = self
+                .block_range
+                .fetch_plan_sections(seg_ref, tenant_hash, accounting)
+                .await?;
+            let refs: Vec<&Predicate> = query.prune.iter().collect();
+            let numeric = field_dir.numeric_range_arms(&refs);
+            let survivors = skip
+                .candidate_blocks(query.ts_min_ns, query.ts_max_ns, None, &numeric)
+                .len();
+            let blocks = skip.l0.len() as u32;
+            let plan_stats = ScanStats {
+                blocks_total: blocks,
+                blocks_after_skip: survivors as u32,
+                blocks_after_postings: survivors as u32,
+                blocks_after_bloom: survivors as u32,
+                blocks_scanned: 0,
+                pages_decoded: 0,
+                pages_skipped: 0,
+                page_bytes_fetched: 0,
+                page_bytes_decoded: 0,
+                bloom_degraded: false,
+                postings_degraded: false,
+            };
+            return Ok(Some((survivors, plan_stats, Some(footer))));
+        }
+
+        // Fallback: a predicate the skip index cannot decide (a `has_word`/text
+        // content arm with only a per-block bloom, an attribute-equality POSTINGS
+        // prune, a stream filter), or a below-threshold object. Read as before --
+        // the survivor count then needs the reader's full prune over the fetched
+        // buffer -- and hand no footer forward. This whole-object plan read is the
+        // amplification #761 could not remove for these shapes; the caller counts
+        // it (a `None` footer on a relevant segment) as a `plan_full_reads` so a
+        // report can see which queries still pay it.
         let Some(bytes) = self
             .tenant_bytes(seg_ref, tenant_hash, query, accounting)
             .await?
@@ -1031,12 +1085,51 @@ impl LogSegmentFetcher {
         let key = &seg_ref.data_object_key;
         let span = decode_span();
         let scan = span.in_scope(|| self.open_scan(key, &bytes, query, &ColumnSelection::all()))?;
-        // The slow branch decodes nothing that carries a reusable footer to the
-        // per-partition subset opens (#693 part 3, deliverable 2): a predicated
-        // or partially-overlapping query does not run `plan_segment_fast`, so
-        // there is no plan-phase footer to hand forward and each subset open
-        // establishes its own etag pin with its own suffix probe.
         Ok(Some((scan.remaining_blocks(), scan.stats(), None)))
+    }
+
+    /// Whether [`plan_segment`](Self::plan_segment)'s survivor count can be read
+    /// from the skip index alone, without fetching or decoding any block (#761).
+    ///
+    /// True when the query carries no block-level predicate the skip index cannot
+    /// evaluate: no content/text arm (those prune only via per-block bloom at
+    /// decode), no stream-attribute filter, and every prune-only arm a
+    /// [`Predicate::NumRange`] (an attribute-equality `Equals` prunes only via
+    /// POSTINGS). For such a query the reader's full prune -- skip, then POSTINGS,
+    /// then bloom -- collapses to its skip step, so `candidate_blocks` over the
+    /// resolved NumRange arms is the exact survivor list the scan will stripe,
+    /// and the count is safe to compute from SKIP_IDX + FIELD_DIR alone. Pending
+    /// erasure is ignored on purpose: it filters rows within surviving blocks
+    /// after decode, so it never changes which blocks survive or how many.
+    ///
+    /// At least one arm is required, so this stays the SELECTIVE path #761 is
+    /// about. A query with no prune arm at all would also be skip-decidable, but
+    /// planning it this way is a pessimization rather than a saving: its
+    /// plan-phase read is already only the ts-candidate blocks, and it warms
+    /// exactly the extents the per-partition subset opens then stripe, so
+    /// removing it would replace one shared read with N concurrent per-partition
+    /// ones for the same bytes. Such a query keeps the pre-#761 plan read (the
+    /// fully-contained case having taken `plan_segment_fast` above).
+    ///
+    /// Destructures `LogQuery` by name for the reason
+    /// [`LogQuery::is_block_predicate_free`] does: a false positive here would
+    /// publish a survivor count the scan does not stripe, so a future field must
+    /// be a build break rather than a silent gap.
+    fn plan_skip_decidable(query: &LogQuery) -> bool {
+        let LogQuery {
+            ts_min_ns: _,
+            ts_max_ns: _,
+            stream_attrs,
+            content,
+            prune,
+            erasure: _,
+        } = query;
+        content.is_empty()
+            && stream_attrs.is_empty()
+            && !prune.is_empty()
+            && prune
+                .iter()
+                .all(|p| matches!(p, Predicate::NumRange { .. }))
     }
 
     /// The predicate-free plan fast path (#693): read only the footer via the
@@ -1322,6 +1415,7 @@ impl LogSegmentFetcher {
                         tenant_hash,
                         query.ts_min_ns,
                         query.ts_max_ns,
+                        &query.prune,
                         footer,
                         accounting,
                     )
@@ -1643,6 +1737,11 @@ pub const DEFAULT_LOG_MAX_CONCURRENT_GETS: usize = 16;
 /// internal cap (`ravel_logseg::reader::MAX_BLOCKS`, not exported). A section
 /// claiming more blocks is treated as corrupt rather than allocated.
 const MAX_BLOCKS: u64 = 1 << 24;
+
+/// Upper bound on decoded FIELD_DIR entry count, mirroring the reader's own
+/// internal cap (`ravel_logseg::reader::MAX_FIELDS`, not exported). A section
+/// claiming more entries is treated as corrupt rather than allocated.
+const MAX_FIELDS: u64 = 1 << 20;
 
 /// Per-object counters from one [`BlockRangeFetcher::fetch_object`] call, for
 /// tests (the GET-count assertion of ADR-0107) and callers that want the
@@ -2144,18 +2243,52 @@ impl BlockRangeFetcher {
             .section(kind::SKIP_IDX)
             .ok_or_else(|| corrupt(key, LogSegError::Corrupted("missing SKIP_IDX".into())))?;
 
-        let stored = match resident_slice(&resident, skip_desc.offset, skip_desc.len) {
+        let raw = self
+            .plan_section_raw(
+                seg_ref,
+                tenant_hash,
+                skip_desc,
+                &resident,
+                &pin,
+                accounting,
+                &mut stats,
+            )
+            .await?;
+        let skip = SkipIndex::decode(&raw, MAX_BLOCKS).map_err(|source| corrupt(key, source))?;
+        Ok((skip, stats))
+    }
+
+    /// Decode one whole-compressed directory section from a region the probe
+    /// already left resident, or a cache-routed range GET when it did not.
+    /// Section-kind agnostic, so [`fetch_skip_index`](Self::fetch_skip_index)
+    /// and [`fetch_plan_sections`](Self::fetch_plan_sections) pull SKIP_IDX and
+    /// FIELD_DIR through the same path without an object-sized buffer, unlike
+    /// [`place_section`](Self::place_section), which needs an
+    /// [`ObjectAssembler`] to place into.
+    #[allow(clippy::too_many_arguments)]
+    async fn plan_section_raw(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        desc: &SectionDesc,
+        resident: &[(u64, Bytes)],
+        pin: &EtagPin,
+        accounting: &QueryAccounting,
+        stats: &mut BlockRangeStats,
+    ) -> Result<Vec<u8>, LogFetchError> {
+        let key = seg_ref.data_object_key.as_str();
+        let stored = match resident_slice(resident, desc.offset, desc.len) {
             Some(bytes) => bytes,
             None => {
-                let (start, end) = (skip_desc.offset, skip_desc.offset + skip_desc.len);
+                let (start, end) = (desc.offset, desc.offset + desc.len);
                 let (bytes, live) = self
                     .cached_extent(
                         seg_ref,
                         tenant_hash,
-                        skip_desc.offset,
-                        skip_desc.len,
+                        desc.offset,
+                        desc.len,
                         GetRange::Range(start, end),
-                        &pin,
+                        pin,
                         accounting,
                     )
                     .await?;
@@ -2165,11 +2298,72 @@ impl BlockRangeFetcher {
                 bytes
             }
         };
+        decode_section(&stored, desc, &self.cfg).map_err(|source| corrupt(key, source))
+    }
 
-        let raw =
-            decode_section(&stored, skip_desc, &self.cfg).map_err(|source| corrupt(key, source))?;
-        let skip = SkipIndex::decode(&raw, MAX_BLOCKS).map_err(|source| corrupt(key, source))?;
-        Ok((skip, stats))
+    /// Read the footer, SKIP_IDX, and FIELD_DIR for one segment and decode all
+    /// three, fetching no BLOCKS byte (#761): the plan phase's counterpart of
+    /// [`fetch_skip_index`](Self::fetch_skip_index) for a query carrying
+    /// prune-only NumRange arms. The footer is returned so the caller can carry
+    /// it to each per-partition subset open (they then skip re-probing, #693 part
+    /// 3), the SKIP_IDX drives the survivor count, and the FIELD_DIR resolves the
+    /// arms to this object's column ids so that count is computed with the same
+    /// pruning the scan will apply.
+    ///
+    /// One ADR-0107 suffix probe plus, where the probe did not already cover
+    /// them, one range GET per section: SKIP_IDX (near the tail, usually covered
+    /// by a production-sized probe) and FIELD_DIR (a front section, generally its
+    /// own GET). No whole-object crossover, so the caller must guarantee
+    /// `object_size > block_range_threshold` for the reason
+    /// [`fetch_footer`](Self::fetch_footer) documents.
+    pub async fn fetch_plan_sections(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        accounting: &QueryAccounting,
+    ) -> Result<(footer::LogFooter, SkipIndex, FieldDir, BlockRangeStats), LogFetchError> {
+        let key = seg_ref.data_object_key.as_str();
+        let mut stats = BlockRangeStats::default();
+        let pin = EtagPin::default();
+        let (footer, resident) = self
+            .probe_footer(seg_ref, tenant_hash, &pin, accounting, &mut stats)
+            .await?;
+
+        let skip_desc = *footer
+            .section(kind::SKIP_IDX)
+            .ok_or_else(|| corrupt(key, LogSegError::Corrupted("missing SKIP_IDX".into())))?;
+        let skip_raw = self
+            .plan_section_raw(
+                seg_ref,
+                tenant_hash,
+                &skip_desc,
+                &resident,
+                &pin,
+                accounting,
+                &mut stats,
+            )
+            .await?;
+        let skip =
+            SkipIndex::decode(&skip_raw, MAX_BLOCKS).map_err(|source| corrupt(key, source))?;
+
+        let field_desc = *footer
+            .section(kind::FIELD_DIR)
+            .ok_or_else(|| corrupt(key, LogSegError::Corrupted("missing FIELD_DIR".into())))?;
+        let field_raw = self
+            .plan_section_raw(
+                seg_ref,
+                tenant_hash,
+                &field_desc,
+                &resident,
+                &pin,
+                accounting,
+                &mut stats,
+            )
+            .await?;
+        let field_dir =
+            FieldDir::decode(&field_raw, MAX_FIELDS).map_err(|source| corrupt(key, source))?;
+
+        Ok((footer, skip, field_dir, stats))
     }
 
     /// Fetch one segment's object as an assembled, decode-ready buffer, reading
@@ -2189,8 +2383,16 @@ impl BlockRangeFetcher {
         ts_max_ns: i64,
         accounting: &QueryAccounting,
     ) -> Result<(Bytes, BlockRangeStats), LogFetchError> {
-        self.fetch_object_with_footer(seg_ref, tenant_hash, ts_min_ns, ts_max_ns, None, accounting)
-            .await
+        self.fetch_object_with_footer(
+            seg_ref,
+            tenant_hash,
+            ts_min_ns,
+            ts_max_ns,
+            &[],
+            None,
+            accounting,
+        )
+        .await
     }
 
     /// [`fetch_object`](Self::fetch_object), optionally reusing a
@@ -2210,6 +2412,13 @@ impl BlockRangeFetcher {
     /// different object fails its stored `crc32c`, a hard [`LogFetchError::Corrupt`]).
     /// Either way the fetch errors rather than assembling bytes from two object
     /// states. `None` keeps the probe-first behavior unchanged.
+    ///
+    /// `prune` carries the query's prune-only predicates (#761). Its NumRange
+    /// arms are resolved against this object's FIELD_DIR and applied to the
+    /// candidate-block selection, so a selective query reads only the surviving
+    /// blocks instead of tripping the coverage crossover into a whole-object GET.
+    /// See [`resolve_extents`](Self::resolve_extents) for why this stays
+    /// byte-identical to the unpruned read.
     #[allow(clippy::too_many_arguments)]
     pub async fn fetch_object_with_footer(
         &self,
@@ -2217,6 +2426,7 @@ impl BlockRangeFetcher {
         tenant_hash: TenantHash,
         ts_min_ns: i64,
         ts_max_ns: i64,
+        prune: &[Predicate],
         plan_footer: Option<&footer::LogFooter>,
         accounting: &QueryAccounting,
     ) -> Result<(Bytes, BlockRangeStats), LogFetchError> {
@@ -2382,13 +2592,15 @@ impl BlockRangeFetcher {
             .section(kind::BLOCKS)
             .ok_or_else(|| corrupt(key, LogSegError::Corrupted("missing BLOCKS".into())))?;
 
-        // SKIP_IDX first and alone. The coverage crossover below can decide the
-        // whole object is cheaper than the candidate ranges, and every OTHER
-        // section it would have fetched first is then wasted: a wide-time-range
-        // query on a large object would pay probe + section GETs and THEN a
-        // whole-object GET, strictly worse than the plain whole-object path it
-        // falls back to. Resolving the candidate extents needs SKIP_IDX and
-        // nothing else, so only SKIP_IDX is fetched before the decision.
+        // SKIP_IDX first, and nothing the candidate set does not need. The
+        // coverage crossover below can decide the whole object is cheaper than
+        // the candidate ranges, and every OTHER section fetched first is then
+        // wasted: a wide-time-range query on a large object would pay probe +
+        // section GETs and THEN a whole-object GET, strictly worse than the
+        // plain whole-object path it falls back to. Resolving the candidate
+        // extents needs SKIP_IDX always and FIELD_DIR only when the query
+        // carries a NumRange arm to resolve (#761), so those are the only two
+        // sections fetched before the decision, and the second only on demand.
         self.place_section(
             seg_ref,
             tenant_hash,
@@ -2414,7 +2626,46 @@ impl BlockRangeFetcher {
         let skip =
             SkipIndex::decode(&skip_raw, MAX_BLOCKS).map_err(|source| corrupt(key, source))?;
 
-        let extents = self.resolve_extents(key, &skip, blocks_desc.offset, ts_min_ns, ts_max_ns)?;
+        // Resolve the query's prune-only NumRange arms against THIS object's
+        // FIELD_DIR so `candidate_blocks` can drop blocks the numeric bounds
+        // prove hold no match (#761). Without this the candidate set was ts-only
+        // and every block survived, so a month-wide selective query crossed the
+        // coverage threshold and read the whole object. FIELD_DIR is a front
+        // section the ranged read fetches anyway (the loop below), so placing it
+        // here only reorders that GET; it is skipped entirely when the query
+        // carries no NumRange arm (a predicate-free or text-only query keeps the
+        // pre-#761 ts-only candidate set). Bloom/POSTINGS arms are not resolved
+        // here: they narrow further at decode over the fetched buffer, which is
+        // sound because that narrowing only ever skips a fetched block.
+        let numeric: Vec<NumRangeArm> = if prune
+            .iter()
+            .any(|p| matches!(p, Predicate::NumRange { .. }))
+        {
+            let field_dir = self
+                .place_and_decode_field_dir(
+                    seg_ref,
+                    tenant_hash,
+                    &footer,
+                    &pin,
+                    &mut asm,
+                    accounting,
+                    &mut stats,
+                )
+                .await?;
+            let refs: Vec<&Predicate> = prune.iter().collect();
+            field_dir.numeric_range_arms(&refs)
+        } else {
+            Vec::new()
+        };
+
+        let extents = self.resolve_extents(
+            key,
+            &skip,
+            blocks_desc.offset,
+            ts_min_ns,
+            ts_max_ns,
+            &numeric,
+        )?;
         stats.candidate_blocks = extents.len() as u64;
 
         // Coverage-based post-pruning crossover (ADR-0107 decision 1): when the
@@ -2458,11 +2709,12 @@ impl BlockRangeFetcher {
         // are not themselves listed sections. When the footer was carried the
         // probe was skipped, so on this (non-coverage) branch that tail is still
         // unplaced; place it now as one range over `[last_section_end,
-        // object_size)`. In practice a carried footer implies an all-candidate
-        // (predicate-free, fully-contained) query, whose coverage always crosses
-        // over above, so this range is only reached when a caller forces the
-        // ranged path; it keeps that path fail-safe rather than assembling a
-        // buffer with a zeroed trailer.
+        // object_size)`. Before #761 a carried footer implied an all-candidate
+        // (predicate-free, fully-contained) query whose coverage always crossed
+        // over above, so this range was unreachable in practice. The skip-index
+        // plan branch now carries a footer for a SELECTIVE query too, which is
+        // exactly the query that stays below the crossover, so this is a live
+        // per-segment range GET on that path rather than a fail-safe.
         if plan_footer.is_some() {
             let tail_start = footer
                 .sections
@@ -2526,6 +2778,21 @@ impl BlockRangeFetcher {
     /// absolute byte extent and stored crc. The byte extent is always the block's
     /// full extent from its SKIP_IDX level-0 entry, never a sub-block slice
     /// (ADR-0107 decision 1).
+    ///
+    /// `numeric` are the query's prune-only [`NumRangeArm`]s, already resolved to
+    /// this object's own column ids against its FIELD_DIR
+    /// ([`FieldDir::numeric_range_arms`]). They narrow the candidate set to the
+    /// blocks whose recorded numeric bounds can still hold a matching row, exactly
+    /// as [`ravel_logseg::RlogReader::scan_blocks`] narrows it at decode with the
+    /// same arms and the same directory. This is why fetch-side pruning is
+    /// byte-identical to the unpruned read: the skip index's per-block bounds are
+    /// conservative (ADR-0013), so a block dropped here is one the decode-side
+    /// prune would have dropped anyway, never a block a surviving row lives in.
+    /// Bloom/POSTINGS pruning is a strict further narrowing the reader still runs
+    /// over the fetched buffer, so it can only skip blocks this already fetched,
+    /// never demand one it did not. With `numeric` empty (a predicate the skip
+    /// index cannot decide, or none) every ts-candidate block is kept, the
+    /// pre-#761 behavior.
     fn resolve_extents(
         &self,
         key: &str,
@@ -2533,8 +2800,9 @@ impl BlockRangeFetcher {
         blocks_offset: u64,
         ts_min_ns: i64,
         ts_max_ns: i64,
+        numeric: &[NumRangeArm],
     ) -> Result<Vec<BlockExtent>, LogFetchError> {
-        let candidates = skip.candidate_blocks(ts_min_ns, ts_max_ns, None, &[]);
+        let candidates = skip.candidate_blocks(ts_min_ns, ts_max_ns, None, numeric);
         let mut out = Vec::with_capacity(candidates.len());
         for i in candidates {
             let entry = skip.l0.get(i).ok_or_else(|| {
@@ -2553,6 +2821,38 @@ impl BlockRangeFetcher {
             });
         }
         Ok(out)
+    }
+
+    /// Place the FIELD_DIR section into `asm` (via [`place_section`](Self::
+    /// place_section), so it single-flights and reuses an already-resident
+    /// region) and decode it, so the caller can resolve a query's prune-only
+    /// NumRange arms to this object's own column ids before the candidate set is
+    /// chosen. FIELD_DIR is compressed as a whole section (docs/log-segment-\
+    /// format.md), the same shape SKIP_IDX is decoded with just above.
+    #[allow(clippy::too_many_arguments)]
+    async fn place_and_decode_field_dir(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        footer: &footer::LogFooter,
+        pin: &EtagPin,
+        asm: &mut ObjectAssembler,
+        accounting: &QueryAccounting,
+        stats: &mut BlockRangeStats,
+    ) -> Result<FieldDir, LogFetchError> {
+        let key = seg_ref.data_object_key.as_str();
+        let desc = footer
+            .section(kind::FIELD_DIR)
+            .ok_or_else(|| corrupt(key, LogSegError::Corrupted("missing FIELD_DIR".into())))?;
+        self.place_section(seg_ref, tenant_hash, desc, pin, asm, accounting, stats)
+            .await?;
+        let start = usize::try_from(desc.offset).map_err(|_| corrupt_range(key))?;
+        let end = start
+            .checked_add(usize::try_from(desc.len).map_err(|_| corrupt_range(key))?)
+            .ok_or_else(|| corrupt_range(key))?;
+        let stored = asm.buf.get(start..end).ok_or_else(|| corrupt_range(key))?;
+        let raw = decode_section(stored, desc, &self.cfg).map_err(|source| corrupt(key, source))?;
+        FieldDir::decode(&raw, MAX_FIELDS).map_err(|source| corrupt(key, source))
     }
 
     /// Place one directory section into `asm`, fetching it through the read
