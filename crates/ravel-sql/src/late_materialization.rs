@@ -88,12 +88,24 @@
 //!
 //! # Cost
 //!
-//! Phase 2 re-reads bytes phase 1 already read. That is a real cost: `k` block
-//! fetches, each one coalesced range per `(row group, projected column)` on a
-//! version-4 object (ADR-0699 decision 5), and they are accounted like any
-//! other scan read because they go through the same
-//! `LogSegmentFetcher::scan_accounted_with_tenant_subset` funnel. It is bounded
-//! by `k`, while what it removes is bounded by the table.
+//! Phase 2 re-reads bytes phase 1 already read: `k` block fetches, accounted
+//! like any other scan read because they go through the same
+//! `LogSegmentFetcher::scan_accounted_with_tenant_subset` funnel the striped
+//! scan path uses.
+//!
+//! Be precise about what a "block fetch" costs, because the request count and
+//! the byte count do not say the same thing. That entry point restricts the
+//! DECODE to the named block, but its byte fetch is the query's ordinary fetch
+//! for the whole object: one whole-object GET at or below the block-range
+//! threshold (ADR-0107), and above it the version-4 coalesced ranges over the
+//! fetch-side candidate set (ADR-0699 decision 5) -- which, for a query whose
+//! only predicate is a residual the skip index cannot decide, is every block.
+//! So phase 2 costs `k` requests and up to `k` objects' bytes, not `k` blocks'
+//! bytes. Narrowing that fetch to the named indices is a ravel-query
+//! follow-up, deliberately not done here.
+//!
+//! Either way the cost is bounded by `k` and by one object, while what it
+//! removes is bounded by the table.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;

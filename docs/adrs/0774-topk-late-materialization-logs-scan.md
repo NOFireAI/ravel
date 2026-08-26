@@ -135,9 +135,14 @@ Final` node. It collects phase 1's at-most-`k` rows, groups their row refs
 by `(segment, block)`, and for each group re-opens that one block through
 `LogSegmentFetcher::scan_accounted_with_tenant_subset` with the ORIGINAL
 column selection -- the same entry point the striped scan path uses, so the
-read rides ADR-0699's version-4 chunk path with a narrow `ColumnSelection`
-rather than adding a read path. It picks the referenced rows out of the
-decoded block and emits them in phase-1 order.
+read rides ADR-0699's version-4 chunk path rather than adding a read path.
+It picks the referenced rows out of the decoded block and emits them in
+phase-1 order.
+
+That entry point restricts the DECODE to the named block; its byte fetch is
+the query's ordinary fetch for the whole object. So phase 2 costs `k`
+requests and up to `k` objects' bytes, not `k` blocks' bytes. See the
+consequences below.
 
 No projection node is inserted to drop the row-ref column. Phase 2's output
 schema is `Arc::clone`d off the original scan's, so the restored column
@@ -228,6 +233,20 @@ it.
   the same `(0, object_size)` cache key phase 1 already admitted and cost
   no request at all; without a cache they are one request each. Both are
   pinned in `crates/ravel-sql/tests/logs_topk_late_materialization.rs`.
+- **Phase 2's bytes are per object, not per block, and this ADR does not
+  fix that.** `scan_accounted_with_tenant_subset` narrows the decode to the
+  named block but not the byte fetch, which is the query's ordinary fetch:
+  one whole-object GET at or below the block-range threshold, and above it
+  the coalesced ranges over the fetch-side candidate set, which for a query
+  whose only predicate is an undecidable residual is every block. On the
+  regression fixture that is measured, not assumed: a single pass moves
+  29,645 bytes over four objects, and the same statement with `k = 10`
+  moves 103,606 -- the ten block reads cost 73,961, roughly ten whole
+  objects, not ten blocks. It is still bounded by `k` where the thing it
+  replaces is bounded by the table, but narrowing that fetch to the named
+  block indices is a real follow-up in ravel-query, deliberately out of
+  this change's scope (which was to ride the existing PAGE_DIR fetch path,
+  not add one).
 - The rewrite is invisible to results: the same rows, in the same order,
   under the same schema. So `late_materialization_extra_columns` is a cost
   knob, never a correctness one, and it is not exposed as a server flag.
