@@ -338,7 +338,8 @@ The bench prints the full report as JSON, then a human table. Per statement:
   was slow: `segments`, `blocks_total`, `blocks_scanned`,
   `blocks_pruned_by_postings` (POSTINGS pruning selectivity), plus the cold run's
   object-store GET/LIST request counts, bytes transferred, and fetch-cache
-  hits/misses/bytes.
+  hits/misses/bytes. Present for the in-process lanes only; the `--flight` lane
+  of step 6 omits the whole block, for the reason given there.
 
 Dataset-level, independent of any one query:
 
@@ -351,8 +352,9 @@ Dataset-level, independent of any one query:
 - **rows** and the **pre-/post-compaction layout label**.
 
 Provenance (backend, region, endpoint, host logical cores, source, dataset id,
-runs, `cache_bytes`, `deadline_secs`, `fetch_concurrency`) is recorded beside
-the numbers so two runs are comparable or provably not.
+runs, `cache_bytes`, `deadline_secs`, `fetch_concurrency`, and
+`flight_endpoint` when step 6's lane ran) is recorded beside the numbers so
+two runs are comparable or provably not.
 
 ## Reading a report against ClickBench
 
@@ -396,7 +398,100 @@ column paid. A full-window statement over an N-object tenant reads every
 object, because the plan phase reads the whole dataset; issues #693 and #699
 are the two open changes to that. So the figure to compare across runs is bytes
 per second at the reported `host_logical_cores`, not the statement's row count.
+## 6. Through the server (Flight SQL)
 
+Everything above measures the SQL executor as a library, in the bench's own
+process. A number a user would see goes through `ravel-server` over Flight SQL:
+server-side planning and admission, gRPC, Arrow IPC encode on the server and
+decode on the client. Those are different numbers, and the second one is what a
+published result claims. The `--flight` lane runs the same corpus, over the same
+tenant, into the same report, through a running server.
+
+Start the server against the same bucket, built with its `flight-sql` feature.
+Flight SQL is served on the gRPC listener:
+
+```sh
+cargo run -p ravel-server --features flight-sql --bin ravel-server -- \
+  --mode query \
+  --store s3 \
+  --listen-grpc 127.0.0.1:4317 \
+  --tenant-token "$RAVEL_FLIGHT_TOKEN=clickbench" \
+  --shards 4 \
+  --fetch-concurrency 8 \
+  --sql-max-query-bytes 1073741824 \
+  --sql-tenant-max-bytes 2147483648 \
+  --cache-max-bytes 268435456
+```
+
+The flags that must mirror the bench's, or the two tables are not comparable:
+
+- `--fetch-concurrency` is the same ADR-0088 knob as the bench's flag of the
+  same name (logs scan partitions and in-flight segment fetches per query). This
+  is the one that moves a cold full scan the most; set both sides to the same
+  value and record it.
+- `--sql-max-query-bytes` is the per-query DataFusion memory-pool ceiling. A
+  statement that fits the bench's budget and not the server's aborts on the
+  server with `query memory budget exhausted` and lands in `failed`.
+- `--sql-tenant-max-bytes` has no bench counterpart: it is the server's
+  per-tenant ceiling across concurrent queries, which an in-process lane running
+  one statement at a time never reaches. Set it above
+  `--sql-max-query-bytes` so it is not the binding limit for a serial run.
+- Cache flags: the bench's `--cache-bytes` attaches an ADR-0046 read cache to
+  its own fetcher; the server's equivalent is `--cache-max-bytes` (plus
+  `--cache-dir` for the disk tier, and `--disable-cache` to turn it off). To
+  compare against a `--cache-bytes 0` bench run, start the server with
+  `--disable-cache`; otherwise match the byte budgets. The server's cache is
+  process-wide and survives between statements, so a warm server does not
+  reproduce the bench's per-statement cold run.
+
+Then point the bench at it. Two lines:
+
+```sh
+export RAVEL_FLIGHT_TOKEN=<the token side of --tenant-token>
+cargo run -p ravel-bench --features sql-latency,flight-lane --bin sql_latency_bench -- \
+  --tenant clickbench --store s3 --flight 127.0.0.1:4317 \
+  --corpus benchmarks/clickbench/hits.corpus.json \
+  --runs 3 --compaction pre --window-hours 200000 \
+  --fetch-concurrency 8 --sql-max-query-bytes 1073741824
+```
+
+- `--flight <host:port>` is the server's `--listen-grpc` address. It needs the
+  `flight-lane` build feature; without it the run fails with an error naming the
+  feature rather than quietly measuring in process.
+- `--flight-token <TOKEN>` passes the credential on the command line;
+  `RAVEL_FLIGHT_TOKEN` is the better place for it, since a token in the argument
+  vector lands in the shell history and in `ps`. It is sent as `authorization:
+  Bearer <TOKEN>` and must be the token side of the server's `--tenant-token
+  <TOKEN>=<TENANT>` pair.
+- `--store` and `--tenant` are still required and still used. The dataset stanza
+  (objects, bytes, rows, layout) and the tenant's declared columns are resolved
+  from the object store **directly**, not through the server: a Flight client
+  cannot read the tenant's catalog, and the declared-column skip check needs the
+  declarations. So this lane needs object-store credentials as well as a server.
+- `--window-hours` / `--now-secs` reach the server in the request metadata, as
+  `x-ravel-start` and `x-ravel-end` in Unix float seconds. The Flight SQL
+  command carries no window of its own, so this is how ravel-sql's Flight
+  service reads it, exactly as the HTTP endpoint reads `start`/`end` from the
+  JSON body. `--deadline-secs` travels the same way as `x-ravel-timeout` and is
+  clamped by the server's own maximum, which a client can shorten but never
+  extend.
+- `--runs`, `--corpus`, `--continue-on-error`, and `--progress-jsonl` behave
+  exactly as in step 5.
+
+**The Flight lane's report has no `scan` block.** `segments`, `blocks_total`,
+`blocks_scanned`, `blocks_pruned_by_postings`, the object-store GET/LIST counts,
+the bytes, and the cache hits and misses are all read off the executor's own
+counters inside the process that ran the query. A Flight SQL response carries
+result batches, not the server's internal accounting, so the bench has no way to
+observe them from the client side. Rather than report zeros, which would read as
+"this statement scanned nothing", the `scan` field is omitted from the JSON
+entirely and the human table prints `-` in those columns. `provenance.source` is
+`"flight"` and `provenance.flight_endpoint` names the address, so a report
+cannot be mistaken for an in-process one. Everything else -- `cold_ms`,
+`min_ms`, `median_ms`, `max_ms`, `rows_returned`, `skipped`, `failed`, and the
+progress stream -- is identical. When you need the attribution, run step 5's
+in-process lane over the same tenant and read the two tables together: the
+in-process one says where the time went, this one says what the user waits.
 ## Gap list: ClickBench statements the construct gate rejects
 
 Running a 43-query suite against a supported-construct gate means some queries
