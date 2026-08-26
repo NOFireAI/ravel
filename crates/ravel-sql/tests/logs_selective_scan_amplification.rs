@@ -574,12 +574,13 @@ async fn selective_numeric_reads_only_surviving_blocks() {
         q37.bytes,
         q37_block_bytes
     );
-    // 165,355 = 99,112 page bytes (8 surviving blocks x 12,389 B of pages across
-    // their eight column chunks) + 65,536 probe bytes (8 x 8 KiB) + 672
-    // front-section bytes (8 x (STREAM_DIR 62 + FIELD_DIR 22)). The page term is
-    // 15% of the full scan; the probe term is the fixed per-object directory
-    // cost, which on this deliberately tiny fixture is 40% of the total and on a
-    // production 1.3 MB object is a rounding error.
+    // 165,355 = 99,147 page bytes (the 8 surviving blocks' pages across their
+    // eight column chunks; blocks differ slightly in encoded size, so the term
+    // is the measured sum, not blocks x a constant) + 65,536 probe bytes
+    // (8 x 8 KiB) + 672 front-section bytes (8 x (STREAM_DIR 62 + FIELD_DIR
+    // 22)). The page term is 15% of the full scan; the probe term is the fixed
+    // per-object directory cost, which on this deliberately tiny fixture is
+    // 40% of the total and on a production 1.3 MB object is a rounding error.
     assert_eq!(
         q37.bytes, 165_355,
         "q37 moves the surviving blocks' page bytes plus the probe and the two \
@@ -691,8 +692,9 @@ async fn text_predicate_falls_back_to_full_object_read() {
     assert_eq!(text.rows, SEGMENTS, "one matching record per segment");
     // The whole objects are read: bytes ~ a full scan plus the probes, the
     // amplification #761 cannot remove for a text predicate. 715,612 = 649,900
-    // object bytes + 65,536 probe bytes (8 x 8 KiB), the plan phase's probe on
-    // top of the whole-object read its fallback then issues.
+    // object bytes + 65,536 probe bytes (8 x 8 KiB) + 176 FIELD_DIR bytes
+    // (8 x 22, read to resolve the arms before the fallback decides), the plan
+    // phase's cost on top of the whole-object read its fallback then issues.
     let full = measure("full_scan", &[], cache).await;
     assert_eq!(
         text.bytes, 715_612,

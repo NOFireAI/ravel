@@ -329,8 +329,9 @@ mandatory on their own access path, which is what keeps every interpreted byte
 checksum-covered (ADR-0010 §4, "Checksum coverage map" below). This is what
 lets a fetcher bring one coalesced byte range per `(row group, projected
 column)` and hand it to a projected decode: the range's holes -- pages of
-pruned blocks, and of columns the projection dropped -- are never interpreted,
-so nothing depends on a checksum over them.
+pruned blocks, and of columns the projection dropped -- may still be fetched
+when coalescing folds them into a requested range, but they are never
+interpreted, so nothing depends on a checksum over them.
 
 A reader may decode a *subset* of a block's columns (`read_block_columns`,
 ADR-0087); the SQL logs scan uses this to decode only the columns a query
