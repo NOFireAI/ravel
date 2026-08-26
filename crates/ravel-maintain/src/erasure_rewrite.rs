@@ -71,6 +71,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use bytes::Bytes;
+use futures::stream::{StreamExt, TryStreamExt, iter as stream_iter};
 use prost::Message;
 use ravel_commit::erasure;
 use ravel_commit::keys;
@@ -576,10 +577,12 @@ async fn resolve_live_inputs(
     store: &dyn ObjectStoreBackend,
     bucket: &Bucket,
     listing: &BucketListing,
+    concurrency: usize,
 ) -> Result<LiveInputs> {
     match resolve_live_record(store, bucket, listing).await? {
         LiveRecord::RawL0 => {
-            let inputs = crate::read::load_inputs(store, bucket, &listing.commit_keys).await?;
+            let inputs =
+                crate::read::load_inputs(store, bucket, &listing.commit_keys, concurrency).await?;
             Ok(LiveInputs::RawL0(inputs))
         }
         LiveRecord::Existing { key, body } => Ok(LiveInputs::Existing { key, body }),
@@ -644,10 +647,18 @@ async fn load_live_catalogs_and_target(
 ) -> Result<(Vec<InputCatalog>, RewriteSupersession)> {
     match live {
         LiveInputs::RawL0(inputs) => {
-            let mut catalogs = Vec::with_capacity(inputs.len());
-            for input in &inputs {
-                catalogs.push(crate::read::load_input_catalog(store, config, input).await?);
-            }
+            // `buffered`, not `buffer_unordered`: the catalogs stay aligned
+            // one-to-one with `inputs` in canonical order (the merge's
+            // tie-break depends on it) while `input_read_concurrency` loads
+            // are in flight.
+            let catalogs: Vec<InputCatalog> = stream_iter(
+                inputs
+                    .iter()
+                    .map(|input| crate::read::load_input_catalog(store, config, input)),
+            )
+            .buffered(config.input_read_concurrency.max(1))
+            .try_collect()
+            .await?;
             let identities = inputs
                 .iter()
                 .map(|i| CompactionInputIdentity {
@@ -1765,7 +1776,7 @@ pub async fn erasure_rewrite_bucket(
     // record set's actual event-time bounds, not the bucket's ingest-hour
     // key, so it can only run after `resolve_live_inputs`'s cheap metadata
     // GET, unlike the old purely key-derived prefilter this replaced.
-    let live = resolve_live_inputs(store, bucket, &listing).await?;
+    let live = resolve_live_inputs(store, bucket, &listing, config.input_read_concurrency).await?;
     let (min_event_ts_ns, max_event_ts_ns) = live_input_event_bounds(&live);
     let overlapping: Vec<&PendingErasureRequest> = pending
         .iter()
@@ -2083,7 +2094,13 @@ pub async fn bucket_erasure_completion(
     // The live view a snapshot would serve: raw L0 records whose identity no
     // record excluded, compaction records no rewrite superseded, and rewrite
     // records no newer rewrite superseded.
-    let l0_inputs = crate::read::load_inputs(store, bucket, &listing.commit_keys).await?;
+    let l0_inputs = crate::read::load_inputs(
+        store,
+        bucket,
+        &listing.commit_keys,
+        config.input_read_concurrency,
+    )
+    .await?;
     let live_l0: Vec<&crate::read::InputRecord> = l0_inputs
         .iter()
         .filter(|ir| {
@@ -2611,7 +2628,7 @@ mod tests {
         let listing = crate::read::list_bucket(&store, &b)
             .await
             .expect("list bucket");
-        let live = resolve_live_inputs(&store, &b, &listing)
+        let live = resolve_live_inputs(&store, &b, &listing, 1)
             .await
             .expect("resolve live inputs");
         let (catalogs, supersession) = load_live_catalogs_and_target(&store, &config, live)
@@ -3502,7 +3519,7 @@ mod tests {
         let listing = crate::read::list_bucket(&store, &b)
             .await
             .expect("list bucket");
-        let live = resolve_live_inputs(&store, &b, &listing)
+        let live = resolve_live_inputs(&store, &b, &listing, 1)
             .await
             .expect("resolve live inputs");
         let (object_keys, supersession) =
@@ -3951,7 +3968,7 @@ mod tests {
         let listing = crate::read::list_bucket(&store, &b)
             .await
             .expect("list bucket");
-        let live = resolve_live_inputs(&store, &b, &listing)
+        let live = resolve_live_inputs(&store, &b, &listing, 1)
             .await
             .expect("resolve live inputs");
         let (object_keys, supersession) =
@@ -4693,7 +4710,7 @@ mod tests {
         let listing = crate::read::list_bucket(store.as_ref(), &bucket())
             .await
             .expect("list bucket");
-        let inputs = crate::read::load_inputs(store.as_ref(), &bucket(), &listing.commit_keys)
+        let inputs = crate::read::load_inputs(store.as_ref(), &bucket(), &listing.commit_keys, 1)
             .await
             .expect("load inputs");
         let l0_key_by_seq: HashMap<u64, String> = inputs
@@ -4900,7 +4917,7 @@ mod tests {
         let listing = crate::read::list_bucket(&store, &logs_bucket())
             .await
             .expect("list bucket");
-        let inputs = crate::read::load_inputs(&store, &logs_bucket(), &listing.commit_keys)
+        let inputs = crate::read::load_inputs(&store, &logs_bucket(), &listing.commit_keys, 1)
             .await
             .expect("load inputs");
         assert_eq!(inputs.len(), 1);

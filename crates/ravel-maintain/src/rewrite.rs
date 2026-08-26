@@ -54,6 +54,7 @@
 //! the identical content-addressed parts and converges at the record's
 //! `CreateIfAbsent`, the same statelessness compaction has.
 
+use futures::stream::{StreamExt, TryStreamExt, iter as stream_iter};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_types::Signal;
 
@@ -101,17 +102,23 @@ pub async fn rewrite_and_publish<C: SegmentCodec>(
     conservation: impl ConservationPredicate,
     start_ns: i64,
 ) -> Result<RewriteOutcome> {
-    let inputs = load_inputs(store, bucket, commit_keys).await?;
+    let inputs = load_inputs(store, bucket, commit_keys, config.input_read_concurrency).await?;
     C::validate_rewrite_inputs(&inputs)?;
     let hash = input_set_hash(&inputs);
 
     // Catalogs aligned one-to-one with `inputs` (canonical order): the merge
     // relies on that alignment for deterministic tie-breaking, same as
-    // compaction's pipeline.
-    let mut catalogs = Vec::with_capacity(inputs.len());
-    for input in &inputs {
-        catalogs.push(C::load_input_catalog(store, config, input).await?);
-    }
+    // compaction's pipeline. `buffered` (not `buffer_unordered`) keeps that
+    // alignment while `input_read_concurrency` catalog loads are in flight:
+    // it yields results in input order regardless of completion order.
+    let catalogs: Vec<C::Catalog> = stream_iter(
+        inputs
+            .iter()
+            .map(|input| C::load_input_catalog(store, config, input)),
+    )
+    .buffered(config.input_read_concurrency.max(1))
+    .try_collect()
+    .await?;
 
     let parts = C::build_parts(store, config, bucket, &inputs, catalogs, &hash).await?;
 
@@ -209,7 +216,13 @@ pub async fn migrate_bucket_format(
     // version without reading it). `load_inputs` verifies each record's key and
     // bucket, so the eligibility read rides on the same decode the rewrite
     // needs anyway.
-    let inputs = load_inputs(store, bucket, &listing.commit_keys).await?;
+    let inputs = load_inputs(
+        store,
+        bucket,
+        &listing.commit_keys,
+        config.input_read_concurrency,
+    )
+    .await?;
     let needs_migration = inputs
         .iter()
         .any(|i| i.record.segment_format_version < target_version);
@@ -893,7 +906,7 @@ mod tests {
         seed(&store, 2, vec![series("beta", &[(20, 2.0)])]).await;
         let b = bucket();
         let listing = list_bucket(&store, &b).await.expect("list");
-        let inputs = load_inputs(&store, &b, &listing.commit_keys)
+        let inputs = load_inputs(&store, &b, &listing.commit_keys, 1)
             .await
             .expect("inputs");
         let hash = input_set_hash(&inputs);

@@ -34,10 +34,10 @@ use uuid::Uuid;
 ///   `O(input_count * block_size)` and does NOT scale with stream/trace size.
 /// - [`Self::peak_total_bytes`]: `fetched + decoded + writer`, adding the
 ///   in-progress part's writer buffer. The writer term is bounded by
-///   `max_l1_part_bytes` (a part is flushed once its record-byte estimate
-///   reaches the cap on a stream boundary) and is the unavoidable
-///   content-addressing cost the ADR calls out: a part's key does not exist
-///   until the whole part is buffered.
+///   `max_l1_part_bytes` (a part is flushed as soon as its record-heap
+///   estimate reaches the cap, mid-stream if that is where the cap falls) and
+///   is the unavoidable content-addressing cost the ADR calls out: a part's
+///   key does not exist until the whole part is buffered.
 ///
 /// Production never installs one (`CompactorConfig::merge_memory_tracker` is
 /// `None`), so the hooks compile to a single `Option` check and add nothing.
@@ -140,6 +140,8 @@ pub const DEFAULT_MIN_COMPACTION_INPUTS: usize = 2;
 /// Default footer suffix-probe size. 64 KiB covers the footer + catalog of a
 /// typical L0 flush in one GET (docs/segment-format.md reader protocol).
 pub const DEFAULT_FOOTER_PROBE_BYTES: u64 = 64 * 1024;
+/// Default `input_read_concurrency`: 8 input reads in flight at once.
+pub const DEFAULT_INPUT_READ_CONCURRENCY: usize = 8;
 
 /// Default `grace`: 24 hours (docs/consistency-model.md "Deletion and GC").
 /// A shared floor for the orphan and unreferenced-part age gates.
@@ -299,6 +301,20 @@ pub struct CompactorConfig {
     pub min_compaction_inputs: usize,
     /// Suffix-probe size for the first footer GET of each input.
     pub footer_probe_bytes: u64,
+    /// How many per-input reads a compaction or rewrite keeps in flight at
+    /// once: the commit-record GETs of [`crate::read::load_inputs`] and the
+    /// per-input catalog loads that follow it. A bucket with hundreds of
+    /// inputs otherwise pays one full store round trip per input in sequence,
+    /// which dominates the merge on any real object store.
+    ///
+    /// This bounds request concurrency only, never resident bytes: a catalog
+    /// is directory metadata (KBs), and the merge itself still streams one
+    /// block at a time per cursor. Values below 1 are treated as 1. Output
+    /// bytes do not depend on it -- inputs are re-sorted into canonical order
+    /// after loading and the merge is a deterministic k-way merge over that
+    /// order -- so raising it can change timing but never content. Default
+    /// [`DEFAULT_INPUT_READ_CONCURRENCY`] (8).
+    pub input_read_concurrency: usize,
     /// This compactor process's uuid. Informational only: it is recorded in
     /// each part's footer `writer_id` and never enters dedup priority.
     /// Default is the nil uuid; the service sets a real one.
@@ -403,6 +419,7 @@ impl Default for CompactorConfig {
             max_l1_part_bytes: DEFAULT_MAX_L1_PART_BYTES,
             min_compaction_inputs: DEFAULT_MIN_COMPACTION_INPUTS,
             footer_probe_bytes: DEFAULT_FOOTER_PROBE_BYTES,
+            input_read_concurrency: DEFAULT_INPUT_READ_CONCURRENCY,
             compactor_writer_id: Uuid::nil(),
             grace_ns: DEFAULT_GRACE_NS,
             protection_horizon_ns: DEFAULT_PROTECTION_HORIZON_NS,
