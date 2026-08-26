@@ -74,6 +74,19 @@
 //! unless an operator opts in. The join/sort/window/file-scan knobs stay
 //! unconditionally `false`: their determinism requirements are out of ADR-0094's
 //! scope.
+//!
+//! Aggregation state size (issue #680, ADR-0102 decision 2's amendment):
+//! [`session_config`] also tightens DataFusion's two skip-partial-aggregation
+//! probe thresholds ([`SKIP_PARTIAL_AGGREGATION_PROBE_ROWS`],
+//! [`SKIP_PARTIAL_AGGREGATION_PROBE_RATIO`]) whenever
+//! `SqlConfig::skip_partial_aggregation` is on, which it is by default. This is
+//! a memory decision, not a determinism one: the partial stage keeps one hash
+//! table per input partition, so a key whose distinct values appear in every
+//! partition costs `partitions x distinct` entries before the final stage ever
+//! merges them. Giving up early bounds that at `partitions x probe rows`. It
+//! cannot change a result -- the final stage sees the same rows and computes
+//! the same groups either way -- so it is orthogonal to the determinism rules
+//! above.
 
 use std::sync::Arc;
 
@@ -355,6 +368,39 @@ pub const ADMITTED_TABLE_FUNCTIONS: [&str; 0] = [];
 /// against the upstream registrations by the drift test.
 pub const EXCLUDED_TABLE_FUNCTIONS: [&str; 2] = ["generate_series", "range"];
 
+/// Rows one partial aggregation partition processes before it checks whether
+/// its group key is worth aggregating at all
+/// (`datafusion.execution.skip_partial_aggregation_probe_rows_threshold`,
+/// DataFusion's default 100,000). Issue #680.
+///
+/// One Arrow batch. The threshold is not a tuning preference, it is the size of
+/// the state a partition is allowed to build before the probe can save it:
+/// whatever a partial partition has accumulated when it gives up stays resident
+/// for the rest of the scan, and every partition pays it, so the cost of the
+/// probe itself is `partitions x this`. DataFusion's 100,000 also never fires
+/// at all on a partition that holds fewer rows than that, which is the common
+/// case here once `target_partitions` divides a tenant's hour.
+///
+/// Not smaller: [`SKIP_PARTIAL_AGGREGATION_PROBE_RATIO`] is judged from a
+/// sample of exactly this many rows, and a smaller sample starts reading a
+/// genuinely reducible mid-cardinality key as unreducible.
+pub const SKIP_PARTIAL_AGGREGATION_PROBE_ROWS: usize = 8192;
+
+/// Distinct-groups-to-rows ratio above which a partial aggregation partition
+/// gives up
+/// (`datafusion.execution.skip_partial_aggregation_probe_ratio_threshold`,
+/// DataFusion's default 0.8). Issue #680.
+///
+/// At 0.5 a partition stops aggregating when its probe found a new group for
+/// more than every other row: at that ratio the partial stage is spending a
+/// hash-table entry per two rows and returning at most a factor of two, which
+/// does not pay for `partitions` copies of the state. Below it the partial
+/// stage still reduces enough to be worth its memory and nothing changes.
+/// Skipping never changes a result, only where the state lives; a
+/// falsely-skipped partition costs rows pushed to the final stage, never a
+/// wrong group.
+pub const SKIP_PARTIAL_AGGREGATION_PROBE_RATIO: f64 = 0.5;
+
 /// An `ObjectStoreRegistry` that holds nothing and registers nothing.
 ///
 /// `register_store` silently declines (returning `None`, the trait's "no
@@ -392,7 +438,7 @@ impl ObjectStoreRegistry for EmptyObjectStoreRegistry {
 /// fan the final aggregation across partitions. `false` for every other query,
 /// which reproduces the old single-partition plan exactly.
 pub fn session_config(config: &SqlConfig, exact_typed_aggregates: bool) -> SessionConfig {
-    SessionConfig::new()
+    let mut session = SessionConfig::new()
         .with_information_schema(false)
         .with_target_partitions(config.engine.fetch_concurrency.max(1))
         // ADR-0094: the only knob that is ever true, and only for a query whose
@@ -401,7 +447,23 @@ pub fn session_config(config: &SqlConfig, exact_typed_aggregates: bool) -> Sessi
         .with_repartition_joins(false)
         .with_repartition_sorts(false)
         .with_repartition_windows(false)
-        .with_repartition_file_scans(false)
+        .with_repartition_file_scans(false);
+
+    // Issue #680 / ADR-0102 decision 2's amendment. Neither option has a
+    // fluent `with_*` setter in DataFusion 54, so both are written through
+    // `options_mut` as typed fields (no string keys, so a renamed option is a
+    // compile error rather than a silently ignored setting).
+    if config.skip_partial_aggregation {
+        let options = session.options_mut();
+        options
+            .execution
+            .skip_partial_aggregation_probe_rows_threshold = SKIP_PARTIAL_AGGREGATION_PROBE_ROWS;
+        options
+            .execution
+            .skip_partial_aggregation_probe_ratio_threshold = SKIP_PARTIAL_AGGREGATION_PROBE_RATIO;
+    }
+
+    session
 }
 
 /// Build a fresh, single-tenant `SessionContext` around `table` with `pool`
@@ -697,6 +759,68 @@ mod tests {
         assert!(!options.optimizer.repartition_sorts);
         assert!(!options.optimizer.repartition_windows);
         assert!(!options.optimizer.repartition_file_scans);
+    }
+
+    /// Issue #680: a default session tightens both skip-partial-aggregation
+    /// probe thresholds, and `skip_partial_aggregation = false` leaves
+    /// DataFusion's own values untouched.
+    ///
+    /// The "off" half reads the stock values from a plain `SessionConfig`
+    /// rather than hardcoding 0.8/100_000, so a DataFusion release that moves
+    /// its defaults does not turn this into a stale change detector -- what is
+    /// pinned is "off changes nothing", which is the property the escape hatch
+    /// promises.
+    #[test]
+    fn skip_partial_aggregation_sets_both_probe_thresholds() {
+        let on = session_config(&SqlConfig::default(), false);
+        assert_eq!(
+            on.options()
+                .execution
+                .skip_partial_aggregation_probe_rows_threshold,
+            SKIP_PARTIAL_AGGREGATION_PROBE_ROWS
+        );
+        assert_eq!(
+            on.options()
+                .execution
+                .skip_partial_aggregation_probe_ratio_threshold,
+            SKIP_PARTIAL_AGGREGATION_PROBE_RATIO
+        );
+
+        let stock = SessionConfig::new();
+        let stock_rows = stock
+            .options()
+            .execution
+            .skip_partial_aggregation_probe_rows_threshold;
+        let stock_ratio = stock
+            .options()
+            .execution
+            .skip_partial_aggregation_probe_ratio_threshold;
+        assert!(
+            SKIP_PARTIAL_AGGREGATION_PROBE_ROWS < stock_rows
+                && SKIP_PARTIAL_AGGREGATION_PROBE_RATIO < stock_ratio,
+            "both Ravel thresholds must be tighter than DataFusion's stock \
+             {stock_rows} rows / {stock_ratio} ratio, or the setting is a no-op"
+        );
+
+        let off = session_config(
+            &SqlConfig {
+                skip_partial_aggregation: false,
+                ..SqlConfig::default()
+            },
+            false,
+        );
+        assert_eq!(
+            off.options()
+                .execution
+                .skip_partial_aggregation_probe_rows_threshold,
+            stock_rows
+        );
+        assert_eq!(
+            off.options()
+                .execution
+                .skip_partial_aggregation_probe_ratio_threshold,
+            stock_ratio
+        );
     }
 
     /// ADR-0022 decision 2: the validation reject-list

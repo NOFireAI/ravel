@@ -815,6 +815,7 @@ async fn byte_budget_exceeded_returns_typed_error() {
         engine: EngineConfig::default(),
         max_query_bytes: 8,
         parallel_final_aggregation: false,
+        skip_partial_aggregation: true,
     };
     let tenant = TenantMemoryAccountant::new(1 << 30);
     let task_ctx = task_ctx_with_pool(&config, Arc::clone(&tenant));
@@ -901,6 +902,7 @@ async fn high_cardinality_trips_query_pool_before_tenant() {
         engine: EngineConfig::default(),
         max_query_bytes: 16 * 1024,
         parallel_final_aggregation: false,
+        skip_partial_aggregation: true,
     };
     let tenant = TenantMemoryAccountant::new(1 << 30);
     let task_ctx = task_ctx_with_pool(&config, Arc::clone(&tenant));
@@ -955,6 +957,7 @@ async fn tenant_budget_trips_and_rolls_back_the_query_reservation() {
         engine: EngineConfig::default(),
         max_query_bytes: 1 << 30,
         parallel_final_aggregation: false,
+        skip_partial_aggregation: true,
     };
     let tenant = TenantMemoryAccountant::new(8);
     let (pool, _breach) = config.query_pool(Arc::clone(&tenant), QueryAccounting::new());
@@ -1011,6 +1014,7 @@ async fn query_budget_reported_first_when_both_ceilings_are_equally_reachable() 
         engine: EngineConfig::default(),
         max_query_bytes: 8,
         parallel_final_aggregation: false,
+        skip_partial_aggregation: true,
     };
     let tenant = TenantMemoryAccountant::new(8);
     let task_ctx = task_ctx_with_pool(&config, Arc::clone(&tenant));
