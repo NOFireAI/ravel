@@ -760,6 +760,26 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    /// Whether this process walks through permission bits: root, or any uid
+    /// holding `CAP_DAC_OVERRIDE`. Probed by writing into a `0o000` directory
+    /// rather than read off a uid, because bypassing DAC is the property the
+    /// mode-bit phases actually depend on, and it is not the same question as
+    /// "is the caller uid 0" in either direction.
+    #[cfg(unix)]
+    fn bypasses_dac() -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        let probe = TempDir::new().unwrap();
+        let denied = probe.path().join("no-permissions");
+        fs::create_dir(&denied).unwrap();
+        fs::set_permissions(&denied, fs::Permissions::from_mode(0o000)).unwrap();
+        let bypassed = fs::write(denied.join("probe"), b"x").is_ok();
+        // Hand the directory back its own permissions so `TempDir`'s drop can
+        // actually remove it; that drop swallows the error it would otherwise
+        // hit, leaving the tree behind.
+        fs::set_permissions(&denied, fs::Permissions::from_mode(0o700)).unwrap();
+        bypassed
+    }
+
     #[tokio::test]
     async fn round_trip_identical_bytes_all_zero_and_zero_length() {
         let tmp = TempDir::new().unwrap();
@@ -782,54 +802,123 @@ mod tests {
         );
     }
 
-    /// Issue #703: every phase here must induce its failure at any uid.
+    /// Issue #703: every phase here must induce its failure at any uid. A
+    /// read-only mode bit does not: root and any `CAP_DAC_OVERRIDE` caller
+    /// write straight through one, so a phase that locks a directory and then
+    /// asserts a miss asserts nothing there, and worse, fails, because the
+    /// insert it expected to be dropped succeeds. The first two phases below
+    /// therefore deny writes with ENOTDIR (a path component that is a regular
+    /// file), which no uid can walk through; the one claim ENOTDIR cannot
+    /// express keeps the mode bit and is skipped under a DAC bypass.
+    ///
+    /// FLIP (non-vacuity): in `Inner::insert`, replace
+    /// `if fs::create_dir_all(parent).is_err() { return; }` with
+    /// `fs::create_dir_all(parent).unwrap();`. The ENOTDIR phases then panic
+    /// inside `insert` instead of degrading, and the test fails at any uid.
     #[tokio::test]
     async fn every_disk_failure_degrades_to_a_miss() {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path().to_path_buf();
 
-        // Directory absent, and not creatable: the parent that would hold
-        // it is read-only, so `create_dir_all` cannot make the configured
-        // directory exist. Reads and inserts must both behave like an
-        // ordinary miss, never panic or report an error.
+        // Directory absent, and not creatable: the path component that would
+        // hold it is a regular file, so `create_dir_all` cannot make the
+        // configured directory exist and every write beneath it fails with
+        // ENOTDIR. Reads and inserts must both behave like an ordinary miss,
+        // never panic or report an error.
         {
-            let readonly_parent = base.join("readonly-parent");
-            fs::create_dir_all(&readonly_parent).unwrap();
-            let missing_dir = readonly_parent.join("cache-dir");
-            #[cfg(unix)]
-            {
-                make_readonly(&readonly_parent);
-                let cache = DiskCache::new(missing_dir, generous_limits());
-                let payload: &[u8] = b"payload";
-                let key = test_key_with_len(1, payload.len() as u64);
-                assert!(cache.get(&key).is_none());
-                cache.insert(key, payload); // must not panic
-                assert!(cache.get(&key).is_none());
-                make_writable(&readonly_parent);
-            }
+            let blocking_file = base.join("a-regular-file");
+            fs::write(&blocking_file, b"not a directory").unwrap();
+            let missing_dir = blocking_file.join("cache-dir");
+            let cache = DiskCache::new(missing_dir.clone(), generous_limits());
+            let payload: &[u8] = b"payload";
+            let key = test_key_with_len(1, payload.len() as u64);
+            assert!(cache.get(&key).is_none());
+            cache.insert(key, payload); // must not panic
+            assert!(cache.get(&key).is_none());
+            assert!(
+                !missing_dir.exists(),
+                "nothing may come into existence beneath a regular file"
+            );
         }
 
-        // Directory read-only: an entry written while writable stays
-        // readable; a later insert while read-only is silently dropped
-        // rather than erroring.
+        // Directory replaced by a regular file after an entry was cached: a
+        // later insert's `create_dir_all`, and every write under the
+        // configured path, now fail with ENOTDIR. What this phase can honestly
+        // claim once the directory is gone is the degradation itself: the new
+        // key is silently not admitted, and the key cached beforehand becomes
+        // a clean miss rather than a panic or an error. The stronger claim
+        // that a previously written entry stays *readable* needs the directory
+        // to survive while denying writes, so it lives in the mode-bit phase
+        // below.
         {
-            let dir = base.join("readonly-dir");
+            let dir = base.join("replaced-by-file");
             fs::create_dir_all(&dir).unwrap();
             let cache = DiskCache::new(dir.clone(), generous_limits());
-            let cached_before_payload: &[u8] = b"cached before lockdown";
+            let cached_before_payload: &[u8] = b"cached before the swap";
             let already_cached = test_key_with_len(10, cached_before_payload.len() as u64);
             cache.insert(already_cached, cached_before_payload);
             assert!(cache.get(&already_cached).is_some());
 
-            #[cfg(unix)]
-            {
+            let moved_away = base.join("replaced-by-file-moved");
+            fs::rename(&dir, &moved_away).unwrap();
+            let replacement: &[u8] = b"a regular file where the cache directory was";
+            fs::write(&dir, replacement).unwrap();
+
+            let never_cached_payload: &[u8] = b"should not persist";
+            let never_cached = test_key_with_len(11, never_cached_payload.len() as u64);
+            cache.insert(never_cached, never_cached_payload);
+            assert!(cache.get(&never_cached).is_none());
+            assert!(
+                cache.get(&already_cached).is_none(),
+                "the cached entry's bytes went with the directory: a miss, not an error"
+            );
+            assert_eq!(
+                fs::read(&dir).unwrap().as_slice(),
+                replacement,
+                "the cache must not have written through the file blocking its path"
+            );
+        }
+
+        // The one claim ENOTDIR cannot express: an entry written while the
+        // directory was writable stays readable once the directory itself is
+        // read-only, and only the later insert is dropped. That needs a
+        // directory that survives and denies writes, which is a mode bit and
+        // nothing else. A caller that bypasses DAC walks through the bit, so
+        // there the phase is skipped with a reason rather than asserting
+        // something untrue of it (#703).
+        #[cfg(unix)]
+        {
+            if bypasses_dac() {
+                println!(
+                    "skipping the read-only-directory phase: this process bypasses DAC \
+                     (root, or CAP_DAC_OVERRIDE), so a read-only mode bit denies it nothing"
+                );
+            } else {
+                let dir = base.join("readonly-dir");
+                fs::create_dir_all(&dir).unwrap();
+                let cache = DiskCache::new(dir.clone(), generous_limits());
+                let cached_before_payload: &[u8] = b"cached before lockdown";
+                let already_cached = test_key_with_len(12, cached_before_payload.len() as u64);
+                cache.insert(already_cached, cached_before_payload);
+                assert!(cache.get(&already_cached).is_some());
+
                 make_readonly(&dir);
-                // Any existing shard subdirectory it would need to write
-                // into is also read-only, since it was created before lockdown.
                 let never_cached_payload: &[u8] = b"should not persist";
-                let never_cached = test_key_with_len(11, never_cached_payload.len() as u64);
+                let never_cached = test_key_with_len(13, never_cached_payload.len() as u64);
+                let never_cached_path = path_for(&dir, &never_cached);
+                let never_cached_shard = never_cached_path.parent().unwrap();
+                assert!(
+                    !never_cached_shard.exists(),
+                    "precondition: this insert must need a new shard directory, \
+                     which is what the read-only parent denies"
+                );
                 cache.insert(never_cached, never_cached_payload);
                 assert!(cache.get(&never_cached).is_none());
+                assert_eq!(
+                    cache.get(&already_cached).as_deref(),
+                    Some(cached_before_payload),
+                    "an entry written while writable stays readable under a read-only directory"
+                );
                 make_writable(&dir);
             }
         }
