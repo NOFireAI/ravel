@@ -207,12 +207,22 @@ impl LogQuery {
     /// filters rows, not blocks, so it never changes the survivor count, but
     /// treating a query with pending erasure as predicate-free would let the
     /// fast path fire in a state the plan phase should stay conservative about.
+    ///
+    /// Destructures `Self` by name rather than checking fields ad hoc: this
+    /// gates a query-correctness invariant (a false positive here silently
+    /// drops rows via the plan fast path), so a future field addition to
+    /// `LogQuery` must be a build break here, not a silent gap.
     #[must_use]
     pub fn is_block_predicate_free(&self) -> bool {
-        self.content.is_empty()
-            && self.prune.is_empty()
-            && self.stream_attrs.is_empty()
-            && self.erasure.is_empty()
+        let Self {
+            ts_min_ns: _,
+            ts_max_ns: _,
+            stream_attrs,
+            content,
+            prune,
+            erasure,
+        } = self;
+        content.is_empty() && prune.is_empty() && stream_attrs.is_empty() && erasure.is_empty()
     }
 }
 
@@ -865,8 +875,20 @@ impl LogSegmentFetcher {
         // needs real ts pruning), and it implies relevance, so the fast path
         // never has to return the irrelevant-`None`. A zero object size cannot
         // be range-probed (every extent, starting with the probe's cache key,
-        // is derived from it), so it falls through to the whole-object slow path.
-        if seg_ref.object_size > 0
+        // is derived from it), so it falls through to the whole-object slow
+        // path, as does an inverted span (`min > max`, the shape a zero-record
+        // payload would produce, structurally unreachable today but not worth
+        // trusting blindly): the slow path's `ts_range_relevant` would return
+        // `None` for a genuinely empty segment, and the fast path should agree
+        // rather than returning `Some((0, ..))` for an input that should never
+        // reach a segment at all. `object_size > block_range_threshold` keeps
+        // the fast path strictly to the band where it actually saves a GET: at
+        // or below the threshold `tenant_bytes` already takes a single
+        // whole-object read (`fetch_footer` has no matching whole-object
+        // crossover of its own, so below the threshold it would read the same
+        // object twice under two different cache keys instead of once).
+        if seg_ref.object_size > self.block_range_threshold
+            && seg_ref.min_event_ts_ns <= seg_ref.max_event_ts_ns
             && query.is_block_predicate_free()
             && query.ts_min_ns <= seg_ref.min_event_ts_ns
             && seg_ref.max_event_ts_ns <= query.ts_max_ns
@@ -1663,13 +1685,22 @@ impl BlockRangeFetcher {
     /// This is the read the predicate-free plan fast path
     /// ([`LogSegmentFetcher::plan_segment`], #693) needs: the survivor count for
     /// such a query is `footer.block_count`, so none of the object's blocks have
-    /// to move. The GET is cache-routed exactly like [`Self::fetch_object`]'s
-    /// probe, so a later block-range fetch of the same segment rides the same
-    /// pinned etag and cached probe extent rather than re-fetching it.
+    /// to move. The GET is cache-routed through [`Self::cached_extent`], the
+    /// same cache [`Self::fetch_object`]'s probe uses, so a later block-range
+    /// fetch of the same segment that happens to probe the identical extent
+    /// (same offset and length -- true above `whole_object_threshold`, where
+    /// both paths use the same suffix key) hits that cached entry rather than
+    /// re-fetching it. Each call creates its own [`EtagPin`]; pins are not
+    /// shared across calls.
     ///
-    /// The caller guarantees `seg_ref.object_size > 0`: every extent here, the
-    /// probe's cache key first, is derived from that size, so a zero size has no
-    /// range to probe (`fetch_object` reads such an object whole instead).
+    /// The caller guarantees `seg_ref.object_size > self.block_range_threshold`
+    /// (via [`LogSegmentFetcher::plan_segment`]'s fast-path gate): this method
+    /// has no whole-object crossover of its own, so calling it at or below that
+    /// threshold would read the object under a different cache key than
+    /// [`Self::fetch_object`]'s whole-object path uses, costing an extra GET
+    /// instead of saving one. A zero object size cannot be range-probed either
+    /// (every extent, starting with the probe's cache key, is derived from it),
+    /// which the same threshold guard rules out.
     pub async fn fetch_footer(
         &self,
         seg_ref: &SegmentRef,
@@ -2809,6 +2840,69 @@ mod plan_fast_path_tests {
         assert!(
             acc.snapshot().total_s3_bytes() > tail,
             "partial overlap: block-range fetch ran"
+        );
+
+        // (v) A prune-only predicate present (the ClickBench `attrs['k']='v'`
+        // shape, via LogsPushdown::prune). "hello" is in every block's body, so
+        // no block is pruned: same survivor count (N) as the fast path, but via
+        // the real fetch. `prune` is the one guarded field with no case above
+        // it, and it is the field that actually removes blocks
+        // (`candidates.retain` in the reader) on the real ClickBench workload.
+        let q = LogQuery::new(i64::MIN, i64::MAX).with_prune(Predicate::HasWord {
+            field: FieldSel::Body,
+            word: "hello".into(),
+        });
+        let acc = QueryAccounting::new();
+        let (count, _) = f
+            .plan_segment(&seg, TENANT, &q, &acc)
+            .await
+            .expect("plan")
+            .expect("relevant");
+        assert_eq!(count, N, "prune: no block pruned");
+        assert!(
+            acc.snapshot().total_s3_bytes() > tail,
+            "prune: block-range fetch ran"
+        );
+    }
+
+    /// (Test c, threshold) An object at or below `block_range_threshold`,
+    /// predicate-free and fully contained, still takes the slow path: the fast
+    /// path's `fetch_footer` has no whole-object crossover of its own, so
+    /// firing it at or below the threshold would read the object under a
+    /// different cache key than the whole-object path already uses, costing an
+    /// extra GET instead of saving one.
+    #[tokio::test]
+    async fn small_object_at_or_below_threshold_takes_the_slow_path() {
+        const N: usize = 6;
+        let records: Vec<LogRecord> = (0..N as i64).map(record).collect();
+        let bytes = build_object(&records);
+        let total = bytes.len() as u64;
+        let tail = tail_len(&bytes);
+        let seg = seg_ref(total, &records);
+        let store = store_with_object(bytes).await;
+        // block_range_threshold == total: exactly at the boundary, so the fast
+        // path's `object_size > block_range_threshold` conjunct is false.
+        let f = LogSegmentFetcher::new(store.clone())
+            .with_block_range_threshold(total)
+            .with_block_range(
+                BlockRangeFetcher::new(store)
+                    .with_suffix_len(tail)
+                    .with_whole_object_threshold(0),
+            );
+        let query = LogQuery::new(i64::MIN, i64::MAX);
+        let acc = QueryAccounting::new();
+        let (count, _) = f
+            .plan_segment(&seg, TENANT, &query, &acc)
+            .await
+            .expect("plan")
+            .expect("relevant");
+        assert_eq!(
+            count, N,
+            "at-threshold: same survivor count as the fast path"
+        );
+        assert!(
+            acc.snapshot().total_s3_bytes() > tail,
+            "at-threshold: block-range fetch ran, not the footer-only probe"
         );
     }
 }
