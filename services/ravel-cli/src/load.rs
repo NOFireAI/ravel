@@ -1996,6 +1996,10 @@ enum StrSrc<'a> {
         values: &'a ArrayRef,
         keys: Vec<usize>,
     },
+    /// An all-null column: every row yields `None`. Used for a dictionary whose
+    /// values array is empty (or whose every key is null), where there is no
+    /// value any row could resolve to.
+    AllNull,
     Bad(&'a ArrayRef),
 }
 
@@ -2008,6 +2012,12 @@ fn str_src(arr: &ArrayRef) -> StrSrc<'_> {
             if matches!(**value_ty, DataType::Utf8 | DataType::LargeUtf8) =>
         {
             let dict = arr.as_any_dictionary();
+            // arrow 59.1's `normalized_keys` asserts the values array is
+            // non-empty, so an empty (or wholly-null) dictionary chunk that a
+            // Parquet writer may emit must take the all-null path first (#708).
+            if dict.values().is_empty() || arr.null_count() == arr.len() {
+                return StrSrc::AllNull;
+            }
             StrSrc::Dict {
                 arr,
                 values: dict.values(),
@@ -2029,6 +2039,7 @@ impl StrSrc<'_> {
                 }
                 read_string(values, keys[row])
             }
+            StrSrc::AllNull => Ok(None),
             StrSrc::Bad(arr) => {
                 if arr.is_null(row) {
                     Ok(None)
@@ -2058,6 +2069,8 @@ enum BytesSrc<'a> {
         values: &'a ArrayRef,
         keys: Vec<usize>,
     },
+    /// The binary analogue of [`StrSrc::AllNull`]: every row yields `None`.
+    AllNull,
     Bad(&'a ArrayRef),
 }
 
@@ -2075,6 +2088,10 @@ fn bytes_src(arr: &ArrayRef) -> BytesSrc<'_> {
             ) =>
         {
             let dict = arr.as_any_dictionary();
+            // See the #708 guard in `str_src`.
+            if dict.values().is_empty() || arr.null_count() == arr.len() {
+                return BytesSrc::AllNull;
+            }
             BytesSrc::Dict {
                 arr,
                 values: dict.values(),
@@ -2097,6 +2114,7 @@ impl BytesSrc<'_> {
                 }
                 read_bytes(values, keys[row])
             }
+            BytesSrc::AllNull => Ok(None),
             BytesSrc::Bad(arr) => {
                 if arr.is_null(row) {
                     Ok(None)
@@ -4300,6 +4318,57 @@ type = "i64"
             col.dyn_col_dicts[plain_pos].is_none(),
             "the plain string column stays plain, no dictionary attached"
         );
+    }
+
+    /// #708: a dictionary-encoded string column whose values array is empty (an
+    /// all-null dictionary chunk a Parquet writer may emit) must resolve to an
+    /// all-null column. Before the fix, `str_src` called
+    /// `DictionaryArray::normalized_keys`, which in arrow-array 59.1 asserts the
+    /// values array is non-empty and panicked here instead.
+    #[test]
+    fn empty_dictionary_str_column_is_all_null() {
+        let keys = Int32Array::from(vec![None, None, None]);
+        let values = Arc::new(StringArray::from(Vec::<&str>::new())) as ArrayRef;
+        let dict = DictionaryArray::<Int32Type>::new(keys, values);
+        let arr: ArrayRef = Arc::new(dict);
+
+        let src = str_src(&arr);
+        assert!(
+            matches!(src, StrSrc::AllNull),
+            "empty-dictionary string column takes the all-null path"
+        );
+        assert!(!src.is_dict(), "an all-null column is not a dictionary");
+        for row in 0..arr.len() {
+            assert_eq!(
+                src.get(row).expect("no error"),
+                None,
+                "every row of an empty-dictionary column is null"
+            );
+        }
+    }
+
+    /// #708, binary analogue: an empty-dictionary binary column resolves to an
+    /// all-null column rather than panicking in `normalized_keys`.
+    #[test]
+    fn empty_dictionary_bytes_column_is_all_null() {
+        let keys = Int32Array::from(vec![None, None]);
+        let values = Arc::new(BinaryArray::from(Vec::<&[u8]>::new())) as ArrayRef;
+        let dict = DictionaryArray::<Int32Type>::new(keys, values);
+        let arr: ArrayRef = Arc::new(dict);
+
+        let src = bytes_src(&arr);
+        assert!(
+            matches!(src, BytesSrc::AllNull),
+            "empty-dictionary binary column takes the all-null path"
+        );
+        assert!(!src.is_dict(), "an all-null column is not a dictionary");
+        for row in 0..arr.len() {
+            assert_eq!(
+                src.get(row).expect("no error"),
+                None,
+                "every row of an empty-dictionary binary column is null"
+            );
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
