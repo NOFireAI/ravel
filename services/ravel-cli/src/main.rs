@@ -725,23 +725,40 @@ enum CatalogCommand {
         #[arg(long, default_value_t = 4)]
         shards: u32,
     },
-    /// One-shot catalog fold for a tenant.
+    /// One-shot catalog fold for one (tenant, signal).
+    ///
+    /// A tenant's snapshot is per signal: a logs or spans tenant is never
+    /// folded unless `--signal` names it. Folding metrics on a logs-only
+    /// tenant seals nothing and publishes an empty metrics HEAD, leaving
+    /// every logs query to list and read every commit record.
     Fold {
         #[arg(long)]
         tenant: String,
         #[arg(long, default_value_t = 4)]
         shards: u32,
+        /// Which signal's snapshot to fold. Defaults to metrics, so an
+        /// existing invocation keeps its meaning.
+        #[arg(long, value_enum, default_value = "metrics")]
+        signal: SignalArg,
     },
-    /// Decode and print HEAD and every referenced snapshot part.
+    /// Decode and print HEAD and every referenced snapshot part for one
+    /// (tenant, signal).
     Inspect {
         #[arg(long)]
         tenant: String,
+        /// Which signal's HEAD to decode. Defaults to metrics.
+        #[arg(long, value_enum, default_value = "metrics")]
+        signal: SignalArg,
     },
-    /// Re-list sealed commit records and diff against the snapshot; exits
-    /// nonzero if the snapshot is missing or mismatches sealed history.
+    /// Re-list sealed commit records for one (tenant, signal) and diff against
+    /// that signal's snapshot; exits nonzero if the snapshot is missing or
+    /// mismatches sealed history.
     Verify {
         #[arg(long)]
         tenant: String,
+        /// Which signal's snapshot to verify. Defaults to metrics.
+        #[arg(long, value_enum, default_value = "metrics")]
+        signal: SignalArg,
     },
 }
 
@@ -829,14 +846,21 @@ async fn main() -> anyhow::Result<()> {
                 },
         } => catalog_list(&cli.store, &tenant, hours, shards).await,
         Command::Catalog {
-            command: CatalogCommand::Fold { tenant, shards },
-        } => catalog::fold(store::build_store(&cli.store)?, &tenant, shards).await,
+            command:
+                CatalogCommand::Fold {
+                    tenant,
+                    shards,
+                    signal,
+                },
+        } => catalog::fold(store::build_store(&cli.store)?, &tenant, shards, signal)
+            .await
+            .map(|_report| ()),
         Command::Catalog {
-            command: CatalogCommand::Inspect { tenant },
-        } => catalog::inspect(store::build_store(&cli.store)?, &tenant).await,
+            command: CatalogCommand::Inspect { tenant, signal },
+        } => catalog::inspect(store::build_store(&cli.store)?, &tenant, signal).await,
         Command::Catalog {
-            command: CatalogCommand::Verify { tenant },
-        } => catalog::verify(store::build_store(&cli.store)?, &tenant).await,
+            command: CatalogCommand::Verify { tenant, signal },
+        } => catalog::verify(store::build_store(&cli.store)?, &tenant, signal).await,
         Command::Maintain {
             command:
                 MaintainCommand::CompactBucket {

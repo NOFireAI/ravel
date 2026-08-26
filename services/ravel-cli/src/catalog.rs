@@ -3,13 +3,21 @@
 //! referenced snapshot part), and `verify` (re-list sealed commit records
 //! and diff against the snapshot). Built strictly against `ravel-catalog`'s
 //! public API: no new methods added to that crate for this tool.
+//!
+//! Every one of the three is per (tenant, signal), exactly as
+//! `ravel_catalog::Catalog::fold` and the ADR-0020 resolve are: a tenant's
+//! logs snapshot is a different object from its metrics snapshot, and folding
+//! one leaves the other untouched. `--signal` selects which, defaulting to
+//! metrics.
 
 use std::sync::Arc;
 
-use ravel_catalog::{CatalogConfig, PartLimits};
+use ravel_catalog::{CatalogConfig, FoldReport, PartLimits};
 use ravel_object_store::{GetRange, ObjectStoreBackend};
 use ravel_types::{Signal, TenantHash, TenantId};
 use uuid::Uuid;
+
+use crate::maintain::SignalArg;
 
 /// HEAD object key (docs/catalog-and-mvcc.md key layout, frozen format).
 /// Duplicated here rather than imported: `ravel-catalog` only exposes the
@@ -19,12 +27,19 @@ fn head_key(tenant: &TenantHash, signal: Signal) -> String {
     format!("t/{}/catalog/{}/HEAD", tenant.to_hex(), signal.key_prefix())
 }
 
-/// Folds one signal's catalog snapshot for a tenant (issue #718).
+/// Folds one signal's catalog snapshot for a tenant, and returns the report it
+/// printed so a caller (the tests) can assert on it rather than on stdout.
+///
+/// `signal` picks which snapshot is folded. A logs or spans tenant is folded
+/// only when `signal` names it: folding metrics on a logs tenant seals nothing
+/// and publishes an empty metrics HEAD, leaving every logs query to re-derive
+/// its snapshot by listing and reading every commit record (issue #718).
 pub async fn fold(
     store: Arc<dyn ObjectStoreBackend>,
     tenant: &str,
     shard_count: u32,
-) -> anyhow::Result<()> {
+    signal: SignalArg,
+) -> anyhow::Result<FoldReport> {
     let catalog_config = CatalogConfig {
         shard_count,
         ..CatalogConfig::default()
@@ -43,10 +58,11 @@ pub async fn fold(
     let now = crate::now_ns()?;
     let folder_id = Uuid::new_v4();
     let report = catalog
-        .fold(&tenant_hash, Signal::Metrics, folder_id, now, &[], None)
+        .fold(&tenant_hash, signal.to_signal(), folder_id, now, &[], None)
         .await
         .map_err(|err| anyhow::anyhow!("fold failed: {err}"))?;
 
+    println!("signal: {}", signal_word(signal.to_signal()));
     println!("no_op: {}", report.no_op);
     println!("rebuilt: {}", report.rebuilt);
     println!(
@@ -60,12 +76,16 @@ pub async fn fold(
     println!("list_requests: {}", report.list_requests);
     println!("get_requests: {}", report.get_requests);
     println!("put_requests: {}", report.put_requests);
-    Ok(())
+    Ok(report)
 }
 
-pub async fn inspect(store: Arc<dyn ObjectStoreBackend>, tenant: &str) -> anyhow::Result<()> {
+pub async fn inspect(
+    store: Arc<dyn ObjectStoreBackend>,
+    tenant: &str,
+    signal: SignalArg,
+) -> anyhow::Result<()> {
     let mut out = String::new();
-    let result = render_inspect(store, tenant, &mut out).await;
+    let result = render_inspect(store, tenant, signal, &mut out).await;
     // Print whatever was rendered even on error: a part fetch/decode failure
     // partway through must not discard the HEAD fields and every earlier
     // part's ref this call already rendered -- an operator inspecting a
@@ -75,7 +95,7 @@ pub async fn inspect(store: Arc<dyn ObjectStoreBackend>, tenant: &str) -> anyhow
     result
 }
 
-/// Decodes the tenant's metrics HEAD and every referenced snapshot part into
+/// Decodes the tenant's HEAD for `signal` and every referenced snapshot part into
 /// the human-readable report `inspect` prints, appending into `out` as it
 /// goes so a failure partway through still leaves everything rendered so far
 /// in `out` for the caller to print. Returns `Err` (with `out` still holding
@@ -90,10 +110,11 @@ pub async fn inspect(store: Arc<dyn ObjectStoreBackend>, tenant: &str) -> anyhow
 pub async fn render_inspect(
     store: Arc<dyn ObjectStoreBackend>,
     tenant: &str,
+    signal: SignalArg,
     out: &mut String,
 ) -> anyhow::Result<()> {
     let tenant_hash = TenantId::new(tenant).hash();
-    let key = head_key(&tenant_hash, Signal::Metrics);
+    let key = head_key(&tenant_hash, signal.to_signal());
 
     let head_bytes = match store.get(&key, GetRange::Full).await {
         Ok(outcome) => outcome.data,
@@ -110,7 +131,14 @@ pub async fn render_inspect(
         "tenant_hash: {}\n",
         hex::encode(&head.tenant_hash)
     ));
-    out.push_str(&format!("signal: {}\n", head.signal));
+    // Both the word and the numeric proto value: the word is what an operator
+    // reads, the number is what is actually on the object, and the two differing
+    // from the `--signal` that was asked for is itself the finding.
+    out.push_str(&format!(
+        "signal: {} ({})\n",
+        head_signal_word(head.signal),
+        head.signal
+    ));
     out.push_str(&format!("shard_count: {}\n", head.shard_count));
     out.push_str(&format!("watermark_hour: {}\n", head.watermark_hour));
     out.push_str(&format!(
@@ -157,6 +185,31 @@ pub async fn render_inspect(
     Ok(())
 }
 
+/// The `--signal` spelling of a [`Signal`], so every report names the signal
+/// with the same word the flag accepts.
+fn signal_word(signal: Signal) -> &'static str {
+    match signal {
+        Signal::Metrics => "metrics",
+        Signal::Logs => "logs",
+        Signal::Spans => "spans",
+        Signal::Profiles => "profiles",
+        Signal::Alerts => "alerts",
+        Signal::Audit => "audit",
+    }
+}
+
+/// The same word for a `SnapshotHead.signal` field as read off the object,
+/// which is a raw proto enum value and so can be a value no signal maps to.
+fn head_signal_word(raw: u32) -> &'static str {
+    match i32::try_from(raw)
+        .ok()
+        .and_then(|value| ravel_commit::signal::from_proto(value).ok())
+    {
+        Some(signal) => signal_word(signal),
+        None => "unknown",
+    }
+}
+
 fn format_identity(id: &ravel_catalog::EntryIdentity) -> String {
     format!(
         "shard={} ingest_hour_bucket={} writer_id={} writer_epoch={} writer_seq={}",
@@ -182,26 +235,34 @@ fn format_uuid_bytes(bytes: &[u8]) -> String {
 /// record are reported but never fail verification: retention deleting a
 /// commit record after it has been folded produces exactly this shape and is
 /// expected, not a divergence.
-pub async fn verify(store: Arc<dyn ObjectStoreBackend>, tenant: &str) -> anyhow::Result<()> {
+pub async fn verify(
+    store: Arc<dyn ObjectStoreBackend>,
+    tenant: &str,
+    signal: SignalArg,
+) -> anyhow::Result<()> {
     let tenant_hash = TenantId::new(tenant).hash();
 
     // The comparison itself lives in `ravel-catalog` (ADR-0059 decision 2) so
     // the scheduled scrubber and this CLI share one implementation. This
     // command keeps its own presentation: the `println!` report and the nonzero
     // exit (via `anyhow::bail!`) on a real divergence.
-    let report =
-        match ravel_catalog::verify_seal_divergence(store.as_ref(), &tenant_hash, Signal::Metrics)
-            .await
-            .map_err(|err| anyhow::anyhow!("{err}"))?
-        {
-            Some(report) => report,
-            None => {
-                let key = head_key(&tenant_hash, Signal::Metrics);
-                println!("no HEAD found at {key}; nothing folded yet, nothing to verify");
-                return Ok(());
-            }
-        };
+    let report = match ravel_catalog::verify_seal_divergence(
+        store.as_ref(),
+        &tenant_hash,
+        signal.to_signal(),
+    )
+    .await
+    .map_err(|err| anyhow::anyhow!("{err}"))?
+    {
+        Some(report) => report,
+        None => {
+            let key = head_key(&tenant_hash, signal.to_signal());
+            println!("no HEAD found at {key}; nothing folded yet, nothing to verify");
+            return Ok(());
+        }
+    };
 
+    println!("signal: {}", signal_word(signal.to_signal()));
     println!("watermark_hour: {}", report.watermark_hour);
     println!(
         "sealed commit records (re-listed): {}",
@@ -309,7 +370,7 @@ mod tests {
             .expect("put head");
 
         let mut report = String::new();
-        render_inspect(store.clone(), tenant, &mut report)
+        render_inspect(store.clone(), tenant, SignalArg::Metrics, &mut report)
             .await
             .expect("inspect renders");
 
@@ -368,7 +429,9 @@ mod tests {
         .await
         .expect("append generation 1");
 
-        fold(store.clone(), tenant, 1).await.expect("cli fold");
+        fold(store.clone(), tenant, 1, SignalArg::Metrics)
+            .await
+            .expect("cli fold");
 
         let head_bytes = store
             .get(&head_key(&tenant_hash, Signal::Metrics), GetRange::Full)
