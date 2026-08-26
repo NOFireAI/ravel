@@ -42,6 +42,189 @@
 # anything.
 set -euo pipefail
 
+# --- History-cleaning helpers --------------------------------------------
+#
+# These are defined before any argument handling so the file can be sourced
+# to get the rewrite without running a merge; that is what
+# scripts/tests/fleet-result-merge-squash.test.sh drives.
+#
+# Two classes of commit have reached protected main through fleet result
+# branches and must never survive into the merge:
+#
+#   1. `wip:` headers: executors that commit work-in-progress snapshots
+#      and never reword them.
+#   2. Pure formatting/style fixups: a commit appended after a failed
+#      `cargo fmt --all --check` whose only content is reformatting.
+#
+# Detection heuristic (documented so it can be tuned):
+#   - wip: subject line begins with `wip:` (case-insensitive).
+#   - formatting fixup: subject contains `fmt` or `style fix`
+#     (case-insensitive) AND the commit's diff against its parent is empty
+#     under `git diff -w` (all changes are whitespace/indentation only).
+#     `-w` will not catch a reformat that rewraps lines, so this is a
+#     conservative filter: it squashes only the unambiguous cases and
+#     leaves anything with a real content change untouched.
+
+# Return the leading `wip:` (case-insensitive) stripped from a subject.
+strip_wip() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  shopt -s nocasematch
+  if [[ "${s}" == wip:* ]]; then
+    s="${s#*:}"
+  fi
+  shopt -u nocasematch
+  s="${s#"${s%%[![:space:]]*}"}"
+  printf '%s' "${s}"
+}
+
+# True if a subject already opens with a Conventional Commits type token.
+has_cc_type() {
+  [[ "$1" =~ ^[a-zA-Z]+(\([^\)]+\))?!?:[[:space:]] ]]
+}
+
+# True if <sha> is a commit the rewrite must not keep on its own, per the
+# heuristic above.
+is_flagged_commit() {
+  local sha="$1" subject parent flagged=0
+  subject="$(git log -1 --format=%s "${sha}")"
+  shopt -s nocasematch
+  if [[ "${subject}" == wip:* ]]; then
+    flagged=1
+  elif [[ "${subject}" == *fmt* || "${subject}" == *"style fix"* ]]; then
+    parent="$(git rev-parse "${sha}^")"
+    if [[ -z "$(git diff -w "${parent}" "${sha}")" ]]; then
+      flagged=1
+    fi
+  fi
+  shopt -u nocasematch
+  [[ ${flagged} -eq 1 ]]
+}
+
+# Print <message> with every trailer of <donor-message> that it does not
+# already carry appended to it, so a Refs:/Fixes:/Signed-off-by: that lived
+# only on a folded commit is never dropped.
+merge_trailers() {
+  local message="$1" donor="$2" tl
+  local -a targs=()
+  while IFS= read -r tl; do
+    if [[ -n "${tl}" ]]; then
+      targs+=(--trailer "${tl}")
+    fi
+  done < <(printf '%s\n' "${donor}" | git interpret-trailers --parse)
+  if [[ ${#targs[@]} -gt 0 ]]; then
+    printf '%s\n' "${message}" | git interpret-trailers \
+      --if-exists addIfDifferent --if-missing add "${targs[@]}"
+  else
+    printf '%s\n' "${message}"
+  fi
+}
+
+# Rebuild <base>..<result-sha> linearly on <rewrite-branch>, folding every
+# flagged commit into the substantive commit it belongs to, and print the
+# resulting commit sha. Progress output goes to stderr so the sha is the
+# only thing on stdout. Leaves HEAD on <rewrite-branch>.
+#
+# A flagged commit that FOLLOWS a substantive one folds backwards into it.
+# A flagged commit that PRECEDES every substantive one folds forwards into
+# the first substantive commit instead: the commit-early practice puts a
+# `wip:` snapshot first on nearly every fleet branch, and keeping it as a
+# separate commit ahead of the deliverable splits one change into two
+# commits on main. The deliverable's message, author and sign-off win; the
+# wip content rides along, and any trailer that lived only on the wip
+# commit is carried over.
+#
+# A branch whose commits are ALL flagged has nothing to fold into, so its
+# first commit is reworded instead: the `wip:` prefix is stripped and, if
+# what remains has no Conventional Commits type, `chore:` is prepended so
+# the subject stays valid. <fallback-label> names the task in the subject
+# of a wip commit that has no text left after stripping.
+fleet_rewrite_history() {
+  local base="$1" result_sha="$2" rewrite_branch="$3" fallback_label="$4"
+  local sha subject stripped new_subject body msg_file
+  # retained: HEAD already holds a commit rebuilt from this branch.
+  # pending_wip: that commit is a provisional wip fold still looking for the
+  # deliverable to be folded into.
+  local retained=0 pending_wip=0
+
+  {
+    git checkout -q -B "${rewrite_branch}" "${base}"
+
+    while IFS= read -r sha; do
+      if ! is_flagged_commit "${sha}"; then
+        if [[ ${pending_wip} -eq 1 ]]; then
+          # Fold the leading wip content forwards into this deliverable,
+          # whose message and author replace the provisional ones.
+          git cherry-pick -n "${sha}"
+          msg_file="$(mktemp)"
+          merge_trailers "$(git log -1 --format=%B "${sha}")" \
+            "$(git log -1 --format=%B HEAD)" >"${msg_file}"
+          # --amend keeps the amended commit's author unless it is given a
+          # new one explicitly; GIT_AUTHOR_* alone would leave the wip
+          # commit's author on the deliverable.
+          git commit --amend --no-verify --allow-empty \
+            --author="$(git log -1 --format='%an <%ae>' "${sha}")" \
+            --date="$(git log -1 --format=%aI "${sha}")" \
+            -F "${msg_file}"
+          rm -f "${msg_file}"
+          pending_wip=0
+        else
+          # Ordinary commit: replay verbatim (author preserved by cherry-pick).
+          git cherry-pick "${sha}"
+        fi
+        retained=1
+        continue
+      fi
+
+      if [[ ${retained} -eq 0 ]]; then
+        # Nothing retained to fold into yet: commit provisionally under a
+        # valid subject. The next substantive commit amends this message
+        # away; it survives only on an all-flagged branch.
+        subject="$(git log -1 --format=%s "${sha}")"
+        stripped="$(strip_wip "${subject}")"
+        if [[ -z "${stripped}" ]]; then
+          new_subject="chore: fleet result for task ${fallback_label}"
+        elif has_cc_type "${stripped}"; then
+          new_subject="${stripped}"
+        else
+          new_subject="chore: ${stripped}"
+        fi
+        body="$(git log -1 --format=%b "${sha}")"
+        msg_file="$(mktemp)"
+        if [[ -n "${body}" ]]; then
+          printf '%s\n\n%s\n' "${new_subject}" "${body}" >"${msg_file}"
+        else
+          printf '%s\n' "${new_subject}" >"${msg_file}"
+        fi
+        git cherry-pick -n "${sha}"
+        GIT_AUTHOR_NAME="$(git log -1 --format=%an "${sha}")" \
+        GIT_AUTHOR_EMAIL="$(git log -1 --format=%ae "${sha}")" \
+        GIT_AUTHOR_DATE="$(git log -1 --format=%aI "${sha}")" \
+          git commit --no-verify -F "${msg_file}"
+        rm -f "${msg_file}"
+        retained=1
+        pending_wip=1
+      else
+        # Fold into whatever HEAD holds, preserving its trailers.
+        git cherry-pick -n "${sha}"
+        msg_file="$(mktemp)"
+        merge_trailers "$(git log -1 --format=%B HEAD)" \
+          "$(git log -1 --format=%B "${sha}")" >"${msg_file}"
+        git commit --amend --no-verify --allow-empty -F "${msg_file}"
+        rm -f "${msg_file}"
+      fi
+    done < <(git rev-list --reverse "${base}..${result_sha}")
+  } >&2
+
+  git rev-parse HEAD
+}
+
+# Sourced rather than executed: stop here, with the helpers above defined and
+# nothing run. Everything below this line performs a merge.
+if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
+  return 0
+fi
+
 if [[ $# -lt 2 ]]; then
   echo "usage: $0 <task-id> <message-file> [-p CRATE ...]" >&2
   exit 64
@@ -133,145 +316,21 @@ if [[ -n "$(git rev-list --merges "${base}..${result_sha}")" ]]; then
 fi
 
 # --- Squash wip:/formatting-fixup commits out of the result branch -------
-#
-# Two classes of commit have reached protected main through fleet result
-# branches and must never survive into the merge:
-#
-#   1. `wip:` headers: executors that commit work-in-progress snapshots
-#      and never reword them.
-#   2. Pure formatting/style fixups: a commit appended after a failed
-#      `cargo fmt --all --check` whose only content is reformatting.
-#
-# Detection heuristic (documented so it can be tuned):
-#   - wip: subject line begins with `wip:` (case-insensitive).
-#   - formatting fixup: subject contains `fmt` or `style fix`
-#     (case-insensitive) AND the commit's diff against its parent is empty
-#     under `git diff -w` (all changes are whitespace/indentation only).
-#     `-w` will not catch a reformat that rewraps lines, so this is a
-#     conservative filter: it squashes only the unambiguous cases and
-#     leaves anything with a real content change untouched.
-#
-# Rewrite: history is rebuilt linearly with cherry-pick. Each flagged commit
-# is folded (`fixup`-style) into the previous retained commit, but its own
-# Refs:/Fixes:/Signed-off-by: trailers are carried into that commit's
-# message if they are not already there, so a required trailer that lived
-# only on a `wip:` snapshot is never dropped. A flagged commit that is the
-# FIRST retained commit has nothing to fold into, so it is reworded instead:
-# its `wip:` prefix is stripped and, if what remains has no Conventional
-# Commits type, a `chore:` type is prepended so the subject stays valid.
-branch_commits=()
-while IFS= read -r c; do
-  branch_commits+=("${c}")
-done < <(git rev-list --reverse "${base}..${result_sha}")
-
-# Return the leading `wip:` (case-insensitive) stripped from a subject.
-strip_wip() {
-  local s="$1"
-  s="${s#"${s%%[![:space:]]*}"}"
-  shopt -s nocasematch
-  if [[ "${s}" == wip:* ]]; then
-    s="${s#*:}"
-  fi
-  shopt -u nocasematch
-  s="${s#"${s%%[![:space:]]*}"}"
-  printf '%s' "${s}"
-}
-
-# True if a subject already opens with a Conventional Commits type token.
-has_cc_type() {
-  [[ "$1" =~ ^[a-zA-Z]+(\([^\)]+\))?!?:[[:space:]] ]]
-}
-
+# The detection heuristic and the fold rules are documented on
+# is_flagged_commit and fleet_rewrite_history at the top of this file.
 need_rewrite=0
-for sha in "${branch_commits[@]+"${branch_commits[@]}"}"; do
-  subject="$(git log -1 --format=%s "${sha}")"
-  shopt -s nocasematch
-  if [[ "${subject}" == wip:* ]]; then
+while IFS= read -r c; do
+  if is_flagged_commit "${c}"; then
     need_rewrite=1
-  elif [[ "${subject}" == *fmt* || "${subject}" == *"style fix"* ]]; then
-    parent="$(git rev-parse "${sha}^")"
-    if [[ -z "$(git diff -w "${parent}" "${sha}")" ]]; then
-      need_rewrite=1
-    fi
   fi
-  shopt -u nocasematch
-done
+done < <(git rev-list --reverse "${base}..${result_sha}")
 
 clean_ref="${result_sha}"
 
 if [[ ${need_rewrite} -eq 1 ]]; then
   echo "==> Squashing wip:/formatting-fixup commits out of the result branch"
   rewrite_branch="_fleet_rewrite_${task_id//\//_}"
-  git checkout -q -B "${rewrite_branch}" "${base}"
-
-  have_real=0
-  for sha in "${branch_commits[@]+"${branch_commits[@]}"}"; do
-    subject="$(git log -1 --format=%s "${sha}")"
-    flagged=0
-    shopt -s nocasematch
-    if [[ "${subject}" == wip:* ]]; then
-      flagged=1
-    elif [[ "${subject}" == *fmt* || "${subject}" == *"style fix"* ]]; then
-      parent="$(git rev-parse "${sha}^")"
-      if [[ -z "$(git diff -w "${parent}" "${sha}")" ]]; then
-        flagged=1
-      fi
-    fi
-    shopt -u nocasematch
-
-    if [[ ${flagged} -eq 0 ]]; then
-      # Ordinary commit: replay verbatim (author preserved by cherry-pick).
-      git cherry-pick "${sha}"
-      have_real=1
-      continue
-    fi
-
-    if [[ ${have_real} -eq 0 ]]; then
-      # First retained commit is flagged: reword it into a valid subject.
-      stripped="$(strip_wip "${subject}")"
-      if [[ -z "${stripped}" ]]; then
-        new_subject="chore: fleet result for task ${task_id}"
-      elif has_cc_type "${stripped}"; then
-        new_subject="${stripped}"
-      else
-        new_subject="chore: ${stripped}"
-      fi
-      body="$(git log -1 --format=%b "${sha}")"
-      msg_file="$(mktemp)"
-      if [[ -n "${body}" ]]; then
-        printf '%s\n\n%s\n' "${new_subject}" "${body}" >"${msg_file}"
-      else
-        printf '%s\n' "${new_subject}" >"${msg_file}"
-      fi
-      git cherry-pick -n "${sha}"
-      GIT_AUTHOR_NAME="$(git log -1 --format=%an "${sha}")" \
-      GIT_AUTHOR_EMAIL="$(git log -1 --format=%ae "${sha}")" \
-      GIT_AUTHOR_DATE="$(git log -1 --format=%aI "${sha}")" \
-        git commit --no-verify -F "${msg_file}"
-      rm -f "${msg_file}"
-      have_real=1
-    else
-      # Fold into the previous retained commit, preserving its trailers.
-      git cherry-pick -n "${sha}"
-      targs=()
-      while IFS= read -r tl; do
-        [[ -n "${tl}" ]] && targs+=(--trailer "${tl}")
-      done < <(git log -1 --format=%B "${sha}" | git interpret-trailers --parse)
-      cur_msg="$(git log -1 --format=%B HEAD)"
-      msg_file="$(mktemp)"
-      if [[ ${#targs[@]} -gt 0 ]]; then
-        printf '%s\n' "${cur_msg}" | git interpret-trailers \
-          --if-exists addIfDifferent --if-missing add \
-          "${targs[@]}" >"${msg_file}"
-      else
-        printf '%s\n' "${cur_msg}" >"${msg_file}"
-      fi
-      git commit --amend --no-verify --allow-empty -F "${msg_file}"
-      rm -f "${msg_file}"
-    fi
-  done
-
-  clean_ref="$(git rev-parse HEAD)"
+  clean_ref="$(fleet_rewrite_history "${base}" "${result_sha}" "${rewrite_branch}" "${task_id}")"
   git checkout -q "${start_checkout}"
 fi
 # --- end squash step -----------------------------------------------------
