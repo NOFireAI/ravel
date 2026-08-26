@@ -63,14 +63,31 @@
 //!   single-flight -- the whole object below the threshold, and the probe, each
 //!   section, and each block above it -- so the partitions striping one segment
 //!   coalesce onto one request per distinct extent rather than one sequence
-//!   each, and on the bench fixture the request count is flat across the whole
-//!   `target_partitions` sweep (planning's prune coalesces with them too).
-//!   Coalescing is not free of request count in general, though: a read that
-//!   misses the in-flight window, or finds its key already evicted, issues its
-//!   own GET. So striding past the segment count *can* raise the GET count above
-//!   the whole-segment path's, and that is the cost ADR-0102 accepts in exchange
-//!   for the cache absorbing the repeat reads and for the extra scan
-//!   parallelism.
+//!   each, and on the bench fixture the scan reads are flat across the whole
+//!   `target_partitions` sweep. The plan reads do NOT coalesce with them: a
+//!   [`tokio::sync::OnceCell`] barrier makes every partition await the whole
+//!   plan pass before draining, so each plan read is the first, cold touch of
+//!   its extent and completes before any scan read starts -- there is no
+//!   concurrent in-flight GET for the scan to collapse onto, and an evicted plan
+//!   entry is simply re-fetched by the scan (issue #691). Coalescing is not free
+//!   of request count in general either: a read that misses the in-flight
+//!   window, or finds its key already evicted, issues its own GET. So striding
+//!   past the segment count *can* raise the GET count above the whole-segment
+//!   path's, and that is the cost ADR-0102 accepts in exchange for the cache
+//!   absorbing the repeat reads and for the extra scan parallelism.
+//! - **Predicate-free full-window fast path (#693 part 3).** When the query has
+//!   no block-level predicate, no pending erasure, and its window fully contains
+//!   every relevant, above-threshold segment, and there are at least
+//!   `target_partitions` such segments, the plan phase is skipped entirely
+//!   ([`LogsScanExec::whole_segment_fast_path`]): whole segments are assigned
+//!   round-robin (the same rule the un-cached path uses), and each is read in one
+//!   whole-object GET ([`LogSegmentFetcher::scan_whole_accounted_with_tenant`]),
+//!   so the request count is exactly one GET per relevant segment, zero suffix
+//!   probes. When there are fewer relevant segments than partitions the striped
+//!   path runs instead, but the plan footer it read is carried to each subset
+//!   open ([`LogSegmentFetcher::fetch_object_with_footer`]) so those opens skip
+//!   their own re-probe. Any other query shape runs the plan-then-stripe path
+//!   above unchanged.
 //!
 //! Above the threshold each partition's read already covers only the pruned
 //! candidate blocks rather than every byte of the segment, so bytes on the wire
@@ -202,6 +219,7 @@ use datafusion::physical_plan::{
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use ravel_catalog::SegmentRef;
+use ravel_logseg::footer::LogFooter;
 use ravel_logseg::{
     AttrColumn, ColumnSelection, ColumnarBlockView, FieldSel, FieldType, LogRecord, Predicate,
     ScanStats,
@@ -529,11 +547,16 @@ impl BlockMetrics {
     /// because a degraded postings section leaves the two counts equal rather
     /// than ordered by construction).
     ///
-    /// Recorded once per relevant segment by partition 0 during planning
-    /// (ADR-0102), never per partition: several partitions stripe one segment's
-    /// blocks, and each re-prunes the whole segment to open its own subset, so
-    /// attributing the whole-segment totals per partition would multiply them.
-    /// The per-partition decode counts come from [`Self::record_scan`] instead.
+    /// On the striped path this is recorded once per relevant segment by
+    /// partition 0 during planning (ADR-0102), never per partition: several
+    /// partitions stripe one segment's blocks, and each re-prunes the whole
+    /// segment to open its own subset, so attributing the whole-segment totals
+    /// per partition would multiply them. On the predicate-free full-window
+    /// whole-segment fast path (#693 part 3) there is no plan phase, but each
+    /// segment has exactly one owning partition, so its owner records these
+    /// totals once at exhaustion straight from the scan's own stats -- still
+    /// exactly once per segment. Either way the per-partition decode counts come
+    /// from [`Self::record_scan`].
     fn record_segment_totals(&self, stats: &ScanStats) {
         self.total.add(stats.blocks_total as usize);
         self.pruned_by_postings.add(
@@ -706,6 +729,58 @@ impl LogsScanExec {
             && self.erasure.is_empty()
     }
 
+    /// Whether this scan can take the predicate-free full-window whole-segment
+    /// fast path (#693 part 3, deliverable 1), returning the count of relevant
+    /// (ts-overlapping) segments when it can. Decided with ZERO I/O from the
+    /// resolved snapshot and `query`, using the same conjuncts
+    /// [`ravel_query::LogSegmentFetcher::plan_segment`]'s own fast-path gate uses
+    /// per segment:
+    ///
+    /// - the query carries no block-level predicate
+    ///   ([`LogQuery::is_block_predicate_free`]: no content, prune-only,
+    ///   stream-attribute, or pending-erasure arm), and
+    /// - every relevant segment has a well-formed span (`min <= max`), is above
+    ///   the fetcher's block-range threshold, and is fully CONTAINED in the
+    ///   window (`ts_min <= seg.min && seg.max <= ts_max`). Containment is
+    ///   strictly stronger than the overlap
+    ///   [`LogsTableProvider::pruned_segments`] already filtered on, so no block
+    ///   of a relevant segment can fall outside the window and every block
+    ///   survives -- the survivor count is the whole segment.
+    ///
+    /// and finally there are at least `target_partitions` relevant segments, so
+    /// whole-segment round-robin still fills every partition. Fewer segments than
+    /// partitions is the striped path's job (deliverable 2 carries the plan
+    /// footer there so its subset opens still skip re-probing); a partial
+    /// overlap, a predicate, a pending erasure, or a below-threshold segment all
+    /// fall to the unchanged plan-then-stripe path, byte for byte.
+    ///
+    /// The threshold conjunct keeps this strictly to the band where skipping the
+    /// plan phase saves a GET: at or below the threshold a segment is already
+    /// read whole in one GET on both the plan and scan paths (they coalesce on
+    /// the same `(0, object_size)` cache key), so the fast path would add nothing
+    /// and would only diverge from the existing small-object tests.
+    fn whole_segment_fast_path(&self, query: &LogQuery) -> Option<usize> {
+        if !query.is_block_predicate_free() {
+            return None;
+        }
+        let threshold = self.fetcher.block_range_threshold();
+        let mut relevant = 0usize;
+        for seg in self.segments.iter() {
+            if !LogSegmentFetcher::ts_range_relevant(seg, self.ts_min, self.ts_max) {
+                continue;
+            }
+            relevant += 1;
+            let contained = seg.min_event_ts_ns <= seg.max_event_ts_ns
+                && seg.object_size > threshold
+                && self.ts_min <= seg.min_event_ts_ns
+                && seg.max_event_ts_ns <= self.ts_max;
+            if !contained {
+                return None;
+            }
+        }
+        (relevant >= self.target_partitions).then_some(relevant)
+    }
+
     fn compute_properties(schema: &SchemaRef, n: usize) -> PlanProperties {
         let eq = EquivalenceProperties::new(Arc::clone(schema));
         PlanProperties::new(
@@ -841,18 +916,35 @@ impl ExecutionPlan for LogsScanExec {
             accounting: self.accounting.clone(),
         });
 
-        // The block-level assignment needs each segment's surviving-block count,
-        // which a prune must produce (async). The first partition to poll runs
-        // that prune for every segment through the shared `counts` cell, with
-        // as many prunes in flight as the scan has partitions; the rest await
-        // its result. Building the future here (not awaiting it) keeps
-        // `execute` synchronous, as DataFusion requires.
-        let counts_fut = plan_counts_future(
-            Arc::clone(&self.counts),
-            Arc::clone(&ctx),
-            Arc::clone(&self.segments),
-            self.target_partitions,
-        );
+        // #693 part 3 deliverable 1: a predicate-free query whose window fully
+        // contains every relevant, above-threshold segment, with at least
+        // `target_partitions` of them, skips the plan phase entirely. Each
+        // partition computes its whole-segment round-robin share with no I/O and
+        // opens each owned segment with one whole-object GET (no plan probe, no
+        // scan-side probe). Any other shape falls to the plan-then-stripe path
+        // below, byte for byte.
+        let (work, fast_whole_segment, state) = if let Some(relevant) =
+            self.whole_segment_fast_path(&ctx.query)
+        {
+            let n = self.target_partitions.max(1).min(relevant.max(1));
+            let work = owned_whole_segments(&self.segments, self.ts_min, self.ts_max, partition, n);
+            (work, true, LogScanState::NextSegment)
+        } else {
+            // The block-level assignment needs each segment's surviving-block
+            // count, which a prune must produce (async). The first partition
+            // to poll runs that prune for every segment through the shared
+            // `counts` cell, with as many prunes in flight as the scan has
+            // partitions; the rest await its result. Building the future here
+            // (not awaiting it) keeps `execute` synchronous, as DataFusion
+            // requires.
+            let counts_fut = plan_counts_future(
+                Arc::clone(&self.counts),
+                Arc::clone(&ctx),
+                Arc::clone(&self.segments),
+                self.target_partitions,
+            );
+            (VecDeque::new(), false, LogScanState::Planning(counts_fut))
+        };
 
         Ok(Box::pin(LogScanStream {
             schema: Arc::clone(&self.schema),
@@ -865,16 +957,18 @@ impl ExecutionPlan for LogsScanExec {
             partition,
             target_partitions: self.target_partitions,
             stripe_blocks: self.stripe_blocks,
+            fast_whole_segment,
             segments: Arc::clone(&self.segments),
-            work: VecDeque::new(),
+            work,
             reservation,
             held: 0,
             emitted: 0,
             pending: Pending::None,
             current_seg: None,
             current_indices: Vec::new(),
+            current_footer: None,
             seg_columnar_blocks: 0,
-            state: LogScanState::Planning(counts_fut),
+            state,
         }))
     }
 }
@@ -898,6 +992,11 @@ struct SegPlan {
     /// consumes `blocks_total` and the postings drop). `blocks_scanned`/`pages`
     /// are zero here -- planning decodes nothing.
     stats: ScanStats,
+    /// The footer the plan fast path read for this segment (#693 part 3,
+    /// deliverable 2), or `None` when the plan slow branch opened the scan
+    /// instead. Carried to each per-partition subset open through [`OwnedSeg`] so
+    /// the open reuses it and skips its own suffix probe.
+    footer: Option<LogFooter>,
 }
 
 type CountsFuture = Pin<Box<dyn Future<Output = DFResult<Arc<PlanCounts>>> + Send>>;
@@ -951,7 +1050,7 @@ async fn compute_plan_counts(
                 .plan_segment(seg, ctx.tenant_hash, &ctx.query, &ctx.accounting),
         );
     }
-    let planned: Vec<Option<(usize, ScanStats)>> = futures::stream::iter(prunes)
+    let planned: Vec<Option<(usize, ScanStats, Option<LogFooter>)>> = futures::stream::iter(prunes)
         .buffered(plan_concurrency.max(1))
         .map_err(SqlError::from)
         .try_collect()
@@ -960,9 +1059,13 @@ async fn compute_plan_counts(
     let mut total_blocks = 0usize;
     for entry in planned {
         match entry {
-            Some((survivors, stats)) => {
+            Some((survivors, stats, footer)) => {
                 total_blocks += survivors;
-                segs.push(Some(SegPlan { survivors, stats }));
+                segs.push(Some(SegPlan {
+                    survivors,
+                    stats,
+                    footer,
+                }));
             }
             None => segs.push(None),
         }
@@ -975,6 +1078,10 @@ async fn compute_plan_counts(
 struct OwnedSeg {
     seg: SegmentRef,
     indices: Vec<usize>,
+    /// The plan-phase footer for this segment (#693 part 3, deliverable 2),
+    /// carried to the subset open so it skips its own suffix probe. `None` on the
+    /// whole-segment fast path (no plan phase) and when the plan slow branch ran.
+    footer: Option<LogFooter>,
 }
 
 /// This partition's share of the block assignment, in one of two modes
@@ -1017,6 +1124,7 @@ fn owned_work(
                 work.push_back(OwnedSeg {
                     seg: segments[seg_idx].clone(),
                     indices,
+                    footer: plan.footer.clone(),
                 });
             }
         }
@@ -1031,10 +1139,47 @@ fn owned_work(
                 work.push_back(OwnedSeg {
                     seg: segments[seg_idx].clone(),
                     indices: (0..plan.survivors).collect(),
+                    footer: plan.footer.clone(),
                 });
             }
             seg_ordinal += 1;
         }
+    }
+    work
+}
+
+/// The predicate-free full-window whole-segment assignment (#693 part 3,
+/// deliverable 1): the same round-robin [`owned_work`]'s un-cached branch uses,
+/// but computed with NO plan phase at all. Relevant (ts-overlapping) segments in
+/// snapshot order are numbered `0..`, and segment `j` goes to partition `j % n`,
+/// which then drains the whole segment through [`open_segment_whole`]. `n` is the
+/// same `min(target_partitions, relevant)` the caller derives, so every
+/// partition gets whole segments and none is split.
+///
+/// Each relevant segment is proved fully contained in the query window and
+/// predicate-free before this runs (see [`LogsScanExec::whole_segment_fast_path`]),
+/// so every block survives and the block-index list is unused here.
+fn owned_whole_segments(
+    segments: &[SegmentRef],
+    ts_min: i64,
+    ts_max: i64,
+    partition: usize,
+    n: usize,
+) -> VecDeque<OwnedSeg> {
+    let mut work = VecDeque::new();
+    let mut ordinal = 0usize;
+    for seg in segments {
+        if !LogSegmentFetcher::ts_range_relevant(seg, ts_min, ts_max) {
+            continue;
+        }
+        if ordinal % n == partition {
+            work.push_back(OwnedSeg {
+                seg: seg.clone(),
+                indices: Vec::new(),
+                footer: None,
+            });
+        }
+        ordinal += 1;
     }
     work
 }
@@ -1056,7 +1201,12 @@ type OpenFuture = Pin<Box<dyn Future<Output = DFResult<Option<LogSegmentScan>>> 
 /// `Ok(None)` means the catalog summary proved the segment irrelevant, with no
 /// GET issued -- which cannot happen for a segment that was already counted
 /// with survivors, but is handled as end-of-segment rather than panicking.
-fn open_segment_subset(ctx: Arc<PartitionCtx>, seg: SegmentRef, indices: Vec<usize>) -> OpenFuture {
+fn open_segment_subset(
+    ctx: Arc<PartitionCtx>,
+    seg: SegmentRef,
+    indices: Vec<usize>,
+    footer: Option<LogFooter>,
+) -> OpenFuture {
     Box::pin(async move {
         let scan = ctx
             .fetcher
@@ -1066,6 +1216,29 @@ fn open_segment_subset(ctx: Arc<PartitionCtx>, seg: SegmentRef, indices: Vec<usi
                 &ctx.query,
                 &ctx.columns,
                 &indices,
+                footer.as_ref(),
+                &ctx.accounting,
+            )
+            .await
+            .map_err(SqlError::from)?;
+        Ok(scan)
+    })
+}
+
+/// Fetch one whole segment's object in a single GET and open its pruned,
+/// column-projected scan over all of its blocks (#693 part 3, deliverable 1).
+/// Used only on the predicate-free full-window whole-segment path, where the
+/// segment is assigned to exactly one partition and every block survives, so a
+/// whole-object read is optimal and no plan phase or suffix probe is needed.
+fn open_segment_whole(ctx: Arc<PartitionCtx>, seg: SegmentRef) -> OpenFuture {
+    Box::pin(async move {
+        let scan = ctx
+            .fetcher
+            .scan_whole_accounted_with_tenant(
+                &seg,
+                ctx.tenant_hash,
+                &ctx.query,
+                &ctx.columns,
                 &ctx.accounting,
             )
             .await
@@ -1168,6 +1341,13 @@ struct LogScanStream {
     /// The assignment mode (ADR-0102, amended by #693): block striping when a
     /// cache is wired, segment-granular otherwise. Passed to [`owned_work`].
     stripe_blocks: bool,
+    /// The predicate-free full-window whole-segment fast path (#693 part 3,
+    /// deliverable 1). When set, `work` was filled by [`owned_whole_segments`]
+    /// with no plan phase, each segment is opened with one whole-object GET
+    /// ([`open_segment_whole`]), and the segment's whole-segment prune totals are
+    /// recorded per segment at exhaustion (each segment has one owner, so no
+    /// double count) instead of by partition 0 during planning.
+    fast_whole_segment: bool,
     /// Every segment in the snapshot, snapshot order, shared with the exec. The
     /// owned-work computation indexes this by segment position.
     segments: Arc<Vec<SegmentRef>>,
@@ -1188,6 +1368,10 @@ struct LogScanStream {
     /// current_seg`], kept so the `attrs_raw` fallback re-opens the row path
     /// over the SAME list (ADR-0102). Set alongside `current_seg`.
     current_indices: Vec<usize>,
+    /// The plan-phase footer for [`Self::current_seg`] (#693 part 3, deliverable
+    /// 2), kept so the `attrs_raw` fallback re-opens the subset with the same
+    /// footer it first used. `None` on the whole-segment fast path.
+    current_footer: Option<LogFooter>,
     /// How many of this partition's blocks in the current segment the columnar
     /// fast path has already emitted. The `attrs_raw` fallback re-opens the
     /// segment over `current_indices` and skips this many positions so none is
@@ -1379,15 +1563,28 @@ impl Stream for LogScanStream {
                     Poll::Pending => return Poll::Pending,
                 },
                 LogScanState::NextSegment => match this.work.pop_front() {
-                    Some(OwnedSeg { seg, indices }) => {
+                    Some(OwnedSeg {
+                        seg,
+                        indices,
+                        footer,
+                    }) => {
                         this.current_seg = Some(seg.clone());
                         this.current_indices = indices.clone();
+                        this.current_footer = footer.clone();
                         this.seg_columnar_blocks = 0;
-                        this.state = LogScanState::Opening(open_segment_subset(
-                            Arc::clone(&this.ctx),
-                            seg,
-                            indices,
-                        ));
+                        // Whole-segment fast path reads the object in one GET
+                        // (#693 part 3); the striped path opens only this
+                        // partition's subset, reusing the plan footer if any.
+                        this.state = if this.fast_whole_segment {
+                            LogScanState::Opening(open_segment_whole(Arc::clone(&this.ctx), seg))
+                        } else {
+                            LogScanState::Opening(open_segment_subset(
+                                Arc::clone(&this.ctx),
+                                seg,
+                                indices,
+                                footer,
+                            ))
+                        };
                     }
                     None => {
                         this.state = LogScanState::Done;
@@ -1481,6 +1678,13 @@ impl Stream for LogScanStream {
                         Step::Failed(e) => return this.fail(e),
                         Step::Exhausted(stats) => {
                             this.blocks.record_scan(&stats);
+                            // The whole-segment fast path has no plan phase, so
+                            // the whole-segment prune totals are recorded here,
+                            // per segment (one owner per segment, no double
+                            // count), instead of by partition 0 during planning.
+                            if this.fast_whole_segment {
+                                this.blocks.record_segment_totals(&stats);
+                            }
                             this.state = LogScanState::NextSegment;
                         }
                         Step::Fallback => {
@@ -1512,11 +1716,16 @@ impl Stream for LogScanStream {
                                     ));
                                 }
                             };
-                            let fut = open_segment_subset(
-                                Arc::clone(&this.ctx),
-                                seg,
-                                this.current_indices.clone(),
-                            );
+                            let fut = if this.fast_whole_segment {
+                                open_segment_whole(Arc::clone(&this.ctx), seg)
+                            } else {
+                                open_segment_subset(
+                                    Arc::clone(&this.ctx),
+                                    seg,
+                                    this.current_indices.clone(),
+                                    this.current_footer.clone(),
+                                )
+                            };
                             this.state = LogScanState::ReopenRows {
                                 fut,
                                 skip: this.seg_columnar_blocks,
@@ -1552,6 +1761,9 @@ impl Stream for LogScanStream {
                             Ok(None) => {
                                 let stats = scan.stats();
                                 this.blocks.record_scan(&stats);
+                                if this.fast_whole_segment {
+                                    this.blocks.record_segment_totals(&stats);
+                                }
                                 this.state = LogScanState::NextSegment;
                             }
                             Err(e) => return this.fail(SqlError::from(e).into()),
@@ -1569,6 +1781,9 @@ impl Stream for LogScanStream {
                         Ok(None) => {
                             let stats = scan.stats();
                             this.blocks.record_scan(&stats);
+                            if this.fast_whole_segment {
+                                this.blocks.record_segment_totals(&stats);
+                            }
                             this.state = LogScanState::NextSegment;
                         }
                         Err(e) => return this.fail(SqlError::from(e).into()),
