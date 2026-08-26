@@ -2630,11 +2630,14 @@ impl BlockRangeFetcher {
         // FIELD_DIR so `candidate_blocks` can drop blocks the numeric bounds
         // prove hold no match (#761). Without this the candidate set was ts-only
         // and every block survived, so a month-wide selective query crossed the
-        // coverage threshold and read the whole object. FIELD_DIR is a front
-        // section the ranged read fetches anyway (the loop below), so placing it
-        // here only reorders that GET; it is skipped entirely when the query
-        // carries no NumRange arm (a predicate-free or text-only query keeps the
-        // pre-#761 ts-only candidate set). Bloom/POSTINGS arms are not resolved
+        // coverage threshold and read the whole object. On the ranged branch
+        // FIELD_DIR is a front section the section loop below fetches anyway,
+        // so placing it here only reorders that GET; on the coverage-crossover
+        // branch it is one extra small GET in front of the whole-object read,
+        // unavoidable because the arms decide the candidate set that decides
+        // coverage. It is skipped entirely when the query carries no NumRange
+        // arm (a predicate-free or text-only query keeps the pre-#761 ts-only
+        // candidate set). Bloom/POSTINGS arms are not resolved
         // here: they narrow further at decode over the fetched buffer, which is
         // sound because that narrowing only ever skips a fetched block.
         let numeric: Vec<NumRangeArm> = if prune
