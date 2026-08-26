@@ -5095,9 +5095,10 @@ type = "i64"
             "the RLOG object must not depend on whether a column arrived dictionary-encoded"
         );
         // Pinned so a drift in either direction is a test failure, not a silent
-        // re-baseline of both sides at once.
+        // re-baseline of both sides at once. The value moves only with the
+        // writer: this one is the RLOG version 4 layout (ADR-0699).
         const RICH_OBJECT_BLAKE3: &str =
-            "011037a68e12f433d8a1273fb29693ddfa15b09122e9373a35e0013426bfcbb5";
+            "363ec1b22915ea2b11cb04e887bb4afb6629503962ea9916ca7719c28638be48";
         assert_eq!(
             blake3::hash(&bytes_off).to_hex().as_str(),
             RICH_OBJECT_BLAKE3,
