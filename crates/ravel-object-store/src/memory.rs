@@ -311,6 +311,47 @@ impl ObjectStoreBackend for MemoryStore {
         Ok(ListPage { objects: out, next })
     }
 
+    async fn list_after(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        page: Option<PageToken>,
+    ) -> Result<ListPage, StoreError> {
+        let objects = self.objects.read();
+        // Resume point: strictly after the page token when paging, else
+        // strictly after `start_after` on the first page (skipping the
+        // sub-range server-side rather than transferring and dropping it),
+        // else the prefix itself. The larger of a page token and
+        // `start_after` is always the page token (it is a key already past
+        // `start_after`), so a present page token subsumes `start_after`.
+        let (start_key, skip_first_if_equal) = match (&page, start_after) {
+            (Some(PageToken(after)), _) => (after.clone(), true),
+            // `start_after` below the prefix cannot exclude any key under it,
+            // so fall back to listing from the prefix.
+            (None, Some(after)) if after >= prefix => (after.to_string(), true),
+            (None, _) => (prefix.to_string(), false),
+        };
+        let mut out = Vec::with_capacity(self.page_size.min(64));
+        for (key, entry) in objects.range(start_key.clone()..) {
+            if skip_first_if_equal && key == &start_key {
+                continue;
+            }
+            if !key.starts_with(prefix) {
+                break;
+            }
+            out.push(entry.meta(key));
+            if out.len() == self.page_size {
+                break;
+            }
+        }
+        let next = if out.len() == self.page_size {
+            out.last().map(|m| PageToken(m.key.clone()))
+        } else {
+            None
+        };
+        Ok(ListPage { objects: out, next })
+    }
+
     async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
         let objects = self.objects.read();
         let mut direct = Vec::new();

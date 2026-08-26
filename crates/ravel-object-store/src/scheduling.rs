@@ -578,6 +578,19 @@ impl ObjectStoreBackend for ScheduledHandle {
         result
     }
 
+    async fn list_after(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        page: Option<PageToken>,
+    ) -> Result<ListPage, StoreError> {
+        let _permit = self.scheduler.acquire(self.class).await;
+        let start = self.clock.now_nanos();
+        let result = self.inner.list_after(prefix, start_after, page).await;
+        self.record(StoreOp::List, start, 0, &result);
+        result
+    }
+
     async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
         let _permit = self.scheduler.acquire(self.class).await;
         let start = self.clock.now_nanos();

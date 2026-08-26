@@ -37,6 +37,7 @@ async fn run_contract_suite(store: &dyn ObjectStoreBackend, root: &str) {
     assert_cas_version_semantics(store, &format!("{root}/cas/")).await;
     assert_range_and_suffix_reads(store, &format!("{root}/range/")).await;
     assert_paginated_listing_completeness(store, &format!("{root}/list/")).await;
+    assert_start_after_listing(store, &format!("{root}/list-after/")).await;
     assert_delimited_listing(store, &format!("{root}/delim/")).await;
     assert_idempotent_delete(store, &format!("{root}/delete/")).await;
     assert_upload_checksum_verification(store, &format!("{root}/checksum/")).await;
@@ -251,6 +252,90 @@ async fn assert_paginated_listing_completeness(store: &dyn ObjectStoreBackend, p
     assert_eq!(
         all_keys, keys,
         "list_all must agree with the manual pagination loop"
+    );
+}
+
+/// `list_after` contract (docs/object-store-contract.md): every returned key
+/// compares strictly greater than `start_after`, in the same lexicographic
+/// order and with the same pagination as `list`; `None` is identical to
+/// `list`; a `start_after` that sorts below the prefix excludes nothing.
+/// Runs against every backend the suite covers, so it pins the native
+/// start-after of `MemoryStore` (at both page sizes) and `S3Store` (against a
+/// real bucket, when configured) as well as the default filter path any other
+/// backend inherits.
+async fn assert_start_after_listing(store: &dyn ObjectStoreBackend, prefix: &str) {
+    let mut keys: Vec<String> = ["a", "b", "c", "d", "e"]
+        .iter()
+        .map(|s| format!("{prefix}{s}"))
+        .collect();
+    keys.sort();
+    for key in &keys {
+        store
+            .put(key, Bytes::from_static(b"x"), PutOptions::default())
+            .await
+            .expect("put");
+    }
+
+    // Drain a full `list_after` scan through the page-token loop so the
+    // assertion holds at any page size.
+    async fn drain_after(
+        store: &dyn ObjectStoreBackend,
+        prefix: &str,
+        start_after: Option<&str>,
+    ) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut ordered = Vec::new();
+        let mut token = None;
+        loop {
+            let page = store
+                .list_after(prefix, start_after, token)
+                .await
+                .expect("list_after page");
+            for meta in &page.objects {
+                if seen.insert(meta.key.clone()) {
+                    ordered.push(meta.key.clone());
+                }
+            }
+            match page.next {
+                Some(next) => token = Some(next),
+                None => break,
+            }
+        }
+        ordered
+    }
+
+    // Strictly greater than an existing key: the key itself is excluded.
+    let after_c = format!("{prefix}c");
+    assert_eq!(
+        drain_after(store, prefix, Some(&after_c)).await,
+        vec![format!("{prefix}d"), format!("{prefix}e")],
+        "list_after returns only keys strictly greater than start_after"
+    );
+
+    // `start_after` need not be an existing key: the shard-hour prefix strings
+    // Ravel passes sort before the first key under them, so nothing is skipped
+    // when the marker sorts below the prefix.
+    let before_all = format!("{prefix}");
+    assert_eq!(
+        drain_after(store, prefix, Some(&before_all)).await,
+        keys,
+        "a start_after at/below the prefix excludes no key under it"
+    );
+
+    // `None` is identical to `list`.
+    assert_eq!(
+        drain_after(store, prefix, None).await,
+        keys,
+        "list_after(None) matches list"
+    );
+
+    // Past the last key: empty.
+    let after_last = format!("{prefix}z");
+    assert!(
+        drain_after(store, prefix, Some(&after_last))
+            .await
+            .is_empty(),
+        "a start_after past the last key returns nothing"
     );
 }
 

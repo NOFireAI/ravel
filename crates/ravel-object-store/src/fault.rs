@@ -947,6 +947,29 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for FaultStore<S> {
         }
     }
 
+    async fn list_after(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        page: Option<PageToken>,
+    ) -> Result<ListPage, StoreError> {
+        self.gate_hold(Op::List, prefix).await;
+        match self.resolve(Op::List, prefix) {
+            None => self.inner.list_after(prefix, start_after, page).await,
+            Some(ScriptedFault::DuplicateDelivery) => {
+                self.inner.list_after(prefix, start_after, page).await?;
+                Err(duplicate_delivery_error())
+            }
+            Some(ScriptedFault::Timeout) => Err(StoreError::Timeout),
+            Some(ScriptedFault::Throttled { retry_after_ms }) => {
+                Err(StoreError::Throttled { retry_after_ms })
+            }
+            Some(ScriptedFault::Transient(msg)) => Err(StoreError::Transient(msg)),
+            Some(ScriptedFault::Permanent(msg)) => Err(StoreError::Permanent(msg)),
+            Some(_) => Err(not_applicable("list_after")),
+        }
+    }
+
     async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
         self.gate_hold(Op::List, prefix).await;
         match self.resolve(Op::List, prefix) {

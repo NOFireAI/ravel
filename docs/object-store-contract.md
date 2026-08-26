@@ -20,6 +20,9 @@ pub trait ObjectStoreBackend: Send + Sync + 'static {
     async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError>;
     /// Paginated recursive prefix listing, lexicographic order.
     async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError>;
+    /// As list, but begins strictly after start_after in key order.
+    async fn list_after(&self, prefix: &str, start_after: Option<&str>, page: Option<PageToken>)
+        -> Result<ListPage, StoreError>;
     /// One-level listing: entries directly under prefix plus common sub-prefixes.
     async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError>;
     async fn delete(&self, key: &str) -> Result<(), StoreError>; // idempotent: NotFound => Ok
@@ -75,6 +78,19 @@ alerts differently (misconfigured credentials or prefix policy).
   key created before the first page request is returned; keys created
   during the scan may or may not appear; a key MAY appear more than once
   and callers MUST dedup by key.
+- `list_after(prefix, start_after, page)` returns exactly the keys `list`
+  would, minus every key `<= start_after`: each returned key compares
+  strictly greater than `start_after`, in the same lexicographic order and
+  under the same pagination and cross-page guarantee as `list`.
+  `start_after == None` is identical to `list`. `start_after` need not name
+  an existing key and is typically a prefix string that sorts before the
+  first key the caller wants, letting the caller skip a whole key sub-range
+  server-side rather than paging through and discarding it (S3
+  `ListObjectsV2` `start-after`, exclusive; the memory oracle resumes its
+  ordered map strictly after the marker). A `start_after` at or below the
+  listed prefix excludes no key under it. Overriding the default (which
+  lists from the prefix and drops `<= start_after` in the client) is a
+  performance property only; the visible result set is identical.
 - `Suffix(0)` and zero-length `Range` are `InvalidRange`.
 - `Range(start, end)` is half-open; the HTTP Range header is inclusive, so
   adapters emit `bytes=start-(end-1)`. Boundary conformance tests required

@@ -448,6 +448,40 @@ pub trait ObjectStoreBackend: Send + Sync + 'static {
     /// Pass `None` for the first page; follow `ListPage::next` until `None`.
     async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError>;
 
+    /// Like [`list`](Self::list), but the listing begins strictly after
+    /// `start_after` in key order (S3 `start-after` semantics): every returned
+    /// key compares strictly greater than `start_after`, in the same
+    /// lexicographic key order, with the same pagination and cross-page
+    /// guarantee as `list`. `start_after == None` is identical to `list`.
+    /// `start_after` need not name an existing key; it is typically a prefix
+    /// string that sorts before the first key the caller wants, so a caller
+    /// can skip a whole key sub-range server-side without paging through it.
+    ///
+    /// The default implementation lists from `prefix` and drops keys
+    /// `<= start_after`; a backend whose store supports a native start-after
+    /// (S3 `list_with_offset`, the in-memory ordered map) overrides it so the
+    /// dropped keys are never transferred. Overriding is a performance
+    /// property only: the visible result is identical either way.
+    async fn list_after(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        page: Option<PageToken>,
+    ) -> Result<ListPage, StoreError> {
+        let page = self.list(prefix, page).await?;
+        match start_after {
+            Some(after) => Ok(ListPage {
+                objects: page
+                    .objects
+                    .into_iter()
+                    .filter(|meta| meta.key.as_str() > after)
+                    .collect(),
+                next: page.next,
+            }),
+            None => Ok(page),
+        }
+    }
+
     /// One-level listing with delimiter `/`.
     async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError>;
 
@@ -495,6 +529,15 @@ impl<T: ObjectStoreBackend + ?Sized> ObjectStoreBackend for Arc<T> {
 
     async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
         (**self).list(prefix, page).await
+    }
+
+    async fn list_after(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        page: Option<PageToken>,
+    ) -> Result<ListPage, StoreError> {
+        (**self).list_after(prefix, start_after, page).await
     }
 
     async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
