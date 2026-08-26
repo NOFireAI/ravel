@@ -37,6 +37,14 @@ use ravel_types::TenantHash;
 /// (ADR-0090 decision 1), matching [`ravel_logseg::record::FieldType`]'s four
 /// non-float, non-nested variants. `f64`, date, and timestamp are deferred; see
 /// the module docs.
+///
+/// The Arrow type each variant maps to is `declared_arrow_type` in
+/// `crate::logs_schema`. That mapping is a wire contract, not a free choice of
+/// in-memory representation: `Str` reaching a client as
+/// `Dictionary(Int32, Utf8)` is what ADR-0099 decision 5 fixes. Grouping is
+/// separate. `Dictionary` is in none of DataFusion's specialized `GroupValues`
+/// arms, so a `GROUP BY` over a `Str` column falls to the `RowConverter` path,
+/// whose decode is bounded by `i32::MAX` bytes per emitted array (issue #737).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeclaredType {
     /// A `Str`-typed attribute, projected as Arrow `Dictionary(Int32, Utf8)`
