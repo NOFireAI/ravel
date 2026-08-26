@@ -220,25 +220,28 @@ that govern every other knob in `session_config`, and to ADR-0094's exact-typed
 classification: it changes where aggregation state lives, not what is summed or
 in what order.
 
-Pinned by `crates/ravel-sql/tests/skip_partial_aggregation.rs` at `D = 50,000`
-over 8 objects (a partition holds 50,000 rows, below DataFusion's stock probe
-threshold and well above 8,192), 1 versus 8 partitions, measuring the
-aggregation-attributable peak: the `COUNT(DISTINCT)` peak minus a
-`count(attrs['u'])` baseline over the identical scan and projection, so the
-scan's own per-partition growth is not charged to the aggregate. Measured 0.11x
-(idle) to 2.79x (fully loaded test runner) with the option on, 5.33x to 6.34x
-with it off, so the test holds the partition ratio at or below 4x and asserts in
-the same run that the untightened session exceeds that bound, which is what
-keeps the bound from passing vacuously.
+Pinned by `crates/ravel-sql/tests/skip_partial_aggregation.rs` on what the
+probe decides, not on how much memory the decision happened to cost: `D =
+25,000` distinct values over 4 objects, three rounds each (300,000 rows), 4
+partitions, and the partial `AggregateExec`'s own metrics read off the executed
+plan. With the option on every partition skips after its probe, so the partial
+stage's `output_rows` equals its input rows (300,000), `skipped_aggregation_rows`
+is 267,232, and the group entries the partial tables held are exactly 4 x 8192
+(bounded to 2 x 8192 x partitions). With the option off the partial stage emits
+one row per key per partition (100,000), skips nothing, and holds 100,000
+entries. Each figure is a function of the fixture and the two thresholds, so it
+is byte-identical run to run under any host load; the red state is structural:
+stop writing either threshold and the tightened side collapses to 100,000
+output rows for 300,000 input rows.
 
-How many partial tables are simultaneously resident at the pool's high-water
-mark is scheduling-dependent, so the fanned-out figure moves with machine load
-by an order of magnitude and no absolute bound on it is robust on its own. The
-load-matched assertion carries the weight: the tightened session's fanned-out
-figure must stay under 0.75 of the untightened one, both measured back to back
-in the same test (measured 0.02 to 0.52). Its red state is structural rather
-than empirical -- stop writing either threshold and the two measurements become
-the same session, so the share becomes exactly 1.0.
+An earlier revision of the pin measured the pool's high-water mark instead (the
+`COUNT(DISTINCT)` peak minus a scalar-count baseline, option on versus off).
+How many partial tables are simultaneously resident at that mark is
+scheduling-dependent, so the share moved from 0.02 on an idle box to 1.55 on a
+loaded 4-core CI runner, and in that fixture each partition's key did not
+reduce at all, so the partial stage emitted the same row count whether it
+aggregated or forwarded. The peak bytes are still printed by the test as a
+diagnostic; nothing asserts on them.
 
 One existing test moved with the behavior:
 `a_high_cardinality_aggregation_is_refused_by_the_aggregate_not_the_scan`
