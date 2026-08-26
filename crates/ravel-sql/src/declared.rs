@@ -43,8 +43,10 @@ use ravel_types::TenantHash;
 /// in-memory representation: `Str` reaching a client as
 /// `Dictionary(Int32, Utf8)` is what ADR-0099 decision 5 fixes. Grouping is
 /// separate. `Dictionary` is in none of DataFusion's specialized `GroupValues`
-/// arms, so a `GROUP BY` over a `Str` column falls to the `RowConverter` path,
-/// whose decode is bounded by `i32::MAX` bytes per emitted array (issue #737).
+/// arms, so a `GROUP BY` over a `Str` column would fall to the `RowConverter`
+/// path, whose decode is bounded by `i32::MAX` bytes per emitted array (issue
+/// #737); [`crate::DictionaryGroupKeysAsViews`] keeps it off that path without
+/// changing this mapping.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeclaredType {
     /// A `Str`-typed attribute, projected as Arrow `Dictionary(Int32, Utf8)`
