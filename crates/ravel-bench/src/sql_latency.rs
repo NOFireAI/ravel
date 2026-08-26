@@ -2331,6 +2331,14 @@ mod tests {
     /// not asserted -- the cold run already hits, and the catalog cache
     /// contributes hits of its own. Building the cached arm without `with_cache`
     /// collapses both deltas to zero, which is what flips the assertions red.
+    ///
+    /// The `has_word` predicate is what keeps the query on that plan-then-scan
+    /// path (issue #739). A predicate-free full-window statement now takes
+    /// `LogsScanExec`'s whole-segment fast path, which reads each segment exactly
+    /// once and so leaves the fetcher cache nothing to absorb within a run -- the
+    /// double read this test is about is precisely what that path eliminates. The
+    /// fixture's single record body is `request 0 timeout after 30s`, so the
+    /// predicate matches it and the returned rows are the same as without it.
     #[tokio::test]
     async fn cache_flag_cuts_store_gets_within_a_run() {
         use ravel_types::accounting::AccountedOp;
@@ -2340,7 +2348,7 @@ mod tests {
         let th = tenant.hash();
         write_shard_objects(&store, &tenant, 0, 1).await;
         let req = SqlRequest {
-            sql: "SELECT body FROM logs".to_string(),
+            sql: "SELECT body FROM logs WHERE has_word(body, 'timeout')".to_string(),
             window: TimeRange {
                 start_ns: 0,
                 end_ns: NOW_NS,

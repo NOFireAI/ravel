@@ -133,20 +133,24 @@ Every OTHER predicate-free, full-window logs statement — `SUM`, `AVG`,
 `GROUP BY`, `ORDER BY ... LIMIT` over the whole table — still executes
 `LogsScanExec`, but issues exactly one whole-object GET per relevant segment and
 ZERO suffix probes (#693 part 3). When the query carries no block-level
-predicate and no pending erasure, its window fully contains every relevant,
-above-threshold segment, and there are at least `target_partitions` such
-segments, `LogsScanExec` skips its plan phase entirely: no block can be pruned,
+predicate and no pending erasure, its window fully contains every relevant
+segment, and there are at least `target_partitions` of them, `LogsScanExec`
+skips its plan phase entirely: no block can be pruned,
 so it assigns whole segments round-robin (one owner per segment) and reads each
 in a single `GetRange::Full`. That removes both probe classes the pre-#693-part-3
 path paid above the block-range threshold — the plan-phase footer probe and the
 per-open scan-side re-probe — which on the 8424-object ClickBench tenant (#680)
 were a combined ~24,700 probes on top of the 8,424 whole-object reads for one
 `SELECT`. When any of those conditions fails the unchanged plan-then-stripe path
-runs (its plan phase probes each segment once); a footer read there is carried
-to the per-partition subset opens so they skip re-probing (ADR-0107 amendment
-2026-08-26). At or below the block-range threshold the plan and scan reads
-already coalesce on one whole-object cache key, so the fast path is gated above
-it, where there is a probe to save.
+runs (its plan phase probes each segment once), and the scan publishes a
+`fast_path_rejected_*` counter naming the conjunct that sent it there; a footer
+read there is carried to the per-partition subset opens so they skip re-probing
+(ADR-0107 amendment 2026-08-26). Object size is not one of the conditions: a
+segment at or below the block-range threshold is read whole by the whole-segment
+entry and by the striped path alike, on the same `(0, object_size)` cache key,
+so it joins the assignment rather than vetoing it (ADR-0102 amendment
+2026-08-26, #739 -- as a query-wide conjunct the threshold let one small tail
+object per `(shard, hour)` disqualify an entire 8,424-object snapshot).
 
 Staleness: the evaluator recognizes the Prometheus staleness marker (the
 exact NaN bit pattern `0x7ff0_0000_0000_0002`, compared via
@@ -1484,17 +1488,21 @@ per segment. `ravel-bench`'s `logs_scan_scaling` report measures the cached and
 un-cached request counts side by side, on above-threshold and whole-object read
 shapes alike; its figures describe that fixture (a `MemoryStore`, and on the
 cached rows a cache sized to hold the whole dataset), not striping in general.
-Its over-threshold rows are what put a number on the residual multiplier, and
-what show where it no longer applies: each row carries reads per segment and
-bytes fetched over dataset bytes, derived in the report rather than left to the
-reader. For a block-predicate-free statement whose window contains every
-relevant segment — the report's `SELECT ts, body FROM logs`, and the shape the
-whole-segment fast path serves (#693 part 3) — those two figures are 1 and
-about 1.0 at every partition count that fits inside the segment count, with or
-without a cache: the plan phase is skipped and each segment is read whole once,
-so there is nothing left for the cache to absorb. The multiplier reappears on
-the row whose partition count exceeds the segment count, which falls back to
-plan-then-stripe. `crates/ravel-query/tests/log_block_range.rs` pins the
+Its rows put a number on the residual multiplier and show where it no longer
+applies: each row carries reads per segment and bytes fetched over dataset
+bytes, derived in the report rather than left to the reader. For a
+block-predicate-free statement whose window contains every relevant segment —
+the report's `SELECT ts, body FROM logs`, and the shape the whole-segment fast
+path serves (#693 part 3, amended by #739) — those two figures are 1 and about
+1.0 at every partition count that fits inside the segment count, on both read
+shapes and with or without a cache: since #739 dropped the block-range-threshold
+conjunct, object size no longer gates the fast path, so the plan phase is skipped
+and each segment is read whole once, and there is nothing left for the cache to
+absorb. The multiplier reappears only on the cache-wired row whose partition
+count exceeds the segment count, which falls back to plan-then-stripe — and even
+there only on the above-threshold read shape, since a whole-object stripe
+coalesces onto the one `(0, object_size)` cache key.
+`crates/ravel-query/tests/log_block_range.rs` pins the
 above-threshold cached case exactly: on its 906,791-byte fixture, 2 partitions
 and 8 partitions striping one segment both cost 6 store GETs (one probe, four
 directory sections, one coalesced candidate run), and 8 concurrent cold

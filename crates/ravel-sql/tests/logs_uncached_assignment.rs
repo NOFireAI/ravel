@@ -12,6 +12,13 @@
 //! partition `j % n` and drains all of that segment's surviving blocks, so the
 //! scan issues exactly one plan read plus one scan read per segment. The cached
 //! path keeps the intra-segment block striping unchanged.
+//!
+//! Every fixture here carries a pending erasure predicate that matches nothing
+//! ([`non_matching_erasure`]), which changes no row and prunes no block but does
+//! keep the scan off the predicate-free full-window whole-segment fast path. That
+//! fast path bypasses the assignment rule these tests are about, and since #739
+//! it no longer excludes small objects, so without the predicate a bare
+//! full-window `SELECT` over this fixture would never reach `owned_work`.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -164,6 +171,53 @@ async fn build_fixture(store: &dyn ObjectStoreBackend) -> (Snapshot, BTreeSet<(i
     (snapshot, want)
 }
 
+/// A pending erasure predicate that matches NOTHING in this fixture: no record
+/// carries the key `absent-key`, so `retain_log_records` drops no row and every
+/// block still survives pruning. Its only effect is to make the query not
+/// block-predicate-free, which keeps the scan off the predicate-free full-window
+/// whole-segment fast path.
+///
+/// These tests pin the ADR-0102/#693 assignment rule (`owned_work`: whole
+/// segments un-cached, block striping cached), and that rule only runs when the
+/// fast path declines. Until #739 the fixture declined it for free, because the
+/// fast path also required every segment to be above the block-range threshold
+/// and these objects are a few KiB. #739 removed that conjunct, so a bare
+/// full-window `SELECT` over this fixture now takes the fast path and never
+/// reaches `owned_work`. This restores the shape under test without perturbing a
+/// single row or block.
+fn non_matching_erasure() -> Vec<ravel_proto::commit::v1::ErasureRequest> {
+    vec![ravel_proto::commit::v1::ErasureRequest {
+        predicate: vec![ravel_proto::commit::v1::ErasurePredicateMatcher {
+            key: "absent-key".to_string(),
+            value: "absent-value".to_string(),
+        }],
+        ..Default::default()
+    }]
+}
+
+/// Sum a counter metric across every partition of the executed `LogsScanExec`.
+fn sum_metric(plan: &Arc<dyn ExecutionPlan>, name: &str) -> usize {
+    let set = find_by_name(plan, "LogsScanExec")
+        .expect("a LogsScanExec leaf")
+        .metrics()
+        .expect("the scan publishes metrics");
+    set.iter()
+        .filter(|m| m.value().name() == name)
+        .map(|m| m.value().as_usize())
+        .sum()
+}
+
+/// Assert the executed `plan` really ran the plan-then-stripe path, by the
+/// rejection reason the scan publishes when it declines the fast path (#739).
+/// Without this a future change could put these fixtures back on the fast path
+/// and the assignment assertions below would pass vacuously.
+fn assert_declined_fast_path(plan: &Arc<dyn ExecutionPlan>) {
+    assert!(
+        sum_metric(plan, "fast_path_rejected_pending_erasure") > 0,
+        "these fixtures must reach the assignment rule, not the whole-segment fast path"
+    );
+}
+
 fn provider(snapshot: Snapshot, fetcher: LogSegmentFetcher) -> LogsTableProvider {
     LogsTableProvider::new(
         snapshot,
@@ -257,7 +311,8 @@ fn build_read_cache(cache_bytes: u64) -> Arc<Cache<CacheFetchError>> {
 async fn uncached_scan_opens_each_segment_once() {
     let counting = CountingStore::new(Arc::new(MemoryStore::new()));
     let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&counting) as Arc<dyn ObjectStoreBackend>;
-    let (snapshot, _want) = build_fixture(store.as_ref()).await;
+    let (mut snapshot, _want) = build_fixture(store.as_ref()).await;
+    snapshot.pending_erasure = non_matching_erasure();
 
     let fetcher = LogSegmentFetcher::new(Arc::clone(&store));
     assert!(
@@ -267,7 +322,8 @@ async fn uncached_scan_opens_each_segment_once() {
     let provider = provider(snapshot, fetcher);
 
     let plan = provider.plan(PARTS).expect("plan");
-    let _ = collect_plan(plan).await;
+    let _ = collect_plan(Arc::clone(&plan)).await;
+    assert_declined_fast_path(&plan);
 
     assert_eq!(
         counting.gets(),
@@ -284,13 +340,15 @@ async fn uncached_scan_opens_each_segment_once() {
 #[tokio::test]
 async fn uncached_segment_granular_returns_every_row_once() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-    let (snapshot, want) = build_fixture(store.as_ref()).await;
+    let (mut snapshot, want) = build_fixture(store.as_ref()).await;
+    snapshot.pending_erasure = non_matching_erasure();
 
     let fetcher = LogSegmentFetcher::new(Arc::clone(&store));
     let provider = provider(snapshot, fetcher);
 
     let plan = provider.plan(PARTS).expect("plan");
     let batches = collect_plan(Arc::clone(&plan)).await;
+    assert_declined_fast_path(&plan);
     let got = batches_to_rows(&batches);
 
     assert_eq!(
@@ -330,7 +388,8 @@ async fn uncached_segment_granular_returns_every_row_once() {
 async fn cached_path_still_stripes_blocks_across_partitions() {
     let counting = CountingStore::new(Arc::new(MemoryStore::new()));
     let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&counting) as Arc<dyn ObjectStoreBackend>;
-    let (snapshot, want) = build_fixture(store.as_ref()).await;
+    let (mut snapshot, want) = build_fixture(store.as_ref()).await;
+    snapshot.pending_erasure = non_matching_erasure();
 
     let cache = build_read_cache(64 << 20);
     let fetcher = LogSegmentFetcher::new(Arc::clone(&store)).with_cache(cache);
@@ -342,6 +401,7 @@ async fn cached_path_still_stripes_blocks_across_partitions() {
 
     let plan = provider.plan(PARTS).expect("plan");
     let batches = collect_plan(Arc::clone(&plan)).await;
+    assert_declined_fast_path(&plan);
 
     // Correctness is unchanged either way.
     assert_eq!(

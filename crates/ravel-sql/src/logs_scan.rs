@@ -75,19 +75,25 @@
 //!   past the segment count *can* raise the GET count above the whole-segment
 //!   path's, and that is the cost ADR-0102 accepts in exchange for the cache
 //!   absorbing the repeat reads and for the extra scan parallelism.
-//! - **Predicate-free full-window fast path (#693 part 3).** When the query has
-//!   no block-level predicate, no pending erasure, and its window fully contains
-//!   every relevant, above-threshold segment, and there are at least
-//!   `target_partitions` such segments, the plan phase is skipped entirely
+//! - **Predicate-free full-window fast path (#693 part 3, amended by #739).**
+//!   When the query has no block-level predicate, no pending erasure, and its
+//!   window fully contains every relevant segment, and there are at least
+//!   `target_partitions` of them, the plan phase is skipped entirely
 //!   ([`LogsScanExec::whole_segment_fast_path`]): whole segments are assigned
 //!   round-robin (the same rule the un-cached path uses), and each is read in one
 //!   whole-object GET ([`LogSegmentFetcher::scan_whole_accounted_with_tenant`]),
 //!   so the request count is exactly one GET per relevant segment, zero suffix
-//!   probes. When there are fewer relevant segments than partitions the striped
+//!   probes. Object size does not enter into it: a segment at or below the
+//!   block-range threshold is read whole by both entries, on the same
+//!   `(0, object_size)` cache key, so it joins the assignment without changing
+//!   what is read (#739 -- as a query-wide conjunct the threshold let one small
+//!   tail object per `(shard, hour)` veto an entire 8,424-object snapshot).
+//!   When there are fewer relevant segments than partitions the striped
 //!   path runs instead, but the plan footer it read is carried to each subset
 //!   open ([`LogSegmentFetcher::fetch_object_with_footer`]) so those opens skip
 //!   their own re-probe. Any other query shape runs the plan-then-stripe path
-//!   above unchanged.
+//!   above unchanged, and publishes a `fast_path_rejected_*` counter naming the
+//!   conjunct that sent it there.
 //!
 //! Above the threshold each partition's read already covers only the pruned
 //! candidate blocks rather than every byte of the segment, so bytes on the wire
@@ -495,6 +501,47 @@ pub struct LogsScanExec {
     metrics: ExecutionPlanMetricsSet,
 }
 
+/// Which conjunct kept a statement off the predicate-free full-window
+/// whole-segment fast path (issue #739). Recorded as a DataFusion counter by
+/// [`BlockMetrics::record_fast_path_rejection`] so a report reading the scan's
+/// metrics can say why a statement striped instead of guessing from GET counts.
+///
+/// The variants are exactly the query-wide conjuncts
+/// [`LogsScanExec::whole_segment_fast_path`] tests, in the order it tests them,
+/// and the first failure wins: a query with both a content predicate and a
+/// partial window reports [`Self::BlockPredicate`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FastPathRejection {
+    /// The snapshot carries a pending selective erasure (ADR-0064 decision 2).
+    PendingErasure,
+    /// The query carries a content, prune-only, or stream-attribute arm, so a
+    /// block can be excluded and the survivor count is not the block count.
+    BlockPredicate,
+    /// Some relevant segment is not fully contained in the query window (a
+    /// partial ts overlap), or its catalog span is ill-formed (`min > max`), so
+    /// containment cannot be proved without reading the segment.
+    SegmentNotContained,
+    /// Fewer relevant segments than partitions: whole-segment round-robin would
+    /// leave partitions empty, which is the striped path's job.
+    FewerSegmentsThanPartitions,
+}
+
+impl FastPathRejection {
+    /// The counter name this reason is published under. One static name per
+    /// variant, so `EXPLAIN ANALYZE` and any metrics reader see the reason
+    /// directly rather than a numeric code they must decode.
+    fn metric_name(self) -> &'static str {
+        match self {
+            FastPathRejection::PendingErasure => "fast_path_rejected_pending_erasure",
+            FastPathRejection::BlockPredicate => "fast_path_rejected_block_predicate",
+            FastPathRejection::SegmentNotContained => "fast_path_rejected_segment_not_contained",
+            FastPathRejection::FewerSegmentsThanPartitions => {
+                "fast_path_rejected_fewer_segments_than_partitions"
+            }
+        }
+    }
+}
+
 /// The per-partition block counters this scan publishes as DataFusion metrics.
 ///
 /// They are the only externally visible difference the prune channel makes:
@@ -539,6 +586,25 @@ impl BlockMetrics {
             columnar_batches: MetricBuilder::new(metrics).counter("columnar_batches", partition),
             rowpath_batches: MetricBuilder::new(metrics).counter("rowpath_batches", partition),
         }
+    }
+
+    /// Publishes why this partition did NOT take the whole-segment fast path
+    /// (issue #739): one increment on the counter named by `reason`, per
+    /// partition, exactly once per `execute` call that struck out. The counter is
+    /// created only when a rejection happens, so a statement that takes the fast
+    /// path publishes none of these names at all.
+    ///
+    /// Takes the metrics set rather than living on `self` because the rejection
+    /// is decided before the per-partition [`BlockMetrics`] is built, and because
+    /// which counter exists depends on the reason.
+    fn record_fast_path_rejection(
+        metrics: &ExecutionPlanMetricsSet,
+        partition: usize,
+        reason: FastPathRejection,
+    ) {
+        MetricBuilder::new(metrics)
+            .counter(reason.metric_name(), partition)
+            .add(1);
     }
 
     /// Accumulates one segment's *whole-segment* prune totals: `blocks_total`
@@ -744,18 +810,18 @@ impl LogsScanExec {
     }
 
     /// Whether this scan can take the predicate-free full-window whole-segment
-    /// fast path (#693 part 3, deliverable 1), returning the count of relevant
-    /// (ts-overlapping) segments when it can. Decided with ZERO I/O from the
-    /// resolved snapshot and `query`, using the same conjuncts
-    /// [`ravel_query::LogSegmentFetcher::plan_segment`]'s own fast-path gate uses
-    /// per segment:
+    /// fast path (#693 part 3 deliverable 1, amended by #739), returning the
+    /// count of relevant (ts-overlapping) segments when it can and the conjunct
+    /// that refused when it cannot. Decided with ZERO I/O from the resolved
+    /// snapshot and `query`:
     ///
-    /// - the query carries no block-level predicate
+    /// - the snapshot carries no pending selective erasure, and the query
+    ///   carries no block-level predicate
     ///   ([`LogQuery::is_block_predicate_free`]: no content, prune-only,
     ///   stream-attribute, or pending-erasure arm), and
-    /// - every relevant segment has a well-formed span (`min <= max`), is above
-    ///   the fetcher's block-range threshold, and is fully CONTAINED in the
-    ///   window (`ts_min <= seg.min && seg.max <= ts_max`). Containment is
+    /// - every relevant segment has a well-formed span (`min <= max`) and is
+    ///   fully CONTAINED in the window
+    ///   (`ts_min <= seg.min && seg.max <= ts_max`). Containment is
     ///   strictly stronger than the overlap
     ///   [`LogsTableProvider::pruned_segments`] already filtered on, so no block
     ///   of a relevant segment can fall outside the window and every block
@@ -765,23 +831,38 @@ impl LogsScanExec {
     /// whole-segment round-robin still fills every partition. Fewer segments than
     /// partitions is the striped path's job (deliverable 2 carries the plan
     /// footer there so its subset opens still skip re-probing); a partial
-    /// overlap, a predicate, a pending erasure, or a below-threshold segment all
-    /// fall to the unchanged plan-then-stripe path, byte for byte.
+    /// overlap, a predicate, or a pending erasure falls to the unchanged
+    /// plan-then-stripe path, byte for byte.
     ///
-    /// The threshold conjunct keeps this strictly to the band where skipping the
-    /// plan phase saves a GET: at or below the threshold a segment is already
-    /// read whole in one GET on both the plan and scan paths (they coalesce on
-    /// the same `(0, object_size)` cache key), so the fast path would add nothing
-    /// and would only diverge from the existing small-object tests.
+    /// # The block-range threshold is not a conjunct (issue #739)
     ///
-    /// Issue #739 revisits the threshold conjunct: it is query-wide here, so a
-    /// single below-threshold tail object disqualifies every segment in the
-    /// snapshot.
-    fn whole_segment_fast_path(&self, query: &LogQuery) -> Option<usize> {
-        if !query.is_block_predicate_free() {
-            return None;
+    /// It used to be one, query-wide: every relevant segment had to satisfy
+    /// `object_size > block_range_threshold`, on the reasoning that at or below
+    /// the threshold there is no probe to save. Query-wide, that made a single
+    /// small object veto the whole snapshot. A bulk load leaves one small tail
+    /// object per `(shard, hour)`, so on the 8,424-object ClickBench tenant
+    /// (#680) a predicate-free full-window statement striped after all and issued
+    /// 22,473 GETs instead of 8,424.
+    ///
+    /// The conjunct is gone rather than made per segment, because per segment it
+    /// decides nothing: at or below the threshold
+    /// [`ravel_query::LogSegmentFetcher::scan_whole_accounted_with_tenant`] and
+    /// the striped path's ranged entry both land in the same `whole_object_bytes`
+    /// read -- one `GetRange::Full` on the `(0, object_size)` cache key, the same
+    /// accounting, and no etag pin on either, since one GET observes one object
+    /// state. So a sub-threshold segment reads identically whichever entry opens
+    /// it, and it can join the whole-segment assignment while the above-threshold
+    /// segments around it keep the probe the fast path removes.
+    fn whole_segment_fast_path(&self, query: &LogQuery) -> Result<usize, FastPathRejection> {
+        // Checked ahead of `is_block_predicate_free` (which folds erasure in)
+        // only so the recorded reason names erasure rather than the generic
+        // block-predicate arm.
+        if !self.erasure.is_empty() {
+            return Err(FastPathRejection::PendingErasure);
         }
-        let threshold = self.fetcher.block_range_threshold();
+        if !query.is_block_predicate_free() {
+            return Err(FastPathRejection::BlockPredicate);
+        }
         let mut relevant = 0usize;
         for seg in self.segments.iter() {
             if !LogSegmentFetcher::ts_range_relevant(seg, self.ts_min, self.ts_max) {
@@ -789,14 +870,16 @@ impl LogsScanExec {
             }
             relevant += 1;
             let contained = seg.min_event_ts_ns <= seg.max_event_ts_ns
-                && seg.object_size > threshold
                 && self.ts_min <= seg.min_event_ts_ns
                 && seg.max_event_ts_ns <= self.ts_max;
             if !contained {
-                return None;
+                return Err(FastPathRejection::SegmentNotContained);
             }
         }
-        (relevant >= self.target_partitions).then_some(relevant)
+        if relevant < self.target_partitions {
+            return Err(FastPathRejection::FewerSegmentsThanPartitions);
+        }
+        Ok(relevant)
     }
 
     fn compute_properties(schema: &SchemaRef, n: usize) -> PlanProperties {
@@ -967,34 +1050,38 @@ impl ExecutionPlan for LogsScanExec {
             accounting: self.accounting.clone(),
         });
 
-        // #693 part 3 deliverable 1: a predicate-free query whose window fully
-        // contains every relevant, above-threshold segment, with at least
-        // `target_partitions` of them, skips the plan phase entirely. Each
-        // partition computes its whole-segment round-robin share with no I/O and
-        // opens each owned segment with one whole-object GET (no plan probe, no
-        // scan-side probe). Any other shape falls to the plan-then-stripe path
-        // below, byte for byte.
-        let (work, fast_whole_segment, state) = if let Some(relevant) =
-            self.whole_segment_fast_path(&ctx.query)
-        {
-            let n = self.target_partitions.max(1).min(relevant.max(1));
-            let work = owned_whole_segments(&self.segments, self.ts_min, self.ts_max, partition, n);
-            (work, true, LogScanState::NextSegment)
-        } else {
-            // The block-level assignment needs each segment's surviving-block
-            // count, which a prune must produce (async). The first partition
-            // to poll runs that prune for every segment through the shared
-            // `counts` cell, with as many prunes in flight as the scan has
-            // partitions; the rest await its result. Building the future here
-            // (not awaiting it) keeps `execute` synchronous, as DataFusion
-            // requires.
-            let counts_fut = plan_counts_future(
-                Arc::clone(&self.counts),
-                Arc::clone(&ctx),
-                Arc::clone(&self.segments),
-                self.target_partitions,
-            );
-            (VecDeque::new(), false, LogScanState::Planning(counts_fut))
+        // #693 part 3 deliverable 1, amended by #739: a predicate-free query
+        // whose window fully contains every relevant segment, with at least
+        // `target_partitions` of them, skips the plan phase entirely, whatever
+        // those segments' sizes are. Each partition computes its whole-segment
+        // round-robin share with no I/O and opens each owned segment with one
+        // whole-object GET (no plan probe, no scan-side probe). Any other shape
+        // falls to the plan-then-stripe path below, byte for byte, and records
+        // which conjunct sent it there.
+        let (work, fast_whole_segment, state) = match self.whole_segment_fast_path(&ctx.query) {
+            Ok(relevant) => {
+                let n = self.target_partitions.max(1).min(relevant.max(1));
+                let work =
+                    owned_whole_segments(&self.segments, self.ts_min, self.ts_max, partition, n);
+                (work, true, LogScanState::NextSegment)
+            }
+            Err(reason) => {
+                BlockMetrics::record_fast_path_rejection(&self.metrics, partition, reason);
+                // The block-level assignment needs each segment's surviving-block
+                // count, which a prune must produce (async). The first partition
+                // to poll runs that prune for every segment through the shared
+                // `counts` cell, with as many prunes in flight as the scan has
+                // partitions; the rest await its result. Building the future here
+                // (not awaiting it) keeps `execute` synchronous, as DataFusion
+                // requires.
+                let counts_fut = plan_counts_future(
+                    Arc::clone(&self.counts),
+                    Arc::clone(&ctx),
+                    Arc::clone(&self.segments),
+                    self.target_partitions,
+                );
+                (VecDeque::new(), false, LogScanState::Planning(counts_fut))
+            }
         };
 
         Ok(Box::pin(LogScanStream {

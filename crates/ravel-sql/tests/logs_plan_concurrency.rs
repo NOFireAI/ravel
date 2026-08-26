@@ -9,6 +9,13 @@
 //! phase never holds more than one, so the "at least two held" wait below
 //! times out against it; the bound is pinned by the held count settling at
 //! `target_partitions` with more segments than that still unplanned.
+//!
+//! The fixture carries a pending erasure predicate that matches nothing, which
+//! drops no row and prunes no block but keeps the scan off the predicate-free
+//! full-window whole-segment fast path. That fast path skips the plan phase
+//! altogether, and since #739 it no longer excludes small objects, so without the
+//! predicate the held GETs below would be the fast path's per-partition segment
+//! opens -- the same count, measuring nothing about `compute_plan_counts`.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -124,7 +131,16 @@ async fn plan_phase_prunes_target_partitions_segments_at_a_time() {
         Snapshot {
             segments,
             segments_pruned: 0,
-            pending_erasure: Vec::new(),
+            // Matches no record in the fixture: it prunes nothing and erases
+            // nothing, it only keeps the scan on the plan-then-stripe path (see
+            // the module doc).
+            pending_erasure: vec![ravel_proto::commit::v1::ErasureRequest {
+                predicate: vec![ravel_proto::commit::v1::ErasurePredicateMatcher {
+                    key: "absent-key".to_string(),
+                    value: "absent-value".to_string(),
+                }],
+                ..Default::default()
+            }],
         },
         TENANT,
         LogSegmentFetcher::new(store),
