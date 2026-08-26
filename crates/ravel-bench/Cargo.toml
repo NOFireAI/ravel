@@ -142,6 +142,14 @@ stage-timing = ["ravel-ingest/stage-timing"]
 # same optional `ravel-sql` entry `flight-egress` uses (no second entry, so no
 # second datafusion/arrow activation) and the plain gates never compile it.
 sql-latency = ["dep:ravel-sql", "dep:datafusion", "dep:ravel-cache", "dep:ravel-rspan", "dep:futures"]
+# The `sql_latency_bench --flight` lane (issue #680): the same corpus executed
+# through a running `ravel-server`'s Flight SQL endpoint instead of an
+# in-process executor. Off by default. No new external crate: `arrow-flight`
+# is already the optional dependency `flight-egress` activates, at the same
+# workspace pin, and `ravel-sql` is already linked with its `flight-sql`
+# feature by the `sql-latency` entry above, so the client type and the service
+# it talks to come from one arrow-flight instance.
+flight-lane = ["sql-latency", "dep:arrow-flight", "dep:futures"]
 
 [dev-dependencies]
 criterion = { workspace = true }
