@@ -6,9 +6,25 @@ use crate::snapshot_format;
 pub const DEFAULT_MAX_INGEST_LAG_NS: i64 = 2 * 60 * 60 * 1_000_000_000;
 /// Default `clock_skew_allowance`: 5 minutes, in nanoseconds.
 pub const DEFAULT_CLOCK_SKEW_ALLOWANCE_NS: i64 = 5 * 60 * 1_000_000_000;
-/// Default bound on decoded commit records cached per tenant. Not named in
-/// the ADR; a capacity cap is the simpler of the two eviction strategies it
-/// explicitly allows ("simple LRU or capacity cap per tenant").
+/// Default bound on decoded commit records cached per tenant, in entries.
+/// Not named in the ADR, which allows "simple LRU or capacity cap per
+/// tenant"; the cache is an LRU (crate::cache).
+///
+/// 10,000 entries is sized so a tenant with a 10,000-segment hot region --
+/// the unsealed `max_flush_lifetime + clock_skew_allowance +
+/// fold_safety_margin` tail every query touches, since no fold has sealed it
+/// yet -- fits entirely, so a repeated resolve over it re-issues no
+/// per-record GET (issue #783). An entry costs roughly 750 bytes: a 119-byte
+/// commit key held twice (the map key and the recency index), the 200-byte
+/// decoded `CommitRecord` plus about 200 bytes of its own heap (tenant hash,
+/// writer uuid, data object key, content hash), and the two maps' slot
+/// overhead. The default is therefore about 8 MB per actively-queried tenant,
+/// reclaimed by the idle-tenant sweep
+/// ([`Catalog::evict_idle_tenants`](crate::Catalog::evict_idle_tenants)).
+///
+/// `0` is the disabled sentinel: nothing is admitted and every record read
+/// falls through to a store GET, matching
+/// [`CatalogConfig::byte_cache_max_bytes`]'s own `0` sentinel.
 pub const DEFAULT_CACHE_CAPACITY_PER_TENANT: usize = 10_000;
 /// Default `max_flush_lifetime`: 1 hour, in nanoseconds. The GC interlock
 /// (ADR-0010 §11) forbids publishing a commit record after this long past
@@ -161,8 +177,10 @@ pub struct CatalogConfig {
     /// absorb writer clock skew, in nanoseconds. Default 5m
     /// ([`DEFAULT_CLOCK_SKEW_ALLOWANCE_NS`]).
     pub clock_skew_allowance_ns: i64,
-    /// Bound on decoded commit records cached per tenant. Default
-    /// [`DEFAULT_CACHE_CAPACITY_PER_TENANT`].
+    /// Bound on decoded commit records cached per tenant, in entries, evicted
+    /// least-recently-used. `0` disables the cache entirely. Default
+    /// [`DEFAULT_CACHE_CAPACITY_PER_TENANT`], which carries the per-entry size
+    /// and the hot-region sizing rationale.
     pub cache_capacity_per_tenant: usize,
     /// Longest a writer may take to publish a commit record after its
     /// ingest hour ends, in nanoseconds. Part of the seal-watermark margin (ADR-0020). Default

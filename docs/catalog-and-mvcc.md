@@ -713,6 +713,33 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
    bound the cache per tenant. Records are immutable and never invalidated,
    except: observing a tombstone for a bucket invalidates that bucket's
    cached commit and compaction records (the trigger ADR-0010 §10 promises).
+
+   That cache is per process and outlives any one resolve, which is what
+   makes a repeated resolve over an unsealed ingest hour cost its LISTs and
+   nothing else (issue #783). The newest `max_flush_lifetime +
+   clock_skew_allowance + fold_safety_margin` of any tenant is always
+   unsealed, so no snapshot part covers it and every query touching recent
+   data resolves it through this step; without the cache that is one GET per
+   hot commit record, per query. Caching by object key alone is sound because
+   a commit record never changes once written: its identity is pinned at
+   flush open (see "Pinned flush identity") and the object is immutable, so
+   only the bucket's LIST result can grow. The LIST therefore still runs on
+   every resolve -- it is what discovers records published since the last one
+   -- and only the per-record GET and decode are skipped. A record the LIST
+   names and the cache does not hold is fetched; a cached record the LIST no
+   longer names is simply never consulted, since the resolve builds its
+   segment set from the LIST (retention and GC remove records only after
+   their bucket is sealed and folded). A hit is counted as a cache hit with
+   the cached object's byte size and issues no GET; a miss is counted as a
+   miss and pays the GET, exactly as the part and postings caches do. The
+   bound is `cache_capacity_per_tenant`, in entries, evicted
+   least-recently-used so a hot ingest hour survives a wider one-off scan or
+   a fold's sweep of older buckets. Its default of 10,000 entries is sized to
+   hold a 10,000-segment hot region whole, at roughly 750 bytes per entry
+   (about 8 MB per actively-queried tenant); `0` disables the cache. A bound
+   below a bucket's record count is worse than a small cache: this step's two
+   passes (the concurrent prewarm, then the sequential include walk) then
+   evict each other's entries and every record is read twice.
 3. Tombstone present: the bucket contributes nothing to the snapshot.
    Otherwise, build ONE unified exclusion mechanism over the bucket
    (ADR-0064 unifies rewrite supersession with compaction's, rather than
@@ -946,8 +973,10 @@ All five caches (`RecordCache`, `CompactionRecordCache`, `HeadCache`,
 `PartCache`, `PostingsCache`) record a cache hit or miss on every lookup and
 add the cached object's original wire-encoded byte size on a hit; a miss
 does not double-count bytes the funnel GET that filled the cache already
-recorded. `HeadCache` additionally carries a process-wide capacity bound
-(`head_cache_capacity`, default 10,000 (tenant, signal) entries, FIFO
+recorded. `RecordCache` evicts least-recently-used within its per-tenant
+bound (`cache_capacity_per_tenant`); the other three per-tenant caches evict
+by insertion order. `HeadCache` additionally carries a process-wide capacity
+bound (`head_cache_capacity`, default 10,000 (tenant, signal) entries, FIFO
 eviction), closing the one cache of the five that previously had a TTL but
 no bound on the number of tenants it could grow to hold.
 
