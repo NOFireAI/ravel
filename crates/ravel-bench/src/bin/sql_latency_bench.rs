@@ -13,6 +13,10 @@
 //!
 //! Loaded-tenant lane (needs a tenant already loaded by `ravel-cli load`):
 //! `... --bin sql_latency_bench -- --tenant <id> --store s3`
+//!
+//! Flight SQL lane (the same tenant, executed through a running server; needs
+//! the `flight-lane` feature on top of `sql-latency`):
+//! `... -- --tenant <id> --store s3 --flight 127.0.0.1:4317`
 #![allow(clippy::expect_used)]
 
 use std::process::ExitCode;
@@ -22,7 +26,8 @@ use clap::Parser;
 use ravel_bench::harness::{StoreKind, store_from_env};
 use ravel_bench::sql_corpus::{checked_default_corpus, load_external_corpus};
 use ravel_bench::sql_latency::{
-    Compaction, GenerateConfig, SqlLatencyReport, TenantConfigInput, run_generated, run_tenant,
+    Compaction, FlightTarget, GenerateConfig, SqlLatencyReport, TenantConfigInput, run_generated,
+    run_tenant,
 };
 use ravel_sql::DEFAULT_MAX_QUERY_BYTES;
 use ravel_types::TimeRange;
@@ -134,9 +139,21 @@ struct Args {
     #[arg(long, default_value_t = false)]
     sql_parallel_final_aggregation: bool,
     /// Execute each statement through a running `ravel-server`'s Flight SQL
-    /// endpoint (`host:port`) instead of the in-process executor.
-    #[arg(long, value_name = "HOST:PORT")]
+    /// endpoint (`host:port`, the server's `--listen-grpc`) instead of the
+    /// in-process executor, so the numbers are the ones a client of that server
+    /// would see. `--store`/`--tenant` are still required and still used: the
+    /// dataset stanza and the tenant's declared columns are resolved from the
+    /// object store directly, because a Flight client cannot read the catalog.
+    /// Needs the `flight-lane` build feature.
+    #[arg(long, value_name = "HOST:PORT", requires = "tenant")]
     flight: Option<String>,
+    /// Bearer credential for `--flight`, sent as `authorization: Bearer
+    /// <TOKEN>`; this is the token side of the server's `--tenant-token
+    /// <TOKEN>=<TENANT>` pair. Falls back to the `RAVEL_FLIGHT_TOKEN`
+    /// environment variable, which is the better place for it: a token on the
+    /// command line lands in the shell history and in `ps`.
+    #[arg(long = "flight-token", value_name = "TOKEN", requires = "flight")]
+    flight_token: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, clap::ValueEnum)]
@@ -249,6 +266,14 @@ async fn run(args: &Args) -> Result<SqlLatencyReport, ravel_bench::sql_latency::
                 progress_jsonl: args.progress_jsonl.clone(),
                 tenant_max_bytes: args.sql_tenant_max_bytes,
                 parallel_final_aggregation: args.sql_parallel_final_aggregation,
+                flight: args.flight.as_ref().map(|endpoint| FlightTarget {
+                    endpoint: endpoint.clone(),
+                    token: args.flight_token.clone().or_else(|| {
+                        std::env::var("RAVEL_FLIGHT_TOKEN")
+                            .ok()
+                            .filter(|t| !t.is_empty())
+                    }),
+                }),
             };
             run_tenant(&cfg).await
         }
@@ -290,6 +315,9 @@ fn print_human_table(report: &SqlLatencyReport) {
     );
     println!("  host       : {} logical cores", p.host_logical_cores);
     println!("  source     : {}  dataset={}", p.source, p.dataset_id);
+    if let Some(flight) = &p.flight_endpoint {
+        println!("  flight sql : {flight} (scan diagnostics are not on the wire)");
+    }
     println!(
         "  dataset    : {} objects, {} bytes, {} rows, layout={}, load={:.1}ms",
         d.object_count, d.stored_bytes, d.rows, d.layout, d.load_wall_ms
@@ -316,6 +344,17 @@ fn print_human_table(report: &SqlLatencyReport) {
         "", "", "", "", "", "", "", "", ""
     );
     for e in &report.entries {
+        // The Flight lane has no scan diagnostics to print (they are executor
+        // counters, and nothing carries them over the wire). `-` says absent;
+        // a `0` would read as "scanned nothing".
+        let (blocks_total, blocks_scanned, gets) = match &e.scan {
+            Some(scan) => (
+                scan.blocks_total.to_string(),
+                scan.blocks_scanned.to_string(),
+                scan.object_store_get_requests.to_string(),
+            ),
+            None => ("-".to_string(), "-".to_string(), "-".to_string()),
+        };
         println!(
             "  {:<32} | {:>9.3} | {:>9.3} | {:>9.3} | {:>9.3} | {:>7} | {:>7} | {:>7} | {:>7}",
             e.id,
@@ -324,9 +363,9 @@ fn print_human_table(report: &SqlLatencyReport) {
             e.max_ms,
             e.cold_ms,
             e.rows_returned,
-            e.scan.blocks_total,
-            e.scan.blocks_scanned,
-            e.scan.object_store_get_requests,
+            blocks_total,
+            blocks_scanned,
+            gets,
         );
     }
     if !report.skipped.is_empty() {
