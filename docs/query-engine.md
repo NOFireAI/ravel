@@ -1955,9 +1955,15 @@ happened, and `EXPLAIN ANALYZE` prints them:
   proof of which one ran.
 - `pages_decoded` / `pages_skipped` — column pages the partition's decode
   decompressed and walked past. **Both counters are written on both paths.** The
-  row path decodes every page of every block it scans, so it reports its whole
-  page count as decoded and 0 as skipped; the columnar path reports the split
-  its projection produced. A zero therefore always means the decode did that
+  row path decodes every page of every block it scans, so a direct row scan
+  reports its whole page count as decoded and 0 as skipped; the columnar path
+  reports the split its projection produced. One case is neither: when an
+  `attrs_raw` block makes the columnar attempt fall back (ADR-0110 decision 3),
+  the partition carries the abandoned attempt's counts into the row path's, so
+  it reports that attempt's skipped pages as skipped and its decoded pages on
+  top of the row decode. Those pages were really decompressed -- the query's
+  `page_bytes_decoded` counts them too -- so the totals are the partition's
+  decode work, not one arm's. A zero therefore always means the decode did that
   much, never that the arm did not count (the row arm left both unwritten before
   issue #669, and an attrs-including `EXPLAIN ANALYZE` read as a decode that
   touched nothing).
