@@ -1102,6 +1102,9 @@ impl Catalog {
     }
 
     #[allow(clippy::too_many_arguments)]
+    // issue #730: cut the resolve's LIST round trips above the snapshot
+    // watermark from three to one (overlap the erasure LIST, one bounded
+    // LIST per shard instead of one per (shard, hour)).
     async fn resolve_fanout(
         &self,
         tenant: &TenantHash,
