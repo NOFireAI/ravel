@@ -3,6 +3,46 @@
 //! Intra-segment scan-partitioning core-count scaling benchmark (ADR-0102
 //! decision 1, epic #361 item 1).
 //!
+//! # The amplification the cached rows cannot show (issue #693)
+//!
+//! The request-count figures here used to be dominated by one configuration:
+//! whole-object reads served out of a cache sized to hold the entire dataset.
+//! That is the configuration in which the un-cached amplification #693 measured
+//! -- up to one read sequence per partition per segment, plus the plan phase
+//! reading every object once more -- cannot appear at all, because
+//! single-flight absorbs the repeats and the whole-object shape hides how much
+//! of each object a partition actually needed.
+//!
+//! So the sweep carries two more axes next to `target_partitions`:
+//!
+//! - `cache_wired`: the read cache on and off, the same counters from the same
+//!   [`QueryAccounting`] fields on both sides.
+//! - `over_threshold`: whether the logs fetcher takes ADR-0107's ranged
+//!   block-range path (suffix probe, directory sections, coalesced candidate
+//!   blocks) or reads whole objects. The fixture publishes objects that clear
+//!   the production [`DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD`] on their own -- 96
+//!   records of 16 KiB body each -- rather than forcing the path with
+//!   [`with_block_range_threshold(0)`][thr] on tiny ones, which is the other
+//!   route and the one `crates/ravel-query`'s block-range tests take. The
+//!   reason is the probe: it is a fixed 64 KiB suffix
+//!   ([`DEFAULT_LOG_SUFFIX_LEN`]), so on a 3 KiB object it re-reads the whole
+//!   object and every ranged read sequence costs about two object-reads instead
+//!   of one. Measured on the earlier small fixture, that doubled the bytes
+//!   figure below exactly (4.0 where 2.0 was due, 10.0 where 5.0 was), which is
+//!   an artifact of the object size and not of the path. Above the threshold the
+//!   probe is a few percent of the object and the figure means what it says.
+//!   [`ComboResult::over_threshold`] `= false` keeps the same objects and moves
+//!   the threshold out of reach instead ([`WHOLE_OBJECT_BLOCK_RANGE_THRESHOLD`]),
+//!   so the two rows differ only in read shape.
+//!
+//! and each row carries two figures derived in the report rather than left to
+//! the reader: [`ComboResult::reads_per_segment`] and
+//! [`ComboResult::bytes_amplification`]. On the un-cached, over-threshold,
+//! full-window row those are the amplification factor itself: every partition
+//! that owns blocks in a segment opens that segment and fetches its candidate
+//! blocks, and the plan phase reads each object once before any of them, so the
+//! bytes amplification lands near `1 + min(partitions, blocks_per_segment)`.
+//!
 //! The sibling of [`crate::groupby_scaling`], aimed at the specific capability
 //! item 1 adds: a `logs` query touching FEWER segments than `target_partitions`
 //! used to pin to at most `segment_count` scan partitions
@@ -23,19 +63,20 @@
 //!
 //! It also reports the object-store request count each combination issues, read
 //! from the executed query's `QueryAccounting` (the same source
-//! [`crate::sql_latency`] and [`crate::pushdown_crossover`] use). The fetch unit
-//! is the whole object (ADR-0087 decision 3: no ranged block reader), so every
-//! partition owning blocks in a segment issues its own whole-object read at that
-//! segment's key. Un-cached, the partition count is capped at the segment count,
-//! so raising `target_partitions` past that changes nothing. Cache-wired, the
-//! partition count keeps climbing and those repeated reads are what ADR-0046's
-//! single-flight cache absorbs.
+//! [`crate::sql_latency`] and [`crate::pushdown_crossover`] use). Every partition
+//! owning blocks in a segment issues its own read sequence at that segment's key;
+//! the shape of the sequence is the `over_threshold` axis (one whole-object GET
+//! at or below the fetcher's block-range threshold, a suffix probe plus directory
+//! sections plus coalesced candidate blocks above it, ADR-0107). Un-cached, the
+//! partition count is capped at the segment count, so raising `target_partitions`
+//! past that changes nothing. Cache-wired, the partition count keeps climbing and
+//! those repeated reads are what ADR-0046's single-flight cache absorbs.
 //!
 //! Every request-count figure in this report is a measurement of THIS fixture --
-//! a `MemoryStore`, this segment/block/partition shape, a cache sized to hold the
-//! whole dataset with no eviction -- and not a general "no amplification" result
-//! about striping. Cache size, eviction, object size, and store latency all move
-//! it.
+//! a `MemoryStore`, this segment/block/partition shape, and on the cached rows a
+//! cache sized to hold the whole dataset with no eviction -- and not a general
+//! result about striping in either direction. Cache size, eviction, object size,
+//! and store latency all move it.
 //!
 //! Finally it reports the cost of the planning prune itself
 //! ([`PlanningLatency`]): `ravel_sql`'s `compute_plan_counts` awaits
@@ -46,6 +87,8 @@
 //!
 //! Report-only: it never changes library behavior. Gated on the `sql-latency`
 //! feature, like the other SQL scaling benches.
+//!
+//! [thr]: ravel_query::LogSegmentFetcher::with_block_range_threshold
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::sync::Arc;
@@ -62,8 +105,8 @@ use ravel_logseg::{
 };
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::{
-    ByteLimit, CacheFetchError, EngineConfig, LogQuery, LogSegmentFetcher, RequestLimit,
-    SegmentFetcher,
+    ByteLimit, CacheFetchError, DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD, EngineConfig, LogQuery,
+    LogSegmentFetcher, RequestLimit, SegmentFetcher,
 };
 use ravel_sql::{SpanSegmentFetcher, SqlConfig, SqlExecutor, SqlRequest};
 use ravel_types::accounting::{AccountedOp, QueryAccounting};
@@ -102,6 +145,11 @@ pub struct LogsScanScalingConfig {
     pub records_per_object: usize,
     /// Writer block target. Small so each segment holds many blocks.
     pub block_target_records: usize,
+    /// Log body length in bytes. Sized so the published objects clear
+    /// [`DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD`], which is what makes the
+    /// `over_threshold` rows a measurement of ADR-0107's ranged path rather than
+    /// of a threshold override (see the module doc).
+    pub body_bytes: usize,
     /// Swept `target_partitions` values (fed through `fetch_concurrency`).
     pub target_partitions: Vec<usize>,
     /// Timed repetitions per combination; the first is the cold run whose
@@ -118,8 +166,10 @@ impl LogsScanScalingConfig {
     /// [`PlanningLatency`] figure said nothing. The swept partition counts
     /// straddle the segment count on both sides (1 below it, 32 at it, 64 above
     /// it) so the report shows the un-cached cap binding and the cached fan-out
-    /// continuing past it. Objects stay small (96 records, 6 blocks each) to keep
-    /// the run cheap despite the segment count.
+    /// continuing past it. Objects stay at 96 records and 6 blocks each to keep
+    /// the run cheap despite the segment count; their 16 KiB bodies are what
+    /// carry each one past [`DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD`], which the
+    /// `over_threshold` rows need (see the module doc).
     pub fn smoke(store: Arc<dyn ObjectStoreBackend>, store_label: &str) -> Self {
         LogsScanScalingConfig {
             store,
@@ -127,6 +177,7 @@ impl LogsScanScalingConfig {
             segments: 32,
             records_per_object: 96,
             block_target_records: 16,
+            body_bytes: 16 * 1024,
             target_partitions: vec![1, 32, 64],
             runs: 2,
             deadline: Duration::from_secs(60),
@@ -141,20 +192,46 @@ pub struct ReportConfig {
     pub segments: usize,
     pub records_per_object: usize,
     pub block_target_records: usize,
+    pub body_bytes: usize,
     pub total_records: usize,
+    /// Bytes of RLOG object the fixture published, summed over every segment.
+    /// The denominator of [`ComboResult::bytes_amplification`], so a row's
+    /// figure is "times the dataset" rather than a raw byte count nobody can
+    /// scale.
+    pub dataset_bytes: u64,
+    /// Size of the smallest object published. The `over_threshold` rows are only
+    /// honest if this exceeds
+    /// [`OVER_THRESHOLD_BLOCK_RANGE_THRESHOLD`], so the report carries it rather
+    /// than asserting the shape in prose.
+    pub min_object_bytes: u64,
     pub target_partitions: Vec<usize>,
+    /// The block-range threshold the `over_threshold` rows build their fetcher
+    /// with: ADR-0107's production default, which every object in this fixture
+    /// exceeds.
+    pub over_threshold_block_range_threshold: u64,
+    /// The block-range threshold the whole-object rows build their fetcher with,
+    /// high enough that no object reaches it.
+    pub whole_object_block_range_threshold: u64,
     pub runs: usize,
     pub cores: usize,
     pub profile: String,
 }
 
-/// One `(target_partitions x cache)` measurement. Every non-axis field is read
-/// from the real plan or the executed query, never echoed from the request.
+/// One `(target_partitions x cache x over_threshold)` measurement. Every
+/// non-axis field is read from the real plan or the executed query, never echoed
+/// from the request; the two derived figures at the end are computed from those
+/// readings, not estimated.
 #[derive(Serialize)]
 pub struct ComboResult {
     pub target_partitions: usize,
     /// Whether ADR-0046's read cache was wired into the logs fetcher.
     pub cache_wired: bool,
+    /// Whether the logs fetcher was built with a block-range threshold of 0, so
+    /// every object takes ADR-0107's ranged path (suffix probe, per-directory
+    /// section GETs, coalesced candidate-block GETs) instead of one whole-object
+    /// GET. False leaves the fetcher's default 512 KiB threshold, which this
+    /// fixture's small objects sit below.
+    pub over_threshold: bool,
     /// Observed: the `LogsScanExec` node's declared output partition count in the
     /// real physical plan. Under block-level striping (ADR-0102) this is
     /// `target_partitions` when the cache is wired, even where the segment count
@@ -183,6 +260,21 @@ pub struct ComboResult {
     pub cache_hits: u64,
     pub cache_misses: u64,
     pub object_store_bytes: u64,
+    /// Derived: [`Self::object_store_get_requests`] over
+    /// [`Self::segments_scanned`]. The "read sequences per segment" figure
+    /// issue #693 is about, as a number the harness reports rather than one a
+    /// reader divides by hand.
+    pub reads_per_segment: f64,
+    /// Derived: [`Self::object_store_bytes`] over
+    /// [`ReportConfig::dataset_bytes`], i.e. how many times over the query read
+    /// the dataset it scanned. 1.0 is "each byte fetched once".
+    ///
+    /// On the un-cached, over-threshold, full-window row this is the
+    /// amplification factor: the plan phase reads every object once, then every
+    /// partition owning blocks in a segment opens that segment and fetches its
+    /// candidates, so the figure sits near
+    /// `1 + min(scan_partitions, blocks_per_segment)`.
+    pub bytes_amplification: f64,
     pub result_rows: usize,
     pub runs_taken: usize,
     pub min_ms: f64,
@@ -197,15 +289,28 @@ pub struct ComboResult {
 }
 
 impl ComboResult {
+    /// Blocks per segment on the fixture this row scanned, from the row's own
+    /// readings. The ceiling on how many partitions can open one segment, and so
+    /// the second term of the expected [`Self::bytes_amplification`].
+    #[must_use]
+    pub fn blocks_per_segment(&self) -> f64 {
+        if self.segments_scanned == 0 {
+            return 0.0;
+        }
+        self.blocks_total as f64 / self.segments_scanned as f64
+    }
+
     fn failed(
         target_partitions: usize,
         cache_wired: bool,
+        over_threshold: bool,
         scan_partitions: usize,
         error: String,
     ) -> Self {
         ComboResult {
             target_partitions,
             cache_wired,
+            over_threshold,
             scan_partitions,
             non_empty_partitions: 0,
             segments_scanned: 0,
@@ -215,6 +320,8 @@ impl ComboResult {
             cache_hits: 0,
             cache_misses: 0,
             object_store_bytes: 0,
+            reads_per_segment: 0.0,
+            bytes_amplification: 0.0,
             result_rows: 0,
             runs_taken: 0,
             min_ms: 0.0,
@@ -255,6 +362,25 @@ pub struct Report {
     /// What the per-segment serialized planning prune costs on this fixture.
     pub planning: PlanningLatency,
     pub combos: Vec<ComboResult>,
+}
+
+impl Report {
+    /// The single row at one point of the `(target_partitions x cache x
+    /// over_threshold)` sweep, so a caller naming a configuration cannot
+    /// silently read a neighbouring row's figures.
+    #[must_use]
+    pub fn combo(
+        &self,
+        target_partitions: usize,
+        cache_wired: bool,
+        over_threshold: bool,
+    ) -> Option<&ComboResult> {
+        self.combos.iter().find(|c| {
+            c.target_partitions == target_partitions
+                && c.cache_wired == cache_wired
+                && c.over_threshold == over_threshold
+        })
+    }
 }
 
 fn percentile(sorted_ns: &[u64], pct: f64) -> u64 {
@@ -318,31 +444,46 @@ fn available_cores() -> usize {
         .unwrap_or(1)
 }
 
+/// The block-range threshold the `over_threshold = false` rows build their logs
+/// fetcher with. No object can exceed `u64::MAX`, so those rows read whole
+/// objects on the same dataset the `over_threshold` rows read in ranges, and the
+/// two differ only in read shape.
+pub const WHOLE_OBJECT_BLOCK_RANGE_THRESHOLD: u64 = u64::MAX;
+
+/// The block-range threshold the `over_threshold = true` rows build their logs
+/// fetcher with: ADR-0107's production default, which the fixture's objects
+/// genuinely exceed rather than being routed around it.
+pub const OVER_THRESHOLD_BLOCK_RANGE_THRESHOLD: u64 = DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD;
+
 /// Build the few-segment / many-block dataset, then sweep every
-/// `(target_partitions x cache)` combination, returning the full report.
+/// `(target_partitions x cache x over_threshold)` combination, returning the
+/// full report.
 pub async fn run(config: &LogsScanScalingConfig) -> Report {
     let store = Arc::clone(&config.store);
     let tenant = TenantId::new(format!("bench-tenant-{}", Uuid::new_v4()));
     let tenant_hash = tenant.hash();
 
-    let total_records = publish_dataset(store.as_ref(), &tenant, config).await;
+    let dataset = publish_dataset(store.as_ref(), &tenant, config).await;
 
     let planning = measure_planning_latency(Arc::clone(&store), tenant_hash).await;
 
-    let mut combos = Vec::with_capacity(config.target_partitions.len() * 2);
+    let mut combos = Vec::with_capacity(config.target_partitions.len() * 4);
     for &tp in &config.target_partitions {
         for cache_wired in [false, true] {
-            let result = run_combo(
-                Arc::clone(&store),
-                tenant_hash,
-                tp,
-                cache_wired,
-                config.runs,
-                config.deadline,
-                total_records,
-            )
-            .await;
-            combos.push(result);
+            for over_threshold in [false, true] {
+                let result = run_combo(
+                    Arc::clone(&store),
+                    tenant_hash,
+                    tp,
+                    cache_wired,
+                    over_threshold,
+                    config.runs,
+                    config.deadline,
+                    &dataset,
+                )
+                .await;
+                combos.push(result);
+            }
         }
     }
 
@@ -353,8 +494,13 @@ pub async fn run(config: &LogsScanScalingConfig) -> Report {
             segments: config.segments,
             records_per_object: config.records_per_object,
             block_target_records: config.block_target_records,
-            total_records,
+            body_bytes: config.body_bytes,
+            total_records: dataset.total_records,
+            dataset_bytes: dataset.total_bytes,
+            min_object_bytes: dataset.min_object_bytes,
             target_partitions: config.target_partitions.clone(),
+            over_threshold_block_range_threshold: OVER_THRESHOLD_BLOCK_RANGE_THRESHOLD,
+            whole_object_block_range_threshold: WHOLE_OBJECT_BLOCK_RANGE_THRESHOLD,
             runs: config.runs,
             cores: available_cores(),
             profile: build_profile().to_string(),
@@ -432,17 +578,19 @@ async fn measure_planning_latency(
     }
 }
 
-/// One `(target_partitions, cache_wired)` measurement.
+/// One `(target_partitions, cache_wired, over_threshold)` measurement.
 #[allow(clippy::too_many_arguments)]
 async fn run_combo(
     store: Arc<dyn ObjectStoreBackend>,
     tenant_hash: TenantHash,
     target_partitions: usize,
     cache_wired: bool,
+    over_threshold: bool,
     runs: usize,
     deadline: Duration,
-    total_records: usize,
+    dataset: &Dataset,
 ) -> ComboResult {
+    let total_records = dataset.total_records;
     let engine = EngineConfig {
         max_series: usize::MAX,
         max_samples: usize::MAX,
@@ -461,9 +609,22 @@ async fn run_combo(
     // cache misses a warm repeat would elide.
     let catalog = match Catalog::new(Arc::clone(&store), CatalogConfig::default()) {
         Ok(c) => Arc::new(c),
-        Err(e) => return ComboResult::failed(target_partitions, cache_wired, 0, e.to_string()),
+        Err(e) => {
+            return ComboResult::failed(
+                target_partitions,
+                cache_wired,
+                over_threshold,
+                0,
+                e.to_string(),
+            );
+        }
     };
-    let mut logs_fetcher = LogSegmentFetcher::new(Arc::clone(&store));
+    let mut logs_fetcher =
+        LogSegmentFetcher::new(Arc::clone(&store)).with_block_range_threshold(if over_threshold {
+            OVER_THRESHOLD_BLOCK_RANGE_THRESHOLD
+        } else {
+            WHOLE_OBJECT_BLOCK_RANGE_THRESHOLD
+        });
     if cache_wired {
         // Big enough to hold every object with room to spare, so the striping's
         // repeated whole-object reads coalesce onto cache hits.
@@ -499,18 +660,42 @@ async fn run_combo(
         .await
     {
         Ok(s) => s,
-        Err(e) => return ComboResult::failed(target_partitions, cache_wired, 0, e.to_string()),
+        Err(e) => {
+            return ComboResult::failed(
+                target_partitions,
+                cache_wired,
+                over_threshold,
+                0,
+                e.to_string(),
+            );
+        }
     };
     let planned = match executor
         .plan_pinned(tenant_hash, snapshot, QUERY, &accounting, &[])
         .await
     {
         Ok(p) => p,
-        Err(e) => return ComboResult::failed(target_partitions, cache_wired, 0, e.to_string()),
+        Err(e) => {
+            return ComboResult::failed(
+                target_partitions,
+                cache_wired,
+                over_threshold,
+                0,
+                e.to_string(),
+            );
+        }
     };
     let plan = match planned.create_physical_plan().await {
         Ok(p) => p,
-        Err(e) => return ComboResult::failed(target_partitions, cache_wired, 0, e.to_string()),
+        Err(e) => {
+            return ComboResult::failed(
+                target_partitions,
+                cache_wired,
+                over_threshold,
+                0,
+                e.to_string(),
+            );
+        }
     };
     let scan_partitions = scan_partition_count(&plan);
 
@@ -523,6 +708,7 @@ async fn run_combo(
             return ComboResult::failed(
                 target_partitions,
                 cache_wired,
+                over_threshold,
                 scan_partitions,
                 e.to_string(),
             );
@@ -545,7 +731,13 @@ async fn run_combo(
     let non_empty_partitions = match count_non_empty_scan_partitions(&plan).await {
         Ok(n) => n,
         Err(e) => {
-            return ComboResult::failed(target_partitions, cache_wired, scan_partitions, e);
+            return ComboResult::failed(
+                target_partitions,
+                cache_wired,
+                over_threshold,
+                scan_partitions,
+                e,
+            );
         }
     };
 
@@ -558,6 +750,7 @@ async fn run_combo(
                 return ComboResult::failed(
                     target_partitions,
                     cache_wired,
+                    over_threshold,
                     scan_partitions,
                     e.to_string(),
                 );
@@ -584,9 +777,24 @@ async fn run_combo(
         total_records as f64 / (median_ns as f64 / 1e9)
     };
 
+    // The two derived figures, computed from this row's own readings so nobody
+    // has to divide the report by hand (or eyeball it): reads per segment, and
+    // how many times over the query fetched the dataset it scanned.
+    let reads_per_segment = if segments_scanned == 0 {
+        0.0
+    } else {
+        object_store_get_requests as f64 / segments_scanned as f64
+    };
+    let bytes_amplification = if dataset.total_bytes == 0 {
+        0.0
+    } else {
+        object_store_bytes as f64 / dataset.total_bytes as f64
+    };
+
     ComboResult {
         target_partitions,
         cache_wired,
+        over_threshold,
         scan_partitions,
         non_empty_partitions,
         segments_scanned,
@@ -596,6 +804,8 @@ async fn run_combo(
         cache_hits,
         cache_misses,
         object_store_bytes,
+        reads_per_segment,
+        bytes_amplification,
         result_rows,
         runs_taken,
         min_ms: min_ns as f64 / 1e6,
@@ -648,15 +858,55 @@ fn resource() -> Vec<(String, AttrValue)> {
     )]
 }
 
+/// What the fixture published: the record count the query scans, and the byte
+/// count [`ComboResult::bytes_amplification`] divides by.
+struct Dataset {
+    total_records: usize,
+    total_bytes: u64,
+    min_object_bytes: u64,
+}
+
+/// Pseudo-random printable filler of `len` bytes, from a SplitMix64 stream
+/// seeded by `seed`.
+///
+/// The body dominates an RLOG record, and the writer compresses it: a repeated
+/// or templated body would collapse back under
+/// [`OVER_THRESHOLD_BLOCK_RANGE_THRESHOLD`] and quietly turn the
+/// `over_threshold` rows into whole-object rows with a different label.
+fn filler(seed: u64, len: usize) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut state = seed;
+    let mut out = String::with_capacity(len);
+    for _ in 0..len {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        out.push(ALPHABET[(z & 63) as usize] as char);
+    }
+    out
+}
+
+/// The record body: the same human-readable head this bench always used, padded
+/// with [`filler`] to `body_bytes`.
+fn body_for(ts: i64, body_bytes: usize) -> String {
+    let head = format!("request {ts} ok");
+    match body_bytes.checked_sub(head.len() + 1) {
+        Some(pad) if pad > 0 => format!("{head} {}", filler(ts as u64, pad)),
+        _ => head,
+    }
+}
+
 /// Write `config.segments` RLOG objects, each carrying `records_per_object`
 /// records under `config.block_target_records`-record blocks, and publish each
-/// one's commit record so a real `Catalog::resolve` finds it. Returns the total
-/// record count the query scans.
+/// one's commit record so a real `Catalog::resolve` finds it. Returns the record
+/// and byte totals the sweep measures against.
 async fn publish_dataset(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantId,
     config: &LogsScanScalingConfig,
-) -> usize {
+) -> Dataset {
     let segments = config.segments.max(1);
     let per_object = config.records_per_object.max(1);
     let tenant_hash = tenant.hash();
@@ -665,6 +915,8 @@ async fn publish_dataset(
         ..RlogConfig::default()
     };
     let mut total = 0usize;
+    let mut total_bytes = 0u64;
+    let mut min_object_bytes = u64::MAX;
     let mut ts = 1_000i64;
     for obj_idx in 0..segments {
         let writer_seq = (obj_idx + 1) as u64;
@@ -693,7 +945,7 @@ async fn publish_dataset(
                     observed_ts_ns: ts,
                     severity_num: 9,
                     severity_text: "INFO".to_string(),
-                    body: format!("request {ts} ok"),
+                    body: body_for(ts, config.body_bytes),
                     trace_id: None,
                     span_id: None,
                     flags: 0,
@@ -704,6 +956,8 @@ async fn publish_dataset(
             total += 1;
         }
         let bytes = writer.finish().expect("finish object");
+        total_bytes += bytes.len() as u64;
+        min_object_bytes = min_object_bytes.min(bytes.len() as u64);
         let new_record = NewCommitRecord {
             tenant_hash,
             signal: Signal::Logs,
@@ -739,5 +993,9 @@ async fn publish_dataset(
             .await
             .expect("publish");
     }
-    total
+    Dataset {
+        total_records: total,
+        total_bytes,
+        min_object_bytes: if segments == 0 { 0 } else { min_object_bytes },
+    }
 }
