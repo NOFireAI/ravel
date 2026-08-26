@@ -252,14 +252,17 @@ the same turn as the `fleet_dispatch` call, every time.
    shape (a short SHA, a remote-only branch name, another task's result
    ref) run `git fetch origin <ref> --quiet && git rev-parse FETCH_HEAD`
    first; dispatch only pushes objects the local repo already has.
-2. **Check `git status --short` on the primary checkout.** The dispatch
-   push refuses to run on ANY uncommitted or untracked file, including a
-   stray build artifact (a leftover `__pycache__/` has blocked dispatch
-   after dispatch before anyone looked). Remove a file only when you can
-   attribute it to a command you ran yourself (a `__pycache__/` from your
-   own compile check). Any file you cannot attribute to yourself is
-   another session's: wait 30 s and retry, up to 3 times, since it
-   reliably self-clears, and never touch it and never ask the user.
+2. **A dirty tree does not block the push; it matters only when the
+   dispatch takes local HEAD.** The dispatch push is ref-based: it pushes
+   the objects behind the `ref` resolved in step 1, and it does not refuse
+   on uncommitted or untracked files. Observed 2026-08-25 (#687): five
+   dispatches pushed fine with three untracked, non-ignored files present
+   the whole time. So do not clean up, wait, or retry over a dirty
+   `git status --short`, and never touch a file you cannot attribute to a
+   command you ran yourself: it is another session's. The caveat that does
+   survive is the HEAD-implicit dispatch: when a dispatch uses local HEAD
+   instead of an explicit ref, uncommitted work decides what gets built,
+   so commit it (or pass the step-1 ref explicitly) first.
 
 ## After dispatch
 
