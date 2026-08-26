@@ -60,6 +60,9 @@
 //! whole-object read per segment, zero suffix probes) is measured instead by the
 //! above-threshold integration tests in `ravel-sql` and `ravel-query`.
 //!
+//! Issue #693 tracks the request-count work this report's figures are quoted
+//! from.
+//!
 //! Report-only: it never changes library behavior. Gated on the `sql-latency`
 //! feature, like the other SQL scaling benches.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
