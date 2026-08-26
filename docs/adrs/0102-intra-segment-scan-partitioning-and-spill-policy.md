@@ -300,3 +300,21 @@ flowchart TB
     Pool -->|"over budget"| Err["Typed budget error\n(disk manager disabled,\nnever silent spill)"]
     Pool -->|"within budget"| Result[Query result]
 ```
+
+## Amendment (2026-08-26, #693)
+
+Intra-segment block striping (decision 1) applies only when the fetcher
+carries ADR-0046's read cache. Without it the scan is segment-granular: each
+segment is assigned whole to one partition (relevant segment `j` in snapshot
+order to partition `j % n`), so it is opened by exactly one partition, and the
+partition count is capped at the segment count.
+
+The reason is that decision 1's whole premise for striping past segment count
+rests on single-flight coalescing the re-opens: `n` partitions sharing one
+segment each open it themselves, and only the cache collapses those onto one
+object-store request per extent. Without the cache nothing coalesces them, so
+striping would multiply object-store reads by the partition count (measured at
+~9x on the 8424-object tenant of #680), which is a regression, not a
+speed-up. The gate was always `LogSegmentFetcher::has_cache`; this amendment
+records that the same predicate now selects the assignment mode, not only the
+partition count.
