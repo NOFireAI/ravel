@@ -499,8 +499,12 @@ file.
   (`f64::to_bits`), never `==`. NaN payloads and -0.0 are significant.
 - Property tests (proptest) for every codec and parser; corrupt-input
   tests must produce typed errors, never panics or wrong data. Check in
-  the regression seed file beside the test: a catch at 20,000 cases that
-  is not replayed on every default run is found again at gate time.
+  the regression seed file where proptest writes it (with no
+  `failure_persistence` override that is `proptest-regressions/` under
+  the crate root for a property test in `src/`, and
+  `tests/<name>.proptest-regressions` for one under `tests/`; both forms
+  exist in this repo): a catch at 20,000 cases that is not replayed by
+  the default test command is found again at gate time.
 - A test pins the claim its commit message makes, in the words the
   message uses. "Asserts the exact split" means the test asserts the
   exact split, not that both sides are non-empty. Reviewers ask, for
@@ -522,7 +526,10 @@ mechanical.
 - A number you print and do not assert on is decoration. Every load,
   fold, bench, and gate script states the expected band for each figure
   it reports (rows written, entries folded, statements measured, bytes
-  moved) and exits non-zero outside it. "Exit 0" means the tool ran,
+  moved) and exits non-zero outside it. A figure that was expected and
+  not emitted, or emitted more than once, fails the same way as one
+  outside its band; the check is "present exactly once and inside the
+  band", not "inside the band if present". "Exit 0" means the tool ran,
   not that the work happened; a pass that measured one statement of
   forty-three and exited zero is the failure this rule exists for.
 - Pre-register before measuring. Before a load or a query pass, write
@@ -534,10 +541,13 @@ mechanical.
   `max_flush_lifetime + clock_skew_allowance + fold_safety_margin` after
   it ends, so a fold run right after a load seals nothing), declared
   columns present, the on-object format version audited, the cache in
-  the state the report claims. Verify each before the first statement
-  and stamp them into the report. A report without the stamp is not a
-  result, and a tenant you did not verify is a tenant you did not
-  measure.
+  the state the report claims. Verify each before the first statement,
+  re-verify after any step that can change state (a fold, a compaction,
+  a cache flush, a reload), and stamp what was verified into the report
+  next to the expected figures, their bands, and the link to the
+  pre-registration comment, so a report entry can be checked without
+  the issue open beside it. A report without the stamp is not a result,
+  and a tenant you did not verify is a tenant you did not measure.
 - When a measurement misses, check in this order and do not skip a step:
   is the measured state the pre-registered state; does the per-phase cost
   split point at one layer; only then hypothesize about code or format.
@@ -549,9 +559,13 @@ mechanical.
 - Cost is a first-class output of every read path, split by phase. Any
   code that touches object storage reports its requests and bytes under
   the phase that issued them (resolve, plan, probe, scan, decode), never
-  into one pooled counter. This is what makes a slowdown attributable in
-  one query instead of one afternoon, and the exact-figure fixture rule
-  above applies to it: a test pins the count per phase.
+  into one pooled counter, and every byte figure names which bytes it
+  counts: wire bytes as transferred, bytes charged to a pool, or
+  decompressed bytes, and whether retries and range reads are included.
+  Two phases reporting "bytes" of different kinds cannot be compared or
+  summed. This is what makes a slowdown attributable in one query
+  instead of one afternoon, and the exact-figure fixture rule above
+  applies to it: a test pins the count per phase.
 - A default that selects which data a command touches (signal, tenant,
   shard set, format version) is never silent when the alternative is
   plausible on that target: refuse, or act and say what was chosen and
@@ -563,12 +577,18 @@ mechanical.
   under the same name turn a missing flag into a wrong default.
 - Plan shape is data; lint it. The explain output captured for every
   bench statement is a regression detector for whole classes of
-  performance bugs once a few shape rules run over it: a TopK above a
-  scan that projects more columns than the sort and filter need, a
-  selective statement moving more bytes than the tenant holds, a full
-  scan issuing more GETs than the tenant has objects. Each of those was
-  visible in captured plans for several passes before a benchmark made
-  it a ticket.
+  performance bugs once a few shape rules run over it, each stated
+  against a budget the statement's shape defines rather than as a bare
+  comparison: a TopK whose input scan decodes columns that only the
+  final result needs (the sort and filter can run on the narrow set and
+  the rest can be fetched for the surviving k rows), a selective
+  statement moving more wire bytes than the tenant's objects hold, a
+  full scan issuing more whole-object GETs than the tenant has objects
+  or more requests than its per-phase budget allows for probes, ranges,
+  and listing pages. A rule without its budget rejects valid plans, so
+  write the budget first. Each of the shapes above was visible in
+  captured plans for several passes before a benchmark made it a
+  ticket.
 - Read your own output before running the next command. A counter that
   moved without an explanation (a LIST count from 9 to 14, a fold that
   reported zero entries, a full pass that finished in thirty seconds) is
