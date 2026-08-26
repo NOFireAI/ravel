@@ -1727,7 +1727,7 @@ projects more than the threshold's worth of columns beyond what its filter and
 sort read. An aggregate or join in between, a sort with no fetch, an
 already-narrow projection, and any RSEG or spans scan all leave the plan alone.
 
-```
+```text
 LogsRowFetchExec: row_ref=__ravel_row_ref, restored_columns=41
   SortExec: TopK(fetch=10), expr=[ts@0 ASC NULLS LAST], preserve_partitioning=[false]
     FilterExec: like(body@1, %NEEDLE%)
@@ -1756,7 +1756,9 @@ order, and the object is immutable with the etag pinned across the read. The
 rule declines under a pending selective erasure, where scan-layer exclusion
 would shift surviving-row positions between the phases.
 
-What it costs is `k` block reads. Those are accounted like any other scan read,
+What it costs is at most `k` logical block fetches (winners in one block
+share a fetch); the object-store requests behind them depend on the fetch
+path, as the next paragraph says. Those are accounted like any other scan read,
 and `LogsRowFetchExec` publishes `row_refs`, `blocks_fetched`, and
 `segments_fetched` per `EXPLAIN ANALYZE` so a report can state phase 2's cost
 instead of inferring it. With a read cache wired and an object below the

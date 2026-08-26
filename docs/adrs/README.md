@@ -3,7 +3,9 @@
 One decision per document. Status: Proposed | Accepted | Superseded.
 
 Numbering: ADR 0001 through 0109 are sequential. From ADR 0110 onward the
-number is the GitHub issue number of the epic that produced it, so the
+number is the GitHub issue number of the issue that produced it (the epic
+when the decision spans the epic, the ticket when an epic has several
+decisions in flight at once, as ADR-0774 under epic #680 does), so the
 sequence jumps. GitHub allocates issue numbers atomically, which removes
 the collision that sequential numbering had between parallel sessions and
 the reservation commit that used to work around it.
