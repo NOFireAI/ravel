@@ -76,6 +76,14 @@
 //! profile nothing while adding the exposure that risks the crash. Take latency
 //! from a separate unprofiled multi-run pass.
 //!
+//! `sql_latency_bench` enforces this rather than trusting the operator to
+//! remember it: a run with the profiler armed (`PROFILE_ENV` set and the
+//! `profiling` feature compiled in) and `--runs > 1` is refused up front by
+//! [`runs_supported_with_profiling`] before the guard is built, so the failure
+//! is a clear error instead of a segfault partway through the first statement.
+//! The profiler alone (`--runs 1`) and repeated runs alone (profiler off) are
+//! both unaffected.
+//!
 //! # Concurrent-query segfault and the query-lane sampling rate (issue #680)
 //!
 //! The same hazard fires without repeated runs once the measured region goes
@@ -120,6 +128,48 @@
 /// measured region in a `pprof` CPU sampler and writes the flamegraph there. If
 /// it is unset, no profiler is started even when the feature is compiled in.
 pub const PROFILE_ENV: &str = "RAVEL_BENCH_PROFILE_SVG";
+
+/// Refuse a profiled run that would execute each statement more than once
+/// (issue #616). `pprof`'s signal sampler unwinds through libgcc's
+/// async-signal-unsafe path on every `SIGPROF` tick, and the crash is
+/// probabilistic in the number of unwinds; more runs of every statement raise
+/// that count and the profiled process has been observed to segfault (see the
+/// "Known instability under repeated execution" section of this module). One
+/// guard around the whole measured region does not close the hazard, so rather
+/// than segfault partway through a run this refuses the combination up front:
+/// take the flamegraph from `--runs 1` (one execution already fills it) and the
+/// latencies from a separate unprofiled multi-run pass.
+///
+/// Pure so the decision is testable without touching the process environment or
+/// arming a real sampler: `profile_requested` is whether a sampler would run
+/// (the `profiling` feature is on and [`PROFILE_ENV`] names a path), which
+/// [`profile_requested`] resolves for the live path.
+pub fn runs_supported_with_profiling(profile_requested: bool, runs: usize) -> Result<(), String> {
+    if profile_requested && runs > 1 {
+        return Err(format!(
+            "--runs > 1 is not supported with {PROFILE_ENV}; the profiler and repeated execution \
+             crash together, issue #616"
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a CPU sampler would actually run for this process: the `profiling`
+/// feature is compiled in and [`PROFILE_ENV`] names a non-empty path. This is
+/// the condition [`runs_supported_with_profiling`] gates on. With the feature
+/// off no `pprof` guard is ever built, so the env var alone cannot crash a run
+/// and this is always `false`.
+#[cfg(feature = "profiling")]
+pub fn profile_requested() -> bool {
+    std::env::var_os(PROFILE_ENV).is_some_and(|v| !v.is_empty())
+}
+
+/// See the `profiling`-on variant. No sampler is linked in a default build, so
+/// a set [`PROFILE_ENV`] cannot crash a repeated run and nothing is refused.
+#[cfg(not(feature = "profiling"))]
+pub fn profile_requested() -> bool {
+    false
+}
 
 /// Sampling frequency in Hz for the ingest lane. 997 (a prime near 1 kHz)
 /// avoids aliasing against any periodic timer in the workload.
@@ -347,6 +397,44 @@ mod manifest_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod refusal_tests {
+    use super::{PROFILE_ENV, runs_supported_with_profiling};
+
+    /// A profiled run (`RAVEL_BENCH_PROFILE_SVG` set, sampler linked) with
+    /// `--runs > 1` is refused up front with the exact message, rather than
+    /// segfaulting partway through the run (issue #616). Reverting the guard to
+    /// an unconditional `Ok(())` makes the first assertion fail. The decision is
+    /// pure so it needs no live sampler or process-env mutation.
+    #[test]
+    fn repeated_runs_refused_only_when_profiling() {
+        // The offending combination: profiler on and more than one run.
+        let err = runs_supported_with_profiling(true, 3)
+            .expect_err("a profiled multi-run pass must be refused");
+        assert_eq!(
+            err,
+            format!(
+                "--runs > 1 is not supported with {PROFILE_ENV}; the profiler and repeated \
+                 execution crash together, issue #616"
+            )
+        );
+
+        // Either alone is fine: a single profiled run is the supported profiling
+        // path, and repeated runs with the profiler off are stable.
+        assert!(
+            runs_supported_with_profiling(true, 1).is_ok(),
+            "one profiled run is the supported flamegraph path"
+        );
+        assert!(
+            runs_supported_with_profiling(false, 3).is_ok(),
+            "repeated runs are stable when no sampler is armed"
+        );
+        // A boundary: exactly one run is never refused, profiler or not.
+        assert!(runs_supported_with_profiling(false, 1).is_ok());
     }
 }
 
