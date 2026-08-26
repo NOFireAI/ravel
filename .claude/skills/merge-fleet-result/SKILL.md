@@ -150,16 +150,24 @@ scripts/fleet-result-merge.sh $TASK message.txt   # add -p CRATE to scope local 
 
 ## After the PR is open
 
-Poll `scripts/pr-review-status.sh <number>` until CI is green and it
-reports a CodeRabbit review against the PR's current head commit. Its
-inline-comment count does not drop to zero once you fix something -- the
-REST API never removes a comment just because the code it flagged
-changed -- so "clean" here means every comment has been individually
-read and its finding fixed or explicitly answered (a reply on the
-thread, or a commit message noting why it doesn't apply), never that
-the count reaches zero. A walkthrough-only review with zero comments
-from the start is the one case that is actually clean by count. Once
-every finding is accounted for, land it by hand:
+**Under `FLEET_MERGE_AUTO=1`** (auto-merge already enabled): just poll
+`gh pr view <number> --json state,mergedAt` until it reports merged, then
+go straight to cleanup below. Do not run a second, manual `gh pr merge`
+against a PR GitHub is already landing for you.
+
+**Otherwise** (the default): poll `scripts/pr-review-status.sh <number>`
+until CI is green, `mergeStateStatus` is `CLEAN` or `UNSTABLE` (`DIRTY`/
+`DRAFT`/`BEHIND` mean it isn't mergeable regardless of CI or review state
+-- resolve those first), and it reports a CodeRabbit review against the
+PR's current head commit with a state other than `CHANGES_REQUESTED`.
+The review's inline-comment count does not drop to zero once you fix
+something -- the REST API never removes a comment just because the code
+it flagged changed -- so "clean" here means every comment has been
+individually read and its finding fixed or explicitly answered (a reply
+on the thread, or a commit message noting why it doesn't apply), never
+that the count reaches zero. A walkthrough-only review with zero
+comments from the start is the one case that is actually clean by count.
+Once every finding is accounted for, land it by hand:
 
 ```sh
 gh pr merge <number> --rebase --delete-branch

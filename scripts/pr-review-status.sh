@@ -16,15 +16,38 @@ state="$(echo "${pr_json}" | jq -r '.state')"
 merge_state="$(echo "${pr_json}" | jq -r '.mergeStateStatus')"
 head_sha="$(echo "${pr_json}" | jq -r '.headRefOid')"
 
-pending=$(echo "${pr_json}" | jq '[.statusCheckRollup[]? | select(.status=="IN_PROGRESS" or .status=="QUEUED" or .status=="PENDING")] | length')
-success=$(echo "${pr_json}" | jq '[.statusCheckRollup[]? | select(.conclusion=="SUCCESS")] | length')
-failing=$(echo "${pr_json}" | jq '[.statusCheckRollup[]? | select(.conclusion=="FAILURE" or .conclusion=="CANCELLED" or .conclusion=="TIMED_OUT")] | length')
-failing_names=$(echo "${pr_json}" | jq -r '[.statusCheckRollup[]? | select(.conclusion=="FAILURE" or .conclusion=="CANCELLED" or .conclusion=="TIMED_OUT") | .name] | join(",")')
-# Every check must resolve to a conclusion this script recognizes as
-# accepted (SUCCESS, or NEUTRAL/SKIPPED, which GitHub also treats as
-# passing) before CI counts as settled; a status this script has never
-# seen must not silently fall out of both the success and failing counts.
-other=$(echo "${pr_json}" | jq '[.statusCheckRollup[]? | select(.status=="COMPLETED" and (.conclusion|IN("SUCCESS","FAILURE","CANCELLED","TIMED_OUT","NEUTRAL","SKIPPED")|not))] | length')
+# `statusCheckRollup` can mix two shapes: a `CheckRun` (GitHub Actions and
+# most modern integrations -- `status`/`conclusion`, name in `.name`) and a
+# legacy `StatusContext` (the older commit-status API some third-party
+# integrations still use -- `state` only, name in `.context`). Classify each
+# entry once, by shape, into one bucket, so neither shape nor an unrecognized
+# value inside a recognized shape can silently vanish from every count.
+normalized="$(echo "${pr_json}" | jq '
+  [.statusCheckRollup[]? | {
+    name: (.name // .context // "unknown"),
+    class: (
+      if has("state") then
+        (if .state=="SUCCESS" then "success"
+         elif (.state=="PENDING" or .state=="EXPECTED") then "pending"
+         elif (.state=="FAILURE" or .state=="ERROR") then "failing"
+         else "other" end)
+      elif has("status") then
+        (if .status!="COMPLETED" then "pending"
+         elif (.conclusion=="SUCCESS" or .conclusion=="NEUTRAL" or .conclusion=="SKIPPED") then "success"
+         elif (.conclusion=="FAILURE" or .conclusion=="CANCELLED" or .conclusion=="TIMED_OUT") then "failing"
+         else "other" end)
+      else "other" end
+    )
+  }]')"
+pending=$(echo "${normalized}" | jq '[.[] | select(.class=="pending")] | length')
+success=$(echo "${normalized}" | jq '[.[] | select(.class=="success")] | length')
+failing=$(echo "${normalized}" | jq '[.[] | select(.class=="failing")] | length')
+failing_names=$(echo "${normalized}" | jq -r '[.[] | select(.class=="failing") | .name] | join(",")')
+# Every check must land in success/pending/failing above (an ACTION_REQUIRED
+# or STALE conclusion, an unrecognized state value, or a shape this script
+# has never seen) before CI counts as settled; this catches whatever falls
+# through all three.
+other=$(echo "${normalized}" | jq '[.[] | select(.class=="other")] | length')
 
 # `--paginate` on an array-returning endpoint writes one JSON array per page,
 # back to back, not one combined array -- `jq -s add` slurps every page into
@@ -68,6 +91,8 @@ elif [[ "${merge_state}" == "DIRTY" || "${merge_state}" == "DRAFT" || "${merge_s
   echo "  -> mergeState is ${merge_state}; not mergeable regardless of CI/CodeRabbit state below"
 elif [[ "${cr_reviews}" == "0" ]]; then
   echo "  -> no CodeRabbit review against the current head commit yet; do not merge until one lands"
+elif [[ "${cr_last_state}" == "CHANGES_REQUESTED" ]]; then
+  echo "  -> CodeRabbit's current-head review is CHANGES_REQUESTED; not clean regardless of inline comment count"
 elif [[ "${failing}" != "0" ]]; then
   echo "  -> CI has failing/cancelled checks; not clean to merge"
 elif [[ "${other}" != "0" ]]; then
