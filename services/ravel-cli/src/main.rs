@@ -626,6 +626,18 @@ enum MaintainCommand {
         /// Compute the plan and report it, but write no L1 parts or record.
         #[arg(long)]
         dry_run: bool,
+        /// Override the compactor's `max_flush_lifetime` (humantime duration,
+        /// e.g. `30m`, `0s`; the same grammar and unit as ravel-server's
+        /// `--gc-max-flush-lifetime`). A bucket seals only at its hour's end
+        /// plus this plus the clock-skew allowance, so lowering it seals
+        /// buckets sooner. UNSAFE below the ingest path's real flush lifetime:
+        /// a bucket a writer is still flushing into can then be sealed and
+        /// compacted, and that writer's later-published object is missed by the
+        /// compaction. The default is the safe 1h; use this only for a tenant
+        /// known quiescent, such as one whose bulk load has finished.
+        #[arg(long, value_name = "DURATION",
+              value_parser = maintain::parse_max_flush_lifetime_ns)]
+        max_flush_lifetime: Option<i64>,
     },
     /// Compact every sealed bucket of a whole tenant signal: walk each shard's
     /// ingest hours and run the same per-bucket compaction `compact-bucket`
@@ -637,8 +649,9 @@ enum MaintainCommand {
         #[arg(long, value_enum)]
         signal: SignalArg,
         /// Shard count to walk (shards `0..N`). Omit to resolve it from the
-        /// tenant's durable provisioning record; with neither, the command
-        /// errors naming the tenant.
+        /// tenant's durable shard-count provisioning record; given together
+        /// with a record, the two must agree. With neither flag nor record the
+        /// command errors, naming the tenant.
         #[arg(long)]
         shards: Option<u32>,
         /// First ingest-hour bucket to consider, inclusive. Omit to start at
@@ -653,6 +666,18 @@ enum MaintainCommand {
         /// records.
         #[arg(long)]
         dry_run: bool,
+        /// Override the compactor's `max_flush_lifetime` (humantime duration,
+        /// e.g. `30m`, `0s`; the same grammar and unit as ravel-server's
+        /// `--gc-max-flush-lifetime`). A bucket seals only at its hour's end
+        /// plus this plus the clock-skew allowance, so lowering it seals
+        /// buckets sooner. UNSAFE below the ingest path's real flush lifetime:
+        /// a bucket a writer is still flushing into can then be sealed and
+        /// compacted, and that writer's later-published object is missed by the
+        /// compaction. The default is the safe 1h; use this only for a tenant
+        /// known quiescent, such as one whose bulk load has finished.
+        #[arg(long, value_name = "DURATION",
+              value_parser = maintain::parse_max_flush_lifetime_ns)]
+        max_flush_lifetime: Option<i64>,
     },
     /// Run one sweep pass (orphan GC, superseded, unreferenced parts) over a shard.
     Sweep {
@@ -872,6 +897,7 @@ async fn main() -> anyhow::Result<()> {
                     shard,
                     hour,
                     dry_run,
+                    max_flush_lifetime,
                 },
         } => {
             maintain::compact(
@@ -881,23 +907,34 @@ async fn main() -> anyhow::Result<()> {
                 shard,
                 hour,
                 dry_run,
+                max_flush_lifetime,
             )
             .await
         }
         Command::Maintain {
             command:
                 MaintainCommand::CompactTenant {
-                    tenant: _,
-                    signal: _,
-                    shards: _,
-                    from_hour: _,
-                    to_hour: _,
-                    dry_run: _,
+                    tenant,
+                    signal,
+                    shards,
+                    from_hour,
+                    to_hour,
+                    dry_run,
+                    max_flush_lifetime,
                 },
-        } => {
-            println!("not implemented");
-            std::process::exit(2);
-        }
+        } => maintain::compact_tenant(
+            store::build_store(&cli.store)?,
+            &tenant,
+            signal,
+            shards,
+            from_hour,
+            to_hour,
+            dry_run,
+            max_flush_lifetime,
+            now_ns()?,
+        )
+        .await
+        .map(|_| ()),
         Command::Maintain {
             command:
                 MaintainCommand::Sweep {
