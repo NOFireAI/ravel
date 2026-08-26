@@ -282,6 +282,12 @@ pub fn build_sql_state(
         // `--sql-parallel-final-aggregation`. Default-off leaves every query
         // single-partitioned exactly as before.
         parallel_final_aggregation,
+        // Issue #680 / ADR-0102 decision 2's amendment: the shipped default,
+        // with no flag. Nothing an operator sets should be able to reintroduce
+        // an aggregation whose memory scales with the partition count; the
+        // `SqlConfig` field exists as an in-process escape hatch and for the
+        // regression test's red side, not as a server-level knob.
+        skip_partial_aggregation: SqlConfig::default().skip_partial_aggregation,
     };
     let max_deadline = config.engine.deadline;
     let mut metrics_fetcher = SegmentFetcher::new(store.clone());

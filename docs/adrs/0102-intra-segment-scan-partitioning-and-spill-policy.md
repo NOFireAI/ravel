@@ -164,6 +164,86 @@ ADR does not pre-decide which way the number comes out, only that the
 flag's
 default follows the measurement, not a guess.
 
+#### Amendment, 2026-08-26: aggregation state scales with partition count (issue #680)
+
+High-cardinality ClickBench statements (`q06_distinct_searchphrase`,
+`q09_region_distinct_users`, `q14_search_phrases_distinct_users`) exhausted an
+8 GiB per-query pool, and the amount by which they overshot tracked the
+partition count. `ravel-bench`'s `groupby_scaling --distinct-sweep`
+(`run_distinct`) measured it directly on the `logs` table: 32 RLOG objects each
+carrying every one of `D` distinct values once, so a partition owning one
+object still sees all `D`, swept over `D` in {10,000, 100,000, 1,000,000} and
+`target_partitions` in {1, 4, 16, 32}, with peak read from
+`QueryAccounting::peak_intermediate_bytes`. Peak pool bytes, 1 partition versus
+32:
+
+| query | D | 1 partition | 32 partitions | ratio | exponent |
+|---|---|---|---|---|---|
+| `COUNT(DISTINCT high)` | 10,000 | 4,269,268 | 47,978,804 | 11.2x | 0.70 |
+| `COUNT(DISTINCT high)` | 100,000 | 9,905,370 | 160,827,822 | 16.2x | 0.80 |
+| `COUNT(DISTINCT high)` | 1,000,000 | 83,305,692 | 419,506,764 | 5.0x | 0.47 |
+| `GROUP BY low, COUNT(DISTINCT high)` | 10,000 | 4,145,004 | 45,792,464 | 11.0x | 0.69 |
+| `GROUP BY low, COUNT(DISTINCT high)` | 100,000 | 9,125,746 | 146,106,714 | 16.0x | 0.80 |
+| `GROUP BY low, COUNT(DISTINCT high)` | 1,000,000 | 62,340,980 | 939,662,480 | 15.1x | 0.78 |
+
+The exponent is `ln(peak ratio) / ln(32)`: 0 would mean peak scales with `D`
+alone, 1 that it scales with `D x partitions`. Measured 0.47 to 0.80, so it is
+between the two and much nearer the second. The mechanism is the one issue #680
+hypothesized, confirmed from the physical plan: `single_distinct_to_groupby`
+rewrites `COUNT(DISTINCT x)` into a grouping aggregate on `x`, and that
+aggregate plans as one `AggregateExec(mode=Partial)` per input partition feeding
+a `CoalescePartitionsExec` and a single `Final`, so the pre-final state is one
+full-sized hash table per partition. It falls short of a clean 32x because
+DataFusion's own skip-partial-aggregation probe already caps a partial partition
+at 100,000 entries — but only once that partition has processed 100,000 rows.
+Below that it never fires at all, which is exactly what a high
+`target_partitions` produces when it divides a tenant's data, and is where the
+multiplier is unbounded.
+
+Fix, in `session_config` (`crates/ravel-sql/src/session.rs`), behind
+`SqlConfig::skip_partial_aggregation` (default on):
+`datafusion.execution.skip_partial_aggregation_probe_rows_threshold` from
+100,000 to 8,192 (one Arrow batch: whatever a partial partition accumulates
+before the probe can save it stays resident, and every partition pays it, so the
+probe's own cost is `partitions x this`), and
+`datafusion.execution.skip_partial_aggregation_probe_ratio_threshold` from 0.8
+to 0.5 (give up when the probe found a new group for more than every other row,
+where the partial stage returns at most a factor of two and cannot pay for
+`partitions` copies of itself). Not lower on either: the ratio is judged from a
+sample of that many rows, and a smaller sample starts misjudging genuinely
+reducible mid-cardinality keys as unreducible.
+
+Neither option can change a result. Skipping decides only whether a partition
+pre-aggregates its rows or forwards them; the final stage sees the same rows and
+computes the same groups either way. This is orthogonal to the determinism rules
+that govern every other knob in `session_config`, and to ADR-0094's exact-typed
+classification: it changes where aggregation state lives, not what is summed or
+in what order.
+
+Pinned by `crates/ravel-sql/tests/skip_partial_aggregation.rs` at `D = 50,000`
+over 8 objects (a partition holds 50,000 rows, below DataFusion's stock probe
+threshold and well above 8,192), 1 versus 8 partitions, measuring the
+aggregation-attributable peak: the `COUNT(DISTINCT)` peak minus a
+`count(attrs['u'])` baseline over the identical scan and projection, so the
+scan's own per-partition growth is not charged to the aggregate. Over three
+runs: 0.11x to 1.01x with the option on, 5.33x to 6.34x with it off. The test
+holds the ratio at or below 2.0x and its sibling asserts the unfixed session
+exceeds it.
+
+Per-entry cost, for sizing a pool by arithmetic instead of guesswork: the
+aggregation-attributable peak divided by `D` is 65.4 bytes at `D = 50,000` and
+63.5 bytes at `D = 200,000`, for a 13-byte string key. At ClickBench's roughly
+17M distinct `UserID` that puts the final aggregation state near 1.1 GiB, the
+partial stage at 32 x 8,192 x 64 B (about 17 MiB, against about 205 MiB under
+DataFusion's stock 100,000-row probe), and the scan at about 1.5 MiB per
+partition. Allowing a factor of two for a hash table resident across a doubling
+resize, `COUNT(DISTINCT UserID)` needs on the order of 2.2 GiB, so an 8 GiB pool
+holds it with room; that it failed at 1 GiB and passed at 8 GiB matches this
+arithmetic, since 1 GiB is below the final state alone. Per-entry cost scales
+with key width, so the `SearchPhrase` statements need the real corpus's measured
+average key length before the same arithmetic applies to them; this fixture's
+fixed-width key cannot supply it.
+
 ### 3. Disable the disk manager explicitly; spill is a typed error, not silent degradation
 
 Match ADR-0013's plain-language claim literally: configure

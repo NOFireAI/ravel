@@ -673,6 +673,7 @@ fn cold_executor(
                 ..EngineConfig::default()
             },
             parallel_final_aggregation,
+            ..SqlConfig::default()
         },
         tenant_max_bytes.max(1),
     )

@@ -266,6 +266,7 @@ async fn a_query_that_outgrows_its_pool_still_releases_tenant_bytes() {
         engine: util::engine_config(),
         max_query_bytes: 400_000,
         parallel_final_aggregation: false,
+        skip_partial_aggregation: true,
     };
     let accountant = TenantMemoryAccountant::new(1 << 30);
     let (pool, _breach) = config.query_pool(Arc::clone(&accountant), QueryAccounting::new());
