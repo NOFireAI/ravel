@@ -44,6 +44,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use datafusion::physical_plan::displayable;
 use ravel_cache::{Cache, CacheLimits};
 use ravel_catalog::{
     Catalog, CatalogConfig, DeclaredColumnType, read_config_values, read_generations_from_store,
@@ -57,13 +58,14 @@ use ravel_logseg::{
 };
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::{
-    CacheFetchError, DEFAULT_FETCH_CONCURRENCY, EngineConfig, LogSegmentFetcher, SegmentFetcher,
+    CacheFetchError, DEFAULT_FETCH_CONCURRENCY, DEFAULT_MAX_SEGMENTS, EngineConfig,
+    LogSegmentFetcher, SegmentFetcher,
 };
 use ravel_sql::{
     DEFAULT_MAX_QUERY_BYTES, DeclaredColumn, DeclaredType, SpanSegmentFetcher, SqlConfig,
     SqlExecutor, SqlRequest, StaticDeclaredColumns,
 };
-use ravel_types::accounting::AccountedOp;
+use ravel_types::accounting::{AccountedOp, QueryAccounting};
 use ravel_types::logstream::log_stream_id;
 use ravel_types::{Signal, TenantHash, TenantId, TimeRange};
 use serde::{Deserialize, Serialize};
@@ -196,9 +198,21 @@ pub struct Provenance {
     /// `max_query_bytes`.
     #[serde(default = "default_tenant_max_bytes")]
     pub tenant_max_bytes: usize,
+    /// The engine's `max_segments` ceiling for the run (`ravel-server
+    /// --max-segments`): the number of sealed, below-watermark segments a
+    /// statement may fan out over before it is refused with `query fans out
+    /// over too many segments` (ADR-0073 decision 2). A statement in `failed`
+    /// with that error was refused by this, not by any byte ceiling.
+    #[serde(default = "default_max_segments")]
+    pub sql_max_segments: usize,
     /// Whether final aggregations were allowed to repartition (ADR-0094).
     #[serde(default)]
     pub parallel_final_aggregation: bool,
+    /// Whether the run wrote a per-statement physical plan (`--explain`). The
+    /// plans are a side artifact under `--explain-dir`, never part of the
+    /// numbers above.
+    #[serde(default)]
+    pub explain: bool,
     /// The Flight SQL endpoint (`host:port`) the statements were executed
     /// against, or `None` for an in-process lane. Deliberately not `endpoint`
     /// above: that one names the object store, and the two are different
@@ -210,6 +224,13 @@ pub struct Provenance {
 /// The tenant ceiling every run used before the knob was configurable.
 fn default_tenant_max_bytes() -> usize {
     DEFAULT_TENANT_MAX_BYTES
+}
+
+/// The engine segment ceiling every run used before the knob was configurable
+/// (issue #720); also what a report written before the field existed
+/// deserializes to.
+fn default_max_segments() -> usize {
+    DEFAULT_MAX_SEGMENTS
 }
 
 /// What every run used before the knob was configurable (issue #680); also
@@ -432,6 +453,19 @@ pub struct GenerateConfig {
     /// `SqlConfig::parallel_final_aggregation`; `false` is the compiled-in
     /// default and what every earlier run used.
     pub parallel_final_aggregation: bool,
+    /// The engine's `max_segments` ceiling, the same knob as `ravel-server
+    /// --max-segments`. Reaches `SqlConfig::engine.max_segments`; a statement
+    /// fanning out over more sealed, below-watermark segments than this is
+    /// refused with `query fans out over too many segments` (ADR-0073
+    /// decision 2). Defaults to [`ravel_query::DEFAULT_MAX_SEGMENTS`], so an
+    /// unset flag leaves the ceiling byte-for-byte unchanged.
+    pub max_segments: usize,
+    /// When `Some`, write each statement's physical plan (`--explain`) to
+    /// `<dir>/<id>.txt` before measuring it, so the DataFusion optimizer rules
+    /// that fired (AggregateStatistics, single_distinct_to_groupby, pushdown)
+    /// are readable per statement. Not timed and not part of the report's
+    /// numbers. `None` writes no plan.
+    pub explain_dir: Option<std::path::PathBuf>,
 }
 
 /// Where the Flight lane sends its statements.
@@ -513,6 +547,22 @@ pub struct TenantConfigInput {
     /// `SqlConfig::parallel_final_aggregation`; `false` is the compiled-in
     /// default and what every earlier run used.
     pub parallel_final_aggregation: bool,
+    /// The engine's `max_segments` ceiling, the same knob as `ravel-server
+    /// --max-segments`. Reaches `SqlConfig::engine.max_segments`; a statement
+    /// fanning out over more sealed, below-watermark segments than this is
+    /// refused with `query fans out over too many segments` (ADR-0073
+    /// decision 2). ADR-0073 decision 2 counts only sealed, below-watermark
+    /// segments, so a freshly loaded tenant can sit far above this ceiling and
+    /// only trip it once a fold seals its hours (issue #720). Defaults to
+    /// [`ravel_query::DEFAULT_MAX_SEGMENTS`].
+    pub max_segments: usize,
+    /// When `Some`, write each statement's physical plan (`--explain`) to
+    /// `<dir>/<id>.txt` before measuring it, so the DataFusion optimizer rules
+    /// that fired (AggregateStatistics, single_distinct_to_groupby, pushdown)
+    /// are readable per statement. Not timed and not part of the report's
+    /// numbers. Ignored by the Flight lane, which has no in-process plan to
+    /// display. `None` writes no plan.
+    pub explain_dir: Option<std::path::PathBuf>,
     /// `Some` executes every statement through a running server's Flight SQL
     /// endpoint instead of an in-process [`SqlExecutor`]. The dataset stanza
     /// and the declared-column set are still resolved from `store` directly:
@@ -619,6 +669,9 @@ pub struct ExecutorSettings {
     /// ADR-0094 repartitioned final aggregation
     /// (`--sql-parallel-final-aggregation`).
     pub parallel_final_aggregation: bool,
+    /// Sealed, below-watermark segments a statement may fan out over
+    /// (`--max-segments`), ADR-0073 decision 2.
+    pub max_segments: usize,
 }
 
 impl Default for ExecutorSettings {
@@ -629,6 +682,7 @@ impl Default for ExecutorSettings {
             fetch_concurrency: DEFAULT_FETCH_CONCURRENCY,
             tenant_max_bytes: DEFAULT_TENANT_MAX_BYTES,
             parallel_final_aggregation: false,
+            max_segments: DEFAULT_MAX_SEGMENTS,
         }
     }
 }
@@ -645,6 +699,7 @@ fn cold_executor(
         fetch_concurrency,
         tenant_max_bytes,
         parallel_final_aggregation,
+        max_segments,
     } = settings;
     let catalog = Arc::new(Catalog::new(
         Arc::clone(store),
@@ -671,6 +726,7 @@ fn cold_executor(
             max_query_bytes,
             engine: EngineConfig {
                 fetch_concurrency: fetch_concurrency.max(1),
+                max_segments,
                 ..EngineConfig::default()
             },
             parallel_final_aggregation,
@@ -678,6 +734,34 @@ fn cold_executor(
         tenant_max_bytes.max(1),
     )
     .with_declared_column_source(Arc::new(StaticDeclaredColumns::new(declared.to_vec()))))
+}
+
+/// The physical plan for `sql`, rendered as the indented text `--explain`
+/// writes. Resolves and plans through the same executor the measurement uses
+/// (`resolve_snapshot` then `plan_pinned`), so the plan reflects the exact
+/// declared columns, snapshot, and engine config the timed run would see, then
+/// formats it with DataFusion's [`displayable`]. Not executed and not timed.
+///
+/// `EXPLAIN <statement>` is not run as SQL: `ravel_sql::validate` rejects an
+/// `EXPLAIN` statement as not read-only, so the plan is built through the
+/// executor's existing `create_physical_plan` API instead, which is the same
+/// first step [`PinnedQuery::execute`] takes.
+async fn explain_plan_text(
+    executor: &SqlExecutor,
+    tenant_hash: TenantHash,
+    req: &SqlRequest,
+    sql: &str,
+    declared: &[DeclaredColumn],
+) -> Result<String, Error> {
+    let accounting = QueryAccounting::new();
+    let (snapshot, _estimate) = executor
+        .resolve_snapshot(tenant_hash, req, &accounting)
+        .await?;
+    let planned = executor
+        .plan_pinned(tenant_hash, snapshot, sql, &accounting, declared)
+        .await?;
+    let plan = planned.create_physical_plan().await?;
+    Ok(displayable(plan.as_ref()).indent(true).to_string())
 }
 
 /// Measure `entries` against a dataset already durable in `store`, using
@@ -703,6 +787,7 @@ pub async fn measure_corpus(
     continue_on_error: bool,
     progress_jsonl: Option<&std::path::Path>,
     settings: ExecutorSettings,
+    explain_dir: Option<&std::path::Path>,
 ) -> Result<(Vec<EntryReport>, Vec<SkippedEntry>, Vec<FailedEntry>), Error> {
     let runs = runs.max(1);
     let mut measured = Vec::new();
@@ -750,6 +835,22 @@ pub async fn measure_corpus(
             now_ns,
             deadline,
         };
+
+        // EXPLAIN side artifact, before any timed run and never counted in the
+        // numbers below. A query-side failure here (a snapshot resolve error,
+        // a planning error, an over-`max_segments` fan-out) is left for the
+        // measurement loop to record in `failed`: writing a plan is not the
+        // question the report answers, so it must not change control flow.
+        // Only a file-write failure propagates, because that is an operator
+        // configuration error (`--explain-dir` unwritable), not a query result.
+        if let Some(dir) = explain_dir
+            && let Ok(plan_text) =
+                explain_plan_text(&executor, tenant_hash, &req, &entry.sql, declared).await
+        {
+            let path = dir.join(format!("{}.txt", entry.id));
+            std::fs::write(&path, plan_text)
+                .map_err(|e| format!("write explain plan {}: {e}", path.display()))?;
+        }
 
         let mut latencies_ns = Vec::with_capacity(runs);
         let mut cold_ns = 0u64;
@@ -1086,6 +1187,7 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
         fetch_concurrency: cfg.fetch_concurrency,
         tenant_max_bytes: cfg.tenant_max_bytes,
         parallel_final_aggregation: cfg.parallel_final_aggregation,
+        max_segments: cfg.max_segments,
     };
     let (entries, skipped, failed) = measure_corpus(
         &cfg.store,
@@ -1100,6 +1202,7 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
         cfg.continue_on_error,
         cfg.progress_jsonl.as_deref(),
         settings,
+        cfg.explain_dir.as_deref(),
     )
     .await?;
 
@@ -1116,7 +1219,9 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
             deadline_secs: cfg.deadline.as_secs(),
             fetch_concurrency: cfg.fetch_concurrency.max(1),
             tenant_max_bytes: cfg.tenant_max_bytes.max(1),
+            sql_max_segments: cfg.max_segments,
             parallel_final_aggregation: cfg.parallel_final_aggregation,
+            explain: cfg.explain_dir.is_some(),
             flight_endpoint: None,
         },
         dataset,
@@ -1179,6 +1284,7 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
         fetch_concurrency: cfg.fetch_concurrency,
         tenant_max_bytes: cfg.tenant_max_bytes,
         parallel_final_aggregation: cfg.parallel_final_aggregation,
+        max_segments: cfg.max_segments,
     };
     // The two lanes measure the same statements over the same dataset stanza
     // and the same declared-column set; they differ only in what executes the
@@ -1199,6 +1305,7 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
                 cfg.continue_on_error,
                 cfg.progress_jsonl.as_deref(),
                 settings,
+                cfg.explain_dir.as_deref(),
             )
             .await?
         }
@@ -1220,7 +1327,9 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
             deadline_secs: cfg.deadline.as_secs(),
             fetch_concurrency: cfg.fetch_concurrency.max(1),
             tenant_max_bytes: cfg.tenant_max_bytes.max(1),
+            sql_max_segments: cfg.max_segments,
             parallel_final_aggregation: cfg.parallel_final_aggregation,
+            explain: cfg.explain_dir.is_some(),
             flight_endpoint: cfg.flight.as_ref().map(|t| t.endpoint.clone()),
         },
         dataset,
@@ -1533,6 +1642,8 @@ mod tests {
             progress_jsonl: None,
             tenant_max_bytes: DEFAULT_TENANT_MAX_BYTES,
             parallel_final_aggregation: false,
+            max_segments: DEFAULT_MAX_SEGMENTS,
+            explain_dir: None,
             flight: None,
         }
     }
@@ -1622,6 +1733,189 @@ mod tests {
         .expect("write provisioning record");
     }
 
+    /// A 1-shard tenant with `objects` hour-0 objects, a provisioning record,
+    /// and a fold at `NOW_NS` so those objects are sealed below the fold
+    /// watermark. ADR-0073 decision 2 counts only sealed, below-watermark
+    /// segments against `max_segments`, so before this fold the objects are
+    /// `Recent` (exempt) and no ceiling can be tripped; after it they are
+    /// `SealedBelowWatermark` and counted. `NOW_NS` (4 h) minus the default
+    /// seal margin (~80 min) seals hour buckets at or below hour 1, so hour 0
+    /// is sealed. Mirrors `ravel-cli catalog fold` (with provisioning
+    /// enforcement, `Signal::Logs`).
+    async fn folded_tenant(store: &Arc<dyn ObjectStoreBackend>, name: &str, objects: usize) {
+        let tenant = TenantId::new(name);
+        write_shard_objects(store, &tenant, 0, objects).await;
+        validate_or_adopt(
+            store.as_ref(),
+            &tenant.hash(),
+            Signal::Logs,
+            1,
+            10,
+            AbsentPolicy::CreateFromConfig,
+        )
+        .await
+        .expect("write provisioning record");
+        let catalog = Catalog::new(
+            Arc::clone(store),
+            CatalogConfig {
+                shard_count: 1,
+                ..CatalogConfig::default()
+            },
+        )
+        .expect("catalog")
+        .with_provisioning_enforcement();
+        catalog
+            .fold(
+                &tenant.hash(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                NOW_NS,
+                &[],
+                None,
+            )
+            .await
+            .expect("fold seals hour 0 below the watermark");
+    }
+
+    /// A folded tenant's sealed segments count against `--sql-max-segments`:
+    /// below the sealed count every statement is refused with the typed
+    /// `TooManySegments` error carried verbatim in `failed`; raised above it
+    /// every statement measures. Reverting `cold_executor` to
+    /// `EngineConfig::default()` (segments unthreaded) leaves the ceiling at
+    /// 1024 for both arms, so the low-ceiling arm below stops failing: the
+    /// `report.failed` assertion flips red.
+    #[tokio::test]
+    async fn sql_max_segments_gate_blocks_folded_tenant_then_raised_measures() {
+        let store = empty_store();
+        // Five sealed hour-0 objects, above the ceiling the first arm sets.
+        folded_tenant(&store, "maxseg-tenant", 5).await;
+
+        // Ceiling below the sealed count: every statement fails to fan out.
+        let mut cfg = tenant_cfg(&store, "maxseg-tenant", Some(1), 0);
+        cfg.entries = vec![entry("q", "SELECT body FROM logs")];
+        cfg.continue_on_error = true;
+        cfg.max_segments = 2;
+        let report = run_tenant(&cfg)
+            .await
+            .expect("run completes, recording the refusal");
+        assert!(
+            report.entries.is_empty(),
+            "no statement measures under a ceiling below the sealed count"
+        );
+        assert_eq!(report.failed.len(), 1, "the one statement was refused");
+        assert_eq!(report.failed[0].id, "q");
+        assert!(
+            report.failed[0]
+                .error
+                .contains("query fans out over too many segments: 5 exceeds max 2"),
+            "the typed TooManySegments error is carried verbatim: {}",
+            report.failed[0].error
+        );
+        assert_eq!(
+            report.provenance.sql_max_segments, 2,
+            "the ceiling under measurement is recorded in provenance"
+        );
+
+        // Raised above the sealed count: every statement measures.
+        let mut cfg = tenant_cfg(&store, "maxseg-tenant", Some(1), 0);
+        cfg.entries = vec![entry("q", "SELECT body FROM logs")];
+        cfg.max_segments = DEFAULT_MAX_SEGMENTS;
+        let report = run_tenant(&cfg)
+            .await
+            .expect("run measures every statement once the ceiling is raised");
+        assert!(
+            report.failed.is_empty(),
+            "no refusal once the ceiling clears the sealed count"
+        );
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].id, "q");
+        assert_eq!(
+            report.provenance.sql_max_segments, DEFAULT_MAX_SEGMENTS,
+            "the raised ceiling is recorded in provenance"
+        );
+    }
+
+    /// `--explain` writes one physical-plan file per measured statement, and an
+    /// aggregate's plan names `AggregateExec`; with the flag off nothing is
+    /// written. The plans are a side artifact: the numbers are unaffected and
+    /// `provenance.explain` records that the flag was on.
+    #[tokio::test]
+    async fn explain_writes_physical_plan_per_statement_and_off_writes_nothing() {
+        let store = empty_store();
+        provisioned_tenant(&store, "explain-tenant").await;
+
+        let on_dir = tempfile::tempdir().expect("tempdir");
+        let mut cfg = tenant_cfg(&store, "explain-tenant", None, 0);
+        cfg.entries = vec![
+            // A GROUP BY aggregate: `count(*)` alone is constant-folded by the
+            // AggregateStatistics rule into a `ProjectionExec` over a
+            // `PlaceholderRowExec` (no `AggregateExec` at all), which is itself
+            // an optimizer outcome `--explain` is meant to surface. A GROUP BY
+            // key defeats that fold and leaves a real `AggregateExec`.
+            entry("agg", "SELECT body, count(*) FROM logs GROUP BY body"),
+            entry("scan", "SELECT body FROM logs"),
+        ];
+        cfg.explain_dir = Some(on_dir.path().to_path_buf());
+        let report = run_tenant(&cfg)
+            .await
+            .expect("run measures with explain on");
+        assert_eq!(report.entries.len(), 2, "both statements still measured");
+        assert!(report.provenance.explain, "provenance records explain on");
+
+        let agg_plan = std::fs::read_to_string(on_dir.path().join("agg.txt"))
+            .expect("aggregate statement's explain file exists");
+        assert!(
+            agg_plan.contains("AggregateExec"),
+            "an aggregate's physical plan names AggregateExec: {agg_plan}"
+        );
+        assert!(
+            on_dir.path().join("scan.txt").exists(),
+            "one explain file per statement, keyed by id"
+        );
+
+        // Off: the same corpus writes no plan and provenance says so.
+        let off_dir = tempfile::tempdir().expect("tempdir");
+        let mut cfg = tenant_cfg(&store, "explain-tenant", None, 0);
+        cfg.entries = vec![entry("agg", "SELECT count(*) FROM logs")];
+        let report = run_tenant(&cfg)
+            .await
+            .expect("run measures with explain off");
+        assert!(!report.provenance.explain, "provenance records explain off");
+        assert!(
+            !off_dir.path().join("agg.txt").exists(),
+            "explain off writes no plan file"
+        );
+    }
+
+    /// `--max-segments` must land on `EngineConfig::max_segments`, not stop at a
+    /// parsed field. A value distinct from the compiled-in default proves the
+    /// override is wired; its companion (the default arm) guards against a
+    /// silent-drop regression passing on a coincidental default.
+    #[test]
+    fn cold_executor_threads_max_segments_override() {
+        let store = empty_store();
+        let custom = DEFAULT_MAX_SEGMENTS * 2;
+        assert_ne!(custom, DEFAULT_MAX_SEGMENTS);
+        let executor = cold_executor(
+            &store,
+            &[],
+            None,
+            ExecutorSettings {
+                max_segments: custom,
+                ..ExecutorSettings::default()
+            },
+        )
+        .expect("build executor");
+        assert_eq!(executor.config().engine.max_segments, custom);
+        let executor =
+            cold_executor(&store, &[], None, ExecutorSettings::default()).expect("build executor");
+        assert_eq!(
+            executor.config().engine.max_segments,
+            DEFAULT_MAX_SEGMENTS,
+            "an omitted flag leaves the compiled-in ceiling unchanged"
+        );
+    }
+
     /// With `continue_on_error`, a statement that fails to execute lands in
     /// `failed` (id, run index, verbatim error) and the statements after it are
     /// still measured. Without it, the same corpus aborts the run at the first
@@ -1702,6 +1996,7 @@ mod tests {
             true,
             None,
             ExecutorSettings::default(),
+            None,
         )
         .await
         .expect("run continues past the expiry");
@@ -1785,6 +2080,7 @@ mod tests {
                         fetch_concurrency: FETCH_CONCURRENCY,
                         ..ExecutorSettings::default()
                     },
+                    None,
                 )
                 .await
             }

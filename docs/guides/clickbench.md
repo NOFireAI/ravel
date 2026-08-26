@@ -286,6 +286,24 @@ cargo run -p ravel-bench --features sql-latency --bin sql_latency_bench -- \
 - `--sql-parallel-final-aggregation` lets an exact-typed query repartition its
   final aggregation (ADR-0094), the same knob as the server flag of that name.
   Off by default; a `GROUP BY` over a high-cardinality key is where it shows.
+- `--sql-max-segments <N>` is the engine's `max_segments` ceiling, the same knob
+  as `ravel-server --max-segments`: the number of sealed, below-watermark
+  segments a statement may fan out over before it is refused with `query fans
+  out over too many segments` (ADR-0073 decision 2). Default 1024, ravel-query's
+  compiled-in value. Only sealed, below-watermark segments count, so a freshly
+  loaded ClickBench tenant (8,424 objects) sits far above the ceiling yet never
+  trips it until a fold seals its hours; once it gets a logs snapshot every
+  statement fails in a fraction of a second with `8424 exceeds max 1024`, so a
+  folded tenant needs this raised past its sealed-segment count. The value is
+  recorded in the report's provenance as `sql_max_segments`.
+- `--explain` writes each statement's physical plan to
+  `--explain-dir <dir>/<id>.txt` (one file per statement, `--explain-dir`
+  required when `--explain` is set) before measuring it, so the DataFusion
+  optimizer rules that fired (`AggregateStatistics`,
+  `single_distinct_to_groupby`, projection/filter pushdown) are readable per
+  statement without a debugger. The plans are a side artifact: not timed, never
+  part of the report's numbers; the provenance records `explain: true`. The
+  `--flight` lane has no in-process plan to display and ignores it.
 - A resolve that finds **0 objects** is now an error naming the tenant, the
   resolved shard count, the window, and `now_ns`, rather than a silent report
   over an empty dataset. A wrong `--window-hours` (the event-time span the
@@ -420,6 +438,7 @@ cargo run -p ravel-server --features flight-sql --bin ravel-server -- \
   --fetch-concurrency 8 \
   --sql-max-query-bytes 1073741824 \
   --sql-tenant-max-bytes 2147483648 \
+  --max-segments 1024 \
   --cache-max-bytes 268435456
 ```
 
