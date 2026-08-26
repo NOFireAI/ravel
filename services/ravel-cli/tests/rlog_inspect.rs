@@ -119,11 +119,12 @@ fn rlog_inspect_output_matches_golden_fixture() {
     assert_eq!(
         stdout, expected,
         "`rlog inspect` output regressed; the RLOG format is frozen \
-         (docs/log-segment-format.md, currently trailer v3) -- this must not \
+         (docs/log-segment-format.md, currently trailer v4) -- this must not \
          change without a version bump and ADR"
     );
     assert!(
         expected.contains("name=SKIP_IDX")
+            && expected.contains("name=PAGE_DIR")
             && expected.contains("stream_dir")
             && expected.contains("field_dir"),
         "the golden fixture stopped exercising a section listing"
@@ -187,4 +188,25 @@ fn truncated_object_prints_typed_error_not_panic() {
         stderr.contains("failed to parse rlog"),
         "expected the typed parse-failure text on stderr, got: {stderr}"
     );
+}
+
+/// Regenerates `tests/fixtures/rlog_inspect.txt` after a deliberate, versioned
+/// format change (never for an internal refactor). Run explicitly:
+///   cargo test -p ravel-cli --test rlog_inspect -- --ignored capture
+#[test]
+#[ignore = "regenerates a golden fixture; run explicitly, never in CI"]
+fn capture_rlog_inspect_fixture() {
+    let path = temp_path("capture");
+    std::fs::write(&path, build_object()).expect("writes object");
+    let output = run_inspect(&path);
+    let _ = std::fs::remove_file(&path);
+    assert!(output.status.success());
+    std::fs::write(
+        PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/rlog_inspect.txt"
+        )),
+        output.stdout,
+    )
+    .expect("writes fixture");
 }

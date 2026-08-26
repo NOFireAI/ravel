@@ -272,7 +272,12 @@ async fn write_rlog_segment_under(tenant: TenantHash) -> (Arc<MemoryStore>, Segm
     for record in &records {
         writer.push(record.clone()).expect("push record");
     }
-    let bytes = writer.finish().expect("finish rlog object");
+    // Version 3: this fixture exists to exercise the block-range path's cache
+    // discipline, and `BlockRangeFetcher` reads a version-4 object whole until
+    // ADR-0699 decision 5's PAGE_DIR-driven fetcher replaces that path (see
+    // `tests/log_block_range.rs`). A version-4 fixture would take the
+    // whole-object fallback and test nothing here.
+    let bytes = writer.finish_v3_for_tests().expect("finish rlog object");
     let size = bytes.len() as u64;
 
     let store = Arc::new(MemoryStore::new());

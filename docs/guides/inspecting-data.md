@@ -174,7 +174,7 @@ Field by field:
 ## `rlog inspect`: what's inside one log segment
 
 Log data lives in RLOG objects (`.rlog`), the columnar log segment format
-(docs/log-segment-format.md, ADR-0029; trailer version 3, ADR-0095). RLOG is
+(docs/log-segment-format.md, ADR-0029; trailer version 4, ADR-0699). RLOG is
 a sibling of RSEG. It shares the same 16-byte trailer, protobuf footer, and
 crc32c discipline, but it has its own sections and none of the bytes. Ingest, query, and lifecycle all run today: the production ingest path writes
 RLOG objects through `ravel-ingest`'s log shard, the `logs` SQL table on
@@ -188,8 +188,8 @@ cargo run -p ravel-cli -- rlog inspect "t/abab.../l/l0/0000/....rlog"
 ```
 
 ```
-total_size: 732
-version: 3
+total_size: 902
+version: 4
 signal: 2
 tenant_hash: abababababababababababababababab
 shard: 3
@@ -209,14 +209,16 @@ part_index: 0
 sections:
   kind=1 name=STREAM_DIR offset=0 len=64 comp=zstd uncompressed_len=96
   kind=2 name=FIELD_DIR offset=64 len=30 comp=zstd uncompressed_len=21
-  kind=3 name=BLOCKS offset=94 len=214 comp=none uncompressed_len=214
-  kind=4 name=SKIP_IDX offset=308 len=75 comp=zstd uncompressed_len=104
-  kind=5 name=BLOOM offset=383 len=164 comp=none uncompressed_len=164
+  kind=3 name=BLOCKS offset=94 len=120 comp=none uncompressed_len=120
+  kind=4 name=SKIP_IDX offset=214 len=75 comp=zstd uncompressed_len=104
+  kind=8 name=PAGE_DIR offset=289 len=164 comp=zstd uncompressed_len=193
+  kind=5 name=BLOOM offset=453 len=164 comp=none uncompressed_len=164
+  kind=6 name=POSTINGS offset=617 len=66 comp=none uncompressed_len=66
 skip_index level 0 (2 block(s)):
-  block[0] offset=0 len=105 crc32c=e97c8ea6 record_count=2 ts_range=[100, 200] stream_ref_range=[0, 0]
-    stat column_id=10 type=i64 min_bits=200 max_bits=504 null_count=0 has_nan=false
-  block[1] offset=105 len=109 crc32c=c009cac7 record_count=2 ts_range=[150, 250] stream_ref_range=[1, 1]
-    stat column_id=10 type=i64 min_bits=200 max_bits=401 null_count=0 has_nan=false
+  block[0] offset=0 len=113 crc32c=941f3f49 record_count=2 ts_range=[100, 200] stream_ref_range=[0, 0]
+    stat column_id=10 type=i64 min_bits=200 max_bits=504 null_count=0 has_nan=false resolved_min=200 resolved_max=504
+  block[1] offset=4 len=116 crc32c=88078374 record_count=2 ts_range=[150, 250] stream_ref_range=[1, 1]
+    stat column_id=10 type=i64 min_bits=200 max_bits=401 null_count=0 has_nan=false resolved_min=200 resolved_max=401
 stream_dir (2 entry(ies)):
   stream_ref=0 stream_id=01000000000000000000000000000000 blob_len=27 blocks=[0, 0]
   stream_ref=1 stream_id=02000000000000000000000000000000 blob_len=27 blocks=[1, 1]
@@ -228,9 +230,9 @@ field_dir (2 entry(ies)):
 Field by field:
 
 - `total_size`, `version`, `signal`: the byte length of the object, the
-  trailer format version (currently `3`; any other version gets a typed
-  error, with no dual-reader path, so a stored v2 object is unreadable rather
-  than migratable), and the signal byte (`2` = logs). Like
+  trailer format version (currently `4`; version 3 is still readable as the
+  N-1 half of the window, anything else gets a typed error), and the signal
+  byte (`2` = logs). Like
   RSEG, the object is footer-first-readable. The 16-byte trailer at the end
   gives the footer's length and crc. A reader therefore validates the footer
   in one suffix GET before it fetches anything else.
@@ -247,19 +249,27 @@ Field by field:
   the same convention that RSEG uses. An L0 flush object (every object shown in
   this guide) stamps the sentinels `level=0`, empty `input_set_hash`, and
   `part_index=0`. A future L1 compacted object carries real values.
-- `sections`: the five mandatory sections and their byte ranges. `kind=1`
+- `sections`: the mandatory sections and their byte ranges. `kind=1`
   `STREAM_DIR` (stream_id to canonical resource+scope blob and block range),
   `kind=2` `FIELD_DIR` (dynamic attribute columns), `kind=3` `BLOCKS` (the
-  columnar row blocks), `kind=4` `SKIP_IDX` (the multi-level min/max index),
-  `kind=5` `BLOOM` (per-block token blooms). STREAM_DIR, FIELD_DIR, and
-  SKIP_IDX use whole-section zstd (`comp=zstd`). BLOCKS and BLOOM are
-  containers that a reader reads entry by entry, so they are `comp=none`.
-  `comp` is printed by name (`none`/`zstd`).
+  columnar row blocks, in row groups since version 4), `kind=4` `SKIP_IDX`
+  (the multi-level min/max index), `kind=8` `PAGE_DIR` (per row group, per
+  column chunk, per page: offset, length, encoding, and crc32c -- version 4
+  only), `kind=5` `BLOOM` (per-block token blooms). `kind=6` `POSTINGS` is
+  optional and present here because the object declared an indexed field.
+  STREAM_DIR, FIELD_DIR, SKIP_IDX, and PAGE_DIR use whole-section zstd
+  (`comp=zstd`). BLOCKS and BLOOM are containers that a reader reads entry by
+  entry, so they are `comp=none`. `comp` is printed by name (`none`/`zstd`).
 - `skip_index level 0`: one line per row block. Each line gives its byte
   `offset` (into BLOCKS) and `len`, the `crc32c` that the reader verifies
   before it decodes the block, `record_count`, and the block's `ts_range` and
   `stream_ref_range` (both inclusive). The skip index prunes on those two
-  ranges. Under each block line is one `stat` line per numeric column the
+  ranges. Since trailer v4 (ADR-0699) `offset` and `len` describe the block's
+  *page span* rather than a contiguous block: the pages of a row group are
+  stored column-major, so consecutive blocks' spans overlap and the `crc32c`
+  covers the block's pages concatenated in column-id order rather than a
+  contiguous byte range. The pages themselves are located through `PAGE_DIR`.
+  Under each block line is one `stat` line per numeric column the
   block's records resolve a value for: `column_id`, `type`
   (`i64`/`f64`/`bool`/`bytes`), `min_bits`/`max_bits`, `null_count`, and
   `has_nan`. `min_bits`/`max_bits`

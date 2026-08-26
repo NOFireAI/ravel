@@ -308,6 +308,21 @@ pub fn open(bytes: &[u8]) -> Result<LogFooter, LogSegError> {
     }
 }
 
+/// The trailer's format version, without decoding the footer.
+///
+/// The version is what selects the BLOCKS layout (ADR-0699 decision 3), so a
+/// reader needs it alongside the section table, which does not carry it. This
+/// only reads the two trailer bytes; every other trailer and footer check is
+/// [`open`]'s, and a caller is expected to have called it.
+pub fn trailer_version(bytes: &[u8]) -> Result<u16, LogSegError> {
+    let trailer = bytes
+        .len()
+        .checked_sub(TRAILER_LEN)
+        .and_then(|at| bytes.get(at..))
+        .ok_or_else(|| LogSegError::Corrupted("object smaller than trailer".into()))?;
+    Ok(u16::from_le_bytes([trailer[8], trailer[9]]))
+}
+
 /// Opens a `.rlog` object from a suffix of its bytes (docs/log-segment-format.md
 /// "Reader protocol"). `suffix` is the last `suffix.len()` bytes of an object of
 /// `total_size` bytes. When the suffix covers the footer and trailer, this

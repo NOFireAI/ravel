@@ -2340,6 +2340,39 @@ impl BlockRangeFetcher {
             }
         };
 
+        // RLOG version 4 (ADR-0699) stores a row group's pages column-major, so
+        // a block is no longer a contiguous byte range and its SKIP_IDX
+        // `block_offset`/`block_len` describe a page span overlapping its
+        // neighbours', with the block crc defined over its pages in column_id
+        // order rather than over that span. The block-range protocol below
+        // assumes neither, so it reads a version-4 object whole -- the same
+        // bytes and the same one GET the pre-ADR-0107 path used, correct and no
+        // worse than before the bump.
+        //
+        // ADR-0699 decision 5 is what replaces this: PAGE_DIR turns each
+        // surviving `(row group, projected column)` into one coalesced range,
+        // which is strictly better than either path here. Until that lands, a
+        // version-4 object is fetched whole.
+        if footer.section(kind::PAGE_DIR).is_some() {
+            let (bytes, live) = self
+                .cached_extent(
+                    seg_ref,
+                    tenant_hash,
+                    0,
+                    total_size,
+                    GetRange::Full,
+                    &pin,
+                    accounting,
+                )
+                .await?;
+            if live {
+                stats.block_range_gets = 1;
+                stats.block_bytes_fetched = bytes.len() as u64;
+            }
+            stats.whole_object = true;
+            return Ok((bytes, stats));
+        }
+
         let skip_desc = footer
             .section(kind::SKIP_IDX)
             .ok_or_else(|| corrupt(key, LogSegError::Corrupted("missing SKIP_IDX".into())))?;

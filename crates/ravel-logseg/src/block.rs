@@ -1137,16 +1137,17 @@ pub fn read_block_columns(
 /// byte range: its pages live in its row group's column chunks, so locating and
 /// checksum-verifying them is the caller's job and this only decodes them.
 ///
-/// `pages` is the block's pages in `column_id` order -- the order PAGE_DIR
-/// lists them in and the order the SKIP_IDX level-0 block crc covers them in --
-/// each paired with its decompressed-to-encoded bytes, or with `None` for a
-/// column the projection dropped and whose stored bytes were therefore never
-/// read at all. That is the difference from version 3's projection: there a
-/// skipped page's bytes were present and merely not decompressed, here they
-/// never left the object store.
+/// `descs` is the block's page descriptors in `column_id` order -- the order
+/// PAGE_DIR lists them in and the order the SKIP_IDX level-0 block crc covers
+/// them in -- and `page_bytes` is the parallel decompressed-to-encoded bytes,
+/// `None` for a column the projection dropped and whose stored bytes were
+/// therefore never read at all. That is the difference from version 3's
+/// projection: there a skipped page's bytes were present and merely not
+/// decompressed, here they never left the object store.
 pub fn read_block_pages(
     record_count: usize,
-    pages: &[(PageDesc, Option<Vec<u8>>)],
+    descs: &[PageDesc],
+    page_bytes: &[Option<Vec<u8>>],
     plans: &[ColumnPlan],
     counters: PageCounters,
 ) -> Result<DecodedBlock, LogSegError> {
@@ -1155,15 +1156,13 @@ pub fn read_block_pages(
             "record_count {record_count} over cap"
         )));
     }
-    if pages.len() as u64 > MAX_PAGES {
+    if descs.len() as u64 > MAX_PAGES {
         return Err(LogSegError::Corrupted(format!(
             "page_count {} over cap",
-            pages.len()
+            descs.len()
         )));
     }
-    let descs: Vec<PageDesc> = pages.iter().map(|(d, _)| *d).collect();
-    let page_bytes: Vec<Option<Vec<u8>>> = pages.iter().map(|(_, b)| b.clone()).collect();
-    decode_columns(record_count, &descs, &page_bytes, plans, counters)
+    decode_columns(record_count, descs, page_bytes, plans, counters)
 }
 
 /// How much of a block's page bytes a read actually touched
