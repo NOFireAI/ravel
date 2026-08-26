@@ -1,40 +1,43 @@
 # RLOG: Ravel Log Segment Format
 
 Persistent contract (ADR-0029). Any change bumps the trailer version. The
-current trailer version is 3 (ADR-0095 redefined what a SKIP_IDX numeric stat
-means; version 2 added the footer's compaction-identity fields and version 1 was
-the format-only initial release, and no reader accepts either any longer).
+current trailer version is 4 (ADR-0699 moved BLOCKS to row groups with
+column-major page placement and added PAGE_DIR). Version 3 is **readable and
+not written**: it is the N-1 half of the supported window, described in its own
+subsection under "BLOCKS" below. Version 2 added the footer's
+compaction-identity fields and version 1 was the format-only initial release;
+no reader accepts either any longer.
 
-Version 3 changes no byte layout: it changes which value a `NumStat` bounds
+Version 4 changes the BLOCKS layout, deletes the per-block header, and
+redefines the SKIP_IDX level-0 block crc, so it is a versioned change rather
+than the additive kind ADR-0029's carve-out excepts -- whatever PAGE_DIR's own
+kind number would imply on its own. Which layout an object uses is determined
+by its trailer version, and mirrored by whether it carries a PAGE_DIR section.
+
+Version 3 changed no byte layout: it changed which value a `NumStat` bounds
 (see "SKIP_IDX" below). Nothing in the bytes distinguishes a v2 stat from a v3
 one, which is exactly why the trailer version moved rather than a section-local
-one. v2 read and write support is deleted in the same change that introduced v3,
-so every stored v2 object is unreadable by a v3 build; there is no dual-reader
-window and no `maintain migrate` path for this transition (a single-version
-reader cannot open its own inputs to rewrite them). Convergence is retention
-aging those objects out, or re-ingestion.
+one. v2 read and write support was deleted in the same change that introduced
+v3.
 
 **Version lifecycle and migration (ADR-0066, normative).** RLOG is a Class A
-bulk data-object format. Until first public release, ADR-0032's
-single-supported-version rule stands: the reader accepts only the current
-trailer version. From first release onward the supported-version window is
-N/N-1 (single-sourced as `ravel_logseg::footer::SUPPORTED_VERSIONS`; the writer,
-reader gate, `audit-versions`, `migrate`, and the compactor's output-version
-constant all read it), rolled out readers-before-writers: a release writing N+1
+bulk data-object format. The supported-version window is N/N-1 (single-sourced
+as `ravel_logseg::footer::SUPPORTED_VERSIONS`; the writer, reader gate,
+`audit-versions`, `migrate`, and the compactor's output-version constant all
+read it), rolled out readers-before-writers: a release writing N+1
 requires a fleet already reading N+1. RLOG compaction already decodes every
-input's records and re-encodes them from scratch, so once that window exists an
-old-version object is migrated forward by the normal compaction and
-`maintain migrate` paths with no special page-copy carve-out; retention also
-ages old objects out. The migrate job verifies and raises the per-(tenant,
-signal) format floor, and N-1 read support is deleted only once every bucket's
-floor is >= N, citing those floors.
+input's records and re-encodes them from scratch, so an old-version object is
+migrated forward by the normal compaction and `maintain migrate` paths with no
+special page-copy carve-out; retention also ages old objects out. The migrate
+job verifies and raises the per-(tenant, signal) format floor, and N-1 read
+support is deleted only once every bucket's floor is >= N, citing those floors.
 
-Today, pre-release, that window is one version wide, so neither path can touch
-an object below it: compaction and `migrate` both go through the reader, and the
-reader refuses the old version outright. A bump therefore strands every stored
-object at the previous version until retention or re-ingestion replaces it
-(ADR-0095 for the v2 → v3 bump). `audit-versions` is what reports live objects
-left behind.
+The v3 → v4 bump (ADR-0699 decision 3) is the first RLOG bump to ship a dual
+reader, so the window is two versions wide: `{3, 4}`. Both paths can therefore
+migrate forward -- compaction always emits version 4, so a compacted tenant
+converges in one pass, and `maintain migrate` rewrites the rest.
+`audit-versions` reports the mix. A tenant that is never compacted keeps paying
+version-3 read costs (whole blocks on the wire) until it is.
 
 Parsers treat every offset, length, count, and tag read from stored bytes
 as untrusted input: bounds-check everything, overflow-check every
@@ -57,21 +60,24 @@ encodings.
 | FIELD_DIR    field directory                      |  kind 2
 | BLOCKS       row blocks (column pages)            |  kind 3
 | SKIP_IDX     multi-level min/max index            |  kind 4
+| PAGE_DIR     per row group, per column chunk,     |  kind 8
+|              per page: offset/len/enc/comp/crc    |
 | BLOOM        per-block token blooms               |  kind 5
 | POSTINGS     per-field term -> block postings     |  kind 6 (optional)
 | footer: LogFooter protobuf bytes                  |
 | trailer (16 bytes):                               |
 |   footer_len:   u32                               |
 |   footer_crc32c:u32                               |
-|   version:      u16   (= 3)                       |
+|   version:      u16   (= 4)                       |
 |   signal:       u8    (2 = logs)                  |
 |   reserved:     u8    (= 0)                       |
 |   magic:        [u8;4] = "RLG1"                   |
 +---------------------------------------------------+
 ```
 
-Writers emit the sections physically in kind order (1..6); readers rely
-only on the footer's section offsets, never on adjacency. Bytes between
+Writers emit the sections physically in the order shown above (PAGE_DIR
+between SKIP_IDX and BLOOM, not in kind order); readers rely only on the
+footer's section offsets, never on adjacency or on kind order. Bytes between
 sections are permitted and MUST be `0x00`; readers never interpret them.
 
 `footer_crc32c` is computed over: the `LogFooter` bytes, then `footer_len`
@@ -131,9 +137,10 @@ they need no separate checksum.
 Validation (all violations `Corrupted`, never panics):
 
 - At most one section per known kind. All five v1 kinds
-  (STREAM_DIR, FIELD_DIR, BLOCKS, SKIP_IDX, BLOOM) are mandatory. POSTINGS
-  (kind 6, ADR-0049) is optional: present only when the writer was given
-  one or more indexed field names (`RlogWriter::with_indexed_fields`);
+  (STREAM_DIR, FIELD_DIR, BLOCKS, SKIP_IDX, BLOOM) are mandatory. PAGE_DIR
+  (kind 8, ADR-0699) is mandatory in version 4 and absent in version 3.
+  POSTINGS (kind 6, ADR-0049) is optional: present only when the writer was
+  given one or more indexed field names (`RlogWriter::with_indexed_fields`);
   absence is legal and never treated as corruption.
 - Every section `[offset, offset+len)` lies within
   `[0, total_size - 16 - footer_len)`, with overflow-checked arithmetic.
@@ -268,8 +275,87 @@ Records are sorted `(stream_ref ascending, ts_ns ascending)`. Target 8192
 records per block, cap 8 MiB uncompressed. Per block, one page per column
 that has at least one value in the block.
 
+A **block** is a logical unit, not a byte range. It is what SKIP_IDX level 0,
+BLOOM, and POSTINGS are keyed by, and nothing about its size or its pruning
+granularity changed in version 4.
+
+A **row group** is a run of `group_target_blocks` consecutive blocks (writer
+configuration, default 32, so 262,144 records at the block target). BLOCKS is
+the object's row groups laid end to end in block order. Within a row group the
+pages are stored **grouped by column, then by block**: all of one column's
+pages for that group's blocks are contiguous (a **column chunk**), and the
+column chunks of one row group follow each other in ascending `column_id`
+order. The last row group of an object is short; an object with fewer blocks
+than `group_target_blocks` has exactly one row group, and its layout is the
+same, so a small flush object pays nothing for the level (ADR-0699 decision 1).
+
 ```
-block:
+BLOCKS (version 4):
+  row group 0 (blocks 0..31):
+    chunk column 0:   page(b0) page(b1) ... page(b31)
+    chunk column 1:   page(b0) page(b1) ... page(b31)
+    ...
+    chunk column 104: page(b0) page(b1) ... page(b31)
+  row group 1 (blocks 32..63):
+    ...
+```
+
+There is no block header. Every page's `column_id`, `enc`, `comp`, `len`, and
+`uncomp_len` -- the fields a version-3 block header carried inline -- live in
+PAGE_DIR, together with the page's offset and its own crc32c. A page a query
+does not want is therefore never read at all, rather than fetched and walked
+past.
+
+A column with values in only some rows of a block carries a presence
+bitmap page (a bitmap-encoded page, `enc = 8`) immediately before the value
+page, so decode restores exact row alignment. Both pages sit in the same column
+chunk, in that order, so one block contributes one or two pages to one chunk.
+A column absent from every row of a block is all-null and occupies zero bytes,
+and contributes no page to the chunk.
+
+The block's crc32c is stored in its SKIP_IDX level-0 entry, not inline, and
+covers the concatenation of the block's pages in ascending `column_id` order --
+which is what a whole-block read assembles once it has located them through
+PAGE_DIR, and is the order PAGE_DIR lists them in. A whole-block reader
+verifies it; a reader taking a subset of the columns cannot (it does not have
+the other pages) and verifies each page's own crc32c instead. Both are
+mandatory on their own access path, which is what keeps every interpreted byte
+checksum-covered (ADR-0010 §4, "Checksum coverage map" below).
+
+A reader may decode a *subset* of a block's columns (`read_block_columns`,
+ADR-0087); the SQL logs scan uses this to decode only the columns a query
+references. Under version 4 the subset is also a *fetch* subset: PAGE_DIR gives
+each column chunk's byte extent, so a projection of `k` columns over a row
+group is `k` contiguous ranges instead of one range per block. A skipped column
+is indistinguishable from an absent one in the decoded result, so a reader that
+projects is responsible for having asked for every column it goes on to read.
+
+`block_offset` and `block_len` in a version-4 SKIP_IDX level-0 entry describe
+the block's *page span*: from its first page's offset to the end of its last.
+Because the pages are column-major, that span overlaps its neighbours' and
+covers most of the row group. It is a superset range containing every one of
+the block's pages, not the block's exact extent, and nothing locates a
+version-4 page through it.
+
+```
+   one row block, columnar (unchanged by version 4; only page placement moved):
+
+   rows ->   r0 r1 r2 r3 r4 ... r8191
+   ts        [ delta / double-delta page       ]
+   stream    [ RLE page: (ref,run)(ref,run) ...]
+   sev_num   [ bit-packed FOR page             ]
+   body      [ string plain: lengths | blob    ]
+   attr.k    [ presence bitmap | FOR page      ]
+```
+
+### Version 3 (readable, not written)
+
+A version-3 object has no PAGE_DIR and no row groups. Each block is one
+contiguous byte range at its SKIP_IDX level-0 `block_offset`, of exactly
+`block_len` bytes, and consecutive blocks follow each other:
+
+```
+block (version 3):
   header:
     record_count: varint
     page_count:   varint
@@ -283,35 +369,62 @@ block:
          each `len` bytes
 ```
 
-A column with values in only some rows of a block carries a presence
-bitmap page (a bitmap-encoded page, `enc = 8`) paired with the value
-page, so decode restores exact row alignment. A column absent from a
-block is all-null and occupies zero bytes. The block's crc32c (stored in
-its SKIP_IDX level-0 entry, not inline) covers the complete block bytes
-(header and all pages); the reader verifies it before decoding anything
-in the block.
+The pages are in descriptor order, which is the block encoder's staging order:
+the fixed columns in field order (so `flags`, column 8, precedes
+`severity_text`, column 4), then the dynamic columns ascending. The block's
+crc32c covers the complete block bytes, header and all pages, and the reader
+verifies it before decoding anything in the block. A column-subset decode is a
+read choice and not a format variant: the crc32c is still verified over the
+complete block bytes, every page descriptor is still parsed, and every page's
+stored extent is still walked, so a truncated or over-long block is rejected
+exactly as it is under a whole-block decode.
 
-A reader may decode a *subset* of a block's columns. The page header names each
-page's `column_id` and stored length, so a reader walks past a page it does not
-want without decompressing it (`read_block_columns`, ADR-0087); the SQL logs
-scan uses this to decode only the columns a query references. This is a read
-choice, not a format variant: the crc32c is still verified over the complete
-block bytes, every page descriptor is still parsed, and every page's stored
-extent is still walked, so a truncated or over-long block is rejected exactly
-as it is under a whole-block decode. A skipped column is indistinguishable from
-an absent one in the decoded result, so a reader that projects is responsible
-for having asked for every column it goes on to read.
+The version-3 reader is the N-1 half of the supported-version window and is
+deleted only by its own reviewed change, once every bucket's recorded format
+floor is at 4 (ADR-0066 decision 1, ADR-0699 decision 3).
+
+## PAGE_DIR (uncompressed form)
+
+Mandatory in version 4, absent in version 3. Compressed as a whole section and
+covered by its `Section.crc32c`, like SKIP_IDX: it is read whole on every open,
+because without it no page can be located at all. A corrupt or undecodable
+PAGE_DIR is a loud `Corrupted` error and never a degrade.
 
 ```
-   one row block, columnar:
-
-   rows ->   r0 r1 r2 r3 r4 ... r8191
-   ts        [ delta / double-delta page       ]
-   stream    [ RLE page: (ref,run)(ref,run) ...]
-   sev_num   [ bit-packed FOR page             ]
-   body      [ string plain: lengths | blob    ]
-   attr.k    [ presence bitmap | FOR page      ]
+group_count: varint
+group_count groups:
+  first_block: varint      index of the group's first block, whole-object
+  block_count: varint
+  chunk_count: varint
+  chunk_count chunks:
+    column_id:   varint
+    offset:      varint    absolute offset of the chunk's first page, into BLOCKS
+    page_count:  varint
+    page_count pages:
+      block:       varint  block index within the group, ascending
+      enc:         u8      encoding tag (see registry)
+      comp:        u8      0=none, 2=zstd
+      len:         varint  stored page bytes
+      uncomp_len:  varint  page bytes before compression
+      crc32c:      u32     over the page's stored bytes
 ```
+
+Page offsets are derived, not stored: a chunk's pages are contiguous from the
+chunk's `offset` in listed order, so the *n*th page begins at `offset` plus the
+`len`s of the pages before it. That makes the section about 14 bytes per page:
+a few KB for a two-block flush object, about 1.5 MB for a 10M-row L1 part with
+105 columns, read once per object per query.
+
+Two entries may name the same `block` within one chunk: a partially present
+column contributes its presence bitmap page and then its value page, so
+`page_count` is the number of *pages* the group's blocks carry for the column,
+between one and two per block that carries it -- not the number of blocks that
+carry it.
+
+Groups partition the object's blocks into consecutive runs starting at block 0:
+the first group's `first_block` is 0 and each subsequent group's continues
+where the previous ended. The whole directory's `block_count` total equals the
+SKIP_IDX level-0 entry count.
 
 ## Encodings (tag registry)
 
@@ -440,9 +553,12 @@ descends only into survivors, so pruning cost scales with surviving data.
 ```
 count0: u32
 count0 level-0 entries:
-  block_offset:   varint   (into BLOCKS)
+  block_offset:   varint   (into BLOCKS; version 4: the block's page span,
+                           see "BLOCKS")
   block_len:      varint
-  block_crc32c:   u32      crc32c over the block's complete stored bytes
+  block_crc32c:   u32      crc32c over the block's pages concatenated in
+                           ascending column_id order (version 4) or over the
+                           block's complete stored bytes (version 3)
   record_count:   varint
   min_ts, max_ts: ivarint
   min_stream_ref, max_stream_ref: varint
@@ -816,6 +932,13 @@ means -- with no byte a reader could use to tell the two meanings apart -- is
 precisely the case the carve-out does not cover, so it took the trailer bump
 to 3 (ADR-0095).
 
+Adding PAGE_DIR would have been free under the same carve-out, but version 4
+is not an additive change: it re-lays BLOCKS, deletes the block header, and
+redefines the SKIP_IDX level-0 block crc. Those are exactly the
+existing-section grammar changes the carve-out does not cover, so it took the
+trailer bump to 4 (ADR-0699 decision 3), which is also what lets the version
+byte, rather than a section's presence, be what selects the layout.
+
 ## Compaction (L0 → L1)
 
 Compaction (ADR-0032) rewrites many small L0 `.rlog` flush
@@ -846,9 +969,14 @@ The merge is defined entirely in terms of this format:
   blobs; a disagreement is an upstream identity violation or a hash
   collision and is a hard, typed error (the cross-object form of the
   single-writer `InconsistentStreamAttrs` check), never a silent pick.
-- **Re-sort and re-block.** The merged records are re-sorted by
+- **Re-sort, re-block, and re-group.** The merged records are re-sorted by
   `(stream_ref ascending, ts ascending)` and re-chunked at the same 8192
-  record block target. There is no record-level dedup: distinct
+  record block target, then placed into row groups of `group_target_blocks`
+  consecutive blocks with their pages column-major (ADR-0699 decision 1).
+  Compaction is where full row groups arise: an L0 flush object is usually one
+  short group, an L1 part is many full ones, which is what makes a narrow
+  projection over a compacted tenant a few contiguous ranges per object
+  instead of one per block. There is no record-level dedup: distinct
   submissions of identical content are distinct records (the write path
   makes retry duplicates structurally impossible), so the L1 object holds
   the union of all inputs' records.
@@ -895,7 +1023,9 @@ its access path (ADR-0010 §4):
 | STREAM_DIR stored bytes | `Section.crc32c` | footer section entry | before decoding the section |
 | FIELD_DIR stored bytes | `Section.crc32c` | footer section entry | before decoding the section |
 | SKIP_IDX stored bytes | `Section.crc32c` | footer section entry | before decoding the section |
-| one BLOCKS block's stored bytes | `block_crc32c` | that block's SKIP_IDX level-0 entry | before decoding the block |
+| PAGE_DIR stored bytes | `Section.crc32c` | footer section entry | before decoding the section |
+| one page's stored bytes | that page's `crc32c` | PAGE_DIR (version 4) | before decompressing the page |
+| one block's pages concatenated in `column_id` order (v4), or its complete bytes including its header (v3) | `block_crc32c` | that block's SKIP_IDX level-0 entry | before decoding the block, by a reader that took every page of it |
 | one BLOOM entry's stored bytes | per-entry `crc32c` | BLOOM container framing | before probing the entry |
 | POSTINGS header (`column_id`, `capped`, `stride`, counts, `first_term`s, offsets, for every field) | whole-section `Section.crc32c` | footer section entry | before `PostingsSection::parse`, in `RlogReader::scan` |
 | one POSTINGS term block's stored bytes | per-block `crc32c` | POSTINGS sparse-index entry | before decompressing the block a probe lands on |
@@ -903,8 +1033,16 @@ its access path (ADR-0010 §4):
 BLOCKS and BLOOM have no whole-section crc because they are never read
 whole: a selective scan touches a handful of blocks or blooms, and a
 whole-section crc could not be verified without fetching the whole
-section, defeating the point. Their per-block and per-entry crc32c are
-the access-path-verifiable equivalents.
+section, defeating the point. Their per-page, per-block, and per-entry
+crc32c are the access-path-verifiable equivalents.
+
+Version 4's per-page crc32c exists for the same reason one level down. A
+reader that fetched two of a hundred columns holds no more than those two
+columns' pages, so it cannot verify the block crc without fetching the block
+and defeating the projection. Every page it decompresses is covered by its own
+checksum instead, and the `enc`/`comp` tags that decide how to interpret it sit
+under PAGE_DIR's section crc, so a flipped tag fails a checksum before it can
+cause a misdecode.
 
 POSTINGS is read differently: `scan` always reads the section's stored
 bytes in full to reach any block within it, so its whole-section
@@ -987,4 +1125,17 @@ All violations are `Corrupted`, never panics:
   trailing bytes left over once the declared term count is consumed; a
   declared term or posting count the block's remaining bytes cannot
   support.
+- page_dir: whole-section crc mismatch (checked before the section is decoded
+  at all, so no offset in it is ever followed unverified); a group count over
+  `MAX_BLOCKS`; a group with no blocks or no chunks; a group whose
+  `first_block` does not continue where the previous group ended (catches both
+  a gap and an overlap in the block partition); a chunk count above what the
+  group's blocks could carry pages for (`block_count * MAX_PAGES`);
+  non-ascending `column_id` across a group's chunks; a page count outside
+  `1..=2 * block_count`; a page naming a block outside its group or going
+  backwards within a chunk; an unknown `enc` tag; an overflowing chunk length
+  or extent; a chunk whose extent ends past the BLOCKS section; a total block
+  count disagreeing with the SKIP_IDX level-0 entry count; truncation; trailing
+  bytes.
+- page crc mismatch (version 4, before the page is decompressed).
 - block crc mismatch.
