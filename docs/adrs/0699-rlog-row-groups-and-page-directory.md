@@ -293,3 +293,58 @@ SKIP_IDX L0: per block, block range+crc  SKIP_IDX L0: per block, stats + crc (pa
 read 2 columns of 32 blocks:            read 2 columns of 32 blocks:
   32 GETs x whole block (~600 KB each)    2 GETs x one chunk (~200 KB each)
 ```
+
+## Amendment (2026-08-26, as implemented)
+
+The writer, PAGE_DIR codec, and dual reader landed as decisions 1-4 describe.
+Three points the decision text under-specified were resolved during
+implementation; this section records them against the code that shipped, and
+`docs/log-segment-format.md` is the normative statement of each. It amends, it
+does not supersede.
+
+1. **Block crc folding order vs page staging order.** Decision 2 defines the
+   retained SKIP_IDX level-0 block crc as crc32c over the block's pages
+   concatenated in `column_id` order. That is the order a whole-block reader
+   assembles and it is what shipped, but it is *not* the order the block
+   encoder stages pages in: the fixed columns are staged in field order, so
+   `flags` (column 8) is staged before `severity_text` (column 4). The crc is
+   therefore accumulated while the row group is placed -- folding each block's
+   pages in the `column_id` order PAGE_DIR lists its chunks in, not over the
+   encoder's field-order payload buffer -- and the reader verifies it the same
+   way (`decode_v4_block`). The block crc is a check on PAGE_DIR's placement
+   claim (right bytes, right order), never taken over a contiguous block extent,
+   which under version 4 no longer exists.
+
+2. **Page count per chunk is bounded by 2 x blocks, not 1 x blocks.** Decision
+   2's PAGE_DIR schema annotates `page_count` as "the number of blocks in this
+   group that carry the column". A partially present column carries a presence
+   bitmap page in addition to its value page, so a chunk holds up to two pages
+   per block. PAGE_DIR's decode enforces the real bound, `2 * block_count`, and
+   the format doc states it.
+
+3. **SKIP_IDX level-0 `block_offset`/`block_len` are a superset page span under
+   version 4.** Decision 1 says a block is no longer a contiguous byte range.
+   The level-0 fields are retained, but under version 4 they describe the
+   block's page span -- from its first page's offset to the end of its last --
+   which overlaps its neighbours' spans and is a superset of the block's actual
+   bytes. Nothing locates a version-4 page through them; PAGE_DIR does that.
+   They remain exact under version 3.
+
+### Interim ravel-query reader (decision 5 not yet landed)
+
+Decision 5 (the PAGE_DIR-driven column-chunk fetcher) is not part of this
+change. Until it lands, every reader outside `ravel-logseg` that a version-4
+object reaches reads the object whole in one `GetRange::Full` GET rather than by
+block range: the ADR-0107 block-range protocol addresses a block by its SKIP_IDX
+byte range and verifies the block crc over exactly those bytes, and version 4
+makes neither hold (point 1 and point 3 above). A whole-object read is the same
+bytes and the same one GET the pre-ADR-0107 path used -- correct and no worse
+than before the version bump, strictly worse than decision 5 will be. This is a
+single guard in `LogSegmentFetcher::fetch_object_with_footer`, placed after the
+footer is resolved so it covers both the suffix-probe path and the plan-carried
+footer path (#693 part 3), and is pinned by
+`version_4_object_is_read_whole_until_the_page_dir_fetcher_lands` in
+`crates/ravel-query/tests/log_block_range.rs`. That test is what the decision-5
+fetcher half turns into its column-chunk assertion: the same fixture, asserting
+one coalesced ranged GET per surviving `(row group, projected column)` instead
+of one whole-object GET.
