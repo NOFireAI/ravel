@@ -145,6 +145,10 @@ async fn publish_dataset(store: Arc<dyn ObjectStoreBackend>) -> TenantId {
         continue_on_error: false,
         fetch_concurrency: DEFAULT_FETCH_CONCURRENCY,
         progress_jsonl: None,
+        tenant_max_bytes: ravel_bench::sql_latency::DEFAULT_TENANT_MAX_BYTES,
+        parallel_final_aggregation: false,
+        max_segments: ravel_query::DEFAULT_MAX_SEGMENTS,
+        explain_dir: None,
     })
     .await
     .expect("generated lane publishes the dataset");
@@ -237,6 +241,10 @@ fn flight_cfg(
         continue_on_error,
         fetch_concurrency: DEFAULT_FETCH_CONCURRENCY,
         progress_jsonl,
+        tenant_max_bytes: ravel_bench::sql_latency::DEFAULT_TENANT_MAX_BYTES,
+        parallel_final_aggregation: false,
+        max_segments: ravel_query::DEFAULT_MAX_SEGMENTS,
+        explain_dir: None,
         flight: Some(flight),
     }
 }

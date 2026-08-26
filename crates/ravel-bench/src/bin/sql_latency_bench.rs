@@ -60,6 +60,29 @@ struct Args {
     /// measured budget byte-for-byte unchanged.
     #[arg(long = "sql-max-query-bytes", value_name = "BYTES", default_value_t = DEFAULT_MAX_QUERY_BYTES)]
     sql_max_query_bytes: usize,
+    /// The engine's `max_segments` ceiling, the same knob as `ravel-server
+    /// --max-segments`: the number of sealed, below-watermark segments a
+    /// statement may fan out over before it is refused with `query fans out
+    /// over too many segments` (ADR-0073 decision 2). Only sealed,
+    /// below-watermark segments count, so a freshly loaded tenant can sit far
+    /// above this and only trip it once a fold seals its hours; raise it to
+    /// measure such a folded tenant. Defaults to ravel-query's compiled-in
+    /// 1024, so an unset flag leaves the ceiling unchanged; recorded in the
+    /// report's provenance.
+    #[arg(long = "sql-max-segments", value_name = "N", default_value_t = ravel_query::DEFAULT_MAX_SEGMENTS)]
+    sql_max_segments: usize,
+    /// Before measuring each statement, write its physical plan to
+    /// `<explain-dir>/<id>.txt` (one file per statement), so the DataFusion
+    /// optimizer rules that fired (AggregateStatistics,
+    /// single_distinct_to_groupby, pushdown) are readable per statement without
+    /// a debugger. The plans are a side artifact: they are not timed and never
+    /// part of the report's numbers. Requires `--explain-dir`.
+    #[arg(long, requires = "explain_dir")]
+    explain: bool,
+    /// Directory the `--explain` physical plans are written to, one
+    /// `<id>.txt` per statement. Required when `--explain` is set.
+    #[arg(long = "explain-dir", value_name = "DIR", requires = "explain")]
+    explain_dir: Option<std::path::PathBuf>,
 
     // --- generated lane knobs ---------------------------------------------
     /// Distinct log records to generate.
@@ -232,6 +255,14 @@ async fn run(args: &Args) -> Result<SqlLatencyReport, ravel_bench::sql_latency::
     let (store_backend, region, endpoint) = provenance_strings(args.store);
     let store = store_from_env(args.store);
 
+    // `--explain` requires `--explain-dir` (clap enforces it), so a set
+    // `--explain` always carries a directory; an unset flag writes no plans.
+    let explain_dir = if args.explain {
+        args.explain_dir.clone()
+    } else {
+        None
+    };
+
     match &args.tenant {
         Some(tenant) => {
             let now_secs = args.now_secs.unwrap_or_else(|| {
@@ -266,6 +297,8 @@ async fn run(args: &Args) -> Result<SqlLatencyReport, ravel_bench::sql_latency::
                 progress_jsonl: args.progress_jsonl.clone(),
                 tenant_max_bytes: args.sql_tenant_max_bytes,
                 parallel_final_aggregation: args.sql_parallel_final_aggregation,
+                max_segments: args.sql_max_segments,
+                explain_dir: explain_dir.clone(),
                 flight: args.flight.as_ref().map(|endpoint| FlightTarget {
                     endpoint: endpoint.clone(),
                     token: args.flight_token.clone().or_else(|| {
@@ -299,6 +332,8 @@ async fn run(args: &Args) -> Result<SqlLatencyReport, ravel_bench::sql_latency::
                 progress_jsonl: args.progress_jsonl.clone(),
                 tenant_max_bytes: args.sql_tenant_max_bytes,
                 parallel_final_aggregation: args.sql_parallel_final_aggregation,
+                max_segments: args.sql_max_segments,
+                explain_dir: explain_dir.clone(),
             };
             run_generated(&cfg).await
         }
@@ -328,6 +363,10 @@ fn print_human_table(report: &SqlLatencyReport) {
     println!(
         "  tenant max : {} bytes  parallel final agg: {}",
         p.tenant_max_bytes, p.parallel_final_aggregation
+    );
+    println!(
+        "  max segs   : {}  explain: {}",
+        p.sql_max_segments, p.explain
     );
     if p.cache_bytes > 0 {
         println!("  read cache : {} bytes", p.cache_bytes);
