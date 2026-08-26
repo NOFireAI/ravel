@@ -75,11 +75,15 @@
 //! Instead, [`build_parts`] merges each stream through one
 //! [`StreamCursor`] per input that decodes exactly one block at a time
 //! ([`RlogRangeReader::stream_blocks`] +
-//! [`RlogRangeReader::decode_block`]), fetching the next block's bytes by range
-//! only once the previous block is drained (one block ahead: the fetch for
-//! block `n + 1` rides along with block `n`'s, so the cursor advances two
-//! blocks per round trip while its raw residency stays at two blocks). A
-//! record's `(stream_ref, ts)`
+//! [`RlogRangeReader::decode_block_in_group`]), fetching the next range only
+//! once the previous one is drained (one ahead: the fetch for range `n + 1`
+//! rides along with range `n`'s, so the cursor advances two ranges per round
+//! trip while its raw residency stays at two). The fetched range is one block
+//! under version 3 and one row group under version 4, whose blocks' pages are
+//! spread across its column chunks (ADR-0699 decision 1); the group's raw
+//! bytes are held while its blocks are decoded out of them one at a time, so
+//! the decoded term is a block in both versions (issue #748). A record's
+//! `(stream_ref, ts)`
 //! stored order makes each input's stream one ts-ascending sequence spread
 //! across ascending blocks, so N inputs carrying the same stream are a standard
 //! k-way merge ordered by `ts_ns`, ties broken by canonical input order. That
@@ -92,7 +96,9 @@
 //! Peak resident memory is then: per-input catalog metadata (KBs per input,
 //! unchanged by the k-way merge), plus at most one decoded block per input
 //! carrying the current stream (`O(input_count * block_size)`, independent of
-//! stream size), plus the in-progress part's writer buffer. The writer buffer
+//! stream size) and the raw bytes of the range that block came from
+//! (`O(input_count * group_size)` under version 4, stored bytes rather than
+//! decoded records), plus the in-progress part's writer buffer. The writer buffer
 //! is bounded by `max_l1_part_bytes`: [`PartSink`] closes the in-progress part
 //! as soon as its [`estimate_record`] total reaches the cap, wherever in the
 //! merged record sequence that falls, so a stream may span consecutive parts.
@@ -678,26 +684,45 @@ impl PartBuilder {
 /// One input's cursor over a single stream's records, yielding them in stored
 /// (ts-ascending) order one block at a time. At most one decoded block is
 /// resident: `head` is the next record to merge, `block` holds the rest of the
-/// current block, and the next block's bytes are fetched by range only once the
-/// current block is drained. `input_index` is the cursor's
+/// current block, and the next block is decoded only once the current one is
+/// drained. `input_index` is the cursor's
 /// canonical position in `catalogs`, the k-way merge's tie-break on equal
 /// `ts_ns`.
+///
+/// The fetch unit and the decode unit differ under RLOG version 4. A version-4
+/// block's pages are spread across its row group's column chunks (ADR-0699
+/// decision 1), so the smallest contiguous range that holds one block is its
+/// whole row group: `locs` is one loc per group and each is fetched with one
+/// ranged GET. The *decoded* unit stays one block: `group` keeps the fetched
+/// group's raw (still compressed) bytes while its blocks are decoded one at a
+/// time out of them, each released before the next is decoded (issue #748).
+/// Under version 3 a loc is a single block and the two units coincide, which is
+/// why this is one code path and not two.
 struct StreamCursor<'a> {
     input_index: usize,
     object_key: &'a str,
     reader: &'a RlogRangeReader,
     /// Candidate blocks for the stream, ascending (ts-ascending for the
-    /// stream), consumed front to back via `next_loc`.
+    /// stream), one loc per row group under version 4 and one per block under
+    /// version 3, consumed front to back via `next_loc`.
     locs: Vec<StreamBlockLoc>,
     next_loc: usize,
+    /// The current loc's raw bytes, held while its blocks are decoded one at a
+    /// time, and dropped as its last block is decoded. `None` between locs.
+    group: Option<(StreamBlockLoc, bytes::Bytes)>,
+    /// The raw byte count `group` still has charged to the tracker's fetched
+    /// term, released when the group's last block is decoded.
+    group_raw_bytes: u64,
+    /// How many of `group`'s blocks have been decoded already.
+    decoded_in_group: usize,
     /// Remaining records of the current decoded block.
     block: std::vec::IntoIter<LogRecord>,
     /// The current block's decoded-byte estimate, held live in the tracker
     /// until the block is released.
     block_bytes: u64,
-    /// The next block's raw bytes, already fetched (issue #711). At most one:
-    /// the prefetch is one block ahead, so the cursor's raw-byte residency is
-    /// two blocks, not the stream.
+    /// The next loc's raw bytes, already fetched (issue #711). At most one:
+    /// the prefetch is one loc ahead, so the cursor's raw-byte residency is
+    /// two locs, not the stream.
     prefetched: Option<(StreamBlockLoc, bytes::Bytes)>,
     /// The next record to merge, or `None` once the cursor is exhausted.
     head: Option<LogRecord>,
@@ -721,6 +746,9 @@ impl<'a> StreamCursor<'a> {
             reader: &catalog.reader,
             locs,
             next_loc: 0,
+            group: None,
+            group_raw_bytes: 0,
+            decoded_in_group: 0,
             block: Vec::new().into_iter(),
             block_bytes: 0,
             prefetched: None,
@@ -745,10 +773,11 @@ impl<'a> StreamCursor<'a> {
     }
 
     /// Load the next record into `head`: the next record of the current block,
-    /// or the first record of the next non-empty block (fetched by range and
-    /// decoded here), or `None` when the stream is exhausted in this input. At
-    /// most one decoded block plus at most two blocks' raw bytes (the one being
-    /// decoded and the one prefetched behind it) are resident at a time.
+    /// or the first record of the next non-empty block (decoded here out of the
+    /// current loc's bytes, fetching the next loc by range when the current one
+    /// is spent), or `None` when the stream is exhausted in this input. At most
+    /// one decoded block plus at most two locs' raw bytes (the one being decoded
+    /// from and the one prefetched behind it) are resident at a time.
     async fn refill(
         &mut self,
         store: &dyn ObjectStoreBackend,
@@ -758,30 +787,85 @@ impl<'a> StreamCursor<'a> {
             self.head = Some(rec);
             return Ok(());
         }
-        // Current block drained: release it and pull the next non-empty block.
+        // Current block drained: release it and decode the next non-empty one.
         self.release_block(tracker);
-        while let Some((loc, data)) = self.next_raw_block(store, tracker).await? {
-            let raw_len = data.len() as u64;
-            let recs = self.reader.decode_block(&loc, data.as_ref())?;
-            let decoded_bytes: u64 = recs.iter().map(estimate_record).sum();
+        loop {
+            if let Some(recs) = self.decode_next_block(tracker)? {
+                self.block = recs.into_iter();
+                if let Some(rec) = self.block.next() {
+                    self.head = Some(rec);
+                    return Ok(());
+                }
+                // A candidate block with no row for this stream (a neighbour's
+                // boundary block): release and try the next.
+                self.release_block(tracker);
+                continue;
+            }
+            // The current loc is fully decoded: fetch the next one.
+            match self.next_raw_block(store, tracker).await? {
+                Some((loc, data)) => {
+                    self.group_raw_bytes = data.len() as u64;
+                    self.decoded_in_group = 0;
+                    self.group = Some((loc, data));
+                }
+                None => {
+                    self.head = None;
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    /// Decode the current loc's next undecoded block, or `None` when the loc is
+    /// spent (or absent).
+    ///
+    /// The loc's raw bytes stay resident across this call so the following block
+    /// can be decoded from them, and are dropped as the last block is decoded:
+    /// the tracker's raw term is therefore per loc (one row group under version
+    /// 4, one block under version 3) while its decoded term is per block.
+    fn decode_next_block(
+        &mut self,
+        tracker: Option<&MergeMemoryTracker>,
+    ) -> Result<Option<Vec<LogRecord>>> {
+        let Some((loc, data)) = self.group.take() else {
+            return Ok(None);
+        };
+        let Some(&block) = loc.block_indices().get(self.decoded_in_group) else {
+            // `stream_blocks` never returns a loc with no blocks; release the
+            // raw charge rather than leak it if one ever did.
             if let Some(t) = tracker {
-                // Records both raw and decoded resident at the high-water
-                // instant, then drops the raw buffer.
+                t.block_decoded(self.group_raw_bytes, 0);
+            }
+            self.group_raw_bytes = 0;
+            self.decoded_in_group = 0;
+            return Ok(None);
+        };
+        let last = self.decoded_in_group + 1 == loc.block_indices().len();
+        let recs = self
+            .reader
+            .decode_block_in_group(&loc, block, data.as_ref())?;
+        self.decoded_in_group += 1;
+        let decoded_bytes: u64 = recs.iter().map(estimate_record).sum();
+        if last {
+            // Both the raw loc and this block's records are resident at this
+            // instant; the raw buffer is dropped right after.
+            let raw_len = self.group_raw_bytes;
+            if let Some(t) = tracker {
                 t.block_decoded(raw_len, decoded_bytes);
             }
+            self.group_raw_bytes = 0;
+            self.decoded_in_group = 0;
             drop(data);
-            self.block_bytes = decoded_bytes;
-            self.block = recs.into_iter();
-            if let Some(rec) = self.block.next() {
-                self.head = Some(rec);
-                return Ok(());
+        } else {
+            // The raw loc is kept for the blocks still to be decoded from it,
+            // so nothing is released from the fetched term yet.
+            if let Some(t) = tracker {
+                t.block_decoded(0, decoded_bytes);
             }
-            // A candidate block with no row for this stream (a neighbour's
-            // boundary block): release and try the next.
-            self.release_block(tracker);
+            self.group = Some((loc, data));
         }
-        self.head = None;
-        Ok(())
+        self.block_bytes = decoded_bytes;
+        Ok(Some(recs))
     }
 
     /// The next candidate block's raw bytes, or `None` once the candidate list
@@ -2536,30 +2620,33 @@ mod tests {
 
     /// Issue #711: peak resident memory tracks the part cap, not the record
     /// count. The same single-stream shape is compacted at 2x and 8x the
-    /// records; the tracker's total high-water must barely move.
+    /// records; the tracker's total high-water must barely move. The fixture is
+    /// written at the production default row group size, so this pins the
+    /// property at the setting production runs with.
     ///
-    /// Demonstrated red against the unsplit code (the same flip as
+    /// Demonstrated red twice. Against the unsplit code (the same flip as
     /// `single_stream_bucket_splits_into_bounded_parts`): the whole stream then
     /// lands in one writer, so the writer term is the whole corpus and the
     /// ratio goes to about 4 (the ratio of the two record counts), failing
-    /// `ratio < 1.3`.
+    /// `ratio < 1.3`. And against the per-row-group decode issue #748 replaced:
+    /// flipping `StreamCursor::decode_next_block` back to
+    /// `decode_block(&loc, ..)` with `last` forced true makes the decoded term
+    /// a whole input's stream at these defaults, giving 2x=1195290 8x=3991290
+    /// ratio=3.34.
     #[tokio::test]
     async fn merge_peak_total_scales_with_the_cap_not_the_record_count() {
         const BASE: i64 = 400;
         const CAP: u64 = 256 * 1024;
         const INPUTS: i64 = 2;
-        // The inputs are re-blocked at 100 records and grouped 2 blocks to a
-        // row group so the decode-side term is the same at both scales (every
-        // input carries far more than one row group). Under RLOG version 4 the
-        // merge's fetch and decode unit is a row group, not a block (ADR-0699
-        // decision 1), so the group has to be small enough to bind here just as
-        // the block did before the bump; at the defaults an input's whole
-        // stream would be one group and the transient term would scale with the
-        // corpus, which is not what this test is about.
+        // The inputs are re-blocked at 100 records, at the production default
+        // row group size (32 blocks): at this scale an input's whole stream is
+        // one row group, which is exactly the shape issue #748 is about. The
+        // merge's fetch unit is that group, but its decode unit is one block
+        // (ADR-0699 amendment), so the decoded term is the same at both scales
+        // and only the group's stored (compressed) bytes follow the corpus.
         const L0_BLOCK: i64 = 100;
-        const L0_GROUP_BLOCKS: usize = 2;
-        // At most one decoded row group plus one raw row group per input. Loose
-        // on purpose: the claim under test is the ratio.
+        // At most one decoded block plus two locs' stored bytes per input.
+        // Loose on purpose: the claim under test is the ratio.
         const TRANSIENT_ALLOWANCE: u64 = 4 * 1024 * 1024;
 
         let mut peaks = Vec::new();
@@ -2577,7 +2664,6 @@ mod tests {
                     &recs,
                     RlogConfig {
                         block_target_records: L0_BLOCK as usize,
-                        group_target_blocks: L0_GROUP_BLOCKS,
                         ..RlogConfig::default()
                     },
                     &[],
@@ -2731,27 +2817,34 @@ mod tests {
     // --- bounded-memory k-way merge ------------------------------
 
     /// Acceptance test (ADR-0065 decision 4): the RLOG
-    /// compaction merge's peak resident decode memory is bounded by row group
-    /// size times input count, independent of how large one hot stream grows.
+    /// compaction merge's peak resident decode memory is bounded by block size
+    /// times input count, independent of how large one hot stream grows.
     ///
-    /// The unit was one block until RLOG version 4 made it one row group
-    /// (ADR-0699 decision 1). A version-4 block's pages are spread across its
-    /// row group's column chunks, so the smallest contiguous range holding all
-    /// of one block is the group; the merge reads every column, so it fetches
-    /// and decodes the group. That is the read-side mirror of the writer's
-    /// stated one-row-group working set, and `group_target_blocks` bounds both.
-    /// What the bound still forbids is what it always forbade: residency that
-    /// grows with the stream.
+    /// RLOG version 4 split the merge's fetch unit from its decode unit. A
+    /// version-4 block's pages are spread across its row group's column chunks
+    /// (ADR-0699 decision 1), so the smallest contiguous range holding all of
+    /// one block is the group and that is what one ranged GET brings; the
+    /// cursor then holds those *stored* bytes and decodes the group's blocks
+    /// one at a time out of them, releasing each before the next (issue #748).
+    /// So the decoded term is one block per input, as it was under version 3,
+    /// and the raw term is one row group of compressed bytes.
     ///
     /// A single hot stream (the common log shape: one busy service carrying
     /// most of a sealed hour) is grown 10x across two runs. The
     /// [`MergeMemoryTracker`]'s recorded *transient* high-water -- the merge's
-    /// own decode-side buffers, at most one fetched raw row group plus one
-    /// decoded row group per input -- must stay under a fixed bound and must
-    /// NOT grow with the stream. The defect was that the old merge decoded a whole stream's
+    /// own decode-side buffers, at most one decoded block plus the raw bytes of
+    /// the row groups it is decoding from, per input -- must stay under a fixed
+    /// bound and must NOT grow with the stream. The defect was that the old
+    /// merge decoded a whole stream's
     /// records from every input into one `Vec`, plus a second copy in the part
     /// accumulator, so peak scaled with stream size; a regression to that shape
     /// would push the `decoded` term to `O(stream)` and break the bound below.
+    ///
+    /// Demonstrated red against the per-row-group decode issue #748 replaced:
+    /// flipping `StreamCursor::decode_next_block` back to
+    /// `decode_block(&loc, ..)` with `last` forced true doubles the decoded
+    /// term at this fixture's 2-block groups (transient 1452268 B against the
+    /// 1098000 B bound), failing `transient < TRANSIENT_BOUND`.
     ///
     /// Deterministic: it asserts on the tracker's accounting, never on process
     /// RSS or allocator hooks, and runs against [`MemoryStore`].
@@ -2761,20 +2854,25 @@ mod tests {
         // l0_blocked_cfg's block target: each input is re-blocked at 1000
         // records, so a grown stream spans many blocks per input.
         const L0_BLOCK: u64 = 1000;
-        // l0_blocked_cfg's row group size: the merge's fetch and decode unit
-        // under version 4. Both scales below span more than this many blocks
-        // per input, so the bound genuinely binds rather than happening to
-        // cover the whole stream.
+        // l0_blocked_cfg's row group size: the merge's *fetch* unit under
+        // version 4 (its decode unit is one block). Both scales below span more
+        // than this many blocks per input, so the bound genuinely binds rather
+        // than happening to cover the whole stream.
         const L0_GROUP_BLOCKS: u64 = 2;
-        // A generous per-record upper bound. `estimate_record` charges the
-        // record's Rust-side heap since issue #711, so these tiny records
-        // estimate at ~270 bytes rather than the ~53 payload bytes this bound
-        // was first sized against; it stays intentionally loose so it tracks
-        // row group size and input count, not the exact estimate.
-        const PER_RECORD_BOUND: u64 = 1024;
-        // At most one raw row group plus one decoded row group per input.
-        const TRANSIENT_BOUND: u64 =
-            INPUTS as u64 * 2 * L0_GROUP_BLOCKS * L0_BLOCK * PER_RECORD_BOUND;
+        // Per-record upper bound on the decoded term. `estimate_record` charges
+        // the record's Rust-side heap since issue #711, so these tiny records
+        // estimate at ~242 bytes rather than the ~53 payload bytes this bound
+        // was first sized against. It is deliberately close to that figure:
+        // decoding a whole 2-block group instead of one block has to break it.
+        const PER_RECORD_BOUND: u64 = 350;
+        // Per-record upper bound on the raw term. Those are stored, compressed
+        // bytes: a whole 3000-record input object here is 890 bytes, so this is
+        // an order of magnitude of headroom.
+        const RAW_PER_RECORD_BOUND: u64 = 4;
+        // Per input: one decoded block, plus the raw bytes of at most two row
+        // groups (the one being decoded from and the one prefetched behind it).
+        const TRANSIENT_BOUND: u64 = INPUTS as u64
+            * (L0_BLOCK * PER_RECORD_BOUND + 2 * L0_GROUP_BLOCKS * L0_BLOCK * RAW_PER_RECORD_BOUND);
         // Rough estimated bytes-per-record for the "stream size" the peak is
         // compared against (reporting and the not-scaling assertion only).
         const PER_RECORD_APPROX: i64 = 270;
@@ -2842,7 +2940,7 @@ mod tests {
             assert!(
                 transient < TRANSIENT_BOUND,
                 "transient peak {transient} exceeded the fixed bound {TRANSIENT_BOUND} \
-                 (row group size x input count)"
+                 (one decoded block plus the raw row groups, x input count)"
             );
             // The only stream-dependent residency is the writer's in-progress
             // part, bounded by the part cap (content-addressing needs the whole
@@ -2854,8 +2952,8 @@ mod tests {
             peaks.push(transient);
         }
 
-        // The stream grew 10x; the decode-side peak did not (the same one row
-        // group per input stays resident regardless of stream size).
+        // The stream grew 10x; the decode-side peak did not (the same one
+        // decoded block per input stays resident regardless of stream size).
         let (base, ten_x) = (peaks[0], peaks[1]);
         assert!(
             ten_x <= base * 2,
