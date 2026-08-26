@@ -187,7 +187,10 @@ fn print_human_table(doc: &Document) {
             s.rows_per_sec,
         );
     }
-    println!("  (* pgDec/pgSkp are columnar-path-only partition metrics; the row path reports 0)");
+    println!(
+        "  (* pgDec/pgSkp are partition metrics on both paths; the row path decodes \
+         every page of each block it scans and skips none)"
+    );
     println!();
     println!(
         "  page_bytes_decoded ratio (row/columnar): {:.3}",

@@ -35,7 +35,7 @@ use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::erasure::snapshot_pending_erasure_predicates;
 use ravel_rspan::{ObjectIdentity, RspanConfig, RspanWriter, SpanQuery, SpanRecord, StatusCode};
 use ravel_sql::{
-    SPAN_COL_DURATION_NS, SPAN_COL_NAME, SPAN_COL_SERVICE_NAME, SPAN_COL_START_TS,
+    SPAN_COL_ATTRS, SPAN_COL_DURATION_NS, SPAN_COL_NAME, SPAN_COL_SERVICE_NAME, SPAN_COL_START_TS,
     SPAN_COL_TRACE_ID, SpanSegmentFetcher, SpansScanExec, spans_schema,
 };
 use ravel_types::TenantHash;
@@ -43,6 +43,31 @@ use ravel_types::accounting::QueryAccounting;
 use uuid::Uuid;
 
 const TENANT: TenantHash = TenantHash([1u8; 16]);
+
+/// The exact page geometry of [`two_object_corpus`], pinned so both paths'
+/// `pages_decoded`/`pages_skipped` partition metrics are asserted as figures
+/// rather than as "nonzero".
+///
+/// Geometry: two objects of three spans each, cut every two records
+/// ([`small_blocks`]), so four blocks (2 + 1 per object). Each block stages nine
+/// pages, one per column that has a value in it: `trace_id`, `span_id`, `name`,
+/// `start_ts`, `end_ts`, `status_code`, `status_message`, `service_name` (the
+/// v3 lift of `service.name`), and the dynamic `http.method` attribute column.
+/// `parent_span_id` and `attrs_raw` are `None` on every fixture span, and a
+/// column with no present value stages no page at all (`write_block`'s
+/// `stage_column`), so neither contributes. A full decode therefore touches
+/// 4 x 9 = 36 pages.
+const ROW_PAGES_DECODED: usize = 36;
+/// What the attrs-free projection of
+/// [`columnar_path_taken_for_attrs_free_projection_and_matches_row_path`]
+/// decodes out of those 36: `trace_id`, `name`, `start_ts`, `service_name`, and
+/// `end_ts` (unprojected, but decoded for `duration_ns` and the ts predicate),
+/// five pages per block over four blocks.
+const COLUMNAR_PAGES_DECODED: usize = 20;
+/// And the pages that projection walks past: `span_id`, `status_code`,
+/// `status_message`, and the dynamic attribute column, four pages per block
+/// over four blocks.
+const COLUMNAR_PAGES_SKIPPED: usize = ROW_PAGES_DECODED - COLUMNAR_PAGES_DECODED;
 
 fn identity() -> ObjectIdentity {
     ObjectIdentity {
@@ -269,12 +294,21 @@ async fn columnar_path_taken_for_attrs_free_projection_and_matches_row_path() {
         "the fast path must not fall back to the row path"
     );
     // The projection excludes the dynamic attribute pages, so decode skipped
-    // them: the page-level proof projection reached the decode.
-    assert!(
-        fast.pages_skipped > 0,
-        "excluding attrs must skip attribute pages ({} decoded, {} skipped)",
-        fast.pages_decoded,
-        fast.pages_skipped,
+    // them: the page-level proof projection reached the decode. Pinned exactly,
+    // not just `> 0`, so a change to what the fast path decodes is caught here
+    // rather than absorbed: over this corpus's four blocks the columnar decode
+    // touches COLUMNAR_PAGES_DECODED pages and walks past
+    // COLUMNAR_PAGES_SKIPPED, and their sum is the same whole-block page total
+    // the row path decodes (ROW_PAGES_DECODED).
+    assert_eq!(
+        (fast.pages_decoded, fast.pages_skipped),
+        (COLUMNAR_PAGES_DECODED, COLUMNAR_PAGES_SKIPPED),
+        "the columnar path's exact page split over this corpus"
+    );
+    assert_eq!(
+        fast.pages_decoded + fast.pages_skipped,
+        ROW_PAGES_DECODED,
+        "every page of every scanned block is either decoded or skipped"
     );
 
     // Row path: same projection, forced ineligible by a no-match erasure so it
@@ -314,6 +348,123 @@ async fn columnar_path_taken_for_attrs_free_projection_and_matches_row_path() {
         (0u8..6).map(|t| [t; 16]).collect::<Vec<_>>(),
         "the two objects were interleaved into 0,1,2,3,4,5"
     );
+}
+
+/// Issue #669: the `pages_decoded`/`pages_skipped` partition metrics mean the
+/// same thing on the row path as on the columnar one. An attrs-including
+/// projection is ineligible for the fast path, so this scan drains the row path,
+/// and the two counters report what its decode actually did: every page of every
+/// block it scanned decoded ([`ROW_PAGES_DECODED`]), none skipped.
+///
+/// Both figures are pinned exactly. The zero is the point as much as the nonzero
+/// one: before the row arm wrote these counters, `EXPLAIN ANALYZE` on an
+/// attrs-including query showed `pages_decoded=0, pages_skipped=0`, which reads
+/// as "this decode touched nothing" rather than "nobody counted". With the arm
+/// instrumented, `pages_decoded=36` beside `pages_skipped=0` says the true
+/// thing: the row path decodes whole blocks and skips nothing.
+///
+/// Flip to watch it fail: delete the two `this.metrics.pages_*.add(...)` lines
+/// from the `Prepared::Rows` arm of `SpanScanStream::poll_next`
+/// (`spans_scan.rs`), the uninstrumented state this closes. Both assertions
+/// below then report 0 for `pages_decoded` while `rowpath_batches` still proves
+/// the row path ran.
+#[tokio::test]
+async fn row_path_reports_the_pages_it_decoded() {
+    let store = MemoryStore::new();
+    let segments = two_object_corpus(&store).await;
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+
+    // Including `attrs` is the eligibility axis: the fast path never builds the
+    // merged map, so this projection drains the row path (ADR-0110 decision 3),
+    // with no erasure predicate needed to force it.
+    let projection = vec![SPAN_COL_TRACE_ID, SPAN_COL_NAME, SPAN_COL_ATTRS];
+    let run = run_scan(
+        Arc::clone(&store),
+        segments.clone(),
+        Some(projection),
+        Vec::new(),
+    )
+    .await;
+
+    assert_eq!(
+        run.columnar_batches, 0,
+        "an attrs-including projection must not run the columnar path"
+    );
+    assert!(
+        run.rowpath_batches > 0,
+        "the row path must have run for the attrs-including projection"
+    );
+
+    assert_eq!(
+        run.pages_decoded, ROW_PAGES_DECODED,
+        "the row path decodes every page of the four blocks it scanned"
+    );
+    assert_eq!(
+        run.pages_skipped, 0,
+        "and skips none: it requests every column, so nothing is walked past"
+    );
+
+    // The scan still returned the rows, projected: the metrics were not bought
+    // by changing what the row path emits.
+    let total: usize = run.batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 6, "every span returned once");
+    let ids: Vec<[u8; 16]> = run.batches.iter().flat_map(|b| trace_ids(b, 0)).collect();
+    assert_eq!(
+        ids,
+        (0u8..6).map(|t| [t; 16]).collect::<Vec<_>>(),
+        "in (trace_id, start_ts) order across both objects"
+    );
+}
+
+/// The `attrs_raw` fallback's page counts (#669). An eligible query whose block
+/// turns out to carry an `attrs_raw` overflow page abandons the columnar attempt
+/// and re-reads the whole partition through the row path, so the partition's
+/// decode really did both: the projected pages of the block the attempt reached,
+/// then every page of that block again. Both show up in `pages_decoded`, and the
+/// attempt's skipped pages in `pages_skipped`, which is why this partition is
+/// the one case where a row-path scan reports a nonzero `pages_skipped`.
+///
+/// Geometry: one span carrying 1001 distinct dynamic attributes. RSPAN gives the
+/// first 1000 (sorted) their own columns and spills the last into `attrs_raw`
+/// (`MAX_DYNAMIC_COLUMNS` in `ravel-rspan`'s writer), so the single block holds
+/// 1000 dynamic pages plus `attrs_raw`, `trace_id`, `span_id`, `name`,
+/// `start_ts`, `end_ts`, `status_code`, `status_message`, and `service_name`:
+/// 1009 pages. The columnar attempt decodes 4 of them (`trace_id`, `start_ts`,
+/// `end_ts`, `name` -- the projection unioned with the ordering and predicate
+/// columns) and skips 1005; the row path then decodes all 1009.
+///
+/// Flip to watch it fail: drop the abandoned attempt's counts in
+/// `prepare_partition`'s `ColumnarAttempt::FellBack` arm (`pages_decoded = 0`,
+/// `pages_skipped = 0`). The metrics then report `(1009, 0)`, the row decode
+/// alone, and this reads as a partition that never attempted the fast path.
+#[tokio::test]
+async fn attrs_raw_fallback_counts_the_abandoned_attempt_and_the_row_decode() {
+    let store = MemoryStore::new();
+    let mut spill = span(0, 0, 10, "checkout", "spill");
+    spill.attrs = std::iter::once(("service.name".to_string(), "checkout".to_string()))
+        .chain((0..1001).map(|i| (format!("k{i:04}"), i.to_string())))
+        .collect();
+    let seg = write_object(&store, "spans/attrs-raw.rspan", &[spill]).await;
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+
+    // Eligible by query shape (no `attrs`, no erasure): the fallback is decided
+    // per block, at decode.
+    let projection = vec![SPAN_COL_TRACE_ID, SPAN_COL_NAME, SPAN_COL_START_TS];
+    let run = run_scan(store, vec![seg], Some(projection), Vec::new()).await;
+
+    assert_eq!(
+        run.columnar_batches, 0,
+        "an attrs_raw block must force the whole partition to the row path"
+    );
+    assert!(run.rowpath_batches > 0, "the row path must have run");
+    assert_eq!(
+        (run.pages_decoded, run.pages_skipped),
+        (4 + 1009, 1005),
+        "the abandoned columnar attempt's pages plus the row path's whole-block decode"
+    );
+
+    let total: usize = run.batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 1, "the span is still returned exactly once");
 }
 
 /// The data-protection case (ADR-0110 decision 3): with a pending erasure
