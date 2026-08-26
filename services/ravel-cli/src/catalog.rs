@@ -19,6 +19,7 @@ fn head_key(tenant: &TenantHash, signal: Signal) -> String {
     format!("t/{}/catalog/{}/HEAD", tenant.to_hex(), signal.key_prefix())
 }
 
+/// Folds one signal's catalog snapshot for a tenant (issue #718).
 pub async fn fold(
     store: Arc<dyn ObjectStoreBackend>,
     tenant: &str,
