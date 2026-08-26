@@ -133,6 +133,10 @@ struct Args {
     /// default, which is what every earlier run measured.
     #[arg(long, default_value_t = false)]
     sql_parallel_final_aggregation: bool,
+    /// Execute each statement through a running `ravel-server`'s Flight SQL
+    /// endpoint (`host:port`) instead of the in-process executor.
+    #[arg(long, value_name = "HOST:PORT")]
+    flight: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, clap::ValueEnum)]
