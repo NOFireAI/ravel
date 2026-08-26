@@ -113,7 +113,9 @@ The shipped design (`crates/ravel-sql/src/logs_scan.rs`) resolves all four:
   `target_partitions.max(1).min(segment_count.max(1))`. `ravel-bench`'s
   `logs_scan_scaling` report measures both sides: on its fixture,
   cache-wired request count stays flat across the `target_partitions`
-  sweep, un-cached it climbs until the segment-count cap binds.
+  sweep, and un-cached it is flat too, at one plan read plus one scan read
+  per segment, because segments are assigned whole (amendment below; the
+  original draft had it climbing until the segment-count cap bound).
 - **Double-count fixed by assigning ownership of the whole-segment totals
   to one partition.** `blocks_total` and the postings-prune drop are
   recorded once, by partition 0 only, during the shared planning step;

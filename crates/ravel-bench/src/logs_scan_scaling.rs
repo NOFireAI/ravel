@@ -24,8 +24,10 @@
 //! [`crate::sql_latency`] and [`crate::pushdown_crossover`] use). The fetch unit
 //! is the whole object (ADR-0087 decision 3: no ranged block reader), so every
 //! partition owning blocks in a segment issues its own whole-object read at that
-//! segment's key. Un-cached, the partition count is capped at the segment count,
-//! so raising `target_partitions` past that changes nothing. Cache-wired, the
+//! segment's key. Un-cached, the partition count is capped at the segment count
+//! and each segment is assigned whole to one partition (ADR-0102's un-cached
+//! amendment), so raising `target_partitions` changes nothing at any value: the
+//! count is one plan read plus one scan read per segment. Cache-wired, the
 //! partition count keeps climbing and those repeated reads are what ADR-0046's
 //! single-flight cache absorbs.
 //!
@@ -170,9 +172,9 @@ pub struct ComboResult {
     pub blocks_total: u64,
     pub blocks_scanned: u64,
     /// Object-store GET requests the cold run issued (`QueryAccounting`). The
-    /// number this deliverable exists to report. Un-cached, the partition count
-    /// is capped at the segment count, so this stops moving once
-    /// `target_partitions` reaches that cap. Cache-wired, the partition count
+    /// number this deliverable exists to report. Un-cached, each segment is
+    /// assigned whole to one partition, so this is one plan read plus one scan
+    /// read per segment at every `target_partitions`. Cache-wired, the partition count
     /// keeps climbing and the repeated whole-object reads at one key are what
     /// single-flight absorbs. A figure for THIS fixture only, not a general
     /// result (see the module doc).

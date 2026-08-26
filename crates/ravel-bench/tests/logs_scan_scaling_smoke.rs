@@ -170,18 +170,20 @@ async fn logs_scan_scaling_smoke_proves_cache_gated_fanout_and_request_count() {
         );
     }
 
-    // The multiplier the segment-count cap bounds but does not remove: below the
-    // cap, raising `target_partitions` still adds whole-object reads, because
-    // every partition owning blocks in a segment opens that segment itself. Only
-    // a single-partition plan matches the pre-item-1 whole-segment request count.
-    let &max_tp = expected_partitions.iter().max().unwrap();
-    if min_tp == 1 && max_tp > 1 {
-        assert!(
-            get_by_combo[&(max_tp, false)] > get_by_combo[&(1, false)],
-            "un-cached GET count still climbs from a single partition to the cap: \
-             tp={max_tp} issued {}, tp=1 issued {}",
-            get_by_combo[&(max_tp, false)],
-            get_by_combo[&(1, false)]
+    // Un-cached, the unit of assignment is the whole segment (ADR-0102, the
+    // un-cached amendment): each segment is opened by exactly one partition, so
+    // raising `target_partitions` below the cap adds no whole-object reads
+    // either. The count is one plan read plus one scan read per segment at every
+    // partition value, which the single-partition run measures directly.
+    let uncached_baseline = get_by_combo[&(min_tp, false)];
+    for &tp in &expected_partitions {
+        assert_eq!(
+            get_by_combo[&(tp, false)],
+            uncached_baseline,
+            "un-cached GET count is flat across the whole sweep once segments \
+             are assigned whole: tp={tp} issued {}, tp={min_tp} issued \
+             {uncached_baseline}",
+            get_by_combo[&(tp, false)]
         );
     }
 }
