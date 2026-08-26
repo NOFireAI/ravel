@@ -520,7 +520,13 @@ pub async fn migrate_family(
                 && listing.compaction_record_keys.is_empty()
                 && !listing.commit_keys.is_empty()
             {
-                let inputs = load_inputs(store, &bucket, &listing.commit_keys).await?;
+                let inputs = load_inputs(
+                    store,
+                    &bucket,
+                    &listing.commit_keys,
+                    config.input_read_concurrency,
+                )
+                .await?;
                 let l0_below = inputs
                     .iter()
                     .filter(|i| i.record.segment_format_version < target_version)

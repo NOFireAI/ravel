@@ -12,6 +12,10 @@
 //! fetched lazily during the merge ([`crate::build`]) with ranged GETs, so
 //! peak memory is bounded by catalog metadata plus one in-flight part buffer, not by the whole bucket's page data.
 
+use std::future::Future;
+use std::pin::Pin;
+
+use futures::stream::{StreamExt, TryStreamExt, iter as stream_iter};
 use ravel_commit::keys::{self, BucketEntry};
 use ravel_commit::record;
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError, list_all};
@@ -101,23 +105,34 @@ pub struct InputRecord {
 /// its own identity fields (ADR-0010 §7 discipline) and its signal against
 /// the bucket, then sort the inputs canonically by
 /// `(writer_id, writer_epoch, writer_seq)`.
+///
+/// The GETs run `concurrency` at a time (`CompactorConfig::input_read_concurrency`).
+/// A bucket with hundreds of L0 inputs is otherwise one full store round trip
+/// per input in sequence. Completion order does not reach the caller: the
+/// canonical sort below re-establishes the one ordering the merge's tie-break
+/// depends on, and `(writer_id, writer_epoch, writer_seq)` is unique per input
+/// (it is what the commit key is built from), so the sort is total and the
+/// result is identical at any concurrency.
 pub async fn load_inputs(
     store: &dyn ObjectStoreBackend,
     bucket: &Bucket,
     commit_keys: &[String],
+    concurrency: usize,
 ) -> Result<Vec<InputRecord>> {
-    let mut inputs = Vec::with_capacity(commit_keys.len());
-    for key in commit_keys {
-        let got = store.get(key, GetRange::Full).await?;
-        let record = record::decode(&got.data)?;
-        // The record's key must reconstruct to the key we listed it at.
-        verify_commit_key(&record, key)?;
-        verify_input_matches_bucket(bucket, &record)?;
-        inputs.push(InputRecord {
-            commit_key: key.clone(),
-            record,
-        });
-    }
+    // Box each GET future with an explicit `+ Send` bound before handing it to
+    // `buffer_unordered`, the same workaround `crate::build::fetch_batch_pages`
+    // documents: a bare `async` block borrowing the `&dyn ObjectStoreBackend`
+    // makes rustc infer a late-bound lifetime whose `Send` it cannot prove is
+    // general enough where the maintain loop is `tokio::spawn`ed.
+    type InputFuture<'f> = Pin<Box<dyn Future<Output = Result<InputRecord>> + Send + 'f>>;
+    let futures: Vec<InputFuture<'_>> = commit_keys
+        .iter()
+        .map(|key| Box::pin(load_one_input(store, bucket, key)) as InputFuture<'_>)
+        .collect();
+    let mut inputs: Vec<InputRecord> = stream_iter(futures)
+        .buffer_unordered(concurrency.max(1))
+        .try_collect()
+        .await?;
     inputs.sort_by(|a, b| {
         (
             a.record.writer_id.as_str(),
@@ -131,6 +146,25 @@ pub async fn load_inputs(
             ))
     });
     Ok(inputs)
+}
+
+/// GET, decode and verify one L0 commit record. Named (not an inline `async`
+/// block) so its future is `Send`-general over the borrowed store; see the
+/// call site in [`load_inputs`].
+async fn load_one_input(
+    store: &dyn ObjectStoreBackend,
+    bucket: &Bucket,
+    key: &str,
+) -> Result<InputRecord> {
+    let got = store.get(key, GetRange::Full).await?;
+    let record = record::decode(&got.data)?;
+    // The record's key must reconstruct to the key we listed it at.
+    verify_commit_key(&record, key)?;
+    verify_input_matches_bucket(bucket, &record)?;
+    Ok(InputRecord {
+        commit_key: key.to_string(),
+        record,
+    })
 }
 
 /// Verify a decoded commit record reconstructs to the key it was fetched at

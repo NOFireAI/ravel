@@ -187,7 +187,7 @@ async fn row10_racing_compactors_loser_converges_and_repairs() {
     // Loser rebuilds its parts (CreateIfAbsent over the winner's identical
     // parts is a no-op) ...
     let listing = read::list_bucket(&store, &bucket).await.unwrap();
-    let inputs = read::load_inputs(&store, &bucket, &listing.commit_keys)
+    let inputs = read::load_inputs(&store, &bucket, &listing.commit_keys, 1)
         .await
         .unwrap();
     let hash = read::input_set_hash(&inputs);
@@ -289,7 +289,7 @@ async fn row11_already_exists_different_hash_alarms() {
 
     // Build our parts (with our hash) and try to publish.
     let listing = read::list_bucket(&store, &bucket).await.unwrap();
-    let inputs = read::load_inputs(&store, &bucket, &listing.commit_keys)
+    let inputs = read::load_inputs(&store, &bucket, &listing.commit_keys, 1)
         .await
         .unwrap();
     let mut catalogs = Vec::new();
@@ -348,7 +348,7 @@ async fn row13_past_deadline_abandons_without_publishing() {
     let clock = FixedClock::new(start_ns + config.max_compaction_lifetime_ns + 1);
 
     let listing = read::list_bucket(&store, &bucket).await.unwrap();
-    let inputs = read::load_inputs(&store, &bucket, &listing.commit_keys)
+    let inputs = read::load_inputs(&store, &bucket, &listing.commit_keys, 1)
         .await
         .unwrap();
     let hash = read::input_set_hash(&inputs);
