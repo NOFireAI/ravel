@@ -30,6 +30,36 @@
 //! crossover preserved). `text_predicate_falls_back_to_full_object_read` pins the
 //! deliberately-kept fallback. `selective_third_no_partition_multiplication_\
 //! under_cache_pressure` pins that eviction no longer re-reads whole objects.
+//!
+//! # Version 4 (ADR-0699 decision 5)
+//!
+//! The writer emits version-4 objects, so the surviving blocks these figures
+//! are proportional to are no longer contiguous byte ranges: a block's pages sit
+//! one per column chunk inside its row group, and the fetch is one coalesced
+//! range per surviving `(row group, projected column)`. Every assertion below
+//! keeps its meaning; the literals are measured on version-4 objects and each
+//! says what it counts.
+//!
+//! Two fetcher settings this fixture pins deliberately, because the figures are
+//! meaningless without them:
+//!
+//! - `SUFFIX_LEN` is sized to cover the object tail (footer, SKIP_IDX, PAGE_DIR,
+//!   BLOOM), which is what `DEFAULT_LOG_SUFFIX_LEN` does at production object
+//!   sizes and what issue #766 raised it for. At the default 256 KiB a probe
+//!   would swallow this fixture's whole 81 KB object and there would be no byte
+//!   figure left to read.
+//! - `with_coalesce_gap(0)`. Under version 4 the hole between two wanted pages
+//!   of one column is the OTHER blocks' pages of that column, so the gap
+//!   threshold decides how many pruned blocks a range reads through. This
+//!   fixture's geometry is one row group of six blocks whose `body` pages are
+//!   ~12.4 KB each, so the hole between `body`'s surviving page and the next
+//!   wanted chunk is ~61.8 KB -- just under the 64 KiB default, which therefore
+//!   fuses the entire BLOCKS section into one range and puts the selective
+//!   shapes back at full-scan bytes. At the production geometry (32-block row
+//!   groups, ~6 KB pages) the same hole is ~186 KB and the default splits it.
+//!   ADR-0699 left this threshold "not decided ... until measured"; the
+//!   measurement is recorded in that ADR's as-built section, and this fixture
+//!   pins the byte proportionality rather than the threshold.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -71,13 +101,17 @@ const TOTAL_BLOCKS: usize = SEGMENTS * BLOCKS_PER_SEG;
 
 /// Body filler bytes per record. Large enough that each object clears the small
 /// block-range threshold this fixture sets, so every read takes ADR-0107's ranged
-/// path, and large relative to the tiny suffix probe so the probe is a rounding
-/// error in the byte figures rather than a second whole-object read.
+/// path, and large enough that `body` dominates each block: it is the column a
+/// selective read still has to fetch a page of per surviving block, so it is
+/// what makes the byte figures track the surviving fraction.
 const BODY_BYTES: usize = 16 * 1024;
-/// Suffix probe length for the ranged path. Deliberately tiny so the probe's
-/// bytes do not dominate; the point of the byte figures is the whole-object read
-/// the coverage crossover issues, not the probe.
-const SUFFIX_LEN: u64 = 256;
+/// Suffix probe length for the ranged path: just over this fixture's 6,780-byte
+/// object tail (footer + SKIP_IDX 139 + PAGE_DIR 199 + BLOOM 6,250), so one
+/// probe per segment carries every plan section and the scan needs no second GET
+/// for them. That is what `DEFAULT_LOG_SUFFIX_LEN` does at production object
+/// sizes (issue #766); the production value would cover this whole 81 KB fixture
+/// object and leave no byte figure to read.
+const SUFFIX_LEN: u64 = 8192;
 
 /// A marker word present in exactly the first block of every segment. A
 /// `has_word` query for it survives one block per segment, but bloom is a
@@ -300,10 +334,13 @@ fn read_cache(cache_bytes: u64) -> Arc<Cache<CacheFetchError>> {
 }
 
 /// A fetcher that treats every object as above the block-range threshold (ranged
-/// path), with a tiny suffix probe and ADR-0046's read cache sized to `cache_bytes`.
+/// path), with a tail-sized suffix probe, no coalescing slack, and ADR-0046's
+/// read cache sized to `cache_bytes`. See this file's header for why those two
+/// settings are pinned rather than left at their defaults.
 fn fetcher(store: Arc<dyn ObjectStoreBackend>, cache_bytes: u64) -> LogSegmentFetcher {
     let block_range = BlockRangeFetcher::new(Arc::clone(&store))
         .with_suffix_len(SUFFIX_LEN)
+        .with_coalesce_gap(0)
         .with_whole_object_threshold(0);
     LogSegmentFetcher::new(store)
         .with_block_range(block_range)
@@ -483,11 +520,12 @@ async fn selective_numeric_reads_only_surviving_blocks() {
         "full scan decodes every block"
     );
     assert_eq!(full.rows, TOTAL_BLOCKS, "full scan returns every record");
+    // 649,900 = the eight version-4 objects' bytes exactly (81,144 B each plus
+    // rounding across the writer's per-object framing). One whole-object GET per
+    // segment and nothing else, so this is the object bytes and not a byte more.
     assert_eq!(
-        full.bytes, 650_087,
-        "full scan reads exactly the object bytes (the fixture now carries a \
-         declared numeric column per record, so the objects are marginally \
-         larger than the pre-#761 reproduction's 649,653)"
+        full.bytes, 649_900,
+        "full scan reads exactly the object bytes"
     );
     assert_eq!(full.plan_full_reads, 0, "full scan skips the plan phase");
 
@@ -510,10 +548,15 @@ async fn selective_numeric_reads_only_surviving_blocks() {
         "q37: the plan phase counted survivors from the skip index, fetching no \
          block"
     );
-    // Exact GET count: 8 suffix probes (plan) + the per-segment directory and
-    // single-block range reads the scan issues, with the 64 MiB cache absorbing
-    // every re-touch. No whole-object GET anywhere.
-    assert_eq!(q37.gets, 56, "q37: exact GET count with no eviction");
+    // Exact GET count: 8 plan probes plus 8 range GETs per segment. Under
+    // version 4 the surviving block's bytes are one page per column chunk of its
+    // row group, and this fixture's blocks carry pages in eight chunks (ts,
+    // observed_ts, stream_ref, severity_num, severity_text, body, flags, code),
+    // none of which coalesce at gap 0 because the pruned blocks' pages for the
+    // same column sit between them. The two front sections (STREAM_DIR,
+    // FIELD_DIR) and every tail section are absorbed by the probe and the 64 MiB
+    // cache. No whole-object GET anywhere.
+    assert_eq!(q37.gets, 72, "q37: exact GET count with no eviction");
     assert_eq!(
         q37.blocks_scanned, SEGMENTS,
         "q37 decodes exactly one block per segment"
@@ -531,6 +574,17 @@ async fn selective_numeric_reads_only_surviving_blocks() {
         q37.bytes,
         q37_block_bytes
     );
+    // 165,355 = 99,112 page bytes (8 surviving blocks x 12,389 B of pages across
+    // their eight column chunks) + 65,536 probe bytes (8 x 8 KiB) + 672
+    // front-section bytes (8 x (STREAM_DIR 62 + FIELD_DIR 22)). The page term is
+    // 15% of the full scan; the probe term is the fixed per-object directory
+    // cost, which on this deliberately tiny fixture is 40% of the total and on a
+    // production 1.3 MB object is a rounding error.
+    assert_eq!(
+        q37.bytes, 165_355,
+        "q37 moves the surviving blocks' page bytes plus the probe and the two \
+         front sections, not the object"
+    );
     assert!(
         q37.bytes <= full.bytes * 2 / 5,
         "q37 reads well under a full scan ({} vs {}), proportional to 8/48",
@@ -546,7 +600,11 @@ async fn selective_numeric_reads_only_surviving_blocks() {
     );
     assert_eq!(q20.full_gets, 0, "q20: no whole-object GET");
     assert_eq!(q20.plan_full_reads, 0, "q20: skip-index plan");
-    assert_eq!(q20.gets, 56, "q20: exact GET count with no eviction");
+    // Same shape as q37: 8 probes plus 8 chunk ranges per segment. q20's second
+    // surviving block per segment is ADJACENT to the first, so its page sits
+    // next to the first's in every chunk and the pair coalesces even at gap 0 --
+    // the range count is unchanged and only the bytes grow.
+    assert_eq!(q20.gets, 72, "q20: exact GET count with no eviction");
     assert_eq!(
         q20.blocks_scanned,
         SEGMENTS * 2,
@@ -563,6 +621,13 @@ async fn selective_numeric_reads_only_surviving_blocks() {
         "q20 reads at least its surviving-block bytes ({} vs {})",
         q20.bytes,
         q20_block_bytes
+    );
+    // 264,405 = 198,197 page bytes (16 surviving blocks) + the same 65,536 probe
+    // and 672 front-section bytes q37 pays: twice q37's page term, identical
+    // fixed term.
+    assert_eq!(
+        q20.bytes, 264_405,
+        "q20 moves twice q37's page bytes and the same fixed directory bytes"
     );
     assert!(
         q20.bytes <= full.bytes * 3 / 5,
@@ -624,9 +689,15 @@ async fn text_predicate_falls_back_to_full_object_read() {
         "bloom still prunes to one block per segment at decode"
     );
     assert_eq!(text.rows, SEGMENTS, "one matching record per segment");
-    // The whole objects are read: bytes ~ a full scan, the amplification #761
-    // cannot remove for a text predicate.
+    // The whole objects are read: bytes ~ a full scan plus the probes, the
+    // amplification #761 cannot remove for a text predicate. 715,612 = 649,900
+    // object bytes + 65,536 probe bytes (8 x 8 KiB), the plan phase's probe on
+    // top of the whole-object read its fallback then issues.
     let full = measure("full_scan", &[], cache).await;
+    assert_eq!(
+        text.bytes, 715_612,
+        "text fallback: the whole objects plus one plan probe each"
+    );
     assert!(
         text.bytes >= full.bytes,
         "text predicate still moves the full-object bytes ({} vs {})",
@@ -643,8 +714,10 @@ async fn text_predicate_falls_back_to_full_object_read() {
 #[tokio::test]
 async fn selective_third_no_partition_multiplication_under_cache_pressure() {
     let big = measure("q20_big_cache", &[code_le(1)], 64 << 20).await;
-    // A cache far smaller than the fixture's object bytes.
-    let small = measure("q20_small_cache", &[code_le(1)], 32 << 10).await;
+    // A cache five times smaller than the fixture's 650 KB of object bytes, so
+    // the probe and directory extents really are evicted between the plan pass
+    // and the per-partition scans.
+    let small = measure("q20_small_cache", &[code_le(1)], 128 << 10).await;
     report(&big);
     report(&small);
 
@@ -687,5 +760,14 @@ async fn selective_third_no_partition_multiplication_under_cache_pressure() {
          surviving block is read once, none of the pruned blocks at all",
         small.bytes,
         full.bytes
+    );
+    // 264,405 with no eviction (16 surviving blocks' page bytes plus the fixed
+    // probe and front-section bytes) against 479,147 under pressure: the
+    // difference is re-fetched probe and directory extents, never a re-read
+    // page. Both stay under the 649,900 a single full pass moves.
+    assert_eq!(big.bytes, 264_405, "q20 with no eviction");
+    assert_eq!(
+        small.bytes, 479_147,
+        "q20 under eviction: more directory re-reads, still under one full pass"
     );
 }
