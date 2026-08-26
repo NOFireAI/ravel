@@ -115,6 +115,11 @@ ravel-server = { path = "../ravel-server", version = "0.10.0", features = ["sql"
 # dependency graph; test-only.
 axum = { workspace = true }
 tower = { workspace = true }
+# The #689 differential test drives the dynamic-column slot table against the
+# pre-change map build over generated batches (row count, column count, key
+# collisions, type mix, null density). Workspace pin; adds no new external
+# crate.
+proptest = { workspace = true }
 # A real deployment-key file on disk for the `tenant_token` CLI tests (they
 # exercise `--deployment-key-file`, not an in-memory key). Already a
 # workspace pin; adds no new external crate.
