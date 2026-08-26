@@ -39,7 +39,8 @@ pub struct SqlConfig {
     /// measured `RecordBatch` sizes, never a sample count.
     pub max_query_bytes: usize,
     /// Whether an exact-typed query is allowed to repartition its final
-    /// aggregation (ADR-0094 decision 4). Process-wide, default `false`: a
+    /// aggregation (ADR-0094 decision 4). Issue #741 revisits this default.
+    /// Process-wide, default `false`: a
     /// per-query classification (ADR-0094 decision 1) only ever flips
     /// DataFusion's `repartition_aggregations` on when this is `true` *and*
     /// every aggregate expression and GROUP BY key in the query is provably
