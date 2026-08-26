@@ -7,10 +7,12 @@
 //! Sweeps DataFusion `target_partitions` (`--target-partitions 1,2,4,8,16`)
 //! over one fixed `logs` scan query and a FEW-segment / MANY-block dataset, so
 //! the undersubscribed case (segment count < target_partitions) this item fixes
-//! is what is measured. Each partition value is run with the read cache wired
-//! and un-wired, so the report shows both the scan fanning out past the segment
-//! count and the object-store GET count (flat with the cache, climbing without
-//! it).
+//! is what is measured. Each partition value is run four ways -- read cache
+//! wired and un-wired, crossed with ADR-0107's whole-object and above-threshold
+//! read shapes (issue #693) -- so the report shows the scan fanning out past the
+//! segment count, the object-store GET count on each shape, and the `reads/sg`
+//! and `bytes_x` columns that turn each row's readings into a single
+//! amplification factor.
 //!
 //! Report-only: a new standalone measurement tool, not wired into any
 //! production path. Gated on the `sql-latency` feature so the default build
@@ -46,6 +48,11 @@ struct Args {
     /// Writer block target. Small so each segment holds many blocks.
     #[arg(long, default_value_t = 64)]
     block_target_records: usize,
+    /// Log body length in bytes. Must be large enough that each published object
+    /// clears ADR-0107's 512 KiB block-range threshold, or the `over_threshold`
+    /// rows measure a whole-object read under an above-threshold label.
+    #[arg(long, default_value_t = 256)]
+    body_bytes: usize,
     /// Comma-separated DataFusion `target_partitions` values to sweep. Straddle
     /// `--segments` so the report shows both the un-cached cap binding and the
     /// cache-wired fan-out continuing past it.
@@ -77,6 +84,7 @@ async fn main() {
             segments: args.segments,
             records_per_object: args.records_per_object,
             block_target_records: args.block_target_records,
+            body_bytes: args.body_bytes,
             target_partitions: args.target_partitions,
             runs: args.runs,
             deadline: Duration::from_secs(args.deadline_secs),
@@ -107,7 +115,16 @@ fn print_human_table(report: &Report) {
         "  block_target_records: {}",
         report.config.block_target_records
     );
+    println!("  body_bytes          : {}", report.config.body_bytes);
     println!("  total_records       : {}", report.config.total_records);
+    println!("  dataset_bytes       : {}", report.config.dataset_bytes);
+    println!(
+        "  min_object_bytes    : {} (over-threshold rows use block-range \
+         threshold {}; whole-object rows use {})",
+        report.config.min_object_bytes,
+        report.config.over_threshold_block_range_threshold,
+        report.config.whole_object_block_range_threshold,
+    );
     println!("  runs per combo      : {}", report.config.runs);
     println!();
     println!(
@@ -120,40 +137,46 @@ fn print_human_table(report: &Report) {
     );
     println!();
     println!(
-        "{:>7} | {:>6} | {:>8} | {:>9} | {:>8} | {:>7} | {:>8} | {:>10} | {:>10} | {:>10} | {:>14}",
+        "{:>7} | {:>6} | {:>7} | {:>8} | {:>9} | {:>8} | {:>7} | {:>8} | {:>9} | {:>9} | {:>10} | {:>10} | {:>10} | {:>14}",
         "target",
         "cache",
+        "overthr",
         "scanpart",
         "nonempty",
         "segments",
         "s3_gets",
         "cachehit",
+        "reads/sg",
+        "bytes_x",
         "med (ms)",
         "min (ms)",
         "max (ms)",
         "rows/sec",
     );
     println!(
-        "{:->7}-+-{:->6}-+-{:->8}-+-{:->9}-+-{:->8}-+-{:->7}-+-{:->8}-+-{:->10}-+-{:->10}-+-{:->10}-+-{:->14}",
-        "", "", "", "", "", "", "", "", "", "", ""
+        "{:->7}-+-{:->6}-+-{:->7}-+-{:->8}-+-{:->9}-+-{:->8}-+-{:->7}-+-{:->8}-+-{:->9}-+-{:->9}-+-{:->10}-+-{:->10}-+-{:->10}-+-{:->14}",
+        "", "", "", "", "", "", "", "", "", "", "", "", "", ""
     );
     for c in &report.combos {
         if let Some(err) = &c.error {
             println!(
-                "{:>7} | {:>6} | FAILED: {}",
-                c.target_partitions, c.cache_wired, err,
+                "{:>7} | {:>6} | {:>7} | FAILED: {}",
+                c.target_partitions, c.cache_wired, c.over_threshold, err,
             );
             continue;
         }
         println!(
-            "{:>7} | {:>6} | {:>8} | {:>9} | {:>8} | {:>7} | {:>8} | {:>10.3} | {:>10.3} | {:>10.3} | {:>14.0}",
+            "{:>7} | {:>6} | {:>7} | {:>8} | {:>9} | {:>8} | {:>7} | {:>8} | {:>9.2} | {:>9.2} | {:>10.3} | {:>10.3} | {:>10.3} | {:>14.0}",
             c.target_partitions,
             c.cache_wired,
+            c.over_threshold,
             c.scan_partitions,
             c.non_empty_partitions,
             c.segments_scanned,
             c.object_store_get_requests,
             c.cache_hits,
+            c.reads_per_segment,
+            c.bytes_amplification,
             c.median_ms,
             c.min_ms,
             c.max_ms,

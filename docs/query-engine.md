@@ -1464,13 +1464,24 @@ not buy: it stops `target_partitions` from setting the multiplier, but below the
 cap a plan with `n` partitions still opens each sufficiently-blocky segment `n`
 times, and the planning prune that counts surviving blocks adds one more read
 per segment. `ravel-bench`'s `logs_scan_scaling` report measures the cached and
-un-cached request counts side by side; its figures describe that fixture (a
-`MemoryStore`, a cache sized to hold the whole dataset), not striping in
-general. `crates/ravel-query/tests/log_block_range.rs` pins the above-threshold
-cached case exactly: on its 906,791-byte fixture, 2 partitions and 8 partitions
-striping one segment both cost 6 store GETs (one probe, four directory
-sections, one coalesced candidate run), and 8 concurrent cold partitions cost
-the same 6.
+un-cached request counts side by side, on above-threshold and whole-object read
+shapes alike; its figures describe that fixture (a `MemoryStore`, and on the
+cached rows a cache sized to hold the whole dataset), not striping in general.
+Its over-threshold rows are what put a number on the residual multiplier, and
+what show where it no longer applies: each row carries reads per segment and
+bytes fetched over dataset bytes, derived in the report rather than left to the
+reader. For a block-predicate-free statement whose window contains every
+relevant segment — the report's `SELECT ts, body FROM logs`, and the shape the
+whole-segment fast path serves (#693 part 3) — those two figures are 1 and
+about 1.0 at every partition count that fits inside the segment count, with or
+without a cache: the plan phase is skipped and each segment is read whole once,
+so there is nothing left for the cache to absorb. The multiplier reappears on
+the row whose partition count exceeds the segment count, which falls back to
+plan-then-stripe. `crates/ravel-query/tests/log_block_range.rs` pins the
+above-threshold cached case exactly: on its 906,791-byte fixture, 2 partitions
+and 8 partitions striping one segment both cost 6 store GETs (one probe, four
+directory sections, one coalesced candidate run), and 8 concurrent cold
+partitions cost the same 6.
 
 The peak-memory consequence follows the same gate, with a second term above the
 block-range threshold. Concurrently-held *decoded* memory is bounded by block
