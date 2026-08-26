@@ -216,10 +216,30 @@ over 8 objects (a partition holds 50,000 rows, below DataFusion's stock probe
 threshold and well above 8,192), 1 versus 8 partitions, measuring the
 aggregation-attributable peak: the `COUNT(DISTINCT)` peak minus a
 `count(attrs['u'])` baseline over the identical scan and projection, so the
-scan's own per-partition growth is not charged to the aggregate. Over three
-runs: 0.11x to 1.01x with the option on, 5.33x to 6.34x with it off. The test
-holds the ratio at or below 2.0x and its sibling asserts the unfixed session
-exceeds it.
+scan's own per-partition growth is not charged to the aggregate. Measured 0.11x
+(idle) to 2.79x (fully loaded test runner) with the option on, 5.33x to 6.34x
+with it off, so the test holds the partition ratio at or below 4x and asserts in
+the same run that the untightened session exceeds that bound, which is what
+keeps the bound from passing vacuously.
+
+How many partial tables are simultaneously resident at the pool's high-water
+mark is scheduling-dependent, so the fanned-out figure moves with machine load
+by an order of magnitude and no absolute bound on it is robust on its own. The
+load-matched assertion carries the weight: the tightened session's fanned-out
+figure must stay under 0.75 of the untightened one, both measured back to back
+in the same test (measured 0.02 to 0.52). Its red state is structural rather
+than empirical -- stop writing either threshold and the two measurements become
+the same session, so the share becomes exactly 1.0.
+
+One existing test moved with the behavior:
+`a_high_cardinality_aggregation_is_refused_by_the_aggregate_not_the_scan`
+(decision 3's operator-identity case) now sets `skip_partial_aggregation` off.
+Its subject is the aggregate operator's own non-spillable reservation being what
+the pool refuses, and with the probe tightened its `GROUP BY ts` stops growing
+after 8192 rows, so the refusal comes from `RepartitionExec`/`RsegScanExec`
+instead. The typed-error requirement decision 3 actually states is unaffected
+and still covered by
+`a_high_cardinality_aggregation_over_budget_is_resources_exhausted`.
 
 Per-entry cost, for sizing a pool by arithmetic instead of guesswork: the
 aggregation-attributable peak divided by `D` is 65.4 bytes at `D = 50,000` and
