@@ -1,13 +1,20 @@
 //! Bounded per-tenant cache of decoded commit records, keyed by full object
 //! key (docs/catalog-and-mvcc.md step 2, ADR-0010 §10).
 //!
-//! Capacity-cap eviction (FIFO): the simpler of the two strategies the ADR
-//! explicitly allows ("simple LRU or capacity cap per tenant"). Commit
-//! records are immutable once published (Phase 1 has no deletion), so
-//! eviction only costs a re-GET+decode on the next miss, never
-//! correctness. Field validation against the expected (tenant, signal,
-//! shard) happens in the caller on every hit and every fresh decode, not
-//! here: the cache only stores and evicts.
+//! LRU eviction, the other of the two strategies the ADR allows ("simple LRU
+//! or capacity cap per tenant"). The cache outlives any one resolve, so the
+//! hot ingest hours a query keeps returning to must not be evicted by a
+//! one-off wide scan or a fold's sweep of older buckets, which is exactly
+//! what insertion-order eviction does to them. Commit records are immutable
+//! once published (Phase 1 has no deletion), so eviction only costs a
+//! re-GET+decode on the next miss, never correctness. Field validation
+//! against the expected (tenant, signal, shard) happens in the caller on
+//! every hit and every fresh decode, not here: the cache only stores and
+//! evicts.
+//!
+//! A `capacity` of 0 is the disabled sentinel (matching
+//! [`CatalogConfig::byte_cache_max_bytes`](crate::CatalogConfig::byte_cache_max_bytes)):
+//! nothing is admitted at all, so every read falls through to a store GET.
 //!
 //! Every `get()` below also records a hit or a miss, and a hit's stored byte
 //! size, into the caller's [`QueryAccounting`] (ADR-0044): the
@@ -28,29 +35,77 @@ use ravel_types::{Signal, TenantHash};
 
 use crate::snapshot_format::{DecodedPart, DecodedPostings};
 
+/// One cached commit record plus the recency stamp that positions it in
+/// [`TenantCache::by_use`].
+struct RecordEntry {
+    record: Arc<CommitRecord>,
+    /// Size of the raw object this was decoded from, captured at insert so a
+    /// hit never re-derives it (see the module docs on accounting).
+    bytes: u64,
+    use_tick: u64,
+}
+
 #[derive(Default)]
 struct TenantCache {
-    entries: HashMap<String, (Arc<CommitRecord>, u64)>,
-    /// Insertion order, oldest first, for capacity-cap eviction.
-    order: std::collections::VecDeque<String>,
+    entries: HashMap<String, RecordEntry>,
+    /// Recency index, least-recently-used first: `use_tick -> key`, in step
+    /// with `entries`. A monotonic tick keeps a touch O(log n) rather than
+    /// the O(n) a queue would cost, which matters because a single resolve
+    /// over a hot ingest hour touches every entry twice (the concurrent
+    /// prewarm, then the sequential include pass).
+    by_use: std::collections::BTreeMap<u64, String>,
+    next_tick: u64,
 }
 
 impl TenantCache {
+    /// Return the entry for `key` and mark it most-recently-used, or `None`
+    /// when absent (an absent key leaves the recency order untouched).
+    fn touch(&mut self, key: &str) -> Option<(Arc<CommitRecord>, u64)> {
+        let tick = self.next_tick;
+        let entry = self.entries.get_mut(key)?;
+        let previous = entry.use_tick;
+        entry.use_tick = tick;
+        let hit = (entry.record.clone(), entry.bytes);
+        self.by_use.remove(&previous);
+        self.by_use.insert(tick, key.to_string());
+        self.next_tick += 1;
+        Some(hit)
+    }
+
     fn insert(&mut self, key: String, record: Arc<CommitRecord>, bytes: u64, capacity: usize) {
-        if self.entries.contains_key(&key) {
+        if capacity == 0 {
             return;
         }
-        self.entries.insert(key.clone(), (record, bytes));
-        self.order.push_back(key);
-        while self.order.len() > capacity.max(1) {
-            if let Some(oldest) = self.order.pop_front() {
-                self.entries.remove(&oldest);
-            }
+        // Already held: records are immutable, so keep the stored value and
+        // only refresh its recency.
+        if self.touch(&key).is_some() {
+            return;
+        }
+        let tick = self.next_tick;
+        self.next_tick += 1;
+        self.entries.insert(
+            key.clone(),
+            RecordEntry {
+                record,
+                bytes,
+                use_tick: tick,
+            },
+        );
+        self.by_use.insert(tick, key);
+        while self.entries.len() > capacity {
+            let Some((_, evicted)) = self.by_use.pop_first() else {
+                break;
+            };
+            self.entries.remove(&evicted);
         }
     }
 }
 
-/// Decoded-record cache, partitioned by tenant.
+/// Decoded-record cache, partitioned by tenant. Process-wide: one `Catalog`
+/// is built per process and held for its lifetime, so an entry admitted by one
+/// resolve is served to every later resolve over the same object key, which is
+/// what makes a repeated resolve over an unsealed ingest hour cost its LISTs
+/// and nothing else (issue #783).
 #[derive(Default)]
 pub(crate) struct RecordCache {
     tenants: Mutex<HashMap<TenantHash, TenantCache>>,
@@ -66,8 +121,8 @@ impl RecordCache {
         let hit = self
             .tenants
             .lock()
-            .get(tenant)
-            .and_then(|c| c.entries.get(key).cloned());
+            .get_mut(tenant)
+            .and_then(|c| c.touch(key));
         match hit {
             Some((record, bytes)) => {
                 accounting.record_cache_hit();
@@ -104,7 +159,7 @@ impl RecordCache {
     pub(crate) fn invalidate_prefix(&self, tenant: &TenantHash, prefix: &str) {
         if let Some(cache) = self.tenants.lock().get_mut(tenant) {
             cache.entries.retain(|k, _| !k.starts_with(prefix));
-            cache.order.retain(|k| !k.starts_with(prefix));
+            cache.by_use.retain(|_, k| !k.starts_with(prefix));
         }
     }
 
@@ -542,6 +597,83 @@ mod tests {
         assert!(cache.get(&tenant, "k2", &accounting).is_some());
         assert!(cache.get(&tenant, "k3", &accounting).is_some());
         assert!(cache.get(&tenant, "k4", &accounting).is_some());
+    }
+
+    /// The one case that separates LRU from insertion-order eviction: a read
+    /// of the oldest entry protects it, and the next-oldest goes instead. A
+    /// hot ingest hour queries keep returning to must survive a wider scan
+    /// admitted after it (issue #783), which insertion-order eviction cannot
+    /// give.
+    #[test]
+    fn lru_evicts_the_least_recently_used() {
+        let cache = RecordCache::default();
+        let tenant = TenantHash([16; 16]);
+        let accounting = QueryAccounting::new();
+        for i in 0..3 {
+            cache.insert(tenant, format!("k{i}"), Arc::new(record([16; 16], 0)), 1, 3);
+        }
+        // Read the oldest-inserted entry: now the least-recently-used is k1.
+        assert!(cache.get(&tenant, "k0", &accounting).is_some());
+        cache.insert(
+            tenant,
+            "k3".to_string(),
+            Arc::new(record([16; 16], 0)),
+            1,
+            3,
+        );
+
+        assert!(
+            cache.get(&tenant, "k0", &accounting).is_some(),
+            "the re-read entry must survive; insertion-order eviction would have dropped it"
+        );
+        assert!(
+            cache.get(&tenant, "k1", &accounting).is_none(),
+            "the least-recently-used entry must be the one evicted"
+        );
+        assert!(cache.get(&tenant, "k2", &accounting).is_some());
+        assert!(cache.get(&tenant, "k3", &accounting).is_some());
+    }
+
+    /// A re-insert of a key already held refreshes its recency rather than
+    /// being ignored: the resolve's prewarm and include passes both go
+    /// through `insert`/`get` for the same key, so an ignored re-insert would
+    /// leave a record the resolve just used looking stale to eviction.
+    #[test]
+    fn reinsert_refreshes_recency() {
+        let cache = RecordCache::default();
+        let tenant = TenantHash([17; 16]);
+        let accounting = QueryAccounting::new();
+        for i in 0..3 {
+            cache.insert(tenant, format!("k{i}"), Arc::new(record([17; 16], 0)), 1, 3);
+        }
+        cache.insert(
+            tenant,
+            "k0".to_string(),
+            Arc::new(record([17; 16], 0)),
+            1,
+            3,
+        );
+        cache.insert(
+            tenant,
+            "k3".to_string(),
+            Arc::new(record([17; 16], 0)),
+            1,
+            3,
+        );
+
+        assert!(cache.get(&tenant, "k0", &accounting).is_some());
+        assert!(cache.get(&tenant, "k1", &accounting).is_none());
+    }
+
+    /// `0` is the disabled sentinel: nothing is admitted, so every read is a
+    /// miss and falls through to a store GET.
+    #[test]
+    fn zero_capacity_admits_nothing() {
+        let cache = RecordCache::default();
+        let tenant = TenantHash([18; 16]);
+        let accounting = QueryAccounting::new();
+        cache.insert(tenant, "k".to_string(), Arc::new(record([18; 16], 0)), 1, 0);
+        assert!(cache.get(&tenant, "k", &accounting).is_none());
     }
 
     #[test]
