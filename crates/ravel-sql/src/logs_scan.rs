@@ -933,6 +933,8 @@ fn plan_counts_future(
 /// semantics (the first error aborts the plan, and `get_or_try_init` does not
 /// cache it); the fetcher's own in-flight GET semaphore remains the global
 /// bound, so an oversized `plan_concurrency` is safe.
+// Issue #693 part 3: the predicate-free full-window fast path in `execute`
+// skips this whole pass; see `owned_work` and `plan_segment_fast`.
 async fn compute_plan_counts(
     ctx: &PartitionCtx,
     segments: &[SegmentRef],
