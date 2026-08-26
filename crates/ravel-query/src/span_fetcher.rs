@@ -84,6 +84,19 @@ pub struct SpanRow {
 pub struct SpanFetchOutput {
     pub records: Vec<SpanRow>,
     pub stats: ScanStats,
+    /// Column pages this fetch's decode decompressed, summed over the blocks it
+    /// scanned. The row exit decodes every page of every block it scans, so this
+    /// is the whole page count of the scanned blocks and
+    /// [`pages_skipped`](Self::pages_skipped) is 0. `ScanStats` carries no page
+    /// counters (only block ones), so these two ride here, from the same
+    /// per-block decode counts the page-byte accounting folds.
+    pub pages_decoded: usize,
+    /// Column pages this fetch's decode walked past because the projection
+    /// excluded them. Always 0 for the row exit, which requests every column;
+    /// it is a measured 0, not an absent counter, so a caller publishing it can
+    /// state the row path skipped nothing rather than leaving a metric unwritten
+    /// (#669).
+    pub pages_skipped: usize,
 }
 
 /// One candidate block resolved to its absolute, bounds-checked
@@ -439,6 +452,8 @@ impl SpanSegmentFetcher {
             accounting,
             page_bytes_fetched: 0,
             page_bytes_decoded: 0,
+            pages_decoded: 0,
+            pages_skipped: 0,
             finished: false,
         })
     }
@@ -544,6 +559,14 @@ pub struct SpanColumnarScan {
     accounting: QueryAccounting,
     page_bytes_fetched: u64,
     page_bytes_decoded: u64,
+    /// Column pages decoded and skipped across the blocks drained so far: the
+    /// count-side siblings of the `page_bytes_*` totals above, taken from the
+    /// same per-block decode. Exposed rather than folded into `accounting`
+    /// because a scan's caller publishes them as PARTITION metrics
+    /// (`SpansScanExec`'s `pages_decoded`/`pages_skipped`), which the
+    /// query-global accounting handle cannot express.
+    pages_decoded: usize,
+    pages_skipped: usize,
     /// Set once the accounting fold has run, so it runs exactly once.
     finished: bool,
 }
@@ -558,6 +581,19 @@ impl SpanColumnarScan {
     /// Candidate blocks not yet decoded.
     pub fn remaining_blocks(&self) -> usize {
         self.candidates.len() - self.cursor
+    }
+
+    /// Column pages the blocks drained so far decompressed. Read after the last
+    /// [`next_block`](Self::next_block), or at any point for the partial total.
+    pub fn pages_decoded(&self) -> usize {
+        self.pages_decoded
+    }
+
+    /// Column pages the blocks drained so far walked past because this scan's
+    /// projection excluded them. Always 0 when the scan requests every column
+    /// (the row exit).
+    pub fn pages_skipped(&self) -> usize {
+        self.pages_skipped
     }
 
     /// Decode the next candidate block and return it with its surviving row
@@ -582,6 +618,8 @@ impl SpanColumnarScan {
             .map_err(|source| corrupt(&self.key, source))?;
         self.page_bytes_fetched += decoded.page_bytes_fetched;
         self.page_bytes_decoded += decoded.page_bytes_decoded;
+        self.pages_decoded += decoded.block.pages_decoded();
+        self.pages_skipped += decoded.block.pages_skipped();
         self.stats.blocks_scanned += 1;
         let rows = surviving_rows(&decoded.block, &self.query)
             .map_err(|source| corrupt(&self.key, source))?;
@@ -831,6 +869,10 @@ fn build_span_row(block: &DecodedBlock, row: usize) -> Result<SpanRow, SpanSegEr
 /// primitive, so `fetch`/`fetch_accounted` share candidate selection, bloom
 /// probing, ts/`trace_id` filtering, and the page-byte fold with the columnar
 /// exit. Dropping the scan folds its accounting (`finish`).
+///
+/// The scan's page counts ride out on the output next to `stats`, so the row
+/// exit's caller can publish the same `pages_decoded`/`pages_skipped` figures
+/// the columnar exit's caller reads off each [`ColumnarBlock`] (#669).
 fn drain_rows(mut scan: SpanColumnarScan) -> Result<SpanFetchOutput, SpanFetchError> {
     let mut records = Vec::new();
     while let Some(block) = scan.next_block()? {
@@ -841,7 +883,12 @@ fn drain_rows(mut scan: SpanColumnarScan) -> Result<SpanFetchOutput, SpanFetchEr
         }
     }
     let stats = scan.stats();
-    Ok(SpanFetchOutput { records, stats })
+    Ok(SpanFetchOutput {
+        records,
+        stats,
+        pages_decoded: scan.pages_decoded(),
+        pages_skipped: scan.pages_skipped(),
+    })
 }
 
 /// The absolute, bounds-checked `[start, end)` byte range of one block within
@@ -1117,6 +1164,74 @@ mod tests {
             col_rows,
             row_out.records.len(),
             "both exits select the identical surviving-row multiset"
+        );
+    }
+
+    /// Issue #669: the row exit reports the page COUNTS its decode performed, so
+    /// its caller can publish the same `pages_decoded`/`pages_skipped` metrics
+    /// the columnar exit's caller publishes. Exact figures, from the fixture's
+    /// geometry: 6 spans cut every 2 records is 3 blocks, and each block stages
+    /// 13 pages (`trace_id`, `span_id`, `name`, `start_ts`, `end_ts`,
+    /// `status_code`, `service_name`, the two dynamic attribute columns, and the
+    /// four event columns; `parent_span_id`, `status_message`, and `attrs_raw`
+    /// have no value on any fixture span, and a column with no present value
+    /// stages no page). The row exit decodes all 39 and skips none; the
+    /// fixed-column projection splits those same 39 into 21 decoded and 18
+    /// skipped.
+    #[tokio::test]
+    async fn row_exit_reports_the_page_counts_the_columnar_exit_splits() {
+        let store = Arc::new(MemoryStore::new());
+        let records: Vec<SpanRecord> = (0..6)
+            .map(|i| {
+                span_with_attrs_and_events(
+                    trace(i + 1),
+                    span(i + 1),
+                    100 + i64::from(i),
+                    200 + i64::from(i),
+                )
+            })
+            .collect();
+        let seg = write_object(&store, 0, &records).await;
+        let fetcher = SpanSegmentFetcher::new(store);
+        let query = all_query();
+
+        let acct = QueryAccounting::new();
+        let row_out = fetcher
+            .fetch_accounted(&seg, TENANT, &query, None, None, &[], &acct)
+            .await
+            .expect("row fetch")
+            .expect("row output");
+        assert_eq!(row_out.stats.blocks_scanned, 3, "three blocks scanned");
+        assert_eq!(
+            (row_out.pages_decoded, row_out.pages_skipped),
+            (39, 0),
+            "the row exit decodes every page of every block it scans"
+        );
+
+        let mut scan = fetcher
+            .fetch_accounted_columnar(
+                &seg,
+                TENANT,
+                &query,
+                None,
+                None,
+                &[],
+                &FIXED_PROJECTION,
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("columnar fetch")
+            .expect("columnar scan");
+        while scan.next_block().expect("next block").is_some() {}
+        assert_eq!(
+            (scan.pages_decoded(), scan.pages_skipped()),
+            (21, 18),
+            "the fixed-column projection's split of those same pages"
+        );
+        assert_eq!(
+            scan.pages_decoded() + scan.pages_skipped(),
+            row_out.pages_decoded,
+            "both exits walk the same pages; only the split differs"
         );
     }
 
