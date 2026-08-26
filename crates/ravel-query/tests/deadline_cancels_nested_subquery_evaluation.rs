@@ -111,6 +111,8 @@ async fn publish_up_segment(
 /// eventually return `DeadlineExceeded` (via the outer `tokio::time::
 /// timeout`), but only after the full ~1.5s of synchronous work, since
 /// nothing inside that work would ever yield or check the deadline itself.
+///
+/// Refs: #706.
 #[tokio::test]
 async fn short_deadline_cancels_nested_subquery_reevaluation_through_the_engine() {
     let tenant_id = TenantId::new("tenant-a".to_string());
