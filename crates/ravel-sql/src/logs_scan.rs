@@ -773,6 +773,10 @@ impl LogsScanExec {
     /// read whole in one GET on both the plan and scan paths (they coalesce on
     /// the same `(0, object_size)` cache key), so the fast path would add nothing
     /// and would only diverge from the existing small-object tests.
+    ///
+    /// Issue #739 revisits the threshold conjunct: it is query-wide here, so a
+    /// single below-threshold tail object disqualifies every segment in the
+    /// snapshot.
     fn whole_segment_fast_path(&self, query: &LogQuery) -> Option<usize> {
         if !query.is_block_predicate_free() {
             return None;
