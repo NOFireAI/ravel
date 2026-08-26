@@ -112,20 +112,26 @@ or attribute-equality prune, or any pending selective erasure in the snapshot
 
 This exact leaf statistic only reaches DataFusion's `AggregateStatistics`
 rule end to end when no `FilterExec` survives above the scan to intercept
-it: `LogsTableProvider::supports_filters_pushdown` currently reports
-`Inexact` for every filter unconditionally (crates/ravel-sql/src/
-logs_provider.rs), so DataFusion keeps re-applying any pushed filter,
-`ts` bound included, in a `FilterExec` above `LogsScanExec`, and that
-`FilterExec` reports its own (non-exact) statistics rather than passing
-the leaf's `Exact` count through. In practice the zero-GET rewrite fires
-today only for the genuinely predicate-free query (no `ts` bound, no
-content, no prune) -- the only shape with no filter left to push down at
-all. The contained-`ts`-bound case computes a correct `Exact` leaf
-statistic (and its `ts` min/max still reach the planner as a leaf
-property), but a `COUNT(*)` with a contained `ts` bound still scans today;
-making `supports_filters_pushdown` report the bound as `Exact` when it is
-already absorbed by this containment check is a separate, unimplemented
-follow-up (issue #733).
+it, because a `FilterExec` reports its own (non-exact) statistics rather
+than passing the leaf's `Exact` count through. So
+`LogsTableProvider::supports_filters_pushdown` (crates/ravel-sql/src/
+logs_provider.rs) reports `Exact` for a filter that resolves purely to a
+`ts` bound and/or a `has_word` content predicate (issue #733), which
+deletes it from the plan: both land in the channel the RLOG reader
+re-verifies against each decoded row's own value (`ravel_logseg`'s `eval`,
+its `Predicate::TsRange` and `Predicate::HasWord` arms), so no residual is
+needed. A `COUNT(*)` over a contained `ts` bound therefore takes the same
+zero-GET path the genuinely predicate-free query does.
+
+Every other filter stays `Inexact`. An `attrs['k'] = 'v'` equality and
+every declared typed column predicate (ADR-0093) go to the prune-only
+channel, which the reader uses for block pruning ONLY and never evaluates
+per row, so DataFusion's residual remains the sole exact evaluator; a
+filter recognized only in part (a `ts` bound AND-ed with an unrecognized
+sub-expression in one unsplit expression) is `Inexact` too, never
+partially credited. A distributed coordinator (ADR-0071) also reports
+every filter `Inexact`, since its fan-out pushes no filter to the workers
+and needs each one back as a residual.
 
 ## Predicate-free full-window logs scan: request count
 

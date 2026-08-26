@@ -181,8 +181,10 @@
 //! not extracted into the fetch at all ([`crate::logs_pushdown`]).
 //!
 //! Correctness comes solely from the merged `attrs` column plus the residual.
-//! Pushdown is always `Inexact`, so DataFusion re-applies the *original*
-//! predicate against the emitted batch. [`build_batch`] populates the `attrs`
+//! An attribute predicate's pushdown is always `Inexact`
+//! ([`crate::logs_pushdown::filter_is_exact`] answers `true` for the ts and
+//! `has_word` shapes only), so DataFusion re-applies the *original* predicate
+//! against the emitted batch. [`build_batch`] populates the `attrs`
 //! column from the fully merged view (ADR-0033 amendment), so the
 //! residual evaluates `attrs['k'] = 'v'` against exactly the data a row's SQL
 //! semantics demand: a resource-only match survives (the residual sees it in the
@@ -871,15 +873,11 @@ impl ExecutionPlan for LogsScanExec {
     /// rewrites the aggregate into a literal, so this scan is never executed
     /// (issue #698: on the ClickBench tenant, issue #680, a scanning
     /// `count(*)` moved 23 GB from object storage to add up 8424 numbers the
-    /// resolve already had). For a query with an actual, contained `ts`
-    /// bound, this leaf statistic is still correct, but
-    /// `LogsTableProvider::supports_filters_pushdown` reports every filter
-    /// `Inexact`, so DataFusion keeps a `FilterExec` re-applying the bound
-    /// above this node; that `FilterExec` reports its own (non-exact)
-    /// statistics rather than passing this one through, so the rewrite does
-    /// not fire and the query still scans. Issue #733 tracks closing that
-    /// reachability gap; until then this method is correct but only
-    /// end-to-end effective for the no-bound case.
+    /// resolve already had). A query with an actual, contained `ts` bound now
+    /// reaches the rule the same way: `LogsTableProvider::supports_filters_\
+    /// pushdown` reports a pure `ts` bound `Exact` (issue #733), so no
+    /// `FilterExec` survives above this node to report its own non-exact
+    /// statistics in place of this one.
     ///
     /// `num_rows` is `Exact` only for the whole-plan request (`partition` is
     /// `None`) and only when [`Self::stats_are_exact`] holds; a per-partition
