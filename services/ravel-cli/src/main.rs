@@ -627,6 +627,33 @@ enum MaintainCommand {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Compact every sealed bucket of a whole tenant signal: walk each shard's
+    /// ingest hours and run the same per-bucket compaction `compact-bucket`
+    /// runs, so an operator no longer has to guess the hour numbers or write a
+    /// per-(shard, hour) shell loop.
+    CompactTenant {
+        #[arg(long)]
+        tenant: String,
+        #[arg(long, value_enum)]
+        signal: SignalArg,
+        /// Shard count to walk (shards `0..N`). Omit to resolve it from the
+        /// tenant's durable provisioning record; with neither, the command
+        /// errors naming the tenant.
+        #[arg(long)]
+        shards: Option<u32>,
+        /// First ingest-hour bucket to consider, inclusive. Omit to start at
+        /// each shard's oldest present hour.
+        #[arg(long)]
+        from_hour: Option<u32>,
+        /// Last ingest-hour bucket to consider, inclusive. Omit to stop at the
+        /// current hour.
+        #[arg(long)]
+        to_hour: Option<u32>,
+        /// Compute each bucket's plan and report it, but write no L1 parts or
+        /// records.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Run one sweep pass (orphan GC, superseded, unreferenced parts) over a shard.
     Sweep {
         #[arg(long)]
@@ -856,6 +883,20 @@ async fn main() -> anyhow::Result<()> {
                 dry_run,
             )
             .await
+        }
+        Command::Maintain {
+            command:
+                MaintainCommand::CompactTenant {
+                    tenant: _,
+                    signal: _,
+                    shards: _,
+                    from_hour: _,
+                    to_hour: _,
+                    dry_run: _,
+                },
+        } => {
+            println!("not implemented");
+            std::process::exit(2);
         }
         Command::Maintain {
             command:
