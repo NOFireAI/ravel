@@ -692,6 +692,9 @@ mod tests {
             report.attrs_including.pages_skipped, 0,
             "the row shape requests every column, so it skips no page"
         );
+        // Holds because this corpus's attrs-including shape takes the row path
+        // directly. A shape whose columnar attempt fell back on an `attrs_raw`
+        // block would carry that attempt's counts too and read higher (#669).
         assert_eq!(
             report.attrs_including.pages_decoded,
             report.attrs_free.pages_decoded + report.attrs_free.pages_skipped,
