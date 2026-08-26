@@ -834,6 +834,14 @@ pub async fn measure_corpus(
     // every entry's execution, both lanes (run_generated/run_tenant funnel
     // through this one function), so a query-side profile always reflects the
     // full corpus rather than one statement in isolation.
+    //
+    // Refuse a profiled multi-run pass before arming the sampler (issue #616):
+    // one guard already brackets the whole region, yet the pprof signal sampler
+    // still segfaults probabilistically the longer it stays armed, so more runs
+    // crash rather than measure. Take the flamegraph from `--runs 1` and the
+    // latencies from a separate unprofiled pass.
+    crate::profiling::runs_supported_with_profiling(crate::profiling::profile_requested(), runs)
+        .map_err(Error::from)?;
     let profile = crate::profiling::ProfileSession::from_env("sql_latency_bench");
 
     'entries: for entry in entries {
