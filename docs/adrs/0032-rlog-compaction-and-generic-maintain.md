@@ -202,3 +202,114 @@ construction once the codec seam exists.
 - `docs/log-segment-format.md` and `proto/ravel/logseg.proto` are
   amended in the same commits as the code that implements each change,
   per the doc-currency rule.
+
+## Amendment 2026-08-26: a part never exceeds the size cap; a stream may span parts
+
+Status: accepted. Supersedes the one-stream-per-part rule that the RLOG
+merge implemented under "stream-merge N inputs into size-capped output
+parts" above. Issue #711.
+
+### What changed
+
+The original RLOG compactor split parts on stream boundaries only: it
+merged one whole stream into the in-progress part, then compared the
+part's accumulated record-byte estimate against `max_l1_part_bytes` and
+opened a new part if the cap was reached. The invariant that produced -
+"a stream never straddles two parts", the log analogue of RSEG's
+series-boundary split - is replaced by a pure size bound:
+
+> A part never exceeds `max_l1_part_bytes` of estimated live record heap.
+> A stream may span consecutive parts.
+
+The cap is now checked after every merged record, so a part closes
+wherever in the merged record sequence the cap falls.
+
+### Why
+
+An RLOG stream is one `(resource, scope)` pair. A tenant sending one
+OTLP resource and scope - a single service, the ordinary shape for logs -
+puts its entire hour into one stream, so a stream-boundary split rule
+gives that bucket no split point at all. Measured on one (shard, hour)
+bucket of a 16-shard ClickBench logs tenant (about 270 RLOG inputs,
+350 MB compressed, 3M rows of 105 attributes, one stream):
+`ravel-cli maintain compact-bucket --signal logs` ran over 12 minutes at
+45.7 GB resident on one core. The k-way block-streaming merge of
+ADR-0065 decision 4 had already bounded the read side to one decoded
+block per input; what was left unbounded was the writer, which held every
+merged record of the stream as a row-major `LogRecord`.
+
+The size estimate was the second half of the defect. It counted payload
+bytes (body, severity text, attribute keys and values) while the writer
+holds `LogRecord`s, whose Rust representation for a wide row is an order
+of magnitude larger: per-row `String` and `Vec` headers and allocations,
+a per-row copy of the resource/scope blob, and one `(String, AttrValue)`
+slot per attribute, which for 105 attributes is 12-16 KB of heap per row
+against roughly 1 KB of payload. A nominal 256 MiB cap therefore
+permitted several GB of live records even where a split point existed.
+`estimate_record` now charges the record's Rust-side heap, term by term
+(the formula is stated above the function in `crates/ravel-maintain/src/rlog.rs`),
+so 256 MiB of estimate is roughly 256 MiB of heap.
+
+Both halves are needed. Moving the check alone would still let a part
+grow past the cap by the estimate's error factor; fixing the estimate
+alone would still leave a single-stream bucket with nowhere to split.
+
+### What readers must tolerate
+
+The bytes of a part are unchanged: each part is still written by the
+frozen `ravel-logseg` writer, from records still pushed in global
+`(stream_id, ts)` order, so every part is individually sorted and
+self-describing exactly as before. Only the partitioning of records into
+parts changed. Concretely:
+
+- **Two consecutive parts of one compaction may carry the same
+  `stream_id`.** `CompactionPart.first_series_id` and `last_series_id`
+  are then *adjacent* rather than strictly disjoint: part `k`'s `last`
+  may equal part `k+1`'s `first`. Their event-time ranges remain
+  non-overlapping and ascending, because records enter parts in ts order
+  within a stream.
+- **Nothing may prune on those bounds assuming disjointness.** Today
+  nothing does: `ravel_catalog`'s `build_l1_segment_ref` turns every part
+  into its own `SegmentRef` and the resolver unions them, filtering on
+  event time only. A future pruning optimization over the series bounds
+  must treat them as a closed interval that a neighbour may share, not as
+  a partition.
+- **Record conservation is unaffected.** The compaction gate
+  (`conserve_exact`) and ADR-0064's erasure gate both sum
+  `part.sample_count`; splitting repartitions records and never adds or
+  drops one.
+- **`sum(part.series_count)` is no longer a distinct-stream count.** A
+  stream that straddles a boundary is counted once per part it appears
+  in. That aggregate is reported (`maintain status`, `CompactionRecord`)
+  and never used as a gate, so this is a reporting change, not a
+  correctness one. A caller that needs the true distinct-stream count of
+  a compaction must union the parts' `STREAM_DIR`s.
+- **Part counts rise, and parts get smaller on disk than the cap
+  suggests.** The cap now bounds estimated heap, not encoded bytes, so a
+  wide-row bucket produces more, individually smaller, L1 objects than
+  the same nominal cap produced before. That is the intended trade:
+  bounded compactor memory in exchange for more objects. Operators who
+  want fewer, larger parts raise `max_l1_part_bytes` deliberately, with
+  the memory cost now visible in the same number.
+
+### Input read concurrency
+
+The same issue covers the compaction read path, which was a chain of
+sequential awaits: one commit-record GET per input, then one catalog load
+per input, then one block GET per cursor advance. A new
+`CompactorConfig::input_read_concurrency` (default 8) bounds how many of
+those are in flight, and each stream cursor prefetches one block ahead.
+This is a latency change only. Output bytes cannot depend on it: inputs
+are re-sorted into canonical `(writer_id, writer_epoch, writer_seq)`
+order after loading, catalogs stay aligned to that order, and the merge
+is a deterministic k-way merge over it. A test asserts the parts are
+byte-identical at concurrency 1 and 8.
+
+### Not in scope
+
+`build_rewrite_logs` (the ADR-0064 erasure rewriter for logs) still
+fetches every input object whole and pushes every survivor into a single
+`RlogWriter` with no size cap, by the deliberate scope reduction its own
+module documents. It has the same unbounded-writer shape this amendment
+removed from the compactor, and reaches it on the same tenant shape. It
+is not changed here; see the issue for the follow-up.

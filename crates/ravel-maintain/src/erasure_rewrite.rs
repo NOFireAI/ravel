@@ -3477,6 +3477,180 @@ mod tests {
         );
     }
 
+    /// ADR-0064 conservation through a mid-stream part split (issue #711).
+    ///
+    /// The bucket holds one log stream whose records exceed the compactor's
+    /// part cap several times over, so a real `compact_bucket` publishes a
+    /// compaction record naming SEVERAL L1 parts that all carry the same
+    /// `stream_id` -- the shape that did not exist before #711, when a stream
+    /// never straddled a part boundary. An erasure then runs over that
+    /// compacted bucket: it resolves the compaction record as its live input,
+    /// reads every one of its parts, and must conserve the count across all of
+    /// them (`input == output + dropped`, ADR-0064 decision 3 point 4).
+    ///
+    /// Non-vacuity is asserted, not assumed: the compaction must have produced
+    /// more than one part, and the erasure must have dropped a non-zero count
+    /// spread across more than one of those parts.
+    ///
+    /// Flip-line proof: in `publish_rewrite_record`, flipping `if
+    /// reconstructed != build.input_sample_count` to `==` makes a conservation
+    /// break publishable, and the `assert_eq!` on the surviving record set
+    /// below is what then fails. Removing the loop over `object_keys` in
+    /// `build_rewrite_logs` (reading only the first part) leaves the gate
+    /// itself to reject the run, failing `expect("erasure rewrite")`.
+    #[tokio::test]
+    async fn logs_erasure_conserves_count_through_a_mid_stream_part_split() {
+        const RECORDS: i64 = 400;
+        const CAP: u64 = 32 * 1024;
+        // Every fourth record belongs to the erased subject.
+        const ERASED_EVERY: i64 = 4;
+
+        let store = MemoryStore::new();
+        // One stream, wide rows, half in each of two L0 inputs.
+        let subject_of = |i: i64| {
+            if i % ERASED_EVERY == 0 {
+                "erased-subject"
+            } else {
+                "kept-subject"
+            }
+        };
+        let make = |i: i64| {
+            let mut attrs: Vec<(String, LogAttrValue)> = (0..8u32)
+                .map(|k| {
+                    (
+                        format!("attr_{k:02}"),
+                        LogAttrValue::Str(format!("value-{i:08}-{k:02}")),
+                    )
+                })
+                .collect();
+            attrs.push((
+                "user_id".to_string(),
+                LogAttrValue::Str(subject_of(i).to_string()),
+            ));
+            log_record(
+                0,
+                i64::from(HOUR) * NS_PER_HOUR + i,
+                &format!("row-{i:08}"),
+                attrs,
+            )
+        };
+        let all: Vec<LogRecord> = (0..RECORDS).map(make).collect();
+        for (j, chunk) in all.chunks(RECORDS as usize / 2).enumerate() {
+            seed_logs(&store, j as u64 + 1, chunk).await;
+        }
+
+        let clock = FixedClock::new(sealed_now_ns());
+        let config = CompactorConfig {
+            max_l1_part_bytes: CAP,
+            ..CompactorConfig::default()
+        };
+
+        // A real compaction first: this is what produces the straddling parts.
+        crate::compact::compact_bucket(&store, &clock, &config, &logs_bucket())
+            .await
+            .expect("compact");
+        let listing = crate::read::list_bucket(&store, &logs_bucket())
+            .await
+            .expect("list bucket");
+        assert_eq!(listing.compaction_record_keys.len(), 1);
+        let got = store
+            .get(&listing.compaction_record_keys[0], GetRange::Full)
+            .await
+            .expect("get compaction record");
+        let crec = CompactionRecord::decode(got.data.as_ref()).expect("decode");
+        assert!(
+            crec.parts.len() > 1,
+            "the fixture must split into several parts, got {}",
+            crec.parts.len()
+        );
+        let (stream0, _) = log_stream_ident(0);
+        for part in &crec.parts {
+            assert_eq!(
+                part.first_series_id,
+                stream0.0.to_vec(),
+                "every part must carry the one straddling stream"
+            );
+        }
+        // The erased subject really spans more than one part.
+        let mut parts_touching_subject = 0;
+        for part in &crec.parts {
+            let key = keys::reconstruct_l1_part_key(&crec, part).expect("part key");
+            let rows = decode_logs_part(&store, &key).await;
+            if rows.iter().any(|r| {
+                r.attrs.iter().any(|(k, v)| {
+                    k == "user_id" && v == &LogAttrValue::Str("erased-subject".to_string())
+                })
+            }) {
+                parts_touching_subject += 1;
+            }
+        }
+        assert!(
+            parts_touching_subject > 1,
+            "the erased subject must span several parts, touched {parts_touching_subject}"
+        );
+
+        let pending = vec![PendingErasureRequest {
+            request_key: "unused-in-memory-only".to_string(),
+            request: logs_erasure_request(7, "user_id", "erased-subject"),
+        }];
+        let mut memo = MaintainMemo::with_default_interval();
+        let outcome = erasure_rewrite_bucket(
+            &store,
+            &clock,
+            &config,
+            &NoLeases,
+            &logs_bucket(),
+            &pending,
+            &mut memo,
+        )
+        .await
+        .expect("erasure rewrite");
+        let publish = match outcome {
+            ErasureRewriteOutcome::Rewritten { publish, .. } => publish,
+            other => panic!("expected Rewritten, got {other:?}"),
+        };
+        assert_eq!(publish, PublishOutcome::Published);
+
+        // Conservation: input == output + dropped, over every part of the
+        // split compaction.
+        let expected_dropped = (0..RECORDS)
+            .filter(|i| subject_of(*i) == "erased-subject")
+            .count();
+        let record = read_rewrite_record_for(&store, &logs_bucket()).await;
+        assert_eq!(record.drops.len(), 1);
+        assert_eq!(
+            record.drops[0].dropped_count as usize, expected_dropped,
+            "every erased row across every part must be counted once"
+        );
+        let output_total: u64 = record.parts.iter().map(|p| p.sample_count).sum();
+        assert_eq!(
+            output_total + record.drops[0].dropped_count,
+            RECORDS as u64,
+            "output + dropped must equal the split bucket's whole record set"
+        );
+
+        // And the surviving rows are exactly the non-subject rows.
+        let mut survivors = Vec::new();
+        for part in &record.parts {
+            let key = keys::reconstruct_rewrite_part_key(&record, part).expect("part key");
+            survivors.extend(decode_logs_part(&store, &key).await);
+        }
+        let expected: Vec<LogRecord> = (0..RECORDS)
+            .filter(|i| subject_of(*i) == "kept-subject")
+            .map(make)
+            .collect();
+        assert_eq!(
+            survivors.len(),
+            expected.len(),
+            "exactly the non-subject rows survive"
+        );
+        let survivor_ts: std::collections::BTreeSet<i64> =
+            survivors.iter().map(|r| r.ts_ns).collect();
+        let expected_ts: std::collections::BTreeSet<i64> =
+            expected.iter().map(|r| r.ts_ns).collect();
+        assert_eq!(survivor_ts, expected_ts);
+    }
+
     /// Running the same LOGS rewrite twice from the same pre-publish state
     /// converges on one `RewriteRecord`, never a double count of dropped
     /// records -- the LOGS sibling of the metrics
