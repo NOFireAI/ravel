@@ -515,6 +515,8 @@ impl<'a> StreamCursor<'a> {
 /// already ts-ascending (the format's `(stream_ref, ts)` order), so a stable
 /// sort of the concatenation orders equal-`ts_ns` records by (input, position),
 /// exactly what selecting the minimum `(ts_ns, input_index)` head does here.
+///
+/// Issue #711: peak memory here is bounded by one part, not one stream.
 async fn merge_stream_into_part(
     store: &dyn ObjectStoreBackend,
     catalogs: &[RlogInputCatalog],
