@@ -500,12 +500,14 @@ async fn corrupted_disk_hit_is_corrupted_through_ram_readthrough() {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use std::future::Future;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
+    use std::task::Poll;
 
     use bytes::Bytes;
     use tempfile::TempDir;
+    use tokio::sync::oneshot;
 
     use super::fixtures::{generous_limits, test_key};
     use super::*;
@@ -560,6 +562,12 @@ mod tests {
     /// Concurrent RAM+disk misses on one key collapse to a single upstream
     /// fetch (ADR-0046 decision 5, spanning both tiers): every waiter gets the
     /// same bytes, and the fetch closure runs exactly once.
+    ///
+    /// The leader is held in its fetch by a `oneshot` this test releases, and
+    /// each follower's future is polled once before that release. That first
+    /// poll is where `SingleFlight::run` takes the in-flight map lock, so
+    /// "the followers joined while the leader was still in flight" is an
+    /// ordering this test enforces rather than a wall-clock race it can lose.
     #[tokio::test]
     async fn single_flight_collapses_concurrent_misses_to_one_upstream() {
         let tmp = TempDir::new().unwrap();
@@ -570,44 +578,68 @@ mod tests {
         let payload = Bytes::from_static(b"fetched once");
         let key = test_key(1, payload.len() as u64);
         let upstream_calls = Arc::new(AtomicUsize::new(0));
+        let follower_fetches = Arc::new(AtomicUsize::new(0));
 
-        let mut handles = Vec::new();
-        for _ in 0..8 {
+        const CALLERS: usize = 8;
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let leader = {
             let tiered = tiered.clone();
             let calls = upstream_calls.clone();
             let payload = payload.clone();
-            handles.push(tokio::spawn(async move {
+            tokio::spawn(async move {
                 tiered
-                    .get_or_fetch(key, move || {
-                        let calls = calls.clone();
-                        let payload = payload.clone();
-                        async move {
-                            calls.fetch_add(1, Ordering::SeqCst);
-                            // Hold the slot so the other callers arrive as
-                            // followers rather than each starting a fresh
-                            // leader after the first completes.
-                            tokio::time::sleep(Duration::from_millis(20)).await;
-                            Ok::<Bytes, &'static str>(payload)
-                        }
+                    .get_or_fetch(key, move || async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        let _ = entered_tx.send(());
+                        let _ = release_rx.await;
+                        Ok::<Bytes, &'static str>(payload)
                     })
                     .await
-            }));
+            })
+        };
+        entered_rx.await.expect("the leader reaches its fetch");
+
+        let mut followers = Vec::new();
+        for _ in 1..CALLERS {
+            let ran = follower_fetches.clone();
+            followers.push(Box::pin(tiered.get_or_fetch(key, move || async move {
+                ran.fetch_add(1, Ordering::SeqCst);
+                Ok::<Bytes, &'static str>(Bytes::from_static(b"never"))
+            })));
         }
-        for handle in handles {
-            let (bytes, _source) = handle.await.unwrap().unwrap();
+        for follower in &mut followers {
+            let first = std::future::poll_fn(|cx| Poll::Ready(follower.as_mut().poll(cx))).await;
+            assert!(
+                first.is_pending(),
+                "a follower parks on the held leader instead of completing on its own"
+            );
+        }
+        release_tx.send(()).expect("the leader is still parked");
+
+        for follower in followers {
+            let (bytes, _source) = follower.await.unwrap();
             assert_eq!(
                 bytes, payload,
                 "every waiter receives the one fetched value"
             );
         }
+        let (bytes, _source) = leader.await.unwrap().unwrap();
+        assert_eq!(bytes, payload, "the leader receives its own fetched value");
+
         assert_eq!(
             upstream_calls.load(Ordering::SeqCst),
             1,
             "8 concurrent misses on one key must produce exactly one upstream fetch"
         );
         assert_eq!(
+            follower_fetches.load(Ordering::SeqCst),
+            0,
+            "a follower never runs its own fetch"
+        );
+        assert_eq!(
             tiered.ram_metrics().snapshot().single_flight_collapses,
-            7,
+            (CALLERS - 1) as u64,
             "the 7 followers each record one collapse"
         );
     }
@@ -625,7 +657,12 @@ mod tests {
     /// without the `self.single_flight.run(...)` wrapper (the pre-fix
     /// `ReadCache::fetch_peeked` Tiered behavior): `upstream_calls` then reads 8,
     /// not 1, and the exactly-one-fetch assertion fails.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    ///
+    /// The leader is held in its fetch by a `oneshot` this test releases, and
+    /// each follower's future is polled once (the poll that takes the
+    /// in-flight map lock) before that release, so no wall-clock hold decides
+    /// whether a caller lands as a follower or as a second leader.
+    #[tokio::test]
     async fn resolve_peeked_miss_collapses_concurrent_callers_to_one_fetch() {
         let tmp = TempDir::new().unwrap();
         let disk = DiskCache::new(tmp.path().to_path_buf(), generous_limits());
@@ -649,40 +686,65 @@ mod tests {
         let misses_after_peeks = ram_metrics.snapshot().misses;
 
         let upstream_calls = Arc::new(AtomicUsize::new(0));
-        let mut handles = Vec::new();
-        for _ in 0..CALLERS {
+        let follower_fetches = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let leader = {
             let tiered = tiered.clone();
             let calls = upstream_calls.clone();
             let payload = payload.clone();
-            handles.push(tokio::spawn(async move {
+            tokio::spawn(async move {
                 tiered
-                    .resolve_peeked_miss(key, move || {
-                        let calls = calls.clone();
-                        let payload = payload.clone();
-                        async move {
-                            calls.fetch_add(1, Ordering::SeqCst);
-                            // Hold the slot so the other callers arrive as
-                            // followers, not fresh leaders after the first
-                            // completes.
-                            tokio::time::sleep(Duration::from_millis(20)).await;
-                            Ok::<Bytes, &'static str>(payload)
-                        }
+                    .resolve_peeked_miss(key, move || async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        let _ = entered_tx.send(());
+                        let _ = release_rx.await;
+                        Ok::<Bytes, &'static str>(payload)
                     })
                     .await
-            }));
+            })
+        };
+        entered_rx.await.expect("the leader reaches its fetch");
+
+        let mut followers = Vec::new();
+        for _ in 1..CALLERS {
+            let ran = follower_fetches.clone();
+            followers.push(Box::pin(tiered.resolve_peeked_miss(
+                key,
+                move || async move {
+                    ran.fetch_add(1, Ordering::SeqCst);
+                    Ok::<Bytes, &'static str>(Bytes::from_static(b"never"))
+                },
+            )));
         }
-        for handle in handles {
-            let bytes = handle.await.unwrap().unwrap();
+        for follower in &mut followers {
+            let first = std::future::poll_fn(|cx| Poll::Ready(follower.as_mut().poll(cx))).await;
+            assert!(
+                first.is_pending(),
+                "a follower parks on the held leader instead of completing on its own"
+            );
+        }
+        release_tx.send(()).expect("the leader is still parked");
+
+        for follower in followers {
+            let bytes = follower.await.unwrap();
             assert_eq!(
                 bytes, payload,
                 "every caller receives the one fetched value"
             );
         }
+        let bytes = leader.await.unwrap().unwrap();
+        assert_eq!(bytes, payload, "the leader receives its own fetched value");
 
         assert_eq!(
             upstream_calls.load(Ordering::SeqCst),
             1,
             "8 concurrent resolve_peeked_miss callers on one key must produce exactly one fetch"
+        );
+        assert_eq!(
+            follower_fetches.load(Ordering::SeqCst),
+            0,
+            "a follower never runs its own fetch"
         );
         assert_eq!(
             ram_metrics.snapshot().single_flight_collapses,
