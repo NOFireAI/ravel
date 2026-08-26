@@ -43,6 +43,11 @@ pub enum DeclaredType {
     /// (ADR-0099 decision 5): a dict-encoded page becomes the Arrow dictionary
     /// and its ids with no per-row allocation, and a plain page a degenerate
     /// identity dictionary, so both paths build the one schema DataFusion checks.
+    ///
+    /// `Dictionary` is not a grouping type DataFusion's specialized
+    /// `GroupValues` implementations accept, so a `GROUP BY` over this column
+    /// falls to the row-format table whose decode carries a hard `i32` offset
+    /// limit across all group keys in one partition (issue #737).
     Str,
     /// An `I64`-typed attribute, projected as Arrow `Int64`.
     I64,
