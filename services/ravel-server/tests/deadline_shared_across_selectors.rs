@@ -151,6 +151,10 @@ async fn start_test_server(store: Arc<dyn ObjectStoreBackend>) -> Running {
 ///
 /// The status assertion (200 vs 504) is the timing-independent
 /// discriminator; the elapsed bound backs the "one deadline, not N" claim.
+///
+// TODO(#731): the `elapsed < 900 ms` bound below is a wall-clock race against
+// the scheduler (#706 class) and flakes under host load; replace it with a
+// deterministic observation that the deadline is shared.
 #[tokio::test]
 async fn metadata_request_shares_one_wall_deadline_across_selectors() {
     const N: usize = 12;
