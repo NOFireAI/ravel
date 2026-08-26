@@ -477,3 +477,47 @@ there is no probe to eliminate. `BlockMetrics::record_segment_totals` moves from
 the partition-0 planning hack to per-segment scan stats on this path (each
 segment has exactly one owning partition, so the whole-segment totals are still
 recorded exactly once).
+
+## Amendment (2026-08-26, #739): the block-range threshold is no longer a conjunct
+
+The amendment above lists four conjuncts, and conjunct 3 requires every relevant
+segment to be above the block-range threshold. That conjunct is removed. The
+other three (block-predicate freedom, no pending erasure, and at least
+`target_partitions` relevant segments) and the containment half of conjunct 3
+are unchanged, so conjunct 3 now reads: every relevant (ts-overlapping) segment
+has a well-formed span and is fully CONTAINED in the query window.
+
+The threshold conjunct was query-wide, and that is what broke: a bulk load leaves
+one small tail object per `(shard, hour)`, so a single sub-512-KiB object
+disqualified every segment in the snapshot. Measured on the 8,424-object
+ClickBench tenant (#680), a predicate-free full-window
+`COUNT(DISTINCT UserID)` at 32 partitions issued 22,473 GETs where the fast path
+would have issued 8,424 plus the resolve's own reads: the fast path never fired,
+because one object out of 8,424 sat below the threshold.
+
+It is removed rather than evaluated per segment because per segment it decides
+nothing. At or below the threshold both entries land in the same
+`LogSegmentFetcher::whole_object_bytes`: the whole-segment entry
+(`scan_whole_accounted_with_tenant`) calls it unconditionally, and the striped
+path's `tenant_bytes_with_footer` falls through to it for exactly the objects
+the threshold excludes. That is one `GetRange::Full` on the `(0, object_size)`
+cache key, the same `QueryAccounting` records, and no `EtagPin` on either side,
+since a single GET observes a single object state. So a sub-threshold segment
+reads identically whichever entry opens it, and it can be assigned whole to one
+partition without changing a byte of what is read, while the above-threshold
+segments around it keep the probe elimination this fast path exists for.
+
+The consequence the earlier text worried about is real and accepted: a snapshot
+whose segments are ALL at or below the threshold now takes the fast path too,
+where it previously striped. Nothing is read differently there either -- the
+plan phase's whole-object read and the scan's are the same cache key, so what
+the fast path removes is the plan pass itself, not a GET.
+
+When a conjunct does fail, the scan now says which one. `LogsScanExec::execute`
+publishes a DataFusion counter named for the first failing conjunct
+(`fast_path_rejected_pending_erasure`, `fast_path_rejected_block_predicate`,
+`fast_path_rejected_segment_not_contained`,
+`fast_path_rejected_fewer_segments_than_partitions`), one increment per
+partition, and no such counter at all when the fast path fires. A latency report
+reading the scan's metrics can then state why a statement striped instead of
+inferring it from GET counts.

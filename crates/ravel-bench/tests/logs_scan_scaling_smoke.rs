@@ -11,15 +11,20 @@
 //!
 //! It also pins the read-amplification figures issue #693 exists for. The
 //! report's statement is `SELECT ts, body FROM logs` over the full window, which
-//! is exactly the shape #693 part 3's whole-segment fast path serves, so on the
-//! `over_threshold` rows whose partition count fits inside the segment count the
-//! plan phase is skipped and each segment is read whole exactly once: one read
-//! per segment (the same statement as "the plan phase issued zero probes") and
-//! bytes amplification of about 1.0, cached and un-cached alike. The row whose
-//! partition count exceeds the segment count fails the fast path's fourth
-//! conjunct and takes the plan-then-stripe path instead; it is pinned
-//! separately, because it is the only combo in the sweep that still pays a plan
-//! phase on an above-threshold object.
+//! is exactly the shape #693 part 3's whole-segment fast path serves. Issue #739
+//! dropped the fast path's block-range-threshold conjunct, so object size no
+//! longer gates it: on every row whose declared partition count fits inside the
+//! segment count -- both `over_threshold` values, cached and un-cached alike --
+//! the plan phase is skipped and each segment is read whole exactly once: one
+//! read per segment (the same statement as "the plan phase issued zero probes")
+//! and bytes amplification of about 1.0. Only the cache-wired row whose partition
+//! count exceeds the segment count fails the fast path's fourth conjunct and
+//! stripes; it is pinned separately as the one combo in the sweep that declines
+//! the fast path. On its over-threshold read shape the striping is visible as
+//! extra probe and directory GETs; on its whole-object read shape the plan pass
+//! and every partition's open share one `(0, object_size)` cache key, so
+//! single-flight coalesces them and only the plan pass, not a GET, is what the
+//! fast path removes there.
 //!
 //! Gated on `sql-latency` (the module and bin's gate), so a default
 //! `cargo test -p ravel-bench` sees an empty crate rather than a link error. Run
@@ -41,23 +46,24 @@ use ravel_object_store::memory::MemoryStore;
 /// amplifications land on exact integers.
 const CATALOG_GET_SLACK: u64 = 1;
 
-/// Upper end of the band the `over_threshold` full-window rows must land in:
-/// one pass over the dataset, plus at most one further read of every segment.
-/// A per-partition read sequence, the shape block striping produced, would blow
-/// straight past it at 32 partitions.
+/// Upper end of the band the fast-path full-window rows must land in (both read
+/// shapes, since #739): one pass over the dataset, plus at most one further read
+/// of every segment. A per-partition read sequence, the shape block striping
+/// produced, would blow straight past it at 32 partitions.
 const MAX_FAST_PATH_AMPLIFICATION: f64 = 2.0;
 
 /// Float slack on a ratio that is an exact integer quotient of two byte counts.
 const EPS: f64 = 1e-9;
 
-/// Whether this row's scan could take #693 part 3's whole-segment fast path:
-/// above the block-range threshold, and with at least as many relevant segments
-/// as the plan declared partitions (the fast path's fourth conjunct, evaluated
-/// against the DECLARED count, which is what `LogsScanExec` compares). The
-/// statement itself is predicate-free and its window contains every segment, so
-/// those two conjuncts hold for every row in this sweep.
+/// Whether this row's scan takes #693 part 3's whole-segment fast path: at least
+/// as many relevant segments as the plan declared partitions (the fast path's
+/// fourth conjunct, evaluated against the DECLARED count, which is what
+/// `LogsScanExec` compares). Since #739 dropped the block-range-threshold
+/// conjunct, object size no longer enters into it, so this is the only conjunct
+/// that varies across the sweep: the statement is predicate-free and its window
+/// contains every segment, so the other three hold for every row.
 fn takes_fast_path(c: &ComboResult, segments: usize) -> bool {
-    c.over_threshold && c.scan_partitions <= segments
+    c.scan_partitions <= segments
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -207,15 +213,16 @@ async fn logs_scan_scaling_smoke_proves_cache_gated_fanout_and_request_count() {
     // striping: a cache too small to hold the working set would evict between
     // partitions and issue GETs again.
     //
-    // Both claims are made only over rows that take the same path as their
-    // un-cached neighbour. The over-threshold row above the segment count is the
-    // exception in both directions: it drops out of the whole-segment fast path
-    // (fourth conjunct) while its un-cached neighbour stays in, so it pays a plan
-    // phase the other does not, and it is pinned on its own below.
+    // Both claims are made only over the cache-wired rows that stay on the fast
+    // path. The row above the segment count is the exception on both axes: it
+    // drops out of the whole-segment fast path (fourth conjunct) while its
+    // un-cached neighbour, capped at the segment count, stays in. It is pinned on
+    // its own below, where the two read shapes diverge (the over-threshold one
+    // pays visible probe GETs, the whole-object one coalesces onto the same key).
     for over_threshold in [false, true] {
         let comparable = |tp: usize| {
             let c = report.combo(tp, true, over_threshold).expect("cached row");
-            !over_threshold || takes_fast_path(c, segments)
+            takes_fast_path(c, segments)
         };
         let flat: Vec<usize> = expected_partitions
             .iter()
@@ -252,10 +259,10 @@ async fn logs_scan_scaling_smoke_proves_cache_gated_fanout_and_request_count() {
 
     // Issue #693 part 3, the figure this report exists to carry. A
     // block-predicate-free statement whose window contains every relevant
-    // segment, over segments above the block-range threshold, with at least as
-    // many relevant segments as declared partitions, skips the plan phase and
-    // reads each segment whole exactly once -- cached or not. So on every
-    // over-threshold row at or below the segment count the GET count is the
+    // segment, with at least as many relevant segments as declared partitions,
+    // skips the plan phase and reads each segment whole exactly once -- cached or
+    // not, and since #739 whatever the object size. So on every row at or below
+    // the segment count, on both `over_threshold` values, the GET count is the
     // segment count (plus the snapshot's own catalog read) and the bytes come to
     // one pass over the dataset.
     //
@@ -270,8 +277,8 @@ async fn logs_scan_scaling_smoke_proves_cache_gated_fanout_and_request_count() {
     {
         fast_path_rows += 1;
         let label = format!(
-            "tp={} cache={} over_threshold=true",
-            c.target_partitions, c.cache_wired
+            "tp={} cache={} over_threshold={}",
+            c.target_partitions, c.cache_wired, c.over_threshold
         );
         let segs = c.segments_scanned as u64;
         assert!(
@@ -296,37 +303,52 @@ async fn logs_scan_scaling_smoke_proves_cache_gated_fanout_and_request_count() {
         );
     }
     assert!(
-        fast_path_rows >= 4,
-        "the sweep must pin the fast path on both cache settings at more than one \
-         partition value; got {fast_path_rows} rows"
+        fast_path_rows >= 8,
+        "the sweep must pin the fast path on both cache settings and both \
+         `over_threshold` values at more than one partition value; got \
+         {fast_path_rows} rows"
     );
-    for cache_wired in [false, true] {
-        for &tp in expected_partitions.iter().filter(|&&tp| tp <= segments) {
-            let c = report
-                .combo(tp, cache_wired, true)
-                .expect("over-threshold row");
-            assert!(
-                takes_fast_path(c, segments),
-                "tp={tp} cache={cache_wired}: a partition value at or below the \
-                 segment count must stay on the fast path, but the plan declared \
-                 {} partitions",
-                c.scan_partitions
-            );
+    for over_threshold in [false, true] {
+        for cache_wired in [false, true] {
+            for &tp in expected_partitions.iter().filter(|&&tp| tp <= segments) {
+                let c = report
+                    .combo(tp, cache_wired, over_threshold)
+                    .expect("swept row");
+                assert!(
+                    takes_fast_path(c, segments),
+                    "tp={tp} cache={cache_wired} over_threshold={over_threshold}: \
+                     a partition value at or below the segment count must stay on \
+                     the fast path since #739, but the plan declared {} partitions",
+                    c.scan_partitions
+                );
+            }
         }
     }
 
     // The other side of the fourth conjunct: a row with MORE declared partitions
     // than relevant segments cannot fill every partition from whole segments, so
-    // it falls back to plan-then-stripe. It pays a suffix probe per segment that
-    // the fast path skips, plus at least one open of every segment, so it reads
-    // strictly more than the same-shape row that keeps the fast path -- while
-    // staying under one extra pass over the dataset, because above the threshold
-    // each partition fetches only its own candidate blocks rather than the whole
-    // object.
+    // it declines the fast path and falls back to plan-then-stripe. Only the
+    // cache-wired row above the segment count reaches this -- the un-cached count
+    // is capped at the segment count -- and since #739 it reaches it on BOTH
+    // `over_threshold` values, so both are pinned off the fast path here. What
+    // the striping COSTS then depends on the read shape, and the two diverge:
+    //
+    // - Above the threshold each partition opens its owned segments with a suffix
+    //   probe, one GET per directory section, and coalesced candidate blocks. The
+    //   probe and section GETs are real work the fast path skips, so the row
+    //   reads strictly more than its fast-path neighbour -- at least one probe per
+    //   segment on top of one open each (>= 2x the segment count) -- while staying
+    //   under one extra pass over the dataset, because each partition fetches only
+    //   its own candidate blocks rather than the whole object.
+    // - At or below the threshold every partition's open, and the plan pass, is a
+    //   whole-object `GetRange::Full` on the one `(0, object_size)` cache key, so
+    //   single-flight coalesces them all. The striped row then issues the SAME GET
+    //   count and reads the SAME single pass as its fast-path neighbour: leaving
+    //   the fast path costs the plan pass, not a GET (ADR-0102's #739 amendment).
     let striped: Vec<&ComboResult> = report
         .combos
         .iter()
-        .filter(|c| c.over_threshold && c.scan_partitions > segments)
+        .filter(|c| c.scan_partitions > segments)
         .collect();
     assert!(
         !striped.is_empty(),
@@ -334,71 +356,87 @@ async fn logs_scan_scaling_smoke_proves_cache_gated_fanout_and_request_count() {
          count ({segments}) so the fast path's relevant_segments >= \
          target_partitions conjunct is exercised failing"
     );
+    let mut striped_over_threshold = 0usize;
+    let mut striped_whole_object = 0usize;
     for c in striped {
         let label = format!(
-            "tp={} cache={} over_threshold=true",
-            c.target_partitions, c.cache_wired
+            "tp={} cache={} over_threshold={}",
+            c.target_partitions, c.cache_wired, c.over_threshold
         );
         let segs = c.segments_scanned as u64;
         assert!(
-            c.object_store_get_requests >= 2 * segs,
-            "{label}: off the fast path the plan phase probes each of {segs} \
-             segments and the scan opens each of them at least once, so the GET \
-             count must be at least {}; got {} over {:.1} blocks per segment",
-            2 * segs,
-            c.object_store_get_requests,
-            c.blocks_per_segment()
+            !takes_fast_path(c, segments) && c.scan_partitions > segments,
+            "{label}: a row above the segment count must decline the fast path; \
+             the plan declared {} partitions",
+            c.scan_partitions
         );
+        // The fast-path neighbour: the same partition value and read shape on the
+        // other cache setting, capped at the segment count and so still on the
+        // fast path.
         let fast = report
-            .combo(c.target_partitions, !c.cache_wired, true)
+            .combo(c.target_partitions, !c.cache_wired, c.over_threshold)
             .expect("the same partition value on the other cache setting");
         assert!(
-            takes_fast_path(fast, segments)
-                && c.object_store_get_requests > fast.object_store_get_requests,
-            "{label}: leaving the fast path must cost strictly more GETs than the \
-             tp={} row that keeps it; got {} against {}",
-            fast.target_partitions,
-            c.object_store_get_requests,
-            fast.object_store_get_requests
+            takes_fast_path(fast, segments),
+            "{label}: the un-cached neighbour is capped at the segment count and \
+             must stay on the fast path; it declared {} partitions",
+            fast.scan_partitions
         );
-        assert!(
-            c.bytes_amplification > 1.0 && c.bytes_amplification < 2.0,
-            "{label}: the striped path re-reads the probe and directory bytes the \
-             fast path never fetches, but fetches only candidate blocks per \
-             partition, so bytes_amplification must sit in (1.0, 2.0); got {:.4}",
-            c.bytes_amplification
-        );
+        if c.over_threshold {
+            striped_over_threshold += 1;
+            assert!(
+                c.object_store_get_requests >= 2 * segs,
+                "{label}: off the fast path the plan phase probes each of {segs} \
+                 segments and the scan opens each of them at least once, so the \
+                 GET count must be at least {}; got {} over {:.1} blocks per \
+                 segment",
+                2 * segs,
+                c.object_store_get_requests,
+                c.blocks_per_segment()
+            );
+            assert!(
+                c.object_store_get_requests > fast.object_store_get_requests,
+                "{label}: leaving the fast path on the ranged read shape must cost \
+                 strictly more GETs than the tp={} row that keeps it; got {} \
+                 against {}",
+                fast.target_partitions,
+                c.object_store_get_requests,
+                fast.object_store_get_requests
+            );
+            assert!(
+                c.bytes_amplification > 1.0 && c.bytes_amplification < 2.0,
+                "{label}: the striped path re-reads the probe and directory bytes \
+                 the fast path never fetches, but fetches only candidate blocks \
+                 per partition, so bytes_amplification must sit in (1.0, 2.0); got \
+                 {:.4}",
+                c.bytes_amplification
+            );
+        } else {
+            striped_whole_object += 1;
+            assert_eq!(
+                c.object_store_get_requests, fast.object_store_get_requests,
+                "{label}: on the whole-object read shape the plan pass and every \
+                 partition's open share the one `(0, object_size)` cache key, so \
+                 single-flight coalesces them and the striped row issues the same \
+                 GET count as its fast-path neighbour ({}); got {}",
+                fast.object_store_get_requests, c.object_store_get_requests
+            );
+            assert!(
+                (c.bytes_amplification - 1.0).abs() <= EPS,
+                "{label}: coalesced whole-object reads move one pass over the \
+                 dataset, so bytes_amplification must be 1.0; got {:.4} ({} bytes \
+                 over a {} byte dataset)",
+                c.bytes_amplification,
+                c.object_store_bytes,
+                report.config.dataset_bytes
+            );
+        }
     }
-
-    // The whole-object rows, which read the SAME objects with the block-range
-    // threshold moved out of reach: below the threshold the fast path does not
-    // apply, so the plan-then-stripe path runs and the plan read is a real
-    // whole-object read rather than a probe. Un-cached that is one plan read plus
-    // one scan read per segment; cache-wired the two share the one
-    // `(0, object_size)` key, so only the plan read reaches the store.
-    for c in report.combos.iter().filter(|c| !c.over_threshold) {
-        let label = format!(
-            "tp={} cache={} over_threshold=false",
-            c.target_partitions, c.cache_wired
-        );
-        let segs = c.segments_scanned as u64;
-        let (reads, amplification) = if c.cache_wired { (1, 1.0) } else { (2, 2.0) };
-        assert!(
-            c.object_store_get_requests >= reads * segs
-                && c.object_store_get_requests <= reads * segs + CATALOG_GET_SLACK,
-            "{label}: the whole-object path costs {reads} store read(s) per \
-             segment over {segs} segments, so the GET count must be {} (plus at \
-             most {CATALOG_GET_SLACK} catalog read); got {}",
-            reads * segs,
-            c.object_store_get_requests
-        );
-        assert!(
-            (c.bytes_amplification - amplification).abs() <= EPS,
-            "{label}: bytes_amplification must be {amplification:.1}; got {:.4} \
-             ({} bytes over a {} byte dataset)",
-            c.bytes_amplification,
-            c.object_store_bytes,
-            report.config.dataset_bytes
-        );
-    }
+    assert_eq!(
+        (striped_over_threshold, striped_whole_object),
+        (1, 1),
+        "the sweep must stripe exactly the cache-wired row above the segment \
+         count on each read shape; got {striped_over_threshold} over-threshold \
+         and {striped_whole_object} whole-object striped rows"
+    );
 }

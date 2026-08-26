@@ -32,39 +32,43 @@
 //! this report's one statement (`SELECT ts, body FROM logs` over the full
 //! window, which carries no block predicate and contains every segment):
 //!
-//! - **over-threshold, either cache setting, `target_partitions` at or below
-//!   the segment count**: #693 part 3's whole-segment fast path
-//!   (`LogsScanExec::whole_segment_fast_path`). The plan phase is skipped, each
-//!   segment is assigned whole to one partition, and each is read once with a
-//!   single full-range GET. `reads_per_segment` is 1 and `bytes_amplification`
-//!   is about 1.0, with zero suffix probes, whether or not a cache is wired.
-//!   The cache has nothing left to absorb on this shape.
-//! - **over-threshold, cache wired, `target_partitions` above the segment
-//!   count**: the fast path's fourth conjunct (`relevant_segments >=
-//!   target_partitions`) fails, so the unchanged plan-then-stripe path runs.
-//!   The plan phase probes every segment, then each partition opens the
-//!   segments it holds blocks in and fetches its candidate blocks, and the
-//!   cache coalesces the repeats onto the extents already resident. This is the
-//!   only row in the sweep that still pays a plan phase on an above-threshold
-//!   object, and it is why the sweep keeps a partition value above the segment
-//!   count.
-//! - **whole-object (below-threshold shape), un-cached**: the plan-then-stripe
-//!   path with a whole-object read unit. Segments are assigned whole to one
-//!   partition each (the un-cached amendment), so the count is one plan read
-//!   plus one scan read per segment at every `target_partitions`.
-//! - **whole-object (below-threshold shape), cache wired**: the same two reads
-//!   per segment, except the scan read hits the cache: the plan and scan reads
-//!   share the one `(0, object_size)` key, so only the plan read reaches the
-//!   store.
+//! - **any row, `target_partitions` at or below the segment count** (both
+//!   `over_threshold` values, both cache settings): #693 part 3's whole-segment
+//!   fast path (`LogsScanExec::whole_segment_fast_path`). The plan phase is
+//!   skipped, each segment is assigned whole to one partition, and each is read
+//!   once with a single full-range GET. `reads_per_segment` is 1 and
+//!   `bytes_amplification` is about 1.0, with zero suffix probes, whether or not
+//!   a cache is wired. Issue #739 dropped the threshold conjunct, so the
+//!   whole-object (below-threshold) rows now take this path too: object size no
+//!   longer decides the routing, and the cache has nothing left to absorb on
+//!   this shape.
+//! - **cache wired, `target_partitions` above the segment count** (both
+//!   `over_threshold` values): the fast path's fourth conjunct
+//!   (`relevant_segments >= target_partitions`) fails, so the unchanged
+//!   plan-then-stripe path runs. The plan phase probes every segment, then each
+//!   partition opens the segments it holds blocks in and fetches its candidate
+//!   blocks, and the cache coalesces the repeats onto the extents already
+//!   resident. This is the only combination in the sweep that still pays a plan
+//!   phase, and it is why the sweep keeps a partition value above the segment
+//!   count. The `over_threshold` axis now decides only the read shape here (a
+//!   ranged sequence above the threshold, a whole-object read below it), not
+//!   whether the plan phase runs.
+//! - **un-cached, `target_partitions` above the segment count** (both
+//!   `over_threshold` values): the un-cached partition count is capped at the
+//!   segment count (the un-cached amendment), so `relevant_segments >=
+//!   target_partitions` still holds and the fast path fires. Each segment is
+//!   read once with a single full-range GET, so the GET count stays flat across
+//!   the sweep.
 //!
 //! An earlier version of this report pinned the un-cached over-threshold rows
 //! to `1 + min(partitions, blocks_per_segment)` passes over the dataset. That
 //! was intra-segment block striping's law: it assumed `n` partitions each
 //! opening the same segment and fetching their own candidate blocks. #693
 //! part 1 confined it to the cache-wired path, and #693 part 3 removed it from
-//! the predicate-free full-window shape entirely. It still governs the
-//! below-threshold and predicated paths, which is where the `over_threshold =
-//! false` rows and the above-segment-count row sit.
+//! the predicate-free full-window shape entirely. Since #739 that removal no
+//! longer depends on object size, so it governs the predicated paths and the
+//! cache-wired combos above the segment count, which is where the sole
+//! plan-then-stripe rows in this sweep sit.
 //!
 //! The sibling of [`crate::groupby_scaling`], aimed at the specific capability
 //! item 1 adds: a `logs` query touching FEWER segments than `target_partitions`
@@ -86,16 +90,19 @@
 //!
 //! It also reports the object-store request count each combination issues, read
 //! from the executed query's `QueryAccounting` (the same source
-//! [`crate::sql_latency`] and [`crate::pushdown_crossover`] use). Every partition
-//! owning blocks in a segment issues its own read sequence at that segment's key;
-//! the shape of the sequence is the `over_threshold` axis (one whole-object GET
-//! at or below the fetcher's block-range threshold, a suffix probe plus directory
-//! sections plus coalesced candidate blocks above it, ADR-0107). Un-cached, the
-//! partition count is capped at the segment count and each segment is assigned
-//! whole to one partition (ADR-0102's un-cached amendment), so raising
-//! `target_partitions` changes nothing at any value. Cache-wired, the partition
-//! count keeps climbing and those repeated reads are what ADR-0046's
-//! single-flight cache absorbs.
+//! [`crate::sql_latency`] and [`crate::pushdown_crossover`] use). On the fast
+//! path each relevant segment is read once with a single whole-object GET,
+//! whichever `over_threshold` value it carries. Only when the query stripes
+//! (the cache-wired combos above the segment count) does each partition owning
+//! blocks in a segment issue its own read sequence at that segment's key, and
+//! only there does the `over_threshold` axis change the sequence shape (one
+//! whole-object GET at or below the fetcher's block-range threshold, a suffix
+//! probe plus directory sections plus coalesced candidate blocks above it,
+//! ADR-0107). Un-cached, the partition count is capped at the segment count and
+//! each segment is assigned whole to one partition (ADR-0102's un-cached
+//! amendment), so raising `target_partitions` changes nothing at any value.
+//! Cache-wired above the segment count the partition count keeps climbing and
+//! those repeated reads are what ADR-0046's single-flight cache absorbs.
 //!
 //! Every request-count figure in this report is a measurement of THIS fixture --
 //! a `MemoryStore`, this segment/block/partition shape, and on the cached rows a
@@ -113,15 +120,23 @@
 //! # Why [`PlanningLatency`] is still worth measuring
 //!
 //! Issue #693 part 3 lets a predicate-free, full-window scan skip the plan phase
-//! entirely, which is exactly the shape this report's statement has, so on the
-//! `over_threshold` rows at or below the segment count no combo pays a plan
-//! phase at all. [`PlanningLatency`] is therefore not a component of those rows'
-//! wall time: it is the standing measurement of what a query that does NOT
-//! satisfy the fast path's conjuncts -- any predicate, a partial window overlap,
-//! a pending erasure, a below-threshold segment, or more partitions than
-//! relevant segments -- still pays before its first block is drained. The
-//! whole-object rows and the above-segment-count row are the combos in this
-//! sweep that pay it.
+//! entirely and read each relevant segment whole in one GET
+//! (`LogsScanExec::whole_segment_fast_path`), which is exactly the shape this
+//! report's statement has. That fast path was once gated on every segment sitting
+//! above the block-range threshold; issue #739 removed that conjunct, so object
+//! size no longer decides anything. Every combo at or below the segment count --
+//! both `over_threshold` values, both cache settings -- now takes the fast path
+//! and pays no plan phase at all. [`PlanningLatency`] is therefore not a component
+//! of those rows' wall time: it is the standing measurement of what a query that
+//! does NOT satisfy the fast path's conjuncts -- any predicate, a partial window
+//! overlap, a pending erasure, or more partitions than relevant segments -- still
+//! pays before its first block is drained. The cache-wired row above the segment
+//! count (32 relevant segments cannot fill 64 partitions) is the one combo in this
+//! sweep on the plan-then-stripe path, and the one that pays it.
+//!
+//! [`PlanningLatency`] is measured on its own fetchers by calling `plan_segment`
+//! directly, so that figure describes `compute_plan_counts`'s serialized await
+//! regardless of which path the swept combos take.
 //!
 //! Issue #693 tracks the request-count work this report's figures are quoted
 //! from.
@@ -273,9 +288,12 @@ pub struct ComboResult {
     /// out of reach ([`WHOLE_OBJECT_BLOCK_RANGE_THRESHOLD`]), so the same objects
     /// are read whole; the two rows differ only in read shape.
     ///
-    /// The axis also decides whether #693 part 3's whole-segment fast path can
-    /// run: one of its conjuncts is `object_size > block_range_threshold`, so the
-    /// whole-object rows always take the plan-then-stripe path.
+    /// Issue #739 dropped the fast path's `object_size > block_range_threshold`
+    /// conjunct, so this axis no longer decides whether #693 part 3's
+    /// whole-segment fast path can run: the whole-object rows take the fast path
+    /// at or below the segment count exactly like the over-threshold rows. It
+    /// now decides only the read shape on the plan-then-stripe path (the
+    /// cache-wired combos above the segment count).
     pub over_threshold: bool,
     /// Observed: the `LogsScanExec` node's declared output partition count in the
     /// real physical plan. Under block-level striping (ADR-0102) this is
@@ -296,17 +314,16 @@ pub struct ComboResult {
     /// Object-store GET requests the cold run issued (`QueryAccounting`). The
     /// number this deliverable exists to report.
     ///
-    /// On the `over_threshold` rows whose partition count is at or below the
-    /// segment count, #693 part 3's whole-segment fast path skips the plan phase
-    /// and reads each segment once, so this is exactly `segments_scanned` --
-    /// zero plan probes -- with or without a cache. On the whole-object rows the
-    /// plan phase runs: un-cached, each segment is assigned whole to one
-    /// partition, so the count is one plan read plus one scan read per segment at
-    /// every `target_partitions`; cache-wired, the scan read hits the cache
-    /// entry the plan read populated. Above the segment count the cached rows
-    /// stripe blocks, and the repeated reads at one key are what single-flight
-    /// absorbs. A figure for THIS fixture only, not a general result (see the
-    /// module doc).
+    /// On every row whose partition count is at or below the segment count --
+    /// both `over_threshold` values, with or without a cache -- #693 part 3's
+    /// whole-segment fast path skips the plan phase and reads each segment once,
+    /// so this is exactly `segments_scanned` plus the catalog slack, with zero
+    /// plan probes (since #739, object size no longer changes this). Above the
+    /// segment count the un-cached rows still take the fast path (the partition
+    /// count is capped at the segment count), while the cached rows decline it
+    /// and stripe blocks, and the repeated reads at one key are what
+    /// single-flight absorbs. A figure for THIS fixture only, not a general
+    /// result (see the module doc).
     pub object_store_get_requests: u64,
     /// Cache hits/misses the cold run recorded (zero when un-cached).
     pub cache_hits: u64,
@@ -324,11 +341,11 @@ pub struct ComboResult {
     ///
     /// About 1.0 on the fast-path rows: each segment is read whole exactly once,
     /// and the only excess is the catalog traffic the same accounting counts.
-    /// On the whole-object un-cached rows it is about 2.0, one plan read plus one
-    /// scan read per segment. Only where blocks stripe across partitions -- the
-    /// cached rows above the segment count, and any predicated or
-    /// below-threshold query -- does the old
-    /// `1 + min(partitions, blocks_per_segment)` law still describe it.
+    /// Since #739 the whole-object rows at or below the segment count take the
+    /// fast path too, so they are also about 1.0. Only where blocks stripe
+    /// across partitions -- the cached rows above the segment count, and any
+    /// predicated query -- does the old `1 + min(partitions, blocks_per_segment)`
+    /// law still describe it.
     pub bytes_amplification: f64,
     pub result_rows: usize,
     pub runs_taken: usize,

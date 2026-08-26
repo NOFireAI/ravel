@@ -1,7 +1,7 @@
-//! Tests for issue #693 part 3 deliverable 1: a predicate-free, full-window
-//! logs statement whose window fully contains every relevant, above-threshold
-//! segment (and there are at least `target_partitions` of them) skips the plan
-//! phase entirely and reads each segment whole in ONE object-store GET.
+//! Tests for issue #693 part 3 deliverable 1, as amended by issue #739: a
+//! predicate-free, full-window logs statement whose window fully contains every
+//! relevant segment (and there are at least `target_partitions` of them) skips
+//! the plan phase entirely and reads each segment whole in ONE object-store GET.
 //!
 //! Post-#707 such a statement paid, per segment, a plan-phase suffix probe
 //! (`plan_segment_fast`) plus a scan-side re-probe per partition-open plus a
@@ -11,12 +11,18 @@
 //! whole-window case: the request count is exactly one whole-object GET per
 //! segment and zero suffix probes.
 //!
-//! The fixture uses objects ABOVE the block-range threshold (the fast path is
-//! gated there, matching `plan_segment`'s own gate): below the threshold the
-//! plan and scan reads already coalesce on one whole-object cache key, so there
-//! is no probe to save. Making the objects above-threshold is what lets the
-//! probe-count assertion mean something: the striped path would probe, the fast
-//! path does not.
+//! Most fixtures here use objects ABOVE the block-range threshold, which is what
+//! lets the probe-count assertion mean something: the striped path would probe,
+//! the fast path does not.
+//!
+//! Issue #739 then removed the threshold as a conjunct. It was query-wide, so one
+//! small object -- the tail a bulk load leaves per `(shard, hour)` -- vetoed the
+//! whole snapshot; a sub-threshold segment is read whole by the whole-segment
+//! entry and by the striped path's ranged entry alike, on the same
+//! `(0, object_size)` cache key, so it joins the assignment without changing what
+//! is read. `mixed_threshold_snapshot_takes_the_fast_path` pins that, and the
+//! `rejection_reason_*` tests pin the `fast_path_rejected_*` counter the scan
+//! publishes when a query-wide conjunct does fail.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -159,6 +165,43 @@ async fn build_fixture(store: &dyn ObjectStoreBackend) -> (Snapshot, BTreeSet<(i
         pending_erasure: Vec::new(),
     };
     (snapshot, want)
+}
+
+/// [`build_fixture`] plus one deliberately smaller tail segment, the shape a bulk
+/// load leaves behind (one small object per `(shard, hour)`). Returns the
+/// snapshot, the full written row set, and the tail's object size, which callers
+/// use as the block-range threshold so the tail lands at or below it and the
+/// `SEGMENTS` full segments land above it.
+async fn build_fixture_with_tail(
+    store: &dyn ObjectStoreBackend,
+) -> (Snapshot, BTreeSet<(i64, String)>, u64) {
+    let (mut snapshot, mut want) = build_fixture(store).await;
+    let ts = (SEGMENTS * 1000) as i64;
+    let tail_record = record(ts, "tail-r0");
+    want.insert((ts, tail_record.body.clone()));
+    let mut content_hash = [0u8; 32];
+    content_hash[0] = (SEGMENTS + 1) as u8;
+    let tail = write_object(store, "logs/tail.rlog", content_hash, &[tail_record]).await;
+    let tail_size = tail.object_size;
+
+    // Prove the fixture actually splits across the threshold it is about to set:
+    // if a one-record object were not strictly smaller than a three-record one,
+    // every segment would sit on the same side and the test would pass for the
+    // wrong reason.
+    let smallest_full = snapshot
+        .segments
+        .iter()
+        .map(|s| s.object_size)
+        .min()
+        .expect("SEGMENTS full segments");
+    assert!(
+        tail_size < smallest_full,
+        "the tail object ({tail_size} B) must be strictly smaller than every full \
+         segment (smallest {smallest_full} B) for the threshold split to be real"
+    );
+
+    snapshot.segments.push(tail);
+    (snapshot, want, tail_size)
 }
 
 fn provider(snapshot: Snapshot, fetcher: LogSegmentFetcher) -> LogsTableProvider {
@@ -363,9 +406,11 @@ async fn predicate_free_full_window_reads_one_whole_object_per_segment() {
 }
 
 /// The fast path returns byte-identical rows to the striped path over the same
-/// data. The striped path is forced by raising the block-range threshold above
-/// the object size, so the fast-path gate's `object_size > threshold` conjunct
-/// fails and the unchanged plan-then-stripe path runs.
+/// data. The striped path is forced by asking for more partitions than there are
+/// relevant segments, so the `relevant_segments >= target_partitions` conjunct
+/// fails and the unchanged plan-then-stripe path runs. (It used to be forced by
+/// raising the block-range threshold above the object size; #739 removed that
+/// conjunct, so a high threshold no longer stripes anything.)
 #[tokio::test]
 async fn fast_path_rows_match_the_striped_path() {
     let base = Arc::new(MemoryStore::new());
@@ -382,16 +427,18 @@ async fn fast_path_rows_match_the_striped_path() {
         .await,
     );
 
-    let striped = LogSegmentFetcher::new(Arc::clone(&store))
-        .with_cache(build_read_cache(64 << 20))
-        .with_block_range_threshold(u64::MAX);
-    let striped_rows = batches_to_rows(
-        &collect_plan(
-            provider(snapshot, striped)
-                .plan(PARTS)
-                .expect("striped plan"),
-        )
-        .await,
+    let striped = above_threshold_fetcher(Arc::clone(&store));
+    let striped_plan = provider(snapshot, striped)
+        .plan(SEGMENTS * 2)
+        .expect("striped plan");
+    let striped_rows = batches_to_rows(&collect_plan(Arc::clone(&striped_plan)).await);
+    assert_eq!(
+        sum_metric(
+            &striped_plan,
+            "fast_path_rejected_fewer_segments_than_partitions"
+        ),
+        SEGMENTS * 2,
+        "the comparison run must actually be on the striped path"
     );
 
     assert_eq!(fast_rows, striped_rows, "fast and striped rows must match");
@@ -411,6 +458,16 @@ async fn assert_takes_striped_path(
     parts: usize,
     pending_erasure: Vec<ravel_proto::commit::v1::ErasureRequest>,
 ) -> u64 {
+    run_striped(filters, parts, pending_erasure).await.0
+}
+
+/// [`assert_takes_striped_path`], also handing back the executed plan so a caller
+/// can read the `fast_path_rejected_*` counters off its metrics.
+async fn run_striped(
+    filters: &[datafusion::logical_expr::Expr],
+    parts: usize,
+    pending_erasure: Vec<ravel_proto::commit::v1::ErasureRequest>,
+) -> (u64, Arc<dyn ExecutionPlan>) {
     let base = Arc::new(MemoryStore::new());
     let (mut snapshot, _want) = build_fixture(base.as_ref()).await;
     snapshot.pending_erasure = pending_erasure;
@@ -421,8 +478,8 @@ async fn assert_takes_striped_path(
     let plan = provider(snapshot, fetcher)
         .plan_filters(parts, filters)
         .expect("plan");
-    let _ = collect_plan(plan).await;
-    counting.suffix_gets()
+    let _ = collect_plan(Arc::clone(&plan)).await;
+    (counting.suffix_gets(), plan)
 }
 
 #[tokio::test]
@@ -482,5 +539,184 @@ async fn conjunct_fewer_segments_than_partitions_takes_striped_path() {
     assert_eq!(
         probes, SEGMENTS as u64,
         "undersubscribed striped path: one plan suffix probe per segment, none per open"
+    );
+}
+
+// ---- issue #739: the threshold is not a query-wide conjunct ---------------
+
+/// Every `fast_path_rejected_*` counter the scan can publish. A test that expects
+/// one of them asserts the other three are absent, so a reason is pinned rather
+/// than merely present.
+const REJECTION_METRICS: [&str; 4] = [
+    "fast_path_rejected_pending_erasure",
+    "fast_path_rejected_block_predicate",
+    "fast_path_rejected_segment_not_contained",
+    "fast_path_rejected_fewer_segments_than_partitions",
+];
+
+/// Assert `expected` is the only rejection reason the executed `plan` recorded,
+/// with one increment per partition. `None` asserts no rejection at all, i.e.
+/// the fast path fired.
+fn assert_rejection(plan: &Arc<dyn ExecutionPlan>, expected: Option<(&str, usize)>) {
+    for name in REJECTION_METRICS {
+        let got = sum_metric(plan, name);
+        let want = match expected {
+            Some((n, count)) if n == name => count,
+            _ => 0,
+        };
+        assert_eq!(got, want, "{name}: expected {want} increments, got {got}");
+    }
+}
+
+/// #739: a snapshot mixing `SEGMENTS` above-threshold segments with one
+/// sub-threshold tail segment still takes the fast path, and reads each of the
+/// `SEGMENTS + 1` segments in exactly one whole-object GET with zero probes.
+///
+/// Before #739 the threshold conjunct was query-wide, so the single tail object
+/// disqualified all `SEGMENTS + 1`: the whole statement striped, paying one plan
+/// suffix probe per above-threshold segment. That is what this test is red
+/// against.
+#[tokio::test]
+async fn mixed_threshold_snapshot_takes_the_fast_path() {
+    const RELEVANT: usize = SEGMENTS + 1;
+
+    let base = Arc::new(MemoryStore::new());
+    let (snapshot, want, tail_size) = build_fixture_with_tail(base.as_ref()).await;
+
+    let counting = ShapeCountingStore::new(base);
+    let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&counting) as Arc<dyn ObjectStoreBackend>;
+    // `object_size > threshold` is false at exactly `tail_size`, so the tail is
+    // the one sub-threshold segment and every full segment is above it.
+    let fetcher = LogSegmentFetcher::new(store)
+        .with_cache(build_read_cache(64 << 20))
+        .with_block_range_threshold(tail_size);
+
+    // PARTS <= RELEVANT, so the `relevant >= target_partitions` conjunct holds.
+    let plan = provider(snapshot, fetcher).plan(PARTS).expect("plan");
+    let batches = collect_plan(Arc::clone(&plan)).await;
+
+    assert_eq!(
+        counting.suffix_gets(),
+        0,
+        "one sub-threshold segment must not put the statement back on the probing \
+         striped path (full={}, range={})",
+        counting.full_gets(),
+        counting.range_gets()
+    );
+    assert_eq!(
+        counting.range_gets(),
+        0,
+        "the fast path issues no byte-range GETs"
+    );
+    assert_eq!(
+        counting.full_gets(),
+        RELEVANT as u64,
+        "exactly one whole-object read per relevant segment, tail included"
+    );
+    assert_rejection(&plan, None);
+
+    assert_eq!(
+        batches_to_rows(&batches),
+        want,
+        "every written row, including the tail's, exactly once"
+    );
+
+    // Recorded once per segment, not once per partition and not once per open.
+    assert_eq!(
+        sum_metric(&plan, "blocks_total"),
+        SEGMENTS * BLOCKS_PER_SEG + 1,
+        "blocks_total covers the full segments plus the tail's single block"
+    );
+    assert_eq!(
+        sum_metric(&plan, "blocks_scanned"),
+        SEGMENTS * BLOCKS_PER_SEG + 1,
+        "every block is scanned exactly once"
+    );
+}
+
+/// The mixed snapshot's rows are identical to what the same data returns on the
+/// striped path (forced by oversubscribing partitions), so joining the tail to
+/// the whole-segment assignment changed the read shape and nothing else.
+#[tokio::test]
+async fn mixed_threshold_rows_match_the_striped_path() {
+    let base = Arc::new(MemoryStore::new());
+    let (snapshot, want, tail_size) = build_fixture_with_tail(base.as_ref()).await;
+    let store: Arc<dyn ObjectStoreBackend> = base;
+
+    let fetcher = || {
+        LogSegmentFetcher::new(Arc::clone(&store))
+            .with_cache(build_read_cache(64 << 20))
+            .with_block_range_threshold(tail_size)
+    };
+
+    let fast_plan = provider(snapshot.clone(), fetcher())
+        .plan(PARTS)
+        .expect("fast");
+    let fast_rows = batches_to_rows(&collect_plan(Arc::clone(&fast_plan)).await);
+    assert_rejection(&fast_plan, None);
+
+    let striped_parts = (SEGMENTS + 1) * 2;
+    let striped_plan = provider(snapshot, fetcher())
+        .plan(striped_parts)
+        .expect("striped");
+    let striped_rows = batches_to_rows(&collect_plan(Arc::clone(&striped_plan)).await);
+    assert_rejection(
+        &striped_plan,
+        Some((
+            "fast_path_rejected_fewer_segments_than_partitions",
+            striped_parts,
+        )),
+    );
+
+    assert_eq!(fast_rows, striped_rows, "fast and striped rows must match");
+    assert_eq!(fast_rows, want, "and both equal the written rows");
+}
+
+// ---- issue #739 deliverable 2: the recorded rejection reason -------------
+
+#[tokio::test]
+async fn rejection_reason_block_predicate() {
+    use datafusion::logical_expr::{col, lit};
+    let expr = ravel_sql::has_word_udf().call(vec![col("body"), lit("s0-r0")]);
+    let (_probes, plan) = run_striped(&[expr], PARTS, Vec::new()).await;
+    assert_rejection(&plan, Some(("fast_path_rejected_block_predicate", PARTS)));
+}
+
+#[tokio::test]
+async fn rejection_reason_segment_not_contained() {
+    use datafusion::common::ScalarValue;
+    use datafusion::logical_expr::{col, lit};
+    let global_max = ((SEGMENTS - 1) * 1000 + (RECORDS_PER_SEG - 1)) as i64;
+    let expr = col("ts").lt_eq(lit(ScalarValue::TimestampNanosecond(
+        Some(global_max - 1),
+        None,
+    )));
+    let (_probes, plan) = run_striped(&[expr], PARTS, Vec::new()).await;
+    assert_rejection(
+        &plan,
+        Some(("fast_path_rejected_segment_not_contained", PARTS)),
+    );
+}
+
+#[tokio::test]
+async fn rejection_reason_pending_erasure() {
+    let erasure = vec![ravel_proto::commit::v1::ErasureRequest {
+        predicate: vec![ravel_proto::commit::v1::ErasurePredicateMatcher {
+            key: "service.name".to_string(),
+            value: "svc".to_string(),
+        }],
+        ..Default::default()
+    }];
+    let (_probes, plan) = run_striped(&[], PARTS, erasure).await;
+    assert_rejection(&plan, Some(("fast_path_rejected_pending_erasure", PARTS)));
+}
+
+#[tokio::test]
+async fn rejection_reason_fewer_segments_than_partitions() {
+    let parts = SEGMENTS * 2;
+    let (_probes, plan) = run_striped(&[], parts, Vec::new()).await;
+    assert_rejection(
+        &plan,
+        Some(("fast_path_rejected_fewer_segments_than_partitions", parts)),
     );
 }
