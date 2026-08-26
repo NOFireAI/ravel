@@ -415,9 +415,10 @@ else
   echo "  Or by hand:     gh pr checks ${pr_number}"
   echo "                  gh api repos/NOFireAI/ravel/pulls/${pr_number}/reviews"
   echo "                  gh api repos/NOFireAI/ravel/pulls/${pr_number}/comments"
-  echo "  Once CI is green and no actionable CodeRabbit finding is open"
-  echo "  (a walkthrough-only comment with zero findings counts as clean):"
-  echo "    gh pr merge ${pr_number} --rebase"
+  echo "  Once ${script_dir}/pr-review-status.sh ${pr_number} reports clean, run the"
+  echo "  exact merge command it prints (it pins --match-head-commit to the SHA it"
+  echo "  just checked, so the merge refuses if the branch moved since):"
+  echo "    gh pr merge ${pr_number} --rebase --delete-branch --match-head-commit <sha from pr-review-status.sh>"
 fi
 
 # Do NOT delete the task/<id>/result and task/<id>/start refs here, with or

@@ -159,18 +159,21 @@ against a PR GitHub is already landing for you.
 until CI is green, `mergeStateStatus` is `CLEAN` or `UNSTABLE` (`DIRTY`/
 `DRAFT`/`BEHIND` mean it isn't mergeable regardless of CI or review state
 -- resolve those first), and it reports a CodeRabbit review against the
-PR's current head commit with a state other than `CHANGES_REQUESTED`.
-The review's inline-comment count does not drop to zero once you fix
-something -- the REST API never removes a comment just because the code
-it flagged changed -- so "clean" here means every comment has been
-individually read and its finding fixed or explicitly answered (a reply
-on the thread, or a commit message noting why it doesn't apply), never
-that the count reaches zero. A walkthrough-only review with zero
-comments from the start is the one case that is actually clean by count.
-Once every finding is accounted for, land it by hand:
+PR's current head commit in state `APPROVED` or `COMMENTED` (`PENDING`,
+`DISMISSED`, and `CHANGES_REQUESTED` are all not clean). The review's
+inline-comment count does not drop to zero once you fix something --
+the REST API never removes a comment just because the code it flagged
+changed -- so "clean" here means every comment has been individually
+read and its finding fixed or explicitly answered (a reply on the
+thread, or a commit message noting why it doesn't apply), never that
+the count reaches zero. A walkthrough-only review with zero comments
+from the start is the one case that is actually clean by count. Once
+every finding is accounted for, `pr-review-status.sh` prints the exact
+merge command, pinned to the head SHA it just checked via
+`--match-head-commit` so the merge refuses if the branch moved since:
 
 ```sh
-gh pr merge <number> --rebase --delete-branch
+gh pr merge <number> --rebase --delete-branch --match-head-commit <sha>
 ```
 
 This removes the `task/$TASK/merge` head once it merges. The script
