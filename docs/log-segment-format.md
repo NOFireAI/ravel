@@ -1014,9 +1014,15 @@ defines word semantics identically on the write and read paths:
 
 - split on any non-alphanumeric character (`char::is_alphanumeric`,
   Unicode-aware);
-- lowercase each token (`char::to_lowercase`, Unicode-aware);
+- lowercase each character (`char::to_lowercase`, Unicode-aware), dropping
+  any resulting character that is not alphanumeric. Full case mapping can
+  emit a combining mark: U+0130 `İ` lowercases to `i` + U+0307 COMBINING
+  DOT ABOVE (a Mark), so the mark is dropped and `İ` folds to `i`, matching
+  what a query typed `istanbul` produces. This keeps every emitted
+  character alphanumeric;
 - truncate each token to its longest character-boundary prefix of at most
-  64 bytes;
+  64 bytes, measured on the folded characters so a length-changing
+  lowercase can neither exceed the cap nor split a codepoint;
 - drop empty tokens; keep duplicates (deduplication is the bloom's job).
 
 A multi-token query word is a phrase: the scan requires all its tokens to
