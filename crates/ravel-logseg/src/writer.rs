@@ -59,8 +59,9 @@ pub struct RlogConfig {
     /// BLOCKS stores column-major, so a projection of `k` columns over a
     /// group is `k` contiguous ranges instead of one range per block. The
     /// block itself is unchanged: `block_target_records`, `block_max_bytes`,
-    /// and every block-keyed prune keep their granularity. Must be nonzero;
-    /// an object with fewer blocks than this has one short row group.
+    /// and every block-keyed prune keep their granularity. A zero value is
+    /// treated as one block per group; an object with fewer blocks than this
+    /// has one short row group.
     pub group_target_blocks: usize,
 }
 

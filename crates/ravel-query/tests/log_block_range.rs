@@ -1330,7 +1330,7 @@ async fn version_4_object_is_read_whole_until_the_page_dir_fetcher_lands() {
         .collect();
     let bytes = build_object_v4(&records);
     assert_eq!(
-        u16::from_le_bytes([bytes[bytes.len() - 8], bytes[bytes.len() - 7]]),
+        footer::trailer_version(&bytes).expect("trailer version"),
         footer::VERSION,
         "the fixture is at the current written version"
     );

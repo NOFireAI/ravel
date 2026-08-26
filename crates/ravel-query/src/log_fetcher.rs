@@ -2345,9 +2345,11 @@ impl BlockRangeFetcher {
         // `block_offset`/`block_len` describe a page span overlapping its
         // neighbours', with the block crc defined over its pages in column_id
         // order rather than over that span. The block-range protocol below
-        // assumes neither, so it reads a version-4 object whole -- the same
-        // bytes and the same one GET the pre-ADR-0107 path used, correct and no
-        // worse than before the bump.
+        // assumes neither, so it reads a version-4 object whole: the same
+        // bytes the pre-ADR-0107 path moved, in one full-object GET on top of
+        // the suffix probe this guard runs after when no plan-carried footer
+        // was supplied (PAGE_DIR presence is only known from the footer). The
+        // probe is cache-routed, so concurrent partitions coalesce onto it.
         //
         // ADR-0699 decision 5 is what replaces this: PAGE_DIR turns each
         // surviving `(row group, projected column)` into one coalesced range,
