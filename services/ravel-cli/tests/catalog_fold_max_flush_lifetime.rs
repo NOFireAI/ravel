@@ -343,3 +343,42 @@ fn the_fold_flag_rejects_the_same_values_as_the_compactor_flag_with_the_same_tex
         );
     }
 }
+
+/// A lifetime near `i64::MAX` would overflow the seal margin (lifetime +
+/// clock-skew + fold-safety additions); the fold must refuse with a clear
+/// error before touching the catalog, never wrap into a bogus watermark.
+#[tokio::test]
+async fn a_lifetime_that_overflows_the_seal_margin_is_refused() {
+    let store = Arc::new(MemoryStore::new());
+    let tenant = "cli-fold-mfl-overflow";
+    let now = fixed_now();
+    seed_tenant(&store, tenant, now).await;
+
+    let err = catalog::fold(
+        store.clone() as Arc<dyn ObjectStoreBackend>,
+        tenant,
+        SHARD_COUNT,
+        SignalArg::Metrics,
+        Some(i64::MAX),
+        now,
+    )
+    .await
+    .expect_err("an overflowing seal margin must be refused");
+    let text = err.to_string();
+    assert!(
+        text.contains("--max-flush-lifetime is too large"),
+        "the error names the flag and the overflow, got: {text}"
+    );
+    let keys: Vec<String> = store
+        .list("t/", None)
+        .await
+        .expect("list")
+        .objects
+        .into_iter()
+        .map(|o| o.key)
+        .collect();
+    assert!(
+        keys.iter().all(|k| !k.contains("/catalog/")),
+        "refusal happens before any catalog write; found {keys:?}"
+    );
+}

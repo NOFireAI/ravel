@@ -32,8 +32,18 @@ fn head_key(tenant: &TenantHash, signal: Signal) -> String {
 /// older than before the fold trusts the hour to be sealed
 /// (docs/catalog-and-mvcc.md "Sealed hours"). Reported next to the watermark so
 /// an operator can see what `--max-flush-lifetime` did.
-fn seal_margin_ns(config: &CatalogConfig) -> i64 {
-    config.max_flush_lifetime_ns + config.clock_skew_allowance_ns + config.fold_safety_margin_ns
+fn seal_margin_ns(config: &CatalogConfig) -> anyhow::Result<i64> {
+    config
+        .max_flush_lifetime_ns
+        .checked_add(config.clock_skew_allowance_ns)
+        .and_then(|n| n.checked_add(config.fold_safety_margin_ns))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "--max-flush-lifetime is too large: the seal margin \
+                 (max_flush_lifetime + clock_skew_allowance + fold_safety_margin) \
+                 overflows"
+            )
+        })
 }
 
 /// Folds one signal's catalog snapshot for a tenant. Returns the report and the
@@ -66,7 +76,7 @@ pub async fn fold(
     if let Some(ns) = max_flush_lifetime_ns {
         catalog_config.max_flush_lifetime_ns = ns;
     }
-    let seal_margin_ns = seal_margin_ns(&catalog_config);
+    let seal_margin_ns = seal_margin_ns(&catalog_config)?;
     // Enforcing, exactly as the server's query path (`ravel_server::query`) is:
     // an enforcing fold reads the tenant's real shard-generation history and
     // stamps a correct `shard_generation_count` and fan-out ceiling, instead of
