@@ -153,6 +153,20 @@
 //! map's contract is that every key is present; per-key `attrs['k']`
 //! projection is out of scope (ADR-0087 decision 3).
 //!
+//! # Row refs, for TopK late materialization (ADR-0774)
+//!
+//! [`LogsScanExec::reproject`] builds a sibling of an existing scan over a
+//! narrower projection, optionally appending one synthetic `UInt64` column
+//! (`__ravel_row_ref`) past every projected index. Each row's value packs the
+//! `(segment ordinal, surviving-block position, surviving-row position)` this
+//! stream is currently at -- cursor state the scan already holds, so nothing
+//! extra is read or decoded to produce it.
+//!
+//! Only [`crate::late_materialization::TopKLateMaterialization`] builds such a
+//! scan, and a scan without it is byte-identical to the pre-ADR-0774 one. What
+//! that address means, and why it still resolves when a second phase re-reads
+//! the block with a wider column selection, is that module's doc.
+//!
 //! # Correctness: the merged `attrs` column plus DataFusion's residual
 //!
 //! This scan pushes three predicate kinds into [`LogSegmentFetcher::fetch`]:
@@ -208,9 +222,9 @@ use std::task::{Context, Poll};
 use datafusion::arrow::array::{
     ArrayRef, BinaryBuilder, BooleanBuilder, DictionaryArray, FixedSizeBinaryBuilder, Int32Array,
     Int64Builder, MapBuilder, StringArray, StringBuilder, StringDictionaryBuilder,
-    TimestampNanosecondArray, UInt8Array, UInt32Array,
+    TimestampNanosecondArray, UInt8Array, UInt32Array, UInt64Array,
 };
-use datafusion::arrow::datatypes::{Int32Type, SchemaRef};
+use datafusion::arrow::datatypes::{Int32Type, Schema, SchemaRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result as DFResult};
@@ -242,6 +256,7 @@ use tokio::sync::OnceCell;
 
 use crate::declared::{DeclaredColumn, DeclaredType};
 use crate::error::SqlError;
+use crate::late_materialization::{RowRef, row_ref_field};
 use crate::logs_schema::{
     FIRST_DECLARED_COL, LOG_COL_ATTRS, LOG_COL_BODY, LOG_COL_FLAGS, LOG_COL_OBSERVED_TS,
     LOG_COL_SEVERITY_NUM, LOG_COL_SEVERITY_TEXT, LOG_COL_SPAN_ID, LOG_COL_TRACE_ID, LOG_COL_TS,
@@ -272,7 +287,7 @@ const BATCH_ROWS: usize = 8192;
 /// direct children, so a deeply nested attribute is undercounted; the fixed
 /// per-record and per-attribute terms dominate at the cardinalities this
 /// bound exists for.
-fn records_memory(records: &[LogRecord]) -> usize {
+pub(crate) fn records_memory(records: &[LogRecord]) -> usize {
     let mut total = std::mem::size_of_val(records);
     for r in records {
         total += r.stream_attrs.len() + r.severity_text.len() + r.body.len();
@@ -478,9 +493,23 @@ pub struct LogsScanExec {
     /// Empty for a zero-declaration query, which is byte-identical to the
     /// pre-ADR-0090 scan.
     declared: Arc<Vec<DeclaredColumn>>,
+    /// The resolved full `logs` schema this scan projects, i.e.
+    /// `logs_schema_with_declared(&declared)`. Kept so [`Self::reproject`] can
+    /// build a narrower sibling scan over the same table without re-deriving
+    /// it (ADR-0774).
+    full_schema: SchemaRef,
     /// This scan's output schema: the resolved full schema
-    /// (`logs_schema_with_declared(&declared)`) projected by `projection`.
+    /// (`logs_schema_with_declared(&declared)`) projected by `projection`, plus
+    /// the synthetic row-ref column appended when `row_refs` is set.
     schema: SchemaRef,
+    /// Whether this scan appends the synthetic `__ravel_row_ref` column
+    /// (ADR-0774): one `UInt64` per row packing the row's `(segment ordinal,
+    /// surviving-block position, surviving-row position)` address, so a second
+    /// phase can re-read exactly the rows a TopK kept. Set only by
+    /// [`Self::reproject`], i.e. only by
+    /// [`crate::late_materialization::TopKLateMaterialization`]; every other
+    /// scan is byte-identical to the pre-ADR-0774 one.
+    row_refs: bool,
     /// Whether this scan may take the columnar fast path (ADR-0099 decision 2),
     /// decided once from the query shape: the projection touches only fixed and
     /// declared columns (no `attrs` map), and no pending erasure predicate
@@ -698,6 +727,74 @@ impl LogsScanExec {
         full_schema: SchemaRef,
         declared: Arc<Vec<DeclaredColumn>>,
     ) -> DFResult<Self> {
+        let projection: Option<Vec<usize>> = projection.cloned();
+        Self::build(
+            tenant_hash,
+            fetcher,
+            segments,
+            target_partitions,
+            ts_min,
+            ts_max,
+            content,
+            prune,
+            erasure,
+            projection,
+            accounting,
+            full_schema,
+            declared,
+            false,
+        )
+    }
+
+    /// The same scan over a different projection of the same table, optionally
+    /// appending the synthetic row-ref column (ADR-0774).
+    ///
+    /// Everything that decides which bytes are read -- the tenant, the fetcher,
+    /// the segment list, the ts bounds, the content and prune predicates, the
+    /// erasure list -- is carried over unchanged, so the narrow phase-1 scan
+    /// this builds prunes to the same surviving blocks, in the same order, and
+    /// evaluates the same exact content filter over the same surviving rows as
+    /// the wide scan it replaces. That identity is what makes a row-ref
+    /// resolvable: see [`crate::late_materialization`].
+    ///
+    /// `projection` is in terms of the resolved FULL schema, exactly like
+    /// [`Self::new`]'s.
+    pub(crate) fn reproject(&self, projection: Vec<usize>, row_refs: bool) -> DFResult<Self> {
+        Self::build(
+            self.tenant_hash,
+            self.fetcher.clone(),
+            &self.segments,
+            self.target_partitions,
+            self.ts_min,
+            self.ts_max,
+            Arc::clone(&self.content),
+            Arc::clone(&self.prune),
+            Arc::clone(&self.erasure),
+            Some(projection),
+            self.accounting.clone(),
+            Arc::clone(&self.full_schema),
+            Arc::clone(&self.declared),
+            row_refs,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        tenant_hash: TenantHash,
+        fetcher: LogSegmentFetcher,
+        segments: &[SegmentRef],
+        target_partitions: usize,
+        ts_min: i64,
+        ts_max: i64,
+        content: Arc<Vec<Predicate>>,
+        prune: Arc<Vec<Predicate>>,
+        erasure: Arc<Vec<ErasurePredicate>>,
+        projection: Option<Vec<usize>>,
+        accounting: QueryAccounting,
+        full_schema: SchemaRef,
+        declared: Arc<Vec<DeclaredColumn>>,
+        row_refs: bool,
+    ) -> DFResult<Self> {
         // Blocks, not segments, are what get striped (ADR-0102), but the
         // per-segment block counts are not known until a prune runs, which is
         // async and cannot happen in this synchronous constructor. So the
@@ -735,7 +832,7 @@ impl LogsScanExec {
         // here rather than carrying an `Option` keeps one code path for the
         // schema, the batch builder, and the column-set resolution.
         let projection: Vec<usize> = match projection {
-            Some(p) => p.clone(),
+            Some(p) => p,
             None => (0..full.fields().len()).collect(),
         };
         for &i in &projection {
@@ -746,7 +843,18 @@ impl LogsScanExec {
             }
         }
         let columns = resolve_columns(&projection, &content, &erasure, &declared);
-        let schema: SchemaRef = Arc::new(full.project(&projection)?);
+        let projected = full.project(&projection)?;
+        // The row-ref column is synthesized per row from the scan's own cursor
+        // position, not decoded, so it contributes nothing to `columns` and
+        // sits last, past every projected column, where a remapped column index
+        // cannot collide with it.
+        let schema: SchemaRef = if row_refs {
+            let mut fields = projected.fields().to_vec();
+            fields.push(Arc::new(row_ref_field()));
+            Arc::new(Schema::new(fields))
+        } else {
+            Arc::new(projected)
+        };
         let columnar_eligible = columnar_static_eligible(&projection, &erasure);
         let properties = Arc::new(Self::compute_properties(&schema, declared_partitions));
         Ok(LogsScanExec {
@@ -763,7 +871,9 @@ impl LogsScanExec {
             projection: Arc::new(projection),
             columns,
             declared,
+            full_schema: full,
             schema,
+            row_refs,
             columnar_eligible,
             stripe_blocks,
             properties,
@@ -894,6 +1004,53 @@ impl LogsScanExec {
         Ok(relevant)
     }
 
+    /// Indices into the resolved full schema this scan emits, in output order
+    /// (ADR-0774: what a late-materialization rewrite narrows and then
+    /// restores).
+    pub(crate) fn projection(&self) -> &[usize] {
+        &self.projection
+    }
+
+    /// Whether this scan can be split into a narrow phase 1 and a row-ref
+    /// fetch (ADR-0774).
+    ///
+    /// The one refusal is a pending selective erasure. A row-ref addresses a
+    /// row by its position in the block's surviving-row list, and the scan
+    /// layer's erasure exclusion ([`retain_unerased`]) removes rows from that
+    /// list after the reader produced it, so the position a phase-1 row
+    /// carries would not be the position phase 2 reads. Refusing is also the
+    /// fail-closed direction: the failure mode of getting erasure wrong is an
+    /// erased record served to a client.
+    ///
+    /// A scan that already emits row refs is not a candidate either: it is
+    /// itself phase 1 of a rewrite this rule already performed.
+    pub(crate) fn late_materialization_candidate(&self) -> bool {
+        self.erasure.is_empty() && !self.row_refs
+    }
+
+    /// Everything [`crate::late_materialization::LogsRowFetchExec`] needs to
+    /// re-read this scan's rows one block at a time (ADR-0774). Every field is
+    /// this scan's own, so phase 2 fetches the same objects, prunes to the same
+    /// surviving blocks, and decodes the same columns the single-phase scan
+    /// would have.
+    pub(crate) fn row_fetch_source(&self) -> RowFetchSource {
+        RowFetchSource {
+            tenant_hash: self.tenant_hash,
+            fetcher: self.fetcher.clone(),
+            segments: Arc::clone(&self.segments),
+            ts_min: self.ts_min,
+            ts_max: self.ts_max,
+            content: Arc::clone(&self.content),
+            prune: Arc::clone(&self.prune),
+            columns: self.columns.clone(),
+            projection: Arc::clone(&self.projection),
+            declared: Arc::clone(&self.declared),
+            schema: Arc::clone(&self.schema),
+            accounting: self.accounting.clone(),
+            concurrency: self.target_partitions,
+        }
+    }
+
     fn compute_properties(schema: &SchemaRef, n: usize) -> PlanProperties {
         let eq = EquivalenceProperties::new(Arc::clone(schema));
         PlanProperties::new(
@@ -903,6 +1060,153 @@ impl LogsScanExec {
             Boundedness::Bounded,
         )
     }
+}
+
+/// The read half of a [`LogsScanExec`], detached so a second phase can re-open
+/// individual blocks of it (ADR-0774).
+///
+/// It is a value, not a plan node: [`crate::late_materialization::
+/// LogsRowFetchExec`] holds one and uses it to turn a batch of row refs into
+/// the rows the wide single-phase scan would have emitted. Every field is
+/// cloned straight off the scan that produced the row refs, so the fetch it
+/// drives is the same fetch, restricted to one block.
+#[derive(Clone)]
+pub(crate) struct RowFetchSource {
+    tenant_hash: TenantHash,
+    fetcher: LogSegmentFetcher,
+    /// Every segment in the snapshot, in snapshot order. A row-ref's segment
+    /// field indexes this.
+    segments: Arc<Vec<SegmentRef>>,
+    ts_min: i64,
+    ts_max: i64,
+    content: Arc<Vec<Predicate>>,
+    prune: Arc<Vec<Predicate>>,
+    /// The FULL projection's column selection, i.e. what the single-phase scan
+    /// would have decoded. Used as both the fetch and the decode selection, as
+    /// `scan_accounted_with_tenant_subset` requires (ADR-0699 decision 5).
+    columns: ColumnSelection,
+    projection: Arc<Vec<usize>>,
+    declared: Arc<Vec<DeclaredColumn>>,
+    /// The scan's original output schema, which is also this fetch's: the
+    /// rewrite restores column order, names, and nullability exactly.
+    schema: SchemaRef,
+    accounting: QueryAccounting,
+    /// How many block fetches may be in flight at once. The scan's declared
+    /// partition count, which is the query's `target_partitions`: phase 2 has
+    /// at most `k` blocks to read and no partitions of its own, so it borrows
+    /// the same fan-out figure rather than inventing one.
+    concurrency: usize,
+}
+
+impl RowFetchSource {
+    /// This fetch's output schema: the original scan's, with no row-ref column.
+    pub(crate) fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    /// The number of columns the restored projection carries, for `EXPLAIN`.
+    pub(crate) fn projected_columns(&self) -> usize {
+        self.projection.len()
+    }
+
+    /// How many block fetches may be in flight at once.
+    pub(crate) fn concurrency(&self) -> usize {
+        self.concurrency
+    }
+
+    /// The [`LogQuery`] the originating scan ran. Rebuilt from the same fields
+    /// in the same order as [`LogsScanExec::execute`], so the pruning is
+    /// identical and a row-ref's surviving-block position means the same thing
+    /// in both phases. Erasure is deliberately absent: a scan carrying one is
+    /// not a late-materialization candidate
+    /// ([`LogsScanExec::late_materialization_candidate`]).
+    fn query(&self) -> LogQuery {
+        let mut query = LogQuery::new(self.ts_min, self.ts_max);
+        for c in self.content.iter() {
+            query = query.with_content(c.clone());
+        }
+        for p in self.prune.iter() {
+            query = query.with_prune(p.clone());
+        }
+        query
+    }
+
+    /// Decode one block of one segment and return the records at the named
+    /// surviving-row positions, paired with the output position each belongs
+    /// at.
+    ///
+    /// `block` is a position in the segment's surviving-block list for this
+    /// query, exactly as [`LogsScanExec`]'s striped path uses, and `rows` are
+    /// positions in that block's surviving-row list. Both are what phase 1
+    /// recorded while draining the same block of the same immutable object
+    /// under the same query, so both resolve; an index that does not is a typed
+    /// error, never a wrong row.
+    pub(crate) async fn fetch_block(
+        &self,
+        segment: usize,
+        block: usize,
+        rows: &[(usize, usize)],
+    ) -> DFResult<Vec<(usize, LogRecord)>> {
+        let seg = self.segments.get(segment).ok_or_else(|| {
+            DataFusionError::Internal(format!("row-ref segment ordinal {segment} out of range"))
+        })?;
+        let query = self.query();
+        let opened = self
+            .fetcher
+            .scan_accounted_with_tenant_subset(
+                seg,
+                self.tenant_hash,
+                &query,
+                &self.columns,
+                &[block],
+                None,
+                &self.accounting,
+            )
+            .await
+            .map_err(SqlError::from)?;
+        // `None` means the catalog summary proved the segment ts-irrelevant.
+        // Phase 1 read a row out of it under the same bounds, so this cannot
+        // happen; say so as an error rather than silently returning no rows.
+        let Some(mut scan) = opened else {
+            return Err(DataFusionError::Internal(format!(
+                "row-ref segment {} became ts-irrelevant between phases",
+                seg.data_object_key
+            )));
+        };
+        let records = scan.next_block().map_err(SqlError::from)?.ok_or_else(|| {
+            DataFusionError::Internal(format!(
+                "row-ref block {block} not in segment {}'s surviving list",
+                seg.data_object_key
+            ))
+        })?;
+        let mut out = Vec::with_capacity(rows.len());
+        for &(row, position) in rows {
+            let record = records.get(row).ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "row-ref row {row} past block {block}'s {} surviving rows in segment {}",
+                    records.len(),
+                    seg.data_object_key
+                ))
+            })?;
+            out.push((position, record.clone()));
+        }
+        Ok(out)
+    }
+
+    /// Build the output batch for `records`, in the original scan's schema.
+    pub(crate) fn build_batch(&self, records: &[LogRecord]) -> DFResult<RecordBatch> {
+        build_batch(
+            records,
+            Arc::clone(&self.schema),
+            &self.projection,
+            &self.declared,
+            None,
+        )
+    }
+
+    /// Rows accumulated into one output batch, shared with the scan so a
+    /// late-materialized result is chunked exactly as the single-phase one.
+    pub(crate) const BATCH_ROWS: usize = BATCH_ROWS;
 }
 
 impl fmt::Debug for LogsScanExec {
@@ -1110,7 +1414,11 @@ impl ExecutionPlan for LogsScanExec {
             held: 0,
             emitted: 0,
             pending: Pending::None,
+            row_refs: self.row_refs,
             current_seg: None,
+            current_seg_ordinal: 0,
+            block_cursor: 0,
+            pending_range: None,
             current_indices: Vec::new(),
             current_footer: None,
             seg_columnar_blocks: 0,
@@ -1240,6 +1548,9 @@ async fn compute_plan_counts(
 /// the segment's surviving-block list) it must drain.
 struct OwnedSeg {
     seg: SegmentRef,
+    /// This segment's position in the snapshot's segment list, i.e. the
+    /// segment field of every row-ref built from it (ADR-0774).
+    ordinal: usize,
     indices: Vec<usize>,
     /// The plan-phase footer for this segment (#693 part 3, deliverable 2),
     /// carried to the subset open so it skips its own suffix probe. `None` on the
@@ -1286,6 +1597,7 @@ fn owned_work(
             if !indices.is_empty() {
                 work.push_back(OwnedSeg {
                     seg: segments[seg_idx].clone(),
+                    ordinal: seg_idx,
                     indices,
                     footer: plan.footer.clone(),
                 });
@@ -1301,6 +1613,7 @@ fn owned_work(
             if seg_ordinal % n == partition {
                 work.push_back(OwnedSeg {
                     seg: segments[seg_idx].clone(),
+                    ordinal: seg_idx,
                     indices: (0..plan.survivors).collect(),
                     footer: plan.footer.clone(),
                 });
@@ -1331,13 +1644,14 @@ fn owned_whole_segments(
 ) -> VecDeque<OwnedSeg> {
     let mut work = VecDeque::new();
     let mut ordinal = 0usize;
-    for seg in segments {
+    for (seg_idx, seg) in segments.iter().enumerate() {
         if !LogSegmentFetcher::ts_range_relevant(seg, ts_min, ts_max) {
             continue;
         }
         if ordinal % n == partition {
             work.push_back(OwnedSeg {
                 seg: seg.clone(),
+                ordinal: seg_idx,
                 indices: Vec::new(),
                 footer: None,
             });
@@ -1469,6 +1783,62 @@ enum Pending {
     Batches(VecDeque<RecordBatch>),
 }
 
+/// The address a run of consecutive output rows carries in the synthetic
+/// row-ref column (ADR-0774): the block they were decoded from, plus the
+/// surviving-row position of the first of them.
+///
+/// `segment` is a position in the snapshot's segment list, `block` a position
+/// in that segment's surviving-block list for this query, and `first_row` a
+/// position in that block's surviving-row list. All three are cursor state the
+/// scan already has; nothing is decoded to produce them.
+#[derive(Clone, Copy)]
+struct RowRefRange {
+    segment: usize,
+    block: usize,
+    first_row: usize,
+}
+
+/// The surviving-block index of the block a partition's cursor is about to
+/// yield, or `None` when the scan emits no row refs (ADR-0774).
+///
+/// `indices` is the partition's own list of surviving-block positions, so the
+/// cursor's `i`-th block is that list's `i`-th entry. The whole-segment fast
+/// path leaves the list empty and drains every survivor in order, so there the
+/// cursor position *is* the surviving-block index.
+///
+/// A free function rather than a method because the columnar drain calls it
+/// while the block cursor holds a mutable borrow of the stream's state field.
+fn block_index(row_refs: bool, indices: &[usize], cursor: usize) -> DFResult<Option<usize>> {
+    if !row_refs {
+        return Ok(None);
+    }
+    if indices.is_empty() {
+        return Ok(Some(cursor));
+    }
+    indices.get(cursor).copied().map(Some).ok_or_else(|| {
+        DataFusionError::Internal(format!(
+            "row-ref cursor at block {cursor} past this partition's {} owned blocks",
+            indices.len()
+        ))
+    })
+}
+
+/// The row-ref column for `rows` consecutive rows starting at `range`.
+fn row_ref_array(range: RowRefRange, rows: usize) -> DFResult<ArrayRef> {
+    let mut packed = Vec::with_capacity(rows);
+    for i in 0..rows {
+        packed.push(
+            RowRef {
+                segment: range.segment,
+                block: range.block,
+                row: range.first_row + i,
+            }
+            .pack()?,
+        );
+    }
+    Ok(Arc::new(UInt64Array::from(packed)))
+}
+
 /// Per-partition record-batch stream (ADR-0087 decisions 1 and 2).
 ///
 /// Holds at most one segment's decoded block plus the batch built from it, and
@@ -1524,9 +1894,24 @@ struct LogScanStream {
     emitted: usize,
     /// The block being drained into batches, in row or columnar form.
     pending: Pending,
+    /// Whether this stream appends the synthetic row-ref column (ADR-0774).
+    row_refs: bool,
     /// The segment currently being drained, kept so the `attrs_raw` fallback can
     /// re-open it on the row path. Set when a segment's open resolves.
     current_seg: Option<SegmentRef>,
+    /// [`Self::current_seg`]'s position in the snapshot's segment list, i.e.
+    /// the segment field of every row-ref stamped while draining it.
+    current_seg_ordinal: usize,
+    /// How many blocks of the current segment's cursor this partition has
+    /// consumed, i.e. the position within [`Self::current_indices`] of the
+    /// block being drained. Reset when a new segment starts and carried across
+    /// the `attrs_raw` re-open, which resumes at exactly this position. It is
+    /// what turns a cursor position into a stable surviving-block index
+    /// ([`Self::current_block`]).
+    block_cursor: usize,
+    /// The address the row-path batch builder stamps from while draining the
+    /// held block. `None` when this scan emits no row refs.
+    pending_range: Option<RowRefRange>,
     /// The surviving-block index list this partition owns for [`Self::
     /// current_seg`], kept so the `attrs_raw` fallback re-opens the row path
     /// over the SAME list (ADR-0102). Set alongside `current_seg`.
@@ -1544,11 +1929,35 @@ struct LogScanStream {
 }
 
 impl LogScanStream {
+    /// The surviving-block index of the block the cursor is about to yield, or
+    /// `None` when this scan emits no row refs.
+    ///
+    /// `current_indices` is this partition's own list of surviving-block
+    /// positions, so the cursor's `i`-th block is that list's `i`-th entry. The
+    /// whole-segment fast path leaves the list empty and drains every survivor
+    /// in order, so there the cursor position *is* the surviving-block index.
+    fn current_block(&self) -> DFResult<Option<usize>> {
+        block_index(self.row_refs, &self.current_indices, self.block_cursor)
+    }
+
+    /// The row-ref address for the block the cursor is about to yield, and
+    /// advance the cursor past it.
+    fn take_block_range(&mut self) -> DFResult<Option<RowRefRange>> {
+        let range = self.current_block()?.map(|block| RowRefRange {
+            segment: self.current_seg_ordinal,
+            block,
+            first_row: 0,
+        });
+        self.block_cursor += 1;
+        Ok(range)
+    }
+
     /// Emit the next row-path batch out of `pending`, moving the reservation
     /// with it: the previous batch's charge is released (it is downstream's
     /// now), the new batch's charge is taken before it is handed over.
     fn emit_next_row_batch(&mut self) -> DFResult<RecordBatch> {
         self.reservation.shrink(std::mem::take(&mut self.emitted));
+        let pending_range = self.pending_range;
         let Pending::Rows { records, pos } = &mut self.pending else {
             return Err(DataFusionError::Internal(
                 "emit_next_row_batch called without a row block held".into(),
@@ -1560,6 +1969,10 @@ impl LogScanStream {
             Arc::clone(&self.schema),
             &self.projection,
             &self.declared,
+            pending_range.map(|r| RowRefRange {
+                first_row: r.first_row + *pos,
+                ..r
+            }),
         )?;
         *pos = end;
         let bytes = batch.get_array_memory_size();
@@ -1729,13 +2142,16 @@ impl Stream for LogScanStream {
                 LogScanState::NextSegment => match this.work.pop_front() {
                     Some(OwnedSeg {
                         seg,
+                        ordinal,
                         indices,
                         footer,
                     }) => {
                         this.current_seg = Some(seg.clone());
+                        this.current_seg_ordinal = ordinal;
                         this.current_indices = indices.clone();
                         this.current_footer = footer.clone();
                         this.seg_columnar_blocks = 0;
+                        this.block_cursor = 0;
                         // Whole-segment fast path reads the object in one GET
                         // (#693 part 3); the striped path opens only this
                         // partition's subset, reusing the plan footer if any.
@@ -1822,12 +2238,33 @@ impl Stream for LogScanStream {
                             if view.has_attrs_raw_page() {
                                 Step::Fallback
                             } else {
-                                match build_columnar_batches(
-                                    &view,
-                                    &this.schema,
-                                    &this.projection,
-                                    &this.declared,
-                                ) {
+                                // The row-ref address of the block just decoded,
+                                // resolved from the cursor position alone. It is
+                                // resolved here rather than before the decode
+                                // because the cursor sits one past its last block
+                                // once the scan is exhausted, and folded into
+                                // `Step::Failed` rather than returned early
+                                // because `scan` borrows `this.state` for the
+                                // whole arm.
+                                let built = block_index(
+                                    this.row_refs,
+                                    &this.current_indices,
+                                    this.block_cursor,
+                                )
+                                .and_then(|block| {
+                                    build_columnar_batches(
+                                        &view,
+                                        &this.schema,
+                                        &this.projection,
+                                        &this.declared,
+                                        block.map(|block| RowRefRange {
+                                            segment: this.current_seg_ordinal,
+                                            block,
+                                            first_row: 0,
+                                        }),
+                                    )
+                                });
+                                match built {
                                     Ok(batches) => Step::Held {
                                         batches,
                                         block_bytes: view.decoded_bytes(),
@@ -1901,8 +2338,11 @@ impl Stream for LogScanStream {
                         } => {
                             // Count every consumed clean block, empty or not, so
                             // a later `attrs_raw` fallback skips exactly the
-                            // blocks the columnar cursor advanced past.
+                            // blocks the columnar cursor advanced past. The
+                            // row-ref cursor moves with it, so a fallback
+                            // re-opens at the same surviving-block position.
                             this.seg_columnar_blocks += 1;
+                            this.block_cursor += 1;
                             // A block with no surviving row is not held at all:
                             // the loop asks for the next block immediately,
                             // which releases it inside this same poll, so there
@@ -1936,6 +2376,13 @@ impl Stream for LogScanStream {
                     }
                     match scan.next_block() {
                         Ok(Some(records)) => {
+                            // Stamp the block's row-ref address before the
+                            // records are held: the batch builder reads it out
+                            // of `pending_range` as it chunks them.
+                            match this.take_block_range() {
+                                Ok(range) => this.pending_range = range,
+                                Err(e) => return this.fail(e),
+                            }
                             if let Err(e) = this.take_row_block(records) {
                                 return this.fail(e);
                             }
@@ -1988,6 +2435,7 @@ fn build_batch(
     schema: SchemaRef,
     projection: &[usize],
     declared: &[DeclaredColumn],
+    row_refs: Option<RowRefRange>,
 ) -> DFResult<RecordBatch> {
     // Precompute the merged attribute view once per record when any projected
     // column needs it -- the `attrs` map or any declared typed column. Hoisted
@@ -2095,6 +2543,9 @@ fn build_batch(
             },
         };
         columns.push(array);
+    }
+    if let Some(range) = row_refs {
+        columns.push(row_ref_array(range, records.len())?);
     }
     debug_assert_eq!(schema.fields().len(), columns.len());
     // The row count is carried explicitly: an empty projection (what a bare
@@ -2503,6 +2954,7 @@ fn build_columnar_batches(
     schema: &SchemaRef,
     projection: &[usize],
     declared: &[DeclaredColumn],
+    row_refs: Option<RowRefRange>,
 ) -> DFResult<Vec<RecordBatch>> {
     let n = view.surviving_count();
     // Resolve each projected declared column's FIELD_DIR column once for the
@@ -2528,7 +2980,17 @@ fn build_columnar_batches(
     while start < n {
         let end = (start + BATCH_ROWS).min(n);
         out.push(build_columnar_batch(
-            view, schema, projection, &plans, &mut cache, start, end,
+            view,
+            schema,
+            projection,
+            &plans,
+            &mut cache,
+            start,
+            end,
+            row_refs.map(|r| RowRefRange {
+                first_row: r.first_row + start,
+                ..r
+            }),
         )?);
         start = end;
     }
@@ -2548,6 +3010,7 @@ fn build_columnar_batch(
     cache: &mut HashMap<u32, Arc<Vec<(String, AttrValue)>>>,
     start: usize,
     end: usize,
+    row_refs: Option<RowRefRange>,
 ) -> DFResult<RecordBatch> {
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(projection.len());
     for &idx in projection {
@@ -2633,6 +3096,9 @@ fn build_columnar_batch(
             },
         };
         columns.push(array);
+    }
+    if let Some(range) = row_refs {
+        columns.push(row_ref_array(range, end - start)?);
     }
     debug_assert_eq!(schema.fields().len(), columns.len());
     // Carry the row count explicitly so an empty projection (a bare `COUNT(*)`)

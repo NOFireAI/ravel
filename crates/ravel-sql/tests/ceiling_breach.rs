@@ -63,6 +63,9 @@ async fn a_join_that_overruns_the_query_ceiling_aborts_and_frees_the_tenant_budg
         max_query_bytes: 768 * 1024,
         parallel_final_aggregation: false,
         skip_partial_aggregation: true,
+        // ADR-0774's rewrite is a `SqlConfig` field now; keep this
+        // fixture's plan shape as it was by not installing the rule.
+        late_materialization_extra_columns: None,
     };
     let fixture = Fixture::build(
         Arc::new(MemoryStore::new()),

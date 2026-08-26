@@ -1696,6 +1696,76 @@ object fetch brings into RAM. Per-block ranged reads are
 `RlogRangeReader`'s territory (used by compaction) and are not on the SQL read
 path.
 
+#### TopK late materialization (ADR-0774)
+
+Projection pushdown only helps a query that asks for few columns. A
+`SELECT <wide projection> ... WHERE ... ORDER BY ... LIMIT k` asks for all of
+them, and gets them for every row, to return `k`. On the ClickBench reference
+tenant (100M rows, 8,424 objects, 105 declared columns) that is the difference
+between a query and a timeout:
+
+| statement | before | expected after |
+|---|---|---|
+| `SELECT COUNT(*) FROM logs WHERE URL LIKE '%google%'` | 22.9 s | unchanged (the rule does not fire) |
+| `SELECT ts, URL FROM logs WHERE URL LIKE '%google%' ORDER BY ts LIMIT 10` | 24.8 s | unchanged (projection already narrow) |
+| `SELECT * FROM logs WHERE URL LIKE '%google%' ORDER BY ts LIMIT 10` (q24) | exceeds a 900 s deadline | within 1.5x of the two-column variant |
+
+The first two bound the third: the count proves the scan and the substring
+`LIKE` cost about 23 s, and the two-column ordered variant proves the sort adds
+about 2 s. `prune=0`/`content=0` in that plan is correct and not a missed
+pushdown -- a substring `LIKE` is neither a block prune nor a bloom probe -- so
+every block is a candidate and the scan decodes all 105 columns of every one of
+them before the filter or the TopK sees a row. The whole difference is the 103
+columns nobody looks at until ten rows have been chosen.
+
+`TopKLateMaterialization` is a physical optimizer rule (installed by
+`build_session` when `SqlConfig::late_materialization_extra_columns` is `Some`,
+which it is by default at 8) that splits such a plan in two. It fires only on a
+`SortExec` that has a `fetch`, does not preserve partitioning, reaches a
+`LogsScanExec` through nothing but filters and schema-preserving plumbing, and
+projects more than the threshold's worth of columns beyond what its filter and
+sort read. An aggregate or join in between, a sort with no fetch, an
+already-narrow projection, and any RSEG or spans scan all leave the plan alone.
+
+```
+LogsRowFetchExec: row_ref=__ravel_row_ref, restored_columns=41
+  SortExec: TopK(fetch=10), expr=[ts@0 ASC NULLS LAST], preserve_partitioning=[false]
+    FilterExec: like(body@1, %NEEDLE%)
+      CooperativeExec
+        LogsScanExec: partitions=1, content=0, prune=0, projection=[ts, body, __ravel_row_ref]
+```
+
+Both phases are visible in one `EXPLAIN`. Phase 1 is the scan line: the same
+TopK over the same filter, but over a scan projecting only `ts` and `body` plus
+`__ravel_row_ref`, a synthetic non-nullable `UInt64` column packing each row's
+`(segment ordinal, surviving-block position, surviving-row position)` -- all
+three cursor state the scan already holds, so nothing is decoded to produce
+them. Phase 2 is `LogsRowFetchExec`: it groups the at-most-`k` surviving row
+refs by block, re-opens exactly those blocks with the original column selection
+through the same accounted fetch entry point the striped scan path uses, and
+emits the rows in phase-1 order under the original schema. `restored_columns`
+is that schema's width. No projection node above it drops the row ref, because
+the fetch node's own output schema is the restored one; the rule runs under
+DataFusion's `schema_check`, so that equality is asserted for every query.
+
+The result is identical to the un-rewritten plan's, ties included: phase 1's
+TopK is the same operator over the same rows in the same order, and phase 2
+does not sort. What makes a row ref resolvable is that pruning never consults
+the column selection, so both phases see the same surviving blocks in the same
+order, and the object is immutable with the etag pinned across the read. The
+rule declines under a pending selective erasure, where scan-layer exclusion
+would shift surviving-row positions between the phases.
+
+What it costs is `k` block reads. Those are accounted like any other scan read,
+and `LogsRowFetchExec` publishes `row_refs`, `blocks_fetched`, and
+`segments_fetched` per `EXPLAIN ANALYZE` so a report can state phase 2's cost
+instead of inferring it. With a read cache wired and an object below the
+block-range threshold they land on the cache key phase 1 already admitted and
+cost no request at all; with `--disable-cache` they are one GET each.
+`crates/ravel-sql/tests/logs_topk_late_materialization.rs` pins both, along
+with the decode split: on its 16-block fixture phase 1 decodes 3 pages per
+block against the single-phase plan's 39, over the same 16 blocks.
+
 Both gaps ADR-0033 recorded are now closed. Both were deliberate, not
 oversights.
 
