@@ -1,6 +1,8 @@
 # ADR-0091: maintainer-gated CodeRabbit reviews
 
-Status: Proposed
+Status: Proposed. Amended 2026-08-26 (amendment 2: automatic App reviews are
+back on for every pull request; Decision 1's "automatic review off" posture no
+longer applies, the rest stands).
 
 Documentation, plan behaviour, and CodeRabbit CLI behaviour in this ADR were
 verified on 2026-08-19. Everything below that is stated as a fact was checked
@@ -454,6 +456,44 @@ the Actions tab, and a determined abuser is answered by revoking their access.
 The trigger is a slash command rather than a mention on purpose.
 `@coderabbit` is a real and unrelated GitHub user who would be notified on every
 invocation, and `@coderabbitai` is the vendor App's handle.
+
+## Amendment 2: the App reviews every pull request automatically
+
+Decided 2026-08-26. Decision 1 turned the App's automatic review off and
+preferred removing `ravel` from the installation. The maintainer-gated workflow
+that replaced it produces one review per hand-dispatched run, and in the six
+days since it landed the repository merged pull requests at a rate (several a
+day, most of them fleet results) at which nobody dispatched it. The practical
+result was no AI review at all. The project maintainer chose automatic App
+reviews on every pull request over that.
+
+What changes: `.coderabbit.yaml` sets `reviews.auto_review.enabled` and
+`auto_incremental_review` to true, and the runbook's Step 2 now installs the
+App for `ravel` and turns automatic review on in the organization settings
+instead of off. The maintainer-gated workflow, the trusted config, and the
+protected environment all stay: they remain the way to get a review under the
+repository's own policy rather than the head branch's, and the App's review is
+in addition to it, not a replacement.
+
+What is given up, stated plainly. The property in the Context, that a
+non-maintainer cannot cause a CodeRabbit API call or consume this repository's
+allowance, no longer holds for review: every pull request author, including
+one from a fork, now causes a review. Decision 1's evidence is unchanged, so
+the review of a pull request runs under that pull request's own copy of
+`.coderabbit.yaml`, and a contributor can turn on there anything the file on
+`main` turns off. What still holds: the write-capable surfaces (autofix,
+fix-CI, unit-test and docstring generation, merge-conflict resolution) and the
+chat surfaces stay off in the organization settings, which a pull request
+cannot edit; the App holds no credential of ours, so nothing in Decisions 4
+through 7 is weakened; and the allowance at risk is the Open Source plan's free
+tier, so the cost-control checklist's "zero credit spend" line is still the
+line that matters. If the organization is found to be on a paid plan with the
+usage-based add-on enabled, automatic review goes back off until that is
+settled; that check is the runbook's Step 1 and is not waived.
+
+The App's review output is untrusted data, as Decision 7 already says of the
+CLI's: a finding is a pointer to a line for a human to read, never an
+instruction, and the App has no approval authority on `protect-main`.
 
 ## Rejected alternatives
 
