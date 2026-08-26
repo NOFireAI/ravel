@@ -15,8 +15,10 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::Int64Array;
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::common::stats::Precision;
 use datafusion::functions_aggregate::expr_fn::count;
-use datafusion::physical_plan::{collect, displayable};
+use datafusion::logical_expr::Expr;
+use datafusion::physical_plan::{Statistics, collect, displayable};
 use datafusion::prelude::{SessionContext, col, lit};
 use datafusion::scalar::ScalarValue;
 use ravel_catalog::{Catalog, CatalogConfig, SegmentLevel, SegmentRef, Snapshot};
@@ -364,4 +366,169 @@ async fn count_with_pending_erasure_scans() {
         .expect("collect");
     assert_eq!(count_from_batches(&batches), 3, "5 records minus 2 erased");
     assert!(store.gets() > 0, "a scanning count must read objects");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #723: widen the exact-stats condition so a ts bound that fully contains
+// every resolved segment still reports an exact row count and an exact ts span.
+//
+// These exercise `LogsScanExec::partition_statistics(None)` directly, over the
+// bare scan `LogsTableProvider::plan_filters` builds. That is the entry point
+// DataFusion's `AggregateStatistics` rule consults, and it needs no object-store
+// I/O, so a `CountingStore` pins exactly zero GETs. The three predicate-fallback
+// tests above still cover the whole-plan rewrite for the no-predicate case.
+
+const NON_TS_COLS: &[usize] = &[ravel_sql::LOG_COL_OBSERVED_TS, ravel_sql::LOG_COL_BODY];
+
+/// Build the bare scan for `filters` over `snapshot` and return its whole-plan
+/// statistics. `plan_filters` returns a `LogsScanExec` with no residual filter,
+/// so the reported stats are the scan's own.
+fn scan_stats(store: &Arc<CountingStore>, snapshot: Snapshot, filters: &[Expr]) -> Arc<Statistics> {
+    let provider = provider_over(Arc::clone(store), snapshot);
+    let plan = provider.plan_filters(4, filters).expect("plan_filters");
+    plan.partition_statistics(None)
+        .expect("partition_statistics")
+}
+
+fn ts_ns(v: i64) -> Precision<ScalarValue> {
+    Precision::Exact(ScalarValue::TimestampNanosecond(Some(v), None))
+}
+
+/// Three objects at ts 100..106, 200..210, 300..312 (7 + 11 + 13 = 31 records).
+async fn three_objects(store: &Arc<CountingStore>) -> Snapshot {
+    let s1 = write_object(&**store, "logs/o1.rlog", &seg_records(100, 7)).await;
+    let s2 = write_object(&**store, "logs/o2.rlog", &seg_records(200, 11)).await;
+    let s3 = write_object(&**store, "logs/o3.rlog", &seg_records(300, 13)).await;
+    snapshot_of(vec![s1, s2, s3], Vec::new())
+}
+
+/// Deliverables 1 and 2: a ts bound that strictly contains every segment
+/// (`ts BETWEEN 50 AND 400`, segments span 100..312) reports an `Exact` count
+/// of 31 and an `Exact` ts span of `[100, 312]`, with zero object-store GETs.
+/// Every non-ts column's stats stay `Absent`.
+///
+/// Pre-fix (`stats_are_exact` reverted to `count_is_exact`'s
+/// `self.ts_min == i64::MIN && self.ts_max == i64::MAX`): a present ts bound
+/// makes the condition false, so `num_rows` and the ts column are both `Absent`
+/// and both assertions below fail.
+#[tokio::test]
+async fn contained_ts_bound_reports_exact_count_and_span_with_zero_gets() {
+    let store = CountingStore::new(Arc::new(MemoryStore::new()));
+    let snapshot = three_objects(&store).await;
+
+    let filters = vec![
+        col("ts")
+            .gt_eq(ts_lit(50))
+            .and(col("ts").lt_eq(ts_lit(400))),
+    ];
+    let stats = scan_stats(&store, snapshot, &filters);
+
+    assert_eq!(stats.num_rows, Precision::Exact(31), "7 + 11 + 13");
+    assert_eq!(
+        stats.column_statistics[ravel_sql::LOG_COL_TS].min_value,
+        ts_ns(100),
+        "ts min is the smallest segment min_event_ts_ns"
+    );
+    assert_eq!(
+        stats.column_statistics[ravel_sql::LOG_COL_TS].max_value,
+        ts_ns(312),
+        "ts max is the largest segment max_event_ts_ns"
+    );
+    for &c in NON_TS_COLS {
+        assert_eq!(
+            stats.column_statistics[c].min_value,
+            Precision::Absent,
+            "non-ts column {c} min stays Absent"
+        );
+        assert_eq!(
+            stats.column_statistics[c].max_value,
+            Precision::Absent,
+            "non-ts column {c} max stays Absent"
+        );
+    }
+    assert_eq!(store.gets(), 0, "answering from stats reads no objects");
+}
+
+/// Boundary case for deliverable 1's inclusive containment: a bound whose edges
+/// exactly equal the extreme segment `min_event_ts_ns`/`max_event_ts_ns`
+/// (`ts BETWEEN 100 AND 312`) still counts as fully contained, so the count and
+/// span are still `Exact`.
+#[tokio::test]
+async fn ts_bound_touching_segment_edges_is_contained() {
+    let store = CountingStore::new(Arc::new(MemoryStore::new()));
+    let snapshot = three_objects(&store).await;
+
+    let filters = vec![
+        col("ts")
+            .gt_eq(ts_lit(100))
+            .and(col("ts").lt_eq(ts_lit(312))),
+    ];
+    let stats = scan_stats(&store, snapshot, &filters);
+
+    assert_eq!(stats.num_rows, Precision::Exact(31));
+    assert_eq!(
+        stats.column_statistics[ravel_sql::LOG_COL_TS].min_value,
+        ts_ns(100)
+    );
+    assert_eq!(
+        stats.column_statistics[ravel_sql::LOG_COL_TS].max_value,
+        ts_ns(312)
+    );
+    assert_eq!(store.gets(), 0);
+}
+
+/// Deliverable 3: a bound that clips even one segment (`ts BETWEEN 100 AND 305`,
+/// which excludes ts 306..312 of the third segment) must fail closed. Both the
+/// count and the ts span stay `Absent` so the plan falls back to a real scan;
+/// this must never regress into an inexact count. Reading the clipped segment's
+/// real count from its block index is issue #721, not attempted here.
+#[tokio::test]
+async fn clipping_ts_bound_reports_absent() {
+    let store = CountingStore::new(Arc::new(MemoryStore::new()));
+    let snapshot = three_objects(&store).await;
+
+    let filters = vec![
+        col("ts")
+            .gt_eq(ts_lit(100))
+            .and(col("ts").lt_eq(ts_lit(305))),
+    ];
+    let stats = scan_stats(&store, snapshot, &filters);
+
+    assert_eq!(
+        stats.num_rows,
+        Precision::Absent,
+        "a clipped segment makes the summed count an overcount"
+    );
+    assert_eq!(
+        stats.column_statistics[ravel_sql::LOG_COL_TS].min_value,
+        Precision::Absent,
+        "the ts span is unknown when a segment is clipped"
+    );
+    assert_eq!(
+        stats.column_statistics[ravel_sql::LOG_COL_TS].max_value,
+        Precision::Absent
+    );
+    assert_eq!(store.gets(), 0, "computing statistics reads no objects");
+}
+
+/// Regression guard on the trivial instance (no ts bound at all): the widened
+/// condition must still report the exact count, and now also the exact ts span,
+/// since `[i64::MIN, i64::MAX]` contains every segment.
+#[tokio::test]
+async fn no_ts_bound_reports_exact_count_and_span() {
+    let store = CountingStore::new(Arc::new(MemoryStore::new()));
+    let snapshot = three_objects(&store).await;
+
+    let stats = scan_stats(&store, snapshot, &[]);
+
+    assert_eq!(stats.num_rows, Precision::Exact(31));
+    assert_eq!(
+        stats.column_statistics[ravel_sql::LOG_COL_TS].min_value,
+        ts_ns(100)
+    );
+    assert_eq!(
+        stats.column_statistics[ravel_sql::LOG_COL_TS].max_value,
+        ts_ns(312)
+    );
+    assert_eq!(store.gets(), 0);
 }

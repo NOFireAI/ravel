@@ -217,6 +217,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties, RecordBatchStream,
     SendableRecordBatchStream, Statistics,
 };
+use datafusion::scalar::ScalarValue;
 use futures::{Stream, StreamExt, TryStreamExt};
 use ravel_catalog::SegmentRef;
 use ravel_logseg::footer::LogFooter;
@@ -701,12 +702,23 @@ impl LogsScanExec {
     /// partition used to have, which only reinforces that no ordering can be
     /// declared. Downstream operators that need one get an explicit sort.
     /// Whether the sum of the snapshot's `SegmentRef::sample_count` values is
-    /// the exact row count of this scan's output (issue #698). It is only when
-    /// nothing between the committed counts and the emitted rows can remove a
-    /// row:
+    /// the exact row count of this scan's output, and its ts span the exact
+    /// min/max over every touched segment (issue #698, widened by issue #723).
+    /// Both hold only when nothing between the committed counts and the emitted
+    /// rows can remove a row:
     ///
-    /// - no ts bound: `ts_min`/`ts_max` are the no-op sentinels a `None`
-    ///   `LogsPushdown::ts_lo`/`ts_hi` lower to (`i64::MIN`/`i64::MAX`);
+    /// - the ts bound fully contains every resolved segment: `ts_min <=
+    ///   seg.min_event_ts_ns && seg.max_event_ts_ns <= ts_max` (inclusive) for
+    ///   every entry in `self.segments`, matching the fast-path containment
+    ///   convention in `ravel_query::log_fetcher`. A bound that clips even one
+    ///   segment removes rows the sum still counts (and leaves the true span
+    ///   unknown), so it fails closed; reading a clipped segment's real count
+    ///   from its block index is issue #721. The no-ts-bound case (`i64::MIN`/
+    ///   `i64::MAX`, the sentinels a `None` `LogsPushdown::ts_lo`/`ts_hi` lower
+    ///   to) is the trivial instance: every segment's span is inside
+    ///   `[i64::MIN, i64::MAX]`. `self.segments` is already the ts-relevant
+    ///   (overlapping) subset the provider resolved, so a fully-out-of-range
+    ///   segment never reaches this check;
     /// - no content predicate (`LogsPushdown::content`, the `has_word` arms
     ///   evaluated exactly per row);
     /// - no attribute-equality prune predicate (`LogsPushdown::prune`); a prune
@@ -721,12 +733,14 @@ impl LogsScanExec {
     /// `LogsPushdown` has exactly these four fields (`ts_lo`, `ts_hi`,
     /// `content`, `prune`); each is covered here, and `erasure` comes from the
     /// resolved snapshot rather than the pushdown.
-    fn count_is_exact(&self) -> bool {
-        self.ts_min == i64::MIN
-            && self.ts_max == i64::MAX
-            && self.content.is_empty()
+    fn stats_are_exact(&self) -> bool {
+        self.content.is_empty()
             && self.prune.is_empty()
             && self.erasure.is_empty()
+            && self
+                .segments
+                .iter()
+                .all(|seg| self.ts_min <= seg.min_event_ts_ns && seg.max_event_ts_ns <= self.ts_max)
     }
 
     /// Whether this scan can take the predicate-free full-window whole-segment
@@ -853,10 +867,12 @@ impl ExecutionPlan for LogsScanExec {
     /// from object storage to add up 8424 numbers the resolve already had.
     ///
     /// `num_rows` is `Exact` only for the whole-plan request (`partition` is
-    /// `None`) and only when [`Self::count_is_exact`] holds; a per-partition
+    /// `None`) and only when [`Self::stats_are_exact`] holds; a per-partition
     /// request gets `Absent`, because a partition's count is its lazily
-    /// resolved striped share of the blocks, not known here. `total_byte_size`
-    /// and every `column_statistics` stay `Absent` (ts min/max is a follow-up).
+    /// resolved striped share of the blocks, not known here. Under the same
+    /// condition the `ts` column's `column_statistics` report an `Exact`
+    /// min/max spanning every touched segment (issue #723); every other
+    /// column's stays `Absent`. `total_byte_size` stays `Absent`.
     fn partition_statistics(&self, partition: Option<usize>) -> DFResult<Arc<Statistics>> {
         // Validate the partition index exactly as the trait default does, so an
         // out-of-range request is an internal error, never a silent answer.
@@ -870,7 +886,7 @@ impl ExecutionPlan for LogsScanExec {
         }
 
         let mut stats = Statistics::new_unknown(&self.schema());
-        if partition.is_none() && self.count_is_exact() {
+        if partition.is_none() && self.stats_are_exact() {
             // Sum in u64 with checked addition; overflow of either the sum or
             // the usize conversion falls back to Absent rather than a wrong
             // count or a panic.
@@ -882,6 +898,22 @@ impl ExecutionPlan for LogsScanExec {
                 && let Ok(n) = usize::try_from(total)
             {
                 stats.num_rows = Precision::Exact(n);
+            }
+
+            // The ts span is exactly `[min(min_event_ts_ns), max(max_event_ts_ns)]`
+            // over the touched segments: the containment check in
+            // `stats_are_exact` proves the bound removes no rows, so no segment's
+            // extremum is clipped away. Report it on the `ts` column wherever the
+            // projection keeps it (a projected-out ts leaves nothing to fill);
+            // empty segments leave both `None`, so the column stays `Absent`.
+            if let (Some(min), Some(max)) = (
+                self.segments.iter().map(|s| s.min_event_ts_ns).min(),
+                self.segments.iter().map(|s| s.max_event_ts_ns).max(),
+            ) && let Some(ts_idx) = self.schema.fields().iter().position(|f| f.name() == "ts")
+            {
+                let col = &mut stats.column_statistics[ts_idx];
+                col.min_value = Precision::Exact(ScalarValue::TimestampNanosecond(Some(min), None));
+                col.max_value = Precision::Exact(ScalarValue::TimestampNanosecond(Some(max), None));
             }
         }
         Ok(Arc::new(stats))
