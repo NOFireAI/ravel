@@ -56,7 +56,7 @@
 //! one writer implementation, so an L0 write and an L1 merge cannot drift. The
 //! only ravel-logseg addition this required is `finish_compacted` itself.
 //!
-//! # Memory (ADR-0065 decision 4)
+//! # Memory (ADR-0065 decision 4, ADR-0032 amendment 2026-08-26)
 //!
 //! The read side ([`RlogCodec::load_input_catalog`]) retains only per-input
 //! catalog metadata: a [`RlogRangeReader`] holding the decoded STREAM_DIR,
@@ -76,7 +76,10 @@
 //! [`StreamCursor`] per input that decodes exactly one block at a time
 //! ([`RlogRangeReader::stream_blocks`] +
 //! [`RlogRangeReader::decode_block`]), fetching the next block's bytes by range
-//! only once the previous block is drained. A record's `(stream_ref, ts)`
+//! only once the previous block is drained (one block ahead: the fetch for
+//! block `n + 1` rides along with block `n`'s, so the cursor advances two
+//! blocks per round trip while its raw residency stays at two blocks). A
+//! record's `(stream_ref, ts)`
 //! stored order makes each input's stream one ts-ascending sequence spread
 //! across ascending blocks, so N inputs carrying the same stream are a standard
 //! k-way merge ordered by `ts_ns`, ties broken by canonical input order. That
@@ -90,19 +93,45 @@
 //! unchanged by the k-way merge), plus at most one decoded block per input
 //! carrying the current stream (`O(input_count * block_size)`, independent of
 //! stream size), plus the in-progress part's writer buffer. The writer buffer
-//! is bounded by `max_l1_part_bytes` -- a part is flushed on a stream boundary
-//! once its record-byte estimate reaches the cap -- and holding a whole part
-//! before its content-addressed key exists is unavoidable, not a regression.
+//! is bounded by `max_l1_part_bytes`: [`PartSink`] closes the in-progress part
+//! as soon as its [`estimate_record`] total reaches the cap, wherever in the
+//! merged record sequence that falls, so a stream may span consecutive parts.
+//! It did NOT always work this way -- the check used to run only between
+//! streams, on the "a stream never straddles two parts" invariant this module
+//! and ADR-0032 once stated -- and a bucket carrying one OTLP resource/scope
+//! (one stream) therefore had no split point at all: 3M wide rows of one
+//! ClickBench logs stream held the whole hour in one writer at 45.7 GB
+//! resident. Issue #711 replaced the invariant with the size bound; parts are
+//! still written by the frozen [`RlogWriter`] unchanged, so only the
+//! partitioning of records into parts changed, never a part's bytes. Holding
+//! one whole part before its content-addressed key exists remains unavoidable.
 //! The [`MergeMemoryTracker`] seam accounts these terms at their real
 //! allocation/decode points and records a high-water mark; the acceptance test
-//! asserts that mark stays under a fixed bound while a hot stream grows.
+//! asserts that mark stays proportional to the cap while a hot stream grows.
 //!
 //! The first RLOG merge held every input object whole (RLOG then had no ranged
 //! section reader); [`ravel_logseg::open_from_suffix`] is now the RLOG analogue
 //! of `ravel_segment::open_from_suffix` and closed that raw-bytes gap.
+//!
+//! # What a reader must tolerate after the split
+//!
+//! Two consecutive parts of one compaction may carry the same `stream_id`,
+//! with adjacent, non-overlapping `(first_series_id, last_series_id)` bounds
+//! (part `k`'s last equals part `k+1`'s first) and adjacent event-time ranges.
+//! Nothing in the read path prunes on those bounds -- the catalog turns every
+//! part into its own `SegmentRef` and the resolver unions them -- so a split
+//! stream reads back as the same row set in the same order. Record
+//! conservation (`sum(part.sample_count)`, the compaction and ADR-0064 erasure
+//! gates) is likewise unaffected: splitting repartitions records, it never
+//! adds or drops one. The one aggregate that does change is
+//! `sum(part.series_count)`, which counts a straddling stream once per part it
+//! appears in; it is reported, never used as a gate.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
+use std::pin::Pin;
 
+use futures::stream::{StreamExt, TryStreamExt, iter as stream_iter};
 use ravel_commit::keys;
 use ravel_logseg::field_dir::FieldDir;
 use ravel_logseg::footer::{self, SuffixOutcome, kind};
@@ -277,64 +306,127 @@ impl SegmentCodec for RlogCodec {
         // the same list, so a field is indexed uniformly across the output.
         let indexed_fields = merged_indexed_fields(&catalogs);
         let tracker = config.merge_memory_tracker.as_ref();
-        let mut parts = Vec::new();
-        let mut part_index: u32 = 0;
-        let mut current: Option<PartBuilder> = None;
+        let mut sink = PartSink {
+            store,
+            bucket,
+            config,
+            input_set_hash,
+            identity,
+            indexed_fields,
+            tracker,
+            current: None,
+            parts: Vec::new(),
+            part_index: 0,
+        };
 
         // Merge stream by stream in sorted stream_id order. Each stream is
         // k-way merged from every input carrying it (ts-ascending, canonical
-        // input-order tie-break) straight into the current part's writer; a
-        // part flushes on a stream boundary once its accumulated record-byte
-        // estimate reaches the size cap (so a stream never straddles two parts,
-        // the log analogue of RSEG's series-boundary split). No intermediate
+        // input-order tie-break) straight into the current part's writer, and
+        // the part flushes the moment its accumulated record-heap estimate
+        // reaches `max_l1_part_bytes` -- mid-stream if that is where the cap
+        // falls (issue #711, ADR-0032 amendment 2026-08-26). No intermediate
         // `Vec<LogRecord>` and no per-stream dedup: distinct submissions of
         // identical content are distinct records (ADR-0032).
         for stream_id in merged.keys() {
-            let part = current.get_or_insert_with(|| PartBuilder::new(&identity, &indexed_fields));
-            merge_stream_into_part(store, &catalogs, stream_id, part, tracker).await?;
-            // Flush on this stream boundary once the part reaches the cap. The
-            // `take` is `Some` here (just inserted above); the `if let` avoids
-            // an `unwrap`/`expect` on the critical path rather than asserting.
-            let over_cap = part.estimate >= config.max_l1_part_bytes && !part.is_empty();
-            if over_cap && let Some(builder) = current.take() {
-                let built = builder
-                    .finish(store, bucket, input_set_hash, part_index, config.dry_run)
-                    .await?;
-                parts.push(built);
-                part_index += 1;
-                if let Some(t) = tracker {
-                    t.set_writer_bytes(0);
-                }
-            }
+            merge_stream_into_parts(store, &catalogs, stream_id, &mut sink, tracker).await?;
         }
-        if let Some(part) = current
-            && !part.is_empty()
-        {
-            let built = part
-                .finish(store, bucket, input_set_hash, part_index, config.dry_run)
+        sink.finish().await
+    }
+}
+
+/// The sequence of L1 parts one merge produces, and the one place a part is
+/// closed and a new one opened.
+///
+/// The split rule is a pure size rule: push records in the merge's canonical
+/// order, and close the in-progress part as soon as its
+/// [`PartBuilder::estimate`] reaches `max_l1_part_bytes`, wherever in the
+/// record sequence that falls. That is the whole of issue #711: the check used
+/// to run only between streams, so a bucket whose records all belong to one
+/// stream (one OTLP resource/scope, the common shape for a single busy
+/// service) held its entire row set live in one writer.
+///
+/// Consecutive parts may therefore carry the same `stream_id` at their shared
+/// boundary, with adjacent, non-overlapping `(series_id, ts)` ranges. Records
+/// still enter each part in global `(stream_id, ts)` order, so every part is
+/// individually sorted and is written by the frozen [`RlogWriter`] unchanged:
+/// only the partitioning of records into parts differs, never a part's bytes
+/// given its record set.
+struct PartSink<'a> {
+    store: &'a dyn ObjectStoreBackend,
+    bucket: &'a Bucket,
+    config: &'a CompactorConfig,
+    input_set_hash: &'a [u8; 32],
+    identity: ObjectIdentity,
+    indexed_fields: Vec<String>,
+    tracker: Option<&'a MergeMemoryTracker>,
+    current: Option<PartBuilder>,
+    parts: Vec<BuiltPart>,
+    part_index: u32,
+}
+
+impl PartSink<'_> {
+    /// Push one merged record, opening a part if none is in progress and
+    /// closing it once the cap is reached.
+    async fn push(&mut self, r: LogRecord) -> Result<()> {
+        if self.current.is_none() {
+            self.current = Some(PartBuilder::new(&self.identity, &self.indexed_fields));
+        }
+        let mut over_cap = false;
+        if let Some(part) = self.current.as_mut() {
+            part.push(r, self.tracker)?;
+            over_cap = part.estimate >= self.config.max_l1_part_bytes;
+        }
+        if over_cap {
+            self.flush().await?;
+        }
+        Ok(())
+    }
+
+    /// Close the in-progress part, if any, and PUT it. A part is never empty
+    /// here: [`Self::push`] only ever calls this after pushing a record, and
+    /// [`Self::finish`] guards on `is_empty`.
+    async fn flush(&mut self) -> Result<()> {
+        // The `if let` (rather than an `unwrap`/`expect`) keeps the critical
+        // path free of a panic path; a `None` here is a no-op, not a lie.
+        if let Some(builder) = self.current.take() {
+            let built = builder
+                .finish(
+                    self.store,
+                    self.bucket,
+                    self.input_set_hash,
+                    self.part_index,
+                    self.config.dry_run,
+                )
                 .await?;
-            parts.push(built);
-            if let Some(t) = tracker {
+            self.parts.push(built);
+            self.part_index += 1;
+            if let Some(t) = self.tracker {
                 t.set_writer_bytes(0);
             }
         }
+        Ok(())
+    }
 
-        Ok(parts)
+    /// Close the trailing part and yield every part built, in part-index order.
+    async fn finish(mut self) -> Result<Vec<BuiltPart>> {
+        if self.current.as_ref().is_some_and(|p| !p.is_empty()) {
+            self.flush().await?;
+        }
+        Ok(self.parts)
     }
 }
 
 /// One in-progress L1 part: the shared [`RlogWriter`] the merged records push
-/// into directly, plus the running record-byte estimate that decides where the
-/// part splits (a stream boundary once the estimate reaches `max_l1_part_bytes`)
-/// and feeds the [`MergeMemoryTracker`]'s writer term. Holding a whole part's
-/// records before [`PartBuilder::finish`] stamps its content-addressed key is
-/// unavoidable (the key is a hash of the whole object); the k-way merge is what
-/// keeps everything *else* bounded.
+/// into directly, plus the running record-heap estimate that decides where the
+/// part splits (wherever the estimate reaches `max_l1_part_bytes`, see
+/// [`PartSink`]) and feeds the [`MergeMemoryTracker`]'s writer term. Holding a
+/// whole part's records before [`PartBuilder::finish`] stamps its
+/// content-addressed key is unavoidable (the key is a hash of the whole
+/// object); the k-way merge is what keeps everything *else* bounded.
 struct PartBuilder {
     writer: RlogWriter,
     /// Sum of [`estimate_record`] over every pushed record: the split trigger
-    /// (matching the old accumulator's `batch_bytes`) and the writer-buffer
-    /// term the tracker records.
+    /// and the writer-buffer term the tracker records.
     estimate: u64,
     min_stream: Option<LogStreamId>,
     max_stream: Option<LogStreamId>,
@@ -416,6 +508,10 @@ struct StreamCursor<'a> {
     /// The current block's decoded-byte estimate, held live in the tracker
     /// until the block is released.
     block_bytes: u64,
+    /// The next block's raw bytes, already fetched (issue #711). At most one:
+    /// the prefetch is one block ahead, so the cursor's raw-byte residency is
+    /// two blocks, not the stream.
+    prefetched: Option<(StreamBlockLoc, bytes::Bytes)>,
     /// The next record to merge, or `None` once the cursor is exhausted.
     head: Option<LogRecord>,
 }
@@ -440,6 +536,7 @@ impl<'a> StreamCursor<'a> {
             next_loc: 0,
             block: Vec::new().into_iter(),
             block_bytes: 0,
+            prefetched: None,
             head: None,
         }))
     }
@@ -463,7 +560,8 @@ impl<'a> StreamCursor<'a> {
     /// Load the next record into `head`: the next record of the current block,
     /// or the first record of the next non-empty block (fetched by range and
     /// decoded here), or `None` when the stream is exhausted in this input. At
-    /// most one block's raw bytes and one decoded block are resident at a time.
+    /// most one decoded block plus at most two blocks' raw bytes (the one being
+    /// decoded and the one prefetched behind it) are resident at a time.
     async fn refill(
         &mut self,
         store: &dyn ObjectStoreBackend,
@@ -475,24 +573,16 @@ impl<'a> StreamCursor<'a> {
         }
         // Current block drained: release it and pull the next non-empty block.
         self.release_block(tracker);
-        while self.next_loc < self.locs.len() {
-            let loc = self.locs[self.next_loc].clone();
-            self.next_loc += 1;
-            let got = store
-                .get(self.object_key, GetRange::Range(loc.start(), loc.end()))
-                .await?;
-            let raw_len = got.data.len() as u64;
-            if let Some(t) = tracker {
-                t.block_fetched(raw_len);
-            }
-            let recs = self.reader.decode_block(&loc, got.data.as_ref())?;
+        while let Some((loc, data)) = self.next_raw_block(store, tracker).await? {
+            let raw_len = data.len() as u64;
+            let recs = self.reader.decode_block(&loc, data.as_ref())?;
             let decoded_bytes: u64 = recs.iter().map(estimate_record).sum();
             if let Some(t) = tracker {
                 // Records both raw and decoded resident at the high-water
                 // instant, then drops the raw buffer.
                 t.block_decoded(raw_len, decoded_bytes);
             }
-            drop(got);
+            drop(data);
             self.block_bytes = decoded_bytes;
             self.block = recs.into_iter();
             if let Some(rec) = self.block.next() {
@@ -506,6 +596,68 @@ impl<'a> StreamCursor<'a> {
         self.head = None;
         Ok(())
     }
+
+    /// The next candidate block's raw bytes, or `None` once the candidate list
+    /// is exhausted.
+    ///
+    /// The GET for the block *after* it is issued in the same concurrent
+    /// `try_join` and its bytes are kept in `prefetched` (issue #711), so the
+    /// cursor advances two blocks per round trip instead of one. Futures are
+    /// lazy, so a stored-but-unpolled future would not be in flight; joining
+    /// the two fetches is what actually overlaps them. Residency stays
+    /// bounded: exactly one prefetched raw block per cursor, never a window
+    /// that grows with the stream.
+    async fn next_raw_block(
+        &mut self,
+        store: &dyn ObjectStoreBackend,
+        tracker: Option<&MergeMemoryTracker>,
+    ) -> Result<Option<(StreamBlockLoc, bytes::Bytes)>> {
+        if let Some((loc, data)) = self.prefetched.take() {
+            return Ok(Some((loc, data)));
+        }
+        let Some(loc) = self.take_next_loc() else {
+            return Ok(None);
+        };
+        let data = match self.take_next_loc() {
+            Some(ahead) => {
+                let (a, b) = futures::try_join!(
+                    fetch_block(store, self.object_key, &loc),
+                    fetch_block(store, self.object_key, &ahead)
+                )?;
+                if let Some(t) = tracker {
+                    t.block_fetched(b.len() as u64);
+                }
+                self.prefetched = Some((ahead, b));
+                a
+            }
+            None => fetch_block(store, self.object_key, &loc).await?,
+        };
+        if let Some(t) = tracker {
+            t.block_fetched(data.len() as u64);
+        }
+        Ok(Some((loc, data)))
+    }
+
+    /// Consume the next candidate block location, if any.
+    fn take_next_loc(&mut self) -> Option<StreamBlockLoc> {
+        let loc = self.locs.get(self.next_loc)?.clone();
+        self.next_loc += 1;
+        Some(loc)
+    }
+}
+
+/// One block's raw bytes by range. Named (not an inline `async` block) so its
+/// future is `Send`-general over the borrowed store; see
+/// [`StreamCursor::next_raw_block`].
+async fn fetch_block(
+    store: &dyn ObjectStoreBackend,
+    object_key: &str,
+    loc: &StreamBlockLoc,
+) -> Result<bytes::Bytes> {
+    let got = store
+        .get(object_key, GetRange::Range(loc.start(), loc.end()))
+        .await?;
+    Ok(got.data)
 }
 
 /// K-way merge one stream from every input carrying it into `part`, in
@@ -516,23 +668,41 @@ impl<'a> StreamCursor<'a> {
 /// sort of the concatenation orders equal-`ts_ns` records by (input, position),
 /// exactly what selecting the minimum `(ts_ns, input_index)` head does here.
 ///
-/// Issue #711: peak memory here is bounded by one part, not one stream.
-async fn merge_stream_into_part(
+/// Records go into `sink`, which closes the in-progress part and opens the next
+/// one the moment the size cap is reached -- possibly in the middle of this
+/// stream (issue #711). The merge order is unaffected: the sink is a pure
+/// partitioner over the sequence this function produces.
+///
+/// The cursors are opened concurrently (`input_read_concurrency` at a time):
+/// each open costs one ranged GET for the stream's first block, so a stream
+/// carried by hundreds of inputs would otherwise serialize hundreds of round
+/// trips before the first record merges.
+async fn merge_stream_into_parts(
     store: &dyn ObjectStoreBackend,
     catalogs: &[RlogInputCatalog],
     stream_id: &LogStreamId,
-    part: &mut PartBuilder,
+    sink: &mut PartSink<'_>,
     tracker: Option<&MergeMemoryTracker>,
 ) -> Result<()> {
-    let mut cursors: Vec<StreamCursor> = Vec::new();
-    for (idx, catalog) in catalogs.iter().enumerate() {
-        if let Some(mut cursor) = StreamCursor::open(catalog, idx, stream_id)? {
-            cursor.refill(store, tracker).await?;
-            if cursor.head.is_some() {
-                cursors.push(cursor);
-            }
-        }
-    }
+    let concurrency = sink.config.input_read_concurrency.max(1);
+    // Box each open-and-first-refill with an explicit `+ Send` bound before
+    // `buffered`, the workaround `crate::build::fetch_batch_pages` documents
+    // for futures that borrow the `&dyn ObjectStoreBackend`. `buffered` keeps
+    // canonical input order, which is the k-way merge's tie-break.
+    type CursorFuture<'f, 'a> =
+        Pin<Box<dyn Future<Output = Result<Option<StreamCursor<'a>>>> + Send + 'f>>;
+    let opens: Vec<CursorFuture<'_, '_>> = catalogs
+        .iter()
+        .enumerate()
+        .map(|(idx, catalog)| {
+            Box::pin(open_cursor(store, catalog, idx, stream_id, tracker)) as CursorFuture<'_, '_>
+        })
+        .collect();
+    let opened: Vec<Option<StreamCursor>> = stream_iter(opens)
+        .buffered(concurrency)
+        .try_collect()
+        .await?;
+    let mut cursors: Vec<StreamCursor> = opened.into_iter().flatten().collect();
     loop {
         // Pick the cursor whose head has the minimum (ts_ns, input_index).
         // input_index is unique per cursor, so the key is a total order and the
@@ -551,11 +721,30 @@ async fn merge_stream_into_part(
             break;
         };
         if let Some(rec) = cursors[bi].take_head() {
-            part.push(rec, tracker)?;
+            sink.push(rec).await?;
         }
         cursors[bi].refill(store, tracker).await?;
     }
     Ok(())
+}
+
+/// Open one input's cursor over `stream_id` and load its first record. Named
+/// (not an inline `async` block) so its future is `Send`-general over the
+/// borrowed store; see the call site in [`merge_stream_into_parts`]. Returns
+/// `None` when the input does not carry the stream, or carries no record for
+/// it.
+async fn open_cursor<'a>(
+    store: &'a dyn ObjectStoreBackend,
+    catalog: &'a RlogInputCatalog,
+    input_index: usize,
+    stream_id: &LogStreamId,
+    tracker: Option<&MergeMemoryTracker>,
+) -> Result<Option<StreamCursor<'a>>> {
+    let Some(mut cursor) = StreamCursor::open(catalog, input_index, stream_id)? else {
+        return Ok(None);
+    };
+    cursor.refill(store, tracker).await?;
+    Ok(cursor.head.is_some().then_some(cursor))
 }
 
 /// Encode one in-progress part's writer into an L1 object and PUT it: run the
@@ -575,7 +764,10 @@ async fn merge_stream_into_part(
 ///
 /// `first_stream_id`/`last_stream_id` are the part's inclusive stream-id bounds
 /// accumulated as records were pushed (streams are merged in sorted id order,
-/// so `first` is the smallest and `last` the largest id in the part).
+/// so `first` is the smallest and `last` the largest id in the part). Since
+/// issue #711 a part may open or close in the middle of a stream, so one part's
+/// `last` may equal the next part's `first`; the bounds are adjacent, not
+/// strictly disjoint.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn finalize_part(
     store: &dyn ObjectStoreBackend,
@@ -654,31 +846,98 @@ pub(crate) fn compactor_identity(bucket: &Bucket, config: &CompactorConfig) -> O
     }
 }
 
-/// A rough uncompressed byte estimate for one record, for the part size cap.
-/// Approximate on purpose (like RSEG's accumulated page-byte estimate): it only
-/// decides where parts split, never correctness.
+/// Per-heap-allocation bookkeeping charged on top of the bytes asked for: the
+/// allocator header plus size-class rounding. A deliberate flat figure, in the
+/// range a general-purpose allocator costs for the small allocations a
+/// [`LogRecord`] is made of.
+const ALLOC_OVERHEAD_BYTES: u64 = 16;
+
+/// The `Vec<LogRecord>` slot one record occupies in the writer, whatever its
+/// payload: 10 fixed fields, three `String`/`Vec` headers, and the `attrs`
+/// vector header.
+const RECORD_SLOT_BYTES: u64 = std::mem::size_of::<LogRecord>() as u64;
+
+/// One `(String, AttrValue)` slot in a record's `attrs` vector: the key's
+/// `String` header plus the widest `AttrValue` variant, before any of their
+/// heap payloads.
+const ATTR_SLOT_BYTES: u64 = std::mem::size_of::<(String, AttrValue)>() as u64;
+
+/// The Rust-side heap one merged [`LogRecord`] occupies while it waits in the
+/// in-progress part's writer, which is what `max_l1_part_bytes` caps
+/// (issue #711). This is deliberately NOT the record's encoded size: the
+/// writer holds row-major `LogRecord`s, and for a wide log row (the ClickBench
+/// shape: ~105 attributes) the Rust representation is an order of magnitude
+/// larger than the bytes it compresses to. Sizing the cap against payload
+/// bytes is what let one 3M-row stream reach 45 GB resident under a nominal
+/// 256 MiB cap.
+///
+/// The formula, one term per real allocation:
+///
+/// ```text
+/// estimate(record) = RECORD_SLOT_BYTES                       // its Vec slot
+///                  + alloc(stream_attrs.len())               // per-row resource/scope copy
+///                  + alloc(severity_text.len())
+///                  + alloc(body.len())
+///                  + alloc(attrs.len() * ATTR_SLOT_BYTES)    // the attrs vector itself
+///                  + sum over attrs of
+///                        alloc(key.len()) + value(v)
+///
+/// alloc(n)  = 0 if n == 0 else n + ALLOC_OVERHEAD_BYTES
+/// value(v)  = alloc(len) for Str/Bytes
+///           = alloc(items.len() * slot) + sum of element values for List/Map
+///           = 0 for I64/F64/Bool, which live inline in the enum and are
+///             already counted by the slot term that holds them
+/// ```
+///
+/// It stays an estimate -- it does not model allocator size classes, `String`
+/// capacity above `len`, or shared allocations -- but it is now within a small
+/// factor of the true heap rather than a small fraction of it, so a 256 MiB cap
+/// means roughly 256 MiB of live records. It still only decides where parts
+/// split, never correctness.
 fn estimate_record(r: &LogRecord) -> u64 {
-    let mut est: u64 = 48; // fixed-column overhead per row
-    est += r.body.len() as u64;
-    est += r.severity_text.len() as u64;
+    let mut est = RECORD_SLOT_BYTES;
+    est = est.saturating_add(alloc_estimate(r.stream_attrs.len() as u64));
+    est = est.saturating_add(alloc_estimate(r.severity_text.len() as u64));
+    est = est.saturating_add(alloc_estimate(r.body.len() as u64));
+    est = est.saturating_add(alloc_estimate(r.attrs.len() as u64 * ATTR_SLOT_BYTES));
     for (k, v) in &r.attrs {
-        est += k.len() as u64 + attr_value_estimate(v);
+        est = est.saturating_add(alloc_estimate(k.len() as u64));
+        est = est.saturating_add(attr_value_estimate(v));
     }
     est
 }
 
+/// One heap allocation of `n` payload bytes, or nothing at all when `n` is 0
+/// (an empty `String`/`Vec` allocates nothing).
+fn alloc_estimate(n: u64) -> u64 {
+    if n == 0 {
+        0
+    } else {
+        n.saturating_add(ALLOC_OVERHEAD_BYTES)
+    }
+}
+
+/// The heap one attribute *value* owns beyond its slot in the containing
+/// vector. Scalars own none: they live inline in the [`AttrValue`] enum, whose
+/// size the slot term already carries.
 fn attr_value_estimate(v: &AttrValue) -> u64 {
     match v {
-        AttrValue::Str(s) => s.len() as u64 + 2,
-        AttrValue::Bytes(b) => b.len() as u64 + 2,
-        AttrValue::List(items) => items.iter().map(attr_value_estimate).sum::<u64>() + 2,
-        AttrValue::Map(kvs) => {
-            kvs.iter()
-                .map(|(k, v)| k.len() as u64 + attr_value_estimate(v))
-                .sum::<u64>()
-                + 2
+        AttrValue::Str(s) => alloc_estimate(s.len() as u64),
+        AttrValue::Bytes(b) => alloc_estimate(b.len() as u64),
+        AttrValue::List(items) => {
+            let slots = items.len() as u64 * std::mem::size_of::<AttrValue>() as u64;
+            items
+                .iter()
+                .map(attr_value_estimate)
+                .fold(alloc_estimate(slots), u64::saturating_add)
         }
-        _ => 8,
+        AttrValue::Map(kvs) => {
+            let slots = kvs.len() as u64 * ATTR_SLOT_BYTES;
+            kvs.iter()
+                .map(|(k, v)| alloc_estimate(k.len() as u64).saturating_add(attr_value_estimate(v)))
+                .fold(alloc_estimate(slots), u64::saturating_add)
+        }
+        AttrValue::I64(_) | AttrValue::F64(_) | AttrValue::Bool(_) => 0,
     }
 }
 
@@ -1828,11 +2087,16 @@ mod tests {
         assert_eq!(stats.blocks_scanned, 0, "a pruned block is never scanned");
     }
 
+    /// Many distinct streams and a tiny part cap: parts get ascending,
+    /// non-overlapping stream-id ranges and the union of records is preserved.
+    ///
+    /// Since issue #711 the ranges are *adjacent*, not strictly disjoint: a
+    /// part can close mid-stream, so one part's `last_series_id` may equal the
+    /// next part's `first_series_id`. This test therefore asserts `<=` between
+    /// parts; the strict-disjointness case is covered by the record-level
+    /// checks in `single_stream_bucket_splits_into_bounded_parts`.
     #[tokio::test]
-    async fn part_splitting_keeps_streams_whole_and_disjoint() {
-        // Many distinct streams and a tiny part cap force splits on stream
-        // boundaries: parts get disjoint, ascending stream-id ranges (a stream
-        // never straddles two parts), and the union of records is preserved.
+    async fn part_splitting_keeps_stream_ranges_ordered_and_non_overlapping() {
         let store = MemoryStore::new();
         let mk = |seq_body: &str| -> Vec<LogRecord> {
             (0..20u32)
@@ -1857,7 +2121,8 @@ mod tests {
         let (rec, parts) = read_output(&store).await;
         assert!(parts.len() >= 2, "tiny cap must split into parts");
 
-        // Part stream-id ranges are disjoint and ascending.
+        // Part stream-id ranges are ascending and non-overlapping (adjacent at
+        // a mid-stream split, strictly increasing otherwise).
         let mut prev_last: Option<[u8; 16]> = None;
         for (i, p) in rec.parts.iter().enumerate() {
             let first: [u8; 16] = p.first_series_id.as_slice().try_into().unwrap();
@@ -1865,8 +2130,8 @@ mod tests {
             assert!(first <= last);
             if let Some(pl) = prev_last {
                 assert!(
-                    pl < first,
-                    "part stream ranges must be disjoint and ordered"
+                    pl <= first,
+                    "part stream ranges must be ordered and non-overlapping"
                 );
             }
             prev_last = Some(last);
@@ -1908,15 +2173,18 @@ mod tests {
         // l0_blocked_cfg's block target: each input is re-blocked at 1000
         // records, so a grown stream spans many blocks per input.
         const L0_BLOCK: u64 = 1000;
-        // A generous per-record upper bound (estimate_record for these tiny
-        // records is ~53 bytes); the bound is intentionally loose so it tracks
+        // A generous per-record upper bound. `estimate_record` charges the
+        // record's Rust-side heap since issue #711, so these tiny records
+        // estimate at ~270 bytes rather than the ~53 payload bytes this bound
+        // was first sized against; it stays intentionally loose so it tracks
         // block size and input count, not the exact estimate.
-        const PER_RECORD_BOUND: u64 = 256;
-        // At most one raw block plus one decoded block resident per input.
+        const PER_RECORD_BOUND: u64 = 1024;
+        // At most one decoded block plus two raw blocks (the one being decoded
+        // and the one prefetched behind it) resident per input.
         const TRANSIENT_BOUND: u64 = INPUTS as u64 * 2 * L0_BLOCK * PER_RECORD_BOUND;
-        // Rough bytes-per-record for the "stream size" the peak is compared
-        // against (only used for reporting and the not-scaling assertion).
-        const PER_RECORD_APPROX: i64 = 53;
+        // Rough estimated bytes-per-record for the "stream size" the peak is
+        // compared against (reporting and the not-scaling assertion only).
+        const PER_RECORD_APPROX: i64 = 270;
 
         // records-per-input at the base scale and 10x.
         let scales = [3_000i64, 30_000i64];
@@ -1950,9 +2218,12 @@ mod tests {
                 .await
                 .expect("compact");
 
-            // One hot stream => exactly one part (a stream never straddles).
+            // 90k tiny records estimate at ~24 MB, far under the 256 MiB
+            // default cap, so this corpus still lands in one part. (Since
+            // issue #711 that is a consequence of the cap, not of a
+            // one-stream-per-part rule.)
             let (_rec, parts) = read_output(&store).await;
-            assert_eq!(parts.len(), 1, "one stream is one part");
+            assert_eq!(parts.len(), 1, "corpus is well under the part cap");
             assert_eq!(
                 decode_all(&parts[0]).len() as i64,
                 records_per_input * i64::from(INPUTS),
@@ -2232,12 +2503,12 @@ mod tests {
         }
 
         /// The same union-equality property under a tiny part cap that forces
-        /// the merge to split across multiple parts on stream boundaries, so the
-        /// "concatenate all parts" side of the differential actually crosses part
-        /// boundaries (the large-cap test above never leaves one part). 512 bytes
-        /// is below a handful of records' estimate, so any multi-stream corpus
-        /// splits; single-stream corpora stay one part (a stream never straddles)
-        /// and still exercise the property.
+        /// the merge to split across multiple parts, so the "concatenate all
+        /// parts" side of the differential actually crosses part boundaries
+        /// (the large-cap test above never leaves one part). 512 bytes is
+        /// below a single record's estimate, so every corpus splits -- since
+        /// issue #711 that includes a single-stream corpus, which splits
+        /// mid-stream rather than staying in one part.
         #[test]
         fn differential_holds_across_part_boundaries(corpus in corpus_strategy()) {
             let rt = tokio::runtime::Builder::new_current_thread()
