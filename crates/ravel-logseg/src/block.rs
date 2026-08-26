@@ -65,17 +65,59 @@ pub struct NumStat {
     pub has_nan: bool,
 }
 
-/// The output of encoding one block.
+/// The output of encoding one block: its pages, and everything its SKIP_IDX
+/// level-0 entry needs beyond a byte range.
+///
+/// The pages are handed back separately from any layout. Version 3 concatenated
+/// a header and them into one contiguous block; version 4 spreads them across
+/// its row group's column chunks (ADR-0699 decision 1), which is why nothing
+/// here commits to a placement.
 #[derive(Clone, Debug)]
 pub struct BlockWriteOut {
-    pub bytes: Vec<u8>,
-    pub crc32c: u32,
+    /// Page descriptors in ascending `column_id` order; a partially present
+    /// column's presence bitmap page comes immediately before its value page.
+    pub descs: Vec<PageDesc>,
+    /// The descriptors' stored page bytes, concatenated in descriptor order.
+    ///
+    /// Descriptor order is staging order, which is *not* ascending `column_id`:
+    /// the fixed columns are staged in field order, so `flags` (column 8) comes
+    /// before `severity_text` (column 4). Version 3's block crc covers this
+    /// order because it covers these bytes; version 4's covers the pages in
+    /// ascending `column_id` order, which is a different concatenation of the
+    /// same pages (ADR-0699 decision 2), so it is computed while the row group
+    /// is placed, not from here.
+    pub payload: Vec<u8>,
     pub record_count: u32,
     pub stats: Vec<NumStat>,
     pub min_ts: i64,
     pub max_ts: i64,
     pub min_stream_ref: u32,
     pub max_stream_ref: u32,
+}
+
+impl BlockWriteOut {
+    /// The version-3 block bytes -- the page-descriptor header followed by the
+    /// pages -- and the crc32c over the whole of them, which is what a
+    /// version-3 SKIP_IDX level-0 entry carries.
+    ///
+    /// Version 4 does not write this layout; it is retained for the version-3
+    /// reader's tests, which need a version-3 producer for arbitrary inputs
+    /// (see `RlogWriter::finish_v3_for_tests`).
+    pub fn v3_bytes(&self) -> (Vec<u8>, u32) {
+        let mut block = Vec::with_capacity(self.payload.len() + 8 * self.descs.len());
+        put_uvarint(&mut block, u64::from(self.record_count));
+        put_uvarint(&mut block, self.descs.len() as u64);
+        for d in &self.descs {
+            put_uvarint(&mut block, u64::from(d.column_id));
+            block.push(d.enc.to_u8());
+            block.push(d.comp);
+            put_uvarint(&mut block, d.len);
+            put_uvarint(&mut block, d.uncomp_len);
+        }
+        block.extend_from_slice(&self.payload);
+        let crc = crc32c::crc32c(&block);
+        (block, crc)
+    }
 }
 
 /// One page staged for a column: its encoding tag and the encoded value bytes.
@@ -399,28 +441,14 @@ pub fn write_block(
         ));
     }
 
-    // Header, then the payload.
-    let mut block = Vec::new();
-    put_uvarint(&mut block, n as u64);
-    put_uvarint(&mut block, descs.len() as u64);
-    for d in &descs {
-        put_uvarint(&mut block, u64::from(d.column_id));
-        block.push(d.enc.to_u8());
-        block.push(d.comp);
-        put_uvarint(&mut block, d.len);
-        put_uvarint(&mut block, d.uncomp_len);
-    }
-    block.extend_from_slice(&payload);
-
-    let crc = crc32c::crc32c(&block);
     let min_ts = ts.iter().copied().min().unwrap_or(0);
     let max_ts = ts.iter().copied().max().unwrap_or(0);
     let min_stream_ref = rows.iter().map(|r| r.stream_ref).min().unwrap_or(0);
     let max_stream_ref = rows.iter().map(|r| r.stream_ref).max().unwrap_or(0);
 
     Ok(BlockWriteOut {
-        bytes: block,
-        crc32c: crc,
+        descs,
+        payload,
         record_count: n as u32,
         stats,
         min_ts,
@@ -661,28 +689,14 @@ pub fn write_block_columnar(
         ));
     }
 
-    // Header, then the payload.
-    let mut block = Vec::new();
-    put_uvarint(&mut block, n as u64);
-    put_uvarint(&mut block, descs.len() as u64);
-    for d in &descs {
-        put_uvarint(&mut block, u64::from(d.column_id));
-        block.push(d.enc.to_u8());
-        block.push(d.comp);
-        put_uvarint(&mut block, d.len);
-        put_uvarint(&mut block, d.uncomp_len);
-    }
-    block.extend_from_slice(&payload);
-
-    let crc = crc32c::crc32c(&block);
     let min_ts = input.ts.iter().copied().min().unwrap_or(0);
     let max_ts = input.ts.iter().copied().max().unwrap_or(0);
     let min_stream_ref = input.stream_ref.iter().copied().min().unwrap_or(0);
     let max_stream_ref = input.stream_ref.iter().copied().max().unwrap_or(0);
 
     Ok(BlockWriteOut {
-        bytes: block,
-        crc32c: crc,
+        descs,
+        payload,
         record_count: n as u32,
         stats,
         min_ts,
@@ -1098,12 +1112,93 @@ pub fn read_block_columns(
         ));
     }
 
+    decode_columns(
+        record_count,
+        &descs,
+        &page_bytes,
+        plans,
+        PageCounters {
+            decoded: pages_decoded,
+            skipped: pages_skipped,
+            bytes_fetched: page_bytes_fetched,
+            bytes_decoded: page_bytes_decoded,
+        },
+    )
+}
+
+/// Decodes one version-4 block from pages the caller located through PAGE_DIR
+/// (ADR-0699 decision 2). A version-4 block has no header and no contiguous
+/// byte range: its pages live in its row group's column chunks, so locating and
+/// checksum-verifying them is the caller's job and this only decodes them.
+///
+/// `pages` is the block's pages in `column_id` order -- the order PAGE_DIR
+/// lists them in and the order the SKIP_IDX level-0 block crc covers them in --
+/// each paired with its decompressed-to-encoded bytes, or with `None` for a
+/// column the projection dropped and whose stored bytes were therefore never
+/// read at all. That is the difference from version 3's projection: there a
+/// skipped page's bytes were present and merely not decompressed, here they
+/// never left the object store.
+pub fn read_block_pages(
+    record_count: usize,
+    pages: &[(PageDesc, Option<Vec<u8>>)],
+    plans: &[ColumnPlan],
+    counters: PageCounters,
+) -> Result<DecodedBlock, LogSegError> {
+    if record_count > MAX_RECORDS as usize {
+        return Err(LogSegError::Corrupted(format!(
+            "record_count {record_count} over cap"
+        )));
+    }
+    if pages.len() as u64 > MAX_PAGES {
+        return Err(LogSegError::Corrupted(format!(
+            "page_count {} over cap",
+            pages.len()
+        )));
+    }
+    let descs: Vec<PageDesc> = pages.iter().map(|(d, _)| *d).collect();
+    let page_bytes: Vec<Option<Vec<u8>>> = pages.iter().map(|(_, b)| b.clone()).collect();
+    decode_columns(record_count, &descs, &page_bytes, plans, counters)
+}
+
+/// How much of a block's page bytes a read actually touched
+/// (docs/adrs/0107-log-segment-block-range-fetch.md decision 4). `fetched` sums
+/// every page the block has, `decoded` only the pages the projection kept;
+/// their gap is the column-filtering waste.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PageCounters {
+    pub decoded: usize,
+    pub skipped: usize,
+    pub bytes_fetched: u64,
+    pub bytes_decoded: u64,
+}
+
+/// Turns a block's page descriptors and their decompressed bytes into a
+/// [`DecodedBlock`]. Shared by the version-3 block reader and the version-4
+/// page reader: only how the pages are located differs between them, never how
+/// a column is rebuilt from a presence page and a value page.
+///
+/// A page whose entry in `page_bytes` is `None` was not read; its column is
+/// left out of the result exactly as an absent column would be.
+fn decode_columns(
+    record_count: usize,
+    descs: &[PageDesc],
+    page_bytes: &[Option<Vec<u8>>],
+    plans: &[ColumnPlan],
+    counters: PageCounters,
+) -> Result<DecodedBlock, LogSegError> {
+    if descs.len() != page_bytes.len() {
+        return Err(LogSegError::Corrupted(
+            "page descriptor and page byte counts differ".into(),
+        ));
+    }
+    let wanted = |i: usize| page_bytes[i].is_some();
+
     // Group descriptor indices by column id, preserving order. Unwanted columns
     // are not grouped at all, so nothing below ever looks at their pages.
     let mut order: Vec<u32> = Vec::new();
     let mut groups: HashMap<u32, Vec<usize>> = HashMap::new();
     for (i, d) in descs.iter().enumerate() {
-        if !wanted(d.column_id) {
+        if !wanted(i) {
             continue;
         }
         groups.entry(d.column_id).or_insert_with(|| {
@@ -1123,10 +1218,10 @@ pub fn read_block_columns(
         str_cols: HashMap::new(),
         fixed_cols: HashMap::new(),
         attrs_raw_page: descs.iter().any(|d| d.column_id == COL_ATTRS_RAW),
-        pages_decoded,
-        pages_skipped,
-        page_bytes_fetched,
-        page_bytes_decoded,
+        pages_decoded: counters.decoded,
+        pages_skipped: counters.skipped,
+        page_bytes_fetched: counters.bytes_fetched,
+        page_bytes_decoded: counters.bytes_decoded,
     };
 
     for column_id in order {
@@ -1137,7 +1232,7 @@ pub fn read_block_columns(
                 if descs[*p].enc != Enc::Bitmap {
                     return Err(LogSegError::Corrupted("presence page not a bitmap".into()));
                 }
-                (decode_bitmap(page(&page_bytes, *p)?, record_count)?, *v)
+                (decode_bitmap(page(page_bytes, *p)?, record_count)?, *v)
             }
             _ => {
                 return Err(LogSegError::Corrupted(format!(
@@ -1148,7 +1243,7 @@ pub fn read_block_columns(
         };
         let present_count = present.iter().filter(|&&b| b).count();
         let enc = descs[value_idx].enc;
-        let encoded = page(&page_bytes, value_idx)?;
+        let encoded = page(page_bytes, value_idx)?;
         match column_kind(column_id, plans)? {
             ColKind::I64 => {
                 let vals = decode_i64(enc, encoded, present_count)?;
@@ -1255,7 +1350,7 @@ mod tests {
         }
         let out = write_block(&rows, &plans, 3).expect("write");
         assert_eq!(out.record_count, 100);
-        let dec = read_block(&out.bytes, out.crc32c, &plans, 1 << 30).expect("read");
+        let dec = read_block(&out.v3_bytes().0, out.v3_bytes().1, &plans, 1 << 30).expect("read");
         assert_eq!(dec.record_count(), 100);
 
         // Fixed columns.
@@ -1289,10 +1384,10 @@ mod tests {
     fn crc_mismatch_is_corrupted() {
         let rows = vec![row(0, 5), row(0, 6)];
         let out = write_block(&rows, &[], 3).expect("write");
-        let mut bad = out.bytes.clone();
+        let mut bad = out.v3_bytes().0;
         bad[0] ^= 0xff;
         assert!(matches!(
-            read_block(&bad, out.crc32c, &[], 1 << 30),
+            read_block(&bad, out.v3_bytes().1, &[], 1 << 30),
             Err(LogSegError::Corrupted(_))
         ));
     }
@@ -1420,7 +1515,7 @@ mod tests {
         // The losing values are still stored: the fix changes the stats, never
         // the rows. Both occurrences survive so the read side can resolve the
         // winner itself.
-        let dec = read_block(&out.bytes, out.crc32c, &plans, 1 << 30).expect("read");
+        let dec = read_block(&out.v3_bytes().0, out.v3_bytes().1, &plans, 1 << 30).expect("read");
         assert_eq!(dec.i64_col(10).and_then(|c| c[0]), Some(9999));
         assert_eq!(dec.bool_col(11).and_then(|c| c[0]), Some(false));
         assert_eq!(
@@ -1506,12 +1601,19 @@ mod tests {
         }
         let out = write_block(&rows, &plans, 3).expect("write");
 
-        let all = read_block(&out.bytes, out.crc32c, &plans, 1 << 30).expect("read all");
+        let all =
+            read_block(&out.v3_bytes().0, out.v3_bytes().1, &plans, 1 << 30).expect("read all");
         assert_eq!(all.pages_skipped(), 0, "no filter skips nothing");
 
         let keep: HashSet<u32> = HashSet::from([COL_TS, COL_STREAM_REF, 11, 17]);
-        let projected =
-            read_block_columns(&out.bytes, out.crc32c, &plans, 1 << 30, Some(&keep)).expect("read");
+        let projected = read_block_columns(
+            &out.v3_bytes().0,
+            out.v3_bytes().1,
+            &plans,
+            1 << 30,
+            Some(&keep),
+        )
+        .expect("read");
 
         assert_eq!(projected.record_count(), 64);
         // Exactly the four requested columns decoded, one page each (every
@@ -1571,12 +1673,19 @@ mod tests {
         // presence bitmap, one page per column).
         let single = |cid: u32| {
             let keep: HashSet<u32> = HashSet::from([cid]);
-            read_block_columns(&out.bytes, out.crc32c, &plans, 1 << 30, Some(&keep))
-                .expect("read")
-                .page_bytes_decoded()
+            read_block_columns(
+                &out.v3_bytes().0,
+                out.v3_bytes().1,
+                &plans,
+                1 << 30,
+                Some(&keep),
+            )
+            .expect("read")
+            .page_bytes_decoded()
         };
 
-        let all = read_block(&out.bytes, out.crc32c, &plans, 1 << 30).expect("read all");
+        let all =
+            read_block(&out.v3_bytes().0, out.v3_bytes().1, &plans, 1 << 30).expect("read all");
         let fetched = all.page_bytes_fetched();
         assert!(fetched > 0);
         assert_eq!(
@@ -1611,8 +1720,14 @@ mod tests {
         // fetched is unchanged, and the split is exact (decoded + skipped ==
         // fetched).
         let keep: HashSet<u32> = HashSet::from([COL_TS, 11, 13]);
-        let projected =
-            read_block_columns(&out.bytes, out.crc32c, &plans, 1 << 30, Some(&keep)).expect("read");
+        let projected = read_block_columns(
+            &out.v3_bytes().0,
+            out.v3_bytes().1,
+            &plans,
+            1 << 30,
+            Some(&keep),
+        )
+        .expect("read");
         assert_eq!(
             projected.page_bytes_fetched(),
             fetched,
@@ -1658,11 +1773,11 @@ mod tests {
         let out = write_block(&rows, &plans, 3).expect("write");
         let keep: HashSet<u32> = HashSet::from([COL_TS, COL_STREAM_REF]);
         // Corrupt the tail, which belongs to a column the filter skips.
-        let mut bad = out.bytes.clone();
+        let mut bad = out.v3_bytes().0;
         let last = bad.len() - 1;
         bad[last] ^= 0xff;
         assert!(matches!(
-            read_block_columns(&bad, out.crc32c, &plans, 1 << 30, Some(&keep)),
+            read_block_columns(&bad, out.v3_bytes().1, &plans, 1 << 30, Some(&keep)),
             Err(LogSegError::Corrupted(_))
         ));
     }
@@ -1694,8 +1809,14 @@ mod tests {
 
         // Decode only column 10 so the figure is exactly that one column's.
         let keep: HashSet<u32> = HashSet::from([10]);
-        let dec =
-            read_block_columns(&out.bytes, out.crc32c, &plans, 1 << 30, Some(&keep)).expect("read");
+        let dec = read_block_columns(
+            &out.v3_bytes().0,
+            out.v3_bytes().1,
+            &plans,
+            1 << 30,
+            Some(&keep),
+        )
+        .expect("read");
 
         // The column dictionary-encoded (4 distinct of 100) and is kept intact.
         let (dict, ids) = dec.str_dict(10).expect("column 10 is a dictionary page");
@@ -1732,7 +1853,7 @@ mod tests {
         }];
         let rows = vec![row(0, 1), row(0, 2)];
         let out = write_block(&rows, &plans, 3).expect("write");
-        let dec = read_block(&out.bytes, out.crc32c, &plans, 1 << 30).expect("read");
+        let dec = read_block(&out.v3_bytes().0, out.v3_bytes().1, &plans, 1 << 30).expect("read");
         assert!(dec.bool_col(12).is_none());
     }
 }

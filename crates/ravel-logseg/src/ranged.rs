@@ -22,12 +22,15 @@
 
 use ravel_types::logstream::LogStreamId;
 
-use crate::block::read_block;
+use crate::block::{DecodedBlock, read_block};
 use crate::error::LogSegError;
 use crate::field_dir::FieldDir;
 use crate::footer::{LogFooter, kind};
 use crate::page::DEFAULT_MAX_UNCOMP;
-use crate::reader::{MAX_BLOCKS, MAX_FIELDS, MAX_STREAMS, column_plans, i64_at, rebuild_record};
+use crate::page_dir::PageDir;
+use crate::reader::{
+    MAX_BLOCKS, MAX_FIELDS, MAX_STREAMS, column_plans, decode_v4_block, i64_at, rebuild_record,
+};
 use crate::record::{COL_STREAM_REF, LogRecord};
 use crate::skip_index::SkipIndex;
 use crate::stream_dir::StreamDir;
@@ -78,15 +81,24 @@ impl StreamBlockSpan {
 /// [`RlogRangeReader::decode_block`], drains it, and only then fetches the next,
 /// so at most one block's raw bytes and one decoded block are resident per
 /// input regardless of how many blocks the stream spans.
+///
+/// Under version 4 a block is not a contiguous byte range: its pages live in
+/// its row group's column chunks (ADR-0699 decision 1). A loc then names the
+/// whole row group -- one contiguous range, because a merge reads every column
+/// -- and covers every candidate block inside it, so the unit a memory-bounded
+/// merge holds is one row group rather than one block. That is the read-side
+/// mirror of the writer's stated one-row-group working set; `group_target_blocks`
+/// bounds both.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StreamBlockLoc {
     /// The stream's dense ref in this object (the decode filter for the block).
     stream_ref: u32,
-    /// The level-0 block index this loc names.
-    block_index: usize,
-    /// Absolute start offset of the block.
+    /// The level-0 block indices this loc covers: exactly one under version 3,
+    /// the row group's candidate blocks under version 4.
+    blocks: Vec<usize>,
+    /// Absolute start offset of the block (version 3) or row group (version 4).
     start: u64,
-    /// Absolute end offset (exclusive) of the block.
+    /// Absolute end offset (exclusive).
     end: u64,
 }
 
@@ -106,9 +118,15 @@ impl StreamBlockLoc {
         self.end - self.start
     }
 
-    /// The level-0 block index this loc names.
+    /// The first level-0 block index this loc covers.
     pub fn block_index(&self) -> usize {
-        self.block_index
+        self.blocks.first().copied().unwrap_or(0)
+    }
+
+    /// Every level-0 block index this loc covers: one under version 3, a row
+    /// group's candidate blocks under version 4.
+    pub fn block_indices(&self) -> &[usize] {
+        &self.blocks
     }
 }
 
@@ -122,6 +140,10 @@ pub struct RlogRangeReader {
     field_dir: FieldDir,
     skip: SkipIndex,
     blocks_offset: u64,
+    /// The decoded PAGE_DIR of a version-4 object, absent for a version-3 one
+    /// (ADR-0699 decision 2). Its presence selects the layout, exactly as it
+    /// does in [`crate::RlogReader`].
+    page_dir: Option<PageDir>,
 }
 
 impl RlogRangeReader {
@@ -137,18 +159,159 @@ impl RlogRangeReader {
         field_dir_raw: &[u8],
         skip_idx_raw: &[u8],
     ) -> Result<Self, LogSegError> {
+        Self::from_sections_with_page_dir(footer, stream_dir_raw, field_dir_raw, skip_idx_raw, None)
+    }
+
+    /// [`Self::from_sections`] plus the version-4 PAGE_DIR section's
+    /// decompressed bytes (ADR-0699 decision 2).
+    ///
+    /// `page_dir_raw` is `Some` exactly when the footer carries a
+    /// `kind::PAGE_DIR` entry, which is exactly when the object is version 4.
+    /// Passing `None` for a version-4 object is refused rather than tolerated:
+    /// without the directory its pages cannot be located at all, and a reader
+    /// that fell back to the version-3 block ranges would read another block's
+    /// bytes.
+    pub fn from_sections_with_page_dir(
+        footer: &LogFooter,
+        stream_dir_raw: &[u8],
+        field_dir_raw: &[u8],
+        skip_idx_raw: &[u8],
+        page_dir_raw: Option<&[u8]>,
+    ) -> Result<Self, LogSegError> {
         let stream_dir = StreamDir::decode(stream_dir_raw, MAX_STREAMS)?;
         let field_dir = FieldDir::decode(field_dir_raw, MAX_FIELDS)?;
         let skip = SkipIndex::decode(skip_idx_raw, MAX_BLOCKS)?;
         let blocks = footer
             .section(kind::BLOCKS)
             .ok_or_else(|| LogSegError::Corrupted("missing BLOCKS section".into()))?;
+        let has_page_dir = footer.section(kind::PAGE_DIR).is_some();
+        let page_dir = match (has_page_dir, page_dir_raw) {
+            (true, Some(raw)) => {
+                let dir = PageDir::decode(raw)?;
+                dir.validate_extents(blocks.len)?;
+                if dir.block_count() != skip.l0.len() as u64 {
+                    return Err(LogSegError::Corrupted(format!(
+                        "page_dir covers {} blocks but skip index has {}",
+                        dir.block_count(),
+                        skip.l0.len()
+                    )));
+                }
+                Some(dir)
+            }
+            (true, None) => {
+                return Err(LogSegError::Corrupted(
+                    "version-4 object opened without its PAGE_DIR section".into(),
+                ));
+            }
+            (false, _) => None,
+        };
         Ok(RlogRangeReader {
             stream_dir,
             field_dir,
             skip,
             blocks_offset: blocks.offset,
+            page_dir,
         })
+    }
+
+    /// The absolute byte extent of the run of blocks `blocks` occupies.
+    ///
+    /// Under version 3 that is the union of their own extents. Under version 4
+    /// a block's pages are spread across its row group's column chunks, so the
+    /// union is taken over the whole row groups the blocks fall in: fetching
+    /// that range brings every page of every block in it, which is what a
+    /// merge (an all-columns read) wants anyway.
+    fn extent_of(&self, blocks: &[usize]) -> Result<(u64, u64), LogSegError> {
+        let mut start = u64::MAX;
+        let mut end = 0u64;
+        for &b in blocks {
+            let (rel_start, rel_len) = match &self.page_dir {
+                Some(dir) => {
+                    let index = u32::try_from(b)
+                        .map_err(|_| LogSegError::Corrupted("block index range".into()))?;
+                    let (group, _) = dir
+                        .locate_block(index)
+                        .ok_or_else(|| LogSegError::Corrupted("block not in page_dir".into()))?;
+                    group_extent(group)?
+                }
+                None => {
+                    let entry = self.skip.l0.get(b).ok_or_else(|| {
+                        LogSegError::Corrupted("skip block index out of range".into())
+                    })?;
+                    (entry.block_offset, entry.block_len)
+                }
+            };
+            let abs = self
+                .blocks_offset
+                .checked_add(rel_start)
+                .ok_or_else(|| LogSegError::Corrupted("block offset overflow".into()))?;
+            let abs_end = abs
+                .checked_add(rel_len)
+                .ok_or_else(|| LogSegError::Corrupted("block range overflow".into()))?;
+            start = start.min(abs);
+            end = end.max(abs_end);
+        }
+        Ok((start, end))
+    }
+
+    /// Decodes one block out of a fetched byte range whose first byte sits at
+    /// absolute offset `base`, dispatching on the object's layout.
+    fn decode_one_block(
+        &self,
+        block: usize,
+        base: u64,
+        bytes: &[u8],
+        plans: &[crate::block::ColumnPlan],
+    ) -> Result<DecodedBlock, LogSegError> {
+        let entry = self
+            .skip
+            .l0
+            .get(block)
+            .ok_or_else(|| LogSegError::Corrupted("skip block index out of range".into()))?;
+        match &self.page_dir {
+            Some(dir) => {
+                let index = u32::try_from(block)
+                    .map_err(|_| LogSegError::Corrupted("block index range".into()))?;
+                let mut pages = dir
+                    .block_pages(index)
+                    .ok_or_else(|| LogSegError::Corrupted("block not in page_dir".into()))?;
+                for p in &mut pages {
+                    p.offset = self
+                        .blocks_offset
+                        .checked_add(p.offset)
+                        .ok_or_else(|| LogSegError::Corrupted("page offset overflow".into()))?;
+                }
+                decode_v4_block(
+                    bytes,
+                    base,
+                    entry.record_count as usize,
+                    entry.block_crc32c,
+                    &pages,
+                    plans,
+                    None,
+                )
+            }
+            None => {
+                let abs = self
+                    .blocks_offset
+                    .checked_add(entry.block_offset)
+                    .ok_or_else(|| LogSegError::Corrupted("block offset overflow".into()))?;
+                let rel = abs
+                    .checked_sub(base)
+                    .ok_or_else(|| LogSegError::Corrupted("block before span start".into()))?;
+                let rel = usize::try_from(rel)
+                    .map_err(|_| LogSegError::Corrupted("block offset range".into()))?;
+                let len = usize::try_from(entry.block_len)
+                    .map_err(|_| LogSegError::Corrupted("block len range".into()))?;
+                let end = rel
+                    .checked_add(len)
+                    .ok_or_else(|| LogSegError::Corrupted("block range overflow".into()))?;
+                let block_bytes = bytes
+                    .get(rel..end)
+                    .ok_or_else(|| LogSegError::Corrupted("block outside fetched span".into()))?;
+                read_block(block_bytes, entry.block_crc32c, plans, DEFAULT_MAX_UNCOMP)
+            }
+        }
     }
 
     /// The object's STREAM_DIR, for the compaction merge's global stream remap.
@@ -175,23 +338,7 @@ impl RlogRangeReader {
         if blocks.is_empty() {
             return Ok(None);
         }
-        let mut start = u64::MAX;
-        let mut end = 0u64;
-        for &b in &blocks {
-            let entry =
-                self.skip.l0.get(b).ok_or_else(|| {
-                    LogSegError::Corrupted("skip block index out of range".into())
-                })?;
-            let abs = self
-                .blocks_offset
-                .checked_add(entry.block_offset)
-                .ok_or_else(|| LogSegError::Corrupted("block offset overflow".into()))?;
-            let abs_end = abs
-                .checked_add(entry.block_len)
-                .ok_or_else(|| LogSegError::Corrupted("block range overflow".into()))?;
-            start = start.min(abs);
-            end = end.max(abs_end);
-        }
+        let (start, end) = self.extent_of(&blocks)?;
         Ok(Some(StreamBlockSpan {
             stream_ref,
             start,
@@ -219,40 +366,8 @@ impl RlogRangeReader {
         let plans = column_plans(&self.field_dir);
         let mut out = Vec::new();
         for &b in &span.blocks {
-            let entry =
-                self.skip.l0.get(b).ok_or_else(|| {
-                    LogSegError::Corrupted("skip block index out of range".into())
-                })?;
-            let abs = self
-                .blocks_offset
-                .checked_add(entry.block_offset)
-                .ok_or_else(|| LogSegError::Corrupted("block offset overflow".into()))?;
-            let rel = abs
-                .checked_sub(span.start)
-                .ok_or_else(|| LogSegError::Corrupted("block before span start".into()))?;
-            let rel = usize::try_from(rel)
-                .map_err(|_| LogSegError::Corrupted("block offset range".into()))?;
-            let len = usize::try_from(entry.block_len)
-                .map_err(|_| LogSegError::Corrupted("block len range".into()))?;
-            let end = rel
-                .checked_add(len)
-                .ok_or_else(|| LogSegError::Corrupted("block range overflow".into()))?;
-            let block_bytes = span_bytes
-                .get(rel..end)
-                .ok_or_else(|| LogSegError::Corrupted("block outside fetched span".into()))?;
-            let decoded = read_block(block_bytes, entry.block_crc32c, &plans, DEFAULT_MAX_UNCOMP)?;
-            for row in 0..decoded.record_count() {
-                let sref = u32::try_from(i64_at(&decoded, COL_STREAM_REF, row)?)
-                    .map_err(|_| LogSegError::Corrupted("stream_ref range".into()))?;
-                if sref == span.stream_ref {
-                    out.push(rebuild_record(
-                        &self.stream_dir,
-                        &self.field_dir,
-                        &decoded,
-                        row,
-                    )?);
-                }
-            }
+            let decoded = self.decode_one_block(b, span.start, span_bytes, &plans)?;
+            self.push_stream_rows(&decoded, span.stream_ref, &mut out)?;
         }
         Ok(out)
     }
@@ -281,22 +396,38 @@ impl RlogRangeReader {
         if blocks.is_empty() {
             return Ok(None);
         }
-        let mut locs = Vec::with_capacity(blocks.len());
-        for b in blocks {
-            let entry =
-                self.skip.l0.get(b).ok_or_else(|| {
-                    LogSegError::Corrupted("skip block index out of range".into())
-                })?;
-            let start = self
-                .blocks_offset
-                .checked_add(entry.block_offset)
-                .ok_or_else(|| LogSegError::Corrupted("block offset overflow".into()))?;
-            let end = start
-                .checked_add(entry.block_len)
-                .ok_or_else(|| LogSegError::Corrupted("block range overflow".into()))?;
+        // Version 3: one loc per block. Version 4: one loc per row group, since
+        // a block's pages are spread across its group's column chunks and a
+        // merge reads every column (ADR-0699 decision 1).
+        let runs: Vec<Vec<usize>> = match &self.page_dir {
+            Some(dir) => {
+                let mut runs: Vec<Vec<usize>> = Vec::new();
+                let mut current: Option<u32> = None;
+                for b in blocks {
+                    let index = u32::try_from(b)
+                        .map_err(|_| LogSegError::Corrupted("block index range".into()))?;
+                    let (group, _) = dir
+                        .locate_block(index)
+                        .ok_or_else(|| LogSegError::Corrupted("block not in page_dir".into()))?;
+                    if current == Some(group.first_block) {
+                        if let Some(run) = runs.last_mut() {
+                            run.push(b);
+                        }
+                    } else {
+                        current = Some(group.first_block);
+                        runs.push(vec![b]);
+                    }
+                }
+                runs
+            }
+            None => blocks.into_iter().map(|b| vec![b]).collect(),
+        };
+        let mut locs = Vec::with_capacity(runs.len());
+        for run in runs {
+            let (start, end) = self.extent_of(&run)?;
             locs.push(StreamBlockLoc {
                 stream_ref,
-                block_index: b,
+                blocks: run,
                 start,
                 end,
             });
@@ -325,29 +456,57 @@ impl RlogRangeReader {
                 "block bytes length != block range".into(),
             ));
         }
-        let entry = self
-            .skip
-            .l0
-            .get(loc.block_index)
-            .ok_or_else(|| LogSegError::Corrupted("skip block index out of range".into()))?;
-        if entry.block_len != loc.byte_len() {
-            return Err(LogSegError::Corrupted("block len != skip entry len".into()));
-        }
         let plans = column_plans(&self.field_dir);
-        let decoded = read_block(block_bytes, entry.block_crc32c, &plans, DEFAULT_MAX_UNCOMP)?;
         let mut out = Vec::new();
+        for &b in &loc.blocks {
+            let decoded = self.decode_one_block(b, loc.start, block_bytes, &plans)?;
+            self.push_stream_rows(&decoded, loc.stream_ref, &mut out)?;
+        }
+        Ok(out)
+    }
+
+    /// Appends the rows of `decoded` that belong to `stream_ref`, rebuilt into
+    /// records, in stored order.
+    fn push_stream_rows(
+        &self,
+        decoded: &DecodedBlock,
+        stream_ref: u32,
+        out: &mut Vec<LogRecord>,
+    ) -> Result<(), LogSegError> {
         for row in 0..decoded.record_count() {
-            let sref = u32::try_from(i64_at(&decoded, COL_STREAM_REF, row)?)
+            let sref = u32::try_from(i64_at(decoded, COL_STREAM_REF, row)?)
                 .map_err(|_| LogSegError::Corrupted("stream_ref range".into()))?;
-            if sref == loc.stream_ref {
+            if sref == stream_ref {
                 out.push(rebuild_record(
                     &self.stream_dir,
                     &self.field_dir,
-                    &decoded,
+                    decoded,
                     row,
                 )?);
             }
         }
-        Ok(out)
+        Ok(())
     }
+}
+
+/// A row group's byte extent in BLOCKS: from its first column chunk's offset to
+/// the end of its last. The chunks of one group are contiguous and in
+/// `column_id` order, so this covers every page of every block in it.
+fn group_extent(group: &crate::page_dir::GroupEntry) -> Result<(u64, u64), LogSegError> {
+    let mut start = u64::MAX;
+    let mut end = 0u64;
+    for chunk in &group.chunks {
+        let (offset, len) = chunk
+            .extent()
+            .ok_or_else(|| LogSegError::Corrupted("page_dir chunk length overflow".into()))?;
+        let chunk_end = offset
+            .checked_add(len)
+            .ok_or_else(|| LogSegError::Corrupted("page_dir chunk extent overflow".into()))?;
+        start = start.min(offset);
+        end = end.max(chunk_end);
+    }
+    if start == u64::MAX {
+        return Err(LogSegError::Corrupted("row group has no chunks".into()));
+    }
+    Ok((start, end - start))
 }

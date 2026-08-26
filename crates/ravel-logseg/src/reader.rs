@@ -10,14 +10,15 @@
 
 use ravel_types::logstream::AttrValue;
 
-use crate::block::{ColumnPlan, DecodedBlock, read_block_columns};
+use crate::block::{ColumnPlan, DecodedBlock, PageCounters, read_block_columns, read_block_pages};
 use crate::bloom_section::BloomSection;
 use crate::columnar::ColumnarBlockView;
 use crate::columns::ColumnSelection;
 use crate::error::LogSegError;
 use crate::field_dir::FieldDir;
 use crate::footer::{COMP_ZSTD, LogFooter, SectionDesc, kind, open};
-use crate::page::DEFAULT_MAX_UNCOMP;
+use crate::page::{DEFAULT_MAX_UNCOMP, read_page};
+use crate::page_dir::{PageDir, PageLoc};
 use crate::postings::{POSTINGS_VERSION_V1, PostingsSection, term_key};
 use crate::record::{
     COL_BODY, COL_FLAGS, COL_OBSERVED_TS, COL_SEVERITY_NUM, COL_SEVERITY_TEXT, COL_SPAN_ID,
@@ -30,7 +31,9 @@ use crate::writer::RlogConfig;
 
 pub(crate) const MAX_STREAMS: u64 = 1 << 24;
 pub(crate) const MAX_FIELDS: u64 = 1 << 20;
-pub(crate) const MAX_BLOCKS: u64 = 1 << 24;
+/// Upper bound on an object's block count (untrusted-input guard). PAGE_DIR
+/// derives its group and block caps from this (ADR-0699 decision 2).
+pub const MAX_BLOCKS: u64 = 1 << 24;
 
 /// Counters describing how much a scan pruned (docs/log-segment-format.md).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -73,6 +76,11 @@ pub struct RlogReader<'a> {
     field_dir: FieldDir,
     skip: SkipIndex,
     blocks_offset: u64,
+    /// The decoded PAGE_DIR of a version-4 object, absent for a version-3 one
+    /// (ADR-0699 decision 2). Its presence is what selects the layout: a
+    /// version-4 block's pages are located through this, a version-3 block's
+    /// through its own header inside its contiguous byte range.
+    page_dir: Option<PageDir>,
     bloom: SectionDesc,
     /// Absent when the object was written with no indexed fields
     /// (docs/log-segment-format.md: POSTINGS is an optional section).
@@ -95,15 +103,56 @@ impl<'a> RlogReader<'a> {
         let blocks = *section(&footer, kind::BLOCKS)?;
         let bloom = *section(&footer, kind::BLOOM)?;
         let postings = footer.section(kind::POSTINGS).copied();
+        // A version-4 object carries PAGE_DIR; a version-3 object does not.
+        // Like SKIP_IDX and unlike BLOOM, it is not optional and a corrupt one
+        // never degrades: without it no version-4 page can be located at all
+        // (ADR-0699 decision 2).
+        let page_dir = match footer.section(kind::PAGE_DIR) {
+            Some(desc) => {
+                let raw = read_section(bytes, desc, cfg)?;
+                let dir = PageDir::decode(&raw)?;
+                dir.validate_extents(blocks.len)?;
+                if dir.block_count() != skip.l0.len() as u64 {
+                    return Err(LogSegError::Corrupted(format!(
+                        "page_dir covers {} blocks but skip index has {}",
+                        dir.block_count(),
+                        skip.l0.len()
+                    )));
+                }
+                Some(dir)
+            }
+            None => None,
+        };
         Ok(RlogReader {
             bytes,
             stream_dir,
             field_dir,
             skip,
             blocks_offset: blocks.offset,
+            page_dir,
             bloom,
             postings,
         })
+    }
+
+    /// The byte extent in BLOCKS of one `(row group, column)` column chunk of a
+    /// version-4 object, absolute in the object: `(offset, length)`, covering
+    /// exactly the pages PAGE_DIR lists for that column in that group,
+    /// contiguous and in order.
+    ///
+    /// This is the seam ADR-0699 decision 5's fetcher reads: one ranged GET per
+    /// surviving `(row group, projected column)` replaces one per block. It
+    /// returns `None` for a version-3 object (which has no column chunks), for a
+    /// group index past the last, and for a column the group carries no page
+    /// for.
+    pub fn column_chunk_range(&self, group: usize, column_id: u32) -> Option<(u64, u64)> {
+        let (offset, len) = self.page_dir.as_ref()?.chunk_range(group, column_id)?;
+        Some((self.blocks_offset.checked_add(offset)?, len))
+    }
+
+    /// The number of row groups in a version-4 object; 0 for a version-3 one.
+    pub fn row_group_count(&self) -> usize {
+        self.page_dir.as_ref().map_or(0, |d| d.groups.len())
     }
 
     /// The column plans for every dynamic column, for block decode.
@@ -345,15 +394,37 @@ impl<'a> RlogReader<'a> {
                 self.skip.l0.get(b).ok_or_else(|| {
                     LogSegError::Corrupted("skip block index out of range".into())
                 })?;
-            let start = self
-                .blocks_offset
-                .checked_add(entry.block_offset)
-                .ok_or_else(|| LogSegError::Corrupted("block offset overflow".into()))?;
-            blocks.push(BlockLoc {
-                start,
-                len: entry.block_len,
-                crc32c: entry.block_crc32c,
-            });
+            match &self.page_dir {
+                Some(dir) => {
+                    let index = u32::try_from(b)
+                        .map_err(|_| LogSegError::Corrupted("block index range".into()))?;
+                    let mut pages = dir
+                        .block_pages(index)
+                        .ok_or_else(|| LogSegError::Corrupted("block not in page_dir".into()))?;
+                    for p in &mut pages {
+                        p.offset = self
+                            .blocks_offset
+                            .checked_add(p.offset)
+                            .ok_or_else(|| LogSegError::Corrupted("page offset overflow".into()))?;
+                    }
+                    blocks.push(BlockLoc::V4 {
+                        record_count: entry.record_count as usize,
+                        crc32c: entry.block_crc32c,
+                        pages,
+                    });
+                }
+                None => {
+                    let start = self
+                        .blocks_offset
+                        .checked_add(entry.block_offset)
+                        .ok_or_else(|| LogSegError::Corrupted("block offset overflow".into()))?;
+                    blocks.push(BlockLoc::V3 {
+                        start,
+                        len: entry.block_len,
+                        crc32c: entry.block_crc32c,
+                    });
+                }
+            }
         }
 
         Ok(BlockScan {
@@ -412,7 +483,7 @@ impl<'a> RlogReader<'a> {
         let mut subset = Vec::with_capacity(indices.len());
         for &i in indices {
             let loc =
-                scan.blocks.get(i).copied().ok_or_else(|| {
+                scan.blocks.get(i).cloned().ok_or_else(|| {
                     LogSegError::Corrupted("subset block index out of range".into())
                 })?;
             subset.push(loc);
@@ -652,13 +723,23 @@ impl<'a> RlogReader<'a> {
     }
 }
 
-/// The absolute extent and checksum of one surviving block, copied out of the
-/// skip index so a [`BlockScan`] can locate it without borrowing the reader.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct BlockLoc {
-    start: u64,
-    len: u64,
-    crc32c: u32,
+/// Where one surviving block's bytes are, copied out of the skip index (and,
+/// for version 4, PAGE_DIR) so a [`BlockScan`] can locate it without borrowing
+/// the reader.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BlockLoc {
+    /// Version 3: one contiguous `header || pages` extent, covered by one crc.
+    V3 { start: u64, len: u64, crc32c: u32 },
+    /// Version 4: the block's pages, each at its own absolute offset, in
+    /// `column_id` order (ADR-0699 decision 1). `crc32c` is the block crc,
+    /// which is now defined over the concatenation of exactly these pages in
+    /// exactly this order, so it is verifiable only by a reader that took all
+    /// of them; a page-subset read verifies each page's own crc instead.
+    V4 {
+        record_count: usize,
+        crc32c: u32,
+        pages: Vec<PageLoc>,
+    },
 }
 
 /// A pruned scan that has not decoded anything yet: the surviving block list,
@@ -810,27 +891,44 @@ impl BlockScan {
         self.current = None;
         self.surviving.clear();
 
-        let Some(loc) = self.blocks.get(self.next).copied() else {
+        let Some(loc) = self.blocks.get(self.next).cloned() else {
             return Ok(false);
         };
         self.next += 1;
-        let start = usize::try_from(loc.start)
-            .map_err(|_| LogSegError::Corrupted("block offset range".into()))?;
-        let len = usize::try_from(loc.len)
-            .map_err(|_| LogSegError::Corrupted("block len range".into()))?;
-        let end = start
-            .checked_add(len)
-            .ok_or_else(|| LogSegError::Corrupted("block range overflow".into()))?;
-        let block_bytes = object_bytes
-            .get(start..end)
-            .ok_or_else(|| LogSegError::Corrupted("block out of bounds".into()))?;
-        let decoded = read_block_columns(
-            block_bytes,
-            loc.crc32c,
-            &self.plans,
-            DEFAULT_MAX_UNCOMP,
-            self.columns.as_ref(),
-        )?;
+        let decoded = match loc {
+            BlockLoc::V3 { start, len, crc32c } => {
+                let start = usize::try_from(start)
+                    .map_err(|_| LogSegError::Corrupted("block offset range".into()))?;
+                let len = usize::try_from(len)
+                    .map_err(|_| LogSegError::Corrupted("block len range".into()))?;
+                let end = start
+                    .checked_add(len)
+                    .ok_or_else(|| LogSegError::Corrupted("block range overflow".into()))?;
+                let block_bytes = object_bytes
+                    .get(start..end)
+                    .ok_or_else(|| LogSegError::Corrupted("block out of bounds".into()))?;
+                read_block_columns(
+                    block_bytes,
+                    crc32c,
+                    &self.plans,
+                    DEFAULT_MAX_UNCOMP,
+                    self.columns.as_ref(),
+                )?
+            }
+            BlockLoc::V4 {
+                record_count,
+                crc32c,
+                ref pages,
+            } => decode_v4_block(
+                object_bytes,
+                0,
+                record_count,
+                crc32c,
+                pages,
+                &self.plans,
+                self.columns.as_ref(),
+            )?,
+        };
         self.stats.blocks_scanned += 1;
         self.stats.pages_decoded += decoded.pages_decoded() as u64;
         self.stats.pages_skipped += decoded.pages_skipped() as u64;
@@ -857,6 +955,85 @@ impl BlockScan {
         self.current = Some(decoded);
         Ok(true)
     }
+}
+
+/// Reads and decodes one version-4 block, given its pages located through
+/// PAGE_DIR (ADR-0699 decisions 1 and 2).
+///
+/// Every page whose column the projection keeps is checksum-verified against
+/// its own PAGE_DIR `crc32c` before it is decompressed, so a page-subset read
+/// verifies every byte it goes on to interpret without touching the rest of the
+/// block. A page whose column the projection drops is never read at all: under
+/// version 3 its stored bytes were inside the block extent already fetched and
+/// were merely walked past, here they are simply not addressed.
+///
+/// When the projection keeps everything, the block's SKIP_IDX level-0 crc is
+/// verified too, over the concatenation of the pages in `column_id` order,
+/// which is what a whole-block read assembles. That is a check on PAGE_DIR's
+/// placement claim, not a duplicate of the per-page checks: it fails if the
+/// directory pointed at the right bytes in the wrong order, or at another
+/// block's pages.
+/// `bytes` need not be the whole object: `base` is the absolute offset its
+/// first byte sits at, so a caller holding one fetched range passes that
+/// range's start and a whole-object caller passes 0.
+pub(crate) fn decode_v4_block(
+    bytes: &[u8],
+    base: u64,
+    record_count: usize,
+    block_crc32c: u32,
+    pages: &[PageLoc],
+    plans: &[ColumnPlan],
+    columns: Option<&std::collections::HashSet<u32>>,
+) -> Result<DecodedBlock, LogSegError> {
+    let wanted = |cid: u32| match columns {
+        None => true,
+        Some(set) => set.contains(&cid),
+    };
+    let mut located: Vec<(crate::page::PageDesc, Option<Vec<u8>>)> =
+        Vec::with_capacity(pages.len());
+    let mut counters = PageCounters::default();
+    let mut block_crc = 0u32;
+    let mut all_read = true;
+    for p in pages {
+        counters.bytes_fetched = counters.bytes_fetched.saturating_add(p.desc.len);
+        if !wanted(p.desc.column_id) {
+            counters.skipped += 1;
+            all_read = false;
+            located.push((p.desc, None));
+            continue;
+        }
+        let rel = p
+            .offset
+            .checked_sub(base)
+            .ok_or_else(|| LogSegError::Corrupted("page before fetched range".into()))?;
+        let start =
+            usize::try_from(rel).map_err(|_| LogSegError::Corrupted("page offset range".into()))?;
+        let len = usize::try_from(p.desc.len)
+            .map_err(|_| LogSegError::Corrupted("page len range".into()))?;
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| LogSegError::Corrupted("page range overflow".into()))?;
+        let stored = bytes
+            .get(start..end)
+            .ok_or_else(|| LogSegError::Corrupted("page out of bounds".into()))?;
+        if crc32c::crc32c(stored) != p.crc32c {
+            return Err(LogSegError::Corrupted(format!(
+                "page crc mismatch for column {}",
+                p.desc.column_id
+            )));
+        }
+        block_crc = crc32c::crc32c_append(block_crc, stored);
+        located.push((
+            p.desc,
+            Some(read_page(stored, &p.desc, DEFAULT_MAX_UNCOMP)?),
+        ));
+        counters.decoded += 1;
+        counters.bytes_decoded = counters.bytes_decoded.saturating_add(p.desc.len);
+    }
+    if all_read && block_crc != block_crc32c {
+        return Err(LogSegError::Corrupted("block crc mismatch".into()));
+    }
+    read_block_pages(record_count, &located, plans, counters)
 }
 
 // --- exact evaluation -------------------------------------------------------
@@ -3646,8 +3823,11 @@ mod tests {
             .offset;
         let skip = skip_of(&good);
         let entry = skip.l0.first().expect("a first block");
-        let at = usize::try_from(blocks_offset + entry.block_offset).expect("offset fits")
-            + usize::try_from(entry.block_len).expect("len fits") / 2;
+        // The block's first byte. Under version 4 `block_len` spans the whole
+        // row group (the block's pages are interleaved with its neighbours'),
+        // so a midpoint offset would land in another block; `block_offset` is
+        // the first block's own first page either way (ADR-0699 decision 1).
+        let at = usize::try_from(blocks_offset + entry.block_offset).expect("offset fits");
         let mut obj = good.clone();
         obj[at] ^= 0xff;
 
