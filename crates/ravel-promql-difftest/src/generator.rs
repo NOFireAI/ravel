@@ -43,11 +43,13 @@ impl GeneratedSeries {
 }
 
 /// One native-histogram sample in the generated dataset. Deliberately
-/// minimal: positive buckets only, integer counts, a fixed schema, which is
+/// minimal: positive buckets only, integer counts, which is
 /// enough to exercise the native `histogram_count`/`_sum`/`_avg`,
 /// `histogram_quantile`, `rate`, and `sum`/`avg` forms. `positive_buckets`
 /// are absolute counts (the remote-write encoder delta-encodes them);
-/// `positive_spans` are `(offset, length)` pairs.
+/// `positive_spans` are `(offset, length)` pairs. `schema` is per sample, and
+/// one series ([`schema_transition_counter`]) changes it mid-series in both
+/// directions so the counter-reset schema term has an oracle.
 #[derive(Debug, Clone)]
 pub struct GeneratedHistogramPoint {
     pub ts_ms: i64,
@@ -157,10 +159,22 @@ pub fn generate(config: &DatasetConfig) -> Dataset {
     }
 }
 
+/// Sample index at which `diff_native_hist_schema` switches from schema 0 up
+/// to schema 1 (a schema INCREASE, which Prometheus treats as a counter reset
+/// whatever the buckets did).
+pub const SCHEMA_INCREASE_AT: usize = 13;
+
+/// Sample index at which `diff_native_hist_schema` switches from schema 1 back
+/// down to schema 0 (a schema DECREASE, which is only a reset if a bucket
+/// shrank once both sides are aligned to the coarser schema).
+pub const SCHEMA_DECREASE_AT: usize = 27;
+
 /// Native-histogram series for the native-histogram corpus: a monotonic counter histogram
 /// (`diff_native_hist`, cumulative bucket counts growing each scrape, reset
-/// hint NO after the first sample) and a two-series family
-/// (`diff_native_hist_agg`, `i="1"`/`i="2"`) for `sum`/`avg` aggregation.
+/// hint NO after the first sample), a two-series family
+/// (`diff_native_hist_agg`, `i="1"`/`i="2"`) for `sum`/`avg` aggregation, and
+/// a schema-transition counter (`diff_native_hist_schema`) that changes schema
+/// in both directions mid-series.
 /// Schema 0, three positive buckets from index 1, zero bucket populated, so
 /// `histogram_quantile` has interior buckets to interpolate.
 fn native_histogram_families(config: &DatasetConfig) -> Vec<GeneratedHistogramSeries> {
@@ -190,7 +204,73 @@ fn native_histogram_families(config: &DatasetConfig) -> Vec<GeneratedHistogramSe
             .collect(),
     };
 
-    vec![counter, agg("1", vec![1, 2, 3]), agg("2", vec![4, 5, 6])]
+    vec![
+        counter,
+        agg("1", vec![1, 2, 3]),
+        agg("2", vec![4, 5, 6]),
+        schema_transition_counter(&timestamps),
+    ]
+}
+
+/// A monotonic counter native histogram that changes schema twice: up at
+/// [`SCHEMA_INCREASE_AT`] (0 -> 1) and back down at [`SCHEMA_DECREASE_AT`]
+/// (1 -> 0). Prometheus' counter-reset detection is directional about that
+/// schema term (an increase is a reset on its own, a decrease is only a reset
+/// if an aligned bucket shrank), so without a series that transitions in both
+/// directions the differential gate cannot tell a directional implementation
+/// from a symmetric one (issue #679).
+///
+/// Two shape choices make the schema term the ONLY thing either side can be
+/// reacting to:
+///
+/// * One positive bucket at index 1 throughout. Down-converting index 1 from
+///   any finer schema lands on index 1 again (`((1 - 1) >> shift) + 1 == 1`),
+///   so the aligned per-bucket comparison across the decrease is a plain
+///   `later >= earlier` on one number, with no merge to reason about.
+/// * Every population strictly grows and the zero bucket is constant, so the
+///   count, zero-count, and per-bucket checks can never fire.
+///
+/// The reset hint is UNKNOWN on the first sample of each schema run and NO
+/// elsewhere, modelling what a reader sees out of a Prometheus histogram
+/// chunk: a schema change ends the current chunk, and samples after a chunk's
+/// first carry NotCounterReset. UNKNOWN at the transitions is what makes both
+/// sides actually run detection there rather than short-circuit on the hint.
+fn schema_transition_counter(timestamps: &[i64]) -> GeneratedHistogramSeries {
+    let points = timestamps
+        .iter()
+        .enumerate()
+        .map(|(i, ts)| {
+            let schema = if i < SCHEMA_INCREASE_AT {
+                0
+            } else if i < SCHEMA_DECREASE_AT {
+                1
+            } else {
+                0
+            };
+            let bucket = 2 * (i as u64 + 1);
+            let zero_count = 1;
+            let reset_hint = if i == 0 || i == SCHEMA_INCREASE_AT || i == SCHEMA_DECREASE_AT {
+                0
+            } else {
+                2
+            };
+            GeneratedHistogramPoint {
+                ts_ms: *ts,
+                schema,
+                zero_threshold: 1e-9,
+                zero_count,
+                count: bucket + zero_count,
+                sum: bucket as f64 * 1.5,
+                positive_spans: vec![(1, 1)],
+                positive_buckets: vec![bucket],
+                reset_hint,
+            }
+        })
+        .collect();
+    GeneratedHistogramSeries {
+        labels: metric("diff_native_hist_schema", &[("kind", "counter")]),
+        points,
+    }
 }
 
 /// Build one histogram point from absolute positive bucket counts at schema 0.
@@ -556,6 +636,102 @@ mod tests {
             .filter(|s| s.metric_name() == "diff_native_hist_agg")
             .count();
         assert_eq!(agg, 2);
+    }
+
+    #[allow(clippy::expect_used)]
+    fn schema_transition_series() -> GeneratedHistogramSeries {
+        generate(&DatasetConfig::default())
+            .histogram_series
+            .into_iter()
+            .find(|s| s.metric_name() == "diff_native_hist_schema")
+            .expect("schema-transition series present")
+    }
+
+    #[test]
+    fn schema_transition_series_changes_schema_in_both_directions() {
+        let series = schema_transition_series();
+        assert!(
+            series.points.len() > SCHEMA_DECREASE_AT,
+            "the dataset must be long enough to carry both transitions"
+        );
+        for (i, point) in series.points.iter().enumerate() {
+            let expected = if (SCHEMA_INCREASE_AT..SCHEMA_DECREASE_AT).contains(&i) {
+                1
+            } else {
+                0
+            };
+            assert_eq!(point.schema, expected, "schema at sample {i}");
+        }
+        let transitions: Vec<(usize, i32, i32)> = series
+            .points
+            .windows(2)
+            .enumerate()
+            .filter(|(_, w)| w[0].schema != w[1].schema)
+            .map(|(i, w)| (i + 1, w[0].schema, w[1].schema))
+            .collect();
+        assert_eq!(
+            transitions,
+            vec![(SCHEMA_INCREASE_AT, 0, 1), (SCHEMA_DECREASE_AT, 1, 0)],
+            "exactly one increase and one decrease, at the declared indices"
+        );
+    }
+
+    #[test]
+    fn schema_transition_series_leaves_the_schema_term_as_the_only_reset_signal() {
+        // Every other input to Prometheus' counter-reset detection is
+        // monotonic or constant, so whatever either side reports at the two
+        // transitions is the schema term and nothing else.
+        let series = schema_transition_series();
+        for pair in series.points.windows(2) {
+            assert!(
+                pair[1].count > pair[0].count,
+                "count must strictly grow: {:?} -> {:?}",
+                pair[0].count,
+                pair[1].count
+            );
+            assert_eq!(
+                pair[0].zero_count, pair[1].zero_count,
+                "constant zero bucket"
+            );
+            assert_eq!(
+                pair[0].zero_threshold.to_bits(),
+                pair[1].zero_threshold.to_bits(),
+                "a changing zero threshold is its own reset signal"
+            );
+            assert_eq!(
+                pair[0].positive_spans,
+                vec![(1, 1)],
+                "one bucket at index 1"
+            );
+            assert!(
+                pair[1].positive_buckets[0] > pair[0].positive_buckets[0],
+                "the single bucket must strictly grow"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_transition_series_hints_unknown_exactly_at_the_transitions() {
+        // UNKNOWN is what makes detection actually run; a NO hint at a
+        // transition would short-circuit both implementations and the entry
+        // would prove nothing about the schema direction.
+        let series = schema_transition_series();
+        let unknown: Vec<usize> = series
+            .points
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.reset_hint == 0)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(unknown, vec![0, SCHEMA_INCREASE_AT, SCHEMA_DECREASE_AT]);
+        assert!(
+            series
+                .points
+                .iter()
+                .enumerate()
+                .all(|(i, p)| p.reset_hint == 0 || (i > 0 && p.reset_hint == 2)),
+            "every other sample hints NO"
+        );
     }
 
     #[test]

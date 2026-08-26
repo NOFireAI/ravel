@@ -33,6 +33,7 @@
 //!   (rate windows, aggregation groups) operates on one producer's series, so
 //!   this holds in practice, but it is not the general Prometheus behavior.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 /// Counter-reset provenance carried alongside a native histogram, mirroring
@@ -277,9 +278,27 @@ impl FloatHistogram {
 
     /// Detect whether `self` is a counter reset relative to `prev`,
     /// Prometheus' `FloatHistogram.DetectReset`: an explicit hint decides when
-    /// present, otherwise any shrink in count, zero-count, or a per-bucket
-    /// population is a reset. Used by the counter-reset compensation loop in
-    /// [`histogram_rate`].
+    /// present, otherwise a shrink in count or zero-count, a schema increase,
+    /// or a shrink in any per-bucket population is a reset. Used by the
+    /// counter-reset compensation loop in [`histogram_rate`] and by
+    /// `irate`/`resets`.
+    ///
+    /// The schema term is DIRECTIONAL, exactly as Prometheus is
+    /// (`h.Schema > previous.Schema`), not a symmetric "the schemas differ":
+    ///
+    /// | `self.scale` vs `prev.scale` | reset from the schema term |
+    /// |---|---|
+    /// | increase (`self` finer) | yes, unconditionally |
+    /// | equal | no |
+    /// | decrease (`self` coarser) | no; the buckets are compared at `self.scale` |
+    ///
+    /// An increase is a reset whatever the bucket populations say, because a
+    /// decrease can hide at the newly-visible finer resolution where no
+    /// comparison against the coarser earlier value can see it. A decrease
+    /// hides nothing: `prev` down-converts to `self.scale` exactly (Prometheus
+    /// iterates `prev`'s buckets at `self`'s schema), so the per-bucket
+    /// comparison runs on aligned bounds and a still-growing counter is not a
+    /// reset.
     pub fn detect_reset(&self, prev: &FloatHistogram) -> bool {
         match self.counter_reset_hint {
             ResetHint::Gauge => false,
@@ -289,12 +308,26 @@ impl FloatHistogram {
                 if self.count < prev.count || self.zero_count < prev.zero_count {
                     return true;
                 }
-                // A schema change or a shrink in any bucket population is a
-                // reset. Comparing by absolute bucket index handles differing
-                // span layouts.
-                if self.scale != prev.scale {
+                // An exponential-schema value and a custom-buckets one are not
+                // comparable in either direction: the custom-buckets sentinel
+                // scale sits far outside the exponential range, so neither
+                // side can be rescaled onto the other's bounds (issue #678).
+                // Report a reset rather than rescale across the sentinel.
+                if self.uses_custom_buckets() != prev.uses_custom_buckets() {
                     return true;
                 }
+                if self.scale > prev.scale {
+                    return true;
+                }
+                // Align `prev` down to `self`'s (equal or coarser) scale so the
+                // per-bucket comparison reads the same bounds on both sides;
+                // equal scales borrow it untouched. Comparing by absolute
+                // bucket index then handles differing span layouts.
+                let prev = if self.scale < prev.scale {
+                    Cow::Owned(prev.copy_to_scale(self.scale))
+                } else {
+                    Cow::Borrowed(prev)
+                };
                 bucket_shrank(&prev.positive_index_map(), &self.positive_index_map())
                     || bucket_shrank(&prev.negative_index_map(), &self.negative_index_map())
             }
@@ -680,6 +713,13 @@ pub fn histogram_rate(samples: &[TimedHistogram], is_counter: bool) -> Option<Fl
     result.sub_assign(&prev0.copy_to_scale(min_scale));
 
     if is_counter {
+        // Reset detection runs on the raw adjacent pair, not on the
+        // min_scale-aligned copies, exactly as Prometheus' second
+        // `histogramRate` pass does: `detect_reset` owns the schema direction
+        // (an increase between the pair is a reset; a decrease aligns inside
+        // it), and pre-aligning both operands to the window minimum would hide
+        // an increase that happened between two samples the window later
+        // down-converts to one common scale.
         let mut prev = prev0.clone();
         for (_, curr) in &samples[1..] {
             if curr.detect_reset(&prev) {
@@ -929,6 +969,121 @@ mod tests {
     }
 
     #[test]
+    fn detect_reset_on_a_schema_increase_even_when_every_bucket_grew() {
+        // prev at scale 0 (count 3), curr at scale 2 (count 10): nothing
+        // shrank, but a finer schema can hide a decrease inside the newly
+        // visible resolution, so Prometheus' `h.Schema > previous.Schema`
+        // makes an increase a reset unconditionally.
+        let prev = positive(0, 1, &[3.0], 6.0);
+        let curr = positive(2, 1, &[10.0], 20.0);
+        assert!(
+            curr.detect_reset(&prev),
+            "a schema increase is a reset on its own"
+        );
+    }
+
+    #[test]
+    fn no_reset_on_a_schema_decrease_whose_buckets_grew_once_aligned() {
+        // prev at scale 1 holds indices {1:1, 2:2}; curr at the coarser scale 0
+        // holds {1:10}. Down-converting prev to scale 0 merges both of its
+        // buckets into index 1 (((1-1)>>1)+1 == ((2-1)>>1)+1 == 1) for 3, and
+        // 10 >= 3, so no bucket shrank and this is NOT a reset.
+        //
+        // The flipped line is `detect_reset`'s schema term: the symmetric
+        // `if self.scale != prev.scale { return true }` it replaced reported a
+        // reset here, since the two scales merely differ.
+        let prev = positive(1, 1, &[1.0, 2.0], 3.0);
+        let curr = positive(0, 1, &[10.0], 20.0);
+        assert!(
+            !curr.detect_reset(&prev),
+            "a schema decrease is only a reset if an aligned bucket shrank"
+        );
+    }
+
+    #[test]
+    fn reset_on_a_schema_decrease_whose_aligned_bucket_shrank() {
+        // The other half of the decrease direction: prev at scale 1 aligns to
+        // {1:11} at scale 0, curr holds {1:4, 2:20}. The total count GREW
+        // (11 -> 24), so only the per-bucket comparison at the common scale
+        // catches the drop in index 1 (11 -> 4).
+        let prev = positive(1, 1, &[5.0, 6.0], 11.0);
+        let curr = positive(0, 1, &[4.0, 20.0], 48.0);
+        assert!(
+            curr.count > prev.count,
+            "the count check must not decide it"
+        );
+        assert!(
+            curr.detect_reset(&prev),
+            "an aligned bucket shrank, so the decrease is a reset"
+        );
+    }
+
+    #[test]
+    fn detect_reset_at_equal_scales_is_the_plain_bucket_comparison() {
+        // Equal scales contribute nothing on their own: growth is not a reset,
+        // a per-bucket shrink under a growing total count still is.
+        let prev = positive(2, 1, &[5.0, 5.0], 10.0);
+        let grown = positive(2, 1, &[6.0, 7.0], 13.0);
+        assert!(!grown.detect_reset(&prev), "equal scales, nothing shrank");
+
+        let shrunk_bucket = positive(2, 1, &[3.0, 20.0], 23.0);
+        assert!(
+            shrunk_bucket.count > prev.count,
+            "the count check must not decide it"
+        );
+        assert!(
+            shrunk_bucket.detect_reset(&prev),
+            "equal scales, index 1 shrank 5 -> 3"
+        );
+    }
+
+    #[test]
+    fn rate_subtracts_across_a_schema_decrease_instead_of_compensating() {
+        // The value the decrease direction is worth: prev at scale 1
+        // ({1:1, 2:2}, count 3, sum 3), curr at scale 0 ({1:10}, count 10,
+        // sum 20). Both align to scale 0, prev merging to {1:3}, so the window
+        // reduction is the plain difference: bucket 10 - 3 = 7, count 7,
+        // sum 20 - 3 = 17.
+        //
+        // The flipped assertions are `r.count == 7.0` and
+        // `r.positive_buckets == [7.0]`: with `detect_reset`'s old symmetric
+        // `self.scale != prev.scale`, the pair read as a reset, so the
+        // compensation loop added prev back and produced count 10, sum 20,
+        // bucket 10 -- the later sample alone, with the earlier one's growth
+        // silently discarded.
+        let prev = positive(1, 1, &[1.0, 2.0], 3.0);
+        let curr = positive(0, 1, &[10.0], 20.0);
+        let r = histogram_rate(&[(0, prev), (60_000_000_000, curr)], true).expect("2 samples");
+        assert_eq!(r.scale, 0, "reduced at the coarser of the two scales");
+        assert_eq!(r.count, 7.0, "10 - 3, not the compensated 10");
+        assert_eq!(r.sum, 17.0, "20 - 3, not the compensated 20");
+        assert_eq!(
+            r.positive_buckets,
+            vec![7.0],
+            "index 1 is 10 - (1 + 2), not the compensated 10"
+        );
+        assert_eq!(
+            r.positive_spans,
+            vec![Span {
+                offset: 1,
+                length: 1
+            }]
+        );
+    }
+
+    #[test]
+    fn rate_still_compensates_across_a_schema_increase() {
+        // The unchanged direction, through the same reducer: prev at scale 0
+        // (count 3), curr at scale 2 (count 10). The increase is a reset, so
+        // the raw difference (10 - 3 = 7) gets prev added back for 10.
+        let prev = positive(0, 1, &[3.0], 6.0);
+        let curr = positive(2, 1, &[10.0], 20.0);
+        let r = histogram_rate(&[(0, prev), (60_000_000_000, curr)], true).expect("2 samples");
+        assert_eq!(r.count, 10.0, "reset compensation restores the later count");
+        assert_eq!(r.sum, 20.0);
+    }
+
+    #[test]
     fn rate_of_monotonic_window_is_the_difference() {
         // Two samples, counts 2 then 6 in bucket (1,2]. No reset. rate window
         // reduction (before the caller's per-second factor) is the plain
@@ -1041,6 +1196,33 @@ mod tests {
             negative_buckets: Vec::new(),
             custom_values: vec![1.0, 2.0],
         }
+    }
+
+    #[test]
+    fn detect_reset_over_mismatched_exponential_and_custom_schemas_does_not_rescale() {
+        // The custom-buckets sentinel (-53) reads as a schema DECREASE against
+        // any exponential scale, so without the schema-type guard the aligning
+        // branch would hand `copy_to_scale` a 53-bit bucket-index shift. The
+        // pair is not comparable in either direction: report a reset.
+        let prev = positive(0, 1, &[10.0], 20.0);
+        let curr = custom_buckets(12.0, 24.0);
+        assert!(
+            curr.count > prev.count,
+            "the count check must not decide it"
+        );
+        assert!(
+            curr.detect_reset(&prev),
+            "an exponential/custom-buckets pair is a reset, not a rescale"
+        );
+        // The other direction reads as an increase (any exponential scale is
+        // above the sentinel) and is a reset too, again with a growing count
+        // so the cheap count check is not what decides it.
+        let custom_prev = custom_buckets(10.0, 20.0);
+        let exponential_curr = positive(0, 1, &[12.0], 24.0);
+        assert!(
+            exponential_curr.detect_reset(&custom_prev),
+            "and the same in the other direction"
+        );
     }
 
     #[test]

@@ -309,23 +309,18 @@ fn instant_value(samples: &[Sample], is_rate: bool) -> Option<f64> {
 /// The two samples are adjacent samples of the same series but can carry
 /// different schemas (RSEG down-converts a flush whose bucket count exceeds
 /// its limit, so two flushes of one series can persist at different scales).
-/// `irate`'s reset check is directional (oracle-verified against three
+/// The reset check is directional (oracle-verified against three
 /// adjacent-schema shapes, see `functions::rate::tests` and
-/// `tests/histogram_native.rs`): a schema INCREASE (`last.scale >
-/// previous.scale`) is always a reset, since Prometheus never risks
-/// comparing a coarser earlier histogram against newly-visible finer detail.
-/// A schema DECREASE is only a reset if the buckets, once aligned to the
-/// common coarser schema, actually shrank -- `FloatHistogram::detect_reset`'s
-/// own `self.scale != prev.scale` shortcut cannot be called directly on the
-/// unaligned pair for this direction (it would flag every decrease as a
-/// reset, which the oracle disproves), so the decrease path aligns first and
-/// lets `detect_reset` fall through to its real `bucket_shrank` check --
-/// safe post-alignment, since both operands then share one scale and
-/// `detect_reset`'s own scale-mismatch branch never fires. `idelta` has no
-/// reset escape at all (always aligns and subtracts) once a schema-type
-/// mismatch is ruled out; this increase/decrease asymmetry is irate-only.
-/// `histogram_rate` (rate/increase/delta) does not share this directional
-/// logic and keeps its own established behavior (histogram.rs) unchanged.
+/// `tests/histogram_native.rs`): a schema INCREASE is always a reset, since
+/// Prometheus never risks comparing a coarser earlier histogram against
+/// newly-visible finer detail, while a schema DECREASE is only a reset if the
+/// buckets, once aligned to the common coarser schema, actually shrank. That
+/// direction now lives where Prometheus keeps it, in
+/// [`FloatHistogram::detect_reset`] (issue #679), so `irate` calls it on the
+/// raw pair the way Prometheus' `instantValue` does rather than carrying its
+/// own copy of the rule. `idelta` has no reset escape at all (always aligns
+/// and subtracts) once a schema-type mismatch is ruled out; the
+/// increase/decrease asymmetry is irate-only.
 ///
 /// An exponential-schema sample paired with a custom-buckets one is a
 /// separate case `copy_to_scale` cannot bridge (a custom-buckets operand
@@ -362,26 +357,15 @@ pub(crate) fn instant_value_hist(
 
     let mut result = last.clone();
     if is_rate {
-        // irate's reset check is directional, oracle-verified against three
-        // adjacent-schema shapes (see the crate's checkpoint history for
-        // #650): a schema INCREASE (finer detail newly visible) is always a
-        // reset, matching `FloatHistogram::detect_reset`'s plain
-        // `self.scale != prev.scale` shortcut, which this deliberately does
-        // NOT call directly on unaligned operands for the decrease direction
-        // -- doing so was tried and is wrong (it flags every decrease as a
-        // reset, when Prometheus only does when a bucket actually shrank). A
-        // schema DECREASE (and the custom/exponential mismatch above) must
-        // instead align to the common coarser schema first and let
-        // `detect_reset` fall through to its real `bucket_shrank` check
-        // (safe to call post-alignment: both operands share the aligned
-        // scale, so `detect_reset`'s own scale-mismatch branch never fires).
-        let min_scale = previous.scale.min(last.scale);
-        let is_reset = schema_type_mismatch
-            || last.scale > previous.scale
-            || result
-                .copy_to_scale(min_scale)
-                .detect_reset(&previous.copy_to_scale(min_scale));
+        // `detect_reset` carries the whole directional rule (#679), so this is
+        // Prometheus' `instantValue` shape: subtract unless the pair is a
+        // reset. The `schema_type_mismatch` short-circuit stays ahead of it
+        // because an explicit `No`/`Gauge` hint would otherwise send an
+        // exponential/custom-buckets pair into `copy_to_scale`, whose
+        // bucket-index shift cannot bridge the custom-buckets sentinel.
+        let is_reset = schema_type_mismatch || last.detect_reset(previous);
         if !is_reset {
+            let min_scale = previous.scale.min(last.scale);
             result = result.copy_to_scale(min_scale);
             result.sub_assign(&previous.copy_to_scale(min_scale));
         }
