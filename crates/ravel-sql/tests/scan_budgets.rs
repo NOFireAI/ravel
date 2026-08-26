@@ -481,6 +481,7 @@ fn task_ctx_with_query_bytes(max_query_bytes: usize) -> Arc<TaskContext> {
         engine: EngineConfig::default(),
         max_query_bytes,
         parallel_final_aggregation: false,
+        skip_partial_aggregation: true,
     };
     let tenant = TenantMemoryAccountant::new(1 << 30);
     let (pool, _breach) = config.query_pool(tenant, QueryAccounting::new());

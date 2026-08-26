@@ -16,7 +16,9 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use ravel_bench::groupby_scaling::{GroupbyScalingConfig, run};
+use ravel_bench::groupby_scaling::{
+    DISTINCT_QUERIES, DistinctScalingConfig, GroupbyScalingConfig, run, run_distinct,
+};
 use ravel_object_store::memory::MemoryStore;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -198,3 +200,112 @@ async fn groupby_scaling_over_budget_combo_fails_labeled_not_panicked() {
 // against a 1M-row in-process dataset still completed successfully after 78s,
 // never tripping). Forcing a real yield point to make this deterministically
 // testable is out of this benchmark's scope.
+
+/// Acceptance test for the distinct-key memory sweep (issue #680).
+///
+/// The sweep's whole value is the peak-pool-bytes figure and the dataset shape
+/// that makes it interpretable, so this asserts both rather than just "a report
+/// came back":
+///
+/// - Every `(query, D, target_partitions)` cell is present and succeeded.
+/// - `total_records == objects * D * repeats_per_value`, so every object really
+///   does carry the full distinct set. A generator that spread the values
+///   across objects instead of repeating them would leave each partition seeing
+///   `D / objects` values, and the partition axis would measure nothing.
+/// - `scan_partitions == min(target_partitions, objects)`: the requested
+///   partition count actually reached `LogsScanExec`. A fan-out pinned to 1
+///   would make every cell identical and the fit meaningless.
+/// - `peak_pool_bytes > 0` on every cell, and a fit per query shape.
+/// - The result row counts are the ones the two query shapes must produce:
+///   one row for `COUNT(DISTINCT ...)`, `low_cardinality` rows for the grouped
+///   shape (the low key is a function of the high key, so every one of the
+///   `low_cardinality` buckets is non-empty at this `D`).
+#[tokio::test(flavor = "multi_thread")]
+async fn distinct_sweep_measures_peak_pool_bytes_across_the_partition_axis() {
+    let config = DistinctScalingConfig::smoke(Arc::new(MemoryStore::new()), "memory");
+    let expected_partitions = config.target_partitions.clone();
+    let expected_distinct = config.distinct_values.clone();
+    let objects = config.objects;
+    let low_cardinality = config.low_cardinality;
+    let repeats = config.repeats_per_value;
+
+    let report = run_distinct(&config).await;
+
+    assert_eq!(
+        report.results.len(),
+        expected_distinct.len() * expected_partitions.len() * DISTINCT_QUERIES.len(),
+        "one result per (D x target_partitions x query shape)"
+    );
+
+    for r in &report.results {
+        assert!(
+            r.error.is_none(),
+            "cell query={} D={} tp={} failed: {:?}",
+            r.query_label,
+            r.distinct_values,
+            r.target_partitions,
+            r.error
+        );
+        assert_eq!(
+            r.total_records,
+            objects * r.distinct_values * repeats,
+            "every object must carry the full distinct set: cell query={} D={} tp={}",
+            r.query_label,
+            r.distinct_values,
+            r.target_partitions
+        );
+        assert_eq!(
+            r.scan_partitions,
+            r.target_partitions.min(objects),
+            "cell query={} D={} tp={}: the requested target_partitions must reach \
+             LogsScanExec (observed {})",
+            r.query_label,
+            r.distinct_values,
+            r.target_partitions,
+            r.scan_partitions
+        );
+        assert!(
+            r.peak_pool_bytes > 0,
+            "cell query={} D={} tp={} must reach a non-zero pool high-water mark",
+            r.query_label,
+            r.distinct_values,
+            r.target_partitions
+        );
+        let expected_rows = match r.query_label.as_str() {
+            "distinct_only" => 1,
+            "groupby_distinct" => low_cardinality.min(r.distinct_values),
+            other => panic!("unexpected query label {other}"),
+        };
+        assert_eq!(
+            r.result_rows, expected_rows,
+            "cell query={} D={} tp={} returned the wrong row count",
+            r.query_label, r.distinct_values, r.target_partitions
+        );
+    }
+
+    // One fit per (query shape, D), each over two real partition counts.
+    assert_eq!(
+        report.fits.len(),
+        expected_distinct.len() * DISTINCT_QUERIES.len(),
+        "one fitted partition axis per (query shape, D)"
+    );
+    for f in &report.fits {
+        assert_eq!(f.min_partitions, expected_partitions[0]);
+        assert_eq!(
+            f.max_partitions,
+            *expected_partitions.last().expect("a partition value")
+        );
+        assert!(
+            f.peak_at_min > 0 && f.peak_at_max > 0 && f.peak_ratio > 0.0,
+            "fit query={} D={} must be over real peaks",
+            f.query_label,
+            f.distinct_values
+        );
+        assert!(
+            f.partition_exponent.is_finite(),
+            "fit query={} D={} exponent must be finite",
+            f.query_label,
+            f.distinct_values
+        );
+    }
+}

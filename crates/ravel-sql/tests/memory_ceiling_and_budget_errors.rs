@@ -191,6 +191,7 @@ async fn a_sort_or_aggregate_budget_error_keeps_its_type() {
         engine: util::engine_config(),
         max_query_bytes: 1024 * 1024,
         parallel_final_aggregation: false,
+        skip_partial_aggregation: true,
     };
     let fixture = Fixture::build(
         Arc::new(MemoryStore::new()),
@@ -267,6 +268,7 @@ async fn a_high_cardinality_aggregation_over_budget_is_resources_exhausted() {
         engine: util::engine_config(),
         max_query_bytes: 16 * 1024 * 1024,
         parallel_final_aggregation: false,
+        skip_partial_aggregation: true,
     };
     let fixture = Fixture::build(
         Arc::new(MemoryStore::new()),
@@ -339,6 +341,7 @@ async fn a_high_cardinality_aggregation_is_refused_by_the_aggregate_not_the_scan
         engine: util::engine_config(),
         max_query_bytes: 16 * 1024 * 1024,
         parallel_final_aggregation: false,
+        skip_partial_aggregation: true,
     };
     let fixture = Fixture::build(
         Arc::new(MemoryStore::new()),
@@ -434,6 +437,7 @@ async fn a_large_order_by_over_budget_is_resources_exhausted() {
         engine: util::engine_config(),
         max_query_bytes: 16 * 1024 * 1024,
         parallel_final_aggregation: false,
+        skip_partial_aggregation: true,
     };
     let fixture = Fixture::build(
         Arc::new(MemoryStore::new()),

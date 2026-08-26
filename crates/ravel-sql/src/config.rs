@@ -46,6 +46,32 @@ pub struct SqlConfig {
     /// order/partition-independent. Set once at server startup
     /// (`services/ravel-server`); no live-reload, like every other field here.
     pub parallel_final_aggregation: bool,
+    /// Whether the partial aggregation stage may give up early on a
+    /// high-cardinality group key (issue #680, ADR-0102 decision 2 amendment).
+    /// Default `true`.
+    ///
+    /// DataFusion builds one partial hash table per input partition and merges
+    /// them in a single final stage, so for a key whose distinct values all
+    /// appear in every partition the pre-final state is roughly
+    /// `partitions x distinct` entries. Measured on the `logs` table
+    /// (`ravel_bench::groupby_scaling::run_distinct`), a 32-partition
+    /// `COUNT(DISTINCT key)` peaked at 5x to 16x the single-partition peak for
+    /// the same key. DataFusion's own probe already bounds this, but its stock
+    /// thresholds (0.8 ratio after 100,000 probe rows) rarely fire on Ravel's
+    /// partitions.
+    ///
+    /// When `true`, [`crate::session_config`] tightens both probe thresholds
+    /// (see [`crate::SKIP_PARTIAL_AGGREGATION_PROBE_ROWS`] and
+    /// [`crate::SKIP_PARTIAL_AGGREGATION_PROBE_RATIO`]).
+    /// This changes where aggregation state lives, never a result: the final
+    /// stage computes the same groups over the same rows either way.
+    ///
+    /// `false` restores DataFusion's stock thresholds. It is the operator
+    /// escape hatch for a workload whose partial stage genuinely reduces well
+    /// and would rather spend memory than push rows to the final stage, and it
+    /// is the "before" side of the regression test in
+    /// `tests/skip_partial_aggregation.rs`.
+    pub skip_partial_aggregation: bool,
 }
 
 impl Default for SqlConfig {
@@ -54,6 +80,7 @@ impl Default for SqlConfig {
             engine: EngineConfig::default(),
             max_query_bytes: DEFAULT_MAX_QUERY_BYTES,
             parallel_final_aggregation: false,
+            skip_partial_aggregation: true,
         }
     }
 }
@@ -113,5 +140,15 @@ mod tests {
     #[test]
     fn parallel_final_aggregation_defaults_to_false() {
         assert!(!SqlConfig::default().parallel_final_aggregation);
+    }
+
+    /// Issue #680: the early give-up is on by default. It is the fix for a
+    /// measured `partitions x distinct` blow-up on high-cardinality
+    /// aggregates, not an opt-in tuning knob, so a change that flips this
+    /// default off is a change to the ClickBench failure mode and should say
+    /// so here.
+    #[test]
+    fn skip_partial_aggregation_defaults_to_true() {
+        assert!(SqlConfig::default().skip_partial_aggregation);
     }
 }

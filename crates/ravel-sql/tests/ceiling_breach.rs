@@ -62,6 +62,7 @@ async fn a_join_that_overruns_the_query_ceiling_aborts_and_frees_the_tenant_budg
         engine: util::engine_config(),
         max_query_bytes: 768 * 1024,
         parallel_final_aggregation: false,
+        skip_partial_aggregation: true,
     };
     let fixture = Fixture::build(
         Arc::new(MemoryStore::new()),
