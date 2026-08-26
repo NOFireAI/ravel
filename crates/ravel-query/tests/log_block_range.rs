@@ -889,7 +889,7 @@ async fn cached_partitions_striping_one_large_segment_cost_a_partition_independe
 
         // The shared planning read, then the per-partition stripes.
         let accounting = QueryAccounting::new();
-        let (surviving, _stats) = fetcher
+        let (surviving, _stats, _footer) = fetcher
             .plan_segment(&seg, TENANT, &query, &accounting)
             .await
             .expect("plan")
@@ -914,6 +914,7 @@ async fn cached_partitions_striping_one_large_segment_cost_a_partition_independe
                         &query,
                         &ravel_logseg::ColumnSelection::all(),
                         &indices,
+                        None,
                         &QueryAccounting::new(),
                     )
                     .await
