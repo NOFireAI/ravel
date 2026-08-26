@@ -4420,14 +4420,41 @@ mod tests {
         let tenant = tenant_id.hash();
 
         // Two live replicas sharing one store; both compute the same live set.
+        // Both process ids are pinned rather than drawn by `with_defaults`:
+        // rendezvous ownership is a pure function of the process id, so the
+        // "A owns some shard, B owns some shard" split this test needs is a fact
+        // about fixed inputs, not a property of a random draw. With two random
+        // ids all 8 shards land on B one run in 256 (2^-8), which is the
+        // 1-in-256 flake this pins out. Under (tenant "acme", Metrics) these two
+        // ids hand A shards {1,2,3,4,5,7} and B shards {0,6}; the split is
+        // asserted below, so a change to `unit_key` or the weight function fails
+        // loudly here instead of flaking.
         let now = SystemClock.now_ns();
-        let a = WorkerSet::with_defaults(now);
-        let b = WorkerSet::with_defaults(now);
+        let a = WorkerSet::with_defaults(now).with_process_id(PINNED_WORKER_ID);
+        let b = WorkerSet::with_defaults(now).with_process_id(PINNED_PEER_ID);
         a.write_heartbeat(&store, now).await.expect("a heartbeat");
         b.write_heartbeat(&store, now).await.expect("b heartbeat");
         let live_ab = a.live_set(&store, now).await.expect("a live set");
         assert_eq!(live_ab, b.live_set(&store, now).await.expect("b live set"));
         assert_eq!(live_ab.len(), 2, "both replicas are live");
+
+        // The pinned ids were chosen for this split: A owns at least one of the
+        // 8 shards and B at least one. If a hash change ever moves all 8 onto
+        // one replica this fails loudly here rather than turning the `find`
+        // below into the 1-in-256 flake.
+        let a_owned = (0..SHARDS)
+            .filter(|shard| a.owns_unit(&live_ab, &tenant, Signal::Metrics, *shard))
+            .count();
+        let b_owned = (0..SHARDS)
+            .filter(|shard| b.owns_unit(&live_ab, &tenant, Signal::Metrics, *shard))
+            .count();
+        assert!(
+            a_owned >= 1 && b_owned >= 1,
+            "PINNED_WORKER_ID and PINNED_PEER_ID were chosen so the rendezvous \
+             splits the 8 shards across both replicas (got A={a_owned}, \
+             B={b_owned}); a hash change moved the split and the ids must be \
+             re-pinned, not left to flake"
+        );
 
         // Pick a shard the rendezvous assigns to A under {A, B}: B does not own
         // it yet, so the pre-handoff filter must reject it.
