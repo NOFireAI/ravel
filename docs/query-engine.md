@@ -213,14 +213,17 @@ Reference figures on the 8,424-object ClickBench tenant. The plan phase reads,
 per segment, one 64 KiB suffix probe (footer + SKIP_IDX) plus one small
 FIELD_DIR range GET to resolve the arms — the FIELD_DIR is a front section, so
 it cannot be folded into the tail probe — and fetches no block. Bytes are
-dominated by the probes: q37-class drops from 19,690 GETs and 11.7 GB to about
-8,700 GETs and 0.65 to 0.9 GB (the ~8,424 probes plus coalesced reads of about
-144 surviving blocks), and q20 from 29,614 GETs and 17.9 GB to about 4 to
+dominated by the probes: q37-class drops from 19,690 GETs and 11.7 GB to
+between about 8,600 GETs (the ~8,424 probes plus coalesced reads of about 144
+surviving blocks, when the probe's cached suffix already covers FIELD_DIR) and
+about 17,000 GETs (a separate FIELD_DIR range GET on every object as well),
+at 0.65 to 0.9 GB either way; q20 from 29,614 GETs and 17.9 GB to about 4 to
 4.7 GB (each of its ~6,592 surviving blocks read once, never a whole-object
 re-read). GET counts stay near two to three per object, because the object
-count is the floor: the plan phase's probe and FIELD_DIR range are one each per
-relevant object however selective the predicate is, and only the
-surviving-block and directory reads scale with the predicate.
+count is the floor: the plan phase's probe and FIELD_DIR range are one each
+per relevant object however selective the predicate is, and only the
+surviving-block and directory reads scale with the predicate. These are
+predictions; the measured pass on the reference tenant replaces them.
 
 Staleness: the evaluator recognizes the Prometheus staleness marker (the
 exact NaN bit pattern `0x7ff0_0000_0000_0002`, compared via
