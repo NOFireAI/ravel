@@ -129,11 +129,14 @@ impl PageDir {
     /// The group holding whole-object block index `block`, and the block's
     /// index within that group.
     pub fn locate_block(&self, block: u32) -> Option<(&GroupEntry, u32)> {
-        let g = self.groups.iter().find(|g| {
-            block >= g.first_block
-                && u64::from(block) < u64::from(g.first_block) + u64::from(g.block_count)
-        })?;
-        Some((g, block - g.first_block))
+        // `decode` proves the groups are consecutive runs from block 0, so
+        // the candidate is the last group whose first block is at or before
+        // `block`; the scan calls this once per block, so it must not walk
+        // every group.
+        let idx = self.groups.partition_point(|g| g.first_block <= block);
+        let g = self.groups.get(idx.checked_sub(1)?)?;
+        (u64::from(block) < u64::from(g.first_block) + u64::from(g.block_count))
+            .then_some((g, block - g.first_block))
     }
 
     /// Every page of whole-object block index `block`, in `column_id` order,
