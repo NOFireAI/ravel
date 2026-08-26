@@ -25,9 +25,9 @@ use arrow::array::{
     TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::array::{BinaryArray, FixedSizeBinaryArray};
-use arrow::datatypes::{DataType, TimeUnit};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
 use ravel_catalog::{AbsentPolicy, validate_or_adopt};
 #[cfg(feature = "stage-timing")]
 use ravel_ingest::LogStageSnapshot;
@@ -1462,6 +1462,172 @@ fn partition_row_group_ranges(n: usize, k: usize) -> Vec<std::ops::Range<usize>>
     ranges
 }
 
+/// The Arrow key type every preserved Parquet dictionary is read back with.
+/// Parquet dictionary indices are `i32`, so `Int32` is the exact key width and
+/// no narrowing or widening happens on the way in.
+const DICT_KEY_TYPE: DataType = DataType::Int32;
+
+/// A dictionary data-page encoding: `RLE_DICTIONARY`, or `PLAIN_DICTIONARY` in
+/// the pre-2.4 spelling.
+fn is_dictionary_encoding(e: parquet::basic::Encoding) -> bool {
+    matches!(
+        e,
+        parquet::basic::Encoding::RLE_DICTIONARY | parquet::basic::Encoding::PLAIN_DICTIONARY
+    )
+}
+
+/// Is every one of `chunk`'s data pages dictionary encoded?
+///
+/// The chunk-level `encodings` list cannot answer this. A writer whose
+/// dictionary outgrows its page-size limit falls back to plain part way through
+/// the chunk, and the result lists `RLE_DICTIONARY` (the pages written before
+/// the fallback) alongside `PLAIN` (the ones after) -- which is also what a
+/// fully dictionary-encoded chunk lists, because its dictionary page is itself
+/// `PLAIN`. The footer's page encoding statistics separate the two: they are
+/// per page type, so the data pages can be read on their own.
+///
+/// When a file records no page statistics at all, this falls back to the
+/// chunk-level list. That over-reports a fallback chunk as dictionary encoded
+/// rather than under-reporting the ordinary case; the values read back are the
+/// same either way, only the per-block work differs.
+fn chunk_is_dictionary_encoded(chunk: &parquet::file::metadata::ColumnChunkMetaData) -> bool {
+    // The reader condenses the statistics to a data-page-only encoding mask by
+    // default, and keeps the full per-page list only when asked to.
+    if let Some(mask) = chunk.page_encoding_stats_mask() {
+        return data_page_encodings_are_all_dictionary(mask.encodings());
+    }
+    if let Some(stats) = chunk.page_encoding_stats() {
+        return data_page_encodings_are_all_dictionary(
+            stats
+                .iter()
+                .filter(|s| {
+                    matches!(
+                        s.page_type,
+                        parquet::basic::PageType::DATA_PAGE
+                            | parquet::basic::PageType::DATA_PAGE_V2
+                    )
+                })
+                .map(|s| s.encoding),
+        );
+    }
+    chunk.encodings().any(is_dictionary_encoding)
+}
+
+/// True when `encodings` is non-empty and every encoding in it is a dictionary
+/// encoding. Empty means the footer recorded no data page for the chunk, which
+/// is not evidence of a dictionary.
+fn data_page_encodings_are_all_dictionary(
+    encodings: impl Iterator<Item = parquet::basic::Encoding>,
+) -> bool {
+    let mut seen = false;
+    for e in encodings {
+        if !is_dictionary_encoding(e) {
+            return false;
+        }
+        seen = true;
+    }
+    seen
+}
+
+/// Derive the Arrow schema the loader drives its data reader with, so that a
+/// Parquet file's own string dictionaries survive into the Arrow batches and
+/// ADR-0109 decision 3 engages (issue #660).
+///
+/// The rule, applied per top-level column of `inferred` (the schema the reader
+/// would infer on its own, embedded Arrow metadata included):
+///
+/// - the column is retyped `Dictionary(Int32, Utf8)` when all of: the inferred
+///   type is `Utf8`; the column is a top-level Parquet leaf of physical type
+///   `BYTE_ARRAY` with the `String`/`UTF8` logical type; and *every* column
+///   chunk for it, in every row group, is dictionary encoded on every data page
+///   ([`chunk_is_dictionary_encoded`]);
+/// - every other column keeps the type the reader would infer, unchanged. That
+///   includes a non-string column the writer happened to dictionary-encode
+///   (only string columns feed decision 3's per-distinct-value work), a column
+///   the embedded Arrow metadata already types as a dictionary, and above all
+///   a string column whose chunks are *not* dictionary encoded because the
+///   writer's dictionary outgrew its page limit and it fell back to plain, as a
+///   unique-per-row column does.
+///
+/// The rule only preserves an encoding the file already carries; it never
+/// forces a dictionary onto a column that has none, which would move per-row
+/// work into the reader instead of removing it.
+///
+/// Returns `None` when no column qualifies, which is the caller's signal to
+/// open the reader with default options and infer as before.
+fn dictionary_preserving_schema(
+    inferred: &SchemaRef,
+    metadata: &parquet::file::metadata::ParquetMetaData,
+) -> Option<SchemaRef> {
+    let descr = metadata.file_metadata().schema_descr();
+    let row_groups = metadata.row_groups();
+    if row_groups.is_empty() {
+        return None;
+    }
+
+    let mut changed = false;
+    let fields: Vec<Field> = inferred
+        .fields()
+        .iter()
+        .map(|field| {
+            let f = field.as_ref().clone();
+            if *f.data_type() != DataType::Utf8 {
+                return f;
+            }
+            // Only a top-level Parquet leaf (path length 1) maps one-to-one to
+            // a top-level Arrow field; anything nested keeps its inferred type.
+            let Some(leaf) = descr
+                .columns()
+                .iter()
+                .position(|c| c.path().parts().len() == 1 && c.path().parts()[0] == *f.name())
+            else {
+                return f;
+            };
+            let col = descr.column(leaf);
+            let is_utf8_byte_array = col.physical_type() == parquet::basic::Type::BYTE_ARRAY
+                && (matches!(
+                    col.logical_type_ref(),
+                    Some(parquet::basic::LogicalType::String)
+                ) || col.converted_type() == parquet::basic::ConvertedType::UTF8);
+            if !is_utf8_byte_array {
+                return f;
+            }
+            if !row_groups
+                .iter()
+                .all(|rg| chunk_is_dictionary_encoded(rg.column(leaf)))
+            {
+                return f;
+            }
+            changed = true;
+            f.with_data_type(DataType::Dictionary(
+                Box::new(DICT_KEY_TYPE),
+                Box::new(DataType::Utf8),
+            ))
+        })
+        .collect();
+
+    changed.then(|| {
+        Arc::new(Schema::new_with_metadata(
+            fields,
+            inferred.metadata().clone(),
+        )) as SchemaRef
+    })
+}
+
+/// Read `parquet_path`'s footer once and derive the reader schema
+/// [`dictionary_preserving_schema`] describes, or `None` when no column
+/// qualifies.
+fn load_reader_schema(parquet_path: &Path) -> Result<Option<SchemaRef>, LoadError> {
+    let file = std::fs::File::open(parquet_path)
+        .map_err(|e| LoadError::Setup(format!("failed to open {}: {e}", parquet_path.display())))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| LoadError::Setup(format!("failed to open Parquet reader: {e}")))?;
+    Ok(dictionary_preserving_schema(
+        &builder.schema().clone(),
+        builder.metadata(),
+    ))
+}
+
 /// Open one [`BatchReader`] per stride cursor (issue #560), each restricted to
 /// its own contiguous partition of `parquet_path`'s row groups, with
 /// `partition_base` set to that partition's first row's file-absolute index.
@@ -1482,6 +1648,11 @@ fn open_stride_cursors(
         running += len;
     }
 
+    // Derived once from the footer, then shared by every cursor: each cursor
+    // reads a disjoint partition of the same file, so they must all agree on
+    // the column types (issue #660).
+    let reader_schema = load_reader_schema(parquet_path)?;
+
     let mut cursors = Vec::with_capacity(k);
     for range in partition_row_group_ranges(row_group_lens.len(), k) {
         if range.is_empty() {
@@ -1497,8 +1668,14 @@ fn open_stride_cursors(
         let file = std::fs::File::open(parquet_path).map_err(|e| {
             LoadError::Setup(format!("failed to open {}: {e}", parquet_path.display()))
         })?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-            .map_err(|e| LoadError::Setup(format!("failed to open Parquet reader: {e}")))?;
+        let builder = match &reader_schema {
+            Some(schema) => ParquetRecordBatchReaderBuilder::try_new_with_options(
+                file,
+                ArrowReaderOptions::new().with_schema(Arc::clone(schema)),
+            ),
+            None => ParquetRecordBatchReaderBuilder::try_new(file),
+        }
+        .map_err(|e| LoadError::Setup(format!("failed to open Parquet reader: {e}")))?;
         let reader = builder
             .with_row_groups(range.collect())
             .with_batch_size(batch_rows)
@@ -4597,11 +4774,11 @@ type = "i64"
             .collect()
     }
 
-    /// Write `batch` to a Parquet file and read it back as one RecordBatch, so a
-    /// dictionary-encoded column exercises the real Parquet decode path (the
-    /// Arrow schema `ArrowWriter` embeds is what lets a `Dictionary` column
-    /// survive the round trip; a plain `BYTE_ARRAY` column comes back plain).
-    fn roundtrip_parquet(batch: &RecordBatch) -> RecordBatch {
+    /// Write `batch` to a Parquet file with the default writer properties (which
+    /// dictionary-encode a `BYTE_ARRAY` column until its dictionary outgrows the
+    /// page-size limit). The returned `TempDir` must stay alive while the path
+    /// is read.
+    fn write_parquet(batch: &RecordBatch) -> (tempfile::TempDir, std::path::PathBuf) {
         use parquet::arrow::ArrowWriter;
         let dir = tempfile::tempdir().expect("tempdir");
         let pq = dir.path().join("rt.parquet");
@@ -4609,14 +4786,82 @@ type = "i64"
         let mut w = ArrowWriter::try_new(file, batch.schema(), None).expect("arrow writer");
         w.write(batch).expect("write batch");
         w.close().expect("close writer");
-        let f = std::fs::File::open(&pq).expect("open parquet");
-        let reader = ParquetRecordBatchReaderBuilder::try_new(f)
-            .expect("reader builder")
+        (dir, pq)
+    }
+
+    /// Read `pq` back as one RecordBatch. `loader_schema` selects the reader the
+    /// loader actually opens: `true` applies [`load_reader_schema`], the
+    /// dictionary-preserving derivation `open_stride_cursors` uses (#660);
+    /// `false` lets the reader infer on its own, which is what the loader did
+    /// before #660 and what the byte-identity anchor compares against.
+    fn read_parquet(pq: &Path, loader_schema: bool) -> RecordBatch {
+        let schema = if loader_schema {
+            load_reader_schema(pq).expect("derive reader schema")
+        } else {
+            None
+        };
+        let f = std::fs::File::open(pq).expect("open parquet");
+        let builder = match &schema {
+            Some(s) => ParquetRecordBatchReaderBuilder::try_new_with_options(
+                f,
+                ArrowReaderOptions::new().with_schema(Arc::clone(s)),
+            ),
+            None => ParquetRecordBatchReaderBuilder::try_new(f),
+        }
+        .expect("reader builder");
+        let reader = builder
+            // Every fixture here fits one row group, so one oversized read batch
+            // yields the whole file and the assertion below holds.
+            .with_batch_size(1 << 20)
             .build()
             .expect("reader");
         let mut batches: Vec<RecordBatch> = reader.map(|b| b.expect("read batch")).collect();
         assert_eq!(batches.len(), 1, "fixture fits one read batch");
         batches.pop().expect("one batch")
+    }
+
+    /// The encoding of every DATA page recorded for `column`'s chunk in each row
+    /// group of `pq`, read out of the footer's page encoding statistics. Used to
+    /// prove whether the writer dictionary-encoded a column or fell back to
+    /// plain, rather than assuming it: the chunk-level `encodings` list shows
+    /// `RLE_DICTIONARY` in both cases, since a fallback keeps the pages it wrote
+    /// before overflowing.
+    fn data_page_encodings(pq: &Path, column: &str) -> Vec<Vec<parquet::basic::Encoding>> {
+        let f = std::fs::File::open(pq).expect("open parquet");
+        let builder = ParquetRecordBatchReaderBuilder::try_new(f).expect("reader builder");
+        let md = builder.metadata();
+        let leaf = md
+            .file_metadata()
+            .schema_descr()
+            .columns()
+            .iter()
+            .position(|c| c.path().parts().len() == 1 && c.path().parts()[0] == *column)
+            .expect("column is a top-level leaf");
+        md.row_groups()
+            .iter()
+            .map(|rg| {
+                rg.column(leaf)
+                    .page_encoding_stats_mask()
+                    .expect("the footer records page encoding statistics")
+                    .encodings()
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The `StrColumnDict` attached to dynamic column `pos`, if any.
+    /// `dyn_col_dicts` is left empty (not a vec of `None`) when no column in the
+    /// batch carries a dictionary, so indexing it directly is not safe.
+    fn col_dict(b: &ColumnarLogBatch, pos: usize) -> Option<&StrColumnDict> {
+        b.dyn_col_dicts.get(pos).and_then(Option::as_ref)
+    }
+
+    /// Write `batch` to Parquet and read it back through the LOADER's reader, so
+    /// a column the file dictionary-encodes arrives as an Arrow `Dictionary`
+    /// (#660) exactly as it does under `ravel-cli load --parquet`.
+    fn roundtrip_parquet(batch: &RecordBatch) -> RecordBatch {
+        let (_dir, pq) = write_parquet(batch);
+        read_parquet(&pq, true)
     }
 
     /// A pinned object identity so two objects are comparable byte for byte: the
@@ -4692,6 +4937,11 @@ type = "i64"
     /// out-of-`u8` severity number, an all-null attribute column, duplicate
     /// mapped keys (winner plus residual), and both dictionary-encoded and plain
     /// string columns.
+    ///
+    /// It is also the #660 anchor: the rich fixture is read twice from the same
+    /// file, once through the loader's dictionary-preserving schema and once
+    /// through plain inference, and the two RLOG objects must be equal and hash
+    /// to the pinned BLAKE3.
     ///
     /// Prove-the-test: change `observed_ts_ns` to `push(0)` (instead of
     /// `raw_ts`), or drop the `TsUnit` scaling in `TsSrc::get` (return the raw
@@ -4784,26 +5034,40 @@ type = "i64"
             ("dictcol", dictcol),
             ("plaincol", plaincol),
         ]);
-        let rich = roundtrip_parquet(&rich);
+        // One file, read two ways: `on` is the loader's reader, which applies
+        // #660's dictionary-preserving schema; `off` lets the reader infer on
+        // its own, which is what the loader opened before #660.
+        let (_rich_dir, rich_pq) = write_parquet(&rich);
+        let on = read_parquet(&rich_pq, true);
+        let off = read_parquet(&rich_pq, false);
 
-        // The Parquet round trip preserves the Arrow dictionary encoding (the
-        // report question): a column arrow-written as a Dictionary comes back a
-        // Dictionary, while the plain column stays plain.
-        let dict_idx = rich.schema().index_of("dictcol").expect("dictcol present");
+        let dict_idx = on.schema().index_of("dictcol").expect("dictcol present");
+        let plain_idx = on.schema().index_of("plaincol").expect("plaincol present");
+
+        // A column arrow-written as a `DictionaryArray` comes back a Dictionary
+        // either way: `ArrowWriter` embeds the Arrow schema that says so.
         assert!(
-            matches!(
-                rich.column(dict_idx).data_type(),
-                DataType::Dictionary(_, _)
-            ),
+            matches!(off.column(dict_idx).data_type(), DataType::Dictionary(_, _)),
             "an arrow-written dictionary column survives the Parquet round trip as a Dictionary"
         );
-        let plain_idx = rich
-            .schema()
-            .index_of("plaincol")
-            .expect("plaincol present");
         assert!(
-            matches!(rich.column(plain_idx).data_type(), DataType::Utf8),
-            "the plain string column arrives plain"
+            matches!(on.column(dict_idx).data_type(), DataType::Dictionary(_, _)),
+            "the loader's schema leaves an already-dictionary column as it is"
+        );
+
+        // #605's expectation, flipped on purpose by #660. `plaincol` was written
+        // from a plain `StringArray`, so the embedded Arrow schema calls it Utf8
+        // and the reader infers Utf8 (`off`) even though the file
+        // dictionary-encodes the column. The loader's schema reads the chunk
+        // encodings instead and types it a Dictionary (`on`).
+        assert!(
+            matches!(off.column(plain_idx).data_type(), DataType::Utf8),
+            "without the loader's schema a plain-written string column arrives Utf8"
+        );
+        assert_eq!(
+            on.column(plain_idx).data_type(),
+            &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            "the loader's reader keeps the file's dictionary on a plain-written string column"
         );
 
         let mut m = base_mapping();
@@ -4818,32 +5082,266 @@ type = "i64"
             attr("plainkey", "plaincol", ColType::Str),
         ];
 
-        let col = assert_paths_match(&rich, &m);
+        let col_off = assert_paths_match(&off, &m);
+        let col_on = assert_paths_match(&on, &m);
 
-        // The dictionary column reached the StrColumnDict fast path; the plain
-        // one did not.
-        assert!(
-            !col.dyn_col_dicts.is_empty(),
-            "at least one column carries a dictionary, so dyn_col_dicts is populated"
+        // The load-bearing invariant: the extra dictionary the loader's reader
+        // now carries changes nothing the writer emits. Same 4 records, same
+        // object, byte for byte, with the schema on and off.
+        let bytes_off = columnar_object(col_off.clone());
+        let bytes_on = columnar_object(col_on.clone());
+        assert_eq!(
+            bytes_on, bytes_off,
+            "the RLOG object must not depend on whether a column arrived dictionary-encoded"
         );
-        let dict_pos = col
+        // Pinned so a drift in either direction is a test failure, not a silent
+        // re-baseline of both sides at once.
+        const RICH_OBJECT_BLAKE3: &str =
+            "011037a68e12f433d8a1273fb29693ddfa15b09122e9373a35e0013426bfcbb5";
+        assert_eq!(
+            blake3::hash(&bytes_off).to_hex().as_str(),
+            RICH_OBJECT_BLAKE3,
+            "object bytes without the dictionary-preserving schema"
+        );
+        assert_eq!(
+            blake3::hash(&bytes_on).to_hex().as_str(),
+            RICH_OBJECT_BLAKE3,
+            "object bytes with the dictionary-preserving schema"
+        );
+
+        let dict_pos = col_on
             .dyn_columns
             .iter()
             .position(|c| c.name == "dictkey")
             .expect("dictkey column");
-        let plain_pos = col
+        let plain_pos = col_on
             .dyn_columns
             .iter()
             .position(|c| c.name == "plainkey")
             .expect("plainkey column");
+
+        // Without the loader's schema, only the arrow-written dictionary column
+        // reaches the StrColumnDict fast path (#605's original expectation).
         assert!(
-            col.dyn_col_dicts[dict_pos].is_some(),
-            "the dictionary-encoded column passes through as a StrColumnDict"
+            col_dict(&col_off, dict_pos).is_some(),
+            "the arrow-written dictionary column passes through as a StrColumnDict"
         );
         assert!(
-            col.dyn_col_dicts[plain_pos].is_none(),
-            "the plain string column stays plain, no dictionary attached"
+            col_dict(&col_off, plain_pos).is_none(),
+            "without the loader's schema the plain-written column stays plain"
         );
+        // With it, so does the plain-written one, because the file
+        // dictionary-encodes it (#660).
+        assert!(
+            col_dict(&col_on, dict_pos).is_some(),
+            "the arrow-written dictionary column still passes through as a StrColumnDict"
+        );
+        assert!(
+            col_dict(&col_on, plain_pos).is_some(),
+            "the plain-written but dictionary-encoded column now passes through as a StrColumnDict"
+        );
+    }
+
+    /// #660: a plain `StringArray` with repeated values, written by
+    /// `ArrowWriter` (which dictionary-encodes `BYTE_ARRAY` by default), now
+    /// comes back through the loader's reader as a `Dictionary` and reaches the
+    /// `StrColumnDict` fast path with the file's exact distinct set.
+    ///
+    /// This deliberately flips #605's expectation. Before the loader supplied a
+    /// reader schema, the embedded Arrow schema said Utf8, arrow-rs fused the
+    /// Parquet dictionary away, and the column took the plain per-row path;
+    /// that is exactly what the `loader_schema = false` half still shows, and it
+    /// is what the whole test asserted before this change. Its red form is the
+    /// `assert_eq!` on `on.column(cat_idx).data_type()`: against the pre-#660
+    /// reader it reads `Utf8` where `Dictionary(Int32, Utf8)` is expected.
+    ///
+    /// Prove-the-test: confirmed by making `load_reader_schema` return `None`
+    /// unconditionally, which is exactly the pre-#660 reader. That assertion
+    /// tripped with `left: Utf8, right: Dictionary(Int32, Utf8)`.
+    #[test]
+    fn repeated_value_string_column_reaches_the_dictionary_path() {
+        const ROWS: usize = 1_000;
+        const DISTINCT: usize = 3;
+        let values = ["alpha", "beta", "gamma"];
+
+        let ts: Vec<i64> = (0..ROWS as i64).map(|i| NOW_NS + i).collect();
+        let cat: Vec<&str> = (0..ROWS).map(|i| values[i % DISTINCT]).collect();
+        let b = batch(vec![("ts", i64_col(ts)), ("cat", str_col(cat))]);
+        let (_dir, pq) = write_parquet(&b);
+
+        // The premise: the writer really did dictionary-encode every data page.
+        let encodings = data_page_encodings(&pq, "cat");
+        assert_eq!(encodings.len(), 1, "one row group");
+        assert!(
+            !encodings[0].is_empty() && encodings[0].iter().copied().all(is_dictionary_encoding),
+            "the writer dictionary-encoded every data page of `cat`: {:?}",
+            encodings[0]
+        );
+
+        let mut m = base_mapping();
+        m.attributes = vec![attr("cat", "cat", ColType::Str)];
+
+        let on = read_parquet(&pq, true);
+        let cat_idx = on.schema().index_of("cat").expect("cat present");
+        assert_eq!(
+            on.column(cat_idx).data_type(),
+            &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            "the loader's reader yields the file's dictionary for a repeated-value string column"
+        );
+
+        let col_on = assert_paths_match(&on, &m);
+        assert_eq!(col_on.num_rows, ROWS, "every row is built");
+        let pos = col_on
+            .dyn_columns
+            .iter()
+            .position(|c| c.name == "cat")
+            .expect("cat column");
+        let dict = col_dict(&col_on, pos).expect("the column carries a StrColumnDict");
+        assert_eq!(
+            dict.distinct.len(),
+            DISTINCT,
+            "the StrColumnDict holds exactly the 3 distinct values"
+        );
+        assert_eq!(dict.ids.len(), ROWS, "one dictionary id per present cell");
+
+        // The pre-#660 reader on the same file, for contrast: Utf8, plain path.
+        let off = read_parquet(&pq, false);
+        assert!(
+            matches!(off.column(cat_idx).data_type(), DataType::Utf8),
+            "plain inference fuses the Parquet dictionary away"
+        );
+        let col_off = assert_paths_match(&off, &m);
+        assert!(
+            col_dict(&col_off, pos).is_none(),
+            "the plain path attaches no StrColumnDict"
+        );
+    }
+
+    /// #660: a unique-per-row string column is left Utf8 and takes the plain
+    /// path. Its dictionary outgrows the writer's default 1 MiB dictionary page
+    /// limit, so the writer falls back to plain encoding, and the loader's rule
+    /// preserves only an encoding the file carries -- it never forces one.
+    ///
+    /// The fallback is read out of the footer here rather than assumed: if a
+    /// future writer default kept the column dictionary-encoded, the first
+    /// assertion fails instead of the test silently proving nothing.
+    ///
+    /// Prove-the-test: confirmed by making `chunk_is_dictionary_encoded` return
+    /// `true` unconditionally, the shape of the mistake this guards against. The
+    /// `load_reader_schema(&pq).is_none()` assertion tripped.
+    #[test]
+    fn unique_per_row_string_column_stays_plain() {
+        const ROWS: usize = 8_000;
+
+        let ts: Vec<i64> = (0..ROWS as i64).map(|i| NOW_NS + i).collect();
+        // ~256 bytes per value, so the dictionary passes 1 MiB well before the
+        // last row and the writer falls back.
+        let owned: Vec<String> = (0..ROWS).map(|i| format!("{i:0>256}")).collect();
+        let uniq: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let b = batch(vec![("ts", i64_col(ts)), ("uniq", str_col(uniq))]);
+        let (_dir, pq) = write_parquet(&b);
+
+        let encodings = data_page_encodings(&pq, "uniq");
+        assert_eq!(encodings.len(), 1, "one row group");
+        assert!(
+            encodings[0].iter().any(|e| !is_dictionary_encoding(*e)),
+            "the writer's dictionary overflowed and it fell back to plain data pages: {:?}",
+            encodings[0]
+        );
+
+        // The derivation leaves the column alone, so no schema is supplied at
+        // all for this file.
+        assert!(
+            load_reader_schema(&pq)
+                .expect("derive reader schema")
+                .is_none(),
+            "no column qualifies, so the loader opens the reader with default options"
+        );
+
+        let on = read_parquet(&pq, true);
+        let idx = on.schema().index_of("uniq").expect("uniq present");
+        assert!(
+            matches!(on.column(idx).data_type(), DataType::Utf8),
+            "a column the file does not dictionary-encode stays Utf8"
+        );
+
+        let mut m = base_mapping();
+        m.attributes = vec![attr("uniq", "uniq", ColType::Str)];
+        let col = build_columnar_or_panic(&on, &m);
+        assert_eq!(col.num_rows, ROWS, "every row is built");
+        let pos = col
+            .dyn_columns
+            .iter()
+            .position(|c| c.name == "uniq")
+            .expect("uniq column");
+        assert!(
+            col_dict(&col, pos).is_none(),
+            "no StrColumnDict is built for a plain column"
+        );
+    }
+
+    /// #660: the rule is scoped to string columns. `ArrowWriter`
+    /// dictionary-encodes a low-cardinality `Int64` column too, and that column
+    /// must keep the type the reader infers.
+    #[test]
+    fn dictionary_encoded_non_string_column_keeps_its_type() {
+        const ROWS: usize = 1_000;
+        const DISTINCT: i64 = 4;
+
+        let ts: Vec<i64> = (0..ROWS as i64).map(|i| NOW_NS + i).collect();
+        let nums: Vec<i64> = (0..ROWS as i64).map(|i| i % DISTINCT).collect();
+        let cat: Vec<&str> = (0..ROWS).map(|i| ["a", "b"][i % 2]).collect();
+        let b = batch(vec![
+            ("ts", i64_col(ts)),
+            ("num", i64_col(nums)),
+            ("cat", str_col(cat)),
+        ]);
+        let (_dir, pq) = write_parquet(&b);
+
+        // The premise: the Int64 column really is dictionary encoded in the file.
+        let encodings = data_page_encodings(&pq, "num");
+        assert_eq!(encodings.len(), 1, "one row group");
+        assert!(
+            !encodings[0].is_empty() && encodings[0].iter().copied().all(is_dictionary_encoding),
+            "the writer dictionary-encoded every data page of `num`: {:?}",
+            encodings[0]
+        );
+
+        // A schema IS supplied (the string column qualifies), so this proves the
+        // rule skipped `num` rather than that it never ran.
+        let schema = load_reader_schema(&pq)
+            .expect("derive reader schema")
+            .expect("the string column qualifies, so a schema is supplied");
+        assert_eq!(
+            schema
+                .field_with_name("num")
+                .expect("num field")
+                .data_type(),
+            &DataType::Int64,
+            "a dictionary-encoded non-string column keeps its inferred type"
+        );
+        assert_eq!(
+            schema
+                .field_with_name("cat")
+                .expect("cat field")
+                .data_type(),
+            &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            "the string column beside it is retyped"
+        );
+        assert_eq!(
+            schema.field_with_name("ts").expect("ts field").data_type(),
+            &DataType::Int64,
+            "the ts column keeps its inferred type"
+        );
+
+        let on = read_parquet(&pq, true);
+        assert_eq!(
+            on.column(on.schema().index_of("num").expect("num present"))
+                .data_type(),
+            &DataType::Int64,
+            "the Int64 column is read back as Int64"
+        );
+        assert_eq!(on.num_rows(), ROWS, "every row is read back");
     }
 
     /// #708: a dictionary-encoded string column whose values array is empty (an

@@ -133,8 +133,14 @@ the distinct values because Parquet already grouped them:
 
 - **Dictionary-preserving string columns.** When a mapped Parquet column
   arrives dictionary-encoded (most of ClickBench's 105 do), the batch
-  carries that dictionary and its ids. The writer maps each distinct value
-  to its RLOG dictionary entry once per block rather than once per row. It
+  carries that dictionary and its ids. Whether it arrives that way is the
+  loader's choice, not the file writer's: the reader is opened with a schema
+  derived from the footer that types every string column whose data pages are
+  dictionary encoded as `Dictionary(Int32, Utf8)` (amended 2026-08-26, issue
+  #660; without it arrow-rs fuses the Parquet dictionary away on any file
+  that lacks `ARROW:schema` metadata, `hits.parquet` included). The writer
+  maps each distinct value to its RLOG dictionary entry once per block rather
+  than once per row. It
   must reproduce exactly the page `encode_strings` derives today
   (`crates/ravel-codec/src/encoding.rs:480`): the entry order is the
   distinct values sorted, and the dictionary-versus-plain choice is
@@ -265,9 +271,8 @@ contradicts the leap from the gather microbench ratio to "roughly 78 points of
 load CPU". It is a local figure (`ravel-bench`'s `columnar_load_compare`,
 x86_64 EPYC-Rome, 8 cores, release, in-memory `MemoryStore`, `--shards 1`) on a
 bounded synthetic ClickBench-shaped sample, not the reference-box result, and
-it deliberately excludes decision 3's dictionary path (which does not engage on
-plain-`BYTE_ARRAY` ClickBench Parquet anyway, issue #660) and all S3, multi-
-shard, and real-PUT cost:
+it deliberately excludes decision 3's dictionary path and all S3, multi-shard,
+and real-PUT cost:
 
 - At ~100 attribute columns (ClickBench's shape) the columnar path shows **no
   measurable write-path CPU reduction** over the row path -- three runs at
@@ -296,6 +301,25 @@ quadratic cost and it wins at high column counts -- but it is evidence that the
 specific magnitude decision 8 predicted does not appear at ClickBench width in
 the write path this harness can see. See docs/ingest.md ("CPU cost of the
 columnar load path vs the row path (measured)") for the full method and scope.
+
+**Amended 2026-08-26 (issue #660).** The parenthesis struck from the paragraph
+above said decision 3's dictionary path "does not engage on plain-`BYTE_ARRAY`
+ClickBench Parquet anyway". That was true of the loader, not of the file.
+ClickBench's `hits.parquet` does dictionary-encode its string columns; what did
+not engage was the reader. arrow-rs materializes a `BYTE_ARRAY` column as a
+plain `StringArray` unless the file embeds `ARROW:schema` metadata written from
+an Arrow `DictionaryArray`, which `hits.parquet` does not, so the Parquet-level
+dictionary was fused away before the loader ever saw it. The loader now derives
+its own reader schema from the footer and types every string column whose data
+pages are dictionary encoded as `Dictionary(Int32, Utf8)`, so decision 3
+engages on any Parquet file whose string columns are dictionary encoded, which
+`hits.parquet`'s are. A string column the writer left plain (a unique-per-row
+column, whose dictionary outgrows the writer's page limit) still takes the
+plain path: the rule preserves an encoding the file carries and never forces
+one. The RLOG bytes are unchanged either way, which is what decision 7's
+byte-identity anchor pins. The `columnar_load_compare` figures above still
+exclude the dictionary path: that harness materializes rows before the timed
+region, so no Arrow column type reaches the writer in it.
 
 ## Rejected alternatives
 
@@ -367,4 +391,4 @@ operator-facing precision for no measurable saving.
 - The reported number is a measured before-and-after on the reference box.
   No load-time win is claimed from the arithmetic in decision 8.
 
-Refs: #586, #519, #541, #560, #570, #584, #585
+Refs: #586, #519, #541, #560, #570, #584, #585, #660

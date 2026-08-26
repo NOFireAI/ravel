@@ -228,8 +228,16 @@ fn corpus_batch(shape: CorpusShape, schema: &SchemaRef) -> RecordBatch {
 }
 
 /// Encodes the corpus to an in-memory Parquet buffer with the default writer
-/// properties (plain `BYTE_ARRAY` for the string columns, so the read-back
-/// carries no Arrow `Dictionary` type and #660's dictionary path stays off).
+/// properties, which dictionary-encode the low-cardinality string columns.
+///
+/// The read-back below still carries no Arrow `Dictionary` type: unlike the
+/// loader, [`decode_corpus`] opens the reader with default options and so gets
+/// the plain `Utf8` arrays the embedded Arrow schema describes. That is
+/// deliberate and is not the #660 gap. This bench measures the router call
+/// alone, and it materializes [`NormalizedLogRecord`]s that feed BOTH paths
+/// before the timed region, so no Arrow column type reaches the columnar
+/// writer at all; ADR-0109 decision 3's dictionary path is out of this
+/// differential's scope by construction, not by the reader's schema.
 pub fn clickbench_shaped_parquet(shape: CorpusShape) -> Vec<u8> {
     let schema = corpus_schema(shape);
     let batch = corpus_batch(shape, &schema);
