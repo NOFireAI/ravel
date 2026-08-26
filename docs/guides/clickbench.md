@@ -288,7 +288,10 @@ cargo run -p ravel-bench --features sql-latency --bin sql_latency_bench -- \
   abort with `query memory budget exhausted`; that aborts the whole run with no
   number for it. Pass a larger byte budget (for example `--sql-max-query-bytes
   1073741824` for 1 GiB) to measure it instead. Omitted, it defaults to
-  ravel-sql's compiled-in 256 MiB, leaving the measured budget unchanged.
+  ravel-sql's compiled-in 256 MiB, leaving the measured budget unchanged. The
+  effective value is recorded in the report's provenance as
+  `sql_max_query_bytes`, so two tables at different per-query budgets are not
+  mistaken for comparable.
 - `--shards <N>` sets how many shards the resolve scans. Omitted, it reads the
   tenant's durable provisioning record (the one `ravel-cli load` writes) and uses
   that record's shard ceiling, so a tenant loaded with `--shards 4` is measured

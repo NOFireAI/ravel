@@ -381,6 +381,7 @@ fn print_human_table(report: &SqlLatencyReport) {
         // value is the server's own (its default is on).
         None => "unknown (server default)".to_string(),
     };
+    println!("  query max  : {} bytes", p.sql_max_query_bytes);
     println!(
         "  tenant max : {} bytes  parallel final agg: requested={} effective={}",
         p.tenant_max_bytes, p.parallel_final_aggregation_requested, effective
