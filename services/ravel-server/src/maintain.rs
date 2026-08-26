@@ -4438,22 +4438,27 @@ mod tests {
         assert_eq!(live_ab, b.live_set(&store, now).await.expect("b live set"));
         assert_eq!(live_ab.len(), 2, "both replicas are live");
 
-        // The pinned ids were chosen for this split: A owns at least one of the
-        // 8 shards and B at least one. If a hash change ever moves all 8 onto
-        // one replica this fails loudly here rather than turning the `find`
-        // below into the 1-in-256 flake.
-        let a_owned = (0..SHARDS)
+        // The pinned ids were chosen for exactly this split. Any other
+        // partition of the 8 shards, including one that still leaves both
+        // replicas non-empty, means `unit_key` or the weight function changed
+        // and the ids must be re-pinned deliberately rather than left to flake.
+        let a_owned: Vec<u32> = (0..SHARDS)
             .filter(|shard| a.owns_unit(&live_ab, &tenant, Signal::Metrics, *shard))
-            .count();
-        let b_owned = (0..SHARDS)
+            .collect();
+        let b_owned: Vec<u32> = (0..SHARDS)
             .filter(|shard| b.owns_unit(&live_ab, &tenant, Signal::Metrics, *shard))
-            .count();
-        assert!(
-            a_owned >= 1 && b_owned >= 1,
-            "PINNED_WORKER_ID and PINNED_PEER_ID were chosen so the rendezvous \
-             splits the 8 shards across both replicas (got A={a_owned}, \
-             B={b_owned}); a hash change moved the split and the ids must be \
-             re-pinned, not left to flake"
+            .collect();
+        assert_eq!(
+            a_owned,
+            [1, 2, 3, 4, 5, 7],
+            "PINNED_WORKER_ID's rendezvous share under (acme, Metrics) moved; \
+             re-pin the ids and this expected split together"
+        );
+        assert_eq!(
+            b_owned,
+            [0, 6],
+            "PINNED_PEER_ID's rendezvous share under (acme, Metrics) moved; \
+             re-pin the ids and this expected split together"
         );
 
         // Pick a shard the rendezvous assigns to A under {A, B}: B does not own
