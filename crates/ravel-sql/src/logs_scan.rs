@@ -574,6 +574,13 @@ struct BlockMetrics {
     /// query (an `attrs` projection, a pending erasure predicate) or an
     /// eligible one that hit a block carrying an `attrs_raw` overflow page.
     rowpath_batches: Count,
+    /// Relevant segments whose plan phase had to read the whole object rather
+    /// than counting survivors from the skip index (#761). Nonzero only for a
+    /// query the skip index cannot decide: a `has_word`/text content arm (bloom
+    /// prunes it only at decode), an attribute-equality POSTINGS prune, or a
+    /// stream filter. Published once by partition 0, so a report can tell a
+    /// fully-skip-planned query from one still paying the plan-phase read.
+    plan_full_reads: Count,
 }
 
 impl BlockMetrics {
@@ -587,6 +594,7 @@ impl BlockMetrics {
             pages_skipped: MetricBuilder::new(metrics).counter("pages_skipped", partition),
             columnar_batches: MetricBuilder::new(metrics).counter("columnar_batches", partition),
             rowpath_batches: MetricBuilder::new(metrics).counter("rowpath_batches", partition),
+            plan_full_reads: MetricBuilder::new(metrics).counter("plan_full_reads", partition),
         }
     }
 
@@ -1117,6 +1125,12 @@ impl ExecutionPlan for LogsScanExec {
 struct PlanCounts {
     segs: Vec<Option<SegPlan>>,
     total_blocks: usize,
+    /// Relevant segments the plan phase read whole because the skip index could
+    /// not decide the query (#761). A segment planned from the skip index alone
+    /// carries its plan footer forward (`SegPlan::footer` is `Some`); the
+    /// whole-object fallback carries none, so this is the count of relevant
+    /// segments with no footer, published as the `plan_full_reads` metric.
+    full_reads: usize,
 }
 
 /// One relevant segment's contribution to [`PlanCounts`].
@@ -1193,10 +1207,16 @@ async fn compute_plan_counts(
         .await?;
     let mut segs = Vec::with_capacity(segments.len());
     let mut total_blocks = 0usize;
+    let mut full_reads = 0usize;
     for entry in planned {
         match entry {
             Some((survivors, stats, footer)) => {
                 total_blocks += survivors;
+                // A relevant segment planned from the skip index carries its
+                // footer forward; the whole-object fallback (#761) carries none.
+                if footer.is_none() {
+                    full_reads += 1;
+                }
                 segs.push(Some(SegPlan {
                     survivors,
                     stats,
@@ -1206,7 +1226,11 @@ async fn compute_plan_counts(
             None => segs.push(None),
         }
     }
-    Ok(Arc::new(PlanCounts { segs, total_blocks }))
+    Ok(Arc::new(PlanCounts {
+        segs,
+        total_blocks,
+        full_reads,
+    }))
 }
 
 /// One segment this partition owns blocks in, and the block-index list (into
@@ -1684,6 +1708,9 @@ impl Stream for LogScanStream {
                         if this.partition == 0 {
                             for plan in counts.segs.iter().flatten() {
                                 this.blocks.record_segment_totals(&plan.stats);
+                            }
+                            if counts.full_reads > 0 {
+                                this.blocks.plan_full_reads.add(counts.full_reads);
                             }
                         }
                         this.work = owned_work(

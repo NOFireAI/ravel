@@ -521,3 +521,63 @@ publishes a DataFusion counter named for the first failing conjunct
 partition, and no such counter at all when the fast path fires. A latency report
 reading the scan's metrics can then state why a statement striped instead of
 inferring it from GET counts.
+
+## Amendment (2026-08-26, #761): the plan phase and the fetch prune by the numeric arms
+
+Decision 1's plan phase (`compute_plan_counts` -> `plan_segment`) resolves each
+segment's surviving-block count before any partition drains a block, and the
+scan reads those survivors through `BlockRangeFetcher`. The previous amendment
+removed the plan phase for a predicate-free statement. This one fixes the cost
+for a SELECTIVE one — the ClickBench q20 and q37-q43 shapes, a declared-column
+or `attrs` numeric predicate — which is not block-predicate-free and so always
+took the plan-then-stripe path.
+
+The defect: neither the plan phase nor the scan applied the query's prune-only
+`NumRange` arms to block selection. `plan_segment`'s slow branch opened each
+segment whole to count survivors, and the scan's
+`BlockRangeFetcher::resolve_extents` called `SkipIndex::candidate_blocks(ts, ts,
+None, &[])` with no numeric arms, so every block was a ts candidate, the
+coverage crossover fired, and the read collapsed to one whole-object GET. The
+predicate pruned blocks only at decode. On the 8,424-object tenant of #680 the
+selective q37 moved 11.7 GB to decode 144 of 17,731 blocks, and q20 moved 17.9
+GB — past the 11.1 GB of objects on disk, because a cold cache re-read each
+surviving segment once per owning partition.
+
+The fix resolves the `NumRange` arms against each object's own FIELD_DIR
+(`FieldDir::numeric_range_arms`, shared with the reader's decode-time prune so
+the arms are byte-for-byte identical) and applies them to `candidate_blocks` in
+both phases:
+
+1. **Fetch side.** `resolve_extents` takes the resolved arms and prunes the
+   candidate set before the coverage crossover is weighed, so a selective scan
+   reads only the surviving blocks. The crossover threshold (0.75) is unchanged:
+   it now fires only when the survivors genuinely cover >= 75% of the BLOCKS
+   section. This is byte-identical to the unpruned read — the skip index's
+   per-block bounds are conservative (ADR-0013), so a block dropped at fetch is
+   one the decode-side prune would have dropped anyway, and the reader still
+   runs the full skip/POSTINGS/bloom prune over the fetched buffer.
+2. **Plan side.** For a query the skip index can decide — ts bounds plus
+   `NumRange` arms, no content/text arm, no attribute-equality POSTINGS prune,
+   no stream filter — `plan_segment` reads footer + SKIP_IDX (the suffix probe)
+   plus the object's FIELD_DIR to resolve the arms, and returns
+   `candidate_blocks(...).len()` with no block fetched. That count equals the
+   survivor list the scan stripes, because for such a query the reader's full
+   prune reduces to its skip step. The footer it read is carried to each subset
+   open (#693 part 3), so those opens skip their own probe.
+3. **Fallback.** A predicate the skip index cannot decide — a `has_word`/text
+   arm (bloom prunes it only at decode), an `attrs['k']='v'` POSTINGS equality,
+   a stream filter — still reads the whole object in the plan phase and is
+   counted in a new `plan_full_reads` DataFusion counter (published once, by
+   partition 0), so a report can see which statements still pay the plan-phase
+   whole-object read.
+
+Reference figures on the 8,424-object tenant. The plan phase now reads, per
+segment, one 64 KiB suffix probe (footer + SKIP_IDX) plus one small FIELD_DIR
+range GET, and no block; the FIELD_DIR is a front section, so resolving the
+numeric arms costs one range GET per segment that the predicate-free path (a
+probe alone) does not pay. Bytes are dominated by the probes: q37-class drops
+from 11.7 GB to about 0.65 GB (about 8,424 probes plus coalesced reads of about
+144 surviving blocks), and q20 from 17.9 GB to about 4-4.5 GB (each of its
+~6,592 surviving blocks read once, no whole-object re-read). The 0.75 coverage
+crossover is unchanged; a numeric predicate whose survivors still cover >= 75%
+of a segment reads that segment whole, exactly as before.
