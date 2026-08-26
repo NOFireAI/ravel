@@ -104,6 +104,7 @@ use url::Url;
 use crate::avg::sequential_avg_udaf;
 use crate::config::SqlConfig;
 use crate::group_keys::DictionaryGroupKeysAsViews;
+use crate::late_materialization::TopKLateMaterialization;
 use crate::logs_provider::LogsTableProvider;
 use crate::logs_udf::has_word_udf;
 use crate::map_field_planner::map_field_access_planner;
@@ -514,12 +515,23 @@ pub fn build_session(
     // after the default rules, which is where `with_physical_optimizer_rule`
     // puts it: the rewrite must see the final partial/final aggregation split
     // that `EnforceDistribution` chose.
-    let state = SessionStateBuilder::new()
+    let mut builder = SessionStateBuilder::new()
         .with_config(session_config(config, exact_typed_aggregates))
         .with_runtime_env(runtime)
         .with_default_features()
-        .with_physical_optimizer_rule(Arc::new(DictionaryGroupKeysAsViews))
-        .build();
+        .with_physical_optimizer_rule(Arc::new(DictionaryGroupKeysAsViews));
+    // ADR-0774: split a wide `logs` TopK into a narrow scan carrying row refs
+    // and a `k`-row block fetch. Appended after `DictionaryGroupKeysAsViews`
+    // for the same reason that one is appended after the defaults: it must see
+    // the final `SortExec`/`FilterExec`/`CoalescePartitionsExec` shape the
+    // default rules chose, and the pass-through allowlist it walks is written
+    // against that shape. `None` does not install it at all, which is the
+    // operator opt-out and the "before" side of the regression fixture.
+    if let Some(extra_columns) = config.late_materialization_extra_columns {
+        builder = builder
+            .with_physical_optimizer_rule(Arc::new(TopKLateMaterialization::new(extra_columns)));
+    }
+    let state = builder.build();
     let mut ctx = SessionContext::new_with_state(state);
 
     // Register a hand-written `ExprPlanner` so `col['key']`

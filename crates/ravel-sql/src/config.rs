@@ -29,6 +29,18 @@ use crate::memory::{CeilingBreach, TenantDelegatingPool, TenantMemoryAccountant}
 /// as it was so behavior is unchanged when the flag is unset.
 pub const DEFAULT_MAX_QUERY_BYTES: usize = 256 * 1024 * 1024;
 
+/// Default width threshold for TopK late materialization (ADR-0774): a `logs`
+/// scan under a TopK must project more than eight columns BEYOND the ones the
+/// filter and the sort read before the rewrite fires.
+///
+/// The rewrite trades decoding every projected column of every surviving block
+/// for decoding the filter's and sort's columns of every surviving block plus
+/// `k` extra block reads. Below a handful of surplus columns the `k` reads are
+/// not obviously repaid, and the shapes this exists for are not marginal: the
+/// measured statement on the ClickBench reference tenant (issue #680) projects
+/// 105 columns and sorts and filters on two, i.e. 103 surplus columns.
+pub const DEFAULT_LATE_MATERIALIZATION_EXTRA_COLUMNS: usize = 8;
+
 /// Per-query ravel-sql configuration: the shared engine budgets plus the
 /// SQL-only per-query memory-pool byte budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +90,21 @@ pub struct SqlConfig {
     /// is the "before" side of the regression test in
     /// `tests/skip_partial_aggregation.rs`.
     pub skip_partial_aggregation: bool,
+    /// Width threshold for TopK late materialization on the `logs` table
+    /// (ADR-0774, issue #774). `Some(n)` installs
+    /// [`crate::TopKLateMaterialization`] and lets it fire on a scan projecting
+    /// more than `n` columns beyond what its TopK's filter and sort read;
+    /// `None` does not install the rule at all, which is the "before" side of
+    /// `tests/logs_topk_late_materialization.rs`.
+    ///
+    /// Default [`DEFAULT_LATE_MATERIALIZATION_EXTRA_COLUMNS`]. Set once at
+    /// server startup, like every other field here.
+    ///
+    /// The rewrite is invisible to results: the same rows in the same order
+    /// under the same schema, with the wide columns decoded for the `k`
+    /// surviving rows instead of for every row. So this is a cost knob, never
+    /// a correctness one.
+    pub late_materialization_extra_columns: Option<usize>,
 }
 
 impl Default for SqlConfig {
@@ -87,6 +114,7 @@ impl Default for SqlConfig {
             max_query_bytes: DEFAULT_MAX_QUERY_BYTES,
             parallel_final_aggregation: true,
             skip_partial_aggregation: true,
+            late_materialization_extra_columns: Some(DEFAULT_LATE_MATERIALIZATION_EXTRA_COLUMNS),
         }
     }
 }
@@ -159,5 +187,19 @@ mod tests {
     #[test]
     fn skip_partial_aggregation_defaults_to_true() {
         assert!(SqlConfig::default().skip_partial_aggregation);
+    }
+
+    /// ADR-0774: the rewrite is on by default, at eight surplus columns. A
+    /// change that turns it off, or moves the threshold, changes which
+    /// ClickBench shapes finish at all (`SELECT * ... ORDER BY ts LIMIT 10`
+    /// exceeded a 900 s deadline without it) and belongs in the same change as
+    /// this assertion, not discovered broken elsewhere.
+    #[test]
+    fn late_materialization_defaults_to_eight_extra_columns() {
+        assert_eq!(
+            SqlConfig::default().late_materialization_extra_columns,
+            Some(8)
+        );
+        assert_eq!(DEFAULT_LATE_MATERIALIZATION_EXTRA_COLUMNS, 8);
     }
 }

@@ -482,6 +482,11 @@ fn task_ctx_with_query_bytes(max_query_bytes: usize) -> Arc<TaskContext> {
         max_query_bytes,
         parallel_final_aggregation: false,
         skip_partial_aggregation: true,
+        // This fixture executes a `LogsScanExec` directly, with no session and
+        // no optimizer, so the ADR-0774 rewrite cannot reach it either way.
+        // Named explicitly rather than spread from the default so a new field
+        // keeps failing this initializer closed.
+        late_materialization_extra_columns: None,
     };
     let tenant = TenantMemoryAccountant::new(1 << 30);
     let (pool, _breach) = config.query_pool(tenant, QueryAccounting::new());
