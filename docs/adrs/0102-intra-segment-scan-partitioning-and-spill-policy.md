@@ -7,12 +7,15 @@ fetch-granularity premise (flattening `candidate_blocks` before partitions
 exist) didn't hold. It was redesigned and shipped in place, not moved to a
 new document: `crates/ravel-sql/src/logs_scan.rs`'s `LogsScanExec` now
 determines per-segment surviving-block counts at plan time via
-`LogSegmentFetcher::plan_segment` (a prune with no block decode), shared
-across partitions through a `tokio::sync::OnceCell`, and gates the fan-out
-past segment count on `LogSegmentFetcher::has_cache` (ADR-0046's
-single-flight cache), the precondition the deferral note named. See the
-end of that section for what changed from the original draft and what
-remains explicitly out of scope (a ranged per-block reader, ADR-0107).
+`LogSegmentFetcher::plan_segment` (a prune with no block decode, or for a
+query with no block-level predicate at all -- #693 part 2 -- no fetch of
+block data whatsoever: the footer's own block count is the survivor
+count), shared across partitions through a `tokio::sync::OnceCell`, and
+gates the fan-out past segment count on `LogSegmentFetcher::has_cache`
+(ADR-0046's single-flight cache), the precondition the deferral note
+named. See the end of that section for what changed from the original
+draft and what remains explicitly out of scope (a ranged per-block
+reader, ADR-0107).
 
 ## Context
 
@@ -120,11 +123,15 @@ The shipped design (`crates/ravel-sql/src/logs_scan.rs`) resolves all four:
   every other partition's `BlockMetrics` records only the blocks it
   actually decoded. Striping a segment across N partitions no longer
   multiplies its whole-segment totals by N.
-- **All three pruning tiers still run, at their original layer.**
-  `plan_segment`'s prune covers skip-index and POSTINGS (matching what
-  `candidate_blocks` did before, just earlier); the partitioned subset is
-  the resulting surviving-block list. Bloom pruning is unchanged: it still
-  runs per-block during decode, inside whichever partition owns that block.
+- **All three pruning tiers still run, at their original layer, for a
+  query with any block-level predicate.** `plan_segment`'s prune covers
+  skip-index and POSTINGS (matching what `candidate_blocks` did before,
+  just earlier); the partitioned subset is the resulting surviving-block
+  list. Bloom pruning is unchanged: it still runs per-block during decode,
+  inside whichever partition owns that block. For a query with NO
+  block-level predicate at all (#693 part 2), none of the three tiers run:
+  every block trivially survives, so `plan_segment` reads only the
+  object's footer and returns its block count directly.
 
 ADR-0087's "no output ordering" guarantee (decision 1 there) is
 unaffected, not silently reacquired: `LogsScanExec::compute_properties`
