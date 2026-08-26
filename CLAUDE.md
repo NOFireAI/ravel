@@ -239,10 +239,12 @@ connection, a pushed-but-broken main).
   with 6 real findings unaddressed this way). Wait for the
   `coderabbitai[bot]` review, fix or answer every actionable finding (a
   walkthrough-only comment with zero findings counts as clean; check with
-  `scripts/pr-review-status.sh <pr-number>`), then merge by hand:
-  `gh pr merge <pr-number> --rebase`. `FLEET_MERGE_AUTO=1` restores the
-  old auto-merge behavior for the rare case that genuinely does not need
-  the wait. Task refs are left on origin until the PR is confirmed
+  `scripts/pr-review-status.sh <pr-number>`), then run the exact merge
+  command it prints once clean (it pins `--match-head-commit` to the SHA
+  it just checked, so a stale check can't land unreviewed code).
+  `FLEET_MERGE_AUTO=1` restores the old auto-merge behavior for the rare
+  case that genuinely does not need the wait. Task refs are left on
+  origin until the PR is confirmed
   merged; see the merge-fleet-result skill for that step. Write the PR
   message to `<message-file>` first (trailers included; line 1 is the
   title, the body starts at line 3); this script does not construct one
