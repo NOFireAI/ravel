@@ -650,15 +650,16 @@ async fn load_live_catalogs_and_target(
             // `buffered`, not `buffer_unordered`: the catalogs stay aligned
             // one-to-one with `inputs` in canonical order (the merge's
             // tie-break depends on it) while `input_read_concurrency` loads
-            // are in flight.
-            let catalogs: Vec<InputCatalog> = stream_iter(
-                inputs
-                    .iter()
-                    .map(|input| crate::read::load_input_catalog(store, config, input)),
-            )
-            .buffered(config.input_read_concurrency.max(1))
-            .try_collect()
-            .await?;
+            // are in flight. Futures are built in a plain loop, not a
+            // `.map()` closure, for the reason `crate::rewrite` documents.
+            let mut pending = Vec::with_capacity(inputs.len());
+            for input in &inputs {
+                pending.push(crate::read::load_input_catalog(store, config, input));
+            }
+            let catalogs: Vec<InputCatalog> = stream_iter(pending)
+                .buffered(config.input_read_concurrency.max(1))
+                .try_collect()
+                .await?;
             let identities = inputs
                 .iter()
                 .map(|i| CompactionInputIdentity {

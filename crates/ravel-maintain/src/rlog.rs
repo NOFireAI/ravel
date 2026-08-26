@@ -1057,21 +1057,24 @@ async fn fetch_section(
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::sync::Arc;
 
     use bytes::Bytes;
     use proptest::prelude::*;
     use prost::Message;
+    use ravel_catalog::{Catalog, CatalogConfig};
     use ravel_commit::record::{self, NewCommitRecord};
     use ravel_logseg::field_dir::FieldDir;
     use ravel_logseg::record::FieldType;
     use ravel_logseg::skip_index::SkipIndex;
     use ravel_logseg::{FieldSel, RlogConfig, RlogReader, RlogWriter, footer, read_section};
     use ravel_logseg::{LogRecord, Predicate, stream_attrs_bytes, writer::ObjectIdentity};
+    use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
     use ravel_object_store::memory::MemoryStore;
     use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, list_all};
     use ravel_proto::commit::v1::CompactionRecord;
     use ravel_types::logstream::{AttrValue, LogStreamId, canonical_attr_bytes, log_stream_id};
-    use ravel_types::{Signal, TenantHash, TenantId};
+    use ravel_types::{Signal, TenantHash, TenantId, TimeRange};
     use uuid::Uuid;
 
     use super::*;
@@ -2147,6 +2150,372 @@ mod tests {
         let mut expected = a.clone();
         expected.extend(b.clone());
         assert_eq!(canon_multiset(&l1), canon_multiset(&expected));
+    }
+
+    // --- mid-stream part splitting (issue #711) ------------------------------
+
+    /// Event-time base for the split fixtures: the start of the fixture
+    /// bucket's own ingest hour, so every record's event time sits inside the
+    /// hour its bucket is keyed by and the catalog's listing window covers it.
+    const SPLIT_BASE_NS: i64 = HOUR as i64 * NS_PER_HOUR;
+
+    /// One wide record of stream 0 at ordinal `i`. Every record this builds has
+    /// the *same* [`estimate_record`] value -- fixed attribute count, fixed key
+    /// lengths, fixed value lengths, and a zero-padded body and ordinal that do
+    /// not change width over the range the tests use -- so a part's record
+    /// capacity is `ceil(cap / estimate)` exactly and the part count is
+    /// arithmetic, not an observation.
+    fn wide_record(i: i64) -> LogRecord {
+        let attrs: Vec<(String, AttrValue)> = (0..8u32)
+            .map(|k| {
+                (
+                    format!("attr_{k:02}"),
+                    AttrValue::Str(format!("value-{:08}-{k:02}", i % 100_000_000)),
+                )
+            })
+            .collect();
+        record(0, SPLIT_BASE_NS + i, &format!("row-{i:08}"), attrs)
+    }
+
+    /// The number of parts a single-stream corpus of `records` records must
+    /// produce under `cap`: a part takes records until its running estimate
+    /// reaches the cap, so it holds `ceil(cap / estimate)` of them.
+    fn expected_part_count(record_estimate: u64, cap: u64, records: u64) -> u64 {
+        let per_part = cap.div_ceil(record_estimate);
+        records.div_ceil(per_part)
+    }
+
+    /// Read a compacted logs bucket back the way a query does: through the real
+    /// [`ravel_catalog::Catalog`] resolve, then decode every segment it serves,
+    /// concatenated in the resolver's own segment order.
+    async fn resolver_rows(store: &Arc<MemoryStore>, range: TimeRange) -> Vec<LogRecord> {
+        let catalog = Catalog::new(
+            Arc::clone(store) as Arc<dyn ObjectStoreBackend>,
+            CatalogConfig {
+                shard_count: SHARD + 1,
+                ..CatalogConfig::default()
+            },
+        )
+        .expect("catalog");
+        let resolved = catalog
+            .resolve(&tenant_hash(), Signal::Logs, range, &[], sealed_now_ns())
+            .await
+            .expect("resolve");
+        let mut rows = Vec::new();
+        for segment in &resolved.segments {
+            let got = store
+                .get(&segment.data_object_key, GetRange::Full)
+                .await
+                .expect("get segment");
+            rows.extend(decode_all(got.data.as_ref()));
+        }
+        rows
+    }
+
+    /// Issue #711: a bucket whose records all belong to ONE stream, and whose
+    /// total estimated heap exceeds `max_l1_part_bytes` several times over,
+    /// splits into exactly the number of parts the cap implies. The stream
+    /// straddles every boundary.
+    ///
+    /// Demonstrated red by restoring the pre-#711 between-streams-only check:
+    /// delete the `if over_cap { self.flush().await?; }` block from
+    /// `PartSink::push` and re-add the flush to `build_parts`'s
+    /// `for stream_id in merged.keys()` loop (`if part.estimate >=
+    /// config.max_l1_part_bytes { sink.flush().await?; }` after
+    /// `merge_stream_into_parts`). The part count collapses to 1 and this test
+    /// fails at `assert_eq!(parts.len() as u64, expected_parts)` with
+    /// `1 != 10`.
+    #[tokio::test]
+    async fn single_stream_bucket_splits_into_bounded_parts() {
+        const PER_INPUT: i64 = 600;
+        const INPUTS: i64 = 2;
+        const CAP: u64 = 64 * 1024;
+        let total = (PER_INPUT * INPUTS) as u64;
+
+        let store = Arc::new(MemoryStore::new());
+        // Interleaved by input but globally unique in ts, so the canonical
+        // merge order is a plain ts-ascending sequence with no tie-break.
+        let per_input: Vec<Vec<LogRecord>> = (0..INPUTS)
+            .map(|j| {
+                (0..PER_INPUT)
+                    .map(|i| wide_record(i * INPUTS + j))
+                    .collect()
+            })
+            .collect();
+        for (j, recs) in per_input.iter().enumerate() {
+            seed(
+                store.as_ref(),
+                Uuid::from_u128(j as u128 + 1),
+                j as u64 + 1,
+                recs,
+            )
+            .await;
+        }
+
+        let record_estimate = estimate_record(&wide_record(0));
+        let expected_parts = expected_part_count(record_estimate, CAP, total);
+        assert!(
+            expected_parts >= 4,
+            "fixture must exceed the cap several times over, got {expected_parts} parts"
+        );
+
+        let config = CompactorConfig {
+            max_l1_part_bytes: CAP,
+            ..CompactorConfig::default()
+        };
+        let clock = FixedClock::new(sealed_now_ns());
+        compact_bucket(store.as_ref(), &clock, &config, &bucket())
+            .await
+            .expect("compact");
+
+        let (rec, parts) = read_output(store.as_ref()).await;
+        assert_eq!(
+            parts.len() as u64,
+            expected_parts,
+            "cap {CAP} over {total} records estimated at {record_estimate} bytes each"
+        );
+
+        // Every record exactly once, across the parts, in canonical order.
+        let mut merged: Vec<LogRecord> = Vec::new();
+        for p in &parts {
+            merged.extend(decode_all(p));
+        }
+        let expected: Vec<LogRecord> = (0..total as i64).map(wide_record).collect();
+        assert_eq!(merged.len() as u64, total, "no record lost or duplicated");
+        assert_eq!(
+            canon_multiset(&merged),
+            canon_multiset(&expected),
+            "the part union must equal the input union"
+        );
+        assert_eq!(
+            merged.iter().map(|r| r.ts_ns).collect::<Vec<_>>(),
+            expected.iter().map(|r| r.ts_ns).collect::<Vec<_>>(),
+            "concatenating the parts in part order must reproduce canonical order"
+        );
+
+        // The stream really straddles: every part carries the one stream id,
+        // and the parts' bounds are adjacent and non-overlapping in event time.
+        let (stream0, _) = stream_ident(0);
+        let mut prev_max: Option<i64> = None;
+        let mut summed: u64 = 0;
+        for p in &rec.parts {
+            assert_eq!(p.first_series_id, stream0.0.to_vec());
+            assert_eq!(p.last_series_id, stream0.0.to_vec());
+            assert!(p.min_event_ts_ns <= p.max_event_ts_ns);
+            if let Some(prev) = prev_max {
+                assert!(
+                    prev < p.min_event_ts_ns,
+                    "part event-time ranges must be adjacent and non-overlapping"
+                );
+            }
+            prev_max = Some(p.max_event_ts_ns);
+            summed += p.sample_count;
+        }
+        assert_eq!(summed, total, "sum(part.sample_count) conserves the count");
+
+        // And the query path serves exactly those rows back.
+        let rows = resolver_rows(
+            &store,
+            TimeRange {
+                start_ns: SPLIT_BASE_NS,
+                end_ns: SPLIT_BASE_NS + total as i64 + 1,
+            },
+        )
+        .await;
+        assert_eq!(
+            canon_multiset(&rows),
+            canon_multiset(&expected),
+            "the resolver must serve the same rows the unsplit bucket held"
+        );
+    }
+
+    /// Issue #711: peak resident memory tracks the part cap, not the record
+    /// count. The same single-stream shape is compacted at 2x and 8x the
+    /// records; the tracker's total high-water must barely move.
+    ///
+    /// Demonstrated red against the unsplit code (the same flip as
+    /// `single_stream_bucket_splits_into_bounded_parts`): the whole stream then
+    /// lands in one writer, so the writer term is the whole corpus and the
+    /// ratio goes to about 4 (the ratio of the two record counts), failing
+    /// `ratio < 1.3`.
+    #[tokio::test]
+    async fn merge_peak_total_scales_with_the_cap_not_the_record_count() {
+        const BASE: i64 = 400;
+        const CAP: u64 = 256 * 1024;
+        const INPUTS: i64 = 2;
+        // The inputs are re-blocked at 100 records so the decode-side term is
+        // the same at both scales (every input carries far more than one
+        // block); at the 8192-record default an input's whole stream would be
+        // one block and the transient term would scale with the corpus, which
+        // is not what this test is about.
+        const L0_BLOCK: i64 = 100;
+        // At most one decoded block plus two raw blocks per input. Loose on
+        // purpose: the claim under test is the ratio.
+        const TRANSIENT_ALLOWANCE: u64 = 4 * 1024 * 1024;
+
+        let mut peaks = Vec::new();
+        for scale in [2i64, 8i64] {
+            let store = MemoryStore::new();
+            let total = BASE * scale;
+            for j in 0..INPUTS {
+                let recs: Vec<LogRecord> = (0..total / INPUTS)
+                    .map(|i| wide_record(i * INPUTS + j))
+                    .collect();
+                seed_l0(
+                    &store,
+                    Uuid::from_u128(j as u128 + 1),
+                    j as u64 + 1,
+                    &recs,
+                    RlogConfig {
+                        block_target_records: L0_BLOCK as usize,
+                        ..RlogConfig::default()
+                    },
+                    &[],
+                )
+                .await;
+            }
+
+            let tracker = MergeMemoryTracker::new();
+            let config = CompactorConfig {
+                max_l1_part_bytes: CAP,
+                merge_memory_tracker: Some(tracker.clone()),
+                ..CompactorConfig::default()
+            };
+            let clock = FixedClock::new(sealed_now_ns());
+            compact_bucket(&store, &clock, &config, &bucket())
+                .await
+                .expect("compact");
+
+            let (_rec, parts) = read_output(&store).await;
+            let peak = tracker.peak_total_bytes();
+            println!(
+                "[mem:rlog #711] scale={scale} records={total} parts={} \
+                 peak_total={peak}B cap={CAP}B",
+                parts.len()
+            );
+            assert!(peak > 0, "the tracker must record real residency");
+            peaks.push((peak, parts.len()));
+        }
+
+        // 4x the records, and the peak must not follow. Asserted before the
+        // shape checks below so the failure a regression produces is the
+        // ratio itself, with both numbers in the message.
+        let (two_x, eight_x) = (peaks[0].0 as f64, peaks[1].0 as f64);
+        let ratio = eight_x / two_x;
+        assert!(
+            ratio < 1.3,
+            "peak scaled with the record count: 2x={two_x} 8x={eight_x} ratio={ratio}"
+        );
+        for (scale, (peak, parts)) in [2, 8].into_iter().zip(peaks) {
+            assert!(
+                peak < 2 * CAP + TRANSIENT_ALLOWANCE,
+                "scale {scale}: peak {peak} exceeded 2x the cap plus the per-input transient"
+            );
+            assert!(parts > 1, "scale {scale}: the fixture must actually split");
+        }
+    }
+
+    // --- concurrent input reads (issue #711) ---------------------------------
+
+    /// Issue #711: `input_read_concurrency` changes only how many reads are in
+    /// flight, never a byte of the output. The same bucket is compacted at
+    /// concurrency 1 and 8 and every part must be byte-identical.
+    ///
+    /// The concurrency is proved to be real, not nominal: a FaultStore gate
+    /// holds every commit-record GET, and at concurrency 8 exactly 8 are held
+    /// simultaneously while at concurrency 1 only ever 1 is. Without the
+    /// fan-out the `wait_until_held(8)` below never returns and the test hangs
+    /// rather than passing vacuously.
+    #[tokio::test]
+    async fn input_read_concurrency_changes_timing_not_bytes() {
+        const INPUTS: u64 = 16;
+
+        async fn compact_at(concurrency: usize) -> (Vec<[u8; 32]>, usize) {
+            let store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+            for j in 0..INPUTS {
+                let recs: Vec<LogRecord> = (0..40i64)
+                    .map(|i| wide_record(i * INPUTS as i64 + j as i64))
+                    .collect();
+                seed(
+                    store.as_ref(),
+                    Uuid::from_u128(u128::from(j) + 1),
+                    j + 1,
+                    &recs,
+                )
+                .await;
+            }
+
+            // Hold every commit-record GET (".cmt" names commit records and
+            // nothing else) so the in-flight count is observable.
+            let gate = store.hold(Op::Get, Some(".cmt".to_string()), Occurrence::Always);
+            let config = CompactorConfig {
+                max_l1_part_bytes: 64 * 1024,
+                input_read_concurrency: concurrency,
+                ..CompactorConfig::default()
+            };
+            let task = tokio::spawn({
+                let store = Arc::clone(&store);
+                async move {
+                    let clock = FixedClock::new(sealed_now_ns());
+                    compact_bucket(store.as_ref(), &clock, &config, &bucket())
+                        .await
+                        .expect("compact");
+                }
+            });
+
+            // The first window fills to exactly `concurrency` and no further:
+            // `buffer_unordered` polls no more than that many futures at once.
+            gate.wait_until_held(concurrency).await;
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+            let peak_in_flight = gate.held_count();
+
+            // From here on release everything the gate catches, so the rest of
+            // the run (and `read_output`'s own read of the compaction record,
+            // which shares the `.cmt` suffix) is never blocked. Parks on the
+            // gate's `Notify` rather than spinning.
+            let releaser = tokio::spawn({
+                let gate = gate.clone();
+                async move {
+                    loop {
+                        gate.wait_until_held(1).await;
+                        for id in gate.held() {
+                            gate.release(id);
+                        }
+                    }
+                }
+            });
+            task.await.expect("compaction task");
+
+            let (_rec, parts) = read_output(store.as_ref()).await;
+            releaser.abort();
+            let hashes = parts
+                .iter()
+                .map(|p| *blake3::hash(p).as_bytes())
+                .collect::<Vec<_>>();
+            (hashes, peak_in_flight)
+        }
+
+        let (serial_hashes, serial_in_flight) = compact_at(1).await;
+        let (concurrent_hashes, concurrent_in_flight) = compact_at(8).await;
+
+        assert_eq!(
+            serial_in_flight, 1,
+            "concurrency 1 must never have two commit-record GETs in flight"
+        );
+        assert_eq!(
+            concurrent_in_flight, 8,
+            "concurrency 8 must hold exactly 8 commit-record GETs at once"
+        );
+        assert!(
+            serial_hashes.len() > 1,
+            "the fixture must split into several parts"
+        );
+        assert_eq!(
+            serial_hashes, concurrent_hashes,
+            "concurrent input reads must produce byte-identical parts"
+        );
     }
 
     // --- bounded-memory k-way merge ------------------------------
