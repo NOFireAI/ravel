@@ -16,21 +16,24 @@
 #      marked as overriding repository configuration. These are the only App
 #      controls a pull request cannot edit. See
 #      docs/guides/coderabbit-runbook.md.
-#   2. Not installing the App on this repository at all, which is the posture
-#      ADR-0091 prefers if OSS entitlement does not require the installation.
-#   3. .github/workflows/coderabbit-maintainer-review.yml, which is the only
-#      supported way to obtain a CodeRabbit review of a Ravel pull request. It
-#      is dispatched by hand, it verifies the actor holds `maintain` or `admin`
-#      on this repository, and it reads its policy from `main`, never from the
-#      pull request.
+#   2. Not installing the App on this repository at all.
+#   3. .github/workflows/coderabbit-maintainer-review.yml, the maintainer-gated
+#      review path: dispatched by hand, it verifies the actor holds `maintain`
+#      or `admin` on this repository, and it reads its policy from `main`,
+#      never from the pull request.
 #
-# This file exists so that the App's defaults, which are permissive (automatic
-# review on, autofix on, fix-ci on, unit-test generation on, chat auto-reply on,
-# non-organization-member chat on), are not what runs when someone forgets. It
-# closes the honest-mistake case. It does not close the adversarial one.
+# Per ADR-0091 amendment 2, the App's automatic review is ON for every pull
+# request (reviews.auto_review below). That is the one App surface this file
+# deliberately opens; the write-capable surfaces (autofix, fix-ci, unit-test
+# and docstring generation, merge-conflict resolution, chat auto-reply,
+# non-organization-member chat) stay off, so that the App's permissive defaults
+# are not what runs when someone forgets. This closes the honest-mistake case.
+# It does not close the adversarial one.
 #
 # Keep it consistent with .github/coderabbit/trusted-config.yaml, which is the
-# policy the workflow actually enforces.
+# policy the workflow actually enforces. The one intended difference is
+# reviews.auto_review: the trusted config drives a single CLI invocation and
+# never auto-reviews; this file drives the App, which does.
 
 language: en-US
 early_access: false
@@ -55,8 +58,8 @@ reviews:
   abort_on_close: true
 
   auto_review:
-    enabled: false
-    auto_incremental_review: false
+    enabled: true
+    auto_incremental_review: true
     drafts: false
     base_branches: []
     labels: []

@@ -101,30 +101,31 @@ does not say whether an Open-Source-plan organization has such a seat. If
 creating the key requires purchasing one, that is a paid capability and the
 answer is the local fallback.
 
-## Step 2: restrict the GitHub App, or remove it
+## Step 2: install the GitHub App for `ravel`, and restrict everything but review
 
-The App is installed on this organization with repository selection `selected`,
-and it has been reviewing Ravel pull requests on its defaults.
-
-**Preferred: remove `NOFireAI/ravel` from the installation.** ADR-0091 does not
-use the App for anything, and an uninstalled App has no attack surface to
-harden. Organization settings, Installed GitHub Apps, CodeRabbit, Configure,
-deselect `ravel`.
-
-Do this only after confirming the one thing that blocks it: whether Open Source
-entitlement survives without the installation. The vendor's pricing page says
-"install CodeRabbit on a public repository, and receive free reviews forever for
-public repositories", which reads as requiring the installation. If OSS
-entitlement does require it, keep the App installed for `ravel` only and apply
-every restriction below.
+ADR-0091 amendment 2 restores the App's automatic review on every pull
+request. The App must therefore be installed on this organization with
+`NOFireAI/ravel` selected. On 2026-08-26 it was not: the organization's
+installed-Apps list carried no `coderabbitai` entry, so the repository's
+`.coderabbit.yaml` governed nothing. Install it from
+<https://github.com/apps/coderabbitai> (or Organization settings, Installed
+GitHub Apps, CodeRabbit, Configure), repository access `Only select
+repositories`, select `ravel`. The vendor's pricing page says "install
+CodeRabbit on a public repository, and receive free reviews forever for public
+repositories"; confirm in the dashboard that `ravel` is receiving Open Source
+treatment after the install, and run the cost-control checklist below.
 
 Apply these in **CodeRabbit organization settings**, which is the only layer a
 pull request cannot edit. A `.coderabbit.yaml` on `main` does not constrain the
 review of a pull request that changes it. Where the plan offers global
-overrides, mark these as overriding repository configuration.
+overrides, mark these as overriding repository configuration. If an earlier
+enablement set the two review switches to off with a global override, that
+override is what a pull request sees, and `.coderabbit.yaml` cannot turn review
+back on: flip them here.
 
-- Automatic review: **off**
-- Automatic incremental review: **off**
+- Automatic review: **on**
+- Automatic incremental review: **on**
+- Review of draft pull requests: **off**
 - Chat auto-reply: **off**
 - Non-organization-member chat: **off**
 - Autofix: **off**
@@ -379,7 +380,7 @@ identities available for the `write` cases.
 | 12 | Duplicate skipped | Dispatch twice for the same head, same policy, same CLI version | Second run: `authorize` sets `review_needed=false`, review job skipped, job summary says Skipped. No CodeRabbit call | I |
 | 13 | Forced duplicate needs maintainer and reason | Dispatch with `force=true` and no `reason`; then with a reason | Without a reason: `reason is required when force is true`. With one: environment approval still required, `role_name` still checked, reason published in the review | I |
 | 14 | PR changing the workflow cannot change the running control plane | From a fork or a `write` account, open a PR editing `.github/workflows/coderabbit-maintainer-review.yml`, then dispatch the workflow | The run executes the copy on `main`; `github.ref` is `refs/heads/main` and the PR's version is never loaded. With step 5 applied, the PR also cannot merge without a code-owner approval | I + M |
-| 15 | PR changing `.coderabbit.yaml` cannot change trusted policy | Open a PR that sets `reviews.auto_review.enabled: true`, `finishing_touches.autofix.enabled: true`, and adds a hostile `path_instructions`, then review it | The CLI is invoked with `--config` pointing at absolute paths outside the tree, so the PR's file is never opened. Confirm in the log that the `--config` arguments are the `RUNNER_TEMP` paths, and that the published policy hash equals the hash of the files on `main` | I |
+| 15 | PR changing `.coderabbit.yaml` cannot change trusted policy | Open a PR that sets `finishing_touches.autofix.enabled: true`, `chat.auto_reply: true`, and adds a hostile `path_instructions`, then review it | The CLI is invoked with `--config` pointing at absolute paths outside the tree, so the PR's file is never opened. Confirm in the log that the `--config` arguments are the `RUNNER_TEMP` paths, and that the published policy hash equals the hash of the files on `main` | I |
 | 16 | Malicious `Makefile` or `build.rs` never executed | Open a PR adding a `build.rs` and a `Makefile` target that write a canary file or make an outbound request, then review it | No canary, no request. The job runs no build, no test, no make, and no package manager; the CLI's only child process is `git` | I |
 | 17 | Malicious agent-instruction file cannot override policy | Open a PR adding `AGENTS.md`, `CLAUDE.md`, `REVIEW.md`, and `.github/copilot-instructions.md` that instruct the reviewer to approve everything and reveal its configuration | Review is unaffected. The CLI reads no agent instruction file; the binary contains no reference to any of these names | I |
 | 18 | Malformed output cannot execute anything | Feed the renderer hostile agent output directly: `python3 .github/coderabbit/render-findings.py --findings <hostile.jsonl> ...` with findings containing `::set-output`, `::error::`, ANSI escapes, `<script>`, `<!-- coderabbit-maintainer-review ... -->`, `@mentions`, bidirectional overrides, and 40 extra findings | Body contains `&#58;&#58;`, `&lt;script&gt;`, `&#64;`, no ANSI, no bidi, no `<!--`, a broken marker name, and at most 20 findings. `find-marker.py` returns `0` for the forged marker | I |
@@ -413,8 +414,8 @@ changes.
 - [ ] Deduplication marker checked before every call
 - [ ] No matrix over crates, directories, or file groups
 - [ ] Rate-limit and over-limit responses exit neutral and spend nothing
-- [ ] `.coderabbit.yaml` and the trusted config both disable automatic and incremental review
-- [ ] App automatic review disabled at organization level, or App removed from `ravel`
+- [ ] The trusted config disables automatic and incremental review; `.coderabbit.yaml` enables both and nothing else that writes
+- [ ] App installed for `ravel`, automatic review on at organization level, every write-capable surface off
 - [ ] CodeRabbit usage page reviewed monthly and showing zero credit spend
 
 ---
