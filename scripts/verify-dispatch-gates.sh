@@ -10,9 +10,11 @@
 # Usage: verify-dispatch-gates.sh <ref> <worktree-parent-dir>
 #
 # <ref> is anything `git worktree add` accepts: a branch, a tag, a SHA.
-# <worktree-parent-dir> MUST be outside this repo's working tree: an
-# untracked worktree left inside the repo blocks the next fleet_dispatch,
-# which refuses to run against a dirty primary checkout.
+# <worktree-parent-dir> MUST be outside this repo's working tree: a
+# worktree left inside the repo shows up as untracked content on the
+# primary checkout, gets swept into any dispatch that takes local HEAD
+# implicitly, and pollutes every `git status` a session reads (the
+# dispatch push itself is ref-based and does not refuse on it; #687).
 #
 # Prints each gate command as it runs. Exits 0 only if every gate passes;
 # on the first failure, prints which command failed and its exit code,
