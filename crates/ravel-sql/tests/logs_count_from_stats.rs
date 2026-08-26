@@ -511,6 +511,109 @@ async fn clipping_ts_bound_reports_absent() {
     assert_eq!(store.gets(), 0, "computing statistics reads no objects");
 }
 
+// ---------------------------------------------------------------------------
+// Issue #733: the caller-side half that makes #723's leaf statistic reachable.
+// `LogsTableProvider::supports_filters_pushdown` reports a filter that resolves
+// purely to a `ts` bound (or a `has_word` call) as `Exact`, so no `FilterExec`
+// survives above the scan to report its own non-exact statistics in place of
+// the leaf's. The two tests below pin the whole physical-plan rewrite, which
+// #723's own checkpoint review named as the missing coverage.
+
+/// A contained `ts` bound answers `COUNT(*)` from the catalog with no scan at
+/// all: `AggregateStatistics` rewrites the aggregate into a literal because
+/// nothing sits between it and `LogsScanExec`'s `Exact` leaf count. So the
+/// physical plan holds neither a `FilterExec` nor a `LogsScanExec`, and the
+/// query reads zero objects.
+///
+/// `ts BETWEEN 50 AND 400` (ns) fully contains the three segments' 100..312
+/// span, which is exactly #723's `contained_ts_bound_reports_exact_count_and_\
+/// span_with_zero_gets` fixture.
+///
+/// Pre-fix (with `supports_filters_pushdown` reverted to
+/// `Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])`): the plan
+/// contains a real `FilterExec` over `LogsScanExec` and `store.gets()` is 3.
+#[tokio::test]
+async fn contained_ts_bound_count_needs_no_filter_and_no_scan() {
+    let store = CountingStore::new(Arc::new(MemoryStore::new()));
+    let snapshot = three_objects(&store).await;
+
+    let ctx = logs_session(provider_over(Arc::clone(&store), snapshot)).expect("session");
+    let plan = ctx
+        .sql(
+            "SELECT COUNT(*) FROM logs \
+             WHERE ts BETWEEN TIMESTAMP '1970-01-01 00:00:00.000000050' \
+             AND TIMESTAMP '1970-01-01 00:00:00.000000400'",
+        )
+        .await
+        .expect("plan")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+    let plan_str = displayable(plan.as_ref()).indent(true).to_string();
+    assert!(
+        !plan_str.contains("FilterExec"),
+        "an exactly-pushed ts bound must leave no residual filter; plan was:\n{plan_str}"
+    );
+    assert!(
+        !plan_str.contains("LogsScanExec"),
+        "the count must be answered from statistics, not scanned; plan was:\n{plan_str}"
+    );
+
+    let batches = collect(Arc::clone(&plan), ctx.task_ctx())
+        .await
+        .expect("collect");
+    assert_eq!(count_from_batches(&batches), 31, "7 + 11 + 13");
+    assert_eq!(store.gets(), 0, "the count answer must read no objects");
+}
+
+/// The fix must not over-widen to the prune-only channel. The SAME contained
+/// `ts` bound, AND-ed with an `attrs['k'] = 'v'` equality, keeps a real
+/// `FilterExec` (the equality is `Inexact`: the reader uses a prune arm for
+/// block pruning only and never evaluates it per row) and a real
+/// `LogsScanExec`, and reads objects.
+///
+/// Every record carries the resource attribute `service.name = api`, so the
+/// answer is still 31: the surviving residual changes the plan, not the rows.
+#[tokio::test]
+async fn ts_bound_with_an_attrs_equality_keeps_the_filter_and_the_scan() {
+    let store = CountingStore::new(Arc::new(MemoryStore::new()));
+    let snapshot = three_objects(&store).await;
+
+    let ctx = logs_session(provider_over(Arc::clone(&store), snapshot)).expect("session");
+    let plan = ctx
+        .sql(
+            "SELECT COUNT(*) FROM logs \
+             WHERE ts BETWEEN TIMESTAMP '1970-01-01 00:00:00.000000050' \
+             AND TIMESTAMP '1970-01-01 00:00:00.000000400' \
+             AND attrs['service.name'] = 'api'",
+        )
+        .await
+        .expect("plan")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+    let plan_str = displayable(plan.as_ref()).indent(true).to_string();
+    assert!(
+        plan_str.contains("FilterExec"),
+        "the prune-only attrs equality must stay Inexact and survive as a \
+         residual; plan was:\n{plan_str}"
+    );
+    assert!(
+        plan_str.contains("LogsScanExec"),
+        "a prune-channel predicate must fail closed to a scan; plan was:\n{plan_str}"
+    );
+
+    let batches = collect(Arc::clone(&plan), ctx.task_ctx())
+        .await
+        .expect("collect");
+    assert_eq!(
+        count_from_batches(&batches),
+        31,
+        "every record carries service.name = api"
+    );
+    assert!(store.gets() > 0, "a scanning count must read objects");
+}
+
 /// Regression guard on the trivial instance (no ts bound at all): the widened
 /// condition must still report the exact count, and now also the exact ts span,
 /// since `[i64::MIN, i64::MAX]` contains every segment.
