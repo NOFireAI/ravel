@@ -305,3 +305,35 @@ one for queries (`ravel-server`'s query wiring and `sql_latency_bench`).
 Before this amendment nothing set it, so every logs scan ran at most 16
 GETs in flight regardless of the flag, and a 100M-row `count(*)` measured
 the same 160 s at `--fetch-concurrency` 16 and 32.
+
+## Amendment 2026-08-26 (issue #693 part 3): a footer carried from the plan phase establishes the etag pin on the first data GET
+
+Decision 1 establishes the mandatory etag pin on the suffix probe: the probe is
+the first live GET of the sequence, so its etag is what every later block-range
+or metadata GET is checked against. Issue #693 part 3 adds a second way in.
+`LogSegmentFetcher::plan_segment`'s predicate-free fast path already reads and
+parses the footer via the probe; it now returns that `LogFooter`, and
+`ravel_sql::logs_scan` carries it into each per-partition subset open
+(`fetch_object_with_footer`). Given the footer, that open skips its own suffix
+probe — the footer already gives every section's offset and length — and
+establishes the pin on the FIRST live section or block GET instead
+(`store_get_pinned`, normally the SKIP_IDX GET).
+
+This is still fail-closed, and no `ravel-logseg` change is needed. Two distinct
+replacement cases:
+
+- A replacement DURING the open's own GET sequence makes a later live GET report
+  a different etag than the first one pinned, exactly as the probe path catches
+  it: `LogFetchError::EtagChanged`, never a buffer assembled from two states.
+- A replacement BEFORE the open even starts is caught by the carried footer's
+  per-section `crc32c`: a section read at the old offset from a different object
+  fails its stored crc on decode (`decode_section`), a hard `LogFetchError::Corrupt`.
+
+The pin is per-open, not carried across calls: the footer struct is reused, but
+each open re-verifies the bytes it reads. Because a footer is only ever carried
+for a predicate-free, fully-contained query, every block is a candidate and the
+coverage crossover reads the whole object, which supplies the footer and trailer
+bytes `RlogReader` re-parses to open the assembled buffer. The block-range
+(non-coverage) branch, reachable only when a caller forces the ranged path,
+places that tail region explicitly so a footer-carried open never assembles a
+buffer with a zeroed trailer.
