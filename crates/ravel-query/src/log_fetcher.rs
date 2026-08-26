@@ -142,14 +142,13 @@ pub struct LogQuery {
     /// which reads and returns exactly what it did before this field existed.
     ///
     /// The caller populates this from the resolved snapshot's attached
-    /// predicates. The resolver already surfaces them: it attaches
-    /// every pending request to `Snapshot::pending_erasure` on each resolve.
-    /// What is still missing is the last hop -- the `ravel-sql` scans that
-    /// build this query (`logs_scan`, `alerts_scan`, `audit_scan`) do not yet
-    /// map that field into this one, so on the SQL log surface this stays
-    /// empty and log erasure exclusion is inert. The metric surface needs no
-    /// such hop: `QueryEngine` reads `Snapshot::pending_erasure` directly at
-    /// its own fetch funnels.
+    /// predicates. The resolver already surfaces them: it attaches every pending
+    /// request to `Snapshot::pending_erasure` on each resolve. The SQL log scan
+    /// makes the last hop: `ravel_sql::logs_scan::LogsScanExec::execute` calls
+    /// [`LogQuery::with_erasure`] with the snapshot's pending predicates, so log
+    /// erasure exclusion is live on the SQL surface. The metric surface needs no
+    /// such hop: `QueryEngine` reads `Snapshot::pending_erasure` directly at its
+    /// own fetch funnels.
     pub erasure: Vec<ErasurePredicate>,
 }
 
@@ -625,6 +624,19 @@ impl LogSegmentFetcher {
         self.cache.is_some()
     }
 
+    /// The object-size threshold above which a tenant-aware fetch reads only
+    /// pruning-relevant blocks (ADR-0107,
+    /// [`with_block_range_threshold`](Self::with_block_range_threshold)). Exposed
+    /// so `ravel_sql::logs_scan`'s predicate-free full-window fast path (#693
+    /// part 3) can decide, with no I/O, whether a segment is in the band where
+    /// skipping the plan phase and reading the whole object in one GET actually
+    /// saves a probe: at or below this size the whole-object read is already the
+    /// only GET, so the fast path adds nothing.
+    #[must_use]
+    pub fn block_range_threshold(&self) -> u64 {
+        self.block_range_threshold
+    }
+
     /// Per-object relevance from the catalog summary alone, with no object
     /// read: true iff the segment's event-ts span (`SegmentRef`'s
     /// `min_event_ts_ns..=max_event_ts_ns`, the same bounds the footer carries)
@@ -889,6 +901,56 @@ impl LogSegmentFetcher {
         }))
     }
 
+    /// Whole-object streaming scan for the predicate-free full-window
+    /// whole-segment path (#693 part 3): reads the ENTIRE object in one
+    /// [`GetRange::Full`] GET, bypassing the block-range probe-and-range protocol
+    /// entirely, then opens the pruned, column-projected scan over all of its
+    /// blocks.
+    ///
+    /// This is the counterpart of
+    /// [`scan_accounted_with_tenant`](Self::scan_accounted_with_tenant) for a
+    /// segment that `ravel_sql::logs_scan` has proved (with zero I/O, from the
+    /// resolved snapshot) is fully contained in a predicate-free query window: it
+    /// is going to read every block, so a whole-object GET is strictly optimal --
+    /// no suffix probe, no per-block ranges, no coverage computation. Above the
+    /// block-range threshold `scan_accounted_with_tenant` would instead issue a
+    /// probe and then (all blocks being candidates) a coverage-crossover
+    /// whole-object GET, i.e. two GETs where this issues one. The whole object is
+    /// keyed `(0, object_size)`, the same key
+    /// [`tenant_bytes`](Self::tenant_bytes)'s whole-object read and
+    /// [`BlockRangeFetcher::fetch_object`]'s crossovers use, so it composes with
+    /// them under the cache's single-flight rather than adding a distinct extent.
+    ///
+    /// A single GET observes one object state, so no [`EtagPin`] is needed: the
+    /// multi-GET consistency the block-range path must defend does not arise here.
+    pub async fn scan_whole_accounted_with_tenant(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        query: &LogQuery,
+        columns: &ColumnSelection,
+        accounting: &QueryAccounting,
+    ) -> Result<Option<LogSegmentScan>, LogFetchError> {
+        if !Self::ts_range_relevant(seg_ref, query.ts_min_ns, query.ts_max_ns) {
+            return Ok(None);
+        }
+        let bytes = self
+            .whole_object_bytes(seg_ref, tenant_hash, accounting)
+            .await?;
+        let key = &seg_ref.data_object_key;
+        let span = decode_span();
+        let scan = span.in_scope(|| self.open_scan(key, &bytes, query, columns))?;
+        Ok(Some(LogSegmentScan {
+            bytes,
+            scan,
+            erasure: query.erasure.clone(),
+            span,
+            key: key.to_string(),
+            accounting: accounting.clone(),
+            finished: false,
+        }))
+    }
+
     /// Prune one segment for intra-segment scan partitioning (ADR-0102) WITHOUT
     /// decoding any block: returns how many of its blocks survive this query's
     /// pruning, plus the whole-segment [`ScanStats`] the prune produced, or
@@ -902,13 +964,22 @@ impl LogSegmentFetcher {
     /// nothing (`blocks_scanned`/`pages_*` in the returned stats are therefore
     /// zero; the totals describe the whole segment). The byte read goes through
     /// the same cache-aware funnel [`scan_accounted_with_tenant`](Self::
-    /// scan_accounted_with_tenant) uses, so in production it is single-flight
-    /// coalesced with the per-partition subset scans that follow rather than
-    /// issuing an extra distinct GET. That holds on both read shapes: one
-    /// whole-object key at or below
-    /// [`with_block_range_threshold`](Self::with_block_range_threshold), and
-    /// per-extent keys (probe, sections, blocks) above it, each of which the
-    /// following subset scans hit rather than re-fetch (ADR-0107).
+    /// scan_accounted_with_tenant) uses and admits the same per-extent cache
+    /// entries.
+    ///
+    /// It does NOT single-flight with the per-partition subset scans that
+    /// follow, though: `ravel_sql::logs_scan` awaits the whole plan pass behind a
+    /// `OnceCell` barrier before any partition drains, so the plan read is the
+    /// FIRST, cold touch of each extent and completes before the subset scans
+    /// even start -- there is no concurrent in-flight GET for them to collapse
+    /// onto. A subset scan then either reuses a cache entry the plan admitted or,
+    /// if it was already evicted, issues its own GET (issue #691 measured the
+    /// probe landing in S3-FIFO probation at freq 0 and being evicted before the
+    /// scan). The way to avoid the extra read is not to coalesce it but to
+    /// eliminate it: #693 part 3 carries this footer forward
+    /// ([`fetch_object_with_footer`](Self::fetch_object_with_footer)) so a subset
+    /// scan skips its own probe, and the predicate-free full-window whole-segment
+    /// path skips the plan pass entirely.
     ///
     /// [`scan_accounted_with_tenant`]: Self::scan_accounted_with_tenant
     pub async fn plan_segment(
@@ -917,7 +988,7 @@ impl LogSegmentFetcher {
         tenant_hash: TenantHash,
         query: &LogQuery,
         accounting: &QueryAccounting,
-    ) -> Result<Option<(usize, ScanStats)>, LogFetchError> {
+    ) -> Result<Option<(usize, ScanStats, Option<footer::LogFooter>)>, LogFetchError> {
         // Fast path (#693): a query with no block-level predicate whose ts
         // window fully CONTAINS the segment's span prunes nothing -- every block
         // survives -- so the survivor count is the footer's `block_count` and no
@@ -945,10 +1016,10 @@ impl LogSegmentFetcher {
             && query.ts_min_ns <= seg_ref.min_event_ts_ns
             && seg_ref.max_event_ts_ns <= query.ts_max_ns
         {
-            return Ok(Some(
-                self.plan_segment_fast(seg_ref, tenant_hash, accounting)
-                    .await?,
-            ));
+            let (n, stats, footer) = self
+                .plan_segment_fast(seg_ref, tenant_hash, accounting)
+                .await?;
+            return Ok(Some((n, stats, Some(footer))));
         }
 
         let Some(bytes) = self
@@ -960,12 +1031,20 @@ impl LogSegmentFetcher {
         let key = &seg_ref.data_object_key;
         let span = decode_span();
         let scan = span.in_scope(|| self.open_scan(key, &bytes, query, &ColumnSelection::all()))?;
-        Ok(Some((scan.remaining_blocks(), scan.stats())))
+        // The slow branch decodes nothing that carries a reusable footer to the
+        // per-partition subset opens (#693 part 3, deliverable 2): a predicated
+        // or partially-overlapping query does not run `plan_segment_fast`, so
+        // there is no plan-phase footer to hand forward and each subset open
+        // establishes its own etag pin with its own suffix probe.
+        Ok(Some((scan.remaining_blocks(), scan.stats(), None)))
     }
 
     /// The predicate-free plan fast path (#693): read only the footer via the
     /// ADR-0107 suffix probe and derive the whole-segment plan counts from
-    /// `footer.block_count` without fetching or decoding any block.
+    /// `footer.block_count` without fetching or decoding any block. Returns the
+    /// parsed [`footer::LogFooter`] alongside the counts so the per-partition
+    /// subset opens can reuse it and skip re-probing (#693 part 3, deliverable
+    /// 2; see [`fetch_object_with_footer`](Self::fetch_object_with_footer)).
     ///
     /// For a genuinely predicate-free, ts-contained query these are exactly the
     /// counts real pruning would compute: every block survives every stage, so
@@ -981,7 +1060,7 @@ impl LogSegmentFetcher {
         seg_ref: &SegmentRef,
         tenant_hash: TenantHash,
         accounting: &QueryAccounting,
-    ) -> Result<(usize, ScanStats), LogFetchError> {
+    ) -> Result<(usize, ScanStats, footer::LogFooter), LogFetchError> {
         // The `page_fetch` phase span the slow path also carries, so the trace
         // shows the probe this path issues. `s3_bytes` reports block bytes only
         // (zero here, matching the slow path's block-range branch convention);
@@ -1021,7 +1100,7 @@ impl LogSegmentFetcher {
             bloom_degraded: false,
             postings_degraded: false,
         };
-        Ok((n, plan_stats))
+        Ok((n, plan_stats, footer))
     }
 
     /// Report this segment's exact per-block record counts and per-numeric-column
@@ -1148,7 +1227,16 @@ impl LogSegmentFetcher {
     /// totals from being counted once per partition (see `ravel_sql::
     /// logs_scan`).
     ///
+    /// `footer`, when `Some`, is the [`footer::LogFooter`] a prior
+    /// [`plan_segment`](Self::plan_segment) fast path already read for this exact
+    /// (immutable) object (#693 part 3, deliverable 2). Supplying it lets the
+    /// block-range read skip its own etag-establishing suffix probe and pin on
+    /// the first section/block GET instead (see
+    /// [`fetch_object_with_footer`](Self::fetch_object_with_footer)); `None`
+    /// probes as before. It changes only the read shape, never the bytes decoded.
+    ///
     /// [`scan_accounted_with_tenant`]: Self::scan_accounted_with_tenant
+    #[allow(clippy::too_many_arguments)]
     pub async fn scan_accounted_with_tenant_subset(
         &self,
         seg_ref: &SegmentRef,
@@ -1156,10 +1244,11 @@ impl LogSegmentFetcher {
         query: &LogQuery,
         columns: &ColumnSelection,
         indices: &[usize],
+        footer: Option<&footer::LogFooter>,
         accounting: &QueryAccounting,
     ) -> Result<Option<LogSegmentScan>, LogFetchError> {
         let Some(bytes) = self
-            .tenant_bytes(seg_ref, tenant_hash, query, accounting)
+            .tenant_bytes_with_footer(seg_ref, tenant_hash, query, footer, accounting)
             .await?
         else {
             return Ok(None);
@@ -1190,10 +1279,28 @@ impl LogSegmentFetcher {
         query: &LogQuery,
         accounting: &QueryAccounting,
     ) -> Result<Option<Bytes>, LogFetchError> {
+        self.tenant_bytes_with_footer(seg_ref, tenant_hash, query, None, accounting)
+            .await
+    }
+
+    /// [`tenant_bytes`](Self::tenant_bytes), optionally carrying a plan-phase
+    /// [`footer::LogFooter`] (#693 part 3, deliverable 2). When `footer` is
+    /// `Some` and the object is above the block-range threshold, the block-range
+    /// read skips its own suffix probe and uses the carried footer, pinning the
+    /// etag on the first section/block GET instead. `None` is the unchanged
+    /// probe-first behavior. Below the threshold the whole-object read never
+    /// probes anyway, so the footer is irrelevant there.
+    async fn tenant_bytes_with_footer(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        query: &LogQuery,
+        footer: Option<&footer::LogFooter>,
+        accounting: &QueryAccounting,
+    ) -> Result<Option<Bytes>, LogFetchError> {
         if !Self::ts_range_relevant(seg_ref, query.ts_min_ns, query.ts_max_ns) {
             return Ok(None);
         }
-        let key = &seg_ref.data_object_key;
 
         // ADR-0107: an object above the block-range threshold is fetched by
         // reading only the blocks skip-index pruning proved relevant, not the
@@ -1210,11 +1317,12 @@ impl LogSegmentFetcher {
             );
             let (bytes, stats) = async {
                 self.block_range
-                    .fetch_object(
+                    .fetch_object_with_footer(
                         seg_ref,
                         tenant_hash,
                         query.ts_min_ns,
                         query.ts_max_ns,
+                        footer,
                         accounting,
                     )
                     .await
@@ -1226,6 +1334,29 @@ impl LogSegmentFetcher {
             fetch_span.record("s3_bytes", stats.block_bytes_fetched);
             return Ok(Some(bytes));
         }
+
+        Ok(Some(
+            self.whole_object_bytes(seg_ref, tenant_hash, accounting)
+                .await?,
+        ))
+    }
+
+    /// One whole-object [`GetRange::Full`] read, cache-keyed `(0, object_size)`,
+    /// with the `page_fetch` span and accounting the tenant-aware funnels share.
+    /// The caller has already decided the object is relevant; this only fetches.
+    ///
+    /// Used by the below-threshold branch of
+    /// [`tenant_bytes_with_footer`](Self::tenant_bytes_with_footer) and by the
+    /// predicate-free full-window whole-segment path
+    /// ([`scan_whole_accounted_with_tenant`](Self::scan_whole_accounted_with_tenant),
+    /// #693 part 3), which reads the whole object in one GET regardless of size.
+    async fn whole_object_bytes(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        accounting: &QueryAccounting,
+    ) -> Result<Bytes, LogFetchError> {
+        let key = &seg_ref.data_object_key;
 
         // Same two phases as `fetch_accounted`, spanned on the path production
         // log/alerts/audit traffic actually takes (ADR-0044 decision 5): the
@@ -1260,7 +1391,7 @@ impl LogSegmentFetcher {
             accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
             fetch_span.record("s3_requests", 1u64);
             fetch_span.record("s3_bytes", got.data.len() as u64);
-            return Ok(Some(got.data));
+            return Ok(got.data);
         };
 
         let cache_key = CacheKey::new(tenant_hash.0, seg_ref.content_hash, 0, seg_ref.object_size);
@@ -1304,7 +1435,7 @@ impl LogSegmentFetcher {
                 fetch_span.record("s3_bytes", bytes.len() as u64);
             }
         }
-        Ok(Some(bytes))
+        Ok(bytes)
     }
 
     /// Runs [`scan_bytes`](Self::scan_bytes) inside the log path's `decode`
@@ -2058,6 +2189,37 @@ impl BlockRangeFetcher {
         ts_max_ns: i64,
         accounting: &QueryAccounting,
     ) -> Result<(Bytes, BlockRangeStats), LogFetchError> {
+        self.fetch_object_with_footer(seg_ref, tenant_hash, ts_min_ns, ts_max_ns, None, accounting)
+            .await
+    }
+
+    /// [`fetch_object`](Self::fetch_object), optionally reusing a
+    /// [`footer::LogFooter`] a prior plan phase already read for this exact
+    /// (immutable) object (#693 part 3, deliverable 2).
+    ///
+    /// When `plan_footer` is `Some`, the etag-establishing suffix probe is
+    /// skipped: the carried footer already gives every section's offset and
+    /// length, so the read goes straight to fetching SKIP_IDX, the remaining
+    /// directory sections, and the candidate blocks. The [`EtagPin`] is then
+    /// established on the FIRST of those live GETs
+    /// ([`store_get_pinned`](Self::store_get_pinned)) rather than on the probe,
+    /// and still fails closed: a mid-sequence replacement makes a later live GET
+    /// report a different etag ([`LogFetchError::EtagChanged`]), and a
+    /// replacement that predates the whole sequence is caught by the carried
+    /// footer's per-section crc (a section read at the old offset from a
+    /// different object fails its stored `crc32c`, a hard [`LogFetchError::Corrupt`]).
+    /// Either way the fetch errors rather than assembling bytes from two object
+    /// states. `None` keeps the probe-first behavior unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fetch_object_with_footer(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        ts_min_ns: i64,
+        ts_max_ns: i64,
+        plan_footer: Option<&footer::LogFooter>,
+        accounting: &QueryAccounting,
+    ) -> Result<(Bytes, BlockRangeStats), LogFetchError> {
         let key = seg_ref.data_object_key.as_str();
         let mut stats = BlockRangeStats::default();
         let pin = EtagPin::default();
@@ -2108,60 +2270,71 @@ impl BlockRangeFetcher {
         // footer parsed at wrong absolute offsets is a `Corrupt`.
         let total_size = seg_ref.object_size;
         let total = usize::try_from(total_size).map_err(|_| corrupt_range(key))?;
-
-        // Etag-establishing probe: a suffix GET that pins the etag every later
-        // live GET is checked against, and carries the footer (and, for a small
-        // object, the whole tail directory). Cache-routed like every other GET
-        // here, so concurrent partitions' probes collapse onto one request.
-        let suffix = self.suffix_len.min(total_size);
-        let probe_start = total_size - suffix;
-        let (probe_bytes, probe_live) = self
-            .cached_extent(
-                seg_ref,
-                tenant_hash,
-                probe_start,
-                suffix,
-                GetRange::Suffix(suffix),
-                &pin,
-                accounting,
-            )
-            .await?;
-        if probe_live {
-            stats.probe_gets = 1;
-        }
-
         let mut asm = ObjectAssembler::new(total);
-        asm.place(key, probe_start, &probe_bytes)?;
 
-        // Footer: parse from the probe suffix, chasing one range if the suffix
-        // did not cover the whole footer (mirrors `SegmentFetcher::open_segment`).
-        let footer = match open_from_suffix(&probe_bytes, total_size)
-            .map_err(|source| corrupt(key, source))?
-        {
-            SuffixOutcome::Ready(footer) => footer,
-            SuffixOutcome::NeedRange { offset, len } => {
-                let (bytes, live) = self
+        // Footer: reused from the plan phase when carried (deliverable 2), else
+        // read via the etag-establishing suffix probe. The probe is a suffix GET
+        // that pins the etag every later live GET is checked against and carries
+        // the footer (and, for a small object, the whole tail directory);
+        // cache-routed like every other GET here, so concurrent partitions'
+        // probes collapse onto one request. When the footer is carried the probe
+        // is skipped entirely and the pin is established below on the first live
+        // section/block GET instead; the carried footer's per-section crc still
+        // catches a replaced object (see the method doc).
+        let footer = match plan_footer {
+            Some(f) => f.clone(),
+            None => {
+                let suffix = self.suffix_len.min(total_size);
+                let probe_start = total_size - suffix;
+                let (probe_bytes, probe_live) = self
                     .cached_extent(
                         seg_ref,
                         tenant_hash,
-                        offset,
-                        len,
-                        GetRange::Range(offset, offset + len),
+                        probe_start,
+                        suffix,
+                        GetRange::Suffix(suffix),
                         &pin,
                         accounting,
                     )
                     .await?;
-                if live {
-                    stats.probe_gets += 1;
+                if probe_live {
+                    stats.probe_gets = 1;
                 }
-                asm.place(key, offset, &bytes)?;
-                match open_from_suffix(&bytes, total_size).map_err(|source| corrupt(key, source))? {
+                asm.place(key, probe_start, &probe_bytes)?;
+                // Parse from the probe suffix, chasing one range if the suffix
+                // did not cover the whole footer (mirrors
+                // `SegmentFetcher::open_segment`).
+                match open_from_suffix(&probe_bytes, total_size)
+                    .map_err(|source| corrupt(key, source))?
+                {
                     SuffixOutcome::Ready(footer) => footer,
-                    SuffixOutcome::NeedRange { .. } => {
-                        return Err(corrupt(
-                            key,
-                            LogSegError::Corrupted("footer not covered".into()),
-                        ));
+                    SuffixOutcome::NeedRange { offset, len } => {
+                        let (bytes, live) = self
+                            .cached_extent(
+                                seg_ref,
+                                tenant_hash,
+                                offset,
+                                len,
+                                GetRange::Range(offset, offset + len),
+                                &pin,
+                                accounting,
+                            )
+                            .await?;
+                        if live {
+                            stats.probe_gets += 1;
+                        }
+                        asm.place(key, offset, &bytes)?;
+                        match open_from_suffix(&bytes, total_size)
+                            .map_err(|source| corrupt(key, source))?
+                        {
+                            SuffixOutcome::Ready(footer) => footer,
+                            SuffixOutcome::NeedRange { .. } => {
+                                return Err(corrupt(
+                                    key,
+                                    LogSegError::Corrupted("footer not covered".into()),
+                                ));
+                            }
+                        }
                     }
                 }
             }
@@ -2243,6 +2416,42 @@ impl BlockRangeFetcher {
             // a subset composes with this one (ADR-0107 decision 3).
             self.admit_blocks_from_whole(seg_ref, tenant_hash, &bytes, &extents);
             return Ok((bytes, stats));
+        }
+
+        // The suffix probe normally places the object's tail -- the footer and
+        // trailer bytes `RlogReader` re-reads to open the assembled buffer, which
+        // are not themselves listed sections. When the footer was carried the
+        // probe was skipped, so on this (non-coverage) branch that tail is still
+        // unplaced; place it now as one range over `[last_section_end,
+        // object_size)`. In practice a carried footer implies an all-candidate
+        // (predicate-free, fully-contained) query, whose coverage always crosses
+        // over above, so this range is only reached when a caller forces the
+        // ranged path; it keeps that path fail-safe rather than assembling a
+        // buffer with a zeroed trailer.
+        if plan_footer.is_some() {
+            let tail_start = footer
+                .sections
+                .iter()
+                .map(|s| s.offset + s.len)
+                .max()
+                .unwrap_or(0);
+            if tail_start < total_size && !asm.covers(tail_start, total_size) {
+                let (bytes, live) = self
+                    .cached_extent(
+                        seg_ref,
+                        tenant_hash,
+                        tail_start,
+                        total_size - tail_start,
+                        GetRange::Range(tail_start, total_size),
+                        &pin,
+                        accounting,
+                    )
+                    .await?;
+                if live {
+                    stats.metadata_gets += 1;
+                }
+                asm.place(key, tail_start, &bytes)?;
+            }
         }
 
         // The remaining non-BLOCKS sections: STREAM_DIR/FIELD_DIR (object front)
@@ -2989,7 +3198,7 @@ mod plan_fast_path_tests {
 
         // Predicate-free, ts window strictly contains [min, max].
         let query = LogQuery::new(i64::MIN, i64::MAX);
-        let (count, stats) = f
+        let (count, stats, _footer) = f
             .plan_segment(&seg, TENANT, &query, &acc)
             .await
             .expect("plan_segment")
@@ -3027,7 +3236,7 @@ mod plan_fast_path_tests {
 
         // Exact span bounds: ts_min == min_event_ts_ns, ts_max == max_event_ts_ns.
         let query = LogQuery::new(seg.min_event_ts_ns, seg.max_event_ts_ns);
-        let (count, _stats) = f
+        let (count, _stats, _footer) = f
             .plan_segment(&seg, TENANT, &query, &acc)
             .await
             .expect("plan_segment")
@@ -3059,7 +3268,7 @@ mod plan_fast_path_tests {
             word: "hello".into(),
         });
         let acc = QueryAccounting::new();
-        let (count, _) = f
+        let (count, _, _) = f
             .plan_segment(&seg, TENANT, &q, &acc)
             .await
             .expect("plan")
@@ -3077,7 +3286,7 @@ mod plan_fast_path_tests {
             AttrValue::Str("svc".into()),
         ));
         let acc = QueryAccounting::new();
-        let (count, _) = f
+        let (count, _, _) = f
             .plan_segment(&seg, TENANT, &q, &acc)
             .await
             .expect("plan")
@@ -3094,7 +3303,7 @@ mod plan_fast_path_tests {
             vec![("request.id".into(), "r0".into())],
         )]);
         let acc = QueryAccounting::new();
-        let (count, _) = f
+        let (count, _, _) = f
             .plan_segment(&seg, TENANT, &q, &acc)
             .await
             .expect("plan")
@@ -3110,7 +3319,7 @@ mod plan_fast_path_tests {
         // run and the survivor count is N-2, not N.
         let q = LogQuery::new(2, i64::MAX);
         let acc = QueryAccounting::new();
-        let (count, _) = f
+        let (count, _, _) = f
             .plan_segment(&seg, TENANT, &q, &acc)
             .await
             .expect("plan")
@@ -3132,7 +3341,7 @@ mod plan_fast_path_tests {
             word: "hello".into(),
         });
         let acc = QueryAccounting::new();
-        let (count, _) = f
+        let (count, _, _) = f
             .plan_segment(&seg, TENANT, &q, &acc)
             .await
             .expect("plan")
@@ -3170,7 +3379,7 @@ mod plan_fast_path_tests {
             );
         let query = LogQuery::new(i64::MIN, i64::MAX);
         let acc = QueryAccounting::new();
-        let (count, _) = f
+        let (count, _, _) = f
             .plan_segment(&seg, TENANT, &query, &acc)
             .await
             .expect("plan")
