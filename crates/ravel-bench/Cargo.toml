@@ -345,6 +345,13 @@ bench = false
 # Tripwire for the object_count invariant (issue #481): distinct data-object
 # keys reachable from the resolved snapshot equal the reported object_count.
 # Behind sql-latency because the L0 case drives the sql_latency harness.
+# The Flight SQL lane (issue #680). The body is gated on `flight-lane` (empty
+# crate without it), so this entry is harmless under every other feature set.
+[[test]]
+name = "sql_latency_flight_smoke"
+path = "tests/sql_latency_flight_smoke.rs"
+bench = false
+
 [[test]]
 name = "sql_latency_object_count_invariant"
 path = "tests/sql_latency_object_count_invariant.rs"
