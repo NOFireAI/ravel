@@ -197,10 +197,10 @@ pages skipped inside the range by the coalescing rule. The
 selection too.
 
 `plan_segment` (#691, #693) needs only survivor counts, and under this ADR
-those come from SKIP_IDX plus PAGE_DIR without touching any page. That is
-#693 part 2's "predicate-free plan needs no read" made structural: the plan
-phase reads three small sections per object and never a page, for every
-statement, not only the predicate-free ones.
+no plan ever touches a page. What it reads is scope-specific, and the
+as-built section below is normative: the predicate-free branch reads the
+footer alone, and the skip-decidable branch reads footer, SKIP_IDX and
+FIELD_DIR, bringing PAGE_DIR alongside for the scan phase.
 
 The RSEG format (metrics) is out of scope; it already has per-series
 ranges and its own fetcher.

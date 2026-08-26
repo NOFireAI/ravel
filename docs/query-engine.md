@@ -219,8 +219,9 @@ and lists every page in PAGE_DIR, so the fetch unit is a column chunk rather
 than a block. The request law for one statement over one such object:
 
 **One suffix probe, plus one coalesced range per surviving `(row group,
-projected column)`, plus a FIELD_DIR range only when the probe's cached suffix
-does not already cover it.** That is one to three GETs per object for a typical
+projected column)`, plus front-section ranges (STREAM_DIR always, FIELD_DIR
+when the query carries numeric arms) only when the probe's cached suffix does
+not already cover them.** That is one to four GETs per object for a typical
 narrow projection over a small object, and it grows with `row_groups x
 projected_columns` rather than with the object's block count.
 
@@ -1675,13 +1676,15 @@ These are a decode-time measurement, a **different axis** from the wire bytes th
 `page_fetch` span and `s3_bytes` record (and from `BlockRangeStats::
 block_bytes_fetched`, the T1 block-range fetch counter above): they count stored
 page bytes that a fetched block already holds, not bytes moved over the network,
-so a projection changes `page_bytes_decoded` without changing any wire counter.
-Reading them together tells both stories in one place -- how many bytes the fetch
-brought in, and how many of the bytes already resident the decode actually
-needed. The instrument exists to measure whether block-level pruning alone
-already captures most of the realistic win before a future per-page-crc RLOG
-section is proposed to shrink the wire fetch to columns (ADR-0107 "Explicitly out
-of scope").
+so under version 3 a projection changes `page_bytes_decoded` without changing
+any wire counter. Under version 4 (ADR-0699 decision 5) the projection IS the
+fetch selection, so the wire counters shrink with it and the two axes move
+together; the gap between them is then only the pruned-page holes coalescing
+chose to fetch. Reading them together tells both stories in one place -- how
+many bytes the fetch brought in, and how many of the bytes already resident
+the decode actually needed. The instrument predates the version-4 fetcher and
+was what measured whether block-level pruning alone captured enough before
+PAGE_DIR shrank the wire fetch to columns.
 
 The per-query DataFusion memory pool now bounds concurrently-held scan memory:
 the reservation grows when a decoded block and the batch built from it are held
