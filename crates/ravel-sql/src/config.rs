@@ -39,13 +39,18 @@ pub struct SqlConfig {
     /// measured `RecordBatch` sizes, never a sample count.
     pub max_query_bytes: usize,
     /// Whether an exact-typed query is allowed to repartition its final
-    /// aggregation (ADR-0094 decision 4). Issue #741 revisits this default.
-    /// Process-wide, default `false`: a
+    /// aggregation (ADR-0094 decision 4, amended 2026-08-26 by issue #741).
+    /// Process-wide, default `true`: a
     /// per-query classification (ADR-0094 decision 1) only ever flips
     /// DataFusion's `repartition_aggregations` on when this is `true` *and*
     /// every aggregate expression and GROUP BY key in the query is provably
-    /// order/partition-independent. Set once at server startup
-    /// (`services/ravel-server`); no live-reload, like every other field here.
+    /// order/partition-independent (`count`, `count distinct`, and
+    /// `sum`/`min`/`max` over non-float input; never `avg` or any float
+    /// accumulator or key). A non-exact-typed plan keeps the single-partition
+    /// final byte for byte whatever this is set to. `false` is the operator
+    /// opt-out, restoring the pre-amendment single-partition final for every
+    /// query. Set once at server startup (`services/ravel-server`); no
+    /// live-reload, like every other field here.
     pub parallel_final_aggregation: bool,
     /// Whether the partial aggregation stage may give up early on a
     /// high-cardinality group key (issue #680, ADR-0102 decision 2 amendment).
@@ -80,7 +85,7 @@ impl Default for SqlConfig {
         SqlConfig {
             engine: EngineConfig::default(),
             max_query_bytes: DEFAULT_MAX_QUERY_BYTES,
-            parallel_final_aggregation: false,
+            parallel_final_aggregation: true,
             skip_partial_aggregation: true,
         }
     }
@@ -132,15 +137,18 @@ impl SqlConfig {
 mod tests {
     use super::*;
 
-    /// ADR-0094: a proper S3-backed production-scale measurement (issue #458)
-    /// found parallel final aggregation not robustly faster than serial at
-    /// any measured partition count, so the flag's default stays `false`.
-    /// This pins that decision -- a future measurement that finds a real win
-    /// and flips the default should update this assertion in the same
-    /// change, not discover it broken in an unrelated PR.
+    /// ADR-0094 amendment (2026-08-26, issue #741): a production-scale
+    /// measurement on the 8,424-object ClickBench tenant (issue #680) found the
+    /// single-partition final aggregate exhausted an 8 GiB per-query pool at 32
+    /// scan partitions on high-cardinality GROUP BY / COUNT(DISTINCT) (nine
+    /// statements failed), while repartitioning the exact-typed final ran those
+    /// in 44-50 s with no determinism cost. The default is therefore `true`.
+    /// This pins that decision -- a change that flips it back to `false` is a
+    /// change to that ClickBench outcome and should update this assertion in the
+    /// same change, not discover it broken in an unrelated PR.
     #[test]
-    fn parallel_final_aggregation_defaults_to_false() {
-        assert!(!SqlConfig::default().parallel_final_aggregation);
+    fn parallel_final_aggregation_defaults_to_true() {
+        assert!(SqlConfig::default().parallel_final_aggregation);
     }
 
     /// Issue #680: the early give-up is on by default. It is the fix for a

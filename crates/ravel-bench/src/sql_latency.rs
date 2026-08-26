@@ -449,9 +449,10 @@ pub struct GenerateConfig {
     /// both have to be raised together to measure a heavy aggregate.
     pub tenant_max_bytes: usize,
     /// Whether an exact-typed query may repartition its final aggregation
-    /// (ADR-0094, `ravel-server --sql-parallel-final-aggregation`). Reaches
-    /// `SqlConfig::parallel_final_aggregation`; `false` is the compiled-in
-    /// default and what every earlier run used.
+    /// (ADR-0094 amended by issue #741, `ravel-server
+    /// --sql-parallel-final-aggregation`). Reaches
+    /// `SqlConfig::parallel_final_aggregation`; `true` is the compiled-in
+    /// default, and `--sql-parallel-final-aggregation=false` is the opt-out.
     pub parallel_final_aggregation: bool,
     /// The engine's `max_segments` ceiling, the same knob as `ravel-server
     /// --max-segments`. Reaches `SqlConfig::engine.max_segments`; a statement
@@ -543,9 +544,10 @@ pub struct TenantConfigInput {
     /// both have to be raised together to measure a heavy aggregate.
     pub tenant_max_bytes: usize,
     /// Whether an exact-typed query may repartition its final aggregation
-    /// (ADR-0094, `ravel-server --sql-parallel-final-aggregation`). Reaches
-    /// `SqlConfig::parallel_final_aggregation`; `false` is the compiled-in
-    /// default and what every earlier run used.
+    /// (ADR-0094 amended by issue #741, `ravel-server
+    /// --sql-parallel-final-aggregation`). Reaches
+    /// `SqlConfig::parallel_final_aggregation`; `true` is the compiled-in
+    /// default, and `--sql-parallel-final-aggregation=false` is the opt-out.
     pub parallel_final_aggregation: bool,
     /// The engine's `max_segments` ceiling, the same knob as `ravel-server
     /// --max-segments`. Reaches `SqlConfig::engine.max_segments`; a statement
@@ -681,7 +683,7 @@ impl Default for ExecutorSettings {
             shard_count: 1,
             fetch_concurrency: DEFAULT_FETCH_CONCURRENCY,
             tenant_max_bytes: DEFAULT_TENANT_MAX_BYTES,
-            parallel_final_aggregation: false,
+            parallel_final_aggregation: true,
             max_segments: DEFAULT_MAX_SEGMENTS,
         }
     }
@@ -2119,7 +2121,9 @@ mod tests {
     /// SECOND limit under `max_query_bytes`: raising only the per-query pool
     /// leaves a heavy aggregate refused by the tenant accountant with a
     /// different error (issue #680 hit exactly that on 18 ClickBench
-    /// statements). Restoring either compiled-in default fails this.
+    /// statements). Under the #741 amendment the default is on, so the override
+    /// threaded here is the `false` opt-out; both directions must reach the
+    /// executor.
     #[test]
     fn cold_executor_threads_tenant_and_parallel_agg_overrides() {
         let store = empty_store();
@@ -2131,18 +2135,24 @@ mod tests {
             None,
             ExecutorSettings {
                 tenant_max_bytes: custom_tenant,
-                parallel_final_aggregation: true,
+                parallel_final_aggregation: false,
                 ..ExecutorSettings::default()
             },
         )
         .expect("build executor");
         assert_eq!(executor.max_tenant_bytes(), custom_tenant);
-        assert!(executor.config().parallel_final_aggregation);
+        assert!(
+            !executor.config().parallel_final_aggregation,
+            "the false opt-out must reach the executor"
+        );
 
         let executor =
             cold_executor(&store, &[], None, ExecutorSettings::default()).expect("build executor");
         assert_eq!(executor.max_tenant_bytes(), DEFAULT_TENANT_MAX_BYTES);
-        assert!(!executor.config().parallel_final_aggregation);
+        assert!(
+            executor.config().parallel_final_aggregation,
+            "the amended default (issue #741) reaches the executor as on"
+        );
     }
 
     /// The deadline a run used is part of its provenance.

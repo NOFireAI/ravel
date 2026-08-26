@@ -156,10 +156,20 @@ struct Args {
     /// used.
     #[arg(long, value_name = "BYTES", default_value_t = ravel_bench::sql_latency::DEFAULT_TENANT_MAX_BYTES)]
     sql_tenant_max_bytes: usize,
-    /// Let an exact-typed query repartition its final aggregation (ADR-0094),
-    /// the same knob as `ravel-server --sql-parallel-final-aggregation`. Off by
-    /// default, which is what every earlier run measured.
-    #[arg(long, default_value_t = false)]
+    /// Let an exact-typed query repartition its final aggregation (ADR-0094,
+    /// amended by issue #741), the same knob as `ravel-server
+    /// --sql-parallel-final-aggregation`. On by default; pass
+    /// `--sql-parallel-final-aggregation=false` (or the bare flag, which stays
+    /// accepted and still means on) to measure the pre-amendment
+    /// single-partition final. The effective value is recorded in the report's
+    /// provenance either way.
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_value_t = true,
+        default_missing_value = "true",
+        action = clap::ArgAction::Set,
+    )]
     sql_parallel_final_aggregation: bool,
     /// Execute each statement through a running `ravel-server`'s Flight SQL
     /// endpoint (`host:port`, the server's `--listen-grpc`) instead of the

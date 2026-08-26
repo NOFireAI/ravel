@@ -1739,19 +1739,24 @@ to union, so a `trace_id` disjunction is refused too.
 
 ## Parallel final aggregation for exact-typed queries (ADR-0094)
 
-Every SQL query plans its aggregation single-partitioned by default: DataFusion's
-`repartition_aggregations` knob is off, so a `Partial` `AggregateExec` runs per
-scan partition, a `CoalescePartitionsExec` collapses them into one stream, and a
-single serial `Final` `AggregateExec` produces the result. This keeps float
-aggregation bit-exact against the differential gate (ADR-0013), whose reference
-depends on a deterministic fold order.
+A query whose aggregation is provably order- and partition-independent
+(exact-typed) fans its `Final` stage across partitions behind a
+hash-partitioning `RepartitionExec`; every other query plans single-partitioned:
+DataFusion's `repartition_aggregations` knob stays off, so a `Partial`
+`AggregateExec` runs per scan partition, a `CoalescePartitionsExec` collapses
+them into one stream, and a single serial `Final` `AggregateExec` produces the
+result. The single-partition plan keeps float aggregation bit-exact against the
+differential gate (ADR-0013), whose reference depends on a deterministic fold
+order.
 
-`--sql-parallel-final-aggregation` (the process-wide `SqlConfig`
-`parallel_final_aggregation`, default off; no live-reload, flipping it needs a
-restart) lets a query whose aggregation is provably order- and
-partition-independent instead fan its `Final` stage across partitions behind a
-hash-partitioning `RepartitionExec`. Admission is per-query and decided from the
-query's fully type-coerced (analyzed) plan:
+This behavior is on by default (`SqlConfig::parallel_final_aggregation`, amended
+to `true` on 2026-08-26 by issue #741; see the ADR-0094 amendment for the
+ClickBench measurement that motivated it). It is process-wide with no
+live-reload, so flipping it needs a restart, and
+`--sql-parallel-final-aggregation=false` is the operator opt-out that restores
+the pre-amendment single-partition final for every query (the bare
+`--sql-parallel-final-aggregation` stays accepted and still means on). Admission
+is per-query and decided from the query's fully type-coerced (analyzed) plan:
 
 - **Eligible:** `count(...)` and `count(DISTINCT ...)` over any type; `sum`,
   `min`, `max` over a resolved **non-float** input.
@@ -1768,7 +1773,7 @@ a scalar/`IN`/`EXISTS` subquery -- forces the whole query onto the
 single-partition plan: `repartition_aggregations` is one session-wide switch, not
 a per-node choice. Any error building or analyzing the classification plan
 fails closed to the single-partition plan (a missed optimization, never a wrong
-result). With the flag off, no classification runs and every query is
+result). With the opt-out set, no classification runs and every query is
 single-partition, byte-identical to before this feature existed.
 
 Row order is unaffected. A `GROUP BY` without an explicit `ORDER BY` has **no
