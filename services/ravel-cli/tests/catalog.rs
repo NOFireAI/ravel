@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use ravel_cli::catalog;
+use ravel_cli::maintain::SignalArg;
 use ravel_commit::keys;
 use ravel_commit::publish::{self, RetryPolicy};
 use ravel_commit::record::{self, NewCommitRecord};
@@ -82,17 +83,30 @@ async fn fold_then_inspect_then_verify_round_trips_cleanly() {
     publish_segment(&store, tenant, 0, 1, created).await;
     publish_segment(&store, tenant, 0, 2, created).await;
 
-    catalog::fold(store.clone() as Arc<dyn ObjectStoreBackend>, tenant, 1)
-        .await
-        .expect("fold succeeds");
+    catalog::fold(
+        store.clone() as Arc<dyn ObjectStoreBackend>,
+        tenant,
+        1,
+        SignalArg::Metrics,
+    )
+    .await
+    .expect("fold succeeds");
 
-    catalog::inspect(store.clone() as Arc<dyn ObjectStoreBackend>, tenant)
-        .await
-        .expect("inspect succeeds against a freshly folded HEAD");
+    catalog::inspect(
+        store.clone() as Arc<dyn ObjectStoreBackend>,
+        tenant,
+        SignalArg::Metrics,
+    )
+    .await
+    .expect("inspect succeeds against a freshly folded HEAD");
 
-    catalog::verify(store.clone() as Arc<dyn ObjectStoreBackend>, tenant)
-        .await
-        .expect("verify finds no divergence right after a fold");
+    catalog::verify(
+        store.clone() as Arc<dyn ObjectStoreBackend>,
+        tenant,
+        SignalArg::Metrics,
+    )
+    .await
+    .expect("verify finds no divergence right after a fold");
 }
 
 #[tokio::test]
@@ -102,17 +116,26 @@ async fn verify_fails_when_a_sealed_record_is_missing_from_the_snapshot() {
     let created = now_ns() - SEALED_AGE_NS;
     publish_segment(&store, tenant, 0, 1, created).await;
 
-    catalog::fold(store.clone() as Arc<dyn ObjectStoreBackend>, tenant, 1)
-        .await
-        .expect("fold succeeds");
+    catalog::fold(
+        store.clone() as Arc<dyn ObjectStoreBackend>,
+        tenant,
+        1,
+        SignalArg::Metrics,
+    )
+    .await
+    .expect("fold succeeds");
 
     // Published after the fold ran, so it is sealed but not yet folded in:
     // the snapshot under-counts relative to the sealed commit history.
     publish_segment(&store, tenant, 0, 2, created).await;
 
-    let err = catalog::verify(store.clone() as Arc<dyn ObjectStoreBackend>, tenant)
-        .await
-        .expect_err("verify must fail when a sealed record is missing from the snapshot");
+    let err = catalog::verify(
+        store.clone() as Arc<dyn ObjectStoreBackend>,
+        tenant,
+        SignalArg::Metrics,
+    )
+    .await
+    .expect_err("verify must fail when a sealed record is missing from the snapshot");
     assert!(
         err.to_string().contains("missing"),
         "unexpected error: {err}"
@@ -124,10 +147,10 @@ async fn inspect_and_verify_report_cleanly_with_no_head_yet() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let tenant = "acme";
 
-    catalog::inspect(store.clone(), tenant)
+    catalog::inspect(store.clone(), tenant, SignalArg::Metrics)
         .await
         .expect("inspect on an absent HEAD reports rather than errors");
-    catalog::verify(store.clone(), tenant)
+    catalog::verify(store.clone(), tenant, SignalArg::Metrics)
         .await
         .expect("verify on an absent HEAD reports rather than errors");
 }
@@ -150,9 +173,13 @@ async fn inspect_rejects_a_corrupt_head() {
         .await
         .expect("seed a corrupt HEAD object");
 
-    let err = catalog::inspect(store as Arc<dyn ObjectStoreBackend>, "acme")
-        .await
-        .expect_err("corrupt HEAD must be a typed error, not a panic or silent success");
+    let err = catalog::inspect(
+        store as Arc<dyn ObjectStoreBackend>,
+        "acme",
+        SignalArg::Metrics,
+    )
+    .await
+    .expect_err("corrupt HEAD must be a typed error, not a panic or silent success");
     assert!(
         err.to_string().contains("corrupt"),
         "unexpected error: {err}"
@@ -231,9 +258,14 @@ async fn inspect_preserves_partial_output_when_a_part_fetch_fails() {
         .expect("seed the head");
 
     let mut out = String::new();
-    let err = catalog::render_inspect(store as Arc<dyn ObjectStoreBackend>, "acme", &mut out)
-        .await
-        .expect_err("a missing part must surface as a typed error");
+    let err = catalog::render_inspect(
+        store as Arc<dyn ObjectStoreBackend>,
+        "acme",
+        SignalArg::Metrics,
+        &mut out,
+    )
+    .await
+    .expect_err("a missing part must surface as a typed error");
     assert!(
         err.to_string().contains("missing"),
         "unexpected error: {err}"

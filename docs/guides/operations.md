@@ -242,9 +242,9 @@ above).
 | `ravel-cli maintain migrate --tenant <n> --signal <metrics\|logs\|spans> [--shards <n>] [--target-version <n>] [--family <name>] [--budget-records <n>]` | `--shards` default `4`, `--budget-records` default `0` (unlimited) | Migrates every live record below `--target-version` (defaults to the signal's current supported version) and raises the recorded format floor once a fresh re-audit confirms nothing below it survives (see "Format migration" below). Resumable: re-run to continue from the durable cursor after a budget stop. A refused raise ("FOUND STRAGGLERS") means genuine live data still below target, not a self-inflicted false positive -- no interleaved `sweep` is needed for this to converge. |
 | `ravel-cli maintain verify-custody --tenant <n> [--shards <n>]` | `--shards` default `4` | Read-only, no `--dry-run` (nothing is written or deleted). Re-verifies the content-addressed chain at rest: every live data object's key-embedded `hash16` against its actual content hash, and every surviving compaction record's referenced inputs (a mismatch is an anomaly; an input the sweeper already legitimately reclaimed past its protection horizon is reported separately, not as an anomaly). Exits nonzero on any anomaly. |
 | `ravel-cli catalog list --tenant <name> [--hours <n>] [--shards <n>]` | `--hours` default `1`, `--shards` default `4` | Lists commit records that the catalog resolves for that tenant over the last `hours` hours. `--shards` must match the shard count the data was written with. |
-| `ravel-cli catalog fold --tenant <name> [--shards <n>]` | `--shards` default `4` | One-shot catalog fold: seals every eligible hour into a new snapshot part and CAS-advances HEAD. Prints the fold report (watermark before/after, buckets folded, entry count, request counts). This is the same operation that the background fold task runs on a timer. |
-| `ravel-cli catalog inspect --tenant <name>` | | Decodes and prints HEAD and every referenced snapshot part: watermark, part keys, hashes, entry counts. It reports rather than errors when no HEAD exists yet. |
-| `ravel-cli catalog verify --tenant <name>` | | Re-lists every sealed commit record and diffs it against the current snapshot. Prints counts of entries missing from or mismatched against the snapshot; exits nonzero on any divergence. It reports rather than errors when no HEAD exists yet. |
+| `ravel-cli catalog fold --tenant <name> [--shards <n>] [--signal <metrics\|logs\|spans>]` | `--shards` default `4`, `--signal` default `metrics` | One-shot catalog fold for one (tenant, signal): seals every eligible hour into a new snapshot part and CAS-advances that signal's HEAD. Prints the fold report (watermark before/after, buckets folded, entry count, request counts). A tenant's logs snapshot is a separate object from its metrics snapshot, so a logs or spans tenant is never folded unless `--signal` names it; without a snapshot, every query on that signal lists and reads every commit record in its window. Folding metrics on a logs-only tenant reports `entry_count 0` and publishes an empty metrics HEAD. This is the same operation the background fold task runs on a timer, which covers all three signals (metrics, logs, and spans) in every mode except `--mode maintain`, where it does not run at all. |
+| `ravel-cli catalog inspect --tenant <name> [--signal <metrics\|logs\|spans>]` | `--signal` default `metrics` | Decodes and prints that signal's HEAD and every referenced snapshot part: watermark, part keys, hashes, entry counts. Names the signal both as a word and as the numeric proto value read off the object, so a HEAD stamped with a signal other than the one asked for is visible. It reports rather than errors when no HEAD exists yet, which is what a logs tenant inspected without `--signal logs` looks like. |
+| `ravel-cli catalog verify --tenant <name> [--signal <metrics\|logs\|spans>]` | `--signal` default `metrics` | Re-lists every sealed commit record for that signal and diffs it against that signal's snapshot. Prints counts of entries missing from or mismatched against the snapshot; exits nonzero on any divergence. It reports rather than errors when no HEAD exists yet, so on a logs tenant it reports "nothing to verify" unless `--signal logs` is given. Verify each signal the tenant actually writes. |
 | `ravel-cli provision adopt --tenant <name> --shards <n> [--signal <metrics\|logs\|spans>]` | | Writes the durable `shard_count` provisioning record for a tenant with pre-ADR data, ahead of any server touching it (ADR-0050 section 5). Runs the same adoption path the server runs: writes the record only when every observed shard index is below `--shards`, and refuses (writing nothing, exiting nonzero) when a higher index proves `--shards` would hide data. Prints one line per signal. A signal with no data and no record is left untouched (its record is written on first ingest). |
 | `ravel-cli typed-attr-column show <tenant>` | | Prints the tenant's durable declared typed attribute columns (ADR-0090 decision 1) from `TenantConfig.typed_attr_columns`, in schema-append order. Distinguishes three states: no config record, a record with no declaration (both leave the deployment default in force), and a present declaration (which replaces the default, including when it is explicitly empty). |
 | `ravel-cli typed-attr-column set <tenant> [KEY:TYPE ...]` | | Replaces the tenant's durable declaration wholesale, validated on the same rules the server's flags are (empty key, duplicate key, conflicting types, fixed-column collision), then swapped with `CasVersion` so a concurrent write is a reported conflict rather than a silent overwrite. Not additive and with no per-key remove: pass the full intended list. Passing no declaration writes an explicit empty one, which means "this tenant declares nothing" and is distinct from having no override. Every other field of the record is carried through unchanged. A query-serving process picks the change up within its staleness horizon (60s); no restart is needed. |
@@ -282,7 +282,8 @@ that already-sealed bucket becomes invisible to non-token queries. A
 key directly, never through the snapshot. This is the one failure mode
 that needs an operator repair rather than resolving itself:
 
-1. Run `ravel-cli catalog verify --tenant <name>` (per signal). A nonzero
+1. Run `ravel-cli catalog verify --tenant <name> --signal <signal>` (once per
+   signal the tenant writes; `--signal` defaults to metrics). A nonzero
    exit and a nonempty "missing from snapshot" count confirm sealed
    commits that the snapshot does not know about.
 2. Delete the tenant's HEAD object for the affected signal:
@@ -291,12 +292,12 @@ that needs an operator repair rather than resolving itself:
    (`mc rm` against MinIO, `aws s3 rm` against S3). Deleting HEAD is safe.
    `Catalog::fold` treats an absent HEAD as "no snapshot yet" and rebuilds
    one from a full listing rather than errors.
-3. Run `ravel-cli catalog fold --tenant <name> --shards <n>` (or wait for
-   the next background fold tick). The fold report's `rebuilt: true` line
-   confirms that it rebuilt from scratch rather than extended the prior
-   snapshot.
-4. Re-run `ravel-cli catalog verify --tenant <name>` to confirm that the
-   divergence is gone.
+3. Run `ravel-cli catalog fold --tenant <name> --shards <n> --signal <signal>`
+   for the affected signal (or wait for the next background fold tick). The
+   fold report's `rebuilt: true` line confirms that it rebuilt from scratch
+   rather than extended the prior snapshot.
+4. Re-run `ravel-cli catalog verify --tenant <name> --signal <signal>` to
+   confirm that the divergence is gone.
 
 There is no `catalog fold --force-rebuild` flag. Deleting HEAD is the
 supported way to force one, because it reuses the same absent-HEAD path that
@@ -2067,13 +2068,14 @@ reattach.
 
    ```sh
    ravel-cli maintain verify-custody --tenant <name>
-   ravel-cli catalog verify --tenant <name>
+   ravel-cli catalog verify --tenant <name> --signal <signal>
    ```
 
    `verify-custody` re-hashes every live data object against its key and
    confirms every surviving record's data is present; `catalog verify`
-   re-lists sealed records and diffs them against the snapshot. Both must be
-   clean (exit zero) before you trust the repair.
+   re-lists sealed records and diffs them against the snapshot for the one
+   signal `--signal` names (default metrics), so run it once per signal the
+   tenant writes. Both must be clean (exit zero) before you trust the repair.
 4. **Resume maintenance.** Restart the `--mode maintain` process without the
    `--maintain-tenant` restriction (or restart the stopped one). The sweeper
    now sees the reconstructed records and treats their data objects as
