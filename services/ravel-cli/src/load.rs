@@ -1999,6 +1999,7 @@ enum StrSrc<'a> {
     Bad(&'a ArrayRef),
 }
 
+// See #708 (empty-dictionary panic) and #680 (decode/encode overlap).
 fn str_src(arr: &ArrayRef) -> StrSrc<'_> {
     match arr.data_type() {
         DataType::Utf8 => downcast_opt(arr).map_or(StrSrc::Bad(arr), StrSrc::Utf8),
