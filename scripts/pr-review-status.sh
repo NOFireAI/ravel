@@ -75,7 +75,7 @@ cr_last_state=$(echo "${reviews_json}" | jq -r --arg sha "${head_sha}" \
 comments_json="$(gh api "repos/${repo}/pulls/${pr}/comments" --paginate | jq -s 'add')"
 cr_comments=$(echo "${comments_json}" | jq '[.[] | select(.user.login=="coderabbitai[bot]")] | length')
 
-summary="PR #${pr}: state=${state} mergeState=${merge_state} CI=${success} pass/${pending} pending/${failing} fail"
+summary="PR #${pr} @ ${head_sha}: state=${state} mergeState=${merge_state} CI=${success} pass/${pending} pending/${failing} fail"
 if [[ "${other}" != "0" ]]; then
   summary="${summary}/${other} unrecognized"
 fi
@@ -91,8 +91,8 @@ elif [[ "${merge_state}" == "DIRTY" || "${merge_state}" == "DRAFT" || "${merge_s
   echo "  -> mergeState is ${merge_state}; not mergeable regardless of CI/CodeRabbit state below"
 elif [[ "${cr_reviews}" == "0" ]]; then
   echo "  -> no CodeRabbit review against the current head commit yet; do not merge until one lands"
-elif [[ "${cr_last_state}" == "CHANGES_REQUESTED" ]]; then
-  echo "  -> CodeRabbit's current-head review is CHANGES_REQUESTED; not clean regardless of inline comment count"
+elif [[ "${cr_last_state}" != "APPROVED" && "${cr_last_state}" != "COMMENTED" ]]; then
+  echo "  -> CodeRabbit's current-head review state is ${cr_last_state} (need APPROVED or COMMENTED); not clean"
 elif [[ "${failing}" != "0" ]]; then
   echo "  -> CI has failing/cancelled checks; not clean to merge"
 elif [[ "${other}" != "0" ]]; then
@@ -105,4 +105,5 @@ elif [[ "${merge_state}" != "CLEAN" && "${merge_state}" != "UNSTABLE" ]]; then
   echo "  -> every check and review looks clean, but mergeState is ${merge_state} (not CLEAN/UNSTABLE); verify by hand before merging"
 else
   echo "  -> clean: CI green, CodeRabbit reviewed the current head with zero inline comments"
+  echo "  -> gh pr merge ${pr} --rebase --delete-branch --match-head-commit ${head_sha}"
 fi
