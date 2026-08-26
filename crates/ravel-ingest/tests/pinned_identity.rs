@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use common::{TestClock, make_point, tenant};
 use ravel_ingest::{IngestConfig, IngestRouter, WriteMode};
-use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault};
+use ravel_object_store::fault::{
+    FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, list_all};
 use ravel_types::Signal;
@@ -31,7 +33,8 @@ async fn retry_across_hour_boundary_keeps_the_pinned_ingest_hour() {
             .with_key_contains("/l0/")
             .with_occurrence(Occurrence::Nth(1)),
     );
-    let store: Arc<dyn ObjectStoreBackend> = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+    let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+    let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
     let clock = TestClock::new(start_ns);
     let config = IngestConfig {
         shard_count: 1,
@@ -65,7 +68,23 @@ async fn retry_across_hour_boundary_keeps_the_pinned_ingest_hour() {
             Duration::from_secs(5)
         ),
         async {
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            // Advance only once the first data PUT has actually faulted, so
+            // the clock genuinely moves while the retry is in flight. A flat
+            // 5 ms sleep here could land after the flush had already closed
+            // on a fast host, leaving the hour assertion below trivially
+            // true and this test proving nothing.
+            let mut retried = false;
+            for _ in 0..2_000 {
+                if fault_store.fault_count(Op::Put, FaultKind::DuplicateDelivery) > 0 {
+                    retried = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            assert!(
+                retried,
+                "the retry this test advances the clock across was never injected"
+            );
             clock.advance_ns(20_000_000_000);
         },
     );

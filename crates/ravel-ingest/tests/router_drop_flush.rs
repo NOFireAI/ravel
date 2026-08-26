@@ -94,16 +94,22 @@ async fn dropping_router_flushes_buffered_points() {
     // (services/ravel-server/src/lib.rs).
     drop(router);
 
-    // Give the detached actor task time to notice the closed channel, flush,
-    // and stop. The MemoryStore PUTs complete promptly.
-    for _ in 0..10 {
-        tokio::task::yield_now().await;
+    // The detached actor task notices the closed channel, flushes, and stops
+    // on its own. Wait for the commit record it writes rather than for a flat
+    // 100 ms: a slow host then takes longer instead of failing, and a host
+    // that never writes one fails on the assertion below rather than on the
+    // length of a sleep.
+    let mut objects = Vec::new();
+    for _ in 0..2_000 {
+        objects = list_all(store.as_ref(), "t/").await.expect("list");
+        if objects.iter().any(|o| o.key.contains("/c/")) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
-    tokio::time::sleep(Duration::from_millis(100)).await;
 
     // The observable outcome: the buffered point was flushed, not silently
     // discarded. A data object and its commit record are now in the store.
-    let objects = list_all(store.as_ref(), "t/").await.expect("list");
     assert!(
         !objects.is_empty(),
         "dropping the router must flush buffered points, but the \
