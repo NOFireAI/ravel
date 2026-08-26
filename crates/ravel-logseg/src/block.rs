@@ -275,8 +275,14 @@ fn bool_stat(column_id: u32, vals: &[Option<bool>]) -> NumStat {
 
 /// Encodes `rows` into one block per the plans for its dynamic columns.
 ///
-/// `rows` must be non-empty. Columns are emitted in ascending column-id order
-/// (fixed 0..=9, then dynamic in `plans` order) for byte-deterministic output.
+/// `rows` must be non-empty. Columns are emitted in a fixed order for
+/// byte-deterministic output: the fixed columns in field order, then the
+/// dynamic columns in `plans` order (ascending by id). Field order is *not*
+/// ascending by id -- `flags` is column 8 and is staged before
+/// `severity_text`, column 4 -- so the descriptors, and therefore
+/// [`BlockWriteOut::payload`], are not in `column_id` order. Version 4's block
+/// crc is defined over the pages in `column_id` order and is computed while the
+/// row group is placed, not from the payload (ADR-0699 decision 2).
 pub fn write_block(
     rows: &[ResolvedRow],
     plans: &[ColumnPlan],
