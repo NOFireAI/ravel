@@ -370,6 +370,7 @@ pub struct StallingStore {
     hits: AtomicU64,
     gate: Notify,
     released: AtomicBool,
+    stalled: Notify,
 }
 
 impl StallingStore {
@@ -381,12 +382,31 @@ impl StallingStore {
             hits: AtomicU64::new(0),
             gate: Notify::new(),
             released: AtomicBool::new(false),
+            stalled: Notify::new(),
         }
     }
 
     pub fn release(&self) {
         self.released.store(true, Ordering::SeqCst);
         self.gate.notify_waiters();
+    }
+
+    /// Park until the `stall_on`-th matching `put` has entered the stall, so a
+    /// test can act on "the actor is now held mid-flush" as a fact rather than
+    /// sleeping for a while and hoping. Mirrors
+    /// `FaultStore::wait_until_held`. Returns immediately if the stall has
+    /// already been entered.
+    pub async fn wait_until_stalled(&self) {
+        loop {
+            if self.hits.load(Ordering::SeqCst) >= self.stall_on {
+                return;
+            }
+            let notified = self.stalled.notified();
+            if self.hits.load(Ordering::SeqCst) >= self.stall_on {
+                return;
+            }
+            notified.await;
+        }
     }
 
     async fn wait_for_release(&self) {
@@ -414,6 +434,7 @@ impl ObjectStoreBackend for StallingStore {
         if key.contains(self.key_contains.as_str()) {
             let hit = self.hits.fetch_add(1, Ordering::SeqCst) + 1;
             if hit == self.stall_on {
+                self.stalled.notify_waiters();
                 self.wait_for_release().await;
             }
         }

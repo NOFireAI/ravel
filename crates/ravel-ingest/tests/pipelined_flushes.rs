@@ -77,9 +77,12 @@ async fn pipelined_flushes_overlap_and_ack_isolation() {
             .await
     });
 
-    // Give the actor a beat to process acme's write and pin its flush before
-    // globex's write is even sent, so submission order is unambiguous.
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    // Submission order must be unambiguous: the seq assertion at the end of
+    // this test is "acme was pinned first", and a 20 ms sleep here only made
+    // that likely. Acme's flush reaching the held data PUT proves the actor
+    // already processed acme's write and pinned its identity, so globex
+    // cannot be pinned first no matter how the runtime schedules it.
+    gate.wait_until_held(1).await;
 
     let globex_router = Arc::clone(&router);
     let globex_tenant = globex.clone();
@@ -279,7 +282,7 @@ async fn pipelining_reaches_the_full_configured_depth_of_three() {
     let gate = fault_store.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Always);
 
     let mut writes = Vec::new();
-    for t in &tenants {
+    for (i, t) in tenants.iter().enumerate() {
         let router = Arc::clone(&router);
         let t = t.clone();
         writes.push(tokio::spawn(async move {
@@ -291,8 +294,10 @@ async fn pipelining_reaches_the_full_configured_depth_of_three() {
         // Stagger submission so the actor pins each flush's identity before
         // the next tenant's write is even sent; not load-bearing for this
         // test's assertion (unlike the ack-isolation test above), but keeps
-        // the three writes from racing each other into the channel.
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        // the three writes from racing each other into the channel. Waiting
+        // for this tenant's own PUT to reach the gate is what a 10 ms sleep
+        // was approximating.
+        gate.wait_until_held(i + 1).await;
     }
 
     gate.wait_until_held(3).await;

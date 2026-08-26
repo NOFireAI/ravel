@@ -62,9 +62,13 @@ async fn full_channel_blocks_the_producer_instead_of_growing_memory() {
             .await;
     });
 
-    // Give the actor a chance to pick up the first write and block inside
-    // its flush before we start filling the channel behind it.
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    // Wait for the actor to actually be held inside its flush before filling
+    // the channel behind it. Sleeping a fixed 20 ms here made the whole
+    // premise of the test ("the actor has stopped draining") a race: if the
+    // stall had not been entered yet, the actor was still draining and the
+    // channel never filled, so the "one more write blocks" assertion below
+    // would be measuring nothing.
+    stalling.wait_until_stalled().await;
 
     // Fill the channel to its configured depth with buffered writes. This
     // takes one write more than `channel_depth` under pipelined flushes
