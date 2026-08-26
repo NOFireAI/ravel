@@ -2548,14 +2548,18 @@ mod tests {
         const BASE: i64 = 400;
         const CAP: u64 = 256 * 1024;
         const INPUTS: i64 = 2;
-        // The inputs are re-blocked at 100 records so the decode-side term is
-        // the same at both scales (every input carries far more than one
-        // block); at the 8192-record default an input's whole stream would be
-        // one block and the transient term would scale with the corpus, which
-        // is not what this test is about.
+        // The inputs are re-blocked at 100 records and grouped 2 blocks to a
+        // row group so the decode-side term is the same at both scales (every
+        // input carries far more than one row group). Under RLOG version 4 the
+        // merge's fetch and decode unit is a row group, not a block (ADR-0699
+        // decision 1), so the group has to be small enough to bind here just as
+        // the block did before the bump; at the defaults an input's whole
+        // stream would be one group and the transient term would scale with the
+        // corpus, which is not what this test is about.
         const L0_BLOCK: i64 = 100;
-        // At most one decoded block plus two raw blocks per input. Loose on
-        // purpose: the claim under test is the ratio.
+        const L0_GROUP_BLOCKS: usize = 2;
+        // At most one decoded row group plus one raw row group per input. Loose
+        // on purpose: the claim under test is the ratio.
         const TRANSIENT_ALLOWANCE: u64 = 4 * 1024 * 1024;
 
         let mut peaks = Vec::new();
@@ -2573,6 +2577,7 @@ mod tests {
                     &recs,
                     RlogConfig {
                         block_target_records: L0_BLOCK as usize,
+                        group_target_blocks: L0_GROUP_BLOCKS,
                         ..RlogConfig::default()
                     },
                     &[],
