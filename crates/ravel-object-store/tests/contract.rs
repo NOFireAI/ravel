@@ -315,9 +315,8 @@ async fn assert_start_after_listing(store: &dyn ObjectStoreBackend, prefix: &str
     // `start_after` need not be an existing key: the shard-hour prefix strings
     // Ravel passes sort before the first key under them, so nothing is skipped
     // when the marker sorts below the prefix.
-    let before_all = format!("{prefix}");
     assert_eq!(
-        drain_after(store, prefix, Some(&before_all)).await,
+        drain_after(store, prefix, Some(prefix)).await,
         keys,
         "a start_after at/below the prefix excludes no key under it"
     );
