@@ -8,7 +8,8 @@
 //! over the cap, an unknown type byte, or truncation is `Corrupted`.
 
 use crate::error::LogSegError;
-use crate::record::FieldType;
+use crate::record::{FieldSel, FieldType, Predicate};
+use crate::skip_index::NumRangeArm;
 use crate::varint::{get_uvarint, put_uvarint};
 
 /// One FIELD_DIR entry.
@@ -61,6 +62,47 @@ impl FieldDir {
     /// The entry with the given column id, if present.
     pub fn by_column_id(&self, column_id: u32) -> Option<&FieldEntry> {
         self.entries.iter().find(|e| e.column_id == column_id)
+    }
+
+    /// Resolve prune-only [`Predicate::NumRange`] arms to
+    /// [`SkipIndex::candidate_blocks`](crate::skip_index::SkipIndex::
+    /// candidate_blocks) inputs, using this object's own column ids.
+    ///
+    /// Each arm names an attribute and its exact column type; it resolves to the
+    /// dynamic column [`FieldDir::column`] returns for that `(name, type)`. An
+    /// arm whose field does not resolve to such a column -- an unknown name, a
+    /// name stored only under other types, or a non-attribute selector -- yields
+    /// no [`NumRangeArm`] and so prunes nothing, the same degrade-safe
+    /// fallthrough the unindexed POSTINGS field takes (ADR-0013). The bounds pass
+    /// straight through as bit patterns; the range is prune-only, so the exact
+    /// residual stays the caller's job (ADR-0095 decision 6). Non-`NumRange` arms
+    /// (a POSTINGS `Equals`, an `And`) are ignored: they are not skip-index
+    /// pruning primitives.
+    ///
+    /// Shared by [`RlogReader::scan_blocks`](crate::RlogReader::scan_blocks) at
+    /// decode and by the query-side block-range fetcher at fetch, so both resolve
+    /// the exact same arms against the exact same directory (the arms a fetch
+    /// prunes on are byte-for-byte the arms decode prunes on).
+    pub fn numeric_range_arms(&self, prune: &[&Predicate]) -> Vec<NumRangeArm> {
+        let mut out = Vec::new();
+        for a in prune {
+            if let Predicate::NumRange {
+                field: FieldSel::Attr(name),
+                ty,
+                min,
+                max,
+            } = a
+                && let Some(entry) = self.column(name, *ty)
+            {
+                out.push(NumRangeArm {
+                    column_id: entry.column_id,
+                    ty: *ty,
+                    min_bits: *min,
+                    max_bits: *max,
+                });
+            }
+        }
+        out
     }
 
     /// Serializes the section in its uncompressed form.
