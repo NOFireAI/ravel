@@ -271,7 +271,7 @@ and the CAS read/write helpers.
   zero-padded 4 digits.
 - Compaction records, rewrite records, and the retention tombstone live in
   the same `c/<shard>/<ingest_hour>/` prefix as L0 commit records, so the
-  existing one-LIST-per-bucket resolution path discovers every shape without
+  per-shard bounded resolution LIST discovers every shape in one pass, without
   a second LIST. Filenames are disjoint by construction:
   `<writer_id>.<epoch>.<seq>.cmt` (L0 commit), `l1.<input_set_hash16>.cmt`
   (compaction record), `rw.<input_set_hash16>.cmt` (selective-erasure rewrite
@@ -288,7 +288,8 @@ and the CAS read/write helpers.
 - Selective-erasure request and completion records (ADR-0064 decision 1) live
   under a separate `t/<tenant_hash>/<signal>/del/` prefix, not in `c/`, so the
   bucket-resolution LIST never sees them; the resolver LISTs `del/` once per
-  resolve to attach pending predicates (decision 2). A `.dreq` is written
+  resolve to attach pending predicates (decision 2), concurrently with the
+  shard fan-out (issue #730). A `.dreq` is written
   `CreateIfAbsent`, is immutable, necessarily names the subject, and is deleted
   after its `.done` exists plus the protection horizon (decision 5). A `.done`
   is written `CreateIfAbsent`, is immutable, carries no plaintext subject
@@ -679,23 +680,30 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
    ingest_hour bucket overlapping `[range.start_ns - max_ingest_lag, now_ns +
    clock_skew_allowance]` (max_ingest_lag default 2 h, clock_skew_allowance
    default 5 m, config). Two traversals produce the identical key set
-   (ADR-0056); resolve picks between them on the width of the listing suffix:
-   - **Per-bucket loop** (narrow/warm windows): LIST
-     `t/<th>/m/c/<shard>/<hour>/` per bucket (paginated; callers dedup keys).
-     Cost `shard_count * hours`, one LIST per bucket, empty buckets included.
-     Prunes best behind a folded snapshot watermark, which shortens the listed
-     suffix to the post-watermark buckets.
+   (ADR-0056); resolve picks between them on the width of the listing suffix.
+   Both issue one bounded LIST per shard over `t/<th>/m/c/<shard>/`, resuming
+   strictly after the watermark hour via the store's `start_after`
+   (`list_after`, the shard-hour prefix for the first listed hour sorts before
+   every key at or above it), so a folded snapshot's sealed hours below the
+   watermark are skipped server-side rather than paged through. Both group the
+   returned keys client-side by `(shard, ingest_hour)` and keep the buckets in
+   the window; a shard's below-watermark history is never listed by either
+   (issue #730):
+   - **Bounded per-shard fan-out** (narrow/warm windows): the per-shard LISTs
+     run concurrently, and each stops paging at the first key whose hour is
+     past the window end (the `YYYYMMDDTHH` hour strings sort chronologically,
+     so once a past-window key appears every later key in the shard is too).
+     Cost one LIST per shard for the hours above the watermark (plus pagination
+     for a dense tail), independent of how many hours or empty buckets the
+     window spans.
    - **Prefix scan** (wide windows, at or above
-     `prefix_list_crossover_requests` suffix buckets, default 720): one drained
-     recursive LIST per shard over `t/<th>/m/c/<shard>/` (paginated), grouping
-     the returned keys client-side by `(shard, ingest_hour)` and keeping the
-     buckets in the window. Cost `O(objects / page_size)`, independent of
-     window width, so an epoch-width window over a sparse tenant costs a
-     handful of pages instead of one LIST per empty hour. The store's LIST
-     takes only a prefix and a continuation token (no start-after), so the scan
-     reads every key in the shard subtree, including hours the window excludes;
-     those are dropped client-side.
-   Both traversals then partition the keys identically (step 2 onward).
+     `prefix_list_crossover_requests` suffix buckets, default 720): the
+     per-shard LISTs drain sequentially under a page-by-page request cap
+     (`max_catalog_list_requests`), so a pathologically wide window is refused
+     deterministically rather than fanning out unboundedly. Cost
+     `O(objects above the watermark / page_size)`.
+   Both traversals produce the identical key set and partition it identically
+   (step 2 onward).
 2. Partition the listed keys by shape (L0 commit record, compaction
    record, selective-erasure rewrite record, tombstone; ADR-0018, ADR-0019,
    ADR-0064). A key matching none of
@@ -751,8 +759,11 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
    was retired, not lost). Neither found after one retry: error
    `unsatisfiable token`, surfaced as 5xx.
 6. Attach pending selective-erasure predicates (ADR-0064 decision 2). Once
-   per resolve -- independent of the per-bucket fan-out and of whether any
-   physical rewrite has run -- LIST `t/<th>/<sig>/del/` exactly once. For
+   per resolve -- independent of whether any physical rewrite has run -- LIST
+   `t/<th>/<sig>/del/` exactly once. This LIST is started before the shard
+   fan-out and joined with it, so its round trip overlaps the bucket LISTs in
+   one wave rather than following them (issue #730); it still completes before
+   the snapshot is constructed, so the visibility bound below is unchanged. For
    every `.dreq` erasure request found, decode and structurally validate it
    and verify its observed key against its own identity fields (ADR-0010 §7),
    then attach it to the snapshot's `pending_erasure`. `.done` completion
@@ -792,22 +803,24 @@ stay discoverable via the `now`-anchored upper bound.
 The window's upper bound is anchored on `now_ns`, not on `range.end_ns`, so a
 client-supplied `range.start_ns` near the epoch spans one bucket per (shard,
 ingest_hour) from that start all the way to the current hour, regardless of
-how narrow `range.end_ns` is. The per-bucket loop's cost for that is
-`shard_count * hour_buckets`, growing by one every wall-clock hour; the
-prefix scan collapses it to `O(objects / page_size)`, which is exactly why
-resolve switches to the prefix scan for wide windows (ADR-0056).
+how narrow `range.end_ns` is. Both traversals cost one bounded LIST per shard
+for the hours above the watermark (`O(objects above the watermark /
+page_size)`), so a wide-but-sparse window no longer pays one LIST per empty
+hour; resolve switches to the prefix scan for wide windows only for its
+sequential page-by-page request cap (ADR-0056).
 
 `Catalog::estimated_catalog_requests` still reports the per-bucket worst case
 `shard_count * hour_buckets + SNAPSHOT_WINDOW_REQUESTS_UPPER_BOUND`
 (ADR-0044 decision 3): it is a true upper envelope of whichever
-traversal runs (the prefix scan issues strictly fewer requests than the
-per-bucket loop it replaces) and is threaded into the cost accounting. It is
-no longer the admission gate for wide windows. Instead:
+traversal runs (both bounded paths issue at most one LIST per shard per page
+of real objects, strictly fewer than the per-bucket worst case) and is
+threaded into the cost accounting. It is no longer the admission gate for wide
+windows. Instead:
 
-- A window whose per-bucket cost would exceed
+- A window whose per-bucket worst case would exceed
   `CatalogConfig::max_catalog_list_requests` (default 100,000) is routed to
-  the prefix scan rather than refused, because the prefix scan does not
-  amplify one-object-worth-of-data into thousands of empty LISTs.
+  the prefix scan rather than refused, because neither bounded path amplifies
+  one-object-worth-of-data into thousands of empty LISTs.
 - The prefix scan carries a runtime LIST cap at the same ceiling: it aborts
   with `WindowTooWide` before issuing a page that would take it over, so a
   single resolve still never issues more than `max_catalog_list_requests`

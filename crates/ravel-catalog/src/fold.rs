@@ -1785,7 +1785,7 @@ impl Catalog {
     /// Classify one `(shard, hour)` commit bucket's listing into the entries
     /// it should contribute to the snapshot, the single shared classifier for both the incremental fold loop and
     /// the reconcile pass (ADR-0063 section 4). Partitioning the bucket's keys
-    /// by shape mirrors the resolve-time listing (`Catalog::list_hour_bucket`,
+    /// by shape mirrors the resolve-time listing (`Catalog::process_bucket`,
     /// docs/catalog-and-mvcc.md step 2) so a fold and a live resolve derive
     /// identical bucket state.
     ///

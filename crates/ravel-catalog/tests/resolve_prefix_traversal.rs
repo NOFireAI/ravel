@@ -170,6 +170,18 @@ impl ObjectStoreBackend for CountingStore {
         *self.log.n.lock().unwrap() += 1;
         self.inner.list(p, t).await
     }
+    async fn list_after(
+        &self,
+        p: &str,
+        start_after: Option<&str>,
+        t: Option<PageToken>,
+    ) -> Result<ListPage, StoreError> {
+        // Count a start-after page the same as a plain page, and forward to
+        // the inner store's native start-after so a below-watermark skip is
+        // measured as it happens in production, not paged over client-side.
+        *self.log.n.lock().unwrap() += 1;
+        self.inner.list_after(p, start_after, t).await
+    }
     async fn list_delimited(&self, p: &str) -> Result<DelimitedList, StoreError> {
         *self.log.n.lock().unwrap() += 1;
         self.inner.list_delimited(p).await
@@ -269,9 +281,10 @@ async fn differential_paths_return_identical_snapshots() {
     );
 }
 
-/// (b) An epoch-width window issues O(objects) requests on the prefix path,
-/// not one-per-hour. The per-bucket loop over the same window issues one LIST
-/// per bucket. Numbers stated so a reader sees the point.
+/// (b) An epoch-width window issues O(objects) requests on BOTH paths now
+/// (issue #730): the non-prefix path lists one bounded LIST per shard, not one
+/// per (shard, hour), so a 5000-hour window with 4950 empty buckets no longer
+/// amplifies. Numbers stated so a reader sees the point.
 #[tokio::test]
 async fn epoch_window_issues_object_bounded_requests() {
     // Sparse corpus: 50 hours each with one shard-0 record => 50 commit
@@ -307,22 +320,21 @@ async fn epoch_window_issues_object_bounded_requests() {
     assert_eq!(snap_pb, snap_px, "same result on both paths");
     assert_eq!(snap_px.segments.len(), 50);
 
-    // Per-bucket = one LIST per (shard, hour) bucket = 5000 for a 5000-hour
-    // window. Prefix = one page per page_size(1000) objects + terminal =
-    // floor(50/1000)+1 = 1. Independent of the 4950 empty buckets. Each resolve
-    // also issues exactly one `del/` LIST for pending erasure (ADR-0064
-    // decision 2), so both paths carry a +1.
+    // Both paths now list one bounded LIST per shard (shard_count 1 => 1
+    // shard LIST), the 50 objects fitting one page_size(1000) page, plus one
+    // `del/` LIST per resolve for pending erasure (ADR-0064 decision 2) = 2.
+    // Neither path pages the 4950 empty buckets: the non-prefix path issues
+    // one bounded LIST per shard (issue #730), not one per (shard, hour).
     assert_eq!(
         log_pb.count(),
-        5001,
-        "per-bucket loop issues one LIST per bucket (window width in hours) plus the del/ LIST"
+        2,
+        "the non-prefix path issues one bounded LIST per shard plus the del/ LIST, \
+         independent of the 4950 empty buckets"
     );
     assert_eq!(
         log_px.count(),
         2,
-        "prefix scan issues O(objects/page_size) LISTs plus the del/ LIST; here 50 objects at \
-         page_size 1000 = 1 page + 1 del/ LIST, versus the per-bucket loop's {}",
-        log_pb.count()
+        "the prefix scan issues one bounded LIST per shard plus the del/ LIST"
     );
 }
 
