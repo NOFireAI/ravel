@@ -40,6 +40,10 @@ const NS_PER_HOUR: i64 = 3_600_000_000_000;
 /// around a single leaf request, so the fan-out collapses from k sequential
 /// round trips toward ceil(k / this) without ever exceeding it.
 pub(crate) const MAX_CONCURRENT_REQUESTS: usize = 16;
+/// One shard's listed commit-bucket entries, keyed by `(shard, ingest_hour)`,
+/// as produced by [`Catalog::list_shard_hours`] and merged in
+/// [`Catalog::list_window_bounded`].
+type ShardBuckets = HashMap<(u32, u32), Vec<ObjectMeta>>;
 /// Delay before the single retry on an exact `min_token` GET
 /// (docs/catalog-and-mvcc.md step 4: "GET it directly ... with one retry").
 /// `MemoryStore` is strongly consistent so tests never observe this delay;
@@ -1269,42 +1273,52 @@ impl Catalog {
             // future is awaited before the Snapshot is built, so ADR-0064's
             // visibility bound is unchanged.
             let erasure_fut = self.list_pending_erasure(tenant, signal, accounting);
-            let listed = if use_prefix {
-                let (listed, erasure) = tokio::join!(
-                    self.list_window_by_prefix(
-                        tenant,
-                        signal,
-                        listing_start_hour,
-                        window_end_hour,
-                        range,
-                        &generations,
-                        accounting,
-                    ),
-                    erasure_fut,
-                );
-                pending_erasure = Some(erasure?);
-                listed?
+            if listing_start_hour > window_end_hour {
+                // Empty listing suffix: a folded snapshot's watermark covers
+                // the whole window, so there is nothing above it to list. The
+                // former per-(shard, hour) loop's `for hour in start..=end`
+                // range was empty here and issued no LIST; issue none either,
+                // so a fully-folded resolve stays entirely GET-based. Only the
+                // erasure LIST runs.
+                pending_erasure = Some(erasure_fut.await?);
             } else {
-                let (listed, erasure) = tokio::join!(
-                    self.list_window_bounded(
-                        tenant,
-                        signal,
-                        listing_start_hour,
-                        window_end_hour,
-                        range,
-                        suffix_scan_shards,
-                        accounting,
-                    ),
-                    erasure_fut,
-                );
-                pending_erasure = Some(erasure?);
-                listed?
-            };
-            for (key, segment_ref) in listed {
-                if !segments.contains_key(&key) {
-                    origin_by_key.insert(key.clone(), SegmentOrigin::Recent);
+                let listed = if use_prefix {
+                    let (listed, erasure) = tokio::join!(
+                        self.list_window_by_prefix(
+                            tenant,
+                            signal,
+                            listing_start_hour,
+                            window_end_hour,
+                            range,
+                            &generations,
+                            accounting,
+                        ),
+                        erasure_fut,
+                    );
+                    pending_erasure = Some(erasure?);
+                    listed?
+                } else {
+                    let (listed, erasure) = tokio::join!(
+                        self.list_window_bounded(
+                            tenant,
+                            signal,
+                            listing_start_hour,
+                            window_end_hour,
+                            range,
+                            &generations,
+                            accounting,
+                        ),
+                        erasure_fut,
+                    );
+                    pending_erasure = Some(erasure?);
+                    listed?
+                };
+                for (key, segment_ref) in listed {
+                    if !segments.contains_key(&key) {
+                        origin_by_key.insert(key.clone(), SegmentOrigin::Recent);
+                    }
+                    segments.entry(key).or_insert(segment_ref);
                 }
-                segments.entry(key).or_insert(segment_ref);
             }
         }
 
@@ -1498,15 +1512,18 @@ impl Catalog {
     /// full-window resolve over an 8-shard tenant with a 3-hour unsealed tail
     /// costs 8 LISTs, not 24.
     ///
-    /// `scan_shards` is the union scan set over the suffix
-    /// ([`crate::provisioning::max_scan_count_over_range`], the same bound
-    /// [`Catalog::list_window_by_prefix`] uses): a per-shard LIST cannot vary
-    /// its shard bound per hour, so it takes the max over the range, which
-    /// keeps a retiring larger generation's higher shard indices in scope for
-    /// `DEFAULT_SCAN_SLACK_HOURS` past a decrease (ADR-0052 section 4). The
-    /// grouped `(shard, hour)` key set equals the union of the per-bucket
-    /// LISTs, so `process_bucket` runs unchanged and the resolved snapshot is
-    /// identical to both the per-bucket loop and the prefix scan.
+    /// The per-shard LIST bound is the union scan set over the suffix
+    /// ([`crate::provisioning::max_scan_count_over_range`]): a per-shard LIST
+    /// cannot vary its shard bound per hour, so it lists up to the max seen
+    /// over the range. A bucket whose shard index is outside its OWN hour's
+    /// `scan_count` is then dropped before `process_bucket`, so the INCLUDED
+    /// set is exactly the per-`(shard, hour)` loop's -- a retiring larger
+    /// generation's higher shards stay listed only for the hours inside their
+    /// `DEFAULT_SCAN_SLACK_HOURS` window past a decrease, never beyond it
+    /// (ADR-0052 section 4). This makes the resolved snapshot byte-identical to
+    /// the old per-bucket loop; it is NOT the prefix scan, which is a documented
+    /// over-scanning superset (see [`Catalog::list_window_by_prefix`] and
+    /// tests/resharding_prefix_traversal.rs).
     #[allow(clippy::too_many_arguments)]
     async fn list_window_bounded(
         &self,
@@ -1515,31 +1532,51 @@ impl Catalog {
         listing_start_hour: u32,
         window_end_hour: u32,
         range: TimeRange,
-        scan_shards: u32,
+        generations: &[crate::provisioning::ShardGeneration],
         accounting: &QueryAccounting,
     ) -> Result<HashMap<String, SegmentRef>, CatalogError> {
+        // Union scan set over the suffix: the widest per-shard bound any hour
+        // in the range needs (a per-shard LIST cannot vary per hour).
+        let scan_shards = crate::provisioning::max_scan_count_over_range(
+            generations,
+            listing_start_hour,
+            window_end_hour,
+            crate::provisioning::DEFAULT_SCAN_SLACK_HOURS,
+        );
         // One bounded LIST per shard, concurrently under the resolve-wide
         // semaphore (each `list_shard_hours` acquires it per page). Shards
         // partition the key space, so their grouped buckets never collide.
-        let shard_groups: Vec<Result<HashMap<(u32, u32), Vec<ObjectMeta>>, CatalogError>> =
-            stream::iter(0..scan_shards)
-                .map(|shard| {
-                    self.list_shard_hours(
-                        tenant,
-                        signal,
-                        shard,
-                        listing_start_hour,
-                        window_end_hour,
-                        accounting,
-                    )
-                })
-                .buffered(MAX_CONCURRENT_REQUESTS)
-                .collect()
-                .await;
-        let mut grouped: HashMap<(u32, u32), Vec<ObjectMeta>> = HashMap::new();
+        let shard_groups: Vec<Result<ShardBuckets, CatalogError>> = stream::iter(0..scan_shards)
+            .map(|shard| {
+                self.list_shard_hours(
+                    tenant,
+                    signal,
+                    shard,
+                    listing_start_hour,
+                    window_end_hour,
+                    accounting,
+                )
+            })
+            .buffered(MAX_CONCURRENT_REQUESTS)
+            .collect()
+            .await;
+        let mut grouped: ShardBuckets = HashMap::new();
         for shard_group in shard_groups {
-            for (coord, objs) in shard_group? {
-                grouped.entry(coord).or_default().extend(objs);
+            for ((shard, hour), objs) in shard_group? {
+                // Per-hour scan set (ADR-0052 section 4): the union LIST bound
+                // over-scans shard indices that THIS hour does not need (a
+                // retiring generation's higher shards past their slack window).
+                // Drop those buckets so the included set matches the
+                // per-(shard, hour) loop exactly, which never listed them.
+                let hour_scan = crate::provisioning::scan_count(
+                    generations,
+                    hour,
+                    crate::provisioning::DEFAULT_SCAN_SLACK_HOURS,
+                );
+                if shard >= hour_scan {
+                    continue;
+                }
+                grouped.entry((shard, hour)).or_default().extend(objs);
             }
         }
 
@@ -1587,12 +1624,12 @@ impl Catalog {
         listing_start_hour: u32,
         window_end_hour: u32,
         accounting: &QueryAccounting,
-    ) -> Result<HashMap<(u32, u32), Vec<ObjectMeta>>, CatalogError> {
+    ) -> Result<ShardBuckets, CatalogError> {
         let tenant_prefix = format!("t/{}/", tenant.to_hex());
         let prefix = keys::commit_shard_prefix(tenant, signal, shard)?;
         let start_after =
             keys::commit_shard_hour_prefix(tenant, signal, shard, listing_start_hour)?;
-        let mut grouped: HashMap<(u32, u32), Vec<ObjectMeta>> = HashMap::new();
+        let mut grouped: ShardBuckets = HashMap::new();
         let mut seen: HashSet<String> = HashSet::new();
         let mut page_token = None;
         'pages: loop {

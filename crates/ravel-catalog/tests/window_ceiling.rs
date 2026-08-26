@@ -272,9 +272,14 @@ async fn oversized_corpus_trips_the_runtime_cap() {
         }
         other => panic!("expected CatalogError::WindowTooWide, got {other:?}"),
     }
+    // The runtime cap bounds the prefix SCAN at the ceiling. The pending-
+    // erasure LIST (ADR-0064) is a separate, always-one LIST that now overlaps
+    // the scan (issue #730), so it is issued once even on the refuse path;
+    // hence the observed total is at most ceiling + 1, not ceiling.
     assert!(
-        (log.list_count() as u64) <= ceiling,
-        "the runtime cap bounds LISTs at the ceiling ({ceiling}); issued {}",
+        (log.list_count() as u64) <= ceiling + 1,
+        "the runtime cap bounds the prefix scan at the ceiling ({ceiling}), plus \
+         the one overlapping erasure LIST; issued {}",
         log.list_count()
     );
 }
