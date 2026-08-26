@@ -1493,9 +1493,11 @@ applies: each row carries reads per segment and bytes fetched over dataset
 bytes, derived in the report rather than left to the reader. For a
 block-predicate-free statement whose window contains every relevant segment —
 the report's `SELECT ts, body FROM logs`, and the shape the whole-segment fast
-path serves (#693 part 3, amended by #739) — those two figures are 1 and about
-1.0 at every partition count that fits inside the segment count, on both read
-shapes and with or without a cache: since #739 dropped the block-range-threshold
+path serves (#693 part 3, amended by #739) — those two figures are about 1
+(the reads figure divides every accounted GET by the segment count, so the
+resolve's one catalog probe lifts it slightly above 1: 1.03 on the 32-segment
+fixture) and 1.0 at every partition count that fits inside the segment count,
+on both read shapes and with or without a cache: since #739 dropped the block-range-threshold
 conjunct, object size no longer gates the fast path, so the plan phase is skipped
 and each segment is read whole once, and there is nothing left for the cache to
 absorb. The multiplier reappears only on the cache-wired row whose partition
