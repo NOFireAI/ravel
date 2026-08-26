@@ -100,7 +100,7 @@ pub struct NumRangeArm {
 /// `null_count` is a `u32` and the sum can exceed it (up to 64 children each with
 /// a `u32` `record_count`); `saturating_add` clamps at `u32::MAX`, which the doc
 /// defines as a saturated lower bound.
-fn merge_stats(children: &[Level0Entry]) -> Vec<NumStat> {
+pub fn merge_stats(children: &[Level0Entry]) -> Vec<NumStat> {
     let mut merged: Vec<NumStat> = Vec::new();
     for child in children {
         for s in &child.stats {

@@ -46,8 +46,9 @@ use crate::fetcher::ReadCache;
 use bytes::Bytes;
 use ravel_cache::{CacheKey, SingleFlightError, Source};
 use ravel_catalog::SegmentRef;
+use ravel_logseg::block::NumStat;
 use ravel_logseg::footer::{self, SectionDesc, kind};
-use ravel_logseg::skip_index::SkipIndex;
+use ravel_logseg::skip_index::{Level0Entry, SkipIndex, merge_stats};
 use ravel_logseg::stream_dir::StreamDir;
 use ravel_logseg::{
     AttrValue, BlockScan, ColumnSelection, ColumnarBlockView, LogRecord, LogSegError, LogStreamId,
@@ -224,6 +225,57 @@ impl LogQuery {
         } = self;
         content.is_empty() && prune.is_empty() && stream_attrs.is_empty() && erasure.is_empty()
     }
+}
+
+/// Exact per-block figures for one segment, derived from its SKIP_IDX alone
+/// (#698 deliverable 2, ADR-0699): how many records sit in blocks the query
+/// window fully contains, the merged per-numeric-column stats over exactly those
+/// blocks, and the indices of the blocks the window only partially overlaps.
+///
+/// Everything here is exact, not an estimate. A block whose `[min_ts, max_ts]`
+/// lies inside `[query.ts_min_ns, query.ts_max_ns]` contributes every one of its
+/// records to the answer, so its stored `record_count` and its stored
+/// [`NumStat`]s are the truth for it and no block byte has to move. A block the
+/// window merely clips contributes an unknown subset, so it is named in
+/// `partial_block_indices` and left for the caller to decode. A block the window
+/// misses entirely contributes nothing and appears nowhere.
+///
+/// # No production caller yet
+///
+/// Nothing in this commit calls
+/// [`plan_segment_block_stats`](LogSegmentFetcher::plan_segment_block_stats).
+/// The caller is #698 deliverable 1 (fleet task ca9c1b10): `ravel_sql`'s
+/// `LogsScanExec::statistics`, which feeds DataFusion's `AggregateStatistics`
+/// so a `COUNT(*)`/`MIN`/`MAX` over a segment can be answered from the plan
+/// instead of a scan. Until that lands the epic capability is NOT reachable end
+/// to end.
+///
+/// ADR-0699's RLOG row groups plus PAGE_DIR make "read only the footer, the skip
+/// index, and the page directory" structural for every statement on the next
+/// format version. This type is the version-3 equivalent of that read, reachable
+/// today against the format on disk.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BlockStatsReport {
+    /// Summed `record_count` over every block the query window fully contains.
+    /// Exact: containment means no row of those blocks is filtered out by the ts
+    /// range, and the fail-closed conditions on
+    /// [`plan_segment_block_stats`](LogSegmentFetcher::plan_segment_block_stats)
+    /// guarantee nothing else can filter one either.
+    pub record_count: u64,
+    /// [`ravel_logseg::skip_index::merge_stats`] over exactly the fully
+    /// contained blocks' [`Level0Entry`] values, with that function's own
+    /// semantics unchanged: `FieldType`-aware `total_cmp` min/max, OR-ed
+    /// `has_nan`, and a `null_count` that folds in the whole `record_count` of
+    /// any contained block carrying no stat for the column (no entry means the
+    /// block is all-null for it).
+    pub stats: Vec<NumStat>,
+    /// Indices into `SkipIndex::l0` of every block that overlaps the query
+    /// window without being contained by it. The caller decodes these itself and
+    /// adds their contribution to the figures above. The length is whatever the
+    /// segment's block spans produce: a ts-ordered segment yields at most one at
+    /// each end, but RLOG sorts rows by `(stream_ref, ts)`, so a multi-stream
+    /// segment interleaves spans and can yield many more.
+    pub partial_block_indices: Vec<usize>,
 }
 
 /// The records matching one fetch, plus the reader's own scan pruning counters.
@@ -972,6 +1024,116 @@ impl LogSegmentFetcher {
         Ok((n, plan_stats))
     }
 
+    /// Report this segment's exact per-block record counts and per-numeric-column
+    /// min/max/null_count for `query`, from the footer and SKIP_IDX alone (#698
+    /// deliverable 2, ADR-0699). No BLOCKS byte is fetched and no block is
+    /// decoded: the answer comes out of the skip index the ADR-0107 probe already
+    /// has to read.
+    ///
+    /// See [`BlockStatsReport`] for what the three fields mean. Blocks the query
+    /// window fully contains are answered here in full; blocks it only clips are
+    /// named in `partial_block_indices` for the caller to decode; blocks it
+    /// misses contribute nothing.
+    ///
+    /// # No production caller yet
+    ///
+    /// Nothing in this commit calls this method. #698 deliverable 1 (fleet task
+    /// ca9c1b10) is the follow-up that wires it into `ravel_sql`'s
+    /// `LogsScanExec::statistics` / `AggregateStatistics`. Until that lands the
+    /// epic capability is NOT reachable end to end.
+    ///
+    /// # Fail-closed conditions
+    ///
+    /// `Ok(None)` means "no fast path, fall back to a real scan". It is returned,
+    /// without any GET, when:
+    ///
+    /// - [`ts_range_relevant`](Self::ts_range_relevant) proves the catalog
+    ///   summary irrelevant to the query window, the same pre-check
+    ///   [`plan_segment`](Self::plan_segment) and
+    ///   [`tenant_bytes`](Self::tenant_bytes) already apply;
+    /// - the query carries any block-level predicate, i.e.
+    ///   [`is_block_predicate_free`](LogQuery::is_block_predicate_free) is false:
+    ///   a non-empty `erasure`, `content`, `prune`, or `stream_attrs`. Each of
+    ///   those can exclude rows a contained block's stored `record_count` counts,
+    ///   so the stored figures would over-report. Erasure is included even though
+    ///   it filters rows rather than blocks, for exactly that reason: an erased
+    ///   row is still counted in the block's `record_count`;
+    /// - `seg_ref.object_size <= self.block_range_threshold`. The read pays off
+    ///   only above the threshold, mirroring
+    ///   [`plan_segment_fast`](Self::plan_segment_fast)'s own gate: at or below
+    ///   it, the whole-object funnel already takes one GET, and
+    ///   [`BlockRangeFetcher::fetch_skip_index`] has no whole-object crossover of
+    ///   its own, so it would read the same object under a second cache key.
+    ///
+    /// The ts range itself is NOT a fail-closed condition. Unlike
+    /// [`plan_segment`](Self::plan_segment)'s fast path this does not need the
+    /// window to contain the whole segment: a window that only clips it still
+    /// gets exact figures for the blocks it does contain, plus the partial
+    /// blocks named.
+    pub async fn plan_segment_block_stats(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        query: &LogQuery,
+        accounting: &QueryAccounting,
+    ) -> Result<Option<BlockStatsReport>, LogFetchError> {
+        if !Self::ts_range_relevant(seg_ref, query.ts_min_ns, query.ts_max_ns) {
+            return Ok(None);
+        }
+        if !query.is_block_predicate_free() {
+            return Ok(None);
+        }
+        if seg_ref.object_size <= self.block_range_threshold {
+            return Ok(None);
+        }
+
+        // The `page_fetch` phase span the other plan paths carry, so the trace
+        // shows the probe and the one section GET this path issues. `s3_bytes`
+        // reports block bytes only, which are structurally zero here; the
+        // directory-overhead bytes are recorded in `accounting`.
+        let fetch_span = tracing::debug_span!(
+            "page_fetch",
+            signal = "logs",
+            s3_requests = tracing::field::Empty,
+            s3_bytes = tracing::field::Empty,
+        );
+        let (skip, stats) = async {
+            self.block_range
+                .fetch_skip_index(seg_ref, tenant_hash, accounting)
+                .await
+        }
+        .instrument(fetch_span.clone())
+        .await?;
+        let requests = stats.probe_gets + stats.metadata_gets + stats.block_range_gets;
+        fetch_span.record("s3_requests", requests);
+        fetch_span.record("s3_bytes", stats.block_bytes_fetched);
+
+        let (ts_min, ts_max) = (query.ts_min_ns, query.ts_max_ns);
+        let mut record_count = 0u64;
+        let mut contained: Vec<Level0Entry> = Vec::new();
+        let mut partial_block_indices = Vec::new();
+        for (i, entry) in skip.l0.iter().enumerate() {
+            // Containment is inclusive at both ends, the same convention
+            // `plan_segment`'s fast path applies to the whole-segment span.
+            if ts_min <= entry.min_ts && entry.max_ts <= ts_max {
+                record_count += u64::from(entry.record_count);
+                contained.push(entry.clone());
+            } else if entry.max_ts >= ts_min && entry.min_ts <= ts_max {
+                // Overlaps but is not contained: an unknown subset of its rows
+                // matches, so only the caller's own decode can settle it. A block
+                // disjoint from the window falls through both arms and
+                // contributes nothing, which is correct and not an omission.
+                partial_block_indices.push(i);
+            }
+        }
+
+        Ok(Some(BlockStatsReport {
+            record_count,
+            stats: merge_stats(&contained),
+            partial_block_indices,
+        }))
+    }
+
     /// [`scan_accounted_with_tenant`](Self::scan_accounted_with_tenant),
     /// restricted to the surviving blocks at the positions in `indices`
     /// (intra-segment scan partitioning, ADR-0102). Same GET, same cache, same
@@ -1444,6 +1606,24 @@ impl ObjectAssembler {
     }
 }
 
+/// `[offset, offset + len)` sliced out of whichever already-fetched region
+/// wholly contains it, or `None` when no region does. The regions are the
+/// `(start, bytes)` pairs [`BlockRangeFetcher::probe_footer`] left resident;
+/// this is [`ObjectAssembler::covers`] + [`ObjectAssembler::slice`] for a read
+/// that never builds an object-sized buffer.
+fn resident_slice(regions: &[(u64, Bytes)], offset: u64, len: u64) -> Option<Bytes> {
+    let end = offset.checked_add(len)?;
+    regions.iter().find_map(|(start, bytes)| {
+        let region_end = start.checked_add(bytes.len() as u64)?;
+        if *start > offset || end > region_end {
+            return None;
+        }
+        let rel = usize::try_from(offset - start).ok()?;
+        let rel_end = rel.checked_add(usize::try_from(len).ok()?)?;
+        Some(bytes.slice(rel..rel_end))
+    })
+}
+
 fn corrupt_range(key: &str) -> LogFetchError {
     LogFetchError::Corrupt {
         key: key.to_string(),
@@ -1707,9 +1887,34 @@ impl BlockRangeFetcher {
         tenant_hash: TenantHash,
         accounting: &QueryAccounting,
     ) -> Result<(footer::LogFooter, BlockRangeStats), LogFetchError> {
-        let key = seg_ref.data_object_key.as_str();
         let mut stats = BlockRangeStats::default();
         let pin = EtagPin::default();
+        let (footer, _resident) = self
+            .probe_footer(seg_ref, tenant_hash, &pin, accounting, &mut stats)
+            .await?;
+        Ok((footer, stats))
+    }
+
+    /// The probe half [`fetch_footer`](Self::fetch_footer) and
+    /// [`fetch_skip_index`](Self::fetch_skip_index) share: the ADR-0107
+    /// etag-establishing suffix GET, plus one footer-range chase when the suffix
+    /// did not cover the whole footer, both counted into `stats.probe_gets`.
+    ///
+    /// The second element is every absolute region this call left resident,
+    /// as `(start, bytes)` pairs. A caller reading a further section can slice it
+    /// from one of those instead of issuing a GET the probe already paid for,
+    /// which is the same "already covered" short circuit
+    /// [`place_section`](Self::place_section) gets from [`ObjectAssembler`]
+    /// without materializing an object-sized buffer for a directory-only read.
+    async fn probe_footer(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        pin: &EtagPin,
+        accounting: &QueryAccounting,
+        stats: &mut BlockRangeStats,
+    ) -> Result<(footer::LogFooter, Vec<(u64, Bytes)>), LogFetchError> {
+        let key = seg_ref.data_object_key.as_str();
         let total_size = seg_ref.object_size;
 
         let suffix = self.suffix_len.min(total_size);
@@ -1721,13 +1926,14 @@ impl BlockRangeFetcher {
                 probe_start,
                 suffix,
                 GetRange::Suffix(suffix),
-                &pin,
+                pin,
                 accounting,
             )
             .await?;
         if probe_live {
             stats.probe_gets = 1;
         }
+        let mut resident = vec![(probe_start, probe_bytes.clone())];
 
         let footer = match open_from_suffix(&probe_bytes, total_size)
             .map_err(|source| corrupt(key, source))?
@@ -1741,13 +1947,14 @@ impl BlockRangeFetcher {
                         offset,
                         len,
                         GetRange::Range(offset, offset + len),
-                        &pin,
+                        pin,
                         accounting,
                     )
                     .await?;
                 if live {
                     stats.probe_gets += 1;
                 }
+                resident.push((offset, bytes.clone()));
                 match open_from_suffix(&bytes, total_size).map_err(|source| corrupt(key, source))? {
                     SuffixOutcome::Ready(footer) => footer,
                     SuffixOutcome::NeedRange { .. } => {
@@ -1759,7 +1966,79 @@ impl BlockRangeFetcher {
                 }
             }
         };
-        Ok((footer, stats))
+        Ok((footer, resident))
+    }
+
+    /// Fetch and decode just the SKIP_IDX section: the same ADR-0107 probe
+    /// [`fetch_footer`](Self::fetch_footer) issues, then the one section the
+    /// footer's directory locates it at, reading no BLOCKS byte and no other
+    /// directory section. Returns the decoded index and the read's
+    /// [`BlockRangeStats`] (`probe_gets` for the probe, `metadata_gets` for the
+    /// SKIP_IDX section GET when the probe did not already cover it; the block
+    /// counters stay zero).
+    ///
+    /// This is one section further than [`fetch_footer`](Self::fetch_footer) and
+    /// stops exactly where [`fetch_object`](Self::fetch_object) diverges: that
+    /// method decodes SKIP_IDX for the same reason, then goes on to resolve
+    /// candidate extents, weigh the coverage crossover, and fetch blocks. Nothing
+    /// here does any of that -- the caller
+    /// ([`LogSegmentFetcher::plan_segment_block_stats`]) wants the index's own
+    /// per-block figures, not the blocks they describe.
+    ///
+    /// The section GET is cache-routed through [`Self::cached_extent`] on the
+    /// section's own extent, the same key
+    /// [`place_section`](Self::place_section) uses, so a later block-range fetch
+    /// of the same segment hits the cached entry rather than re-fetching it.
+    /// Each call creates its own [`EtagPin`]; pins are not shared across calls.
+    ///
+    /// The caller guarantees `seg_ref.object_size > self.block_range_threshold`,
+    /// for the reason [`fetch_footer`](Self::fetch_footer) documents: this method
+    /// has no whole-object crossover of its own, so below that threshold it would
+    /// read the object under a different cache key than the whole-object path
+    /// uses, costing a GET instead of saving one.
+    pub async fn fetch_skip_index(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        accounting: &QueryAccounting,
+    ) -> Result<(SkipIndex, BlockRangeStats), LogFetchError> {
+        let key = seg_ref.data_object_key.as_str();
+        let mut stats = BlockRangeStats::default();
+        let pin = EtagPin::default();
+        let (footer, resident) = self
+            .probe_footer(seg_ref, tenant_hash, &pin, accounting, &mut stats)
+            .await?;
+
+        let skip_desc = footer
+            .section(kind::SKIP_IDX)
+            .ok_or_else(|| corrupt(key, LogSegError::Corrupted("missing SKIP_IDX".into())))?;
+
+        let stored = match resident_slice(&resident, skip_desc.offset, skip_desc.len) {
+            Some(bytes) => bytes,
+            None => {
+                let (start, end) = (skip_desc.offset, skip_desc.offset + skip_desc.len);
+                let (bytes, live) = self
+                    .cached_extent(
+                        seg_ref,
+                        tenant_hash,
+                        skip_desc.offset,
+                        skip_desc.len,
+                        GetRange::Range(start, end),
+                        &pin,
+                        accounting,
+                    )
+                    .await?;
+                if live {
+                    stats.metadata_gets += 1;
+                }
+                bytes
+            }
+        };
+
+        let raw =
+            decode_section(&stored, skip_desc, &self.cfg).map_err(|source| corrupt(key, source))?;
+        let skip = SkipIndex::decode(&raw, MAX_BLOCKS).map_err(|source| corrupt(key, source))?;
+        Ok((skip, stats))
     }
 
     /// Fetch one segment's object as an assembled, decode-ready buffer, reading
@@ -2904,5 +3183,737 @@ mod plan_fast_path_tests {
             acc.snapshot().total_s3_bytes() > tail,
             "at-threshold: block-range fetch ran, not the footer-only probe"
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod plan_block_stats_tests {
+    //! Tests for the SKIP_IDX-only block-stats fast path (#698 deliverable 2):
+    //! [`LogSegmentFetcher::plan_segment_block_stats`] answers a segment's exact
+    //! per-block record count and per-numeric-column min/max/null_count from the
+    //! footer plus the SKIP_IDX section, fetching no BLOCKS byte.
+    //!
+    //! The baselines here are computed by fully decoding the same fixture's
+    //! blocks through the ordinary reader path
+    //! ([`LogSegmentScan::next_block`], one `Vec<LogRecord>` per block) and
+    //! folding the records by hand. Nothing in a baseline reads the skip index,
+    //! so a wrong stored stat or a wrong containment rule shows up as a
+    //! mismatch rather than cancelling out.
+
+    use super::*;
+    use async_trait::async_trait;
+    use ravel_catalog::SegmentLevel;
+    use ravel_logseg::field_dir::FieldDir;
+    use ravel_logseg::writer::ObjectIdentity;
+    use ravel_logseg::{FieldType, RlogWriter, read_section, stream_attrs_bytes};
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_object_store::{
+        Capabilities, DelimitedList, ListPage, ObjectMeta, PageToken, PutOptions, PutOutcome,
+    };
+    use ravel_types::logstream::log_stream_id;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use uuid::Uuid;
+
+    const TENANT: TenantHash = TenantHash([7u8; 16]);
+    const CONTENT_HASH: [u8; 32] = [9u8; 32];
+    const KEY: &str = "t/stats.rlog";
+    /// The numeric attribute names the fixtures put on their records. `latency`
+    /// is F64 (negative values and a NaN, so a naive `u64`-bits fold disagrees
+    /// with `merge_stats`'s `total_cmp` one) and `code` is I64 (negative too).
+    const LATENCY: &str = "latency";
+    const CODE: &str = "code";
+
+    /// Counts `get` calls and records the range of each, so a test can pin both
+    /// how many reads happened and which bytes they covered. Everything else
+    /// delegates to the inner [`MemoryStore`].
+    struct RangeRecordingStore {
+        inner: Arc<MemoryStore>,
+        gets: AtomicU64,
+        ranges: Mutex<Vec<GetRange>>,
+    }
+
+    impl RangeRecordingStore {
+        fn new(inner: Arc<MemoryStore>) -> Self {
+            RangeRecordingStore {
+                inner,
+                gets: AtomicU64::new(0),
+                ranges: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn get_count(&self) -> u64 {
+            self.gets.load(Ordering::SeqCst)
+        }
+
+        fn ranges(&self) -> Vec<GetRange> {
+            self.ranges.lock().expect("ranges lock").clone()
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStoreBackend for RangeRecordingStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            self.gets.fetch_add(1, Ordering::SeqCst);
+            self.ranges.lock().expect("ranges lock").push(range);
+            self.inner.get(key, range).await
+        }
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+        async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                multipart: false,
+                ..self.inner.capabilities()
+            }
+        }
+    }
+
+    fn identity() -> ObjectIdentity {
+        ObjectIdentity {
+            tenant_hash: [7u8; 16],
+            shard: 0,
+            writer_id: [2u8; 16],
+            writer_epoch: 1,
+            writer_seq: 1,
+        }
+    }
+
+    /// One record on stream `service`, carrying the two numeric attributes when
+    /// `nums` is `Some`. A record built with `None` resolves neither name (no
+    /// stream layer carries them either), so it counts only in `null_count`.
+    fn record(service: &str, ts: i64, nums: Option<(f64, i64)>) -> LogRecord {
+        let resource = vec![(
+            "service.name".to_string(),
+            AttrValue::Str(service.to_string()),
+        )];
+        let attrs = match nums {
+            Some((latency, code)) => vec![
+                (LATENCY.to_string(), AttrValue::F64(latency)),
+                (CODE.to_string(), AttrValue::I64(code)),
+            ],
+            None => Vec::new(),
+        };
+        LogRecord {
+            stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+            stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+            ts_ns: ts,
+            observed_ts_ns: ts,
+            severity_num: 9,
+            severity_text: "INFO".into(),
+            body: "hello world".into(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs,
+        }
+    }
+
+    /// Two records per block, so a block can hold a NaN row alongside a row with
+    /// a real value. That matters: a block whose only `latency` row is NaN gets
+    /// `min_bits == max_bits == 0` from the writer (`f64_stat`'s `unwrap_or(0)`),
+    /// which would fold `+0.0` into the merged bounds and make the hand baseline
+    /// below wrong for a reason that has nothing to do with this fast path.
+    fn build_object(records: &[LogRecord]) -> Vec<u8> {
+        let cfg = RlogConfig {
+            block_target_records: 2,
+            ..RlogConfig::default()
+        };
+        let mut w = RlogWriter::new(cfg, identity());
+        for r in records {
+            w.push(r.clone()).expect("push");
+        }
+        w.finish().expect("finish")
+    }
+
+    fn seg_ref(size: u64, records: &[LogRecord]) -> SegmentRef {
+        let min = records.iter().map(|r| r.ts_ns).min().expect("nonempty");
+        let max = records.iter().map(|r| r.ts_ns).max().expect("nonempty");
+        SegmentRef {
+            data_object_key: KEY.to_string(),
+            object_size: size,
+            min_event_ts_ns: min,
+            max_event_ts_ns: max,
+            ingest_hour_bucket: 0,
+            sample_count: records.len() as u64,
+            series_count: 0,
+            shard: 0,
+            content_hash: CONTENT_HASH,
+            writer_id: Uuid::from_u128(1),
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+        }
+    }
+
+    /// The object's footer+trailer byte length. A probe suffix of exactly this
+    /// covers the footer with no range chase and reaches no other section, so
+    /// SKIP_IDX costs its own measurable GET.
+    fn footer_region_len(bytes: &[u8]) -> u64 {
+        let trailer = &bytes[bytes.len() - footer::TRAILER_LEN..];
+        let footer_len = u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
+        u64::from(footer_len) + footer::TRAILER_LEN as u64
+    }
+
+    /// The absolute `[start, end)` of the object's BLOCKS and SKIP_IDX sections.
+    fn section_extents(bytes: &[u8]) -> ((u64, u64), (u64, u64)) {
+        let f = footer::open(bytes).expect("footer");
+        let b = f.section(kind::BLOCKS).expect("BLOCKS");
+        let s = f.section(kind::SKIP_IDX).expect("SKIP_IDX");
+        ((b.offset, b.offset + b.len), (s.offset, s.offset + s.len))
+    }
+
+    /// `(latency_column_id, code_column_id)` from the object's FIELD_DIR. A
+    /// name-to-id lookup, independent of anything the fast path computes.
+    fn numeric_column_ids(bytes: &[u8]) -> (u32, u32) {
+        let f = footer::open(bytes).expect("footer");
+        let desc = f.section(kind::FIELD_DIR).expect("FIELD_DIR");
+        let raw = read_section(bytes, desc, &RlogConfig::default()).expect("field dir raw");
+        let dir = FieldDir::decode(&raw, 1 << 20).expect("field dir decode");
+        (
+            dir.column(LATENCY, FieldType::F64)
+                .expect("latency column")
+                .column_id,
+            dir.column(CODE, FieldType::I64)
+                .expect("code column")
+                .column_id,
+        )
+    }
+
+    async fn store_with_object(bytes: Vec<u8>) -> Arc<MemoryStore> {
+        let store = Arc::new(MemoryStore::new());
+        store
+            .put(KEY, Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("put");
+        store
+    }
+
+    /// A fetcher whose probe reads exactly the footer region, so SKIP_IDX is a
+    /// distinct, countable GET and no read can accidentally cover a block.
+    /// `block_range_threshold = 0` puts every nonempty fixture above the gate.
+    fn fetcher(store: Arc<dyn ObjectStoreBackend>, probe: u64) -> LogSegmentFetcher {
+        LogSegmentFetcher::new(store.clone())
+            .with_block_range_threshold(0)
+            .with_block_range(
+                BlockRangeFetcher::new(store)
+                    .with_suffix_len(probe)
+                    .with_whole_object_threshold(0),
+            )
+    }
+
+    /// One block as the reader actually decodes it: its rows' ts span and their
+    /// resolved numeric attribute values. This is the baseline side of every
+    /// assertion below and reads no skip-index byte.
+    #[derive(Debug)]
+    struct DecodedBlock {
+        min_ts: i64,
+        max_ts: i64,
+        records: Vec<LogRecord>,
+    }
+
+    /// Fully decodes the object block by block through the ordinary scan path.
+    /// The query is predicate-free over the whole ts axis, so nothing is pruned
+    /// and the yielded blocks are the segment's blocks in `SkipIndex::l0` order.
+    async fn decode_blocks(
+        store: Arc<dyn ObjectStoreBackend>,
+        seg: &SegmentRef,
+    ) -> Vec<DecodedBlock> {
+        let f = LogSegmentFetcher::new(store);
+        let acc = QueryAccounting::new();
+        let mut scan = f
+            .scan_accounted_with_tenant(
+                seg,
+                TENANT,
+                &LogQuery::new(i64::MIN, i64::MAX),
+                &ColumnSelection::all(),
+                &acc,
+            )
+            .await
+            .expect("scan")
+            .expect("relevant");
+        let mut out = Vec::new();
+        while let Some(records) = scan.next_block().expect("next_block") {
+            let min_ts = records
+                .iter()
+                .map(|r| r.ts_ns)
+                .min()
+                .expect("nonempty block");
+            let max_ts = records
+                .iter()
+                .map(|r| r.ts_ns)
+                .max()
+                .expect("nonempty block");
+            out.push(DecodedBlock {
+                min_ts,
+                max_ts,
+                records,
+            });
+        }
+        out
+    }
+
+    /// The hand-folded expectation over the decoded blocks a `[ts_min, ts_max]`
+    /// window fully contains: total record count, the two numeric columns'
+    /// bounds/null counts/NaN flags, and the indices of the blocks the window
+    /// only clips.
+    #[derive(Debug, PartialEq)]
+    struct Baseline {
+        record_count: u64,
+        latency_min: f64,
+        latency_max: f64,
+        latency_nulls: u32,
+        latency_has_nan: bool,
+        code_min: i64,
+        code_max: i64,
+        code_nulls: u32,
+        partial: Vec<usize>,
+    }
+
+    fn attr_f64(rec: &LogRecord, name: &str) -> Option<f64> {
+        rec.attrs.iter().find_map(|(k, v)| match v {
+            AttrValue::F64(f) if k == name => Some(*f),
+            _ => None,
+        })
+    }
+
+    fn attr_i64(rec: &LogRecord, name: &str) -> Option<i64> {
+        rec.attrs.iter().find_map(|(k, v)| match v {
+            AttrValue::I64(i) if k == name => Some(*i),
+            _ => None,
+        })
+    }
+
+    /// Folds `blocks` by hand under the SAME containment rule the fast path is
+    /// supposed to use, with `contains` supplied by the caller so a test can
+    /// deliberately fold under the WRONG rule (overlap instead of containment)
+    /// and show the assertion failing.
+    fn baseline(blocks: &[DecodedBlock], ts_min: i64, ts_max: i64) -> Baseline {
+        let mut record_count = 0u64;
+        let mut latency_min = f64::INFINITY;
+        let mut latency_max = f64::NEG_INFINITY;
+        let mut latency_nulls = 0u32;
+        let mut latency_has_nan = false;
+        let mut code_min = i64::MAX;
+        let mut code_max = i64::MIN;
+        let mut code_nulls = 0u32;
+        let mut partial = Vec::new();
+        for (i, b) in blocks.iter().enumerate() {
+            if ts_min <= b.min_ts && b.max_ts <= ts_max {
+                record_count += b.records.len() as u64;
+                for rec in &b.records {
+                    match attr_f64(rec, LATENCY) {
+                        // NaN is counted in `has_nan` and excluded from the
+                        // bounds (ADR-0095), and is NOT a null.
+                        Some(v) if v.is_nan() => latency_has_nan = true,
+                        Some(v) => {
+                            if v.total_cmp(&latency_min).is_lt() {
+                                latency_min = v;
+                            }
+                            if v.total_cmp(&latency_max).is_gt() {
+                                latency_max = v;
+                            }
+                        }
+                        None => latency_nulls += 1,
+                    }
+                    match attr_i64(rec, CODE) {
+                        Some(v) => {
+                            code_min = code_min.min(v);
+                            code_max = code_max.max(v);
+                        }
+                        None => code_nulls += 1,
+                    }
+                }
+            } else if b.max_ts >= ts_min && b.min_ts <= ts_max {
+                partial.push(i);
+            }
+        }
+        Baseline {
+            record_count,
+            latency_min,
+            latency_max,
+            latency_nulls,
+            latency_has_nan,
+            code_min,
+            code_max,
+            code_nulls,
+            partial,
+        }
+    }
+
+    /// Reads the report's two numeric stats back into the baseline's shape.
+    fn as_baseline(report: &BlockStatsReport, latency_col: u32, code_col: u32) -> Baseline {
+        let latency = report
+            .stats
+            .iter()
+            .find(|s| s.column_id == latency_col)
+            .expect("latency stat");
+        let code = report
+            .stats
+            .iter()
+            .find(|s| s.column_id == code_col)
+            .expect("code stat");
+        Baseline {
+            record_count: report.record_count,
+            latency_min: f64::from_bits(latency.min_bits),
+            latency_max: f64::from_bits(latency.max_bits),
+            latency_nulls: latency.null_count,
+            latency_has_nan: latency.has_nan,
+            code_min: code.min_bits as i64,
+            code_max: code.max_bits as i64,
+            code_nulls: code.null_count,
+            partial: report.partial_block_indices.clone(),
+        }
+    }
+
+    /// Fixture A: one stream, ts 0..=9, two records per block, so five
+    /// ts-ordered blocks `[0,1] [2,3] [4,5] [6,7] [8,9]`. The window `[1, 8]`
+    /// contains the middle three and clips exactly one at each end -- the
+    /// realistic two-partial case.
+    ///
+    /// The numeric payload is chosen so a wrong fold is visible rather than
+    /// coincidentally right: block `[2,3]` carries `-2.5` and a NaN, block
+    /// `[4,5]` carries `7.5` and `1.0`, block `[6,7]` carries no numeric
+    /// attribute at all (so `merge_stats`'s "no entry means the whole block is
+    /// null" arm has to fire), and the two clipped blocks carry `1000.0`/`999`
+    /// -- values that appear in the answer only if containment is wrong.
+    fn fixture_a() -> Vec<LogRecord> {
+        vec![
+            record("api", 0, Some((1000.0, 999))),
+            record("api", 1, Some((1000.0, 999))),
+            record("api", 2, Some((-2.5, -7))),
+            record("api", 3, Some((f64::NAN, 3))),
+            record("api", 4, Some((7.5, 5))),
+            record("api", 5, Some((1.0, 9))),
+            record("api", 6, None),
+            record("api", 7, None),
+            record("api", 8, Some((1000.0, 999))),
+            record("api", 9, Some((1000.0, 999))),
+        ]
+    }
+
+    /// Fixture B: three streams, four records each, two records per block. RLOG
+    /// sorts rows by `(stream_ref, ts)` before cutting blocks, so each stream
+    /// contributes two blocks and the six blocks' ts spans interleave rather
+    /// than forming one ordered sequence:
+    /// `[0,10] [100,110]`, `[5,15] [105,115]`, `[2,12] [102,112]`.
+    /// The window `[4, 110]` contains two of them and clips FOUR, which is what
+    /// makes a `partial_block_indices` hardcoded to the two-partial shape wrong.
+    fn fixture_b() -> Vec<LogRecord> {
+        let mut out = Vec::new();
+        for (service, tss) in [
+            ("api", [0i64, 10, 100, 110]),
+            ("worker", [5, 15, 105, 115]),
+            ("cron", [2, 12, 102, 112]),
+        ] {
+            for ts in tss {
+                out.push(record(service, ts, Some((ts as f64, ts))));
+            }
+        }
+        out
+    }
+
+    /// The fast path's `record_count` and merged `stats` equal a baseline folded
+    /// by hand over the same blocks decoded through the ordinary reader, and the
+    /// read that produced them is exactly the footer probe plus the SKIP_IDX
+    /// section: two GETs, neither touching a BLOCKS byte.
+    ///
+    /// Non-vacuity: this test was first run with
+    /// `plan_segment_block_stats`'s containment arm relaxed from
+    /// `ts_min <= entry.min_ts && entry.max_ts <= ts_max` to the overlap test
+    /// `entry.max_ts >= ts_min && entry.min_ts <= ts_max` (the `if` at the head
+    /// of the `for (i, entry) in skip.l0.iter().enumerate()` loop). That folds
+    /// the two clipped blocks in, and the assertion fails with `record_count`
+    /// 10 instead of 6, `latency_max` 1000.0 instead of 7.5, `code_max` 999
+    /// instead of 9, and an empty `partial_block_indices` instead of `[0, 4]`.
+    #[tokio::test]
+    async fn block_stats_match_a_decoded_baseline_reading_no_block_bytes() {
+        let records = fixture_a();
+        let bytes = build_object(&records);
+        let total = bytes.len() as u64;
+        let probe = footer_region_len(&bytes);
+        let ((blocks_start, blocks_end), (skip_start, skip_end)) = section_extents(&bytes);
+        let (latency_col, code_col) = numeric_column_ids(&bytes);
+        let seg = seg_ref(total, &records);
+
+        let mem = store_with_object(bytes).await;
+        let baseline_blocks = decode_blocks(mem.clone() as Arc<dyn ObjectStoreBackend>, &seg).await;
+        assert_eq!(
+            baseline_blocks.len(),
+            5,
+            "two records per block over ten rows"
+        );
+
+        let store = Arc::new(RangeRecordingStore::new(mem));
+        let f = fetcher(store.clone() as Arc<dyn ObjectStoreBackend>, probe);
+        let acc = QueryAccounting::new();
+
+        let (ts_min, ts_max) = (1i64, 8i64);
+        let report = f
+            .plan_segment_block_stats(&seg, TENANT, &LogQuery::new(ts_min, ts_max), &acc)
+            .await
+            .expect("plan_segment_block_stats")
+            .expect("fast path applies");
+
+        let want = baseline(&baseline_blocks, ts_min, ts_max);
+        assert_eq!(want.record_count, 6, "three fully contained two-row blocks");
+        assert_eq!(want.partial, vec![0, 4], "one clipped block at each end");
+        assert_eq!(as_baseline(&report, latency_col, code_col), want);
+        // Spelled out, so a change to `baseline` cannot quietly move both sides.
+        assert_eq!(report.record_count, 6);
+        assert_eq!(report.partial_block_indices, vec![0, 4]);
+        let latency = report
+            .stats
+            .iter()
+            .find(|s| s.column_id == latency_col)
+            .expect("latency stat");
+        assert_eq!(
+            f64::from_bits(latency.min_bits),
+            -2.5,
+            "total_cmp order: the negative is the min, not the u64-bits maximum"
+        );
+        assert_eq!(f64::from_bits(latency.max_bits), 7.5);
+        assert!(latency.has_nan, "block [2,3] carries a NaN latency");
+        assert_eq!(
+            latency.null_count, 2,
+            "block [6,7] carries no stat: all its rows are null"
+        );
+        let code = report
+            .stats
+            .iter()
+            .find(|s| s.column_id == code_col)
+            .expect("code stat");
+        assert_eq!(code.min_bits as i64, -7);
+        assert_eq!(code.max_bits as i64, 9);
+        assert_eq!(code.null_count, 2);
+
+        // Exactly two reads: the suffix probe covering the footer region, and
+        // the SKIP_IDX section. No BLOCKS byte moved.
+        assert_eq!(store.get_count(), 2, "footer probe + SKIP_IDX section only");
+        let ranges = store.ranges();
+        assert_eq!(
+            ranges[0],
+            GetRange::Suffix(probe),
+            "the first read is the etag-establishing suffix probe"
+        );
+        assert_eq!(
+            ranges[1],
+            GetRange::Range(skip_start, skip_end),
+            "the second read is exactly the SKIP_IDX section extent"
+        );
+        for range in &ranges {
+            let (start, end) = match *range {
+                GetRange::Range(s, e) => (s, e),
+                GetRange::Suffix(n) => (total - n, total),
+                GetRange::Full => (0, total),
+            };
+            assert!(
+                end <= blocks_start || start >= blocks_end,
+                "read {range:?} overlaps BLOCKS [{blocks_start}, {blocks_end})"
+            );
+        }
+        assert_eq!(
+            acc.snapshot().total_s3_bytes(),
+            probe + (skip_end - skip_start),
+            "bytes read are the probe plus the SKIP_IDX section, nothing else"
+        );
+    }
+
+    /// `partial_block_indices` is the true overlapping-but-not-contained set,
+    /// however large. A three-stream segment's blocks interleave in ts, so the
+    /// window `[4, 110]` clips FOUR of the six blocks -- a length any
+    /// "one partial at each end" assumption gets wrong.
+    #[tokio::test]
+    async fn partial_block_indices_is_not_two_when_block_spans_interleave() {
+        let records = fixture_b();
+        let bytes = build_object(&records);
+        let total = bytes.len() as u64;
+        let probe = footer_region_len(&bytes);
+        let ((blocks_start, blocks_end), (skip_start, skip_end)) = section_extents(&bytes);
+        let (latency_col, code_col) = numeric_column_ids(&bytes);
+        let seg = seg_ref(total, &records);
+
+        let mem = store_with_object(bytes).await;
+        let baseline_blocks = decode_blocks(mem.clone() as Arc<dyn ObjectStoreBackend>, &seg).await;
+        assert_eq!(baseline_blocks.len(), 6, "three streams, two blocks each");
+        let spans: Vec<(i64, i64)> = baseline_blocks
+            .iter()
+            .map(|b| (b.min_ts, b.max_ts))
+            .collect();
+        assert!(
+            spans.windows(2).any(|w| w[1].0 < w[0].0),
+            "the fixture's block spans must genuinely interleave, not be ts-ordered: {spans:?}"
+        );
+
+        let store = Arc::new(RangeRecordingStore::new(mem));
+        let f = fetcher(store.clone() as Arc<dyn ObjectStoreBackend>, probe);
+        let acc = QueryAccounting::new();
+
+        let (ts_min, ts_max) = (4i64, 110i64);
+        let report = f
+            .plan_segment_block_stats(&seg, TENANT, &LogQuery::new(ts_min, ts_max), &acc)
+            .await
+            .expect("plan_segment_block_stats")
+            .expect("fast path applies");
+
+        let want = baseline(&baseline_blocks, ts_min, ts_max);
+        assert_eq!(
+            want.partial.len(),
+            4,
+            "four of six blocks are clipped by [4, 110]: {spans:?}"
+        );
+        assert_eq!(want.record_count, 4, "two fully contained two-row blocks");
+        assert_eq!(as_baseline(&report, latency_col, code_col), want);
+        assert_eq!(report.partial_block_indices.len(), 4);
+        assert_eq!(report.record_count, 4);
+
+        assert_eq!(store.get_count(), 2, "footer probe + SKIP_IDX section only");
+        for range in &store.ranges() {
+            let (start, end) = match *range {
+                GetRange::Range(s, e) => (s, e),
+                GetRange::Suffix(n) => (total - n, total),
+                GetRange::Full => (0, total),
+            };
+            assert!(
+                end <= blocks_start || start >= blocks_end,
+                "read {range:?} overlaps BLOCKS [{blocks_start}, {blocks_end})"
+            );
+        }
+        assert_eq!(
+            acc.snapshot().total_s3_bytes(),
+            probe + (skip_end - skip_start)
+        );
+    }
+
+    /// A non-empty `query.erasure` makes the function decline, with no GET at
+    /// all, even though every other condition holds. Erasure drops rows a
+    /// contained block's stored `record_count` still counts, so reporting the
+    /// stored figures would over-report.
+    #[tokio::test]
+    async fn erasure_present_declines_the_fast_path() {
+        let records = fixture_a();
+        let bytes = build_object(&records);
+        let total = bytes.len() as u64;
+        let probe = footer_region_len(&bytes);
+        let seg = seg_ref(total, &records);
+        let store = Arc::new(RangeRecordingStore::new(store_with_object(bytes).await));
+        let f = fetcher(store.clone() as Arc<dyn ObjectStoreBackend>, probe);
+        let acc = QueryAccounting::new();
+
+        // Identical to the passing case above except for the erasure list.
+        let query = LogQuery::new(1, 8).with_erasure(vec![ErasurePredicate::windowless(vec![(
+            "request.id".into(),
+            "r0".into(),
+        )])]);
+        let got = f
+            .plan_segment_block_stats(&seg, TENANT, &query, &acc)
+            .await
+            .expect("plan_segment_block_stats");
+        assert!(got.is_none(), "erasure pending: fail closed");
+        assert_eq!(store.get_count(), 0, "declining costs no GET");
+
+        // Control: the same query without erasure does fire, so the decline is
+        // attributable to the erasure list and nothing else.
+        let acc = QueryAccounting::new();
+        assert!(
+            f.plan_segment_block_stats(&seg, TENANT, &LogQuery::new(1, 8), &acc)
+                .await
+                .expect("plan_segment_block_stats")
+                .is_some(),
+            "without erasure the same query takes the fast path"
+        );
+    }
+
+    /// An object whose size sits exactly AT `block_range_threshold` declines,
+    /// matching `plan_segment_fast`'s `>` (not `>=`) convention: at or below the
+    /// threshold the whole-object funnel already pays one GET, and
+    /// `fetch_skip_index` has no whole-object crossover of its own.
+    #[tokio::test]
+    async fn object_exactly_at_the_block_range_threshold_declines() {
+        let records = fixture_a();
+        let bytes = build_object(&records);
+        let total = bytes.len() as u64;
+        let probe = footer_region_len(&bytes);
+        let seg = seg_ref(total, &records);
+        let store = Arc::new(RangeRecordingStore::new(store_with_object(bytes).await));
+        let inner = store.clone() as Arc<dyn ObjectStoreBackend>;
+        let at = LogSegmentFetcher::new(inner.clone())
+            .with_block_range_threshold(total)
+            .with_block_range(
+                BlockRangeFetcher::new(inner)
+                    .with_suffix_len(probe)
+                    .with_whole_object_threshold(0),
+            );
+        let acc = QueryAccounting::new();
+        let got = at
+            .plan_segment_block_stats(&seg, TENANT, &LogQuery::new(1, 8), &acc)
+            .await
+            .expect("plan_segment_block_stats");
+        assert!(got.is_none(), "at the threshold, not above it: fail closed");
+        assert_eq!(store.get_count(), 0, "declining costs no GET");
+
+        // One byte below the object size puts it above the threshold, and the
+        // same call now fires: the boundary is the only thing being tested.
+        let above = LogSegmentFetcher::new(store.clone() as Arc<dyn ObjectStoreBackend>)
+            .with_block_range_threshold(total - 1)
+            .with_block_range(
+                BlockRangeFetcher::new(store.clone() as Arc<dyn ObjectStoreBackend>)
+                    .with_suffix_len(probe)
+                    .with_whole_object_threshold(0),
+            );
+        assert!(
+            above
+                .plan_segment_block_stats(&seg, TENANT, &LogQuery::new(1, 8), &acc)
+                .await
+                .expect("plan_segment_block_stats")
+                .is_some(),
+            "one byte above the threshold the fast path fires"
+        );
+    }
+
+    /// A segment the catalog summary proves irrelevant declines with no GET, the
+    /// same `ts_range_relevant` pre-check `plan_segment` and `tenant_bytes`
+    /// apply.
+    #[tokio::test]
+    async fn irrelevant_segment_declines_without_a_get() {
+        let records = fixture_a();
+        let bytes = build_object(&records);
+        let total = bytes.len() as u64;
+        let probe = footer_region_len(&bytes);
+        let seg = seg_ref(total, &records);
+        let store = Arc::new(RangeRecordingStore::new(store_with_object(bytes).await));
+        let f = fetcher(store.clone() as Arc<dyn ObjectStoreBackend>, probe);
+        let acc = QueryAccounting::new();
+
+        // The segment spans ts 0..=9; this window is entirely above it.
+        let got = f
+            .plan_segment_block_stats(&seg, TENANT, &LogQuery::new(1_000, 2_000), &acc)
+            .await
+            .expect("plan_segment_block_stats");
+        assert!(got.is_none(), "ts-irrelevant segment");
+        assert_eq!(store.get_count(), 0);
     }
 }
