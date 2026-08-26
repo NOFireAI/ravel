@@ -1078,7 +1078,7 @@ const ATTR_SLOT_BYTES: u64 = std::mem::size_of::<(String, AttrValue)>() as u64;
 /// factor of the true heap rather than a small fraction of it, so a 256 MiB cap
 /// means roughly 256 MiB of live records. It still only decides where parts
 /// split, never correctness.
-fn estimate_record(r: &LogRecord) -> u64 {
+pub(crate) fn estimate_record(r: &LogRecord) -> u64 {
     let mut est = RECORD_SLOT_BYTES;
     est = est.saturating_add(alloc_estimate(r.stream_attrs.len() as u64));
     est = est.saturating_add(alloc_estimate(r.severity_text.len() as u64));
