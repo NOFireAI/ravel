@@ -193,13 +193,16 @@ ravel-cli --store <your-store-flags> catalog fold \
 mandatory: the fold defaults to metrics, and folding metrics on this
 logs-only tenant seals nothing and publishes an empty metrics HEAD.
 
-Check the report before going further. `entry_count` must equal the `objects
-written` figure the load printed; anything lower means part of the load is
-still outside the snapshot. `seal_margin: 20m` confirms the override took
-effect (the default is `1h 20m`). Note that `0s` removes only the
-flush-lifetime term, so the still-open ingest hour is not sealed: if the load
-finished minutes ago, run the fold again once that hour has ended, or accept
-that its objects are resolved by listing.
+Check the report before going further. `seal_margin: 20m` confirms the
+override took effect (the default is `1h 20m`), and that residual margin is
+also why `entry_count` may still be below the `objects written` figure the
+load printed: `0s` removes only the flush-lifetime term, so an ingest hour
+seals 20 minutes after it ends, and the hour the load finished in (plus the
+previous one, for 20 minutes) stays hot. The equality `entry_count == objects
+written` is the bench precondition, not the load's exit check: re-run the fold
+once 20 minutes have passed since the last loaded hour ended, and only then
+measure. Anything still lower at that point means part of the load is outside
+the snapshot.
 
 This is not optional tuning. Without a snapshot covering these hours, every
 query resolves by listing and reading commit records directly: one
