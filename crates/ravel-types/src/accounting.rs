@@ -118,6 +118,13 @@ struct Inner {
     /// regardless of column filtering. Decode-time column-filtering
     /// measurement, NOT wire bytes; see `ops`'s `s3_bytes` for wire bytes
     /// (ADR-0107 decision 4).
+    ///
+    /// Its name predates ADR-0699 and it is no longer a fetch figure on a
+    /// version-4 object: the column-chunk fetcher brings only the projected
+    /// columns' pages, so a page counted here may never have crossed the wire.
+    /// The gap to `page_bytes_decoded` is then what a whole-block read WOULD
+    /// have cost, which is the saving the chunk path made. The bytes actually
+    /// moved are `s3_bytes`, on every version.
     page_bytes_fetched: AtomicU64,
     /// Stored bytes of the pages a logs scan actually decoded after column
     /// filtering. Decode-time column-filtering measurement, NOT wire bytes; see
@@ -208,6 +215,9 @@ impl QueryAccounting {
     /// actual bytes moved over the wire stay measured by [`Self::add_s3_bytes`].
     /// Paired with [`Self::add_page_bytes_decoded`], the two expose how much of
     /// each fetched block a narrow projection throws away at decode.
+    ///
+    /// On a version-4 object (ADR-0699 decision 5) the unselected pages counted
+    /// here were never fetched at all; see the field's own documentation.
     pub fn add_page_bytes_fetched(&self, bytes: u64) {
         self.0
             .page_bytes_fetched

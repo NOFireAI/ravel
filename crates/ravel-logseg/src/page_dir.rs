@@ -21,6 +21,8 @@
 //! guarantees is re-checked rather than assumed, and every violation is
 //! [`LogSegError::Corrupted`], never a panic and never a silent misread.
 
+use std::collections::HashSet;
+
 use crate::block::MAX_PAGES;
 use crate::encoding::Enc;
 use crate::error::LogSegError;
@@ -182,6 +184,51 @@ impl PageDir {
             .iter()
             .find(|c| c.column_id == column_id)?
             .extent()
+    }
+
+    /// The byte extents in BLOCKS, `(offset, stored length)`, of exactly the
+    /// pages row group `group` holds for the blocks named in `blocks` (indices
+    /// *within* the group, strictly ascending) and the columns `columns` keeps
+    /// (`None` keeps every column).
+    ///
+    /// This is what ADR-0699 decision 5's fetcher ranges over. A projection of
+    /// `k` columns over a group whose blocks all survive is `k` runs of
+    /// contiguous pages, one per column chunk; a group in which only some
+    /// blocks survive contributes only those blocks' pages, and the pruned
+    /// blocks' pages are the gaps the fetcher's coalescing rule decides whether
+    /// to read through or split around. One extent per page, ascending within a
+    /// chunk and with the chunks in `column_id` order, which is ascending
+    /// overall because a group's chunks are contiguous in that order.
+    ///
+    /// `None` when `group` is past the last group or a page offset overflows
+    /// (which [`Self::decode`] already rejects).
+    pub fn projected_page_ranges(
+        &self,
+        group: usize,
+        blocks: &[u32],
+        columns: Option<&HashSet<u32>>,
+    ) -> Option<Vec<(u64, u64)>> {
+        let g = self.groups.get(group)?;
+        let mut out = Vec::new();
+        for chunk in &g.chunks {
+            let keep = match columns {
+                None => true,
+                Some(set) => set.contains(&chunk.column_id),
+            };
+            let mut at = chunk.offset;
+            for p in &chunk.pages {
+                let start = at;
+                at = at.checked_add(p.len)?;
+                // `blocks` is ascending, so this stays a binary search rather
+                // than a linear scan: a default-sized group has 32 blocks and a
+                // wide object has one chunk per column, so a linear membership
+                // test here would be quadratic in the group.
+                if keep && blocks.binary_search(&p.block).is_ok() {
+                    out.push((start, p.len));
+                }
+            }
+        }
+        Some(out)
     }
 
     /// Total blocks the directory covers.
@@ -499,6 +546,74 @@ mod tests {
         assert_eq!(b2.len(), 1);
         assert_eq!(b2[0].offset, 41);
         assert!(dir.block_pages(3).is_none());
+    }
+
+    #[test]
+    fn projected_page_ranges_keeps_only_the_named_blocks_and_columns() {
+        let dir = sample();
+        // Every column, every block of group 0: the whole group, contiguous.
+        let all = dir
+            .projected_page_ranges(0, &[0, 1], None)
+            .expect("group 0");
+        assert_eq!(all, vec![(0, 10), (10, 12), (22, 3), (25, 7), (32, 9)]);
+
+        // One block of the group: block 1's page in each chunk, with block 0's
+        // pages left as the holes between them.
+        let b1 = dir.projected_page_ranges(0, &[1], None).expect("group 0");
+        assert_eq!(b1, vec![(10, 12), (32, 9)]);
+
+        // One column: that chunk's pages only. Column 5 carries a presence page
+        // and a value page for block 0, and both come back.
+        let c5 = dir
+            .projected_page_ranges(0, &[0, 1], Some(&HashSet::from([5])))
+            .expect("group 0");
+        assert_eq!(c5, vec![(22, 3), (25, 7), (32, 9)]);
+
+        // One block and one column: exactly the intersection.
+        let one = dir
+            .projected_page_ranges(0, &[0], Some(&HashSet::from([0])))
+            .expect("group 0");
+        assert_eq!(one, vec![(0, 10)]);
+
+        // A column the group does not carry contributes nothing, and a block
+        // index outside the group contributes nothing, neither being an error:
+        // the caller's selection is not a claim about this object's layout.
+        assert_eq!(
+            dir.projected_page_ranges(0, &[0, 1], Some(&HashSet::from([9])))
+                .expect("group 0"),
+            Vec::new()
+        );
+        assert_eq!(
+            dir.projected_page_ranges(0, &[7], None).expect("group 0"),
+            Vec::new()
+        );
+        // A group past the last is `None`, not an empty list.
+        assert_eq!(dir.projected_page_ranges(2, &[0], None), None);
+    }
+
+    /// The extents of every block and every column of a group are exactly the
+    /// group's chunk ranges laid end to end: a projection that keeps everything
+    /// reads the group's whole span, which is what lets the fetcher's coalescing
+    /// collapse it into one GET with no separate whole-group case.
+    #[test]
+    fn projected_page_ranges_over_everything_tiles_the_group() {
+        let dir = sample();
+        let group = &dir.groups[0];
+        let blocks: Vec<u32> = (0..group.block_count).collect();
+        let ranges = dir
+            .projected_page_ranges(0, &blocks, None)
+            .expect("group 0");
+        let mut at = group.chunks[0].offset;
+        for (offset, len) in &ranges {
+            assert_eq!(*offset, at, "the ranges are contiguous");
+            at += len;
+        }
+        let total: u64 = group
+            .chunks
+            .iter()
+            .map(|c| c.extent().expect("extent").1)
+            .sum();
+        assert_eq!(at - group.chunks[0].offset, total);
     }
 
     #[test]

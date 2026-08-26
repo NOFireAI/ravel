@@ -89,8 +89,14 @@ trailer byte except the crc field itself is covered (ADR-0010 §4).
 Identical in shape to RSEG v1:
 
 1. Reject objects smaller than 16 bytes as `Corrupted`.
-2. Suffix-GET 64 KiB (or the whole object if smaller). Verify `magic`,
-   `version`, `signal`, `reserved`.
+2. Suffix-GET the object's tail (or the whole object if smaller). Verify
+   `magic`, `version`, `signal`, `reserved`. The suffix length is a reader
+   choice, not a format constant: it should cover the footer and whatever tail
+   sections the reader is about to need, and a reader that guesses short
+   simply issues step 3's extra ranged GET. `ravel-query`'s log fetcher probes
+   256 KiB, sized so that one probe carries the footer, SKIP_IDX and PAGE_DIR
+   past the BLOOM section that sits between them (ADR-0699 decision 5, issue
+   #766).
 3. Require `footer_len > 0` and `16 + footer_len <= total_size`;
    otherwise `Corrupted`. If the suffix did not cover the footer, issue
    one more ranged GET.
@@ -320,7 +326,11 @@ PAGE_DIR, and is the order PAGE_DIR lists them in. A whole-block reader
 verifies it; a reader taking a subset of the columns cannot (it does not have
 the other pages) and verifies each page's own crc32c instead. Both are
 mandatory on their own access path, which is what keeps every interpreted byte
-checksum-covered (ADR-0010 §4, "Checksum coverage map" below).
+checksum-covered (ADR-0010 §4, "Checksum coverage map" below). This is what
+lets a fetcher bring one coalesced byte range per `(row group, projected
+column)` and hand it to a projected decode: the range's holes -- pages of
+pruned blocks, and of columns the projection dropped -- are never interpreted,
+so nothing depends on a checksum over them.
 
 A reader may decode a *subset* of a block's columns (`read_block_columns`,
 ADR-0087); the SQL logs scan uses this to decode only the columns a query

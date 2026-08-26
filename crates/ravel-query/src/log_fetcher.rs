@@ -29,16 +29,24 @@
 //! Two read shapes, split by object size (ADR-0107). The tenant-aware funnels
 //! fetch an object at or below [`LogSegmentFetcher::with_block_range_threshold`]
 //! (512 KiB by default) with a single [`GetRange::Full`], which is every small
-//! RLOG object and every fixture here. Above it they read only the blocks
+//! RLOG object and every fixture here. Above it they read only the parts
 //! skip-index pruning proved relevant, through [`BlockRangeFetcher`]: a suffix
-//! probe that pins the etag, the directory sections, and coalesced
-//! candidate-block ranges, assembled into an object-sized buffer the unchanged
-//! reader decodes from. Every GET of either shape is routed through ADR-0046's
+//! probe that pins the etag, the directory sections, and coalesced ranges over
+//! the relevant data, assembled into an object-sized buffer the unchanged
+//! reader decodes from. What a "relevant part" is depends on the object's
+//! version. A version-3 object's block is one contiguous byte range, so the
+//! ranges are candidate blocks and the projection is a decode choice only. A
+//! version-4 object stores each row group's pages column-major and lists them
+//! in PAGE_DIR (ADR-0699), so a block is not a byte range at all: the ranges
+//! are the surviving blocks' pages inside each projected column's chunk, and
+//! the [`ColumnSelection`] the scan passes to decode is the fetch selection too
+//! (decision 5). Every GET of either shape is routed through ADR-0046's
 //! read cache when one is wired, keyed by the extent it fetched, so concurrent
 //! callers for the same extent collapse onto one request. The untenanted
 //! [`LogSegmentFetcher::fetch`]/[`LogSegmentFetcher::fetch_accounted`] entry
 //! points have no cache key and always read the whole object in one GET.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::erasure::ErasurePredicate;
@@ -49,6 +57,7 @@ use ravel_catalog::SegmentRef;
 use ravel_logseg::block::NumStat;
 use ravel_logseg::field_dir::FieldDir;
 use ravel_logseg::footer::{self, SectionDesc, kind};
+use ravel_logseg::page_dir::PageDir;
 use ravel_logseg::skip_index::{Level0Entry, NumRangeArm, SkipIndex, merge_stats};
 use ravel_logseg::stream_dir::StreamDir;
 use ravel_logseg::{
@@ -841,8 +850,12 @@ impl LogSegmentFetcher {
         query: &LogQuery,
         accounting: &QueryAccounting,
     ) -> Result<Option<LogFetchOutput>, LogFetchError> {
+        // This funnel's decode (`scan_bytes`) reads every column, so the fetch
+        // selection is the same: on a version-4 object it brings every column
+        // chunk of every surviving block (ADR-0699 decision 5).
+        let all = ColumnSelection::all();
         let Some(bytes) = self
-            .tenant_bytes(seg_ref, tenant_hash, query, accounting)
+            .tenant_bytes(seg_ref, tenant_hash, query, &all, accounting)
             .await?
         else {
             return Ok(None);
@@ -883,7 +896,7 @@ impl LogSegmentFetcher {
         accounting: &QueryAccounting,
     ) -> Result<Option<LogSegmentScan>, LogFetchError> {
         let Some(bytes) = self
-            .tenant_bytes(seg_ref, tenant_hash, query, accounting)
+            .tenant_bytes(seg_ref, tenant_hash, query, columns, accounting)
             .await?
         else {
             return Ok(None);
@@ -1076,15 +1089,16 @@ impl LogSegmentFetcher {
         // amplification #761 could not remove for these shapes; the caller counts
         // it (a `None` footer on a relevant segment) as a `plan_full_reads` so a
         // report can see which queries still pay it.
+        let all = ColumnSelection::all();
         let Some(bytes) = self
-            .tenant_bytes(seg_ref, tenant_hash, query, accounting)
+            .tenant_bytes(seg_ref, tenant_hash, query, &all, accounting)
             .await?
         else {
             return Ok(None);
         };
         let key = &seg_ref.data_object_key;
         let span = decode_span();
-        let scan = span.in_scope(|| self.open_scan(key, &bytes, query, &ColumnSelection::all()))?;
+        let scan = span.in_scope(|| self.open_scan(key, &bytes, query, &all))?;
         Ok(Some((scan.remaining_blocks(), scan.stats(), None)))
     }
 
@@ -1341,7 +1355,7 @@ impl LogSegmentFetcher {
         accounting: &QueryAccounting,
     ) -> Result<Option<LogSegmentScan>, LogFetchError> {
         let Some(bytes) = self
-            .tenant_bytes_with_footer(seg_ref, tenant_hash, query, footer, accounting)
+            .tenant_bytes_with_footer(seg_ref, tenant_hash, query, columns, footer, accounting)
             .await?
         else {
             return Ok(None);
@@ -1370,9 +1384,10 @@ impl LogSegmentFetcher {
         seg_ref: &SegmentRef,
         tenant_hash: TenantHash,
         query: &LogQuery,
+        columns: &ColumnSelection,
         accounting: &QueryAccounting,
     ) -> Result<Option<Bytes>, LogFetchError> {
-        self.tenant_bytes_with_footer(seg_ref, tenant_hash, query, None, accounting)
+        self.tenant_bytes_with_footer(seg_ref, tenant_hash, query, columns, None, accounting)
             .await
     }
 
@@ -1383,11 +1398,22 @@ impl LogSegmentFetcher {
     /// etag on the first section/block GET instead. `None` is the unchanged
     /// probe-first behavior. Below the threshold the whole-object read never
     /// probes anyway, so the footer is irrelevant there.
+    ///
+    /// `columns` is the same [`ColumnSelection`] the caller will hand the
+    /// decode. On a version-4 object it is the FETCH selection too (ADR-0699
+    /// decision 5): the block-range read brings one coalesced range per
+    /// surviving `(row group, projected column)` rather than every column of
+    /// every surviving block. A caller that decodes with a wider selection than
+    /// it fetched with would address pages this never brought, which is a typed
+    /// `Corrupted` error rather than wrong data, so the two must be the same
+    /// value.
+    #[allow(clippy::too_many_arguments)]
     async fn tenant_bytes_with_footer(
         &self,
         seg_ref: &SegmentRef,
         tenant_hash: TenantHash,
         query: &LogQuery,
+        columns: &ColumnSelection,
         footer: Option<&footer::LogFooter>,
         accounting: &QueryAccounting,
     ) -> Result<Option<Bytes>, LogFetchError> {
@@ -1416,6 +1442,7 @@ impl LogSegmentFetcher {
                         query.ts_min_ns,
                         query.ts_max_ns,
                         &query.prune,
+                        columns,
                         footer,
                         accounting,
                     )
@@ -1701,11 +1728,28 @@ impl LogSegmentFetcher {
 }
 
 /// Default suffix length of the etag-establishing probe GET (ADR-0107 decision
-/// 1). Mirrors `crate::fetcher::DEFAULT_SUFFIX_LEN`. The RLOG tail metadata
-/// (SKIP_IDX, BLOOM, POSTINGS) and the footer sit after the (large) BLOCKS
-/// section, so a suffix of this size normally covers the whole tail in one GET
-/// and no extra metadata GET is needed for them.
-pub const DEFAULT_LOG_SUFFIX_LEN: u64 = 64 * 1024;
+/// 1, ADR-0699 decision 5). The RLOG tail metadata (SKIP_IDX, PAGE_DIR, BLOOM,
+/// POSTINGS) and the footer sit after the (large) BLOCKS section, so a suffix
+/// of this size covers the whole tail in one GET and no extra metadata GET is
+/// needed for them.
+///
+/// 256 KiB rather than the 64 KiB this started at (issue #766). The plan phase
+/// needs SKIP_IDX, and under version 4 the fetch phase needs PAGE_DIR as well;
+/// both sit *before* BLOOM in the object, so a suffix probe reaches them only
+/// by spanning BLOOM too. On the reference ClickBench tenant BLOOM averages
+/// 86 KB, so the 64 KiB probe missed SKIP_IDX on 68.8% of above-threshold
+/// objects and cost 4,415 extra GETs per predicated statement. The
+/// `probe_covers_the_plan_sections_on_a_wide_row_group_object` test measures
+/// the tail on a 32-block-group, 105-column object and pins that this value
+/// covers it.
+///
+/// This is a request-count choice with a byte cost: the probe is a fixed
+/// per-object read that a narrow projection does not shrink, so on a small
+/// object it can dominate the column chunks themselves. It is cache-routed and
+/// shared by every partition and by the plan and scan phases of one statement,
+/// which is what keeps that cost to once per object per query rather than once
+/// per read. `BlockRangeFetcher::with_suffix_len` overrides it.
+pub const DEFAULT_LOG_SUFFIX_LEN: u64 = 256 * 1024;
 
 /// Default maximum gap between two wanted block extents that still get coalesced
 /// into a single GET. Same 64 KiB start as `crate::fetcher::DEFAULT_COALESCE_GAP`
@@ -1769,6 +1813,20 @@ pub struct BlockRangeStats {
     /// Set when a crossover (size-threshold pre-probe, or coverage-based
     /// post-pruning) took the whole-object path instead of range fetches.
     pub whole_object: bool,
+    /// Tail sections this read had to locate pages or blocks through that the
+    /// suffix probe's WINDOW did not cover, so a report can show the residual
+    /// miss rate the probe length leaves (issue #766). SKIP_IDX always counts;
+    /// PAGE_DIR counts on a version-4 object. FIELD_DIR and STREAM_DIR never
+    /// do: they sit at the object's front, where no suffix probe can reach them
+    /// at any length, so counting them would put a floor under the metric and
+    /// hide the quantity it exists to expose.
+    ///
+    /// Measured against the probe window, not against what the read cache
+    /// happened to hold, so it is a property of `suffix_len` and the object's
+    /// shape rather than of cache residency. A miss costs one extra GET, not
+    /// one per section: the missed tail sections are adjacent in the object and
+    /// are fetched as one coalesced range.
+    pub probe_misses: u64,
 }
 
 /// One candidate block's absolute byte extent in the object and its stored crc,
@@ -1783,6 +1841,25 @@ struct BlockExtent {
 }
 
 impl BlockExtent {
+    fn abs_end(&self) -> u64 {
+        self.abs_start.saturating_add(self.len)
+    }
+}
+
+/// One absolute byte extent of the object, with no checksum attached.
+///
+/// Version 4's fetch unit is a run of pages inside a column chunk (ADR-0699
+/// decision 5), which carries no checksum of its own: the per-page `crc32c`
+/// values live in PAGE_DIR and are verified at decode, one page at a time. So
+/// the version-4 path ranges over these rather than over [`BlockExtent`], whose
+/// `crc32c` a version-3 read verifies before the bytes are placed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ByteExtent {
+    abs_start: u64,
+    len: u64,
+}
+
+impl ByteExtent {
     fn abs_end(&self) -> u64 {
         self.abs_start.saturating_add(self.len)
     }
@@ -2235,19 +2312,35 @@ impl BlockRangeFetcher {
         let key = seg_ref.data_object_key.as_str();
         let mut stats = BlockRangeStats::default();
         let pin = EtagPin::default();
-        let (footer, resident) = self
+        let (footer, mut resident) = self
             .probe_footer(seg_ref, tenant_hash, &pin, accounting, &mut stats)
             .await?;
 
-        let skip_desc = footer
+        let skip_desc = *footer
             .section(kind::SKIP_IDX)
             .ok_or_else(|| corrupt(key, LogSegError::Corrupted("missing SKIP_IDX".into())))?;
 
+        // SKIP_IDX only: this entry point's caller
+        // (`plan_segment_block_stats`) reads the index's own per-block figures
+        // and no page, so warming PAGE_DIR here would move bytes nothing goes on
+        // to use. `fetch_plan_sections`, whose caller IS followed by a scan,
+        // brings the pair.
+        self.ensure_tail_plan_sections(
+            seg_ref,
+            tenant_hash,
+            &footer,
+            &[kind::SKIP_IDX],
+            &mut resident,
+            &pin,
+            accounting,
+            &mut stats,
+        )
+        .await?;
         let raw = self
             .plan_section_raw(
                 seg_ref,
                 tenant_hash,
-                skip_desc,
+                &skip_desc,
                 &resident,
                 &pin,
                 accounting,
@@ -2256,6 +2349,65 @@ impl BlockRangeFetcher {
             .await?;
         let skip = SkipIndex::decode(&raw, MAX_BLOCKS).map_err(|source| corrupt(key, source))?;
         Ok((skip, stats))
+    }
+
+    /// Bring the named TAIL sections into `resident`. Sections the probe already
+    /// covered cost nothing; the rest are fetched as coalesced runs, so a probe
+    /// too short for two adjacent sections (SKIP_IDX and PAGE_DIR always are --
+    /// the writer emits PAGE_DIR immediately after SKIP_IDX) costs one extra GET
+    /// rather than two (issue #766). Every named section the probe WINDOW did
+    /// not cover is counted in [`BlockRangeStats::probe_misses`], whether or not
+    /// a GET was needed for it.
+    ///
+    /// A kind the footer does not carry is skipped, which is how a version-3
+    /// object passes PAGE_DIR here harmlessly.
+    #[allow(clippy::too_many_arguments)]
+    async fn ensure_tail_plan_sections(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        footer: &footer::LogFooter,
+        kinds: &[u32],
+        resident: &mut Vec<(u64, Bytes)>,
+        pin: &EtagPin,
+        accounting: &QueryAccounting,
+        stats: &mut BlockRangeStats,
+    ) -> Result<(), LogFetchError> {
+        let total_size = seg_ref.object_size;
+        let suffix = self.suffix_len.min(total_size);
+        let mut missing: Vec<ByteExtent> = Vec::new();
+        for &k in kinds {
+            let Some(desc) = footer.section(k) else {
+                continue;
+            };
+            if !probe_window_covers(desc, total_size, suffix) {
+                stats.probe_misses += 1;
+            }
+            if resident_slice(resident, desc.offset, desc.len).is_none() {
+                missing.push(ByteExtent {
+                    abs_start: desc.offset,
+                    len: desc.len,
+                });
+            }
+        }
+        for run in coalesce_byte_extents(&missing, self.coalesce_gap) {
+            let (bytes, live) = self
+                .cached_extent(
+                    seg_ref,
+                    tenant_hash,
+                    run.abs_start,
+                    run.len,
+                    GetRange::Range(run.abs_start, run.abs_end()),
+                    pin,
+                    accounting,
+                )
+                .await?;
+            if live {
+                stats.metadata_gets += 1;
+            }
+            resident.push((run.abs_start, bytes));
+        }
+        Ok(())
     }
 
     /// Decode one whole-compressed directory section from a region the probe
@@ -2325,13 +2477,30 @@ impl BlockRangeFetcher {
         let key = seg_ref.data_object_key.as_str();
         let mut stats = BlockRangeStats::default();
         let pin = EtagPin::default();
-        let (footer, resident) = self
+        let (footer, mut resident) = self
             .probe_footer(seg_ref, tenant_hash, &pin, accounting, &mut stats)
             .await?;
 
         let skip_desc = *footer
             .section(kind::SKIP_IDX)
             .ok_or_else(|| corrupt(key, LogSegError::Corrupted("missing SKIP_IDX".into())))?;
+        // SKIP_IDX and, on a version-4 object, PAGE_DIR: the pair is adjacent, so
+        // a probe too short for both costs one coalesced GET rather than two.
+        // PAGE_DIR is brought here even though the survivor count does not need
+        // it, because the scan this plan feeds locates its pages through it,
+        // fetches it under this same extent key, and would otherwise pay a
+        // second round trip for bytes the probe already had.
+        self.ensure_tail_plan_sections(
+            seg_ref,
+            tenant_hash,
+            &footer,
+            &[kind::SKIP_IDX, kind::PAGE_DIR],
+            &mut resident,
+            &pin,
+            accounting,
+            &mut stats,
+        )
+        .await?;
         let skip_raw = self
             .plan_section_raw(
                 seg_ref,
@@ -2389,6 +2558,36 @@ impl BlockRangeFetcher {
             ts_min_ns,
             ts_max_ns,
             &[],
+            &ColumnSelection::all(),
+            None,
+            accounting,
+        )
+        .await
+    }
+
+    /// [`fetch_object`](Self::fetch_object) with a column projection, which on
+    /// a version-4 object is a FETCH projection (ADR-0699 decision 5): the read
+    /// brings one coalesced range per surviving `(row group, projected column)`
+    /// instead of every column of every surviving block. On a version-3 object
+    /// `columns` changes nothing about what is fetched -- a block is one
+    /// contiguous range there and the projection is a decode choice only
+    /// (ADR-0087).
+    pub async fn fetch_object_projected(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        ts_min_ns: i64,
+        ts_max_ns: i64,
+        columns: &ColumnSelection,
+        accounting: &QueryAccounting,
+    ) -> Result<(Bytes, BlockRangeStats), LogFetchError> {
+        self.fetch_object_with_footer(
+            seg_ref,
+            tenant_hash,
+            ts_min_ns,
+            ts_max_ns,
+            &[],
+            columns,
             None,
             accounting,
         )
@@ -2419,6 +2618,11 @@ impl BlockRangeFetcher {
     /// blocks instead of tripping the coverage crossover into a whole-object GET.
     /// See [`resolve_extents`](Self::resolve_extents) for why this stays
     /// byte-identical to the unpruned read.
+    ///
+    /// `columns` is the query's [`ColumnSelection`]. On a version-4 object it
+    /// selects which column chunks are fetched as well as which are decoded
+    /// (ADR-0699 decision 5); on a version-3 object it is ignored by the fetch,
+    /// which reads whole blocks.
     #[allow(clippy::too_many_arguments)]
     pub async fn fetch_object_with_footer(
         &self,
@@ -2427,6 +2631,7 @@ impl BlockRangeFetcher {
         ts_min_ns: i64,
         ts_max_ns: i64,
         prune: &[Predicate],
+        columns: &ColumnSelection,
         plan_footer: Option<&footer::LogFooter>,
         accounting: &QueryAccounting,
     ) -> Result<(Bytes, BlockRangeStats), LogFetchError> {
@@ -2555,34 +2760,29 @@ impl BlockRangeFetcher {
         // `block_offset`/`block_len` describe a page span overlapping its
         // neighbours', with the block crc defined over its pages in column_id
         // order rather than over that span. The block-range protocol below
-        // assumes neither, so it reads a version-4 object whole: the same
-        // bytes the pre-ADR-0107 path moved, in one full-object GET on top of
-        // the suffix probe this guard runs after when no plan-carried footer
-        // was supplied (PAGE_DIR presence is only known from the footer). The
-        // probe is cache-routed, so concurrent partitions coalesce onto it.
-        //
-        // ADR-0699 decision 5 is what replaces this: PAGE_DIR turns each
-        // surviving `(row group, projected column)` into one coalesced range,
-        // which is strictly better than either path here. Until that lands, a
-        // version-4 object is fetched whole.
+        // assumes both, so a version-4 object takes decision 5's chunk path
+        // instead: PAGE_DIR turns each surviving `(row group, projected
+        // column)` into one coalesced range. Dispatched here, after the footer
+        // is resolved, because PAGE_DIR's presence is only known from the
+        // footer -- which covers both the probe path and the plan-carried
+        // footer path (#693 part 3).
         if footer.section(kind::PAGE_DIR).is_some() {
-            let (bytes, live) = self
-                .cached_extent(
+            return self
+                .fetch_object_v4(
                     seg_ref,
                     tenant_hash,
-                    0,
-                    total_size,
-                    GetRange::Full,
+                    ts_min_ns,
+                    ts_max_ns,
+                    prune,
+                    columns,
+                    &footer,
+                    plan_footer.is_none(),
+                    asm,
                     &pin,
                     accounting,
+                    stats,
                 )
-                .await?;
-            if live {
-                stats.block_range_gets = 1;
-                stats.block_bytes_fetched = bytes.len() as u64;
-            }
-            stats.whole_object = true;
-            return Ok((bytes, stats));
+                .await;
         }
 
         let skip_desc = footer
@@ -2775,6 +2975,384 @@ impl BlockRangeFetcher {
         )
         .await?;
         Ok((asm.into_bytes(), stats))
+    }
+
+    /// The version-4 read (ADR-0699 decision 5): one coalesced range per
+    /// surviving `(row group, projected column)`, instead of the version-3
+    /// protocol's one range per surviving block.
+    ///
+    /// The footer is already resolved -- by the suffix probe (`probed`), whose
+    /// bytes are already in `asm`, or carried from the plan phase -- so this
+    /// picks up at the directories. SKIP_IDX says which blocks survive, PAGE_DIR
+    /// says where their pages are, and the query's [`ColumnSelection`] resolved
+    /// against FIELD_DIR says which column chunks to read. The pages the
+    /// surviving blocks hold in the kept chunks become byte extents that the
+    /// same coalescing rule the version-3 path uses fuses into GETs: a pruned
+    /// block's pages are the gaps in those runs, read through when the gap is
+    /// under `coalesce_gap` and split around otherwise. When the selection keeps
+    /// every column and every block of a group survives, that group's pages are
+    /// one contiguous span and coalesce into exactly one range, which is why
+    /// there is no separate whole-group case here.
+    ///
+    /// # Checksums
+    ///
+    /// Nothing here verifies a block crc, and nothing can: under version 4 that
+    /// crc covers the block's pages in `column_id` order, which a projected read
+    /// does not hold (docs/log-segment-format.md, "BLOCKS"). Verification moves
+    /// to the decode instead, per page, against PAGE_DIR's own `crc32c`
+    /// (`decode_v4_block`), so every byte this fetch brings and the reader goes
+    /// on to interpret is still checksum-covered on its own access path
+    /// (ADR-0010 §4). A read whose selection keeps every one of a block's pages
+    /// verifies the block crc as well. That also makes the coalesced range a
+    /// legitimate cache unit even though it can span a pruned block's pages: a
+    /// corrupt cache hit fails at the first page crc it feeds the decode, the
+    /// same way a corrupt live fetch does, and the gap bytes are never
+    /// interpreted at all.
+    #[allow(clippy::too_many_arguments)]
+    async fn fetch_object_v4(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        ts_min_ns: i64,
+        ts_max_ns: i64,
+        prune: &[Predicate],
+        columns: &ColumnSelection,
+        footer: &footer::LogFooter,
+        probed: bool,
+        mut asm: ObjectAssembler,
+        pin: &EtagPin,
+        accounting: &QueryAccounting,
+        mut stats: BlockRangeStats,
+    ) -> Result<(Bytes, BlockRangeStats), LogFetchError> {
+        let key = seg_ref.data_object_key.as_str();
+        let total_size = seg_ref.object_size;
+        let blocks_desc = *footer
+            .section(kind::BLOCKS)
+            .ok_or_else(|| corrupt(key, LogSegError::Corrupted("missing BLOCKS".into())))?;
+        let skip_desc = *footer
+            .section(kind::SKIP_IDX)
+            .ok_or_else(|| corrupt(key, LogSegError::Corrupted("missing SKIP_IDX".into())))?;
+        let page_desc = *footer
+            .section(kind::PAGE_DIR)
+            .ok_or_else(|| corrupt(key, LogSegError::Corrupted("missing PAGE_DIR".into())))?;
+
+        // Issue #766's residual miss rate: the two tail sections this read has
+        // to locate pages through, counted against the probe WINDOW rather than
+        // against cache residency, so the figure reports what the probe length
+        // costs on this object's shape.
+        let suffix = self.suffix_len.min(total_size);
+        for desc in [&skip_desc, &page_desc] {
+            if !probe_window_covers(desc, total_size, suffix) {
+                stats.probe_misses += 1;
+            }
+        }
+
+        // A carried footer skipped the probe (#693 part 3), which on a
+        // version-4 object would leave every tail section -- SKIP_IDX, PAGE_DIR,
+        // BLOOM, POSTINGS -- and the footer/trailer bytes to be fetched one at a
+        // time. The plan phase that carried the footer already read that whole
+        // tail as its probe and admitted it under its extent key, so asking the
+        // cache for the same extent places all of it at once for no GET. Only
+        // done with a cache wired: without one every `cached_extent` call is a
+        // live GET, and re-reading the tail on the wire would move more bytes
+        // than the per-section reads it replaces.
+        if !probed && self.cache.is_some() && suffix > 0 {
+            let probe_start = total_size - suffix;
+            let (bytes, live) = self
+                .cached_extent(
+                    seg_ref,
+                    tenant_hash,
+                    probe_start,
+                    suffix,
+                    GetRange::Range(probe_start, total_size),
+                    pin,
+                    accounting,
+                )
+                .await?;
+            if live {
+                stats.probe_gets += 1;
+            }
+            asm.place(key, probe_start, &bytes)?;
+        }
+
+        // SKIP_IDX and PAGE_DIR first, and nothing the candidate set does not
+        // need: the coverage crossover below can still decide the whole object
+        // is cheaper, and every other section fetched before that decision would
+        // then be wasted (the same ordering rule the version-3 path follows).
+        // The two are adjacent in the object -- the writer emits PAGE_DIR
+        // immediately after SKIP_IDX -- so a probe that missed both costs one
+        // coalesced GET rather than two.
+        self.place_sections_coalesced(
+            seg_ref,
+            tenant_hash,
+            &[skip_desc, page_desc],
+            pin,
+            &mut asm,
+            accounting,
+            &mut stats,
+        )
+        .await?;
+        let skip_raw = self.placed_section_raw(key, &asm, &skip_desc)?;
+        let skip =
+            SkipIndex::decode(&skip_raw, MAX_BLOCKS).map_err(|source| corrupt(key, source))?;
+        let page_raw = self.placed_section_raw(key, &asm, &page_desc)?;
+        let page_dir = PageDir::decode(&page_raw).map_err(|source| corrupt(key, source))?;
+        page_dir
+            .validate_extents(blocks_desc.len)
+            .map_err(|source| corrupt(key, source))?;
+
+        // FIELD_DIR, when either channel needs it: the prune-only NumRange arms
+        // resolve to this object's column ids through it (#761), and so does the
+        // projection. An all-columns query with no numeric arm needs neither, and
+        // FIELD_DIR is a front section a suffix probe never covers, so skipping
+        // it there is a real saved GET.
+        let wants_numeric = prune
+            .iter()
+            .any(|p| matches!(p, Predicate::NumRange { .. }));
+        let (numeric, selected) = if wants_numeric || !columns.is_all() {
+            let field_dir = self
+                .place_and_decode_field_dir(
+                    seg_ref,
+                    tenant_hash,
+                    footer,
+                    pin,
+                    &mut asm,
+                    accounting,
+                    &mut stats,
+                )
+                .await?;
+            let numeric = if wants_numeric {
+                let refs: Vec<&Predicate> = prune.iter().collect();
+                field_dir.numeric_range_arms(&refs)
+            } else {
+                Vec::new()
+            };
+            // The same resolution `RlogReader::scan_blocks` runs on the same
+            // FIELD_DIR, so the pages fetched here are exactly the pages the
+            // decode addresses.
+            (numeric, columns.resolve(&field_dir))
+        } else {
+            (Vec::new(), None)
+        };
+
+        let candidates = skip.candidate_blocks(ts_min_ns, ts_max_ns, None, &numeric);
+        stats.candidate_blocks = candidates.len() as u64;
+        let wanted = projected_page_extents(
+            key,
+            &page_dir,
+            blocks_desc.offset,
+            &candidates,
+            selected.as_ref(),
+        )?;
+
+        // Coverage-based post-pruning crossover (ADR-0107 decision 1), against
+        // the BLOCKS section's own size for the reason the version-3 path
+        // documents. The numerator is now the projected page bytes rather than
+        // whole candidate blocks, so a narrow projection stays far below the
+        // threshold even when every block survives, and an all-columns read of
+        // every block reaches ~1.0 and takes the single GET.
+        let wanted_bytes: u64 = wanted.iter().map(|e| e.len).sum();
+        let coverage = wanted_bytes as f64 / blocks_desc.len.max(1) as f64;
+        if coverage >= self.coverage_threshold {
+            let (bytes, live) = self
+                .cached_extent(
+                    seg_ref,
+                    tenant_hash,
+                    0,
+                    total_size,
+                    GetRange::Full,
+                    pin,
+                    accounting,
+                )
+                .await?;
+            if live {
+                stats.block_range_gets = 1;
+                stats.block_bytes_fetched = bytes.len() as u64;
+            }
+            stats.whole_object = true;
+            // No per-block cache admission from the whole object here, unlike
+            // the version-3 path: a version-4 block is not a contiguous extent,
+            // so there is no block-keyed entry a later ranged read would look
+            // for. The chunk ranges are the cache unit instead, and this read
+            // resolved none of them.
+            return Ok((bytes, stats));
+        }
+
+        // The suffix probe normally places the object's tail -- the footer and
+        // trailer bytes `RlogReader` re-reads to open the assembled buffer,
+        // which are not themselves listed sections. A carried footer skipped the
+        // probe, so place that tail now (the version-3 path does the same).
+        if !probed {
+            let tail_start = footer
+                .sections
+                .iter()
+                .map(|s| s.offset + s.len)
+                .max()
+                .unwrap_or(0);
+            if tail_start < total_size && !asm.covers(tail_start, total_size) {
+                let (bytes, live) = self
+                    .cached_extent(
+                        seg_ref,
+                        tenant_hash,
+                        tail_start,
+                        total_size - tail_start,
+                        GetRange::Range(tail_start, total_size),
+                        pin,
+                        accounting,
+                    )
+                    .await?;
+                if live {
+                    stats.metadata_gets += 1;
+                }
+                asm.place(key, tail_start, &bytes)?;
+            }
+        }
+
+        // The remaining non-BLOCKS sections: STREAM_DIR/FIELD_DIR at the object
+        // front, and BLOOM/POSTINGS when a short probe missed them. The reader
+        // re-verifies each section's crc on decode, so a corrupt section hit
+        // fails closed there (ADR-0046).
+        for section in &footer.sections {
+            if section.kind == kind::BLOCKS {
+                continue;
+            }
+            self.place_section(
+                seg_ref,
+                tenant_hash,
+                section,
+                pin,
+                &mut asm,
+                accounting,
+                &mut stats,
+            )
+            .await?;
+        }
+
+        self.fetch_chunk_ranges(
+            seg_ref,
+            tenant_hash,
+            pin,
+            &wanted,
+            &mut asm,
+            accounting,
+            &mut stats,
+        )
+        .await?;
+        Ok((asm.into_bytes(), stats))
+    }
+
+    /// Fetch the coalesced page ranges into `asm`, every run concurrently,
+    /// through the same [`cached_extent`](Self::cached_extent) path every other
+    /// GET here takes: concurrent partitions striping one segment resolve the
+    /// identical candidate set and the identical projection, so they produce the
+    /// identical runs and collapse onto one real request each rather than one
+    /// per partition (ADR-0102 decision 1's premise), and the etag pin holds
+    /// across the sequence.
+    #[allow(clippy::too_many_arguments)]
+    async fn fetch_chunk_ranges(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        pin: &EtagPin,
+        wanted: &[ByteExtent],
+        asm: &mut ObjectAssembler,
+        accounting: &QueryAccounting,
+        stats: &mut BlockRangeStats,
+    ) -> Result<(), LogFetchError> {
+        let key = seg_ref.data_object_key.as_str();
+        let runs: Vec<ByteExtent> = coalesce_byte_extents(wanted, self.coalesce_gap)
+            .into_iter()
+            // A run the probe already brought costs nothing: its bytes are in
+            // `asm` at the right offsets already.
+            .filter(|r| !asm.covers(r.abs_start, r.abs_end()))
+            .collect();
+        let outcomes = futures::future::join_all(runs.iter().map(|run| async move {
+            let (bytes, live) = self
+                .cached_extent(
+                    seg_ref,
+                    tenant_hash,
+                    run.abs_start,
+                    run.len,
+                    GetRange::Range(run.abs_start, run.abs_end()),
+                    pin,
+                    accounting,
+                )
+                .await?;
+            Ok::<_, LogFetchError>((run.abs_start, bytes, live))
+        }))
+        .await;
+        for outcome in outcomes {
+            let (start, bytes, live) = outcome?;
+            if live {
+                stats.block_range_gets += 1;
+                stats.block_bytes_fetched =
+                    stats.block_bytes_fetched.saturating_add(bytes.len() as u64);
+            } else {
+                stats.block_cache_hits += 1;
+            }
+            asm.place(key, start, &bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Place several sections into `asm` with one GET per coalesced run rather
+    /// than one per section, for sections a caller needs together. Sections
+    /// already covered by an earlier read cost nothing; the rest are merged
+    /// under the same `coalesce_gap` policy the block ranges use, which is what
+    /// keeps a probe too short for both SKIP_IDX and PAGE_DIR to one extra GET
+    /// instead of two (issue #766).
+    #[allow(clippy::too_many_arguments)]
+    async fn place_sections_coalesced(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        sections: &[SectionDesc],
+        pin: &EtagPin,
+        asm: &mut ObjectAssembler,
+        accounting: &QueryAccounting,
+        stats: &mut BlockRangeStats,
+    ) -> Result<(), LogFetchError> {
+        let key = seg_ref.data_object_key.as_str();
+        let missing: Vec<ByteExtent> = sections
+            .iter()
+            .filter(|s| !asm.covers(s.offset, s.offset + s.len))
+            .map(|s| ByteExtent {
+                abs_start: s.offset,
+                len: s.len,
+            })
+            .collect();
+        for run in coalesce_byte_extents(&missing, self.coalesce_gap) {
+            let (bytes, live) = self
+                .cached_extent(
+                    seg_ref,
+                    tenant_hash,
+                    run.abs_start,
+                    run.len,
+                    GetRange::Range(run.abs_start, run.abs_end()),
+                    pin,
+                    accounting,
+                )
+                .await?;
+            if live {
+                stats.metadata_gets += 1;
+            }
+            asm.place(key, run.abs_start, &bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Decode one whole-compressed section out of the assembled buffer, where an
+    /// earlier `place_*` call already put its stored bytes.
+    fn placed_section_raw(
+        &self,
+        key: &str,
+        asm: &ObjectAssembler,
+        desc: &SectionDesc,
+    ) -> Result<Vec<u8>, LogFetchError> {
+        let stored = asm
+            .slice(desc.offset, desc.len)
+            .ok_or_else(|| corrupt_range(key))?;
+        decode_section(stored, desc, &self.cfg).map_err(|source| corrupt(key, source))
     }
 
     /// Resolve each candidate block index (from `skip.candidate_blocks`) to its
@@ -3322,9 +3900,31 @@ fn verify_block_crc(key: &str, bytes: &[u8], ext: &BlockExtent) -> Result<(), Lo
 /// meaningful (coalesced ranges are split back to per-block extents by the
 /// caller and each block's own crc is verified there).
 fn coalesce_extents(extents: &[BlockExtent], max_gap: u64) -> Vec<BlockExtent> {
+    let ranges: Vec<ByteExtent> = extents
+        .iter()
+        .map(|e| ByteExtent {
+            abs_start: e.abs_start,
+            len: e.len,
+        })
+        .collect();
+    coalesce_byte_extents(&ranges, max_gap)
+        .into_iter()
+        .map(|r| BlockExtent {
+            abs_start: r.abs_start,
+            len: r.len,
+            crc32c: 0,
+        })
+        .collect()
+}
+
+/// [`coalesce_extents`] over plain byte extents: the same rule (sort by start,
+/// join two runs whose gap is at most `max_gap`), applied to version 4's
+/// page-range fetch units. This is the one place the gap policy lives, so the
+/// version-3 block path and the version-4 chunk path cannot drift apart on it.
+fn coalesce_byte_extents(extents: &[ByteExtent], max_gap: u64) -> Vec<ByteExtent> {
     let mut ranges: Vec<(u64, u64)> = extents.iter().map(|e| (e.abs_start, e.abs_end())).collect();
     ranges.sort_by_key(|r| r.0);
-    let mut out: Vec<BlockExtent> = Vec::new();
+    let mut out: Vec<ByteExtent> = Vec::new();
     for (start, end) in ranges {
         if let Some(last) = out.last_mut()
             && start <= last.abs_end().saturating_add(max_gap)
@@ -3333,13 +3933,79 @@ fn coalesce_extents(extents: &[BlockExtent], max_gap: u64) -> Vec<BlockExtent> {
             last.len = new_end - last.abs_start;
             continue;
         }
-        out.push(BlockExtent {
+        out.push(ByteExtent {
             abs_start: start,
             len: end - start,
-            crc32c: 0,
         });
     }
     out
+}
+
+/// The absolute byte extents of exactly the pages the surviving blocks
+/// `candidates` hold for the columns `selected` keeps, over every row group
+/// holding at least one survivor (ADR-0699 decision 5). `selected` is `None`
+/// for an all-columns read.
+///
+/// `candidates` are whole-object level-0 block indices, strictly ascending, as
+/// [`SkipIndex::candidate_blocks`] returns them. PAGE_DIR's decode proves the
+/// groups partition the object's blocks into consecutive runs from block 0, so
+/// one forward pass over the groups splits the candidates between them with no
+/// per-block search. A candidate no group claims is corruption (the reader's
+/// own open checks the same invariant from the other side, PAGE_DIR block count
+/// against the skip index's), never a silently dropped block.
+fn projected_page_extents(
+    key: &str,
+    page_dir: &PageDir,
+    blocks_offset: u64,
+    candidates: &[usize],
+    selected: Option<&HashSet<u32>>,
+) -> Result<Vec<ByteExtent>, LogFetchError> {
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    for (gi, group) in page_dir.groups.iter().enumerate() {
+        let group_end = u64::from(group.first_block) + u64::from(group.block_count);
+        let mut within: Vec<u32> = Vec::new();
+        while let Some(&b) = candidates.get(at) {
+            if b as u64 >= group_end {
+                break;
+            }
+            let b = u32::try_from(b).map_err(|_| corrupt_range(key))?;
+            let rel = b
+                .checked_sub(group.first_block)
+                .ok_or_else(|| corrupt_range(key))?;
+            within.push(rel);
+            at += 1;
+        }
+        if within.is_empty() {
+            continue;
+        }
+        let ranges = page_dir
+            .projected_page_ranges(gi, &within, selected)
+            .ok_or_else(|| corrupt_range(key))?;
+        for (offset, len) in ranges {
+            let abs_start = blocks_offset
+                .checked_add(offset)
+                .ok_or_else(|| corrupt_range(key))?;
+            out.push(ByteExtent { abs_start, len });
+        }
+    }
+    if at != candidates.len() {
+        return Err(corrupt(
+            key,
+            LogSegError::Corrupted("candidate block outside the page directory".into()),
+        ));
+    }
+    Ok(out)
+}
+
+/// Whether a suffix probe of `suffix` bytes over an object of `total_size`
+/// bytes covers `desc` entirely. This asks about the probe WINDOW, not about
+/// what any particular read has resident, so it answers "would a longer probe
+/// have saved this GET" rather than "did the cache hold it" (issue #766, the
+/// `probe_misses` counter).
+fn probe_window_covers(desc: &SectionDesc, total_size: u64, suffix: u64) -> bool {
+    let probe_start = total_size.saturating_sub(suffix);
+    desc.offset >= probe_start && desc.offset.saturating_add(desc.len) <= total_size
 }
 
 /// The canonical-byte needle for one stream-attribute equality: the single
