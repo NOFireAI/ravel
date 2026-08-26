@@ -310,6 +310,10 @@ impl PageDir {
                 let mut pages = Vec::with_capacity(cap(page_count));
                 let mut chunk_len = 0u64;
                 let mut prev_block: Option<u32> = None;
+                // Pages of one block within a chunk are a consecutive run; the
+                // chunk-wide cap above bounds their total, this bounds the run
+                // so no block can carry more than the presence-plus-value pair.
+                let mut run = 0u64;
                 for _ in 0..page_count {
                     let block = read_u32_varint(bytes, &mut pos)?;
                     if u64::from(block) >= block_count {
@@ -322,6 +326,17 @@ impl PageDir {
                     {
                         return Err(LogSegError::Corrupted(format!(
                             "page_dir page blocks not ascending: {block} after {prev}"
+                        )));
+                    }
+                    run = if prev_block == Some(block) {
+                        run + 1
+                    } else {
+                        1
+                    };
+                    if run > MAX_PAGES_PER_BLOCK_PER_COLUMN {
+                        return Err(LogSegError::Corrupted(format!(
+                            "page_dir block {block} carries more than \
+                             {MAX_PAGES_PER_BLOCK_PER_COLUMN} pages in one column"
                         )));
                     }
                     prev_block = Some(block);
@@ -568,6 +583,35 @@ mod tests {
         put_uvarint(&mut bytes, 3); // page_count: over 2 * block_count
         let err = PageDir::decode(&bytes);
         assert!(is_corrupted(err));
+    }
+
+    #[test]
+    fn rejects_more_pages_for_one_block_than_the_per_block_cap() {
+        // Two blocks allow four pages in the chunk, but all four on block 0
+        // exceed the per-block presence-plus-value pair; the decoder must
+        // refuse at the third page rather than let block_pages hand back
+        // four pages for one block and column.
+        let mut bytes = Vec::new();
+        put_uvarint(&mut bytes, 1); // group_count
+        put_uvarint(&mut bytes, 0); // first_block
+        put_uvarint(&mut bytes, 2); // block_count
+        put_uvarint(&mut bytes, 1); // chunk_count
+        put_uvarint(&mut bytes, 0); // column_id
+        put_uvarint(&mut bytes, 0); // offset
+        put_uvarint(&mut bytes, 4); // page_count: within 2 * block_count
+        for _ in 0..3 {
+            put_uvarint(&mut bytes, 0); // block 0, three times
+            bytes.push(Enc::Plain.to_u8());
+            bytes.push(0); // comp
+            put_uvarint(&mut bytes, 1); // len
+            put_uvarint(&mut bytes, 1); // uncomp_len
+            bytes.extend_from_slice(&0u32.to_le_bytes()); // crc32c
+        }
+        let err = PageDir::decode(&bytes).expect_err("third page of block 0 must be refused");
+        assert!(
+            matches!(&err, LogSegError::Corrupted(msg) if msg.contains("more than")),
+            "expected the per-block cap error, got {err:?}"
+        );
     }
 
     #[test]
