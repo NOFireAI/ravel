@@ -1,7 +1,7 @@
 //! Differential proof for compaction/retention folding: for a population that mixes a plain
 //! L0 bucket, a compacted bucket, and a tombstoned bucket, `Catalog::resolve`
 //! must return the exact same segment set whether it runs before any fold
-//! (pure Phase 1 listing, `Catalog::list_hour_bucket`) or after one (served
+//! (pure Phase 1 listing, `Catalog::list_window_bounded`) or after one (served
 //! from the snapshot part the fold wrote). The two paths share no code past
 //! `Catalog::resolve` itself, so agreement here proves the fold reproduces the
 //! resolver's compaction/retention rules exactly: L1 parts added at level 1,

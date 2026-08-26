@@ -184,6 +184,18 @@ impl ObjectStoreBackend for CountingStore {
         self.log.lists.lock().unwrap().push(prefix.to_string());
         self.inner.list(prefix, page).await
     }
+    async fn list_after(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        page: Option<PageToken>,
+    ) -> Result<ListPage, StoreError> {
+        // Log the listed prefix and forward to the inner store's native
+        // start-after so the below-watermark skip is exercised as it is in
+        // production (resolve lists one bounded LIST per shard, issue #730).
+        self.log.lists.lock().unwrap().push(prefix.to_string());
+        self.inner.list_after(prefix, start_after, page).await
+    }
     async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
         self.inner.list_delimited(prefix).await
     }
@@ -378,11 +390,14 @@ async fn hours_above_watermark_are_listed_not_snapshot_served() {
         2,
         "both the sealed and the still-open segment must be visible"
     );
-    let hot_prefix =
-        keys::commit_shard_hour_prefix(&tenant(), Signal::Metrics, 0, base_hour + 1).unwrap();
+    // The resolve lists one bounded LIST per shard (issue #730), resuming
+    // strictly after the watermark, so the shard prefix (not the per-hour
+    // prefix) is what reaches the store; the still-open hour above the
+    // watermark falls inside that shard's bounded scan.
+    let shard_prefix = keys::commit_shard_prefix(&tenant(), Signal::Metrics, 0).unwrap();
     assert!(
-        log.list_count_for(&hot_prefix) >= 1,
-        "the hour above the watermark must still be listed"
+        log.list_count_for(&shard_prefix) >= 1,
+        "the hour above the watermark must still be listed live, via the shard's bounded LIST"
     );
 }
 
@@ -413,7 +428,10 @@ async fn absent_head_falls_back_to_full_listing() {
         .await
         .expect("resolve falls back cleanly when no snapshot has ever been folded");
     assert_eq!(snapshot.segments.len(), 1);
-    let prefix = keys::commit_shard_hour_prefix(&tenant(), Signal::Metrics, 0, hour).unwrap();
+    // No fold has run, so the whole window is listed live: the resolve lists
+    // one bounded LIST per shard (issue #730), so the shard prefix reaches the
+    // store, not the per-hour prefix.
+    let prefix = keys::commit_shard_prefix(&tenant(), Signal::Metrics, 0).unwrap();
     assert!(log.list_count_for(&prefix) >= 1);
 }
 

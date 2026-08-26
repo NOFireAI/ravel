@@ -85,7 +85,7 @@ pub(crate) struct SnapshotWindow {
 impl SnapshotWindow {
     /// Extract entries for `[lower_hour, upper_hour]` (inclusive) from every
     /// part, filtered by event-time overlap with `query_range` exactly as
-    /// `Catalog::list_hour_bucket` does, deduped into `out` by data key. Entries are sorted
+    /// `Catalog::process_bucket` does, deduped into `out` by data key. Entries are sorted
     /// hour-major within each part, so the
     /// matching hour range is one contiguous slice found by
     /// `partition_point`.

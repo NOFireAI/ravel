@@ -109,18 +109,20 @@ pub const DEFAULT_PROTECTION_HORIZON_NS: i64 = 25 * 3_600 * 1_000_000_000 + 5 * 
 /// ([`crate::FoldReport::frontier_hours_deferred`]). 168 = seven days of
 /// hourly buckets.
 pub const DEFAULT_FRONTIER_RECONCILE_MAX_HOURS: u32 = 168;
-/// Default crossover at which `Catalog::resolve` switches from the
-/// per-(shard, ingest-hour) LIST loop to a single per-shard recursive prefix
-/// LIST (ADR-0056). Expressed in per-bucket request units, i.e. the number of
-/// `(shard, hour)` buckets the listing suffix spans: at or above this, the
-/// prefix scan (cost `O(objects / page_size)`, independent of window width)
-/// wins over the per-bucket loop (one LIST per bucket, empty buckets
-/// included). 720 is thirty days of hourly buckets at `shard_count = 1`: warm
-/// operational windows stay on the watermark-pruning per-bucket path, and the
-/// per-bucket path's request amplification is capped at 720 LISTs before the
-/// handoff. Purely a performance heuristic -- both paths return identical
-/// snapshots and both respect [`DEFAULT_MAX_CATALOG_LIST_REQUESTS`], so any
-/// value is correct.
+/// Default crossover at which `Catalog::resolve` switches from the non-prefix
+/// bounded LIST path to the per-shard recursive prefix scan (ADR-0056).
+/// Expressed in per-bucket request units, i.e. the number of `(shard, hour)`
+/// buckets the listing suffix spans. Both paths now list one bounded LIST per
+/// shard, resuming strictly after the watermark via `start_after`, so both
+/// cost `O(objects above the watermark / page_size)` and neither pages
+/// through a shard's below-watermark history. The remaining difference is only
+/// how each drains a shard: the non-prefix path fans the shards out
+/// concurrently and stops each at the first hour past the window; the prefix
+/// scan drains them sequentially under a page-by-page request cap, which is
+/// what a very wide window wants. 720 is thirty days of hourly buckets at
+/// `shard_count = 1`. Purely a performance heuristic -- both paths return
+/// identical snapshots and both respect [`DEFAULT_MAX_CATALOG_LIST_REQUESTS`],
+/// so any value is correct.
 pub const DEFAULT_PREFIX_LIST_CROSSOVER_REQUESTS: u64 = 720;
 
 /// Catalog configuration.
