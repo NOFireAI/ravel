@@ -43,6 +43,12 @@ pub enum DeclaredType {
     /// (ADR-0099 decision 5): a dict-encoded page becomes the Arrow dictionary
     /// and its ids with no per-row allocation, and a plain page a degenerate
     /// identity dictionary, so both paths build the one schema DataFusion checks.
+    ///
+    /// A `GROUP BY` over a column of this type must not reach DataFusion's
+    /// `RowConverter` path: `Dictionary(Int32, Utf8)` is grouped through
+    /// `GroupValuesRows`, whose `emit` decodes every group key back into one
+    /// `Utf8` array and panics with `offset overflow` once the decoded bytes
+    /// cross `i32::MAX` (issue #737).
     Str,
     /// An `I64`-typed attribute, projected as Arrow `Int64`.
     I64,
