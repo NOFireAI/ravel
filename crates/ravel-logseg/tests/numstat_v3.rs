@@ -521,36 +521,43 @@ proptest! {
     }
 }
 
-/// The v3 trailer is what the writer emits and the only version the reader
-/// accepts: a v2 object (or any other version) is refused with the typed
-/// `UnsupportedVersion`, since ADR-0095 deleted v2 read support in the same
-/// change. Exercised on a real written object rather than a hand-built footer.
+/// The v4 trailer is what the writer emits, and the accepted window is v4 plus
+/// the v3 objects the N-1 reader still decodes (ADR-0699 decision 3). Any other
+/// version is refused with the typed `UnsupportedVersion`: v2 read support was
+/// deleted by ADR-0095 and stays deleted, and a v5 object is fail-closed-on-newer.
+/// Exercised on a real written object rather than a hand-built footer.
 #[test]
-fn writer_emits_v3_and_reader_refuses_anything_else() {
+fn writer_emits_v4_and_reader_refuses_outside_the_window() {
     let specs: [StreamSpec; 3] = [None, None, None];
     let obj = write_object(&[vec![("dur".to_string(), AttrValue::I64(5))]], &specs, 1);
     let n = obj.len();
     assert_eq!(
         u16::from_le_bytes([obj[n - 8], obj[n - 7]]),
-        3,
-        "the writer emits trailer version 3"
+        4,
+        "the writer emits trailer version 4"
     );
-    assert_eq!(footer::VERSION, 3);
-    assert!(footer::SUPPORTED_VERSIONS.contains(3));
+    assert_eq!(footer::VERSION, 4);
+    assert!(footer::SUPPORTED_VERSIONS.contains(4));
+    assert!(
+        footer::SUPPORTED_VERSIONS.contains(3),
+        "v3 is the N-1 half of the window"
+    );
     assert!(
         !footer::SUPPORTED_VERSIONS.contains(2),
         "v2 read support is deleted, not windowed"
     );
 
     // The version check in open_from_suffix runs before the footer crc is
-    // verified, so downgrading just the version field is rejected as
+    // verified, so rewriting just the version field is rejected as
     // UnsupportedVersion specifically, not masked by a stale-crc Corrupted
     // error -- confirmed by asserting the exact variant, not just is_err().
-    let mut downgraded = obj.clone();
-    downgraded[n - 8..n - 6].copy_from_slice(&2u16.to_le_bytes());
-    match footer::open(&downgraded) {
-        Err(ravel_logseg::LogSegError::UnsupportedVersion(2)) => {}
-        other => panic!("expected UnsupportedVersion(2), got {other:?}"),
+    for bad in [2u16, 5u16] {
+        let mut retagged = obj.clone();
+        retagged[n - 8..n - 6].copy_from_slice(&bad.to_le_bytes());
+        match footer::open(&retagged) {
+            Err(ravel_logseg::LogSegError::UnsupportedVersion(v)) if v == bad => {}
+            other => panic!("expected UnsupportedVersion({bad}), got {other:?}"),
+        }
     }
 }
 

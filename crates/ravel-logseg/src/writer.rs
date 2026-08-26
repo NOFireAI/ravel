@@ -14,14 +14,17 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use ravel_types::logstream::{AttrValue, LogStreamId, canonical_attr_bytes};
 
 use crate::block::{
-    BlockStrDict, ColumnPlan, ColumnarBlockInput, write_block, write_block_columnar,
+    BlockStrDict, BlockWriteOut, ColumnPlan, ColumnarBlockInput, write_block, write_block_columnar,
 };
 use crate::bloom::BloomBuilder;
 use crate::bloom_section::encode_bloom_section;
 use crate::columnar_batch::ColumnarLogBatch;
 use crate::error::LogSegError;
 use crate::field_dir::{FieldDir, FieldEntry};
-use crate::footer::{COMP_NONE, COMP_ZSTD, LogFooter, SectionDesc, kind, write_footer_and_trailer};
+use crate::footer::{
+    self, COMP_NONE, COMP_ZSTD, LogFooter, SectionDesc, kind, write_footer_and_trailer_versioned,
+};
+use crate::page_dir::{ChunkEntry, GroupEntry, PageDir, PageEntry};
 use crate::postings::{DEFAULT_STRIDE, FieldTerms, encode_postings_section, term_key};
 use crate::reader::stream_attr_pairs;
 use crate::record::{
@@ -209,10 +212,45 @@ impl RlogWriter {
     /// Like [`RlogWriter::finish`], but also returns counters
     /// ([`WriteStats`]) not otherwise recoverable from the object bytes.
     pub fn finish_with_stats(self) -> Result<(Vec<u8>, WriteStats), LogSegError> {
-        if !self.batches.is_empty() {
-            return self.build_object_columnar(0, Vec::new(), 0);
+        let layout = self.layout();
+        self.build(0, Vec::new(), 0, layout)
+    }
+
+    /// Produces the object in the version-3 BLOCKS layout: each block is
+    /// `header || pages`, there is no PAGE_DIR section, and the trailer says 3.
+    ///
+    /// Production never writes version 3 -- ADR-0699 decision 3 makes 4 the
+    /// written version and this is not a supported entry point. It exists so
+    /// the version-3 reader, which stays as the N-1 reader (ADR-0066
+    /// decision 1), has a producer for arbitrary inputs to be tested against;
+    /// the frozen `tests/fixtures/golden_rlog_v3.bin` pins one input, and the
+    /// differential proptests need all of them.
+    #[doc(hidden)]
+    pub fn finish_v3_for_tests(self) -> Result<Vec<u8>, LogSegError> {
+        self.build(0, Vec::new(), 0, Layout::V3).map(|(b, _)| b)
+    }
+
+    /// The row-group layout this writer's configuration asks for.
+    fn layout(&self) -> Layout {
+        Layout::V4 {
+            group_target_blocks: self.cfg.group_target_blocks,
         }
-        self.build_object(0, Vec::new(), 0)
+    }
+
+    /// Routes to the row or columnar build pipeline. A writer is one or the
+    /// other for its lifetime (ADR-0109 decision 5), and both produce the same
+    /// bytes for the same records.
+    fn build(
+        self,
+        level: u32,
+        input_set_hash: Vec<u8>,
+        part_index: u32,
+        layout: Layout,
+    ) -> Result<(Vec<u8>, WriteStats), LogSegError> {
+        if !self.batches.is_empty() {
+            return self.build_object_columnar(level, input_set_hash, part_index, layout);
+        }
+        self.build_object(level, input_set_hash, part_index, layout)
     }
 
     /// Produces the whole object as an L1 compacted part, stamping the caller's
@@ -247,10 +285,8 @@ impl RlogWriter {
         input_set_hash: Vec<u8>,
         part_index: u32,
     ) -> Result<(Vec<u8>, WriteStats), LogSegError> {
-        if !self.batches.is_empty() {
-            return self.build_object_columnar(level, input_set_hash, part_index);
-        }
-        self.build_object(level, input_set_hash, part_index)
+        let layout = self.layout();
+        self.build(level, input_set_hash, part_index, layout)
     }
 
     /// The shared object-building pipeline behind [`RlogWriter::finish`] and
@@ -263,6 +299,7 @@ impl RlogWriter {
         level: u32,
         input_set_hash: Vec<u8>,
         part_index: u32,
+        layout: Layout,
     ) -> Result<(Vec<u8>, WriteStats), LogSegError> {
         if self.records.is_empty() {
             return Err(LogSegError::LimitExceeded("empty object".into()));
@@ -472,8 +509,7 @@ impl RlogWriter {
         let mut first_blk: HashMap<u32, u32> = HashMap::new();
         let mut last_blk: HashMap<u32, u32> = HashMap::new();
 
-        let mut blocks_bytes: Vec<u8> = Vec::new();
-        let mut l0: Vec<Level0Entry> = Vec::new();
+        let mut blocks = BlocksBuilder::new(layout);
         let mut bloom_entries: Vec<Vec<u8>> = Vec::new();
 
         // POSTINGS accumulation: per indexed column, term -> sorted block
@@ -593,19 +629,7 @@ impl RlogWriter {
                 }
             }
 
-            let block_offset = blocks_bytes.len() as u64;
-            blocks_bytes.extend_from_slice(&out.bytes);
-            l0.push(Level0Entry {
-                block_offset,
-                block_len: out.bytes.len() as u64,
-                block_crc32c: out.crc32c,
-                record_count: out.record_count,
-                min_ts: out.min_ts,
-                max_ts: out.max_ts,
-                min_stream_ref: out.min_stream_ref,
-                max_stream_ref: out.max_stream_ref,
-                stats: out.stats,
-            });
+            blocks.push(out);
         }
 
         // STREAM_DIR.
@@ -645,6 +669,7 @@ impl RlogWriter {
             .collect();
         let field_dir = FieldDir::new(field_entries);
 
+        let (blocks_bytes, l0, page_dir) = blocks.finish();
         let skip = SkipIndex::build(l0);
 
         // Final per-field postings verdict: capped fields get `Capped`
@@ -703,6 +728,17 @@ impl RlogWriter {
             kind::SKIP_IDX,
             &compress(&skip.encode(), self.cfg.zstd_level)?,
         );
+        // PAGE_DIR is mandatory in version 4 and absent in version 3
+        // (ADR-0699 decision 2). Compressed as a whole section under the
+        // section crc, like SKIP_IDX: it is read whole on every open.
+        if layout != Layout::V3 {
+            push_section(
+                &mut object,
+                &mut sections,
+                kind::PAGE_DIR,
+                &compress(&page_dir.encode(), self.cfg.zstd_level)?,
+            );
+        }
         push_section(
             &mut object,
             &mut sections,
@@ -747,7 +783,7 @@ impl RlogWriter {
             input_set_hash,
             part_index,
         };
-        write_footer_and_trailer(&mut object, &footer);
+        write_footer_and_trailer_versioned(&mut object, &footer, layout.trailer_version());
         Ok((
             object,
             WriteStats {
@@ -787,6 +823,7 @@ impl RlogWriter {
         level: u32,
         input_set_hash: Vec<u8>,
         part_index: u32,
+        layout: Layout,
     ) -> Result<(Vec<u8>, WriteStats), LogSegError> {
         let batches = &self.batches;
         let total_rows: usize = batches.iter().map(|b| b.num_rows).sum();
@@ -1129,8 +1166,7 @@ impl RlogWriter {
         let mut col_blocks: HashMap<u32, u32> = HashMap::new();
         let mut first_blk: HashMap<u32, u32> = HashMap::new();
         let mut last_blk: HashMap<u32, u32> = HashMap::new();
-        let mut blocks_bytes: Vec<u8> = Vec::new();
-        let mut l0: Vec<Level0Entry> = Vec::new();
+        let mut blocks = BlocksBuilder::new(layout);
         let mut bloom_entries: Vec<Vec<u8>> = Vec::new();
         let mut postings_terms: BTreeMap<u32, BTreeMap<Vec<u8>, BTreeSet<u32>>> = BTreeMap::new();
         let mut postings_capped: BTreeSet<u32> = BTreeSet::new();
@@ -1399,19 +1435,7 @@ impl RlogWriter {
                 *col_blocks.entry(*cid).or_insert(0) += 1;
             }
 
-            let block_offset = blocks_bytes.len() as u64;
-            blocks_bytes.extend_from_slice(&out.bytes);
-            l0.push(Level0Entry {
-                block_offset,
-                block_len: out.bytes.len() as u64,
-                block_crc32c: out.crc32c,
-                record_count: out.record_count,
-                min_ts: out.min_ts,
-                max_ts: out.max_ts,
-                min_stream_ref: out.min_stream_ref,
-                max_stream_ref: out.max_stream_ref,
-                stats: out.stats,
-            });
+            blocks.push(out);
         }
 
         // STREAM_DIR.
@@ -1451,6 +1475,7 @@ impl RlogWriter {
             .collect();
         let field_dir = FieldDir::new(field_entries);
 
+        let (blocks_bytes, l0, page_dir) = blocks.finish();
         let skip = SkipIndex::build(l0);
 
         let postings_capped_fields = postings_capped.len() as u32;
@@ -1498,6 +1523,17 @@ impl RlogWriter {
             kind::SKIP_IDX,
             &compress(&skip.encode(), self.cfg.zstd_level)?,
         );
+        // PAGE_DIR is mandatory in version 4 and absent in version 3
+        // (ADR-0699 decision 2). Compressed as a whole section under the
+        // section crc, like SKIP_IDX: it is read whole on every open.
+        if layout != Layout::V3 {
+            push_section(
+                &mut object,
+                &mut sections,
+                kind::PAGE_DIR,
+                &compress(&page_dir.encode(), self.cfg.zstd_level)?,
+            );
+        }
         push_section(
             &mut object,
             &mut sections,
@@ -1538,7 +1574,7 @@ impl RlogWriter {
             input_set_hash,
             part_index,
         };
-        write_footer_and_trailer(&mut object, &footer);
+        write_footer_and_trailer_versioned(&mut object, &footer, layout.trailer_version());
         Ok((
             object,
             WriteStats {
@@ -2016,6 +2052,217 @@ fn insert_text(builder: &mut BloomBuilder, column_id: u32, bytes: &[u8]) {
     }
 }
 
+/// Which BLOCKS layout a build emits.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Layout {
+    /// Version 3: each block is `header || pages`, written as the block is
+    /// encoded, and its SKIP_IDX level-0 crc covers the whole of it. Never
+    /// written in production; see [`RlogWriter::finish_v3_for_tests`].
+    V3,
+    /// Version 4 (ADR-0699 decision 1): row groups of `group_target_blocks`
+    /// consecutive blocks, pages column-major inside a group.
+    V4 { group_target_blocks: usize },
+}
+
+impl Layout {
+    fn trailer_version(self) -> u16 {
+        match self {
+            Layout::V3 => 3,
+            Layout::V4 { .. } => footer::VERSION,
+        }
+    }
+}
+
+/// Places encoded blocks into the BLOCKS section and, for version 4, builds the
+/// PAGE_DIR that locates their pages.
+///
+/// Version 4 buffers one row group's blocks before placing any of them: within
+/// a group the pages are stored grouped by column then by block, so a column's
+/// pages for the whole group are contiguous (a *column chunk*) and the chunks
+/// follow each other in `column_id` order (ADR-0699 decision 1). That buffer is
+/// the writer's entire extra working set over the one-block-of-cells peak #682
+/// established, and `group_target_blocks` bounds it: at most that many blocks'
+/// *encoded, already-compressed* pages are resident at once, plus the blocks'
+/// stats.
+///
+/// `block_offset`/`block_len` in a version-4 SKIP_IDX level-0 entry describe the
+/// block's page span -- from its first page's offset to the end of its last --
+/// which is a superset range containing every one of its pages, not the exact
+/// extent it was under version 3. Nothing locates a version-4 page through it;
+/// PAGE_DIR does that.
+struct BlocksBuilder {
+    layout: Layout,
+    /// The BLOCKS section bytes built so far. Offsets recorded in PAGE_DIR and
+    /// in SKIP_IDX are relative to its start.
+    bytes: Vec<u8>,
+    dir: PageDir,
+    /// The current row group's encoded blocks, not yet placed.
+    pending: Vec<BlockWriteOut>,
+    /// Level-0 entries in block order, complete once the block's group flushed.
+    l0: Vec<Level0Entry>,
+}
+
+impl BlocksBuilder {
+    fn new(layout: Layout) -> Self {
+        BlocksBuilder {
+            layout,
+            bytes: Vec::new(),
+            dir: PageDir::default(),
+            pending: Vec::new(),
+            l0: Vec::new(),
+        }
+    }
+
+    /// Adds one encoded block. Under version 4 the block is buffered and placed
+    /// when its row group fills; under version 3 it is written immediately.
+    fn push(&mut self, out: BlockWriteOut) {
+        match self.layout {
+            Layout::V3 => {
+                let (block, crc) = out.v3_bytes();
+                let block_offset = self.bytes.len() as u64;
+                self.bytes.extend_from_slice(&block);
+                self.l0
+                    .push(level0(&out, block_offset, block.len() as u64, crc));
+            }
+            Layout::V4 {
+                group_target_blocks,
+            } => {
+                self.pending.push(out);
+                if self.pending.len() >= group_target_blocks.max(1) {
+                    self.flush_group();
+                }
+            }
+        }
+    }
+
+    /// Places the buffered row group column-major and records its PAGE_DIR
+    /// entry. A group shorter than `group_target_blocks` (the object's last, or
+    /// its only) is laid out identically, so a small flush object pays nothing
+    /// for the level.
+    fn flush_group(&mut self) {
+        let pending = std::mem::take(&mut self.pending);
+        if pending.is_empty() {
+            return;
+        }
+        let first_block = self.l0.len() as u32;
+        let block_count = pending.len();
+
+        // Per block, the byte offset of each of its pages inside its own
+        // payload, so a page can be sliced out of it while placing the chunk.
+        let payload_offsets: Vec<Vec<u64>> = pending
+            .iter()
+            .map(|out| {
+                let mut at = 0u64;
+                out.descs
+                    .iter()
+                    .map(|d| {
+                        let start = at;
+                        at += d.len;
+                        start
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // Column chunks, in ascending column_id order. `BTreeMap` (never
+        // `HashMap`) so identical input yields byte-identical output, the same
+        // determinism rule the rest of this pipeline follows.
+        let mut by_column: BTreeMap<u32, Vec<(usize, usize)>> = BTreeMap::new();
+        for (bi, out) in pending.iter().enumerate() {
+            for (di, d) in out.descs.iter().enumerate() {
+                by_column.entry(d.column_id).or_default().push((bi, di));
+            }
+        }
+
+        // Every block's page span, for its SKIP_IDX level-0 byte range, and its
+        // version-4 crc, accumulated as its pages are placed. Chunks are
+        // visited in ascending column_id order and a chunk's pages in ascending
+        // block order, so each block's pages are folded in exactly the order
+        // PAGE_DIR lists them, which is the order ADR-0699 decision 2 defines
+        // the block crc over. That is NOT the order `BlockWriteOut::payload`
+        // holds them in: the fixed columns are staged in field order, so
+        // `flags` (column 8) is staged before `severity_text` (column 4).
+        let mut span_start = vec![u64::MAX; block_count];
+        let mut span_end = vec![0u64; block_count];
+        let mut block_crc = vec![0u32; block_count];
+
+        let mut chunks = Vec::with_capacity(by_column.len());
+        for (column_id, entries) in by_column {
+            let offset = self.bytes.len() as u64;
+            let mut pages = Vec::with_capacity(entries.len());
+            for (bi, di) in entries {
+                let out = &pending[bi];
+                let desc = out.descs[di];
+                let at = self.bytes.len() as u64;
+                let from = payload_offsets[bi][di] as usize;
+                let to = from + desc.len as usize;
+                let stored = &out.payload[from..to];
+                self.bytes.extend_from_slice(stored);
+                span_start[bi] = span_start[bi].min(at);
+                span_end[bi] = span_end[bi].max(at + desc.len);
+                block_crc[bi] = crc32c::crc32c_append(block_crc[bi], stored);
+                pages.push(PageEntry {
+                    block: bi as u32,
+                    enc: desc.enc,
+                    comp: desc.comp,
+                    len: desc.len,
+                    uncomp_len: desc.uncomp_len,
+                    crc32c: crc32c::crc32c(stored),
+                });
+            }
+            chunks.push(ChunkEntry {
+                column_id,
+                offset,
+                pages,
+            });
+        }
+
+        for (bi, out) in pending.iter().enumerate() {
+            // A block always carries at least its ts page, so its span is
+            // always real; guard anyway rather than underflow on an empty one.
+            let (start, end) = if span_start[bi] == u64::MAX {
+                (self.bytes.len() as u64, self.bytes.len() as u64)
+            } else {
+                (span_start[bi], span_end[bi])
+            };
+            self.l0.push(level0(out, start, end - start, block_crc[bi]));
+        }
+
+        self.dir.groups.push(GroupEntry {
+            first_block,
+            block_count: block_count as u32,
+            chunks,
+        });
+    }
+
+    /// The finished BLOCKS bytes, the level-0 entries, and the PAGE_DIR (empty
+    /// under version 3, where no such section is written).
+    fn finish(mut self) -> (Vec<u8>, Vec<Level0Entry>, PageDir) {
+        self.flush_group();
+        (self.bytes, self.l0, self.dir)
+    }
+}
+
+/// The SKIP_IDX level-0 entry for one encoded block.
+fn level0(
+    out: &BlockWriteOut,
+    block_offset: u64,
+    block_len: u64,
+    block_crc32c: u32,
+) -> Level0Entry {
+    Level0Entry {
+        block_offset,
+        block_len,
+        block_crc32c,
+        record_count: out.record_count,
+        min_ts: out.min_ts,
+        max_ts: out.max_ts,
+        min_stream_ref: out.min_stream_ref,
+        max_stream_ref: out.max_stream_ref,
+        stats: out.stats.clone(),
+    }
+}
+
 /// A section's stored bytes plus its compression descriptor fields.
 struct Stored {
     bytes: Vec<u8>,
@@ -2057,6 +2304,84 @@ fn push_section(object: &mut Vec<u8>, sections: &mut Vec<SectionDesc>, kind: u32
         comp: stored.comp,
         uncomp_len: stored.uncomp_len,
     });
+}
+
+/// The row-group buffer's block bound (ADR-0699 consequences), pinned directly
+/// on the buffer rather than inferred from the object.
+/// `tests/rlog_v4_row_group_working_set.rs` pins the byte size that bound
+/// implies.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod row_group_buffer {
+    use super::*;
+    use crate::page::PageDesc;
+
+    fn block(payload_len: usize, columns: &[u32]) -> BlockWriteOut {
+        let each = payload_len / columns.len().max(1);
+        BlockWriteOut {
+            descs: columns
+                .iter()
+                .map(|c| PageDesc {
+                    column_id: *c,
+                    enc: crate::encoding::Enc::Plain,
+                    comp: 0,
+                    len: each as u64,
+                    uncomp_len: each as u64,
+                })
+                .collect(),
+            payload: vec![7u8; each * columns.len()],
+            record_count: 8,
+            stats: Vec::new(),
+            min_ts: 0,
+            max_ts: 1,
+            min_stream_ref: 0,
+            max_stream_ref: 0,
+        }
+    }
+
+    #[test]
+    fn never_holds_more_than_group_target_blocks() {
+        for group in [1usize, 3, 32] {
+            let mut builder = BlocksBuilder::new(Layout::V4 {
+                group_target_blocks: group,
+            });
+            for _ in 0..(3 * group + 1) {
+                builder.push(block(64, &[0, 4, 9]));
+                assert!(
+                    builder.pending.len() < group,
+                    "buffer held {} blocks at a {group}-block group target",
+                    builder.pending.len()
+                );
+            }
+            let (_, l0, dir) = builder.finish();
+            assert_eq!(l0.len(), 3 * group + 1);
+            assert_eq!(dir.block_count(), l0.len() as u64);
+            for g in &dir.groups {
+                assert!(
+                    g.block_count as usize <= group,
+                    "row group of {} blocks over the {group}-block target",
+                    g.block_count
+                );
+            }
+        }
+    }
+
+    /// A zero group target is treated as one block per group rather than
+    /// buffering the whole object: the config is a target, and a nonsense value
+    /// must not turn the bounded working set into an unbounded one.
+    #[test]
+    fn zero_group_target_does_not_buffer_the_object() {
+        let mut builder = BlocksBuilder::new(Layout::V4 {
+            group_target_blocks: 0,
+        });
+        for _ in 0..5 {
+            builder.push(block(64, &[0]));
+            assert!(builder.pending.is_empty());
+        }
+        let (_, l0, dir) = builder.finish();
+        assert_eq!(l0.len(), 5);
+        assert_eq!(dir.groups.len(), 5);
+    }
 }
 
 #[cfg(test)]

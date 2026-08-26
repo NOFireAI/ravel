@@ -328,9 +328,20 @@ pub(crate) async fn load_catalog_from_object(
         Vec::new()
     };
 
+    // PAGE_DIR is present exactly on a version-4 input (ADR-0699
+    // decision 2), and locating its blocks' pages is impossible without it.
+    let page_dir_raw = match ftr.section(kind::PAGE_DIR) {
+        Some(_) => Some(fetch_section(store, &object_key, &ftr, kind::PAGE_DIR, &cfg).await?),
+        None => None,
+    };
     let record_count = ftr.record_count;
-    let reader =
-        RlogRangeReader::from_sections(&ftr, &stream_dir_raw, &field_dir_raw, &skip_idx_raw)?;
+    let reader = RlogRangeReader::from_sections_with_page_dir(
+        &ftr,
+        &stream_dir_raw,
+        &field_dir_raw,
+        &skip_idx_raw,
+        page_dir_raw.as_deref(),
+    )?;
     Ok(RlogInputCatalog {
         object_key,
         reader,

@@ -1,8 +1,16 @@
-//! Golden-bytes regression for the RLOG v3 writer (ADR-0095,
-//! docs/log-segment-format.md): the writer's output for a fixed representative
-//! input must stay byte-for-byte identical across internal refactors of the v3
-//! encode path. RLOG v3 is a frozen persistent contract; this test is the
-//! tripwire for an accidental format change.
+//! Golden-bytes regression for RLOG v3 (ADR-0095,
+//! docs/log-segment-format.md): the version-3 encode path's output for a fixed
+//! representative input must stay byte-for-byte identical, and the frozen
+//! fixture must keep decoding through the version-3 reader. RLOG v3 is a frozen
+//! persistent contract; this test is the tripwire for an accidental change to
+//! it.
+//!
+//! Since ADR-0699 the writer emits version 4, so the bytes here come from
+//! `RlogWriter::finish_v3_for_tests` -- the version-3 producer retained for the
+//! version-3 reader, which stays as the N-1 reader (ADR-0066 decision 1). The
+//! fixture is never regenerated: version 3 is not written any more, so any
+//! divergence from it is a regression in the N-1 path, never a deliberate
+//! change. `tests/golden_bytes_v4.rs` pins what the writer actually emits.
 //!
 //! The fixture's records include one attribute name carried twice over two
 //! types, so the pinned bytes cover v3's SKIP_IDX NumStat rule (a stat bounds
@@ -17,9 +25,6 @@
 //! (no `SystemTime::now`, no randomness), so the output is deterministic and
 //! golden-pinnable.
 //!
-//! To regenerate `golden_rlog_v3.bin` after a deliberate, versioned format
-//! change (never for an internal refactor), run:
-//!   cargo test -p ravel-logseg --test golden_bytes_v3 -- --ignored --nocapture
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use ravel_logseg::field_dir::FieldDir;
@@ -108,7 +113,7 @@ fn write_golden() -> Vec<u8> {
     for rec in golden_records() {
         w.push(rec).expect("push record");
     }
-    w.finish().expect("finish v3 golden")
+    w.finish_v3_for_tests().expect("finish v3 golden")
 }
 
 #[test]
@@ -123,13 +128,18 @@ fn matches_golden_fixture() {
          without a version bump and ADR"
     );
 
-    // The trailer carries the live footer::VERSION (never a mirrored literal),
-    // and every mandatory v1 section is present.
+    // The trailer says 3, which is the window's floor, not its current
+    // version; a version-3 object is exactly the N-1 case the window exists
+    // for.
     let n = written.len();
     assert_eq!(
         u16::from_le_bytes([written[n - 8], written[n - 7]]),
-        footer::VERSION,
-        "trailer must carry the live footer::VERSION"
+        footer::SUPPORTED_VERSIONS.oldest(),
+        "the version-3 fixture sits at the window floor"
+    );
+    assert!(
+        footer::SUPPORTED_VERSIONS.contains(3),
+        "version 3 must stay readable (ADR-0066 decision 1)"
     );
     let decoded = open(&written).expect("open golden object");
     for k in [
@@ -144,6 +154,10 @@ fn matches_golden_fixture() {
             "mandatory section kind {k} present"
         );
     }
+    assert!(
+        decoded.section(kind::PAGE_DIR).is_none(),
+        "version 3 carries no PAGE_DIR"
+    );
 
     // The whole object round-trips: every record is recoverable. An empty
     // `And` matches every record.
@@ -201,17 +215,4 @@ fn write_is_deterministic_across_repeated_calls() {
         write_golden(),
         "v3 output must be deterministic"
     );
-}
-
-#[test]
-#[ignore = "regenerates a golden fixture; run explicitly, never in CI"]
-fn capture_golden_rlog_v3() {
-    std::fs::write(
-        concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/golden_rlog_v3.bin"
-        ),
-        write_golden(),
-    )
-    .expect("write fixture");
 }

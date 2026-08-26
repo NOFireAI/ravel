@@ -24,12 +24,16 @@ pub const MAGIC: [u8; 4] = *b"RLG1";
 /// bounded too, by whatever its stream layer gives it. The bytes are unchanged
 /// in shape, so nothing but this version byte distinguishes the two meanings.
 ///
-/// The reader gates on the single-version window below, so a v1 or v2 object is
-/// rejected outright; there is no dual-reader path and no `maintain migrate`
-/// rewrite (ADR-0095: pre-release single-supported-version regime, ADR-0027).
-/// Every stored v2 object becomes unreadable when this build ships;
-/// convergence is retention expiry or re-ingestion.
-pub const VERSION: u16 = 3;
+/// Bumped 3 -> 4 by ADR-0699, which moved BLOCKS to row groups whose pages are
+/// stored column-major and moved the page descriptors out of the block header
+/// into the new PAGE_DIR section. A version-4 block is not a contiguous byte
+/// range and has no header, so nothing but this version byte tells a reader
+/// which of the two layouts BLOCKS holds.
+///
+/// Version 3 remains readable: it is the N-1 half of the window below
+/// (ADR-0066 decision 1), so a stored version-3 object keeps decoding while
+/// compaction and `maintain migrate` rewrite it to version 4.
+pub const VERSION: u16 = 4;
 
 /// The set of RLOG trailer versions this build's reader accepts (ADR-0066
 /// decision 1: "N/N-1 window, readers first"). Writers always emit the current
@@ -85,12 +89,12 @@ impl SupportedVersions {
     }
 }
 
-/// RLOG's supported-version window. Today it resolves to the single current
-/// version [`VERSION`] (v3, ADR-0095); the machinery carries ADR-0066's
-/// two-wide shape ready for the first post-release bump. This is the single
+/// RLOG's supported-version window: `{3, 4}` since ADR-0699 decision 3, the
+/// first RLOG bump to ship a dual reader. The writer emits
+/// `SUPPORTED_VERSIONS.newest()`; the reader accepts either. This is the single
 /// source the writer, the reader gate, `audit-versions`, `migrate`, and the
 /// compactor's `OUTPUT_FORMAT_VERSION` all read.
-pub const SUPPORTED_VERSIONS: SupportedVersions = SupportedVersions::single(VERSION);
+pub const SUPPORTED_VERSIONS: SupportedVersions = SupportedVersions::n_and_prev(VERSION);
 
 /// Signal byte for log segments.
 pub const SIGNAL_LOGS: u8 = 2;
@@ -256,13 +260,23 @@ fn footer_crc(footer_bytes: &[u8], footer_len: u32, version: u16, signal: u8, re
 
 /// Appends the footer protobuf bytes and the 16-byte trailer to `out`.
 pub fn write_footer_and_trailer(out: &mut Vec<u8>, footer: &LogFooter) {
+    write_footer_and_trailer_versioned(out, footer, VERSION);
+}
+
+/// [`write_footer_and_trailer`] with the trailer version named explicitly.
+///
+/// The writer always emits [`VERSION`]. This exists so the version-3 producer
+/// the version-3 reader's tests need
+/// (`RlogWriter::finish_v3_for_tests`) can stamp the version its layout
+/// actually is, without a second copy of the trailer arithmetic.
+pub fn write_footer_and_trailer_versioned(out: &mut Vec<u8>, footer: &LogFooter, version: u16) {
     let footer_bytes = footer.to_proto().encode_to_vec();
     let footer_len = footer_bytes.len() as u32;
-    let crc = footer_crc(&footer_bytes, footer_len, VERSION, SIGNAL_LOGS, RESERVED);
+    let crc = footer_crc(&footer_bytes, footer_len, version, SIGNAL_LOGS, RESERVED);
     out.extend_from_slice(&footer_bytes);
     out.extend_from_slice(&footer_len.to_le_bytes());
     out.extend_from_slice(&crc.to_le_bytes());
-    out.extend_from_slice(&VERSION.to_le_bytes());
+    out.extend_from_slice(&version.to_le_bytes());
     out.push(SIGNAL_LOGS);
     out.push(RESERVED);
     out.extend_from_slice(&MAGIC);
@@ -622,16 +636,16 @@ mod tests {
         ));
     }
 
-    /// Today's RLOG window resolves to exactly the single current version, so
-    /// the reader's accepted set is byte-for-byte the pre-ADR-0066 behaviour:
-    /// v3 accepted, v2 and a hypothetical v4 rejected. Only the window's shape
-    /// is new machinery.
+    /// Today's RLOG window is the N/N-1 pair ADR-0699 decision 3 opened: the
+    /// current version 4 and the version-3 objects the N-1 reader still
+    /// decodes. Version 2 and a hypothetical version 5 are rejected.
     #[test]
-    fn todays_window_accepts_only_the_current_version() {
+    fn todays_window_accepts_the_current_version_and_its_predecessor() {
         assert_eq!(SUPPORTED_VERSIONS.newest(), VERSION);
-        assert_eq!(SUPPORTED_VERSIONS.oldest(), VERSION);
+        assert_eq!(SUPPORTED_VERSIONS.oldest(), VERSION - 1);
         assert!(SUPPORTED_VERSIONS.contains(VERSION));
-        assert!(!SUPPORTED_VERSIONS.contains(VERSION - 1));
+        assert!(SUPPORTED_VERSIONS.contains(VERSION - 1));
+        assert!(!SUPPORTED_VERSIONS.contains(VERSION - 2));
         assert!(!SUPPORTED_VERSIONS.contains(VERSION + 1));
     }
 
