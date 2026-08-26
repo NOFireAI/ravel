@@ -27,10 +27,10 @@ pub use fetcher::{
     SamplePriority, SegmentFetcher,
 };
 pub use log_fetcher::{
-    BlockRangeFetcher, BlockRangeStats, ColumnarBlockOutcome, DEFAULT_LOG_COALESCE_GAP,
-    DEFAULT_LOG_COVERAGE_THRESHOLD, DEFAULT_LOG_MAX_CONCURRENT_GETS, DEFAULT_LOG_SUFFIX_LEN,
-    DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD, LogFetchError, LogFetchOutput, LogQuery, LogSegmentFetcher,
-    LogSegmentScan, StreamAttrEquals,
+    BlockRangeFetcher, BlockRangeStats, BlockStatsReport, ColumnarBlockOutcome,
+    DEFAULT_LOG_COALESCE_GAP, DEFAULT_LOG_COVERAGE_THRESHOLD, DEFAULT_LOG_MAX_CONCURRENT_GETS,
+    DEFAULT_LOG_SUFFIX_LEN, DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD, LogFetchError, LogFetchOutput,
+    LogQuery, LogSegmentFetcher, LogSegmentScan, StreamAttrEquals,
 };
 pub use query_admission::{
     QueryAdmissionController, QueryConcurrencyLimit, QueryPermit, QueryRejected,
