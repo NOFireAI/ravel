@@ -234,7 +234,7 @@ async fn seed_orphan_l0(store: &MemoryStore, tenant: &str, shard: u32, seq: u64)
 async fn compact_empty_bucket_is_below_min() {
     // Hour 0 is long sealed; an empty bucket has zero inputs, below the
     // min-inputs trigger, so a dry run reports it and writes nothing.
-    compact(store(), "acme", SignalArg::Metrics, 0, 0, true)
+    compact(store(), "acme", SignalArg::Metrics, 0, 0, true, None)
         .await
         .expect("compact dry-run runs");
 }
