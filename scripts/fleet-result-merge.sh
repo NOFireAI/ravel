@@ -4,8 +4,20 @@
 # status checks, linear history / rebase-merge only, no direct pushes), so
 # this script never merges or pushes to main itself. It cleans the result
 # branch's history (see the squash step below), pushes the cleaned history
-# to a PR head branch, opens a PR, and enables auto-merge (--rebase) so
-# GitHub lands it once the required checks pass.
+# to a PR head branch, and opens a PR.
+#
+# The PR is opened WITHOUT auto-merge by default (standing rule, 2026-08-26):
+# CodeRabbit's GitHub App reviews every PR but posts as a review comment, not
+# a required status check, so `--auto` merges before that review lands.
+# #749/#750 landed with 6 real CodeRabbit findings unaddressed this way. Wait
+# for the coderabbitai[bot] review, fix or explicitly answer every actionable
+# finding it raises (a walkthrough-only comment with zero findings counts as
+# clean), then merge by hand once CI is green:
+#   gh pr merge <n> --rebase
+# `scripts/pr-review-status.sh <n>` prints CI + CodeRabbit status in one line.
+# FLEET_MERGE_AUTO=1 restores the old behavior (`gh pr merge --auto --rebase`)
+# for a case that genuinely does not need a CodeRabbit wait; do not set this
+# out of impatience, only when you have already confirmed no review applies.
 #
 # Run fleet-result-inspect.sh first and review its output; this script
 # does not pause for review, it assumes you already decided the diff scope
@@ -377,7 +389,7 @@ fi
 echo "==> Pushing cleaned history to ${pr_branch}"
 git push --force-with-lease origin "${clean_ref}:refs/heads/${pr_branch}"
 
-echo "==> Opening pull request and enabling auto-merge (--rebase)"
+echo "==> Opening pull request"
 pr_title="$(head -n 1 "${message_file}")"
 second_line="$(sed -n '2p' "${message_file}")"
 if [[ -n "${second_line}" ]]; then
@@ -387,18 +399,34 @@ if [[ -n "${second_line}" ]]; then
 fi
 body_file="$(mktemp)"
 tail -n +3 "${message_file}" >"${body_file}"
-gh pr create --base main --head "${pr_branch}" \
-  --title "${pr_title}" --body-file "${body_file}"
+pr_url="$(gh pr create --base main --head "${pr_branch}" \
+  --title "${pr_title}" --body-file "${body_file}" | tail -n 1)"
 rm -f "${body_file}"
-gh pr merge --auto --rebase --delete-branch "${pr_branch}"
+pr_number="${pr_url##*/}"
 
-# Do NOT delete the task/<id>/result and task/<id>/start refs here: auto-merge
-# only enables the merge, it does not wait for required checks. Deleting them
-# now, before the PR has actually landed, reintroduces the exact silent-loss
-# shape this script exists to prevent: if a required check later fails, the
-# PR sits open with no way to recover the original result branch, and this
-# script would already have reported success. The task refs are cleaned up by
-# the merge-fleet-result skill's "after the PR is open" step, once it has
+if [[ "${FLEET_MERGE_AUTO:-0}" == "1" ]]; then
+  echo "==> FLEET_MERGE_AUTO=1: enabling auto-merge (--rebase)"
+  gh pr merge --auto --rebase --delete-branch "${pr_number}"
+  echo "Opened PR for task ${task_id}; auto-merge (--rebase) will land it once required checks pass."
+else
+  echo "==> Opened without auto-merge (standing rule): wait for coderabbitai[bot], then merge by hand"
+  echo "  ${pr_url}"
+  echo "  Check status:   ${script_dir}/pr-review-status.sh ${pr_number}"
+  echo "  Or by hand:     gh pr checks ${pr_number}"
+  echo "                  gh api repos/NOFireAI/ravel/pulls/${pr_number}/reviews"
+  echo "                  gh api repos/NOFireAI/ravel/pulls/${pr_number}/comments"
+  echo "  Once CI is green and no actionable CodeRabbit finding is open"
+  echo "  (a walkthrough-only comment with zero findings counts as clean):"
+  echo "    gh pr merge ${pr_number} --rebase"
+fi
+
+# Do NOT delete the task/<id>/result and task/<id>/start refs here, with or
+# without auto-merge: this script reporting success does not mean the PR has
+# landed. Deleting them now reintroduces the exact silent-loss shape this
+# script exists to prevent: if a required check (or an unresolved CodeRabbit
+# finding) later blocks the merge, the PR sits open with no way to recover
+# the original result branch. The task refs are cleaned up by the
+# merge-fleet-result skill's "after the PR is open" step, once it has
 # confirmed via `gh pr view --json state,mergedAt` that the PR actually merged.
 
 # Drop the temp rewrite branch now that it is safely pushed.
@@ -407,6 +435,5 @@ if [[ -n "${rewrite_branch}" ]]; then
   rewrite_branch=""
 fi
 
-echo "Opened PR for task ${task_id}; auto-merge (--rebase) will land it once required checks pass."
 echo "Task refs (task/${task_id}/result, task/${task_id}/start) are left in place;"
 echo "delete them only after confirming the PR merged (see merge-fleet-result skill)."
