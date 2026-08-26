@@ -33,7 +33,7 @@ rebase-merge keeps each commit's own message, so per-commit `Fixes:`/
 **The PR opens WITHOUT auto-merge by default (standing rule, 2026-08-26).**
 CodeRabbit's GitHub App reviews every PR but posts as a review comment, not
 a required status check, so `--auto` merges before that review lands --
-#749/#750 landed with 6 real CodeRabbit findings unaddressed this way. Wait
+\#749/\#750 landed with 6 real CodeRabbit findings unaddressed this way. Wait
 for the `coderabbitai[bot]` review, fix or explicitly answer every
 actionable finding (a walkthrough-only comment with zero findings counts
 as clean), then merge by hand once CI is green:
@@ -150,9 +150,16 @@ scripts/fleet-result-merge.sh $TASK message.txt   # add -p CRATE to scope local 
 
 ## After the PR is open
 
-Poll `scripts/pr-review-status.sh <number>` until it reports clean (CI
-green, CodeRabbit reviewed, no open inline comments), fixing or answering
-every finding along the way, then land it by hand:
+Poll `scripts/pr-review-status.sh <number>` until CI is green and it
+reports a CodeRabbit review against the PR's current head commit. Its
+inline-comment count does not drop to zero once you fix something -- the
+REST API never removes a comment just because the code it flagged
+changed -- so "clean" here means every comment has been individually
+read and its finding fixed or explicitly answered (a reply on the
+thread, or a commit message noting why it doesn't apply), never that
+the count reaches zero. A walkthrough-only review with zero comments
+from the start is the one case that is actually clean by count. Once
+every finding is accounted for, land it by hand:
 
 ```sh
 gh pr merge <number> --rebase --delete-branch
