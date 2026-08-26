@@ -20,8 +20,12 @@
 //! EK); nothing here changes a recorded value, only refuses when config and
 //! record disagree.
 
+use std::future::Future;
+
 use prost::Message;
-use ravel_object_store::{GetRange, ObjectStoreBackend, PutMode, PutOptions, StoreError};
+use ravel_object_store::{
+    GetOutcome, GetRange, ObjectStoreBackend, PutMode, PutOptions, StoreError,
+};
 use ravel_proto::sys::v1 as sysproto;
 use ravel_types::{Signal, TenantHash};
 
@@ -802,8 +806,12 @@ pub fn read_generations_checked(
 /// stale-in-the-wrong-direction cached view could silently under-scan a query,
 /// and the operations are already GET-bounded, so the fresh GET is accepted in
 /// preference to a second staleness/caching policy with its own proof
-/// obligations. It does not route through the catalog's query-accounting GET
-/// funnel, matching the existing [`validate_or_adopt`] provisioning read.
+/// obligations. This raw-store entry point issues a plain `store.get`, for
+/// callers that hold no per-query accounting handle (ravel-maintain's migrate
+/// pass, ravel-bench's fixtures). The catalog resolve and fold paths call
+/// [`read_generations_accounted`] instead, so their provisioning-record GET
+/// funnels through `Catalog::guarded_get` and is both semaphore-bounded and
+/// recorded (issue #729).
 pub async fn read_generations_from_store(
     store: &dyn ObjectStoreBackend,
     tenant_hash: &TenantHash,
@@ -874,6 +882,40 @@ pub enum AbsentPolicy {
     CheckOnly,
 }
 
+/// Decode provisioning-record bytes, mapping a decode failure to a typed
+/// [`ProvisioningError::Decode`] naming the key. Shared by [`read_record`] (raw
+/// store path) and [`read_record_accounted`] (resolve funnel path) so the two
+/// decode a record identically regardless of how its bytes were fetched.
+fn decode_record(
+    key: &str,
+    bytes: &[u8],
+) -> Result<sysproto::ProvisioningRecord, ProvisioningError> {
+    sysproto::ProvisioningRecord::decode(bytes).map_err(|source| ProvisioningError::Decode {
+        key: key.to_string(),
+        source,
+    })
+}
+
+/// One object-store GET of a provisioning-record key, semaphore-bounded and
+/// recorded into a query's cost accounting by the resolve path that supplies it
+/// (issue #729). The catalog resolve path implements this over
+/// `Catalog::guarded_get`, so the generation-history read and the `shard_count`
+/// enforcement check funnel through the same resolve semaphore and per-query
+/// [`ravel_types::accounting::QueryAccounting`] as every other resolve GET,
+/// rather than a raw `store.get` that escapes both. Administrative touches
+/// (ingest adoption, reshard, floor raise, the maintain loop) run off any
+/// per-query accounting handle and keep the raw `store.get` path in
+/// [`read_record`]/[`validate_or_adopt`].
+pub(crate) trait AccountedRecordGet {
+    /// GET `key` at full range. Same result shape as
+    /// `ObjectStoreBackend::get(key, GetRange::Full)`, so a caller's decode and
+    /// `NotFound`-is-absent handling is identical to a raw read.
+    fn accounted_get_full(
+        &self,
+        key: &str,
+    ) -> impl Future<Output = Result<GetOutcome, StoreError>> + Send;
+}
+
 /// Read a (tenant, signal)'s provisioning record, if present. `NotFound` is
 /// `Ok(None)`, not an error: absence is a valid state with adoption semantics.
 async fn read_record(
@@ -881,19 +923,70 @@ async fn read_record(
     key: &str,
 ) -> Result<Option<sysproto::ProvisioningRecord>, ProvisioningError> {
     match store.get(key, GetRange::Full).await {
-        Ok(outcome) => {
-            let record =
-                sysproto::ProvisioningRecord::decode(outcome.data.as_ref()).map_err(|source| {
-                    ProvisioningError::Decode {
-                        key: key.to_string(),
-                        source,
-                    }
-                })?;
-            Ok(Some(record))
-        }
+        Ok(outcome) => Ok(Some(decode_record(key, outcome.data.as_ref())?)),
         Err(StoreError::NotFound) => Ok(None),
         Err(err) => Err(ProvisioningError::store(key, err)),
     }
+}
+
+/// [`read_record`] over an [`AccountedRecordGet`] instead of a raw store, so the
+/// GET is semaphore-bounded and recorded (issue #729). Identical decode and
+/// `NotFound`-is-`None` handling; the only difference is the funnel the GET
+/// takes.
+async fn read_record_accounted(
+    getter: &impl AccountedRecordGet,
+    key: &str,
+) -> Result<Option<sysproto::ProvisioningRecord>, ProvisioningError> {
+    match getter.accounted_get_full(key).await {
+        Ok(outcome) => Ok(Some(decode_record(key, outcome.data.as_ref())?)),
+        Err(StoreError::NotFound) => Ok(None),
+        Err(err) => Err(ProvisioningError::store(key, err)),
+    }
+}
+
+/// [`read_generations_from_store`] over an [`AccountedRecordGet`], for the
+/// catalog resolve path (issue #729). Identical decode, version/misfile/history
+/// validation, and absent-is-`None` semantics; the only difference is that the
+/// underlying provisioning-record GET runs through the resolve's accounted,
+/// semaphore-bounded funnel instead of a raw `store.get`.
+pub(crate) async fn read_generations_accounted(
+    getter: &impl AccountedRecordGet,
+    tenant_hash: &TenantHash,
+    signal: Signal,
+) -> Result<Option<Vec<ShardGeneration>>, ProvisioningError> {
+    let key = provisioning_key(tenant_hash, signal);
+    match read_record_accounted(getter, &key).await? {
+        Some(record) => Ok(Some(read_generations_checked(
+            &record,
+            &key,
+            tenant_hash,
+            signal,
+        )?)),
+        None => Ok(None),
+    }
+}
+
+/// The read-path ([`AbsentPolicy::CheckOnly`]) branch of [`validate_or_adopt`]
+/// over an [`AccountedRecordGet`], for the catalog resolve path (issue #729). It
+/// validates a present record's `shard_count` and generation history exactly as
+/// [`validate_or_adopt`] does under `CheckOnly`, returns
+/// [`ProvisioningCheck::FreshNoData`] when the record is absent, and never
+/// writes or lists (a query-only node may hold write-restricted credentials).
+/// The sole difference from `validate_or_adopt(.., CheckOnly)` is that the
+/// record GET runs through the resolve's accounted, semaphore-bounded funnel
+/// rather than a raw `store.get`.
+pub(crate) async fn validate_check_only_accounted(
+    getter: &impl AccountedRecordGet,
+    tenant_hash: &TenantHash,
+    signal: Signal,
+    shard_count: u32,
+) -> Result<ProvisioningCheck, ProvisioningError> {
+    let key = provisioning_key(tenant_hash, signal);
+    if let Some(record) = read_record_accounted(getter, &key).await? {
+        validate_record(&record, &key, tenant_hash, signal, shard_count)?;
+        return Ok(ProvisioningCheck::Matched);
+    }
+    Ok(ProvisioningCheck::FreshNoData)
 }
 
 /// Validate a decoded record against the (tenant, signal) it was read under and

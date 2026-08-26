@@ -750,18 +750,23 @@ impl Catalog {
         default_retention_ns: Option<i64>,
     ) -> Result<FoldReport, CatalogError> {
         let head_key = head_object_key(tenant, signal);
+        // Fold never runs on the query path (module docs above) and keeps
+        // its own `RequestCounters`; this handle exists only to satisfy the
+        // shared cache/load API's `QueryAccounting` parameter and is discarded.
+        // Declared before the generation read so that read's own GET (issue
+        // #729: it now funnels through `guarded_get`) has a handle to charge,
+        // discarded like every other fold-path GET.
+        let accounting = QueryAccounting::new();
         // The generation history for the read-side scan rule (ADR-0052 section
         // 4/5), read fresh (see `Catalog::read_scan_generations`). A fold must
         // enumerate the same per-hour shard set a resolve would, and records
         // the fan-out ceiling and generation count into the HEAD it writes.
-        let generations = self.read_scan_generations(tenant, signal).await?;
+        let generations = self
+            .read_scan_generations(tenant, signal, &accounting)
+            .await?;
         let shard_generation_count = generations.len() as u32;
         let mut counters = RequestCounters::default();
         let mut attempt: u32 = 0;
-        // Fold never runs on the query path (module docs above) and keeps
-        // its own `RequestCounters`; this handle exists only to satisfy the
-        // shared cache/load API's `QueryAccounting` parameter and is discarded.
-        let accounting = QueryAccounting::new();
 
         // The tenant's effective retention window, read once per fold
         // (loop-invariant). Bounds the retention-frontier reconcile pass below

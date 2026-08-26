@@ -640,7 +640,14 @@ impl Catalog {
             return Ok(None);
         }
         let revalidated = self
-            .validate_head_against_generations(tenant, signal, head_key, &head, generations)
+            .validate_head_against_generations(
+                tenant,
+                signal,
+                head_key,
+                &head,
+                generations,
+                accounting,
+            )
             .await?;
 
         let bytes = got.data.len() as u64;
@@ -695,6 +702,7 @@ impl Catalog {
         head_key: &str,
         head: &SnapshotHead,
         generations: &[ShardGeneration],
+        accounting: &QueryAccounting,
     ) -> Result<Option<Vec<ShardGeneration>>, CatalogError> {
         if head_generations_acceptable(head, generations) {
             return Ok(None);
@@ -706,8 +714,11 @@ impl Catalog {
             return Err(head_shard_count_mismatch(head_key, head, generations));
         }
         // Re-read once, bypassing any caching (the read is uncached by
-        // construction), and recompute before failing.
-        let fresh = self.read_scan_generations(tenant, signal).await?;
+        // construction), and recompute before failing. This resolve-path read
+        // funnels through `guarded_get` like the first one (issue #729).
+        let fresh = self
+            .read_scan_generations(tenant, signal, accounting)
+            .await?;
         if head_generations_acceptable(head, &fresh) {
             return Ok(Some(fresh));
         }
