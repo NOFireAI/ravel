@@ -1942,6 +1942,32 @@ of its disjuncts; a **cross-axis** disjunction (`status_code = 2 OR duration_ns
 > 5e8`) is refused. `trace_id` is a single-point lookup with no range primitive
 to union, so a `trace_id` disjunction is refused too.
 
+Scan paths and their partition metrics (ADR-0110). `SpansScanExec` runs one of
+two paths per partition: a columnar fast path that builds Arrow arrays straight
+from RSPAN's block view, taken when the projection excludes `attrs`, no pending
+erasure predicate applies, and no scanned block carries an `attrs_raw` overflow
+page; and the row path, which rebuilds each `SpanRecord` and is what a query
+touching `attrs` (`SELECT *` included) runs. Four partition metrics show what
+happened, and `EXPLAIN ANALYZE` prints them:
+
+- `columnar_batches` / `rowpath_batches` — batches emitted by each path. The two
+  paths' output is identical by construction, so these are the only external
+  proof of which one ran.
+- `pages_decoded` / `pages_skipped` — column pages the partition's decode
+  decompressed and walked past. **Both counters are written on both paths.** The
+  row path decodes every page of every block it scans, so it reports its whole
+  page count as decoded and 0 as skipped; the columnar path reports the split
+  its projection produced. A zero therefore always means the decode did that
+  much, never that the arm did not count (the row arm left both unwritten before
+  issue #669, and an attrs-including `EXPLAIN ANALYZE` read as a decode that
+  touched nothing).
+
+The page-byte counters on `QueryAccounting` (`page_bytes_fetched` /
+`page_bytes_decoded`, ADR-0107 decision 4) sit next to these on both paths, as
+they do for logs. They are the byte-weighted view of the same decode: page
+counts weight every page equally, while an attribute or event page usually
+carries far more bytes than a fixed-width one.
+
 ## Parallel final aggregation for exact-typed queries (ADR-0094)
 
 A query whose aggregation is provably order- and partition-independent

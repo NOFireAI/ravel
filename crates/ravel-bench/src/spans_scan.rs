@@ -12,11 +12,12 @@
 //! numbers.
 //!
 //! Note on which "decoded" counter is comparable. The `pages_decoded`/
-//! `pages_skipped` PARTITION METRICS (ADR-0110 decision 5) are incremented only
-//! on the columnar path, so they read 0 on the row shape and cannot form a
-//! cross-path ratio. The quantity that IS recorded on both paths and that
-//! decision 7's regression test actually asserts on is `page_bytes_decoded` in
-//! `QueryAccounting` (decision 2): equal `page_bytes_fetched` on both shapes,
+//! `pages_skipped` PARTITION METRICS (ADR-0110 decision 5) are written on both
+//! paths since issue #669: the row shape reports every page of every block it
+//! scanned as decoded and none skipped, because it requests every column. They
+//! are page COUNTS, though, and a page's stored size varies by column, so the
+//! quantity decision 7's regression test asserts on stays `page_bytes_decoded`
+//! in `QueryAccounting` (decision 2): equal `page_bytes_fetched` on both shapes,
 //! strictly lower `page_bytes_decoded` on the columnar shape. This lane reports
 //! the partition metrics for transparency and computes the ratio on
 //! `page_bytes_decoded`.
@@ -141,15 +142,15 @@ pub struct ShapeResult {
     pub columnar_batches: usize,
     /// Batches the scan emitted through the unchanged row path.
     pub rowpath_batches: usize,
-    /// The `pages_decoded` PARTITION METRIC (ADR-0110 decision 5). This counter
-    /// is incremented ONLY on the columnar path (`spans_scan.rs` bumps it in the
-    /// `Prepared::Columnar` arm, never in the row arm), so it reads 0 on the row
-    /// shape. It is therefore NOT a cross-path comparable; the comparable
-    /// decoded quantity is [`page_bytes_decoded`](Self::page_bytes_decoded). See
-    /// the module report for the ADR/code note on this.
+    /// The `pages_decoded` PARTITION METRIC (ADR-0110 decision 5), written on
+    /// both paths (#669): on the row shape it is every page of every block the
+    /// scan decoded, on the columnar shape only the projected ones. Comparable
+    /// across shapes as a count; the byte-weighted comparison the ratio uses is
+    /// [`page_bytes_decoded`](Self::page_bytes_decoded).
     pub pages_decoded: usize,
-    /// The `pages_skipped` partition metric. Columnar path only; 0 on the row
-    /// path, for the same reason as [`pages_decoded`](Self::pages_decoded).
+    /// The `pages_skipped` partition metric. Nonzero on the columnar shape,
+    /// which walks past the attribute and event pages; 0 on the row shape, which
+    /// requests every column and so skips nothing.
     pub pages_skipped: usize,
     /// Stored bytes of the pages the scan actually fetched, from
     /// `QueryAccounting` (ADR-0107 decision 4). Recorded on BOTH paths and, per
@@ -202,9 +203,10 @@ pub struct Report {
     /// `attrs_including.page_bytes_decoded / attrs_free.page_bytes_decoded`, the
     /// cross-path decoded-bytes ratio (ADR-0110 decision 7). Above 1.0 when the
     /// columnar shape decoded fewer page bytes than the row shape; 1.0 means a
-    /// vacuous corpus with no pages to skip. This uses `page_bytes_decoded`, NOT
-    /// the columnar-only `pages_decoded` partition metric, which reads 0 on the
-    /// row shape and so cannot form a ratio.
+    /// vacuous corpus with no pages to skip. This uses `page_bytes_decoded`, not
+    /// the `pages_decoded` partition metric: that one counts pages, whose stored
+    /// sizes differ by column, so a count ratio would not weight the skipped
+    /// attribute and event pages by what they actually cost to decode.
     pub page_bytes_decoded_ratio: f64,
     /// `attrs_free.rows_per_sec / attrs_including.rows_per_sec`. Reported as a
     /// measured ratio, never described as "faster": interpret it against the
@@ -678,16 +680,27 @@ mod tests {
             report.attrs_free.rows, report.attrs_including.rows,
             "both shapes return the same rows"
         );
-        // The `pages_decoded`/`pages_skipped` partition metrics are columnar-only:
-        // the fast path skips pages, and the row path never touches these
-        // counters, so it reports 0 for both.
+        // The `pages_decoded`/`pages_skipped` partition metrics, on both paths
+        // (#669). Both shapes scan the same blocks over the same corpus, so the
+        // row shape's decoded count equals the columnar shape's decoded plus
+        // skipped: the same pages, split differently by the projection.
         assert!(
             report.attrs_free.pages_skipped > 0,
             "the columnar shape must skip attribute/event pages"
         );
         assert_eq!(
-            report.attrs_including.pages_decoded, 0,
-            "the row path does not publish the pages_decoded partition metric"
+            report.attrs_including.pages_skipped, 0,
+            "the row shape requests every column, so it skips no page"
+        );
+        assert_eq!(
+            report.attrs_including.pages_decoded,
+            report.attrs_free.pages_decoded + report.attrs_free.pages_skipped,
+            "the row shape decodes exactly the pages the columnar shape decoded \
+             plus the ones it skipped"
+        );
+        assert!(
+            report.attrs_including.pages_decoded > 0,
+            "the row shape must report the pages it decoded, not an unwritten 0"
         );
 
         // The cross-path decoded quantity is `page_bytes_decoded` (QueryAccounting),

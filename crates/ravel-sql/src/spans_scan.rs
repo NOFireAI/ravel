@@ -93,9 +93,9 @@ const BATCH_ROWS: usize = 8192;
 const METRIC_COLUMNAR_BATCHES: &str = "columnar_batches";
 /// Metric name for the count of batches emitted by the row path fallback.
 const METRIC_ROWPATH_BATCHES: &str = "rowpath_batches";
-/// Metric name for the column pages the columnar decode decompressed.
+/// Metric name for the column pages the decode decompressed, on either path.
 const METRIC_PAGES_DECODED: &str = "pages_decoded";
-/// Metric name for the column pages the columnar decode walked past because the
+/// Metric name for the column pages the decode walked past because the
 /// projection excluded them: the page-level proof projection reached decode.
 const METRIC_PAGES_SKIPPED: &str = "pages_skipped";
 
@@ -211,7 +211,9 @@ pub struct SpansScanExec {
     /// Partition metrics (ADR-0110 decision 5): `columnar_batches`/
     /// `rowpath_batches` show which path a partition ran, and
     /// `pages_decoded`/`pages_skipped` show projection reaching decode, so
-    /// `EXPLAIN ANALYZE` and a test can assert eligibility directly.
+    /// `EXPLAIN ANALYZE` and a test can assert eligibility directly. Both page
+    /// counters are written on both paths (#669), so a zero always means the
+    /// decode did that much and never that the arm forgot to count.
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -411,10 +413,15 @@ impl ExecutionPlan for SpansScanExec {
 /// `SpansScanExec::metrics` exposes to `EXPLAIN ANALYZE`.
 #[derive(Clone)]
 struct SpanScanMetrics {
-    /// Column pages the columnar decode decompressed this partition.
+    /// Column pages this partition's decode decompressed, on whichever path it
+    /// ran (#669): the columnar attempt's per-block counts, the row path's, or
+    /// both when an `attrs_raw` block made the partition fall back after
+    /// decoding some blocks columnar.
     pages_decoded: Count,
-    /// Column pages the columnar decode skipped because the projection excluded
-    /// them. Zero on the row path, which decodes every page.
+    /// Column pages this partition's decode walked past because the projection
+    /// excluded them. A row-path partition reports 0 because it decodes every
+    /// page of every block it scans, which is a measurement of that path, not an
+    /// unwritten counter: `pages_decoded` is nonzero beside it.
     pages_skipped: Count,
     /// Output batches this partition built through the columnar fast path,
     /// straight from a [`ravel_rspan::ColumnarBlockView`] with no `SpanRecord`
@@ -477,8 +484,28 @@ enum Prepared {
     Rows {
         rows: Vec<SpanRow>,
         projection: Option<Arc<Vec<usize>>>,
+        /// Aggregate page counts across every block this partition decoded, for
+        /// the `pages_decoded`/`pages_skipped` metrics, exactly as the columnar
+        /// variant carries its own (#669). The row fetch decodes every page of
+        /// every block it scans, so `pages_skipped` is 0 unless an abandoned
+        /// columnar attempt contributed to it.
+        pages_decoded: usize,
+        pages_skipped: usize,
     },
     Columnar(ColumnarPartition),
+}
+
+/// What the columnar attempt produced: the materialized partition, or the
+/// `attrs_raw` fallback, carrying the pages the abandoned attempt had already
+/// decoded. Those pages really were decompressed (the query's page-byte
+/// accounting counts them too), so they belong in the partition's totals rather
+/// than being dropped because the attempt was discarded.
+enum ColumnarAttempt {
+    Ready(ColumnarPartition),
+    FellBack {
+        pages_decoded: usize,
+        pages_skipped: usize,
+    },
 }
 
 /// Fetch every segment in this partition and return its rows in `(trace_id,
@@ -525,12 +552,18 @@ async fn prepare_partition(
         });
     }
 
+    // Pages this partition's decode touched, published as the
+    // `pages_decoded`/`pages_skipped` metrics. Non-zero before the row loop only
+    // when an abandoned columnar attempt already decoded blocks.
+    let mut pages_decoded = 0usize;
+    let mut pages_skipped = 0usize;
+
     if attempt_columnar {
         // `attempt_columnar` implies the provider pushed a projection.
         let proj = projection
             .clone()
             .ok_or_else(|| DataFusionError::Internal("columnar scan without projection".into()))?;
-        if let Some(part) = prepare_columnar(
+        match prepare_columnar(
             &fetcher,
             tenant_hash,
             &segs,
@@ -543,10 +576,18 @@ async fn prepare_partition(
         )
         .await?
         {
-            return Ok(Prepared::Columnar(part));
+            ColumnarAttempt::Ready(part) => return Ok(Prepared::Columnar(part)),
+            // A block carried an `attrs_raw` overflow page: fall through to the
+            // row path for the whole partition, still emitting the projected
+            // schema, and keep the abandoned attempt's page counts.
+            ColumnarAttempt::FellBack {
+                pages_decoded: d,
+                pages_skipped: s,
+            } => {
+                pages_decoded = d;
+                pages_skipped = s;
+            }
         }
-        // A block carried an `attrs_raw` overflow page: fall through to the row
-        // path for the whole partition, still emitting the projected schema.
     }
 
     let mut out: Vec<SpanRow> = Vec::new();
@@ -566,6 +607,11 @@ async fn prepare_partition(
         else {
             continue;
         };
+        // The same decode-side counts the columnar arm reads off each block; the
+        // row fetch requests every column, so it decodes every page of every
+        // block it scanned and skips none (#669).
+        pages_decoded += output.pages_decoded;
+        pages_skipped += output.pages_skipped;
         out.extend(output.records);
     }
     // Selective-erasure exclusion (ADR-0064 decision 2): applied
@@ -585,13 +631,16 @@ async fn prepare_partition(
     Ok(Prepared::Rows {
         rows: out,
         projection,
+        pages_decoded,
+        pages_skipped,
     })
 }
 
 /// Drain the columnar exit for the whole partition (ADR-0110 decisions 3, 6).
-/// Returns `None` when a block carries an `attrs_raw` overflow page, signalling
-/// the caller to fall back to the row path; otherwise the held blocks and the
-/// stable `(trace_id, start_ts)` ordering over their surviving rows.
+/// Returns [`ColumnarAttempt::FellBack`] when a block carries an `attrs_raw`
+/// overflow page, signalling the caller to fall back to the row path; otherwise
+/// the held blocks and the stable `(trace_id, start_ts)` ordering over their
+/// surviving rows.
 #[allow(clippy::too_many_arguments)]
 async fn prepare_columnar(
     fetcher: &SpanSegmentFetcher,
@@ -603,7 +652,7 @@ async fn prepare_columnar(
     predicates: &[BloomPredicate<'_>],
     projection: &Arc<Vec<usize>>,
     accounting: &QueryAccounting,
-) -> DFResult<Option<ColumnarPartition>> {
+) -> DFResult<ColumnarAttempt> {
     let union = union_projected_columns(projection);
     let mut blocks: Vec<HeldBlock> = Vec::new();
     let mut pages_decoded = 0usize;
@@ -626,14 +675,20 @@ async fn prepare_columnar(
             continue;
         };
         while let Some(cb) = scan.next_block().map_err(SqlError::from)? {
+            // Counted before the eligibility check below: this block's pages
+            // were decompressed by `next_block` whether or not the partition
+            // goes on to abandon the attempt.
+            pages_decoded += cb.block.pages_decoded();
+            pages_skipped += cb.block.pages_skipped();
             // Last eligibility clause (ADR-0110 decision 3): a block carrying an
             // `attrs_raw` overflow page fails closed to the row path, answered
             // from page descriptors without decoding the page.
             if cb.block.has_attrs_raw_page() {
-                return Ok(None);
+                return Ok(ColumnarAttempt::FellBack {
+                    pages_decoded,
+                    pages_skipped,
+                });
             }
-            pages_decoded += cb.block.pages_decoded();
-            pages_skipped += cb.block.pages_skipped();
             if !cb.rows.is_empty() {
                 blocks.push(HeldBlock {
                     block: cb.block,
@@ -667,7 +722,7 @@ async fn prepare_columnar(
     keyed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     let order: Vec<(usize, usize)> = keyed.into_iter().map(|(_, _, bi, r)| (bi, r)).collect();
 
-    Ok(Some(ColumnarPartition {
+    Ok(ColumnarAttempt::Ready(ColumnarPartition {
         blocks,
         order,
         projection: Arc::clone(projection),
@@ -734,7 +789,18 @@ impl Stream for SpanScanStream {
         loop {
             match &mut this.state {
                 SpanScanState::Fetching(fut) => match fut.as_mut().poll(cx) {
-                    Poll::Ready(Ok(Prepared::Rows { rows, projection })) => {
+                    Poll::Ready(Ok(Prepared::Rows {
+                        rows,
+                        projection,
+                        pages_decoded,
+                        pages_skipped,
+                    })) => {
+                        // Published on this path for the same reason as on the
+                        // columnar one (#669): the counters are what an EXPLAIN
+                        // ANALYZE reader has to judge decode work by, and a
+                        // metric left unwritten reads as a measured zero.
+                        this.metrics.pages_decoded.add(pages_decoded);
+                        this.metrics.pages_skipped.add(pages_skipped);
                         this.state = SpanScanState::EmittingRows {
                             rows,
                             projection,
