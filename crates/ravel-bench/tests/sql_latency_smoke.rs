@@ -56,6 +56,8 @@ fn small_generate_config(store: Arc<dyn ObjectStoreBackend>, runs: usize) -> Gen
         progress_jsonl: None,
         tenant_max_bytes: ravel_bench::sql_latency::DEFAULT_TENANT_MAX_BYTES,
         parallel_final_aggregation: false,
+        max_segments: ravel_query::DEFAULT_MAX_SEGMENTS,
+        explain_dir: None,
     }
 }
 
@@ -239,6 +241,7 @@ async fn an_entry_with_an_unsatisfied_required_declaration_is_skipped_with_the_k
         false,
         None,
         ravel_bench::sql_latency::ExecutorSettings::default(),
+        None,
     )
     .await
     .expect("measure_corpus runs");
