@@ -9,9 +9,11 @@
 //! [`LogSegmentFetcher::ts_range_relevant`] against the extracted ts bounds,
 //! and builds a single [`LogsScanExec`] leaf.
 //!
-//! `supports_filters_pushdown` returns `Inexact` for every filter, exactly like
-//! the metrics provider: DataFusion always re-applies the originals above the
-//! scan, so pruning may only widen. An attribute predicate (`attrs['k']='v'`) is
+//! `supports_filters_pushdown` returns `Inexact` for every filter except one
+//! that resolves purely to a `ts` bound and/or a `has_word` call, which the
+//! reader re-verifies per row and so answers `Exact` (issue #733). Everything
+//! else DataFusion re-applies above the scan, so pruning may only widen. An
+//! attribute predicate (`attrs['k']='v'`) is
 //! pushed only into the prune-only channel ([`LogsPushdown::prune`]), which
 //! drives POSTINGS block pruning inside the reader and is never evaluated per
 //! row: a stream-level or per-record prune used as a filter would be unsound
@@ -48,7 +50,7 @@ use crate::distributed::{WorkerSlice, WorkerSliceClient};
 use crate::distributed_rlog::{
     DistributedRlogContext, LOGS_ORDER_COLS, distributed_logs_plan, sort_slice_fragment,
 };
-use crate::logs_pushdown::{LogsPushdown, extract_logs};
+use crate::logs_pushdown::{LogsPushdown, extract_logs, filter_is_exact};
 use crate::logs_scan::LogsScanExec;
 use crate::logs_schema::{logs_schema, logs_schema_with_declared};
 
@@ -265,14 +267,55 @@ impl TableProvider for LogsTableProvider {
         TableType::Base
     }
 
-    /// Inexact for every filter: the provider prunes what it can (widen-only),
-    /// but DataFusion must always re-apply the original filters above the scan.
-    /// Never `Exact` (carried over from the metrics provider).
+    /// `Exact` for a filter that resolves purely to a `ts` bound and/or a
+    /// `has_word` content predicate; `Inexact` for everything else (issue #733).
+    ///
+    /// The split follows which reader channel the extracted predicate lands in
+    /// ([`crate::logs_pushdown`]):
+    ///
+    /// - `ts` bounds and `has_word` arms go to the exact channel
+    ///   ([`LogsPushdown::ts_lo`]/[`LogsPushdown::ts_hi`],
+    ///   [`LogsPushdown::content`]), which `ravel_query`'s `combined_predicate`
+    ///   folds into the single `Predicate` the reader re-verifies per decoded
+    ///   row: `ravel_logseg::reader`'s `eval` reads that row's own `ts` for
+    ///   `Predicate::TsRange` and that row's own field text for
+    ///   `Predicate::HasWord`. Nothing survives for a residual to re-check, so
+    ///   the filter can be deleted from the plan. Deleting it is what lets
+    ///   `LogsScanExec`'s exact leaf statistics reach DataFusion's
+    ///   `AggregateStatistics` rule: a `FilterExec` above the scan would report
+    ///   its own non-exact statistics instead of passing the leaf's through.
+    /// - Everything else -- an `attrs['k'] = 'v'` equality, every declared typed
+    ///   column predicate (ADR-0093) -- goes to the prune-only
+    ///   [`LogsPushdown::prune`] channel. `open_scan` passes that channel
+    ///   separately from the exact predicate and the reader uses it for block
+    ///   pruning ONLY, never per row, so DataFusion's residual stays the sole
+    ///   exact evaluator and the filter must stay `Inexact`.
+    ///
+    /// A filter the extractor recognizes only in part (a `ts` bound AND-ed with
+    /// an unrecognized sub-expression in one unsplit `Expr`) is `Inexact`, not
+    /// partially credited, and so is one it recognizes nothing in.
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
     ) -> DFResult<Vec<TableProviderFilterPushDown>> {
-        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+        // The distributed coordinator path fans out to workers without pushing
+        // any filter (see `scan` below), so every filter it plans MUST come back
+        // as a residual above the fan-out. Reporting `Exact` there would delete
+        // a predicate nothing re-applies.
+        #[cfg(feature = "flight-sql")]
+        if self.distributed.is_some() {
+            return Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()]);
+        }
+        Ok(filters
+            .iter()
+            .map(|f| {
+                if filter_is_exact(f, self.declared.as_ref()) {
+                    TableProviderFilterPushDown::Exact
+                } else {
+                    TableProviderFilterPushDown::Inexact
+                }
+            })
+            .collect())
     }
 
     async fn scan(
@@ -286,9 +329,11 @@ impl TableProvider for LogsTableProvider {
         // instead of scanning locally. The scan's `_limit` is honored as a
         // fetch-stop hint across the distributed partitions, with the exact limit
         // re-applied above the merge (over-fetch is safe, under-fetch is not).
-        // Filters are re-applied above the returned plan by DataFusion (the
-        // provider reports `Inexact`), so not pushing them to workers only widens
-        // each worker's read, never changes a row. The `logs` provider carries no
+        // Filters are re-applied above the returned plan by DataFusion (with a
+        // coordinator installed, `supports_filters_pushdown` reports `Inexact`
+        // for every filter for exactly this reason), so not pushing them to
+        // workers only widens each worker's read, never changes a row. The
+        // `logs` provider carries no
         // per-query byte budget (admission is decided at resolve time), so the
         // fan-out folds bytes into the query accounting under an `Unlimited`
         // ceiling, matching the local path.
@@ -314,11 +359,13 @@ impl TableProvider for LogsTableProvider {
         // dropped columns the scan had already paid to decode and materialize.
         //
         // The projection DataFusion hands us already contains every column its
-        // residual `FilterExec` above this scan will read: pushdown is
-        // `Inexact`, so the optimizer keeps the filters' columns in the scan's
-        // projection. `LogsScanExec` separately adds the columns its own pushed
-        // content predicates and pending erasure predicates need, which are not
-        // visible in the projection at all.
+        // residual `FilterExec` above this scan will read: an `Inexact` filter
+        // survives above the scan, so the optimizer keeps its columns in the
+        // scan's projection. An `Exact` one does not survive and its columns may
+        // well be projected out, which is safe because `LogsScanExec` separately
+        // adds the columns its own pushed content predicates and pending erasure
+        // predicates need (`logs_scan::resolve_columns`); those are not visible
+        // in the projection at all.
         self.build_scan(target_partitions, &pushdown, projection)
     }
 }
@@ -1695,6 +1742,217 @@ mod tests {
         assert!(
             extract_logs(&cast_filters, &declared).prune.is_empty(),
             "a Cast-wrapped comparison must produce no prune arm"
+        );
+    }
+
+    // --- exact filter pushdown (issue #733) ----------------------------------
+
+    /// A provider over an empty snapshot: `supports_filters_pushdown` is a pure
+    /// function of the filter and the declared vocabulary, so it needs no data
+    /// and issues no I/O.
+    fn pushdown_provider(declared: Vec<DeclaredColumn>) -> LogsTableProvider {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        LogsTableProvider::new(
+            Snapshot {
+                segments: Vec::new(),
+                segments_pruned: 0,
+                pending_erasure: Vec::new(),
+            },
+            TenantHash([7u8; 16]),
+            LogSegmentFetcher::new(store),
+            QueryAccounting::new(),
+        )
+        .with_declared_columns(declared)
+    }
+
+    fn pushdown_for(provider: &LogsTableProvider, filter: &Expr) -> TableProviderFilterPushDown {
+        let mut v = provider
+            .supports_filters_pushdown(&[filter])
+            .expect("supports_filters_pushdown");
+        assert_eq!(v.len(), 1, "one verdict per filter");
+        v.remove(0)
+    }
+
+    fn ts_lit(v: i64) -> Expr {
+        datafusion::prelude::lit(datafusion::scalar::ScalarValue::TimestampNanosecond(
+            Some(v),
+            None,
+        ))
+    }
+
+    /// Every filter that resolves purely to a `ts` bound and/or a `has_word`
+    /// call is `Exact`: both land in the channel `ravel_logseg::reader`'s `eval`
+    /// re-verifies against the row's own value, so nothing is left for a
+    /// residual.
+    #[test]
+    fn pure_ts_bound_and_has_word_filters_are_exact() {
+        use datafusion::prelude::{col, lit};
+
+        use crate::logs_udf::has_word_udf;
+
+        let p = pushdown_provider(Vec::new());
+        let between = Expr::Between(datafusion::logical_expr::Between {
+            expr: Box::new(col("ts")),
+            negated: false,
+            low: Box::new(ts_lit(100)),
+            high: Box::new(ts_lit(200)),
+        });
+        let cases = [
+            col("ts").gt_eq(ts_lit(100)),
+            col("ts").lt(ts_lit(200)),
+            col("ts").eq(ts_lit(150)),
+            // A flipped operand order is the same bound.
+            ts_lit(100).lt_eq(col("ts")),
+            between,
+            // Two ts bounds AND-ed inside ONE unsplit filter expression.
+            col("ts")
+                .gt_eq(ts_lit(100))
+                .and(col("ts").lt_eq(ts_lit(200))),
+            has_word_udf().call(vec![col("body"), lit("timeout")]),
+            has_word_udf().call(vec![col("severity_text"), lit("error")]),
+            // A ts bound AND a content predicate together, unsplit.
+            col("ts")
+                .gt_eq(ts_lit(100))
+                .and(has_word_udf().call(vec![col("body"), lit("timeout")])),
+        ];
+        for filter in cases {
+            assert_eq!(
+                pushdown_for(&p, &filter),
+                TableProviderFilterPushDown::Exact,
+                "must be Exact: {filter:?}"
+            );
+        }
+    }
+
+    /// Everything the extractor routes to the prune-only channel stays
+    /// `Inexact`: the reader uses a prune arm for block pruning only and never
+    /// evaluates it per row, so DataFusion's residual is the sole exact
+    /// evaluator. An `attrs['k'] = 'v'` map equality and a declared typed column
+    /// predicate (ADR-0093) are both in that channel.
+    #[test]
+    fn prune_channel_filters_stay_inexact() {
+        use datafusion::functions::core::expr_fn::get_field;
+        use datafusion::prelude::{col, lit};
+
+        let p = pushdown_provider(i64_status_code());
+        let cases = [
+            get_field(col("attrs"), "service.name").eq(lit("api")),
+            col("status_code").eq(lit(500i64)),
+            col("status_code").gt(lit(500i64)),
+            col("status_code").in_list(vec![lit(200i64), lit(404i64)], false),
+        ];
+        for filter in cases {
+            assert_eq!(
+                pushdown_for(&p, &filter),
+                TableProviderFilterPushDown::Inexact,
+                "a prune-channel filter must stay Inexact: {filter:?}"
+            );
+        }
+    }
+
+    /// A filter the extractor recognizes only in part is `Inexact`, never
+    /// partially credited. Reporting `Exact` deletes the WHOLE filter from the
+    /// plan, so a `ts` bound AND-ed with anything not itself exactly verified
+    /// would silently drop that other conjunct's rows.
+    ///
+    /// DataFusion normally splits top-level `AND`s into separate filters before
+    /// pushdown, so these compound shapes are a fail-closed guard rather than a
+    /// shape seen every day.
+    #[test]
+    fn partially_recognized_compound_filters_are_inexact() {
+        use datafusion::functions::core::expr_fn::get_field;
+        use datafusion::prelude::{col, lit};
+
+        let p = pushdown_provider(i64_status_code());
+        let like = Expr::Like(datafusion::logical_expr::Like {
+            negated: false,
+            expr: Box::new(col("body")),
+            pattern: Box::new(lit("%time%")),
+            escape_char: None,
+            case_insensitive: false,
+        });
+        let cases = [
+            // A ts bound AND an attrs-map equality: the equality is prune-only.
+            col("ts")
+                .gt_eq(ts_lit(100))
+                .and(get_field(col("attrs"), "k").eq(lit("v"))),
+            // A ts bound AND a declared-column predicate: likewise prune-only.
+            col("ts")
+                .gt_eq(ts_lit(100))
+                .and(col("status_code").eq(lit(500i64))),
+            // A ts bound AND a shape the extractor recognizes in NEITHER
+            // channel: `LIKE` is deliberately never pushed (soundness, see
+            // crate::logs_pushdown), so the residual must keep it.
+            col("ts").gt_eq(ts_lit(100)).and(like),
+        ];
+        for filter in cases {
+            assert_eq!(
+                pushdown_for(&p, &filter),
+                TableProviderFilterPushDown::Inexact,
+                "a partially recognized filter must be Inexact: {filter:?}"
+            );
+        }
+    }
+
+    /// An expression the extractor recognizes nothing in keeps the unchanged
+    /// `Inexact` default. It must never fall through to `Exact`.
+    #[test]
+    fn unrecognized_filters_stay_inexact() {
+        use datafusion::prelude::{col, lit};
+
+        use crate::logs_udf::has_word_udf;
+
+        let p = pushdown_provider(Vec::new());
+        let negated_between = Expr::Between(datafusion::logical_expr::Between {
+            expr: Box::new(col("ts")),
+            negated: true,
+            low: Box::new(ts_lit(100)),
+            high: Box::new(ts_lit(200)),
+        });
+        let cases = [
+            // Not in the ts comparison allowlist.
+            col("ts").not_eq(ts_lit(100)),
+            Expr::Not(Box::new(col("ts").gt_eq(ts_lit(100)))),
+            negated_between,
+            // An integer literal is an ambiguous ts scale and is rejected.
+            col("ts").gt_eq(lit(100i64)),
+            // `has_word` over a column with no field selector.
+            has_word_udf().call(vec![col("attrs"), lit("timeout")]),
+            // A fixed column with no extraction path at all.
+            col("severity_num").eq(lit(5i64)),
+            // A disjunction of two ts bounds is not one range.
+            datafusion::logical_expr::or(col("ts").gt_eq(ts_lit(100)), col("ts").lt(ts_lit(10))),
+        ];
+        for filter in cases {
+            assert_eq!(
+                pushdown_for(&p, &filter),
+                TableProviderFilterPushDown::Inexact,
+                "an unrecognized filter must stay Inexact: {filter:?}"
+            );
+        }
+    }
+
+    /// The verdicts line up with the filters positionally, so a mixed set is
+    /// reported per filter rather than collapsed to one answer.
+    #[test]
+    fn verdicts_are_reported_per_filter_in_order() {
+        use datafusion::functions::core::expr_fn::get_field;
+        use datafusion::prelude::{col, lit};
+
+        let p = pushdown_provider(Vec::new());
+        let ts = col("ts").gt_eq(ts_lit(100));
+        let attrs = get_field(col("attrs"), "k").eq(lit("v"));
+        let hi = col("ts").lt_eq(ts_lit(200));
+        let verdicts = p
+            .supports_filters_pushdown(&[&ts, &attrs, &hi])
+            .expect("supports_filters_pushdown");
+        assert_eq!(
+            verdicts,
+            vec![
+                TableProviderFilterPushDown::Exact,
+                TableProviderFilterPushDown::Inexact,
+                TableProviderFilterPushDown::Exact,
+            ]
         );
     }
 }

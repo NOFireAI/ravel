@@ -2,9 +2,10 @@
 //! invariant the metrics pushdown obeys (crate::pushdown): pruning may only
 //! ever *widen* the read set relative to the query's true need, never narrow
 //! it. `LogsTableProvider::supports_filters_pushdown` returns `Inexact` for
-//! every filter, so DataFusion always re-applies the originals above the scan;
-//! exactness comes from that residual plus the scan re-applying nothing
-//! destructive.
+//! every filter except one it can prove the reader re-verifies per row
+//! ([`filter_is_exact`]: a pure `ts` bound and/or `has_word` call), so
+//! DataFusion re-applies every other original above the scan; exactness comes
+//! from that residual plus the scan re-applying nothing destructive.
 //!
 //! Recognized shapes (everything else contributes nothing and widens):
 //!
@@ -184,6 +185,62 @@ pub fn extract_logs(filters: &[Expr], declared: &[DeclaredColumn]) -> LogsPushdo
         walk_conjunct(f, &mut out, declared);
     }
     out
+}
+
+/// Whether `filter` is captured EXACTLY by the ts and content channels, with
+/// nothing left over for a residual to evaluate.
+///
+/// [`crate::logs_provider::LogsTableProvider::supports_filters_pushdown`]
+/// reports `TableProviderFilterPushDown::Exact` for exactly the filters this
+/// answers `true` for, which deletes them from the plan. So it fails closed:
+/// every conjunct of `filter` must be a shape whose pushed predicate is
+/// *equivalent* to it, not merely implied by it.
+///
+/// Two shapes qualify, and only because the reader re-verifies both per row
+/// (`ravel_logseg::reader`'s `eval`, its `Predicate::TsRange` and
+/// `Predicate::HasWord` arms both read the row's own value): a `ts` bound and a
+/// `has_word(col, 'literal')` call. Everything routed to the prune-only
+/// [`LogsPushdown::prune`] channel, and everything not recognized at all,
+/// answers `false`.
+pub fn filter_is_exact(filter: &Expr, declared: &[DeclaredColumn]) -> bool {
+    if let Expr::BinaryExpr(BinaryExpr { left, op, right }) = filter
+        && *op == Operator::And
+    {
+        return filter_is_exact(left, declared) && filter_is_exact(right, declared);
+    }
+    leaf_is_exact(filter, declared)
+}
+
+/// [`filter_is_exact`] for one non-`AND` conjunct. The extraction is
+/// [`handle_leaf`] itself and the shapes are recognized with the same primitives
+/// it dispatches on, so the two cannot disagree about what is recognized. What
+/// is added here is per-shape *completeness*: which channel field the shape must
+/// have populated for the pushed predicate to mean the whole leaf. A bound the
+/// extractor dropped (an overflowing `ts > <max literal>`, a `BETWEEN` with a
+/// non-timestamp edge) leaves its field `None`, so this answers `false` and the
+/// filter stays `Inexact`. A shape `handle_leaf` learns to recognize later also
+/// answers `false` until it is added here.
+fn leaf_is_exact(expr: &Expr, declared: &[DeclaredColumn]) -> bool {
+    let mut out = LogsPushdown::default();
+    handle_leaf(expr, &mut out, declared);
+    if !out.prune.is_empty() {
+        return false;
+    }
+    match expr {
+        // A `ts` comparison denotes one bound, or two for `=`; all of them must
+        // have survived `apply_ts_bound`.
+        Expr::BinaryExpr(be) => match ts_comparison(be) {
+            Some((Operator::Eq, _)) => out.ts_lo.is_some() && out.ts_hi.is_some(),
+            Some((Operator::Gt | Operator::GtEq, _)) => out.ts_lo.is_some(),
+            Some((Operator::Lt | Operator::LtEq, _)) => out.ts_hi.is_some(),
+            _ => false,
+        },
+        Expr::Between(bt) if !bt.negated && is_ts_col(&bt.expr) => {
+            out.ts_lo.is_some() && out.ts_hi.is_some()
+        }
+        Expr::ScalarFunction(sf) if sf.func.name() == HAS_WORD_UDF => !out.content.is_empty(),
+        _ => false,
+    }
 }
 
 fn walk_conjunct(expr: &Expr, out: &mut LogsPushdown, declared: &[DeclaredColumn]) {
