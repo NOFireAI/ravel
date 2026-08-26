@@ -1025,6 +1025,16 @@ defines word semantics identically on the write and read paths:
   lowercase can neither exceed the cap nor split a codepoint;
 - drop empty tokens; keep duplicates (deduplication is the bloom's job).
 
+A change to these rules is not a format version bump (token bytes are
+not a pinned invariant; the bloom framing and POSTINGS structure are),
+but it does change what an already-written object indexed. An object
+written under an earlier fold keeps its old token keys in its bloom and
+POSTINGS, so a query folded under the current rules can miss a word in
+that object. The miss is a false negative only: a bloom or POSTINGS
+negative prunes, and the exact scan re-tokenizes with the current rules,
+so no wrong row is returned. Re-ingesting or compacting the object
+rewrites its tokens under the current rules.
+
 A multi-token query word is a phrase: the scan requires all its tokens to
 be present, in order, in the tokenized field value; a single-token word
 requires containment.
