@@ -158,6 +158,65 @@ so it joins the assignment rather than vetoing it (ADR-0102 amendment
 2026-08-26, #739 -- as a query-wide conjunct the threshold let one small tail
 object per `(shard, hour)` disqualify an entire 8,424-object snapshot).
 
+## Selective (predicated) logs scan: request count
+
+A statement with a block-level predicate — a declared-column or `attrs`
+numeric comparison (the ClickBench q20 and q37-q43 shapes), a text
+`has_word`, a stream filter — is not block-predicate-free, so it takes the
+plan-then-stripe path, never the whole-segment fast path above. Before #761
+that path read every relevant object WHOLE twice over: the plan phase opened
+each segment to count survivors, and the scan's `fetch_object_with_footer`
+resolved candidate blocks by `SkipIndex::candidate_blocks(ts, ts, None, &[])`
+— no numeric arms — so every block was a ts candidate, the coverage crossover
+(`candidate_bytes / BLOCKS-section bytes >= 0.75`) fired, and the read
+collapsed to one whole-object GET. The predicate pruned blocks only at decode,
+shrinking `blocks_scanned` but not the bytes moved. On the 8,424-object
+ClickBench tenant (#680) q37 moved 11.7 GB to decode 144 of 17,731 blocks, and
+q20 moved 17.9 GB — more than the 11.1 GB of objects on disk, because a cold
+cache re-read each surviving segment once per owning partition.
+
+#761 makes the prune-only `NumRange` arms drive candidate selection. Each arm
+is resolved against the object's own FIELD_DIR
+(`FieldDir::numeric_range_arms`) to its column id, then applied to
+`candidate_blocks` in two places:
+
+- **Fetch side.** `fetch_object_with_footer` prunes the candidate set to the
+  surviving blocks before it weighs the coverage crossover, so a selective
+  query reads only those blocks (and the crossover fires only when the
+  survivors genuinely cover >= 75% of the BLOCKS section — the threshold is
+  unchanged). This is byte-identical to the unpruned read: the skip index's
+  per-block bounds are conservative (ADR-0013), so a block dropped at fetch is
+  one the decode-side prune would drop anyway, and the reader still runs the
+  full skip/POSTINGS/bloom prune over the fetched buffer.
+- **Plan side.** `plan_segment` counts survivors from the skip index alone
+  (footer + SKIP_IDX via the 64 KiB suffix probe, plus the object's FIELD_DIR
+  to resolve the arms) and fetches no block, carrying the footer forward so
+  each per-partition subset open skips its own probe (#693 part 3). This is
+  sound because for a query the skip index can decide — ts bounds and NumRange
+  arms only — the reader's full prune reduces to its skip step, so the count
+  equals the survivor list the scan stripes.
+
+A predicate the skip index cannot decide — a `has_word`/text arm (bloom prunes
+it only at decode), an `attrs['k']='v'` POSTINGS equality, a stream filter —
+still reads the whole object in the plan phase and is counted in the
+`plan_full_reads` metric, so a report can see which statements still pay it.
+
+Reference figures on the 8,424-object ClickBench tenant. The plan phase reads,
+per segment, one 64 KiB suffix probe (footer + SKIP_IDX) plus one small
+FIELD_DIR range GET to resolve the arms — the FIELD_DIR is a front section, so
+it cannot be folded into the tail probe — and fetches no block. Bytes are
+dominated by the probes: q37-class drops from 11.7 GB to about 0.65-0.9 GB
+(the ~8,424 probes plus coalesced reads of about 144 surviving blocks), and
+q20 from 17.9 GB to about 4-4.7 GB (each of its ~6,592 surviving blocks read
+once, never a whole-object re-read). The GET count does NOT fall in the same
+proportion, and is not meant to: the object count is the floor, because every
+relevant object still needs at least its probe. q37-class lands near 8,700
+GETs, down from 19,690 but only just under the 8,424-GET full scan — about two
+to three per object (probe + FIELD_DIR in the plan, plus the surviving-block
+and directory reads of the segments that actually survive). The FIELD_DIR GET
+is the one request resolving the numeric arms adds over the predicate-free
+path's single probe.
+
 Staleness: the evaluator recognizes the Prometheus staleness marker (the
 exact NaN bit pattern `0x7ff0_0000_0000_0002`, compared via
 `f64::to_bits()`, never `is_nan()`). A selector whose newest in-window
