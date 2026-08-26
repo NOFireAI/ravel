@@ -176,7 +176,7 @@ ClickBench tenant (#680) q37 moved 19,690 GETs and 11.7 GB to decode 144 of
 of objects on disk, because a cold cache re-read each surviving segment once
 per owning partition.
 
-#761 makes the prune-only `NumRange` arms drive candidate selection. Each arm
+Issue #761 makes the prune-only `NumRange` arms drive candidate selection. Each arm
 is resolved against the object's own FIELD_DIR
 (`FieldDir::numeric_range_arms`) to its column id, then applied to
 `candidate_blocks` in two places:
