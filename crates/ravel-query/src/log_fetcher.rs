@@ -1091,10 +1091,27 @@ impl LogSegmentFetcher {
             && Self::ts_range_relevant(seg_ref, query.ts_min_ns, query.ts_max_ns)
             && Self::plan_skip_decidable(query)
         {
-            let (footer, skip, field_dir, _stats) = self
-                .block_range
-                .fetch_plan_sections(seg_ref, tenant_hash, accounting)
-                .await?;
+            // The `page_fetch` phase span the other two plan branches carry
+            // (#782), with the same two fields and the same convention:
+            // `s3_bytes` reports block bytes only, zero here because this branch
+            // reads directory sections and no block; the directory bytes are
+            // recorded in `accounting`.
+            let fetch_span = tracing::debug_span!(
+                "page_fetch",
+                signal = "logs",
+                s3_requests = tracing::field::Empty,
+                s3_bytes = tracing::field::Empty,
+            );
+            let (footer, skip, field_dir, stats) = async {
+                self.block_range
+                    .fetch_plan_sections(seg_ref, tenant_hash, accounting)
+                    .await
+            }
+            .instrument(fetch_span.clone())
+            .await?;
+            let requests = stats.probe_gets + stats.metadata_gets + stats.block_range_gets;
+            fetch_span.record("s3_requests", requests);
+            fetch_span.record("s3_bytes", stats.block_bytes_fetched);
             let refs: Vec<&Predicate> = query.prune.iter().collect();
             let numeric = field_dir.numeric_range_arms(&refs);
             let survivors = skip
