@@ -20,6 +20,7 @@ pub mod error;
 pub mod field_dir;
 pub mod footer;
 pub mod page;
+pub mod page_dir;
 pub mod postings;
 pub mod ranged;
 pub mod reader;

@@ -95,7 +95,7 @@ is identical, so small L0 flush objects pay nothing for the level.
 
 ### 2. A PAGE_DIR section, with per-page checksums
 
-A new mandatory section `PAGE_DIR` (kind 10; ADR-0029's rule makes an
+A new mandatory section `PAGE_DIR` (kind 8, the next free RLOG kind; ADR-0029's rule makes an
 additive section kind free of a version bump, but decision 3 bumps anyway)
 lists, per row group, per column chunk, per page:
 

@@ -150,6 +150,8 @@ Validation (all violations `Corrupted`, never panics):
 | 4 | SKIP_IDX | skip index levels 0 and 1 | zstd |
 | 5 | BLOOM | per-block token bloom filters | none (per-entry) |
 | 6 | POSTINGS | per-field term -> block-index postings (optional) | none (per-block, zstd inside) |
+| 7 | GRAM_IDX | reserved (ADR-0105, not implemented) | - |
+| 8 | PAGE_DIR | per row group, per column chunk, per page: offset, length, enc/comp, crc32c | zstd |
 
 STREAM_DIR, FIELD_DIR, and SKIP_IDX are compressed as whole sections
 (zstd level 3 default) and always read whole. BLOCKS, BLOOM, and
