@@ -422,6 +422,8 @@ async fn flush_batch(
 mod tests {
     use super::*;
 
+    use std::future::Future;
+    use std::task::Poll;
     use std::time::Duration;
 
     use ravel_commit::keys;
@@ -640,27 +642,32 @@ mod tests {
         let config = pipeline_config(1000, Duration::from_secs(3600));
         let pipeline = Arc::new(AuditPipeline::spawn(store.clone(), tenant, config));
 
-        // Submit in the background; these stay buffered (below max_batch, before
-        // max_age) so their `submit` futures are still pending.
-        let mut handles = Vec::new();
-        for i in 0..2 {
-            let pipeline = pipeline.clone();
-            handles.push(tokio::spawn(async move {
-                pipeline.submit(test_event(13_000 + i, 7)).await
-            }));
+        // Both events must be queued before the shutdown drain runs, or the
+        // drain has nothing to flush and this test asserts nothing. `submit`
+        // sends into the flush task's channel and only then awaits its
+        // completion oneshot, so polling each future exactly once puts both
+        // events in the queue and leaves both callers pending -- the state
+        // this test needs, established by construction rather than by giving
+        // two spawned tasks 50 ms of wall clock to get there.
+        let mut submissions: Vec<_> = (0..2)
+            .map(|i| Box::pin(pipeline.submit(test_event(13_000 + i, 7))))
+            .collect();
+        for submission in &mut submissions {
+            let first = std::future::poll_fn(|cx| Poll::Ready(submission.as_mut().poll(cx))).await;
+            assert!(
+                first.is_pending(),
+                "a buffered submit stays pending until its batch flushes"
+            );
         }
-        // Give the two submissions time to reach the flush task's buffer.
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         pipeline
             .shutdown()
             .await
             .expect("shutdown drains and flushes");
 
-        for handle in handles {
-            handle
+        for submission in submissions {
+            submission
                 .await
-                .expect("submit task")
                 .expect("a buffered event is flushed by shutdown, not discarded");
         }
         assert_eq!(
