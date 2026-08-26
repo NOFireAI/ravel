@@ -303,11 +303,19 @@ cargo run -p ravel-bench --features sql-latency --bin sql_latency_bench -- \
 - `--sql-parallel-final-aggregation` lets an exact-typed query repartition its
   final aggregation (ADR-0094, amended by issue #741), the same knob as the
   server flag of that name. On by default; a `GROUP BY` or `COUNT(DISTINCT)`
-  over a high-cardinality key is where it shows (the amendment measured nine
-  such statements moving from pool-exhausted failures to 44-50 s here). Pass
-  `--sql-parallel-final-aggregation=false` to measure the pre-amendment
-  single-partition final; the bare flag stays accepted and still means on. The
-  effective value is recorded in the report's provenance.
+  over a high-cardinality key is where it shows. With the flag off, nine such
+  statements failed with a pool-exhausted error; with it on, **five of those
+  nine** (`COUNT(DISTINCT UserID)` and four more) moved to 44-50 s, while the
+  other **four (q29, q33, q34, q35) still exhaust the pool** for a separate
+  reason (see the ADR-0094 2026-08-26 amendment and its "still excluded" note).
+  Pass `--sql-parallel-final-aggregation=false` to measure the pre-amendment
+  single-partition final; the bare flag stays accepted and still means on. This
+  local value is recorded in the report's provenance as
+  `parallel_final_aggregation_requested`; for an in-process (`--tenant`) run it
+  is also the effective value (`parallel_final_aggregation_effective`), but a
+  `--flight` run does not send the setting to the server, so its effective value
+  is the server's own default (on) unless the server was started otherwise, and
+  the report records `parallel_final_aggregation_effective` as null.
 - `--sql-max-segments <N>` is the engine's `max_segments` ceiling, the same knob
   as `ravel-server --max-segments`: the number of sealed, below-watermark
   segments a statement may fan out over before it is refused with `query fans
@@ -392,9 +400,12 @@ Dataset-level, independent of any one query:
 - **rows** and the **pre-/post-compaction layout label**.
 
 Provenance (backend, region, endpoint, host logical cores, source, dataset id,
-runs, `cache_bytes`, `deadline_secs`, `fetch_concurrency`, and
-`flight_endpoint` when step 6's lane ran) is recorded beside the numbers so
-two runs are comparable or provably not.
+runs, `cache_bytes`, `deadline_secs`, `fetch_concurrency`,
+`parallel_final_aggregation_requested` (the local CLI value) and
+`parallel_final_aggregation_effective` (the value that governed execution:
+equal to the request for an in-process lane, null for a `--flight` run whose
+effective setting is the server's), and `flight_endpoint` when step 6's lane
+ran) is recorded beside the numbers so two runs are comparable or provably not.
 
 ## Reading a report against ClickBench
 

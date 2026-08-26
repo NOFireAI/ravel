@@ -161,8 +161,13 @@ struct Args {
     /// --sql-parallel-final-aggregation`. On by default; pass
     /// `--sql-parallel-final-aggregation=false` (or the bare flag, which stays
     /// accepted and still means on) to measure the pre-amendment
-    /// single-partition final. The effective value is recorded in the report's
-    /// provenance either way.
+    /// single-partition final. This local value is recorded in the report's
+    /// provenance as `parallel_final_aggregation_requested`. For an in-process
+    /// lane it reaches the executor and so is also the effective value; under
+    /// `--flight` it does NOT reach the server (the setting is not on the Flight
+    /// wire), so the report's `parallel_final_aggregation_effective` is null and
+    /// the server's own default (on) governs unless the server was started
+    /// otherwise.
     #[arg(
         long,
         num_args = 0..=1,
@@ -370,9 +375,15 @@ fn print_human_table(report: &SqlLatencyReport) {
     println!("  runs/query : {}", p.runs);
     println!("  deadline   : {} s per statement", p.deadline_secs);
     println!("  fetch conc : {}", p.fetch_concurrency);
+    let effective = match p.parallel_final_aggregation_effective {
+        Some(v) => v.to_string(),
+        // A Flight run does not send the setting to the server; the effective
+        // value is the server's own (its default is on).
+        None => "unknown (server default)".to_string(),
+    };
     println!(
-        "  tenant max : {} bytes  parallel final agg: {}",
-        p.tenant_max_bytes, p.parallel_final_aggregation
+        "  tenant max : {} bytes  parallel final agg: requested={} effective={}",
+        p.tenant_max_bytes, p.parallel_final_aggregation_requested, effective
     );
     println!(
         "  max segs   : {}  explain: {}",

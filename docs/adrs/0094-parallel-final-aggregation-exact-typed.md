@@ -641,8 +641,14 @@ at 32 scan partitions with an 8 GiB per-query memory pool:
   `ORDER BY` was already unguaranteed (see `docs/query-engine.md`), so the
   repartitioned merge order changes nothing a client was entitled to rely
   on. Decision 3's caveat — that the hash exchange carries every forwarded
-  row when the #728 probe fires — held only as a *slower*, never a
-  *failing*, path.
+  row when the #728 probe fires — held as a *slower*, not a *failing*, path
+  **under the measured 8 GiB per-query pool**. That is a result about this
+  configuration, not an unconditional property: the redistribution buffer
+  still moves the memory ceiling (the scoping sweep hit `Memory Exhausted
+  while SpillPool (DiskManager is disabled)` on a parallel-plan combination,
+  recorded above), so the exhaustion risk stands and a smaller pool or a
+  larger group set can still fail the parallel path. Spilling is disabled by
+  design (ADR-0013), so there is no softer degradation.
 
 The measurement therefore inverts decision 4's default-follows-measurement
 conclusion for the exact-typed class: the serial final is not merely slower
@@ -666,7 +672,19 @@ never eligible (their fold is IEEE f64 addition, not associative past
 disqualifying aggregate or key anywhere in the query — including inside a
 scalar/`IN`/`EXISTS` subquery — still forces the whole query onto the
 single-partition plan. This amendment changes only the default of the gate,
-not the gate. It also does not touch the *string-keyed partial* stage that
-exhausts the pool for a different reason (`partitions x distinct` pre-final
-state); that is issue #680's separate `skip_partial_aggregation` fix, which
-was already on by default.
+not the gate.
+
+**Final stage only; the partial stage is a separate problem (#737).** This
+ADR governs the *final* aggregation stage. Its gate excludes float aggregates
+and float `GROUP BY` keys; a **non-float `GROUP BY` key, string keys
+included, is admitted** and its final is repartitioned. Repartitioning the
+final does not touch the *partial* stage, and a high-cardinality `GROUP BY`
+(the ClickBench string-keyed statements are the ones this bites) can still
+exhaust the per-query pool at the `Partial` `AggregateExec` -- the
+`partitions x distinct` pre-final state materialized per scan partition --
+even when its final is repartitioned. That partial-stage memory problem is
+tracked separately as issue #737 (the `skip_partial_aggregation` mitigation),
+and it is why some high-cardinality statements still fail with the parallel
+final on. Do not read this amendment as a claim that every high-cardinality
+`GROUP BY` now completes: it fixes the final-merge exhaustion for the
+exact-typed class, not the partial-stage one.

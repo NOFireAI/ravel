@@ -328,6 +328,20 @@ async fn flight_lane_measures_every_statement_over_the_wire_without_scan_diagnos
         report.provenance.endpoint, "n/a",
         "the object-store endpoint field is left alone"
     );
+    // The Flight lane does not send `parallel_final_aggregation` to the server,
+    // so the report must record the local CLI value only as *requested*
+    // (`flight_cfg` sets it false), and the *effective* value as unknown
+    // (`None`): the server's own config governed, and this process cannot know
+    // it. Recording the local value as effective (the bug this fixes) would have
+    // `parallel_final_aggregation_effective == Some(false)` here.
+    assert!(
+        !report.provenance.parallel_final_aggregation_requested,
+        "the requested field carries this run's CLI value (false)"
+    );
+    assert_eq!(
+        report.provenance.parallel_final_aggregation_effective, None,
+        "a Flight run does not send the setting, so the effective value is unknown"
+    );
     // The dataset stanza is still resolved from the store directly: a Flight
     // client cannot read the catalog.
     assert_eq!(report.dataset.object_count, 3);
