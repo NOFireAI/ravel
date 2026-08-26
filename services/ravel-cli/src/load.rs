@@ -4936,19 +4936,18 @@ type = "i64"
         (dir, pq, m)
     }
 
-    /// #773: the load setup parses the input's Parquet footer exactly once, no
-    /// matter how many stride cursors it opens.
+    /// The load setup parses the input's Parquet footer exactly once, no matter
+    /// how many stride cursors it opens.
     ///
     /// The counter is the footer-tail read (`CountingReader`). The fixture has 8
-    /// row groups, and the load requests 8 read cursors, so
-    /// `resolve_read_cursors` gives 8 cursors (one per row group). Before #773
-    /// the setup parsed the footer once in `row_group_row_counts`, once more in
-    /// `load_reader_schema`, and once per cursor as each builder re-opened the
-    /// file: `cursors + 2 == 10` parses. Sharing one `ArrowReaderMetadata` (the
-    /// `new_with_metadata` builder line in `open_stride_cursors`) drops that to
-    /// exactly 1. Flip that builder back to `try_new`/`try_new_with_options` and
-    /// the count returns to `cursors + 1`; drop the shared metadata entirely and
-    /// it returns to `cursors + 2`.
+    /// row groups and the load requests 8 read cursors, so
+    /// `resolve_read_cursors` gives one cursor per row group; every one of them
+    /// takes the shared `ArrowReaderMetadata` through the `new_with_metadata`
+    /// builder line in `open_stride_cursors`, which is what holds the count to
+    /// exactly one. Flip that builder to `try_new`/`try_new_with_options` and
+    /// the count becomes `cursors + 1`; stop sharing the metadata with
+    /// `row_group_row_counts` and `load_reader_schema` too and it becomes
+    /// `cursors + 2`.
     #[test]
     fn load_setup_parses_the_footer_once() {
         const GROUPS: usize = 8;
