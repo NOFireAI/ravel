@@ -26,11 +26,26 @@ PASS, continue with the procedure below.
 checks must pass, and history is linear (rebase-merge only). No process,
 `fleet-result-merge.sh` included, pushes `main` directly. The script
 lands a result branch by cleaning its history, pushing that cleaned history
-to a `task/<id>/merge` head branch, opening a PR against `main`, and
-enabling auto-merge (`gh pr merge --auto --rebase`) so GitHub lands it the
-moment the required checks pass. The rebase-merge keeps each commit's own
-message, so per-commit `Fixes:`/`Refs:` trailers still close their issues
-when they land.
+to a `task/<id>/merge` head branch, and opening a PR against `main`. The
+rebase-merge keeps each commit's own message, so per-commit `Fixes:`/
+`Refs:` trailers still close their issues when they land.
+
+**The PR opens WITHOUT auto-merge by default (standing rule, 2026-08-26).**
+CodeRabbit's GitHub App reviews every PR but posts as a review comment, not
+a required status check, so `--auto` merges before that review lands --
+#749/#750 landed with 6 real CodeRabbit findings unaddressed this way. Wait
+for the `coderabbitai[bot]` review, fix or explicitly answer every
+actionable finding (a walkthrough-only comment with zero findings counts
+as clean), then merge by hand once CI is green:
+
+```sh
+scripts/pr-review-status.sh <pr-number>   # one-line CI + CodeRabbit status
+gh pr merge <pr-number> --rebase
+```
+
+`FLEET_MERGE_AUTO=1` restores the old `gh pr merge --auto --rebase`
+behavior for the rare case that genuinely does not need a CodeRabbit wait;
+do not set it out of impatience.
 
 ## Result-branch history is cleaned before the PR is opened
 
@@ -73,7 +88,7 @@ written before that discipline, or that slip.
 (refuses unless HEAD is a clean `main`/`origin/main`, so a stale HEAD can
 never produce a too-old merge base), does the history clean above, runs the
 local pre-flight gates on the cleaned tree, and only then pushes the PR
-head, opens the PR, and turns on auto-merge.
+head and opens the PR (without auto-merge; see above).
 
 ```sh
 TASK=<task-id>
@@ -122,19 +137,33 @@ scripts/fleet-result-merge.sh $TASK message.txt   # add -p CRATE to scope local 
 - `gh api` sends every `-f` value as a string. A boolean or number field
   needs `-F` (`-F strict=false`), or the API answers with
   `"false" is not a boolean`.
-- `gh pr merge --auto --rebase` can fail once with a GraphQL error naming
-  a merge method you never requested ("squash merging is not allowed").
-  That is API flakiness around enabling auto-merge: retry once before
-  investigating repo settings.
+- `gh pr merge --auto --rebase` (only under `FLEET_MERGE_AUTO=1`, or the
+  final by-hand merge once CodeRabbit is clean) can fail once with a
+  GraphQL error naming a merge method you never requested ("squash merging
+  is not allowed"). That is API flakiness around enabling auto-merge:
+  retry once before investigating repo settings.
+- Disabling auto-merge on a PR that is already mid-merge fails silently:
+  GitHub can complete a merge within seconds of a required check going
+  green, and a `gh pr merge --disable-auto` call that loses that race just
+  finds the PR already merged. This is why the default is to never enable
+  auto-merge in the first place, not to enable-then-disable it.
 
 ## After the PR is open
 
-Auto-merge lands the PR once the required checks pass; `--delete-branch`
-removes the `task/$TASK/merge` head once it merges. The script deliberately
-leaves `task/$TASK/result` and `task/$TASK/start` in place: enabling
-auto-merge is not landing, and deleting them before the checks finish would
-mean a failed check leaves the PR open with no way to recover the original
-result branch.
+Poll `scripts/pr-review-status.sh <number>` until it reports clean (CI
+green, CodeRabbit reviewed, no open inline comments), fixing or answering
+every finding along the way, then land it by hand:
+
+```sh
+gh pr merge <number> --rebase --delete-branch
+```
+
+This removes the `task/$TASK/merge` head once it merges. The script
+deliberately leaves `task/$TASK/result` and `task/$TASK/start` in place
+regardless of merge mode: opening a PR is not landing, and deleting them
+before the checks (and the CodeRabbit wait) finish would mean a failed
+check or an unresolved finding leaves the PR open with no way to recover
+the original result branch.
 
 Watch the PR (`gh pr view <number> --json state,mergedAt`) until it reports
 merged. Once merged, delete the task refs yourself:

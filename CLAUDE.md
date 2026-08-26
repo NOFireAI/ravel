@@ -231,14 +231,23 @@ connection, a pushed-but-broken main).
   claim; look at what actually landed.
 - `scripts/fleet-result-merge.sh <task-id> <message-file> [-p CRATE ...]`:
   cleans `wip:`/fixup commits out of the reviewed result branch, runs
-  `gates.sh`, and opens a PR against `main` with auto-merge enabled
-  (`main` is protected; the script never pushes or merges it directly).
-  Task refs are left on origin until the PR is confirmed merged; see the
-  merge-fleet-result skill for that step. Write the PR message to
-  `<message-file>` first (trailers included; line 1 is the title, the
-  body starts at line 3); this script does not construct one for you.
-  Run `fleet-result-inspect.sh` first: this script does not pause for
-  review, it assumes you already decided the scope is correct.
+  `gates.sh`, and opens a PR against `main` (`main` is protected; the
+  script never pushes or merges it directly). The PR opens WITHOUT
+  auto-merge by default (standing rule, 2026-08-26): CodeRabbit's GitHub
+  App reviews every PR as a comment, not a required status check, so
+  `--auto` used to merge before that review landed (#749/#750 shipped
+  with 6 real findings unaddressed this way). Wait for the
+  `coderabbitai[bot]` review, fix or answer every actionable finding (a
+  walkthrough-only comment with zero findings counts as clean; check with
+  `scripts/pr-review-status.sh <pr-number>`), then merge by hand:
+  `gh pr merge <pr-number> --rebase`. `FLEET_MERGE_AUTO=1` restores the
+  old auto-merge behavior for the rare case that genuinely does not need
+  the wait. Task refs are left on origin until the PR is confirmed
+  merged; see the merge-fleet-result skill for that step. Write the PR
+  message to `<message-file>` first (trailers included; line 1 is the
+  title, the body starts at line 3); this script does not construct one
+  for you. Run `fleet-result-inspect.sh` first: this script does not
+  pause for review, it assumes you already decided the scope is correct.
   `FLEET_MERGE_SKIP_GATES=1` skips the local `gates.sh` run and lets the
   PR's required checks be the gate; the cost is learning about a red PR
   from CI instead of immediately. The precondition is mechanical:
@@ -249,6 +258,15 @@ connection, a pushed-but-broken main).
   receipt: rerun the gates. The script also runs `assert-gh-auth.sh`
   first and `assert-clean-authorship.sh` on the rewritten history before
   it pushes.
+- `scripts/pr-review-status.sh <pr-number>`: one-line status for the
+  wait-for-CodeRabbit-then-merge-by-hand flow -- `mergeStateStatus`, the
+  CI check rollup (pass/pending/fail counts, failing check names), and
+  the `coderabbitai[bot]` review count plus its inline-comment count. The
+  REST comments endpoint carries no resolved/unresolved field (that's a
+  GraphQL review-thread concept), so a nonzero comment count needs a
+  human/session read of `gh api repos/.../pulls/<n>/comments` to judge
+  whether each was already fixed or answered; the script only tells you
+  there's something to read.
 - `scripts/verify-dispatch-gates.sh <ref> <scratchpad-dir>`: the tier-1
   gate check behind the `verify-dispatch` skill: an isolated worktree
   outside the repo, a cold `CARGO_TARGET_DIR`, and the full workspace
