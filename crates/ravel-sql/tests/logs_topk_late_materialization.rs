@@ -697,7 +697,7 @@ async fn without_a_cache_phase_two_costs_exactly_one_get_per_fetched_block() {
 /// the same order; phase 2 does not sort.
 ///
 /// The fixture collapses `ts` onto the block ordinal, so each segment has four
-/// records at each of four `ts` values and the twelve matching records tie
+/// records at each of four `ts` values and the ten matching records tie
 /// heavily. Comparison is against the un-rewritten plan, so this fails if the
 /// rewrite ever reorders a tied group rather than pinning one arbitrary order.
 #[tokio::test]

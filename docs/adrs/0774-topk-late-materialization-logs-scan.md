@@ -23,7 +23,7 @@ columns) three statements bound the problem:
 
 The third statement's plan is
 
-```
+```text
 SortExec: TopK(fetch=10), expr=[ts ASC]
   CoalescePartitionsExec
     FilterExec: like(URL, %google%)
@@ -140,9 +140,12 @@ It picks the referenced rows out of the decoded block and emits them in
 phase-1 order.
 
 That entry point restricts the DECODE to the named block; its byte fetch is
-the query's ordinary fetch for the whole object. So phase 2 costs `k`
-requests and up to `k` objects' bytes, not `k` blocks' bytes. See the
-consequences below.
+the query's ordinary fetch for the whole object. So phase 2 performs at
+most `k` logical block fetches (fewer when winners share a block), and the
+object-store request count behind them depends on the fetch path: zero on
+a cache hit, one whole-object GET at or below the block-range threshold,
+the coalesced ranges above it. Bytes are up to `k` objects', not `k`
+blocks'. See the consequences below.
 
 No projection node is inserted to drop the row-ref column. Phase 2's output
 schema is `Arc::clone`d off the original scan's, so the restored column
@@ -228,10 +231,12 @@ it.
 
 ## Consequences
 
-- A qualifying statement costs `k` extra block reads. With ADR-0046's read
-  cache wired and an object below the block-range threshold, those land on
-  the same `(0, object_size)` cache key phase 1 already admitted and cost
-  no request at all; without a cache they are one request each. Both are
+- A qualifying statement costs at most `k` extra logical block fetches.
+  The store requests behind them depend on the fetch path: with ADR-0046's
+  read cache wired and an object below the block-range threshold they land
+  on the same `(0, object_size)` cache key phase 1 already admitted and
+  cost no request at all; without a cache they are one GET each below the
+  threshold and the coalesced ranges above it. Both cache states are
   pinned in `crates/ravel-sql/tests/logs_topk_late_materialization.rs`.
 - **Phase 2's bytes are per object, not per block, and this ADR does not
   fix that.** `scan_accounted_with_tenant_subset` narrows the decode to the
