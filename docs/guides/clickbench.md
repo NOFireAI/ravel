@@ -76,7 +76,8 @@ ravel-cli --store <your-store-flags> load \
   --shards 4 \
   --batch-rows 40000 \
   --read-cursors 4 \
-  --pipeline-depth 1
+  --pipeline-depth 1 \
+  --decode-queue-batches 2
 ```
 
 `--batch-rows` is the object-count lever. One batch is one Strict flush, which is
@@ -135,6 +136,22 @@ decoded-batch-plus-pending-write working set by roughly the depth. This cost is
 *in addition to* the `--batch-rows` x `--shards` product above, not a
 replacement for it: the per-batch resident size is still set by that product, and
 `--pipeline-depth` keeps that many built batches alive at once.
+
+`--decode-queue-batches` is the decode/encode overlap lever (issue #680). A
+bounded channel sits between the Parquet reader plus `build_columnar_batch`
+stage and the shard writers, so the reader decodes batch N+1 (and, with
+`--read-cursors > 1`, stride-reads several row-group regions in parallel) while
+the writers are still flushing batch N, instead of the two stages alternating in
+lockstep with each waiting on the other. Its default of `2` lets the reader run
+up to two batches ahead; raise it if the decode stage is starving the writers,
+lower it to `1` to bound the queue tightest. The reader blocks when the channel
+is full, so the queue holds at most `--decode-queue-batches` built batches — that
+much memory again on top of both the `--batch-rows` x `--shards` per-batch size
+and the `--pipeline-depth` in-flight-write working set. Size the peak working set
+as roughly `(--pipeline-depth + --decode-queue-batches + 2)` built batches (the
+in-flight writes, the queued batches, plus one in each stage's hand). The RLOG
+objects a load writes are byte-identical regardless of this flag: only the
+scheduling of the unchanged decode and write work moves.
 
 As a concrete anchor (issue #682, measured at 8 shards, 80k rows, depth 1): live
 heap is about 6GB under a memory-returning allocator (tcmalloc) and scales close

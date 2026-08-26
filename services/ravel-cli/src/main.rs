@@ -274,6 +274,18 @@ enum Command {
         /// this gap cannot occur. `0` is rejected.
         #[arg(long, default_value_t = 1)]
         pipeline_depth: usize,
+        /// Number of decoded batches allowed to sit queued between the Parquet
+        /// decode/build stage and the shard writers (issue #680). A bounded
+        /// channel decouples the two: the reader decodes batch N+1 (and, with
+        /// `--read-cursors > 1`, stride-reads several row-group regions in
+        /// parallel) while the encoders write batch N, so decode and encode
+        /// overlap instead of running in lockstep. The reader blocks when the
+        /// channel is full, so the queue holds at most this many built batches;
+        /// the extra memory is roughly this count times one batch's built size,
+        /// on top of `--pipeline-depth`'s in-flight-write working set. Defaults
+        /// to 2. Must be at least 1; 0 is rejected.
+        #[arg(long, default_value_t = ravel_cli::load::DEFAULT_DECODE_QUEUE_BATCHES)]
+        decode_queue_batches: usize,
     },
 }
 
@@ -1291,6 +1303,7 @@ async fn main() -> anyhow::Result<()> {
             batch_rows,
             read_cursors,
             pipeline_depth,
+            decode_queue_batches,
         } => {
             let profile = ravel_cli::cli_profiling::ProfileSession::from_env("ravel-cli-load");
             let result = ravel_cli::load::run(
@@ -1302,6 +1315,7 @@ async fn main() -> anyhow::Result<()> {
                 batch_rows,
                 read_cursors,
                 pipeline_depth,
+                decode_queue_batches,
                 now_ns()?,
             )
             .await;

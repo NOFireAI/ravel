@@ -64,6 +64,14 @@ pub const LOADER_MAX_ATTRIBUTES_PER_RECORD: usize = 1024;
 /// batch. Every successful write is fully durable before the next batch starts.
 pub const DEFAULT_BATCH_ROWS: usize = 10_000;
 
+/// Default number of decoded batches allowed to sit queued between the Parquet
+/// decode/build stage and the shard-write stage (issue #680). The decoder runs
+/// ahead by up to this many batches while the encoders drain earlier ones, so
+/// decode and encode overlap instead of running in lockstep. Bounds the memory
+/// the queue holds to roughly this count times one batch's built size; stacks
+/// with `--pipeline-depth`'s own in-flight-write working set.
+pub const DEFAULT_DECODE_QUEUE_BATCHES: usize = 2;
+
 /// Ack deadline for each Strict write. Generous: a bulk load values completing
 /// over racing a slow store.
 const WRITE_ACK_DEADLINE: Duration = Duration::from_secs(60);
@@ -260,6 +268,7 @@ pub async fn run(
     batch_rows: usize,
     read_cursors: Option<usize>,
     pipeline_depth: usize,
+    decode_queue_batches: usize,
     now_ns: i64,
 ) -> anyhow::Result<()> {
     run_warning_to(
@@ -271,6 +280,7 @@ pub async fn run(
         batch_rows,
         read_cursors,
         pipeline_depth,
+        decode_queue_batches,
         now_ns,
         &mut std::io::stderr(),
     )
@@ -294,6 +304,7 @@ pub(crate) async fn run_warning_to(
     batch_rows: usize,
     read_cursors: Option<usize>,
     pipeline_depth: usize,
+    decode_queue_batches: usize,
     now_ns: i64,
     warnings: &mut dyn std::io::Write,
 ) -> anyhow::Result<()> {
@@ -305,7 +316,10 @@ pub(crate) async fn run_warning_to(
         .map_err(|e| anyhow::anyhow!("failed to read --mapping {}: {e}", mapping_path.display()))?;
     let mapping = parse_mapping(&mapping_text)?;
 
-    match load(
+    // The production entry point drives the columnar fast path (ADR-0109) with
+    // the operator-configured decode-queue depth; `load` keeps a stable
+    // signature for tests and callers that want the default depth.
+    match load_instrumented(
         store,
         parquet_path,
         tenant,
@@ -314,8 +328,12 @@ pub(crate) async fn run_warning_to(
         batch_rows,
         read_cursors,
         pipeline_depth,
+        decode_queue_batches,
         now_ns,
         Arc::new(SystemClock),
+        LoadPath::Columnar,
+        None,
+        None,
     )
     .await
     {
@@ -574,9 +592,11 @@ pub async fn load(
         batch_rows,
         read_cursors,
         pipeline_depth,
+        DEFAULT_DECODE_QUEUE_BATCHES,
         now_ns,
         clock,
         LoadPath::Columnar,
+        None,
         None,
     )
     .await
@@ -589,9 +609,13 @@ pub async fn load(
 /// [`load`] always passes `None`.
 type BuildStartHook = Arc<dyn Fn() + Send + Sync>;
 
-/// [`load`] with the decode/build start hook injected. See [`load`] for the
-/// contract; `on_build_start` fires once per batch that has data to build, on
-/// the blocking decode/build task, before the per-row loop.
+/// [`load`] with the decode/build hooks and the decode-queue depth injected. See
+/// [`load`] for the contract; `on_build_start` fires once per batch that has
+/// data to build, on the blocking decode/build task, before the per-row loop.
+/// `on_batch_queued` fires once per built batch after it is handed to the
+/// decode->encode channel (issue #680), so a test can observe how far the
+/// decoder has run ahead of the encoders while a write is held. Both are `None`
+/// in production.
 #[allow(clippy::too_many_arguments)]
 async fn load_instrumented(
     store: Arc<dyn ObjectStoreBackend>,
@@ -602,10 +626,12 @@ async fn load_instrumented(
     batch_rows: usize,
     read_cursors: Option<usize>,
     pipeline_depth: usize,
+    decode_queue_batches: usize,
     now_ns: i64,
     clock: Arc<dyn Clock>,
     path: LoadPath,
     on_build_start: Option<BuildStartHook>,
+    on_batch_queued: Option<BuildStartHook>,
 ) -> Result<LoadReport, LoadError> {
     // Reject a zero batch size with a typed error rather than silently clamping
     // it to 1: `batch_rows` is the operator-facing `--batch-rows` lever, and a
@@ -635,6 +661,17 @@ async fn load_instrumented(
         return Err(LoadError::Setup(
             "--read-cursors must be at least 1, or omitted for automatic sizing \
              (min(shard count, row-group count)); 0 was given"
+                .to_string(),
+        ));
+    }
+    // Same shape as the guards above: `--decode-queue-batches` is the
+    // operator-facing lever bounding how many decoded batches may sit queued
+    // ahead of the encoders (issue #680). A depth of 0 is a channel that can
+    // hold no batch, so it is rejected rather than silently clamped.
+    if decode_queue_batches == 0 {
+        return Err(LoadError::Setup(
+            "--decode-queue-batches must be at least 1 (the number of decoded batches allowed to \
+             queue ahead of the shard writers); 0 was given"
                 .to_string(),
         ));
     }
@@ -702,80 +739,59 @@ async fn load_instrumented(
         tokio::task::JoinHandle<Result<LogWriteReceipt, LogWriteError>>,
     )> = std::collections::VecDeque::with_capacity(pipeline_depth);
 
-    // Single-batch decode/build lookahead (issue #541), independent of the write
-    // window above. Batch N+1's decode/build (sync Parquet decode via
-    // `Iterator::next`, then the per-row `build_record` loop, both CPU-bound)
-    // runs on a `spawn_blocking` task started *before* batch N's write I/O is
-    // awaited, so N+1's CPU work overlaps the writes' I/O wait. The non-`Clone`
-    // `ParquetRecordBatchReader` is shuttled into and back out of the closure
-    // each iteration.
+    // Decode/encode overlap (issue #680). A single blocking decoder task owns
+    // the K stride cursors and drives the existing `collect_spans` +
+    // `build_columnar_batch` stage, in row-group order, pushing each built batch
+    // into a bounded channel; this loop pulls from that channel and drives the
+    // shard writes. The channel is the decouple point that replaces the former
+    // single-batch lookahead (issue #541): the decoder runs ahead by up to
+    // `decode_queue_batches` batches (back-pressured by `blocking_send` when the
+    // channel is full) while the encoders drain earlier ones, so decode and
+    // encode overlap instead of alternating in lockstep. Batch composition,
+    // order, and shard assignment are unchanged (the decoder produces exactly
+    // the same batches, in the same FIFO order, that the former inline loop did),
+    // so the RLOG bytes written are identical for the same input and flags.
     //
-    // Result ordering stays strict-FIFO regardless of `pipeline_depth`: writes
-    // are recorded (and a write failure surfaced) only by consuming `inflight`
-    // oldest-first, so `report.tokens` grows in submission order, and a build
-    // error for a later batch is only reported after every earlier batch's write
-    // has been drained from the window. At `pipeline_depth == 1` the window
-    // holds at most one write, popped and awaited before the next batch's write
-    // starts, so the observable results and ordering match the pre-widening loop
-    // exactly (only the execution shape differs: the write now runs on a spawned
-    // task rather than inline).
+    // Result ordering stays strict-FIFO regardless of `pipeline_depth` or
+    // `decode_queue_batches`: batches arrive from the channel in submission
+    // order, and writes are recorded (and a write failure surfaced) only by
+    // consuming `inflight` oldest-first, so `report.tokens` grows in submission
+    // order, and a build error for a later batch is only reported after every
+    // earlier batch's write has been drained from the window.
     let mapping = Arc::new(mapping.clone());
     let state = StrideCursors {
         cursors,
         deal_offset: 0,
     };
 
-    // Spawn the decode/build of the next batch, moving the stride cursors in;
-    // the task hands them back with the outcome.
-    let spawn_build = |state: StrideCursors| {
-        let mapping = Arc::clone(&mapping);
-        let limits = limits.clone();
-        let hook = on_build_start.clone();
-        tokio::task::spawn_blocking(move || match path {
-            LoadPath::Row => {
-                decode_and_build_stride(state, mapping, limits, now_ns, batch_rows, hook.as_ref())
-            }
-            LoadPath::Columnar => decode_and_build_stride_columnar(
-                state,
-                mapping,
-                limits,
-                now_ns,
-                batch_rows,
-                hook.as_ref(),
-            ),
-        })
-    };
+    let (mut rx, decode_handle) = spawn_decode_pipeline(
+        state,
+        Arc::clone(&mapping),
+        limits.clone(),
+        now_ns,
+        batch_rows,
+        path,
+        on_build_start,
+        on_batch_queued,
+        decode_queue_batches,
+    );
 
-    // Prime the pipeline with batch 0.
-    let mut pending = spawn_build(state);
+    // `true` once the decoder signals clean exhaustion (`Prefetched::Done`). If
+    // the channel instead closes without a `Done` (the decoder task panicked),
+    // this stays `false` and the panic is surfaced as a batch decode failure.
+    let mut decoder_done = false;
 
     loop {
-        let (state, built) = match pending.await {
-            Ok(pair) => pair,
-            // A panic in the decode/build task is a batch decode failure;
-            // earlier batches' writes may still be in flight, so drain them
-            // first (oldest-first) so any already-durable earlier batch is
-            // reported and any earlier write failure surfaces ahead of this one,
-            // exactly as the former serial loop ordered them.
-            Err(join_err) => {
-                drain_inflight(
-                    &mut inflight,
-                    &mut report,
-                    &mut shards_seen,
-                    &mut data_batches_flushed,
-                    shards,
-                )
-                .await?;
-                return Err(LoadError::BatchFailed {
-                    reason: format!("Parquet decode/build task failed: {join_err}"),
-                    durable: report.tokens.clone(),
-                });
+        let built = match rx.recv().await {
+            Some(Prefetched::Done) => {
+                decoder_done = true;
+                break;
             }
-        };
-
-        let built = match built {
-            Prefetched::Done => break,
-            Prefetched::BatchFailed { reason } => {
+            Some(Prefetched::BatchFailed { reason }) => {
+                // Earlier batches' writes may still be in flight, so drain them
+                // first (oldest-first) so any already-durable earlier batch is
+                // reported and any earlier write failure surfaces ahead of this
+                // one, exactly as the former serial loop ordered them.
                 drain_inflight(
                     &mut inflight,
                     &mut report,
@@ -789,7 +805,7 @@ async fn load_instrumented(
                     durable: report.tokens.clone(),
                 });
             }
-            Prefetched::RowRejected { row, reason } => {
+            Some(Prefetched::RowRejected { row, reason }) => {
                 drain_inflight(
                     &mut inflight,
                     &mut report,
@@ -804,22 +820,24 @@ async fn load_instrumented(
                     durable: report.tokens.clone(),
                 });
             }
-            Prefetched::Batch(built) => built,
+            Some(Prefetched::Batch(built)) => built,
+            // The channel closed without a `Done`: the decoder task ended early,
+            // which on this path means it panicked. Drain earlier writes, then
+            // surface the panic as a batch decode failure (below).
+            None => break,
         };
 
         let n = built.num_rows() as u64;
         if n == 0 {
-            // A zero-row batch writes nothing; advance and prefetch the next.
-            pending = spawn_build(state);
+            // A zero-row batch writes nothing; wait for the next.
             continue;
         }
 
         // Spawn this batch's write onto its own task so it runs concurrently
-        // with the writes already in flight and with the next batch's
-        // decode/build, then prefetch that next batch. A `tokio::spawn`ed write
-        // begins executing immediately; a merely-constructed future would do no
-        // I/O until polled, which is why the window is built from join handles,
-        // not from unpolled futures.
+        // with the writes already in flight and with the decoder's next batch. A
+        // `tokio::spawn`ed write begins executing immediately; a merely-
+        // constructed future would do no I/O until polled, which is why the
+        // window is built from join handles, not from unpolled futures.
         let handle = match built {
             Built::Row(records) => {
                 let router = Arc::clone(&router);
@@ -845,7 +863,6 @@ async fn load_instrumented(
             }
         };
         inflight.push_back((n, handle));
-        pending = spawn_build(state);
 
         // Bound true concurrency to `pipeline_depth`: once the window is full,
         // resolve the oldest write before starting the next batch's write. This
@@ -889,8 +906,33 @@ async fn load_instrumented(
         }
     }
 
-    // The stream is exhausted; drain every write still in the window in the same
-    // oldest-first order before reporting success.
+    // The channel is drained. If it closed without a `Done`, the decoder task
+    // ended early (a panic in the decode/build): drain the earlier writes
+    // oldest-first, then surface the panic as a batch decode failure, matching
+    // the ordering the former inline loop produced on a decode-task panic.
+    if !decoder_done {
+        drain_inflight(
+            &mut inflight,
+            &mut report,
+            &mut shards_seen,
+            &mut data_batches_flushed,
+            shards,
+        )
+        .await?;
+        let reason = match decode_handle.await {
+            Err(join_err) => format!("Parquet decode/build task failed: {join_err}"),
+            Ok(()) => "Parquet decode/build task ended without completing".to_string(),
+        };
+        return Err(LoadError::BatchFailed {
+            reason,
+            durable: report.tokens.clone(),
+        });
+    }
+
+    // Clean exhaustion: reap the finished decoder task, then drain every write
+    // still in the window in the same oldest-first order before reporting
+    // success.
+    let _ = decode_handle.await;
     drain_inflight(
         &mut inflight,
         &mut report,
@@ -914,6 +956,73 @@ async fn load_instrumented(
     }
     report.elapsed = started.elapsed();
     Ok(report)
+}
+
+/// Spawn the decode/build stage (issue #680) as one blocking task that owns the
+/// K stride cursors and feeds a bounded channel. Each iteration decodes and
+/// builds exactly one batch through the same `collect_spans` +
+/// `build_columnar_batch` (or row) path the former inline loop used, in
+/// row-group order, then `blocking_send`s the outcome; the send blocks when the
+/// channel already holds `queue_depth` batches, which is the back-pressure that
+/// bounds the queue's memory to `queue_depth` built batches. The task stops
+/// after sending a terminal outcome (`Done`/`BatchFailed`/`RowRejected`) or when
+/// the receiver is dropped (the loader returned early). Returns the receiving
+/// half plus the task's join handle, which the caller reaps to distinguish a
+/// clean end from a decode-task panic.
+#[allow(clippy::too_many_arguments)]
+fn spawn_decode_pipeline(
+    mut state: StrideCursors,
+    mapping: Arc<Mapping>,
+    limits: LogIngestLimits,
+    now_ns: i64,
+    batch_rows: usize,
+    path: LoadPath,
+    on_build_start: Option<BuildStartHook>,
+    on_batch_queued: Option<BuildStartHook>,
+    queue_depth: usize,
+) -> (
+    tokio::sync::mpsc::Receiver<Prefetched>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::channel(queue_depth);
+    let handle = tokio::task::spawn_blocking(move || {
+        loop {
+            let (next_state, built) = match path {
+                LoadPath::Row => decode_and_build_stride(
+                    state,
+                    Arc::clone(&mapping),
+                    limits.clone(),
+                    now_ns,
+                    batch_rows,
+                    on_build_start.as_ref(),
+                ),
+                LoadPath::Columnar => decode_and_build_stride_columnar(
+                    state,
+                    Arc::clone(&mapping),
+                    limits.clone(),
+                    now_ns,
+                    batch_rows,
+                    on_build_start.as_ref(),
+                ),
+            };
+            state = next_state;
+            let is_batch = matches!(built, Prefetched::Batch(_));
+            if tx.blocking_send(built).is_err() {
+                // Receiver dropped: the loader returned early (a write failed,
+                // or an earlier terminal outcome was consumed). Stop decoding.
+                break;
+            }
+            if is_batch {
+                if let Some(hook) = &on_batch_queued {
+                    hook();
+                }
+            } else {
+                // A terminal outcome was the last thing to send.
+                break;
+            }
+        }
+    });
+    (rx, handle)
 }
 
 /// Await one popped in-flight write and fold its outcome into the report, or
@@ -3129,6 +3238,7 @@ type = "i64"
             10_000,
             None,
             1,
+            DEFAULT_DECODE_QUEUE_BATCHES,
             NOW_NS,
             &mut sink,
         )
@@ -3298,6 +3408,417 @@ type = "i64"
             err.to_string()
                 .contains("--pipeline-depth must be at least 1"),
             "the error names the lever: {err}"
+        );
+    }
+
+    /// `--decode-queue-batches 0` is rejected with a typed [`LoadError::Setup`]
+    /// before any work, mirroring `pipeline_depth_zero_is_rejected` (issue
+    /// #680). A depth of 0 is a channel that can hold no batch, so the guard
+    /// makes it unreachable rather than letting `mpsc::channel(0)` be hit.
+    #[tokio::test]
+    async fn decode_queue_batches_zero_is_rejected() {
+        use ravel_object_store::memory::MemoryStore;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let m = base_mapping();
+        let err = load_instrumented(
+            store,
+            Path::new("/nonexistent.parquet"),
+            "acme",
+            &m,
+            4,
+            10,
+            None,
+            1,
+            0,
+            NOW_NS,
+            Arc::new(FixedClock(NOW_NS)),
+            LoadPath::Columnar,
+            None,
+            None,
+        )
+        .await
+        .expect_err("decode_queue_batches of 0 is rejected");
+        assert!(
+            matches!(err, LoadError::Setup(_)),
+            "a typed setup error, got: {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("--decode-queue-batches must be at least 1"),
+            "the error names the lever: {err}"
+        );
+    }
+
+    /// A multi-batch Parquet fixture with a dictionary-encoded string column, a
+    /// plain string column, a resource column, and a ts column, so the decode
+    /// stage does real `build_columnar_batch` work (dictionary interning
+    /// included) rather than trivial passthrough.
+    fn multi_batch_dict_fixture() -> (tempfile::TempDir, std::path::PathBuf, Mapping) {
+        use parquet::arrow::ArrowWriter;
+
+        let n = 8usize;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pq = dir.path().join("overlap.parquet");
+        let ts: Vec<i64> = (0..n).map(|k| NOW_NS - (k as i64) * 1_000).collect();
+        let dictvals: Vec<Option<&str>> = (0..n)
+            .map(|k| {
+                if k % 3 == 0 {
+                    None
+                } else {
+                    Some(["a", "b", "c"][k % 3])
+                }
+            })
+            .collect();
+        let dictcol =
+            Arc::new(dictvals.into_iter().collect::<DictionaryArray<Int32Type>>()) as ArrayRef;
+        let plain = Arc::new(StringArray::from(
+            (0..n).map(|k| format!("p{}", k % 4)).collect::<Vec<_>>(),
+        )) as ArrayRef;
+        let svc = Arc::new(StringArray::from_iter_values(
+            (0..n).map(|k| format!("svc{}", k % 2)),
+        )) as ArrayRef;
+        let b = batch(vec![
+            ("ts", Arc::new(Int64Array::from(ts)) as ArrayRef),
+            ("svc", svc),
+            ("dictcol", dictcol),
+            ("plaincol", plain),
+        ]);
+        let file = std::fs::File::create(&pq).expect("create parquet");
+        let mut w = ArrowWriter::try_new(file, b.schema(), None).expect("arrow writer");
+        w.write(&b).expect("write batch");
+        w.close().expect("close writer");
+
+        let mut m = base_mapping();
+        m.resource_attributes = vec![attr("service.name", "svc", ColType::Str)];
+        m.attributes = vec![
+            attr("dictkey", "dictcol", ColType::Str),
+            attr("plainkey", "plaincol", ColType::Str),
+        ];
+        (dir, pq, m)
+    }
+
+    /// Drive the decode stage at a given queue depth and return the BLAKE3 of
+    /// each built columnar batch's RLOG encoding, in build order. The writer is
+    /// pinned to a fixed identity so the encoding depends only on batch content,
+    /// not on the router's random per-run `writer_id`.
+    async fn decode_object_hashes(
+        pq: &Path,
+        mapping: &Mapping,
+        shards: u32,
+        batch_rows: usize,
+        read_cursors: Option<usize>,
+        queue_depth: usize,
+    ) -> Vec<[u8; 32]> {
+        let row_group_lens = row_group_row_counts(pq).expect("row group lens");
+        let cursor_count = resolve_read_cursors(read_cursors, shards, row_group_lens.len());
+        let cursors =
+            open_stride_cursors(pq, &row_group_lens, cursor_count, batch_rows).expect("cursors");
+        let state = StrideCursors {
+            cursors,
+            deal_offset: 0,
+        };
+        let (mut rx, handle) = spawn_decode_pipeline(
+            state,
+            Arc::new(mapping.clone()),
+            LogIngestLimits::default(),
+            NOW_NS,
+            batch_rows,
+            LoadPath::Columnar,
+            None,
+            None,
+            queue_depth,
+        );
+        let mut hashes = Vec::new();
+        while let Some(p) = rx.recv().await {
+            match p {
+                Prefetched::Batch(Built::Columnar(b)) => {
+                    if b.num_rows > 0 {
+                        hashes.push(*blake3::hash(&columnar_object(*b)).as_bytes());
+                    }
+                }
+                Prefetched::Batch(Built::Row(_)) => panic!("columnar path only"),
+                Prefetched::Done => {}
+                Prefetched::BatchFailed { reason } => panic!("batch failed: {reason}"),
+                Prefetched::RowRejected { row, reason } => {
+                    panic!("row {row} rejected: {reason}")
+                }
+            }
+        }
+        handle.await.expect("decoder task joins");
+        hashes
+    }
+
+    /// Byte-identity across decode-queue depths (issue #680): moving scheduling
+    /// (the depth of the decode->encode channel) must not change the bytes of
+    /// any RLOG object. The same fixture decoded at depth 1 (today's near-
+    /// lockstep) and depth 4 must produce the identical ordered sequence of
+    /// per-batch RLOG encodings. The comparison is at the batch encoding rather
+    /// than at the stored object because the production `LogIngestRouter` draws a
+    /// random `writer_id` per construction (crates/ravel-ingest, `SystemRng`),
+    /// so two full loads never share stored bytes regardless of this change; the
+    /// batch content the writer consumes is exactly what scheduling could
+    /// perturb, and it is what this pins.
+    ///
+    /// Prove-the-test: make `spawn_decode_pipeline` reorder or drop a batch (or
+    /// have `build_columnar_batch` depend on queue depth) and the two hash lists
+    /// diverge. Confirmed conceptually by the depth-1-vs-4 equality: the only
+    /// difference between the runs is the channel capacity.
+    #[tokio::test]
+    async fn rlog_objects_are_byte_identical_across_decode_queue_depths() {
+        let (_dir, pq, m) = multi_batch_dict_fixture();
+        // batch_rows = 2 over 8 rows -> four batches.
+        let lockstep = decode_object_hashes(&pq, &m, 4, 2, None, 1).await;
+        let deep = decode_object_hashes(&pq, &m, 4, 2, None, 4).await;
+        assert!(
+            lockstep.len() >= 3,
+            "the fixture splits into several batches: {}",
+            lockstep.len()
+        );
+        assert_eq!(
+            lockstep,
+            deep,
+            "RLOG object bytes must not depend on the decode-queue depth ({} objects)",
+            lockstep.len()
+        );
+    }
+
+    /// Collect every data object (`/l0/`) a store holds, deduped by key, as
+    /// `(key, size)`. Used to compare two loads structurally end to end.
+    async fn list_data_objects(store: &dyn ObjectStoreBackend) -> Vec<(String, u64)> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut page: Option<ravel_object_store::PageToken> = None;
+        loop {
+            let p = store.list("", page).await.expect("list");
+            for o in p.objects {
+                if o.key.contains("/l0/") && seen.insert(o.key.clone()) {
+                    out.push((o.key, o.size));
+                }
+            }
+            match p.next {
+                Some(t) => page = Some(t),
+                None => break,
+            }
+        }
+        out
+    }
+
+    /// End-to-end structural invariance across decode-queue depths (issue #680):
+    /// a real `load_instrumented` at depth 1 and at depth 4, each into its own
+    /// `MemoryStore`, writes the same number of data objects with the same
+    /// multiset of sizes. (Object bytes themselves differ only by the router's
+    /// random `writer_id`; size is invariant to it, so equal sorted sizes plus
+    /// equal counts is the strongest depth-independent store-level check. The
+    /// content-level guarantee is `rlog_objects_are_byte_identical_...` above.)
+    #[tokio::test]
+    async fn load_writes_the_same_objects_across_decode_queue_depths() {
+        use ravel_object_store::memory::MemoryStore;
+
+        let (_dir, pq, m) = multi_batch_dict_fixture();
+
+        let run = |depth: usize| {
+            let pq = pq.clone();
+            let m = m.clone();
+            async move {
+                let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+                load_instrumented(
+                    Arc::clone(&store),
+                    &pq,
+                    "acme",
+                    &m,
+                    4,
+                    2,
+                    None,
+                    2,
+                    depth,
+                    NOW_NS,
+                    Arc::new(FixedClock(NOW_NS)),
+                    LoadPath::Columnar,
+                    None,
+                    None,
+                )
+                .await
+                .expect("load succeeds");
+                let mut objs = list_data_objects(store.as_ref()).await;
+                objs.sort_by_key(|(_, size)| *size);
+                objs.into_iter().map(|(_, size)| size).collect::<Vec<u64>>()
+            }
+        };
+
+        let sizes_1 = run(1).await;
+        let sizes_4 = run(4).await;
+        assert!(!sizes_1.is_empty(), "the load wrote data objects");
+        assert_eq!(
+            sizes_1, sizes_4,
+            "object count and sizes must not depend on the decode-queue depth"
+        );
+    }
+
+    /// A store that holds only the FIRST data-object PUT for a fixed duration,
+    /// snapshotting a shared counter at the moment that PUT completes. Every
+    /// other PUT and every non-PUT call passes straight through.
+    struct FirstPutHoldStore {
+        inner: Arc<dyn ObjectStoreBackend>,
+        hold: Duration,
+        queued: Arc<std::sync::atomic::AtomicUsize>,
+        first_seen: Arc<std::sync::atomic::AtomicBool>,
+        snapshot: Arc<std::sync::Mutex<Option<usize>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for FirstPutHoldStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: bytes::Bytes,
+            opts: ravel_object_store::PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, ravel_object_store::StoreError> {
+            use std::sync::atomic::Ordering;
+            if key.contains("/l0/") && !self.first_seen.swap(true, Ordering::SeqCst) {
+                tokio::time::sleep(self.hold).await;
+                *self.snapshot.lock().expect("snapshot lock") =
+                    Some(self.queued.load(Ordering::SeqCst));
+            }
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: ravel_object_store::GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, ravel_object_store::StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn put_multipart<'a>(
+            &'a self,
+            key: &str,
+        ) -> Result<Box<dyn ravel_object_store::MultipartUpload + 'a>, ravel_object_store::StoreError>
+        {
+            self.inner.put_multipart(key).await
+        }
+
+        async fn head(
+            &self,
+            key: &str,
+        ) -> Result<ravel_object_store::ObjectMeta, ravel_object_store::StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, ravel_object_store::StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, ravel_object_store::StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), ravel_object_store::StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// The decoder runs more than one batch ahead of the encoders, and no
+    /// further than the queue depth (issue #680). With `--pipeline-depth 1` the
+    /// loader consumes exactly one batch, spawns its write, and blocks awaiting
+    /// that write's ack. Holding that first data PUT lets the decoder fill the
+    /// decode->encode channel and block on back-pressure: it will have queued
+    /// exactly `decode_queue_batches + 1` batches (one consumed by the loop plus
+    /// `decode_queue_batches` buffered in the full channel), no matter how many
+    /// batches remain in the file.
+    ///
+    /// Non-vacuity (prove-the-test): forcing lockstep by changing
+    /// `QUEUE_DEPTH` to 1 leaves only 2 batches queued (1 consumed + 1
+    /// buffered), which fails the `> 2` "more than one ahead" assertion; and if
+    /// the channel were unbounded the decoder would race to queue all ~20
+    /// batches, failing the `== QUEUE_DEPTH + 1` bound.
+    #[tokio::test]
+    async fn decoder_runs_ahead_bounded_by_the_queue_depth() {
+        use ravel_object_store::memory::MemoryStore;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        const QUEUE_DEPTH: usize = 3;
+        // Many small batches so the bound (not the file's end) is what stops the
+        // decoder: batch_rows = 2 over 40 rows -> 20 batches.
+        let n_rows = 40usize;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pq = dir.path().join("many.parquet");
+        let b = batch(vec![
+            ("ts", i64_col(vec![NOW_NS; n_rows])),
+            ("svc", str_col(vec!["api"; n_rows])),
+        ]);
+        {
+            use parquet::arrow::ArrowWriter;
+            let file = std::fs::File::create(&pq).expect("create parquet");
+            let mut w = ArrowWriter::try_new(file, b.schema(), None).expect("arrow writer");
+            w.write(&b).expect("write batch");
+            w.close().expect("close writer");
+        }
+        let m = parse_mapping(
+            "ts_column = \"ts\"\nts_unit = \"nanos\"\n\n\
+             [[resource_attribute]]\nkey = \"service.name\"\ncolumn = \"svc\"\ntype = \"str\"\n",
+        )
+        .expect("valid mapping");
+
+        let queued = Arc::new(AtomicUsize::new(0));
+        let snapshot = Arc::new(std::sync::Mutex::new(None));
+        let store = Arc::new(FirstPutHoldStore {
+            inner: Arc::new(MemoryStore::new()),
+            hold: Duration::from_millis(300),
+            queued: Arc::clone(&queued),
+            first_seen: Arc::new(AtomicBool::new(false)),
+            snapshot: Arc::clone(&snapshot),
+        });
+
+        let queued_hook = Arc::clone(&queued);
+        let on_queued: BuildStartHook = Arc::new(move || {
+            queued_hook.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let report = load_instrumented(
+            store as Arc<dyn ObjectStoreBackend>,
+            &pq,
+            "acme",
+            &m,
+            1,
+            2,
+            None,
+            1,
+            QUEUE_DEPTH,
+            NOW_NS,
+            Arc::new(FixedClock(NOW_NS)),
+            LoadPath::Columnar,
+            None,
+            Some(on_queued),
+        )
+        .await
+        .expect("the pipelined load succeeds");
+        assert_eq!(report.rows_processed, n_rows as u64, "every row is written");
+
+        let ahead = snapshot
+            .lock()
+            .expect("snapshot lock")
+            .expect("the first data PUT was held and snapshotted");
+        assert!(
+            ahead > 2,
+            "the decoder ran more than one batch ahead while the encoder was blocked \
+             (a lockstep depth-1 loop leaves it at 2): queued = {ahead}"
+        );
+        assert_eq!(
+            ahead,
+            QUEUE_DEPTH + 1,
+            "and no further: 1 consumed by the loop plus {QUEUE_DEPTH} buffered in the full channel"
         );
     }
 
@@ -3574,10 +4095,12 @@ type = "i64"
             2,
             None,
             1,
+            DEFAULT_DECODE_QUEUE_BATCHES,
             NOW_NS,
             Arc::new(FixedClock(NOW_NS)),
             LoadPath::Columnar,
             Some(hook),
+            None,
         )
         .await
         .expect("the pipelined load succeeds");
@@ -3955,6 +4478,7 @@ type = "i64"
             batch_rows,
             Some(1),
             1,
+            DEFAULT_DECODE_QUEUE_BATCHES,
             NOW_NS,
             &mut sink,
         )
@@ -3981,6 +4505,7 @@ type = "i64"
             batch_rows,
             Some(4),
             1,
+            DEFAULT_DECODE_QUEUE_BATCHES,
             NOW_NS,
             &mut sink,
         )
@@ -4021,6 +4546,7 @@ type = "i64"
             batch_rows,
             Some(1),
             1,
+            DEFAULT_DECODE_QUEUE_BATCHES,
             NOW_NS,
             &mut sink,
         )
@@ -4392,9 +4918,11 @@ type = "i64"
             batch_rows,
             read_cursors,
             1,
+            DEFAULT_DECODE_QUEUE_BATCHES,
             now_ns,
             clock,
             LoadPath::Row,
+            None,
             None,
         )
         .await
