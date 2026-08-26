@@ -1762,9 +1762,20 @@ and `LogsRowFetchExec` publishes `row_refs`, `blocks_fetched`, and
 instead of inferring it. With a read cache wired and an object below the
 block-range threshold they land on the cache key phase 1 already admitted and
 cost no request at all; with `--disable-cache` they are one GET each.
-`crates/ravel-sql/tests/logs_topk_late_materialization.rs` pins both, along
-with the decode split: on its 16-block fixture phase 1 decodes 3 pages per
-block against the single-phase plan's 39, over the same 16 blocks.
+
+Requests and bytes do not say the same thing here. The fetch entry point phase
+2 uses restricts the *decode* to the named block, not the byte fetch, which is
+the query's ordinary fetch for that object: a whole-object GET at or below the
+block-range threshold, and above it the version-4 coalesced ranges over the
+fetch-side candidate set -- every block, for a query whose only predicate is a
+residual the skip index cannot decide. So phase 2 moves up to `k` objects'
+bytes, not `k` blocks'. Narrowing that is a ravel-query follow-up (ADR-0774
+consequences).
+
+`crates/ravel-sql/tests/logs_topk_late_materialization.rs` pins all of it: on
+its 16-block, 41-column fixture phase 1 decodes 3 pages per block against the
+single-phase plan's 39 over the same 16 blocks, and un-cached, a `k = 10`
+statement moves 103,606 bytes in 14 GETs against a single pass's 29,645 in 4.
 
 Both gaps ADR-0033 recorded are now closed. Both were deliberate, not
 oversights.

@@ -636,7 +636,8 @@ async fn phase_two_reads_only_the_segments_holding_the_winners() {
 /// The same statements with no read cache, where phase 2's re-reads ARE real
 /// object-store requests: exactly one per block fetched, on top of phase 1's
 /// one per segment. This is the cost side of the trade the ADR states, pinned
-/// as a figure rather than described.
+/// as a figure rather than described -- in requests AND in bytes, because the
+/// two do not say the same thing here (see the byte assertions below).
 #[tokio::test]
 async fn without_a_cache_phase_two_costs_exactly_one_get_per_fetched_block() {
     let one = run(&wide_statement(1), Setup::new().uncached()).await;
@@ -664,6 +665,26 @@ async fn without_a_cache_phase_two_costs_exactly_one_get_per_fetched_block() {
         all.gets - baseline.gets,
         all.blocks_fetched as u64,
         "the whole extra request cost is one GET per block phase 2 fetched"
+    );
+
+    // Bytes, not just requests. Phase 2 restricts the DECODE to one block, but
+    // its byte fetch is the query's normal fetch for that object: these fixture
+    // objects are below the block-range threshold, so each block read is a
+    // whole-object GET, exactly as the baseline's segment reads are. So the
+    // cost is one object's bytes per winner, not one block's. 29,645 is the
+    // four objects a single pass moves (the baseline); 103,606 is that plus
+    // 73,961 for the ten whole-object block reads, and 36,818 is that plus
+    // 7,173 for one. See ADR-0774's consequences: narrowing that fetch to the
+    // named block indices is a ravel-query follow-up, and it is what would make
+    // the byte cost per-block rather than per-object.
+    assert_eq!(baseline.bytes, 29_645, "the four objects, once");
+    assert_eq!(
+        one.bytes, 36_818,
+        "one winner adds one whole-object block read"
+    );
+    assert_eq!(
+        all.bytes, 103_606,
+        "ten winners add ten whole-object block reads"
     );
     // And the rows are still identical, so the extra reads bought nothing but
     // the decode saving.
