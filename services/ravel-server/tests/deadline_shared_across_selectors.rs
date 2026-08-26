@@ -3,16 +3,40 @@
 //! deadline to the whole request, not grant the full deadline afresh to each
 //! `match[]` selector.
 //!
-//! The store is wrapped so every listing costs a fixed delay, and with a short
-//! client `timeout` the request as a whole is bounded by that
-//! single budget: it fails with a `504 timeout` well before N per-selector
-//! budgets would elapse.
+//! The store is wrapped so every listing costs a fixed delay. A `/series`
+//! request carrying N selectors resolves them one at a time, each drawing down
+//! the same request budget (`resolve_matched_series` in ravel-query computes
+//! one absolute `request_deadline` and hands each selector only the time still
+//! left). With N selectors' worth of listing far exceeding a short client
+//! `timeout`, the request trips the shared deadline and returns `504 timeout`
+//! after only a prefix of the selectors have resolved.
+//!
+//! Determinism (#706, #680, #731): the earlier version asserted `elapsed <
+//! 900 ms` (3x the 300 ms budget) to back the "one deadline, not N" claim.
+//! That is a wall-clock race against the scheduler: under host load the
+//! deadline still fires but the cancelled futures are not polled promptly, so
+//! the measured wall time overran 900 ms and the test failed (observed at
+//! 964 ms, twice, in the flight-sql lane). The change under gate cannot reach
+//! that assertion; it is a pure timing flake.
+//!
+//! The fix keeps the load-robust `504` discriminator and replaces the wall
+//! bound with a count. `Catalog::resolve` issues exactly one
+//! `t/<th>/<sig>/del/` LIST per snapshot resolution (ADR-0064 decision 2), so
+//! counting those LISTs counts the selectors that ran a full resolution. Under
+//! one shared budget the deadline cuts the request off after only a prefix of
+//! the N selectors resolve, so that count is strictly below N; a per-selector
+//! budget would resolve all N. Host load only makes fewer selectors fit the
+//! budget, never more, so `resolutions < N` is an upper bound that holds
+//! regardless of how loaded the box is -- the deterministic replacement for
+//! the old timing assertion. Mirrors the "observe the shared bound, don't race
+//! it" fix #717 applied to the query-engine deadline tests.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -28,12 +52,19 @@ const TOKEN: &str = "testtoken";
 
 /// Wraps an inner store and sleeps a fixed amount before every listing, so
 /// each snapshot resolution (one per `match[]` selector) costs measurable
-/// wall-clock time. Reads/writes are delegated unchanged; only `list` is
-/// slowed, which is the operation the catalog snapshot resolver drives per
-/// selector (crates/ravel-catalog `resolve` -> `list_hour_bucket`).
+/// wall-clock time and N of them dwarf a short request budget. Reads/writes
+/// are delegated unchanged; only `list` is slowed, which is the operation the
+/// catalog snapshot resolver drives per selector (crates/ravel-catalog
+/// `resolve` -> `list_hour_bucket`).
+///
+/// `resolutions` counts the `del/` LISTs. `Catalog::resolve` issues exactly one
+/// `t/<th>/<sig>/del/` LIST per snapshot resolution (ADR-0064 decision 2), so
+/// this counter is the number of selectors that ran a full resolution before
+/// the request ended -- the deterministic signal the test asserts on.
 struct SlowListStore {
     inner: Arc<MemoryStore>,
     list_delay: Duration,
+    resolutions: Arc<AtomicUsize>,
 }
 
 #[async_trait]
@@ -56,6 +87,12 @@ impl ObjectStoreBackend for SlowListStore {
     }
 
     async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
+        // One `del/` LIST marks one completed snapshot resolution (ADR-0064
+        // decision 2). Count before the delay so a resolution that reaches the
+        // del LIST is counted even if the deadline fires during the sleep.
+        if prefix.contains("/del/") {
+            self.resolutions.fetch_add(1, Ordering::SeqCst);
+        }
         tokio::time::sleep(self.list_delay).await;
         self.inner.list(prefix, page).await
     }
@@ -138,36 +175,40 @@ async fn start_test_server(store: Arc<dyn ObjectStoreBackend>) -> Running {
     .expect("server starts")
 }
 
-/// A `/series` request carrying many `match[]` selectors
-/// shares one wall deadline. Each selector drives one snapshot resolution,
-/// which lists a handful of catalog buckets; slowing each list by
-/// `LIST_DELAY` makes one selector cost roughly `PER_SELECTOR`. The client
-/// sets a `timeout` a few selectors' worth long, far below the N-selector
-/// total. If the deadline were granted per selector (the defect), every
-/// selector would resolve within its own fresh budget and the request would
-/// return 200 after roughly `N * PER_SELECTOR`. With one shared budget the
-/// request instead trips the deadline and returns `504 timeout` after
-/// roughly a single `timeout`, never the N-fold total.
+/// A `/series` request carrying N `match[]` selectors shares one wall deadline.
+/// Each selector drives one snapshot resolution, which lists a handful of
+/// catalog buckets; slowing each list by `LIST_DELAY` makes N selectors' worth
+/// of listing far exceed the short client `timeout`. The request trips the
+/// shared deadline and returns `504 timeout`.
 ///
-/// The status assertion (200 vs 504) is the timing-independent
-/// discriminator; the elapsed bound backs the "one deadline, not N" claim.
+/// Two assertions carry the claim, neither of them a wall-clock measurement:
 ///
-// TODO(#731): the `elapsed < 900 ms` bound below is a wall-clock race against
-// the scheduler (#706 class) and flakes under host load; replace it with a
-// deterministic observation that the deadline is shared.
+/// * `504` is the timing-independent discriminator. N selectors need
+///   `>= ~N * PER_SELECTOR` of real listing, far above the budget, so the
+///   deadline fires regardless of host speed. A per-selector budget would let
+///   every selector resolve inside its own fresh budget and return `200`.
+/// * `resolutions < N` shows the budget is *shared*: the deadline cut the
+///   request off after only a prefix of the N selectors ran a full resolution
+///   (one `del/` LIST each, ADR-0064 decision 2). A per-selector budget would
+///   resolve all N (`resolutions == N`). Load only lowers this count, so the
+///   `< N` bound never flakes upward -- it replaces the old `elapsed < 3x`
+///   bound that did.
 #[tokio::test]
 async fn metadata_request_shares_one_wall_deadline_across_selectors() {
     const N: usize = 12;
-    // One selector lists ~4 catalog buckets; at 25 ms each that is ~100 ms of
-    // work, comfortably below REQUEST_TIMEOUT so a single selector never
-    // trips on its own, while N of them (>= ~1.2 s) dwarf the shared budget.
+    // One selector lists a handful of catalog buckets plus its `del/` LIST; at
+    // 25 ms each that is tens of ms of work, well below REQUEST_TIMEOUT so a
+    // single selector never trips on its own, while N of them dwarf the shared
+    // budget.
     const LIST_DELAY: Duration = Duration::from_millis(25);
     // Shared budget: a few selectors' worth, well under the N-selector total.
     const REQUEST_TIMEOUT: Duration = Duration::from_millis(300);
 
+    let resolutions = Arc::new(AtomicUsize::new(0));
     let store = Arc::new(SlowListStore {
         inner: Arc::new(MemoryStore::new()),
         list_delay: LIST_DELAY,
+        resolutions: Arc::clone(&resolutions),
     });
     let store_dyn: Arc<dyn ObjectStoreBackend> = store;
     let running = start_test_server(store_dyn).await;
@@ -183,7 +224,6 @@ async fn metadata_request_shares_one_wall_deadline_across_selectors() {
         format!("{}", REQUEST_TIMEOUT.as_secs_f64()),
     ));
 
-    let started = Instant::now();
     let response = client
         .get(format!("{base}/api/v1/series"))
         .header("authorization", format!("Bearer {TOKEN}"))
@@ -192,27 +232,37 @@ async fn metadata_request_shares_one_wall_deadline_across_selectors() {
         .await
         .expect("series request completes");
     let status = response.status();
-    let elapsed = started.elapsed();
+    let body = response.text().await.expect("series response body");
 
     // The whole request is bounded by one wall deadline: it deadline-fails
     // (504 timeout) rather than succeeding after N independent budgets.
     assert_eq!(
         status, 504,
         "request should trip the shared wall deadline (504), not grant each \
-         selector its own budget; got {status}"
+         selector its own budget; got {status} with body {body}"
+    );
+    // ...and it is the typed deadline error, not some other 504. The envelope
+    // tags the class `timeout` and the message names the deadline.
+    assert!(
+        body.contains("\"errorType\":\"timeout\""),
+        "expected the typed timeout error envelope, got {body}"
+    );
+    assert!(
+        body.contains("deadline"),
+        "expected the deadline error message, got {body}"
     );
 
-    // And it does so within roughly one budget, not N. The tripping selector
-    // returns as soon as the shared budget is spent, so a fixed request lands
-    // near REQUEST_TIMEOUT plus one selector's cost; a per-selector grant
-    // would instead run all N (>= ~1.2 s). Bound at 3x the budget: independent
-    // of the exact per-selector list count, well above one deadline and well
-    // below the N-fold total.
-    let bound = REQUEST_TIMEOUT * 3;
+    // One shared budget, not N: the deadline cut the request off after only a
+    // prefix of the N selectors ran a full snapshot resolution. A per-selector
+    // budget would have resolved all N (resolutions == N). Host load can only
+    // lower this count (fewer selectors fit the budget), so the bound holds
+    // regardless of how loaded the box is.
+    let resolved = resolutions.load(Ordering::SeqCst);
     assert!(
-        elapsed < bound,
-        "request took {elapsed:?}, at or above {bound:?} (3x the shared \
-         budget); the deadline is not shared across the {N} selectors"
+        resolved < N,
+        "the {N} selectors must share one wall budget: only a prefix of them \
+         should resolve before the shared deadline fires, but {resolved} of \
+         {N} resolved (a per-selector budget would resolve all {N})"
     );
 
     running.shutdown().await.expect("graceful shutdown");
