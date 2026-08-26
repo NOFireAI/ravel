@@ -51,6 +51,14 @@ pub struct RlogConfig {
     /// Terms per POSTINGS term block (docs/adrs/0049-rlog-postings.md
     /// decision 2). Must be nonzero.
     pub postings_stride: u32,
+    /// Blocks per row group (docs/adrs/0699-rlog-row-groups-and-page-directory.md
+    /// decision 4). A row group is this many consecutive blocks whose pages
+    /// BLOCKS stores column-major, so a projection of `k` columns over a
+    /// group is `k` contiguous ranges instead of one range per block. The
+    /// block itself is unchanged: `block_target_records`, `block_max_bytes`,
+    /// and every block-keyed prune keep their granularity. Must be nonzero;
+    /// an object with fewer blocks than this has one short row group.
+    pub group_target_blocks: usize,
 }
 
 impl Default for RlogConfig {
@@ -64,6 +72,7 @@ impl Default for RlogConfig {
             max_uncomp_section: 1 << 30,
             postings_max_distinct: 10_000,
             postings_stride: DEFAULT_STRIDE,
+            group_target_blocks: 32,
         }
     }
 }
