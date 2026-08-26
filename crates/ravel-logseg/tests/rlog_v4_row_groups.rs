@@ -10,7 +10,7 @@
 
 use proptest::prelude::*;
 use ravel_logseg::footer::{
-    self, COMP_ZSTD, LogFooter, SectionDesc, kind, open, write_footer_and_trailer,
+    self, COMP_ZSTD, LogFooter, SectionDesc, kind, open, write_footer_and_trailer_versioned,
 };
 use ravel_logseg::page_dir::PageDir;
 use ravel_logseg::{
@@ -142,7 +142,15 @@ fn explode(object: &[u8]) -> (LogFooter, Vec<Section>) {
 /// Reassembles an object from sections, recomputing every offset, length, and
 /// section crc, so a rewritten section yields a structurally valid object whose
 /// only defect is the one the test introduced.
-fn assemble(mut footer: LogFooter, sections: &[Section]) -> Vec<u8> {
+fn assemble(footer: LogFooter, sections: &[Section]) -> Vec<u8> {
+    assemble_versioned(footer, sections, footer::VERSION)
+}
+
+/// [`assemble`] with the trailer version named, so a version-3 object stays
+/// version 3 through a rewrite. The footer crc covers the version byte, so
+/// patching it afterwards would fail the crc instead of whatever the test meant
+/// to exercise.
+fn assemble_versioned(mut footer: LogFooter, sections: &[Section], version: u16) -> Vec<u8> {
     let mut object = Vec::new();
     let mut descs = Vec::with_capacity(sections.len());
     for s in sections {
@@ -158,7 +166,7 @@ fn assemble(mut footer: LogFooter, sections: &[Section]) -> Vec<u8> {
         });
     }
     footer.sections = descs;
-    write_footer_and_trailer(&mut object, &footer);
+    write_footer_and_trailer_versioned(&mut object, &footer, version);
     object
 }
 
@@ -200,6 +208,22 @@ fn flip(object: &[u8], at: usize) -> Vec<u8> {
 
 fn is_corrupted(r: Result<impl Sized, LogSegError>) -> bool {
     matches!(r, Err(LogSegError::Corrupted(_)))
+}
+
+/// Asserts the error is `Corrupted` and that its message names `needle`.
+///
+/// Used where a weaker "some error happened" would pass on a different check
+/// entirely: a version-4 object with its PAGE_DIR removed is *also* rejected
+/// downstream, because its BLOCKS bytes fail the block crc when read as
+/// version-3 blocks. Only the message proves the version/section agreement
+/// check is what refused it.
+fn corrupted_saying(r: Result<impl Sized, LogSegError>, needle: &str) {
+    match r {
+        Err(LogSegError::Corrupted(m)) if m.contains(needle) => {}
+        Err(LogSegError::Corrupted(m)) => panic!("Corrupted but not about {needle}: {m}"),
+        Err(other) => panic!("expected Corrupted about {needle}, got {other:?}"),
+        Ok(_) => panic!("expected Corrupted about {needle}, got Ok"),
+    }
 }
 
 /// Opens and drains an object, returning whatever error either step produced.
@@ -726,6 +750,38 @@ fn version_gate_accepts_3_and_4_and_refuses_5() {
             .is_none(),
         "version 3 carries no PAGE_DIR"
     );
+
+    // The version byte and PAGE_DIR's presence must agree: a version-4 object
+    // whose PAGE_DIR was dropped, and a version-3 object that gained one, are
+    // both refused rather than read under a guessed layout.
+    let (footer, sections) = explode(&v4);
+    let without: Vec<Section> = sections
+        .into_iter()
+        .filter(|s| s.kind != kind::PAGE_DIR)
+        .collect();
+    corrupted_saying(
+        open_and_drain(&assemble(footer, &without)),
+        "disagrees with the PAGE_DIR section",
+    );
+
+    let (v3_footer, mut v3_sections) = explode(&v3);
+    let dir_stored = {
+        let (_, v4_sections) = explode(&v4);
+        v4_sections
+            .into_iter()
+            .find(|s| s.kind == kind::PAGE_DIR)
+            .expect("PAGE_DIR in v4")
+    };
+    v3_sections.push(dir_stored);
+    let v3_plus = assemble_versioned(v3_footer, &v3_sections, 3);
+    corrupted_saying(
+        open_and_drain(&v3_plus),
+        "disagrees with the PAGE_DIR section",
+    );
+    // The same rewrite without the added section still reads at version 3, so
+    // the refusal above is about PAGE_DIR and not about the rewrite.
+    let (v3_footer, v3_sections) = explode(&v3);
+    assert!(open_and_drain(&assemble_versioned(v3_footer, &v3_sections, 3)).is_ok());
 
     let mut future = v4.clone();
     future[n4 - 8..n4 - 6].copy_from_slice(&5u16.to_le_bytes());

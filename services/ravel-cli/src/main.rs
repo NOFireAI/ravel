@@ -1677,6 +1677,7 @@ fn rlog_section_kind_name(kind: u32) -> &'static str {
         kind::SKIP_IDX => "SKIP_IDX",
         kind::BLOOM => "BLOOM",
         kind::POSTINGS => "POSTINGS",
+        kind::PAGE_DIR => "PAGE_DIR",
         _ => "UNKNOWN",
     }
 }

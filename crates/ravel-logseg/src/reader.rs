@@ -16,7 +16,7 @@ use crate::columnar::ColumnarBlockView;
 use crate::columns::ColumnSelection;
 use crate::error::LogSegError;
 use crate::field_dir::FieldDir;
-use crate::footer::{COMP_ZSTD, LogFooter, SectionDesc, kind, open};
+use crate::footer::{self, COMP_ZSTD, LogFooter, SectionDesc, kind, open};
 use crate::page::{DEFAULT_MAX_UNCOMP, read_page};
 use crate::page_dir::{PageDir, PageLoc};
 use crate::postings::{POSTINGS_VERSION_V1, PostingsSection, term_key};
@@ -107,6 +107,18 @@ impl<'a> RlogReader<'a> {
         // Like SKIP_IDX and unlike BLOOM, it is not optional and a corrupt one
         // never degrades: without it no version-4 page can be located at all
         // (ADR-0699 decision 2).
+        // The trailer version is what says which BLOCKS layout this is, and
+        // PAGE_DIR's presence must agree with it (ADR-0699 decision 3). A
+        // version-4 object without the section, or a version-3 object with one,
+        // is refused rather than read under a guessed layout: guessing would
+        // decode another block's bytes as this one's.
+        let version = footer::trailer_version(bytes)?;
+        let expects_page_dir = version >= 4;
+        if expects_page_dir != footer.section(kind::PAGE_DIR).is_some() {
+            return Err(LogSegError::Corrupted(format!(
+                "trailer version {version} disagrees with the PAGE_DIR section's presence"
+            )));
+        }
         let page_dir = match footer.section(kind::PAGE_DIR) {
             Some(desc) => {
                 let raw = read_section(bytes, desc, cfg)?;
@@ -989,17 +1001,18 @@ pub(crate) fn decode_v4_block(
         None => true,
         Some(set) => set.contains(&cid),
     };
-    let mut located: Vec<(crate::page::PageDesc, Option<Vec<u8>>)> =
-        Vec::with_capacity(pages.len());
+    let mut descs: Vec<crate::page::PageDesc> = Vec::with_capacity(pages.len());
+    let mut page_bytes: Vec<Option<Vec<u8>>> = Vec::with_capacity(pages.len());
     let mut counters = PageCounters::default();
     let mut block_crc = 0u32;
     let mut all_read = true;
     for p in pages {
         counters.bytes_fetched = counters.bytes_fetched.saturating_add(p.desc.len);
+        descs.push(p.desc);
         if !wanted(p.desc.column_id) {
             counters.skipped += 1;
             all_read = false;
-            located.push((p.desc, None));
+            page_bytes.push(None);
             continue;
         }
         let rel = p
@@ -1023,17 +1036,14 @@ pub(crate) fn decode_v4_block(
             )));
         }
         block_crc = crc32c::crc32c_append(block_crc, stored);
-        located.push((
-            p.desc,
-            Some(read_page(stored, &p.desc, DEFAULT_MAX_UNCOMP)?),
-        ));
+        page_bytes.push(Some(read_page(stored, &p.desc, DEFAULT_MAX_UNCOMP)?));
         counters.decoded += 1;
         counters.bytes_decoded = counters.bytes_decoded.saturating_add(p.desc.len);
     }
     if all_read && block_crc != block_crc32c {
         return Err(LogSegError::Corrupted("block crc mismatch".into()));
     }
-    read_block_pages(record_count, &located, plans, counters)
+    read_block_pages(record_count, &descs, &page_bytes, plans, counters)
 }
 
 // --- exact evaluation -------------------------------------------------------

@@ -142,10 +142,14 @@ impl PageDir {
     /// directory or a page offset overflows.
     pub fn block_pages(&self, block: u32) -> Option<Vec<PageLoc>> {
         let (group, within) = self.locate_block(block)?;
+        // The per-page offset is derived by running the chunk's offset forward,
+        // inline rather than through `page_offsets`: this is on the scan's
+        // per-block path and a wide object has one chunk per column, so a
+        // per-chunk allocation here would scale with the column count.
         let mut out = Vec::new();
         for chunk in &group.chunks {
-            let offsets = chunk.page_offsets()?;
-            for (p, at) in chunk.pages.iter().zip(offsets) {
+            let mut at = chunk.offset;
+            for p in &chunk.pages {
                 if p.block == within {
                     out.push(PageLoc {
                         desc: p.desc(chunk.column_id),
@@ -153,6 +157,7 @@ impl PageDir {
                         offset: at,
                     });
                 }
+                at = at.checked_add(p.len)?;
             }
         }
         Some(out)

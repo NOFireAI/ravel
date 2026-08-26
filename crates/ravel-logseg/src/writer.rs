@@ -2090,7 +2090,7 @@ impl Layout {
 /// which is a superset range containing every one of its pages, not the exact
 /// extent it was under version 3. Nothing locates a version-4 page through it;
 /// PAGE_DIR does that.
-struct BlocksBuilder {
+pub struct BlocksBuilder {
     layout: Layout,
     /// The BLOCKS section bytes built so far. Offsets recorded in PAGE_DIR and
     /// in SKIP_IDX are relative to its start.
@@ -2103,6 +2103,20 @@ struct BlocksBuilder {
 }
 
 impl BlocksBuilder {
+    /// A version-4 layout builder at the given row group size, for a caller
+    /// assembling BLOCKS out of blocks it encoded itself.
+    ///
+    /// The writer uses this internally. It is public because a hand-built
+    /// version-4 object (a test fixture, a tool) has to produce BLOCKS bytes,
+    /// SKIP_IDX level-0 entries, and a PAGE_DIR that agree with each other, and
+    /// re-deriving the placement rule outside this module is exactly how the
+    /// three drift apart.
+    pub fn version_4(group_target_blocks: usize) -> Self {
+        BlocksBuilder::new(Layout::V4 {
+            group_target_blocks,
+        })
+    }
+
     fn new(layout: Layout) -> Self {
         BlocksBuilder {
             layout,
@@ -2115,7 +2129,7 @@ impl BlocksBuilder {
 
     /// Adds one encoded block. Under version 4 the block is buffered and placed
     /// when its row group fills; under version 3 it is written immediately.
-    fn push(&mut self, out: BlockWriteOut) {
+    pub fn push(&mut self, out: BlockWriteOut) {
         match self.layout {
             Layout::V3 => {
                 let (block, crc) = out.v3_bytes();
@@ -2237,7 +2251,7 @@ impl BlocksBuilder {
 
     /// The finished BLOCKS bytes, the level-0 entries, and the PAGE_DIR (empty
     /// under version 3, where no such section is written).
-    fn finish(mut self) -> (Vec<u8>, Vec<Level0Entry>, PageDir) {
+    pub fn finish(mut self) -> (Vec<u8>, Vec<Level0Entry>, PageDir) {
         self.flush_group();
         (self.bytes, self.l0, self.dir)
     }

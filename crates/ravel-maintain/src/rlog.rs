@@ -441,9 +441,11 @@ pub(crate) async fn merge_catalogs(
     }
 
     // No whole-object fetch: the per-input ranged readers are already in the
-    // catalogs. Each stream's blocks are fetched by range one block at a
-    // time in the k-way merge below, so raw resident bytes stay bounded to
-    // one block per input, never a whole stream or the whole bucket.
+    // catalogs. Each stream's blocks are fetched by range in the k-way merge
+    // below one decode unit at a time -- a block under version 3, a row group
+    // under version 4 (ADR-0699 decision 1, a block's pages are spread across
+    // its group's column chunks) -- so raw resident bytes stay bounded to one
+    // such unit per input, never a whole stream or the whole bucket.
     let identity = compactor_identity(bucket, config);
     let tracker = config.merge_memory_tracker.as_ref();
     let mut sink = PartSink {
@@ -1631,6 +1633,14 @@ mod tests {
     fn l0_blocked_cfg() -> RlogConfig {
         RlogConfig {
             block_target_records: 1000,
+            // A small row group (production default 32). Under RLOG version 4
+            // the merge's fetch and decode unit is a row group, not a block
+            // (ADR-0699 decision 1: a block's pages are spread across its
+            // group's column chunks, so no smaller contiguous range holds all
+            // of one block), so a test that grows a stream past the group cap
+            // has to use a group small enough for the caps to bind at test
+            // scale.
+            group_target_blocks: 2,
             ..RlogConfig::default()
         }
     }
@@ -2716,15 +2726,24 @@ mod tests {
     // --- bounded-memory k-way merge ------------------------------
 
     /// Acceptance test (ADR-0065 decision 4): the RLOG
-    /// compaction merge's peak resident decode memory is bounded by block size
-    /// times input count, independent of how large one hot stream grows.
+    /// compaction merge's peak resident decode memory is bounded by row group
+    /// size times input count, independent of how large one hot stream grows.
+    ///
+    /// The unit was one block until RLOG version 4 made it one row group
+    /// (ADR-0699 decision 1). A version-4 block's pages are spread across its
+    /// row group's column chunks, so the smallest contiguous range holding all
+    /// of one block is the group; the merge reads every column, so it fetches
+    /// and decodes the group. That is the read-side mirror of the writer's
+    /// stated one-row-group working set, and `group_target_blocks` bounds both.
+    /// What the bound still forbids is what it always forbade: residency that
+    /// grows with the stream.
     ///
     /// A single hot stream (the common log shape: one busy service carrying
     /// most of a sealed hour) is grown 10x across two runs. The
     /// [`MergeMemoryTracker`]'s recorded *transient* high-water -- the merge's
-    /// own decode-side buffers, at most one fetched raw block plus one decoded
-    /// block per input -- must stay under a fixed bound and must NOT grow with
-    /// the stream. The defect was that the old merge decoded a whole stream's
+    /// own decode-side buffers, at most one fetched raw row group plus one
+    /// decoded row group per input -- must stay under a fixed bound and must
+    /// NOT grow with the stream. The defect was that the old merge decoded a whole stream's
     /// records from every input into one `Vec`, plus a second copy in the part
     /// accumulator, so peak scaled with stream size; a regression to that shape
     /// would push the `decoded` term to `O(stream)` and break the bound below.
@@ -2737,15 +2756,20 @@ mod tests {
         // l0_blocked_cfg's block target: each input is re-blocked at 1000
         // records, so a grown stream spans many blocks per input.
         const L0_BLOCK: u64 = 1000;
+        // l0_blocked_cfg's row group size: the merge's fetch and decode unit
+        // under version 4. Both scales below span more than this many blocks
+        // per input, so the bound genuinely binds rather than happening to
+        // cover the whole stream.
+        const L0_GROUP_BLOCKS: u64 = 2;
         // A generous per-record upper bound. `estimate_record` charges the
         // record's Rust-side heap since issue #711, so these tiny records
         // estimate at ~270 bytes rather than the ~53 payload bytes this bound
         // was first sized against; it stays intentionally loose so it tracks
-        // block size and input count, not the exact estimate.
+        // row group size and input count, not the exact estimate.
         const PER_RECORD_BOUND: u64 = 1024;
-        // At most one decoded block plus two raw blocks (the one being decoded
-        // and the one prefetched behind it) resident per input.
-        const TRANSIENT_BOUND: u64 = INPUTS as u64 * 2 * L0_BLOCK * PER_RECORD_BOUND;
+        // At most one raw row group plus one decoded row group per input.
+        const TRANSIENT_BOUND: u64 =
+            INPUTS as u64 * 2 * L0_GROUP_BLOCKS * L0_BLOCK * PER_RECORD_BOUND;
         // Rough estimated bytes-per-record for the "stream size" the peak is
         // compared against (reporting and the not-scaling assertion only).
         const PER_RECORD_APPROX: i64 = 270;
@@ -2813,7 +2837,7 @@ mod tests {
             assert!(
                 transient < TRANSIENT_BOUND,
                 "transient peak {transient} exceeded the fixed bound {TRANSIENT_BOUND} \
-                 (block size x input count)"
+                 (row group size x input count)"
             );
             // The only stream-dependent residency is the writer's in-progress
             // part, bounded by the part cap (content-addressing needs the whole
@@ -2825,8 +2849,8 @@ mod tests {
             peaks.push(transient);
         }
 
-        // The stream grew 10x; the decode-side peak did not (the same handful
-        // of blocks stay resident regardless of stream size).
+        // The stream grew 10x; the decode-side peak did not (the same one row
+        // group per input stays resident regardless of stream size).
         let (base, ten_x) = (peaks[0], peaks[1]);
         assert!(
             ten_x <= base * 2,

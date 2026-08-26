@@ -115,13 +115,31 @@ fn record_with_attrs(name: &str, ts: i64, body: &str) -> LogRecord {
     }
 }
 
-/// Build one RLOG object's bytes from `records` (one block each).
+/// Build one RLOG version-3 object's bytes from `records` (one block each).
+///
+/// The block-range protocol under test is the version-3 one: it addresses each
+/// block by its SKIP_IDX byte range and verifies `block_crc32c` over exactly
+/// those bytes. RLOG version 4 (ADR-0699) makes neither true -- a block's pages
+/// are spread column-major across its row group -- so `BlockRangeFetcher` reads
+/// a version-4 object whole until ADR-0699 decision 5's PAGE_DIR-driven fetcher
+/// replaces this protocol. These fixtures therefore stay at version 3, which is
+/// what keeps the protocol covered; `version_4_object_is_read_whole` below pins
+/// the version-4 behaviour.
 fn build_object(records: &[LogRecord]) -> Vec<u8> {
     let mut w = RlogWriter::new(one_record_blocks(), identity());
     for r in records {
         w.push(r.clone()).expect("push");
     }
-    w.finish().expect("finish")
+    w.finish_v3_for_tests().expect("finish v3")
+}
+
+/// The same fixture at the current written version.
+fn build_object_v4(records: &[LogRecord]) -> Vec<u8> {
+    let mut w = RlogWriter::new(one_record_blocks(), identity());
+    for r in records {
+        w.push(r.clone()).expect("push");
+    }
+    w.finish().expect("finish v4")
 }
 
 /// A `SegmentRef` for an object of `size` bytes spanning `records`' ts range.
@@ -1290,4 +1308,74 @@ async fn page_decode_accounting_is_a_separate_axis_from_wire_bytes() {
         proj_snap.s3_requests(AccountedOp::Get),
         "the T1 GET count is unmoved by the decode-time pair"
     );
+}
+
+// ---- Test 9: RLOG version 4 ----------------------------------------------
+
+/// A version-4 object is read whole, and its rows are the whole-object path's.
+///
+/// ADR-0699 stores a row group's pages column-major, so a block is no longer a
+/// contiguous byte range and its SKIP_IDX `block_offset`/`block_len` describe an
+/// overlapping page span, with `block_crc32c` defined over the block's pages in
+/// `column_id` order rather than over that span. The block-range protocol
+/// assumes neither, so it falls back rather than fetching ranges it cannot
+/// verify. This pins the fallback rather than leaving it to be discovered as a
+/// crc failure, and it is the test ADR-0699 decision 5's PAGE_DIR-driven
+/// fetcher replaces: when that lands, a version-4 object stops being read whole
+/// and this test becomes an assertion about column chunks.
+#[tokio::test]
+async fn version_4_object_is_read_whole_until_the_page_dir_fetcher_lands() {
+    let records: Vec<LogRecord> = (0..20)
+        .map(|ts| record("api", ts, if ts == 8 { "connection timeout" } else { "ok" }))
+        .collect();
+    let bytes = build_object_v4(&records);
+    assert_eq!(
+        u16::from_le_bytes([bytes[bytes.len() - 8], bytes[bytes.len() - 7]]),
+        footer::VERSION,
+        "the fixture is at the current written version"
+    );
+    assert!(
+        footer::open(&bytes)
+            .expect("footer")
+            .section(kind::PAGE_DIR)
+            .is_some(),
+        "a version-4 object carries PAGE_DIR"
+    );
+
+    let mem = Arc::new(MemoryStore::new());
+    mem.put("logs/v4.rlog", bytes.clone().into(), PutOptions::default())
+        .await
+        .expect("put");
+    let seg = seg_ref("logs/v4.rlog", bytes.len() as u64, &records);
+    let store: Arc<dyn ObjectStoreBackend> = mem;
+    let (_blocks_offset, _blocks_len, tail_len) = layout(&bytes);
+
+    let br = BlockRangeFetcher::new(Arc::clone(&store))
+        .with_whole_object_threshold(0)
+        .with_suffix_len(tail_len)
+        // A threshold the candidate coverage cannot reach, so a whole-object
+        // read here is the version-4 fallback and not the coverage crossover.
+        .with_coverage_threshold(1000.0);
+    let (got, stats) = br
+        .fetch_object(&seg, TENANT, 6, 13, &QueryAccounting::new())
+        .await
+        .expect("version-4 fetch succeeds");
+
+    assert!(stats.whole_object, "a version-4 object is read whole");
+    assert_eq!(
+        stats.candidate_blocks, 0,
+        "no block extents are resolved: the fallback returns before pruning"
+    );
+    assert_eq!(got.len(), bytes.len(), "the whole object is returned");
+    assert_eq!(got.as_ref(), bytes.as_slice());
+
+    // And the rows match the plain whole-object path, so the fallback is a
+    // fetch-strategy choice and nothing about what a query sees.
+    let query = LogQuery::new(6, 13);
+    let whole = LogSegmentFetcher::new(Arc::clone(&store))
+        .fetch(&seg, &query)
+        .await
+        .expect("whole fetch")
+        .expect("in range");
+    assert_eq!(whole.records.len(), 8, "ts 6..=13 inclusive");
 }

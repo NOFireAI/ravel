@@ -43,8 +43,8 @@ use ravel_logseg::footer::{
 };
 use ravel_logseg::reader::read_section;
 use ravel_logseg::record::{ColumnValue, ResolvedRow};
-use ravel_logseg::skip_index::{Level0Entry, SkipIndex};
-use ravel_logseg::writer::ObjectIdentity;
+use ravel_logseg::skip_index::SkipIndex;
+use ravel_logseg::writer::{BlocksBuilder, ObjectIdentity};
 use ravel_logseg::{
     AttrValue, FieldSel, FieldType, LogRecord, Predicate, RlogConfig, RlogWriter,
     stream_attrs_bytes,
@@ -1586,25 +1586,26 @@ fn rewrite_str_column_cells(
         ty: FieldType::Str,
     }];
     let block = write_block(&rows, &plans, cfg.zstd_level).expect("write one block");
-    let skip = SkipIndex::build(vec![Level0Entry {
-        block_offset: 0,
-        block_len: block.bytes.len() as u64,
-        block_crc32c: block.crc32c,
-        record_count: block.record_count,
-        min_ts: block.min_ts,
-        max_ts: block.max_ts,
-        min_stream_ref: block.min_stream_ref,
-        max_stream_ref: block.max_stream_ref,
-        stats: block.stats.clone(),
-    }])
-    .encode();
+    // Lay the one block out through the writer's own version-4 layout
+    // (ADR-0699), so BLOCKS, the SKIP_IDX level-0 entry, and PAGE_DIR agree
+    // with each other rather than being re-derived here.
+    let mut layout = BlocksBuilder::version_4(cfg.group_target_blocks);
+    layout.push(block);
+    let (blocks_bytes, l0, page_dir) = layout.finish();
+    let skip = SkipIndex::build(l0).encode();
+    let page_dir_bytes = page_dir.encode();
 
     let mut out: Vec<u8> = Vec::new();
     let mut sections: Vec<SectionDesc> = Vec::new();
     for d in &footer.sections {
         let (bytes, comp, uncomp_len) = match d.kind {
-            kind::BLOCKS => (block.bytes.clone(), COMP_NONE, block.bytes.len() as u64),
+            kind::BLOCKS => (blocks_bytes.clone(), COMP_NONE, blocks_bytes.len() as u64),
             kind::SKIP_IDX => (skip.clone(), COMP_NONE, skip.len() as u64),
+            kind::PAGE_DIR => (
+                page_dir_bytes.clone(),
+                COMP_NONE,
+                page_dir_bytes.len() as u64,
+            ),
             _ => {
                 let start = usize::try_from(d.offset).expect("offset fits");
                 let end = start + usize::try_from(d.len).expect("len fits");
