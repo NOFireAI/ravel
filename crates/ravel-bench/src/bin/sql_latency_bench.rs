@@ -355,6 +355,20 @@ async fn run(args: &Args) -> Result<SqlLatencyReport, ravel_bench::sql_latency::
     }
 }
 
+/// Human-readable label for `parallel_final_aggregation_effective`. `Some(v)`
+/// is what governed an in-process run. `None` is the Flight lane: the setting
+/// is not on the Flight wire, so this process cannot know what governed the
+/// server. That is "server-controlled", NOT "server default": when the server
+/// was started with an explicit `--sql-parallel-final-aggregation`, `None` does
+/// not mean the compiled-in default, so naming the default is a false claim
+/// (issue #763).
+fn parallel_final_aggregation_effective_label(effective: Option<bool>) -> String {
+    match effective {
+        Some(v) => v.to_string(),
+        None => "unknown (server-controlled)".to_string(),
+    }
+}
+
 fn print_human_table(report: &SqlLatencyReport) {
     let p = &report.provenance;
     let d = &report.dataset;
@@ -375,12 +389,8 @@ fn print_human_table(report: &SqlLatencyReport) {
     println!("  runs/query : {}", p.runs);
     println!("  deadline   : {} s per statement", p.deadline_secs);
     println!("  fetch conc : {}", p.fetch_concurrency);
-    let effective = match p.parallel_final_aggregation_effective {
-        Some(v) => v.to_string(),
-        // A Flight run does not send the setting to the server; the effective
-        // value is the server's own (its default is on).
-        None => "unknown (server default)".to_string(),
-    };
+    let effective =
+        parallel_final_aggregation_effective_label(p.parallel_final_aggregation_effective);
     println!(
         "  tenant max : {} bytes  parallel final agg: requested={} effective={}",
         p.tenant_max_bytes, p.parallel_final_aggregation_requested, effective
@@ -395,13 +405,29 @@ fn print_human_table(report: &SqlLatencyReport) {
         println!("  read cache : off");
     }
     println!();
+    // `get` is the cold run's object-store GETs; the `w_` columns are the warm
+    // run's (run 1) GETs, store bytes, and fetch-cache hits, so a reader can see
+    // whether the second execution dropped to plan reads only or still fetched
+    // objects (issue #767). The warm columns are `-` for a single-run report or
+    // the Flight lane (no per-run accounting on the wire).
     println!(
-        "  {:<32} | {:>9} | {:>9} | {:>9} | {:>9} | {:>7} | {:>7} | {:>7} | {:>7}",
-        "id", "min ms", "med ms", "max ms", "cold ms", "rows", "blk_tot", "blk_scn", "get"
+        "  {:<32} | {:>9} | {:>9} | {:>9} | {:>9} | {:>7} | {:>7} | {:>7} | {:>7} | {:>7} | {:>9} | {:>7}",
+        "id",
+        "min ms",
+        "med ms",
+        "max ms",
+        "cold ms",
+        "rows",
+        "blk_tot",
+        "blk_scn",
+        "get",
+        "w_get",
+        "w_bytes",
+        "w_hit"
     );
     println!(
-        "  {:-<32}-+-{:-<9}-+-{:-<9}-+-{:-<9}-+-{:-<9}-+-{:-<7}-+-{:-<7}-+-{:-<7}-+-{:-<7}",
-        "", "", "", "", "", "", "", "", ""
+        "  {:-<32}-+-{:-<9}-+-{:-<9}-+-{:-<9}-+-{:-<9}-+-{:-<7}-+-{:-<7}-+-{:-<7}-+-{:-<7}-+-{:-<7}-+-{:-<9}-+-{:-<7}",
+        "", "", "", "", "", "", "", "", "", "", "", ""
     );
     for e in &report.entries {
         // The Flight lane has no scan diagnostics to print (they are executor
@@ -415,8 +441,18 @@ fn print_human_table(report: &SqlLatencyReport) {
             ),
             None => ("-".to_string(), "-".to_string(), "-".to_string()),
         };
+        // The warm run is run index 1. Absent when the run had fewer than two
+        // executions, or on the Flight lane which carries no per-run accounting.
+        let (warm_gets, warm_bytes, warm_hits) = match e.per_run_accounting.as_deref() {
+            Some(runs) if runs.len() >= 2 => (
+                runs[1].object_store_get_requests.to_string(),
+                runs[1].object_store_bytes.to_string(),
+                runs[1].cache_hits.to_string(),
+            ),
+            _ => ("-".to_string(), "-".to_string(), "-".to_string()),
+        };
         println!(
-            "  {:<32} | {:>9.3} | {:>9.3} | {:>9.3} | {:>9.3} | {:>7} | {:>7} | {:>7} | {:>7}",
+            "  {:<32} | {:>9.3} | {:>9.3} | {:>9.3} | {:>9.3} | {:>7} | {:>7} | {:>7} | {:>7} | {:>7} | {:>9} | {:>7}",
             e.id,
             e.min_ms,
             e.median_ms,
@@ -426,6 +462,9 @@ fn print_human_table(report: &SqlLatencyReport) {
             blocks_total,
             blocks_scanned,
             gets,
+            warm_gets,
+            warm_bytes,
+            warm_hits,
         );
     }
     if !report.skipped.is_empty() {
@@ -439,5 +478,31 @@ fn print_human_table(report: &SqlLatencyReport) {
         for f in &report.failed {
             println!("    {:<32} run {}: {}", f.id, f.run, f.error);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The Flight lane's effective-aggregation label is "server-controlled",
+    /// not "server default" (issue #763): a `None` effective value means only
+    /// that this process cannot know the server's setting, and an explicit
+    /// server-side `--sql-parallel-final-aggregation` makes "default" false.
+    /// Reverting the string to "unknown (server default)" flips this red.
+    #[test]
+    fn flight_effective_label_is_server_controlled() {
+        assert_eq!(
+            parallel_final_aggregation_effective_label(None),
+            "unknown (server-controlled)"
+        );
+        assert_eq!(
+            parallel_final_aggregation_effective_label(Some(true)),
+            "true"
+        );
+        assert_eq!(
+            parallel_final_aggregation_effective_label(Some(false)),
+            "false"
+        );
     }
 }

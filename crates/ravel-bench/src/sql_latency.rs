@@ -310,6 +310,28 @@ pub struct ScanDiagnostics {
     pub cache_bytes: u64,
 }
 
+/// The object-store traffic and cache behavior of a single execution, read off
+/// the executor's `QueryAccounting`. Recorded once per run (not only the cold
+/// run) so a warm repeat can be read for the question it exists to answer: did
+/// the second execution drop to plan reads only, or does it still fetch objects
+/// (issue #767). The cold run's figures also live in [`ScanDiagnostics`] (the
+/// `object_store_*`/`cache_*` fields), kept there for report compatibility.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RunAccounting {
+    /// Object-store GET requests this run issued.
+    pub object_store_get_requests: u64,
+    /// Object-store LIST requests this run issued.
+    pub object_store_list_requests: u64,
+    /// Bytes transferred from the object store across every operation kind.
+    pub object_store_bytes: u64,
+    /// Fetch-cache hits on this run.
+    pub cache_hits: u64,
+    /// Fetch-cache misses on this run.
+    pub cache_misses: u64,
+    /// Bytes served from the fetch cache on this run.
+    pub cache_bytes: u64,
+}
+
 /// One measured statement.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EntryReport {
@@ -332,6 +354,14 @@ pub struct EntryReport {
     /// zeros would read as "nothing was scanned".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scan: Option<ScanDiagnostics>,
+    /// Object-store accounting for every execution, in run order (index 0 is
+    /// the cold run), so a warm repeat's GETs/bytes/cache hits can be read
+    /// rather than only the cold run's (issue #767). Length equals the report's
+    /// `runs` for an in-process lane. `None` for the Flight lane, whose response
+    /// carries no executor accounting (same reason `scan` is `None`). Index 0
+    /// duplicates the `cold_*` figures in `scan`, which stay for compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_run_accounting: Option<Vec<RunAccounting>>,
 }
 
 /// One statement that was not run because the dataset does not satisfy its
@@ -873,6 +903,7 @@ pub async fn measure_corpus(
         }
 
         let mut latencies_ns = Vec::with_capacity(runs);
+        let mut per_run_accounting = Vec::with_capacity(runs);
         let mut cold_ns = 0u64;
         let mut rows_returned = 0usize;
         let mut scan = ScanDiagnostics {
@@ -913,13 +944,26 @@ pub async fn measure_corpus(
             };
             let elapsed_ns = start.elapsed().as_nanos() as u64;
             latencies_ns.push(elapsed_ns);
+            // Record accounting for every run, not only the cold one: the warm
+            // run exists to answer whether the second execution drops to plan
+            // reads only or still fetches objects, and that is unreadable from
+            // the cold figures alone (issue #767).
+            let acc = &outcome.accounting;
+            per_run_accounting.push(RunAccounting {
+                object_store_get_requests: acc.s3_requests(AccountedOp::Get),
+                object_store_list_requests: acc.s3_requests(AccountedOp::List),
+                object_store_bytes: acc.total_s3_bytes(),
+                cache_hits: acc.cache_hits,
+                cache_misses: acc.cache_misses,
+                cache_bytes: acc.cache_bytes,
+            });
             if run == 0 {
-                // The cold run's counters are the informative ones: it pays the
-                // object-store traffic and cache misses a warm repeat elides.
-                // Block counters are deterministic across runs regardless.
+                // The cold run's block counters and rows go into `scan`; its
+                // object-store/cache figures are kept there too (as the
+                // `cold_*` fields) for report compatibility, and now also live
+                // at index 0 of `per_run_accounting`.
                 cold_ns = elapsed_ns;
                 rows_returned = outcome.output.num_rows();
-                let acc = &outcome.accounting;
                 scan = ScanDiagnostics {
                     segments: outcome.stats.segments,
                     blocks_total: outcome.stats.blocks_total,
@@ -946,6 +990,7 @@ pub async fn measure_corpus(
             cold_ms: to_ms(cold_ns),
             rows_returned,
             scan: Some(scan),
+            per_run_accounting: Some(per_run_accounting),
         };
         if let Some(sink) = progress.as_mut() {
             sink.write(&EntryEvent::Measured(report.clone()))?;
@@ -1071,6 +1116,7 @@ async fn measure_over_flight(
             cold_ms: to_ms(cold_ns),
             rows_returned,
             scan: None,
+            per_run_accounting: None,
         };
         if let Some(sink) = progress.as_mut() {
             sink.write(&EntryEvent::Measured(report.clone()))?;
@@ -2492,6 +2538,146 @@ mod tests {
             1,
             "a zero is clamped to one partition, never a zero-partition plan"
         );
+    }
+
+    /// A one-object, cache-wired fixture measured twice. Accounting is recorded
+    /// for BOTH runs, not only the cold one (issue #767): the array is length 2,
+    /// the cold run pays the object-store traffic, and the warm run serves from
+    /// cache instead of refetching -- the "does the second execution drop to
+    /// plan reads only" answer the warm run exists to give.
+    ///
+    /// The exact figures the fixture produces (pinned below, never `> 0`): the
+    /// single RLOG object plus the catalog resolve are 3 store GETs on the cold
+    /// run (`l/HEAD` pointer, the commit record, the data object; the
+    /// plan-then-scan second read of the data object is absorbed by the fetcher
+    /// cache, 2 hits). On the warm run the data object and most of the resolve
+    /// are cache-served, so store GETs fall to 1 and cache hits rise to 4, with
+    /// no store bytes transferred. The `has_word` predicate keeps the query on
+    /// the plan-then-scan path so the cache has a within-run second read to
+    /// absorb (see `cache_flag_cuts_store_gets_within_a_run`).
+    ///
+    /// Red against the `run == 0` guard: moving the `per_run_accounting.push`
+    /// back under `if run == 0` leaves the array length 1 with the warm entry
+    /// absent, so the `acc.len() == 2` and every `acc[1]` assertion fail.
+    #[tokio::test]
+    async fn per_run_accounting_records_warm_run_not_only_cold() {
+        let store = empty_store();
+        let tenant = TenantId::new("perrun-tenant");
+        write_shard_objects(&store, &tenant, 0, 1).await;
+        let window = TimeRange {
+            start_ns: 0,
+            end_ns: NOW_NS,
+        };
+        let (measured, skipped, failed) = measure_corpus(
+            &store,
+            tenant.hash(),
+            &[entry(
+                "q",
+                "SELECT body FROM logs WHERE has_word(body, 'timeout')",
+            )],
+            &[],
+            2,
+            window,
+            NOW_NS,
+            64 << 20,
+            Duration::from_secs(30),
+            false,
+            None,
+            ExecutorSettings::default(),
+            None,
+        )
+        .await
+        .expect("run");
+        assert!(skipped.is_empty() && failed.is_empty());
+        let acc = measured[0]
+            .per_run_accounting
+            .as_ref()
+            .expect("an in-process lane records per-run accounting");
+        assert_eq!(
+            acc.len(),
+            2,
+            "one accounting entry per run; the run==0 guard leaves length 1"
+        );
+
+        // Cold run: the one object plus the catalog resolve.
+        assert_eq!(
+            acc[0].object_store_get_requests, 3,
+            "cold run's store GETs: l/HEAD + commit record + the data object"
+        );
+        assert_eq!(acc[0].cache_hits, 2, "cold run's fetcher-cache hits");
+        assert_eq!(acc[0].cache_misses, 3, "cold run's fetcher-cache misses");
+        assert_eq!(acc[0].object_store_bytes, 836, "cold run's store bytes");
+
+        // Warm run: served from cache, so it drops to plan reads only.
+        assert_eq!(
+            acc[1].object_store_get_requests, 1,
+            "warm run's store GETs fall from 3 to 1 (the rest cache-served)"
+        );
+        assert_eq!(
+            acc[1].cache_hits, 4,
+            "warm run's cache hits rise from 2 to 4"
+        );
+        assert_eq!(
+            acc[1].object_store_bytes, 0,
+            "warm run transfers no store bytes"
+        );
+
+        // The cold figures still live in `scan`, equal to index 0, so a
+        // report reader that only knows `scan` is unaffected.
+        let scan = measured[0].scan.as_ref().expect("cold scan diagnostics");
+        assert_eq!(
+            scan.object_store_get_requests,
+            acc[0].object_store_get_requests
+        );
+        assert_eq!(scan.cache_hits, acc[0].cache_hits);
+    }
+
+    /// The report JSON keeps its existing shape and gains the per-run array.
+    /// A cold accounting field under `scan` is unchanged (pinned), and
+    /// `per_run_accounting` is an array whose length equals `runs`.
+    #[tokio::test]
+    async fn report_json_keeps_cold_fields_and_adds_per_run_array() {
+        let store = empty_store();
+        let tenant = TenantId::new("json-tenant");
+        write_shard_objects(&store, &tenant, 0, 1).await;
+        let window = TimeRange {
+            start_ns: 0,
+            end_ns: NOW_NS,
+        };
+        let (measured, _skipped, _failed) = measure_corpus(
+            &store,
+            tenant.hash(),
+            &[entry(
+                "q",
+                "SELECT body FROM logs WHERE has_word(body, 'timeout')",
+            )],
+            &[],
+            2,
+            window,
+            NOW_NS,
+            64 << 20,
+            Duration::from_secs(30),
+            false,
+            None,
+            ExecutorSettings::default(),
+            None,
+        )
+        .await
+        .expect("run");
+
+        let v: serde_json::Value = serde_json::to_value(&measured[0]).expect("serialize entry");
+        // The existing cold field under `scan` is unchanged.
+        assert_eq!(
+            v["scan"]["object_store_get_requests"], 3,
+            "the cold run's store GETs are still carried under `scan`"
+        );
+        // The new array is present and one entry long per run.
+        let per_run = v["per_run_accounting"]
+            .as_array()
+            .expect("per_run_accounting is a JSON array");
+        assert_eq!(per_run.len(), 2, "per_run_accounting has one entry per run");
+        assert_eq!(per_run[0]["object_store_get_requests"], 3);
+        assert_eq!(per_run[1]["object_store_get_requests"], 1);
     }
 
     #[test]
