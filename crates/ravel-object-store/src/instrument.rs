@@ -541,6 +541,19 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for InstrumentedStore<S> {
         result
     }
 
+    async fn list_after(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        page: Option<PageToken>,
+    ) -> Result<ListPage, StoreError> {
+        let start = self.clock.now_nanos();
+        let result = self.inner.list_after(prefix, start_after, page).await;
+        // A start-after page is still one LIST, counted the same as `list`.
+        self.record(StoreOp::List, start, 0, &result);
+        result
+    }
+
     async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
         let start = self.clock.now_nanos();
         let result = self.inner.list_delimited(prefix).await;

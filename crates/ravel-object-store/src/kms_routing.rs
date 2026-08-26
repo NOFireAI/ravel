@@ -280,6 +280,15 @@ impl ObjectStoreBackend for KmsRoutingStore {
         self.default.list(prefix, page).await
     }
 
+    async fn list_after(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        page: Option<PageToken>,
+    ) -> Result<ListPage, StoreError> {
+        self.default.list_after(prefix, start_after, page).await
+    }
+
     async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
         self.default.list_delimited(prefix).await
     }

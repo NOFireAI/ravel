@@ -942,6 +942,44 @@ impl ObjectStoreBackend for S3Store {
         Ok(ListPage { objects: out, next })
     }
 
+    async fn list_after(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        page: Option<PageToken>,
+    ) -> Result<ListPage, StoreError> {
+        let prefix_path = prefix_of(prefix);
+        // A page token resumes strictly after the previous page's last key;
+        // on the first page `start_after` plays the same role. Both map to
+        // `object_store`'s `list_with_offset`, whose offset is exclusive
+        // (ListObjectsV2 `start-after`), so keys equal to the offset are
+        // skipped server-side and never transferred. A present page token is
+        // always past `start_after`, so it takes precedence.
+        let offset = match (&page, start_after) {
+            (Some(PageToken(after)), _) => Some(Path::from(after.as_str())),
+            (None, Some(after)) => Some(Path::from(after)),
+            (None, None) => None,
+        };
+        let mut stream = match &offset {
+            Some(offset) => self.store.list_with_offset(prefix_path.as_ref(), offset),
+            None => self.store.list(prefix_path.as_ref()),
+        };
+        let mut out = Vec::with_capacity(self.page_size.min(1024));
+        while out.len() < self.page_size {
+            match stream.next().await {
+                Some(Ok(meta)) => out.push(map_meta(meta)?),
+                Some(Err(e)) => return Err(map_error_common(e)),
+                None => break,
+            }
+        }
+        let next = if out.len() == self.page_size {
+            out.last().map(|m| PageToken(m.key.clone()))
+        } else {
+            None
+        };
+        Ok(ListPage { objects: out, next })
+    }
+
     async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
         let prefix_path = prefix_of(prefix);
         let result = self
