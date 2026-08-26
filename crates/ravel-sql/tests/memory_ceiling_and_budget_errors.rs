@@ -341,7 +341,19 @@ async fn a_high_cardinality_aggregation_is_refused_by_the_aggregate_not_the_scan
         engine: util::engine_config(),
         max_query_bytes: 16 * 1024 * 1024,
         parallel_final_aggregation: false,
-        skip_partial_aggregation: true,
+        // Off deliberately, and it is the only test in this file that turns it
+        // off (issue #680). This case's subject is the aggregate operator's own
+        // non-spillable reservation being what the pool refuses. With the
+        // tightened skip-partial-aggregation probe on (the shipped default),
+        // `GROUP BY ts` gives every row its own group, the probe fires after
+        // 8192 rows, and the partial stage stops growing -- so the aggregate
+        // never reaches the ceiling and the refusal comes from
+        // `RepartitionExec`/`RsegScanExec` instead. The query still fails typed,
+        // which is what ADR-0102 decision 3 requires and what
+        // `a_high_cardinality_aggregation_over_budget_is_resources_exhausted`
+        // asserts; only this test's operator-identity claim depends on the
+        // aggregate being the one that runs out.
+        skip_partial_aggregation: false,
     };
     let fixture = Fixture::build(
         Arc::new(MemoryStore::new()),
