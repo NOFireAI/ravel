@@ -44,6 +44,22 @@
 //! segments, so this measures it over the fixture's full segment set and reports
 //! the serial wall time next to the same prunes issued concurrently.
 //!
+//! # #693 part 3 and why this fixture still runs the plan phase
+//!
+//! Issue #693 part 3 lets a predicate-free, full-window scan skip the plan phase
+//! entirely and read each relevant segment whole in one GET (`ravel_sql`'s
+//! `LogsScanExec::whole_segment_fast_path`). That fast path is gated on the same
+//! conjuncts `plan_segment`'s own fast path uses, which include
+//! `object_size > block_range_threshold`: the plan/scan re-probe it eliminates
+//! only exists above the block-range threshold, and at or below it the plan and
+//! scan reads already coalesce on the one `(0, object_size)` cache key. This
+//! fixture's objects are small (96 records, 6 blocks), well below the default
+//! 512 KiB threshold, so they stay on the plan-then-stripe path and every figure
+//! here -- the [`PlanningLatency`] measurement and the per-combo GET counts --
+//! is unchanged by #693 part 3. The fast path's request-count law (one
+//! whole-object read per segment, zero suffix probes) is measured instead by the
+//! above-threshold integration tests in `ravel-sql` and `ravel-query`.
+//!
 //! Report-only: it never changes library behavior. Gated on the `sql-latency`
 //! feature, like the other SQL scaling benches.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -393,7 +409,7 @@ async fn measure_planning_latency(
             .plan_segment(seg, tenant_hash, &query, &accounting)
             .await
             .expect("plan segment");
-        if let Some((survivors, _)) = planned {
+        if let Some((survivors, _, _)) = planned {
             total_blocks += survivors;
         }
     }
@@ -418,7 +434,7 @@ async fn measure_planning_latency(
     assert_eq!(
         planned
             .iter()
-            .filter_map(|p| p.as_ref().map(|(s, _)| *s))
+            .filter_map(|p| p.as_ref().map(|(s, _, _)| *s))
             .sum::<usize>(),
         total_blocks,
         "both planning passes must prune to the same surviving-block count"
