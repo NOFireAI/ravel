@@ -28,8 +28,9 @@ use crate::varint::{get_uvarint, put_uvarint};
 /// real block never approaches this; it caps allocation from a hostile header.
 const MAX_RECORDS: u64 = 1 << 24;
 /// Upper bound on a block's page count. Fixed columns plus the 1000-column
-/// dynamic budget, each up to two pages, stays well under this.
-const MAX_PAGES: u64 = 4096;
+/// dynamic budget, each up to two pages, stays well under this. PAGE_DIR
+/// derives its own per-group caps from this (ADR-0699 decision 2).
+pub const MAX_PAGES: u64 = 4096;
 
 /// The type of a dynamic attribute column, as resolved from FIELD_DIR. Fixed
 /// columns (ids 0..=9) carry no plan; their types are implicit.

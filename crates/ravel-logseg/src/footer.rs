@@ -119,6 +119,12 @@ pub mod kind {
     pub const SKIP_IDX: u32 = 4;
     pub const BLOOM: u32 = 5;
     pub const POSTINGS: u32 = 6;
+    // Kind 7 is reserved for GRAM_IDX (ADR-0105), which has no implementation
+    // yet; PAGE_DIR takes the next free number rather than that one.
+    /// Per-row-group, per-column-chunk, per-page directory
+    /// (ADR-0699 decision 2). Mandatory in trailer version 4, absent in
+    /// version 3.
+    pub const PAGE_DIR: u32 = 8;
 }
 
 /// One section table entry (mirrors `ravel.logseg.v1.Section`).
