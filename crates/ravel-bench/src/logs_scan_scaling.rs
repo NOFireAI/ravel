@@ -36,9 +36,11 @@
 //!   `over_threshold` values, both cache settings): #693 part 3's whole-segment
 //!   fast path (`LogsScanExec::whole_segment_fast_path`). The plan phase is
 //!   skipped, each segment is assigned whole to one partition, and each is read
-//!   once with a single full-range GET. `reads_per_segment` is 1 and
-//!   `bytes_amplification` is about 1.0, with zero suffix probes, whether or not
-//!   a cache is wired. Issue #739 dropped the threshold conjunct, so the
+//!   once with a single full-range GET. `reads_per_segment` is about 1 (it
+//!   divides every accounted GET by the segment count, and the resolve's one
+//!   catalog probe rides along, so 33 GETs over 32 segments reads 1.03) and
+//!   `bytes_amplification` is 1.0 within float slack (the probe carries no
+//!   bytes), with zero suffix probes, whether or not a cache is wired. Issue #739 dropped the threshold conjunct, so the
 //!   whole-object (below-threshold) rows now take this path too: object size no
 //!   longer decides the routing, and the cache has nothing left to absorb on
 //!   this shape.
