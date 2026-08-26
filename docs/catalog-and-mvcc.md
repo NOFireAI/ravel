@@ -823,9 +823,13 @@ windows. Instead:
   one-object-worth-of-data into thousands of empty LISTs.
 - The prefix scan carries a runtime LIST cap at the same ceiling: it aborts
   with `WindowTooWide` before issuing a page that would take it over, so a
-  single resolve still never issues more than `max_catalog_list_requests`
-  catalog LISTs. Only a scan whose *actual object volume* is unsustainable is
-  refused; a wide-but-sparse window is served.
+  single resolve's scan never issues more than `max_catalog_list_requests`
+  catalog LISTs. The ADR-0064 pending-erasure LIST is one further LIST
+  outside that cap: it starts alongside the scan and is issued once even
+  when the scan is refused, so a resolve issues at most
+  `max_catalog_list_requests + 1` LISTs in total. Only a scan whose *actual
+  object volume* is unsustainable is refused; a wide-but-sparse window is
+  served.
 
 The refusal is never a silent narrowing to a partial result (exact semantics
 by default). The typed error carries the count and the limit so the caller
