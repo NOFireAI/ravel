@@ -47,6 +47,39 @@ fn wall_clock() -> anyhow::Result<FixedClock> {
     Ok(FixedClock::new(crate::now_ns()?))
 }
 
+/// Parse a `--max-flush-lifetime` value into nanoseconds.
+///
+/// Same grammar as ravel-server's `--gc-max-flush-lifetime`: a humantime
+/// duration string (`1h`, `30m`, `1h5m`), converted to `i64` nanoseconds. The
+/// server's parser is `parse_gc_duration_ns` in
+/// services/ravel-server/src/config.rs; it is private to a crate ravel-cli does
+/// not depend on at build time, so the grammar is copied here rather than
+/// shared. One deliberate difference: zero is accepted, because `0s` is the
+/// point of this override on a quiescent tenant (seal every bucket whose hour
+/// has ended, subject only to the clock-skew allowance). Negative values are
+/// unrepresentable in humantime, so the only rejections are an unparseable
+/// spelling and a value too large for `i64` nanoseconds.
+pub fn parse_max_flush_lifetime_ns(s: &str) -> Result<i64, String> {
+    let dur = humantime::parse_duration(s)
+        .map_err(|e| format!("invalid --max-flush-lifetime '{s}': {e}"))?;
+    i64::try_from(dur.as_nanos()).map_err(|_| format!("--max-flush-lifetime '{s}' is too large"))
+}
+
+/// The compactor config a `compact-bucket` / `compact-tenant` invocation runs
+/// with: defaults, plus the dry-run switch and the optional operator override
+/// of `max_flush_lifetime_ns` (which moves the seal margin, see
+/// [`parse_max_flush_lifetime_ns`]).
+fn compactor_config(dry_run: bool, max_flush_lifetime_ns: Option<i64>) -> CompactorConfig {
+    let mut config = CompactorConfig {
+        dry_run,
+        ..CompactorConfig::default()
+    };
+    if let Some(ns) = max_flush_lifetime_ns {
+        config.max_flush_lifetime_ns = ns;
+    }
+    config
+}
+
 /// `maintain compact-bucket`: run one compaction pass over a single bucket.
 pub async fn compact(
     store: Arc<dyn ObjectStoreBackend>,
@@ -55,13 +88,11 @@ pub async fn compact(
     shard: u32,
     hour: u32,
     dry_run: bool,
+    max_flush_lifetime_ns: Option<i64>,
 ) -> anyhow::Result<()> {
     let tenant_hash = TenantId::new(tenant).hash();
     let bucket = Bucket::new(tenant_hash, signal.to_signal(), shard, hour);
-    let config = CompactorConfig {
-        dry_run,
-        ..CompactorConfig::default()
-    };
+    let config = compactor_config(dry_run, max_flush_lifetime_ns);
     let clock = wall_clock()?;
 
     let outcome = compact_bucket(store.as_ref(), &clock, &config, &bucket)
@@ -94,6 +125,249 @@ pub async fn compact(
         }
     }
     Ok(())
+}
+
+/// Why a `compact-tenant` run could not decide which shards to walk. Typed so
+/// the message names the tenant and the fix, rather than surfacing as a bare
+/// store error or, worse, as a silent walk over the wrong shard range.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum CompactTenantError {
+    #[error(
+        "tenant {tenant:?} has no shard-count provisioning record for signal {signal:?}, and no \
+         --shards was given; pass --shards N with the shard count the tenant was written at"
+    )]
+    NoProvisioningRecord { tenant: String, signal: Signal },
+    #[error(
+        "--shards {requested} disagrees with tenant {tenant:?}'s provisioning record for signal \
+         {signal:?}, whose shard ceiling at hour {hour} is {ceiling}; rerun with --shards \
+         {ceiling} or omit --shards"
+    )]
+    ShardCountDisagreement {
+        tenant: String,
+        signal: Signal,
+        requested: u32,
+        ceiling: u32,
+        hour: u32,
+    },
+}
+
+/// Per-outcome bucket counts for one `maintain compact-tenant` run, plus the
+/// parts written. Wall time is deliberately not a field: it is printed but
+/// never returned, so a test can pin this whole struct.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompactTenantReport {
+    /// Shards walked (`0..shards`).
+    pub shards: u32,
+    /// Buckets newly compacted (or, under `--dry-run`, that would have been).
+    pub compacted: usize,
+    /// Buckets that already carried a compaction record.
+    pub already: usize,
+    /// Buckets reached that are not yet sealed. Hours ascend, so the walk stops
+    /// at the first one in each shard; this is therefore at most one per shard.
+    pub not_sealed: usize,
+    /// Buckets below `min_compaction_inputs` L0 records.
+    pub below_min: usize,
+    /// Buckets carrying a retention tombstone.
+    pub tombstoned: usize,
+    /// L1 parts written across every compacted bucket (would-be writes under
+    /// `--dry-run`).
+    pub parts_written: usize,
+}
+
+/// Resolve how many shards `compact-tenant` walks for one (tenant, signal).
+///
+/// The same four-case resolve `ravel-bench`'s SQL latency tenant lane uses
+/// (`resolve_shard_count` in crates/ravel-bench/src/sql_latency.rs): the
+/// durable provisioning record `ravel-cli load` writes via `validate_or_adopt`
+/// carries the shard-generation history, and
+/// [`ravel_catalog::shard_ceiling`] over it at `now_hour` is the largest shard
+/// count active at or before that hour. Flag and record present must agree
+/// (never silently prefer one); flag only trusts the flag (a tenant written
+/// before provisioning records existed); record only uses the ceiling; neither
+/// refuses, naming the tenant.
+async fn resolve_shard_count(
+    store: &dyn ObjectStoreBackend,
+    tenant_hash: &TenantHash,
+    tenant: &str,
+    signal: Signal,
+    override_shards: Option<u32>,
+    now_hour: u32,
+) -> anyhow::Result<u32> {
+    let generations = ravel_catalog::read_generations_from_store(store, tenant_hash, signal)
+        .await
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "shard-generation history read failed for tenant {tenant:?} signal \
+                 {signal:?}: {err}; refusing to walk a possibly-truncated shard range"
+            )
+        })?;
+    match (override_shards, generations) {
+        (Some(requested), Some(gens)) => {
+            let ceiling = ravel_catalog::shard_ceiling(&gens, now_hour);
+            if requested != ceiling {
+                return Err(CompactTenantError::ShardCountDisagreement {
+                    tenant: tenant.to_string(),
+                    signal,
+                    requested,
+                    ceiling,
+                    hour: now_hour,
+                }
+                .into());
+            }
+            Ok(requested)
+        }
+        (Some(requested), None) => Ok(requested),
+        (None, Some(gens)) => Ok(ravel_catalog::shard_ceiling(&gens, now_hour)),
+        (None, None) => Err(CompactTenantError::NoProvisioningRecord {
+            tenant: tenant.to_string(),
+            signal,
+        }
+        .into()),
+    }
+}
+
+/// Every ingest-hour bucket present under one `(tenant, signal, shard)`,
+/// ascending. The same listing `ravel_maintain::scan`'s per-shard walk does
+/// (its `list_shard_hours` is private to that crate); a common prefix that is
+/// not an hour is layout drift and errors rather than being skipped.
+async fn shard_hours(
+    store: &dyn ObjectStoreBackend,
+    tenant_hash: &TenantHash,
+    signal: Signal,
+    shard: u32,
+) -> anyhow::Result<Vec<u32>> {
+    let shard_prefix = keys::commit_shard_prefix(tenant_hash, signal, shard)
+        .map_err(|err| anyhow::anyhow!("failed to build shard prefix: {err}"))?;
+    let listed = store
+        .list_delimited(&shard_prefix)
+        .await
+        .map_err(|err| anyhow::anyhow!("failed to list {shard_prefix}: {err}"))?;
+    let mut hours = Vec::with_capacity(listed.common_prefixes.len());
+    for common in &listed.common_prefixes {
+        let rest = common
+            .strip_prefix(&shard_prefix)
+            .and_then(|r| r.strip_suffix('/'))
+            .unwrap_or("");
+        let hour = keys::parse_ingest_hour_string(rest).map_err(|err| {
+            anyhow::anyhow!("unexpected key {common} under {shard_prefix}: {err}")
+        })?;
+        hours.push(hour);
+    }
+    hours.sort_unstable();
+    Ok(hours)
+}
+
+/// `maintain compact-tenant`: compact every sealed bucket of one (tenant,
+/// signal), across every shard.
+///
+/// Exposes `ravel_maintain::scan`'s per-shard hour walk rather than
+/// reimplementing it: hours ascend from the shard's oldest present hour (or
+/// `from_hour`) to `to_hour` (or the hour containing `now_ns`), each bucket
+/// goes through the same [`compact_bucket`] `compact-bucket` calls, and the
+/// walk stops at the first unsealed hour in a shard because every later hour is
+/// also unsealed. No advisory cursor is read or written: a one-shot operator
+/// invocation covers the range it was asked for, every time.
+///
+/// `NotSealed` is a reported outcome, not a failure; only a compaction error
+/// aborts the run (and it aborts the whole run, so the operator sees the fault
+/// instead of a summary that quietly omits shards).
+#[allow(clippy::too_many_arguments)]
+pub async fn compact_tenant(
+    store: Arc<dyn ObjectStoreBackend>,
+    tenant: &str,
+    signal: SignalArg,
+    shards: Option<u32>,
+    from_hour: Option<u32>,
+    to_hour: Option<u32>,
+    dry_run: bool,
+    max_flush_lifetime_ns: Option<i64>,
+    now_ns: i64,
+) -> anyhow::Result<CompactTenantReport> {
+    let started = std::time::Instant::now();
+    let tenant_hash = TenantId::new(tenant).hash();
+    let sig = signal.to_signal();
+    let now_hour = u32::try_from(now_ns / ravel_maintain::config::NS_PER_HOUR)
+        .map_err(|_| anyhow::anyhow!("current ingest hour {now_ns} ns does not fit u32"))?;
+    let shard_count =
+        resolve_shard_count(store.as_ref(), &tenant_hash, tenant, sig, shards, now_hour).await?;
+    let last_hour = to_hour.unwrap_or(now_hour);
+    let first_hour = from_hour.unwrap_or(0);
+
+    let config = compactor_config(dry_run, max_flush_lifetime_ns);
+    let clock = FixedClock::new(now_ns);
+    let mut report = CompactTenantReport {
+        shards: shard_count,
+        ..CompactTenantReport::default()
+    };
+
+    println!("tenant: {tenant}");
+    println!("signal: {sig:?}");
+    println!("shards: {shard_count}");
+    println!("hour_range: [{first_hour}, {last_hour}]");
+    println!("max_flush_lifetime_ns: {}", config.max_flush_lifetime_ns);
+    println!("dry_run: {dry_run}");
+
+    for shard in 0..shard_count {
+        for hour in shard_hours(store.as_ref(), &tenant_hash, sig, shard).await? {
+            if hour < first_hour {
+                continue;
+            }
+            if hour > last_hour {
+                break;
+            }
+            let bucket = Bucket::new(tenant_hash, sig, shard, hour);
+            let outcome = compact_bucket(store.as_ref(), &clock, &config, &bucket)
+                .await
+                .map_err(|err| {
+                    anyhow::anyhow!("compaction failed for shard {shard} hour {hour}: {err}")
+                })?;
+            match outcome {
+                CompactionOutcome::NotSealed => {
+                    report.not_sealed += 1;
+                    println!("shard={shard} hour={hour} outcome=NotSealed");
+                    // Hours ascend, so every later bucket is unsealed too.
+                    break;
+                }
+                CompactionOutcome::Tombstoned => {
+                    report.tombstoned += 1;
+                    println!("shard={shard} hour={hour} outcome=Tombstoned");
+                }
+                CompactionOutcome::AlreadyCompacted => {
+                    report.already += 1;
+                    println!("shard={shard} hour={hour} outcome=AlreadyCompacted");
+                }
+                CompactionOutcome::BelowMinInputs { count } => {
+                    report.below_min += 1;
+                    println!("shard={shard} hour={hour} outcome=BelowMinInputs l0_records={count}");
+                }
+                CompactionOutcome::Compacted { parts, publish } => {
+                    report.compacted += 1;
+                    report.parts_written += parts;
+                    let publish = match publish {
+                        PublishOutcome::Published => "Published".to_string(),
+                        PublishOutcome::Converged { parts_repaired } => {
+                            format!("Converged(parts_repaired={parts_repaired})")
+                        }
+                        PublishOutcome::Abandoned => "Abandoned".to_string(),
+                    };
+                    println!(
+                        "shard={shard} hour={hour} outcome=Compacted parts={parts} \
+                         publish={publish}"
+                    );
+                }
+            }
+        }
+    }
+
+    let verb = if dry_run { "would write" } else { "wrote" };
+    println!("compacted: {}", report.compacted);
+    println!("already: {}", report.already);
+    println!("not_sealed: {}", report.not_sealed);
+    println!("below_min: {}", report.below_min);
+    println!("tombstoned: {}", report.tombstoned);
+    println!("parts ({verb}): {}", report.parts_written);
+    println!("wall_time_ms: {}", started.elapsed().as_millis());
+    Ok(report)
 }
 
 /// `maintain sweep`: run one sweep pass (all three GC rules) over a shard.
