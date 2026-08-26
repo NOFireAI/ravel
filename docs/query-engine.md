@@ -110,6 +110,27 @@ rows the committed counts still include. So an operator who sees a `COUNT(*)`
 answered with zero GETs is seeing the by-design fast path, and one predicate
 or one pending erasure is enough to put the read back on the scan.
 
+## Predicate-free full-window logs scan: request count
+
+Every OTHER predicate-free, full-window logs statement — `SUM`, `AVG`,
+`GROUP BY`, `ORDER BY ... LIMIT` over the whole table — still executes
+`LogsScanExec`, but issues exactly one whole-object GET per relevant segment and
+ZERO suffix probes (#693 part 3). When the query carries no block-level
+predicate and no pending erasure, its window fully contains every relevant,
+above-threshold segment, and there are at least `target_partitions` such
+segments, `LogsScanExec` skips its plan phase entirely: no block can be pruned,
+so it assigns whole segments round-robin (one owner per segment) and reads each
+in a single `GetRange::Full`. That removes both probe classes the pre-#693-part-3
+path paid above the block-range threshold — the plan-phase footer probe and the
+per-open scan-side re-probe — which on the 8424-object ClickBench tenant (#680)
+were a combined ~24,700 probes on top of the 8,424 whole-object reads for one
+`SELECT`. When any of those conditions fails the unchanged plan-then-stripe path
+runs (its plan phase probes each segment once); a footer read there is carried
+to the per-partition subset opens so they skip re-probing (ADR-0107 amendment
+2026-08-26). At or below the block-range threshold the plan and scan reads
+already coalesce on one whole-object cache key, so the fast path is gated above
+it, where there is a probe to save.
+
 Staleness: the evaluator recognizes the Prometheus staleness marker (the
 exact NaN bit pattern `0x7ff0_0000_0000_0002`, compared via
 `f64::to_bits()`, never `is_nan()`). A selector whose newest in-window
