@@ -8,9 +8,15 @@
 /// Tokens of `text`: lowercase words split on any non-alphanumeric character.
 ///
 /// - split on `!char::is_alphanumeric` (Unicode-aware);
-/// - lowercase each token with `char::to_lowercase` (Unicode-aware);
+/// - lowercase each character with `char::to_lowercase` (Unicode-aware),
+///   dropping any resulting character that is not alphanumeric. Full case
+///   mapping can emit a combining mark (U+0130 `İ` lowercases to `i` +
+///   U+0307 COMBINING DOT ABOVE, a Mark); dropping it keeps every emitted
+///   character alphanumeric, and folds `İ` to `i` exactly as a query typed
+///   `istanbul` folds;
 /// - truncate each token to its longest character-boundary prefix of at most
-///   64 bytes;
+///   64 bytes, measured on the folded characters so a length-changing
+///   lowercase can neither exceed the cap nor split a codepoint;
 /// - drop empty tokens; keep duplicates (deduplication is the bloom's job).
 pub fn tokens(text: &str) -> Vec<Vec<u8>> {
     /// Byte cap on a single token (docs/log-segment-format.md constant).
@@ -38,8 +44,14 @@ pub fn tokens(text: &str) -> Vec<Vec<u8>> {
                 continue;
             }
             for lc in ch.to_lowercase() {
-                // Appending this lowercased char must keep the token within
-                // the 64-byte cap on a character boundary.
+                // Full case mapping can emit a non-alphanumeric character
+                // (U+0130 lowercases to 'i' + U+0307 COMBINING DOT ABOVE).
+                // Drop it so every emitted character stays alphanumeric.
+                if !lc.is_alphanumeric() {
+                    continue;
+                }
+                // Appending this folded char must keep the token within the
+                // 64-byte cap on a character boundary.
                 if cur.len() + lc.len_utf8() > TOKEN_MAX_BYTES {
                     truncated = true;
                     break;
@@ -102,6 +114,80 @@ mod tests {
     fn unicode_word_is_lowercased() {
         // A single uppercase multi-byte word lowercases and stays one token.
         assert_eq!(toks("STRASSE"), vec![b"strasse".to_vec()]);
+    }
+
+    #[test]
+    fn full_case_mapping_stays_alphanumeric() {
+        // U+0130 LATIN CAPITAL LETTER I WITH DOT ABOVE lowercases under the
+        // full Unicode case mapping to "i" + U+0307 COMBINING DOT ABOVE.
+        // U+0307 is a Mark, not alphanumeric: the fold drops it so the token
+        // is plain "i".
+        assert_eq!(toks("İ"), vec![b"i".to_vec()]);
+        for tok in toks("İ") {
+            let s = std::str::from_utf8(&tok).expect("valid utf-8");
+            assert!(s.chars().all(|c| c.is_alphanumeric()));
+        }
+    }
+
+    #[test]
+    fn dotted_i_folds_to_ascii_across_case() {
+        // "İstanbul", "ISTANBUL" and "istanbul" must all fold to the same
+        // single token, so a query for any casing hits a document written
+        // with any other.
+        let expected = vec![b"istanbul".to_vec()];
+        assert_eq!(toks("İstanbul"), expected);
+        assert_eq!(toks("ISTANBUL"), expected);
+        assert_eq!(toks("istanbul"), expected);
+    }
+
+    #[test]
+    fn combining_marks_after_letter_fold_to_letter() {
+        // Combining marks are not alphanumeric, so they act as separators:
+        // a letter followed only by marks yields just the letter.
+        assert_eq!(toks("a\u{0301}\u{0300}\u{0307}"), vec![b"a".to_vec()]);
+    }
+
+    #[test]
+    fn fold_expanding_near_cap_never_splits_a_codepoint() {
+        // Each 'İ' folds to a single ASCII 'i' (the combining mark is
+        // dropped), so 100 of them fill the 64-byte token exactly and the
+        // cap lands on a character boundary.
+        let dotted = "İ".repeat(100);
+        let out = tokens(&dotted);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].len() <= 64);
+        let s = std::str::from_utf8(&out[0])
+            .expect("cap must stay on a char boundary, never splitting a codepoint");
+        assert!(s.chars().all(|c| c.is_alphanumeric()));
+
+        // A word built from characters whose lowercase is two bytes wide
+        // ('Α' -> 'α', 2 bytes) reaches the byte cap on a whole character:
+        // 32 characters is 64 bytes, so the token is capped at 32 chars and
+        // never straddles a codepoint.
+        let greek = "Α".repeat(64);
+        let out = tokens(&greek);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].len() <= 64);
+        let s = std::str::from_utf8(&out[0])
+            .expect("cap must stay on a char boundary, never splitting a codepoint");
+        assert_eq!(s.chars().count(), 32);
+        assert!(s.chars().all(|c| c.is_alphanumeric()));
+    }
+
+    /// Symmetry: the write path (bloom insertion / POSTINGS) and the read
+    /// path (word/phrase match) must fold identically. They can only do so
+    /// because both call this one `tokens` function; this test pins that a
+    /// query term and the indexed body fold to the same token through the
+    /// same function, so the two sides cannot drift.
+    #[test]
+    fn write_and_read_paths_fold_through_one_function() {
+        // Simulates the ingest side (indexing a body) and the query side
+        // (folding a user's search word) for the same word in different
+        // casings.
+        let indexed = tokens("İstanbul was Constantinople");
+        let query = tokens("ISTANBUL");
+        assert_eq!(query, vec![b"istanbul".to_vec()]);
+        assert!(indexed.contains(&query[0]));
     }
 
     /// Acceptance test: pins the four normative rules from
