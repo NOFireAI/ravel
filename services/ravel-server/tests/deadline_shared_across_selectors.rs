@@ -3,33 +3,33 @@
 //! deadline to the whole request, not grant the full deadline afresh to each
 //! `match[]` selector.
 //!
-//! The store is wrapped so every listing costs a fixed delay. A `/series`
-//! request carrying N selectors resolves them one at a time, each drawing down
-//! the same request budget (`resolve_matched_series` in ravel-query computes
-//! one absolute `request_deadline` and hands each selector only the time still
-//! left). With N selectors' worth of listing far exceeding a short client
-//! `timeout`, the request trips the shared deadline and returns `504 timeout`
-//! after only a prefix of the selectors have resolved.
+//! A `/series` request carrying N selectors resolves them one at a time, each
+//! drawing down the same request budget (`resolve_matched_series` in
+//! ravel-query computes one absolute `request_deadline` and hands each
+//! selector only the time still left). The store is a `FaultStore` with a hold
+//! gate armed on the `t/<th>/<sig>/del/` LIST that the K-th selector's
+//! resolution issues (one per resolve, ADR-0064 decision 2). The K-th selector
+//! parks inside the store and the request cannot progress past it, so the
+//! shared deadline fires while it is still held: the request returns `504
+//! timeout` with exactly K - 1 selectors resolved, and the deadline the error
+//! reports is the budget that was left after those K - 1, not the configured
+//! one.
 //!
-//! Determinism (#706, #680, #731): the earlier version asserted `elapsed <
-//! 900 ms` (3x the 300 ms budget) to back the "one deadline, not N" claim.
-//! That is a wall-clock race against the scheduler: under host load the
-//! deadline still fires but the cancelled futures are not polled promptly, so
-//! the measured wall time overran 900 ms and the test failed (observed at
-//! 964 ms, twice, in the flight-sql lane). The change under gate cannot reach
-//! that assertion; it is a pure timing flake.
-//!
-//! The fix keeps the load-robust `504` discriminator and replaces the wall
-//! bound with a count. `Catalog::resolve` issues exactly one
-//! `t/<th>/<sig>/del/` LIST per snapshot resolution (ADR-0064 decision 2), so
-//! counting those LISTs counts the selectors that ran a full resolution. Under
-//! one shared budget the deadline cuts the request off after only a prefix of
-//! the N selectors resolve, so that count is strictly below N; a per-selector
-//! budget would resolve all N. Host load only makes fewer selectors fit the
-//! budget, never more, so `resolutions < N` is an upper bound that holds
-//! regardless of how loaded the box is -- the deterministic replacement for
-//! the old timing assertion. Mirrors the "observe the shared bound, don't race
-//! it" fix #717 applied to the query-engine deadline tests.
+//! Determinism (#757, #743, #731, #680): every earlier version of this test
+//! discriminated on wall-clock bands, and the two that survived failed in
+//! opposite directions on the same 16-core hosts, on branches that touch
+//! nothing on the metadata path. `elapsed < 900 ms` (3x the 300 ms budget)
+//! failed under load at 964 ms, because a fired deadline does not mean the
+//! cancelled futures are polled promptly. `resolutions < N` then failed on a
+//! quiet, fast host: once #730 cut a resolve from 25 LISTs to 9, all 12
+//! selectors fit inside the 300 ms budget, so nothing was cut off and the
+//! prefix the assertion described never formed. Both bands are gone. What
+//! stops the request now is an event the test holds open, not a race the test
+//! hopes to win: the held selector never finishes at any host speed, so the
+//! prefix is exactly K - 1 rather than "some number below N", and the only
+//! duration left in the file is a 30 s ceiling that distinguishes a hang from
+//! a failure. Mirrors the "observe the shared bound, don't race it" fix #717
+//! applied to the query-engine deadline tests.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -40,6 +40,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
@@ -50,25 +51,27 @@ use ravel_types::TenantId;
 
 const TOKEN: &str = "testtoken";
 
-/// Wraps an inner store and sleeps a fixed amount before every listing, so
-/// each snapshot resolution (one per `match[]` selector) costs measurable
-/// wall-clock time and N of them dwarf a short request budget. Reads/writes
-/// are delegated unchanged; only `list` is slowed, which is the operation the
-/// catalog snapshot resolver drives per selector (crates/ravel-catalog
-/// `resolve` -> `list_hour_bucket`).
+/// Wraps an inner store, counting and slowing the `t/<th>/<sig>/del/` LIST
+/// that `Catalog::resolve` issues exactly once per snapshot resolution
+/// (ADR-0064 decision 2). One `del/` LIST is therefore one selector's
+/// completed resolution: `resolutions` is the number of selectors that
+/// finished resolving, counted after the dwell and before the call reaches the
+/// backend, so a resolution cut off part way is not counted as one.
 ///
-/// `resolutions` counts the `del/` LISTs. `Catalog::resolve` issues exactly one
-/// `t/<th>/<sig>/del/` LIST per snapshot resolution (ADR-0064 decision 2), so
-/// this counter is the number of selectors that ran a full resolution before
-/// the request ended -- the deterministic signal the test asserts on.
-struct SlowListStore {
-    inner: Arc<MemoryStore>,
-    list_delay: Duration,
+/// `dwell` is what each resolved selector spends out of the shared request
+/// budget. It is not what stops the request (the hold gate is), so nothing
+/// here is a race: the request must survive `dwell` on each of the K - 1
+/// selectors before the held one, which it does with the budget over three
+/// times their total. Overshoot under load only takes more of the shared
+/// budget, which is the direction the assertions already allow for.
+struct CatalogResolveProbe {
+    inner: MemoryStore,
+    dwell: Duration,
     resolutions: Arc<AtomicUsize>,
 }
 
 #[async_trait]
-impl ObjectStoreBackend for SlowListStore {
+impl ObjectStoreBackend for CatalogResolveProbe {
     async fn put(
         &self,
         key: &str,
@@ -87,13 +90,10 @@ impl ObjectStoreBackend for SlowListStore {
     }
 
     async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
-        // One `del/` LIST marks one completed snapshot resolution (ADR-0064
-        // decision 2). Count before the delay so a resolution that reaches the
-        // del LIST is counted even if the deadline fires during the sleep.
         if prefix.contains("/del/") {
+            tokio::time::sleep(self.dwell).await;
             self.resolutions.fetch_add(1, Ordering::SeqCst);
         }
-        tokio::time::sleep(self.list_delay).await;
         self.inner.list(prefix, page).await
     }
 
@@ -175,71 +175,142 @@ async fn start_test_server(store: Arc<dyn ObjectStoreBackend>) -> Running {
     .expect("server starts")
 }
 
+/// The `Duration` the timeout envelope reports, parsed back out of
+/// `QueryError::DeadlineExceeded`'s message ("query exceeded its deadline of
+/// 2.199843211s", `Duration`'s own `Debug` rendering). This is the budget the
+/// engine was handed for the selector that tripped the deadline, and it is the
+/// only place the size of that budget is visible from outside the process.
+fn reported_deadline(body: &str) -> Duration {
+    let tail = body
+        .split("deadline of ")
+        .nth(1)
+        .unwrap_or_else(|| panic!("expected the deadline error message, got {body}"));
+    let split = tail
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or_else(|| panic!("expected a duration after \"deadline of \", got {tail}"));
+    let (value, unit) = tail.split_at(split);
+    let value: f64 = value
+        .parse()
+        .unwrap_or_else(|e| panic!("expected a numeric duration, got {value}: {e}"));
+    let seconds = if unit.starts_with("ns") {
+        value / 1e9
+    } else if unit.starts_with("\u{b5}s") {
+        value / 1e6
+    } else if unit.starts_with("ms") {
+        value / 1e3
+    } else if unit.starts_with('s') {
+        value
+    } else {
+        panic!("unrecognized duration unit in {tail}")
+    };
+    Duration::from_secs_f64(seconds)
+}
+
 /// A `/series` request carrying N `match[]` selectors shares one wall deadline.
-/// Each selector drives one snapshot resolution, which lists a handful of
-/// catalog buckets; slowing each list by `LIST_DELAY` makes N selectors' worth
-/// of listing far exceed the short client `timeout`. The request trips the
-/// shared deadline and returns `504 timeout`.
+/// The store holds the K-th selector's catalog `del/` LIST open, so the
+/// request is parked inside selector K when the shared deadline fires, and
+/// three assertions carry the claim, none of them a wall-clock band:
 ///
-/// Two assertions carry the claim, neither of them a wall-clock measurement:
-///
-/// * `504` is the timing-independent discriminator. N selectors need
-///   `>= ~N * PER_SELECTOR` of real listing, far above the budget, so the
-///   deadline fires regardless of host speed. A per-selector budget would let
-///   every selector resolve inside its own fresh budget and return `200`.
-/// * `resolutions < N` shows the budget is *shared*: the deadline cut the
-///   request off after only a prefix of the N selectors ran a full resolution
-///   (one `del/` LIST each, ADR-0064 decision 2). A per-selector budget would
-///   resolve all N (`resolutions == N`). Load only lowers this count, so the
-///   `< N` bound never flakes upward -- it replaces the old `elapsed < 3x`
-///   bound that did.
+/// * `504 timeout` arrives while the hold is still held. A request whose only
+///   in-flight work is parked forever can only end on a deadline, at any host
+///   speed.
+/// * Exactly `K - 1` selectors resolved. The selectors before the held one
+///   completed, the held one never reached the backend, and no selector after
+///   it started, because the loop cannot get past the held one. This is an
+///   exact count, not a bound: nothing about it moves when the host is fast,
+///   slow, or loaded.
+/// * The deadline the error reports is at most the budget left after the
+///   K - 1 dwells, so the selector that tripped it was handed the *remaining*
+///   budget. A per-selector budget reports the configured deadline instead,
+///   because it never subtracts what earlier selectors spent.
 #[tokio::test]
 async fn metadata_request_shares_one_wall_deadline_across_selectors() {
-    const N: usize = 12;
-    // One selector lists a handful of catalog buckets plus its `del/` LIST; at
-    // 25 ms each that is tens of ms of work, well below REQUEST_TIMEOUT so a
-    // single selector never trips on its own, while N of them dwarf the shared
-    // budget.
-    const LIST_DELAY: Duration = Duration::from_millis(25);
-    // Shared budget: a few selectors' worth, well under the N-selector total.
-    const REQUEST_TIMEOUT: Duration = Duration::from_millis(300);
+    const SELECTORS: usize = 12;
+    // Held selector (1-indexed): far enough in that a prefix exists before it,
+    // near enough that the dwells before it stay a small share of the budget.
+    const HELD_SELECTOR: usize = 3;
+    // What each resolved selector takes out of the shared budget.
+    const DWELL: Duration = Duration::from_millis(400);
+    // The whole request's budget, over three times the two dwells that precede
+    // the held selector.
+    const SHARED_BUDGET: Duration = Duration::from_secs(3);
+    // Not a bound on anything the test measures: a ceiling that turns a hang
+    // (a deadline that never fires, a response that never arrives) into a
+    // named failure instead of a stuck run.
+    const HANG_CEILING: Duration = Duration::from_secs(30);
 
     let resolutions = Arc::new(AtomicUsize::new(0));
-    let store = Arc::new(SlowListStore {
-        inner: Arc::new(MemoryStore::new()),
-        list_delay: LIST_DELAY,
-        resolutions: Arc::clone(&resolutions),
-    });
+    let store = Arc::new(FaultStore::new(
+        CatalogResolveProbe {
+            inner: MemoryStore::new(),
+            dwell: DWELL,
+            resolutions: Arc::clone(&resolutions),
+        },
+        FaultPlan::empty(),
+    ));
+    // Park the K-th `del/` LIST, and only that one: the selectors before it
+    // resolve normally, and the ones after it never issue theirs.
+    let gate = store.hold(
+        Op::List,
+        Some("/del/".to_string()),
+        Occurrence::Nth(HELD_SELECTOR as u64),
+    );
     let store_dyn: Arc<dyn ObjectStoreBackend> = store;
     let running = start_test_server(store_dyn).await;
     let base = format!("http://{}", running.http_addr);
     let client = reqwest::Client::new();
 
     let mut query: Vec<(String, String)> = Vec::new();
-    for i in 0..N {
+    for i in 0..SELECTORS {
         query.push(("match[]".to_string(), format!("series_{i}")));
     }
     query.push((
         "timeout".to_string(),
-        format!("{}", REQUEST_TIMEOUT.as_secs_f64()),
+        format!("{}", SHARED_BUDGET.as_secs_f64()),
     ));
 
-    let response = client
-        .get(format!("{base}/api/v1/series"))
-        .header("authorization", format!("Bearer {TOKEN}"))
-        .query(&query)
-        .send()
-        .await
-        .expect("series request completes");
-    let status = response.status();
-    let body = response.text().await.expect("series response body");
+    let mut request = tokio::spawn(async move {
+        let response = client
+            .get(format!("{base}/api/v1/series"))
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .query(&query)
+            .send()
+            .await
+            .expect("series request completes");
+        let status = response.status();
+        let body = response.text().await.expect("series response body");
+        (status, body)
+    });
 
-    // The whole request is bounded by one wall deadline: it deadline-fails
-    // (504 timeout) rather than succeeding after N independent budgets.
+    // The request reaches selector K and parks there. Racing the response
+    // against the hold rather than just awaiting the hold keeps a request that
+    // ended early (a rejected parameter, a deadline that fired before the
+    // prefix resolved) from showing up as a 30 s stall with no explanation.
+    let ended_early = tokio::time::timeout(HANG_CEILING, async {
+        tokio::select! {
+            () = gate.wait_until_held(1) => None,
+            finished = &mut request => Some(finished),
+        }
+    })
+    .await
+    .expect("selector K's catalog LIST must reach the store within the hang ceiling");
+    assert!(
+        ended_early.is_none(),
+        "the request ended before selector {HELD_SELECTOR} parked in the store, so nothing \
+         was holding it open when it finished: {ended_early:?}"
+    );
+
+    // Nothing releases the hold until after this returns, so whatever ends the
+    // request ends it while selector K is still parked mid-resolve.
+    let (status, body) = tokio::time::timeout(HANG_CEILING, &mut request)
+        .await
+        .expect("the shared deadline must end the request while selector K is held")
+        .expect("request task joins");
+
     assert_eq!(
         status, 504,
-        "request should trip the shared wall deadline (504), not grant each \
-         selector its own budget; got {status} with body {body}"
+        "a request parked in selector {HELD_SELECTOR} can only end on a deadline; \
+         got {status} with body {body}"
     );
     // ...and it is the typed deadline error, not some other 504. The envelope
     // tags the class `timeout` and the message names the deadline.
@@ -252,18 +323,67 @@ async fn metadata_request_shares_one_wall_deadline_across_selectors() {
         "expected the deadline error message, got {body}"
     );
 
-    // One shared budget, not N: the deadline cut the request off after only a
-    // prefix of the N selectors ran a full snapshot resolution. A per-selector
-    // budget would have resolved all N (resolutions == N). Host load can only
-    // lower this count (fewer selectors fit the budget), so the bound holds
-    // regardless of how loaded the box is.
-    let resolved = resolutions.load(Ordering::SeqCst);
+    // The held call is still held: the response was produced while selector
+    // K's resolution was in flight, not after it completed.
+    let held = gate.held_details();
+    assert_eq!(
+        held.len(),
+        1,
+        "selector {HELD_SELECTOR}'s catalog LIST must still be held when the request \
+         returns, but the store holds {held:?}"
+    );
     assert!(
-        resolved < N,
-        "the {N} selectors must share one wall budget: only a prefix of them \
-         should resolve before the shared deadline fires, but {resolved} of \
-         {N} resolved (a per-selector budget would resolve all {N})"
+        held[0].2.contains("/del/"),
+        "the held call must be the catalog `del/` LIST of selector {HELD_SELECTOR}, got {held:?}"
     );
 
+    // One shared budget, not N: the selectors before the held one resolved,
+    // the held one never reached the backend, and the loop never got to the
+    // ones after it. Exact, because the held selector cannot finish at any
+    // host speed.
+    let resolved = resolutions.load(Ordering::SeqCst);
+    assert_eq!(
+        resolved,
+        HELD_SELECTOR - 1,
+        "the {SELECTORS} selectors must share one wall budget: exactly the \
+         {} before the held one should resolve, but {resolved} did (a per-selector \
+         budget resolves the held one's successors too)",
+        HELD_SELECTOR - 1
+    );
+
+    // The budget the tripped selector was handed is what the earlier selectors
+    // left of the request's, so it is at most the configured budget minus
+    // their dwells. A deadline rebuilt per selector reports the configured
+    // budget in full.
+    let granted = reported_deadline(&body);
+    let spent_by_prefix = DWELL * (HELD_SELECTOR as u32 - 1);
+    let ceiling = SHARED_BUDGET - spent_by_prefix;
+    assert!(
+        granted <= ceiling,
+        "selector {HELD_SELECTOR} must be handed what is left of the request's \
+         {SHARED_BUDGET:?} after the {} selectors before it spent {spent_by_prefix:?}, \
+         so at most {ceiling:?}; the error reports {granted:?}, which is a budget \
+         granted afresh rather than shared",
+        HELD_SELECTOR - 1
+    );
+
+    // Releasing the held call drives no further resolution: the deadline
+    // already cancelled the parked resolve, and the request it belonged to is
+    // over, so no selector after the held one ever runs.
+    assert!(
+        gate.release(held[0].0),
+        "the held call must still be in the store's held set when the request returns"
+    );
     running.shutdown().await.expect("graceful shutdown");
+    assert_eq!(
+        gate.held_count(),
+        0,
+        "the released call must leave the held set"
+    );
+    assert_eq!(
+        resolutions.load(Ordering::SeqCst),
+        HELD_SELECTOR - 1,
+        "releasing the held call must not resolve another selector: the request \
+         ended on the shared deadline and does not resume"
+    );
 }
