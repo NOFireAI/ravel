@@ -1423,8 +1423,16 @@ cap a plan with `n` partitions still opens each sufficiently-blocky segment `n`
 times, and the planning prune that counts surviving blocks adds one more read
 per segment. `ravel-bench`'s `logs_scan_scaling` report measures the cached and
 un-cached request counts side by side; its figures describe that fixture (a
-`MemoryStore`, a cache sized to hold the whole dataset), not striping in
-general. `crates/ravel-query/tests/log_block_range.rs` pins the above-threshold
+`MemoryStore`, and on the cached rows a cache sized to hold the whole dataset),
+not striping in general. Its un-cached, over-threshold rows are what put a
+number on that residual multiplier: they report reads per segment and bytes
+fetched over dataset bytes for a full-window scan of objects past the
+block-range threshold with no cache to absorb the repeats, and on that fixture
+the bytes figure comes to one plan read plus one scan read per partition
+(`1 + min(partitions, blocks_per_segment)`). The cached rows on their own were
+the previous, incomplete picture: coalescing holds them near 1.0 whatever the
+partition count, so nothing in the report showed what an un-cached deployment
+pays. `crates/ravel-query/tests/log_block_range.rs` pins the above-threshold
 cached case exactly: on its 906,791-byte fixture, 2 partitions and 8 partitions
 striping one segment both cost 6 store GETs (one probe, four directory
 sections, one coalesced candidate run), and 8 concurrent cold partitions cost
