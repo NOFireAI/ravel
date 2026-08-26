@@ -1,20 +1,28 @@
 //! `LogsScanExec`: the leaf of the `logs` pipeline, the log-signal sibling of
 //! [`crate::scan::RsegScanExec`] (ADR-0033).
 //!
-//! Partitions the snapshot's segments' *blocks* round-robin across
-//! `target_partitions` partitions (intra-segment scan partitioning, ADR-0102).
-//! Every `(segment, surviving-block)` unit across all segments is flattened
-//! into one ordered list (segment order, then block order) and unit `i` is
-//! assigned to partition `i % n`, where `n = target_partitions.max(1).
-//! min(total_block_count.max(1))`. This lets a query touching fewer segments
-//! than `target_partitions` still fan out to `target_partitions` partitions:
-//! the old segment-granular rule (`min(target_partitions, segment_count)`)
-//! pinned such a query to at most `segment_count` partitions.
+//! Partitions the snapshot's work across `target_partitions` partitions in one
+//! of two modes, chosen once at construction from whether the fetcher carries
+//! ADR-0046's read cache ([`LogSegmentFetcher::has_cache`], ADR-0102 amended by
+//! #693):
 //!
-//! That fan-out is gated on the fetcher carrying ADR-0046's read cache
-//! ([`LogSegmentFetcher::has_cache`]); an un-cached fetcher keeps the old
-//! `min(target_partitions, segment_count)` bound. See
-//! [`LogsScanExec::new`] and the request-count paragraph below for why.
+//! - **Cache-wired: intra-segment block striping.** Every `(segment,
+//!   surviving-block)` unit across all segments is flattened into one ordered
+//!   list (segment order, then block order) and unit `i` is assigned to
+//!   partition `i % n`, where `n = target_partitions.max(1).
+//!   min(total_block_count.max(1))`. This lets a query touching fewer segments
+//!   than `target_partitions` still fan out to `target_partitions` partitions:
+//!   the old segment-granular rule (`min(target_partitions, segment_count)`)
+//!   pinned such a query to at most `segment_count` partitions.
+//! - **Un-cached: segment-granular.** Each segment is assigned whole to one
+//!   partition (relevant segment `j` in snapshot order to partition `j % n`),
+//!   so every segment is opened by exactly one partition. The partition count is
+//!   capped at the segment count.
+//!
+//! The block-striping fan-out is gated on the cache because without single-
+//! flight to coalesce re-opens it would multiply object-store reads by the
+//! partition count. See [`LogsScanExec::new`], [`owned_work`], and the
+//! request-count paragraph below for why.
 //!
 //! The per-segment surviving-block counts the assignment needs are determined
 //! once, before draining, by [`LogSegmentFetcher::plan_segment`] (a prune with
@@ -37,16 +45,18 @@
 //! skip-index pruning kept. What those reads cost depends on the cache, and so
 //! does how many partitions are planned:
 //!
-//! - **Un-cached fetcher.** The partition count is capped at the segment count,
-//!   so the request count stops responding to `target_partitions` once that cap
-//!   binds. It is the pre-ADR-0102 whole-segment count only when the plan
-//!   collapses to a single partition; with `n > 1` partitions, every segment
-//!   holding at least `n` surviving blocks is opened by all `n` of them, so the
-//!   scan costs up to `n` read sequences per segment, and planning's prune
-//!   (`compute_plan_counts`) adds one more per relevant segment. The cap
-//!   bounds that multiplier by the segment count instead of letting
-//!   `target_partitions` set it; it does not remove it. `ravel-bench`'s
-//!   `logs_scan_scaling` report measures both.
+//! - **Un-cached fetcher.** The assignment is segment-granular (#693): each
+//!   segment is assigned whole to one partition ([`owned_work`]), so a segment
+//!   is opened by exactly one partition and issues exactly one scan read
+//!   sequence, whatever `target_partitions` is. The request count is one plan
+//!   read per relevant segment (`compute_plan_counts`) plus one scan read per
+//!   relevant segment, and the partition count is capped at the segment count
+//!   (a query touching fewer segments than `target_partitions` cannot fan out
+//!   past them, since a partition with no segment does no work). This is the
+//!   pre-ADR-0102 whole-segment request count restored: without the cache there
+//!   is no single-flight to coalesce re-opens, so striping a segment across
+//!   partitions would multiply object-store reads by the partition count for no
+//!   benefit. `ravel-bench`'s `logs_scan_scaling` report measures both.
 //! - **Cache-wired fetcher.** The partition count is `target_partitions`, so
 //!   several partitions can stripe one segment's blocks. Every GET of either
 //!   shape is keyed by the extent it fetched and routed through the cache's
@@ -450,6 +460,13 @@ pub struct LogsScanExec {
     /// applies. The remaining per-block clause (no `attrs_raw` overflow page) is
     /// checked as each block is decoded; see [`columnar_static_eligible`].
     columnar_eligible: bool,
+    /// The assignment mode, decided once at construction from
+    /// [`LogSegmentFetcher::has_cache`] (ADR-0102, amended by #693). `true` (a
+    /// cache is wired) stripes a segment's surviving blocks across partitions;
+    /// `false` assigns each segment whole to one partition, so an un-cached scan
+    /// opens each segment exactly once. Threaded into the stream and
+    /// [`owned_work`]; the same predicate gates `declared_partitions` above.
+    stripe_blocks: bool,
     properties: Arc<PlanProperties>,
     /// This query's accounting handle (ADR-0044), threaded into every
     /// per-partition fetch so log fetches are recorded like every other
@@ -601,7 +618,12 @@ impl LogsScanExec {
         // object-store GETs for no reason. So an un-cached fetcher falls back to
         // the pre-ADR-0102 bound, `min(target_partitions, segment_count)`, and
         // never plans a partition whose extra GETs nothing absorbs.
-        let declared_partitions = if fetcher.has_cache() {
+        // `stripe_blocks` decides both the partition count and the per-unit
+        // assignment, and is computed once from the same `has_cache` predicate:
+        // with the cache a segment's blocks stripe across partitions, without it
+        // each segment is assigned whole to one partition (see `owned_work`).
+        let stripe_blocks = fetcher.has_cache();
+        let declared_partitions = if stripe_blocks {
             target_partitions.max(1)
         } else {
             target_partitions.max(1).min(segments.len().max(1))
@@ -641,6 +663,7 @@ impl LogsScanExec {
             declared,
             schema,
             columnar_eligible,
+            stripe_blocks,
             properties,
             accounting,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -841,6 +864,7 @@ impl ExecutionPlan for LogsScanExec {
             blocks: BlockMetrics::new(&self.metrics, partition),
             partition,
             target_partitions: self.target_partitions,
+            stripe_blocks: self.stripe_blocks,
             segments: Arc::clone(&self.segments),
             work: VecDeque::new(),
             reservation,
@@ -951,9 +975,21 @@ struct OwnedSeg {
     indices: Vec<usize>,
 }
 
-/// This partition's share of the flattened block assignment (ADR-0102): unit
-/// `i` in the segment-then-block order over all surviving blocks goes to
-/// partition `i % n`, with `n = target_partitions.max(1).min(total.max(1))`.
+/// This partition's share of the block assignment, in one of two modes
+/// (ADR-0102, amended by #693), both with `n = target_partitions.max(1).
+/// min(total.max(1))`.
+///
+/// - **`stripe_blocks` true** (a read cache is wired): the flattened block
+///   assignment. Unit `i` in the segment-then-block order over all surviving
+///   blocks goes to partition `i % n`, so a segment's blocks stripe across
+///   partitions and single-flight coalesces the re-opens.
+/// - **`stripe_blocks` false** (un-cached): the segment-granular assignment.
+///   Counting only segments with a surviving block, in snapshot order, segment
+///   `j` goes to partition `j % n` and that partition drains all of the
+///   segment's surviving block indices (`0..survivors`). Each segment is opened
+///   by exactly one partition, so with nothing to coalesce re-opens the scan
+///   still costs one read per segment rather than one per partition per segment.
+///
 /// Returns, per owned segment, the surviving-block indices this partition
 /// drains, in ascending order.
 fn owned_work(
@@ -961,23 +997,41 @@ fn owned_work(
     segments: &[SegmentRef],
     partition: usize,
     n: usize,
+    stripe_blocks: bool,
 ) -> VecDeque<OwnedSeg> {
     let mut work = VecDeque::new();
-    let mut global = 0usize;
-    for (seg_idx, plan) in counts.segs.iter().enumerate() {
-        let Some(plan) = plan else { continue };
-        let mut indices = Vec::new();
-        for local in 0..plan.survivors {
-            if (global + local) % n == partition {
-                indices.push(local);
+    if stripe_blocks {
+        let mut global = 0usize;
+        for (seg_idx, plan) in counts.segs.iter().enumerate() {
+            let Some(plan) = plan else { continue };
+            let mut indices = Vec::new();
+            for local in 0..plan.survivors {
+                if (global + local) % n == partition {
+                    indices.push(local);
+                }
+            }
+            global += plan.survivors;
+            if !indices.is_empty() {
+                work.push_back(OwnedSeg {
+                    seg: segments[seg_idx].clone(),
+                    indices,
+                });
             }
         }
-        global += plan.survivors;
-        if !indices.is_empty() {
-            work.push_back(OwnedSeg {
-                seg: segments[seg_idx].clone(),
-                indices,
-            });
+    } else {
+        let mut seg_ordinal = 0usize;
+        for (seg_idx, plan) in counts.segs.iter().enumerate() {
+            let Some(plan) = plan else { continue };
+            if plan.survivors == 0 {
+                continue;
+            }
+            if seg_ordinal % n == partition {
+                work.push_back(OwnedSeg {
+                    seg: segments[seg_idx].clone(),
+                    indices: (0..plan.survivors).collect(),
+                });
+            }
+            seg_ordinal += 1;
         }
     }
     work
@@ -1109,6 +1163,9 @@ struct LogScanStream {
     /// `(segment, block-index-list)` units this partition owns (ADR-0102).
     partition: usize,
     target_partitions: usize,
+    /// The assignment mode (ADR-0102, amended by #693): block striping when a
+    /// cache is wired, segment-granular otherwise. Passed to [`owned_work`].
+    stripe_blocks: bool,
     /// Every segment in the snapshot, snapshot order, shared with the exec. The
     /// owned-work computation indexes this by segment position.
     segments: Arc<Vec<SegmentRef>>,
@@ -1307,7 +1364,13 @@ impl Stream for LogScanStream {
                                 this.blocks.record_segment_totals(&plan.stats);
                             }
                         }
-                        this.work = owned_work(&counts, &this.segments, this.partition, n);
+                        this.work = owned_work(
+                            &counts,
+                            &this.segments,
+                            this.partition,
+                            n,
+                            this.stripe_blocks,
+                        );
                         this.state = LogScanState::NextSegment;
                     }
                     Poll::Ready(Err(e)) => return this.fail(e),
