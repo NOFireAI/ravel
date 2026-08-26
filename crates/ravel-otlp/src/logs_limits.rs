@@ -153,6 +153,18 @@ pub enum LogRejection {
     #[error("attribute {key} is a string-table reference (strindex) with no value of its own")]
     UnsupportedAttributeValue { key: String },
 
+    /// An array or kvlist attribute value nests deeper than
+    /// [`crate::logs_normalize::MAX_ATTRIBUTE_NESTING_DEPTH`] levels. Rejected
+    /// rather than converted so the recursive
+    /// [`crate::logs_normalize`] converter cannot be driven past a bounded
+    /// depth by a hostile or malformed payload, independent of the decoder's
+    /// own recursion limit. Dropped as a single attribute when it sits on a
+    /// record, like [`LogRejection::MissingAttributeValue`]; a resource or
+    /// scope attribute that trips it rejects that group instead, the same as
+    /// any other conversion failure there.
+    #[error("attribute {key} nests more than {max} levels deep")]
+    AttributeTooDeeplyNested { key: String, max: usize },
+
     /// `reason` applied identically to `count` log records that share one
     /// resource or scope (a resource or scope whose attribute set exceeded
     /// its limit, so nothing under it can be given a stream identity).
@@ -284,6 +296,14 @@ mod tests {
         );
         assert_eq!(
             LogRejection::UnsupportedAttributeValue { key: "k".into() }.rejected_count(),
+            1
+        );
+        assert_eq!(
+            LogRejection::AttributeTooDeeplyNested {
+                key: "k".into(),
+                max: 100,
+            }
+            .rejected_count(),
             1
         );
         assert_eq!(
