@@ -297,7 +297,7 @@ read 2 columns of 32 blocks:            read 2 columns of 32 blocks:
 ## Amendment (2026-08-26, as implemented)
 
 The writer, PAGE_DIR codec, and dual reader landed as decisions 1-4 describe.
-Three points the decision text under-specified were resolved during
+Four points the decision text under-specified were resolved during
 implementation; this section records them against the code that shipped, and
 `docs/log-segment-format.md` is the normative statement of each. It amends, it
 does not supersede.
@@ -329,6 +329,22 @@ does not supersede.
    which overlaps its neighbours' spans and is a superset of the block's actual
    bytes. Nothing locates a version-4 page through them; PAGE_DIR does that.
    They remain exact under version 3.
+
+4. **The compaction merge fetches a row group and decodes a block.** Because a
+   version-4 block is no longer a contiguous range (point 3), the compactor's
+   per-input cursor takes one ranged GET per row group per input: the group is
+   the smallest contiguous range that holds any one of its blocks, and a merge
+   reads every column anyway. It then keeps only those raw, still compressed
+   group bytes and decodes the group's blocks one at a time out of them
+   (`RlogRangeReader::decode_block_in_group`), releasing each decoded block
+   before the next. Its transient is therefore one decoded block plus one raw
+   row group per input, not one decoded row group; at the default
+   `group_target_blocks = 32` the difference is 32x on the decoded term, and a
+   small L0 input whose whole stream is a single row group would otherwise put
+   the entire input in the decoded term. That is what the issue #711 memory
+   tests pin, and since issue #748 they are written with default-sized row
+   groups so they pin it at the setting production runs with. Version 3 is
+   unaffected: its group is one block, and it is the same code path.
 
 ### Interim ravel-query reader (decision 5 not yet landed)
 

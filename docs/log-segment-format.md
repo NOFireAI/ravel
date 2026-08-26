@@ -995,6 +995,17 @@ L0 write, the compactor performs them by decoding each input back to
 records and feeding the merged records through the same writer via
 `finish_compacted`; the L0 and L1 encoders are one implementation.
 
+No input is decoded whole. The merge is a k-way streaming merge with one
+cursor per input over the stream it is merging, and its read-side working
+set is one row group's stored bytes plus one decoded block per input: the
+row group is what one ranged GET brings (under version 4 a block's pages
+are spread across the group's column chunks, so no smaller contiguous
+range holds a whole block), and the group's blocks are decoded one at a
+time out of those bytes, each released before the next. The one term that
+scales with the data is the in-progress part's own buffer, bounded by the
+part size cap, because a part's content-addressed key does not exist until
+the whole part is encoded.
+
 ## Tokenizer
 
 `tokens(text)` yields the word tokens used as bloom keys and as the unit

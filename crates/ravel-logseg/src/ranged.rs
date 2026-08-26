@@ -85,10 +85,12 @@ impl StreamBlockSpan {
 /// Under version 4 a block is not a contiguous byte range: its pages live in
 /// its row group's column chunks (ADR-0699 decision 1). A loc then names the
 /// whole row group -- one contiguous range, because a merge reads every column
-/// -- and covers every candidate block inside it, so the unit a memory-bounded
-/// merge holds is one row group rather than one block. That is the read-side
-/// mirror of the writer's stated one-row-group working set; `group_target_blocks`
-/// bounds both.
+/// -- and covers every candidate block inside it, so the raw bytes a
+/// memory-bounded merge holds are one row group rather than one block. That is
+/// the read-side mirror of the writer's stated one-row-group working set;
+/// `group_target_blocks` bounds both. The *decoded* residency stays one block:
+/// the caller decodes the group's blocks one at a time out of those raw bytes
+/// with [`RlogRangeReader::decode_block_in_group`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StreamBlockLoc {
     /// The stream's dense ref in this object (the decode filter for the block).
@@ -446,23 +448,72 @@ impl RlogRangeReader {
     /// [`crate::reader::rebuild_record`] path, so a record decoded one block at
     /// a time is byte-for-byte the record a whole-span or whole-object decode
     /// would produce.
+    ///
+    /// Under version 4 a loc names a whole row group, so this returns every
+    /// candidate block of that group at once. A caller that wants the decoded
+    /// residency of one block rather than one group decodes the group's blocks
+    /// individually with [`Self::decode_block_in_group`].
     pub fn decode_block(
         &self,
         loc: &StreamBlockLoc,
         block_bytes: &[u8],
     ) -> Result<Vec<LogRecord>, LogSegError> {
-        if block_bytes.len() as u64 != loc.byte_len() {
-            return Err(LogSegError::Corrupted(
-                "block bytes length != block range".into(),
-            ));
-        }
-        let plans = column_plans(&self.field_dir);
+        let plans = self.check_loc_bytes(loc, block_bytes)?;
         let mut out = Vec::new();
         for &b in &loc.blocks {
             let decoded = self.decode_one_block(b, loc.start, block_bytes, &plans)?;
             self.push_stream_rows(&decoded, loc.stream_ref, &mut out)?;
         }
         Ok(out)
+    }
+
+    /// Decode exactly one of `loc`'s blocks out of `loc`'s fetched bytes.
+    ///
+    /// `block` is a level-0 block index and must be one of
+    /// [`StreamBlockLoc::block_indices`]; `group_bytes` must be the object's
+    /// `[loc.start, loc.end)` range, the same buffer [`Self::decode_block`]
+    /// takes. Under version 3 a loc holds a single block and this is
+    /// [`Self::decode_block`] with the index spelled out. Under version 4 a loc
+    /// holds a whole row group, and this is what lets a caller keep the group's
+    /// raw bytes resident (they are the smallest contiguous range that holds any
+    /// one of its blocks) while decoding one block at a time and releasing each
+    /// before the next: the decoded residency is then one block, not one group.
+    ///
+    /// Rows are filtered and rebuilt exactly as [`Self::decode_block`] does, so
+    /// decoding a loc's blocks one at a time and concatenating the results in
+    /// `block_indices` order yields byte-for-byte what [`Self::decode_block`]
+    /// returns for the whole loc.
+    pub fn decode_block_in_group(
+        &self,
+        loc: &StreamBlockLoc,
+        block: usize,
+        group_bytes: &[u8],
+    ) -> Result<Vec<LogRecord>, LogSegError> {
+        let plans = self.check_loc_bytes(loc, group_bytes)?;
+        if !loc.blocks.contains(&block) {
+            return Err(LogSegError::Corrupted(
+                "block index is not in this loc".into(),
+            ));
+        }
+        let decoded = self.decode_one_block(block, loc.start, group_bytes, &plans)?;
+        let mut out = Vec::new();
+        self.push_stream_rows(&decoded, loc.stream_ref, &mut out)?;
+        Ok(out)
+    }
+
+    /// Check that `bytes` is exactly `loc`'s fetched range and return the column
+    /// plans a decode of it needs.
+    fn check_loc_bytes(
+        &self,
+        loc: &StreamBlockLoc,
+        bytes: &[u8],
+    ) -> Result<Vec<crate::block::ColumnPlan>, LogSegError> {
+        if bytes.len() as u64 != loc.byte_len() {
+            return Err(LogSegError::Corrupted(
+                "block bytes length != block range".into(),
+            ));
+        }
+        Ok(column_plans(&self.field_dir))
     }
 
     /// Appends the rows of `decoded` that belong to `stream_ref`, rebuilt into
@@ -509,4 +560,252 @@ fn group_extent(group: &crate::page_dir::GroupEntry) -> Result<(u64, u64), LogSe
         return Err(LogSegError::Corrupted("row group has no chunks".into()));
     }
     Ok((start, end - start))
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::footer::open;
+    use crate::reader::read_section;
+    use crate::record::stream_attrs_bytes;
+    use crate::writer::{ObjectIdentity, RlogConfig, RlogWriter};
+    use ravel_types::logstream::AttrValue;
+
+    /// 4 records to a block, 2 blocks to a row group: 2 streams x 40 records is
+    /// 20 blocks over 10 row groups, so every stream's blocks span several
+    /// groups and a group holds more than one block.
+    const BLOCK_RECORDS: usize = 4;
+    const GROUP_BLOCKS: usize = 2;
+    const PER_STREAM: i64 = 40;
+
+    fn sid(n: u8) -> LogStreamId {
+        let mut a = [0u8; 16];
+        a[0] = n;
+        LogStreamId(a)
+    }
+
+    fn rec(stream: u8, i: i64) -> LogRecord {
+        LogRecord {
+            stream_id: sid(stream),
+            stream_attrs: stream_attrs_bytes(
+                &[(
+                    "service.name".to_string(),
+                    AttrValue::Str(format!("s{stream}")),
+                )],
+                "scope",
+                "1",
+                &[],
+            ),
+            ts_ns: i,
+            observed_ts_ns: i + 1,
+            severity_num: (i % 24) as u8,
+            severity_text: if i % 2 == 0 { "INFO" } else { "WARN" }.to_string(),
+            body: format!("stream {stream} record {i}"),
+            trace_id: Some([(i % 251) as u8; 16]),
+            span_id: Some([(i % 251) as u8; 8]),
+            flags: (i as u32) & 7,
+            attrs: vec![
+                ("k".to_string(), AttrValue::I64(i % 11)),
+                ("t".to_string(), AttrValue::Str(format!("v{}", i % 5))),
+            ],
+        }
+    }
+
+    fn corpus() -> Vec<LogRecord> {
+        let mut out = Vec::new();
+        for s in 0..2u8 {
+            for i in 0..PER_STREAM {
+                out.push(rec(s, i));
+            }
+        }
+        out
+    }
+
+    fn write_object(v4: bool) -> Vec<u8> {
+        let cfg = RlogConfig {
+            block_target_records: BLOCK_RECORDS,
+            group_target_blocks: GROUP_BLOCKS,
+            ..RlogConfig::default()
+        };
+        let identity = ObjectIdentity {
+            tenant_hash: [3u8; 16],
+            shard: 0,
+            writer_id: [4u8; 16],
+            writer_epoch: 1,
+            writer_seq: 2,
+        };
+        let mut w = RlogWriter::new(cfg, identity);
+        for r in corpus() {
+            w.push(r).expect("push");
+        }
+        if v4 {
+            w.finish().expect("finish v4")
+        } else {
+            w.finish_v3_for_tests().expect("finish v3")
+        }
+    }
+
+    fn reader_of(object: &[u8]) -> RlogRangeReader {
+        let cfg = RlogConfig::default();
+        let ftr = open(object).expect("open footer");
+        let section = |k: u32| {
+            read_section(object, ftr.section(k).expect("section present"), &cfg).expect("section")
+        };
+        let page_dir = ftr
+            .section(kind::PAGE_DIR)
+            .map(|d| read_section(object, d, &cfg).expect("PAGE_DIR"));
+        RlogRangeReader::from_sections_with_page_dir(
+            &ftr,
+            &section(kind::STREAM_DIR),
+            &section(kind::FIELD_DIR),
+            &section(kind::SKIP_IDX),
+            page_dir.as_deref(),
+        )
+        .expect("range reader")
+    }
+
+    fn slice(object: &[u8], start: u64, end: u64) -> Vec<u8> {
+        object[start as usize..end as usize].to_vec()
+    }
+
+    /// Decoding a version-4 object one block at a time out of its row group's
+    /// bytes yields exactly the records `decode_stream` yields for the whole
+    /// stream: same count, same values, same order. This is the property the
+    /// compactor's per-block decode transient rests on.
+    #[test]
+    fn decode_block_in_group_matches_decode_stream_block_by_block() {
+        let object = write_object(true);
+        let reader = reader_of(&object);
+        let stream = sid(1);
+
+        let locs = reader
+            .stream_blocks(&stream)
+            .expect("stream_blocks")
+            .expect("stream present");
+        // The fixture must really exercise multi-block groups, or decoding one
+        // block at a time would be indistinguishable from decoding the loc.
+        assert!(
+            locs.len() > 1,
+            "the stream must span several row groups, got {}",
+            locs.len()
+        );
+        assert!(
+            locs.iter().any(|l| l.block_indices().len() > 1),
+            "at least one row group must hold more than one of the stream's blocks"
+        );
+
+        let mut per_block = Vec::new();
+        for loc in &locs {
+            let bytes = slice(&object, loc.start(), loc.end());
+            for &b in loc.block_indices() {
+                let recs = reader
+                    .decode_block_in_group(loc, b, &bytes)
+                    .expect("decode one block");
+                // One block holds at most the block target, so a single call
+                // never materializes a whole group's records.
+                assert!(
+                    recs.len() <= BLOCK_RECORDS,
+                    "block {b} decoded {} records, over the {BLOCK_RECORDS} block target",
+                    recs.len()
+                );
+                per_block.extend(recs);
+            }
+        }
+
+        let span = reader
+            .stream_block_span(&stream)
+            .expect("span")
+            .expect("stream present");
+        let whole = reader
+            .decode_stream(&span, &slice(&object, span.start(), span.end()))
+            .expect("decode_stream");
+
+        let expected: Vec<LogRecord> = (0..PER_STREAM).map(|i| rec(1, i)).collect();
+        assert_eq!(per_block.len() as i64, PER_STREAM, "exact record count");
+        assert_eq!(whole.len() as i64, PER_STREAM, "exact record count");
+        assert_eq!(per_block, whole, "block-at-a-time == whole-stream decode");
+        assert_eq!(per_block, expected, "and both equal the written records");
+    }
+
+    /// The same holds under version 3, where a loc is one block: the entry point
+    /// is the shared path, not a version-4 fork.
+    #[test]
+    fn decode_block_in_group_matches_decode_stream_under_version_3() {
+        let object = write_object(false);
+        let reader = reader_of(&object);
+        let stream = sid(0);
+
+        let locs = reader
+            .stream_blocks(&stream)
+            .expect("stream_blocks")
+            .expect("stream present");
+        assert!(
+            locs.iter().all(|l| l.block_indices().len() == 1),
+            "a version-3 loc is exactly one block"
+        );
+        let mut per_block = Vec::new();
+        for loc in &locs {
+            let bytes = slice(&object, loc.start(), loc.end());
+            for &b in loc.block_indices() {
+                per_block.extend(
+                    reader
+                        .decode_block_in_group(loc, b, &bytes)
+                        .expect("decode one block"),
+                );
+            }
+        }
+        let expected: Vec<LogRecord> = (0..PER_STREAM).map(|i| rec(0, i)).collect();
+        assert_eq!(per_block, expected);
+    }
+
+    /// Corrupt input is a typed error, never a panic or a wrong record: a
+    /// flipped byte inside the fetched row group fails a checksum, a block index
+    /// from another group is refused, and a short buffer is refused.
+    #[test]
+    fn decode_block_in_group_rejects_corrupt_input() {
+        let object = write_object(true);
+        let reader = reader_of(&object);
+        let stream = sid(1);
+        let locs = reader
+            .stream_blocks(&stream)
+            .expect("stream_blocks")
+            .expect("stream present");
+        let loc = &locs[0];
+        let block = loc.block_indices()[0];
+        let bytes = slice(&object, loc.start(), loc.end());
+
+        let mut flipped = bytes.clone();
+        flipped[0] ^= 0xff;
+        let err = reader
+            .decode_block_in_group(loc, block, &flipped)
+            .expect_err("a flipped page byte must not decode");
+        assert!(
+            matches!(err, LogSegError::Corrupted(_)),
+            "expected Corrupted, got {err:?}"
+        );
+
+        // A block index that belongs to a different row group.
+        let other = locs
+            .iter()
+            .flat_map(|l| l.block_indices())
+            .find(|b| !loc.block_indices().contains(b))
+            .copied()
+            .expect("another group's block");
+        let err = reader
+            .decode_block_in_group(loc, other, &bytes)
+            .expect_err("a block outside the loc must be refused");
+        assert!(
+            matches!(err, LogSegError::Corrupted(_)),
+            "expected Corrupted, got {err:?}"
+        );
+
+        let err = reader
+            .decode_block_in_group(loc, block, &bytes[..bytes.len() - 1])
+            .expect_err("a short buffer must be refused");
+        assert!(
+            matches!(err, LogSegError::Corrupted(_)),
+            "expected Corrupted, got {err:?}"
+        );
+    }
 }
