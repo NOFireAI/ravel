@@ -2,9 +2,9 @@
 //! spans (RSPAN) signals (ADR-0064 decision 3).
 //! [`build_rewrite`] is the metrics (RSEG) driver; [`build_rewrite_logs`] and
 //! [`build_rewrite_spans`] are its logs/spans siblings, working from whole
-//! object keys rather than RSEG's per-run catalogs. Logs stream those objects
-//! block by block through the compactor's own merge ([`build_rewrite_logs`]);
-//! spans still decode each object whole. [`erasure_rewrite_bucket`] dispatches
+//! object keys rather than RSEG's per-run catalogs. Logs and spans stream those
+//! objects block by block through the compactor's own merge
+//! ([`build_rewrite_logs`], [`build_rewrite_spans`]). [`erasure_rewrite_bucket`] dispatches
 //! to whichever of the three applies by `bucket.signal` and, on a successful
 //! publish, calls [`crate::scan::MaintainMemo::invalidate`] for the rewritten
 //! bucket's hour so the interior zone re-verifies immediately instead of
@@ -49,10 +49,11 @@
 //! request-hot path); a follow-up can adopt `build.rs`'s batching machinery
 //! without changing this module's public shape.
 //!
-//! That scope reduction no longer covers logs. [`build_rewrite_logs`] runs the
-//! RLOG compactor's own streaming merge and splits its survivors into
-//! `max_l1_part_bytes`-bounded parts (issue #725); metrics and spans still
-//! have the whole-object, single-part shape described above.
+//! That scope reduction no longer covers logs or spans. [`build_rewrite_logs`]
+//! (issue #725) and [`build_rewrite_spans`] (issue #742) run their signal's own
+//! streaming compaction merge and split survivors into
+//! `max_l1_part_bytes`-bounded parts; only metrics still has the whole-object,
+//! single-part shape described above.
 //!
 //! ## Exemplars are dropped, not carried forward (open gap)
 //!
@@ -89,7 +90,6 @@ use ravel_proto::commit::v1::{
     CompactionInputIdentity, CompactionPart, CompactionRecord, ErasurePredicateMatcher,
     ErasureRequest, RewriteDrop, RewriteRecord,
 };
-use ravel_rspan::{RspanConfig, RspanReader, RspanWriter, SpanQuery};
 use ravel_segment::{
     CompactionMetaV4, IngestBounds, ReaderLimits, RunEntry, RunInputV4, RunValuePageV4,
     SegmentIdentity, SegmentWriter, SeriesInputV4, SeriesValues, ValueKind,
@@ -1288,17 +1288,45 @@ fn first_dropping_span_request(
 }
 
 /// Decode-filter-reencode one SPANS bucket's live record set against every
-/// applicable request's matcher -- the SPANS sibling of [`build_rewrite_logs`],
-/// still under the module doc's whole-object-GET scope reduction (which logs
-/// left behind in issue #725): every object named by `object_keys` is fetched
-/// whole and decoded with [`RspanReader::scan`] under an unbounded
-/// [`SpanQuery::ts_range`], and every survivor is pushed into one uncapped
-/// [`RspanWriter`]. A span's whole [`ravel_rspan::SpanRecord`]
-/// (including any links/events, which per that type's own field-shape and doc
-/// comment live only as opaque blob entries inside `attrs`, never as separate
-/// columns) is decoded, tested, and either pushed to the output writer intact
-/// or dropped intact -- there is no per-field split that could leave a partial
-/// span behind.
+/// applicable request's matcher, mirroring [`build_rewrite_logs`]'s batching
+/// contract (every request in `requests` gets a `drops[]` entry, even a zero
+/// one). A span's whole [`ravel_rspan::SpanRecord`] (including any
+/// links/events, which per that type's own field-shape and doc comment live
+/// only as opaque blob entries inside `attrs`, never as separate columns) is
+/// decoded, tested, and either kept intact or dropped intact -- there is no
+/// per-field split that could leave a partial span behind.
+///
+/// # Memory (issue #742)
+///
+/// This is [`rspan_codec::merge`], the same flat k-way block-streaming merge
+/// the compactor runs, with the erasure predicate as its per-record filter. So
+/// it inherits every bound issue #711 gave RSPAN compaction: each input is read
+/// one block at a time by range (never whole) through one `BlockCursor`,
+/// `input_read_concurrency` cursor opens are in flight at once, and survivors
+/// land in a `PartBuilder` that closes the in-progress part on a trace boundary
+/// as soon as its overhead-aware estimate reaches `max_l1_part_bytes`. Peak
+/// resident memory is therefore one part plus one decoded block per input,
+/// never the bucket.
+///
+/// It did NOT always work this way: this function used to GET every input whole
+/// with `RspanReader::scan`, and push every survivor into ONE unbounded
+/// `RspanWriter`, so a bucket carrying one hot trace held the raw object bytes
+/// and every decoded survivor at once. This is the same shape #725 removed from
+/// the logs erasure rewrite and #711 removed from the spans compactor.
+///
+/// A rewrite therefore emits N parts. Nothing downstream assumed one: the
+/// conservation gate in [`publish_rewrite_record`] already sums
+/// `part.sample_count` over `build.parts` (ADR-0064 decision 3 point 4), the
+/// publish loop already PUTs each part under its own `part_index`-keyed
+/// content-addressed key, and the catalog already unions every part of a
+/// `RewriteRecord` into its own `SegmentRef`, so ADR-0064 needs no change.
+///
+/// The input-side footer cross-check now runs on
+/// [`rspan_codec::SpanInputCatalog`]'s footer `record_count`, read from the
+/// ranged footer each catalog load already fetched, instead of from a
+/// whole-object GET. It fires after the merge rather than before the write,
+/// which changes nothing it protects: the merge is a `dry_run` build, so an
+/// abort here is still an abort before the first byte is written.
 pub async fn build_rewrite_spans(
     store: &dyn ObjectStoreBackend,
     bucket: &Bucket,
@@ -1307,73 +1335,41 @@ pub async fn build_rewrite_spans(
     requests: &[ApplicableSpanRequest],
     input_set_hash: &[u8; 32],
 ) -> Result<RewriteBuild> {
-    let read_cfg = RspanConfig::default();
-    let full_range = SpanQuery::ts_range(i64::MIN, i64::MAX);
+    let catalogs = rspan_codec::load_catalogs_by_key(store, config, object_keys).await?;
 
-    let mut input_sample_count: u64 = 0;
-    let mut output_sample_count: u64 = 0;
-    let mut footer_record_count: u64 = 0;
+    // Input-side record-count authority: each input object's RSPAN footer
+    // declares its own `record_count`, read from the ranged footer this load
+    // already fetched (never a whole-object GET). Summing it and cross-checking
+    // against the merge tally below closes the silent data-loss gap the
+    // conservation gate cannot: that gate proves survivors + drops == the
+    // merge's own count, so a decode that silently dropped input records would
+    // satisfy it against a deflated input total and permanently supersede the
+    // originals. Same rationale as the logs path in `build_rewrite_logs`.
+    let footer_record_count = checked_sample_sum(catalogs.iter().map(|c| c.footer.record_count))?;
+
     let mut dropped_counts = vec![0u64; requests.len()];
-
-    let identity = rspan_codec::compactor_identity(bucket, config);
-    let mut writer = RspanWriter::new(read_cfg, identity);
-    let mut trace_ids: HashSet<[u8; 16]> = HashSet::new();
-    let mut any_survivor = false;
-
-    for object_key in object_keys {
-        let got = store.get(object_key, GetRange::Full).await?;
-        // Input-side record-count authority: the RSPAN footer's
-        // own `record_count`, summed and cross-checked against the scan tally
-        // below. Same rationale as the logs path in `build_rewrite_logs`: the
-        // output-side conservation gate cannot see an input record the decode
-        // silently lost, and the originals get superseded, so the loss would be
-        // permanent and invisible.
-        let footer = ravel_rspan::open(got.data.as_ref())?;
-        footer_record_count = footer_record_count
-            .checked_add(footer.record_count)
-            .ok_or_else(|| {
-                MaintainError::Invariant("footer record_count sum overflowed u64".to_string())
-            })?;
-        let reader = RspanReader::new(got.data.as_ref(), &read_cfg)?;
-        let (records, _stats) = reader.scan(&full_range)?;
-        for record in records {
-            input_sample_count = input_sample_count.checked_add(1).ok_or_else(|| {
-                MaintainError::Invariant("input_sample_count sum overflowed u64".to_string())
-            })?;
-            match first_dropping_span_request(requests, &record.attrs, record.start_ts_ns) {
-                Some(i) => dropped_counts[i] += 1,
-                None => {
-                    output_sample_count = output_sample_count.checked_add(1).ok_or_else(|| {
-                        MaintainError::Invariant(
-                            "output_sample_count sum overflowed u64".to_string(),
-                        )
-                    })?;
-                    trace_ids.insert(record.trace_id);
-                    any_survivor = true;
-                    writer.push(record);
-                }
+    // dry_run: true -- `publish_rewrite_record` PUTs `build.parts` itself, only
+    // after its conservation gate passes, mirroring `build_rewrite_logs` and how
+    // `build_rewrite_part` (metrics) also defers the PUT to that shared path.
+    let merged = rspan_codec::merge(
+        store,
+        config,
+        bucket,
+        &catalogs,
+        input_set_hash,
+        true,
+        &mut |record| match first_dropping_span_request(requests, &record.attrs, record.start_ts_ns)
+        {
+            Some(i) => {
+                dropped_counts[i] += 1;
+                Ok(false)
             }
-        }
-    }
+            None => Ok(true),
+        },
+    )
+    .await?;
 
-    input_footer_cross_check(bucket, input_sample_count, footer_record_count)?;
-
-    let parts = if any_survivor {
-        // dry_run: true, same reason as build_rewrite_logs.
-        let built = rspan_codec::finalize_part(
-            store,
-            bucket,
-            writer,
-            input_set_hash,
-            0,
-            trace_ids.len() as u64,
-            true,
-        )
-        .await?;
-        vec![built]
-    } else {
-        Vec::new()
-    };
+    input_footer_cross_check(bucket, merged.input_record_count, footer_record_count)?;
 
     let drops = requests
         .iter()
@@ -1385,9 +1381,9 @@ pub async fn build_rewrite_spans(
         .collect();
 
     Ok(RewriteBuild {
-        parts,
-        input_sample_count,
-        output_sample_count,
+        parts: merged.parts,
+        input_sample_count: merged.input_record_count,
+        output_sample_count: merged.output_record_count,
         drops,
     })
 }
@@ -3070,7 +3066,7 @@ mod tests {
     use ravel_logseg::LogRecord;
     use ravel_logseg::writer::ObjectIdentity as LogObjectIdentity;
     use ravel_rspan::writer::ObjectIdentity as SpanObjectIdentity;
-    use ravel_rspan::{SpanRecord, StatusCode};
+    use ravel_rspan::{RspanConfig, RspanReader, RspanWriter, SpanQuery, SpanRecord, StatusCode};
 
     fn logs_bucket() -> Bucket {
         Bucket::new(tenant_hash(), Signal::Logs, SHARD, HOUR)
@@ -4221,6 +4217,19 @@ mod tests {
     /// the shape `rspan_codec.rs`'s own test module writes for a real span
     /// ingest shard.
     async fn seed_spans(store: &dyn ObjectStoreBackend, seq: u64, records: &[SpanRecord]) {
+        seed_spans_with(store, seq, records, RspanConfig::default()).await;
+    }
+
+    /// [`seed_spans`] with the L0 writer's block target under test control, so a
+    /// bounded-memory fixture can force an input to be blocked at a smaller size
+    /// than the compactor's 8192-record output (the RSPAN analogue of the logs
+    /// `seed_logs_with`).
+    async fn seed_spans_with(
+        store: &dyn ObjectStoreBackend,
+        seq: u64,
+        records: &[SpanRecord],
+        cfg: RspanConfig,
+    ) {
         let th = tenant_hash();
         let writer_id = Uuid::from_u128(u128::from(seq));
         let identity = SpanObjectIdentity {
@@ -4230,7 +4239,7 @@ mod tests {
             writer_epoch: EPOCH,
             writer_seq: seq,
         };
-        let mut w = RspanWriter::new(RspanConfig::default(), identity);
+        let mut w = RspanWriter::new(cfg, identity);
         for r in records {
             w.push(r.clone());
         }
@@ -4728,6 +4737,412 @@ mod tests {
         );
     }
 
+    // --- bounded-memory spans erasure rewrite (issue #742) -------------------
+
+    /// The erased and kept `svc` values, deliberately the same length so every
+    /// surviving span has the same [`rspan_codec::estimate_record`] value and
+    /// [`expected_part_count`] is arithmetic, not an observation.
+    const SPAN_ERASED: &str = "erased-0";
+    const SPAN_KEPT: &str = "kept-000";
+    /// A fixed-width padding value that dominates a span's estimate, so a
+    /// modest corpus exceeds the part cap several times over.
+    const SPAN_PAD_LEN: usize = 4000;
+    /// Every fourth span belongs to the erased subject.
+    const SPAN_ERASE_EVERY: i64 = 4;
+
+    fn span_split_subject_of(i: i64) -> &'static str {
+        if i % SPAN_ERASE_EVERY == 0 {
+            SPAN_ERASED
+        } else {
+            SPAN_KEPT
+        }
+    }
+
+    /// One span at ordinal `i`, in its own distinct trace (so a trace boundary,
+    /// the only place an RSPAN part may split, falls between every span), with
+    /// fixed name and pad widths so every span's estimate is identical, plus
+    /// the `svc` attr the erasure predicate matches. `trace_id` is the ordinal
+    /// big-endian, so the merged `(trace_id, start_ts)` order is ordinal order.
+    fn split_span(i: i64) -> SpanRecord {
+        SpanRecord {
+            trace_id: (i as u128).to_be_bytes(),
+            span_id: [0u8; 8],
+            parent_span_id: None,
+            name: "op".to_string(),
+            start_ts_ns: SPLIT_BASE_NS + i,
+            end_ts_ns: SPLIT_BASE_NS + i + 1,
+            status_code: StatusCode::Ok,
+            status_message: None,
+            attrs: vec![
+                ("svc".to_string(), span_split_subject_of(i).to_string()),
+                ("pad".to_string(), "p".repeat(SPAN_PAD_LEN)),
+            ],
+        }
+    }
+
+    /// Seed `inputs` L0 `.rspan` objects covering ordinals `0..total` of
+    /// [`split_span`], round-robin, so the k-way merge interleaves the inputs
+    /// (input `j` holds traces `j, j+inputs, ...`, and the merge reassembles the
+    /// global ascending order). The SPANS analogue of the logs `seed_split_inputs`.
+    async fn seed_split_spans(
+        store: &dyn ObjectStoreBackend,
+        total: i64,
+        inputs: i64,
+        cfg: RspanConfig,
+    ) {
+        for j in 0..inputs {
+            let recs: Vec<SpanRecord> = (0..total / inputs)
+                .map(|i| split_span(i * inputs + j))
+                .collect();
+            seed_spans_with(store, j as u64 + 1, &recs, cfg).await;
+        }
+    }
+
+    /// The one pending request the spans split fixtures erase by.
+    fn split_pending_spans() -> Vec<PendingErasureRequest> {
+        vec![PendingErasureRequest {
+            request_key: "unused-in-memory-only".to_string(),
+            request: spans_erasure_request(742, "svc", SPAN_ERASED),
+        }]
+    }
+
+    /// Sort each record's attrs in place, so a canonical-attr-order comparison
+    /// is orthogonal to the column-oriented order the codec canonicalizes on
+    /// encode (the same accommodation
+    /// `spans_links_events_survive_or_drop_atomically_with_whole_record` makes).
+    fn sort_span_attrs(records: &mut [SpanRecord]) {
+        for r in records.iter_mut() {
+            r.attrs.sort();
+        }
+    }
+
+    /// Issue #742: an erasure over a SPANS bucket whose SURVIVORS exceed
+    /// `max_l1_part_bytes` several times over emits exactly the number of parts
+    /// the cap implies, not one part sized by the bucket. Every erased span is
+    /// absent, every other span is present exactly once and in canonical
+    /// `(trace_id, start_ts)` order across the part sequence, and the count
+    /// conserves the ADR-0064 way: `sum(part.sample_count) + dropped == input`.
+    ///
+    /// Every span is its own trace, so a split point exists between every span
+    /// and the part count is the same arithmetic the logs split test pins.
+    ///
+    /// Demonstrated red by restoring the single unbounded writer: in
+    /// `rspan_codec::merge`, replace the trace-boundary flush trigger
+    /// `let over_cap = part.estimate >= config.max_l1_part_bytes && !part.is_empty();`
+    /// with `let over_cap = false;`. Every survivor then lands in one part and
+    /// this fails at the part-count assertion with `1 != <expected_parts>`.
+    #[tokio::test]
+    async fn spans_erasure_splits_survivors_into_bounded_parts() {
+        const TOTAL: i64 = 100;
+        const INPUTS: i64 = 2;
+        const CAP: u64 = 64 * 1024;
+
+        let store = MemoryStore::new();
+        seed_split_spans(&store, TOTAL, INPUTS, RspanConfig::default()).await;
+
+        let expected: Vec<SpanRecord> = (0..TOTAL)
+            .filter(|i| span_split_subject_of(*i) == SPAN_KEPT)
+            .map(split_span)
+            .collect();
+        let survivors_expected = expected.len() as u64;
+        let dropped_expected = TOTAL as u64 - survivors_expected;
+        assert!(dropped_expected > 0, "the fixture must erase something");
+
+        // Every survivor has the same estimate, so the part count is
+        // arithmetic. Taken from ordinal 1, a kept span.
+        let record_estimate = rspan_codec::estimate_record(&split_span(1));
+        let expected_parts = expected_part_count(record_estimate, CAP, survivors_expected);
+        assert!(
+            expected_parts >= 4,
+            "fixture must exceed the cap several times over, got {expected_parts} parts"
+        );
+
+        let clock = FixedClock::new(sealed_now_ns());
+        let config = CompactorConfig {
+            max_l1_part_bytes: CAP,
+            ..CompactorConfig::default()
+        };
+        let mut memo = MaintainMemo::with_default_interval();
+        let outcome = erasure_rewrite_bucket(
+            &store,
+            &clock,
+            &config,
+            &NoLeases,
+            &spans_bucket(),
+            &split_pending_spans(),
+            &mut memo,
+        )
+        .await
+        .expect("erasure rewrite");
+        let (parts, publish) = match outcome {
+            ErasureRewriteOutcome::Rewritten { parts, publish } => (parts, publish),
+            other => panic!("expected Rewritten, got {other:?}"),
+        };
+        assert_eq!(publish, PublishOutcome::Published);
+        assert_eq!(
+            parts as u64, expected_parts,
+            "cap {CAP} over {survivors_expected} survivors estimated at {record_estimate} bytes \
+             each"
+        );
+
+        let record = read_rewrite_record_for(&store, &spans_bucket()).await;
+        assert_eq!(record.parts.len() as u64, expected_parts);
+
+        // ADR-0064 accounting through N parts.
+        assert_eq!(record.drops.len(), 1);
+        assert_eq!(record.drops[0].dropped_count, dropped_expected);
+        let output_total: u64 = record.parts.iter().map(|p| p.sample_count).sum();
+        assert_eq!(
+            output_total + record.drops[0].dropped_count,
+            TOTAL as u64,
+            "sum(part.sample_count) + dropped must equal the whole input record set"
+        );
+
+        // Every erased span absent, every other present exactly once, in
+        // canonical order across the part sequence.
+        let mut survivors = Vec::new();
+        for part in &record.parts {
+            let key = keys::reconstruct_rewrite_part_key(&record, part).expect("part key");
+            survivors.extend(decode_spans_part(&store, &key).await);
+        }
+        assert!(
+            !survivors
+                .iter()
+                .any(|r| r.attrs.iter().any(|(k, v)| k == "svc" && v == SPAN_ERASED)),
+            "no erased span may survive in any part"
+        );
+        let mut survivors_sorted = survivors.clone();
+        let mut expected_sorted = expected.clone();
+        sort_span_attrs(&mut survivors_sorted);
+        sort_span_attrs(&mut expected_sorted);
+        assert_eq!(
+            survivors_sorted, expected_sorted,
+            "concatenating the parts in part order must reproduce exactly the kept spans, once \
+             each, in canonical (trace_id, start_ts) order"
+        );
+
+        // The parts really are a split of one ascending trace sequence: each
+        // part's trace-id range is disjoint from and above the previous part's.
+        let mut prev_last: Option<[u8; 16]> = None;
+        for p in &record.parts {
+            let first: [u8; 16] = p.first_series_id.as_slice().try_into().unwrap();
+            let last: [u8; 16] = p.last_series_id.as_slice().try_into().unwrap();
+            assert!(first <= last);
+            if let Some(pl) = prev_last {
+                assert!(pl < first, "part trace ranges must be disjoint and ordered");
+            }
+            prev_last = Some(last);
+        }
+    }
+
+    /// Issue #742: the spans erasure rewrite's peak resident memory tracks the
+    /// part cap, not how many spans it read or kept. The same distinct-trace
+    /// shape is erased at 2x and 8x the records; the tracker's total high-water
+    /// must barely move.
+    ///
+    /// Demonstrated red by the same flip as
+    /// [`spans_erasure_splits_survivors_into_bounded_parts`] (`over_cap = false`
+    /// in `rspan_codec::merge`, restoring the single unbounded writer): the
+    /// writer term then holds every survivor, so the peak follows the record
+    /// count and the ratio goes to about 4, failing `ratio < 1.3` while
+    /// `parts > 1` fails too. Restoring the pre-#742 whole-object-GET-and-scan
+    /// body of `build_rewrite_spans` instead makes the tracker record nothing
+    /// (that path has no cursor to account), failing `peak > 0`.
+    #[tokio::test]
+    async fn spans_erasure_peak_scales_with_the_cap_not_the_survivor_count() {
+        const BASE: i64 = 40;
+        const INPUTS: i64 = 2;
+        const CAP: u64 = 64 * 1024;
+        // The inputs are re-blocked small so the decode-side term is the same at
+        // both scales (every input carries far more than one block); at the
+        // 8192-record default an input's whole stream would be one block and the
+        // transient term would scale with the corpus, which is not the claim.
+        const L0_BLOCK: usize = 16;
+        // Loose on purpose: the claim under test is the ratio, not this bound.
+        const TRANSIENT_ALLOWANCE: u64 = 8 * 1024 * 1024;
+
+        let mut peaks = Vec::new();
+        for scale in [2i64, 8i64] {
+            let store = MemoryStore::new();
+            let total = BASE * scale;
+            seed_split_spans(
+                &store,
+                total,
+                INPUTS,
+                RspanConfig {
+                    block_target_records: L0_BLOCK,
+                    ..RspanConfig::default()
+                },
+            )
+            .await;
+
+            let tracker = MergeMemoryTracker::new();
+            let config = CompactorConfig {
+                max_l1_part_bytes: CAP,
+                merge_memory_tracker: Some(tracker.clone()),
+                ..CompactorConfig::default()
+            };
+            let clock = FixedClock::new(sealed_now_ns());
+            let mut memo = MaintainMemo::with_default_interval();
+            let outcome = erasure_rewrite_bucket(
+                &store,
+                &clock,
+                &config,
+                &NoLeases,
+                &spans_bucket(),
+                &split_pending_spans(),
+                &mut memo,
+            )
+            .await
+            .expect("erasure rewrite");
+            let parts = match outcome {
+                ErasureRewriteOutcome::Rewritten { parts, .. } => parts,
+                other => panic!("expected Rewritten, got {other:?}"),
+            };
+
+            let peak = tracker.peak_total_bytes();
+            println!(
+                "[mem:erasure #742] scale={scale} records={total} parts={parts} \
+                 peak_total={peak}B cap={CAP}B"
+            );
+            assert!(peak > 0, "the tracker must record real residency");
+            peaks.push((peak, parts));
+        }
+
+        // 4x the records, and the peak must not follow. Asserted before the
+        // shape checks so the failure a regression produces is the ratio itself,
+        // with both numbers in the message.
+        let (two_x, eight_x) = (peaks[0].0 as f64, peaks[1].0 as f64);
+        let ratio = eight_x / two_x;
+        assert!(
+            ratio < 1.3,
+            "peak scaled with the survivor count: 2x={two_x} 8x={eight_x} ratio={ratio}"
+        );
+        for (scale, (peak, parts)) in [2, 8].into_iter().zip(peaks) {
+            assert!(
+                peak < 2 * CAP + TRANSIENT_ALLOWANCE,
+                "scale {scale}: peak {peak} exceeded 2x the cap plus the per-input transient"
+            );
+            assert!(parts > 1, "scale {scale}: the fixture must actually split");
+        }
+    }
+
+    /// Issue #742: `input_read_concurrency` changes only how many of the spans
+    /// rewrite's input reads are in flight, never a byte of its output. The same
+    /// bucket is erased at concurrency 1 and 8 and every part must be
+    /// byte-identical (BLAKE3 over the part objects themselves).
+    ///
+    /// The concurrency is proved real, not nominal: a FaultStore gate holds
+    /// every L0 data-object GET (`/l0/` names L0 data objects and nothing else
+    /// here), and at concurrency 8 exactly 8 are held simultaneously (the
+    /// catalog loads that `load_catalogs_by_key` fans out) while at concurrency
+    /// 1 only ever 1 is.
+    ///
+    /// Demonstrated red by restoring the pre-#742 body of `build_rewrite_spans`,
+    /// whose `for object_key in object_keys { store.get(object_key,
+    /// GetRange::Full) }` loop reads one input at a time: the
+    /// `wait_until_held(8)` below then never reaches 8, and the
+    /// `expect("input reads must reach the configured concurrency in flight")`
+    /// on its timeout fires.
+    #[tokio::test]
+    async fn spans_erasure_input_read_concurrency_changes_timing_not_bytes() {
+        const INPUTS: i64 = 16;
+        const TOTAL: i64 = 160;
+
+        async fn erase_at(concurrency: usize) -> (Vec<[u8; 32]>, usize) {
+            let store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+            seed_split_spans(store.as_ref(), TOTAL, INPUTS, RspanConfig::default()).await;
+
+            // Hold every L0 data-object GET so the in-flight count is
+            // observable. Commit records live under `/c/` and rewrite parts
+            // under `/l1/`, so neither is caught here.
+            let gate = store.hold(Op::Get, Some("/l0/".to_string()), Occurrence::Always);
+            let config = CompactorConfig {
+                max_l1_part_bytes: 64 * 1024,
+                input_read_concurrency: concurrency,
+                ..CompactorConfig::default()
+            };
+            let task = tokio::spawn({
+                let store = Arc::clone(&store);
+                async move {
+                    let clock = FixedClock::new(sealed_now_ns());
+                    let mut memo = MaintainMemo::with_default_interval();
+                    erasure_rewrite_bucket(
+                        store.as_ref(),
+                        &clock,
+                        &config,
+                        &NoLeases,
+                        &spans_bucket(),
+                        &split_pending_spans(),
+                        &mut memo,
+                    )
+                    .await
+                    .expect("erasure rewrite");
+                }
+            });
+
+            // The first window fills to exactly `concurrency` and no further:
+            // `buffered` polls no more than that many futures at once. Bounded
+            // so a serialized read path fails here instead of hanging.
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                gate.wait_until_held(concurrency),
+            )
+            .await
+            .expect("input reads must reach the configured concurrency in flight");
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+            let peak_in_flight = gate.held_count();
+
+            // Release everything the gate catches from here on, so the rest of
+            // the run is never blocked. Parks on the gate's `Notify`.
+            let releaser = tokio::spawn({
+                let gate = gate.clone();
+                async move {
+                    loop {
+                        gate.wait_until_held(1).await;
+                        for id in gate.held() {
+                            gate.release(id);
+                        }
+                    }
+                }
+            });
+            task.await.expect("erasure task");
+
+            let record = read_rewrite_record_for(store.as_ref(), &spans_bucket()).await;
+            let mut hashes = Vec::with_capacity(record.parts.len());
+            for part in &record.parts {
+                let key = keys::reconstruct_rewrite_part_key(&record, part).expect("part key");
+                let got = store.get(&key, GetRange::Full).await.expect("get part");
+                hashes.push(*blake3::hash(got.data.as_ref()).as_bytes());
+            }
+            releaser.abort();
+            (hashes, peak_in_flight)
+        }
+
+        let (serial_hashes, serial_in_flight) = erase_at(1).await;
+        let (concurrent_hashes, concurrent_in_flight) = erase_at(8).await;
+
+        assert_eq!(
+            serial_in_flight, 1,
+            "concurrency 1 must never have two input GETs in flight"
+        );
+        assert_eq!(
+            concurrent_in_flight, 8,
+            "concurrency 8 must have exactly 8 input GETs in flight"
+        );
+        assert!(
+            serial_hashes.len() > 1,
+            "the fixture must split into several parts, got {}",
+            serial_hashes.len()
+        );
+        assert_eq!(
+            serial_hashes, concurrent_hashes,
+            "input_read_concurrency changed the rewritten parts' bytes"
+        );
+    }
+
     // -----------------------------------------------------------------
     // Input-side record-count cross-check
     // -----------------------------------------------------------------
@@ -5011,9 +5426,25 @@ mod tests {
         );
     }
 
-    /// The SPANS sibling of [`logs_input_footer_overcount_aborts_rewrite_publish`].
-    /// Flip-line proof: the same, over the `input_footer_cross_check(...)?` call
-    /// in `build_rewrite_spans`.
+    /// The SPANS sibling of [`logs_input_footer_overcount_aborts_rewrite_publish`],
+    /// with one difference the shared merge introduced (issue #742): the RSPAN
+    /// merge's own per-input `BlockCursor` cross-check
+    /// (`rspan_codec::BlockCursor::refill`) compares each cursor's decoded count
+    /// to that input's declared footer `record_count` as it drains, so an
+    /// over-declared footer aborts loud with
+    /// [`MaintainError::SpanInputRecordCountMismatch`] before
+    /// `build_rewrite_spans`'s aggregate `input_footer_cross_check` (kept, but a
+    /// weaker sum-vs-sum gate) is ever reached. This is strictly stronger than
+    /// the logs path, which has no per-input cursor check and so aborts with the
+    /// aggregate `ErasureInputConservationViolation`. Either way no byte is
+    /// written and the originals stay live.
+    ///
+    /// Flip-line proof: deleting the `decoded_count != declared_record_count`
+    /// check in `rspan_codec::BlockCursor::refill` lets the over-declared footer
+    /// through the merge; the aggregate `input_footer_cross_check(...)?` in
+    /// `build_rewrite_spans` then still aborts, but as
+    /// `ErasureInputConservationViolation`, so the `matches!(err,
+    /// SpanInputRecordCountMismatch { .. })` below fails.
     #[tokio::test]
     async fn spans_input_footer_overcount_aborts_rewrite_publish() {
         let store = MemoryStore::new();
@@ -5062,8 +5493,15 @@ mod tests {
         .expect_err("footer/scan record-count mismatch must abort the rewrite");
 
         assert!(
-            matches!(err, MaintainError::ErasureInputConservationViolation { .. }),
-            "expected ErasureInputConservationViolation, got {err:?}"
+            matches!(
+                err,
+                MaintainError::SpanInputRecordCountMismatch {
+                    decoded_record_count: 2,
+                    footer_record_count: 3,
+                    ..
+                }
+            ),
+            "expected SpanInputRecordCountMismatch (decoded 2, footer 3), got {err:?}"
         );
 
         let after = list_all(&store, "").await.expect("list after");

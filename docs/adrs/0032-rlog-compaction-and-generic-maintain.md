@@ -324,5 +324,9 @@ already stated over `sum(output sample_count)`, the parts are already
 PUT under `part_index`-keyed content-addressed keys, and the catalog
 already unions every part of a `RewriteRecord`.
 
-The RSPAN erasure rewriter (`build_rewrite_spans`) still has the
-whole-object, single-writer shape; it was not part of that follow-up.
+The RSPAN erasure rewriter (`build_rewrite_spans`) now runs through the
+same shared merge too (issue #742): it streams each input's blocks through
+one `BlockCursor` per input and partitions survivors into
+`max_l1_part_bytes`-bounded parts, so neither the logs nor the spans
+erasure rewrite is unbounded any longer, and both emit N parts for the same
+reason a compaction does.
