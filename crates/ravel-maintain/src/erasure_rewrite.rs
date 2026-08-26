@@ -1174,6 +1174,13 @@ fn first_dropping_log_request(
 /// pruning index (ADR-0013), so a rewritten part carrying none loses a rare
 /// maintenance pass some query pruning, never correctness, the same shape of
 /// tradeoff as this module's documented exemplar-drop for metrics.
+///
+/// Peak memory is bounded the way the compactor's is (issue #725, following
+/// issue #711): inputs are read block by block through [`rlog::StreamCursor`]
+/// with a bounded read fan-out, and survivors land in a [`rlog::PartSink`] that
+/// opens the next part mid-stream once the current one reaches
+/// `max_l1_part_bytes`. A rewrite therefore emits N parts, never one part
+/// sized by the bucket.
 pub async fn build_rewrite_logs(
     store: &dyn ObjectStoreBackend,
     bucket: &Bucket,
