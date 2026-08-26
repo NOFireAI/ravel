@@ -210,6 +210,20 @@ pub enum SqlError {
     #[error("internal ravel-sql error: {0}")]
     Internal(String),
 
+    /// A DataFusion operator panicked while the query's stream was being
+    /// polled, and [`crate::PinnedStream`] unwound it into an error rather
+    /// than letting it escape (issue #737).
+    ///
+    /// This is the last line, not a design: a panic that reaches here is a bug
+    /// in an operator or in a kernel it calls, and the fix belongs where the
+    /// panic is raised. What the boundary guarantees is that one query's bug
+    /// cannot take down the task serving it, or the process. The payload is
+    /// the panic message, which can quote arbitrary values an operator was
+    /// holding, so it redacts like [`SqlError::Internal`] and reaches the
+    /// server log only.
+    #[error("a query operator panicked: {0}")]
+    OperatorPanic(String),
+
     /// Reconstructed from a `DataFusionError::Shared` (checkpoint review
     /// finding, not in the original design): DataFusion wraps some errors
     /// in an `Arc` to hand the same error to multiple stream consumers, so
@@ -251,7 +265,8 @@ impl SqlError {
             | SqlError::ResourcesExhausted(_)
             | SqlError::Plan(_)
             | SqlError::Execution(_)
-            | SqlError::Internal(_) => ErrorClass::Unsupported,
+            | SqlError::Internal(_)
+            | SqlError::OperatorPanic(_) => ErrorClass::Unsupported,
             SqlError::Shared { class, .. } => *class,
         }
     }
@@ -306,7 +321,7 @@ impl SqlError {
             | SqlError::ResourcesExhausted(_) => self.to_string(),
             SqlError::Plan(_) => MSG_PLAN.to_string(),
             SqlError::Execution(_) => MSG_EXECUTION.to_string(),
-            SqlError::Internal(_) => MSG_INTERNAL.to_string(),
+            SqlError::Internal(_) | SqlError::OperatorPanic(_) => MSG_INTERNAL.to_string(),
             SqlError::Shared { message, .. } => message.clone(),
         }
     }

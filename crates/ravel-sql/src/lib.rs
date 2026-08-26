@@ -60,6 +60,7 @@ mod executor;
 pub mod flight;
 #[cfg(feature = "flight-sql")]
 mod flight_ticket;
+mod group_keys;
 mod labels;
 mod like_udf;
 mod logs_provider;
@@ -125,6 +126,7 @@ pub use flight_ticket::{
     FlightTicket, FlightTicketError, MAX_STATEMENT_LEN, SegmentPin, TICKET_KEY_LEN, TicketKey,
     derive_ticket_key,
 };
+pub use group_keys::{DICTIONARY_GROUP_KEYS_RULE, DictionaryGroupKeysAsViews};
 pub use logs_provider::LogsTableProvider;
 pub use logs_pushdown::{LogsPushdown, extract_logs};
 pub use logs_scan::LogsScanExec;

@@ -394,3 +394,38 @@ flowchart LR
   ADR's decisions 1 to 3 for RSPAN. Columnar erasure evaluation is still open,
   and is what forces ADR-0110's eligibility rule to fail closed to the row path
   whenever an erasure predicate is pending.
+
+## Amendment: decision 5 is a wire type, not a grouping type (issue #737)
+
+Decision 5 fixes `Dictionary(Int32, Utf8)` as the type a declared `Str` column
+is scanned into and delivered as. That part stands unchanged: the scan builds
+dictionary arrays on both paths, the Flight statement path resends
+dictionaries, and a client sees the same column type it saw before.
+
+What the decision did not say, and was read as saying, is that the same type is
+what the engine groups on. It is not, and cannot be. DataFusion 54 has no
+specialized group-value table for `Dictionary`, so a `GROUP BY` over a declared
+`Str` column falls to `GroupValuesRows`, whose emit decodes the whole group
+table into one array through `arrow_row`'s `i32` offsets and panics with
+`offset overflow` past `i32::MAX` bytes of key data. A ClickBench-shaped tenant
+reaches that in one query.
+
+The `logs` table therefore now groups such a column as `Utf8View` for the
+duration of the aggregation, and casts it back to `Dictionary(Int32, Utf8)` in
+a projection directly above the aggregate that produces final values. The rule
+is `DictionaryGroupKeysAsViews` (`crates/ravel-sql/src/group_keys.rs`),
+installed by `build_session` on every session. The rewrite is schema-preserving
+by construction and DataFusion asserts it (the rule sets `schema_check`), so
+this amendment changes an in-memory representation inside one operator and
+nothing on the wire. `Utf8View`, not `Utf8`: the latter carries the same `i32`
+offsets in a single values buffer and would move the limit rather than remove
+it.
+
+Two follow-ups this amendment does not close:
+
+- A single `Utf8` group key (`attrs['k']`, which is what a non-declaring tenant
+  writes) takes `GroupValuesBytes::<i32>`, whose emit has its own `i32` offset
+  limit in one values buffer. The rule above does not touch it, because that
+  path is not what issue #737 reported.
+- `severity_text` is still `Utf8`, unchanged and still deferred for the reason
+  decision 5 gives.

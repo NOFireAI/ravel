@@ -1812,6 +1812,51 @@ count), so a client that needs a stable order must add `ORDER BY`. The result
 *content* is identical across partition counts for an admitted query; only
 arrival order varies.
 
+## String-keyed `GROUP BY`, and the panic boundary under it
+
+A declared `Str` column reaches Arrow as `Dictionary(Int32, Utf8)` (ADR-0099
+decision 5). That is the type a client receives, and it is deliberately not the
+type the engine groups on. DataFusion 54 has no specialized group-value table
+for `Dictionary`: it is absent from both the single-column dispatch in
+`aggregates::group_values::new_group_values` and the `supported_type` list the
+multi-column `GroupValuesColumn` is built from, so a `GROUP BY` over one falls
+through to `GroupValuesRows`. That table encodes each key into arrow's
+comparable row format and decodes the whole table back into one array on emit,
+through `arrow_row`'s `i32` offsets. A tenant with enough distinct keys to
+cross `i32::MAX` bytes of key data crosses it inside that single decode, and
+nothing bounds it first: the aggregate stream slices its output to `batch_size`
+only after the emit has already built the batch, and the memory pool
+reservation is released before it.
+
+`DictionaryGroupKeysAsViews` (`crates/ravel-sql/src/group_keys.rs`), a physical
+optimizer rule every session installs, casts dictionary-encoded string group
+keys to `Utf8View` on the aggregate that first reads them and casts the emitted
+group column back to its declared type in a projection directly above the
+aggregate that produces final values. `Utf8View` is in both of DataFusion's
+dispatch tables, so the grouping runs on `GroupValuesBytesView`, which stores
+its values in a list of 2 MiB blocks addressed per view and has no single
+offset buffer to overflow. `Utf8` would also leave the row-converter path and
+is deliberately not what the rule casts to: it carries the same `i32` offsets
+in one buffer, so it would move the limit rather than remove it. Both casts are
+cheap -- arrow builds views directly over an existing dictionary's values
+buffer without copying string data -- and neither is visible to a caller: the
+projection restores the column's name, position, and declared type, so the
+query's result schema is identical with and without the rule. Grouping sets and
+aggregates that already carry an output ordering are left on the original path;
+an ordered aggregate emits incrementally (`EmitTo::First`) and is bounded
+already.
+
+Underneath that sits a guarantee that does not depend on the rewrite being
+right. Every batch from every SQL transport passes through `PinnedStream`, and
+its poll catches an unwinding panic raised anywhere in the plan and returns
+`SqlError::OperatorPanic` instead, then fuses the stream. A panic in an
+operator or in an arrow kernel it calls is a bug, and the fix belongs where it
+is raised; what the boundary guarantees is that such a bug fails one query with
+a typed error rather than unwinding out of the task serving it. The panic
+message reaches the server log only: like `SqlError::Internal` it redacts to a
+fixed client string, because a panic payload can quote whatever values the
+operator was holding.
+
 ## Caching note
 
 ADR-0046 added a content-addressed RAM read-cache tier (`ravel-cache`,
