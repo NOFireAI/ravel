@@ -1,5 +1,5 @@
 //! Group-by aggregation core-count scaling benchmark core (ADR-0102 decision
-//! 4).
+//! 4), extended for issue #680 with a distinct-key memory sweep.
 //!
 //! One fixed group-by query over one fixed cardinality, swept across two axes:
 //! `target_partitions` (the knob a running server sets from core count) and
