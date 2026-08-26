@@ -430,3 +430,50 @@ striping would multiply object-store reads by the partition count (measured at
 speed-up. The gate was always `LogSegmentFetcher::has_cache`; this amendment
 records that the same predicate now selects the assignment mode, not only the
 partition count.
+
+## Amendment (2026-08-26, #693 part 3): predicate-free full-window whole-segment assignment
+
+Decision 1 stripes a snapshot's surviving blocks across partitions and resolves
+the per-segment surviving-block counts up front, once, through a plan phase
+(`compute_plan_counts`, `LogSegmentFetcher::plan_segment`) behind a `OnceCell`
+barrier. For a predicate-free full-window statement that plan phase is pure
+overhead: no block can be pruned, so every segment's survivor count is its whole
+block count, known from the footer with no block decode. Worse, above the
+block-range threshold (ADR-0107) the plan phase issues one suffix probe per
+segment that never coalesces with the scan reads — the barrier makes it the
+first, cold touch, and it is evicted from S3-FIFO probation before the scan (on
+the 8424-object tenant of #680 that was 8,424 plan probes plus ~16,300 scan-side
+re-probes plus 8,424 whole-object reads for a single `SELECT`).
+
+So for a statement that satisfies all four conjuncts below, the plan phase is
+skipped entirely and whole segments are assigned round-robin — the same rule the
+un-cached path uses (segment `j` in snapshot order to partition `j % n`, `n =
+min(target_partitions, relevant_segments)`) — with each segment read whole in
+one GET (`scan_whole_accounted_with_tenant`, a single `GetRange::Full`, no
+probe). The request count becomes exactly one whole-object read per relevant
+segment, zero suffix probes.
+
+The four conjuncts, all decidable from the resolved snapshot with zero I/O (they
+reuse `plan_segment`'s own fast-path gate per segment):
+
+1. the query is block-predicate-free (`LogQuery::is_block_predicate_free`: no
+   content, prune-only, or stream-attribute arm);
+2. the snapshot carries no pending selective erasure (folded into (1) via
+   `LogQuery::erasure`), since erasure removes rows the committed counts still
+   include;
+3. every relevant (ts-overlapping) segment is above the block-range threshold,
+   has a well-formed span, and is fully CONTAINED in the query window
+   (`ts_min <= seg.min && seg.max <= ts_max`) — strictly stronger than the
+   overlap the provider already pruned on, so every block of every relevant
+   segment survives; and
+4. there are at least `target_partitions` relevant segments, so whole-segment
+   round-robin still fills every partition.
+
+When any conjunct fails, the unchanged plan-then-stripe path runs. The
+`object_size > block_range_threshold` conjunct keeps the fast path to the band
+where it actually saves a request: at or below the threshold the plan and scan
+reads already coalesce on the one `(0, object_size)` whole-object cache key, so
+there is no probe to eliminate. `BlockMetrics::record_segment_totals` moves from
+the partition-0 planning hack to per-segment scan stats on this path (each
+segment has exactly one owning partition, so the whole-segment totals are still
+recorded exactly once).
