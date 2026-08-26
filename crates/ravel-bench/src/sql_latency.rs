@@ -604,6 +604,7 @@ fn build_read_cache(cache_bytes: u64) -> Arc<Cache<CacheFetchError>> {
 /// `ravel-server` also has. They travel together because they are only
 /// meaningful together: a statement refused by one ceiling says nothing about
 /// the others, and a table is comparable only when all of them match.
+// issue #720: carries `--sql-max-segments` and `--explain`.
 #[derive(Clone, Copy, Debug)]
 pub struct ExecutorSettings {
     /// Per-query DataFusion pool ceiling (`--sql-max-query-bytes`).
