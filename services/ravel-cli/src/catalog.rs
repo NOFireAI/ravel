@@ -11,6 +11,7 @@
 //! metrics.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use ravel_catalog::{CatalogConfig, FoldReport, PartLimits};
 use ravel_object_store::{GetRange, ObjectStoreBackend};
@@ -27,23 +28,45 @@ fn head_key(tenant: &TenantHash, signal: Signal) -> String {
     format!("t/{}/catalog/{}/HEAD", tenant.to_hex(), signal.key_prefix())
 }
 
-/// Folds one signal's catalog snapshot for a tenant, and returns the report it
-/// printed so a caller (the tests) can assert on it rather than on stdout.
+/// The seal margin a fold runs with: the sum an ingest hour's end must be
+/// older than before the fold trusts the hour to be sealed
+/// (docs/catalog-and-mvcc.md "Sealed hours"). Reported next to the watermark so
+/// an operator can see what `--max-flush-lifetime` did.
+fn seal_margin_ns(config: &CatalogConfig) -> i64 {
+    config.max_flush_lifetime_ns + config.clock_skew_allowance_ns + config.fold_safety_margin_ns
+}
+
+/// Folds one signal's catalog snapshot for a tenant. Returns the report and the
+/// exact text it printed, so a caller (the tests) can assert on both rather
+/// than on stdout.
 ///
 /// `signal` picks which snapshot is folded. A logs or spans tenant is folded
 /// only when `signal` names it: folding metrics on a logs tenant seals nothing
 /// and publishes an empty metrics HEAD, leaving every logs query to re-derive
 /// its snapshot by listing and reading every commit record (issue #718).
+///
+/// `max_flush_lifetime_ns`, when given, replaces
+/// [`CatalogConfig::max_flush_lifetime_ns`] for this invocation only, moving
+/// the seal margin and so the watermark this fold may advance to.
+/// `clock_skew_allowance_ns` and `fold_safety_margin_ns` keep their defaults:
+/// the override asserts that no writer is still flushing, not that the
+/// folder's clock is exact.
 pub async fn fold(
     store: Arc<dyn ObjectStoreBackend>,
     tenant: &str,
     shard_count: u32,
     signal: SignalArg,
-) -> anyhow::Result<FoldReport> {
-    let catalog_config = CatalogConfig {
+    max_flush_lifetime_ns: Option<i64>,
+    now_ns: i64,
+) -> anyhow::Result<(FoldReport, String)> {
+    let mut catalog_config = CatalogConfig {
         shard_count,
         ..CatalogConfig::default()
     };
+    if let Some(ns) = max_flush_lifetime_ns {
+        catalog_config.max_flush_lifetime_ns = ns;
+    }
+    let seal_margin_ns = seal_margin_ns(&catalog_config);
     // Enforcing, exactly as the server's query path (`ravel_server::query`) is:
     // an enforcing fold reads the tenant's real shard-generation history and
     // stamps a correct `shard_generation_count` and fan-out ceiling, instead of
@@ -55,28 +78,42 @@ pub async fn fold(
         .with_provisioning_enforcement();
 
     let tenant_hash = TenantId::new(tenant).hash();
-    let now = crate::now_ns()?;
     let folder_id = Uuid::new_v4();
     let report = catalog
-        .fold(&tenant_hash, signal.to_signal(), folder_id, now, &[], None)
+        .fold(
+            &tenant_hash,
+            signal.to_signal(),
+            folder_id,
+            now_ns,
+            &[],
+            None,
+        )
         .await
         .map_err(|err| anyhow::anyhow!("fold failed: {err}"))?;
 
-    println!("signal: {}", signal_word(signal.to_signal()));
-    println!("no_op: {}", report.no_op);
-    println!("rebuilt: {}", report.rebuilt);
-    println!(
-        "previous_watermark_hour: {:?}",
+    let mut out = String::new();
+    out.push_str(&format!("signal: {}\n", signal_word(signal.to_signal())));
+    out.push_str(&format!("no_op: {}\n", report.no_op));
+    out.push_str(&format!("rebuilt: {}\n", report.rebuilt));
+    out.push_str(&format!(
+        "previous_watermark_hour: {:?}\n",
         report.previous_watermark_hour
-    );
-    println!("watermark_hour: {:?}", report.watermark_hour);
-    println!("buckets_folded: {}", report.buckets_folded);
-    println!("entry_count: {}", report.entry_count);
-    println!("part_bytes: {}", report.part_bytes);
-    println!("list_requests: {}", report.list_requests);
-    println!("get_requests: {}", report.get_requests);
-    println!("put_requests: {}", report.put_requests);
-    Ok(report)
+    ));
+    out.push_str(&format!("watermark_hour: {:?}\n", report.watermark_hour));
+    out.push_str(&format!(
+        "seal_margin: {}\n",
+        humantime::format_duration(Duration::from_nanos(
+            u64::try_from(seal_margin_ns).unwrap_or(0)
+        ))
+    ));
+    out.push_str(&format!("buckets_folded: {}\n", report.buckets_folded));
+    out.push_str(&format!("entry_count: {}\n", report.entry_count));
+    out.push_str(&format!("part_bytes: {}\n", report.part_bytes));
+    out.push_str(&format!("list_requests: {}\n", report.list_requests));
+    out.push_str(&format!("get_requests: {}\n", report.get_requests));
+    out.push_str(&format!("put_requests: {}\n", report.put_requests));
+    print!("{out}");
+    Ok((report, out))
 }
 
 pub async fn inspect(
@@ -429,7 +466,7 @@ mod tests {
         .await
         .expect("append generation 1");
 
-        fold(store.clone(), tenant, 1, SignalArg::Metrics)
+        fold(store.clone(), tenant, 1, SignalArg::Metrics, None, now)
             .await
             .expect("cli fold");
 

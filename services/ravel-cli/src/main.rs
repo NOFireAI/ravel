@@ -2,7 +2,10 @@
 
 use clap::{Parser, Subcommand};
 use ravel_cli::maintain::SignalArg;
-use ravel_cli::{catalog, hold, idem, maintain, now_ns, store, tenancy, tenant_token};
+use ravel_cli::{
+    catalog, hold, idem, maintain, now_ns, parse_max_flush_lifetime_ns, store, tenancy,
+    tenant_token,
+};
 use ravel_logseg::block::NumStat;
 use ravel_logseg::field_dir::FieldDir;
 use ravel_logseg::footer::{self, COMP_NONE, COMP_ZSTD, kind};
@@ -648,7 +651,7 @@ enum MaintainCommand {
         /// compaction. The default is the safe 1h; use this only for a tenant
         /// known quiescent, such as one whose bulk load has finished.
         #[arg(long, value_name = "DURATION",
-              value_parser = maintain::parse_max_flush_lifetime_ns)]
+              value_parser = parse_max_flush_lifetime_ns)]
         max_flush_lifetime: Option<i64>,
     },
     /// Compact every sealed bucket of a whole tenant signal: walk each shard's
@@ -688,7 +691,7 @@ enum MaintainCommand {
         /// compaction. The default is the safe 1h; use this only for a tenant
         /// known quiescent, such as one whose bulk load has finished.
         #[arg(long, value_name = "DURATION",
-              value_parser = maintain::parse_max_flush_lifetime_ns)]
+              value_parser = parse_max_flush_lifetime_ns)]
         max_flush_lifetime: Option<i64>,
     },
     /// Run one sweep pass (orphan GC, superseded, unreferenced parts) over a shard.
@@ -804,6 +807,23 @@ enum CatalogCommand {
         /// existing invocation keeps its meaning.
         #[arg(long, value_enum, default_value = "metrics")]
         signal: SignalArg,
+        /// Override the fold's `max_flush_lifetime` (humantime duration, e.g.
+        /// `30m`, `0s`; the same grammar and unit as the `maintain
+        /// compact-bucket` / `compact-tenant` flag and ravel-server's
+        /// `--gc-max-flush-lifetime`). An hour seals only at its end plus this
+        /// plus the clock-skew allowance plus the fold safety margin, so a
+        /// freshly finished load waits over an hour before its last hours can
+        /// be folded; lowering this seals them sooner. The flag asserts that no
+        /// writer is still flushing, not that this host's clock is exact: the
+        /// clock-skew allowance and the fold safety margin keep their defaults.
+        /// UNSAFE under a live writer: a commit record published into a bucket
+        /// this fold already sealed is never picked up by a later incremental
+        /// fold, which re-lists only hours after the watermark. The default is
+        /// the safe 1h; use this only for a tenant known quiescent, such as one
+        /// whose bulk load has finished and whose writer process has exited.
+        #[arg(long, value_name = "DURATION",
+              value_parser = parse_max_flush_lifetime_ns)]
+        max_flush_lifetime: Option<i64>,
     },
     /// Decode and print HEAD and every referenced snapshot part for one
     /// (tenant, signal).
@@ -916,10 +936,18 @@ async fn main() -> anyhow::Result<()> {
                     tenant,
                     shards,
                     signal,
+                    max_flush_lifetime,
                 },
-        } => catalog::fold(store::build_store(&cli.store)?, &tenant, shards, signal)
-            .await
-            .map(|_report| ()),
+        } => catalog::fold(
+            store::build_store(&cli.store)?,
+            &tenant,
+            shards,
+            signal,
+            max_flush_lifetime,
+            now_ns()?,
+        )
+        .await
+        .map(|_report| ()),
         Command::Catalog {
             command: CatalogCommand::Inspect { tenant, signal },
         } => catalog::inspect(store::build_store(&cli.store)?, &tenant, signal).await,

@@ -175,6 +175,40 @@ warning; one appearing means a per-object attribute set is wider than the schema
 suggests (stray per-record keys), which is worth investigating before trusting
 the numbers.
 
+### Fold the catalog before measuring anything
+
+The load's writer process has exited by this point, so nothing can publish
+another commit record into the hours it wrote. Fold them immediately instead of
+waiting out the seal margin:
+
+```sh
+ravel-cli --store <your-store-flags> catalog fold \
+  --tenant clickbench \
+  --shards 4 \
+  --signal logs \
+  --max-flush-lifetime 0s
+```
+
+`--shards` must be the value the load ran with, and `--signal logs` is
+mandatory: the fold defaults to metrics, and folding metrics on this
+logs-only tenant seals nothing and publishes an empty metrics HEAD.
+
+Check the report before going further. `entry_count` must equal the `objects
+written` figure the load printed; anything lower means part of the load is
+still outside the snapshot. `seal_margin: 20m` confirms the override took
+effect (the default is `1h 20m`). Note that `0s` removes only the
+flush-lifetime term, so the still-open ingest hour is not sealed: if the load
+finished minutes ago, run the fold again once that hour has ended, or accept
+that its objects are resolved by listing.
+
+This is not optional tuning. Without a snapshot covering these hours, every
+query resolves by listing and reading commit records directly: one
+commit-record GET per segment, per statement. On a 100M-row `hits` load that
+is 8,424 GETs for a single statement, and a 43-statement pass measured that
+way reads as a format or engine regression when it is only an unfolded
+catalog. A tenant loaded from 14:54Z to 16:08Z cannot be folded by the default
+margin until 18:21Z, which is exactly the window this flag removes.
+
 ## 3. Declare the typed columns
 
 The load writes the data; it does not tell the SQL layer which attributes to

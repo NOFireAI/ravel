@@ -88,6 +88,8 @@ async fn fold_then_inspect_then_verify_round_trips_cleanly() {
         tenant,
         1,
         SignalArg::Metrics,
+        None,
+        now_ns(),
     )
     .await
     .expect("fold succeeds");
@@ -121,6 +123,8 @@ async fn verify_fails_when_a_sealed_record_is_missing_from_the_snapshot() {
         tenant,
         1,
         SignalArg::Metrics,
+        None,
+        now_ns(),
     )
     .await
     .expect("fold succeeds");
