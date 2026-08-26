@@ -89,11 +89,15 @@ pub use tiered::{Source, TieredCache};
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::Poll;
     use std::time::Duration;
 
     use bytes::Bytes;
+    use tokio::sync::oneshot;
     use tokio::time::timeout;
 
     use super::*;
@@ -104,72 +108,132 @@ mod tests {
         CacheKey::new([7u8; 16], content_hash, 0, 0)
     }
 
+    /// Poll `future` exactly once and report whether it completed. The first
+    /// poll of a `SingleFlight::run` future is where it takes the in-flight
+    /// map lock and becomes a leader or a follower, so polling once is how
+    /// these tests make follower registration an ordering they enforce rather
+    /// than a wall-clock race decided by how promptly the runtime schedules a
+    /// spawned task against a leader that holds its slot for a fixed sleep.
+    async fn poll_once<F: Future>(future: &mut Pin<Box<F>>) -> Poll<F::Output> {
+        std::future::poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx))).await
+    }
+
     #[tokio::test]
     async fn single_flight_collapses_concurrent_misses_and_propagates_errors() {
         let flight: Arc<SingleFlight<CacheKey, Bytes, &'static str>> =
             Arc::new(SingleFlight::new());
         let key = test_key(1);
+        const CALLERS: usize = 8;
 
         // N concurrent misses on one key produce exactly one upstream
-        // call, and every waiter receives the same bytes.
+        // call, and every waiter receives the same bytes. The leader is held
+        // inside its fetch by a `oneshot` this test releases only after every
+        // follower has been polled once, so exactly one of the N is the leader
+        // by construction.
         let upstream_calls = Arc::new(AtomicUsize::new(0));
-        let mut handles = Vec::new();
-        for _ in 0..8 {
+        let follower_fetches = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let leader = {
             let flight = flight.clone();
             let upstream_calls = upstream_calls.clone();
-            handles.push(tokio::spawn(async move {
+            tokio::spawn(async move {
                 flight
-                    .run(key, move || {
-                        let upstream_calls = upstream_calls.clone();
-                        async move {
-                            upstream_calls.fetch_add(1, Ordering::SeqCst);
-                            tokio::time::sleep(Duration::from_millis(20)).await;
-                            Ok::<Bytes, &'static str>(Bytes::from_static(b"payload"))
-                        }
+                    .run(key, move || async move {
+                        upstream_calls.fetch_add(1, Ordering::SeqCst);
+                        let _ = entered_tx.send(());
+                        let _ = release_rx.await;
+                        Ok::<Bytes, &'static str>(Bytes::from_static(b"payload"))
                     })
                     .await
-            }));
+            })
+        };
+        entered_rx.await.unwrap();
+
+        let mut followers = Vec::new();
+        for _ in 1..CALLERS {
+            let ran = follower_fetches.clone();
+            followers.push(Box::pin(flight.run(key, move || async move {
+                ran.fetch_add(1, Ordering::SeqCst);
+                Ok::<Bytes, &'static str>(Bytes::from_static(b"never"))
+            })));
         }
-        for handle in handles {
-            let (result, _role) = handle.await.unwrap();
+        for follower in &mut followers {
+            assert!(
+                poll_once(follower).await.is_pending(),
+                "a follower parks on the held leader instead of completing on its own"
+            );
+        }
+        release_tx.send(()).expect("the leader is still parked");
+
+        for follower in followers {
+            let (result, role) = follower.await;
             assert_eq!(result.unwrap().as_ref(), b"payload".as_slice());
+            assert_eq!(role, Role::Follower, "every later caller is a follower");
         }
+        let (result, role) = leader.await.unwrap();
+        assert_eq!(result.unwrap().as_ref(), b"payload".as_slice());
+        assert_eq!(role, Role::Leader, "the held caller is the one leader");
         assert_eq!(
             upstream_calls.load(Ordering::SeqCst),
             1,
             "N concurrent misses on one key must produce exactly one upstream call"
         );
+        assert_eq!(
+            follower_fetches.load(Ordering::SeqCst),
+            0,
+            "a follower never runs its own fetch"
+        );
 
         // A failing upstream call reaches every waiter as an error,
-        // rather than hanging any of them.
+        // rather than hanging any of them. Held the same way.
         let key2 = test_key(2);
         let upstream_calls2 = Arc::new(AtomicUsize::new(0));
-        let mut handles = Vec::new();
-        for _ in 0..8 {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let leader = {
             let flight = flight.clone();
             let upstream_calls2 = upstream_calls2.clone();
-            handles.push(tokio::spawn(async move {
+            tokio::spawn(async move {
                 flight
-                    .run(key2, move || {
-                        let upstream_calls2 = upstream_calls2.clone();
-                        async move {
-                            upstream_calls2.fetch_add(1, Ordering::SeqCst);
-                            tokio::time::sleep(Duration::from_millis(20)).await;
-                            Err::<Bytes, &'static str>("upstream exploded")
-                        }
+                    .run(key2, move || async move {
+                        upstream_calls2.fetch_add(1, Ordering::SeqCst);
+                        let _ = entered_tx.send(());
+                        let _ = release_rx.await;
+                        Err::<Bytes, &'static str>("upstream exploded")
                     })
                     .await
-            }));
+            })
+        };
+        entered_rx.await.unwrap();
+
+        let mut followers = Vec::new();
+        for _ in 1..CALLERS {
+            followers.push(Box::pin(flight.run(key2, || async {
+                Ok::<Bytes, &'static str>(Bytes::from_static(b"never"))
+            })));
         }
-        for handle in handles {
-            let (result, _role) = handle.await.unwrap();
+        for follower in &mut followers {
+            assert!(
+                poll_once(follower).await.is_pending(),
+                "a follower parks on the held leader instead of completing on its own"
+            );
+        }
+        release_tx.send(()).expect("the leader is still parked");
+
+        for follower in followers {
+            let (result, role) = follower.await;
             match result {
                 Err(SingleFlightError::Upstream(message)) => {
                     assert_eq!(message, "upstream exploded")
                 }
                 other => panic!("expected every waiter to see the upstream error, got {other:?}"),
             }
+            assert_eq!(role, Role::Follower);
         }
+        let (result, role) = leader.await.unwrap();
+        assert!(matches!(result, Err(SingleFlightError::Upstream(_))));
+        assert_eq!(role, Role::Leader);
         assert_eq!(upstream_calls2.load(Ordering::SeqCst), 1);
 
         // A second, later miss on the same key after the first completed
@@ -197,36 +261,41 @@ mod tests {
             Arc::new(SingleFlight::new());
 
         // A leader that panics before producing a result must not leave a
-        // concurrent follower waiting forever.
+        // concurrent follower waiting forever. The leader parks inside its
+        // fetch until this test releases it, and the follower is registered
+        // (polled once) before that release, so "the follower joined while the
+        // leader was still in flight" is ordered here rather than raced
+        // between a 2 ms and a 10 ms sleep.
         let key = test_key(100);
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
         let leader = {
             let flight = flight.clone();
             tokio::spawn(async move {
                 flight
-                    .run(key, || async {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    .run(key, move || async move {
+                        let _ = entered_tx.send(());
+                        let _ = release_rx.await;
                         panic!("leader blew up before producing a result");
                     })
                     .await
             })
         };
-        tokio::time::sleep(Duration::from_millis(2)).await;
+        entered_rx.await.unwrap();
+
         let follower_ran = Arc::new(AtomicUsize::new(0));
-        let follower = {
-            let flight = flight.clone();
-            let follower_ran = follower_ran.clone();
-            tokio::spawn(async move {
-                flight
-                    .run(key, move || {
-                        let follower_ran = follower_ran.clone();
-                        async move {
-                            follower_ran.fetch_add(1, Ordering::SeqCst);
-                            Ok::<Bytes, &'static str>(Bytes::from_static(b"never"))
-                        }
-                    })
-                    .await
-            })
+        let mut follower = {
+            let ran = follower_ran.clone();
+            Box::pin(flight.run(key, move || async move {
+                ran.fetch_add(1, Ordering::SeqCst);
+                Ok::<Bytes, &'static str>(Bytes::from_static(b"never"))
+            }))
         };
+        assert!(
+            poll_once(&mut follower).await.is_pending(),
+            "the follower parks on the still-in-flight leader"
+        );
+        release_tx.send(()).expect("the leader is still parked");
 
         assert!(
             leader.await.is_err(),
@@ -234,8 +303,7 @@ mod tests {
         );
         let (follower_result, follower_role) = timeout(Duration::from_secs(2), follower)
             .await
-            .expect("a panicking leader must not leave a follower parked forever")
-            .expect("follower task must not itself panic");
+            .expect("a panicking leader must not leave a follower parked forever");
         assert!(matches!(
             follower_result,
             Err(SingleFlightError::LeaderLost)
@@ -248,37 +316,39 @@ mod tests {
         );
 
         // A leader whose task is cancelled before it produces a result
-        // must not leave a concurrent follower waiting forever either.
+        // must not leave a concurrent follower waiting forever either. The
+        // leader parks on a `oneshot` whose sender this test never fires, so
+        // it is still in flight when the abort lands -- no 60 s sleep to
+        // outrun and no 10 ms windows to lose.
         let key2 = test_key(101);
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (_never_tx, never_rx) = oneshot::channel::<()>();
         let leader2 = {
             let flight = flight.clone();
             tokio::spawn(async move {
                 flight
-                    .run(key2, || async {
-                        tokio::time::sleep(Duration::from_secs(60)).await;
+                    .run(key2, move || async move {
+                        let _ = entered_tx.send(());
+                        let _ = never_rx.await;
                         Ok::<Bytes, &'static str>(Bytes::from_static(b"unreachable"))
                     })
                     .await
             })
         };
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        let follower2 = {
-            let flight = flight.clone();
-            tokio::spawn(async move {
-                flight
-                    .run(key2, || async {
-                        Ok::<Bytes, &'static str>(Bytes::from_static(b"never"))
-                    })
-                    .await
-            })
-        };
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        entered_rx.await.unwrap();
+
+        let mut follower2 = Box::pin(flight.run(key2, || async {
+            Ok::<Bytes, &'static str>(Bytes::from_static(b"never"))
+        }));
+        assert!(
+            poll_once(&mut follower2).await.is_pending(),
+            "the follower parks on the still-in-flight leader"
+        );
         leader2.abort();
 
         let (follower2_result, _role) = timeout(Duration::from_secs(2), follower2)
             .await
-            .expect("a cancelled leader must not leave a follower parked forever")
-            .expect("follower task must not itself panic");
+            .expect("a cancelled leader must not leave a follower parked forever");
         assert!(matches!(
             follower2_result,
             Err(SingleFlightError::LeaderLost)
