@@ -27,7 +27,9 @@ use arrow::array::{
 use arrow::array::{BinaryArray, FixedSizeBinaryArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
-use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
+use parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
+};
 use ravel_catalog::{AbsentPolicy, validate_or_adopt};
 #[cfg(feature = "stage-timing")]
 use ravel_ingest::LogStageSnapshot;
@@ -719,9 +721,16 @@ async fn load_instrumented(
         clock,
     ));
 
-    let row_group_lens = row_group_row_counts(parquet_path)?;
+    // Parse the input's Parquet footer exactly once here (issue #773). The
+    // shared metadata sizes the stride cursors, derives the reader schema, and
+    // is handed to every cursor's builder, so a 105-column footer is decoded a
+    // single time per load instead of once per setup site plus once per cursor.
+    let input = FileInput { path: parquet_path };
+    let metadata = read_input_metadata(&input)?;
+    let row_group_lens = row_group_row_counts(&metadata);
     let cursor_count = resolve_read_cursors(read_cursors, shards, row_group_lens.len());
-    let cursors = open_stride_cursors(parquet_path, &row_group_lens, cursor_count, batch_rows)?;
+    let cursors =
+        open_stride_cursors(&input, &metadata, &row_group_lens, cursor_count, batch_rows)?;
 
     let started = Instant::now();
     let mut report = LoadReport::default();
@@ -1417,20 +1426,50 @@ fn shard_skew_warning(distinct_shards: usize, shards: u32) -> Option<String> {
     ))
 }
 
-/// Read each row group's row count from `parquet_path`'s footer, in row-group
-/// order, without decoding any data. Used to size and partition the stride
-/// cursors (issue #560) before any reader is opened.
-fn row_group_row_counts(parquet_path: &Path) -> Result<Vec<u64>, LoadError> {
-    let file = std::fs::File::open(parquet_path)
-        .map_err(|e| LoadError::Setup(format!("failed to open {}: {e}", parquet_path.display())))?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-        .map_err(|e| LoadError::Setup(format!("failed to open Parquet reader: {e}")))?;
-    Ok(builder
+/// Opens a fresh reader over the load input for each independent read. The
+/// stride cursors read disjoint row-group partitions concurrently, so each
+/// needs its own reader (its own file offset), but they all share one parsed
+/// footer: only the data pages are re-read, never the metadata (issue #773).
+trait InputReaders {
+    type Reader: parquet::file::reader::ChunkReader + 'static;
+    fn open(&self) -> Result<Self::Reader, LoadError>;
+}
+
+/// The production input: a Parquet file on disk. Each `open` is a new file
+/// handle over the same path.
+struct FileInput<'a> {
+    path: &'a Path,
+}
+
+impl InputReaders for FileInput<'_> {
+    type Reader = std::fs::File;
+
+    fn open(&self) -> Result<std::fs::File, LoadError> {
+        std::fs::File::open(self.path)
+            .map_err(|e| LoadError::Setup(format!("failed to open {}: {e}", self.path.display())))
+    }
+}
+
+/// Parse the input's Parquet footer once and return the metadata every setup
+/// site reuses (issue #773). This is the single footer decode per load input;
+/// `row_group_row_counts`, `load_reader_schema`, and each stride cursor's
+/// builder all take the result rather than re-reading it.
+fn read_input_metadata<S: InputReaders>(source: &S) -> Result<ArrowReaderMetadata, LoadError> {
+    let reader = source.open()?;
+    ArrowReaderMetadata::load(&reader, ArrowReaderOptions::default())
+        .map_err(|e| LoadError::Setup(format!("failed to read Parquet metadata: {e}")))
+}
+
+/// Read each row group's row count from the already-parsed footer, in
+/// row-group order, without decoding any data. Used to size and partition the
+/// stride cursors (issue #560) before any reader is opened.
+fn row_group_row_counts(metadata: &ArrowReaderMetadata) -> Vec<u64> {
+    metadata
         .metadata()
         .row_groups()
         .iter()
         .map(|rg| rg.num_rows() as u64)
-        .collect())
+        .collect()
 }
 
 /// Resolve `--read-cursors` (issue #560): absent means auto-sized to
@@ -1614,18 +1653,11 @@ fn dictionary_preserving_schema(
     })
 }
 
-/// Read `parquet_path`'s footer once and derive the reader schema
-/// [`dictionary_preserving_schema`] describes, or `None` when no column
-/// qualifies.
-fn load_reader_schema(parquet_path: &Path) -> Result<Option<SchemaRef>, LoadError> {
-    let file = std::fs::File::open(parquet_path)
-        .map_err(|e| LoadError::Setup(format!("failed to open {}: {e}", parquet_path.display())))?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-        .map_err(|e| LoadError::Setup(format!("failed to open Parquet reader: {e}")))?;
-    Ok(dictionary_preserving_schema(
-        &builder.schema().clone(),
-        builder.metadata(),
-    ))
+/// Derive the reader schema [`dictionary_preserving_schema`] describes from the
+/// already-parsed footer, or `None` when no column qualifies. The metadata is
+/// the shared one from [`read_input_metadata`]; nothing is re-read here.
+fn load_reader_schema(metadata: &ArrowReaderMetadata) -> Option<SchemaRef> {
+    dictionary_preserving_schema(metadata.schema(), metadata.metadata())
 }
 
 /// Open one [`BatchReader`] per stride cursor (issue #560), each restricted to
@@ -1635,8 +1667,9 @@ fn load_reader_schema(parquet_path: &Path) -> Result<Option<SchemaRef>, LoadErro
 /// degenerate zero-row-group case, which forces `k == 1`) yields an
 /// already-exhausted cursor with no reader opened, rather than asking Parquet
 /// to build a reader over zero row groups.
-fn open_stride_cursors(
-    parquet_path: &Path,
+fn open_stride_cursors<S: InputReaders>(
+    source: &S,
+    metadata: &ArrowReaderMetadata,
     row_group_lens: &[u64],
     k: usize,
     batch_rows: usize,
@@ -1648,10 +1681,23 @@ fn open_stride_cursors(
         running += len;
     }
 
-    // Derived once from the footer, then shared by every cursor: each cursor
-    // reads a disjoint partition of the same file, so they must all agree on
-    // the column types (issue #660).
-    let reader_schema = load_reader_schema(parquet_path)?;
+    // Derived once from the shared footer, then applied to every cursor: each
+    // cursor reads a disjoint partition of the same file, so they must all
+    // agree on the column types (issue #660).
+    let reader_schema = load_reader_schema(metadata);
+
+    // The `ArrowReaderMetadata` every cursor's builder is constructed from: the
+    // shared footer, with the dictionary-preserving schema applied when one was
+    // derived. Building it from the already-parsed metadata (issue #773) means
+    // no cursor re-parses the footer; it only opens a reader for the data pages.
+    let cursor_metadata = match &reader_schema {
+        Some(schema) => ArrowReaderMetadata::try_new(
+            Arc::clone(metadata.metadata()),
+            ArrowReaderOptions::new().with_schema(Arc::clone(schema)),
+        )
+        .map_err(|e| LoadError::Setup(format!("failed to apply reader schema: {e}")))?,
+        None => metadata.clone(),
+    };
 
     let mut cursors = Vec::with_capacity(k);
     for range in partition_row_group_ranges(row_group_lens.len(), k) {
@@ -1665,17 +1711,9 @@ fn open_stride_cursors(
             continue;
         }
         let partition_base = group_file_base[range.start];
-        let file = std::fs::File::open(parquet_path).map_err(|e| {
-            LoadError::Setup(format!("failed to open {}: {e}", parquet_path.display()))
-        })?;
-        let builder = match &reader_schema {
-            Some(schema) => ParquetRecordBatchReaderBuilder::try_new_with_options(
-                file,
-                ArrowReaderOptions::new().with_schema(Arc::clone(schema)),
-            ),
-            None => ParquetRecordBatchReaderBuilder::try_new(file),
-        }
-        .map_err(|e| LoadError::Setup(format!("failed to open Parquet reader: {e}")))?;
+        let file = source.open()?;
+        let builder =
+            ParquetRecordBatchReaderBuilder::new_with_metadata(file, cursor_metadata.clone());
         let reader = builder
             .with_row_groups(range.collect())
             .with_batch_size(batch_rows)
@@ -3686,10 +3724,13 @@ type = "i64"
         read_cursors: Option<usize>,
         queue_depth: usize,
     ) -> Vec<[u8; 32]> {
-        let row_group_lens = row_group_row_counts(pq).expect("row group lens");
+        let input = FileInput { path: pq };
+        let metadata = read_input_metadata(&input).expect("read metadata");
+        let row_group_lens = row_group_row_counts(&metadata);
         let cursor_count = resolve_read_cursors(read_cursors, shards, row_group_lens.len());
         let cursors =
-            open_stride_cursors(pq, &row_group_lens, cursor_count, batch_rows).expect("cursors");
+            open_stride_cursors(&input, &metadata, &row_group_lens, cursor_count, batch_rows)
+                .expect("cursors");
         let state = StrideCursors {
             cursors,
             deal_offset: 0,
@@ -4789,6 +4830,198 @@ type = "i64"
         (dir, pq)
     }
 
+    /// The dictionary-preserving reader schema the loader derives for `pq`, or
+    /// `None` when no column qualifies. Parses the footer once, exactly as the
+    /// loader does, then hands the shared metadata to [`load_reader_schema`].
+    fn reader_schema_for(pq: &Path) -> Option<SchemaRef> {
+        let metadata = read_input_metadata(&FileInput { path: pq }).expect("read metadata");
+        load_reader_schema(&metadata)
+    }
+
+    /// A `ChunkReader` over the input bytes that counts Parquet footer parses.
+    ///
+    /// Every metadata parse issues exactly one `get_read` at `len - 8`: that
+    /// eight-byte footer tail carries the metadata length and the `PAR1` magic,
+    /// and `parse_metadata` reads it before anything else (parquet
+    /// `file::metadata::reader`). A data-page reader built from already-parsed
+    /// metadata (`new_with_metadata`) never touches that tail. Counting reads at
+    /// that offset therefore counts footer parses and nothing else.
+    struct CountingReader {
+        inner: bytes::Bytes,
+        footer_reads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl parquet::file::reader::Length for CountingReader {
+        fn len(&self) -> u64 {
+            self.inner.len() as u64
+        }
+    }
+
+    impl parquet::file::reader::ChunkReader for CountingReader {
+        type T = <bytes::Bytes as parquet::file::reader::ChunkReader>::T;
+
+        fn get_read(&self, start: u64) -> parquet::errors::Result<Self::T> {
+            if start == self.inner.len() as u64 - parquet::file::FOOTER_SIZE as u64 {
+                self.footer_reads
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            parquet::file::reader::ChunkReader::get_read(&self.inner, start)
+        }
+
+        fn get_bytes(&self, start: u64, length: usize) -> parquet::errors::Result<bytes::Bytes> {
+            parquet::file::reader::ChunkReader::get_bytes(&self.inner, start, length)
+        }
+    }
+
+    /// An [`InputReaders`] that hands out [`CountingReader`]s over the same file
+    /// bytes, all sharing one footer-parse counter. Every `open` (the initial
+    /// metadata read plus each stride cursor's data reader) increments the same
+    /// counter, so `footer_reads` is the total footer parses for the whole load
+    /// setup.
+    struct CountingInput {
+        bytes: bytes::Bytes,
+        footer_reads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl CountingInput {
+        fn new(pq: &Path) -> Self {
+            let bytes = bytes::Bytes::from(std::fs::read(pq).expect("read fixture bytes"));
+            Self {
+                bytes,
+                footer_reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+
+        fn footer_reads(&self) -> usize {
+            self.footer_reads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl InputReaders for CountingInput {
+        type Reader = CountingReader;
+
+        fn open(&self) -> Result<CountingReader, LoadError> {
+            Ok(CountingReader {
+                inner: self.bytes.clone(),
+                footer_reads: Arc::clone(&self.footer_reads),
+            })
+        }
+    }
+
+    /// A Parquet fixture forced to `groups` row groups (one row each), so a load
+    /// over it opens one stride cursor per row group. Returns the temp dir (kept
+    /// alive), the path, and a mapping that reads the string column as a resource
+    /// attribute.
+    fn multi_row_group_fixture(groups: usize) -> (tempfile::TempDir, std::path::PathBuf, Mapping) {
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pq = dir.path().join("groups.parquet");
+        let ts: Vec<i64> = (0..groups as i64).map(|k| NOW_NS + k).collect();
+        let svc: Vec<&str> = (0..groups).map(|k| ["api", "web"][k % 2]).collect();
+        let b = batch(vec![("ts", i64_col(ts)), ("svc", str_col(svc))]);
+        let file = std::fs::File::create(&pq).expect("create parquet");
+        // One row per row group: `groups` rows written with a max group size of 1
+        // flush a fresh row group each row.
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(1))
+            .build();
+        let mut w = ArrowWriter::try_new(file, b.schema(), Some(props)).expect("arrow writer");
+        w.write(&b).expect("write batch");
+        w.close().expect("close writer");
+
+        let mut m = base_mapping();
+        m.resource_attributes = vec![attr("service.name", "svc", ColType::Str)];
+        (dir, pq, m)
+    }
+
+    /// #773: the load setup parses the input's Parquet footer exactly once, no
+    /// matter how many stride cursors it opens.
+    ///
+    /// The counter is the footer-tail read (`CountingReader`). The fixture has 8
+    /// row groups, and the load requests 8 read cursors, so
+    /// `resolve_read_cursors` gives 8 cursors (one per row group). Before #773
+    /// the setup parsed the footer once in `row_group_row_counts`, once more in
+    /// `load_reader_schema`, and once per cursor as each builder re-opened the
+    /// file: `cursors + 2 == 10` parses. Sharing one `ArrowReaderMetadata` (the
+    /// `new_with_metadata` builder line in `open_stride_cursors`) drops that to
+    /// exactly 1. Flip that builder back to `try_new`/`try_new_with_options` and
+    /// the count returns to `cursors + 1`; drop the shared metadata entirely and
+    /// it returns to `cursors + 2`.
+    #[test]
+    fn load_setup_parses_the_footer_once() {
+        const GROUPS: usize = 8;
+        let (_dir, pq, _m) = multi_row_group_fixture(GROUPS);
+        let source = CountingInput::new(&pq);
+
+        // The exact setup sequence `run_load` runs, driven through the counting
+        // input instead of a file on disk.
+        let metadata = read_input_metadata(&source).expect("read metadata");
+        let row_group_lens = row_group_row_counts(&metadata);
+        assert_eq!(
+            row_group_lens.len(),
+            GROUPS,
+            "the fixture is forced to one row group per row"
+        );
+        let cursor_count = resolve_read_cursors(Some(8), 4, row_group_lens.len());
+        assert_eq!(
+            cursor_count, GROUPS,
+            "8 requested cursors over 8 row groups gives 8 cursors"
+        );
+        let cursors = open_stride_cursors(&source, &metadata, &row_group_lens, cursor_count, 1024)
+            .expect("cursors");
+        assert_eq!(cursors.len(), GROUPS, "one cursor per row group");
+
+        assert_eq!(
+            source.footer_reads(),
+            1,
+            "the whole load setup parses the footer exactly once; before #773 it \
+             parsed cursors + 2 = {} times",
+            cursor_count + 2
+        );
+    }
+
+    /// #773: sharing the parsed footer changes nothing the load writes. The same
+    /// fixture loaded through the (changed) stride-cursor path produces the exact
+    /// same rows, objects, and columnar batches it did before.
+    #[tokio::test]
+    async fn shared_footer_load_output_is_unchanged() {
+        use ravel_object_store::memory::MemoryStore;
+
+        const GROUPS: usize = 8;
+        let (_dir, pq, m) = multi_row_group_fixture(GROUPS);
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let report = load(
+            Arc::clone(&store),
+            &pq,
+            "acme",
+            &m,
+            4,
+            1,
+            Some(8),
+            1,
+            NOW_NS,
+            Arc::new(FixedClock(NOW_NS)),
+        )
+        .await
+        .expect("load succeeds");
+
+        // Exact figures, pre-registered from the fixture shape: 8 rows, and with
+        // batch_rows == 1 one columnar batch (hence one RLOG object) per row.
+        assert_eq!(report.rows_processed, GROUPS as u64, "every row is written");
+        assert_eq!(
+            report.columnar_batches_built, GROUPS as u64,
+            "batch_rows == 1 builds one columnar batch per row"
+        );
+        assert_eq!(
+            report.objects_written(),
+            GROUPS,
+            "one shard flush per batch is one object per row"
+        );
+    }
+
     /// Read `pq` back as one RecordBatch. `loader_schema` selects the reader the
     /// loader actually opens: `true` applies [`load_reader_schema`], the
     /// dictionary-preserving derivation `open_stride_cursors` uses (#660);
@@ -4796,7 +5029,7 @@ type = "i64"
     /// before #660 and what the byte-identity anchor compares against.
     fn read_parquet(pq: &Path, loader_schema: bool) -> RecordBatch {
         let schema = if loader_schema {
-            load_reader_schema(pq).expect("derive reader schema")
+            reader_schema_for(pq)
         } else {
             None
         };
@@ -5253,9 +5486,7 @@ type = "i64"
         // The derivation leaves the column alone, so no schema is supplied at
         // all for this file.
         assert!(
-            load_reader_schema(&pq)
-                .expect("derive reader schema")
-                .is_none(),
+            reader_schema_for(&pq).is_none(),
             "no column qualifies, so the loader opens the reader with default options"
         );
 
@@ -5310,9 +5541,8 @@ type = "i64"
 
         // A schema IS supplied (the string column qualifies), so this proves the
         // rule skipped `num` rather than that it never ran.
-        let schema = load_reader_schema(&pq)
-            .expect("derive reader schema")
-            .expect("the string column qualifies, so a schema is supplied");
+        let schema =
+            reader_schema_for(&pq).expect("the string column qualifies, so a schema is supplied");
         assert_eq!(
             schema
                 .field_with_name("num")
