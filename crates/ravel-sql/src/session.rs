@@ -95,6 +95,7 @@ use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
 use datafusion::execution::memory_pool::MemoryPool;
 use datafusion::execution::object_store::ObjectStoreRegistry;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::registry::FunctionRegistry;
 use datafusion::object_store::ObjectStore;
 use datafusion::prelude::{SessionConfig, SessionContext};
@@ -102,6 +103,7 @@ use url::Url;
 
 use crate::avg::sequential_avg_udaf;
 use crate::config::SqlConfig;
+use crate::group_keys::DictionaryGroupKeysAsViews;
 use crate::logs_provider::LogsTableProvider;
 use crate::logs_udf::has_word_udf;
 use crate::map_field_planner::map_field_access_planner;
@@ -503,8 +505,22 @@ pub fn build_session(
         )
         .build_arc()?;
 
-    let mut ctx =
-        SessionContext::new_with_config_rt(session_config(config, exact_typed_aggregates), runtime);
+    // `SessionContext::new_with_config_rt` with one extra physical optimizer
+    // rule. `DictionaryGroupKeysAsViews` keeps a `GROUP BY` over a declared
+    // `Str` column (Arrow `Dictionary(Int32, Utf8)`) off DataFusion's
+    // `RowConverter` group-value path, whose emit cannot exceed `i32::MAX`
+    // decoded bytes in one array (issue #737). It is schema-preserving, so no
+    // caller sees a different result type; see `crate::group_keys`. Appended
+    // after the default rules, which is where `with_physical_optimizer_rule`
+    // puts it: the rewrite must see the final partial/final aggregation split
+    // that `EnforceDistribution` chose.
+    let state = SessionStateBuilder::new()
+        .with_config(session_config(config, exact_typed_aggregates))
+        .with_runtime_env(runtime)
+        .with_default_features()
+        .with_physical_optimizer_rule(Arc::new(DictionaryGroupKeysAsViews))
+        .build();
+    let mut ctx = SessionContext::new_with_state(state);
 
     // Register a hand-written `ExprPlanner` so `col['key']`
     // (`logs.attrs`, `samples.labels`) plans instead of failing with

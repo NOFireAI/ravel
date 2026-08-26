@@ -765,14 +765,7 @@ impl SqlExecutor {
         )
         .map_err(plan_error)?;
         let schema = plan.schema();
-        let inner = execute_stream(Arc::clone(&plan), ctx.task_ctx()).map_err(plan_error)?;
-        Ok(PinnedStream {
-            _ctx: ctx,
-            inner,
-            schema,
-            breach,
-            plan,
-        })
+        PinnedStream::start(ctx, plan, schema, breach)
     }
 
     /// One `Catalog::resolve` plus the `max_segments` budget check. Resolves
@@ -1131,14 +1124,7 @@ impl PinnedQuery {
         // are equivalent: `execute_stream` is `create_physical_plan` then
         // `execute_stream(plan, task_ctx)`.
         let plan = frame.create_physical_plan().await.map_err(plan_error)?;
-        let inner = execute_stream(Arc::clone(&plan), ctx.task_ctx()).map_err(plan_error)?;
-        Ok(PinnedStream {
-            _ctx: ctx,
-            inner,
-            schema,
-            breach,
-            plan,
-        })
+        PinnedStream::start(ctx, plan, schema, breach)
     }
 }
 
@@ -1163,9 +1149,38 @@ pub struct PinnedStream {
     /// it changes nothing about execution: the operators live in `inner`, and
     /// this is the same `Arc` handle.
     plan: Arc<dyn ExecutionPlan>,
+    /// Set once an operator has panicked under [`Stream::poll_next`]. A stream
+    /// whose poll unwound is left in whatever state the panic interrupted, so
+    /// it is never polled again; this fuses it instead.
+    panicked: bool,
 }
 
 impl PinnedStream {
+    /// Execute `plan` under `ctx` and wrap its stream in this type's ceiling
+    /// and panic boundaries.
+    ///
+    /// This is the constructor [`PinnedQuery::execute`] uses. It is public so
+    /// a test can drive a plan the `SqlExecutor` path cannot produce: that
+    /// path registers exactly one table provider of its own choosing
+    /// (`crate::session::build_session`, security invariant 1), so an operator
+    /// that panics on demand has no way in through it.
+    pub fn start(
+        ctx: SessionContext,
+        plan: Arc<dyn ExecutionPlan>,
+        schema: SchemaRef,
+        breach: Arc<CeilingBreach>,
+    ) -> Result<Self, SqlError> {
+        let inner = execute_stream(Arc::clone(&plan), ctx.task_ctx()).map_err(plan_error)?;
+        Ok(PinnedStream {
+            _ctx: ctx,
+            inner,
+            schema,
+            breach,
+            plan,
+            panicked: false,
+        })
+    }
+
     /// The stream's schema, identical to the planned schema.
     pub fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
@@ -1204,9 +1219,51 @@ impl Stream for PinnedStream {
         if let Some(message) = self.breach.message() {
             return Poll::Ready(Some(Err(SqlError::ResourcesExhausted(message.to_string()))));
         }
-        self.inner
-            .poll_next_unpin(cx)
-            .map(|next| next.map(|batch| batch.map_err(execution_error)))
+        if self.panicked {
+            return Poll::Ready(None);
+        }
+        // The panic boundary (issue #737). A panic raised inside a DataFusion
+        // operator, or inside an arrow kernel it calls, unwinds through this
+        // poll: an `i32` offset overflow while a group-by table is decoded is
+        // the case that put it here, but nothing about the boundary is
+        // specific to that one. Unwinding past here kills whichever task is
+        // driving the query -- the HTTP handler or the Flight `DoGet` -- and
+        // the client sees a dropped connection rather than an error.
+        //
+        // `AssertUnwindSafe` is the honest annotation and not a shortcut: the
+        // borrows crossing the boundary really can be left inconsistent by a
+        // panic, which is exactly why `panicked` fuses the stream instead of
+        // resuming it. The default panic hook still runs, so the operator's
+        // own message and backtrace reach stderr before this returns.
+        let polled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.inner.poll_next_unpin(cx)
+        }));
+        match polled {
+            Ok(next) => next.map(|next| next.map(|batch| batch.map_err(execution_error))),
+            Err(payload) => {
+                self.panicked = true;
+                // `payload.as_ref()`, not `&payload`: coercing the `Box`
+                // itself to `&dyn Any` would downcast the box rather than
+                // what it holds, and every arm would miss.
+                let message = panic_message(payload.as_ref());
+                Poll::Ready(Some(Err(SqlError::OperatorPanic(message))))
+            }
+        }
+    }
+}
+
+/// The message carried by a caught panic, for the server-side log.
+///
+/// `panic!` payloads are `&'static str` for a literal and `String` for a
+/// formatted message; anything else came from `panic_any` and has no text to
+/// recover.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "panic with a non-string payload".to_string()
     }
 }
 
