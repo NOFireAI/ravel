@@ -58,6 +58,10 @@ use ravel_logseg::block::NumStat;
 use ravel_logseg::field_dir::FieldDir;
 use ravel_logseg::footer::{self, SectionDesc, kind};
 use ravel_logseg::page_dir::PageDir;
+use ravel_logseg::record::{
+    COL_ATTRS_RAW, COL_BODY, COL_FLAGS, COL_OBSERVED_TS, COL_SEVERITY_NUM, COL_SEVERITY_TEXT,
+    COL_SPAN_ID, COL_STREAM_REF, COL_TRACE_ID, COL_TS,
+};
 use ravel_logseg::skip_index::{Level0Entry, NumRangeArm, SkipIndex, merge_stats};
 use ravel_logseg::stream_dir::StreamDir;
 use ravel_logseg::{
@@ -915,28 +919,55 @@ impl LogSegmentFetcher {
         }))
     }
 
-    /// Whole-object streaming scan for the predicate-free full-window
-    /// whole-segment path (#693 part 3): reads the ENTIRE object in one
-    /// [`GetRange::Full`] GET, bypassing the block-range probe-and-range protocol
-    /// entirely, then opens the pruned, column-projected scan over all of its
-    /// blocks.
+    /// Whole-segment streaming scan for the predicate-free full-window path
+    /// (#693 part 3), for a segment `ravel_sql::logs_scan` has proved (with zero
+    /// I/O, from the resolved snapshot) is fully contained in a predicate-free
+    /// query window. Every block survives, the segment is assigned to exactly
+    /// one partition, and no plan pass runs; this only decides how the bytes
+    /// those blocks need are read.
     ///
-    /// This is the counterpart of
-    /// [`scan_accounted_with_tenant`](Self::scan_accounted_with_tenant) for a
-    /// segment that `ravel_sql::logs_scan` has proved (with zero I/O, from the
-    /// resolved snapshot) is fully contained in a predicate-free query window: it
-    /// is going to read every block, so a whole-object GET is strictly optimal --
-    /// no suffix probe, no per-block ranges, no coverage computation. Above the
-    /// block-range threshold `scan_accounted_with_tenant` would instead issue a
-    /// probe and then (all blocks being candidates) a coverage-crossover
-    /// whole-object GET, i.e. two GETs where this issues one. The whole object is
-    /// keyed `(0, object_size)`, the same key
-    /// [`tenant_bytes`](Self::tenant_bytes)'s whole-object read and
-    /// [`BlockRangeFetcher::fetch_object`]'s crossovers use, so it composes with
-    /// them under the cache's single-flight rather than adding a distinct extent.
+    /// Two read shapes, chosen with no extra I/O from the caller's
+    /// [`ColumnSelection`] and the object size:
     ///
-    /// A single GET observes one object state, so no [`EtagPin`] is needed: the
-    /// multi-GET consistency the block-range path must defend does not arise here.
+    /// - a selection as wide as the object's own column set
+    ///   ([`selects_every_column`]), or an object at or below the block-range
+    ///   threshold: the ENTIRE object in one [`GetRange::Full`] GET, with no
+    ///   suffix probe, no per-block ranges, and no coverage computation. Keyed
+    ///   `(0, object_size)`, the same key
+    ///   [`tenant_bytes`](Self::tenant_bytes)'s whole-object read and
+    ///   [`BlockRangeFetcher::fetch_object`]'s crossovers use, so it composes
+    ///   with them under the cache's single-flight rather than adding a distinct
+    ///   extent. A single GET observes one object state, so no [`EtagPin`] is
+    ///   needed here.
+    /// - a projection narrower than every column, on an object above the
+    ///   threshold: the same ADR-0699 decision 5 chunk read
+    ///   [`scan_accounted_with_tenant`](Self::scan_accounted_with_tenant) takes
+    ///   -- one etag-establishing suffix probe, then one coalesced range per
+    ///   surviving `(row group, projected column)` (#790). Without this, the
+    ///   fast path was the one read shape the chunk fetcher never reached, on
+    ///   exactly the statements with the widest byte-to-projection gap: the v19
+    ///   pass measured every full scan moving 11.1 GB at 8,424 GETs even
+    ///   projecting one column of 105, while selective statements dropped to
+    ///   ~2 GB through PAGE_DIR. Nothing about the fast path changes: no plan
+    ///   pass, whole segments assigned to partitions, one probe per segment, and
+    ///   the >= 75% coverage crossover still reads the object whole, so
+    ///   `SELECT *` and wide projections keep today's single GET.
+    ///
+    /// There is no predicate to prune with, so every block is a candidate on
+    /// the second shape and only the column selection narrows the bytes.
+    ///
+    /// # Version 3
+    ///
+    /// A version-3 object carries no PAGE_DIR: its blocks are contiguous byte
+    /// ranges and a projection is a decode choice only, so the whole-block
+    /// candidate set covers the BLOCKS section and the coverage crossover puts
+    /// the read back on one whole-object GET on the same `(0, object_size)`
+    /// key. The object read is therefore unchanged, but it costs the suffix
+    /// probe that discovered the version: the trailer is the only place the
+    /// format version is written (`ravel_logseg::footer`), so no caller can
+    /// know it without reading the object's tail. The probe is cache-routed on
+    /// the extent every other read of this segment probes, so it is one GET per
+    /// object per query, not one per read.
     pub async fn scan_whole_accounted_with_tenant(
         &self,
         seg_ref: &SegmentRef,
@@ -948,9 +979,14 @@ impl LogSegmentFetcher {
         if !Self::ts_range_relevant(seg_ref, query.ts_min_ns, query.ts_max_ns) {
             return Ok(None);
         }
-        let bytes = self
-            .whole_object_bytes(seg_ref, tenant_hash, accounting)
-            .await?;
+        let bytes =
+            if selects_every_column(columns) || seg_ref.object_size <= self.block_range_threshold {
+                self.whole_object_bytes(seg_ref, tenant_hash, accounting)
+                    .await?
+            } else {
+                self.block_range_bytes(seg_ref, tenant_hash, query, columns, None, accounting)
+                    .await?
+            };
         let key = &seg_ref.data_object_key;
         let span = decode_span();
         let scan = span.in_scope(|| self.open_scan(key, &bytes, query, columns))?;
@@ -1424,42 +1460,67 @@ impl LogSegmentFetcher {
         // ADR-0107: an object above the block-range threshold is fetched by
         // reading only the blocks skip-index pruning proved relevant, not the
         // whole object. Small objects (all current fixtures, RLOG's typical
-        // size) fall through to the unchanged whole-object path below. The
-        // block-range fetcher records its own store/cache accounting; this span
-        // reports its store-GET totals so the phase stays visible.
+        // size) fall through to the unchanged whole-object path below.
         if seg_ref.object_size > self.block_range_threshold {
-            let fetch_span = tracing::debug_span!(
-                "page_fetch",
-                signal = "logs",
-                s3_requests = tracing::field::Empty,
-                s3_bytes = tracing::field::Empty,
-            );
-            let (bytes, stats) = async {
-                self.block_range
-                    .fetch_object_with_footer(
-                        seg_ref,
-                        tenant_hash,
-                        query.ts_min_ns,
-                        query.ts_max_ns,
-                        &query.prune,
-                        columns,
-                        footer,
-                        accounting,
-                    )
-                    .await
-            }
-            .instrument(fetch_span.clone())
-            .await?;
-            let requests = stats.probe_gets + stats.metadata_gets + stats.block_range_gets;
-            fetch_span.record("s3_requests", requests);
-            fetch_span.record("s3_bytes", stats.block_bytes_fetched);
-            return Ok(Some(bytes));
+            return Ok(Some(
+                self.block_range_bytes(seg_ref, tenant_hash, query, columns, footer, accounting)
+                    .await?,
+            ));
         }
 
         Ok(Some(
             self.whole_object_bytes(seg_ref, tenant_hash, accounting)
                 .await?,
         ))
+    }
+
+    /// The above-threshold read shape (ADR-0107, ADR-0699 decision 5): only the
+    /// parts pruning and the projection proved relevant, through
+    /// [`BlockRangeFetcher::fetch_object_with_footer`], under the `page_fetch`
+    /// span every fetch phase here carries. The block-range fetcher records its
+    /// own store/cache accounting; this span reports its store-GET totals so the
+    /// phase stays visible.
+    ///
+    /// Shared by the striped entry ([`tenant_bytes_with_footer`](Self::
+    /// tenant_bytes_with_footer)) and by the projected whole-segment entry
+    /// ([`scan_whole_accounted_with_tenant`](Self::scan_whole_accounted_with_tenant),
+    /// #790), which reach it under different guards: the caller has already
+    /// decided the object is relevant and above the threshold.
+    async fn block_range_bytes(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        query: &LogQuery,
+        columns: &ColumnSelection,
+        footer: Option<&footer::LogFooter>,
+        accounting: &QueryAccounting,
+    ) -> Result<Bytes, LogFetchError> {
+        let fetch_span = tracing::debug_span!(
+            "page_fetch",
+            signal = "logs",
+            s3_requests = tracing::field::Empty,
+            s3_bytes = tracing::field::Empty,
+        );
+        let (bytes, stats) = async {
+            self.block_range
+                .fetch_object_with_footer(
+                    seg_ref,
+                    tenant_hash,
+                    query.ts_min_ns,
+                    query.ts_max_ns,
+                    &query.prune,
+                    columns,
+                    footer,
+                    accounting,
+                )
+                .await
+        }
+        .instrument(fetch_span.clone())
+        .await?;
+        let requests = stats.probe_gets + stats.metadata_gets + stats.block_range_gets;
+        fetch_span.record("s3_requests", requests);
+        fetch_span.record("s3_bytes", stats.block_bytes_fetched);
+        Ok(bytes)
     }
 
     /// One whole-object [`GetRange::Full`] read, cache-keyed `(0, object_size)`,
@@ -1470,7 +1531,8 @@ impl LogSegmentFetcher {
     /// [`tenant_bytes_with_footer`](Self::tenant_bytes_with_footer) and by the
     /// predicate-free full-window whole-segment path
     /// ([`scan_whole_accounted_with_tenant`](Self::scan_whole_accounted_with_tenant),
-    /// #693 part 3), which reads the whole object in one GET regardless of size.
+    /// #693 part 3), which takes it at any object size when the caller decodes
+    /// every column (#790).
     async fn whole_object_bytes(
         &self,
         seg_ref: &SegmentRef,
@@ -4015,6 +4077,55 @@ fn probe_window_covers(desc: &SectionDesc, total_size: u64, suffix: u64) -> bool
 /// so exactly one leading byte is removed. The result is never empty in
 /// practice; if it somehow were, [`blob_contains`] treats it as matching
 /// nothing rather than everything.
+/// Every fixed block column id (`ravel_logseg::record`), including the
+/// `attrs_raw` overflow. A selection has to name all of them, and take the
+/// all-attributes channel on top, before it is as wide as any object's own
+/// column set.
+const EVERY_FIXED_COLUMN: [u32; 10] = [
+    COL_TS,
+    COL_OBSERVED_TS,
+    COL_STREAM_REF,
+    COL_SEVERITY_NUM,
+    COL_SEVERITY_TEXT,
+    COL_BODY,
+    COL_TRACE_ID,
+    COL_SPAN_ID,
+    COL_FLAGS,
+    COL_ATTRS_RAW,
+];
+
+/// Whether `columns` decodes every column of every object, decided with no I/O
+/// (#790): the test the whole-segment entry routes on, since a selection this
+/// wide would fetch every chunk, cross the coverage threshold, and take the
+/// whole-object GET anyway -- after paying a probe and a FIELD_DIR range to
+/// find that out.
+///
+/// [`ColumnSelection::all`] is not the only such selection, and is not the one
+/// the SQL surface produces: `ravel_sql::logs_scan`'s `resolve_columns` builds
+/// even a full projection by NAMING each column, so `SELECT *` arrives here as
+/// a selection with every fixed column plus the all-attributes channel rather
+/// than as `all()`. Routing on `is_all()` alone would put every SQL statement,
+/// however wide, on the chunk read.
+///
+/// Resolution runs against an EMPTY directory on purpose: what comes back is
+/// the fixed columns the selection names (plus the `attrs_raw` overflow the
+/// all-attributes channel adds), which is all this decision needs. An object's
+/// dynamic columns need no directory here, because they are covered exactly
+/// when [`ColumnSelection::wants_all_attrs`] is set, whatever the object
+/// declares.
+fn selects_every_column(columns: &ColumnSelection) -> bool {
+    if columns.is_all() {
+        return true;
+    }
+    if !columns.wants_all_attrs() {
+        return false;
+    }
+    match columns.resolve(&FieldDir::new(Vec::new())) {
+        None => true,
+        Some(ids) => EVERY_FIXED_COLUMN.iter().all(|id| ids.contains(id)),
+    }
+}
+
 fn stream_attr_needle(filter: &StreamAttrEquals) -> Vec<u8> {
     let full = canonical_attr_bytes(std::slice::from_ref(&(
         filter.key.clone(),

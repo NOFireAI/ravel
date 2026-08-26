@@ -22,6 +22,11 @@
 //! 7. The default suffix probe covers the plan sections (footer, SKIP_IDX,
 //!    PAGE_DIR) of a wide, full-row-group object, so #766's second GET is gone.
 //! 8. What a chunk read decodes is what a whole-object read decodes.
+//! 9. The predicate-free full-window whole-segment entry
+//!    (`scan_whole_accounted_with_tenant`) takes the same chunk read when the
+//!    caller projects (#790), and keeps its single whole-object GET for
+//!    `ColumnSelection::all`, for a wide projection over the coverage
+//!    crossover, and for a version-3 object.
 //!
 //! The oracle for 1-3 is PAGE_DIR itself, walked here independently of the
 //! fetcher's own walk, plus an exact literal so a silent change in either shows
@@ -54,6 +59,7 @@ use ravel_object_store::{
 use ravel_query::{BlockRangeFetcher, CacheFetchError, LogFetchError, LogQuery, LogSegmentFetcher};
 use ravel_types::TenantHash;
 use ravel_types::accounting::{AccountedOp, QueryAccounting};
+use ravel_types::logstream::LogStreamId;
 use uuid::Uuid;
 
 const TENANT: TenantHash = TenantHash([7u8; 16]);
@@ -135,16 +141,30 @@ fn records() -> Vec<LogRecord> {
 }
 
 fn build_object(records: &[LogRecord]) -> Vec<u8> {
-    let cfg = RlogConfig {
-        block_target_records: BLOCK_RECORDS,
-        group_target_blocks: GROUP_BLOCKS,
-        ..RlogConfig::default()
-    };
-    let mut w = RlogWriter::new(cfg, identity());
+    let mut w = RlogWriter::new(fixture_config(), identity());
     for r in records {
         w.push(r.clone()).expect("push");
     }
     w.finish().expect("finish v4")
+}
+
+/// The same records in the version-3 BLOCKS layout (`header || pages` per
+/// block, no PAGE_DIR), the N-1 reader's format (ADR-0066 decision 1). Written
+/// through the writer's test-only version-3 exit; production writes version 4.
+fn build_v3_object(records: &[LogRecord]) -> Vec<u8> {
+    let mut w = RlogWriter::new(fixture_config(), identity());
+    for r in records {
+        w.push(r.clone()).expect("push");
+    }
+    w.finish_v3_for_tests().expect("finish v3")
+}
+
+fn fixture_config() -> RlogConfig {
+    RlogConfig {
+        block_target_records: BLOCK_RECORDS,
+        group_target_blocks: GROUP_BLOCKS,
+        ..RlogConfig::default()
+    }
 }
 
 fn seg_ref(size: u64, records: &[LogRecord]) -> SegmentRef {
@@ -1152,4 +1172,368 @@ async fn version_4_chunk_read_decodes_what_a_whole_object_read_decodes() {
             );
         }
     }
+}
+
+// ---- 9. the predicate-free whole-segment fast path projects too (#790) -----
+
+/// The stored length of one front directory section.
+fn section_len(bytes: &[u8], k: u32) -> u64 {
+    footer_of(bytes).section(k).expect("section present").len
+}
+
+/// A fetcher whose whole-segment entry takes the ranged path on this small
+/// fixture: the probe covers exactly the object tail and nothing coalesces, so
+/// every GET count below is a statement about the read shape.
+fn whole_segment_fetcher(store: Arc<dyn ObjectStoreBackend>, bytes: &[u8]) -> LogSegmentFetcher {
+    LogSegmentFetcher::new(Arc::clone(&store))
+        .with_block_range_threshold(0)
+        .with_block_range(ranged(store, bytes))
+}
+
+/// Drains a scan opened by the whole-segment entry and returns `(ts, stream,
+/// flags)` per row, the fields a `flags` projection can speak for.
+fn projected_rows(rows: &[LogRecord]) -> Vec<(i64, LogStreamId, u32)> {
+    rows.iter()
+        .map(|r| (r.ts_ns, r.stream_id, r.flags))
+        .collect()
+}
+
+/// The predicate-free full-window whole-segment path over a version-4 object
+/// reads through PAGE_DIR when the caller projects: one suffix probe, one GET
+/// for each of the two front sections no suffix reaches, and one range per
+/// surviving `(row group, projected column)` -- and it moves those columns'
+/// page bytes plus that fixed overhead, not the object.
+///
+/// Before #790 this entry called `whole_object_bytes` unconditionally, so it
+/// was the one read shape ADR-0699's chunk fetcher never reached, on exactly
+/// the statements with the widest byte-to-projection gap.
+///
+/// Non-vacuity: restoring the old body (`let bytes = self
+/// .whole_object_bytes(seg_ref, tenant_hash, accounting).await?;` in
+/// `LogSegmentFetcher::scan_whole_accounted_with_tenant`) makes this one
+/// `GetRange::Full` of the whole object: `suffix_gets` is 0, `full_gets` is 1,
+/// the range count is 0, and the byte total is the object.
+#[tokio::test]
+async fn whole_segment_fast_path_projects_a_version_4_object_through_page_dir() {
+    let recs = records();
+    let bytes = build_object(&recs);
+    let mem = store_with(&bytes).await;
+    let recording = RecordingStore::new(mem);
+    let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&recording) as Arc<dyn ObjectStoreBackend>;
+
+    // One queried column (`flags`) plus the two the format always decodes.
+    let sel = ColumnSelection::fixed_only().with_flags();
+    let ids = resolved(&bytes, &sel).expect("a projection, not all columns");
+    assert_eq!(ids, HashSet::from([COL_TS, COL_STREAM_REF, COL_FLAGS]));
+    let all_blocks: Vec<usize> = (0..BLOCKS).collect();
+    let runs = expected_runs(&bytes, &all_blocks, Some(&ids), 0);
+
+    let fetcher = whole_segment_fetcher(store, &bytes);
+    let seg = seg_ref(bytes.len() as u64, &recs);
+    // The window contains the segment and carries no predicate: the shape
+    // `ravel_sql::logs_scan` proves before it takes this entry.
+    let query = LogQuery::new(i64::MIN, i64::MAX);
+    let acc = QueryAccounting::new();
+    let mut scan = fetcher
+        .scan_whole_accounted_with_tenant(&seg, TENANT, &query, &sel, &acc)
+        .await
+        .expect("whole-segment scan")
+        .expect("in range");
+    let mut got = Vec::new();
+    while let Some(rows) = scan.next_block().expect("decode") {
+        got.extend(rows);
+    }
+    assert_eq!(got.len(), RECORDS, "every record of the segment comes back");
+
+    assert_eq!(recording.full_gets(), 0, "no whole-object GET");
+    assert_eq!(
+        recording.suffix_gets(),
+        1,
+        "one etag-establishing suffix probe per segment"
+    );
+    // 9 = 3 row groups x 3 projected columns, plus STREAM_DIR and FIELD_DIR at
+    // the object front. The exact literal beside the oracle: a change in the
+    // fixture's layout or in the fetcher's walk has to move this number.
+    assert_eq!(runs.len(), 9, "one run per (row group, projected column)");
+    assert_eq!(
+        recording.ranges().len(),
+        11,
+        "9 chunk ranges + 2 front sections: {:?}",
+        recording.ranges()
+    );
+    assert_eq!(
+        recording.gets(),
+        12,
+        "1 probe + 2 front sections + 9 ranges"
+    );
+
+    let mut issued: Vec<(u64, u64)> = recording
+        .ranges()
+        .into_iter()
+        .filter(|(a, b)| runs.iter().any(|(s, l)| a == s && b == &(s + l)))
+        .collect();
+    issued.sort_unstable();
+    let mut want: Vec<(u64, u64)> = runs.iter().map(|(s, l)| (*s, s + l)).collect();
+    want.sort_unstable();
+    assert_eq!(issued, want, "the chunk GETs are the resolved chunk ranges");
+
+    // The exact byte figure: the projected columns' page bytes plus the fixed
+    // probe and front-section overhead, and nothing else.
+    let chunk_bytes: u64 = runs.iter().map(|(_, l)| l).sum();
+    let overhead = tail_len(&bytes)
+        + section_len(&bytes, kind::STREAM_DIR)
+        + section_len(&bytes, kind::FIELD_DIR);
+    let moved = acc.snapshot().total_s3_bytes();
+    assert_eq!(
+        moved,
+        chunk_bytes + overhead,
+        "the read moves the projected pages ({chunk_bytes}) plus the probe and front \
+         sections ({overhead}) and nothing else"
+    );
+    let object = bytes.len() as u64;
+    assert!(
+        moved * 4 < object,
+        "the whole-segment read must now move well under a quarter of the object: \
+         {moved} of {object}"
+    );
+}
+
+/// What the projected whole-segment read decodes is what the whole-object read
+/// decodes: every row, and the projected column's value on each, by value.
+///
+/// Non-vacuity: with the pre-#790 body restored the two sides are the same
+/// whole-object read and the comparison cannot fail; it is meaningful because
+/// the left side now fetches a strict subset of the object's bytes, which the
+/// byte assertion states.
+#[tokio::test]
+async fn whole_segment_projected_scan_decodes_what_the_whole_object_scan_decodes() {
+    let recs = records();
+    let bytes = build_object(&recs);
+    let store: Arc<dyn ObjectStoreBackend> = store_with(&bytes).await;
+    let seg = seg_ref(bytes.len() as u64, &recs);
+    let query = LogQuery::new(i64::MIN, i64::MAX);
+    let sel = ColumnSelection::fixed_only().with_flags();
+
+    // The unchanged whole-object read of the same entry (production defaults:
+    // the fixture sits below the block-range threshold).
+    let whole = LogSegmentFetcher::new(Arc::clone(&store));
+    let whole_acc = QueryAccounting::new();
+    let mut want = Vec::new();
+    let mut scan = whole
+        .scan_whole_accounted_with_tenant(&seg, TENANT, &query, &sel, &whole_acc)
+        .await
+        .expect("whole scan")
+        .expect("in range");
+    while let Some(rows) = scan.next_block().expect("decode") {
+        want.extend(rows);
+    }
+
+    let acc = QueryAccounting::new();
+    let chunked = whole_segment_fetcher(Arc::clone(&store), &bytes);
+    let mut got = Vec::new();
+    let mut scan = chunked
+        .scan_whole_accounted_with_tenant(&seg, TENANT, &query, &sel, &acc)
+        .await
+        .expect("chunk scan")
+        .expect("in range");
+    while let Some(rows) = scan.next_block().expect("decode") {
+        got.extend(rows);
+    }
+
+    assert_eq!(got, want, "projected chunk read == whole-object read");
+    // Pinned by value, not only against the other read: `flags` is
+    // `(i & 7) + 1` and `ts` is `i`, for all 12 records in order.
+    let expected: Vec<(i64, LogStreamId, u32)> = (0..RECORDS)
+        .map(|i| {
+            let r = record(i);
+            (r.ts_ns, r.stream_id, r.flags)
+        })
+        .collect();
+    assert_eq!(expected.len(), RECORDS);
+    assert_eq!(projected_rows(&got), expected, "every row, by value");
+    assert!(
+        acc.snapshot().total_s3_bytes() < whole_acc.snapshot().total_s3_bytes(),
+        "the projected read moved fewer bytes than the whole-object read: {} vs {}",
+        acc.snapshot().total_s3_bytes(),
+        whole_acc.snapshot().total_s3_bytes()
+    );
+}
+
+/// `ColumnSelection::all` keeps the pre-#790 read exactly: one whole-object GET,
+/// no probe, no range.
+#[tokio::test]
+async fn whole_segment_all_columns_reads_the_object_whole() {
+    let recs = records();
+    let bytes = build_object(&recs);
+    let mem = store_with(&bytes).await;
+    let recording = RecordingStore::new(mem);
+    let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&recording) as Arc<dyn ObjectStoreBackend>;
+
+    let fetcher = whole_segment_fetcher(store, &bytes);
+    let seg = seg_ref(bytes.len() as u64, &recs);
+    let query = LogQuery::new(i64::MIN, i64::MAX);
+
+    // Both spellings of "every column": `ColumnSelection::all`, and the one the
+    // SQL surface actually produces for a full projection, which NAMES each
+    // fixed column and takes the all-attributes channel
+    // (`ravel_sql::logs_scan::resolve_columns`) and so answers `is_all() ==
+    // false`. Routing on `is_all()` alone would put every SQL statement,
+    // however wide, on the chunk read.
+    let named_every_column = ColumnSelection::fixed_only()
+        .with_observed_ts()
+        .with_severity_num()
+        .with_severity_text()
+        .with_body()
+        .with_trace_id()
+        .with_span_id()
+        .with_flags()
+        .with_all_attrs();
+    assert!(
+        !named_every_column.is_all(),
+        "the SQL-shaped full projection is not `all()`; that is the point"
+    );
+
+    for (label, sel) in [
+        ("all()", ColumnSelection::all()),
+        ("named every column", named_every_column),
+    ] {
+        let before = recording.gets();
+        let acc = QueryAccounting::new();
+        let mut scan = fetcher
+            .scan_whole_accounted_with_tenant(&seg, TENANT, &query, &sel, &acc)
+            .await
+            .expect("whole-segment scan")
+            .expect("in range");
+        let mut rows = 0usize;
+        while let Some(block) = scan.next_block().expect("decode") {
+            rows += block.len();
+        }
+
+        assert_eq!(rows, RECORDS, "{label}");
+        assert_eq!(recording.gets() - before, 1, "{label}: exactly one GET");
+        assert_eq!(recording.suffix_gets(), 0, "{label}: no probe, ever");
+        assert!(recording.ranges().is_empty(), "{label}: no range GET");
+        assert_eq!(
+            acc.snapshot().total_s3_bytes(),
+            bytes.len() as u64,
+            "{label}: exactly the object"
+        );
+    }
+    assert_eq!(recording.full_gets(), 2, "one whole-object GET each");
+}
+
+/// A projection wide enough to cross the 75% coverage threshold reads the
+/// object whole: the crossover applies to this entry exactly as it does to the
+/// striped one, so `SELECT *`-shaped statements keep their single GET.
+#[tokio::test]
+async fn whole_segment_wide_projection_crosses_over_to_one_whole_object_get() {
+    let recs = records();
+    let bytes = build_object(&recs);
+    let mem = store_with(&bytes).await;
+    let recording = RecordingStore::new(mem);
+    let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&recording) as Arc<dyn ObjectStoreBackend>;
+
+    // `body` is 8 KiB per record against a few bytes for every other column, so
+    // keeping it covers well over 75% of the BLOCKS section.
+    let sel = ColumnSelection::fixed_only().with_body();
+    let ids = resolved(&bytes, &sel).expect("a projection, not all columns");
+    let runs = expected_runs(&bytes, &(0..BLOCKS).collect::<Vec<_>>(), Some(&ids), 0);
+    let wanted: u64 = runs.iter().map(|(_, l)| l).sum();
+    let (_, blocks_len) = blocks_extent(&bytes);
+    assert!(
+        wanted as f64 / blocks_len as f64 >= 0.75,
+        "the fixture must put this projection over the crossover: {wanted} of {blocks_len}"
+    );
+
+    let fetcher = whole_segment_fetcher(store, &bytes);
+    let seg = seg_ref(bytes.len() as u64, &recs);
+    let query = LogQuery::new(i64::MIN, i64::MAX);
+    let acc = QueryAccounting::new();
+    let mut scan = fetcher
+        .scan_whole_accounted_with_tenant(&seg, TENANT, &query, &sel, &acc)
+        .await
+        .expect("whole-segment scan")
+        .expect("in range");
+    let mut rows = 0usize;
+    while let Some(block) = scan.next_block().expect("decode") {
+        rows += block.len();
+    }
+
+    assert_eq!(rows, RECORDS);
+    assert_eq!(recording.full_gets(), 1, "the crossover reads the object");
+    assert_eq!(
+        recording.suffix_gets(),
+        1,
+        "the probe that resolved PAGE_DIR"
+    );
+    assert_eq!(
+        recording.ranges().len(),
+        1,
+        "FIELD_DIR only, to resolve the projection: {:?}",
+        recording.ranges()
+    );
+}
+
+/// A version-3 object has no PAGE_DIR, so its blocks are contiguous and a
+/// projection is a decode choice only: the candidate set covers the BLOCKS
+/// section, the coverage crossover fires, and the object is read whole in one
+/// `GetRange::Full` on the same `(0, object_size)` key as before.
+///
+/// The suffix probe in front of it is the version discovery: the trailer is the
+/// only place the format version is written, so no caller can route on it
+/// without reading the object's tail. That is one extra cache-routed GET per
+/// object per query on a version-3 object, and no extra whole-object read.
+#[tokio::test]
+async fn whole_segment_on_a_version_3_object_reads_the_object_whole() {
+    let recs = records();
+    let bytes = build_v3_object(&recs);
+    assert!(
+        footer_of(&bytes).section(kind::PAGE_DIR).is_none(),
+        "the fixture must be a version-3 object"
+    );
+    let mem = store_with(&bytes).await;
+    let recording = RecordingStore::new(mem);
+    let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&recording) as Arc<dyn ObjectStoreBackend>;
+
+    let fetcher = whole_segment_fetcher(store, &bytes);
+    let seg = seg_ref(bytes.len() as u64, &recs);
+    let query = LogQuery::new(i64::MIN, i64::MAX);
+    let acc = QueryAccounting::new();
+    let mut scan = fetcher
+        .scan_whole_accounted_with_tenant(
+            &seg,
+            TENANT,
+            &query,
+            &ColumnSelection::fixed_only().with_flags(),
+            &acc,
+        )
+        .await
+        .expect("whole-segment scan")
+        .expect("in range");
+    let mut got = Vec::new();
+    while let Some(rows) = scan.next_block().expect("decode") {
+        got.extend(rows);
+    }
+
+    assert_eq!(got.len(), RECORDS, "every record of the segment comes back");
+    assert_eq!(
+        recording.full_gets(),
+        1,
+        "the object is still read whole, exactly once"
+    );
+    assert_eq!(
+        recording.suffix_gets(),
+        1,
+        "one probe, which is what reads the version"
+    );
+    assert!(
+        recording.ranges().is_empty(),
+        "no section GET: the probe covers the tail: {:?}",
+        recording.ranges()
+    );
+    assert_eq!(
+        acc.snapshot().total_s3_bytes(),
+        bytes.len() as u64 + tail_len(&bytes),
+        "the whole object plus the probe suffix"
+    );
 }

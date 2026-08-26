@@ -137,17 +137,40 @@ and needs each one back as a residual.
 
 Every OTHER predicate-free, full-window logs statement — `SUM`, `AVG`,
 `GROUP BY`, `ORDER BY ... LIMIT` over the whole table — still executes
-`LogsScanExec`, but issues exactly one whole-object GET per relevant segment and
-ZERO suffix probes (#693 part 3). When the query carries no block-level
-predicate and no pending erasure, its window fully contains every relevant
-segment, and there are at least `target_partitions` of them, `LogsScanExec`
-skips its plan phase entirely: no block can be pruned,
-so it assigns whole segments round-robin (one owner per segment) and reads each
-in a single `GetRange::Full`. That removes both probe classes the pre-#693-part-3
-path paid above the block-range threshold — the plan-phase footer probe and the
-per-open scan-side re-probe — which on the 8424-object ClickBench tenant (#680)
-were a combined ~24,700 probes on top of the 8,424 whole-object reads for one
-`SELECT`. When any of those conditions fails the unchanged plan-then-stripe path
+`LogsScanExec`, with NO plan phase and one read sequence per relevant segment.
+When the query carries no block-level predicate and no pending erasure, its
+window fully contains every relevant segment, and there are at least
+`target_partitions` of them, `LogsScanExec` skips its plan phase entirely: no
+block can be pruned, so it assigns whole segments round-robin (one owner per
+segment). That removes both probe classes the pre-#693-part-3 path paid above
+the block-range threshold — the plan-phase footer probe and the per-open
+scan-side re-probe — which on the 8424-object ClickBench tenant (#680) were a
+combined ~24,700 probes on top of the 8,424 whole-object reads for one `SELECT`.
+
+What one such segment costs depends on the projection (#790). A statement whose
+column selection is as wide as the object's own column set, and any object at
+or below the block-range threshold, reads the object in a single `GetRange::Full`
+with no suffix probe at all. "As wide as the object" is decided with no I/O and
+is not the same test as `ColumnSelection::all()`: a full SQL projection arrives
+as a selection that NAMES every fixed column and takes the all-attributes
+channel (`resolve_columns`), so the routing checks for that shape too — the
+alternative would put `SELECT *` on the chunk read, where it would fetch every
+chunk, cross the coverage threshold, and take the whole-object GET anyway after
+paying a probe and a FIELD_DIR range to find out. A statement that projects a
+narrower column set out of an above-threshold version-4 object reads through
+PAGE_DIR instead, exactly as the striped path does: one suffix probe, then one
+coalesced range per surviving `(row group, projected column)` — every block
+survives, so only the projection narrows the bytes — with the front-section
+GETs and the 75% coverage crossover described
+under "Requests per object on a version-4 object" below. Until #790 this entry
+was the one read shape the chunk fetcher never reached, on exactly the
+statements with the widest byte-to-projection gap: the v19 pass measured every
+full scan moving 11.1 GB at 8,424 GETs even projecting one column of 105, while
+selective statements dropped to about 2 GB through PAGE_DIR. A version-3 object
+has no PAGE_DIR, so its candidate blocks cover the BLOCKS section, the coverage
+crossover fires, and it is still read whole on the same `(0, object_size)` key —
+behind the probe that read its version, which the trailer is the only place to
+find. When any of those conditions fails the unchanged plan-then-stripe path
 runs (its plan phase probes each segment once), and the scan publishes a
 `fast_path_rejected_*` counter naming the conjunct that sent it there; a footer
 read there is carried to the per-partition subset opens so they skip re-probing
@@ -220,10 +243,17 @@ than a block. The request law for one statement over one such object:
 
 **One suffix probe, plus one coalesced range per surviving `(row group,
 projected column)`, plus front-section ranges (STREAM_DIR always, FIELD_DIR
-when the query carries numeric arms) only when the probe's cached suffix does
-not already cover them.** That is one to four GETs per object for a typical
-narrow projection over a small object, and it grows with `row_groups x
-projected_columns` rather than with the object's block count.
+when the query carries numeric arms or projects fewer than every column) only
+when the probe's cached suffix does not already cover them.** That is one to
+four GETs per object for a typical narrow projection over a small object, and it
+grows with `row_groups x projected_columns` rather than with the object's block
+count.
+
+This law governs both entries into the scan since #790: the plan-then-stripe
+path a predicate sends a statement down, and the predicate-free full-window
+whole-segment path above, whose only difference is that every block survives so
+the candidate set is never narrowed. A statement that decodes every column takes
+one whole-object GET on either entry.
 
 The pieces, and why each is where it is:
 
@@ -251,9 +281,14 @@ The pieces, and why each is where it is:
 Reference figures on the 8,424-object ClickBench tenant, at version 4. A
 single-column, predicate-free statement reads 8,424 probes plus about one
 coalesced range per object (these objects hold roughly two blocks, so one row
-group), moving on the order of `1/N` of each object for `N` columns of similar
-width — a few hundred MB against the 11.1 GB the version-3 whole-object reads
-moved for the same statement. A selective statement adds its FIELD_DIR range
+group) plus its two front sections, moving on the order of `1/N` of each object
+for `N` columns of similar width — a few hundred MB against the 11.1 GB the
+version-3 whole-object reads moved for the same statement, which the v19 pass
+measured at 8,424 GETs. That statement takes the whole-segment path, so before
+#790 it read every object whole however narrow its projection; the figure above
+is the prediction the v21 pass checks. `SELECT *` is unchanged either way: it
+decodes every column, so it keeps the single whole-object GET per object and
+moves the 11.1 GB the objects hold. A selective statement adds its FIELD_DIR range
 where the probe did not cover it and reads only the surviving blocks' pages:
 q37-class drops from 19,690 GETs and 11.7 GB, and q20-class from 29,614 GETs and
 17.9 GB, to between one and three GETs per relevant object either way. The
@@ -1603,14 +1638,23 @@ applies: each row carries reads per segment and bytes fetched over dataset
 bytes, derived in the report rather than left to the reader. For a
 block-predicate-free statement whose window contains every relevant segment —
 the report's `SELECT ts, body FROM logs`, and the shape the whole-segment fast
-path serves (#693 part 3, amended by #739) — those two figures are about 1
-(the reads figure divides every accounted GET by the segment count, so the
-resolve's one catalog probe lifts it slightly above 1: 1.03 on the 32-segment
-fixture) and 1.0 at every partition count that fits inside the segment count,
-on both read shapes and with or without a cache: since #739 dropped the block-range-threshold
-conjunct, object size no longer gates the fast path, so the plan phase is skipped
-and each segment is read whole once, and there is nothing left for the cache to
-absorb. The multiplier reappears only on the cache-wired row whose partition
+path serves (#693 part 3, amended by #739) — the plan phase is skipped and each
+segment is read once at every partition count that fits inside the segment
+count, with or without a cache, since #739 dropped the block-range-threshold
+conjunct and object size no longer gates the fast path. What one read costs
+still splits by read shape, since #790: on the whole-object (below-threshold)
+rows it is one full-range GET, so reads per segment is about 1 (the figure
+divides every accounted GET by the segment count, so the resolve's one catalog
+probe lifts it slightly above 1: 1.03 on the 32-segment fixture) and bytes over
+dataset bytes is 1.0 within float slack. On the above-threshold rows the
+statement's two-column projection now reads through PAGE_DIR, so both figures
+move: a probe plus the projected chunk ranges (or, where `body` puts the
+projection over the 75% coverage crossover, a probe plus one whole-object GET).
+The report's own module documentation still describes the pre-#790 shape for
+those rows; its numbers are the measurement, and the prose there is stale until
+a run replaces it.
+
+The multiplier reappears only on the cache-wired row whose partition
 count exceeds the segment count, which falls back to plan-then-stripe — and even
 there only on the above-threshold read shape, since a whole-object stripe
 coalesces onto the one `(0, object_size)` cache key.
