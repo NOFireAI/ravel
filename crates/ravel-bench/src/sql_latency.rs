@@ -205,9 +205,26 @@ pub struct Provenance {
     /// with that error was refused by this, not by any byte ceiling.
     #[serde(default = "default_max_segments")]
     pub sql_max_segments: usize,
-    /// Whether final aggregations were allowed to repartition (ADR-0094).
+    /// What this benchmark process was *asked* to do about repartitioning an
+    /// exact-typed final aggregation (ADR-0094): the local
+    /// `--sql-parallel-final-aggregation` CLI value. This is only the request,
+    /// not necessarily what governed execution -- see
+    /// `parallel_final_aggregation_effective`. Named `requested` (not the bare
+    /// `parallel_final_aggregation`) precisely because the two can differ under
+    /// the Flight lane.
+    #[serde(default, alias = "parallel_final_aggregation")]
+    pub parallel_final_aggregation_requested: bool,
+    /// The value that actually governed execution, when this harness knows it.
+    /// `Some(v)` for an in-process lane (`generate`/`tenant`), which applies the
+    /// requested value directly to `SqlConfig::parallel_final_aggregation`.
+    /// `None` for the Flight lane: the benchmark does not send this setting over
+    /// the wire (it is not a Flight header), so a Flight run's effective value is
+    /// the running server's own -- the compiled-in default (`true`, on) unless
+    /// the server was started with `--sql-parallel-final-aggregation=false`.
+    /// Recording `None` rather than the local request stops a Flight report from
+    /// claiming a setting it never established.
     #[serde(default)]
-    pub parallel_final_aggregation: bool,
+    pub parallel_final_aggregation_effective: Option<bool>,
     /// Whether the run wrote a per-statement physical plan (`--explain`). The
     /// plans are a side artifact under `--explain-dir`, never part of the
     /// numbers above.
@@ -1223,7 +1240,10 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
             fetch_concurrency: cfg.fetch_concurrency.max(1),
             tenant_max_bytes: cfg.tenant_max_bytes.max(1),
             sql_max_segments: cfg.max_segments,
-            parallel_final_aggregation: cfg.parallel_final_aggregation,
+            parallel_final_aggregation_requested: cfg.parallel_final_aggregation,
+            // In-process lane: the requested value reaches the executor's
+            // `SqlConfig`, so it is also the effective one.
+            parallel_final_aggregation_effective: Some(cfg.parallel_final_aggregation),
             explain: cfg.explain_dir.is_some(),
             flight_endpoint: None,
         },
@@ -1331,7 +1351,15 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
             fetch_concurrency: cfg.fetch_concurrency.max(1),
             tenant_max_bytes: cfg.tenant_max_bytes.max(1),
             sql_max_segments: cfg.max_segments,
-            parallel_final_aggregation: cfg.parallel_final_aggregation,
+            parallel_final_aggregation_requested: cfg.parallel_final_aggregation,
+            // The Flight lane does not send this setting to the server (it is not
+            // a Flight header), so what governed execution is the server's own
+            // config, unknown to this process: record `None`. An in-process
+            // tenant run applies the requested value directly, so it is effective.
+            parallel_final_aggregation_effective: match &cfg.flight {
+                Some(_) => None,
+                None => Some(cfg.parallel_final_aggregation),
+            },
             explain: cfg.explain_dir.is_some(),
             flight_endpoint: cfg.flight.as_ref().map(|t| t.endpoint.clone()),
         },
@@ -1887,6 +1915,40 @@ mod tests {
         assert!(
             !off_dir.path().join("agg.txt").exists(),
             "explain off writes no plan file"
+        );
+    }
+
+    /// An in-process (`tenant`) run applies its `parallel_final_aggregation`
+    /// request directly to the executor's `SqlConfig`, so the report records it
+    /// under both `_requested` and `_effective`, equal. (The Flight lane, where
+    /// the setting is not on the wire and `_effective` is `None`, is pinned by
+    /// `sql_latency_flight_smoke.rs` under the `flight-lane` feature.)
+    #[tokio::test]
+    async fn in_process_report_records_requested_and_effective_equal() {
+        let store = empty_store();
+        provisioned_tenant(&store, "agg-tenant").await;
+
+        let mut cfg = tenant_cfg(&store, "agg-tenant", None, 0);
+        cfg.entries = vec![entry("scan", "SELECT body FROM logs")];
+        cfg.parallel_final_aggregation = true;
+        let report = run_tenant(&cfg).await.expect("tenant lane runs");
+        assert!(
+            report.provenance.parallel_final_aggregation_requested,
+            "the requested field carries the config value"
+        );
+        assert_eq!(
+            report.provenance.parallel_final_aggregation_effective,
+            Some(true),
+            "an in-process run's effective value is the applied request"
+        );
+
+        cfg.parallel_final_aggregation = false;
+        let report = run_tenant(&cfg).await.expect("tenant lane runs");
+        assert!(!report.provenance.parallel_final_aggregation_requested);
+        assert_eq!(
+            report.provenance.parallel_final_aggregation_effective,
+            Some(false),
+            "requested and effective stay equal for an in-process run"
         );
     }
 

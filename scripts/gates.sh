@@ -152,8 +152,8 @@ fi
 # locally. stage-timing is a separate lane CI checks and runs, kept at parity.
 if [[ ${want_bench} -eq 1 ]]; then
   run_feature_lane sql-latency,profiling,flight-lane -p ravel-bench
-  echo "==> cargo check --locked -p ravel-bench --features stage-timing"
-  cargo check --locked -p ravel-bench --features stage-timing
+  echo "==> cargo check --locked -p ravel-bench --features stage-timing --all-targets"
+  cargo check --locked -p ravel-bench --features stage-timing --all-targets
   echo "==> cargo test --locked -p ravel-bench --features stage-timing"
   cargo test --locked -p ravel-bench --features stage-timing
 fi

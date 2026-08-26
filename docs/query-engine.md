@@ -1792,6 +1792,18 @@ fails closed to the single-partition plan (a missed optimization, never a wrong
 result). With the opt-out set, no classification runs and every query is
 single-partition, byte-identical to before this feature existed.
 
+A **non-float `GROUP BY` key, string keys included, is eligible**: the gate
+rejects only *float* group keys (and float/`avg` aggregates), so a string-keyed
+`GROUP BY count(...)` is admitted and its final is repartitioned. This governs
+the **final** stage only. It does not address the **partial** stage: a
+high-cardinality `GROUP BY` can still exhaust the per-query memory pool at the
+`Partial` `AggregateExec` -- the `partitions x distinct` pre-final state
+materialized per scan partition -- even with the final repartitioned. That
+partial-stage memory problem is a separate concern, tracked as issue #737 (the
+`skip_partial_aggregation` mitigation); it is why some high-cardinality
+statements still fail with parallel final aggregation on. Do not read this
+feature as making every high-cardinality `GROUP BY` complete.
+
 Row order is unaffected. A `GROUP BY` without an explicit `ORDER BY` has **no
 row-order guarantee** in this engine -- single-partition or repartitioned, and
 unchanged by ADR-0094. Under repartitioned final aggregation the physical merge
