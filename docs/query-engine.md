@@ -1248,7 +1248,7 @@ conformance_table`; regenerate that same command with
 `RAVEL_UPDATE_CONFORMANCE_TABLE=1`. Do not edit the block between
 the markers by hand.
 
-Surface: 133 constructs over 238 corpus entries in 10 corpus files.
+Surface: 133 constructs over 242 corpus entries in 10 corpus files.
 
 | State | Constructs |
 | --- | --- |
@@ -1347,7 +1347,7 @@ Surface: 133 constructs over 238 corpus entries in 10 corpus files.
 | `exp` | function | supported | `corpus/transform.txt`, 1 entry |
 | `floor` | function | supported | `corpus/transform.txt`, 1 entry |
 | `histogram_avg` | function | supported | `corpus/histogram_native.txt`, 1 entry |
-| `histogram_count` | function | supported | `corpus/histogram_native.txt`, 3 entries |
+| `histogram_count` | function | supported | `corpus/histogram_native.txt`, 5 entries |
 | `histogram_fraction` | function | supported | `corpus/histogram_classic.txt`, 3 entries |
 | `histogram_quantile` | function | supported | `corpus/histogram_classic.txt`, 8 entries |
 | `histogram_stddev` | function | intentionally rejected | `Unsupported: function call (422 execution)`; rejection verified; not in ravel-promql's function registry; native-histogram dispersion is not implemented |

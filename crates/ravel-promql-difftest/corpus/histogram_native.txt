@@ -49,7 +49,9 @@
 # Dataset: diff_native_hist{kind="counter"} is a monotonic counter native
 # histogram (schema 0, three positive buckets, populated zero bucket).
 # diff_native_hist_agg{i="1"|"2"} are two constant native histograms for
-# aggregation.
+# aggregation. diff_native_hist_schema{kind="counter"} is a monotonic counter
+# that changes schema up at sample 13 and back down at sample 27, for the
+# directional counter-reset entries near the end of this file.
 
 name: native_histogram_count
 query: histogram_count(diff_native_hist)
@@ -308,6 +310,66 @@ name: native_histogram_resets_instant
 query: resets(diff_native_hist[5m])
 kind: instant
 time: +600s
+mode: unordered
+
+# Schema transitions (#679). Prometheus' counter-reset detection is
+# DIRECTIONAL about the schema term: a schema INCREASE is a reset whatever the
+# buckets did (a decrease can hide in the newly visible finer resolution),
+# while a schema DECREASE is not, and the subtraction still runs after the
+# finer side is down-converted. Ravel's `FloatHistogram::detect_reset` used a
+# symmetric `self.scale != prev.scale`, so it called every decrease a reset
+# too; nothing here could catch it, because until this ticket the generator
+# emitted schema 0 for every sample of every series.
+#
+# `diff_native_hist_schema{kind="counter"}` (generator.rs
+# `schema_transition_counter`) is a monotonic counter with one positive bucket
+# at index 1, a constant zero bucket, and two schema changes: up at sample 13
+# (+390s) and back down at sample 27 (+810s). Every other reset input grows or
+# stays put, so the schema term is the only thing either side can be reacting
+# to at those two samples. The two windows below are each 5m wide and contain
+# exactly one transition: +600s covers (300s, 600s] and so sample 13, +990s
+# covers (690s, 990s] and so sample 27.
+#
+# Expected on both sides: 1 reset over the increase window, 0 over the
+# decrease window, and a rate whose count is the plain difference across the
+# decrease rather than the compensated later-sample-alone.
+#
+# NOT yet confirmed against the pinned binary: the change that added these was
+# executed on a host with no Prometheus binary and no network egress to fetch
+# one, so this is their first real oracle exposure. The Ravel side is pinned
+# independently by ravel-promql unit tests (histogram.rs
+# `no_reset_on_a_schema_decrease_whose_buckets_grew_once_aligned`,
+# `rate_subtracts_across_a_schema_decrease_instead_of_compensating`;
+# tests/histogram_native.rs
+# `resets_counts_a_schema_increase_but_not_a_schema_decrease`). One thing only
+# a real run can settle: Prometheus serves the counter-reset hint its chunk
+# layer derived, not the one remote write carried, and a schema change ends a
+# chunk. These entries assume the transition sample reads back as
+# UnknownCounterReset (so detection runs). If the oracle instead reports a
+# reset over the decrease window, the chunk header is what to look at first,
+# not the histogram.rs direction.
+name: native_histogram_resets_over_a_schema_increase
+query: resets(diff_native_hist_schema[5m])
+kind: instant
+time: +600s
+mode: unordered
+
+name: native_histogram_resets_over_a_schema_decrease
+query: resets(diff_native_hist_schema[5m])
+kind: instant
+time: +990s
+mode: unordered
+
+name: native_histogram_rate_count_over_a_schema_increase
+query: histogram_count(rate(diff_native_hist_schema[5m]))
+kind: instant
+time: +600s
+mode: unordered
+
+name: native_histogram_rate_count_over_a_schema_decrease
+query: histogram_count(rate(diff_native_hist_schema[5m]))
+kind: instant
+time: +990s
 mode: unordered
 
 name: native_histogram_changes_range

@@ -725,3 +725,89 @@ fn idelta_over_mismatched_exponential_and_custom_bucket_schemas_warns_and_drops(
         annos.warnings()
     );
 }
+
+#[test]
+fn resets_counts_a_schema_increase_but_not_a_schema_decrease() {
+    // `resets` is `FloatHistogram::detect_reset` reduced to a float, so it
+    // reads the schema direction straight out (#679). The increase pair
+    // (scale 0 -> 2) is a reset even though its buckets grew; the decrease
+    // pair (scale 1 -> 0) is not, because prev's two scale-1 buckets merge to
+    // 3 at scale 0 and 10 >= 3.
+    //
+    // The flipped assertion is the decrease case's `vec![0.0]`: with
+    // `detect_reset`'s old symmetric `self.scale != prev.scale` schema term,
+    // any schema change counted, so both windows answered 1.
+    let increase = TestSource::new()
+        .with_histogram_series(
+            &[("__name__", "h")],
+            &[
+                (sec_ns(270), hist_scale(0, 1, &[3.0], 6.0)),
+                (sec_ns(300), hist_scale(2, 1, &[10.0], 20.0)),
+            ],
+        )
+        .expect("valid series");
+    let got = Evaluator::new()
+        .instant(&increase, "resets(h[5m])", 5 * 60_000)
+        .expect("evaluates");
+    assert_eq!(floats(&got), vec![1.0], "a schema increase is a reset");
+
+    let decrease = TestSource::new()
+        .with_histogram_series(
+            &[("__name__", "h")],
+            &[
+                (sec_ns(270), hist_scale(1, 1, &[1.0, 2.0], 3.0)),
+                (sec_ns(300), hist_scale(0, 1, &[10.0], 20.0)),
+            ],
+        )
+        .expect("valid series");
+    let got = Evaluator::new()
+        .instant(&decrease, "resets(h[5m])", 5 * 60_000)
+        .expect("evaluates");
+    assert_eq!(
+        floats(&got),
+        vec![0.0],
+        "a schema decrease whose aligned buckets grew is not a reset"
+    );
+}
+
+#[test]
+fn rate_subtracts_across_a_schema_decrease_end_to_end() {
+    // The same decrease pair through `rate`, which reaches `detect_reset` via
+    // `histogram_rate`'s compensation loop rather than `irate`'s pairwise
+    // check. The window reduction is 10 - 3 = 7 with sum 20 - 3 = 17; `rate`
+    // then scales both by one extrapolation factor, so this pins their ratio
+    // rather than a hand-computed absolute: sum/count must be (20 - 3)/(10 -
+    // 3), the ratio the raw difference has and the compensated result (20/10)
+    // does not.
+    //
+    // The flipped assertion is `sum / count == 17/7`: before the fix the pair
+    // read as a reset, the loop added prev back, and the ratio was 20/10.
+    let src = TestSource::new()
+        .with_histogram_series(
+            &[("__name__", "h")],
+            &[
+                (sec_ns(270), hist_scale(1, 1, &[1.0, 2.0], 3.0)),
+                (sec_ns(300), hist_scale(0, 1, &[10.0], 20.0)),
+            ],
+        )
+        .expect("valid series");
+    let got = Evaluator::new()
+        .instant(&src, "rate(h[5m])", 5 * 60_000)
+        .expect("evaluates");
+    assert_eq!(got.len(), 1);
+    let h = got[0]
+        .histogram
+        .as_ref()
+        .expect("rate over histograms yields a histogram element");
+    assert_eq!(h.scale, 0, "reduced at the coarser of the two scales");
+    assert_eq!(
+        h.positive_buckets.len(),
+        1,
+        "the aligned single bucket, not a two-bucket unaligned merge"
+    );
+    let ratio = h.sum / h.count;
+    assert!(
+        (ratio - 17.0 / 7.0).abs() < 1e-12,
+        "sum/count must be (20-3)/(10-3), not the reset-compensated 20/10: {ratio}"
+    );
+}
