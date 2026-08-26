@@ -608,3 +608,65 @@ flowchart TD
     REPART --> EXEC["real session, plan, execute"]
     SINGLE --> EXEC
 ```
+
+## Amendment 2026-08-26 (issue #741): default flips to `true`
+
+Status: Accepted (amends decision 4's default; the classification of
+decision 1 and the determinism argument of decision 3 are unchanged).
+
+The original decision shipped `parallel_final_aggregation` defaulting to
+`false`, on the strength of the earlier synthetic-load measurement, which
+found parallel not robustly faster than serial at any partition count.
+This amendment flips the default to `true` for the exact-typed class only.
+The classification gate is untouched: a non-exact-typed plan still gets the
+single-partition final byte for byte, and nothing here changes which plans
+are eligible.
+
+**Evidence.** Measured on the 8,424-object ClickBench tenant (issue #680)
+at 32 scan partitions with an 8 GiB per-query memory pool:
+
+- With the flag **off**, every high-cardinality `GROUP BY` /
+  `COUNT(DISTINCT)` statement runs its `Final` aggregate in a single
+  partition under `CoalescePartitionsExec`. That serial final exhausted
+  the 8 GiB pool: **nine statements failed** outright with a pool-exhausted
+  error (not merely slow — refused, because spilling is disabled by design,
+  ADR-0013/ADR-0102 decision 3).
+- With the flag **on**, `COUNT(DISTINCT UserID)` completes in **44–50 s**,
+  and four more previously-failing statements complete at **47–50 s** — the
+  same figure as a plain full scan, i.e. the aggregate stops being the
+  bottleneck. The read-only trace found **no determinism cost** for the
+  exact-typed class: the partition of the group set cannot change any
+  aggregated value (`count`, `count distinct`, and integer `sum`/`min`/`max`
+  are all partition-order-independent), and output order without an explicit
+  `ORDER BY` was already unguaranteed (see `docs/query-engine.md`), so the
+  repartitioned merge order changes nothing a client was entitled to rely
+  on. Decision 3's caveat — that the hash exchange carries every forwarded
+  row when the #728 probe fires — held only as a *slower*, never a
+  *failing*, path.
+
+The measurement therefore inverts decision 4's default-follows-measurement
+conclusion for the exact-typed class: the serial final is not merely slower
+at scale, it fails queries that the parallel final completes, and it does so
+with no correctness or determinism cost for that class.
+
+**Opt-out.** The behavior remains a single process-wide switch with no
+live-reload. `SqlConfig::parallel_final_aggregation` now defaults to `true`;
+the server flag `--sql-parallel-final-aggregation` stays accepted and still
+means on, and `--sql-parallel-final-aggregation=false` is the operator
+opt-out (a clap bool value parser: `num_args = 0..=1`, `default_value_t =
+true`, `default_missing_value = "true"`, `action = Set`). Setting it to
+`false` restores the exact pre-amendment single-partition final for every
+query. The bench (`sql_latency_bench`) carries the same shape and its
+report's provenance records the effective value.
+
+**Still excluded (unchanged).** `avg`/`mean` over any input type remain
+never eligible (their fold is IEEE f64 addition, not associative past
+2^53), as does any `sum`/`min`/`max` over a float input and any float
+`GROUP BY` key (including a bare `SELECT DISTINCT float_col`). A single
+disqualifying aggregate or key anywhere in the query — including inside a
+scalar/`IN`/`EXISTS` subquery — still forces the whole query onto the
+single-partition plan. This amendment changes only the default of the gate,
+not the gate. It also does not touch the *string-keyed partial* stage that
+exhausts the pool for a different reason (`partitions x distinct` pre-final
+state); that is issue #680's separate `skip_partial_aggregation` fix, which
+was already on by default.

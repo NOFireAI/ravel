@@ -487,17 +487,26 @@ pub struct Cli {
     pub sql_tenant_max_bytes: usize,
 
     /// Allow an exact-typed SQL query to repartition its final aggregation
-    /// (ADR-0094), threaded into `ravel_sql::SqlConfig::parallel_final_aggregation`.
-    /// Off by default: a process with this unset plans every aggregation
-    /// single-partitioned, byte-identical to before this flag existed. When set,
-    /// a per-query classification flips DataFusion's `repartition_aggregations`
-    /// on only for a query whose aggregates and GROUP BY keys are all provably
-    /// order/partition-independent (`count`, and `sum`/`min`/`max` over non-float
-    /// input, no float group key); `avg`/`mean` and any float input or key are
-    /// never eligible and stay single-partitioned. Process-wide, not per-tenant;
-    /// flipping it needs a restart, like every other SQL budget. Meaningful only
-    /// in a build with the `sql` feature; inert otherwise.
-    #[arg(long = "sql-parallel-final-aggregation")]
+    /// (ADR-0094, amended 2026-08-26 by issue #741), threaded into
+    /// `ravel_sql::SqlConfig::parallel_final_aggregation`. On by default: a
+    /// per-query classification flips DataFusion's `repartition_aggregations`
+    /// on for a query whose aggregates and GROUP BY keys are all provably
+    /// order/partition-independent (`count`, `count distinct`, and
+    /// `sum`/`min`/`max` over non-float input, no float group key);
+    /// `avg`/`mean` and any float input or key are never eligible and stay
+    /// single-partitioned. Pass `--sql-parallel-final-aggregation=false` (or the
+    /// bare `--sql-parallel-final-aggregation`, which stays accepted and still
+    /// means on) to control it; `false` is the operator opt-out that restores
+    /// the pre-amendment single-partition final for every query. Process-wide,
+    /// not per-tenant; flipping it needs a restart, like every other SQL budget.
+    /// Meaningful only in a build with the `sql` feature; inert otherwise.
+    #[arg(
+        long = "sql-parallel-final-aggregation",
+        num_args = 0..=1,
+        default_value_t = true,
+        default_missing_value = "true",
+        action = clap::ArgAction::Set,
+    )]
     pub sql_parallel_final_aggregation: bool,
 
     /// Object size above which a logs scan reads only the pruning-relevant
@@ -1012,8 +1021,10 @@ pub struct QueryBudgets {
     /// accountant (`max_tenant_bytes`).
     pub sql_tenant_max_bytes: usize,
     /// Whether an exact-typed SQL query may repartition its final aggregation
-    /// (ADR-0094). Reaches `SqlConfig::parallel_final_aggregation`. Default
-    /// `false`, so a server built without the flag is byte-identical to before.
+    /// (ADR-0094, amended by issue #741). Reaches
+    /// `SqlConfig::parallel_final_aggregation`. Default `true`; the
+    /// `--sql-parallel-final-aggregation=false` opt-out restores the
+    /// single-partition final.
     pub sql_parallel_final_aggregation: bool,
     /// Object size above which a logs scan reads only the pruning-relevant RLOG
     /// blocks instead of the whole object (ADR-0107). Reaches
@@ -1029,7 +1040,7 @@ impl Default for QueryBudgets {
             max_segments: ravel_query::DEFAULT_MAX_SEGMENTS,
             sql_max_query_bytes: DEFAULT_SQL_MAX_QUERY_BYTES,
             sql_tenant_max_bytes: DEFAULT_SQL_TENANT_MAX_BYTES,
-            sql_parallel_final_aggregation: false,
+            sql_parallel_final_aggregation: true,
             logs_block_range_threshold: DEFAULT_LOGS_BLOCK_RANGE_THRESHOLD,
         }
     }
@@ -3815,8 +3826,8 @@ mod tests {
         assert_eq!(budgets.sql_max_query_bytes, DEFAULT_SQL_MAX_QUERY_BYTES);
         assert_eq!(budgets.sql_tenant_max_bytes, DEFAULT_SQL_TENANT_MAX_BYTES);
         assert!(
-            !budgets.sql_parallel_final_aggregation,
-            "ADR-0094: exact-typed final-aggregation repartitioning defaults off"
+            budgets.sql_parallel_final_aggregation,
+            "ADR-0094 amendment (#741): exact-typed final-aggregation repartitioning defaults on"
         );
         // The two EngineConfig-bound defaults leave a base config untouched.
         assert_eq!(

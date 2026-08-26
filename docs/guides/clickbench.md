@@ -301,8 +301,13 @@ cargo run -p ravel-bench --features sql-latency --bin sql_latency_bench -- \
   heavy aggregate needs both raised together. Default 1 GiB, what every earlier
   run used.
 - `--sql-parallel-final-aggregation` lets an exact-typed query repartition its
-  final aggregation (ADR-0094), the same knob as the server flag of that name.
-  Off by default; a `GROUP BY` over a high-cardinality key is where it shows.
+  final aggregation (ADR-0094, amended by issue #741), the same knob as the
+  server flag of that name. On by default; a `GROUP BY` or `COUNT(DISTINCT)`
+  over a high-cardinality key is where it shows (the amendment measured nine
+  such statements moving from pool-exhausted failures to 44-50 s here). Pass
+  `--sql-parallel-final-aggregation=false` to measure the pre-amendment
+  single-partition final; the bare flag stays accepted and still means on. The
+  effective value is recorded in the report's provenance.
 - `--sql-max-segments <N>` is the engine's `max_segments` ceiling, the same knob
   as `ravel-server --max-segments`: the number of sealed, below-watermark
   segments a statement may fan out over before it is refused with `query fans
