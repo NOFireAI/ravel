@@ -908,14 +908,39 @@ and `resolve_pruned` entry points are unchanged and pass a discarded
 `QueryAccounting` handle, so every existing caller keeps its current
 signature and behavior.
 
-`Catalog::guarded_get` and `Catalog::guarded_list_all` are the only two
-places a resolve issues an S3 request (both Phase 1 listing and Phase 2
-snapshot reads funnel through them), so accounting is recorded there, never
-at a call site: one `AccountedOp::Get` per GET attempt and one
+`Catalog::guarded_get` is the only place a resolve issues a GET, and
+`Catalog::guarded_list_all` is the LIST funnel for every path except the two
+shard-scan traversals named below. Accounting is recorded in the funnel,
+never at a call site: one `AccountedOp::Get` per GET attempt and one
 `AccountedOp::List` per LIST page, both unconditional; bytes are added only
 for a successful GET, matching `InstrumentedStore`'s convention that a
-failed request and a LIST move no bytes. `resolve`'s two funnels never issue
+failed request and a LIST move no bytes. `resolve`'s funnels never issue
 a HEAD.
+
+Every GET a resolve issues goes through `guarded_get`, including the two
+provisioning-record reads that provisioning enforcement adds: the generation
+history `Catalog::read_scan_generations` reads fresh on every resolve, and
+the one-shot `shard_count` check `Catalog::enforce_provisioning_once` runs on
+a (tenant, signal)'s first touch. Both were raw `store.get` calls that
+escaped the resolve semaphore and the accounting, so an enforcing catalog
+under-reported a query's GET count by one on every resolve, and by two on a
+(tenant, signal)'s first touch; they now take the same funnel as every other
+resolve GET. The raw `store.get` in `provisioning.rs` remains
+only on the administrative paths, which never run under a query and hold no
+per-query accounting: `validate_or_adopt`'s adoption write and its race
+re-read, `append_generation` (reshard), `raise_format_floor`, and
+`read_floors_from_store`.
+
+The two shard-scan LIST paths (`Catalog::list_window_bounded`, via
+`list_shard_hours`, and `Catalog::list_window_by_prefix`) record their own
+`AccountedOp::List` per page instead of going through `guarded_list_all`.
+Both need `list_after`'s start-after marker to skip a shard's
+below-watermark history server-side, which `guarded_list_all`'s plain `list`
+does not take, and the prefix scan additionally checks its runtime LIST
+ceiling before each page rather than draining unconditionally. Each still
+acquires the same request-semaphore permit per page and applies the same
+ADR-0050 section 2 tenant-prefix assertion, so the bound and the request
+count are what `guarded_list_all` would produce; only the code path differs.
 
 All five caches (`RecordCache`, `CompactionRecordCache`, `HeadCache`,
 `PartCache`, `PostingsCache`) record a cache hit or miss on every lookup and

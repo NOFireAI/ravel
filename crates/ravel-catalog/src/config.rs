@@ -222,11 +222,15 @@ pub struct CatalogConfig {
     /// [`DEFAULT_MAX_CATALOG_LIST_REQUESTS`].
     pub max_catalog_list_requests: u64,
     /// Crossover, in `(shard, hour)` bucket units, at which `Catalog::resolve`
-    /// switches from the per-bucket LIST loop to a single per-shard recursive
-    /// prefix LIST (ADR-0056). When the listing suffix spans at least this many
-    /// buckets (`shard_count * listing_hours`), the prefix scan is used;
-    /// narrower windows keep the per-bucket loop, which prunes better behind a
-    /// folded snapshot watermark. A performance heuristic only: both paths
+    /// switches from the non-prefix bounded LIST path to the per-shard
+    /// recursive prefix scan (ADR-0056). When the listing suffix spans at least
+    /// this many buckets (`shard_count * listing_hours`), the prefix scan is
+    /// used. Both paths issue one bounded `list_after` per shard, resuming
+    /// strictly after the watermark, so neither pages through a shard's
+    /// below-watermark history; narrower windows keep the non-prefix path,
+    /// which fans the shards out concurrently and stops each at the first hour
+    /// past the window, while the prefix scan drains them sequentially under a
+    /// page-by-page request cap. A performance heuristic only: both paths
     /// return identical snapshots and both respect
     /// [`max_catalog_list_requests`](Self::max_catalog_list_requests). Default
     /// [`DEFAULT_PREFIX_LIST_CROSSOVER_REQUESTS`].

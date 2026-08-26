@@ -232,6 +232,26 @@ pub struct Catalog {
     tenant_activity: Mutex<HashMap<TenantHash, i64>>,
 }
 
+/// Adapts [`Catalog::guarded_get`] to the provisioning module's
+/// [`crate::provisioning::AccountedRecordGet`], so the resolve-path provisioning
+/// reads (the generation history and the `shard_count` enforcement check) run
+/// through the same semaphore-bounded, accounted GET funnel as every other
+/// resolve GET (issue #729) rather than a raw `store.get`. Holds only borrows,
+/// so it is built cheaply per read from the resolve's own `&self` and
+/// `accounting`.
+struct GuardedRecordGet<'a> {
+    catalog: &'a Catalog,
+    accounting: &'a QueryAccounting,
+}
+
+impl crate::provisioning::AccountedRecordGet for GuardedRecordGet<'_> {
+    async fn accounted_get_full(&self, key: &str) -> Result<GetOutcome, StoreError> {
+        self.catalog
+            .guarded_get(key, GetRange::Full, self.accounting)
+            .await
+    }
+}
+
 impl Catalog {
     /// Errors if `config.shard_count == 0` (a resolvable catalog needs at
     /// least one shard).
@@ -353,6 +373,7 @@ impl Catalog {
         &self,
         tenant: &TenantHash,
         signal: Signal,
+        accounting: &QueryAccounting,
     ) -> Result<(), CatalogError> {
         if !self.enforce_provisioning {
             return Ok(());
@@ -364,13 +385,19 @@ impl Catalog {
         {
             return Ok(());
         }
-        let check = crate::provisioning::validate_or_adopt(
-            self.store.as_ref(),
+        // Route the check's record GET through `guarded_get` (issue #729): the
+        // read-only `CheckOnly` policy never writes or lists, so this is the
+        // same record read `validate_or_adopt(.., CheckOnly)` performs, now
+        // semaphore-bounded and recorded like every other resolve GET.
+        let getter = GuardedRecordGet {
+            catalog: self,
+            accounting,
+        };
+        let check = crate::provisioning::validate_check_only_accounted(
+            &getter,
             tenant,
             signal,
             self.config.shard_count,
-            0,
-            crate::provisioning::AbsentPolicy::CheckOnly,
         )
         .await?;
         // Only a `Matched` result is safe to cache forever: the record is
@@ -407,13 +434,22 @@ impl Catalog {
         &self,
         tenant: &TenantHash,
         signal: Signal,
+        accounting: &QueryAccounting,
     ) -> Result<Vec<crate::provisioning::ShardGeneration>, CatalogError> {
         if !self.enforce_provisioning {
             return Ok(vec![implicit_generation_zero(self.config.shard_count)]);
         }
-        match crate::provisioning::read_generations_from_store(self.store.as_ref(), tenant, signal)
-            .await?
-        {
+        // Route the generation-history GET through `guarded_get` (issue #729):
+        // this read runs on every resolve, so leaving it as a raw `store.get`
+        // under-counted a query's GETs by one and escaped the resolve
+        // semaphore. `accounting` may be a discarded handle for non-query
+        // callers (the fold path); the read still funnels through the same
+        // bounded entry point.
+        let getter = GuardedRecordGet {
+            catalog: self,
+            accounting,
+        };
+        match crate::provisioning::read_generations_accounted(&getter, tenant, signal).await? {
             Some(generations) => Ok(generations),
             None => Ok(vec![implicit_generation_zero(self.config.shard_count)]),
         }
@@ -1123,7 +1159,8 @@ impl Catalog {
         // catalog's configured shard_count disagrees with the (tenant, signal)'s
         // provisioning record, so a lower value never silently drops the shards
         // it omits. A no-op unless enforcement was opted into.
-        self.enforce_provisioning_once(tenant, signal).await?;
+        self.enforce_provisioning_once(tenant, signal, accounting)
+            .await?;
 
         // The generation history for the per-hour scan rule (ADR-0052 section
         // 4), read fresh (see `read_scan_generations`). A corrupt or misfiled
@@ -1149,7 +1186,9 @@ impl Catalog {
         // resolve computed its scan set from, not a later independent read (a
         // generation appended between the two reads would be invisible to the
         // gate while already visible in the resolved segments).
-        let mut generations = self.read_scan_generations(tenant, signal).await?;
+        let mut generations = self
+            .read_scan_generations(tenant, signal, accounting)
+            .await?;
 
         let mut segments: HashMap<String, SegmentRef> = HashMap::new();
         let mut segments_pruned = 0u64;
@@ -1933,21 +1972,23 @@ impl Catalog {
         Ok(out)
     }
 
-    /// The prefix-scan traversal path (ADR-0056): one drained recursive prefix
-    /// LIST per shard over [`keys::commit_shard_prefix`], grouped client-side
-    /// by `(shard, ingest-hour)` and resolved through
+    /// The prefix-scan traversal path (ADR-0056): one drained recursive
+    /// `list_after` per shard over [`keys::commit_shard_prefix`], grouped
+    /// client-side by `(shard, ingest-hour)` and resolved through
     /// [`Catalog::process_bucket`], for the window buckets in
     /// `[listing_start_hour, window_end_hour]`.
     ///
-    /// Cost is `O(objects / page_size)`, independent of window width, versus
-    /// the per-bucket loop's one LIST per bucket (ADR-0056 measurement). The
-    /// store's `list` cannot seek past a prefix (continuation token only, no
-    /// start-after), so the scan reads every commit key in each shard subtree,
-    /// including hours below `listing_start_hour`; those are dropped by the
-    /// client-side filter, exactly the buckets the per-bucket loop would have
-    /// skipped. The range scanned is unchanged, only the scan method
-    /// (ADR-0056 INTERACTION 2): a key in any in-range bucket, however far below the
-    /// window end, is still grouped and resolved.
+    /// Cost is `O(objects above the watermark / page_size)`, independent of
+    /// window width, versus the pre-ADR-0056 one LIST per `(shard, hour)`
+    /// bucket (ADR-0056 measurement). Each shard's scan resumes strictly past
+    /// the `listing_start_hour` shard-hour prefix via the `list_after` start
+    /// marker, so the shard's below-watermark history is skipped server-side
+    /// rather than paged through and discarded, exactly as the non-prefix
+    /// path ([`Catalog::list_window_bounded`]) does. What the recursive scan
+    /// still over-reads is the other end: keys past `window_end_hour`, which
+    /// the client-side filter drops. The range resolved is unchanged, only
+    /// the scan method (ADR-0056 INTERACTION 2): a key in any in-range bucket,
+    /// however far below the window end, is still grouped and resolved.
     ///
     /// A running LIST count is capped at
     /// [`CatalogConfig::max_catalog_list_requests`](crate::CatalogConfig::max_catalog_list_requests)
@@ -1956,6 +1997,13 @@ impl Catalog {
     /// runtime on the one path whose cost is not knowable before listing: a
     /// wide-but-sparse window is served, and only a scan whose actual object
     /// volume is unsustainable is refused.
+    ///
+    /// That page-by-page ceiling, and the `list_after` start marker, are why
+    /// this path records its own `AccountedOp::List` per page instead of
+    /// calling [`Catalog::guarded_list_all`], which takes no start marker and
+    /// drains unconditionally. The permit, the accounting, and the ADR-0050
+    /// section 2 tenant-prefix assertion are the same either way
+    /// (docs/catalog-and-mvcc.md "Query cost accounting").
     #[allow(clippy::too_many_arguments)]
     async fn list_window_by_prefix(
         &self,
@@ -3076,7 +3124,7 @@ mod tests {
     use ravel_object_store::InstrumentedStore;
     use ravel_object_store::PutOptions;
     use ravel_object_store::fault::{
-        FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault, Sequence,
+        FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault, Sequence,
     };
     use ravel_object_store::memory::MemoryStore;
 
@@ -3609,6 +3657,158 @@ mod tests {
             .resolve(&tenant(), Signal::Metrics, range, &[], now)
             .await
             .expect("enforcement off: resolve ignores the provisioning record");
+    }
+
+    /// Issue #729: with provisioning enforcement on, the generation-history
+    /// read every resolve performs must be an accounted GET through
+    /// `guarded_get`, not a raw `store.get`. Both catalogs are warmed with one
+    /// resolve (populating the record/HEAD caches, and memoizing the enforced
+    /// catalog's one-shot `shard_count` check), then a second resolve is
+    /// measured on each so the two run under identical cache warmth. The only
+    /// GET that then differs is the always-fresh generation read: enforcement
+    /// off synthesizes generation 0 with no store read, enforcement on reads
+    /// the record, so the enforced resolve issues exactly one more GET.
+    ///
+    /// FLIP (pre-fix demonstration): in `Catalog::read_scan_generations`,
+    /// replace `read_generations_accounted(&getter, tenant, signal)` with the
+    /// raw `read_generations_from_store(self.store.as_ref(), tenant, signal)`.
+    /// The generation GET then bypasses `guarded_get`, `on` stays equal to
+    /// `off`, and the `on == off + 1` assertion fails.
+    #[tokio::test]
+    async fn provisioning_generation_read_is_accounted_get() {
+        let store = Arc::new(MemoryStore::new());
+        let now = 500_000 * NS_PER_HOUR + 30 * 60_000_000_000;
+        publish_segment(&store, 0, 1, 500_000, now, now - 1_000, now).await;
+        // A record whose shard_count matches the configured value, so the
+        // resolve's scan set (and therefore every non-provisioning GET) is
+        // identical with enforcement on and off; the only difference is the
+        // provisioning read this change accounts for.
+        seed_provisioning_record(&store, 1).await;
+        let range = TimeRange {
+            start_ns: now - 1_000,
+            end_ns: now,
+        };
+
+        // Measure the second resolve of a catalog, after a warm-up resolve, so
+        // the record/HEAD caches are populated identically for both variants.
+        async fn measured_gets(catalog: &Catalog, range: TimeRange, now: i64) -> u64 {
+            catalog
+                .resolve(&tenant(), Signal::Metrics, range, &[], now)
+                .await
+                .expect("warm-up resolve");
+            let acc = QueryAccounting::new();
+            catalog
+                .resolve_with_accounting(&tenant(), Signal::Metrics, range, &[], now, &acc)
+                .await
+                .expect("measured resolve");
+            acc.snapshot().s3_requests(AccountedOp::Get)
+        }
+
+        let off_catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let off = measured_gets(&off_catalog, range, now).await;
+
+        let on_catalog = Catalog::new(store.clone(), config(1))
+            .expect("catalog")
+            .with_provisioning_enforcement();
+        let on = measured_gets(&on_catalog, range, now).await;
+
+        assert_eq!(
+            off, 1,
+            "warm resolve GET count with enforcement off: only the uncached HEAD read"
+        );
+        assert_eq!(
+            on,
+            off + 1,
+            "enforcement on adds exactly the generation-history GET, routed through guarded_get"
+        );
+    }
+
+    /// Issue #729: the resolve-path provisioning read is bounded by the resolve
+    /// request semaphore because it funnels through `guarded_get`, which holds a
+    /// permit around the store call. A FaultStore hold on the
+    /// provisioning-record GET blocks the resolve while that permit is held; a
+    /// raw `store.get` would issue the same GET but acquire no permit.
+    ///
+    /// FLIP (pre-fix demonstration): revert `enforce_provisioning_once` to the
+    /// raw `validate_or_adopt(self.store.as_ref(), .., CheckOnly)` call (and
+    /// `read_scan_generations` to `read_generations_from_store`). The held
+    /// provisioning GET then holds no resolve permit, so `available_permits()`
+    /// stays at `MAX_CONCURRENT_REQUESTS` and the `== MAX_CONCURRENT_REQUESTS -
+    /// 1` assertion fails.
+    #[tokio::test]
+    async fn provisioning_read_holds_a_resolve_semaphore_permit() {
+        let mem = MemoryStore::new();
+        let now = 500_000 * NS_PER_HOUR + 30 * 60_000_000_000;
+        publish_segment(&mem, 0, 1, 500_000, now, now - 1_000, now).await;
+        seed_provisioning_record(&mem, 1).await;
+        let store = Arc::new(FaultStore::new(mem, FaultPlan::empty()));
+
+        // Hold every provisioning-record GET inside the store until released.
+        // On a fresh enforcement-on catalog the first such GET is the
+        // `shard_count` enforcement check (`enforce_provisioning_once`), which
+        // runs before the listing fan-out.
+        let gate = store.hold(Op::Get, Some("/prov".to_string()), Occurrence::Always);
+
+        let catalog = Arc::new(
+            Catalog::new(store.clone(), config(1))
+                .expect("catalog")
+                .with_provisioning_enforcement(),
+        );
+        let range = TimeRange {
+            start_ns: now - 1_000,
+            end_ns: now,
+        };
+
+        assert_eq!(
+            catalog.request_semaphore.available_permits(),
+            MAX_CONCURRENT_REQUESTS,
+            "no permit is held before the resolve starts"
+        );
+
+        let acc = QueryAccounting::new();
+        let acc_task = acc.clone();
+        let cat_task = catalog.clone();
+        let task = tokio::spawn(async move {
+            cat_task
+                .resolve_with_accounting(&tenant(), Signal::Metrics, range, &[], now, &acc_task)
+                .await
+        });
+
+        gate.wait_until_held(1).await;
+        assert_eq!(
+            gate.held_count(),
+            1,
+            "the provisioning-record GET is in flight, blocked inside the store"
+        );
+        assert_eq!(
+            catalog.request_semaphore.available_permits(),
+            MAX_CONCURRENT_REQUESTS - 1,
+            "the held provisioning GET holds a resolve semaphore permit: it routed through \
+             guarded_get, not a raw store.get"
+        );
+
+        // Release every held provisioning GET (the enforcement check, then the
+        // generation-history read) so the resolve runs to completion. Bounded so
+        // a resolve that blocks on something other than this gate fails the test
+        // instead of hanging the suite.
+        let mut spins = 0;
+        while !task.is_finished() {
+            for id in gate.held() {
+                gate.release(id);
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            spins += 1;
+            assert!(
+                spins < 10_000,
+                "resolve did not finish after releasing every held provisioning GET"
+            );
+        }
+        let snapshot = task.await.expect("join resolve task").expect("resolve");
+        assert_eq!(
+            snapshot.segments.len(),
+            1,
+            "once unblocked the resolve returns the published segment"
+        );
     }
 
     /// End-to-end: an older HEAD (`shard_generation_count` lower
