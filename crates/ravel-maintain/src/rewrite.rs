@@ -111,14 +111,20 @@ pub async fn rewrite_and_publish<C: SegmentCodec>(
     // compaction's pipeline. `buffered` (not `buffer_unordered`) keeps that
     // alignment while `input_read_concurrency` catalog loads are in flight:
     // it yields results in input order regardless of completion order.
-    let catalogs: Vec<C::Catalog> = stream_iter(
-        inputs
-            .iter()
-            .map(|input| C::load_input_catalog(store, config, input)),
-    )
-    .buffered(config.input_read_concurrency.max(1))
-    .try_collect()
-    .await?;
+    //
+    // The futures are built in a plain loop rather than a `.map()` closure:
+    // a closure returning a future that borrows its `&InputRecord` argument is
+    // inferred as higher-ranked over that lifetime, and its auto-traits then
+    // fail to leak through the stream adapter with "implementation of `FnOnce`
+    // is not general enough" wherever the maintain loop is `tokio::spawn`ed.
+    let mut pending = Vec::with_capacity(inputs.len());
+    for input in &inputs {
+        pending.push(C::load_input_catalog(store, config, input));
+    }
+    let catalogs: Vec<C::Catalog> = stream_iter(pending)
+        .buffered(config.input_read_concurrency.max(1))
+        .try_collect()
+        .await?;
 
     let parts = C::build_parts(store, config, bucket, &inputs, catalogs, &hash).await?;
 
