@@ -92,7 +92,27 @@
 //! `record.rs`'s module doc); both, if decoded at all, live as opaque blob
 //! values inside `attrs`, which this merge already carries through verbatim
 //! per record. No special handling beyond that pass-through is needed.
+//!
+//! # One merge, two callers (issue #742)
+//!
+//! [`merge`] is that k-way block-streaming merge, and both RSPAN writers of L1
+//! parts run through it: compaction ([`SpanCodec::build_parts`]) keeping every
+//! record, and the ADR-0064 selective-erasure rewrite
+//! (`erasure_rewrite::build_rewrite_spans`) keeping the records no pending
+//! request's matcher drops. This mirrors the RLOG split (issue #725): the
+//! rewrite used to GET every input object whole and push every survivor into
+//! one unbounded [`RspanWriter`], so its peak memory scaled with the bucket,
+//! not one part. Sharing the driver gives it the same bound the compactor has
+//! (one decoded block per input plus the in-progress part) and keeps the two
+//! from drifting on merge order, trace-boundary split points, or the per-input
+//! footer cross-check. Compaction keeps every record, so its byte output is
+//! unchanged: `merge` with a keep-everything filter reproduces exactly the
+//! part sequence the inline loop produced.
 
+use std::future::Future;
+use std::pin::Pin;
+
+use futures::stream::{StreamExt, TryStreamExt, iter as stream_iter};
 use ravel_commit::keys;
 use ravel_object_store::{GetRange, ObjectStoreBackend};
 use ravel_proto::commit::v1::CompactionPart;
@@ -146,54 +166,7 @@ impl SegmentCodec for SpanCodec {
         input: &InputRecord,
     ) -> Result<Self::Catalog> {
         let object_key = keys::reconstruct_data_key(&input.record)?;
-
-        // Locate and validate the footer from a suffix probe: one ranged GET,
-        // growing to a second only if the probe missed the whole footer (the
-        // RSPAN analogue of the RSEG/RLOG read path). This fails loud here on a
-        // missing or corrupt input, before the merge fetches any block bytes.
-        let probe = store
-            .get(&object_key, GetRange::Suffix(config.footer_probe_bytes))
-            .await?;
-        let total = probe.total_size;
-        let ftr = match footer::open_from_suffix(&probe.data, total)? {
-            SuffixOutcome::Ready(f) => f,
-            SuffixOutcome::NeedRange { offset, len } => {
-                let tail = store
-                    .get(&object_key, GetRange::Range(offset, offset + len))
-                    .await?;
-                match footer::open_from_suffix(&tail.data, total)? {
-                    SuffixOutcome::Ready(f) => f,
-                    SuffixOutcome::NeedRange { .. } => {
-                        return Err(MaintainError::Invariant(
-                            "rspan footer not covered by ranged fetch".into(),
-                        ));
-                    }
-                }
-            }
-        };
-        // Fetch and decode the SKIP_IDX section by range. BLOCKS is never
-        // fetched here; the merge streams blocks by range one at a time.
-        let skip_desc = ftr.section(kind::SKIP_IDX).ok_or_else(|| {
-            MaintainError::Invariant("rspan input missing SKIP_IDX section".into())
-        })?;
-        let skip_section = store
-            .get(
-                &object_key,
-                GetRange::Range(skip_desc.offset, skip_desc.offset + skip_desc.len),
-            )
-            .await?;
-        let skip_idx_raw = footer::decode_section(
-            skip_section.data.as_ref(),
-            skip_desc,
-            footer::DEFAULT_MAX_SECTION_UNCOMP,
-        )?;
-        let reader = RspanRangeReader::from_sections(&ftr, &skip_idx_raw)?;
-
-        Ok(SpanInputCatalog {
-            object_key,
-            footer: ftr,
-            reader,
-        })
+        load_catalog_from_object(store, config, object_key).await
     }
 
     async fn build_parts(
@@ -209,93 +182,295 @@ impl SegmentCodec for SpanCodec {
                 "inputs and catalogs length mismatch".to_string(),
             ));
         }
+        // Compaction drops nothing, so every merged record is kept and the
+        // counts the merge returns are the input count twice over; the
+        // compaction-side conservation gate reads `part.sample_count`, not
+        // these.
+        let merged = merge(
+            store,
+            config,
+            bucket,
+            &catalogs,
+            input_set_hash,
+            config.dry_run,
+            &mut |_| Ok(true),
+        )
+        .await?;
+        Ok(merged.parts)
+    }
+}
 
-        // No whole-object fetch: the per-input ranged readers are already in
-        // the catalogs. Blocks are fetched by range one at a time in the flat
-        // k-way merge below, so raw resident bytes stay bounded to one block
-        // per input, never a whole object or the whole bucket.
-        let identity = compactor_identity(bucket, config);
-        let tracker = config.merge_memory_tracker.as_ref();
+/// The object-key-parametrized core of [`SpanCodec::load_input_catalog`],
+/// generalized so a caller holding an object key from something other than an
+/// L0 [`InputRecord`] can decode a catalog too. The erasure rewrite
+/// (`erasure_rewrite::build_rewrite_spans`) is that caller: its live input set
+/// is a list of whole-object keys (L0 data objects, or the parts of the live
+/// compaction/rewrite record), never `InputRecord`s.
+pub(crate) async fn load_catalog_from_object(
+    store: &dyn ObjectStoreBackend,
+    config: &CompactorConfig,
+    object_key: String,
+) -> Result<SpanInputCatalog> {
+    // Locate and validate the footer from a suffix probe: one ranged GET,
+    // growing to a second only if the probe missed the whole footer (the
+    // RSPAN analogue of the RSEG/RLOG read path). This fails loud here on a
+    // missing or corrupt input, before the merge fetches any block bytes.
+    let probe = store
+        .get(&object_key, GetRange::Suffix(config.footer_probe_bytes))
+        .await?;
+    let total = probe.total_size;
+    let ftr = match footer::open_from_suffix(&probe.data, total)? {
+        SuffixOutcome::Ready(f) => f,
+        SuffixOutcome::NeedRange { offset, len } => {
+            let tail = store
+                .get(&object_key, GetRange::Range(offset, offset + len))
+                .await?;
+            match footer::open_from_suffix(&tail.data, total)? {
+                SuffixOutcome::Ready(f) => f,
+                SuffixOutcome::NeedRange { .. } => {
+                    return Err(MaintainError::Invariant(
+                        "rspan footer not covered by ranged fetch".into(),
+                    ));
+                }
+            }
+        }
+    };
+    // Fetch and decode the SKIP_IDX section by range. BLOCKS is never
+    // fetched here; the merge streams blocks by range one at a time.
+    let skip_desc = ftr
+        .section(kind::SKIP_IDX)
+        .ok_or_else(|| MaintainError::Invariant("rspan input missing SKIP_IDX section".into()))?;
+    let skip_section = store
+        .get(
+            &object_key,
+            GetRange::Range(skip_desc.offset, skip_desc.offset + skip_desc.len),
+        )
+        .await?;
+    let skip_idx_raw = footer::decode_section(
+        skip_section.data.as_ref(),
+        skip_desc,
+        footer::DEFAULT_MAX_SECTION_UNCOMP,
+    )?;
+    let reader = RspanRangeReader::from_sections(&ftr, &skip_idx_raw)?;
 
-        let mut cursors: Vec<BlockCursor> = Vec::with_capacity(catalogs.len());
-        for (idx, catalog) in catalogs.iter().enumerate() {
-            let mut cursor = BlockCursor::open(catalog, idx);
-            cursor.refill(store, tracker).await?;
-            cursors.push(cursor);
+    Ok(SpanInputCatalog {
+        object_key,
+        footer: ftr,
+        reader,
+    })
+}
+
+/// One catalog per object key, `input_read_concurrency` loads in flight.
+///
+/// `buffered`, not `buffer_unordered`: the returned catalogs stay aligned
+/// one-to-one with `object_keys` in canonical order, which is the k-way
+/// merge's tie-break on equal `(trace_id, start_ts_ns)`.
+pub(crate) async fn load_catalogs_by_key(
+    store: &dyn ObjectStoreBackend,
+    config: &CompactorConfig,
+    object_keys: &[String],
+) -> Result<Vec<SpanInputCatalog>> {
+    let mut pending = Vec::with_capacity(object_keys.len());
+    for object_key in object_keys {
+        pending.push(load_catalog_from_object(store, config, object_key.clone()));
+    }
+    stream_iter(pending)
+        .buffered(config.input_read_concurrency.max(1))
+        .try_collect()
+        .await
+}
+
+/// What one run of [`merge`] produced: the parts, and the record counts the
+/// caller's conservation gates need.
+pub(crate) struct SpanMergeOutput {
+    /// Every part built, in part-index order.
+    pub parts: Vec<BuiltPart>,
+    /// Records the merge read out of the inputs, kept and dropped alike.
+    pub input_record_count: u64,
+    /// Records the filter kept, so the ones actually pushed into a part.
+    pub output_record_count: u64,
+}
+
+/// The merge's running record tallies. Checked addition throughout: an
+/// overflowing tally is itself an invariant breach, never a silent wrap that
+/// could balance a caller's conservation gate against a wrong total.
+#[derive(Default)]
+struct RecordCounts {
+    input: u64,
+    output: u64,
+}
+
+impl RecordCounts {
+    fn add_input(&mut self) -> Result<()> {
+        self.input = self.input.checked_add(1).ok_or_else(|| {
+            MaintainError::Invariant("merged input record count overflowed u64".to_string())
+        })?;
+        Ok(())
+    }
+
+    fn add_output(&mut self) -> Result<()> {
+        self.output = self.output.checked_add(1).ok_or_else(|| {
+            MaintainError::Invariant("merged output record count overflowed u64".to_string())
+        })?;
+        Ok(())
+    }
+}
+
+/// The shared flat k-way block-streaming merge: every input's span records, in
+/// global `(trace_id, start_ts_ns)` order, filtered through `keep`, partitioned
+/// into parts of at most `max_l1_part_bytes` on trace boundaries.
+///
+/// Both callers of the RSPAN merge run through here (issue #742). Compaction
+/// ([`SpanCodec::build_parts`]) keeps every record; the ADR-0064 erasure
+/// rewrite (`erasure_rewrite::build_rewrite_spans`) keeps the records no
+/// pending request's matcher drops. Sharing the driver is what gives the
+/// rewrite the same memory bound the compactor has: peak resident memory is one
+/// decoded block per input plus the in-progress part, never the bucket. It also
+/// means the two cannot drift on merge order, on where a part splits, or on the
+/// per-input footer cross-check ([`BlockCursor::refill`]).
+///
+/// `dry_run` decides whether each part is PUT as it closes: compaction PUTs
+/// here, while the erasure rewrite defers every PUT to its own publish path,
+/// which writes parts only after its conservation gate passes.
+///
+/// Each input is already sorted by `(trace_id, start_ts_ns)` (RSPAN's on-disk
+/// order), so selecting the globally-minimum `(trace_id, start_ts_ns,
+/// input_index)` head across all cursors reproduces byte-for-byte the ordering
+/// the old "gather everything then stable-sort" produced (see the module memory
+/// note). A part flushes on a `trace_id` transition once it reaches the size
+/// cap, so a trace never straddles two parts; since the sort key puts
+/// `trace_id` first, all of one trace's records across every input are
+/// contiguous here, so a plain `last_trace != current` check (inside
+/// [`PartBuilder::push`]) counts distinct traces correctly without a set. A
+/// record `keep` rejects is released here, so the erasure rewrite's peak memory
+/// is bounded by its survivors' part, not by everything it read.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn merge(
+    store: &dyn ObjectStoreBackend,
+    config: &CompactorConfig,
+    bucket: &Bucket,
+    catalogs: &[SpanInputCatalog],
+    input_set_hash: &[u8; 32],
+    dry_run: bool,
+    keep: &mut (dyn FnMut(&SpanRecord) -> Result<bool> + Send),
+) -> Result<SpanMergeOutput> {
+    // No whole-object fetch: the per-input ranged readers are already in the
+    // catalogs. Blocks are fetched by range one at a time in the flat k-way
+    // merge below, so raw resident bytes stay bounded to one block per input,
+    // never a whole object or the whole bucket.
+    let identity = compactor_identity(bucket, config);
+    let tracker = config.merge_memory_tracker.as_ref();
+    let concurrency = config.input_read_concurrency.max(1);
+
+    // Open every input's cursor and load its first record, `input_read_concurrency`
+    // opens in flight (each open costs one ranged block GET). `buffered` keeps
+    // canonical input order, the k-way merge's tie-break on equal
+    // `(trace_id, start_ts_ns)`. Box each future with an explicit `+ Send`
+    // bound before `buffered`, the workaround `crate::rlog::merge_stream_into_parts`
+    // documents for futures that borrow the `&dyn ObjectStoreBackend`.
+    type CursorFuture<'f, 'a> = Pin<Box<dyn Future<Output = Result<BlockCursor<'a>>> + Send + 'f>>;
+    let opens: Vec<CursorFuture<'_, '_>> = catalogs
+        .iter()
+        .enumerate()
+        .map(|(idx, catalog)| {
+            Box::pin(open_cursor(store, catalog, idx, tracker)) as CursorFuture<'_, '_>
+        })
+        .collect();
+    let mut cursors: Vec<BlockCursor> = stream_iter(opens)
+        .buffered(concurrency)
+        .try_collect()
+        .await?;
+
+    let mut parts = Vec::new();
+    let mut part_index: u32 = 0;
+    let mut current: Option<PartBuilder> = None;
+    let mut current_trace: Option<[u8; 16]> = None;
+    let mut counts = RecordCounts::default();
+
+    loop {
+        let mut best: Option<(usize, [u8; 16], i64, usize)> = None;
+        for (i, cursor) in cursors.iter().enumerate() {
+            if let Some(head) = &cursor.head {
+                let key = (head.trace_id, head.start_ts_ns, cursor.input_index);
+                match best {
+                    Some((_, bt, bts, bidx)) if (bt, bts, bidx) <= key => {}
+                    _ => best = Some((i, key.0, key.1, key.2)),
+                }
+            }
+        }
+        let Some((bi, trace_id, _, _)) = best else {
+            break;
+        };
+        let Some(rec) = cursors[bi].take_head() else {
+            return Err(MaintainError::Invariant(
+                "rspan merge selected a cursor with no head".into(),
+            ));
+        };
+
+        counts.add_input()?;
+
+        // The trace-boundary flush runs on every `trace_id` transition in the
+        // merged stream, independent of `keep`: a part is closed before the
+        // first record of a new trace so a trace never straddles two parts.
+        // Only surviving records open or push into a part.
+        if current_trace != Some(trace_id) {
+            if let Some(part) = &current {
+                let over_cap = part.estimate >= config.max_l1_part_bytes && !part.is_empty();
+                if over_cap && let Some(builder) = current.take() {
+                    let built = builder
+                        .finish(store, bucket, input_set_hash, part_index, dry_run)
+                        .await?;
+                    parts.push(built);
+                    part_index += 1;
+                    if let Some(t) = tracker {
+                        t.set_writer_bytes(0);
+                    }
+                }
+            }
+            current_trace = Some(trace_id);
         }
 
-        let mut parts = Vec::new();
-        let mut part_index: u32 = 0;
-        let mut current: Option<PartBuilder> = None;
-        let mut current_trace: Option<[u8; 16]> = None;
-
-        // Flat k-way merge over every input's block stream: each input is
-        // already sorted by `(trace_id, start_ts_ns)` (RSPAN's on-disk order),
-        // so selecting the globally-minimum `(trace_id, start_ts_ns,
-        // input_index)` head across all cursors reproduces byte-for-byte the
-        // ordering the old "gather everything then stable-sort" produced (see
-        // the module memory note). A part flushes on a `trace_id` transition
-        // once it reaches the size cap, so a trace never straddles two parts;
-        // since the sort key puts `trace_id` first, all of one trace's records
-        // across every input are contiguous here, so a plain
-        // `last_trace != current` check (inside [`PartBuilder::push`]) counts
-        // distinct traces correctly without a set.
-        loop {
-            let mut best: Option<(usize, [u8; 16], i64, usize)> = None;
-            for (i, cursor) in cursors.iter().enumerate() {
-                if let Some(head) = &cursor.head {
-                    let key = (head.trace_id, head.start_ts_ns, cursor.input_index);
-                    match best {
-                        Some((_, bt, bts, bidx)) if (bt, bts, bidx) <= key => {}
-                        _ => best = Some((i, key.0, key.1, key.2)),
-                    }
-                }
-            }
-            let Some((bi, trace_id, _, _)) = best else {
-                break;
-            };
-            let Some(rec) = cursors[bi].take_head() else {
-                return Err(MaintainError::Invariant(
-                    "rspan merge selected a cursor with no head".into(),
-                ));
-            };
-
-            if current_trace != Some(trace_id) {
-                if let Some(part) = &current {
-                    let over_cap = part.estimate >= config.max_l1_part_bytes && !part.is_empty();
-                    if over_cap && let Some(builder) = current.take() {
-                        let built = builder
-                            .finish(store, bucket, input_set_hash, part_index, config.dry_run)
-                            .await?;
-                        parts.push(built);
-                        part_index += 1;
-                        if let Some(t) = tracker {
-                            t.set_writer_bytes(0);
-                        }
-                    }
-                }
-                current_trace = Some(trace_id);
-            }
-
+        if keep(&rec)? {
+            counts.add_output()?;
             let part = current.get_or_insert_with(|| PartBuilder::new(&identity));
             part.push(rec, tracker);
-            cursors[bi].refill(store, tracker).await?;
         }
-
-        if let Some(part) = current
-            && !part.is_empty()
-        {
-            let built = part
-                .finish(store, bucket, input_set_hash, part_index, config.dry_run)
-                .await?;
-            parts.push(built);
-            if let Some(t) = tracker {
-                t.set_writer_bytes(0);
-            }
-        }
-
-        Ok(parts)
+        cursors[bi].refill(store, tracker).await?;
     }
+
+    if let Some(part) = current
+        && !part.is_empty()
+    {
+        let built = part
+            .finish(store, bucket, input_set_hash, part_index, dry_run)
+            .await?;
+        parts.push(built);
+        if let Some(t) = tracker {
+            t.set_writer_bytes(0);
+        }
+    }
+
+    Ok(SpanMergeOutput {
+        parts,
+        input_record_count: counts.input,
+        output_record_count: counts.output,
+    })
+}
+
+/// Open one input's cursor over its whole block sequence and load its first
+/// record. Named (not an inline `async` block) so its future is `Send`-general
+/// over the borrowed store; see the call site in [`merge`]. The cursor is
+/// retained even when the input carries no record: [`BlockCursor::refill`]
+/// still runs its per-input footer cross-check as it drains.
+async fn open_cursor<'a>(
+    store: &'a dyn ObjectStoreBackend,
+    catalog: &'a SpanInputCatalog,
+    input_index: usize,
+    tracker: Option<&MergeMemoryTracker>,
+) -> Result<BlockCursor<'a>> {
+    let mut cursor = BlockCursor::open(catalog, input_index);
+    cursor.refill(store, tracker).await?;
+    Ok(cursor)
 }
 
 /// One in-progress L1 part: the shared [`RspanWriter`] merged records push
@@ -582,8 +757,10 @@ pub(crate) fn compactor_identity(bucket: &Bucket, config: &CompactorConfig) -> O
 
 /// A rough uncompressed byte estimate for one span, for the part size cap.
 /// Approximate on purpose (it only decides where parts split, never
-/// correctness); mirrors the writer's own `row_estimate`.
-fn estimate_record(r: &SpanRecord) -> u64 {
+/// correctness); mirrors the writer's own `row_estimate`. `pub(crate)` so the
+/// erasure-rewrite split test can compute a part count arithmetically rather
+/// than observe it, the same way the RLOG path exposes `rlog::estimate_record`.
+pub(crate) fn estimate_record(r: &SpanRecord) -> u64 {
     let mut est: u64 = 48; // fixed-field overhead (ids, timestamps, status)
     est += r.name.len() as u64;
     if let Some(m) = &r.status_message {
