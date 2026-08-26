@@ -1,9 +1,10 @@
 //! Selective-erasure rewrite pass for the metrics (RSEG), logs (RLOG), and
 //! spans (RSPAN) signals (ADR-0064 decision 3).
 //! [`build_rewrite`] is the metrics (RSEG) driver; [`build_rewrite_logs`] and
-//! [`build_rewrite_spans`] are its logs/spans siblings, decoding whole
-//! `.rlog`/`.rspan` objects rather than RSEG's per-run catalogs (see
-//! [`build_rewrite_logs`]'s doc for why). [`erasure_rewrite_bucket`] dispatches
+//! [`build_rewrite_spans`] are its logs/spans siblings, working from whole
+//! object keys rather than RSEG's per-run catalogs. Logs stream those objects
+//! block by block through the compactor's own merge ([`build_rewrite_logs`]);
+//! spans still decode each object whole. [`erasure_rewrite_bucket`] dispatches
 //! to whichever of the three applies by `bucket.signal` and, on a successful
 //! publish, calls [`crate::scan::MaintainMemo::invalidate`] for the rewritten
 //! bucket's hour so the interior zone re-verifies immediately instead of
@@ -41,12 +42,17 @@
 //! [`ravel_segment::decode_run_histogram_pages`], filters, and re-encodes
 //! survivors via [`ravel_segment::encode_run_v4`]. It also does not replicate
 //! `build_parts`'s size-capped multi-part splitting or its coalesced ranged
-//! fetch: every live input/part is read with one whole-object GET and every
-//! bucket's survivors are written as a single output part. Both are
+//! fetch: every live metrics input/part is read with one whole-object GET and
+//! a metrics bucket's survivors are written as a single output part. Both are
 //! deliberate, transparent scope reductions for a first correct
 //! implementation (erasure rewrites are rare maintenance passes, not a
 //! request-hot path); a follow-up can adopt `build.rs`'s batching machinery
 //! without changing this module's public shape.
+//!
+//! That scope reduction no longer covers logs. [`build_rewrite_logs`] runs the
+//! RLOG compactor's own streaming merge and splits its survivors into
+//! `max_l1_part_bytes`-bounded parts (issue #725); metrics and spans still
+//! have the whole-object, single-part shape described above.
 //!
 //! ## Exemplars are dropped, not carried forward (open gap)
 //!
@@ -75,10 +81,7 @@ use futures::stream::{StreamExt, TryStreamExt, iter as stream_iter};
 use prost::Message;
 use ravel_commit::erasure;
 use ravel_commit::keys;
-use ravel_logseg::{
-    AttrValue as LogAttrValue, LogStreamId, Predicate as LogPredicate, RlogConfig, RlogReader,
-    RlogWriter,
-};
+use ravel_logseg::AttrValue as LogAttrValue;
 use ravel_object_store::{
     GetRange, ObjectStoreBackend, PutOptions, StoreError, UploadChecksum, list_all,
 };
@@ -691,13 +694,14 @@ async fn load_live_catalogs_and_target(
     }
 }
 
-/// Resolve `live` down to the whole-object keys [`build_rewrite_logs`] /
-/// [`build_rewrite_spans`] GET-and-decode-in-full and the [`RewriteSupersession`]
-/// target the eventual `RewriteRecord` names -- the LOGS/SPANS sibling of
+/// Resolve `live` down to the object keys [`build_rewrite_logs`] /
+/// [`build_rewrite_spans`] read and the [`RewriteSupersession`] target the
+/// eventual `RewriteRecord` names -- the LOGS/SPANS sibling of
 /// [`load_live_catalogs_and_target`], stopping short of that function's
-/// per-run [`InputCatalog`] fetch because the logs/spans rewrite path (module
-/// doc's scope reduction) decodes every live object whole rather than through
-/// ranged per-run catalogs, so there is no catalog to build here at all.
+/// per-run [`InputCatalog`] fetch because neither logs nor spans has an RSEG
+/// per-run catalog to build. What each driver then does with the keys differs:
+/// logs hand them to `rlog::load_catalogs_by_key` for a block-streaming merge,
+/// spans still GET each object whole.
 fn live_input_object_keys_and_target(
     live: LiveInputs,
 ) -> Result<(Vec<String>, RewriteSupersession)> {
@@ -1165,22 +1169,47 @@ fn first_dropping_log_request(
 /// Decode-filter-reencode one LOGS bucket's live record set against every
 /// applicable request's matcher, mirroring [`build_rewrite`]'s batching
 /// contract (every request in `requests` gets a `drops[]` entry, even a zero
-/// one) but not its per-run catalog machinery: this module's "single
-/// whole-object GET" scope reduction (top-of-module doc) means every object
-/// named by `object_keys` is fetched whole and every one of its records is
-/// decoded via [`RlogReader::scan`] with an unbounded [`LogPredicate::TsRange`],
-/// rather than range-fetching individual blocks. Records are pushed into one
-/// [`RlogWriter`] with no indexed fields at all -- POSTINGS is a widen-only
-/// pruning index (ADR-0013), so a rewritten part carrying none loses a rare
-/// maintenance pass some query pruning, never correctness, the same shape of
-/// tradeoff as this module's documented exemplar-drop for metrics.
+/// one).
 ///
-/// Peak memory is bounded the way the compactor's is (issue #725, following
-/// issue #711): inputs are read block by block through [`rlog::StreamCursor`]
-/// with a bounded read fan-out, and survivors land in a [`rlog::PartSink`] that
-/// opens the next part mid-stream once the current one reaches
-/// `max_l1_part_bytes`. A rewrite therefore emits N parts, never one part
-/// sized by the bucket.
+/// Survivors are written with no indexed fields at all -- POSTINGS is a
+/// widen-only pruning index (ADR-0013), so a rewritten part carrying none loses
+/// a rare maintenance pass some query pruning, never correctness, the same
+/// shape of tradeoff as this module's documented exemplar-drop for metrics.
+/// Regenerating the index sections from survivors (rather than carrying an
+/// input's through) is what makes an ADR-0064 `.done` claim true of the object
+/// itself, so this is a floor, not just a saving.
+///
+/// # Memory (issue #725)
+///
+/// This is [`rlog::merge_catalogs`], the same k-way block-streaming merge the
+/// compactor runs, with the erasure predicate as its per-record filter. So it
+/// inherits every bound issue #711 gave compaction: each input is read one
+/// block at a time by range (never whole), `input_read_concurrency` cursor
+/// opens are in flight at once, and survivors land in a `PartSink` that closes
+/// the in-progress part as soon as its overhead-aware estimate reaches
+/// `max_l1_part_bytes`, wherever in the merged record sequence that falls.
+/// Peak resident memory is therefore one part plus one decoded block per input,
+/// never the bucket.
+///
+/// It did NOT always work this way: this function used to GET every input whole
+/// and push every survivor into ONE unbounded [`RlogWriter`], so a bucket
+/// carrying one hot stream (3M wide ClickBench rows over ~270 inputs) held the
+/// raw object bytes and every decoded survivor at once, past the 45.7 GB
+/// resident the compactor peaked at before #711.
+///
+/// A rewrite therefore emits N parts. Nothing downstream assumed one: the
+/// conservation gate in [`publish_rewrite_record`] already sums
+/// `part.sample_count` over `build.parts` (ADR-0064 decision 3 point 4), the
+/// publish loop already PUTs each part under its own `part_index`-keyed
+/// content-addressed key, and the catalog already unions every part of a
+/// `RewriteRecord` into its own `SegmentRef`.
+///
+/// The input-side footer cross-check now runs on
+/// [`RlogInputCatalog::record_count`], read from the footer each catalog load
+/// already fetched, instead of from a whole-object GET. It fires after the
+/// merge rather than before the write, which changes nothing it protects: the
+/// merge is a `dry_run` build, so an abort here is still an abort before the
+/// first byte is written.
 pub async fn build_rewrite_logs(
     store: &dyn ObjectStoreBackend,
     bucket: &Bucket,
@@ -1189,87 +1218,45 @@ pub async fn build_rewrite_logs(
     requests: &[ApplicableLogRequest],
     input_set_hash: &[u8; 32],
 ) -> Result<RewriteBuild> {
-    let read_cfg = RlogConfig::default();
-    let full_range = LogPredicate::TsRange {
-        min_ns: i64::MIN,
-        max_ns: i64::MAX,
-    };
+    // `false`: this pass writes its parts with no indexed fields, so recovering
+    // each input's POSTINGS field list would cost a ranged GET per input and be
+    // discarded.
+    let catalogs = rlog::load_catalogs_by_key(store, config, object_keys, false).await?;
 
-    let mut input_sample_count: u64 = 0;
-    let mut output_sample_count: u64 = 0;
-    let mut footer_record_count: u64 = 0;
+    // Input-side record-count authority: each input object's RLOG footer
+    // declares its own `record_count`, written at flush/compact time
+    // independently of the decode path this pass runs. Summing it and
+    // cross-checking against the merge tally below closes the silent data-loss
+    // gap the conservation gate cannot: that gate proves survivors + drops ==
+    // the merge's own count, so a decode that silently dropped input records
+    // would satisfy it against a deflated input total and permanently supersede
+    // the originals. Metrics catches the same class via the catalog
+    // `run.sample_count` cross-check; logs/spans had no equivalent until here.
+    let footer_record_count = checked_sample_sum(catalogs.iter().map(|c| c.record_count))?;
+
     let mut dropped_counts = vec![0u64; requests.len()];
-
-    let identity = rlog::compactor_identity(bucket, config);
-    let mut writer = RlogWriter::new(read_cfg, identity);
-    let mut first_stream_id: Option<LogStreamId> = None;
-    let mut last_stream_id: Option<LogStreamId> = None;
-    let mut any_survivor = false;
-
-    for object_key in object_keys {
-        let got = store.get(object_key, GetRange::Full).await?;
-        // Input-side record-count authority: each input object's
-        // RLOG footer declares its own `record_count`, written at flush/compact
-        // time independently of the decode path this pass runs. Summing it and
-        // cross-checking against the scan tally below closes the silent
-        // data-loss gap the conservation gate cannot: that gate proves
-        // survivors + drops == the scan's own count, so a decode that silently
-        // dropped input records would satisfy it against a deflated input total
-        // and permanently supersede the originals. Metrics catches the same
-        // class via the catalog `run.sample_count` cross-check; logs/spans had
-        // no equivalent until here.
-        let footer = ravel_logseg::footer::open(got.data.as_ref())?;
-        footer_record_count = footer_record_count
-            .checked_add(footer.record_count)
-            .ok_or_else(|| {
-                MaintainError::Invariant("footer record_count sum overflowed u64".to_string())
-            })?;
-        let reader = RlogReader::new(got.data.as_ref(), &read_cfg)?;
-        let (records, _stats) = reader.scan(&full_range)?;
-        for record in records {
-            input_sample_count = input_sample_count.checked_add(1).ok_or_else(|| {
-                MaintainError::Invariant("input_sample_count sum overflowed u64".to_string())
-            })?;
-            match first_dropping_log_request(requests, &record.attrs, record.ts_ns) {
-                Some(i) => dropped_counts[i] += 1,
-                None => {
-                    output_sample_count = output_sample_count.checked_add(1).ok_or_else(|| {
-                        MaintainError::Invariant(
-                            "output_sample_count sum overflowed u64".to_string(),
-                        )
-                    })?;
-                    let sid = record.stream_id;
-                    first_stream_id = Some(first_stream_id.map_or(sid, |f| f.min(sid)));
-                    last_stream_id = Some(last_stream_id.map_or(sid, |l| l.max(sid)));
-                    any_survivor = true;
-                    writer.push(record)?;
-                }
+    // dry_run: true -- `publish_rewrite_record` PUTs `build.parts` itself, only
+    // after its conservation gate passes, mirroring how `build_rewrite_part`
+    // (metrics) also defers the PUT to that shared publish path.
+    let merged = rlog::merge_catalogs(
+        store,
+        config,
+        bucket,
+        &catalogs,
+        input_set_hash,
+        Vec::new(),
+        true,
+        &mut |record| match first_dropping_log_request(requests, &record.attrs, record.ts_ns) {
+            Some(i) => {
+                dropped_counts[i] += 1;
+                Ok(false)
             }
-        }
-    }
+            None => Ok(true),
+        },
+    )
+    .await?;
 
-    input_footer_cross_check(bucket, input_sample_count, footer_record_count)?;
-
-    let parts = if any_survivor {
-        // dry_run: true -- `publish_rewrite_record` PUTs `build.parts` itself,
-        // only after its conservation gate passes, mirroring how
-        // `build_rewrite_part` (metrics) also defers the PUT to that shared
-        // publish path instead of writing here.
-        let built = rlog::finalize_part(
-            store,
-            bucket,
-            writer,
-            first_stream_id,
-            last_stream_id,
-            input_set_hash,
-            0,
-            true,
-        )
-        .await?;
-        vec![built]
-    } else {
-        Vec::new()
-    };
+    input_footer_cross_check(bucket, merged.input_record_count, footer_record_count)?;
 
     let drops = requests
         .iter()
@@ -1281,9 +1268,9 @@ pub async fn build_rewrite_logs(
         .collect();
 
     Ok(RewriteBuild {
-        parts,
-        input_sample_count,
-        output_sample_count,
+        parts: merged.parts,
+        input_sample_count: merged.input_record_count,
+        output_sample_count: merged.output_record_count,
         drops,
     })
 }
@@ -2213,6 +2200,9 @@ mod tests {
 
     use ravel_catalog::{Catalog, CatalogConfig};
     use ravel_commit::record::{self, NewCommitRecord};
+    use ravel_logseg::{
+        LogStreamId, Predicate as LogPredicate, RlogConfig, RlogReader, RlogWriter,
+    };
     use ravel_object_store::memory::MemoryStore;
     use ravel_segment::{SeriesInputV3, VERSION_V7};
     use ravel_types::{Label, METRIC_NAME_LABEL, SeriesId, TenantId, TimeRange};
