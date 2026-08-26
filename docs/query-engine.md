@@ -100,15 +100,32 @@ the plan contains no `LogsScanExec` and the query issues zero object-store
 GETs. Every `sample_count` is written by the commit record, so the sum is
 known the moment `Catalog::resolve` returns; before this, counting the full
 ClickBench tenant (issue #680, 8424 objects, 100M rows) took 142 s and moved
-23 GB from object storage to add up numbers the resolve already had. The scan
-falls back to the exact-count-by-scanning path (row count reported `Absent`,
-the rule does not fire, `LogsScanExec` stays in the plan) whenever the count
-of committed rows is not the query's answer: any pushed predicate at all (a
-`ts` bound, a `has_word` content predicate, or an attribute-equality prune),
-or any pending selective erasure in the snapshot (ADR-0064), which removes
-rows the committed counts still include. So an operator who sees a `COUNT(*)`
-answered with zero GETs is seeing the by-design fast path, and one predicate
-or one pending erasure is enough to put the read back on the scan.
+23 GB from object storage to add up numbers the resolve already had. The leaf
+also reports an `Exact` `num_rows`/`ts` span (issue #723) when a `ts` bound is
+present but fully CONTAINS every resolved segment -- the bound removes no
+row, so the sum is still exact -- not only in the no-bound case. The leaf
+falls back to `Absent` (the rule does not fire on it, `LogsScanExec` stays in
+the plan) whenever the count of committed rows is not the query's answer: a
+`ts` bound that clips at least one segment, any `has_word` content predicate
+or attribute-equality prune, or any pending selective erasure in the snapshot
+(ADR-0064), which removes rows the committed counts still include.
+
+This exact leaf statistic only reaches DataFusion's `AggregateStatistics`
+rule end to end when no `FilterExec` survives above the scan to intercept
+it: `LogsTableProvider::supports_filters_pushdown` currently reports
+`Inexact` for every filter unconditionally (crates/ravel-sql/src/
+logs_provider.rs), so DataFusion keeps re-applying any pushed filter,
+`ts` bound included, in a `FilterExec` above `LogsScanExec`, and that
+`FilterExec` reports its own (non-exact) statistics rather than passing
+the leaf's `Exact` count through. In practice the zero-GET rewrite fires
+today only for the genuinely predicate-free query (no `ts` bound, no
+content, no prune) -- the only shape with no filter left to push down at
+all. The contained-`ts`-bound case computes a correct `Exact` leaf
+statistic (and its `ts` min/max still reach the planner as a leaf
+property), but a `COUNT(*)` with a contained `ts` bound still scans today;
+making `supports_filters_pushdown` report the bound as `Exact` when it is
+already absorbed by this containment check is a separate, unimplemented
+follow-up (issue #733).
 
 Staleness: the evaluator recognizes the Prometheus staleness marker (the
 exact NaN bit pattern `0x7ff0_0000_0000_0002`, compared via

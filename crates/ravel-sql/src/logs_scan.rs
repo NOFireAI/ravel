@@ -784,20 +784,35 @@ impl ExecutionPlan for LogsScanExec {
         Some(self.metrics.clone_inner())
     }
 
-    /// Report the exact row count for a predicate-free, erasure-free
-    /// `COUNT(*)` straight from the catalog's committed row counts, so
-    /// DataFusion's `AggregateStatistics` physical-optimizer rule rewrites the
-    /// aggregate into a literal and never executes this scan (issue #698). On
-    /// the ClickBench tenant (issue #680) a scanning `count(*)` moved 23 GB
-    /// from object storage to add up 8424 numbers the resolve already had.
+    /// Report the exact row count and `ts` span straight from the catalog's
+    /// committed row counts and segment bounds, for any query where nothing
+    /// removes a row the committed counts still include: no content/prune
+    /// predicate, no pending erasure, and a `ts` bound (if any) that fully
+    /// CONTAINS every resolved segment (issue #698, widened by #723).
+    ///
+    /// For the genuinely predicate-free query (no `ts` bound at all, the
+    /// trivial contained case) this statistic reaches DataFusion's
+    /// `AggregateStatistics` physical-optimizer rule undisturbed and the rule
+    /// rewrites the aggregate into a literal, so this scan is never executed
+    /// (issue #698: on the ClickBench tenant, issue #680, a scanning
+    /// `count(*)` moved 23 GB from object storage to add up 8424 numbers the
+    /// resolve already had). For a query with an actual, contained `ts`
+    /// bound, this leaf statistic is still correct, but
+    /// `LogsTableProvider::supports_filters_pushdown` reports every filter
+    /// `Inexact`, so DataFusion keeps a `FilterExec` re-applying the bound
+    /// above this node; that `FilterExec` reports its own (non-exact)
+    /// statistics rather than passing this one through, so the rewrite does
+    /// not fire and the query still scans. Issue #733 tracks closing that
+    /// reachability gap; until then this method is correct but only
+    /// end-to-end effective for the no-bound case.
     ///
     /// `num_rows` is `Exact` only for the whole-plan request (`partition` is
     /// `None`) and only when [`Self::stats_are_exact`] holds; a per-partition
     /// request gets `Absent`, because a partition's count is its lazily
     /// resolved striped share of the blocks, not known here. Under the same
     /// condition the `ts` column's `column_statistics` report an `Exact`
-    /// min/max spanning every touched segment (issue #723); every other
-    /// column's stays `Absent`. `total_byte_size` stays `Absent`.
+    /// min/max spanning every touched segment; every other column's stays
+    /// `Absent`. `total_byte_size` stays `Absent`.
     fn partition_statistics(&self, partition: Option<usize>) -> DFResult<Arc<Statistics>> {
         // Validate the partition index exactly as the trait default does, so an
         // out-of-range request is an internal error, never a silent answer.
@@ -834,7 +849,7 @@ impl ExecutionPlan for LogsScanExec {
             if let (Some(min), Some(max)) = (
                 self.segments.iter().map(|s| s.min_event_ts_ns).min(),
                 self.segments.iter().map(|s| s.max_event_ts_ns).max(),
-            ) && let Some(ts_idx) = self.schema.fields().iter().position(|f| f.name() == "ts")
+            ) && let Some(ts_idx) = self.projection.iter().position(|&i| i == LOG_COL_TS)
             {
                 let col = &mut stats.column_statistics[ts_idx];
                 col.min_value = Precision::Exact(ScalarValue::TimestampNanosecond(Some(min), None));
