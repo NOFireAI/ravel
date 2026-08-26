@@ -4,11 +4,28 @@
 # coderabbitai[bot] review/finding counts, in one call instead of the three
 # or four `gh` invocations every session was hand-rolling.
 #
-# Usage: pr-review-status.sh <pr-number>
+# Usage: pr-review-status.sh <pr-number> [--confirm-addressed]
+#
+# --confirm-addressed: the operator's explicit statement that every
+# CodeRabbit inline comment on the PR has been read and each one fixed or
+# answered. The REST API has no resolved/unresolved field (see below), so
+# once a PR has ever had a finding its comment count never returns to zero
+# and the clean branch below could otherwise never fire again (issue #764:
+# PR #754 had 13 addressed comments across 4 fix rounds and no way to get
+# the SHA-pinned merge command). The flag skips ONLY the comment-count
+# conjunct; CI, the current-head review, and the mergeState checks still
+# gate exactly as without it.
 set -euo pipefail
 
-pr="${1:?usage: pr-review-status.sh <pr-number>}"
+pr="${1:?usage: pr-review-status.sh <pr-number> [--confirm-addressed]}"
 repo="NOFireAI/ravel"
+confirm_addressed=0
+if [[ "${2:-}" == "--confirm-addressed" ]]; then
+  confirm_addressed=1
+elif [[ -n "${2:-}" ]]; then
+  echo "usage: pr-review-status.sh <pr-number> [--confirm-addressed]" >&2
+  exit 2
+fi
 
 pr_json="$(gh pr view "${pr}" --repo "${repo}" \
   --json state,mergeStateStatus,statusCheckRollup,headRefOid)"
@@ -99,11 +116,15 @@ elif [[ "${other}" != "0" ]]; then
   echo "  -> CI has ${other} check(s) in an unrecognized state; verify by hand before merging"
 elif [[ "${pending}" != "0" ]]; then
   echo "  -> CI still running; wait"
-elif [[ "${cr_comments}" != "0" ]]; then
-  echo "  -> ${cr_comments} CodeRabbit inline comment(s); read them and confirm each is fixed or answered before merging"
+elif [[ "${cr_comments}" != "0" && "${confirm_addressed}" != "1" ]]; then
+  echo "  -> ${cr_comments} CodeRabbit inline comment(s); read them, then re-run with --confirm-addressed once each is fixed or answered (the API cannot tell; see the header comment)"
 elif [[ "${merge_state}" != "CLEAN" && "${merge_state}" != "UNSTABLE" ]]; then
   echo "  -> every check and review looks clean, but mergeState is ${merge_state} (not CLEAN/UNSTABLE); verify by hand before merging"
 else
-  echo "  -> clean: CI green, CodeRabbit reviewed the current head with zero inline comments"
+  if [[ "${cr_comments}" != "0" ]]; then
+    echo "  -> clean (operator confirmed all ${cr_comments} inline comment(s) addressed): CI green, CodeRabbit reviewed the current head"
+  else
+    echo "  -> clean: CI green, CodeRabbit reviewed the current head with zero inline comments"
+  fi
   echo "  -> gh pr merge ${pr} --rebase --delete-branch --match-head-commit ${head_sha}"
 fi
