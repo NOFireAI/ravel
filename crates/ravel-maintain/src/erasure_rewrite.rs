@@ -1289,8 +1289,11 @@ fn first_dropping_span_request(
 
 /// Decode-filter-reencode one SPANS bucket's live record set against every
 /// applicable request's matcher -- the SPANS sibling of [`build_rewrite_logs`],
-/// same whole-object-GET scope reduction, [`RspanReader::scan`] with an
-/// unbounded [`SpanQuery::ts_range`]. A span's whole [`ravel_rspan::SpanRecord`]
+/// still under the module doc's whole-object-GET scope reduction (which logs
+/// left behind in issue #725): every object named by `object_keys` is fetched
+/// whole and decoded with [`RspanReader::scan`] under an unbounded
+/// [`SpanQuery::ts_range`], and every survivor is pushed into one uncapped
+/// [`RspanWriter`]. A span's whole [`ravel_rspan::SpanRecord`]
 /// (including any links/events, which per that type's own field-shape and doc
 /// comment live only as opaque blob entries inside `attrs`, never as separate
 /// columns) is decoded, tested, and either pushed to the output writer intact
@@ -2203,6 +2206,7 @@ mod tests {
     use ravel_logseg::{
         LogStreamId, Predicate as LogPredicate, RlogConfig, RlogReader, RlogWriter,
     };
+    use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
     use ravel_object_store::memory::MemoryStore;
     use ravel_segment::{SeriesInputV3, VERSION_V7};
     use ravel_types::{Label, METRIC_NAME_LABEL, SeriesId, TenantId, TimeRange};
@@ -2210,6 +2214,7 @@ mod tests {
 
     use super::*;
     use crate::clock::FixedClock;
+    use crate::config::MergeMemoryTracker;
     use crate::read::SeriesPlan;
     use crate::sweep::NoLeases;
 
@@ -3141,6 +3146,21 @@ mod tests {
         records: &[LogRecord],
         indexed_fields: &[&str],
     ) {
+        seed_logs_with(store, seq, records, indexed_fields, RlogConfig::default()).await;
+    }
+
+    /// [`seed_logs_indexed`] with the writer config too, so a fixture can pick
+    /// the input's block size. A memory test needs inputs of many small blocks:
+    /// at the 8192-record default an input's whole stream is one block, and the
+    /// merge's decode-side term would scale with the corpus for reasons that
+    /// have nothing to do with what is under test.
+    async fn seed_logs_with(
+        store: &dyn ObjectStoreBackend,
+        seq: u64,
+        records: &[LogRecord],
+        indexed_fields: &[&str],
+        cfg: RlogConfig,
+    ) {
         let th = tenant_hash();
         let writer_id = Uuid::from_u128(u128::from(seq));
         let identity = LogObjectIdentity {
@@ -3150,7 +3170,7 @@ mod tests {
             writer_epoch: EPOCH,
             writer_seq: seq,
         };
-        let mut w = RlogWriter::new(RlogConfig::default(), identity)
+        let mut w = RlogWriter::new(cfg, identity)
             .with_indexed_fields(indexed_fields.iter().map(|f| (*f).to_string()).collect());
         for r in records {
             w.push(r.clone()).expect("push log record");
@@ -3646,6 +3666,415 @@ mod tests {
         let expected_ts: std::collections::BTreeSet<i64> =
             expected.iter().map(|r| r.ts_ns).collect();
         assert_eq!(survivor_ts, expected_ts);
+    }
+
+    // --- bounded-memory logs erasure rewrite (issue #725) --------------------
+
+    /// Event-time base for the #725 fixtures: the start of the fixture
+    /// bucket's own ingest hour, so every record's event time sits inside the
+    /// hour its bucket is keyed by.
+    const SPLIT_BASE_NS: i64 = HOUR as i64 * NS_PER_HOUR;
+    /// The erased and kept `user_id` values. Deliberately the same length:
+    /// every surviving record must have the same [`rlog::estimate_record`]
+    /// value for [`expected_part_count`] to be arithmetic, not an observation.
+    const SPLIT_ERASED: &str = "erased-0";
+    const SPLIT_KEPT: &str = "kept-000";
+    /// Every fourth record belongs to the erased subject.
+    const SPLIT_ERASE_EVERY: i64 = 4;
+
+    fn split_subject_of(i: i64) -> &'static str {
+        if i % SPLIT_ERASE_EVERY == 0 {
+            SPLIT_ERASED
+        } else {
+            SPLIT_KEPT
+        }
+    }
+
+    /// One wide record of stream 0 at ordinal `i`: `rlog.rs`'s own #711 split
+    /// fixture shape (fixed attribute count, fixed key and value widths, a
+    /// zero-padded body and ordinal that do not change width over the range
+    /// these tests use) plus the `user_id` the erasure predicate matches.
+    fn wide_log_record(i: i64) -> LogRecord {
+        let mut attrs: Vec<(String, LogAttrValue)> = (0..8u32)
+            .map(|k| {
+                (
+                    format!("attr_{k:02}"),
+                    LogAttrValue::Str(format!("value-{:08}-{k:02}", i % 100_000_000)),
+                )
+            })
+            .collect();
+        attrs.push((
+            "user_id".to_string(),
+            LogAttrValue::Str(split_subject_of(i).to_string()),
+        ));
+        log_record(0, SPLIT_BASE_NS + i, &format!("row-{i:08}"), attrs)
+    }
+
+    /// The number of parts `survivors` equally-sized surviving records must
+    /// produce under `cap`: a part takes records until its running estimate
+    /// reaches the cap, so it holds `ceil(cap / estimate)` of them. Erased
+    /// records never enter a part, so they do not count here.
+    fn expected_part_count(record_estimate: u64, cap: u64, survivors: u64) -> u64 {
+        survivors.div_ceil(cap.div_ceil(record_estimate))
+    }
+
+    /// Seed `inputs` L0 objects covering ordinals `0..total` of
+    /// [`wide_log_record`], round-robin, so the canonical merge order
+    /// interleaves the inputs and every record's `ts_ns` is globally unique
+    /// (no tie-break to reason about).
+    async fn seed_split_inputs(
+        store: &dyn ObjectStoreBackend,
+        total: i64,
+        inputs: i64,
+        cfg: RlogConfig,
+    ) {
+        for j in 0..inputs {
+            let recs: Vec<LogRecord> = (0..total / inputs)
+                .map(|i| wide_log_record(i * inputs + j))
+                .collect();
+            seed_logs_with(store, j as u64 + 1, &recs, &[], cfg).await;
+        }
+    }
+
+    /// The one pending request these fixtures erase by.
+    fn split_pending() -> Vec<PendingErasureRequest> {
+        vec![PendingErasureRequest {
+            request_key: "unused-in-memory-only".to_string(),
+            request: logs_erasure_request(725, "user_id", SPLIT_ERASED),
+        }]
+    }
+
+    /// Issue #725: an erasure over a bucket whose SURVIVORS exceed
+    /// `max_l1_part_bytes` several times over emits exactly the number of
+    /// parts the cap implies, not one part sized by the bucket. Every erased
+    /// row is absent, every other row is present exactly once and in canonical
+    /// order across the part sequence, and the count conserves the ADR-0064
+    /// way: `sum(part.sample_count) + dropped == input`.
+    ///
+    /// The whole corpus is one stream, so this is the shape that had no split
+    /// point at all before the size rule: a single OTLP resource/scope, the
+    /// common shape for one busy service.
+    ///
+    /// Demonstrated red by restoring the single unbounded writer: in
+    /// `rlog::PartSink::push`, replace `over_cap = part.estimate >=
+    /// self.config.max_l1_part_bytes` with `over_cap = false`. Every survivor
+    /// then lands in one part and this fails at the part-count assertion with
+    /// `1 != 8`.
+    #[tokio::test]
+    async fn logs_erasure_splits_survivors_into_bounded_parts() {
+        const TOTAL: i64 = 800;
+        const INPUTS: i64 = 2;
+        const CAP: u64 = 64 * 1024;
+
+        let store = MemoryStore::new();
+        seed_split_inputs(&store, TOTAL, INPUTS, RlogConfig::default()).await;
+
+        let expected: Vec<LogRecord> = (0..TOTAL)
+            .filter(|i| split_subject_of(*i) == SPLIT_KEPT)
+            .map(wide_log_record)
+            .collect();
+        let survivors_expected = expected.len() as u64;
+        let dropped_expected = TOTAL as u64 - survivors_expected;
+        assert!(dropped_expected > 0, "the fixture must erase something");
+
+        // Every survivor has the same estimate, so the part count is
+        // arithmetic. Taken from ordinal 1, which is a kept row.
+        let record_estimate = rlog::estimate_record(&wide_log_record(1));
+        let expected_parts = expected_part_count(record_estimate, CAP, survivors_expected);
+        assert!(
+            expected_parts >= 4,
+            "fixture must exceed the cap several times over, got {expected_parts} parts"
+        );
+
+        let clock = FixedClock::new(sealed_now_ns());
+        let config = CompactorConfig {
+            max_l1_part_bytes: CAP,
+            ..CompactorConfig::default()
+        };
+        let mut memo = MaintainMemo::with_default_interval();
+        let outcome = erasure_rewrite_bucket(
+            &store,
+            &clock,
+            &config,
+            &NoLeases,
+            &logs_bucket(),
+            &split_pending(),
+            &mut memo,
+        )
+        .await
+        .expect("erasure rewrite");
+        let (parts, publish) = match outcome {
+            ErasureRewriteOutcome::Rewritten { parts, publish } => (parts, publish),
+            other => panic!("expected Rewritten, got {other:?}"),
+        };
+        assert_eq!(publish, PublishOutcome::Published);
+        assert_eq!(
+            parts as u64, expected_parts,
+            "cap {CAP} over {survivors_expected} survivors estimated at {record_estimate} bytes \
+             each"
+        );
+
+        let record = read_rewrite_record_for(&store, &logs_bucket()).await;
+        assert_eq!(record.parts.len() as u64, expected_parts);
+
+        // ADR-0064 accounting through N parts.
+        assert_eq!(record.drops.len(), 1);
+        assert_eq!(record.drops[0].dropped_count, dropped_expected);
+        let output_total: u64 = record.parts.iter().map(|p| p.sample_count).sum();
+        assert_eq!(
+            output_total + record.drops[0].dropped_count,
+            TOTAL as u64,
+            "sum(part.sample_count) + dropped must equal the whole input record set"
+        );
+
+        // Every erased row absent, every other row present exactly once, in
+        // canonical order across the part sequence.
+        let mut survivors = Vec::new();
+        for part in &record.parts {
+            let key = keys::reconstruct_rewrite_part_key(&record, part).expect("part key");
+            survivors.extend(decode_logs_part(&store, &key).await);
+        }
+        assert!(
+            !survivors.iter().any(|r| r
+                .attrs
+                .iter()
+                .any(|(k, v)| k == "user_id" && v == &LogAttrValue::Str(SPLIT_ERASED.to_string()))),
+            "no erased row may survive in any part"
+        );
+        assert_eq!(
+            survivors, expected,
+            "concatenating the parts in part order must reproduce exactly the kept rows, once \
+             each, in canonical order"
+        );
+
+        // The parts really are a split of one straddling stream: each carries
+        // the same single stream id, with adjacent non-overlapping event-time
+        // ranges.
+        let (stream0, _) = log_stream_ident(0);
+        let mut prev_max: Option<i64> = None;
+        for p in &record.parts {
+            assert_eq!(p.first_series_id, stream0.0.to_vec());
+            assert_eq!(p.last_series_id, stream0.0.to_vec());
+            assert!(p.min_event_ts_ns <= p.max_event_ts_ns);
+            if let Some(prev) = prev_max {
+                assert!(
+                    prev < p.min_event_ts_ns,
+                    "part event-time ranges must be adjacent and non-overlapping"
+                );
+            }
+            prev_max = Some(p.max_event_ts_ns);
+        }
+    }
+
+    /// Issue #725: the erasure rewrite's peak resident memory tracks the part
+    /// cap, not how many records it read or kept. The same single-stream shape
+    /// is erased at 2x and 8x the records; the tracker's total high-water must
+    /// barely move.
+    ///
+    /// Demonstrated red by the same flip as
+    /// [`logs_erasure_splits_survivors_into_bounded_parts`] (`over_cap =
+    /// false` in `rlog::PartSink::push`, restoring the single unbounded
+    /// writer): the writer term then holds every survivor, so the peak follows
+    /// the record count and the ratio goes to about 4, failing `ratio < 1.3`
+    /// while `parts > 1` fails too. Restoring the pre-#725
+    /// whole-object-GET-and-scan body of `build_rewrite_logs` instead makes
+    /// the tracker record nothing at all (that path has no cursor to account),
+    /// failing `peak > 0`.
+    #[tokio::test]
+    async fn logs_erasure_peak_scales_with_the_cap_not_the_survivor_count() {
+        const BASE: i64 = 400;
+        const INPUTS: i64 = 2;
+        const CAP: u64 = 64 * 1024;
+        // The inputs are re-blocked at 100 records so the decode-side term is
+        // the same at both scales (every input carries far more than one
+        // block); at the 8192-record default an input's whole stream would be
+        // one block and the transient term would scale with the corpus, which
+        // is not what this test is about.
+        const L0_BLOCK: usize = 100;
+        // At most one decoded block plus two raw blocks per input. Loose on
+        // purpose: the claim under test is the ratio.
+        const TRANSIENT_ALLOWANCE: u64 = 4 * 1024 * 1024;
+
+        let mut peaks = Vec::new();
+        for scale in [2i64, 8i64] {
+            let store = MemoryStore::new();
+            let total = BASE * scale;
+            seed_split_inputs(
+                &store,
+                total,
+                INPUTS,
+                RlogConfig {
+                    block_target_records: L0_BLOCK,
+                    ..RlogConfig::default()
+                },
+            )
+            .await;
+
+            let tracker = MergeMemoryTracker::new();
+            let config = CompactorConfig {
+                max_l1_part_bytes: CAP,
+                merge_memory_tracker: Some(tracker.clone()),
+                ..CompactorConfig::default()
+            };
+            let clock = FixedClock::new(sealed_now_ns());
+            let mut memo = MaintainMemo::with_default_interval();
+            let outcome = erasure_rewrite_bucket(
+                &store,
+                &clock,
+                &config,
+                &NoLeases,
+                &logs_bucket(),
+                &split_pending(),
+                &mut memo,
+            )
+            .await
+            .expect("erasure rewrite");
+            let parts = match outcome {
+                ErasureRewriteOutcome::Rewritten { parts, .. } => parts,
+                other => panic!("expected Rewritten, got {other:?}"),
+            };
+
+            let peak = tracker.peak_total_bytes();
+            println!(
+                "[mem:erasure #725] scale={scale} records={total} parts={parts} \
+                 peak_total={peak}B cap={CAP}B"
+            );
+            assert!(peak > 0, "the tracker must record real residency");
+            peaks.push((peak, parts));
+        }
+
+        // 4x the records, and the peak must not follow. Asserted before the
+        // shape checks below so the failure a regression produces is the ratio
+        // itself, with both numbers in the message.
+        let (two_x, eight_x) = (peaks[0].0 as f64, peaks[1].0 as f64);
+        let ratio = eight_x / two_x;
+        assert!(
+            ratio < 1.3,
+            "peak scaled with the survivor count: 2x={two_x} 8x={eight_x} ratio={ratio}"
+        );
+        for (scale, (peak, parts)) in [2, 8].into_iter().zip(peaks) {
+            assert!(
+                peak < 2 * CAP + TRANSIENT_ALLOWANCE,
+                "scale {scale}: peak {peak} exceeded 2x the cap plus the per-input transient"
+            );
+            assert!(parts > 1, "scale {scale}: the fixture must actually split");
+        }
+    }
+
+    /// Issue #725: `input_read_concurrency` changes only how many of the
+    /// rewrite's input reads are in flight, never a byte of its output. The
+    /// same bucket is erased at concurrency 1 and 8 and every part must be
+    /// byte-identical (BLAKE3 over the part objects themselves).
+    ///
+    /// The concurrency is proved to be real, not nominal: a FaultStore gate
+    /// holds every L0 data-object GET (`/l0/` names L0 data objects and
+    /// nothing else here), and at concurrency 8 exactly 8 are held
+    /// simultaneously while at concurrency 1 only ever 1 is.
+    ///
+    /// Demonstrated red by restoring the pre-#725 body of
+    /// `build_rewrite_logs`, whose `for object_key in object_keys { store.get(
+    /// object_key, GetRange::Full) }` loop reads one input at a time: the
+    /// `wait_until_held(8)` below then never reaches 8, and the
+    /// `expect("input reads must reach the configured concurrency in flight")`
+    /// on its timeout fires.
+    #[tokio::test]
+    async fn logs_erasure_input_read_concurrency_changes_timing_not_bytes() {
+        const INPUTS: i64 = 16;
+        const TOTAL: i64 = 320;
+
+        async fn erase_at(concurrency: usize) -> (Vec<[u8; 32]>, usize) {
+            let store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+            seed_split_inputs(store.as_ref(), TOTAL, INPUTS, RlogConfig::default()).await;
+
+            // Hold every L0 data-object GET so the in-flight count is
+            // observable. Commit records live under `/c/` and rewrite parts
+            // under `/l1/`, so neither is caught here.
+            let gate = store.hold(Op::Get, Some("/l0/".to_string()), Occurrence::Always);
+            let config = CompactorConfig {
+                max_l1_part_bytes: 64 * 1024,
+                input_read_concurrency: concurrency,
+                ..CompactorConfig::default()
+            };
+            let task = tokio::spawn({
+                let store = Arc::clone(&store);
+                async move {
+                    let clock = FixedClock::new(sealed_now_ns());
+                    let mut memo = MaintainMemo::with_default_interval();
+                    erasure_rewrite_bucket(
+                        store.as_ref(),
+                        &clock,
+                        &config,
+                        &NoLeases,
+                        &logs_bucket(),
+                        &split_pending(),
+                        &mut memo,
+                    )
+                    .await
+                    .expect("erasure rewrite");
+                }
+            });
+
+            // The first window fills to exactly `concurrency` and no further:
+            // `buffered` polls no more than that many futures at once. Bounded
+            // so a serialized read path fails here instead of hanging.
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                gate.wait_until_held(concurrency),
+            )
+            .await
+            .expect("input reads must reach the configured concurrency in flight");
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+            let peak_in_flight = gate.held_count();
+
+            // From here on release everything the gate catches, so the rest of
+            // the run is never blocked. Parks on the gate's `Notify` rather
+            // than spinning.
+            let releaser = tokio::spawn({
+                let gate = gate.clone();
+                async move {
+                    loop {
+                        gate.wait_until_held(1).await;
+                        for id in gate.held() {
+                            gate.release(id);
+                        }
+                    }
+                }
+            });
+            task.await.expect("erasure task");
+
+            let record = read_rewrite_record_for(store.as_ref(), &logs_bucket()).await;
+            let mut hashes = Vec::with_capacity(record.parts.len());
+            for part in &record.parts {
+                let key = keys::reconstruct_rewrite_part_key(&record, part).expect("part key");
+                let got = store.get(&key, GetRange::Full).await.expect("get part");
+                hashes.push(*blake3::hash(got.data.as_ref()).as_bytes());
+            }
+            releaser.abort();
+            (hashes, peak_in_flight)
+        }
+
+        let (serial_hashes, serial_in_flight) = erase_at(1).await;
+        let (concurrent_hashes, concurrent_in_flight) = erase_at(8).await;
+
+        assert_eq!(
+            serial_in_flight, 1,
+            "concurrency 1 must never have two input GETs in flight"
+        );
+        assert_eq!(
+            concurrent_in_flight, 8,
+            "concurrency 8 must have exactly 8 input GETs in flight"
+        );
+        assert!(
+            serial_hashes.len() > 1,
+            "the fixture must split into several parts, got {}",
+            serial_hashes.len()
+        );
+        assert_eq!(
+            serial_hashes, concurrent_hashes,
+            "input_read_concurrency changed the rewritten parts' bytes"
+        );
     }
 
     /// Running the same LOGS rewrite twice from the same pre-publish state
