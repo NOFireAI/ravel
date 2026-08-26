@@ -443,8 +443,13 @@ jobs:
   #   - ravel-bench --features parquet-baseline (arrow/parquet/object_store)
   #   - ravel-bench --features flight-egress    (ravel-sql/datafusion/flight)
   #   - ravel-bench --features profiling        (pprof/inferno flamegraph lane)
+  #   - ravel-bench --features flight-lane      (ravel-sql/arrow-flight; the
+  #                                              Flight SQL bench lane, PR #724)
   #   - ravel-bench --features sql-latency      (ravel-sql; the SQL corpus and
   #                                              its construct gate, ADR-0100)
+  #   - ravel-bench --features sql-latency,profiling,flight-lane (the widest
+  #                                              combination the ClickBench box
+  #                                              builds; RUNS its tests, #714/#732)
   #   - ravel-bench --features stage-timing     (ravel-ingest/stage-timing;
   #                                              per-stage ingest breakdown,
   #                                              ADR-0104. RUNS its test, does
@@ -489,6 +494,8 @@ jobs:
         run: cargo check --locked -p ravel-bench --features flight-egress
       - name: Check ravel-bench --features profiling
         run: cargo check --locked -p ravel-bench --features profiling
+      - name: Check ravel-bench --features flight-lane
+        run: cargo check --locked -p ravel-bench --features flight-lane
       - name: Check ravel-bench --features sql-latency
         run: cargo check --locked -p ravel-bench --features sql-latency --all-targets
         # The one lane here that also RUNS its tests. A compile probe is the
@@ -501,6 +508,8 @@ jobs:
         # the step above (same feature set, same target dir).
       - name: Test ravel-bench --features sql-latency
         run: cargo test --locked -p ravel-bench --features sql-latency
+      - name: Test ravel-bench --features sql-latency,profiling,flight-lane
+        run: cargo test --locked -p ravel-bench --features sql-latency,profiling,flight-lane
       - name: Check ravel-bench --features stage-timing
         run: cargo check --locked -p ravel-bench --features stage-timing --all-targets
         # RUN the stage-timing acceptance test, not merely compile it (ADR-0104

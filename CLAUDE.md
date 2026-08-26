@@ -94,8 +94,11 @@ cargo clippy -p ravel-server -p ravel-sql --features flight-sql --all-targets --
 cargo test   -p ravel-server -p ravel-sql --features flight-sql
 ```
 
-`scripts/gates.sh` runs these when the crates are in scope. Do not skip
-them: a workspace gate can print "All gates passed" on a tree where
+`scripts/gates.sh` runs these when the crates are in scope. It also runs a
+ravel-bench lane (`--features sql-latency,profiling,flight-lane` clippy and
+tests, plus `--features stage-timing`) whenever ravel-bench, ravel-sql,
+ravel-query, or ravel-ingest is in scope, matching CI's `features` job. Do
+not skip them: a workspace gate can print "All gates passed" on a tree where
 `--features sql` fails to compile, because the broken call site sits in a
 target the default feature set never builds.
 

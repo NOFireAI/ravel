@@ -93,16 +93,21 @@ else
   cargo test --locked --doc --profile ci "${crate_args[@]}"
 fi
 
-# Feature-gated surfaces (issues #609, #616). ravel-server's `sql` and
-# `flight-sql` features are off by default, so nothing above compiles the SQL
-# handler, the Flight SQL service, or their tests. Without these lanes a local
-# run prints "All gates passed" on a tree CI rejects. That happened while
-# rebasing #511: the workspace gate was green and `--features sql` failed with
-# E0061 on a call site that had gone stale under a textually clean merge.
+# Feature-gated surfaces (issues #609, #616, #714, #732). ravel-server's `sql`
+# and `flight-sql` features, and ravel-bench's bench-lane features, are off by
+# default, so nothing above compiles the SQL handler, the Flight SQL service,
+# the bench lanes, or their tests. Without these lanes a local run prints "All
+# gates passed" on a tree CI rejects. That happened while rebasing #511: the
+# workspace gate was green and `--features sql` failed with E0061 on a call
+# site that had gone stale under a textually clean merge. It happened again for
+# ravel-bench: #712 merged on a receipt but went red in CI's features job
+# because gates.sh never built ravel-bench's sql-latency tests, and #724's
+# `flight-lane` feature left main uncompilable under
+# `--features sql-latency,profiling,flight-lane` because nothing gated it.
 #
-# Mirrors CI's `lint` and `flight-sql` jobs. In scoped mode these run only
-# when the affected crates are named, so `-p ravel-logseg` does not pay for a
-# ravel-server build it did not ask for.
+# Mirrors CI's `lint`, `flight-sql`, and `features` jobs. In scoped mode these
+# run only when the affected crates are named, so `-p ravel-logseg` does not
+# pay for a ravel-server build it did not ask for.
 run_feature_lane() {
   local feature="$1"
   shift
@@ -118,12 +123,19 @@ run_feature_lane() {
 }
 
 want_features=0
+want_bench=0
 if [[ ${#crate_args[@]} -eq 0 ]]; then
   want_features=1
+  want_bench=1
 else
   for arg in "${crate_args[@]}"; do
     case "${arg}" in
       ravel-server | ravel-sql) want_features=1 ;;
+    esac
+    # ravel-bench's feature tests exercise these crates, so any of them in
+    # scope should pay for the bench lanes.
+    case "${arg}" in
+      ravel-bench | ravel-sql | ravel-query | ravel-ingest) want_bench=1 ;;
     esac
   done
 fi
@@ -131,6 +143,19 @@ fi
 if [[ ${want_features} -eq 1 ]]; then
   run_feature_lane sql -p ravel-server
   run_feature_lane flight-sql -p ravel-server -p ravel-sql
+fi
+
+# ravel-bench bench lanes. The ClickBench box builds
+# `--features sql-latency,profiling` and `--features
+# sql-latency,profiling,flight-lane`; gate the widest combination so a break in
+# any of the three features (SQL corpus, profiling, Flight SQL bench) is caught
+# locally. stage-timing is a separate lane CI checks and runs, kept at parity.
+if [[ ${want_bench} -eq 1 ]]; then
+  run_feature_lane sql-latency,profiling,flight-lane -p ravel-bench
+  echo "==> cargo check --locked -p ravel-bench --features stage-timing"
+  cargo check --locked -p ravel-bench --features stage-timing
+  echo "==> cargo test --locked -p ravel-bench --features stage-timing"
+  cargo test --locked -p ravel-bench --features stage-timing
 fi
 
 # --- Gates-pass receipt ---------------------------------------------------
