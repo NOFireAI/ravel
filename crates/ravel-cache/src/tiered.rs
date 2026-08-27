@@ -149,6 +149,19 @@ where
     ///
     /// In corruption mode a [`Source::Cache`] result (RAM or disk) is
     /// corrupted; a [`Source::Upstream`] result is the clean fetched bytes.
+    ///
+    /// **Error-path accounting (issue #656).** When `fetch` fails this method
+    /// records neither a hit nor a miss: it threads the error straight out
+    /// (the follower's single-flight collapse is still counted, because a
+    /// collapse happened regardless of the leader's outcome). Hit/miss
+    /// accounting is the caller's, keyed off the returned [`Source`] on the
+    /// success path -- this handle has no `QueryAccounting` and takes no
+    /// opinion on whether a faulted upstream GET should count as a miss. A
+    /// caller that records a miss on the success `Source::Upstream` branch must
+    /// therefore decide explicitly whether the *error* branch records one too;
+    /// a caller whose success and error paths disagree (one counts the miss,
+    /// the other returns before any accounting) makes a faulted GET count
+    /// differently than a served miss, the exact divergence #656 tracks.
     pub async fn get_or_fetch<F, Fut>(
         &self,
         key: CacheKey,
@@ -246,7 +259,11 @@ where
     /// record a single-flight collapse when a caller rides another caller's
     /// leader (`self.ram.metrics().record_collapse()`, the same counter
     /// `get_or_fetch`'s follower branch feeds), since that is real coalescing
-    /// worth surfacing on the SLI.
+    /// worth surfacing on the SLI. On a `fetch` error it records neither a hit
+    /// nor a miss and threads the error out unchanged, exactly as
+    /// [`get_or_fetch`](Self::get_or_fetch) does: the caller's earlier `get`
+    /// already accounted the one miss for this logical request, so the error
+    /// path adds nothing here regardless (issue #656).
     ///
     /// On a fetch success the leader admits to **both** tiers (decision 3) via
     /// the same dual-tier admission [`insert`](Self::insert) uses, so a later RAM
@@ -912,6 +929,49 @@ mod tests {
             tiered.disk.get(&key).as_deref(),
             Some(value.as_ref()),
             "insert must admit to the disk tier, not RAM alone"
+        );
+    }
+
+    /// #656: the disk tier's own metrics accessor surfaces a disk-served hit.
+    /// A key resident only on disk is read through the tiered handle; the hit
+    /// registers on [`TieredCache::disk_metrics`], while the RAM-tier view
+    /// ([`TieredCache::ram_metrics`]) records the same read as a *miss* -- which
+    /// is exactly why a RAM-only accessor under-reports disk-served hits and the
+    /// disk accessor is needed. This is the crate-level primitive behind
+    /// `ravel_catalog::Catalog::byte_cache_disk_metrics`.
+    ///
+    /// To watch it bite, read only `ram_metrics()`: `disk_after.hits` would be
+    /// invisible there and the disk-served hit would read as a pure miss.
+    #[tokio::test]
+    async fn disk_served_hit_is_visible_on_disk_metrics() {
+        let tmp = TempDir::new().unwrap();
+        let disk = DiskCache::new(tmp.path().to_path_buf(), generous_limits());
+        let ram: Cache<&'static str> = Cache::new(generous_limits());
+        let tiered = TieredCache::new(ram, disk);
+
+        let clean = Bytes::from_static(b"disk resident");
+        let key = test_key(1, clean.len() as u64);
+        // Populate disk only; RAM stays empty so the read falls through to disk.
+        tiered.disk.insert(key, &clean);
+
+        let disk_before = tiered.disk_metrics().snapshot();
+        let ram_before = tiered.ram_metrics().snapshot();
+
+        let served = tiered.get(&key).expect("a disk-resident key resolves");
+        assert_eq!(served, clean);
+
+        let disk_after = tiered.disk_metrics().snapshot();
+        let ram_after = tiered.ram_metrics().snapshot();
+        assert_eq!(
+            disk_after.hits,
+            disk_before.hits + 1,
+            "a disk-served hit must read as a hit on the disk-tier metrics"
+        );
+        assert_eq!(
+            ram_after.misses,
+            ram_before.misses + 1,
+            "the same read is a miss on the RAM-tier metrics: a RAM-only \
+             accessor would report the disk-served hit as a miss (#656)"
         );
     }
 
