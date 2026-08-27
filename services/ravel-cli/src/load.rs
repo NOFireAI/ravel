@@ -6955,4 +6955,216 @@ type = "i64"
              slot-table build {slot_elapsed:?}"
         );
     }
+
+    /// A store wrapper that measures how many data-object (`/l0/`) PUTs are ever
+    /// in flight at the same instant on one shard, and (optionally) holds each
+    /// such PUT at a [`tokio::sync::Barrier`] so a target concurrency is reached
+    /// deterministically rather than racing on wall-clock overlap. Non-data PUTs
+    /// (provisioning record, commit records) pass straight through and are never
+    /// gated or counted. The high-water mark is the fixture's serialisation
+    /// observable for issue #800: at `max_inflight_flushes == 1` a shard runs
+    /// one flush at a time, so it is pinned at 1; raising the cap lets several
+    /// of the shard's flushes PUT at once.
+    struct ConcurrentPutStore {
+        inner: Arc<dyn ObjectStoreBackend>,
+        in_flight: Arc<std::sync::atomic::AtomicUsize>,
+        high_water: Arc<std::sync::atomic::AtomicUsize>,
+        /// When set, every data-object PUT waits here until `size` of them have
+        /// arrived, forcing exactly that many to be simultaneously in flight.
+        /// `None` counts without holding, which is all the serial (`== 1`) case
+        /// can ever reach.
+        rendezvous: Option<Arc<tokio::sync::Barrier>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for ConcurrentPutStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: bytes::Bytes,
+            opts: ravel_object_store::PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, ravel_object_store::StoreError> {
+            use std::sync::atomic::Ordering;
+            let is_data_object = key.contains("/l0/");
+            if is_data_object {
+                let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.high_water.fetch_max(now, Ordering::SeqCst);
+                if let Some(barrier) = &self.rendezvous {
+                    barrier.wait().await;
+                }
+            }
+            let result = self.inner.put(key, data, opts).await;
+            if is_data_object {
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            }
+            result
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: ravel_object_store::GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, ravel_object_store::StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn put_multipart<'a>(
+            &'a self,
+            key: &str,
+        ) -> Result<Box<dyn ravel_object_store::MultipartUpload + 'a>, ravel_object_store::StoreError>
+        {
+            self.inner.put_multipart(key).await
+        }
+
+        async fn head(
+            &self,
+            key: &str,
+        ) -> Result<ravel_object_store::ObjectMeta, ravel_object_store::StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, ravel_object_store::StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, ravel_object_store::StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), ravel_object_store::StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// Issue #800: the loader's throughput stall was that a shard ran encode and
+    /// its S3 PUT strictly one flush at a time (`max_inflight_flushes == 1`),
+    /// even when several batches were ready, so every PUT round trip ran with the
+    /// next batch's encode blocked behind it. This drives one shard with four
+    /// ready batches and measures the peak number of data-object PUTs in flight
+    /// at once. The pre-fix configuration (`max_inflight_flushes == 1`) pins it
+    /// at exactly 1; the post-fix configuration (`4`) reaches exactly 4, proving
+    /// the shard now overlaps its flushes' PUTs. Both configurations write the
+    /// same four objects for the same eight rows, so the concurrency change alters
+    /// no output.
+    ///
+    /// Non-vacuity (prove-the-test): the post-fix run holds every data PUT at a
+    /// `Barrier(4)`, so it can only advance if four flushes really are in flight
+    /// together. Force the pre-fix serialisation back (set the post-fix run's
+    /// `max_inflight_flushes` to 1) and only one PUT ever reaches the barrier;
+    /// the four-way barrier never releases and the outer `timeout` fires, failing
+    /// the test rather than passing vacuously. The pre-fix half needs no barrier:
+    /// with the cap at 1 the shard structurally cannot put two objects at once,
+    /// so its high-water mark of 1 is not a race.
+    #[tokio::test]
+    async fn raising_max_inflight_flushes_overlaps_a_shards_puts() {
+        use ravel_object_store::memory::MemoryStore;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Eight rows, one shard, batch_rows = 2 -> four single-object batches.
+        let n_rows = 8usize;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pq = dir.path().join("four_batches.parquet");
+        let b = batch(vec![
+            ("ts", i64_col(vec![NOW_NS; n_rows])),
+            ("svc", str_col(vec!["api"; n_rows])),
+        ]);
+        {
+            use parquet::arrow::ArrowWriter;
+            let file = std::fs::File::create(&pq).expect("create parquet");
+            let mut w = ArrowWriter::try_new(file, b.schema(), None).expect("arrow writer");
+            w.write(&b).expect("write batch");
+            w.close().expect("close writer");
+        }
+        let m = parse_mapping(
+            "ts_column = \"ts\"\nts_unit = \"nanos\"\n\n\
+             [[resource_attribute]]\nkey = \"service.name\"\ncolumn = \"svc\"\ntype = \"str\"\n",
+        )
+        .expect("valid mapping");
+
+        // Run the loader over one shard with the given per-shard flush cap and an
+        // optional barrier that forces `expect_concurrency` PUTs to overlap.
+        // Returns (high-water in-flight data PUTs, objects written).
+        let run = |max_inflight: u32, rendezvous: Option<usize>| {
+            let pq = pq.clone();
+            let m = m.clone();
+            async move {
+                let high_water = Arc::new(AtomicUsize::new(0));
+                let store = Arc::new(ConcurrentPutStore {
+                    inner: Arc::new(MemoryStore::new()),
+                    in_flight: Arc::new(AtomicUsize::new(0)),
+                    high_water: Arc::clone(&high_water),
+                    rendezvous: rendezvous.map(|size| Arc::new(tokio::sync::Barrier::new(size))),
+                });
+                let report = load_instrumented(
+                    store as Arc<dyn ObjectStoreBackend>,
+                    &pq,
+                    "acme",
+                    &m,
+                    1,
+                    2,
+                    None,
+                    // pipeline_depth 4 keeps all four batches in flight so they
+                    // reach the shard together; the per-shard cap is the variable
+                    // under test.
+                    4,
+                    max_inflight,
+                    4,
+                    NOW_NS,
+                    Arc::new(FixedClock(NOW_NS)),
+                    LoadPath::Columnar,
+                    None,
+                    None,
+                )
+                .await
+                .expect("the load succeeds");
+                assert_eq!(report.rows_processed, n_rows as u64, "every row is written");
+                (high_water.load(Ordering::SeqCst), report.objects_written())
+            }
+        };
+
+        // Pre-fix: one flush at a time. No barrier -- the shard structurally
+        // cannot overlap, so the count cannot exceed 1 and no gate is needed.
+        let (serial_high_water, serial_objects) = run(1, None).await;
+        assert_eq!(
+            serial_high_water, 1,
+            "at max_inflight_flushes == 1 the shard runs one flush at a time, so at most one \
+             data-object PUT is ever in flight"
+        );
+
+        // Post-fix: four flushes may PUT at once. The `Barrier(4)` releases only
+        // when all four are simultaneously in flight, so the timeout is what
+        // catches a regression to serial behaviour instead of a hang.
+        let (overlap_high_water, overlap_objects) =
+            tokio::time::timeout(Duration::from_secs(30), run(4, Some(4)))
+                .await
+                .expect(
+                    "four flushes overlap within the timeout; a regression to one-at-a-time \
+                     leaves the Barrier(4) unmet and trips this",
+                );
+        assert_eq!(
+            overlap_high_water, 4,
+            "at max_inflight_flushes == 4 the shard overlaps all four batches' PUTs"
+        );
+
+        // The concurrency change alters no output: same object count both ways.
+        assert_eq!(
+            serial_objects, overlap_objects,
+            "the object count does not depend on the per-shard flush concurrency"
+        );
+        assert_eq!(
+            serial_objects, 4,
+            "four batches over one shard write four objects"
+        );
+    }
 }

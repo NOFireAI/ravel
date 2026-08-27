@@ -76,9 +76,19 @@ ravel-cli --store <your-store-flags> load \
   --shards 4 \
   --batch-rows 40000 \
   --read-cursors 4 \
-  --pipeline-depth 1 \
+  --pipeline-depth 4 \
+  --max-inflight-flushes 4 \
   --decode-queue-batches 2
 ```
+
+Both write-window flags are passed together on purpose. Raising
+`--pipeline-depth` alone over-subscribes a pipeline that cannot admit more than
+`shards x max_inflight_flushes` concurrent writes, and the queued batches
+exhaust their ack wait: a measured run at depth 16 against a per-shard cap of 1
+aborted with `flush failed: timed out waiting for shard ack`. Raised together at
+`4`, the same 100M-row corpus loaded in 1,519.75 s against 4,466.76 s at the
+defaults, a 2.94x reduction, with the object count unchanged at 8,424 and cores
+busy going from 2.33 to 8.58 of 16.
 
 `--batch-rows` is the object-count lever. One batch is one Strict flush, which is
 one RLOG object per shard the batch's rows land on. Per-object cost (LIST,
@@ -124,16 +134,35 @@ the ~8192-rows-per-shard floor above is unchanged. Raising `--shards` still
 means raising `--batch-rows` to match, regardless of `--read-cursors`.
 
 `--pipeline-depth` is the write-latency lever, and it trades memory for it. Each
-batch's write is one S3 PUT round trip per involved shard; at the default depth
-`1` the loader submits one batch's write and waits for its ack before building or
-submitting the next, so on a fast encoder that PUT round trip is the serial term
-that dominates wall time. Raising the depth lets up to that many writes overlap:
-the loader keeps submitting later batches while earlier writes are still awaiting
-their acks, hiding the round-trip latency behind subsequent encode and I/O. The
-cost is memory. Each in-flight write keeps its built batch resident until its ack
-returns, so raising `--pipeline-depth` above `1` multiplies the live
-decoded-batch-plus-pending-write working set by roughly the depth. This cost is
-*in addition to* the `--batch-rows` x `--shards` product above, not a
+batch's write is one S3 PUT round trip per involved shard; at depth `1` the loader
+submits one batch's write and waits for its ack before building or submitting the
+next, so on a fast encoder that PUT round trip is the serial term that dominates
+wall time (issue #800: the v4 100M-row reload sat at ~2.3 of 16 cores busy for
+exactly this reason). The default is `4`: the loader keeps up to four batches'
+writes in flight, submitting later batches while earlier writes are still awaiting
+their acks, hiding the round-trip latency behind subsequent encode and I/O.
+
+**The default is `1`, and the benchmark recipe above passes `4` explicitly.**
+ADR-0807 keeps both write-window defaults at `1`: above `1`, a batch after a
+failing one may already have committed in the background when the failure
+happens, so its rows can become query-visible without being reported durable and
+a resume re-ingests them. At `1` that cannot occur, because no later batch is in
+flight. The speed-up is opt-in for exactly that reason.
+
+Depth alone is not enough either — with one flush per shard the shards still
+process their queued batches one PUT at a time — so a fast load must also raise
+the per-shard concurrent-flush cap (`--max-inflight-flushes`, ADR-0067 decision
+2), which lets each shard encode a later batch while an earlier one's PUT is in
+flight. Raising the depth on its own over-subscribes the pipeline and produces
+`flush failed: timed out waiting for shard ack`, measured at depth 16 against a
+per-shard cap of 1. Object content is unchanged: commit
+records stay immutable and keyed by writer sequence, so a shard's flushes may PUT
+and publish concurrently without changing any object's bytes or the order a reader
+derives from the sequence field, and each Strict write is still acked only once
+its own flush is durable. The cost is memory. Each in-flight write keeps its built
+batch resident until its ack returns, so raising `--pipeline-depth` multiplies the
+live decoded-batch-plus-pending-write working set by roughly the depth. This cost
+is *in addition to* the `--batch-rows` x `--shards` product above, not a
 replacement for it: the per-batch resident size is still set by that product, and
 `--pipeline-depth` keeps that many built batches alive at once.
 
@@ -163,8 +192,15 @@ you run. Because the real per-row cost is allocator-dependent by more than 3x,
 the loader does not compute or enforce a safe ceiling for you: size
 `--pipeline-depth` against your host's memory the same way you size the
 `--batch-rows` x `--shards` product, measuring on your own allocator rather than
-trusting a single baked-in per-row estimate. `1` reproduces today's
-one-write-at-a-time behavior exactly.
+trusting a single baked-in per-row estimate. `1` reproduces the older
+one-write-at-a-time behavior exactly, where the reported durable-token list on a
+partial-load failure cannot undercount; at any depth above `1` a batch after the
+failing one may already have committed its data in the background (the loader
+cancels its own wait for that write's ack, not the underlying write), so its rows
+can become query-visible without being reported durable. The reported list stays
+exactly the batches strictly before the failing one, in submission order; a
+re-run re-ingests the whole file, so this only matters if your downstream is not
+tolerant of duplicate rows for the same commit window.
 
 The loader prints a completion summary to stdout — `rows processed`,
 `objects written`, and `elapsed` (the load wall-time ClickBench reports). It also
