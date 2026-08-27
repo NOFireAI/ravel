@@ -730,14 +730,15 @@ impl QueryEngine {
             // an `async_trait` remote fetch nested inside a fan-out combinator
             // makes the whole query future fail axum's `Handler` `Send` bound.
             //
-            // `federate_discovery` takes a single pooled `QueryAccounting`
-            // handle and folds a remote cluster's own spend into it; that
-            // remote spend has no phase breakdown of its own visible here, so
-            // it is charged to `scan` rather than left unaccounted (issue
-            // #796 finding: federation is an opaque remote fetch, not
-            // phase-splittable without a remote-side accounting change).
+            // `federate_discovery` takes the whole `PhaseAccounting` (not
+            // just `.scan()`): it folds the remote's spend into the `scan`
+            // sub-handle (issue #796 finding: federation is an opaque remote
+            // fetch, not phase-splittable without a remote-side accounting
+            // change), but its budget re-check needs `pooled()` to see the
+            // local resolve/plan/probe spend `fetch_all_series` already
+            // recorded too.
             let (fed_series, fed_warnings, fed_partial) = self
-                .federate_discovery(tenant_hash, matchers.to_vec(), window, accounting.scan())
+                .federate_discovery(tenant_hash, matchers.to_vec(), window, &accounting)
                 .await?;
             // Union local + remote identities and enforce `max_series` ONCE
             // over the combined set, mirroring the query path's single
@@ -806,7 +807,7 @@ impl QueryEngine {
         tenant_hash: TenantHash,
         matchers: Vec<LabelMatcher>,
         window: TimeRange,
-        accounting: &QueryAccounting,
+        accounting: &PhaseAccounting,
     ) -> Result<(Vec<(SeriesId, LabelSet)>, Vec<String>, bool), QueryError> {
         let mut series: Vec<(SeriesId, LabelSet)> = Vec::new();
         let Some(federation) = &self.federation else {
@@ -818,7 +819,8 @@ impl QueryEngine {
         // structurally preventing this cluster's tokens from leaking). The
         // operator credential is baked into the fetcher, so no client credential
         // is threaded here and the remote's tenant identity comes from its own
-        // auth, never the wire.
+        // auth, never the wire. Remote spend is charged to `scan` (issue #796
+        // finding, same treatment as `federate_scalar`).
         let outcome = federation
             .fetch(
                 tenant_hash,
@@ -828,15 +830,17 @@ impl QueryEngine {
                 window.start_ns,
                 window.end_ns,
                 Vec::new(),
-                accounting.clone(),
+                accounting.scan().clone(),
                 self.config,
             )
             .await?;
         // Re-enforce the coordinator's bytes-scanned budget over the combined
         // local+remote spend now folded into `accounting`, identical to the
-        // query path. A budget trip is never masked by skip_unavailable.
+        // query path. `pooled()` (not just `.scan()`) so the local
+        // fetch_all_series spend recorded on resolve/plan/probe is included.
+        // A budget trip is never masked by skip_unavailable.
         if let Some(err) = bytes_scanned_exceeded(
-            accounting.snapshot().total_s3_bytes(),
+            accounting.snapshot().pooled().total_s3_bytes(),
             self.config.max_bytes_scanned,
         ) {
             return Err(err);
@@ -844,7 +848,7 @@ impl QueryEngine {
         // Re-enforce the coordinator's request budget the same way (ADR-0073
         // decision 3): a budget trip is never masked by skip_unavailable.
         if let Some(err) = segment_admission::request_budget_exceeded(
-            accounting.snapshot().total_s3_requests(),
+            accounting.snapshot().pooled().total_s3_requests(),
             self.config.max_s3_requests,
         ) {
             return Err(err);
@@ -1121,13 +1125,13 @@ impl QueryEngine {
                 .zip(windows_ref.iter())
                 .map(|(plan, w)| (plan.matchers.clone(), w.start_ns, w.end_ns))
                 .collect();
-            // `federate_scalar` takes a single pooled `QueryAccounting` handle
-            // and folds a remote cluster's own spend into it; that remote
-            // spend has no phase breakdown of its own visible here, so it is
-            // charged to `scan` rather than left unaccounted (issue #796
-            // finding: same treatment as `federate_discovery` above).
+            // `federate_scalar` takes the whole `PhaseAccounting` (not just
+            // `.scan()`): it folds the remote's spend into the `scan`
+            // sub-handle (issue #796 finding: an opaque remote fetch has no
+            // phase breakdown of its own), but its budget re-check needs
+            // `pooled()` to see the local resolve/plan/probe spend too.
             let (fed_runs, fed_hist_runs, fed_stats, fed_warnings, fed_partial) = self
-                .federate_scalar(tenant_hash, fed_plans, accounting.scan())
+                .federate_scalar(tenant_hash, fed_plans, &accounting)
                 .await?;
             all_scalar_runs.extend(fed_runs);
             // Merge every remote's native-histogram runs into the same
@@ -1597,7 +1601,7 @@ impl QueryEngine {
         &self,
         tenant_hash: TenantHash,
         plan_matchers_windows: Vec<(Vec<LabelMatcher>, i64, i64)>,
-        accounting: &QueryAccounting,
+        accounting: &PhaseAccounting,
     ) -> Result<
         (
             Vec<Vec<FetchedSeriesSoa>>,
@@ -1623,7 +1627,9 @@ impl QueryEngine {
             // leaking this cluster's tokens). The operator credential is baked
             // into the fetcher, so no client credential is threaded here.
             // Owned args (accounting is an `Arc` clone that folds into the same
-            // handle) keep the fan-out future higher-ranked `Send`.
+            // handle) keep the fan-out future higher-ranked `Send`. Remote
+            // spend is charged to `scan` (issue #796 finding: opaque remote
+            // fetch, no phase breakdown of its own).
             let outcome = federation
                 .fetch(
                     tenant_hash,
@@ -1633,22 +1639,27 @@ impl QueryEngine {
                     start_ns,
                     end_ns,
                     Vec::new(),
-                    accounting.clone(),
+                    accounting.scan().clone(),
                     self.config,
                 )
                 .await?;
             // Re-enforce the coordinator's bytes-scanned budget over the
             // combined local+remote spend now folded into `accounting`, so a
-            // tight cap trips typed on the union of both clusters' frames. A
-            // budget trip is never masked by skip_unavailable.
+            // tight cap trips typed on the union of both clusters' frames AND
+            // the local resolve/plan/probe/scan spend already recorded on the
+            // other phase handles this query attempt shares -- `pooled()` is
+            // required here, not just the `scan` sub-handle the remote spend
+            // landed on, or a local-heavy resolve/plan/probe cost would be
+            // invisible to this check. A budget trip is never masked by
+            // skip_unavailable.
             if let Some(err) = bytes_scanned_exceeded(
-                accounting.snapshot().total_s3_bytes(),
+                accounting.snapshot().pooled().total_s3_bytes(),
                 self.config.max_bytes_scanned,
             ) {
                 return Err(err);
             }
             if let Some(err) = segment_admission::request_budget_exceeded(
-                accounting.snapshot().total_s3_requests(),
+                accounting.snapshot().pooled().total_s3_requests(),
                 self.config.max_s3_requests,
             ) {
                 return Err(err);
