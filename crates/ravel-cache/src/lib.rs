@@ -65,7 +65,19 @@
 //! funnels start using this handle. A caller that cannot express its miss
 //! handling as one upstream-fetch closure instead has [`tiered::TieredCache::get`]
 //! and [`tiered::TieredCache::insert`]: the same read-through and dual-tier
-//! admission, with no fetch and no single-flight participation.
+//! admission, with no fetch and no single-flight participation. A caller that
+//! peeked both tiers with `get`, saw a confirmed miss, and now wants that miss
+//! resolved *coalesced* -- so concurrent callers for one key collapse onto a
+//! single upstream fetch -- uses [`tiered::TieredCache::resolve_peeked_miss`]:
+//! it joins the same single-flight `get_or_fetch` uses and admits to both tiers
+//! on success, but consults neither tier and records no miss of its own,
+//! because the caller's earlier `get` already accounted the one miss.
+//!
+//! Both tiers' counters are readable independently:
+//! [`tiered::TieredCache::ram_metrics`] (which also carries the cross-tier
+//! single-flight collapses) and [`tiered::TieredCache::disk_metrics`], so a
+//! disk-served hit is visible on the disk tier rather than hidden behind a
+//! RAM-only miss.
 
 mod cache;
 mod clock;

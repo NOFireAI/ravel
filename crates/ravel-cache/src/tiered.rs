@@ -779,6 +779,63 @@ mod tests {
         );
     }
 
+    /// #653: the single-caller resolve path -- no concurrency -- runs the fetch
+    /// once, admits to BOTH tiers, and records NO miss of its own; the caller's
+    /// prior `get` peek is the one accounted miss. The cheap companion to the
+    /// concurrent-collapse proof above, on the same `resolve_peeked_miss`
+    /// surface.
+    #[tokio::test]
+    async fn resolve_peeked_miss_single_caller_admits_both_tiers_and_records_no_miss() {
+        let tmp = TempDir::new().unwrap();
+        let disk = DiskCache::new(tmp.path().to_path_buf(), generous_limits());
+        let ram: Cache<&'static str> = Cache::new(generous_limits());
+        let ram_metrics = ram.metrics();
+        let tiered = TieredCache::new(ram, disk);
+
+        let payload = Bytes::from_static(b"resolved once");
+        let key = test_key(1, payload.len() as u64);
+
+        // Peek both tiers and miss: the one accounted miss for this request.
+        assert!(tiered.get(&key).is_none());
+        let misses_after_peek = ram_metrics.snapshot().misses;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = calls.clone();
+        let payload2 = payload.clone();
+        let got = tiered
+            .resolve_peeked_miss(key, move || {
+                let calls2 = calls2.clone();
+                let payload2 = payload2.clone();
+                async move {
+                    calls2.fetch_add(1, Ordering::SeqCst);
+                    Ok::<Bytes, &'static str>(payload2)
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(got, payload);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the fetch runs exactly once"
+        );
+
+        // Admitted to BOTH tiers.
+        assert_eq!(tiered.ram.get(&key).as_deref(), Some(payload.as_ref()));
+        assert!(
+            tiered.disk.get(&key).is_some(),
+            "resolve admits to the disk tier, not RAM alone"
+        );
+
+        // No miss recorded by resolve itself: the peek was the one accounted
+        // miss for this logical request.
+        assert_eq!(
+            ram_metrics.snapshot().misses,
+            misses_after_peek,
+            "resolve_peeked_miss records no miss of its own"
+        );
+    }
+
     /// A successful upstream fetch populates BOTH tiers (ADR-0046 decision 3),
     /// not RAM alone. Proven by evicting the RAM entry and reading again: the
     /// key is served from disk with no second upstream fetch, the exact cold
