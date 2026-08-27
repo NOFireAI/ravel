@@ -468,6 +468,26 @@ detectably, not silently: `ravel-cli catalog verify` re-lists sealed
 buckets and diffs them against the snapshot, and a rebuild repairs any
 divergence because commit records remain the ground truth.
 
+This diff is scoped to L0 commit records, and its identity map is keyed by a
+fixed-width writer_id, so both sides must agree on that width. A snapshot
+carries two entry levels: a level-0 L0 commit entry, whose `writer_id` is the
+16-byte flush writer uuid, and a level-1 compaction or rewrite part, whose
+`writer_id` slot instead carries the parent record's 32-byte `input_set_hash`
+(there is no dedicated L1-identity field; `crates/ravel-catalog/src/fold.rs`
+`build_l1_snapshot_entry`/`build_rewrite_l1_snapshot_entry` overload the
+`writer_*` slots, and `snapshot_format::part` `validate_entries` enforces the
+width per level: 16 for level 0, 32 for level 1). Every producer of a snapshot
+entry MUST honour that per-level width; a mismatch is a format violation, not a
+value to widen the reader around. `verify_seal_divergence`
+(`crates/ravel-catalog/src/seal_divergence.rs`) therefore compares only the
+level-0 entries against the L0 commit history, and mirrors the fold's
+supersession exclusion on the ground-truth side: an L0 commit record named in a
+compaction or rewrite record's `inputs` is folded into an L1 part and dropped
+from the snapshot, yet its commit record stays on the store until a later sweep,
+so a superseded L0 record is excluded from the ground truth rather than reported
+missing. Level-1 entries are counted but not diffed, since they have no L0
+commit record to match.
+
 Config discipline: `max_flush_lifetime` and `clock_skew_allowance` may only
 be raised for writers after every folder's seal computation uses the raised
 values (deployment ordering: folders before writers). Lowering them is
