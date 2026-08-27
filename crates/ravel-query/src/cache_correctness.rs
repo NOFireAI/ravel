@@ -1517,7 +1517,7 @@ async fn write_span_segment_under(tenant: TenantHash) -> (Arc<MemoryStore>, Segm
 /// Prove-the-test: with `SpanSegmentFetcher::with_cache` never called on
 /// `fetcher_b` (i.e. built exactly as the pre-fix `SpanSegmentFetcher` always
 /// was, with no cache field to attach), this assertion fails: see
-/// `zero_read_assertion_fails_without_the_cache_wiring` below, which pins the
+/// `zero_read_assertion_would_fail_without_the_cache_wiring` below, which pins the
 /// exact failing count.
 #[tokio::test]
 async fn span_second_identical_query_issues_zero_store_reads() {
