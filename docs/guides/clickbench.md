@@ -77,7 +77,8 @@ ravel-cli --store <your-store-flags> load \
   --batch-rows 40000 \
   --read-cursors 4 \
   --pipeline-depth 1 \
-  --decode-queue-batches 2
+  --decode-queue-batches 2 \
+  --target-bytes 1
 ```
 
 `--batch-rows` is the object-count lever. One batch is one Strict flush, which is
@@ -106,7 +107,7 @@ spread and this flag as one of the levers to raise it.
 a shard: rows spread across all `--shards` instead of every row landing on
 shard 0. That changes the batch-rows arithmetic. A batch's rows now split
 across up to `--shards` shards, and each shard's slice flushes as its own
-object *immediately* (the loader's `target_bytes` is fixed at `1`) — before it
+object *immediately* (at the default `--target-bytes 1`) — before it
 can reach the `block_target_records` block target (8192 rows). With the
 default `--batch-rows 10000` and `--shards 4`, a shard's slice averages ~2500
 rows, well under one full block, and object count would inflate well past
@@ -122,6 +123,34 @@ This `--batch-rows`-scales-with-`--shards` sizing floor still applies once
 assembled *from*, not how many rows in total each shard receives per batch, so
 the ~8192-rows-per-shard floor above is unchanged. Raising `--shards` still
 means raising `--batch-rows` to match, regardless of `--read-cursors`.
+
+`--target-bytes` is the other object-size lever, and unlike `--batch-rows` its
+memory cost is flat. At the default `1` a shard's slice of a batch flushes as
+its own object the moment it is written: one object per involved shard per
+batch, `--batch-rows` sets its size, no buffer lingers. Any larger value is a
+byte target the shard accumulates *encoded* records toward across several
+batches before it flushes, so objects grow without any more Arrow batches being
+held resident. That is the difference that matters at 100M rows: raising
+`--batch-rows` for bigger objects costs memory linearly, because each Arrow
+batch is buffered whole (measured on issue #801: 6x the batch rows reached
+27.4GB RSS on a 30GB box in 2.5 minutes), while raising `--target-bytes` costs
+one partially-filled shard buffer per shard. For reference, the default load
+geometry at `--batch-rows 65536` over 100M rows wrote 8424 objects of 1.32MB
+each: 16,850 PUTs during the load and an 8424-GET floor on every query
+afterwards. `IngestConfig`'s own default target is 8MiB.
+
+The trade is ack timing, not durability. A Strict write's ack is still sent
+only after that flush's data object and commit record are published, so an ack
+always means the records are durable. But above `1` the flush that answers a
+batch's ack may be triggered by a *later* batch reaching the target, so that
+ack now waits for one; a buffer that never reaches the target is released by
+the ingest router's wall-clock age trigger instead (`max_flush_delay`, 2s),
+which is also what releases the tail of every load. Two consequences for a bulk
+load: set `--pipeline-depth` to at least the number of batches that accumulate
+into one flush, or the loader blocks on an ack no submitted batch can release
+and every flush waits out that 2s timer; and objects bucket by their flush-open
+wall-clock reading, which above `1` is later than the write that filled them.
+`0` is rejected.
 
 `--pipeline-depth` is the write-latency lever, and it trades memory for it. Each
 batch's write is one S3 PUT round trip per involved shard; at the default depth
