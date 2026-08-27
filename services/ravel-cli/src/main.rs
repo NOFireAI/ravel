@@ -275,7 +275,7 @@ enum Command {
         /// downstream is tolerant of duplicate rows for the same commit
         /// window. `1` preserves today's one-write-at-a-time behavior, where
         /// this gap cannot occur. `0` is rejected.
-        #[arg(long, default_value_t = 1)]
+        #[arg(long, default_value_t = ravel_cli::load::DEFAULT_PIPELINE_DEPTH)]
         pipeline_depth: usize,
         /// Number of decoded batches allowed to sit queued between the Parquet
         /// decode/build stage and the shard writers (issue #680). A bounded
