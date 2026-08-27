@@ -30,6 +30,34 @@
 //! shard directory that is not a live entry at its own canonical path is
 //! deleted rather than left to accumulate.
 //!
+//! **Per-instance namespace subdirectory** (issue #671). Every entry a
+//! [`DiskCache`] writes lives under a namespace subdirectory of the configured
+//! directory: `dir/<namespace>/<shard>/<file>`, never `dir/<shard>/<file>`.
+//! The namespace is fixed at construction ([`DiskCache::new_in_namespace`]);
+//! [`DiskCache::new`] applies [`DEFAULT_NAMESPACE`]. This is the isolation two
+//! instances over one `--cache-dir` need: the server builds one `DiskCache`
+//! for the fetcher cache and a second for the catalog byte cache over the same
+//! directory, and without a namespace they share one file namespace, so
+//! on-disk bytes can reach ~2x the configured `max_bytes`, either instance's
+//! eviction deletes files the other still counts resident, and a restart's
+//! `scan_existing` seeds both with the union of both instances' files. A
+//! namespace scopes all four operations to `dir/<namespace>`: `path_for`
+//! writes there, `scan_existing` reads only there, the age sweep walks only
+//! there, and eviction unlinks only there. Distinct labels ("store",
+//! "catalog") therefore never see, count, or delete each other's files.
+//!
+//! A directory warmed by a build from *before* this change holds entries at
+//! the old rootless `dir/<shard>/<file>` layout. Those files sit outside every
+//! namespace subdirectory, so `scan_existing` (which reads only
+//! `dir/<namespace>`) neither seeds nor deletes them, and no instance counts
+//! them toward its byte or entry budget: they are inert. They are not a leak
+//! in the accounting sense (no live entry points at them and no budget hides
+//! them), but they do occupy disk until an operator deletes the stale root
+//! shards or a future full-directory sweep reclaims them; this crate's
+//! per-namespace scan deliberately does not, because deleting files outside
+//! its own namespace would race a concurrent instance that owns the sibling
+//! namespace under the same root.
+//!
 //! **Read-time verification is crc32c, and that is the whole of it**
 //! (decision 4, amended 2026-08-02). `CacheKey` is `(tenant_hash,
 //! content_hash, offset, len)`, where `content_hash` is the blake3 of the
@@ -103,6 +131,17 @@ const MAGIC: [u8; 4] = *b"RVCD";
 const FORMAT_VERSION: u32 = 3;
 const HEADER_LEN: usize = 4 + 4 + 16 + 32 + 8 + 8 + 8 + 4;
 const ENTRY_EXTENSION: &str = "rvc";
+
+/// Namespace label [`DiskCache::new`]/[`DiskCache::new_with_clock`] apply when
+/// the caller does not name one (issue #671). Every instance lives under a
+/// namespace subdirectory of the configured directory, so an un-labelled
+/// `new` call still lands in its own file namespace rather than sharing the
+/// directory root with another instance. Two instances that must share one
+/// `--cache-dir` (the server's fetcher cache and catalog byte cache) pass
+/// distinct labels through [`DiskCache::new_in_namespace`] instead of relying
+/// on this default; two instances both built through the default `new` would
+/// still collide, which is why production paths name their label.
+const DEFAULT_NAMESPACE: &str = "default";
 
 /// Process-wide counter so two `DiskCache` instances constructed in the
 /// same process (even pointed at the same directory) never derive the same
@@ -218,6 +257,10 @@ fn path_for(dir: &Path, key: &CacheKey) -> PathBuf {
 /// sweeper never keeps the tier alive, so dropping the [`DiskCache`] frees this
 /// state and the next tick sees a dead `Weak` and exits (see [`spawn_sweeper`]).
 struct Inner {
+    /// The namespaced root every path operation derives from:
+    /// `configured_dir/<namespace>` (issue #671). `path_for`, `scan_existing`,
+    /// the age sweep, and eviction all read and write only beneath this, so a
+    /// sibling instance's `configured_dir/<other-namespace>` is never touched.
     dir: PathBuf,
     limits: CacheLimits,
     state: Mutex<S3Fifo<()>>,
@@ -272,7 +315,7 @@ impl DiskCache {
     /// one; constructing off a runtime panics rather than silently skipping the
     /// sweep. See [`DiskCache::new_with_clock`].
     pub fn new(dir: PathBuf, limits: CacheLimits) -> Self {
-        Self::new_with_clock(dir, limits, Arc::new(SystemClock))
+        Self::new_in_namespace_with_clock(dir, DEFAULT_NAMESPACE, limits, Arc::new(SystemClock))
     }
 
     /// Like [`DiskCache::new`], but with an explicit [`Clock`] for the
@@ -288,9 +331,41 @@ impl DiskCache {
     /// exactly as [`tokio::spawn`] itself would, rather than leave the sweep
     /// un-spawned and the bound silently unenforced for idle entries.
     pub fn new_with_clock(dir: PathBuf, limits: CacheLimits, clock: Arc<dyn Clock>) -> Self {
+        Self::new_in_namespace_with_clock(dir, DEFAULT_NAMESPACE, limits, clock)
+    }
+
+    /// Like [`DiskCache::new`], but with an explicit `namespace` label
+    /// (issue #671). Every entry is stored under `dir/<namespace>/...` and the
+    /// startup scan, age sweep, and eviction all scope to `dir/<namespace>`, so
+    /// two instances over one directory with distinct labels never see, count,
+    /// or delete each other's files. `namespace` must be a single non-empty
+    /// path segment (no separators); the server passes `"store"` for the
+    /// fetcher cache and `"catalog"` for the catalog byte cache. See the
+    /// [module docs](self) for the warm-directory migration behavior.
+    pub fn new_in_namespace(dir: PathBuf, namespace: &str, limits: CacheLimits) -> Self {
+        Self::new_in_namespace_with_clock(dir, namespace, limits, Arc::new(SystemClock))
+    }
+
+    /// Like [`DiskCache::new_in_namespace`], but with an explicit [`Clock`].
+    /// The single constructor every other entry point funnels through.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside a Tokio runtime, exactly as
+    /// [`DiskCache::new_with_clock`] does and for the same reason.
+    pub fn new_in_namespace_with_clock(
+        dir: PathBuf,
+        namespace: &str,
+        limits: CacheLimits,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
         // Acquire the runtime handle first, so an off-runtime construction fails
         // before doing any filesystem work rather than after.
         let handle = Handle::current();
+        // Bake the namespace into the root every path operation derives from, so
+        // `path_for`, `scan_existing`, the sweep, and eviction are all scoped to
+        // `dir/<namespace>` with no further namespace threading (issue #671).
+        let dir = dir.join(namespace);
         let state = Inner::scan_existing(&dir, limits, clock.now_ns());
         let inner = Arc::new(Inner {
             dir,
@@ -357,6 +432,16 @@ impl DiskCache {
     #[cfg(test)]
     fn inner_weak(&self) -> Weak<Inner> {
         Arc::downgrade(&self.inner)
+    }
+
+    /// The namespaced root this instance stores entries under
+    /// (`configured_dir/<namespace>`), for tests that compute an entry's
+    /// canonical path with [`path_for`] or inspect the on-disk layout: after
+    /// namespacing (issue #671) the files live here, not directly under the
+    /// directory passed to the constructor.
+    #[cfg(test)]
+    fn dir(&self) -> &Path {
+        &self.inner.dir
     }
 }
 
@@ -902,10 +987,14 @@ mod tests {
                 cache.insert(already_cached, cached_before_payload);
                 assert!(cache.get(&already_cached).is_some());
 
-                make_readonly(&dir);
+                // Lock the namespaced root (where entries actually live), not
+                // the configured dir: after #671 a new shard is created under
+                // `dir/<namespace>`, so that is the directory whose writes must
+                // be denied for this phase to test anything.
+                make_readonly(cache.dir());
                 let never_cached_payload: &[u8] = b"should not persist";
                 let never_cached = test_key_with_len(13, never_cached_payload.len() as u64);
-                let never_cached_path = path_for(&dir, &never_cached);
+                let never_cached_path = path_for(cache.dir(), &never_cached);
                 let never_cached_shard = never_cached_path.parent().unwrap();
                 assert!(
                     !never_cached_shard.exists(),
@@ -919,7 +1008,7 @@ mod tests {
                     Some(cached_before_payload),
                     "an entry written while writable stays readable under a read-only directory"
                 );
-                make_writable(&dir);
+                make_writable(cache.dir());
             }
         }
 
@@ -933,7 +1022,7 @@ mod tests {
             cache.insert(key, &payload);
             assert!(cache.get(&key).is_some());
 
-            let path = path_for(&dir, &key);
+            let path = path_for(cache.dir(), &key);
             let full = fs::read(&path).unwrap();
             fs::write(&path, &full[..full.len() - 10]).unwrap();
             assert!(cache.get(&key).is_none());
@@ -951,7 +1040,7 @@ mod tests {
             cache.insert(key, &payload);
             assert!(cache.get(&key).is_some());
 
-            let path = path_for(&dir, &key);
+            let path = path_for(cache.dir(), &key);
             let mut full = fs::read(&path).unwrap();
             let last = full.len() - 1;
             full[last] ^= 0xFF;
@@ -995,7 +1084,7 @@ mod tests {
             fs::create_dir_all(&dir).unwrap();
             let cache = DiskCache::new(dir.clone(), generous_limits());
             let key = test_key(50);
-            let path = path_for(&dir, &key);
+            let path = path_for(cache.dir(), &key);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(&path, b"not a cache entry, just noise from somewhere else").unwrap();
             assert!(cache.get(&key).is_none());
@@ -1011,7 +1100,7 @@ mod tests {
         let key = test_key_with_len(1, 200);
         let payload = vec![0x42u8; 200];
         let full_header = encode_header(&key, &payload, 0);
-        let path = path_for(&dir, &key);
+        let path = path_for(cache.dir(), &key);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
 
         // Every truncation point short of the complete file: no bytes at
@@ -1093,7 +1182,7 @@ mod tests {
         // accounting: no more files are sitting in the directory than the
         // entry count allows.
         let mut on_disk = 0usize;
-        for shard in fs::read_dir(tmp.path()).unwrap().flatten() {
+        for shard in fs::read_dir(cache.dir()).unwrap().flatten() {
             if shard.file_type().unwrap().is_dir() {
                 on_disk += fs::read_dir(shard.path()).unwrap().count();
             }
@@ -1116,8 +1205,9 @@ mod tests {
         }
 
         // A junk file from some other source, sitting in the same shard
-        // layout a real entry would use.
-        let junk_shard = dir.join("zz");
+        // layout a real entry would use -- inside the instance's namespace
+        // subdirectory, which is the only place its scan looks (#671).
+        let junk_shard = dir.join(DEFAULT_NAMESPACE).join("zz");
         fs::create_dir_all(&junk_shard).unwrap();
         let junk_path = junk_shard.join("not-a-real-entry.rvc");
         let mut junk = fs::File::create(&junk_path).unwrap();
@@ -1152,7 +1242,9 @@ mod tests {
     async fn startup_scan_sweeps_orphaned_scratch_files() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_path_buf();
-        let shard = dir.join("ab");
+        // The orphan sits inside the instance's namespace subdirectory, the
+        // only place its startup scan traverses (#671).
+        let shard = dir.join(DEFAULT_NAMESPACE).join("ab");
         fs::create_dir_all(&shard).unwrap();
         let orphan = shard.join(format!(".tmp-{}-0-0", std::process::id()));
         fs::write(&orphan, vec![0u8; 4096]).unwrap();
@@ -1218,7 +1310,7 @@ mod tests {
         cache.insert(key, &payload);
         assert!(cache.get(&key).is_some(), "precondition: entry is live");
 
-        let path = path_for(&dir, &key);
+        let path = path_for(cache.dir(), &key);
         let mut bytes = fs::read(&path).unwrap();
         let last = bytes.len() - 1;
         bytes[last] ^= 0xFF;
@@ -1249,7 +1341,9 @@ mod tests {
         let real_key = test_key_with_len(1, 64);
         let payload = vec![7u8; 64];
         let header = encode_header(&real_key, &payload, 0);
-        let wrong_shard = dir.join("zz");
+        // Inside the namespace subdirectory the scan traverses, but at a
+        // non-canonical path within it (#671).
+        let wrong_shard = dir.join(DEFAULT_NAMESPACE).join("zz");
         fs::create_dir_all(&wrong_shard).unwrap();
         let wrong_path = wrong_shard.join("misplaced.rvc");
         let mut buf = Vec::new();
@@ -1360,7 +1454,7 @@ mod tests {
             "an expiry is not a disk error: the entry was well-formed"
         );
         assert!(
-            !path_for(tmp.path(), &key).exists(),
+            !path_for(cache.dir(), &key).exists(),
             "the stale entry's bytes must be dropped from disk, not left to persist"
         );
 
@@ -1393,7 +1487,7 @@ mod tests {
         assert_eq!(reopened.len(), 0, "an aged-out entry must not be seeded");
         assert_eq!(reopened.total_bytes(), 0);
         assert!(
-            !path_for(&dir, &test_key_with_len(1, 10)).exists(),
+            !path_for(reopened.dir(), &test_key_with_len(1, 10)).exists(),
             "the startup scan must delete an entry already past the max-age"
         );
     }
@@ -1440,7 +1534,7 @@ mod tests {
         assert_eq!(old_header.len(), 4 + 4 + 16 + 32 + 8 + 8 + 4); // 76, the v2 layout
         assert_eq!(old_header.len() + payload.len(), HEADER_LEN); // reads as a full header
 
-        let path = path_for(&dir, &key);
+        let path = path_for(cache.dir(), &key);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let mut buf = old_header;
         buf.extend_from_slice(&payload);
@@ -1475,7 +1569,7 @@ mod tests {
         let cache = DiskCache::new_with_clock(dir.clone(), generous_limits(), clock);
 
         let key = test_key_with_len(7, 32);
-        let path = path_for(&dir, &key);
+        let path = path_for(cache.dir(), &key);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
 
         for bytes in [
@@ -1519,7 +1613,7 @@ mod tests {
 
         let key = test_key_with_len(1, 5);
         cache.insert(key, b"hello");
-        let path = path_for(&dir, &key);
+        let path = path_for(cache.dir(), &key);
         assert!(path.exists(), "precondition: the entry is on disk");
         assert_eq!(cache.len(), 1);
 
@@ -1569,7 +1663,7 @@ mod tests {
 
         let key = test_key_with_len(1, 5);
         cache.insert(key, b"hello");
-        let path = path_for(&dir, &key);
+        let path = path_for(cache.dir(), &key);
         assert!(path.exists(), "precondition: the entry is on disk");
 
         // Age it out; the periodic task must notice on its own within a bounded
@@ -1657,7 +1751,7 @@ mod tests {
         clock.set(5_000_002);
         cache.sweep_expired_now();
         assert!(
-            !path_for(&dir, &key).exists(),
+            !path_for(cache.dir(), &key).exists(),
             "the sweep must drop a one-ns-old entry when max-age is 0"
         );
 
@@ -1734,5 +1828,205 @@ mod tests {
             result.is_err(),
             "off-runtime construction must panic loudly, not return a sweeperless cache"
         );
+    }
+
+    /// Counts entry files under a namespaced root: every regular file under a
+    /// two-hex shard subdirectory. Used by the #671 isolation tests to prove a
+    /// namespace's on-disk file count independently of another namespace under
+    /// the same configured directory.
+    fn count_entry_files(dir: &Path) -> usize {
+        let mut n = 0;
+        let Ok(shards) = fs::read_dir(dir) else {
+            return 0;
+        };
+        for shard in shards.flatten() {
+            if shard.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                n += fs::read_dir(shard.path())
+                    .map(|it| it.flatten().count())
+                    .unwrap_or(0);
+            }
+        }
+        n
+    }
+
+    /// Total entry files across every namespace subdirectory under `base`
+    /// (`base/<namespace>/<shard>/<file>`). Distinct from summing
+    /// [`count_entry_files`] on two known roots: it counts whatever is actually
+    /// on disk, so if two instances collapsed onto one shared namespace the
+    /// physical file total it returns is their union, not 2x a per-namespace
+    /// count -- which is what makes it a decisive cross-eviction signal.
+    fn count_all_entry_files(base: &Path) -> usize {
+        let mut n = 0;
+        let Ok(namespaces) = fs::read_dir(base) else {
+            return 0;
+        };
+        for ns in namespaces.flatten() {
+            if ns.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                n += count_entry_files(&ns.path());
+            }
+        }
+        n
+    }
+
+    /// #671: two `DiskCache` instances over one directory with distinct
+    /// namespace labels are fully isolated. Each enforces its own byte/entry
+    /// budget over its own `dir/<namespace>` subtree, and neither counts nor
+    /// evicts the other's files even when both hold the identical keys. All
+    /// figures are pinned exactly.
+    ///
+    /// FLIP (non-vacuity): build both instances with the SAME label (e.g.
+    /// `"store"` for both). Two changes fail immediately: `store.dir()` and
+    /// `catalog.dir()` become equal (the `assert_ne` fires), and the
+    /// base-wide `count_all_entry_files(base) == 8` collapses to 4, because the
+    /// two instances now share one `dir/store` file set and their identical keys
+    /// map to one file rather than two -- the cross-eviction this test forbids.
+    #[tokio::test]
+    async fn distinct_namespaces_over_one_dir_are_isolated() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().to_path_buf();
+        let entry = 1024u64;
+        // 4 entries / 4096 bytes: inserting 10 distinct once-touched keys forces
+        // eviction down to exactly 4 resident (4 * 1024 == 4096).
+        let limits = CacheLimits::new(entry * 4, 4, entry * 4);
+
+        let store = DiskCache::new_in_namespace(base.clone(), "store", limits);
+        let catalog = DiskCache::new_in_namespace(base.clone(), "catalog", limits);
+        assert_ne!(
+            store.dir(),
+            catalog.dir(),
+            "distinct labels, distinct roots"
+        );
+
+        // Identical keys in both instances: with distinct namespaces they land
+        // in separate files (dir/store/... vs dir/catalog/...) and never collide.
+        for i in 0..10u64 {
+            let key = test_key_with_len(i, entry);
+            store.insert(key, &vec![0xAAu8; entry as usize]);
+            catalog.insert(key, &vec![0xBBu8; entry as usize]);
+        }
+
+        // Each stays within its own budget, pinned exactly.
+        assert_eq!(store.len(), 4);
+        assert_eq!(store.total_bytes(), 4096);
+        assert_eq!(catalog.len(), 4);
+        assert_eq!(catalog.total_bytes(), 4096);
+
+        // Neither evicts the other's files: exactly 4 files under each
+        // namespace, and 8 physical files across the shared directory. The
+        // base-wide count is the decisive cross-eviction guard -- a shared
+        // namespace would collapse it to 4.
+        assert_eq!(count_entry_files(store.dir()), 4);
+        assert_eq!(count_entry_files(catalog.dir()), 4);
+        assert_eq!(count_all_entry_files(&base), 8);
+
+        // The catalog's bytes are intact through its own reads (the store's
+        // eviction never touched them): a surviving catalog key still serves
+        // 0xBB bytes, not the store's 0xAA.
+        let survivor = (0..10u64)
+            .map(|i| test_key_with_len(i, entry))
+            .find(|k| catalog.get(k).is_some())
+            .expect("the catalog retains 4 of its own entries");
+        assert_eq!(
+            catalog.get(&survivor).as_deref(),
+            Some(vec![0xBBu8; entry as usize].as_slice()),
+            "the catalog serves its own bytes, unperturbed by the store's eviction"
+        );
+    }
+
+    /// #671: a restart re-seeds each namespace from ONLY its own subtree. Two
+    /// instances are populated with different entry counts, dropped, and
+    /// reopened; each reopened instance's `len()` reflects only its own
+    /// namespace, never the union.
+    ///
+    /// FLIP (non-vacuity): reopen the store instance under the `"catalog"` label
+    /// (or a shared one). Its scan then reads the other subtree and `len()`
+    /// becomes 3, not 2 -- proving the scan is namespace-scoped.
+    #[tokio::test]
+    async fn restart_reseeds_each_namespace_independently() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().to_path_buf();
+        {
+            let store = DiskCache::new_in_namespace(base.clone(), "store", generous_limits());
+            store.insert(test_key_with_len(1, 10), &[1u8; 10]);
+            store.insert(test_key_with_len(2, 10), &[2u8; 10]);
+            let catalog = DiskCache::new_in_namespace(base.clone(), "catalog", generous_limits());
+            catalog.insert(test_key_with_len(1, 20), &[3u8; 20]);
+            catalog.insert(test_key_with_len(2, 20), &[4u8; 20]);
+            catalog.insert(test_key_with_len(3, 20), &[5u8; 20]);
+        }
+
+        let store = DiskCache::new_in_namespace(base.clone(), "store", generous_limits());
+        assert_eq!(store.len(), 2, "store re-seeds from only its own namespace");
+        assert_eq!(store.total_bytes(), 20);
+
+        let catalog = DiskCache::new_in_namespace(base.clone(), "catalog", generous_limits());
+        assert_eq!(
+            catalog.len(),
+            3,
+            "catalog re-seeds from only its own namespace"
+        );
+        assert_eq!(catalog.total_bytes(), 60);
+    }
+
+    /// #671: entries left in the directory ROOT by a build from before
+    /// namespacing (the old `dir/<shard>/<file>` layout, no namespace
+    /// subdirectory) are claimed by NO namespace. `scan_existing` reads only
+    /// `dir/<namespace>`, so neither a "store" nor a "catalog" instance seeds
+    /// such a file into its budget or deletes it; it persists untouched until an
+    /// operator (or a future full-directory sweep) removes it.
+    ///
+    /// FLIP (non-vacuity): construct an instance with an empty label
+    /// (`new_in_namespace(base, "", ..)`), whose namespaced root collapses back
+    /// to `base`. Its `scan_existing` then traverses the root shard, seeds the
+    /// warm entry (`len()` becomes 1), and the "counted in neither / not
+    /// deleted" assertions fail.
+    #[tokio::test]
+    async fn warm_root_entries_are_claimed_by_no_namespace() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().to_path_buf();
+
+        // A well-formed entry at the pre-namespacing root layout: base/<shard>/
+        // <file>, with no namespace subdirectory in the path.
+        let key = test_key_with_len(1, 64);
+        let payload = vec![7u8; 64];
+        let warm_path = path_for(&base, &key);
+        fs::create_dir_all(warm_path.parent().unwrap()).unwrap();
+        let clock = TestClock::new(1_000_000);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&encode_header(&key, &payload, 1_000_000)); // within max-age at now
+        buf.extend_from_slice(&payload);
+        fs::write(&warm_path, &buf).unwrap();
+
+        let store = DiskCache::new_in_namespace_with_clock(
+            base.clone(),
+            "store",
+            generous_limits(),
+            clock.clone(),
+        );
+        let catalog = DiskCache::new_in_namespace_with_clock(
+            base.clone(),
+            "catalog",
+            generous_limits(),
+            clock,
+        );
+
+        // Counted in neither budget: each scanned only its own namespace.
+        assert_eq!(store.len(), 0);
+        assert_eq!(store.total_bytes(), 0);
+        assert_eq!(catalog.len(), 0);
+        assert_eq!(catalog.total_bytes(), 0);
+
+        // Not deleted by either scan: the warm file sits at the root, outside
+        // both `dir/store` and `dir/catalog`, so no per-namespace scan reaches
+        // it.
+        assert!(
+            warm_path.exists(),
+            "a pre-namespacing root entry must survive both instances' scans untouched"
+        );
+
+        // And it is a genuine miss through each instance, which looks only under
+        // its own namespace where this key has no file.
+        assert!(store.get(&key).is_none());
+        assert!(catalog.get(&key).is_none());
     }
 }
