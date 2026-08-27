@@ -409,7 +409,12 @@ pub const MAX_ATTRIBUTE_NESTING_DEPTH: usize = 100;
 
 /// Map one OTLP `AnyValue` to the canonical [`AttrValue`]. Lists and maps
 /// recurse through the same mapping. `key` is carried only for the rejection
-/// message; nested values report their enclosing attribute's key.
+/// message. A value nested inside a list reports the enclosing attribute's
+/// key; one nested inside a kvlist reports that map entry's own key instead,
+/// because the kvlist arm rebinds it. The two arms have disagreed since before
+/// the depth guard existed, and unifying them changes the key reported by the
+/// pre-existing missing- and unsupported-value rejections, so it is issue #808
+/// rather than part of the guard.
 ///
 /// `depth` is the current nesting level (1 for a top-level attribute value,
 /// one more per enclosing array or kvlist). Exceeding
