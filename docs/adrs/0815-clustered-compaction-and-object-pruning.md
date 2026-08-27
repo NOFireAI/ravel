@@ -86,11 +86,16 @@ Decision: clustering is a compaction output choice. Ingest is untouched.
 The clustering key is a fixed per-signal default, overridable per tenant, never
 silently derived:
 
-- **Logs, spans, alerts, audit (RLOG/RSPAN):** lead with EventTime. The merge
-  sorts by `(ts, <existing tiebreak>)` for a clustering-eligible (tenant,
-  signal) instead of `(stream_ref, ts)`. Stream identity stays a lower-order
-  tiebreak so the STREAM_DIR remap and the cross-object stream-identity check
-  (rlog.rs) are unchanged; only the leading sort column moves.
+- **Logs, alerts, audit (RLOG):** lead with EventTime. Decision 4 states
+  precisely what changes in `crates/ravel-maintain/src/rlog.rs::merge_catalogs`
+  to get there; stream identity moves from an outer partition to a low-order
+  tiebreak, it does not merely change position within one comparator.
+- **Spans (RSPAN): out of scope.** Not part of a combined "RLOG/RSPAN" family
+  for this decision. Decision 4 states why: the RSPAN merge's trace-transition
+  part split cannot carry a time-leading order without a different algorithm,
+  not a sort-key change, so this ADR does not cluster spans by time. A
+  narrow-time-window statement over spans gets no object-level exclusion from
+  this ADR.
 - **Metrics (RSEG):** unchanged. RSEG is already series-major and a metric
   query is series-scoped, not a narrow-EventTime-window scan over an
   unclustered table; the measurement class this ADR targets does not exist for
@@ -116,55 +121,196 @@ against a known key, not a guess re-made per statement.
 ### 3. Object exclusion: narrow catalog-level bounds, read without a GET
 
 Clustering changes nothing unless an object can be excluded WITHOUT a data GET.
-Both halves are required and must be stated separately:
+Both halves are required and must be stated separately. Every bound in this
+section is **per output part, never per compaction record**: the catalog
+mints exactly one `SegmentRef` per `CompactionRecord.parts` entry
+(docs/catalog-and-mvcc.md "Snapshot resolution"; `crates/ravel-catalog/src/
+snapshot.rs::SegmentRef`), and object exclusion filters on that `SegmentRef`.
+A record-level bound cannot represent two parts whose clustering-key ranges
+are disjoint: a record spanning both would report a min/max wide enough to
+cover the gap between them, excluding nothing a query landing in that gap
+should have excluded. Every field this decision adds therefore lives on
+`CompactionPart` and is copied to its `SegmentRef` exactly as today's
+per-part `min_event_ts_ns`/`max_event_ts_ns` already are -- `SegmentRef`
+carries that pair flat on the struct, not nested under the L1 variant, and
+`CompactionPart` already carries the same pair per part
+(proto/ravel/commit.proto). No field this ADR adds is ever read or written at
+record granularity.
 
 - **The clustering half** (this ADR's new work): compaction emits parts whose
   per-part span of the clustering key is narrow, because the merge is sorted by
   that key and parts are cut on its boundaries (decision 4).
-- **The exclusion half** (where the per-object min/max lives, and how the
+- **The exclusion half** (where the per-part min/max lives, and how the
   planner reads it):
-  - **For the EventTime key, the exclusion half already exists.** The per-part
-    `event bounds` on the L1 `SegmentRef`, reconstructed from the compaction
-    record and never trusted from a stored string (ADR-0010 §7), are the
-    per-object min/max of the clustering key. Resolve step 4 filters on them
-    before any data GET. Today's block stats also live *inside* the object
-    (SKIP_IDX), which is exactly why discovering a block has nothing still
-    costs a request; the commit/part-record bounds are the copy that lives in
-    the catalog and costs no data GET. So for EventTime the two halves reduce
-    to one new thing: clustering. No new catalog field.
+  - **For the EventTime key, the exclusion half already exists and is
+    already per-part.** `CompactionPart.min_event_ts_ns`/`max_event_ts_ns`
+    (proto/ravel/commit.proto), reconstructed onto each part's `SegmentRef`
+    and never trusted from a stored string (ADR-0010 §7), are the per-part
+    min/max of the clustering key. Resolve step 4 filters on them before any
+    data GET. Today's block stats also live *inside* the object (SKIP_IDX),
+    which is exactly why discovering a block has nothing still costs a
+    request; the part-record bounds are the copy that lives in the catalog
+    and costs no data GET. So for EventTime the two halves reduce to one new
+    thing: clustering. No new catalog field.
   - **For a non-EventTime clustering key** (the per-tenant override on a
-    declared column), the catalog carries no per-object min/max of that column
-    today; it lives only in the object's per-block column stats, so discovering
-    an object has nothing costs a GET. That key needs the exclusion half built:
-    an additive `clustering_min`/`clustering_max` pair (typed per the column's
-    declared type, ADR-0101 vocabulary) on the compaction record and mirrored
-    onto the part `SegmentRef`, populated by the compactor from the merged
-    rows. The planner reads it in resolve step 4 beside the event-bound filter.
-    This is an additive proto field, not a segment-format change (decision 6).
+    declared column), the catalog carries no per-part min/max of that column
+    today; it lives only in the object's per-block column stats, so
+    discovering a part has nothing costs a GET. That key needs the exclusion
+    half built: two additive fields on `CompactionPart` --
+    `clustering_min`/`clustering_max` (typed per the column's declared type,
+    ADR-0101 vocabulary) -- populated by the compactor from that part's own
+    merged rows and copied onto the part's `SegmentRef` the same way the
+    EventTime pair already is. The planner reads them in resolve step 4
+    beside the event-bound filter. This is an additive proto field on
+    `CompactionPart`, not a segment-format change (decision 6).
 
 Say it plainly: for the default (time) key this ADR ships clustering alone and
-reuses existing bounds; for an override key it ships clustering plus one
-additive catalog field. Neither reads a data object to exclude one.
+reuses existing per-part bounds; for an override key it ships clustering plus
+two additive per-part catalog fields. Neither reads a data object to exclude
+one, and neither is ever read or written at record granularity.
+
+#### Identity: pinning the clustering configuration that produced a record
+
+The clustering key is read from `t/<tenant_hash>/config`
+(`TenantConfigRecord.clustering_key`, decision 2), a mutable, whole-record
+CAS-replaced object. `input_set_hash` (docs/catalog-and-mvcc.md) is defined
+today as the blake3 digest over the compaction record's sorted `inputs` list
+alone. If the clustering key changes between a compaction attempt and its
+retry, the same input set now merges into different rows-per-part on each
+attempt: the first attempt's `CreateIfAbsent` publishes one set of parts, the
+retry recomputes different parts (parts are independently content-addressed
+by their own bytes, so they never collide with each other) but tries to
+publish the SAME record key with a DIFFERENT `parts` list body. That is
+exactly the shape the commit-record protocol calls split-brain and crashes
+loudly on (docs/catalog-and-mvcc.md "Commit sequence" step 3); here it would
+crash-loop rather than converge, because the cause is a durable config value
+that stays changed, not a transient retry.
+
+Decision: for a clustering-eligible (tenant, signal), `input_set_hash` is
+computed over the sorted `inputs` list domain-separated by the resolved
+`clustering_key` value that produced this attempt's parts -- the same
+domain-separation idiom the ADR-0064 rewrite record's `input_set_hash`
+already uses to stay distinct from the compaction record's
+(docs/catalog-and-mvcc.md: "a distinct domain from the compaction
+`input_set_hash` so the two can never collide"). A clustering-key change
+between attempts therefore produces a genuinely different record key, never a
+body collision on the same key: two attempts under two configs coexist
+exactly as two racing compactors already do today under ADR-0018's
+overlap-harmlessness rule, and whichever publishes second is superseded
+through the ordinary supersession path the next time compaction runs, not
+through a crash. Unclustered signals (metrics) keep the existing hash
+definition byte-for-byte -- untouched, no migration -- because they never
+resolve a `clustering_key` in the first place.
+
+That still leaves: given a `clustering_min`/`clustering_max` on some
+`SegmentRef`, how does a reader know which key produced it? Answer:
+`CompactionRecord` gains an additive `clustering_key` field (the sentinel for
+"none" on an unclustered signal, the sentinel for EventTime, or the declared
+override column name) recording the resolved value used for that record's
+merge, and `CompactionPart` mirrors it onto each part alongside its bounds,
+so a `SegmentRef` is self-describing: the resolver never has to re-derive the
+key from the CURRENT tenant config (which may have moved on since this
+record was written) to know what column its own bounds mean. A resolver
+filtering a narrow-window predicate on column `X` matches it only against a
+`SegmentRef` whose own `clustering_key` names `X`; a `SegmentRef` produced
+under a different or since-changed key is read as EventTime-only-bounded (or
+unbounded, see the fail-open rule below) for that predicate, never assumed to
+also bound `X`.
+
+#### Fail-open: missing, malformed, or unvalidated bounds
+
+`clustering_min`/`clustering_max` (the EventTime pair or an override-column
+pair) is a pruning hint, never a correctness gate. If a `SegmentRef`'s
+clustering bounds for the predicate's key are absent, fail to decode, or were
+never validated as having been computed from that part's own final merged
+rows, the resolver MUST treat the bound as unknown and include the part:
+read the object. The failure mode is **fail-open (read), never fail-closed
+(skip)** -- skipping on an unknown bound is silent data loss (a query returns
+fewer rows than exist, with no error), not a slow query, and this ADR's
+entire value proposition depends on exclusion being provably safe, so an
+unsafe exclusion is strictly worse than no exclusion at all.
+
+- **Null handling.** If any row the compactor merges into a part has a null
+  in the clustering column, the compactor does not populate that part's
+  `clustering_min`/`clustering_max` at all (leaves the field absent), rather
+  than encoding a sentinel or silently excluding the null rows from the
+  computed range. An absent field is unknown by the rule above, so the part
+  is always read whenever it contains a row the compactor could not bound.
+  This applies only to the override-column pair; the EventTime pair has no
+  null case (EventTime is a required field on every admitted row, ADR-0010
+  §8's admission bound).
+- **Validated means computed from this part's own output rows.** A
+  `clustering_min`/`clustering_max` value is populated only at the moment the
+  compactor writes the part it describes, directly from the rows that landed
+  in it. Nothing ever carries a bound forward from an input or from a
+  different part, and there is no code path that populates the field without
+  computing it fresh; "validated" and "present" are therefore the same
+  condition by construction, and there is no partially-trusted intermediate
+  state to define semantics for beyond "absent, therefore unknown, therefore
+  read."
 
 ### 4. Interaction with the compaction tiers
 
-- **L1 compaction (ADR-0018, `compact.rs`, `max_l1_part_bytes` default 256
-  MiB, parts cut on stream/series boundaries at the byte cap):** modified, not
-  replaced. The exact-conservation contract (`conserve_exact`, rows in = rows
-  out) is unchanged; only the merge sort order and the part-cut predicate
-  change. A part is still flushed at the byte cap; clustering only guarantees
-  that a byte-cap-cut part covers a contiguous clustering-key range, because
-  the merge feeding it is sorted by that key. Within one ingest hour this
+- **L1 compaction -- RLOG signals (logs, alerts, audit) (ADR-0018,
+  `crates/ravel-maintain/src/rlog.rs`, `max_l1_part_bytes` default 256 MiB):**
+  modified, not replaced -- but the modification is a loop restructuring, not
+  a comparator tweak. `merge_catalogs` today is a two-level loop: sorted
+  `stream_id` in the OUTER loop, then a ts-ascending k-way merge of just that
+  stream's records across inputs in the inner loop ("Merge stream by stream
+  in sorted stream_id order", rlog.rs) -- every record of one stream precedes
+  every record of the next regardless of timestamp, which is what makes
+  today's output stream-major. Reordering the comparator inside the existing
+  loop nesting cannot produce ts-major output; the loop nesting itself has to
+  invert to a single k-way merge across every stream and every input at once,
+  selecting the globally-minimum `(ts, stream_ref, <existing tiebreak>)` head
+  at each step, with `stream_ref` demoted from an outer partition to a
+  tiebreak. `PartSink`'s cut predicate does NOT change: it already flushes
+  purely on `max_l1_part_bytes`, mid-stream if that is where the cap lands
+  (issue #711); cutting mid-(what is no longer a stream boundary at all)
+  needs no new logic, because the predicate was never "cut on stream
+  boundaries" to begin with -- it is, and stays, a byte-cap cut only. The
+  exact-conservation contract (`conserve_exact`, rows in = rows out) is
+  unchanged by either version of the loop. Within one ingest hour this
   narrows per-part bounds for any hour that holds more than one part.
+
+  One resource-shape consequence the restructuring introduces: today's merge
+  holds one decode unit open per INPUT (one stream active at a time, ranged
+  readers advance stream by stream). A global k-way merge across every stream
+  needs a live cursor per (input, stream) pair, since any stream's next
+  record can be the global minimum at any step: the concurrently open
+  decode-unit count grows from O(inputs) to O(inputs x streams active in the
+  bucket). `MergeMemoryTracker` already bounds total accumulated heap
+  regardless of cursor count, so this is not unbounded, but it is a real
+  change in shape from today's bound and must be sized against a tenant's
+  actual per-hour stream cardinality at implementation time, not assumed away
+  by the tracker's existing ceiling.
+
+- **L1 compaction -- spans (RSPAN):** unmodified. Decision 2 excludes spans
+  from time-leading clustering: `crates/ravel-maintain/src/
+  rspan_codec.rs::merge` selects the minimum `(trace_id, start_ts_ns,
+  input_index)` head, and the writer "splits only on a trace boundary, never
+  mid-trace" (rspan_codec.rs). Moving the leading key to `ts` would scatter
+  one trace's records to wherever each record's own timestamp falls in the
+  global order, so there is no longer a single trace-boundary point left to
+  cut a part on, and preserving the never-split invariant would require
+  buffering an unbounded number of concurrently open traces -- a different
+  merge algorithm, not a sort-key change. RSPAN keeps its current merge,
+  current part-cut rule, and current (wide) per-part EventTime bounds; this
+  ADR does not attempt object-level time exclusion for spans.
 - **#593 (L2 cross-hour exact compaction):** composes, and is where clustering
   pays off most. A bulk-imported corpus puts the whole EventTime range into a
   few ingest hours, so within-hour L1 clustering alone cannot separate hours
   that do not exist as a partition; L2 merges across hours and is the tier that
   produces objects whose EventTime bounds each cover a narrow, corpus-wide time
   slice. L2 applies the identical sorted-merge-and-cut; it is the same rewrite
-  primitive over a wider input set. This ADR specifies the output invariant; it
-  does not subsume #593, it requires #593 to reach full effect on a
-  time-uncorrelated ingest order and composes with it.
+  primitive over a wider input set, and it inherits this ADR's per-part bound
+  and identity-pinning rules verbatim (decision 3). L2's cross-hour span also
+  makes decision 7's retention rule load-bearing: an L2 record is the first
+  object shape in Ravel whose retention lifetime cannot be read off a single
+  ingest-hour key component, and decision 7 states the rule that covers it.
+  This ADR specifies the output invariant; it does not subsume #593, it
+  requires #593 to reach full effect on a time-uncorrelated ingest order and
+  composes with it.
 - **#118 (rollup/downsampling tier):** orthogonal. Rollup is a lossy
   pre-aggregation that reduces row count; clustering is an exact reordering that
   preserves rows. A rollup tier's outputs can themselves be clustered by the
@@ -217,32 +363,110 @@ exclusion is an index problem, and it solves only the former.
   changes meaning, old objects stay readable and are re-clustered
   opportunistically through the normal rewrite-on-touch force, and there is no
   version floor to raise.
-- **Catalog record:** for the EventTime default, no field is added (existing
-  event bounds serve). For a per-tenant override key, the additive
-  `clustering_min/max` on the compaction record and the `clustering_key` on
-  `TenantConfigRecord` are additive proto fields on additive-by-contract
-  records (the same class as the `enc`/`config` histories in
-  docs/catalog-and-mvcc.md); an old reader ignores them and reads the object,
-  so they need no bump and no migration either.
+- **Catalog record:** finding 1 moves the bounds from `CompactionRecord` to
+  `CompactionPart`; finding 2 adds `clustering_key` to `CompactionRecord` and
+  changes what `input_set_hash` is computed over for a clustering-eligible
+  signal. Each is judged against the same test ADR-0066 decision 4 sets: does
+  an old reader that does not know the new field still decode the record
+  correctly and reach the same answer for the bytes it does understand?
+  - `CompactionPart.clustering_min`/`clustering_max`,
+    `CompactionPart.clustering_key`, `CompactionRecord.clustering_key`, and
+    `TenantConfigRecord.clustering_key`: additive proto fields, the same
+    class as the `enc`/`config` histories (docs/catalog-and-mvcc.md) and as
+    this ADR's own EventTime precedent (`CompactionPart.min_event_ts_ns`/
+    `max_event_ts_ns` are already additive fields on the same message, added
+    without a bump when ADR-0018 shipped compaction). An old reader ignores
+    an unknown field on a message it already knows how to decode and reads
+    the object; no bump, no migration.
+  - The `input_set_hash` domain-separation change (identity, decision 3) is
+    NOT a segment-format or catalog-schema change -- no wire field changes
+    shape -- but it IS a change to how a value in an existing field is
+    computed, and unlike an additive field, an old reader cannot tell a
+    domain-separated hash from an undifferentiated one just by decoding it;
+    it can only fail to find the record it expects at the key it computes.
+    This is scoped narrowly: it applies only to a (tenant, signal) that is
+    clustering-eligible AND has a `clustering_key` resolved, i.e. only once
+    this feature is turned on for that tenant, so a tenant that never sets
+    `clustering_key` computes `input_set_hash` exactly as today, byte for
+    byte, and needs nothing. For a tenant that turns clustering on, this
+    changes a frozen identity derivation for that tenant's future L1/L2
+    records; new records simply key differently than an unclustered record
+    over the same inputs would have, which is safe (nothing old ever
+    collides with it) but is still a derivation change, not an additive
+    field, so it is called out explicitly rather than folded into the
+    additive bucket above. It needs no reader-visible migration (nothing
+    stored changes shape, and no existing record is reinterpreted), so it
+    does not trigger ADR-0066 decision 4's migration class, but it is a
+    one-way switch per tenant: once a tenant's config carries a
+    `clustering_key`, its compaction records key differently for as long as
+    clustering stays on.
 
-Stated plainly: the default path needs no format version bump and no migration
-class; the override path needs two additive proto fields and still no bump.
+Stated plainly: no segment-format bump, no catalog-schema bump, and no
+ADR-0066 decision 4 migration class for either path. Finding 1 stays additive
+because it moves an already-additive field to a sibling message inside the
+same additive-by-contract record. Finding 2 stays out of the bump/migration
+system entirely because it is opt-in per tenant and touches no wire shape --
+but it is a real, one-way change to a frozen derivation for that tenant, and
+this ADR states that plainly rather than folding it into "just another
+additive field."
 
 ### 7. Erasure and retention
 
-Both walk objects, and both key on the ingest-hour bucket, which clustering
-within a bucket does not change:
+Both walk objects. Erasure keys on the ingest-hour bucket exactly as before;
+clustering within a bucket does not change that. Retention also keys on the
+ingest-hour bucket for L1, unchanged -- but not for L2, which introduces the
+first object shape whose retention lifetime spans more than one bucket (see
+below):
 
-- **Retention (ADR-0019, age-based):** unchanged for within-hour L1 clustering
-  -- a tombstone still retires a whole ingest hour, and the objects it retires
-  are that hour's clustered parts. It interacts with clustering only through
-  **L2 cross-hour** (#593): an L2 object spans an ingest-hour *range*, so the
-  retention frontier must key on the object's newest covered hour, not a single
-  hour. That is #593's own concern (a cross-hour object already breaks the
-  one-object-one-hour assumption); this ADR adds nothing to it beyond noting
-  that a clustered L2 object's covered-hour set must be recorded on its record
-  so retention and the retention-frontier reconcile (docs/catalog-and-mvcc.md)
-  see every hour it holds.
+- **Retention (ADR-0019, age-based):** unchanged for within-hour L1
+  clustering -- a tombstone still retires a whole ingest hour, and the
+  objects it retires are that hour's clustered parts, each covering exactly
+  one hour as today. **L2 cross-hour (#593) needs an explicit rule, not a
+  note.** An L2 object spans an ingest-hour range, and ADR-0019 decision 4
+  deletes a bucket's data objects, compaction records, and parts as a unit
+  once every record in the bucket is expired. An L2 object covering one
+  expired hour and one still-live hour can neither be dropped (deletes rows
+  still inside the retention window, violating ADR-0019's exact floor: "no
+  sample younger than R is ever excluded") nor kept (retains expired rows
+  past R, violating the same floor from the other side). Of the four shapes a
+  rule here could take -- splitting the object at compaction time, a
+  selective rewrite that drops the expired hour's rows and re-emits a
+  narrower object (repurposing the ADR-0064 erasure-rewrite mechanism),
+  deferring the whole bucket's tombstone until every hour the object covers
+  is expired, or forbidding a clustered part from ever spanning a retention
+  boundary -- this ADR chooses **deferral**:
+
+  `CompactionRecord` gains an additive `covered_hour_min`/`covered_hour_max`
+  pair (u32, unix hours, same encoding as `ingest_hour_bucket`) recording the
+  full range of ingest hours whose rows an L2 record's parts contain; for an
+  L1 record both equal the single `ingest_hour_bucket` it already carries, so
+  no L1 behavior or reader changes. ADR-0019 decision 1's expiry test --
+  "sealed, and every record in it has `max_event_ts < now - R`" -- extends
+  to: a bucket is expired only when every record whose
+  `covered_hour_min..covered_hour_max` range includes that bucket's hour is
+  ALSO expired by the same test, checked over its own full covered range. A
+  bucket named by a live-spanning L2 record's covered range therefore does
+  not tombstone -- not that hour alone, and not any other hour the same
+  record covers -- until the record's newest covered hour also expires, at
+  which point every hour it covers tombstones together in the same sweep
+  pass. This is bounded over-retention only (the record's oldest covered
+  hour stays live slightly past its own individual expiry, for at most the
+  width of the record's covered-hour range), the same class of cost
+  ADR-0019 decision 1 already accepts for bucket granularity ("the cost of
+  bucket granularity is bounded over-retention, not under-retention"); this
+  just widens the bound from one bucket to one L2 record's covered-hour
+  range, with no new correctness mechanism and no new deletion path.
+  Splitting and selective rewrite are both rejected for this ADR's scope:
+  splitting couples the compactor to the retention frontier at merge time (a
+  merge would have to know, and re-check, R for every input hour it touches,
+  for a benefit that only matters at the one boundary a corpus happens to
+  straddle), and selective rewrite would stand up a whole ADR-0064-shaped
+  rewrite path scoped to retention alone; deferral needs neither and costs
+  only slightly stale deletion, which ADR-0019 already treats as an
+  acceptable failure direction everywhere else. Forbidding a clustered part
+  from ever spanning a retention boundary is rejected because it is not
+  enforceable at merge time without the same frontier-coupling splitting
+  would need.
 - **Erasure (ADR-0064, selective rewrite):** a rewrite drops a subject's rows
   and re-emits the object. Two consequences. First, a rewrite that removes rows
   can only narrow a clustered part's key bounds, never widen them, so the
@@ -294,6 +518,16 @@ absent or duplicated figure fails the same as one outside the band.
    exact multiset of inputs, reordered), so any divergence is a bug in the
    clustered merge, and the differential harness is what proves the
    reordering-only claim end to end.
+5. **A missing or malformed clustering bound always reads the object.** A
+   targeted test constructs a part whose `clustering_min`/`clustering_max` is
+   absent, and a second case where it is present but fails to decode against
+   its declared type, and asserts the resolve path issues a data GET for the
+   part under a narrow-window predicate on that column in both cases -- the
+   fail-open branch actually executing, not merely present in code. The test
+   is demonstrated failing first: run against a deliberately fail-closed stub
+   (one that skips the part when its bound cannot be read) and confirm the
+   GET-count assertion fails there, before trusting the same assertion to
+   guard the real implementation.
 
 ## Alternatives considered
 
@@ -308,3 +542,22 @@ absent or duplicated figure fails the same as one outside the band.
   (decision 6): the EventTime bounds the default path needs already live in the
   commit and part records, and an override key needs only additive proto
   fields. A frozen-format change would be a cost with no benefit here.
+- **Record-level `clustering_min`/`clustering_max`.** Rejected (decision 3):
+  the catalog mints one `SegmentRef` per `CompactionPart`, and a record
+  spanning two disjoint clustering-key ranges has no single min/max that is
+  both correct and excludes anything; only per-part bounds can represent
+  that.
+- **An unpinned `input_set_hash` (today's definition, unchanged) plus a
+  mid-flight clustering-key change.** Rejected (decision 3): the same input
+  set under two different clustering-key values would try to publish two
+  different `parts` bodies under the identical record key, which the
+  commit-record protocol's split-brain rule crashes on -- and because the
+  cause is a durable config change rather than a transient retry, the crash
+  would loop rather than converge.
+- **Splitting a clustered part at merge time so it never spans a retention
+  boundary, or a selective rewrite that trims an expiring L2 object.**
+  Rejected (decision 7) in favor of deferral: both couple the compactor (or a
+  new rewrite path) to the retention frontier for a benefit that only
+  matters at the one hour range a corpus happens to straddle; deferral gets
+  the same correctness with no new mechanism, at the cost of bounded
+  over-retention ADR-0019 already accepts elsewhere.
