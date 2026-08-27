@@ -162,6 +162,13 @@ where
     /// a caller whose success and error paths disagree (one counts the miss,
     /// the other returns before any accounting) makes a faulted GET count
     /// differently than a served miss, the exact divergence #656 tracks.
+    ///
+    /// The tier metrics are a separate question from that query-level choice.
+    /// A RAM miss and a disk miss are recorded BEFORE the upstream fetch is
+    /// attempted, so on a faulted fetch both are already counted and
+    /// `ram_metrics`/`disk_metrics` include them. A consumer reading those
+    /// counters is seeing tier lookups, not served requests, and must not read
+    /// a faulted GET as a zero-miss cache operation.
     pub async fn get_or_fetch<F, Fut>(
         &self,
         key: CacheKey,
