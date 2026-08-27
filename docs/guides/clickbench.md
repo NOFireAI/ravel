@@ -124,8 +124,11 @@ assembled *from*, not how many rows in total each shard receives per batch, so
 the ~8192-rows-per-shard floor above is unchanged. Raising `--shards` still
 means raising `--batch-rows` to match, regardless of `--read-cursors`.
 
-`--target-bytes` is the other object-size lever, and unlike `--batch-rows` its
-memory cost is flat. At the default `1` a shard's slice of a batch flushes as
+`--target-bytes` is the other object-size lever, and unlike `--batch-rows` it
+does not multiply Arrow batch memory. It is not free, though: a larger target
+means each active shard holds a larger *encoded* buffer until it flushes, so
+total encoded-buffer memory scales with the target times the shard count. What
+stays bounded is the Arrow side, which is what made `--batch-rows` expensive. At the default `1` a shard's slice of a batch flushes as
 its own object the moment it is written: one object per involved shard per
 batch, `--batch-rows` sets its size, no buffer lingers. Any larger value is a
 byte target the shard accumulates *encoded* records toward across several
