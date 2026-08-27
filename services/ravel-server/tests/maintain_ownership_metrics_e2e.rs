@@ -248,22 +248,20 @@ async fn two_maintain_workers_reach_and_report_full_ownership_on_real_metrics() 
     );
 
     // A fresh discovery cycle must run under the now-converged live set
-    // before `units_owned` reflects the final partition; the maintenance
-    // interval is 1s, so this comfortably waits for one.
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
-    // A single scrape pair can race `run_discovery_cycle`'s
-    // `set_units_owned(0)`-then-accumulate window (maintain.rs): a scrape
-    // landing between one worker's reset and its tenant loop finishing sees
-    // a transient undercount. Poll a short, bounded number of times rather
-    // than lengthening the fixed sleep above -- the reset window is a few
-    // microseconds, so this almost always succeeds on the first scrape and
-    // only retries across a genuine race.
+    // before `units_owned` reflects the final partition (the maintenance
+    // interval is 1s), and a single scrape pair can also race
+    // `run_discovery_cycle`'s `set_units_owned(0)`-then-accumulate window
+    // (maintain.rs): a scrape landing between one worker's reset and its
+    // tenant loop finishing sees a transient undercount. Both are covered by
+    // polling to the same total window this used to spend as a fixed 3s sleep
+    // plus a shorter poll. A fixed sleep in front of a bounded poll only
+    // lengthens the test: it cannot make a slow discovery cycle arrive, and
+    // the poll already tolerates one.
     let expected_total = u64::from(SHARD_COUNT) * 3;
     let mut owned_a = 0;
     let mut owned_b = 0;
     let mut settled = false;
-    for _ in 0..25 {
+    for _ in 0..40 {
         let body_a = scrape(&client, &base_a).await;
         let body_b = scrape(&client, &base_b).await;
         owned_a = sample_value(&body_a, "ravel_maintain_units_owned{mode=\"maintain\"}")

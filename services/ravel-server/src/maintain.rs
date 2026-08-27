@@ -2193,9 +2193,18 @@ mod tests {
         // Two replicas, each with the default membership/timing. A single clock
         // reading for both heartbeats keeps both fresh within the liveness
         // window.
+        //
+        // Both process ids are pinned, for the reason [`PINNED_WORKER_ID`]
+        // records: rendezvous ownership is a pure function of the process id,
+        // so with two random ids the split this test is named for is a draw,
+        // not a fact. All 8 shards land on one replica one run in 256, and the
+        // old draw-independent assertions below (each shard owned by exactly
+        // one of the two, the two memos summing to the unit count) all still
+        // hold on that draw while proving nothing about partitioning. Pinned,
+        // the split itself is asserted.
         let now = 1_000 * TEST_NS_PER_HOUR;
-        let a = WorkerSet::with_defaults(now);
-        let b = WorkerSet::with_defaults(now);
+        let a = WorkerSet::with_defaults(now).with_process_id(PINNED_WORKER_ID);
+        let b = WorkerSet::with_defaults(now).with_process_id(PINNED_PEER_ID);
         a.write_heartbeat(&store, now).await.expect("a heartbeat");
         b.write_heartbeat(&store, now).await.expect("b heartbeat");
 
@@ -2209,8 +2218,8 @@ mod tests {
 
         // Ownership is computed identically by both, and every unit is owned by
         // exactly one replica (disjoint and complete).
-        let mut owned_by_a = 0u32;
-        let mut owned_by_b = 0u32;
+        let mut a_shards = Vec::new();
+        let mut b_shards = Vec::new();
         for shard in 0..SHARDS {
             let a_owns = a.owns_unit(&live_a, &tenant, Signal::Metrics, shard);
             let b_owns = b.owns_unit(&live_b, &tenant, Signal::Metrics, shard);
@@ -2219,11 +2228,28 @@ mod tests {
                 "shard {shard} must be owned by exactly one of the two replicas"
             );
             if a_owns {
-                owned_by_a += 1;
+                a_shards.push(shard);
             } else {
-                owned_by_b += 1;
+                b_shards.push(shard);
             }
         }
+        // The exact split the two pinned ids produce under (acme, Metrics).
+        // Any other partition, including one that still leaves both replicas
+        // non-empty, means `unit_key` or the weight function changed and the
+        // ids must be re-pinned deliberately; the same expected split is
+        // asserted in `reseed_and_seeding_track_genuine_ownership_handoff`.
+        assert_eq!(
+            a_shards,
+            [1, 2, 3, 4, 5, 7],
+            "PINNED_WORKER_ID's rendezvous share under (acme, Metrics) moved"
+        );
+        assert_eq!(
+            b_shards,
+            [0, 6],
+            "PINNED_PEER_ID's rendezvous share under (acme, Metrics) moved"
+        );
+        let owned_by_a = a_shards.len() as u32;
+        let owned_by_b = b_shards.len() as u32;
         assert_eq!(owned_by_a + owned_by_b, SHARDS, "every unit is owned");
 
         // Run both replicas' ticks over the same tenant, each with its own cold
