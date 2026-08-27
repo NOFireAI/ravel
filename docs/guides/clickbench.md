@@ -140,7 +140,7 @@ batch is buffered whole (measured on issue #801: 6x the batch rows reached
 one partially-filled shard buffer per shard. For reference, the default load
 geometry at `--batch-rows 65536` over 100M rows wrote 8424 objects of 1.32MB
 each: 16,850 PUTs during the load and an 8424-GET floor on every query
-afterwards. `IngestConfig`'s own default target is 8MiB.
+afterward. `IngestConfig`'s own default target is 8MiB.
 
 The trade is ack timing, not durability. A Strict write's ack is still sent
 only after that flush's data object and commit record are published, so an ack
