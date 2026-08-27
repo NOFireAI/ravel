@@ -384,7 +384,7 @@ cargo run -p ravel-bench --features sql-latency --bin sql_latency_bench -- \
   data does not fall in) or a wrong tenant is therefore loud, not a table of
   `0 objects, 0 rows` statements that all "passed" in a few milliseconds.
 
-#### CPU flamegraph pass (use `--runs 1`)
+#### CPU flamegraph pass (use `--runs 1`, and read the concurrency caveat below)
 
 To capture a CPU flamegraph of the corpus, build with `--features
 sql-latency,profiling` and set `RAVEL_BENCH_PROFILE_SVG` to the output path.
@@ -408,16 +408,65 @@ sampler and not usable anyway. Take latency from a separate unprofiled `--runs
 3` pass, and read the flamegraph for CPU attribution only. See
 `crates/ravel-bench/src/profiling.rs` for the mechanism.
 
-The same signal-safety hazard also fired once the corpus's logs scan lane ran
-its segment prunes and scan partitions concurrently, segfaulting even at
-`--runs 1` (issue #680). To keep the exposure down, the query lanes
-(`sql_latency_bench`, `query_latency_bench`) now sample at 199 Hz rather than
-the ingest lane's 997 Hz; this is the configuration the in-process sampler is
-known to survive on the ClickBench corpus. It is still a probabilistic hazard,
-not a proof of safety: if a profiled query run faults on your host, do not raise
-the rate. Fall back to `perf record --call-graph dwarf` on the box, which
-unwinds out of process instead of inside the target's signal handler; the load
-and query flamegraphs on issue #680 were produced that way.
+**The real hazard is thread count and duration, not `--runs`.** The same
+signal-safety hazard also fired once the corpus's logs scan lane ran its
+segment prunes and scan partitions concurrently, segfaulting even at
+`--runs 1` (issue #680), and fresh field evidence on the `ravel-cli load`
+path (same box, same corpus, `--pipeline-depth 4 --max-inflight-flushes 4`,
+`--runs` fixed at 1 throughout) crashed a profiled long single run at 720s
+with 4.94 cores busy, while an otherwise-identical profiled run that stayed
+at 2.33 cores busy survived 4,466s. `--runs > 1` is refused because it is one
+easy way to reach many concurrent unsafe unwinds; it is not the only way, and
+a single long run at high thread-level concurrency (many worker threads busy
+for a long time, which any fast-load or fast-query configuration produces)
+reaches the same hazard with `--runs 1` and no refusal to catch it. Do not
+read "the bench let my `--runs 1` pass run" as "this configuration is safe to
+profile in-process."
+
+To reduce exposure, every profiled bench label now samples at 199 Hz rather
+than the previous 997 Hz (the 997 Hz rate was kept for the ingest lane only
+because its measured region was believed to be sequential; it is not --
+`ingest_bench`'s write loop spawns one tokio task per batch with no bound on
+how many are in flight, so raising `--points-per-sec` or
+`--max-inflight-flushes` raises real concurrent thread count the same way
+`--pipeline-depth`/`--max-inflight-flushes` did in the field evidence above).
+199 Hz lowers the odds of a tick landing in pprof's async-signal-unsafe
+unwind window; it does not close it. It is still a probabilistic hazard, not
+a proof of safety: if a profiled run faults on your host, do not raise the
+rate further, and do not read a clean run as proof the configuration is safe.
+
+**For a fast-load or fast-query configuration, do not use the in-process
+sampler at all.** Use `perf record` on the host instead: it samples from
+outside the target process (via the kernel's PMU/timer infrastructure) and
+never runs an unwinder inside the profiled process's own signal handler, so
+this hazard does not apply to it.
+
+```sh
+# Run the bench (or ravel-cli load) unprofiled, under perf, at the real
+# concurrency you want a flamegraph for:
+perf record --call-graph dwarf -o /tmp/sql_latency.perf.data -- \
+cargo run -p ravel-bench --features sql-latency --bin sql_latency_bench -- \
+  --tenant clickbench --store s3 \
+  --corpus benchmarks/clickbench/hits.corpus.json \
+  --runs 3 --compaction pre --window-hours 200000
+
+# Convert the perf capture into the same kind of SVG flamegraph the
+# in-process sampler writes:
+perf script -i /tmp/sql_latency.perf.data \
+  | inferno-collapse-perf \
+  | inferno-flamegraph > /tmp/sql_latency.svg
+```
+
+`--call-graph dwarf` is the default recommendation here because this
+workspace does not build with forced frame pointers (`--call-graph fp` would
+need `-C force-frame-pointers=yes` in `.cargo/config.toml`). `inferno-collapse-perf`
+and `inferno-flamegraph` come from the `inferno` crate's `cargo install
+inferno --features cli` (the same crate `pprof`'s own `flamegraph` feature
+uses internally to render its SVG), so the output format and how you read it
+is unchanged; only how the samples were collected differs. This path removes
+`--runs > 1`'s refusal too, since perf carries none of the in-process hazard:
+run it at whatever `--runs` and concurrency setting you actually want to
+measure.
 
 ### How to read the report
 
