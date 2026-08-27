@@ -311,6 +311,27 @@ enum Command {
         /// to 2. Must be at least 1; 0 is rejected.
         #[arg(long, default_value_t = ravel_cli::load::DEFAULT_DECODE_QUEUE_BATCHES)]
         decode_queue_batches: usize,
+        /// Bytes a shard's buffer accumulates before it flushes as one RLOG
+        /// object (issue #801). At the default `1` every batch flushes as its
+        /// own object the moment it is written: one object per involved shard
+        /// per batch, `--batch-rows` sets its size, and no buffer lingers. A
+        /// larger value lets a shard accumulate ENCODED records across several
+        /// batches until the target is reached, so objects grow without any
+        /// more Arrow batches being held in memory -- unlike raising
+        /// `--batch-rows`, whose memory cost is linear because each batch is
+        /// buffered whole.
+        ///
+        /// The trade is ack timing, not durability. A Strict write's ack is
+        /// still sent only after its records' object and commit record are
+        /// published, so an ack always means durable. But above `1` the flush
+        /// that answers a batch's ack may be triggered by a LATER batch, so
+        /// that ack now waits for one; a buffer that never reaches the target
+        /// waits for the router's wall-clock age trigger instead
+        /// (`max_flush_delay`, 2s). Set `--pipeline-depth` to at least the
+        /// number of batches that accumulate into one flush, or every flush
+        /// waits out that timer. `0` is rejected.
+        #[arg(long, value_name = "BYTES", default_value_t = ravel_cli::load::DEFAULT_TARGET_BYTES)]
+        target_bytes: usize,
     },
 }
 
@@ -1380,6 +1401,7 @@ async fn main() -> anyhow::Result<()> {
             pipeline_depth,
             max_inflight_flushes,
             decode_queue_batches,
+            target_bytes,
         } => {
             let profile = ravel_cli::cli_profiling::ProfileSession::from_env("ravel-cli-load");
             let result = ravel_cli::load::run(
@@ -1393,6 +1415,7 @@ async fn main() -> anyhow::Result<()> {
                 pipeline_depth,
                 max_inflight_flushes,
                 decode_queue_batches,
+                target_bytes,
                 now_ns()?,
             )
             .await;
