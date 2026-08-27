@@ -202,7 +202,12 @@ is resolved against the object's own FIELD_DIR
   to qualify: a query with no prune arm is skip-decidable too, but its plan read
   already fetches only the ts-candidate blocks and warms exactly the extents the
   subset opens stripe, so planning it this way would trade one shared read for
-  N per-partition ones over the same bytes.
+  N per-partition ones over the same bytes. This branch's `fetch_plan_sections`
+  read is wrapped in its own `page_fetch` span (#782), recording the probe and
+  section GET count and `BlockRangeStats::block_bytes_fetched` on it, the same
+  way `plan_segment_fast` and `plan_segment_block_stats` already do — before
+  #782 this branch's read was the one plan-phase GET on the query path with no
+  span at all, invisible to a trace over a statement that took it.
 
 A predicate the skip index cannot decide — a `has_word`/text arm (bloom prunes
 it only at decode), an `attrs['k']='v'` POSTINGS equality, a stream filter —
@@ -1685,6 +1690,32 @@ many bytes the fetch brought in, and how many of the bytes already resident
 the decode actually needed. The instrument predates the version-4 fetcher and
 was what measured whether block-level pruning alone captured enough before
 PAGE_DIR shrank the wire fetch to columns.
+
+The predicate-free full-window whole-segment fast path (#693 part 3, above)
+is the one shape where the two axes never move together, by design (#790).
+It issues exactly one whole-object `GetRange::Full` GET per segment
+regardless of projection -- that request count is the fast path's entire
+reason to exist, and #790 does not change it -- so `page_bytes_fetched`
+always equals the object's full stored page bytes, on every projection.
+What #790 fixed is `page_bytes_decoded`: `scan_whole_accounted_with_tenant`
+already threaded the caller's `ColumnSelection` into the same
+`decode_v4_block` page-level skip every other read path uses, so a one-column
+scan (`SELECT ts, body FROM logs`, the report's own statement shape) was
+already decoding only that column's pages on a version-4 object -- but
+nothing pinned it, so the fast path's decode-time narrowing had no regression
+coverage and could have silently regressed to decoding every page without
+any test failing. `narrow_projection_decodes_only_wanted_columns`
+(`crates/ravel-query/src/log_fetcher.rs`) now pins it: a one-column
+projection over a 6-block, 8-column-per-block fixture decodes exactly 3
+pages per block (`ts`, `stream_ref`, `body`) against 8 for
+`ColumnSelection::all()` on the same object, and the difference matches
+`pages_skipped` exactly. A user observes the effect in `pages_decoded`/
+`page_bytes_decoded` on `ScanStats` (`EXPLAIN ANALYZE`'s per-partition page
+counters) and in reduced peak decode memory, never in request count or wire
+bytes -- those stay exactly where the #693-part-3 fast path already put them.
+Reachable from any predicate-free, fully-contained, narrow-projection
+statement large enough to take the fast path (`SELECT ts, body FROM logs`
+included).
 
 The per-query DataFusion memory pool now bounds concurrently-held scan memory:
 the reservation grows when a decoded block and the batch built from it are held
