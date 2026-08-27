@@ -16,7 +16,10 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use ravel_sql::{GROUP_VALUES_CEILING_COMPENSATION, compensated_group_values_ceiling};
+use ravel_sql::{
+    GROUP_VALUES_CEILING_COMPENSATION, GROUP_VALUES_RESIZE_TRANSIENT_FACTOR,
+    compensated_group_values_ceiling,
+};
 
 /// Bytes a `GroupValues` slot occupies for an Int64 group key: the 8-byte
 /// value plus the 8-byte group index the hashbrown table stores. This is the
@@ -104,4 +107,26 @@ fn the_compensation_factor_is_the_documented_product_and_bounds_the_ratio() {
         "the factor {GROUP_VALUES_CEILING_COMPENSATION} must strictly exceed the measured \
          steady under-count ratio {measured_ratio}"
     );
+}
+
+/// The ceiling must bound the modelled peak at EVERY table size, not only
+/// asymptotically. A purely multiplicative compensation does not: the reported
+/// figure omits a fixed control-group allocation that does not scale, so at 8
+/// buckets the real size is 152 against a reported 112, the modelled 1.5x peak
+/// is 228, and 112 * 1.83 is 205. Every table below roughly 512 buckets was
+/// under-bounded. Remove the fixed-overhead term from
+/// `compensated_group_values_ceiling` and this goes red at the first size.
+#[test]
+fn the_compensated_ceiling_bounds_small_tables_too() {
+    for buckets in [8usize, 16, 32, 64, 128, 256, 512] {
+        let reported = reported_size(buckets);
+        let modelled_peak =
+            (real_size(buckets) as f64 * GROUP_VALUES_RESIZE_TRANSIENT_FACTOR).ceil() as usize;
+        let ceiling = compensated_group_values_ceiling(reported);
+        assert!(
+            ceiling >= modelled_peak,
+            "buckets={buckets}: ceiling {ceiling} must bound the modelled peak {modelled_peak}              (reported {reported}, real {})",
+            real_size(buckets)
+        );
+    }
 }

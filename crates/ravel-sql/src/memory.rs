@@ -328,8 +328,6 @@ impl MemoryPool for TenantDelegatingPool {
                 self.query_limit
             ))
         })?;
-        self.accounting
-            .observe_intermediate_bytes(query_total as u64);
         if let Err(used) = self.tenant.try_grow(additional) {
             // Roll the query reservation back so a tenant-budget failure
             // leaves nothing reserved on either budget.
@@ -340,6 +338,12 @@ impl MemoryPool for TenantDelegatingPool {
                 self.tenant.limit()
             )));
         }
+        // Observed only once BOTH budgets have granted the growth. Recording it
+        // before the tenant check leaves a peak for bytes that no successful
+        // reservation ever held, because the query reservation above is rolled
+        // back on a tenant refusal: the peak would outlive the allocation.
+        self.accounting
+            .observe_intermediate_bytes(query_total as u64);
         Ok(())
     }
 

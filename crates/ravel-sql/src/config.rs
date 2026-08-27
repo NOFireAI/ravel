@@ -80,7 +80,25 @@ pub const GROUP_VALUES_CEILING_COMPENSATION: f64 =
 /// fact allocate up to 1.83x that and overrun (issue #740, findings 2 and 3).
 pub fn compensated_group_values_ceiling(reported_size: usize) -> usize {
     ((reported_size as f64) * GROUP_VALUES_CEILING_COMPENSATION).ceil() as usize
+        + GROUP_VALUES_FIXED_OVERHEAD_CEILING
 }
+
+/// Control-group bytes hashbrown allocates alongside the buckets that
+/// `GroupValues::size()` counts in neither its capacity nor its entry width.
+/// Unlike the per-bucket control byte, which is a fixed fraction of the
+/// reported figure and is therefore covered by the multiplicative
+/// compensation, this part does not scale, so a purely multiplicative ceiling
+/// under-bounds every small table.
+const GROUP_VALUES_FIXED_OVERHEAD_BYTES: usize = 16;
+
+/// [`GROUP_VALUES_FIXED_OVERHEAD_BYTES`] carried through the same resize
+/// transient the multiplicative factor models, so the sum is an upper bound at
+/// every table size rather than only asymptotically. Without it the ceiling is
+/// below the modelled peak for every table under roughly 512 buckets: at 8
+/// buckets the reported figure is 112, the real allocation 152, the modelled
+/// peak 228, and the multiplicative ceiling alone returns 205.
+const GROUP_VALUES_FIXED_OVERHEAD_CEILING: usize =
+    (GROUP_VALUES_FIXED_OVERHEAD_BYTES as f64 * GROUP_VALUES_RESIZE_TRANSIENT_FACTOR) as usize + 1;
 
 /// Per-query ravel-sql configuration: the shared engine budgets plus the
 /// SQL-only per-query memory-pool byte budget.
