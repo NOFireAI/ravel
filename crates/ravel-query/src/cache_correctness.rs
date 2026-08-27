@@ -32,7 +32,11 @@ use ravel_logseg::writer::ObjectIdentity;
 use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
 use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
 use ravel_object_store::memory::MemoryStore;
-use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions};
+use ravel_object_store::{
+    Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
+    PageToken, PutOptions, PutOutcome, StoreError,
+};
+use ravel_promql::LabelMatcher;
 use ravel_segment::{
     FooterOutcome, HistogramCounts, HistogramSample, HistogramSpan, HistogramValue, IngestBounds,
     ReaderLimits, ResetHint, SegmentIdentity, SegmentWriter, SeriesInputV3, SeriesValues,
@@ -1396,5 +1400,312 @@ async fn block_range_peek_then_defer_records_one_miss_per_logical_miss() {
         "the tiered tier must record exactly one miss per logical cache miss (peek-then-defer), \
          not two: a second miss layered on the deferred fetch would inflate this above the \
          RAM-only oracle of {oracle_misses}"
+    );
+}
+
+// ---- #811: footer-suffix reads are cache-eligible ----------------------
+
+/// Wraps a `MemoryStore` and records the exact `GetRange` of every `get()`
+/// call, so a test can distinguish *which* bytes a fetcher re-requested
+/// instead of only counting GETs in aggregate. The RSEG footer trailer sits
+/// at the very end of the object (docs/segment-format.md), so a range whose
+/// `end` equals the object's total size is a footer-opening read; every
+/// other range this fetcher issues (catalog sections, value pages) lands
+/// strictly before that tail.
+#[derive(Default)]
+struct RangeLog {
+    calls: std::sync::Mutex<Vec<GetRange>>,
+}
+
+impl RangeLog {
+    fn snapshot(&self) -> Vec<GetRange> {
+        self.calls.lock().expect("range log lock").clone()
+    }
+
+    /// Count of logged calls whose range's end lands exactly on
+    /// `total_size`: the footer trailer's fixed position, regardless of
+    /// whether the range was requested as `Suffix` (no explicit end) or as
+    /// an absolute `Range`/`Full`.
+    fn footer_range_calls(&self, total_size: u64) -> usize {
+        self.calls
+            .lock()
+            .expect("range log lock")
+            .iter()
+            .filter(|r| match r {
+                GetRange::Full => true,
+                GetRange::Range(_, end) => *end == total_size,
+                GetRange::Suffix(_) => true,
+            })
+            .count()
+    }
+}
+
+struct RangeLoggingStore {
+    inner: MemoryStore,
+    log: Arc<RangeLog>,
+}
+
+impl RangeLoggingStore {
+    fn new(inner: MemoryStore) -> (Self, Arc<RangeLog>) {
+        let log = Arc::new(RangeLog::default());
+        (
+            RangeLoggingStore {
+                inner,
+                log: Arc::clone(&log),
+            },
+            log,
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStoreBackend for RangeLoggingStore {
+    async fn put(
+        &self,
+        key: &str,
+        data: Bytes,
+        opts: PutOptions,
+    ) -> Result<PutOutcome, StoreError> {
+        self.inner.put(key, data, opts).await
+    }
+
+    async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+        self.log.calls.lock().expect("range log lock").push(range);
+        self.inner.get(key, range).await
+    }
+
+    async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+        self.inner.head(key).await
+    }
+
+    async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
+        self.inner.list(prefix, page).await
+    }
+
+    async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+        self.inner.list_delimited(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.inner.delete(key).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+}
+
+/// Forces the ranged (footer-suffix + `NeedRange` chase) path regardless of
+/// this fixture's actual size, the same way
+/// `corrupted_cache_hits_never_produce_wrong_results_ranged_path` does:
+/// `whole_object_threshold(0)` disables the whole-object short-circuit, and
+/// `suffix_len(64)` is deliberately smaller than the footer proto, so the
+/// first probe always needs a `NeedRange` chase.
+fn ranged_footer_fetcher(backend: Arc<dyn ObjectStoreBackend>) -> SegmentFetcher {
+    SegmentFetcher::new(backend)
+        .with_whole_object_threshold(0)
+        .with_suffix_len(64)
+}
+
+/// #811: a footer probe that used to be `GetRange::Suffix` (uncacheable, no
+/// absolute start to key a cache entry on) is now an absolute `GetRange`,
+/// routed through the same cache every other ranged GET uses. A second,
+/// *different* query over the same segment (scalar matcher, then a
+/// histogram matcher selecting disjoint pages) must not reissue either of
+/// the footer-opening GETs the first query already paid for, while it still
+/// issues fresh GETs for the pages only the second query needs -- proving
+/// the footer specifically is cached, not that the whole query happened to
+/// repeat.
+#[tokio::test]
+async fn footer_probe_and_needrange_chase_are_cache_hits_on_a_second_distinct_query() {
+    let (store, seg_ref) = write_rseg_segment().await;
+    let bytes = store
+        .get(&seg_ref.data_object_key, GetRange::Full)
+        .await
+        .expect("read back segment bytes")
+        .data;
+    let total_size = seg_ref.object_size;
+
+    let inner = MemoryStore::new();
+    inner
+        .put(&seg_ref.data_object_key, bytes, PutOptions::default())
+        .await
+        .expect("seed logging store");
+    let (logging_store, log) = RangeLoggingStore::new(inner);
+    let backend: Arc<dyn ObjectStoreBackend> = Arc::new(logging_store);
+
+    let limits = CacheLimits::new(16 * 1024 * 1024, 100, 16 * 1024 * 1024);
+    let cache = Arc::new(Cache::new(limits));
+    let fetcher = ranged_footer_fetcher(backend).with_cache(cache);
+
+    // First query: scalar matcher on `chaotic_metric`. A genuine cache miss,
+    // so it must pay at least the footer probe plus its `NeedRange` chase.
+    let scalar_matchers = [LabelMatcher::equal("__name__", "chaotic_metric")];
+    fetcher
+        .fetch_soa(RSEG_TENANT, &seg_ref, &scalar_matchers)
+        .await
+        .expect("first query, scalar path");
+    let footer_calls_after_first = log.footer_range_calls(total_size);
+    let total_calls_after_first = log.snapshot().len();
+    assert_eq!(
+        footer_calls_after_first,
+        2,
+        "the 64-byte suffix probe is too small for this segment's footer, so opening it must \
+         take exactly two footer-range GETs (the probe, then the NeedRange chase), got {:?}",
+        log.snapshot()
+    );
+
+    // Second query: a disjoint matcher on the histogram series, so it needs
+    // pages the first query never touched, but the same footer.
+    let hist_matchers = [LabelMatcher::equal("__name__", "hist_metric")];
+    fetcher
+        .fetch_histograms(RSEG_TENANT, &seg_ref, &hist_matchers)
+        .await
+        .expect("second query, histogram path");
+    let footer_calls_after_second = log.footer_range_calls(total_size);
+    let total_calls_after_second = log.snapshot().len();
+
+    assert_eq!(
+        footer_calls_after_second,
+        footer_calls_after_first,
+        "a second, different query over the same segment must add zero footer-range GETs \
+         (both the probe and the chase are cache hits); log: {:?}",
+        log.snapshot()
+    );
+    assert!(
+        total_calls_after_second > total_calls_after_first,
+        "the second query selects pages the first one never fetched, so it must still issue \
+         new (non-footer) store GETs -- a total of zero here would mean this test failed to \
+         exercise a genuinely different query, not that caching worked"
+    );
+}
+
+/// Same shape as the accounting proof above
+/// (`cache_accounting_counts_hits_misses_and_bytes_without_double_counting_s3_requests`),
+/// but forced onto the ranged footer-suffix path instead of the
+/// whole-object path that test's small fixture takes by default: before
+/// #811 a `GetRange::Suffix` footer probe always bypassed the cache
+/// (`guarded_get`'s `cacheable_range` match returns `None` for `Suffix`),
+/// so this exact scenario never even reached `cached_get` on the first
+/// GET. `matches_series` is `matchers.iter().all(...)`, vacuously true for
+/// an empty matcher slice, so an empty matcher set selects every series,
+/// not none; a matcher naming a `__name__` value absent from the fixture
+/// selects zero series instead, so no page GET follows the catalog decode
+/// and the only work either call does is opening the segment (footer
+/// probe, chase, and the catalog sections `decode_selected` always reads
+/// to know nothing matched). Repeating the identical query isolates that
+/// cost cleanly.
+#[tokio::test]
+async fn footer_only_query_hits_add_zero_s3_requests_and_zero_bytes() {
+    let (store, seg_ref) = write_rseg_segment().await;
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+    let limits = CacheLimits::new(16 * 1024 * 1024, 100, 16 * 1024 * 1024);
+    let cache = Arc::new(Cache::new(limits));
+    let fetcher = ranged_footer_fetcher(backend).with_cache(cache);
+    let no_match = [LabelMatcher::equal("__name__", "no_such_metric")];
+
+    let accounting = QueryAccounting::new();
+    fetcher
+        .fetch_soa_accounted(RSEG_TENANT, &seg_ref, &no_match, &accounting)
+        .await
+        .expect("miss: open the segment, match nothing");
+    let after_miss = accounting.snapshot();
+    assert_eq!(
+        after_miss.s3_requests(AccountedOp::Get),
+        3,
+        "opening this segment's footer through the 64-byte ranged probe takes two GETs \
+         (probe, then NeedRange chase), plus one coalesced GET for the LABEL_DICT/SERIES_IDS/ \
+         SERIES_META catalog sections decode_selected always reads; a matcher that selects \
+         zero series still needs the catalog decoded to know that, so that is the whole \
+         query's S3 cost with no page GET behind it"
+    );
+    let requests_after_miss = after_miss.s3_requests(AccountedOp::Get);
+    let bytes_after_miss = after_miss.s3_bytes(AccountedOp::Get);
+
+    fetcher
+        .fetch_soa_accounted(RSEG_TENANT, &seg_ref, &no_match, &accounting)
+        .await
+        .expect("hit: identical query, footer served from cache");
+    let after_hit = accounting.snapshot();
+    assert_eq!(
+        after_hit.s3_requests(AccountedOp::Get),
+        requests_after_miss,
+        "a fully cached footer-open must add zero S3 requests"
+    );
+    assert_eq!(
+        after_hit.s3_bytes(AccountedOp::Get),
+        bytes_after_miss,
+        "a fully cached footer-open must add zero S3 bytes"
+    );
+    assert_eq!(
+        after_hit.cache_hits, 3,
+        "the probe, the chase, and the catalog-sections GET must all register as cache hits"
+    );
+    assert!(
+        after_hit.cache_bytes > 0,
+        "a cache hit must still report the bytes it served, just not as S3 traffic"
+    );
+}
+
+/// #811 deliverable 3: the one call site in scope (`SegmentFetcher::open_segment`)
+/// still takes the old `GetRange::Suffix` path, unconverted, when
+/// `object_size == 0` -- the only representation of "unavailable" this
+/// `u64` field has (every real `SegmentRef` carries the commit/compaction
+/// record's actual size, docs/catalog-and-mvcc.md). That path must still
+/// produce correct results, including a `NeedRange` chase over it: this
+/// pins the same segment decoding identically whether opened through the
+/// absolute-range path (`object_size` known) or the suffix path
+/// (`object_size` absent), and that only `Suffix` ranges are used on the
+/// unavailable-size path -- never a silent, unlogged fallback to something
+/// else.
+#[tokio::test]
+async fn needrange_chase_still_correct_when_object_size_is_unavailable() {
+    let (store, mut seg_ref) = write_rseg_segment().await;
+    let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+
+    let known_size_fetcher = ranged_footer_fetcher(Arc::clone(&backend));
+    let (mut truth, _stats) = known_size_fetcher
+        .fetch_soa(RSEG_TENANT, &seg_ref, &[])
+        .await
+        .expect("baseline fetch with object_size known");
+    truth.sort_by_key(|s| s.series_id.0);
+
+    let inner = MemoryStore::new();
+    let bytes = store
+        .get(&seg_ref.data_object_key, GetRange::Full)
+        .await
+        .expect("read back segment bytes")
+        .data;
+    inner
+        .put(&seg_ref.data_object_key, bytes, PutOptions::default())
+        .await
+        .expect("seed logging store");
+    let (logging_store, log) = RangeLoggingStore::new(inner);
+    let logging_backend: Arc<dyn ObjectStoreBackend> = Arc::new(logging_store);
+
+    seg_ref.object_size = 0;
+    let unknown_size_fetcher = ranged_footer_fetcher(logging_backend);
+    let (mut unknown, _stats) = unknown_size_fetcher
+        .fetch_soa(RSEG_TENANT, &seg_ref, &[])
+        .await
+        .expect("fetch with object_size unavailable must still succeed");
+    unknown.sort_by_key(|s| s.series_id.0);
+
+    assert_eq!(truth.len(), unknown.len());
+    for (a, b) in truth.iter().zip(unknown.iter()) {
+        assert!(soa_bits_eq(a, b));
+    }
+
+    let calls = log.snapshot();
+    assert!(
+        calls
+            .iter()
+            .all(|r| matches!(r, GetRange::Suffix(_) | GetRange::Range(..))),
+        "unexpected range kind on the object_size-unavailable path: {calls:?}"
+    );
+    assert!(
+        matches!(calls.first(), Some(GetRange::Suffix(64))),
+        "with object_size unavailable the first GET must stay the old suffix probe, never a \
+         silently fabricated absolute range: {calls:?}"
     );
 }

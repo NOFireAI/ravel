@@ -1012,11 +1012,12 @@ async fn warm_cache_query_records_zero_store_bytes_on_fetch_spans() {
 
 /// Copy of [`DEFAULT_WHOLE_OBJECT_THRESHOLD`] (`fetcher.rs`, 512 KiB), which
 /// `ravel-query` does not re-export. A segment strictly larger than this takes
-/// `open_segment`'s footer-`Suffix` path instead of the whole-object `Full`
-/// path, which is what routes the page bytes through `ensure_ranges`'
-/// `join_all` accumulation rather than resolving them from the one whole-object
-/// buffer. The fixture below asserts its own object clears this bound so the
-/// test can never silently regress onto the whole-object path.
+/// `open_segment`'s footer-tail path (an absolute `Range` when `object_size`
+/// is known, `Suffix` otherwise) instead of the whole-object `Full` path,
+/// which is what routes the page bytes through `ensure_ranges`' `join_all`
+/// accumulation rather than resolving them from the one whole-object buffer.
+/// The fixture below asserts its own object clears this bound so the test can
+/// never silently regress onto the whole-object path.
 const WHOLE_OBJECT_THRESHOLD: u64 = 512 * 1024;
 
 /// ADR-0044 decision 5: the `page_fetch` phase's cache attribution,
@@ -1034,16 +1035,17 @@ const WHOLE_OBJECT_THRESHOLD: u64 = 512 * 1024;
 ///
 /// This fixture is a segment strictly larger than [`WHOLE_OBJECT_THRESHOLD`]
 /// (one series, ~100k high-entropy samples so the value pages do not compress
-/// below raw f64). `open_segment` reads only its 64 KiB footer suffix, so the
+/// below raw f64). `open_segment` reads only its 64 KiB footer tail, so the
 /// page bytes are genuinely missing from `regions` and the subsequent
 /// `page_fetch` runs the real `ensure_ranges` `join_all` loop. Its
 /// `Range`-typed page GETs are cache-eligible, so a warm run serves them from
-/// the ADR-0046 read cache for `{0, 0}` store cost -- but the segment's first
-/// read is a `GetRange::Suffix`, which `guarded_get`'s `cacheable_range` never
-/// routes through the cache, so it crosses the network on every run. Hence the
-/// warm assertions here differ from the whole-object test: the warm `page_fetch`
-/// span records zero store requests and bytes, while the warm query's own
-/// `total_s3_bytes` stays non-zero (the footer suffix), not zero.
+/// the ADR-0046 read cache for `{0, 0}` store cost -- and since #811 the
+/// segment's first read is `GetRange::Range(object_size - suffix_len,
+/// object_size)`, not `GetRange::Suffix`, whenever `object_size` is known (as
+/// it is here, from the commit record `publish_segment` builds), so that read
+/// is cache-eligible too and crosses the network only on the cold run.
+/// Warm assertions here match the whole-object test: both the warm
+/// `page_fetch` span and the warm query's own `total_s3_bytes` are zero.
 ///
 /// A dedicated thread-local `SpanCollector` (installed via `set_default` for the
 /// duration of this test, over the global collector that
@@ -1119,7 +1121,7 @@ async fn warm_cache_page_fetch_span_records_zero_store_bytes_on_ensure_ranges_pa
     assert!(
         object_size > WHOLE_OBJECT_THRESHOLD,
         "fixture object ({object_size} bytes) must exceed the whole-object threshold \
-         ({WHOLE_OBJECT_THRESHOLD} bytes) so open_segment takes the Suffix path"
+         ({WHOLE_OBJECT_THRESHOLD} bytes) so open_segment takes the footer-tail path, not Full"
     );
 
     let recorder = Arc::new(CapturingRecorder::default());
@@ -1192,13 +1194,13 @@ async fn warm_cache_page_fetch_span_records_zero_store_bytes_on_ensure_ranges_pa
         );
         calls[1].0.total_s3_bytes()
     };
-    // Unlike the whole-object test, the warm total is NOT zero: the segment's
-    // first read is a Suffix GET, which is never cache-routed, so the footer
-    // crosses the network on every run.
-    assert!(
-        warm_total_s3_bytes > 0,
-        "the warm query still reads the uncacheable footer suffix, so its total store bytes \
-         must stay non-zero (got {warm_total_s3_bytes})"
+    // Same as the whole-object test: since #811 the segment's first read is
+    // an absolute Range GET (object_size is known here), which is
+    // cache-eligible, so a fully warm run reads nothing from the store.
+    assert_eq!(
+        warm_total_s3_bytes, 0,
+        "the warm query's footer read is now cache-eligible (an absolute Range, not a Suffix), \
+         so its total store bytes must be zero (got {warm_total_s3_bytes})"
     );
 
     // This warm run's page_fetch spans (everything past the cold run's count).
