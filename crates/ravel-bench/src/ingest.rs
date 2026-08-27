@@ -388,6 +388,25 @@ pub struct VisibilityReport {
 }
 
 pub async fn run(config: &IngestBenchConfig) -> Report {
+    run_with_profile(config, || {
+        crate::profiling::ProfileSession::from_env("ingest_bench")
+    })
+    .await
+}
+
+/// [`run`], with the profiling session built by `build_profile` instead of
+/// resolved from [`crate::profiling::PROFILE_ENV`]. `build_profile` is called
+/// at the same point `run` builds its session (immediately after fixture
+/// generation, before the write loop), so the ordering guarantee the module
+/// doc comment below describes holds for both callers. Test seam for
+/// `tests/profiling_ingest_concurrent.rs` (issue #616): arming the sampler for
+/// a test needs `crate::profiling::ProfileSession::to_path`, not
+/// `std::env::set_var` (`unsafe` under the 2024 edition, and process env is
+/// global state that races every other test in the binary regardless).
+pub async fn run_with_profile<F>(config: &IngestBenchConfig, build_profile: F) -> Report
+where
+    F: FnOnce() -> crate::profiling::ProfileSession,
+{
     let store = Arc::clone(&config.store);
 
     let tenant = TenantId::new("bench-tenant");
@@ -469,7 +488,7 @@ pub async fn run(config: &IngestBenchConfig) -> Report {
     // is active we skip all three so the samples attribute to the ingest path
     // alone. A profiling run therefore reports no visibility-lag or
     // depth-occupancy figures by design; drive an unprofiled run for those.
-    let profile = crate::profiling::ProfileSession::from_env("ingest_bench");
+    let profile = build_profile();
     let measure_harness = !profile.is_active();
 
     let ack_deadline = Duration::from_secs(config.ack_timeout_secs);

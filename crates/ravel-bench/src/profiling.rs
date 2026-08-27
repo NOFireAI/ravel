@@ -98,13 +98,17 @@
 //! multiplying the guard's lifetime, which is why sequential runs at the same
 //! sampling rate survived.
 //!
-//! The fix lowers the sampling frequency for the query lanes only, from 997 Hz
-//! to 199 Hz (`QUERY_SAMPLE_HZ`). This is the lever pprof's own documentation
-//! makes available: the signal frequency directly sets how many unsafe unwinds
-//! occur per second of on-CPU time, so cutting it about fivefold cuts the
-//! exposure by the same factor, while 199 Hz (still twice pprof's default of
-//! 99 Hz) keeps the flamegraph dense. The ingest lane keeps 997 Hz because its
-//! measured region was sequential when the crash was observed.
+//! The fix lowered the sampling frequency for the query lanes only, from
+//! 997 Hz to 199 Hz, on the premise that the ingest lane's measured region was
+//! sequential and did not need it. The reframing in the next section shows
+//! that premise does not hold: the ingest lane reaches the same
+//! many-threads-on-CPU shape at ordinary fast-load settings, with no special
+//! flag. The frequency cut is therefore applied to every label now, not just
+//! the ones matching "sql"/"query"; see [`SAMPLE_HZ`] below. This is the lever
+//! pprof's own documentation makes available: the signal frequency directly
+//! sets how many unsafe unwinds occur per second of on-CPU time, so cutting it
+//! about fivefold cuts the exposure by the same factor, while 199 Hz (still
+//! twice pprof's default of 99 Hz) keeps the flamegraph dense.
 //!
 //! Two heavier options were considered and rejected for this task. Switching
 //! pprof to its `frame-pointer` unwinder would sidestep libgcc entirely, but
@@ -122,6 +126,116 @@
 //! When a flamegraph is needed for a workload that still faults under sampling,
 //! `perf record --call-graph dwarf` on the host is the fallback: it unwinds out
 //! of process and does not run inside the target's signal handler.
+//!
+//! # The hazard is thread count and duration, not run count (issue #616, reframed)
+//!
+//! Fresh field evidence narrows the mechanism further than the sections above
+//! did and shows the `--runs > 1` guard does not cover it. Two loads on the
+//! same box, same corpus, same branch head, `--pipeline-depth 4
+//! --max-inflight-flushes 4`, differing only in whether a sampler was armed:
+//! the profiled load segfaulted (exit 139, signal 11) at 720s with 4.94 cores
+//! busy; the unprofiled load completed cleanly at 1,519.75s, 8,424 objects. A
+//! third, earlier profiled load that stayed at 2.33 cores busy survived
+//! 4,466s under the same sampler. `--runs` was 1 in every case: nothing here
+//! repeats a statement or a run, so [`runs_supported_with_profiling`] does not
+//! fire and cannot be extended to fire, because there is no second run to
+//! refuse. What differs across the three is how many threads had an on-CPU,
+//! `SIGPROF`-interruptible stack at once, and for how long -- exactly the two
+//! quantities the mechanism above already names as the drivers of a signal
+//! landing in the async-signal-unsafe unwind window.
+//!
+//! This crate's own ingest lane reaches that same axis without any special
+//! flag. `ingest::run`'s dispatch loop spawns one tokio task per batch as
+//! soon as pacing allows and does not join it before spawning the next; nothing
+//! caps how many `IngestRouter::write` calls are concurrently in flight. A
+//! `#[tokio::main]` binary defaults to a multi-thread runtime, so raising
+//! `--points-per-sec` relative to `--batch-size` (shorter pacing interval, more
+//! outstanding tasks) or `--max-inflight-flushes` (more concurrent flushes per
+//! shard) both raise the number of threads a `SIGPROF` tick can land on mid-
+//! unwind, the same way `--pipeline-depth`/`--max-inflight-flushes` did on the
+//! `ravel-cli load` path that produced the field evidence above. The "the
+//! ingest lane's measured region was sequential" premise the frequency split
+//! below rests on is therefore not a property of the ingest lane in general;
+//! it happened to hold for whatever narrow configuration was profiled when
+//! that premise was written down, and does not hold at the concurrency a
+//! fast-load configuration actually uses. `tests/profiling_ingest_concurrent.rs`
+//! exercises the real `IngestRouter` write path at `--shards 4
+//! --max-inflight-flushes 4` with a small batch size against a high points/sec
+//! rate for exactly this reason.
+//!
+//! Practical consequence: **the profiling lane and the fast-load settings are
+//! mutually exclusive for the in-process sampler.** You can have an in-process
+//! flamegraph, or you can have the configuration that makes the loader faster
+//! (higher `--max-inflight-flushes`, more concurrent tasks in flight), but not
+//! provably both at once. `runs_supported_with_profiling` stays: repeated
+//! statements still multiply how long the guard stays armed and are still
+//! refused for that reason. It does not, and cannot, cover a single long run
+//! at high thread count, which is why this section exists as a separate guard
+//! rail in the module doc rather than a code check: there is no clean flag
+//! value (unlike `--runs > 1`) to refuse this on, only a continuum of
+//! concurrency the mechanism gets worse across.
+//!
+//! # Evaluated and rejected: `framehop-unwinder`
+//!
+//! `pprof` 0.15.0 (the version this workspace pins, and the newest published
+//! to crates.io as of this writing) added an optional `framehop-unwinder`
+//! feature (upstream CHANGELOG, PR tikv/pprof-rs#267): a pure-Rust unwinder
+//! built on the `framehop` crate (the one behind Firefox Profiler's `samply`),
+//! designed specifically to avoid libgcc's `_Unwind_Backtrace`. Its own type
+//! signature documents the intent: `UnwinderNative<Vec<u8>,
+//! MustNotAllocateDuringUnwind>`. This looked like the direct fix for the
+//! mechanism diagnosed above, so it was evaluated, not assumed.
+//!
+//! It is rejected for this workspace: the vendored 0.15.0 source
+//! (`src/backtrace/framehop_unwinder.rs`) initializes its `UNWINDER` static
+//! through `once_cell::sync::Lazy` with no eager construction anywhere in
+//! `ProfilerGuardBuilder::build`, so the first `SIGPROF` tick to reach it -- on
+//! whichever thread gets there first -- runs the real initialization (scanning
+//! loaded modules, building the unwind cache) from inside the signal handler.
+//! That allocates, which is exactly the class of bug this feature exists to
+//! avoid. Upstream confirms this as a real, only-recently-fixed defect:
+//! tikv/pprof-rs#281 tracks it, and tikv/pprof-rs#282 ("framehop: remove the
+//! allocation in signal handle of framehop"), merged 2025-10-15, fixes it by
+//! forcing initialization before the first signal delivery. As of this
+//! writing no `pprof` release contains that commit (a maintainer asked
+//! upstream on 2026-02-15 to "tag a release with this commit", still open);
+//! `cargo` cannot pull an unreleased commit as a normal dependency. Separately,
+//! a reviewer on #282 itself disputed the PR's own comment that a lock
+//! acquisition "should always succeed" during signal delivery, on the grounds
+//! that `SIGPROF` can be delivered concurrently to multiple threads -- the
+//! exact axis this issue is about -- with no visible resolution in that
+//! thread. Adopting `framehop-unwinder` today would trade one documented
+//! signal-unsafe code path (libgcc's unwind) for a different one (an
+//! unreleased fix for a lazy-init allocation, with an open question about
+//! concurrent delivery even after that fix). It is not adopted here, and
+//! should be re-evaluated once a `pprof` release actually contains #282 and
+//! the concurrent-delivery question in its review thread is resolved.
+//!
+//! # External profiler: the actual answer for real concurrency (issue #616)
+//!
+//! Given the above, no in-process configuration of this sampler is provably
+//! safe at the concurrency a fast-load or fast-query configuration produces,
+//! and lowering the frequency (see [`SAMPLE_HZ`]) only lowers the odds of a
+//! tick landing in the unsafe unwind window, it does not close the window.
+//! Stated plainly: this is not fixed, only mitigated, for any run that keeps
+//! more than a handful of threads on-CPU for more than a few seconds.
+//!
+//! The recommended path for a flamegraph at real concurrency is `perf record`
+//! on the host, converted through `inferno`'s CLI tools
+//! (`inferno-collapse-perf` piped into `inferno-flamegraph`) into the same
+//! kind of SVG this module writes. `perf` unwinds from outside the profiled
+//! process (it samples via the kernel's PMU/timer infrastructure and reads the
+//! target's stack out of `/proc/<pid>/mem` or a captured stack snapshot
+//! after the fact), so there is no in-process signal handler for a `SIGPROF`
+//! tick to land inside mid-unwind: the hazard this whole module documents
+//! does not apply to it. See `docs/guides/clickbench.md` for the exact
+//! commands, including the `--call-graph dwarf` vs `--call-graph fp` choice
+//! (`dwarf` is the default recommendation here because this workspace does
+//! not build with forced frame pointers). This module's in-process sampler
+//! remains useful for a quick, low-concurrency look (the default,
+//! `--max-inflight-flushes 1`, sequential settings) where the exposure this
+//! section describes is small; reach for `perf` once the configuration being
+//! profiled is the fast one.
 
 /// Environment variable naming the flamegraph SVG output path. When it is set
 /// and the crate was built with the `profiling` feature, a bench core wraps its
@@ -139,6 +253,15 @@ pub const PROFILE_ENV: &str = "RAVEL_BENCH_PROFILE_SVG";
 /// than segfault partway through a run this refuses the combination up front:
 /// take the flamegraph from `--runs 1` (one execution already fills it) and the
 /// latencies from a separate unprofiled multi-run pass.
+///
+/// This guards run count only. It does not, and cannot, cover the separate
+/// thread-count/duration axis described in the "hazard is thread count and
+/// duration, not run count" section of the module doc: a single `--runs 1`
+/// pass at high concurrency (many worker threads busy for a long time) is
+/// outside what this check refuses, because there is no repeated run for it
+/// to catch. That axis has no equivalent flag-level guard; it is documented,
+/// not code-checked, and mitigated by [`SAMPLE_HZ`] and, for real
+/// concurrency, by using an external profiler instead.
 ///
 /// Pure so the decision is testable without touching the process environment or
 /// arming a real sampler: `profile_requested` is whether a sampler would run
@@ -171,39 +294,28 @@ pub fn profile_requested() -> bool {
     false
 }
 
-/// Sampling frequency in Hz for the ingest lane. 997 (a prime near 1 kHz)
-/// avoids aliasing against any periodic timer in the workload.
+/// Sampling frequency in Hz for every bench label. Originally 997 Hz for the
+/// ingest lane and 199 Hz for the query lanes (`sample_hz_for` picked between
+/// them by matching "sql"/"query" in the label); unified to the lower rate for
+/// every label once the ingest lane turned out to reach the same
+/// many-threads-concurrent shape as the query lanes at ordinary fast-load
+/// settings (see the "hazard is thread count and duration" section of the
+/// module doc, issue #616). 199 is a prime near 200 Hz and still twice
+/// pprof's own default frequency of 99 Hz, so the flamegraph stays dense
+/// while the count of async-signal-unsafe unwinds per second of on-CPU time
+/// drops about fivefold relative to the original 997 Hz. This lowers the odds
+/// of the crash; it does not close the window pprof's unwinder leaves open,
+/// so it is a mitigation, not a fix -- see "External profiler: the actual
+/// answer for real concurrency" above for the path that removes the hazard
+/// rather than narrowing it.
 #[cfg(feature = "profiling")]
-const SAMPLE_HZ: std::os::raw::c_int = 997;
-
-/// Sampling frequency in Hz for the query lanes (`sql_latency_bench`,
-/// `query_latency_bench`). Deliberately lower than the ingest lane; see the
-/// "Concurrent-query segfault" section of the module doc (issue #680). 199 is a
-/// prime near 200 Hz and still twice pprof's own default frequency of 99 Hz, so
-/// the flamegraph stays dense while the count of async-signal-unsafe unwinds per
-/// second of on-CPU time drops about fivefold.
-#[cfg(feature = "profiling")]
-const QUERY_SAMPLE_HZ: std::os::raw::c_int = 199;
+const SAMPLE_HZ: std::os::raw::c_int = 199;
 
 #[cfg(feature = "profiling")]
 mod imp {
     use std::path::PathBuf;
 
-    use super::{PROFILE_ENV, QUERY_SAMPLE_HZ, SAMPLE_HZ};
-
-    /// The query lanes run their statements across many worker threads
-    /// concurrently, and each `SIGPROF` tick unwinds through libgcc, which is
-    /// not async-signal-safe, so more concurrent unwinds per second of
-    /// wall-clock raise the odds of a fault (issue #680). Sample those lanes
-    /// slower. The ingest lane, whose measured region was sequential when the
-    /// crash was observed, keeps the higher rate.
-    fn sample_hz_for(label: &str) -> std::os::raw::c_int {
-        if label.contains("sql") || label.contains("query") {
-            QUERY_SAMPLE_HZ
-        } else {
-            SAMPLE_HZ
-        }
-    }
+    use super::{PROFILE_ENV, SAMPLE_HZ};
 
     /// An active (or inert) profiling session. Created via
     /// [`ProfileSession::from_env`] or [`ProfileSession::to_path`]; call
@@ -244,14 +356,19 @@ mod imp {
         /// environment. Used by the crate's own test and by any caller that has
         /// already resolved an output path.
         pub fn to_path(label: &str, path: PathBuf) -> Self {
-            let hz = sample_hz_for(label);
             match pprof::ProfilerGuardBuilder::default()
-                .frequency(hz)
+                .frequency(SAMPLE_HZ)
                 .blocklist(&["libc", "libgcc", "pthread", "vdso"])
                 .build()
             {
                 Ok(guard) => {
-                    eprintln!("profiling: sampling '{label}' at {hz} Hz");
+                    eprintln!(
+                        "profiling: sampling '{label}' at {SAMPLE_HZ} Hz. This sampler is not \
+                         provably safe under high thread-level concurrency (issue #616); a \
+                         long, many-threads-busy run can still crash it. For a fast-load or \
+                         fast-query configuration, prefer `perf record` on the host instead -- \
+                         see docs/guides/clickbench.md."
+                    );
                     ProfileSession {
                         active: Some(Active {
                             guard,
