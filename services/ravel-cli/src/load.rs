@@ -3877,7 +3877,12 @@ type = "i64"
     /// other PUT and every non-PUT call passes straight through.
     struct FirstPutHoldStore {
         inner: Arc<dyn ObjectStoreBackend>,
-        hold: Duration,
+        /// Hold the first data PUT until the decoder has queued this many
+        /// batches, then snapshot the count. The bounded decode channel is
+        /// what stops the decoder, so this target is reached (and not
+        /// exceeded) as a property of the code rather than of how many
+        /// batches the host managed inside a fixed hold.
+        hold_until_queued: usize,
         queued: Arc<std::sync::atomic::AtomicUsize>,
         first_seen: Arc<std::sync::atomic::AtomicBool>,
         snapshot: Arc<std::sync::Mutex<Option<usize>>>,
@@ -3893,7 +3898,14 @@ type = "i64"
         ) -> Result<ravel_object_store::PutOutcome, ravel_object_store::StoreError> {
             use std::sync::atomic::Ordering;
             if key.contains("/l0/") && !self.first_seen.swap(true, Ordering::SeqCst) {
-                tokio::time::sleep(self.hold).await;
+                // Bounded so a regression that stops the decoder short fails
+                // the assertion on the snapshot rather than hanging the suite.
+                for _ in 0..10_000 {
+                    if self.queued.load(Ordering::SeqCst) >= self.hold_until_queued {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
                 *self.snapshot.lock().expect("snapshot lock") =
                     Some(self.queued.load(Ordering::SeqCst));
             }
@@ -3993,7 +4005,12 @@ type = "i64"
         let snapshot = Arc::new(std::sync::Mutex::new(None));
         let store = Arc::new(FirstPutHoldStore {
             inner: Arc::new(MemoryStore::new()),
-            hold: Duration::from_millis(300),
+            // The channel bound stops the decoder at exactly this many
+            // (1 consumed by the loop + QUEUE_DEPTH buffered), which is also
+            // what the assertions below pin. Holding until the decoder gets
+            // there replaces a fixed 300 ms hold whose outcome was however
+            // many batches the host happened to decode in that window.
+            hold_until_queued: QUEUE_DEPTH + 1,
             queued: Arc::clone(&queued),
             first_seen: Arc::new(AtomicBool::new(false)),
             snapshot: Arc::clone(&snapshot),
