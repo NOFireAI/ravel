@@ -139,6 +139,16 @@ pub enum SealDivergenceError {
         #[source]
         source: prost::DecodeError,
     },
+    #[error(
+        "compaction record at {key} declares input_set_hash {declared} but its own \
+         `inputs` hash to {computed}: the record cannot be trusted to name the L0 entries \
+         it actually superseded"
+    )]
+    CompactionInputSetHashMismatch {
+        key: String,
+        declared: String,
+        computed: String,
+    },
     #[error("rewrite record at {key} is corrupt: {source}")]
     RewriteRecordCorrupt {
         key: String,
@@ -281,6 +291,25 @@ pub async fn verify_seal_divergence(
                         source,
                     }
                 })?;
+                // A compaction record's `inputs` is untrusted stored data
+                // (ADR-0010 §7 discipline, applied here the same way
+                // `verify_commit_key` applies it to a commit record's own
+                // identity fields): recompute the canonical hash from the
+                // record's own `inputs` and refuse to treat them as
+                // superseded unless it matches the record's declared
+                // `input_set_hash`. Without this check a record whose
+                // declared inputs disagree with its hash removes real L0
+                // entries from `ground_truth` below and `verify` reports an
+                // agreement it never established -- the dangerous failure
+                // direction, since it goes quiet instead of loud.
+                let computed = ravel_commit::erasure::compute_compaction_input_set_hash(&rec.inputs);
+                if rec.input_set_hash.as_slice() != computed.as_slice() {
+                    return Err(SealDivergenceError::CompactionInputSetHashMismatch {
+                        key: object.key.clone(),
+                        declared: hex::encode(&rec.input_set_hash),
+                        computed: hex::encode(computed),
+                    });
+                }
                 for input in rec.inputs {
                     superseded.insert((input.writer_id, input.writer_epoch, input.writer_seq));
                 }
@@ -292,6 +321,12 @@ pub async fn verify_seal_divergence(
                         key: object.key.clone(),
                         source,
                     })?;
+                // Unlike the compaction arm above, this needs no separate
+                // input_set_hash check: decode_rewrite already runs
+                // validate_rewrite, which recomputes the hash from the
+                // record's own inputs/superseded_record_key and applied
+                // request ids and rejects a mismatch
+                // (ErasureError::InputSetHashMismatch, erasure.rs:452).
                 let rec = ravel_commit::erasure::decode_rewrite(&got.data).map_err(|source| {
                     SealDivergenceError::RewriteRecordCorrupt {
                         key: object.key.clone(),
@@ -439,6 +474,29 @@ mod tests {
         inputs: &[&ravel_proto::commit::v1::CommitRecord],
         created_unix_ns: i64,
     ) {
+        publish_compaction_with_hash_override(
+            store,
+            tenant,
+            ingest_hour_bucket,
+            inputs,
+            created_unix_ns,
+            None,
+        )
+        .await
+    }
+
+    /// Same as [`publish_compaction`], but lets a test force the stored
+    /// `input_set_hash` to a value that disagrees with the canonical hash of
+    /// `inputs` (`hash_override`), to exercise
+    /// `verify_seal_divergence`'s rejection of a forged compaction record.
+    async fn publish_compaction_with_hash_override(
+        store: &MemoryStore,
+        tenant: &str,
+        ingest_hour_bucket: u32,
+        inputs: &[&ravel_proto::commit::v1::CommitRecord],
+        created_unix_ns: i64,
+        hash_override: Option<[u8; 32]>,
+    ) {
         use ravel_commit::signal;
         use ravel_proto::commit::v1::{CompactionInputIdentity, CompactionPart, CompactionRecord};
 
@@ -451,15 +509,9 @@ mod tests {
                 writer_seq: r.writer_seq,
             })
             .collect();
-        // The exact preimage does not matter for this test, only that the
-        // resulting input_set_hash is 32 bytes (a blake3 digest always is).
-        let mut hasher = blake3::Hasher::new();
-        for id in &input_ids {
-            hasher.update(id.writer_id.as_bytes());
-            hasher.update(&id.writer_epoch.to_le_bytes());
-            hasher.update(&id.writer_seq.to_le_bytes());
-        }
-        let input_set_hash = *hasher.finalize().as_bytes();
+        let input_set_hash = hash_override.unwrap_or_else(|| {
+            ravel_commit::erasure::compute_compaction_input_set_hash(&input_ids)
+        });
         let part_payload = format!("l1-{ingest_hour_bucket}").into_bytes();
         let part_content_hash = *blake3::hash(&part_payload).as_bytes();
         let part = CompactionPart {
@@ -593,6 +645,51 @@ mod tests {
             "the superseded L0 record is excluded from the ground truth"
         );
         assert!(report.orphaned.is_empty());
+    }
+
+    #[tokio::test]
+    async fn forged_compaction_input_set_hash_fails_verify_instead_of_hiding_l0(
+    ) {
+        // Regression for issue #830: a compaction record whose declared
+        // `input_set_hash` does not match a canonical hash of its own
+        // `inputs` must make `verify_seal_divergence` FAIL, not silently
+        // remove the named L0 entry from the ground truth and report a
+        // clean, no-divergence result it never established. Before the
+        // `CompactionInputSetHashMismatch` check existed, this exact setup
+        // returned `Ok(Some(report))` with `report.has_divergence() == false`
+        // and `sealed_record_count == 0` -- the superseded L0 record vanished
+        // from the comparison entirely, and `verify` went quiet instead of
+        // loud.
+        let store = Arc::new(MemoryStore::new());
+        let tenant = "forged-compaction-hash";
+        let now = 600_000 * NS_PER_HOUR;
+        let created = now - SEALED_AGE_NS;
+        let hour = u32::try_from(created / NS_PER_HOUR).expect("fits u32");
+
+        let l0 = publish_segment(store.as_ref(), tenant, 1, created).await;
+        publish_compaction_with_hash_override(
+            store.as_ref(),
+            tenant,
+            hour,
+            &[&l0],
+            created,
+            Some([0x42; 32]),
+        )
+        .await;
+        fold(store.clone(), tenant, now).await;
+
+        let err = verify_seal_divergence(
+            store.as_ref(),
+            &TenantId::new(tenant).hash(),
+            Signal::Metrics,
+        )
+        .await
+        .expect_err("a forged input_set_hash must be a hard error, not a clean report");
+
+        assert!(
+            matches!(err, SealDivergenceError::CompactionInputSetHashMismatch { .. }),
+            "expected CompactionInputSetHashMismatch, got {err:?}"
+        );
     }
 
     #[tokio::test]
