@@ -1034,16 +1034,18 @@ const WHOLE_OBJECT_THRESHOLD: u64 = 512 * 1024;
 ///
 /// This fixture is a segment strictly larger than [`WHOLE_OBJECT_THRESHOLD`]
 /// (one series, ~100k high-entropy samples so the value pages do not compress
-/// below raw f64). `open_segment` reads only its 64 KiB footer suffix, so the
+/// below raw f64). `open_segment` reads only its 64 KiB footer window, so the
 /// page bytes are genuinely missing from `regions` and the subsequent
 /// `page_fetch` runs the real `ensure_ranges` `join_all` loop. Its
 /// `Range`-typed page GETs are cache-eligible, so a warm run serves them from
-/// the ADR-0046 read cache for `{0, 0}` store cost -- but the segment's first
-/// read is a `GetRange::Suffix`, which `guarded_get`'s `cacheable_range` never
-/// routes through the cache, so it crosses the network on every run. Hence the
-/// warm assertions here differ from the whole-object test: the warm `page_fetch`
-/// span records zero store requests and bytes, while the warm query's own
-/// `total_s3_bytes` stays non-zero (the footer suffix), not zero.
+/// the ADR-0046 read cache for `{0, 0}` store cost -- and, since issue #811,
+/// so is the segment's first read: `open_segment` now issues it as an
+/// absolute `Range(object_size - suffix, object_size)` rather than
+/// `GetRange::Suffix`, so `guarded_get`'s `cacheable_range` routes it through
+/// the cache too. A warm run therefore crosses the network zero times, on
+/// both the `segment_open` and `page_fetch` spans and the query's own
+/// `total_s3_bytes`, matching the whole-object test below rather than
+/// differing from it.
 ///
 /// A dedicated thread-local `SpanCollector` (installed via `set_default` for the
 /// duration of this test, over the global collector that
@@ -1177,8 +1179,29 @@ async fn warm_cache_page_fetch_span_records_zero_store_bytes_on_ensure_ranges_pa
     );
     let cold_page_fetch_count = cold_page_fetch.len();
 
-    // Warm run: identical query. The page ranges are now cache-resident; only
-    // the footer suffix still crosses the network.
+    // The cold run's segment_open span must show the footer read as a real
+    // store GET too (issue #811: before this fix it always was, since the
+    // suffix read never cached; now the point is that it stops being one on
+    // the warm run below).
+    let cold_segment_open: Vec<CapturedSpan> = {
+        let completed = collector.completed.lock().expect("completed lock");
+        completed
+            .iter()
+            .filter(|s| s.name == "segment_open")
+            .cloned()
+            .collect()
+    };
+    assert!(
+        cold_segment_open
+            .iter()
+            .any(|s| s.s3_requests.unwrap_or(0) > 0 && s.s3_bytes.unwrap_or(0) > 0),
+        "expected the cold segment_open span to record a real store GET for the footer; \
+         got {cold_segment_open:?}"
+    );
+    let cold_segment_open_count = cold_segment_open.len();
+
+    // Warm run: identical query. Both the footer read and the page ranges are
+    // now cache-resident (issue #811), so nothing crosses the network.
     let (status, body) = call(&app, &uri, Some("secret-warm-pf")).await;
     assert_eq!(status, StatusCode::OK, "warm query failed: {body}");
     assert_eq!(vector_results(&body).len(), 1, "one series expected (warm)");
@@ -1192,14 +1215,46 @@ async fn warm_cache_page_fetch_span_records_zero_store_bytes_on_ensure_ranges_pa
         );
         calls[1].0.total_s3_bytes()
     };
-    // Unlike the whole-object test, the warm total is NOT zero: the segment's
-    // first read is a Suffix GET, which is never cache-routed, so the footer
-    // crosses the network on every run.
-    assert!(
-        warm_total_s3_bytes > 0,
-        "the warm query still reads the uncacheable footer suffix, so its total store bytes \
-         must stay non-zero (got {warm_total_s3_bytes})"
+    // Before issue #811's fix, the segment's first read stayed a
+    // `GetRange::Suffix`, which `guarded_get`'s `cacheable_range` never
+    // routes through the cache, so this total stayed non-zero on every warm
+    // run. It is now an absolute `Range`, so the warm run is fully
+    // cache-served: exactly zero store bytes, matching the whole-object test.
+    assert_eq!(
+        warm_total_s3_bytes, 0,
+        "the warm query must be fully cache-served, including the footer: got \
+         {warm_total_s3_bytes} store bytes"
     );
+
+    // This warm run's segment_open spans (everything past the cold run's
+    // count): the footer read specifically, isolated from page_fetch below.
+    let warm_segment_open: Vec<CapturedSpan> = {
+        let completed = collector.completed.lock().expect("completed lock");
+        completed
+            .iter()
+            .filter(|s| s.name == "segment_open")
+            .skip(cold_segment_open_count)
+            .cloned()
+            .collect()
+    };
+    assert!(
+        !warm_segment_open.is_empty(),
+        "expected a warm-run segment_open span; got none"
+    );
+    for span in &warm_segment_open {
+        assert_eq!(
+            span.s3_requests
+                .expect("segment_open must record s3_requests"),
+            0,
+            "warm-run segment_open span (the footer read) must record zero store requests; a \
+             non-zero value means the footer GET still crossed the network"
+        );
+        assert_eq!(
+            span.s3_bytes.expect("segment_open must record s3_bytes"),
+            0,
+            "warm-run segment_open span (the footer read) must record zero store bytes"
+        );
+    }
 
     // This warm run's page_fetch spans (everything past the cold run's count).
     let warm_page_fetch: Vec<CapturedSpan> = {

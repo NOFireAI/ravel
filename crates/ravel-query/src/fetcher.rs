@@ -652,10 +652,16 @@ impl SegmentFetcher {
     /// does not describe it (ADR-0046 decision 4's amendment). `Full` maps
     /// to the range `(0, seg_ref.object_size)`; the whole object is a valid
     /// sub-range of itself, and its `total_size` is trivially its own
-    /// length, unlike `GetRange::Suffix`. A suffix GET always bypasses the
-    /// cache: `Cache`'s value is bare `Bytes`, with nowhere to carry the
-    /// object's total size a suffix hit would need to fabricate, and total
-    /// size is not otherwise recoverable from a suffix's own byte length.
+    /// length, unlike `GetRange::Suffix`. A `GetRange::Suffix` request
+    /// always bypasses the cache: `Cache`'s value is bare `Bytes`, with
+    /// nowhere to carry the object's total size a suffix hit would need to
+    /// fabricate, and total size is not otherwise recoverable from a
+    /// suffix's own byte length. `open_segment`'s footer read is therefore
+    /// issued as an absolute `Range` whenever `seg_ref.object_size` is
+    /// known (every real `SegmentRef` -- issue #811), so it lands in the
+    /// cache-eligible arm above; `Suffix` only still reaches this function
+    /// through `open_segment`'s `object_size == 0` defensive fallback,
+    /// which real segments never take.
     ///
     /// A cache-routed GET's `expected_etag` check runs, or does not, by
     /// whether the call is a hit or a miss -- these are not the same case.
@@ -960,14 +966,27 @@ impl SegmentFetcher {
             // Size-aware first GET: the commit record already
             // carries the exact object size, so a small object is read whole in
             // one request (its footer, catalog, and pages then all come from that
-            // buffer, never a second probe), while a large one keeps the
-            // footer-suffix read that touches only the tail. `whole_object_threshold
+            // buffer, never a second probe), while a large one reads only the
+            // tail -- as an absolute `Range(object_size - suffix, object_size)`
+            // rather than `GetRange::Suffix`, so it carries the same bytes but is
+            // cache-eligible under `guarded_get`'s existing `Range`/`Full` arm
+            // (issue #811: a suffix GET cannot be cache-keyed by absolute range,
+            // so it used to bypass the cache on every query). `whole_object_threshold
             // == 0` disables the whole-object path.
+            //
+            // `object_size == 0` keeps the old `GetRange::Suffix` fallback: every
+            // real `SegmentRef` carries the commit or compaction record's own
+            // `object_size` field, set by the writer before the segment is
+            // committed, so this is defense against a value that should be
+            // unreachable in production, not a real "unknown size" call site.
             let first_range =
                 if seg_ref.object_size != 0 && seg_ref.object_size <= self.whole_object_threshold {
                     GetRange::Full
-                } else {
+                } else if seg_ref.object_size == 0 {
                     GetRange::Suffix(self.suffix_len)
+                } else {
+                    let suffix = self.suffix_len.min(seg_ref.object_size);
+                    GetRange::Range(seg_ref.object_size - suffix, seg_ref.object_size)
                 };
             let (first, first_cost) = self
                 .guarded_get(seg_ref, tenant_hash, first_range, None, accounting)
