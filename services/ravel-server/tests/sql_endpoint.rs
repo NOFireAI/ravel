@@ -1458,6 +1458,397 @@ async fn an_audit_write_failure_fails_the_query_closed_in_required_mode() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Cost recorded on every exit path (issue #809): a query's actual accounting
+// must reach `state.query_accounting` whether it succeeds, fails, times out,
+// or the request future is dropped mid-flight -- not only on the happy path.
+// ---------------------------------------------------------------------------
+
+/// Like [`build_router_with_sink`], but with a caller-chosen [`SqlConfig`] and
+/// returning the [`QueryAccountingMetrics`] handle so a test can inspect
+/// [`QueryAccountingMetrics::outcome_snapshot`] after driving a request.
+fn build_router_with_config(
+    store: Arc<dyn ObjectStoreBackend>,
+    tokens: HashMap<String, TenantId>,
+    sql_config: SqlConfig,
+) -> (Router, Arc<ravel_server::metrics::QueryAccountingMetrics>) {
+    build_router_with_config_and_deadline(store, tokens, sql_config, Duration::from_secs(30))
+}
+
+/// Like [`build_router_with_config`], but also lets a test set the server's
+/// wall-deadline ceiling. `SqlState::max_deadline`, not
+/// `SqlConfig::engine.deadline`, is what `build_request` clamps a request's
+/// deadline to (`services/ravel-server/src/sql.rs`'s `build_request`); the
+/// wall deadline the HTTP endpoint actually enforces
+/// (`tokio::time::timeout` around `SqlExecutor::execute`,
+/// crates/ravel-sql/src/executor.rs) comes from here, not from the engine
+/// config a caller might expect.
+fn build_router_with_config_and_deadline(
+    store: Arc<dyn ObjectStoreBackend>,
+    tokens: HashMap<String, TenantId>,
+    sql_config: SqlConfig,
+    max_deadline: Duration,
+) -> (Router, Arc<ravel_server::metrics::QueryAccountingMetrics>) {
+    let catalog =
+        Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
+    let executor = SqlExecutor::new(
+        catalog,
+        SegmentFetcher::new(store.clone()),
+        LogSegmentFetcher::new(store.clone()),
+        ravel_sql::SpanSegmentFetcher::new(store.clone()),
+        sql_config,
+        1 << 30,
+    );
+    let query_accounting = Arc::new(ravel_server::metrics::QueryAccountingMetrics::new(
+        std::collections::HashSet::new(),
+    ));
+    let app = router(SqlState {
+        executor: Arc::new(executor),
+        tenant_resolver: Arc::new(StaticBearerTokenResolver::new(tokens)),
+        store,
+        clock: Arc::new(FixedClock),
+        max_deadline,
+        query_accounting: Arc::clone(&query_accounting),
+        query_admission: ravel_query::QueryAdmissionController::shared(
+            ravel_query::QueryConcurrencyLimit::Unlimited,
+        ),
+        audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
+    });
+    (app, query_accounting)
+}
+
+/// The one row in `outcome_snapshot()` matching `status`, or a panic naming
+/// what was there instead -- so a wrong-status regression fails with the
+/// actual rows, not just "not found".
+fn only_outcome_row(
+    query_accounting: &ravel_server::metrics::QueryAccountingMetrics,
+    status: ravel_server::metrics::QueryOutcomeStatus,
+) -> ravel_server::metrics::QueryOutcomeRow {
+    let rows = query_accounting.outcome_snapshot();
+    let matching: Vec<_> = rows.iter().filter(|r| r.status == status).collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "expected exactly one {status:?} row, got: {rows:?}"
+    );
+    *matching[0]
+}
+
+/// A query that reads real objects and then fails must record the actual
+/// bytes it read, not zero. `TooManyBytesScanned` is the one `SqlError`
+/// variant (besides `RequestBudgetExceeded`) that carries an exact figure the
+/// executor measured, so the test proves the recorded figure against a
+/// dynamically-learned baseline rather than a hand-computed magic number: the
+/// baseline run (unbounded budget) and the tripped run read the identical
+/// fixture through the identical query, so their real bytes-scanned totals
+/// must be identical, and the trip fires only after that real fetch
+/// completed (`crates/ravel-sql/src/scan.rs`'s `prepare_partition`, out of
+/// this task's scope, checks the running total once per completed segment
+/// fetch, mirroring the same incremental checkpoint
+/// `ravel_query::segment_admission` uses for PromQL).
+#[tokio::test]
+async fn a_query_that_reads_objects_then_fails_records_the_bytes_it_actually_read() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    publish_segment(store.as_ref(), &tenant, 0, "m", &[(100, 1.0), (200, 2.5)]).await;
+    let query = "SELECT ts, value FROM samples ORDER BY ts";
+
+    // Baseline: an unbounded run records the real bytes-scanned total on
+    // success.
+    let (baseline_app, baseline_accounting) =
+        build_router_with_config(Arc::clone(&store), tokens(&[("acme-token", "acme")]), {
+            let mut cfg = SqlConfig::default();
+            cfg.engine.max_bytes_scanned = ravel_query::ByteLimit::Unlimited;
+            cfg
+        });
+    let (status, value) = post_json(&baseline_app, "acme-token", query).await;
+    assert_eq!(status, StatusCode::OK, "baseline query must succeed: {value}");
+    let baseline = only_outcome_row(
+        &baseline_accounting,
+        ravel_server::metrics::QueryOutcomeStatus::Success,
+    );
+    assert!(
+        baseline.counters.s3_bytes > 0,
+        "the query must have read real bytes for this test to be meaningful"
+    );
+
+    // Same fixture, same query, budget set one byte below the baseline's real
+    // total: the fetch that already happened is what trips the check, so the
+    // error's `scanned` figure must equal the baseline's real total exactly.
+    let (tripped_app, tripped_accounting) =
+        build_router_with_config(Arc::clone(&store), tokens(&[("acme-token", "acme")]), {
+            let mut cfg = SqlConfig::default();
+            cfg.engine.max_bytes_scanned =
+                ravel_query::ByteLimit::Bounded(baseline.counters.s3_bytes - 1);
+            cfg
+        });
+    let (status, value) = post_json(&tripped_app, "acme-token", query).await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a budget trip must be a client-visible error, not silently succeed: {value}"
+    );
+
+    let errored = only_outcome_row(
+        &tripped_accounting,
+        ravel_server::metrics::QueryOutcomeStatus::Error,
+    );
+    assert_eq!(
+        errored.counters.s3_bytes, baseline.counters.s3_bytes,
+        "the failed query's recorded bytes must match what it actually read, not zero \
+         and not an estimate"
+    );
+    assert_eq!(errored.counters.queries, 1);
+    // No Success or Canceled row: the query recorded exactly once, as Error.
+    assert!(
+        tripped_accounting
+            .outcome_snapshot()
+            .iter()
+            .all(|r| r.status == ravel_server::metrics::QueryOutcomeStatus::Error)
+    );
+}
+
+/// A backend wrapping `inner` whose `get` sleeps for `delay` (real tokio
+/// time) before delegating. `MemoryStore`'s own operations never yield to the
+/// executor, so `tokio::time::timeout` (`crates/ravel-sql/src/executor.rs`)
+/// never gets a chance to race a bare `MemoryStore`: the wrapped future
+/// resolves on its very first poll regardless of how small the configured
+/// deadline is, timer included. This wrapper forces a genuine `.await` that
+/// returns `Pending` for real wall-clock time, so a short deadline set below
+/// `delay` deterministically fires while a real GET is outstanding.
+struct DelayedGet<S> {
+    inner: S,
+    delay: Duration,
+}
+
+#[async_trait::async_trait]
+impl<S: ObjectStoreBackend> ObjectStoreBackend for DelayedGet<S> {
+    async fn put(
+        &self,
+        key: &str,
+        data: bytes::Bytes,
+        opts: PutOptions,
+    ) -> Result<ravel_object_store::PutOutcome, ravel_object_store::StoreError> {
+        self.inner.put(key, data, opts).await
+    }
+
+    async fn get(
+        &self,
+        key: &str,
+        range: GetRange,
+    ) -> Result<ravel_object_store::GetOutcome, ravel_object_store::StoreError> {
+        tokio::time::sleep(self.delay).await;
+        self.inner.get(key, range).await
+    }
+
+    async fn head(
+        &self,
+        key: &str,
+    ) -> Result<ravel_object_store::ObjectMeta, ravel_object_store::StoreError> {
+        self.inner.head(key).await
+    }
+
+    async fn list(
+        &self,
+        prefix: &str,
+        page: Option<ravel_object_store::PageToken>,
+    ) -> Result<ravel_object_store::ListPage, ravel_object_store::StoreError> {
+        self.inner.list(prefix, page).await
+    }
+
+    async fn list_delimited(
+        &self,
+        prefix: &str,
+    ) -> Result<ravel_object_store::DelimitedList, ravel_object_store::StoreError> {
+        self.inner.list_delimited(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), ravel_object_store::StoreError> {
+        self.inner.delete(key).await
+    }
+
+    fn capabilities(&self) -> ravel_object_store::Capabilities {
+        self.inner.capabilities()
+    }
+}
+
+/// A query that exceeds its wall-clock deadline must record `Timeout`, not
+/// `Error` and not nothing. `DelayedGet` (200ms) plus a 5ms deadline makes the
+/// trip fire deterministically while a real GET is genuinely outstanding, the
+/// same shape issue #809's motivating incident describes.
+///
+/// This test proves the STATUS split only: it does NOT prove the recorded
+/// cost reflects that real object-store work, because `SqlExecutor::execute`
+/// (crates/ravel-sql/src/executor.rs, out of this task's
+/// `services/ravel-server`-only scope) keeps its `QueryAccounting` handle
+/// entirely internal and does not expose it, or the figures it holds, on a
+/// `DeadlineExceeded` return -- so `error_cost` in `sql.rs` has no non-zero
+/// figures to record for this variant (see its doc comment). Closing that
+/// gap needs a `ravel-sql` API change, out of scope here and named in this
+/// task's final report.
+#[tokio::test]
+async fn a_query_that_exceeds_its_deadline_records_timeout_status() {
+    let inner: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    publish_segment(inner.as_ref(), &tenant, 0, "m", &[(100, 1.0), (200, 2.5)]).await;
+    let delayed_store: Arc<dyn ObjectStoreBackend> = Arc::new(DelayedGet {
+        inner,
+        delay: Duration::from_millis(200),
+    });
+
+    let (app, query_accounting) = build_router_with_config_and_deadline(
+        delayed_store,
+        tokens(&[("acme-token", "acme")]),
+        SqlConfig::default(),
+        Duration::from_millis(5),
+    );
+
+    let (status, value) = post_json(&app, "acme-token", "SELECT ts, value FROM samples").await;
+    assert_eq!(
+        status,
+        StatusCode::GATEWAY_TIMEOUT,
+        "a deadline trip must reach the client as a timeout status: {value}"
+    );
+
+    let timed_out = only_outcome_row(
+        &query_accounting,
+        ravel_server::metrics::QueryOutcomeStatus::Timeout,
+    );
+    assert_eq!(timed_out.counters.queries, 1);
+}
+
+/// A backend wrapping `inner` whose `get` signals `entered` the instant it is
+/// called, then blocks on `proceed` before delegating -- so a test can drive
+/// a request until it is genuinely suspended inside a real in-flight GET,
+/// then tear the request future down without ever unblocking it. Every other
+/// method delegates straight through.
+struct BlockingOnFirstGet<S> {
+    inner: S,
+    entered: Arc<tokio::sync::Notify>,
+    proceed: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl<S: ObjectStoreBackend> ObjectStoreBackend for BlockingOnFirstGet<S> {
+    async fn put(
+        &self,
+        key: &str,
+        data: bytes::Bytes,
+        opts: PutOptions,
+    ) -> Result<ravel_object_store::PutOutcome, ravel_object_store::StoreError> {
+        self.inner.put(key, data, opts).await
+    }
+
+    async fn get(
+        &self,
+        key: &str,
+        range: GetRange,
+    ) -> Result<ravel_object_store::GetOutcome, ravel_object_store::StoreError> {
+        self.entered.notify_one();
+        self.proceed.notified().await;
+        self.inner.get(key, range).await
+    }
+
+    async fn head(
+        &self,
+        key: &str,
+    ) -> Result<ravel_object_store::ObjectMeta, ravel_object_store::StoreError> {
+        self.inner.head(key).await
+    }
+
+    async fn list(
+        &self,
+        prefix: &str,
+        page: Option<ravel_object_store::PageToken>,
+    ) -> Result<ravel_object_store::ListPage, ravel_object_store::StoreError> {
+        self.inner.list(prefix, page).await
+    }
+
+    async fn list_delimited(
+        &self,
+        prefix: &str,
+    ) -> Result<ravel_object_store::DelimitedList, ravel_object_store::StoreError> {
+        self.inner.list_delimited(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), ravel_object_store::StoreError> {
+        self.inner.delete(key).await
+    }
+
+    fn capabilities(&self) -> ravel_object_store::Capabilities {
+        self.inner.capabilities()
+    }
+}
+
+/// Deliverable 5: the request future being DROPPED mid-flight (a client
+/// disconnect while a real GET is outstanding), not merely returning an
+/// error, must still record a `Canceled` cost. This is reachable from a real
+/// caller today: axum drops the whole per-request future, `CostGuard`
+/// included, the instant a client disconnects mid-query, exactly as `.abort()`
+/// drops this test's spawned task below -- `handle`/`run` never gets a chance
+/// to run any code after the dropped `.await`, which is the entire point of
+/// `CostGuard` living in a `Drop` impl rather than at the end of the happy
+/// path.
+#[tokio::test]
+async fn a_dropped_request_future_records_a_canceled_cost() {
+    let inner: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    publish_segment(inner.as_ref(), &tenant, 0, "m", &[(100, 1.0), (200, 2.5)]).await;
+
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let proceed = Arc::new(tokio::sync::Notify::new());
+    let blocking_store: Arc<dyn ObjectStoreBackend> = Arc::new(BlockingOnFirstGet {
+        inner,
+        entered: Arc::clone(&entered),
+        proceed: Arc::clone(&proceed),
+    });
+
+    let (app, query_accounting) = build_router_with_config(
+        blocking_store,
+        tokens(&[("acme-token", "acme")]),
+        SqlConfig::default(),
+    );
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/sql")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, "Bearer acme-token")
+        .body(Body::from(body("SELECT ts, value FROM samples ORDER BY ts")))
+        .expect("build request");
+
+    let task = tokio::spawn(async move { app.oneshot(request).await });
+
+    // Waits until the request is genuinely suspended inside the real GET
+    // (`BlockingOnFirstGet::get` signals `entered` before blocking on
+    // `proceed`), not until some fixed delay has elapsed.
+    entered.notified().await;
+
+    // Abort, never signaling `proceed`: the request future -- including
+    // `run`'s local `cost_guard` -- is dropped mid-`.await`, exactly as a
+    // real client disconnect would drop it. Nothing after the blocked
+    // `.await` ever runs; `entered`/`proceed` are otherwise unused after this.
+    task.abort();
+    let joined = task.await;
+    assert!(
+        joined.is_err() && joined.unwrap_err().is_cancelled(),
+        "the request future must have been aborted, not completed"
+    );
+
+    let canceled = only_outcome_row(
+        &query_accounting,
+        ravel_server::metrics::QueryOutcomeStatus::Canceled,
+    );
+    assert_eq!(canceled.counters.queries, 1);
+    // No Success or Error row: the only fold that happened was the Drop path.
+    assert!(
+        query_accounting
+            .outcome_snapshot()
+            .iter()
+            .all(|r| r.status == ravel_server::metrics::QueryOutcomeStatus::Canceled)
+    );
+}
+
 /// Reachability for the last task of epic #360: a tenant's declared `Str`
 /// column must arrive as Arrow `Dictionary(Int32, Utf8)` when queried through
 /// the shipping server's real Flight SQL surface, not merely inside ravel-sql.
