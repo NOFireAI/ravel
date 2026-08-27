@@ -15,6 +15,8 @@ use ravel_segment::{
     decode_run_pages_soa, open_from_suffix, plan_ranges_v4,
 };
 use ravel_types::accounting::{AccountedOp, QueryAccounting};
+
+use crate::phase_accounting::PhaseAccounting;
 use ravel_types::{LabelSet, Sample, SeriesId, TenantHash};
 use tracing::Instrument;
 
@@ -1478,11 +1480,12 @@ impl SegmentFetcher {
         seg_ref: &SegmentRef,
         matchers: &[LabelMatcher],
         count_stats: bool,
-        accounting: &QueryAccounting,
+        accounting: &PhaseAccounting,
     ) -> Result<(Vec<RunDecode>, FetchStats), FetchError> {
         let key = &seg_ref.data_object_key;
-        let (footer, total_size, suffix_etag, mut regions) =
-            self.open_segment(tenant_hash, seg_ref, accounting).await?;
+        let (footer, total_size, suffix_etag, mut regions) = self
+            .open_segment(tenant_hash, seg_ref, accounting.plan())
+            .await?;
         let selected = self
             .decode_selected(
                 seg_ref,
@@ -1492,7 +1495,7 @@ impl SegmentFetcher {
                 &suffix_etag,
                 &mut regions,
                 matchers,
-                accounting,
+                accounting.probe(),
             )
             .await?;
         let scalar: Vec<&SeriesEntryV4> = selected
@@ -1510,7 +1513,7 @@ impl SegmentFetcher {
                 &scalar,
                 &suffix_etag,
                 &mut regions,
-                accounting,
+                accounting.scan(),
             )
             .await?;
         self.build_scalar_decodes(
@@ -1520,7 +1523,7 @@ impl SegmentFetcher {
             &planned,
             &regions,
             count_stats,
-            accounting,
+            accounting.scan(),
         )
     }
 
@@ -1667,11 +1670,12 @@ impl SegmentFetcher {
         tenant_hash: TenantHash,
         seg_ref: &SegmentRef,
         matchers: &[LabelMatcher],
-        accounting: &QueryAccounting,
+        accounting: &PhaseAccounting,
     ) -> Result<Vec<RunHistogramDecode>, FetchError> {
         let key = &seg_ref.data_object_key;
-        let (footer, total_size, suffix_etag, mut regions) =
-            self.open_segment(tenant_hash, seg_ref, accounting).await?;
+        let (footer, total_size, suffix_etag, mut regions) = self
+            .open_segment(tenant_hash, seg_ref, accounting.plan())
+            .await?;
         let selected = self
             .decode_selected(
                 seg_ref,
@@ -1681,7 +1685,7 @@ impl SegmentFetcher {
                 &suffix_etag,
                 &mut regions,
                 matchers,
-                accounting,
+                accounting.probe(),
             )
             .await?;
         let histogram: Vec<&SeriesEntryV4> = selected
@@ -1699,10 +1703,17 @@ impl SegmentFetcher {
                 &histogram,
                 &suffix_etag,
                 &mut regions,
-                accounting,
+                accounting.scan(),
             )
             .await?;
-        self.build_histogram_decodes(key, seg_ref, &histogram, &planned, &regions, accounting)
+        self.build_histogram_decodes(
+            key,
+            seg_ref,
+            &histogram,
+            &planned,
+            &regions,
+            accounting.scan(),
+        )
     }
 
     /// Histogram counterpart to
@@ -1831,11 +1842,12 @@ impl SegmentFetcher {
         seg_ref: &SegmentRef,
         matchers: &[LabelMatcher],
         count_stats: bool,
-        accounting: &QueryAccounting,
+        accounting: &PhaseAccounting,
     ) -> Result<(Vec<RunDecode>, FetchStats, Vec<RunHistogramDecode>), FetchError> {
         let key = &seg_ref.data_object_key;
-        let (footer, total_size, suffix_etag, mut regions) =
-            self.open_segment(tenant_hash, seg_ref, accounting).await?;
+        let (footer, total_size, suffix_etag, mut regions) = self
+            .open_segment(tenant_hash, seg_ref, accounting.plan())
+            .await?;
         let selected = self
             .decode_selected(
                 seg_ref,
@@ -1845,7 +1857,7 @@ impl SegmentFetcher {
                 &suffix_etag,
                 &mut regions,
                 matchers,
-                accounting,
+                accounting.probe(),
             )
             .await?;
         let scalar: Vec<&SeriesEntryV4> = selected
@@ -1867,7 +1879,7 @@ impl SegmentFetcher {
                 &scalar,
                 &suffix_etag,
                 &mut regions,
-                accounting,
+                accounting.scan(),
             )
             .await?
         };
@@ -1881,7 +1893,7 @@ impl SegmentFetcher {
                 &histogram,
                 &suffix_etag,
                 &mut regions,
-                accounting,
+                accounting.scan(),
             )
             .await?
         };
@@ -1896,7 +1908,7 @@ impl SegmentFetcher {
                 &scalar_planned,
                 &regions,
                 count_stats,
-                accounting,
+                accounting.scan(),
             )?
         };
         let histogram_out = if histogram.is_empty() {
@@ -1908,7 +1920,7 @@ impl SegmentFetcher {
                 &histogram,
                 &histogram_planned,
                 &regions,
-                accounting,
+                accounting.scan(),
             )?
         };
         Ok((scalar_out, stats, histogram_out))
@@ -1941,8 +1953,33 @@ impl SegmentFetcher {
         matchers: &[LabelMatcher],
         accounting: &QueryAccounting,
     ) -> Result<Vec<SeriesEntry>, FetchError> {
-        let (footer, total_size, suffix_etag, mut regions) =
-            self.open_segment(tenant_hash, seg_ref, accounting).await?;
+        let phase = PhaseAccounting::new();
+        let result = self
+            .fetch_series_phase_accounted(tenant_hash, seg_ref, matchers, &phase)
+            .await;
+        accounting.merge_snapshot(&phase.snapshot().pooled());
+        result
+    }
+
+    /// Phase-split counterpart of
+    /// [`fetch_series_accounted`](Self::fetch_series_accounted) (issue #796):
+    /// same behavior, but every GET is recorded against the phase that
+    /// issued it (plan for [`open_segment`](Self::open_segment), probe for
+    /// [`decode_selected`](Self::decode_selected)) rather than pooled onto
+    /// one handle. `fetch_series_accounted` is now a thin wrapper over this
+    /// that folds the four phase totals back into its single
+    /// `QueryAccounting` handle, so its own callers (`ravel-sql`'s direct
+    /// calls included) see unchanged pooled numbers.
+    pub(crate) async fn fetch_series_phase_accounted(
+        &self,
+        tenant_hash: TenantHash,
+        seg_ref: &SegmentRef,
+        matchers: &[LabelMatcher],
+        accounting: &PhaseAccounting,
+    ) -> Result<Vec<SeriesEntry>, FetchError> {
+        let (footer, total_size, suffix_etag, mut regions) = self
+            .open_segment(tenant_hash, seg_ref, accounting.plan())
+            .await?;
         let selected = self
             .decode_selected(
                 seg_ref,
@@ -1952,7 +1989,7 @@ impl SegmentFetcher {
                 &suffix_etag,
                 &mut regions,
                 matchers,
-                accounting,
+                accounting.probe(),
             )
             .await?;
         Ok(selected.into_iter().map(|e| e.entry).collect())
@@ -1984,9 +2021,12 @@ impl SegmentFetcher {
         matchers: &[LabelMatcher],
         accounting: &QueryAccounting,
     ) -> Result<Vec<FetchedSeries>, FetchError> {
-        let (runs, _stats) = self
-            .fetch_runs(tenant_hash, seg_ref, matchers, false, accounting)
-            .await?;
+        let phase = PhaseAccounting::new();
+        let result = self
+            .fetch_runs(tenant_hash, seg_ref, matchers, false, &phase)
+            .await;
+        accounting.merge_snapshot(&phase.snapshot().pooled());
+        let (runs, _stats) = result?;
         Ok(runs.into_iter().map(RunDecode::into_aos).collect())
     }
 
@@ -2015,9 +2055,12 @@ impl SegmentFetcher {
         matchers: &[LabelMatcher],
         accounting: &QueryAccounting,
     ) -> Result<(Vec<FetchedSeriesSoa>, FetchStats), FetchError> {
-        let (runs, stats) = self
-            .fetch_runs(tenant_hash, seg_ref, matchers, true, accounting)
-            .await?;
+        let phase = PhaseAccounting::new();
+        let result = self
+            .fetch_runs(tenant_hash, seg_ref, matchers, true, &phase)
+            .await;
+        accounting.merge_snapshot(&phase.snapshot().pooled());
+        let (runs, stats) = result?;
         Ok((runs.into_iter().map(RunDecode::into_soa).collect(), stats))
     }
 
@@ -2048,9 +2091,12 @@ impl SegmentFetcher {
         matchers: &[LabelMatcher],
         accounting: &QueryAccounting,
     ) -> Result<Vec<FetchedHistogramSeries>, FetchError> {
-        let runs = self
-            .fetch_histogram_runs(tenant_hash, seg_ref, matchers, accounting)
-            .await?;
+        let phase = PhaseAccounting::new();
+        let result = self
+            .fetch_histogram_runs(tenant_hash, seg_ref, matchers, &phase)
+            .await;
+        accounting.merge_snapshot(&phase.snapshot().pooled());
+        let runs = result?;
         Ok(runs
             .into_iter()
             .map(RunHistogramDecode::into_fetched)
@@ -2096,6 +2142,37 @@ impl SegmentFetcher {
         seg_ref: &SegmentRef,
         matchers: &[LabelMatcher],
         accounting: &QueryAccounting,
+    ) -> Result<
+        (
+            Vec<FetchedSeriesSoa>,
+            FetchStats,
+            Vec<FetchedHistogramSeries>,
+        ),
+        FetchError,
+    > {
+        let phase = PhaseAccounting::new();
+        let result = self
+            .fetch_soa_and_histograms_phase_accounted(tenant_hash, seg_ref, matchers, &phase)
+            .await;
+        accounting.merge_snapshot(&phase.snapshot().pooled());
+        result
+    }
+
+    /// Phase-split counterpart of
+    /// [`fetch_soa_and_histograms_accounted`](Self::fetch_soa_and_histograms_accounted)
+    /// (issue #796); see [`fetch_series_phase_accounted`](Self::fetch_series_phase_accounted)
+    /// for why both forms exist. `engine.rs` calls this directly with a real,
+    /// persistent `PhaseAccounting` for end-to-end phase visibility;
+    /// `fetch_soa_and_histograms_accounted` is a thin wrapper over this that
+    /// folds the four phase totals back into its single `QueryAccounting`
+    /// handle, so its own callers (`ravel-sql`'s direct calls included) see
+    /// unchanged pooled numbers.
+    pub(crate) async fn fetch_soa_and_histograms_phase_accounted(
+        &self,
+        tenant_hash: TenantHash,
+        seg_ref: &SegmentRef,
+        matchers: &[LabelMatcher],
+        accounting: &PhaseAccounting,
     ) -> Result<
         (
             Vec<FetchedSeriesSoa>,

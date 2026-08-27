@@ -51,6 +51,7 @@ use std::sync::Arc;
 
 use crate::erasure::ErasurePredicate;
 use crate::fetcher::ReadCache;
+use crate::phase_accounting::PhaseAccounting;
 use bytes::Bytes;
 use ravel_cache::{CacheKey, SingleFlightError, Source};
 use ravel_catalog::SegmentRef;
@@ -781,44 +782,56 @@ impl LogSegmentFetcher {
         &self,
         seg_ref: &SegmentRef,
         query: &LogQuery,
-        accounting: &QueryAccounting,
+        caller_accounting: &QueryAccounting,
     ) -> Result<Option<LogFetchOutput>, LogFetchError> {
-        if !Self::ts_range_relevant(seg_ref, query.ts_min_ns, query.ts_max_ns) {
-            return Ok(None);
+        // Issue #796: this funnel has no separate plan step of its own (one
+        // unconditional whole-object GET, then decode), so its GET is charged
+        // to the `scan` phase. See `crate::phase_accounting`'s module docs for
+        // the phase taxonomy and `scan_accounted_with_tenant` below for the
+        // tenant-aware funnel this untenanted entry point mirrors.
+        let phase = PhaseAccounting::new();
+        let accounting = phase.scan();
+        let result = async {
+            if !Self::ts_range_relevant(seg_ref, query.ts_min_ns, query.ts_max_ns) {
+                return Ok(None);
+            }
+            let key = &seg_ref.data_object_key;
+            // Two separable phases here (ADR-0044 decision 5): the
+            // whole-object GET, then the STREAM_DIR resolve + `RlogReader` scan in
+            // `scan_bytes`. They are named `page_fetch` and `decode` to match the
+            // metric path's phase names. This entry point is reached by the
+            // unaccounted `fetch` (and by tests); the real production log/alerts/
+            // audit callers in `ravel-sql` go through
+            // `fetch_accounted_with_tenant`, which carries its own copy of these
+            // spans over its own (cache-aware) GET path. Wiring those callers onto
+            // an accounted funnel at all is separate, still-open future work.
+            let fetch_span = tracing::debug_span!(
+                "page_fetch",
+                signal = "logs",
+                s3_requests = tracing::field::Empty,
+                s3_bytes = tracing::field::Empty,
+            );
+            let got = async {
+                self.store
+                    .get(key, GetRange::Full)
+                    .await
+                    .map_err(|source| LogFetchError::Store {
+                        key: key.to_string(),
+                        source,
+                    })
+            }
+            .instrument(fetch_span.clone())
+            .await?;
+            accounting.record_s3_request(AccountedOp::Get);
+            accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
+            // This funnel issues exactly one whole-object GET per call.
+            fetch_span.record("s3_requests", 1u64);
+            fetch_span.record("s3_bytes", got.data.len() as u64);
+            self.decode_spanned(key, &got.data, query)
         }
-        let key = &seg_ref.data_object_key;
-        // Two separable phases here (ADR-0044 decision 5): the
-        // whole-object GET, then the STREAM_DIR resolve + `RlogReader` scan in
-        // `scan_bytes`. They are named `page_fetch` and `decode` to match the
-        // metric path's phase names. This entry point is reached by the
-        // unaccounted `fetch` (and by tests); the real production log/alerts/
-        // audit callers in `ravel-sql` go through
-        // `fetch_accounted_with_tenant`, which carries its own copy of these
-        // spans over its own (cache-aware) GET path. Wiring those callers onto
-        // an accounted funnel at all is separate, still-open future work.
-        let fetch_span = tracing::debug_span!(
-            "page_fetch",
-            signal = "logs",
-            s3_requests = tracing::field::Empty,
-            s3_bytes = tracing::field::Empty,
-        );
-        let got = async {
-            self.store
-                .get(key, GetRange::Full)
-                .await
-                .map_err(|source| LogFetchError::Store {
-                    key: key.to_string(),
-                    source,
-                })
-        }
-        .instrument(fetch_span.clone())
-        .await?;
-        accounting.record_s3_request(AccountedOp::Get);
-        accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
-        // This funnel issues exactly one whole-object GET per call.
-        fetch_span.record("s3_requests", 1u64);
-        fetch_span.record("s3_bytes", got.data.len() as u64);
-        self.decode_spanned(key, &got.data, query)
+        .await;
+        caller_accounting.merge_snapshot(&phase.snapshot().pooled());
+        result
     }
 
     /// Cache-aware counterpart of [`fetch_accounted`](Self::fetch_accounted):
@@ -848,19 +861,34 @@ impl LogSegmentFetcher {
         seg_ref: &SegmentRef,
         tenant_hash: TenantHash,
         query: &LogQuery,
-        accounting: &QueryAccounting,
+        caller_accounting: &QueryAccounting,
     ) -> Result<Option<LogFetchOutput>, LogFetchError> {
+        // Issue #796: `tenant_bytes` (below the block-range threshold, a
+        // whole-object GET) and the block-range path it falls through to
+        // above threshold both do data reads with no separate plan step of
+        // their own here, so this funnel's GETs are charged to `scan`.
+        // `decode_spanned` (below) records no accounting of its own -- unlike
+        // the `LogSegmentScan`-returning funnels below, this one fully
+        // decodes and returns before this function returns, so buffering into
+        // a disposable `PhaseAccounting` and merging once is safe here.
+        let phase = PhaseAccounting::new();
+        let accounting = phase.scan();
         // This funnel's decode (`scan_bytes`) reads every column, so the fetch
         // selection is the same: on a version-4 object it brings every column
         // chunk of every surviving block (ADR-0699 decision 5).
         let all = ColumnSelection::all();
-        let Some(bytes) = self
-            .tenant_bytes(seg_ref, tenant_hash, query, &all, accounting)
-            .await?
-        else {
-            return Ok(None);
-        };
-        self.decode_spanned(&seg_ref.data_object_key, &bytes, query)
+        let result = async {
+            let Some(bytes) = self
+                .tenant_bytes(seg_ref, tenant_hash, query, &all, accounting)
+                .await?
+            else {
+                return Ok(None);
+            };
+            self.decode_spanned(&seg_ref.data_object_key, &bytes, query)
+        }
+        .await;
+        caller_accounting.merge_snapshot(&phase.snapshot().pooled());
+        result
     }
 
     /// Streaming counterpart of
@@ -887,6 +915,23 @@ impl LogSegmentFetcher {
     /// by [`BlockRangeFetcher`] as a probe plus coalesced block ranges, so the
     /// raw bytes moved are proportional to pruning rather than to object size --
     /// but the resident buffer is still object-sized, per call.
+    ///
+    /// # Issue #796 phase attribution
+    ///
+    /// Every GET this funnel issues (directly, or through
+    /// [`BlockRangeFetcher`]'s probe-then-range protocol above the
+    /// block-range threshold) is `scan` phase by this file's mapping: unlike
+    /// [`plan_segment`](Self::plan_segment), nothing here is a standalone
+    /// planning read. `accounting` is taken and stored as-is (not buffered
+    /// through a disposable [`PhaseAccounting`](crate::phase_accounting::PhaseAccounting)
+    /// like [`fetch_accounted_with_tenant`](Self::fetch_accounted_with_tenant)):
+    /// the returned [`LogSegmentScan`] keeps writing to it after this call
+    /// returns (`LogSegmentScan::finish`'s deferred `page_bytes_fetched`/
+    /// `page_bytes_decoded`, ADR-0107 decision 4), so a merge-once buffer
+    /// would silently drop those writes. A caller wanting a live `scan`-phase
+    /// split for this funnel would need to pass a `PhaseAccounting::scan()`
+    /// handle directly; no in-scope caller does, which is a #796 report
+    /// finding, not a bug fixed here.
     pub async fn scan_accounted_with_tenant(
         &self,
         seg_ref: &SegmentRef,
@@ -937,6 +982,11 @@ impl LogSegmentFetcher {
     ///
     /// A single GET observes one object state, so no [`EtagPin`] is needed: the
     /// multi-GET consistency the block-range path must defend does not arise here.
+    ///
+    /// Issue #796: `scan` phase, same reasoning and the same not-buffered
+    /// `accounting` handling as
+    /// [`scan_accounted_with_tenant`](Self::scan_accounted_with_tenant)'s doc
+    /// comment.
     pub async fn scan_whole_accounted_with_tenant(
         &self,
         seg_ref: &SegmentRef,
@@ -996,127 +1046,145 @@ impl LogSegmentFetcher {
     /// path skips the plan pass entirely.
     ///
     /// [`scan_accounted_with_tenant`]: Self::scan_accounted_with_tenant
+    ///
+    /// Issue #796: every GET this method issues -- the fast path's footer
+    /// probe, the skip-decidable path's `fetch_plan_sections`, and the
+    /// fallback's whole-object read (a planning read here, not a scan, per
+    /// its own comment below) -- is `plan` phase. Buffered through a
+    /// disposable [`PhaseAccounting`](crate::phase_accounting::PhaseAccounting)
+    /// and merged once before returning: safe here because, unlike the
+    /// `LogSegmentScan`-returning funnels, nothing this method returns keeps
+    /// writing to the accounting handle after it returns (the fallback's
+    /// `scan.remaining_blocks()`/`scan.stats()` are read synchronously, and
+    /// the `BlockScan` itself carries no accounting handle).
     pub async fn plan_segment(
         &self,
         seg_ref: &SegmentRef,
         tenant_hash: TenantHash,
         query: &LogQuery,
-        accounting: &QueryAccounting,
+        caller_accounting: &QueryAccounting,
     ) -> Result<Option<(usize, ScanStats, Option<footer::LogFooter>)>, LogFetchError> {
-        // Fast path (#693): a query with no block-level predicate whose ts
-        // window fully CONTAINS the segment's span prunes nothing -- every block
-        // survives -- so the survivor count is the footer's `block_count` and no
-        // block-range fetch or decode is needed. Only the ADR-0107 suffix probe
-        // runs, to read the footer. Containment is strictly stronger than
-        // `ts_range_relevant`'s overlap (a partially-overlapping window still
-        // needs real ts pruning), and it implies relevance, so the fast path
-        // never has to return the irrelevant-`None`. A zero object size cannot
-        // be range-probed (every extent, starting with the probe's cache key,
-        // is derived from it), so it falls through to the whole-object slow
-        // path, as does an inverted span (`min > max`, the shape a zero-record
-        // payload would produce, structurally unreachable today but not worth
-        // trusting blindly): the slow path's `ts_range_relevant` would return
-        // `None` for a genuinely empty segment, and the fast path should agree
-        // rather than returning `Some((0, ..))` for an input that should never
-        // reach a segment at all. `object_size > block_range_threshold` keeps
-        // the fast path strictly to the band where it actually saves a GET: at
-        // or below the threshold `tenant_bytes` already takes a single
-        // whole-object read (`fetch_footer` has no matching whole-object
-        // crossover of its own, so below the threshold it would read the same
-        // object twice under two different cache keys instead of once).
-        if seg_ref.object_size > self.block_range_threshold
-            && seg_ref.min_event_ts_ns <= seg_ref.max_event_ts_ns
-            && query.is_block_predicate_free()
-            && query.ts_min_ns <= seg_ref.min_event_ts_ns
-            && seg_ref.max_event_ts_ns <= query.ts_max_ns
-        {
-            let (n, stats, footer) = self
-                .plan_segment_fast(seg_ref, tenant_hash, accounting)
-                .await?;
-            return Ok(Some((n, stats, Some(footer))));
-        }
-
-        // Skip-index-only survivor count (#761): when every block-level predicate
-        // the query carries is decidable from the skip index alone -- ts bounds
-        // and prune-only NumRange arms, no text/content arm, no attribute-equality
-        // POSTINGS prune, no stream filter -- the surviving-block count is exactly
-        // `candidate_blocks` over those arms, with no BLOCKS byte fetched and no
-        // block decoded. The reader's full prune (skip, then POSTINGS, then bloom)
-        // reduces to the skip step for such a query, so this count equals the
-        // survivor list a subset open will stripe over, and the footer read here
-        // carries forward so those opens skip their own probe (#693 part 3).
-        //
-        // The relevance check is the one the fallback's `tenant_bytes` runs: it
-        // is what turns an out-of-window segment into the `None` the caller
-        // drops, and unlike the fast path's containment test this branch's
-        // guard does not imply it.
-        if seg_ref.object_size > self.block_range_threshold
-            && seg_ref.min_event_ts_ns <= seg_ref.max_event_ts_ns
-            && Self::ts_range_relevant(seg_ref, query.ts_min_ns, query.ts_max_ns)
-            && Self::plan_skip_decidable(query)
-        {
-            // The `page_fetch` phase span the other plan paths carry (#782), so
-            // the trace shows the probe and section GETs this branch issues.
-            // `s3_bytes` reports block bytes only, which are structurally zero
-            // here; the directory-overhead bytes are recorded in `accounting`.
-            let fetch_span = tracing::debug_span!(
-                "page_fetch",
-                signal = "logs",
-                s3_requests = tracing::field::Empty,
-                s3_bytes = tracing::field::Empty,
-            );
-            let (footer, skip, field_dir, stats) = async {
-                self.block_range
-                    .fetch_plan_sections(seg_ref, tenant_hash, accounting)
-                    .await
+        let phase = PhaseAccounting::new();
+        let accounting = phase.plan();
+        let result = async {
+            // Fast path (#693): a query with no block-level predicate whose ts
+            // window fully CONTAINS the segment's span prunes nothing -- every block
+            // survives -- so the survivor count is the footer's `block_count` and no
+            // block-range fetch or decode is needed. Only the ADR-0107 suffix probe
+            // runs, to read the footer. Containment is strictly stronger than
+            // `ts_range_relevant`'s overlap (a partially-overlapping window still
+            // needs real ts pruning), and it implies relevance, so the fast path
+            // never has to return the irrelevant-`None`. A zero object size cannot
+            // be range-probed (every extent, starting with the probe's cache key,
+            // is derived from it), so it falls through to the whole-object slow
+            // path, as does an inverted span (`min > max`, the shape a zero-record
+            // payload would produce, structurally unreachable today but not worth
+            // trusting blindly): the slow path's `ts_range_relevant` would return
+            // `None` for a genuinely empty segment, and the fast path should agree
+            // rather than returning `Some((0, ..))` for an input that should never
+            // reach a segment at all. `object_size > block_range_threshold` keeps
+            // the fast path strictly to the band where it actually saves a GET: at
+            // or below the threshold `tenant_bytes` already takes a single
+            // whole-object read (`fetch_footer` has no matching whole-object
+            // crossover of its own, so below the threshold it would read the same
+            // object twice under two different cache keys instead of once).
+            if seg_ref.object_size > self.block_range_threshold
+                && seg_ref.min_event_ts_ns <= seg_ref.max_event_ts_ns
+                && query.is_block_predicate_free()
+                && query.ts_min_ns <= seg_ref.min_event_ts_ns
+                && seg_ref.max_event_ts_ns <= query.ts_max_ns
+            {
+                let (n, stats, footer) = self
+                    .plan_segment_fast(seg_ref, tenant_hash, accounting)
+                    .await?;
+                return Ok(Some((n, stats, Some(footer))));
             }
-            .instrument(fetch_span.clone())
-            .await?;
-            let requests = stats.probe_gets + stats.metadata_gets + stats.block_range_gets;
-            fetch_span.record("s3_requests", requests);
-            fetch_span.record("s3_bytes", stats.block_bytes_fetched);
 
-            let refs: Vec<&Predicate> = query.prune.iter().collect();
-            let numeric = field_dir.numeric_range_arms(&refs);
-            let survivors = skip
-                .candidate_blocks(query.ts_min_ns, query.ts_max_ns, None, &numeric)
-                .len();
-            let blocks = skip.l0.len() as u32;
-            let plan_stats = ScanStats {
-                blocks_total: blocks,
-                blocks_after_skip: survivors as u32,
-                blocks_after_postings: survivors as u32,
-                blocks_after_bloom: survivors as u32,
-                blocks_scanned: 0,
-                pages_decoded: 0,
-                pages_skipped: 0,
-                page_bytes_fetched: 0,
-                page_bytes_decoded: 0,
-                bloom_degraded: false,
-                postings_degraded: false,
+            // Skip-index-only survivor count (#761): when every block-level predicate
+            // the query carries is decidable from the skip index alone -- ts bounds
+            // and prune-only NumRange arms, no text/content arm, no attribute-equality
+            // POSTINGS prune, no stream filter -- the surviving-block count is exactly
+            // `candidate_blocks` over those arms, with no BLOCKS byte fetched and no
+            // block decoded. The reader's full prune (skip, then POSTINGS, then bloom)
+            // reduces to the skip step for such a query, so this count equals the
+            // survivor list a subset open will stripe over, and the footer read here
+            // carries forward so those opens skip their own probe (#693 part 3).
+            //
+            // The relevance check is the one the fallback's `tenant_bytes` runs: it
+            // is what turns an out-of-window segment into the `None` the caller
+            // drops, and unlike the fast path's containment test this branch's
+            // guard does not imply it.
+            if seg_ref.object_size > self.block_range_threshold
+                && seg_ref.min_event_ts_ns <= seg_ref.max_event_ts_ns
+                && Self::ts_range_relevant(seg_ref, query.ts_min_ns, query.ts_max_ns)
+                && Self::plan_skip_decidable(query)
+            {
+                // The `page_fetch` phase span the other plan paths carry (#782), so
+                // the trace shows the probe and section GETs this branch issues.
+                // `s3_bytes` reports block bytes only, which are structurally zero
+                // here; the directory-overhead bytes are recorded in `accounting`.
+                let fetch_span = tracing::debug_span!(
+                    "page_fetch",
+                    signal = "logs",
+                    s3_requests = tracing::field::Empty,
+                    s3_bytes = tracing::field::Empty,
+                );
+                let (footer, skip, field_dir, stats) = async {
+                    self.block_range
+                        .fetch_plan_sections(seg_ref, tenant_hash, accounting)
+                        .await
+                }
+                .instrument(fetch_span.clone())
+                .await?;
+                let requests = stats.probe_gets + stats.metadata_gets + stats.block_range_gets;
+                fetch_span.record("s3_requests", requests);
+                fetch_span.record("s3_bytes", stats.block_bytes_fetched);
+
+                let refs: Vec<&Predicate> = query.prune.iter().collect();
+                let numeric = field_dir.numeric_range_arms(&refs);
+                let survivors = skip
+                    .candidate_blocks(query.ts_min_ns, query.ts_max_ns, None, &numeric)
+                    .len();
+                let blocks = skip.l0.len() as u32;
+                let plan_stats = ScanStats {
+                    blocks_total: blocks,
+                    blocks_after_skip: survivors as u32,
+                    blocks_after_postings: survivors as u32,
+                    blocks_after_bloom: survivors as u32,
+                    blocks_scanned: 0,
+                    pages_decoded: 0,
+                    pages_skipped: 0,
+                    page_bytes_fetched: 0,
+                    page_bytes_decoded: 0,
+                    bloom_degraded: false,
+                    postings_degraded: false,
+                };
+                return Ok(Some((survivors, plan_stats, Some(footer))));
+            }
+
+            // Fallback: a predicate the skip index cannot decide (a `has_word`/text
+            // content arm with only a per-block bloom, an attribute-equality POSTINGS
+            // prune, a stream filter), or a below-threshold object. Read as before --
+            // the survivor count then needs the reader's full prune over the fetched
+            // buffer -- and hand no footer forward. This whole-object plan read is the
+            // amplification #761 could not remove for these shapes; the caller counts
+            // it (a `None` footer on a relevant segment) as a `plan_full_reads` so a
+            // report can see which queries still pay it.
+            let all = ColumnSelection::all();
+            let Some(bytes) = self
+                .tenant_bytes(seg_ref, tenant_hash, query, &all, accounting)
+                .await?
+            else {
+                return Ok(None);
             };
-            return Ok(Some((survivors, plan_stats, Some(footer))));
+            let key = &seg_ref.data_object_key;
+            let span = decode_span();
+            let scan = span.in_scope(|| self.open_scan(key, &bytes, query, &all))?;
+            Ok(Some((scan.remaining_blocks(), scan.stats(), None)))
         }
-
-        // Fallback: a predicate the skip index cannot decide (a `has_word`/text
-        // content arm with only a per-block bloom, an attribute-equality POSTINGS
-        // prune, a stream filter), or a below-threshold object. Read as before --
-        // the survivor count then needs the reader's full prune over the fetched
-        // buffer -- and hand no footer forward. This whole-object plan read is the
-        // amplification #761 could not remove for these shapes; the caller counts
-        // it (a `None` footer on a relevant segment) as a `plan_full_reads` so a
-        // report can see which queries still pay it.
-        let all = ColumnSelection::all();
-        let Some(bytes) = self
-            .tenant_bytes(seg_ref, tenant_hash, query, &all, accounting)
-            .await?
-        else {
-            return Ok(None);
-        };
-        let key = &seg_ref.data_object_key;
-        let span = decode_span();
-        let scan = span.in_scope(|| self.open_scan(key, &bytes, query, &all))?;
-        Ok(Some((scan.remaining_blocks(), scan.stats(), None)))
+        .await;
+        caller_accounting.merge_snapshot(&phase.snapshot().pooled());
+        result
     }
 
     /// Whether [`plan_segment`](Self::plan_segment)'s survivor count can be read
@@ -1360,6 +1428,11 @@ impl LogSegmentFetcher {
     /// probes as before. It changes only the read shape, never the bytes decoded.
     ///
     /// [`scan_accounted_with_tenant`]: Self::scan_accounted_with_tenant
+    ///
+    /// Issue #796: `scan` phase, same reasoning and the same not-buffered
+    /// `accounting` handling as
+    /// [`scan_accounted_with_tenant`](Self::scan_accounted_with_tenant)'s doc
+    /// comment.
     #[allow(clippy::too_many_arguments)]
     pub async fn scan_accounted_with_tenant_subset(
         &self,
