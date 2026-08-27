@@ -165,12 +165,12 @@ where
     /// [`get_or_fetch`](Self::get_or_fetch) carries.** This method records one
     /// miss on a miss. A caller that peeks a key with `get`, sees a miss, and
     /// then resolves it by calling [`get_or_fetch`](Self::get_or_fetch) on the
-    /// same key records a *second* miss for the one logical request, because
-    /// `get_or_fetch` accounts its own leader miss too -- corrupting the
-    /// request-hit-rate SLI ADR-0046 depends on. A peek-then-fetch caller must
-    /// treat this `get`'s miss as the single accounted miss for that key and
-    /// resolve the value some other way (a coalesced fetch elsewhere), not
-    /// layer `get_or_fetch`'s accounting on top.
+    /// same key must not be counted twice for the one logical request: this
+    /// `get`'s miss is the single accounted miss for that key, and the
+    /// request-hit-rate SLI ADR-0046 depends on it staying that way.
+    /// `get_or_fetch` itself runs `single_flight` and records no miss of its
+    /// own, so it remains the correct way to resolve a peeked miss; what the
+    /// caller must avoid is counting a second miss around it, not the call.
     pub fn get(&self, key: &CacheKey) -> Option<Bytes> {
         self.inner.get(key).map(|bytes| self.maybe_corrupt(bytes))
     }

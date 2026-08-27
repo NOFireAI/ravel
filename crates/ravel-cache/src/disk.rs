@@ -339,8 +339,10 @@ impl DiskCache {
     /// startup scan, age sweep, and eviction all scope to `dir/<namespace>`, so
     /// two instances over one directory with distinct labels never see, count,
     /// or delete each other's files. `namespace` must be a single non-empty
-    /// path segment (no separators); the server passes `"store"` for the
-    /// fetcher cache and `"catalog"` for the catalog byte cache. See the
+    /// path component. The server passes `"store"` for the fetcher cache
+    /// (`services/ravel-server/src/store.rs`); a `"catalog"` label for the
+    /// catalog byte cache is planned and not yet wired, so today only one
+    /// namespace is in use. See the
     /// [module docs](self) for the warm-directory migration behavior.
     pub fn new_in_namespace(dir: PathBuf, namespace: &str, limits: CacheLimits) -> Self {
         Self::new_in_namespace_with_clock(dir, namespace, limits, Arc::new(SystemClock))
@@ -367,13 +369,22 @@ impl DiskCache {
         limits: CacheLimits,
         clock: Arc<dyn Clock>,
     ) -> Self {
+        // Exactly one ordinary component. A string check is not enough: on
+        // Windows a drive prefix like "C:" or "C:foo" contains no separator yet
+        // makes `PathBuf::join` REPLACE the base path rather than extend it,
+        // which escapes the layout as surely as a leading slash does. Asking
+        // `Path::components` settles every case with one rule. A Windows drive
+        // prefix is included: there "C:foo" yields Prefix + Normal and is
+        // rejected, while on Unix the same string is one ordinary filename that
+        // escapes nothing and is correctly accepted. That is why there is no
+        // cross-platform test for it -- asserting the rejection on Unix would
+        // assert a falsehood.
+        let mut parts = std::path::Path::new(namespace).components();
+        let one_normal =
+            matches!(parts.next(), Some(std::path::Component::Normal(_))) && parts.next().is_none();
         assert!(
-            !namespace.is_empty()
-                && namespace != "."
-                && namespace != ".."
-                && !namespace.contains('/')
-                && !namespace.contains(std::path::MAIN_SEPARATOR),
-            "DiskCache namespace must be a single non-empty path segment, got {namespace:?}"
+            one_normal,
+            "DiskCache namespace must be exactly one ordinary path component, got {namespace:?}"
         );
         // Acquire the runtime handle first, so an off-runtime construction fails
         // before doing any filesystem work rather than after.
@@ -2054,7 +2065,7 @@ mod tests {
     /// reintroduced silently. Removing the assert makes this test pass a value
     /// that collapses the root.
     #[tokio::test]
-    #[should_panic(expected = "single non-empty path segment")]
+    #[should_panic(expected = "exactly one ordinary path component")]
     async fn an_empty_namespace_is_refused_rather_than_collapsing_the_root() {
         let dir = tempfile::tempdir().expect("tempdir");
         let _ = DiskCache::new_in_namespace(dir.path().to_path_buf(), "", generous_limits());
@@ -2063,7 +2074,7 @@ mod tests {
     /// A label with a separator escapes the intended one-segment layout, and a
     /// leading slash makes `Path::join` discard the base directory entirely.
     #[tokio::test]
-    #[should_panic(expected = "single non-empty path segment")]
+    #[should_panic(expected = "exactly one ordinary path component")]
     async fn a_multi_segment_namespace_is_refused() {
         let dir = tempfile::tempdir().expect("tempdir");
         let _ = DiskCache::new_in_namespace(dir.path().to_path_buf(), "a/b", generous_limits());
