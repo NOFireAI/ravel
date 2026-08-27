@@ -99,7 +99,11 @@ pub use audit_pushdown::{AuditPushdown, extract_audit};
 pub use audit_schema::{
     AUDIT_COL_ATTRS, AUDIT_COL_BODY, AUDIT_COL_SEVERITY_TEXT, AUDIT_COL_TS, audit_schema,
 };
-pub use config::{DEFAULT_LATE_MATERIALIZATION_EXTRA_COLUMNS, DEFAULT_MAX_QUERY_BYTES, SqlConfig};
+pub use config::{
+    DEFAULT_LATE_MATERIALIZATION_EXTRA_COLUMNS, DEFAULT_MAX_QUERY_BYTES,
+    GROUP_VALUES_CEILING_COMPENSATION, GROUP_VALUES_RESIZE_TRANSIENT_FACTOR,
+    GROUP_VALUES_UNDERCOUNT_FACTOR, SqlConfig, compensated_group_values_ceiling,
+};
 pub use declared::{DeclaredColumn, DeclaredColumnSource, DeclaredType, StaticDeclaredColumns};
 #[cfg(feature = "flight-sql")]
 pub use distributed::{
@@ -114,8 +118,8 @@ pub use distributed_rlog::{
     sort_slice_fragment,
 };
 pub use error::{
-    ErrorClass, MSG_CORRUPT, MSG_EXECUTION, MSG_INTERNAL, MSG_PLAN, MSG_UNAVAILABLE,
-    MSG_UNSATISFIABLE, SqlError,
+    ErrorClass, MSG_CORRUPT, MSG_EXECUTION, MSG_INTERNAL, MSG_PLAN, MSG_SPILL_DISABLED_MARKER,
+    MSG_UNAVAILABLE, MSG_UNSATISFIABLE, SqlError,
 };
 pub use executor::{PinnedQuery, PinnedStream, SqlExecutor, SqlOutcome, SqlRequest, SqlStats};
 #[cfg(feature = "flight-sql")]
