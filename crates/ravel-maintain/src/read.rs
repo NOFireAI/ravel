@@ -16,10 +16,11 @@ use std::future::Future;
 use std::pin::Pin;
 
 use futures::stream::{StreamExt, TryStreamExt, iter as stream_iter};
+use ravel_commit::erasure::compute_compaction_input_set_hash;
 use ravel_commit::keys::{self, BucketEntry};
 use ravel_commit::record;
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError, list_all};
-use ravel_proto::commit::v1::CommitRecord;
+use ravel_proto::commit::v1::{CommitRecord, CompactionInputIdentity};
 use ravel_segment::{
     ExemplarInput, FooterLocation, FooterOutcome, ReaderLimits, ValueKind, decode_catalog_v4,
     decode_catalog_v5, decode_exemplars_section, open_from_suffix, plan_ranges_v4,
@@ -38,11 +39,6 @@ const SERIES_META: u32 = 6;
 const SERIES_IDX: u32 = 8;
 const SERIES_META_CHUNKS: u32 = 9;
 const EXEMPLARS: u32 = 10;
-
-/// Domain-separated prefix for the `input_set_hash` preimage. Fixes the
-/// canonical byte stream so any two compactors over the same sealed bucket
-/// derive the same hash and therefore the same record key.
-const INPUT_SET_HASH_DOMAIN: &[u8] = b"ravel-compaction-input-set-v1\0";
 
 /// The partitioned result of listing a bucket's `c/<shard>/<hour>/` prefix
 /// (partitions listed keys by shape). Unknown shapes are a hard
@@ -218,22 +214,26 @@ fn signal_name(s: Signal) -> String {
     s.key_prefix().to_string()
 }
 
-/// Canonical `input_set_hash`: blake3 over a domain-separated, length-framed
-/// encoding of the sorted input identities. Inputs MUST already
-/// be in canonical order (as [`load_inputs`] leaves them).
+/// Canonical `input_set_hash` for `inputs`. Inputs MUST already be in
+/// canonical order (as [`load_inputs`] leaves them).
+///
+/// A thin wrapper over
+/// [`ravel_commit::erasure::compute_compaction_input_set_hash`], the single
+/// source of truth for this hash (issue #830): builds the identity list from
+/// the decoded `InputRecord`s and delegates, so this crate carries no
+/// hash-preimage logic of its own to drift from `ravel-catalog`'s
+/// `seal_divergence`, which recomputes the same hash from a stored record's
+/// declared `inputs`.
 pub fn input_set_hash(inputs: &[InputRecord]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(INPUT_SET_HASH_DOMAIN);
-    let count = inputs.len() as u64;
-    hasher.update(&count.to_le_bytes());
-    for input in inputs {
-        let wid = input.record.writer_id.as_bytes();
-        hasher.update(&(wid.len() as u64).to_le_bytes());
-        hasher.update(wid);
-        hasher.update(&input.record.writer_epoch.to_le_bytes());
-        hasher.update(&input.record.writer_seq.to_le_bytes());
-    }
-    *hasher.finalize().as_bytes()
+    let ids: Vec<CompactionInputIdentity> = inputs
+        .iter()
+        .map(|input| CompactionInputIdentity {
+            writer_id: input.record.writer_id.clone(),
+            writer_epoch: input.record.writer_epoch,
+            writer_seq: input.record.writer_seq,
+        })
+        .collect();
+    compute_compaction_input_set_hash(&ids)
 }
 
 /// One run's copy plan: dedup-priority provenance (from the input's COMMIT
