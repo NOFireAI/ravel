@@ -43,6 +43,8 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
+use crate::fetcher::ReadCache;
+use ravel_cache::{CacheKey, SingleFlightError, Source};
 use ravel_catalog::SegmentRef;
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
 use ravel_rspan::block::{DEFAULT_MAX_UNCOMP, DecodedBlock, read_block, read_block_projected};
@@ -167,6 +169,15 @@ pub enum SpanFetchError {
 pub struct SpanSegmentFetcher {
     store: Arc<dyn ObjectStoreBackend>,
     cfg: RspanConfig,
+    /// ADR-0046's read cache, consulted by
+    /// [`fetch_accounted`](Self::fetch_accounted) and
+    /// [`fetch_accounted_columnar`](Self::fetch_accounted_columnar) -- the only
+    /// funnels here that carry the `tenant_hash` a cache key needs.
+    /// [`fetch`](Self::fetch) is unaccounted and tenant-blind (test/block-stat
+    /// spy only) and never consults it, unchanged by its presence. Either tier
+    /// configuration (see [`ReadCache`]); production builds the RAM or
+    /// RAM-over-disk variant the same way the metric and log fetchers do.
+    cache: Option<ReadCache>,
 }
 
 impl SpanSegmentFetcher {
@@ -174,6 +185,7 @@ impl SpanSegmentFetcher {
         SpanSegmentFetcher {
             store,
             cfg: RspanConfig::default(),
+            cache: None,
         }
     }
 
@@ -181,6 +193,19 @@ impl SpanSegmentFetcher {
     #[must_use]
     pub fn with_config(mut self, cfg: RspanConfig) -> Self {
         self.cfg = cfg;
+        self
+    }
+
+    /// Wires ADR-0046's read cache into
+    /// [`fetch_accounted`](Self::fetch_accounted) and
+    /// [`fetch_accounted_columnar`](Self::fetch_accounted_columnar), mirroring
+    /// [`LogSegmentFetcher::with_cache`](crate::log_fetcher::LogSegmentFetcher::with_cache).
+    /// Accepts either tier configuration through [`ReadCache`] (an
+    /// `Arc<Cache<..>>` or an `Arc<TieredCache<..>>`, both convert via
+    /// [`From`]).
+    #[must_use]
+    pub fn with_cache(mut self, cache: impl Into<ReadCache>) -> Self {
+        self.cache = Some(cache.into());
         self
     }
 
@@ -307,20 +332,9 @@ impl SpanSegmentFetcher {
         }
 
         let key = &seg_ref.data_object_key;
-        let got = self
-            .store
-            .get(key, GetRange::Full)
-            .await
-            .map_err(|source| SpanFetchError::Store {
-                key: key.to_string(),
-                source,
-            })?;
-        // This funnel issues exactly one whole-object GET per call, the same
-        // shape the logs funnel records (one `Get` request, the transferred
-        // byte count). `estimate_spans_cost` bounds this at one GET per segment.
-        accounting.record_s3_request(AccountedOp::Get);
-        accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
-        let bytes = got.data;
+        let bytes = self
+            .whole_object_bytes(seg_ref, tenant_hash, accounting)
+            .await?;
 
         // Tenant identity guard: an object whose footer names a different
         // tenant is never decoded. The footer trailer is parsed here (cheap);
