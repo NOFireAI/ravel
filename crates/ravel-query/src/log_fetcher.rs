@@ -51,6 +51,7 @@ use std::sync::Arc;
 
 use crate::erasure::ErasurePredicate;
 use crate::fetcher::ReadCache;
+use crate::phase_accounting::PhaseAccounting;
 use bytes::Bytes;
 use ravel_cache::{CacheKey, SingleFlightError, Source};
 use ravel_catalog::SegmentRef;
@@ -781,8 +782,16 @@ impl LogSegmentFetcher {
         &self,
         seg_ref: &SegmentRef,
         query: &LogQuery,
-        accounting: &QueryAccounting,
+        caller_accounting: &QueryAccounting,
     ) -> Result<Option<LogFetchOutput>, LogFetchError> {
+        // Issue #796: this funnel has no separate plan step of its own (one
+        // unconditional whole-object GET, then decode), so its GET is charged
+        // to the `scan` phase. See `crate::phase_accounting`'s module docs for
+        // the phase taxonomy and `scan_accounted_with_tenant` below for the
+        // tenant-aware funnel this untenanted entry point mirrors.
+        let phase = PhaseAccounting::new();
+        let accounting = phase.scan();
+        let result = async {
         if !Self::ts_range_relevant(seg_ref, query.ts_min_ns, query.ts_max_ns) {
             return Ok(None);
         }
@@ -819,6 +828,10 @@ impl LogSegmentFetcher {
         fetch_span.record("s3_requests", 1u64);
         fetch_span.record("s3_bytes", got.data.len() as u64);
         self.decode_spanned(key, &got.data, query)
+        }
+        .await;
+        caller_accounting.merge_snapshot(&phase.snapshot().pooled());
+        result
     }
 
     /// Cache-aware counterpart of [`fetch_accounted`](Self::fetch_accounted):
@@ -848,19 +861,34 @@ impl LogSegmentFetcher {
         seg_ref: &SegmentRef,
         tenant_hash: TenantHash,
         query: &LogQuery,
-        accounting: &QueryAccounting,
+        caller_accounting: &QueryAccounting,
     ) -> Result<Option<LogFetchOutput>, LogFetchError> {
+        // Issue #796: `tenant_bytes` (below the block-range threshold, a
+        // whole-object GET) and the block-range path it falls through to
+        // above threshold both do data reads with no separate plan step of
+        // their own here, so this funnel's GETs are charged to `scan`.
+        // `decode_spanned` (below) records no accounting of its own -- unlike
+        // the `LogSegmentScan`-returning funnels below, this one fully
+        // decodes and returns before this function returns, so buffering into
+        // a disposable `PhaseAccounting` and merging once is safe here.
+        let phase = PhaseAccounting::new();
+        let accounting = phase.scan();
         // This funnel's decode (`scan_bytes`) reads every column, so the fetch
         // selection is the same: on a version-4 object it brings every column
         // chunk of every surviving block (ADR-0699 decision 5).
         let all = ColumnSelection::all();
-        let Some(bytes) = self
-            .tenant_bytes(seg_ref, tenant_hash, query, &all, accounting)
-            .await?
-        else {
-            return Ok(None);
-        };
-        self.decode_spanned(&seg_ref.data_object_key, &bytes, query)
+        let result = async {
+            let Some(bytes) = self
+                .tenant_bytes(seg_ref, tenant_hash, query, &all, accounting)
+                .await?
+            else {
+                return Ok(None);
+            };
+            self.decode_spanned(&seg_ref.data_object_key, &bytes, query)
+        }
+        .await;
+        caller_accounting.merge_snapshot(&phase.snapshot().pooled());
+        result
     }
 
     /// Streaming counterpart of
@@ -887,6 +915,23 @@ impl LogSegmentFetcher {
     /// by [`BlockRangeFetcher`] as a probe plus coalesced block ranges, so the
     /// raw bytes moved are proportional to pruning rather than to object size --
     /// but the resident buffer is still object-sized, per call.
+    ///
+    /// # Issue #796 phase attribution
+    ///
+    /// Every GET this funnel issues (directly, or through
+    /// [`BlockRangeFetcher`]'s probe-then-range protocol above the
+    /// block-range threshold) is `scan` phase by this file's mapping: unlike
+    /// [`plan_segment`](Self::plan_segment), nothing here is a standalone
+    /// planning read. `accounting` is taken and stored as-is (not buffered
+    /// through a disposable [`PhaseAccounting`](crate::phase_accounting::PhaseAccounting)
+    /// like [`fetch_accounted_with_tenant`](Self::fetch_accounted_with_tenant)):
+    /// the returned [`LogSegmentScan`] keeps writing to it after this call
+    /// returns (`LogSegmentScan::finish`'s deferred `page_bytes_fetched`/
+    /// `page_bytes_decoded`, ADR-0107 decision 4), so a merge-once buffer
+    /// would silently drop those writes. A caller wanting a live `scan`-phase
+    /// split for this funnel would need to pass a `PhaseAccounting::scan()`
+    /// handle directly; no in-scope caller does, which is a #796 report
+    /// finding, not a bug fixed here.
     pub async fn scan_accounted_with_tenant(
         &self,
         seg_ref: &SegmentRef,
@@ -937,6 +982,11 @@ impl LogSegmentFetcher {
     ///
     /// A single GET observes one object state, so no [`EtagPin`] is needed: the
     /// multi-GET consistency the block-range path must defend does not arise here.
+    ///
+    /// Issue #796: `scan` phase, same reasoning and the same not-buffered
+    /// `accounting` handling as
+    /// [`scan_accounted_with_tenant`](Self::scan_accounted_with_tenant)'s doc
+    /// comment.
     pub async fn scan_whole_accounted_with_tenant(
         &self,
         seg_ref: &SegmentRef,
@@ -996,13 +1046,27 @@ impl LogSegmentFetcher {
     /// path skips the plan pass entirely.
     ///
     /// [`scan_accounted_with_tenant`]: Self::scan_accounted_with_tenant
+    ///
+    /// Issue #796: every GET this method issues -- the fast path's footer
+    /// probe, the skip-decidable path's `fetch_plan_sections`, and the
+    /// fallback's whole-object read (a planning read here, not a scan, per
+    /// its own comment below) -- is `plan` phase. Buffered through a
+    /// disposable [`PhaseAccounting`](crate::phase_accounting::PhaseAccounting)
+    /// and merged once before returning: safe here because, unlike the
+    /// `LogSegmentScan`-returning funnels, nothing this method returns keeps
+    /// writing to the accounting handle after it returns (the fallback's
+    /// `scan.remaining_blocks()`/`scan.stats()` are read synchronously, and
+    /// the `BlockScan` itself carries no accounting handle).
     pub async fn plan_segment(
         &self,
         seg_ref: &SegmentRef,
         tenant_hash: TenantHash,
         query: &LogQuery,
-        accounting: &QueryAccounting,
+        caller_accounting: &QueryAccounting,
     ) -> Result<Option<(usize, ScanStats, Option<footer::LogFooter>)>, LogFetchError> {
+        let phase = PhaseAccounting::new();
+        let accounting = phase.plan();
+        let result = async {
         // Fast path (#693): a query with no block-level predicate whose ts
         // window fully CONTAINS the segment's span prunes nothing -- every block
         // survives -- so the survivor count is the footer's `block_count` and no
@@ -1117,6 +1181,10 @@ impl LogSegmentFetcher {
         let span = decode_span();
         let scan = span.in_scope(|| self.open_scan(key, &bytes, query, &all))?;
         Ok(Some((scan.remaining_blocks(), scan.stats(), None)))
+        }
+        .await;
+        caller_accounting.merge_snapshot(&phase.snapshot().pooled());
+        result
     }
 
     /// Whether [`plan_segment`](Self::plan_segment)'s survivor count can be read
@@ -1360,6 +1428,11 @@ impl LogSegmentFetcher {
     /// probes as before. It changes only the read shape, never the bytes decoded.
     ///
     /// [`scan_accounted_with_tenant`]: Self::scan_accounted_with_tenant
+    ///
+    /// Issue #796: `scan` phase, same reasoning and the same not-buffered
+    /// `accounting` handling as
+    /// [`scan_accounted_with_tenant`](Self::scan_accounted_with_tenant)'s doc
+    /// comment.
     #[allow(clippy::too_many_arguments)]
     pub async fn scan_accounted_with_tenant_subset(
         &self,
