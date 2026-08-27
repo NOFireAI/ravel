@@ -276,11 +276,17 @@ async fn run(args: &Args) -> Result<SqlLatencyReport, ravel_bench::sql_latency::
     // 8,424-object tenant wastes the run and real S3 requests. It is not in
     // `measure_corpus` because library code deciding this from process-global
     // env makes an exported RAVEL_BENCH_PROFILE_SVG fail unrelated tests.
-    ravel_bench::profiling::runs_supported_with_profiling(
-        ravel_bench::profiling::profile_requested(),
-        args.runs,
-    )
-    .map_err(ravel_bench::sql_latency::Error::from)?;
+    // The Flight lane executes in `measure_over_flight`, which never constructs
+    // a `ProfileSession`, so no sampler exists there and the crash this guards
+    // cannot happen; refusing a Flight `--runs 3` (the default) would reject a
+    // safe run. Gate on the lanes that actually arm a sampler.
+    if args.flight.is_none() {
+        ravel_bench::profiling::runs_supported_with_profiling(
+            ravel_bench::profiling::profile_requested(),
+            args.runs,
+        )
+        .map_err(ravel_bench::sql_latency::Error::from)?;
+    }
     let entries = match &args.corpus {
         Some(path) => load_external_corpus(path)?,
         None => checked_default_corpus()?,
