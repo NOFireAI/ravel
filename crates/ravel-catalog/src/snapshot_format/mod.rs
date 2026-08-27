@@ -240,6 +240,77 @@ mod tests {
         assert_eq!(decoded.entries, vec![entry]);
     }
 
+    /// The per-level writer_id width is the identity contract every producer
+    /// of a snapshot entry must honour: a level-0 L0 entry carries the 16-byte
+    /// flush writer uuid, a level-1 compaction or rewrite part carries the
+    /// 32-byte `input_set_hash` in the same slot (fold.rs
+    /// `build_l1_snapshot_entry`). A future producer emitting the wrong width
+    /// fails here at encode time, not hours later at a `catalog verify` on a
+    /// real tenant (issue #819).
+    #[test]
+    fn writer_id_width_is_pinned_per_level() {
+        let base = SnapshotEntry {
+            level: 0,
+            shard: 0,
+            ingest_hour_bucket: 0,
+            writer_id: vec![0xAA; 16],
+            writer_epoch: 1,
+            writer_seq: 1,
+            content_hash: vec![0xBB; 32],
+            object_size: 100,
+            min_event_ts_ns: 0,
+            max_event_ts_ns: 100,
+            sample_count: 1,
+            series_count: 1,
+            segment_format_version: 1,
+            created_unix_ns: 1_000,
+        };
+
+        // Level 0 accepts exactly the 16-byte flush writer uuid.
+        encode_part([0x11; 16], 1, 8, 5, std::slice::from_ref(&base))
+            .expect("16-byte level-0 writer_id encodes");
+        let l0_wide = SnapshotEntry {
+            writer_id: vec![0xAA; 32],
+            ..base.clone()
+        };
+        assert_eq!(
+            encode_part([0x11; 16], 1, 8, 5, std::slice::from_ref(&l0_wide))
+                .expect_err("32-byte level-0 writer_id is rejected"),
+            SnapshotFormatError::BadFieldLen {
+                field: "writer_id",
+                expected: 16,
+                actual: 32,
+            }
+        );
+
+        // Level 1 accepts exactly the 32-byte input_set_hash.
+        let l1 = SnapshotEntry {
+            level: 1,
+            writer_id: vec![0xCC; 32],
+            writer_epoch: 0,
+            writer_seq: 0,
+            ..base.clone()
+        };
+        encode_part([0x11; 16], 1, 8, 5, std::slice::from_ref(&l1))
+            .expect("32-byte level-1 writer_id encodes");
+        let l1_narrow = SnapshotEntry {
+            level: 1,
+            writer_id: vec![0xCC; 16],
+            writer_epoch: 0,
+            writer_seq: 0,
+            ..base
+        };
+        assert_eq!(
+            encode_part([0x11; 16], 1, 8, 5, std::slice::from_ref(&l1_narrow))
+                .expect_err("16-byte level-1 writer_id is rejected"),
+            SnapshotFormatError::BadFieldLen {
+                field: "writer_id",
+                expected: 32,
+                actual: 16,
+            }
+        );
+    }
+
     /// Pins the persistent-format constants. A change here is a format
     /// change (.claude/skills/format-change),
     /// never a refactor.
