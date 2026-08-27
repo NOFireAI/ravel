@@ -12,7 +12,9 @@ use std::sync::Arc;
 
 use ravel_types::logstream::AttrValue;
 
-use crate::block::{ColumnPlan, DecodedBlock, PageCounters, read_block_columns, read_block_pages};
+use crate::block::{
+    ColumnIdSet, ColumnPlan, DecodedBlock, PageCounters, read_block_columns, read_block_pages,
+};
 use crate::bloom_section::BloomSection;
 use crate::columnar::ColumnarBlockView;
 use crate::columns::ColumnSelection;
@@ -449,7 +451,9 @@ impl<'a> RlogReader<'a> {
             stream_dir: self.stream_dir.clone(),
             field_dir: self.field_dir.clone(),
             plans: self.plans(),
-            columns: columns.resolve(&self.field_dir),
+            columns: columns
+                .resolve(&self.field_dir)
+                .map(|s| s.into_iter().collect()),
             content: content.clone(),
             blocks,
             page_dir: self.page_dir.clone(),
@@ -768,8 +772,11 @@ pub struct BlockScan {
     stream_dir: StreamDir,
     field_dir: FieldDir,
     plans: Vec<ColumnPlan>,
-    /// `None` decodes every column (see [`ColumnSelection::resolve`]).
-    columns: Option<std::collections::HashSet<u32>>,
+    /// `None` decodes every column (see [`ColumnSelection::resolve`]). Column
+    /// ids are self-generated and dense (docs on [`ColumnIdSet`]), so this
+    /// re-collects `resolve`'s std `HashSet<u32>` into the crate's faster set
+    /// rather than paying SipHash on every page of every block decoded.
+    columns: Option<ColumnIdSet>,
     /// The exact per-row filter, re-evaluated against every decoded row.
     content: Predicate,
     blocks: Vec<BlockLoc>,
@@ -1022,7 +1029,7 @@ pub(crate) fn decode_v4_block(
     block_crc32c: u32,
     pages: &[PageLoc],
     plans: &[ColumnPlan],
-    columns: Option<&std::collections::HashSet<u32>>,
+    columns: Option<&ColumnIdSet>,
 ) -> Result<DecodedBlock, LogSegError> {
     let wanted = |cid: u32| match columns {
         None => true,
