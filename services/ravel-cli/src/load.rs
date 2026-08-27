@@ -74,6 +74,13 @@ pub const DEFAULT_BATCH_ROWS: usize = 10_000;
 /// with `--pipeline-depth`'s own in-flight-write working set.
 pub const DEFAULT_DECODE_QUEUE_BATCHES: usize = 2;
 
+/// Default per-shard bound on concurrently in-flight flushes (issue #807), the
+/// `--max-inflight-flushes` lever. Pinned to
+/// [`IngestConfig::max_inflight_flushes`]'s own default by
+/// `default_max_inflight_flushes_matches_ingest_config`, so the loader's
+/// out-of-the-box flush pipelining stays exactly the server's.
+pub const DEFAULT_MAX_INFLIGHT_FLUSHES: u32 = 1;
+
 /// Ack deadline for each Strict write. Generous: a bulk load values completing
 /// over racing a slow store.
 const WRITE_ACK_DEADLINE: Duration = Duration::from_secs(60);
@@ -270,6 +277,7 @@ pub async fn run(
     batch_rows: usize,
     read_cursors: Option<usize>,
     pipeline_depth: usize,
+    max_inflight_flushes: u32,
     decode_queue_batches: usize,
     now_ns: i64,
 ) -> anyhow::Result<()> {
@@ -282,6 +290,7 @@ pub async fn run(
         batch_rows,
         read_cursors,
         pipeline_depth,
+        max_inflight_flushes,
         decode_queue_batches,
         now_ns,
         &mut std::io::stderr(),
@@ -306,6 +315,7 @@ pub(crate) async fn run_warning_to(
     batch_rows: usize,
     read_cursors: Option<usize>,
     pipeline_depth: usize,
+    max_inflight_flushes: u32,
     decode_queue_batches: usize,
     now_ns: i64,
     warnings: &mut dyn std::io::Write,
@@ -330,6 +340,7 @@ pub(crate) async fn run_warning_to(
         batch_rows,
         read_cursors,
         pipeline_depth,
+        max_inflight_flushes,
         decode_queue_batches,
         now_ns,
         Arc::new(SystemClock),
@@ -557,6 +568,9 @@ impl LoadError {
 ///   first-touch path `services/ravel-server` runs; the router then resolves
 ///   the active generation from that record itself.
 /// - `batch_rows` rows are written per Strict flush.
+/// - The per-shard flush window is [`DEFAULT_MAX_INFLIGHT_FLUSHES`] and the
+///   decode-queue depth [`DEFAULT_DECODE_QUEUE_BATCHES`]; [`load_instrumented`]
+///   is the seam that takes either as a parameter.
 /// - `now_ns` is the ingest-time anchor for the future-skew check (the past-lag
 ///   check is deliberately omitted per ADR-0089). Bucketing is by the router's
 ///   own clock (load-time wall clock), independent of the records' event times.
@@ -594,6 +608,7 @@ pub async fn load(
         batch_rows,
         read_cursors,
         pipeline_depth,
+        DEFAULT_MAX_INFLIGHT_FLUSHES,
         DEFAULT_DECODE_QUEUE_BATCHES,
         now_ns,
         clock,
@@ -628,6 +643,7 @@ async fn load_instrumented(
     batch_rows: usize,
     read_cursors: Option<usize>,
     pipeline_depth: usize,
+    max_inflight_flushes: u32,
     decode_queue_batches: usize,
     now_ns: i64,
     clock: Arc<dyn Clock>,
@@ -663,6 +679,19 @@ async fn load_instrumented(
         return Err(LoadError::Setup(
             "--read-cursors must be at least 1, or omitted for automatic sizing \
              (min(shard count, row-group count)); 0 was given"
+                .to_string(),
+        ));
+    }
+    // Same shape as the guards above: `--max-inflight-flushes` is the
+    // operator-facing lever bounding how many flushes one shard may run at once
+    // (issue #807). A bound of 0 is a semaphore no flush can ever acquire, so
+    // the shard actor would park on its first flush trigger forever; reject it
+    // here rather than silently clamping to 1.
+    if max_inflight_flushes == 0 {
+        return Err(LoadError::Setup(
+            "--max-inflight-flushes must be at least 1 (the number of flushes one shard may have \
+             in flight at once); 0 would deadlock every flush, since a shard could never acquire \
+             a permit to run one"
                 .to_string(),
         ));
     }
@@ -711,10 +740,18 @@ async fn load_instrumented(
     // unawaited future does no I/O until polled; spawning is what makes the S3
     // PUT round trips overlap). `write`/`write_columnar` take `&self`, so this
     // is the only change the router's own type needs.
+    //
+    // `max_inflight_flushes` is the second, inner concurrency window (issue
+    // #807): `pipeline_depth` bounds the writes the loader keeps outstanding,
+    // this bounds the flushes each shard actor may run at once, and the two
+    // multiply. It reaches the shard actors' flush semaphores unmodified
+    // (`Semaphore::new(config.max_inflight_flushes as usize)` in
+    // crates/ravel-ingest/src/log_shard.rs); nothing downstream clamps it.
     let router = Arc::new(LogIngestRouter::new(
         IngestConfig {
             shard_count: shards,
             target_bytes: 1,
+            max_inflight_flushes,
             ..IngestConfig::default()
         },
         Arc::clone(&store),
@@ -3453,6 +3490,7 @@ type = "i64"
             10_000,
             None,
             1,
+            DEFAULT_MAX_INFLIGHT_FLUSHES,
             DEFAULT_DECODE_QUEUE_BATCHES,
             NOW_NS,
             &mut sink,
@@ -3644,6 +3682,7 @@ type = "i64"
             10,
             None,
             1,
+            DEFAULT_MAX_INFLIGHT_FLUSHES,
             0,
             NOW_NS,
             Arc::new(FixedClock(NOW_NS)),
@@ -3661,6 +3700,65 @@ type = "i64"
             err.to_string()
                 .contains("--decode-queue-batches must be at least 1"),
             "the error names the lever: {err}"
+        );
+    }
+
+    /// `--max-inflight-flushes 0` is rejected with a typed [`LoadError::Setup`]
+    /// before any work, mirroring `pipeline_depth_zero_is_rejected` (issue
+    /// #807). A bound of 0 builds `Semaphore::new(0)` in every shard actor, a
+    /// permit no flush can ever acquire, so the guard makes it unreachable
+    /// rather than letting the first flush trigger park forever.
+    ///
+    /// Non-vacuity (prove-the-test): the message assertion is what carries the
+    /// weight. With the guard deleted, this fixture still fails, but on the
+    /// missing-file open further down, so the `LoadError::Setup(_)` shape alone
+    /// would pass while the flag went unvalidated; only the
+    /// `--max-inflight-flushes must be at least 1` text distinguishes the two.
+    #[tokio::test]
+    async fn max_inflight_flushes_zero_is_rejected() {
+        use ravel_object_store::memory::MemoryStore;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let m = base_mapping();
+        let err = load_instrumented(
+            store,
+            Path::new("/nonexistent.parquet"),
+            "acme",
+            &m,
+            4,
+            10,
+            None,
+            1,
+            0,
+            DEFAULT_DECODE_QUEUE_BATCHES,
+            NOW_NS,
+            Arc::new(FixedClock(NOW_NS)),
+            LoadPath::Columnar,
+            None,
+            None,
+        )
+        .await
+        .expect_err("max_inflight_flushes of 0 is rejected");
+        assert!(
+            matches!(err, LoadError::Setup(_)),
+            "a typed setup error, got: {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("--max-inflight-flushes must be at least 1"),
+            "the error names the lever: {err}"
+        );
+    }
+
+    /// The loader's `--max-inflight-flushes` default is the ingest layer's own
+    /// default, not an independent literal that can drift from it: omitting the
+    /// flag must leave a load running exactly the flush pipelining
+    /// `IngestConfig` ships with.
+    #[test]
+    fn default_max_inflight_flushes_matches_ingest_config() {
+        assert_eq!(
+            DEFAULT_MAX_INFLIGHT_FLUSHES,
+            IngestConfig::default().max_inflight_flushes,
+            "the CLI default must track IngestConfig::max_inflight_flushes"
         );
     }
 
@@ -3848,6 +3946,7 @@ type = "i64"
                     2,
                     None,
                     2,
+                    DEFAULT_MAX_INFLIGHT_FLUSHES,
                     depth,
                     NOW_NS,
                     Arc::new(FixedClock(NOW_NS)),
@@ -4013,6 +4112,7 @@ type = "i64"
             2,
             None,
             1,
+            DEFAULT_MAX_INFLIGHT_FLUSHES,
             QUEUE_DEPTH,
             NOW_NS,
             Arc::new(FixedClock(NOW_NS)),
@@ -4313,6 +4413,7 @@ type = "i64"
             2,
             None,
             1,
+            DEFAULT_MAX_INFLIGHT_FLUSHES,
             DEFAULT_DECODE_QUEUE_BATCHES,
             NOW_NS,
             Arc::new(FixedClock(NOW_NS)),
@@ -4696,6 +4797,7 @@ type = "i64"
             batch_rows,
             Some(1),
             1,
+            DEFAULT_MAX_INFLIGHT_FLUSHES,
             DEFAULT_DECODE_QUEUE_BATCHES,
             NOW_NS,
             &mut sink,
@@ -4723,6 +4825,7 @@ type = "i64"
             batch_rows,
             Some(4),
             1,
+            DEFAULT_MAX_INFLIGHT_FLUSHES,
             DEFAULT_DECODE_QUEUE_BATCHES,
             NOW_NS,
             &mut sink,
@@ -4764,6 +4867,7 @@ type = "i64"
             batch_rows,
             Some(1),
             1,
+            DEFAULT_MAX_INFLIGHT_FLUSHES,
             DEFAULT_DECODE_QUEUE_BATCHES,
             NOW_NS,
             &mut sink,
@@ -5646,6 +5750,7 @@ type = "i64"
             batch_rows,
             read_cursors,
             1,
+            DEFAULT_MAX_INFLIGHT_FLUSHES,
             DEFAULT_DECODE_QUEUE_BATCHES,
             now_ns,
             clock,
@@ -5937,6 +6042,125 @@ type = "i64"
             max_d3 >= 3,
             "at --pipeline-depth 3 the write window reaches three concurrently outstanding PUTs, \
              got {max_d3}"
+        );
+    }
+
+    /// `--max-inflight-flushes` is load-bearing, not accepted-and-ignored, and
+    /// it is a genuinely different window from `--pipeline-depth`: it bounds the
+    /// flushes ONE SHARD may run at once, where `--pipeline-depth` bounds the
+    /// writes the loader keeps outstanding across all shards. Every batch here
+    /// lands on the same shard (`--shards 1`), so the shard's flush semaphore is
+    /// the only thing that can serialize them, and `--pipeline-depth 4` is held
+    /// above every flush setting under test so the loader's own window is never
+    /// the binding constraint.
+    ///
+    /// Four rows, one row per batch, each data-object PUT held 50ms while the
+    /// store tracks the running maximum of concurrently outstanding data-object
+    /// PUTs. Both arms assert an exact figure, not a floor: the semaphore is a
+    /// hard ceiling (a shard may not exceed its permit count) and, with four
+    /// batches queued behind a four-deep loader window, it is also reached.
+    ///
+    /// Non-vacuity (prove-the-test): confirmed failing against the pre-change
+    /// code by deleting the `max_inflight_flushes,` field from the
+    /// `IngestConfig` literal in `load_instrumented`, which is exactly the state
+    /// before this ticket -- the flag parsed and threaded but never reaching the
+    /// router. The window then falls back to `IngestConfig::default()`'s 1 and
+    /// the `flushes = 3` arm observes a high-water mark of 1 instead of 3. The
+    /// `flushes = 1` arm is the control: it reads 1 either way, so on its own it
+    /// proves nothing, which is why the higher setting is asserted exactly.
+    #[tokio::test]
+    async fn max_inflight_flushes_bounds_concurrent_flushes_per_shard() {
+        use parquet::arrow::ArrowWriter;
+        use ravel_object_store::memory::MemoryStore;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Rows, and therefore single-row batches, in the fixture. One more
+        /// than the highest flush window under test, so the window (not the
+        /// supply of batches) is what the high-water mark measures.
+        const BATCHES: usize = 4;
+        /// Held above every flush setting under test: the loader's own window
+        /// must never be the binding constraint on this fixture.
+        const PIPELINE_DEPTH: usize = 4;
+
+        async fn max_concurrent_at_flush_window(flushes: u32) -> usize {
+            // One shard, so every batch's flush contends for the same shard
+            // actor's semaphore. Distinct hosts keep the objects distinct
+            // without changing routing.
+            let shards = 1u32;
+            let hosts: Vec<String> = (0..BATCHES).map(|i| format!("h{i}")).collect();
+
+            let dir = tempfile::tempdir().expect("tempdir");
+            let pq = dir.path().join("flush_window.parquet");
+            let cols: Vec<(String, ArrayRef)> = vec![
+                ("ts".to_string(), i64_col(vec![NOW_NS; BATCHES])),
+                ("svc".to_string(), str_col(vec!["api"; BATCHES])),
+                (
+                    "host".to_string(),
+                    str_col(hosts.iter().map(|h| h.as_str()).collect()),
+                ),
+            ];
+            let b = RecordBatch::try_from_iter(cols).expect("record batch");
+            let file = std::fs::File::create(&pq).expect("create parquet");
+            let mut writer = ArrowWriter::try_new(file, b.schema(), None).expect("arrow writer");
+            writer.write(&b).expect("write batch");
+            writer.close().expect("close writer");
+
+            let m = parse_mapping(
+                "ts_column = \"ts\"\nts_unit = \"nanos\"\n\n\
+                 [[resource_attribute]]\nkey = \"service.name\"\ncolumn = \"svc\"\ntype = \"str\"\n\n\
+                 [[resource_attribute]]\nkey = \"host\"\ncolumn = \"host\"\ntype = \"str\"\n",
+            )
+            .expect("valid mapping");
+
+            let max_in_flight = Arc::new(AtomicUsize::new(0));
+            let store = Arc::new(InstrumentedPutStore {
+                inner: Arc::new(MemoryStore::new()),
+                delays: vec![("/l0/", Duration::from_millis(50))],
+                in_flight: Arc::new(AtomicUsize::new(0)),
+                max_in_flight: Arc::clone(&max_in_flight),
+                watch_prefixes: Vec::new(),
+                watch_started: Arc::new(AtomicUsize::new(0)),
+                watch_completed: Arc::new(AtomicUsize::new(0)),
+            });
+
+            let report = load_instrumented(
+                store as Arc<dyn ObjectStoreBackend>,
+                &pq,
+                "acme",
+                &m,
+                shards,
+                1,
+                None,
+                PIPELINE_DEPTH,
+                flushes,
+                DEFAULT_DECODE_QUEUE_BATCHES,
+                NOW_NS,
+                Arc::new(FixedClock(NOW_NS)),
+                LoadPath::Columnar,
+                None,
+                None,
+            )
+            .await
+            .expect("the load succeeds");
+            assert_eq!(
+                report.rows_processed, BATCHES as u64,
+                "every row is written"
+            );
+            max_in_flight.load(Ordering::SeqCst)
+        }
+
+        let max_w1 = max_concurrent_at_flush_window(1).await;
+        assert_eq!(
+            max_w1, 1,
+            "at --max-inflight-flushes 1 the shard runs exactly one flush at a time even with \
+             --pipeline-depth {PIPELINE_DEPTH} handing it {BATCHES} writes, got {max_w1}"
+        );
+
+        let max_w3 = max_concurrent_at_flush_window(3).await;
+        assert_eq!(
+            max_w3, 3,
+            "at --max-inflight-flushes 3 the shard runs exactly three flushes at once: the \
+             semaphore is the ceiling and {BATCHES} queued batches reach it, got {max_w3}"
         );
     }
 
