@@ -167,6 +167,15 @@ rejected point counts and reasons.
   and must not be over-read to cover logs and spans (ADR-0051 §5).
 - Writer-side retries of the same flush are idempotent by construction:
   same commit key, content-hash-verified (ADR-0002).
+- The `ravel-cli load` bulk path is an instance of this at-least-once logs
+  duplication, not an exception to it. At `--pipeline-depth` > 1 a batch after a
+  failing one may commit in the background after the loader has already returned
+  an error, becoming query-visible without appearing in the loader's reported
+  durable-token list; a resume from that list re-ingests those rows. The Strict
+  ack contract above is intact (the router still returns a token only for a shard
+  that durably committed); the gap is between that ack and the loader's resume
+  aid. See ADR-0807, which keeps the loader default at `--pipeline-depth 1`, where
+  the gap cannot arise.
 
 ### Opt-in client idempotency key (logs and spans)
 
