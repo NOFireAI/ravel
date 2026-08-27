@@ -26,7 +26,7 @@ use ravel_object_store::{
 use ravel_proto::catalog::v1::{SnapshotEntry, SnapshotHead, SnapshotPartRef, SnapshotPostingsRef};
 use ravel_proto::commit::v1::{CommitRecord, CompactionPart, CompactionRecord, RewriteRecord};
 use ravel_segment::{ExpectedIdentity, ReaderLimits, SegmentError};
-use ravel_types::accounting::QueryAccounting;
+use ravel_types::accounting::{AccountedOp, QueryAccounting};
 use ravel_types::{METRIC_NAME_LABEL, Signal, TenantHash};
 use uuid::Uuid;
 
@@ -766,6 +766,18 @@ impl Catalog {
             .await?;
         let shard_generation_count = generations.len() as u32;
         let mut counters = RequestCounters::default();
+        // Fold the generation-history read's GET(s) into the fold's own
+        // counters. Under provisioning enforcement `read_scan_generations`
+        // funnels one provisioning-record GET through `guarded_get` (issue
+        // #729), charged only to the `accounting` handle this fold otherwise
+        // discards; without counting it here `FoldReport.get_requests`
+        // under-reports the store's real GETs by exactly one whenever
+        // enforcement is on (issue #770). The snapshot is taken before the
+        // retry loop reuses `accounting`, so it captures only this pre-loop
+        // read; every in-loop guarded GET is counted explicitly at its call
+        // site. With enforcement off the read issues no store request and this
+        // adds zero.
+        counters.get_requests += accounting.snapshot().s3_requests(AccountedOp::Get);
         let mut attempt: u32 = 0;
 
         // The tenant's effective retention window, read once per fold
@@ -799,6 +811,12 @@ impl Catalog {
                 default_retention_ns
             }
         };
+        // Count the tenant-config record GET. `read_config_values` issues one
+        // raw `store.get` per fold on every outcome (hit, absent, or error) and
+        // takes neither a counters nor an accounting handle, so it is otherwise
+        // invisible to the report. Read once before the retry loop, so it is one
+        // GET per fold regardless of how many CAS attempts the loop makes.
+        counters.get_requests += 1;
 
         loop {
             let head_state = self.get_head(&head_key, &mut counters).await?;
@@ -2117,7 +2135,7 @@ mod tests {
         FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
     };
     use ravel_object_store::memory::MemoryStore;
-    use ravel_object_store::{ObjectStoreBackend, PutOptions};
+    use ravel_object_store::{InstrumentedStore, ObjectStoreBackend, PutOptions};
     use ravel_proto::commit::v1::{CompactionInputIdentity, RetentionTombstone};
     use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
     use ravel_types::{Label, LabelSet, Sample, SeriesId, TenantId};
@@ -2767,9 +2785,9 @@ mod tests {
         assert!(!first.no_op);
         assert_eq!(first.entry_count, 1);
         assert!(first.postings_built);
-        // HEAD get (absent) + 1 commit-record load + 1 segment fetch to
-        // decode the sole entry's names.
-        assert_eq!(first.get_requests, 3);
+        // HEAD get (absent) + 1 tenant-config read + 1 commit-record load +
+        // 1 segment fetch to decode the sole entry's names.
+        assert_eq!(first.get_requests, 4);
 
         let now_2 = now_at_seal(12);
         publish_real_segment(
@@ -2790,11 +2808,95 @@ mod tests {
         assert!(!second.no_op);
         assert_eq!(second.entry_count, 2);
         assert!(second.postings_built);
-        // HEAD get + previous-part load + previous-postings load + 1 new
-        // commit-record load + 1 new segment fetch = 5: the first fold's
-        // "cpu" entry is neither re-loaded from the part nor re-decoded
+        // HEAD get + tenant-config read + previous-part load + previous-postings
+        // load + 1 new commit-record load + 1 new segment fetch = 6: the first
+        // fold's "cpu" entry is neither re-loaded from the part nor re-decoded
         // from its segment.
-        assert_eq!(second.get_requests, 5);
+        assert_eq!(second.get_requests, 6);
+    }
+
+    /// `FoldReport.get_requests` must equal the store's real observed GET count
+    /// on every path (issue #770). Two fold GETs were charged to the discarded
+    /// `QueryAccounting` handle or a bare `store.get` and never folded into the
+    /// report: the tenant-config read (every fold) and, under provisioning
+    /// enforcement, the generation-history read. The report is measured against
+    /// an `InstrumentedStore`'s own GET counter rather than a hand-written
+    /// constant, so the assertion tracks the code it checks.
+    ///
+    /// FLIP (pre-fix demonstration, either line reverted in `Catalog::fold`):
+    /// dropping `counters.get_requests += accounting.snapshot()...` leaves the
+    /// enforcement path reporting 4 against 5 observed; dropping
+    /// `counters.get_requests += 1` after the tenant-config read leaves both
+    /// paths reporting one below observed. Each makes an `assert_eq!` of report
+    /// against observed fail.
+    #[tokio::test]
+    async fn fold_report_get_requests_equals_observed_store_gets() {
+        // One rebuild fold over a fresh instrumented store holding a single
+        // sealed segment. Returns (FoldReport.get_requests, the store's real GET
+        // calls issued during the fold only). Publishing happens on the inner
+        // store before it is wrapped, so only the fold's own requests are
+        // measured.
+        async fn measured(enforce: bool) -> (u64, u64) {
+            let inner = MemoryStore::new();
+            let now = now_at_seal(10);
+            publish_real_segment(
+                &inner,
+                0,
+                Uuid::new_v4(),
+                1,
+                10,
+                now - NS_PER_HOUR,
+                &["cpu"],
+            )
+            .await;
+            let store = Arc::new(InstrumentedStore::new(inner));
+            let catalog = {
+                let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+                if enforce {
+                    catalog.with_provisioning_enforcement()
+                } else {
+                    catalog
+                }
+            };
+
+            let before = store.metrics().snapshot();
+            let report = catalog
+                .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[], None)
+                .await
+                .expect("fold");
+            let after = store.metrics().snapshot();
+
+            assert!(!report.no_op);
+            assert!(report.rebuilt);
+            (report.get_requests, after.get.calls - before.get.calls)
+        }
+
+        // Enforcement off: the report must equal the store's real GET count.
+        // The scan set is a single shard 0 either way (implicit generation 0 at
+        // shard_count 1), so the GETs are HEAD (absent) + tenant-config +
+        // commit-record load + segment fetch = 4.
+        let (off_report, off_observed) = measured(false).await;
+        assert_eq!(
+            off_report, off_observed,
+            "with enforcement off the report must equal the store's observed GETs"
+        );
+        assert_eq!(off_observed, 4);
+
+        // Enforcement on: `read_scan_generations` funnels exactly one extra GET
+        // (the provisioning-record read, NotFound here but still one request)
+        // through `guarded_get`. That is the GET issue #770 dropped; the report
+        // must now equal the store's real count on this path too.
+        let (on_report, on_observed) = measured(true).await;
+        assert_eq!(
+            on_report, on_observed,
+            "with enforcement on the report must equal the store's observed GETs"
+        );
+        assert_eq!(on_observed, 5);
+        assert_eq!(
+            on_observed,
+            off_observed + 1,
+            "enforcement issues exactly one extra GET, the provisioning read"
+        );
     }
 
     // ---- ADR-0063 T2: hour-partitioned sealed/tail parts ----
