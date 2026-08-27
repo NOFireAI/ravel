@@ -409,12 +409,12 @@ pub const MAX_ATTRIBUTE_NESTING_DEPTH: usize = 100;
 
 /// Map one OTLP `AnyValue` to the canonical [`AttrValue`]. Lists and maps
 /// recurse through the same mapping. `key` is carried only for the rejection
-/// message. A value nested inside a list reports the enclosing attribute's
-/// key; one nested inside a kvlist reports that map entry's own key instead,
-/// because the kvlist arm rebinds it. The two arms have disagreed since before
-/// the depth guard existed, and unifying them changes the key reported by the
-/// pre-existing missing- and unsupported-value rejections, so it is issue #808
-/// rather than part of the guard.
+/// message, and it is always the enclosing top-level attribute's key, never
+/// the innermost list index or map entry key: the converter drops the whole
+/// attribute either way, so the rejection needs the name of the thing that
+/// was dropped, not an inner map entry that no longer exists as an
+/// independent value. Both recursive arms pass `key` through unchanged
+/// (issue #808).
 ///
 /// `depth` is the current nesting level (1 for a top-level attribute value,
 /// one more per enclosing array or kvlist). Exceeding
@@ -454,8 +454,7 @@ fn convert_value(
                 .values
                 .iter()
                 .map(|kv| {
-                    convert_value(&kv.key, kv.value.as_ref(), depth + 1)
-                        .map(|v| (kv.key.clone(), v))
+                    convert_value(key, kv.value.as_ref(), depth + 1).map(|v| (kv.key.clone(), v))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(AttrValue::Map(entries))
@@ -1014,6 +1013,205 @@ mod tests {
             }]
         );
         assert_eq!(out.rejected[0].rejected_count(), 1);
+    }
+
+    // --- convert_value key identity (#808): both recursive arms must report
+    // the enclosing top-level attribute's key, never an inner list index or
+    // map entry key, since the converter drops the whole attribute either
+    // way and an inner key may not even be unique.
+
+    #[test]
+    fn value_rejected_inside_a_list_reports_the_enclosing_attribute_key() {
+        let out = normalize(request(vec![resource_logs(
+            vec![],
+            vec![scope_logs(
+                "lib",
+                "1",
+                vec![record(
+                    Some(any(AnyValueVariant::StringValue("body".into()))),
+                    vec![attr_kv(
+                        "outer",
+                        any(AnyValueVariant::ArrayValue(ArrayValue {
+                            values: vec![AnyValue { value: None }],
+                        })),
+                    )],
+                    1,
+                )],
+            )],
+        )]));
+        assert_eq!(
+            out.rejected,
+            vec![LogRejection::MissingAttributeValue {
+                key: "outer".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn value_rejected_inside_a_kvlist_reports_the_enclosing_attribute_key() {
+        // The changing case: before #808 this arm rebound `key` to the map
+        // entry's own key ("inner") instead of the enclosing attribute's.
+        let out = normalize(request(vec![resource_logs(
+            vec![],
+            vec![scope_logs(
+                "lib",
+                "1",
+                vec![record(
+                    Some(any(AnyValueVariant::StringValue("body".into()))),
+                    vec![attr_kv(
+                        "outer",
+                        any(AnyValueVariant::KvlistValue(KeyValueList {
+                            values: vec![KeyValue {
+                                key: "inner".to_string(),
+                                value: None,
+                                ..Default::default()
+                            }],
+                        })),
+                    )],
+                    1,
+                )],
+            )],
+        )]));
+        assert_eq!(
+            out.rejected,
+            vec![LogRejection::MissingAttributeValue {
+                key: "outer".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn value_rejected_inside_a_kvlist_nested_in_a_list_reports_the_enclosing_attribute_key() {
+        let out = normalize(request(vec![resource_logs(
+            vec![],
+            vec![scope_logs(
+                "lib",
+                "1",
+                vec![record(
+                    Some(any(AnyValueVariant::StringValue("body".into()))),
+                    vec![attr_kv(
+                        "outer",
+                        any(AnyValueVariant::ArrayValue(ArrayValue {
+                            values: vec![any(AnyValueVariant::KvlistValue(KeyValueList {
+                                values: vec![KeyValue {
+                                    key: "inner".to_string(),
+                                    value: None,
+                                    ..Default::default()
+                                }],
+                            }))],
+                        })),
+                    )],
+                    1,
+                )],
+            )],
+        )]));
+        assert_eq!(
+            out.rejected,
+            vec![LogRejection::MissingAttributeValue {
+                key: "outer".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn value_rejected_inside_a_list_nested_in_a_kvlist_reports_the_enclosing_attribute_key() {
+        let out = normalize(request(vec![resource_logs(
+            vec![],
+            vec![scope_logs(
+                "lib",
+                "1",
+                vec![record(
+                    Some(any(AnyValueVariant::StringValue("body".into()))),
+                    vec![attr_kv(
+                        "outer",
+                        any(AnyValueVariant::KvlistValue(KeyValueList {
+                            values: vec![KeyValue {
+                                key: "inner".to_string(),
+                                value: Some(any(AnyValueVariant::ArrayValue(ArrayValue {
+                                    values: vec![AnyValue { value: None }],
+                                }))),
+                                ..Default::default()
+                            }],
+                        })),
+                    )],
+                    1,
+                )],
+            )],
+        )]));
+        assert_eq!(
+            out.rejected,
+            vec![LogRejection::MissingAttributeValue {
+                key: "outer".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn unsupported_attribute_value_inside_a_kvlist_reports_the_enclosing_attribute_key() {
+        let out = normalize(request(vec![resource_logs(
+            vec![],
+            vec![scope_logs(
+                "lib",
+                "1",
+                vec![record(
+                    Some(any(AnyValueVariant::StringValue("body".into()))),
+                    vec![attr_kv(
+                        "outer",
+                        any(AnyValueVariant::KvlistValue(KeyValueList {
+                            values: vec![KeyValue {
+                                key: "inner".to_string(),
+                                value: Some(any(AnyValueVariant::StringValueStrindex(5))),
+                                ..Default::default()
+                            }],
+                        })),
+                    )],
+                    1,
+                )],
+            )],
+        )]));
+        assert_eq!(
+            out.rejected,
+            vec![LogRejection::UnsupportedAttributeValue {
+                key: "outer".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn attribute_too_deeply_nested_inside_a_kvlist_reports_the_enclosing_attribute_key() {
+        // The depth guard reaches its rejection through the `depth > MAX`
+        // check at the top of convert_value, a different route than the
+        // Missing/Unsupported arms below it, so it needs its own coverage
+        // of the same key-identity claim.
+        let deep = nested_array(MAX_ATTRIBUTE_NESTING_DEPTH, AnyValueVariant::IntValue(7));
+        let out = normalize(request(vec![resource_logs(
+            vec![],
+            vec![scope_logs(
+                "lib",
+                "1",
+                vec![record(
+                    Some(any(AnyValueVariant::StringValue("body".into()))),
+                    vec![attr_kv(
+                        "outer",
+                        any(AnyValueVariant::KvlistValue(KeyValueList {
+                            values: vec![KeyValue {
+                                key: "inner".to_string(),
+                                value: Some(deep),
+                                ..Default::default()
+                            }],
+                        })),
+                    )],
+                    1,
+                )],
+            )],
+        )]));
+        assert_eq!(
+            out.rejected,
+            vec![LogRejection::AttributeTooDeeplyNested {
+                key: "outer".to_string(),
+                max: MAX_ATTRIBUTE_NESTING_DEPTH,
+            }]
+        );
     }
 
     #[test]
