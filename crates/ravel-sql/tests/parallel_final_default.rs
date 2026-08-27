@@ -30,35 +30,46 @@
 //!
 //! Issue #771 proposed admitting `avg` over an integer column on the premise
 //! that its partial state is an exact `(sum, count)` pair. The ADR-0094
-//! amendment for #771 rejects that premise; three more tests pin the facts the
-//! rejection rests on. They are not a uniform staleness guard, and the
-//! amendment states which branch each one covers: a decimal partial state
-//! upstream reddens the first, an integer one does not (this crate's
-//! `SequentialAvg` displaces DataFusion's accumulator whenever the return type
-//! is Float64, so upstream's state never reaches the plan), and the
-//! order-dependence test is a pinned illustration that consults no symbol from
-//! either crate.
+//! amendment for #771 rejected that premise for DataFusion's own accumulator
+//! and this crate's original `SequentialAvg`, both of which folded every
+//! `avg` numerator as Float64 regardless of input type, making a
+//! cross-partition merge of the partial sum order-dependent.
 //!
-//! - `avg_over_int_column_carries_a_float64_partial_sum_state`: the `Partial`
-//!   aggregate for `avg(k)` over a declared `Int64` `k` emits a **Float64**
-//!   partial-sum state column, not an integer or decimal one.
-//! - `f64_partial_sum_merge_is_order_dependent_for_integer_input`: adding
-//!   Float64 partial sums of ordinary `i64` values in two different orders
-//!   yields two different bit patterns, so merging avg's partial states across
-//!   partitions is not exact.
-//! - `avg_group_by_int_key_agrees_and_stays_single_final` and
-//!   `avg_over_float_input_stays_single_partition`: a `GROUP BY` avg over the
-//!   integer column returns identical pinned values with the flag on and off
-//!   and keeps the single-partition final in both, even though its group key is
-//!   the non-float kind ADR-0094 otherwise admits; the float-input avg keeps it
-//!   too.
+//! ADR-0825 revisits that rejection for the integer case specifically: `avg`
+//! over a resolved integer argument (`Int8`-`Int64`, `UInt8`-`UInt32`) now
+//! stays `Int64` through the analyzed plan (crate::avg's `coerce_types`) and
+//! accumulates in `i128` with checked addition, so its partial state really
+//! is the exact `(Decimal128(38, 0) sum, Int64 count)` pair #771 wanted, and
+//! `aggregate_expr_is_exact` (`executor.rs`) admits it. `avg` over a Float64
+//! argument is untouched: it still folds as plain IEEE f64, still carries an
+//! order-dependent partial sum, and is still never exact. Four tests pin the
+//! facts on each side of that split:
 //!
-//! Both of those carry a `GROUP BY` because an **ungrouped** avg is the wrong
-//! shape to test the gate with: DataFusion does not repartition a single-row
-//! aggregate, so `avg_stays_single_partition_under_default` above holds whether
-//! or not the classifier admits avg (verified by admitting it and watching that
-//! test stay green while the grouped ones went red). The grouped shapes are the
-//! load-bearing guards.
+//! - `avg_over_int_column_carries_a_decimal128_partial_sum_state`: the
+//!   `Partial` aggregate for `avg(k)` over a declared `Int64` `k` emits a
+//!   **Decimal128(38, 0)** partial-sum state column, the exact-integer kind,
+//!   not a Float64 one.
+//! - `f64_partial_sum_merge_is_order_dependent`: adding Float64 partial sums
+//!   of ordinary `i64` values in two different orders yields two different
+//!   bit patterns. This is no longer why avg over an integer *column* is
+//!   non-exact (it isn't, per the point above), but it is exactly why avg
+//!   over a Float64 *argument* stays non-exact: that path still folds in
+//!   f64, whatever type the underlying column was declared as.
+//! - `avg_group_by_int_key_repartitions_final_under_default`: a `GROUP BY`
+//!   avg over the integer column now fans its final aggregation out under
+//!   the default (`FinalPartitioned` + a hash repartition), the same shape
+//!   `sum`/`COUNT(DISTINCT ...)` get, and returns identical pinned bits with
+//!   the flag on and off.
+//! - `avg_over_float_input_stays_single_partition`: the same `GROUP BY`
+//!   shape, but with an explicit Float64 argument, keeps the
+//!   single-partition final in both flag states -- proving the exact-integer
+//!   admission does not leak into the float path.
+//!
+//! Both of the last two carry a `GROUP BY` because an **ungrouped** aggregate
+//! is the wrong shape to test the gate with: DataFusion does not repartition
+//! a single-row aggregate, so `avg_stays_single_partition_under_default`
+//! above holds regardless of whether the classifier admits the statement.
+//! The grouped shapes are the load-bearing guards.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -419,8 +430,12 @@ async fn opt_out_count_distinct_int_stays_single_partition() {
 
 #[tokio::test]
 async fn avg_stays_single_partition_under_default() {
-    // avg resolves to Float64 (a float accumulator), so it is not exact-typed
-    // and must keep the single-partition final even though the default is on.
+    // avg(k) over the declared Int64 column is exact-typed under ADR-0825,
+    // but an ungrouped aggregate is never repartitioned regardless of what
+    // the classifier says (a single scalar row has nothing to fan out), so
+    // this must keep the single-partition final even though the default is
+    // on. See `avg_group_by_int_key_repartitions_final_under_default` below
+    // for the grouped shape that actually exercises the classification gate.
     let fixture = Fixture::build(Fixture::config(
         SqlConfig::default().parallel_final_aggregation,
     ))
@@ -439,7 +454,7 @@ async fn avg_stays_single_partition_under_default() {
     );
     assert!(
         plan.contains("AggregateExec: mode=Final,"),
-        "the non-exact avg keeps the single-partition Final aggregate; got:\n{plan}"
+        "an ungrouped avg keeps the single-partition Final aggregate; got:\n{plan}"
     );
 }
 
@@ -463,17 +478,17 @@ fn expected_grouped_avg_rows() -> Vec<(i64, u64)> {
 }
 
 #[tokio::test]
-async fn avg_over_int_column_carries_a_float64_partial_sum_state() {
-    // Issue #771's premise was that avg over an integer column carries an exact
-    // (sum, count) partial state, making a cross-partition merge exact. It does
-    // not: DataFusion 54.1.0 coerces every non-decimal, non-duration avg
-    // argument to Float64 (average.rs:101-113 signature, :168 return type,
-    // :179 comment), and the accumulator that actually serves this plan holds
-    // the numerator as f64: this crate's `SequentialAvgAccumulator` (avg.rs),
-    // registered over the built-in. DataFusion's own `AvgAccumulator { sum:
-    // Option<f64>, count: u64 }` (average.rs:505-508) is the same shape, so the
-    // premise fails either way, but only the replacement is observable here.
-    // The partial state column type in the plan is the observable form.
+async fn avg_over_int_column_carries_a_decimal128_partial_sum_state() {
+    // Issue #771's premise was that avg over an integer column carries an
+    // exact (sum, count) partial state, making a cross-partition merge exact.
+    // ADR-0825 makes that premise true for the integer case: `k` is a
+    // declared Int64 column, an admitted integer type, so crate::avg's
+    // `coerce_types` keeps its argument Int64 instead of widening it to
+    // Float64, and `ExactIntegerAvgAccumulator`/
+    // `ExactIntegerAvgGroupsAccumulator` (avg.rs) accumulate the numerator in
+    // i128 with checked addition. Its partial state is `(Decimal128(38, 0)
+    // sum, Int64 count)`. The partial state column type in the plan is the
+    // observable form.
     let fixture = Fixture::build(Fixture::config(
         SqlConfig::default().parallel_final_aggregation,
     ))
@@ -487,17 +502,17 @@ async fn avg_over_int_column_carries_a_float64_partial_sum_state() {
         .find(|line| line.contains("AggregateExec: mode=Partial"))
         .unwrap_or_else(|| panic!("expected a Partial AggregateExec; got:\n{plan}"));
     assert!(
-        partial.contains("[avg_sum]:Float64"),
-        "avg's partial sum state over an Int64 column must be Float64 (issue #771's \
-         exact-(sum, count) premise is false); got:\n{partial}"
+        partial.contains("[avg_sum]:Decimal128(38, 0)"),
+        "avg's partial sum state over an admitted-integer column must be \
+         Decimal128(38, 0), the exact-integer kind (ADR-0825 decision 2); got:\n{partial}"
     );
     assert!(
         partial.contains("[avg_count]:Int64"),
         "avg's partial count state must be an integer count; got:\n{partial}"
     );
-    // The exact-typed aggregate for the same column, for contrast: sum(k)
-    // really does carry an Int64 partial state, which is why sum over an
-    // integer input is admitted and avg is not.
+    // The other exact-typed aggregate over the same column, for contrast:
+    // sum(k) carries a plain Int64 partial state (unchanged by ADR-0825,
+    // which explicitly does not touch the public `sum` aggregate).
     let sum_plan = fixture
         .physical_plan_text_with_schema("SELECT sum(k) AS s FROM logs")
         .await;
@@ -513,13 +528,13 @@ async fn avg_over_int_column_carries_a_float64_partial_sum_state() {
 
 #[tokio::test]
 async fn avg_over_float_input_stays_single_partition() {
-    // The other half of the #771 amendment: an avg whose input is float before
-    // coercion is excluded too. (The logs surface declares no float column
-    // type, so the float input is an explicit cast; the planner then drops the
-    // cast, because Float64 is where avg's coercion sends an Int64 argument
-    // anyway. That collapse is the amendment's second point in visible form:
-    // after analysis, avg over an integer column and avg over a float one are
-    // the same plan, so the classifier has no resolved type to admit one by.)
+    // ADR-0825 splits avg into two resolved-type kinds and only admits one:
+    // an explicit CAST(k AS DOUBLE) resolves to Float64 before the aggregate
+    // is classified, so it keeps the order-dependent f64 partial-sum
+    // accumulator and stays outside `aggregate_expr_is_exact`, unlike the
+    // bare Int64 column the sibling test above exercises. The logs surface
+    // declares no native float column, so this is the only way to put a
+    // Float64 argument in front of avg.
     // The statement carries an Int64 GROUP BY key for the reason the module doc
     // gives: an ungrouped aggregate is never repartitioned whatever the
     // classifier says, so only a grouped shape can tell an excluded avg from an
@@ -547,13 +562,18 @@ async fn avg_over_float_input_stays_single_partition() {
 }
 
 #[test]
-fn f64_partial_sum_merge_is_order_dependent_for_integer_input() {
+fn f64_partial_sum_merge_is_order_dependent() {
     // Three ordinary i64 values a log column can hold. Folded as f64 (which is
-    // what avg does, per the test above), the two groupings a repartitioned
-    // merge can produce differ in the last bit: 2^53 + 1 rounds back to 2^53,
-    // while 1 + 1 = 2 survives and 2^53 + 2 is representable. So the partial
-    // sums of a group split across partitions do not merge exactly, and the
-    // division that follows inherits the difference.
+    // what avg does whenever its argument resolves to Float64), the two
+    // groupings a repartitioned merge can produce differ in the last bit:
+    // 2^53 + 1 rounds back to 2^53, while 1 + 1 = 2 survives and 2^53 + 2 is
+    // representable. So the partial sums of a group split across partitions
+    // do not merge exactly, and the division that follows inherits the
+    // difference. This is no longer why avg over an integer *column* is
+    // non-exact -- ADR-0825 gives that case an exact i128 accumulator that
+    // never folds through f64 -- but it is exactly why avg over a Float64
+    // *argument* stays non-exact regardless of what the underlying column
+    // was declared as.
     let values: [i64; 3] = [1 << 53, 1, 1];
     let one_partition = ((values[0] as f64) + values[1] as f64) + values[2] as f64;
     let two_partitions = (values[0] as f64) + ((values[1] as f64) + values[2] as f64);
@@ -569,13 +589,18 @@ fn f64_partial_sum_merge_is_order_dependent_for_integer_input() {
     assert_ne!(
         one_partition.to_bits(),
         two_partitions.to_bits(),
-        "if f64 addition of these i64 values were associative, avg over integer \
-         input could merge across partitions exactly (issue #771)"
+        "if f64 addition of these i64 values were associative, avg over a Float64 \
+         argument could merge partial sums across partitions exactly"
     );
 }
 
 #[tokio::test]
-async fn avg_group_by_int_key_agrees_and_stays_single_final() {
+async fn avg_group_by_int_key_repartitions_final_under_default() {
+    // ADR-0825: avg over the admitted-integer column is exact-typed, so under
+    // the default it must get the same FinalPartitioned/Hash-repartition
+    // shape sum/COUNT(DISTINCT ...) get, and the opt-out must restore the
+    // single-partition final -- the same pair the COUNT(DISTINCT k) tests
+    // above pin, now for avg.
     let on = Fixture::build(Fixture::config(true)).await;
     let off = Fixture::build(Fixture::config(false)).await;
 
@@ -589,25 +614,31 @@ async fn avg_group_by_int_key_agrees_and_stays_single_final() {
     );
     assert_eq!(
         on_rows, off_rows,
-        "avg over an integer column must return identical bits with the flag on and off"
+        "avg over an integer column must return identical bits with the flag on and off: \
+         i128 addition is associative and exact, so partitioning cannot move the result"
     );
 
-    // And it stays on the single-partition final in both, which is why the two
-    // agree: the group key is Int64 (admissible on its own), so avg is the only
-    // disqualifier here.
-    for (label, plan) in [
-        ("flag on", on.physical_plan_text(GROUP_BY_AVG_SQL).await),
-        ("flag off", off.physical_plan_text(GROUP_BY_AVG_SQL).await),
-    ] {
-        assert!(
-            !plan.contains("AggregateExec: mode=FinalPartitioned"),
-            "{label}: an avg must never fan its final aggregation out; got:\n{plan}"
-        );
-        assert!(
-            plan.contains("AggregateExec: mode=Final,"),
-            "{label}: the avg keeps the single-partition Final aggregate; got:\n{plan}"
-        );
-    }
+    let on_plan = on.physical_plan_text(GROUP_BY_AVG_SQL).await;
+    assert!(
+        on_plan.contains("AggregateExec: mode=FinalPartitioned"),
+        "flag on: an exact-typed avg over an integer column must fan its final \
+         aggregation out; got:\n{on_plan}"
+    );
+    assert!(
+        on_plan.contains("RepartitionExec: partitioning=Hash"),
+        "flag on: the fanned-out final aggregate must be fed by a hash repartition; \
+         got:\n{on_plan}"
+    );
+
+    let off_plan = off.physical_plan_text(GROUP_BY_AVG_SQL).await;
+    assert!(
+        !off_plan.contains("AggregateExec: mode=FinalPartitioned"),
+        "flag off: the opt-out must not fan the final aggregation out; got:\n{off_plan}"
+    );
+    assert!(
+        off_plan.contains("AggregateExec: mode=Final,"),
+        "flag off: the opt-out keeps a single-partition Final aggregate; got:\n{off_plan}"
+    );
 }
 
 #[tokio::test]

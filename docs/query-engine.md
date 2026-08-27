@@ -1996,31 +1996,35 @@ the pre-amendment single-partition final for every query (the bare
 is per-query and decided from the query's fully type-coerced (analyzed) plan:
 
 - **Eligible:** `count(...)` and `count(DISTINCT ...)` over any type; `sum`,
-  `min`, `max` over a resolved **non-float** input.
-- **Never eligible:** `avg`/`mean` over **any** input type (their UDAF always
-  runs plain IEEE f64 addition, which is not associative once a running sum
-  exceeds 2^53, so it depends on the single-partition fold order); any `sum`,
-  `min`, `max` over a `Float16`/`Float32`/`Float64` input; and any **float
-  GROUP BY key** (including a bare `SELECT DISTINCT float_col`), because
-  `-0.0`/NaN payloads are bit-significant here and no merge-order-stable
-  representative bit pattern for a float group key is proven.
+  `min`, `max` over a resolved **non-float** input; `avg`/`mean` over a
+  resolved **integer** input (ADR-0825, amending the `#771` rejection below).
+- **Never eligible:** `avg`/`mean` over a resolved **Float64** input (its UDAF
+  runs plain IEEE f64 addition for that kind, which is not associative once a
+  running sum exceeds 2^53, so it depends on the single-partition fold order);
+  any `sum`, `min`, `max` over a `Float16`/`Float32`/`Float64` input; and any
+  **float GROUP BY key** (including a bare `SELECT DISTINCT float_col`),
+  because `-0.0`/NaN payloads are bit-significant here and no
+  merge-order-stable representative bit pattern for a float group key is
+  proven.
 
-`avg` over an **integer** column is excluded by that same rule, and the reason
-is worth stating because the shape looks admissible: an integer argument never
-reaches an accumulator as an integer. DataFusion coerces every non-decimal,
-non-duration `avg` argument to `Float64` before planning finishes, so the
-partial state a two-phase `avg` carries is a **Float64** sum with an integer
-count -- not the exact `(integer sum, count)` pair that would merge across
-partitions without loss. Merging those partial sums is f64 addition and depends
-on how the group was split. A second consequence of the same coercion: after
-analysis both `avg(int_col)` and `avg(float_col)` carry a `Float64` argument
-type, so the classifier has no resolved type by which it could admit one and
-reject the other. The two analyzed nodes are not otherwise identical -- coercion
-adds a cast to the integer case and name preservation renames it back -- so it
-is the argument type that defeats the classifier, not plan identity. See the ADR-0094 amendment for issue
-`#771`, which rejects admitting `avg` on this basis and lists the routes that
-could instead fix the wide-`GROUP BY` `avg` statements that exhaust the memory
-pool today (issue `#741`).
+Originally `avg` over an **integer** column was excluded by the same
+fold-order rule that excludes Float64 `avg`, for a reason the ADR-0094
+amendment for issue `#771` describes at length: DataFusion's built-in `avg`
+coerces every non-decimal, non-duration argument to `Float64` before planning
+finishes, so an integer argument never reached an accumulator as an integer,
+and the classifier had no resolved type by which it could tell `avg(int_col)`
+from `avg(float_col)` apart. ADR-0825 changes the premise: the `avg`/`mean`
+UDAF (`crate::avg`) now coerces an admitted integer argument (`Int8`-`Int64`,
+`UInt8`-`UInt32`) to `Int64` and keeps it there instead of widening to
+`Float64`, and sums it exactly in `i128` with checked addition. That partial
+state is the real `(exact sum, count)` pair issue `#771` found missing --
+carried as `(Decimal128(38, 0), Int64)` -- and integer addition is
+associative, so merging it across partitions in any order reproduces the
+single-partition result exactly. `avg(int_col)` and `avg(float_col)` are
+therefore no longer the same analyzed node: the integer argument keeps its
+Int64 type through analysis instead of widening, which is exactly what the
+classifier now keys on. `avg` over a Float64 argument is unaffected and stays
+excluded for the reason above.
 
 A single disqualifying aggregate or key anywhere in the query -- including inside
 a scalar/`IN`/`EXISTS` subquery -- forces the whole query onto the

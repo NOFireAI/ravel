@@ -68,8 +68,11 @@
 //! classification (`executor::SqlExecutor`) has proven every aggregate and
 //! GROUP BY key in the query is order/partition-independent -- `count`, and
 //! `sum`/`min`/`max` over a resolved non-float input, with no float group key;
-//! `avg`/`mean` (always plain IEEE f64 addition) and any float input or key are
-//! never eligible. It is `false` for every other query and behind a default-off
+//! `avg`/`mean` over a resolved integer input is eligible too (ADR-0825
+//! decision 3): its partial sum is exact `i128` accumulation, never plain f64
+//! addition. `avg`/`mean` over a resolved Float64 input (still plain IEEE f64
+//! addition) and any float input or key are never eligible. It is `false`
+//! for every other query and behind a default-off
 //! `SqlConfig` flag, so this is byte-identical to the old single-partition plan
 //! unless an operator opts in. The join/sort/window/file-scan knobs stay
 //! unconditionally `false`: their determinism requirements are out of ADR-0094's
