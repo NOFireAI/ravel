@@ -470,6 +470,30 @@ impl DiskCache {
     fn dir(&self) -> &Path {
         &self.inner.dir
     }
+
+    /// Corrupts an already-admitted entry's on-disk bytes in place: flips the
+    /// last byte of the file at `key`'s canonical path, mirroring this
+    /// crate's own `get_on_corrupted_payload_is_a_disk_error_not_a_clean_miss`
+    /// test technique. Exists so a cross-crate test can exercise the crc32c
+    /// degrade-to-miss path (module docs, "Corruption after a successful
+    /// write") without this crate exposing its private on-disk layout
+    /// (`path_for`, `Inner::dir`) outside test code; `cfg(test)` gating (as on
+    /// [`dir`](Self::dir) above) is per-crate and does not reach another
+    /// crate's tests, so this is unconditionally `pub`, only doc-hidden, same
+    /// as `RlogWriter::finish_v3_for_tests`. A no-op if no entry is currently
+    /// live at that path: like every other on-disk failure mode this crate
+    /// handles, a missing or unreadable file degrades silently rather than
+    /// panicking in what is, outside test builds, still production code.
+    #[doc(hidden)]
+    pub fn corrupt_entry_for_test(&self, key: &CacheKey) {
+        let path = path_for(&self.inner.dir, key);
+        if let Ok(mut bytes) = fs::read(&path)
+            && let Some(last) = bytes.len().checked_sub(1)
+        {
+            bytes[last] ^= 0xFF;
+            let _ = fs::write(&path, &bytes);
+        }
+    }
 }
 
 impl Drop for DiskCache {

@@ -42,7 +42,9 @@
 
 use std::sync::Arc;
 
+use crate::fetcher::ReadCache;
 use bytes::Bytes;
+use ravel_cache::{CacheKey, SingleFlightError, Source};
 use ravel_catalog::SegmentRef;
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
 use ravel_rspan::block::{DEFAULT_MAX_UNCOMP, DecodedBlock, read_block, read_block_projected};
@@ -167,6 +169,18 @@ pub enum SpanFetchError {
 pub struct SpanSegmentFetcher {
     store: Arc<dyn ObjectStoreBackend>,
     cfg: RspanConfig,
+    /// ADR-0046's read cache, consulted by
+    /// [`whole_object_bytes`](Self::whole_object_bytes) on behalf of
+    /// [`fetch_accounted`](Self::fetch_accounted) and
+    /// [`fetch_accounted_columnar`](Self::fetch_accounted_columnar) -- the only
+    /// funnels here that carry the `tenant_hash` a cache key needs.
+    /// [`fetch`](Self::fetch) is unaccounted and tenant-blind (test/block-stat
+    /// spy only) and never consults it, unchanged by its presence. Mirrors
+    /// [`LogSegmentFetcher::cache`](crate::log_fetcher::LogSegmentFetcher);
+    /// either tier configuration (see [`ReadCache`]) works, and production
+    /// builds the RAM or RAM-over-disk variant the same way the metric and log
+    /// fetchers do.
+    cache: Option<ReadCache>,
 }
 
 impl SpanSegmentFetcher {
@@ -174,6 +188,7 @@ impl SpanSegmentFetcher {
         SpanSegmentFetcher {
             store,
             cfg: RspanConfig::default(),
+            cache: None,
         }
     }
 
@@ -182,6 +197,27 @@ impl SpanSegmentFetcher {
     pub fn with_config(mut self, cfg: RspanConfig) -> Self {
         self.cfg = cfg;
         self
+    }
+
+    /// Wires ADR-0046's read cache into
+    /// [`fetch_accounted`](Self::fetch_accounted) and
+    /// [`fetch_accounted_columnar`](Self::fetch_accounted_columnar), mirroring
+    /// [`LogSegmentFetcher::with_cache`](crate::log_fetcher::LogSegmentFetcher::with_cache).
+    /// Accepts either tier configuration through [`ReadCache`] (an
+    /// `Arc<Cache<..>>` or an `Arc<TieredCache<..>>`, both convert via
+    /// [`From`]).
+    #[must_use]
+    pub fn with_cache(mut self, cache: impl Into<ReadCache>) -> Self {
+        self.cache = Some(cache.into());
+        self
+    }
+
+    /// Whether this fetcher was built with [`with_cache`](Self::with_cache).
+    /// Exposed for tests and callers that need to know without a probe read
+    /// (mirrors [`LogSegmentFetcher::has_cache`](crate::log_fetcher::LogSegmentFetcher::has_cache)).
+    #[must_use]
+    pub fn has_cache(&self) -> bool {
+        self.cache.is_some()
     }
 
     /// Per-object relevance from the catalog summary alone, with no object
@@ -274,19 +310,22 @@ impl SpanSegmentFetcher {
 
     /// Accounted, tenant-checked counterpart of [`fetch`](Self::fetch):
     /// identical prune-and-scan behavior, plus two things (ADR-0044). The
-    /// object GET is recorded against `accounting` at this funnel -- the funnel
-    /// the span scan did not account before -- exactly as
-    /// `LogSegmentFetcher::fetch_accounted` records the log GET; and the fetched
-    /// object's footer `tenant_hash` is verified against `tenant_hash` before it
-    /// is decoded, failing closed with [`SpanFetchError::TenantMismatch`].
+    /// object read is recorded against `accounting` at this funnel -- the
+    /// funnel the span scan did not account before -- exactly as
+    /// `LogSegmentFetcher::fetch_accounted` records the log read (cache hit or
+    /// store GET, via [`whole_object_bytes`](Self::whole_object_bytes)); and
+    /// the fetched object's footer `tenant_hash` is verified against
+    /// `tenant_hash` before it is decoded, failing closed with
+    /// [`SpanFetchError::TenantMismatch`].
     ///
     /// `tenant_hash` mirrors the logs scan chain, which threads a
     /// `TenantHash` from `LogsTableProvider` through `LogsScanExec` into
-    /// `LogSegmentFetcher::fetch_accounted_with_tenant`. There it keys the
-    /// ADR-0046 read cache; RSPAN has no read cache in this crate, so the same
-    /// threaded identity instead guards against decoding an object that belongs
-    /// to another tenant. The GET is recorded before the guard runs: the
-    /// request was really issued regardless of whose object came back.
+    /// `LogSegmentFetcher::fetch_accounted_with_tenant`. Here it does double
+    /// duty: it keys the ADR-0046 read cache (when [`with_cache`](Self::with_cache)
+    /// configured one), exactly as the logs/metrics funnels key theirs, and it
+    /// guards against decoding an object that belongs to another tenant. The
+    /// read is recorded before the guard runs: the request was really issued
+    /// regardless of whose object came back.
     ///
     /// This is the funnel a production `spans` query takes once a caller is
     /// wired in (ADR-0045 decision 5, phase 2); the unaccounted, tenant-blind
@@ -307,20 +346,9 @@ impl SpanSegmentFetcher {
         }
 
         let key = &seg_ref.data_object_key;
-        let got = self
-            .store
-            .get(key, GetRange::Full)
-            .await
-            .map_err(|source| SpanFetchError::Store {
-                key: key.to_string(),
-                source,
-            })?;
-        // This funnel issues exactly one whole-object GET per call, the same
-        // shape the logs funnel records (one `Get` request, the transferred
-        // byte count). `estimate_spans_cost` bounds this at one GET per segment.
-        accounting.record_s3_request(AccountedOp::Get);
-        accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
-        let bytes = got.data;
+        let bytes = self
+            .whole_object_bytes(seg_ref, tenant_hash, accounting)
+            .await?;
 
         // Tenant identity guard: an object whose footer names a different
         // tenant is never decoded. The footer trailer is parsed here (cheap);
@@ -383,19 +411,12 @@ impl SpanSegmentFetcher {
         }
 
         let key = &seg_ref.data_object_key;
-        let got = self
-            .store
-            .get(key, GetRange::Full)
-            .await
-            .map_err(|source| SpanFetchError::Store {
-                key: key.to_string(),
-                source,
-            })?;
-        // Same one whole-object GET the row exit records: this change skips
-        // decode, not fetch, so `page_bytes_fetched` cannot diverge here.
-        accounting.record_s3_request(AccountedOp::Get);
-        accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
-        let bytes = got.data;
+        // Same one whole-object read the row exit records (cache hit or store
+        // GET): this exit skips decode, not fetch, so `page_bytes_fetched`
+        // cannot diverge here.
+        let bytes = self
+            .whole_object_bytes(seg_ref, tenant_hash, accounting)
+            .await?;
 
         let footer = open(&bytes).map_err(|source| corrupt(key, source))?;
         if footer.tenant_hash != tenant_hash.0 {
@@ -456,6 +477,83 @@ impl SpanSegmentFetcher {
             pages_skipped: 0,
             finished: false,
         })
+    }
+
+    /// Fetches one segment's whole-object bytes, consulting the ADR-0046 read
+    /// cache when [`with_cache`](Self::with_cache) configured one -- mirrors
+    /// [`LogSegmentFetcher::whole_object_bytes`](crate::log_fetcher::LogSegmentFetcher::whole_object_bytes)
+    /// byte-for-byte in shape. With no cache configured this issues exactly
+    /// the one store GET `fetch_accounted`/`fetch_accounted_columnar` recorded
+    /// before this existed, so an uncached caller's behavior and accounting
+    /// are unchanged.
+    ///
+    /// With a cache configured, the key is `(tenant_hash, content_hash, 0,
+    /// object_size)` (ADR-0046 decision 2): tenant is part of the key, so two
+    /// tenants whose objects are byte-identical never share an entry, even
+    /// though the content hash alone would already be unique -- defence in
+    /// depth against a hash collision or a programming error serving one
+    /// tenant's bytes to another. A cache hit re-runs the disk tier's crc32c
+    /// check on every access (ADR-0046 decision 4); a checksum failure or any
+    /// other disk-entry defect degrades to a miss and is counted by
+    /// `ravel-cache`'s own `disk_errors_degraded_to_misses` counter, not a new
+    /// span-specific one, and this call falls through to the one store GET a
+    /// miss takes -- it never serves unverified bytes. `source` (from
+    /// [`ReadCache::get_or_fetch`]) decides whether this call records a cache
+    /// hit or a cache miss plus the underlying store GET, so a hit and a miss
+    /// are never double-counted on the tiered tier.
+    async fn whole_object_bytes(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        accounting: &QueryAccounting,
+    ) -> Result<Bytes, SpanFetchError> {
+        let key = &seg_ref.data_object_key;
+
+        let Some(cache) = &self.cache else {
+            let got = self
+                .store
+                .get(key, GetRange::Full)
+                .await
+                .map_err(|source| SpanFetchError::Store {
+                    key: key.to_string(),
+                    source,
+                })?;
+            accounting.record_s3_request(AccountedOp::Get);
+            accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
+            return Ok(got.data);
+        };
+
+        let cache_key = CacheKey::new(tenant_hash.0, seg_ref.content_hash, 0, seg_ref.object_size);
+        // One read-through call, accounted from the returned `Source`: a
+        // single call avoids the peek-then-`get_or_fetch` double-count on the
+        // tiered tier (see `ReadCache::get_or_fetch`).
+        let (bytes, source) = cache
+            .get_or_fetch(cache_key, || async move {
+                let got = self.store.get(key, GetRange::Full).await?;
+                accounting.record_s3_request(AccountedOp::Get);
+                accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
+                Ok(got.data)
+            })
+            .await
+            // This funnel's closure is one unconditional whole-object GET
+            // that verifies nothing itself, so the `EtagChanged`/`Corrupt`
+            // classes below are unreachable here rather than wrong; they are
+            // still mapped so the match is exhaustive against the shared
+            // error type.
+            .map_err(|err| from_cache_error(key, err))?;
+
+        match source {
+            Source::Cache => {
+                accounting.record_cache_hit();
+                accounting.add_cache_bytes(bytes.len() as u64);
+            }
+            // A miss issues one store GET for the resulting bytes, recorded
+            // by the closure above.
+            Source::Upstream => {
+                accounting.record_cache_miss();
+            }
+        }
+        Ok(bytes)
     }
 
     /// Candidate selection over one whole-object's bytes, with no block decoded:
@@ -930,6 +1028,45 @@ fn corrupt(key: &str, source: SpanSegError) -> SpanFetchError {
     SpanFetchError::Corrupt {
         key: key.to_string(),
         source,
+    }
+}
+
+/// Maps a read-cache single-flight error onto [`SpanFetchError`], mirroring
+/// `log_fetcher::from_cache_error`. `SpanFetchError` carries no `EtagChanged`
+/// variant (RSPAN's cache closure never checks an etag, unlike the block-range
+/// funnel this mapping shape was copied from), so that arm folds into
+/// `Corrupt` rather than being silently dropped from the match.
+fn from_cache_error(
+    key: &str,
+    err: SingleFlightError<crate::fetcher::CacheFetchError>,
+) -> SpanFetchError {
+    match err {
+        SingleFlightError::Upstream(crate::fetcher::CacheFetchError::Store(source)) => {
+            SpanFetchError::Store {
+                key: key.to_string(),
+                source: crate::fetcher::clone_store_error(&source),
+            }
+        }
+        SingleFlightError::Upstream(crate::fetcher::CacheFetchError::EtagChanged { .. }) => {
+            SpanFetchError::Corrupt {
+                key: key.to_string(),
+                source: SpanSegError::Corrupted(
+                    "read cache reported a changed etag, which this funnel never checks".into(),
+                ),
+            }
+        }
+        SingleFlightError::Upstream(crate::fetcher::CacheFetchError::Corrupt {
+            message, ..
+        }) => SpanFetchError::Corrupt {
+            key: key.to_string(),
+            source: SpanSegError::Corrupted(message),
+        },
+        SingleFlightError::LeaderLost => SpanFetchError::Store {
+            key: key.to_string(),
+            source: StoreError::Transient(
+                "cache single-flight leader lost before producing a result".to_string(),
+            ),
+        },
     }
 }
 

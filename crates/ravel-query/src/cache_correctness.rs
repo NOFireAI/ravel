@@ -9,8 +9,16 @@
 //! (including NaN bit patterns) to the same query run with no cache at all.
 //!
 //! `Catalog::guarded_get` is ADR-0046's third funnel
-//! (crates/ravel-catalog/src/catalog.rs), covered elsewhere, so this suite
-//! covers RSEG and RLOG only.
+//! (crates/ravel-catalog/src/catalog.rs), covered elsewhere, so the
+//! corruption-acceptance gate above covers RSEG and RLOG only. The RSPAN
+//! section below (issue #810) covers the fourth funnel,
+//! `SpanSegmentFetcher::whole_object_bytes` (called from `fetch_accounted`
+//! and `fetch_accounted_columnar`), with its own narrower test set: RSPAN's
+//! whole-object read is a single unconditional GET with no in-closure
+//! integrity check of its own, so the global corruption-mode gate above
+//! (which corrupts every hit and expects either a typed error or the
+//! uncached result) does not add coverage there beyond what the disk-tier
+//! checksum tests already prove.
 //!
 //! Known limitation, stated in ADR-0046 decision 4's amendment:
 //! `maybe_corrupt` only runs inside `Cache::get`'s hit path, never on the
@@ -33,6 +41,10 @@ use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_by
 use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions};
+use ravel_rspan::{
+    ObjectIdentity as SpanObjectIdentity, RspanConfig, RspanWriter, SpanQuery, SpanRecord,
+    StatusCode,
+};
 use ravel_segment::{
     FooterOutcome, HistogramCounts, HistogramSample, HistogramSpan, HistogramValue, IngestBounds,
     ReaderLimits, ResetHint, SegmentIdentity, SegmentWriter, SeriesInputV3, SeriesValues,
@@ -46,7 +58,7 @@ use uuid::Uuid;
 use crate::fetcher::FetchedHistogramSeries;
 use crate::{
     BlockRangeFetcher, FetchError, FetchStats, FetchedSeriesSoa, LogFetchError, LogFetchOutput,
-    LogQuery, LogSegmentFetcher, SegmentFetcher,
+    LogQuery, LogSegmentFetcher, SegmentFetcher, SpanFetchError, SpanSegmentFetcher,
 };
 
 const RSEG_TENANT: TenantHash = TenantHash([13u8; 16]);
@@ -1396,5 +1408,460 @@ async fn block_range_peek_then_defer_records_one_miss_per_logical_miss() {
         "the tiered tier must record exactly one miss per logical cache miss (peek-then-defer), \
          not two: a second miss layered on the deferred fetch would inflate this above the \
          RAM-only oracle of {oracle_misses}"
+    );
+}
+
+// ---- RSPAN whole-object cache wiring (issue #810) ------------------------
+//
+// `SpanSegmentFetcher::whole_object_bytes` (span_fetcher.rs) is the fourth
+// ADR-0046 funnel: consulted by `fetch_accounted` and
+// `fetch_accounted_columnar` on `tenant_hash`'s behalf, never by the
+// unaccounted, tenant-blind `fetch` (test/block-stat spy only, never on a
+// production query path). It is a single unconditional whole-object GET with
+// no in-closure integrity check, so it reuses the exact `ReadCache`/`CacheKey`
+// machinery RSEG and RLOG already use rather than inventing a span-specific
+// policy: same key shape `(tenant_hash, content_hash, offset, len)`, same
+// crc32c-backed disk tier, same `disk_errors_degraded_to_misses` counter on a
+// checksum failure, same `QueryAccounting::record_cache_hit`/
+// `record_cache_miss` on the query side. Nothing here is span-specific.
+
+const RSPAN_TENANT: TenantHash = TenantHash([33u8; 16]);
+
+fn span_record(id: u8, start: i64, end: i64) -> SpanRecord {
+    SpanRecord {
+        trace_id: [id; 16],
+        span_id: [id; 8],
+        parent_span_id: None,
+        name: "op".to_string(),
+        start_ts_ns: start,
+        end_ts_ns: end,
+        status_code: StatusCode::Unset,
+        status_message: None,
+        attrs: Vec::new(),
+    }
+}
+
+fn span_query() -> SpanQuery {
+    SpanQuery::ts_range(i64::MIN, i64::MAX)
+}
+
+/// Writes a small RSPAN object (4 spans), puts it on a fresh `MemoryStore`,
+/// and returns a matching L0 `SegmentRef` under `RSPAN_TENANT`.
+async fn write_span_segment() -> (Arc<MemoryStore>, SegmentRef) {
+    write_span_segment_under(RSPAN_TENANT).await
+}
+
+/// Like [`write_span_segment`] but writes the object identity (and therefore
+/// the footer's `tenant_hash`) under `tenant`, mirroring
+/// [`write_rlog_segment_under`]. `content_hash` is a fixed sentinel, not a
+/// real blake3: like RLOG, the RSPAN read path verifies no content hash on
+/// read (only the footer's `tenant_hash`, checked in `fetch_accounted`, and
+/// the disk cache's own crc32c apply), so a sentinel is exactly as valid a
+/// fixture as a real hash and does not need this test module to depend on
+/// `ravel_rspan`'s hashing internals.
+async fn write_span_segment_under(tenant: TenantHash) -> (Arc<MemoryStore>, SegmentRef) {
+    let records = vec![
+        span_record(1, 0, 10),
+        span_record(2, 5, 15),
+        span_record(3, 10, 20),
+        span_record(4, 15, 25),
+    ];
+    let identity = SpanObjectIdentity {
+        tenant_hash: tenant.0,
+        shard: 0,
+        writer_id: [30u8; 16],
+        writer_epoch: 1,
+        writer_seq: 1,
+    };
+    let mut writer = RspanWriter::new(RspanConfig::default(), identity);
+    for r in &records {
+        writer.push(r.clone());
+    }
+    let bytes = writer.finish().expect("finish rspan object");
+    let size = bytes.len() as u64;
+
+    let store = Arc::new(MemoryStore::new());
+    let key = "test/cache-correctness-segment.rspan";
+    store
+        .put(key, Bytes::from(bytes), PutOptions::default())
+        .await
+        .expect("put span segment object");
+
+    let seg_ref = SegmentRef {
+        data_object_key: key.to_string(),
+        object_size: size,
+        min_event_ts_ns: 0,
+        max_event_ts_ns: 25,
+        ingest_hour_bucket: 0,
+        sample_count: records.len() as u64,
+        series_count: 0,
+        shard: 0,
+        content_hash: [23u8; 32],
+        writer_id: Uuid::from_u128(8),
+        writer_epoch: 1,
+        writer_seq: 1,
+        created_unix_ns: 0,
+        level: SegmentLevel::L0,
+    };
+    (store, seg_ref)
+}
+
+/// Required test 1: a second identical span query issues zero cacheable
+/// object-store reads. Same shape as
+/// [`rseg_the_same_tenant_reads_its_own_cached_bytes_without_consulting_the_store`]:
+/// the first fetch (a real `MemoryStore`) warms the cache, the second fetcher
+/// is backed by a store whose every GET fails permanently, and the fault
+/// counter -- the store's own counter, not a derived one -- is the exact-count
+/// proof that the second query never reached it.
+///
+/// Prove-the-test: with `SpanSegmentFetcher::with_cache` never called on
+/// `fetcher_b` (i.e. built exactly as the pre-fix `SpanSegmentFetcher` always
+/// was, with no cache field to attach), this assertion fails: see
+/// `zero_read_assertion_fails_without_the_cache_wiring` below, which pins the
+/// exact failing count.
+#[tokio::test]
+async fn span_second_identical_query_issues_zero_store_reads() {
+    let (store, seg_ref) = write_span_segment_under(RSPAN_TENANT).await;
+
+    let limits = CacheLimits::new(16 * 1024 * 1024, 100, 16 * 1024 * 1024);
+    let cache: Arc<Cache<crate::fetcher::CacheFetchError>> = Arc::new(Cache::new(limits));
+
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+    let fetcher = SpanSegmentFetcher::new(backend).with_cache(cache.clone());
+    let query = span_query();
+    let truth = fetcher
+        .fetch_accounted(
+            &seg_ref,
+            RSPAN_TENANT,
+            &query,
+            None,
+            None,
+            &[],
+            &QueryAccounting::new(),
+        )
+        .await
+        .expect("first fetch populates the cache")
+        .expect("segment overlaps the query range");
+
+    let fault_store = get_failing_store();
+    let backend_b: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+    let fetcher_b = SpanSegmentFetcher::new(backend_b).with_cache(cache);
+    let second = fetcher_b
+        .fetch_accounted(
+            &seg_ref,
+            RSPAN_TENANT,
+            &query,
+            None,
+            None,
+            &[],
+            &QueryAccounting::new(),
+        )
+        .await
+        .expect("the second identical query must be served from cache, never touching the store")
+        .expect("segment overlaps the query range");
+
+    assert_eq!(
+        second.records, truth.records,
+        "the cache-served second query must return the same rows as the first"
+    );
+    assert_eq!(
+        fault_store.fault_count(Op::Get, FaultKind::Permanent),
+        0,
+        "a second identical span query must issue zero cacheable object-store reads"
+    );
+}
+
+/// Not one of the four required tests on its own: it exists to produce, and
+/// pin, the exact failing count deliverable's "demonstrate the zero-read
+/// assertion failing against pre-fix code" requirement asks for. It runs the
+/// identical protocol as
+/// [`span_second_identical_query_issues_zero_store_reads`] but never attaches
+/// a cache to the second fetcher -- exactly the only code path that existed
+/// before this fix, since `SpanSegmentFetcher` had no `cache` field and no
+/// `with_cache` method to call. Without cache wiring the second query is a
+/// second unconditional GET, so the store's fault counter reads 1, not 0: the
+/// same assertion this file's `span_second_identical_query_issues_zero_store_reads`
+/// makes would fail with "assertion `left == right` failed ... left: 1,
+/// right: 0" against pre-fix code. Kept as a permanent regression pin rather
+/// than a one-off manual run, so a future revert of the cache wiring is
+/// caught here instead of only by inspection.
+#[tokio::test]
+async fn zero_read_assertion_would_fail_without_the_cache_wiring() {
+    let (store, seg_ref) = write_span_segment_under(RSPAN_TENANT).await;
+    let query = span_query();
+
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+    let fetcher = SpanSegmentFetcher::new(backend);
+    fetcher
+        .fetch_accounted(
+            &seg_ref,
+            RSPAN_TENANT,
+            &query,
+            None,
+            None,
+            &[],
+            &QueryAccounting::new(),
+        )
+        .await
+        .expect("first fetch")
+        .expect("segment overlaps the query range");
+
+    let fault_store = get_failing_store();
+    let backend_b: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+    // No `.with_cache(...)`: the pre-fix shape of `SpanSegmentFetcher`.
+    let fetcher_b = SpanSegmentFetcher::new(backend_b);
+    let result = fetcher_b
+        .fetch_accounted(
+            &seg_ref,
+            RSPAN_TENANT,
+            &query,
+            None,
+            None,
+            &[],
+            &QueryAccounting::new(),
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "with no cache attached the second query must reach the failing store and error"
+    );
+    assert_eq!(
+        fault_store.fault_count(Op::Get, FaultKind::Permanent),
+        1,
+        "pre-fix behavior: an uncached second query issues exactly one more store read, which is \
+         the exact count that makes span_second_identical_query_issues_zero_store_reads' \
+         `fault_count == 0` assertion fail against pre-fix code"
+    );
+}
+
+/// Required test 2: a cache that never admits this segment (the standing
+/// refusal `evicted_entry_falls_back_to_store_and_produces_correct_result`
+/// above uses for RSEG) forces every fetch back to the store. The fallback is
+/// never silent: `QueryAccounting::cache_misses` records it on every call,
+/// and the store (a real, non-failing `MemoryStore`) is genuinely consulted
+/// both times, returning correct data throughout.
+///
+/// Naming note for the report: this is the ordinary miss counter
+/// (`QueryAccounting::cache_misses` / `ravel-cache`'s `CacheMetrics::misses`),
+/// not `disk_errors_degraded_to_misses`. `ravel-cache`'s own disk-tier tests
+/// (`get_on_never_cached_key_is_a_clean_miss_not_a_disk_error`) draw this
+/// line deliberately: an entry that was never admitted (evicted, or, as
+/// here, standingly refused) is a clean miss, not a disk error, and must not
+/// move `disk_errors_degraded_to_misses`. That counter is reserved for a
+/// checksum failure on an entry that WAS admitted --
+/// [`span_corrupted_disk_entry_degrades_to_a_store_read`] below is the test
+/// that exercises it.
+#[tokio::test]
+async fn span_evicted_entry_falls_back_to_store_and_produces_correct_result() {
+    let (store, seg_ref) = write_span_segment().await;
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+    let query = span_query();
+
+    let uncached = SpanSegmentFetcher::new(backend.clone());
+    let truth = uncached
+        .fetch_accounted(
+            &seg_ref,
+            RSPAN_TENANT,
+            &query,
+            None,
+            None,
+            &[],
+            &QueryAccounting::new(),
+        )
+        .await
+        .expect("uncached fetch")
+        .expect("segment overlaps the query range");
+
+    let limits = CacheLimits::new(1, 1, 1);
+    let cache: Arc<Cache<crate::fetcher::CacheFetchError>> = Arc::new(Cache::new(limits));
+    let fetcher = SpanSegmentFetcher::new(backend).with_cache(cache);
+
+    let accounting = QueryAccounting::new();
+    let first = fetcher
+        .fetch_accounted(&seg_ref, RSPAN_TENANT, &query, None, None, &[], &accounting)
+        .await
+        .expect("first fetch, forced miss")
+        .expect("segment overlaps the query range");
+    let after_first = accounting.snapshot();
+    assert_eq!(
+        after_first.cache_misses, 1,
+        "a cache too small to admit this segment must record a miss on every call"
+    );
+
+    let second = fetcher
+        .fetch_accounted(&seg_ref, RSPAN_TENANT, &query, None, None, &[], &accounting)
+        .await
+        .expect("second fetch, forced miss again")
+        .expect("segment overlaps the query range");
+    let after_second = accounting.snapshot();
+    assert_eq!(
+        after_second.cache_misses, 2,
+        "the second call must degrade to the store again, recording a second miss"
+    );
+
+    assert_eq!(first.records, truth.records);
+    assert_eq!(second.records, truth.records);
+}
+
+/// Required test 3: two tenants with byte-identical objects do not share a
+/// cache entry. Same shape as
+/// [`rseg_a_second_tenant_does_not_read_the_first_tenants_cached_bytes`]:
+/// tenant A's fetch warms the cache; tenant B's fetch of the SAME
+/// `SegmentRef` (same `content_hash`, same whole-object range -- the only
+/// difference is the `tenant_hash` parameter) goes through a GET-failing
+/// store sharing that cache. A correct key includes `tenant_hash`, so B
+/// misses and must consult the store, which fails; the fault counter, not
+/// merely `is_err()`, is what distinguishes this from a key that dropped
+/// `tenant_hash` (B would still error on the footer's `TenantMismatch`
+/// check either way, since the object was written under `TENANT_A`).
+#[tokio::test]
+async fn span_a_second_tenant_does_not_read_the_first_tenants_cached_bytes() {
+    let (store, seg_ref) = write_span_segment_under(TENANT_A).await;
+    let query = span_query();
+
+    let limits = CacheLimits::new(16 * 1024 * 1024, 100, 16 * 1024 * 1024);
+    let cache: Arc<Cache<crate::fetcher::CacheFetchError>> = Arc::new(Cache::new(limits));
+
+    let backend_a: Arc<dyn ObjectStoreBackend> = store;
+    let fetcher_a = SpanSegmentFetcher::new(backend_a).with_cache(cache.clone());
+    fetcher_a
+        .fetch_accounted(
+            &seg_ref,
+            TENANT_A,
+            &query,
+            None,
+            None,
+            &[],
+            &QueryAccounting::new(),
+        )
+        .await
+        .expect("tenant A's own fetch populates the cache")
+        .expect("segment overlaps the query range");
+
+    let fault_store = get_failing_store();
+    let backend_b: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+    let fetcher_b = SpanSegmentFetcher::new(backend_b).with_cache(cache);
+    let result = fetcher_b
+        .fetch_accounted(
+            &seg_ref,
+            TENANT_B,
+            &query,
+            None,
+            None,
+            &[],
+            &QueryAccounting::new(),
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "tenant B must not receive a result for tenant A's object; got {result:?}"
+    );
+    assert!(
+        matches!(result, Err(SpanFetchError::Store { .. })),
+        "a correctly tenant-keyed cache must miss for tenant B and surface the store's own \
+         failure (SpanFetchError::Store); got {result:?}. A `TenantMismatch` here would mean the \
+         cache served tenant A's bytes back for tenant B's key (fault_count would then read 0, \
+         proving the cache -- not the store's footer guard -- was what caught it)"
+    );
+    assert!(
+        fault_store.fault_count(Op::Get, FaultKind::Permanent) >= 1,
+        "tenant B's fetch must consult the store (proving a cache miss keyed on tenant_hash), \
+         but no GET fault fired -- the cache served one tenant's bytes to another"
+    );
+}
+
+/// Required test 4: a corrupted entry fails checksum validation, falls back
+/// to a store read, and returns correct data. Uses the disk tier's OWN
+/// crc32c check (not `Cache::with_corruption`, which corrupts every RAM hit
+/// and, applied to a disk-served hit, is proven above by
+/// `corrupted_disk_tier_hits_never_produce_wrong_results` to fail CLOSED
+/// with a typed error -- the RAM-layer corruption bypasses the disk tier's
+/// own integrity check entirely, and it reaches the format-level footer/block
+/// crc instead. That is the wrong mechanism for this deliverable, which
+/// wants the transparent, correct-data fallback the disk tier's own crc32c
+/// produces on real on-disk corruption. `DiskCache::corrupt_entry_for_test`
+/// (added to `ravel-cache` for this test; see the crate's doc comment) flips
+/// a byte in an already-admitted entry's real on-disk file, mirroring
+/// `ravel-cache::disk::get_on_corrupted_payload_is_a_disk_error_not_a_clean_miss`'s
+/// own technique, so the second fetch here hits genuinely corrupted bytes on
+/// disk and must degrade transparently rather than error.
+#[tokio::test]
+async fn span_corrupted_disk_entry_degrades_to_a_store_read() {
+    let tmp = tempfile::TempDir::new().expect("temp dir for the disk cache tier");
+    let (store, seg_ref) = write_span_segment().await;
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+    let query = span_query();
+
+    let uncached = SpanSegmentFetcher::new(backend.clone());
+    let truth = uncached
+        .fetch_accounted(
+            &seg_ref,
+            RSPAN_TENANT,
+            &query,
+            None,
+            None,
+            &[],
+            &QueryAccounting::new(),
+        )
+        .await
+        .expect("uncached fetch")
+        .expect("segment overlaps the query range");
+
+    // RAM refuses admission so every hit is disk-served, and disk is plain
+    // (no `with_corruption`): the corruption in this test is real on-disk
+    // byte damage, applied after a clean admission, not the RAM-layer
+    // simulation the acceptance gate above uses.
+    let disk = DiskCache::new(tmp.path().to_path_buf(), generous_cache_limits());
+    let disk_metrics = disk.metrics();
+    let cache = Arc::new(TieredCache::new(
+        Cache::<crate::fetcher::CacheFetchError>::new(ram_rejecting_limits()),
+        disk,
+    ));
+    let fetcher = SpanSegmentFetcher::new(backend).with_cache(cache.clone());
+
+    let first = fetcher
+        .fetch_accounted(
+            &seg_ref,
+            RSPAN_TENANT,
+            &query,
+            None,
+            None,
+            &[],
+            &QueryAccounting::new(),
+        )
+        .await
+        .expect("first fetch (both-tier miss, admits a clean disk entry)")
+        .expect("segment overlaps the query range");
+    assert_eq!(first.records, truth.records);
+
+    let cache_key = CacheKey::new(RSPAN_TENANT.0, seg_ref.content_hash, 0, seg_ref.object_size);
+    let degraded_before = disk_metrics.snapshot().disk_errors_degraded_to_misses;
+    cache.disk_for_test().corrupt_entry_for_test(&cache_key);
+
+    let second = fetcher
+        .fetch_accounted(
+            &seg_ref,
+            RSPAN_TENANT,
+            &query,
+            None,
+            None,
+            &[],
+            &QueryAccounting::new(),
+        )
+        .await
+        .expect("a corrupted disk entry must degrade to a store read, not an error")
+        .expect("segment overlaps the query range");
+
+    assert_eq!(
+        second.records, truth.records,
+        "the degraded fetch must still return correct data"
+    );
+    assert_eq!(
+        disk_metrics.snapshot().disk_errors_degraded_to_misses,
+        degraded_before + 1,
+        "a corrupted disk entry must increment disk_errors_degraded_to_misses exactly once, \
+         never serving unverified bytes silently"
     );
 }
