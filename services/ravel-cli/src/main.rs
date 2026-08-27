@@ -289,6 +289,24 @@ enum Command {
         /// to 2. Must be at least 1; 0 is rejected.
         #[arg(long, default_value_t = ravel_cli::load::DEFAULT_DECODE_QUEUE_BATCHES)]
         decode_queue_batches: usize,
+        /// Maximum flushes a single shard may have in flight at once
+        /// (`IngestConfig::max_inflight_flushes`). One flush is one built RLOG
+        /// object plus its commit record; this bounds how many of them a shard
+        /// may be encoding and writing to object storage concurrently. It is a
+        /// PER-SHARD window, so the whole load's flush ceiling is roughly
+        /// `--shards` x this value, and is additionally capped by
+        /// `--pipeline-depth` (the loader never keeps more than that many
+        /// writes outstanding across all shards, whatever this is set to). The
+        /// cost is memory: each in-flight flush holds its built object resident
+        /// until its terminal outcome (both PUTs durable, or the flush
+        /// abandoned), so a shard's peak flush working set scales by this
+        /// value. Acknowledgement is unchanged: a Strict write is still acked
+        /// only once its own flush's data object and commit record are durable;
+        /// raising this only lets more flushes reach that point concurrently,
+        /// it does not change what an ack means. `1` (the default) preserves
+        /// today's one-flush-per-shard behaviour. `0` is rejected.
+        #[arg(long, default_value_t = 1)]
+        max_inflight_flushes: u32,
     },
 }
 
@@ -1357,6 +1375,7 @@ async fn main() -> anyhow::Result<()> {
             read_cursors,
             pipeline_depth,
             decode_queue_batches,
+            max_inflight_flushes,
         } => {
             let profile = ravel_cli::cli_profiling::ProfileSession::from_env("ravel-cli-load");
             let result = ravel_cli::load::run(
@@ -1369,6 +1388,7 @@ async fn main() -> anyhow::Result<()> {
                 read_cursors,
                 pipeline_depth,
                 decode_queue_batches,
+                max_inflight_flushes,
                 now_ns()?,
             )
             .await;

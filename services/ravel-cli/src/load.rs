@@ -271,6 +271,7 @@ pub async fn run(
     read_cursors: Option<usize>,
     pipeline_depth: usize,
     decode_queue_batches: usize,
+    max_inflight_flushes: u32,
     now_ns: i64,
 ) -> anyhow::Result<()> {
     run_warning_to(
@@ -283,6 +284,7 @@ pub async fn run(
         read_cursors,
         pipeline_depth,
         decode_queue_batches,
+        max_inflight_flushes,
         now_ns,
         &mut std::io::stderr(),
     )
@@ -307,6 +309,7 @@ pub(crate) async fn run_warning_to(
     read_cursors: Option<usize>,
     pipeline_depth: usize,
     decode_queue_batches: usize,
+    max_inflight_flushes: u32,
     now_ns: i64,
     warnings: &mut dyn std::io::Write,
 ) -> anyhow::Result<()> {
@@ -331,6 +334,7 @@ pub(crate) async fn run_warning_to(
         read_cursors,
         pipeline_depth,
         decode_queue_batches,
+        max_inflight_flushes,
         now_ns,
         Arc::new(SystemClock),
         LoadPath::Columnar,
@@ -595,6 +599,10 @@ pub async fn load(
         read_cursors,
         pipeline_depth,
         DEFAULT_DECODE_QUEUE_BATCHES,
+        // The stable test/caller entry point keeps today's single-flush-per-shard
+        // window; tests that vary it drive `load_instrumented` directly, as the
+        // decode-queue-depth tests already do.
+        1,
         now_ns,
         clock,
         LoadPath::Columnar,
@@ -629,6 +637,7 @@ async fn load_instrumented(
     read_cursors: Option<usize>,
     pipeline_depth: usize,
     decode_queue_batches: usize,
+    max_inflight_flushes: u32,
     now_ns: i64,
     clock: Arc<dyn Clock>,
     path: LoadPath,
@@ -677,6 +686,18 @@ async fn load_instrumented(
                 .to_string(),
         ));
     }
+    // Same shape as the guards above: `--max-inflight-flushes` is the
+    // operator-facing lever bounding how many flushes one shard may have in
+    // flight at once (`IngestConfig::max_inflight_flushes`). A window of 0 is a
+    // shard that can never spawn a flush, so it is rejected rather than silently
+    // clamped.
+    if max_inflight_flushes == 0 {
+        return Err(LoadError::Setup(
+            "--max-inflight-flushes must be at least 1 (the number of flushes one shard may have \
+             in flight at once); 0 was given"
+                .to_string(),
+        ));
+    }
 
     let limits = LogIngestLimits::default();
     let tenant_id = TenantId::new(tenant);
@@ -715,6 +736,7 @@ async fn load_instrumented(
         IngestConfig {
             shard_count: shards,
             target_bytes: 1,
+            max_inflight_flushes,
             ..IngestConfig::default()
         },
         Arc::clone(&store),
@@ -3454,6 +3476,7 @@ type = "i64"
             None,
             1,
             DEFAULT_DECODE_QUEUE_BATCHES,
+            1,
             NOW_NS,
             &mut sink,
         )
@@ -3645,6 +3668,7 @@ type = "i64"
             None,
             1,
             0,
+            1,
             NOW_NS,
             Arc::new(FixedClock(NOW_NS)),
             LoadPath::Columnar,
@@ -3660,6 +3684,48 @@ type = "i64"
         assert!(
             err.to_string()
                 .contains("--decode-queue-batches must be at least 1"),
+            "the error names the lever: {err}"
+        );
+    }
+
+    /// `--max-inflight-flushes 0` is rejected with a typed [`LoadError::Setup`]
+    /// before any work, mirroring `decode_queue_batches_zero_is_rejected` (issue
+    /// #807). A window of 0 is a shard that can never spawn a flush, so the guard
+    /// makes it unreachable rather than letting a zero-permit semaphore deadlock
+    /// every flush. The guard fires before the file is even opened, so a
+    /// nonexistent path still yields the max-inflight-flushes error, not an I/O
+    /// error.
+    #[tokio::test]
+    async fn max_inflight_flushes_zero_is_rejected() {
+        use ravel_object_store::memory::MemoryStore;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let m = base_mapping();
+        let err = load_instrumented(
+            store,
+            Path::new("/nonexistent.parquet"),
+            "acme",
+            &m,
+            4,
+            10,
+            None,
+            1,
+            DEFAULT_DECODE_QUEUE_BATCHES,
+            0,
+            NOW_NS,
+            Arc::new(FixedClock(NOW_NS)),
+            LoadPath::Columnar,
+            None,
+            None,
+        )
+        .await
+        .expect_err("max_inflight_flushes of 0 is rejected");
+        assert!(
+            matches!(err, LoadError::Setup(_)),
+            "a typed setup error, got: {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("--max-inflight-flushes must be at least 1"),
             "the error names the lever: {err}"
         );
     }
@@ -3849,6 +3915,7 @@ type = "i64"
                     None,
                     2,
                     depth,
+                    1,
                     NOW_NS,
                     Arc::new(FixedClock(NOW_NS)),
                     LoadPath::Columnar,
@@ -4014,6 +4081,7 @@ type = "i64"
             None,
             1,
             QUEUE_DEPTH,
+            1,
             NOW_NS,
             Arc::new(FixedClock(NOW_NS)),
             LoadPath::Columnar,
@@ -4314,6 +4382,7 @@ type = "i64"
             None,
             1,
             DEFAULT_DECODE_QUEUE_BATCHES,
+            1,
             NOW_NS,
             Arc::new(FixedClock(NOW_NS)),
             LoadPath::Columnar,
@@ -4697,6 +4766,7 @@ type = "i64"
             Some(1),
             1,
             DEFAULT_DECODE_QUEUE_BATCHES,
+            1,
             NOW_NS,
             &mut sink,
         )
@@ -4724,6 +4794,7 @@ type = "i64"
             Some(4),
             1,
             DEFAULT_DECODE_QUEUE_BATCHES,
+            1,
             NOW_NS,
             &mut sink,
         )
@@ -4765,6 +4836,7 @@ type = "i64"
             Some(1),
             1,
             DEFAULT_DECODE_QUEUE_BATCHES,
+            1,
             NOW_NS,
             &mut sink,
         )
@@ -5647,6 +5719,7 @@ type = "i64"
             read_cursors,
             1,
             DEFAULT_DECODE_QUEUE_BATCHES,
+            1,
             now_ns,
             clock,
             LoadPath::Row,
@@ -5937,6 +6010,108 @@ type = "i64"
             max_d3 >= 3,
             "at --pipeline-depth 3 the write window reaches three concurrently outstanding PUTs, \
              got {max_d3}"
+        );
+    }
+
+    /// `--max-inflight-flushes` is load-bearing, not accepted-and-ignored: it
+    /// bounds how many flushes ONE shard may run at once (issue #807). Every
+    /// batch here is a single row on a single shard (`--shards 1`), so all the
+    /// flushes contend for that one shard's flush semaphore, and the loader's
+    /// own `--pipeline-depth` is held wide (equal to the batch count) so it is
+    /// never the binding constraint -- the only thing that can serialize the
+    /// per-shard data PUTs is `max_inflight_flushes`. Every data-object PUT
+    /// sleeps 50ms while the store tracks the running maximum of concurrently
+    /// outstanding data-object PUTs.
+    ///
+    /// Non-vacuity (prove-the-test): at window 1 the observed max is exactly 1
+    /// (today's behaviour, the shard serializes its flushes); at window 3 it
+    /// reaches exactly 3 (the semaphore's hard cap, which the 50ms hold makes
+    /// the three earliest flushes actually overlap). An implementation that
+    /// ignored the flag and left the shard semaphore at 1 would leave the max
+    /// at 1 for both windows, failing the window-3 assertion. Confirmed by
+    /// hard-coding `Semaphore::new(1)` in `shard.rs::LogFlushActor::new`: the
+    /// window-3 max then reads 1.
+    #[tokio::test]
+    async fn max_inflight_flushes_bounds_concurrent_shard_flushes() {
+        use parquet::arrow::ArrowWriter;
+        use ravel_object_store::memory::MemoryStore;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        async fn max_concurrent_at_window(window: u32) -> usize {
+            // One shard: every row routes to shard 0, so all flushes share that
+            // shard's flush semaphore. `n_rows` single-row batches, submitted
+            // with a pipeline depth equal to the batch count so the loader keeps
+            // every write outstanding at once and cannot be the bottleneck.
+            let shards = 1u32;
+            let n_rows = 6usize;
+            let pipeline_depth = n_rows;
+
+            let dir = tempfile::tempdir().expect("tempdir");
+            let pq = dir.path().join("inflight.parquet");
+            let cols: Vec<(String, ArrayRef)> = vec![
+                ("ts".to_string(), i64_col(vec![NOW_NS; n_rows])),
+                ("svc".to_string(), str_col(vec!["api"; n_rows])),
+                ("host".to_string(), str_col(vec!["api"; n_rows])),
+            ];
+            let b = RecordBatch::try_from_iter(cols).expect("record batch");
+            let file = std::fs::File::create(&pq).expect("create parquet");
+            let mut writer = ArrowWriter::try_new(file, b.schema(), None).expect("arrow writer");
+            writer.write(&b).expect("write batch");
+            writer.close().expect("close writer");
+
+            let m = parse_mapping(
+                "ts_column = \"ts\"\nts_unit = \"nanos\"\n\n\
+                 [[resource_attribute]]\nkey = \"service.name\"\ncolumn = \"svc\"\ntype = \"str\"\n\n\
+                 [[resource_attribute]]\nkey = \"host\"\ncolumn = \"host\"\ntype = \"str\"\n",
+            )
+            .expect("valid mapping");
+
+            let max_in_flight = Arc::new(AtomicUsize::new(0));
+            let store = Arc::new(InstrumentedPutStore {
+                inner: Arc::new(MemoryStore::new()),
+                delays: vec![("/l0/", Duration::from_millis(50))],
+                in_flight: Arc::new(AtomicUsize::new(0)),
+                max_in_flight: Arc::clone(&max_in_flight),
+                watch_prefixes: Vec::new(),
+                watch_started: Arc::new(AtomicUsize::new(0)),
+                watch_completed: Arc::new(AtomicUsize::new(0)),
+            });
+
+            let report = load_instrumented(
+                store as Arc<dyn ObjectStoreBackend>,
+                &pq,
+                "acme",
+                &m,
+                shards,
+                1,
+                None,
+                pipeline_depth,
+                DEFAULT_DECODE_QUEUE_BATCHES,
+                window,
+                NOW_NS,
+                Arc::new(FixedClock(NOW_NS)),
+                LoadPath::Columnar,
+                None,
+                None,
+            )
+            .await
+            .expect("the load succeeds");
+            assert_eq!(report.rows_processed, n_rows as u64, "every row is written");
+            max_in_flight.load(Ordering::SeqCst)
+        }
+
+        let max_w1 = max_concurrent_at_window(1).await;
+        assert_eq!(
+            max_w1, 1,
+            "at --max-inflight-flushes 1 the shard runs exactly one flush at a time (today's \
+             behaviour), got {max_w1}"
+        );
+
+        let max_w3 = max_concurrent_at_window(3).await;
+        assert_eq!(
+            max_w3, 3,
+            "at --max-inflight-flushes 3 the shard runs three flushes concurrently (the \
+             semaphore's cap), got {max_w3}"
         );
     }
 
