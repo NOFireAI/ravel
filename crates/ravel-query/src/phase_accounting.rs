@@ -230,12 +230,15 @@ mod tests {
         phase.probe().record_s3_request(AccountedOp::Get);
         let snap = phase.snapshot();
         for p in QueryPhase::ALL {
-            assert_eq!(snap.phase(p), match p {
-                QueryPhase::Resolve => &snap.resolve,
-                QueryPhase::Plan => &snap.plan,
-                QueryPhase::Probe => &snap.probe,
-                QueryPhase::Scan => &snap.scan,
-            });
+            assert_eq!(
+                snap.phase(p),
+                match p {
+                    QueryPhase::Resolve => &snap.resolve,
+                    QueryPhase::Plan => &snap.plan,
+                    QueryPhase::Probe => &snap.probe,
+                    QueryPhase::Scan => &snap.scan,
+                }
+            );
         }
     }
 }

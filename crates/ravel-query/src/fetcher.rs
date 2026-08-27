@@ -2022,7 +2022,9 @@ impl SegmentFetcher {
         accounting: &QueryAccounting,
     ) -> Result<Vec<FetchedSeries>, FetchError> {
         let phase = PhaseAccounting::new();
-        let result = self.fetch_runs(tenant_hash, seg_ref, matchers, false, &phase).await;
+        let result = self
+            .fetch_runs(tenant_hash, seg_ref, matchers, false, &phase)
+            .await;
         accounting.merge_snapshot(&phase.snapshot().pooled());
         let (runs, _stats) = result?;
         Ok(runs.into_iter().map(RunDecode::into_aos).collect())
@@ -2054,7 +2056,9 @@ impl SegmentFetcher {
         accounting: &QueryAccounting,
     ) -> Result<(Vec<FetchedSeriesSoa>, FetchStats), FetchError> {
         let phase = PhaseAccounting::new();
-        let result = self.fetch_runs(tenant_hash, seg_ref, matchers, true, &phase).await;
+        let result = self
+            .fetch_runs(tenant_hash, seg_ref, matchers, true, &phase)
+            .await;
         accounting.merge_snapshot(&phase.snapshot().pooled());
         let (runs, stats) = result?;
         Ok((runs.into_iter().map(RunDecode::into_soa).collect(), stats))

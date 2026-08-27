@@ -6634,7 +6634,15 @@ mod prefetch_tests {
     async fn phase_split_below_threshold_segment_pins_exact_per_phase_figures() {
         let store = Arc::new(MemoryStore::new());
         let tenant_hash = TenantId::new("acme").hash();
-        publish_metric(&store, tenant_hash, 1, "metric_a", BASE_NS - NS_PER_MIN, 1.0).await;
+        publish_metric(
+            &store,
+            tenant_hash,
+            1,
+            "metric_a",
+            BASE_NS - NS_PER_MIN,
+            1.0,
+        )
+        .await;
 
         let eng = engine(Arc::clone(&store));
         let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
@@ -6671,7 +6679,10 @@ mod prefetch_tests {
         let pooled = pa.pooled();
         assert_eq!(pooled.total_s3_requests(), 5, "3 GETs + 2 LISTs");
         assert_eq!(pooled.total_s3_bytes(), 604);
-        assert_eq!(pooled, stats.accounting, "phase_accounting.pooled() must equal the existing pooled QueryStats.accounting field exactly");
+        assert_eq!(
+            pooled, stats.accounting,
+            "phase_accounting.pooled() must equal the existing pooled QueryStats.accounting field exactly"
+        );
     }
 
     /// Issue #796, shape 2 (above [`crate::fetcher::DEFAULT_WHOLE_OBJECT_THRESHOLD`]):
@@ -6730,7 +6741,10 @@ mod prefetch_tests {
         let pooled = pa.pooled();
         assert_eq!(pooled.total_s3_requests(), 5 + 2, "5 GETs + 2 LISTs");
         assert_eq!(pooled.total_s3_bytes(), 293 + 65536 + 3111 + 2983182);
-        assert_eq!(pooled, stats.accounting, "phase_accounting.pooled() must equal the existing pooled QueryStats.accounting field exactly");
+        assert_eq!(
+            pooled, stats.accounting,
+            "phase_accounting.pooled() must equal the existing pooled QueryStats.accounting field exactly"
+        );
     }
 }
 
