@@ -235,6 +235,91 @@ what the numbers mean and where they come from:
   publication until fixed. Rehearsals re-run when the restore-relevant machinery
   changes materially, and the record keeps its history.
 
+## Automated rehearsal workflow
+
+`scripts/dr-rehearsal/restore-rehearsal.sh` (issue #814) automates restore
+procedure steps 1-4 against a real MinIO/S3 replica and measures RPO/RTO,
+rather than leaving the rehearsal above as an entirely manual exercise:
+
+1. Refuses to proceed unless the operator passes
+   `--confirm-writers-stopped` (and, optionally, `--primary-http` for a
+   best-effort reachability check that the primary is actually down) —
+   before touching the replica, restore bucket, or reconciliation tools
+   (restore procedure step 1).
+2. Refuses to restore into a non-empty restore bucket (step 2): the
+   rehearsal proves the procedure, and a restore bucket that already
+   holds objects would let reconciliation pass by reading pre-existing
+   data instead of the copy it is meant to verify.
+3. Mirrors the replica into the restore bucket, then measures RPO
+   immediately as the object-count delta between the two buckets, before
+   reconciliation has any chance to explain or repair the difference.
+4. Runs `maintain verify-custody`, then `commit reconstruct`, then
+   `catalog verify`, then a canary query, in that order, short-circuiting
+   on the first failure (step 3-4). Runs `--inject-fault
+   dangling-commit-record|missing-data|canary-query-error` prove each
+   stage actually catches its fault (see `services/ravel-cli/tests/
+   dr_rehearsal_fault_injection.rs` for the first two, proven at the
+   library level; the canary fault is proven at the shell level, see
+   below).
+5. Gates the temporary canary query-mode server on a nonce-stamped file
+   written only after reconciliation succeeds
+   (`dr_require_reconciliation_complete` in `scripts/dr-rehearsal/lib.sh`)
+   — a mechanical check the script asserts even though it just wrote the
+   stamp itself, not an assumption drawn from statement order. No
+   long-lived service is ever started against the restore bucket; the
+   query-mode process this script starts is temporary and exists only to
+   run the canary check.
+6. Writes RTO (wall-clock seconds from the writers-stopped freeze to a
+   clean canary result) and RPO (lost-object count) to a JSON artifact
+   at `<--artifact-dir>/rehearsal-report.json` (`--artifact-dir` defaults
+   to a fresh `mktemp -d`, printed at the end of the run, and is never a
+   path under this repository). `.github/workflows/dr-rehearsal.yml`
+   uploads that file as the `dr-rehearsal-report` workflow artifact on
+   every run, pass or fail.
+
+Run `scripts/dr-rehearsal/restore-rehearsal.sh --check` to validate the
+script's structure and dependencies without starting MinIO or touching any
+bucket; this is the only mode a MinIO/S3-less environment (a fleet
+executor's sandbox has no reachable docker daemon) can exercise. A real
+run needs a human or CI runner with a real or MinIO-backed S3 endpoint;
+see the flags documented in `restore-rehearsal.sh --help`.
+
+### Pre-registered RPO/RTO bands (issue #814)
+
+Per the measurement-discipline rule that a figure gets a predicted band
+before it is measured, not after: the rehearsal fixture is one L0 metrics
+segment (the `gen_otlp_fixture` example's single `demo_requests_total`
+series) copied into an otherwise-empty restore bucket, reconciled across
+4 shards and 2 signals (metrics, logs — logs finds nothing, correctly).
+
+- **RPO (lost objects) — expected 0, miss if > 0.** The rehearsal stops
+  the seed writer before mirroring and mirrors synchronously before any
+  reconciliation runs, so nothing should be in flight for the copy to
+  miss. A clean (non-fault-injected) run measuring RPO > 0 means the
+  mirror step itself dropped an object or a writer was not actually
+  stopped, not that replication lag is being faithfully reproduced (this
+  synthetic rehearsal has no replication lag to measure — that number
+  comes from a real deployment's replicated bucket, per "RPO and RTO:
+  defined here, published only from a rehearsal" above).
+- **RTO (wall-clock seconds, freeze to clean canary) — expected 3-60s,
+  miss if < 1s or > 120s.** `dr_wait_for` polls once a second with caps
+  of 30s (MinIO healthy), 60s (seed server reachable), and 60s (query
+  server reachable); a single L0 segment reconciles in a small constant
+  number of object-store calls, so the total should be dominated by
+  container and process startup, not reconciliation work, for this
+  fixture size. Under 1s would mean a step was skipped rather than run;
+  over 120s approaches the sum of the wait ceilings and indicates a
+  stall, not slow-but-real work.
+
+These bands describe the tiny synthetic fixture the automated workflow
+seeds, not a production-sized restore: RTO for a real deployment scales
+with the restored object count and is not predicted here (see "RPO and
+RTO: defined here, published only from a rehearsal" above). A rehearsal
+run against this fixture that lands outside its band is investigated
+before its number is recorded below; a run against a real replica gets
+its own pre-registered band on the tracking issue for that rehearsal,
+per the same discipline.
+
 ## Rehearsal record
 
 A rehearsal drives the restore procedure above against a real replica and

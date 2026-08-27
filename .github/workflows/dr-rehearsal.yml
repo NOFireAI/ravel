@@ -1,0 +1,134 @@
+name: dr-rehearsal
+
+# Issue #814: automated disaster-recovery rehearsal. Drives
+# scripts/dr-rehearsal/restore-rehearsal.sh against a real MinIO instance:
+# one clean run that measures RPO/RTO into an uploaded artifact, then three
+# separate runs that each inject one of the acceptance-criterion faults
+# (dangling commit record, missing/unreconstructable data, a canary query
+# over data that was never seeded) and assert the run fails. A workflow only
+# ever observed green is not evidence it catches anything; these three steps
+# are that evidence, re-proven on every dispatch rather than trusted from a
+# one-time manual run.
+#
+# workflow_dispatch only, like bench-s3.yml: this provisions a real MinIO
+# container and takes longer than a PR gate should, so it never runs on
+# push/pull_request/merge_group and can never block a merge.
+#
+# No local gate compiles this file. It is not "done" until a pushed
+# workflow_dispatch run is green; see docs/guides/disaster-recovery.md's
+# "Automated rehearsal workflow" section for what that run measures and
+# where its artifact lands.
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  dr-rehearsal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: ./.github/actions/free-disk-space
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - name: Install sccache
+        id: sccache
+        continue-on-error: true
+        uses: ./.github/actions/setup-sccache
+      - name: Disable sccache if its install flaked
+        if: steps.sccache.outcome == 'failure'
+        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # Build once, up front: restore-rehearsal.sh's ravel_cli()/
+      # ravel_server_cmd() wrappers use a prebuilt binary from PATH when one
+      # is present and fall back to `cargo run` otherwise. Falling back here
+      # would mean every reconciliation step recompiles the workspace,
+      # swamping the RTO measurement with build time instead of the restore
+      # work the pre-registered band in disaster-recovery.md is about.
+      - name: Build ravel-server and ravel-cli
+        run: cargo build --release --locked -p ravel-server -p ravel-cli
+      - name: Put release binaries on PATH
+        run: echo "${{ github.workspace }}/target/release" >> "$GITHUB_PATH"
+
+      - name: Structural check (no MinIO required)
+        run: scripts/dr-rehearsal/restore-rehearsal.sh --check
+
+      # Each invocation below starts and tears down its own MinIO container
+      # via lib.sh's minio_up/minio_down against deploy/docker-compose/
+      # minio.yml, whose volume is a host bind mount (minio-data/ at the repo
+      # root), not a Docker-managed volume: `docker compose down` does not
+      # clear it. Without the rm -rf below, the second invocation's restore
+      # bucket would inherit the first invocation's objects and fail
+      # deliverable 1 (restore into an empty bucket) instead of exercising
+      # the fault it is meant to inject.
+      - name: Real rehearsal run (expect success, measures RPO/RTO)
+        run: |
+          rm -rf minio-data
+          mkdir -p "${RUNNER_TEMP}/dr-rehearsal-real"
+          scripts/dr-rehearsal/restore-rehearsal.sh \
+            --confirm-writers-stopped \
+            --artifact-dir "${RUNNER_TEMP}/dr-rehearsal-real"
+
+      - name: Fault injection - dangling commit record (expect failure)
+        run: |
+          rc=0
+          rm -rf minio-data
+          mkdir -p "${RUNNER_TEMP}/dr-rehearsal-dangling"
+          scripts/dr-rehearsal/restore-rehearsal.sh \
+            --confirm-writers-stopped \
+            --artifact-dir "${RUNNER_TEMP}/dr-rehearsal-dangling" \
+            --inject-fault dangling-commit-record || rc=$?
+          echo "restore-rehearsal.sh exited ${rc} (expected nonzero)"
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::dangling-commit-record fault injection did not fail the rehearsal"
+            exit 1
+          fi
+
+      - name: Fault injection - missing data (expect failure)
+        run: |
+          rc=0
+          rm -rf minio-data
+          mkdir -p "${RUNNER_TEMP}/dr-rehearsal-missing-data"
+          scripts/dr-rehearsal/restore-rehearsal.sh \
+            --confirm-writers-stopped \
+            --artifact-dir "${RUNNER_TEMP}/dr-rehearsal-missing-data" \
+            --inject-fault missing-data || rc=$?
+          echo "restore-rehearsal.sh exited ${rc} (expected nonzero)"
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::missing-data fault injection did not fail the rehearsal"
+            exit 1
+          fi
+
+      - name: Fault injection - canary query error (expect failure)
+        run: |
+          rc=0
+          rm -rf minio-data
+          mkdir -p "${RUNNER_TEMP}/dr-rehearsal-canary"
+          scripts/dr-rehearsal/restore-rehearsal.sh \
+            --confirm-writers-stopped \
+            --artifact-dir "${RUNNER_TEMP}/dr-rehearsal-canary" \
+            --inject-fault canary-query-error || rc=$?
+          echo "restore-rehearsal.sh exited ${rc} (expected nonzero)"
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::canary-query-error fault injection did not fail the rehearsal"
+            exit 1
+          fi
+
+      - name: Upload rehearsal reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dr-rehearsal-report
+          path: |
+            ${{ runner.temp }}/dr-rehearsal-real/rehearsal-report.json
+            ${{ runner.temp }}/dr-rehearsal-dangling/rehearsal-report.json
+            ${{ runner.temp }}/dr-rehearsal-missing-data/rehearsal-report.json
+            ${{ runner.temp }}/dr-rehearsal-canary/rehearsal-report.json
+          retention-days: 90
+          if-no-files-found: warn
