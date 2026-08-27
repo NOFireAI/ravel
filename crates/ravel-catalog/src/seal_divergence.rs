@@ -268,12 +268,13 @@ pub async fn verify_seal_divergence(
         let mut superseded: HashSet<(String, u64, u64)> = HashSet::new();
         for object in &objects {
             if keys::parse_compaction_record_key(&object.key).is_ok() {
-                let got = store.get(&object.key, GetRange::Full).await.map_err(|source| {
-                    SealDivergenceError::RecordFetch {
+                let got = store
+                    .get(&object.key, GetRange::Full)
+                    .await
+                    .map_err(|source| SealDivergenceError::RecordFetch {
                         key: object.key.clone(),
                         source,
-                    }
-                })?;
+                    })?;
                 let rec = CompactionRecord::decode(got.data.as_ref()).map_err(|source| {
                     SealDivergenceError::CompactionRecordCorrupt {
                         key: object.key.clone(),
@@ -284,12 +285,13 @@ pub async fn verify_seal_divergence(
                     superseded.insert((input.writer_id, input.writer_epoch, input.writer_seq));
                 }
             } else if keys::parse_rewrite_record_key(&object.key).is_ok() {
-                let got = store.get(&object.key, GetRange::Full).await.map_err(|source| {
-                    SealDivergenceError::RecordFetch {
+                let got = store
+                    .get(&object.key, GetRange::Full)
+                    .await
+                    .map_err(|source| SealDivergenceError::RecordFetch {
                         key: object.key.clone(),
                         source,
-                    }
-                })?;
+                    })?;
                 let rec = ravel_commit::erasure::decode_rewrite(&got.data).map_err(|source| {
                     SealDivergenceError::RewriteRecordCorrupt {
                         key: object.key.clone(),
