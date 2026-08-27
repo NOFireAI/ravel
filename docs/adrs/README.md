@@ -32,7 +32,7 @@ the reservation commit that used to work around it.
 | [0019](0019-age-based-retention.md) | Age-based retention via bucket tombstones and horizon-gated sweep | Accepted |
 | [0020](0020-metric-index.md) | Metric index: catalog snapshots as the commit index, async fold, name postings gated | Accepted |
 | [0021](0021-promql-full-evaluator.md) | Full PromQL evaluator scope and phasing, differential harness against pinned Prometheus | Accepted |
-| [0022](0022-floating-aggregate-exactness.md) | Floating aggregate exactness: allowlisted v1 subset, avg admitted via a sequential UDAF, second-moment family excluded | Accepted |
+| [0022](0022-floating-aggregate-exactness.md) | Floating aggregate exactness: allowlisted v1 subset, avg admitted via a sequential UDAF, second-moment family excluded | Amended by 0825 |
 | [0023](0023-grouped-min-max-total-order-udaf.md) | Grouped MIN/MAX restored via a total-order min/max UDAF replacing the built-ins | Accepted |
 | [0024](0024-sum-sequential-fold.md) | Replace the built-in `sum` aggregate with a sequential-fold UDAF | Proposed |
 | [0025](0025-promql-differential-float-precision-residue.md) | PromQL differential float-precision residue: rate/deriv/predict_linear vs. atanh | Accepted |
@@ -104,7 +104,7 @@ the reservation commit that used to work around it.
 | [0091](0091-maintainer-gated-coderabbit-reviews.md) | Maintainer-gated CodeRabbit reviews: a workflow started by hand or by a `/coderabbit review` comment, which verifies `role_name` is maintain or admin, keeps the credential behind a main-only protected environment, loads policy from main by absolute path, and never executes pull-request code; amendment 2 (2026-08-26) turns the App's automatic review back on for every pull request, with every write-capable surface still off | Proposed |
 | [0092](0092-run-merged-l1-and-rseg-v7.md) | Run-merged L1 compaction and RSEG v7: per-sample dedup provenance columns, first timestamp as a delta from the run minimum, no alignment pad on single-sample raw value pages, and three measured page encodings, landed as one version bump | Accepted |
 | [0093](0093-typed-column-pushdown-logs.md) | Skip-index and postings pushdown for declared typed logs columns: one resolver dispatching to two existing prune primitives (NumRange for I64/Bool, POSTINGS Equals for Str/Bytes), envelope-range IN, allowlist-only extraction | Proposed |
-| [0094](0094-parallel-final-aggregation-exact-typed.md) | Parallel final aggregation for exact-typed inputs | Proposed |
+| [0094](0094-parallel-final-aggregation-exact-typed.md) | Parallel final aggregation for exact-typed inputs | Amended by 0825 |
 | [0095](0095-numstat-crosstype-declared-column-agreement.md) | NumStat cross-type resolution fix and RLOG v3 | Accepted |
 | [0096](0096-queryfrag-per-sample-provenance-and-histograms.md) | Query fan-out frame carries per-sample provenance and histograms | Accepted |
 | [0097](0097-sql-scalar-function-surface.md) | The SQL scalar and window function surface: extend the fail-closed registry gate beyond aggregates | Proposed |
@@ -118,3 +118,4 @@ the reservation commit that used to work around it.
 | [0107](0107-pruning-proportional-logs-fetch.md) | Pruning-proportional block-range fetches for logs scans: a coalescing RLOG block-range fetcher mirroring SegmentFetcher (etag pinning, per-block cache admission), scoped to block-level pruning since column-level fetch savings need a frozen-format change | Proposed |
 | [0699](0699-rlog-row-groups-and-page-directory.md) | RLOG row groups with column-major pages and a PAGE_DIR section: a scan fetches only the projected columns' chunks, per-page checksums keep every read verifiable, trailer version 4 with the version-3 reader kept as N-1 | Proposed |
 | [0774](0774-topk-late-materialization-logs-scan.md) | TopK late materialization for the logs scan: a physical optimizer rule splitting a wide `ORDER BY ... LIMIT k` into a narrow row-ref-carrying scan and a k-row block fetch | Proposed |
+| [0825](0825-grouped-aggregation-accumulator-path.md) | Grouped aggregation accumulator path: flat per-group GroupsAccumulators replace the per-group boxed-accumulator adapter, and integer-input avg moves to exact i128 accumulation, deterministic by construction and admitted to the parallel final | Accepted |
