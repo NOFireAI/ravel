@@ -1714,8 +1714,10 @@ pages per block (`ts`, `stream_ref`, `body`) against 8 for
 counters) and in reduced peak decode memory, never in request count or wire
 bytes -- those stay exactly where the #693-part-3 fast path already put them.
 Reachable from any predicate-free, fully-contained, narrow-projection
-statement large enough to take the fast path (`SELECT ts, body FROM logs`
-included).
+statement that takes the fast path (`SELECT ts, body FROM logs` included).
+Object size does not gate it: since #739 the fast path is chosen for a
+segment at or below the block-range threshold too, which is what the
+request-count paragraph above already states.
 
 The per-query DataFusion memory pool now bounds concurrently-held scan memory:
 the reservation grows when a decoded block and the batch built from it are held
