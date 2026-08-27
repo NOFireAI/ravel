@@ -161,6 +161,40 @@ async fn drain_until_done<T>(gate: &GateHandle, tasks: &[tokio::task::JoinHandle
     .expect("held requests drain within 10s");
 }
 
+/// Poll `/metrics` until `want` metric points have been admitted into shard
+/// buffers, which is the precondition the shedding tests need: a request whose
+/// point is buffered has already passed the in-flight ingest ceiling and is
+/// parked awaiting its flush's ack, so it is holding one of the permits. The
+/// counter is monotonic, so this cannot see a transient. Returns the last
+/// value read, for the assertion's message.
+async fn wait_for_buffered_items(client: &reqwest::Client, base: &str, want: u64) -> u64 {
+    let mut seen = 0;
+    for _ in 0..1_000 {
+        let body = client
+            .get(format!("{base}/metrics"))
+            .send()
+            .await
+            .expect("metrics scrape completes")
+            .text()
+            .await
+            .expect("metrics body is text");
+        seen = body
+            .lines()
+            .find(|line| {
+                line.starts_with("ravel_ingest_buffered_items_total")
+                    && line.contains("signal=\"metrics\"")
+            })
+            .and_then(|line| line.rsplit(' ').next())
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        if seen >= want {
+            return seen;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    seen
+}
+
 async fn durable_metric_object_count(store: &dyn ObjectStoreBackend) -> usize {
     let prefix = format!("t/{}/m/l0/", TenantId::new(TENANT).hash().to_hex());
     list_all(store, &prefix)
@@ -204,11 +238,18 @@ async fn http_third_concurrent_request_over_limit_is_shed() {
         })
         .collect();
 
-    // Give the two admitted requests time to pass admission, enqueue on the
-    // shard, and (once the shard's flush timer fires) reach the held PUT --
-    // all far faster than it takes for either task to finish, since finishing
-    // requires this test to release the gate first.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Both admitted requests must have passed the ceiling and be parked
+    // awaiting their flush before the third is sent: the ceiling has to be
+    // saturated for the third to be shed at all. Waiting for both points to
+    // reach a shard buffer proves it. The 300 ms sleep this replaces only made
+    // it likely, and on a host slow enough to miss the window the third
+    // request is admitted and the 429 assertion below fails for a scheduling
+    // reason rather than a product one.
+    let buffered = wait_for_buffered_items(&client, &base, 2).await;
+    assert_eq!(
+        buffered, 2,
+        "both admitted requests must have buffered their point, so both hold a permit"
+    );
     assert!(
         held_tasks.iter().all(|t| !t.is_finished()),
         "both admitted requests must still be in flight, blocked on the held flush"
@@ -289,6 +330,7 @@ async fn grpc_third_concurrent_request_over_limit_is_shed() {
     let store: Arc<dyn ObjectStoreBackend> = fault.clone();
     let running = start_test_server(store.clone(), IngestConcurrencyLimit::Bounded(2)).await;
     let grpc_addr = running.grpc_addr.expect("gateway mode binds gRPC");
+    let http_base = format!("http://{}", running.http_addr);
 
     let data_key_prefix = format!("t/{}/m/l0/", TenantId::new(TENANT).hash().to_hex());
     let gate = fault.hold(Op::Put, Some(data_key_prefix), Occurrence::Always);
@@ -315,7 +357,13 @@ async fn grpc_third_concurrent_request_over_limit_is_shed() {
         })
         .collect();
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Same saturation precondition as the HTTP case above, waited for rather
+    // than slept through.
+    let buffered = wait_for_buffered_items(&reqwest::Client::new(), &http_base, 2).await;
+    assert_eq!(
+        buffered, 2,
+        "both admitted gRPC requests must have buffered their point, so both hold a permit"
+    );
     assert!(
         held_tasks.iter().all(|t| !t.is_finished()),
         "both admitted gRPC requests must still be in flight, blocked on the held flush"
