@@ -1018,6 +1018,75 @@ attached to `QueryStats` alongside the existing `segments_fetched`/
 `segments_pruned`/per-run `FetchStats` (`raw_f64_pages`/`raw_f64_bytes`,
 narrower than `decompressed_bytes`: only `ValPageKind::RawF64` pages).
 
+### Per-phase split (issue #796)
+
+The pooled `QueryAccountingSnapshot` above sums every GET a statement
+issues into one counter: the resolve's commit-record reads, the
+plan-phase footer/skip-index probe, the segment catalog fetch, and the
+actual block/page data reads all land in the same number, so a pooled
+figure alone cannot say which stage is responsible for a runaway
+request count (#835: one statement issued 18,937 GETs against a
+3,469-object tenant, and the pooled counter could not localize them).
+
+`crates/ravel-query/src/phase_accounting.rs`'s `PhaseAccounting` wraps
+four independent `QueryAccounting` handles, one per phase, using this
+doc's own vocabulary:
+
+- **resolve** -- the catalog snapshot resolve's commit-record GETs
+  (`Catalog::resolve_pruned_with_generations` and friends).
+- **plan** -- footer/skip-index probing to build a fetch plan
+  (`SegmentFetcher::open_segment`, `LogSegmentFetcher::plan_segment`; see
+  "Segment catalog fetch: whole-object vs sparse catalog-probe" and
+  "Selective (predicated) logs scan: request count" above for what a plan
+  phase does per format).
+- **probe** -- the segment catalog fetch itself: whole-object, sparse
+  catalog-probe, or whole-object-fallback (`SegmentFetcher::decode_selected`).
+- **scan** -- the actual block/page/chunk data reads
+  (`SegmentFetcher::fetch_scalar_pages`/`fetch_histogram_pages`,
+  `LogSegmentFetcher::scan_accounted_with_tenant`).
+
+Decode (turning fetched bytes into typed samples/rows) is deliberately
+not a fifth phase: it issues no store request, so it has nothing to
+attribute a request or wire-byte counter to. Its own byte figures
+(`decompressed_bytes`, `page_bytes_fetched`/`page_bytes_decoded`) stay on
+whichever handle its call site is passed -- by convention the `scan`
+handle, since decode always follows a scan in this crate's fetch
+pipelines.
+
+`PhaseAccountingSnapshot::pooled()` sums all four phases back to exactly
+the pre-#796 pooled number: `QueryStats::accounting` is computed as
+`phase_accounting.pooled()`, so every existing reader of that field keeps
+seeing the same number, unchanged. `QueryStats` additionally carries the
+full `phase_accounting: PhaseAccountingSnapshot` for callers that want
+the split.
+
+Two entry points issue GETs the phase split cannot yet attribute without
+a change outside this crate's issue #796 scope:
+
+- Federation and distributed fan-out (`federate_discovery`,
+  `federate_scalar`, `distrib::client`'s `SliceFetcher`) cross a wire
+  boundary as one pooled `QueryAccountingSnapshot`
+  (`SliceResponse.accounting`) that predates #796; a worker's per-slice
+  spend is charged to `scan` on the coordinator side rather than left
+  unaccounted. Splitting it for real would need a wire-format version
+  bump to the coordinator/worker protobuf.
+- `LogSegmentFetcher`'s three streaming entry points that return a live
+  `LogSegmentScan` (`scan_accounted_with_tenant`,
+  `scan_whole_accounted_with_tenant`, `scan_accounted_with_tenant_subset`)
+  keep writing deferred `page_bytes_fetched`/`page_bytes_decoded` into
+  their stored `QueryAccounting` handle after the constructing call
+  returns (`LogSegmentScan::finish`, ADR-0107 decision 4, run from
+  `next_block`'s exhaustion arm or from `Drop`). A disposable
+  `PhaseAccounting` buffered and merged once before return -- the pattern
+  used everywhere else in this split -- would silently drop those later
+  writes, so these three keep taking a plain `&QueryAccounting` and are
+  `scan` phase by construction instead, documented at each call site.
+
+`ravel-sql`'s `SqlExecutor` builds its own `QueryAccounting` per attempt
+(`SqlOutcome.accounting`) entirely inside that crate, so the phase split
+does not yet reach `ravel-bench`'s `sql_latency_bench` report: doing so
+needs a `ravel-sql` change outside this crate's scope for issue #796.
+
 ### Pre-execution cost estimate
 
 The estimate has two parts, computed at two different moments, because
