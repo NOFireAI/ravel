@@ -2005,6 +2005,21 @@ is per-query and decided from the query's fully type-coerced (analyzed) plan:
   `-0.0`/NaN payloads are bit-significant here and no merge-order-stable
   representative bit pattern for a float group key is proven.
 
+`avg` over an **integer** column is excluded by that same rule, and the reason
+is worth stating because the shape looks admissible: an integer argument never
+reaches an accumulator as an integer. DataFusion coerces every non-decimal,
+non-duration `avg` argument to `Float64` before planning finishes, so the
+partial state a two-phase `avg` carries is a **Float64** sum with an integer
+count -- not the exact `(integer sum, count)` pair that would merge across
+partitions without loss. Merging those partial sums is f64 addition and depends
+on how the group was split. A second consequence of the same coercion: after
+analysis, `avg(int_col)` and `avg(float_col)` are the same plan with the same
+`Float64` argument type, so the classifier has no resolved type by which it
+could admit one and reject the other. See the ADR-0094 amendment for issue
+`#771`, which rejects admitting `avg` on this basis and lists the routes that
+could instead fix the wide-`GROUP BY` `avg` statements that exhaust the memory
+pool today (issue `#741`).
+
 A single disqualifying aggregate or key anywhere in the query -- including inside
 a scalar/`IN`/`EXISTS` subquery -- forces the whole query onto the
 single-partition plan: `repartition_aggregations` is one session-wide switch, not

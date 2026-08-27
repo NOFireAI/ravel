@@ -1611,8 +1611,11 @@ fn aggregate_expr_is_exact(expr: &Expr, schema: &DFSchema) -> bool {
             None => false,
         },
         // `avg`/`mean` always run plain IEEE f64 addition (crate::avg), so they
-        // are never exact regardless of input type; any other name is outside
-        // the admitted aggregate set and fails closed.
+        // are never exact regardless of input type: an integer argument is
+        // coerced to Float64 before it reaches any accumulator, so the partial
+        // sum state is f64 there too and a cross-partition merge of it is
+        // order-dependent (ADR-0094's amendment for issue #771). Any other name
+        // is outside the admitted aggregate set and fails closed.
         _ => false,
     }
 }

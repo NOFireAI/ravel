@@ -688,3 +688,127 @@ and it is why some high-cardinality statements still fail with the parallel
 final on. Do not read this amendment as a claim that every high-cardinality
 `GROUP BY` now completes: it fixes the final-merge exhaustion for the
 exact-typed class, not the partial-stage one.
+
+## Amendment 2026-08-26 (issue #771): `avg` over integer input, rejected
+
+Status: Rejected. `avg`/`mean` remain never eligible, over every input type.
+Decision 1's classification is unchanged and no code changed with this
+amendment; what changed is that the exclusion now has DataFusion 54.1.0's
+own accumulator state cited against it, and tests that pin the cited facts.
+
+**The proposal.** Issue #771 (under epic #680) argued that `avg` over an
+integer column should be admitted to the repartitioned final: its partial
+state is a `(sum, count)` pair whose merge across partitions would be exact
+integer addition, with the only float step being one division per group after
+the merge, computed identically in one partition or many. On that premise the
+exactness argument that excludes float `GROUP BY` keys and float sums would
+not apply, and ClickBench `q33_watch_ip_aggregates_all` (an `avg` over a wide
+`GROUP BY`, which exhausts the 8 GiB pool while its four sibling statements
+complete in 12-16 s under the parallel final, issue #741) would join the
+admitted class.
+
+**The premise is false.** `avg` over an integer column does not carry an
+exact integer sum anywhere in DataFusion 54.1.0, because the integer never
+reaches an accumulator:
+
+- `avg`'s signature coerces every integer or float argument to Float64:
+  `TypeSignature::Coercible` with `Coercion::new_implicit(TypeSignatureClass::
+  Native(logical_float64()), vec![TypeSignatureClass::Integer,
+  TypeSignatureClass::Float], NativeType::Float64)`
+  (`datafusion-functions-aggregate-54.1.0/src/average.rs:101-113`). Only
+  Decimal and Duration arguments keep their own type.
+- Its return type for everything but Decimal and Duration is Float64
+  (`average.rs:137-170`, the `_ => Ok(DataType::Float64)` arm at
+  `average.rs:168`).
+- The accumulator dispatch's own comment says so: "Numeric types are converted
+  to Float64 via `coerce_avg_type` during logical plan creation"
+  (`average.rs:179`), and the non-distinct dispatch for that case is
+  `(Float64, Float64) => Ok(Box::<AvgAccumulator>::default())`
+  (`average.rs:224`).
+- `AvgAccumulator` holds the numerator as f64:
+  `pub struct AvgAccumulator { sum: Option<f64>, count: u64 }`
+  (`average.rs:505-508`). `update_batch` folds with `*v += x` on f64
+  (`average.rs:511-518`), and `merge_batch` merges partial states the same
+  way -- "sums are summed", `sum(states[1].as_primitive::<Float64Type>())`
+  then `*v += x` (`average.rs:544-554`). The state fields are
+  `count: UInt64` plus `sum` typed as the (already coerced to Float64) input
+  (`average.rs:317-331`).
+
+So the merge across partitions is f64 addition, not exact integer addition.
+f64 addition is not associative once a running sum passes 2^53, which
+ordinary `i64` log values reach: summing `2^53`, `1`, `1` gives
+`9007199254740992` when folded left to right and `9007199254740994` when the
+two small values are added in a sibling partition first. Two partitionings of
+one group therefore produce two different numerators and two different
+quotients. This is pinned by
+`f64_partial_sum_merge_is_order_dependent_for_integer_input`
+(`crates/ravel-sql/tests/parallel_final_default.rs`).
+
+**This crate's `avg` is stricter still.** The `avg` a Ravel session actually
+executes is not the built-in: `session.rs:611` registers `crate::avg`'s
+`SequentialAvg` UDAF over the name and its `mean` alias (ADR-0022 decisions
+3, 4). It delegates signature, return type and coercion to the built-in, so
+integer input coerces to Float64 exactly as above, and its own state is
+`(Float64 sum, Int64 count)` with a `merge_batch` that adds partial sums with
+plain IEEE addition (`avg.rs`, `state_fields` and
+`SequentialAvgAccumulator::merge_batch`). It exists specifically to guarantee
+a bit-reproducible result by folding in the deterministic `(series_id, ts)`
+order that v1 gets from executing aggregation single-partitioned. Admitting
+`avg` would break that UDAF's stated precondition directly, not merely risk a
+rounding difference.
+
+**A second, independent obstacle.** Decision 1 classifies from the *analyzed*
+(type-coerced) plan, by resolved type. After coercion, `avg(int_col)` and
+`avg(float_col)` are the same expression shape with the same Float64 argument
+type -- the planner even drops an explicit `CAST(int_col AS DOUBLE)` inside
+`avg`, because Float64 is where the integer was going anyway. There is no
+resolved type by which the classifier could admit the integer case and keep
+excluding the float one; doing it would require classifying from the
+pre-coercion plan or reaching through the coercion cast into the input
+schema, which is a change to decision 1's foundation and not a new arm in
+`aggregate_expr_is_exact`.
+
+**Prior art.** This is the second time the proposal has been made and
+rejected. The Context section above records the first: an earlier draft of
+this ADR admitted `avg`/`mean` over non-float input on the same reasoning and
+was corrected by adversarial review before any code was written. That
+rejection argued from `crate::avg`'s module doc; this one adds the upstream
+accumulator's source, so the next reader does not have to re-derive either.
+
+**No q33 measurement is pre-registered, because nothing changes.** The
+pre-registration this amendment was asked to carry -- q33 completing in 12-20
+s at 8,424 GETs / 11.1 GB with no pool exhaustion, like its four siblings --
+would only be meaningful for a change that admits q33's `avg` to the
+repartitioned final. This amendment admits nothing, so q33's behavior is
+byte-for-byte what it is today: its `avg` keeps the single-partition final
+and it still exhausts the 8 GiB pool. Issue #741's q33 failure is therefore
+**not** addressed here and stays open. The routes that could address it, none
+of which this amendment takes:
+
+- Rewrite `avg(x)` over an integer column into `sum(x) / count(x)` before
+  classification, so the exact integer `sum` (already admitted) does the
+  cross-partition work and one division per group happens after the merge.
+  This is the proposal's arithmetic, obtained by changing the plan rather
+  than by misclassifying the existing accumulator. It needs its own ADR: it
+  changes NULL and overflow behavior at the edges (`sum` of an empty group,
+  integer overflow wrapping) and it must agree with ADR-0022's fold for the
+  cases where both can run.
+- Reduce the partial stage's footprint instead of the final's (issue #737,
+  `skip_partial_aggregation`), which is where a wide `GROUP BY` spends the
+  memory the final merge then inherits.
+- Accept a documented tolerance for `avg`, which ADR-0013's differential gate
+  currently forbids.
+
+**Tests pinning this amendment** (all in
+`crates/ravel-sql/tests/parallel_final_default.rs`, alongside the
+classification tests in `executor.rs`):
+`avg_over_int_column_carries_a_float64_partial_sum_state` reads the
+`Partial` aggregate's state schema out of the physical plan and asserts the
+avg sum state is Float64 while `sum(k)` over the same Int64 column carries an
+Int64 one; `f64_partial_sum_merge_is_order_dependent_for_integer_input` pins
+the non-associativity above by bit pattern;
+`avg_group_by_int_key_agrees_and_stays_single_final` and
+`avg_over_float_input_stays_single_partition` pin the plan shape and the
+exact per-group values on a fixture. If a future DataFusion release gives
+`avg` an exact integer or decimal partial state, the first of those goes red
+and this amendment is the thing to revisit.
