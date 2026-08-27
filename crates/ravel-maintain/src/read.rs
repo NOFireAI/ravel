@@ -19,7 +19,7 @@ use futures::stream::{StreamExt, TryStreamExt, iter as stream_iter};
 use ravel_commit::keys::{self, BucketEntry};
 use ravel_commit::record;
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError, list_all};
-use ravel_proto::commit::v1::CommitRecord;
+use ravel_proto::commit::v1::{CommitRecord, CompactionInputIdentity};
 use ravel_segment::{
     ExemplarInput, FooterLocation, FooterOutcome, ReaderLimits, ValueKind, decode_catalog_v4,
     decode_catalog_v5, decode_exemplars_section, open_from_suffix, plan_ranges_v4,
@@ -38,11 +38,6 @@ const SERIES_META: u32 = 6;
 const SERIES_IDX: u32 = 8;
 const SERIES_META_CHUNKS: u32 = 9;
 const EXEMPLARS: u32 = 10;
-
-/// Domain-separated prefix for the `input_set_hash` preimage. Fixes the
-/// canonical byte stream so any two compactors over the same sealed bucket
-/// derive the same hash and therefore the same record key.
-const INPUT_SET_HASH_DOMAIN: &[u8] = b"ravel-compaction-input-set-v1\0";
 
 /// The partitioned result of listing a bucket's `c/<shard>/<hour>/` prefix
 /// (partitions listed keys by shape). Unknown shapes are a hard
@@ -218,22 +213,21 @@ fn signal_name(s: Signal) -> String {
     s.key_prefix().to_string()
 }
 
-/// Canonical `input_set_hash`: blake3 over a domain-separated, length-framed
-/// encoding of the sorted input identities. Inputs MUST already
-/// be in canonical order (as [`load_inputs`] leaves them).
+/// Canonical `input_set_hash`: delegates to
+/// [`ravel_commit::erasure::compute_compaction_input_set_hash`], the single
+/// definition this crate and `ravel-catalog`'s `seal_divergence` check both
+/// call. Inputs MUST already be in canonical order (as [`load_inputs`]
+/// leaves them).
 pub fn input_set_hash(inputs: &[InputRecord]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(INPUT_SET_HASH_DOMAIN);
-    let count = inputs.len() as u64;
-    hasher.update(&count.to_le_bytes());
-    for input in inputs {
-        let wid = input.record.writer_id.as_bytes();
-        hasher.update(&(wid.len() as u64).to_le_bytes());
-        hasher.update(wid);
-        hasher.update(&input.record.writer_epoch.to_le_bytes());
-        hasher.update(&input.record.writer_seq.to_le_bytes());
-    }
-    *hasher.finalize().as_bytes()
+    let ids: Vec<CompactionInputIdentity> = inputs
+        .iter()
+        .map(|input| CompactionInputIdentity {
+            writer_id: input.record.writer_id.clone(),
+            writer_epoch: input.record.writer_epoch,
+            writer_seq: input.record.writer_seq,
+        })
+        .collect();
+    ravel_commit::erasure::compute_compaction_input_set_hash(&ids)
 }
 
 /// One run's copy plan: dedup-priority provenance (from the input's COMMIT
@@ -704,5 +698,59 @@ mod tests {
                 "dropping section kind {dropped} must fail closed, got {got:?}"
             );
         }
+    }
+
+    /// One-definition test (issue #830): `input_set_hash` here is not a
+    /// second copy of the hash, it delegates to
+    /// [`ravel_commit::erasure::compute_compaction_input_set_hash`]. Compute
+    /// the hash of the same input set both through this crate's
+    /// [`InputRecord`]-shaped path and directly through the moved function on
+    /// hand-built [`CompactionInputIdentity`] values; they must agree by
+    /// construction, since they are the same call, not by coincidentally
+    /// matching preimages kept in sync by inspection.
+    #[test]
+    fn input_set_hash_agrees_with_the_moved_ravel_commit_function() {
+        use ravel_proto::commit::v1::CommitRecord;
+
+        let inputs = vec![
+            InputRecord {
+                commit_key: "irrelevant-to-the-hash-1".to_string(),
+                record: CommitRecord {
+                    writer_id: "11111111-1111-1111-1111-111111111111".to_string(),
+                    writer_epoch: 1,
+                    writer_seq: 7,
+                    ..Default::default()
+                },
+            },
+            InputRecord {
+                commit_key: "irrelevant-to-the-hash-2".to_string(),
+                record: CommitRecord {
+                    writer_id: "22222222-2222-2222-2222-222222222222".to_string(),
+                    writer_epoch: 2,
+                    writer_seq: 3,
+                    ..Default::default()
+                },
+            },
+        ];
+
+        let via_maintain = input_set_hash(&inputs);
+
+        let identities: Vec<CompactionInputIdentity> = inputs
+            .iter()
+            .map(|i| CompactionInputIdentity {
+                writer_id: i.record.writer_id.clone(),
+                writer_epoch: i.record.writer_epoch,
+                writer_seq: i.record.writer_seq,
+            })
+            .collect();
+        let via_ravel_commit =
+            ravel_commit::erasure::compute_compaction_input_set_hash(&identities);
+
+        assert_eq!(
+            via_maintain, via_ravel_commit,
+            "ravel-maintain's input_set_hash must be the same call as \
+             ravel_commit::erasure::compute_compaction_input_set_hash, not a \
+             second definition that could drift"
+        );
     }
 }

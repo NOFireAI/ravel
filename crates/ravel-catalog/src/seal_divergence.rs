@@ -139,6 +139,15 @@ pub enum SealDivergenceError {
         #[source]
         source: prost::DecodeError,
     },
+    #[error(
+        "compaction record at {key} declares input_set_hash {declared} but its \
+         inputs hash to {computed}"
+    )]
+    CompactionInputSetHashMismatch {
+        key: String,
+        declared: String,
+        computed: String,
+    },
     #[error("rewrite record at {key} is corrupt: {source}")]
     RewriteRecordCorrupt {
         key: String,
@@ -281,6 +290,31 @@ pub async fn verify_seal_divergence(
                         source,
                     }
                 })?;
+                // A compaction record's declared `input_set_hash` must match
+                // the canonical hash of its own `inputs`: every input named
+                // here is removed from the ground-truth set below, so a
+                // record whose declared hash disagrees with its inputs could
+                // make this check silently skip real L0 entries instead of
+                // catching them as missing (issue #830). Recomputed the same
+                // way `ravel-maintain`'s compaction loader derives the hash
+                // it publishes, so a well-formed record always agrees.
+                // A compaction record's declared `input_set_hash` must match
+                // the canonical hash of its own `inputs`: every input named
+                // here is removed from the ground-truth set below, so a
+                // record whose declared hash disagrees with its inputs could
+                // make this check silently skip real L0 entries instead of
+                // catching them as missing (issue #830). Recomputed the same
+                // way `ravel-maintain`'s compaction loader derives the hash
+                // it publishes, so a well-formed record always agrees.
+                let computed =
+                    ravel_commit::erasure::compute_compaction_input_set_hash(&rec.inputs);
+                if rec.input_set_hash.as_slice() != computed.as_slice() {
+                    return Err(SealDivergenceError::CompactionInputSetHashMismatch {
+                        key: object.key.clone(),
+                        declared: hex::encode(&rec.input_set_hash),
+                        computed: hex::encode(computed),
+                    });
+                }
                 for input in rec.inputs {
                     superseded.insert((input.writer_id, input.writer_epoch, input.writer_seq));
                 }
@@ -432,12 +466,18 @@ mod tests {
     /// folds this part in as a level-1 entry (32-byte `input_set_hash` in the
     /// writer_id slot). Only the record object is written; the fold reads the
     /// record, not the L1 part object.
+    ///
+    /// `tamper_hash`: when true, stores a `input_set_hash` that does not
+    /// match `inputs` (a corrupt/malicious record), to exercise the
+    /// [`SealDivergenceError::CompactionInputSetHashMismatch`] check
+    /// (issue #830). Never set for a well-formed fixture.
     async fn publish_compaction(
         store: &MemoryStore,
         tenant: &str,
         ingest_hour_bucket: u32,
         inputs: &[&ravel_proto::commit::v1::CommitRecord],
         created_unix_ns: i64,
+        tamper_hash: bool,
     ) {
         use ravel_commit::signal;
         use ravel_proto::commit::v1::{CompactionInputIdentity, CompactionPart, CompactionRecord};
@@ -451,15 +491,14 @@ mod tests {
                 writer_seq: r.writer_seq,
             })
             .collect();
-        // The exact preimage does not matter for this test, only that the
-        // resulting input_set_hash is 32 bytes (a blake3 digest always is).
-        let mut hasher = blake3::Hasher::new();
-        for id in &input_ids {
-            hasher.update(id.writer_id.as_bytes());
-            hasher.update(&id.writer_epoch.to_le_bytes());
-            hasher.update(&id.writer_seq.to_le_bytes());
+        // The canonical hash: `verify_seal_divergence` now recomputes and
+        // checks this (issue #830), so a well-formed test fixture must carry
+        // the real thing, not a placeholder 32 bytes.
+        let mut input_set_hash =
+            ravel_commit::erasure::compute_compaction_input_set_hash(&input_ids);
+        if tamper_hash {
+            input_set_hash[0] ^= 0xff;
         }
-        let input_set_hash = *hasher.finalize().as_bytes();
         let part_payload = format!("l1-{ingest_hour_bucket}").into_bytes();
         let part_content_hash = *blake3::hash(&part_payload).as_bytes();
         let part = CompactionPart {
@@ -563,7 +602,7 @@ mod tests {
         let hour = u32::try_from(created / NS_PER_HOUR).expect("fits u32");
 
         let l0 = publish_segment(store.as_ref(), tenant, 1, created).await;
-        publish_compaction(store.as_ref(), tenant, hour, &[&l0], created).await;
+        publish_compaction(store.as_ref(), tenant, hour, &[&l0], created, false).await;
         fold(store.clone(), tenant, now).await;
 
         let report = verify_seal_divergence(
@@ -596,6 +635,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tampered_compaction_input_set_hash_fails_loud_not_quiet() {
+        // Regression for issue #830. Before the fix, `verify_seal_divergence`
+        // trusted a compaction record's `inputs` at face value: it built the
+        // `superseded` set straight from `rec.inputs` and never checked that
+        // `rec.input_set_hash` is actually the canonical hash of those inputs.
+        // A record whose declared inputs don't match its hash could then make
+        // this check silently exclude real L0 entries from the ground truth,
+        // reporting a clean, no-divergence result it never actually
+        // established -- verify going quiet instead of loud. This asserts the
+        // opposite: a tampered record is a hard `Err`, not a clean report.
+        let store = Arc::new(MemoryStore::new());
+        let tenant = "tampered-compaction";
+        let now = 600_000 * NS_PER_HOUR;
+        let created = now - SEALED_AGE_NS;
+        let hour = u32::try_from(created / NS_PER_HOUR).expect("fits u32");
+
+        let l0 = publish_segment(store.as_ref(), tenant, 1, created).await;
+        publish_compaction(store.as_ref(), tenant, hour, &[&l0], created, true).await;
+        fold(store.clone(), tenant, now).await;
+
+        let err = verify_seal_divergence(
+            store.as_ref(),
+            &TenantId::new(tenant).hash(),
+            Signal::Metrics,
+        )
+        .await
+        .expect_err(
+            "a compaction record whose declared input_set_hash disagrees with its \
+             inputs must be a hard error, not a silent clean report",
+        );
+        assert!(
+            matches!(
+                err,
+                SealDivergenceError::CompactionInputSetHashMismatch { .. }
+            ),
+            "expected CompactionInputSetHashMismatch, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn l1_compaction_present_does_not_hide_unrelated_missing_record() {
         // The exclusion set built from compaction/rewrite `inputs` must only
         // ever shrink the ground truth by the records those inputs actually
@@ -610,7 +689,15 @@ mod tests {
         let hour = u32::try_from(created / NS_PER_HOUR).expect("fits u32");
 
         let compacted_l0 = publish_segment(store.as_ref(), tenant, 1, created).await;
-        publish_compaction(store.as_ref(), tenant, hour, &[&compacted_l0], created).await;
+        publish_compaction(
+            store.as_ref(),
+            tenant,
+            hour,
+            &[&compacted_l0],
+            created,
+            false,
+        )
+        .await;
         fold(store.clone(), tenant, now).await;
         // Sealed but published after the fold, and never part of any
         // compaction: the snapshot under-counts this one specifically.
@@ -648,7 +735,15 @@ mod tests {
         let hour = u32::try_from(created / NS_PER_HOUR).expect("fits u32");
 
         let compacted_l0 = publish_segment(store.as_ref(), tenant, 1, created).await;
-        publish_compaction(store.as_ref(), tenant, hour, &[&compacted_l0], created).await;
+        publish_compaction(
+            store.as_ref(),
+            tenant,
+            hour,
+            &[&compacted_l0],
+            created,
+            false,
+        )
+        .await;
         let uncompacted_l0 = publish_segment(store.as_ref(), tenant, 2, created).await;
         fold(store.clone(), tenant, now).await;
 

@@ -234,12 +234,48 @@ pub fn decode_completion(bytes: &[u8]) -> Result<ErasureCompletion, ErasureError
     Ok(record)
 }
 
+// --- CompactionRecord ---
+
+/// Domain-separation prefix for [`compute_compaction_input_set_hash`].
+/// Distinct from [`REWRITE_INPUT_SET_HASH_DOMAIN`] so the two hashes can
+/// never collide even if the same input byte sequence were fed to both.
+pub const COMPACTION_INPUT_SET_HASH_DOMAIN: &[u8] = b"ravel-compaction-input-set-v1\0";
+
+/// Compute the canonical `input_set_hash` for a `CompactionRecord`: blake3
+/// over a domain-separated, length-framed encoding of the input identities.
+///
+/// The preimage, in order, is:
+///
+/// 1. the [`COMPACTION_INPUT_SET_HASH_DOMAIN`] tag;
+/// 2. a little-endian `u64` count of `inputs`, then for each input its
+///    `writer_id` UTF-8 bytes (length-prefixed by a little-endian `u64`),
+///    then its `writer_epoch` and `writer_seq` as little-endian `u64`.
+///
+/// `inputs` MUST already be sorted canonically by
+/// `(writer_id, writer_epoch, writer_seq)` (ravel-maintain's `load_inputs`
+/// leaves them this way); this function does not sort. This is the single
+/// definition of the hash: ravel-maintain's compaction loader and
+/// ravel-catalog's `seal_divergence` check both call this function rather
+/// than keeping their own copy, so the two can never drift apart.
+pub fn compute_compaction_input_set_hash(inputs: &[CompactionInputIdentity]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(COMPACTION_INPUT_SET_HASH_DOMAIN);
+    hasher.update(&(inputs.len() as u64).to_le_bytes());
+    for input in inputs {
+        let wid = input.writer_id.as_bytes();
+        hasher.update(&(wid.len() as u64).to_le_bytes());
+        hasher.update(wid);
+        hasher.update(&input.writer_epoch.to_le_bytes());
+        hasher.update(&input.writer_seq.to_le_bytes());
+    }
+    *hasher.finalize().as_bytes()
+}
+
 // --- RewriteRecord ---
 
 /// Domain-separation prefix for [`compute_rewrite_input_set_hash`]. Distinct
-/// from ravel-maintain's compaction `input_set_hash` domain
-/// (`ravel-compaction-input-set-v1\0`) so the two hashes can never collide
-/// even if the same input byte sequence were fed to both.
+/// from [`COMPACTION_INPUT_SET_HASH_DOMAIN`] so the two hashes can never
+/// collide even if the same input byte sequence were fed to both.
 pub const REWRITE_INPUT_SET_HASH_DOMAIN: &[u8] = b"ravel-rewrite-input-set-v1\0";
 
 /// Compute the canonical `input_set_hash` for a [`RewriteRecord`]
@@ -257,7 +293,8 @@ pub const REWRITE_INPUT_SET_HASH_DOMAIN: &[u8] = b"ravel-rewrite-input-set-v1\0"
 ///      little-endian `u64` count of the inputs, then for each input its
 ///      `writer_id` UTF-8 bytes (length-prefixed by a little-endian `u64`),
 ///      then its `writer_epoch` and `writer_seq` as little-endian `u64` —
-///      the same shape ravel-maintain's compaction `input_set_hash` uses; or
+///      the same per-input shape [`compute_compaction_input_set_hash`] uses;
+///      or
 ///    - (superseded, discriminant `0x01`) if `superseded_record_key` is
 ///      `Some`: its UTF-8 bytes prefixed by their length as a little-endian
 ///      `u64`;
@@ -957,6 +994,91 @@ mod tests {
         let mut rw = valid_rewrite();
         rw.drops.clear();
         assert_eq!(validate_rewrite(&rw), Err(ErasureError::EmptyDrops));
+    }
+
+    /// Reproduces, independently of [`compute_compaction_input_set_hash`],
+    /// the exact preimage ravel-maintain's `read::input_set_hash` computed
+    /// before the move (domain tag, little-endian `u64` count, then per
+    /// input a length-prefixed `writer_id`, `writer_epoch`,
+    /// `writer_seq`, all little-endian). A move that produced different
+    /// bytes for any input would be a frozen-contract change (the hash names
+    /// a compaction record's key), not a refactor; this pins the byte
+    /// sequence against known inputs so that would fail here.
+    fn reference_compaction_input_set_hash(inputs: &[CompactionInputIdentity]) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"ravel-compaction-input-set-v1\0");
+        hasher.update(&(inputs.len() as u64).to_le_bytes());
+        for input in inputs {
+            let wid = input.writer_id.as_bytes();
+            hasher.update(&(wid.len() as u64).to_le_bytes());
+            hasher.update(wid);
+            hasher.update(&input.writer_epoch.to_le_bytes());
+            hasher.update(&input.writer_seq.to_le_bytes());
+        }
+        *hasher.finalize().as_bytes()
+    }
+
+    #[test]
+    fn compute_compaction_input_set_hash_matches_reference_bytes() {
+        let cases: Vec<Vec<CompactionInputIdentity>> = vec![
+            vec![],
+            vec![CompactionInputIdentity {
+                writer_id: Uuid::from_u128(1).to_string(),
+                writer_epoch: 1,
+                writer_seq: 1,
+            }],
+            vec![
+                CompactionInputIdentity {
+                    writer_id: Uuid::from_u128(1).to_string(),
+                    writer_epoch: 1,
+                    writer_seq: 1,
+                },
+                CompactionInputIdentity {
+                    writer_id: Uuid::from_u128(2).to_string(),
+                    writer_epoch: 7,
+                    writer_seq: 42,
+                },
+            ],
+        ];
+        for inputs in cases {
+            assert_eq!(
+                compute_compaction_input_set_hash(&inputs),
+                reference_compaction_input_set_hash(&inputs),
+                "moved function must compute byte-identical hashes to the \
+                 pre-move algorithm for inputs {inputs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compute_compaction_input_set_hash_is_deterministic() {
+        let inputs = vec![CompactionInputIdentity {
+            writer_id: Uuid::from_u128(9).to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        }];
+        assert_eq!(
+            compute_compaction_input_set_hash(&inputs),
+            compute_compaction_input_set_hash(&inputs)
+        );
+    }
+
+    #[test]
+    fn compute_compaction_input_set_hash_differs_on_inputs() {
+        let a = vec![CompactionInputIdentity {
+            writer_id: Uuid::from_u128(1).to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        }];
+        let b = vec![CompactionInputIdentity {
+            writer_id: Uuid::from_u128(1).to_string(),
+            writer_epoch: 1,
+            writer_seq: 2,
+        }];
+        assert_ne!(
+            compute_compaction_input_set_hash(&a),
+            compute_compaction_input_set_hash(&b)
+        );
     }
 
     #[test]
