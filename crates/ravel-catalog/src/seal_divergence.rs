@@ -26,6 +26,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use prost::Message;
+use ravel_commit::erasure::compute_compaction_input_set_hash;
 use ravel_commit::keys::{self, KeyError};
 use ravel_commit::record::{self, RecordError};
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
@@ -138,6 +139,16 @@ pub enum SealDivergenceError {
         key: String,
         #[source]
         source: prost::DecodeError,
+    },
+    #[error(
+        "compaction record at {key} declares input_set_hash {declared} but its own inputs \
+         hash to {computed}: the record is corrupt or forged, not a routine condition; its \
+         declared inputs are not trusted to suppress anything"
+    )]
+    CompactionInputSetHashMismatch {
+        key: String,
+        declared: String,
+        computed: String,
     },
     #[error("rewrite record at {key} is corrupt: {source}")]
     RewriteRecordCorrupt {
@@ -281,6 +292,24 @@ pub async fn verify_seal_divergence(
                         source,
                     }
                 })?;
+                // The loader above only checks the record's key and that it
+                // protobuf-decodes; neither confirms `inputs` is what the
+                // record's own `input_set_hash` names. Recompute the
+                // canonical hash from `rec.inputs` and compare before
+                // trusting a single one of them to suppress an L0 entry from
+                // the ground truth: a mismatch means the record is corrupt
+                // or forged (never a routine condition, since every writer
+                // of a real compaction record computes this hash the same
+                // way), and failing loud here is what makes `catalog verify`
+                // notice instead of silently under-checking real L0 entries.
+                let computed = compute_compaction_input_set_hash(&rec.inputs);
+                if rec.input_set_hash.as_slice() != computed.as_slice() {
+                    return Err(SealDivergenceError::CompactionInputSetHashMismatch {
+                        key: object.key.clone(),
+                        declared: hex::encode(&rec.input_set_hash),
+                        computed: hex::encode(computed),
+                    });
+                }
                 for input in rec.inputs {
                     superseded.insert((input.writer_id, input.writer_epoch, input.writer_seq));
                 }
@@ -439,6 +468,32 @@ mod tests {
         inputs: &[&ravel_proto::commit::v1::CommitRecord],
         created_unix_ns: i64,
     ) {
+        // The canonical hash, exactly as a real compactor computes it: a
+        // fixture with any other value is the mismatch fixture below, not
+        // this one.
+        publish_compaction_with_hash(
+            store,
+            tenant,
+            ingest_hour_bucket,
+            inputs,
+            created_unix_ns,
+            None,
+        )
+        .await;
+    }
+
+    /// Same as [`publish_compaction`], but `forged_hash` (when `Some`)
+    /// overrides the stored `input_set_hash` with a value that does not
+    /// match the canonical hash of `inputs` -- the mismatch fixture for
+    /// [`compaction_record_with_mismatched_input_set_hash_fails_loudly`].
+    async fn publish_compaction_with_hash(
+        store: &MemoryStore,
+        tenant: &str,
+        ingest_hour_bucket: u32,
+        inputs: &[&ravel_proto::commit::v1::CommitRecord],
+        created_unix_ns: i64,
+        forged_hash: Option<[u8; 32]>,
+    ) -> String {
         use ravel_commit::signal;
         use ravel_proto::commit::v1::{CompactionInputIdentity, CompactionPart, CompactionRecord};
 
@@ -451,15 +506,8 @@ mod tests {
                 writer_seq: r.writer_seq,
             })
             .collect();
-        // The exact preimage does not matter for this test, only that the
-        // resulting input_set_hash is 32 bytes (a blake3 digest always is).
-        let mut hasher = blake3::Hasher::new();
-        for id in &input_ids {
-            hasher.update(id.writer_id.as_bytes());
-            hasher.update(&id.writer_epoch.to_le_bytes());
-            hasher.update(&id.writer_seq.to_le_bytes());
-        }
-        let input_set_hash = *hasher.finalize().as_bytes();
+        let input_set_hash =
+            forged_hash.unwrap_or_else(|| compute_compaction_input_set_hash(&input_ids));
         let part_payload = format!("l1-{ingest_hour_bucket}").into_bytes();
         let part_content_hash = *blake3::hash(&part_payload).as_bytes();
         let part = CompactionPart {
@@ -496,6 +544,7 @@ mod tests {
             )
             .await
             .expect("put compaction record");
+        key
     }
 
     async fn fold(store: Arc<dyn ObjectStoreBackend>, tenant: &str, now_ns: i64) {
@@ -675,6 +724,56 @@ mod tests {
         );
         assert!(report.missing.is_empty());
         assert!(report.mismatched.is_empty());
+    }
+
+    #[tokio::test]
+    async fn compaction_record_with_mismatched_input_set_hash_fails_loudly() {
+        // Issue #830. A compaction record whose declared `input_set_hash`
+        // does not correspond to its own `inputs` must not be trusted to
+        // suppress those inputs from the ground truth: `verify_seal_divergence`
+        // must fail loud, naming the record, rather than silently excluding
+        // real L0 entries because a forged or corrupt record said so.
+        let store = Arc::new(MemoryStore::new());
+        let tenant = "forged-hash";
+        let now = 600_000 * NS_PER_HOUR;
+        let created = now - SEALED_AGE_NS;
+        let hour = u32::try_from(created / NS_PER_HOUR).expect("fits u32");
+
+        let l0 = publish_segment(store.as_ref(), tenant, 1, created).await;
+        let forged = [0x42u8; 32];
+        let record_key = publish_compaction_with_hash(
+            store.as_ref(),
+            tenant,
+            hour,
+            &[&l0],
+            created,
+            Some(forged),
+        )
+        .await;
+        fold(store.clone(), tenant, now).await;
+
+        let tenant_hash = TenantId::new(tenant).hash();
+        let err = verify_seal_divergence(store.as_ref(), &tenant_hash, Signal::Metrics)
+            .await
+            .expect_err(
+                "a compaction record whose input_set_hash disagrees with its own \
+                         inputs must be a hard error, not a divergence result",
+            );
+        match &err {
+            SealDivergenceError::CompactionInputSetHashMismatch {
+                key,
+                declared,
+                computed,
+            } => {
+                assert_eq!(key, &record_key, "the error must name the offending record");
+                assert_eq!(declared, &hex::encode(forged));
+                assert_ne!(
+                    declared, computed,
+                    "the whole point of the fixture is that these disagree"
+                );
+            }
+            other => panic!("expected CompactionInputSetHashMismatch, got {other:?}"),
+        }
     }
 
     #[tokio::test]
