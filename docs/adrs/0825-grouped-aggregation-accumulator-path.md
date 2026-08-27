@@ -32,8 +32,8 @@ row filter and completes in 27.1 s, second slowest in the corpus. A cost
 that appears when a filter is removed and cardinality rises is a per-group
 cost curve, not a scan cost.
 
-One thing this profile does NOT say: that the open I/O tickets (#790,
-#815, #520, #811) are low-value. They target object-store waits, which an
+One thing this profile does NOT say: that the open I/O tickets (#790, #815,
+#520, #811) are low-value. They target object-store waits, which an
 on-CPU profile cannot see at all. This profile ranks compute; it says
 nothing about wall-clock spent waiting. The correct reading is narrower:
 of the CPU the query path burns, the adapter is the single largest owner,
@@ -170,8 +170,17 @@ corpus's hot path.
    Decimal128 carries the i128 exactly for any sum reachable under the
    row cap, and the pack is checked, not assumed. Evaluation is two
    documented, portable roundings: i128 to f64 (round to nearest, ties to
-   even, Rust's defined `as` semantics) then one correctly rounded IEEE
-   division by the count. The fold and merge are integer addition:
+   even, Rust's defined `as` semantics) then an IEEE division by the count.
+   **This is not in general the correctly rounded exact mean.** Converting
+   the sum first can lose information that a rational-to-f64 rounding of
+   `sum/count` would keep, so for a sum beyond 2^53 the result may differ
+   by an ulp from the exactly rounded value. That is accepted, and it is
+   not what this decision buys: the property being bought is that every
+   partitioning and merge order yields the SAME bits, not that those bits
+   are the closest f64 to the true rational mean. Exact rational rounding
+   is a strictly further step, is not required by ADR-0094's admission
+   rule, and is not taken here. The float path has never had it either.
+   Whatever this evaluates to, it evaluates to it identically everywhere. The fold and merge are integer addition:
    associative and commutative, so every partitioning and every merge
    order yields identical bits. The determinism guarantee for integer
    `avg` is thereby kept by exactness instead of by ordering, satisfying
@@ -185,8 +194,11 @@ corpus's hot path.
    resolved type) is dissolved by decision 2, which removes the coercion
    rather than reaching around it: the analyzed plan now carries Int64,
    and the classifier gains one arm reading it. `avg` over float input
-   remains never eligible, as does any float `sum`/`min`/`max` and any
-   float group key; the #771 amendment's rejection of classifier-only
+   remains ineligible **for ADR-0094's repartitioned final specifically**,
+   as does any float `sum`/`min`/`max` and any float group key. That is a
+   statement about parallel-final admission, not about whether these
+   aggregates may have a `GroupsAccumulator`: decision 4 gives float
+   `min`/`max` exactly that, and the two are independent; the #771 amendment's rejection of classifier-only
    admission stands and is superseded only because the arithmetic
    underneath changed.
 4. **Float-input `min`/`max`: a custom total-order `GroupsAccumulator`**,
