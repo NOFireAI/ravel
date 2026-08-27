@@ -353,12 +353,28 @@ impl DiskCache {
     ///
     /// Panics if called outside a Tokio runtime, exactly as
     /// [`DiskCache::new_with_clock`] does and for the same reason.
+    ///
+    /// Panics if `namespace` is not a single non-empty path segment. This is
+    /// a runtime check, not a debug assertion, because the failure it prevents
+    /// is silent: `Path::join("")` yields the base directory unchanged, which
+    /// would restore the shared root this namespacing exists to remove and let
+    /// two instances evict each other again, and a leading-slash or multi-
+    /// segment label escapes the intended layout. Every call site passes a
+    /// literal, so a violation is a programmer error at construction.
     pub fn new_in_namespace_with_clock(
         dir: PathBuf,
         namespace: &str,
         limits: CacheLimits,
         clock: Arc<dyn Clock>,
     ) -> Self {
+        assert!(
+            !namespace.is_empty()
+                && namespace != "."
+                && namespace != ".."
+                && !namespace.contains('/')
+                && !namespace.contains(std::path::MAIN_SEPARATOR),
+            "DiskCache namespace must be a single non-empty path segment, got {namespace:?}"
+        );
         // Acquire the runtime handle first, so an off-runtime construction fails
         // before doing any filesystem work rather than after.
         let handle = Handle::current();
@@ -2028,5 +2044,28 @@ mod tests {
         // its own namespace where this key has no file.
         assert!(store.get(&key).is_none());
         assert!(catalog.get(&key).is_none());
+    }
+
+    /// The namespace must be a single non-empty path segment, enforced at
+    /// runtime rather than by convention. An empty label is the dangerous case:
+    /// `Path::join("")` returns the base directory unchanged, so without this
+    /// guard two instances constructed with `""` would share one root again and
+    /// evict each other's entries, which is exactly the bug namespacing fixes,
+    /// reintroduced silently. Removing the assert makes this test pass a value
+    /// that collapses the root.
+    #[tokio::test]
+    #[should_panic(expected = "single non-empty path segment")]
+    async fn an_empty_namespace_is_refused_rather_than_collapsing_the_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _ = DiskCache::new_in_namespace(dir.path().to_path_buf(), "", generous_limits());
+    }
+
+    /// A label with a separator escapes the intended one-segment layout, and a
+    /// leading slash makes `Path::join` discard the base directory entirely.
+    #[tokio::test]
+    #[should_panic(expected = "single non-empty path segment")]
+    async fn a_multi_segment_namespace_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _ = DiskCache::new_in_namespace(dir.path().to_path_buf(), "a/b", generous_limits());
     }
 }
