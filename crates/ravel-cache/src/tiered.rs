@@ -132,6 +132,18 @@ where
         self.disk.metrics()
     }
 
+    /// The disk tier itself, for a cross-crate test that needs to corrupt an
+    /// admitted entry's real on-disk bytes via
+    /// [`DiskCache::corrupt_entry_for_test`] rather than only read its
+    /// counters through [`disk_metrics`](Self::disk_metrics). `TieredCache`
+    /// owns its disk tier directly rather than behind an `Arc`, so a caller
+    /// holding only an `Arc<TieredCache<_>>` (as `ravel-query`'s `ReadCache`
+    /// does) has no other way to reach it.
+    #[doc(hidden)]
+    pub fn disk_for_test(&self) -> &DiskCache {
+        &self.disk
+    }
+
     /// Read `key` through both tiers, fetching upstream only if both miss.
     ///
     /// Returns the served bytes and the [`Source`] they came from. Order:
