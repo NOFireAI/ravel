@@ -11,6 +11,7 @@ mod error;
 mod fetcher;
 pub mod http;
 mod log_fetcher;
+mod phase_accounting;
 mod query_admission;
 mod segment_admission;
 pub mod span_fetcher;
@@ -32,6 +33,7 @@ pub use log_fetcher::{
     DEFAULT_LOG_SUFFIX_LEN, DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD, LogFetchError, LogFetchOutput,
     LogQuery, LogSegmentFetcher, LogSegmentScan, StreamAttrEquals,
 };
+pub use phase_accounting::{Phase, PhaseAccounting, PhaseAccountingSnapshot, PhaseAccountingSource};
 pub use query_admission::{
     QueryAdmissionController, QueryConcurrencyLimit, QueryPermit, QueryRejected,
     query_admission_snapshot_key, reconcile_query_admission_once,
