@@ -232,8 +232,14 @@ the audit changed nothing.
 
 - **Measured since this ADR was written: raising both windows to 4 loads the
   100M-row ClickBench corpus in 1,519.75 s against 4,466.76 s at the defaults,
-  a 2.94x reduction.** Object count is unchanged at 8,424, which is what makes
-  it a single-variable result, and cores busy rise from 2.33 to 8.58 of 16.
+  a 2.94x reduction.** This measures the **combined effect of raising both
+  windows**; it is not a single-variable result. The unchanged object count of
+  8,424 controls for object layout, which is what makes the comparison against
+  arm A meaningful, but it does not apportion the gain between
+  `--pipeline-depth` and `--max-inflight-flushes`. What is known about the split
+  is one-sided: raising the depth ALONE aborts, so the second window is
+  necessary; no arm has isolated the flush window on its own. Cores busy rise
+  from 2.33 to 8.58 of 16.
   Two failed arms bracket it: doubling `--batch-rows` instead (bigger objects,
   both windows at default) was 11% SLOWER, and raising `--pipeline-depth` to 16
   alone aborted with `flush failed: timed out waiting for shard ack`, because
