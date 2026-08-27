@@ -1610,12 +1610,24 @@ fn aggregate_expr_is_exact(expr: &Expr, schema: &DFSchema) -> bool {
             // A sum/min/max with no argument should not occur; fail closed.
             None => false,
         },
-        // `avg`/`mean` always run plain IEEE f64 addition (crate::avg), so they
-        // are never exact regardless of input type: an integer argument is
-        // coerced to Float64 before it reaches any accumulator, so the partial
-        // sum state is f64 there too and a cross-partition merge of it is
-        // order-dependent (ADR-0094's amendment for issue #771). Any other name
-        // is outside the admitted aggregate set and fails closed.
+        // `avg`/`mean` over a resolved integer input runs exact i128
+        // accumulation with checked addition (crate::avg, ADR-0825 decision
+        // 2): the analyzer coerces the admitted integer types (Int8-Int64,
+        // UInt8-UInt32) to Int64, so a resolved Int64 argument's partial sum
+        // is exact regardless of partitioning or merge order. A Float64
+        // argument still runs the plain IEEE f64 fold (ADR-0094's original
+        // amendment for issue #771) and stays never exact: that partial sum
+        // is order-dependent. Any other resolved type (Decimal, Duration) is
+        // unreachable on the v1 `samples` surface and fails closed.
+        "avg" | "mean" => match aggregate_function.params.args.first() {
+            Some(arg) => matches!(
+                arg.get_type(schema),
+                Ok(datafusion::arrow::datatypes::DataType::Int64)
+            ),
+            None => false,
+        },
+        // Any other name is outside the admitted aggregate set and fails
+        // closed.
         _ => false,
     }
 }
@@ -2062,7 +2074,7 @@ mod tests {
     /// alone. Proven by inspecting the coerced argument's type, not just that the
     /// code compiles.
     #[tokio::test]
-    async fn analyzer_coerces_avg_argument_to_float64() {
+    async fn analyzer_preserves_avg_integer_argument_as_int64() {
         use datafusion::arrow::datatypes::DataType;
 
         let exec = eviction_test_executor();
@@ -2098,13 +2110,55 @@ mod tests {
             .expect("argument type resolves");
         assert_eq!(
             arg_type,
-            DataType::Float64,
-            "the analyzer must coerce avg(int) to a Float64 argument"
+            DataType::Int64,
+            "an admitted integer argument to avg must stay Int64, not widen to Float64 (ADR-0825 decision 2)"
         );
-        // And avg is never exact regardless of that resolved type.
+        // And avg over that resolved Int64 argument is exact.
+        assert!(
+            aggregate_expr_is_exact(expr, schema),
+            "avg over a resolved integer input is exact-eligible (ADR-0094 amendment, ADR-0825 decision 3)"
+        );
+    }
+
+    #[tokio::test]
+    async fn analyzer_still_coerces_avg_float_argument_to_float64() {
+        use datafusion::arrow::datatypes::DataType;
+
+        let exec = eviction_test_executor();
+        let plan = exec
+            .analyzed_classification_plan(
+                TenantHash([9u8; 16]),
+                "SELECT avg(value) AS a FROM samples",
+                &[],
+            )
+            .await
+            .expect("throwaway avg plan analyzes");
+
+        let mut aggregates = Vec::new();
+        let mut distincts = Vec::new();
+        collect_aggregate_exprs(&plan, &mut aggregates, &mut distincts);
+        let aggregate = aggregates.first().expect("one aggregate node");
+        let schema = aggregate.input.schema().as_ref();
+        let expr = aggregate.aggr_expr.first().expect("one aggregate expr");
+        let inner = match expr {
+            Expr::Alias(alias) => alias.expr.as_ref(),
+            other => other,
+        };
+        let Expr::AggregateFunction(af) = inner else {
+            panic!("aggregate expression is not an AggregateFunction: {inner:?}");
+        };
+        let arg_type = af
+            .params
+            .args
+            .first()
+            .expect("avg has an argument")
+            .get_type(schema)
+            .expect("argument type resolves");
+        assert_eq!(arg_type, DataType::Float64);
+        // Float avg is never exact.
         assert!(
             !aggregate_expr_is_exact(expr, schema),
-            "avg is never exact-eligible (ADR-0094 decision 1)"
+            "avg over a Float64 input is never exact-eligible (ADR-0094 decision 1)"
         );
     }
 
@@ -2155,10 +2209,15 @@ mod tests {
                 .classify_exact_typed(t, "SELECT DISTINCT value FROM samples", &[])
                 .await
         );
-        // avg over integer input: not exact.
+        // avg over a resolved integer input: exact (ADR-0825 decision 3).
+        assert!(
+            exec.classify_exact_typed(t, "SELECT avg(CAST(value AS BIGINT)) FROM samples", &[])
+                .await
+        );
+        // avg over a float input: still not exact.
         assert!(
             !exec
-                .classify_exact_typed(t, "SELECT avg(CAST(value AS BIGINT)) FROM samples", &[])
+                .classify_exact_typed(t, "SELECT avg(value) FROM samples", &[])
                 .await
         );
         // A disqualifying float avg hidden inside a scalar subquery: not exact,
