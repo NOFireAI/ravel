@@ -409,12 +409,10 @@ pub const MAX_ATTRIBUTE_NESTING_DEPTH: usize = 100;
 
 /// Map one OTLP `AnyValue` to the canonical [`AttrValue`]. Lists and maps
 /// recurse through the same mapping. `key` is carried only for the rejection
-/// message. A value nested inside a list reports the enclosing attribute's
-/// key; one nested inside a kvlist reports that map entry's own key instead,
-/// because the kvlist arm rebinds it. The two arms have disagreed since before
-/// the depth guard existed, and unifying them changes the key reported by the
-/// pre-existing missing- and unsupported-value rejections, so it is issue #808
-/// rather than part of the guard.
+/// message and always names the enclosing top-level attribute, never an
+/// inner list index or map entry: the converter drops the whole attribute on
+/// a nested failure, and an inner map entry's own key is not something the
+/// sender can find in their instrumentation.
 ///
 /// `depth` is the current nesting level (1 for a top-level attribute value,
 /// one more per enclosing array or kvlist). Exceeding
@@ -454,8 +452,7 @@ fn convert_value(
                 .values
                 .iter()
                 .map(|kv| {
-                    convert_value(&kv.key, kv.value.as_ref(), depth + 1)
-                        .map(|v| (kv.key.clone(), v))
+                    convert_value(key, kv.value.as_ref(), depth + 1).map(|v| (kv.key.clone(), v))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(AttrValue::Map(entries))
@@ -1014,6 +1011,135 @@ mod tests {
             }]
         );
         assert_eq!(out.rejected[0].rejected_count(), 1);
+    }
+
+    /// Wrap `leaf` in `layers` nested single-entry `KeyValueList`s, each
+    /// entry keyed `inner_key`. Mirrors [`nested_array`] but through the
+    /// kvlist arm, which the pre-existing nesting tests above never exercise.
+    fn nested_kvlist(layers: usize, inner_key: &str, leaf: AnyValueVariant) -> AnyValue {
+        let mut value = any(leaf);
+        for _ in 0..layers {
+            value = any(AnyValueVariant::KvlistValue(KeyValueList {
+                values: vec![KeyValue {
+                    key: inner_key.to_string(),
+                    value: Some(value),
+                    ..Default::default()
+                }],
+            }));
+        }
+        value
+    }
+
+    /// A value nested through a kvlist, not just a list, past the depth
+    /// limit must still report the enclosing top-level attribute's key
+    /// ("deepmap"), not the innermost map entry's own key ("inner"): the
+    /// whole "deepmap" attribute is what gets dropped, and "inner" does not
+    /// name anything the sender can find in their instrumentation. Before
+    /// the fix at the kvlist arm of `convert_value` (the recursive call
+    /// passed `&kv.key` instead of `key`), this failed with:
+    ///   assertion `left == right` failed
+    ///     left: [AttributeTooDeeplyNested { key: "inner", max: 100 }]
+    ///     right: [AttributeTooDeeplyNested { key: "deepmap", max: 100 }]
+    #[test]
+    fn attribute_nested_via_kvlist_one_past_the_limit_reports_the_enclosing_key() {
+        let deep = nested_kvlist(
+            MAX_ATTRIBUTE_NESTING_DEPTH,
+            "inner",
+            AnyValueVariant::IntValue(7),
+        );
+        let out = normalize(request(vec![resource_logs(
+            vec![],
+            vec![scope_logs(
+                "lib",
+                "1",
+                vec![record(
+                    Some(any(AnyValueVariant::StringValue("body".into()))),
+                    vec![attr_kv("deepmap", deep)],
+                    1,
+                )],
+            )],
+        )]));
+        assert_eq!(out.records.len(), 1);
+        assert!(out.records[0].attrs.is_empty());
+        assert_eq!(
+            out.rejected,
+            vec![LogRejection::AttributeTooDeeplyNested {
+                key: "deepmap".to_string(),
+                max: MAX_ATTRIBUTE_NESTING_DEPTH,
+            }]
+        );
+    }
+
+    /// Same enclosing-key contract for a missing value found inside a
+    /// kvlist. Before the fix this failed with:
+    ///   assertion `left == right` failed
+    ///     left: [MissingAttributeValue { key: "inner" }]
+    ///     right: [MissingAttributeValue { key: "deepmap" }]
+    #[test]
+    fn missing_attribute_value_reached_through_kvlist_reports_the_enclosing_key() {
+        let deepmap = any(AnyValueVariant::KvlistValue(KeyValueList {
+            values: vec![KeyValue {
+                key: "inner".to_string(),
+                value: None,
+                ..Default::default()
+            }],
+        }));
+        let out = normalize(request(vec![resource_logs(
+            vec![],
+            vec![scope_logs(
+                "lib",
+                "1",
+                vec![record(
+                    Some(any(AnyValueVariant::StringValue("body".into()))),
+                    vec![attr_kv("deepmap", deepmap)],
+                    1,
+                )],
+            )],
+        )]));
+        assert_eq!(out.records.len(), 1);
+        assert!(out.records[0].attrs.is_empty());
+        assert_eq!(
+            out.rejected,
+            vec![LogRejection::MissingAttributeValue {
+                key: "deepmap".to_string()
+            }]
+        );
+    }
+
+    /// Same enclosing-key contract for a string-table-reference value found
+    /// inside a kvlist. Before the fix this failed with:
+    ///   assertion `left == right` failed
+    ///     left: [UnsupportedAttributeValue { key: "inner" }]
+    ///     right: [UnsupportedAttributeValue { key: "deepmap" }]
+    #[test]
+    fn unsupported_attribute_value_reached_through_kvlist_reports_the_enclosing_key() {
+        let deepmap = any(AnyValueVariant::KvlistValue(KeyValueList {
+            values: vec![KeyValue {
+                key: "inner".to_string(),
+                value: Some(any(AnyValueVariant::StringValueStrindex(1))),
+                ..Default::default()
+            }],
+        }));
+        let out = normalize(request(vec![resource_logs(
+            vec![],
+            vec![scope_logs(
+                "lib",
+                "1",
+                vec![record(
+                    Some(any(AnyValueVariant::StringValue("body".into()))),
+                    vec![attr_kv("deepmap", deepmap)],
+                    1,
+                )],
+            )],
+        )]));
+        assert_eq!(out.records.len(), 1);
+        assert!(out.records[0].attrs.is_empty());
+        assert_eq!(
+            out.rejected,
+            vec![LogRejection::UnsupportedAttributeValue {
+                key: "deepmap".to_string()
+            }]
+        );
     }
 
     #[test]
