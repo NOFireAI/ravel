@@ -23,11 +23,13 @@
 //!   folded (reconciliation), so it is
 //!   reported but never treated as a failure by any caller.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
+use prost::Message;
 use ravel_commit::keys::{self, KeyError};
 use ravel_commit::record::{self, RecordError};
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
+use ravel_proto::commit::v1::CompactionRecord;
 use ravel_types::{Signal, TenantHash};
 use uuid::Uuid;
 
@@ -52,9 +54,14 @@ pub struct SealDivergenceReport {
     /// are not expected in the snapshot yet and are excluded from the diff.
     pub watermark_hour: u32,
     /// Count of sealed commit records re-listed from the store (the ground
-    /// truth the snapshot is compared against).
+    /// truth the snapshot is compared against). Records superseded by a
+    /// compaction or rewrite record are excluded, matching what the fold
+    /// contributes to the snapshot.
     pub sealed_record_count: usize,
-    /// Count of entries in the folded snapshot.
+    /// Count of entries in the folded snapshot, all levels. Only the level-0
+    /// (L0 commit) entries participate in the diff below; level-1 compaction
+    /// and rewrite parts are counted here but not compared, since they have no
+    /// L0 commit record in the ground truth.
     pub snapshot_entry_count: usize,
     /// Sealed commit records absent from the snapshot (an under-count).
     pub missing: Vec<EntryIdentity>,
@@ -126,6 +133,18 @@ pub enum SealDivergenceError {
     },
     #[error("commit record at {key} has an invalid writer_id")]
     RecordWriterId { key: String },
+    #[error("compaction record at {key} is corrupt: {source}")]
+    CompactionRecordCorrupt {
+        key: String,
+        #[source]
+        source: prost::DecodeError,
+    },
+    #[error("rewrite record at {key} is corrupt: {source}")]
+    RewriteRecordCorrupt {
+        key: String,
+        #[source]
+        source: ravel_commit::erasure::ErasureError,
+    },
 }
 
 /// HEAD object key (docs/catalog-and-mvcc.md key layout, frozen format).
@@ -163,9 +182,25 @@ pub async fn verify_seal_divergence(
         source,
     })?;
 
-    // Decode the folded snapshot's entries into the shared identity shape.
+    // Decode the folded snapshot's entries into the shared L0 identity shape.
+    //
+    // This comparison is scoped to sealed L0 commit records: the ground truth
+    // re-listed below is the L0 commit history, and the divergence it catches
+    // is the folder under-counting those records. A snapshot carries two entry
+    // levels (snapshot_format::part validate_entries): a level-0 L0 commit,
+    // whose writer_id is the 16-byte flush uuid, and a level-1 compaction or
+    // rewrite part, whose writer_id slot instead carries the parent record's
+    // 32-byte input_set_hash (fold.rs build_l1_snapshot_entry). An L1 part has
+    // no L0 commit record to match here: it represents the L0 records the fold
+    // superseded, which are handled on the ground-truth side below. So only
+    // level-0 entries enter the identity map; a level-1 entry's 32-byte
+    // input_set_hash is never coerced into the 16-byte L0 tuple, which would
+    // silently truncate and collide. `decode_part` has already checked the
+    // per-level width, so a level-0 writer_id is guaranteed 16 bytes; the
+    // fallible convert stays as defense against an entry that bypassed decode.
     let limits = PartLimits::default();
     let mut snapshot_entries: BTreeMap<EntryIdentity, Vec<u8>> = BTreeMap::new();
+    let mut snapshot_entry_count = 0usize;
     for part_ref in &head.parts {
         let got = store
             .get(&part_ref.key, GetRange::Full)
@@ -180,6 +215,10 @@ pub async fn verify_seal_divergence(
                 source,
             })?;
         for entry in decoded.entries {
+            snapshot_entry_count += 1;
+            if entry.level != 0 {
+                continue;
+            }
             let writer_id: [u8; 16] = entry.writer_id.as_slice().try_into().map_err(|_| {
                 SealDivergenceError::PartWriterId {
                     key: part_ref.key.clone(),
@@ -198,6 +237,20 @@ pub async fn verify_seal_divergence(
 
     // Re-list every sealed commit record directly from the store (the ground
     // truth), decoded into the same identity shape.
+    //
+    // A compaction or rewrite record supersedes a set of L0 commit records: the
+    // fold folds those L0s into a level-1 part and drops them from the snapshot
+    // (fold.rs contributed_bucket skips any L0 whose identity is in the
+    // `excluded` set built from every compaction/rewrite record's `inputs`).
+    // The superseded L0 commit records remain on the store until a later sweep
+    // deletes them, so between fold and sweep a superseded L0 record is present
+    // in the commit history but legitimately absent from the snapshot. To avoid
+    // flagging it as `missing`, mirror the fold's exclusion here: build the same
+    // superseded set from the shard's compaction and rewrite records, and skip
+    // any L0 record it names. Matching the fold on raw `inputs` alone is
+    // sufficient: a rewrite that supersedes a whole compaction record by key
+    // adds no new L0s, since that compaction record's own `inputs` are already
+    // collected here.
     let mut ground_truth: BTreeMap<EntryIdentity, Vec<u8>> = BTreeMap::new();
     for shard in 0..head.shard_count {
         let prefix = keys::commit_shard_prefix(tenant_hash, signal, shard)
@@ -208,7 +261,49 @@ pub async fn verify_seal_divergence(
                 prefix: prefix.clone(),
                 source,
             })?;
-        for object in objects {
+
+        // Pass one: the L0 identities superseded by a compaction or rewrite
+        // record in this shard, keyed exactly as the fold keys `excluded`:
+        // the raw `(writer_id string, epoch, seq)` triple.
+        let mut superseded: HashSet<(String, u64, u64)> = HashSet::new();
+        for object in &objects {
+            if keys::parse_compaction_record_key(&object.key).is_ok() {
+                let got = store.get(&object.key, GetRange::Full).await.map_err(|source| {
+                    SealDivergenceError::RecordFetch {
+                        key: object.key.clone(),
+                        source,
+                    }
+                })?;
+                let rec = CompactionRecord::decode(got.data.as_ref()).map_err(|source| {
+                    SealDivergenceError::CompactionRecordCorrupt {
+                        key: object.key.clone(),
+                        source,
+                    }
+                })?;
+                for input in rec.inputs {
+                    superseded.insert((input.writer_id, input.writer_epoch, input.writer_seq));
+                }
+            } else if keys::parse_rewrite_record_key(&object.key).is_ok() {
+                let got = store.get(&object.key, GetRange::Full).await.map_err(|source| {
+                    SealDivergenceError::RecordFetch {
+                        key: object.key.clone(),
+                        source,
+                    }
+                })?;
+                let rec = ravel_commit::erasure::decode_rewrite(&got.data).map_err(|source| {
+                    SealDivergenceError::RewriteRecordCorrupt {
+                        key: object.key.clone(),
+                        source,
+                    }
+                })?;
+                for input in rec.inputs {
+                    superseded.insert((input.writer_id, input.writer_epoch, input.writer_seq));
+                }
+            }
+        }
+
+        // Pass two: every non-superseded sealed L0 commit record.
+        for object in &objects {
             let Ok(parsed) = keys::parse_commit_key(&object.key) else {
                 continue;
             };
@@ -227,6 +322,9 @@ pub async fn verify_seal_divergence(
                     key: object.key.clone(),
                     source,
                 })?;
+            if superseded.contains(&(rec.writer_id.clone(), rec.writer_epoch, rec.writer_seq)) {
+                continue;
+            }
             let writer_id = *Uuid::parse_str(&rec.writer_id)
                 .map_err(|_| SealDivergenceError::RecordWriterId {
                     key: object.key.clone(),
@@ -261,7 +359,7 @@ pub async fn verify_seal_divergence(
     Ok(Some(SealDivergenceReport {
         watermark_hour: head.watermark_hour,
         sealed_record_count: ground_truth.len(),
-        snapshot_entry_count: snapshot_entries.len(),
+        snapshot_entry_count,
         missing,
         mismatched,
         orphaned,
@@ -286,7 +384,12 @@ mod tests {
     // SEALED_AGE_NS), so a published record is sealed by fold time.
     const SEALED_AGE_NS: i64 = 3 * NS_PER_HOUR;
 
-    async fn publish_segment(store: &MemoryStore, tenant: &str, seq: u64, created_unix_ns: i64) {
+    async fn publish_segment(
+        store: &MemoryStore,
+        tenant: &str,
+        seq: u64,
+        created_unix_ns: i64,
+    ) -> ravel_proto::commit::v1::CommitRecord {
         let tenant_hash = TenantId::new(tenant).hash();
         let ingest_hour_bucket = u32::try_from(created_unix_ns / NS_PER_HOUR).expect("fits u32");
         let payload = format!("seg-{seq}").into_bytes();
@@ -318,6 +421,79 @@ mod tests {
         publish::publish(store, &rec, &RetryPolicy::default())
             .await
             .expect("publish");
+        rec
+    }
+
+    /// Publish an L1 compaction record over `inputs` into `(shard 0,
+    /// ingest_hour_bucket)`, contributing one L1 part. The record supersedes
+    /// its inputs, so the fold drops those L0 entries from the snapshot and
+    /// folds this part in as a level-1 entry (32-byte `input_set_hash` in the
+    /// writer_id slot). Only the record object is written; the fold reads the
+    /// record, not the L1 part object.
+    async fn publish_compaction(
+        store: &MemoryStore,
+        tenant: &str,
+        ingest_hour_bucket: u32,
+        inputs: &[&ravel_proto::commit::v1::CommitRecord],
+        created_unix_ns: i64,
+    ) {
+        use ravel_commit::signal;
+        use ravel_proto::commit::v1::{CompactionInputIdentity, CompactionPart, CompactionRecord};
+
+        let tenant_hash = TenantId::new(tenant).hash();
+        let input_ids: Vec<CompactionInputIdentity> = inputs
+            .iter()
+            .map(|r| CompactionInputIdentity {
+                writer_id: r.writer_id.clone(),
+                writer_epoch: r.writer_epoch,
+                writer_seq: r.writer_seq,
+            })
+            .collect();
+        // The exact preimage does not matter for this test, only that the
+        // resulting input_set_hash is 32 bytes (a blake3 digest always is).
+        let mut hasher = blake3::Hasher::new();
+        for id in &input_ids {
+            hasher.update(id.writer_id.as_bytes());
+            hasher.update(&id.writer_epoch.to_le_bytes());
+            hasher.update(&id.writer_seq.to_le_bytes());
+        }
+        let input_set_hash = *hasher.finalize().as_bytes();
+        let part_payload = format!("l1-{ingest_hour_bucket}").into_bytes();
+        let part_content_hash = *blake3::hash(&part_payload).as_bytes();
+        let part = CompactionPart {
+            part_index: 0,
+            first_series_id: vec![0u8; 16],
+            last_series_id: vec![0xffu8; 16],
+            content_hash: part_content_hash.to_vec(),
+            object_size: part_payload.len() as u64,
+            sample_count: 1,
+            series_count: 1,
+            run_count: 1,
+            min_event_ts_ns: created_unix_ns - 1_000,
+            max_event_ts_ns: created_unix_ns,
+            segment_format_version: 3,
+        };
+        let record = CompactionRecord {
+            format_version: 1,
+            tenant_hash: tenant_hash.0.to_vec(),
+            signal: signal::to_proto(Signal::Metrics).into(),
+            shard: 0,
+            ingest_hour_bucket,
+            level: 1,
+            inputs: input_ids,
+            input_set_hash: input_set_hash.to_vec(),
+            parts: vec![part],
+            created_unix_ns,
+        };
+        let key = keys::compaction_record_key_for(&record).expect("compaction key");
+        store
+            .put(
+                &key,
+                Bytes::from(record.encode_to_vec()),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put compaction record");
     }
 
     async fn fold(store: Arc<dyn ObjectStoreBackend>, tenant: &str, now_ns: i64) {
@@ -368,6 +544,53 @@ mod tests {
         assert!(report.orphaned.is_empty());
         assert_eq!(report.sealed_record_count, 2);
         assert_eq!(report.snapshot_entry_count, 2);
+    }
+
+    #[tokio::test]
+    async fn l1_compaction_entry_is_verifiable_and_not_missing() {
+        // Regression for issue #819. An L1 compaction over a sealed tenant
+        // leaves the snapshot carrying a level-1 entry whose writer_id slot
+        // holds the 32-byte input_set_hash, and leaves the superseded L0
+        // commit record on the store until a later sweep. `catalog verify`
+        // must (1) not reject the 32-byte writer_id as malformed, and (2) not
+        // report the superseded L0 record as missing from the snapshot.
+        let store = Arc::new(MemoryStore::new());
+        let tenant = "compacted";
+        let now = 600_000 * NS_PER_HOUR;
+        let created = now - SEALED_AGE_NS;
+        let hour = u32::try_from(created / NS_PER_HOUR).expect("fits u32");
+
+        let l0 = publish_segment(store.as_ref(), tenant, 1, created).await;
+        publish_compaction(store.as_ref(), tenant, hour, &[&l0], created).await;
+        fold(store.clone(), tenant, now).await;
+
+        let report = verify_seal_divergence(
+            store.as_ref(),
+            &TenantId::new(tenant).hash(),
+            Signal::Metrics,
+        )
+        .await
+        .expect("an L1 snapshot entry must not be a malformed writer_id (issue #819)")
+        .expect("HEAD present after fold");
+
+        assert!(
+            !report.has_divergence(),
+            "a superseded L0 record folded into an L1 part is not a divergence"
+        );
+        assert!(
+            report.missing.is_empty(),
+            "the superseded L0 record must not be reported missing"
+        );
+        assert!(report.mismatched.is_empty());
+        // The L1 part is counted in the snapshot but not compared; the
+        // superseded L0 record is excluded from the ground truth, so nothing
+        // is diffed and nothing is orphaned.
+        assert_eq!(report.snapshot_entry_count, 1, "the L1 part is counted");
+        assert_eq!(
+            report.sealed_record_count, 0,
+            "the superseded L0 record is excluded from the ground truth"
+        );
+        assert!(report.orphaned.is_empty());
     }
 
     #[tokio::test]
