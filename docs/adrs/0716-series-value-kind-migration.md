@@ -3,7 +3,7 @@
 Status: Proposed. Issue #716 (compaction), issue #789 (selective erasure),
 epic #680. Issue #676 (PromQL range-function semantics over a mixed-kind
 read) was split out of this decision and is addressed in "Interaction with
-#676" below.
+`#676`" below.
 
 ## Context
 
@@ -272,7 +272,7 @@ enough that the extra parts show up in object-count budgets.
 series, compact the rest, leave its L0 objects live). Leaves the migrated
 series permanently uncompacted (unbounded L0 accumulation for exactly the
 series least likely to be re-emitted under a new name) and, fatally for
-#789, an erasure rewrite cannot "skip" a series its predicate matches:
+`#789`, an erasure rewrite cannot "skip" a series its predicate matches:
 skipping is non-completion, and the request blocks forever. Rejected
 because it converts a legal deadline into a standing alarm.
 
