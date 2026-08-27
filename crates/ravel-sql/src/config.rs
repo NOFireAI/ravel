@@ -41,6 +41,47 @@ pub const DEFAULT_MAX_QUERY_BYTES: usize = 256 * 1024 * 1024;
 /// 105 columns and sorts and filters on two, i.e. 103 surplus columns.
 pub const DEFAULT_LATE_MATERIALIZATION_EXTRA_COLUMNS: usize = 8;
 
+/// Under-count of DataFusion 54's `GroupValues::size()` against the real
+/// hashbrown allocation of the group-key table (issue #740, finding 2).
+/// `size()` charges `capacity() * entry_size`, where `capacity()` is the
+/// table's usable slot count at the 7/8 load factor, and it counts no control
+/// bytes. The real allocation is `buckets * entry_size` (with
+/// `buckets = capacity / (7/8)`) plus one control byte per bucket and the
+/// group width, so for an Int64 group table (16-byte entry: value plus group
+/// index) the ratio is `(8/7) * ((entry_size + 1) / entry_size) = 8*17/(7*16)
+/// = 1.2143`, which the #740 trace saw as 570 MB real against 470 MB reported
+/// for 17M groups. Rounded up to two decimals so the factor is an upper
+/// bound on the under-count, not an estimate of it.
+pub const GROUP_VALUES_UNDERCOUNT_FACTOR: f64 = 1.22;
+
+/// Transient over-allocation while a hashbrown group table doubles (issue
+/// #740, finding 3). A grow allocates the new table before freeing the old,
+/// so a doubling holds `old + new = steady/2 + steady = 1.5 * steady` at its
+/// peak, and DataFusion grows the pool reservation only after the resize
+/// completes (`row_hash.rs` ~745/793), so the pool holds the pre-batch figure
+/// while that transient peak is live. The peak is bounded at 1.5x the settled
+/// real size because hashbrown never grows by more than doubling.
+pub const GROUP_VALUES_RESIZE_TRANSIENT_FACTOR: f64 = 1.5;
+
+/// Combined compensation applied to a reported `GroupValues::size()` figure to
+/// bound the real peak the pool must survive: the under-count times the resize
+/// transient, `1.22 * 1.5 = 1.83`. Both defects are upstream in DataFusion 54
+/// (documented in the ADR-0102 amendment for #740); this crate cannot fix
+/// either from outside DataFusion, so it compensates its own ceiling math by
+/// this factor rather than trusting the reported figure. See
+/// [`compensated_group_values_ceiling`].
+pub const GROUP_VALUES_CEILING_COMPENSATION: f64 =
+    GROUP_VALUES_UNDERCOUNT_FACTOR * GROUP_VALUES_RESIZE_TRANSIENT_FACTOR;
+
+/// Inflate a reported `GroupValues::size()` estimate to an upper bound on the
+/// real hashbrown peak, by [`GROUP_VALUES_CEILING_COMPENSATION`]. A caller
+/// sizing an aggregate stage against the memory budget must compare the budget
+/// to this, not to the raw `size()`, or a table that reports fitting will in
+/// fact allocate up to 1.83x that and overrun (issue #740, findings 2 and 3).
+pub fn compensated_group_values_ceiling(reported_size: usize) -> usize {
+    ((reported_size as f64) * GROUP_VALUES_CEILING_COMPENSATION).ceil() as usize
+}
+
 /// Per-query ravel-sql configuration: the shared engine budgets plus the
 /// SQL-only per-query memory-pool byte budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

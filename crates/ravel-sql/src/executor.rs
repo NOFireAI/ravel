@@ -80,7 +80,7 @@ use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::dataframe::DataFrame;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
+use datafusion::execution::memory_pool::{MemoryLimit, MemoryPool, UnboundedMemoryPool};
 use datafusion::logical_expr::{Aggregate, Distinct, Expr, ExprSchemable, LogicalPlan};
 use datafusion::physical_plan::{ExecutionPlan, execute_stream};
 use datafusion::prelude::SessionContext;
@@ -1153,6 +1153,14 @@ pub struct PinnedStream {
     /// whose poll unwound is left in whatever state the panic interrupted, so
     /// it is never polled again; this fuses it instead.
     panicked: bool,
+    /// The pool installed on `ctx`'s `RuntimeEnv` (issue #740). Read at every
+    /// execution-error mapping so a `ResourcesExhausted` DataFusion raises
+    /// against a spill-capable operator (which names the operator holding the
+    /// reservation, not the consumer that filled it) can be re-attributed from
+    /// this pool's own `used`/`limit`, the same pool `try_grow` refused
+    /// against. Derived from `ctx` in [`Self::start`] rather than threaded in
+    /// separately, so no caller of `start` changes.
+    pool: Arc<dyn MemoryPool>,
 }
 
 impl PinnedStream {
@@ -1170,6 +1178,12 @@ impl PinnedStream {
         schema: SchemaRef,
         breach: Arc<CeilingBreach>,
     ) -> Result<Self, SqlError> {
+        // The same pool `build_session` installed on `ctx`'s `RuntimeEnv`
+        // (`crate::session`), read back here rather than passed in: every
+        // `ResourcesExhausted` this stream maps needs it, and deriving it from
+        // `ctx` keeps every `start` caller (the local path, the Flight SQL
+        // worker fragment, and the panic-boundary test) unchanged.
+        let pool = Arc::clone(&ctx.runtime_env().memory_pool);
         let inner = execute_stream(Arc::clone(&plan), ctx.task_ctx()).map_err(plan_error)?;
         Ok(PinnedStream {
             _ctx: ctx,
@@ -1178,6 +1192,7 @@ impl PinnedStream {
             breach,
             plan,
             panicked: false,
+            pool,
         })
     }
 
@@ -1239,7 +1254,10 @@ impl Stream for PinnedStream {
             self.inner.poll_next_unpin(cx)
         }));
         match polled {
-            Ok(next) => next.map(|next| next.map(|batch| batch.map_err(execution_error))),
+            Ok(next) => {
+                let pool = Arc::clone(&self.pool);
+                next.map(|next| next.map(|batch| batch.map_err(|e| execution_error(e, &pool))))
+            }
             Err(payload) => {
                 self.panicked = true;
                 // `payload.as_ref()`, not `&payload`: coercing the `Box`
@@ -1336,13 +1354,37 @@ fn plan_error(err: DataFusionError) -> SqlError {
 /// message can distinguish "this query cannot be planned" from "this query
 /// failed while running", which is the only diagnostic signal that survives
 /// redaction.
-fn execution_error(err: DataFusionError) -> SqlError {
-    match take_sql_error(err) {
+///
+/// `pool` is the stream's own `MemoryPool` (issue #740): a `ResourcesExhausted`
+/// reaching here can be a spill-capable operator's refusal (a `RepartitionExec`
+/// exchange or an external sort, named by DataFusion's own message, with no
+/// byte figures) rather than this pool's own `try_grow` text (which already
+/// names its budget and figures). [`SqlError::resources_exhausted_reattributed`]
+/// tells the two apart and rewrites only the former, from `pool`'s occupancy at
+/// this moment; the caller does not need to classify the message itself.
+///
+/// `take_sql_error` already unwraps a `ResourcesExhausted` at any wrapper depth
+/// into `Ok(SqlError::ResourcesExhausted(msg))` (its own doc comment above),
+/// so the re-attribution runs after that recovery, on the recovered
+/// `SqlError::ResourcesExhausted` itself, not in the `Err` branch below (which
+/// a bare or wrapped `ResourcesExhausted` never reaches).
+fn execution_error(err: DataFusionError, pool: &Arc<dyn MemoryPool>) -> SqlError {
+    let sql = match take_sql_error(err) {
         Ok(sql) => sql,
         Err(other) => match other {
             DataFusionError::ResourcesExhausted(msg) => SqlError::ResourcesExhausted(msg),
-            other => SqlError::Execution(other.to_string()),
+            other => return SqlError::Execution(other.to_string()),
         },
+    };
+    match sql {
+        SqlError::ResourcesExhausted(msg) => {
+            let limit = match pool.memory_limit() {
+                MemoryLimit::Finite(limit) => limit,
+                MemoryLimit::Infinite | MemoryLimit::Unknown => usize::MAX,
+            };
+            SqlError::resources_exhausted_reattributed(&msg, pool.reserved(), limit)
+        }
+        other => other,
     }
 }
 
@@ -2049,10 +2091,55 @@ mod tests {
 
     #[test]
     fn resources_exhausted_keeps_its_own_counts() {
+        // A message without MSG_SPILL_DISABLED_MARKER is not DataFusion's
+        // spill-refusal shape (issue #740); `execution_error` must pass it
+        // through unchanged rather than substituting the pool's own figures,
+        // so the pool here is a throwaway the reattribution never reads.
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
         let df = DataFusionError::ResourcesExhausted("needs 40 bytes, limit 8".to_string());
-        let err = execution_error(df);
+        let err = execution_error(df, &pool);
         assert!(matches!(err, SqlError::ResourcesExhausted(_)));
         assert!(err.client_message().contains("limit 8"));
+    }
+
+    /// Issue #740, finding 1: a `RepartitionExec` output channel's spill
+    /// refusal (DataFusion 54's `"... SpillPool (DiskManager is disabled)"`,
+    /// carrying no byte figures) is re-attributed from the stream's own pool
+    /// occupancy at the moment of refusal, not passed through with the
+    /// exchange's name and no figures. Exercises the real seam
+    /// [`execution_error`] runs at (issue #740's named caller,
+    /// [`PinnedStream::poll_next`]'s `batch.map_err`), with a real
+    /// `TenantDelegatingPool` reserved to a known figure rather than a bare
+    /// `resources_exhausted_reattributed` unit call.
+    #[test]
+    fn a_spill_refusal_from_the_streams_own_pool_names_its_occupancy() {
+        use datafusion::execution::memory_pool::MemoryConsumer;
+
+        let tenant = TenantMemoryAccountant::new(1 << 30);
+        let pool: Arc<dyn MemoryPool> = Arc::new(crate::memory::TenantDelegatingPool::new(
+            8000,
+            tenant,
+            CeilingBreach::new(),
+            QueryAccounting::new(),
+        ));
+        let consumer = MemoryConsumer::new("GroupedHashAggregateStream[0]").register(&pool);
+        consumer.try_grow(6144).expect("within the query ceiling");
+
+        let df = DataFusionError::ResourcesExhausted(
+            "Memory Exhausted while SpillPool (DiskManager is disabled)".to_string(),
+        );
+        let err = execution_error(df, &pool);
+        let SqlError::ResourcesExhausted(message) = &err else {
+            panic!("still a typed ResourcesExhausted; got {err:?}");
+        };
+        assert!(
+            message.contains("6144") && message.contains("8000"),
+            "message must name the pool's reserved bytes and limit; got {message:?}"
+        );
+        assert!(
+            !message.contains("SpillPool"),
+            "the exchange's own name must not survive re-attribution; got {message:?}"
+        );
     }
 
     /// ADR-0094 report sanity check: the analyzer step

@@ -592,3 +592,69 @@ each per relevant object no matter how selective the predicate is, and only the
 surviving-block reads scale with the predicate. The 0.75 coverage crossover is
 unchanged; a numeric predicate whose survivors still cover >= 75% of a segment
 reads that segment whole, exactly as before.
+
+## Amendment (2026-08-27, #740): the pass-through spill error misattributes, and `GroupValues::size()` under-counts
+
+Decision 3 above shipped the disabled-disk-manager spill as a typed
+`ResourcesExhausted`, mapped through unchanged from whatever DataFusion 54
+happened to raise. Production traces on the #680 ClickBench tenant found two
+defects that decision alone did not cover.
+
+**Finding 1: the pass-through message names the wrong operator.** A
+`RepartitionExec` output channel refused by the pool falls to
+`create_in_progress_file("SpillPool")`, and with the disk manager disabled
+that raises `"Memory Exhausted while SpillPool (DiskManager is disabled)"` (an
+external sort raises the equivalent `"... while Sorting ..."`). The message
+names the operator that HOLDS the reservation it could not grow, not the
+consumer that FILLED the pool (the aggregate hash tables), and carries no
+byte figures. `SqlError::resources_exhausted_reattributed` (`ravel-sql`,
+`error.rs`) rewrites any `ResourcesExhausted` carrying the
+`"DiskManager is disabled"` substring from the query's own
+`MemoryPool::reserved()`/limit at the moment of refusal, read at the one seam
+every batch from either transport crosses:
+`PinnedStream::poll_next`'s `execution_error` mapping (`executor.rs`), which
+now reads `ctx`'s installed pool back off `SessionContext::runtime_env()`
+rather than trusting the message. A message without the marker (this crate's
+own `try_grow` text, or any other native `ResourcesExhausted`) passes through
+unchanged.
+
+This is a substring match on an upstream string DataFusion owns, not a
+structured discriminant: DataFusion's `MemoryConsumer`/`DiskManager` types
+carry no typed "spill refused, disk disabled" variant to match on instead, so
+there is no more precise handle available from outside the crate. A DataFusion
+upgrade that rewords the message stops the rewrite silently -- every pool
+failure downgrades back to the pre-#740 pass-through, not a compile error or a
+panic. `memory_pool_attribution.rs` pins the exact current string as a
+`const SPILL_MSG` local to the test (deliberately not reading
+`MSG_SPILL_DISABLED_MARKER`'s own substring back out, which would make the
+test tautological against itself) and pins `TenantDelegatingPool` figures the
+rewrite must reproduce; a DataFusion bump that changes the wording turns this
+red instead of leaving the misattribution unnoticed.
+
+**Findings 2 and 3: `GroupValues::size()` under-counts, and a resize doubles
+it.** DataFusion 54's `GroupValues::size()` reports `capacity() * entry_size`
+-- `capacity()` is the hashbrown table's usable slot count at the 7/8 load
+factor, with no control bytes counted. The real allocation is the full bucket
+count (`capacity / (7/8)`, always a power of two) times `entry_size`, plus one
+control byte per bucket plus the SIMD group width; for an Int64 group table
+(16-byte entry) that gap is about 21%, matching a production trace that saw
+570 MB real against 470 MB reported for a 17M-group aggregate (finding 2).
+Separately, a hashbrown table mid-resize holds the old and the new allocation
+at once, a transient peak of 1.5x the settled real size, while the pool
+reservation still reflects the pre-resize figure until the resize completes
+(finding 3). `GROUP_VALUES_CEILING_COMPENSATION` (`ravel-sql`, `config.rs`) is
+the product of both factors (1.22 x 1.5 = 1.83), and
+`compensated_group_values_ceiling` inflates a reported `size()` to a
+documented upper bound on the real peak; `memory_group_values_compensation.rs`
+pins the factor and shows it strictly exceeds the measured steady under-count
+ratio.
+
+As of this amendment, `compensated_group_values_ceiling` has no caller: no
+code in `ravel-sql` reads `GroupValues::size()` to size an aggregate stage
+before running it (there is no pre-execution admission check for group-by
+cardinality; the pool's own `try_grow` is a post-hoc ceiling on the bytes
+DataFusion actually asked to reserve, not a predictive one). Findings 2 and 3
+are recorded and the compensation factor is derived and pinned so a future
+admission check has a bound to use, but nothing exercises it on a real query
+path yet; that wiring is unclaimed follow-up work, not part of this
+amendment's fix.

@@ -98,14 +98,16 @@ impl TenantMemoryAccountant {
     }
 
     /// Reserve `additional` bytes if doing so stays at or under the ceiling.
-    /// Returns `Err` (reserving nothing) when it would overflow the tenant
-    /// budget. CAS loop so concurrent queries account correctly.
-    fn try_grow(&self, additional: usize) -> Result<(), ()> {
+    /// Returns `Err(used)` (reserving nothing) when it would overflow the
+    /// tenant budget, where `used` is the bytes reserved at the moment of
+    /// refusal so the caller can name the pool's occupancy, not just the
+    /// rejected delta. CAS loop so concurrent queries account correctly.
+    fn try_grow(&self, additional: usize) -> Result<(), usize> {
         let mut cur = self.used.load(Ordering::Acquire);
         loop {
             let next = cur.saturating_add(additional);
             if next > self.limit {
-                return Err(());
+                return Err(cur);
             }
             match self
                 .used
@@ -216,13 +218,14 @@ impl TenantDelegatingPool {
     }
 
     /// Reserve `additional` against the query budget only. CAS loop; returns
-    /// the new query total on success, reserving nothing on overflow.
-    fn query_try_grow(&self, additional: usize) -> Result<usize, ()> {
+    /// the new query total on success, and `Err(used)` reserving nothing on
+    /// overflow, where `used` is the bytes reserved at the moment of refusal.
+    fn query_try_grow(&self, additional: usize) -> Result<usize, usize> {
         let mut cur = self.query_used.load(Ordering::Acquire);
         loop {
             let next = cur.saturating_add(additional);
             if next > self.query_limit {
-                return Err(());
+                return Err(cur);
             }
             match self.query_used.compare_exchange_weak(
                 cur,
@@ -318,20 +321,22 @@ impl MemoryPool for TenantDelegatingPool {
     fn try_grow(&self, _reservation: &MemoryReservation, additional: usize) -> DFResult<()> {
         // Query budget first: a query must trip its own pool before it can
         // threaten the tenant budget.
-        let query_total = self.query_try_grow(additional).map_err(|()| {
+        let query_total = self.query_try_grow(additional).map_err(|used| {
             DataFusionError::ResourcesExhausted(format!(
-                "query memory pool exhausted: {additional} more bytes exceeds per-query limit {}",
+                "query memory pool exhausted: {additional} more bytes on top of {used} \
+                 already reserved exceeds per-query limit {}",
                 self.query_limit
             ))
         })?;
         self.accounting
             .observe_intermediate_bytes(query_total as u64);
-        if self.tenant.try_grow(additional).is_err() {
+        if let Err(used) = self.tenant.try_grow(additional) {
             // Roll the query reservation back so a tenant-budget failure
             // leaves nothing reserved on either budget.
             self.query_shrink(additional);
             return Err(DataFusionError::ResourcesExhausted(format!(
-                "tenant memory budget exhausted: {additional} more bytes exceeds tenant limit {}",
+                "tenant memory budget exhausted: {additional} more bytes on top of {used} \
+                 already reserved exceeds tenant limit {}",
                 self.tenant.limit()
             )));
         }
