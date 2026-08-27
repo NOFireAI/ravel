@@ -1856,6 +1856,55 @@ pub const DEFAULT_LOG_COVERAGE_THRESHOLD: f64 = 0.75;
 /// RLOG never share the permit pool.
 pub const DEFAULT_LOG_MAX_CONCURRENT_GETS: usize = 16;
 
+/// Bytes of transfer that cost the same wall time as one object-store request on
+/// the log read path: the currency in which the read-shape crossovers weigh a
+/// saved byte against an extra GET.
+///
+/// Derived from the two measured passes on the 8,424-object ClickBench tenant
+/// (issue #680) recorded in docs/query-engine.md, by fitting
+/// `time = requests * latency + bytes / bandwidth` to both:
+///
+/// - the version-3 full scan, 8,424 requests and 11.1 GB in 142 s;
+/// - the q37-q43 selective class, about 15,800 requests and 2.1 GB in 43 s.
+///
+/// Two equations, two unknowns: about 1.14 ms of fixed cost per request and
+/// about 84 MB/s of effective transfer, so one request costs what roughly 93 KB
+/// of transfer costs. This value rounds that to 96 KiB. Both figures are
+/// wall-clock at the concurrency those passes ran with, which is the same
+/// concurrency this fetcher issues at ([`DEFAULT_LOG_MAX_CONCURRENT_GETS`]), so
+/// the ratio transfers even though neither term is a per-connection figure.
+///
+/// It lands within 1.5x of [`DEFAULT_LOG_COALESCE_GAP`], which is the same
+/// currency already expressed as a policy: the coalescer reads through up to
+/// 64 KiB of bytes it does not want rather than pay one more request. The two
+/// are kept as separate constants because they answer different questions (how
+/// much waste inside one read, versus whether a whole read shape pays), but a
+/// change that moves them far apart is a signal that one of them is stale.
+///
+/// `0` means requests are free, which turns every crossover that consults this
+/// into "prefer the read that moves fewer bytes". Tests use that to measure a
+/// read shape without the cost policy on top of it.
+pub const DEFAULT_LOG_REQUEST_BYTE_EQUIVALENT: u64 = 96 * 1024;
+
+/// Requests a projected whole-segment read pays before its first chunk range,
+/// against the one `GetRange::Full` the whole-object read issues: the
+/// etag-establishing suffix probe, and STREAM_DIR and FIELD_DIR, which sit at
+/// the object's front where no suffix probe of any length reaches them.
+const PROJECTED_READ_FIXED_GETS: u64 = 3;
+
+/// Whether a read that moves `saved_bytes` fewer bytes at the price of
+/// `extra_gets` more requests is worth taking, in the byte-equivalent currency
+/// `request_byte_equivalent` defines (see
+/// [`DEFAULT_LOG_REQUEST_BYTE_EQUIVALENT`]).
+///
+/// Strict `>`, so a read that saves exactly what its extra requests cost keeps
+/// the shape with fewer requests. With `extra_gets` at zero this is "does it
+/// save anything at all", which is the right answer for a projected read that
+/// coalesces to a single range: same request count, fewer bytes.
+fn saving_beats_requests(saved_bytes: u64, extra_gets: u64, request_byte_equivalent: u64) -> bool {
+    saved_bytes > extra_gets.saturating_mul(request_byte_equivalent)
+}
+
 /// Upper bound on decoded SKIP_IDX block count, mirroring the reader's own
 /// internal cap (`ravel_logseg::reader::MAX_BLOCKS`, not exported). A section
 /// claiming more blocks is treated as corrupt rather than allocated.
@@ -2047,6 +2096,10 @@ pub struct BlockRangeFetcher {
     coalesce_gap: u64,
     whole_object_threshold: u64,
     coverage_threshold: f64,
+    /// Byte-equivalent of one store request, the term that lets the read-shape
+    /// crossovers compare a byte saving against a request cost
+    /// ([`DEFAULT_LOG_REQUEST_BYTE_EQUIVALENT`]).
+    request_byte_equivalent: u64,
     /// Bounds in-flight byte-range GETs. Its own instance, never shared with
     /// `SegmentFetcher`'s RSEG semaphore (ADR-0107 decision 1).
     get_semaphore: Arc<Semaphore>,
@@ -2062,6 +2115,7 @@ impl BlockRangeFetcher {
             coalesce_gap: DEFAULT_LOG_COALESCE_GAP,
             whole_object_threshold: DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
             coverage_threshold: DEFAULT_LOG_COVERAGE_THRESHOLD,
+            request_byte_equivalent: DEFAULT_LOG_REQUEST_BYTE_EQUIVALENT,
             get_semaphore: Arc::new(Semaphore::new(DEFAULT_LOG_MAX_CONCURRENT_GETS)),
         }
     }
@@ -2107,6 +2161,26 @@ impl BlockRangeFetcher {
     pub fn with_coverage_threshold(mut self, f: f64) -> Self {
         self.coverage_threshold = f;
         self
+    }
+
+    /// Sets the byte-equivalent of one store request
+    /// ([`DEFAULT_LOG_REQUEST_BYTE_EQUIVALENT`]), the term the read-shape
+    /// crossovers weigh an extra GET against a byte saving with. `0` declares
+    /// requests free, which makes every crossover prefer whichever shape moves
+    /// fewer bytes; the tests that measure a read shape rather than the cost
+    /// policy set it there.
+    #[must_use]
+    pub fn with_request_byte_equivalent(mut self, n: u64) -> Self {
+        self.request_byte_equivalent = n;
+        self
+    }
+
+    /// The byte-equivalent of one store request this fetcher weighs with, so
+    /// the whole-segment entry that routes into it can apply the same rule
+    /// before it decides to probe.
+    #[must_use]
+    pub fn request_byte_equivalent(&self) -> u64 {
+        self.request_byte_equivalent
     }
 
     #[must_use]
@@ -3224,15 +3298,33 @@ impl BlockRangeFetcher {
             selected.as_ref(),
         )?;
 
-        // Coverage-based post-pruning crossover (ADR-0107 decision 1), against
-        // the BLOCKS section's own size for the reason the version-3 path
-        // documents. The numerator is now the projected page bytes rather than
-        // whole candidate blocks, so a narrow projection stays far below the
-        // threshold even when every block survives, and an all-columns read of
-        // every block reaches ~1.0 and takes the single GET.
+        // Two crossovers back to the single whole-object GET, and the projected
+        // ranges are taken only when BOTH decline it (#790, then this).
+        //
+        // Coverage (ADR-0107 decision 1), against the BLOCKS section's own size
+        // for the reason the version-3 path documents. The numerator is the
+        // projected page bytes rather than whole candidate blocks, so a narrow
+        // projection stays far below the threshold even when every block
+        // survives, and an all-columns read of every block reaches ~1.0 and
+        // takes the single GET.
+        //
+        // Request cost, the term coverage alone cannot express: coverage is a
+        // ratio, so it says a read saving 174 bytes out of 1.18 MB and one
+        // saving 174 bytes out of 200 KB are equally far below the threshold,
+        // and it never weighs how many GETs the ranges cost. The comparison
+        // here is the marginal one at this point in the read: the probe and the
+        // directory sections are already paid, so what is left to choose is one
+        // whole-object GET against `coalesced.len()` range GETs, and the ranges
+        // are worth it only when the bytes they drop outweigh the requests they
+        // add ([`saving_beats_requests`]).
         let wanted_bytes: u64 = wanted.iter().map(|e| e.len).sum();
         let coverage = wanted_bytes as f64 / blocks_desc.len.max(1) as f64;
-        if coverage >= self.coverage_threshold {
+        let saved_bytes = blocks_desc.len.saturating_sub(wanted_bytes);
+        let extra_gets = (coalesce_byte_extents(&wanted, self.coalesce_gap).len() as u64)
+            .saturating_sub(1);
+        if coverage >= self.coverage_threshold
+            || !saving_beats_requests(saved_bytes, extra_gets, self.request_byte_equivalent)
+        {
             let (bytes, live) = self
                 .cached_extent(
                     seg_ref,
