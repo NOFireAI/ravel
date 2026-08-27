@@ -64,6 +64,14 @@ pub const LOADER_MAX_ATTRIBUTES_PER_RECORD: usize = 1024;
 /// batch. Every successful write is fully durable before the next batch starts.
 pub const DEFAULT_BATCH_ROWS: usize = 10_000;
 
+/// Default flush target size, in bytes, for a shard's buffer. `1` makes every
+/// Strict write flush inside its own `handle_write`, so one batch is one RLOG
+/// object per involved shard and every ack is answered by that write's own
+/// flush. Any larger value lets a shard accumulate encoded records across
+/// several batches before it flushes, which defers those earlier batches' acks
+/// (see [`load_instrumented`]).
+pub const DEFAULT_TARGET_BYTES: usize = 1;
+
 /// Default number of decoded batches allowed to sit queued between the Parquet
 /// decode/build stage and the shard-write stage (issue #680). The decoder runs
 /// ahead by up to this many batches while the encoders drain earlier ones, so
@@ -269,6 +277,7 @@ pub async fn run(
     read_cursors: Option<usize>,
     pipeline_depth: usize,
     decode_queue_batches: usize,
+    target_bytes: usize,
     now_ns: i64,
 ) -> anyhow::Result<()> {
     run_warning_to(
@@ -281,6 +290,7 @@ pub async fn run(
         read_cursors,
         pipeline_depth,
         decode_queue_batches,
+        target_bytes,
         now_ns,
         &mut std::io::stderr(),
     )
@@ -305,6 +315,7 @@ pub(crate) async fn run_warning_to(
     read_cursors: Option<usize>,
     pipeline_depth: usize,
     decode_queue_batches: usize,
+    target_bytes: usize,
     now_ns: i64,
     warnings: &mut dyn std::io::Write,
 ) -> anyhow::Result<()> {
@@ -329,6 +340,7 @@ pub(crate) async fn run_warning_to(
         read_cursors,
         pipeline_depth,
         decode_queue_batches,
+        target_bytes,
         now_ns,
         Arc::new(SystemClock),
         LoadPath::Columnar,
@@ -447,8 +459,11 @@ fn print_durable_tokens(err: &LoadError) {
 #[derive(Debug, Clone, Default)]
 pub struct LoadReport {
     pub rows_processed: u64,
-    /// One token per shard flushed, across every batch. Its length is the
-    /// number of objects/segments written.
+    /// One token per shard acked, across every batch, in submission order. At
+    /// the default `--target-bytes 1` that is one token per object written; at
+    /// a larger target one flush answers several batches' acks with the same
+    /// token, so the list repeats it once per batch that flush carried. Use
+    /// [`LoadReport::objects_written`] for the object count.
     pub tokens: Vec<CommitToken>,
     pub elapsed: Duration,
     /// The router's cumulative write metrics, snapshotted once the load
@@ -477,8 +492,13 @@ pub struct LoadReport {
 }
 
 impl LoadReport {
+    /// Distinct commit tokens in [`LoadReport::tokens`], which is the number of
+    /// RLOG objects the load wrote. Counting the list's length instead would
+    /// report batches-times-shards, which only equals the object count while
+    /// every write gets its own flush (`--target-bytes 1`).
     pub fn objects_written(&self) -> usize {
-        self.tokens.len()
+        let mut seen = std::collections::HashSet::new();
+        self.tokens.iter().filter(|t| seen.insert(t.encode())).count()
     }
 }
 
@@ -554,7 +574,10 @@ impl LoadError {
 ///   [`validate_or_adopt`] with [`AbsentPolicy::CreateFromConfig`], the same
 ///   first-touch path `services/ravel-server` runs; the router then resolves
 ///   the active generation from that record itself.
-/// - `batch_rows` rows are written per Strict flush.
+/// - `batch_rows` rows are written per Strict write. At this entry point's
+///   fixed [`DEFAULT_TARGET_BYTES`] flush target that is also one flush, and so
+///   one RLOG object per involved shard; [`load_instrumented`] takes the target
+///   as a parameter and documents what a larger one changes.
 /// - `now_ns` is the ingest-time anchor for the future-skew check (the past-lag
 ///   check is deliberately omitted per ADR-0089). Bucketing is by the router's
 ///   own clock (load-time wall clock), independent of the records' event times.
@@ -593,6 +616,7 @@ pub async fn load(
         read_cursors,
         pipeline_depth,
         DEFAULT_DECODE_QUEUE_BATCHES,
+        DEFAULT_TARGET_BYTES,
         now_ns,
         clock,
         LoadPath::Columnar,
@@ -616,6 +640,15 @@ type BuildStartHook = Arc<dyn Fn() + Send + Sync>;
 /// decode->encode channel (issue #680), so a test can observe how far the
 /// decoder has run ahead of the encoders while a write is held. Both are `None`
 /// in production.
+///
+/// `target_bytes` is the shard buffer's flush target (`--target-bytes`). At `1`
+/// every Strict write flushes inside its own `handle_write`, so a write's ack is
+/// answered by its own flush. Above that, a shard accumulates encoded records
+/// across batches, so an earlier batch's ack is not answered until a later batch
+/// pushes the buffer over the target or the router's age trigger
+/// (`max_flush_delay`) fires. The ack still means durable when it arrives; it
+/// just arrives later, and the loader's in-flight window must be wide enough to
+/// submit the batch that releases it (see the flush-target comment inside).
 #[allow(clippy::too_many_arguments)]
 async fn load_instrumented(
     store: Arc<dyn ObjectStoreBackend>,
@@ -627,6 +660,7 @@ async fn load_instrumented(
     read_cursors: Option<usize>,
     pipeline_depth: usize,
     decode_queue_batches: usize,
+    target_bytes: usize,
     now_ns: i64,
     clock: Arc<dyn Clock>,
     path: LoadPath,
@@ -675,6 +709,17 @@ async fn load_instrumented(
                 .to_string(),
         ));
     }
+    // Same shape as the guards above: `--target-bytes` is the operator-facing
+    // flush-target lever (issue #801). A target of 0 is not a smaller target
+    // than 1, it is the same one (`est_bytes >= 0` holds for an empty buffer),
+    // so it is rejected rather than silently behaving as 1.
+    if target_bytes == 0 {
+        return Err(LoadError::Setup(
+            "--target-bytes must be at least 1 (1 flushes every batch as its own object); 0 was \
+             given"
+                .to_string(),
+        ));
+    }
 
     let limits = LogIngestLimits::default();
     let tenant_id = TenantId::new(tenant);
@@ -698,12 +743,23 @@ async fn load_instrumented(
         ))
     })?;
 
-    // `target_bytes: 1` makes each Strict batch flush immediately as one RLOG
-    // object, inside `handle_write`'s size trigger, rather than waiting on the
-    // age trigger's `max_flush_delay` clock. That is what a bulk loader wants:
-    // one object per batch, `batch_rows` controls its size, and every write's
-    // ack is durable with no lingering buffer. It also keeps flush timing off
-    // the wall clock, so the object buckets by the flush-open reading directly.
+    // `target_bytes: 1` (the `--target-bytes` default) makes each Strict batch
+    // flush immediately as one RLOG object, inside `handle_write`'s size
+    // trigger, rather than waiting on the age trigger's `max_flush_delay`
+    // clock. That is what a bulk loader wants by default: one object per batch,
+    // `batch_rows` controls its size, and every write's ack is durable with no
+    // lingering buffer. It also keeps flush timing off the wall clock, so the
+    // object buckets by the flush-open reading directly.
+    //
+    // A larger target keeps the durability meaning of an ack (it is still sent
+    // from `ack_waiters` only after that flush's object and commit record are
+    // published) but drops the other three: a shard's buffer now spans several
+    // batches, so a batch's ack waits for whichever later batch pushes the
+    // buffer over the target, and a tail buffer that never reaches the target
+    // is released by the wall-clock age trigger instead. The loader's in-flight
+    // window must therefore be wide enough to hold the batches that accumulate
+    // into one flush, or every flush waits out `max_flush_delay`.
+    //
     // `Arc` so each batch's write can be `tokio::spawn`ed onto its own task and
     // run genuinely concurrently up to `pipeline_depth` (a constructed-but-
     // unawaited future does no I/O until polled; spawning is what makes the S3
@@ -712,7 +768,7 @@ async fn load_instrumented(
     let router = Arc::new(LogIngestRouter::new(
         IngestConfig {
             shard_count: shards,
-            target_bytes: 1,
+            target_bytes,
             ..IngestConfig::default()
         },
         Arc::clone(&store),
@@ -3416,6 +3472,7 @@ type = "i64"
             None,
             1,
             DEFAULT_DECODE_QUEUE_BATCHES,
+            DEFAULT_TARGET_BYTES,
             NOW_NS,
             &mut sink,
         )
@@ -3607,6 +3664,7 @@ type = "i64"
             None,
             1,
             0,
+            DEFAULT_TARGET_BYTES,
             NOW_NS,
             Arc::new(FixedClock(NOW_NS)),
             LoadPath::Columnar,
@@ -3808,6 +3866,7 @@ type = "i64"
                     None,
                     2,
                     depth,
+                    DEFAULT_TARGET_BYTES,
                     NOW_NS,
                     Arc::new(FixedClock(NOW_NS)),
                     LoadPath::Columnar,
@@ -3973,6 +4032,7 @@ type = "i64"
             None,
             1,
             QUEUE_DEPTH,
+            DEFAULT_TARGET_BYTES,
             NOW_NS,
             Arc::new(FixedClock(NOW_NS)),
             LoadPath::Columnar,
@@ -4273,6 +4333,7 @@ type = "i64"
             None,
             1,
             DEFAULT_DECODE_QUEUE_BATCHES,
+            DEFAULT_TARGET_BYTES,
             NOW_NS,
             Arc::new(FixedClock(NOW_NS)),
             LoadPath::Columnar,
@@ -4656,6 +4717,7 @@ type = "i64"
             Some(1),
             1,
             DEFAULT_DECODE_QUEUE_BATCHES,
+            DEFAULT_TARGET_BYTES,
             NOW_NS,
             &mut sink,
         )
@@ -4683,6 +4745,7 @@ type = "i64"
             Some(4),
             1,
             DEFAULT_DECODE_QUEUE_BATCHES,
+            DEFAULT_TARGET_BYTES,
             NOW_NS,
             &mut sink,
         )
@@ -4724,6 +4787,7 @@ type = "i64"
             Some(1),
             1,
             DEFAULT_DECODE_QUEUE_BATCHES,
+            DEFAULT_TARGET_BYTES,
             NOW_NS,
             &mut sink,
         )
@@ -5418,6 +5482,7 @@ type = "i64"
             read_cursors,
             1,
             DEFAULT_DECODE_QUEUE_BATCHES,
+            DEFAULT_TARGET_BYTES,
             now_ns,
             clock,
             LoadPath::Row,
