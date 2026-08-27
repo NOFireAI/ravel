@@ -310,14 +310,15 @@ pub fn build_sql_state(
         .with_block_range_threshold(config.engine.logs_block_range_threshold)
         .with_max_concurrent_gets(config.engine.fetch_concurrency);
     // The spans fetcher (RSPAN) reads the same object store, with the default
-    // RspanConfig (ADR-0045 decision 5). It attaches no fetcher cache: unlike
-    // the RSEG/RLOG fetchers it has no `with_cache` seam, and none is wired
-    // here. Its `fetch_accounted` path is tenant-checked and accounted (ADR-0045
-    // via #1080), so a `spans` query is isolated and metered like any other.
-    let span_fetcher = SpanSegmentFetcher::new(store.clone());
+    // RspanConfig (ADR-0045 decision 5). Its `fetch_accounted` path is
+    // tenant-checked and accounted (ADR-0045 via #1080), so a `spans` query is
+    // isolated and metered like any other; when a cache is configured it also
+    // routes through ADR-0046's read cache, same as RSEG/RLOG (#810).
+    let mut span_fetcher = SpanSegmentFetcher::new(store.clone());
     if let Some(cache) = cache {
         metrics_fetcher = metrics_fetcher.with_cache(cache.clone());
-        logs_fetcher = logs_fetcher.with_cache(cache);
+        logs_fetcher = logs_fetcher.with_cache(cache.clone());
+        span_fetcher = span_fetcher.with_cache(cache);
     }
     // The metrics fetcher (RSEG), the logs fetcher (RLOG), and the spans
     // fetcher (RSPAN) all read the same object store; the executor uses
