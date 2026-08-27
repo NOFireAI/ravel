@@ -2500,7 +2500,8 @@ pub struct QueryAccountingMetrics {
     rows: parking_lot::Mutex<HashMap<(Option<TenantHash>, WorkloadClass), QueryCostCounters>>,
     /// The outcome-status split (issue #809), independent of `rows` above;
     /// see [`QueryOutcomeRow`] for why it is a separate map.
-    outcomes: parking_lot::Mutex<HashMap<(Option<TenantHash>, QueryOutcomeStatus), QueryCostCounters>>,
+    outcomes:
+        parking_lot::Mutex<HashMap<(Option<TenantHash>, QueryOutcomeStatus), QueryCostCounters>>,
 }
 
 impl QueryAccountingMetrics {

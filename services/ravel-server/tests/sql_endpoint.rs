@@ -1562,7 +1562,11 @@ async fn a_query_that_reads_objects_then_fails_records_the_bytes_it_actually_rea
             cfg
         });
     let (status, value) = post_json(&baseline_app, "acme-token", query).await;
-    assert_eq!(status, StatusCode::OK, "baseline query must succeed: {value}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "baseline query must succeed: {value}"
+    );
     let baseline = only_outcome_row(
         &baseline_accounting,
         ravel_server::metrics::QueryOutcomeStatus::Success,
@@ -1814,7 +1818,9 @@ async fn a_dropped_request_future_records_a_canceled_cost() {
         .uri("/api/v1/sql")
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::AUTHORIZATION, "Bearer acme-token")
-        .body(Body::from(body("SELECT ts, value FROM samples ORDER BY ts")))
+        .body(Body::from(body(
+            "SELECT ts, value FROM samples ORDER BY ts",
+        )))
         .expect("build request");
 
     let task = tokio::spawn(async move { app.oneshot(request).await });
