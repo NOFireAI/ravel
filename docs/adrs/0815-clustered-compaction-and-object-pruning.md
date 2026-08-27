@@ -288,7 +288,10 @@ function of the input set and this value), the resolved part byte cap
 merge -- the resolved partition parameters of decision 4's
 range-partitioned rewrite (`clustering_sample_target`,
 `clustering_sample_key_cap`, `clustering_resplit_depth`,
-`max_clustering_partitions`, and the resolved sort-budget bytes), because
+`max_clustering_partitions`, and the resolved sort-budget bytes; the
+sampler byte reservation and its fixed per-entry accounting charge are
+derived from the first two, so they are pinned transitively, and a change
+to either derivation is a tuple change like any other), because
 partition boundaries, and therefore part cut points, are a deterministic
 function of the input set and these values exactly as the batch partition
 is of `max_merge_cursors`. The tuple is serialized with
@@ -764,7 +767,17 @@ stored order, rows in stored order), decodes each row far enough to read
 the key column, and retains every `ceil(N / S)`-th non-null key value,
 where N is the exact input row count summed from the input records'
 `sample_count` fields (known before the pass starts, never estimated) and
-S is `clustering_sample_target` (default 65,536 retained keys). Each
+S is `clustering_sample_target` (default 65,536). S is a target, not the
+retained count: the stride `ceil(N / S)` retains `R = ceil(N / ceil(N /
+S))` keys, and R equals N when N <= S but only approaches S from below
+otherwise (N = 65,537 gives stride 2 and R = 32,769, barely half the
+target). Every rule below that cuts or counts the sample is therefore
+stated over R, the actual retained count, never over the target S; R is
+itself a pure function of N and S, so determinism is unaffected. When
+N = 0, or every input row's key is null, R = 0: no sampling output
+exists, no stride is ever used as a divisor (`ceil(0 / S)` never reaches
+one), G collapses to 1, and the merge is the null-partition (or empty)
+case below. Each
 retained key is truncated to `clustering_sample_key_cap` bytes (default
 512 -- deliberately wider than the 128-byte wire-bound cap, which limits
 what a `CompactionPart` STORES, not what a splitter may compare). The
@@ -772,9 +785,19 @@ stride is deterministic and there is no RNG anywhere in the path, so the
 sample -- and every boundary derived from it -- is a pure function of the
 input set and the resolved configuration, which is what lets decision 3's
 identity tuple pin the partition boundaries. Sampler memory is bounded by
-construction, not by the tracker's grace: 65,536 keys x (512 bytes + entry
-overhead) is at most 36 MiB, accounted to `MergeMemoryTracker` as a fixed
-reservation before the first block is read.
+construction, not by the tracker's grace, and the bound is accounted in
+BYTES, never in key count: each retained key is charged to
+`MergeMemoryTracker` at its retained byte length plus a fixed 64-byte
+per-entry charge, against a fixed sampler reservation of 36 MiB
+(65,536 x (512 + 64) bytes exactly), reserved before the first block is
+read. The initial pass cannot exceed the reservation (R <= S and every
+key is truncated to the cap, so its worst case is the reservation's own
+defining product), but the accounting runs on this pass anyway, because
+the re-sampling pass below shares the reservation and does not share the
+truncation: the figure the tracker enforces is bytes, and sampler tracked
+bytes exceeding the reservation at any instant, on any pass, is an
+enforcement defect of the same class as the sort stage exceeding
+`sort_budget`.
 
 The same pass sums the exact decoded byte size B of the input rows (it
 decodes every block anyway), and the partition count is
@@ -782,12 +805,30 @@ decodes every block anyway), and the partition count is
 where `sort_budget` is the merge memory budget minus the cursor floor (the
 cursor-bound subsection above) and the sampler reservation, the 1.5 is
 headroom for sampling error, and `max_clustering_partitions` defaults to
-1,024. A merge whose unclamped G exceeds the cap fails loudly naming B,
-`sort_budget`, and the cap -- the scheduler must dispatch fewer inputs per
-merge -- mirroring the cursor-floor rule above. The sorted sample is cut
-at every `ceil(S / G)`-th retained key to yield the G-1 splitters;
-adjacent equal splitters collapse, so no partition is empty by
-construction.
+1,024. `sort_budget > 0` is a checked precondition, not an assumption:
+before the sampling pass starts, a resolved merge memory budget less than
+or equal to the cursor floor plus the 36 MiB sampler reservation REFUSES
+with a typed configuration error naming all three figures (budget, floor,
+reservation). The G formula divides by `sort_budget`, and a non-positive
+divisor is a misconfiguration to reject at the boundary, never a value to
+compute with; the violation condition is exactly `sort_budget <= 0`, and
+the refusal fires before any block is read, so a misconfigured merge
+costs zero I/O. A merge whose unclamped G exceeds the cap fails loudly
+naming B, `sort_budget`, and the cap -- the scheduler must dispatch fewer
+inputs per merge -- mirroring the cursor-floor rule above. The sorted
+sample is cut at every `ceil(R / G)`-th retained key -- R, the actual
+retained count, never the target S: cutting a 32,769-key sample (the
+N = 65,537 case above) at `ceil(S / G)`-key strides with G = 7 would
+yield three splitters where six are wanted, silently under-partitioning
+-- to yield up to G - 1 splitters; adjacent equal splitters collapse, so
+no partition is empty by construction. When the sample yields fewer than
+G - 1 distinct splitters (small R, or heavy collapse), the effective
+partition count is capped at the available distinct splitters plus one.
+That cap is a sampling-resolution event, never a refusal and never a
+memory hazard: the resulting oversized partitions are absorbed by the
+enforced split path below, exactly as the cardinality degenerate case
+describes, so an undersized splitter set costs extra split passes, not
+the bound and not an unnecessary refusal.
 
 **Why this keeps the merge inside the `MergeMemoryTracker` bound: the
 bound is enforced, not predicted.** The memory claim does not rest on the
@@ -796,17 +837,41 @@ tracker, and a partition that reaches `sort_budget` before its last input
 row stops, splits its key range, and re-runs the sub-ranges: sub-splitters
 come first from the retained sample restricted to the range; when that
 yields fewer than two distinct keys, one range-restricted re-sampling pass
-runs (same sampler, keys filtered to the range, and -- because the range's
-row population is a fraction of the input -- retaining FULL-length keys
-under the same 36 MiB reservation); recursion past
+runs: same sampler, keys filtered to the range, retaining UNTRUNCATED
+keys so that keys sharing a common prefix longer than the initial cap
+become distinguishable. Untruncated keys void the initial pass's
+worst-case product, so the re-sample is governed by the byte accounting
+alone, under the same 36 MiB reservation, and the accounting is enforced
+per retention, never predicted from a key count: retaining a key charges
+its full byte length plus the 64-byte entry charge BEFORE the key is
+kept, and a retention that would push tracked sampler bytes past the
+reservation instead doubles the stride -- the keys at odd ordinal
+positions of the current retained sequence are evicted and their bytes
+released, halving retained bytes, and retention continues at the doubled
+stride. Stride doubling is a pure function of the input sequence and the
+resolved configuration, so re-sampled splitters stay deterministic and
+decision 3's identity tuple still pins them; doubling repeats as needed,
+and a re-sample that ends with fewer than two distinct retained keys
+falls into the unsplittable case below. One state cannot be degraded
+around: a single key whose own bytes plus the entry charge exceed the
+whole reservation cannot be retained at any stride, and the re-sample
+REFUSES with a typed error naming the key's byte length and the
+reservation -- deterministic, before allocation, the same
+refuse-not-spill posture as the unsplittable case. There is therefore no
+path, initial or re-sampling, on which sampler allocation precedes
+accounting: the merge memory bound stays enforced, in bytes, on every
+path. Recursion past
 `clustering_resplit_depth` (default 2) refuses, below. Sampling quality
 therefore affects only how often the split path runs (one extra read pass
-per split), never the peak heap. The peak-heap figure and its band: peak
-tracked bytes for the sort stage stay within `[0.25, 1.0] x sort_budget`
-on the acceptance corpus -- above 1.0 the enforcement is broken, below
-0.25 the partitioner overcut by more than 2x -- and the expected resplit
-count on that corpus is stated per test (a resplit count above the stated
-band is a pre-registration miss, not noise).
+per split), never the peak heap. The peak-heap figures and their bands:
+peak tracked bytes for the sort stage stay within `[0.25, 1.0] x
+sort_budget` on the acceptance corpus -- above 1.0 the enforcement is
+broken, below 0.25 the partitioner overcut by more than 2x; peak tracked
+sampler bytes never exceed the 36 MiB reservation on any pass (a single
+byte over is an enforcement defect; there is no tolerance band above);
+and the expected resplit and stride-doubling counts on that corpus are
+stated per test (a count outside the stated band is a pre-registration
+miss, not noise).
 
 Degenerate cases, each with a defined outcome:
 
@@ -821,8 +886,11 @@ Degenerate cases, each with a defined outcome:
 - **Keys sharing a long common prefix.** Distinct keys that collide within
   the 512-byte initial sampler cap yield equal splitters, which collapse;
   their rows land in one partition. If that partition exceeds
-  `sort_budget`, the split path runs with full-length keys from the
-  range-restricted re-sample. Only keys indistinguishable at full length
+  `sort_budget`, the split path runs with untruncated keys from the
+  range-restricted re-sample, under the byte-accounted reservation above
+  (stride doubling absorbs many long keys; a single key wider than the
+  whole reservation is the typed re-sample refusal). Only keys
+  indistinguishable at full length
   are truly unsplittable, and those are by definition one key value --
   the previous case.
 - **Cardinality far above the sample's resolution.** Expected and
@@ -832,8 +900,9 @@ Degenerate cases, each with a defined outcome:
   split, never by the heap.
 - **The bound cannot be met.** When an over-budget partition's range
   cannot split (more than one distinct full-length key, but fewer than two
-  distinct splitter candidates -- or `clustering_resplit_depth`
-  exhausted), the merge REFUSES: a typed error naming the range's key
+  distinct splitter candidates; `clustering_resplit_depth` exhausted; or
+  the re-sample's single-key-over-reservation refusal above), the merge
+  REFUSES: a typed error naming the range's key
   prefix, its accumulated bytes, and `sort_budget`; nothing is published,
   and the inputs stay live and queryable. Refuse, not spill: a
   spill-to-object-storage path would need a scratch key namespace and a
@@ -890,7 +959,18 @@ exclusion is an index problem, and it solves only the former.
 - **Segment format:** no bump. Clustering reorders rows within the frozen
   RLOG/RSPAN layout; the on-object bytes a clustered part writes are a valid
   current-version segment, produced by the same writer an L0 flush uses
-  (rlog.rs re-blocks through a fresh `RlogWriter`). This is a compaction
+  (rlog.rs re-blocks through a fresh `RlogWriter`). One inference this
+  bullet must stop a careful reader from making: ADR-0032's Context says
+  `LogFooter` has no compaction identity, which, read as current state,
+  would make an L1 `.rlog` indistinguishable from L0 and this no-bump
+  claim unsound. That sentence describes the pre-ADR-0032 state, and its
+  decision shipped: the RLOG trailer is at version 4 today
+  (`crates/ravel-logseg/src/footer.rs::VERSION`; v2 added the identity
+  fields per ADR-0032, v3 per ADR-0095, v4 per ADR-0699), and `LogFooter`
+  carries `level`, `input_set_hash`, and `part_index` on every RLOG
+  object, so an L1 `.rlog` is distinguishable from L0 by the footer's
+  `level` alone and a clustered part needs nothing new from the trailer.
+  This is a compaction
   output-choice change, not a page-grammar or trailer change, so it is not a
   migration class under ADR-0066 decision 4: nothing on an existing object
   changes meaning, old objects stay readable and are re-clustered
@@ -930,7 +1010,9 @@ exclusion is an index problem, and it solves only the former.
     enum addition carries that rollout ordering, on ADR-0101's schedule.
   - The one deliberate exception to the additive class: a CROSS-HOUR
     record (decision 7: `covered_hour_max > covered_hour_min`) is published
-    at `format_version = 2` with one replica per covered hour. That is a
+    at `format_version = 2` with one replica per covered hour, the home
+    replica written last as the all-or-nothing visibility barrier
+    (decision 7's barrier paragraph). That is a
     reader-floor raise on `CompactionRecord` -- ADR-0066 decision 4 Class
     C's own lever for a change old readers must refuse rather than
     misread, using the typed `format_version` check the record already
@@ -1085,14 +1167,63 @@ below):
   also makes a cross-hour record discoverable to a resolve whose window
   overlaps ANY covered hour, which #593 needs independently; the resolver
   dedupes replicas by `input_set_hash` and applies input exclusion
-  snapshot-wide, and the corresponding amendment to
+  snapshot-wide (both only once the record is live per the barrier
+  paragraph below), and the corresponding amendment to
   docs/catalog-and-mvcc.md's resolution section ships with #593's
   implementation, not silently here. Two scheduling guards keep
   publication and the sweep from racing: the compactor selects only input
   hours at least `l2_retention_margin` (default 24 h) short of their own
-  expiry, and once any replica is durable the coverage gate below defers
-  every covered bucket, so the only race window is publication itself,
-  which the margin covers.
+  expiry, and once the home replica is durable every covered bucket's
+  listing already carries a replica (the home is written last, per the
+  barrier paragraph below), so the coverage gate defers each of them; the
+  window before the home lands is publication itself, which the margin
+  covers and the barrier keeps invisible.
+
+  **Publication is all-or-nothing, and the barrier is one object.** The
+  replica writes above are independent `CreateIfAbsent` PUTs, and object
+  storage offers no multi-object atomic write, so without a further rule
+  a publication that stops partway would leave some covered hours seeing
+  a replica and others seeing nothing: an hour holding a replica would
+  treat the record's inputs as superseded while a missing hour's resolve
+  cannot exclude them, and a replica-less expired hour could tombstone
+  inputs a later-completed record still claims. The rule: a cross-hour
+  record, and the supersession of its inputs, is live if and only if its
+  HOME replica exists -- the replica stored under the record's own
+  `ingest_hour_bucket`, at its deterministic key. The compactor's
+  publication order is normative: the content-addressed part objects
+  first (durable before any replica references them, as in every
+  compaction publish), then every non-home replica in ascending
+  covered-hour order, then the home replica LAST, only after every other
+  replica is durable. That single `CreateIfAbsent` PUT of the home
+  replica is the atomic visibility barrier: one object, one existence
+  bit, flipped by the one write shape object storage does make atomic.
+  Until it exists, nothing is live. A non-home replica discovered by any
+  consumer (resolver, sweep, compactor, erasure rewriter) confers no
+  supersession and no coverage claim until that consumer confirms the
+  home replica exists, by GET on the home key derived from the replica's
+  own `ingest_hour_bucket` and `input_set_hash` fields (one GET per
+  discovered cross-hour record per pass, cacheable per snapshot). Home
+  present: the record participates everywhere, replicas deduped by
+  `input_set_hash` as above. Home absent: the replica is an orphan of an
+  interrupted publication -- the resolver includes the record's inputs
+  exactly as if no record existed (nothing superseded, no rows lost, no
+  rows duplicated), and the sweep DEFERS the bucket (gate case 6 below).
+  An interrupted publication therefore leaves every covered hour agreeing
+  the record does not exist yet; the failure this closes is one hour
+  believing its inputs superseded while another does not, and no partial
+  state can express that any longer. Convergence is the compactor's
+  normal idempotent retry: keys are deterministic and every PUT is
+  `CreateIfAbsent`, so a re-run over the same sealed inputs re-writes
+  whatever replicas are missing and then the home replica, completing the
+  original publication rather than forking it. One pre-flight guards the
+  flip itself: immediately before the home write, the compactor re-checks
+  every covered bucket for a retention tombstone and REFUSES to publish
+  the home replica if one exists (the inputs it would supersede are
+  already retired); the window between that check and the home PUT sits
+  inside `l2_retention_margin` by the scheduling guard below, so a
+  tombstone cannot land inside it. An orphan replica older than the
+  margin is a defect deferral with the standard alarm, remedied by the
+  retry or by operator supersession, never by a guess.
 
   **The gate, enumerated.** For a coverage-aware sweep evaluating bucket
   H, every record listed under H is checked before H may tombstone, and
@@ -1119,8 +1250,14 @@ below):
      what it can of the record and proceeds, and it never treats the
      record as v1. Defer. (This is also the pre-coverage sweep's path,
      for free: its supported set is `{1}`.)
+  6. **Orphaned**: a cross-hour replica listed under H whose home
+     replica (the record object under the replica's own
+     `ingest_hour_bucket`) does not exist -- an interrupted publication,
+     per the barrier paragraph above. The record is not live and
+     supersedes nothing, but H's listing carries a record whose
+     lifecycle is unresolved; defer.
 
-  A record that passes all five checks participates in the extended
+  A record that passes all six checks participates in the extended
   expiry test above: H tombstones only when every record whose covered
   range includes H is expired over its own FULL covered range, and then
   every hour that record covers tombstones together in the same pass.
@@ -1138,7 +1275,10 @@ below):
   self-heal: each is reported per pass with record key and case, a
   defect deferral persisting past `retention_defect_alarm_after`
   (default 24 h) escalates to an error-level alarm, and the remedy is
-  operator action (supersede or fix the writer). A defective record
+  operator action (supersede or fix the writer). Case 6 is the one defect
+  defer with a self-heal path -- the compactor's idempotent republication
+  (the barrier paragraph above) completes the interrupted publication --
+  and it escalates on the same clock if it persists. A defective record
   blocks exactly the buckets whose listings carry one of its replicas;
   every other bucket's retention progresses unaffected, so a single bad
   record can never stop the sweep fleet-wide. Case 5 converges by
@@ -1261,17 +1401,36 @@ absent or duplicated figure fails the same as one outside the band.
    adjacent-row order violations under the full override comparator
    across the concatenated parts exactly 0; sort-stage peak tracked bytes
    within `[0.25, 1.0] x sort_budget` (above: bound broken; below:
-   partitioner overcut by more than 2x); resplit passes exactly 1 (the
+   partitioner overcut by more than 2x); peak tracked sampler bytes at
+   most the 36 MiB reservation on both passes (one byte over is
+   enforcement broken; no upper tolerance band exists); stride doublings
+   during the planted re-sample exactly 0 (the cohort's untruncated keys
+   fit the reservation by construction of the corpus; 1+ is a
+   pre-registration miss); resplit passes exactly 1 (the
    planted cohort; 0 means the plant did not exercise the path, 2+ is a
    sampler-quality miss); partition count G within `[G_ideal, 2 x
    G_ideal]` for `G_ideal = ceil(1.5 * B / sort_budget)`. Companions:
    `lexical_partition_determinism` merges the same inputs twice and
    asserts byte-identical output (differing part content hashes exactly
-   0), and `str_override_refuses_unsplittable` sets
+   0); `str_override_refuses_unsplittable` sets
    `clustering_resplit_depth = 0` against an over-budget multi-key
    partition and asserts the typed refusal (naming key prefix,
    accumulated bytes, and `sort_budget`) with part PUTs exactly 0 and
-   inputs still live.
+   inputs still live; `non_positive_sort_budget_refuses_before_sampling`
+   resolves a merge memory budget exactly equal to the cursor floor plus
+   the sampler reservation (`sort_budget = 0`) and asserts the typed
+   configuration error naming budget, floor, and reservation, with input
+   blocks read exactly 0 and part PUTs exactly 0;
+   `splitters_derive_from_retained_count` builds N = 65,537 rows (stride
+   2) and forces G = 7, then asserts the retained count is exactly
+   32,769, the sample is cut at `ceil(R / G)` = 4,682-key strides
+   yielding exactly 6 splitters and 7 partitions (demonstrated failing
+   first against the `ceil(S / G)` arithmetic, which yields 3 splitters
+   on the same sample); and `resample_key_over_reservation_refuses`
+   plants a single key wider than the whole reservation in a range
+   forced to re-sample and asserts the typed refusal naming the key's
+   byte length and the reservation, with part PUTs exactly 0 and inputs
+   still live.
 10. **The retention coverage gate defers on every defect, mixed-version**
     (`retention_coverage_gate_defects_defer` and
     `v1_sweep_fails_closed_on_v2_replica`). Writer: a coverage-aware (v2)
@@ -1283,8 +1442,10 @@ absent or duplicated figure fails the same as one outside the band.
     whole covered range is expired. Reader: the same build's sweep.
     Asserts tombstones written for the five defect buckets exactly 0;
     the per-case deferral counter exactly 1 for each of the five
-    enumerated cases (asserted per case, not as a sum of 5, so a case
-    silently falling through to another's branch fails); the control
+    cases it constructs (asserted per case, not as a sum of 5, so a case
+    silently falling through to another's branch fails; gate case 6, the
+    orphaned replica, is pinned by acceptance 11's fault-injection test
+    rather than re-planted here); the control
     record's covered range tombstones in one pass, tombstone count
     exactly its covered width. Mixed-version half: writer a v2 build
     publishing a cross-hour record with replicas; reader a v1-only
@@ -1295,6 +1456,34 @@ absent or duplicated figure fails the same as one outside the band.
     sweep that drops unknown fields and applies the per-bucket test: the
     stub tombstones the covered bucket, and the zero-tombstone assertion
     catches exactly that.
+11. **A partial cross-hour publication is invisible everywhere**
+    (`cross_hour_partial_publication_stays_invisible`). Writer: a
+    coverage-aware build publishing a three-hour L2 record over sealed
+    inputs of known row count. `FaultStore` kills the publication after
+    the FIRST replica write -- keyed to the PUT operation kind and the
+    non-home replica's key substring, first occurrence -- and the test
+    asserts the fault counter fired exactly once, so the injection is
+    proven, per the repo's FaultStore rule. With only that orphan replica
+    durable, asserts: a resolve over EVERY covered hour returns rows
+    equal to the pre-publication baseline exactly (+-0 -- no hour treats
+    the inputs as superseded, no hour loses or duplicates a row); the
+    retention sweep over every covered bucket writes tombstones exactly 0
+    and increments the case-6 (orphaned) deferral counter exactly 1 on
+    the one bucket listing the orphan. Then a compactor retry over the
+    same sealed inputs completes publication (remaining replicas, home
+    last) and the test asserts: every covered hour's resolve now excludes
+    the superseded inputs, rows still equal baseline exactly (+-0), and
+    the replicas dedupe to one record by `input_set_hash`. Companion for
+    the pre-flight (`tombstoned_covered_hour_blocks_home_publication`):
+    with a retention tombstone planted on one covered hour before the
+    retry, the retry returns the typed refusal and home-replica PUTs are
+    exactly 0. Demonstrated failing first against a stub sweep that
+    treats any replica as live coverage without confirming the home
+    replica: on a fully-expired covered range holding only the orphan,
+    the stub applies the extended expiry test, finds the range expired,
+    and tombstones -- retiring inputs whose superseding record never
+    became live -- and the tombstones-exactly-0 assertion catches exactly
+    that.
 
 ## Alternatives considered
 
@@ -1382,3 +1571,14 @@ absent or duplicated figure fails the same as one outside the band.
   to look back). The reader-floor bump to `format_version = 2` plus one
   replica per covered hour makes the gate mechanical for old and new
   sweeps alike.
+- **Independently live cross-hour replicas (each `CreateIfAbsent` write
+  authoritative the moment it lands).** Rejected (decision 7's barrier
+  paragraph): object storage has no multi-object atomic write, so a
+  publication interrupted between replicas would leave covered hours
+  disagreeing -- one hour treating the record's inputs as superseded
+  while another cannot exclude them, and a replica-less expired hour free
+  to tombstone inputs a later-completed record still claims. Making the
+  home replica, written last, the single liveness bit turns "is this
+  record published" into a one-object existence check every consumer
+  answers identically, at the cost of one GET per discovered cross-hour
+  record.
