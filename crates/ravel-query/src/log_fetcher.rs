@@ -1055,10 +1055,27 @@ impl LogSegmentFetcher {
             && Self::ts_range_relevant(seg_ref, query.ts_min_ns, query.ts_max_ns)
             && Self::plan_skip_decidable(query)
         {
-            let (footer, skip, field_dir, _stats) = self
-                .block_range
-                .fetch_plan_sections(seg_ref, tenant_hash, accounting)
-                .await?;
+            // The `page_fetch` phase span the other plan paths carry (#782), so
+            // the trace shows the probe and section GETs this branch issues.
+            // `s3_bytes` reports block bytes only, which are structurally zero
+            // here; the directory-overhead bytes are recorded in `accounting`.
+            let fetch_span = tracing::debug_span!(
+                "page_fetch",
+                signal = "logs",
+                s3_requests = tracing::field::Empty,
+                s3_bytes = tracing::field::Empty,
+            );
+            let (footer, skip, field_dir, stats) = async {
+                self.block_range
+                    .fetch_plan_sections(seg_ref, tenant_hash, accounting)
+                    .await
+            }
+            .instrument(fetch_span.clone())
+            .await?;
+            let requests = stats.probe_gets + stats.metadata_gets + stats.block_range_gets;
+            fetch_span.record("s3_requests", requests);
+            fetch_span.record("s3_bytes", stats.block_bytes_fetched);
+
             let refs: Vec<&Predicate> = query.prune.iter().collect();
             let numeric = field_dir.numeric_range_arms(&refs);
             let survivors = skip
@@ -4395,6 +4412,475 @@ mod plan_fast_path_tests {
         assert!(
             acc.snapshot().total_s3_bytes() > tail,
             "at-threshold: block-range fetch ran, not the footer-only probe"
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod whole_segment_projection_tests {
+    //! Pins #790: `scan_whole_accounted_with_tenant` (the predicate-free
+    //! whole-segment fast path, #693 part 3) decodes only the pages its
+    //! `ColumnSelection` projects, the same PAGE_DIR-driven per-page column
+    //! skip `decode_v4_block` already applies on every other scan path
+    //! (ADR-0699 decisions 1, 2, 5), rather than decoding every column of
+    //! every block after its one whole-object GET.
+
+    use super::*;
+    use ravel_catalog::SegmentLevel;
+    use ravel_logseg::writer::ObjectIdentity;
+    use ravel_logseg::{RlogWriter, stream_attrs_bytes};
+    use ravel_object_store::PutOptions;
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_types::logstream::log_stream_id;
+    use uuid::Uuid;
+
+    const TENANT: TenantHash = TenantHash([11u8; 16]);
+    const CONTENT_HASH: [u8; 32] = [13u8; 32];
+    const KEY: &str = "t/whole-projection.rlog";
+
+    fn identity() -> ObjectIdentity {
+        ObjectIdentity {
+            tenant_hash: [11u8; 16],
+            shard: 0,
+            writer_id: [3u8; 16],
+            writer_epoch: 1,
+            writer_seq: 1,
+        }
+    }
+
+    fn record(ts: i64) -> LogRecord {
+        let resource = vec![("service.name".to_string(), AttrValue::Str("svc".into()))];
+        LogRecord {
+            stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+            stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+            ts_ns: ts,
+            observed_ts_ns: ts,
+            severity_num: 9,
+            severity_text: "INFO".into(),
+            body: format!("body-{ts}"),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: vec![("request.id".to_string(), AttrValue::Str(format!("r{ts}")))],
+        }
+    }
+
+    /// One block per record (`block_target_records: 1`), all inside the one
+    /// default row group (`group_target_blocks` 32 covers `N` < 32 blocks), so
+    /// PAGE_DIR lists exactly one page per column per block with no
+    /// cross-group split to complicate the page count.
+    fn build_object(records: &[LogRecord]) -> Vec<u8> {
+        let cfg = RlogConfig {
+            block_target_records: 1,
+            ..RlogConfig::default()
+        };
+        let mut w = RlogWriter::new(cfg, identity());
+        for r in records {
+            w.push(r.clone()).expect("push");
+        }
+        w.finish().expect("finish")
+    }
+
+    fn seg_ref(size: u64, records: &[LogRecord]) -> SegmentRef {
+        let min = records.iter().map(|r| r.ts_ns).min().expect("nonempty");
+        let max = records.iter().map(|r| r.ts_ns).max().expect("nonempty");
+        SegmentRef {
+            data_object_key: KEY.to_string(),
+            object_size: size,
+            min_event_ts_ns: min,
+            max_event_ts_ns: max,
+            ingest_hour_bucket: 0,
+            sample_count: records.len() as u64,
+            series_count: 0,
+            shard: 0,
+            content_hash: CONTENT_HASH,
+            writer_id: Uuid::from_u128(1),
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+        }
+    }
+
+    async fn store_with_object(bytes: Vec<u8>) -> Arc<MemoryStore> {
+        let store = Arc::new(MemoryStore::new());
+        store
+            .put(KEY, Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("put");
+        store
+    }
+
+    /// Drains a whole-segment scan to completion and returns its final stats.
+    async fn drain(
+        f: &LogSegmentFetcher,
+        seg: &SegmentRef,
+        columns: &ColumnSelection,
+    ) -> ScanStats {
+        let acc = QueryAccounting::new();
+        let mut scan = f
+            .scan_whole_accounted_with_tenant(
+                seg,
+                TENANT,
+                &LogQuery::new(i64::MIN, i64::MAX),
+                columns,
+                &acc,
+            )
+            .await
+            .expect("scan")
+            .expect("relevant");
+        while scan.next_block().expect("next_block").is_some() {}
+        scan.stats()
+    }
+
+    /// A one-column projection (`ts`/`stream_ref` implicit, `body` requested --
+    /// the shape `SELECT ts, body FROM logs` resolves to, ADR-0087 decision 3)
+    /// through the whole-segment fast path decodes exactly `wanted` pages per
+    /// block and skips the rest. `wanted` is 3 by construction:
+    /// `ColumnSelection::fixed_only().with_body()` never touches the `attrs`/
+    /// `all_attrs` branch of `ColumnSelection::resolve` (`crates/ravel-logseg/
+    /// src/columns.rs`), so it resolves to exactly `{COL_TS, COL_STREAM_REF,
+    /// COL_BODY}` on any object, independent of that object's FIELD_DIR.
+    ///
+    /// `ColumnSelection::all()` on the SAME object is the baseline every other
+    /// page belongs to: `decode_v4_block`'s `wanted` closure (`crates/
+    /// ravel-logseg/src/reader.rs`) always returns `true` when `columns` is
+    /// `None` (which `all()` resolves to), so it decodes every page and skips
+    /// none. `all.pages_decoded - narrow.pages_decoded` is therefore exactly
+    /// the page count `narrow.pages_skipped` reports; the two are cross-checked
+    /// rather than asserted separately so a change that skips too many or too
+    /// few pages cannot land as a bytes-shrink alone.
+    ///
+    /// Non-vacuity: with `decode_v4_block`'s `let wanted = |cid: u32| match
+    /// columns { None => true, Some(set) => set.contains(&cid) };` changed to
+    /// always return `true` regardless of `columns` (decode every page, i.e.
+    /// reverting the projection this test pins), `narrow.pages_decoded` comes
+    /// out equal to `all.pages_decoded` and the `pages_decoded` assertion below
+    /// fails: `left: 48, right: 18` (confirmed by making exactly that edit and
+    /// rerunning). 48 is `8 * N`, this fixture's real per-block page count: the
+    /// seven fixed columns it populates (`ts`, `observed_ts`, `stream_ref`,
+    /// `severity_num`, `severity_text`, `body`, `flags`) plus its one dynamic
+    /// attribute column (`request.id`); `trace_id`/`span_id` are unset and get
+    /// no page, and nothing here overflows into `attrs_raw`.
+    #[tokio::test]
+    async fn narrow_projection_decodes_only_wanted_columns() {
+        const N: usize = 6;
+        let records: Vec<LogRecord> = (0..N as i64).map(record).collect();
+        let bytes = build_object(&records);
+        let total = bytes.len() as u64;
+        let seg = seg_ref(total, &records);
+        let store = store_with_object(bytes).await;
+        let f = LogSegmentFetcher::new(store);
+
+        let narrow = ColumnSelection::fixed_only().with_body();
+        let all_stats = drain(&f, &seg, &ColumnSelection::all()).await;
+        let narrow_stats = drain(&f, &seg, &narrow).await;
+
+        const WANTED: u64 = 3;
+        assert_eq!(
+            all_stats.pages_skipped, 0,
+            "ColumnSelection::all() decodes every page and skips none"
+        );
+        assert_eq!(
+            narrow_stats.pages_decoded,
+            WANTED * N as u64,
+            "one page per wanted column (ts, stream_ref, body) per block, over \
+             {N} blocks"
+        );
+        assert_eq!(
+            narrow_stats.pages_skipped,
+            all_stats.pages_decoded - narrow_stats.pages_decoded,
+            "every page the narrow selection didn't decode was skipped, not \
+             fetched or decoded"
+        );
+        assert!(
+            narrow_stats.page_bytes_decoded < all_stats.page_bytes_decoded,
+            "projecting to one column must decode fewer bytes than decoding \
+             every column: narrow {} B, all {} B",
+            narrow_stats.page_bytes_decoded,
+            all_stats.page_bytes_decoded
+        );
+        assert_eq!(
+            narrow_stats.blocks_scanned, N as u32,
+            "every block is still visited -- the fast path narrows decode, not \
+             which blocks it reads"
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod plan_skip_decidable_span_tests {
+    //! Pins #782: `plan_segment`'s skip-decidable branch (a query whose only
+    //! block-level predicate is a prune-only `NumRange` arm, #761) opens a
+    //! `page_fetch` span around its `fetch_plan_sections` read and records
+    //! that read's real request/byte counts on it, mirroring the pattern
+    //! `plan_segment_fast` and `plan_segment_block_stats` already carry.
+    //! Before the fix this branch's read was invisible to tracing: no span
+    //! wrapped it at all, so a trace over a query taking this branch showed
+    //! no `page_fetch` phase, only the ones plan_segment's other branches
+    //! open.
+
+    use super::*;
+    use ravel_catalog::SegmentLevel;
+    use ravel_logseg::writer::ObjectIdentity;
+    use ravel_logseg::{FieldSel, FieldType, RlogWriter, stream_attrs_bytes};
+    use ravel_object_store::PutOptions;
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_types::logstream::log_stream_id;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use uuid::Uuid;
+
+    const TENANT: TenantHash = TenantHash([21u8; 16]);
+    const CONTENT_HASH: [u8; 32] = [23u8; 32];
+    const KEY: &str = "t/skip-decidable-span.rlog";
+
+    fn identity() -> ObjectIdentity {
+        ObjectIdentity {
+            tenant_hash: [21u8; 16],
+            shard: 0,
+            writer_id: [4u8; 16],
+            writer_epoch: 1,
+            writer_seq: 1,
+        }
+    }
+
+    fn record(ts: i64, code: i64) -> LogRecord {
+        let resource = vec![("service.name".to_string(), AttrValue::Str("svc".into()))];
+        LogRecord {
+            stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+            stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+            ts_ns: ts,
+            observed_ts_ns: ts,
+            severity_num: 9,
+            severity_text: "INFO".into(),
+            body: "hello world".into(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: vec![("code".to_string(), AttrValue::I64(code))],
+        }
+    }
+
+    /// One block per record, so `n` records span `n` blocks -- irrelevant to
+    /// this test's own claim (it never inspects `ScanStats.blocks_*`), kept
+    /// only so the fixture matches the sibling modules' known-good shape.
+    fn build_object(records: &[LogRecord]) -> Vec<u8> {
+        let cfg = RlogConfig {
+            block_target_records: 1,
+            ..RlogConfig::default()
+        };
+        let mut w = RlogWriter::new(cfg, identity());
+        for r in records {
+            w.push(r.clone()).expect("push");
+        }
+        w.finish().expect("finish")
+    }
+
+    fn seg_ref(size: u64, records: &[LogRecord]) -> SegmentRef {
+        let min = records.iter().map(|r| r.ts_ns).min().expect("nonempty");
+        let max = records.iter().map(|r| r.ts_ns).max().expect("nonempty");
+        SegmentRef {
+            data_object_key: KEY.to_string(),
+            object_size: size,
+            min_event_ts_ns: min,
+            max_event_ts_ns: max,
+            ingest_hour_bucket: 0,
+            sample_count: records.len() as u64,
+            series_count: 0,
+            shard: 0,
+            content_hash: CONTENT_HASH,
+            writer_id: Uuid::from_u128(1),
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+        }
+    }
+
+    async fn store_with_object(bytes: Vec<u8>) -> Arc<MemoryStore> {
+        let store = Arc::new(MemoryStore::new());
+        store
+            .put(KEY, Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("put");
+        store
+    }
+
+    /// `block_range_threshold(0)` routes every object through the block-range
+    /// fetcher (`fetch_plan_sections`'s real path) rather than the small-object
+    /// whole-read shortcut, so the skip-decidable branch's own read is the one
+    /// under test.
+    fn fetcher(store: Arc<MemoryStore>) -> LogSegmentFetcher {
+        LogSegmentFetcher::new(store.clone())
+            .with_block_range_threshold(0)
+            .with_block_range(BlockRangeFetcher::new(store).with_whole_object_threshold(0))
+    }
+
+    /// The subset of a `page_fetch` span's fields this test asserts on.
+    #[derive(Default, Debug)]
+    struct Captured {
+        signal: Option<String>,
+        s3_requests: Option<u64>,
+        s3_bytes: Option<u64>,
+    }
+
+    struct FieldVisitor<'a>(&'a mut Captured);
+
+    impl tracing::field::Visit for FieldVisitor<'_> {
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            match field.name() {
+                "s3_requests" => self.0.s3_requests = Some(value),
+                "s3_bytes" => self.0.s3_bytes = Some(value),
+                _ => {}
+            }
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "signal" {
+                self.0.signal = Some(value.to_string());
+            }
+        }
+
+        fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
+    }
+
+    /// Records every `page_fetch` span's fields as of its close, keyed by span
+    /// id, so a test that opens exactly one such span can read back what it
+    /// carried once `plan_segment` returns and the span guard drops.
+    #[derive(Clone, Default)]
+    struct PageFetchCollector {
+        live: Arc<Mutex<HashMap<u64, (String, Captured)>>>,
+        closed: Arc<Mutex<Vec<Captured>>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PageFetchCollector {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if attrs.metadata().name() != "page_fetch" {
+                return;
+            }
+            let mut captured = Captured::default();
+            attrs.record(&mut FieldVisitor(&mut captured));
+            if let Ok(mut live) = self.live.lock() {
+                live.insert(
+                    id.into_u64(),
+                    (attrs.metadata().name().to_string(), captured),
+                );
+            }
+        }
+
+        fn on_record(
+            &self,
+            id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if let Ok(mut live) = self.live.lock()
+                && let Some((_, captured)) = live.get_mut(&id.into_u64())
+            {
+                values.record(&mut FieldVisitor(captured));
+            }
+        }
+
+        fn on_close(&self, id: tracing::span::Id, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+            let taken = self
+                .live
+                .lock()
+                .ok()
+                .and_then(|mut live| live.remove(&id.into_u64()));
+            if let (Some((_, captured)), Ok(mut closed)) = (taken, self.closed.lock()) {
+                closed.push(captured);
+            }
+        }
+    }
+
+    /// A query whose only block-level predicate is a prune-only `NumRange` arm
+    /// takes `plan_segment`'s skip-decidable branch (`Self::plan_skip_decidable`:
+    /// `content` and `stream_attrs` empty, `prune` nonempty and every arm a
+    /// `NumRange`), which must open a `page_fetch` span around its
+    /// `fetch_plan_sections` read and record that read's real request/byte
+    /// counts on it -- not zero, not absent, the read this branch actually
+    /// issued.
+    ///
+    /// Non-vacuity: with the `fetch_span`/`.instrument(fetch_span.clone())`
+    /// wrapping removed from `plan_segment`'s skip-decidable branch (reverting
+    /// #782, i.e. calling `fetch_plan_sections` bare the way this branch did
+    /// before the fix), no span named `page_fetch` closes during this call at
+    /// all, `closed.len()` comes out `0`, and the `expect("plan_segment's \
+    /// skip-decidable branch opened exactly one page_fetch span")` below panics
+    /// instead of the two field assertions running.
+    ///
+    /// The subscriber is installed with the crate's own proven pattern for a
+    /// test-scoped tracing capture (`crates/ravel-query/src/fetcher.rs`'s
+    /// `phase_spans_never_record_onto_the_ambient_span_when_disabled`): a
+    /// `tracing_subscriber::registry()` layered with the collector and
+    /// installed via `set_default()`, held for the test body's scope. This is
+    /// thread-local, so it isolates cleanly from any `page_fetch` span a
+    /// concurrently-running sibling test opens under its own subscriber (or
+    /// none) -- unlike a process-global default, which every thread's spans
+    /// would route through and which this test's own sibling `plan_segment`
+    /// tests, several of which also open `page_fetch` spans, would pollute.
+    #[tokio::test]
+    async fn skip_decidable_branch_opens_page_fetch_span() {
+        let collector = PageFetchCollector::default();
+        let subscriber = tracing_subscriber::registry().with(collector.clone());
+        let _guard = subscriber.set_default();
+
+        const N: usize = 6;
+        let records: Vec<LogRecord> = (0..N as i64).map(|ts| record(ts, 500)).collect();
+        let bytes = build_object(&records);
+        let total = bytes.len() as u64;
+        let seg = seg_ref(total, &records);
+        let store = store_with_object(bytes).await;
+        let f = fetcher(store);
+        let acc = QueryAccounting::new();
+
+        let query = LogQuery::new(i64::MIN, i64::MAX).with_prune(Predicate::NumRange {
+            field: FieldSel::Attr("code".into()),
+            ty: FieldType::I64,
+            min: Some(0i64 as u64),
+            max: Some(1_000i64 as u64),
+        });
+        let (count, _stats, footer) = f
+            .plan_segment(&seg, TENANT, &query, &acc)
+            .await
+            .expect("plan_segment")
+            .expect("relevant segment");
+        assert_eq!(count, N, "wide NumRange bound excludes no block");
+        assert!(
+            footer.is_some(),
+            "skip-decidable branch forwards the parsed footer like the fast path does"
+        );
+
+        let closed = collector.closed.lock().expect("lock");
+        let span = closed
+            .first()
+            .expect("plan_segment's skip-decidable branch opened exactly one page_fetch span");
+        assert_eq!(
+            closed.len(),
+            1,
+            "exactly one page_fetch span for this one plan_segment call, not zero and not several"
+        );
+        assert_eq!(span.signal.as_deref(), Some("logs"));
+        assert!(
+            span.s3_requests.is_some_and(|n| n > 0),
+            "the span must carry the real request count fetch_plan_sections issued, got {:?}",
+            span.s3_requests
+        );
+        assert!(
+            span.s3_bytes.is_some(),
+            "the span must record s3_bytes (structurally 0 for this branch, but present, not \
+             Empty), got {:?}",
+            span.s3_bytes
         );
     }
 }
