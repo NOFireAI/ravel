@@ -771,16 +771,6 @@ impl SegmentFetcher {
         let key = seg_ref.data_object_key.as_str();
         let cache_key = CacheKey::new(tenant_hash.0, seg_ref.content_hash, start, end - start);
 
-        // Leader-only side channel for the live etag: the closure runs for a
-        // leader miss and never for a follower or a hit (see below), so this
-        // stays `None` in exactly the cases where there is no live etag to
-        // report. `get_or_fetch` returns only the fetched bytes, not the
-        // `GetOutcome` they came from, so the etag has nowhere else to escape
-        // the closure.
-        let leader_etag: std::sync::Arc<std::sync::Mutex<Option<Etag>>> =
-            std::sync::Arc::new(std::sync::Mutex::new(None));
-        let leader_etag_slot = leader_etag.clone();
-
         // One read-through call, then account for it from the returned
         // [`Source`]. A single call avoids the peek-then-`get_or_fetch`
         // double-count on the tiered tier (see [`ReadCache::get_or_fetch`] and
@@ -802,9 +792,6 @@ impl SegmentFetcher {
                         key: key.to_string(),
                     });
                 }
-                *leader_etag_slot
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(got.etag.clone());
                 Ok(got.data)
             })
             .await
@@ -843,9 +830,6 @@ impl SegmentFetcher {
             Source::Cache => {
                 accounting.record_cache_hit();
                 accounting.add_cache_bytes(bytes.len() as u64);
-                // No live read happened this call: nothing to report as this
-                // range's current etag (see `guarded_get`'s doc comment on
-                // why a hit skips the etag check for the same reason).
                 Ok((
                     placeholder_outcome(bytes, seg_ref.object_size),
                     GetCost::default(),
@@ -863,25 +847,7 @@ impl SegmentFetcher {
                     requests: 1,
                     bytes: bytes.len() as u64,
                 };
-                // The leader's live etag, when this call was the leader
-                // (`leader_etag` was set inside the closure above). A
-                // follower rode another caller's in-flight GET without
-                // running the closure itself, so it has no live etag of its
-                // own to report either -- same placeholder as a cache hit.
-                let etag = leader_etag
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take();
-                let outcome = match etag {
-                    Some(etag) => GetOutcome {
-                        data: bytes,
-                        etag,
-                        version: Version(String::new()),
-                        total_size: seg_ref.object_size,
-                    },
-                    None => placeholder_outcome(bytes, seg_ref.object_size),
-                };
-                Ok((outcome, cost))
+                Ok((placeholder_outcome(bytes, seg_ref.object_size), cost))
             }
         }
     }
@@ -890,7 +856,7 @@ impl SegmentFetcher {
         &self,
         seg_ref: &SegmentRef,
         tenant_hash: TenantHash,
-        suffix_etag: Option<&Etag>,
+        suffix_etag: &Etag,
         needed: &[(u64, u64)],
         regions: &mut FetchedRegions,
         accounting: &QueryAccounting,
@@ -927,7 +893,7 @@ impl SegmentFetcher {
                         seg_ref,
                         tenant_hash,
                         GetRange::Range(start, end),
-                        suffix_etag,
+                        Some(suffix_etag),
                         accounting,
                     )
                     .await?;
@@ -966,7 +932,7 @@ impl SegmentFetcher {
         tenant_hash: TenantHash,
         seg_ref: &SegmentRef,
         accounting: &QueryAccounting,
-    ) -> Result<(Footer, u64, Option<Etag>, FetchedRegions), FetchError> {
+    ) -> Result<(Footer, u64, Etag, FetchedRegions), FetchError> {
         // Created and recorded on directly, never through
         // `tracing::Span::current()` (ADR-0044 decision 5): this span is
         // debug-level, so at an INFO production level it is disabled, and
@@ -994,27 +960,12 @@ impl SegmentFetcher {
             // Size-aware first GET: the commit record already
             // carries the exact object size, so a small object is read whole in
             // one request (its footer, catalog, and pages then all come from that
-            // buffer, never a second probe), while a large one reads only the
-            // tail. `whole_object_threshold == 0` disables the whole-object path.
-            //
-            // The tail read is `GetRange::Range(object_size - suffix_len,
-            // object_size)`, not `GetRange::Suffix`, whenever `object_size` is
-            // known (every real `SegmentRef`: the field comes straight off the
-            // commit/compaction record, docs/catalog-and-mvcc.md). A suffix GET
-            // has no absolute start to key a cache entry on, so it always
-            // bypasses the cache (`guarded_get`'s `cacheable_range` match); an
-            // absolute range restates the same bytes as a normal cache-eligible
-            // GET, so the footer of a large, repeatedly-queried segment is
-            // fetched from the store once and served from cache after (#811).
-            // `GetRange::Suffix` survives only for `object_size == 0`, the
-            // degenerate case where no absolute range can be computed at all;
-            // no real segment hits it.
+            // buffer, never a second probe), while a large one keeps the
+            // footer-suffix read that touches only the tail. `whole_object_threshold
+            // == 0` disables the whole-object path.
             let first_range =
                 if seg_ref.object_size != 0 && seg_ref.object_size <= self.whole_object_threshold {
                     GetRange::Full
-                } else if seg_ref.object_size != 0 {
-                    let start = seg_ref.object_size.saturating_sub(self.suffix_len);
-                    GetRange::Range(start, seg_ref.object_size)
                 } else {
                     GetRange::Suffix(self.suffix_len)
                 };
@@ -1026,18 +977,7 @@ impl SegmentFetcher {
             span_requests = span_requests.saturating_add(first_cost.requests);
             span_bytes = span_bytes.saturating_add(first_cost.bytes);
             let total_size = first.total_size;
-            // A cache hit (or a single-flight follower) on this first GET has
-            // no live store etag to anchor on: `cached_get` reports a
-            // placeholder empty etag whenever this call itself made no live
-            // store read (see `guarded_get`'s doc comment on why a hit skips
-            // the etag check, and `cached_get`'s `leader_etag` side channel
-            // for the follower case). A real store etag is never the empty
-            // string, so an empty `first.etag` unambiguously means "no live
-            // read this call" and downstream range GETs for this segment
-            // open skip verification too, the same way this GET itself did
-            // -- there is nothing live to compare a cached or ridden-along
-            // footer against.
-            let suffix_etag = (!first.etag.0.is_empty()).then(|| first.etag.clone());
+            let suffix_etag = first.etag.clone();
             let mut regions = FetchedRegions::default();
             let first_start = total_size.saturating_sub(first.data.len() as u64);
             regions.insert(first_start, first.data.clone());
@@ -1052,7 +992,7 @@ impl SegmentFetcher {
                             seg_ref,
                             tenant_hash,
                             GetRange::Range(offset, offset + len),
-                            suffix_etag.as_ref(),
+                            Some(&suffix_etag),
                             accounting,
                         )
                         .await?;
@@ -1124,7 +1064,7 @@ impl SegmentFetcher {
         tenant_hash: TenantHash,
         footer: &Footer,
         total_size: u64,
-        suffix_etag: Option<&Etag>,
+        suffix_etag: &Etag,
         regions: &mut FetchedRegions,
         matchers: &[LabelMatcher],
         accounting: &QueryAccounting,
@@ -1267,7 +1207,7 @@ impl SegmentFetcher {
         seg_ref: &SegmentRef,
         tenant_hash: TenantHash,
         footer: &Footer,
-        suffix_etag: Option<&Etag>,
+        suffix_etag: &Etag,
         regions: &mut FetchedRegions,
         ranges: &SparseCatalogRanges,
         accounting: &QueryAccounting,
@@ -1326,7 +1266,7 @@ impl SegmentFetcher {
         tenant_hash: TenantHash,
         footer: &Footer,
         scalar: &[&SeriesEntryV4],
-        suffix_etag: Option<&Etag>,
+        suffix_etag: &Etag,
         regions: &mut FetchedRegions,
         accounting: &QueryAccounting,
     ) -> Result<Vec<ravel_segment::PlannedRunRange>, FetchError> {
@@ -1384,7 +1324,7 @@ impl SegmentFetcher {
         tenant_hash: TenantHash,
         footer: &Footer,
         histogram: &[&SeriesEntryV4],
-        suffix_etag: Option<&Etag>,
+        suffix_etag: &Etag,
         regions: &mut FetchedRegions,
         accounting: &QueryAccounting,
     ) -> Result<Vec<ravel_segment::PlannedRunRange>, FetchError> {
@@ -1549,7 +1489,7 @@ impl SegmentFetcher {
                 tenant_hash,
                 &footer,
                 total_size,
-                suffix_etag.as_ref(),
+                &suffix_etag,
                 &mut regions,
                 matchers,
                 accounting,
@@ -1568,7 +1508,7 @@ impl SegmentFetcher {
                 tenant_hash,
                 &footer,
                 &scalar,
-                suffix_etag.as_ref(),
+                &suffix_etag,
                 &mut regions,
                 accounting,
             )
@@ -1738,7 +1678,7 @@ impl SegmentFetcher {
                 tenant_hash,
                 &footer,
                 total_size,
-                suffix_etag.as_ref(),
+                &suffix_etag,
                 &mut regions,
                 matchers,
                 accounting,
@@ -1757,7 +1697,7 @@ impl SegmentFetcher {
                 tenant_hash,
                 &footer,
                 &histogram,
-                suffix_etag.as_ref(),
+                &suffix_etag,
                 &mut regions,
                 accounting,
             )
@@ -1902,7 +1842,7 @@ impl SegmentFetcher {
                 tenant_hash,
                 &footer,
                 total_size,
-                suffix_etag.as_ref(),
+                &suffix_etag,
                 &mut regions,
                 matchers,
                 accounting,
@@ -1925,7 +1865,7 @@ impl SegmentFetcher {
                 tenant_hash,
                 &footer,
                 &scalar,
-                suffix_etag.as_ref(),
+                &suffix_etag,
                 &mut regions,
                 accounting,
             )
@@ -1939,7 +1879,7 @@ impl SegmentFetcher {
                 tenant_hash,
                 &footer,
                 &histogram,
-                suffix_etag.as_ref(),
+                &suffix_etag,
                 &mut regions,
                 accounting,
             )
@@ -2009,7 +1949,7 @@ impl SegmentFetcher {
                 tenant_hash,
                 &footer,
                 total_size,
-                suffix_etag.as_ref(),
+                &suffix_etag,
                 &mut regions,
                 matchers,
                 accounting,
