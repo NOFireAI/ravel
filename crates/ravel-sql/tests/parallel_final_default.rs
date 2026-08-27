@@ -446,11 +446,11 @@ async fn avg_stays_single_partition_under_default() {
 
     assert!(
         !plan.contains("AggregateExec: mode=FinalPartitioned"),
-        "a float avg must never fan its final aggregation out, default or not; got:\n{plan}"
+        "an ungrouped integer avg must never fan its final aggregation out, default or not; got:\n{plan}"
     );
     assert!(
         !plan.contains("RepartitionExec: partitioning=Hash"),
-        "a float avg must never get a hash repartition, default or not; got:\n{plan}"
+        "an ungrouped integer avg must never get a hash repartition, default or not; got:\n{plan}"
     );
     assert!(
         plan.contains("AggregateExec: mode=Final,"),
