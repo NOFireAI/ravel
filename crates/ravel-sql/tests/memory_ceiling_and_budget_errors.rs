@@ -431,13 +431,17 @@ async fn a_high_cardinality_aggregation_is_refused_by_the_aggregate_not_the_scan
 
 /// ADR-0102 decision 3: with the disk manager disabled, a large `ORDER BY` that
 /// overruns the budget through DataFusion's external sort also fails as
-/// `SqlError::ResourcesExhausted` -- but its message originates in
+/// `SqlError::ResourcesExhausted`. Its raw message originates in
 /// `DiskManager::create_tmp_file`
 /// (`"Memory Exhausted while Sorting (DiskManager is disabled)"`), propagated as
-/// `DataFusionError::ResourcesExhausted` and mapped to the same
-/// `SqlError::ResourcesExhausted` variant the aggregation path uses. Same typed
-/// variant, distinct message from the aggregation case (which is the pool's
-/// `try_grow` text) -- confirmed here by matching the disk-manager wording.
+/// `DataFusionError::ResourcesExhausted` -- the same pass-through shape issue
+/// #740 (finding 1) covers for the aggregation/exchange path: it names the
+/// operator that asked to spill, not the consumers that filled the pool, and
+/// carries no byte figures. `execution_error` re-attributes it the same way,
+/// via `SqlError::resources_exhausted_reattributed` keying off
+/// `MSG_SPILL_DISABLED_MARKER` ("DiskManager is disabled") in the raw message,
+/// so the client-visible text below no longer contains that literal DataFusion
+/// wording; it names the pool's own occupancy and limit instead.
 ///
 /// `ORDER BY value` forces a real external sort: the pipeline output is already
 /// ordered by `(series_id, ts)`, so ordering by `ts` alone could be elided,
@@ -445,9 +449,10 @@ async fn a_high_cardinality_aggregation_is_refused_by_the_aggregate_not_the_scan
 ///
 /// Prove-the-test: with the `with_disk_manager_builder(...Disabled)` line
 /// removed, the sorter's spill attempt reaches the default `OsTmpDirectory`
-/// disk manager and the overrun instead surfaces as the pool's
-/// `"query memory pool exhausted: ..."` error (no disk-manager wording), so the
-/// `contains("DiskManager is disabled")` assertion below fails. Verified by
+/// disk manager and the overrun instead surfaces as the pool's own
+/// `"query memory pool exhausted: ..."` `try_grow` refusal, which does not
+/// contain `MSG_SPILL_DISABLED_MARKER` and so is passed through unchanged --
+/// the `contains("spill is disabled")` assertion below fails. Verified by
 /// removing the line and observing that exact message.
 #[tokio::test]
 async fn a_large_order_by_over_budget_is_resources_exhausted() {
@@ -484,14 +489,35 @@ async fn a_large_order_by_over_budget_is_resources_exhausted() {
         matches!(err, SqlError::ResourcesExhausted(_)),
         "ORDER BY over budget must fail typed rather than spill; got {err:?}"
     );
-    // The sort path's message originates from the disabled disk manager, a
-    // different source than the aggregation path's pool `try_grow`; both are the
-    // same typed variant, and the distinct message is expected.
+    // The sort path's raw message originates from the disabled disk manager, a
+    // different source than the aggregation path's pool `try_grow` text; both
+    // are re-attributed to the same client-visible shape by `execution_error`
+    // (issue #740), so both assert the reattributed wording, not DataFusion's
+    // own text.
     let SqlError::ResourcesExhausted(msg) = &err else {
         unreachable!("asserted above");
     };
     assert!(
-        msg.contains("DiskManager is disabled"),
-        "the sort path's error must name the disabled disk manager; got {msg:?}"
+        msg.contains("spill is disabled"),
+        "the sort path's error must be re-attributed as a disabled-spill \
+         refusal, not passed through with DataFusion's own wording; got {msg:?}"
+    );
+    assert!(
+        !msg.contains("DiskManager is disabled") && !msg.contains("Sorting"),
+        "DataFusion's own operator wording must not survive re-attribution; \
+         got {msg:?}"
+    );
+    // Nothing else in this single-partition pipeline holds a reservation on
+    // this pool before the sort's own first (and only) grow attempt, which
+    // already exceeds the whole per-query budget in one call -- so the
+    // pool's occupancy at the moment of refusal is 0, not a partial fill.
+    // Pinned exact per this repo's number-pinning rule; a DataFusion version
+    // that changes the external sorter's batching would change this figure
+    // and this assertion would catch it.
+    assert!(
+        msg.contains("0 of 16777216 bytes reserved"),
+        "the reattributed message must name the pool's exact occupancy and \
+         the query's configured limit (16777216 = max_query_bytes above); \
+         got {msg:?}"
     );
 }

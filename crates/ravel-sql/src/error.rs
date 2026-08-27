@@ -75,6 +75,21 @@ pub const MSG_EXECUTION: &str = "the SQL query failed during execution";
 /// bugs; the caller gets nothing actionable and the server logs everything.
 pub const MSG_INTERNAL: &str = "internal query engine error";
 
+/// Substring DataFusion embeds in the `ResourcesExhausted` a spill-capable
+/// operator raises when the pool refuses its `try_grow` and the disk manager
+/// is disabled (ADR-0102 decision 3): an external sort raises
+/// `"Memory Exhausted while Sorting (DiskManager is disabled)"`, a
+/// `RepartitionExec` output channel `"... while SpillPool (DiskManager is
+/// disabled)"`.
+///
+/// The text names the operator that HOLDS the reservation it could not grow
+/// (the exchange, the sorter), not the consumer that FILLED the pool (the
+/// aggregate hash tables), and carries no byte figures. On its own it
+/// misattributes the exhaustion and tells the caller nothing about how close
+/// to the limit the query was. [`SqlError::resources_exhausted_reattributed`]
+/// rewrites it from the pool's own occupancy at the moment of refusal.
+pub const MSG_SPILL_DISABLED_MARKER: &str = "DiskManager is disabled";
+
 /// The client-visible class of a [`SqlError`]. The HTTP layer maps this to
 /// a status code and an error-type tag; it never inspects the error itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,6 +254,37 @@ pub enum SqlError {
 }
 
 impl SqlError {
+    /// Re-attribute a disabled-disk-manager spill refusal to the pool that
+    /// actually filled, from the pool's `used`/`limit` at the moment of
+    /// refusal (read from `MemoryPool::reserved()` and its configured limit).
+    ///
+    /// When `raw` carries [`MSG_SPILL_DISABLED_MARKER`], DataFusion has named
+    /// the spilling operator (the sort, the `RepartitionExec` exchange) and
+    /// supplied no byte figures. This replaces that message with the query
+    /// pool's occupancy: attribution is by CONSUMER, not by holder -- the
+    /// figures are the whole query pool's `used`/`limit` (what the aggregate
+    /// tables filled), not the spilling exchange's own small reservation, and
+    /// the message says so. When `raw` is not a spill-disabled message it is
+    /// returned unchanged as a plain [`SqlError::ResourcesExhausted`], so a
+    /// caller can route every native `ResourcesExhausted` through this without
+    /// classifying it first.
+    ///
+    /// The rewritten text carries only byte counts and a limit -- no object
+    /// key, no tenant identity -- so it echoes to the client verbatim like the
+    /// other budget errors ([`SqlError::client_message`]).
+    pub fn resources_exhausted_reattributed(raw: &str, used: usize, limit: usize) -> Self {
+        if raw.contains(MSG_SPILL_DISABLED_MARKER) {
+            SqlError::ResourcesExhausted(format!(
+                "the query memory pool is full and spill is disabled: {used} of {limit} bytes \
+                 reserved across the query's operators when a spill was requested (attribution \
+                 is by the consumers that filled the pool, not the operator that requested the \
+                 spill)"
+            ))
+        } else {
+            SqlError::ResourcesExhausted(raw.to_string())
+        }
+    }
+
     /// The client-visible class, for HTTP status selection.
     pub fn class(&self) -> ErrorClass {
         match self {
