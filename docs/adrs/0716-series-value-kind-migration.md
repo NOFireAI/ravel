@@ -342,11 +342,31 @@ Named tests, each with the assertion that fails if the claim is false:
   Histogram totalling exactly 50, no coercion. This pins the storage
   contract #676 builds on.
 - `prop_mixed_kind_compaction_conserves_per_kind_multisets`
-  (ravel-maintain, proptest): arbitrary interleavings of scalar and
-  histogram samples across 2-4 inputs for 1-8 series, a random subset
-  migrated. Property: publish succeeds, per-kind sample multisets are
-  conserved exactly, and no output object carries two catalog entries for
-  one id. Default proptest case count for the crate; the regression seed
+  (ravel-maintain, proptest): scalar and histogram samples across 2-4
+  inputs for 1-8 series, a random subset migrated. Property: publish
+  succeeds, per-kind sample multisets are conserved exactly, and no output
+  object carries two catalog entries for one id.
+
+  The generator is **constrained, not arbitrary**, and both constraints are
+  load-bearing rather than conveniences:
+
+  1. **One value kind per series per input.** A single input segment
+     carrying both kinds for one `series_id` violates the segment
+     homogeneity that ingest enforces within a flush
+     (`ravel-ingest/src/value.rs`), so such a fixture is unreachable in
+     production and would fail the property for a reason unrelated to this
+     decision. Migration is expressed the way it actually happens: kind A
+     in an earlier input, kind B in a later one.
+  2. **Same-kind timestamps are unique within a series.** ADR-0092
+     deduplicates same-kind samples sharing a timestamp, so exact multiset
+     conservation is simply not the correct oracle when the generator can
+     emit duplicates. Either generate distinct timestamps, or apply
+     ADR-0092's deduplication when computing the expected multiset --
+     pick one and say which in the test's doc comment.
+
+  A generator that ignores either constraint produces failures that look
+  like conservation bugs and are not, which is the most expensive kind of
+  false positive in a property test. Default proptest case count for the crate; the regression seed
   file is checked in at the location matching the test's placement
   (`proptest-regressions/` for `src/`, `tests/<name>.proptest-regressions`
   for `tests/`).
