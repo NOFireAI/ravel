@@ -959,6 +959,32 @@ mod tests {
         assert!(matches!(err, DataFusionError::Internal(_)));
     }
 
+    /// The group and partition counts the grouped proptest fans over. Three
+    /// partitions is the smallest count that distinguishes merge order from
+    /// merge pairing; four groups keeps some groups empty in some partitions,
+    /// which is the case that exercises the null partial-sum branch.
+    const GROUPED_PROPTEST_GROUPS: usize = 4;
+    const GROUPED_PROPTEST_PARTITIONS: usize = 3;
+
+    /// Drain a grouped integer accumulator and return each group's result as
+    /// raw bits, so the comparison distinguishes values `==` would not.
+    fn grouped_integer_bits(acc: &mut ExactIntegerAvgGroupsAccumulator) -> Vec<Option<u64>> {
+        let array = acc.evaluate(EmitTo::All).expect("evaluate must not fail");
+        let array = array
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("evaluate must return a Float64Array");
+        (0..array.len())
+            .map(|index| {
+                if array.is_valid(index) {
+                    Some(array.value(index).to_bits())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     fn merge_state_into(acc: &mut ExactIntegerAvgAccumulator, state: &[ScalarValue]) {
         let arrays: Vec<ArrayRef> = state
             .iter()
@@ -1016,5 +1042,105 @@ mod tests {
                 );
             }
         }
+
+        /// The same invariance, on the accumulator a real `GROUP BY` plan
+        /// actually runs. `ExactIntegerAvgGroupsAccumulator` does not share
+        /// `ExactIntegerAvgAccumulator`'s state code: its partial sums round
+        /// trip through a `Decimal128(38, 0)` array rather than staying an
+        /// `i128` in a scalar, and its merge reads them back per group. A
+        /// pack, unpack, or group-alignment defect in that path would change
+        /// the answer with the number of partitions while the ungrouped
+        /// sibling above stayed green.
+        #[test]
+        fn integer_avg_grouped_partition_and_merge_order_never_changes_the_result(
+            rows in prop::collection::vec(
+                (-1_000_000_000_000i64..1_000_000_000_000i64, 0usize..GROUPED_PROPTEST_GROUPS, 0usize..GROUPED_PROPTEST_PARTITIONS),
+                0..96,
+            ),
+        ) {
+            let mut reference = ExactIntegerAvgGroupsAccumulator::new();
+            let values: ArrayRef = Arc::new(Int64Array::from(
+                rows.iter().map(|&(value, _, _)| value).collect::<Vec<_>>(),
+            ));
+            let group_indices: Vec<usize> = rows.iter().map(|&(_, group, _)| group).collect();
+            reference
+                .update_batch(&[values], &group_indices, None, GROUPED_PROPTEST_GROUPS)
+                .expect("update_batch must not fail");
+            let reference_bits = grouped_integer_bits(&mut reference);
+
+            let mut states = Vec::with_capacity(GROUPED_PROPTEST_PARTITIONS);
+            for partition in 0..GROUPED_PROPTEST_PARTITIONS {
+                let mut acc = ExactIntegerAvgGroupsAccumulator::new();
+                let taken: Vec<(i64, usize)> = rows
+                    .iter()
+                    .filter(|&&(_, _, part)| part == partition)
+                    .map(|&(value, group, _)| (value, group))
+                    .collect();
+                let array: ArrayRef = Arc::new(Int64Array::from(
+                    taken.iter().map(|&(value, _)| value).collect::<Vec<_>>(),
+                ));
+                let indices: Vec<usize> = taken.iter().map(|&(_, group)| group).collect();
+                acc.update_batch(&[array], &indices, None, GROUPED_PROPTEST_GROUPS)
+                    .expect("update_batch must not fail");
+                states.push(acc.state(EmitTo::All).expect("state must not fail"));
+            }
+
+            let merge_indices: Vec<usize> = (0..GROUPED_PROPTEST_GROUPS).collect();
+            for order in [[0usize, 1, 2], [2, 1, 0], [1, 0, 2], [0, 2, 1]] {
+                let mut merged = ExactIntegerAvgGroupsAccumulator::new();
+                for idx in order {
+                    merged
+                        .merge_batch(&states[idx], &merge_indices, None, GROUPED_PROPTEST_GROUPS)
+                        .expect("merge_batch must not fail");
+                }
+                prop_assert_eq!(
+                    reference_bits.clone(),
+                    grouped_integer_bits(&mut merged),
+                    "merge order {:?} produced different per-group results than the single-partition fold",
+                    order
+                );
+            }
+        }
+    }
+
+    /// `EmitTo::First` must drain exactly the first `n` groups and leave the
+    /// remainder addressable at their shifted indices. An emit that returned
+    /// the right values but left `sums` and `counts` misaligned would
+    /// silently attribute later rows to the wrong group, which no
+    /// whole-batch test can see.
+    #[test]
+    fn exact_integer_grouped_emit_first_drains_and_shifts() {
+        let mut acc = ExactIntegerAvgGroupsAccumulator::new();
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![10i64, 20, 30, 40, 100, 200]));
+        let group_indices = vec![0usize, 0, 1, 1, 2, 2];
+        acc.update_batch(&[values], &group_indices, None, 3)
+            .expect("update_batch must not fail");
+
+        let emitted = acc
+            .evaluate(EmitTo::First(2))
+            .expect("evaluate must not fail");
+        let emitted = emitted
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("evaluate must return a Float64Array");
+        assert_eq!(
+            emitted.len(),
+            2,
+            "EmitTo::First(2) must emit exactly 2 groups"
+        );
+        assert_eq!(emitted.value(0), 15.0);
+        assert_eq!(emitted.value(1), 35.0);
+
+        let rest = acc.evaluate(EmitTo::All).expect("evaluate must not fail");
+        let rest = rest
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("evaluate must return a Float64Array");
+        assert_eq!(rest.len(), 1, "one group must remain after draining two");
+        assert_eq!(
+            rest.value(0),
+            150.0,
+            "the surviving group's state must shift down, not be re-read at its old index"
+        );
     }
 }
