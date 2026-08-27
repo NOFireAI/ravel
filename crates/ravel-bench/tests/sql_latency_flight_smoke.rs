@@ -342,6 +342,20 @@ async fn flight_lane_measures_every_statement_over_the_wire_without_scan_diagnos
         report.provenance.parallel_final_aggregation_effective, None,
         "a Flight run does not send the setting, so the effective value is unknown"
     );
+    // Same shape for the per-query pool ceiling (issue #615): `--sql-max-query-bytes`
+    // is not a Flight header either, and `ExecutorSettings` is passed only on the
+    // in-process arm, so the server's own ceiling governed. Echoing the local CLI
+    // value as effective would let two Flight tables taken at different
+    // `--sql-max-query-bytes` values look comparable while having run under
+    // identical server ceilings.
+    assert_eq!(
+        report.provenance.sql_max_query_bytes_requested, DEFAULT_MAX_QUERY_BYTES,
+        "the requested field carries this run's CLI value (flight_cfg's default)"
+    );
+    assert_eq!(
+        report.provenance.sql_max_query_bytes_effective, None,
+        "a Flight run does not send the ceiling, so the effective value is unknown"
+    );
     // The dataset stanza is still resolved from the store directly: a Flight
     // client cannot read the catalog.
     assert_eq!(report.dataset.object_count, 3);

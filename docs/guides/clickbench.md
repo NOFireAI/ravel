@@ -289,9 +289,13 @@ cargo run -p ravel-bench --features sql-latency --bin sql_latency_bench -- \
   number for it. Pass a larger byte budget (for example `--sql-max-query-bytes
   1073741824` for 1 GiB) to measure it instead. Omitted, it defaults to
   ravel-sql's compiled-in 256 MiB, leaving the measured budget unchanged. The
-  effective value is recorded in the report's provenance as
-  `sql_max_query_bytes`, so two tables at different per-query budgets are not
-  mistaken for comparable.
+  report's provenance records it twice: `sql_max_query_bytes_requested` is what
+  the run asked for, and `sql_max_query_bytes_effective` is what governed. On
+  the in-process lanes they are the same. Under `--flight` the flag is not sent
+  to the server (it is not a Flight header), so the server's own ceiling
+  governed and `effective` is null: two Flight tables at different
+  `--sql-max-query-bytes` values are NOT comparable on that basis, and the null
+  is what stops them being mistaken for it.
 - `--shards <N>` sets how many shards the resolve scans. Omitted, it reads the
   tenant's durable provisioning record (the one `ravel-cli load` writes) and uses
   that record's shard ceiling, so a tenant loaded with `--shards 4` is measured
@@ -384,7 +388,9 @@ cargo run -p ravel-bench --features sql-latency --bin sql_latency_bench -- \
 
 To capture a CPU flamegraph of the corpus, build with `--features
 sql-latency,profiling` and set `RAVEL_BENCH_PROFILE_SVG` to the output path.
-For a profiled pass, run it with **`--runs 1`**, not `--runs 3`:
+For a profiled pass, run it with **`--runs 1`**, not `--runs 3`: with
+`RAVEL_BENCH_PROFILE_SVG` set, any `--runs` above 1 is REFUSED with an error
+rather than run (issue #616), so this is a rule the binary enforces, not advice.
 
 ```sh
 RAVEL_BENCH_PROFILE_SVG=/tmp/sql_latency.svg \
@@ -395,8 +401,8 @@ cargo run -p ravel-bench --features sql-latency,profiling --bin sql_latency_benc
 ```
 
 The profiler is a signal sampler, and running each statement more than once
-under a live sampler has been observed to segfault the process (issue #616);
-`--runs 1` is stable. This costs nothing for a profile: one execution already
+under a live sampler has been observed to segfault the process (issue #616), so
+the binary refuses that combination outright; `--runs 1` is stable. This costs nothing for a profile: one execution already
 yields a dense flamegraph, and profiled latency numbers are inflated by the
 sampler and not usable anyway. Take latency from a separate unprofiled `--runs
 3` pass, and read the flamegraph for CPU attribution only. See
@@ -466,9 +472,12 @@ Tick every line before putting two reports side by side.
 - Same instance type and the same instance. Issue #680 measured a 1.6x to 2x
   gap between two c6a.4xlarge boxes at identical settings, so a cross-box
   comparison carries the box id or it carries nothing.
-- Same `fetch_concurrency`, `cache_bytes`, `deadline_secs`, and
-  `sql_max_query_bytes`. The first three are in the provenance; the last is the
-  DataFusion pool ceiling the run was given.
+- Same `fetch_concurrency`, `cache_bytes`, `deadline_secs`, and per-query pool
+  ceiling. All four are in the provenance; compare on
+  `sql_max_query_bytes_effective`, not on what was requested. Where that field
+  is null (a `--flight` run), the ceiling that governed is the server's and is
+  not recorded here, so the two runs are comparable on it only if you know both
+  servers were configured the same.
 - Same allocator. An `LD_PRELOAD` of tcmalloc against the default glibc changes
   peak RSS by about 2x, and the allocator is not in the provenance, so it goes
   in the report's caption.

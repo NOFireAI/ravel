@@ -193,14 +193,21 @@ pub struct Provenance {
     /// full-scan statement is latency-bound and moves nearly linearly with it.
     #[serde(default = "default_fetch_concurrency")]
     pub fetch_concurrency: usize,
-    /// The per-query DataFusion memory-pool ceiling for the run
-    /// (`ravel-server --sql-max-query-bytes`, ADR-0088). A statement that failed
-    /// with `query memory pool exhausted` was refused by this, not by
-    /// `tenant_max_bytes`. Recorded so a report states the per-query budget its
-    /// statements ran under; a report written before this field existed
-    /// deserializes to [`ravel_sql::DEFAULT_MAX_QUERY_BYTES`].
+    /// The per-query DataFusion memory-pool ceiling this run ASKED for
+    /// (`--sql-max-query-bytes`, ADR-0088). A report written before this field
+    /// existed deserializes to [`ravel_sql::DEFAULT_MAX_QUERY_BYTES`].
     #[serde(default = "default_max_query_bytes")]
-    pub sql_max_query_bytes: usize,
+    pub sql_max_query_bytes_requested: usize,
+    /// The ceiling that actually governed execution, or `None` when this
+    /// process cannot know it. The Flight lane does not send the setting to the
+    /// server (it is not a Flight header), so what governed there is the
+    /// server's own config: a statement that failed with `query memory pool
+    /// exhausted` on that lane was refused by a ceiling this report cannot
+    /// name. Recording the requested value as effective would let two Flight
+    /// tables taken at different `--sql-max-query-bytes` values look
+    /// comparable while having run under identical server ceilings.
+    #[serde(default)]
+    pub sql_max_query_bytes_effective: Option<usize>,
     /// The tenant accountant's ceiling for the run. A statement that failed
     /// with `tenant memory budget exhausted` was refused by this, not by
     /// `max_query_bytes`.
@@ -865,13 +872,11 @@ pub async fn measure_corpus(
     // through this one function), so a query-side profile always reflects the
     // full corpus rather than one statement in isolation.
     //
-    // Refuse a profiled multi-run pass before arming the sampler (issue #616):
-    // one guard already brackets the whole region, yet the pprof signal sampler
-    // still segfaults probabilistically the longer it stays armed, so more runs
-    // crash rather than measure. Take the flamegraph from `--runs 1` and the
-    // latencies from a separate unprofiled pass.
-    crate::profiling::runs_supported_with_profiling(crate::profiling::profile_requested(), runs)
-        .map_err(Error::from)?;
+    // The profiled multi-run refusal (issue #616) lives in the binary, not here:
+    // deciding it from process-global env inside library code would make an
+    // exported RAVEL_BENCH_PROFILE_SVG fail unrelated tests that legitimately
+    // pass runs > 1, and it would fire only after the resolve and LIST fan-out
+    // this function is called with.
     let profile = crate::profiling::ProfileSession::from_env("sql_latency_bench");
 
     'entries: for entry in entries {
@@ -1307,7 +1312,10 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
             cache_bytes: cfg.cache_bytes,
             deadline_secs: cfg.deadline.as_secs(),
             fetch_concurrency: cfg.fetch_concurrency.max(1),
-            sql_max_query_bytes: cfg.max_query_bytes,
+            sql_max_query_bytes_requested: cfg.max_query_bytes,
+            // In-process lane: the requested ceiling reaches the executor's
+            // `SqlConfig`, so it is also the effective one.
+            sql_max_query_bytes_effective: Some(cfg.max_query_bytes),
             tenant_max_bytes: cfg.tenant_max_bytes.max(1),
             sql_max_segments: cfg.max_segments,
             parallel_final_aggregation_requested: cfg.parallel_final_aggregation,
@@ -1419,7 +1427,14 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
             cache_bytes: cfg.cache_bytes,
             deadline_secs: cfg.deadline.as_secs(),
             fetch_concurrency: cfg.fetch_concurrency.max(1),
-            sql_max_query_bytes: cfg.max_query_bytes,
+            sql_max_query_bytes_requested: cfg.max_query_bytes,
+            // `settings` is passed only on the in-process arm of the match
+            // above, so on the Flight lane this ceiling never left the process
+            // and the server's own config governed instead.
+            sql_max_query_bytes_effective: match &cfg.flight {
+                Some(_) => None,
+                None => Some(cfg.max_query_bytes),
+            },
             tenant_max_bytes: cfg.tenant_max_bytes.max(1),
             sql_max_segments: cfg.max_segments,
             parallel_final_aggregation_requested: cfg.parallel_final_aggregation,
@@ -2735,13 +2750,14 @@ mod tests {
         assert_eq!(executor.config().max_query_bytes, DEFAULT_MAX_QUERY_BYTES);
     }
 
-    /// The effective per-query pool ceiling is recorded in the run's provenance
-    /// block (issue #615): a run with a raised `--sql-max-query-bytes` records
-    /// exactly that value, and an unset flag records the compiled-in default.
-    /// Before the field existed the block carried no per-query budget at all, so
-    /// this assertion has nothing to read and fails to compile against the old
-    /// provenance; with the field present but unpopulated it would read the
-    /// serde default and the raised-value arm goes red.
+    /// The per-query pool ceiling is recorded in the run's provenance block
+    /// (issue #615): a run with a raised `--sql-max-query-bytes` records exactly
+    /// that value, and an unset flag records the compiled-in default. The
+    /// in-process lane applies what it asks for, so `effective` is `Some` of the
+    /// same figure. Before the field existed the block carried no per-query
+    /// budget at all, so this assertion has nothing to read and fails to compile
+    /// against the old provenance; with the field present but unpopulated it
+    /// would read the serde default and the raised-value arm goes red.
     #[tokio::test]
     async fn provenance_records_effective_max_query_bytes() {
         let store = empty_store();
@@ -2754,8 +2770,13 @@ mod tests {
         cfg.max_query_bytes = custom;
         let report = run_tenant(&cfg).await.expect("tenant lane runs");
         assert_eq!(
-            report.provenance.sql_max_query_bytes, custom,
+            report.provenance.sql_max_query_bytes_requested, custom,
             "the raised per-query pool ceiling is recorded in provenance"
+        );
+        assert_eq!(
+            report.provenance.sql_max_query_bytes_effective,
+            Some(custom),
+            "the in-process lane applies the requested ceiling, so it is effective"
         );
 
         // Unset flag (the config default): the block records the compiled-in
@@ -2763,8 +2784,49 @@ mod tests {
         let cfg = tenant_cfg(&store, "maxquerybytes-tenant", None, 0);
         let report = run_tenant(&cfg).await.expect("tenant lane runs");
         assert_eq!(
-            report.provenance.sql_max_query_bytes, DEFAULT_MAX_QUERY_BYTES,
+            report.provenance.sql_max_query_bytes_requested, DEFAULT_MAX_QUERY_BYTES,
             "an unset flag records the compiled-in per-query budget"
+        );
+        assert_eq!(
+            report.provenance.sql_max_query_bytes_effective,
+            Some(DEFAULT_MAX_QUERY_BYTES),
+            "an unset flag is still effective on the in-process lane"
+        );
+    }
+
+    /// The recorded ceiling must be the one that GOVERNED, not the one that was
+    /// asked for. Echoing `cfg.max_query_bytes` into provenance passes an
+    /// equality check even when the value never reaches the executor, so this
+    /// pins the wiring instead: a ceiling small enough to refuse the statement
+    /// must actually refuse it. Replace `max_query_bytes: cfg.max_query_bytes`
+    /// in the `ExecutorSettings` built by `run_tenant` with the compiled-in
+    /// default and this goes red while the provenance assertions above stay
+    /// green, which is exactly the gap it exists to close.
+    #[tokio::test]
+    async fn a_tiny_max_query_bytes_actually_refuses_the_statement() {
+        let store = empty_store();
+        provisioned_tenant(&store, "maxquerybytes-wired").await;
+
+        let mut cfg = tenant_cfg(&store, "maxquerybytes-wired", None, 0);
+        cfg.entries = vec![entry(
+            "agg",
+            "SELECT body, count(*) FROM logs GROUP BY body",
+        )];
+        cfg.continue_on_error = true;
+        cfg.max_query_bytes = 1024;
+        let report = run_tenant(&cfg).await.expect("tenant lane runs");
+        assert_eq!(
+            report.provenance.sql_max_query_bytes_effective,
+            Some(1024),
+            "the tiny ceiling is recorded as effective on the in-process lane"
+        );
+        assert!(
+            !report.failed.is_empty(),
+            "a 1 KiB per-query pool must refuse the statement; if the ceiling never \
+             reached the executor the statement succeeds and `failed` is empty. \
+             failed={:?} entries={}",
+            report.failed,
+            report.entries.len()
         );
     }
 }
