@@ -31,6 +31,7 @@ use crate::fetcher::{
     FetchError, FetchStats, FetchedHistogramSeries, FetchedSeriesSoa, ReadCache, SamplePriority,
     SegmentFetcher,
 };
+use crate::phase_accounting::{PhaseAccounting, PhaseAccountingSnapshot};
 use crate::segment_admission;
 
 /// Which evaluation shape a prefetch is being computed for: an instant
@@ -71,8 +72,21 @@ pub struct QueryStats {
     /// sample's typed-output footprint regardless of encoding.
     pub page_stats: FetchStats,
     /// Actual per-query store/decode counters (ADR-0044 decision 1),
-    /// recorded at the fetcher's funnels.
+    /// recorded at the fetcher's funnels. Computed as
+    /// `phase_accounting.pooled()`; kept alongside it unchanged so every
+    /// existing reader of the pooled total sees the same number as before
+    /// issue #796 split it by phase.
     pub accounting: QueryAccountingSnapshot,
+    /// Per-phase split (issue #796) of the same GETs and bytes `accounting`
+    /// pools: resolve (catalog snapshot resolve), plan (footer/skip-index
+    /// probing), probe (segment catalog fetch), scan (block/page reads).
+    /// See `crate::phase_accounting` for phase boundaries and what each
+    /// byte counter counts. Federation and distributed-worker fan-out
+    /// (`federate_scalar`, `federate_discovery`, `distrib::fetch`) are
+    /// opaque remote fetches whose own internal phase breakdown is not
+    /// visible here; their GETs land on the `scan` phase by convention
+    /// (see the call sites in `prefetch`/`resolve_series_for_labels`).
+    pub phase_accounting: PhaseAccountingSnapshot,
     /// Upper-envelope cost estimate computed after snapshot resolution and
     /// before any page fetch (ADR-0044 decision 3).
     pub estimate: CostEstimate,
@@ -95,14 +109,15 @@ impl QueryStats {
         segments_fetched: u64,
         segments_pruned: u64,
         page_stats: FetchStats,
-        accounting: QueryAccountingSnapshot,
+        phase_accounting: PhaseAccountingSnapshot,
         estimate: CostEstimate,
     ) -> Self {
         QueryStats {
             segments_fetched,
             segments_pruned,
             page_stats,
-            accounting,
+            accounting: phase_accounting.pooled(),
+            phase_accounting,
             estimate,
             partial: false,
             warnings: Vec::new(),
@@ -120,6 +135,7 @@ impl Default for QueryStats {
             segments_pruned: 0,
             page_stats: FetchStats::default(),
             accounting: QueryAccountingSnapshot::default(),
+            phase_accounting: PhaseAccountingSnapshot::default(),
             estimate: CostEstimate::new(0, 0, 0, 0, 0),
             partial: false,
             warnings: Vec::new(),
@@ -688,7 +704,7 @@ impl QueryEngine {
         // pushdown), so it ignores the resolve's generation history.
         let attempt = |snapshot: Snapshot,
                        _generations: Vec<ShardGeneration>,
-                       accounting: QueryAccounting| async move {
+                       accounting: PhaseAccounting| async move {
             // The bytes-scanned budget (ADR-0061 decision 1) is enforced
             // inside `fetch_all_series`, once per completed segment fetch, so a
             // labels/series query that matches zero series still evaluates the
@@ -713,6 +729,14 @@ impl QueryEngine {
             // the same reason `prefetch` runs `federate_scalar` sequentially:
             // an `async_trait` remote fetch nested inside a fan-out combinator
             // makes the whole query future fail axum's `Handler` `Send` bound.
+            //
+            // `federate_discovery` takes the whole `PhaseAccounting` (not
+            // just `.scan()`): it folds the remote's spend into the `scan`
+            // sub-handle (issue #796 finding: federation is an opaque remote
+            // fetch, not phase-splittable without a remote-side accounting
+            // change), but its budget re-check needs `pooled()` to see the
+            // local resolve/plan/probe spend `fetch_all_series` already
+            // recorded too.
             let (fed_series, fed_warnings, fed_partial) = self
                 .federate_discovery(tenant_hash, matchers.to_vec(), window, &accounting)
                 .await?;
@@ -783,7 +807,7 @@ impl QueryEngine {
         tenant_hash: TenantHash,
         matchers: Vec<LabelMatcher>,
         window: TimeRange,
-        accounting: &QueryAccounting,
+        accounting: &PhaseAccounting,
     ) -> Result<(Vec<(SeriesId, LabelSet)>, Vec<String>, bool), QueryError> {
         let mut series: Vec<(SeriesId, LabelSet)> = Vec::new();
         let Some(federation) = &self.federation else {
@@ -795,7 +819,8 @@ impl QueryEngine {
         // structurally preventing this cluster's tokens from leaking). The
         // operator credential is baked into the fetcher, so no client credential
         // is threaded here and the remote's tenant identity comes from its own
-        // auth, never the wire.
+        // auth, never the wire. Remote spend is charged to `scan` (issue #796
+        // finding, same treatment as `federate_scalar`).
         let outcome = federation
             .fetch(
                 tenant_hash,
@@ -805,15 +830,17 @@ impl QueryEngine {
                 window.start_ns,
                 window.end_ns,
                 Vec::new(),
-                accounting.clone(),
+                accounting.scan().clone(),
                 self.config,
             )
             .await?;
         // Re-enforce the coordinator's bytes-scanned budget over the combined
         // local+remote spend now folded into `accounting`, identical to the
-        // query path. A budget trip is never masked by skip_unavailable.
+        // query path. `pooled()` (not just `.scan()`) so the local
+        // fetch_all_series spend recorded on resolve/plan/probe is included.
+        // A budget trip is never masked by skip_unavailable.
         if let Some(err) = bytes_scanned_exceeded(
-            accounting.snapshot().total_s3_bytes(),
+            accounting.snapshot().pooled().total_s3_bytes(),
             self.config.max_bytes_scanned,
         ) {
             return Err(err);
@@ -821,7 +848,7 @@ impl QueryEngine {
         // Re-enforce the coordinator's request budget the same way (ADR-0073
         // decision 3): a budget trip is never masked by skip_unavailable.
         if let Some(err) = segment_admission::request_budget_exceeded(
-            accounting.snapshot().total_s3_requests(),
+            accounting.snapshot().pooled().total_s3_requests(),
             self.config.max_s3_requests,
         ) {
             return Err(err);
@@ -902,7 +929,7 @@ impl QueryEngine {
         let windows_ref = &windows;
         let attempt = |snapshot: Snapshot,
                        generations: Vec<ShardGeneration>,
-                       accounting: QueryAccounting| async move {
+                       accounting: PhaseAccounting| async move {
             // Owned clones, not borrowed slice items: a closure capturing a
             // reference into `plans` through this combinator chain makes
             // rustc infer a fixed (non-higher-ranked) lifetime for the
@@ -1098,6 +1125,11 @@ impl QueryEngine {
                 .zip(windows_ref.iter())
                 .map(|(plan, w)| (plan.matchers.clone(), w.start_ns, w.end_ns))
                 .collect();
+            // `federate_scalar` takes the whole `PhaseAccounting` (not just
+            // `.scan()`): it folds the remote's spend into the `scan`
+            // sub-handle (issue #796 finding: an opaque remote fetch has no
+            // phase breakdown of its own), but its budget re-check needs
+            // `pooled()` to see the local resolve/plan/probe spend too.
             let (fed_runs, fed_hist_runs, fed_stats, fed_warnings, fed_partial) = self
                 .federate_scalar(tenant_hash, fed_plans, &accounting)
                 .await?;
@@ -1212,7 +1244,7 @@ impl QueryEngine {
         mut attempt: F,
     ) -> Result<(T, QueryStats), QueryError>
     where
-        F: FnMut(Snapshot, Vec<ShardGeneration>, QueryAccounting) -> Fut,
+        F: FnMut(Snapshot, Vec<ShardGeneration>, PhaseAccounting) -> Fut,
         Fut: std::future::Future<Output = Result<(T, FetchStats), QueryError>>,
     {
         // The catalog term (ADR-0044 decision 3) is the same for both
@@ -1226,7 +1258,7 @@ impl QueryEngine {
         // retried attempt re-resolves and re-fetches from scratch, so the
         // discarded first attempt's in-flight counts must not bleed into the
         // attempt that actually produced the result.
-        let first_accounting = QueryAccounting::new();
+        let first_accounting = PhaseAccounting::new();
         let (first, first_generations) = self
             .resolve_bounded(
                 tenant_hash,
@@ -1234,7 +1266,7 @@ impl QueryEngine {
                 min_tokens,
                 now_ns,
                 name_filter,
-                &first_accounting,
+                first_accounting.resolve(),
             )
             .await?;
         let first_estimate = estimate_cost(&first, fetch_multiplier, catalog_requests);
@@ -1245,7 +1277,7 @@ impl QueryEngine {
                 source: StoreError::NotFound,
                 ..
             })) => {
-                let second_accounting = QueryAccounting::new();
+                let second_accounting = PhaseAccounting::new();
                 let (second, second_generations) = self
                     .resolve_bounded(
                         tenant_hash,
@@ -1253,7 +1285,7 @@ impl QueryEngine {
                         min_tokens,
                         now_ns,
                         name_filter,
-                        &second_accounting,
+                        second_accounting.resolve(),
                     )
                     .await?;
                 let second_estimate = estimate_cost(&second, fetch_multiplier, catalog_requests);
@@ -1344,7 +1376,7 @@ impl QueryEngine {
         tenant_hash: TenantHash,
         snapshot: &Snapshot,
         matchers: &[LabelMatcher],
-        accounting: &QueryAccounting,
+        accounting: &PhaseAccounting,
         max_bytes_scanned: ByteLimit,
         max_s3_requests: RequestLimit,
     ) -> Result<
@@ -1364,7 +1396,7 @@ impl QueryEngine {
                 let accounting = accounting.clone();
                 async move {
                     fetcher
-                        .fetch_soa_and_histograms_accounted(
+                        .fetch_soa_and_histograms_phase_accounted(
                             tenant_hash,
                             &seg_ref,
                             matchers.as_slice(),
@@ -1390,13 +1422,14 @@ impl QueryEngine {
             histogram_out.push(histograms);
             page_stats.raw_f64_pages += stats.raw_f64_pages;
             page_stats.raw_f64_bytes += stats.raw_f64_bytes;
-            if let Some(err) =
-                bytes_scanned_exceeded(accounting.snapshot().total_s3_bytes(), max_bytes_scanned)
-            {
+            if let Some(err) = bytes_scanned_exceeded(
+                accounting.snapshot().pooled().total_s3_bytes(),
+                max_bytes_scanned,
+            ) {
                 return Err(err);
             }
             if let Some(err) = segment_admission::request_budget_exceeded(
-                accounting.snapshot().total_s3_requests(),
+                accounting.snapshot().pooled().total_s3_requests(),
                 max_s3_requests,
             ) {
                 return Err(err);
@@ -1438,7 +1471,7 @@ impl QueryEngine {
         tenant_hash: TenantHash,
         snapshot: &Snapshot,
         matchers: &[LabelMatcher],
-        accounting: &QueryAccounting,
+        accounting: &PhaseAccounting,
         max_bytes_scanned: ByteLimit,
         max_s3_requests: RequestLimit,
         deadline_unix_ns: i64,
@@ -1468,6 +1501,15 @@ impl QueryEngine {
             let cost = estimate_cost(snapshot, 1, 0);
             if crate::distrib::partition::should_distribute(distributed.thresholds(), &cost) {
                 let erasure = snapshot_erasure_predicates(snapshot);
+                // `distributed.fetch` takes a single pooled `QueryAccounting`
+                // handle: a worker's per-slice spend crosses the
+                // coordinator/worker protobuf wire as one pooled
+                // `QueryAccountingSnapshot` (`distrib/client.rs`'s
+                // `SliceResponse.accounting`), predating issue #796 and
+                // requiring a wire-format version bump to phase-split -- out
+                // of this ticket's scope. Charged to `scan` rather than left
+                // unaccounted (issue #796 finding, same treatment as
+                // federation above).
                 if let Some((triple, partials)) = distributed
                     .fetch(
                         tenant_hash,
@@ -1475,7 +1517,7 @@ impl QueryEngine {
                         snapshot,
                         matchers,
                         &erasure,
-                        accounting,
+                        accounting.scan(),
                         &self.config,
                         deadline_unix_ns,
                         partial_aggregate,
@@ -1491,13 +1533,13 @@ impl QueryEngine {
                     // under-reports: it re-evaluates the same budget over the
                     // fully-folded accounting the distributed fetch returned.
                     if let Some(err) = bytes_scanned_exceeded(
-                        accounting.snapshot().total_s3_bytes(),
+                        accounting.snapshot().pooled().total_s3_bytes(),
                         max_bytes_scanned,
                     ) {
                         return Err(err);
                     }
                     if let Some(err) = segment_admission::request_budget_exceeded(
-                        accounting.snapshot().total_s3_requests(),
+                        accounting.snapshot().pooled().total_s3_requests(),
                         max_s3_requests,
                     ) {
                         return Err(err);
@@ -1559,7 +1601,7 @@ impl QueryEngine {
         &self,
         tenant_hash: TenantHash,
         plan_matchers_windows: Vec<(Vec<LabelMatcher>, i64, i64)>,
-        accounting: &QueryAccounting,
+        accounting: &PhaseAccounting,
     ) -> Result<
         (
             Vec<Vec<FetchedSeriesSoa>>,
@@ -1585,7 +1627,9 @@ impl QueryEngine {
             // leaking this cluster's tokens). The operator credential is baked
             // into the fetcher, so no client credential is threaded here.
             // Owned args (accounting is an `Arc` clone that folds into the same
-            // handle) keep the fan-out future higher-ranked `Send`.
+            // handle) keep the fan-out future higher-ranked `Send`. Remote
+            // spend is charged to `scan` (issue #796 finding: opaque remote
+            // fetch, no phase breakdown of its own).
             let outcome = federation
                 .fetch(
                     tenant_hash,
@@ -1595,22 +1639,27 @@ impl QueryEngine {
                     start_ns,
                     end_ns,
                     Vec::new(),
-                    accounting.clone(),
+                    accounting.scan().clone(),
                     self.config,
                 )
                 .await?;
             // Re-enforce the coordinator's bytes-scanned budget over the
             // combined local+remote spend now folded into `accounting`, so a
-            // tight cap trips typed on the union of both clusters' frames. A
-            // budget trip is never masked by skip_unavailable.
+            // tight cap trips typed on the union of both clusters' frames AND
+            // the local resolve/plan/probe/scan spend already recorded on the
+            // other phase handles this query attempt shares -- `pooled()` is
+            // required here, not just the `scan` sub-handle the remote spend
+            // landed on, or a local-heavy resolve/plan/probe cost would be
+            // invisible to this check. A budget trip is never masked by
+            // skip_unavailable.
             if let Some(err) = bytes_scanned_exceeded(
-                accounting.snapshot().total_s3_bytes(),
+                accounting.snapshot().pooled().total_s3_bytes(),
                 self.config.max_bytes_scanned,
             ) {
                 return Err(err);
             }
             if let Some(err) = segment_admission::request_budget_exceeded(
-                accounting.snapshot().total_s3_requests(),
+                accounting.snapshot().pooled().total_s3_requests(),
                 self.config.max_s3_requests,
             ) {
                 return Err(err);
@@ -1642,7 +1691,7 @@ impl QueryEngine {
         tenant_hash: TenantHash,
         snapshot: &Snapshot,
         matchers: &[LabelMatcher],
-        accounting: &QueryAccounting,
+        accounting: &PhaseAccounting,
         max_bytes_scanned: ByteLimit,
         max_s3_requests: RequestLimit,
     ) -> Result<Vec<Vec<ravel_segment::SeriesEntry>>, QueryError> {
@@ -1655,7 +1704,7 @@ impl QueryEngine {
                 let accounting = accounting.clone();
                 async move {
                     fetcher
-                        .fetch_series_accounted(
+                        .fetch_series_phase_accounted(
                             tenant_hash,
                             &seg_ref,
                             matchers.as_slice(),
@@ -1675,13 +1724,14 @@ impl QueryEngine {
         // in-flight fetches.
         while let Some(r) = stream.next().await {
             out.push(r?);
-            if let Some(err) =
-                bytes_scanned_exceeded(accounting.snapshot().total_s3_bytes(), max_bytes_scanned)
-            {
+            if let Some(err) = bytes_scanned_exceeded(
+                accounting.snapshot().pooled().total_s3_bytes(),
+                max_bytes_scanned,
+            ) {
                 return Err(err);
             }
             if let Some(err) = segment_admission::request_budget_exceeded(
-                accounting.snapshot().total_s3_requests(),
+                accounting.snapshot().pooled().total_s3_requests(),
                 max_s3_requests,
             ) {
                 return Err(err);
@@ -5019,6 +5069,7 @@ mod prefetch_tests {
         HistogramCounts, HistogramSample, HistogramSpan, HistogramValue, IngestBounds, ResetHint,
         SegmentIdentity, SegmentWriter, SeriesInput, SeriesInputV3, SeriesValues, WrittenSegment,
     };
+    use ravel_types::accounting::AccountedOp;
     use ravel_types::{Label, TenantId};
     use uuid::Uuid;
 
@@ -6524,6 +6575,186 @@ mod prefetch_tests {
             "a shared-matcher query scans exactly the real single-fetch bytes, so it must \
              not trip a budget set at that exact real cost: {:?}",
             result.err()
+        );
+    }
+
+    /// A segment big enough (above [`crate::fetcher::DEFAULT_WHOLE_OBJECT_THRESHOLD`])
+    /// that `open_segment` takes the footer-suffix probe path instead of
+    /// folding the whole object into one read: this is the shape where
+    /// `plan`, `probe`, and `scan` are three genuinely distinct GETs rather
+    /// than the below-threshold case where `probe`/`scan` reuse `plan`'s
+    /// already-resident bytes. Values are bit-scrambled (not sequential) so
+    /// ALP/delta encoding cannot shrink the object back under threshold.
+    async fn publish_wide_metric_segment(
+        store: &MemoryStore,
+        tenant_hash: TenantHash,
+        writer_seq: u64,
+        metric: &str,
+        series_count: u64,
+        samples_per_series: u64,
+    ) {
+        let hour_bucket = u32::try_from(BASE_NS / (3_600 * NS_PER_SEC)).expect("hour bucket");
+        let series: Vec<(&str, Vec<Sample>)> = (0..series_count)
+            .map(|i| {
+                let id: &'static str = Box::leak(format!("s{i}").into_boxed_str());
+                let samples: Vec<Sample> = (0..samples_per_series)
+                    .map(|j| {
+                        let scramble = i
+                            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                            .wrapping_add(j.wrapping_mul(0xBF58_476D_1CE4_E5B9));
+                        Sample {
+                            ts_ns: BASE_NS - NS_PER_MIN + j as i64,
+                            value: f64::from_bits(
+                                0x3FF0_0000_0000_0000 | (scramble & 0x000F_FFFF_FFFF_FFFF),
+                            ),
+                        }
+                    })
+                    .collect();
+                (id, samples)
+            })
+            .collect();
+        publish_metric_segment_multi(
+            store,
+            tenant_hash,
+            writer_seq,
+            metric,
+            series,
+            hour_bucket,
+            BASE_NS,
+        )
+        .await;
+    }
+
+    /// Issue #796, shape 1 (below [`crate::fetcher::DEFAULT_WHOLE_OBJECT_THRESHOLD`]):
+    /// one hot commit record, one small segment. `open_segment` folds the
+    /// entire object into its one `plan`-phase GET, so `decode_selected`
+    /// (`probe`) and the page fetch (`scan`) that follow both run entirely
+    /// against bytes already resident in the fetch cache -- zero additional
+    /// GETs for either. This is a legitimate, exact shape in its own right
+    /// (not every phase issues a request on every query), and it is the
+    /// shape that exercises summing phases where two of the four are
+    /// all-zero.
+    ///
+    /// Every number below was captured from a real run against
+    /// [`MemoryStore`], not assumed: this is the exact cost of resolving one
+    /// hot commit record and opening one below-threshold segment on this
+    /// store implementation, pinned so a regression in either the catalog's
+    /// resolve path or `open_segment`'s threshold check is caught here
+    /// rather than only downstream in #835-style diagnosis.
+    #[tokio::test]
+    async fn phase_split_below_threshold_segment_pins_exact_per_phase_figures() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        publish_metric(
+            &store,
+            tenant_hash,
+            1,
+            "metric_a",
+            BASE_NS - NS_PER_MIN,
+            1.0,
+        )
+        .await;
+
+        let eng = engine(Arc::clone(&store));
+        let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
+        let plan = vec![window_plan("metric_a")];
+        let (_source, stats) = eng
+            .prefetch(tenant_hash, &plan, &eval_window, &[], BASE_NS)
+            .await
+            .expect("prefetch");
+        let pa = &stats.phase_accounting;
+
+        // resolve: one hot commit record costs exactly 2 GETs + 2 LISTs on
+        // `MemoryStore` (`Catalog::resolve_pruned_with_generations`, out of
+        // this crate's scope) -- not the naive 1:1 a single record might
+        // suggest.
+        assert_eq!(pa.resolve.s3_requests(AccountedOp::Get), 2);
+        assert_eq!(pa.resolve.s3_requests(AccountedOp::List), 2);
+        assert_eq!(pa.resolve.s3_bytes(AccountedOp::Get), 288);
+
+        // plan: exactly one whole-object GET (below threshold), one segment
+        // opened.
+        assert_eq!(pa.plan.s3_requests(AccountedOp::Get), 1);
+        assert_eq!(pa.plan.s3_bytes(AccountedOp::Get), 316);
+        assert_eq!(pa.plan.segments_opened, 1);
+
+        // probe and scan: zero further GETs, entirely served from `plan`'s
+        // resident bytes.
+        assert_eq!(pa.probe.s3_requests(AccountedOp::Get), 0);
+        assert_eq!(pa.probe.series_matched, 1);
+        assert_eq!(pa.scan.s3_requests(AccountedOp::Get), 0);
+        assert_eq!(pa.scan.decompressed_bytes, 16);
+
+        // Sum of phases equals the pooled figure exactly, for requests and
+        // bytes, including phases whose counters are all zero.
+        let pooled = pa.pooled();
+        assert_eq!(pooled.total_s3_requests(), 5, "3 GETs + 2 LISTs");
+        assert_eq!(pooled.total_s3_bytes(), 604);
+        assert_eq!(
+            pooled, stats.accounting,
+            "phase_accounting.pooled() must equal the existing pooled QueryStats.accounting field exactly"
+        );
+    }
+
+    /// Issue #796, shape 2 (above [`crate::fetcher::DEFAULT_WHOLE_OBJECT_THRESHOLD`]):
+    /// one hot commit record, one wide segment (150 series x 3000 samples,
+    /// bit-scrambled so it cannot compress back under threshold). Here
+    /// `plan`, `probe`, and `scan` are three genuinely distinct real GETs --
+    /// the footer-suffix probe, the segment catalog fetch, and the page data
+    /// read -- so this is the "phases are NOT all equal" shape the resolve
+    /// phase's cost does not scale with (a query against a bigger segment
+    /// still resolves the same one hot commit record) while plan/probe/scan
+    /// do. `scan`'s single GET matches the object count exactly (one
+    /// segment, one scan-phase GET), directly exercising the #835 scenario
+    /// this split exists to diagnose (attributing per-object scan cost
+    /// distinctly from resolve/plan/probe cost).
+    #[tokio::test]
+    async fn phase_split_above_threshold_segment_has_unequal_phases_and_pins_exact_figures() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        publish_wide_metric_segment(&store, tenant_hash, 1, "metric_a", 150, 3000).await;
+
+        let eng = engine(Arc::clone(&store));
+        let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
+        let plan = vec![window_plan("metric_a")];
+        let (_source, stats) = eng
+            .prefetch(tenant_hash, &plan, &eval_window, &[], BASE_NS)
+            .await
+            .expect("prefetch");
+        let pa = &stats.phase_accounting;
+
+        assert_eq!(pa.resolve.s3_requests(AccountedOp::Get), 2);
+        assert_eq!(pa.resolve.s3_requests(AccountedOp::List), 2);
+        assert_eq!(pa.resolve.s3_bytes(AccountedOp::Get), 293);
+
+        assert_eq!(pa.plan.s3_requests(AccountedOp::Get), 1);
+        assert_eq!(pa.plan.s3_bytes(AccountedOp::Get), 65536);
+        assert_eq!(pa.plan.segments_opened, 1);
+
+        assert_eq!(pa.probe.s3_requests(AccountedOp::Get), 1);
+        assert_eq!(pa.probe.s3_bytes(AccountedOp::Get), 3111);
+        assert_eq!(pa.probe.series_matched, 150);
+
+        // The scenario #796 exists for: this segment is one object, and the
+        // scan phase issues exactly one GET for it. On a tenant with N
+        // objects a predicate-free full scan issues exactly N scan-phase
+        // GETs -- this is that claim pinned at N=1.
+        assert_eq!(pa.scan.s3_requests(AccountedOp::Get), 1);
+        assert_eq!(pa.scan.s3_bytes(AccountedOp::Get), 2983182);
+        assert_eq!(pa.scan.decompressed_bytes, 7_200_000);
+
+        assert!(
+            pa.plan.s3_requests(AccountedOp::Get) != pa.resolve.s3_requests(AccountedOp::Get)
+                || pa.probe.s3_bytes(AccountedOp::Get) != pa.scan.s3_bytes(AccountedOp::Get),
+            "this shape must have at least one pair of unequal phases"
+        );
+
+        let pooled = pa.pooled();
+        assert_eq!(pooled.total_s3_requests(), 5 + 2, "5 GETs + 2 LISTs");
+        assert_eq!(pooled.total_s3_bytes(), 293 + 65536 + 3111 + 2983182);
+        assert_eq!(
+            pooled, stats.accounting,
+            "phase_accounting.pooled() must equal the existing pooled QueryStats.accounting field exactly"
         );
     }
 }
