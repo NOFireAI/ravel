@@ -61,8 +61,12 @@ pub fn build_cache(cli: &Cli) -> Option<ravel_query::ReadCache> {
         )))),
         Some(dir) => {
             // The disk tier mirrors the RAM tier's capacity from the same
-            // `--cache-max-bytes` number and the same two constants.
-            let disk = DiskCache::new(dir.clone(), ram_limits);
+            // `--cache-max-bytes` number and the same two constants. The
+            // `"store"` namespace (issue #671) keeps this fetcher cache's files
+            // in `dir/store/`, disjoint from the catalog byte cache that shares
+            // the same `--cache-dir`, so the two never collide, double-count, or
+            // evict each other's entries.
+            let disk = DiskCache::new_in_namespace(dir.clone(), "store", ram_limits);
             let tiered = TieredCache::new(Cache::new(ram_limits), disk);
             Some(ravel_query::ReadCache::Tiered(Arc::new(tiered)))
         }
