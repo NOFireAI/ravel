@@ -387,9 +387,7 @@ impl RlogWriter {
         for blob in streams.values() {
             for (k, v) in stream_attr_pairs(blob)? {
                 let (ty, _) = resolve_value(&v);
-                let eligible = indexed_names.contains(k.as_str())
-                    || matches!(ty, FieldType::I64 | FieldType::F64 | FieldType::Bool);
-                if eligible {
+                if stream_level_column_eligible(k.as_str(), ty, &indexed_names) {
                     distinct.insert((k, ty.to_u8()));
                 }
             }
@@ -885,9 +883,7 @@ impl RlogWriter {
         for blob in streams.values() {
             for (k, v) in stream_attr_pairs(blob)? {
                 let (ty, _) = resolve_value(&v);
-                let eligible = indexed_names.contains(k.as_str())
-                    || matches!(ty, FieldType::I64 | FieldType::F64 | FieldType::Bool);
-                if eligible {
+                if stream_level_column_eligible(k.as_str(), ty, &indexed_names) {
                     distinct.insert((k, ty.to_u8()));
                 }
             }
@@ -1613,6 +1609,27 @@ type ColumnIndex = HashMap<u8, HashMap<String, u32>>;
 /// keep every probe going through it so no call site reconstructs an owned key.
 fn column_lookup(column_of: &ColumnIndex, name: &str, ty_byte: u8) -> Option<u32> {
     column_of.get(&ty_byte).and_then(|m| m.get(name)).copied()
+}
+
+/// Whether a stream-level-only attribute `(name, ty)` earns a dynamic column
+/// even though no record carries it per-record. Two kinds qualify:
+///
+/// - an indexed name (ADR-0049 amendment), so `indexed_term_columns` can key
+///   its merged-view postings by a column, and
+/// - a numeric type (I64/F64/Bool), so `stat_winner_columns` has a column to
+///   key its NumStat by.
+///
+/// The row path ([`RlogWriter::build_object`]) and the columnar path
+/// ([`RlogWriter::build_object_columnar`]) both grant these columns, and the
+/// rule has to be identical on both or the two would assign different columns
+/// for the same records and break the byte-identity guarantee (ADR-0109
+/// decision 7). It lives here, called from both, so it cannot drift.
+fn stream_level_column_eligible(
+    name: &str,
+    ty: FieldType,
+    indexed_names: &std::collections::HashSet<&str>,
+) -> bool {
+    indexed_names.contains(name) || matches!(ty, FieldType::I64 | FieldType::F64 | FieldType::Bool)
 }
 
 /// Resolves one record into storage form: dense stream ref, dynamic columns
@@ -2568,6 +2585,86 @@ mod tests {
         // to it.
         assert!(fd.column("lib", FieldType::I64).is_some());
         assert_eq!(fd.len(), 3);
+    }
+
+    /// Both build paths grant the identical set of stream-level-only dynamic
+    /// columns. The grant rule (`stream_level_column_eligible`) is shared, so
+    /// the row path and the columnar path cannot diverge on which
+    /// resource/scope-only key earns a column. The fixture puts four keys only
+    /// on the stream blob -- no record carries them per-record, so every
+    /// FIELD_DIR entry is a stream-level grant -- covering each arm of the rule:
+    ///
+    /// - `idx.str`   Str, indexed     -> granted (indexed, non-grantable type)
+    /// - `both.i64`  I64, indexed     -> granted (indexed and numeric)
+    /// - `num.i64`   I64, not indexed -> granted (grantable type, not indexed)
+    /// - `plain.str` Str, not indexed -> denied (neither)
+    ///
+    /// so the granted set is exactly {idx.str/Str, both.i64/I64, num.i64/I64}
+    /// on both paths. Flip either call site back to a diverging inline rule
+    /// (drop the `indexed_names` clause on one, say) and the two sets stop
+    /// matching.
+    #[test]
+    fn both_build_paths_grant_same_stream_level_columns() {
+        let blob = stream_attrs_bytes(
+            &[
+                ("idx.str".into(), AttrValue::Str("x".into())),
+                ("both.i64".into(), AttrValue::I64(7)),
+                ("num.i64".into(), AttrValue::I64(3)),
+                ("plain.str".into(), AttrValue::Str("y".into())),
+            ],
+            "scope",
+            "1.0",
+            &[],
+        );
+        let indexed = vec!["idx.str".to_string(), "both.i64".to_string()];
+        // Every record carries the same stream blob and no per-record attrs, so
+        // the only columns the object can grant are the stream-level ones.
+        let records: Vec<LogRecord> = (0..6i64)
+            .map(|i| {
+                let mut r = base_record(0, i);
+                r.stream_attrs = blob.clone();
+                r
+            })
+            .collect();
+
+        let granted = |obj: &[u8]| -> Vec<(String, u8)> {
+            let footer = open(obj).expect("open");
+            let fd = read_field_dir(obj, &footer);
+            let mut set: Vec<(String, u8)> = fd
+                .entries()
+                .iter()
+                .map(|e| (e.name.clone(), e.ty.to_u8()))
+                .collect();
+            set.sort();
+            set
+        };
+
+        let mut rw =
+            RlogWriter::new(RlogConfig::default(), identity()).with_indexed_fields(indexed.clone());
+        for r in &records {
+            rw.push(r.clone()).expect("row push");
+        }
+        let row_obj = rw.finish().expect("row finish");
+
+        let mut cw =
+            RlogWriter::new(RlogConfig::default(), identity()).with_indexed_fields(indexed);
+        cw.push_columnar(ColumnarLogBatch::from_records(&records))
+            .expect("columnar push");
+        let col_obj = cw.finish().expect("columnar finish");
+
+        let mut expected: Vec<(String, u8)> = vec![
+            ("idx.str".to_string(), FieldType::Str.to_u8()),
+            ("both.i64".to_string(), FieldType::I64.to_u8()),
+            ("num.i64".to_string(), FieldType::I64.to_u8()),
+        ];
+        expected.sort();
+        assert_eq!(granted(&row_obj), expected, "row path granted set");
+        assert_eq!(granted(&col_obj), expected, "columnar path granted set");
+        assert_eq!(
+            granted(&row_obj),
+            granted(&col_obj),
+            "both paths grant the identical stream-level column set"
+        );
     }
 
     /// Decodes the STREAM_DIR of a written object.
