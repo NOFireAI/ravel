@@ -102,8 +102,12 @@ struct Args {
     extra_attrs: usize,
 
     // --- tenant lane knobs ------------------------------------------------
-    /// Which layout the tenant is in. ADR-0100 decision 4 requires the report
-    /// to state this rather than guess.
+    /// Which layout the operator expects the tenant to be in. The report's
+    /// printed `layout=` is never taken from this flag (issue #834): it is
+    /// derived from the resolved snapshot's own segments. This flag is a
+    /// stated expectation checked against that derivation; a mismatch
+    /// refuses with `TenantLaneError::LayoutDisagreement` instead of
+    /// printing a label the data contradicts.
     #[arg(long, value_enum, default_value_t = CompactionArg::Pre)]
     compaction: CompactionArg,
     /// Upper bound (unix seconds) of the resolve window and the injected query
@@ -406,9 +410,13 @@ fn print_human_table(report: &SqlLatencyReport) {
     if let Some(flight) = &p.flight_endpoint {
         println!("  flight sql : {flight} (scan diagnostics are not on the wire)");
     }
+    let load = match d.load_wall_ms {
+        Some(ms) => format!(", load={ms:.1}ms"),
+        None => String::new(),
+    };
     println!(
-        "  dataset    : {} objects, {} bytes, {} rows, layout={}, load={:.1}ms",
-        d.object_count, d.stored_bytes, d.rows, d.layout, d.load_wall_ms
+        "  dataset    : {} objects, {} bytes, {} rows, layout={}{load}",
+        d.object_count, d.stored_bytes, d.rows, d.layout
     );
     println!("  runs/query : {}", p.runs);
     println!("  deadline   : {} s per statement", p.deadline_secs);
