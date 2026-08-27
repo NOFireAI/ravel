@@ -139,7 +139,11 @@ What the pinned datafusion 54.1.0 accumulators actually do
    exactness here, since the gate compares against a reference running
    the identical algorithm either way, and higher-accuracy summation is a
    different decision that re-enters through this same admission rule if
-   ever wanted.
+   ever wanted. Amended by ADR-0825: this f64 fold only runs when `avg`'s
+   argument resolves to Float64. An argument that resolves to an admitted
+   integer type instead coerces to Int64 and sums exactly in `i128`,
+   which needs no fold-order pinning at all, integer addition is
+   associative.
 4. **`avg`/`mean` are admitted via a custom UDAF**: decision 3's internal
    fold divided by the non-null row count in one correctly rounded IEEE
    division; a zero count yields NULL, never NaN or infinity. The row
