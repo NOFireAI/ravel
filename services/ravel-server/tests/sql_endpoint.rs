@@ -1828,7 +1828,12 @@ async fn a_dropped_request_future_records_a_canceled_cost() {
     // Waits until the request is genuinely suspended inside the real GET
     // (`BlockingOnFirstGet::get` signals `entered` before blocking on
     // `proceed`), not until some fixed delay has elapsed.
-    entered.notified().await;
+    // Bounded on purpose. If a future change serves this read without issuing a
+    // `get` (a cache, a range-free plan, an early error), an unbounded wait
+    // would hang until the CI job times out with nothing naming the cause.
+    tokio::time::timeout(std::time::Duration::from_secs(30), entered.notified())
+        .await
+        .expect("the request must reach BlockingOnFirstGet::get; if it no longer issues a get, this test's premise is stale");
 
     // Abort, never signaling `proceed`: the request future -- including
     // `run`'s local `cost_guard` -- is dropped mid-`.await`, exactly as a

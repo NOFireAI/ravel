@@ -2422,6 +2422,37 @@ pub struct QueryCostCounters {
     pub estimated_decompressed_bytes: u64,
 }
 
+impl QueryCostCounters {
+    /// Fold one query's cost into this row.
+    ///
+    /// Both the workload-class family and the outcome-status family accumulate
+    /// the identical set of counters and differ only in which map and key they
+    /// select, so the arithmetic lives here once. Adding a field to this struct
+    /// and not to this method under-reports it in BOTH families rather than
+    /// silently in one, which is the failure mode the duplicated version had.
+    fn fold(&mut self, accounting: &QueryAccountingSnapshot, estimate: &CostEstimate) {
+        self.queries = self.queries.saturating_add(1);
+        self.s3_requests = self
+            .s3_requests
+            .saturating_add(accounting.total_s3_requests());
+        self.s3_bytes = self.s3_bytes.saturating_add(accounting.total_s3_bytes());
+        self.cache_hits = self.cache_hits.saturating_add(accounting.cache_hits);
+        self.cache_misses = self.cache_misses.saturating_add(accounting.cache_misses);
+        self.decompressed_bytes = self
+            .decompressed_bytes
+            .saturating_add(accounting.decompressed_bytes);
+        self.estimated_requests = self
+            .estimated_requests
+            .saturating_add(estimate.estimated_requests);
+        self.estimated_store_bytes = self
+            .estimated_store_bytes
+            .saturating_add(estimate.estimated_store_bytes);
+        self.estimated_decompressed_bytes = self
+            .estimated_decompressed_bytes
+            .saturating_add(estimate.estimated_decompressed_bytes);
+    }
+}
+
 /// One rendered row of the per-query cost family: the (tenant bucket, workload
 /// class) key plus its accumulated [`QueryCostCounters`]. `tenant` is `None`
 /// for the folded `other` bucket and `Some(hash)` for a configured tenant, the
@@ -2536,25 +2567,7 @@ impl QueryAccountingMetrics {
             .then_some(tenant_hash);
         let mut rows = self.rows.lock();
         let acc = rows.entry((bucket, workload_class)).or_default();
-        acc.queries = acc.queries.saturating_add(1);
-        acc.s3_requests = acc
-            .s3_requests
-            .saturating_add(accounting.total_s3_requests());
-        acc.s3_bytes = acc.s3_bytes.saturating_add(accounting.total_s3_bytes());
-        acc.cache_hits = acc.cache_hits.saturating_add(accounting.cache_hits);
-        acc.cache_misses = acc.cache_misses.saturating_add(accounting.cache_misses);
-        acc.decompressed_bytes = acc
-            .decompressed_bytes
-            .saturating_add(accounting.decompressed_bytes);
-        acc.estimated_requests = acc
-            .estimated_requests
-            .saturating_add(estimate.estimated_requests);
-        acc.estimated_store_bytes = acc
-            .estimated_store_bytes
-            .saturating_add(estimate.estimated_store_bytes);
-        acc.estimated_decompressed_bytes = acc
-            .estimated_decompressed_bytes
-            .saturating_add(estimate.estimated_decompressed_bytes);
+        acc.fold(accounting, estimate);
     }
 
     /// A stable-ordered copy of every observed row, for rendering. Order by
@@ -2599,25 +2612,7 @@ impl QueryAccountingMetrics {
             .then_some(tenant_hash);
         let mut outcomes = self.outcomes.lock();
         let acc = outcomes.entry((bucket, status)).or_default();
-        acc.queries = acc.queries.saturating_add(1);
-        acc.s3_requests = acc
-            .s3_requests
-            .saturating_add(accounting.total_s3_requests());
-        acc.s3_bytes = acc.s3_bytes.saturating_add(accounting.total_s3_bytes());
-        acc.cache_hits = acc.cache_hits.saturating_add(accounting.cache_hits);
-        acc.cache_misses = acc.cache_misses.saturating_add(accounting.cache_misses);
-        acc.decompressed_bytes = acc
-            .decompressed_bytes
-            .saturating_add(accounting.decompressed_bytes);
-        acc.estimated_requests = acc
-            .estimated_requests
-            .saturating_add(estimate.estimated_requests);
-        acc.estimated_store_bytes = acc
-            .estimated_store_bytes
-            .saturating_add(estimate.estimated_store_bytes);
-        acc.estimated_decompressed_bytes = acc
-            .estimated_decompressed_bytes
-            .saturating_add(estimate.estimated_decompressed_bytes);
+        acc.fold(accounting, estimate);
     }
 
     /// A stable-ordered copy of every observed outcome-status row, mirroring
