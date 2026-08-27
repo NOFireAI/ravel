@@ -61,6 +61,10 @@ pub enum PostingsBuildError {
     BadContentHashLen(usize),
     #[error("entry writer_id must be 16 bytes, got {0}")]
     BadWriterIdLen(usize),
+    #[error("L1 entry writer_id (input_set_hash) must be 32 bytes, got {0}")]
+    BadInputSetHashLen(usize),
+    #[error("L1 entry writer_epoch (part_index) does not fit u32: {0}")]
+    BadPartIndex(u64),
     #[error("segment series entry has no {METRIC_NAME_LABEL} label")]
     MissingMetricName,
     #[error("unsupported segment format version {0}")]
@@ -1256,7 +1260,19 @@ impl Catalog {
             // fetched once -- a one-time full build, not a partial merge. A
             // build failure at any entry from `decode_start` onward aborts
             // the whole index, never publishes a partial one.
-            let postings_names = if entries.iter().all(|entry| entry.level == 0) {
+            //
+            // Level is not gated here: `fetch_segment_names` derives an L1
+            // entry's key and identity the same way `build_segment_ref_from_entry`
+            // does for a query read, so a compacted bucket's `__name__` set
+            // is decoded exactly like an L0 one. The forward-merge ordinal
+            // assumption a compaction rewrite breaks is guarded by
+            // `reconciled` above, not by level: a bucket whose content
+            // changed under an already-recorded ordinal (an L0 run superseded
+            // by its L1 compaction) always lands in `dirty_hours` and forces
+            // `decode_start = 0` here, while a bucket that arrives
+            // already-compacted on its first fold is a plain hour-major
+            // append and never disturbs a previously-recorded ordinal.
+            let postings_names = {
                 let (postings_baseline, postings_decode_start): (Vec<NamePostings>, usize) =
                     if rebuilt || reconciled {
                         (Vec::new(), 0)
@@ -1286,14 +1302,6 @@ impl Catalog {
                     &mut counters,
                 )
                 .await
-            } else {
-                // A level-1 (compaction) entry is present. The forward
-                // postings merge assumes append-only, hour-major L0 growth
-                // with stable ordinals, which a compaction rewrite breaks, and
-                // an L1 part carries no L0 segment to decode `__name__` from.
-                // Publish no postings ref so a resolve considers every entry
-                // exactly rather than pruning against a stale or partial index.
-                None
             };
             let mut postings_built = false;
             let mut postings_size = 0u64;
@@ -2033,6 +2041,16 @@ impl Catalog {
 /// single implementation is deliberate: two copies that must always agree
 /// would be a maintenance hazard, since a scrub is only meaningful if it
 /// derives names exactly the way the fold that wrote the postings did.
+///
+/// Level-aware key and identity derivation, matching
+/// `build_segment_ref_from_entry` (`snapshot_resolve.rs`) exactly: an L0
+/// entry's `writer_id`/`writer_epoch`/`writer_seq` are the flush's real
+/// writer identity, addressed with `keys::data_key`. An L1 entry has no
+/// writer identity of its own; the fold packs its `input_set_hash` into
+/// `writer_id` and its `part_index` into `writer_epoch`
+/// (`build_l1_snapshot_entry`), addressed with `keys::l1_part_key`, and its
+/// footer carries the nil/0 sentinel identity `ravel-query`'s fetcher checks
+/// L1 segments against (`expected_identity` in `ravel-query/src/fetcher.rs`).
 pub async fn fetch_segment_names(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
@@ -2044,32 +2062,61 @@ pub async fn fetch_segment_names(
         .as_slice()
         .try_into()
         .map_err(|_| PostingsBuildError::BadContentHashLen(entry.content_hash.len()))?;
-    let writer_id_bytes: [u8; 16] = entry
-        .writer_id
-        .as_slice()
-        .try_into()
-        .map_err(|_| PostingsBuildError::BadWriterIdLen(entry.writer_id.len()))?;
-    let writer_id = Uuid::from_bytes(writer_id_bytes);
-    let data_key = keys::data_key(
-        tenant,
-        signal,
-        entry.shard,
-        writer_id,
-        entry.writer_epoch,
-        entry.writer_seq,
-        &content_hash,
-    )?;
+
+    let (data_key, expected) = if entry.level == 0 {
+        let writer_id_bytes: [u8; 16] = entry
+            .writer_id
+            .as_slice()
+            .try_into()
+            .map_err(|_| PostingsBuildError::BadWriterIdLen(entry.writer_id.len()))?;
+        let writer_id = Uuid::from_bytes(writer_id_bytes);
+        let data_key = keys::data_key(
+            tenant,
+            signal,
+            entry.shard,
+            writer_id,
+            entry.writer_epoch,
+            entry.writer_seq,
+            &content_hash,
+        )?;
+        let expected = ExpectedIdentity {
+            tenant_hash: tenant.0,
+            shard: entry.shard,
+            writer_id: writer_id.to_string(),
+            writer_epoch: entry.writer_epoch,
+            writer_seq: entry.writer_seq,
+        };
+        (data_key, expected)
+    } else {
+        let input_set_hash: [u8; 32] = entry
+            .writer_id
+            .as_slice()
+            .try_into()
+            .map_err(|_| PostingsBuildError::BadInputSetHashLen(entry.writer_id.len()))?;
+        let part_index = u32::try_from(entry.writer_epoch)
+            .map_err(|_| PostingsBuildError::BadPartIndex(entry.writer_epoch))?;
+        let data_key = keys::l1_part_key(
+            tenant,
+            signal,
+            entry.shard,
+            entry.ingest_hour_bucket,
+            &hex::encode(&input_set_hash[..8]),
+            part_index,
+            &hex::encode(&content_hash[..8]),
+        )?;
+        let expected = ExpectedIdentity {
+            tenant_hash: tenant.0,
+            shard: entry.shard,
+            writer_id: Uuid::nil().to_string(),
+            writer_epoch: 0,
+            writer_seq: 0,
+        };
+        (data_key, expected)
+    };
     let got = store.get(&data_key, GetRange::Full).await?;
 
     let limits = ReaderLimits::default();
     let location = ravel_segment::open_from_full(&got.data, limits)?;
-    let expected = ExpectedIdentity {
-        tenant_hash: tenant.0,
-        shard: entry.shard,
-        writer_id: writer_id.to_string(),
-        writer_epoch: entry.writer_epoch,
-        writer_seq: entry.writer_seq,
-    };
     ravel_segment::check_identity(&location.footer, &expected)?;
 
     // ADR-0027: v7 is the only supported version (`open_from_full` above has
@@ -3350,6 +3397,98 @@ mod tests {
         record
     }
 
+    /// Like `publish_real_segment`, but writes the real RSEG part as an L1
+    /// compaction output (`keys::l1_part_key`, footer identity nil/0/0 per
+    /// `build_l1_snapshot_entry`) with a `CompactionRecord` pointing at it,
+    /// instead of a `CommitRecord`-addressed L0 object. Needed so a test can
+    /// observe `Catalog::build_postings` actually GET and decode an L1
+    /// entry, the same way it already does for L0 via
+    /// `publish_real_segment`.
+    async fn publish_real_compaction(
+        store: &MemoryStore,
+        shard: u32,
+        ingest_hour_bucket: u32,
+        created_unix_ns: i64,
+        metrics: &[&str],
+    ) -> CompactionRecord {
+        let tenant_id = TenantId::new("fold-postings-fault-test");
+        let series: Vec<SeriesInput> = metrics
+            .iter()
+            .map(|metric| {
+                let labels = LabelSet::new(vec![Label {
+                    name: METRIC_NAME_LABEL.to_string(),
+                    value: (*metric).to_string(),
+                }])
+                .expect("valid labels");
+                let series_id = SeriesId::compute(&tenant_id, metric, &labels).expect("series id");
+                SeriesInput {
+                    series_id,
+                    labels,
+                    samples: vec![Sample {
+                        ts_ns: created_unix_ns,
+                        value: 1.0,
+                    }],
+                }
+            })
+            .collect();
+        let identity = SegmentIdentity {
+            tenant_hash: tenant().0,
+            shard,
+            writer_id: Uuid::nil().to_string(),
+            writer_epoch: 0,
+            writer_seq: 0,
+        };
+        let min_ingest_ts_ns = created_unix_ns - 1_000;
+        let max_ingest_ts_ns = created_unix_ns;
+        let bounds = IngestBounds {
+            min_ingest_ts_ns,
+            max_ingest_ts_ns,
+        };
+        let written = SegmentWriter::write(series, identity, bounds).expect("write segment");
+        let input_set_hash =
+            *blake3::hash(format!("l1-inputs-{shard}-{ingest_hour_bucket}").as_bytes()).as_bytes();
+        let part = CompactionPart {
+            part_index: 0,
+            first_series_id: vec![0u8; 16],
+            last_series_id: vec![0xffu8; 16],
+            content_hash: written.summary.blake3.to_vec(),
+            object_size: written.bytes.len() as u64,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            run_count: 1,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            segment_format_version: 3,
+        };
+        let record = CompactionRecord {
+            format_version: 1,
+            tenant_hash: tenant().0.to_vec(),
+            signal: signal::to_proto(Signal::Metrics).into(),
+            shard,
+            ingest_hour_bucket,
+            level: 1,
+            inputs: Vec::new(),
+            input_set_hash: input_set_hash.to_vec(),
+            parts: vec![part],
+            created_unix_ns,
+        };
+        let data_key =
+            keys::reconstruct_l1_part_key(&record, &record.parts[0]).expect("l1 part key");
+        publish::put_data_object(store, &data_key, written.bytes)
+            .await
+            .expect("put l1 part object");
+        let ckey = keys::compaction_record_key_for(&record).expect("compaction key");
+        store
+            .put(
+                &ckey,
+                Bytes::from(record.encode_to_vec()),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put compaction record");
+        record
+    }
+
     /// Publish a retention tombstone for `(shard, ingest_hour_bucket)`. The
     /// fold classifies a bucket as tombstoned from the key shape alone and
     /// never reads the body, so a minimal valid record suffices.
@@ -3478,6 +3617,50 @@ mod tests {
                 .any(|p| p.min_hour <= 10 && 10 <= p.watermark_hour),
             "a part still covers hour 10"
         );
+    }
+
+    /// Regression for issue #587: a fold used to skip postings entirely the
+    /// moment any L1 (compacted) entry was present, because
+    /// `fetch_segment_names` could only key and identity-check an L0 object.
+    /// A bucket set mixing one real L0 segment and one real L1 compaction
+    /// part must still build postings and cover both entries.
+    #[tokio::test]
+    async fn mixed_l0_l1_entries_still_build_postings() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        let now = now_at_seal(10);
+        publish_real_segment(
+            &store,
+            0,
+            Uuid::new_v4(),
+            1,
+            5,
+            now - 5 * NS_PER_HOUR,
+            &["cpu"],
+        )
+        .await;
+        publish_real_compaction(&store, 0, 8, now - 2 * NS_PER_HOUR, &["disk"]).await;
+
+        let report = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[], None)
+            .await
+            .expect("fold");
+
+        assert!(!report.no_op);
+        assert!(report.rebuilt);
+        assert_eq!(report.entry_count, 2);
+        assert!(
+            report.postings_built,
+            "postings must be built over a mixed L0/L1 entry set, not skipped"
+        );
+
+        let head = read_head(store.as_ref()).await;
+        assert!(head.postings.is_some());
+        let entries = collect_head_entries(store.as_ref(), &head).await;
+        let mut levels: Vec<u32> = entries.iter().map(|e| e.level).collect();
+        levels.sort_unstable();
+        assert_eq!(levels, vec![0, 1], "entry set is genuinely mixed L0/L1");
     }
 
     /// The reconcile pass must never reintroduce a duplicate entry identity.
