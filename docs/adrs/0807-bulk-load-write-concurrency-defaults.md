@@ -71,7 +71,7 @@ Per shard, each outstanding batch contributes at most one flush, and the
 per-shard semaphore caps concurrent flushes at `max_inflight_flushes`. So the
 number of object writes in flight is:
 
-```
+```text
 concurrent_object_writes = shards * min(pipeline_depth, max_inflight_flushes)
 ```
 
@@ -200,7 +200,11 @@ the audit changed nothing.
 
 3. **Both bulk-loader defaults stay at 1.** `--pipeline-depth` and
    `--max-inflight-flushes` both default to 1, preserving today's
-   one-write-at-a-time behavior and today's exact durable-token report. The
+   one-batch-at-a-time behavior and today's exact durable-token report.
+   Note the formula above: at the defaults the ceiling is still `shards`
+   concurrent object writes, because a batch fans out to every shard its rows
+   touch. What depth 1 enforces is the barrier BETWEEN batches, not one write
+   at a time. The
    speed-up is opt-in because its cost is a durability-report weakening (the
    acknowledgement consequence above), and that must be a conscious operator
    choice, not a default. A bulk load is restartable and idempotency is the
@@ -226,8 +230,23 @@ the audit changed nothing.
 
 ## Consequences
 
-- **Every published ClickBench load figure was measured at depth 1 and is no
-  longer representative.** The 4,466.76 s reference load, the comparison claiming
+- **Measured since this ADR was written: raising both windows to 4 loads the
+  100M-row ClickBench corpus in 1,519.75 s against 4,466.76 s at the defaults,
+  a 2.94x reduction.** Object count is unchanged at 8,424, which is what makes
+  it a single-variable result, and cores busy rise from 2.33 to 8.58 of 16.
+  Two failed arms bracket it: doubling `--batch-rows` instead (bigger objects,
+  both windows at default) was 11% SLOWER, and raising `--pipeline-depth` to 16
+  alone aborted with `flush failed: timed out waiting for shard ack`, because
+  depth over-subscribes a pipeline bounded by the formula above. This is what
+  the opt-in buys, and it raises the value of decision 5: once flush
+  cancellation exists, the default becomes a plain throughput decision worth
+  2.94x.
+
+- **Every published ClickBench load figure produced by this repo's load scripts
+  was measured at the defaults and is no longer representative.** The scope is
+  what the scripts prove: `run_load_v4.sh` and `run_load_v4big.sh` pass neither
+  write-window flag, so they ran at the effective defaults. A figure whose recipe
+  has not been inspected is not covered by this claim. The 4,466.76 s reference load, the comparison claiming
   a load 2.1x faster than Elasticsearch, and the 15x deficit against ClickHouse's
   290 s were all measured with `--pipeline-depth 1`, `--max-inflight-flushes 1`,
   and the default `--shards 4` on a 16-core box, i.e. `shards * min(1, 1) = 4`
