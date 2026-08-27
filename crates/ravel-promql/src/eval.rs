@@ -3522,25 +3522,33 @@ mod tests {
     }
 
     #[test]
-    fn short_deadline_cancels_a_long_running_nested_subquery_evaluation() {
+    fn expired_deadline_cancels_a_long_running_nested_subquery_before_any_query() {
         // `max_over_time(up[1000s:1s])` over a 1000-step outer range (1000
         // points, 1s step) re-evaluates its ~1000-point inner subquery from
-        // scratch at every outer step: ~1,000,000 total
-        // evaluation points, comfortably under both the per-node
-        // `max_range_points` cap and the shared `max_total_eval_points`
-        // budget, so without a deadline this runs to completion -- measured
-        // separately at just over 1.5s in this same debug build. With a
-        // 20ms deadline, the evaluator's own `check_deadline` (fired inside
-        // the per-outer-step subquery re-evaluation loop, once per inner
-        // grid point too) must notice and stop well before that, not after
-        // running the full ~1,000,000-point computation and only then
-        // reporting a timeout: the assertion on `elapsed` is what tells the
-        // two apart, since a bug that dropped every `check_deadline` call
-        // would still return `DeadlineExceeded` eventually (via a future
-        // outer wrapper) but only after the full ~1.5s of work.
+        // scratch at every outer step: ~1,000,000 total evaluation points,
+        // comfortably under both the per-node `max_range_points` cap and the
+        // shared `max_total_eval_points` budget, so without a deadline this
+        // runs to completion, issuing one storage query per inner grid point
+        // (the same one-query-per-inner-point accounting
+        // `repeated_nested_subquery_reevaluation_is_rejected_by_shared_budget`
+        // pins at 30 queries for its 6x5 grid).
+        //
+        // `check_deadline` runs at the top of both the outer and the inner
+        // grid step, so with a deadline that is already in the past the
+        // evaluation must stop before it touches storage at all. The bug this
+        // rules out is an evaluator whose only deadline check is an outer
+        // wrapper: it would still return `DeadlineExceeded`, but only after
+        // running the full ~1,000,000-point computation, so `query_count`
+        // would read 1,000,000 rather than 0.
+        //
+        // The measure is work done, counted exactly, not wall clock. This
+        // test used to set a 20 ms deadline and assert `elapsed < 500 ms`
+        // against a workload measured at just over 1.5 s in this same debug
+        // build: a 3x margin over a figure that moves with host load, which
+        // is a red gate run on a busy host rather than a bug. A deadline in
+        // the past is in the past on every host.
         let source = one_series_source();
-        let deadline = Instant::now() + std::time::Duration::from_millis(20);
-        let start = Instant::now();
+        let deadline = Instant::now() - std::time::Duration::from_millis(1);
         let err = Evaluator::new()
             .with_deadline(deadline)
             .range(
@@ -3550,14 +3558,14 @@ mod tests {
                 1_000_000 + 999_000,
                 1_000,
             )
-            .expect_err("a deadline in the past relative to the workload must fire");
-        let elapsed = start.elapsed();
+            .expect_err("a deadline already in the past must fire");
         assert!(matches!(err, Error::DeadlineExceeded));
-        assert!(
-            elapsed < std::time::Duration::from_millis(500),
-            "evaluation must be cancelled soon after the 20ms deadline, not \
-             after running the full ~1,000,000-point computation (which \
-             takes over 1.5s in this same debug build); took {elapsed:?}"
+        assert_eq!(
+            source.query_count(),
+            0,
+            "an expired deadline must be noticed by the in-grid check before \
+             any storage query, not after the full 1,000,000-point \
+             computation with only an outer wrapper reporting the timeout"
         );
     }
 
