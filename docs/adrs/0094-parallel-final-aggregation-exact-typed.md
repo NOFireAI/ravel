@@ -692,8 +692,8 @@ exact-typed class, not the partial-stage one.
 ## Amendment 2026-08-26 (issue #771): `avg` over integer input, rejected
 
 Status: Rejected. `avg`/`mean` remain never eligible, over every input type.
-Decision 1's classification is unchanged and no code changed with this
-amendment; what changed is that the exclusion now has DataFusion 54.1.0's
+Decision 1's classification is unchanged and no behavior changed with this
+amendment (the only source edit is a comment on the classifier's `avg` arm); what changed is that the exclusion now has DataFusion 54.1.0's
 own accumulator state cited against it, and tests that pin the cited facts.
 
 **The proposal.** Issue #771 (under epic #680) argued that `avg` over an
@@ -759,9 +759,13 @@ rounding difference.
 
 **A second, independent obstacle.** Decision 1 classifies from the *analyzed*
 (type-coerced) plan, by resolved type. After coercion, `avg(int_col)` and
-`avg(float_col)` are the same expression shape with the same Float64 argument
-type -- the planner even drops an explicit `CAST(int_col AS DOUBLE)` inside
-`avg`, because Float64 is where the integer was going anyway. There is no
+`avg(float_col)` carry the same Float64 argument type. Nothing is dropped: type
+coercion *adds* a cast to the integer case and leaves an already-Float64
+explicit cast alone, and name preservation then aliases the coerced integer
+case back to `avg(logs.k)` while the explicit-cast case keeps the longer name.
+So the two analyzed nodes are not identical -- they differ by field name -- and
+it is the resolved argument type, not plan identity, that defeats the
+classifier. There is no
 resolved type by which the classifier could admit the integer case and keep
 excluding the float one; doing it would require classifying from the
 pre-coercion plan or reaching through the coercion cast into the input
@@ -785,6 +789,11 @@ and it still exhausts the 8 GiB pool. Issue #741's q33 failure is therefore
 **not** addressed here and stays open. The routes that could address it, none
 of which this amendment takes:
 
+- Rework `crate::avg`'s numerator to genuine fixed-point or integer arithmetic
+  for non-float input, which is the route the rejected-alternatives section of
+  this ADR's own body already left open. It is listed first here because a
+  reader who takes this amendment's list as exhaustive would otherwise never
+  find it.
 - Rewrite `avg(x)` over an integer column into `sum(x) / count(x)` before
   classification, so the exact integer `sum` (already admitted) does the
   cross-partition work and one division per group happens after the merge.
@@ -808,7 +817,23 @@ avg sum state is Float64 while `sum(k)` over the same Int64 column carries an
 Int64 one; `f64_partial_sum_merge_is_order_dependent_for_integer_input` pins
 the non-associativity above by bit pattern;
 `avg_group_by_int_key_agrees_and_stays_single_final` and
-`avg_over_float_input_stays_single_partition` pin the plan shape and the
-exact per-group values on a fixture. If a future DataFusion release gives
-`avg` an exact integer or decimal partial state, the first of those goes red
-and this amendment is the thing to revisit.
+`avg_over_float_input_stays_single_partition` pin the plan shape on a fixture.
+
+State the staleness guard per branch, because it does not hold uniformly. A
+DataFusion release that gave `avg` an exact **decimal** partial state would
+redden `avg_over_int_column_carries_a_float64_partial_sum_state`: a decimal
+return type makes `SequentialAvg` delegate, so upstream's state fields reach
+the plan. An exact **integer** partial state would not, because `SequentialAvg`
+displaces DataFusion's accumulator entirely and hardcodes its own
+`(Float64, Int64)` state whenever the return type is Float64, so upstream's
+state never reaches the plan to be observed. The guard that does cover the
+integer case is pre-existing: `analyzer_coerces_avg_argument_to_float64`
+asserts the analyzed argument type is Float64, and reddens if DataFusion stops
+coercing integers.
+
+`f64_partial_sum_merge_is_order_dependent_for_integer_input` is a pinned
+illustration, not a guard: it asserts constants about IEEE doubles and
+references no symbol from this crate or DataFusion, so a rework of
+`SequentialAvg`'s numerator to fixed-point arithmetic leaves it green. It
+documents why the premise is false; it does not detect the premise becoming
+true.

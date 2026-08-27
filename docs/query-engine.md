@@ -1981,9 +1981,11 @@ partial state a two-phase `avg` carries is a **Float64** sum with an integer
 count -- not the exact `(integer sum, count)` pair that would merge across
 partitions without loss. Merging those partial sums is f64 addition and depends
 on how the group was split. A second consequence of the same coercion: after
-analysis, `avg(int_col)` and `avg(float_col)` are the same plan with the same
-`Float64` argument type, so the classifier has no resolved type by which it
-could admit one and reject the other. See the ADR-0094 amendment for issue
+analysis both `avg(int_col)` and `avg(float_col)` carry a `Float64` argument
+type, so the classifier has no resolved type by which it could admit one and
+reject the other. The two analyzed nodes are not otherwise identical -- coercion
+adds a cast to the integer case and name preservation renames it back -- so it
+is the argument type that defeats the classifier, not plan identity. See the ADR-0094 amendment for issue
 `#771`, which rejects admitting `avg` on this basis and lists the routes that
 could instead fix the wide-`GROUP BY` `avg` statements that exhaust the memory
 pool today (issue `#741`).

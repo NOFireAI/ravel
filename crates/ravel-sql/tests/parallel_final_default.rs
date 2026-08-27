@@ -31,8 +31,13 @@
 //! Issue #771 proposed admitting `avg` over an integer column on the premise
 //! that its partial state is an exact `(sum, count)` pair. The ADR-0094
 //! amendment for #771 rejects that premise; three more tests pin the facts the
-//! rejection rests on, so a DataFusion upgrade or a UDAF change that made the
-//! premise true would go red here instead of leaving the amendment stale:
+//! rejection rests on. They are not a uniform staleness guard, and the
+//! amendment states which branch each one covers: a decimal partial state
+//! upstream reddens the first, an integer one does not (this crate's
+//! `SequentialAvg` displaces DataFusion's accumulator whenever the return type
+//! is Float64, so upstream's state never reaches the plan), and the
+//! order-dependence test is a pinned illustration that consults no symbol from
+//! either crate.
 //!
 //! - `avg_over_int_column_carries_a_float64_partial_sum_state`: the `Partial`
 //!   aggregate for `avg(k)` over a declared `Int64` `k` emits a **Float64**
@@ -463,11 +468,12 @@ async fn avg_over_int_column_carries_a_float64_partial_sum_state() {
     // (sum, count) partial state, making a cross-partition merge exact. It does
     // not: DataFusion 54.1.0 coerces every non-decimal, non-duration avg
     // argument to Float64 (average.rs:101-113 signature, :168 return type,
-    // :179 comment) and both accumulators that can serve this plan hold the
-    // numerator as f64 (`AvgAccumulator { sum: Option<f64>, count: u64 }`,
-    // average.rs:505-508; this crate's replacement `SequentialAvgAccumulator`,
-    // avg.rs, likewise). The partial state column type in the plan is the
-    // observable form of that fact.
+    // :179 comment), and the accumulator that actually serves this plan holds
+    // the numerator as f64: this crate's `SequentialAvgAccumulator` (avg.rs),
+    // registered over the built-in. DataFusion's own `AvgAccumulator { sum:
+    // Option<f64>, count: u64 }` (average.rs:505-508) is the same shape, so the
+    // premise fails either way, but only the replacement is observable here.
+    // The partial state column type in the plan is the observable form.
     let fixture = Fixture::build(Fixture::config(
         SqlConfig::default().parallel_final_aggregation,
     ))
