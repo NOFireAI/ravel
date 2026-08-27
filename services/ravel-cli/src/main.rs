@@ -277,6 +277,28 @@ enum Command {
         /// this gap cannot occur. `0` is rejected.
         #[arg(long, default_value_t = 1)]
         pipeline_depth: usize,
+        /// Number of flushes one shard may have in flight at once (issue #807).
+        /// This bounds the shard actor's own flush pipeline, PER SHARD: the
+        /// loader writes one RLOG object per batch per involved shard, and with
+        /// the default `1` a shard actor must wait for the previous object's
+        /// PUT and commit-record publish before it starts the next one, so a
+        /// second batch landing on the same shard queues behind the first even
+        /// when `--pipeline-depth` has already handed both to the router. The
+        /// resulting ceiling on genuinely concurrent flushes is roughly
+        /// `--shards` x this value, capped additionally by `--pipeline-depth`
+        /// (the loader never keeps more than that many writes outstanding, so a
+        /// value above `--pipeline-depth` cannot be reached). The cost is
+        /// memory: each in-flight flush holds its built object, and the buffered
+        /// records it was built from, resident until that flush's terminal
+        /// outcome (its commit record published, or its retry budget exhausted),
+        /// so the per-shard resident flush working set scales by this value. A
+        /// Strict write's acknowledgement is unchanged by the setting: each
+        /// flush answers its own waiters only after its own data object and its
+        /// own commit record have landed. `1` preserves today's
+        /// one-flush-per-shard behavior. `0` is rejected: it is a semaphore no
+        /// flush can ever acquire, which would deadlock the shard.
+        #[arg(long, default_value_t = ravel_cli::load::DEFAULT_MAX_INFLIGHT_FLUSHES)]
+        max_inflight_flushes: u32,
         /// Number of decoded batches allowed to sit queued between the Parquet
         /// decode/build stage and the shard writers (issue #680). A bounded
         /// channel decouples the two: the reader decodes batch N+1 (and, with
@@ -1356,6 +1378,7 @@ async fn main() -> anyhow::Result<()> {
             batch_rows,
             read_cursors,
             pipeline_depth,
+            max_inflight_flushes,
             decode_queue_batches,
         } => {
             let profile = ravel_cli::cli_profiling::ProfileSession::from_env("ravel-cli-load");
@@ -1368,6 +1391,7 @@ async fn main() -> anyhow::Result<()> {
                 batch_rows,
                 read_cursors,
                 pipeline_depth,
+                max_inflight_flushes,
                 decode_queue_batches,
                 now_ns()?,
             )
