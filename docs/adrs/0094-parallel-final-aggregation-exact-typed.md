@@ -1,6 +1,9 @@
 # ADR-0094: parallel final aggregation for exact-typed inputs
 
-Status: Accepted
+Status: Accepted. Amended by ADR-0825: once `avg`'s accumulator is
+integer-exact for resolved integer input (i128 sum, associative merge),
+decision 1's classification admits `avg`/`mean` over resolved integer
+input; `avg` over float input remains never eligible.
 
 ## Context
 

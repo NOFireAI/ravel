@@ -1,6 +1,9 @@
 # ADR-0022: Floating aggregate exactness: allowlisted v1 subset, avg admitted via a sequential UDAF, second-moment family excluded
 
-Status: Accepted
+Status: Accepted. Amended by ADR-0825: decision 3's grouped execution
+path (the plain-accumulator-behind-the-adapter clause) is replaced by a
+sequential-order GroupsAccumulator with identical bits, and integer input
+moves to exact i128 accumulation instead of the f64 fold.
 
 Companion to ADR-0013; amends the v1 aggregate subset it defines. Grouped
 min/max total-order semantics are a sibling gap decided separately in
