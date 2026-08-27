@@ -58,6 +58,11 @@ struct Args {
     /// a heavy query that otherwise aborts with `query memory budget exhausted`.
     /// Defaults to ravel-sql's compiled-in 256 MiB, so an unset flag leaves the
     /// measured budget byte-for-byte unchanged.
+    ///
+    /// Applies to the in-process lanes only. It is not a Flight header, so under
+    /// `--flight` the server's own ceiling governs and this flag changes
+    /// nothing; the report records `sql_max_query_bytes_effective` as null
+    /// there rather than echoing what was asked for.
     #[arg(long = "sql-max-query-bytes", value_name = "BYTES", default_value_t = DEFAULT_MAX_QUERY_BYTES)]
     sql_max_query_bytes: usize,
     /// The engine's `max_segments` ceiling, the same knob as `ravel-server
@@ -263,6 +268,19 @@ async fn main() -> ExitCode {
 }
 
 async fn run(args: &Args) -> Result<SqlLatencyReport, ravel_bench::sql_latency::Error> {
+    // Refuse a profiled multi-run pass up front (issue #616): the pprof signal
+    // sampler segfaults probabilistically the longer it stays armed, so more
+    // runs crash rather than measure. Checked here, before the corpus load and
+    // before any store resolve, because it depends only on argv and the
+    // environment: refusing after a multi-minute LIST fan-out over a
+    // 8,424-object tenant wastes the run and real S3 requests. It is not in
+    // `measure_corpus` because library code deciding this from process-global
+    // env makes an exported RAVEL_BENCH_PROFILE_SVG fail unrelated tests.
+    ravel_bench::profiling::runs_supported_with_profiling(
+        ravel_bench::profiling::profile_requested(),
+        args.runs,
+    )
+    .map_err(ravel_bench::sql_latency::Error::from)?;
     let entries = match &args.corpus {
         Some(path) => load_external_corpus(path)?,
         None => checked_default_corpus()?,
@@ -391,7 +409,16 @@ fn print_human_table(report: &SqlLatencyReport) {
     println!("  fetch conc : {}", p.fetch_concurrency);
     let effective =
         parallel_final_aggregation_effective_label(p.parallel_final_aggregation_effective);
-    println!("  query max  : {} bytes", p.sql_max_query_bytes);
+    println!(
+        "  query max  : requested={} bytes  effective={}",
+        p.sql_max_query_bytes_requested,
+        match p.sql_max_query_bytes_effective {
+            Some(v) => format!("{v} bytes"),
+            // A Flight run does not send the ceiling to the server; the
+            // effective value is the server's own.
+            None => "unknown (server config)".to_string(),
+        }
+    );
     println!(
         "  tenant max : {} bytes  parallel final agg: requested={} effective={}",
         p.tenant_max_bytes, p.parallel_final_aggregation_requested, effective
