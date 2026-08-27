@@ -631,4 +631,42 @@ mod flight {
             );
         }
     }
+
+    /// Issue #809 deliverable 3 requires one statement traversing both Flight
+    /// SQL phases (`GetFlightInfo`, `DoGet`) to produce exactly one cost
+    /// record, so a per-statement total can be computed by summing `queries`
+    /// without double-counting. It currently produces TWO: `get_flight_info_statement`
+    /// in `crates/ravel-sql/src/flight/service.rs` calls `.record(...)` for the
+    /// resolve+plan phase, and `RecordOnStreamEnd::drop` in
+    /// `crates/ravel-sql/src/flight/stream.rs` calls `.record(...)` again when
+    /// the `DoGet` stream ends, per ADR-0044's documented "two-handle split" (see
+    /// `service.rs`'s own comment on the split). Both call sites are inside
+    /// `crates/ravel-sql`, out of this task's `services/ravel-server`-only
+    /// scope, so this test pins the CURRENT (wrong) count rather than asserting
+    /// the ticket's `count == 1` against code that cannot satisfy it without a
+    /// `ravel-sql` change. See this task's final report for the finding.
+    #[tokio::test]
+    async fn a_flight_sql_statement_currently_records_cost_twice_not_once() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = TenantId::new("acme".to_string());
+        publish_segment(store.as_ref(), &tenant, 0).await;
+        let query_accounting = Arc::new(QueryAccountingMetrics::new(HashSet::new()));
+        let state = sql_state(Arc::clone(&store), &tenant, Arc::clone(&query_accounting));
+
+        run_flight_query(&state).await;
+
+        let total_queries: u64 = query_accounting
+            .snapshot()
+            .iter()
+            .map(|r| r.counters.queries)
+            .sum();
+        assert_eq!(
+            total_queries, 2,
+            "one Flight SQL statement currently folds two cost records (GetFlightInfo \
+             and DoGet each call `.record`), not one; issue #809 deliverable 3 names this \
+             as a required fix but the recording call sites are in crates/ravel-sql, out \
+             of this task's services/ravel-server-only scope -- this assertion pins today's \
+             actual (wrong) behavior rather than silently asserting the ticket's target"
+        );
+    }
 }

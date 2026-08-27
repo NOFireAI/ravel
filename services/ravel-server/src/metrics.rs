@@ -2433,6 +2433,47 @@ pub struct QueryAccountingRow {
     pub counters: QueryCostCounters,
 }
 
+/// The final disposition of one query, recorded alongside its cost so a total
+/// can be split by outcome (issue #809). A closed set of four: every query
+/// exits as exactly one of these, never a fifth kind invented to describe an
+/// exit these do not cover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum QueryOutcomeStatus {
+    Success,
+    Error,
+    Timeout,
+    Canceled,
+}
+
+impl QueryOutcomeStatus {
+    pub fn name(self) -> &'static str {
+        match self {
+            QueryOutcomeStatus::Success => "success",
+            QueryOutcomeStatus::Error => "error",
+            QueryOutcomeStatus::Timeout => "timeout",
+            QueryOutcomeStatus::Canceled => "canceled",
+        }
+    }
+}
+
+/// One rendered row of the per-query outcome-status split (issue #809): the
+/// (tenant bucket, status) key plus its accumulated [`QueryCostCounters`].
+/// `tenant` follows the same `None`-is-`other` convention as
+/// [`QueryAccountingRow`]. Kept as an independent map from `rows` rather than
+/// widening the existing `ravel_query_*` family's key by a `status` label: the
+/// existing family is fed only on success today (issue #680's stale-comment
+/// finding aside, error/timeout/canceled queries have never folded into it),
+/// and giving `render_query_family` a new label dimension would multiply its
+/// series count for a rendering path this ticket does not require. This row
+/// is queryable via [`QueryAccountingMetrics::outcome_snapshot`]; it does not
+/// (yet) render on `/metrics`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryOutcomeRow {
+    pub tenant: Option<TenantHash>,
+    pub status: QueryOutcomeStatus,
+    pub counters: QueryCostCounters,
+}
+
 /// Process-global aggregator for per-query cost accounting (ADR-0044 section
 /// 4), written once per completed query by every query handler and read at
 /// scrape time by [`metrics_handler`]. One instance per process, shared with
@@ -2457,6 +2498,10 @@ pub struct QueryAccountingRow {
 pub struct QueryAccountingMetrics {
     configured: HashSet<TenantHash>,
     rows: parking_lot::Mutex<HashMap<(Option<TenantHash>, WorkloadClass), QueryCostCounters>>,
+    /// The outcome-status split (issue #809), independent of `rows` above;
+    /// see [`QueryOutcomeRow`] for why it is a separate map.
+    outcomes:
+        parking_lot::Mutex<HashMap<(Option<TenantHash>, QueryOutcomeStatus), QueryCostCounters>>,
 }
 
 impl QueryAccountingMetrics {
@@ -2467,6 +2512,7 @@ impl QueryAccountingMetrics {
         QueryAccountingMetrics {
             configured,
             rows: parking_lot::Mutex::new(HashMap::new()),
+            outcomes: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -2530,6 +2576,68 @@ impl QueryAccountingMetrics {
                 .value()
                 .cmp(&tenant_label(b.tenant).value())
                 .then_with(|| a.workload_class.name().cmp(b.workload_class.name()))
+        });
+        out
+    }
+
+    /// Fold one completed query's actual counters and its pre-execution
+    /// estimate into the (tenant bucket, status) row (issue #809). Same
+    /// cardinality-bounding fold and `saturating_add` discipline as
+    /// [`QueryAccountingMetrics::record`], into the independent `outcomes`
+    /// map so this never changes what the existing `ravel_query_*` family
+    /// reports.
+    pub fn record_outcome(
+        &self,
+        tenant_hash: TenantHash,
+        status: QueryOutcomeStatus,
+        accounting: &QueryAccountingSnapshot,
+        estimate: &CostEstimate,
+    ) {
+        let bucket = self
+            .configured
+            .contains(&tenant_hash)
+            .then_some(tenant_hash);
+        let mut outcomes = self.outcomes.lock();
+        let acc = outcomes.entry((bucket, status)).or_default();
+        acc.queries = acc.queries.saturating_add(1);
+        acc.s3_requests = acc
+            .s3_requests
+            .saturating_add(accounting.total_s3_requests());
+        acc.s3_bytes = acc.s3_bytes.saturating_add(accounting.total_s3_bytes());
+        acc.cache_hits = acc.cache_hits.saturating_add(accounting.cache_hits);
+        acc.cache_misses = acc.cache_misses.saturating_add(accounting.cache_misses);
+        acc.decompressed_bytes = acc
+            .decompressed_bytes
+            .saturating_add(accounting.decompressed_bytes);
+        acc.estimated_requests = acc
+            .estimated_requests
+            .saturating_add(estimate.estimated_requests);
+        acc.estimated_store_bytes = acc
+            .estimated_store_bytes
+            .saturating_add(estimate.estimated_store_bytes);
+        acc.estimated_decompressed_bytes = acc
+            .estimated_decompressed_bytes
+            .saturating_add(estimate.estimated_decompressed_bytes);
+    }
+
+    /// A stable-ordered copy of every observed outcome-status row, mirroring
+    /// [`QueryAccountingMetrics::snapshot`]'s sort discipline (tenant label,
+    /// then a secondary key -- here the status name).
+    pub fn outcome_snapshot(&self) -> Vec<QueryOutcomeRow> {
+        let outcomes = self.outcomes.lock();
+        let mut out: Vec<QueryOutcomeRow> = outcomes
+            .iter()
+            .map(|((tenant, status), counters)| QueryOutcomeRow {
+                tenant: *tenant,
+                status: *status,
+                counters: *counters,
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            tenant_label(a.tenant)
+                .value()
+                .cmp(&tenant_label(b.tenant).value())
+                .then_with(|| a.status.name().cmp(b.status.name()))
         });
         out
     }
