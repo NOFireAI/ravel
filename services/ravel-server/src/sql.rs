@@ -63,12 +63,13 @@ use ravel_object_store::ObjectStoreBackend;
 use ravel_query::QueryAdmissionController;
 use ravel_query::http::TenantResolver;
 use ravel_sql::{ErrorClass, SqlError, SqlExecutor, SqlRequest};
+use ravel_types::accounting::{AccountedOp, CostEstimate, QueryAccountingSnapshot};
 use ravel_types::{CommitToken, TenantHash, TimeRange};
 use serde::Deserialize;
 use serde_json::json;
 use tracing::Instrument;
 
-use crate::metrics::WorkloadClass;
+use crate::metrics::{QueryOutcomeStatus, WorkloadClass};
 
 /// The Arrow IPC stream media type, as registered by the Arrow project.
 pub const ARROW_STREAM_MEDIA_TYPE: &str = "application/vnd.apache.arrow.stream";
@@ -106,12 +107,10 @@ pub struct SqlState {
     /// The process-global per-query cost aggregator (ADR-0044 section 4).
     /// Each completed statement folds its accounting snapshot and cost
     /// estimate into it, tagged with the tenant hash and workload class, for
-    /// `/metrics`. One instance per process, shared with `/api/v1/analytics`.
-    ///
-    /// The Flight SQL and PromQL paths do not record into it yet: both build
-    /// their own `QueryAccounting` per request and report it in the response
-    /// only, so `/metrics` covers SQL and analytics traffic, not all query
-    /// traffic. Wiring them is future work.
+    /// `/metrics`. One instance per process, shared with `/api/v1/analytics`,
+    /// the Flight SQL path (`crate::flight::service`), and the PromQL path,
+    /// all of which hold it as `Arc<dyn QueryCostRecorder>` -- so `/metrics`
+    /// covers every query surface, not only `/api/v1/sql`.
     pub query_accounting: Arc<crate::metrics::QueryAccountingMetrics>,
     /// The fleet-global query concurrency ceiling (ADR-0061 decision 2), the one
     /// shared controller every query surface in the process gates against.
@@ -143,6 +142,98 @@ struct SqlBody {
     /// Read-your-write commit tokens.
     #[serde(default)]
     min_commit_token: Vec<String>,
+}
+
+/// Guarantees `run`'s query cost and outcome status reach
+/// `state.query_accounting` exactly once, on every exit from `run` -- success,
+/// error, and the one exit no `return` or `?` can reach: the enclosing
+/// request future being dropped mid-`.await` on `execute` (a client
+/// disconnect while the query is still doing object-store work). This is the
+/// same guard/`Drop` shape as `handle`'s `_permit`
+/// (`QueryAdmissionController`, ADR-0061 decision 2), applied to cost
+/// recording instead of concurrency admission.
+///
+/// `finish` is called immediately once `result` is known, before
+/// `submit_audit(..).await?` or `result.map_err(..)?` get a chance to return
+/// early, so both of those early returns run after the fold has already
+/// happened and cannot skip it. If `finish` is never reached -- the only way
+/// is the guard itself being dropped without `run` reaching that line, i.e.
+/// the whole `run` future dropped mid-`execute().await` -- `Drop::drop` runs
+/// unconditionally (Rust guarantees this for every value dropped by scope
+/// exit, `return`, `?`, panic, or an abandoned `.await`) and folds a
+/// zero-accounting `Canceled` record instead. There is no path through `run`
+/// that skips both.
+struct CostGuard<'a> {
+    metrics: &'a crate::metrics::QueryAccountingMetrics,
+    tenant_hash: TenantHash,
+    finished: bool,
+}
+
+impl<'a> CostGuard<'a> {
+    fn new(metrics: &'a crate::metrics::QueryAccountingMetrics, tenant_hash: TenantHash) -> Self {
+        CostGuard {
+            metrics,
+            tenant_hash,
+            finished: false,
+        }
+    }
+
+    /// Record the real outcome. Consumes the guard so a second call is a
+    /// compile error, not a double fold.
+    fn finish(
+        mut self,
+        status: QueryOutcomeStatus,
+        accounting: &QueryAccountingSnapshot,
+        estimate: &CostEstimate,
+    ) {
+        self.metrics
+            .record_outcome(self.tenant_hash, status, accounting, estimate);
+        self.finished = true;
+    }
+}
+
+impl Drop for CostGuard<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.metrics.record_outcome(
+                self.tenant_hash,
+                QueryOutcomeStatus::Canceled,
+                &QueryAccountingSnapshot::default(),
+                &CostEstimate::new(0, 0, 0, 0, 0),
+            );
+        }
+    }
+}
+
+/// Best-effort outcome status and accounting for a failed query, derived from
+/// the `SqlError` variant alone. Only [`SqlError::TooManyBytesScanned`] and
+/// [`SqlError::RequestBudgetExceeded`] carry the exact counters that tripped
+/// them; every other variant -- including `DeadlineExceeded`, a wall-deadline
+/// timeout -- is recorded with a zero snapshot. This is a real gap, not an
+/// oversight: `SqlExecutor::execute` (crates/ravel-sql/src/executor.rs) owns
+/// its `QueryAccounting` handle entirely internally and exposes it only on
+/// `SqlOutcome` on the success path, so a timeout or any other error variant
+/// without its own embedded figures has no accounting data this module can
+/// reach. Closing that gap needs a ravel-sql API change (out of this task's
+/// `services/ravel-server`-only scope) to expose the live handle, or the
+/// figures, on every error path -- flagged in this task's report rather than
+/// worked around here.
+fn error_cost(err: &SqlError) -> (QueryOutcomeStatus, QueryAccountingSnapshot, CostEstimate) {
+    let status = match err.class() {
+        ErrorClass::Timeout => QueryOutcomeStatus::Timeout,
+        _ => QueryOutcomeStatus::Error,
+    };
+    let mut snapshot = QueryAccountingSnapshot::default();
+    match err {
+        SqlError::TooManyBytesScanned { scanned, .. } => {
+            snapshot.s3_bytes[AccountedOp::Get.index()] = *scanned;
+        }
+        SqlError::RequestBudgetExceeded { requests, .. } => {
+            snapshot.s3_requests[AccountedOp::Get.index()] = *requests;
+        }
+        _ => {}
+    }
+    (status, snapshot, CostEstimate::new(0, 0, 0, 0, 0))
 }
 
 async fn handle(State(state): State<SqlState>, req: Request<Body>) -> Response {
@@ -193,6 +284,11 @@ async fn run(state: &SqlState, req: Request<Body>) -> Result<Response, ApiError>
         s3_bytes = tracing::field::Empty,
     );
 
+    // Constructed before `execute` is awaited so a dropped `run` future
+    // (client disconnect mid-query) still folds a Canceled record through its
+    // `Drop` -- see `CostGuard`'s doc comment for the full mechanism.
+    let cost_guard = CostGuard::new(&state.query_accounting, tenant_hash);
+
     // The query has now reached execution for a resolved tenant, so it is
     // auditable (ADR-0042 decision 4, ADR-0062 §2a). Run it, then submit
     // exactly one query-audit event for the outcome - success or the specific
@@ -209,6 +305,25 @@ async fn run(state: &SqlState, req: Request<Body>) -> Result<Response, ApiError>
         Ok(_) => QueryStatus::Ok,
         Err(_) => QueryStatus::Error,
     };
+
+    // Fold the real outcome on EVERY exit past this point (issue #809): this
+    // runs before `submit_audit`'s `?` and `result.map_err(..)?` below, so an
+    // audit-write failure or a redacted `SqlError` can no longer skip cost
+    // recording the way only the success path used to reach it.
+    match &result {
+        Ok(outcome) => {
+            cost_guard.finish(
+                QueryOutcomeStatus::Success,
+                &outcome.accounting,
+                &outcome.estimate,
+            );
+        }
+        Err(err) => {
+            let (outcome_status, snapshot, estimate) = error_cost(err);
+            cost_guard.finish(outcome_status, &snapshot, &estimate);
+        }
+    }
+
     submit_audit(
         state,
         tenant_hash,
@@ -227,7 +342,9 @@ async fn run(state: &SqlState, req: Request<Body>) -> Result<Response, ApiError>
     // the final counts on the span. The executor already built and dropped a
     // fresh `QueryAccounting` per attempt; `outcome.accounting` is the
     // successful attempt's snapshot, so a retried attempt's counters never
-    // bleed in.
+    // bleed in. Unchanged by the outcome-status fold above: this is the
+    // pre-existing `ravel_query_*` family, fed only on success as before, and
+    // `CostGuard` folds into its own independent map.
     span.record("s3_requests", outcome.accounting.total_s3_requests());
     span.record("s3_bytes", outcome.accounting.total_s3_bytes());
     state.query_accounting.record(
