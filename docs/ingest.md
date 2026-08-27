@@ -766,6 +766,24 @@ What this measurement supports and what it does not:
   block encode does **not** translate into a proportional end-to-end write-path
   saving at that width, which is the gap this measurement exposes.
 
+### Bulk-load write concurrency (ADR-0807)
+
+The CPU numbers above measure one write path against another; they do not
+measure how much of the object-storage round trip is hidden behind other work.
+On the reference box a 100M-row ClickBench load ran at 2.33 of 16 cores busy
+with 0.06% iowait, because the bulk loader serializes its writes at the default
+settings. Two nested concurrency windows bound the bulk write path, and both
+default to 1: `--pipeline-depth` (batches the loader keeps outstanding) and
+`max_inflight_flushes` (flushes per shard, the per-shard semaphore above). The
+loader builds its own `IngestConfig` from `..IngestConfig::default()`, so
+`max_inflight_flushes` is fixed at 1 on the bulk path and, unlike on
+`ravel-server`, not reachable by a flag. The concurrent-write ceiling is
+`shards * min(pipeline_depth, max_inflight_flushes)`. ADR-0807 audits every
+write-path bound, decides to expose `--max-inflight-flushes` on the loader while
+keeping both defaults at 1 (raising `--pipeline-depth` above 1 weakens the
+loader's durable-token report, so the speed-up is opt-in), and records that every
+published ClickBench load figure was measured at depth 1.
+
 ## Metrics (self-observability)
 
 `IngestMetrics` (crates/ravel-ingest/src/metrics.rs) exposes process-global
