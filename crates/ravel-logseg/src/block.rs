@@ -8,6 +8,7 @@
 //! SKIP_IDX level-0 entry, not inline; [`read_block`] verifies it before
 //! decoding anything.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 
@@ -755,7 +756,7 @@ pub fn write_block_columnar(
 /// ids instead of materializing one owned `Vec<u8>` per row; a plain page keeps
 /// the per-row values. Both are addressed by block row position and carry
 /// presence separately: an absent row reads `None` either way.
-enum StrColumn {
+pub(crate) enum StrColumn {
     /// Per-row values, `None` for an absent row. What a plain page decodes to.
     Plain(Vec<Option<Vec<u8>>>),
     /// The distinct values plus one id per block row: `Some(id)` indexes `dict`,
@@ -789,6 +790,64 @@ impl StrColumn {
     }
 }
 
+/// A block's decoded columns of one storage kind, addressed by column id.
+///
+/// Column ids are dense and small (fixed 0..=9, dynamic from
+/// [`FIRST_DYNAMIC_COL`] up to the block's dynamic-column budget), so a `Vec`
+/// slot per id resolves a column with one bounds-checked index and no hashing.
+/// SipHash over a `&u32` key was 6% of warm-pass self time on the scan's hot
+/// loop; there is no HashDoS surface on an internal, per-block map (#875).
+struct ColMap<T> {
+    /// One slot per column id; `None` where the block carries no such column
+    /// (absent from every row, or projected away by the scan's column filter).
+    cols: Vec<Option<T>>,
+}
+
+impl<T> ColMap<T> {
+    fn new() -> Self {
+        ColMap { cols: Vec::new() }
+    }
+
+    fn get(&self, column_id: u32) -> Option<&T> {
+        self.cols.get(column_id as usize).and_then(Option::as_ref)
+    }
+
+    fn insert(&mut self, column_id: u32, value: T) {
+        let idx = column_id as usize;
+        if idx >= self.cols.len() {
+            self.cols.resize_with(idx + 1, || None);
+        }
+        self.cols[idx] = Some(value);
+    }
+
+    fn values(&self) -> impl Iterator<Item = &T> {
+        self.cols.iter().flatten()
+    }
+}
+
+/// A byte-valued column resolved once by id: a string column (plain or
+/// dictionary) or a fixed-width id column. A given column id is only ever one of
+/// the two, so [`DecodedBlock::bytes_col`] resolves it with a single lookup and
+/// [`ColumnarBlockView::bytes_cursor`](crate::ColumnarBlockView) walks it per row
+/// with none. It yields cell bytes, never the storage vector, so ADR-0099
+/// decision 4's string-storage change stays invisible to callers.
+pub(crate) enum BytesColRef<'a> {
+    Str(&'a StrColumn),
+    Fixed(&'a [Option<Vec<u8>>]),
+}
+
+impl<'a> BytesColRef<'a> {
+    /// The bytes at block row `row`, or `None` for an absent row. Borrowed from
+    /// the block for `'a`, not from the [`BytesColRef`], so a cursor can hand out
+    /// a cell that outlives the transient cursor.
+    pub(crate) fn cell(&self, row: usize) -> Option<&'a [u8]> {
+        match self {
+            BytesColRef::Str(s) => s.cell(row),
+            BytesColRef::Fixed(v) => v.get(row)?.as_deref(),
+        }
+    }
+}
+
 /// A decoded block: per-column, per-row values. Every column vector has length
 /// `record_count`; `None` marks a row where the column has no value.
 ///
@@ -800,11 +859,18 @@ impl StrColumn {
 /// the same nothing).
 pub struct DecodedBlock {
     record_count: usize,
-    i64_cols: HashMap<u32, Vec<Option<i64>>>,
-    f64_cols: HashMap<u32, Vec<Option<u64>>>,
-    bool_cols: HashMap<u32, Vec<Option<bool>>>,
-    str_cols: HashMap<u32, StrColumn>,
-    fixed_cols: HashMap<u32, Vec<Option<Vec<u8>>>>,
+    i64_cols: ColMap<Vec<Option<i64>>>,
+    f64_cols: ColMap<Vec<Option<u64>>>,
+    bool_cols: ColMap<Vec<Option<bool>>>,
+    str_cols: ColMap<StrColumn>,
+    fixed_cols: ColMap<Vec<Option<Vec<u8>>>>,
+    /// Count of column resolutions by id (`i64_col`, `bytes_col`, ... ), for
+    /// tests that pin the scan does O(columns) resolutions per block, not
+    /// O(rows x columns) (#875). A per-cell accessor bumps it once per cell; a
+    /// cursor bumps it once per column and then indexes the resolved slice with
+    /// no further bump. `Cell`, not atomic: a block is read by one thread and
+    /// this must not add a barrier to the hot per-cell path.
+    col_lookups: Cell<u64>,
     /// Whether any page descriptor in this block named [`COL_ATTRS_RAW`], read
     /// off the header and independent of the column filter (see
     /// [`DecodedBlock::has_attrs_raw_page`]).
@@ -919,14 +985,27 @@ impl DecodedBlock {
         }
         total
     }
+    /// Column resolutions by id since decode: see [`Self::col_lookups`].
+    pub fn column_lookups(&self) -> u64 {
+        self.col_lookups.get()
+    }
+
+    #[inline]
+    fn bump_lookup(&self) {
+        self.col_lookups.set(self.col_lookups.get() + 1);
+    }
+
     pub fn i64_col(&self, column_id: u32) -> Option<&[Option<i64>]> {
-        self.i64_cols.get(&column_id).map(Vec::as_slice)
+        self.bump_lookup();
+        self.i64_cols.get(column_id).map(Vec::as_slice)
     }
     pub fn f64_col(&self, column_id: u32) -> Option<&[Option<u64>]> {
-        self.f64_cols.get(&column_id).map(Vec::as_slice)
+        self.bump_lookup();
+        self.f64_cols.get(column_id).map(Vec::as_slice)
     }
     pub fn bool_col(&self, column_id: u32) -> Option<&[Option<bool>]> {
-        self.bool_cols.get(&column_id).map(Vec::as_slice)
+        self.bump_lookup();
+        self.bool_cols.get(column_id).map(Vec::as_slice)
     }
 
     /// The bytes of string column `column_id` at block row `row`, or `None` when
@@ -934,7 +1013,23 @@ impl DecodedBlock {
     /// the plain and dictionary storage shapes read through here, so a caller
     /// never learns which one the column is (ADR-0099 decision 4).
     pub(crate) fn str_at(&self, column_id: u32, row: usize) -> Option<&[u8]> {
-        self.str_cols.get(&column_id)?.cell(row)
+        self.bump_lookup();
+        self.str_cols.get(column_id)?.cell(row)
+    }
+
+    /// Resolve a byte-valued column (string or fixed-width) by id once, for a
+    /// cursor that then walks it per row with no further lookup. `None` when the
+    /// block carries no such column (absent or projected away). One lookup even
+    /// though a byte column can live in either the string or the fixed map: a
+    /// given id is only ever one of the two.
+    pub(crate) fn bytes_col(&self, column_id: u32) -> Option<BytesColRef<'_>> {
+        self.bump_lookup();
+        if let Some(s) = self.str_cols.get(column_id) {
+            return Some(BytesColRef::Str(s));
+        }
+        self.fixed_cols
+            .get(column_id)
+            .map(|v| BytesColRef::Fixed(v.as_slice()))
     }
 
     /// The dictionary form of string column `column_id`: its distinct values and
@@ -942,14 +1037,16 @@ impl DecodedBlock {
     /// absent, projected away, or stored in plain form -- a plain page is read
     /// through [`Self::str_at`], never forced into a dictionary here.
     pub(crate) fn str_dict(&self, column_id: u32) -> Option<StrDictRef<'_>> {
-        match self.str_cols.get(&column_id)? {
+        self.bump_lookup();
+        match self.str_cols.get(column_id)? {
             StrColumn::Dict { dict, ids } => Some((dict, ids)),
             StrColumn::Plain(_) => None,
         }
     }
 
     pub fn fixed_col(&self, column_id: u32) -> Option<&[Option<Vec<u8>>]> {
-        self.fixed_cols.get(&column_id).map(Vec::as_slice)
+        self.bump_lookup();
+        self.fixed_cols.get(column_id).map(Vec::as_slice)
     }
 
     /// Test-only fused view of a string column, `None` when the column is absent.
@@ -957,7 +1054,7 @@ impl DecodedBlock {
     /// assertions read unchanged regardless of the storage shape.
     #[cfg(test)]
     fn str_col_fused(&self, column_id: u32) -> Option<Vec<Option<Vec<u8>>>> {
-        let _ = self.str_cols.get(&column_id)?;
+        let _ = self.str_cols.get(column_id)?;
         Some(
             (0..self.record_count)
                 .map(|row| self.str_at(column_id, row).map(<[u8]>::to_vec))
@@ -1255,11 +1352,12 @@ fn decode_columns(
 
     let mut out = DecodedBlock {
         record_count,
-        i64_cols: HashMap::new(),
-        f64_cols: HashMap::new(),
-        bool_cols: HashMap::new(),
-        str_cols: HashMap::new(),
-        fixed_cols: HashMap::new(),
+        i64_cols: ColMap::new(),
+        f64_cols: ColMap::new(),
+        bool_cols: ColMap::new(),
+        str_cols: ColMap::new(),
+        fixed_cols: ColMap::new(),
+        col_lookups: Cell::new(0),
         attrs_raw_page: descs.iter().any(|d| d.column_id == COL_ATTRS_RAW),
         pages_decoded: counters.decoded,
         pages_skipped: counters.skipped,
