@@ -231,6 +231,39 @@ Leaving this undefined would give an object class with no owner, reaped too
 early or never — which is how storage leaks and mysterious mid-fold failures
 both start.
 
+### 1b. A posting's payload is (part, entry, block bitmap), not an ordinal
+
+A posting that resolves only to a snapshot entry — an object — does **not**
+support this ADR's own acceptance criterion that `q20` becomes proportional to
+matching *blocks*. Having narrowed to a candidate object, the reader would still
+have to fetch that object's internal directory to learn which blocks match: an
+extra round trip and a directory probe (order 256 KiB) **per candidate object**.
+That is far better than reading the object whole, and it is not what was
+promised.
+
+So a point or gram posting carries at least:
+
+```text
+(part ordinal, entry ordinal, block/row-group bitmap)
+```
+
+The bitmap is what makes the acceptance criterion measurable, and it is what
+lets a candidate object be opened with page ranges on the first request rather
+than the second.
+
+**Two layers, both required, neither substituting for the other.** An S3 object
+is the unit of durability and atomic publication; it is not the unit of reading.
+RLOG v4 already stores independently addressable, independently compressed
+column pages plus a `PAGE_DIR` of their offsets and lengths, so a candidate
+object can be read as a few page ranges rather than in full. This ADR's index
+decides **which objects to open at all**; the existing page layout decides **how
+much of an opened object to read**. The per-object indexes that exist today help
+only after an object is already open, which is the gap this plane closes.
+
+The consequence for the acceptance criteria is that a bitmap-carrying posting is
+a requirement of the pack format, not an optimisation to add later: retrofitting
+it changes the pack layout and therefore its version.
+
 ### 2. Routing must never be per-object
 
 A point lookup resolves through a small cached root to one or a few leaves.
@@ -580,7 +613,9 @@ time-leading slice.
 
 **Queries that stop scanning.** `q02`, `q07` and `q08` become answerable at
 zero data GETs from statistics alone. `q20` becomes proportional to matching
-blocks rather than to corpus objects. `q23` is bounded by positive gram
+blocks rather than to corpus objects — but only because postings carry a block
+bitmap (§1b); an object-ordinal-only posting would leave a directory probe per
+candidate object and would not meet this criterion. `q23` is bounded by positive gram
 candidates — true, and possibly vacuous, since a common substring in a web
 corpus can appear in nearly every block, which is why item 4 is deferred behind
 a selectivity measurement rather than assumed.
