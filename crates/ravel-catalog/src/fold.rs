@@ -188,8 +188,12 @@ struct RequestCounters {
 /// HEAD as read at the top of one fold attempt.
 enum HeadState {
     Absent,
+    /// `head` is boxed so this large variant does not inflate every
+    /// `HeadState` value (`clippy::large_enum_variant`): `SnapshotHead` grew
+    /// past 300 bytes when ADR-0850 added `column_stats`, while the other
+    /// variants are tiny.
     Valid {
-        head: SnapshotHead,
+        head: Box<SnapshotHead>,
         version: Version,
     },
     /// HEAD object exists but failed to decode: logged loudly by
@@ -1700,7 +1704,7 @@ impl Catalog {
                 counters.get_requests += 1;
                 match snapshot_format::decode_head(&got.data) {
                     Ok(head) => Ok(HeadState::Valid {
-                        head,
+                        head: Box::new(head),
                         version: got.version,
                     }),
                     // A HEAD whose `format_version` this process does not
