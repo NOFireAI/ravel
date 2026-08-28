@@ -32,7 +32,7 @@
 //! errors (which carry only counts and limits an operator needs).
 
 use datafusion::error::DataFusionError;
-use ravel_catalog::CatalogError;
+use ravel_catalog::{CatalogError, LoadColumnStatsError};
 use ravel_query::{FetchError, LogFetchError};
 
 use crate::spans_fetcher::SpanFetchError;
@@ -128,6 +128,17 @@ pub enum SqlError {
     /// Snapshot resolution failed.
     #[error("snapshot resolution failed: {0}")]
     Catalog(#[from] CatalogError),
+
+    /// Loading the ADR-0850 column-statistics object for the metadata-only
+    /// aggregate path failed. Every ordinary miss (nothing folded yet, no
+    /// column-stats ref, a GET error, a decode error) already degrades to
+    /// `Ok(None)` inside [`ravel_catalog::Catalog::load_column_stats`] and
+    /// never reaches here; only a genuinely unparseable HEAD/part or an
+    /// ADR-0050 §2 tenant-hash isolation breach surfaces as this variant,
+    /// so it is treated as the same class of fault as
+    /// [`SqlError::Catalog`], not silently absorbed into "no statistics".
+    #[error("column statistics load failed: {0}")]
+    ColumnStats(#[from] LoadColumnStatsError),
 
     /// A segment fetch or decode failed mid-scan.
     #[error("segment fetch failed: {0}")]
@@ -297,6 +308,7 @@ impl SqlError {
             // into the transient-unavailable redaction.
             SqlError::Catalog(CatalogError::WindowTooWide { .. }) => ErrorClass::Unsupported,
             SqlError::Catalog(_)
+            | SqlError::ColumnStats(_)
             | SqlError::Fetch(_)
             | SqlError::LogFetch(_)
             | SqlError::SpanFetch(_)
@@ -335,6 +347,10 @@ impl SqlError {
             // treatment as the budget errors below.
             SqlError::Catalog(catalog @ CatalogError::WindowTooWide { .. }) => catalog.to_string(),
             SqlError::Catalog(catalog) => redact_catalog(catalog).to_string(),
+            // A tenant-hash mismatch would otherwise embed both hashes and
+            // an object key in its `Display`; corrupt HEAD/part errors embed
+            // a key and the decode failure. Neither reaches the client.
+            SqlError::ColumnStats(_) => MSG_CORRUPT.to_string(),
             SqlError::Fetch(fetch) => match fetch {
                 FetchError::Corrupt { .. } => MSG_CORRUPT.to_string(),
                 FetchError::Store { .. } | FetchError::EtagChanged { .. } => {
