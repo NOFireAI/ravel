@@ -140,8 +140,11 @@ enum HeadLoad {
     /// HEAD is present but undecodable (or a newer format this build cannot
     /// read): fail-closed, every bucket is blocked.
     Unreadable,
-    /// HEAD is present and decoded.
-    Present(SnapshotHead),
+    /// HEAD is present and decoded. Boxed so this large variant does not
+    /// inflate every `HeadLoad` (`clippy::large_enum_variant`): `SnapshotHead`
+    /// grew past 300 bytes when ADR-0850 added `column_stats`, while the other
+    /// variants are unit-sized.
+    Present(Box<SnapshotHead>),
 }
 
 /// The result of gating one bucket on HEAD reachability.
@@ -232,7 +235,7 @@ impl SnapshotReachability {
             let head_key = catalog_head_key(tenant, signal);
             let load = match store.get(&head_key, GetRange::Full).await {
                 Ok(got) => match decode_head(got.data.as_ref()) {
-                    Ok(head) => HeadLoad::Present(head),
+                    Ok(head) => HeadLoad::Present(Box::new(head)),
                     Err(err) => {
                         // Present but undecodable/newer: fail-closed. Cannot
                         // prove non-reachability from a HEAD we cannot read.
