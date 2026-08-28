@@ -111,6 +111,7 @@ use crate::late_materialization::TopKLateMaterialization;
 use crate::logs_provider::LogsTableProvider;
 use crate::logs_udf::has_word_udf;
 use crate::map_field_planner::map_field_access_planner;
+use crate::metadata_agg::MetadataOnlyAggregate;
 use crate::minmax::{total_order_max_udaf, total_order_min_udaf};
 use crate::provider::RavelTableProvider;
 use crate::spans_provider::SpansTableProvider;
@@ -522,7 +523,15 @@ pub fn build_session(
         .with_config(session_config(config, exact_typed_aggregates))
         .with_runtime_env(runtime)
         .with_default_features()
-        .with_physical_optimizer_rule(Arc::new(DictionaryGroupKeysAsViews));
+        .with_physical_optimizer_rule(Arc::new(DictionaryGroupKeysAsViews))
+        // ADR-0850 item 2: answer `COUNT(*) WHERE <declared column> <>
+        // <literal>` and `GROUP BY <declared column>, COUNT(*)` from exact
+        // per-object column statistics, with zero data-block GETs, when the
+        // loaded statistics can prove the answer exact. Appended after the
+        // default rules for the same reason `DictionaryGroupKeysAsViews` is:
+        // it must see the final partial/final aggregation split
+        // `EnforceDistribution` chose. See `crate::metadata_agg`.
+        .with_physical_optimizer_rule(Arc::new(MetadataOnlyAggregate));
     // ADR-0774: split a wide `logs` TopK into a narrow scan carrying row refs
     // and a `k`-row block fetch. Appended after `DictionaryGroupKeysAsViews`
     // for the same reason that one is appended after the defaults: it must see
