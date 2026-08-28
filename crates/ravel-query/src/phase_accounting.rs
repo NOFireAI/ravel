@@ -225,6 +225,28 @@ mod tests {
     }
 
     #[test]
+    fn pooled_uses_max_not_sum_for_the_non_additive_peak() {
+        // Every other pooled test uses GET requests and GET bytes, which are
+        // additive, so none of them can tell a field-wise sum from correct
+        // pooled semantics. `peak_intermediate_bytes` is a high-water mark:
+        // two phases each peaking at 100 never held 200 at once. This fails
+        // if `saturating_add` is ever changed to add that field.
+        let phase = PhaseAccounting::new();
+        phase.plan().observe_intermediate_bytes(100);
+        phase.scan().observe_intermediate_bytes(60);
+
+        let pooled = phase.snapshot().pooled();
+        assert_eq!(
+            pooled.peak_intermediate_bytes, 100,
+            "pooled peak must be the max across phases, not their sum"
+        );
+        assert_ne!(
+            pooled.peak_intermediate_bytes, 160,
+            "a field-wise sum of the peaks would report memory never held"
+        );
+    }
+
+    #[test]
     fn phase_accessor_matches_named_accessor() {
         let phase = PhaseAccounting::new();
         phase.probe().record_s3_request(AccountedOp::Get);

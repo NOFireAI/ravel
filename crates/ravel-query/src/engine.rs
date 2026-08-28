@@ -6731,8 +6731,20 @@ mod prefetch_tests {
         assert_eq!(pa.plan.s3_bytes(AccountedOp::Get), 65536);
         assert_eq!(pa.plan.segments_opened, 1);
 
+        // The whole test rests on this segment taking the ranged path. If a
+        // codec change ever shrinks it below the whole-object threshold,
+        // `open_segment` reads it in one GET, probe and scan go to zero, and
+        // the failure surfaces as four unrelated mismatches instead of one
+        // cause. Pin the precondition so it fails as itself.
+        let scan_bytes = pa.scan.s3_bytes(AccountedOp::Get);
+        assert!(
+            scan_bytes > crate::fetcher::DEFAULT_WHOLE_OBJECT_THRESHOLD,
+            "fixture must exceed the whole-object threshold or the phase split \
+             under test does not happen: scan read {scan_bytes} bytes, threshold {}",
+            crate::fetcher::DEFAULT_WHOLE_OBJECT_THRESHOLD
+        );
+
         assert_eq!(pa.probe.s3_requests(AccountedOp::Get), 1);
-        assert_eq!(pa.probe.s3_bytes(AccountedOp::Get), 3111);
         assert_eq!(pa.probe.series_matched, 150);
 
         // The scenario #796 exists for: this segment is one object, and the
@@ -6740,18 +6752,43 @@ mod prefetch_tests {
         // objects a predicate-free full scan issues exactly N scan-phase
         // GETs -- this is that claim pinned at N=1.
         assert_eq!(pa.scan.s3_requests(AccountedOp::Get), 1);
-        assert_eq!(pa.scan.s3_bytes(AccountedOp::Get), 2983182);
         assert_eq!(pa.scan.decompressed_bytes, 7_200_000);
+
+        // Byte figures are bounded proportionally rather than pinned exactly.
+        // The property this test exists for is request attribution per phase,
+        // and an exact compressed total would report an unrelated encoder
+        // change as an accounting regression. A flat floor would be the wrong
+        // fix -- one low enough to be safe also passes when a figure counts a
+        // fraction of the truth -- so each bound is tied to a known quantity:
+        // the scan reads one whole segment, so its wire bytes must be a real
+        // fraction of what it decoded, and the probe reads a bounded slice of
+        // that same object.
+        let decoded = pa.scan.decompressed_bytes;
+        assert!(
+            scan_bytes > decoded / 8 && scan_bytes < decoded,
+            "scan wire bytes {scan_bytes} must be a compressed fraction of the \
+             {decoded} bytes decoded, not a fraction of one object's worth"
+        );
+        let probe_bytes = pa.probe.s3_bytes(AccountedOp::Get);
+        assert!(
+            probe_bytes > 0 && probe_bytes < scan_bytes / 100,
+            "probe reads a small slice of the object the scan reads whole: \
+             probe {probe_bytes} vs scan {scan_bytes}"
+        );
 
         assert!(
             pa.plan.s3_requests(AccountedOp::Get) != pa.resolve.s3_requests(AccountedOp::Get)
-                || pa.probe.s3_bytes(AccountedOp::Get) != pa.scan.s3_bytes(AccountedOp::Get),
+                || probe_bytes != scan_bytes,
             "this shape must have at least one pair of unequal phases"
         );
 
         let pooled = pa.pooled();
         assert_eq!(pooled.total_s3_requests(), 5 + 2, "5 GETs + 2 LISTs");
-        assert_eq!(pooled.total_s3_bytes(), 293 + 65536 + 3111 + 2983182);
+        assert_eq!(
+            pooled.total_s3_bytes(),
+            293 + 65536 + probe_bytes + scan_bytes,
+            "pooled bytes must equal the phase-wise sum exactly, whatever the encoder produced"
+        );
         assert_eq!(
             pooled, stats.accounting,
             "phase_accounting.pooled() must equal the existing pooled QueryStats.accounting field exactly"
