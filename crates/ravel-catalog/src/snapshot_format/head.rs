@@ -134,5 +134,38 @@ fn validate_head(head: &SnapshotHead) -> Result<(), SnapshotFormatError> {
             }
         }
     }
+
+    if let Some(column_stats) = &head.column_stats {
+        if column_stats.blake3.len() != 32 {
+            return Err(SnapshotFormatError::BadColumnStatsRefBlake3Len(
+                column_stats.blake3.len(),
+            ));
+        }
+        if column_stats.key.is_empty() {
+            return Err(SnapshotFormatError::EmptyColumnStatsKey);
+        }
+        if column_stats.part_blake3.len() != head.parts.len() {
+            return Err(SnapshotFormatError::ColumnStatsRefPartCountMismatch {
+                stats_parts: column_stats.part_blake3.len(),
+                head_parts: head.parts.len(),
+            });
+        }
+        for (index, (stats_hash, part)) in column_stats
+            .part_blake3
+            .iter()
+            .zip(head.parts.iter())
+            .enumerate()
+        {
+            if stats_hash.len() != 32 {
+                return Err(SnapshotFormatError::BadColumnStatsRefPartBlake3Len {
+                    index,
+                    actual: stats_hash.len(),
+                });
+            }
+            if stats_hash != &part.blake3 {
+                return Err(SnapshotFormatError::ColumnStatsRefPartBlake3Mismatch { index });
+            }
+        }
+    }
     Ok(())
 }

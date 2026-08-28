@@ -3360,6 +3360,7 @@ mod tests {
             folder_id: Uuid::new_v4().into_bytes().to_vec(),
             created_unix_ns: 0,
             shard_generation_count: 1,
+            column_stats: None,
         }
     }
 
@@ -3856,6 +3857,7 @@ mod tests {
             created_unix_ns: 0,
             postings: None,
             shard_generation_count: 1,
+            column_stats: None,
         };
         let head_bytes = crate::snapshot_format::encode_head(&head).expect("encode head");
         store
@@ -3953,6 +3955,7 @@ mod tests {
             created_unix_ns: 0,
             postings: None,
             shard_generation_count: 2,
+            column_stats: None,
         };
         let head_bytes = crate::snapshot_format::encode_head(&head).expect("encode head");
         inner

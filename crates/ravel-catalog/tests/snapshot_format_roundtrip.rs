@@ -189,6 +189,7 @@ fn arb_head() -> impl Strategy<Value = SnapshotHead> {
                     folder_id: folder_id.clone(),
                     created_unix_ns,
                     shard_generation_count: 1,
+                    column_stats: None,
                 }
             })
         })

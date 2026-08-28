@@ -4566,6 +4566,7 @@ dependencies = [
  "prost",
  "ravel-cache",
  "ravel-commit",
+ "ravel-logseg",
  "ravel-object-store",
  "ravel-proto",
  "ravel-segment",
