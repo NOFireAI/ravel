@@ -1393,6 +1393,7 @@ pub async fn start(
             folder_id: on_demand_folder_id,
             retention: on_demand_fold_retention.clone(),
             in_flight: on_demand_fold_in_flight.clone(),
+            fold_interval: config.fold.fold_interval,
         };
         http_router = http_router.merge(fold_on_demand::router(on_demand_fold_state));
         if let Some(mtls) = &config.mtls_listener {
@@ -1404,6 +1405,7 @@ pub async fn start(
                 folder_id: on_demand_folder_id,
                 retention: on_demand_fold_retention,
                 in_flight: on_demand_fold_in_flight,
+                fold_interval: config.fold.fold_interval,
             };
             mtls_router = mtls_router.merge(fold_on_demand::router(mtls_fold_state));
         }
