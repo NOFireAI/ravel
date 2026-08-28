@@ -4,11 +4,13 @@
 //! phase 2/3's job). Kept in one place so writer and reader can't drift
 //! apart, mirroring `ravel-segment`'s `format.rs` convention.
 
+mod column_stats;
 mod error;
 mod head;
 mod part;
 mod postings;
 
+pub use column_stats::{DecodedColumnStats, decode_column_stats, encode_column_stats};
 pub use error::SnapshotFormatError;
 pub use head::{HEAD_FORMAT_VERSION, decode_head, encode_head};
 pub use part::{DecodedPart, decode_part, encode_part, encode_part_ranged};
@@ -84,6 +86,46 @@ impl Default for PostingsLimits {
     }
 }
 
+/// Envelope magic, first 4 bytes of every column-statistics object
+/// (ADR-0850).
+pub const COLUMN_STATS_MAGIC: [u8; 4] = *b"RCST";
+
+/// Column-statistics envelope format version. This is the v1 layout.
+pub const COLUMN_STATS_VERSION: u8 = 1;
+
+/// Reserved column-statistics envelope bytes; must always be zero in v1.
+pub const COLUMN_STATS_RESERVED: [u8; 3] = [0, 0, 0];
+
+/// Minimum possible column-statistics envelope size: every fixed-width
+/// field present, with a zero-length header and zero-length body.
+pub(crate) const MIN_COLUMN_STATS_ENVELOPE_LEN: usize = 4 + 1 + 3 + 4 + 8 + 4 + 4;
+
+/// Default resource cap for a column-stats object's declared decompressed
+/// body size, applied before decompression allocates a buffer.
+pub const DEFAULT_MAX_COLUMN_STATS_BYTES: u64 = 256 << 20;
+
+/// Fold-time cardinality ceiling: the most distinct values one segment's
+/// dictionary for one column may hold before the dictionary is omitted
+/// outright (ADR-0850 decision 3). Chosen to comfortably cover legitimate
+/// per-segment categorical columns while bounding one segment's dictionary
+/// size; never used to truncate, only to gate presence.
+pub const DEFAULT_MAX_COLUMN_DICTIONARY_ENTRIES: usize = 10_000;
+
+/// Decode-time resource bound, checked before a column-stats object's body
+/// is decompressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColumnStatsLimits {
+    pub max_column_stats_bytes: u64,
+}
+
+impl Default for ColumnStatsLimits {
+    fn default() -> Self {
+        ColumnStatsLimits {
+            max_column_stats_bytes: DEFAULT_MAX_COLUMN_STATS_BYTES,
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -116,6 +158,7 @@ mod tests {
             folder_id: vec![0x33; 16],
             created_unix_ns: 0,
             shard_generation_count: 1,
+            column_stats: None,
         }
     }
 
@@ -325,5 +368,10 @@ mod tests {
         assert_eq!(POSTINGS_VERSION, 1);
         assert_eq!(POSTINGS_RESERVED, [0, 0, 0]);
         assert_eq!(DEFAULT_MAX_POSTINGS_BYTES, 256 << 20);
+        assert_eq!(COLUMN_STATS_MAGIC, *b"RCST");
+        assert_eq!(COLUMN_STATS_VERSION, 1);
+        assert_eq!(COLUMN_STATS_RESERVED, [0, 0, 0]);
+        assert_eq!(DEFAULT_MAX_COLUMN_STATS_BYTES, 256 << 20);
+        assert_eq!(DEFAULT_MAX_COLUMN_DICTIONARY_ENTRIES, 10_000);
     }
 }
