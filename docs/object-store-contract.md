@@ -171,7 +171,17 @@ state). `abort` releases the uploaded parts. It is best effort against the
 server but final for the handle: an upload S3 never heard the abort for leaves
 orphaned parts, which are billed until a bucket lifecycle rule reaps them, and
 never a readable object. Operators SHOULD configure such a rule
-(`AbortIncompleteMultipartUpload`) on Ravel buckets.
+(`AbortIncompleteMultipartUpload`) on Ravel buckets. Because `put()`'s
+above-threshold multipart path aborts best effort and discards the result
+(it never retries or blocks on the abort), that failure is otherwise silent:
+`S3Store::multipart_abort_failures` counts aborts whose request itself
+returned an error (parts certainly orphaned, so a non-zero value with the
+lifecycle rule absent is a live cost leak), and `S3Store::multipart_uploads_unreaped`
+counts multipart uploads that ended without a successful abort for any reason
+(a failed abort, or a future dropped mid-upload before any abort ran);
+subtracting the first from the second isolates the dropped case. Both read a
+process-local `AtomicU64` on the `S3Store`; a hard process crash increments
+neither, so that case stays inferable only from S3's own list of open uploads.
 
 **Retry and failure.** Nothing retries internally beyond what `object_store`'s
 client already does per request. A `put_part` that still fails *poisons the

@@ -1041,6 +1041,82 @@ async fn put_above_threshold_leaves_no_object_when_a_part_fails() {
     );
 }
 
+/// When the best-effort abort of a failed multipart put *itself* fails, the
+/// parts are orphaned on the bucket and billed until the
+/// `AbortIncompleteMultipartUpload` lifecycle rule reaps them. #864 makes that
+/// invisible failure countable: `multipart_abort_failures` must read exactly 1
+/// (not `> 0`) for the one abort that erred, and `multipart_uploads_unreaped`
+/// must also read 1 because the upload ended without a successful abort.
+#[tokio::test]
+async fn failed_multipart_abort_is_counted_exactly_once() {
+    let fake = FakeS3::start().await;
+    let store = fake.store();
+    // One part succeeds, the rest are refused: the put fails and must abort.
+    fake.script(Op::UploadPart, [Fault::Pass]);
+    fake.always(Op::UploadPart, Fault::AccessDenied);
+    // And the abort request itself is refused, so the parts stay orphaned.
+    // 403 is permanent, so object_store issues exactly one AbortMultipart.
+    fake.always(Op::AbortMultipart, Fault::AccessDenied);
+
+    let payload = Bytes::from(vec![9u8; MULTIPART_THRESHOLD + 1]);
+    let error = store
+        .put("fault/abort-fails", payload, PutOptions::default())
+        .await
+        .expect_err("a refused part must fail the put");
+    assert!(!error.is_retryable(), "a 403 on a part is permanent, got {error:?}");
+
+    assert_eq!(
+        fake.count(Op::AbortMultipart),
+        1,
+        "a failed multipart put must attempt exactly one abort"
+    );
+    assert_eq!(
+        store.multipart_abort_failures(),
+        1,
+        "the one abort that returned an error must be counted exactly once"
+    );
+    assert_eq!(
+        store.multipart_uploads_unreaped(),
+        1,
+        "an upload whose abort failed ended without a successful abort"
+    );
+}
+
+/// The counter cannot be firing unconditionally: the same failed-part put with
+/// a *healthy* abort endpoint leaves `multipart_abort_failures` at exactly 0.
+/// The abort succeeds, so the upload was cleanly reaped and
+/// `multipart_uploads_unreaped` is 0 too.
+#[tokio::test]
+async fn successful_multipart_abort_leaves_failure_counter_at_zero() {
+    let fake = FakeS3::start().await;
+    let store = fake.store();
+    fake.script(Op::UploadPart, [Fault::Pass]);
+    fake.always(Op::UploadPart, Fault::AccessDenied);
+    // AbortMultipart is left healthy (default Pass), so the abort succeeds.
+
+    let payload = Bytes::from(vec![9u8; MULTIPART_THRESHOLD + 1]);
+    store
+        .put("fault/abort-ok", payload, PutOptions::default())
+        .await
+        .expect_err("a refused part must fail the put");
+
+    assert_eq!(
+        fake.count(Op::AbortMultipart),
+        1,
+        "the failed put must still abort so parts are not left billed"
+    );
+    assert_eq!(
+        store.multipart_abort_failures(),
+        0,
+        "a successful abort must not increment the failed-abort counter"
+    );
+    assert_eq!(
+        store.multipart_uploads_unreaped(),
+        0,
+        "a cleanly aborted upload did not end without a successful abort"
+    );
+}
+
 /// `SlowDown` inside a 200 response body is S3's documented behavior for
 /// `CompleteMultipartUpload`, and it is a protocol signal rather than a
 /// success: the client must retry it, and the upload must complete correctly
