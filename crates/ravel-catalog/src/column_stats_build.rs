@@ -448,3 +448,166 @@ pub(crate) fn decode_previous_column_stats(
     }
     Ok(decoded.segments)
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use ravel_logseg::writer::ObjectIdentity;
+    use ravel_logseg::{LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_object_store::{ObjectStoreBackend, PutOptions};
+    use ravel_proto::catalog::v1::SnapshotEntry;
+    use ravel_proto::catalog::v1::column_value::Kind;
+    use ravel_types::logstream::{AttrValue, log_stream_id};
+
+    const TENANT: TenantHash = TenantHash([0x5a; 16]);
+    const WRITER: u128 = 0x1111_2222_3333_4444_5555_6666_7777_8888;
+
+    fn identity() -> ObjectIdentity {
+        ObjectIdentity {
+            tenant_hash: TENANT.0,
+            shard: 0,
+            writer_id: *Uuid::from_u128(WRITER).as_bytes(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        }
+    }
+
+    /// One log record on the single `service.name = api` stream carrying the
+    /// given dynamic attributes.
+    fn record(ts: i64, attrs: &[(String, AttrValue)]) -> LogRecord {
+        let resource = vec![(
+            "service.name".to_string(),
+            AttrValue::Str("api".to_string()),
+        )];
+        LogRecord {
+            stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+            stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+            ts_ns: ts,
+            observed_ts_ns: ts,
+            severity_num: 9,
+            severity_text: "INFO".into(),
+            body: format!("body {ts}").into(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: attrs.to_vec(),
+        }
+    }
+
+    fn i64_attr(key: &str, v: i64) -> (String, AttrValue) {
+        (key.to_string(), AttrValue::I64(v))
+    }
+
+    /// Write `records` as a real L0 RLOG object onto `store` at its true
+    /// `data_key`, and return the matching L0 [`SnapshotEntry`]. Blocks are cut
+    /// every 3 records so the tally spans several blocks.
+    async fn write_l0(store: &dyn ObjectStoreBackend, records: &[LogRecord]) -> SnapshotEntry {
+        let cfg = RlogConfig {
+            block_target_records: 3,
+            ..RlogConfig::default()
+        };
+        let mut w = RlogWriter::new(cfg, identity());
+        for r in records {
+            w.push(r.clone()).expect("push");
+        }
+        let bytes = w.finish().expect("finish");
+        let content_hash = *blake3::hash(&bytes).as_bytes();
+        let writer_id = Uuid::from_u128(WRITER);
+        let key =
+            ravel_commit::keys::data_key(&TENANT, Signal::Logs, 0, writer_id, 1, 1, &content_hash)
+                .expect("data key");
+        store
+            .put(&key, bytes::Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("put");
+
+        SnapshotEntry {
+            level: 0,
+            shard: 0,
+            ingest_hour_bucket: 0,
+            writer_id: writer_id.into_bytes().to_vec(),
+            writer_epoch: 1,
+            writer_seq: 1,
+            content_hash: content_hash.to_vec(),
+            object_size: 0,
+            min_event_ts_ns: 0,
+            max_event_ts_ns: 0,
+            sample_count: records.len() as u64,
+            series_count: 0,
+            segment_format_version: 1,
+            created_unix_ns: 0,
+        }
+    }
+
+    fn declared(key: &str, ty: DeclaredColumnType) -> DeclaredTypedColumn {
+        DeclaredTypedColumn {
+            key: key.to_string(),
+            ty,
+        }
+    }
+
+    fn i64_kind(v: &ColumnValue) -> i64 {
+        match &v.kind {
+            Some(Kind::I64(x)) => *x,
+            other => panic!("expected I64 column value, got {other:?}"),
+        }
+    }
+
+    /// The statistics a segment gets are the exact values its rows imply: a
+    /// six-row object where `status` is 200,200,404,200,<absent>,500 yields
+    /// non_null_count 5, null_count 1, the exact per-value dictionary, and
+    /// min/max 200/500. A declared column no row sets (`absent`) gets no entry
+    /// at all, and a dynamic attribute that is not declared (`extra`) is never
+    /// tallied.
+    #[tokio::test]
+    async fn segment_stats_are_the_exact_values_the_rows_imply() {
+        let store = MemoryStore::new();
+        let records = vec![
+            record(1, &[i64_attr("status", 200), i64_attr("extra", 7)]),
+            record(2, &[i64_attr("status", 200)]),
+            record(3, &[i64_attr("status", 404)]),
+            record(4, &[i64_attr("status", 200)]),
+            record(5, &[]), // no status: one null
+            record(6, &[i64_attr("status", 500)]),
+        ];
+        let entry = write_l0(&store, &records).await;
+
+        let typed = vec![
+            declared("status", DeclaredColumnType::I64),
+            declared("absent", DeclaredColumnType::I64),
+        ];
+        let seg = fetch_segment_column_stats(&store, &TENANT, Signal::Logs, &entry, &typed)
+            .await
+            .expect("build stats");
+
+        assert_eq!(
+            seg.columns.len(),
+            1,
+            "only `status` is present and declared"
+        );
+        let status = &seg.columns[0];
+        assert_eq!(status.name, "status");
+        assert_eq!(status.declared_type, 2, "I64 stats tag");
+        assert_eq!(status.non_null_count, 5, "five rows set status");
+        assert_eq!(status.null_count, 1, "row 5 left status absent");
+        assert!(
+            status.dictionary_present,
+            "cardinality is well under the ceiling"
+        );
+
+        let dict: Vec<(i64, u64)> = status
+            .dictionary
+            .iter()
+            .map(|e| (i64_kind(e.value.as_ref().expect("value")), e.count))
+            .collect();
+        assert_eq!(
+            dict,
+            vec![(200, 3), (404, 1), (500, 1)],
+            "exact per-value counts, ascending"
+        );
+        assert_eq!(i64_kind(status.min.as_ref().expect("min")), 200);
+        assert_eq!(i64_kind(status.max.as_ref().expect("max")), 500);
+    }
+}
