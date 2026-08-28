@@ -70,6 +70,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use futures::StreamExt;
@@ -241,6 +242,20 @@ pub struct S3Store {
     /// as `credential_provider`, so [`S3Store::credential_refresh_failures`]
     /// can read its counter (ADR-0106).
     instance_role_provider: Option<Arc<InstanceRoleCredentialProvider>>,
+    /// Best-effort aborts in [`S3Store::put_via_multipart`] whose
+    /// `AbortMultipartUpload` request itself returned an error, so the upload's
+    /// parts are certainly orphaned until the bucket's
+    /// `AbortIncompleteMultipartUpload` lifecycle rule reaps them (#864). Read
+    /// via [`S3Store::multipart_abort_failures`].
+    multipart_abort_failures: AtomicU64,
+    /// Multipart uploads opened by [`S3Store::put_via_multipart`] that ended
+    /// without a successful abort for any reason: a failed abort (also counted
+    /// in `multipart_abort_failures`) or a future dropped mid-upload before
+    /// either completion or abort ran (deadline cancellation, task teardown).
+    /// The two are distinguishable because only the first also moves
+    /// `multipart_abort_failures`; the difference isolates the dropped case.
+    /// Read via [`S3Store::multipart_uploads_unreaped`] (#864).
+    multipart_uploads_unreaped: AtomicU64,
 }
 
 impl S3Store {
@@ -254,6 +269,8 @@ impl S3Store {
             page_size: LIST_PAGE_SIZE,
             credential_provider,
             instance_role_provider,
+            multipart_abort_failures: AtomicU64::new(0),
+            multipart_uploads_unreaped: AtomicU64::new(0),
         })
     }
 
@@ -279,6 +296,32 @@ impl S3Store {
             .as_deref()
             .map(InstanceRoleCredentialProvider::refresh_failures)
             .unwrap_or(0)
+    }
+
+    /// Count of best-effort aborts in [`S3Store::put_via_multipart`] whose
+    /// `AbortMultipartUpload` request itself returned an error (#864). Each one
+    /// leaves the failed upload's parts orphaned on the bucket, billed until
+    /// the `AbortIncompleteMultipartUpload` lifecycle rule
+    /// (docs/object-store-contract.md, "Required bucket configuration") reaps
+    /// them; a non-zero value with that rule absent is a live cost leak. The
+    /// best-effort abort is deliberate: this counts the failure rather than
+    /// blocking or retrying it.
+    pub fn multipart_abort_failures(&self) -> u64 {
+        self.multipart_abort_failures.load(Ordering::Relaxed)
+    }
+
+    /// Count of multipart uploads opened by [`S3Store::put_via_multipart`] that
+    /// ended without a successful abort for any reason (#864): either the abort
+    /// itself failed (which also increments
+    /// [`S3Store::multipart_abort_failures`]) or the upload future was dropped
+    /// mid-flight before completion or abort ran, so no abort was even attempted
+    /// (a deadline cancellation or task teardown). Subtracting
+    /// `multipart_abort_failures` isolates the dropped case, which is otherwise
+    /// invisible: a completed upload and a cleanly aborted one never count here.
+    /// A hard process crash (SIGKILL) drops no futures and so increments
+    /// nothing; that case is inferable only from S3's own list of open uploads.
+    pub fn multipart_uploads_unreaped(&self) -> u64 {
+        self.multipart_uploads_unreaped.load(Ordering::Relaxed)
     }
 
     /// Build the `AmazonS3Builder` from a [`S3Config`], with no network
@@ -738,7 +781,69 @@ impl MultipartUpload for S3MultipartUpload {
     }
 }
 
+/// Increments the "ended without a successful abort" counter (#864) when
+/// dropped, unless disarmed first. Armed right after a multipart upload is
+/// opened and disarmed only on a clean complete or a successful abort, so a
+/// future dropped mid-upload (deadline cancellation, task teardown) still
+/// records the orphaned upload; without it, only a failed abort call would be
+/// visible.
+struct UnreapedGuard<'a> {
+    counter: &'a AtomicU64,
+    armed: bool,
+}
+
+impl<'a> UnreapedGuard<'a> {
+    fn armed(counter: &'a AtomicU64) -> Self {
+        Self {
+            counter,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for UnreapedGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 impl S3Store {
+    /// Abort a failed multipart upload best effort, observing the outcome
+    /// rather than acting on it: the abort is deliberately never retried and
+    /// never blocking (docs/object-store-contract.md, "Visibility and abort").
+    /// A successful abort disarms `unreaped` because the parts were released. A
+    /// failed abort leaves them orphaned until the bucket's
+    /// `AbortIncompleteMultipartUpload` lifecycle rule reaps them, so it
+    /// increments `multipart_abort_failures`, logs the key for an operator to
+    /// grep, and leaves `unreaped` armed so the upload also counts there (#864).
+    async fn abort_best_effort(
+        &self,
+        key: &str,
+        upload: &mut Box<dyn OsMultipartUpload>,
+        unreaped: &mut UnreapedGuard<'_>,
+    ) {
+        match upload.abort().await {
+            Ok(()) => unreaped.disarm(),
+            Err(e) => {
+                self.multipart_abort_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    phase = "multipart_abort",
+                    key = %key,
+                    error = %map_error_common(e),
+                    "multipart abort failed; upload parts orphaned until the \
+                     AbortIncompleteMultipartUpload lifecycle rule reaps them"
+                );
+            }
+        }
+    }
+
     /// The [`MULTIPART_THRESHOLD`] path of [`ObjectStoreBackend::put`]: cut the
     /// buffer into [`MULTIPART_PART_SIZE`] parts, upload at most
     /// [`MULTIPART_UPLOAD_CONCURRENCY`] of them at a time, then complete. Any
@@ -762,6 +867,12 @@ impl S3Store {
             .put_multipart(&path)
             .await
             .map_err(map_error_common)?;
+
+        // The upload now exists on the server: every early return or dropped
+        // future from here until a clean complete or a successful abort leaves
+        // parts billed. The guard records that as an unreaped upload (#864);
+        // it is disarmed only on a clean resolution.
+        let mut unreaped = UnreapedGuard::armed(&self.multipart_uploads_unreaped);
 
         // Every part but the last is exactly MULTIPART_PART_SIZE, which is
         // both above S3's minimum and uniform, as R2-class backends require.
@@ -790,14 +901,19 @@ impl S3Store {
             }
         }
         if let Some(e) = failure {
-            let _ = upload.abort().await;
+            self.abort_best_effort(key, &mut upload, &mut unreaped)
+                .await;
             return Err(e);
         }
 
         match upload.complete().await {
-            Ok(result) => outcome_of(key, result),
+            Ok(result) => {
+                unreaped.disarm();
+                outcome_of(key, result)
+            }
             Err(e) => {
-                let _ = upload.abort().await;
+                self.abort_best_effort(key, &mut upload, &mut unreaped)
+                    .await;
                 Err(map_error_common(e))
             }
         }
@@ -1159,6 +1275,34 @@ mod tests {
             .await
             .expect_err("put_part after abort must fail");
         assert!(matches!(after_abort, StoreError::Permanent(_)));
+    }
+
+    /// The unreaped-upload guard (#864) counts on drop only while armed, so a
+    /// multipart upload future dropped mid-flight (deadline cancellation, task
+    /// teardown) records the orphaned upload, while a clean complete or a
+    /// successful abort disarms it and records nothing. This is the mechanism
+    /// that makes the "process died mid-upload" case visible rather than only
+    /// the "abort itself failed" one.
+    #[test]
+    fn unreaped_guard_counts_on_drop_only_while_armed() {
+        let counter = AtomicU64::new(0);
+        // Armed and dropped without a clean resolution: the dropped-mid-upload
+        // case. It counts.
+        drop(UnreapedGuard::armed(&counter));
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            1,
+            "an armed guard must count the orphaned upload on drop"
+        );
+        // Disarmed before drop: the clean-resolution case. It does not count.
+        let mut guard = UnreapedGuard::armed(&counter);
+        guard.disarm();
+        drop(guard);
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            1,
+            "a disarmed guard must not count on drop"
+        );
     }
 
     fn test_config() -> S3Config {
