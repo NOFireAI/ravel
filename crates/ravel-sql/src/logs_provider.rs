@@ -35,7 +35,7 @@ use datafusion::physical_expr::expressions::col;
 use datafusion::physical_plan::ExecutionPlan;
 #[cfg(feature = "flight-sql")]
 use datafusion::physical_plan::projection::ProjectionExec;
-use ravel_catalog::{SegmentRef, Snapshot};
+use ravel_catalog::{LoadedColumnStats, SegmentRef, Snapshot};
 #[cfg(feature = "flight-sql")]
 use ravel_query::ByteLimit;
 use ravel_query::LogSegmentFetcher;
@@ -76,6 +76,12 @@ pub struct LogsTableProvider {
     /// exactly. The provider's advertised [`Self::schema`] and every
     /// `LogsScanExec` it builds are derived from this list.
     declared: Arc<Vec<DeclaredColumn>>,
+    /// Exact per-segment column statistics for the tenant's declared columns
+    /// (ADR-0850), resolved once per plan by `SqlExecutor` and installed with
+    /// [`LogsTableProvider::with_column_stats`]. `None` -- the default -- is
+    /// byte-identical to the pre-ADR-0850 provider: every metadata-only path
+    /// degrades to scanning.
+    column_stats: Option<Arc<LoadedColumnStats>>,
     /// The coordinator-side distributed fan-out (ADR-0071; #326), if this
     /// provider is acting as a distributed coordinator. `None` -- the default,
     /// and every non-Flight build -- is the local scan path unchanged.
@@ -103,6 +109,7 @@ impl LogsTableProvider {
             accounting,
             erasure,
             declared: Arc::new(Vec::new()),
+            column_stats: None,
             #[cfg(feature = "flight-sql")]
             distributed: None,
         }
@@ -179,6 +186,16 @@ impl LogsTableProvider {
         self
     }
 
+    /// Install this plan's loaded column statistics (ADR-0850), resolved once
+    /// by `SqlExecutor` via `Catalog::load_column_stats` and threaded down. A
+    /// builder method for the same reason [`Self::with_declared_columns`] is
+    /// one: `LogsTableProvider::new` stays source-compatible, and `None` (the
+    /// default) reproduces the pre-ADR-0850 provider exactly.
+    pub fn with_column_stats(mut self, column_stats: Option<Arc<LoadedColumnStats>>) -> Self {
+        self.column_stats = column_stats;
+        self
+    }
+
     /// Build the scan over every segment in the snapshot with no pushdown and
     /// no projection (every column). Exposed (like the metrics provider's
     /// `plan`) so tests can execute the scan without a SQL front-end.
@@ -229,7 +246,8 @@ impl LogsTableProvider {
             self.accounting.clone(),
             Arc::clone(&self.schema),
             Arc::clone(&self.declared),
-        )?;
+        )?
+        .with_column_stats(self.column_stats.clone());
         Ok(Arc::new(scan))
     }
 
