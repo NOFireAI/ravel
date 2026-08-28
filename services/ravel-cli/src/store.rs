@@ -314,9 +314,15 @@ mod tests {
             (StatusCode::OK, [(header::ETAG, "\"mock-etag\"")], "").into_response()
         }
 
+        /// Serves `Range` the way a real S3-compatible endpoint does: 206 with
+        /// a `Content-Range`, or 416 when no part of the range exists. The
+        /// adapter reads a whole object as bounded ranged requests, so a mock
+        /// that answered 200 here would be rejected as a non-partial response
+        /// before its body was ever read.
         async fn get_object(
             State(state): State<Arc<MockS3>>,
             AxumPath((_bucket, key)): AxumPath<(String, String)>,
+            headers: HeaderMap,
         ) -> Response {
             let found = state
                 .objects
@@ -324,18 +330,44 @@ mod tests {
                 .expect("objects lock")
                 .get(&key)
                 .cloned();
-            match found {
-                Some(data) => (
-                    StatusCode::OK,
-                    [
-                        (header::ETAG, "\"mock-etag\""),
-                        (header::LAST_MODIFIED, "Wed, 21 Oct 2020 07:28:00 GMT"),
-                    ],
-                    data,
-                )
-                    .into_response(),
-                None => StatusCode::NOT_FOUND.into_response(),
+            let Some(data) = found else {
+                return StatusCode::NOT_FOUND.into_response();
+            };
+            let requested = headers
+                .get(header::RANGE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|spec| spec.strip_prefix("bytes=")?.split_once('-'))
+                .map(|(start, end)| (start.parse::<usize>(), end.parse::<usize>()));
+            let (status, body, content_range) = match requested {
+                None => (StatusCode::OK, data.clone(), None),
+                Some((Ok(start), Ok(end))) if start < data.len() => {
+                    let end = end.min(data.len() - 1);
+                    (
+                        StatusCode::PARTIAL_CONTENT,
+                        data.slice(start..end + 1),
+                        Some(format!("bytes {start}-{end}/{}", data.len())),
+                    )
+                }
+                Some(_) => return StatusCode::RANGE_NOT_SATISFIABLE.into_response(),
+            };
+            let mut response = (
+                status,
+                [
+                    (header::ETAG, "\"mock-etag\"".to_string()),
+                    (
+                        header::LAST_MODIFIED,
+                        "Wed, 21 Oct 2020 07:28:00 GMT".to_string(),
+                    ),
+                ],
+                body,
+            )
+                .into_response();
+            if let Some(value) = content_range
+                && let Ok(value) = value.parse()
+            {
+                response.headers_mut().insert(header::CONTENT_RANGE, value);
             }
+            response
         }
 
         let state = Arc::new(MockS3::default());
