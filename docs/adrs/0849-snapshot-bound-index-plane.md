@@ -95,9 +95,18 @@ prefix, no new lifecycle.
 
 Binding is **two-level, and this is load-bearing**. The `IndexRoot` alone binds
 the exact ordered snapshot-part hashes, exactly as `.npost` does today. **Leaf
-packs bind per part** (or per stable part prefix — non-tail parts key on a
-stable `watermark_hour` per ADR-0063, so prefixes survive appends), with
-ordinals **part-local**.
+packs bind per part**, with ordinals **part-local**.
+
+**A leaf binds the covered part's exact `SnapshotPartRef.blake3`, never its
+`watermark_hour`.** `watermark_hour` is a stable *range label*, not a content
+identity: a replacement part produced by compaction can carry the same
+`watermark_hour` while changing entries and the ordinal mapping. Binding a leaf
+to the label would accept a stale leaf against rewritten data and silently omit
+matches — the same wrong-results class as the config-inferred coverage below,
+reached by a different route. The stability of the label buys nothing here and
+must not be mistaken for stability of the content. A regression test covers
+exactly this: same `watermark_hour`, different part bytes, leaf must be
+rejected.
 
 Whole-set binding on every leaf was the draft's design and it is wrong. Every
 content-changing fold appends or replaces a part, so exact-whole-set binding
@@ -130,6 +139,14 @@ Therefore, in this order, before any fold writes a pack:
    granularity above and must be settled with it.
 2. Ship and fully roll out the sweeper's reference-set change **before** the
    first pack-writing fold reaches production.
+3. **Gate every `HEAD` writer before the first root is published.** Upgrading
+   the sweeper closes only half of the hazard: a lagging folder that CASes a
+   `HEAD` without the index field strips the live root reference, and the *new*
+   sweeper then correctly computes a reference set that omits it and reaps the
+   packs. Either every `HEAD` writer must preserve the field it does not
+   understand, or old writers must be blocked before the first root publication.
+   Mixed-version folder-and-sweeper combinations are a required test matrix, not
+   an afterthought.
 
 Two rolling-upgrade hazards, both the ADR-0066 decision 2 shape, and both must
 be closed by that ordering rather than by hope:
@@ -146,12 +163,22 @@ self-destructs on every mixed-version window and must be rebuilt. This makes
 **Intermediate fragments have the same problem and the same answer.** The L1
 fragments of §3 are objects no `HEAD` ever names, written by a compaction that
 may die before the fold consumes them. They are therefore unreferenced from the
-moment they exist. Rather than invent a second reference-set mechanism for
-them, fragments are **fold-side only**: built and consumed within a single fold
-without a separate durable lifecycle, or, if they must outlive their producer,
-they get an explicit key prefix, an abandonment deadline shorter than the
-protection horizon, and their own reclamation rule stated here before any code
-writes one. An orphan class with no owner is how storage leaks start.
+moment they exist. "Fold-side only" does not resolve this, because §3's own pipeline has L1
+compaction *produce* fragments and a later catalog fold *consume* them: two
+stages, not one atomic operation, so a fragment outlives its producer by
+construction. The choice is therefore forced, and one of these is picked before
+any code writes a fragment:
+
+- **(a) No durable fragments.** The fold recomputes from the rewritten data it
+  is already decoding. Simplest, and it costs fold CPU rather than storage.
+- **(b) Durable fragments with a stated lifecycle**: an explicit key prefix
+  distinct from published packs, a named owner, an abandonment deadline shorter
+  than the protection horizon, and a reclamation rule keyed on that deadline
+  rather than on `HEAD` reachability (a fragment is never `HEAD`-reachable, so
+  the sweeper's reference-set rule cannot govern it).
+
+Leaving this undefined gives an object class with no owner, reaped too early or
+never — which is how storage leaks and mysterious mid-fold failures both start.
 
 ### 2. Routing must never be per-object
 
@@ -167,9 +194,18 @@ to each object" approach, and any future proposal must be checked against it.
 caps are stated and asserted per phase:
 
 - **root probe: at most 1 GET** per (tenant, signal) per query, cache-missable;
-- **leaf probes: at most `L` GETs** for a single-field point predicate, `L`
-  fixed per pack layout and declared in the root, never a function of object
-  count;
+- **leaf probes: a cap per index type**, each declared in the root and each a
+  function of pack layout, never of object count: `L_point` for a single-field
+  point predicate, `L_gram` for a gram lookup, and for a compound predicate a
+  **global per-query ceiling** that the sum across fields may not exceed — an
+  AND over `k` fields must not cost `k` times a single-field lookup by default,
+  since the planner may probe the most selective field first and evaluate the
+  rest as residual;
+- **probe parallelism** is declared too, since `L` sequential probes and `L`
+  concurrent probes are the same request count and very different latency;
+- a predicate whose shape has **no declared cap** does not get a
+  best-effort probe: it falls back to scanning. An uncapped path is how bounded
+  routing degrades into the per-object design this section rejects;
 - cold routing therefore costs **at most 2 sequential round trips** before the
   first data GET — call it 40-100 ms in-region, which is why cold index numbers
   are published separately from hot ones (see Consequences).
@@ -178,14 +214,27 @@ A query whose routing exceeds its budget fails the shape lint rather than
 silently costing more than the scan it replaced. This makes the per-object
 rejection above mechanical instead of a matter of review taste.
 
-**Bloom pre-check first.** ADR-0050 §2's tenant-hash pre-check runs before any
-index probe. A predicate whose value is absent from the tenant-level filter
-resolves to zero candidates at **zero** index GETs, which is the cheapest
-possible answer and must not be given up by routing straight to a pack.
+**There is no tenant-level membership filter today, and this ADR does not
+pretend otherwise.** An earlier draft of this section claimed ADR-0050 §2 gave a
+tenant-hash pre-check that could resolve an absent value at zero index GETs.
+That was a misreading twice over: ADR-0050 §2 is `tenant_hash` mismatch failing
+closed, a tenant *isolation* invariant, not value membership; and the filters
+that do exist are ADR-0029's **per-block token blooms living inside the RLOG
+object**, which cannot pre-empt a lookup because reaching them means opening the
+object this design exists to avoid opening.
+
+A tenant-scoped membership filter would be a **new pack type in this plane** —
+cheap, worth building, and listed here as a candidate rather than borrowed from
+an ADR that does not provide it. If one is built it must cover **token-resolved
+segments** as well as snapshot data, or bypass the pre-check whenever a pinned
+commit token contributes segments: those segments come from direct commit-record
+GETs outside the snapshot, so a filter built only over snapshot data can report
+a confident zero for a value that a token segment holds. That is a wrong result,
+not a slow one.
 
 ### 3. The safety lemma
 
-```
+```text
 query candidates = index matches among covered objects
                  ∪ every uncovered object
 ```
@@ -209,6 +258,13 @@ requirements, not refinements:
   regardless of object coverage. With this rule Class B stands, because a
   rebuild need not reproduce identical packs, only packs valid for their own
   declaration.
+- **A leaf that fails validation subtracts its own coverage.** A leaf is usable
+  only after hash, version, part-binding and decode validation all pass. On any
+  failure the planner removes *that leaf's* (ordinal range x field x index type)
+  contribution from the root-declared coverage and scans the affected scope.
+  Falling back to scanning while still counting the scope as covered is the
+  worst of both: the prune omits matching entries and nothing reports it. Each
+  failure mode gets its own test.
 - **Partial coverage within an object** (some blocks indexed, an entry
   half-processed by L1) requires the ordinal-range dimension, or fold must never
   mark an entry covered until it is fully indexed.
@@ -272,10 +328,24 @@ the rewrite plus fold interval (order 72 h). For **pruning** this is safe by the
 lemma: over-selection is corrected by the scan's own row-level filter. For
 **metadata execution** it is not — a `COUNT` served from a pack built before the
 erasure returns the pre-erasure number, which is a wrong answer to a compliance
-operation. The condition is therefore enforced by a recorded erasure epoch that
-a pack must be no older than, checked at plan time; "no pending selective
-erasure" as a prose condition with no carrier is exactly the shape that ships
-unimplemented.
+operation. The condition is therefore enforced by an erasure epoch, and the carrier does
+not exist yet: `ErasureRequest`, `ErasureCompletion` and `RewriteRecord` carry
+`created_unix_ns`, `requested_unix_ns` and `completed_unix_ns`, but no
+scope-wide freshness value a pack could be compared against. Concretely:
+
+- the tenant's **erasure epoch** is the maximum `created_unix_ns` over its live
+  erasure requests;
+- every statistics pack records the epoch it was built at, as declared data in
+  the root;
+- `MetadataAggregateExec` is selected only when `pack_epoch >= tenant_epoch`,
+  and falls back to scanning otherwise.
+
+Ordering matters and is stated so it cannot be assumed away: a request is
+acknowledged before the rewrite lands and long before the fold republishes, so
+the epoch must advance at **acknowledgement**, not at completion. An epoch that
+advanced only on completion would leave exactly the window this condition
+exists to close. "No pending selective erasure" as prose with no carrier is the
+shape that ships unimplemented.
 
 **Exactness or fallback, never estimation.** These figures answer queries
 directly, so a bound is not sufficient: `q02` needs the exact count of one
