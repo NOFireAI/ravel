@@ -44,9 +44,30 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use ravel_catalog::MAX_SHARD_COUNT;
 use ravel_types::TenantHash;
 
 use crate::attribution::TenantPutAttribution;
+
+/// Shard indices [`IngestMetrics::new`] preallocates per-shard skew
+/// accumulators for.
+///
+/// Set to [`MAX_SHARD_COUNT`], the largest `shard_count` a provisioning record
+/// may declare for any generation: `provisioning.rs` rejects anything outside
+/// `1..=10000` as `GenerationDefect::CountOutOfRange`, and the live routing
+/// count is `ravel_catalog::active_shard_count` over those validated
+/// generations. So no generation this process can activate produces a shard
+/// index at or above this capacity, which is what makes the "an index outside
+/// the slice is dropped" fallback unreachable in practice rather than a hole
+/// the way sizing to `config.shard_count` was.
+///
+/// The cost is one allocation of `MAX_SHARD_COUNT * size_of::<ShardSkewAtomics>()`
+/// (10 000 * 40 bytes = 400 KiB) per router, once at construction, against a
+/// metric whose entire purpose is to be trusted (issue #865). A growable
+/// lock-free structure would save most of that, at the cost of an indexing
+/// scheme on the per-message hot path; a flat slice keeps that path a single
+/// bounds-checked index.
+pub const SHARD_SKEW_CAPACITY: u32 = MAX_SHARD_COUNT;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlushTrigger {
@@ -170,10 +191,24 @@ pub struct IngestMetrics {
     /// message, so this path must not serialise every shard on one lock: a
     /// process-wide mutex here would add a contention point to the very path
     /// #865 measures and could manufacture the throughput limit it exists to
-    /// test for. Preallocated to `shard_count` by [`IngestMetrics::new`] (the
-    /// shard set is fixed for the process); `IngestMetrics::default()` allocates
-    /// none, and any shard index outside the slice is dropped rather than
-    /// counted, matching the best-effort nature of this observability.
+    /// test for.
+    ///
+    /// Preallocated by [`IngestMetrics::new`] to [`SHARD_SKEW_CAPACITY`], which
+    /// covers every shard index `write_points` can route to, not just the
+    /// configured `shard_count`. The shard set is *not* fixed for the process:
+    /// [`crate::generation::GenerationSwitch`] keeps one shard-actor set per
+    /// distinct `shard_count` seen and takes the live count from the tenant's
+    /// generation history (`ravel_catalog::active_shard_count`), so a tenant
+    /// that activates a larger generation routes to indices above
+    /// `config.shard_count` (ADR-0052 section 2). Sizing to `shard_count` would
+    /// drop exactly those shards, and dropping them biases the measurement
+    /// toward reporting *less* skew than there is, in a metric that exists to
+    /// settle a skew argument (issue #865).
+    ///
+    /// `IngestMetrics::default()` allocates none. An index at or above the
+    /// slice is still dropped rather than counted, matching the best-effort
+    /// nature of this observability; [`SHARD_SKEW_CAPACITY`] is chosen so no
+    /// generation the catalog accepts can reach that case.
     shard_skew: Box<[ShardSkewAtomics]>,
     /// Metadata-record GETs issued by the metric metadata sink's flush window
     /// (ADR-0085 decision 1). The ADR budgets one GET per tenant per window
@@ -211,11 +246,34 @@ pub struct IngestMetrics {
 /// Accumulator behind [`IngestMetrics::shard_skew`], one per shard. Each field
 /// is an independent [`AtomicU64`] so the per-message enqueue/process path
 /// updates its own shard with no lock and no cross-shard contention; the public
-/// [`ShardSkewStats`] is its point-in-time copy with `queue_depth` derived. All
-/// updates and reads use `Relaxed`: these are monotonic self-observability
-/// counters, not a synchronisation edge, so a snapshot that catches
-/// `messages_processed` incremented a moment before its matching `on_actor_ns`
-/// addend simply reports a cumulative sum one message behind, which self-heals.
+/// [`ShardSkewStats`] is its point-in-time copy with `queue_depth` derived.
+///
+/// # Ordering of the `on_actor_ns` / `messages_processed` pair
+///
+/// The two are separate atomics, so a reader cannot get an instantaneous
+/// snapshot of both. What it does get is a one-directional guarantee, which is
+/// the direction that matters for the derived mean `on_actor_ns /
+/// messages_processed`:
+///
+/// - The writer adds to `on_actor_ns` with `Relaxed`, then bumps
+///   `messages_processed` with `Release`.
+/// - [`IngestMetrics::shard_skew_by_shard`] loads `messages_processed` with
+///   `Acquire` **first**, then `on_actor_ns` with `Relaxed`.
+///
+/// The `Release`/`Acquire` pair and the release sequence formed by the chain of
+/// `fetch_add` read-modify-writes make every `on_actor_ns` addend that preceded
+/// a counted message visible to that reader. So a message can never be counted
+/// without its time, which would report the actor as *faster* than it is --
+/// precisely the direction that would manufacture evidence for the claim this
+/// metric exists to test (issue #865, and the earlier defect where permit wait
+/// was folded into `on_actor_ns`).
+///
+/// The opposite tear is still observable and is deliberate: a reader can see an
+/// `on_actor_ns` addend whose message has not yet been counted, so the mean can
+/// read high by at most one in-flight message's time per concurrent actor. Both
+/// counters are cumulative, so that self-heals on the next read. All other
+/// fields are plain `Relaxed` monotonic counters with no paired counter to tear
+/// against.
 #[derive(Debug, Default)]
 struct ShardSkewAtomics {
     messages_enqueued: AtomicU64,
@@ -339,16 +397,22 @@ pub struct IngestMetricsSnapshot {
 }
 
 impl IngestMetrics {
-    /// Metrics for a router of `shard_count` shards. Preallocates the lock-free
-    /// per-shard skew accumulators (issue #865): the shard set is fixed for the
-    /// process, so the per-message path indexes straight into the slice with no
-    /// lock. `IngestMetrics::default()` allocates none, which suits the many
-    /// tests and sinks that never touch the per-shard counters.
+    /// Metrics for a router whose generation-0 set has `shard_count` shards.
+    /// Preallocates the lock-free per-shard skew accumulators (issue #865) so
+    /// the per-message path indexes straight into the slice with no lock.
+    ///
+    /// The preallocation is [`SHARD_SKEW_CAPACITY`], not `shard_count`: a
+    /// tenant that activates a larger generation routes to shard indices above
+    /// the configured count (ADR-0052 section 2), and those must be counted
+    /// too. `shard_count` still participates only as a lower bound, for a
+    /// process configured above the catalog's own ceiling.
+    ///
+    /// `IngestMetrics::default()` allocates none, which suits the many tests
+    /// and sinks that never touch the per-shard counters.
     pub fn new(shard_count: u32) -> Self {
+        let capacity = shard_count.max(SHARD_SKEW_CAPACITY) as usize;
         IngestMetrics {
-            shard_skew: (0..shard_count)
-                .map(|_| ShardSkewAtomics::default())
-                .collect(),
+            shard_skew: (0..capacity).map(|_| ShardSkewAtomics::default()).collect(),
             ..Default::default()
         }
     }
@@ -408,13 +472,15 @@ impl IngestMetrics {
     /// on-actor serial section, excluding both the flush that runs off the
     /// actor and any flush-permit wait the caller already subtracted (issue
     /// #865). The `on_actor_ns` addend is stored before the processed count is
-    /// bumped, so a concurrent reader is at worst one message behind on the
-    /// count, never crediting a processed message with no time (see
-    /// [`ShardSkewAtomics`] on the `Relaxed` ordering).
+    /// bumped, and the count is bumped with `Release` against the `Acquire`
+    /// load in [`IngestMetrics::shard_skew_by_shard`], so a concurrent reader
+    /// is at worst one message behind on the count and never credits a
+    /// processed message with no time. See [`ShardSkewAtomics`] for why that
+    /// one direction is the one worth paying an ordering for.
     pub(crate) fn record_shard_processed(&self, shard: u32, on_actor_ns: u64) {
         if let Some(s) = self.shard_skew.get(shard as usize) {
             s.on_actor_ns.fetch_add(on_actor_ns, Ordering::Relaxed);
-            s.messages_processed.fetch_add(1, Ordering::Relaxed);
+            s.messages_processed.fetch_add(1, Ordering::Release);
         }
     }
 
@@ -447,6 +513,12 @@ impl IngestMetrics {
     /// #865). A shard with no recorded activity is simply absent. `queue_depth`
     /// is derived here as `messages_enqueued - messages_processed`, saturating
     /// at 0.
+    ///
+    /// This is not an instantaneous snapshot of all five counters: they are
+    /// independent atomics under concurrent recording. The one guarantee is
+    /// that `messages_processed` never runs ahead of the `on_actor_ns` it
+    /// belongs to; see [`ShardSkewAtomics`] for the ordering and for the bound
+    /// on the tear in the other direction.
     pub fn shard_skew_by_shard(&self) -> Vec<(u32, ShardSkewStats)> {
         // Preallocated by shard index, so iteration is already shard-ordered. A
         // shard that never enqueued or processed a message reads all-zero and is
@@ -456,7 +528,10 @@ impl IngestMetrics {
             .enumerate()
             .filter_map(|(shard, s)| {
                 let messages_enqueued = s.messages_enqueued.load(Ordering::Relaxed);
-                let messages_processed = s.messages_processed.load(Ordering::Relaxed);
+                // Acquire, and before `on_actor_ns`: pairs with the `Release`
+                // in `record_shard_processed` so every counted message's time
+                // addend is already visible below.
+                let messages_processed = s.messages_processed.load(Ordering::Acquire);
                 let on_actor_ns = s.on_actor_ns.load(Ordering::Relaxed);
                 let flush_permit_wait_ns = s.flush_permit_wait_ns.load(Ordering::Relaxed);
                 let off_actor_ns = s.off_actor_ns.load(Ordering::Relaxed);
@@ -852,6 +927,99 @@ mod tests {
                 "shard {shard} enqueued and processed counts match, so depth is 0"
             );
         }
+    }
+
+    /// The shard set is not fixed for the process: a tenant whose provisioning
+    /// record activates a larger generation routes to shard indices above
+    /// `config.shard_count` (ADR-0052 section 2, `generation.rs`). Sizing the
+    /// skew slice to `config.shard_count` dropped every one of those shards
+    /// silently, which biases the #865 measurement toward reporting less skew
+    /// than there is.
+    ///
+    /// The premise is derived here rather than asserted: `active_shard_count`
+    /// is the same pure rule `GenerationSwitch` routes on, so the shard index
+    /// under test is one the router really can produce.
+    #[test]
+    fn shard_skew_covers_indices_above_the_configured_shard_count() {
+        use ravel_catalog::{ShardGeneration, active_shard_count};
+
+        const CONFIGURED: u32 = 4;
+        let generations = vec![
+            ShardGeneration {
+                generation: 0,
+                shard_count: CONFIGURED,
+                activation_hour: 0,
+                appended_unix_ns: 0,
+            },
+            ShardGeneration {
+                generation: 1,
+                shard_count: 16,
+                activation_hour: 100,
+                appended_unix_ns: 1,
+            },
+        ];
+        let live = active_shard_count(&generations, 100);
+        assert_eq!(live, 16, "generation 1 is active at hour 100");
+        assert!(
+            live > CONFIGURED,
+            "the routed count must exceed the configured one for this test to mean anything"
+        );
+
+        let metrics = IngestMetrics::new(CONFIGURED);
+        // The highest index generation 1 routes to, well above `CONFIGURED`.
+        let shard = live - 1;
+        metrics.record_shard_enqueued(shard);
+        metrics.record_shard_enqueued(shard);
+        metrics.record_shard_enqueued(shard);
+        metrics.record_shard_processed(shard, 7_000);
+        metrics.record_shard_flush_permit_wait_ns(shard, 11);
+        metrics.record_shard_off_actor_ns(shard, 13);
+
+        // Exact values, not "an entry exists" or "some count > 0": the defect
+        // is a silently missing entry, so the assertion has to fail both when
+        // the entry is absent and when any figure in it is wrong.
+        assert_eq!(
+            metrics.shard_skew_by_shard(),
+            vec![(
+                shard,
+                ShardSkewStats {
+                    messages_enqueued: 3,
+                    messages_processed: 1,
+                    queue_depth: 2,
+                    on_actor_ns: 7_000,
+                    flush_permit_wait_ns: 11,
+                    off_actor_ns: 13,
+                }
+            )]
+        );
+    }
+
+    /// The capacity covers the whole domain a validated provisioning record can
+    /// declare, so the "index outside the slice is dropped" fallback is
+    /// unreachable for any generation the catalog accepts. Pins the top of the
+    /// range as well as the bottom: a capacity off by one at the ceiling would
+    /// lose exactly the largest reshard.
+    #[test]
+    fn shard_skew_covers_the_largest_generation_the_catalog_accepts() {
+        let metrics = IngestMetrics::new(1);
+        let highest = ravel_catalog::MAX_SHARD_COUNT - 1;
+        metrics.record_shard_enqueued(highest);
+        metrics.record_shard_processed(highest, 42);
+
+        assert_eq!(
+            metrics.shard_skew_by_shard(),
+            vec![(
+                highest,
+                ShardSkewStats {
+                    messages_enqueued: 1,
+                    messages_processed: 1,
+                    queue_depth: 0,
+                    on_actor_ns: 42,
+                    flush_permit_wait_ns: 0,
+                    off_actor_ns: 0,
+                }
+            )]
+        );
     }
 
     #[test]
