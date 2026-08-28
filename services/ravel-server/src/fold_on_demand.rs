@@ -28,6 +28,28 @@
 //! to, and an operator holding several tenants' credentials gets a check that
 //! they used the one they meant.
 //!
+//! # Admission
+//!
+//! Concurrent calls for one `(tenant, signal)` collapse into a single fold
+//! through [`SingleFlight`], the coalescing primitive the read cache already
+//! uses: one call runs the fold, every other call in flight for that key
+//! waits on its result and issues no object-store work of its own, and each
+//! response says which it was in `coalesced`. That is this route's admission
+//! gate. A fold is object-store-heavy -- it LISTs commit records, GETs parts,
+//! and PUTs new parts plus `HEAD` -- and it does that work whether or not
+//! anything turns out to be eligible, so an unguarded route would multiply
+//! that cost by the caller's own concurrency. A credential resolves to
+//! exactly one tenant (see Authorization above), so this bounds any one
+//! caller to one in-flight fold per signal, which is the same load the
+//! scheduled loop already places on that tenant.
+//!
+//! The route deliberately does not take a `QueryAdmissionController` permit
+//! the way the query surfaces do. A fold is deferred maintenance traffic and
+//! runs on the background store handle (ADR-0070); charging it against the
+//! query hot path's ceiling would let an operator's folds shed queries, and a
+//! permit bounds concurrency without removing the duplicated work that
+//! coalescing removes outright.
+//!
 //! # Concurrency
 //!
 //! Safe to call concurrently with the scheduled fold and with itself, because
@@ -35,9 +57,10 @@
 //! (docs/catalog-and-mvcc.md): every folder writes its parts under
 //! content-addressed keys and then compare-and-swaps `HEAD`. A losing CAS is
 //! an ordinary outcome, not corruption -- the loser re-reads `HEAD` and either
-//! rebases or stops, and no caller's data is lost either way. This module adds
-//! no lock of its own; a lock would only convert a cheap CAS loss into a
-//! queue.
+//! rebases or stops, and no caller's data is lost either way. The coalescing
+//! above is not a lock over the catalog: it deduplicates this route's own
+//! concurrent calls and never blocks or queues behind a fold this process did
+//! not start.
 //!
 //! # Outcomes
 //!
@@ -45,7 +68,11 @@
 //! `status` field ([`FoldOutcome`]):
 //!
 //! - `published`: this call wrote a new snapshot, advancing `HEAD` to name
-//!   content that differs from what it named before.
+//!   content that differs from what it named before. "Differs" is decided by
+//!   comparing the entry set the two `HEAD`s name, never by their entry
+//!   totals: one fold can fold new commits in and drop entries through a
+//!   retention tombstone in the same pass, and the two can cancel to an
+//!   identical total over a snapshot whose content changed.
 //! - `nothing_eligible`: no commit was eligible to fold. A fold seals an
 //!   ingest hour only once `max_flush_lifetime + clock_skew_allowance +
 //!   fold_safety_margin` has elapsed after that hour ends, so a fold
@@ -60,6 +87,7 @@
 //!   call) won the `HEAD` CAS. The catalog is fine and the winner's snapshot
 //!   is published; this call did not publish one.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use axum::Router;
@@ -68,10 +96,12 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
-use ravel_catalog::{Catalog, CatalogError, FoldReport};
+use ravel_cache::{Role, SingleFlight, SingleFlightError};
+use ravel_catalog::{Catalog, CatalogError, FoldReport, PartLimits, decode_head, decode_part};
 use ravel_ingest::Clock;
 use ravel_maintain::RetentionConfig;
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
+use ravel_proto::catalog::v1::{SnapshotHead, SnapshotPartRef};
 use ravel_query::http::TenantResolver;
 use ravel_types::{Signal, TenantHash, TenantId};
 use serde::Deserialize;
@@ -151,7 +181,27 @@ pub struct OnDemandFold {
     /// operator's question is whether any data was eligible -- but the
     /// watermark move is real and is never hidden.
     pub head_advanced: bool,
+    /// Object-store GETs this route issued outside [`Catalog::fold`]: the
+    /// `HEAD` reads that bracket the fold, plus any snapshot part read to
+    /// decide whether the entry set changed. Reported separately from the
+    /// fold report's own `get_requests` because it is a different phase's
+    /// cost, and two phases' request counts are not summable into one figure.
+    pub classify_get_requests: u64,
 }
+
+/// Coalescing key: one in-flight fold per `(tenant, signal)`, which is the
+/// granularity [`Catalog::fold`] itself operates at.
+type FoldKey = (TenantHash, Signal);
+
+/// The route's admission gate (see the module docs): concurrent calls for one
+/// `(tenant, signal)` run one fold and share its result.
+///
+/// The value is `Arc`-wrapped because [`SingleFlight`] hands every waiter a
+/// clone, and so is the error: [`CatalogError`] is not `Clone` (it carries
+/// non-cloneable store and format errors), and an `Arc` shares the one real
+/// error rather than flattening it to a string that the 503 path could no
+/// longer log in full.
+pub type FoldInFlight = SingleFlight<FoldKey, Arc<OnDemandFold>, Arc<CatalogError>>;
 
 /// Shared state for the route: the same [`Catalog`] the query paths resolve
 /// through and the scheduled fold folds with, the store (read directly for the
@@ -173,6 +223,11 @@ pub struct OnDemandFoldState {
     /// The deployment-default retention window source (ADR-0078), the same
     /// `RetentionConfig` the scheduled fold and the Maintain-mode sweep use.
     pub retention: Arc<RetentionConfig>,
+    /// The route's admission gate. One instance per process, shared by every
+    /// listener this route is mounted on, so a call arriving on the mTLS
+    /// listener coalesces with a concurrent one on `--listen-http` instead of
+    /// running a second fold for the same tenant.
+    pub in_flight: Arc<FoldInFlight>,
 }
 
 /// The `/api/v1/admin/fold` router.
@@ -248,27 +303,48 @@ async fn run(state: &OnDemandFoldState, req: Request<Body>) -> Result<Response, 
     let now_ns = state.clock.now_ns();
     let default_retention_ns = state.retention.window_for(&tenant_hash);
 
-    let result = fold_once(
-        state.catalog.as_ref(),
-        state.store.as_ref(),
-        &tenant_hash,
-        signal,
-        state.folder_id,
-        now_ns,
-        default_retention_ns,
-    )
-    .await
-    .map_err(|err| {
+    // The admission gate (module docs): a concurrent call for this
+    // (tenant, signal) joins the fold already running instead of starting a
+    // second one over the same objects.
+    let (outcome, role) = state
+        .in_flight
+        .run((tenant_hash, signal), || async {
+            fold_once(
+                state.catalog.as_ref(),
+                state.store.as_ref(),
+                &tenant_hash,
+                signal,
+                state.folder_id,
+                now_ns,
+                default_retention_ns,
+            )
+            .await
+            .map(Arc::new)
+            .map_err(Arc::new)
+        })
+        .await;
+
+    let result = outcome.map_err(|err| {
         // Same redaction discipline as the query surfaces: a `CatalogError`
         // embeds the physical object key, and the tenant hash inside it, so
         // the full error is logged server-side and the caller gets a
-        // class-level message.
-        tracing::warn!(
-            tenant = %tenant_hash.to_hex(),
-            signal = ?signal,
-            error = %err,
-            "on-demand catalog fold failed"
-        );
+        // class-level message. A lost leader (the coalesced-into call was
+        // cancelled, typically a client disconnect) is reported the same way:
+        // nothing is known about the fold's outcome, and the call is
+        // retryable.
+        match &err {
+            SingleFlightError::Upstream(err) => tracing::warn!(
+                tenant = %tenant_hash.to_hex(),
+                signal = ?signal,
+                error = %err,
+                "on-demand catalog fold failed"
+            ),
+            SingleFlightError::LeaderLost => tracing::warn!(
+                tenant = %tenant_hash.to_hex(),
+                signal = ?signal,
+                "on-demand catalog fold: the fold this call coalesced into was cancelled"
+            ),
+        }
         ApiError {
             status: StatusCode::SERVICE_UNAVAILABLE,
             error_type: "unavailable",
@@ -276,10 +352,12 @@ async fn run(state: &OnDemandFoldState, req: Request<Body>) -> Result<Response, 
         }
     })?;
 
+    let coalesced = role == Role::Follower;
     tracing::info!(
         tenant = %tenant_hash.to_hex(),
         signal = ?signal,
         outcome = result.outcome.as_str(),
+        coalesced,
         watermark_hour = ?result.report.as_ref().and_then(|r| r.watermark_hour),
         "on-demand catalog fold complete"
     );
@@ -291,6 +369,13 @@ async fn run(state: &OnDemandFoldState, req: Request<Body>) -> Result<Response, 
         "message": result.outcome.message(),
         "tenant_hash": tenant_hash.to_hex(),
         "signal": body.signal,
+        // `true` when this request did not run the fold itself but coalesced
+        // into one already in flight for the same (tenant, signal) and is
+        // reporting that fold's outcome. The catalog state the outcome
+        // describes is this request's answer either way; what differs is
+        // which request paid for it.
+        "coalesced": coalesced,
+        "classify_get_requests": result.classify_get_requests,
     });
     if let Some(report) = &result.report {
         // `as_object_mut` is `Some` for the literal above, which is an object;
@@ -332,8 +417,8 @@ async fn run(state: &OnDemandFoldState, req: Request<Body>) -> Result<Response, 
 ///   somebody else published while this call was folding.
 /// - A fold whose sealing watermark advanced over hours that held no commits
 ///   rewrites `HEAD` and reports `no_op: false`, having folded nothing. The
-///   previous `HEAD`'s entry count tells that apart from a fold that really
-///   changed the snapshot's content.
+///   two `HEAD`s' entry sets tell that apart from a fold that really changed
+///   the snapshot's content (see [`snapshot_content_changed`]).
 pub async fn fold_once(
     catalog: &Catalog,
     store: &dyn ObjectStoreBackend,
@@ -343,36 +428,68 @@ pub async fn fold_once(
     now_ns: i64,
     default_retention_ns: Option<i64>,
 ) -> Result<OnDemandFold, CatalogError> {
-    let before = read_head(store, tenant, signal)
+    let mut gets = 0u64;
+    let before = read_head(store, tenant, signal, &mut gets)
         .await
         .map_err(CatalogError::Store)?;
-    let entries_before = head_entry_count(before.as_deref());
 
     match catalog
         .fold(tenant, signal, folder_id, now_ns, &[], default_retention_ns)
         .await
     {
         Ok(report) if !report.no_op => {
-            // `HEAD` was rewritten. Whether anything was *eligible* is a
-            // second question: an ingest hour that seals while holding no
-            // commit still advances the watermark, and the resulting snapshot
-            // names exactly the entries the previous one did. Comparing the
-            // entry counts answers it in either direction -- a fold that
-            // folds new commits in, and one that drops entries through a
-            // retention tombstone, both changed the snapshot's content.
-            let outcome = if report.entry_count == entries_before {
-                FoldOutcome::NothingEligible
-            } else {
+            // `HEAD` was rewritten by this call. Whether anything was
+            // *eligible* is a second question: an ingest hour that seals while
+            // holding no commit still advances the watermark, and the
+            // resulting snapshot names exactly the entries the previous one
+            // did. Only the entry set answers that. Entry totals do not: a
+            // single fold can fold new commits in and drop entries through a
+            // retention tombstone, and if those cancel, the total is
+            // unchanged over content that is not.
+            let after = match read_head(store, tenant, signal, &mut gets).await {
+                Ok(after) => after,
+                Err(err) => {
+                    // The fold published; only the check of what it published
+                    // failed. `nothing_eligible` is a definite negative claim,
+                    // so it is never the answer to a check that did not run.
+                    tracing::warn!(
+                        tenant = %tenant.to_hex(),
+                        signal = ?signal,
+                        error = %err,
+                        "on-demand catalog fold: HEAD unreadable after a publishing fold; \
+                         reporting published without the content comparison"
+                    );
+                    return Ok(OnDemandFold {
+                        outcome: FoldOutcome::Published,
+                        report: Some(report),
+                        head_advanced: true,
+                        classify_get_requests: gets,
+                    });
+                }
+            };
+            let changed = snapshot_content_changed(
+                store,
+                tenant,
+                signal,
+                before.as_deref(),
+                after.as_deref(),
+                &mut gets,
+            )
+            .await;
+            let outcome = if changed {
                 FoldOutcome::Published
+            } else {
+                FoldOutcome::NothingEligible
             };
             Ok(OnDemandFold {
                 outcome,
                 report: Some(report),
                 head_advanced: true,
+                classify_get_requests: gets,
             })
         }
         Ok(report) => {
-            let after = read_head(store, tenant, signal)
+            let after = read_head(store, tenant, signal, &mut gets)
                 .await
                 .map_err(CatalogError::Store)?;
             let outcome = if after == before {
@@ -384,6 +501,7 @@ pub async fn fold_once(
                 outcome,
                 report: Some(report),
                 head_advanced: false,
+                classify_get_requests: gets,
             })
         }
         // The catalog retries a losing CAS internally and only surfaces this
@@ -401,6 +519,7 @@ pub async fn fold_once(
                 outcome: FoldOutcome::LostCas,
                 report: None,
                 head_advanced: false,
+                classify_get_requests: gets,
             })
         }
         Err(err) => Err(err),
@@ -415,7 +534,9 @@ async fn read_head(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
     signal: Signal,
+    gets: &mut u64,
 ) -> Result<Option<Vec<u8>>, StoreError> {
+    *gets += 1;
     match store
         .get(&crate::fold::head_key(tenant, signal), GetRange::Full)
         .await
@@ -426,25 +547,195 @@ async fn read_head(
     }
 }
 
-/// Entries named by a `HEAD` object, summed over its parts. `0` for an absent
-/// `HEAD`, and for one this process cannot decode -- both mean "no snapshot
-/// content to compare against", and a fold over either rebuilds from the
-/// commit layout anyway.
-fn head_entry_count(head: Option<&[u8]>) -> u64 {
-    head.and_then(|bytes| ravel_catalog::decode_head(bytes).ok())
-        .map(|head| head.parts.iter().map(|part| part.entry_count).sum())
-        .unwrap_or(0)
+/// Snapshot parts read to compare two `HEAD`s' entry sets, per side. Only
+/// parts whose content actually changed are ever read (see
+/// [`snapshot_content_changed`]): a watermark-only rewrite changes exactly one
+/// (the tail), and a rebuild that re-derives the same entries changes none,
+/// because a part's `blake3` is over its bytes. A remainder larger than this
+/// means many parts' contents differ, which is already the answer, so the cap
+/// bounds the comparison's cost without changing what it concludes.
+const MAX_COMPARED_PARTS: usize = 8;
+
+/// Whether the entry set named by `HEAD` differs between `before` and `after`.
+///
+/// This never errors: it answers the classification question, and the fold it
+/// classifies has already published. When the comparison cannot be completed
+/// (an undecodable `HEAD`, a part that has since been swept, a remainder past
+/// [`MAX_COMPARED_PARTS`]) it answers `true` and logs, because
+/// `nothing_eligible` asserts that no commit entered or left the snapshot and
+/// that is not something an incomplete comparison has shown.
+///
+/// The comparison is cheap in every ordinary case. Parts are content
+/// addressed, so a part carrying the same `blake3` on both sides holds the
+/// same entries by construction and needs no read; only the remainder on each
+/// side is fetched and decoded.
+async fn snapshot_content_changed(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    signal: Signal,
+    before: Option<&[u8]>,
+    after: Option<&[u8]>,
+    gets: &mut u64,
+) -> bool {
+    let after = match after.map(decode_head) {
+        Some(Ok(head)) => head,
+        other => {
+            tracing::warn!(
+                tenant = %tenant.to_hex(),
+                signal = ?signal,
+                present = other.is_some(),
+                "on-demand catalog fold: the new HEAD did not decode; \
+                 reporting published without the content comparison"
+            );
+            return true;
+        }
+    };
+    // An absent previous HEAD is the empty snapshot, which is a real
+    // comparand: a first fold over hours that hold nothing publishes a HEAD
+    // naming zero entries, and nothing was eligible for it either. A present
+    // but undecodable one is not, and falls through to the mismatch below.
+    let before: Option<SnapshotHead> = match before.map(decode_head) {
+        None => None,
+        Some(Ok(head)) => Some(head),
+        Some(Err(err)) => {
+            tracing::warn!(
+                tenant = %tenant.to_hex(),
+                signal = ?signal,
+                error = %err,
+                "on-demand catalog fold: the previous HEAD did not decode; \
+                 reporting published without the content comparison"
+            );
+            return true;
+        }
+    };
+    let before_parts: &[SnapshotPartRef] = before.as_ref().map_or(&[], |head| &head.parts);
+
+    if entry_total(before_parts) != entry_total(&after.parts) {
+        return true;
+    }
+    let before_only = parts_absent_from(before_parts, &after.parts);
+    let after_only = parts_absent_from(&after.parts, before_parts);
+    if before_only.is_empty() && after_only.is_empty() {
+        return false;
+    }
+    if before_only.len() > MAX_COMPARED_PARTS || after_only.len() > MAX_COMPARED_PARTS {
+        tracing::warn!(
+            tenant = %tenant.to_hex(),
+            signal = ?signal,
+            before_only = before_only.len(),
+            after_only = after_only.len(),
+            "on-demand catalog fold: too many parts differ to compare entry sets; \
+             reporting published"
+        );
+        return true;
+    }
+    let (Some(before_entries), Some(after_entries)) = (
+        read_entry_ids(store, tenant, signal, &before_only, gets).await,
+        read_entry_ids(store, tenant, signal, &after_only, gets).await,
+    ) else {
+        return true;
+    };
+    before_entries != after_entries
+}
+
+/// Entries named across a `HEAD`'s parts.
+fn entry_total(parts: &[SnapshotPartRef]) -> u64 {
+    parts.iter().map(|part| part.entry_count).sum()
+}
+
+/// The parts of `parts` whose bytes no part of `other` also names. Matching is
+/// on `blake3` alone: it is the hash of the part's full bytes, and the part
+/// key embeds a prefix of it, so equal hashes mean equal entries.
+fn parts_absent_from<'a>(
+    parts: &'a [SnapshotPartRef],
+    other: &[SnapshotPartRef],
+) -> Vec<&'a SnapshotPartRef> {
+    let present: BTreeSet<&[u8]> = other.iter().map(|part| part.blake3.as_slice()).collect();
+    parts
+        .iter()
+        .filter(|part| !present.contains(part.blake3.as_slice()))
+        .collect()
+}
+
+/// One snapshot entry's identity plus the object it names:
+/// `(level, shard, ingest_hour_bucket, writer_id, writer_epoch, writer_seq,
+/// content_hash)`. The leading tuple is the fold's own dedup key
+/// (`ravel_catalog::EntryIdentity`); `content_hash` is carried too so a
+/// rewritten entry for one identity counts as a change.
+type EntryId = (u32, u32, u32, Vec<u8>, u64, u64, Vec<u8>);
+
+/// Every entry identity across `parts`, or `None` if any part could not be
+/// read or decoded (the caller then declines to claim the sets are equal).
+async fn read_entry_ids(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    signal: Signal,
+    parts: &[&SnapshotPartRef],
+    gets: &mut u64,
+) -> Option<BTreeSet<EntryId>> {
+    let limits = PartLimits::default();
+    let mut ids = BTreeSet::new();
+    for part in parts {
+        *gets += 1;
+        let bytes = match store.get(&part.key, GetRange::Full).await {
+            Ok(got) => got.data,
+            Err(err) => {
+                tracing::warn!(
+                    tenant = %tenant.to_hex(),
+                    signal = ?signal,
+                    key = %part.key,
+                    error = %err,
+                    "on-demand catalog fold: a snapshot part named by HEAD could not be read"
+                );
+                return None;
+            }
+        };
+        let decoded = match decode_part(&bytes, &limits) {
+            Ok(decoded) => decoded,
+            Err(err) => {
+                tracing::warn!(
+                    tenant = %tenant.to_hex(),
+                    signal = ?signal,
+                    key = %part.key,
+                    error = %err,
+                    "on-demand catalog fold: a snapshot part named by HEAD did not decode"
+                );
+                return None;
+            }
+        };
+        for entry in decoded.entries {
+            ids.insert((
+                entry.level,
+                entry.shard,
+                entry.ingest_hour_bucket,
+                entry.writer_id,
+                entry.writer_epoch,
+                entry.writer_seq,
+                entry.content_hash,
+            ));
+        }
+    }
+    Some(ids)
 }
 
 fn authenticate(state: &OnDemandFoldState, headers: &HeaderMap) -> Result<TenantId, ApiError> {
-    state
-        .tenant_resolver
-        .resolve(headers)
-        .map_err(|_| ApiError {
+    state.tenant_resolver.resolve(headers).map_err(|err| {
+        // The same discipline the fold path applies to a catalog fault: the
+        // caller gets a class-level answer, the server keeps the error. A
+        // resolver that failed because its durable auth map was unreachable
+        // is a deployment fault, not a bad credential, and a bare 401 leaves
+        // no trace of it anywhere.
+        tracing::warn!(
+            error = %err,
+            route = FOLD_ROUTE,
+            "on-demand catalog fold: tenant resolution failed"
+        );
+        ApiError {
             status: StatusCode::UNAUTHORIZED,
             error_type: "unauthorized",
             message: "authentication required".to_string(),
-        })
+        }
+    })
 }
 
 /// The endpoint's error shape, mirroring the sibling query endpoints' typed
@@ -852,6 +1143,7 @@ mod tests {
             clock: Arc::new(SystemClock),
             folder_id: Uuid::from_u128(1),
             retention: Arc::new(RetentionConfig::default()),
+            in_flight: Arc::new(FoldInFlight::new()),
         }
     }
 

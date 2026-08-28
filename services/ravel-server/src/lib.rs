@@ -631,7 +631,9 @@ fn remote_write_state(
 /// `store` is the foreground, ack-bearing object-store handle (ADR-0070
 /// decision 1): the ingest routers, the catalog, and every query surface use
 /// it. `store_background` is the maintenance-class handle: the maintain, fold,
-/// and scrub loops use it. The two come from a `ClassedStore`; in the default
+/// and scrub loops use it, and so does the on-demand fold route, which runs
+/// the scheduled fold's work on an operator's trigger rather than a timer's.
+/// The two come from a `ClassedStore`; in the default
 /// passthrough construction they are the same `Arc`, so this split changes
 /// nothing at runtime and only becomes load-bearing once `--store-scheduling`
 /// installs the real scheduler. Every other object-store consumer here (the
@@ -1375,23 +1377,33 @@ pub async fn start(
         // triggers. Authorization is the deployment's tenant resolver, the
         // same credential the query routes above require.
         let on_demand_fold_retention = Arc::new(config.maintain.retention.clone());
+        // One coalescing gate for the process, shared by both listeners: a
+        // fold triggered on the mTLS listener and one triggered on
+        // `--listen-http` for the same (tenant, signal) run once, not twice.
+        let on_demand_fold_in_flight = Arc::new(fold_on_demand::FoldInFlight::new());
         let on_demand_fold_state = fold_on_demand::OnDemandFoldState {
             catalog: catalog.clone(),
-            store: store.clone(),
+            // Background class (ADR-0070), matching the scheduled fold below:
+            // an on-demand fold runs the identical LIST/GET/PUT sequence over
+            // the same objects, so it is the same deferred maintenance
+            // traffic and must not share the query hot path's bounds.
+            store: store_background.clone(),
             tenant_resolver: config.tenant_resolver.clone(),
             clock: Arc::new(SystemClock),
             folder_id: on_demand_folder_id,
             retention: on_demand_fold_retention.clone(),
+            in_flight: on_demand_fold_in_flight.clone(),
         };
         http_router = http_router.merge(fold_on_demand::router(on_demand_fold_state));
         if let Some(mtls) = &config.mtls_listener {
             let mtls_fold_state = fold_on_demand::OnDemandFoldState {
                 catalog: catalog.clone(),
-                store: store.clone(),
+                store: store_background.clone(),
                 tenant_resolver: mtls.resolver.clone(),
                 clock: Arc::new(SystemClock),
                 folder_id: on_demand_folder_id,
                 retention: on_demand_fold_retention,
+                in_flight: on_demand_fold_in_flight,
             };
             mtls_router = mtls_router.merge(fold_on_demand::router(mtls_fold_state));
         }
