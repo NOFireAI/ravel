@@ -850,12 +850,46 @@ in-flight flushes today; wiring either into an operator scrape is a follow-up in
   messages, not ingest load.
 - `queue_depth`: `messages_enqueued - messages_processed` at read time
   (saturating), the messages still in the channel.
-- `on_actor_ns` vs `off_actor_ns`: injected-`Clock` nanoseconds spent in the
-  actor's serial merge/pin section versus in the flush task ADR-0067 runs off
-  the actor (encode plus both PUTs). The split is the point: without it a
-  measurement cannot tell an actor-thread bottleneck from a flush bottleneck.
-  The actor returns from `handle_write` once the flush task is spawned, so its
-  on-actor time never includes the flush.
+- `on_actor_ns`, `flush_permit_wait_ns`, `off_actor_ns`: injected-`Clock`
+  nanoseconds, split three ways. See "The three time spans" below; reading any
+  two of them as if they were the whole split misattributes backpressure.
+
+#### The three time spans
+
+The split is the point of the whole measurement: without it, a figure cannot
+tell an actor-thread bottleneck from a flush bottleneck, and a two-way split
+cannot tell either of those from flush backpressure. Each span is bracketed on
+the injected `Clock` at a distinct boundary in `crates/ravel-ingest/src/shard.rs`,
+and the three boundaries are consecutive, so no nanosecond of any sampled
+interval is charged to more than one counter.
+
+| Counter | Starts | Stops | What it means |
+|---|---|---|---|
+| `on_actor_ns` | the actor pulls a `Write` off its channel | `handle_write` returns, minus any permit wait nested inside | merge-and-pin work the single-threaded actor genuinely serialises |
+| `flush_permit_wait_ns` | `flush_tenant` reaches the `max_inflight_flushes` acquire | that acquire grants a permit | this shard's flush backpressure: the actor is stalled on an earlier flush of the same shard |
+| `off_actor_ns` | the spawned flush task enters `run_flush`, permit already held | `run_flush` returns (success or abandonment) | exemplar admission, encode, and both PUTs |
+
+Read them as: a rising `on_actor_ns` means the actor is the bottleneck; a rising
+`flush_permit_wait_ns` means flushing is, and the actor is merely waiting on it;
+a rising `off_actor_ns` with a flat permit wait means flushes are slow but not
+yet backed up.
+
+`on_actor_ns` and `flush_permit_wait_ns` both accrue on the actor task, so they
+are disjoint in wall time as well as in code: together they account for the
+actor's whole `Write`-handling window, and their sum can never exceed it.
+`off_actor_ns` accrues in spawned tasks that run *concurrently* with the actor,
+which is exactly what ADR-0067's pipelining is for, so it is a sum over
+concurrent tasks: at `max_inflight_flushes > 1` it can legitimately exceed wall
+time, and it overlaps the other two in wall time. That overlap is not
+double-counting -- no sampled interval lands in two counters.
+
+The interval an actor spends parked in `flush_permit_wait_ns` is wall-time
+concurrent with a *prior* flush's `off_actor_ns`, and it is charged to the actor
+side exactly once, as permit wait, never as actor work. Folding it into
+`on_actor_ns` instead (as the first cut of this metric did) both double-counts
+that interval and inverts the reading: the actor reports busy precisely when the
+truth is that flushes are backed up. `crates/ravel-ingest/tests/shard_skew.rs`
+pins both properties on fixed input.
 
 Still tracked future work (not yet implemented): a per-tenant dimensioned
 model and per-shard latency histograms -- per-shard buffered bytes/points,
