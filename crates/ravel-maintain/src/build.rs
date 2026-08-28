@@ -235,6 +235,15 @@ pub async fn build_parts(
     // `max_l1_part_bytes`. Part boundaries are chosen on output bytes (ADR-0092
     // decision 3), which after run merging no longer track input bytes, so a
     // part may span several fetch windows and a window may finish several parts.
+    //
+    // On this RSEG path `max_l1_part_bytes` is used for exactly what its name
+    // (the stored-size target, issue #872) means: real encoded output bytes.
+    // There is no separate memory bound here because this builder never holds a
+    // whole stream's decoded records the way the RLOG merge does -- it
+    // materializes and flushes series by series -- so its peak is already the
+    // output part, which `max_l1_part_bytes` bounds directly. `max_l1_part_bytes`
+    // is the encoded budget; the RLOG-only `max_l1_part_memory_bytes` does not
+    // apply.
     let mut pending: Vec<SeriesInputV7> = Vec::new();
     let mut pending_exemplars: Vec<ExemplarInput> = Vec::new();
     let mut pending_output_bytes: u64 = 0;
