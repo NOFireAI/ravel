@@ -488,6 +488,17 @@ fn declared_null_scalar(ty: DeclaredType) -> ScalarValue {
     }
 }
 
+/// Exact `GROUP BY <declared column>, COUNT(*)` result from
+/// [`LogsScanExec::declared_group_counts`] (ADR-0850's q08 shape): one exact
+/// count per distinct non-null value, plus the count of NULL rows kept
+/// separately so a caller can decide whether SQL's NULL group applies (it
+/// does when `null_count > 0`, and a zero-segment or all-null scan still
+/// answers correctly with `counts` empty and `null_count` set accordingly).
+pub(crate) struct DeclaredGroupCounts {
+    pub(crate) counts: Vec<(ScalarValue, u64)>,
+    pub(crate) null_count: u64,
+}
+
 /// Log segment scan producing block-at-a-time batches over a projection of the
 /// public `logs` schema. Declares no ordering (ADR-0087 decision 1).
 pub struct LogsScanExec {
@@ -1048,6 +1059,85 @@ impl LogsScanExec {
             min.unwrap_or_else(|| null_scalar.clone()),
             max.unwrap_or(null_scalar),
         ))
+    }
+
+    /// Exact count of rows whose declared column at schema index
+    /// `FIRST_DECLARED_COL + k` is non-null and not equal to `literal`
+    /// (ADR-0850's q02 shape: `COUNT(*) WHERE <declared column> <> <literal>`,
+    /// which per SQL three-valued logic excludes NULL rows the same way the
+    /// scan path's per-row `<>` evaluation would). `None` means fall back to
+    /// scanning, for every reason [`Self::declared_min_max`] does (no pending
+    /// erasure allowed, no `Str` support, needs a loaded column-stats object
+    /// covering every touched segment), plus one specific to this path: any
+    /// covered segment whose dictionary is absent because its distinct-value
+    /// count exceeded the fold's cardinality ceiling (ADR-0850 decision 3) has
+    /// no exact per-value count to subtract, so a count derived from it could
+    /// be wrong outright, not merely unavailable.
+    pub(crate) fn declared_not_equal_count(&self, k: usize, literal: &ScalarValue) -> Option<u64> {
+        if !self.erasure.is_empty() {
+            return None;
+        }
+        let declared = self.declared.get(k)?;
+        if matches!(declared.ty, DeclaredType::Str) {
+            return None;
+        }
+        let stats = self.column_stats.as_ref()?;
+        let mut total: u64 = 0;
+        for seg in self.segments.iter() {
+            let seg_stats = stats.segments.get(&segment_identity(seg))?;
+            let stat = seg_stats.columns.iter().find(|c| c.name == declared.key)?;
+            if !stat.dictionary_present {
+                return None;
+            }
+            let mut matching: u64 = 0;
+            for entry in &stat.dictionary {
+                let value = entry.value.as_ref()?;
+                let v = declared_scalar(declared.ty, value)?;
+                if v == *literal {
+                    matching += entry.count;
+                }
+            }
+            total += stat.non_null_count.checked_sub(matching)?;
+        }
+        Some(total)
+    }
+
+    /// Exact GROUP BY value -> COUNT(*) for the declared column at schema
+    /// index `FIRST_DECLARED_COL + k` (ADR-0850's q08 shape), merging every
+    /// touched segment's exact dictionary. `None` means fall back to
+    /// scanning, for the same reasons [`Self::declared_not_equal_count`]
+    /// does. `ScalarValue`'s `Eq`/`Hash` are used directly as the merge key:
+    /// `DeclaredType` has no floating-point variant, so the NaN/-0.0 hazards
+    /// that motivate this repo's bit-pattern float-comparison rule elsewhere
+    /// never arise for a declared column's value domain.
+    pub(crate) fn declared_group_counts(&self, k: usize) -> Option<DeclaredGroupCounts> {
+        if !self.erasure.is_empty() {
+            return None;
+        }
+        let declared = self.declared.get(k)?;
+        if matches!(declared.ty, DeclaredType::Str) {
+            return None;
+        }
+        let stats = self.column_stats.as_ref()?;
+        let mut merged: HashMap<ScalarValue, u64> = HashMap::new();
+        let mut null_count: u64 = 0;
+        for seg in self.segments.iter() {
+            let seg_stats = stats.segments.get(&segment_identity(seg))?;
+            let stat = seg_stats.columns.iter().find(|c| c.name == declared.key)?;
+            if !stat.dictionary_present {
+                return None;
+            }
+            null_count += stat.null_count;
+            for entry in &stat.dictionary {
+                let value = entry.value.as_ref()?;
+                let v = declared_scalar(declared.ty, value)?;
+                *merged.entry(v).or_insert(0) += entry.count;
+            }
+        }
+        Some(DeclaredGroupCounts {
+            counts: merged.into_iter().collect(),
+            null_count,
+        })
     }
 
     /// Whether this scan can take the predicate-free full-window whole-segment
