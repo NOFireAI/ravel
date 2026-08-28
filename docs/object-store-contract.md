@@ -170,16 +170,39 @@ the reason compaction's crash story degrades to wasted work rather than corrupt
 state). `abort` releases the uploaded parts. It is best effort against the
 server but final for the handle: an upload S3 never heard the abort for leaves
 orphaned parts, which are billed until a bucket lifecycle rule reaps them, and
-never a readable object. Operators SHOULD configure such a rule
-(`AbortIncompleteMultipartUpload`) on Ravel buckets. Because `put()`'s
+never a readable object. **A bucket that Ravel writes multipart uploads to MUST
+configure `AbortIncompleteMultipartUpload`**, with a cleanup period of 7 days or
+less. This is not a recommendation: a failed abort or a future dropped
+mid-upload can leave billable parts indefinitely, and nothing in Ravel reaps
+them, so the lifecycle rule is the only mechanism that bounds the cost. Because `put()`'s
 above-threshold multipart path aborts best effort and discards the result
 (it never retries or blocks on the abort), that failure is otherwise silent:
-`S3Store::multipart_abort_failures` counts aborts whose request itself
-returned an error (parts certainly orphaned, so a non-zero value with the
-lifecycle rule absent is a live cost leak), and `S3Store::multipart_uploads_unreaped`
-counts multipart uploads that ended without a successful abort for any reason
-(a failed abort, or a future dropped mid-upload before any abort ran);
-subtracting the first from the second isolates the dropped case. Both read a
+`S3Store::multipart_abort_failures` counts aborts whose request returned an
+error, and `S3Store::multipart_uploads_unreaped` counts multipart uploads that
+ended without a successful abort for any reason (a failed abort, or a future
+dropped mid-upload with its abort unresolved). Note the two do not partition
+cleanly: if the future is cancelled while `upload.abort().await` is still
+pending, the guard increments `multipart_uploads_unreaped` while
+`multipart_abort_failures` does not, even though an abort request WAS attempted
+and may well have been applied server-side. So the difference between them
+counts "no confirmed abort outcome", which includes both "no abort was issued"
+and "an abort was issued and its result is unknown".
+
+Both counters cover only uploads that reached the point where the guard is
+armed. `put_via_multipart` arms `UnreapedGuard` *after*
+`put_multipart(&path).await` returns, so if `CreateMultipartUpload` is accepted
+server-side and the future is cancelled before its response arrives, an open
+upload exists that neither counter ever sees. That window is bounded by the
+lifecycle rule and by nothing else, which is a further reason the rule is
+required rather than advisory.
+
+Read both as **outcomes that were not confirmed**, not as a count of billable
+orphans. An abort can return an error after S3 has already applied the
+operation, and in particular an abort issued after an ambiguous `complete()`
+error can fail precisely *because the upload already completed* — leaving a
+visible object and nothing to reap, while both counters rise. So a non-zero
+value means "reconcile against S3's own list of open uploads", not "this many
+orphans exist". Both read a
 process-local `AtomicU64` on the `S3Store`; a hard process crash increments
 neither, so that case stays inferable only from S3's own list of open uploads.
 
@@ -441,9 +464,11 @@ adapter contract:
    a manifest, or provenance data outside any path Ravel's own retention
    logic controls.
 3. **Two sanctioned lifecycle rules**, and only these:
-   - `AbortIncompleteMultipartUpload` (recommended, 7 days) — cleans up
-     abandoned multipart uploads; absence does not violate the contract,
-     it just lets incomplete uploads accumulate.
+   - `AbortIncompleteMultipartUpload` (REQUIRED, 7 days or less) — cleans up
+     abandoned multipart uploads. **Its absence violates the bucket
+     configuration contract**, because nothing in Ravel reaps abandoned
+     uploads: a failed abort or a future dropped mid-upload leaves billable
+     parts indefinitely, and this rule is the only mechanism that bounds them.
    - The noncurrent-version expiration rule required by point 1 when
      versioning is ON.
 4. **Object Lock, compliance mode**, on the protected prefixes: `sys/*`,
@@ -470,8 +495,12 @@ report what a backend affirmatively discloses, via
 qualification" above) plus `bucket_config_alarms`, which turns an observed
 [`BucketConfigProbe`] into `"ALARM:"`-prefixed strings for a genuine
 contract violation (point 1's versioning/expiration pairing) and
-`"NOTE:"`-prefixed strings for an advisory gap (the recommended
-multipart-abort rule). Every production backend reports
+`"NOTE:"`-prefixed strings where the probe cannot establish compliance. The
+multipart-abort rule is REQUIRED (point 3), so its absence is a contract
+violation and not an advisory gap; it is reported under `"NOTE:"` only because
+this crate calls no vendor API that can observe the rule, so the probe cannot
+determine compliance either way. The prefix reflects the limits of the probe,
+never a weaker requirement. Every production backend reports
 [`ObjectLockStatus::Unknown`] and every `BucketConfigProbe` field
 `Unknown` through these traits today — there is no vendor API this crate
 calls to populate anything else — so today these probes are informational

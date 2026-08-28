@@ -243,10 +243,11 @@ pub struct S3Store {
     /// can read its counter (ADR-0106).
     instance_role_provider: Option<Arc<InstanceRoleCredentialProvider>>,
     /// Best-effort aborts in [`S3Store::put_via_multipart`] whose
-    /// `AbortMultipartUpload` request itself returned an error, so the upload's
-    /// parts are certainly orphaned until the bucket's
-    /// `AbortIncompleteMultipartUpload` lifecycle rule reaps them (#864). Read
-    /// via [`S3Store::multipart_abort_failures`].
+    /// `AbortMultipartUpload` request returned an error, so cleanup was NOT
+    /// CONFIRMED from here (#864). Not proof of orphaning: S3 can apply
+    /// `complete` or `abort` and then fail the response, so this can count an
+    /// upload that is already a visible object. Reconcile against S3's own list
+    /// of open uploads. Read via [`S3Store::multipart_abort_failures`].
     multipart_abort_failures: AtomicU64,
     /// Multipart uploads opened by [`S3Store::put_via_multipart`] that ended
     /// without a successful abort for any reason: a failed abort (also counted
@@ -299,13 +300,18 @@ impl S3Store {
     }
 
     /// Count of best-effort aborts in [`S3Store::put_via_multipart`] whose
-    /// `AbortMultipartUpload` request itself returned an error (#864). Each one
-    /// leaves the failed upload's parts orphaned on the bucket, billed until
-    /// the `AbortIncompleteMultipartUpload` lifecycle rule
+    /// `AbortMultipartUpload` request returned an error (#864).
+    ///
+    /// This is a **cleanup-not-confirmed** count, not a count of orphans. S3 can
+    /// apply the operation and then fail the response, and an abort issued after
+    /// an ambiguous `complete()` can fail precisely because the upload already
+    /// completed — a visible object with nothing to reap, counted here anyway.
+    /// So a non-zero value means "reconcile against S3's list of open uploads",
+    /// and only the uploads that really are incomplete are billed until the
+    /// `AbortIncompleteMultipartUpload` lifecycle rule
     /// (docs/object-store-contract.md, "Required bucket configuration") reaps
-    /// them; a non-zero value with that rule absent is a live cost leak. The
-    /// best-effort abort is deliberate: this counts the failure rather than
-    /// blocking or retrying it.
+    /// them. The best-effort abort is deliberate: this counts the unconfirmed
+    /// outcome rather than blocking or retrying it.
     pub fn multipart_abort_failures(&self) -> u64 {
         self.multipart_abort_failures.load(Ordering::Relaxed)
     }
@@ -817,11 +823,18 @@ impl S3Store {
     /// Abort a failed multipart upload best effort, observing the outcome
     /// rather than acting on it: the abort is deliberately never retried and
     /// never blocking (docs/object-store-contract.md, "Visibility and abort").
-    /// A successful abort disarms `unreaped` because the parts were released. A
-    /// failed abort leaves them orphaned until the bucket's
-    /// `AbortIncompleteMultipartUpload` lifecycle rule reaps them, so it
-    /// increments `multipart_abort_failures`, logs the key for an operator to
-    /// grep, and leaves `unreaped` armed so the upload also counts there (#864).
+    /// A successful abort disarms `unreaped` because the parts were released.
+    ///
+    /// An abort that returns `Err` is recorded as **cleanup not confirmed**, not
+    /// as proof that parts are orphaned, and the distinction is deliberate: a
+    /// response can fail after S3 has already applied the operation. In
+    /// particular, after an ambiguous `complete()` error the subsequent abort can
+    /// fail *because the upload already completed*, in which case there is a
+    /// visible object and nothing to reap. Both counters therefore mean "the
+    /// outcome was not confirmed from here", and an operator reconciles against
+    /// remote state (or the lifecycle rule does) rather than trusting them as a
+    /// count of billable orphans. Treating `Err` as confirmed orphaning would
+    /// over-report by exactly the ambiguous-completion case (#864).
     async fn abort_best_effort(
         &self,
         key: &str,
@@ -837,7 +850,8 @@ impl S3Store {
                     phase = "multipart_abort",
                     key = %key,
                     error = %map_error_common(e),
-                    "multipart abort failed; upload parts orphaned until the \
+                    "multipart abort not confirmed; if the upload did not \
+                     already complete, its parts stay billable until the \
                      AbortIncompleteMultipartUpload lifecycle rule reaps them"
                 );
             }

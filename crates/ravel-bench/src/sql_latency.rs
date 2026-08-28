@@ -47,8 +47,8 @@ use std::time::{Duration, Instant};
 use datafusion::physical_plan::displayable;
 use ravel_cache::{Cache, CacheLimits};
 use ravel_catalog::{
-    Catalog, CatalogConfig, DeclaredColumnType, read_config_values, read_generations_from_store,
-    shard_ceiling,
+    Catalog, CatalogConfig, DeclaredColumnType, SegmentLevel, read_config_values,
+    read_generations_from_store, shard_ceiling,
 };
 use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
@@ -130,13 +130,37 @@ pub enum TenantLaneError {
         end_ns: i64,
         now_ns: i64,
     },
+    /// `--compaction` asserted a layout that disagrees with what the tenant's
+    /// resolved snapshot actually contains. The label itself is always the
+    /// observed one ([`DatasetInfo::layout`] is never an echo of this flag,
+    /// issue #834); this is a separate, optional sanity check that fails
+    /// closed when the operator's belief about the tenant is stale, instead
+    /// of letting a mislabeled report through silently.
+    #[error(
+        "--compaction {asserted} disagrees with tenant `{tenant}`'s resolved snapshot: observed \
+         layout is `{observed}` across {object_count} resolved objects; recheck the tenant or \
+         drop the wrong --compaction flag"
+    )]
+    CompactionMismatch {
+        tenant: String,
+        asserted: &'static str,
+        observed: String,
+        object_count: usize,
+    },
 }
 
-/// Whether the measured object layout is a freshly loaded tenant (many small
-/// objects) or one the maintenance machinery has compacted (fewer, larger).
-/// ADR-0100 decision 4 requires the report to *state* this rather than guess,
-/// so the `--tenant` lane takes it as an operator-supplied flag; the generated
-/// lane is always freshly written and never compacted.
+/// An operator's belief about whether the measured tenant is a freshly loaded
+/// layout (many small objects) or one the maintenance machinery has compacted
+/// (fewer, larger).
+///
+/// This no longer supplies [`DatasetInfo::layout`] (issue #834: a
+/// `--compaction pre` label survived a real compaction and nearly entered a
+/// published comparison unchallenged). `layout` is always derived from the
+/// resolved snapshot's segment levels: any [`SegmentLevel::L1`] segment means
+/// compaction has run over at least part of the tenant. `Compaction` now
+/// feeds only an optional check ([`TenantConfigInput::compaction`]): when the
+/// operator states one, the tenant lane refuses to run if it disagrees with
+/// what the snapshot actually is, rather than silently trusting either side.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Compaction {
     /// A freshly loaded (or freshly generated) layout, never compacted.
@@ -287,10 +311,13 @@ fn default_deadline_secs() -> u64 {
 /// The dataset as it sits in the object store, independent of any one query.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DatasetInfo {
-    /// Wall time to build and publish the dataset. Measured for the generated
-    /// lane; `0.0` for the `--tenant` lane, whose load happened out of process
-    /// through `ravel-cli` and is not this harness's to time.
-    pub load_wall_ms: f64,
+    /// Wall time to build and publish the dataset. `Some` for the generated
+    /// lane, which builds and times it in process. `None` for the `--tenant`
+    /// lane: its load happened out of process through `ravel-cli` before this
+    /// run started, so there is nothing here to time, and a load that never
+    /// ran must never render as a measured `0.0ms` (issue #834).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_wall_ms: Option<f64>,
     /// Bytes stored across the dataset's data objects (summed over the resolved
     /// snapshot's segments).
     pub stored_bytes: u64,
@@ -301,7 +328,11 @@ pub struct DatasetInfo {
     pub object_count: usize,
     /// Durable rows across the dataset (summed segment sample counts).
     pub rows: u64,
-    /// `"pre-compaction"` or `"post-compaction"`: which layout was measured.
+    /// `"pre-compaction"` or `"post-compaction"`: which layout the tenant's
+    /// resolved snapshot actually contains, derived from each segment's
+    /// `SegmentLevel` (any `L1` segment means compaction has run over at
+    /// least part of the tenant). Observed, never an echo of an operator flag
+    /// (issue #834).
     pub layout: String,
 }
 
@@ -573,8 +604,13 @@ pub struct TenantConfigInput {
     pub window: TimeRange,
     /// Injected clock reading bounding that window.
     pub now_ns: i64,
-    /// Which layout the operator is measuring.
-    pub compaction: Compaction,
+    /// The operator's optional belief about which layout the tenant is in,
+    /// checked against the resolved snapshot rather than trusted (issue
+    /// #834). `Some` refuses the run if it disagrees with what the snapshot's
+    /// segments actually are; `None` skips the check. Either way,
+    /// `SqlLatencyReport::dataset.layout` is always the observed value, never
+    /// this flag echoed back.
+    pub compaction: Option<Compaction>,
     /// Per-query DataFusion memory-pool ceiling, in bytes, fed to
     /// [`SqlConfig::max_query_bytes`]. Mirrors `ravel-server`'s
     /// `--sql-max-query-bytes` (ADR-0088): raise it to measure a heavy query
@@ -1212,16 +1248,25 @@ async fn measure_over_flight(
     )))
 }
 
-/// Resolve the dataset-level figures (bytes, object count, rows) from a
-/// full-window catalog resolve over the logs signal. Shared by both lanes so
-/// object count is defined identically however the dataset was written.
+/// Resolve the dataset-level figures (bytes, object count, rows, layout)
+/// from a full-window catalog resolve over the logs signal. Shared by both
+/// lanes so every figure is defined identically however the dataset was
+/// written.
+///
+/// `layout` is derived here, never taken as a parameter (issue #834): a
+/// resolved snapshot with any [`SegmentLevel::L1`] segment has had
+/// compaction run over at least part of it, so it is reported
+/// `"post-compaction"`; an all-L0 snapshot is `"pre-compaction"`. This is the
+/// same signal ADR-0018's L0/L1 discriminator already carries per segment,
+/// read off the resolve every caller already performs -- no new state, no
+/// operator input, and no way for it to drift from what the tenant actually
+/// is.
 async fn dataset_info(
     store: &Arc<dyn ObjectStoreBackend>,
     tenant_hash: TenantHash,
     window: TimeRange,
     now_ns: i64,
-    load_wall_ms: f64,
-    compaction: Compaction,
+    load_wall_ms: Option<f64>,
     shard_count: u32,
 ) -> Result<DatasetInfo, Error> {
     let catalog = Arc::new(Catalog::new(
@@ -1236,12 +1281,21 @@ async fn dataset_info(
         .await?;
     let stored_bytes = snapshot.segments.iter().map(|s| s.object_size).sum();
     let rows = snapshot.segments.iter().map(|s| s.sample_count).sum();
+    let layout = if snapshot
+        .segments
+        .iter()
+        .any(|s| matches!(s.level, SegmentLevel::L1 { .. }))
+    {
+        Compaction::Post.label()
+    } else {
+        Compaction::Pre.label()
+    };
     Ok(DatasetInfo {
         load_wall_ms,
         stored_bytes,
         object_count: snapshot.segments.len(),
         rows,
-        layout: compaction.label().to_string(),
+        layout: layout.to_string(),
     })
 }
 
@@ -1270,8 +1324,7 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
         tenant_hash,
         window,
         NOW_NS,
-        load_wall_ms,
-        Compaction::Pre,
+        Some(load_wall_ms),
         shard_count,
     )
     .await?;
@@ -1361,8 +1414,7 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
         tenant_hash,
         cfg.window,
         cfg.now_ns,
-        0.0,
-        cfg.compaction,
+        None,
         shard_count,
     )
     .await?;
@@ -1378,6 +1430,22 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
             now_ns: cfg.now_ns,
         }
         .into());
+    }
+    // `dataset.layout` above is always the observed value; this is a separate,
+    // optional check of the operator's belief against it (issue #834). Refuse
+    // rather than let a stale `--compaction` claim sit next to a report that
+    // silently disagrees with it.
+    if let Some(asserted) = cfg.compaction {
+        let observed_post = dataset.layout == Compaction::Post.label();
+        if (asserted == Compaction::Post) != observed_post {
+            return Err(TenantLaneError::CompactionMismatch {
+                tenant: cfg.tenant.clone(),
+                asserted: asserted.label(),
+                observed: dataset.layout.clone(),
+                object_count: dataset.object_count,
+            }
+            .into());
+        }
     }
     let settings = ExecutorSettings {
         max_query_bytes: cfg.max_query_bytes,
@@ -1749,7 +1817,7 @@ mod tests {
                 end_ns: NOW_NS,
             },
             now_ns: NOW_NS,
-            compaction: Compaction::Pre,
+            compaction: None,
             max_query_bytes: DEFAULT_MAX_QUERY_BYTES,
             shards,
             cache_bytes,
@@ -2346,7 +2414,7 @@ mod tests {
         };
 
         // Pre-fix: shard_count 1 resolves shard 0 only.
-        let pre = dataset_info(&store, th, window, NOW_NS, 0.0, Compaction::Pre, 1)
+        let pre = dataset_info(&store, th, window, NOW_NS, None, 1)
             .await
             .expect("resolve at shard_count 1");
         assert_eq!(
@@ -2355,7 +2423,7 @@ mod tests {
         );
 
         // Fix: shard_count 2 counts both shards.
-        let post = dataset_info(&store, th, window, NOW_NS, 0.0, Compaction::Pre, 2)
+        let post = dataset_info(&store, th, window, NOW_NS, None, 2)
             .await
             .expect("resolve at shard_count 2");
         assert_eq!(
@@ -2827,6 +2895,210 @@ mod tests {
              failed={:?} entries={}",
             report.failed,
             report.entries.len()
+        );
+    }
+
+    /// A 1-shard tenant with `objects` hour-0 RLOG objects, a provisioning
+    /// record, and a real compaction over that bucket (issue #834): unlike
+    /// [`folded_tenant`], which only seals the hour for `max_segments`
+    /// accounting, this drives `ravel_maintain::compact_bucket` so the
+    /// resolved snapshot's segments are genuinely `SegmentLevel::L1`, the
+    /// ground truth `dataset_info`'s derived `layout` reads. `objects` must be
+    /// at least `DEFAULT_MIN_COMPACTION_INPUTS` (2) or the bucket has too few
+    /// inputs to compact.
+    async fn compacted_tenant(store: &Arc<dyn ObjectStoreBackend>, name: &str, objects: usize) {
+        let tenant = TenantId::new(name);
+        let tenant_hash = tenant.hash();
+        write_shard_objects(store, &tenant, 0, objects).await;
+        validate_or_adopt(
+            store.as_ref(),
+            &tenant_hash,
+            Signal::Logs,
+            1,
+            10,
+            AbsentPolicy::CreateFromConfig,
+        )
+        .await
+        .expect("write provisioning record");
+
+        let clock = ravel_maintain::FixedClock::new(NOW_NS);
+        let config = ravel_maintain::CompactorConfig::default();
+        let bucket = ravel_maintain::Bucket::new(tenant_hash, Signal::Logs, 0, 0);
+        let outcome = ravel_maintain::compact_bucket(store.as_ref(), &clock, &config, &bucket)
+            .await
+            .expect("compact hour-0 bucket");
+        assert!(
+            matches!(outcome, ravel_maintain::CompactionOutcome::Compacted { .. }),
+            "fixture must actually compact, got {outcome:?}"
+        );
+    }
+
+    /// `dataset_info` must report BOTH layout directions from the same
+    /// derivation, not a hardcoded string: an all-L0 tenant is
+    /// `"pre-compaction"` and a tenant with a real compaction over its bucket
+    /// is `"post-compaction"` (issue #834). A one-directional fix -- for
+    /// instance one that always returns `Compaction::Pre.label()` -- passes
+    /// only the first of these two assertions.
+    ///
+    /// Prove-the-test: reverting `dataset_info`'s `layout` to echo a
+    /// `Compaction` parameter fixed at `Compaction::Pre` (the pre-#834
+    /// behavior) makes the `post` assertion below fail with
+    /// `left: "post-compaction", right: "pre-compaction"` -- exactly the
+    /// mislabel this ticket reports (a compacted tenant printed
+    /// `layout=pre-compaction`).
+    #[tokio::test]
+    async fn dataset_info_layout_reports_both_directions_from_observed_state() {
+        let window = TimeRange {
+            start_ns: 0,
+            end_ns: NOW_NS,
+        };
+
+        let pre_store = empty_store();
+        provisioned_tenant(&pre_store, "layout-pre-tenant").await;
+        let pre = dataset_info(
+            &pre_store,
+            TenantId::new("layout-pre-tenant").hash(),
+            window,
+            NOW_NS,
+            None,
+            1,
+        )
+        .await
+        .expect("resolve pre-compaction tenant");
+        assert_eq!(pre.layout, "pre-compaction");
+
+        let post_store = empty_store();
+        compacted_tenant(&post_store, "layout-post-tenant", 2).await;
+        let post = dataset_info(
+            &post_store,
+            TenantId::new("layout-post-tenant").hash(),
+            window,
+            NOW_NS,
+            None,
+            1,
+        )
+        .await
+        .expect("resolve post-compaction tenant");
+        assert_eq!(
+            post.layout, "post-compaction",
+            "a tenant with a real compaction over its bucket must report \
+             post-compaction, derived from the resolved snapshot's L1 segments, \
+             not echoed from an operator flag"
+        );
+    }
+
+    /// `run_tenant`'s end-to-end report agrees with `dataset_info` on both
+    /// directions, and JSON serializes the same value the struct holds (one
+    /// code path, not two that could drift apart).
+    #[tokio::test]
+    async fn run_tenant_reports_observed_layout_not_the_compaction_flag() {
+        let store = empty_store();
+        compacted_tenant(&store, "run-tenant-post-layout", 2).await;
+        let mut cfg = tenant_cfg(&store, "run-tenant-post-layout", None, 0);
+        // The operator's belief is wrong (stale `--compaction pre`), but the
+        // flag is unset here so no CompactionMismatch refusal fires; the
+        // report must still say what the snapshot actually is.
+        cfg.compaction = None;
+        let report = run_tenant(&cfg).await.expect("tenant lane runs");
+        assert_eq!(report.dataset.layout, "post-compaction");
+        let json = serde_json::to_value(&report.dataset).expect("DatasetInfo serializes");
+        assert_eq!(json["layout"], "post-compaction");
+    }
+
+    /// An operator's stated `--compaction` belief is checked against the
+    /// observed snapshot, in both mismatch directions, and refuses rather
+    /// than letting a report print next to a silently wrong assertion (issue
+    /// #834 deliverable 3). Agreement in either direction runs cleanly.
+    #[tokio::test]
+    async fn compaction_flag_mismatch_refuses_in_both_directions() {
+        let post_store = empty_store();
+        compacted_tenant(&post_store, "mismatch-post-tenant", 2).await;
+        let mut cfg = tenant_cfg(&post_store, "mismatch-post-tenant", None, 0);
+        cfg.compaction = Some(Compaction::Pre);
+        let err = run_tenant(&cfg)
+            .await
+            .expect_err("asserting pre-compaction on a compacted tenant must refuse");
+        assert!(
+            err.to_string().contains("disagrees with"),
+            "error must name the disagreement: {err}"
+        );
+
+        let pre_store = empty_store();
+        provisioned_tenant(&pre_store, "mismatch-pre-tenant").await;
+        let mut cfg = tenant_cfg(&pre_store, "mismatch-pre-tenant", None, 0);
+        cfg.compaction = Some(Compaction::Post);
+        let err = run_tenant(&cfg)
+            .await
+            .expect_err("asserting post-compaction on an uncompacted tenant must refuse");
+        assert!(
+            err.to_string().contains("disagrees with"),
+            "error must name the disagreement: {err}"
+        );
+
+        // Agreement in either direction runs cleanly (this is a check, not a
+        // ban on stating the flag at all).
+        let agree_store = empty_store();
+        compacted_tenant(&agree_store, "mismatch-agree-tenant", 2).await;
+        let mut cfg = tenant_cfg(&agree_store, "mismatch-agree-tenant", None, 0);
+        cfg.compaction = Some(Compaction::Post);
+        run_tenant(&cfg)
+            .await
+            .expect("a --compaction flag that agrees with the observed layout must not refuse");
+    }
+
+    /// A run that performed no load must report `load_wall_ms` as `None`, not
+    /// a measured-looking `0.0`, and JSON must OMIT the key entirely rather
+    /// than serialize a `null` (issue #834 deliverable 2): a reader scanning
+    /// for the key's presence, not its value, is how this is meant to be
+    /// checked at the wire level.
+    #[tokio::test]
+    async fn tenant_lane_omits_load_wall_ms_generated_lane_reports_it() {
+        let store = empty_store();
+        provisioned_tenant(&store, "no-load-tenant").await;
+        let cfg = tenant_cfg(&store, "no-load-tenant", None, 0);
+        let report = run_tenant(&cfg).await.expect("tenant lane runs");
+        assert_eq!(
+            report.dataset.load_wall_ms, None,
+            "the tenant lane performed no load in this invocation"
+        );
+        let json = serde_json::to_value(&report.dataset).expect("DatasetInfo serializes");
+        assert!(
+            json.get("load_wall_ms").is_none(),
+            "load_wall_ms must be absent from JSON, not null, when no load ran: {json}"
+        );
+
+        let gen_store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let gen_cfg = GenerateConfig {
+            store: gen_store,
+            store_backend: "memory".to_string(),
+            region: "n/a".to_string(),
+            endpoint: "n/a".to_string(),
+            entries: Vec::new(),
+            runs: 1,
+            records: 4,
+            records_per_object: 4,
+            extra_attrs: 0,
+            max_query_bytes: DEFAULT_MAX_QUERY_BYTES,
+            cache_bytes: 0,
+            deadline: Duration::from_secs(30),
+            continue_on_error: false,
+            fetch_concurrency: DEFAULT_FETCH_CONCURRENCY,
+            progress_jsonl: None,
+            tenant_max_bytes: DEFAULT_TENANT_MAX_BYTES,
+            parallel_final_aggregation: false,
+            max_segments: DEFAULT_MAX_SEGMENTS,
+            explain_dir: None,
+        };
+        let gen_report = run_generated(&gen_cfg).await.expect("generated lane runs");
+        let load_ms = gen_report
+            .dataset
+            .load_wall_ms
+            .expect("the generated lane builds and times its own load");
+        assert!(load_ms >= 0.0, "load wall time must be a real duration");
+        let json = serde_json::to_value(&gen_report.dataset).expect("DatasetInfo serializes");
+        assert!(
+            json.get("load_wall_ms").is_some(),
+            "load_wall_ms must be present in JSON when the lane actually loaded: {json}"
         );
     }
 }

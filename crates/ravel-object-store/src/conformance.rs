@@ -267,7 +267,7 @@ pub async fn probe_object_lock<S: ObjectLockProbeSource + ?Sized>(source: &S) ->
 //
 // ADR-0064 makes bucket versioning and lifecycle rules a normative contract:
 // versioning OFF unless paired with a noncurrent-version expiration rule, the
-// `AbortIncompleteMultipartUpload` rule recommended, and no other expiration
+// `AbortIncompleteMultipartUpload` rule REQUIRED (#864), and no other expiration
 // rule on any Ravel prefix. Like the Object Lock probe above, this is
 // informational-plus-alarming, never startup-blocking: `object_store` 0.14 has
 // no bucket-policy query, so a real backend reports every field `Unknown`
@@ -327,7 +327,7 @@ impl LifecycleRuleStatus {
 
 /// Observed (or unknown) required-bucket-configuration state (ADR-0064 §7).
 /// Reports the three settings the ADR names: object versioning, the
-/// `AbortIncompleteMultipartUpload` lifecycle rule (recommended), and the
+/// `AbortIncompleteMultipartUpload` lifecycle rule (REQUIRED, #864), and the
 /// noncurrent-version expiration rule (required only when versioning is on).
 #[derive(Debug, Clone)]
 pub struct BucketConfigProbe {
@@ -378,13 +378,18 @@ pub fn bucket_config_alarms(probe: &BucketConfigProbe) -> Vec<String> {
                 .to_string(),
         );
     }
-    // Recommended, not required: the abort-incomplete-multipart rule
-    // (ADR-0064 §7 point 3; also converts S5-19's undocumented dependency into
-    // a documented one).
+    // REQUIRED (#864): the abort-incomplete-multipart rule (ADR-0064 §7 point 3;
+    // also converts S5-19's undocumented dependency into a documented one).
+    // Emitted under NOTE rather than ALARM only because no vendor API this crate
+    // calls can observe the rule, so the probe cannot establish compliance
+    // either way. The prefix reflects the probe's limits, not a weaker rule.
     if probe.abort_incomplete_multipart_upload == LifecycleRuleStatus::Absent {
         alarms.push(
-            "NOTE: the recommended AbortIncompleteMultipartUpload lifecycle rule (7 days) is not \
-             configured (ADR-0064 §7 point 3). Incomplete multipart uploads will accumulate."
+            "NOTE: the REQUIRED AbortIncompleteMultipartUpload lifecycle rule (7 days or \
+             less) is not configured (ADR-0064 §7 point 3). Its absence violates the bucket \
+             configuration contract: nothing in Ravel reaps abandoned multipart uploads, so \
+             their parts stay billable indefinitely. The NOTE prefix reflects the probe's \
+             limits, not an optional requirement."
                 .to_string(),
         );
     }
@@ -1240,7 +1245,7 @@ mod tests {
     }
 
     /// A compliant versioned bucket (ADR-0064 §7): versioning on, and both the
-    /// noncurrent-version expiration and the recommended abort-incomplete rule
+    /// noncurrent-version expiration and the required abort-incomplete rule
     /// present, raises no alarm.
     #[tokio::test]
     async fn bucket_config_compliant_versioned_bucket_has_no_alarms() {
@@ -1275,7 +1280,8 @@ mod tests {
 
     /// The load-bearing non-compliant case (S4-12): versioning on with no
     /// noncurrent-version expiration rule alarms as an unsupported
-    /// configuration; a missing abort-incomplete rule adds an advisory note.
+    /// configuration; a missing abort-incomplete rule adds a NOTE, which marks a
+    /// contract violation the probe cannot confirm rather than an optional gap.
     #[tokio::test]
     async fn bucket_config_versioned_without_noncurrent_rule_alarms() {
         let source = FixedBucketConfig(BucketConfigProbe {
