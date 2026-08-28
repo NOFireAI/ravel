@@ -84,7 +84,10 @@
 //! Peak resident memory is then: per-input catalog metadata (KBs per input),
 //! plus at most one decoded block per input (`O(input_count * block_size)`,
 //! independent of trace size), plus the in-progress part's writer buffer
-//! (bounded by `max_l1_part_bytes`). The [`crate::config::MergeMemoryTracker`]
+//! (bounded by the memory bound `max_l1_part_memory_bytes`). RSPAN splits on
+//! trace boundaries and carries only that one memory bound; the stored-size
+//! target the RLOG merge grew (issue #872) has no RSPAN counterpart yet. The
+//! [`crate::config::MergeMemoryTracker`]
 //! seam accounts these terms at their real allocation/decode points, the same
 //! seam RLOG's merge feeds.
 //!
@@ -318,7 +321,8 @@ impl RecordCounts {
 
 /// The shared flat k-way block-streaming merge: every input's span records, in
 /// global `(trace_id, start_ts_ns)` order, filtered through `keep`, partitioned
-/// into parts of at most `max_l1_part_bytes` on trace boundaries.
+/// into parts of at most `max_l1_part_memory_bytes` (the memory bound) on trace
+/// boundaries.
 ///
 /// Both callers of the RSPAN merge run through here (issue #742). Compaction
 /// ([`SpanCodec::build_parts`]) keeps every record; the ADR-0064 erasure
@@ -415,7 +419,7 @@ pub(crate) async fn merge(
         // Only surviving records open or push into a part.
         if current_trace != Some(trace_id) {
             if let Some(part) = &current {
-                let over_cap = part.estimate >= config.max_l1_part_bytes && !part.is_empty();
+                let over_cap = part.estimate >= config.max_l1_part_memory_bytes && !part.is_empty();
                 if over_cap && let Some(builder) = current.take() {
                     let built = builder
                         .finish(store, bucket, input_set_hash, part_index, dry_run)
@@ -475,8 +479,9 @@ async fn open_cursor<'a>(
 
 /// One in-progress L1 part: the shared [`RspanWriter`] merged records push
 /// into directly, plus the running record-byte estimate that decides where
-/// the part splits (a trace boundary once the estimate reaches
-/// `max_l1_part_bytes`) and feeds the [`MergeMemoryTracker`]'s writer term.
+/// the part splits (a trace boundary once the estimate reaches the memory
+/// bound `max_l1_part_memory_bytes`) and feeds the [`MergeMemoryTracker`]'s
+/// writer term.
 struct PartBuilder {
     writer: RspanWriter,
     estimate: u64,
@@ -1200,7 +1205,7 @@ mod tests {
 
         let clock = FixedClock::new(sealed_now_ns());
         let config = CompactorConfig {
-            max_l1_part_bytes: 256,
+            max_l1_part_memory_bytes: 256,
             ..CompactorConfig::default()
         };
         compact_bucket(&store, &clock, &config, &bucket())
@@ -1483,8 +1488,8 @@ mod tests {
             println!(
                 "[mem:rspan #908] records/input={records_per_input} trace~={trace_bytes}B \
                  peak_transient={transient}B peak_total={total}B transient_bound={TRANSIENT_BOUND}B \
-                 part_cap={}B",
-                config.max_l1_part_bytes
+                 mem_bound={}B",
+                config.max_l1_part_memory_bytes
             );
 
             // The decode-side peak is under the fixed bound.
@@ -1501,8 +1506,8 @@ mod tests {
             // part, bounded by the part cap (content-addressing needs the
             // whole part before its key exists).
             assert!(
-                total < TRANSIENT_BOUND + config.max_l1_part_bytes,
-                "total peak {total} exceeded transient bound + part cap"
+                total < TRANSIENT_BOUND + config.max_l1_part_memory_bytes,
+                "total peak {total} exceeded transient bound + memory bound"
             );
             peaks.push(transient);
         }

@@ -33,11 +33,13 @@ use uuid::Uuid;
 ///   one raw block plus one decoded block per input, so it is
 ///   `O(input_count * block_size)` and does NOT scale with stream/trace size.
 /// - [`Self::peak_total_bytes`]: `fetched + decoded + writer`, adding the
-///   in-progress part's writer buffer. The writer term is bounded by
-///   `max_l1_part_bytes` (a part is flushed as soon as its record-heap
-///   estimate reaches the cap, mid-stream if that is where the cap falls) and
-///   is the unavoidable content-addressing cost the ADR calls out: a part's
-///   key does not exist until the whole part is buffered.
+///   in-progress part's writer buffer. The writer term is bounded by the
+///   memory bound `max_l1_part_memory_bytes` (a part is flushed as soon as its
+///   record-heap estimate reaches that bound, mid-stream if that is where it
+///   falls) and is the unavoidable content-addressing cost the ADR calls out:
+///   a part's key does not exist until the whole part is buffered. The RLOG
+///   merge may also close a part earlier on the stored-size target
+///   `max_l1_part_bytes` (issue #872), which only lowers this term.
 ///
 /// Production never installs one (`CompactorConfig::merge_memory_tracker` is
 /// `None`), so the hooks compile to a single `Option` check and add nothing.
@@ -58,6 +60,12 @@ struct MergeMemoryInner {
     peak_transient: AtomicU64,
     /// High-water of `fetched + decoded + writer`.
     peak_total: AtomicU64,
+    /// Parts closed because the decoded record-heap estimate reached
+    /// `max_l1_part_memory_bytes` (the memory bound fired).
+    memory_bound_flushes: AtomicU64,
+    /// Parts closed because the encoded-bytes estimate reached
+    /// `max_l1_part_bytes` (the stored-size target fired).
+    stored_bound_flushes: AtomicU64,
 }
 
 impl MergeMemoryTracker {
@@ -120,6 +128,32 @@ impl MergeMemoryTracker {
     pub fn peak_total_bytes(&self) -> u64 {
         self.inner.peak_total.load(Ordering::Relaxed)
     }
+
+    /// Record that a part was closed by the memory bound (its decoded
+    /// record-heap estimate reached `max_l1_part_memory_bytes`).
+    pub fn note_memory_bound_flush(&self) {
+        self.inner
+            .memory_bound_flushes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record that a part was closed by the stored-size target (its
+    /// encoded-bytes estimate reached `max_l1_part_bytes`).
+    pub fn note_stored_bound_flush(&self) {
+        self.inner
+            .stored_bound_flushes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many parts closed because the memory bound fired.
+    pub fn memory_bound_flushes(&self) -> u64 {
+        self.inner.memory_bound_flushes.load(Ordering::Relaxed)
+    }
+
+    /// How many parts closed because the stored-size target fired.
+    pub fn stored_bound_flushes(&self) -> u64 {
+        self.inner.stored_bound_flushes.load(Ordering::Relaxed)
+    }
 }
 
 /// Nanoseconds in one hour; an ingest-hour bucket spans exactly this.
@@ -133,8 +167,25 @@ pub const DEFAULT_CLOCK_SKEW_ALLOWANCE_NS: i64 = 300_000_000_000;
 /// Default `max_compaction_lifetime`: 1 hour. Mirrors the
 /// writer interlock so the sweeper's unreferenced-part rule is safe.
 pub const DEFAULT_MAX_COMPACTION_LIFETIME_NS: i64 = NS_PER_HOUR;
-/// Default `max_l1_part_bytes`: 256 MiB.
+/// Default `max_l1_part_bytes`: 256 MiB. This is the **stored-size target**:
+/// the encoded/on-object byte budget a part is closed at (RSEG output page
+/// bytes in `build.rs`; an encoded-bytes estimate in the RLOG merge). It is
+/// deliberately equal to the memory-bound default so this crate's geometry is
+/// unchanged from when one knob did both jobs: on a wide schema the memory
+/// bound reaches 256 MiB of decoded record heap long before a part's stored
+/// bytes reach 256 MiB, so the memory bound stays binding and the stored
+/// target does not fire. Lowering it to `8..=16 MiB` is the follow-up that
+/// grows objects (issue #872); see `max_l1_part_stored_bytes`'s doc.
 pub const DEFAULT_MAX_L1_PART_BYTES: u64 = 256 * 1024 * 1024;
+/// Default `max_l1_part_memory_bytes`: 256 MiB. This is the **memory bound**:
+/// the decoded record-heap estimate the in-progress part is closed at, the
+/// invariant issue #711 added to keep compactor peak memory survivable on an
+/// 8 GB host (a bucket carrying one wide stream once held 45.7 GB resident
+/// under a nominal 256 MiB cap that was measured in stored, not heap, bytes).
+/// Equal to [`DEFAULT_MAX_L1_PART_BYTES`] on purpose: the two jobs were one
+/// knob before this split and their shared default reproduces the old
+/// behaviour exactly.
+pub const DEFAULT_MAX_L1_PART_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
 /// Default minimum L0 records for a bucket to be worth compacting.
 pub const DEFAULT_MIN_COMPACTION_INPUTS: usize = 2;
 /// Default footer suffix-probe size. 64 KiB covers the footer + catalog of a
@@ -293,9 +344,33 @@ pub struct CompactorConfig {
     /// Deadline after which a compaction run must not publish its record
     /// measured from the run's start via the clock.
     pub max_compaction_lifetime_ns: i64,
-    /// Split parts on series boundaries once accumulated verbatim page bytes
-    /// reach this.
+    /// The **stored-size target**: close the in-progress L1 part once its
+    /// encoded/on-object bytes reach this. On the RSEG path (`build.rs`) this
+    /// is the accumulated output page-byte total (ADR-0092 decision 3). On the
+    /// RLOG path (`rlog.rs`) it is an encoded-bytes estimate summed per record
+    /// ([`crate::rlog::estimate_stored_record`]), because the RLOG writer holds
+    /// row-major records and does not expose an incremental encoded size. Named
+    /// for the bytes it measures: it governs object geometry (object count and
+    /// per-object stored size), which is what the historical `max_l1_part_bytes`
+    /// name always implied. It does NOT bound memory; that is
+    /// [`Self::max_l1_part_memory_bytes`]. A part closes on whichever of the two
+    /// is reached first. Default [`DEFAULT_MAX_L1_PART_BYTES`] (256 MiB), chosen
+    /// so today's geometry is unchanged (issue #872); lower it to grow objects.
     pub max_l1_part_bytes: u64,
+    /// The **memory bound**: close the in-progress L1 part once its decoded
+    /// record-heap estimate reaches this, wherever in the merged record
+    /// sequence that falls (mid-stream if need be). This is what issue #711
+    /// added and what keeps compactor peak memory bounded: the RLOG/RSPAN
+    /// merges hold one whole in-progress part's records live before its
+    /// content-addressed key can be computed, so the resident heap of that part
+    /// is what this caps ([`crate::rlog::estimate_record`] /
+    /// `rspan_codec::estimate_record`, the Rust heap of a `LogRecord`/
+    /// `SpanRecord`, an order of magnitude larger than its compressed bytes on
+    /// a wide schema). Named for the bytes it measures: decoded heap, not
+    /// stored bytes. A part closes on whichever of this and
+    /// [`Self::max_l1_part_bytes`] is reached first. Default
+    /// [`DEFAULT_MAX_L1_PART_MEMORY_BYTES`] (256 MiB).
+    pub max_l1_part_memory_bytes: u64,
     /// Buckets with fewer L0 records than this are left uncompacted; set 1 for
     /// v1-retirement campaigns.
     pub min_compaction_inputs: usize,
@@ -417,6 +492,7 @@ impl Default for CompactorConfig {
             clock_skew_allowance_ns: DEFAULT_CLOCK_SKEW_ALLOWANCE_NS,
             max_compaction_lifetime_ns: DEFAULT_MAX_COMPACTION_LIFETIME_NS,
             max_l1_part_bytes: DEFAULT_MAX_L1_PART_BYTES,
+            max_l1_part_memory_bytes: DEFAULT_MAX_L1_PART_MEMORY_BYTES,
             min_compaction_inputs: DEFAULT_MIN_COMPACTION_INPUTS,
             footer_probe_bytes: DEFAULT_FOOTER_PROBE_BYTES,
             input_read_concurrency: DEFAULT_INPUT_READ_CONCURRENCY,
