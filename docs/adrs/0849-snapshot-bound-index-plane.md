@@ -352,17 +352,33 @@ scope-wide freshness value a pack could be compared against. Concretely:
   bare scalar timestamp and deliberately carries no request id or subject
   identifier, so retaining it permanently does not recreate the reason `.dreq`
   is deleted;
-- every statistics pack records the epoch it was built at, as declared data in
-  the root;
+- every statistics pack records an epoch **derived from the erasure state
+  actually applied in the source data it summarises**, never from its own build
+  wall-clock. Concretely it is the minimum, over the parts the pack covers, of
+  the epoch each part's *content* reflects, which means the applied epoch has to
+  be carried on the rewritten parts rather than inferred. Build time is the
+  wrong clock: a pack built after acknowledgement but before the rewrite is
+  visible still summarises pre-erasure rows, and stamping it with the new
+  high-water mark would let it satisfy the comparison below and return
+  pre-erasure counts — the very outcome the epoch exists to prevent. The
+  alternative, blocking pack publication until rewrite and fold have
+  incorporated the acknowledgement, is also sound and simpler to reason about,
+  at the cost of stalling indexing behind every erasure; whichever is chosen is
+  stated in the implementing ticket, but deriving the epoch from build time is
+  not among the options;
 - `MetadataAggregateExec` is selected only when `pack_epoch >= tenant_epoch`,
   and falls back to scanning otherwise.
 
 Ordering matters and is stated so it cannot be assumed away: a request is
 acknowledged before the rewrite lands and long before the fold republishes, so
 the epoch must advance at **acknowledgement**, not at completion. The required
-test walks acknowledgement to rewrite to fold and asserts both that the epoch
-never decreases across the sequence, including across `.dreq` reclamation, and
-that a pack built before acknowledgement is rejected. An epoch that
+test walks acknowledgement to rewrite to fold and asserts three things: that the
+epoch never decreases across the sequence, including across `.dreq` reclamation;
+that a pack built **before** acknowledgement is rejected; and that a pack built
+**after acknowledgement but before the rewrite is visible** is also rejected.
+The third case is the one a build-time epoch passes and a content-derived epoch
+catches, so testing only the first two would leave the mechanism looking correct
+while the gap stayed open. An epoch that
 advanced only on completion would leave exactly the window this condition
 exists to close. "No pending selective erasure" as prose with no carrier is the
 shape that ships unimplemented.
