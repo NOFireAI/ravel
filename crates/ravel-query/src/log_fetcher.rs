@@ -597,6 +597,17 @@ impl LogSegmentFetcher {
         self
     }
 
+    /// Sets the block-range fetcher's request cost
+    /// ([`BlockRangeFetcher::with_request_cost_bytes`]), the byte-denominated
+    /// cost of one store round trip that drives its whole-object crossover and
+    /// coalescing gap (ADR-0107). A property of the store and instance, not the
+    /// RLOG format.
+    #[must_use]
+    pub fn with_request_cost_bytes(mut self, n: u64) -> Self {
+        self.block_range = self.block_range.with_request_cost_bytes(n);
+        self
+    }
+
     /// Replaces the block-range fetcher (ADR-0107) with a fully configured one,
     /// for callers and tests that need to set the coalescing gap, coverage
     /// crossover, or concurrency bound directly. The replacement keeps this
@@ -1841,16 +1852,56 @@ impl LogSegmentFetcher {
 /// per read. `BlockRangeFetcher::with_suffix_len` overrides it.
 pub const DEFAULT_LOG_SUFFIX_LEN: u64 = 256 * 1024;
 
-/// Default maximum gap between two wanted block extents that still get coalesced
-/// into a single GET. Same 64 KiB start as `crate::fetcher::DEFAULT_COALESCE_GAP`
-/// (ADR-0107 decision 1: "start at RSEG's 64 KiB").
+/// Default cost of one store request, expressed as a latency-bandwidth product:
+/// the byte volume whose transfer time (at the store's single-stream bandwidth)
+/// equals one request's round-trip latency. This is the exchange rate between
+/// the two things a range-vs-whole-object decision trades: a saved request is
+/// worth this many saved bytes, so a decision that avoids `k` requests to move
+/// `b` extra bytes is a win exactly when `b < k * request_cost`.
+///
+/// The default is derived from q20 on in-region S3 from an r6a.4xlarge at 8
+/// concurrent fetch permits: 20.95 ms of occupied permit time per GET, of which
+/// ~1.01 ms is payload transfer at ~90 MB/s single-stream, so ~95% of each
+/// request is round-trip latency. 20.95 ms x 90 MB/s ~= 1.8 MiB of transfer buys
+/// one round trip.
+///
+/// This is a property of the STORE AND INSTANCE (its latency and per-stream
+/// bandwidth at the fetch concurrency in use), NOT of the RLOG format, which is
+/// why it is a configurable tunable rather than a frozen constant: a different
+/// store, a cross-region bucket, or a different permit count has a different
+/// value, and every one of the fetch-layer thresholds below is derived from it
+/// so that recalibrating the store recalibrates all of them at once.
+/// [`BlockRangeFetcher::with_request_cost_bytes`] overrides it.
+pub const DEFAULT_LOG_REQUEST_COST_BYTES: u64 = 1_887_437; // ~1.8 MiB
+
+/// Floor on the coalescing gap, under the request-cost-derived default. Two
+/// wanted extents separated by less than the effective gap fuse into one GET.
+/// The principled value is [`DEFAULT_LOG_REQUEST_COST_BYTES`]: it is never worth
+/// a second request to skip a hole whose bytes cost less to transfer than the
+/// request would cost, so the effective gap is the request cost (much larger
+/// than this floor). This 64 KiB floor (`crate::fetcher::DEFAULT_COALESCE_GAP`,
+/// ADR-0107 decision 1: "start at RSEG's 64 KiB") applies only when a caller
+/// drives the request cost below it.
 pub const DEFAULT_LOG_COALESCE_GAP: u64 = 64 * 1024;
 
-/// Default object size at or below which the size-threshold pre-probe crossover
-/// reads the whole object in one GET instead of probing and range-fetching
-/// (ADR-0107 decision 1, "size-threshold, pre-probe whole-object read"). Mirrors
-/// `crate::fetcher::DEFAULT_WHOLE_OBJECT_THRESHOLD` (512 KiB) exactly: below it
-/// the extra probe + per-range round trips cost more than the bytes they save.
+/// Multiple of the request cost at which a whole-object read breaks even against
+/// the probe+ranged path. The ranged protocol adds on the order of this many
+/// store round trips over a single whole-object GET (a probe, one coalesced
+/// front-section GET, and a small number of block/chunk-run GETs -- ~5.46
+/// GETs/object measured on q20), so it cannot save enough bytes to pay for
+/// itself until the object exceeds this many request-costs. 5 x 1.8 MiB ~= 8.9
+/// MiB reproduces q20's measured whole-object break-even.
+const WHOLE_OBJECT_REQUEST_MULTIPLE: u64 = 5;
+
+/// Floor on the size-threshold pre-probe crossover, under the
+/// request-cost-derived default. An object at or below the effective threshold
+/// is read whole in one GET instead of probing and range-fetching (ADR-0107
+/// decision 1, "size-threshold, pre-probe whole-object read"). The principled
+/// value is `WHOLE_OBJECT_REQUEST_MULTIPLE * request_cost`: below it the extra
+/// round trips the ranged path adds cost more than the bytes they could save at
+/// ANY selectivity. This 512 KiB floor (matching
+/// `crate::fetcher::DEFAULT_WHOLE_OBJECT_THRESHOLD`) applies only when a caller
+/// drives the request cost low enough that the derived threshold falls under it.
 pub const DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD: u64 = 512 * 1024;
 
 /// Default coverage fraction at or above which the post-pruning crossover falls
@@ -2055,9 +2106,20 @@ pub struct BlockRangeFetcher {
     /// (see [`ReadCache`]); every production caller builds the RAM variant.
     cache: Option<ReadCache>,
     suffix_len: u64,
-    coalesce_gap: u64,
-    whole_object_threshold: u64,
+    /// Coalescing gap. `None` derives it from `request_cost_bytes` (the
+    /// principled default); `Some(n)` pins it, which the tests use to force an
+    /// exact run count. See [`Self::effective_coalesce_gap`].
+    coalesce_gap: Option<u64>,
+    /// Size-threshold pre-probe crossover. `None` derives it from
+    /// `request_cost_bytes`; `Some(n)` pins it (and `Some(0)` forces the ranged
+    /// path). See [`Self::effective_whole_object_threshold`].
+    whole_object_threshold: Option<u64>,
     coverage_threshold: f64,
+    /// Cost of one store request as a byte volume (a latency-bandwidth product);
+    /// the single quantity every range-vs-whole-object decision here is driven
+    /// from ([`DEFAULT_LOG_REQUEST_COST_BYTES`]). A property of the store and
+    /// instance, so it is a tunable, not a constant.
+    request_cost_bytes: u64,
     /// Bounds in-flight byte-range GETs. Its own instance, never shared with
     /// `SegmentFetcher`'s RSEG semaphore (ADR-0107 decision 1).
     get_semaphore: Arc<Semaphore>,
@@ -2070,9 +2132,10 @@ impl BlockRangeFetcher {
             cfg: RlogConfig::default(),
             cache: None,
             suffix_len: DEFAULT_LOG_SUFFIX_LEN,
-            coalesce_gap: DEFAULT_LOG_COALESCE_GAP,
-            whole_object_threshold: DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+            coalesce_gap: None,
+            whole_object_threshold: None,
             coverage_threshold: DEFAULT_LOG_COVERAGE_THRESHOLD,
+            request_cost_bytes: DEFAULT_LOG_REQUEST_COST_BYTES,
             get_semaphore: Arc::new(Semaphore::new(DEFAULT_LOG_MAX_CONCURRENT_GETS)),
         }
     }
@@ -2097,18 +2160,55 @@ impl BlockRangeFetcher {
 
     #[must_use]
     pub fn with_coalesce_gap(mut self, n: u64) -> Self {
-        self.coalesce_gap = n;
+        self.coalesce_gap = Some(n);
         self
     }
 
-    /// Sets the size-threshold pre-probe crossover. An object whose size is at or
-    /// below `n` is read whole in one GET; `0` disables the size crossover (every
-    /// object takes the probe + range path), which the tests use to force the
-    /// ranged path on a small fixture.
+    /// Sets the size-threshold pre-probe crossover explicitly, overriding the
+    /// request-cost-derived default. An object whose size is at or below `n` is
+    /// read whole in one GET; `0` disables the size crossover (every object takes
+    /// the probe + range path), which the tests use to force the ranged path on a
+    /// small fixture.
     #[must_use]
     pub fn with_whole_object_threshold(mut self, n: u64) -> Self {
-        self.whole_object_threshold = n;
+        self.whole_object_threshold = Some(n);
         self
+    }
+
+    /// Sets the cost of one store request as a byte volume (a latency-bandwidth
+    /// product; see [`DEFAULT_LOG_REQUEST_COST_BYTES`]). This drives the
+    /// whole-object crossover and the coalescing gap whenever those are left at
+    /// their defaults, so recalibrating the store (a faster tier, a cross-region
+    /// bucket, a different fetch concurrency) recalibrates every fetch-layer
+    /// range-vs-whole-object decision through this one knob.
+    #[must_use]
+    pub fn with_request_cost_bytes(mut self, n: u64) -> Self {
+        self.request_cost_bytes = n;
+        self
+    }
+
+    /// The coalescing gap in effect: an explicit [`Self::with_coalesce_gap`]
+    /// override when set, else the request cost (floored by
+    /// [`DEFAULT_LOG_COALESCE_GAP`]). It is never worth a second request to skip
+    /// a hole whose bytes transfer for less than one request costs, so the
+    /// principled gap is exactly one request cost.
+    fn effective_coalesce_gap(&self) -> u64 {
+        self.coalesce_gap
+            .unwrap_or_else(|| self.request_cost_bytes.max(DEFAULT_LOG_COALESCE_GAP))
+    }
+
+    /// The size-threshold pre-probe crossover in effect: an explicit
+    /// [`Self::with_whole_object_threshold`] override when set (including the `0`
+    /// that forces the ranged path), else `WHOLE_OBJECT_REQUEST_MULTIPLE`
+    /// request-costs (floored by [`DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD`]). Below
+    /// the break-even the ranged path's extra round trips cost more than the
+    /// bytes they could save at any selectivity, so the whole-object read wins.
+    fn effective_whole_object_threshold(&self) -> u64 {
+        self.whole_object_threshold.unwrap_or_else(|| {
+            self.request_cost_bytes
+                .saturating_mul(WHOLE_OBJECT_REQUEST_MULTIPLE)
+                .max(DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD)
+        })
     }
 
     /// Sets the coverage-based post-pruning crossover fraction (0.0..=1.0). When
@@ -2480,7 +2580,7 @@ impl BlockRangeFetcher {
                 });
             }
         }
-        for run in coalesce_byte_extents(&missing, self.coalesce_gap) {
+        for run in coalesce_byte_extents(&missing, self.effective_coalesce_gap()) {
             let (bytes, live) = self
                 .cached_extent(
                     seg_ref,
@@ -2745,8 +2845,12 @@ impl BlockRangeFetcher {
         // object is read whole in one GET, mirroring `SegmentFetcher`. Keyed
         // `(0, object_size)`, the same key `LogSegmentFetcher::tenant_bytes`
         // gives its whole-object read, so the two compose and concurrent callers
-        // coalesce instead of each paying the GET.
-        if seg_ref.object_size <= self.whole_object_threshold {
+        // coalesce instead of each paying the GET. The threshold is request-cost
+        // driven (deliverable 2): below the break-even the ranged path's extra
+        // round trips cost more than the bytes they could save at any
+        // selectivity, so the whole-object read is the faster option even though
+        // it moves the most bytes.
+        if seg_ref.object_size <= self.effective_whole_object_threshold() {
             let (bytes, live) = self
                 .cached_extent(
                     seg_ref,
@@ -3034,12 +3138,29 @@ impl BlockRangeFetcher {
             }
         }
 
-        // The remaining non-BLOCKS sections: STREAM_DIR/FIELD_DIR (object front)
-        // and any tail section (BLOOM/POSTINGS) a short probe missed. The reader
-        // re-verifies each section's crc on decode, so a corrupt section hit
-        // fails closed there (ADR-0046).
+        // The two front sections (STREAM_DIR/FIELD_DIR): one coalesced GET over
+        // their adjacent span (deliverable 4), skipped entirely when an earlier
+        // FIELD_DIR resolution already brought them.
+        self.place_front_sections(
+            seg_ref,
+            tenant_hash,
+            &footer,
+            &pin,
+            &mut asm,
+            accounting,
+            &mut stats,
+        )
+        .await?;
+
+        // Any remaining tail section (BLOOM/POSTINGS) a short probe missed: one
+        // GET each, never coalesced with the front across the BLOCKS gap. The
+        // reader re-verifies each section's crc on decode, so a corrupt section
+        // hit fails closed there (ADR-0046).
         for section in &footer.sections {
-            if section.kind == kind::BLOCKS {
+            if matches!(
+                section.kind,
+                kind::BLOCKS | kind::STREAM_DIR | kind::FIELD_DIR
+            ) {
                 continue;
             }
             self.place_section(
@@ -3298,12 +3419,30 @@ impl BlockRangeFetcher {
             }
         }
 
-        // The remaining non-BLOCKS sections: STREAM_DIR/FIELD_DIR at the object
-        // front, and BLOOM/POSTINGS when a short probe missed them. The reader
-        // re-verifies each section's crc on decode, so a corrupt section hit
-        // fails closed there (ADR-0046).
+        // The two front sections (STREAM_DIR/FIELD_DIR): one coalesced GET over
+        // their adjacent span (deliverable 4). On the narrow-projection path
+        // `place_and_decode_field_dir` already brought both, so this is a no-op
+        // there; on an all-columns v4 read it is the read's one front GET.
+        self.place_front_sections(
+            seg_ref,
+            tenant_hash,
+            footer,
+            pin,
+            &mut asm,
+            accounting,
+            &mut stats,
+        )
+        .await?;
+
+        // Any remaining tail section (BLOOM/POSTINGS) a short probe missed: one
+        // GET each, never coalesced with the front across the BLOCKS gap. The
+        // reader re-verifies each section's crc on decode, so a corrupt section
+        // hit fails closed there (ADR-0046).
         for section in &footer.sections {
-            if section.kind == kind::BLOCKS {
+            if matches!(
+                section.kind,
+                kind::BLOCKS | kind::STREAM_DIR | kind::FIELD_DIR
+            ) {
                 continue;
             }
             self.place_section(
@@ -3350,7 +3489,7 @@ impl BlockRangeFetcher {
         stats: &mut BlockRangeStats,
     ) -> Result<(), LogFetchError> {
         let key = seg_ref.data_object_key.as_str();
-        let runs: Vec<ByteExtent> = coalesce_byte_extents(wanted, self.coalesce_gap)
+        let runs: Vec<ByteExtent> = coalesce_byte_extents(wanted, self.effective_coalesce_gap())
             .into_iter()
             // A run the probe already brought costs nothing: its bytes are in
             // `asm` at the right offsets already.
@@ -3411,7 +3550,7 @@ impl BlockRangeFetcher {
                 len: s.len,
             })
             .collect();
-        for run in coalesce_byte_extents(&missing, self.coalesce_gap) {
+        for run in coalesce_byte_extents(&missing, self.effective_coalesce_gap()) {
             let (bytes, live) = self
                 .cached_extent(
                     seg_ref,
@@ -3494,12 +3633,79 @@ impl BlockRangeFetcher {
         Ok(out)
     }
 
-    /// Place the FIELD_DIR section into `asm` (via [`place_section`](Self::
-    /// place_section), so it single-flights and reuses an already-resident
-    /// region) and decode it, so the caller can resolve a query's prune-only
-    /// NumRange arms to this object's own column ids before the candidate set is
-    /// chosen. FIELD_DIR is compressed as a whole section (docs/log-segment-\
-    /// format.md), the same shape SKIP_IDX is decoded with just above.
+    /// Place the object's two front directory sections -- STREAM_DIR (kind 1)
+    /// then FIELD_DIR (kind 2), which the writer emits ADJACENT at the object
+    /// front (docs/log-segment-format.md) -- in ONE range GET over their combined
+    /// span, instead of one GET each (deliverable 4). No suffix probe of any
+    /// length reaches a front section, so without coalescing the two are two of
+    /// the ~5.46 store round trips an object's ranged read costs (ADR-0107), for
+    /// a byte volume that is a rounding error against one request cost; presenting
+    /// them together to one GET removes one whole request per object. A section
+    /// already resident (an earlier call, or a footer that omits one of the two)
+    /// costs nothing, and the span then covers only whichever remains. Counts one
+    /// [`BlockRangeStats::metadata_gets`] when it fetches, never a `probe_miss`
+    /// (the front is unreachable by any probe, so counting it there would put a
+    /// floor under that metric -- see the `probe_misses` field doc).
+    #[allow(clippy::too_many_arguments)]
+    async fn place_front_sections(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        footer: &footer::LogFooter,
+        pin: &EtagPin,
+        asm: &mut ObjectAssembler,
+        accounting: &QueryAccounting,
+        stats: &mut BlockRangeStats,
+    ) -> Result<(), LogFetchError> {
+        let key = seg_ref.data_object_key.as_str();
+        let mut start = u64::MAX;
+        let mut end = 0u64;
+        for k in [kind::STREAM_DIR, kind::FIELD_DIR] {
+            let Some(desc) = footer.section(k) else {
+                continue;
+            };
+            if asm.covers(desc.offset, desc.offset + desc.len) {
+                continue;
+            }
+            start = start.min(desc.offset);
+            end = end.max(desc.offset + desc.len);
+        }
+        if start >= end {
+            return Ok(());
+        }
+        let (bytes, live) = self
+            .cached_extent(
+                seg_ref,
+                tenant_hash,
+                start,
+                end - start,
+                GetRange::Range(start, end),
+                pin,
+                accounting,
+            )
+            .await?;
+        if live {
+            stats.metadata_gets += 1;
+        }
+        asm.place(key, start, &bytes)
+    }
+
+    /// Place FIELD_DIR into `asm` (via [`place_section`](Self::place_section), on
+    /// its own per-section cache key, so a subset scan reuses the FIELD_DIR the
+    /// plan phase already cached under that key) and decode it, so the caller can
+    /// resolve a query's prune-only NumRange arms and its projection to this
+    /// object's own column ids before the candidate set is chosen.
+    ///
+    /// STREAM_DIR is deliberately NOT coalesced in here: this runs BEFORE the
+    /// coverage crossover, and a query that then crosses over to a whole-object
+    /// read never needs STREAM_DIR, so bringing it eagerly would move directory
+    /// bytes the crossover discards. STREAM_DIR is instead brought by
+    /// [`place_front_sections`](Self::place_front_sections) after the crossover,
+    /// where -- with FIELD_DIR already resident -- it is the only remaining front
+    /// section and coalesces with nothing; on an all-columns read that skips this
+    /// method both front sections arrive cold there and coalesce into one GET.
+    /// FIELD_DIR is compressed as a whole section (docs/log-segment-format.md),
+    /// the same shape SKIP_IDX is decoded with just above.
     #[allow(clippy::too_many_arguments)]
     async fn place_and_decode_field_dir(
         &self,
@@ -3512,17 +3718,18 @@ impl BlockRangeFetcher {
         stats: &mut BlockRangeStats,
     ) -> Result<FieldDir, LogFetchError> {
         let key = seg_ref.data_object_key.as_str();
-        let desc = footer
+        let desc = *footer
             .section(kind::FIELD_DIR)
             .ok_or_else(|| corrupt(key, LogSegError::Corrupted("missing FIELD_DIR".into())))?;
-        self.place_section(seg_ref, tenant_hash, desc, pin, asm, accounting, stats)
+        self.place_section(seg_ref, tenant_hash, &desc, pin, asm, accounting, stats)
             .await?;
         let start = usize::try_from(desc.offset).map_err(|_| corrupt_range(key))?;
         let end = start
             .checked_add(usize::try_from(desc.len).map_err(|_| corrupt_range(key))?)
             .ok_or_else(|| corrupt_range(key))?;
         let stored = asm.buf.get(start..end).ok_or_else(|| corrupt_range(key))?;
-        let raw = decode_section(stored, desc, &self.cfg).map_err(|source| corrupt(key, source))?;
+        let raw =
+            decode_section(stored, &desc, &self.cfg).map_err(|source| corrupt(key, source))?;
         FieldDir::decode(&raw, MAX_FIELDS).map_err(|source| corrupt(key, source))
     }
 
@@ -3628,7 +3835,7 @@ impl BlockRangeFetcher {
         // `crate::fetcher::SegmentFetcher::ensure_ranges`' `join_all`). Awaiting
         // the runs in series made `get_semaphore` inert: a sequential loop never
         // has more than one GET in flight to bound.
-        let runs = coalesce_extents(&missing, self.coalesce_gap);
+        let runs = coalesce_extents(&missing, self.effective_coalesce_gap());
         let outcomes = futures::future::join_all(runs.iter().map(|run| {
             let blocks: Vec<BlockExtent> = missing
                 .iter()
