@@ -269,6 +269,17 @@ pub struct Provenance {
     /// numbers above.
     #[serde(default)]
     pub explain: bool,
+    /// Whether one `SqlExecutor` (and its in-process catalog caches) was reused
+    /// across every statement (`--warm-catalog`), instead of a fresh cold
+    /// executor per statement. A server holds one process-level catalog and
+    /// `RecordCache` for a tenant's whole query stream, so its resolve phase is
+    /// warm for every statement after the first; a cold-per-statement bench
+    /// re-pays the resolve GETs on every statement and so overstates
+    /// resolve-phase cost relative to that server (issue #857). Recorded so a
+    /// report states which of the two regimes it measured: under `true`, only
+    /// the first statement's run 0 is a genuine cold resolve.
+    #[serde(default)]
+    pub warm_catalog: bool,
     /// The Flight SQL endpoint (`host:port`) the statements were executed
     /// against, or `None` for an in-process lane. Deliberately not `endpoint`
     /// above: that one names the object store, and the two are different
@@ -567,6 +578,13 @@ pub struct GenerateConfig {
     /// are readable per statement. Not timed and not part of the report's
     /// numbers. `None` writes no plan.
     pub explain_dir: Option<std::path::PathBuf>,
+    /// Reuse one `SqlExecutor` (and its in-process catalog caches) across every
+    /// statement (`--warm-catalog`) instead of building a fresh cold executor
+    /// per statement. See [`Provenance::warm_catalog`] for why this matters: a
+    /// server's resolve phase is warm for every statement after the first, and
+    /// a cold-per-statement bench diverges from it by re-paying the resolve
+    /// GETs each time (issue #857).
+    pub warm_catalog: bool,
 }
 
 /// Where the Flight lane sends its statements.
@@ -676,6 +694,11 @@ pub struct TenantConfigInput {
     /// a Flight client cannot read the tenant's catalog, and the skip check
     /// needs the declarations.
     pub flight: Option<FlightTarget>,
+    /// Reuse one `SqlExecutor` (and its in-process catalog caches) across every
+    /// statement (`--warm-catalog`) instead of building a fresh cold executor
+    /// per statement. See [`Provenance::warm_catalog`]. Ignored by the Flight
+    /// lane, which builds no in-process executor.
+    pub warm_catalog: bool,
 }
 
 fn percentile(sorted_ns: &[u64], pct: f64) -> u64 {
@@ -881,6 +904,13 @@ async fn explain_plan_text(
 /// first run is the cold number. An entry whose `required_declarations` are not
 /// all satisfied by `declared` is skipped with its missing key named and never
 /// executed.
+///
+/// When `warm_catalog` is set, one executor (and one read cache, when
+/// `cache_bytes > 0`) is built once and reused for every statement instead of
+/// a fresh one per statement. This mirrors a server's process-level catalog and
+/// `RecordCache`, whose resolve phase is warm for every statement after the
+/// first; under it only the first statement's run 0 is a genuine cold resolve
+/// (issue #857).
 #[allow(clippy::too_many_arguments)]
 pub async fn measure_corpus(
     store: &Arc<dyn ObjectStoreBackend>,
@@ -895,6 +925,7 @@ pub async fn measure_corpus(
     continue_on_error: bool,
     progress_jsonl: Option<&std::path::Path>,
     settings: ExecutorSettings,
+    warm_catalog: bool,
     explain_dir: Option<&std::path::Path>,
 ) -> Result<(Vec<EntryReport>, Vec<SkippedEntry>, Vec<FailedEntry>), Error> {
     let runs = runs.max(1);
@@ -902,6 +933,18 @@ pub async fn measure_corpus(
     let mut skipped = Vec::new();
     let mut failed = Vec::new();
     let mut progress = progress_jsonl.map(ProgressSink::open).transpose()?;
+
+    // `--warm-catalog`: one executor (and one read cache) reused across every
+    // statement, so the catalog resolve of every statement after the first is
+    // served from the warm in-process `RecordCache`/`HeadCache`, exactly as a
+    // server's process-level catalog would (issue #857). Built once here; the
+    // per-entry `None` path below keeps the cold-per-statement default.
+    let shared_executor = if warm_catalog {
+        let cache = (cache_bytes > 0).then(|| build_read_cache(cache_bytes));
+        Some(cold_executor(store, declared, cache, settings)?)
+    } else {
+        None
+    };
 
     // CPU flamegraph lane (issue #365's pattern; see crate::profiling). Covers
     // every entry's execution, both lanes (run_generated/run_tenant funnel
@@ -936,12 +979,24 @@ pub async fn measure_corpus(
             continue;
         }
 
-        // A fresh cache per entry (not per run) so run 0 is genuinely cold while
-        // later runs of the SAME statement can serve from it; sharing one cache
-        // across entries would warm one statement from another's reads over the
-        // same segments.
-        let cache = (cache_bytes > 0).then(|| build_read_cache(cache_bytes));
-        let executor = cold_executor(store, declared, cache, settings)?;
+        // Cold default: a fresh cache and executor per entry (not per run) so
+        // run 0 is genuinely cold while later runs of the SAME statement can
+        // serve from it; sharing one cache across entries would warm one
+        // statement from another's reads over the same segments. Under
+        // `--warm-catalog` the one `shared_executor` built above is reused
+        // instead, deliberately warming each statement from the last.
+        // The cold path builds a fresh executor owned by this iteration;
+        // `owned_executor` holds it alive for the run loop below. The warm path
+        // borrows the one `shared_executor` instead and leaves this unused.
+        let owned_executor;
+        let executor: &SqlExecutor = match &shared_executor {
+            Some(shared) => shared,
+            None => {
+                let cache = (cache_bytes > 0).then(|| build_read_cache(cache_bytes));
+                owned_executor = cold_executor(store, declared, cache, settings)?;
+                &owned_executor
+            }
+        };
         let req = SqlRequest {
             sql: entry.sql.clone(),
             window,
@@ -959,7 +1014,7 @@ pub async fn measure_corpus(
         // configuration error (`--explain-dir` unwritable), not a query result.
         if let Some(dir) = explain_dir
             && let Ok(plan_text) =
-                explain_plan_text(&executor, tenant_hash, &req, &entry.sql, declared).await
+                explain_plan_text(executor, tenant_hash, &req, &entry.sql, declared).await
         {
             let path = dir.join(format!("{}.txt", entry.id));
             std::fs::write(&path, plan_text)
@@ -1349,6 +1404,7 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
         cfg.continue_on_error,
         cfg.progress_jsonl.as_deref(),
         settings,
+        cfg.warm_catalog,
         cfg.explain_dir.as_deref(),
     )
     .await?;
@@ -1376,6 +1432,7 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
             // `SqlConfig`, so it is also the effective one.
             parallel_final_aggregation_effective: Some(cfg.parallel_final_aggregation),
             explain: cfg.explain_dir.is_some(),
+            warm_catalog: cfg.warm_catalog,
             flight_endpoint: None,
         },
         dataset,
@@ -1474,6 +1531,7 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
                 cfg.continue_on_error,
                 cfg.progress_jsonl.as_deref(),
                 settings,
+                cfg.warm_catalog,
                 cfg.explain_dir.as_deref(),
             )
             .await?
@@ -1515,6 +1573,7 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
                 None => Some(cfg.parallel_final_aggregation),
             },
             explain: cfg.explain_dir.is_some(),
+            warm_catalog: cfg.warm_catalog,
             flight_endpoint: cfg.flight.as_ref().map(|t| t.endpoint.clone()),
         },
         dataset,
@@ -1830,6 +1889,7 @@ mod tests {
             max_segments: DEFAULT_MAX_SEGMENTS,
             explain_dir: None,
             flight: None,
+            warm_catalog: false,
         }
     }
 
@@ -2215,6 +2275,7 @@ mod tests {
             true,
             None,
             ExecutorSettings::default(),
+            false,
             None,
         )
         .await
@@ -2299,6 +2360,7 @@ mod tests {
                         fetch_concurrency: FETCH_CONCURRENCY,
                         ..ExecutorSettings::default()
                     },
+                    false,
                     None,
                 )
                 .await
@@ -2529,6 +2591,147 @@ mod tests {
         }
     }
 
+    /// The cold run 0 GET count of every entry, in entry order. Index 0 of
+    /// `per_run_accounting` is the cold run; the pooled `QueryAccounting` the
+    /// executor surfaces is all the phase attribution `SqlExecutor::execute`
+    /// exposes (issue #857 report), and the catalog resolve's GETs are a
+    /// component of it.
+    fn cold_gets(entries: &[EntryReport]) -> Vec<u64> {
+        entries
+            .iter()
+            .map(|e| {
+                e.per_run_accounting
+                    .as_ref()
+                    .expect("in-process lane records per-run accounting")[0]
+                    .object_store_get_requests
+            })
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn measure_same_statement(
+        store: &Arc<dyn ObjectStoreBackend>,
+        tenant_hash: TenantHash,
+        statements: usize,
+        warm_catalog: bool,
+    ) -> Vec<EntryReport> {
+        let entries: Vec<CorpusEntry> = (0..statements)
+            .map(|i| entry(&format!("q{i}"), "SELECT body FROM logs"))
+            .collect();
+        let window = TimeRange {
+            start_ns: 0,
+            end_ns: NOW_NS,
+        };
+        let (measured, _skipped, failed) = measure_corpus(
+            store,
+            tenant_hash,
+            &entries,
+            &[],
+            1,
+            window,
+            NOW_NS,
+            0,
+            Duration::from_secs(30),
+            false,
+            None,
+            ExecutorSettings::default(),
+            warm_catalog,
+            None,
+        )
+        .await
+        .expect("measure_corpus runs");
+        assert!(failed.is_empty(), "no statement fails: {failed:?}");
+        assert_eq!(measured.len(), statements, "every statement is measured");
+        measured
+    }
+
+    /// `--warm-catalog` reuses one executor across statements, so the catalog
+    /// resolve of every statement after the first is served from the warm
+    /// in-process `RecordCache`/`HeadCache` instead of re-listing and re-GETting
+    /// the commit records. The resolve GETs are a component of the pooled
+    /// `object_store_get_requests` the executor surfaces, so with the flag on
+    /// they stop recurring: later statements cost strictly fewer GETs than the
+    /// first and plateau. With the flag off (a fresh cold executor per
+    /// statement, the default) every statement re-pays the same resolve GETs,
+    /// so the per-statement GET count is flat and higher. This is the divergence
+    /// from server behaviour issue #857 names (a server holds one process-level
+    /// catalog for a tenant's whole query stream).
+    ///
+    /// Reverting `measure_corpus` to build a cold executor per statement under
+    /// `warm_catalog` (dropping the `shared_executor` branch) makes the warm
+    /// arm behave like the cold one, so the `warm[later] < warm[0]` assertion
+    /// flips red.
+    #[tokio::test]
+    async fn warm_catalog_reuses_resolve_across_statements() {
+        let store = empty_store();
+        let tenant = TenantId::new("warm-catalog-tenant");
+        // Several small objects, each its own commit record, so the resolve's
+        // per-commit-record GETs are a visible share of every statement's cost
+        // and the warm/cold difference is unambiguous.
+        write_shard_objects(&store, &tenant, 0, 8).await;
+        let th = tenant.hash();
+        const STATEMENTS: usize = 4;
+
+        let cold = measure_same_statement(&store, th, STATEMENTS, false).await;
+        let warm = measure_same_statement(&store, th, STATEMENTS, true).await;
+
+        let cold_g = cold_gets(&cold);
+        let warm_g = cold_gets(&warm);
+
+        // Cold: a fresh executor per statement re-pays the same GETs every time.
+        for i in 1..STATEMENTS {
+            assert_eq!(
+                cold_g[i], cold_g[0],
+                "cold executor re-pays the same GETs on every statement: {cold_g:?}"
+            );
+        }
+        // Warm: the first statement warms the catalog; every statement after it
+        // pays strictly fewer GETs (the resolve component no longer recurs) and
+        // the count plateaus.
+        assert!(
+            warm_g[1] < warm_g[0],
+            "the warm catalog serves the resolve of later statements: {warm_g:?}"
+        );
+        for i in 2..STATEMENTS {
+            assert_eq!(
+                warm_g[i], warm_g[1],
+                "warm per-statement GETs plateau once the catalog is warm: {warm_g:?}"
+            );
+        }
+        // The whole point of the flag: a later warm statement costs fewer GETs
+        // than the same statement on the cold path.
+        assert!(
+            warm_g[STATEMENTS - 1] < cold_g[STATEMENTS - 1],
+            "a warm later statement costs fewer GETs than the cold path's: warm {warm_g:?} \
+             vs cold {cold_g:?}"
+        );
+    }
+
+    /// Provenance records which regime the run measured, so a report states
+    /// whether its resolve-phase figures are server-like (warm) or
+    /// cold-per-statement.
+    #[tokio::test]
+    async fn warm_catalog_is_recorded_in_provenance() {
+        let store = empty_store();
+        provisioned_tenant(&store, "warm-prov-tenant").await;
+
+        let mut cfg = tenant_cfg(&store, "warm-prov-tenant", None, 0);
+        cfg.entries = vec![entry("q", "SELECT body FROM logs")];
+        cfg.warm_catalog = true;
+        let report = run_tenant(&cfg).await.expect("tenant lane runs");
+        assert!(
+            report.provenance.warm_catalog,
+            "warm-catalog on is recorded"
+        );
+
+        cfg.warm_catalog = false;
+        let report = run_tenant(&cfg).await.expect("tenant lane runs");
+        assert!(
+            !report.provenance.warm_catalog,
+            "warm-catalog off is recorded"
+        );
+    }
+
     /// The `--cache-bytes` cache is not inert: attaching it to the log fetcher
     /// cuts object-store GETs and adds fetch-cache hits.
     ///
@@ -2692,6 +2895,7 @@ mod tests {
             false,
             None,
             ExecutorSettings::default(),
+            false,
             None,
         )
         .await
@@ -2768,6 +2972,7 @@ mod tests {
             false,
             None,
             ExecutorSettings::default(),
+            false,
             None,
         )
         .await
@@ -3088,6 +3293,7 @@ mod tests {
             parallel_final_aggregation: false,
             max_segments: DEFAULT_MAX_SEGMENTS,
             explain_dir: None,
+            warm_catalog: false,
         };
         let gen_report = run_generated(&gen_cfg).await.expect("generated lane runs");
         let load_ms = gen_report
