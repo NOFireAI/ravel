@@ -704,6 +704,21 @@ fn large_object() -> (Vec<LogRecord>, Vec<u8>) {
     (records, bytes)
 }
 
+/// An object inside the ONLY interval where a byte-only 512 KiB threshold and a
+/// 700 KiB request-cost break-even disagree: 27 one-record blocks of ~24 KiB
+/// each, 612181 bytes. That is 87893 B above
+/// [`ravel_query::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD`], which would range-fetch
+/// it, and 104619 B below the 700 KiB break-even
+/// `whole_object_vs_ranged_is_driven_by_the_request_cost` configures, which
+/// reads it whole. `big_records` is deterministic, so the size is the same on
+/// every run; that test asserts both bounds so a fixture-generation change
+/// cannot drift it out of the window unnoticed.
+fn medium_object() -> (Vec<LogRecord>, Vec<u8>) {
+    let records = big_records(27);
+    let bytes = build_object(&records);
+    (records, bytes)
+}
+
 /// The fixed non-BLOCKS section GET cost the probe window `[total - suffix,
 /// total)` does NOT already cover: the two adjacent FRONT sections (STREAM_DIR,
 /// FIELD_DIR) as ONE coalesced GET when either is uncovered (deliverable 4;
@@ -1356,26 +1371,35 @@ async fn page_decode_accounting_is_a_separate_axis_from_wire_bytes() {
 //
 // The whole-object-vs-ranged decision is driven from one configurable quantity,
 // the request cost (a latency-bandwidth product; `BlockRangeFetcher::
-// with_request_cost_bytes`), not from a byte-only size threshold. These two
-// tests pin that: the SAME protocol reads a sub-break-even object whole and an
-// above-break-even object ranged, and a large coalescing gap (also driven from
-// the request cost) never turns a genuinely narrow read into a whole-object one.
+// with_request_cost_bytes`), not from a byte-only size threshold. Test 10 pins
+// that by reading an object the byte-only rule would range-fetch whole, because
+// the request cost says so; test 11 pins that a large coalescing gap (also
+// driven from the request cost) never turns a genuinely narrow read into a
+// whole-object one.
 
 /// The size-threshold crossover is request-cost driven: with the request cost
 /// set so the break-even (`WHOLE_OBJECT_REQUEST_MULTIPLE` = 5 request-costs)
-/// lands at 700 KiB, an object below it is read whole in ONE GET and an object
-/// above it takes the probe+ranged path, WITHOUT any explicit
-/// `with_whole_object_threshold` -- the decision consults the request cost
-/// alone. Request counts are exact, not "fewer than before".
+/// lands at 700 KiB, the crossover sits at 700 KiB and not at the 512 KiB
+/// byte-only floor, WITHOUT any explicit `with_whole_object_threshold` -- the
+/// decision consults the request cost alone. Request counts are exact, not
+/// "fewer than before".
 ///
-/// Prove-the-test: reverting the `<= self.effective_whole_object_threshold()`
-/// comparison in `fetch_object_with_footer` to the old byte-only `<=
-/// self.whole_object_threshold` (with the field back to a `u64` default of 512
-/// KiB) reads the 960 KiB object whole too -- `!stats.whole_object` then fails on
-/// the large fixture, since 960 KiB is above 512 KiB but a whole-object read at
-/// 512 KiB threshold would have taken the ranged path; the request-aware
-/// threshold (700 KiB) is what keeps the large one ranged while reading the
-/// small one whole.
+/// Prove-the-test: the byte-only rule (`<= self.whole_object_threshold`, a `u64`
+/// defaulting to 512 KiB) and the request-cost rule (`<=
+/// self.effective_whole_object_threshold()`, 700 KiB here) disagree on exactly
+/// one interval, [512 KiB, 700 KiB): ranged under the former, whole under the
+/// latter. So only a fixture inside that interval can fail. The small
+/// (`subset_object`, tiny bodies, far under 512 KiB) and large (960 KiB)
+/// fixtures sit outside it and are read the same way under both rules -- they
+/// anchor the two ends, they do not discriminate. `medium_object` (612181 B,
+/// above 512 KiB and below 700 KiB) is inside it: reverting that
+/// comparison in `fetch_object_with_footer` to the byte-only field puts it on
+/// the probe+ranged path, so `medium_stats.whole_object` and the exact
+/// one-GET count both fail. Its ts window is narrow enough to stay under the
+/// coverage crossover, so nothing routes it back to a whole-object read once the
+/// size rule sends it ranged, and both of its size bounds are asserted below: a
+/// fixture-generation change that drifted it out of the interval would restore
+/// the vacuity with no assertion firing.
 #[tokio::test]
 async fn whole_object_vs_ranged_is_driven_by_the_request_cost() {
     // 5 * 140 KiB = 700 KiB break-even, above the 512 KiB floor so the
