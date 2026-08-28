@@ -80,14 +80,21 @@
 //!   window fully contains every relevant segment, and there are at least
 //!   `target_partitions` of them, the plan phase is skipped entirely
 //!   ([`LogsScanExec::whole_segment_fast_path`]): whole segments are assigned
-//!   round-robin (the same rule the un-cached path uses), and each is read in one
-//!   whole-object GET ([`LogSegmentFetcher::scan_whole_accounted_with_tenant`]),
-//!   so the request count is exactly one GET per relevant segment, zero suffix
-//!   probes. Object size does not enter into it: a segment at or below the
-//!   block-range threshold is read whole by both entries, on the same
-//!   `(0, object_size)` cache key, so it joins the assignment without changing
-//!   what is read (#739 -- as a query-wide conjunct the threshold let one small
-//!   tail object per `(shard, hour)` veto an entire 8,424-object snapshot).
+//!   round-robin (the same rule the un-cached path uses), and each is drained
+//!   over every one of its blocks with no probe and no plan read. Which bytes
+//!   that costs is decided by the PROJECTION, not by the block set (#862,
+//!   [`LogsScanExec::fast_path_reads_whole_object`]): a projection covering the
+//!   whole resolved schema is read in one whole-object GET
+//!   ([`LogSegmentFetcher::scan_whole_accounted_with_tenant`]), so the request
+//!   count is exactly one GET per relevant segment and zero suffix probes; a
+//!   narrower one takes the projection-aware ranged entry
+//!   ([`LogSegmentFetcher::scan_accounted_with_tenant`]) and moves the projected
+//!   columns' pages instead of the corpus. Object size does not enter into the
+//!   fast path's own gating: a segment at or below the block-range threshold is
+//!   read whole by both entries, on the same `(0, object_size)` cache key, so it
+//!   joins the assignment without changing what is read (#739 -- as a
+//!   query-wide conjunct the threshold let one small tail object per
+//!   `(shard, hour)` veto an entire 8,424-object snapshot).
 //!   When there are fewer relevant segments than partitions the striped
 //!   path runs instead, but the plan footer it read is carried to each subset
 //!   open ([`LogSegmentFetcher::fetch_object_with_footer`]) so those opens skip
@@ -612,6 +619,20 @@ struct BlockMetrics {
     /// Published once by partition 0, so a report can tell a fully-skip-planned
     /// query from one still paying the plan-phase read.
     plan_full_reads: Count,
+    /// Whole-segment fast-path opens that fetched the ENTIRE object in one
+    /// `GetRange::Full` GET, because the scan's projection covers every column
+    /// of the resolved schema (issue #862). Zero on the plan-then-stripe path.
+    fast_path_whole_object_opens: Count,
+    /// Whole-segment fast-path opens that went through the ranged entry
+    /// instead, because the scan projects a strict subset of the schema's
+    /// columns (issue #862). Those opens fetch the projected page ranges of
+    /// every block rather than the whole object, so this counter is what
+    /// attributes a fast-path statement's `scan`-phase GETs to the narrow
+    /// entry in a report: `fast_path_whole_object_opens` GETs are one per
+    /// object, these are a probe plus the projected ranges (or a single
+    /// whole-object GET when the ADR-0107 coverage crossover decides the
+    /// projection is wide enough to be worth reading whole).
+    fast_path_ranged_opens: Count,
 }
 
 impl BlockMetrics {
@@ -626,6 +647,22 @@ impl BlockMetrics {
             columnar_batches: MetricBuilder::new(metrics).counter("columnar_batches", partition),
             rowpath_batches: MetricBuilder::new(metrics).counter("rowpath_batches", partition),
             plan_full_reads: MetricBuilder::new(metrics).counter("plan_full_reads", partition),
+            fast_path_whole_object_opens: MetricBuilder::new(metrics)
+                .counter("fast_path_whole_object_opens", partition),
+            fast_path_ranged_opens: MetricBuilder::new(metrics)
+                .counter("fast_path_ranged_opens", partition),
+        }
+    }
+
+    /// Counts one whole-segment fast-path open under the entry it took (issue
+    /// #862). Called at every open, including an `attrs_raw` fallback's
+    /// re-open, so the two counters sum to the fast path's fetch attempts
+    /// rather than to its segment count.
+    fn record_fast_path_open(&self, whole_object: bool) {
+        if whole_object {
+            self.fast_path_whole_object_opens.add(1);
+        } else {
+            self.fast_path_ranged_opens.add(1);
         }
     }
 
@@ -1004,6 +1041,56 @@ impl LogsScanExec {
         Ok(relevant)
     }
 
+    /// Whether a whole-segment fast-path open should read the ENTIRE object in
+    /// one `GetRange::Full` GET (issue #862).
+    ///
+    /// The fast path's own conjuncts ([`Self::whole_segment_fast_path`]) decide
+    /// that every BLOCK of the segment is going to be read. They say nothing
+    /// about which COLUMNS are, and `whole_object_bytes` takes no column
+    /// selection at all, so before this a statement projecting one of a
+    /// tenant's hundred declared columns moved the whole corpus: one
+    /// whole-object GET per object, byte-identical to `SELECT *`.
+    ///
+    /// A whole-object GET is the right read only when the projection is
+    /// genuinely everything. When it is, this returns true and the open keeps
+    /// the single GET the fast path exists for. When it is not, the open goes
+    /// through the ranged entry instead
+    /// ([`ravel_query::LogSegmentFetcher::scan_accounted_with_tenant`]), which
+    /// is already projection-aware: it fetches one coalesced range per
+    /// surviving `(row group, projected column)` and keeps the ADR-0107
+    /// coverage crossover, so a wide-but-not-total projection still reads the
+    /// object whole when that is cheaper. Row-wise the two entries are
+    /// interchangeable here: both open the scan over EVERY block of the
+    /// segment with this scan's own query and column selection
+    /// (`open_scan`), and under the fast path's containment and
+    /// predicate-freedom every block survives either way, so narrowing the
+    /// fetch cannot drop a row.
+    ///
+    /// Decided from the projection the query already carries -- no new knob,
+    /// and the 0.75 coverage threshold is untouched. "Everything" is measured
+    /// against the resolved full schema rather than against
+    /// [`ColumnSelection::is_all`]: `resolve_columns` never builds
+    /// `ColumnSelection::all` for a real statement (it starts from
+    /// `fixed_only` and names what the projection asks for), so `is_all` alone
+    /// would send even `SELECT *` down the ranged entry and cost it a probe per
+    /// object. It is still consulted, because a selection that decodes
+    /// everything reads everything whatever the projection indices say.
+    fn fast_path_reads_whole_object(&self) -> bool {
+        if self.columns.is_all() {
+            return true;
+        }
+        let width = self.full_schema.fields().len();
+        let mut covered = vec![false; width];
+        for &i in self.projection.iter() {
+            // Every index was range-checked in `build`; `get_mut` keeps that a
+            // no-op rather than a panic if that ever stops holding.
+            if let Some(slot) = covered.get_mut(i) {
+                *slot = true;
+            }
+        }
+        covered.iter().all(|&c| c)
+    }
+
     /// Indices into the resolved full schema this scan emits, in output order
     /// (ADR-0774: what a late-materialization rewrite narrows and then
     /// restores).
@@ -1360,6 +1447,7 @@ impl ExecutionPlan for LogsScanExec {
             query,
             columns: self.columns.clone(),
             accounting: self.accounting.clone(),
+            fast_path_whole_object: self.fast_path_reads_whole_object(),
         });
 
         // #693 part 3 deliverable 1, amended by #739: a predicate-free query
@@ -1669,6 +1757,10 @@ struct PartitionCtx {
     query: LogQuery,
     columns: ColumnSelection,
     accounting: QueryAccounting,
+    /// Which fetch entry a whole-segment fast-path open takes (issue #862), from
+    /// [`LogsScanExec::fast_path_reads_whole_object`]. Unused on the
+    /// plan-then-stripe path, which reads by range for every projection.
+    fast_path_whole_object: bool,
 }
 
 type OpenFuture = Pin<Box<dyn Future<Output = DFResult<Option<LogSegmentScan>>> + Send>>;
@@ -1702,24 +1794,48 @@ fn open_segment_subset(
     })
 }
 
-/// Fetch one whole segment's object in a single GET and open its pruned,
-/// column-projected scan over all of its blocks (#693 part 3, deliverable 1).
-/// Used only on the predicate-free full-window whole-segment path, where the
-/// segment is assigned to exactly one partition and every block survives, so a
-/// whole-object read is optimal and no plan phase or suffix probe is needed.
+/// Fetch one segment and open its pruned, column-projected scan over ALL of its
+/// blocks (#693 part 3, deliverable 1). Used only on the predicate-free
+/// full-window whole-segment path, where the segment is assigned to exactly one
+/// partition and every block survives, so no plan phase is needed.
+///
+/// Which bytes that costs depends on the projection, not on the block set
+/// (issue #862, see [`LogsScanExec::fast_path_reads_whole_object`]):
+///
+/// - `ctx.fast_path_whole_object`: the whole object in a single `GetRange::Full`
+///   GET, with no suffix probe and no coverage computation. This is the read
+///   #693 introduced, and it stays the read for a projection that covers the
+///   whole schema, where every byte of the object is wanted anyway.
+/// - otherwise: the ranged entry, which brings one coalesced range per
+///   surviving `(row group, projected column)`.
+///
+/// Both open the scan over every block with the same query and the same
+/// [`ColumnSelection`], so they return identical rows; only the bytes moved to
+/// produce them differ.
 fn open_segment_whole(ctx: Arc<PartitionCtx>, seg: SegmentRef) -> OpenFuture {
     Box::pin(async move {
-        let scan = ctx
-            .fetcher
-            .scan_whole_accounted_with_tenant(
-                &seg,
-                ctx.tenant_hash,
-                &ctx.query,
-                &ctx.columns,
-                &ctx.accounting,
-            )
-            .await
-            .map_err(SqlError::from)?;
+        let scan = if ctx.fast_path_whole_object {
+            ctx.fetcher
+                .scan_whole_accounted_with_tenant(
+                    &seg,
+                    ctx.tenant_hash,
+                    &ctx.query,
+                    &ctx.columns,
+                    &ctx.accounting,
+                )
+                .await
+        } else {
+            ctx.fetcher
+                .scan_accounted_with_tenant(
+                    &seg,
+                    ctx.tenant_hash,
+                    &ctx.query,
+                    &ctx.columns,
+                    &ctx.accounting,
+                )
+                .await
+        }
+        .map_err(SqlError::from)?;
         Ok(scan)
     })
 }
@@ -2152,10 +2268,14 @@ impl Stream for LogScanStream {
                         this.current_footer = footer.clone();
                         this.seg_columnar_blocks = 0;
                         this.block_cursor = 0;
-                        // Whole-segment fast path reads the object in one GET
-                        // (#693 part 3); the striped path opens only this
-                        // partition's subset, reusing the plan footer if any.
+                        // Whole-segment fast path drains every block of the
+                        // segment (#693 part 3), fetching it whole or by
+                        // projected range (#862); the striped path opens only
+                        // this partition's subset, reusing the plan footer if
+                        // any.
                         this.state = if this.fast_whole_segment {
+                            this.blocks
+                                .record_fast_path_open(this.ctx.fast_path_whole_object);
                             LogScanState::Opening(open_segment_whole(Arc::clone(&this.ctx), seg))
                         } else {
                             LogScanState::Opening(open_segment_subset(
@@ -2318,6 +2438,8 @@ impl Stream for LogScanStream {
                                 }
                             };
                             let fut = if this.fast_whole_segment {
+                                this.blocks
+                                    .record_fast_path_open(this.ctx.fast_path_whole_object);
                                 open_segment_whole(Arc::clone(&this.ctx), seg)
                             } else {
                                 open_segment_subset(
