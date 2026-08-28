@@ -31,7 +31,7 @@
 //! cell whose column is absent from the block or was projected away by the
 //! scan's [`ColumnSelection`](crate::ColumnSelection).
 
-use crate::block::DecodedBlock;
+use crate::block::{BytesColRef, DecodedBlock};
 use crate::field_dir::FieldDir;
 use crate::record::{
     COL_BODY, COL_FLAGS, COL_OBSERVED_TS, COL_SEVERITY_NUM, COL_SEVERITY_TEXT, COL_SPAN_ID,
@@ -107,6 +107,121 @@ impl<'a> StrDictColumn<'a> {
     pub fn value_at(&self, i: usize) -> Option<&'a [u8]> {
         let id = self.id_at(i)? as usize;
         self.dict.get(id).map(Vec::as_slice)
+    }
+}
+
+/// A single column resolved once for the whole block, walked per surviving row.
+///
+/// The scan's row loop read one cell with one `HashMap<u32, _>` lookup per cell
+/// (`i64_at` was 7% of warm-pass self time, its `RandomState` hashing another
+/// 6%); a cursor resolves the column's storage once, then indexes the resolved
+/// slice per row with no lookup at all (#875). It preserves ADR-0099 decision
+/// 4: like every accessor here it hands out a *value* per surviving row and
+/// never the storage vector, so the string-storage change decision 4 makes stays
+/// invisible to callers -- the string cursor is [`BytesCursor`], which yields
+/// cell bytes through the same opaque [`BytesColRef`] the plain and dictionary
+/// shapes both read through.
+///
+/// A cursor's `at` distinguishes an absent column from a present column whose
+/// cell is null the same way the per-cell accessor did -- both read as `None` at
+/// the value level, byte-identical to the prior path -- while
+/// [`is_column_present`](I64Cursor::is_column_present) exposes which case it is
+/// for a caller that needs to tell them apart.
+macro_rules! value_cursor {
+    ($name:ident, $val:ty, $doc:literal) => {
+        #[doc = $doc]
+        pub struct $name<'a> {
+            /// The resolved column slice, one entry per block row, or `None` when
+            /// the block carries no such column (absent or projected away).
+            col: Option<&'a [Option<$val>]>,
+            /// Block row positions of the surviving rows (the view's `rows`).
+            rows: &'a [usize],
+        }
+
+        impl<'a> $name<'a> {
+            /// The cell at surviving row `i`, or `None` when `i` is out of range,
+            /// the column is absent, or the cell is null.
+            #[inline]
+            pub fn at(&self, i: usize) -> Option<$val> {
+                let row = *self.rows.get(i)?;
+                self.col?.get(row).copied().flatten()
+            }
+
+            /// Whether the block carries this column at all, distinct from a
+            /// present column whose cell at some row is null: both read as `None`
+            /// from [`at`](Self::at), this tells them apart.
+            pub fn is_column_present(&self) -> bool {
+                self.col.is_some()
+            }
+
+            /// Number of surviving rows the cursor ranges over.
+            pub fn len(&self) -> usize {
+                self.rows.len()
+            }
+
+            /// Whether no row survives.
+            pub fn is_empty(&self) -> bool {
+                self.rows.is_empty()
+            }
+        }
+    };
+}
+
+value_cursor!(
+    I64Cursor,
+    i64,
+    "An i64 column resolved once per block (a fixed i64 column or an I64 attribute)."
+);
+value_cursor!(
+    F64BitsCursor,
+    u64,
+    "An f64 column resolved once per block, yielding `to_bits` patterns so NaN \
+     payloads and `-0.0` stay bit-exact (see \
+     [`ColumnarBlockView::f64_bits_at`])."
+);
+value_cursor!(BoolCursor, bool, "A bool column resolved once per block.");
+
+/// A byte-valued column (string or fixed-width id) resolved once per block,
+/// walked per surviving row. Yields cell bytes through [`BytesColRef`], never the
+/// storage vector, so it satisfies ADR-0099 decision 4 exactly as
+/// [`ColumnarBlockView::bytes_at`] does.
+pub struct BytesCursor<'a> {
+    col: Option<BytesColRef<'a>>,
+    rows: &'a [usize],
+}
+
+impl<'a> BytesCursor<'a> {
+    /// The bytes at surviving row `i`, or `None` when `i` is out of range, the
+    /// column is absent, or the cell is null.
+    #[inline]
+    pub fn at(&self, i: usize) -> Option<&'a [u8]> {
+        let row = *self.rows.get(i)?;
+        self.col.as_ref()?.cell(row)
+    }
+
+    /// The bytes at surviving row `i` as `&str`, or `None` when the cell is
+    /// absent **or** its bytes are not UTF-8. Treating invalid UTF-8 as no value
+    /// matches the row path (`String::from_utf8(..).ok()`), which lets a
+    /// resource/scope fallback show through for that row.
+    #[inline]
+    pub fn str_at(&self, i: usize) -> Option<&'a str> {
+        std::str::from_utf8(self.at(i)?).ok()
+    }
+
+    /// Whether the block carries this column at all (see
+    /// [`I64Cursor::is_column_present`]).
+    pub fn is_column_present(&self) -> bool {
+        self.col.is_some()
+    }
+
+    /// Number of surviving rows the cursor ranges over.
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Whether no row survives.
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
     }
 }
 
@@ -342,6 +457,102 @@ impl<'a> ColumnarBlockView<'a> {
                 },
             )
         })
+    }
+
+    // --- per-column cursors -------------------------------------------------
+
+    /// Resolve column `column_id` as an i64 column once, for a cursor that walks
+    /// the surviving rows with no further lookup (#875). The resolution is the
+    /// one `HashMap`/`Vec` lookup the per-cell [`i64_at`](Self::i64_at) did on
+    /// every cell.
+    pub fn i64_cursor(&self, column_id: u32) -> I64Cursor<'a> {
+        I64Cursor {
+            col: self.block.i64_col(column_id),
+            rows: self.rows,
+        }
+    }
+
+    /// Resolve column `column_id` as an f64 column once (bits form, see
+    /// [`f64_bits_at`](Self::f64_bits_at)).
+    pub fn f64_bits_cursor(&self, column_id: u32) -> F64BitsCursor<'a> {
+        F64BitsCursor {
+            col: self.block.f64_col(column_id),
+            rows: self.rows,
+        }
+    }
+
+    /// Resolve column `column_id` as a bool column once.
+    pub fn bool_cursor(&self, column_id: u32) -> BoolCursor<'a> {
+        BoolCursor {
+            col: self.block.bool_col(column_id),
+            rows: self.rows,
+        }
+    }
+
+    /// Resolve column `column_id` as a byte-valued column once (a string column
+    /// or a fixed-width id column; see [`bytes_at`](Self::bytes_at)).
+    pub fn bytes_cursor(&self, column_id: u32) -> BytesCursor<'a> {
+        BytesCursor {
+            col: self.block.bytes_col(column_id),
+            rows: self.rows,
+        }
+    }
+
+    /// A cursor over the event-timestamp column.
+    pub fn ts_cursor(&self) -> I64Cursor<'a> {
+        self.i64_cursor(COL_TS)
+    }
+
+    /// A cursor over the observed-timestamp column.
+    pub fn observed_ts_cursor(&self) -> I64Cursor<'a> {
+        self.i64_cursor(COL_OBSERVED_TS)
+    }
+
+    /// A cursor over the severity-number column.
+    pub fn severity_num_cursor(&self) -> I64Cursor<'a> {
+        self.i64_cursor(COL_SEVERITY_NUM)
+    }
+
+    /// A cursor over the flags column.
+    pub fn flags_cursor(&self) -> I64Cursor<'a> {
+        self.i64_cursor(COL_FLAGS)
+    }
+
+    /// A cursor over the dense STREAM_DIR reference column, as its stored i64
+    /// (the caller narrows to `u32`, exactly as [`stream_ref`](Self::stream_ref)
+    /// does).
+    pub fn stream_ref_cursor(&self) -> I64Cursor<'a> {
+        self.i64_cursor(COL_STREAM_REF)
+    }
+
+    /// A cursor over the severity-text column (stored bytes, not UTF-8 validated;
+    /// see [`severity_text`](Self::severity_text)).
+    pub fn severity_text_cursor(&self) -> BytesCursor<'a> {
+        self.bytes_cursor(COL_SEVERITY_TEXT)
+    }
+
+    /// A cursor over the body column.
+    pub fn body_cursor(&self) -> BytesCursor<'a> {
+        self.bytes_cursor(COL_BODY)
+    }
+
+    /// A cursor over the trace-id column.
+    pub fn trace_id_cursor(&self) -> BytesCursor<'a> {
+        self.bytes_cursor(COL_TRACE_ID)
+    }
+
+    /// A cursor over the span-id column.
+    pub fn span_id_cursor(&self) -> BytesCursor<'a> {
+        self.bytes_cursor(COL_SPAN_ID)
+    }
+
+    /// Column resolutions by id since this block was decoded (see
+    /// [`DecodedBlock::column_lookups`](crate::block::DecodedBlock::column_lookups)).
+    /// A cursor bumps this once per column; a per-cell accessor bumps it once
+    /// per cell. Exposed so a test can pin that the scan resolves O(columns) per
+    /// block, not O(rows x columns).
+    pub fn column_lookups(&self) -> u64 {
+        self.block.column_lookups()
     }
 
     // --- by column id -------------------------------------------------------
