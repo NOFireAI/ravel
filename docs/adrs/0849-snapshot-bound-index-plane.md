@@ -201,8 +201,15 @@ caps are stated and asserted per phase:
   AND over `k` fields must not cost `k` times a single-field lookup by default,
   since the planner may probe the most selective field first and evaluate the
   rest as residual;
-- **probe parallelism** is declared too, since `L` sequential probes and `L`
-  concurrent probes are the same request count and very different latency;
+- **probe parallelism** is declared too, and it is **bound to `L`**, since `L`
+  sequential probes and `L` concurrent probes are the same request count and
+  very different latency. With `parallelism < L` the leaves resolve in
+  `ceil(L / parallelism)` waves and cold routing costs
+  `1 + ceil(L / parallelism)` sequential round trips, which breaks the
+  two-round-trip bound stated below. Either `parallelism >= L` for every
+  declared root, or the bound is restated as the calculated value and enforced
+  as such. A root declaring `L > parallelism` is a test case, not a
+  possibility to be assumed away;
 - a predicate whose shape has **no declared cap** does not get a
   best-effort probe: it falls back to scanning. An uncapped path is how bounded
   routing degrades into the per-object design this section rejects;
@@ -333,8 +340,18 @@ not exist yet: `ErasureRequest`, `ErasureCompletion` and `RewriteRecord` carry
 `created_unix_ns`, `requested_unix_ns` and `completed_unix_ns`, but no
 scope-wide freshness value a pack could be compared against. Concretely:
 
-- the tenant's **erasure epoch** is the maximum `created_unix_ns` over its live
-  erasure requests;
+- the tenant's **erasure epoch** is a **persistent monotonic high-water mark**,
+  not a maximum over the live request set. ADR-0064 deletes `.dreq` after
+  completion plus the horizon (and that deletion is a privacy requirement, not
+  a cleanup convenience — the `.dreq` carries the subject identifier), while
+  `.done` is permanent and carries no epoch. A maximum over live requests
+  therefore *decreases* when a request is reaped, and a stale pack that was
+  correctly rejected yesterday starts satisfying `pack_epoch >= tenant_epoch`
+  tomorrow, readmitting pre-erasure counts. The high-water mark is advanced
+  atomically at acknowledgement and retained after `.dreq` deletion. It is a
+  bare scalar timestamp and deliberately carries no request id or subject
+  identifier, so retaining it permanently does not recreate the reason `.dreq`
+  is deleted;
 - every statistics pack records the epoch it was built at, as declared data in
   the root;
 - `MetadataAggregateExec` is selected only when `pack_epoch >= tenant_epoch`,
@@ -342,7 +359,10 @@ scope-wide freshness value a pack could be compared against. Concretely:
 
 Ordering matters and is stated so it cannot be assumed away: a request is
 acknowledged before the rewrite lands and long before the fold republishes, so
-the epoch must advance at **acknowledgement**, not at completion. An epoch that
+the epoch must advance at **acknowledgement**, not at completion. The required
+test walks acknowledgement to rewrite to fold and asserts both that the epoch
+never decreases across the sequence, including across `.dreq` reclamation, and
+that a pack built before acknowledgement is rejected. An epoch that
 advanced only on completion would leave exactly the window this condition
 exists to close. "No pending selective erasure" as prose with no carrier is the
 shape that ships unimplemented.
