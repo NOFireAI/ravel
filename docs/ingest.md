@@ -875,8 +875,15 @@ a rising `off_actor_ns` with a flat permit wait means flushes are slow but not
 yet backed up.
 
 `on_actor_ns` and `flush_permit_wait_ns` both accrue on the actor task, so they
-are disjoint in wall time as well as in code: together they account for the
-actor's whole `Write`-handling window, and their sum can never exceed it.
+are disjoint in wall time as well as in code: no wall-clock interval is charged
+to both. They do not, however, jointly equal the actor's `Write`-handling
+window. `on_actor_ns` is scoped to `Write` handling, but `flush_permit_wait_ns`
+is recorded in `flush_tenant`, which the actor also reaches from `flush_aged`
+and `flush_all`: an age-triggered or manual flush parks on the same semaphore
+outside any `Write`-handling window, and that wait still lands in
+`flush_permit_wait_ns`. So permit wait can accrue when no `Write` is being
+handled, and the two counters' sum can exceed the `Write`-handling window by
+exactly those out-of-band flush waits.
 `off_actor_ns` accrues in spawned tasks that run *concurrently* with the actor,
 which is exactly what ADR-0067's pipelining is for, so it is a sum over
 concurrent tasks: at `max_inflight_flushes > 1` it can legitimately exceed wall
