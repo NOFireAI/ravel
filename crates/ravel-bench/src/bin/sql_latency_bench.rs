@@ -26,8 +26,8 @@ use clap::Parser;
 use ravel_bench::harness::{StoreKind, store_from_env};
 use ravel_bench::sql_corpus::{checked_default_corpus, load_external_corpus};
 use ravel_bench::sql_latency::{
-    Compaction, FlightTarget, GenerateConfig, SqlLatencyReport, TenantConfigInput, run_generated,
-    run_tenant,
+    Compaction, DatasetInfo, FlightTarget, GenerateConfig, SqlLatencyReport, TenantConfigInput,
+    run_generated, run_tenant,
 };
 use ravel_sql::DEFAULT_MAX_QUERY_BYTES;
 use ravel_types::TimeRange;
@@ -102,10 +102,14 @@ struct Args {
     extra_attrs: usize,
 
     // --- tenant lane knobs ------------------------------------------------
-    /// Which layout the tenant is in. ADR-0100 decision 4 requires the report
-    /// to state this rather than guess.
-    #[arg(long, value_enum, default_value_t = CompactionArg::Pre)]
-    compaction: CompactionArg,
+    /// The operator's belief about which layout the tenant is in, checked
+    /// against the resolved snapshot rather than trusted (issue #834): the
+    /// report's `dataset.layout` is always derived from the tenant's actual
+    /// segment levels, never from this flag. Unset skips the check; set, a
+    /// disagreement refuses the run instead of printing a label that
+    /// contradicts what the snapshot holds.
+    #[arg(long, value_enum)]
+    compaction: Option<CompactionArg>,
     /// Upper bound (unix seconds) of the resolve window and the injected query
     /// clock. Defaults to the wall clock at startup.
     #[arg(long)]
@@ -326,7 +330,7 @@ async fn run(args: &Args) -> Result<SqlLatencyReport, ravel_bench::sql_latency::
                     end_ns: now_ns,
                 },
                 now_ns,
-                compaction: args.compaction.into(),
+                compaction: args.compaction.map(Into::into),
                 max_query_bytes: args.sql_max_query_bytes,
                 shards: args.shards,
                 cache_bytes: args.cache_bytes,
@@ -393,6 +397,23 @@ fn parallel_final_aggregation_effective_label(effective: Option<bool>) -> String
     }
 }
 
+/// The `dataset` report line, shared by the human table and (structurally,
+/// via the same `DatasetInfo` fields) the JSON output, so the two cannot
+/// disagree (issue #834). `layout` is always the observed value on `d`, never
+/// an echo of `--compaction`. `load=` is appended only when `d.load_wall_ms`
+/// is `Some`: a run that performed no load (the `--tenant` lane) omits the
+/// figure entirely rather than rendering a measured-looking `0.0ms`.
+fn dataset_line(d: &DatasetInfo) -> String {
+    let mut line = format!(
+        "{} objects, {} bytes, {} rows, layout={}",
+        d.object_count, d.stored_bytes, d.rows, d.layout
+    );
+    if let Some(load_ms) = d.load_wall_ms {
+        line.push_str(&format!(", load={load_ms:.1}ms"));
+    }
+    line
+}
+
 fn print_human_table(report: &SqlLatencyReport) {
     let p = &report.provenance;
     let d = &report.dataset;
@@ -406,10 +427,7 @@ fn print_human_table(report: &SqlLatencyReport) {
     if let Some(flight) = &p.flight_endpoint {
         println!("  flight sql : {flight} (scan diagnostics are not on the wire)");
     }
-    println!(
-        "  dataset    : {} objects, {} bytes, {} rows, layout={}, load={:.1}ms",
-        d.object_count, d.stored_bytes, d.rows, d.layout, d.load_wall_ms
-    );
+    println!("  dataset    : {}", dataset_line(d));
     println!("  runs/query : {}", p.runs);
     println!("  deadline   : {} s per statement", p.deadline_secs);
     println!("  fetch conc : {}", p.fetch_concurrency);
@@ -538,5 +556,58 @@ mod tests {
             parallel_final_aggregation_effective_label(Some(false)),
             "false"
         );
+    }
+
+    fn dataset(layout: &str, load_wall_ms: Option<f64>) -> DatasetInfo {
+        DatasetInfo {
+            load_wall_ms,
+            stored_bytes: 4096,
+            object_count: 3,
+            rows: 60,
+            layout: layout.to_string(),
+        }
+    }
+
+    /// Both layout directions must show up verbatim in the printed line
+    /// (issue #834): a fix that hardcodes one direction passes only one of
+    /// these two assertions.
+    #[test]
+    fn dataset_line_reports_both_layout_directions() {
+        assert!(dataset_line(&dataset("pre-compaction", None)).contains("layout=pre-compaction"));
+        assert!(
+            dataset_line(&dataset("post-compaction", None)).contains("layout=post-compaction")
+        );
+    }
+
+    /// A run with no load omits the figure entirely rather than rendering a
+    /// measured-looking `0.0ms` (issue #834).
+    #[test]
+    fn dataset_line_omits_load_when_absent_and_shows_it_when_present() {
+        assert!(!dataset_line(&dataset("pre-compaction", None)).contains("load="));
+        assert!(dataset_line(&dataset("pre-compaction", Some(12.5))).contains("load=12.5ms"));
+    }
+
+    /// The human table's `layout`/`load` substrings must agree with what the
+    /// same `DatasetInfo` serializes to in JSON: both read off one struct, so
+    /// there is exactly one code path per field, not two that can drift
+    /// apart.
+    #[test]
+    fn dataset_line_agrees_with_json_serialization() {
+        let with_load = dataset("post-compaction", Some(7.0));
+        let json = serde_json::to_value(&with_load).expect("DatasetInfo serializes");
+        assert_eq!(json["layout"], "post-compaction");
+        assert_eq!(json["load_wall_ms"], 7.0);
+        assert!(dataset_line(&with_load).contains("layout=post-compaction"));
+        assert!(dataset_line(&with_load).contains("load=7.0ms"));
+
+        let no_load = dataset("pre-compaction", None);
+        let json = serde_json::to_value(&no_load).expect("DatasetInfo serializes");
+        assert!(
+            json.get("load_wall_ms").is_none(),
+            "load_wall_ms must be omitted from JSON when absent, not null: {json}"
+        );
+        assert_eq!(json["layout"], "pre-compaction");
+        assert!(dataset_line(&no_load).contains("layout=pre-compaction"));
+        assert!(!dataset_line(&no_load).contains("load="));
     }
 }
