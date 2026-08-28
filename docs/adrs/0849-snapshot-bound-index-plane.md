@@ -244,8 +244,28 @@ promised.
 So a point or gram posting carries at least:
 
 ```text
-(part ordinal, entry ordinal, block/row-group bitmap)
+(part ordinal, entry ordinal, BLOCK bitmap)
 ```
+
+**Block-level, not row-group-level.** These are not interchangeable and an
+earlier draft of this section wrote "block/row-group bitmap" as though they were.
+An RLOG row group holds consecutive blocks — 32 by default — so a
+row-group-granular bitmap cannot identify *which* block inside a group matched,
+and the reader would fetch the whole row-group chunk. That fails the
+block-proportional `q20` criterion this section exists to protect, by exactly the
+average group size.
+
+The reader already accepts the finer granularity:
+`PageDir::projected_page_ranges(group, blocks, columns)` takes a specific block
+list *and* an optional column set, so a block bitmap is directly usable and a
+row-group bitmap would discard a dimension the reader can already exploit. The
+alternative, enforcing one block per row group, is sound but pays it back in
+directory size and loses the grouping's own benefits.
+
+Before the pack version is published, a fixture must cover **multiple blocks in
+one row group with a posting matching only one of them**, since that is the only
+case that distinguishes a block bitmap from a row-group bitmap and the one a
+single-block-per-group fixture silently passes.
 
 The bitmap is what makes the acceptance criterion measurable, and it is what
 lets a candidate object be opened with page ranges on the first request rather
