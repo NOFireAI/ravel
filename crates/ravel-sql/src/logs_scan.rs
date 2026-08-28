@@ -2911,7 +2911,10 @@ fn build_declared_str_columnar(
 ) -> DFResult<ArrayRef> {
     let n = end - start;
     Ok(
-        match plan.matching_col().and_then(|mc| view.str_dict(mc.column_id)) {
+        match plan
+            .matching_col()
+            .and_then(|mc| view.str_dict(mc.column_id))
+        {
             Some(col) => {
                 // Dictionary values start as the page's distinct byte values,
                 // decoded to UTF-8; a non-UTF-8 entry becomes a NULL value. Ids
@@ -3215,4 +3218,114 @@ fn build_columnar_batch(
     let options = RecordBatchOptions::new().with_row_count(Some(end - start));
     RecordBatch::try_new_with_options(Arc::clone(schema), columns, &options)
         .map_err(DataFusionError::from)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod columnar_lookup_tests {
+    use super::*;
+    use datafusion::arrow::array::{Array, Int64Array};
+    use ravel_logseg::record::stream_attrs_bytes;
+    use ravel_logseg::{
+        ColumnSelection, LogRecord, ObjectIdentity, Predicate, RlogConfig, RlogReader, RlogWriter,
+    };
+    use ravel_types::logstream::LogStreamId;
+
+    fn sid(n: u8) -> LogStreamId {
+        let mut a = [0u8; 16];
+        a[0] = n;
+        LogStreamId(a)
+    }
+
+    fn rec_k(ts: i64, k: Option<i64>) -> LogRecord {
+        LogRecord {
+            stream_id: sid(0),
+            stream_attrs: stream_attrs_bytes(
+                &[("service.name".into(), AttrValue::Str("svc".into()))],
+                "scope",
+                "1",
+                &[],
+            ),
+            ts_ns: ts,
+            observed_ts_ns: ts,
+            severity_num: 9,
+            severity_text: "INFO".into(),
+            body: "keep".into(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: k
+                .map(|v| vec![("k".to_string(), AttrValue::I64(v))])
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Deliverable 2 (#875): for a single-matching-column declared scan the
+    /// presence test and the value read fuse to one cursor read, so the block's
+    /// declared column is resolved exactly once. The pre-change path ran
+    /// `attr_present` and then `read_typed_cell` -- two full cell reads, each
+    /// resolving the column by id -- for `2 * rows` resolutions per block.
+    /// Flipping the fused read back to that double read makes the count below
+    /// `2 * rows` instead of `1`.
+    #[test]
+    fn single_matching_declared_scan_reads_each_cell_once() {
+        let cfg = RlogConfig {
+            block_target_records: 16,
+            max_dynamic_columns: 8,
+            ..RlogConfig::default()
+        };
+        let mut w = RlogWriter::new(
+            cfg,
+            ObjectIdentity {
+                tenant_hash: [0; 16],
+                shard: 0,
+                writer_id: [0; 16],
+                writer_epoch: 0,
+                writer_seq: 0,
+            },
+        );
+        // Every row sets `k`, so the record always wins and no resource/scope
+        // fallback (which would resolve `stream_ref` per row) is consulted: the
+        // count isolates the declared column's own resolution.
+        for (ts, v) in [(100i64, 10i64), (101, 20), (102, 30), (103, 40)] {
+            w.push(rec_k(ts, Some(v))).expect("push");
+        }
+        let obj = w.finish().expect("finish");
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+        let mut scan = reader
+            .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
+            .expect("scan");
+        let view = scan
+            .next_block_columnar(&obj)
+            .expect("columnar exit")
+            .expect("one block");
+        let rows = view.surviving_count();
+        assert_eq!(rows, 4);
+
+        let dc = DeclaredColumn::new("k", DeclaredType::I64);
+        let base = view.column_lookups();
+        let plan = DeclaredPlan::build(&view, &dc);
+        assert!(
+            plan.single_matching(),
+            "the key has exactly one FIELD_DIR column, of the declared type"
+        );
+        let mut cache = HashMap::new();
+        let arr = build_declared_columnar_array(&view, &plan, 0, rows, &mut cache)
+            .expect("declared array");
+        let lookups = view.column_lookups() - base;
+        assert_eq!(
+            lookups, 1,
+            "the declared column is resolved once per block, not 2*rows (the pre-change double read)"
+        );
+
+        let ints = arr
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("declared I64 array");
+        assert_eq!(ints.len(), 4);
+        for (i, want) in [10i64, 20, 30, 40].into_iter().enumerate() {
+            assert!(ints.is_valid(i), "row {i} is non-null");
+            assert_eq!(ints.value(i), want, "row {i}");
+        }
+    }
 }

@@ -4067,6 +4067,219 @@ mod tests {
         );
     }
 
+    /// A four-row single-block fixture whose rows all match `keep`, carrying one
+    /// column of every declared attribute type. Used by the cursor tests below.
+    fn cursor_fixture() -> Vec<u8> {
+        let cfg = RlogConfig {
+            block_target_records: 16,
+            max_dynamic_columns: 8,
+            ..RlogConfig::default()
+        };
+        let recs = vec![
+            rec_attrs(
+                0,
+                100,
+                "keep a",
+                vec![
+                    attr("b_int", AttrValue::I64(1)),
+                    attr("c_f64", AttrValue::F64(1.0)),
+                    attr("d_bool", AttrValue::Bool(true)),
+                    attr("a_str", AttrValue::Str("p".into())),
+                    attr("e_bytes", AttrValue::Bytes(vec![1])),
+                ],
+            ),
+            rec_attrs(0, 101, "keep b", vec![attr("b_int", AttrValue::I64(2))]),
+            rec_attrs(0, 102, "keep c", vec![attr("c_f64", AttrValue::F64(3.0))]),
+            // Row 3 sets no attribute at all: every dynamic column has a null
+            // cell here.
+            rec_attrs(0, 103, "keep d", Vec::new()),
+        ];
+        build(cfg, recs)
+    }
+
+    fn cursor_reader_cfg() -> RlogConfig {
+        RlogConfig {
+            block_target_records: 16,
+            max_dynamic_columns: 8,
+            ..RlogConfig::default()
+        }
+    }
+
+    /// Deliverable 1 (#875): a cursor resolves its column once per block, so the
+    /// scan does O(columns) resolutions, never O(rows x columns). Pins the exact
+    /// count for a known 4-row, single-block fixture. The per-cell accessor --
+    /// the pre-change path -- is shown resolving the column on every cell (R per
+    /// column), so the exact-count assertion here fails against it: flipping the
+    /// cursor loop's `cur.at(i)` back to `view.i64_at(col, i)` turns 6 into
+    /// 6 * R.
+    #[test]
+    fn cursor_resolves_each_column_once_per_block() {
+        let obj = cursor_fixture();
+        let cfg = cursor_reader_cfg();
+        let reader = RlogReader::new(&obj, &cfg).expect("open object");
+        let pred = Predicate::And(Vec::new());
+        let mut cursor = reader
+            .scan_blocks(&pred, &[], &ColumnSelection::all())
+            .expect("open cursor");
+        let view = cursor
+            .next_block_columnar(&obj)
+            .expect("columnar exit")
+            .expect("one block");
+        let rows = view.surviving_count();
+        assert_eq!(rows, 4, "match-all keeps every row of the single block");
+
+        // Resolving these does not touch the block's column maps (FIELD_DIR
+        // lookups), so they do not move the counter.
+        let b_int = view.resolve_attr("b_int", FieldType::I64).expect("b_int");
+        let c_f64 = view.resolve_attr("c_f64", FieldType::F64).expect("c_f64");
+        let d_bool = view
+            .resolve_attr("d_bool", FieldType::Bool)
+            .expect("d_bool");
+        let a_str = view.resolve_attr("a_str", FieldType::Str).expect("a_str");
+        let e_bytes = view
+            .resolve_attr("e_bytes", FieldType::Bytes)
+            .expect("e_bytes");
+
+        let base = view.column_lookups();
+        // ts plus one column of every declared type: six distinct columns.
+        let cur_ts = view.ts_cursor();
+        let cur_bi = view.i64_cursor(b_int.column_id);
+        let cur_cf = view.f64_bits_cursor(c_f64.column_id);
+        let cur_db = view.bool_cursor(d_bool.column_id);
+        let cur_as = view.bytes_cursor(a_str.column_id);
+        let cur_eb = view.bytes_cursor(e_bytes.column_id);
+        const COLUMNS: u64 = 6;
+        // Walking every surviving row through the cursors adds no resolution.
+        for i in 0..rows {
+            let _ = (
+                cur_ts.at(i),
+                cur_bi.at(i),
+                cur_cf.at(i),
+                cur_db.at(i),
+                cur_as.at(i),
+                cur_eb.at(i),
+            );
+        }
+        let cursor_lookups = view.column_lookups() - base;
+        assert_eq!(
+            cursor_lookups, COLUMNS,
+            "one resolution per column, independent of the {rows} rows"
+        );
+
+        // The pre-change shape: the per-cell accessor resolves the column on
+        // every cell. Over the two i64 columns (ts, b_int) that is exactly 2 per
+        // row -- O(rows x columns), the cost this change deletes.
+        let before = view.column_lookups();
+        for i in 0..rows {
+            let _ = view.i64_at(COL_TS, i);
+            let _ = view.i64_at(b_int.column_id, i);
+        }
+        let per_cell = view.column_lookups() - before;
+        assert_eq!(
+            per_cell,
+            2 * rows as u64,
+            "per-cell accessor resolves once per cell"
+        );
+        assert!(
+            per_cell > COLUMNS,
+            "the pre-change per-cell path fails the O(columns) bound"
+        );
+    }
+
+    /// Deliverable 1 correctness bar (#875): a cursor keeps an absent column and
+    /// a present-but-null cell distinguishable, both directions. Both read as
+    /// `None` at the value level -- byte-identical to the per-cell accessor the
+    /// scan used before -- while `is_column_present` tells the two apart.
+    #[test]
+    fn cursor_distinguishes_absent_column_from_null_cell() {
+        let obj = cursor_fixture();
+        let cfg = cursor_reader_cfg();
+        let reader = RlogReader::new(&obj, &cfg).expect("open object");
+        let pred = Predicate::And(Vec::new());
+        let mut cursor = reader
+            .scan_blocks(&pred, &[], &ColumnSelection::all())
+            .expect("open cursor");
+        let view = cursor
+            .next_block_columnar(&obj)
+            .expect("columnar exit")
+            .expect("one block");
+        let b_int = view.resolve_attr("b_int", FieldType::I64).expect("b_int");
+
+        // Present column, null cell: b_int is decoded but row 3 sets no value.
+        let bi = view.i64_cursor(b_int.column_id);
+        assert!(bi.is_column_present(), "b_int is a decoded column");
+        assert_eq!(bi.at(0), Some(1), "row 0 sets b_int");
+        assert_eq!(bi.at(3), None, "row 3 has a null b_int cell");
+
+        // Absent column: b_int has no f64 storage, so an f64 cursor over its id
+        // resolves to no column at all.
+        let bi_as_f64 = view.f64_bits_cursor(b_int.column_id);
+        assert!(
+            !bi_as_f64.is_column_present(),
+            "there is no f64 column for b_int"
+        );
+        assert_eq!(bi_as_f64.at(0), None, "an absent column reads None");
+
+        // Both directions read None as a value, and the two are still
+        // distinguishable through `is_column_present`.
+        assert_eq!(bi.at(3), None, "null cell reads None");
+        assert_eq!(bi_as_f64.at(0), None, "absent column reads None");
+        assert_ne!(
+            bi.is_column_present(),
+            bi_as_f64.is_column_present(),
+            "null cell and absent column stay distinguishable"
+        );
+    }
+
+    /// Deliverable correctness bar (#875): the f64 cursor round-trips the exact
+    /// stored bit pattern, so `-0.0` stays distinct from `+0.0` and a NaN payload
+    /// survives. `f64_bits_at`/the cursor return bits for exactly this reason.
+    #[test]
+    fn f64_cursor_preserves_exact_bit_pattern() {
+        let cfg = RlogConfig {
+            block_target_records: 16,
+            max_dynamic_columns: 8,
+            ..RlogConfig::default()
+        };
+        let nan_payload = f64::from_bits(f64::NAN.to_bits() | 0x7);
+        let recs = vec![
+            rec_attrs(0, 100, "keep a", vec![attr("v", AttrValue::F64(-0.0))]),
+            rec_attrs(0, 101, "keep b", vec![attr("v", AttrValue::F64(0.0))]),
+            rec_attrs(
+                0,
+                102,
+                "keep c",
+                vec![attr("v", AttrValue::F64(nan_payload))],
+            ),
+            rec_attrs(0, 103, "keep d", vec![attr("v", AttrValue::F64(1.5))]),
+        ];
+        let obj = build(cfg, recs);
+        let reader = RlogReader::new(&obj, &cfg).expect("open object");
+        let pred = Predicate::And(Vec::new());
+        let mut cursor = reader
+            .scan_blocks(&pred, &[], &ColumnSelection::all())
+            .expect("open cursor");
+        let view = cursor
+            .next_block_columnar(&obj)
+            .expect("columnar exit")
+            .expect("one block");
+        let v = view.resolve_attr("v", FieldType::F64).expect("v col");
+        let cur = view.f64_bits_cursor(v.column_id);
+        assert_eq!(cur.at(0), Some((-0.0f64).to_bits()), "-0.0 bit pattern");
+        assert_eq!(cur.at(1), Some(0.0f64.to_bits()), "+0.0 bit pattern");
+        assert_ne!(
+            cur.at(0),
+            cur.at(1),
+            "-0.0 and +0.0 are distinct bit patterns"
+        );
+        assert_eq!(
+            cur.at(2),
+            Some(nan_payload.to_bits()),
+            "NaN payload preserved"
+        );
+        assert_eq!(cur.at(3), Some(1.5f64.to_bits()));
+    }
+
     /// Both exits reject a corrupt block with the same typed error, and neither
     /// panics. The flipped byte is inside block 0's stored extent, so its
     /// crc32c no longer matches its SKIP_IDX entry.
