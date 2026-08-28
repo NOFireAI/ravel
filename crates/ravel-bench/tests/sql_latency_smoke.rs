@@ -58,6 +58,7 @@ fn small_generate_config(store: Arc<dyn ObjectStoreBackend>, runs: usize) -> Gen
         parallel_final_aggregation: false,
         max_segments: ravel_query::DEFAULT_MAX_SEGMENTS,
         explain_dir: None,
+        warm_catalog: false,
     }
 }
 
@@ -241,6 +242,7 @@ async fn an_entry_with_an_unsatisfied_required_declaration_is_skipped_with_the_k
         false,
         None,
         ravel_bench::sql_latency::ExecutorSettings::default(),
+        false,
         None,
     )
     .await
