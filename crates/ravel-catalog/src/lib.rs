@@ -7,6 +7,8 @@
 mod auth_token_map;
 mod cache;
 mod catalog;
+mod column_stats_build;
+mod column_stats_resolve;
 mod config;
 mod covering_postings;
 mod error;
@@ -29,6 +31,7 @@ pub use auth_token_map::{
 };
 pub use catalog::Catalog;
 pub use catalog::resolve_rewrite_supersession;
+pub use column_stats_resolve::{LoadColumnStatsError, LoadedColumnStats, load_column_stats};
 pub use config::{
     CatalogConfig, DEFAULT_BYTE_CACHE_MAX_BYTES, DEFAULT_BYTE_CACHE_MAX_ENTRIES,
     DEFAULT_BYTE_CACHE_MAX_ENTRY_BYTES, DEFAULT_CACHE_CAPACITY_PER_TENANT,
@@ -65,9 +68,11 @@ pub use seal_divergence::{
 };
 pub use snapshot::{SegmentLevel, SegmentOrigin, SegmentOrigins, SegmentRef, Snapshot};
 pub use snapshot_format::{
-    DEFAULT_MAX_POSTINGS_BYTES, DEFAULT_MAX_SNAPSHOT_PART_BYTES, DecodedPart, DecodedPostings,
-    HEAD_FORMAT_VERSION, MAGIC, NamePostings, PartLimits, PostingsLimits, SnapshotFormatError,
-    VERSION, decode_head, decode_part, decode_postings, encode_head, encode_part, encode_postings,
+    ColumnStatsLimits, DEFAULT_MAX_COLUMN_DICTIONARY_ENTRIES, DEFAULT_MAX_COLUMN_STATS_BYTES,
+    DEFAULT_MAX_POSTINGS_BYTES, DEFAULT_MAX_SNAPSHOT_PART_BYTES, DecodedColumnStats, DecodedPart,
+    DecodedPostings, HEAD_FORMAT_VERSION, MAGIC, NamePostings, PartLimits, PostingsLimits,
+    SnapshotFormatError, VERSION, decode_column_stats, decode_head, decode_part, decode_postings,
+    encode_column_stats, encode_head, encode_part, encode_postings,
 };
 pub use tenant_config::{
     DeclaredColumnType, DeclaredTypedColumn, FIXED_LOGS_SQL_COLUMNS,
