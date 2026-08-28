@@ -275,17 +275,35 @@ pub struct Provenance {
     /// `RecordCache` for a tenant's whole query stream, so its resolve phase is
     /// warm for every statement after the first; a cold-per-statement bench
     /// re-pays the resolve GETs on every statement and so overstates
-    /// resolve-phase cost relative to that server (issue #857). Recorded so a
-    /// report states which of the two regimes it measured: under `true`, only
-    /// the first statement's run 0 is a genuine cold resolve.
+    /// resolve-phase cost relative to that server (issue #857).
+    ///
+    /// `Some(v)` for an in-process lane (`generate`/`tenant`), which builds the
+    /// executor the flag governs: under `Some(true)`, only the first statement's
+    /// run 0 is a genuine cold resolve. `None` for the Flight lane: it builds no
+    /// in-process executor, so the flag governs nothing there and reporting its
+    /// value would be a mislabelled measurement (the same class of defect as the
+    /// effective-ceiling fields above avoid on that lane). See
+    /// [`recorded_warm_catalog`].
     #[serde(default)]
-    pub warm_catalog: bool,
+    pub warm_catalog: Option<bool>,
     /// The Flight SQL endpoint (`host:port`) the statements were executed
     /// against, or `None` for an in-process lane. Deliberately not `endpoint`
     /// above: that one names the object store, and the two are different
     /// machines in any deployment worth measuring.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flight_endpoint: Option<String>,
+}
+
+/// The `warm_catalog` regime a report should record. `--warm-catalog` reuses
+/// one in-process [`SqlExecutor`] across statements, so it governs only the
+/// in-process lanes; the Flight lane builds no such executor
+/// ([`measure_over_flight`] runs each statement over the wire), so the flag
+/// changes nothing there. Recording its value on that lane would claim a regime
+/// the run never measured (issue #857 review), so a Flight run records `None`,
+/// exactly as the effective-ceiling fields do. `flight` is
+/// `cfg.flight.is_some()`.
+fn recorded_warm_catalog(flight: bool, warm_catalog: bool) -> Option<bool> {
+    if flight { None } else { Some(warm_catalog) }
 }
 
 /// The tenant ceiling every run used before the knob was configurable.
@@ -1432,7 +1450,9 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
             // `SqlConfig`, so it is also the effective one.
             parallel_final_aggregation_effective: Some(cfg.parallel_final_aggregation),
             explain: cfg.explain_dir.is_some(),
-            warm_catalog: cfg.warm_catalog,
+            // The generate lane is always in-process (no Flight target), so the
+            // flag governed the run it describes.
+            warm_catalog: recorded_warm_catalog(false, cfg.warm_catalog),
             flight_endpoint: None,
         },
         dataset,
@@ -1573,7 +1593,10 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
                 None => Some(cfg.parallel_final_aggregation),
             },
             explain: cfg.explain_dir.is_some(),
-            warm_catalog: cfg.warm_catalog,
+            // Not-applicable on the Flight lane: it builds no in-process
+            // executor, so `--warm-catalog` governed nothing there (issue #857
+            // review). The in-process tenant lane applies it directly.
+            warm_catalog: recorded_warm_catalog(cfg.flight.is_some(), cfg.warm_catalog),
             flight_endpoint: cfg.flight.as_ref().map(|t| t.endpoint.clone()),
         },
         dataset,
@@ -2719,16 +2742,54 @@ mod tests {
         cfg.entries = vec![entry("q", "SELECT body FROM logs")];
         cfg.warm_catalog = true;
         let report = run_tenant(&cfg).await.expect("tenant lane runs");
-        assert!(
+        assert_eq!(
             report.provenance.warm_catalog,
-            "warm-catalog on is recorded"
+            Some(true),
+            "warm-catalog on is recorded on the in-process tenant lane"
         );
 
         cfg.warm_catalog = false;
         let report = run_tenant(&cfg).await.expect("tenant lane runs");
-        assert!(
-            !report.provenance.warm_catalog,
-            "warm-catalog off is recorded"
+        assert_eq!(
+            report.provenance.warm_catalog,
+            Some(false),
+            "warm-catalog off is recorded on the in-process tenant lane"
+        );
+    }
+
+    /// Item 2 (issue #857 review): the Flight lane builds no in-process
+    /// executor, so `--warm-catalog` governs nothing there. A `--flight
+    /// --warm-catalog` run must therefore not report `warm_catalog: true`; it
+    /// records the regime as not-applicable, exactly as the effective-ceiling
+    /// fields do. The Flight lane cannot run without a live server, so this
+    /// tests the recording rule and its serialisation directly.
+    ///
+    /// Prove-the-test: reverting `recorded_warm_catalog` to `Some(warm_catalog)`
+    /// unconditionally makes the flight case serialise `true`, failing both the
+    /// `None` assertion and the "not true" serialisation assertion below.
+    #[test]
+    fn flight_lane_never_records_warm_catalog_as_true() {
+        // The recording rule: in-process lanes carry the flag; the Flight lane
+        // is not-applicable regardless of the flag.
+        assert_eq!(recorded_warm_catalog(true, true), None);
+        assert_eq!(recorded_warm_catalog(true, false), None);
+        assert_eq!(recorded_warm_catalog(false, true), Some(true));
+        assert_eq!(recorded_warm_catalog(false, false), Some(false));
+
+        // The serialised report of a `--flight --warm-catalog` run must not
+        // claim `true`.
+        let flight_warm = serde_json::json!({
+            "warm_catalog": recorded_warm_catalog(true, true),
+        });
+        assert_ne!(
+            flight_warm["warm_catalog"],
+            serde_json::json!(true),
+            "a Flight run must not serialise warm_catalog: true"
+        );
+        assert_eq!(
+            flight_warm["warm_catalog"],
+            serde_json::Value::Null,
+            "a Flight run serialises warm_catalog as not-applicable (null)"
         );
     }
 
