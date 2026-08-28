@@ -550,6 +550,20 @@ pub struct SegmentFetcher {
     /// is derived per call from the caller-supplied `tenant_hash`, never
     /// fixed on the fetcher itself.
     cache: Option<ReadCache>,
+    /// Counts first-GET footer reads that fell back to an uncacheable
+    /// `GetRange::Suffix` because the segment ref carried no `object_size`
+    /// (issue #811). A known object size is read as an absolute tail range the
+    /// ADR-0046 read cache can serve (keyed by content hash plus absolute
+    /// range), so a second query over the same segment issues zero footer
+    /// GETs; an absent size cannot be keyed that way (a suffix hit has no
+    /// object total size to fabricate), so the footer is re-fetched per query.
+    /// Making that fallback observable is the point: a silent one hides the
+    /// missed optimization in exactly the case it did not apply. Shared across
+    /// clones (an `Arc`), never reset. No production RSEG ref reaches this
+    /// path -- the commit record always records the object size (the writer at
+    /// `crates/ravel-ingest/src/shard.rs` and every compaction part), so a
+    /// nonzero count flags a ref built without one.
+    suffix_fallbacks: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl SegmentFetcher {
@@ -564,7 +578,21 @@ impl SegmentFetcher {
                 DEFAULT_MAX_CONCURRENT_GETS,
             )),
             cache: None,
+            suffix_fallbacks: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// Number of first-GET footer reads that took the uncacheable suffix
+    /// fallback because the segment ref carried no `object_size` (issue #811).
+    /// Zero on every production RSEG query: the commit record always records
+    /// the object size, so the footer is read as a cacheable absolute range. A
+    /// nonzero value means a ref reached the fetcher without a size and its
+    /// footer was re-fetched from the store rather than served from ADR-0046's
+    /// read cache. Exposed so the fallback is observable, never silent.
+    #[must_use]
+    pub fn suffix_fallbacks(&self) -> u64 {
+        self.suffix_fallbacks
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Wires ADR-0046's read cache into every GET `guarded_get` issues
@@ -595,9 +623,10 @@ impl SegmentFetcher {
 
     /// Sets the whole-object fetch threshold. An object whose
     /// commit-record size is at or below `n` is read whole on its first GET;
-    /// a larger one keeps the footer-suffix path. `0` disables the
-    /// whole-object path entirely (every object takes the suffix path),
-    /// which is what the multi-GET suffix tests use to exercise the footer
+    /// a larger one reads only the footer tail. `0` disables the
+    /// whole-object path entirely, so every object with a known size takes the
+    /// footer tail read (an absolute range, cache-eligible per issue #811),
+    /// which is what the multi-GET tests use to exercise the footer
     /// `NeedRange` chase on a small object.
     #[must_use]
     pub fn with_whole_object_threshold(mut self, n: u64) -> Self {
@@ -719,7 +748,13 @@ impl SegmentFetcher {
                 key: key.to_string(),
                 source,
             })?;
+        // An empty expected etag is not a real S3 etag; it is the "no live pin
+        // available" sentinel a cache-served footer read produces (see
+        // `cached_get` and `open_segment`, issue #811), so it never gates a
+        // store read. A real etag still pins, catching a mutated object
+        // mid-read.
         if let Some(expected) = expected_etag
+            && !expected.0.is_empty()
             && &got.etag != expected
         {
             return Err(FetchError::EtagChanged {
@@ -781,6 +816,19 @@ impl SegmentFetcher {
         // store round trip, so nothing added to this span's S3 counts), and
         // [`Source::Upstream`] means the store GET inside the closure ran (a
         // leader miss) or this call rode another's in-flight GET (a follower).
+        // A leader miss runs the closure and learns the store's real etag; a
+        // hit or a single-flight follower does not, and no etag is knowable
+        // from this call. `open_segment` pins later range reads to the footer
+        // GET's etag, and the footer is read through this cache now (issue
+        // #811), so the real etag must survive a leader miss -- otherwise every
+        // later ranged store GET on a cold large-object query would mismatch an
+        // empty pin. On a hit or follower the cache's content-hash key is what
+        // guarantees immutability instead (ADR-0046 decision 4); the empty etag
+        // then flows out as the "no live pin available" sentinel the range-read
+        // etag check skips.
+        let leader_etag: std::sync::Arc<std::sync::Mutex<Option<Etag>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let etag_capture = leader_etag.clone();
         let (bytes, source) = cache
             .get_or_fetch(cache_key, || async move {
                 let got = self
@@ -788,11 +836,15 @@ impl SegmentFetcher {
                     .await
                     .map_err(|source| CacheFetchError::Store(std::sync::Arc::new(source)))?;
                 if let Some(expected) = expected_etag
+                    && !expected.0.is_empty()
                     && &got.etag != expected
                 {
                     return Err(CacheFetchError::EtagChanged {
                         key: key.to_string(),
                     });
+                }
+                if let Ok(mut slot) = etag_capture.lock() {
+                    *slot = Some(got.etag.clone());
                 }
                 Ok(got.data)
             })
@@ -849,7 +901,24 @@ impl SegmentFetcher {
                     requests: 1,
                     bytes: bytes.len() as u64,
                 };
-                Ok((placeholder_outcome(bytes, seg_ref.object_size), cost))
+                // Real etag on a leader miss (a store GET happened in this
+                // call); empty on a follower that rode another caller's GET,
+                // which `open_segment` and the range-read check treat as "no
+                // live pin available".
+                let etag = leader_etag
+                    .lock()
+                    .ok()
+                    .and_then(|mut slot| slot.take())
+                    .unwrap_or_else(|| Etag(String::new()));
+                Ok((
+                    GetOutcome {
+                        data: bytes,
+                        etag,
+                        version: Version(String::new()),
+                        total_size: seg_ref.object_size,
+                    },
+                    cost,
+                ))
             }
         }
     }
@@ -959,18 +1028,41 @@ impl SegmentFetcher {
             let mut span_requests: u64 = 0;
             let mut span_bytes: u64 = 0;
             let key = &seg_ref.data_object_key;
-            // Size-aware first GET: the commit record already
-            // carries the exact object size, so a small object is read whole in
-            // one request (its footer, catalog, and pages then all come from that
-            // buffer, never a second probe), while a large one keeps the
-            // footer-suffix read that touches only the tail. `whole_object_threshold
-            // == 0` disables the whole-object path.
-            let first_range =
-                if seg_ref.object_size != 0 && seg_ref.object_size <= self.whole_object_threshold {
-                    GetRange::Full
-                } else {
-                    GetRange::Suffix(self.suffix_len)
-                };
+            // Size-aware first GET: the commit record already carries the exact
+            // object size, so a small object is read whole in one request (its
+            // footer, catalog, and pages then all come from that buffer, never a
+            // second probe), while a large one reads only the footer tail.
+            //
+            // When the size is known that tail is issued as an absolute range
+            // (`Range(object_size - footer_len, object_size)`), not a suffix, so
+            // ADR-0046's read cache -- keyed by content hash plus absolute range
+            // -- can serve it and a second query over the same segment issues
+            // zero footer GETs (issue #811). A suffix GET is not cache-eligible
+            // (a hit would have no object total size to fabricate) and would
+            // re-fetch the footer every query. The suffix path is kept only for
+            // the case where the size is genuinely absent, and that fallback is
+            // counted (`suffix_fallbacks`) rather than taken silently.
+            // `whole_object_threshold == 0` disables the whole-object path; the
+            // first GET is then the footer tail read (an absolute range when the
+            // size is known, a suffix only when it is absent).
+            let first_range = if seg_ref.object_size == 0 {
+                self.suffix_fallbacks
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::debug!(
+                    object_key = %seg_ref.data_object_key,
+                    "footer read falls back to an uncacheable suffix GET: the segment ref \
+                     carried no object_size, so the read cache cannot serve it"
+                );
+                GetRange::Suffix(self.suffix_len)
+            } else if seg_ref.object_size <= self.whole_object_threshold {
+                GetRange::Full
+            } else {
+                // Clamp the footer length to the object so a `suffix_len` wider
+                // than the object reads the whole object (a valid tail) rather
+                // than underflowing the start offset.
+                let footer_len = self.suffix_len.min(seg_ref.object_size);
+                GetRange::Range(seg_ref.object_size - footer_len, seg_ref.object_size)
+            };
             let (first, first_cost) = self
                 .guarded_get(seg_ref, tenant_hash, first_range, None, accounting)
                 .await?;
@@ -3408,8 +3500,8 @@ mod tests {
         // first GET alone would already cover the whole object and the
         // catalog-probe path below would correctly find nothing left to fetch
         // -- exercising the whole-object optimization instead of the one this test is
-        // for. Disable it so the first GET stays a footer suffix and this test
-        // isolates the catalog-probe path on its own.
+        // for. Disable it so the first GET stays a footer tail read and this
+        // test isolates the catalog-probe path on its own.
         let fetcher = fetcher.with_whole_object_threshold(0);
         let (soa, _stats) = fetcher
             .fetch_soa(tenant_hash, &seg_ref, &matchers)
@@ -3631,10 +3723,10 @@ mod tests {
 
     /// Below the whole-object threshold the first GET reads the
     /// entire object (one request, no footer probe) regardless of `suffix_len`;
-    /// above it the footer-suffix path runs and a tiny suffix forces the
+    /// above it the footer tail read runs and a tiny footer length forces the
     /// `NeedRange` chase into more than one GET. Both decode identical data.
     #[tokio::test]
-    async fn size_aware_first_get_reads_whole_small_object_else_footer_suffix() {
+    async fn size_aware_first_get_reads_whole_small_object_else_footer_tail() {
         let (mem, tenant_hash, seg_ref) = write_test_segment().await;
         let bytes = mem
             .get(&seg_ref.data_object_key, GetRange::Full)
@@ -3658,24 +3750,24 @@ mod tests {
             "below threshold the fetch reads the whole object in one GET"
         );
 
-        // Above threshold (whole-object disabled) with a tiny suffix: the
-        // footer NeedRange chase issues at least a second GET.
-        let suffix_store = counting_store(bytes, &seg_ref.data_object_key).await;
-        let suffix_backend: Arc<dyn ObjectStoreBackend> = suffix_store.clone();
-        let suffixed = SegmentFetcher::new(suffix_backend)
+        // Above threshold (whole-object disabled) with a tiny footer length:
+        // the footer NeedRange chase issues at least a second GET.
+        let tail_store = counting_store(bytes, &seg_ref.data_object_key).await;
+        let tail_backend: Arc<dyn ObjectStoreBackend> = tail_store.clone();
+        let tailed = SegmentFetcher::new(tail_backend)
             .with_whole_object_threshold(0)
             .with_suffix_len(16)
             .fetch(tenant_hash, &seg_ref, &[])
             .await
-            .expect("footer-suffix fetch");
+            .expect("footer tail fetch");
         assert!(
-            suffix_store.sequence_progress(0) >= 2,
-            "above threshold the footer-suffix path issues a second probe, got {}",
-            suffix_store.sequence_progress(0)
+            tail_store.sequence_progress(0) >= 2,
+            "above threshold the footer tail read issues a second probe, got {}",
+            tail_store.sequence_progress(0)
         );
 
         let mut a = whole;
-        let mut b = suffixed;
+        let mut b = tailed;
         a.sort_by_key(|s| s.series_id.0);
         b.sort_by_key(|s| s.series_id.0);
         assert_eq!(a.len(), b.len());
@@ -3813,5 +3905,281 @@ mod tests {
              never land on any other span (production's request-level span \
              declares the same field names): got {leaked:?}"
         );
+    }
+
+    /// A fresh RAM-only ADR-0046 read cache, sized well above any test object
+    /// so nothing evicts mid-test.
+    fn ram_cache() -> Arc<ravel_cache::Cache<CacheFetchError>> {
+        let limits = ravel_cache::CacheLimits::new(64 * 1024 * 1024, 1024, 64 * 1024 * 1024);
+        Arc::new(ravel_cache::Cache::new(limits))
+    }
+
+    /// Puts `bytes` on a fresh `MemoryStore` under `key`. `MemoryStore` is the
+    /// object-store semantics oracle and returns the object's whole
+    /// `total_size` on a `Range` GET exactly as S3 does, so an absolute footer
+    /// tail range resolves the same `total_size` a suffix would have.
+    async fn store_from_bytes(key: &str, bytes: Bytes) -> Arc<MemoryStore> {
+        let store = Arc::new(MemoryStore::new());
+        store
+            .put(key, bytes, PutOptions::default())
+            .await
+            .expect("put segment object");
+        store
+    }
+
+    fn assert_fetched_eq(got: &[FetchedSeries], truth: &[FetchedSeries]) {
+        assert_eq!(got.len(), truth.len(), "series count differs");
+        for (x, y) in got.iter().zip(truth.iter()) {
+            assert_eq!(x.series_id, y.series_id);
+            assert_eq!(x.labels, y.labels);
+            assert_eq!(x.samples.len(), y.samples.len());
+            for (sx, sy) in x.samples.iter().zip(y.samples.iter()) {
+                assert_eq!(sx.ts_ns, sy.ts_ns);
+                // Bit-pattern equality: NaN payloads and -0.0 are significant
+                // (CLAUDE.md testing patterns).
+                assert_eq!(sx.value.to_bits(), sy.value.to_bits());
+            }
+        }
+    }
+
+    /// Issue #811: with the object size known, the footer is read as an
+    /// absolute tail range that ADR-0046's read cache serves, so a second open
+    /// of the same large segment issues EXACTLY ZERO footer GETs.
+    ///
+    /// Per-phase, not pooled: `open_segment` reads only the footer (no catalog
+    /// or page GETs), so the `QueryAccounting` handle passed to it counts the
+    /// footer-open phase alone. A pooled query-wide counter would fold the
+    /// catalog and page GETs in and could hide an extra footer round trip.
+    ///
+    /// This is the test the deliverable says must fail against the pre-fix
+    /// code: flip the sized-ref branch in `open_segment` back to
+    /// `GetRange::Suffix(self.suffix_len)` and the second open's
+    /// `s3_requests(Get)` becomes 1 (a suffix GET bypasses the cache), so the
+    /// `== 0` assertion fails. Verified failing during development.
+    #[tokio::test]
+    async fn second_open_of_large_segment_issues_exactly_zero_footer_gets() {
+        let (bytes, tenant_hash, seg_ref) = write_sparse_test_segment(4096, 32).await;
+        assert!(
+            seg_ref.object_size > DEFAULT_SUFFIX_LEN,
+            "the segment must exceed the {DEFAULT_SUFFIX_LEN} B footer tail so the \
+             footer read is a genuine absolute tail range, got {} B",
+            seg_ref.object_size
+        );
+
+        let store = store_from_bytes(&seg_ref.data_object_key, bytes).await;
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        // whole_object_threshold below the object size forces the footer tail
+        // path (not the whole-object read); the cache makes the tail reusable.
+        let fetcher = SegmentFetcher::new(backend)
+            .with_whole_object_threshold(1024)
+            .with_cache(ram_cache());
+
+        // First open: a genuine miss. Exactly one footer GET (the absolute tail
+        // range; the 64 KiB default tail covers this object's footer, so no
+        // NeedRange chase), which populates the cache.
+        let acct1 = QueryAccounting::new();
+        fetcher
+            .open_segment(tenant_hash, &seg_ref, &acct1)
+            .await
+            .expect("first open");
+        let s1 = acct1.snapshot();
+        assert_eq!(
+            s1.s3_requests(AccountedOp::Get),
+            1,
+            "first open reads the footer tail with exactly one store GET"
+        );
+        // The single-GET assertion above only holds while the footer plus
+        // trailer fit inside the tail range. If a format change grew the footer
+        // past DEFAULT_SUFFIX_LEN the read would take a NeedRange chase and a
+        // second GET, and the assertion above would fail without saying why.
+        // Pin the precondition against the observable so drift names itself.
+        assert!(
+            s1.s3_bytes(AccountedOp::Get) <= DEFAULT_SUFFIX_LEN,
+            "the footer plus trailer must fit inside the {DEFAULT_SUFFIX_LEN} B              tail for this to be a single-GET open; read {} B, which means the              footer outgrew the tail and the read took a NeedRange chase",
+            s1.s3_bytes(AccountedOp::Get)
+        );
+        assert_eq!(s1.cache_hits, 0, "first open is a genuine cache miss");
+
+        // Second open of the same segment: the footer tail range is served from
+        // the read cache. Zero footer GETs, zero footer bytes off the store.
+        let acct2 = QueryAccounting::new();
+        fetcher
+            .open_segment(tenant_hash, &seg_ref, &acct2)
+            .await
+            .expect("second open");
+        let s2 = acct2.snapshot();
+        assert_eq!(
+            s2.s3_requests(AccountedOp::Get),
+            0,
+            "the second open must issue zero footer GETs: the absolute tail range \
+             is served from the read cache (issue #811)"
+        );
+        assert_eq!(
+            s2.s3_bytes(AccountedOp::Get),
+            0,
+            "a cache-served footer transfers zero store bytes"
+        );
+        assert_eq!(s2.cache_hits, 1, "the footer read is exactly one cache hit");
+        assert!(
+            s2.cache_bytes > 0,
+            "the cache hit served the footer bytes, got {} B",
+            s2.cache_bytes
+        );
+        assert_eq!(
+            fetcher.suffix_fallbacks(),
+            0,
+            "a sized ref never takes the uncacheable suffix fallback"
+        );
+    }
+
+    /// The footer `NeedRange` chase reads correct data on both the sized
+    /// (absolute-range) path and the sizeless (suffix-fallback) path, and the
+    /// fallback is observable (issue #811). A 16-byte footer length forces the
+    /// first read to miss the footer so the chase runs in both cases.
+    #[tokio::test]
+    async fn footer_needrange_chase_reads_correct_data_for_known_and_absent_size() {
+        let (mem, tenant_hash, seg_ref) = write_test_segment().await;
+        let bytes = mem
+            .get(&seg_ref.data_object_key, GetRange::Full)
+            .await
+            .expect("get bytes")
+            .data;
+
+        // Reference: a plain uncached whole-object read.
+        let truth = {
+            let store = store_from_bytes(&seg_ref.data_object_key, bytes.clone()).await;
+            let backend: Arc<dyn ObjectStoreBackend> = store;
+            let mut r = SegmentFetcher::new(backend)
+                .fetch(tenant_hash, &seg_ref, &[])
+                .await
+                .expect("uncached truth fetch");
+            r.sort_by_key(|s| s.series_id.0);
+            r
+        };
+
+        // (a) Known size: whole-object path disabled and a 16-byte tail, so the
+        // first GET is an absolute Range that misses the footer and the
+        // NeedRange chase re-reads it as another absolute range. Decodes the
+        // reference data, and no suffix fallback is taken.
+        {
+            let store = store_from_bytes(&seg_ref.data_object_key, bytes.clone()).await;
+            let backend: Arc<dyn ObjectStoreBackend> = store;
+            let fetcher = SegmentFetcher::new(backend)
+                .with_whole_object_threshold(0)
+                .with_suffix_len(16);
+            let mut got = fetcher
+                .fetch(tenant_hash, &seg_ref, &[])
+                .await
+                .expect("sized-ref NeedRange chase");
+            got.sort_by_key(|s| s.series_id.0);
+            assert_fetched_eq(&got, &truth);
+            assert_eq!(
+                fetcher.suffix_fallbacks(),
+                0,
+                "a sized ref takes the absolute-range path, never the suffix fallback"
+            );
+        }
+
+        // (b) Absent size (`object_size == 0`): the suffix fallback is taken,
+        // the NeedRange chase still decodes the reference data, and the
+        // fallback is observable exactly once rather than silent.
+        {
+            let mut sizeless = seg_ref.clone();
+            sizeless.object_size = 0;
+            let store = store_from_bytes(&seg_ref.data_object_key, bytes.clone()).await;
+            let backend: Arc<dyn ObjectStoreBackend> = store;
+            let fetcher = SegmentFetcher::new(backend).with_suffix_len(16);
+            let mut got = fetcher
+                .fetch(tenant_hash, &sizeless, &[])
+                .await
+                .expect("sizeless-ref suffix NeedRange chase");
+            got.sort_by_key(|s| s.series_id.0);
+            assert_fetched_eq(&got, &truth);
+            assert_eq!(
+                fetcher.suffix_fallbacks(),
+                1,
+                "an unsized ref must take the observable suffix fallback exactly once"
+            );
+        }
+    }
+
+    /// End-to-end guard for issue #811 over a full `fetch_soa` (footer +
+    /// catalog + pages), not just `open_segment`: a cold query with a cache
+    /// attached must succeed, and a second identical query must issue zero
+    /// store GETs and zero store bytes because every read -- footer absolute
+    /// tail range, catalog ranges, page ranges -- is cache-eligible.
+    ///
+    /// This also pins the etag regression the footer-through-cache change
+    /// introduced and fixed: routing the footer GET through the cache made its
+    /// `GetOutcome` etag empty, so the cold query's later ranged store GETs
+    /// mismatched the empty pin and failed with `EtagChanged`. A leader miss
+    /// now carries the real store etag out of `cached_get`, and an empty pin is
+    /// treated as "no pin". Before that fix this test's first query errors.
+    #[tokio::test]
+    async fn full_query_over_large_segment_is_cache_served_on_second_pass() {
+        let (bytes, tenant_hash, seg_ref) = write_sparse_test_segment(4096, 32).await;
+        assert!(
+            seg_ref.object_size > DEFAULT_SUFFIX_LEN,
+            "segment must exceed the footer tail, got {} B",
+            seg_ref.object_size
+        );
+        let store = store_from_bytes(&seg_ref.data_object_key, bytes).await;
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let fetcher = SegmentFetcher::new(backend)
+            .with_whole_object_threshold(1024)
+            .with_cache(ram_cache());
+        let matchers = [LabelMatcher::equal("__name__", "sparse_metric_100")];
+
+        // Cold query: succeeds (no EtagChanged) and reads from the store.
+        let acct1 = QueryAccounting::new();
+        let (mut soa1, _s1) = fetcher
+            .fetch_soa_accounted(tenant_hash, &seg_ref, &matchers, &acct1)
+            .await
+            .expect("cold cached query must not fail with EtagChanged");
+        soa1.sort_by_key(|s| s.series_id.0);
+        assert_eq!(soa1.len(), 1, "the matcher pins exactly one series");
+        assert!(
+            acct1.snapshot().total_s3_requests() > 0,
+            "the cold query reads from the store"
+        );
+
+        // Second identical query: every extent is cache-resident, so zero store
+        // GETs and zero store bytes, and the result is bit-identical.
+        let acct2 = QueryAccounting::new();
+        let (mut soa2, _s2) = fetcher
+            .fetch_soa_accounted(tenant_hash, &seg_ref, &matchers, &acct2)
+            .await
+            .expect("warm cached query");
+        soa2.sort_by_key(|s| s.series_id.0);
+        let s2 = acct2.snapshot();
+        assert_eq!(
+            s2.total_s3_requests(),
+            0,
+            "the second query must issue zero store GETs (footer, catalog and \
+             pages are all cache-served; issue #811)"
+        );
+        assert_eq!(
+            s2.total_s3_bytes(),
+            0,
+            "a fully cache-served query transfers zero store bytes"
+        );
+        assert!(
+            s2.cache_hits > 0,
+            "the second query is served from the cache"
+        );
+        assert_eq!(
+            fetcher.suffix_fallbacks(),
+            0,
+            "a sized ref never falls back"
+        );
+
+        assert_eq!(soa1.len(), soa2.len());
+        for (a, b) in soa1.iter().zip(soa2.iter()) {
+            assert_eq!(a.series_id, b.series_id);
+            assert_eq!(a.timestamps, b.timestamps);
+            let av: Vec<u64> = a.values.iter().map(|v| v.to_bits()).collect();
+            let bv: Vec<u64> = b.values.iter().map(|v| v.to_bits()).collect();
+            assert_eq!(av, bv);
+        }
     }
 }
