@@ -884,13 +884,27 @@ impl BlockScan {
         let Some(decoded) = self.current.as_ref() else {
             return Err(LogSegError::Corrupted("block not decoded".into()));
         };
+        // Resolve stream_ref and ts once for the whole block, not once per
+        // surviving row (#875): the per-row body then only indexes the resolved
+        // slices, and the error text stays identical to the per-cell `i64_at`.
+        let stream_refs = decoded.i64_col(COL_STREAM_REF);
+        let ts = decoded.i64_col(COL_TS);
+        let entries = self.stream_dir.entries();
         for &row in &self.surviving {
-            let sref = u32::try_from(i64_at(decoded, COL_STREAM_REF, row)?)
+            let raw = stream_refs
+                .and_then(|c| c.get(row).copied())
+                .flatten()
+                .ok_or_else(|| {
+                    LogSegError::Corrupted(format!("missing i64 col {COL_STREAM_REF}"))
+                })?;
+            let sref = u32::try_from(raw)
                 .map_err(|_| LogSegError::Corrupted("stream_ref range".into()))?;
-            if self.stream_dir.entries().get(sref as usize).is_none() {
+            if entries.get(sref as usize).is_none() {
                 return Err(LogSegError::Corrupted("stream_ref out of range".into()));
             }
-            i64_at(decoded, COL_TS, row)?;
+            ts.and_then(|c| c.get(row).copied())
+                .flatten()
+                .ok_or_else(|| LogSegError::Corrupted(format!("missing i64 col {COL_TS}")))?;
         }
         Ok(Some(ColumnarBlockView::new(
             &self.stream_dir,

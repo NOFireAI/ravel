@@ -39,7 +39,9 @@ pub use ravel_codec::{bloom, bloom_section, encoding, tokenizer};
 // deliberately NOT re-exported: the view is the whole public surface over a
 // decoded block, so decision 4 can change how columns are stored without
 // touching a caller.
-pub use columnar::{AttrColumn, ColumnarBlockView, StrDictColumn};
+pub use columnar::{
+    AttrColumn, BoolCursor, BytesCursor, ColumnarBlockView, F64BitsCursor, I64Cursor, StrDictColumn,
+};
 pub use columnar_batch::{Bitmap, ColumnarLogBatch, DynColumn, StrColumnDict, VarBytes};
 pub use columns::ColumnSelection;
 pub use error::LogSegError;

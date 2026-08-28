@@ -244,8 +244,8 @@ use futures::{Stream, StreamExt, TryStreamExt};
 use ravel_catalog::SegmentRef;
 use ravel_logseg::footer::LogFooter;
 use ravel_logseg::{
-    AttrColumn, ColumnSelection, ColumnarBlockView, FieldSel, FieldType, LogRecord, Predicate,
-    ScanStats,
+    AttrColumn, BoolCursor, BytesCursor, ColumnSelection, ColumnarBlockView, F64BitsCursor,
+    FieldSel, FieldType, I64Cursor, LogRecord, Predicate, ScanStats,
 };
 use ravel_query::erasure::ErasurePredicate;
 use ravel_query::{ColumnarBlockOutcome, LogQuery, LogSegmentFetcher, LogSegmentScan};
@@ -2632,21 +2632,117 @@ fn declared_column_array(dc: &DeclaredColumn, merged: &[Vec<(String, AttrValue)>
 // Columnar fast path (ADR-0099 decision 2)
 // ---------------------------------------------------------------------------
 
-/// One declared column's FIELD_DIR resolution for a block, done once via
-/// [`ColumnarBlockView::resolve_attr`] rather than per row via
-/// [`find_attr`] (ADR-0099 decision 2).
-struct DeclaredPlan<'d> {
+/// A FIELD_DIR column of a declared key, resolved once for the whole block into
+/// a per-column cursor (#875). The scan's row loop read one cell with one
+/// `HashMap<u32, _>` lookup per cell; the cursor resolves the column's storage
+/// once and then indexes the resolved slice per row with no lookup.
+enum DeclaredCursor<'a> {
+    Str(BytesCursor<'a>),
+    Bytes(BytesCursor<'a>),
+    I64(I64Cursor<'a>),
+    F64(F64BitsCursor<'a>),
+    Bool(BoolCursor<'a>),
+}
+
+impl<'a> DeclaredCursor<'a> {
+    fn resolve(view: &ColumnarBlockView<'a>, col: AttrColumn) -> Self {
+        match col.ty {
+            FieldType::Str => DeclaredCursor::Str(view.bytes_cursor(col.column_id)),
+            FieldType::Bytes => DeclaredCursor::Bytes(view.bytes_cursor(col.column_id)),
+            FieldType::I64 => DeclaredCursor::I64(view.i64_cursor(col.column_id)),
+            FieldType::F64 => DeclaredCursor::F64(view.f64_bits_cursor(col.column_id)),
+            FieldType::Bool => DeclaredCursor::Bool(view.bool_cursor(col.column_id)),
+        }
+    }
+
+    /// Whether the record sets the key in this column at surviving row `i`, with
+    /// the same "readable" rule the row path uses: an invalid-UTF-8 `Str` cell is
+    /// not a value (matches [`read_str_cell`]), so it must not suppress the
+    /// resource/scope fallback.
+    fn present_at(&self, i: usize) -> bool {
+        match self {
+            DeclaredCursor::Str(c) => c.str_at(i).is_some(),
+            DeclaredCursor::Bytes(c) => c.at(i).is_some(),
+            DeclaredCursor::I64(c) => c.at(i).is_some(),
+            DeclaredCursor::F64(c) => c.at(i).is_some(),
+            DeclaredCursor::Bool(c) => c.at(i).is_some(),
+        }
+    }
+
+    /// The cell at surviving row `i` as an [`AttrValue`], or `None` when NULL (or,
+    /// for `Str`, not UTF-8). Used for the non-`Str` builders and to compare a
+    /// record value's variant against the declared type; the `Str` builder reads
+    /// `&str` directly so it never allocates a throwaway `String` (#875).
+    fn value_at(&self, i: usize) -> Option<AttrValue> {
+        match self {
+            DeclaredCursor::Str(c) => c.str_at(i).map(|s| AttrValue::Str(s.to_string())),
+            DeclaredCursor::Bytes(c) => c.at(i).map(|b| AttrValue::Bytes(b.to_vec())),
+            DeclaredCursor::I64(c) => c.at(i).map(AttrValue::I64),
+            DeclaredCursor::F64(c) => c.at(i).map(|bits| AttrValue::F64(f64::from_bits(bits))),
+            DeclaredCursor::Bool(c) => c.at(i).map(AttrValue::Bool),
+        }
+    }
+}
+
+/// One declared column's FIELD_DIR resolution for a block, done once rather than
+/// per row (ADR-0099 decision 2). Every FIELD_DIR column of the key is resolved
+/// to a cursor once when the plan is built; the row loop then reads through the
+/// cursors with no per-cell column lookup (#875).
+struct DeclaredPlan<'d, 'a> {
     dc: &'d DeclaredColumn,
-    /// The FIELD_DIR column carrying this key at the declared type, if any. A
-    /// record row whose value lives here reads that value; a row whose value
-    /// lives in a different-typed column of the same key reads NULL (record
-    /// wins, wrong variant), matching the row path exactly.
-    matching: Option<AttrColumn>,
-    /// Every FIELD_DIR column for this key, across all stored types. Used only
-    /// to answer "does this record set the key at all" so record-wins precedence
-    /// matches the merged view: if the record sets the key (any type), the
-    /// resource/scope fallback is not consulted.
-    all_cols: Vec<AttrColumn>,
+    /// The raw FIELD_DIR columns of this key, across all stored types. Kept
+    /// because [`ColumnarBlockView::str_dict`] resolves by column id.
+    cols: Vec<AttrColumn>,
+    /// Cursors parallel to [`Self::cols`], resolved once for the block.
+    cursors: Vec<DeclaredCursor<'a>>,
+    /// Index into [`Self::cols`]/[`Self::cursors`] of the declared-type column,
+    /// if the key has one. A record row whose value lives here reads that value;
+    /// a row whose value lives in a different-typed column of the same key reads
+    /// NULL (record wins, wrong variant), matching the row path exactly.
+    matching_idx: Option<usize>,
+}
+
+impl<'d, 'a> DeclaredPlan<'d, 'a> {
+    fn build(view: &ColumnarBlockView<'a>, dc: &'d DeclaredColumn) -> DeclaredPlan<'d, 'a> {
+        let cols: Vec<AttrColumn> = view.attr_columns_for(&dc.key).collect();
+        let declared_ty = declared_field_type(dc.ty);
+        let matching_idx = cols.iter().position(|c| c.ty == declared_ty);
+        let cursors = cols
+            .iter()
+            .map(|&c| DeclaredCursor::resolve(view, c))
+            .collect();
+        DeclaredPlan {
+            dc,
+            cols,
+            cursors,
+            matching_idx,
+        }
+    }
+
+    /// The declared-type FIELD_DIR column, if the key has one.
+    fn matching_col(&self) -> Option<AttrColumn> {
+        self.matching_idx.map(|k| self.cols[k])
+    }
+
+    /// The cursor over the declared-type column, if any.
+    fn matching_cursor(&self) -> Option<&DeclaredCursor<'a>> {
+        self.matching_idx.map(|k| &self.cursors[k])
+    }
+
+    /// True when the key's only FIELD_DIR column is the declared-type one, so a
+    /// single cursor read is both the presence answer and the value: the
+    /// double read (`attr_present` then `read_typed_cell`) collapses to one
+    /// (deliverable 2, #875).
+    fn single_matching(&self) -> bool {
+        self.cursors.len() == 1 && self.matching_idx == Some(0)
+    }
+
+    /// Whether the record sets the key in any of its FIELD_DIR columns at
+    /// surviving row `i`. Only consulted in the multi-column case; the fused case
+    /// gets the same answer from the single matching read.
+    fn record_sets_key(&self, i: usize) -> bool {
+        self.cursors.iter().any(|c| c.present_at(i))
+    }
 }
 
 /// The [`FieldType`] a declared column resolves its FIELD_DIR column at. A
@@ -2658,23 +2754,6 @@ fn declared_field_type(ty: DeclaredType) -> FieldType {
         DeclaredType::I64 => FieldType::I64,
         DeclaredType::Bool => FieldType::Bool,
         DeclaredType::Bytes => FieldType::Bytes,
-    }
-}
-
-/// Whether a FIELD_DIR column carries a *readable* value at surviving row `i`.
-///
-/// "Readable" is what makes this agree with the row path: a `Str` cell holding
-/// bytes that are not UTF-8 is not a value there
-/// (`get_attr_value`/`read_typed_cell`), so it must not count as the record
-/// setting the key either -- otherwise it would suppress the resource/scope
-/// fallback the row path applies.
-fn attr_present(view: &ColumnarBlockView<'_>, col: AttrColumn, i: usize) -> bool {
-    match col.ty {
-        FieldType::Str => read_str_cell(view, col.column_id, i).is_some(),
-        FieldType::Bytes => view.bytes_at(col.column_id, i).is_some(),
-        FieldType::I64 => view.i64_at(col.column_id, i).is_some(),
-        FieldType::F64 => view.f64_bits_at(col.column_id, i).is_some(),
-        FieldType::Bool => view.bool_at(col.column_id, i).is_some(),
     }
 }
 
@@ -2714,54 +2793,30 @@ fn resource_attrs<'c>(
 /// [`AttrValue`] whose variant the caller checks against the declared type.
 fn declared_merged_value(
     view: &ColumnarBlockView<'_>,
-    plan: &DeclaredPlan<'_>,
+    plan: &DeclaredPlan<'_, '_>,
     i: usize,
     cache: &mut HashMap<u32, Arc<Vec<(String, AttrValue)>>>,
 ) -> DFResult<Option<AttrValue>> {
-    let record_sets_key = plan.all_cols.iter().any(|&c| attr_present(view, c, i));
-    if record_sets_key {
-        let Some(mc) = plan.matching else {
-            return Ok(None);
-        };
-        return Ok(read_typed_cell(view, mc, i));
+    if plan.single_matching() {
+        // Fused: the one matching-column read is both the presence test and the
+        // value (deliverable 2, #875). `value_at` is `Some` exactly when the
+        // record sets the key at the declared type; `None` (absent, or a `Str`
+        // cell that is not UTF-8) falls through to the resource/scope value,
+        // matching the row path.
+        if let Some(v) = plan.matching_cursor().and_then(|c| c.value_at(i)) {
+            return Ok(Some(v));
+        }
+    } else if plan.record_sets_key(i) {
+        // Record wins. Its value is the declared-type column's cell, or NULL when
+        // the record set the key only in a different-typed column (ADR-0090
+        // decision 7); either way the resource/scope fallback is not consulted.
+        return Ok(plan.matching_cursor().and_then(|c| c.value_at(i)));
     }
     let Some(stream_ref) = view.stream_ref(i) else {
         return Ok(None);
     };
     let resource = resource_attrs(view, cache, stream_ref)?;
     Ok(find_attr(resource, &plan.dc.key).cloned())
-}
-
-/// A `Str`-typed FIELD_DIR cell at surviving row `i`, as `&str`: `None` when the
-/// cell is NULL **or** when its bytes are not UTF-8.
-///
-/// Treating invalid UTF-8 as no value is what the row path does
-/// (`get_attr_value`'s `String::from_utf8(b).ok()`, `ravel-logseg`'s
-/// `reader.rs`), which makes the attribute absent for that record and lets the
-/// resource/scope value show through. Substituting U+FFFD instead would both
-/// invent a value and suppress that fallback, and this crate's rule is exact
-/// semantics by default.
-fn read_str_cell<'v>(view: &ColumnarBlockView<'v>, column_id: u32, i: usize) -> Option<&'v str> {
-    std::str::from_utf8(view.bytes_at(column_id, i)?).ok()
-}
-
-/// Read the value of a FIELD_DIR column at surviving row `i` as an
-/// [`AttrValue`], or `None` when the cell is NULL (or, for `Str`, not UTF-8;
-/// see [`read_str_cell`]).
-fn read_typed_cell(view: &ColumnarBlockView<'_>, col: AttrColumn, i: usize) -> Option<AttrValue> {
-    match col.ty {
-        FieldType::Str => {
-            read_str_cell(view, col.column_id, i).map(|s| AttrValue::Str(s.to_string()))
-        }
-        FieldType::I64 => view.i64_at(col.column_id, i).map(AttrValue::I64),
-        FieldType::F64 => view
-            .f64_bits_at(col.column_id, i)
-            .map(|bits| AttrValue::F64(f64::from_bits(bits))),
-        FieldType::Bool => view.bool_at(col.column_id, i).map(AttrValue::Bool),
-        FieldType::Bytes => view
-            .bytes_at(col.column_id, i)
-            .map(|b| AttrValue::Bytes(b.to_vec())),
-    }
 }
 
 /// Build one declared typed attribute column for surviving rows `start..end`
@@ -2775,7 +2830,7 @@ fn read_typed_cell(view: &ColumnarBlockView<'_>, col: AttrColumn, i: usize) -> O
 /// future declared `f64` slots in as one arm on both paths.
 fn build_declared_columnar_array(
     view: &ColumnarBlockView<'_>,
-    plan: &DeclaredPlan<'_>,
+    plan: &DeclaredPlan<'_, '_>,
     start: usize,
     end: usize,
     cache: &mut HashMap<u32, Arc<Vec<(String, AttrValue)>>>,
@@ -2843,19 +2898,20 @@ fn build_declared_columnar_array(
 ///   the page).
 /// - **Plain page** (`str_dict` returns `None`, or the key has no `Str`
 ///   FIELD_DIR column at all): a degenerate identity dictionary, one entry per
-///   non-null surviving row with keys `0..`, built from [`declared_merged_value`]
-///   exactly as the pre-dictionary code did. No hashing and no dedup pass, so
-///   this case stays exactly as expensive as it was.
+///   non-null surviving row with keys `0..`. The record's own `Str` value is read
+///   as `&str` straight from the [`BytesCursor`] into the builder, so no
+///   throwaway `String` is allocated per cell (deliverable 3, #875). No hashing
+///   and no dedup pass, so this case stays exactly as expensive as it was.
 fn build_declared_str_columnar(
     view: &ColumnarBlockView<'_>,
-    plan: &DeclaredPlan<'_>,
+    plan: &DeclaredPlan<'_, '_>,
     start: usize,
     end: usize,
     cache: &mut HashMap<u32, Arc<Vec<(String, AttrValue)>>>,
 ) -> DFResult<ArrayRef> {
     let n = end - start;
     Ok(
-        match plan.matching.and_then(|mc| view.str_dict(mc.column_id)) {
+        match plan.matching_col().and_then(|mc| view.str_dict(mc.column_id)) {
             Some(col) => {
                 // Dictionary values start as the page's distinct byte values,
                 // decoded to UTF-8; a non-UTF-8 entry becomes a NULL value. Ids
@@ -2874,12 +2930,12 @@ fn build_declared_str_columnar(
                 })?;
                 let mut keys: Vec<Option<i32>> = Vec::with_capacity(n);
                 for i in start..end {
-                    if plan.all_cols.iter().any(|&c| attr_present(view, c, i)) {
+                    if plan.record_sets_key(i) {
                         // Record wins. `id_at` is `Some` only when the record's
                         // `Str` column has a value at this row; `None` (record set
                         // the key in another-typed column) is a NULL cell. An `id`
                         // pointing at a non-UTF-8 (NULL) dictionary value also reads
-                        // NULL, matching `read_str_cell`.
+                        // NULL, matching the UTF-8 rule on the `Str` cursor.
                         match col.id_at(i) {
                             Some(id) => keys.push(Some(i32::try_from(id).map_err(|_| {
                                 DataFusionError::Internal(
@@ -2910,18 +2966,61 @@ fn build_declared_str_columnar(
                 Arc::new(dict)
             }
             None => {
-                // Identity dictionary: one entry per non-null row, no dedup.
+                // Identity dictionary: one entry per non-null row, no dedup. The
+                // record's own value is appended as `&str` straight from the
+                // cursor -- no per-cell `String` (deliverable 3, #875).
                 let mut values = StringBuilder::new();
                 let mut keys: Vec<Option<i32>> = Vec::with_capacity(n);
                 let mut next = 0i32;
+                // The declared-type (`Str`) column's cursor, when the key has a
+                // plain-page `Str` column; `None` when it has no `Str` column at
+                // all (then only the resource/scope fallback yields a value).
+                let matching_str = match plan.matching_cursor() {
+                    Some(DeclaredCursor::Str(c)) => Some(c),
+                    _ => None,
+                };
                 for i in start..end {
-                    match declared_merged_value(view, plan, i, cache)? {
-                        Some(AttrValue::Str(s)) => {
-                            values.append_value(&s);
+                    // `appended` == "this row is decided, do not consult the
+                    // resource/scope fallback" (record wins over resource).
+                    let mut appended = false;
+                    if plan.single_matching() {
+                        // Fused: one cursor read is both presence and value.
+                        if let Some(s) = matching_str.and_then(|c| c.str_at(i)) {
+                            values.append_value(s);
                             keys.push(Some(next));
                             next += 1;
+                            appended = true;
                         }
-                        _ => keys.push(None),
+                        // A `None` here (absent, or not UTF-8) falls through to
+                        // the fallback, matching the row path.
+                    } else if plan.record_sets_key(i) {
+                        // Record wins: its declared-type `Str` cell, or NULL when
+                        // it set the key only in a different-typed column.
+                        match matching_str.and_then(|c| c.str_at(i)) {
+                            Some(s) => {
+                                values.append_value(s);
+                                keys.push(Some(next));
+                                next += 1;
+                            }
+                            None => keys.push(None),
+                        }
+                        appended = true;
+                    }
+                    if appended {
+                        continue;
+                    }
+                    if let Some(stream_ref) = view.stream_ref(i) {
+                        let resource = resource_attrs(view, cache, stream_ref)?;
+                        match find_attr(resource, &plan.dc.key) {
+                            Some(AttrValue::Str(s)) => {
+                                values.append_value(s);
+                                keys.push(Some(next));
+                                next += 1;
+                            }
+                            _ => keys.push(None),
+                        }
+                    } else {
+                        keys.push(None);
                     }
                 }
                 let dict = DictionaryArray::<Int32Type>::try_new(
@@ -2957,21 +3056,15 @@ fn build_columnar_batches(
     row_refs: Option<RowRefRange>,
 ) -> DFResult<Vec<RecordBatch>> {
     let n = view.surviving_count();
-    // Resolve each projected declared column's FIELD_DIR column once for the
-    // whole block (ADR-0099 decision 2), not per row and not per chunk.
-    let mut plans: HashMap<usize, DeclaredPlan> = HashMap::new();
+    // Resolve each projected declared column's FIELD_DIR columns to cursors once
+    // for the whole block (ADR-0099 decision 2, #875), not per row and not per
+    // chunk: the row loop then reads through the cursors with no column lookup.
+    let mut plans: HashMap<usize, DeclaredPlan<'_, '_>> = HashMap::new();
     for &idx in projection {
         if idx >= FIRST_DECLARED_COL
             && let Some(dc) = declared.get(idx - FIRST_DECLARED_COL)
         {
-            plans.insert(
-                idx,
-                DeclaredPlan {
-                    dc,
-                    matching: view.resolve_attr(&dc.key, declared_field_type(dc.ty)),
-                    all_cols: view.attr_columns_for(&dc.key).collect(),
-                },
-            );
+            plans.insert(idx, DeclaredPlan::build(view, dc));
         }
     }
     let mut cache: HashMap<u32, Arc<Vec<(String, AttrValue)>>> = HashMap::new();
@@ -3006,7 +3099,7 @@ fn build_columnar_batch(
     view: &ColumnarBlockView<'_>,
     schema: &SchemaRef,
     projection: &[usize],
-    plans: &HashMap<usize, DeclaredPlan<'_>>,
+    plans: &HashMap<usize, DeclaredPlan<'_, '_>>,
     cache: &mut HashMap<u32, Arc<Vec<(String, AttrValue)>>>,
     start: usize,
     end: usize,
@@ -3015,25 +3108,35 @@ fn build_columnar_batch(
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(projection.len());
     for &idx in projection {
         let array: ArrayRef = match idx {
-            LOG_COL_TS => Arc::new(TimestampNanosecondArray::from(
-                (start..end)
-                    .map(|i| view.ts(i).unwrap_or_default())
-                    .collect::<Vec<_>>(),
-            )),
-            LOG_COL_OBSERVED_TS => Arc::new(TimestampNanosecondArray::from(
-                (start..end)
-                    .map(|i| view.observed_ts(i).unwrap_or_default())
-                    .collect::<Vec<_>>(),
-            )),
-            LOG_COL_SEVERITY_NUM => Arc::new(UInt8Array::from(
-                (start..end)
-                    .map(|i| view.severity_num(i).unwrap_or_default() as u8)
-                    .collect::<Vec<_>>(),
-            )),
+            LOG_COL_TS => {
+                let cur = view.ts_cursor();
+                Arc::new(TimestampNanosecondArray::from(
+                    (start..end)
+                        .map(|i| cur.at(i).unwrap_or_default())
+                        .collect::<Vec<_>>(),
+                ))
+            }
+            LOG_COL_OBSERVED_TS => {
+                let cur = view.observed_ts_cursor();
+                Arc::new(TimestampNanosecondArray::from(
+                    (start..end)
+                        .map(|i| cur.at(i).unwrap_or_default())
+                        .collect::<Vec<_>>(),
+                ))
+            }
+            LOG_COL_SEVERITY_NUM => {
+                let cur = view.severity_num_cursor();
+                Arc::new(UInt8Array::from(
+                    (start..end)
+                        .map(|i| cur.at(i).unwrap_or_default() as u8)
+                        .collect::<Vec<_>>(),
+                ))
+            }
             LOG_COL_SEVERITY_TEXT => {
+                let cur = view.severity_text_cursor();
                 let mut b = StringBuilder::new();
                 for i in start..end {
-                    match view.severity_text(i) {
+                    match cur.at(i) {
                         Some(bytes) => b.append_value(view_str(bytes)?),
                         None => b.append_value(""),
                     }
@@ -3041,9 +3144,10 @@ fn build_columnar_batch(
                 Arc::new(b.finish())
             }
             LOG_COL_BODY => {
+                let cur = view.body_cursor();
                 let mut b = StringBuilder::new();
                 for i in start..end {
-                    match view.body(i) {
+                    match cur.at(i) {
                         Some(bytes) => b.append_value(view_str(bytes)?),
                         None => b.append_value(""),
                     }
@@ -3051,9 +3155,10 @@ fn build_columnar_batch(
                 Arc::new(b.finish())
             }
             LOG_COL_TRACE_ID => {
+                let cur = view.trace_id_cursor();
                 let mut b = FixedSizeBinaryBuilder::with_capacity(end - start, TRACE_ID_WIDTH);
                 for i in start..end {
-                    match view.trace_id(i) {
+                    match cur.at(i) {
                         Some(id) => b.append_value(id).map_err(|e| {
                             SqlError::Internal(format!("trace_id array build: {e}"))
                         })?,
@@ -3063,9 +3168,10 @@ fn build_columnar_batch(
                 Arc::new(b.finish())
             }
             LOG_COL_SPAN_ID => {
+                let cur = view.span_id_cursor();
                 let mut b = FixedSizeBinaryBuilder::with_capacity(end - start, SPAN_ID_WIDTH);
                 for i in start..end {
-                    match view.span_id(i) {
+                    match cur.at(i) {
                         Some(id) => b
                             .append_value(id)
                             .map_err(|e| SqlError::Internal(format!("span_id array build: {e}")))?,
@@ -3074,11 +3180,14 @@ fn build_columnar_batch(
                 }
                 Arc::new(b.finish())
             }
-            LOG_COL_FLAGS => Arc::new(UInt32Array::from(
-                (start..end)
-                    .map(|i| view.flags(i).unwrap_or_default() as u32)
-                    .collect::<Vec<_>>(),
-            )),
+            LOG_COL_FLAGS => {
+                let cur = view.flags_cursor();
+                Arc::new(UInt32Array::from(
+                    (start..end)
+                        .map(|i| cur.at(i).unwrap_or_default() as u32)
+                        .collect::<Vec<_>>(),
+                ))
+            }
             // Ruled out by `columnar_static_eligible`; a projection reaching the
             // fast path never carries the `attrs` map.
             LOG_COL_ATTRS => {
