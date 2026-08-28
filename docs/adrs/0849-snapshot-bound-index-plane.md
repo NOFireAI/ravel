@@ -586,11 +586,17 @@ serve both time ranges and high-cardinality point lookups — the latter is what
 point postings are for. What changes: EventTime-leading clustering is justified
 by **organic telemetry**, where ingest arrival order already correlates with
 event time and recent-window queries dominate, so the scattering hazard does not
-arise. It is therefore gated on a pre-registered A/B against `q37`-`q43` before
-touching any measured tenant, and on a target workload that is not a bulk-loaded
-entity-sorted corpus. For *this* tenant the selective clustering key would be
-`CounterID`, which is ADR-0815's deferred override-key path rather than the
-time-leading slice.
+arise. It is therefore gated on a pre-registered A/B before touching any
+measured tenant, and on a target workload that is not a bulk-loaded
+entity-sorted corpus. The A/B is same binary, same tenant, one snapshot before
+clustering and one after, covering `q37` through `q43` inclusive, with the
+expected direction and the pass band for each statement written down before any
+number exists. `q43` is required rather than optional: its `EventDate BETWEEN
+15900 AND 15901` is the only real time window in the class, so it is the one
+statement expected to improve and the only evidence that the mechanism works at
+all. ADR-0815 acceptance 12 is that gate in normative form. For *this* tenant
+the selective clustering key would be `CounterID`, which is ADR-0815's deferred
+override-key path rather than the time-leading slice.
 
 ## Rejected alternatives
 
@@ -625,9 +631,12 @@ time-leading slice.
    handles ranges; postings handle points; neither substitutes for the other.
 
 7. **A general external-sort subsystem for arbitrary clustering keys, first.**
-   Rejected as sequencing: it is the most complex piece of ADR-0815 and its
-   value is unmeasured until basic time clustering has been landed and
-   measured. Deferred, not rejected on merit.
+   Rejected as sequencing: it is the most complex piece of ADR-0815, and this
+   ADR's own statistics pruning (§5) already covers `q37`-`q43` on this tenant
+   at far less machinery. Note the tension rather than hiding it: §6 states
+   that on this tenant the override key is the only clustering key that could
+   help, so the deferral is about complexity and sequencing, not about the
+   override path being the wrong key here. Deferred, not rejected on merit.
 
 ## Consequences
 
@@ -652,7 +661,11 @@ Pruning works today because the corpus arrives sorted by
 `(CounterID, EventDate, ...)` and the load preserves those runs, leaving blocks
 near-single-CounterID. A global EventTime sort would scatter each counter's rows
 evenly, leave roughly 60 matching rows in nearly every block, and stop that arm
-pruning at all. ADR-0815 carries the same misattribution.
+pruning at all. `q43` is the exception and the only one: its window is
+`EventDate BETWEEN 15900 AND 15901`, two real days, so it would improve
+modestly. ADR-0815 carried the same misattribution in its Context and
+Acceptance; both were corrected under #859, and its acceptance 12 now carries
+the pre-registered A/B gate §6 refers to.
 
 **Queries that do not, and the honest count.** Full `SUM`/`AVG` over the corpus
 still scans without materialised aggregate states. **An index alone does not

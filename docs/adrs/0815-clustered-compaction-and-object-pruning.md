@@ -8,9 +8,8 @@ README's issue-number rule.
 ## Context
 
 On the ClickBench reference tenant `clickbench-v4` (8,424 objects, 17,731
-blocks, 11.116 GB, 8 shards, RLOG v4), the narrow-time-window statement class
-q37-q43 already prunes well at block granularity and terribly at object
-granularity:
+blocks, 11.116 GB, 8 shards, RLOG v4), the selective statement class q37-q43
+already prunes well at block granularity and terribly at object granularity:
 
 | figure | value |
 |---|---|
@@ -22,17 +21,49 @@ granularity:
 | competitor wall, same shapes | 0.06-0.09 s |
 
 Block pruning works; object pruning does not exist. If the surviving 0.8% of
-blocks were clustered they would occupy roughly 0.8% of objects (~67); touching
-100% of objects to keep 0.8% of blocks means every object holds a few rows
-matching any narrow window. The corpus explains it: `hits.parquet` is
-CounterID-sorted (#560) and EventTime does not correlate with CounterID, so
-every flushed batch spans nearly the whole EventTime range, and every object's
+blocks were gathered into objects they would occupy roughly 0.8% of them (~67);
+touching 100% of objects to keep 0.8% of blocks means those blocks are spread
+over every object in the corpus.
+
+**What prunes on this corpus is CounterID, not time.** The attribution matters
+because it decides which corpus may measure this ADR, so state it exactly.
+q37-q42 filter `EventDate BETWEEN 15887 AND 15917`
+(benchmarks/clickbench/hits.corpus.json; the epoch-day mapping is
+docs/guides/clickbench.md). That is 2013-07-01 to 2013-07-31, and the `hits`
+corpus is entirely July 2013, so the date predicate selects the whole corpus
+and prunes nothing at all. The predicate that selects is `CounterID = 62`, at
+roughly 0.7-0.8% of rows. The measured 144 of 17,731 surviving blocks is 0.81%,
+which is CounterID's row share, not the share any time window would keep. q43
+is the one statement in the class carrying a real window (`EventDate BETWEEN
+15900 AND 15901`, two days), and it carries the same `CounterID = 62` arm.
+
+The mechanism behind the 144 blocks is entity locality in the load, not
+clustering of any kind. `hits.parquet` arrives sorted by `(CounterID,
+EventDate, ...)` (#560) and the load preserves those runs, so a block is
+near-single-CounterID and the block-level `CounterID` min/max arm excludes
+almost all of them. EventTime does not correlate with CounterID, so every
+flushed batch spans nearly the whole EventTime range, and every object's
 catalog-level `[min_event_ts, max_event_ts]` is therefore nearly the whole
 range. The resolve-time event-overlap filter (docs/catalog-and-mvcc.md,
 "Snapshot resolution" step 4, and the per-part event bounds on an L1
 `SegmentRef`) already excludes an object whose event range misses the query
 window without a data GET, but with every object's bounds spanning the whole
-range it excludes nothing.
+range it excludes nothing. Those two facts are consistent only under this
+attribution: wide event bounds are exactly why time excludes no object, while
+CounterID locality excludes 99.2% of blocks regardless.
+
+**So this corpus is where time-leading clustering backfires, and it must not be
+the corpus that justifies or measures it.** A global EventTime sort scatters
+each counter's rows evenly across the whole order. `CounterID = 62` holds
+roughly 800,000 of the corpus's ~100M rows; at the 8,192-row block target
+(`block_target_records`, docs/guides/clickbench.md) nearly every one of the
+17,731 blocks would then hold about 60 matching rows, the `CounterID` min/max
+arm would stop excluding anything, and q37-q42 would go from 144 surviving
+blocks to nearly all of them. q43 would improve modestly, because its two-day
+window is real. Decision 2 states what does justify the time-leading default,
+acceptance 1 states which corpus may carry the object-count claim, and
+acceptance 12 is the pre-registered A/B that must run before the key is
+enabled on any measured tenant.
 
 Two facts bound the design:
 
@@ -110,10 +141,24 @@ for EventTime) is an additive field on `TenantConfigRecord`, resolved
 override-over-default exactly as retention and admission limits already are. A
 tenant whose queries filter on a different low-cardinality dimension (say a
 `Region` column) sets the key to that column and gets object exclusion on it
-instead of on time; the default remains EventTime because the measured pain is
-narrow time windows. Which declared types are eligible as an override key,
+instead of on time. Which declared types are eligible as an override key,
 and the canonical order each clusters under, are defined in decision 3's
 eligibility subsection.
+
+**What justifies EventTime as the default, and what does not.** Not q37-q43:
+Context shows those statements are selected by `CounterID`, and a global
+EventTime sort would regress six of the seven. The default rests on organic
+telemetry instead, where two properties hold that the ClickBench corpus does
+not have. Queries are dominated by recent-time windows, so a narrow per-object
+EventTime bound is the bound most statements can use. Ingest arrival order
+already correlates with event time, so a time-leading merge concentrates rather
+than scatters: it tightens per-object bounds without spreading any entity's
+rows across more objects than the arrival order already did. The scattering
+hazard Context describes needs a bulk-loaded, entity-sorted corpus whose
+arrival order is uncorrelated with event time, which is exactly what ClickBench
+is. For the `clickbench-v4` tenant specifically the selective clustering key is
+`CounterID`, so that tenant belongs to the override-key path above rather than
+to the time-leading default. ADR-0849 §6 records the same split.
 
 A tenant whose queries filter on a **high-cardinality point** dimension
 (`WHERE UserID = c`) is not served by any single clustering key; that is point
@@ -506,7 +551,10 @@ data. Each consumer fails toward the outcome it can afford.
   ingest-hour key component, and decision 7 states the rule that covers it.
   This ADR specifies the output invariant; it does not subsume #593, it
   requires #593 to reach full effect on a time-uncorrelated ingest order and
-  composes with it.
+  composes with it. That is a statement about which TIER produces narrow
+  bounds, not about which corpus justifies the time-leading key: a
+  bulk-loaded, entity-sorted corpus is the case decision 2 excludes from the
+  default and acceptance 12 gates.
 - **#118 (rollup/downsampling tier):** orthogonal. Rollup is a lossy
   pre-aggregation that reduces row count; clustering is an exact reordering that
   preserves rows. A rollup tier's outputs can themselves be clustered by the
@@ -923,13 +971,16 @@ and #118, subsumes none, conflicts with none.
 
 ### 5. The conflicting-key problem, stated honestly
 
-A sort key leads with exactly one dimension. Time clustering answers the narrow
-EventTime window (q37-q43). A high-cardinality point lookup (`WHERE UserID =
-c`, q20) wants the surviving rows gathered by UserID, which a time-leading sort
-scatters across every part. A compound key `(ts, UserID)` does not fix this:
+A sort key leads with exactly one dimension. Time clustering answers a genuinely
+narrow EventTime window (of the measured statements, only q43 has one). A
+high-cardinality point lookup (`WHERE UserID = c`, q20) wants the surviving rows
+gathered by UserID, which a time-leading sort scatters across every part. The
+same scattering is what Context describes for `CounterID = 62` in q37-q42: a
+low-cardinality entity predicate is served by locality on that entity, and a
+time-leading sort destroys it. A compound key `(ts, UserID)` does not fix this:
 within each contiguous ts run UserID is still spread across the run's whole
 value domain, so a UserID predicate prunes nothing at object granularity; and
-`(UserID, ts)` destroys the time clustering the measured statements need. One
+`(UserID, ts)` destroys the time clustering a real window needs. One
 key cannot serve both, and this ADR does not claim it can.
 
 The answer for point lookups is the **POSTINGS attribute index (ADR-0049,
@@ -1303,18 +1354,25 @@ Each band is pre-registered before any measurement, on the tracking issue, with
 its reasoning. A figure must be emitted exactly once and inside its band; an
 absent or duplicated figure fails the same as one outside the band.
 
-1. **Objects opened for a narrow-window statement falls by at least an order of
-   magnitude.** Hard gate: q37-q43 opens `<= 842` objects (an order of
-   magnitude below the measured 8,424). Pre-registered expectation: `40-150`
-   objects. Reasoning: 144 surviving blocks are contiguous in EventTime once
-   clustered; at the corpus's block density (17,731 blocks / 8,424 objects =
-   2.1 blocks/object), preserved under the same block size and byte cap, 144
-   blocks occupy ~68 objects, plus at most a couple of boundary parts. With
-   256-MiB parts the count is lower still. A result in `(150, 842]` passes the
-   gate but is a pre-registration miss to investigate (clustering weaker than
-   the density argument predicts, e.g. L2 has not run and the window still
-   spans multiple within-hour part sets). Stated as an exact object count from
-   the resolve accounting, never as a wall-clock improvement.
+1. **Objects opened for a genuinely narrow-window statement falls by at least
+   an order of magnitude.** The measurement corpus is an organic-arrival
+   telemetry corpus whose ingest order correlates with event time, never
+   `clickbench-v4`: Context states why that corpus's q37-q42 are selected by
+   `CounterID` and would regress, and acceptance 12 is the separate gate that
+   applies to it. The measured statement is a window keeping fraction `f` of
+   the corpus's rows with no other prunable predicate, and `f` is registered
+   with the band. Hard gate: objects opened `<= 0.1 x` the corpus's live
+   object count. Pre-registered expectation: within `[f, 2f] x` the live
+   object count, plus at most one boundary part per (shard, ingest hour) the
+   window touches. Reasoning: the surviving rows are contiguous in EventTime
+   once clustered, so a window keeping `f` of the rows keeps about `f` of the
+   parts at the same block size and byte cap, and decision 4's stream batching
+   contributes at most one boundary part per batch. A result inside the hard
+   gate but outside that band passes but is a pre-registration miss to
+   investigate (clustering weaker than the contiguity argument predicts, e.g.
+   L2 has not run and the window still spans multiple within-hour part sets).
+   Stated as an exact object count from the resolve accounting, never as a
+   wall-clock improvement.
 2. **An excluded object costs ZERO GETs, asserted per phase.** For every object
    whose clustering-key bounds miss the query window, the data GETs attributed
    to it in the probe, scan, and decode phases are exactly 0; the only cost of
@@ -1484,6 +1542,27 @@ absent or duplicated figure fails the same as one outside the band.
     and tombstones -- retiring inputs whose superseding record never
     became live -- and the tombstones-exactly-0 assertion catches exactly
     that.
+12. **EventTime-leading clustering never touches a measured tenant without a
+    pre-registered A/B.** This is a process gate on enabling the feature, not
+    a unit test, and it is a precondition for any reported number. Before
+    `clustering_key` resolves to EventTime for a tenant whose figures are
+    reported anywhere, an A/B is registered on the tracking issue and then
+    run: same binary, same tenant, same corpus, one snapshot before
+    clustering and one after, with the expected direction and the pass band
+    for every figure written down BEFORE any number exists. Statement
+    coverage is q37 through q43 inclusive. q43 is required, not optional: it
+    is the only statement in the class with a real time window
+    (`EventDate BETWEEN 15900 AND 15901`) and therefore the only one expected
+    to improve, so an A/B that drops it cannot show the mechanism working at
+    all. Per-statement figures: surviving blocks, objects opened, and data
+    GETs per phase, each emitted exactly once. For `clickbench-v4` the
+    pre-registered direction is fixed by Context's arithmetic and is a
+    regression: q37-q42 surviving blocks rise from 144 toward 17,731 and
+    objects opened do not fall, while q43 improves. Numbers that arrive
+    before the registration are not a result (the repo's pre-registration
+    rule), and enabling the key on a measured tenant without a registered
+    A/B is a process violation of the same class as breaking decision 4's
+    rollout gate.
 
 ## Alternatives considered
 
