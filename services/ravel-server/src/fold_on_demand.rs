@@ -30,18 +30,27 @@
 //!
 //! # Admission
 //!
+//! A fold is object-store-heavy -- it LISTs commit records, GETs parts, and
+//! PUTs new parts plus `HEAD` -- and it does that work whether or not anything
+//! turns out to be eligible. Two independent gates keep an operator (or a
+//! script) from multiplying that cost:
+//!
 //! Concurrent calls for one `(tenant, signal)` collapse into a single fold
 //! through [`SingleFlight`], the coalescing primitive the read cache already
 //! uses: one call runs the fold, every other call in flight for that key
 //! waits on its result and issues no object-store work of its own, and each
-//! response says which it was in `coalesced`. That is this route's admission
-//! gate. A fold is object-store-heavy -- it LISTs commit records, GETs parts,
-//! and PUTs new parts plus `HEAD` -- and it does that work whether or not
-//! anything turns out to be eligible, so an unguarded route would multiply
-//! that cost by the caller's own concurrency. A credential resolves to
-//! exactly one tenant (see Authorization above), so this bounds any one
-//! caller to one in-flight fold per signal, which is the same load the
-//! scheduled loop already places on that tenant.
+//! response says which it was in `coalesced`. A credential resolves to exactly
+//! one tenant (see Authorization above), so this bounds any one caller to one
+//! in-flight fold per signal.
+//!
+//! `SingleFlight` bounds *concurrency*, not *rate*: sequential calls do not
+//! overlap, so each would otherwise run a full fold. The rate gate closes that:
+//! before folding, the route reads `HEAD` and, if it was published more
+//! recently than the fold interval (the same `fold_interval`
+//! [`crate::fold`]'s `head_fresh_enough` skips a scheduled tick on), returns
+//! [`FoldOutcome::Throttled`] without listing anything. A caller hammering the
+//! route sequentially therefore triggers at most one fold per interval, the
+//! same load the scheduled loop already places on that tenant.
 //!
 //! The route deliberately does not take a `QueryAdmissionController` permit
 //! the way the query surfaces do. A fold is deferred maintenance traffic and
@@ -86,9 +95,14 @@
 //! - `lost_cas`: a concurrent fold (the scheduled loop, or another operator
 //!   call) won the `HEAD` CAS. The catalog is fine and the winner's snapshot
 //!   is published; this call did not publish one.
+//! - `throttled`: the rate gate declined to fold because `HEAD` was published
+//!   more recently than the fold interval. No listing ran, so this call makes
+//!   no eligibility claim -- it is deliberately not folded into
+//!   `nothing_eligible`, which asserts a negative the throttle never checked.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
@@ -133,6 +147,15 @@ pub enum FoldOutcome {
     /// A concurrent fold won the `HEAD` CAS. This call published nothing; the
     /// winner's snapshot is what `HEAD` names.
     LostCas,
+    /// The rate gate declined to run a fold because `HEAD` was published more
+    /// recently than the fold interval. Distinct from `NothingEligible`: this
+    /// call did no listing and made no eligibility claim: it only observed that
+    /// a fold ran recently enough that another would be wasted object-store
+    /// work. `NothingEligible` asserts a definite negative (no commit entered or
+    /// left the snapshot); a throttle never ran the check that could assert it,
+    /// so reusing that status would be the mislabelled-measurement defect the
+    /// review flagged elsewhere.
+    Throttled,
 }
 
 impl FoldOutcome {
@@ -142,6 +165,7 @@ impl FoldOutcome {
             FoldOutcome::Published => "published",
             FoldOutcome::NothingEligible => "nothing_eligible",
             FoldOutcome::LostCas => "lost_cas",
+            FoldOutcome::Throttled => "throttled",
         }
     }
 
@@ -161,6 +185,10 @@ impl FoldOutcome {
             FoldOutcome::LostCas => {
                 "a concurrent fold won the HEAD compare-and-swap; this call published no \
                  snapshot and the winner's snapshot is the current HEAD"
+            }
+            FoldOutcome::Throttled => {
+                "a fold ran for this tenant and signal more recently than the fold interval, so \
+                 this call did not run another; retry after the interval elapses"
             }
         }
     }
@@ -228,6 +256,13 @@ pub struct OnDemandFoldState {
     /// listener coalesces with a concurrent one on `--listen-http` instead of
     /// running a second fold for the same tenant.
     pub in_flight: Arc<FoldInFlight>,
+    /// The scheduled fold's interval, reused as the on-demand route's rate gate
+    /// (the same value [`crate::fold`]'s `head_fresh_enough` skips a tick on). A
+    /// call whose `HEAD` is fresher than this returns [`FoldOutcome::Throttled`]
+    /// without folding: [`SingleFlight`] bounds concurrency, and this bounds
+    /// rate, so a caller issuing sequential calls cannot drive one full
+    /// `Catalog::fold` (a LIST, GETs, and PUTs) per call.
+    pub fold_interval: Duration,
 }
 
 /// The `/api/v1/admin/fold` router.
@@ -317,6 +352,7 @@ async fn run(state: &OnDemandFoldState, req: Request<Body>) -> Result<Response, 
                 state.folder_id,
                 now_ns,
                 default_retention_ns,
+                state.fold_interval,
             )
             .await
             .map(Arc::new)
@@ -406,6 +442,11 @@ async fn run(state: &OnDemandFoldState, req: Request<Body>) -> Result<Response, 
 /// `now_ns` is the caller's clock reading: this function never reads a clock,
 /// so the sealing window is deterministic under test.
 ///
+/// `fold_interval` is the rate gate: a `HEAD` published within it of `now_ns`
+/// returns [`FoldOutcome::Throttled`] before any listing. `Duration::ZERO`
+/// disables the gate (a HEAD's age is always non-negative), which is how the
+/// direct-call tests exercise the fold outcomes without throttling.
+///
 /// Classification needs the `HEAD` object from before the fold, because
 /// [`Catalog::fold`]'s own report cannot distinguish the non-publishing cases
 /// on its own:
@@ -419,6 +460,7 @@ async fn run(state: &OnDemandFoldState, req: Request<Body>) -> Result<Response, 
 ///   rewrites `HEAD` and reports `no_op: false`, having folded nothing. The
 ///   two `HEAD`s' entry sets tell that apart from a fold that really changed
 ///   the snapshot's content (see [`snapshot_content_changed`]).
+#[allow(clippy::too_many_arguments)]
 pub async fn fold_once(
     catalog: &Catalog,
     store: &dyn ObjectStoreBackend,
@@ -427,11 +469,31 @@ pub async fn fold_once(
     folder_id: Uuid,
     now_ns: i64,
     default_retention_ns: Option<i64>,
+    fold_interval: Duration,
 ) -> Result<OnDemandFold, CatalogError> {
     let mut gets = 0u64;
     let before = read_head(store, tenant, signal, &mut gets)
         .await
         .map_err(CatalogError::Store)?;
+
+    // Rate gate (see the module docs' "# Admission"): if a fold published this
+    // HEAD more recently than the fold interval, decline rather than repeat a
+    // LIST/GET/PUT sequence a sequential caller would otherwise pay per call.
+    // `SingleFlight` above only deduplicates *concurrent* calls, so this is the
+    // gate that bounds rate. A zero interval never trips (age is always `>= 0`),
+    // which is how the direct-call tests opt out. The `before` read is the one
+    // this gate needs, so it costs no extra GET.
+    if let Some(bytes) = &before
+        && let Ok(head) = decode_head(bytes)
+        && crate::fold::head_is_fresh(head.created_unix_ns, now_ns, fold_interval)
+    {
+        return Ok(OnDemandFold {
+            outcome: FoldOutcome::Throttled,
+            report: None,
+            head_advanced: false,
+            classify_get_requests: gets,
+        });
+    }
 
     match catalog
         .fold(tenant, signal, folder_id, now_ns, &[], default_retention_ns)
@@ -930,6 +992,7 @@ mod tests {
             Uuid::from_u128(1),
             NOW_NS,
             None,
+            Duration::ZERO,
         )
         .await
         .expect("fold");
@@ -990,6 +1053,7 @@ mod tests {
             Uuid::from_u128(1),
             NOW_NS,
             None,
+            Duration::ZERO,
         )
         .await
         .expect("fold");
@@ -1019,6 +1083,7 @@ mod tests {
             Uuid::from_u128(1),
             NOW_NS,
             None,
+            Duration::ZERO,
         )
         .await
         .expect("second fold");
@@ -1097,6 +1162,7 @@ mod tests {
             Uuid::from_u128(1),
             NOW_NS,
             None,
+            Duration::ZERO,
         )
         .await
         .expect("first fold");
@@ -1119,6 +1185,7 @@ mod tests {
             Uuid::from_u128(1),
             NOW_NS + 2 * NS_PER_HOUR,
             None,
+            Duration::ZERO,
         )
         .await
         .expect("second fold");
@@ -1204,6 +1271,7 @@ mod tests {
                 Uuid::from_u128(0xa),
                 NOW_NS,
                 None,
+                Duration::ZERO,
             )
             .await
         });
@@ -1226,6 +1294,7 @@ mod tests {
             Uuid::from_u128(0xb),
             NOW_NS,
             None,
+            Duration::ZERO,
         )
         .await
         .expect("racer B fold");
@@ -1268,6 +1337,80 @@ mod tests {
         );
     }
 
+    /// Item 1 (rate gate): [`SingleFlight`] deduplicates only *concurrent*
+    /// calls, so a caller issuing calls sequentially would otherwise run a full
+    /// `Catalog::fold` -- a LIST, GETs, and PUTs -- on every one. With a nonzero
+    /// `fold_interval`, only the first of a rapid sequential burst folds; every
+    /// later call whose `HEAD` is still fresher than the interval is throttled
+    /// before listing anything.
+    ///
+    /// The count is exact and taken from the fold reports, not merely the
+    /// response shape: exactly one call carries a report (it ran the fold) and
+    /// that report is the only listing the burst did.
+    ///
+    /// Prove-the-test: flip `interval` to `Duration::ZERO` (marked below) and
+    /// the gate is disabled -- every call folds, `folds_run` becomes `N`, and
+    /// the first assertion fails. That is the failure shape the current
+    /// (pre-gate) behavior produced.
+    #[tokio::test]
+    async fn sequential_calls_within_the_interval_run_one_fold() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = TenantId::new("fold-on-demand-rate");
+        let tenant_hash = tenant.hash();
+        let sealed_hour = (NOW_NS / NS_PER_HOUR - 3) as u32;
+        seed_log_commit(store.as_ref(), &tenant, sealed_hour, 0).await;
+
+        let catalog = catalog(store.clone());
+        // Flip to `Duration::ZERO` to disable the gate and watch this test fail.
+        let interval = Duration::from_secs(5 * 60);
+
+        const N: usize = 5;
+        let mut outcomes = Vec::new();
+        let mut total_list_requests = 0u64;
+        for _ in 0..N {
+            let result = fold_once(
+                catalog.as_ref(),
+                store.as_ref(),
+                &tenant_hash,
+                Signal::Logs,
+                Uuid::from_u128(1),
+                NOW_NS,
+                None,
+                interval,
+            )
+            .await
+            .expect("fold");
+            if let Some(report) = &result.report {
+                total_list_requests += report.list_requests;
+            }
+            outcomes.push(result.outcome);
+        }
+
+        let folds_run = outcomes
+            .iter()
+            .filter(|o| **o != FoldOutcome::Throttled)
+            .count();
+        assert_eq!(
+            folds_run, 1,
+            "exactly one sequential call within the interval runs a fold: {outcomes:?}"
+        );
+        assert_eq!(
+            outcomes[0],
+            FoldOutcome::Published,
+            "the first call folds the sealed hour and publishes"
+        );
+        assert!(
+            outcomes[1..].iter().all(|o| *o == FoldOutcome::Throttled),
+            "every later call in the burst is throttled: {outcomes:?}"
+        );
+        // The one fold that ran did the only listing; the throttled calls
+        // carried no report and listed nothing.
+        assert!(
+            total_list_requests > 0,
+            "the fold that ran listed commit records"
+        );
+    }
+
     fn state(store: Arc<dyn ObjectStoreBackend>, catalog: Arc<Catalog>) -> OnDemandFoldState {
         let tokens = std::collections::HashMap::from([(
             TOKEN.to_string(),
@@ -1281,6 +1424,10 @@ mod tests {
             folder_id: Uuid::from_u128(1),
             retention: Arc::new(RetentionConfig::default()),
             in_flight: Arc::new(FoldInFlight::new()),
+            // The HTTP tests below drive single or concurrent calls against a
+            // store with no prior HEAD, so the rate gate never trips; a zero
+            // interval keeps that explicit and independent of the wall clock.
+            fold_interval: Duration::ZERO,
         }
     }
 
