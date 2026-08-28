@@ -44,13 +44,18 @@
 //! Three distinct outcomes, always 200, always named in the response body's
 //! `status` field ([`FoldOutcome`]):
 //!
-//! - `published`: this call wrote a new snapshot and advanced `HEAD`.
-//! - `nothing_eligible`: nothing was sealable, so no snapshot was published
-//!   and `HEAD` is untouched. A fold seals an ingest hour only once
-//!   `max_flush_lifetime + clock_skew_allowance + fold_safety_margin` has
-//!   elapsed after that hour ends, so a fold triggered right after a load
-//!   seals nothing. That is the rule working, not a failure, which is exactly
-//!   why it is a separate status rather than a `published` with zero counters.
+//! - `published`: this call wrote a new snapshot, advancing `HEAD` to name
+//!   content that differs from what it named before.
+//! - `nothing_eligible`: no commit was eligible to fold. A fold seals an
+//!   ingest hour only once `max_flush_lifetime + clock_skew_allowance +
+//!   fold_safety_margin` has elapsed after that hour ends, so a fold
+//!   triggered right after a load seals nothing. That is the rule working,
+//!   not a failure, which is exactly why it is a separate status rather than
+//!   a `published` with zero counters. The response's `head_advanced` field
+//!   separates the two shapes this outcome takes: `false` when `HEAD` was
+//!   left untouched, `true` when the sealing watermark moved over hours that
+//!   held nothing to fold, so the new snapshot names the same entries the old
+//!   one did.
 //! - `lost_cas`: a concurrent fold (the scheduled loop, or another operator
 //!   call) won the `HEAD` CAS. The catalog is fine and the winner's snapshot
 //!   is published; this call did not publish one.
@@ -87,11 +92,13 @@ const MAX_BODY_BYTES: usize = 64 * 1024;
 /// boolean plus a log line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FoldOutcome {
-    /// A new snapshot was published and `HEAD` now names it.
+    /// A new snapshot was published: `HEAD` now names content that differs
+    /// from what it named before this call.
     Published,
-    /// Nothing was eligible to fold: no ingest hour has sealed beyond the
-    /// previous watermark, so no snapshot was published and `HEAD` is
-    /// unchanged.
+    /// Nothing was eligible to fold: no commit entered or left the snapshot,
+    /// either because no ingest hour has sealed beyond the previous watermark
+    /// (`head_advanced: false`) or because the hours that did seal held
+    /// nothing to fold (`head_advanced: true`, a watermark-only rewrite).
     NothingEligible,
     /// A concurrent fold won the `HEAD` CAS. This call published nothing; the
     /// winner's snapshot is what `HEAD` names.
@@ -115,9 +122,11 @@ impl FoldOutcome {
         match self {
             FoldOutcome::Published => "a new catalog snapshot was published",
             FoldOutcome::NothingEligible => {
-                "nothing was eligible to fold, so no snapshot was published and HEAD is \
-                 unchanged; an ingest hour seals only once max_flush_lifetime + \
-                 clock_skew_allowance + fold_safety_margin has elapsed after that hour ends"
+                "nothing was eligible to fold: no commit entered or left the snapshot, so the \
+                 catalog names exactly what it named before (see head_advanced for whether the \
+                 sealing watermark still moved). An ingest hour seals only once \
+                 max_flush_lifetime + clock_skew_allowance + fold_safety_margin has elapsed \
+                 after that hour ends, so a fold run right after a load seals nothing"
             }
             FoldOutcome::LostCas => {
                 "a concurrent fold won the HEAD compare-and-swap; this call published no \
@@ -135,6 +144,13 @@ impl FoldOutcome {
 pub struct OnDemandFold {
     pub outcome: FoldOutcome,
     pub report: Option<FoldReport>,
+    /// Whether this call rewrote `HEAD`. Reported separately from the outcome
+    /// because the two can differ: a fold whose sealing watermark advanced
+    /// over hours holding nothing foldable rewrites `HEAD` while folding no
+    /// entry at all. That is a [`FoldOutcome::NothingEligible`] -- the
+    /// operator's question is whether any data was eligible -- but the
+    /// watermark move is real and is never hidden.
+    pub head_advanced: bool,
 }
 
 /// Shared state for the route: the same [`Catalog`] the query paths resolve
@@ -271,6 +287,7 @@ async fn run(state: &OnDemandFoldState, req: Request<Body>) -> Result<Response, 
     let mut payload = json!({
         "status": result.outcome.as_str(),
         "published": result.outcome == FoldOutcome::Published,
+        "head_advanced": result.head_advanced,
         "message": result.outcome.message(),
         "tenant_hash": tenant_hash.to_hex(),
         "signal": body.signal,
@@ -305,13 +322,18 @@ async fn run(state: &OnDemandFoldState, req: Request<Body>) -> Result<Response, 
 /// so the sealing window is deterministic under test.
 ///
 /// Classification needs the `HEAD` object from before the fold, because
-/// [`Catalog::fold`]'s own report cannot distinguish the two non-publishing
-/// cases on its own. A fold that loses the `HEAD` CAS re-reads `HEAD`, finds
-/// the winner's watermark already covers its own, and returns a `no_op`
-/// report -- byte-identical in shape to the report for "nothing has sealed".
-/// The `HEAD` object itself tells them apart: unchanged means nothing
-/// happened, changed means somebody else published while this call was
-/// folding.
+/// [`Catalog::fold`]'s own report cannot distinguish the non-publishing cases
+/// on its own:
+///
+/// - A fold that loses the `HEAD` CAS re-reads `HEAD`, finds the winner's
+///   watermark already covers its own, and returns a `no_op` report --
+///   identical in shape to the report for "nothing has sealed". The `HEAD`
+///   object tells them apart: unchanged means nothing happened, changed means
+///   somebody else published while this call was folding.
+/// - A fold whose sealing watermark advanced over hours that held no commits
+///   rewrites `HEAD` and reports `no_op: false`, having folded nothing. The
+///   previous `HEAD`'s entry count tells that apart from a fold that really
+///   changed the snapshot's content.
 pub async fn fold_once(
     catalog: &Catalog,
     store: &dyn ObjectStoreBackend,
@@ -324,15 +346,31 @@ pub async fn fold_once(
     let before = read_head(store, tenant, signal)
         .await
         .map_err(CatalogError::Store)?;
+    let entries_before = head_entry_count(before.as_deref());
 
     match catalog
         .fold(tenant, signal, folder_id, now_ns, &[], default_retention_ns)
         .await
     {
-        Ok(report) if !report.no_op => Ok(OnDemandFold {
-            outcome: FoldOutcome::Published,
-            report: Some(report),
-        }),
+        Ok(report) if !report.no_op => {
+            // `HEAD` was rewritten. Whether anything was *eligible* is a
+            // second question: an ingest hour that seals while holding no
+            // commit still advances the watermark, and the resulting snapshot
+            // names exactly the entries the previous one did. Comparing the
+            // entry counts answers it in either direction -- a fold that
+            // folds new commits in, and one that drops entries through a
+            // retention tombstone, both changed the snapshot's content.
+            let outcome = if report.entry_count == entries_before {
+                FoldOutcome::NothingEligible
+            } else {
+                FoldOutcome::Published
+            };
+            Ok(OnDemandFold {
+                outcome,
+                report: Some(report),
+                head_advanced: true,
+            })
+        }
         Ok(report) => {
             let after = read_head(store, tenant, signal)
                 .await
@@ -345,6 +383,7 @@ pub async fn fold_once(
             Ok(OnDemandFold {
                 outcome,
                 report: Some(report),
+                head_advanced: false,
             })
         }
         // The catalog retries a losing CAS internally and only surfaces this
@@ -361,6 +400,7 @@ pub async fn fold_once(
             Ok(OnDemandFold {
                 outcome: FoldOutcome::LostCas,
                 report: None,
+                head_advanced: false,
             })
         }
         Err(err) => Err(err),
@@ -386,12 +426,25 @@ async fn read_head(
     }
 }
 
+/// Entries named by a `HEAD` object, summed over its parts. `0` for an absent
+/// `HEAD`, and for one this process cannot decode -- both mean "no snapshot
+/// content to compare against", and a fold over either rebuilds from the
+/// commit layout anyway.
+fn head_entry_count(head: Option<&[u8]>) -> u64 {
+    head.and_then(|bytes| ravel_catalog::decode_head(bytes).ok())
+        .map(|head| head.parts.iter().map(|part| part.entry_count).sum())
+        .unwrap_or(0)
+}
+
 fn authenticate(state: &OnDemandFoldState, headers: &HeaderMap) -> Result<TenantId, ApiError> {
-    state.tenant_resolver.resolve(headers).map_err(|_| ApiError {
-        status: StatusCode::UNAUTHORIZED,
-        error_type: "unauthorized",
-        message: "authentication required".to_string(),
-    })
+    state
+        .tenant_resolver
+        .resolve(headers)
+        .map_err(|_| ApiError {
+            status: StatusCode::UNAUTHORIZED,
+            error_type: "unauthorized",
+            message: "authentication required".to_string(),
+        })
 }
 
 /// The endpoint's error shape, mirroring the sibling query endpoints' typed
@@ -528,7 +581,11 @@ mod tests {
         )
         .expect("build data key");
         store
-            .put(&data_key, Bytes::from(bytes), PutOptions::create_if_absent())
+            .put(
+                &data_key,
+                Bytes::from(bytes),
+                PutOptions::create_if_absent(),
+            )
             .await
             .expect("put RLOG object");
 
@@ -615,8 +672,12 @@ mod tests {
 
     /// Nothing-eligible path: the tenant's only write lands in the current
     /// hour, which cannot be sealed yet. The outcome is exactly
-    /// `nothing_eligible` -- not a failure, and not a claimed publish -- and
-    /// no HEAD was written.
+    /// `nothing_eligible` -- not a failure, and not a claimed publish -- in
+    /// both shapes it takes: the first call moves the sealing watermark over
+    /// hours holding nothing (`head_advanced: true`, zero entries), and the
+    /// second, with the watermark already there, leaves HEAD untouched
+    /// (`head_advanced: false`). Neither may claim a publish, because the
+    /// operator's write is still unsealed in both.
     #[tokio::test]
     async fn a_tenant_with_unsealable_writes_reports_nothing_eligible() {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
@@ -645,17 +706,38 @@ mod tests {
             FoldOutcome::NothingEligible,
             "a write in the current hour is not sealable, so nothing is eligible"
         );
-        let report = result.report.expect("a no-op fold still carries a report");
-        assert!(report.no_op, "the underlying fold must be a no-op");
-        let head = store
-            .get(
-                &crate::fold::head_key(&tenant_hash, Signal::Logs),
-                GetRange::Full,
-            )
-            .await;
+        let report = result.report.expect("the fold carries a report");
+        assert_eq!(
+            report.entry_count, 0,
+            "the unsealed write must not appear in the snapshot"
+        );
         assert!(
-            matches!(head, Err(StoreError::NotFound)),
-            "no snapshot may be published when nothing is eligible"
+            result.head_advanced,
+            "the sealing watermark still moves over the empty hours behind it"
+        );
+
+        // Second call, same clock: the watermark is already where the sealing
+        // rule allows, so this one is a true no-op and leaves HEAD alone.
+        let again = fold_once(
+            catalog.as_ref(),
+            store.as_ref(),
+            &tenant_hash,
+            Signal::Logs,
+            Uuid::from_u128(1),
+            NOW_NS,
+            None,
+        )
+        .await
+        .expect("second fold");
+        assert_eq!(
+            again.outcome,
+            FoldOutcome::NothingEligible,
+            "still nothing sealable, so still nothing eligible"
+        );
+        assert!(!again.head_advanced, "HEAD must be left untouched");
+        assert!(
+            again.report.expect("the fold carries a report").no_op,
+            "the underlying fold must be a no-op"
         );
     }
 
@@ -773,7 +855,11 @@ mod tests {
         }
     }
 
-    async fn post(state: OnDemandFoldState, token: Option<&str>, body: &str) -> (StatusCode, Vec<u8>) {
+    async fn post(
+        state: OnDemandFoldState,
+        token: Option<&str>,
+        body: &str,
+    ) -> (StatusCode, Vec<u8>) {
         let mut builder = HttpRequest::builder()
             .method("POST")
             .uri(FOLD_ROUTE)
