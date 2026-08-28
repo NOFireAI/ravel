@@ -64,8 +64,8 @@ use datafusion::physical_plan::{
 };
 use datafusion::scalar::ScalarValue;
 
-use crate::logs_schema::FIRST_DECLARED_COL;
 use crate::logs_scan::{DeclaredGroupCounts, LogsScanExec};
+use crate::logs_schema::FIRST_DECLARED_COL;
 
 /// The rule's name, as it appears in DataFusion's optimizer diagnostics.
 pub const METADATA_ONLY_AGGREGATE_RULE: &str = "metadata_only_aggregate";
@@ -292,7 +292,8 @@ fn rewrite(node: Arc<dyn ExecutionPlan>) -> DFResult<Transformed<Arc<dyn Executi
             if col_index < FIRST_DECLARED_COL || literal.is_null() {
                 return Ok(Transformed::no(node));
             }
-            let Some(count) = scan.declared_not_equal_count(col_index - FIRST_DECLARED_COL, &literal)
+            let Some(count) =
+                scan.declared_not_equal_count(col_index - FIRST_DECLARED_COL, &literal)
             else {
                 return Ok(Transformed::no(node));
             };
@@ -462,10 +463,12 @@ impl ExecutionPlan for MetadataOnlyExec {
     }
 
     fn partition_statistics(&self, _partition: Option<usize>) -> DFResult<Arc<Statistics>> {
-        Ok(Arc::new(physical_plan::common::compute_record_batch_statistics(
-            &[vec![self.batch.clone()]],
-            &self.schema,
-            None,
-        )))
+        Ok(Arc::new(
+            physical_plan::common::compute_record_batch_statistics(
+                &[vec![self.batch.clone()]],
+                &self.schema,
+                None,
+            ),
+        ))
     }
 }
