@@ -65,7 +65,6 @@ use datafusion::physical_plan::{
 use datafusion::scalar::ScalarValue;
 
 use crate::logs_scan::{DeclaredGroupCounts, LogsScanExec};
-use crate::logs_schema::FIRST_DECLARED_COL;
 
 /// The rule's name, as it appears in DataFusion's optimizer diagnostics.
 pub const METADATA_ONLY_AGGREGATE_RULE: &str = "metadata_only_aggregate";
@@ -132,9 +131,14 @@ fn classify_scan_chain(plan: &Arc<dyn ExecutionPlan>) -> Option<ScanChainStep> {
         return None;
     }
     if let Some(filter) = plan.downcast_ref::<FilterExec>() {
-        if filter.projection().is_some() {
-            return None;
-        }
+        // A `FilterExec` projection only reshapes what flows UP out of the
+        // filter; `filter.predicate()` is always expressed over the filter's
+        // INPUT schema (this scan's output space), which is the only thing the
+        // q02 branch reads it for. The q08 branch declines outright when any
+        // filter is present, so a projected filter can never coexist with a
+        // group-key index that would be desynced by it. A COUNT(*) filter in
+        // particular carries `projection=[]` (nothing flows up), so rejecting a
+        // projected filter here would refuse the primary q02 shape entirely.
         return Some(ScanChainStep::Filter(Arc::new(filter.clone())));
     }
     if plan.is::<CoalescePartitionsExec>() || plan.is::<CooperativeExec>() {
@@ -289,12 +293,16 @@ fn rewrite(node: Arc<dyn ExecutionPlan>) -> DFResult<Transformed<Arc<dyn Executi
             let Some((col_index, literal)) = not_equal_literal(filter.predicate()) else {
                 return Ok(Transformed::no(node));
             };
-            if col_index < FIRST_DECLARED_COL || literal.is_null() {
+            // `col_index` is in the scan's output space (projection pushdown
+            // has already run by the time this rule fires); resolve it to a
+            // declared-column index before reading statistics.
+            let Some(k) = scan.declared_index_for_output(col_index) else {
+                return Ok(Transformed::no(node));
+            };
+            if literal.is_null() {
                 return Ok(Transformed::no(node));
             }
-            let Some(count) =
-                scan.declared_not_equal_count(col_index - FIRST_DECLARED_COL, &literal)
-            else {
+            let Some(count) = scan.declared_not_equal_count(k, &literal) else {
                 return Ok(Transformed::no(node));
             };
             let Some(count) = count_to_i64(count) else {
@@ -308,10 +316,13 @@ fn rewrite(node: Arc<dyn ExecutionPlan>) -> DFResult<Transformed<Arc<dyn Executi
         // q08: <declared column>, COUNT(*) GROUP BY <declared column>. A
         // filter combined with a GROUP BY is out of scope for this rule.
         Some(col_index) => {
-            if filter.is_some() || col_index < FIRST_DECLARED_COL {
+            if filter.is_some() {
                 return Ok(Transformed::no(node));
             }
-            let Some(counts) = scan.declared_group_counts(col_index - FIRST_DECLARED_COL) else {
+            let Some(k) = scan.declared_index_for_output(col_index) else {
+                return Ok(Transformed::no(node));
+            };
+            let Some(counts) = scan.declared_group_counts(k) else {
                 return Ok(Transformed::no(node));
             };
             match group_counts_batch(&schema, counts) {

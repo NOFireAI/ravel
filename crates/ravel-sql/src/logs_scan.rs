@@ -1102,6 +1102,21 @@ impl LogsScanExec {
         Some(total)
     }
 
+    /// The declared-column index (into `self.declared`) that this scan's
+    /// output column `output_col` projects, or `None` when that output column
+    /// is not a declared typed column. The metadata-only aggregate rule
+    /// receives filter and group-key column indices in this scan's *output*
+    /// space (projection pushdown has already rewritten them by the time the
+    /// rule fires), so it resolves them through `self.projection` before
+    /// indexing `self.declared`; passing a raw output index straight into
+    /// [`Self::declared_not_equal_count`]/[`Self::declared_group_counts`]
+    /// would consult the wrong column whenever the scan is projected.
+    pub(crate) fn declared_index_for_output(&self, output_col: usize) -> Option<usize> {
+        let full = *self.projection.get(output_col)?;
+        full.checked_sub(FIRST_DECLARED_COL)
+            .filter(|k| *k < self.declared.len())
+    }
+
     /// Exact GROUP BY value -> COUNT(*) for the declared column at schema
     /// index `FIRST_DECLARED_COL + k` (ADR-0850's q08 shape), merging every
     /// touched segment's exact dictionary. `None` means fall back to
