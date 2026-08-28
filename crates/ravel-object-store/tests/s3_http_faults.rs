@@ -54,7 +54,7 @@ use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::Response;
 use bytes::Bytes;
 use parking_lot::Mutex;
-use ravel_object_store::s3::{MULTIPART_THRESHOLD, S3Config, S3Store};
+use ravel_object_store::s3::{MULTIPART_THRESHOLD, S3Config, S3HttpConfig, S3Store};
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, StoreError};
 
 /// Bucket name the fake serves. Path-style requests put it in the first path
@@ -122,14 +122,28 @@ enum Fault {
     DropMidResponse,
 }
 
-/// One request as the server saw it: which operation, which key, when, and
-/// which fault (if any) was served for it.
+/// One request as the server saw it: which operation, which key, when, which
+/// fault (if any) was served for it, and the byte range it asked for.
+///
+/// `range` is what makes "the adapter bounded this read" observable from the
+/// server side rather than inferred from the bytes that came back.
 #[derive(Clone, Debug)]
 struct Seen {
     op: Op,
     key: String,
     at: Instant,
     fault: Option<Fault>,
+    /// Inclusive `[start, end]` from the request's `Range` header, absent for
+    /// an unranged request.
+    range: Option<(u64, u64)>,
+}
+
+impl Seen {
+    /// Bytes this request asked for, or `None` if it was unranged (i.e. asked
+    /// for the whole object, however large that turns out to be).
+    fn range_len(&self) -> Option<u64> {
+        self.range.map(|(start, end)| end - start + 1)
+    }
 }
 
 #[derive(Default)]
@@ -164,12 +178,13 @@ impl FakeState {
         self.always.lock().get(&op).copied()
     }
 
-    fn record(&self, op: Op, key: &str, fault: Option<Fault>) {
+    fn record(&self, op: Op, key: &str, fault: Option<Fault>, range: Option<(u64, u64)>) {
         self.log.lock().push(Seen {
             op,
             key: key.to_string(),
             at: Instant::now(),
             fault,
+            range,
         });
     }
 }
@@ -209,7 +224,19 @@ impl FakeS3 {
     /// [`S3Config::endpoint`] override. No new configuration surface: this is
     /// the same field a MinIO deployment sets.
     fn store(&self) -> S3Store {
-        S3Store::new(S3Config {
+        S3Store::new(self.config()).expect("a fake-endpoint S3Store must build")
+    }
+
+    /// The same store under an explicit [`S3HttpConfig`]. Used by the bounded
+    /// whole-object read tests: the read chunk is derived from
+    /// `request_timeout`, so a shorter timeout gives a small enough chunk to
+    /// exercise splitting on a test-sized object.
+    fn store_with_http(&self, http: S3HttpConfig) -> S3Store {
+        S3Store::with_http_config(self.config(), http).expect("a fake-endpoint S3Store must build")
+    }
+
+    fn config(&self) -> S3Config {
+        S3Config {
             bucket: BUCKET.to_string(),
             region: "us-east-1".to_string(),
             endpoint: Some(format!("http://{}", self.addr)),
@@ -222,8 +249,7 @@ impl FakeS3 {
             credentials_file: None,
             auth: Default::default(),
             instance_metadata_endpoint: None,
-        })
-        .expect("a fake-endpoint S3Store must build")
+        }
     }
 
     /// Serve `faults` in order for the next N requests of `op`, then serve
@@ -349,27 +375,53 @@ fn error_response(status: StatusCode, code: &str, message: &str) -> Response {
     )
 }
 
-/// A 200 whose body starts and then stops short of the declared
+/// A response whose body starts and then stops short of the declared
 /// `Content-Length`. hyper aborts the connection when the body stream errors,
 /// so the client sees a message that ended early.
-fn drop_mid_response() -> Response {
+///
+/// Answers a ranged request 206 with a matching `Content-Range`, exactly as a
+/// real endpoint would. Serving 200 to a ranged request instead would be
+/// rejected as a non-partial response before the body was ever read, so the
+/// injected mid-body drop would never be what the test exercised.
+fn drop_mid_response(headers: &HeaderMap) -> Response {
     let stream = futures::stream::iter(vec![
         Ok::<Bytes, std::io::Error>(Bytes::from_static(b"partial-object-prefix")),
         Err(std::io::Error::other(
             "injected mid-response connection drop",
         )),
     ]);
-    build(
-        StatusCode::OK,
-        vec![
-            (header::ETAG, "\"dropped\"".to_string()),
-            (header::LAST_MODIFIED, LAST_MODIFIED.to_string()),
-            // Far more than the stream delivers, so the client's read ends
-            // early rather than looking like a complete short object.
-            (header::CONTENT_LENGTH, "65536".to_string()),
-        ],
-        Body::from_stream(stream),
-    )
+    let mut response_headers = vec![
+        (header::ETAG, "\"dropped\"".to_string()),
+        (header::LAST_MODIFIED, LAST_MODIFIED.to_string()),
+    ];
+    // Declared length is far more than the stream delivers in either case, so
+    // the client's read ends early rather than looking like a complete short
+    // object.
+    let status = match requested_range(headers) {
+        Some((start, end)) => {
+            response_headers.push((
+                header::CONTENT_RANGE,
+                format!("bytes {start}-{end}/{}", end + 1),
+            ));
+            response_headers.push((header::CONTENT_LENGTH, (end - start + 1).to_string()));
+            StatusCode::PARTIAL_CONTENT
+        }
+        None => {
+            response_headers.push((header::CONTENT_LENGTH, "65536".to_string()));
+            StatusCode::OK
+        }
+    };
+    build(status, response_headers, Body::from_stream(stream))
+}
+
+/// The inclusive `[start, end]` a `Range: bytes=start-end` header asks for.
+/// `None` for an absent header or any form this fake does not need to parse
+/// (an open-ended or suffix range), which the adapter's bounded reads never
+/// send.
+fn requested_range(headers: &HeaderMap) -> Option<(u64, u64)> {
+    let spec = headers.get(header::RANGE)?.to_str().ok()?;
+    let (start, end) = spec.strip_prefix("bytes=")?.split_once('-')?;
+    Some((start.parse().ok()?, end.parse().ok()?))
 }
 
 /// Serve a `Range` header against `data`, or the whole object when absent.
@@ -428,7 +480,7 @@ async fn handle(
         .unwrap_or_default();
 
     let fault = state.take_fault(op);
-    state.record(op, &key, fault);
+    state.record(op, &key, fault, requested_range(&headers));
 
     match fault {
         Some(Fault::ServiceUnavailable) => error_response(
@@ -459,7 +511,7 @@ async fn handle(
             "AccessDenied",
             "Access Denied by the fake endpoint.",
         ),
-        Some(Fault::DropMidResponse) => drop_mid_response(),
+        Some(Fault::DropMidResponse) => drop_mid_response(&headers),
         Some(Fault::Pass) | None => serve(&state, op, &key, &query, &headers, data),
     }
 }
@@ -906,6 +958,223 @@ async fn connection_dropped_mid_response_surfaces_retryable() {
             StoreError::Transient(_) | StoreError::Timeout | StoreError::Throttled { .. }
         ),
         "a dropped connection must classify as a transport failure, got {error:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Bounded whole-object reads
+// ---------------------------------------------------------------------------
+
+/// An [`S3HttpConfig`] whose read chunk is 1 MiB, so a test-sized object is
+/// enough to exercise splitting.
+///
+/// 7 s of `request_timeout` minus the 6 s connect/TLS/first-byte allowance
+/// leaves 1 s of transfer, which carries 625 000 bytes at the 5 Mbps floor the
+/// bound is sized against; that is under the 1 MiB minimum chunk, so the bound
+/// floors there. Asserted below rather than assumed, so a change to any of the
+/// three constants surfaces here instead of silently changing what these tests
+/// cover.
+fn small_chunk_http() -> S3HttpConfig {
+    S3HttpConfig {
+        request_timeout: Duration::from_secs(7),
+        ..Default::default()
+    }
+}
+
+/// A distinguishable byte at every offset, so a read that concatenates its
+/// pieces in the wrong order, drops one, or overlaps two fails on content and
+/// not only on length.
+fn patterned(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i % 251) as u8).collect()
+}
+
+/// The property [`S3HttpConfig::request_timeout`]'s stated criterion rests on:
+/// no single request carries more than the timeout can transfer at the floor
+/// rate, *including* a whole-object read, whose size the data chooses rather
+/// than this crate.
+///
+/// Before this was fixed, `GetRange::Full` mapped straight to an unranged GET,
+/// so a 256 MiB L1 compaction part went out as one request against a 20 s
+/// ceiling it needs ~410 s to satisfy at that floor rate: it could only time
+/// out, and then spend the retry budget re-issuing a request that never fits.
+/// The assertion is on what the *server* saw, so a client that still sent one
+/// unranged GET cannot pass it.
+#[tokio::test]
+async fn whole_object_read_is_split_into_requests_the_timeout_can_carry() {
+    let fake = FakeS3::start().await;
+    let http = small_chunk_http();
+    let bound = http.max_request_body_bytes();
+    assert_eq!(
+        bound,
+        1024 * 1024,
+        "this test's object size is written against a 1 MiB bound"
+    );
+    let store = fake.store_with_http(http);
+
+    // Deliberately not a multiple of the bound: the final request is short, so
+    // an off-by-one in the range arithmetic shows up as wrong bytes.
+    let size = 5 * bound + 123;
+    let object = patterned(size);
+    fake.seed("fault/bounded-read", &object);
+
+    let outcome = store
+        .get("fault/bounded-read", GetRange::Full)
+        .await
+        .expect("a bounded whole-object read must return the object");
+
+    // Complete-object semantics for the caller: same bytes, same total size.
+    assert_eq!(outcome.data.len(), size, "every byte of the object arrived");
+    assert_eq!(
+        &outcome.data[..],
+        &object[..],
+        "bytes are exact and in order"
+    );
+    assert_eq!(outcome.total_size, size as u64);
+
+    let gets = fake.requests(Op::Get);
+    assert_eq!(
+        gets.len(),
+        size.div_ceil(bound),
+        "the read must be issued as ceil(size / bound) requests, saw {gets:?}"
+    );
+    for seen in &gets {
+        let len = seen
+            .range_len()
+            .expect("every request of a bounded read carries a Range header");
+        assert!(
+            len <= bound as u64,
+            "a request asked for {len} bytes, above the {bound}-byte bound the \
+             request timeout is sized for"
+        );
+    }
+    // The ranges partition the object exactly: no gap, no overlap, so wire
+    // bytes are the object's size and not more.
+    let mut covered: Vec<(u64, u64)> = gets.iter().filter_map(|seen| seen.range).collect();
+    covered.sort_unstable();
+    let mut next = 0u64;
+    for (start, end) in covered {
+        assert_eq!(start, next, "ranges must be contiguous from 0");
+        next = end + 1;
+    }
+    assert_eq!(
+        next, size as u64,
+        "the ranges together must cover exactly the object"
+    );
+}
+
+/// The cost of the fix is bounded to objects that need it: an object at or
+/// under the chunk bound is still exactly one request, as it was before.
+/// Pinned because a request is the expensive unit on this store, and the
+/// overwhelming majority of reads here (footers, index objects, commit
+/// records) sit far below the bound.
+#[tokio::test]
+async fn whole_object_read_below_the_bound_stays_one_request() {
+    let fake = FakeS3::start().await;
+    let http = small_chunk_http();
+    let bound = http.max_request_body_bytes();
+    let store = fake.store_with_http(http);
+
+    let object = patterned(bound);
+    fake.seed("fault/exactly-one-chunk", &object);
+
+    let outcome = store
+        .get("fault/exactly-one-chunk", GetRange::Full)
+        .await
+        .expect("an object at the bound must read in one request");
+    assert_eq!(&outcome.data[..], &object[..]);
+    assert_eq!(
+        fake.count(Op::Get),
+        1,
+        "an object at or below the bound costs exactly one request"
+    );
+}
+
+/// A zero-byte object has no satisfiable range, so the bounded form cannot
+/// express it and a real endpoint answers 416. The read must still succeed and
+/// return an empty object, at the cost of one extra unranged request -- the one
+/// case where the split path issues more requests than bytes require.
+#[tokio::test]
+async fn whole_object_read_of_an_empty_object_falls_back_to_unranged() {
+    let fake = FakeS3::start().await;
+    let store = fake.store_with_http(small_chunk_http());
+    fake.seed("fault/empty", b"");
+
+    let outcome = store
+        .get("fault/empty", GetRange::Full)
+        .await
+        .expect("a zero-byte object must read as an empty object, not an InvalidRange error");
+    assert!(outcome.data.is_empty());
+    assert_eq!(outcome.total_size, 0);
+
+    let gets = fake.requests(Op::Get);
+    assert_eq!(gets.len(), 2, "one refused ranged probe, then one unranged");
+    assert!(
+        gets[0].range.is_some() && gets[1].range.is_none(),
+        "the fallback must be the unranged form, saw {gets:?}"
+    );
+}
+
+/// A caller-supplied range is passed through untouched, however large. The
+/// caller sized that request itself, and splitting it here would hide the cost
+/// from the code that chose it; the bound exists for `GetRange::Full`, which
+/// carries no caller-chosen size.
+#[tokio::test]
+async fn a_caller_supplied_range_is_never_split() {
+    let fake = FakeS3::start().await;
+    let http = small_chunk_http();
+    let bound = http.max_request_body_bytes();
+    let store = fake.store_with_http(http);
+
+    let object = patterned(4 * bound);
+    fake.seed("fault/caller-range", &object);
+
+    let wanted = 3 * bound;
+    let outcome = store
+        .get("fault/caller-range", GetRange::Range(0, wanted as u64))
+        .await
+        .expect("a caller range must be served");
+    assert_eq!(&outcome.data[..], &object[..wanted]);
+
+    let gets = fake.requests(Op::Get);
+    assert_eq!(
+        gets.len(),
+        1,
+        "one caller range is one request, saw {gets:?}"
+    );
+    assert_eq!(gets[0].range_len(), Some(wanted as u64));
+}
+
+/// The bound is derived from `request_timeout`, so the criterion holds for a
+/// configured value and not only for the default. Pins both ends of the clamp:
+/// the default sits at the 8 MiB cap that the multipart part size sets, and a
+/// very tight timeout floors at 1 MiB rather than shrinking without limit.
+#[tokio::test]
+async fn the_request_body_bound_tracks_the_configured_timeout() {
+    let default = S3HttpConfig::default();
+    assert_eq!(
+        default.max_request_body_bytes(),
+        8 * 1024 * 1024,
+        "the default timeout's transfer budget is capped at the multipart part size"
+    );
+
+    let tight = S3HttpConfig {
+        request_timeout: Duration::from_secs(1),
+        ..Default::default()
+    };
+    assert_eq!(
+        tight.max_request_body_bytes(),
+        1024 * 1024,
+        "a timeout below the overhead allowance floors the bound rather than reaching zero"
+    );
+
+    let middling = S3HttpConfig {
+        request_timeout: Duration::from_secs(14),
+        ..Default::default()
+    };
+    assert_eq!(
+        middling.max_request_body_bytes(),
+        8 * 625_000,
+        "8 s of transfer budget at the 5 Mbps floor is 5 MB, under the cap"
     );
 }
 

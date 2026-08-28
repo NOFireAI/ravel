@@ -73,7 +73,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use object_store::aws::{AmazonS3, AmazonS3Builder, AwsCredentialProvider};
 use object_store::path::Path;
@@ -134,6 +134,61 @@ const _: () = assert!(crate::MULTIPART_MAX_PARTS * MULTIPART_PART_SIZE >= 64 * 1
 /// compactor writing several objects at once must not open an unbounded
 /// number of connections per object.
 const MULTIPART_UPLOAD_CONCURRENCY: usize = 4;
+
+/// How many of a bounded whole-object read's ranged GETs
+/// ([`S3Store::get_whole_object`]) are in flight at once. Same reasoning and
+/// same value as [`MULTIPART_UPLOAD_CONCURRENCY`] on the write side: enough
+/// parallel connections that splitting a large read does not serialise its
+/// round trips, few enough that a query fetching many objects at once does not
+/// multiply its connection count by the chunk count of each.
+const WHOLE_OBJECT_GET_CONCURRENCY: usize = 4;
+
+/// Transfer rate the per-request body bound is sized against: 5 Mbps
+/// (0.625 MB/s), roughly 2000x below this deployment's line rate (same-region
+/// S3 from an r6a.4xlarge, up to 10 Gbps sustained).
+///
+/// This is a *floor*, not an estimate: it is the rate below which a request is
+/// treated as failed rather than slow. Sizing the bound against it is what lets
+/// [`S3HttpConfig::request_timeout`] stay a fixed number while the objects
+/// Ravel reads do not — see that field for the arithmetic.
+pub const FLOOR_TRANSFER_BYTES_PER_SEC: u64 = 625_000;
+
+/// The share of [`S3HttpConfig::request_timeout`] reserved for everything that
+/// is not body transfer: TCP connect, the TLS handshake, and S3's
+/// time-to-first-byte on a degraded path. Deducted before
+/// [`S3HttpConfig::max_request_body_bytes`] converts what is left into bytes at
+/// [`FLOOR_TRANSFER_BYTES_PER_SEC`].
+///
+/// Twice the 3 s [`S3HttpConfig::connect_timeout`], so a connect that consumes
+/// its whole budget still leaves room for a slow first byte.
+const REQUEST_OVERHEAD_ALLOWANCE: Duration = Duration::from_secs(6);
+
+/// Floor on [`S3HttpConfig::max_request_body_bytes`]. Below roughly this size
+/// the per-request round trip dominates the transfer, so a whole-object read
+/// split this finely costs more in requests than the bound buys back. A
+/// `request_timeout` configured so tight that the floor binds (under
+/// `REQUEST_OVERHEAD_ALLOWANCE + 1 MiB / FLOOR_TRANSFER_BYTES_PER_SEC`, about
+/// 7.7 s) cannot satisfy the floor-bandwidth criterion at any non-degenerate
+/// chunk size; the default satisfies it with margin, and the compile-time
+/// assertion below pins that.
+const MIN_REQUEST_BODY_BYTES: usize = 1024 * 1024;
+
+/// The [`S3HttpConfig::request_timeout`] default, named so the compile-time
+/// check below can state the criterion against it.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+
+// The criterion `request_timeout`'s doc comment states, checked at compile time
+// rather than left to a reader re-deriving it: the largest body any single
+// request carries (`MULTIPART_PART_SIZE`, the cap on both the multipart part
+// size and the whole-object read chunk) transfers inside the default timeout at
+// FLOOR_TRANSFER_BYTES_PER_SEC, with REQUEST_OVERHEAD_ALLOWANCE left over for
+// connect, TLS, and time-to-first-byte. Lowering the default timeout or raising
+// the part size without re-deriving the pair fails the build here.
+const _: () = assert!(
+    (MULTIPART_PART_SIZE as u64).div_ceil(FLOOR_TRANSFER_BYTES_PER_SEC)
+        + REQUEST_OVERHEAD_ALLOWANCE.as_secs()
+        <= DEFAULT_REQUEST_TIMEOUT.as_secs()
+);
 
 /// How [`S3Store`] sources AWS credentials (ADR-0106).
 ///
@@ -271,13 +326,37 @@ pub struct S3HttpConfig {
     /// Inherited default is 30 s. It must stay above the tail of the single
     /// largest request on the wire — an 8 MiB multipart part
     /// ([`MULTIPART_PART_SIZE`]) or a whole-object GET — even on a badly
-    /// degraded connection: 8 MiB at a pathological ~5 Mbps (0.625 MB/s, ~2000x
-    /// below this box's line rate) is ~13 s, plus connect and TLS. 20 s clears
-    /// that with margin while cutting a hung connection's slot occupancy by a
-    /// third versus the inherited 30 s. It is deliberately still conservative:
-    /// there is no tail-latency measurement in this repo to justify going lower
-    /// (toward ~10 s), and a timeout below the real tail turns a slow-but-
-    /// succeeding request into a retry storm. Tighten only with a measurement.
+    /// degraded connection.
+    ///
+    /// **The largest case is the read side, and it is bounded rather than
+    /// assumed.** A whole-object read is the only request whose size is set by
+    /// the data instead of by this crate: `max_l1_part_bytes` defaults to
+    /// 256 MiB, 32x an 8 MiB part, so a fixed timeout sized for a part cannot
+    /// also cover an unranged GET. [`S3Store::get`] therefore never issues one:
+    /// [`GetRange::Full`] is served as ranged requests of at most
+    /// [`S3HttpConfig::max_request_body_bytes`] each, which is derived from
+    /// *this field* — so the criterion holds for whatever value is configured
+    /// here, not only for the default.
+    ///
+    /// The arithmetic, for the largest request rather than the smallest: at the
+    /// default 20 s, [`REQUEST_OVERHEAD_ALLOWANCE`] takes 6 s for connect, TLS,
+    /// and time-to-first-byte, leaving 14 s of transfer. At a pathological
+    /// ~5 Mbps ([`FLOOR_TRANSFER_BYTES_PER_SEC`], 0.625 MB/s, ~2000x below this
+    /// box's line rate) that carries 8.75 MB, and the bound is capped at
+    /// [`MULTIPART_PART_SIZE`] (8 MiB = 8.39 MB, ~13.4 s at the floor) so read
+    /// and write share one largest-request-on-the-wire. A 256 MiB L1 compaction
+    /// part is then 32 requests that each fit the timeout, not one ~410 s
+    /// request against a 20 s ceiling that can only time out and burn the retry
+    /// budget re-attempting a request that never fits. A compile-time assertion
+    /// next to those constants pins the inequality.
+    ///
+    /// 20 s also cuts a hung connection's slot occupancy by a third versus the
+    /// inherited 30 s. It is deliberately still conservative: there is no
+    /// tail-latency measurement in this repo to justify going lower (toward
+    /// ~10 s), and a timeout below the real tail turns a slow-but-succeeding
+    /// request into a retry storm. Tighten only with a measurement — and note
+    /// that tightening it also shrinks `max_request_body_bytes`, so a
+    /// whole-object read pays it back in extra requests.
     pub request_timeout: Duration,
     /// TCP + TLS connect-phase timeout.
     ///
@@ -307,10 +386,40 @@ pub struct S3HttpConfig {
     pub http2_keep_alive_timeout: Duration,
 }
 
+impl S3HttpConfig {
+    /// The largest body a single request may carry and still finish inside
+    /// [`S3HttpConfig::request_timeout`] at [`FLOOR_TRANSFER_BYTES_PER_SEC`],
+    /// after [`REQUEST_OVERHEAD_ALLOWANCE`] is set aside for connect, TLS, and
+    /// time-to-first-byte.
+    ///
+    /// This is what makes the timeout's criterion something the code satisfies
+    /// rather than something the doc asserts: [`S3Store::get`] splits a
+    /// [`GetRange::Full`] read into ranged requests of at most this many bytes,
+    /// so no request on the wire is larger than the timeout can carry. Capped
+    /// at [`MULTIPART_PART_SIZE`] so the read and write paths share one largest
+    /// request, and floored at [`MIN_REQUEST_BODY_BYTES`] so an extremely tight
+    /// configured timeout degrades into more requests rather than into
+    /// unboundedly many.
+    ///
+    /// A caller-supplied [`GetRange::Range`] is *not* bounded by this: the
+    /// caller asked for exactly those bytes, and silently splitting a range the
+    /// caller sized itself would hide the cost from the code that chose it.
+    pub fn max_request_body_bytes(&self) -> usize {
+        let transfer_budget = self
+            .request_timeout
+            .saturating_sub(REQUEST_OVERHEAD_ALLOWANCE);
+        let millis = u64::try_from(transfer_budget.as_millis()).unwrap_or(u64::MAX);
+        let bytes = millis.saturating_mul(FLOOR_TRANSFER_BYTES_PER_SEC) / 1000;
+        usize::try_from(bytes)
+            .unwrap_or(usize::MAX)
+            .clamp(MIN_REQUEST_BODY_BYTES, MULTIPART_PART_SIZE)
+    }
+}
+
 impl Default for S3HttpConfig {
     fn default() -> Self {
         S3HttpConfig {
-            request_timeout: Duration::from_secs(20),
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
             connect_timeout: Duration::from_secs(3),
             pool_idle_timeout: Duration::from_secs(30),
             http2_keep_alive_interval: Duration::from_secs(10),
@@ -353,6 +462,11 @@ fn client_options(http: &S3HttpConfig) -> ClientOptions {
 pub struct S3Store {
     store: AmazonS3,
     page_size: usize,
+    /// Largest body [`S3Store::get_whole_object`] asks for in one request,
+    /// resolved once from the [`S3HttpConfig`] this store was built with
+    /// ([`S3HttpConfig::max_request_body_bytes`]) so the per-request derivation
+    /// is not repeated on every read.
+    max_get_chunk: usize,
     /// `Some` only when [`S3Config::credentials_file`] was set; kept
     /// alongside the `AmazonS3` client (which holds its own clone as an
     /// opaque `object_store::CredentialProvider` trait object) purely so
@@ -399,6 +513,7 @@ impl S3Store {
         Ok(S3Store {
             store,
             page_size: LIST_PAGE_SIZE,
+            max_get_chunk: http.max_request_body_bytes(),
             credential_provider,
             instance_role_provider,
             multipart_abort_failures: AtomicU64::new(0),
@@ -1069,6 +1184,165 @@ impl S3Store {
             }
         }
     }
+
+    /// One GET, ranged or not, reduced to the three things this adapter needs
+    /// from it. `if_match` rides along as an `If-Match` precondition, used by
+    /// [`S3Store::get_whole_object`] to pin every request of a split read to
+    /// one version of the object.
+    async fn get_one(
+        &self,
+        key: &str,
+        range: Option<OsGetRange>,
+        if_match: Option<String>,
+    ) -> Result<GetChunk, StoreError> {
+        let result = self
+            .store
+            .get_opts(
+                &path_of(key),
+                OsGetOptions {
+                    range,
+                    if_match,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(map_get_error)?;
+        let etag = result
+            .meta
+            .e_tag
+            .clone()
+            .ok_or_else(|| StoreError::Permanent(format!("S3 returned no ETag for {key}")))?;
+        // For a partial response this is the total object size parsed out of
+        // `Content-Range`, not the length of the slice returned, which is what
+        // makes one bounded request enough to learn how many more to issue.
+        let total_size = result.meta.size;
+        let data = result.bytes().await.map_err(map_error_common)?;
+        Ok(GetChunk {
+            data,
+            etag,
+            total_size,
+        })
+    }
+
+    /// [`GetRange::Full`] as bounded requests: complete-object semantics for
+    /// the caller, no single request larger than
+    /// [`S3HttpConfig::max_request_body_bytes`] on the wire.
+    ///
+    /// An unranged GET is the only request this adapter issues whose size the
+    /// data decides rather than this crate, so it is the one that can outgrow
+    /// [`S3HttpConfig::request_timeout`] — a 256 MiB L1 compaction part cannot
+    /// finish inside 20 s at the floor rate the timeout is sized against, and
+    /// retrying it only re-runs a request that never fits. Splitting it makes
+    /// every request one the timeout can carry.
+    ///
+    /// **Cost.** An object at or below the chunk size is exactly one request,
+    /// as before; above it, `ceil(size / chunk)` requests, up to
+    /// [`WHOLE_OBJECT_GET_CONCURRENCY`] of them in flight. Wire bytes are
+    /// unchanged (the ranges partition the object exactly and none overlap)
+    /// apart from one extra set of response headers per additional request;
+    /// neither figure counts `object_store`'s internal retries, which sit
+    /// inside each request.
+    ///
+    /// **One version, or an error.** Every request after the first carries the
+    /// first's ETag as an `If-Match`, so an object overwritten mid-read fails
+    /// the read instead of splicing two versions into one buffer. Data objects
+    /// are immutable, so this is a guard on the mutable-pointer keys, and those
+    /// are small enough to take the single-request path anyway.
+    async fn get_whole_object(&self, key: &str) -> Result<GetOutcome, StoreError> {
+        let chunk = self.max_get_chunk as u64;
+        let first = match self
+            .get_one(key, Some(OsGetRange::Bounded(0..chunk)), None)
+            .await
+        {
+            Ok(first) => first,
+            // A zero-byte object has no satisfiable range, so a ranged request
+            // for one is a 416. That is the single whole-object read the
+            // bounded form cannot express; re-issue it unranged, where an empty
+            // body is a legal 200. `GetRange::Full` carries no caller range, so
+            // an unsatisfiable range here can only mean an empty object.
+            Err(StoreError::InvalidRange(_)) => {
+                let whole = self.get_one(key, None, None).await?;
+                return Ok(GetOutcome {
+                    data: whole.data,
+                    etag: Etag(whole.etag.clone()),
+                    version: Version(whole.etag),
+                    total_size: whole.total_size,
+                });
+            }
+            Err(e) => return Err(e),
+        };
+
+        let total_size = first.total_size;
+        if first.data.len() as u64 >= total_size {
+            return Ok(GetOutcome {
+                data: first.data,
+                etag: Etag(first.etag.clone()),
+                version: Version(first.etag),
+                total_size,
+            });
+        }
+
+        let mut ranges = Vec::new();
+        let mut offset = first.data.len() as u64;
+        while offset < total_size {
+            let end = (offset + chunk).min(total_size);
+            ranges.push(offset..end);
+            offset = end;
+        }
+
+        let capacity = usize::try_from(total_size).map_err(|_| {
+            StoreError::Permanent(format!(
+                "get of {key}: object of {total_size} bytes does not fit in memory"
+            ))
+        })?;
+        let mut data = BytesMut::with_capacity(capacity);
+        data.extend_from_slice(&first.data);
+
+        // `buffered`, not `buffer_unordered`: the pieces are concatenated in
+        // issue order, so they must be yielded in issue order.
+        let etag = first.etag.clone();
+        {
+            let mut inflight = futures::stream::iter(ranges.into_iter().map(|range| {
+                self.get_one(key, Some(OsGetRange::Bounded(range)), Some(etag.clone()))
+            }))
+            .buffered(WHOLE_OBJECT_GET_CONCURRENCY);
+            while let Some(piece) = inflight.next().await {
+                let piece = piece.map_err(|e| match e {
+                    // The `If-Match` failed: the object was overwritten between
+                    // this read's first request and this one. Retryable,
+                    // because a fresh read sees one consistent version.
+                    StoreError::PreconditionFailed => StoreError::Transient(format!(
+                        "get of {key}: object was overwritten during a bounded whole-object read"
+                    )),
+                    other => other,
+                })?;
+                data.extend_from_slice(&piece.data);
+            }
+        }
+
+        if data.len() as u64 != total_size {
+            return Err(StoreError::Transient(format!(
+                "get of {key}: assembled {} bytes from bounded requests, expected {total_size}",
+                data.len()
+            )));
+        }
+        Ok(GetOutcome {
+            data: data.freeze(),
+            etag: Etag(first.etag.clone()),
+            version: Version(first.etag),
+            total_size,
+        })
+    }
+}
+
+/// One GET response reduced to what [`ObjectStoreBackend::get`] needs:
+/// the bytes it returned, the object's ETag, and the object's *total* size
+/// (from `Content-Range` on a partial response, so it is the whole object's
+/// size even when the body is one chunk of it).
+struct GetChunk {
+    data: Bytes,
+    etag: String,
+    total_size: u64,
 }
 
 #[async_trait::async_trait]
@@ -1137,7 +1411,10 @@ impl ObjectStoreBackend for S3Store {
 
     async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
         let os_range = match range {
-            GetRange::Full => None,
+            // The one request whose size the caller does not choose, so the one
+            // that has to be bounded here to stay inside
+            // `S3HttpConfig::request_timeout`.
+            GetRange::Full => return self.get_whole_object(key).await,
             GetRange::Range(start, end) => {
                 if start >= end {
                     return Err(StoreError::InvalidRange(format!(
@@ -1151,30 +1428,12 @@ impl ObjectStoreBackend for S3Store {
             }
             GetRange::Suffix(n) => Some(OsGetRange::Suffix(n)),
         };
-        let path = path_of(key);
-        let result = self
-            .store
-            .get_opts(
-                &path,
-                OsGetOptions {
-                    range: os_range,
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(map_get_error)?;
-        let etag = result
-            .meta
-            .e_tag
-            .clone()
-            .ok_or_else(|| StoreError::Permanent(format!("S3 returned no ETag for {key}")))?;
-        let total_size = result.meta.size;
-        let data = result.bytes().await.map_err(map_error_common)?;
+        let chunk = self.get_one(key, os_range, None).await?;
         Ok(GetOutcome {
-            data,
-            etag: Etag(etag.clone()),
-            version: Version(etag),
-            total_size,
+            data: chunk.data,
+            etag: Etag(chunk.etag.clone()),
+            version: Version(chunk.etag),
+            total_size: chunk.total_size,
         })
     }
 
