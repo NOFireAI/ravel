@@ -71,15 +71,16 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures::StreamExt;
 use object_store::aws::{AmazonS3, AmazonS3Builder, AwsCredentialProvider};
 use object_store::path::Path;
 use object_store::{
-    GetOptions as OsGetOptions, GetRange as OsGetRange, MultipartUpload as OsMultipartUpload,
-    ObjectStore, ObjectStoreExt, PutMode as OsPutMode, PutOptions as OsPutOptions, PutPayload,
-    UpdateVersion,
+    ClientOptions, GetOptions as OsGetOptions, GetRange as OsGetRange,
+    MultipartUpload as OsMultipartUpload, ObjectStore, ObjectStoreExt, PutMode as OsPutMode,
+    PutOptions as OsPutOptions, PutPayload, UpdateVersion,
 };
 
 use crate::{
@@ -228,6 +229,125 @@ pub struct S3Config {
     pub instance_metadata_endpoint: Option<String>,
 }
 
+/// Deliberate HTTP-client tuning for the S3 backend (#851).
+///
+/// `object_store` builds its `AmazonS3` client on inherited `ClientOptions`
+/// defaults unless a `ClientOptions` is installed: a 30 s request timeout, a
+/// 5 s connect timeout, and no pool-idle cap (reqwest's ~90 s). None of those
+/// numbers were chosen by this repo, and the request timeout in particular is
+/// a hole in the deadline model: on the read path Ravel runs (same-region S3,
+/// r6a.4xlarge, up to 10 Gbps sustained, hundreds of concurrent fetches per
+/// query) a single hung connection holds a concurrency slot for 30 s while the
+/// query's own deadline is usually shorter, so the timeout never fires as a
+/// safety net. Every value below is set on purpose, with the reasoning that
+/// set it, so a future reader can retune from evidence rather than guess.
+///
+/// This is a separate struct rather than fields on [`S3Config`] because
+/// `S3Config` is built by struct literal (no `..default`) in several crates
+/// outside this one's edit scope; adding fields there would not compile.
+/// [`S3Store::new`] applies [`S3HttpConfig::default`]; [`S3Store::with_http_config`]
+/// overrides it. The default values are the deliberate choices; the fields
+/// exist so tests and unusual deployments can set a non-default value that
+/// reaches the client.
+///
+/// **Retry interaction / worst case.** `object_store` runs its own internal
+/// retry loop per logical operation (`RetryConfig`, unchanged here: default
+/// `max_retries = 10`, `retry_timeout = 180 s`, jittered exponential backoff),
+/// and a request timeout is a *retryable* error. The loop checks its budget
+/// *before* each retry, so no new attempt starts once 180 s have elapsed since
+/// the first, but the final in-flight attempt still runs its full
+/// `request_timeout`. The worst-case wall time for one logical operation is
+/// therefore about `retry_timeout + request_timeout` = 180 s + 20 s ≈ 200 s of
+/// internal retrying. In practice every caller passes a deadline and the trait
+/// honors cancellation by drop (docs/object-store-contract.md, "Rules for
+/// callers"), so the query deadline — typically well under 180 s — bounds one
+/// operation first. Lowering `request_timeout` shortens each attempt but does
+/// not change this 180 s ceiling; only `RetryConfig` would, and tuning it is
+/// out of this change's scope.
+#[derive(Debug, Clone)]
+pub struct S3HttpConfig {
+    /// Overall per-request timeout: connect through response-body-complete.
+    ///
+    /// Inherited default is 30 s. It must stay above the tail of the single
+    /// largest request on the wire — an 8 MiB multipart part
+    /// ([`MULTIPART_PART_SIZE`]) or a whole-object GET — even on a badly
+    /// degraded connection: 8 MiB at a pathological ~5 Mbps (0.625 MB/s, ~2000x
+    /// below this box's line rate) is ~13 s, plus connect and TLS. 20 s clears
+    /// that with margin while cutting a hung connection's slot occupancy by a
+    /// third versus the inherited 30 s. It is deliberately still conservative:
+    /// there is no tail-latency measurement in this repo to justify going lower
+    /// (toward ~10 s), and a timeout below the real tail turns a slow-but-
+    /// succeeding request into a retry storm. Tighten only with a measurement.
+    pub request_timeout: Duration,
+    /// TCP + TLS connect-phase timeout.
+    ///
+    /// Inherited default is 5 s. An in-region connect completes in single-digit
+    /// to low-tens of milliseconds; the Linux initial SYN retransmit is ~1 s, so
+    /// 3 s tolerates one lost SYN with margin while failing a black-holed path
+    /// ~40% faster than the 5 s default, letting a retry re-dial a fresh 5-tuple
+    /// within a typical query deadline. AWS's own latency-sensitive guidance
+    /// (cited by `object_store`'s `ClientOptions::default`) recommends ~3.1 s.
+    pub connect_timeout: Duration,
+    /// How long an idle pooled connection is kept before it is recycled.
+    ///
+    /// Inherited default is unset (reqwest keeps idle connections ~90 s).
+    /// Hundreds of concurrent fetches per query reuse warm TLS across back-to-
+    /// back query phases (sub-second to few-second gaps), so we keep a generous
+    /// window rather than tearing connections down after each wave — but we cap
+    /// it below reqwest's ~90 s so a connection an intermediary or S3 silently
+    /// half-closed during a longer idle gap is recycled locally before it is
+    /// handed to a new request (reusing a dead socket costs a broken-pipe plus a
+    /// retry). 30 s balances warm reuse against stale-socket risk; the exact
+    /// value wants a keep-alive/idle-close measurement against the real endpoint.
+    pub pool_idle_timeout: Duration,
+    /// HTTP/2 keep-alive ping interval. See the type note on why this is inert
+    /// under the HTTP/1.1 default we keep.
+    pub http2_keep_alive_interval: Duration,
+    /// HTTP/2 keep-alive ping acknowledgement timeout. See the type note.
+    pub http2_keep_alive_timeout: Duration,
+}
+
+impl Default for S3HttpConfig {
+    fn default() -> Self {
+        S3HttpConfig {
+            request_timeout: Duration::from_secs(20),
+            connect_timeout: Duration::from_secs(3),
+            pool_idle_timeout: Duration::from_secs(30),
+            http2_keep_alive_interval: Duration::from_secs(10),
+            http2_keep_alive_timeout: Duration::from_secs(10),
+        }
+    }
+}
+
+/// Build the `object_store` [`ClientOptions`] from an [`S3HttpConfig`], setting
+/// every value #851 cares about explicitly rather than inheriting it.
+///
+/// **HTTP/2 keep-alive is set but inert under the transport we use.**
+/// `object_store`'s `ClientOptions` default is HTTP/1.1-only (arrow-rs#5194:
+/// HTTP/2 is measurably slower for the bulk transfers S3 reads are), and we do
+/// not force HTTP/2, so reqwest never negotiates it and the keep-alive ping
+/// knobs below never fire. They are set anyway so the client is correct *if* a
+/// future deployment enables HTTP/2: a black-holed connection is then detected
+/// within ~interval+timeout (≈20 s) instead of only at `request_timeout`.
+/// `with_http2_keep_alive_while_idle` extends that detection to connections
+/// sitting idle in the pool, not only those with an active stream. Under the
+/// HTTP/1.1 default that actually runs, connection liveness is covered by
+/// `connect_timeout` (dead connect), the request timeout (hung request), and
+/// `pool_idle_timeout` (stale pooled socket) instead.
+///
+/// `pool_max_idle_per_host` is deliberately left unset (no cap): hundreds of
+/// concurrent per-query fetches want a large warm pool, and an idle cap would
+/// force reconnect churn under exactly the load this deployment runs.
+fn client_options(http: &S3HttpConfig) -> ClientOptions {
+    ClientOptions::new()
+        .with_timeout(http.request_timeout)
+        .with_connect_timeout(http.connect_timeout)
+        .with_pool_idle_timeout(http.pool_idle_timeout)
+        .with_http2_keep_alive_interval(http.http2_keep_alive_interval)
+        .with_http2_keep_alive_timeout(http.http2_keep_alive_timeout)
+        .with_http2_keep_alive_while_idle()
+}
+
 /// S3 / MinIO backend implementing [`ObjectStoreBackend`] over
 /// `object_store`'s `AmazonS3` client.
 pub struct S3Store {
@@ -260,8 +380,19 @@ pub struct S3Store {
 }
 
 impl S3Store {
+    /// Build with the deliberate [`S3HttpConfig::default`] HTTP-client tuning
+    /// (#851). Every current caller uses this; it sets the request/connect/
+    /// pool-idle timeouts and HTTP/2 keep-alive explicitly rather than
+    /// inheriting `object_store`'s defaults.
     pub fn new(config: S3Config) -> Result<Self, StoreError> {
-        let (builder, credential_provider, instance_role_provider) = Self::builder(&config)?;
+        Self::with_http_config(config, S3HttpConfig::default())
+    }
+
+    /// Build with an explicit [`S3HttpConfig`], overriding the default HTTP
+    /// client tuning (#851). Exists so an unusual deployment or a test can set
+    /// a non-default timeout and have it reach the constructed client.
+    pub fn with_http_config(config: S3Config, http: S3HttpConfig) -> Result<Self, StoreError> {
+        let (builder, credential_provider, instance_role_provider) = Self::builder(&config, &http)?;
         let store = builder
             .build()
             .map_err(|e| StoreError::Permanent(format!("failed to build S3 client: {e}")))?;
@@ -354,6 +485,7 @@ impl S3Store {
     #[allow(clippy::type_complexity)]
     fn builder(
         config: &S3Config,
+        http: &S3HttpConfig,
     ) -> Result<
         (
             AmazonS3Builder,
@@ -362,9 +494,14 @@ impl S3Store {
         ),
         StoreError,
     > {
+        // Install the explicit HTTP client tuning (#851) first: the per-knob
+        // client setters below (`with_allow_http`) mutate the same
+        // `ClientOptions`, whereas `with_client_options` replaces it wholesale,
+        // so it has to come before them or it would clobber `allow_http`.
         let mut builder = AmazonS3Builder::new()
             .with_bucket_name(&config.bucket)
-            .with_region(&config.region);
+            .with_region(&config.region)
+            .with_client_options(client_options(http));
         // The inline key setters exist only under Static: `InstanceRole` never
         // signs with a static key, and setting one would be exactly the mix the
         // check below forbids.
@@ -1370,10 +1507,13 @@ mod tests {
         let config = test_config();
         assert!(config.kms_key_id.is_none());
 
-        // The historical build path, reproduced verbatim without any KMS knob.
+        // The historical build path, reproduced verbatim without any KMS knob,
+        // plus the #851 client options every build now installs (in the same
+        // position `builder` sets them, before the per-knob client setters).
         let mut baseline = AmazonS3Builder::new()
             .with_bucket_name(&config.bucket)
             .with_region(&config.region)
+            .with_client_options(client_options(&S3HttpConfig::default()))
             .with_access_key_id(&config.access_key_id)
             .with_secret_access_key(&config.secret_access_key)
             .with_allow_http(config.allow_http)
@@ -1385,7 +1525,9 @@ mod tests {
         assert_eq!(
             format!(
                 "{:?}",
-                S3Store::builder(&config).expect("no credentials file").0
+                S3Store::builder(&config, &S3HttpConfig::default())
+                    .expect("no credentials file")
+                    .0
             ),
             format!("{baseline:?}"),
             "None kms_key_id must not change the builder"
@@ -1397,7 +1539,9 @@ mod tests {
         assert_ne!(
             format!(
                 "{:?}",
-                S3Store::builder(&with_key).expect("no credentials file").0
+                S3Store::builder(&with_key, &S3HttpConfig::default())
+                    .expect("no credentials file")
+                    .0
             ),
             format!("{baseline:?}"),
             "Some kms_key_id must change the builder"
@@ -1412,16 +1556,97 @@ mod tests {
         assert_ne!(
             format!(
                 "{:?}",
-                S3Store::builder(&with_token)
+                S3Store::builder(&with_token, &S3HttpConfig::default())
                     .expect("no credentials file")
                     .0
             ),
             format!(
                 "{:?}",
-                S3Store::builder(&baseline).expect("no credentials file").0
+                S3Store::builder(&baseline, &S3HttpConfig::default())
+                    .expect("no credentials file")
+                    .0
             ),
             "a session token must change the builder"
         );
+    }
+
+    /// Every HTTP-client value #851 sets is installed on the builder `.build()`
+    /// consumes, and matches what [`client_options`] produced. The builder's
+    /// `get_config_value` is the observable seam: the built `AmazonS3` client
+    /// exposes no config readback, so a refactor that dropped
+    /// `.with_client_options(..)` in [`S3Store::builder`] would make these read
+    /// back `object_store`'s inherited defaults and fail here rather than
+    /// silently reverting the timeouts. Flip: delete the `.with_client_options`
+    /// call in `builder` and the `Timeout` case (and the inherited-vs-configured
+    /// assertion below) fail, the latter because the builder then reads the
+    /// inherited "30s".
+    #[test]
+    fn http_client_options_reach_the_builder() {
+        use object_store::ClientConfigKey;
+        use object_store::aws::AmazonS3ConfigKey;
+
+        let http = S3HttpConfig::default();
+        let reference = client_options(&http);
+        let builder = S3Store::builder(&test_config(), &http)
+            .expect("no credentials file")
+            .0;
+
+        for key in [
+            ClientConfigKey::Timeout,
+            ClientConfigKey::ConnectTimeout,
+            ClientConfigKey::PoolIdleTimeout,
+            ClientConfigKey::Http2KeepAliveInterval,
+            ClientConfigKey::Http2KeepAliveTimeout,
+            ClientConfigKey::Http2KeepAliveWhileIdle,
+        ] {
+            assert_eq!(
+                builder.get_config_value(&AmazonS3ConfigKey::Client(key)),
+                reference.get_config_value(&key),
+                "builder must carry the configured {key:?}"
+            );
+        }
+
+        // The request timeout specifically must be the deliberate value, not
+        // object_store's inherited 30 s default -- the exact hole #851 closes.
+        let inherited = ClientOptions::default().get_config_value(&ClientConfigKey::Timeout);
+        let configured =
+            builder.get_config_value(&AmazonS3ConfigKey::Client(ClientConfigKey::Timeout));
+        assert_ne!(
+            configured, inherited,
+            "the request timeout must be deliberately set, not inherited (30s)"
+        );
+    }
+
+    /// A non-default value set through the config mechanism ([`S3HttpConfig`],
+    /// applied via [`S3Store::with_http_config`]/[`S3Store::builder`]) reaches
+    /// the client, so the values are configurable and not just hard-coded.
+    #[test]
+    fn non_default_http_config_reaches_the_client() {
+        use object_store::ClientConfigKey;
+        use object_store::aws::AmazonS3ConfigKey;
+
+        let http = S3HttpConfig {
+            // Not the 20 s default, nor object_store's 30 s inherited default.
+            request_timeout: Duration::from_secs(7),
+            ..S3HttpConfig::default()
+        };
+        let builder = S3Store::builder(&test_config(), &http)
+            .expect("no credentials file")
+            .0;
+        let got = builder.get_config_value(&AmazonS3ConfigKey::Client(ClientConfigKey::Timeout));
+        assert_eq!(
+            got,
+            client_options(&http).get_config_value(&ClientConfigKey::Timeout),
+            "a non-default request timeout set through config must reach the client"
+        );
+        assert_ne!(
+            got,
+            client_options(&S3HttpConfig::default()).get_config_value(&ClientConfigKey::Timeout),
+            "the configured value must differ from the default, proving the path is live"
+        );
+        // The full construction path (build() included) accepts the override.
+        S3Store::with_http_config(test_config(), http)
+            .expect("a non-default http config must build");
     }
 
     /// Stand up a minimal always-succeeding mock IMDS on an ephemeral loopback
@@ -1500,7 +1725,7 @@ mod tests {
                 ("session_token", with_token),
                 ("credentials_file", with_file),
             ] {
-                let err = S3Store::builder(&config)
+                let err = S3Store::builder(&config, &S3HttpConfig::default())
                     .expect_err(&format!("InstanceRole + {label} must be rejected"));
                 assert!(
                     matches!(err, StoreError::Permanent(_)),
@@ -1510,7 +1735,7 @@ mod tests {
 
             // All-absent against the same working endpoint builds cleanly: the
             // rejections above are the mix guard, not a blanket refusal.
-            S3Store::builder(&clean)
+            S3Store::builder(&clean, &S3HttpConfig::default())
                 .expect("all-absent InstanceRole must build against a working IMDS");
         })
         .await
@@ -1538,16 +1763,18 @@ mod tests {
         let (instance_debug, baseline_debug) = tokio::task::spawn_blocking(move || {
             let instance_debug = format!(
                 "{:?}",
-                S3Store::builder(&instance_role)
+                S3Store::builder(&instance_role, &S3HttpConfig::default())
                     .expect("instance-role builder must construct against the mock")
                     .0
             );
-            // Every non-credential setter the InstanceRole path applies, with
-            // no key setters and no provider: the one difference must be the
-            // installed credential provider.
+            // Every non-credential setter the InstanceRole path applies (the
+            // #851 client options included), with no key setters and no
+            // provider: the one difference must be the installed credential
+            // provider.
             let mut baseline = AmazonS3Builder::new()
                 .with_bucket_name(&baseline_config.bucket)
                 .with_region(&baseline_config.region)
+                .with_client_options(client_options(&S3HttpConfig::default()))
                 .with_allow_http(baseline_config.allow_http)
                 .with_virtual_hosted_style_request(!baseline_config.force_path_style);
             if let Some(endpoint) = &baseline_config.endpoint {
@@ -1579,7 +1806,8 @@ mod tests {
         let mut config = test_config();
         config.session_token = Some("inline-token".to_string());
         config.credentials_file = Some(path);
-        let (_, provider, _) = S3Store::builder(&config).expect("valid credentials file");
+        let (_, provider, _) =
+            S3Store::builder(&config, &S3HttpConfig::default()).expect("valid credentials file");
         let provider = provider.expect("a credentials file must produce a provider");
         let credential = provider.get_credential().await.expect("file credentials");
         assert_eq!(
