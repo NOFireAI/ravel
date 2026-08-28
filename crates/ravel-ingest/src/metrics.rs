@@ -3,13 +3,17 @@
 //!
 //! # Counting convention
 //!
-//! Every counter here is a monotonic process-global total. There is **no
-//! per-shard and no per-tenant dimension**: a single [`IngestMetrics`] is
-//! constructed once by the router and shared by every shard actor through an
-//! `Arc`, so a value is the sum across all shards and all tenants of this
-//! process. The dimensioned model docs/ingest.md describes (per-shard buffered
-//! bytes/points, per-shard latency histograms, per-tenant accepted/rejected
-//! points) is not implemented here; that doc marks it as tracked future work.
+//! Every counter in [`IngestMetricsSnapshot`] is a monotonic process-global
+//! total with **no per-shard and no per-tenant dimension**: a single
+//! [`IngestMetrics`] is constructed once by the router and shared by every
+//! shard actor through an `Arc`, so a value is the sum across all shards and
+//! all tenants of this process. Two per-shard dimensions sit outside that flat
+//! snapshot, each read through its own accessor: the in-flight-flush gauge
+//! ([`IngestMetrics::in_flight_flushes_by_shard`]) and the ingest-skew figures
+//! ([`IngestMetrics::shard_skew_by_shard`], issue #865: per-shard message
+//! throughput, queue depth, and the on-actor/off-actor time split). The
+//! per-tenant dimensioned model and per-shard latency histograms docs/ingest.md
+//! still lists as future work are not implemented here.
 //!
 //! Two timing conventions coexist, and mixing them up misreads the numbers:
 //!
@@ -633,13 +637,19 @@ mod tests {
         let metrics = IngestMetrics::default();
         metrics.record_shard_processed(2, 0);
         let skew = metrics.shard_skew_by_shard();
-        assert_eq!(skew, vec![(2, ShardSkewStats {
-            messages_enqueued: 0,
-            messages_processed: 1,
-            queue_depth: 0,
-            on_actor_ns: 0,
-            off_actor_ns: 0,
-        })]);
+        assert_eq!(
+            skew,
+            vec![(
+                2,
+                ShardSkewStats {
+                    messages_enqueued: 0,
+                    messages_processed: 1,
+                    queue_depth: 0,
+                    on_actor_ns: 0,
+                    off_actor_ns: 0,
+                }
+            )]
+        );
     }
 
     #[test]

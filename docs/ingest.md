@@ -831,8 +831,34 @@ Counters recorded today:
   `max_inflight_flushes` at its default of 1, this never exceeds
   `shard_count`.
 
-Tracked future work (not yet implemented): a per-shard
-and per-tenant dimensioned model — per-shard buffered bytes/points, flush
-build/put/commit latency histograms, ack latency, and queue depth; per-tenant
-accepted/rejected points and bytes. It requires a metrics backend that these
-flat atomics do not provide and is out of scope for the counters above.
+### Per-shard skew (issue #865)
+
+To make per-shard ingest skew measurable -- so an argument about shard-actor
+throughput rests on data, not assertion -- `IngestMetrics` also carries a
+per-shard dimension, read via `IngestMetrics::shard_skew_by_shard()` (and
+reachable from a benchmark through `IngestRouter::metrics()`, the same handle
+`in_flight_flushes_by_shard` is read through). It is not part of the flat
+`IngestMetricsSnapshot`, whose `Copy` shape holds no per-shard dimension, so the
+process `/metrics` surface renders it no more than it renders per-shard
+in-flight flushes today; wiring either into an operator scrape is a follow-up in
+`services/ravel-server`. Per shard (`ShardSkewStats`):
+
+- `messages_enqueued`: `Write` messages the router sent into the shard's
+  channel, counted at the router's `send`.
+- `messages_processed`: `Write` messages the shard actor pulled and handled.
+  `FlushNow`/`Shutdown` are excluded from both counts: they are control
+  messages, not ingest load.
+- `queue_depth`: `messages_enqueued - messages_processed` at read time
+  (saturating), the messages still in the channel.
+- `on_actor_ns` vs `off_actor_ns`: injected-`Clock` nanoseconds spent in the
+  actor's serial merge/pin section versus in the flush task ADR-0067 runs off
+  the actor (encode plus both PUTs). The split is the point: without it a
+  measurement cannot tell an actor-thread bottleneck from a flush bottleneck.
+  The actor returns from `handle_write` once the flush task is spawned, so its
+  on-actor time never includes the flush.
+
+Still tracked future work (not yet implemented): a per-tenant dimensioned
+model and per-shard latency histograms -- per-shard buffered bytes/points,
+flush build/put/commit and ack latency distributions; per-tenant
+accepted/rejected points and bytes. Those require a metrics backend that these
+flat atomics and the per-shard maps above do not provide.
