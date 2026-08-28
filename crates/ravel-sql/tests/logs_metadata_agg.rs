@@ -14,10 +14,19 @@
 //! or an omitted dictionary) the rule declines and the plan keeps its
 //! `LogsScanExec`.
 //!
-//! These build the loaded statistics by hand and inject them with
+//! Most of these build the loaded statistics by hand and inject them with
 //! `LogsTableProvider::with_column_stats`, so no fold runs: the object under
 //! test is the query-side rewrite, and a hand-built `LoadedColumnStats` is the
 //! exact input the resolver would have threaded down.
+//!
+//! The equivalence tests at the end of the file are the exception, and they
+//! carry the property the whole optimization rests on: over one real RLOG
+//! corpus, the REWRITTEN answer equals the SCANNED answer for the same query.
+//! They write real objects, derive the statistics from those same records, and
+//! run each statement twice -- once with statistics loaded (rewrite eligible)
+//! and once with none (rewrite ineligible, so the scan runs) -- asserting the
+//! two agree. An assertion over fabricated statistics alone cannot catch a
+//! rewrite that answers a different question than the one asked.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -29,8 +38,10 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::physical_plan::{collect, displayable};
 use datafusion::prelude::SessionContext;
 use ravel_catalog::{EntryIdentity, LoadedColumnStats, SegmentLevel, SegmentRef, Snapshot};
-use ravel_object_store::ObjectStoreBackend;
+use ravel_logseg::writer::ObjectIdentity;
+use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
 use ravel_object_store::memory::MemoryStore;
+use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_proto::catalog::v1::{ColumnStat, ColumnStatsSegment, ColumnValue, DictEntry};
 use ravel_query::LogSegmentFetcher;
 use ravel_sql::{
@@ -39,6 +50,7 @@ use ravel_sql::{
 };
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
+use ravel_types::logstream::log_stream_id;
 use uuid::Uuid;
 
 mod util;
@@ -499,6 +511,158 @@ async fn non_declared_column_declines_and_keeps_the_scan() {
     );
 }
 
+/// A `ts` bound that CLIPS a touched segment invalidates every folded
+/// whole-segment figure, so q02 must decline.
+///
+/// This is the non-obvious reachable case (#850 wave-0 checkpoint): segments
+/// are resolved on OVERLAP, and `LogsTableProvider::supports_filters_pushdown`
+/// reports a pure `ts` bound `Exact`, so DataFusion deletes the ts
+/// `FilterExec` outright and the bound survives only inside the scan's
+/// `ts_min`/`ts_max`. The surviving `status <> 404` filter is then the single
+/// `FilterExec` the rule admits, and the rewrite fires over segments whose
+/// dictionaries describe rows the query excludes.
+///
+/// Both fixture segments span ts 0..=1_000, so `ts < 500` clips both. Before
+/// the fix `declared_not_equal_count` consulted only `erasure` and returned 8,
+/// the whole-segment total: byte-for-byte the answer to the query WITHOUT the
+/// ts bound. A per-segment dictionary carries no intra-segment time
+/// distribution, so the clipped count cannot be derived from it and declining
+/// is the only exact option.
+#[tokio::test]
+async fn q02_clipping_ts_bound_declines_and_keeps_the_scan() {
+    let store = CountingStore::new(Arc::new(MemoryStore::new()));
+    let (a, b) = two_status_segments();
+    let stats = status_stats(&a, &b);
+    let snapshot = snapshot_of(vec![a, b], Vec::new());
+    let ctx = logs_session(provider(&store, snapshot, status_col(), Some(stats))).expect("session");
+
+    let plan = ctx
+        .sql(
+            "SELECT COUNT(*) FROM logs WHERE status <> 404 \
+             AND ts < TIMESTAMP '1970-01-01 00:00:00.000000500'",
+        )
+        .await
+        .expect("plan")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+    let shown = plan_str(&plan);
+    assert!(
+        !shown.contains("MetadataOnlyExec"),
+        "a clipping ts bound must decline the rewrite; plan was:\n{shown}"
+    );
+    assert!(
+        shown.contains("LogsScanExec"),
+        "a clipping ts bound must fall back to a scan; plan was:\n{shown}"
+    );
+}
+
+/// The q08 half of the same hole. This shape carries no `FilterExec` at all,
+/// so nothing but `declared_group_counts` itself can refuse for a clipping ts
+/// bound. Before the fix it returned the same map as the unbounded query
+/// (`{200: 7, 404: 2, 500: 1, NULL: 1}`), ignoring `ts < 500` entirely.
+#[tokio::test]
+async fn q08_clipping_ts_bound_declines_and_keeps_the_scan() {
+    let store = CountingStore::new(Arc::new(MemoryStore::new()));
+    let (a, b) = two_status_segments();
+    let stats = status_stats(&a, &b);
+    let snapshot = snapshot_of(vec![a, b], Vec::new());
+    let ctx = logs_session(provider(&store, snapshot, status_col(), Some(stats))).expect("session");
+
+    let plan = ctx
+        .sql(
+            "SELECT status, COUNT(*) FROM logs \
+             WHERE ts < TIMESTAMP '1970-01-01 00:00:00.000000500' GROUP BY status",
+        )
+        .await
+        .expect("plan")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+    let shown = plan_str(&plan);
+    assert!(
+        !shown.contains("MetadataOnlyExec"),
+        "a clipping ts bound must decline the rewrite; plan was:\n{shown}"
+    );
+    assert!(
+        shown.contains("LogsScanExec"),
+        "a clipping ts bound must fall back to a scan; plan was:\n{shown}"
+    );
+}
+
+/// A `has_word` content predicate is the second hole of the same shape, and
+/// it reaches the rule the same way a clipping ts bound does: `has_word` is
+/// also reported `Exact` by `LogsTableProvider::supports_filters_pushdown`
+/// (crates/ravel-sql/src/logs_provider.rs:288-304), so its `FilterExec` is
+/// deleted and the predicate survives only as `LogsScanExec::content`, where
+/// the reader evaluates it per row. Nothing in `classify_scan_chain`
+/// (crates/ravel-sql/src/metadata_agg.rs:129-151) looks at `content`, so the
+/// `status <> 404` filter is again the single admitted `FilterExec` and the
+/// rewrite fires over dictionaries that count rows the content predicate
+/// removes.
+#[tokio::test]
+async fn content_predicate_declines_and_keeps_the_scan() {
+    let store = CountingStore::new(Arc::new(MemoryStore::new()));
+    let (a, b) = two_status_segments();
+    let stats = status_stats(&a, &b);
+    let snapshot = snapshot_of(vec![a, b], Vec::new());
+    let ctx = logs_session(provider(&store, snapshot, status_col(), Some(stats))).expect("session");
+
+    let plan = ctx
+        .sql("SELECT COUNT(*) FROM logs WHERE status <> 404 AND has_word(body, 'needle')")
+        .await
+        .expect("plan")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+    let shown = plan_str(&plan);
+    assert!(
+        !shown.contains("MetadataOnlyExec"),
+        "a content predicate must decline the rewrite; plan was:\n{shown}"
+    );
+    assert!(
+        shown.contains("LogsScanExec"),
+        "a content predicate must fall back to a scan; plan was:\n{shown}"
+    );
+}
+
+/// A `ts` bound that CONTAINS every touched segment removes no row, so the
+/// folded figures stay exact and the rewrite must still fire. Without this the
+/// two tests above would be satisfied by a guard that refuses any ts bound at
+/// all, which would silently retire the optimization for every windowed query.
+#[tokio::test]
+async fn q02_containing_ts_bound_still_answers_from_stats() {
+    let store = CountingStore::new(Arc::new(MemoryStore::new()));
+    let (a, b) = two_status_segments();
+    let stats = status_stats(&a, &b);
+    let snapshot = snapshot_of(vec![a, b], Vec::new());
+    let ctx = logs_session(provider(&store, snapshot, status_col(), Some(stats))).expect("session");
+
+    // Both segments span 0..=1_000, so this bound contains them exactly.
+    let plan = ctx
+        .sql(
+            "SELECT COUNT(*) FROM logs WHERE status <> 404 \
+             AND ts BETWEEN TIMESTAMP '1970-01-01 00:00:00.000000000' \
+             AND TIMESTAMP '1970-01-01 00:00:00.000001000'",
+        )
+        .await
+        .expect("plan")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+    let shown = plan_str(&plan);
+    assert!(
+        !shown.contains("LogsScanExec"),
+        "a containing ts bound must still answer from stats; plan was:\n{shown}"
+    );
+
+    let batches = collect(Arc::clone(&plan), ctx.task_ctx())
+        .await
+        .expect("collect");
+    assert_eq!(count_scalar(&batches), 8, "(5-2) + (5-0), nulls excluded");
+    assert_eq!(store.gets(), 0, "a contained window must read no objects");
+}
+
 /// A segment whose dictionary was omitted (distinct-value count exceeded the
 /// fold's cardinality ceiling, `dictionary_present = false`) carries no exact
 /// per-value counts, so a q02/q08 answer derived from it could be wrong
@@ -538,5 +702,280 @@ async fn omitted_dictionary_declines_and_keeps_the_scan() {
     assert!(
         shown.contains("LogsScanExec"),
         "an omitted dictionary must fall back to a scan; plan was:\n{shown}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Rewrite-equals-scan equivalence over a real corpus
+// ---------------------------------------------------------------------------
+
+/// `(ts_ns, status)` for the first real segment. `None` means the record
+/// carries no `status` attribute at all, so the declared column reads NULL.
+const SEG_A_ROWS: &[(i64, Option<i64>)] = &[
+    (0, Some(200)),
+    (100, Some(200)),
+    (200, Some(404)),
+    (300, Some(200)),
+    (400, Some(404)),
+    (500, Some(500)),
+];
+
+/// `(ts_ns, status)` for the second real segment.
+const SEG_B_ROWS: &[(i64, Option<i64>)] = &[
+    (50, Some(200)),
+    (150, Some(500)),
+    (250, Some(200)),
+    (350, None),
+    (450, Some(200)),
+    (550, Some(200)),
+];
+
+/// The clipping bound both equivalence tests use. Segment A spans 0..=500 and
+/// segment B spans 50..=550, so `ts < 500` clips both: it drops A's last row
+/// and B's last row while leaving each segment overlapping the window, which
+/// is exactly the shape segment resolution keeps and whole-segment statistics
+/// cannot describe.
+const CLIP_SQL: &str = "TIMESTAMP '1970-01-01 00:00:00.000000500'";
+
+fn eq_record(ts: i64, status: Option<i64>) -> LogRecord {
+    let resource: Vec<(String, AttrValue)> = vec![(
+        "service.name".to_string(),
+        AttrValue::Str("api".to_string()),
+    )];
+    let attrs = match status {
+        Some(v) => vec![("status".to_string(), AttrValue::I64(v))],
+        None => Vec::new(),
+    };
+    LogRecord {
+        stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+        stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+        ts_ns: ts,
+        observed_ts_ns: ts,
+        severity_num: 9,
+        severity_text: "INFO".to_string(),
+        body: format!("row at {ts}"),
+        trace_id: None,
+        span_id: None,
+        flags: 0,
+        attrs,
+    }
+}
+
+/// Write `rows` as one real RLOG object under `key` and return the
+/// `SegmentRef` describing it, with the ts span and sample count taken from
+/// the records actually written.
+async fn write_real_segment(
+    store: &Arc<CountingStore>,
+    key: &str,
+    seq: u64,
+    rows: &[(i64, Option<i64>)],
+) -> SegmentRef {
+    let mut w = RlogWriter::new(
+        RlogConfig::default(),
+        ObjectIdentity {
+            tenant_hash: TENANT.0,
+            shard: 0,
+            writer_id: [2u8; 16],
+            writer_epoch: 1,
+            writer_seq: seq,
+        },
+    );
+    for (ts, status) in rows {
+        w.push(eq_record(*ts, *status)).expect("push");
+    }
+    let bytes = w.finish().expect("finish");
+    let object_size = bytes.len() as u64;
+    store
+        .put(key, bytes::Bytes::from(bytes), PutOptions::default())
+        .await
+        .expect("put");
+    SegmentRef {
+        data_object_key: key.to_string(),
+        object_size,
+        min_event_ts_ns: rows.iter().map(|(ts, _)| *ts).min().expect("nonempty"),
+        max_event_ts_ns: rows.iter().map(|(ts, _)| *ts).max().expect("nonempty"),
+        ingest_hour_bucket: 0,
+        sample_count: rows.len() as u64,
+        series_count: 0,
+        shard: 0,
+        content_hash: [0u8; 32],
+        writer_id: writer(),
+        writer_epoch: 1,
+        writer_seq: seq,
+        created_unix_ns: 0,
+        level: SegmentLevel::L0,
+    }
+}
+
+/// The exact `status` statistics for `rows`: what a correct fold over that
+/// object produces. Derived from the same constants the object is written
+/// from, so the statistics and the data cannot drift apart.
+fn stat_from_rows(rows: &[(i64, Option<i64>)]) -> ColumnStat {
+    let mut dict: Vec<(i64, u64)> = Vec::new();
+    let mut null_count = 0u64;
+    for (_, status) in rows {
+        match status {
+            Some(v) => match dict.iter_mut().find(|(dv, _)| dv == v) {
+                Some(entry) => entry.1 += 1,
+                None => dict.push((*v, 1)),
+            },
+            None => null_count += 1,
+        }
+    }
+    dict.sort_unstable();
+    i64_stat("status", &dict, null_count, true)
+}
+
+/// One real corpus plus its exact statistics, reusable across both eligibility
+/// settings so the two runs read byte-identical data.
+struct RealCorpus {
+    store: Arc<CountingStore>,
+    a: SegmentRef,
+    b: SegmentRef,
+    stats: Arc<LoadedColumnStats>,
+}
+
+impl RealCorpus {
+    async fn build() -> RealCorpus {
+        let store = CountingStore::new(Arc::new(MemoryStore::new()));
+        let a = write_real_segment(&store, "logs/eq-a.rlog", 1, SEG_A_ROWS).await;
+        let b = write_real_segment(&store, "logs/eq-b.rlog", 2, SEG_B_ROWS).await;
+        let stats = loaded_stats(vec![
+            (&a, stats_segment(&a, vec![stat_from_rows(SEG_A_ROWS)])),
+            (&b, stats_segment(&b, vec![stat_from_rows(SEG_B_ROWS)])),
+        ]);
+        RealCorpus { store, a, b, stats }
+    }
+
+    /// Run `sql` over this corpus. `with_stats` decides whether the rewrite is
+    /// eligible at all: with no loaded statistics the rule always declines, so
+    /// the same statement is forced down the ordinary scan path.
+    async fn run(&self, sql: &str, with_stats: bool) -> (String, Vec<RecordBatch>) {
+        let stats = with_stats.then(|| Arc::clone(&self.stats));
+        let snapshot = snapshot_of(vec![self.a.clone(), self.b.clone()], Vec::new());
+        let ctx =
+            logs_session(provider(&self.store, snapshot, status_col(), stats)).expect("session");
+        let plan = ctx
+            .sql(sql)
+            .await
+            .expect("plan")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        let shown = plan_str(&plan);
+        let batches = collect(plan, ctx.task_ctx()).await.expect("collect");
+        (shown, batches)
+    }
+}
+
+/// The q02 equivalence property, and the regression the wave-0 checkpoint
+/// found. Over one real corpus:
+///
+/// - unbounded, the rewrite fires (no `LogsScanExec` in the plan) and its
+///   count equals the scanned count, 9;
+/// - under `ts < 500`, which clips both segments, the true count is 7. The
+///   rewrite must decline, and the fallback answer must still be 7.
+///
+/// The clipped and unbounded answers differ (7 vs 9), so the ts bound provably
+/// removes rows: a rewrite that ignores it returns 9 for both. That is exactly
+/// what the pre-fix tree did, because `declared_not_equal_count` consulted
+/// only `erasure` and summed whole-segment dictionary totals.
+#[tokio::test]
+async fn q02_rewritten_answer_equals_scanned_answer() {
+    let corpus = RealCorpus::build().await;
+
+    let unbounded = "SELECT COUNT(*) FROM logs WHERE status <> 404";
+    let (rewritten_plan, rewritten) = corpus.run(unbounded, true).await;
+    let (_, scanned) = corpus.run(unbounded, false).await;
+    assert!(
+        !rewritten_plan.contains("LogsScanExec"),
+        "the unbounded q02 must be answered from stats, or this test compares \
+         the scan against itself; plan was:\n{rewritten_plan}"
+    );
+    assert_eq!(
+        count_scalar(&rewritten),
+        count_scalar(&scanned),
+        "the rewritten q02 answer must equal the scanned answer"
+    );
+    assert_eq!(
+        count_scalar(&scanned),
+        9,
+        "4 from segment A, 5 from segment B"
+    );
+
+    let clipped = &format!("SELECT COUNT(*) FROM logs WHERE status <> 404 AND ts < {CLIP_SQL}");
+    let (clipped_plan, clipped_rewrite) = corpus.run(clipped, true).await;
+    let (_, clipped_scan) = corpus.run(clipped, false).await;
+    assert!(
+        clipped_plan.contains("LogsScanExec"),
+        "a clipping ts bound must fall back to a scan; plan was:\n{clipped_plan}"
+    );
+    assert_eq!(
+        count_scalar(&clipped_rewrite),
+        count_scalar(&clipped_scan),
+        "the clipped q02 answer must not depend on whether statistics loaded"
+    );
+    assert_eq!(
+        count_scalar(&clipped_scan),
+        7,
+        "3 from segment A, 4 from segment B once ts < 500 drops one row each"
+    );
+    assert_ne!(
+        count_scalar(&clipped_scan),
+        count_scalar(&scanned),
+        "the ts bound must actually remove rows, or the clipped case proves nothing"
+    );
+}
+
+/// The q08 half of the same property. Unbounded, the merged dictionary is
+/// `{200: 7, 404: 2, 500: 2, NULL: 1}`; under `ts < 500` the true grouping is
+/// `{200: 6, 404: 2, 500: 1, NULL: 1}`. This shape carries no `FilterExec` at
+/// all, so `declared_group_counts` is the only thing that can refuse for the
+/// clipping bound.
+#[tokio::test]
+async fn q08_rewritten_answer_equals_scanned_answer() {
+    let corpus = RealCorpus::build().await;
+
+    let unbounded = "SELECT status, COUNT(*) FROM logs GROUP BY status";
+    let (rewritten_plan, rewritten) = corpus.run(unbounded, true).await;
+    let (_, scanned) = corpus.run(unbounded, false).await;
+    assert!(
+        !rewritten_plan.contains("LogsScanExec"),
+        "the unbounded q08 must be answered from stats, or this test compares \
+         the scan against itself; plan was:\n{rewritten_plan}"
+    );
+    assert_eq!(
+        group_counts(&rewritten),
+        group_counts(&scanned),
+        "the rewritten q08 groups must equal the scanned groups"
+    );
+    assert_eq!(
+        group_counts(&scanned),
+        HashMap::from([(Some(200), 7), (Some(404), 2), (Some(500), 2), (None, 1)]),
+        "the whole corpus, 12 rows over four groups"
+    );
+
+    let clipped =
+        &format!("SELECT status, COUNT(*) FROM logs WHERE ts < {CLIP_SQL} GROUP BY status");
+    let (clipped_plan, clipped_rewrite) = corpus.run(clipped, true).await;
+    let (_, clipped_scan) = corpus.run(clipped, false).await;
+    assert!(
+        clipped_plan.contains("LogsScanExec"),
+        "a clipping ts bound must fall back to a scan; plan was:\n{clipped_plan}"
+    );
+    assert_eq!(
+        group_counts(&clipped_rewrite),
+        group_counts(&clipped_scan),
+        "the clipped q08 groups must not depend on whether statistics loaded"
+    );
+    assert_eq!(
+        group_counts(&clipped_scan),
+        HashMap::from([(Some(200), 6), (Some(404), 2), (Some(500), 1), (None, 1)]),
+        "ts < 500 drops one 200 row and one 500 row"
+    );
+    assert_ne!(
+        group_counts(&clipped_scan),
+        group_counts(&scanned),
+        "the ts bound must actually remove rows, or the clipped case proves nothing"
     );
 }

@@ -1066,15 +1066,26 @@ impl LogsScanExec {
     /// (ADR-0850's q02 shape: `COUNT(*) WHERE <declared column> <> <literal>`,
     /// which per SQL three-valued logic excludes NULL rows the same way the
     /// scan path's per-row `<>` evaluation would). `None` means fall back to
-    /// scanning, for every reason [`Self::declared_min_max`] does (no pending
-    /// erasure allowed, no `Str` support, needs a loaded column-stats object
-    /// covering every touched segment), plus one specific to this path: any
-    /// covered segment whose dictionary is absent because its distinct-value
-    /// count exceeded the fold's cardinality ceiling (ADR-0850 decision 3) has
-    /// no exact per-value count to subtract, so a count derived from it could
-    /// be wrong outright, not merely unavailable.
+    /// scanning, for every reason [`Self::declared_min_max`] does at its call
+    /// site ([`Self::stats_are_exact`]: no pending erasure, no content or
+    /// prune predicate, and a ts bound that clips no touched segment) plus no
+    /// `Str` support, a loaded column-stats object covering every touched
+    /// segment, and one reason specific to this path: any covered segment
+    /// whose dictionary is absent because its distinct-value count exceeded
+    /// the fold's cardinality ceiling (ADR-0850 decision 3) has no exact
+    /// per-value count to subtract, so a count derived from it could be wrong
+    /// outright, not merely unavailable.
+    ///
+    /// The [`Self::stats_are_exact`] gate is what makes a clipping ts bound
+    /// safe. Segments are resolved on OVERLAP, and a pure `ts` bound is
+    /// reported `Exact` by `LogsTableProvider::supports_filters_pushdown`, so
+    /// the `FilterExec` that carried it is deleted and the bound survives only
+    /// as `self.ts_min`/`self.ts_max`. A per-segment dictionary carries no
+    /// intra-segment time distribution, so a clipped segment's contribution
+    /// cannot be derived from it at all; summing its whole-segment counts
+    /// would answer a different query than the one asked.
     pub(crate) fn declared_not_equal_count(&self, k: usize, literal: &ScalarValue) -> Option<u64> {
-        if !self.erasure.is_empty() {
+        if !self.stats_are_exact() {
             return None;
         }
         let declared = self.declared.get(k)?;
@@ -1121,12 +1132,16 @@ impl LogsScanExec {
     /// index `FIRST_DECLARED_COL + k` (ADR-0850's q08 shape), merging every
     /// touched segment's exact dictionary. `None` means fall back to
     /// scanning, for the same reasons [`Self::declared_not_equal_count`]
-    /// does. `ScalarValue`'s `Eq`/`Hash` are used directly as the merge key:
+    /// does, including the [`Self::stats_are_exact`] gate: this shape carries
+    /// no `FilterExec` at all, so a `WHERE ts < ...` bound that clips a
+    /// touched segment reaches here purely as `self.ts_min`/`self.ts_max` and
+    /// nothing else in the plan would refuse for it.
+    /// `ScalarValue`'s `Eq`/`Hash` are used directly as the merge key:
     /// `DeclaredType` has no floating-point variant, so the NaN/-0.0 hazards
     /// that motivate this repo's bit-pattern float-comparison rule elsewhere
     /// never arise for a declared column's value domain.
     pub(crate) fn declared_group_counts(&self, k: usize) -> Option<DeclaredGroupCounts> {
-        if !self.erasure.is_empty() {
+        if !self.stats_are_exact() {
             return None;
         }
         let declared = self.declared.get(k)?;
