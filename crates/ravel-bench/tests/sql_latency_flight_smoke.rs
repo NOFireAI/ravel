@@ -231,7 +231,7 @@ fn flight_cfg(
             end_ns: NOW_NS,
         },
         now_ns: NOW_NS,
-        compaction: ravel_bench::sql_latency::Compaction::Pre,
+        compaction: None,
         max_query_bytes: DEFAULT_MAX_QUERY_BYTES,
         // The generated lane writes shard 0 only and leaves no provisioning
         // record, so the shard count has to be named.
