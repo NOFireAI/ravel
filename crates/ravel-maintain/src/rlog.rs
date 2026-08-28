@@ -98,22 +98,39 @@
 //! carrying the current stream (`O(input_count * block_size)`, independent of
 //! stream size) and the raw bytes of the range that block came from
 //! (`O(input_count * group_size)` under version 4, stored bytes rather than
-//! decoded records), plus the in-progress part's writer buffer. The writer buffer
-//! is bounded by `max_l1_part_bytes`: [`PartSink`] closes the in-progress part
-//! as soon as its [`estimate_record`] total reaches the cap, wherever in the
-//! merged record sequence that falls, so a stream may span consecutive parts.
-//! It did NOT always work this way -- the check used to run only between
-//! streams, on the "a stream never straddles two parts" invariant this module
-//! and ADR-0032 once stated -- and a bucket carrying one OTLP resource/scope
-//! (one stream) therefore had no split point at all: 3M wide rows of one
-//! ClickBench logs stream held the whole hour in one writer at 45.7 GB
-//! resident. Issue #711 replaced the invariant with the size bound; parts are
-//! still written by the frozen [`RlogWriter`] unchanged, so only the
-//! partitioning of records into parts changed, never a part's bytes. Holding
-//! one whole part before its content-addressed key exists remains unavoidable.
-//! The [`MergeMemoryTracker`] seam accounts these terms at their real
+//! decoded records), plus the in-progress part's writer buffer. The writer
+//! buffer is bounded by the **memory bound** `max_l1_part_memory_bytes`:
+//! [`PartSink`] closes the in-progress part as soon as its [`estimate_record`]
+//! (decoded-heap) total reaches that bound, wherever in the merged record
+//! sequence that falls, so a stream may span consecutive parts. It did NOT
+//! always work this way -- the check used to run only between streams, on the
+//! "a stream never straddles two parts" invariant this module and ADR-0032
+//! once stated -- and a bucket carrying one OTLP resource/scope (one stream)
+//! therefore had no split point at all: 3M wide rows of one ClickBench logs
+//! stream held the whole hour in one writer at 45.7 GB resident. Issue #711
+//! replaced the invariant with the size bound; parts are still written by the
+//! frozen [`RlogWriter`] unchanged, so only the partitioning of records into
+//! parts changed, never a part's bytes. Holding one whole part before its
+//! content-addressed key exists remains unavoidable. The
+//! [`MergeMemoryTracker`] seam accounts these terms at their real
 //! allocation/decode points and records a high-water mark; the acceptance test
-//! asserts that mark stays proportional to the cap while a hot stream grows.
+//! asserts that mark stays proportional to the memory bound while a hot stream
+//! grows.
+//!
+//! # Memory bound and stored-size target are two separate knobs (issue #872)
+//!
+//! `max_l1_part_memory_bytes` above bounds the decoded record heap and is what
+//! keeps this merge survivable on a small host. It does NOT govern object
+//! geometry: on a wide schema it reaches 256 MiB of heap after only a few MB of
+//! stored bytes, so every L1 object was tiny (~3.5 MB on ClickBench, a 74x gap
+//! below the 256 MiB the knob's old name implied). Object geometry is a second,
+//! independent knob, the **stored-size target** `max_l1_part_bytes`: [`PartSink`]
+//! also sums [`estimate_stored_record`] (an encoded-bytes proxy) per record and
+//! closes the part when that total reaches the target. A part closes on
+//! whichever bound is reached first. With the shipped defaults (both 256 MiB)
+//! the memory bound still fires first on every real schema, so this split is
+//! behaviour-neutral until an operator lowers the stored target to grow
+//! objects.
 //!
 //! The first RLOG merge held every input object whole (RLOG then had no ranged
 //! section reader); [`ravel_logseg::open_from_suffix`] is now the RLOG analogue
@@ -394,8 +411,9 @@ pub(crate) struct MergeOutput {
 }
 
 /// The shared k-way block-streaming merge: every input's records, in global
-/// `(stream_id, ts)` order, filtered through `keep`, partitioned into parts of
-/// at most `max_l1_part_bytes`.
+/// `(stream_id, ts)` order, filtered through `keep`, partitioned into parts
+/// closed at the memory bound `max_l1_part_memory_bytes` or the stored-size
+/// target `max_l1_part_bytes`, whichever is reached first.
 ///
 /// Both callers of the RLOG merge run through here. Compaction
 /// ([`RlogCodec::build_parts`]) keeps every record; the ADR-0064 erasure
@@ -473,8 +491,11 @@ pub(crate) async fn merge_catalogs(
     // k-way merged from every input carrying it (ts-ascending, canonical
     // input-order tie-break) straight into the current part's writer, and
     // the part flushes the moment its accumulated record-heap estimate
-    // reaches `max_l1_part_bytes` -- mid-stream if that is where the cap
-    // falls (issue #711, ADR-0032 amendment 2026-08-26). No intermediate
+    // reaches `max_l1_part_memory_bytes` (the memory bound) or its encoded
+    // estimate reaches `max_l1_part_bytes` (the stored target), whichever comes
+    // first -- mid-stream if that is where the bound falls (issue #711 for the
+    // memory bound, issue #872 for the stored target, ADR-0032 amendment
+    // 2026-08-26). No intermediate
     // `Vec<LogRecord>` and no per-stream dedup: distinct submissions of
     // identical content are distinct records (ADR-0032).
     for stream_id in merged.keys() {
@@ -525,12 +546,14 @@ impl RecordCounts {
 /// The sequence of L1 parts one merge produces, and the one place a part is
 /// closed and a new one opened.
 ///
-/// The split rule is a pure size rule: push records in the merge's canonical
-/// order, and close the in-progress part as soon as its
-/// [`PartBuilder::estimate`] reaches `max_l1_part_bytes`, wherever in the
-/// record sequence that falls. That is the whole of issue #711: the check used
-/// to run only between streams, so a bucket whose records all belong to one
-/// stream (one OTLP resource/scope, the common shape for a single busy
+/// The split rule pushes records in the merge's canonical order and closes the
+/// in-progress part as soon as EITHER bound is reached (issue #872): its
+/// [`PartBuilder::estimate`] (decoded heap) reaches the memory bound
+/// `max_l1_part_memory_bytes`, or its [`PartBuilder::stored_estimate`] (encoded
+/// bytes) reaches the stored target `max_l1_part_bytes`, wherever in the record
+/// sequence that falls. The memory bound is the whole of issue #711: the check
+/// used to run only between streams, so a bucket whose records all belong to
+/// one stream (one OTLP resource/scope, the common shape for a single busy
 /// service) held its entire row set live in one writer.
 ///
 /// Consecutive parts may therefore carry the same `stream_id` at their shared
@@ -564,12 +587,31 @@ impl PartSink<'_> {
         if self.current.is_none() {
             self.current = Some(PartBuilder::new(&self.identity, &self.indexed_fields));
         }
-        let mut over_cap = false;
+        let mut over_memory = false;
+        let mut over_stored = false;
         if let Some(part) = self.current.as_mut() {
             part.push(r, self.tracker)?;
-            over_cap = part.estimate >= self.config.max_l1_part_bytes;
+            // Two independent bounds; a part closes when EITHER is reached
+            // (issue #872). The memory bound protects compactor peak memory
+            // (issue #711); the stored target governs object geometry. On a
+            // wide schema the heap estimate reaches its cap first (small
+            // objects); on a narrow, highly compressible schema the encoded
+            // estimate reaches its target first. With the shipped defaults
+            // (both 256 MiB) the memory bound binds and the stored target does
+            // not fire, so this crate's geometry is unchanged.
+            over_memory = part.estimate >= self.config.max_l1_part_memory_bytes;
+            over_stored = part.stored_estimate >= self.config.max_l1_part_bytes;
         }
-        if over_cap {
+        if over_memory || over_stored {
+            if let Some(t) = self.tracker {
+                // The memory bound is the invariant; when both fire at once
+                // attribute the flush to it.
+                if over_memory {
+                    t.note_memory_bound_flush();
+                } else {
+                    t.note_stored_bound_flush();
+                }
+            }
             self.flush().await?;
         }
         Ok(())
@@ -610,17 +652,25 @@ impl PartSink<'_> {
 }
 
 /// One in-progress L1 part: the shared [`RlogWriter`] the merged records push
-/// into directly, plus the running record-heap estimate that decides where the
-/// part splits (wherever the estimate reaches `max_l1_part_bytes`, see
-/// [`PartSink`]) and feeds the [`MergeMemoryTracker`]'s writer term. Holding a
+/// into directly, plus the two running estimates that decide where the part
+/// splits (the decoded-heap `estimate` against the memory bound and the encoded
+/// `stored_estimate` against the stored target, whichever is reached first, see
+/// [`PartSink`]); the heap estimate also feeds the [`MergeMemoryTracker`]'s
+/// writer term. Holding a
 /// whole part's records before [`PartBuilder::finish`] stamps its
 /// content-addressed key is unavoidable (the key is a hash of the whole
 /// object); the k-way merge is what keeps everything *else* bounded.
 struct PartBuilder {
     writer: RlogWriter,
-    /// Sum of [`estimate_record`] over every pushed record: the split trigger
-    /// and the writer-buffer term the tracker records.
+    /// Sum of [`estimate_record`] over every pushed record: the **memory
+    /// bound**'s trigger (compared against `max_l1_part_memory_bytes`) and the
+    /// writer-buffer term the tracker records. This is decoded Rust heap, not
+    /// stored bytes.
     estimate: u64,
+    /// Sum of [`estimate_stored_record`] over every pushed record: the
+    /// **stored-size target**'s trigger (compared against `max_l1_part_bytes`).
+    /// This estimates encoded/on-object bytes, not heap.
+    stored_estimate: u64,
     min_stream: Option<LogStreamId>,
     max_stream: Option<LogStreamId>,
     count: usize,
@@ -633,6 +683,7 @@ impl PartBuilder {
         PartBuilder {
             writer,
             estimate: 0,
+            stored_estimate: 0,
             min_stream: None,
             max_stream: None,
             count: 0,
@@ -643,12 +694,16 @@ impl PartBuilder {
         self.count == 0
     }
 
-    /// Push one merged record into the part's writer, updating the running
-    /// estimate and the part's inclusive stream-id bounds.
+    /// Push one merged record into the part's writer, updating both running
+    /// estimates (heap for the memory bound, encoded for the stored target) and
+    /// the part's inclusive stream-id bounds.
     fn push(&mut self, r: LogRecord, tracker: Option<&MergeMemoryTracker>) -> Result<()> {
         self.min_stream = Some(self.min_stream.map_or(r.stream_id, |m| m.min(r.stream_id)));
         self.max_stream = Some(self.max_stream.map_or(r.stream_id, |m| m.max(r.stream_id)));
         self.estimate = self.estimate.saturating_add(estimate_record(&r));
+        self.stored_estimate = self
+            .stored_estimate
+            .saturating_add(estimate_stored_record(&r));
         self.count += 1;
         self.writer.push(r)?;
         if let Some(t) = tracker {
@@ -1144,13 +1199,14 @@ const RECORD_SLOT_BYTES: u64 = std::mem::size_of::<LogRecord>() as u64;
 const ATTR_SLOT_BYTES: u64 = std::mem::size_of::<(String, AttrValue)>() as u64;
 
 /// The Rust-side heap one merged [`LogRecord`] occupies while it waits in the
-/// in-progress part's writer, which is what `max_l1_part_bytes` caps
-/// (issue #711). This is deliberately NOT the record's encoded size: the
-/// writer holds row-major `LogRecord`s, and for a wide log row (the ClickBench
-/// shape: ~105 attributes) the Rust representation is an order of magnitude
-/// larger than the bytes it compresses to. Sizing the cap against payload
-/// bytes is what let one 3M-row stream reach 45 GB resident under a nominal
-/// 256 MiB cap.
+/// in-progress part's writer, which is what the memory bound
+/// `max_l1_part_memory_bytes` caps (issue #711). This is deliberately NOT the
+/// record's encoded size (that is [`estimate_stored_record`], which the
+/// stored-size target uses): the writer holds row-major `LogRecord`s, and for a
+/// wide log row (the ClickBench shape: ~105 attributes) the Rust representation
+/// is an order of magnitude larger than the bytes it compresses to. Sizing the
+/// memory bound against encoded payload bytes is what let one 3M-row stream
+/// reach 45 GB resident under a nominal 256 MiB cap.
 ///
 /// The formula, one term per real allocation:
 ///
@@ -1219,6 +1275,77 @@ fn attr_value_estimate(v: &AttrValue) -> u64 {
                 .fold(alloc_estimate(slots), u64::saturating_add)
         }
         AttrValue::I64(_) | AttrValue::F64(_) | AttrValue::Bool(_) => 0,
+    }
+}
+
+/// Fixed per-record encoded cost the stored-size estimate charges regardless of
+/// payload: the columnar `ts_ns`, `stream_ref`, and `severity_number` cells a
+/// record always occupies (docs/log-segment-format.md). A deliberately flat
+/// figure in the range those fixed-width columns cost before compression.
+const STORED_RECORD_FIXED_BYTES: u64 = 16;
+
+/// The encoded/on-object bytes one merged [`LogRecord`] is estimated to add to
+/// a part, the quantity `max_l1_part_bytes` (the stored-size target) caps.
+///
+/// This is deliberately NOT [`estimate_record`], which measures the record's
+/// Rust *heap* for the memory bound. The two answer different questions and are
+/// an order of magnitude apart on a wide schema, which is the whole point of
+/// issue #872: the memory bound reached 256 MiB of heap after only ~3.5 MB of
+/// stored bytes on the ClickBench tenant, so a single knob measured in heap
+/// could not also govern object geometry.
+///
+/// It is a pre-compression payload proxy: the sum of the value bytes that
+/// actually enter this part's columns (timestamps and identifiers as a small
+/// fixed cost, then `severity_text`, `body`, and every dynamic attribute's key
+/// and value bytes). Two things are excluded on purpose:
+///
+/// - `stream_attrs` (the resource/scope blob) is stored once per stream in
+///   STREAM_DIR, not once per record, so charging it per record would inflate
+///   the estimate on exactly the wide-stream shape this is meant to size.
+/// - zstd compression. The estimate is the uncompressed column payload, so it
+///   is an upper bound on the bytes those columns compress to; a target of `T`
+///   payload bytes yields an object of `T / compression_ratio` stored bytes.
+///   That makes the target conservative (objects no larger than `T`), which is
+///   the safe direction for a memory-adjacent geometry knob, and it is why the
+///   size-target default is left at 256 MiB: on the current corpus the memory
+///   bound still fires first, so no stored target value can change today's
+///   geometry.
+///
+/// Like [`estimate_record`] it only decides where parts split, never
+/// correctness: the frozen [`RlogWriter`] produces identical bytes for a given
+/// record set however the records were partitioned.
+pub(crate) fn estimate_stored_record(r: &LogRecord) -> u64 {
+    let mut est = STORED_RECORD_FIXED_BYTES;
+    est = est.saturating_add(r.severity_text.len() as u64);
+    est = est.saturating_add(r.body.len() as u64);
+    for (k, v) in &r.attrs {
+        est = est.saturating_add(k.len() as u64);
+        est = est.saturating_add(attr_value_stored_estimate(v));
+    }
+    est
+}
+
+/// The encoded value bytes one attribute *value* contributes to the stored-size
+/// estimate. Scalars cost their fixed column width; strings and byte strings
+/// cost their length; nested containers cost the sum of their elements plus a
+/// small per-element tag. No allocator or Rust-slot overhead is counted (that
+/// is [`attr_value_estimate`]'s job for the heap bound), because these bytes
+/// are what land in the object, not what the record occupies in memory.
+fn attr_value_stored_estimate(v: &AttrValue) -> u64 {
+    match v {
+        AttrValue::Str(s) => s.len() as u64,
+        AttrValue::Bytes(b) => b.len() as u64,
+        AttrValue::I64(_) | AttrValue::F64(_) => 8,
+        AttrValue::Bool(_) => 1,
+        AttrValue::List(items) => items
+            .iter()
+            .map(attr_value_stored_estimate)
+            .fold(0u64, |acc, n| acc.saturating_add(n).saturating_add(1)),
+        AttrValue::Map(kvs) => kvs.iter().fold(0u64, |acc, (k, v)| {
+            acc.saturating_add(k.len() as u64)
+                .saturating_add(attr_value_stored_estimate(v))
+                .saturating_add(1)
+        }),
     }
 }
 
@@ -2507,10 +2634,10 @@ mod tests {
     /// straddles every boundary.
     ///
     /// Demonstrated red by restoring the pre-#711 between-streams-only check:
-    /// delete the `if over_cap { self.flush().await?; }` block from
-    /// `PartSink::push` and re-add the flush to `build_parts`'s
+    /// delete the `if over_memory || over_stored { .. self.flush().await?; }`
+    /// block from `PartSink::push` and re-add the flush to `build_parts`'s
     /// `for stream_id in merged.keys()` loop (`if part.estimate >=
-    /// config.max_l1_part_bytes { sink.flush().await?; }` after
+    /// config.max_l1_part_memory_bytes { sink.flush().await?; }` after
     /// `merge_stream_into_parts`). The part count collapses to 1 and this test
     /// fails at `assert_eq!(parts.len() as u64, expected_parts)` with
     /// `1 != 10`.
@@ -2549,7 +2676,7 @@ mod tests {
         );
 
         let config = CompactorConfig {
-            max_l1_part_bytes: CAP,
+            max_l1_part_memory_bytes: CAP,
             ..CompactorConfig::default()
         };
         let clock = FixedClock::new(sealed_now_ns());
@@ -2673,7 +2800,7 @@ mod tests {
 
             let tracker = MergeMemoryTracker::new();
             let config = CompactorConfig {
-                max_l1_part_bytes: CAP,
+                max_l1_part_memory_bytes: CAP,
                 merge_memory_tracker: Some(tracker.clone()),
                 ..CompactorConfig::default()
             };
@@ -2709,6 +2836,281 @@ mod tests {
             );
             assert!(parts > 1, "scale {scale}: the fixture must actually split");
         }
+    }
+
+    // --- memory bound vs stored-size target (issue #872) ---------------------
+
+    /// One narrow record of stream 0: a tiny body and no attributes, so its
+    /// encoded [`estimate_stored_record`] is a handful of bytes while its
+    /// decoded [`estimate_record`] still carries the per-record Rust-slot and
+    /// resource-blob overhead. This is the "narrow rows, high compression"
+    /// direction: stored bytes accumulate far slower than heap, so the
+    /// stored-size target can be made to fire first.
+    fn narrow_record(i: i64) -> LogRecord {
+        record(0, SPLIT_BASE_NS + i, "x", Vec::new())
+    }
+
+    /// Issue #872: on a wide schema the MEMORY bound fires first. With both
+    /// bounds set to the same value, the decoded heap estimate reaches it long
+    /// before the encoded estimate does (wide rows are an order of magnitude
+    /// larger in memory than on the object), so every part closes on memory and
+    /// none on the stored target. The parts are small on disk, which is exactly
+    /// the geometry issue #872 is about.
+    #[tokio::test]
+    async fn wide_rows_close_the_part_on_the_memory_bound() {
+        const PER_INPUT: i64 = 400;
+        const INPUTS: i64 = 2;
+        // Equal bounds: the only thing that decides which fires is the per-record
+        // heap-vs-stored ratio, and for a wide row that ratio is well above 1.
+        const BOUND: u64 = 64 * 1024;
+        let total = (PER_INPUT * INPUTS) as u64;
+
+        let store = Arc::new(MemoryStore::new());
+        for j in 0..INPUTS {
+            let recs: Vec<LogRecord> = (0..PER_INPUT)
+                .map(|i| wide_record(i * INPUTS + j))
+                .collect();
+            seed(
+                store.as_ref(),
+                Uuid::from_u128(j as u128 + 1),
+                j as u64 + 1,
+                &recs,
+            )
+            .await;
+        }
+
+        let heap = estimate_record(&wide_record(0));
+        let stored = estimate_stored_record(&wide_record(0));
+        assert!(
+            heap > stored * 2,
+            "fixture must be wide: heap {heap} should dwarf stored {stored}"
+        );
+        let expected_parts = expected_part_count(heap, BOUND, total);
+        assert!(
+            expected_parts >= 4,
+            "fixture must split several times, got {expected_parts}"
+        );
+
+        let tracker = MergeMemoryTracker::new();
+        let config = CompactorConfig {
+            max_l1_part_memory_bytes: BOUND,
+            max_l1_part_bytes: BOUND,
+            merge_memory_tracker: Some(tracker.clone()),
+            ..CompactorConfig::default()
+        };
+        let clock = FixedClock::new(sealed_now_ns());
+        compact_bucket(store.as_ref(), &clock, &config, &bucket())
+            .await
+            .expect("compact");
+
+        let (rec, parts) = read_output(store.as_ref()).await;
+        assert_eq!(
+            parts.len() as u64,
+            expected_parts,
+            "part count is the memory arithmetic"
+        );
+        // The bound that fired: memory only. Every non-final flush is a memory
+        // flush; the stored target never triggered.
+        assert_eq!(
+            tracker.stored_bound_flushes(),
+            0,
+            "no part may close on the stored target for a wide schema"
+        );
+        assert_eq!(
+            tracker.memory_bound_flushes(),
+            expected_parts - 1,
+            "every closed part (all but the trailing one) closed on the memory bound"
+        );
+        // And the objects really are small on disk relative to the bound, which
+        // is the 74x gap issue #872 names.
+        for p in &rec.parts {
+            assert!(
+                p.object_size < BOUND,
+                "part stored size {} should sit well under the {BOUND}B bound",
+                p.object_size
+            );
+        }
+    }
+
+    /// Issue #872: on a narrow, highly compressible schema the STORED target
+    /// fires first. The memory bound is left at its 256 MiB default (far above
+    /// anything this corpus reaches in heap) and the stored target is set small,
+    /// so every part closes on encoded bytes and none on memory. This is the
+    /// follow-up's shape: lowering the stored target is what grows/shrinks
+    /// objects, independently of the memory invariant.
+    #[tokio::test]
+    async fn narrow_rows_close_the_part_on_the_stored_target() {
+        const PER_INPUT: i64 = 500;
+        const INPUTS: i64 = 2;
+        const STORED_TARGET: u64 = 4 * 1024;
+        let total = (PER_INPUT * INPUTS) as u64;
+
+        let store = Arc::new(MemoryStore::new());
+        for j in 0..INPUTS {
+            let recs: Vec<LogRecord> = (0..PER_INPUT)
+                .map(|i| narrow_record(i * INPUTS + j))
+                .collect();
+            seed(
+                store.as_ref(),
+                Uuid::from_u128(j as u128 + 1),
+                j as u64 + 1,
+                &recs,
+            )
+            .await;
+        }
+
+        let stored = estimate_stored_record(&narrow_record(0));
+        let expected_parts = expected_part_count(stored, STORED_TARGET, total);
+        assert!(
+            expected_parts >= 3,
+            "fixture must split several times, got {expected_parts}"
+        );
+
+        let tracker = MergeMemoryTracker::new();
+        let config = CompactorConfig {
+            // Memory bound at its shipped default: nothing this corpus does in
+            // heap comes close, so it must never be the bound that fires.
+            max_l1_part_bytes: STORED_TARGET,
+            merge_memory_tracker: Some(tracker.clone()),
+            ..CompactorConfig::default()
+        };
+        let clock = FixedClock::new(sealed_now_ns());
+        compact_bucket(store.as_ref(), &clock, &config, &bucket())
+            .await
+            .expect("compact");
+
+        let (_rec, parts) = read_output(store.as_ref()).await;
+        assert_eq!(
+            parts.len() as u64,
+            expected_parts,
+            "part count is the stored arithmetic"
+        );
+        assert_eq!(
+            tracker.memory_bound_flushes(),
+            0,
+            "no part may close on the memory bound for this corpus"
+        );
+        assert_eq!(
+            tracker.stored_bound_flushes(),
+            expected_parts - 1,
+            "every closed part (all but the trailing one) closed on the stored target"
+        );
+    }
+
+    /// Issue #872 deliverable 2: the shipped defaults reproduce today's
+    /// geometry. Today's geometry is the memory-bound-only split, so a run at
+    /// the shipped stored default (256 MiB, hugely above the memory bound on
+    /// this fixture) must be byte-for-byte identical -- same part count, same
+    /// per-object stored size -- to a run with the stored target disabled
+    /// entirely (`u64::MAX`). If the stored target ever perturbed a
+    /// memory-bound run, this fails. The memory bound is scaled down to 64 KiB
+    /// so the fixture splits without a 256 MiB corpus; the ratio to the shipped
+    /// stored default is what production ships (memory << stored).
+    #[tokio::test]
+    async fn shipped_stored_default_does_not_change_memory_bound_geometry() {
+        const PER_INPUT: i64 = 400;
+        const INPUTS: i64 = 2;
+        const MEM_BOUND: u64 = 64 * 1024;
+
+        async fn run(stored_target: u64) -> Vec<u64> {
+            let store = Arc::new(MemoryStore::new());
+            for j in 0..INPUTS {
+                let recs: Vec<LogRecord> = (0..PER_INPUT)
+                    .map(|i| wide_record(i * INPUTS + j))
+                    .collect();
+                seed(
+                    store.as_ref(),
+                    Uuid::from_u128(j as u128 + 1),
+                    j as u64 + 1,
+                    &recs,
+                )
+                .await;
+            }
+            let config = CompactorConfig {
+                max_l1_part_memory_bytes: MEM_BOUND,
+                max_l1_part_bytes: stored_target,
+                ..CompactorConfig::default()
+            };
+            let clock = FixedClock::new(sealed_now_ns());
+            compact_bucket(store.as_ref(), &clock, &config, &bucket())
+                .await
+                .expect("compact");
+            let (rec, _parts) = read_output(store.as_ref()).await;
+            rec.parts.iter().map(|p| p.object_size).collect()
+        }
+
+        // Shipped stored default vs the stored target switched off.
+        let shipped = run(crate::config::DEFAULT_MAX_L1_PART_BYTES).await;
+        let disabled = run(u64::MAX).await;
+        assert!(
+            shipped.len() > 1,
+            "the fixture must split under the memory bound"
+        );
+        assert_eq!(
+            shipped, disabled,
+            "the shipped stored default must not change the memory-bound geometry: \
+             object count and every per-object stored size must be identical"
+        );
+    }
+
+    /// Issue #872 constraint: raising the stored target far above the memory
+    /// bound does not weaken the memory bound. With the stored target at
+    /// `u64::MAX` the memory bound is the only thing that can close a part, so
+    /// compactor peak memory must stay within the memory bound plus the fixed
+    /// decode-side transient even as a hot stream grows.
+    #[tokio::test]
+    async fn memory_stays_bounded_when_the_stored_target_is_raised_far_above_it() {
+        const PER_INPUT: i64 = 800;
+        const INPUTS: i64 = 2;
+        const MEM_BOUND: u64 = 128 * 1024;
+        const TRANSIENT_ALLOWANCE: u64 = 4 * 1024 * 1024;
+
+        let store = Arc::new(MemoryStore::new());
+        for j in 0..INPUTS {
+            let recs: Vec<LogRecord> = (0..PER_INPUT)
+                .map(|i| wide_record(i * INPUTS + j))
+                .collect();
+            seed_l0(
+                store.as_ref(),
+                Uuid::from_u128(j as u128 + 1),
+                j as u64 + 1,
+                &recs,
+                RlogConfig {
+                    block_target_records: 100,
+                    ..RlogConfig::default()
+                },
+                &[],
+            )
+            .await;
+        }
+
+        let tracker = MergeMemoryTracker::new();
+        let config = CompactorConfig {
+            max_l1_part_memory_bytes: MEM_BOUND,
+            max_l1_part_bytes: u64::MAX, // stored target effectively off
+            merge_memory_tracker: Some(tracker.clone()),
+            ..CompactorConfig::default()
+        };
+        let clock = FixedClock::new(sealed_now_ns());
+        compact_bucket(store.as_ref(), &clock, &config, &bucket())
+            .await
+            .expect("compact");
+
+        let (_rec, parts) = read_output(store.as_ref()).await;
+        assert!(
+            parts.len() > 1,
+            "the fixture must split on the memory bound"
+        );
+        assert!(
+            tracker.memory_bound_flushes() > 0 && tracker.stored_bound_flushes() == 0,
+            "the memory bound must be the binding one when the stored target is raised off"
+        );
+        let peak = tracker.peak_total_bytes();
+        assert!(
+            peak < MEM_BOUND + TRANSIENT_ALLOWANCE,
+            "peak {peak} exceeded the memory bound {MEM_BOUND} plus the transient allowance, \
+             so raising the stored target weakened the memory bound"
+        );
     }
 
     // --- concurrent input reads (issue #711) ---------------------------------
@@ -2928,8 +3330,8 @@ mod tests {
             println!(
                 "[mem:rlog #745] records/input={records_per_input} stream~={stream_bytes}B \
                  peak_transient={transient}B peak_total={total}B transient_bound={TRANSIENT_BOUND}B \
-                 part_cap={}B",
-                config.max_l1_part_bytes
+                 mem_bound={}B",
+                config.max_l1_part_memory_bytes
             );
 
             // The decode-side peak is under the fixed bound.
@@ -2946,8 +3348,8 @@ mod tests {
             // part, bounded by the part cap (content-addressing needs the whole
             // part before its key exists).
             assert!(
-                total < TRANSIENT_BOUND + config.max_l1_part_bytes,
-                "total peak {total} exceeded transient bound + part cap"
+                total < TRANSIENT_BOUND + config.max_l1_part_memory_bytes,
+                "total peak {total} exceeded transient bound + memory bound"
             );
             peaks.push(transient);
         }
