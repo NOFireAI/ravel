@@ -88,6 +88,18 @@ struct Args {
     /// `<id>.txt` per statement. Required when `--explain` is set.
     #[arg(long = "explain-dir", value_name = "DIR", requires = "explain")]
     explain_dir: Option<std::path::PathBuf>,
+    /// Reuse one `SqlExecutor` (and its in-process catalog caches) across every
+    /// statement instead of building a fresh cold executor per statement. A
+    /// server holds one process-level catalog and `RecordCache` for a tenant's
+    /// whole query stream, so its resolve phase is warm for every statement
+    /// after the first; without this flag the bench builds a cold executor per
+    /// statement and re-pays the resolve GETs each time, overstating
+    /// resolve-phase cost relative to that server (issue #857). Under it, only
+    /// the first statement's cold run is a genuine cold resolve. Applies to the
+    /// in-process lanes only; the Flight lane executes against a running server
+    /// that is already process-warm, so this flag does not reach it.
+    #[arg(long)]
+    warm_catalog: bool,
 
     // --- generated lane knobs ---------------------------------------------
     /// Distinct log records to generate.
@@ -342,6 +354,7 @@ async fn run(args: &Args) -> Result<SqlLatencyReport, ravel_bench::sql_latency::
                 parallel_final_aggregation: args.sql_parallel_final_aggregation,
                 max_segments: args.sql_max_segments,
                 explain_dir: explain_dir.clone(),
+                warm_catalog: args.warm_catalog,
                 flight: args.flight.as_ref().map(|endpoint| FlightTarget {
                     endpoint: endpoint.clone(),
                     token: args.flight_token.clone().or_else(|| {
@@ -377,6 +390,7 @@ async fn run(args: &Args) -> Result<SqlLatencyReport, ravel_bench::sql_latency::
                 parallel_final_aggregation: args.sql_parallel_final_aggregation,
                 max_segments: args.sql_max_segments,
                 explain_dir: explain_dir.clone(),
+                warm_catalog: args.warm_catalog,
             };
             run_generated(&cfg).await
         }
@@ -450,6 +464,15 @@ fn print_human_table(report: &SqlLatencyReport) {
     println!(
         "  max segs   : {}  explain: {}",
         p.sql_max_segments, p.explain
+    );
+    println!(
+        "  warm cat   : {} (resolve phase {})",
+        p.warm_catalog,
+        if p.warm_catalog {
+            "warm after the first statement, as a server's would be"
+        } else {
+            "cold per statement; overstates server resolve cost"
+        }
     );
     if p.cache_bytes > 0 {
         println!("  read cache : {} bytes", p.cache_bytes);
