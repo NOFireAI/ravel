@@ -340,7 +340,9 @@ async fn head_fresh_enough(
 /// `t/<tenant_hash>/catalog/<signal>/HEAD`. Reconstructed here rather than
 /// imported because it names a `pub(crate)` helper inside `ravel-catalog`;
 /// this task only ever uses it for the freshness peek above, never to
-/// mutate the object.
-fn head_key(tenant: &TenantHash, signal: Signal) -> String {
+/// mutate the object, and so does
+/// [`crate::fold_on_demand`], which shares this one spelling of the key
+/// rather than growing a second copy.
+pub(crate) fn head_key(tenant: &TenantHash, signal: Signal) -> String {
     format!("t/{}/catalog/{}/HEAD", tenant.to_hex(), signal.key_prefix())
 }
