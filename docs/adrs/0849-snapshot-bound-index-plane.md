@@ -574,7 +574,8 @@ number.
 
 The narrow, time-leading slice of ADR-0815 — cluster during compaction, lead
 with EventTime, publish narrow per-part bounds, exclude before any data GET — is
-**not sequenced by this ADR, and must not be measured on the ClickBench tenant.**
+**not sequenced by this ADR, and must not be justified by the ClickBench
+tenant.**
 An earlier draft landed it as item 2 on the strength of `q37`-`q43`, and
 Consequences now shows that reasoning was backwards: on that corpus a global
 EventTime sort would scatter the `CounterID` locality the surviving prune depends
@@ -586,11 +587,29 @@ serve both time ranges and high-cardinality point lookups — the latter is what
 point postings are for. What changes: EventTime-leading clustering is justified
 by **organic telemetry**, where ingest arrival order already correlates with
 event time and recent-window queries dominate, so the scattering hazard does not
-arise. It is therefore gated on a pre-registered A/B against `q37`-`q43` before
-touching any measured tenant, and on a target workload that is not a bulk-loaded
-entity-sorted corpus. For *this* tenant the selective clustering key would be
-`CounterID`, which is ADR-0815's deferred override-key path rather than the
-time-leading slice.
+arise. It is therefore gated on **two separate pre-registered A/Bs**, and they
+must not be conflated. Both are same binary, same tenant, one snapshot before
+clustering and one after, with the expected direction and pass band for every
+figure written down before any number exists. ADR-0815 acceptance 12 is these
+gates in normative form.
+
+1. **The `clickbench-v4` negative control.** Covers `q37` through `q43`
+   inclusive, `q43` required rather than optional: its `EventDate BETWEEN 15900
+   AND 15901` is the only genuine time window in the class, so it is the one
+   statement expected to improve and the only evidence the mechanism works at
+   all on this corpus. Its registered direction is a **regression** for
+   `q37`-`q42`. Passing means regressing as predicted, which confirms the
+   mechanism is understood; it is **never** evidence for enabling the key.
+2. **The telemetry enablement A/B**, which is what may justify enabling
+   EventTime as a default, and which must PASS its own band. `q37`-`q43` do not
+   apply to it: those identifiers are defined solely by the ClickBench corpus,
+   so requiring them of a telemetry workload would require statements that
+   workload does not contain. It names its own recent-window statements over
+   organically-arriving data and registers their own metric directions, in the
+   implementing ticket rather than here.
+
+For *this* tenant the selective clustering key would be `CounterID`, which is
+ADR-0815's deferred override-key path rather than the time-leading slice.
 
 ## Rejected alternatives
 
@@ -625,9 +644,13 @@ time-leading slice.
    handles ranges; postings handle points; neither substitutes for the other.
 
 7. **A general external-sort subsystem for arbitrary clustering keys, first.**
-   Rejected as sequencing: it is the most complex piece of ADR-0815 and its
-   value is unmeasured until basic time clustering has been landed and
-   measured. Deferred, not rejected on merit.
+   Rejected as sequencing: it is the most complex piece of ADR-0815, and this
+   ADR's own statistics pruning (§5) already covers `q37`-`q42` on this tenant
+   (and `q43`, whose real two-day window clustering would additionally help)
+   at far less machinery. Note the tension rather than hiding it: §6 states
+   that on this tenant the override key is the only clustering key that could
+   help, so the deferral is about complexity and sequencing, not about the
+   override path being the wrong key here. Deferred, not rejected on merit.
 
 ## Consequences
 
@@ -651,8 +674,12 @@ predicate is `CounterID = 62` at roughly 0.8% of rows, and the measured 144 of
 Pruning works today because the corpus arrives sorted by
 `(CounterID, EventDate, ...)` and the load preserves those runs, leaving blocks
 near-single-CounterID. A global EventTime sort would scatter each counter's rows
-evenly, leave roughly 60 matching rows in nearly every block, and stop that arm
-pruning at all. ADR-0815 carries the same misattribution.
+evenly, leave roughly 45 matching rows in nearly every block, and stop that arm
+pruning at all. `q43` is the exception and the only one: its window is
+`EventDate BETWEEN 15900 AND 15901`, two real days, so it would improve
+modestly. ADR-0815 carried the same misattribution in its Context and
+Acceptance; both were corrected under #859, and its acceptance 12 now carries
+the pre-registered A/B gate §6 refers to.
 
 **Queries that do not, and the honest count.** Full `SUM`/`AVG` over the corpus
 still scans without materialised aggregate states. **An index alone does not
