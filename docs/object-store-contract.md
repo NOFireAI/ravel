@@ -90,6 +90,35 @@ correctness but are inert under the client's HTTP/1.1 default (which we keep:
 HTTP/2 is slower for bulk S3 transfers), so under HTTP/1.1 connection liveness
 comes from the connect, request, and pool-idle timeouts.
 
+**A fixed timeout requires a bounded request, so the adapter bounds one.** Every
+request size is chosen by this crate except one: a whole-object read, whose size
+is whatever the object is. `max_l1_part_bytes` defaults to 256 MiB, 32x an 8 MiB
+multipart part, so no fixed timeout can cover both. `S3Store::get` therefore
+never issues an unranged GET: `GetRange::Full` is served as ranged requests of
+at most `S3HttpConfig::max_request_body_bytes()` bytes each, derived from the
+configured `request_timeout` as
+`(request_timeout - 6 s of connect/TLS/first-byte allowance) * 625 000 B/s`
+(a 5 Mbps floor rate), capped at the 8 MiB multipart part size so read and write
+share one largest-request-on-the-wire. At the default 20 s that is 8 MiB, ~13.4 s
+at the floor rate, inside the 14 s transfer budget; a compile-time assertion in
+`s3.rs` pins the inequality. A caller-supplied `GetRange::Range` is passed
+through unsplit: the caller sized that request itself.
+
+Cost of the split, in requests and wire bytes as transferred, excluding
+`object_store`'s internal per-request retries:
+
+| Object size | Requests | Wire bytes |
+|---|---|---|
+| 0 | 2 (one 416-refused ranged probe, then one unranged) | 0 body bytes |
+| 1 byte .. bound | 1 | the object |
+| above the bound | `ceil(size / bound)`, up to 4 in flight | the object, plus one response header set per additional request |
+
+The ranges partition the object exactly, so no byte is fetched twice. Every
+request after the first carries the first's ETag as an `If-Match`, so an object
+overwritten mid-read fails the read (retryable) rather than splicing two
+versions together; data objects are immutable, and the mutable pointer keys are
+all far below the bound, so this is a guard rather than a live path.
+
 **Worst-case wall time for one logical operation.** A request timeout is a
 retryable error, and `object_store` runs its own internal retry loop
 (`RetryConfig`, unchanged: `max_retries = 10`, `retry_timeout = 180 s`,
