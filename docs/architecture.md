@@ -385,10 +385,23 @@ refused with 403. There is no separate platform-operator credential in
 `ravel-server` today, so folding a tenant means holding that tenant's
 credential.
 
+**Admission.** Concurrent calls for one `(tenant, signal)` collapse into a
+single fold, through the same request-coalescing primitive the read cache
+uses: one call runs the fold, the others wait on its result and issue no
+object-store work at all, and each response reports which it was in
+`coalesced`. That is the route's admission gate. A fold LISTs commit records,
+GETs parts, and PUTs new parts plus `HEAD` whether or not anything turns out
+to be eligible, and a credential resolves to exactly one tenant, so this
+bounds any one caller to a single in-flight fold per signal. The route takes
+no query-admission permit: a fold is deferred maintenance traffic, runs on
+the background store handle (ADR-0070) like the scheduled fold, and must not
+be charged against the query hot path's ceiling.
+
 **Concurrency.** Safe to call concurrently with the scheduled fold and with
 itself. A fold publishes through the `HEAD` CAS protocol
 (docs/catalog-and-mvcc.md), so a losing CAS is an ordinary outcome, not
-corruption; the endpoint takes no lock of its own.
+corruption; the endpoint takes no lock over the catalog, and the coalescing
+above never queues behind a fold this process did not start.
 
 **Outcomes.** Every completed call is 200 and names one of three statuses,
 because "published a snapshot" and "there was nothing to publish" are
@@ -407,6 +420,18 @@ clock_skew_allowance + fold_safety_margin` has elapsed after that hour ends
 report -- watermark hours, buckets folded, entry count, and the per-phase
 request counts -- so a call that published can be checked against what it
 claims.
+
+`published` and `nothing_eligible` are told apart by the entry set the two
+`HEAD`s name, never by their entry totals: a single fold can fold new commits
+in and drop entries through a retention tombstone in the same pass, and when
+those cancel the total is identical over content that changed. Snapshot parts
+are content addressed, so a part carrying the same hash on both sides needs
+no read and only the remainder is fetched; a watermark-only rewrite leaves
+exactly one part differing. The GETs this costs are reported under their own
+`classify_get_requests` field rather than summed into the fold's counts, and
+a comparison that cannot be completed answers `published` and logs, because
+`nothing_eligible` asserts that no commit entered or left and an incomplete
+comparison has not shown that.
 
 A request that fails before the fold runs is an error body, not an outcome:
 401 with no credential, 400 for a missing or unknown `signal` or a malformed
