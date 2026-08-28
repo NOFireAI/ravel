@@ -588,8 +588,8 @@ async fn corrupt_per_block_cache_hit_fails_closed() {
 /// fraction, not the object size. With `coalesce_gap == 0`, the block-range GET
 /// count equals the number of maximal contiguous runs among candidate blocks; a
 /// suffix sized to the tail makes the fixed overhead exactly one probe GET plus
-/// one GET per uncovered front section (STREAM_DIR, FIELD_DIR). The asserted
-/// figures are exact, not "fewer than before".
+/// one coalesced GET for the two adjacent front sections (STREAM_DIR, FIELD_DIR,
+/// deliverable 4). The asserted figures are exact, not "fewer than before".
 #[tokio::test]
 async fn block_range_get_count_is_proportional_to_candidate_fraction() {
     let (records, bytes) = subset_object();
@@ -641,17 +641,22 @@ async fn block_range_get_count_is_proportional_to_candidate_fraction() {
         "candidate bytes {candidate_bytes} must be far under the block region {blocks_len}"
     );
 
-    // Total store GETs: probe (1) + front metadata (STREAM_DIR + FIELD_DIR = 2)
-    // + one per contiguous candidate run. The tail (SKIP_IDX/BLOOM/POSTINGS +
-    // footer) is covered by the probe, so it costs no extra GET.
-    let expected_total = 1 + 2 + expected_runs as u64;
+    // Total store GETs: probe (1) + front metadata (STREAM_DIR + FIELD_DIR are
+    // adjacent at the object front and fetched together in ONE coalesced GET,
+    // deliverable 4) + one per contiguous candidate run. The tail
+    // (SKIP_IDX/BLOOM/POSTINGS + footer) is covered by the probe, so it costs no
+    // extra GET.
+    let expected_total = 1 + 1 + expected_runs as u64;
     assert_eq!(
         counting.get_count(),
         expected_total,
-        "probe(1) + front-meta(2) + block runs({expected_runs})"
+        "probe(1) + coalesced front-meta(1) + block runs({expected_runs})"
     );
     assert_eq!(stats.probe_gets, 1);
-    assert_eq!(stats.metadata_gets, 2);
+    assert_eq!(
+        stats.metadata_gets, 1,
+        "STREAM_DIR + FIELD_DIR fetched in one coalesced front-section GET"
+    );
     assert!(!stats.whole_object);
 }
 
@@ -699,18 +704,33 @@ fn large_object() -> (Vec<LogRecord>, Vec<u8>) {
     (records, bytes)
 }
 
-/// Non-BLOCKS sections the probe window `[total - suffix, total)` does NOT
-/// already cover: one metadata GET each.
+/// The fixed non-BLOCKS section GET cost the probe window `[total - suffix,
+/// total)` does NOT already cover: the two adjacent FRONT sections (STREAM_DIR,
+/// FIELD_DIR) as ONE coalesced GET when either is uncovered (deliverable 4;
+/// always uncovered here, since a suffix probe never reaches the front), plus
+/// one GET per uncovered TAIL section.
 fn uncovered_sections(bytes: &[u8], suffix: u64) -> u64 {
     let footer = footer::open(bytes).expect("footer");
     let total = bytes.len() as u64;
     let probe_start = total.saturating_sub(suffix);
-    footer
-        .sections
-        .iter()
-        .filter(|s| s.kind != kind::BLOCKS)
-        .filter(|s| s.offset < probe_start || s.offset + s.len > total)
-        .count() as u64
+    let is_front = |k: u32| k == kind::STREAM_DIR || k == kind::FIELD_DIR;
+    let mut front_get = 0u64;
+    let mut tail_gets = 0u64;
+    for s in &footer.sections {
+        if s.kind == kind::BLOCKS {
+            continue;
+        }
+        let uncovered = s.offset < probe_start || s.offset + s.len > total;
+        if !uncovered {
+            continue;
+        }
+        if is_front(s.kind) {
+            front_get = 1;
+        } else {
+            tail_gets += 1;
+        }
+    }
+    front_get + tail_gets
 }
 
 /// Coalesced runs among candidate extents at a gap threshold: the exact number
@@ -886,10 +906,17 @@ async fn cached_partitions_striping_one_large_segment_cost_a_partition_independe
         let seg = seg_ref("logs/big.rlog", bytes.len() as u64, &records);
         let query = LogQuery::new(ts_min, ts_max);
 
-        // Production defaults throughout: no threshold override, no probe-length
-        // override, no coverage override. Only the cache is wired, exactly as
-        // `build_sql_state` wires it.
-        let fetcher = LogSegmentFetcher::new(store).with_cache(big_cache());
+        // Production defaults for probe length and coverage; the cache is wired
+        // exactly as `build_sql_state` wires it. The request cost is lowered to
+        // 64 KiB so this deliberately sub-MB fixture stays ABOVE the
+        // request-aware whole-object threshold (5 x request-cost, floored at 512
+        // KiB) and exercises the ranged protocol this test is about. The
+        // single-flight/coalescing property under test is independent of the
+        // request cost, and at 64 KiB the effective coalescing gap is the
+        // 64 KiB `DEFAULT_LOG_COALESCE_GAP` the oracle uses.
+        let fetcher = LogSegmentFetcher::new(store)
+            .with_cache(big_cache())
+            .with_request_cost_bytes(ravel_query::DEFAULT_LOG_COALESCE_GAP);
         assert!(
             fetcher.has_cache(),
             "the ADR-0102 fan-out gate this test stands in for reads has_cache()"
@@ -994,7 +1021,11 @@ async fn concurrent_cold_partitions_collapse_onto_one_get_per_extent() {
     let store: Arc<dyn ObjectStoreBackend> = counting.clone();
     let seg = seg_ref("logs/cold.rlog", bytes.len() as u64, &records);
 
-    let br = BlockRangeFetcher::new(store).with_cache(big_cache());
+    // Request cost lowered to 64 KiB so this sub-MB fixture stays above the
+    // request-aware whole-object threshold and takes the ranged path; see test 6.
+    let br = BlockRangeFetcher::new(store)
+        .with_cache(big_cache())
+        .with_request_cost_bytes(ravel_query::DEFAULT_LOG_COALESCE_GAP);
     let mut tasks = Vec::new();
     for _ in 0..PARTITIONS {
         let br = br.clone();
@@ -1075,7 +1106,11 @@ async fn concurrent_cold_partitions_collapse_onto_one_get_per_extent_tiered() {
     let seg = seg_ref("logs/cold-tiered.rlog", bytes.len() as u64, &records);
 
     let tmp = tempfile::TempDir::new().expect("temp dir for the disk cache tier");
-    let br = BlockRangeFetcher::new(store).with_cache(big_tiered_cache(tmp.path()));
+    // Request cost lowered to 64 KiB so this sub-MB fixture stays above the
+    // request-aware whole-object threshold and takes the ranged path; see test 6.
+    let br = BlockRangeFetcher::new(store)
+        .with_cache(big_tiered_cache(tmp.path()))
+        .with_request_cost_bytes(ravel_query::DEFAULT_LOG_COALESCE_GAP);
     let mut tasks = Vec::new();
     for _ in 0..PARTITIONS {
         let br = br.clone();
@@ -1159,7 +1194,13 @@ async fn corrupt_block_hit_fails_closed_with_only_blocks_resident() {
         );
     }
 
-    let br = BlockRangeFetcher::new(store).with_cache(cache);
+    // Request cost lowered to 64 KiB so this sub-MB fixture stays above the
+    // request-aware whole-object threshold and takes the per-block ranged path
+    // whose cache-hit gate is under test (see test 6); a whole-object read would
+    // never consult the pre-admitted per-block entries.
+    let br = BlockRangeFetcher::new(store)
+        .with_cache(cache)
+        .with_request_cost_bytes(ravel_query::DEFAULT_LOG_COALESCE_GAP);
     let err = br
         .fetch_object(&seg, TENANT, ts_min, ts_max, &QueryAccounting::new())
         .await
@@ -1310,3 +1351,217 @@ async fn page_decode_accounting_is_a_separate_axis_from_wire_bytes() {
 // (`version_4_object_is_read_whole_until_the_page_dir_fetcher_lands`, now
 // `version_4_projected_read_fetches_one_range_per_group_and_column`), live in
 // `tests/log_page_dir_fetch.rs`.
+
+// ---- Tests 10-11: the request-cost-driven decisions (issues #835, #862) -----
+//
+// The whole-object-vs-ranged decision is driven from one configurable quantity,
+// the request cost (a latency-bandwidth product; `BlockRangeFetcher::
+// with_request_cost_bytes`), not from a byte-only size threshold. These two
+// tests pin that: the SAME protocol reads a sub-break-even object whole and an
+// above-break-even object ranged, and a large coalescing gap (also driven from
+// the request cost) never turns a genuinely narrow read into a whole-object one.
+
+/// The size-threshold crossover is request-cost driven: with the request cost
+/// set so the break-even (`WHOLE_OBJECT_REQUEST_MULTIPLE` = 5 request-costs)
+/// lands at 700 KiB, an object below it is read whole in ONE GET and an object
+/// above it takes the probe+ranged path, WITHOUT any explicit
+/// `with_whole_object_threshold` -- the decision consults the request cost
+/// alone. Request counts are exact, not "fewer than before".
+///
+/// Prove-the-test: reverting the `<= self.effective_whole_object_threshold()`
+/// comparison in `fetch_object_with_footer` to the old byte-only `<=
+/// self.whole_object_threshold` (with the field back to a `u64` default of 512
+/// KiB) reads the 960 KiB object whole too -- `!stats.whole_object` then fails on
+/// the large fixture, since 960 KiB is above 512 KiB but a whole-object read at
+/// 512 KiB threshold would have taken the ranged path; the request-aware
+/// threshold (700 KiB) is what keeps the large one ranged while reading the
+/// small one whole.
+#[tokio::test]
+async fn whole_object_vs_ranged_is_driven_by_the_request_cost() {
+    // 5 * 140 KiB = 700 KiB break-even, above the 512 KiB floor so the
+    // request-derived value (not the floor) is what decides.
+    const REQUEST_COST: u64 = 140 * 1024;
+    let break_even = 5 * REQUEST_COST;
+
+    // Small side: the 20-block subset object, far under the break-even.
+    let (small_recs, small_bytes) = subset_object();
+    let small_total = small_bytes.len() as u64;
+    assert!(
+        small_total < break_even,
+        "small fixture {small_total} must sit below the {break_even} B break-even"
+    );
+    let small_mem = Arc::new(MemoryStore::new());
+    small_mem
+        .put(
+            "logs/small.rlog",
+            small_bytes.clone().into(),
+            PutOptions::default(),
+        )
+        .await
+        .expect("put small");
+    let small_seg = seg_ref("logs/small.rlog", small_total, &small_recs);
+    let small_counting = Arc::new(CountingStore::new(small_mem));
+    let small_store: Arc<dyn ObjectStoreBackend> = small_counting.clone();
+    let (_small_buf, small_stats) = BlockRangeFetcher::new(small_store)
+        .with_request_cost_bytes(REQUEST_COST)
+        .fetch_object(
+            &small_seg,
+            TENANT,
+            i64::MIN,
+            i64::MAX,
+            &QueryAccounting::new(),
+        )
+        .await
+        .expect("small fetch");
+    assert!(
+        small_stats.whole_object,
+        "an object below the break-even is read whole"
+    );
+    assert_eq!(
+        small_counting.get_count(),
+        1,
+        "the whole-object read is exactly one GET"
+    );
+    assert_eq!(small_stats.block_range_gets, 0, "no ranged block GETs");
+
+    // Large side: the 40-block, ~960 KiB object, above the break-even.
+    let (large_recs, large_bytes) = large_object();
+    let large_total = large_bytes.len() as u64;
+    assert!(
+        large_total > break_even,
+        "large fixture {large_total} must sit above the {break_even} B break-even"
+    );
+    let (_blocks_offset, _blocks_len, tail) = layout(&large_bytes);
+    let (ts_min, ts_max) = (2, 11);
+    let cands = candidate_extents(&large_bytes, ts_min, ts_max);
+    let effective_gap = REQUEST_COST.max(ravel_query::DEFAULT_LOG_COALESCE_GAP);
+    let expected_runs = coalesced_runs(cands.clone(), effective_gap);
+    assert!(
+        !cands.is_empty() && (cands.len() as u64) < 40,
+        "a strict nontrivial candidate subset, got {}",
+        cands.len()
+    );
+
+    let large_mem = Arc::new(MemoryStore::new());
+    large_mem
+        .put(
+            "logs/large.rlog",
+            large_bytes.clone().into(),
+            PutOptions::default(),
+        )
+        .await
+        .expect("put large");
+    let large_seg = seg_ref("logs/large.rlog", large_total, &large_recs);
+    let large_counting = Arc::new(CountingStore::new(large_mem));
+    let large_store: Arc<dyn ObjectStoreBackend> = large_counting.clone();
+    let (_large_buf, large_stats) = BlockRangeFetcher::new(large_store)
+        .with_request_cost_bytes(REQUEST_COST)
+        // Probe the tail exactly, so the front sections are the only uncovered
+        // metadata and the candidate GETs are clean.
+        .with_suffix_len(tail)
+        .fetch_object(&large_seg, TENANT, ts_min, ts_max, &QueryAccounting::new())
+        .await
+        .expect("large fetch");
+    assert!(
+        !large_stats.whole_object,
+        "an object above the break-even takes the ranged path"
+    );
+    assert_eq!(
+        large_stats.probe_gets, 1,
+        "one etag-establishing suffix probe"
+    );
+    assert_eq!(
+        large_stats.metadata_gets, 1,
+        "STREAM_DIR + FIELD_DIR in one coalesced front-section GET"
+    );
+    assert_eq!(
+        large_stats.block_range_gets, expected_runs,
+        "one coalesced GET per candidate run at the request-cost-derived gap"
+    );
+    assert_eq!(
+        large_counting.get_count(),
+        1 + 1 + expected_runs,
+        "probe(1) + coalesced front-meta(1) + block runs({expected_runs})"
+    );
+}
+
+/// The coverage crossover is the backstop that keeps a large coalescing gap from
+/// silently turning a genuinely narrow read into a whole-object one: coverage is
+/// measured on the real candidate bytes (gap-independent), so a narrow candidate
+/// set stays under the crossover and on the ranged path no matter how large the
+/// gap coalesces its runs, while a set that genuinely covers most of the object
+/// still crosses over. This is what stops the item-3 gap widening from undoing
+/// the item-2 whole-object decision.
+///
+/// Prove-the-test: if coverage were instead measured on the post-coalesce run
+/// bytes, the huge gap would inflate the narrow read's run to nearly the whole
+/// object and `!narrow_stats.whole_object` would fail. It holds because the
+/// crossover's numerator is the candidate extents' own bytes.
+#[tokio::test]
+async fn a_large_coalesce_gap_does_not_cross_a_narrow_read_over_to_whole_object() {
+    const REQUEST_COST: u64 = 140 * 1024;
+    let (records, bytes) = large_object();
+    let total = bytes.len() as u64;
+    let (_blocks_offset, blocks_len, tail) = layout(&bytes);
+    let mem = Arc::new(MemoryStore::new());
+    mem.put("logs/gap.rlog", bytes.clone().into(), PutOptions::default())
+        .await
+        .expect("put");
+    let seg = seg_ref("logs/gap.rlog", total, &records);
+
+    // A gap as large as the whole object: every candidate run would fuse.
+    let make = |store: Arc<dyn ObjectStoreBackend>| {
+        BlockRangeFetcher::new(store)
+            .with_request_cost_bytes(REQUEST_COST)
+            .with_suffix_len(tail)
+            .with_coalesce_gap(total)
+    };
+
+    // Narrow: a two-block ts window. Its candidate bytes are a small fraction of
+    // BLOCKS, so coverage is far under the 0.75 crossover.
+    let (narrow_min, narrow_max) = (2, 3);
+    let narrow_cands = candidate_extents(&bytes, narrow_min, narrow_max);
+    let narrow_bytes: u64 = narrow_cands.iter().map(|(_, l, _)| *l).sum();
+    let narrow_coverage = narrow_bytes as f64 / blocks_len as f64;
+    assert!(
+        narrow_coverage < ravel_query::DEFAULT_LOG_COVERAGE_THRESHOLD,
+        "the narrow set must be genuinely under the coverage crossover, got {narrow_coverage}"
+    );
+    let narrow_counting = Arc::new(CountingStore::new(mem.clone()));
+    let (_buf, narrow_stats) = make(narrow_counting.clone())
+        .fetch_object(
+            &seg,
+            TENANT,
+            narrow_min,
+            narrow_max,
+            &QueryAccounting::new(),
+        )
+        .await
+        .expect("narrow fetch");
+    assert!(
+        !narrow_stats.whole_object,
+        "a genuinely narrow read stays ranged even at a whole-object-sized gap"
+    );
+    assert_eq!(
+        narrow_stats.candidate_blocks,
+        narrow_cands.len() as u64,
+        "the candidate set is the narrow ts window's blocks"
+    );
+    assert_eq!(
+        narrow_stats.block_range_gets, 1,
+        "the huge gap fuses the narrow candidates into exactly one run"
+    );
+
+    // Wide control: every block a candidate. Coverage reaches ~1.0, so the SAME
+    // configuration crosses over to one whole-object GET -- the crossover tracks
+    // genuine coverage, not the gap.
+    let wide_counting = Arc::new(CountingStore::new(mem));
+    let (_buf, wide_stats) = make(wide_counting)
+        .fetch_object(&seg, TENANT, i64::MIN, i64::MAX, &QueryAccounting::new())
+        .await
+        .expect("wide fetch");
+    assert!(
+        wide_stats.whole_object,
+        "a read whose candidates cover the object still crosses over to whole-object"
+    );
+}
