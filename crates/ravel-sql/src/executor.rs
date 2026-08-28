@@ -661,10 +661,18 @@ impl SqlExecutor {
                 // last fold's build/PUT failed -- reproduces the
                 // pre-ADR-0850 provider exactly; every metadata-only path
                 // keyed off it degrades to scanning on a `None`.
-                let column_stats = self
-                    .catalog
-                    .load_column_stats(&tenant_hash, Signal::Logs)
-                    .await?;
+                let column_stats = if extras.declared.is_empty() {
+                    // No configured typed columns: no metadata-only column path
+                    // can ever apply, so skip the HEAD GET load_column_stats
+                    // would issue. This keeps a predicate-free COUNT(*) on a
+                    // tenant with no declared columns reading zero objects, and
+                    // reproduces the pre-ADR-0850 provider exactly.
+                    None
+                } else {
+                    self.catalog
+                        .load_column_stats(&tenant_hash, Signal::Logs)
+                        .await?
+                };
                 SessionTable::Logs(Arc::new(
                     LogsTableProvider::new(
                         snapshot,
