@@ -466,12 +466,15 @@ fn print_human_table(report: &SqlLatencyReport) {
         p.sql_max_segments, p.explain
     );
     println!(
-        "  warm cat   : {} (resolve phase {})",
-        p.warm_catalog,
-        if p.warm_catalog {
-            "warm after the first statement, as a server's would be"
-        } else {
-            "cold per statement; overstates server resolve cost"
+        "  warm cat   : {}",
+        match p.warm_catalog {
+            Some(true) =>
+                "true (resolve phase warm after the first statement, as a server's would be)",
+            Some(false) =>
+                "false (resolve phase cold per statement; overstates server resolve cost)",
+            // The Flight lane builds no in-process executor, so the flag
+            // governed nothing on the wire (issue #857 review).
+            None => "n/a (Flight lane; the server governs resolve caching)",
         }
     );
     if p.cache_bytes > 0 {
