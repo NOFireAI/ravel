@@ -385,17 +385,22 @@ refused with 403. There is no separate platform-operator credential in
 `ravel-server` today, so folding a tenant means holding that tenant's
 credential.
 
-**Admission.** Concurrent calls for one `(tenant, signal)` collapse into a
-single fold, through the same request-coalescing primitive the read cache
-uses: one call runs the fold, the others wait on its result and issue no
-object-store work at all, and each response reports which it was in
-`coalesced`. That is the route's admission gate. A fold LISTs commit records,
-GETs parts, and PUTs new parts plus `HEAD` whether or not anything turns out
-to be eligible, and a credential resolves to exactly one tenant, so this
-bounds any one caller to a single in-flight fold per signal. The route takes
-no query-admission permit: a fold is deferred maintenance traffic, runs on
-the background store handle (ADR-0070) like the scheduled fold, and must not
-be charged against the query hot path's ceiling.
+**Admission.** A fold LISTs commit records, GETs parts, and PUTs new parts
+plus `HEAD` whether or not anything turns out to be eligible, so two gates keep
+a caller from multiplying that cost. Concurrent calls for one `(tenant,
+signal)` collapse into a single fold, through the same request-coalescing
+primitive the read cache uses: one call runs the fold, the others wait on its
+result and issue no object-store work at all, and each response reports which
+it was in `coalesced`. That bounds concurrency, not rate: sequential calls do
+not overlap, so coalescing alone would let a caller run one full fold per call.
+The rate gate closes that: before folding, the route reads `HEAD` and, if it
+was published more recently than the fold interval (the same value the
+scheduled loop skips a tick on), returns `throttled` without listing anything.
+A credential resolves to exactly one tenant, so together the two gates bound
+any one caller to a single fold per signal per interval. The route takes no
+query-admission permit: a fold is deferred maintenance traffic, runs on the
+background store handle (ADR-0070) like the scheduled fold, and must not be
+charged against the query hot path's ceiling.
 
 **Concurrency.** Safe to call concurrently with the scheduled fold and with
 itself. A fold publishes through the `HEAD` CAS protocol
@@ -403,15 +408,16 @@ itself. A fold publishes through the `HEAD` CAS protocol
 corruption; the endpoint takes no lock over the catalog, and the coalescing
 above never queues behind a fold this process did not start.
 
-**Outcomes.** Every completed call is 200 and names one of three statuses,
-because "published a snapshot" and "there was nothing to publish" are
-different facts an operator has to tell apart:
+**Outcomes.** Every completed call is 200 and names one of four statuses,
+because "published a snapshot", "there was nothing to publish", and "a fold ran
+too recently to run another" are different facts an operator has to tell apart:
 
 | `status` | Meaning |
 |---|---|
 | `published` | A new snapshot was published: `HEAD` now names content that differs from what it named before. |
 | `nothing_eligible` | No commit was eligible to fold. The response's `head_advanced` says whether the sealing watermark still moved (`true`, a watermark-only rewrite over empty hours) or `HEAD` was untouched (`false`). |
 | `lost_cas` | A concurrent fold (the scheduled loop, or another call) won the `HEAD` CAS. That fold's snapshot is the current `HEAD`; this call published none. |
+| `throttled` | The rate gate declined to fold because `HEAD` was published more recently than the fold interval. No listing ran, so this call makes no eligibility claim; it is deliberately distinct from `nothing_eligible`, which asserts a negative the throttle never checked. |
 
 `nothing_eligible` is the expected answer immediately after a load, and is
 not a failure: a fold seals an ingest hour only once `max_flush_lifetime +
@@ -433,11 +439,16 @@ a comparison that cannot be completed answers `published` and logs, because
 `nothing_eligible` asserts that no commit entered or left and an incomplete
 comparison has not shown that.
 
-A request that fails before the fold runs is an error body, not an outcome:
-401 with no credential, 400 for a missing or unknown `signal` or a malformed
-body, 403 for a body naming another tenant, 503 for a store or catalog fault
-(logged in full server-side, redacted in the response like the query
-surfaces').
+A request that fails is an error body, not an outcome: 401 with no credential,
+400 for a missing or unknown `signal` or a malformed body, 403 for a body
+naming another tenant, 503 for a store or catalog fault (logged in full
+server-side, redacted in the response like the query surfaces'). The
+authentication and validation errors (401/400/403) do precede the fold, so on
+them no object-store work happened. A 503 does not carry that guarantee: it is
+also returned for a `CatalogError` raised by `Catalog::fold` itself and for a
+lost single-flight leader, and in both cases the fold may have already written
+snapshot parts before failing. Treat a 503 as "the outcome is unknown, retry",
+not as "nothing was written".
 
 ## Alert evaluation
 

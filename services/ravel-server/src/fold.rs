@@ -332,7 +332,17 @@ async fn head_fresh_enough(
     let Ok(head) = ravel_catalog::decode_head(&got.data) else {
         return false;
     };
-    let age_ns = now_ns.saturating_sub(head.created_unix_ns);
+    head_is_fresh(head.created_unix_ns, now_ns, interval)
+}
+
+/// Whether a HEAD published at `created_unix_ns` is younger than `interval` as
+/// of `now_ns`. The freshness predicate behind [`head_fresh_enough`], factored
+/// out so the on-demand route ([`crate::fold_on_demand`]) applies the same rule
+/// to a HEAD it has already read rather than growing a second freshness notion.
+/// A zero `interval` is never fresh (age is always `>= 0`), which is how a
+/// caller opts out of the gate.
+pub(crate) fn head_is_fresh(created_unix_ns: i64, now_ns: i64, interval: Duration) -> bool {
+    let age_ns = now_ns.saturating_sub(created_unix_ns);
     age_ns >= 0 && (age_ns as u128) < interval.as_nanos()
 }
 
