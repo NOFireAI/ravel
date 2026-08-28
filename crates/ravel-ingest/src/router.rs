@@ -102,7 +102,10 @@ impl IngestRouter {
         clock: Arc<dyn Clock>,
         rng: Arc<dyn RngSource>,
     ) -> Self {
-        let metrics = Arc::new(IngestMetrics::default());
+        // Preallocate the lock-free per-shard skew accumulators for this
+        // router's fixed shard set (issue #865), so the per-message enqueue and
+        // process paths never contend on a shared lock.
+        let metrics = Arc::new(IngestMetrics::new(config.shard_count));
         #[cfg(feature = "stage-timing")]
         let stage_timings = Arc::new(MetricStageTimings::new());
         // Each generation's shard-actor set gets a fresh writer identity, so

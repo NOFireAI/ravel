@@ -219,9 +219,7 @@ async fn slow_flush_time_lands_off_actor_not_on_actor() {
     // completes. The flush task brackets `run_flush` on the same clock, so its
     // recorded off-actor time is exactly SLOW.
     tokio::join!(router.flush_all(), async {
-        while slow_store.hits() < 1 {
-            tokio::task::yield_now().await;
-        }
+        await_slow_puts(&slow_store, 1).await;
         clock.advance_ns(SLOW.as_nanos() as i64);
     });
 
@@ -267,6 +265,14 @@ fn contended_flush_config() -> IngestConfig {
     }
 }
 
+/// Upper bound on the injected-clock spin helpers below. The happy path only
+/// yields a handful of times before the condition holds, so this real-clock
+/// timeout never fires there and no injected time passes. If the actor never
+/// reaches the expected state, the wrapped spin fails naming the condition it
+/// was waiting on instead of hanging until the harness kills the whole run
+/// (issue #865 review, item 6).
+const SPIN_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Spins until the shard actor has merged `n` points in total. `buffered_*` is
 /// incremented in `handle_write` before the flush trigger, and the only
 /// suspension point between that increment and the flush-permit acquire is the
@@ -274,18 +280,36 @@ fn contended_flush_config() -> IngestConfig {
 /// observing this count from the test task means the actor has already reached
 /// (and parked on) that acquire.
 async fn await_points_merged(router: &IngestRouter, n: u64) {
-    while router.metrics().snapshot().buffered_points_total < n {
-        tokio::task::yield_now().await;
-    }
+    tokio::time::timeout(SPIN_TIMEOUT, async {
+        while router.metrics().snapshot().buffered_points_total < n {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "actor never merged {n} points within {SPIN_TIMEOUT:?}: reached {}",
+            router.metrics().snapshot().buffered_points_total
+        )
+    });
 }
 
 /// Spins until `store` has entered its artificial delay `n` times, i.e. `n`
 /// flushes have their data PUT genuinely in flight and stalled on the injected
 /// clock.
 async fn await_slow_puts(store: &SlowStore, n: u64) {
-    while store.hits() < n {
-        tokio::task::yield_now().await;
-    }
+    tokio::time::timeout(SPIN_TIMEOUT, async {
+        while store.hits() < n {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "store never reached {n} slow PUTs within {SPIN_TIMEOUT:?}: reached {}",
+            store.hits()
+        )
+    });
 }
 
 /// The defect this test exists for: at `max_inflight_flushes`, a size-triggered
