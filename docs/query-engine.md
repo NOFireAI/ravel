@@ -133,6 +133,47 @@ partially credited. A distributed coordinator (ADR-0071) also reports
 every filter `Inexact`, since its fan-out pushes no filter to the workers
 and needs each one back as a residual.
 
+## Logs aggregates from exact per-object column statistics
+
+Two further aggregate shapes are answered entirely from ADR-0850's exact
+per-object column statistics, with zero data-block GETs and no `LogsScanExec`
+in the plan. The statistics are built at fold time (one exact decode pass per
+L0 object over each configured typed attribute column, stored in an RCST1
+object bound to the covered part set) and loaded once per query by
+`Catalog::load_column_stats`; the query-side rewrite is `MetadataOnlyAggregate`
+(crates/ravel-sql/src/metadata_agg.rs), which replaces the aggregate subtree
+with a `MetadataOnlyExec` leaf whose `EXPLAIN` line reads
+`MetadataOnlyExec: metadata_only=true, rows=<n>`. The two shapes are:
+
+- **q02** — `SELECT COUNT(*) FROM logs WHERE <declared column> <> <literal>`,
+  one residual filter over the scan and no `GROUP BY`. Answered as
+  `sum over segments of (non_null_count - count(value = literal))`, read from
+  each segment's exact dictionary. NULL rows are excluded, matching SQL
+  three-valued logic for `<>`.
+- **q08** — `SELECT <declared column>, COUNT(*) FROM logs GROUP BY <declared
+  column>`, a plain declared-column group key directly over the scan and no
+  filter. Answered by merging every touched segment's exact dictionary by
+  value, plus the summed `null_count` as a synthetic NULL group when nonzero.
+
+Both are additive to DataFusion's built-in `AggregateStatistics` rule (which
+handles the predicate-free `COUNT(*)` above and can never fire for either
+shape here, since it requires no `GROUP BY` and no residual filter). The
+column index a filter or group key carries is in the scan's output space by
+the time the rule runs (projection pushdown has already run), so the rule
+resolves it through the scan's projection before reading statistics.
+
+The rule declines -- leaving the plan's `LogsScanExec` in place to answer by
+scanning, exactly as it would have without ADR-0850 -- whenever exactness
+cannot be proven. It declines whenever ANY selective erasure is pending in the
+snapshot (ADR-0064): the committed dictionary counts still include rows the
+erasure removes, so no metadata-only answer can be exact until the erasure is
+applied. It also declines for a `Str`-typed declared column, a predicate or
+group key over a non-declared column, a segment with no loaded statistics, and
+a segment whose per-value dictionary the fold omitted for exceeding the
+cardinality ceiling (ADR-0850 decision 3) -- an omitted dictionary carries no
+exact per-value counts, so a derived count could be wrong outright, not merely
+unavailable.
+
 ## Predicate-free full-window logs scan: request count
 
 Every OTHER predicate-free, full-window logs statement — `SUM`, `AVG`,
