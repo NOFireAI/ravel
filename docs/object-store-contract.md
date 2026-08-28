@@ -65,6 +65,42 @@ jittered exponential backoff. `AlreadyExists` on `CreateIfAbsent` is a
 *protocol signal*, not an error to retry. `AccessDenied` is permanent and
 alerts differently (misconfigured credentials or prefix policy).
 
+### HTTP client timeouts (S3 adapter)
+
+The `S3Store` adapter builds its `object_store` `AmazonS3` client on an
+explicit `ClientOptions` (`S3HttpConfig`), so the request, connect, and
+pool-idle timeouts are deliberate values this repo chose, not whatever the
+dependency happens to default to. The `S3HttpConfig` doc comment carries the
+per-value reasoning; the values (defaults, overridable via
+`S3Store::with_http_config`) are:
+
+| Value | Configured | Inherited default it replaces |
+|---|---|---|
+| Request timeout (connect → body complete) | 20 s | 30 s |
+| Connect timeout (TCP + TLS) | 3 s | 5 s |
+| Pool idle timeout | 30 s | ~90 s (reqwest, uncapped) |
+| HTTP/2 keep-alive interval / ack timeout | 10 s / 10 s, while-idle on | disabled |
+
+The request timeout must stay above the tail of the largest single request on
+the wire (an 8 MiB multipart part or a whole-object GET) even on a badly
+degraded connection, so it is set conservatively at 20 s pending a tail-latency
+measurement to tighten it; a timeout below the real tail turns a slow-but-
+succeeding request into a retry storm. The HTTP/2 keep-alive knobs are set for
+correctness but are inert under the client's HTTP/1.1 default (which we keep:
+HTTP/2 is slower for bulk S3 transfers), so under HTTP/1.1 connection liveness
+comes from the connect, request, and pool-idle timeouts.
+
+**Worst-case wall time for one logical operation.** A request timeout is a
+retryable error, and `object_store` runs its own internal retry loop
+(`RetryConfig`, unchanged: `max_retries = 10`, `retry_timeout = 180 s`,
+jittered exponential backoff), stopping before it *starts* a retry once 180 s
+have elapsed since the first attempt. The final in-flight attempt still runs
+its full 20 s, so one logical operation can spend about `retry_timeout +
+request_timeout` = 180 s + 20 s ≈ 200 s inside the adapter before surfacing an
+error. Callers bound this from above: every caller passes a deadline and the
+trait honors cancellation by drop, so the query deadline (usually well under
+180 s) is what ends one operation in practice.
+
 ### Semantics adapters MUST honor
 
 - Conditional-put failure maps by mode: under `CreateIfAbsent` a
