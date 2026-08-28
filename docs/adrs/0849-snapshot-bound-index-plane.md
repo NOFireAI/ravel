@@ -93,11 +93,65 @@ additive key-layout change: a new suffix under a prefix that already exists,
 already carries `.npost`, and is already covered by supersession GC. No new
 prefix, no new lifecycle.
 
-The `IndexRoot` is bound to the **exact ordered snapshot-part hashes**, exactly
-as `.npost` is today, and a pack decoded against a different part set is
-rejected rather than trusted. Postings address **snapshot-entry ordinals**, not
-repeated object keys, so a posting list costs a varint per match rather than a
-key.
+Binding is **two-level, and this is load-bearing**. The `IndexRoot` alone binds
+the exact ordered snapshot-part hashes, exactly as `.npost` does today. **Leaf
+packs bind per part** (or per stable part prefix — non-tail parts key on a
+stable `watermark_hour` per ADR-0063, so prefixes survive appends), with
+ordinals **part-local**.
+
+Whole-set binding on every leaf was the draft's design and it is wrong. Every
+content-changing fold appends or replaces a part, so exact-whole-set binding
+would unbind **every** pack on **every** fold, even where no ordinal moved. For
+one small `.npost` object that is free; for point postings over ~10^7 distinct
+values plus gram packs over a 12 GB corpus it means rebuilding the entire index
+plane per fold, and on a live-ingest tenant folding hourly the index rebuild
+bytes can exceed the ingested bytes. It also contradicts the incremental build
+pipeline in §3 — building fragments during compaction only to discard them on
+every publish.
+
+With two-level binding an appended tail invalidates only the root (small), and
+a compacted hour invalidates only that hour's packs. A pack decoded against a
+part set it does not bind is rejected rather than trusted, unchanged.
+
+### 1a. The lifecycle is NOT inherited. It must be extended first.
+
+The draft claimed new pack suffixes inherit the existing GC lifecycle. **That is
+false, and the failure is destructive rather than leaky.**
+`sweep_unreferenced_catalog_objects` lists the whole `idx/` prefix — so new
+suffixes *are* swept — but its reference set is exactly `HEAD.parts[].key` plus
+the optional `postings.key`. A pack the `HEAD` does not name is an unreferenced
+object and is **deleted** once past the 25 h 05 m protection horizon.
+
+Therefore, in this order, before any fold writes a pack:
+
+1. Extend `SnapshotHead` to name the `IndexRoot`, and decide how the sweeper
+   protects **leaves**: either the `HEAD` names every pack key, or the sweeper
+   decodes roots to build its reference set. This interacts with the binding
+   granularity above and must be settled with it.
+2. Ship and fully roll out the sweeper's reference-set change **before** the
+   first pack-writing fold reaches production.
+
+Two rolling-upgrade hazards, both the ADR-0066 decision 2 shape, and both must
+be closed by that ordering rather than by hope:
+
+- an **old sweeper** decodes a new `HEAD`, drops the unknown proto field,
+  computes the old reference set, and reaps live packs at the horizon;
+- a **lagging folder** decodes the new `HEAD`, ignores the unknown index field,
+  and CASes a `HEAD` *without* it — after which the sweeper reaps.
+
+Correctness survives both via fail-open, but the index plane silently
+self-destructs on every mixed-version window and must be rebuilt. This makes
+`HEAD` and sweeper plumbing **wave 0** of the epic, not a later concern.
+
+**Intermediate fragments have the same problem and the same answer.** The L1
+fragments of §3 are objects no `HEAD` ever names, written by a compaction that
+may die before the fold consumes them. They are therefore unreferenced from the
+moment they exist. Rather than invent a second reference-set mechanism for
+them, fragments are **fold-side only**: built and consumed within a single fold
+without a separate durable lifecycle, or, if they must outlive their producer,
+they get an explicit key prefix, an abandonment deadline shorter than the
+protection horizon, and their own reclamation rule stated here before any code
+writes one. An orphan class with no owner is how storage leaks start.
 
 ### 2. Routing must never be per-object
 
@@ -109,6 +163,26 @@ construction**: it replaces 3,469 data GETs with 3,469 index GETs and moves
 nothing. This is the constraint that rules out the obvious "put an index next
 to each object" approach, and any future proposal must be checked against it.
 
+**Normative routing budget.** "Small" and "a few" are not enforceable, so the
+caps are stated and asserted per phase:
+
+- **root probe: at most 1 GET** per (tenant, signal) per query, cache-missable;
+- **leaf probes: at most `L` GETs** for a single-field point predicate, `L`
+  fixed per pack layout and declared in the root, never a function of object
+  count;
+- cold routing therefore costs **at most 2 sequential round trips** before the
+  first data GET — call it 40-100 ms in-region, which is why cold index numbers
+  are published separately from hot ones (see Consequences).
+
+A query whose routing exceeds its budget fails the shape lint rather than
+silently costing more than the scan it replaced. This makes the per-object
+rejection above mechanical instead of a matter of review taste.
+
+**Bloom pre-check first.** ADR-0050 §2's tenant-hash pre-check runs before any
+index probe. A predicate whose value is absent from the tenant-level filter
+resolves to zero candidates at **zero** index GETs, which is the cheapest
+possible answer and must not be given up by routing straight to a pack.
+
 ### 3. The safety lemma
 
 ```
@@ -117,8 +191,43 @@ query candidates = index matches among covered objects
 ```
 
 A missing, stale, corrupt, or version-mismatched index therefore makes a query
-**slower, never wrong**. This is what lets coverage lag ingest, and it is why
-the index can be built off the acknowledgement path:
+**slower, never wrong**.
+
+**Coverage is not a bit.** It is three-dimensional — **(entry-ordinal range) x
+(field) x (index type)** — declared in the root, with each pack
+complete-by-construction for its declared scope (the encode-side validation
+precedent in `encode_postings`). Two consequences that are correctness
+requirements, not refinements:
+
+- **A pack's field set is data declared in the root, never inferred from live
+  config at read time.** `TenantConfig.indexed_fields` (ADR-0079) is mutable
+  per-tenant config. Build a pack while field `F` is curated, de-curate `F`,
+  let a Class-B rebuild run, and the new pack lacks `F`. A query on `F` against
+  per-object coverage would then see "covered, zero index matches" and
+  **wrongly exclude matching objects — a wrong result, not a slow one.** A field
+  absent from the root's declaration means *uncovered for that field*,
+  regardless of object coverage. With this rule Class B stands, because a
+  rebuild need not reproduce identical packs, only packs valid for their own
+  declaration.
+- **Partial coverage within an object** (some blocks indexed, an entry
+  half-processed by L1) requires the ordinal-range dimension, or fold must never
+  mark an entry covered until it is fully indexed.
+
+**The lemma covers candidate pruning only.** `MetadataAggregateExec` is *not*
+protected by the union-with-uncovered shape; its safety is the stricter
+condition list in §5. Reading "slower, never wrong" as covering metadata
+execution would ship a wrong count, so the two mechanisms are named separately
+and must be tested separately.
+
+**Enumerating uncovered objects costs no extra I/O.** Snapshot resolve already
+decodes all part entries per query, so uncovered = live ordinals minus the
+root's covered ranges, plus above-watermark listed segments, plus
+token-resolved segments. Read-your-write token segments come from direct
+commit-record GETs outside the snapshot and are therefore structurally in the
+uncovered branch; the planner must place them there.
+
+This is what lets coverage lag ingest, and it is why the index can be built off
+the acknowledgement path:
 
 - an L0 write is acknowledged **uncovered**; queries scan that recent tail
 - **L1 compaction** builds index fragments while it is already decoding and
@@ -155,6 +264,18 @@ complete predicate and aggregate are representable, type and null/NaN semantics
 match the scan exactly, no pending selective erasure invalidates the counts, no
 row-level policy requires row inspection, and the pinned commit token adds no
 uncovered segment. Otherwise the planner uses an indexed scan or a full scan.
+
+**The erasure condition needs a mechanism, not a clause.** ADR-0064 erasure is
+acknowledged before the rewrite lands, and the fold that would refresh a pack
+runs later still, so a stale pack can outlive an acknowledged erasure by up to
+the rewrite plus fold interval (order 72 h). For **pruning** this is safe by the
+lemma: over-selection is corrected by the scan's own row-level filter. For
+**metadata execution** it is not — a `COUNT` served from a pack built before the
+erasure returns the pre-erasure number, which is a wrong answer to a compliance
+operation. The condition is therefore enforced by a recorded erasure epoch that
+a pack must be no older than, checked at plan time; "no pending selective
+erasure" as a prose condition with no carrier is exactly the shape that ships
+unimplemented.
 
 **Exactness or fallback, never estimation.** These figures answer queries
 directly, so a bound is not sufficient: `q02` needs the exact count of one
@@ -224,6 +345,12 @@ item 5 and are a different mechanism.
 the same MVCC protection horizon as the data snapshot they describe, so they
 inherit the same delayed-reclamation behaviour already measured (a tenant holds
 roughly 1.9x its live set during the 25 h 05 m horizon).
+
+**Cost accounting is not optional here.** Root and leaf probes are their own
+phases under the repo's per-phase cost rule, never folded into the scan's
+counters. An index that removes 3,469 data GETs and silently adds 400 index
+GETs must show as exactly that, or the plane cannot be judged. The routing
+budget above is the assertable band.
 
 **New failure mode, bounded by construction.** A corrupt or stale pack degrades
 to scanning. That is a latency regression, never a correctness one, and it is
