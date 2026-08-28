@@ -217,6 +217,16 @@ Flight SQL, exemplars, alerting, and analytics. The
 [traces guide](docs/guides/traces.md) covers querying spans over the `spans`
 SQL table.
 
+One maintenance route sits alongside them: `POST /api/v1/admin/fold` triggers
+a catalog fold for the authenticated tenant and one named signal, instead of
+waiting for the background fold's next tick. It takes the same bearer token
+the query routes take, and its response says which of three things happened --
+a snapshot was `published`, `nothing_eligible` was found to fold, or a
+concurrent fold won the `HEAD` compare-and-swap (`lost_cas`). Right after a
+load the honest answer is `nothing_eligible`: an ingest hour is not foldable
+until the sealing window behind it has elapsed. See
+[architecture](docs/architecture.md#on-demand-catalog-fold).
+
 ## Kubernetes
 
 The operator runs the same ingest and query round trip on a real cluster. This

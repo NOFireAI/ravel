@@ -177,8 +177,9 @@ Sigma/OCSF: later phases. See the spec docs as they land.
 `ravel-server` binds up to three listeners:
 
 - `--listen-http`: OTLP HTTP-protobuf, Remote Write, `/api/v1/*` query and
-  analytics routes, `/api/v1/sql` (feature `sql`), and the mode-independent
-  `/healthz`, `/readyz`, `/metrics` routes.
+  analytics routes, `/api/v1/sql` (feature `sql`), the on-demand fold route
+  `/api/v1/admin/fold` (below), and the mode-independent `/healthz`,
+  `/readyz`, `/metrics` routes.
 - `--listen-grpc`: OTLP gRPC and, under the `flight-sql` feature, Flight SQL.
   Bound only in the modes and feature combinations that serve one of those.
   Under `--distributed-query` it also carries the cluster-internal
@@ -353,6 +354,65 @@ applies the requested op to each series of the matrix, capping a call at 1000
 series and each `change_point` series at 2000 points (approximation via
 `downsample` is opt-in and visible). Unlike the SQL path it needs no cargo
 feature, since it links no Arrow or DataFusion.
+
+## On-demand catalog fold
+
+The catalog fold normally runs on the background loop in `ravel-server`'s
+`fold.rs`, on a jittered `--fold-interval` cadence over every discovered
+tenant. `POST /api/v1/admin/fold` is the on-demand form of the same
+operation, for one tenant and one signal (issue #785). It calls the same
+`Catalog::fold` entry point with the same per-process `folder_id` and the same
+CLI-derived retention window; it does not change the scheduled fold's cadence
+or behaviour, and there is no all-tenants variant.
+
+Request body (`signal` is required; `tenant` is optional):
+
+```json
+{"signal": "metrics", "tenant": "acme"}
+```
+
+`signal` is one of `metrics`, `logs`, `spans`, and is never defaulted: a
+tenant holds each signal's snapshot independently, so a default would make
+"folded the wrong signal" indistinguishable from "the window was empty".
+
+**Authorization.** The route is mounted on `--listen-http` and on the mTLS
+listener, in the modes that serve a query surface, and it authenticates
+through the deployment's configured `TenantResolver` chain -- the same
+credential `/api/v1/query` and `/api/v1/sql` require. The fold runs for the
+tenant that credential resolves to, and nothing else: if the body names a
+tenant, the name must hash to the authenticated tenant or the request is
+refused with 403. There is no separate platform-operator credential in
+`ravel-server` today, so folding a tenant means holding that tenant's
+credential.
+
+**Concurrency.** Safe to call concurrently with the scheduled fold and with
+itself. A fold publishes through the `HEAD` CAS protocol
+(docs/catalog-and-mvcc.md), so a losing CAS is an ordinary outcome, not
+corruption; the endpoint takes no lock of its own.
+
+**Outcomes.** Every completed call is 200 and names one of three statuses,
+because "published a snapshot" and "there was nothing to publish" are
+different facts an operator has to tell apart:
+
+| `status` | Meaning |
+|---|---|
+| `published` | A new snapshot was published: `HEAD` now names content that differs from what it named before. |
+| `nothing_eligible` | No commit was eligible to fold. The response's `head_advanced` says whether the sealing watermark still moved (`true`, a watermark-only rewrite over empty hours) or `HEAD` was untouched (`false`). |
+| `lost_cas` | A concurrent fold (the scheduled loop, or another call) won the `HEAD` CAS. That fold's snapshot is the current `HEAD`; this call published none. |
+
+`nothing_eligible` is the expected answer immediately after a load, and is
+not a failure: a fold seals an ingest hour only once `max_flush_lifetime +
+clock_skew_allowance + fold_safety_margin` has elapsed after that hour ends
+(docs/catalog-and-mvcc.md). The response also carries the underlying fold
+report -- watermark hours, buckets folded, entry count, and the per-phase
+request counts -- so a call that published can be checked against what it
+claims.
+
+A request that fails before the fold runs is an error body, not an outcome:
+401 with no credential, 400 for a missing or unknown `signal` or a malformed
+body, 403 for a body naming another tenant, 503 for a store or catalog fault
+(logged in full server-side, redacted in the response like the query
+surfaces').
 
 ## Alert evaluation
 
