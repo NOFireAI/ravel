@@ -20,6 +20,7 @@ pub mod flight_auth;
 #[cfg(feature = "flight-sql")]
 pub mod flight_deadline;
 pub mod fold;
+pub mod fold_on_demand;
 pub mod gc_config;
 pub mod health;
 pub mod idle_tenant_state;
@@ -1170,6 +1171,16 @@ pub async fn start(
     // `fold::spawn` below in every non-maintain mode; the sweep is spawned
     // afterwards and needs its own `Arc`.
     let sweep_catalog = catalog.clone();
+    // One `folder_id` for every on-demand fold this process serves
+    // (`/api/v1/admin/fold`, issue #785), matching `fold::spawn`'s
+    // one-per-process rule for the scheduled loop
+    // (proto/ravel/catalog.proto, `SnapshotHead.folder_id`). Drawn from the
+    // same OS-entropy source (ADR-0068 decision 2) rather than
+    // `Uuid::new_v4()` directly.
+    let on_demand_folder_id = {
+        use ravel_commit::rng::RngSource as _;
+        ravel_commit::rng::SystemRng.new_uuid()
+    };
     // The SQL executor the idle-tenant sweep evicts idle memory accountants
     // from. Assigned inside the query block below (the one place the executor
     // is built) and read at the sweep spawn site; `None` in a mode that builds
@@ -1353,6 +1364,36 @@ pub async fn start(
                 audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
             };
             mtls_router = mtls_router.merge(analytics::router(mtls_analytics_state));
+        }
+
+        // POST /api/v1/admin/fold (issue #785): the on-demand form of the
+        // background fold below, for one tenant and one signal. Mounted in
+        // exactly the modes that run the scheduled fold task and serve a
+        // query surface, sharing the same `Catalog`, the same CLI-derived
+        // retention config, and one `folder_id` per process, so an operator
+        // call and a scheduled tick are the same operation with different
+        // triggers. Authorization is the deployment's tenant resolver, the
+        // same credential the query routes above require.
+        let on_demand_fold_retention = Arc::new(config.maintain.retention.clone());
+        let on_demand_fold_state = fold_on_demand::OnDemandFoldState {
+            catalog: catalog.clone(),
+            store: store.clone(),
+            tenant_resolver: config.tenant_resolver.clone(),
+            clock: Arc::new(SystemClock),
+            folder_id: on_demand_folder_id,
+            retention: on_demand_fold_retention.clone(),
+        };
+        http_router = http_router.merge(fold_on_demand::router(on_demand_fold_state));
+        if let Some(mtls) = &config.mtls_listener {
+            let mtls_fold_state = fold_on_demand::OnDemandFoldState {
+                catalog: catalog.clone(),
+                store: store.clone(),
+                tenant_resolver: mtls.resolver.clone(),
+                clock: Arc::new(SystemClock),
+                folder_id: on_demand_folder_id,
+                retention: on_demand_fold_retention,
+            };
+            mtls_router = mtls_router.merge(fold_on_demand::router(mtls_fold_state));
         }
 
         // GET/POST /api/v1/query_exemplars (ADR-0047 decision 4):
