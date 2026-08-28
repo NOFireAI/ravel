@@ -58,7 +58,7 @@ pub use lifecycle::{
 pub use log_error::LogWriteError;
 pub use log_metrics::{LogIngestMetrics, LogIngestMetricsSnapshot};
 pub use log_router::{LogIndexedFields, LogIngestRouter, LogWriteReceipt, NoIndexedFields};
-pub use metrics::{FlushTrigger, IngestMetrics, IngestMetricsSnapshot};
+pub use metrics::{FlushTrigger, IngestMetrics, IngestMetricsSnapshot, ShardSkewStats};
 pub use metrics_meta_sink::{
     DEFAULT_MAX_CAS_RETRIES, DEFAULT_METADATA_FLUSH_WINDOW, FlushSummary, MetadataSink,
     MetadataSinkConfig, catalog_metric_kind,

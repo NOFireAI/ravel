@@ -952,7 +952,16 @@ impl ShardActor {
                 msg = self.rx.recv() => {
                     match msg {
                         Some(ShardMsg::Write { tenant, points, exemplars, ack, charge }) => {
+                            // Per-shard skew (issue #865): time the serial
+                            // on-actor section only. The flush this may open runs
+                            // in a spawned task whose time is recorded off-actor
+                            // in `flush_tenant`; `handle_write` returns once that
+                            // task is spawned, so this delta never includes it.
+                            let started_ns = self.clock.now_ns();
                             self.handle_write(tenant, points, exemplars, ack, charge).await;
+                            let on_actor_ns =
+                                self.clock.now_ns().saturating_sub(started_ns).max(0) as u64;
+                            self.metrics.record_shard_processed(self.shard, on_actor_ns);
                         }
                         Some(ShardMsg::FlushNow { done }) => {
                             self.flush_all(FlushTrigger::Manual).await;
@@ -1281,10 +1290,20 @@ impl ShardActor {
             shard: self.shard,
         };
         let ctx = Arc::clone(&self.ctx);
+        // Per-shard skew (issue #865): time the whole flush, which runs here off
+        // the actor (ADR-0067). Bracketing `run_flush` on the injected clock,
+        // rather than inside it, keeps the measurement out of the pinned-identity
+        // path and captures every exit `run_flush` takes, abandonment included.
+        let clock = Arc::clone(&self.clock);
+        let metrics = Arc::clone(&self.metrics);
+        let shard = self.shard;
         self.flushes.spawn(async move {
             let _permit = permit;
             let _guard = guard;
+            let started_ns = clock.now_ns();
             ctx.run_flush(pinned).await;
+            let off_actor_ns = clock.now_ns().saturating_sub(started_ns).max(0) as u64;
+            metrics.record_shard_off_actor_ns(shard, off_actor_ns);
         });
     }
 }
