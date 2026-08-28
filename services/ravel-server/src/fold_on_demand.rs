@@ -777,6 +777,7 @@ mod tests {
 
     use axum::http::Request as HttpRequest;
     use bytes::Bytes;
+    use prost::Message as _;
     use ravel_catalog::CatalogConfig;
     use ravel_commit::publish::{self, RetryPolicy};
     use ravel_commit::record::{self, NewCommitRecord};
@@ -787,6 +788,7 @@ mod tests {
     use ravel_object_store::PutOptions;
     use ravel_object_store::fault::{FaultStore, Occurrence, Op};
     use ravel_object_store::memory::MemoryStore;
+    use ravel_proto::commit::v1::RetentionTombstone;
     use ravel_query::http::StaticBearerTokenResolver;
     use ravel_types::logstream::log_stream_id;
     use tower::ServiceExt;
@@ -1032,6 +1034,141 @@ mod tests {
         );
     }
 
+    /// Publishes a retention tombstone for `(shard, ingest_hour_bucket)` on
+    /// the logs signal. The fold classifies a bucket as tombstoned from the
+    /// key shape alone and never reads the body, so a minimal valid record is
+    /// enough (matching `ravel_catalog::fold`'s own fixture).
+    async fn publish_retention_tombstone(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        shard: u32,
+        ingest_hour_bucket: u32,
+    ) {
+        let record = RetentionTombstone {
+            format_version: 1,
+            tenant_hash: tenant.0.to_vec(),
+            signal: ravel_commit::signal::to_proto(Signal::Logs).into(),
+            shard,
+            ingest_hour_bucket,
+            retired_at_ns: 0,
+            retention_window_ns: 0,
+            record_count_observed: 0,
+        };
+        let key = ravel_commit::keys::retention_tombstone_key_for(&record).expect("tombstone key");
+        store
+            .put(
+                &key,
+                Bytes::from(record.encode_to_vec()),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put retention tombstone");
+    }
+
+    /// The outcome must turn on what the snapshot names, not on how many
+    /// entries it names. One fold folds a newly sealed commit in and, in the
+    /// same pass, applies a retention tombstone that drops an older bucket:
+    /// the entry total is identical on both sides while `HEAD` names
+    /// different content. That is a publish, and answering `nothing_eligible`
+    /// to it would tell an operator their fold did nothing when it moved
+    /// their catalog.
+    #[tokio::test]
+    async fn a_fold_whose_additions_and_retirements_cancel_still_reports_published() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = TenantId::new("fold-on-demand-cancelling");
+        let tenant_hash = tenant.hash();
+        let base_hour = NOW_NS / NS_PER_HOUR;
+        // Both sealed at NOW_NS (the watermark there is base_hour - 3).
+        let retired_hour = (base_hour - 5) as u32;
+        let kept_hour = (base_hour - 4) as u32;
+        // Sealed only at NOW_NS + 2h, so the second fold's watermark advance
+        // is what folds it in.
+        let added_hour = (base_hour - 2) as u32;
+
+        seed_log_commit(store.as_ref(), &tenant, retired_hour, 0).await;
+        seed_log_commit(store.as_ref(), &tenant, kept_hour, 1).await;
+
+        let catalog = catalog(store.clone());
+        let first = fold_once(
+            catalog.as_ref(),
+            store.as_ref(),
+            &tenant_hash,
+            Signal::Logs,
+            Uuid::from_u128(1),
+            NOW_NS,
+            None,
+        )
+        .await
+        .expect("first fold");
+        assert_eq!(first.outcome, FoldOutcome::Published);
+        let entries_before = first
+            .report
+            .expect("the first fold carries a report")
+            .entry_count;
+        assert_eq!(entries_before, 2, "both seeded hours are folded in");
+
+        // One entry enters and one leaves, in the same fold.
+        seed_log_commit(store.as_ref(), &tenant, added_hour, 2).await;
+        publish_retention_tombstone(store.as_ref(), &tenant_hash, 0, retired_hour).await;
+
+        let second = fold_once(
+            catalog.as_ref(),
+            store.as_ref(),
+            &tenant_hash,
+            Signal::Logs,
+            Uuid::from_u128(1),
+            NOW_NS + 2 * NS_PER_HOUR,
+            None,
+        )
+        .await
+        .expect("second fold");
+        let report = second.report.expect("the second fold carries a report");
+        // Non-vacuity: the fixture only exercises the defect if the totals
+        // really do cancel. If this ever stops holding, the outcome assertion
+        // below would pass for the wrong reason.
+        assert_eq!(
+            report.entry_count, entries_before,
+            "the fixture must cancel: an equal entry total over changed content"
+        );
+        assert!(
+            report.watermark_hour > Some(retired_hour),
+            "the second fold must have advanced past the retired hour"
+        );
+        assert_eq!(
+            second.outcome,
+            FoldOutcome::Published,
+            "the snapshot names different content, so this call published"
+        );
+        assert!(second.head_advanced);
+
+        // What the snapshot names is what changed: the retired hour is gone
+        // and the newly sealed one is there.
+        let head_bytes = store
+            .get(
+                &crate::fold::head_key(&tenant_hash, Signal::Logs),
+                GetRange::Full,
+            )
+            .await
+            .expect("HEAD present");
+        let head = ravel_catalog::decode_head(&head_bytes.data).expect("decode HEAD");
+        let mut hours = Vec::new();
+        for part in &head.parts {
+            let bytes = store
+                .get(&part.key, GetRange::Full)
+                .await
+                .expect("part present");
+            let decoded =
+                ravel_catalog::decode_part(&bytes.data, &PartLimits::default()).expect("part");
+            hours.extend(decoded.entries.iter().map(|e| e.ingest_hour_bucket));
+        }
+        hours.sort_unstable();
+        assert_eq!(
+            hours,
+            vec![kept_hour, added_hour],
+            "the retired hour left the snapshot and the newly sealed one entered it"
+        );
+    }
+
     /// Concurrent-CAS path: two folds race on the same tenant. A `FaultStore`
     /// hold gate makes the interleaving deterministic (`MemoryStore` never
     /// yields, so without it the first fold would simply run to completion
@@ -1173,14 +1310,71 @@ mod tests {
         (status, bytes.to_vec())
     }
 
+    /// Records the `error` field of every WARN event, so the next test can
+    /// prove a rejected credential leaves a server-side record rather than
+    /// vanishing into the 401.
+    #[derive(Default, Clone)]
+    struct WarnErrorCapture(Arc<parking_lot::Mutex<Vec<String>>>);
+
+    impl<S> tracing_subscriber::Layer<S> for WarnErrorCapture
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+            struct Visitor(Option<String>);
+            impl tracing::field::Visit for Visitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "error" {
+                        self.0 = Some(format!("{value:?}"));
+                    }
+                }
+            }
+            let mut visitor = Visitor(None);
+            event.record(&mut visitor);
+            if let Some(error) = visitor.0 {
+                self.0.lock().push(error);
+            }
+        }
+    }
+
     /// The route carries the same authorization the tenant-scoped query
-    /// routes do: no credential, no fold.
+    /// routes do: no credential, no fold. The resolver's error is kept
+    /// server-side rather than discarded on the way to the 401: the resolver
+    /// chain can fail for reasons that are not a bad credential (an
+    /// unreachable durable auth map), and a bare 401 records none of them.
+    ///
+    /// Non-vacuity: the handler previously mapped the error with `|_|`, so the
+    /// capture stays empty against that code and this test fails on its
+    /// second assertion while the status assertion alone passes either way.
     #[tokio::test]
-    async fn an_unauthenticated_request_is_refused() {
+    async fn an_unauthenticated_request_is_refused_and_logged() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let catalog = catalog(store.clone());
+
+        let captured: Arc<parking_lot::Mutex<Vec<String>>> = Arc::default();
+        let subscriber = tracing_subscriber::registry().with(WarnErrorCapture(captured.clone()));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
         let (status, _) = post(state(store, catalog), None, r#"{"signal":"logs"}"#).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            captured.lock().as_slice(),
+            &["unauthenticated request".to_string()],
+            "the resolver's error must reach the log, not just the caller's 401"
+        );
     }
 
     /// The signal is required and never defaulted, and a tenant named in the
@@ -1230,5 +1424,150 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
         assert_eq!(body["status"], "nothing_eligible");
         assert_eq!(body["published"], false);
+        assert_eq!(body["coalesced"], false);
+    }
+
+    /// The other side of the same surface: a tenant with a long-sealed hour
+    /// gets the published outcome and the merged fold report, under the field
+    /// names an operator reads. Only the HTTP layer is under test here (the
+    /// classification itself is covered above), but a dropped or renamed
+    /// field in the merge reaches an operator with nothing else to catch it.
+    ///
+    /// `state()` installs the real `SystemClock`, so the seeded hour is
+    /// relative to the current wall-clock hour rather than the fixed `NOW_NS`
+    /// the direct `fold_once` tests use.
+    #[tokio::test]
+    async fn the_response_names_the_published_outcome_and_the_fold_report() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = TenantId::new("fold-on-demand-http");
+        let now_ns = SystemClock.now_ns();
+        // Three hours back: past the default sealing sum of max_flush_lifetime
+        // (1h) + clock_skew_allowance (5m) + fold_safety_margin (15m) no
+        // matter where inside the current hour the clock sits.
+        let sealed_hour = (now_ns / NS_PER_HOUR - 3) as u32;
+        seed_log_commit(store.as_ref(), &tenant, sealed_hour, 0).await;
+
+        let catalog = catalog(store.clone());
+        let (status, body) = post(
+            state(store, catalog),
+            Some(TOKEN),
+            r#"{"signal":"logs","tenant":"fold-on-demand-http"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(body["status"], "published");
+        assert_eq!(body["published"], true);
+        assert_eq!(body["head_advanced"], true);
+        assert_eq!(body["coalesced"], false);
+        assert_eq!(body["signal"], "logs");
+        assert_eq!(
+            body["entry_count"], 1,
+            "the seeded commit is the one entry folded in"
+        );
+        // The watermark covers the seeded hour. Not equality: the sealing sum
+        // is 1h20m, so the hour it lands in depends on where inside the
+        // current hour the wall clock sits, and pinning it would make this
+        // test pass or fail by the minute.
+        assert!(
+            body["watermark_hour"]
+                .as_u64()
+                .is_some_and(|hour| hour >= u64::from(sealed_hour)),
+            "the watermark must cover the seeded hour {sealed_hour}: {body}"
+        );
+        for field in [
+            "buckets_folded",
+            "parts_total",
+            "rebuilt",
+            "previous_watermark_hour",
+            "list_requests",
+            "get_requests",
+            "put_requests",
+            "classify_get_requests",
+        ] {
+            assert!(
+                body.get(field).is_some(),
+                "the merged report must carry {field}: {body}"
+            );
+        }
+        assert!(
+            body["buckets_folded"].as_u64().is_some_and(|n| n > 0),
+            "a fold that folded an entry listed at least one commit bucket"
+        );
+    }
+
+    /// The route's admission gate: two calls in flight for one
+    /// (tenant, signal) run ONE fold, and the one that did not run it says so
+    /// in `coalesced` while reporting the same outcome.
+    ///
+    /// The interleaving is forced, not hoped for. A `FaultStore` hold parks
+    /// the first fold inside its `HEAD` PUT, so the second call is issued
+    /// while the first is genuinely in flight; the releaser task cannot run
+    /// until both request futures have parked, because a `current_thread`
+    /// runtime only schedules it once the task driving them yields.
+    ///
+    /// Non-vacuity: without the gate both calls fold. The second would then
+    /// win the CAS the first is held on, so the two responses would carry
+    /// different statuses (`lost_cas` and `published`) and neither would be
+    /// coalesced -- the shape the race test above asserts deliberately.
+    #[tokio::test]
+    async fn two_concurrent_calls_for_one_tenant_run_one_fold() {
+        let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), Default::default()));
+        let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+        let tenant = TenantId::new("fold-on-demand-http");
+        let tenant_hash = tenant.hash();
+        let now_ns = SystemClock.now_ns();
+        let sealed_hour = (now_ns / NS_PER_HOUR - 3) as u32;
+        seed_log_commit(store.as_ref(), &tenant, sealed_hour, 0).await;
+
+        let head = crate::fold::head_key(&tenant_hash, Signal::Logs);
+        let gate = fault_store.hold(Op::Put, Some(head.clone()), Occurrence::Nth(1));
+
+        // One state, so both calls share the one coalescing gate the way two
+        // requests on one listener do.
+        let state = state(store.clone(), catalog(store.clone()));
+
+        let releaser = {
+            let gate = gate.clone();
+            tokio::spawn(async move {
+                gate.wait_until_held(1).await;
+                let held = gate.held_details();
+                assert_eq!(held.len(), 1, "exactly one call is held: {held:?}");
+                assert_eq!(held[0].2, head, "the held call is the HEAD CAS");
+                assert!(gate.release(held[0].0), "release the held HEAD CAS");
+            })
+        };
+
+        let body = r#"{"signal":"logs"}"#;
+        let (first, second) = tokio::join!(
+            post(state.clone(), Some(TOKEN), body),
+            post(state.clone(), Some(TOKEN), body),
+        );
+        releaser.await.expect("releaser task");
+
+        let mut bodies = Vec::new();
+        for (status, raw) in [first, second] {
+            assert_eq!(status, StatusCode::OK);
+            bodies.push(serde_json::from_slice::<serde_json::Value>(&raw).expect("JSON body"));
+        }
+        let coalesced: Vec<bool> = bodies
+            .iter()
+            .map(|b| b["coalesced"].as_bool().expect("coalesced is a bool"))
+            .collect();
+        assert_eq!(
+            coalesced.iter().filter(|c| **c).count(),
+            1,
+            "exactly one of the two calls ran the fold: {bodies:?}"
+        );
+        assert_eq!(
+            bodies[0]["status"], bodies[1]["status"],
+            "the coalesced call reports the fold it joined: {bodies:?}"
+        );
+        assert_eq!(bodies[0]["status"], "published");
+        assert_eq!(
+            bodies[0]["entry_count"], bodies[1]["entry_count"],
+            "both responses carry the one fold's report"
+        );
+        assert_eq!(gate.held_count(), 0, "no call is left held");
     }
 }
