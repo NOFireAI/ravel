@@ -16,7 +16,9 @@ HTTP /api/v1/query, /query_range, /labels, /label/{name}/values, /series
      fetch window
   -> per selector (concurrency-bounded, default 8), against that one
      snapshot:
-       for each snapshot segment: suffix GET (64 KiB) -> Reader::parse
+       for each snapshot segment: footer tail GET (absolute 64 KiB range
+         when the object size is known, cache-eligible; issue #811)
+         -> Reader::parse
          -> prune series by that selector's own matchers (SERIES_META +
             LABEL_DICT)
          -> plan page ranges, coalesce adjacent (gap <= 64 KiB)
@@ -1143,11 +1145,17 @@ depends on the first GET's shape. A segment at or below
 `DEFAULT_WHOLE_OBJECT_THRESHOLD` reads its whole object with a
 `GetRange::Full` first GET, which is cache-eligible, so both its GETs (and
 thus the whole `segment_open` cost) are zero on a fully warm cache. A
-segment above the threshold reads its footer with a `GetRange::Suffix`
-first GET, which `guarded_get`'s `cacheable_range` never routes through the
-cache (a suffix has no total size to fabricate a hit from), so that GET
-crosses the network on every run and `segment_open`'s cost is never zero
-for such a segment regardless of cache warmth. `page_fetch`
+segment above the threshold reads its footer as an absolute tail range
+(`GetRange::Range(object_size - suffix_len, object_size)`), which
+`guarded_get`'s `cacheable_range` routes through the cache keyed by content
+hash plus absolute range (issue #811), so that GET too is zero on a warm
+cache and `segment_open`'s cost reaches zero for such a segment. The one
+exception is a segment ref with no `object_size`, which cannot form an
+absolute range and falls back to a `GetRange::Suffix` first GET that
+bypasses the cache (a suffix has no total size to fabricate a hit from);
+that fallback is counted by `SegmentFetcher::suffix_fallbacks` rather than
+taken silently, and no production RSEG ref reaches it (the commit record
+always records the object size). `page_fetch`
 records the store-sourced count and bytes `ensure_ranges` reports for the
 coalesced GETs it issued on that call; those are `GetRange::Range` GETs,
 which are cache-eligible, so this phase's cost is the one that reaches zero
