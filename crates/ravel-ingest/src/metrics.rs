@@ -151,6 +151,15 @@ pub struct IngestMetrics {
     /// struct (see the module docs' "no per-shard dimension" note); read it
     /// via [`IngestMetrics::in_flight_flushes_by_shard`].
     in_flight_flushes: Mutex<HashMap<u32, i64>>,
+    /// Per-shard ingest-skew accounting (issue #865): message throughput and
+    /// the on-actor/off-actor time split, so an argument about shard-actor
+    /// throughput rests on measured per-shard figures rather than assertion.
+    /// Like `in_flight_flushes` above, it carries a per-shard dimension the
+    /// flat `Copy` [`IngestMetricsSnapshot`] cannot hold, so it is read via
+    /// [`IngestMetrics::shard_skew_by_shard`] rather than folded into the
+    /// snapshot. Keyed by shard index; a shard that never enqueued or processed
+    /// a message has no entry, equivalent to all-zero.
+    shard_skew: Mutex<HashMap<u32, ShardSkewCounters>>,
     /// Metadata-record GETs issued by the metric metadata sink's flush window
     /// (ADR-0085 decision 1). The ADR budgets one GET per tenant per window
     /// with a non-empty pending set, so this is the counter an operator checks
@@ -182,6 +191,49 @@ pub struct IngestMetrics {
     /// than folded into [`IngestMetricsSnapshot`] (which is `Copy`). See
     /// [`crate::attribution`] for the counting convention and eviction policy.
     put_attribution: TenantPutAttribution,
+}
+
+/// Accumulator behind [`IngestMetrics::shard_skew`], one per shard. Held under
+/// the map's `Mutex`; the public [`ShardSkewStats`] is its point-in-time copy
+/// with `queue_depth` derived.
+#[derive(Debug, Default)]
+struct ShardSkewCounters {
+    messages_enqueued: u64,
+    messages_processed: u64,
+    on_actor_ns: u64,
+    off_actor_ns: u64,
+}
+
+/// Point-in-time per-shard ingest-skew figures (issue #865). Read via
+/// [`IngestMetrics::shard_skew_by_shard`]; a benchmark reaches it through
+/// [`crate::IngestRouter::metrics`], the same handle it already reads
+/// [`IngestMetrics::in_flight_flushes_by_shard`] through.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShardSkewStats {
+    /// `Write` messages the router sent into this shard's channel.
+    pub messages_enqueued: u64,
+    /// `Write` messages this shard's actor pulled and handled. `FlushNow` and
+    /// `Shutdown` are excluded from both this and `messages_enqueued`: they are
+    /// control messages, not ingest load, and counting them would break the
+    /// enqueued-minus-processed depth identity below.
+    pub messages_processed: u64,
+    /// Messages enqueued into this shard's channel but not yet processed by its
+    /// actor, at snapshot time: `messages_enqueued - messages_processed`.
+    /// Saturating, so a read that catches the two counters mid-update (enqueue
+    /// runs on the router task, process on the actor task) reports 0 rather
+    /// than underflowing.
+    pub queue_depth: u64,
+    /// Injected-`Clock` nanoseconds the actor task spent processing this
+    /// shard's `Write` messages: the serial merge-and-pin section that runs ON
+    /// the actor. It excludes the flush, which ADR-0067 moved into a spawned
+    /// task off the actor; that time lands in `off_actor_ns`.
+    pub on_actor_ns: u64,
+    /// Injected-`Clock` nanoseconds spent in this shard's flush tasks, which
+    /// run OFF the actor (ADR-0067): exemplar admission, encode, and both PUTs.
+    /// Kept distinct from `on_actor_ns` so a future measurement can tell an
+    /// actor-thread bottleneck from a flush bottleneck -- the exact ambiguity a
+    /// single figure cannot resolve.
+    pub off_actor_ns: u64,
 }
 
 /// Point-in-time copy of [`IngestMetrics`] for scraping. See the
@@ -259,6 +311,74 @@ impl IngestMetrics {
             .collect();
         counts.sort_unstable_by_key(|&(shard, _)| shard);
         counts
+    }
+
+    /// One `Write` message sent by the router into shard `shard`'s channel
+    /// (issue #865). Enqueue-time: counted at the router's `send`, so
+    /// `messages_enqueued - messages_processed` is the depth still in the
+    /// channel.
+    pub(crate) fn record_shard_enqueued(&self, shard: u32) {
+        let mut map = self
+            .shard_skew
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        map.entry(shard).or_default().messages_enqueued += 1;
+    }
+
+    /// One `Write` message pulled and handled by shard `shard`'s actor, plus
+    /// the injected-`Clock` nanoseconds the actor spent handling it -- the
+    /// on-actor serial section, excluding the flush that runs off the actor
+    /// (issue #865). Recorded together in one lock so a reader never sees a
+    /// processed count without its matching on-actor time.
+    pub(crate) fn record_shard_processed(&self, shard: u32, on_actor_ns: u64) {
+        let mut map = self
+            .shard_skew
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = map.entry(shard).or_default();
+        entry.messages_processed += 1;
+        entry.on_actor_ns = entry.on_actor_ns.saturating_add(on_actor_ns);
+    }
+
+    /// One completed flush task's injected-`Clock` nanoseconds, attributed to
+    /// the shard it flushed (issue #865). Off-actor by construction: the flush
+    /// runs in a spawned task (ADR-0067), so this time never overlaps the
+    /// actor's own `on_actor_ns`.
+    pub(crate) fn record_shard_off_actor_ns(&self, shard: u32, off_actor_ns: u64) {
+        let mut map = self
+            .shard_skew
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = map.entry(shard).or_default();
+        entry.off_actor_ns = entry.off_actor_ns.saturating_add(off_actor_ns);
+    }
+
+    /// Point-in-time per-shard skew figures, sorted by shard index (issue
+    /// #865). A shard with no recorded activity is simply absent. `queue_depth`
+    /// is derived here as `messages_enqueued - messages_processed`, saturating
+    /// at 0.
+    pub fn shard_skew_by_shard(&self) -> Vec<(u32, ShardSkewStats)> {
+        let map = self
+            .shard_skew
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut out: Vec<(u32, ShardSkewStats)> = map
+            .iter()
+            .map(|(&shard, c)| {
+                (
+                    shard,
+                    ShardSkewStats {
+                        messages_enqueued: c.messages_enqueued,
+                        messages_processed: c.messages_processed,
+                        queue_depth: c.messages_enqueued.saturating_sub(c.messages_processed),
+                        on_actor_ns: c.on_actor_ns,
+                        off_actor_ns: c.off_actor_ns,
+                    },
+                )
+            })
+            .collect();
+        out.sort_unstable_by_key(|&(shard, _)| shard);
+        out
     }
 
     /// Attribute one completed flush's PUTs to `tenant` (success-time,
@@ -458,6 +578,68 @@ mod tests {
         metrics.record_inflight_flush_delta(0, -1);
         assert_eq!(metrics.in_flight_flushes_by_shard(), vec![(0, 1), (1, 1)]);
         assert_eq!(metrics.snapshot().in_flight_flushes_total, 2);
+    }
+
+    #[test]
+    fn shard_skew_tracks_per_shard_throughput_and_time_split() {
+        let metrics = IngestMetrics::default();
+        // Shard 0 takes three messages, shard 1 takes one: a skewed load.
+        metrics.record_shard_enqueued(0);
+        metrics.record_shard_enqueued(0);
+        metrics.record_shard_enqueued(0);
+        metrics.record_shard_enqueued(1);
+        // Two of shard 0's three, and shard 1's one, have been processed; the
+        // third message for shard 0 is still in the channel.
+        metrics.record_shard_processed(0, 100);
+        metrics.record_shard_processed(0, 200);
+        metrics.record_shard_processed(1, 50);
+        // Flush time lands off the actor, and only on shard 0 here.
+        metrics.record_shard_off_actor_ns(0, 9_000);
+
+        let skew = metrics.shard_skew_by_shard();
+        assert_eq!(
+            skew,
+            vec![
+                (
+                    0,
+                    ShardSkewStats {
+                        messages_enqueued: 3,
+                        messages_processed: 2,
+                        queue_depth: 1,
+                        on_actor_ns: 300,
+                        off_actor_ns: 9_000,
+                    }
+                ),
+                (
+                    1,
+                    ShardSkewStats {
+                        messages_enqueued: 1,
+                        messages_processed: 1,
+                        queue_depth: 0,
+                        on_actor_ns: 50,
+                        off_actor_ns: 0,
+                    }
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn shard_queue_depth_saturates_when_processed_leads_enqueued() {
+        // The two counters are updated on different tasks (enqueue on the
+        // router, process on the actor), so a snapshot can catch a processed
+        // increment before its enqueue is visible. Depth must read 0, never
+        // underflow to u64::MAX.
+        let metrics = IngestMetrics::default();
+        metrics.record_shard_processed(2, 0);
+        let skew = metrics.shard_skew_by_shard();
+        assert_eq!(skew, vec![(2, ShardSkewStats {
+            messages_enqueued: 0,
+            messages_processed: 1,
+            queue_depth: 0,
+            on_actor_ns: 0,
+            off_actor_ns: 0,
+        })]);
     }
 
     #[test]
