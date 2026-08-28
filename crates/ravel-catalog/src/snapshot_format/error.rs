@@ -148,4 +148,67 @@ pub enum SnapshotFormatError {
     PostingsPartBindingMismatch,
     #[error("malformed varint in postings body")]
     PostingsBadVarint,
+
+    #[error("head column-stats ref blake3 must be 32 bytes, got {0}")]
+    BadColumnStatsRefBlake3Len(usize),
+    #[error("head column-stats ref has an empty key")]
+    EmptyColumnStatsKey,
+    #[error("head column-stats ref part_blake3[{index}] must be 32 bytes, got {actual}")]
+    BadColumnStatsRefPartBlake3Len { index: usize, actual: usize },
+    #[error("head column-stats ref names {stats_parts} parts but head has {head_parts} parts")]
+    ColumnStatsRefPartCountMismatch {
+        stats_parts: usize,
+        head_parts: usize,
+    },
+    #[error("head column-stats ref part_blake3[{index}] does not match parts[{index}].blake3")]
+    ColumnStatsRefPartBlake3Mismatch { index: usize },
+
+    #[error("column-stats object is smaller than the minimum envelope prefix: {size} bytes")]
+    ColumnStatsTooSmall { size: usize },
+    #[error("bad column-stats magic bytes")]
+    ColumnStatsBadMagic,
+    #[error("unsupported column-stats format version {0}")]
+    ColumnStatsUnsupportedVersion(u8),
+    #[error("column-stats reserved envelope bytes are non-zero")]
+    ColumnStatsReservedNonZero,
+    #[error("column-stats data has trailing bytes past the declared structure")]
+    ColumnStatsTrailingBytes,
+    #[error("column-stats header_crc32c mismatch")]
+    ColumnStatsHeaderCrcMismatch,
+    #[error("column-stats header protobuf failed to decode: {0}")]
+    ColumnStatsHeaderDecode(String),
+    #[error(
+        "column-stats header format_version {header} does not match envelope version {envelope}"
+    )]
+    ColumnStatsHeaderVersionMismatch { header: u32, envelope: u8 },
+    #[error("column-stats header tenant_hash must be 16 bytes, got {0}")]
+    ColumnStatsBadTenantHashLen(usize),
+    #[error("column-stats body_crc32c mismatch")]
+    ColumnStatsBodyCrcMismatch,
+    #[error(
+        "declared decompressed column-stats body length {declared} exceeds configured cap {cap}"
+    )]
+    ColumnStatsDecompressedTooLarge { declared: u64, cap: u64 },
+    #[error(
+        "decompressed column-stats body length {actual} does not match header's declared {expected}"
+    )]
+    ColumnStatsDecompressedLenMismatch { expected: u64, actual: u64 },
+    #[error("column-stats segment protobuf failed to decode: {0}")]
+    ColumnStatsSegmentDecode(String),
+    #[error("column-stats segment_count {actual} does not match header's declared {expected}")]
+    ColumnStatsSegmentCountMismatch { expected: u64, actual: u64 },
+    #[error(
+        "column-stats segments are not strictly sorted by (ingest_hour_bucket, shard, writer_id, writer_epoch, writer_seq)"
+    )]
+    ColumnStatsSegmentsUnsorted,
+    #[error("duplicate segment identity in column-stats segment set")]
+    ColumnStatsDuplicateSegment,
+    #[error("column-stats segment {field} must be {expected} bytes, got {actual}")]
+    ColumnStatsBadFieldLen {
+        field: &'static str,
+        expected: usize,
+        actual: usize,
+    },
+    #[error("column-stats header part_blake3 does not match the expected covered parts")]
+    ColumnStatsPartBindingMismatch,
 }

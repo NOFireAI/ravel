@@ -26,6 +26,7 @@ use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::cache::{CompactionRecordCache, HeadCache, PartCache, PostingsCache, RecordCache};
+use crate::column_stats_resolve::{self, LoadColumnStatsError, LoadedColumnStats};
 use crate::config::CatalogConfig;
 use crate::error::CatalogError;
 use crate::provisioning::ShardGeneration;
@@ -735,6 +736,23 @@ impl Catalog {
     /// `pub(crate)`: lets `snapshot_resolve` share the decoded-part cache.
     pub(crate) fn part_cache(&self) -> &PartCache {
         &self.part_cache
+    }
+
+    /// Resolve exact per-segment column statistics for `(tenant, signal)`
+    /// from the current folded snapshot HEAD (ADR-0850), for a query engine
+    /// to join against its own resolved snapshot by identity. `Ok(None)`
+    /// means no usable column-stats object exists right now (nothing folded
+    /// yet, no configured typed columns, or the last fold's column-stats
+    /// build/PUT failed): the caller must fall back to scanning, never treat
+    /// this as "zero columns configured means zero rows". See
+    /// [`column_stats_resolve::load_column_stats`] for the full
+    /// degrade-to-`Ok(None)` contract.
+    pub async fn load_column_stats(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+    ) -> Result<Option<LoadedColumnStats>, LoadColumnStatsError> {
+        column_stats_resolve::load_column_stats(self.store(), tenant, signal).await
     }
 
     /// Evict every per-tenant cache outer-map entry for tenants last touched
@@ -3360,6 +3378,7 @@ mod tests {
             folder_id: Uuid::new_v4().into_bytes().to_vec(),
             created_unix_ns: 0,
             shard_generation_count: 1,
+            column_stats: None,
         }
     }
 
@@ -3856,6 +3875,7 @@ mod tests {
             created_unix_ns: 0,
             postings: None,
             shard_generation_count: 1,
+            column_stats: None,
         };
         let head_bytes = crate::snapshot_format::encode_head(&head).expect("encode head");
         store
@@ -3953,6 +3973,7 @@ mod tests {
             created_unix_ns: 0,
             postings: None,
             shard_generation_count: 2,
+            column_stats: None,
         };
         let head_bytes = crate::snapshot_format::encode_head(&head).expect("encode head");
         inner

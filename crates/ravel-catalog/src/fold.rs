@@ -23,7 +23,10 @@ use ravel_object_store::{
     GetRange, ObjectMeta, ObjectStoreBackend, PutMode, PutOptions, StoreError, UploadChecksum,
     Version, list_all,
 };
-use ravel_proto::catalog::v1::{SnapshotEntry, SnapshotHead, SnapshotPartRef, SnapshotPostingsRef};
+use ravel_proto::catalog::v1::{
+    ColumnStatsSegment, SnapshotColumnStatsRef, SnapshotEntry, SnapshotHead, SnapshotPartRef,
+    SnapshotPostingsRef,
+};
 use ravel_proto::commit::v1::{CommitRecord, CompactionPart, CompactionRecord, RewriteRecord};
 use ravel_segment::{ExpectedIdentity, ReaderLimits, SegmentError};
 use ravel_types::accounting::{AccountedOp, QueryAccounting};
@@ -31,12 +34,14 @@ use ravel_types::{METRIC_NAME_LABEL, Signal, TenantHash};
 use uuid::Uuid;
 
 use crate::catalog::Catalog;
+use crate::column_stats_build;
 use crate::config::CatalogConfig;
 use crate::error::CatalogError;
 use crate::provisioning::{DEFAULT_SCAN_SLACK_HOURS, ShardGeneration, scan_count};
 use crate::snapshot_format::{
     self, HEAD_FORMAT_VERSION, NamePostings, PartLimits, SnapshotFormatError,
 };
+use crate::tenant_config::DeclaredTypedColumn;
 
 /// RSEG section kinds needed to decode a segment's catalog
 /// (docs/segment-format.md `SectionKind`). Kinds 1/2 are v1
@@ -133,6 +138,15 @@ pub struct FoldReport {
     /// Encoded size of the postings object, in bytes. `0` when
     /// `postings_built` is `false`.
     pub postings_bytes: u64,
+    /// `true` if this fold successfully built and attached a column-statistics
+    /// object (ADR-0850). `false` covers "the tenant has no configured typed
+    /// attribute columns" (nothing to build), a no-op fold, and "the build
+    /// failed and the fold proceeded without a column-stats ref" -- exactly
+    /// the same three-way ambiguity `postings_built` already accepts.
+    pub column_stats_built: bool,
+    /// Encoded size of the column-stats object, in bytes. `0` when
+    /// `column_stats_built` is `false`.
+    pub column_stats_bytes: u64,
     /// Number of commit-bucket entries this fold skipped rather than
     /// aborting on: an unrecognized bucket-key shape, or a commit record
     /// whose identity duplicates one already folded. Both are layout drift
@@ -174,8 +188,12 @@ struct RequestCounters {
 /// HEAD as read at the top of one fold attempt.
 enum HeadState {
     Absent,
+    /// `head` is boxed so this large variant does not inflate every
+    /// `HeadState` value (`clippy::large_enum_variant`): `SnapshotHead` grew
+    /// past 300 bytes when ADR-0850 added `column_stats`, while the other
+    /// variants are tiny.
     Valid {
-        head: SnapshotHead,
+        head: Box<SnapshotHead>,
         version: Version,
     },
     /// HEAD object exists but failed to decode: logged loudly by
@@ -256,6 +274,21 @@ fn postings_object_key(
 ) -> String {
     format!(
         "t/{}/catalog/{}/idx/{}.{}.npost",
+        tenant.to_hex(),
+        signal.key_prefix(),
+        keys::ingest_hour_string(watermark_hour),
+        hash16
+    )
+}
+
+fn column_stats_object_key(
+    tenant: &TenantHash,
+    signal: Signal,
+    watermark_hour: u32,
+    hash16: &str,
+) -> String {
+    format!(
+        "t/{}/catalog/{}/idx/{}.{}.cstat",
         tenant.to_hex(),
         signal.key_prefix(),
         keys::ingest_hour_string(watermark_hour),
@@ -798,23 +831,32 @@ impl Catalog {
         // reconcile (nothing is being retired). The fold's index role is a pure
         // optimization and the sweep's HEAD-reachability gate is the durable
         // delete blocker, so a config-read fault never fails the fold.
-        let tenant_retention_ns: Option<i64> = match crate::tenant_config::read_config_values(
-            self.store(),
-            tenant,
-        )
-        .await
+        let tenant_config = match crate::tenant_config::read_config_values(self.store(), tenant)
+            .await
         {
-            Ok(Some(cfg)) => cfg.retention_ns.or(default_retention_ns),
-            Ok(None) => default_retention_ns,
+            Ok(cfg) => cfg,
             Err(err) => {
                 tracing::warn!(
                     error = %err,
                     tenant = %tenant.to_hex(),
-                    "tenant config read failed; falling back to deployment-default retention for frontier reconcile"
+                    "tenant config read failed; falling back to deployment-default retention and no typed attribute columns"
                 );
-                default_retention_ns
+                None
             }
         };
+        let tenant_retention_ns: Option<i64> = tenant_config
+            .as_ref()
+            .and_then(|cfg| cfg.retention_ns)
+            .or(default_retention_ns);
+        // ADR-0850: the tenant's configured typed logs attribute columns, if
+        // any. `None`/absent config/a read failure all mean "no configured
+        // columns" -- unlike `retention_ns`, `typed_attr_columns` has no
+        // deployment-wide default threaded through `fold` (ravel-bench's own
+        // consumer of this field treats absence the same way), so a fold
+        // simply builds no column-stats artifact for that tenant.
+        let typed_attr_columns: Vec<DeclaredTypedColumn> = tenant_config
+            .and_then(|cfg| cfg.typed_attr_columns)
+            .unwrap_or_default();
         // Count the tenant-config record GET. `read_config_values` issues one
         // raw `store.get` per fold on every outcome (hit, absent, or error) and
         // takes neither a counters nor an accounting handle, so it is otherwise
@@ -1365,6 +1407,201 @@ impl Catalog {
                 None => None,
             };
 
+            // Column statistics (ADR-0850): exact per-object statistics for
+            // the tenant's configured typed logs attribute columns. Unlike
+            // postings, the baseline is joined by identity
+            // (`entry_identity`), not ordinal position: a segment's exact
+            // statistics never change once written, so any L0 entry present
+            // in both the previous fold's column-stats object and this
+            // fold's entry set is reused verbatim with no re-fetch, and only
+            // a genuinely new L0 entry is fetched and scanned. This also
+            // makes the `reconciled`/`rebuilt` ordinal-invalidation concern
+            // that forces postings to restart from scratch moot here: a
+            // selective-erasure rewrite or a compaction excludes its
+            // superseded L0 entries from `entries` entirely (replacing them
+            // with an L1 entry under an unrelated identity,
+            // `classify_bucket`'s supersession handling above), so an erased
+            // entry's identity simply stops appearing in `entries` and its
+            // stale baseline statistics are never carried forward -- not
+            // because this code checks for erasure, but because the entry it
+            // would apply to is no longer in the set being folded.
+            //
+            // Column stats are restricted to level-0 entries: an L1 entry's
+            // writer_id/writer_epoch slots are repurposed
+            // (`build_l1_snapshot_entry`) and carry no real writer identity,
+            // so it is excluded here the same way `fetch_segment_column_stats`
+            // asserts on its own input.
+            //
+            // A single segment's fetch/decode/tally failure never aborts the
+            // whole column-stats artifact (`column_stats_build`'s module
+            // docs): that segment is simply absent from `column_segments`,
+            // which the query-time reader already treats as "no stats here,
+            // fall back to scanning."
+            let (column_stats_built, column_stats_size, column_stats_ref) = if typed_attr_columns
+                .is_empty()
+            {
+                (false, 0u64, None)
+            } else {
+                let baseline: HashMap<EntryIdentity, ColumnStatsSegment> = if rebuilt {
+                    HashMap::new()
+                } else if let HeadState::Valid { head, .. } = &head_state
+                    && let Some(stats_ref) = &head.column_stats
+                {
+                    match self.store().get(&stats_ref.key, GetRange::Full).await {
+                        Ok(got) => {
+                            counters.get_requests += 1;
+                            let expected_part_blake3: Vec<[u8; 32]> = part_hashes.clone();
+                            match column_stats_build::decode_previous_column_stats(
+                                &got.data,
+                                &expected_part_blake3,
+                                &crate::snapshot_format::ColumnStatsLimits::default(),
+                            ) {
+                                Ok(segments) => segments
+                                    .into_iter()
+                                    .map(|segment| {
+                                        let identity: EntryIdentity = (
+                                            segment.ingest_hour_bucket,
+                                            segment.shard,
+                                            segment.writer_id.clone(),
+                                            segment.writer_epoch,
+                                            segment.writer_seq,
+                                        );
+                                        (identity, segment)
+                                    })
+                                    .collect(),
+                                Err(err) => {
+                                    tracing::warn!(
+                                        error = %err,
+                                        tenant = %tenant.to_hex(),
+                                        "previous column-stats object failed to decode or bind to this fold's parts; rebuilding every segment's statistics"
+                                    );
+                                    HashMap::new()
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                tenant = %tenant.to_hex(),
+                                "previous column-stats object GET failed; rebuilding every segment's statistics"
+                            );
+                            HashMap::new()
+                        }
+                    }
+                } else {
+                    HashMap::new()
+                };
+
+                let mut column_segments: Vec<ColumnStatsSegment> = Vec::new();
+                for entry in entries.iter().filter(|e| e.level == 0) {
+                    let identity = entry_identity(entry);
+                    if let Some(existing) = baseline.get(&identity) {
+                        column_segments.push(existing.clone());
+                        continue;
+                    }
+                    match column_stats_build::fetch_segment_column_stats(
+                        self.store(),
+                        tenant,
+                        signal,
+                        entry,
+                        &typed_attr_columns,
+                    )
+                    .await
+                    {
+                        Ok(segment) => {
+                            counters.get_requests += 1;
+                            column_segments.push(segment);
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                tenant = %tenant.to_hex(),
+                                ingest_hour_bucket = entry.ingest_hour_bucket,
+                                shard = entry.shard,
+                                "column-stats build failed for one segment; it has no stats entry and queries over it fall back to scanning"
+                            );
+                        }
+                    }
+                }
+                column_segments.sort_by(|a, b| {
+                    (
+                        a.ingest_hour_bucket,
+                        a.shard,
+                        a.writer_id.as_slice(),
+                        a.writer_epoch,
+                        a.writer_seq,
+                    )
+                        .cmp(&(
+                            b.ingest_hour_bucket,
+                            b.shard,
+                            b.writer_id.as_slice(),
+                            b.writer_epoch,
+                            b.writer_seq,
+                        ))
+                });
+
+                match snapshot_format::encode_column_stats(
+                    tenant.0,
+                    signal_num,
+                    part_hashes.iter().map(|h| h.to_vec()).collect(),
+                    &column_segments,
+                ) {
+                    Ok(stats_bytes) => {
+                        let stats_crc = crc32c::crc32c(&stats_bytes);
+                        let stats_hash = blake3::hash(&stats_bytes);
+                        let stats_hash16 = &stats_hash.to_hex()[..16];
+                        let stats_key =
+                            column_stats_object_key(tenant, signal, watermark_hour, stats_hash16);
+                        let size = stats_bytes.len() as u64;
+                        let segment_count = column_segments.len() as u32;
+                        match self
+                            .store()
+                            .put(
+                                &stats_key,
+                                Bytes::from(stats_bytes),
+                                PutOptions::create_if_absent()
+                                    .with_checksum(UploadChecksum::Crc32c(stats_crc)),
+                            )
+                            .await
+                        {
+                            Ok(_) | Err(StoreError::AlreadyExists) => {
+                                counters.put_requests += 1;
+                                (
+                                    true,
+                                    size,
+                                    Some(SnapshotColumnStatsRef {
+                                        key: stats_key,
+                                        blake3: stats_hash.as_bytes().to_vec(),
+                                        size,
+                                        segment_count,
+                                        part_blake3: part_hashes
+                                            .iter()
+                                            .map(|h| h.to_vec())
+                                            .collect(),
+                                    }),
+                                )
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    error = %err,
+                                    tenant = %tenant.to_hex(),
+                                    "column-stats PUT failed, folding without a column-stats ref"
+                                );
+                                (false, 0, None)
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            tenant = %tenant.to_hex(),
+                            "column-stats encode failed, folding without a column-stats ref"
+                        );
+                        (false, 0, None)
+                    }
+                }
+            };
+
             let new_head = SnapshotHead {
                 format_version: HEAD_FORMAT_VERSION,
                 tenant_hash: tenant.0.to_vec(),
@@ -1378,6 +1615,7 @@ impl Catalog {
                 // `validate_head` enforces for a multi-part head.
                 parts: part_refs.clone(),
                 postings: postings_ref,
+                column_stats: column_stats_ref,
                 folder_id: folder_id.into_bytes().to_vec(),
                 created_unix_ns: now_ns,
                 shard_generation_count,
@@ -1430,6 +1668,8 @@ impl Catalog {
                         put_requests: counters.put_requests,
                         postings_built,
                         postings_bytes: postings_size,
+                        column_stats_built,
+                        column_stats_bytes: column_stats_size,
                         layout_drift_count,
                         frontier_hours_reconciled,
                         frontier_hours_deferred,
@@ -1464,7 +1704,7 @@ impl Catalog {
                 counters.get_requests += 1;
                 match snapshot_format::decode_head(&got.data) {
                     Ok(head) => Ok(HeadState::Valid {
-                        head,
+                        head: Box::new(head),
                         version: got.version,
                     }),
                     // A HEAD whose `format_version` this process does not
@@ -2163,6 +2403,8 @@ fn no_op_report(watermark_hour: Option<u32>, counters: RequestCounters) -> FoldR
         put_requests: counters.put_requests,
         postings_built: false,
         postings_bytes: 0,
+        column_stats_built: false,
+        column_stats_bytes: 0,
         layout_drift_count: 0,
         frontier_hours_reconciled: 0,
         frontier_hours_deferred: 0,

@@ -653,15 +653,37 @@ impl SqlExecutor {
             // plan are installed on the logs provider here; they widen the
             // table's schema and are consumed only by this provider. A metrics-
             // or spans-target query leaves `extras.declared` unused.
-            TargetSignal::Logs => SessionTable::Logs(Arc::new(
-                LogsTableProvider::new(
-                    snapshot,
-                    tenant_hash,
-                    self.log_fetcher.clone(),
-                    accounting.clone(),
-                )
-                .with_declared_columns(extras.declared),
-            )),
+            TargetSignal::Logs => {
+                // ADR-0850: resolved once per plan from the current folded
+                // catalog HEAD, independently of `snapshot` (a different
+                // object, not versioned against the pinned snapshot). `None`
+                // -- nothing folded yet, no configured typed columns, or the
+                // last fold's build/PUT failed -- reproduces the
+                // pre-ADR-0850 provider exactly; every metadata-only path
+                // keyed off it degrades to scanning on a `None`.
+                let column_stats = if extras.declared.is_empty() {
+                    // No configured typed columns: no metadata-only column path
+                    // can ever apply, so skip the HEAD GET load_column_stats
+                    // would issue. This keeps a predicate-free COUNT(*) on a
+                    // tenant with no declared columns reading zero objects, and
+                    // reproduces the pre-ADR-0850 provider exactly.
+                    None
+                } else {
+                    self.catalog
+                        .load_column_stats(&tenant_hash, Signal::Logs)
+                        .await?
+                };
+                SessionTable::Logs(Arc::new(
+                    LogsTableProvider::new(
+                        snapshot,
+                        tenant_hash,
+                        self.log_fetcher.clone(),
+                        accounting.clone(),
+                    )
+                    .with_declared_columns(extras.declared)
+                    .with_column_stats(column_stats.map(Arc::new)),
+                ))
+            }
             // The spans provider drives `SpanSegmentFetcher::fetch_accounted`
             // for every scanned segment: `accounting` is cloned in so each
             // span GET is recorded against this query, and the fetch is

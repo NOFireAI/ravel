@@ -241,12 +241,14 @@ use datafusion::physical_plan::{
 };
 use datafusion::scalar::ScalarValue;
 use futures::{Stream, StreamExt, TryStreamExt};
-use ravel_catalog::SegmentRef;
+use ravel_catalog::{LoadedColumnStats, SegmentRef};
 use ravel_logseg::footer::LogFooter;
 use ravel_logseg::{
     AttrColumn, ColumnSelection, ColumnarBlockView, FieldSel, FieldType, LogRecord, Predicate,
     ScanStats,
 };
+use ravel_proto::catalog::v1::ColumnValue;
+use ravel_proto::catalog::v1::column_value::Kind as ColumnValueKind;
 use ravel_query::erasure::ErasurePredicate;
 use ravel_query::{ColumnarBlockOutcome, LogQuery, LogSegmentFetcher, LogSegmentScan};
 use ravel_types::TenantHash;
@@ -442,6 +444,61 @@ fn columnar_static_eligible(projection: &[usize], erasure: &[ErasurePredicate]) 
     erasure.is_empty() && projection.iter().all(|&i| i != LOG_COL_ATTRS)
 }
 
+/// The identity tuple `fold::entry_identity` uses for `seg`, so a column-
+/// stats lookup joins by identity rather than ordinal position (ADR-0850).
+/// An L1 (compacted) segment's `writer_id` is `Uuid::nil()` by convention
+/// ([`SegmentRef::writer_id`]'s doc); column stats are only ever built for L0
+/// entries (a fold-time filter, not enforced here), so an L1 segment's
+/// identity simply never matches an entry in the loaded stats and the lookup
+/// falls back to scanning it, with no special case needed.
+fn segment_identity(seg: &SegmentRef) -> ravel_catalog::EntryIdentity {
+    (
+        seg.ingest_hour_bucket,
+        seg.shard,
+        *seg.writer_id.as_bytes(),
+        seg.writer_epoch,
+        seg.writer_seq,
+    )
+}
+
+/// Decode `value` as the Arrow scalar `ty` projects to, or `None` when
+/// `value`'s oneof kind does not match `ty` (a corrupt or version-mismatched
+/// stat). `Str` is unreachable here: callers check for it before ever calling
+/// this (see [`LogsScanExec::declared_min_max`]).
+fn declared_scalar(ty: DeclaredType, value: &ColumnValue) -> Option<ScalarValue> {
+    match (ty, value.kind.as_ref()) {
+        (DeclaredType::I64, Some(ColumnValueKind::I64(v))) => Some(ScalarValue::Int64(Some(*v))),
+        (DeclaredType::Bool, Some(ColumnValueKind::B(v))) => Some(ScalarValue::Boolean(Some(*v))),
+        (DeclaredType::Bytes, Some(ColumnValueKind::BytesVal(v))) => {
+            Some(ScalarValue::Binary(Some(v.clone())))
+        }
+        _ => None,
+    }
+}
+
+/// The `None`-valued Arrow scalar `ty` projects to, for a declared column
+/// whose exact MIN/MAX is `NULL` (every covered segment's column entirely
+/// null, or zero segments). `Str` is unreachable, matching [`declared_scalar`].
+fn declared_null_scalar(ty: DeclaredType) -> ScalarValue {
+    match ty {
+        DeclaredType::I64 => ScalarValue::Int64(None),
+        DeclaredType::Bool => ScalarValue::Boolean(None),
+        DeclaredType::Bytes => ScalarValue::Binary(None),
+        DeclaredType::Str => ScalarValue::Utf8(None),
+    }
+}
+
+/// Exact `GROUP BY <declared column>, COUNT(*)` result from
+/// [`LogsScanExec::declared_group_counts`] (ADR-0850's q08 shape): one exact
+/// count per distinct non-null value, plus the count of NULL rows kept
+/// separately so a caller can decide whether SQL's NULL group applies (it
+/// does when `null_count > 0`, and a zero-segment or all-null scan still
+/// answers correctly with `counts` empty and `null_count` set accordingly).
+pub(crate) struct DeclaredGroupCounts {
+    pub(crate) counts: Vec<(ScalarValue, u64)>,
+    pub(crate) null_count: u64,
+}
+
 /// Log segment scan producing block-at-a-time batches over a projection of the
 /// public `logs` schema. Declares no ordering (ADR-0087 decision 1).
 pub struct LogsScanExec {
@@ -493,6 +550,15 @@ pub struct LogsScanExec {
     /// Empty for a zero-declaration query, which is byte-identical to the
     /// pre-ADR-0090 scan.
     declared: Arc<Vec<DeclaredColumn>>,
+    /// Exact per-segment column statistics for the tenant's declared columns
+    /// (ADR-0850), loaded once per plan and threaded down from
+    /// [`crate::executor::SqlExecutor`]. `None` when no usable column-stats
+    /// object exists (nothing folded yet, no configured typed columns, or the
+    /// last fold's build/PUT failed): every metadata-only path degrades to
+    /// scanning in that case. A live segment absent from
+    /// `LoadedColumnStats::segments` has no exact statistics either, checked
+    /// per column at the point of use rather than here.
+    column_stats: Option<Arc<LoadedColumnStats>>,
     /// The resolved full `logs` schema this scan projects, i.e.
     /// `logs_schema_with_declared(&declared)`. Kept so [`Self::reproject`] can
     /// build a narrower sibling scan over the same table without re-deriving
@@ -776,6 +842,21 @@ impl LogsScanExec {
             Arc::clone(&self.declared),
             row_refs,
         )
+        .map(|scan| scan.with_column_stats(self.column_stats.clone()))
+    }
+
+    /// Attach this plan's loaded column statistics (ADR-0850), resolved once
+    /// per plan by [`crate::executor::SqlExecutor`] and threaded down through
+    /// [`crate::logs_provider::LogsTableProvider::with_column_stats`]. A
+    /// builder method rather than a constructor parameter for the same reason
+    /// [`crate::logs_provider::LogsTableProvider::with_declared_columns`] is
+    /// one: every existing call site of [`Self::new`] stays source-compatible.
+    pub(crate) fn with_column_stats(
+        mut self,
+        column_stats: Option<Arc<LoadedColumnStats>>,
+    ) -> Self {
+        self.column_stats = column_stats;
+        self
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -871,6 +952,7 @@ impl LogsScanExec {
             projection: Arc::new(projection),
             columns,
             declared,
+            column_stats: None,
             full_schema: full,
             schema,
             row_refs,
@@ -929,6 +1011,148 @@ impl LogsScanExec {
                 .segments
                 .iter()
                 .all(|seg| self.ts_min <= seg.min_event_ts_ns && seg.max_event_ts_ns <= self.ts_max)
+    }
+
+    /// Exact MIN/MAX for the declared column at schema index
+    /// `FIRST_DECLARED_COL + k` over every segment this scan touches
+    /// (ADR-0850), joined against `self.column_stats` by identity. `None`
+    /// means the safety lemma from #849 requires falling back to scanning:
+    /// no loaded column-stats object at all, an unsupported declared type
+    /// (`Str`, projected as `Dictionary(Int32, Utf8)`; not implemented here),
+    /// a relevant segment with no entry in the loaded stats (never built, or
+    /// postdates the fold that built them), or a segment whose stat for this
+    /// column has no entry or decodes to a value of the wrong kind (a
+    /// corrupt/version-mismatched stat).
+    ///
+    /// `Some((min, max))` with both a `None`-valued scalar is still an exact
+    /// answer, not a fallback: every covered segment's column was entirely
+    /// null, or there are zero segments, and SQL `MIN`/`MAX` over all-NULL or
+    /// zero-row input is `NULL`.
+    fn declared_min_max(&self, k: usize) -> Option<(ScalarValue, ScalarValue)> {
+        let declared = self.declared.get(k)?;
+        if matches!(declared.ty, DeclaredType::Str) {
+            return None;
+        }
+        let stats = self.column_stats.as_ref()?;
+        let mut min: Option<ScalarValue> = None;
+        let mut max: Option<ScalarValue> = None;
+        for seg in self.segments.iter() {
+            let seg_stats = stats.segments.get(&segment_identity(seg))?;
+            let stat = seg_stats.columns.iter().find(|c| c.name == declared.key)?;
+            if let Some(min_val) = stat.min.as_ref() {
+                let v = declared_scalar(declared.ty, min_val)?;
+                min = Some(match min {
+                    Some(cur) if v.partial_cmp(&cur) != Some(std::cmp::Ordering::Less) => cur,
+                    _ => v,
+                });
+            }
+            if let Some(max_val) = stat.max.as_ref() {
+                let v = declared_scalar(declared.ty, max_val)?;
+                max = Some(match max {
+                    Some(cur) if v.partial_cmp(&cur) != Some(std::cmp::Ordering::Greater) => cur,
+                    _ => v,
+                });
+            }
+        }
+        let null_scalar = declared_null_scalar(declared.ty);
+        Some((
+            min.unwrap_or_else(|| null_scalar.clone()),
+            max.unwrap_or(null_scalar),
+        ))
+    }
+
+    /// Exact count of rows whose declared column at schema index
+    /// `FIRST_DECLARED_COL + k` is non-null and not equal to `literal`
+    /// (ADR-0850's q02 shape: `COUNT(*) WHERE <declared column> <> <literal>`,
+    /// which per SQL three-valued logic excludes NULL rows the same way the
+    /// scan path's per-row `<>` evaluation would). `None` means fall back to
+    /// scanning, for every reason [`Self::declared_min_max`] does (no pending
+    /// erasure allowed, no `Str` support, needs a loaded column-stats object
+    /// covering every touched segment), plus one specific to this path: any
+    /// covered segment whose dictionary is absent because its distinct-value
+    /// count exceeded the fold's cardinality ceiling (ADR-0850 decision 3) has
+    /// no exact per-value count to subtract, so a count derived from it could
+    /// be wrong outright, not merely unavailable.
+    pub(crate) fn declared_not_equal_count(&self, k: usize, literal: &ScalarValue) -> Option<u64> {
+        if !self.erasure.is_empty() {
+            return None;
+        }
+        let declared = self.declared.get(k)?;
+        if matches!(declared.ty, DeclaredType::Str) {
+            return None;
+        }
+        let stats = self.column_stats.as_ref()?;
+        let mut total: u64 = 0;
+        for seg in self.segments.iter() {
+            let seg_stats = stats.segments.get(&segment_identity(seg))?;
+            let stat = seg_stats.columns.iter().find(|c| c.name == declared.key)?;
+            if !stat.dictionary_present {
+                return None;
+            }
+            let mut matching: u64 = 0;
+            for entry in &stat.dictionary {
+                let value = entry.value.as_ref()?;
+                let v = declared_scalar(declared.ty, value)?;
+                if v == *literal {
+                    matching += entry.count;
+                }
+            }
+            total += stat.non_null_count.checked_sub(matching)?;
+        }
+        Some(total)
+    }
+
+    /// The declared-column index (into `self.declared`) that this scan's
+    /// output column `output_col` projects, or `None` when that output column
+    /// is not a declared typed column. The metadata-only aggregate rule
+    /// receives filter and group-key column indices in this scan's *output*
+    /// space (projection pushdown has already rewritten them by the time the
+    /// rule fires), so it resolves them through `self.projection` before
+    /// indexing `self.declared`; passing a raw output index straight into
+    /// [`Self::declared_not_equal_count`]/[`Self::declared_group_counts`]
+    /// would consult the wrong column whenever the scan is projected.
+    pub(crate) fn declared_index_for_output(&self, output_col: usize) -> Option<usize> {
+        let full = *self.projection.get(output_col)?;
+        full.checked_sub(FIRST_DECLARED_COL)
+            .filter(|k| *k < self.declared.len())
+    }
+
+    /// Exact GROUP BY value -> COUNT(*) for the declared column at schema
+    /// index `FIRST_DECLARED_COL + k` (ADR-0850's q08 shape), merging every
+    /// touched segment's exact dictionary. `None` means fall back to
+    /// scanning, for the same reasons [`Self::declared_not_equal_count`]
+    /// does. `ScalarValue`'s `Eq`/`Hash` are used directly as the merge key:
+    /// `DeclaredType` has no floating-point variant, so the NaN/-0.0 hazards
+    /// that motivate this repo's bit-pattern float-comparison rule elsewhere
+    /// never arise for a declared column's value domain.
+    pub(crate) fn declared_group_counts(&self, k: usize) -> Option<DeclaredGroupCounts> {
+        if !self.erasure.is_empty() {
+            return None;
+        }
+        let declared = self.declared.get(k)?;
+        if matches!(declared.ty, DeclaredType::Str) {
+            return None;
+        }
+        let stats = self.column_stats.as_ref()?;
+        let mut merged: HashMap<ScalarValue, u64> = HashMap::new();
+        let mut null_count: u64 = 0;
+        for seg in self.segments.iter() {
+            let seg_stats = stats.segments.get(&segment_identity(seg))?;
+            let stat = seg_stats.columns.iter().find(|c| c.name == declared.key)?;
+            if !stat.dictionary_present {
+                return None;
+            }
+            null_count += stat.null_count;
+            for entry in &stat.dictionary {
+                let value = entry.value.as_ref()?;
+                let v = declared_scalar(declared.ty, value)?;
+                *merged.entry(v).or_insert(0) += entry.count;
+            }
+        }
+        Some(DeclaredGroupCounts {
+            counts: merged.into_iter().collect(),
+            null_count,
+        })
     }
 
     /// Whether this scan can take the predicate-free full-window whole-segment
@@ -1328,6 +1552,24 @@ impl ExecutionPlan for LogsScanExec {
                 let col = &mut stats.column_statistics[ts_idx];
                 col.min_value = Precision::Exact(ScalarValue::TimestampNanosecond(Some(min), None));
                 col.max_value = Precision::Exact(ScalarValue::TimestampNanosecond(Some(max), None));
+            }
+
+            // ADR-0850: the same gate widens to a declared column's exact
+            // min/max, joined against `self.column_stats` by identity rather
+            // than ordinal position. `declared_min_max` itself enforces the
+            // per-column fallback (an uncovered segment, a corrupt/type-
+            // mismatched stat, or an unsupported declared type all report
+            // `None` here, leaving the column `Absent`); this loop only
+            // decides which output index to fill.
+            for k in 0..self.declared.len() {
+                let schema_idx = FIRST_DECLARED_COL + k;
+                if let Some(out_idx) = self.projection.iter().position(|&i| i == schema_idx)
+                    && let Some((min, max)) = self.declared_min_max(k)
+                {
+                    let col = &mut stats.column_statistics[out_idx];
+                    col.min_value = Precision::Exact(min);
+                    col.max_value = Precision::Exact(max);
+                }
             }
         }
         Ok(Arc::new(stats))

@@ -2178,6 +2178,7 @@ mod tests {
             folder_id: vec![0u8; 16],
             created_unix_ns: 0,
             postings,
+            column_stats: None,
             shard_generation_count: 1,
         };
         let bytes = ravel_catalog::encode_head(&head).expect("valid HEAD encodes");
@@ -2655,6 +2656,7 @@ mod tests {
                 folder_id: vec![0u8; 16],
                 created_unix_ns: 0,
                 postings: None,
+                column_stats: None,
                 shard_generation_count: 1,
             };
             Bytes::from(ravel_catalog::encode_head(&head).expect("valid swapped HEAD"))

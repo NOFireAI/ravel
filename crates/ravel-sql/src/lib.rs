@@ -71,6 +71,7 @@ mod logs_schema;
 mod logs_udf;
 mod map_field_planner;
 mod memory;
+mod metadata_agg;
 mod minmax;
 mod output;
 mod provider;
@@ -145,6 +146,7 @@ pub use logs_schema::{
 };
 pub use logs_udf::{HAS_WORD_UDF, has_word_udf};
 pub use memory::{CeilingBreach, TenantDelegatingPool, TenantMemoryAccountant};
+pub use metadata_agg::{METADATA_ONLY_AGGREGATE_RULE, MetadataOnlyAggregate, MetadataOnlyExec};
 pub use output::QueryOutput;
 pub use provider::RavelTableProvider;
 pub use pushdown::Pushdown;

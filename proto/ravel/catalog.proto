@@ -64,6 +64,12 @@ message SnapshotHead {
   // record view. Absent/0 = pre-reshard head; readers must never treat
   // absence as an error.
   uint32 shard_generation_count = 10;
+  // Additive, ADR-0850 (logs typed-column statistics). Absent when the
+  // tenant has no configured typed columns (ADR-0090), no eligible L0
+  // segment has been folded yet, or the last fold's column-stats build
+  // failed; readers must never treat absence as an error, and must fall
+  // back to scanning for any statistic this ref does not cover.
+  SnapshotColumnStatsRef column_stats = 11;
 }
 
 message SnapshotPartRef {
@@ -102,4 +108,79 @@ message SnapshotPostingsHeader {
   uint64 entry_count = 5;      // total entries across the covered parts
   uint32 name_count = 6;
   uint64 body_uncompressed_len = 7;
+}
+
+// Reference to a column-statistics object (RCST1 envelope), ADR-0850. Bound
+// to the exact set of parts it was built from, the same way
+// SnapshotPostingsRef binds a name-postings object: a column-stats object is
+// only trustworthy against the parts whose blake3 hashes it names here.
+message SnapshotColumnStatsRef {
+  string key = 1;              // full object key of the column-stats object
+  bytes blake3 = 2;             // 32, of the column-stats object's full bytes
+  uint64 size = 3;
+  uint32 segment_count = 4;     // number of segments with an entry in this object
+  repeated bytes part_blake3 = 5;  // covered parts' blake3, same order as parts
+}
+
+message ColumnStatsHeader {
+  uint32 format_version = 1;  // 1; must match envelope version
+  bytes tenant_hash = 2;      // 16
+  uint32 signal = 3;
+  repeated bytes part_blake3 = 4;  // covered parts' blake3, binds this
+                                    // object to an exact part set
+  uint64 segment_count = 5;
+  uint64 body_uncompressed_len = 6;
+}
+
+// A single dynamic-type scalar: exactly one of the typed-column value
+// domains (ADR-0090: Str, I64, Bool, Bytes). `str_utf8` and `bytes_val` are
+// distinct so a Str column's dictionary/min/max round-trip as UTF-8 text
+// even though both are wire-encoded as `bytes`.
+message ColumnValue {
+  oneof kind {
+    int64 i64 = 1;
+    bool b = 2;
+    string str_utf8 = 3;
+    bytes bytes_val = 4;
+  }
+}
+
+message DictEntry {
+  ColumnValue value = 1;
+  uint64 count = 2;
+}
+
+// Exact per-object statistics for one configured typed-attribute column,
+// computed by a genuine fold-time decode pass over the segment's declared
+// column (ADR-0850). `dictionary_present` false means the column's distinct
+// value count in this segment exceeded the fold's cardinality ceiling: the
+// dictionary is omitted outright, never truncated, and a reader must treat
+// this exactly as "no exact per-value counts available", not as "zero
+// distinct values".
+message ColumnStat {
+  string name = 1;
+  // ravel.sys.v1.TypedAttrColumnType as i32 (no cross-file proto import in
+  // this repo; same convention as SnapshotPartHeader.signal).
+  uint32 declared_type = 2;
+  uint64 non_null_count = 3;
+  uint64 null_count = 4;
+  // Present only when non_null_count > 0; absent (proto3 default) for an
+  // all-null or entirely-absent column in this segment.
+  ColumnValue min = 5;
+  ColumnValue max = 6;
+  bool dictionary_present = 7;
+  repeated DictEntry dictionary = 8;
+}
+
+// One segment's exact column statistics, identified the same way
+// `fold::entry_identity` identifies a `SnapshotEntry`, so a reader can join
+// this record back onto a resolved `SegmentRef` without relying on ordinal
+// position.
+message ColumnStatsSegment {
+  uint32 ingest_hour_bucket = 1;
+  uint32 shard = 2;
+  bytes writer_id = 3;
+  uint64 writer_epoch = 4;
+  uint64 writer_seq = 5;
+  repeated ColumnStat columns = 6;
 }
