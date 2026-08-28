@@ -854,6 +854,41 @@ in-flight flushes today; wiring either into an operator scrape is a follow-up in
   nanoseconds, split three ways. See "The three time spans" below; reading any
   two of them as if they were the whole split misattributes backpressure.
 
+#### Which shards are covered
+
+Every shard index the write path can route to, not only the `shard_count` the
+process was configured with. The shard set is not fixed for the lifetime of the
+process: `GenerationSwitch` (ADR-0052 section 2) keeps one shard-actor set per
+distinct `shard_count` seen and takes the live count from the tenant's
+generation history via `active_shard_count`, so a tenant that activates a larger
+generation routes to indices above the configured count. The accumulators are
+therefore preallocated to `MAX_SHARD_COUNT` (10 000, the ceiling
+`provisioning.rs` validates every generation's `shard_count` against), so no
+generation the catalog accepts can route to an index the metric drops. Sizing to
+the configured count instead would omit exactly the shards a reshard adds, and
+omitting shards biases this measurement toward reporting *less* skew than there
+is -- the direction that would manufacture agreement with the claim the metric
+exists to test.
+
+#### What a single read does and does not guarantee
+
+`shard_skew_by_shard()` reads five independent atomics per shard, so under
+concurrent recording it is not an instantaneous snapshot of all five. One
+direction is guaranteed and one is not:
+
+- `messages_processed` never runs ahead of the `on_actor_ns` it belongs to: the
+  actor adds the time with `Relaxed` and then bumps the count with `Release`,
+  and the reader loads the count with `Acquire` before the time. A counted
+  message therefore always has its time addend included, so the derived mean
+  `on_actor_ns / messages_processed` can never read low because of a torn pair.
+- The reverse tear is observable: a time addend whose message has not yet been
+  counted, so the mean can read high by at most one in-flight message per
+  concurrent actor. Both counters are cumulative, so a later read self-heals.
+
+`queue_depth` is derived at read time from two counters updated on different
+tasks and is saturating for the same reason; it can read 0 when a processed
+increment is visible before its enqueue.
+
 #### The three time spans
 
 The split is the point of the whole measurement: without it, a figure cannot
