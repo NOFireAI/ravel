@@ -488,7 +488,7 @@ mod tests {
             observed_ts_ns: ts,
             severity_num: 9,
             severity_text: "INFO".into(),
-            body: format!("body {ts}").into(),
+            body: format!("body {ts}"),
             trace_id: None,
             span_id: None,
             flags: 0,

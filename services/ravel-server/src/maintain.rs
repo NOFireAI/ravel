@@ -2648,6 +2648,7 @@ mod tests {
             folder_id: vec![0u8; 16],
             created_unix_ns: 0,
             postings: None,
+            column_stats: None,
             shard_generation_count: 1,
         };
         store
