@@ -11,9 +11,10 @@
 //! snapshot, each read through its own accessor: the in-flight-flush gauge
 //! ([`IngestMetrics::in_flight_flushes_by_shard`]) and the ingest-skew figures
 //! ([`IngestMetrics::shard_skew_by_shard`], issue #865: per-shard message
-//! throughput, queue depth, and the on-actor/off-actor time split). The
-//! per-tenant dimensioned model and per-shard latency histograms docs/ingest.md
-//! still lists as future work are not implemented here.
+//! throughput, queue depth, and the three-way on-actor / flush-permit-wait /
+//! off-actor time split). The per-tenant dimensioned model and per-shard
+//! latency histograms docs/ingest.md still lists as future work are not
+//! implemented here.
 //!
 //! Two timing conventions coexist, and mixing them up misreads the numbers:
 //!
@@ -156,8 +157,9 @@ pub struct IngestMetrics {
     /// via [`IngestMetrics::in_flight_flushes_by_shard`].
     in_flight_flushes: Mutex<HashMap<u32, i64>>,
     /// Per-shard ingest-skew accounting (issue #865): message throughput and
-    /// the on-actor/off-actor time split, so an argument about shard-actor
-    /// throughput rests on measured per-shard figures rather than assertion.
+    /// the on-actor / flush-permit-wait / off-actor time split, so an argument
+    /// about shard-actor throughput rests on measured per-shard figures rather
+    /// than assertion.
     /// Like `in_flight_flushes` above, it carries a per-shard dimension the
     /// flat `Copy` [`IngestMetricsSnapshot`] cannot hold, so it is read via
     /// [`IngestMetrics::shard_skew_by_shard`] rather than folded into the
@@ -205,6 +207,7 @@ struct ShardSkewCounters {
     messages_enqueued: u64,
     messages_processed: u64,
     on_actor_ns: u64,
+    flush_permit_wait_ns: u64,
     off_actor_ns: u64,
 }
 
@@ -212,6 +215,36 @@ struct ShardSkewCounters {
 /// [`IngestMetrics::shard_skew_by_shard`]; a benchmark reaches it through
 /// [`crate::IngestRouter::metrics`], the same handle it already reads
 /// [`IngestMetrics::in_flight_flushes_by_shard`] through.
+///
+/// # The three time spans
+///
+/// `on_actor_ns`, `flush_permit_wait_ns`, and `off_actor_ns` partition a
+/// shard's flush pipeline into three spans that share no nanosecond of any
+/// sampled interval. Each is bracketed on the injected [`crate::Clock`] at a
+/// distinct code boundary in `shard.rs`, and the three boundaries are
+/// consecutive:
+///
+/// 1. `on_actor_ns` runs from the actor pulling a `Write` message off its
+///    channel to `handle_write` returning, **minus** any permit wait nested
+///    inside that call.
+/// 2. `flush_permit_wait_ns` runs from `flush_tenant` reaching the
+///    `max_inflight_flushes` semaphore acquire to that acquire granting a
+///    permit.
+/// 3. `off_actor_ns` runs from the spawned flush task entering `run_flush`
+///    (permit already held) to `run_flush` returning.
+///
+/// Spans 1 and 2 both accrue on the actor task and are therefore disjoint in
+/// wall time as well: together they account for the actor's whole
+/// `Write`-handling window, and `on_actor_ns + flush_permit_wait_ns` can never
+/// exceed the wall time the actor spent handling messages. Span 3 accrues in
+/// spawned tasks that run *concurrently* with the actor, which is the entire
+/// point of ADR-0067's pipelining, so it is a sum over concurrent tasks: at
+/// `max_inflight_flushes > 1` it can legitimately exceed wall time, and it
+/// overlaps spans 1 and 2 in wall time. Overlapping in wall time is not
+/// double-counting: no single sampled interval is added to two counters. In
+/// particular, the interval an actor spends parked in span 2 is wall-time
+/// concurrent with a *prior* flush's span 3, and is charged to the actor side
+/// exactly once, as permit wait, never as actor work.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ShardSkewStats {
     /// `Write` messages the router sent into this shard's channel.
@@ -228,15 +261,30 @@ pub struct ShardSkewStats {
     /// than underflowing.
     pub queue_depth: u64,
     /// Injected-`Clock` nanoseconds the actor task spent processing this
-    /// shard's `Write` messages: the serial merge-and-pin section that runs ON
-    /// the actor. It excludes the flush, which ADR-0067 moved into a spawned
-    /// task off the actor; that time lands in `off_actor_ns`.
+    /// shard's `Write` messages: the serial merge-and-pin work the actor
+    /// genuinely serialises, and nothing else. It excludes the flush, which
+    /// ADR-0067 moved into a spawned task (`off_actor_ns`), and it excludes the
+    /// wait for a flush permit (`flush_permit_wait_ns`), which is a prior
+    /// flush's duration rather than work this actor performs.
     pub on_actor_ns: u64,
+    /// Injected-`Clock` nanoseconds this shard spent parked on the
+    /// `max_inflight_flushes` semaphore before a flush task could be spawned
+    /// (ADR-0067 decision 2). This runs on the actor task, but it is not actor
+    /// work: the actor is stalled waiting for an earlier flush of this same
+    /// shard to release its permit, so this is the shard's flush backpressure
+    /// signal. A rising figure here says flushing is the bottleneck; a rising
+    /// `on_actor_ns` says the single-threaded actor is.
+    ///
+    /// Counted for every flush trigger, not only the size trigger inside
+    /// `handle_write`: an age or manual flush parks on the same semaphore.
+    pub flush_permit_wait_ns: u64,
     /// Injected-`Clock` nanoseconds spent in this shard's flush tasks, which
     /// run OFF the actor (ADR-0067): exemplar admission, encode, and both PUTs.
-    /// Kept distinct from `on_actor_ns` so a future measurement can tell an
-    /// actor-thread bottleneck from a flush bottleneck -- the exact ambiguity a
-    /// single figure cannot resolve.
+    /// Measured from inside the spawned task with the permit already held, so
+    /// it never re-counts `flush_permit_wait_ns`. Kept distinct from
+    /// `on_actor_ns` so a measurement can tell an actor-thread bottleneck from
+    /// a flush bottleneck -- the exact ambiguity a single figure cannot
+    /// resolve.
     pub off_actor_ns: u64,
 }
 
@@ -331,9 +379,10 @@ impl IngestMetrics {
 
     /// One `Write` message pulled and handled by shard `shard`'s actor, plus
     /// the injected-`Clock` nanoseconds the actor spent handling it -- the
-    /// on-actor serial section, excluding the flush that runs off the actor
-    /// (issue #865). Recorded together in one lock so a reader never sees a
-    /// processed count without its matching on-actor time.
+    /// on-actor serial section, excluding both the flush that runs off the
+    /// actor and any flush-permit wait the caller already subtracted (issue
+    /// #865). Recorded together in one lock so a reader never sees a processed
+    /// count without its matching on-actor time.
     pub(crate) fn record_shard_processed(&self, shard: u32, on_actor_ns: u64) {
         let mut map = self
             .shard_skew
@@ -344,10 +393,28 @@ impl IngestMetrics {
         entry.on_actor_ns = entry.on_actor_ns.saturating_add(on_actor_ns);
     }
 
+    /// One flush trigger's injected-`Clock` wait on shard `shard`'s
+    /// `max_inflight_flushes` semaphore (issue #865). Recorded by `flush_tenant`
+    /// for every trigger, and excluded by the actor loop from the `on_actor_ns`
+    /// it reports for the same message: the wait is a prior flush's duration,
+    /// so charging it as actor work would say "the actor is busy" exactly when
+    /// the truth is "flushes are backed up".
+    pub(crate) fn record_shard_flush_permit_wait_ns(&self, shard: u32, wait_ns: u64) {
+        let mut map = self
+            .shard_skew
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = map.entry(shard).or_default();
+        entry.flush_permit_wait_ns = entry.flush_permit_wait_ns.saturating_add(wait_ns);
+    }
+
     /// One completed flush task's injected-`Clock` nanoseconds, attributed to
-    /// the shard it flushed (issue #865). Off-actor by construction: the flush
-    /// runs in a spawned task (ADR-0067), so this time never overlaps the
-    /// actor's own `on_actor_ns`.
+    /// the shard it flushed (issue #865). Bracketed inside the spawned task
+    /// with the permit already held (ADR-0067), so it re-counts neither the
+    /// actor's `on_actor_ns` nor the `flush_permit_wait_ns` that preceded the
+    /// spawn. It does run concurrently with the actor in wall time, which is
+    /// what pipelining is for; see [`ShardSkewStats`] for why that is not
+    /// double-counting.
     pub(crate) fn record_shard_off_actor_ns(&self, shard: u32, off_actor_ns: u64) {
         let mut map = self
             .shard_skew
@@ -376,6 +443,7 @@ impl IngestMetrics {
                         messages_processed: c.messages_processed,
                         queue_depth: c.messages_enqueued.saturating_sub(c.messages_processed),
                         on_actor_ns: c.on_actor_ns,
+                        flush_permit_wait_ns: c.flush_permit_wait_ns,
                         off_actor_ns: c.off_actor_ns,
                     },
                 )
@@ -599,6 +667,9 @@ mod tests {
         metrics.record_shard_processed(1, 50);
         // Flush time lands off the actor, and only on shard 0 here.
         metrics.record_shard_off_actor_ns(0, 9_000);
+        // Shard 0's second flush trigger found the semaphore at its bound and
+        // parked; that wait is its own span, not part of either figure above.
+        metrics.record_shard_flush_permit_wait_ns(0, 700);
 
         let skew = metrics.shard_skew_by_shard();
         assert_eq!(
@@ -611,6 +682,7 @@ mod tests {
                         messages_processed: 2,
                         queue_depth: 1,
                         on_actor_ns: 300,
+                        flush_permit_wait_ns: 700,
                         off_actor_ns: 9_000,
                     }
                 ),
@@ -621,10 +693,40 @@ mod tests {
                         messages_processed: 1,
                         queue_depth: 0,
                         on_actor_ns: 50,
+                        flush_permit_wait_ns: 0,
                         off_actor_ns: 0,
                     }
                 ),
             ]
+        );
+    }
+
+    /// The three time spans accumulate independently: a permit wait recorded
+    /// for a shard must move neither `on_actor_ns` nor `off_actor_ns`, and
+    /// repeated waits sum rather than replace. Pins that the third counter was
+    /// added as its own accumulator, not carved out of one of the other two.
+    #[test]
+    fn flush_permit_wait_accumulates_without_touching_the_other_two_spans() {
+        let metrics = IngestMetrics::default();
+        metrics.record_shard_processed(0, 40);
+        metrics.record_shard_off_actor_ns(0, 500);
+        metrics.record_shard_flush_permit_wait_ns(0, 60);
+        metrics.record_shard_flush_permit_wait_ns(0, 90);
+
+        let skew = metrics.shard_skew_by_shard();
+        assert_eq!(
+            skew,
+            vec![(
+                0,
+                ShardSkewStats {
+                    messages_enqueued: 0,
+                    messages_processed: 1,
+                    queue_depth: 0,
+                    on_actor_ns: 40,
+                    flush_permit_wait_ns: 150,
+                    off_actor_ns: 500,
+                }
+            )]
         );
     }
 
@@ -646,6 +748,7 @@ mod tests {
                     messages_processed: 1,
                     queue_depth: 0,
                     on_actor_ns: 0,
+                    flush_permit_wait_ns: 0,
                     off_actor_ns: 0,
                 }
             )]

@@ -10,9 +10,10 @@
 //! how many such tasks may run at once per shard via a semaphore acquired
 //! before spawning; at the bound, the acquire blocks the flush trigger (and
 //! therefore the actor's ability to pull its next message), which is exactly
-//! where backpressure is meant to propagate. The adaptive age trigger
-//! (ADR-0067 decision 3) is `age_threshold_ns`/`adaptive_age_threshold_ns`
-//! below.
+//! where backpressure is meant to propagate, and is measured as its own span
+//! (`flush_permit_wait_ns`, issue #865) rather than charged to either the
+//! actor or the flush it waits on. The adaptive age trigger (ADR-0067
+//! decision 3) is `age_threshold_ns`/`adaptive_age_threshold_ns` below.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -954,13 +955,23 @@ impl ShardActor {
                         Some(ShardMsg::Write { tenant, points, exemplars, ack, charge }) => {
                             // Per-shard skew (issue #865): time the serial
                             // on-actor section only. The flush this may open runs
-                            // in a spawned task whose time is recorded off-actor
-                            // in `flush_tenant`; `handle_write` returns once that
-                            // task is spawned, so this delta never includes it.
+                            // in a spawned task, timed off-actor in `flush_tenant`.
+                            // `handle_write` returns once that task is spawned, so
+                            // this delta excludes the flush itself -- but NOT the
+                            // `max_inflight_flushes` acquire that precedes the
+                            // spawn, which at the bound parks here for a prior
+                            // flush's remaining duration. That wait is backpressure,
+                            // not actor work, and is already counted (once) as
+                            // `flush_permit_wait_ns`, so subtract it rather than let
+                            // it read as "the actor is busy" whenever flushing is
+                            // the real bottleneck.
                             let started_ns = self.clock.now_ns();
-                            self.handle_write(tenant, points, exemplars, ack, charge).await;
-                            let on_actor_ns =
+                            let permit_wait_ns = self
+                                .handle_write(tenant, points, exemplars, ack, charge)
+                                .await;
+                            let elapsed_ns =
                                 self.clock.now_ns().saturating_sub(started_ns).max(0) as u64;
+                            let on_actor_ns = elapsed_ns.saturating_sub(permit_wait_ns);
                             self.metrics.record_shard_processed(self.shard, on_actor_ns);
                         }
                         Some(ShardMsg::FlushNow { done }) => {
@@ -1010,6 +1021,10 @@ impl ShardActor {
         }
     }
 
+    /// Returns the injected-`Clock` nanoseconds this call spent parked on the
+    /// flush-permit semaphore, so the actor loop can exclude them from
+    /// `on_actor_ns` (issue #865). Zero on every path that opens no flush, and
+    /// zero when a permit was free.
     async fn handle_write(
         &mut self,
         tenant: TenantId,
@@ -1017,11 +1032,11 @@ impl ShardActor {
         exemplars: Vec<IngestExemplar>,
         ack: Option<Ack>,
         charge: Option<Arc<IngestByteCharge>>,
-    ) {
+    ) -> u64 {
         if points.is_empty() && exemplars.is_empty() && ack.is_none() {
             // Nothing buffered: drop the charge now so its bytes are refunded
             // rather than held for a message that touched no buffer.
-            return;
+            return 0;
         }
         let arrival_ns = self.clock.now_ns();
         let points_len = points.len() as u64;
@@ -1050,7 +1065,7 @@ impl ShardActor {
                 if let Some(ack) = ack {
                     self.ctx.ack_waiters(vec![ack], Err(err));
                 }
-                return;
+                return 0;
             }
         };
         // Merge times only the sample-buffer append, matching the logs merge;
@@ -1075,8 +1090,9 @@ impl ShardActor {
             .map(|b| b.est_bytes >= target_bytes)
             .unwrap_or(false);
         if should_flush && let Some(buf) = self.tenants.remove(&tenant) {
-            self.flush_tenant(tenant, buf, FlushTrigger::Size).await;
+            return self.flush_tenant(tenant, buf, FlushTrigger::Size).await;
         }
+        0
     }
 
     /// A buffer with a strict-mode waiter or at least `min_flush_bytes`
@@ -1195,7 +1211,18 @@ impl ShardActor {
     /// An empty buffer (exemplars only, no samples) never reaches the
     /// semaphore or a spawned task at all: there is nothing to encode, and a
     /// flush identity pinned for nothing would burn a `seq` for no object.
-    async fn flush_tenant(&mut self, tenant: TenantId, buf: TenantBuf, trigger: FlushTrigger) {
+    ///
+    /// Returns the injected-`Clock` nanoseconds spent parked on that semaphore
+    /// (issue #865), already recorded as this shard's `flush_permit_wait_ns`.
+    /// The return value exists only so a caller that brackets on-actor time
+    /// around this call can subtract it; callers that do not (`flush_aged`,
+    /// `flush_all`) drop it, and the counter is still recorded for them.
+    async fn flush_tenant(
+        &mut self,
+        tenant: TenantId,
+        buf: TenantBuf,
+        trigger: FlushTrigger,
+    ) -> u64 {
         let TenantBuf {
             series,
             exemplars,
@@ -1221,7 +1248,7 @@ impl ShardActor {
             // that ever changes, this returns without acking and the router
             // reads the dropped oneshot as a dead shard.
             debug_assert!(waiters.is_empty());
-            return;
+            return 0;
         }
         self.metrics.record_flush(trigger);
 
@@ -1235,7 +1262,7 @@ impl ShardActor {
                 self.metrics.record_abandoned_input_rejected();
                 self.ctx
                     .ack_waiters(waiters, Err(WriteError::SegmentBuild(msg)));
-                return;
+                return 0;
             }
         };
         let deadline_ns =
@@ -1277,6 +1304,14 @@ impl ShardActor {
         // itself awaited from `handle_write`/`flush_aged`/`flush_all`, that
         // park keeps the actor from pulling its next channel message,
         // exactly the backpressure path the bounded mpsc already relies on.
+        //
+        // Per-shard skew (issue #865): that park is its own span, bracketed on
+        // the injected clock from here to the grant. It sits between the actor's
+        // merge-and-pin work and the spawned flush's own span, and belongs to
+        // neither: what elapses here is a PRIOR flush's remaining duration, so
+        // folding it into `on_actor_ns` would report an actor bottleneck at
+        // exactly the moment flushing is the bottleneck.
+        let permit_wait_start_ns = self.clock.now_ns();
         let permit = match Arc::clone(&self.semaphore).acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => panic!(
@@ -1284,6 +1319,13 @@ impl ShardActor {
                 self.shard
             ),
         };
+        let permit_wait_ns = self
+            .clock
+            .now_ns()
+            .saturating_sub(permit_wait_start_ns)
+            .max(0) as u64;
+        self.metrics
+            .record_shard_flush_permit_wait_ns(self.shard, permit_wait_ns);
         self.metrics.record_inflight_flush_delta(self.shard, 1);
         let guard = InFlightFlushGuard {
             metrics: Arc::clone(&self.metrics),
@@ -1294,6 +1336,8 @@ impl ShardActor {
         // the actor (ADR-0067). Bracketing `run_flush` on the injected clock,
         // rather than inside it, keeps the measurement out of the pinned-identity
         // path and captures every exit `run_flush` takes, abandonment included.
+        // The bracket opens inside the spawned task, with the permit already
+        // held, so the wait for that permit is not counted here as well.
         let clock = Arc::clone(&self.clock);
         let metrics = Arc::clone(&self.metrics);
         let shard = self.shard;
@@ -1305,6 +1349,7 @@ impl ShardActor {
             let off_actor_ns = clock.now_ns().saturating_sub(started_ns).max(0) as u64;
             metrics.record_shard_off_actor_ns(shard, off_actor_ns);
         });
+        permit_wait_ns
     }
 }
 
