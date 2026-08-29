@@ -125,8 +125,10 @@
 //! stored bytes, so every L1 object was tiny (~3.5 MB on ClickBench, a 74x gap
 //! below the 256 MiB the knob's old name implied). Object geometry is a second,
 //! independent knob, the **stored-size target** `max_l1_part_bytes`: [`PartSink`]
-//! also sums [`estimate_stored_record`] (an encoded-bytes proxy) per record and
-//! closes the part when that total reaches the target. A part closes on
+//! also sums [`estimate_stored_record`] (an encoded-bytes proxy) per record,
+//! plus [`estimate_stored_stream`] once per distinct stream in the part (the
+//! STREAM_DIR entry the object stores once per stream), and closes the part when
+//! that total reaches the target. A part closes on
 //! whichever bound is reached first. With the shipped defaults (both 256 MiB)
 //! the memory bound still fires first on every real schema, so this split is
 //! behaviour-neutral until an operator lowers the stored target to grow
@@ -667,10 +669,17 @@ struct PartBuilder {
     /// writer-buffer term the tracker records. This is decoded Rust heap, not
     /// stored bytes.
     estimate: u64,
-    /// Sum of [`estimate_stored_record`] over every pushed record: the
+    /// Sum of [`estimate_stored_record`] over every pushed record, plus
+    /// [`estimate_stored_stream`] once per distinct stream in this part: the
     /// **stored-size target**'s trigger (compared against `max_l1_part_bytes`).
     /// This estimates encoded/on-object bytes, not heap.
     stored_estimate: u64,
+    /// The streams whose STREAM_DIR entry this part has already been charged
+    /// for. A set rather than a "did the stream change" check so the charge is
+    /// once per distinct stream whatever order records arrive in; it holds one
+    /// 16-byte id per stream in the part, which is negligible beside the part's
+    /// records.
+    charged_streams: BTreeSet<LogStreamId>,
     min_stream: Option<LogStreamId>,
     max_stream: Option<LogStreamId>,
     count: usize,
@@ -684,6 +693,7 @@ impl PartBuilder {
             writer,
             estimate: 0,
             stored_estimate: 0,
+            charged_streams: BTreeSet::new(),
             min_stream: None,
             max_stream: None,
             count: 0,
@@ -697,10 +707,21 @@ impl PartBuilder {
     /// Push one merged record into the part's writer, updating both running
     /// estimates (heap for the memory bound, encoded for the stored target) and
     /// the part's inclusive stream-id bounds.
+    ///
+    /// A record whose stream this part has not seen before also charges the
+    /// stored estimate for that stream's STREAM_DIR entry
+    /// ([`estimate_stored_stream`]): the blob is written once per stream in the
+    /// object, so it belongs in the encoded estimate once per stream, not once
+    /// per record and not never.
     fn push(&mut self, r: LogRecord, tracker: Option<&MergeMemoryTracker>) -> Result<()> {
         self.min_stream = Some(self.min_stream.map_or(r.stream_id, |m| m.min(r.stream_id)));
         self.max_stream = Some(self.max_stream.map_or(r.stream_id, |m| m.max(r.stream_id)));
         self.estimate = self.estimate.saturating_add(estimate_record(&r));
+        if self.charged_streams.insert(r.stream_id) {
+            self.stored_estimate = self
+                .stored_estimate
+                .saturating_add(estimate_stored_stream(&r.stream_attrs));
+        }
         self.stored_estimate = self
             .stored_estimate
             .saturating_add(estimate_stored_record(&r));
@@ -1301,7 +1322,13 @@ const STORED_RECORD_FIXED_BYTES: u64 = 16;
 ///
 /// - `stream_attrs` (the resource/scope blob) is stored once per stream in
 ///   STREAM_DIR, not once per record, so charging it per record would inflate
-///   the estimate on exactly the wide-stream shape this is meant to size.
+///   the estimate on exactly the wide-stream shape this is meant to size. It is
+///   not free, though: [`estimate_stored_stream`] charges each distinct stream's
+///   blob once per part it appears in, so a part carrying many streams with
+///   large resource blobs still reaches the target. Charging neither made the
+///   estimate blind to the whole STREAM_DIR section, and a many-stream,
+///   fat-blob bucket then ran far past the target while the estimate stayed
+///   small.
 /// - zstd compression. The estimate is the uncompressed column payload, so it
 ///   is an upper bound on the bytes those columns compress to; a target of `T`
 ///   payload bytes yields an object of `T / compression_ratio` stored bytes.
@@ -1323,6 +1350,32 @@ pub(crate) fn estimate_stored_record(r: &LogRecord) -> u64 {
         est = est.saturating_add(attr_value_stored_estimate(v));
     }
     est
+}
+
+/// Fixed per-stream encoded cost of one STREAM_DIR entry beyond its blob: the
+/// 16-byte `stream_id` plus the entry's `blob_len`, `first_blk`, and `last_blk`
+/// varints (docs/log-segment-format.md, "STREAM_DIR (uncompressed form)"). A
+/// deliberately flat figure at the top of the varints' range, in the same spirit
+/// as [`STORED_RECORD_FIXED_BYTES`].
+const STORED_STREAM_DIR_ENTRY_BYTES: u64 = 32;
+
+/// The encoded/on-object bytes one distinct stream adds to a part: its
+/// STREAM_DIR entry, which is the resource/scope blob plus
+/// [`STORED_STREAM_DIR_ENTRY_BYTES`] of entry overhead.
+///
+/// [`PartBuilder`] charges this once per distinct stream in the part, which is
+/// exactly how the writer stores it: the blob is written once per stream in
+/// STREAM_DIR, not once per record ([`estimate_stored_record`] therefore leaves
+/// it out). A part that opens a stream, closes, and reopens the same stream in
+/// the next part is charged in both, because both parts carry the entry.
+///
+/// Without this charge the stored estimate ignored STREAM_DIR entirely, so a
+/// bucket with many streams and large resource or scope blobs could run far past
+/// `max_l1_part_bytes` in real object bytes while its estimate stayed near the
+/// (tiny) sum of its record payloads. The estimate is only meaningful as a
+/// proxy for object size if it counts every section that grows with the data.
+fn estimate_stored_stream(stream_attrs: &[u8]) -> u64 {
+    STORED_STREAM_DIR_ENTRY_BYTES.saturating_add(stream_attrs.len() as u64)
 }
 
 /// The encoded value bytes one attribute *value* contributes to the stored-size
@@ -2960,7 +3013,11 @@ mod tests {
         }
 
         let stored = estimate_stored_record(&narrow_record(0));
-        let expected_parts = expected_part_count(stored, STORED_TARGET, total);
+        // Every part also pays this fixture's single stream's STREAM_DIR entry
+        // once, at its first record, so the records-per-part arithmetic runs
+        // against what is left of the target.
+        let stream_charge = estimate_stored_stream(&narrow_record(0).stream_attrs);
+        let expected_parts = expected_part_count(stored, STORED_TARGET - stream_charge, total);
         assert!(
             expected_parts >= 3,
             "fixture must split several times, got {expected_parts}"
@@ -2994,6 +3051,193 @@ mod tests {
             tracker.stored_bound_flushes(),
             expected_parts - 1,
             "every closed part (all but the trailing one) closed on the stored target"
+        );
+    }
+
+    /// Padding bytes in a fat stream's resource blob. The padding is
+    /// pseudo-random alphanumerics, not a repeated character: STREAM_DIR is
+    /// zstd-compressed as a whole section, so a compressible pad would leave the
+    /// object far smaller than the blob bytes the estimate charges and the
+    /// object-size assertion below would hold whatever the estimate counted.
+    const FAT_BLOB_PAD_BYTES: usize = 4096;
+
+    /// Deterministic pseudo-random alphanumerics, `n` bytes, distinct per
+    /// `seed`. An LCG, so the fixture is reproducible and no stream's blob is a
+    /// copy of another's.
+    fn incompressible_pad(seed: u64, n: usize) -> String {
+        const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+        let mut state = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut out = String::with_capacity(n);
+        for _ in 0..n {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            out.push(ALPHABET[(state >> 33) as usize % ALPHABET.len()] as char);
+        }
+        out
+    }
+
+    /// Stream `n` with a large resource blob ([`FAT_BLOB_PAD_BYTES`] of padding
+    /// in one resource attribute). The id is still the true hash of the blob, as
+    /// in [`stream_ident`], so the object carries real stream identity.
+    fn fat_stream_ident(n: u32) -> (LogStreamId, Vec<u8>) {
+        let res = vec![
+            (
+                "service.name".to_string(),
+                AttrValue::Str(format!("svc{n:03}")),
+            ),
+            (
+                "resource.detail".to_string(),
+                AttrValue::Str(incompressible_pad(u64::from(n), FAT_BLOB_PAD_BYTES)),
+            ),
+        ];
+        let id = log_stream_id(&res, "scope", "1", &[]);
+        let blob = stream_attrs_bytes(&res, "scope", "1", &[]);
+        (id, blob)
+    }
+
+    /// One tiny record of the fat stream `n`: the record payload is a handful of
+    /// bytes, so everything this fixture's parts weigh comes from STREAM_DIR.
+    fn fat_stream_record(n: u32, ts: i64) -> LogRecord {
+        let (stream_id, stream_attrs) = fat_stream_ident(n);
+        LogRecord {
+            stream_id,
+            stream_attrs,
+            ts_ns: ts,
+            observed_ts_ns: ts,
+            severity_num: 9,
+            severity_text: "INFO".into(),
+            body: "x".into(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: Vec::new(),
+        }
+    }
+
+    /// A part's STREAM_DIR is charged against the stored-size target once per
+    /// distinct stream, so a bucket of many streams with large resource blobs
+    /// splits on those blobs rather than running past the target on them.
+    ///
+    /// `estimate_stored_record` excludes `stream_attrs`, correctly: the blob is
+    /// stored once per stream, not once per record. Nothing charged it per
+    /// stream either, so STREAM_DIR was invisible to the target: this fixture's
+    /// records are a few bytes each, so its estimate stayed near 4 KiB while its
+    /// single object held ~96 fat blobs.
+    ///
+    /// Both assertions are magnitudes proportional to the fixture, not floors:
+    /// the part count is the stream-charge arithmetic over `STREAMS` streams and
+    /// a `STORED_TARGET`-byte target, and each part's real object size stays
+    /// within twice the target.
+    ///
+    /// Demonstrated red by under-charging: adding
+    /// `&& self.charged_streams.len() == 1` to the charge in
+    /// `PartBuilder::push` (one stream per part instead of every distinct one)
+    /// yields a single part of 269_641 bytes, 4.1x the 65_536-byte target,
+    /// failing the size assertion and then the count assertion with `1 != 7`.
+    /// A flat floor low enough to be safe would have passed at both.
+    #[tokio::test]
+    async fn many_streams_charge_stream_dir_against_the_stored_target() {
+        const STREAMS: u32 = 96;
+        const INPUTS: u64 = 2;
+        const STORED_TARGET: u64 = 64 * 1024;
+
+        let store = Arc::new(MemoryStore::new());
+        for j in 0..INPUTS {
+            // One record per stream per input, so each stream is carried by
+            // every input and the merge sees it as one stream, not two.
+            let recs: Vec<LogRecord> = (0..STREAMS)
+                .map(|s| fat_stream_record(s, SPLIT_BASE_NS + i64::from(s) * 2 + j as i64))
+                .collect();
+            seed(
+                store.as_ref(),
+                Uuid::from_u128(u128::from(j) + 1),
+                j + 1,
+                &recs,
+            )
+            .await;
+        }
+
+        // The split rule, walked: a stream's first record in a part pays the
+        // STREAM_DIR entry plus its own payload, later records pay their payload
+        // only, and the part closes as soon as the running total reaches the
+        // target. Every stream here has the same blob length and the same
+        // record shape, so the walk does not depend on which stream id sorts
+        // first.
+        let charge = estimate_stored_stream(&fat_stream_record(0, 0).stream_attrs);
+        let per_record = estimate_stored_record(&fat_stream_record(0, 0));
+        assert!(
+            charge > per_record * 100,
+            "fixture must be STREAM_DIR-dominated: charge {charge} vs record {per_record}"
+        );
+        let mut expected_parts = 0u64;
+        let mut acc = 0u64;
+        for _ in 0..STREAMS {
+            for r in 0..INPUTS {
+                acc += if r == 0 {
+                    charge + per_record
+                } else {
+                    per_record
+                };
+                if acc >= STORED_TARGET {
+                    expected_parts += 1;
+                    acc = 0;
+                }
+            }
+        }
+        if acc > 0 {
+            expected_parts += 1;
+        }
+        assert!(
+            expected_parts >= 5,
+            "fixture must split several times, got {expected_parts}"
+        );
+
+        let tracker = MergeMemoryTracker::new();
+        let config = CompactorConfig {
+            max_l1_part_bytes: STORED_TARGET,
+            // Memory bound at its shipped default: this corpus holds a few
+            // hundred tiny records in heap, so it can never be the bound that
+            // fires and every split below is the stored target's.
+            merge_memory_tracker: Some(tracker.clone()),
+            ..CompactorConfig::default()
+        };
+        let clock = FixedClock::new(sealed_now_ns());
+        compact_bucket(store.as_ref(), &clock, &config, &bucket())
+            .await
+            .expect("compact");
+
+        let (rec, parts) = read_output(store.as_ref()).await;
+        assert_eq!(
+            tracker.memory_bound_flushes(),
+            0,
+            "no part may close on the memory bound for this corpus"
+        );
+        // The estimate is only worth having if it tracks the object it names.
+        // Each part's real stored size stays within twice the target; uncharged,
+        // one part carried every stream's blob.
+        for p in &rec.parts {
+            assert!(
+                p.object_size < 2 * STORED_TARGET,
+                "part of {} bytes exceeded twice the {STORED_TARGET}-byte stored target",
+                p.object_size
+            );
+        }
+        assert_eq!(
+            parts.len() as u64,
+            expected_parts,
+            "part count is the STREAM_DIR-charge arithmetic"
+        );
+
+        // Records are conserved across the split.
+        let mut l1: Vec<LogRecord> = Vec::new();
+        for p in &parts {
+            l1.extend(decode_all(p));
+        }
+        assert_eq!(
+            l1.len() as u64,
+            u64::from(STREAMS) * INPUTS,
+            "every record survives the split"
         );
     }
 
