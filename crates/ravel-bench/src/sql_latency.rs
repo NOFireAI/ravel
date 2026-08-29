@@ -418,10 +418,15 @@ pub struct RunAccounting {
     /// `plan_segment` and `plan_segment_block_stats` issue, plus the whole-object
     /// plan fallback for a predicate the skip index cannot decide.
     ///
-    /// Each miss costs one extra GET, so this is the request half of the trade a
-    /// shorter probe makes and belongs beside
-    /// [`Self::object_store_get_requests`]: a probe floor can only be tightened
-    /// against these numbers (issue #883, `ravel_query::LOG_SUFFIX_FLOOR_BYTES`).
+    /// Counts uncovered tail SECTIONS, not GETs. A short version-4 probe can
+    /// miss both SKIP_IDX and PAGE_DIR and increment twice while the fetcher
+    /// coalesces their adjacent ranges into a single GET, so this is an upper
+    /// bound on the extra requests, never a one-to-one count. Reading it as
+    /// GETs overstates the cost of a short probe by up to a factor of two,
+    /// which matters because this is the number a probe floor is tightened
+    /// against (issue #883, `ravel_query::LOG_SUFFIX_FLOOR_BYTES`). Compare it
+    /// with [`Self::object_store_get_requests`] rather than substituting for
+    /// it.
     /// It is measured against the probe WINDOW, not against cache residency, so
     /// a warm run reports the same value as the cold one even though its GETs
     /// fall.
