@@ -1,0 +1,310 @@
+#!/usr/bin/env bash
+# Cases for check-test-hygiene.sh. Add a case here before changing a rule, the
+# way .claude/guards/pretooluse.test.sh works for the hook.
+#
+# Each case builds a throwaway repo under $TMPDIR with the guard copied into
+# its scripts/guards/, so the guard's own `cd repo_root` lands on the fixture
+# and nothing here touches the real checkout.
+#
+# Run: bash scripts/guards/check-test-hygiene.test.sh
+set -uo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+GUARD="${HERE}/check-test-hygiene.sh"
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/check-test-hygiene-test.XXXXXX")"
+trap 'rm -rf "${TMP}"' EXIT
+
+fails=0
+passes=0
+
+# new_repo <name>: a scratch repo with the guard installed. Prints its path.
+new_repo() {
+  local dir="${TMP}/$1"
+  mkdir -p "${dir}/scripts/guards"
+  cp "${GUARD}" "${dir}/scripts/guards/check-test-hygiene.sh"
+  git -C "${dir}" init -q 2>/dev/null
+  git -C "${dir}" config user.email t@example.com
+  git -C "${dir}" config user.name Test
+  printf '%s\n' "${dir}"
+}
+
+# check <name> <repo> <want-exit> <want-substring-or-empty>
+check() {
+  local name="$1" dir="$2" want_rc="$3" want_sub="${4:-}"
+  local out rc=0
+  out="$(cd "${dir}" && bash scripts/guards/check-test-hygiene.sh crates 2>&1)" || rc=$?
+  if [[ "${rc}" != "${want_rc}" ]]; then
+    printf 'FAIL  %s: exit %s, wanted %s\n' "${name}" "${rc}" "${want_rc}"
+    printf '%s\n' "${out}" | sed 's/^/      /'
+    fails=$((fails + 1))
+    return
+  fi
+  if [[ -n "${want_sub}" && "${out}" != *"${want_sub}"* ]]; then
+    printf 'FAIL  %s: output missing %s\n' "${name}" "${want_sub}"
+    printf '%s\n' "${out}" | sed 's/^/      /'
+    fails=$((fails + 1))
+    return
+  fi
+  printf 'ok    %s\n' "${name}"
+  passes=$((passes + 1))
+}
+
+# --- wall-clock ------------------------------------------------------------
+
+d="$(new_repo direct)"
+mkdir -p "${d}/crates/c/tests"
+cat >"${d}/crates/c/tests/t.rs" <<'RS'
+#[test]
+fn t() {
+    let start = Instant::now();
+    work();
+    assert!(start.elapsed() < Duration::from_secs(1), "too slow");
+}
+RS
+check "flags an assert reading .elapsed() directly" "${d}" 1 "tests/t.rs:5: wall-clock"
+
+d="$(new_repo derived)"
+mkdir -p "${d}/crates/c/tests"
+cat >"${d}/crates/c/tests/t.rs" <<'RS'
+#[test]
+fn t() {
+    let t0 = Instant::now();
+    let a = t0.elapsed();
+    let t1 = Instant::now();
+    let b = t1.elapsed();
+    let ratio = a.as_secs_f64() / b.as_secs_f64();
+    assert!(ratio > 2.0, "the fast path must be faster");
+}
+RS
+check "flags an assert on a value derived from a measurement" "${d}" 1 "reads \`ratio\`"
+
+d="$(new_repo allowed)"
+mkdir -p "${d}/crates/c/tests"
+cat >"${d}/crates/c/tests/t.rs" <<'RS'
+#[test]
+fn t() {
+    let start = Instant::now();
+    // hygiene-allow: wall-clock -- an #[ignore]d probe whose subject is wall time
+    assert!(start.elapsed() < Duration::from_secs(1));
+}
+RS
+check "an allow marker on the line above suppresses the finding" "${d}" 0 "clean"
+
+d="$(new_repo allowed-block)"
+mkdir -p "${d}/crates/c/tests"
+cat >"${d}/crates/c/tests/t.rs" <<'RS'
+#[test]
+fn t() {
+    let start = Instant::now();
+    let took = start.elapsed();
+    // hygiene-allow: wall-clock -- the reason runs to several lines, because
+    // the case genuinely cannot take an injected clock: the timing belongs to
+    // a third-party client that accepts no clock from us, and the ceiling is
+    // three orders of magnitude away from both outcomes.
+    assert!(took < Duration::from_secs(1));
+}
+RS
+check "an allow marker earlier in the same comment block suppresses it" "${d}" 0 "clean"
+
+d="$(new_repo allowed-detached)"
+mkdir -p "${d}/crates/c/tests"
+cat >"${d}/crates/c/tests/t.rs" <<'RS'
+#[test]
+fn t() {
+    // hygiene-allow: wall-clock -- detached from the assertion by real code
+    let start = Instant::now();
+    let took = start.elapsed();
+    assert!(took < Duration::from_secs(1));
+}
+RS
+check "a marker separated from the assertion by code does not suppress" "${d}" 1 "wall-clock"
+
+# The regression that made the first draft of this guard noisy: production code
+# times something into a report field, and a test asserts the field's presence.
+# That is not a timing band and must not be flagged.
+d="$(new_repo prod-field)"
+mkdir -p "${d}/crates/c/src"
+cat >"${d}/crates/c/src/lane.rs" <<'RS'
+pub fn run() -> Report {
+    let started = Instant::now();
+    let out = work();
+    let load_wall_ms = started.elapsed().as_secs_f64() * 1000.0;
+    Report { out, load_wall_ms: Some(load_wall_ms) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_load_reports_none() {
+        let report = Report::default();
+        assert_eq!(report.load_wall_ms, None, "no load ran in this invocation");
+    }
+}
+RS
+check "a presence check on a production timing field is not a finding" "${d}" 0 "clean"
+
+# A duration that is data, not elapsed real time.
+d="$(new_repo semantic)"
+mkdir -p "${d}/crates/c/tests"
+cat >"${d}/crates/c/tests/t.rs" <<'RS'
+#[test]
+fn t() {
+    let span = decode();
+    assert_eq!(span.duration_ns, 50, "duration_ns is end - start");
+    assert!(elapsed_ns == 2 * SLOW.as_nanos() as u64);
+}
+RS
+check "a semantic duration field is not a wall-clock band" "${d}" 0 "clean"
+
+# --- unseeded randomness ---------------------------------------------------
+
+d="$(new_repo entropy)"
+mkdir -p "${d}/crates/c/tests"
+cat >"${d}/crates/c/tests/t.rs" <<'RS'
+#[test]
+fn t() {
+    let mut rng = rand::rng();
+    assert!(rng.random::<u64>() > 0);
+}
+RS
+check "flags an entropy draw in a test file" "${d}" 1 "unseeded-rng"
+
+d="$(new_repo seeded)"
+mkdir -p "${d}/crates/c/tests"
+cat >"${d}/crates/c/tests/t.rs" <<'RS'
+#[test]
+fn t() {
+    let mut rng = StdRng::seed_from_u64(0xC0FFEE);
+    assert!(rng.random::<u64>() > 0);
+}
+RS
+check "a seeded rng is clean" "${d}" 0 "clean"
+
+# The sanctioned production seam: entropy above the test module in a src file.
+d="$(new_repo prod-seam)"
+mkdir -p "${d}/crates/c/src"
+cat >"${d}/crates/c/src/rng.rs" <<'RS'
+impl RngSource for SystemRng {
+    fn jitter_ms(&self, max_ms: u64) -> u64 {
+        rand::rng().random_range(0..=max_ms)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn t() {
+        assert_eq!(SystemRng.jitter_ms(0), 0);
+    }
+}
+RS
+check "production entropy above the test module is not a finding" "${d}" 0 "clean"
+
+# --- proptest seeds --------------------------------------------------------
+
+d="$(new_repo seed-untracked)"
+mkdir -p "${d}/crates/c/src" "${d}/crates/c/proptest-regressions"
+cat >"${d}/crates/c/src/codec.rs" <<'RS'
+proptest! {
+    #[test]
+    fn roundtrip(v in any::<u64>()) {
+        prop_assert_eq!(decode(encode(v)), v);
+    }
+}
+RS
+printf 'cc 0102030405060708 # shrinks to v = 0\n' \
+  >"${d}/crates/c/proptest-regressions/codec.txt"
+check "flags a src/ regression seed that is not tracked" "${d}" 1 "proptest-seed"
+
+d="$(new_repo seed-tracked)"
+mkdir -p "${d}/crates/c/src" "${d}/crates/c/proptest-regressions"
+cat >"${d}/crates/c/src/codec.rs" <<'RS'
+proptest! {
+    #[test]
+    fn roundtrip(v in any::<u64>()) {
+        prop_assert_eq!(decode(encode(v)), v);
+    }
+}
+RS
+printf 'cc 0102030405060708 # shrinks to v = 0\n' \
+  >"${d}/crates/c/proptest-regressions/codec.txt"
+git -C "${d}" add -A >/dev/null 2>&1
+git -C "${d}" commit -qm seed >/dev/null 2>&1
+check "a tracked src/ regression seed is clean" "${d}" 0 "clean"
+
+d="$(new_repo seed-tests-dir)"
+mkdir -p "${d}/crates/c/tests"
+cat >"${d}/crates/c/tests/differential.rs" <<'RS'
+proptest! {
+    #[test]
+    fn same(v in any::<u64>()) {
+        prop_assert_eq!(a(v), b(v));
+    }
+}
+RS
+printf 'cc 0102030405060708 # shrinks to v = 0\n' \
+  >"${d}/crates/c/tests/differential.proptest-regressions"
+check "flags an untracked tests/<name>.proptest-regressions" "${d}" 1 \
+  "tests/differential.proptest-regressions"
+
+d="$(new_repo seed-ignored)"
+mkdir -p "${d}/crates/c/tests"
+cat >"${d}/crates/c/tests/differential.rs" <<'RS'
+proptest! {
+    #[test]
+    fn same(v in any::<u64>()) {
+        prop_assert_eq!(a(v), b(v));
+    }
+}
+RS
+printf 'cc 0102030405060708\n' \
+  >"${d}/crates/c/tests/differential.proptest-regressions"
+printf '*.proptest-regressions\n' >"${d}/.gitignore"
+git -C "${d}" add -Af crates .gitignore >/dev/null 2>&1
+git -C "${d}" commit -qm seed >/dev/null 2>&1
+check "flags a tracked-but-gitignored seed" "${d}" 1 "gitignore"
+
+d="$(new_repo no-seed-yet)"
+mkdir -p "${d}/crates/c/src"
+cat >"${d}/crates/c/src/codec.rs" <<'RS'
+proptest! {
+    #[test]
+    fn roundtrip(v in any::<u64>()) {
+        prop_assert_eq!(decode(encode(v)), v);
+    }
+}
+RS
+check "a proptest that has never caught anything is clean" "${d}" 0 "clean"
+
+d="$(new_repo persistence-off)"
+mkdir -p "${d}/crates/c/src"
+cat >"${d}/crates/c/src/codec.rs" <<'RS'
+proptest! {
+    #![proptest_config(ProptestConfig { failure_persistence: None, ..Default::default() })]
+    #[test]
+    fn roundtrip(v in any::<u64>()) {
+        prop_assert_eq!(decode(encode(v)), v);
+    }
+}
+RS
+check "flags a failure_persistence override" "${d}" 1 "failure_persistence"
+
+# --- usage -----------------------------------------------------------------
+
+d="$(new_repo usage)"
+mkdir -p "${d}/crates/c/src"
+: >"${d}/crates/c/src/lib.rs"
+out="$(cd "${d}" && bash scripts/guards/check-test-hygiene.sh --nope 2>&1)"
+rc=$?
+if [[ "${rc}" == "64" && "${out}" == *"unknown option"* ]]; then
+  printf 'ok    an unknown option exits 64\n'
+  passes=$((passes + 1))
+else
+  printf 'FAIL  an unknown option exits 64: got %s / %s\n' "${rc}" "${out}"
+  fails=$((fails + 1))
+fi
+
+printf '\n%d passed, %d failed\n' "${passes}" "${fails}"
+[[ "${fails}" -eq 0 ]]
