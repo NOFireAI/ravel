@@ -293,26 +293,29 @@ done <"${sources_file}"
 # then rule 3 has no file to find. Flag every occurrence: there is no
 # legitimate use of it here.
 persistence_hits="$(mktemp "${TMPDIR:-/tmp}/ravel-test-hygiene-fp.XXXXXX")"
-persistence_status=0
-xargs -0 grep -Hn 'failure_persistence' <"${sources_file}" >"${persistence_hits}" \
-  || persistence_status=$?
-# Exit codes here are genuinely ambiguous and differ between implementations.
-# GNU xargs reports 123 when the utility exited 1-125 on any input, mapping
-# grep's "no match" (1) and its "read error" (2) to one code; BSD xargs was
-# observed propagating grep's own 1 instead. So neither 1 nor 123 identifies a
-# clean result on its own, and treating either as failure breaks the common
-# case of simply finding nothing.
-#
-# What IS unambiguous: 0, 1 and 123 all mean the scan ran. Anything else --
-# a signal, a missing utility, an unreadable list -- means it did not, and the
-# guard must refuse rather than read an empty hit file as clean.
-if [[ "${persistence_status}" -ne 0 \
-   && "${persistence_status}" -ne 1 \
-   && "${persistence_status}" -ne 123 ]]; then
-  echo "check-test-hygiene.sh: the failure_persistence scan failed (exit ${persistence_status})." >&2
-  rm -f "${persistence_hits}"
-  exit 70
-fi
+# grep's own status separates the three outcomes that matter here: 0 matched,
+# 1 nothing matched, 2 could not read. xargs destroys exactly that distinction,
+# because GNU xargs maps every utility exit from 1 to 125 onto a single 123, so
+# an unreadable source is indistinguishable from a clean scan. Call grep
+# directly, in batches to stay under the argument limit, and read its status.
+persistence_sources=()
+while IFS= read -r -d '' persistence_src; do
+  persistence_sources+=("${persistence_src}")
+done <"${sources_file}"
+
+persistence_batch=0
+while [[ "${persistence_batch}" -lt "${#persistence_sources[@]}" ]]; do
+  persistence_status=0
+  grep -Hn 'failure_persistence' \
+    "${persistence_sources[@]:${persistence_batch}:500}" \
+    >>"${persistence_hits}" || persistence_status=$?
+  if [[ "${persistence_status}" -ne 0 && "${persistence_status}" -ne 1 ]]; then
+    echo "check-test-hygiene.sh: the failure_persistence scan failed (grep exit ${persistence_status})." >&2
+    rm -f "${persistence_hits}"
+    exit 70
+  fi
+  persistence_batch=$(( persistence_batch + 500 ))
+done
 sed 's/^\([^:]*:[0-9]*\):.*$/\1: proptest-seed: failure_persistence override can disable seed writing; the caught case is then lost/' \
   <"${persistence_hits}" >>"${findings_file}"
 rm -f "${persistence_hits}"
