@@ -1032,6 +1032,18 @@ async fn publish_dataset(
             total += 1;
         }
         let bytes = writer.finish().expect("finish object");
+        // Mechanical drift guard: the scan path routes off the object's own
+        // trailer, never the declared segment_format_version (a resolved
+        // SegmentRef drops the field), so a wrong declaration is invisible at
+        // query time and the smoke test passes either way. Comparing the
+        // declaration against the trailer the writer just produced is the one
+        // place both are visible, so it catches the drift here instead.
+        let declared_segment_format_version = u32::from(ravel_logseg::footer::VERSION);
+        assert_eq!(
+            u32::from(ravel_logseg::footer::trailer_version(&bytes).expect("trailer version")),
+            declared_segment_format_version,
+            "RlogWriter trailer must match the declared segment_format_version"
+        );
         total_bytes += bytes.len() as u64;
         min_object_bytes = min_object_bytes.min(bytes.len() as u64);
         let new_record = NewCommitRecord {
@@ -1055,7 +1067,7 @@ async fn publish_dataset(
             max_event_ts_ns: max,
             min_ingest_ts_ns: min,
             max_ingest_ts_ns: max,
-            segment_format_version: 1,
+            segment_format_version: declared_segment_format_version,
             created_unix_ns: 10,
             ingest_hour_bucket: 0,
         };
