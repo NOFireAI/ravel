@@ -775,7 +775,7 @@ impl Catalog {
         tenant: &TenantHash,
         signal: Signal,
         accounting: &QueryAccounting,
-    ) -> Result<Option<LoadedColumnStats>, LoadColumnStatsError> {
+    ) -> Result<Option<Arc<LoadedColumnStats>>, LoadColumnStatsError> {
         // Route every GET through the same semaphore-bounded, accounted funnel
         // (`guarded_get`) every other query read uses, so this path's requests
         // and bytes are credited to `accounting` under `AccountedOp::Get` and
@@ -806,7 +806,7 @@ impl Catalog {
             })
         };
         if let Some(stats) = cache_hit {
-            return Ok(Some((*stats).clone()));
+            return Ok(Some(stats));
         }
         let Some(loaded) =
             column_stats_resolve::fetch_stats_object(&getter, tenant, &resolved).await?
@@ -822,7 +822,7 @@ impl Catalog {
                 stats: Arc::clone(&stats),
             },
         );
-        Ok(Some((*stats).clone()))
+        Ok(Some(stats))
     }
 
     /// Evict every per-tenant cache outer-map entry for tenants last touched
