@@ -69,10 +69,17 @@ jobs:
       # push:tags trigger (GitHub peels the tag object), so no manual peel is
       # needed. Self-referential: repo comes from github.repository, host from
       # github.server_url, auth from the ambient GITHUB_TOKEN. Bounded wait of
-      # 15 minutes at a 30s poll interval (30 attempts): long enough to absorb
-      # the race where the tag lands while the main-push ci.yml run for the
-      # same commit is still in flight, short enough not to pin a runner for an
-      # hour. Fails closed on a failed run, on absence, and on timeout.
+      # 30 minutes at a 30s poll interval (60 attempts). The budget is sized
+      # against the measured ci.yml duration on main: a code-touching run took
+      # 20m 15s and 21m 08s on 2026-08-29 (runs 33277652112, 33275214028), and
+      # a release commit always touches Cargo.toml and Cargo.lock so it always
+      # draws that ~20 minute run rather than the ~30s docs-only path. 30
+      # minutes clears that with headroom to absorb the race where the tag
+      # lands while the main-push ci.yml run for the same commit is still in
+      # flight, without pinning a runner for an hour; the previous 15 minute
+      # budget timed out the real v0.11.0 tag (#914). If ci.yml's own duration
+      # grows past ~25 minutes, raise this. Fails closed on a failed run, on
+      # absence, and on timeout.
       - name: Require successful CI run for the tagged commit
         if: github.event_name == 'push'
         env:
@@ -88,16 +95,24 @@ jobs:
           export GH_HOST="${GH_HOST#http://}"
           echo "gating on a successful ci.yml run for $REPO @ $SHA (host $GH_HOST)"
 
-          max_attempts=30      # 30 * 30s = 15 minutes
+          max_attempts=60      # 60 * 30s = 30 minutes (see comment above)
           interval=30
           attempt=1
+          start=$SECONDS
           while (( attempt <= max_attempts )); do
+            # One API call per attempt, carrying every ci.yml run for this SHA
+            # as tab-separated status, conclusion, id, url. status/conclusion
+            # feed the terminal-state checks; id/url/status make a slow run
+            # (one exists, still in progress) distinguishable from a missing
+            # one (none exists) in the poll line below.
+            runs="$(gh api \
+              "repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&per_page=100" \
+              --jq '.workflow_runs[] | [.status, (.conclusion // "null"), (.id | tostring), .html_url] | @tsv' \
+              2>/dev/null || true)"
+
             # Only completed runs carry a conclusion; a run still queued or in
             # progress reports status but conclusion null, so we keep waiting.
-            conclusions="$(gh api \
-              "repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&per_page=100" \
-              --jq '.workflow_runs[] | select(.status == "completed") | .conclusion' \
-              2>/dev/null || true)"
+            conclusions="$(printf '%s\n' "$runs" | awk -F'\t' '$1 == "completed" { print $2 }')"
 
             if echo "$conclusions" | grep -qx "success"; then
               echo "found a successful ci.yml run for $SHA"
@@ -112,12 +127,20 @@ jobs:
               exit 1
             fi
 
-            echo "attempt $attempt/$max_attempts: no successful ci.yml run for $SHA yet; sleeping ${interval}s"
+            elapsed=$(( SECONDS - start ))
+            if [[ -n "$runs" ]]; then
+              # Newest run first (GitHub returns runs in descending order).
+              latest="${runs%%$'\n'*}"
+              IFS=$'\t' read -r run_status run_concl run_id run_url <<< "$latest"
+              echo "attempt $attempt/$max_attempts (${elapsed}s elapsed): ci.yml run $run_id for $SHA is running (status=$run_status, conclusion=$run_concl) $run_url ; no successful run yet, sleeping ${interval}s"
+            else
+              echo "attempt $attempt/$max_attempts (${elapsed}s elapsed): no ci.yml run exists for $SHA yet; sleeping ${interval}s"
+            fi
             sleep "$interval"
             (( attempt++ )) || true
           done
 
-          echo "::error::timed out after $((max_attempts * interval))s waiting for a successful ci.yml run for $SHA (decision 9, fail closed)"
+          echo "::error::timed out after $(( SECONDS - start ))s waiting for a successful ci.yml run for $SHA (decision 9, fail closed)"
           exit 1
 
   # ADR-0037 multi-arch amendment, decisions 12-15 and 17, as amended by
