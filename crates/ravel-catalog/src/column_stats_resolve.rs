@@ -55,8 +55,29 @@ pub struct LoadedColumnStats {
     pub part_blake3: Vec<[u8; 32]>,
 }
 
+/// The column-stats object the current folded HEAD points at, resolved from
+/// HEAD alone (one GET) without yet fetching the object itself. Splitting the
+/// load in two lets a caller consult a reuse cache keyed by what actually
+/// identifies the resolved object -- its content hash (`blake3`) plus the
+/// HEAD's covered part set (`expected_part_blake3`, the binding a stale stats
+/// object fails) -- and skip the second GET when both still match a cached
+/// entry. A changed fold produces a different HEAD, hence a different `blake3`
+/// or part set, so it always misses and re-resolves (issue #888).
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedStatsRef {
+    /// Object key of the `.cstat` object HEAD references.
+    pub key: String,
+    /// Content hash of the referenced object (`SnapshotColumnStatsRef.blake3`),
+    /// the fetch's blake3 gate and the cache's primary key.
+    pub blake3: [u8; 32],
+    /// The covered parts' blake3 hashes, in `SnapshotHead.parts` order. The
+    /// binding this HEAD imposes on the stats object; a fetch (or a cache hit)
+    /// is valid only against this exact part set.
+    pub expected_part_blake3: Vec<[u8; 32]>,
+}
+
 /// A genuinely unparseable HEAD, or an isolation breach, encountered while
-/// loading column statistics: the only conditions [`load_column_stats`]
+/// loading column statistics: the only conditions this path
 /// surfaces as an error rather than degrading to `Ok(None)`.
 #[derive(Debug, thiserror::Error)]
 pub enum LoadColumnStatsError {
@@ -87,27 +108,28 @@ fn head_key(tenant: &TenantHash, signal: Signal) -> String {
     format!("t/{}/catalog/{}/HEAD", tenant.to_hex(), signal.key_prefix())
 }
 
-/// Resolve exact per-segment column statistics for `(tenant, signal)` from
-/// the current folded snapshot HEAD, or `Ok(None)` when no usable
-/// column-stats object exists right now (nothing folded yet, no configured
-/// typed columns, or the last fold's column-stats build/PUT failed).
+/// Read the current folded snapshot HEAD for `(tenant, signal)` and return the
+/// column-stats object it points at, or `Ok(None)` when none exists right now
+/// (nothing folded yet, no configured typed columns, or the last fold's
+/// column-stats build/PUT failed). The first of the two-GET load: it issues
+/// the HEAD GET only, and never fetches the stats object -- that is
+/// [`fetch_stats_object`], so a caller can consult a reuse cache in between.
 ///
-/// Every GET is issued through `getter`, so it is credited to the caller's
+/// The HEAD GET is issued through `getter`, so it is credited to the caller's
 /// [`QueryAccounting`](ravel_types::accounting::QueryAccounting) and bounded
 /// by the catalog request semaphore, the same funnel every other query read
-/// path uses (issue #850). The requests charge to `AccountedOp::Get`.
+/// path uses (issue #850). It charges to `AccountedOp::Get`.
 ///
-/// Metadata-cost: exactly two GETs -- the HEAD and the one column-stats
-/// object. Unlike `load_covering_postings`, this loader fetches no snapshot
-/// part: it needs only each part's blake3 (already carried in
-/// `SnapshotHead.parts`) for the binding check, and callers join against
-/// their own resolved snapshot rather than a rebuilt covered-entry universe.
-/// See the [module docs](self) for the full degrade-to-`Ok(None)` contract.
-pub(crate) async fn load_column_stats(
+/// Unlike `load_covering_postings`, this path fetches no snapshot part: it
+/// needs only each part's blake3 (already carried in `SnapshotHead.parts`) for
+/// the binding check, and callers join against their own resolved snapshot
+/// rather than a rebuilt covered-entry universe. See the [module docs](self)
+/// for the full degrade-to-`Ok(None)` contract.
+pub(crate) async fn resolve_stats_ref(
     getter: &impl AccountedRecordGet,
     tenant: &TenantHash,
     signal: Signal,
-) -> Result<Option<LoadedColumnStats>, LoadColumnStatsError> {
+) -> Result<Option<ResolvedStatsRef>, LoadColumnStatsError> {
     let key = head_key(tenant, signal);
 
     let head_bytes = match getter.accounted_get_full(&key).await {
@@ -122,6 +144,9 @@ pub(crate) async fn load_column_stats(
     let Some(stats_ref) = head.column_stats.clone() else {
         return Ok(None);
     };
+    let Ok(blake3) = <[u8; 32]>::try_from(stats_ref.blake3.as_slice()) else {
+        return Ok(None);
+    };
 
     // The parts are NOT fetched: this loader needs only their blake3 (which
     // HEAD already carries) to bind the stats object to this HEAD's part set.
@@ -130,18 +155,37 @@ pub(crate) async fn load_column_stats(
     // a hard error on the logs query path.
     let mut expected_part_blake3: Vec<[u8; 32]> = Vec::with_capacity(head.parts.len());
     for part_ref in &head.parts {
-        let Ok(blake3) = <[u8; 32]>::try_from(part_ref.blake3.as_slice()) else {
+        let Ok(part_blake3) = <[u8; 32]>::try_from(part_ref.blake3.as_slice()) else {
             return Ok(None);
         };
-        expected_part_blake3.push(blake3);
+        expected_part_blake3.push(part_blake3);
     }
 
-    let data = match getter.accounted_get_full(&stats_ref.key).await {
+    Ok(Some(ResolvedStatsRef {
+        key: stats_ref.key,
+        blake3,
+        expected_part_blake3,
+    }))
+}
+
+/// GET, blake3-verify, tenant-check, part-bind, and decode the object named by
+/// `resolved`. The second GET of the two-GET load; kept separate from
+/// [`resolve_stats_ref`] so a caller can skip it on a reuse-cache hit. Every
+/// degrade-to-`Ok(None)` case from the [module docs](self) is enforced here
+/// against `resolved`'s content hash and part binding, so a cache that keys on
+/// those two values and skips this call gets the identical answer this call
+/// would have produced.
+pub(crate) async fn fetch_stats_object(
+    getter: &impl AccountedRecordGet,
+    tenant: &TenantHash,
+    resolved: &ResolvedStatsRef,
+) -> Result<Option<LoadedColumnStats>, LoadColumnStatsError> {
+    let data = match getter.accounted_get_full(&resolved.key).await {
         Ok(got) => got.data,
         Err(_) => return Ok(None),
     };
     let digest = blake3::hash(&data);
-    if digest.as_bytes().as_slice() != stats_ref.blake3.as_slice() {
+    if *digest.as_bytes() != resolved.blake3 {
         return Ok(None);
     }
 
@@ -153,7 +197,7 @@ pub(crate) async fn load_column_stats(
 
     if decoded.header.tenant_hash != tenant.0.to_vec() {
         return Err(LoadColumnStatsError::TenantHashMismatch {
-            key: stats_ref.key.clone(),
+            key: resolved.key.clone(),
             expected: tenant.to_hex(),
             actual: hex::encode(&decoded.header.tenant_hash),
         });
@@ -168,7 +212,7 @@ pub(crate) async fn load_column_stats(
     let Ok(actual_part_blake3) = actual_part_blake3 else {
         return Ok(None);
     };
-    if actual_part_blake3 != expected_part_blake3 {
+    if actual_part_blake3 != resolved.expected_part_blake3 {
         return Ok(None);
     }
 
@@ -189,6 +233,6 @@ pub(crate) async fn load_column_stats(
 
     Ok(Some(LoadedColumnStats {
         segments,
-        part_blake3: expected_part_blake3,
+        part_blake3: resolved.expected_part_blake3.clone(),
     }))
 }

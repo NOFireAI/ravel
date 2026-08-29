@@ -66,7 +66,7 @@
 //! reserved bytes (crate::memory); partial state is discarded,
 //! never returned (docs/query-engine.md "Budgets").
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -96,6 +96,7 @@ use crate::cost::{estimate_logs_cost, estimate_metrics_cost, estimate_spans_cost
 use crate::declared::{DeclaredColumn, DeclaredColumnSource, default_declared_source};
 use crate::error::SqlError;
 use crate::logs_provider::LogsTableProvider;
+use crate::logs_pushdown::extract_logs;
 use crate::memory::{CeilingBreach, TenantMemoryAccountant};
 use crate::output::QueryOutput;
 use crate::provider::RavelTableProvider;
@@ -668,6 +669,18 @@ impl SqlExecutor {
                     // tenant with no declared columns reading zero objects, and
                     // reproduces the pre-ADR-0850 provider exactly.
                     None
+                } else if !self
+                    .logs_column_stats_eligible(tenant_hash, &snapshot, sql, &extras.declared)
+                    .await
+                {
+                    // Issue #888: no metadata-only column path can fire for this
+                    // plan (decided from the plan and the resolved snapshot
+                    // alone, ahead of the load), so skip the two GETs
+                    // load_column_stats would issue. A `None` here reproduces
+                    // the pre-ADR-0850 provider exactly, the same as an absent
+                    // stats object would, so every failing-open behavior is
+                    // preserved.
+                    None
                 } else {
                     self.catalog
                         .load_column_stats(&tenant_hash, Signal::Logs, accounting)
@@ -959,6 +972,82 @@ impl SqlExecutor {
             .analyzer()
             .execute_and_check(plan, &config_options, |_, _| {})
             .ok()
+    }
+
+    /// Whether any ADR-0850 metadata-only column-statistics path could fire for
+    /// this logs plan, decided from the plan and the resolved snapshot alone,
+    /// BEFORE the two-GET `load_column_stats` (issue #888). `false` means every
+    /// path is provably out of reach, so the load is pure waste and is skipped;
+    /// the query then answers exactly as an absent stats object would (the
+    /// pre-ADR-0850 provider).
+    ///
+    /// Every branch fails OPEN (returns `true`, keeping the load) on any
+    /// uncertainty, because a false `false` would turn ADR-0850 off for a plan
+    /// that could have used it. The three metadata-only paths -- q07
+    /// `MIN`/`MAX(declared)`, q02 `COUNT(*)` with a residual `declared <> lit`
+    /// filter, q08 `COUNT(*) GROUP BY declared` -- all gate downstream on
+    /// [`crate::logs_scan`]'s `stats_are_exact` (no pending erasure, no content
+    /// or prune predicate, and a ts bound that clips no touched segment) and
+    /// all are aggregates referencing a declared column. This mirrors exactly
+    /// those necessary conditions; anything they cannot prove is left to
+    /// decline downstream and still loads here.
+    async fn logs_column_stats_eligible(
+        &self,
+        tenant_hash: TenantHash,
+        snapshot: &Snapshot,
+        sql: &str,
+        declared: &[DeclaredColumn],
+    ) -> bool {
+        // Pending selective erasure (ADR-0064) rejects the ENTIRE query for
+        // every metadata-only path (safety lemma): a pending erasure removes
+        // rows the precomputed counts/extrema still include. Snapshot-only and
+        // certain, so it is checked first and without building a plan.
+        if !snapshot.pending_erasure.is_empty() {
+            return false;
+        }
+        // The analyzed logical plan carries both the aggregate shape and the
+        // filter conjuncts this check needs. If it cannot be built, fall back
+        // to loading (the pre-hoist behavior always loaded).
+        let Some(plan) = self
+            .analyzed_classification_plan(tenant_hash, sql, declared)
+            .await
+        else {
+            return true;
+        };
+        // Every path is an aggregate over a declared column. A non-aggregate
+        // (a raw select, a top-N) or an aggregate touching no declared column
+        // (a predicate-free `COUNT(*)`, answered from `sample_count` with no
+        // column stats) can never consume the loaded object.
+        if !plan_has_aggregate(&plan) || !plan_references_declared(&plan, declared) {
+            return false;
+        }
+        // Re-derive the reader pushdown from the plan's filter conjuncts with
+        // the SAME extractor the scan uses, so the content/prune/ts decisions
+        // match `stats_are_exact` exactly. A content or prune predicate makes
+        // every path decline; the analyzed (pre-optimizer) plan can only carry
+        // fewer such predicates than the scan ultimately sees, so a match here
+        // is real and skipping is safe, while a miss merely loads.
+        let mut filters = Vec::new();
+        collect_filter_predicates(&plan, &mut filters);
+        let pushdown = extract_logs(&filters, declared);
+        if !pushdown.content.is_empty() || !pushdown.prune.is_empty() {
+            return false;
+        }
+        // A ts bound that clips even one touched segment makes `stats_are_exact`
+        // fail closed. The touched set is the ts-overlapping subset the provider
+        // resolves (`pruned_segments`); a segment fully outside the bound is
+        // pruned away and never reaches the containment check, so it must not
+        // count as a clip here either.
+        let (ts_min, ts_max) = (pushdown.ts_min(), pushdown.ts_max());
+        let clips = snapshot
+            .segments
+            .iter()
+            .filter(|s| LogSegmentFetcher::ts_range_relevant(s, ts_min, ts_max))
+            .any(|s| !(ts_min <= s.min_event_ts_ns && s.max_event_ts_ns <= ts_max));
+        if clips {
+            return false;
+        }
+        true
     }
 
     /// A throwaway [`SessionTable`] over an empty snapshot for `target`,
@@ -1592,6 +1681,55 @@ fn plan_is_exact_typed(plan: &LogicalPlan) -> bool {
     let mut distincts = Vec::new();
     collect_aggregate_exprs(plan, &mut aggregates, &mut distincts);
     aggregates.iter().all(aggregate_node_is_exact) && distincts.iter().all(distinct_node_is_exact)
+}
+
+/// Whether `plan` (analyzed) has any [`LogicalPlan::Aggregate`] node (issue
+/// #888). Every ADR-0850 metadata-only path replaces an `AggregateExec`, so a
+/// plan with no aggregate can never consume column statistics. Reuses
+/// [`collect_aggregate_exprs`]'s reach (inputs plus embedded subquery plans),
+/// so it fails open: an aggregate anywhere counts, even one the metadata rule
+/// would not ultimately match.
+fn plan_has_aggregate(plan: &LogicalPlan) -> bool {
+    let mut aggregates = Vec::new();
+    let mut distincts = Vec::new();
+    collect_aggregate_exprs(plan, &mut aggregates, &mut distincts);
+    !aggregates.is_empty()
+}
+
+/// Whether `plan` references at least one of `declared`'s columns by name
+/// (issue #888). Every ADR-0850 metadata-only path names a declared column: a
+/// `MIN`/`MAX` argument (q07), a `GROUP BY` key (q08), or the `col <> lit`
+/// filter column (q02). A plan naming none can never consume column
+/// statistics -- a predicate-free `COUNT(*)`, for instance, is answered from
+/// `sample_count` with no column stats at all. Recurses inputs the same way
+/// [`collect_filter_predicates`] does; matching by unqualified column name is
+/// intentionally broad (fail open), since a false negative would turn ADR-0850
+/// off for a plan that could use it.
+fn plan_references_declared(plan: &LogicalPlan, declared: &[DeclaredColumn]) -> bool {
+    let names: HashSet<&str> = declared.iter().map(|d| d.key.as_str()).collect();
+    plan_references_names(plan, &names)
+}
+
+fn plan_references_names(plan: &LogicalPlan, names: &HashSet<&str>) -> bool {
+    for expr in plan.expressions() {
+        let mut found = false;
+        // Never errors: the closure only inspects and returns a recursion verb.
+        let _ = expr.apply(|node| {
+            if let Expr::Column(column) = node
+                && names.contains(column.name.as_str())
+            {
+                found = true;
+                return Ok(TreeNodeRecursion::Stop);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+        if found {
+            return true;
+        }
+    }
+    plan.inputs()
+        .iter()
+        .any(|input| plan_references_names(input, names))
 }
 
 /// Classify a DISTINCT node's implicit group keys (ADR-0094 decision 1): a
