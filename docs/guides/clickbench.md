@@ -164,8 +164,12 @@ wall-clock reading, which above `1` is later than the write that filled them.
 levers, and they compose:
 
 ```text
-concurrent_object_writes = shards * min(pipeline_depth, max_inflight_flushes)
+concurrent_object_writes = active_shards * min(pipeline_depth, max_inflight_flushes)
 ```
+
+`active_shards` is the number of shards a batch actually routes rows to, which
+equals the configured `--shards` only when every batch touches every shard. With
+narrower fan-out the configured value is a ceiling, not the multiplier.
 
 `--pipeline-depth` bounds the batch writes the loader keeps outstanding;
 `--max-inflight-flushes` bounds the flushes any one shard actor will run at
@@ -205,8 +209,13 @@ failure the loader resolves every outstanding write before returning, rather
 than abandoning it, so the list is exactly the batches that committed: those
 before the failure, then any submitted after it whose own write landed anyway
 (the loader cannot stop a shard actor already mid-PUT, so it waits for the
-outcome instead of guessing). A resume from that list re-ingests neither rows
-that committed nor rows that did not.
+outcome instead of guessing). The list neither omits a batch that committed nor
+names one that did not.
+
+That is a statement about the report, not a resume mechanism. The loader has no
+resume mode: re-running re-ingests the whole file and there is no dedup, so a
+re-run duplicates every row the failed attempt did commit. The list tells an
+operator which rows are already durable; acting on it is their decision.
 
 `--decode-queue-batches` is the decode/encode overlap lever (issue #680). A
 bounded channel sits between the Parquet reader plus `build_columnar_batch`
@@ -236,8 +245,9 @@ the loader does not compute or enforce a safe ceiling for you: size
 `--batch-rows` x `--shards` product, measuring on your own allocator rather than
 trusting a single baked-in per-row estimate. `1` reproduces the
 one-write-at-a-time behaviour the loader had before issue #800; the shipped
-default of `4` takes that anchor's live working set to roughly `4x` on the same
-geometry, which is the memory the default spends.
+default of `4` raises the in-flight batches 4x, which takes that anchor's live
+working set from 3 to 6 batches, roughly `2x` on the same geometry. That is the
+memory the default spends.
 
 The loader prints a completion summary to stdout — `rows processed`,
 `objects written`, and `elapsed` (the load wall-time ClickBench reports). It also
