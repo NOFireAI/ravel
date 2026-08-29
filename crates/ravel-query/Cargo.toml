@@ -95,7 +95,7 @@ ravel-cache = { workspace = true }
 # proof (tests/differential_compaction.rs) drives P4's real compactor to
 # produce write_v4 L1 parts. ravel-maintain does not depend on ravel-query,
 # so this is acyclic.
-ravel-maintain = { path = "../ravel-maintain", version = "0.10.0" }
+ravel-maintain = { path = "../ravel-maintain", version = "0.11.0" }
 proptest = { workspace = true }
 # The ADR-0046 disk cache tier (crates/ravel-query/src/cache_correctness.rs)
 # needs a real on-disk directory to construct a `ravel_cache::DiskCache`; the
