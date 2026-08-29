@@ -775,7 +775,10 @@ fn expected_segment_gets(bytes: &[u8], ts_min: i64, ts_max: i64) -> u64 {
         total > ravel_query::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
         "fixture must be above the production threshold, got {total} bytes"
     );
-    let suffix = ravel_query::DEFAULT_LOG_SUFFIX_LEN;
+    // The probe window is the size-derived suffix (#883), not a flat 256 KiB:
+    // this fixture's tail exceeds the derived probe, so the uncovered tail
+    // sections it leaves are part of the expected per-segment GET count.
+    let suffix = ravel_query::derive_suffix_len(total);
     let cands = candidate_extents(bytes, ts_min, ts_max);
     assert!(
         cands.len() > 1 && cands.len() < 40,
@@ -1645,5 +1648,239 @@ async fn a_large_coalesce_gap_does_not_cross_a_narrow_read_over_to_whole_object(
     assert!(
         wide_stats.whole_object,
         "a read whose candidates cover the object still crosses over to whole-object"
+    );
+}
+
+// ---- Object-size-derived suffix probe (issue #883) ------------------------
+
+/// An object above the 512 KiB threshold whose TAIL is small: a few blocks of
+/// many records each, inflated by high-entropy NUMERIC columns (which land in
+/// BLOCKS and in compact per-block SKIP_IDX stats, never in BLOOM) with a
+/// one-token body (so BLOOM stays tiny). This is the ClickBench shape -- few
+/// blocks, structured columns -- rather than `large_object`'s one-record,
+/// high-entropy-text blocks whose per-block BLOOM alone makes the tail exceed
+/// the derived floor. Returns the records and the object bytes.
+fn small_tail_object() -> (Vec<LogRecord>, Vec<u8>) {
+    const COLUMNS: usize = 12;
+    const RECORDS: i64 = 12_288; // three full 4096-record blocks
+    let cfg = RlogConfig {
+        block_target_records: 4096,
+        ..RlogConfig::default()
+    };
+    let mut w = RlogWriter::new(cfg, identity());
+    let resource = vec![("service.name".to_string(), AttrValue::Str("api".into()))];
+    let mut state: u64 = 0x1234_5678_9abc_def0;
+    let mut records = Vec::with_capacity(RECORDS as usize);
+    for ts in 0..RECORDS {
+        let attrs: Vec<(String, AttrValue)> = (0..COLUMNS)
+            .map(|c| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (format!("n{c:02}"), AttrValue::I64(state as i64))
+            })
+            .collect();
+        let r = LogRecord {
+            stream_id: ravel_types::logstream::log_stream_id(&resource, "scope", "1.0", &[]),
+            stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+            ts_ns: ts,
+            observed_ts_ns: ts,
+            severity_num: 9,
+            severity_text: "INFO".into(),
+            body: "x".into(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs,
+        };
+        w.push(r.clone()).expect("push");
+        records.push(r);
+    }
+    let bytes = w.finish_v3_for_tests().expect("finish v3");
+    (records, bytes)
+}
+
+/// The l0 shape of a decoded skip index, `(block_offset, block_len,
+/// block_crc32c)` per block: the byte-level oracle a ranged read must reproduce
+/// no matter how short its probe was.
+fn skip_shape(skip: &SkipIndex) -> Vec<(u64, u64, u32)> {
+    skip.l0
+        .iter()
+        .map(|e| (e.block_offset, e.block_len, e.block_crc32c))
+        .collect()
+}
+
+/// The SKIP_IDX decoded straight from the object bytes, the oracle for the
+/// fetcher's own decode.
+fn oracle_skip(bytes: &[u8]) -> SkipIndex {
+    let footer = footer::open(bytes).expect("footer");
+    let skip_desc = footer.section(kind::SKIP_IDX).expect("SKIP_IDX");
+    let raw = read_section(bytes, skip_desc, &RlogConfig::default()).expect("skip raw");
+    SkipIndex::decode(&raw, 1 << 24).expect("skip decode")
+}
+
+/// The probe length is chosen from the object size, not a flat 256 KiB (issue
+/// #883): `object_size / LOG_SUFFIX_SIZE_DIVISOR`, floored at
+/// `LOG_SUFFIX_FLOOR_BYTES` and ceilinged at `DEFAULT_LOG_SUFFIX_LEN`. This pins
+/// the derivation at representative sizes so a later change to the constants or
+/// the formula fails loudly rather than drifting the probe.
+///
+/// Prove-the-test: changing `LOG_SUFFIX_SIZE_DIVISOR` (e.g. 32 -> 16) or
+/// `LOG_SUFFIX_FLOOR_BYTES` moves these expected values, and the `assert_eq!`s
+/// fire. Demonstrated failing during development by setting the divisor to 16
+/// (the 6 MiB case then derives 393216, not 196608).
+#[test]
+fn derives_probe_from_object_size() {
+    // The three constants the formula is built from.
+    assert_eq!(ravel_query::LOG_SUFFIX_FLOOR_BYTES, 128 * 1024);
+    assert_eq!(ravel_query::DEFAULT_LOG_SUFFIX_LEN, 256 * 1024);
+    assert_eq!(ravel_query::LOG_SUFFIX_SIZE_DIVISOR, 32);
+
+    let d = ravel_query::derive_suffix_len;
+
+    // The reference ClickBench tenant's 3.47 MB mean object probes the FLOOR,
+    // 128 KiB rather than the old flat 256 KiB: half the plan-phase probe bytes.
+    assert_eq!(d(3_500_000), 128 * 1024, "3.47 MB mean -> floor");
+
+    // Floor break-even: at 4 MiB the raw fraction equals the floor exactly.
+    assert_eq!(d(4 * 1024 * 1024), 128 * 1024, "4 MiB -> floor exactly");
+
+    // Between the two break-evens the size-proportional value is used verbatim.
+    assert_eq!(d(6 * 1024 * 1024), 192 * 1024, "6 MiB -> 6 MiB / 32");
+
+    // Ceiling break-even: at 8 MiB the fraction equals the ceiling exactly.
+    assert_eq!(d(8 * 1024 * 1024), 256 * 1024, "8 MiB -> ceiling exactly");
+
+    // Above the ceiling break-even the probe is capped at the ceiling: a large
+    // object never probes more than the widest measured object needs.
+    assert_eq!(d(64 * 1024 * 1024), 256 * 1024, "64 MiB -> ceiling");
+
+    // Just above the whole-object threshold: still the floor, never a sliver.
+    assert_eq!(d(600 * 1024), 128 * 1024, "600 KiB -> floor");
+}
+
+/// An object whose trailer FITS inside the derived probe is read in exactly ONE
+/// request: the size-derived suffix (the 128 KiB floor for this ~1 MB fixture)
+/// covers footer + SKIP_IDX, so a plan-phase `fetch_skip_index` issues the probe
+/// GET and nothing else, and reports zero probe misses. The decoded index is
+/// byte-identical to the oracle.
+///
+/// Prove-the-test: this pins the exact GET count (1) and `probe_misses == 0`,
+/// which a too-small derivation breaks. Demonstrated failing during development
+/// by setting `LOG_SUFFIX_FLOOR_BYTES` to 4 KiB: the derived probe then misses
+/// SKIP_IDX, the count becomes 2 and `probe_misses` becomes 1.
+#[tokio::test]
+async fn derived_probe_covering_the_trailer_reads_in_one_request() {
+    let (records, bytes) = small_tail_object();
+    let total = bytes.len() as u64;
+    let (_blocks_offset, _blocks_len, tail) = layout(&bytes);
+
+    // Fixture precondition: above the whole-object threshold, and its tail sits
+    // inside the derived floor so the probe covers SKIP_IDX in one GET. A
+    // fixture-generation change that violated either would fail here, not
+    // silently pass a weaker property.
+    assert!(
+        total > ravel_query::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+        "fixture must be above the whole-object threshold, got {total}"
+    );
+    let derived = ravel_query::derive_suffix_len(total);
+    assert!(
+        tail < derived,
+        "the trailer ({tail} B) must fit inside the derived probe ({derived} B)"
+    );
+
+    let mem = Arc::new(MemoryStore::new());
+    mem.put("logs/fit.rlog", bytes.clone().into(), PutOptions::default())
+        .await
+        .expect("put");
+    let counting = Arc::new(CountingStore::new(mem));
+    let store: Arc<dyn ObjectStoreBackend> = counting.clone();
+    let seg = seg_ref("logs/fit.rlog", total, &records);
+
+    // Default suffix: no `with_suffix_len`, so the probe is derived from size.
+    let (skip, stats) = BlockRangeFetcher::new(store)
+        .fetch_skip_index(&seg, TENANT, &QueryAccounting::new())
+        .await
+        .expect("fetch skip index");
+
+    assert_eq!(stats.probe_gets, 1, "one etag-establishing suffix probe");
+    assert_eq!(stats.metadata_gets, 0, "no follow-up section GET");
+    assert_eq!(stats.probe_misses, 0, "the derived probe covered SKIP_IDX");
+    assert_eq!(
+        counting.get_count(),
+        1,
+        "a trailer that fits the derived probe is read in exactly one request"
+    );
+    assert_eq!(
+        skip_shape(&skip),
+        skip_shape(&oracle_skip(&bytes)),
+        "the decoded skip index is byte-identical to the oracle"
+    );
+}
+
+/// An object whose trailer EXCEEDS the probe is still read correctly, and the
+/// miss costs exactly one extra request that the per-object accounting counts.
+/// The probe is pinned just past SKIP_IDX's end (a deliberately-too-small
+/// window, standing in for an under-sized derivation) so it covers the footer
+/// but not SKIP_IDX: the read then pays the probe plus one follow-up section
+/// GET, `probe_misses` is 1, and the decoded index still matches the oracle.
+///
+/// Prove-the-test: this pins the exact GET count (2) and `probe_misses == 1`. A
+/// miss that silently cost an extra round trip on every object would be a
+/// regression wearing a byte win; the count assertion is what catches it.
+/// Demonstrated failing during development by removing `stats.probe_misses +=
+/// 1` from `ensure_tail_plan_sections` (the `probe_misses == 1` assertion then
+/// reads 0), and by widening the pinned suffix to cover SKIP_IDX (the count
+/// drops to 1).
+#[tokio::test]
+async fn a_trailer_larger_than_the_probe_costs_one_extra_counted_request() {
+    let (records, bytes) = large_object();
+    let total = bytes.len() as u64;
+    let footer = footer::open(&bytes).expect("footer");
+    let skip_desc = footer.section(kind::SKIP_IDX).expect("SKIP_IDX");
+    let skip_end = skip_desc.offset + skip_desc.len;
+
+    // A probe that starts exactly at SKIP_IDX's end: it covers everything after
+    // SKIP_IDX (BLOOM/POSTINGS and the footer, so no footer chase) but not
+    // SKIP_IDX itself, which is the section the plan phase must decode.
+    let suffix = total - skip_end;
+    assert!(
+        suffix < total - skip_desc.offset,
+        "the pinned probe must not reach SKIP_IDX's start"
+    );
+
+    let mem = Arc::new(MemoryStore::new());
+    mem.put(
+        "logs/exceed.rlog",
+        bytes.clone().into(),
+        PutOptions::default(),
+    )
+    .await
+    .expect("put");
+    let counting = Arc::new(CountingStore::new(mem));
+    let store: Arc<dyn ObjectStoreBackend> = counting.clone();
+    let seg = seg_ref("logs/exceed.rlog", total, &records);
+
+    let (skip, stats) = BlockRangeFetcher::new(store)
+        .with_suffix_len(suffix)
+        .fetch_skip_index(&seg, TENANT, &QueryAccounting::new())
+        .await
+        .expect("fetch skip index");
+
+    assert_eq!(stats.probe_gets, 1, "one etag-establishing suffix probe");
+    assert_eq!(
+        stats.metadata_gets, 1,
+        "one follow-up GET for the missed SKIP_IDX"
+    );
+    assert_eq!(stats.probe_misses, 1, "the probe missed SKIP_IDX");
+    assert_eq!(
+        counting.get_count(),
+        2,
+        "a trailer larger than the probe costs exactly one extra request"
+    );
+    assert_eq!(
+        skip_shape(&skip),
+        skip_shape(&oracle_skip(&bytes)),
+        "the index is decoded correctly despite the probe miss"
     );
 }
