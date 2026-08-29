@@ -174,15 +174,39 @@ resolves it through the scan's projection before reading statistics.
 
 The rule declines -- leaving the plan's `LogsScanExec` in place to answer by
 scanning, exactly as it would have without ADR-0850 -- whenever exactness
-cannot be proven. It declines whenever ANY selective erasure is pending in the
-snapshot (ADR-0064): the committed dictionary counts still include rows the
-erasure removes, so no metadata-only answer can be exact until the erasure is
-applied. It also declines for a `Str`-typed declared column, a predicate or
-group key over a non-declared column, a segment with no loaded statistics, and
-a segment whose per-value dictionary the fold omitted for exceeding the
-cardinality ceiling (ADR-0850 decision 3) -- an omitted dictionary carries no
-exact per-value counts, so a derived count could be wrong outright, not merely
-unavailable.
+cannot be proven. The full set of decline conditions:
+
+- ANY selective erasure is pending in the snapshot (ADR-0064): the committed
+  dictionary counts still include rows the erasure removes, so no metadata-only
+  answer can be exact until the erasure is applied.
+- A `ts` bound CLIPS any touched segment. Segments resolve on OVERLAP, and a
+  pure `ts` bound is reported `Exact` by
+  `LogsTableProvider::supports_filters_pushdown`, so its `FilterExec` is
+  deleted and the bound survives only as the scan's `ts_min`/`ts_max`. A
+  per-segment dictionary carries no intra-segment time distribution, so a
+  clipped segment's contribution cannot be derived from it; summing its
+  whole-segment counts would answer a different query. Conversely, a `ts` bound
+  that FULLY CONTAINS every touched segment removes no row and REMAINS
+  eligible: the optimisation still fires for a windowed query whose window
+  brackets the data, so a time filter does not by itself retire it.
+- A non-empty `content` predicate (e.g. `has_word`) or a non-empty `prune`
+  channel is present: both also survive pushdown as `Exact` (deleted
+  `FilterExec`, evaluated per row inside the scan), and neither is reflected in
+  the whole-segment dictionary counts.
+- A `Str`-typed declared column, a predicate or group key over a non-declared
+  column, or a segment with no loaded statistics.
+- A segment whose per-value dictionary the fold omitted for exceeding the
+  cardinality ceiling (ADR-0850 decision 3) -- an omitted dictionary carries no
+  exact per-value counts, so a derived count could be wrong outright, not
+  merely unavailable.
+- A segment carrying an internally-inconsistent `ColumnStat` (its dictionary
+  counts do not sum to `non_null_count`). Such a record is rejected at load by
+  `decode_column_stats`, but `declared_not_equal_count`/`declared_group_counts`
+  decline on it too, failing closed rather than computing from it.
+
+The ts/content/prune declines are gated by `LogsScanExec::stats_are_exact`,
+which requires no pending erasure, an empty `content`, an empty `prune`, and a
+`ts` bound that contains every touched segment.
 
 ## Predicate-free full-window logs scan: request count
 

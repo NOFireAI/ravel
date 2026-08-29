@@ -239,16 +239,25 @@ Two DataFusion mechanisms carry the three statements:
   reports exact `ColumnStatistics::min_value`/`max_value` for a declared
   column once every resolved segment has an exact `ColumnStat` for it.
 - q02 and q08 need one new physical optimizer rule
-  (`LogsMetadataAggregateRule`), because DataFusion's stock `Statistics`
+  (`MetadataOnlyAggregate`, registered under the name
+  `metadata_only_aggregate`), because DataFusion's stock `Statistics`
   type has no value-to-count structure and no rewrite from statistics
   for a filtered or grouped `COUNT(*)`. The rule matches `AggregateExec
-  [COUNT(*), optional single-column GROUP BY]` over an optional
-  `FilterExec[col <> lit | col = lit]` over `LogsScanExec`, and replaces
-  the whole subtree with a literal-values plan only when every resolved
-  segment's dictionary for the relevant column both exists
+  [COUNT(*), optional single-column GROUP BY]` over `LogsScanExec`, and
+  replaces the whole subtree with a literal-values plan only when every
+  resolved segment's dictionary for the relevant column both exists
   (`dictionary_present`) and is otherwise valid per the safety lemma
   below; any segment failing either check leaves the original plan
-  untouched.
+  untouched. Two branch contracts constrain when it fires:
+  - **q02** (bare `COUNT(*)`) requires a residual filter, and that
+    filter must be `col <> lit`: `not_equal_literal` accepts only
+    `Operator::NotEq`, so `col = lit` (equality) declines. A
+    predicate-free `COUNT(*)` also declines here, because DataFusion's
+    own `AggregateStatistics` rule already answers it from
+    `partition_statistics` (the q07 path above).
+  - **q08** (single-column `GROUP BY`) declines outright when any filter
+    is present: a filter combined with a `GROUP BY` is out of scope for
+    this rule.
 
 ### 6. Observability: `metadata_only` marker
 
@@ -287,10 +296,12 @@ condition is snapshot-wide) back to the scan path:
   `dictionary_present` is false for any relevant segment (cardinality
   ceiling exceeded) — q02 in particular must never approximate: an
   inexact count of the literal being excluded is worse than a scan.
-- A pending selective-erasure predicate (ADR-0064) touches the queried
-  tenant/column: erasure invalidates precomputed counts for any segment
-  it could affect, so the corresponding segment's stats are treated as
-  absent for the duration the erasure is pending.
+- A pending selective-erasure predicate (ADR-0064) is present on the
+  resolved snapshot: erasure invalidates precomputed counts, so the
+  metadata-only path is rejected for the ENTIRE query (not merely the
+  affected segment) while any erasure is pending. `stats_are_exact`
+  refuses whenever `self.erasure` is non-empty, so q02/q08 fall back to
+  a full scan.
 - The snapshot's pinned commit token (MVCC) admits a segment the
   resolved `Snapshot.segments` list didn't have when column stats were
   last folded (an uncovered segment): coverage is judged against the
