@@ -63,6 +63,19 @@ pub struct SegmentRef {
     /// resolution"). Determines how a reader verifies the segment footer
     /// and how the ref sorts into the mixed-level snapshot order.
     pub level: SegmentLevel,
+    /// On-object format version, carried from the commit/compaction record or
+    /// folded snapshot entry (the proto `segment_format_version`). It is the
+    /// RLOG trailer version for a logs segment and the RSEG version for a
+    /// samples segment. The reader still verifies the fetched footer's own
+    /// version against the object, so this is a routing hint, not the trusted
+    /// version: it lets a scan decide a version-dependent read shape before it
+    /// opens the object. The whole-segment fast path uses it to keep the ranged
+    /// column-chunk read on RLOG v4 objects, where the `ColumnSelection` is a
+    /// fetch selection (ADR-0699 decision 5), and off the N-1 v3 objects the
+    /// reader window still accepts (ADR-0066 decision 1), where that selection
+    /// is a decode choice only and the ranged route would pay a probe to fetch
+    /// the same whole-object bytes (issue #862).
+    pub segment_format_version: u32,
 }
 
 /// A pinned, immutable set of segments for one `resolve` call (MVCC).

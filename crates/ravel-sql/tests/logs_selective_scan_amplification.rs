@@ -229,6 +229,7 @@ async fn write_segment(store: &dyn ObjectStoreBackend, seg: usize) -> SegmentRef
         writer_seq: (seg + 1) as u64,
         created_unix_ns: 0,
         level: SegmentLevel::L0,
+        segment_format_version: u32::from(ravel_logseg::footer::VERSION),
     }
 }
 

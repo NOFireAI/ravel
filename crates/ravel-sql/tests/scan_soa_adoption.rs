@@ -167,6 +167,7 @@ async fn write_segment(
         writer_seq: spec.writer_seq,
         created_unix_ns: spec.created_unix_ns,
         level: SegmentLevel::L0,
+        segment_format_version: u32::from(ravel_segment::SUPPORTED_VERSIONS.newest()),
     }
 }
 
