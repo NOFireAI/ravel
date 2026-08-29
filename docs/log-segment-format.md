@@ -2,17 +2,16 @@
 
 Persistent contract (ADR-0029). Any change bumps the trailer version. The
 current trailer version is 4 (ADR-0699 moved BLOCKS to row groups with
-column-major page placement and added PAGE_DIR). Version 3 is **readable and
-not written**: it is the N-1 half of the supported window, described in its own
-subsection under "BLOCKS" below. Version 2 added the footer's
-compaction-identity fields and version 1 was the format-only initial release;
-no reader accepts either any longer.
+column-major page placement and added PAGE_DIR). It is the only version any
+reader accepts: ADR-0892 deleted the version-3 reader, and version 2 (which
+added the footer's compaction-identity fields) and version 1 (the format-only
+initial release) were retired the same way before it.
 
-Version 4 changes the BLOCKS layout, deletes the per-block header, and
-redefines the SKIP_IDX level-0 block crc, so it is a versioned change rather
+Version 4 changed the BLOCKS layout, deleted the per-block header, and
+redefined the SKIP_IDX level-0 block crc, so it was a versioned change rather
 than the additive kind ADR-0029's carve-out excepts -- whatever PAGE_DIR's own
-kind number would imply on its own. Which layout an object uses is determined
-by its trailer version, and mirrored by whether it carries a PAGE_DIR section.
+kind number would imply on its own. A version-4 object always carries a
+PAGE_DIR section, and one that does not is refused.
 
 Version 3 changed no byte layout: it changed which value a `NumStat` bounds
 (see "SKIP_IDX" below). Nothing in the bytes distinguishes a v2 stat from a v3
@@ -21,23 +20,23 @@ one. v2 read and write support was deleted in the same change that introduced
 v3.
 
 **Version lifecycle and migration (ADR-0066, normative).** RLOG is a Class A
-bulk data-object format. The supported-version window is N/N-1 (single-sourced
-as `ravel_logseg::footer::SUPPORTED_VERSIONS`; the writer, reader gate,
+bulk data-object format. The supported-version window is single-sourced as
+`ravel_logseg::footer::SUPPORTED_VERSIONS`; the writer, reader gate,
 `audit-versions`, `migrate`, and the compactor's output-version constant all
-read it), rolled out readers-before-writers: a release writing N+1
-requires a fleet already reading N+1. RLOG compaction already decodes every
-input's records and re-encodes them from scratch, so an old-version object is
+read it. Until first public release the window holds exactly one version
+(ADR-0027 decision 7, ADR-0892): each bump deletes the previous version's
+reader in the same change, and a pre-1.0.0 development store holding older
+objects is wiped or re-ingested. The N/N-1 window ADR-0066 describes, rolled
+out readers-before-writers -- a release writing N+1 requires a fleet already
+reading N+1 -- opens at, and only at, that release.
+
+RLOG compaction already decodes every input's records and re-encodes them from
+scratch, so once the window is two versions wide an old-version object is
 migrated forward by the normal compaction and `maintain migrate` paths with no
 special page-copy carve-out; retention also ages old objects out. The migrate
 job verifies and raises the per-(tenant, signal) format floor, and N-1 read
 support is deleted only once every bucket's floor is >= N, citing those floors.
-
-The v3 → v4 bump (ADR-0699 decision 3) is the first RLOG bump to ship a dual
-reader, so the window is two versions wide: `{3, 4}`. Both paths can therefore
-migrate forward -- compaction always emits version 4, so a compacted tenant
-converges in one pass, and `maintain migrate` rewrites the rest.
-`audit-versions` reports the mix. A tenant that is never compacted keeps paying
-version-3 read costs (whole blocks on the wire) until it is.
+`audit-versions` reports the mix.
 
 Parsers treat every offset, length, count, and tag read from stored bytes
 as untrusted input: bounds-check everything, overflow-check every
@@ -144,7 +143,7 @@ Validation (all violations `Corrupted`, never panics):
 
 - At most one section per known kind. All five v1 kinds
   (STREAM_DIR, FIELD_DIR, BLOCKS, SKIP_IDX, BLOOM) are mandatory. PAGE_DIR
-  (kind 8, ADR-0699) is mandatory in version 4 and absent in version 3.
+  (kind 8, ADR-0699) is mandatory.
   POSTINGS (kind 6, ADR-0049) is optional: present only when the writer was
   given one or more indexed field names (`RlogWriter::with_indexed_fields`);
   absence is legal and never treated as corruption.
@@ -307,8 +306,8 @@ BLOCKS (version 4):
 ```
 
 There is no block header. Every page's `column_id`, `enc`, `comp`, `len`, and
-`uncomp_len` -- the fields a version-3 block header carried inline -- live in
-PAGE_DIR, together with the page's offset and its own crc32c. A page a query
+`uncomp_len` live in PAGE_DIR, together with the page's offset and its own
+crc32c. A page a query
 does not want is therefore never read at all, rather than fetched and walked
 past.
 
@@ -359,44 +358,9 @@ version-4 page through it.
    attr.k    [ presence bitmap | FOR page      ]
 ```
 
-### Version 3 (readable, not written)
-
-A version-3 object has no PAGE_DIR and no row groups. Each block is one
-contiguous byte range at its SKIP_IDX level-0 `block_offset`, of exactly
-`block_len` bytes, and consecutive blocks follow each other:
-
-```
-block (version 3):
-  header:
-    record_count: varint
-    page_count:   varint
-    page_count page descriptors:
-      column_id:  varint
-      enc:        u8      encoding tag (see registry)
-      comp:       u8      0=none, 2=zstd
-      len:        varint  stored page bytes
-      uncomp_len: varint  page bytes before compression
-  pages: page_count pages concatenated, in descriptor order,
-         each `len` bytes
-```
-
-The pages are in descriptor order, which is the block encoder's staging order:
-the fixed columns in field order (so `flags`, column 8, precedes
-`severity_text`, column 4), then the dynamic columns ascending. The block's
-crc32c covers the complete block bytes, header and all pages, and the reader
-verifies it before decoding anything in the block. A column-subset decode is a
-read choice and not a format variant: the crc32c is still verified over the
-complete block bytes, every page descriptor is still parsed, and every page's
-stored extent is still walked, so a truncated or over-long block is rejected
-exactly as it is under a whole-block decode.
-
-The version-3 reader is the N-1 half of the supported-version window and is
-deleted only by its own reviewed change, once every bucket's recorded format
-floor is at 4 (ADR-0066 decision 1, ADR-0699 decision 3).
-
 ## PAGE_DIR (uncompressed form)
 
-Mandatory in version 4, absent in version 3. Compressed as a whole section and
+Mandatory. Compressed as a whole section and
 covered by its `Section.crc32c`, like SKIP_IDX: it is read whole on every open,
 because without it no page can be located at all. A corrupt or undecodable
 PAGE_DIR is a loud `Corrupted` error and never a degrade.
@@ -564,12 +528,10 @@ descends only into survivors, so pruning cost scales with surviving data.
 ```
 count0: u32
 count0 level-0 entries:
-  block_offset:   varint   (into BLOCKS; version 4: the block's page span,
-                           see "BLOCKS")
+  block_offset:   varint   (into BLOCKS; the block's page span, see "BLOCKS")
   block_len:      varint
   block_crc32c:   u32      crc32c over the block's pages concatenated in
-                           ascending column_id order (version 4) or over the
-                           block's complete stored bytes (version 3)
+                           ascending column_id order
   record_count:   varint
   min_ts, max_ts: ivarint
   min_stream_ref, max_stream_ref: varint
@@ -1062,8 +1024,8 @@ its access path (ADR-0010 §4):
 | FIELD_DIR stored bytes | `Section.crc32c` | footer section entry | before decoding the section |
 | SKIP_IDX stored bytes | `Section.crc32c` | footer section entry | before decoding the section |
 | PAGE_DIR stored bytes | `Section.crc32c` | footer section entry | before decoding the section |
-| one page's stored bytes | that page's `crc32c` | PAGE_DIR (version 4) | before decompressing the page |
-| one block's pages concatenated in `column_id` order (v4), or its complete bytes including its header (v3) | `block_crc32c` | that block's SKIP_IDX level-0 entry | before decoding the block, by a reader that took every page of it |
+| one page's stored bytes | that page's `crc32c` | PAGE_DIR | before decompressing the page |
+| one block's pages concatenated in `column_id` order | `block_crc32c` | that block's SKIP_IDX level-0 entry | before decoding the block, by a reader that took every page of it |
 | one BLOOM entry's stored bytes | per-entry `crc32c` | BLOOM container framing | before probing the entry |
 | POSTINGS header (`column_id`, `capped`, `stride`, counts, `first_term`s, offsets, for every field) | whole-section `Section.crc32c` | footer section entry | before `PostingsSection::parse`, in `RlogReader::scan` |
 | one POSTINGS term block's stored bytes | per-block `crc32c` | POSTINGS sparse-index entry | before decompressing the block a probe lands on |

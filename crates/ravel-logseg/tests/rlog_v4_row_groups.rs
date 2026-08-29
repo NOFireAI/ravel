@@ -1,11 +1,11 @@
 //! RLOG version 4: row groups with column-major page placement and the
 //! PAGE_DIR section (ADR-0699).
 //!
-//! Covers the acceptance anchors ADR-0699 names: a differential check that
-//! a version-4 object decodes to the same records as the version-3 writer
-//! produced for the same batch, projection pushdown through PAGE_DIR, the
-//! row-group boundary cases, and the corrupt-input cases (a flipped page
-//! byte, a flipped PAGE_DIR byte, a truncated last row group).
+//! Covers the acceptance anchors ADR-0699 names: a differential check that the
+//! decoded records do not depend on how the pages were placed into row groups,
+//! projection pushdown through PAGE_DIR, the row-group boundary cases, and the
+//! corrupt-input cases (a flipped page byte, a flipped PAGE_DIR byte, a
+//! truncated last row group).
 #![allow(clippy::expect_used)]
 
 use proptest::prelude::*;
@@ -57,12 +57,18 @@ fn write_v4(cfg: RlogConfig, recs: &[LogRecord]) -> Vec<u8> {
     w.finish().expect("finish v4")
 }
 
-fn write_v3(cfg: RlogConfig, recs: &[LogRecord]) -> Vec<u8> {
-    let mut w = writer(cfg);
-    for r in recs {
-        w.push(r.clone()).expect("push");
-    }
-    w.finish_v3_for_tests().expect("finish v3")
+/// The same records written as ONE row group, whatever `cfg` asks for: the
+/// differential oracle for a placement, since a single group is the smallest
+/// possible number of column chunks and the most different placement there is
+/// from a many-group one.
+fn write_single_group(cfg: RlogConfig, recs: &[LogRecord]) -> Vec<u8> {
+    write_v4(
+        RlogConfig {
+            group_target_blocks: usize::MAX,
+            ..cfg
+        },
+        recs,
+    )
 }
 
 fn scan_all(object: &[u8]) -> Vec<LogRecord> {
@@ -146,8 +152,8 @@ fn assemble(footer: LogFooter, sections: &[Section]) -> Vec<u8> {
     assemble_versioned(footer, sections, footer::VERSION)
 }
 
-/// [`assemble`] with the trailer version named, so a version-3 object stays
-/// version 3 through a rewrite. The footer crc covers the version byte, so
+/// [`assemble`] with the trailer version named, so a test can stamp a version
+/// the reader does not accept. The footer crc covers the version byte, so
 /// patching it afterwards would fail the crc instead of whatever the test meant
 /// to exercise.
 fn assemble_versioned(mut footer: LogFooter, sections: &[Section], version: u16) -> Vec<u8> {
@@ -233,7 +239,7 @@ fn open_and_drain(object: &[u8]) -> Result<Vec<LogRecord>, LogSegError> {
     Ok(reader.scan(&Predicate::And(Vec::new()))?.0)
 }
 
-// --- differential: version 4 decodes to what version 3 decodes --------------
+// --- differential: the decode does not depend on the placement --------------
 
 fn arb_attr_value() -> impl Strategy<Value = AttrValue> {
     let leaf = prop_oneof![
@@ -299,14 +305,15 @@ fn key(r: &LogRecord) -> String {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(128))]
 
-    /// ADR-0699's acceptance anchor: for the generators the columnar-versus-row
-    /// differential already covers, a version-4 object read through the
-    /// version-4 reader yields the same records, in the same order, as the same
-    /// batch written through the version-3 path and read through the version-3
-    /// reader. Both objects come from one writer whose only difference is the
-    /// BLOCKS layout, so a divergence is a layout defect and nothing else.
+    /// ADR-0699's acceptance anchor, restated against the placement it
+    /// introduced: for the generators the columnar-versus-row differential
+    /// already covers, the same batch placed into `group` blocks per row group
+    /// and into one single row group yields the same records, in the same
+    /// order. The two objects come from one writer whose only difference is
+    /// where each page landed, so a divergence is a placement defect and
+    /// nothing else.
     #[test]
-    fn version_4_decodes_to_what_version_3_decodes(
+    fn the_decode_does_not_depend_on_the_row_group_size(
         records in proptest::collection::vec(arb_record(), 1..25),
         max_dyn in 1usize..8,
         group in 1usize..4,
@@ -318,20 +325,26 @@ proptest! {
             group_target_blocks: group,
             ..RlogConfig::default()
         };
-        let v3 = write_v3(cfg, &records);
-        let v4 = write_v4(cfg, &records);
-        prop_assert_ne!(&v3, &v4, "the two layouts must not be the same bytes");
+        let many = write_v4(cfg, &records);
+        let one = write_single_group(cfg, &records);
+        prop_assert_eq!(page_dir_of(&one).groups.len(), 1, "the oracle is one group");
+        // The two placements really differ whenever the corpus spans more than
+        // one group; when it does not, the objects are identical by
+        // construction and the comparison below is trivially true.
+        if page_dir_of(&many).groups.len() > 1 {
+            prop_assert_ne!(&many, &one, "different placements must be different bytes");
+        }
 
-        let from_v3: Vec<String> = scan_all(&v3).iter().map(key).collect();
-        let from_v4: Vec<String> = scan_all(&v4).iter().map(key).collect();
-        prop_assert_eq!(from_v4, from_v3);
+        let from_one: Vec<String> = scan_all(&one).iter().map(key).collect();
+        let from_many: Vec<String> = scan_all(&many).iter().map(key).collect();
+        prop_assert_eq!(from_many, from_one);
     }
 }
 
 /// The row-group boundary cases ADR-0699's consequences section names: one
 /// block, `group_target_blocks - 1`, exactly one group, and one over.
 #[test]
-fn row_group_boundary_cases_decode_identically_to_version_3() {
+fn row_group_boundary_cases_decode_identically_to_a_single_group() {
     const GROUP: usize = 4;
     const PER_BLOCK: usize = 5;
 
@@ -342,12 +355,15 @@ fn row_group_boundary_cases_decode_identically_to_version_3() {
             ..RlogConfig::default()
         };
         let records = linear_corpus(blocks * PER_BLOCK);
-        let v3 = write_v3(cfg, &records);
+        let one = write_single_group(cfg, &records);
         let v4 = write_v4(cfg, &records);
 
-        let from_v3: Vec<String> = scan_all(&v3).iter().map(key).collect();
+        let from_one: Vec<String> = scan_all(&one).iter().map(key).collect();
         let from_v4: Vec<String> = scan_all(&v4).iter().map(key).collect();
-        assert_eq!(from_v4, from_v3, "{blocks} blocks at a {GROUP}-block group");
+        assert_eq!(
+            from_v4, from_one,
+            "{blocks} blocks at a {GROUP}-block group"
+        );
 
         let dir = page_dir_of(&v4);
         assert_eq!(dir.block_count(), blocks as u64, "{blocks} blocks");
@@ -710,22 +726,20 @@ fn page_dir_page_count_over_the_cap_is_refused() {
 
 // --- version gate -----------------------------------------------------------
 
-/// A version-3 object still reads through the N-1 reader, and a version-5
-/// trailer is refused with the existing typed unsupported-version error
-/// (ADR-0699 decision 3, ADR-0066 decision 2).
+/// The version gate accepts version 4 and nothing else: a trailer stamped 3 or
+/// 5 is refused with the typed unsupported-version error (ADR-0892 decision 1,
+/// ADR-0066 decision 2). PAGE_DIR is mandatory at that one version, so an
+/// object missing it is refused rather than read under a guessed layout.
 #[test]
-fn version_gate_accepts_3_and_4_and_refuses_5() {
+fn version_gate_accepts_only_4() {
     let cfg = RlogConfig {
         block_target_records: 5,
         group_target_blocks: 4,
         ..RlogConfig::default()
     };
     let records = linear_corpus(20);
-    let v3 = write_v3(cfg, &records);
     let v4 = write_v4(cfg, &records);
 
-    let n3 = v3.len();
-    assert_eq!(u16::from_le_bytes([v3[n3 - 8], v3[n3 - 7]]), 3);
     let n4 = v4.len();
     assert_eq!(
         u16::from_le_bytes([v4[n4 - 8], v4[n4 - 7]]),
@@ -734,26 +748,13 @@ fn version_gate_accepts_3_and_4_and_refuses_5() {
     assert_eq!(footer::VERSION, 4);
 
     assert_eq!(
-        scan_all(&v3).len(),
-        records.len(),
-        "a version-3 object reads"
-    );
-    assert_eq!(
         scan_all(&v4).len(),
         records.len(),
         "a version-4 object reads"
     );
-    assert!(
-        open(&v3)
-            .expect("open v3")
-            .section(kind::PAGE_DIR)
-            .is_none(),
-        "version 3 carries no PAGE_DIR"
-    );
 
-    // The version byte and PAGE_DIR's presence must agree: a version-4 object
-    // whose PAGE_DIR was dropped, and a version-3 object that gained one, are
-    // both refused rather than read under a guessed layout.
+    // A version-4 object whose PAGE_DIR was dropped is refused rather than read
+    // under a guessed layout.
     let (footer, sections) = explode(&v4);
     let without: Vec<Section> = sections
         .into_iter()
@@ -761,27 +762,26 @@ fn version_gate_accepts_3_and_4_and_refuses_5() {
         .collect();
     corrupted_saying(
         open_and_drain(&assemble(footer, &without)),
-        "disagrees with the PAGE_DIR section",
+        "missing PAGE_DIR section",
     );
 
-    let (v3_footer, mut v3_sections) = explode(&v3);
-    let dir_stored = {
-        let (_, v4_sections) = explode(&v4);
-        v4_sections
-            .into_iter()
-            .find(|s| s.kind == kind::PAGE_DIR)
-            .expect("PAGE_DIR in v4")
-    };
-    v3_sections.push(dir_stored);
-    let v3_plus = assemble_versioned(v3_footer, &v3_sections, 3);
-    corrupted_saying(
-        open_and_drain(&v3_plus),
-        "disagrees with the PAGE_DIR section",
-    );
-    // The same rewrite without the added section still reads at version 3, so
-    // the refusal above is about PAGE_DIR and not about the rewrite.
-    let (v3_footer, v3_sections) = explode(&v3);
-    assert!(open_and_drain(&assemble_versioned(v3_footer, &v3_sections, 3)).is_ok());
+    // The predecessor version is refused with the typed variant, not read and
+    // not mistaken for corruption. The object is the current one restamped, so
+    // every other byte is structurally valid and the trailer version is the
+    // only thing that can be failing.
+    let (footer, sections) = explode(&v4);
+    let stamped_v3 = assemble_versioned(footer, &sections, footer::VERSION - 1);
+    match open_and_drain(&stamped_v3) {
+        Err(LogSegError::UnsupportedVersion(3)) => {}
+        other => panic!(
+            "expected UnsupportedVersion(3), got {:?}",
+            other.map(|_| ())
+        ),
+    }
+    // The same rewrite at the current version still reads, so the refusal above
+    // is about the version byte and not about the rewrite.
+    let (footer, sections) = explode(&v4);
+    assert!(open_and_drain(&assemble_versioned(footer, &sections, footer::VERSION)).is_ok());
 
     let mut future = v4.clone();
     future[n4 - 8..n4 - 6].copy_from_slice(&5u16.to_le_bytes());
