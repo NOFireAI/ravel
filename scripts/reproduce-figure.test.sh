@@ -108,5 +108,22 @@ check "auto with no numeric metrics aborts" 3 "has nothing to sum" "$TMP/nometri
 printf '{"id":"qA","min_ms":1000.0}{"id":"qB","min_ms":3000.0}\n' > "$TMP/concat.json"
 check "concatenated docs on one line parse" 0 "EXACT: drop qB" "$TMP/concat.json" min_ms 1.00
 
+# Non-finite and out-of-range inputs must ABORT, not reach the matching loop.
+# nan compares False against everything, so a nan claim would exit 1 -- the one
+# output meant to be quoted as evidence that a figure is wrong. Same trap as the
+# misspelled field, surviving in a different form.
+check "nan claimed aborts"       3 "is not finite" "$TMP/report.json" min_ms nan
+check "inf claimed aborts"       3 "is not finite" "$TMP/report.json" min_ms inf
+check "-inf claimed aborts"      3 "is not finite" "$TMP/report.json" min_ms -inf
+check "negative count aborts"    3 "is negative"   "$TMP/report.json" min_ms 4.00 -3
+
+# bool is a subclass of int in Python, so an unguarded isinstance check sums
+# `true` as 1 and reports a total that is quietly wrong.
+printf '{"id":"qA","min_ms":true}\n{"id":"qB","min_ms":1000.0}\n' > "$TMP/boolmetric.json"
+check "boolean timing aborts" 3 "non-numeric or non-finite" "$TMP/boolmetric.json" min_ms 1.00
+
+printf '{"id":"qA","min_ms":1e999}\n{"id":"qB","min_ms":1000.0}\n' > "$TMP/infmetric.json"
+check "non-finite timing aborts" 3 "non-numeric or non-finite" "$TMP/infmetric.json" min_ms 1.00
+
 if [ "$fails" -ne 0 ]; then echo; echo "$fails case(s) failed"; exit 1; fi
 echo; echo "all reproduce-figure cases passed"
