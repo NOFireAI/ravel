@@ -247,17 +247,28 @@ pinned identity, not completion order, so a caller's `write()` always
 resolves to its own token regardless of which flush's PUT the store lets
 through first.
 
-`max_inflight_flushes` (`IngestConfig::max_inflight_flushes`, CLI
-`--max-inflight-flushes`, default **1**) bounds how many such spawned
-tasks one shard may have outstanding at once, via a per-shard
-`tokio::sync::Semaphore`. It is the only thing a flush trigger can now
-block on. Default 1 reproduces today's one-flush-at-a-time behavior bit
-for bit; raising it trades bounded extra per-shard memory (buffers held
-open by the extra in-flight flushes, up to `max_inflight_flushes - 1`
-flush windows' worth) for overlapped PUT latency, and should be raised
-only as a measured decision. `0` is rejected at
-the CLI edge (`Cli::validate`): it would deadlock every flush, since a
-shard could never acquire a permit to run one.
+`max_inflight_flushes` (`IngestConfig::max_inflight_flushes`) bounds how
+many such spawned tasks one shard may have outstanding at once, via a
+per-shard `tokio::sync::Semaphore`. It is the only thing a flush trigger
+can now block on. It has two defaults, because it has two callers with
+different memory owners: **1** on `ravel-server`
+(`--max-inflight-flushes`, ADR-0067 decision 2), where nothing upstream
+caps the work a shard is offered, so raising it trades bounded extra
+per-shard memory (buffers held open by the extra in-flight flushes, up to
+`max_inflight_flushes - 1` flush windows' worth) for overlapped PUT
+latency and should be a measured decision; and **4** on `ravel-cli load`
+(`--max-inflight-flushes`, ADR-0807 as amended by issue #800), where
+`--pipeline-depth` already caps the outstanding batches, so the flush
+window costs no further memory and only decides whether that bounded set
+of objects is written concurrently. `0` is rejected at the CLI edge
+(`Cli::validate` on the server, a typed `LoadError::Setup` on the
+loader): it would deadlock every flush, since a shard could never acquire
+a permit to run one.
+
+Whether the semaphore is actually the constraint is observable rather
+than inferred: `flush_permit_wait_ns` in the per-shard skew stats below
+accrues only when a trigger parks at the bound, so a zero there means the
+window is not being asked for anything, not that it is coping.
 
 Pipelining does not change what the catalog already tolerates: a
 flush's seq is allocated at pin time, not at commit time, so two
@@ -642,7 +653,7 @@ carries max token per shard).
 | put retry budget | 4 attempts, 100ms..2s jittered backoff |
 | max in-flight ingest requests (process-wide) | 1024 (`--max-inflight-ingest-requests`, 0 = unlimited) |
 | max ingest buffer bytes (process-wide, all signals) | 512 MiB (`--max-ingest-buffer-bytes`, 0 = unlimited) |
-| max_inflight_flushes (per shard, all three pipelines) | 1 (`--max-inflight-flushes`, rejects 0) |
+| max_inflight_flushes (per shard, all three pipelines) | 1 on `ravel-server`, 4 on `ravel-cli load` (`--max-inflight-flushes`, rejects 0) |
 | adaptive_flush_delay (metrics pipeline only) | off (`--adaptive-flush-delay`) |
 | idle-tenant state TTL (process-wide) | 1 h (`--idle-tenant-state-ttl`, 0 = disabled) |
 
@@ -771,18 +782,28 @@ What this measurement supports and what it does not:
 The CPU numbers above measure one write path against another; they do not
 measure how much of the object-storage round trip is hidden behind other work.
 On the reference box a 100M-row ClickBench load ran at 2.33 of 16 cores busy
-with 0.06% iowait, because the bulk loader serializes its writes at the default
-settings. Two nested concurrency windows bound the bulk write path, and both
-default to 1: `--pipeline-depth` (batches the loader keeps outstanding) and
+with 0.06% iowait, because the bulk loader serialized its writes at the
+then-current defaults. Two nested concurrency windows bound the bulk write path:
+`--pipeline-depth` (batches the loader keeps outstanding) and
 `max_inflight_flushes` (flushes per shard, the per-shard semaphore above). The
-loader builds its own `IngestConfig` from `..IngestConfig::default()`, so
-`max_inflight_flushes` is fixed at 1 on the bulk path and, unlike on
-`ravel-server`, not reachable by a flag. The concurrent-write ceiling is
-`shards * min(pipeline_depth, max_inflight_flushes)`. ADR-0807 audits every
-write-path bound, decides to expose `--max-inflight-flushes` on the loader while
-keeping both defaults at 1 (raising `--pipeline-depth` above 1 weakens the
-loader's durable-token report, so the speed-up is opt-in), and records that every
-published ClickBench load figure was measured at depth 1.
+concurrent-write ceiling is
+`shards * min(pipeline_depth, max_inflight_flushes)`.
+
+Because that term is a `min`, neither window alone changes anything, which is
+measured rather than argued: on a 16-batch single-shard fixture with a 40ms
+injected data-object PUT (issue #800), depth 1 / flushes 1 took 673.9 ms, depth 4
+/ flushes 1 took 671.9 ms, depth 1 / flushes 4 took 673.3 ms, and depth 4 /
+flushes 4 took 169.3 ms. At depth 1 the loader never asks a shard for a second
+concurrent flush, so `flush_permit_wait_ns` is exactly 0 and the per-shard window
+is not the thing the load is waiting on.
+
+ADR-0807 audits every write-path bound and exposes `--max-inflight-flushes` on
+the loader; its amendment for issue #800 moves both loader defaults to 4, having
+first closed the durable-token report gap that made the speed-up opt-in (the
+loader now resolves every outstanding write on a failure instead of abandoning
+it, so the report equals what landed at any depth). `ravel-server`'s own default
+is unchanged. Every published ClickBench load figure predates both changes and
+needs re-measuring.
 
 ## Metrics (self-observability)
 
@@ -837,7 +858,18 @@ To make per-shard ingest skew measurable -- so an argument about shard-actor
 throughput rests on data, not assertion -- `IngestMetrics` also carries a
 per-shard dimension, read via `IngestMetrics::shard_skew_by_shard()` (and
 reachable from a benchmark through `IngestRouter::metrics()`, the same handle
-`in_flight_flushes_by_shard` is read through). It is not part of the flat
+`in_flight_flushes_by_shard` is read through).
+
+`LogIngestMetrics` carries the same dimension, with the same
+`shard_skew_by_shard()` reader and the same three spans (issue #800). The two
+share one accumulator (`metrics::ShardSkew`), so a figure means the same thing on
+either pipeline. This matters because `ravel-cli load` drives the logs pipeline
+and not the metrics one: while the accounting existed only on the metrics side,
+every skew figure for the bulk-load path read as absent, and ADR-0807's audit of
+that path had to reason from the code instead of from a measurement. The span
+path (`span_router.rs`, `span_shard.rs`) is still uncovered.
+
+It is not part of the flat
 `IngestMetricsSnapshot`, whose `Copy` shape holds no per-shard dimension, so the
 process `/metrics` surface renders it no more than it renders per-shard
 in-flight flushes today; wiring either into an operator scrape is a follow-up in

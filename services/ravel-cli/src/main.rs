@@ -2261,8 +2261,57 @@ async fn catalog_list(
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    use clap::Parser;
+
     use super::rspan_status_mask_names;
+    use super::{Cli, Command};
     use ravel_rspan::skip_index::{STATUS_BIT_ERROR, STATUS_BIT_OK, STATUS_BIT_UNSET};
+
+    /// The shipped write-concurrency defaults, read where an operator meets
+    /// them: `ravel load` with neither window flag given (issue #800). The
+    /// constants in `load.rs` are only the shipped behaviour if the clap
+    /// attributes actually reference them, and a `default_value_t = 1` literal
+    /// on either flag would leave the library constant correct and the binary
+    /// serial.
+    ///
+    /// Non-vacuity (prove-the-test): the pre-change tree had
+    /// `#[arg(long, default_value_t = 1)] pipeline_depth`, and this test's
+    /// `pipeline_depth == DEFAULT_PIPELINE_DEPTH` assertion fails against it
+    /// (1 against 4).
+    #[test]
+    fn load_write_window_flags_default_to_the_documented_constants() {
+        let cli = Cli::try_parse_from([
+            "ravel",
+            "load",
+            "--parquet",
+            "hits.parquet",
+            "--tenant",
+            "acme",
+            "--mapping",
+            "hits.toml",
+        ])
+        .expect("a load invocation with no window flags parses");
+
+        let Command::Load {
+            pipeline_depth,
+            max_inflight_flushes,
+            ..
+        } = cli.command
+        else {
+            panic!("expected the load subcommand");
+        };
+
+        assert_eq!(
+            pipeline_depth,
+            ravel_cli::load::DEFAULT_PIPELINE_DEPTH,
+            "--pipeline-depth must default to DEFAULT_PIPELINE_DEPTH"
+        );
+        assert_eq!(
+            max_inflight_flushes,
+            ravel_cli::load::DEFAULT_MAX_INFLIGHT_FLUSHES,
+            "--max-inflight-flushes must default to DEFAULT_MAX_INFLIGHT_FLUSHES"
+        );
+    }
 
     #[test]
     fn status_mask_names_known_bits() {
