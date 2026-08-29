@@ -137,6 +137,56 @@ fn i64_stat(
     }
 }
 
+fn str_value(v: &str) -> ColumnValue {
+    ColumnValue {
+        kind: Some(ravel_proto::catalog::v1::column_value::Kind::StrUtf8(
+            v.to_string(),
+        )),
+    }
+}
+
+/// An exact `Str` `ColumnStat` from a value->count dictionary, mirroring
+/// [`i64_stat`]. Used to prove a `Str`-declared column declines even when its
+/// statistics ARE present.
+fn str_stat(name: &str, dict: &[(&str, u64)]) -> ColumnStat {
+    let non_null_count: u64 = dict.iter().map(|(_, c)| c).sum();
+    let min = dict.iter().map(|(v, _)| v.to_string()).min();
+    let max = dict.iter().map(|(v, _)| v.to_string()).max();
+    ColumnStat {
+        name: name.to_string(),
+        declared_type: 1, // ravel.sys.v1.TypedAttrColumnType::Str
+        non_null_count,
+        null_count: 0,
+        min: min.as_deref().map(str_value),
+        max: max.as_deref().map(str_value),
+        dictionary_present: true,
+        dictionary: dict
+            .iter()
+            .map(|(v, c)| DictEntry {
+                value: Some(str_value(v)),
+                count: *c,
+            })
+            .collect(),
+    }
+}
+
+/// An I64 `ColumnStat` whose dictionary was OMITTED (`dictionary_present =
+/// false`) for exceeding the fold's cardinality ceiling, while
+/// `non_null_count` still reflects the real non-null rows. This is the state
+/// a q02/q08 answer cannot be derived from, so the rule must decline.
+fn i64_omitted_stat(name: &str, non_null_count: u64) -> ColumnStat {
+    ColumnStat {
+        name: name.to_string(),
+        declared_type: 2,
+        non_null_count,
+        null_count: 0,
+        min: None,
+        max: None,
+        dictionary_present: false,
+        dictionary: Vec::new(),
+    }
+}
+
 fn stats_segment(seg: &SegmentRef, columns: Vec<ColumnStat>) -> ColumnStatsSegment {
     ColumnStatsSegment {
         ingest_hour_bucket: seg.ingest_hour_bucket,
@@ -172,12 +222,31 @@ fn snapshot_of(
 
 /// A logs session over `provider`, built exactly as `SqlExecutor` builds one
 /// (`build_session`, so the default physical optimizer chain, including
-/// `MetadataOnlyAggregate`, is in force).
+/// `MetadataOnlyAggregate`, is in force). Single-stage aggregate:
+/// `exact_typed_aggregates = false`.
 fn logs_session(provider: LogsTableProvider) -> datafusion::error::Result<SessionContext> {
+    logs_session_with(provider, false)
+}
+
+/// A logs session with an explicit `exact_typed_aggregates` flag. With `true`
+/// (the production default for a query the classifier admits, ADR-0094), a
+/// `GROUP BY` becomes the two-stage `Partial -> RepartitionExec(Hash) ->
+/// FinalPartitioned` plan, which the rewrite must descend through
+/// (`shuffle_child` admits the hash repartition) just as it does the
+/// single-stage plan.
+fn logs_session_with(
+    provider: LogsTableProvider,
+    exact_typed_aggregates: bool,
+) -> datafusion::error::Result<SessionContext> {
     let config = SqlConfig::default();
     let tenant = TenantMemoryAccountant::new(1 << 30);
     let (pool, _breach) = config.query_pool(tenant, QueryAccounting::new());
-    build_session(&config, pool, SessionTable::Logs(Arc::new(provider)), false)
+    build_session(
+        &config,
+        pool,
+        SessionTable::Logs(Arc::new(provider)),
+        exact_typed_aggregates,
+    )
 }
 
 fn provider(
@@ -405,6 +474,148 @@ async fn metadata_only_exec_marker_reports_row_count() {
     );
 }
 
+/// `COUNT(NULL)` is 0 by SQL semantics, NOT `COUNT(*)`. The rule must not
+/// treat a literal-NULL count argument as `COUNT(*)` and answer it from
+/// `non_null_count`: with the pre-fix `is_count_star` this statement rewrote
+/// to the metadata count of non-404 rows and returned it; it must return 0.
+///
+/// Run over the real corpus so the declined statement can execute its scan
+/// (a fabricated segment has no object to read). With statistics loaded the
+/// rule is eligible but declines on the NULL literal, so the scan runs and
+/// returns 0.
+#[tokio::test]
+async fn count_null_is_zero_not_rewritten() {
+    let corpus = RealCorpus::build().await;
+    let (shown, batches) = corpus
+        .run("SELECT COUNT(NULL) FROM logs WHERE status <> 404", true)
+        .await;
+    assert!(
+        !shown.contains("MetadataOnlyExec"),
+        "COUNT(NULL) must not be rewritten as COUNT(*); plan was:\n{shown}"
+    );
+    assert_eq!(
+        count_scalar(&batches),
+        0,
+        "COUNT(NULL) is 0, not the row count"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Parallel final aggregation (ADR-0094, the shipped default): the rewrite must
+// fire over the two-stage Partial -> RepartitionExec(Hash) -> FinalPartitioned
+// plan, not only the single-stage aggregate.
+// ---------------------------------------------------------------------------
+
+/// q08 with `exact_typed_aggregates = true` (production's default for a query
+/// the classifier admits). The scan path proves the plan shape is the
+/// two-stage parallel one; with statistics loaded the rewrite descends through
+/// the hash repartition and answers from metadata with zero GETs.
+#[tokio::test]
+async fn q08_parallel_final_answered_from_stats() {
+    let store = CountingStore::new(Arc::new(MemoryStore::new()));
+    let (a, b) = two_status_segments();
+
+    // No stats: the rule declines, so the ordinary exact-typed plan survives
+    // and we can assert it really is Partial -> RepartitionExec(Hash) ->
+    // FinalPartitioned.
+    let scan_ctx = logs_session_with(
+        provider(
+            &store,
+            snapshot_of(vec![a.clone(), b.clone()], Vec::new()),
+            status_col(),
+            None,
+        ),
+        true,
+    )
+    .expect("session");
+    let scan_plan = scan_ctx
+        .sql("SELECT status, COUNT(*) FROM logs GROUP BY status")
+        .await
+        .expect("plan")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+    let scan_shown = plan_str(&scan_plan);
+    assert!(
+        scan_shown.contains("RepartitionExec")
+            && scan_shown.contains("mode=FinalPartitioned")
+            && scan_shown.contains("mode=Partial"),
+        "exact_typed_aggregates must produce the two-stage parallel plan; plan was:\n{scan_shown}"
+    );
+
+    // Stats loaded: the rewrite fires over that same shape.
+    let stats = status_stats(&a, &b);
+    let ctx = logs_session_with(
+        provider(
+            &store,
+            snapshot_of(vec![a, b], Vec::new()),
+            status_col(),
+            Some(stats),
+        ),
+        true,
+    )
+    .expect("session");
+    let plan = ctx
+        .sql("SELECT status, COUNT(*) FROM logs GROUP BY status")
+        .await
+        .expect("plan")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+    let shown = plan_str(&plan);
+    assert!(
+        !shown.contains("LogsScanExec") && shown.contains("MetadataOnlyExec"),
+        "the rewrite must fire over the parallel-final plan; plan was:\n{shown}"
+    );
+    let batches = collect(Arc::clone(&plan), ctx.task_ctx())
+        .await
+        .expect("collect");
+    let expected: HashMap<Option<i64>, i64> =
+        HashMap::from([(Some(200), 7), (Some(404), 2), (Some(500), 1), (None, 1)]);
+    assert_eq!(
+        group_counts(&batches),
+        expected,
+        "merged dictionary plus NULL"
+    );
+    assert_eq!(store.gets(), 0, "answered from stats, no objects read");
+}
+
+/// q02 with `exact_typed_aggregates = true`: the count aggregate is still
+/// order/partition-independent, so the rewrite must fire and read no objects.
+#[tokio::test]
+async fn q02_parallel_final_answered_from_stats() {
+    let store = CountingStore::new(Arc::new(MemoryStore::new()));
+    let (a, b) = two_status_segments();
+    let stats = status_stats(&a, &b);
+    let ctx = logs_session_with(
+        provider(
+            &store,
+            snapshot_of(vec![a, b], Vec::new()),
+            status_col(),
+            Some(stats),
+        ),
+        true,
+    )
+    .expect("session");
+    let plan = ctx
+        .sql("SELECT COUNT(*) FROM logs WHERE status <> 404")
+        .await
+        .expect("plan")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+    let shown = plan_str(&plan);
+    assert!(
+        !shown.contains("LogsScanExec") && shown.contains("MetadataOnlyExec"),
+        "the rewrite must fire under exact_typed_aggregates; plan was:\n{shown}"
+    );
+    let batches = collect(Arc::clone(&plan), ctx.task_ctx())
+        .await
+        .expect("collect");
+    assert_eq!(count_scalar(&batches), 8, "(5-2) + (5-0), nulls excluded");
+    assert_eq!(store.gets(), 0, "answered from stats, no objects read");
+}
+
 // ---------------------------------------------------------------------------
 // Decline paths (safety lemma): each keeps the LogsScanExec and never rewrites.
 // ---------------------------------------------------------------------------
@@ -454,11 +665,20 @@ async fn pending_erasure_declines_and_keeps_the_scan() {
 async fn str_typed_column_declines_and_keeps_the_scan() {
     let store = CountingStore::new(Arc::new(MemoryStore::new()));
     let (a, b) = two_status_segments();
-    // The stats carry a `region` entry, but its declared type is Str, which
-    // `declared_not_equal_count` refuses before reading the dictionary.
+    // The stats DO carry a `region` entry with a real present dictionary, so a
+    // missing-column decline cannot mask the reason under test: the sole cause
+    // is that `region` is declared `Str`, which `declared_not_equal_count`
+    // refuses (logs_scan.rs, the `matches!(declared.ty, DeclaredType::Str)`
+    // gate, reinforced by `declared_scalar` having no `Str` arm).
     let stats = loaded_stats(vec![
-        (&a, stats_segment(&a, Vec::new())),
-        (&b, stats_segment(&b, Vec::new())),
+        (
+            &a,
+            stats_segment(&a, vec![str_stat("region", &[("us", 3), ("eu", 2)])]),
+        ),
+        (
+            &b,
+            stats_segment(&b, vec![str_stat("region", &[("us", 4), ("eu", 2)])]),
+        ),
     ]);
     let snapshot = snapshot_of(vec![a, b], Vec::new());
     let declared = vec![DeclaredColumn::new("region", DeclaredType::Str)];
@@ -667,7 +887,10 @@ async fn q02_containing_ts_bound_still_answers_from_stats() {
 /// fold's cardinality ceiling, `dictionary_present = false`) carries no exact
 /// per-value counts, so a q02/q08 answer derived from it could be wrong
 /// outright, not merely unavailable. The rule must decline. Segment A has a
-/// present dictionary; segment B's is omitted, which alone forces fallback.
+/// present dictionary; segment B's is omitted while still declaring 5 non-null
+/// rows, so dropping the `!dictionary_present` gate (logs_scan.rs) would
+/// undercount by exactly those 5 rows -- the gate is the only thing that can
+/// cause the decline here.
 #[tokio::test]
 async fn omitted_dictionary_declines_and_keeps_the_scan() {
     let store = CountingStore::new(Arc::new(MemoryStore::new()));
@@ -679,9 +902,10 @@ async fn omitted_dictionary_declines_and_keeps_the_scan() {
         ),
         (
             &b,
-            // dictionary_present = false: the fold dropped this column's
-            // dictionary for exceeding the cardinality ceiling.
-            stats_segment(&b, vec![i64_stat("status", &[], 5, false)]),
+            // dictionary_present = false with 5 real non-null rows: the fold
+            // dropped this column's dictionary for exceeding the cardinality
+            // ceiling.
+            stats_segment(&b, vec![i64_omitted_stat("status", 5)]),
         ),
     ]);
     let snapshot = snapshot_of(vec![a, b], Vec::new());
@@ -977,5 +1201,62 @@ async fn q08_rewritten_answer_equals_scanned_answer() {
         group_counts(&clipped_scan),
         group_counts(&scanned),
         "the ts bound must actually remove rows, or the clipped case proves nothing"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Fail-closed on an internally-inconsistent record (Finding 4, read side)
+// ---------------------------------------------------------------------------
+
+/// An internally-inconsistent `ColumnStat` (dictionary counts that do not sum
+/// to `non_null_count`) is rejected at LOAD by `decode_column_stats`, so the
+/// real path can never hand one to the query. Injected by hand here (bypassing
+/// decode), the READ side must still fail closed: `declared_not_equal_count`
+/// declines rather than subtracting from a dictionary that cannot account for
+/// the claimed rows, and the query returns the correct SCANNED answer.
+#[tokio::test]
+async fn inconsistent_record_declines_at_use_and_scans_correct_answer() {
+    let corpus = RealCorpus::build().await;
+
+    // Corrupt segment A's stat: claim 100 more non-null rows than its
+    // dictionary accounts for.
+    let mut bad_a = stat_from_rows(SEG_A_ROWS);
+    bad_a.non_null_count += 100;
+    let bad_stats = loaded_stats(vec![
+        (&corpus.a, stats_segment(&corpus.a, vec![bad_a])),
+        (
+            &corpus.b,
+            stats_segment(&corpus.b, vec![stat_from_rows(SEG_B_ROWS)]),
+        ),
+    ]);
+
+    let snapshot = snapshot_of(vec![corpus.a.clone(), corpus.b.clone()], Vec::new());
+    let ctx = logs_session(provider(
+        &corpus.store,
+        snapshot,
+        status_col(),
+        Some(bad_stats),
+    ))
+    .expect("session");
+    let plan = ctx
+        .sql("SELECT COUNT(*) FROM logs WHERE status <> 404")
+        .await
+        .expect("plan")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+    let shown = plan_str(&plan);
+    assert!(
+        shown.contains("LogsScanExec") && !shown.contains("MetadataOnlyExec"),
+        "an inconsistent record must decline at use and fall back to a scan; plan was:\n{shown}"
+    );
+
+    let batches = collect(Arc::clone(&plan), ctx.task_ctx())
+        .await
+        .expect("collect");
+    assert_eq!(
+        count_scalar(&batches),
+        9,
+        "the scan returns the true count, unaffected by the corrupt stat"
     );
 }
