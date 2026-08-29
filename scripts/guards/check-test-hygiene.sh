@@ -89,21 +89,85 @@ fi
 # measurement in one test and reused for something unrelated in another test in
 # the same file is a false positive. The escape-hatch marker covers it.
 awk_prog='
-function strip_line(s,   out, i, c, n, instr, esc) {
-  # Drop // comments and double-quoted string contents, so paren counting and
-  # identifier matching never see an assertion message.
-  out = ""; instr = 0; esc = 0; n = length(s)
-  for (i = 1; i <= n; i++) {
+# String and comment contents are prose, not code: paren counting and
+# identifier matching must never see an assertion message. strip_line removes
+# them and returns the code skeleton of one physical line.
+#
+# State (sstate/shashes/sesc) is per file, carried across lines, because a Rust
+# string literal spans lines: an ordinary "..." continues until its closing
+# quote (a trailing backslash-newline is just whitespace trimming, not a
+# terminator), and a raw string r#"..."# can hold newlines outright. The old
+# per-line stripper reset at every newline, so the second and later lines of a
+# multi-line assertion message were scanned as if they were code -- that is the
+# false positive this guard shipped (issue #896): the English word "wall" in a
+# continued message matched a `wall` timing identifier. FNR==1 resets the state
+# for each file.
+#
+# String forms handled: ordinary "..." with \" escapes, raw strings r"...",
+# r#"..."# and higher hash counts, and the byte-string prefixes b"..." / br"..."
+# / br#"..."#. Char literals are consumed whole so a quote inside one (a
+# quote char literal, or an escaped-quote char literal) cannot open a spurious
+# string that swallows the rest of the file. Order matters: // is checked before
+# any quote, and a char literal and raw-string opener are recognised before a
+# bare " opens an ordinary string.
+function charlit_len(s, i,   c2, c, j) {
+  # s[i] is a single quote. Return the length of a char literal starting there,
+  # or 0 when the quote opens a lifetime/label (`\x27a`, `\x27static`) instead.
+  c2 = substr(s, i + 1, 1)
+  if (c2 == "\\") {
+    j = i + 2                       # first char after the backslash
+    c = substr(s, j, 1)
+    if (c == "x") j = j + 3         # \xHH then the closing quote
+    else if (c == "u") {            # \u{HHHH...}
+      j = j + 1
+      while (j <= length(s) && substr(s, j, 1) != "}") j++
+      j++
+    } else j = j + 1                # single-char escape (\n \\ \x27 \" ...)
+    if (substr(s, j, 1) == SQ) return j - i + 1
+    return 0
+  }
+  if (substr(s, i + 2, 1) == SQ) return 3
+  return 0
+}
+function strip_line(s,   out, i, n, c, j, k, hashes, hs, cl) {
+  out = ""; n = length(s); i = 1
+  while (i <= n) {
     c = substr(s, i, 1)
-    if (instr) {
-      if (esc) { esc = 0; continue }
-      if (c == "\\") { esc = 1; continue }
-      if (c == "\"") { instr = 0 }
-      continue
+    if (sstate == 1) {                          # inside "..."
+      if (sesc) { sesc = 0; i++; continue }
+      if (c == "\\") { sesc = 1; i++; continue }
+      if (c == "\"") sstate = 0
+      i++; continue
     }
-    if (c == "\"") { instr = 1; continue }
-    if (c == "/" && substr(s, i + 1, 1) == "/") break
-    out = out c
+    if (sstate == 2) {                          # inside raw string, shashes #s
+      if (c == "\"") {
+        hs = ""
+        for (j = 0; j < shashes; j++) hs = hs "#"
+        if (shashes == 0 || substr(s, i + 1, shashes) == hs) {
+          sstate = 0; i += 1 + shashes; continue
+        }
+      }
+      i++; continue
+    }
+    if (c == "/" && substr(s, i + 1, 1) == "/") break   # line comment
+    if (c == SQ) {                              # char literal or lifetime
+      cl = charlit_len(s, i)
+      if (cl > 0) { i += cl; continue }         # drop the literal
+      out = out c; i++; continue                # a lifetime tick: keep it
+    }
+    if (c == "r" || (c == "b" && substr(s, i + 1, 1) == "r")) {
+      j = i
+      if (c == "b") j++                         # skip a byte-string prefix
+      k = j + 1                                 # j is the r, k scans the hashes
+      hashes = 0
+      while (substr(s, k, 1) == "#") { hashes++; k++ }
+      if (substr(s, k, 1) == "\"") {
+        sstate = 2; shashes = hashes; i = k + 1; continue
+      }
+      # not a raw string (a raw identifier r#ident, or a plain r): fall through
+    }
+    if (c == "\"") { sstate = 1; i++; continue }
+    out = out c; i++
   }
   return out
 }
@@ -235,10 +299,12 @@ function scan(   i, j, buf, rawbuf, start, b, id, lhs, rhs, k, parts, ntok, cap,
     report("unseeded-rng", i, "test draws from OS entropy: seed it (StdRng::seed_from_u64) so a failure replays")
   }
 }
+BEGIN { SQ = sprintf("%c", 39) }   # a single quote, unwriteable in this quoting
 FNR == 1 {
   if (nlines > 0) scan()
   delete raw; delete clean; delete timing
   nlines = 0; cfg_test_line = 0
+  sstate = 0; shashes = 0; sesc = 0
   curfile = FILENAME
   is_test_file = (FILENAME ~ /\/tests\// || FILENAME ~ /\/benches\// || FILENAME ~ /tests\.rs$/)
 }
