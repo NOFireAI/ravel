@@ -348,7 +348,8 @@ pub struct CompactorConfig {
     /// encoded/on-object bytes reach this. On the RSEG path (`build.rs`) this
     /// is the accumulated output page-byte total (ADR-0092 decision 3). On the
     /// RLOG path (`rlog.rs`) it is an encoded-bytes estimate summed per record
-    /// ([`crate::rlog::estimate_stored_record`]), because the RLOG writer holds
+    /// ([`crate::rlog::estimate_stored_record`]) plus one STREAM_DIR entry per
+    /// distinct stream in the part, because the RLOG writer holds
     /// row-major records and does not expose an incremental encoded size. Named
     /// for the bytes it measures: it governs object geometry (object count and
     /// per-object stored size), which is what the historical `max_l1_part_bytes`
