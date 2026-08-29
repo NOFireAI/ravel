@@ -659,6 +659,48 @@ impl LogSegmentFetcher {
         self.block_range_threshold
     }
 
+    /// Whether the probe-and-range path is worth its extra round trips on an
+    /// object of `object_size` bytes whose projection is expected to read
+    /// `projected_fraction` of them (`0.0` = one column out of many, `1.0` =
+    /// every column). Answered from the catalog summary and the resolved
+    /// projection alone, with no I/O, so a scan can route a segment before it
+    /// opens it (issue #862).
+    ///
+    /// The arbiter is the request-cost model this module already runs on
+    /// ([`DEFAULT_LOG_REQUEST_COST_BYTES`]), not a second threshold. A saved
+    /// request is worth `request_cost_bytes` saved bytes; the ranged protocol
+    /// adds [`WHOLE_OBJECT_REQUEST_MULTIPLE`] round trips over one whole-object
+    /// GET; so it pays exactly when it saves more than
+    /// `WHOLE_OBJECT_REQUEST_MULTIPLE * request_cost_bytes` bytes. That product
+    /// is `BlockRangeFetcher::effective_whole_object_threshold`, which the fetch
+    /// layer already compares the WHOLE object size against -- the same question
+    /// at `projected_fraction == 0.0`. A narrower projection changes what the
+    /// ranged path SAVES, never what it costs, so the same threshold generalizes
+    /// by moving the projection into the saving.
+    ///
+    /// At or below [`Self::block_range_threshold`] the answer is always false:
+    /// there [`tenant_bytes`](Self::tenant_bytes) reads the whole object
+    /// whichever entry point opens it, so routing buys nothing and would only
+    /// add a probe.
+    ///
+    /// `projected_fraction` is an estimate, deliberately: the exact projected
+    /// byte volume is not known until PAGE_DIR is read. The byte-exact decision
+    /// still happens one layer down, in the coverage crossover
+    /// ([`DEFAULT_LOG_COVERAGE_THRESHOLD`]), which falls back to a single
+    /// whole-object GET when the projected pages turn out to cover the object
+    /// after all. This call decides only whether it is worth reading the
+    /// directory to ask. A non-finite fraction fails closed to the whole-object
+    /// read.
+    #[must_use]
+    pub fn ranged_projection_pays(&self, object_size: u64, projected_fraction: f64) -> bool {
+        if object_size <= self.block_range_threshold || !projected_fraction.is_finite() {
+            return false;
+        }
+        let fraction = projected_fraction.clamp(0.0, 1.0);
+        let saved = object_size as f64 * (1.0 - fraction);
+        saved > self.block_range.effective_whole_object_threshold() as f64
+    }
+
     /// Per-object relevance from the catalog summary alone, with no object
     /// read: true iff the segment's event-ts span (`SegmentRef`'s
     /// `min_event_ts_ns..=max_event_ts_ns`, the same bounds the footer carries)
@@ -6230,5 +6272,133 @@ mod plan_block_stats_tests {
             .expect("plan_segment_block_stats");
         assert!(got.is_none(), "ts-irrelevant segment");
         assert_eq!(store.get_count(), 0);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod ranged_projection_cost_tests {
+    //! The arithmetic behind [`LogSegmentFetcher::ranged_projection_pays`]
+    //! (issue #862), pinned at its break-even rather than at a convenient
+    //! distance from it.
+    //!
+    //! The break-even is the fetch layer's existing whole-object crossover,
+    //! `WHOLE_OBJECT_REQUEST_MULTIPLE * request_cost_bytes`, applied to the
+    //! bytes the projection SKIPS rather than to the object's whole size. Every
+    //! case below states the saving it produces and which side of that figure it
+    //! falls on.
+    //!
+    //! Note which crossover is in effect. `with_block_range_threshold` sets the
+    //! funnel's routing threshold AND the block-range fetcher's size crossover
+    //! to the same value, so a caller that sets it (every production caller does,
+    //! at `EngineConfig::logs_block_range_threshold`, 512 KiB by default) pins
+    //! the break-even to that figure rather than to the request-cost-derived
+    //! one. The tests below cover both configurations, because both ship.
+
+    use super::*;
+    use ravel_object_store::memory::MemoryStore;
+
+    /// A fetcher at the DERIVED break-even: request cost 200,000 bytes, so the
+    /// crossover is `5 * 200,000 = 1,000,000` saved bytes (above the 512 KiB
+    /// floor, which would otherwise mask the multiple). The routing threshold is
+    /// left at its 512 KiB default.
+    fn derived() -> LogSegmentFetcher {
+        let store = Arc::new(MemoryStore::new());
+        let block_range = BlockRangeFetcher::new(store.clone()).with_request_cost_bytes(200_000);
+        LogSegmentFetcher::new(store).with_block_range(block_range)
+    }
+
+    /// The routing threshold takes precedence: at or below it every entry point
+    /// reads the whole object anyway, so a probe would buy nothing.
+    #[test]
+    fn at_or_below_the_routing_threshold_never_ranges() {
+        let f = derived();
+        assert_eq!(
+            f.block_range_threshold(),
+            DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD
+        );
+        assert!(
+            !f.ranged_projection_pays(DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD, 0.0),
+            "at the threshold"
+        );
+        assert!(!f.ranged_projection_pays(0, 0.0), "a sizeless object");
+    }
+
+    /// A projection reading everything saves nothing, at any object size.
+    #[test]
+    fn a_full_projection_never_ranges() {
+        let f = derived();
+        assert!(!f.ranged_projection_pays(1_000_000_000, 1.0));
+        // Out-of-range and non-finite fractions fail closed the same way.
+        assert!(!f.ranged_projection_pays(1_000_000_000, 1.5));
+        assert!(!f.ranged_projection_pays(1_000_000_000, f64::NAN));
+    }
+
+    /// The derived break-even itself, from both sides. A 2,000,000-byte object
+    /// at a fraction of 0.5 saves exactly 1,000,000 bytes, which IS the
+    /// break-even and therefore not a win (the comparison is strict); one more
+    /// byte of saving is.
+    #[test]
+    fn the_break_even_is_five_request_costs_of_saving() {
+        let f = derived();
+        assert!(
+            !f.ranged_projection_pays(2_000_000, 0.5),
+            "saving exactly 1,000,000 bytes does not beat a 1,000,000-byte break-even"
+        );
+        assert!(
+            f.ranged_projection_pays(2_000_002, 0.5),
+            "saving 1,000,001 bytes does"
+        );
+    }
+
+    /// Raising the request cost raises the break-even proportionally: the same
+    /// object and projection that paid at a cost of 200,000 does not at
+    /// 2,000,000. This is what makes recalibrating the store recalibrate the
+    /// routing rather than needing a second knob.
+    #[test]
+    fn the_request_cost_moves_the_break_even() {
+        let store = Arc::new(MemoryStore::new());
+        let dear = LogSegmentFetcher::new(store.clone())
+            .with_block_range(BlockRangeFetcher::new(store).with_request_cost_bytes(2_000_000));
+        assert!(derived().ranged_projection_pays(2_000_002, 0.5));
+        assert!(!dear.ranged_projection_pays(2_000_002, 0.5));
+    }
+
+    /// The shipped production configuration: `with_block_range_threshold` pins
+    /// both crossovers, so the break-even is that figure and NOT the derived
+    /// one. At the 512 KiB default a 3.5 MB object -- the ClickBench reference
+    /// tenant's average after L1 compaction -- ranges for a narrow projection
+    /// and does not for a projection reading nine tenths of its columns.
+    #[test]
+    fn an_explicit_block_range_threshold_is_the_break_even() {
+        let store = Arc::new(MemoryStore::new());
+        let f = LogSegmentFetcher::new(store)
+            .with_block_range_threshold(DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD);
+        let object = 3_500_000u64;
+        assert!(
+            f.ranged_projection_pays(object, 3.0 / 115.0),
+            "a three-of-115-column projection saves ~3.4 MB, past a 512 KiB break-even"
+        );
+        assert!(
+            !f.ranged_projection_pays(object, 0.9),
+            "a nine-tenths projection saves 350 KB, short of it"
+        );
+    }
+
+    /// An explicit whole-object threshold overrides the derived break-even, so a
+    /// test fixture pinning one gets exactly the break-even it pinned. `0` makes
+    /// any nonzero saving a win.
+    #[test]
+    fn an_explicit_threshold_is_the_break_even() {
+        let store = Arc::new(MemoryStore::new());
+        let f = LogSegmentFetcher::new(store).with_block_range_threshold(0);
+        assert!(
+            f.ranged_projection_pays(1, 0.0),
+            "at a break-even of zero, any saving wins"
+        );
+        assert!(
+            !f.ranged_projection_pays(1, 1.0),
+            "a full projection still saves nothing"
+        );
     }
 }
