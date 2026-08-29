@@ -2174,10 +2174,19 @@ mod tests {
 
         // New (dict) footprint: one id per row + the distinct set once.
         let dict_figure = N * opt_u32 + DISTINCT * vec_spine + DISTINCT * LEN;
+        // Plus the slot vector `str_cols` allocates to hold that one column.
+        // It is sized by the largest column id present, so decoding column 10
+        // alone still forces 11 slots; charging it is what stops a sparse block
+        // under-reporting its resident memory. The oracle carries it rather
+        // than the assertion loosening to an inequality: an exact figure is
+        // available here, and a `>=` would stop pinning the dictionary
+        // footprint this test exists to check.
+        let slots = 11 * std::mem::size_of::<Option<StrColumn>>();
         assert_eq!(
             dec.decoded_heap_bytes(),
-            dict_figure,
-            "decoded_heap_bytes must report the dictionary footprint"
+            dict_figure + slots,
+            "decoded_heap_bytes must report the dictionary footprint plus the \
+             slot vector its column id forces"
         );
 
         // Old (fused) footprint the code must no longer report: one owned buffer
