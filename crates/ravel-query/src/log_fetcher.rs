@@ -3104,7 +3104,15 @@ impl BlockRangeFetcher {
         // a property of the derived probe length and this object's shape. A
         // window too short to reach SKIP_IDX forces the section GET below, which
         // is exactly the extra request a too-small derivation would cost.
-        if !probe_window_covers(skip_desc, total_size, self.effective_suffix_len(total_size)) {
+        // Only when THIS read issued the probe. With a carried plan footer the
+        // plan phase already probed and already recorded its own misses, so
+        // counting a hypothetical window here would double-count the same
+        // object. That matters because `probe_misses` is the figure that gates
+        // any future tightening of the floor: a metric that over-reports makes
+        // the derived probe look more dangerous than it is.
+        if plan_footer.is_none()
+            && !probe_window_covers(skip_desc, total_size, self.effective_suffix_len(total_size))
+        {
             stats.probe_misses += 1;
         }
 
@@ -3373,10 +3381,16 @@ impl BlockRangeFetcher {
         // to locate pages through, counted against the probe WINDOW rather than
         // against cache residency, so the figure reports what the probe length
         // costs on this object's shape.
+        // Same gate as the version-3 path above: only a read that actually
+        // issued the probe can miss it. A carried footer means the plan phase
+        // probed and counted, and the coverage crossover below can still decide
+        // to read the whole object, which is not a probe miss either.
         let suffix = self.effective_suffix_len(total_size);
-        for desc in [&skip_desc, &page_desc] {
-            if !probe_window_covers(desc, total_size, suffix) {
-                stats.probe_misses += 1;
+        if probed {
+            for desc in [&skip_desc, &page_desc] {
+                if !probe_window_covers(desc, total_size, suffix) {
+                    stats.probe_misses += 1;
+                }
             }
         }
 
