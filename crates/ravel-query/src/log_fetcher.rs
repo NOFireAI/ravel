@@ -1139,6 +1139,7 @@ impl LogSegmentFetcher {
                     signal = "logs",
                     s3_requests = tracing::field::Empty,
                     s3_bytes = tracing::field::Empty,
+                    probe_misses = tracing::field::Empty,
                 );
                 let (footer, skip, field_dir, stats) = async {
                     self.block_range
@@ -1150,6 +1151,11 @@ impl LogSegmentFetcher {
                 let requests = stats.probe_gets + stats.metadata_gets + stats.block_range_gets;
                 fetch_span.record("s3_requests", requests);
                 fetch_span.record("s3_bytes", stats.block_bytes_fetched);
+                // Probe misses (#883): tail sections the derived probe window did
+                // not cover, reported alongside the request and byte counts for
+                // this plan phase. A nonzero value here is the extra request a
+                // too-small derivation costs.
+                fetch_span.record("probe_misses", stats.probe_misses);
 
                 let refs: Vec<&Predicate> = query.prune.iter().collect();
                 let numeric = field_dir.numeric_range_arms(&refs);
@@ -1273,6 +1279,7 @@ impl LogSegmentFetcher {
             signal = "logs",
             s3_requests = tracing::field::Empty,
             s3_bytes = tracing::field::Empty,
+            probe_misses = tracing::field::Empty,
         );
         let (footer, stats) = async {
             self.block_range
@@ -1284,6 +1291,9 @@ impl LogSegmentFetcher {
         let requests = stats.probe_gets + stats.metadata_gets + stats.block_range_gets;
         fetch_span.record("s3_requests", requests);
         fetch_span.record("s3_bytes", stats.block_bytes_fetched);
+        // Probe misses (#883): a footer chase here is a probe too short to reach
+        // even the footer, reported per phase beside the request/byte counts.
+        fetch_span.record("probe_misses", stats.probe_misses);
 
         let n = usize::try_from(footer.block_count).map_err(|_| LogFetchError::Corrupt {
             key: seg_ref.data_object_key.clone(),
@@ -1378,6 +1388,7 @@ impl LogSegmentFetcher {
             signal = "logs",
             s3_requests = tracing::field::Empty,
             s3_bytes = tracing::field::Empty,
+            probe_misses = tracing::field::Empty,
         );
         let (skip, stats) = async {
             self.block_range
@@ -1389,6 +1400,9 @@ impl LogSegmentFetcher {
         let requests = stats.probe_gets + stats.metadata_gets + stats.block_range_gets;
         fetch_span.record("s3_requests", requests);
         fetch_span.record("s3_bytes", stats.block_bytes_fetched);
+        // Probe misses (#883): SKIP_IDX not covered by the derived probe window,
+        // reported per phase beside the request/byte counts.
+        fetch_span.record("probe_misses", stats.probe_misses);
 
         let (ts_min, ts_max) = (query.ts_min_ns, query.ts_max_ns);
         let mut record_count = 0u64;
@@ -1534,6 +1548,7 @@ impl LogSegmentFetcher {
                 signal = "logs",
                 s3_requests = tracing::field::Empty,
                 s3_bytes = tracing::field::Empty,
+                probe_misses = tracing::field::Empty,
             );
             let (bytes, stats) = async {
                 self.block_range
@@ -1554,6 +1569,10 @@ impl LogSegmentFetcher {
             let requests = stats.probe_gets + stats.metadata_gets + stats.block_range_gets;
             fetch_span.record("s3_requests", requests);
             fetch_span.record("s3_bytes", stats.block_bytes_fetched);
+            // Probe misses (#883): SKIP_IDX/PAGE_DIR (and any footer chase) not
+            // covered by the derived probe window on this scan-phase read,
+            // reported beside the request/byte counts.
+            fetch_span.record("probe_misses", stats.probe_misses);
             return Ok(Some(bytes));
         }
 
@@ -1849,8 +1868,69 @@ impl LogSegmentFetcher {
 /// object it can dominate the column chunks themselves. It is cache-routed and
 /// shared by every partition and by the plan and scan phases of one statement,
 /// which is what keeps that cost to once per object per query rather than once
-/// per read. `BlockRangeFetcher::with_suffix_len` overrides it.
+/// per read. `BlockRangeFetcher::with_suffix_len` pins it explicitly.
+///
+/// Since #883 this 256 KiB is the CEILING of a per-object derivation
+/// ([`derive_suffix_len`]), not a flat default: the fixed 256 KiB was sized for
+/// objects with far more blocks than the reference ClickBench tenant carries
+/// (mean object 3.47 MB, ~4 blocks), where it reads 7.6% of an entire object to
+/// locate a tail of tens of KB and costs a ~0.91 GB plan-phase floor across a
+/// full-corpus pass. The derivation shrinks the probe for a small object while
+/// keeping this ceiling for a wide one whose tail genuinely approaches it. The
+/// ceiling stays 256 KiB because the widest object measured (a 105-column,
+/// 128-block object, issue #766) needs a probe this large to carry footer +
+/// SKIP_IDX + PAGE_DIR past the BLOOM section between them in one GET; beyond it
+/// a longer probe is pure over-read.
 pub const DEFAULT_LOG_SUFFIX_LEN: u64 = 256 * 1024;
+
+/// Floor of the per-object suffix-probe derivation ([`derive_suffix_len`], issue
+/// #883): the smallest probe issued for any object above the whole-object
+/// threshold. The plan and scan probes must reach SKIP_IDX (and, on a version-4
+/// object, PAGE_DIR), which sit BEFORE the BLOOM section in the object, so a
+/// suffix probe reaches them only by spanning BLOOM too. On the reference
+/// ClickBench tenant BLOOM averages 86 KB (issue #766); 128 KiB covers that
+/// average plus the adjacent PAGE_DIR/SKIP_IDX/POSTINGS/footer with headroom, so
+/// a floor-sized probe still captures the plan sections of a low-block-count
+/// object in ONE request. Sized deliberately above the pre-#766 64 KiB probe,
+/// which missed SKIP_IDX on 68.8% of above-threshold objects: a miss costs a
+/// second round trip, and at ~1.8 MiB per request (`DEFAULT_LOG_REQUEST_COST\
+/// _BYTES`) trading 64 KiB of over-read for an extra GET is a large net loss.
+/// The floor is what enforces "fewer bytes at NO more requests": lowering it
+/// trades bytes for miss risk and must be validated against the per-phase
+/// [`BlockRangeStats::probe_misses`] on a real corpus first.
+pub const LOG_SUFFIX_FLOOR_BYTES: u64 = 128 * 1024;
+
+/// Divisor of the per-object suffix-probe derivation ([`derive_suffix_len`],
+/// issue #883): the probe targets `object_size / LOG_SUFFIX_SIZE_DIVISOR`,
+/// clamped to `[LOG_SUFFIX_FLOOR_BYTES, DEFAULT_LOG_SUFFIX_LEN]`. The tail a
+/// probe must reach (footer, POSTINGS, BLOOM, PAGE_DIR, SKIP_IDX) grows with the
+/// block and column count that also drives object size, so for a fixed schema
+/// the tail is a roughly constant fraction of the object and a fraction of the
+/// size is a sound proxy for it. `32` places the ceiling break-even at
+/// `DEFAULT_LOG_SUFFIX_LEN * 32` = 8 MiB (an object at or above 8 MiB probes the
+/// full 256 KiB) and the floor break-even at `LOG_SUFFIX_FLOOR_BYTES * 32` = 4
+/// MiB (an object at or below 4 MiB probes the 128 KiB floor). The reference
+/// tenant's 3.47 MB mean object therefore probes the floor, 128 KiB rather than
+/// 256 KiB: half the plan-phase probe bytes for the same one request.
+pub const LOG_SUFFIX_SIZE_DIVISOR: u64 = 32;
+
+/// The suffix-probe length for an object of `total_size` bytes when no explicit
+/// probe is pinned (issue #883): `total_size / LOG_SUFFIX_SIZE_DIVISOR` clamped
+/// to `[LOG_SUFFIX_FLOOR_BYTES, DEFAULT_LOG_SUFFIX_LEN]`. The result is not
+/// capped to `total_size` here (a probe longer than the object is a well-formed
+/// suffix GET the store returns whole); callers that need the effective,
+/// object-capped value go through [`BlockRangeFetcher::effective_suffix_len`].
+///
+/// See [`LOG_SUFFIX_FLOOR_BYTES`], [`LOG_SUFFIX_SIZE_DIVISOR`], and
+/// [`DEFAULT_LOG_SUFFIX_LEN`] for the reasoning behind each bound. A too-small
+/// result costs a second request on a probe miss, which is the exchange rate
+/// this derivation is calibrated against, so it is pinned by a test
+/// (`derives_probe_from_object_size`) and reported per phase via
+/// [`BlockRangeStats::probe_misses`].
+#[must_use]
+pub fn derive_suffix_len(total_size: u64) -> u64 {
+    (total_size / LOG_SUFFIX_SIZE_DIVISOR).clamp(LOG_SUFFIX_FLOOR_BYTES, DEFAULT_LOG_SUFFIX_LEN)
+}
 
 /// Default cost of one store request, expressed as a latency-bandwidth product:
 /// the byte volume whose transfer time (at the store's single-stream bandwidth)
@@ -2105,7 +2185,10 @@ pub struct BlockRangeFetcher {
     /// section. `None` sends every GET to the store. Either tier configuration
     /// (see [`ReadCache`]); every production caller builds the RAM variant.
     cache: Option<ReadCache>,
-    suffix_len: u64,
+    /// Suffix-probe length. `None` derives it per object from the object size
+    /// ([`derive_suffix_len`], issue #883); `Some(n)` pins it, which the tests
+    /// use to force an exact probe window. See [`Self::effective_suffix_len`].
+    suffix_len: Option<u64>,
     /// Coalescing gap. `None` derives it from `request_cost_bytes` (the
     /// principled default); `Some(n)` pins it, which the tests use to force an
     /// exact run count. See [`Self::effective_coalesce_gap`].
@@ -2131,7 +2214,7 @@ impl BlockRangeFetcher {
             store,
             cfg: RlogConfig::default(),
             cache: None,
-            suffix_len: DEFAULT_LOG_SUFFIX_LEN,
+            suffix_len: None,
             coalesce_gap: None,
             whole_object_threshold: None,
             coverage_threshold: DEFAULT_LOG_COVERAGE_THRESHOLD,
@@ -2152,10 +2235,29 @@ impl BlockRangeFetcher {
         self
     }
 
+    /// Pins the suffix-probe length explicitly, overriding the per-object
+    /// derivation ([`derive_suffix_len`], issue #883). The tests use this to
+    /// force an exact probe window; production callers leave it unset so each
+    /// object is probed proportionally to its size.
     #[must_use]
     pub fn with_suffix_len(mut self, n: u64) -> Self {
-        self.suffix_len = n.max(1);
+        self.suffix_len = Some(n.max(1));
         self
+    }
+
+    /// The suffix-probe length in effect for an object of `total_size` bytes: an
+    /// explicit [`Self::with_suffix_len`] override when set, else the per-object
+    /// derivation [`derive_suffix_len`] (issue #883). Capped to `total_size` (a
+    /// probe cannot read more than the object) and floored at 1 (a zero-length
+    /// suffix is not a valid GET; a zero-size object is handled before any
+    /// probe). This is the single place every probe site computes its window, so
+    /// the derivation, the [`BlockRangeStats::probe_misses`] window check, and
+    /// the cache key all agree on one length per object.
+    fn effective_suffix_len(&self, total_size: u64) -> u64 {
+        let want = self
+            .suffix_len
+            .unwrap_or_else(|| derive_suffix_len(total_size));
+        want.min(total_size).max(1)
     }
 
     #[must_use]
@@ -2414,7 +2516,7 @@ impl BlockRangeFetcher {
         let key = seg_ref.data_object_key.as_str();
         let total_size = seg_ref.object_size;
 
-        let suffix = self.suffix_len.min(total_size);
+        let suffix = self.effective_suffix_len(total_size);
         let probe_start = total_size - suffix;
         let (probe_bytes, probe_live) = self
             .cached_extent(
@@ -2437,6 +2539,11 @@ impl BlockRangeFetcher {
         {
             SuffixOutcome::Ready(footer) => footer,
             SuffixOutcome::NeedRange { offset, len } => {
+                // The probe suffix did not even reach the footer: a probe miss
+                // that forces a follow-up request (#883). Counted against the
+                // window, so it fires whether or not this call's chase GET was a
+                // cache hit, matching the tail-section miss accounting.
+                stats.probe_misses += 1;
                 let (bytes, live) = self
                     .cached_extent(
                         seg_ref,
@@ -2564,7 +2671,7 @@ impl BlockRangeFetcher {
         stats: &mut BlockRangeStats,
     ) -> Result<(), LogFetchError> {
         let total_size = seg_ref.object_size;
-        let suffix = self.suffix_len.min(total_size);
+        let suffix = self.effective_suffix_len(total_size);
         let mut missing: Vec<ByteExtent> = Vec::new();
         for &k in kinds {
             let Some(desc) = footer.section(k) else {
@@ -2893,7 +3000,7 @@ impl BlockRangeFetcher {
         let footer = match plan_footer {
             Some(f) => f.clone(),
             None => {
-                let suffix = self.suffix_len.min(total_size);
+                let suffix = self.effective_suffix_len(total_size);
                 let probe_start = total_size - suffix;
                 let (probe_bytes, probe_live) = self
                     .cached_extent(
@@ -2918,6 +3025,10 @@ impl BlockRangeFetcher {
                 {
                     SuffixOutcome::Ready(footer) => footer,
                     SuffixOutcome::NeedRange { offset, len } => {
+                        // The probe suffix did not reach the footer: a probe
+                        // miss forcing a follow-up request (#883), counted
+                        // against the window like the tail-section misses below.
+                        stats.probe_misses += 1;
                         let (bytes, live) = self
                             .cached_extent(
                                 seg_ref,
@@ -2985,6 +3096,17 @@ impl BlockRangeFetcher {
         let blocks_desc = footer
             .section(kind::BLOCKS)
             .ok_or_else(|| corrupt(key, LogSegError::Corrupted("missing BLOCKS".into())))?;
+
+        // Residual miss rate for the version-3 scan path (#883, mirroring the
+        // version-4 path and `ensure_tail_plan_sections`): SKIP_IDX is the tail
+        // section this read locates candidate blocks through, counted against
+        // the probe WINDOW rather than against cache residency, so the figure is
+        // a property of the derived probe length and this object's shape. A
+        // window too short to reach SKIP_IDX forces the section GET below, which
+        // is exactly the extra request a too-small derivation would cost.
+        if !probe_window_covers(skip_desc, total_size, self.effective_suffix_len(total_size)) {
+            stats.probe_misses += 1;
+        }
 
         // SKIP_IDX first, and nothing the candidate set does not need. The
         // coverage crossover below can decide the whole object is cheaper than
@@ -3251,7 +3373,7 @@ impl BlockRangeFetcher {
         // to locate pages through, counted against the probe WINDOW rather than
         // against cache residency, so the figure reports what the probe length
         // costs on this object's shape.
-        let suffix = self.suffix_len.min(total_size);
+        let suffix = self.effective_suffix_len(total_size);
         for desc in [&skip_desc, &page_desc] {
             if !probe_window_covers(desc, total_size, suffix) {
                 stats.probe_misses += 1;
