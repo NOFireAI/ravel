@@ -361,9 +361,11 @@ fn subset_object() -> (Vec<LogRecord>, Vec<u8>) {
 
 /// The block-range path's decoded rows are byte-identical to the whole-object
 /// path's over the same candidate (ts) set, even though the block-range buffer
-/// holds only the candidate blocks (pruned blocks are zeroed gaps the reader
-/// never touches). The probe suffix is sized to the tail only, so the ranged
-/// path genuinely range-fetches the front metadata and the candidate blocks.
+/// holds only the candidate blocks (pruned blocks are gaps the reader never
+/// touches; issue #894 leaves them holding a pooled buffer's prior contents
+/// rather than zero, which the fail-closed `slice` keeps unreadable). The probe
+/// suffix is sized to the tail only, so the ranged path genuinely range-fetches
+/// the front metadata and the candidate blocks.
 #[tokio::test]
 async fn block_range_rows_match_whole_object_over_same_candidate_set() {
     let (records, bytes) = subset_object();
