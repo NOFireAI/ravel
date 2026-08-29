@@ -14,11 +14,14 @@
 //! appears in only one input already is one run: it is copied verbatim with no
 //! provenance column (byte-identical to the L0 shape), which costs nothing.
 //!
-//! Parts are split on ENCODED OUTPUT page bytes (ADR-0092 decision 3), not on
-//! input catalog byte ranges: after run merging the output size is a function of
-//! the data's shape through per-page codec selection, so the input-byte figure
-//! no longer predicts it. Input page bytes are retained only as a fetch-buffer
-//! bound (the window below). A series' runs never straddle a part and part
+//! Parts are split on ENCODED OUTPUT bytes (ADR-0092 decision 3), not on input
+//! catalog byte ranges: after run merging the output size is a function of the
+//! data's shape through per-page codec selection, so the input-byte figure no
+//! longer predicts it. The output figure is every section that grows with what
+//! the part carries -- pages, SERIES_IDS, SERIES_META (including the per-sample
+//! provenance columns), LABEL_DICT, EXEMPLARS -- so what the split rule counts
+//! is the object it is about to write; see `PartSizeEstimate`. Input page bytes
+//! are retained only as a fetch-buffer bound (the window below). A series' runs never straddle a part and part
 //! id-ranges are disjoint, since series are emitted in ascending id order and a
 //! part is a contiguous id range. Each finished part is a whole object written
 //! with a single `CreateIfAbsent` PUT (no multipart), and its encoded bytes are
@@ -47,7 +50,7 @@
 //! real object storage. Each window's series are materialized (decoded, merged,
 //! re-encoded) in ascending id order and the window's fetched buffers are then
 //! dropped, so peak fetch buffering is one window's worth. A part accumulates
-//! re-encoded series across windows until its OUTPUT page bytes reach
+//! re-encoded series across windows until its estimated STORED bytes reach
 //! `max_l1_part_bytes`, checked between series; the encoded parts held until
 //! publish, plus one series' decoded samples at a time, dominate peak memory.
 //! Neither of those two terms is sized by a config knob: the retained parts grow
@@ -235,34 +238,37 @@ pub async fn build_parts(
     let mut part_index: u32 = 0;
 
     // The rolling output part: series already decoded, merged, and re-encoded
-    // whose accumulated ENCODED page bytes have not yet reached
+    // whose accumulated ENCODED STORED bytes have not yet reached
     // `max_l1_part_bytes`. Part boundaries are chosen on output bytes (ADR-0092
     // decision 3), which after run merging no longer track input bytes, so a
     // part may span several fetch windows and a window may finish several parts.
     //
     // On this RSEG path `max_l1_part_bytes` is used for exactly what its name
-    // (the stored-size target, issue #872) means: real encoded output bytes.
+    // (the stored-size target, issue #872) means: the bytes of the object about
+    // to be written. `PartSizeEstimate` charges every section that grows with
+    // the data, not the pages alone.
+    //
     // `l1_part_memory_target_bytes` is not read here at all, so no configured
     // number sizes this builder's heap. What it holds at once is one fetch
-    // window's raw pages (the same figure applied to INPUT page bytes), one
-    // series' decoded samples while `materialize_series` decodes, merges, and
-    // re-encodes its runs (bounded by that series' own size and by nothing
+    // window's raw pages (the stored-size target applied to INPUT page bytes),
+    // one series' decoded samples while `materialize_series` decodes, merges,
+    // and re-encodes its runs (bounded by that series' own size and by nothing
     // configurable), and every finished part's encoded bytes, which are retained
     // until publish so convergence repair can re-PUT one. The pending output
     // part is the only term `max_l1_part_bytes` sizes, and it is checked between
     // series, so that term runs one whole series past the target.
     let mut pending: Vec<SeriesInputV7> = Vec::new();
     let mut pending_exemplars: Vec<ExemplarInput> = Vec::new();
-    let mut pending_output_bytes: u64 = 0;
+    let mut pending_estimate = PartSizeEstimate::new();
     let mut exemplars_assigned = 0usize;
 
     // Accumulate consecutive series into a fetch window until their INPUT page
     // bytes reach the cap (the fetch-buffer bound; the last series closes the
     // final window). Fetch that window's pages (coalesced + concurrent),
     // materialize each series in ascending id order into a run-merged
-    // `SeriesInputV7`, and flush a part whenever the pending output reaches the
-    // cap. A single series whose output alone exceeds the cap becomes its own
-    // part. Series stay in ascending id order throughout, so every part is a
+    // `SeriesInputV7`, and flush a part whenever the pending part's stored-size
+    // estimate reaches the target. A single series whose own stored bytes exceed
+    // it becomes its own part. Series stay in ascending id order throughout, so every part is a
     // contiguous, disjoint id range.
     let mut window_start = 0usize;
     let mut window_input_bytes: u64 = 0;
@@ -275,15 +281,15 @@ pub async fn build_parts(
         let window = &builds[window_start..=i];
         let regions = fetch_batch_pages(store, &semaphore, window).await?;
         for build in window {
-            let (series_v7, output_bytes) =
-                materialize_series(build, &regions, migrate_keys, limits)?;
+            let series_v7 = materialize_series(build, &regions, migrate_keys, limits)?;
+            pending_estimate.push_series(&series_v7);
             pending.push(series_v7);
-            pending_output_bytes = pending_output_bytes.saturating_add(output_bytes);
             if let Some(mut records) = exemplars_by_series.remove(&build.series_id.0) {
                 exemplars_assigned += records.len();
+                pending_estimate.push_exemplars(&records);
                 pending_exemplars.append(&mut records);
             }
-            if pending_output_bytes >= config.max_l1_part_bytes {
+            if pending_estimate.bytes() >= config.max_l1_part_bytes {
                 let part = flush_part(
                     bucket,
                     config,
@@ -299,14 +305,14 @@ pub async fn build_parts(
                 }
                 parts.push(part);
                 part_index += 1;
-                pending_output_bytes = 0;
+                pending_estimate.reset();
             }
         }
         window_start = i + 1;
         window_input_bytes = 0;
     }
 
-    // The tail part: whatever series remain below the cap.
+    // The tail part: whatever series remain below the stored-size target.
     if !pending.is_empty() {
         let part = flush_part(
             bucket,
@@ -350,7 +356,8 @@ pub async fn build_parts(
 /// One output series' merge plan without its page bytes: identity, borrowed
 /// labels, and its ordered runs (each tagged with the input object to fetch
 /// from), plus the total INPUT page bytes those runs contribute to a fetch
-/// window (the fetch-buffer bound; part sizing is on output bytes).
+/// window (the fetch-buffer bound; part sizing is on the output's stored-size
+/// estimate).
 struct SeriesBuild<'a> {
     series_id: SeriesId,
     labels: &'a LabelSet,
@@ -443,8 +450,9 @@ async fn fetch_one_range<'a>(
 }
 
 /// Decode, merge, and re-encode one series into a single run-merged
-/// [`SeriesInputV7`], returning it with its encoded output page-byte size (the
-/// figure `build_parts` splits parts on, ADR-0092 decision 3).
+/// [`SeriesInputV7`]. What it contributes to the part's stored-size estimate
+/// (the figure `build_parts` splits parts on, ADR-0092 decision 3) is charged
+/// by [`PartSizeEstimate::push_series`] from the returned value.
 ///
 /// A series with exactly one contributing run is already one run: it is copied
 /// verbatim (no per-sample provenance column, so the merged object stays
@@ -461,7 +469,7 @@ fn materialize_series(
     regions: &BatchRegions<'_>,
     migrate_keys: &HashSet<String>,
     limits: ReaderLimits,
-) -> Result<(SeriesInputV7, u64)> {
+) -> Result<SeriesInputV7> {
     let series_id = build.series_id;
     let kind = match build.runs.first() {
         Some((_, run)) => run.kind,
@@ -511,18 +519,14 @@ fn materialize_series(
                 value_page,
             }
         };
-        let output_bytes = run_output_bytes(&run_v4);
-        return Ok((
-            SeriesInputV7 {
-                series_id,
-                labels: build.labels.clone(),
-                runs: vec![RunInputV7 {
-                    run: run_v4,
-                    provenance: None,
-                }],
-            },
-            output_bytes,
-        ));
+        return Ok(SeriesInputV7 {
+            series_id,
+            labels: build.labels.clone(),
+            runs: vec![RunInputV7 {
+                run: run_v4,
+                provenance: None,
+            }],
+        });
     }
 
     // Multi-run merge: decode every run, tagging each sample with its run's
@@ -534,31 +538,170 @@ fn materialize_series(
         ValueKind::Scalar => merge_scalar_runs(&series_id, build, regions, limits)?,
         ValueKind::Histogram => merge_histogram_runs(&series_id, build, regions, limits)?,
     };
-    let output_bytes = run_output_bytes(&run_v4);
-    Ok((
-        SeriesInputV7 {
-            series_id,
-            labels: build.labels.clone(),
-            runs: vec![RunInputV7 {
-                run: run_v4,
-                provenance: Some(provenance),
-            }],
-        },
-        output_bytes,
-    ))
+    Ok(SeriesInputV7 {
+        series_id,
+        labels: build.labels.clone(),
+        runs: vec![RunInputV7 {
+            run: run_v4,
+            provenance: Some(provenance),
+        }],
+    })
 }
 
-/// The encoded output page bytes one run contributes to a part, the counterpart
-/// of the input `page_bytes` figure a fetch window is bounded by. Provenance
-/// columns live in the zstd-compressed SERIES_META, not the page sections, so
-/// they are not counted here; part sizing tracks the TS/VAL/HIST page sections,
-/// which dominate object size, exactly as the pre-merge input figure did.
-fn run_output_bytes(run: &RunInputV4) -> u64 {
+/// The framed TS and VAL-or-HIST page bytes one run contributes to a part: the
+/// page sections' share of the stored object, and the counterpart of the input
+/// `page_bytes` figure a fetch window is bounded by. Each page's `enc`/`comp`/
+/// `crc32c` header is already inside these buffers, which hold the page exactly
+/// as it lands in the object. The catalog, dictionary, provenance and exemplar
+/// sections are charged separately by [`PartSizeEstimate`].
+fn run_page_bytes(run: &RunInputV4) -> u64 {
     let value_len = match &run.value_page {
         RunValuePageV4::Scalar(p) => p.len(),
         RunValuePageV4::Histogram(p) => p.len(),
     };
     run.ts_page.len() as u64 + value_len as u64
+}
+
+/// Fixed encoded cost every part pays before it carries anything: the
+/// FooterProto (identity, event and ingest bounds, compaction provenance, and
+/// one `Section` entry per section), the 16-byte trailer, and the zero padding
+/// the writer inserts to 8-byte-align VAL_PAGES (docs/segment-format.md). A
+/// deliberately flat figure at the top of that range, in the same spirit as the
+/// RLOG merge's `STORED_RECORD_FIXED_BYTES`: it does not grow with what the
+/// part carries, so it needs no per-item term.
+const STORED_PART_FIXED_BYTES: u64 = 512;
+
+/// Fixed encoded cost one series adds beyond its label strings and its runs:
+/// its 16-byte SERIES_IDS entry (never zstd-compressed, BLAKE3 ids being
+/// incompressible), its series-major SERIES_META cells (`schema_ref`, the
+/// schema's value ordinals, `value_kind`, `run_count`), and, at or above the
+/// sparse-emission threshold, its SERIES_IDX entry.
+const STORED_SERIES_FIXED_BYTES: u64 = 48;
+
+/// Fixed encoded cost one run adds: the twelve run-major SERIES_META varints
+/// (blocks 5-16 of docs/segment-format.md), every one of them a delta, a count
+/// or a page length. A flat figure at the top of the range those varints
+/// occupy.
+const STORED_RUN_FIXED_BYTES: u64 = 24;
+
+/// Encoded cost per sample of a run that carries the optional per-sample dedup
+/// provenance columns (blocks 17-21). Charged only for a run-merged run: a
+/// single-run series copies through with `provenance: None` and the columns
+/// cost it nothing, which is the format's canonical "no provenance" form.
+///
+/// A flat figure at the top of the range those four codec-encoded columns cost
+/// per sample before the section's zstd. `prov_created_delta`, `prov_epoch` and
+/// `prov_seq` are constant across all the samples one source write
+/// contributed, so `ravel_codec::encode_i64` picks a run-length or delta form
+/// and they cost well under a byte per sample; `prov_in_page_index` walks the
+/// source pages' positions, so it delta-encodes to about one.
+const STORED_PROVENANCE_SAMPLE_BYTES: u64 = 4;
+
+/// Fixed encoded cost of one LABEL_DICT entry beyond the string's own bytes:
+/// its length varint.
+const STORED_DICT_ENTRY_BYTES: u64 = 2;
+
+/// Fixed encoded cost of one EXEMPLARS record beyond its attribute ordinals:
+/// the `series_index` and `ts_delta` varints, the 8-byte value, the 16-byte
+/// trace id, the 8-byte span id, and `attr_count`.
+const STORED_EXEMPLAR_FIXED_BYTES: u64 = 40;
+
+/// Encoded cost of one exemplar attribute pair: its two LABEL_DICT ordinal
+/// varints. The strings themselves intern into the object's LABEL_DICT and are
+/// charged there, once per part, exactly as a series label is.
+const STORED_EXEMPLAR_ATTR_BYTES: u64 = 4;
+
+/// The estimated stored size of the in-progress part, the figure compared
+/// against [`CompactorConfig::max_l1_part_bytes`].
+///
+/// The knob is named for on-object bytes, so this counts every RSEG section
+/// that grows with what the part carries: the TS/VAL/HIST pages
+/// ([`run_page_bytes`]), each series' SERIES_IDS entry and series-major
+/// SERIES_META cells, each run's run-major cells, the per-sample provenance
+/// columns a run-merged run adds, each distinct LABEL_DICT string, and the
+/// EXEMPLARS records. Charging the pages alone left the provenance columns,
+/// the dictionary and the exemplars out, and all three grow with the data, so
+/// the stored object could pass the target while the estimate stayed under it
+/// and the excess accumulated from one series to the next.
+///
+/// Like the RLOG estimate ([`crate::rlog::estimate_stored_record`]) this is a
+/// pre-compression proxy: LABEL_DICT and SERIES_META are zstd-compressed
+/// sections, so what is charged for them is an upper bound on what they store,
+/// which is the conservative direction for a geometry knob. And like it, the
+/// estimate only decides where parts split, never correctness: the writer
+/// produces the same bytes for a given series set however the series were
+/// partitioned across parts.
+struct PartSizeEstimate {
+    bytes: u64,
+    /// LABEL_DICT interns each distinct string once per object, so a string is
+    /// charged once per part rather than once per series or exemplar that
+    /// names it. A part that closes and reopens on the same label pays for it
+    /// in both, because both objects carry the entry.
+    charged_dict: HashSet<String>,
+}
+
+impl PartSizeEstimate {
+    fn new() -> Self {
+        Self {
+            bytes: STORED_PART_FIXED_BYTES,
+            charged_dict: HashSet::new(),
+        }
+    }
+
+    /// Start the next part: the fixed footer cost again, and an empty
+    /// dictionary, since the new object interns its own strings from scratch.
+    fn reset(&mut self) {
+        self.bytes = STORED_PART_FIXED_BYTES;
+        self.charged_dict.clear();
+    }
+
+    fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    fn charge_dict_string(&mut self, s: &str) {
+        if !self.charged_dict.contains(s) {
+            self.charged_dict.insert(s.to_string());
+            self.bytes = self
+                .bytes
+                .saturating_add(s.len() as u64)
+                .saturating_add(STORED_DICT_ENTRY_BYTES);
+        }
+    }
+
+    fn push_series(&mut self, series: &SeriesInputV7) {
+        self.bytes = self.bytes.saturating_add(STORED_SERIES_FIXED_BYTES);
+        for label in series.labels.iter() {
+            self.charge_dict_string(&label.name);
+            self.charge_dict_string(&label.value);
+        }
+        for run in &series.runs {
+            self.bytes = self
+                .bytes
+                .saturating_add(STORED_RUN_FIXED_BYTES)
+                .saturating_add(run_page_bytes(&run.run));
+            if let Some(provenance) = &run.provenance {
+                self.bytes = self.bytes.saturating_add(
+                    (provenance.len() as u64).saturating_mul(STORED_PROVENANCE_SAMPLE_BYTES),
+                );
+            }
+        }
+    }
+
+    fn push_exemplars(&mut self, records: &[ExemplarInput]) {
+        for record in records {
+            self.bytes = self
+                .bytes
+                .saturating_add(STORED_EXEMPLAR_FIXED_BYTES)
+                .saturating_add(
+                    (record.attrs.len() as u64).saturating_mul(STORED_EXEMPLAR_ATTR_BYTES),
+                );
+            for (name, value) in &record.attrs {
+                self.charge_dict_string(name);
+                self.charge_dict_string(value);
+            }
+        }
+    }
 }
 
 /// A sample's full ADR-0010 §5 dedup key, the ordering key within one
