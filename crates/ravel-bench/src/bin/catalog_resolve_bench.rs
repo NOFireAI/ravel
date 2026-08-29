@@ -219,6 +219,11 @@ async fn publish_lightweight(
         max_event_ts_ns: created_unix_ns,
         min_ingest_ts_ns: created_unix_ns - 1_000,
         max_ingest_ts_ns: created_unix_ns,
+        // The payload above is a raw string, not an RSEG object: this helper
+        // bypasses SegmentWriter and the resolve scenario never decodes it, so
+        // the version routes nothing. Kept a literal (no writer constant fits)
+        // rather than a real format version, which would falsely advertise
+        // decodable bytes.
         segment_format_version: 1,
         created_unix_ns,
         ingest_hour_bucket,
@@ -291,7 +296,7 @@ async fn publish_real_segment(
         max_event_ts_ns: written.summary.max_event_ts_ns,
         min_ingest_ts_ns: written.summary.min_event_ts_ns,
         max_ingest_ts_ns: written.summary.max_event_ts_ns,
-        segment_format_version: 1,
+        segment_format_version: u32::from(ravel_segment::SUPPORTED_VERSIONS.newest()),
         created_unix_ns,
         ingest_hour_bucket,
     };

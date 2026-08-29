@@ -1880,7 +1880,7 @@ async fn generate_dataset(
             max_event_ts_ns: max,
             min_ingest_ts_ns: min,
             max_ingest_ts_ns: max,
-            segment_format_version: 1,
+            segment_format_version: u32::from(ravel_logseg::footer::VERSION),
             created_unix_ns: 10,
             ingest_hour_bucket: 0,
         };
@@ -2009,7 +2009,7 @@ mod tests {
                 max_event_ts_ns: rec.ts_ns,
                 min_ingest_ts_ns: rec.ts_ns,
                 max_ingest_ts_ns: rec.ts_ns,
-                segment_format_version: 1,
+                segment_format_version: u32::from(ravel_logseg::footer::VERSION),
                 created_unix_ns: 10,
                 ingest_hour_bucket: 0,
             };
