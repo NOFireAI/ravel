@@ -293,7 +293,12 @@ async fn mock_s3_handler(
                             .body(Body::empty())
                             .expect("build response"),
                         Some(Some((start, end))) => {
+                            // Content-Length is the length the GET would
+                            // return, computed before the HEAD body is
+                            // suppressed. Deriving it from the sent body makes
+                            // every object look zero-length to `S3Store::head`.
                             let slice = bytes.slice(start..end + 1);
+                            let content_length = slice.len();
                             let response_body = if method == Method::HEAD {
                                 Bytes::new()
                             } else {
@@ -303,12 +308,14 @@ async fn mock_s3_handler(
                                 .status(StatusCode::PARTIAL_CONTENT)
                                 .header("ETag", etag.clone())
                                 .header("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT")
-                                .header("Content-Length", response_body.len().to_string())
+                                .header("Content-Length", content_length.to_string())
                                 .header("Content-Range", format!("bytes {start}-{end}/{len}"))
                                 .body(Body::from(response_body))
                                 .expect("build response")
                         }
                         None => {
+                            // Same rule as the ranged arm: the full
+                            // representation length, not the sent body length.
                             let response_body = if method == Method::HEAD {
                                 Bytes::new()
                             } else {
@@ -318,7 +325,7 @@ async fn mock_s3_handler(
                                 .status(StatusCode::OK)
                                 .header("ETag", etag.clone())
                                 .header("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT")
-                                .header("Content-Length", response_body.len().to_string())
+                                .header("Content-Length", len.to_string())
                                 .body(Body::from(response_body))
                                 .expect("build response")
                         }
