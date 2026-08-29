@@ -63,7 +63,7 @@ trap 'rm -f "${findings_file}" "${sources_file}"' EXIT
 find "${roots[@]}" -type f -name '*.rs' \
   -not -path '*/target/*' \
   -not -path '*/node_modules/*' \
-  | sort >"${sources_file}"
+  -print0 | sort -z >"${sources_file}"
 
 if [[ ! -s "${sources_file}" ]]; then
   echo "check-test-hygiene.sh: no Rust sources under ${roots[*]}" >&2
@@ -250,7 +250,14 @@ FNR == 1 {
 }
 END { if (nlines > 0) scan() }
 '
-xargs awk "${awk_prog}" <"${sources_file}" >"${findings_file}"
+scan_status=0
+xargs -0 awk "${awk_prog}" <"${sources_file}" >"${findings_file}" || scan_status=$?
+if [[ "${scan_status}" -ne 0 ]]; then
+  echo "check-test-hygiene.sh: the source scan failed (exit ${scan_status})." >&2
+  echo "  Refusing to report a result: an empty findings file after a failed" >&2
+  echo "  scan is indistinguishable from a clean tree." >&2
+  exit 70
+fi
 
 # --- rule 3 ----------------------------------------------------------------
 #
@@ -259,7 +266,7 @@ xargs awk "${awk_prog}" <"${sources_file}" >"${findings_file}"
 # `src/`, and `<dir>/<name>.proptest-regressions` for one under `tests/`. Both
 # forms exist in this repo. A seed that exists but is untracked, or that a
 # .gitignore covers, is never replayed by `cargo test`.
-while IFS= read -r src; do
+while IFS= read -r -d '' src; do
   grep -q 'proptest!' "${src}" || continue
   case "${src}" in
     */src/*)
@@ -285,13 +292,34 @@ done <"${sources_file}"
 # A `failure_persistence` override can switch seed writing off entirely, and
 # then rule 3 has no file to find. Flag every occurrence: there is no
 # legitimate use of it here.
-xargs grep -Hn 'failure_persistence' <"${sources_file}" 2>/dev/null \
-  | sed 's/^\([^:]*:[0-9]*\):.*$/\1: proptest-seed: failure_persistence override can disable seed writing; the caught case is then lost/' \
-    >>"${findings_file}"
+persistence_hits="$(mktemp "${TMPDIR:-/tmp}/ravel-test-hygiene-fp.XXXXXX")"
+persistence_status=0
+xargs -0 grep -Hn 'failure_persistence' <"${sources_file}" >"${persistence_hits}" \
+  || persistence_status=$?
+# Exit codes here are genuinely ambiguous and differ between implementations.
+# GNU xargs reports 123 when the utility exited 1-125 on any input, mapping
+# grep's "no match" (1) and its "read error" (2) to one code; BSD xargs was
+# observed propagating grep's own 1 instead. So neither 1 nor 123 identifies a
+# clean result on its own, and treating either as failure breaks the common
+# case of simply finding nothing.
+#
+# What IS unambiguous: 0, 1 and 123 all mean the scan ran. Anything else --
+# a signal, a missing utility, an unreadable list -- means it did not, and the
+# guard must refuse rather than read an empty hit file as clean.
+if [[ "${persistence_status}" -ne 0 \
+   && "${persistence_status}" -ne 1 \
+   && "${persistence_status}" -ne 123 ]]; then
+  echo "check-test-hygiene.sh: the failure_persistence scan failed (exit ${persistence_status})." >&2
+  rm -f "${persistence_hits}"
+  exit 70
+fi
+sed 's/^\([^:]*:[0-9]*\):.*$/\1: proptest-seed: failure_persistence override can disable seed writing; the caught case is then lost/' \
+  <"${persistence_hits}" >>"${findings_file}"
+rm -f "${persistence_hits}"
 
 count=$(grep -c '' "${findings_file}")
 if [[ "${count}" -eq 0 ]]; then
-  echo "check-test-hygiene.sh: clean ($(grep -c '' "${sources_file}") Rust sources)"
+  echo "check-test-hygiene.sh: clean ($(tr -cd '\0' <"${sources_file}" | wc -c | tr -d ' ') Rust sources)"
   exit 0
 fi
 
