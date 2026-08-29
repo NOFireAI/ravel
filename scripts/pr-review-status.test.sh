@@ -151,6 +151,24 @@ check_outside "human review quoting the marker is NOT counted" 0 "$(cat <<EOF
 EOF
 )"
 
+# The bot itself quotes the heading when it discusses this mechanism, and a
+# quote is not a finding. This is the case the user filter above does NOT
+# cover: same phrase, same line, bot author, current head -- and no <summary>
+# element, because nothing was actually reported. Matching the phrase rather
+# than the emitted element counted this and blocked a clean PR.
+check_outside "bot review quoting the marker in prose is NOT counted" 0 "$(cat <<EOF
+[{"user":{"login":"coderabbitai[bot]"},"commit_id":"${SHA}",
+  "body":"Line 40 counts any same-line prose containing Outside diff range comments (1), which is a false positive."}]
+EOF
+)"
+
+# Backticked inline code is the same shape and must not count either.
+check_outside "bot review with the marker in inline code is NOT counted" 0 "$(cat <<EOF
+[{"user":{"login":"coderabbitai[bot]"},"commit_id":"${SHA}",
+  "body":"Match the emitted \`⚠️ Outside diff range comments (1)\` summary marker instead of the phrase."}]
+EOF
+)"
+
 # --- end-to-end verdict, pr-review-status.sh ------------------------------
 #
 # The count above only matters if it flips the verdict. These run the real

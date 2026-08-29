@@ -26,10 +26,23 @@
 #   finding, which trains an operator to pass --confirm-addressed reflexively
 #   and puts us back where #908 started.
 #
-# The pattern requires "Outside diff range" and, on the SAME line, the word
-# "comment"/"comments". That is the shape of every emitted heading, including
-# the older "Outside diff range and nitpick comments (N)" variant, and it does
-# not fire on prose that merely uses the phrase across a sentence.
+# The pattern requires the emitted <summary> ELEMENT, not the phrase. The bot
+# writes the heading as
+#
+#   > <summary>⚠️ Outside diff range comments (1)</summary>
+#
+# so the match is anchored on <summary> ... </summary> with "Outside diff
+# range" and "comment"/"comments" inside it, on one line. Matching the phrase
+# alone was wrong in a way that is easy to reproduce: a review that QUOTES the
+# heading in ordinary prose -- discussing this very mechanism, for instance --
+# contains the phrase and the word on one line and would be counted as a
+# finding, blocking a clean PR. That is a false block rather than the false
+# clear #908 was about, but a checker that cries wolf while discussing itself
+# trains the operator to pass --confirm-addressed reflexively, which lands back
+# at the same place.
+#
+# The older "Outside diff range and nitpick comments (N)" variant is emitted in
+# the same element and is still matched.
 #
 # Counting rule: the heading carries the number of findings in the block in
 # parentheses, so a heading with a count contributes that count, and a heading
@@ -37,7 +50,7 @@
 # reviews at the same head, sum.
 def outside_diff_count:
   [
-    match("Outside diff range[^\\n]*comments?[^\\n]*"; "g")
+    match("<summary>[^\\n]*Outside diff range[^\\n]*comments?[^\\n]*</summary>"; "g")
     | .string
     | ((capture("\\((?<n>[0-9]+)\\)") | .n | tonumber) // 1)
   ]
