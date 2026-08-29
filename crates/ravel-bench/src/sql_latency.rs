@@ -286,6 +286,20 @@ pub struct Provenance {
     /// [`recorded_warm_catalog`].
     #[serde(default)]
     pub warm_catalog: Option<bool>,
+    /// The logs suffix-probe length (`--logs-suffix-len`, issue #883) that
+    /// governed this run's log reads, or `None` when the per-object derivation
+    /// ([`ravel_query::derive_suffix_len`]) governed instead. Recorded so a
+    /// probe sweep's arms are distinguishable: one report per pinned window, and
+    /// an arm that cannot say which window produced it is not a measurement.
+    ///
+    /// `Some(n)` for an in-process lane (`generate`/`tenant`) with the flag set;
+    /// `None` when the flag was unset (derivation governs). The Flight lane
+    /// records `None` even when the flag was set: it builds no in-process
+    /// fetcher, the setting is not on the Flight wire, and no `ravel-server`
+    /// flag corresponds to it, so the pinned window governed nothing there --
+    /// exactly as the effective-ceiling fields above record `None` on that lane.
+    #[serde(default)]
+    pub logs_suffix_len: Option<u64>,
     /// The Flight SQL endpoint (`host:port`) the statements were executed
     /// against, or `None` for an in-process lane. Deliberately not `endpoint`
     /// above: that one names the object store, and the two are different
@@ -629,6 +643,14 @@ pub struct GenerateConfig {
     /// a cold-per-statement bench diverges from it by re-paying the resolve
     /// GETs each time (issue #857).
     pub warm_catalog: bool,
+    /// Pin the logs suffix-probe window to this many bytes, or `None` for the
+    /// per-object derivation ([`ravel_query::derive_suffix_len`], issue #883).
+    /// `None` leaves today's derivation byte-for-byte untouched; `Some(n)`
+    /// reaches [`ExecutorSettings::logs_suffix_len`] and so
+    /// [`ravel_query::LogSegmentFetcher::with_suffix_len`]. No `ravel-server`
+    /// flag corresponds to it: this is the seam a probe sweep sets the window
+    /// through.
+    pub logs_suffix_len: Option<u64>,
 }
 
 /// Where the Flight lane sends its statements.
@@ -743,6 +765,15 @@ pub struct TenantConfigInput {
     /// per statement. See [`Provenance::warm_catalog`]. Ignored by the Flight
     /// lane, which builds no in-process executor.
     pub warm_catalog: bool,
+    /// Pin the logs suffix-probe window to this many bytes, or `None` for the
+    /// per-object derivation ([`ravel_query::derive_suffix_len`], issue #883).
+    /// `None` leaves today's derivation byte-for-byte untouched; `Some(n)`
+    /// reaches [`ExecutorSettings::logs_suffix_len`] and so
+    /// [`ravel_query::LogSegmentFetcher::with_suffix_len`]. No `ravel-server`
+    /// flag corresponds to it: this is the seam a probe sweep sets the window
+    /// through. Reaches the in-process fetcher only; the Flight lane never
+    /// applies it (the setting is not on the Flight wire).
+    pub logs_suffix_len: Option<u64>,
 }
 
 fn percentile(sorted_ns: &[u64], pct: f64) -> u64 {
@@ -1495,6 +1526,7 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
         tenant_max_bytes: cfg.tenant_max_bytes,
         parallel_final_aggregation: cfg.parallel_final_aggregation,
         max_segments: cfg.max_segments,
+        logs_suffix_len: cfg.logs_suffix_len,
         ..ExecutorSettings::default()
     };
     let (entries, skipped, failed) = measure_corpus(
@@ -1541,6 +1573,9 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
             // The generate lane is always in-process (no Flight target), so the
             // flag governed the run it describes.
             warm_catalog: recorded_warm_catalog(false, cfg.warm_catalog),
+            // In-process lane: the pinned window (or the derivation, when unset)
+            // reaches the fetcher, so the requested value is the effective one.
+            logs_suffix_len: cfg.logs_suffix_len,
             flight_endpoint: None,
         },
         dataset,
@@ -1556,6 +1591,25 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
 /// Kept deliberately thin over [`measure_corpus`]/[`dataset_info`]: the only
 /// lane-specific step is resolving the durable declaration, so the generated
 /// lane (which the smoke test drives) exercises the rest of this path too.
+/// The executor knobs the loaded-tenant lane builds from its config. Pulled out
+/// so the config-to-fetcher seam is testable in one place: a test can assert the
+/// pinned `logs_suffix_len` survives this mapping (issue #883) instead of the
+/// mapping being buried inline where only an end-to-end run could catch a
+/// dropped field. `shard_count` is resolved separately (issue #677) and passed
+/// in.
+fn tenant_executor_settings(cfg: &TenantConfigInput, shard_count: u32) -> ExecutorSettings {
+    ExecutorSettings {
+        max_query_bytes: cfg.max_query_bytes,
+        shard_count,
+        fetch_concurrency: cfg.fetch_concurrency,
+        tenant_max_bytes: cfg.tenant_max_bytes,
+        parallel_final_aggregation: cfg.parallel_final_aggregation,
+        max_segments: cfg.max_segments,
+        logs_suffix_len: cfg.logs_suffix_len,
+        ..ExecutorSettings::default()
+    }
+}
+
 pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Error> {
     let tenant = TenantId::new(cfg.tenant.clone());
     let tenant_hash = tenant.hash();
@@ -1612,15 +1666,7 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
             .into());
         }
     }
-    let settings = ExecutorSettings {
-        max_query_bytes: cfg.max_query_bytes,
-        shard_count,
-        fetch_concurrency: cfg.fetch_concurrency,
-        tenant_max_bytes: cfg.tenant_max_bytes,
-        parallel_final_aggregation: cfg.parallel_final_aggregation,
-        max_segments: cfg.max_segments,
-        ..ExecutorSettings::default()
-    };
+    let settings = tenant_executor_settings(cfg, shard_count);
     // The two lanes measure the same statements over the same dataset stanza
     // and the same declared-column set; they differ only in what executes the
     // SQL, in process or across a gRPC channel to a server.
@@ -1686,6 +1732,15 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
             // executor, so `--warm-catalog` governed nothing there (issue #857
             // review). The in-process tenant lane applies it directly.
             warm_catalog: recorded_warm_catalog(cfg.flight.is_some(), cfg.warm_catalog),
+            // `settings` reaches the fetcher only on the in-process arm of the
+            // match above; the Flight lane never applies the pinned window (it
+            // is not on the wire and no server flag corresponds to it), so it
+            // governed nothing there and records `None`, exactly as the
+            // effective-ceiling fields do.
+            logs_suffix_len: match &cfg.flight {
+                Some(_) => None,
+                None => cfg.logs_suffix_len,
+            },
             flight_endpoint: cfg.flight.as_ref().map(|t| t.endpoint.clone()),
         },
         dataset,
@@ -2012,6 +2067,7 @@ mod tests {
             explain_dir: None,
             flight: None,
             warm_catalog: false,
+            logs_suffix_len: None,
         }
     }
 
@@ -3305,6 +3361,201 @@ mod tests {
         }
     }
 
+    // ---- The `--logs-suffix-len` seam (#883) -------------------------------
+
+    /// A `logs_suffix_len` set on the loaded-tenant config reaches the fetcher.
+    /// Asserted at the point of reliance, not the parse site: the exact pinned
+    /// window flows through the config-to-settings seam
+    /// ([`tenant_executor_settings`]) and, at the fetcher, misses exactly the
+    /// SKIP_IDX section it cannot cover -- once in the plan phase and once in the
+    /// scan phase, the same fixture and reasoning as
+    /// [`probe_misses_reach_per_run_accounting_when_the_trailer_exceeds_the_probe`].
+    ///
+    /// The whole-object crossover is dropped for this tiny fixture
+    /// (`logs_block_range_threshold: 0`) only so the ranged probe path runs at
+    /// all; the value under test is `logs_suffix_len`, which the settings step
+    /// carries verbatim (first assertion) and the fetcher then applies (the
+    /// probe-miss assertions).
+    ///
+    /// Prove-the-test: pinned exact values, never `> 0`. Demonstrated failing
+    /// against the pre-change code by removing `logs_suffix_len: cfg.logs_suffix_len`
+    /// from [`tenant_executor_settings`] (the field then falls back to
+    /// `ExecutorSettings::default()`'s `None`): the settings assertion reads
+    /// `None` against `Some(suffix)`, and the derived probe covers the whole
+    /// tiny object so both probe-miss assertions read 0 against the expected 1.
+    #[tokio::test]
+    async fn tenant_config_logs_suffix_len_reaches_the_fetcher() {
+        let store = empty_store();
+        let tenant = TenantId::new("suffix-flag-tenant");
+        let objects = write_shard_objects(&store, &tenant, 0, 1).await;
+        let suffix = suffix_just_past_skip_idx(&objects[0]);
+
+        let mut cfg = tenant_cfg(&store, "suffix-flag-tenant", None, 0);
+        cfg.logs_suffix_len = Some(suffix);
+        // The seam the loaded-tenant lane builds carries the pinned window
+        // verbatim; run_tenant feeds this same value to measure_corpus.
+        let settings = tenant_executor_settings(&cfg, 1);
+        assert_eq!(
+            settings.logs_suffix_len,
+            Some(suffix),
+            "the config's pinned window must survive into the executor settings"
+        );
+
+        let window = TimeRange {
+            start_ns: 0,
+            end_ns: NOW_NS,
+        };
+        let (measured, skipped, failed) = measure_corpus(
+            &store,
+            tenant.hash(),
+            &[entry("q", PROBE_MISS_SQL)],
+            &[],
+            1,
+            window,
+            NOW_NS,
+            64 << 20,
+            Duration::from_secs(30),
+            false,
+            None,
+            ExecutorSettings {
+                logs_block_range_threshold: 0,
+                ..settings
+            },
+            false,
+            None,
+        )
+        .await
+        .expect("run");
+        assert!(skipped.is_empty() && failed.is_empty());
+        let acc = measured[0]
+            .per_run_accounting
+            .as_ref()
+            .expect("an in-process lane records per-run accounting");
+        assert_eq!(
+            acc[0].probe_misses_plan, 1,
+            "the pinned window misses SKIP_IDX in the plan phase exactly once"
+        );
+        assert_eq!(
+            acc[0].probe_misses_scan, 1,
+            "the pinned window misses SKIP_IDX in the scan phase exactly once"
+        );
+    }
+
+    /// An unset `logs_suffix_len` leaves the per-object derivation in place, so
+    /// the run behaves exactly as it does today: the settings carry `None`, and
+    /// the derived probe covers this tiny object's whole trailer, reporting zero
+    /// misses on both phases.
+    ///
+    /// Prove-the-test: pinned to 0 and to `None`, never `>= 0`. Changing
+    /// [`tenant_executor_settings`] to hardcode `logs_suffix_len: Some(1)` makes
+    /// the settings assertion read `Some(1)` against `None`, and that 1-byte
+    /// probe misses every tail section, so the probe-miss assertions read nonzero
+    /// against the expected 0.
+    #[tokio::test]
+    async fn tenant_config_unset_logs_suffix_len_keeps_the_derivation() {
+        let store = empty_store();
+        let tenant = TenantId::new("suffix-unset-tenant");
+        let objects = write_shard_objects(&store, &tenant, 0, 1).await;
+        let total = objects[0].len() as u64;
+        assert!(
+            ravel_query::derive_suffix_len(total) >= total,
+            "fixture precondition: the derived probe ({} B) must cover the whole \
+             object ({total} B), or an unset run would already show a miss",
+            ravel_query::derive_suffix_len(total)
+        );
+
+        let cfg = tenant_cfg(&store, "suffix-unset-tenant", None, 0);
+        assert_eq!(
+            cfg.logs_suffix_len, None,
+            "the default config leaves the probe length unset"
+        );
+        let settings = tenant_executor_settings(&cfg, 1);
+        assert_eq!(
+            settings.logs_suffix_len, None,
+            "an unset config leaves the derivation in place"
+        );
+
+        let window = TimeRange {
+            start_ns: 0,
+            end_ns: NOW_NS,
+        };
+        let (measured, skipped, failed) = measure_corpus(
+            &store,
+            tenant.hash(),
+            &[entry("q", PROBE_MISS_SQL)],
+            &[],
+            1,
+            window,
+            NOW_NS,
+            64 << 20,
+            Duration::from_secs(30),
+            false,
+            None,
+            ExecutorSettings {
+                logs_block_range_threshold: 0,
+                ..settings
+            },
+            false,
+            None,
+        )
+        .await
+        .expect("run");
+        assert!(skipped.is_empty() && failed.is_empty());
+        let acc = measured[0]
+            .per_run_accounting
+            .as_ref()
+            .expect("an in-process lane records per-run accounting");
+        assert_eq!(
+            acc[0].probe_misses_plan, 0,
+            "the derived probe covers every plan-phase tail section, as today"
+        );
+        assert_eq!(
+            acc[0].probe_misses_scan, 0,
+            "the derived probe covers every scan-phase tail section, as today"
+        );
+    }
+
+    /// The provenance records the exact pinned window when the flag is set and
+    /// `None` when it is unset. The fixture tenant's objects sit below the
+    /// whole-object crossover, so a pinned window changes nothing the fetcher
+    /// does here; this test pins the recording, not the effect (which the two
+    /// tests above pin).
+    ///
+    /// Prove-the-test: pinned to `Some(4096)` and `None`, never merely present.
+    /// Replacing the tenant lane's `logs_suffix_len: match &cfg.flight { ... }`
+    /// provenance line with a hardcoded `None` makes the set arm read `None`
+    /// against `Some(4096)`.
+    #[tokio::test]
+    async fn provenance_records_logs_suffix_len() {
+        let store = empty_store();
+        provisioned_tenant(&store, "suffix-prov-tenant").await;
+
+        let mut cfg = tenant_cfg(&store, "suffix-prov-tenant", None, 0);
+        cfg.entries = vec![entry("scan", "SELECT body FROM logs")];
+        cfg.logs_suffix_len = Some(4096);
+        let report = run_tenant(&cfg).await.expect("tenant lane runs");
+        assert_eq!(
+            report.provenance.logs_suffix_len,
+            Some(4096),
+            "a set --logs-suffix-len is recorded verbatim in provenance"
+        );
+        let json = serde_json::to_value(&report.provenance).expect("provenance serializes");
+        assert_eq!(json["logs_suffix_len"], 4096);
+
+        let mut cfg = tenant_cfg(&store, "suffix-prov-tenant", None, 0);
+        cfg.entries = vec![entry("scan", "SELECT body FROM logs")];
+        let report = run_tenant(&cfg).await.expect("tenant lane runs");
+        assert_eq!(
+            report.provenance.logs_suffix_len, None,
+            "an unset flag records null (the per-object derivation governs)"
+        );
+        let json = serde_json::to_value(&report.provenance).expect("provenance serializes");
+        assert!(
+            json["logs_suffix_len"].is_null(),
+            "an unset flag serializes as null, not a figure: {json}"
+        );
+    }
+
     /// The report JSON keeps its existing shape and gains the per-run array.
     /// A cold accounting field under `scan` is unchanged (pinned), and
     /// `per_run_accounting` is an array whose length equals `runs`.
@@ -3657,6 +3908,7 @@ mod tests {
             max_segments: DEFAULT_MAX_SEGMENTS,
             explain_dir: None,
             warm_catalog: false,
+            logs_suffix_len: None,
         };
         let gen_report = run_generated(&gen_cfg).await.expect("generated lane runs");
         let load_ms = gen_report
