@@ -21,9 +21,7 @@ use crate::bloom_section::encode_bloom_section;
 use crate::columnar_batch::ColumnarLogBatch;
 use crate::error::LogSegError;
 use crate::field_dir::{FieldDir, FieldEntry};
-use crate::footer::{
-    self, COMP_NONE, COMP_ZSTD, LogFooter, SectionDesc, kind, write_footer_and_trailer_versioned,
-};
+use crate::footer::{COMP_NONE, COMP_ZSTD, LogFooter, SectionDesc, kind, write_footer_and_trailer};
 use crate::page_dir::{ChunkEntry, GroupEntry, PageDir, PageEntry};
 use crate::postings::{DEFAULT_STRIDE, FieldTerms, encode_postings_section, term_key};
 use crate::reader::stream_attr_pairs;
@@ -217,23 +215,9 @@ impl RlogWriter {
         self.build(0, Vec::new(), 0, layout)
     }
 
-    /// Produces the object in the version-3 BLOCKS layout: each block is
-    /// `header || pages`, there is no PAGE_DIR section, and the trailer says 3.
-    ///
-    /// Production never writes version 3 -- ADR-0699 decision 3 makes 4 the
-    /// written version and this is not a supported entry point. It exists so
-    /// the version-3 reader, which stays as the N-1 reader (ADR-0066
-    /// decision 1), has a producer for arbitrary inputs to be tested against;
-    /// the frozen `tests/fixtures/golden_rlog_v3.bin` pins one input, and the
-    /// differential proptests need all of them.
-    #[doc(hidden)]
-    pub fn finish_v3_for_tests(self) -> Result<Vec<u8>, LogSegError> {
-        self.build(0, Vec::new(), 0, Layout::V3).map(|(b, _)| b)
-    }
-
     /// The row-group layout this writer's configuration asks for.
     fn layout(&self) -> Layout {
-        Layout::V4 {
+        Layout {
             group_target_blocks: self.cfg.group_target_blocks,
         }
     }
@@ -727,17 +711,15 @@ impl RlogWriter {
             kind::SKIP_IDX,
             &compress(&skip.encode(), self.cfg.zstd_level)?,
         );
-        // PAGE_DIR is mandatory in version 4 and absent in version 3
-        // (ADR-0699 decision 2). Compressed as a whole section under the
-        // section crc, like SKIP_IDX: it is read whole on every open.
-        if layout != Layout::V3 {
-            push_section(
-                &mut object,
-                &mut sections,
-                kind::PAGE_DIR,
-                &compress(&page_dir.encode(), self.cfg.zstd_level)?,
-            );
-        }
+        // PAGE_DIR is mandatory (ADR-0699 decision 2). Compressed as a whole
+        // section under the section crc, like SKIP_IDX: it is read whole on
+        // every open.
+        push_section(
+            &mut object,
+            &mut sections,
+            kind::PAGE_DIR,
+            &compress(&page_dir.encode(), self.cfg.zstd_level)?,
+        );
         push_section(
             &mut object,
             &mut sections,
@@ -782,7 +764,7 @@ impl RlogWriter {
             input_set_hash,
             part_index,
         };
-        write_footer_and_trailer_versioned(&mut object, &footer, layout.trailer_version());
+        write_footer_and_trailer(&mut object, &footer);
         Ok((
             object,
             WriteStats {
@@ -1520,17 +1502,15 @@ impl RlogWriter {
             kind::SKIP_IDX,
             &compress(&skip.encode(), self.cfg.zstd_level)?,
         );
-        // PAGE_DIR is mandatory in version 4 and absent in version 3
-        // (ADR-0699 decision 2). Compressed as a whole section under the
-        // section crc, like SKIP_IDX: it is read whole on every open.
-        if layout != Layout::V3 {
-            push_section(
-                &mut object,
-                &mut sections,
-                kind::PAGE_DIR,
-                &compress(&page_dir.encode(), self.cfg.zstd_level)?,
-            );
-        }
+        // PAGE_DIR is mandatory (ADR-0699 decision 2). Compressed as a whole
+        // section under the section crc, like SKIP_IDX: it is read whole on
+        // every open.
+        push_section(
+            &mut object,
+            &mut sections,
+            kind::PAGE_DIR,
+            &compress(&page_dir.encode(), self.cfg.zstd_level)?,
+        );
         push_section(
             &mut object,
             &mut sections,
@@ -1571,7 +1551,7 @@ impl RlogWriter {
             input_set_hash,
             part_index,
         };
-        write_footer_and_trailer_versioned(&mut object, &footer, layout.trailer_version());
+        write_footer_and_trailer(&mut object, &footer);
         Ok((
             object,
             WriteStats {
@@ -2070,32 +2050,18 @@ fn insert_text(builder: &mut BloomBuilder, column_id: u32, bytes: &[u8]) {
     }
 }
 
-/// Which BLOCKS layout a build emits.
+/// The BLOCKS layout a build emits (ADR-0699 decision 1): row groups of
+/// `group_target_blocks` consecutive blocks, pages column-major inside a group.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Layout {
-    /// Version 3: each block is `header || pages`, written as the block is
-    /// encoded, and its SKIP_IDX level-0 crc covers the whole of it. Never
-    /// written in production; see [`RlogWriter::finish_v3_for_tests`].
-    V3,
-    /// Version 4 (ADR-0699 decision 1): row groups of `group_target_blocks`
-    /// consecutive blocks, pages column-major inside a group.
-    V4 { group_target_blocks: usize },
+struct Layout {
+    group_target_blocks: usize,
 }
 
-impl Layout {
-    fn trailer_version(self) -> u16 {
-        match self {
-            Layout::V3 => 3,
-            Layout::V4 { .. } => footer::VERSION,
-        }
-    }
-}
-
-/// Places encoded blocks into the BLOCKS section and, for version 4, builds the
-/// PAGE_DIR that locates their pages.
+/// Places encoded blocks into the BLOCKS section and builds the PAGE_DIR that
+/// locates their pages.
 ///
-/// Version 4 buffers one row group's blocks before placing any of them: within
-/// a group the pages are stored grouped by column then by block, so a column's
+/// One row group's blocks are buffered before any of them is placed: within a
+/// group the pages are stored grouped by column then by block, so a column's
 /// pages for the whole group are contiguous (a *column chunk*) and the chunks
 /// follow each other in `column_id` order (ADR-0699 decision 1). That buffer is
 /// the writer's entire extra working set over the one-block-of-cells peak #682
@@ -2103,11 +2069,10 @@ impl Layout {
 /// *encoded, already-compressed* pages are resident at once, plus the blocks'
 /// stats.
 ///
-/// `block_offset`/`block_len` in a version-4 SKIP_IDX level-0 entry describe the
-/// block's page span -- from its first page's offset to the end of its last --
-/// which is a superset range containing every one of its pages, not the exact
-/// extent it was under version 3. Nothing locates a version-4 page through it;
-/// PAGE_DIR does that.
+/// `block_offset`/`block_len` in a SKIP_IDX level-0 entry describe the block's
+/// page span -- from its first page's offset to the end of its last -- which is
+/// a superset range containing every one of its pages, not an exact extent.
+/// Nothing locates a page through it; PAGE_DIR does that.
 pub struct BlocksBuilder {
     layout: Layout,
     /// The BLOCKS section bytes built so far. Offsets recorded in PAGE_DIR and
@@ -2121,16 +2086,16 @@ pub struct BlocksBuilder {
 }
 
 impl BlocksBuilder {
-    /// A version-4 layout builder at the given row group size, for a caller
-    /// assembling BLOCKS out of blocks it encoded itself.
+    /// A layout builder at the given row group size, for a caller assembling
+    /// BLOCKS out of blocks it encoded itself.
     ///
     /// The writer uses this internally. It is public because a hand-built
-    /// version-4 object (a test fixture, a tool) has to produce BLOCKS bytes,
-    /// SKIP_IDX level-0 entries, and a PAGE_DIR that agree with each other, and
+    /// object (a test fixture, a tool) has to produce BLOCKS bytes, SKIP_IDX
+    /// level-0 entries, and a PAGE_DIR that agree with each other, and
     /// re-deriving the placement rule outside this module is exactly how the
     /// three drift apart.
     pub fn version_4(group_target_blocks: usize) -> Self {
-        BlocksBuilder::new(Layout::V4 {
+        BlocksBuilder::new(Layout {
             group_target_blocks,
         })
     }
@@ -2145,25 +2110,12 @@ impl BlocksBuilder {
         }
     }
 
-    /// Adds one encoded block. Under version 4 the block is buffered and placed
-    /// when its row group fills; under version 3 it is written immediately.
+    /// Adds one encoded block. The block is buffered and placed when its row
+    /// group fills.
     pub fn push(&mut self, out: BlockWriteOut) {
-        match self.layout {
-            Layout::V3 => {
-                let (block, crc) = out.v3_bytes();
-                let block_offset = self.bytes.len() as u64;
-                self.bytes.extend_from_slice(&block);
-                self.l0
-                    .push(level0(&out, block_offset, block.len() as u64, crc));
-            }
-            Layout::V4 {
-                group_target_blocks,
-            } => {
-                self.pending.push(out);
-                if self.pending.len() >= group_target_blocks.max(1) {
-                    self.flush_group();
-                }
-            }
+        self.pending.push(out);
+        if self.pending.len() >= self.layout.group_target_blocks.max(1) {
+            self.flush_group();
         }
     }
 
@@ -2374,7 +2326,7 @@ mod row_group_buffer {
     #[test]
     fn never_holds_more_than_group_target_blocks() {
         for group in [1usize, 3, 32] {
-            let mut builder = BlocksBuilder::new(Layout::V4 {
+            let mut builder = BlocksBuilder::new(Layout {
                 group_target_blocks: group,
             });
             for _ in 0..(3 * group + 1) {
@@ -2403,7 +2355,7 @@ mod row_group_buffer {
     /// must not turn the bounded working set into an unbounded one.
     #[test]
     fn zero_group_target_does_not_buffer_the_object() {
-        let mut builder = BlocksBuilder::new(Layout::V4 {
+        let mut builder = BlocksBuilder::new(Layout {
             group_target_blocks: 0,
         });
         for _ in 0..5 {
