@@ -113,7 +113,10 @@ async fn publish_logs(store: &dyn ObjectStoreBackend, tenant: &TenantId, records
         max_event_ts_ns: max,
         min_ingest_ts_ns: min,
         max_ingest_ts_ns: max,
-        segment_format_version: 1,
+        // The version the RlogWriter above actually stamped. A commit record
+        // that names another one is refused before any GET is issued
+        // (ADR-0892 decision 4), so this cannot be a placeholder.
+        segment_format_version: u32::from(ravel_logseg::footer::VERSION),
         created_unix_ns: 10,
         ingest_hour_bucket: 0,
     };
@@ -404,7 +407,10 @@ async fn read_declared_bytes(value: &AttrValue, cfg: RlogConfig, filler: usize) 
         max_event_ts_ns: 1,
         min_ingest_ts_ns: 1,
         max_ingest_ts_ns: 1,
-        segment_format_version: 1,
+        // The version the RlogWriter above actually stamped. A commit record
+        // that names another one is refused before any GET is issued
+        // (ADR-0892 decision 4), so this cannot be a placeholder.
+        segment_format_version: u32::from(ravel_logseg::footer::VERSION),
         created_unix_ns: 10,
         ingest_hour_bucket: 0,
     };

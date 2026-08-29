@@ -82,24 +82,6 @@ fn build_object() -> Vec<u8> {
     w.finish().expect("finish")
 }
 
-/// Same fixture, forced to RLOG version 3. The mid-sequence etag-change catch
-/// (`footer_carried_open_still_catches_an_etag_change`) is a property of the
-/// ADR-0107 block-range protocol's multiple live GETs: the open pins the etag
-/// on its first section/block GET and a later GET reporting a different one
-/// fails closed. RLOG version 4 (ADR-0699) reads a whole object in one GET
-/// (there is no per-block range to verify), so there is no "later GET" and the
-/// scenario cannot arise; the version-4 whole-object fallback is pinned by
-/// `version_4_object_is_read_whole_until_the_page_dir_fetcher_lands` in
-/// tests/log_block_range.rs. The footer-carry probe-skip itself is exercised on
-/// a version-4 object by `footer_carried_subset_open_skips_the_probe`.
-fn build_object_v3() -> Vec<u8> {
-    let mut w = RlogWriter::new(one_record_cfg(), identity());
-    for ts in 0..N as i64 {
-        w.push(record(ts)).expect("push");
-    }
-    w.finish_v3_for_tests().expect("finish v3")
-}
-
 fn one_record_cfg() -> RlogConfig {
     RlogConfig {
         block_target_records: 1,
@@ -371,7 +353,7 @@ async fn footer_carried_subset_open_skips_the_probe() {
 /// bytes from two object states.
 #[tokio::test]
 async fn footer_carried_open_still_catches_an_etag_change() {
-    let bytes = build_object_v3();
+    let bytes = build_object();
     let total = bytes.len() as u64;
     let tail = tail_len(&bytes);
     let end = blocks_end(&bytes);

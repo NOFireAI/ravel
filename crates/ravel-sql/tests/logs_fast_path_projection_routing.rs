@@ -69,7 +69,7 @@ use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
     PageToken, PutOptions, PutOutcome, StoreError,
 };
-use ravel_query::{BlockRangeFetcher, CacheFetchError, LogSegmentFetcher};
+use ravel_query::{BlockRangeFetcher, CacheFetchError, LogFetchError, LogSegmentFetcher};
 use ravel_sql::{
     DeclaredColumn, DeclaredType, FIRST_DECLARED_COL, LOG_COL_ATTRS, LOG_COL_TS, LogsTableProvider,
 };
@@ -185,18 +185,33 @@ fn record(seg: usize, blk: usize) -> LogRecord {
     }
 }
 
-/// Which RLOG trailer version the fixture writes. The column-chunk ranged read
-/// is a v4 capability (ADR-0699 decision 5): only a v4 object stores pages
-/// column-major with a PAGE_DIR that turns the `ColumnSelection` into a fetch
-/// selection. A v3 object ignores the selection for fetch and reads whole
-/// blocks, so an above-threshold v3 segment must keep the whole-object read
-/// however narrow the projection (issue #862). Production never writes v3, but
-/// the N/N-1 reader window (ADR-0066 decision 1) keeps stored v3 objects
-/// readable, so a real tenant can hold them.
+/// Which RLOG trailer version the fixture stamps on its objects. The
+/// column-chunk ranged read needs a PAGE_DIR (ADR-0699 decision 5), and only
+/// version 4 has one; ADR-0892 deleted the version-3 reader, so a v3 object is
+/// not readable at all and the routing question does not arise for it. What is
+/// pinned instead is what it COSTS to find that out: nothing (decision 4).
 #[derive(Clone, Copy)]
 enum RlogVersion {
     V3,
     V4,
+}
+
+/// Restamp `object`'s trailer at `version`, recomputing the footer crc over it
+/// exactly as the writer does, so the only thing wrong with the result is its
+/// declared version.
+///
+/// This is how the v3 fixture is built now that no v3 producer exists. Patching
+/// the two version bytes in place would break the footer crc, and the object
+/// would be refused as corruption rather than as an unsupported version --
+/// which would pass this file's rejection test for the wrong reason.
+fn restamp_version(object: &[u8], version: u16) -> Vec<u8> {
+    let footer = ravel_logseg::footer::open(object).expect("open the object's footer");
+    let n = object.len();
+    let trailer = &object[n - ravel_logseg::footer::TRAILER_LEN..];
+    let footer_len = u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]) as usize;
+    let mut out = object[..n - ravel_logseg::footer::TRAILER_LEN - footer_len].to_vec();
+    ravel_logseg::footer::write_footer_and_trailer_versioned(&mut out, &footer, version);
+    out
 }
 
 async fn write_segment(
@@ -209,12 +224,13 @@ async fn write_segment(
     for r in &recs {
         w.push(r.clone()).expect("push");
     }
+    let written = w.finish().expect("finish");
     let (bytes, format_version) = match version {
-        RlogVersion::V4 => (w.finish().expect("finish"), ravel_logseg::footer::VERSION),
-        RlogVersion::V3 => (
-            w.finish_v3_for_tests().expect("finish v3"),
-            ravel_logseg::footer::VERSION - 1,
-        ),
+        RlogVersion::V4 => (written, ravel_logseg::footer::VERSION),
+        RlogVersion::V3 => {
+            let v = ravel_logseg::footer::VERSION - 1;
+            (restamp_version(&written, v), v)
+        }
     };
     let size = bytes.len() as u64;
     let key = format!("logs/seg{seg}.rlog");
@@ -651,62 +667,85 @@ async fn both_paths_return_identical_rows() {
     );
 }
 
-/// The version gate (issue #862): the SAME narrow projection over the SAME
-/// above-threshold segments, written at RLOG v3 instead of v4, must keep the
-/// whole-object read. The column-chunk ranged read is a v4 capability (ADR-0699
-/// decision 5): on a v3 object `fetch_object_with_footer` ignores the
-/// `ColumnSelection` for fetch and reads whole blocks, so routing ranged would
-/// pay a SKIP_IDX suffix probe, find every block surviving (the fast path's
-/// precondition), and then issue the same whole-object GET anyway -- more
-/// requests, identical bytes.
+/// ADR-0892 decisions 4 and 5: the SAME narrow projection over the SAME
+/// above-threshold segments, stamped at RLOG v3 instead of v4, is REFUSED with
+/// the typed `UnsupportedVersion` error having issued ZERO requests of every
+/// counted kind.
 ///
-/// This is the exact asymmetry the suite is built to catch, run the other way:
-/// `narrow_projection_reads_column_chunks_not_whole_objects` pins the v4 narrow
-/// shape at `(0 full, SEGMENTS suffix, 5*SEGMENTS ranges)`; here the same
-/// projection at v3 must be `(SEGMENTS full, 0 suffix, 0 ranges)`.
+/// This arm used to pin the opposite law -- `(SEGMENTS full, 0 suffix, 0
+/// ranges)`, the whole-object read a v3 segment kept however narrow the
+/// projection (issue #862) -- and it is rewritten rather than deleted because
+/// it is the only coverage of what a v3 object costs, and this change is
+/// exactly what alters that cost.
 ///
-/// Fails on the pre-fix code: without the version gate in
-/// `PartitionCtx::open_by_column_chunk`, `ranged_projection_pays` returns true
-/// for this above-threshold narrow shape and the v3 segments route ranged, so
-/// the suffix-probe counter is `SEGMENTS`, not 0, and `ranged_segments` is
-/// `SEGMENTS`, not 0.
+/// The ordering is the point, and it is not free. Removing the version gate
+/// from `PartitionCtx::open_by_column_chunk` (decision 3) removes what used to
+/// route a v3 object away from the ranged path, so without decision 4's
+/// pre-filter the object reaches `open_from_suffix` only after a suffix probe
+/// has been paid for -- and, when the probe misses the footer, a footer-range
+/// GET on top. The error is the same either way; the request count is not.
+/// Moving `refuse_unreadable_version` back below the fetch fails on the suffix
+/// and range counters here, not on the error.
+///
+/// Zero is asserted exactly, per counted kind, never as "fewer than before".
 #[tokio::test]
-async fn narrow_projection_over_v3_segment_keeps_the_whole_object_read() {
+async fn narrow_projection_over_v3_segment_is_refused_before_any_request() {
     let base = Arc::new(MemoryStore::new());
     let snapshot = build_snapshot(base.as_ref(), RlogVersion::V3).await;
-    let stored = snapshot_bytes(&snapshot);
-    drop(snapshot);
+    let counting = CountingStore::new(base);
+    let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&counting) as Arc<dyn ObjectStoreBackend>;
+    let threshold = smallest_object(&snapshot) / THRESHOLD_DIVISOR;
+    let prov = Arc::new(provider(snapshot, fetcher(store, threshold)));
 
-    let shape = measure_versioned(
-        Some(narrow_projection()),
-        Some(THRESHOLD_DIVISOR),
-        RlogVersion::V3,
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(PARTS));
+    let plan = TableProvider::scan(
+        prov.as_ref(),
+        &ctx.state(),
+        Some(&narrow_projection()),
+        &[],
+        None,
     )
-    .await;
+    .await
+    .expect("scan");
+    let err = collect(Arc::clone(&plan), Arc::new(TaskContext::default()))
+        .await
+        .expect_err("a v3 segment is unreadable and must not produce rows");
 
-    // Exact request law: one whole-object GET per segment, no probe, no ranges.
-    // The v3 object cannot fetch by column chunk, so the narrow projection reads
-    // the whole object exactly as a wide one would.
+    // The typed error, not a string match and not a generic internal error.
+    assert_unsupported_version(&err, ravel_logseg::footer::VERSION - 1);
+
+    // Exact request law: nothing was fetched. The probe (`suffix`), the
+    // SKIP_IDX/PAGE_DIR front-section reads and every block range (`range`),
+    // and the whole-object read (`full`) are each exactly zero, as are the
+    // bytes they would have moved.
     assert_eq!(
-        (shape.full_gets, shape.suffix_gets, shape.range_gets),
-        (SEGMENTS as u64, 0, 0),
-        "a v3 segment keeps the whole-object read however narrow the projection"
+        (
+            counting.full.load(Ordering::SeqCst),
+            counting.suffix.load(Ordering::SeqCst),
+            counting.range.load(Ordering::SeqCst),
+            counting.bytes.load(Ordering::SeqCst),
+        ),
+        (0, 0, 0, 0),
+        "an unreadable object costs no round trips: no full GET, no suffix \
+         probe, no range GET, no bytes"
     );
+}
 
-    // A whole-object read moves exactly the stored bytes, the same equality the
-    // wide-shape v4 guards assert.
-    assert_eq!(
-        (shape.bytes, stored),
-        (stored, stored),
-        "the v3 narrow read moves every stored byte, not a column-chunk subset"
-    );
-
-    // Routing: every segment took the whole-object entry, none the ranged one.
-    assert_eq!(
-        (shape.ranged_segments, shape.whole_object_segments),
-        (0, SEGMENTS),
-        "a v3 segment is never routed by column chunk, whatever the projection"
-    );
-
-    assert_eq!(shape.rows, TOTAL_ROWS, "every row is still returned");
+/// Assert `err` carries `LogSegError::UnsupportedVersion(version)` through the
+/// `SqlError` boundary, whatever DataFusion wrapped it in.
+fn assert_unsupported_version(err: &datafusion::error::DataFusionError, version: u16) {
+    let root = err.find_root();
+    let datafusion::error::DataFusionError::External(inner) = root else {
+        panic!("expected an External error carrying SqlError, got {root:?}");
+    };
+    let Some(sql) = inner.downcast_ref::<ravel_sql::SqlError>() else {
+        panic!("expected a SqlError, got {inner}");
+    };
+    match sql {
+        ravel_sql::SqlError::LogFetch(LogFetchError::Corrupt { source, .. }) => assert!(
+            matches!(source, ravel_logseg::LogSegError::UnsupportedVersion(v) if *v == version),
+            "expected UnsupportedVersion({version}), got {source:?}"
+        ),
+        other => panic!("expected SqlError::LogFetch(Corrupt), got {other:?}"),
+    }
 }

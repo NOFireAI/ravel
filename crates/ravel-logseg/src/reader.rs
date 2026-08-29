@@ -12,15 +12,13 @@ use std::sync::Arc;
 
 use ravel_types::logstream::AttrValue;
 
-use crate::block::{
-    ColumnIdSet, ColumnPlan, DecodedBlock, PageCounters, read_block_columns, read_block_pages,
-};
+use crate::block::{ColumnIdSet, ColumnPlan, DecodedBlock, PageCounters, read_block_pages};
 use crate::bloom_section::BloomSection;
 use crate::columnar::ColumnarBlockView;
 use crate::columns::ColumnSelection;
 use crate::error::LogSegError;
 use crate::field_dir::FieldDir;
-use crate::footer::{self, COMP_ZSTD, LogFooter, SectionDesc, kind, open};
+use crate::footer::{COMP_ZSTD, LogFooter, SectionDesc, kind, open};
 use crate::page::{DEFAULT_MAX_UNCOMP, read_page};
 use crate::page_dir::{PageDir, PageLoc};
 use crate::postings::{POSTINGS_VERSION_V1, PostingsSection, term_key};
@@ -80,10 +78,8 @@ pub struct RlogReader<'a> {
     field_dir: FieldDir,
     skip: SkipIndex,
     blocks_offset: u64,
-    /// The decoded PAGE_DIR of a version-4 object, absent for a version-3 one
-    /// (ADR-0699 decision 2). Its presence is what selects the layout: a
-    /// version-4 block's pages are located through this, a version-3 block's
-    /// through its own header inside its contiguous byte range.
+    /// The object's decoded PAGE_DIR (ADR-0699 decision 2), through which
+    /// every block's pages are located.
     ///
     /// Behind an [`Arc`] so a [`BlockScan`] shares this one decoded copy and
     /// resolves each surviving block's pages at decode time, rather than
@@ -91,7 +87,7 @@ pub struct RlogReader<'a> {
     /// pruned: the survivor list then stays proportional to the surviving-block
     /// count with one shared copy of the page metadata, not proportional to
     /// surviving blocks times pages-per-block (issue #760).
-    page_dir: Option<Arc<PageDir>>,
+    page_dir: Arc<PageDir>,
     bloom: SectionDesc,
     /// Absent when the object was written with no indexed fields
     /// (docs/log-segment-format.md: POSTINGS is an optional section).
@@ -114,37 +110,26 @@ impl<'a> RlogReader<'a> {
         let blocks = *section(&footer, kind::BLOCKS)?;
         let bloom = *section(&footer, kind::BLOOM)?;
         let postings = footer.section(kind::POSTINGS).copied();
-        // A version-4 object carries PAGE_DIR; a version-3 object does not.
-        // Like SKIP_IDX and unlike BLOOM, it is not optional and a corrupt one
-        // never degrades: without it no version-4 page can be located at all
-        // (ADR-0699 decision 2).
-        // The trailer version is what says which BLOCKS layout this is, and
-        // PAGE_DIR's presence must agree with it (ADR-0699 decision 3). A
-        // version-4 object without the section, or a version-3 object with one,
-        // is refused rather than read under a guessed layout: guessing would
+        // PAGE_DIR is mandatory (ADR-0699 decision 2): a block's pages are
+        // located only through it. Like SKIP_IDX and unlike BLOOM it is not
+        // optional and a corrupt one never degrades, and an object missing it
+        // is refused rather than read under a guessed layout, which would
         // decode another block's bytes as this one's.
-        let version = footer::trailer_version(bytes)?;
-        let expects_page_dir = version >= 4;
-        if expects_page_dir != footer.section(kind::PAGE_DIR).is_some() {
-            return Err(LogSegError::Corrupted(format!(
-                "trailer version {version} disagrees with the PAGE_DIR section's presence"
-            )));
-        }
-        let page_dir = match footer.section(kind::PAGE_DIR) {
-            Some(desc) => {
-                let raw = read_section(bytes, desc, cfg)?;
-                let dir = PageDir::decode(&raw)?;
-                dir.validate_extents(blocks.len)?;
-                if dir.block_count() != skip.l0.len() as u64 {
-                    return Err(LogSegError::Corrupted(format!(
-                        "page_dir covers {} blocks but skip index has {}",
-                        dir.block_count(),
-                        skip.l0.len()
-                    )));
-                }
-                Some(Arc::new(dir))
+        let page_dir = {
+            let desc = footer
+                .section(kind::PAGE_DIR)
+                .ok_or_else(|| LogSegError::Corrupted("missing PAGE_DIR section".into()))?;
+            let raw = read_section(bytes, desc, cfg)?;
+            let dir = PageDir::decode(&raw)?;
+            dir.validate_extents(blocks.len)?;
+            if dir.block_count() != skip.l0.len() as u64 {
+                return Err(LogSegError::Corrupted(format!(
+                    "page_dir covers {} blocks but skip index has {}",
+                    dir.block_count(),
+                    skip.l0.len()
+                )));
             }
-            None => None,
+            Arc::new(dir)
         };
         Ok(RlogReader {
             bytes,
@@ -158,24 +143,22 @@ impl<'a> RlogReader<'a> {
         })
     }
 
-    /// The byte extent in BLOCKS of one `(row group, column)` column chunk of a
-    /// version-4 object, absolute in the object: `(offset, length)`, covering
-    /// exactly the pages PAGE_DIR lists for that column in that group,
-    /// contiguous and in order.
+    /// The byte extent in BLOCKS of one `(row group, column)` column chunk,
+    /// absolute in the object: `(offset, length)`, covering exactly the pages
+    /// PAGE_DIR lists for that column in that group, contiguous and in order.
     ///
     /// This is the seam ADR-0699 decision 5's fetcher reads: one ranged GET per
     /// surviving `(row group, projected column)` replaces one per block. It
-    /// returns `None` for a version-3 object (which has no column chunks), for a
-    /// group index past the last, and for a column the group carries no page
-    /// for.
+    /// returns `None` for a group index past the last, and for a column the
+    /// group carries no page for.
     pub fn column_chunk_range(&self, group: usize, column_id: u32) -> Option<(u64, u64)> {
-        let (offset, len) = self.page_dir.as_ref()?.chunk_range(group, column_id)?;
+        let (offset, len) = self.page_dir.chunk_range(group, column_id)?;
         Some((self.blocks_offset.checked_add(offset)?, len))
     }
 
-    /// The number of row groups in a version-4 object; 0 for a version-3 one.
+    /// The number of row groups in the object.
     pub fn row_group_count(&self) -> usize {
-        self.page_dir.as_ref().map_or(0, |d| d.groups.len())
+        self.page_dir.groups.len()
     }
 
     /// The column plans for every dynamic column, for block decode.
@@ -411,8 +394,8 @@ impl<'a> RlogReader<'a> {
 
         // Locate the survivors. Nothing is read or decoded here: the caller
         // drives the decode one block at a time through `BlockScan::next_block`.
-        // A version-4 survivor is named by its whole-object block index only;
-        // its pages are resolved through the shared PAGE_DIR at decode time
+        // A survivor is named by its whole-object block index only; its pages
+        // are resolved through the shared PAGE_DIR at decode time
         // (`BlockScan::decode_block`), so the survivor list holds one fixed-size
         // handle per surviving block rather than a `Vec<PageLoc>` of that
         // block's pages, keeping it O(surviving blocks) not O(surviving blocks
@@ -423,28 +406,13 @@ impl<'a> RlogReader<'a> {
                 self.skip.l0.get(b).ok_or_else(|| {
                     LogSegError::Corrupted("skip block index out of range".into())
                 })?;
-            match &self.page_dir {
-                Some(_) => {
-                    let block_index = u32::try_from(b)
-                        .map_err(|_| LogSegError::Corrupted("block index range".into()))?;
-                    blocks.push(BlockLoc::V4 {
-                        record_count: entry.record_count as usize,
-                        crc32c: entry.block_crc32c,
-                        block_index,
-                    });
-                }
-                None => {
-                    let start = self
-                        .blocks_offset
-                        .checked_add(entry.block_offset)
-                        .ok_or_else(|| LogSegError::Corrupted("block offset overflow".into()))?;
-                    blocks.push(BlockLoc::V3 {
-                        start,
-                        len: entry.block_len,
-                        crc32c: entry.block_crc32c,
-                    });
-                }
-            }
+            let block_index =
+                u32::try_from(b).map_err(|_| LogSegError::Corrupted("block index range".into()))?;
+            blocks.push(BlockLoc {
+                record_count: entry.record_count as usize,
+                crc32c: entry.block_crc32c,
+                block_index,
+            });
         }
 
         Ok(BlockScan {
@@ -528,7 +496,7 @@ impl<'a> RlogReader<'a> {
             columns: None,
             content: Predicate::And(Vec::new()),
             blocks: Vec::new(),
-            page_dir: None,
+            page_dir: Arc::new(PageDir::default()),
             blocks_offset: 0,
             next: 0,
             stats,
@@ -731,29 +699,24 @@ impl<'a> RlogReader<'a> {
     }
 }
 
-/// Where one surviving block's bytes are, copied out of the skip index (and,
-/// for version 4, PAGE_DIR) so a [`BlockScan`] can locate it without borrowing
-/// the reader.
+/// Which surviving block to decode: its whole-object block index, resolved to
+/// the block's pages through the [`BlockScan`]'s shared PAGE_DIR at decode time
+/// rather than carried here (issue #760), plus what the skip index says about
+/// it.
+///
+/// `crc32c` is the block crc, defined over the concatenation of the block's
+/// pages in `column_id` order, so it is verifiable only by a reader that took
+/// all of them; a page-subset read verifies each page's own crc instead.
 ///
 /// `Copy` is load-bearing: it is what proves a survivor entry cannot own a
 /// `Vec<PageLoc>`, so the pruned survivor list holds one fixed-size handle per
 /// surviving block, not that block's page list. Reintroducing a per-block page
 /// vector here (the pre-#760 shape) fails to compile against this derive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BlockLoc {
-    /// Version 3: one contiguous `header || pages` extent, covered by one crc.
-    V3 { start: u64, len: u64, crc32c: u32 },
-    /// Version 4: the whole-object block index, resolved to the block's pages
-    /// through the [`BlockScan`]'s shared PAGE_DIR at decode time rather than
-    /// carried here (issue #760). `crc32c` is the block crc, defined over the
-    /// concatenation of the block's pages in `column_id` order, so it is
-    /// verifiable only by a reader that took all of them; a page-subset read
-    /// verifies each page's own crc instead.
-    V4 {
-        record_count: usize,
-        crc32c: u32,
-        block_index: u32,
-    },
+struct BlockLoc {
+    record_count: usize,
+    crc32c: u32,
+    block_index: u32,
 }
 
 /// A pruned scan that has not decoded anything yet: the surviving block list,
@@ -780,15 +743,14 @@ pub struct BlockScan {
     /// The exact per-row filter, re-evaluated against every decoded row.
     content: Predicate,
     blocks: Vec<BlockLoc>,
-    /// The object's shared decoded PAGE_DIR (version 4 only; `None` under
-    /// version 3). One [`Arc`] copy per scan, cloned from the reader, through
-    /// which [`Self::decode_block`] resolves each version-4 survivor's pages at
-    /// decode time. This is what keeps the pruned survivor list proportional to
-    /// the surviving-block count rather than to blocks times pages-per-block
-    /// (issue #760).
-    page_dir: Option<Arc<PageDir>>,
+    /// The object's shared decoded PAGE_DIR. One [`Arc`] copy per scan, cloned
+    /// from the reader, through which [`Self::decode_block`] resolves each
+    /// survivor's pages at decode time. This is what keeps the pruned survivor
+    /// list proportional to the surviving-block count rather than to blocks
+    /// times pages-per-block (issue #760).
+    page_dir: Arc<PageDir>,
     /// Absolute offset of the BLOCKS section, added to the PAGE_DIR-relative
-    /// page offsets when a version-4 block is resolved at decode time.
+    /// page offsets when a block is resolved at decode time.
     blocks_offset: u64,
     next: usize,
     stats: ScanStats,
@@ -936,59 +898,30 @@ impl BlockScan {
             return Ok(false);
         };
         self.next += 1;
-        let decoded = match loc {
-            BlockLoc::V3 { start, len, crc32c } => {
-                let start = usize::try_from(start)
-                    .map_err(|_| LogSegError::Corrupted("block offset range".into()))?;
-                let len = usize::try_from(len)
-                    .map_err(|_| LogSegError::Corrupted("block len range".into()))?;
-                let end = start
-                    .checked_add(len)
-                    .ok_or_else(|| LogSegError::Corrupted("block range overflow".into()))?;
-                let block_bytes = object_bytes
-                    .get(start..end)
-                    .ok_or_else(|| LogSegError::Corrupted("block out of bounds".into()))?;
-                read_block_columns(
-                    block_bytes,
-                    crc32c,
-                    &self.plans,
-                    DEFAULT_MAX_UNCOMP,
-                    self.columns.as_ref(),
-                )?
-            }
-            BlockLoc::V4 {
-                record_count,
-                crc32c,
-                block_index,
-            } => {
-                // Resolve the block's pages now, from the shared PAGE_DIR,
-                // rather than from a per-block list built at scan time (issue
-                // #760). `block_pages` returns offsets relative to the BLOCKS
-                // section; shift them to absolute object offsets, exactly what
-                // the scan-time build produced, so the decode is byte-identical.
-                let dir = self.page_dir.as_ref().ok_or_else(|| {
-                    LogSegError::Corrupted("version-4 block without page_dir".into())
-                })?;
-                let mut pages = dir
-                    .block_pages(block_index)
-                    .ok_or_else(|| LogSegError::Corrupted("block not in page_dir".into()))?;
-                for p in &mut pages {
-                    p.offset = self
-                        .blocks_offset
-                        .checked_add(p.offset)
-                        .ok_or_else(|| LogSegError::Corrupted("page offset overflow".into()))?;
-                }
-                decode_v4_block(
-                    object_bytes,
-                    0,
-                    record_count,
-                    crc32c,
-                    &pages,
-                    &self.plans,
-                    self.columns.as_ref(),
-                )?
-            }
-        };
+        // Resolve the block's pages now, from the shared PAGE_DIR, rather than
+        // from a per-block list built at scan time (issue #760). `block_pages`
+        // returns offsets relative to the BLOCKS section; shift them to
+        // absolute object offsets, exactly what the scan-time build produced,
+        // so the decode is byte-identical.
+        let mut pages = self
+            .page_dir
+            .block_pages(loc.block_index)
+            .ok_or_else(|| LogSegError::Corrupted("block not in page_dir".into()))?;
+        for p in &mut pages {
+            p.offset = self
+                .blocks_offset
+                .checked_add(p.offset)
+                .ok_or_else(|| LogSegError::Corrupted("page offset overflow".into()))?;
+        }
+        let decoded = decode_v4_block(
+            object_bytes,
+            0,
+            loc.record_count,
+            loc.crc32c,
+            &pages,
+            &self.plans,
+            self.columns.as_ref(),
+        )?;
         self.stats.blocks_scanned += 1;
         self.stats.pages_decoded += decoded.pages_decoded() as u64;
         self.stats.pages_skipped += decoded.pages_skipped() as u64;
@@ -1761,17 +1694,11 @@ mod tests {
     }
 
     /// The number of resident page-location handles the pruned survivor list
-    /// holds: one whole-object block index per surviving version-4 block, one
-    /// extent per surviving version-3 block. This is one handle per surviving
-    /// block, never one per page: `BlockLoc` is `Copy` (asserted below), so an
-    /// entry cannot own a `Vec<PageLoc>`, and the sum is the survivor count.
+    /// holds: one whole-object block index per surviving block, never one per
+    /// page. `BlockLoc` is `Copy` (asserted below), so an entry cannot own a
+    /// `Vec<PageLoc>`, and the sum is the survivor count.
     fn resident_page_locations(scan: &BlockScan) -> usize {
-        scan.blocks
-            .iter()
-            .map(|b| match b {
-                BlockLoc::V4 { .. } | BlockLoc::V3 { .. } => 1,
-            })
-            .sum()
+        scan.blocks.len()
     }
 
     /// The version-4 survivor list holds one shared copy of the page metadata
@@ -1806,10 +1733,7 @@ mod tests {
         let obj = build(cfg, recs);
 
         let reader = RlogReader::new(&obj, &cfg).expect("open reader");
-        let dir = reader
-            .page_dir
-            .clone()
-            .expect("version-4 object has a PAGE_DIR");
+        let dir = reader.page_dir.clone();
         assert_eq!(dir.block_count(), BLOCKS as u64, "8 blocks as configured");
         assert_eq!(
             dir.groups.len(),
@@ -1836,10 +1760,7 @@ mod tests {
         assert_eq!(all.blocks.len(), BLOCKS, "all 8 blocks survive");
         // One shared copy of the page metadata, not one per survivor.
         assert!(
-            Arc::ptr_eq(
-                all.page_dir.as_ref().expect("scan holds page_dir"),
-                reader.page_dir.as_ref().expect("reader holds page_dir"),
-            ),
+            Arc::ptr_eq(&all.page_dir, &reader.page_dir),
             "the scan shares the reader's one decoded PAGE_DIR"
         );
         let all_resident = resident_page_locations(&all);
@@ -1887,49 +1808,57 @@ mod tests {
         );
     }
 
-    /// The lazy page resolution decodes byte-for-byte what the eager build did:
-    /// the version-4 decode equals the version-3 decode of the same corpus,
-    /// record for record, over a multi-block, multi-page, multi-group segment.
+    /// Resolving each survivor's pages lazily, out of the shared PAGE_DIR at
+    /// decode time, does not depend on how those pages were placed: the same
+    /// corpus written across several row groups and written as one decodes to
+    /// the same records, in the same order, over a multi-block, multi-page,
+    /// wide-column segment.
+    ///
+    /// The two objects differ in exactly where every page landed, so a
+    /// resolution that mixed up two blocks' pages, or shifted a page offset,
+    /// diverges here. The exact `ts` sequence is pinned alongside, so a decode
+    /// that agreed with itself while dropping or reordering rows also fails.
     #[test]
-    fn v4_lazy_page_resolution_decodes_identically() {
+    fn lazy_page_resolution_does_not_depend_on_the_row_group_size() {
         const COLS: usize = 25;
-        let cfg = RlogConfig {
+        const RECS: i64 = 32;
+        let many_groups = RlogConfig {
             block_target_records: 4,
             group_target_blocks: 4,
             ..RlogConfig::default()
         };
-        let recs: Vec<LogRecord> = (0..32i64).map(|ts| wide_rec(ts, COLS)).collect();
+        let one_group = RlogConfig {
+            group_target_blocks: usize::MAX,
+            ..many_groups
+        };
+        let recs: Vec<LogRecord> = (0..RECS).map(|ts| wide_rec(ts, COLS)).collect();
 
-        let mut w4 = RlogWriter::new(cfg, identity());
-        for r in &recs {
-            w4.push(r.clone()).expect("push v4");
-        }
-        let v4 = w4.finish().expect("finish v4");
+        let many = build(many_groups, recs.clone());
+        let one = build(one_group, recs);
+        assert_ne!(many, one, "the two placements must be different bytes");
 
-        let mut w3 = RlogWriter::new(cfg, identity());
-        for r in &recs {
-            w3.push(r.clone()).expect("push v3");
-        }
-        let v3 = w3.finish_v3_for_tests().expect("finish v3");
+        let cfg = RlogConfig::default();
+        let reader_many = RlogReader::new(&many, &cfg).expect("open many-group");
+        let reader_one = RlogReader::new(&one, &cfg).expect("open one-group");
+        assert_eq!(
+            (reader_many.row_group_count(), reader_one.row_group_count()),
+            (2, 1),
+            "32 records at 4 per block is 8 blocks: 2 groups at 4 per group, 1 when ungrouped"
+        );
 
         let pred = Predicate::And(Vec::new());
-        let (rows4, _) = RlogReader::new(&v4, &cfg)
-            .expect("open v4")
-            .scan(&pred)
-            .expect("scan v4");
-        let (rows3, _) = RlogReader::new(&v3, &cfg)
-            .expect("open v3")
-            .scan(&pred)
-            .expect("scan v3");
+        let (rows_many, _) = reader_many.scan(&pred).expect("scan many-group");
+        let (rows_one, _) = reader_one.scan(&pred).expect("scan one-group");
 
+        let ts: Vec<i64> = rows_many.iter().map(|r| r.ts_ns).collect();
         assert_eq!(
-            rows4.len(),
-            32,
-            "every record survives a predicate-free scan"
+            ts,
+            (0..RECS).collect::<Vec<_>>(),
+            "every record comes back exactly once, in stored order"
         );
         assert_eq!(
-            rows4, rows3,
-            "lazy version-4 page resolution decodes identically to version 3"
+            rows_many, rows_one,
+            "lazy page resolution decodes identically whatever the row group size"
         );
     }
 

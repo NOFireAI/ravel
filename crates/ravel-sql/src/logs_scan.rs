@@ -254,12 +254,14 @@ use ravel_catalog::{LoadedColumnStats, SegmentRef};
 use ravel_logseg::footer::LogFooter;
 use ravel_logseg::{
     AttrColumn, BoolCursor, BytesCursor, ColumnSelection, ColumnarBlockView, F64BitsCursor,
-    FieldSel, FieldType, I64Cursor, LogRecord, Predicate, ScanStats,
+    FieldSel, FieldType, I64Cursor, LogRecord, LogSegError, Predicate, ScanStats,
 };
 use ravel_proto::catalog::v1::ColumnValue;
 use ravel_proto::catalog::v1::column_value::Kind as ColumnValueKind;
 use ravel_query::erasure::ErasurePredicate;
-use ravel_query::{ColumnarBlockOutcome, LogQuery, LogSegmentFetcher, LogSegmentScan};
+use ravel_query::{
+    ColumnarBlockOutcome, LogFetchError, LogQuery, LogSegmentFetcher, LogSegmentScan,
+};
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
 use ravel_types::logstream::AttrValue;
@@ -2211,14 +2213,12 @@ impl PartitionCtx {
     /// rather than with one whole-object GET (issue #862).
     ///
     /// The fast path's own conjuncts ([`LogsScanExec::whole_segment_fast_path`])
-    /// prove every block of `seg` survives, which is why the whole-object read
-    /// was unconditionally optimal under RLOG v3: reading every block meant
-    /// needing every byte. Under v4 it does not. Every block surviving says
-    /// nothing about how many COLUMNS the projection wants, and the ranged entry
-    /// point ([`open_segment_ranged`]) already fetches one coalesced range per
-    /// surviving `(row group, projected column)` from the very same
-    /// [`ColumnSelection`] (ADR-0699 decision 5), so a narrow projection can
-    /// leave most of the object unread.
+    /// prove every block of `seg` survives. That does not make the whole-object
+    /// read optimal: every block surviving says nothing about how many COLUMNS
+    /// the projection wants, and the ranged entry point ([`open_segment_ranged`])
+    /// already fetches one coalesced range per surviving `(row group, projected
+    /// column)` from the very same [`ColumnSelection`] (ADR-0699 decision 5), so
+    /// a narrow projection can leave most of the object unread.
     ///
     /// The arbiter is the fetch layer's request-cost model, not a threshold
     /// invented here: the ranged path pays only when the bytes the projection
@@ -2227,24 +2227,43 @@ impl PartitionCtx {
     /// the unchanged whole-object read, where it belongs -- the ranged path
     /// would fetch the same bytes and pay a probe on top.
     ///
-    /// The route is available only on an RLOG v4 object. The column-chunk fetch
-    /// is a v4 capability (ADR-0699 decision 5): only a v4 object stores pages
-    /// column-major with a PAGE_DIR, so only there does the `ColumnSelection`
-    /// select which chunks are FETCHED. On a v3 object `fetch_object_with_footer`
-    /// ignores the selection for fetch purposes and reads whole blocks
-    /// (`log_fetcher::LogSegmentFetcher::fetch_object_with_footer` docs), so
-    /// routing an above-threshold v3 segment ranged would pay a SKIP_IDX probe,
-    /// find every block surviving, and then issue the same whole-object GET
-    /// anyway -- more requests, identical bytes. The N/N-1 reader window keeps
-    /// v3 objects legitimately readable (ADR-0066 decision 1), so the version
-    /// must be consulted, not assumed. `SegmentRef::segment_format_version`
-    /// carries it from the snapshot without a per-segment lookup at open time.
+    /// The route is unconditional in the format version (ADR-0892 decision 3):
+    /// every readable RLOG object stores pages column-major with a PAGE_DIR, so
+    /// the `ColumnSelection` always selects which chunks are FETCHED. An object
+    /// whose declared version this build cannot read never reaches here at all;
+    /// [`refuse_unreadable_version`] turns it away before any route is chosen.
     fn open_by_column_chunk(&self, seg: &SegmentRef) -> bool {
-        seg.segment_format_version >= u32::from(ravel_logseg::footer::VERSION)
-            && self
-                .fetcher
-                .ranged_projection_pays(seg.object_size, self.projected_fraction)
+        self.fetcher
+            .ranged_projection_pays(seg.object_size, self.projected_fraction)
     }
+}
+
+/// Refuse a segment whose declared RLOG format version this build cannot read,
+/// BEFORE any request is issued for it (ADR-0892 decision 4).
+///
+/// Every open path below calls this first. Without it an unreadable object is
+/// found out by `ravel_logseg::footer::open_from_suffix`, which runs on bytes
+/// the ranged path has already paid a suffix probe (and possibly a footer-range
+/// GET) to fetch, or that the whole-object path has fetched entirely. The
+/// snapshot already carries the version in
+/// [`SegmentRef::segment_format_version`], so the round trips buy nothing.
+///
+/// This is a pre-filter, not the gate: the object's own trailer is still
+/// checked on open, so a catalog entry that disagrees with the bytes is caught
+/// there. The error it produces is the same shape that check produces, so a
+/// caller cannot tell which one refused the object.
+fn refuse_unreadable_version(seg: &SegmentRef) -> Result<(), SqlError> {
+    // The catalog carries the version as u32 and an RLOG trailer is u16, so a
+    // value that does not fit is one no build could read; it is reported at the
+    // u16 ceiling rather than silently truncated into the supported window.
+    let declared = u16::try_from(seg.segment_format_version).unwrap_or(u16::MAX);
+    if ravel_logseg::footer::SUPPORTED_VERSIONS.contains(declared) {
+        return Ok(());
+    }
+    Err(SqlError::LogFetch(LogFetchError::Corrupt {
+        key: seg.data_object_key.clone(),
+        source: LogSegError::UnsupportedVersion(declared),
+    }))
 }
 
 type OpenFuture = Pin<Box<dyn Future<Output = DFResult<Option<LogSegmentScan>>> + Send>>;
@@ -2261,6 +2280,7 @@ fn open_segment_subset(
     footer: Option<LogFooter>,
 ) -> OpenFuture {
     Box::pin(async move {
+        refuse_unreadable_version(&seg)?;
         let scan = ctx
             .fetcher
             .scan_accounted_with_tenant_subset(
@@ -2287,6 +2307,7 @@ fn open_segment_subset(
 /// or suffix probe is needed.
 fn open_segment_whole(ctx: Arc<PartitionCtx>, seg: SegmentRef) -> OpenFuture {
     Box::pin(async move {
+        refuse_unreadable_version(&seg)?;
         let scan = ctx
             .fetcher
             .scan_whole_accounted_with_tenant(
@@ -2316,6 +2337,7 @@ fn open_segment_whole(ctx: Arc<PartitionCtx>, seg: SegmentRef) -> OpenFuture {
 /// [`open_segment_whole`] would have yielded.
 fn open_segment_ranged(ctx: Arc<PartitionCtx>, seg: SegmentRef) -> OpenFuture {
     Box::pin(async move {
+        refuse_unreadable_version(&seg)?;
         let scan = ctx
             .fetcher
             .scan_accounted_with_tenant(

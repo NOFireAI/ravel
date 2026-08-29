@@ -30,18 +30,16 @@ pub const MAGIC: [u8; 4] = *b"RLG1";
 /// range and has no header, so nothing but this version byte tells a reader
 /// which of the two layouts BLOCKS holds.
 ///
-/// Version 3 remains readable: it is the N-1 half of the window below
-/// (ADR-0066 decision 1), so a stored version-3 object keeps decoding while
-/// compaction and `maintain migrate` rewrite it to version 4.
+/// Version 3 is not readable: ADR-0892 deleted its reader, so the window below
+/// is a single version, matching RSPAN and RSEG. A stored version-3 object is
+/// rejected with [`LogSegError::UnsupportedVersion`].
 pub const VERSION: u16 = 4;
 
-/// The set of RLOG trailer versions this build's reader accepts (ADR-0066
-/// decision 1: "N/N-1 window, readers first"). Writers always emit the current
-/// version [`VERSION`]; readers accept the current version and, once a version
-/// bump lands, the immediately preceding one. The window is at most two
-/// versions wide by construction and never accepts anything below the
-/// immediately preceding version, so a retired version (RLOG v1) stays
-/// rejected. This is the single source the reader gate and the CLI
+/// The set of RLOG trailer versions this build's reader accepts. Writers always
+/// emit the current version [`VERSION`]; readers accept that version and
+/// nothing else. The window is at most two versions wide by construction and
+/// never accepts anything below its floor, so a retired version stays rejected.
+/// This is the single source the reader gate and the CLI
 /// `audit-versions`/`migrate` paths all read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SupportedVersions {
@@ -51,8 +49,8 @@ pub struct SupportedVersions {
 
 impl SupportedVersions {
     /// A window accepting exactly one version. This is the shape today: RLOG is
-    /// still pre-release, so each bump deletes the previous version's reader in
-    /// the same change (ADR-0032 for v1, ADR-0095 for v2). There is no N-1 to
+    /// still pre-release, so each bump deletes the previous version's reader
+    /// (ADR-0032 for v1, ADR-0095 for v2, ADR-0892 for v3). There is no N-1 to
     /// accept and the reader behaves identically to the old single-version gate.
     pub const fn single(version: u16) -> Self {
         Self {
@@ -62,8 +60,9 @@ impl SupportedVersions {
     }
 
     /// The N/N-1 window: accept `newest` and the immediately preceding version.
-    /// Used at the first format bump that ships a dual reader; no RLOG version
-    /// uses it today.
+    /// Reserved for first public release, which is the only point ADR-0027
+    /// decision 7 and ADR-0066 decision 1 open it; no RLOG version uses it
+    /// today (ADR-0892).
     pub const fn n_and_prev(newest: u16) -> Self {
         // `newest` is always a real format version (>= 1), so the predecessor
         // never underflows.
@@ -89,12 +88,13 @@ impl SupportedVersions {
     }
 }
 
-/// RLOG's supported-version window: `{3, 4}` since ADR-0699 decision 3, the
-/// first RLOG bump to ship a dual reader. The writer emits
-/// `SUPPORTED_VERSIONS.newest()`; the reader accepts either. This is the single
-/// source the writer, the reader gate, `audit-versions`, `migrate`, and the
-/// compactor's `OUTPUT_FORMAT_VERSION` all read.
-pub const SUPPORTED_VERSIONS: SupportedVersions = SupportedVersions::n_and_prev(VERSION);
+/// RLOG's supported-version window: `{4}` since ADR-0892, which deleted the
+/// version-3 reader and brought RLOG back in line with RSPAN and RSEG. The
+/// writer emits `SUPPORTED_VERSIONS.newest()`; the reader accepts that and
+/// nothing else. This is the single source the writer, the reader gate,
+/// `audit-versions`, `migrate`, and the compactor's `OUTPUT_FORMAT_VERSION` all
+/// read.
+pub const SUPPORTED_VERSIONS: SupportedVersions = SupportedVersions::single(VERSION);
 
 /// Signal byte for log segments.
 pub const SIGNAL_LOGS: u8 = 2;
@@ -126,8 +126,8 @@ pub mod kind {
     // Kind 7 is reserved for GRAM_IDX (ADR-0105), which has no implementation
     // yet; PAGE_DIR takes the next free number rather than that one.
     /// Per-row-group, per-column-chunk, per-page directory
-    /// (ADR-0699 decision 2). Mandatory in trailer version 4, absent in
-    /// version 3.
+    /// (ADR-0699 decision 2). Mandatory in trailer version 4, the only version
+    /// this build reads.
     pub const PAGE_DIR: u32 = 8;
 }
 
@@ -265,10 +265,11 @@ pub fn write_footer_and_trailer(out: &mut Vec<u8>, footer: &LogFooter) {
 
 /// [`write_footer_and_trailer`] with the trailer version named explicitly.
 ///
-/// The writer always emits [`VERSION`]. This exists so the version-3 producer
-/// the version-3 reader's tests need
-/// (`RlogWriter::finish_v3_for_tests`) can stamp the version its layout
-/// actually is, without a second copy of the trailer arithmetic.
+/// The writer always emits [`VERSION`]. This exists so a test can stamp a
+/// version the reader does not accept, and assert the typed rejection, without
+/// a second copy of the trailer arithmetic: a hand-rolled trailer whose
+/// `footer_crc32c` did not cover the substituted version byte would be refused
+/// as corruption and prove nothing about the version gate.
 pub fn write_footer_and_trailer_versioned(out: &mut Vec<u8>, footer: &LogFooter, version: u16) {
     let footer_bytes = footer.to_proto().encode_to_vec();
     let footer_len = footer_bytes.len() as u32;
@@ -651,17 +652,53 @@ mod tests {
         ));
     }
 
-    /// Today's RLOG window is the N/N-1 pair ADR-0699 decision 3 opened: the
-    /// current version 4 and the version-3 objects the N-1 reader still
-    /// decodes. Version 2 and a hypothetical version 5 are rejected.
+    /// Today's RLOG window is a single version: ADR-0892 deleted the version-3
+    /// reader, so nothing but [`VERSION`] is accepted.
     #[test]
-    fn todays_window_accepts_the_current_version_and_its_predecessor() {
+    fn todays_window_accepts_only_the_current_version() {
         assert_eq!(SUPPORTED_VERSIONS.newest(), VERSION);
-        assert_eq!(SUPPORTED_VERSIONS.oldest(), VERSION - 1);
+        assert_eq!(SUPPORTED_VERSIONS.oldest(), VERSION);
         assert!(SUPPORTED_VERSIONS.contains(VERSION));
-        assert!(SUPPORTED_VERSIONS.contains(VERSION - 1));
         assert!(!SUPPORTED_VERSIONS.contains(VERSION - 2));
         assert!(!SUPPORTED_VERSIONS.contains(VERSION + 1));
+    }
+
+    /// The predecessor version is EXCLUDED, in the shape RSEG pins its own
+    /// exclusion of `VERSION_V6` (`ravel-segment/src/format.rs`). ADR-0892
+    /// decision 6: deleting a reader without pinning its absence lets the
+    /// window silently reopen, and `SupportedVersions::n_and_prev` is one token
+    /// away in the same file. Swapping `single(VERSION)` back to
+    /// `n_and_prev(VERSION)` fails here.
+    #[test]
+    fn the_previous_version_is_excluded_from_the_window() {
+        assert!(!SUPPORTED_VERSIONS.contains(VERSION - 1));
+    }
+
+    /// The exclusion is the reader's behaviour, not just the constant's: a
+    /// structurally valid object whose trailer says 3, with the crc recomputed
+    /// over that version so nothing else can be what fails, is rejected with
+    /// the typed `UnsupportedVersion(3)`.
+    #[test]
+    fn rejects_v3_trailer_as_unsupported_version() {
+        const V3: u16 = 3;
+        let footer = sample_footer(sample_sections());
+        let footer_bytes = footer.to_proto().encode_to_vec();
+        let footer_len = footer_bytes.len() as u32;
+        let crc = footer_crc(&footer_bytes, footer_len, V3, SIGNAL_LOGS, RESERVED);
+
+        let mut obj = vec![0u8; 5];
+        obj.extend_from_slice(&footer_bytes);
+        obj.extend_from_slice(&footer_len.to_le_bytes());
+        obj.extend_from_slice(&crc.to_le_bytes());
+        obj.extend_from_slice(&V3.to_le_bytes());
+        obj.push(SIGNAL_LOGS);
+        obj.push(RESERVED);
+        obj.extend_from_slice(&MAGIC);
+
+        assert!(matches!(
+            open(&obj),
+            Err(LogSegError::UnsupportedVersion(3))
+        ));
     }
 
     /// The N/N-1 window shape, proven on a synthetic version number (no RLOG
