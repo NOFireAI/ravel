@@ -313,7 +313,17 @@ The pieces, and why each is where it is:
   68.8% of above-threshold objects and cost 4,415 extra GETs per predicated
   statement. A probe that still falls short costs one extra GET, not one per
   section: SKIP_IDX and PAGE_DIR are adjacent and are fetched as one range, and
-  `BlockRangeStats::probe_misses` reports the residual rate.
+  `BlockRangeStats::probe_misses` reports the residual rate. That per-read
+  figure is also accumulated per phase on the `LogSegmentFetcher` that served
+  the read (`LogSegmentFetcher::probe_miss_counter`, issue #883), which is how
+  it reaches a caller that measures whole statements: `BlockRangeStats` is
+  dropped at the fetch boundary, and the `page_fetch` span field beside
+  `s3_requests`/`s3_bytes` is not aggregated anywhere. The SQL latency bench
+  reports the difference across one execution under `per_run_accounting` as
+  `probe_misses_plan` and `probe_misses_scan`, so a measurement pass can say
+  which phase's probe spent the extra requests. A miss is measured against the
+  probe *window*, not against cache residency, so a warm run reports the same
+  count as a cold one.
 - STREAM_DIR and FIELD_DIR sit at the object's *front*, so no suffix probe of
   any length reaches them. FIELD_DIR is read only when the query needs it (a
   NumRange arm to resolve, or a projection narrower than every column), and it
