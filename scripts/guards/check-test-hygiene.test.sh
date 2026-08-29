@@ -224,6 +224,53 @@ fn t() {
 RS
 check "a raw string with a comment marker does not desync the scan" "${d}" 0 "clean"
 
+# Rust block comments hold code often enough that commented-out timing
+# assertions are a real shape. Before this was handled the scan saw the code
+# inside `/* ... */` and reported a violation from a line that never runs.
+d="$(new_repo block-comment-code)"
+mkdir -p "${d}/crates/c/tests"
+cat >"${d}/crates/c/tests/t.rs" <<'RS'
+#[test]
+fn t() {
+    let start = Instant::now();
+    /* an approach we dropped:
+       assert!(start.elapsed() < Duration::from_secs(1), "too slow");
+    */
+    assert_eq!(rows_written, 60, "exact row count");
+}
+RS
+check "code inside a block comment is not flagged" "${d}" 0 "clean"
+
+# Rust block comments NEST, so a scan that closes on the first `*/` would
+# resume parsing inside a comment and could flag the line after it.
+d="$(new_repo block-comment-nested)"
+mkdir -p "${d}/crates/c/tests"
+cat >"${d}/crates/c/tests/t.rs" <<'RS'
+#[test]
+fn t() {
+    let start = Instant::now();
+    /* outer /* inner */ still commented:
+       assert!(start.elapsed() < Duration::from_secs(1), "no");
+    */
+    assert_eq!(objects, 8, "exact object count");
+}
+RS
+check "a nested block comment closes at the right place" "${d}" 0 "clean"
+
+# The inverse of the two above: a `/*` inside a string literal must not open a
+# comment and swallow the genuine assertion that follows it.
+d="$(new_repo slash-star-in-string)"
+mkdir -p "${d}/crates/c/tests"
+cat >"${d}/crates/c/tests/t.rs" <<'RS'
+#[test]
+fn t() {
+    let s = "/* not a comment";
+    let start = Instant::now();
+    assert!(start.elapsed() < Duration::from_secs(1), "fast");
+}
+RS
+check "a /* inside a string does not open a comment" "${d}" 1 "wall-clock"
+
 # A // comment holding an unbalanced quote must not open a string that swallows
 # the rest of the file. If it did, the genuine timing assertion two lines down
 # would vanish from the scan (a false negative). Order: // before any quote.

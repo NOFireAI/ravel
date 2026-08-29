@@ -133,6 +133,16 @@ function strip_line(s,   out, i, n, c, j, k, hashes, hs, cl) {
   out = ""; n = length(s); i = 1
   while (i <= n) {
     c = substr(s, i, 1)
+    # Block comments first: inside one, quotes and `//` carry no meaning, so
+    # this has to shadow the string and line-comment branches below. Rust
+    # nests them, so this counts depth rather than scanning for the first
+    # `*/`. bdepth persists across lines like sstate, because a block comment
+    # opened on one line closes on another.
+    if (bdepth > 0) {
+      if (c == "/" && substr(s, i + 1, 1) == "*") { bdepth++; i += 2; continue }
+      if (c == "*" && substr(s, i + 1, 1) == "/") { bdepth--; i += 2; continue }
+      i++; continue
+    }
     if (sstate == 1) {                          # inside "..."
       if (sesc) { sesc = 0; i++; continue }
       if (c == "\\") { sesc = 1; i++; continue }
@@ -148,6 +158,9 @@ function strip_line(s,   out, i, n, c, j, k, hashes, hs, cl) {
         }
       }
       i++; continue
+    }
+    if (c == "/" && substr(s, i + 1, 1) == "*") {       # block comment opens
+      bdepth = 1; i += 2; continue
     }
     if (c == "/" && substr(s, i + 1, 1) == "/") break   # line comment
     if (c == SQ) {                              # char literal or lifetime
@@ -304,7 +317,7 @@ FNR == 1 {
   if (nlines > 0) scan()
   delete raw; delete clean; delete timing
   nlines = 0; cfg_test_line = 0
-  sstate = 0; shashes = 0; sesc = 0
+  sstate = 0; shashes = 0; sesc = 0; bdepth = 0
   curfile = FILENAME
   is_test_file = (FILENAME ~ /\/tests\// || FILENAME ~ /\/benches\// || FILENAME ~ /tests\.rs$/)
 }
