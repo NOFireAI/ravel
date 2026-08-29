@@ -166,6 +166,80 @@ fn t() {
 RS
 check "a semantic duration field is not a wall-clock band" "${d}" 0 "clean"
 
+# issue #896: a tainted identifier named only inside an assertion message string
+# must not be flagged. The message spans lines, so the taint word sits on a
+# continuation line. Before the stripper carried string state across lines, this
+# was reported as `assertion reads \`wall\``, and both ways out -- rewording the
+# message or waiving a clock the assertion never reads -- made the tree worse.
+d="$(new_repo msg-only-taint)"
+mkdir -p "${d}/crates/c/tests"
+cat >"${d}/crates/c/tests/t.rs" <<'RS'
+#[test]
+fn t() {
+    let t0 = Instant::now();
+    let wall = t0.elapsed();
+    record(wall);
+    assert_eq!(
+        objects_written(),
+        BATCHES,
+        "object layout is identical across arms: {BATCHES} objects however \
+         the windows are set, so the wall comparison is not confounded by \
+         a different number of PUTs"
+    );
+}
+RS
+check "a tainted name only inside a multi-line message is not flagged" "${d}" 0 "clean"
+
+# The other side of the same change: a genuine timing assertion whose message
+# happens to discuss timing is still flagged. Detection must not have weakened.
+d="$(new_repo real-taint-with-msg)"
+mkdir -p "${d}/crates/c/tests"
+cat >"${d}/crates/c/tests/t.rs" <<'RS'
+#[test]
+fn t() {
+    let start = Instant::now();
+    let wall = start.elapsed();
+    assert!(
+        wall < Duration::from_secs(1),
+        "the wall clock must stay under a second"
+    );
+}
+RS
+check "a real timing assertion with a timing message is still flagged" "${d}" 1 "reads \`wall\`"
+
+# A raw string carrying a // marker and an embedded quote must not desync the
+# scan. Old per-line stripping paired the raw string's inner quotes as an
+# ordinary string and left the tainted word between them exposed as code, a
+# false positive; the raw-string form must strip the whole literal.
+d="$(new_repo raw-string-comment)"
+mkdir -p "${d}/crates/c/tests"
+cat >"${d}/crates/c/tests/t.rs" <<'RS'
+#[test]
+fn t() {
+    let t0 = Instant::now();
+    let wall = t0.elapsed();
+    record(wall);
+    assert_eq!(got, want, r#"a "wall" // divider between arms"#);
+}
+RS
+check "a raw string with a comment marker does not desync the scan" "${d}" 0 "clean"
+
+# A // comment holding an unbalanced quote must not open a string that swallows
+# the rest of the file. If it did, the genuine timing assertion two lines down
+# would vanish from the scan (a false negative). Order: // before any quote.
+d="$(new_repo comment-unbalanced-quote)"
+mkdir -p "${d}/crates/c/tests"
+cat >"${d}/crates/c/tests/t.rs" <<'RS'
+#[test]
+fn t() {
+    // this comment has an unbalanced " quote and a stray ) paren
+    let start = Instant::now();
+    let wall = start.elapsed();
+    assert!(wall < Duration::from_secs(1), "fast");
+}
+RS
+check "a comment with an unbalanced quote does not swallow the file" "${d}" 1 "wall-clock"
+
 # --- unseeded randomness ---------------------------------------------------
 
 d="$(new_repo entropy)"
