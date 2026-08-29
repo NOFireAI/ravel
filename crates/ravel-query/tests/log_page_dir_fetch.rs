@@ -953,13 +953,17 @@ async fn concurrent_partitions_reading_one_chunk_collapse_onto_one_get() {
 
 // ---- 7. the probe covers the plan sections -------------------------------
 
-/// The default suffix probe covers footer + SKIP_IDX + PAGE_DIR on a
-/// full-row-group, wide object, so a predicated statement pays one probe per
-/// object and no second GET for the plan sections (issue #766).
+/// The ceiling suffix probe (`DEFAULT_LOG_SUFFIX_LEN`) covers footer + SKIP_IDX
+/// + PAGE_DIR on a full-row-group, wide object, so a predicated statement over a
+/// production-sized object of this width (where the #883 derivation reaches the
+/// ceiling) pays one probe per object and no second GET for the plan sections
+/// (issue #766).
 ///
-/// The measured section sizes are printed, because the probe length is chosen
-/// from them: this test is the measurement that justifies
-/// `DEFAULT_LOG_SUFFIX_LEN`, not only a guard on it.
+/// The measured section sizes are printed, because the ceiling is chosen from
+/// them: this test is the measurement that justifies `DEFAULT_LOG_SUFFIX_LEN` as
+/// the derivation's ceiling, not only a guard on it. The end-to-end read pins
+/// the ceiling because the cheap fixture is byte-small (its size-derived probe
+/// would be the floor); see the comment at that call site.
 ///
 /// Non-vacuity: reverting `DEFAULT_LOG_SUFFIX_LEN` to the 64 KiB it was before
 /// #766 makes the tail exceed the probe and both the `tail <= suffix` assertion
@@ -1050,8 +1054,16 @@ async fn probe_covers_the_plan_sections_on_a_wide_row_group_object() {
         ravel_query::DEFAULT_LOG_SUFFIX_LEN,
     );
 
-    // And end to end: a plan-phase read of this object at production defaults
-    // reports no probe miss.
+    // And end to end: a plan-phase read of this object at the CEILING probe
+    // reports no probe miss. Since #883 the default suffix is derived from the
+    // object size (`derive_suffix_len`), and this fixture is deliberately
+    // byte-small but section-wide (2-record blocks), so its size-derived probe
+    // is the floor, not the ceiling this test is about. A production wide object
+    // of this width carries far more records per block and so is many MB, where
+    // the derivation reaches `DEFAULT_LOG_SUFFIX_LEN`; the pin below reproduces
+    // that ceiling on the cheap fixture, which is what makes the `tail <=
+    // DEFAULT_LOG_SUFFIX_LEN` measurement above an end-to-end no-miss guarantee
+    // rather than a bare byte comparison.
     let mem = store_with(&bytes).await;
     let recording = RecordingStore::new(mem);
     let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&recording) as Arc<dyn ObjectStoreBackend>;
@@ -1067,13 +1079,14 @@ async fn probe_covers_the_plan_sections_on_a_wide_row_group_object() {
     let acc = QueryAccounting::new();
     let (_footer, _skip, _fd, stats) = BlockRangeFetcher::new(store)
         .with_whole_object_threshold(0)
+        .with_suffix_len(ravel_query::DEFAULT_LOG_SUFFIX_LEN)
         .fetch_plan_sections(&seg, TENANT, &acc)
         .await
         .expect("plan sections");
     assert_eq!(stats.probe_gets, 1, "one probe");
     assert_eq!(
         stats.probe_misses, 0,
-        "the default probe covered SKIP_IDX and PAGE_DIR"
+        "the ceiling probe covered SKIP_IDX and PAGE_DIR"
     );
     assert!(
         recording.ranges().len() <= 1,
