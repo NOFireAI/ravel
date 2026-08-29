@@ -262,18 +262,67 @@ async fn mock_s3_handler(
             let objects = mock.objects.lock().expect("mock objects lock");
             match objects.get(&key) {
                 Some((bytes, etag)) => {
-                    let response_body = if method == Method::HEAD {
-                        Bytes::new()
-                    } else {
-                        bytes.clone()
-                    };
-                    Response::builder()
-                        .status(StatusCode::OK)
-                        .header("ETag", etag.clone())
-                        .header("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT")
-                        .header("Content-Length", response_body.len().to_string())
-                        .body(Body::from(response_body))
-                        .expect("build response")
+                    // A ranged GET must answer 206 with only the requested
+                    // bytes. `object_store` rejects a 200 to a Range request
+                    // with "Received non-partial response when range
+                    // requested", so ignoring the header here fails the caller
+                    // for a reason unrelated to what these tests assert.
+                    // All three RFC 7233 forms: `bytes=A-B`, `bytes=A-`, and
+                    // `bytes=-N`, the suffix form every footer read uses.
+                    let len = bytes.len();
+                    let range = headers
+                        .get(axum::http::header::RANGE)
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|spec| spec.strip_prefix("bytes=")?.split_once('-'))
+                        .map(|(start, end)| match (start.trim(), end.trim()) {
+                            ("", n) => n.parse::<usize>().ok().and_then(|n| {
+                                (n > 0 && len > 0).then(|| (len.saturating_sub(n), len - 1))
+                            }),
+                            (s, "") => s
+                                .parse::<usize>()
+                                .ok()
+                                .and_then(|s| (s < len).then(|| (s, len - 1))),
+                            (s, e) => match (s.parse::<usize>(), e.parse::<usize>()) {
+                                (Ok(s), Ok(e)) if s < len && s <= e => Some((s, e.min(len - 1))),
+                                _ => None,
+                            },
+                        });
+                    match range {
+                        Some(None) => Response::builder()
+                            .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                            .body(Body::empty())
+                            .expect("build response"),
+                        Some(Some((start, end))) => {
+                            let slice = bytes.slice(start..end + 1);
+                            let response_body = if method == Method::HEAD {
+                                Bytes::new()
+                            } else {
+                                slice
+                            };
+                            Response::builder()
+                                .status(StatusCode::PARTIAL_CONTENT)
+                                .header("ETag", etag.clone())
+                                .header("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT")
+                                .header("Content-Length", response_body.len().to_string())
+                                .header("Content-Range", format!("bytes {start}-{end}/{len}"))
+                                .body(Body::from(response_body))
+                                .expect("build response")
+                        }
+                        None => {
+                            let response_body = if method == Method::HEAD {
+                                Bytes::new()
+                            } else {
+                                bytes.clone()
+                            };
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header("ETag", etag.clone())
+                                .header("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT")
+                                .header("Content-Length", response_body.len().to_string())
+                                .body(Body::from(response_body))
+                                .expect("build response")
+                        }
+                    }
                 }
                 None => Response::builder()
                     .status(StatusCode::NOT_FOUND)
