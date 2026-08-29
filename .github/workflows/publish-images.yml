@@ -105,10 +105,27 @@ jobs:
             # feed the terminal-state checks; id/url/status make a slow run
             # (one exists, still in progress) distinguishable from a missing
             # one (none exists) in the poll line below.
+            # Keep the API's own exit code. `|| true` alone would turn an auth,
+            # rate-limit or network failure into an empty `runs`, which reads
+            # downstream as "no ci.yml run exists for this SHA" -- so the gate
+            # would sleep out the whole budget reporting a missing run when the
+            # real problem is that we cannot see it. Those need opposite
+            # responses from whoever is watching the log.
+            api_rc=0
             runs="$(gh api \
               "repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&per_page=100" \
               --jq '.workflow_runs[] | [.status, (.conclusion // "null"), (.id | tostring), .html_url] | @tsv' \
-              2>/dev/null || true)"
+              2>/dev/null)" || api_rc=$?
+
+            if (( api_rc != 0 )); then
+              # Transient by assumption, so keep polling rather than failing the
+              # release on one bad response -- but say so, and do not let this
+              # attempt's empty output be read as evidence about the run.
+              echo "attempt $attempt/$max_attempts: gh api failed (exit ${api_rc}) querying ci.yml runs for $SHA; retrying in ${interval}s"
+              sleep "$interval"
+              (( attempt++ )) || true
+              continue
+            fi
 
             # Only completed runs carry a conclusion; a run still queued or in
             # progress reports status but conclusion null, so we keep waiting.
