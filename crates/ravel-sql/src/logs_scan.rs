@@ -2226,9 +2226,24 @@ impl PartitionCtx {
     /// projection (`SELECT *`, or any reference to the merged `attrs` map) on
     /// the unchanged whole-object read, where it belongs -- the ranged path
     /// would fetch the same bytes and pay a probe on top.
+    ///
+    /// The route is available only on an RLOG v4 object. The column-chunk fetch
+    /// is a v4 capability (ADR-0699 decision 5): only a v4 object stores pages
+    /// column-major with a PAGE_DIR, so only there does the `ColumnSelection`
+    /// select which chunks are FETCHED. On a v3 object `fetch_object_with_footer`
+    /// ignores the selection for fetch purposes and reads whole blocks
+    /// (`log_fetcher::LogSegmentFetcher::fetch_object_with_footer` docs), so
+    /// routing an above-threshold v3 segment ranged would pay a SKIP_IDX probe,
+    /// find every block surviving, and then issue the same whole-object GET
+    /// anyway -- more requests, identical bytes. The N/N-1 reader window keeps
+    /// v3 objects legitimately readable (ADR-0066 decision 1), so the version
+    /// must be consulted, not assumed. `SegmentRef::segment_format_version`
+    /// carries it from the snapshot without a per-segment lookup at open time.
     fn open_by_column_chunk(&self, seg: &SegmentRef) -> bool {
-        self.fetcher
-            .ranged_projection_pays(seg.object_size, self.projected_fraction)
+        seg.segment_format_version >= u32::from(ravel_logseg::footer::VERSION)
+            && self
+                .fetcher
+                .ranged_projection_pays(seg.object_size, self.projected_fraction)
     }
 }
 

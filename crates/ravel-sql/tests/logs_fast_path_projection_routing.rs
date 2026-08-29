@@ -185,13 +185,37 @@ fn record(seg: usize, blk: usize) -> LogRecord {
     }
 }
 
-async fn write_segment(store: &dyn ObjectStoreBackend, seg: usize) -> SegmentRef {
+/// Which RLOG trailer version the fixture writes. The column-chunk ranged read
+/// is a v4 capability (ADR-0699 decision 5): only a v4 object stores pages
+/// column-major with a PAGE_DIR that turns the `ColumnSelection` into a fetch
+/// selection. A v3 object ignores the selection for fetch and reads whole
+/// blocks, so an above-threshold v3 segment must keep the whole-object read
+/// however narrow the projection (issue #862). Production never writes v3, but
+/// the N/N-1 reader window (ADR-0066 decision 1) keeps stored v3 objects
+/// readable, so a real tenant can hold them.
+#[derive(Clone, Copy)]
+enum RlogVersion {
+    V3,
+    V4,
+}
+
+async fn write_segment(
+    store: &dyn ObjectStoreBackend,
+    seg: usize,
+    version: RlogVersion,
+) -> SegmentRef {
     let recs: Vec<LogRecord> = (0..BLOCKS_PER_SEG).map(|b| record(seg, b)).collect();
     let mut w = RlogWriter::new(one_record_blocks(), identity((seg + 1) as u64));
     for r in &recs {
         w.push(r.clone()).expect("push");
     }
-    let bytes = w.finish().expect("finish");
+    let (bytes, format_version) = match version {
+        RlogVersion::V4 => (w.finish().expect("finish"), ravel_logseg::footer::VERSION),
+        RlogVersion::V3 => (
+            w.finish_v3_for_tests().expect("finish v3"),
+            ravel_logseg::footer::VERSION - 1,
+        ),
+    };
     let size = bytes.len() as u64;
     let key = format!("logs/seg{seg}.rlog");
     let content_hash = *blake3::hash(&bytes).as_bytes();
@@ -216,13 +240,14 @@ async fn write_segment(store: &dyn ObjectStoreBackend, seg: usize) -> SegmentRef
         writer_seq: (seg + 1) as u64,
         created_unix_ns: 0,
         level: SegmentLevel::L0,
+        segment_format_version: u32::from(format_version),
     }
 }
 
-async fn build_snapshot(store: &dyn ObjectStoreBackend) -> Snapshot {
+async fn build_snapshot(store: &dyn ObjectStoreBackend, version: RlogVersion) -> Snapshot {
     let mut segments = Vec::with_capacity(SEGMENTS);
     for s in 0..SEGMENTS {
-        segments.push(write_segment(store, s).await);
+        segments.push(write_segment(store, s, version).await);
     }
     Snapshot {
         segments,
@@ -396,8 +421,19 @@ struct Shape {
 /// Plan and run one projection against a fresh fixture at `threshold`, and
 /// report its exact wire cost.
 async fn measure(projection: Option<Vec<usize>>, threshold_divisor: Option<u64>) -> Shape {
+    measure_versioned(projection, threshold_divisor, RlogVersion::V4).await
+}
+
+/// [`measure`] over a fixture written at an explicit RLOG version, so the
+/// version gate on the ranged route (issue #862) can be exercised on both v3
+/// and v4 objects.
+async fn measure_versioned(
+    projection: Option<Vec<usize>>,
+    threshold_divisor: Option<u64>,
+    version: RlogVersion,
+) -> Shape {
     let base = Arc::new(MemoryStore::new());
-    let snapshot = build_snapshot(base.as_ref()).await;
+    let snapshot = build_snapshot(base.as_ref(), version).await;
     let threshold = match threshold_divisor {
         Some(d) => smallest_object(&snapshot) / d,
         // No divisor: a break-even larger than any object in the fixture, so
@@ -477,7 +513,7 @@ const TOTAL_ROWS: usize = SEGMENTS * BLOCKS_PER_SEG;
 #[tokio::test]
 async fn narrow_projection_reads_column_chunks_not_whole_objects() {
     let base = Arc::new(MemoryStore::new());
-    let snapshot = build_snapshot(base.as_ref()).await;
+    let snapshot = build_snapshot(base.as_ref(), RlogVersion::V4).await;
     let stored = snapshot_bytes(&snapshot);
     drop(snapshot);
 
@@ -521,7 +557,7 @@ async fn narrow_projection_reads_column_chunks_not_whole_objects() {
 #[tokio::test]
 async fn wide_projection_keeps_the_whole_object_read() {
     let base = Arc::new(MemoryStore::new());
-    let snapshot = build_snapshot(base.as_ref()).await;
+    let snapshot = build_snapshot(base.as_ref(), RlogVersion::V4).await;
     let stored = snapshot_bytes(&snapshot);
     drop(snapshot);
 
@@ -550,7 +586,7 @@ async fn wide_projection_keeps_the_whole_object_read() {
 #[tokio::test]
 async fn select_star_is_unchanged() {
     let base = Arc::new(MemoryStore::new());
-    let snapshot = build_snapshot(base.as_ref()).await;
+    let snapshot = build_snapshot(base.as_ref(), RlogVersion::V4).await;
     let stored = snapshot_bytes(&snapshot);
     drop(snapshot);
 
@@ -613,4 +649,64 @@ async fn both_paths_return_identical_rows() {
         ranged.pairs, whole.pairs,
         "both paths return identical (ts, d00) rows"
     );
+}
+
+/// The version gate (issue #862): the SAME narrow projection over the SAME
+/// above-threshold segments, written at RLOG v3 instead of v4, must keep the
+/// whole-object read. The column-chunk ranged read is a v4 capability (ADR-0699
+/// decision 5): on a v3 object `fetch_object_with_footer` ignores the
+/// `ColumnSelection` for fetch and reads whole blocks, so routing ranged would
+/// pay a SKIP_IDX suffix probe, find every block surviving (the fast path's
+/// precondition), and then issue the same whole-object GET anyway -- more
+/// requests, identical bytes.
+///
+/// This is the exact asymmetry the suite is built to catch, run the other way:
+/// `narrow_projection_reads_column_chunks_not_whole_objects` pins the v4 narrow
+/// shape at `(0 full, SEGMENTS suffix, 5*SEGMENTS ranges)`; here the same
+/// projection at v3 must be `(SEGMENTS full, 0 suffix, 0 ranges)`.
+///
+/// Fails on the pre-fix code: without the version gate in
+/// `PartitionCtx::open_by_column_chunk`, `ranged_projection_pays` returns true
+/// for this above-threshold narrow shape and the v3 segments route ranged, so
+/// the suffix-probe counter is `SEGMENTS`, not 0, and `ranged_segments` is
+/// `SEGMENTS`, not 0.
+#[tokio::test]
+async fn narrow_projection_over_v3_segment_keeps_the_whole_object_read() {
+    let base = Arc::new(MemoryStore::new());
+    let snapshot = build_snapshot(base.as_ref(), RlogVersion::V3).await;
+    let stored = snapshot_bytes(&snapshot);
+    drop(snapshot);
+
+    let shape = measure_versioned(
+        Some(narrow_projection()),
+        Some(THRESHOLD_DIVISOR),
+        RlogVersion::V3,
+    )
+    .await;
+
+    // Exact request law: one whole-object GET per segment, no probe, no ranges.
+    // The v3 object cannot fetch by column chunk, so the narrow projection reads
+    // the whole object exactly as a wide one would.
+    assert_eq!(
+        (shape.full_gets, shape.suffix_gets, shape.range_gets),
+        (SEGMENTS as u64, 0, 0),
+        "a v3 segment keeps the whole-object read however narrow the projection"
+    );
+
+    // A whole-object read moves exactly the stored bytes, the same equality the
+    // wide-shape v4 guards assert.
+    assert_eq!(
+        (shape.bytes, stored),
+        (stored, stored),
+        "the v3 narrow read moves every stored byte, not a column-chunk subset"
+    );
+
+    // Routing: every segment took the whole-object entry, none the ranged one.
+    assert_eq!(
+        (shape.ranged_segments, shape.whole_object_segments),
+        (0, SEGMENTS),
+        "a v3 segment is never routed by column chunk, whatever the projection"
+    );
+
+    assert_eq!(shape.rows, TOTAL_ROWS, "every row is still returned");
 }

@@ -202,6 +202,7 @@ async fn write_segment(
         writer_seq,
         created_unix_ns,
         level: SegmentLevel::L0,
+        segment_format_version: u32::from(ravel_segment::SUPPORTED_VERSIONS.newest()),
     }
 }
 
@@ -1468,6 +1469,7 @@ async fn write_rlog_segment(
         writer_seq,
         created_unix_ns,
         level: SegmentLevel::L0,
+        segment_format_version: u32::from(ravel_logseg::footer::VERSION),
     }
 }
 
@@ -2163,6 +2165,7 @@ async fn write_rspan_segment(
         writer_seq,
         created_unix_ns,
         level: SegmentLevel::L0,
+        segment_format_version: u32::from(ravel_rspan::footer::VERSION),
     }
 }
 

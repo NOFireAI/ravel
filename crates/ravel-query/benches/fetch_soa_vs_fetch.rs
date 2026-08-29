@@ -88,6 +88,7 @@ async fn build_store() -> (Arc<MemoryStore>, TenantHash, SegmentRef) {
         writer_seq: 1,
         created_unix_ns: 42,
         level: ravel_catalog::SegmentLevel::L0,
+        segment_format_version: u32::from(ravel_segment::SUPPORTED_VERSIONS.newest()),
     };
     (store, tenant_hash, seg_ref)
 }

@@ -4897,6 +4897,7 @@ mod plan_fast_path_tests {
             writer_seq: 1,
             created_unix_ns: 0,
             level: SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_logseg::footer::VERSION),
         }
     }
 
@@ -5245,6 +5246,7 @@ mod whole_segment_projection_tests {
             writer_seq: 1,
             created_unix_ns: 0,
             level: SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_logseg::footer::VERSION),
         }
     }
 
@@ -5448,6 +5450,7 @@ mod plan_skip_decidable_span_tests {
             writer_seq: 1,
             created_unix_ns: 0,
             level: SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_logseg::footer::VERSION),
         }
     }
 
@@ -5945,6 +5948,7 @@ mod plan_block_stats_tests {
             writer_seq: 1,
             created_unix_ns: 0,
             level: SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_logseg::footer::VERSION),
         }
     }
 

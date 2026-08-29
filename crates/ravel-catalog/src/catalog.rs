@@ -2917,6 +2917,7 @@ fn build_l1_segment_ref(
             input_set_hash,
             part_index: part.part_index,
         },
+        segment_format_version: part.segment_format_version,
     })
 }
 
@@ -2983,6 +2984,7 @@ fn build_rewrite_l1_segment_ref(
             input_set_hash,
             part_index: part.part_index,
         },
+        segment_format_version: part.segment_format_version,
     })
 }
 
@@ -3139,6 +3141,7 @@ fn build_segment_ref(key: &str, record: &CommitRecord) -> Result<SegmentRef, Cat
         writer_seq: record.writer_seq,
         created_unix_ns: record.created_unix_ns,
         level: SegmentLevel::L0,
+        segment_format_version: record.segment_format_version,
     })
 }
 

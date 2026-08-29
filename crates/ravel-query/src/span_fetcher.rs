@@ -1206,6 +1206,7 @@ mod tests {
             writer_seq: key,
             created_unix_ns: 0,
             level: SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_rspan::footer::VERSION),
         }
     }
 
