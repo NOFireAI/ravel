@@ -28,7 +28,7 @@ pub use fetcher::{
     SamplePriority, SegmentFetcher,
 };
 pub use log_fetcher::{
-    BlockRangeFetcher, BlockRangeStats, BlockStatsReport, ColumnarBlockOutcome,
+    BlockRangeFetcher, BlockRangeStats, BlockStatsReport, CarriedFooter, ColumnarBlockOutcome,
     DEFAULT_LOG_COALESCE_GAP, DEFAULT_LOG_COVERAGE_THRESHOLD, DEFAULT_LOG_MAX_CONCURRENT_GETS,
     DEFAULT_LOG_SUFFIX_LEN, DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD, LOG_SUFFIX_FLOOR_BYTES,
     LOG_SUFFIX_SIZE_DIVISOR, LogFetchError, LogFetchOutput, LogQuery, LogSegmentFetcher,
