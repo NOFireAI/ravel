@@ -92,6 +92,12 @@ Start here to run Ravel, ingest into it, or query it.
   the typed columns from the checked-in mapping, and measuring with
   `sql_latency_bench`, plus the gap list of statements the construct gate
   rejects. Read this to reproduce or extend the ClickBench numbers.
+- [guides/clickbench-aws-runbook.md](guides/clickbench-aws-runbook.md): the
+  same workload end to end on AWS -- creating the bucket, credentials, SSM
+  parameters, IAM instance role and EC2 box, then the exact load, compact,
+  fold, declare and measure commands, the report integrity checks that decide
+  whether a pass stands, and teardown. Read this to run a measured pass from
+  nothing.
 - [guides/coderabbit-runbook.md](guides/coderabbit-runbook.md): enabling,
   verifying, operating, rotating, and removing the maintainer-gated CodeRabbit
   integration (ADR-0091), including the controls that live in GitHub and
