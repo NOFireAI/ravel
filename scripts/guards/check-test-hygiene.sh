@@ -250,7 +250,7 @@ FNR == 1 {
 }
 END { if (nlines > 0) scan() }
 '
-xargs -a "${sources_file}" awk "${awk_prog}" >"${findings_file}"
+xargs awk "${awk_prog}" <"${sources_file}" >"${findings_file}"
 
 # --- rule 3 ----------------------------------------------------------------
 #
@@ -285,7 +285,7 @@ done <"${sources_file}"
 # A `failure_persistence` override can switch seed writing off entirely, and
 # then rule 3 has no file to find. Flag every occurrence: there is no
 # legitimate use of it here.
-xargs -a "${sources_file}" grep -Hn 'failure_persistence' 2>/dev/null \
+xargs grep -Hn 'failure_persistence' <"${sources_file}" 2>/dev/null \
   | sed 's/^\([^:]*:[0-9]*\):.*$/\1: proptest-seed: failure_persistence override can disable seed writing; the caught case is then lost/' \
     >>"${findings_file}"
 
