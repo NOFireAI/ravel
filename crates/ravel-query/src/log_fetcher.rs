@@ -2389,17 +2389,23 @@ impl ByteExtent {
     }
 }
 
-/// Most idle assembly buffers one [`AssemblyBufferPool`] holds on to. A ranged
-/// read holds a buffer only for the length of one `fetch_object` call, so this
-/// bounds resident assembly memory at roughly this many objects regardless of
-/// how many reads pass through.
-const MAX_IDLE_ASSEMBLY_BUFFERS: usize = 4;
+/// Most idle assembly buffers one [`AssemblyBufferPool`] holds on to.
+///
+/// Sized to [`DEFAULT_LOG_MAX_CONCURRENT_GETS`] because that is the scale of
+/// concurrent ranged reads one fetcher serves: partitions striping a segment
+/// each hold a buffer for the length of their own `fetch_object` call, so a cap
+/// below the fan-out would leave most of a wave allocating and only the first
+/// few reusing.
+const MAX_IDLE_ASSEMBLY_BUFFERS: usize = DEFAULT_LOG_MAX_CONCURRENT_GETS;
 
-/// Longest buffer the pool takes back. A buffer stays at the length of the
-/// largest object it has served (that is what makes reuse free of any
-/// `memset`), so retaining an outlier would pin its whole length for the life
-/// of the process; past this it is dropped instead.
-const MAX_POOLED_ASSEMBLY_BYTES: usize = 64 * 1024 * 1024;
+/// Total length the pool keeps idle across every buffer it holds. A buffer
+/// stays at the length of the largest object it has served (that is what makes
+/// reuse free of any `memset`), so a count-only bound would let a wave of large
+/// objects pin `MAX_IDLE_ASSEMBLY_BUFFERS` times an object size for the life of
+/// the process. Bounding the sum instead scales the pool to the objects it
+/// actually sees: many small ones fill the count cap, a few large ones fill
+/// this, and a single buffer longer than the whole budget is never retained.
+const MAX_IDLE_ASSEMBLY_BYTES: usize = 128 * 1024 * 1024;
 
 /// Reuse counters for one [`BlockRangeFetcher`]'s assembly-buffer pool
 /// ([`BlockRangeFetcher::assembly_buffer_stats`], issue #894). Cumulative over
@@ -2432,19 +2438,51 @@ pub struct AssemblyBufferStats {
 /// [`Vec::resize`] runs only over real growth. That is what makes the bytes
 /// outside a read's placed regions the PREVIOUS object's rather than zeros, and
 /// why [`ObjectAssembler::slice`] refuses any range it did not place.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct AssemblyBufferPool {
-    idle: std::sync::Mutex<Vec<Vec<u8>>>,
+    idle: std::sync::Mutex<IdleBuffers>,
+    /// Retention bounds, [`MAX_IDLE_ASSEMBLY_BUFFERS`] and
+    /// [`MAX_IDLE_ASSEMBLY_BYTES`] in production. Fields rather than constants
+    /// read at the use site so the tests can pin the eviction behavior at a
+    /// budget small enough to exercise without allocating hundreds of MiB.
+    max_idle_bufs: usize,
+    max_idle_bytes: usize,
     allocated: AtomicU64,
     reused: AtomicU64,
     zeroed_bytes: AtomicU64,
+}
+
+impl Default for AssemblyBufferPool {
+    fn default() -> Self {
+        AssemblyBufferPool {
+            idle: std::sync::Mutex::default(),
+            max_idle_bufs: MAX_IDLE_ASSEMBLY_BUFFERS,
+            max_idle_bytes: MAX_IDLE_ASSEMBLY_BYTES,
+            allocated: AtomicU64::new(0),
+            reused: AtomicU64::new(0),
+            zeroed_bytes: AtomicU64::new(0),
+        }
+    }
+}
+
+/// The idle set and its running total length, kept together so
+/// [`AssemblyBufferPool::release`] can enforce the byte budget without walking
+/// the set.
+#[derive(Debug, Default)]
+struct IdleBuffers {
+    bufs: Vec<Vec<u8>>,
+    bytes: usize,
 }
 
 impl AssemblyBufferPool {
     /// A buffer usable as `[0, len)`, from the idle set when one is there.
     fn acquire(self: &Arc<Self>, len: usize) -> AssemblyBuffer {
         let taken = match self.idle.lock() {
-            Ok(mut idle) => idle.pop(),
+            Ok(mut idle) => {
+                let got = idle.bufs.pop();
+                idle.bytes = idle.bytes.saturating_sub(got.as_ref().map_or(0, Vec::len));
+                got
+            }
             // A poisoned pool means some other read panicked mid-checkout. The
             // buffers are plain bytes with no invariant to corrupt, but taking
             // the lock's word for it and allocating fresh is the cheap, correct
@@ -2470,13 +2508,15 @@ impl AssemblyBufferPool {
     }
 
     fn release(&self, buf: Vec<u8>) {
-        if buf.capacity() == 0 || buf.len() > MAX_POOLED_ASSEMBLY_BYTES {
+        if buf.capacity() == 0 {
             return;
         }
         if let Ok(mut idle) = self.idle.lock()
-            && idle.len() < MAX_IDLE_ASSEMBLY_BUFFERS
+            && idle.bufs.len() < self.max_idle_bufs
+            && idle.bytes + buf.len() <= self.max_idle_bytes
         {
-            idle.push(buf);
+            idle.bytes += buf.len();
+            idle.bufs.push(buf);
         }
     }
 
@@ -6836,11 +6876,11 @@ mod assembly_buffer_tests {
         assert_eq!(pool.stats().reused, 1, "both buffers are back");
     }
 
-    /// The pool bounds what it retains: past
+    /// The pool bounds what it retains by count: past
     /// [`MAX_IDLE_ASSEMBLY_BUFFERS`] idle buffers the extras are dropped rather
     /// than held for the life of the process.
     #[test]
-    fn the_idle_set_is_bounded() {
+    fn the_idle_set_is_bounded_by_count() {
         let pool = pool();
         let live: Vec<ObjectAssembler> = (0..MAX_IDLE_ASSEMBLY_BUFFERS + 2)
             .map(|_| ObjectAssembler::new(&pool, 64))
@@ -6850,10 +6890,44 @@ mod assembly_buffer_tests {
             (MAX_IDLE_ASSEMBLY_BUFFERS + 2) as u64
         );
         drop(live);
-        assert_eq!(
-            pool.idle.lock().expect("idle").len(),
-            MAX_IDLE_ASSEMBLY_BUFFERS
+        let idle = pool.idle.lock().expect("idle");
+        assert_eq!(idle.bufs.len(), MAX_IDLE_ASSEMBLY_BUFFERS);
+        assert_eq!(idle.bytes, MAX_IDLE_ASSEMBLY_BUFFERS * 64);
+    }
+
+    /// And by total length, which is the bound that matters when the objects are
+    /// large: with a 3 KiB budget, two concurrent 2 KiB buffers retain one and
+    /// drop the other even though the count cap has room, and a buffer longer
+    /// than the whole budget is never retained.
+    #[test]
+    fn the_idle_set_is_bounded_by_total_length() {
+        let pool = Arc::new(AssemblyBufferPool {
+            max_idle_bytes: 3072,
+            ..AssemblyBufferPool::default()
+        });
+        let a = ObjectAssembler::new(&pool, 2048);
+        let b = ObjectAssembler::new(&pool, 2048);
+        drop(a);
+        drop(b);
+        {
+            let idle = pool.idle.lock().expect("idle");
+            assert_eq!(
+                idle.bufs.len(),
+                1,
+                "the second buffer overflowed the budget"
+            );
+            assert_eq!(idle.bytes, 2048);
+        }
+
+        // Takes the one idle buffer, grows it past the budget, and is therefore
+        // not taken back.
+        drop(ObjectAssembler::new(&pool, 4096));
+        let idle = pool.idle.lock().expect("idle");
+        assert!(
+            idle.bufs.is_empty(),
+            "an over-budget buffer is not retained"
         );
+        assert_eq!(idle.bytes, 0);
     }
 }
 
