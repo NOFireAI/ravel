@@ -22,6 +22,8 @@
 //! 7. The default suffix probe covers the plan sections (footer, SKIP_IDX,
 //!    PAGE_DIR) of a wide, full-row-group object, so #766's second GET is gone.
 //! 8. What a chunk read decodes is what a whole-object read decodes.
+//! 9. A tail-section probe miss is counted exactly once per object per read
+//!    path, by whichever layer issued the probe (#883, issue #885 review).
 //!
 //! The oracle for 1-3 is PAGE_DIR itself, walked here independently of the
 //! fetcher's own walk, plus an exact literal so a silent change in either shows
@@ -51,7 +53,9 @@ use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
     PageToken, PutOptions, PutOutcome, StoreError,
 };
-use ravel_query::{BlockRangeFetcher, CacheFetchError, LogFetchError, LogQuery, LogSegmentFetcher};
+use ravel_query::{
+    BlockRangeFetcher, CacheFetchError, CarriedFooter, LogFetchError, LogQuery, LogSegmentFetcher,
+};
 use ravel_types::TenantHash;
 use ravel_types::accounting::{AccountedOp, QueryAccounting};
 use uuid::Uuid;
@@ -1170,4 +1174,201 @@ async fn version_4_chunk_read_decodes_what_a_whole_object_read_decodes() {
             );
         }
     }
+}
+
+// ---- 9. a tail miss is counted once, by whoever issued the probe ----------
+
+/// A probe pinned to start exactly at PAGE_DIR's end: it covers the footer and
+/// the trailer (so there is no footer chase) but neither of the two tail
+/// sections a version-4 read locates pages through, so the derived window costs
+/// this object one extra request and `probe_misses` must report exactly 2.
+///
+/// Returns the object bytes and that suffix.
+fn probe_missing_both_tail_sections() -> (Vec<u8>, u64) {
+    let bytes = build_object(&records());
+    let total = bytes.len() as u64;
+    let f = footer_of(&bytes);
+    let skip = f.section(kind::SKIP_IDX).expect("SKIP_IDX");
+    let page = f.section(kind::PAGE_DIR).expect("PAGE_DIR");
+    let suffix = total - (page.offset + page.len);
+    let probe_start = total - suffix;
+    assert!(
+        skip.offset < probe_start && page.offset < probe_start,
+        "the pinned probe must reach neither SKIP_IDX ({}) nor PAGE_DIR ({}), \
+         but starts at {probe_start}",
+        skip.offset,
+        page.offset
+    );
+    (bytes, suffix)
+}
+
+/// A scan that issued its own probe counts its own tail misses: no footer is
+/// carried, so this read is the only layer that probed the object and the two
+/// uncovered tail sections are its own.
+///
+/// This is case 1 of the three-way, and it is the case the gates never changed.
+/// It is here as the control for the two below: if this ever stops reporting 2,
+/// the fixture stopped reaching the miss-counting site and the other two tests
+/// are vacuous rather than passing.
+///
+/// Prove-the-test: the count is exact, so it fails in both directions. Widening
+/// the pinned suffix to `tail_len(&bytes)` (a probe that covers both sections)
+/// drops it to 0; deleting either `stats.probe_misses += 1` in
+/// `fetch_object_v4` drops it to 1.
+#[tokio::test]
+async fn a_scan_that_probed_counts_its_own_tail_misses() {
+    let (bytes, suffix) = probe_missing_both_tail_sections();
+    let mem = store_with(&bytes).await;
+    let store: Arc<dyn ObjectStoreBackend> = mem;
+    let seg = seg_ref(bytes.len() as u64, &records());
+    let acc = QueryAccounting::new();
+
+    let (_got, stats) = BlockRangeFetcher::new(store)
+        .with_whole_object_threshold(0)
+        .with_suffix_len(suffix)
+        .fetch_object_with_footer(
+            &seg,
+            TENANT,
+            i64::MIN,
+            i64::MAX,
+            &[],
+            &ColumnSelection::all(),
+            None,
+            &acc,
+        )
+        .await
+        .expect("fetch");
+
+    assert_eq!(
+        stats.probe_gets, 1,
+        "the probe covered the footer, no chase"
+    );
+    assert_eq!(
+        stats.probe_misses, 2,
+        "this read probed, so it counts SKIP_IDX and PAGE_DIR itself"
+    );
+}
+
+/// A scan handed a footer whose plan read counted NOTHING about the tail
+/// sections still counts them: `plan_segment_fast` calls `fetch_footer`, which
+/// reads the footer alone, so the probe that was too short to reach SKIP_IDX and
+/// PAGE_DIR costs THIS read the extra request and no other layer has counted it.
+///
+/// This is case 3, the one the previous commit's `plan_footer.is_none()` /
+/// `probed` gates silently dropped.
+///
+/// Prove-the-test: demonstrated failing against the pre-fix code by restoring
+/// the gate at `crates/ravel-query/src/log_fetcher.rs`'s `if count_tail_misses`
+/// in `fetch_object_v4` to `if probed`, which is `plan_footer.is_none()` and so
+/// false here: `probe_misses` then reads 0 against the expected 2.
+#[tokio::test]
+async fn a_carried_footer_that_counted_nothing_leaves_the_scan_to_count() {
+    let (bytes, suffix) = probe_missing_both_tail_sections();
+    let mem = store_with(&bytes).await;
+    let store: Arc<dyn ObjectStoreBackend> = mem;
+    let seg = seg_ref(bytes.len() as u64, &records());
+    let acc = QueryAccounting::new();
+
+    // What `plan_segment_fast` does: read the footer and nothing else. It
+    // reports no tail miss, which is the whole reason the scan must.
+    let fetcher = BlockRangeFetcher::new(store)
+        .with_whole_object_threshold(0)
+        .with_suffix_len(suffix);
+    let (footer, plan_stats) = fetcher
+        .fetch_footer(&seg, TENANT, &acc)
+        .await
+        .expect("footer-only plan read");
+    assert_eq!(
+        plan_stats.probe_misses, 0,
+        "fetch_footer reads no tail section, so it counts no tail miss"
+    );
+
+    let (_got, stats) = fetcher
+        .fetch_object_with_footer(
+            &seg,
+            TENANT,
+            i64::MIN,
+            i64::MAX,
+            &[],
+            &ColumnSelection::all(),
+            Some(CarriedFooter {
+                footer: &footer,
+                tail_misses_counted: false,
+            }),
+            &acc,
+        )
+        .await
+        .expect("fetch");
+
+    assert_eq!(
+        stats.probe_misses, 2,
+        "nobody counted these two sections yet, so this read does"
+    );
+    assert_eq!(
+        plan_stats.probe_misses + stats.probe_misses,
+        2,
+        "exactly once across the plan and the scan"
+    );
+}
+
+/// A scan handed a footer whose plan read ALREADY counted the tail sections
+/// counts nothing: `fetch_plan_sections` runs `ensure_tail_plan_sections`, which
+/// counted both, and counting them again here would report one object's
+/// too-short probe as two.
+///
+/// This is case 2. The sum across the two phases is the assertion that matters:
+/// it is 2 whether the counting happens in the plan or in the scan, and it is 4
+/// if both count.
+///
+/// Prove-the-test: demonstrated failing by deleting the `count_tail_misses`
+/// gate at `crates/ravel-query/src/log_fetcher.rs`'s `if count_tail_misses` in
+/// `fetch_object_v4` (the double-count the previous commit fixed): the scan
+/// then reports 2 and the sum reads 4.
+#[tokio::test]
+async fn a_carried_footer_that_already_counted_is_not_counted_again() {
+    let (bytes, suffix) = probe_missing_both_tail_sections();
+    let mem = store_with(&bytes).await;
+    let store: Arc<dyn ObjectStoreBackend> = mem;
+    let seg = seg_ref(bytes.len() as u64, &records());
+    let acc = QueryAccounting::new();
+
+    let fetcher = BlockRangeFetcher::new(store)
+        .with_whole_object_threshold(0)
+        .with_suffix_len(suffix);
+    let (footer, _skip, _fd, plan_stats) = fetcher
+        .fetch_plan_sections(&seg, TENANT, &acc)
+        .await
+        .expect("plan sections");
+    assert_eq!(
+        plan_stats.probe_misses, 2,
+        "the plan read located both tail sections through a window that reached \
+         neither, and counted them"
+    );
+
+    let (_got, stats) = fetcher
+        .fetch_object_with_footer(
+            &seg,
+            TENANT,
+            i64::MIN,
+            i64::MAX,
+            &[],
+            &ColumnSelection::all(),
+            Some(CarriedFooter {
+                footer: &footer,
+                tail_misses_counted: true,
+            }),
+            &acc,
+        )
+        .await
+        .expect("fetch");
+
+    assert_eq!(
+        stats.probe_misses, 0,
+        "the plan phase already counted this object's tail misses"
+    );
+    assert_eq!(
+        plan_stats.probe_misses + stats.probe_misses,
+        2,
+        "exactly once across the plan and the scan, not twice"
+    );
 }

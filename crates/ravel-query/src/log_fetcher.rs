@@ -1550,6 +1550,23 @@ impl LogSegmentFetcher {
                 s3_bytes = tracing::field::Empty,
                 probe_misses = tracing::field::Empty,
             );
+            // What the plan read that produced this footer already counted
+            // (#883, issue #885 review). `plan_segment` has exactly two
+            // footer-carrying branches and they are mutually exclusive on the
+            // same predicate this asks: the fast path requires
+            // `is_block_predicate_free` (an empty `prune`), while
+            // `plan_skip_decidable` requires a non-empty all-NumRange `prune`.
+            // So a footer carried for this (segment, query) pair came from
+            // `fetch_plan_sections`, which counted the tail sections, exactly
+            // when `plan_skip_decidable` holds, and from `fetch_footer`, which
+            // counted nothing about them, otherwise. Asking the predicate
+            // `plan_segment` itself branches on keeps the two from drifting
+            // apart, and any answer this cannot place falls to `false`, the
+            // direction that counts a miss rather than hiding one.
+            let carried = footer.map(|f| CarriedFooter {
+                footer: f,
+                tail_misses_counted: Self::plan_skip_decidable(query),
+            });
             let (bytes, stats) = async {
                 self.block_range
                     .fetch_object_with_footer(
@@ -1559,7 +1576,7 @@ impl LogSegmentFetcher {
                         query.ts_max_ns,
                         &query.prune,
                         columns,
-                        footer,
+                        carried,
                         accounting,
                     )
                     .await
@@ -2050,6 +2067,28 @@ pub struct BlockRangeStats {
     pub probe_misses: u64,
 }
 
+/// A [`footer::LogFooter`] a prior plan read produced for this exact (immutable)
+/// object, carried into a scan read so it can skip its own suffix probe (#693
+/// part 3), together with what that plan read already counted.
+///
+/// `tail_misses_counted` exists because the plan phase has TWO footer-carrying
+/// reads and they differ in exactly that. [`BlockRangeFetcher::fetch_plan_sections`]
+/// runs `ensure_tail_plan_sections`, which counts this object's tail-section
+/// probe misses into the plan phase's own [`BlockRangeStats`];
+/// [`BlockRangeFetcher::fetch_footer`] reads the footer alone and counts nothing
+/// about SKIP_IDX or PAGE_DIR. A scan handed a bare footer cannot tell the two
+/// apart, so it either counts the first object twice or drops the second
+/// object's real miss (#883, issue #885 review).
+#[derive(Clone, Copy, Debug)]
+pub struct CarriedFooter<'a> {
+    /// The footer the plan read parsed, valid for this exact object.
+    pub footer: &'a footer::LogFooter,
+    /// True when the plan read that produced [`Self::footer`] already counted
+    /// this object's tail-section probe misses
+    /// ([`BlockRangeStats::probe_misses`]).
+    pub tail_misses_counted: bool,
+}
+
 /// One candidate block's absolute byte extent in the object and its stored crc,
 /// resolved from a `SkipIndex` level-0 entry (`block_offset`/`block_len`/
 /// `block_crc32c`). The extent start is absolute: `blocks_offset + block_offset`
@@ -2480,6 +2519,14 @@ impl BlockRangeFetcher {
     /// instead of saving one. A zero object size cannot be range-probed either
     /// (every extent, starting with the probe's cache key, is derived from it),
     /// which the same threshold guard rules out.
+    ///
+    /// This reads the footer and nothing else, so the only `probe_misses` it can
+    /// report is a footer chase. It counts NO tail-section miss: SKIP_IDX and
+    /// PAGE_DIR are not read here, and the read that does go on to locate blocks
+    /// through them is the one that pays for a window too short to reach them.
+    /// A footer carried out of here must therefore travel as a
+    /// [`CarriedFooter`] with `tail_misses_counted: false`, or that read's miss
+    /// is counted by nobody.
     pub async fn fetch_footer(
         &self,
         seg_ref: &SegmentRef,
@@ -2896,7 +2943,8 @@ impl BlockRangeFetcher {
     /// (immutable) object (#693 part 3, deliverable 2).
     ///
     /// When `plan_footer` is `Some`, the etag-establishing suffix probe is
-    /// skipped: the carried footer already gives every section's offset and
+    /// skipped: the carried [`CarriedFooter::footer`] already gives every
+    /// section's offset and
     /// length, so the read goes straight to fetching SKIP_IDX, the remaining
     /// directory sections, and the candidate blocks. The [`EtagPin`] is then
     /// established on the FIRST of those live GETs
@@ -2908,6 +2956,10 @@ impl BlockRangeFetcher {
     /// different object fails its stored `crc32c`, a hard [`LogFetchError::Corrupt`]).
     /// Either way the fetch errors rather than assembling bytes from two object
     /// states. `None` keeps the probe-first behavior unchanged.
+    ///
+    /// [`CarriedFooter::tail_misses_counted`] says whether the plan read that
+    /// produced the footer already counted this object's tail-section probe
+    /// misses; see the invariant stated at `count_tail_misses` below.
     ///
     /// `prune` carries the query's prune-only predicates (#761). Its NumRange
     /// arms are resolved against this object's FIELD_DIR and applied to the
@@ -2929,12 +2981,28 @@ impl BlockRangeFetcher {
         ts_max_ns: i64,
         prune: &[Predicate],
         columns: &ColumnSelection,
-        plan_footer: Option<&footer::LogFooter>,
+        plan_footer: Option<CarriedFooter<'_>>,
         accounting: &QueryAccounting,
     ) -> Result<(Bytes, BlockRangeStats), LogFetchError> {
         let key = seg_ref.data_object_key.as_str();
         let mut stats = BlockRangeStats::default();
         let pin = EtagPin::default();
+
+        // The invariant behind every `probe_misses` site: a tail-section miss is
+        // counted exactly once per object per read path, by whichever layer
+        // actually issued the probe. This read issued it when no footer was
+        // carried, so it counts its own. A carried footer names a plan read that
+        // issued the probe instead, and `tail_misses_counted` says whether that
+        // read already counted the tail sections (`fetch_plan_sections`, via
+        // `ensure_tail_plan_sections`) or read the footer alone and counted
+        // nothing (`fetch_footer`). Both directions are real defects and they do
+        // not cancel: counting a `fetch_plan_sections` object again double-reports
+        // it, and skipping a `fetch_footer` object drops a miss that costs this
+        // read a real extra request. Under-reporting is the worse of the two,
+        // because `probe_misses` is the figure that gates any future tightening
+        // of the derived probe floor and a metric that hides misses makes the
+        // probe look safer than it is.
+        let count_tail_misses = !plan_footer.is_some_and(|carried| carried.tail_misses_counted);
 
         // An object whose commit record carries no size cannot be range-planned
         // at all: every range in this protocol, starting with the probe's own
@@ -2998,7 +3066,7 @@ impl BlockRangeFetcher {
         // section/block GET instead; the carried footer's per-section crc still
         // catches a replaced object (see the method doc).
         let footer = match plan_footer {
-            Some(f) => f.clone(),
+            Some(carried) => carried.footer.clone(),
             None => {
                 let suffix = self.effective_suffix_len(total_size);
                 let probe_start = total_size - suffix;
@@ -3082,6 +3150,7 @@ impl BlockRangeFetcher {
                     columns,
                     &footer,
                     plan_footer.is_none(),
+                    count_tail_misses,
                     asm,
                     &pin,
                     accounting,
@@ -3104,13 +3173,9 @@ impl BlockRangeFetcher {
         // a property of the derived probe length and this object's shape. A
         // window too short to reach SKIP_IDX forces the section GET below, which
         // is exactly the extra request a too-small derivation would cost.
-        // Only when THIS read issued the probe. With a carried plan footer the
-        // plan phase already probed and already recorded its own misses, so
-        // counting a hypothetical window here would double-count the same
-        // object. That matters because `probe_misses` is the figure that gates
-        // any future tightening of the floor: a metric that over-reports makes
-        // the derived probe look more dangerous than it is.
-        if plan_footer.is_none()
+        // Counted here only when no earlier layer already counted it for this
+        // object, per the invariant at `count_tail_misses` above.
+        if count_tail_misses
             && !probe_window_covers(skip_desc, total_size, self.effective_suffix_len(total_size))
         {
             stats.probe_misses += 1;
@@ -3360,6 +3425,7 @@ impl BlockRangeFetcher {
         columns: &ColumnSelection,
         footer: &footer::LogFooter,
         probed: bool,
+        count_tail_misses: bool,
         mut asm: ObjectAssembler,
         pin: &EtagPin,
         accounting: &QueryAccounting,
@@ -3381,12 +3447,11 @@ impl BlockRangeFetcher {
         // to locate pages through, counted against the probe WINDOW rather than
         // against cache residency, so the figure reports what the probe length
         // costs on this object's shape.
-        // Same gate as the version-3 path above: only a read that actually
-        // issued the probe can miss it. A carried footer means the plan phase
-        // probed and counted, and the coverage crossover below can still decide
-        // to read the whole object, which is not a probe miss either.
+        // Same gate as the version-3 path: `count_tail_misses` is false only
+        // when the plan read that carried the footer already counted these two
+        // sections, per the invariant `fetch_object_with_footer` states.
         let suffix = self.effective_suffix_len(total_size);
-        if probed {
+        if count_tail_misses {
             for desc in [&skip_desc, &page_desc] {
                 if !probe_window_covers(desc, total_size, suffix) {
                     stats.probe_misses += 1;
@@ -5037,6 +5102,10 @@ mod plan_skip_decidable_span_tests {
     //! wrapped it at all, so a trace over a query taking this branch showed
     //! no `page_fetch` phase, only the ones plan_segment's other branches
     //! open.
+    //!
+    //! The same span capture pins the other figure those spans carry across the
+    //! plan/scan boundary: `probe_misses`, which must count a tail-section miss
+    //! exactly once per object per read path (#883, issue #885 review).
 
     use super::*;
     use ravel_catalog::SegmentLevel;
@@ -5143,6 +5212,7 @@ mod plan_skip_decidable_span_tests {
         signal: Option<String>,
         s3_requests: Option<u64>,
         s3_bytes: Option<u64>,
+        probe_misses: Option<u64>,
     }
 
     struct FieldVisitor<'a>(&'a mut Captured);
@@ -5152,6 +5222,7 @@ mod plan_skip_decidable_span_tests {
             match field.name() {
                 "s3_requests" => self.0.s3_requests = Some(value),
                 "s3_bytes" => self.0.s3_bytes = Some(value),
+                "probe_misses" => self.0.probe_misses = Some(value),
                 _ => {}
             }
         }
@@ -5298,6 +5369,135 @@ mod plan_skip_decidable_span_tests {
              Empty), got {:?}",
             span.s3_bytes
         );
+    }
+
+    /// A suffix probe pinned to start exactly at PAGE_DIR's end: it covers the
+    /// footer and the trailer, so no plan read chases the footer, but neither of
+    /// the two tail sections a version-4 scan locates pages through. Whichever
+    /// layer probes this object therefore owes exactly two tail-section misses.
+    fn suffix_missing_both_tail_sections(bytes: &[u8]) -> u64 {
+        let total = bytes.len() as u64;
+        let f = footer::open(bytes).expect("footer");
+        let skip = f.section(kind::SKIP_IDX).expect("SKIP_IDX");
+        let page = f.section(kind::PAGE_DIR).expect("PAGE_DIR");
+        let suffix = total - (page.offset + page.len);
+        assert!(
+            skip.offset < total - suffix && page.offset < total - suffix,
+            "the pinned probe must reach neither tail section"
+        );
+        suffix
+    }
+
+    fn fetcher_with_suffix(store: Arc<MemoryStore>, suffix: u64) -> LogSegmentFetcher {
+        LogSegmentFetcher::new(store.clone())
+            .with_block_range_threshold(0)
+            .with_block_range(
+                BlockRangeFetcher::new(store)
+                    .with_whole_object_threshold(0)
+                    .with_suffix_len(suffix),
+            )
+    }
+
+    /// End to end over the two phases: `plan_segment` reads a footer, hands it to
+    /// a subset scan, and the object's tail-section probe misses are counted
+    /// exactly once across the pair -- by the plan phase when the plan read
+    /// located those sections, and by the scan when it did not.
+    ///
+    /// This is what pins the derivation in `tenant_bytes_with_footer`, which is
+    /// the only place that decides which of the two a carried footer came from.
+    /// The fetcher-level tests in `tests/log_block_range.rs` and
+    /// `tests/log_page_dir_fetch.rs` construct the [`CarriedFooter`] by hand and
+    /// so cannot catch a wrong flag here.
+    ///
+    /// Prove-the-test: inverting that derivation to
+    /// `tail_misses_counted: !Self::plan_skip_decidable(query)` swaps both
+    /// halves -- the predicate-free scan reads 0 against the expected 2, and the
+    /// NumRange scan reads 2 against the expected 0. Hardcoding it to `true`
+    /// (the previous commit's `plan_footer.is_some()` gate) fails the
+    /// predicate-free half alone; hardcoding it to `false` (no gate at all)
+    /// fails the NumRange half alone.
+    #[tokio::test]
+    async fn a_carried_footer_is_counted_once_across_plan_and_scan() {
+        // (query, plan-phase misses, scan-phase misses). The predicate-free
+        // query takes `plan_segment_fast`, whose `fetch_footer` reads no tail
+        // section and counts nothing, leaving both misses to the scan. The
+        // NumRange query takes the skip-decidable branch, whose
+        // `fetch_plan_sections` reads both tail sections and counts them, so the
+        // scan must count neither. Either way the total is 2.
+        let cases = [
+            (LogQuery::new(i64::MIN, i64::MAX), 0u64, 2u64),
+            (
+                LogQuery::new(i64::MIN, i64::MAX).with_prune(Predicate::NumRange {
+                    field: FieldSel::Attr("code".into()),
+                    ty: FieldType::I64,
+                    min: Some(0i64 as u64),
+                    max: Some(1_000i64 as u64),
+                }),
+                2,
+                0,
+            ),
+        ];
+
+        for (query, want_plan, want_scan) in cases {
+            let collector = PageFetchCollector::default();
+            let subscriber = tracing_subscriber::registry().with(collector.clone());
+            let _guard = subscriber.set_default();
+
+            const N: usize = 6;
+            let records: Vec<LogRecord> = (0..N as i64).map(|ts| record(ts, 500)).collect();
+            let bytes = build_object(&records);
+            let suffix = suffix_missing_both_tail_sections(&bytes);
+            let seg = seg_ref(bytes.len() as u64, &records);
+            let store = store_with_object(bytes).await;
+            let f = fetcher_with_suffix(store, suffix);
+            let acc = QueryAccounting::new();
+
+            let (count, _stats, footer) = f
+                .plan_segment(&seg, TENANT, &query, &acc)
+                .await
+                .expect("plan_segment")
+                .expect("relevant segment");
+            assert!(footer.is_some(), "both branches carry their footer forward");
+
+            let indices: Vec<usize> = (0..count).collect();
+            let scan = f
+                .scan_accounted_with_tenant_subset(
+                    &seg,
+                    TENANT,
+                    &query,
+                    &ColumnSelection::all(),
+                    &indices,
+                    footer.as_ref(),
+                    &acc,
+                )
+                .await
+                .expect("subset scan")
+                .expect("relevant segment");
+            drop(scan);
+
+            let closed = collector.closed.lock().expect("lock");
+            assert_eq!(
+                closed.len(),
+                2,
+                "one page_fetch span for the plan read and one for the scan read"
+            );
+            assert_eq!(
+                closed[0].probe_misses,
+                Some(want_plan),
+                "plan phase misses for {query:?}"
+            );
+            assert_eq!(
+                closed[1].probe_misses,
+                Some(want_scan),
+                "scan phase misses for {query:?}"
+            );
+            assert_eq!(
+                closed[0].probe_misses.unwrap_or_default()
+                    + closed[1].probe_misses.unwrap_or_default(),
+                2,
+                "one count per missed tail section, whichever phase issued the probe"
+            );
+        }
     }
 }
 

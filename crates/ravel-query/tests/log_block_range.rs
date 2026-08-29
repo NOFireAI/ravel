@@ -37,14 +37,14 @@ use ravel_logseg::footer::{self, kind};
 use ravel_logseg::skip_index::SkipIndex;
 use ravel_logseg::writer::ObjectIdentity;
 use ravel_logseg::{
-    AttrValue, LogRecord, RlogConfig, RlogWriter, read_section, stream_attrs_bytes,
+    AttrValue, ColumnSelection, LogRecord, RlogConfig, RlogWriter, read_section, stream_attrs_bytes,
 };
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
     Capabilities, DelimitedList, Etag, GetOutcome, GetRange, ListPage, ObjectMeta,
     ObjectStoreBackend, PageToken, PutOptions, PutOutcome, StoreError,
 };
-use ravel_query::{BlockRangeFetcher, LogFetchError, LogQuery, LogSegmentFetcher};
+use ravel_query::{BlockRangeFetcher, CarriedFooter, LogFetchError, LogQuery, LogSegmentFetcher};
 use ravel_types::TenantHash;
 use ravel_types::accounting::{AccountedOp, QueryAccounting};
 use uuid::Uuid;
@@ -1882,5 +1882,164 @@ async fn a_trailer_larger_than_the_probe_costs_one_extra_counted_request() {
         skip_shape(&skip),
         skip_shape(&oracle_skip(&bytes)),
         "the index is decoded correctly despite the probe miss"
+    );
+}
+
+// ---- One miss, one count: the three-way carried-footer state (#883) --------
+
+/// A probe pinned to start exactly at SKIP_IDX's end on the version-3 fixture:
+/// it covers the footer and every tail section after SKIP_IDX (so there is no
+/// footer chase) but not SKIP_IDX itself, the one section a version-3 read has
+/// to locate candidate blocks through. Returns the records, the object bytes,
+/// and that suffix.
+fn probe_missing_skip_idx() -> (Vec<LogRecord>, Vec<u8>, u64) {
+    let (records, bytes) = large_object();
+    let total = bytes.len() as u64;
+    let footer = footer::open(&bytes).expect("footer");
+    let skip_desc = footer.section(kind::SKIP_IDX).expect("SKIP_IDX");
+    let suffix = total - (skip_desc.offset + skip_desc.len);
+    assert!(
+        footer.section(kind::PAGE_DIR).is_none(),
+        "this fixture must be version 3, so the version-3 miss site is the one \
+         under test"
+    );
+    assert!(
+        skip_desc.offset < total - suffix,
+        "the pinned probe must not reach SKIP_IDX's start"
+    );
+    (records, bytes, suffix)
+}
+
+async fn ranged_v3(bytes: &[u8], suffix: u64) -> BlockRangeFetcher {
+    let mem = Arc::new(MemoryStore::new());
+    mem.put(
+        "logs/three-way.rlog",
+        bytes::Bytes::copy_from_slice(bytes),
+        PutOptions::default(),
+    )
+    .await
+    .expect("put");
+    let store: Arc<dyn ObjectStoreBackend> = mem;
+    BlockRangeFetcher::new(store)
+        .with_whole_object_threshold(0)
+        .with_suffix_len(suffix)
+}
+
+/// The version-3 scan's tail-section miss is counted exactly once per object,
+/// by whichever layer issued the probe, across all three states a read can be
+/// in.
+///
+/// 1. No carried footer: this read probed, so it counts its own miss.
+/// 2. A footer carried by `fetch_plan_sections`, which already counted the miss
+///    into the plan phase's own stats: the scan counts nothing, and the total
+///    across the two phases is one, not two.
+/// 3. A footer carried by `fetch_footer`, which read the footer alone and
+///    counted nothing about SKIP_IDX: the scan counts the miss, because it is
+///    the read that pays for it and no other layer has.
+///
+/// All three counts are exact rather than bounds, so each fails in both
+/// directions.
+///
+/// Prove-the-test, per case, against
+/// `crates/ravel-query/src/log_fetcher.rs`'s `if count_tail_misses` in
+/// `fetch_object_with_footer`'s version-3 branch:
+///
+/// - case 1 fails (0 against 1) with the whole `stats.probe_misses += 1` under
+///   that gate deleted;
+/// - case 2 fails (2 against the expected total of 1) with the gate deleted so
+///   the site counts unconditionally, which is the double-count the previous
+///   commit fixed;
+/// - case 3 fails (0 against 1) with the gate restored to the previous commit's
+///   `plan_footer.is_none()`, which is false here even though the carried
+///   footer's read counted nothing. That is the under-count this test exists
+///   for.
+#[tokio::test]
+async fn a_version_3_tail_miss_is_counted_once_by_whoever_probed() {
+    let (records, bytes, suffix) = probe_missing_skip_idx();
+    let total = bytes.len() as u64;
+    let seg = seg_ref("logs/three-way.rlog", total, &records);
+    let fetcher = ranged_v3(&bytes, suffix).await;
+    let acc = QueryAccounting::new();
+    let all = ColumnSelection::all();
+
+    // Case 1: this read issues the probe.
+    let (_bytes, own) = fetcher
+        .fetch_object_with_footer(&seg, TENANT, i64::MIN, i64::MAX, &[], &all, None, &acc)
+        .await
+        .expect("unprompted fetch");
+    assert_eq!(own.probe_gets, 1, "the probe covered the footer, no chase");
+    assert_eq!(
+        own.probe_misses, 1,
+        "this read probed and SKIP_IDX fell outside its window"
+    );
+
+    // Case 2: the plan read counted, so the scan must not.
+    let (planned_footer, _skip, _fd, plan_counted) = fetcher
+        .fetch_plan_sections(&seg, TENANT, &acc)
+        .await
+        .expect("plan sections");
+    assert_eq!(
+        plan_counted.probe_misses, 1,
+        "ensure_tail_plan_sections counts the SKIP_IDX the window missed"
+    );
+    let (_bytes, after_counted) = fetcher
+        .fetch_object_with_footer(
+            &seg,
+            TENANT,
+            i64::MIN,
+            i64::MAX,
+            &[],
+            &all,
+            Some(CarriedFooter {
+                footer: &planned_footer,
+                tail_misses_counted: true,
+            }),
+            &acc,
+        )
+        .await
+        .expect("scan on a counted footer");
+    assert_eq!(
+        after_counted.probe_misses, 0,
+        "the plan phase already counted this object"
+    );
+    assert_eq!(
+        plan_counted.probe_misses + after_counted.probe_misses,
+        1,
+        "one miss, one count across the plan and the scan"
+    );
+
+    // Case 3: the plan read the footer alone and counted nothing.
+    let (bare_footer, footer_only) = fetcher
+        .fetch_footer(&seg, TENANT, &acc)
+        .await
+        .expect("footer-only plan read");
+    assert_eq!(
+        footer_only.probe_misses, 0,
+        "fetch_footer reads no tail section, so it counts no tail miss"
+    );
+    let (_bytes, after_bare) = fetcher
+        .fetch_object_with_footer(
+            &seg,
+            TENANT,
+            i64::MIN,
+            i64::MAX,
+            &[],
+            &all,
+            Some(CarriedFooter {
+                footer: &bare_footer,
+                tail_misses_counted: false,
+            }),
+            &acc,
+        )
+        .await
+        .expect("scan on an uncounted footer");
+    assert_eq!(
+        after_bare.probe_misses, 1,
+        "nobody counted this object's SKIP_IDX miss yet, so this read does"
+    );
+    assert_eq!(
+        footer_only.probe_misses + after_bare.probe_misses,
+        1,
+        "one miss, one count across the plan and the scan"
     );
 }
