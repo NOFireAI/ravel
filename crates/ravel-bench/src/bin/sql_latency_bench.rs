@@ -489,12 +489,14 @@ fn print_human_table(report: &SqlLatencyReport) {
     // objects (issue #767). The warm columns are `-` for a single-run report or
     // the Flight lane (no per-run accounting on the wire).
     //
-    // `pmiss` is the cold run's tail-section probe misses, plan phase plus scan
-    // phase (issue #883). It sits next to `get` because it is part of it: each
-    // miss is one of those GETs, spent because the derived suffix probe did not
-    // reach SKIP_IDX/PAGE_DIR. A `get` column that rises with `pmiss` is a probe
-    // too short; one that rises without it is not. The per-phase split is in the
-    // report JSON's `per_run_accounting`.
+    // `pmiss` is the cold run's uncovered tail SECTIONS, plan phase plus scan
+    // phase (issue #883) -- not a GET count. A short version-4 probe can miss
+    // SKIP_IDX and PAGE_DIR both and count twice while the fetcher coalesces
+    // their adjacent ranges into one GET, so it bounds the extra requests from
+    // above. It sits next to `get` to be read against it: a `get` column that
+    // rises alongside `pmiss` is a probe too short; one that rises with `pmiss`
+    // flat is not. The per-phase split is in the report JSON's
+    // `per_run_accounting`.
     println!(
         "  {:<32} | {:>9} | {:>9} | {:>9} | {:>9} | {:>7} | {:>7} | {:>7} | {:>7} | {:>7} | {:>7} | {:>9} | {:>7}",
         "id",

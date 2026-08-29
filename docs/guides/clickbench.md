@@ -539,10 +539,12 @@ warm one. It carries the same object-store and cache figures as `scan` plus
 PAGE_DIR on a version-4 object) that the run's suffix probe did not reach,
 split by the phase that issued the probe.
 
-Read them against `object_store_get_requests`. Each miss is one of those GETs,
-spent because the derived probe was too short for that object's trailer, so a
-run whose GETs rose along with its probe misses paid for the probe length, and
-one whose GETs rose with probe misses flat did not. This is the number that
+Read them against `object_store_get_requests`, and read them as uncovered tail
+SECTIONS rather than as GETs. A short version-4 probe can miss SKIP_IDX and
+PAGE_DIR both, incrementing twice, while the fetcher coalesces their adjacent
+ranges into a single GET -- so the count bounds the extra requests from above
+and never maps one-to-one. A run whose GETs rose alongside its probe misses
+paid for the probe length; one whose GETs rose with probe misses flat did not. This is the number that
 gates any tightening of the probe floor (`LOG_SUFFIX_FLOOR_BYTES`): a change
 that trades probe bytes for requests is a win only if these stay where they
 were. They are measured against the probe window rather than against the read
