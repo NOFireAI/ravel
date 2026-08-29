@@ -13,18 +13,31 @@
 //! report's statement is `SELECT ts, body FROM logs` over the full window, which
 //! is exactly the shape #693 part 3's whole-segment fast path serves. Issue #739
 //! dropped the fast path's block-range-threshold conjunct, so object size no
-//! longer gates it: on every row whose declared partition count fits inside the
-//! segment count -- both `over_threshold` values, cached and un-cached alike --
-//! the plan phase is skipped and each segment is read whole exactly once: one
-//! read per segment (the same statement as "the plan phase issued zero probes")
-//! and bytes amplification of about 1.0. Only the cache-wired row whose partition
-//! count exceeds the segment count fails the fast path's fourth conjunct and
-//! stripes; it is pinned separately as the one combo in the sweep that declines
-//! the fast path. On its over-threshold read shape the striping is visible as
-//! extra probe and directory GETs; on its whole-object read shape the plan pass
-//! and every partition's open share one `(0, object_size)` cache key, so
-//! single-flight coalesces them and only the plan pass, not a GET, is what the
-//! fast path removes there.
+//! longer decides ELIGIBILITY: on every row whose declared partition count fits
+//! inside the segment count -- both `over_threshold` values, cached and
+//! un-cached alike -- the plan phase is skipped and no segment is planned or
+//! probed for pruning.
+//!
+//! Since #887 object size decides the READ SHAPE inside that fast path instead.
+//! `PartitionCtx::open_by_column_chunk` routes each segment as it opens it, and
+//! it holds only when the segment declares RLOG v4 AND
+//! `LogSegmentFetcher::ranged_projection_pays` judges the bytes a narrow
+//! projection skips worth the round trips the probe-and-range protocol adds.
+//! The fixture writes v4 objects, so on this sweep the `over_threshold` axis is
+//! exactly that second conjunct: the whole-object rows put the block-range
+//! threshold out of reach, `ranged_projection_pays` answers false at or below
+//! it, and they keep the one whole-object GET per segment; the over-threshold
+//! rows clear it with the projection's saving to spare and take the ranged
+//! entry. Both are pinned below, each against the request and byte law of its
+//! own route.
+//!
+//! Only the cache-wired row whose partition count exceeds the segment count
+//! fails the fast path's fourth conjunct and stripes; it is pinned separately as
+//! the one combo in the sweep that declines the fast path. On its over-threshold
+//! read shape the striping is visible as extra probe and directory GETs; on its
+//! whole-object read shape the plan pass and every partition's open share one
+//! `(0, object_size)` cache key, so single-flight coalesces them and only the
+//! plan pass, not a GET, is what the fast path removes there.
 //!
 //! Gated on `sql-latency` (the module and bin's gate), so a default
 //! `cargo test -p ravel-bench` sees an empty crate rather than a link error. Run
@@ -37,6 +50,7 @@ use std::sync::Arc;
 
 use ravel_bench::logs_scan_scaling::{ComboResult, LogsScanScalingConfig, run};
 use ravel_object_store::memory::MemoryStore;
+use ravel_query::{DEFAULT_LOG_SUFFIX_LEN, LOG_SUFFIX_FLOOR_BYTES};
 
 /// The resolved snapshot's own catalog GET. `QueryAccounting` counts it in the
 /// same `AccountedOp::Get` bucket as the scan's reads, so every per-segment
@@ -46,24 +60,71 @@ use ravel_object_store::memory::MemoryStore;
 /// amplifications land on exact integers.
 const CATALOG_GET_SLACK: u64 = 1;
 
-/// Upper end of the band the fast-path full-window rows must land in (both read
-/// shapes, since #739): one pass over the dataset, plus at most one further read
-/// of every segment. A per-partition read sequence, the shape block striping
-/// produced, would blow straight past it at 32 partitions.
+/// Upper end of the band the whole-object fast-path rows must land in: one pass
+/// over the dataset, plus at most one further read of every segment. A
+/// per-partition read sequence, the shape block striping produced, would blow
+/// straight past it at 32 partitions.
 const MAX_FAST_PATH_AMPLIFICATION: f64 = 2.0;
 
 /// Float slack on a ratio that is an exact integer quotient of two byte counts.
 const EPS: f64 = 1e-9;
 
+/// The share of an object's columns this report's statement reads, as
+/// `ResolvedColumns::fraction_of` computes it: `SELECT ts, body` names two
+/// columns and `ColumnSelection` always adds `stream_ref`, so three distinct
+/// object columns out of the ten fixed ones `ravel_logseg::record` stores (the
+/// fixture declares no typed attribute columns, so there is nothing else in the
+/// denominator). This is the `projected_fraction` `LogsScanExec` hands
+/// `ranged_projection_pays`, and the precondition assertion below re-derives the
+/// routing decision from it rather than trusting the label on the row.
+const PROJECTED_FRACTION: f64 = 3.0 / 10.0;
+
+/// Requests per segment the ranged fast-path route issues, as a band derived
+/// from the shape of the read rather than from an observed number.
+///
+/// The protocol (`ravel_query::log_fetcher`, ADR-0107) is: one suffix probe for
+/// the tail sections (footer, PAGE_DIR, SKIP_IDX); one coalesced GET over the
+/// two front directory sections (STREAM_DIR/FIELD_DIR), which no suffix probe
+/// can reach; then the data. The data is ONE more GET on this fixture whichever
+/// way the fetcher decides it: the effective coalescing gap is one request cost
+/// (`DEFAULT_LOG_REQUEST_COST_BYTES`, ~1.8 MiB) and every object here is smaller
+/// than that, so all projected column-chunk extents of an object fuse into a
+/// single range -- and if the projected pages instead cover the BLOCKS section
+/// past `DEFAULT_LOG_COVERAGE_THRESHOLD`, the crossover replaces them with one
+/// whole-object GET, which is also one. Hence 3 per segment, and 2 if a probe
+/// long enough to reach the front sections ever makes that GET redundant.
+const RANGED_MIN_GETS_PER_SEGMENT: u64 = 2;
+const RANGED_MAX_GETS_PER_SEGMENT: u64 = 3;
+
 /// Whether this row's scan takes #693 part 3's whole-segment fast path: at least
 /// as many relevant segments as the plan declared partitions (the fast path's
 /// fourth conjunct, evaluated against the DECLARED count, which is what
 /// `LogsScanExec` compares). Since #739 dropped the block-range-threshold
-/// conjunct, object size no longer enters into it, so this is the only conjunct
-/// that varies across the sweep: the statement is predicate-free and its window
-/// contains every segment, so the other three hold for every row.
+/// conjunct, object size no longer enters into ELIGIBILITY, so this is the only
+/// conjunct that varies across the sweep: the statement is predicate-free and
+/// its window contains every segment, so the other three hold for every row.
+///
+/// What the fast path then COSTS depends on the route it opens each segment
+/// with; see [`reads_by_column_chunk`].
 fn takes_fast_path(c: &ComboResult, segments: usize) -> bool {
     c.scan_partitions <= segments
+}
+
+/// Whether this fast-path row opens its segments by column chunk (#887's ranged
+/// route, `PartitionCtx::open_by_column_chunk`) rather than with one
+/// whole-object GET each.
+///
+/// The routing predicate is `segment_format_version >=
+/// ravel_logseg::footer::VERSION && ranged_projection_pays(object_size,
+/// projected_fraction)`. The fixture writes v4 objects through `RlogWriter` and
+/// declares that version, so the first conjunct holds for every row. The second
+/// is false at or below the fetcher's block-range threshold and true once the
+/// object clears it by more than the projection's saving -- which is exactly the
+/// sweep's `over_threshold` axis, since the whole-object rows build their
+/// fetcher with the threshold at `u64::MAX`. The caller asserts the saving
+/// really does clear the break-even on this fixture rather than assuming it.
+fn reads_by_column_chunk(c: &ComboResult) -> bool {
+    c.over_threshold
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -84,16 +145,36 @@ async fn logs_scan_scaling_smoke_proves_cache_gated_fanout_and_request_count() {
     );
 
     // The `over_threshold` rows are only what they claim if the fixture's
-    // objects genuinely clear ADR-0107's threshold. Forcing the ranged path onto
-    // sub-threshold objects instead would make the 64 KiB suffix probe re-read
-    // each whole object, and would put the fast path out of reach entirely (its
-    // `object_size > block_range_threshold` conjunct), so every figure below
-    // would describe the plan-then-stripe path under an over-threshold label.
+    // objects genuinely clear ADR-0107's threshold, and since #887 that
+    // threshold is what routes them: `ranged_projection_pays` answers false
+    // outright at or below it, so a sub-threshold object cannot reach the ranged
+    // route at all and every figure below would describe a whole-object read
+    // under an over-threshold label. Forcing the ranged path onto sub-threshold
+    // objects instead (a threshold of 0) is the other route, and it is rejected
+    // in the bench itself: the suffix probe has a 128 KiB floor, so on a small
+    // object it re-reads the object and the byte figure measures object size
+    // rather than the path.
     assert!(
         report.config.min_object_bytes > report.config.over_threshold_block_range_threshold,
         "the smallest published object ({} bytes) must exceed the block-range \
          threshold ({} bytes) for the over_threshold rows to measure ADR-0107's \
          above-threshold path",
+        report.config.min_object_bytes,
+        report.config.over_threshold_block_range_threshold
+    );
+    // The second conjunct of the same routing decision, re-derived here rather
+    // than assumed: `ranged_projection_pays` takes the ranged route only when
+    // the bytes the projection is expected to skip, `object_size * (1 -
+    // projected_fraction)`, beat the fetcher's request-cost break-even -- which
+    // `with_block_range_threshold` pins to the same threshold value. Stated on
+    // the SMALLEST object, so it holds for every segment in the fixture.
+    let projected_saving = report.config.min_object_bytes as f64 * (1.0 - PROJECTED_FRACTION);
+    assert!(
+        projected_saving > report.config.over_threshold_block_range_threshold as f64,
+        "the projection skips {projected_saving:.0} bytes of the smallest object \
+         ({} bytes at a projected fraction of {PROJECTED_FRACTION}), which must \
+         beat the ranged path's break-even ({} bytes) for `ranged_projection_pays` \
+         to route the over_threshold rows by column chunk",
         report.config.min_object_bytes,
         report.config.over_threshold_block_range_threshold
     );
@@ -257,56 +338,140 @@ async fn logs_scan_scaling_smoke_proves_cache_gated_fanout_and_request_count() {
         }
     }
 
-    // Issue #693 part 3, the figure this report exists to carry. A
-    // block-predicate-free statement whose window contains every relevant
-    // segment, with at least as many relevant segments as declared partitions,
-    // skips the plan phase and reads each segment whole exactly once -- cached or
-    // not, and since #739 whatever the object size. So on every row at or below
-    // the segment count, on both `over_threshold` values, the GET count is the
-    // segment count (plus the snapshot's own catalog read) and the bytes come to
-    // one pass over the dataset.
+    // Issue #693 part 3, the figures this report exists to carry, split by the
+    // route #887 opens each segment with. A block-predicate-free statement whose
+    // window contains every relevant segment, with at least as many relevant
+    // segments as declared partitions, skips the plan phase on every row at or
+    // below the segment count -- cached or not, and since #739 whatever the
+    // object size. What one read of a segment then COSTS is the routing decision
+    // (`reads_by_column_chunk`), and the two routes have different laws:
     //
-    // The GET bound is what pins "zero plan probes": a plan phase costs one
-    // suffix probe per segment, which would put the count at 2x the segment
-    // count, far outside the slack.
-    let mut fast_path_rows = 0usize;
+    // - whole-object rows: one full GET per segment, and one pass over the
+    //   dataset. The GET bound is what pins "zero plan probes" there: a plan
+    //   phase costs one suffix probe per segment, which would put the count at 2x
+    //   the segment count, far outside the slack.
+    // - ranged rows: the probe-and-range protocol, whose per-segment request
+    //   band is `RANGED_MIN_GETS_PER_SEGMENT..=RANGED_MAX_GETS_PER_SEGMENT`, and
+    //   whose bytes are the data the read brings PLUS one suffix probe per
+    //   segment. On this statement the probe is pure overhead: the projection is
+    //   narrow by column count (`PROJECTED_FRACTION`), which is what routes it,
+    //   but the `body` column carries nearly every stored byte, so the projected
+    //   pages cover the BLOCKS section past `DEFAULT_LOG_COVERAGE_THRESHOLD` and
+    //   the fetcher's byte-exact crossover falls back to one whole-object GET
+    //   after the probe. The band below states that: one pass over the dataset
+    //   plus a probe per segment.
+    let dataset_bytes = report.config.dataset_bytes as f64;
+    let segs_all = segments as u64;
+    // `derive_suffix_len` clamps the probe to `[LOG_SUFFIX_FLOOR_BYTES,
+    // DEFAULT_LOG_SUFFIX_LEN]` per object (#883), so the probe traffic over the
+    // fixture is between one floor and one cap per segment. The upper bound
+    // carries a second cap's worth on top for the front-section GETs and any
+    // tail range, which are directory bytes and orders of magnitude smaller than
+    // a probe. Neither end is an observed number: the floor is the constant, the
+    // dataset size is the report's own reading.
+    let ranged_amp_min = 1.0 + (segs_all * LOG_SUFFIX_FLOOR_BYTES) as f64 / dataset_bytes;
+    let ranged_amp_max = 1.0 + 2.0 * (segs_all * DEFAULT_LOG_SUFFIX_LEN) as f64 / dataset_bytes;
+    let mut whole_object_rows = 0usize;
+    let mut ranged_rows = 0usize;
     for c in report
         .combos
         .iter()
         .filter(|c| takes_fast_path(c, segments))
     {
-        fast_path_rows += 1;
         let label = format!(
             "tp={} cache={} over_threshold={}",
             c.target_partitions, c.cache_wired, c.over_threshold
         );
         let segs = c.segments_scanned as u64;
-        assert!(
-            c.object_store_get_requests >= segs
-                && c.object_store_get_requests <= segs + CATALOG_GET_SLACK,
-            "{label}: the whole-segment fast path reads each of {segs} segments \
-             once and issues zero plan probes, so the GET count must be {segs} \
-             (plus at most {CATALOG_GET_SLACK} catalog read); got {} \
-             ({:.4} reads per segment)",
-            c.object_store_get_requests,
-            c.reads_per_segment
-        );
-        assert!(
-            c.bytes_amplification >= 1.0 - EPS
-                && c.bytes_amplification <= MAX_FAST_PATH_AMPLIFICATION,
-            "{label}: bytes_amplification {:.4} is outside the one-pass band \
-             [1.0, {MAX_FAST_PATH_AMPLIFICATION}]; {} bytes fetched over a {} \
-             byte dataset",
-            c.bytes_amplification,
-            c.object_store_bytes,
-            report.config.dataset_bytes
-        );
+        if reads_by_column_chunk(c) {
+            ranged_rows += 1;
+            assert!(
+                c.object_store_get_requests >= RANGED_MIN_GETS_PER_SEGMENT * segs
+                    && c.object_store_get_requests
+                        <= RANGED_MAX_GETS_PER_SEGMENT * segs + CATALOG_GET_SLACK,
+                "{label}: the ranged fast-path route issues a suffix probe, a \
+                 front-section GET, and one coalesced data read per segment, so \
+                 the GET count over {segs} segments must be in [{}, {}] (the \
+                 upper end plus at most {CATALOG_GET_SLACK} catalog read); got {} \
+                 ({:.4} reads per segment). One read per segment means the route \
+                 stopped engaging -- the segments must declare RLOG \
+                 `ravel_logseg::footer::VERSION` for `open_by_column_chunk` to \
+                 reach `ranged_projection_pays` at all.",
+                RANGED_MIN_GETS_PER_SEGMENT * segs,
+                RANGED_MAX_GETS_PER_SEGMENT * segs,
+                c.object_store_get_requests,
+                c.reads_per_segment
+            );
+            assert!(
+                c.bytes_amplification >= ranged_amp_min - EPS
+                    && c.bytes_amplification <= ranged_amp_max,
+                "{label}: the ranged route moves one pass over the dataset plus \
+                 one suffix probe per segment, so bytes_amplification must be in \
+                 [{ranged_amp_min:.4}, {ranged_amp_max:.4}]; got {:.4} ({} bytes \
+                 over a {} byte dataset). Exactly 1.0 means the segments were read \
+                 whole and the ranged route never engaged; below the band means \
+                 the coverage crossover stopped falling back to the whole object, \
+                 which is a routing change, not noise.",
+                c.bytes_amplification,
+                c.object_store_bytes,
+                report.config.dataset_bytes
+            );
+            // The same partition value and cache setting on the other read shape:
+            // the same plan, the same rows, off the ranged route. Comparing the
+            // two is what makes the figures above a statement about the ROUTE
+            // rather than about this fixture's request count.
+            let whole = report
+                .combo(c.target_partitions, c.cache_wired, false)
+                .expect("the same partition value on the whole-object read shape");
+            assert!(
+                c.object_store_get_requests > whole.object_store_get_requests,
+                "{label}: the ranged route pays a probe and a front-section GET \
+                 the whole-object route never issues, so it must read strictly \
+                 more than its whole-object neighbour ({}); got {}",
+                whole.object_store_get_requests,
+                c.object_store_get_requests
+            );
+        } else {
+            whole_object_rows += 1;
+            assert!(
+                c.object_store_get_requests >= segs
+                    && c.object_store_get_requests <= segs + CATALOG_GET_SLACK,
+                "{label}: the whole-object fast-path route reads each of {segs} \
+                 segments once and issues zero plan probes, so the GET count must \
+                 be {segs} (plus at most {CATALOG_GET_SLACK} catalog read); got {} \
+                 ({:.4} reads per segment)",
+                c.object_store_get_requests,
+                c.reads_per_segment
+            );
+            assert!(
+                c.bytes_amplification >= 1.0 - EPS
+                    && c.bytes_amplification <= MAX_FAST_PATH_AMPLIFICATION,
+                "{label}: bytes_amplification {:.4} is outside the one-pass band \
+                 [1.0, {MAX_FAST_PATH_AMPLIFICATION}]; {} bytes fetched over a {} \
+                 byte dataset",
+                c.bytes_amplification,
+                c.object_store_bytes,
+                report.config.dataset_bytes
+            );
+        }
     }
+    let fast_path_rows = whole_object_rows + ranged_rows;
     assert!(
         fast_path_rows >= 8,
         "the sweep must pin the fast path on both cache settings and both \
          `over_threshold` values at more than one partition value; got \
          {fast_path_rows} rows"
+    );
+    assert_eq!(
+        whole_object_rows, ranged_rows,
+        "the `over_threshold` axis is the routing axis, so the fast-path rows \
+         must split evenly between the two routes; got {whole_object_rows} \
+         whole-object and {ranged_rows} ranged"
+    );
+    assert!(
+        ranged_rows >= 4,
+        "the ranged route must be pinned on both cache settings at more than one \
+         partition value; got {ranged_rows} rows"
     );
     for over_threshold in [false, true] {
         for cache_wired in [false, true] {
@@ -318,7 +483,9 @@ async fn logs_scan_scaling_smoke_proves_cache_gated_fanout_and_request_count() {
                     takes_fast_path(c, segments),
                     "tp={tp} cache={cache_wired} over_threshold={over_threshold}: \
                      a partition value at or below the segment count must stay on \
-                     the fast path since #739, but the plan declared {} partitions",
+                     the fast path since #739 -- #887 routes what one read of a \
+                     segment costs, not whether the fast path applies -- but the \
+                     plan declared {} partitions",
                     c.scan_partitions
                 );
             }
