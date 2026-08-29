@@ -250,8 +250,17 @@ pub struct Catalog {
     /// issue #888). Consulted in [`Catalog::load_column_stats`] after the HEAD
     /// GET and before the stats-object GET, so a repeated eligible plan against
     /// an unchanged folded HEAD reuses the decoded object instead of
-    /// re-fetching it. Swept per tenant by [`Catalog::evict_idle_tenants`]
-    /// alongside the other re-derivable per-tenant caches.
+    /// re-fetching it.
+    ///
+    /// Reclamation, stated precisely because the two dimensions differ.
+    /// ENTRY COUNT is bounded by (tenants x signals) and
+    /// [`Catalog::evict_idle_tenants`] removes a tenant's entry once it passes
+    /// the idle TTL. ENTRY SIZE has no budget: a `LoadedColumnStats` holds one
+    /// `ColumnStatsSegment` per live segment, so an ACTIVE tenant's entry grows
+    /// with that tenant and is never reclaimed while it stays active.
+    /// `cache_capacity_per_tenant`, which bounds the sibling decoded caches,
+    /// cannot express this: it is documented in entries and this map holds
+    /// exactly one entry per key. Issue #905 carries the byte budget.
     column_stats_cache: Mutex<HashMap<(TenantHash, Signal), CachedColumnStats>>,
 }
 
