@@ -1721,6 +1721,24 @@ fn plan_references_names(plan: &LogicalPlan, names: &HashSet<&str>) -> bool {
                 found = true;
                 return Ok(TreeNodeRecursion::Stop);
             }
+            // A subquery's plan hangs off the expression, not off
+            // `plan.inputs()`, so the input recursion below never reaches it.
+            // `collect_aggregate_exprs` descends these three for the same
+            // reason; without the matching descent here the two walks disagree,
+            // and `SELECT (SELECT MIN(status) FROM logs)` would be judged to
+            // name no declared column while being judged to hold an aggregate.
+            let nested = match node {
+                Expr::ScalarSubquery(subquery) => Some(&subquery.subquery),
+                Expr::InSubquery(in_subquery) => Some(&in_subquery.subquery.subquery),
+                Expr::Exists(exists) => Some(&exists.subquery.subquery),
+                _ => None,
+            };
+            if let Some(plan) = nested
+                && plan_references_names(plan, names)
+            {
+                found = true;
+                return Ok(TreeNodeRecursion::Stop);
+            }
             Ok(TreeNodeRecursion::Continue)
         });
         if found {
