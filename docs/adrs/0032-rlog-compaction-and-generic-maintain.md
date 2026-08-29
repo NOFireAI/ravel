@@ -203,7 +203,7 @@ construction once the codec seam exists.
   amended in the same commits as the code that implements each change,
   per the doc-currency rule.
 
-## Amendment 2026-08-26: a part never exceeds the size cap; a stream may span parts
+## Amendment 2026-08-26: a part splits on a size target; a stream may span parts
 
 Status: accepted. Supersedes the one-stream-per-part rule that the RLOG
 merge implemented under "stream-merge N inputs into size-capped output
@@ -213,16 +213,20 @@ parts" above. Issue #711.
 
 The original RLOG compactor split parts on stream boundaries only: it
 merged one whole stream into the in-progress part, then compared the
-part's accumulated record-byte estimate against `max_l1_part_bytes` and
-opened a new part if the cap was reached. The invariant that produced -
-"a stream never straddles two parts", the log analogue of RSEG's
-series-boundary split - is replaced by a pure size bound:
+part's accumulated record-byte estimate against the single size knob that
+then existed, and opened a new part if it was reached. The invariant that
+produced - "a stream never straddles two parts", the log analogue of
+RSEG's series-boundary split - is replaced by a pure size rule:
 
-> A part never exceeds `max_l1_part_bytes` of estimated live record heap.
-> A stream may span consecutive parts.
+> A part is closed as soon as its estimated live record heap reaches
+> `l1_part_memory_target_bytes`, so it exceeds that target by at most the
+> one record that crossed it. A stream may span consecutive parts.
 
-The cap is now checked after every merged record, so a part closes
-wherever in the merged record sequence the cap falls.
+The target is checked after every merged record, so a part closes
+wherever in the merged record sequence it falls. The knob is named
+`l1_part_memory_target_bytes` as of the 2026-08-29 amendment below; this
+amendment was written when one knob named `max_l1_part_bytes` measured
+that heap quantity, and it is that heap quantity the rule is about.
 
 ### Why
 
@@ -244,14 +248,14 @@ holds `LogRecord`s, whose Rust representation for a wide row is an order
 of magnitude larger: per-row `String` and `Vec` headers and allocations,
 a per-row copy of the resource/scope blob, and one `(String, AttrValue)`
 slot per attribute, which for 105 attributes is 12-16 KB of heap per row
-against roughly 1 KB of payload. A nominal 256 MiB cap therefore
+against roughly 1 KB of payload. A nominal 256 MiB target therefore
 permitted several GB of live records even where a split point existed.
 `estimate_record` now charges the record's Rust-side heap, term by term
 (the formula is stated above the function in `crates/ravel-maintain/src/rlog.rs`),
 so 256 MiB of estimate is roughly 256 MiB of heap.
 
 Both halves are needed. Moving the check alone would still let a part
-grow past the cap by the estimate's error factor; fixing the estimate
+grow past the target by the estimate's error factor; fixing the estimate
 alone would still leave a single-stream bucket with nowhere to split.
 
 ### What readers must tolerate
@@ -284,13 +288,15 @@ parts changed. Concretely:
   and never used as a gate, so this is a reporting change, not a
   correctness one. A caller that needs the true distinct-stream count of
   a compaction must union the parts' `STREAM_DIR`s.
-- **Part counts rise, and parts get smaller on disk than the cap
-  suggests.** The cap now bounds estimated heap, not encoded bytes, so a
-  wide-row bucket produces more, individually smaller, L1 objects than
-  the same nominal cap produced before. That is the intended trade:
-  bounded compactor memory in exchange for more objects. Operators who
-  want fewer, larger parts raise `max_l1_part_bytes` deliberately, with
-  the memory cost now visible in the same number.
+- **Part counts rise, and parts get smaller on disk than the target
+  suggests.** `l1_part_memory_target_bytes` is measured in estimated heap,
+  not encoded bytes, so a wide-row bucket produces more, individually
+  smaller, L1 objects than the same nominal figure produced before. That is
+  the intended trade: bounded compactor memory in exchange for more objects.
+  An operator who wants fewer, larger parts on such a bucket raises
+  `l1_part_memory_target_bytes`, with the memory cost visible in the same
+  number; raising `max_l1_part_bytes` does nothing there, because the heap
+  target is the one that fires first.
 
 ### Input read concurrency
 
@@ -326,24 +332,31 @@ already unions every part of a `RewriteRecord`.
 
 The RSPAN erasure rewriter (`build_rewrite_spans`) now runs through the
 same shared merge too (issue #742): it streams each input's blocks through
-one `BlockCursor` per input and partitions survivors into
-`max_l1_part_bytes`-bounded parts, so neither the logs nor the spans
-erasure rewrite is unbounded any longer, and both emit N parts for the same
-reason a compaction does.
+one `BlockCursor` per input and splits survivors on
+`l1_part_memory_target_bytes`, the only part-size knob the RSPAN merge
+reads, so neither the logs nor the spans erasure rewrite is unbounded any
+longer, and both emit N parts for the same reason a compaction does.
 
-## Amendment 2026-08-29: the heap knob is a split target, not a bound
+## Amendment 2026-08-29: the heap knob is a split target; the stored knob counts every section
 
 Status: accepted. Amends the wording of the 2026-08-26 amendment above.
 Issues #872, #680.
 
-The knob that amendment calls `max_l1_part_bytes` was split in two
-(issue #872), because one name covered two quantities about 74x apart:
+The single knob that amendment was written against, then named
+`max_l1_part_bytes`, was split in two (issue #872), because one name
+covered two quantities about 74x apart:
 `max_l1_part_bytes` keeps the name and now means encoded/on-object bytes,
-and the heap quantity this amendment is about is
-`l1_part_memory_target_bytes`. Read the invariant above against that
-second name.
+and the heap quantity that amendment is about is
+`l1_part_memory_target_bytes`. The amendment's rule has been rewritten in
+place against that second name, and the two names now denote:
 
-The invariant is also stated too strongly for the codebase as a whole.
+- `l1_part_memory_target_bytes` - decoded record heap, the split target
+  the RLOG and RSPAN merges compare their in-progress part against.
+- `max_l1_part_bytes` - encoded/on-object bytes, the stored-size target
+  the RLOG merge and the RSEG metrics builder compare their in-progress
+  part's stored-size estimate against.
+
+The heap rule was also stated too strongly for the codebase as a whole.
 "A part never exceeds ... of estimated live record heap" holds on the
 RLOG path this ADR governs, where the check runs after every merged
 record, so a part exceeds the target by at most one record. It does not
@@ -359,3 +372,30 @@ So the number is where parts split, not a ceiling on resident bytes, and
 it is named for that. Sizing a host from it alone is safe only for logs;
 for spans the figure to survive is the target plus the largest single
 trace a tenant sends.
+
+### The stored-size target counts every section, not just the payload
+
+The same defect had survived in the other half of the pair (issue #680).
+`max_l1_part_bytes` is named for the bytes of the object about to be
+written, and on both paths that use it the figure compared against it is
+an estimate, so the estimate has to charge every section whose size grows
+with what the part carries or the object outgrows the target while the
+estimate stays under it, series by series or record by record.
+
+- RLOG (`rlog.rs`) charges `estimate_stored_record` per record plus one
+  STREAM_DIR entry per distinct stream in the part; the STREAM_DIR half
+  was itself a gap closed earlier under this rule.
+- RSEG (`build.rs`) charges the TS/VAL/HIST pages, each series' SERIES_IDS
+  entry and series-major SERIES_META cells, each run's run-major cells,
+  the per-sample provenance columns a run-merged run adds, each distinct
+  LABEL_DICT string, and the EXEMPLARS records. It previously charged the
+  page payload alone, which left LABEL_DICT, the provenance columns and
+  the exemplars uncounted.
+
+Both estimates are pre-compression proxies over zstd-compressed sections,
+so they charge at or above what those sections store. Neither is a bound:
+each is checked between whole items (a record, a series), so a part runs
+past the target by the last item that crossed it, and neither models the
+compressor. What the rule forbids is a term missing from the sum
+altogether, because that error accumulates without limit while an
+overshoot by one item does not.

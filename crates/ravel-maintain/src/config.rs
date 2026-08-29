@@ -174,8 +174,8 @@ pub const DEFAULT_CLOCK_SKEW_ALLOWANCE_NS: i64 = 300_000_000_000;
 /// writer interlock so the sweeper's unreferenced-part rule is safe.
 pub const DEFAULT_MAX_COMPACTION_LIFETIME_NS: i64 = NS_PER_HOUR;
 /// Default `max_l1_part_bytes`: 256 MiB. This is the **stored-size target**:
-/// the encoded/on-object byte budget a part is closed at (RSEG output page
-/// bytes in `build.rs`; an encoded-bytes estimate in the RLOG merge). It is
+/// the encoded/on-object byte budget a part is closed at, estimated per section
+/// in `build.rs` and per record plus per stream in the RLOG merge. It is
 /// deliberately equal to the memory-target default so this crate's geometry is
 /// unchanged from when one knob did both jobs: on a wide schema the memory
 /// target reaches 256 MiB of decoded record heap long before a part's stored
@@ -354,11 +354,18 @@ pub struct CompactorConfig {
     pub max_compaction_lifetime_ns: i64,
     /// The **stored-size target**: close the in-progress L1 part once its
     /// encoded/on-object bytes reach this. On the RSEG path (`build.rs`) this
-    /// is the accumulated output page-byte total (ADR-0092 decision 3). On the
+    /// is the part's stored-size estimate, which charges every section that
+    /// grows with what the part carries: the TS/VAL/HIST pages (ADR-0092
+    /// decision 3), each series' SERIES_IDS entry and SERIES_META cells, the
+    /// per-sample provenance columns a run-merged run adds, each distinct
+    /// LABEL_DICT string, and the EXEMPLARS records. On the
     /// RLOG path (`rlog.rs`) it is an encoded-bytes estimate summed per record
     /// ([`crate::rlog::estimate_stored_record`]) plus one STREAM_DIR entry per
     /// distinct stream in the part, because the RLOG writer holds
-    /// row-major records and does not expose an incremental encoded size. Named
+    /// row-major records and does not expose an incremental encoded size. Both
+    /// estimates are pre-compression proxies over zstd-compressed sections, so
+    /// they charge at or above what those sections store, which is the
+    /// conservative direction. Named
     /// for the bytes it measures: it governs object geometry (object count and
     /// per-object stored size), which is what the historical `max_l1_part_bytes`
     /// name always implied. It does NOT bound memory; neither does
@@ -389,7 +396,7 @@ pub struct CompactorConfig {
     ///   a span shard is this target plus the largest single trace a tenant
     ///   sends, not this target.
     /// - RSEG metrics (`build.rs`): does not read this field at all. Parts close
-    ///   on [`Self::max_l1_part_bytes`] (encoded output bytes), and that path's
+    ///   on [`Self::max_l1_part_bytes`] (the estimated stored object), and that path's
     ///   peak is one fetch window's raw pages, plus one series' decoded samples
     ///   (a multi-run series is decoded and merged whole, so it is bounded by
     ///   that series' size and by nothing configurable), plus every finished
