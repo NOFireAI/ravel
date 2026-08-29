@@ -7,13 +7,14 @@
 # Usage: pr-review-status.sh <pr-number> [--confirm-addressed]
 #
 # --confirm-addressed: the operator's explicit statement that every
-# CodeRabbit inline comment on the PR has been read and each one fixed or
-# answered. The REST API has no resolved/unresolved field (see below), so
+# CodeRabbit finding on the PR has been read and each one fixed or
+# answered, both the inline comments and the outside-diff findings in the
+# review body. The REST API has no resolved/unresolved field (see below), so
 # once a PR has ever had a finding its comment count never returns to zero
 # and the clean branch below could otherwise never fire again (issue #764:
 # PR #754 had 13 addressed comments across 4 fix rounds and no way to get
-# the SHA-pinned merge command). The flag skips ONLY the comment-count
-# conjunct; CI, the current-head review, and the mergeState checks still
+# the SHA-pinned merge command). The flag skips ONLY the finding-count
+# conjuncts; CI, the current-head review, and the mergeState checks still
 # gate exactly as without it.
 set -euo pipefail
 
@@ -113,6 +114,17 @@ cr_walkthroughs=$(echo "${issue_comments_json}" | jq --arg sha "${head_sha}" \
 comments_json="$(gh api "repos/${repo}/pulls/${pr}/comments" --paginate | jq -s 'add')"
 cr_comments=$(echo "${comments_json}" | jq '[.[] | select(.user.login=="coderabbitai[bot]")] | length')
 
+# A finding that falls outside the range GitHub accepts an inline comment on
+# goes into the review BODY instead, under an "Outside diff range comments (N)"
+# heading. It leaves no entry on the review-comments endpoint above, so nothing
+# read so far can see it. On #908 the two inline comments were pinned to a
+# superseded commit and had already been fixed, so `inline_comments=2` read as
+# "two stale findings, nothing new" while an unaddressed body finding sat at
+# the current head -- the exact shape this script exists to prevent. Head
+# discipline is the review's own commit_id, matching cr_reviews above.
+cr_outside_diff=$(echo "${reviews_json}" | jq --arg sha "${head_sha}" \
+  -f "$(dirname "$0")/lib/coderabbit-outside-diff.jq")
+
 summary="PR #${pr} @ ${head_sha}: state=${state} mergeState=${merge_state} CI=${success} pass/${pending} pending/${failing} fail"
 if [[ "${other}" != "0" ]]; then
   summary="${summary}/${other} unrecognized"
@@ -121,6 +133,14 @@ if [[ "${failing}" != "0" ]]; then
   summary="${summary} (${failing_names})"
 fi
 summary="${summary} | CodeRabbit: reviews@head=${cr_reviews} walkthroughs@head=${cr_walkthroughs} last=${cr_last_state} inline_comments=${cr_comments}"
+# Appended only when nonzero, so a PR with no body findings prints exactly the
+# line it printed before this field existed. The name says body_findings rather
+# than anything with "comment" in it: these are not inline comments and are not
+# fetched from the comments endpoint, and an operator who reads the two counts
+# as one number is back to the #908 failure.
+if [[ "${cr_outside_diff}" != "0" ]]; then
+  summary="${summary} outside_diff_body_findings@head=${cr_outside_diff}"
+fi
 echo "${summary}"
 
 if [[ "${state}" != "OPEN" ]]; then
@@ -139,11 +159,17 @@ elif [[ "${pending}" != "0" ]]; then
   echo "  -> CI still running; wait"
 elif [[ "${cr_comments}" != "0" && "${confirm_addressed}" != "1" ]]; then
   echo "  -> ${cr_comments} CodeRabbit inline comment(s); read them, then re-run with --confirm-addressed once each is fixed or answered (the API cannot tell; see the header comment)"
+elif [[ "${cr_outside_diff}" != "0" && "${confirm_addressed}" != "1" ]]; then
+  echo "  -> ${cr_outside_diff} CodeRabbit outside-diff finding(s) in the review BODY at head, not inline; read the body with \`gh api repos/${repo}/pulls/${pr}/reviews --jq '.[] | select(.commit_id==\"${head_sha}\") | .body'\`, then re-run with --confirm-addressed once each is fixed or answered"
 elif [[ "${merge_state}" != "CLEAN" && "${merge_state}" != "UNSTABLE" ]]; then
   echo "  -> every check and review looks clean, but mergeState is ${merge_state} (not CLEAN/UNSTABLE); verify by hand before merging"
 else
-  if [[ "${cr_comments}" != "0" ]]; then
+  if [[ "${cr_comments}" != "0" && "${cr_outside_diff}" != "0" ]]; then
+    echo "  -> clean (operator confirmed all ${cr_comments} inline comment(s) and ${cr_outside_diff} outside-diff body finding(s) addressed): CI green, CodeRabbit reviewed the current head"
+  elif [[ "${cr_comments}" != "0" ]]; then
     echo "  -> clean (operator confirmed all ${cr_comments} inline comment(s) addressed): CI green, CodeRabbit reviewed the current head"
+  elif [[ "${cr_outside_diff}" != "0" ]]; then
+    echo "  -> clean (operator confirmed all ${cr_outside_diff} outside-diff body finding(s) addressed): CI green, CodeRabbit reviewed the current head"
   else
     echo "  -> clean: CI green, CodeRabbit reviewed the current head with zero inline comments"
   fi
