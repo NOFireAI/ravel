@@ -72,6 +72,12 @@ fn seg_ref(seq: u64, sample_count: u64) -> SegmentRef {
         writer_seq: seq,
         created_unix_ns: 0,
         level: SegmentLevel::L0,
+        // The metadata path under test never opens the object, so nothing here
+        // routes on this. Declared as the current logs version anyway, matching
+        // the writer a real ref of this shape would have come from and the
+        // other ravel-sql fixtures, rather than a literal that would be a lie
+        // if anything later did read it.
+        segment_format_version: u32::from(ravel_logseg::footer::VERSION),
     }
 }
 
@@ -349,6 +355,46 @@ async fn eligible_min_max_answers_from_metadata_with_two_gets() {
     );
     assert_eq!(scalar(&batches, 0), Some(200), "min(status)");
     assert_eq!(scalar(&batches, 1), Some(404), "max(status)");
+    assert_eq!(
+        store.gets(),
+        2,
+        "exactly the HEAD GET and the one column-stats GET; no scan"
+    );
+}
+
+/// The declared reference can sit inside a subquery expression rather than the
+/// outer plan. A subquery's plan hangs off the expression, not off
+/// `plan.inputs()`, so an eligibility walk that only recurses inputs misses it
+/// and skips the stats load -- which fails open (the nested aggregate falls
+/// back to scanning) but throws away exactly the case ADR-0850 exists for.
+#[tokio::test]
+async fn eligible_min_max_inside_a_scalar_subquery_still_answers_from_metadata() {
+    let store = CountingStore::new(Arc::new(MemoryStore::new()));
+    let seg = seg_ref(1, 5);
+    install_head_and_stats(
+        &*store,
+        &[stats_segment(
+            &seg,
+            vec![i64_stat("status", &[(200, 3), (404, 2)], 0)],
+        )],
+    )
+    .await;
+    let executor = executor(&store);
+
+    let (plan, batches) = run(
+        &executor,
+        snapshot_of(vec![seg]),
+        "SELECT (SELECT min(status) FROM logs)",
+        &status_col(),
+    )
+    .await;
+
+    assert!(
+        !plan.contains("LogsScanExec"),
+        "a min() inside a scalar subquery must still answer from stats, not a \
+         scan; plan was:\n{plan}"
+    );
+    assert_eq!(scalar(&batches, 0), Some(200), "min(status) via subquery");
     assert_eq!(
         store.gets(),
         2,
