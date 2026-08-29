@@ -44,6 +44,18 @@
 # The older "Outside diff range and nitpick comments (N)" variant is emitted in
 # the same element and is still matched.
 #
+# KNOWN LIMIT, accepted deliberately: a body that quotes the COMPLETE element
+# verbatim still counts. Tightening further (requiring the "> " blockquote
+# prefix the bot currently emits, say) would exclude that case, but it couples
+# this check to a formatting detail of the bot's output -- and if that detail
+# ever changes, real findings stop being counted and the gate goes quiet. That
+# is a false CLEAR, the failure this whole check exists to prevent, traded for
+# a false BLOCK that costs one read of the body. The asymmetry decides it: an
+# over-count makes a human look, an under-count ships unfixed findings. Verified
+# not to fire in practice -- run against the live review bodies on PR #915 at
+# head 88f60210, including the review that raised this exact concern, the count
+# is 0.
+#
 # Counting rule: the heading carries the number of findings in the block in
 # parentheses, so a heading with a count contributes that count, and a heading
 # without one contributes 1. Multiple headings in one body, and multiple
