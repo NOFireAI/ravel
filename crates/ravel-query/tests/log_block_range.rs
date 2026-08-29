@@ -1372,8 +1372,8 @@ async fn page_decode_accounting_is_a_separate_axis_from_wire_bytes() {
 // The whole-object-vs-ranged decision is driven from one configurable quantity,
 // the request cost (a latency-bandwidth product; `BlockRangeFetcher::
 // with_request_cost_bytes`), not from a byte-only size threshold. Test 10 pins
-// that by reading an object the byte-only rule would range-fetch whole, because
-// the request cost says so; test 11 pins that a large coalescing gap (also
+// that by reading whole an object the byte-only rule would have range-fetched,
+// because the request cost says so; test 11 pins that a large coalescing gap (also
 // driven from the request cost) never turns a genuinely narrow read into a
 // whole-object one.
 
@@ -1506,6 +1506,60 @@ async fn whole_object_vs_ranged_is_driven_by_the_request_cost() {
         large_counting.get_count(),
         1 + 1 + expected_runs,
         "probe(1) + coalesced front-meta(1) + block runs({expected_runs})"
+    );
+
+    // Medium side (the discriminator): the ONLY fixture inside the interval where
+    // the two rules disagree, [DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD, break_even) =
+    // [512 KiB, 700 KiB). Under the request-cost rule its size is below the
+    // break-even, so it is read whole in one GET; under the byte-only 512 KiB
+    // rule it is above the floor and would take the ranged path. Both bounds are
+    // asserted (mirroring `small_total < break_even`) so a fixture-generation
+    // change that drifted its encoded size out of the window would fail here
+    // rather than silently restoring the vacuity this test exists to remove. The
+    // ts window is narrow ([2, 11] of 27 blocks, coverage under the crossover) so
+    // that reverting the size rule to byte-only genuinely sends it ranged and the
+    // coverage backstop does not route it back to a whole-object read.
+    let (medium_recs, medium_bytes) = medium_object();
+    let medium_total = medium_bytes.len() as u64;
+    assert!(
+        medium_total > ravel_query::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+        "medium fixture {medium_total} must sit above the {} B byte-only threshold",
+        ravel_query::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD
+    );
+    assert!(
+        medium_total < break_even,
+        "medium fixture {medium_total} must sit below the {break_even} B break-even"
+    );
+    let medium_mem = Arc::new(MemoryStore::new());
+    medium_mem
+        .put(
+            "logs/medium.rlog",
+            medium_bytes.clone().into(),
+            PutOptions::default(),
+        )
+        .await
+        .expect("put medium");
+    let medium_seg = seg_ref("logs/medium.rlog", medium_total, &medium_recs);
+    let medium_counting = Arc::new(CountingStore::new(medium_mem));
+    let medium_store: Arc<dyn ObjectStoreBackend> = medium_counting.clone();
+    let (_medium_buf, medium_stats) = BlockRangeFetcher::new(medium_store)
+        .with_request_cost_bytes(REQUEST_COST)
+        .fetch_object(&medium_seg, TENANT, 2, 11, &QueryAccounting::new())
+        .await
+        .expect("medium fetch");
+    assert!(
+        medium_stats.whole_object,
+        "an object inside [byte-only threshold, break-even) is read whole under \
+         the request-cost rule"
+    );
+    assert_eq!(
+        medium_counting.get_count(),
+        1,
+        "the whole-object read is exactly one GET"
+    );
+    assert_eq!(
+        medium_stats.block_range_gets, 0,
+        "a whole-object read issues no ranged block GETs"
     );
 }
 
