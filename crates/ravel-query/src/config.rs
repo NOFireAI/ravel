@@ -167,6 +167,24 @@ pub struct EngineConfig {
     /// mitigation for an operator who hits a regression on the block-range path;
     /// `0` sends every object through it.
     pub logs_block_range_threshold: u64,
+    /// Cost of one object-store round trip, denominated in transfer bytes: a
+    /// saved request is worth this many saved bytes (ADR-0904 decision 1). Like
+    /// `logs_block_range_threshold` this is not an engine limit; it rides here
+    /// because this is the config the server folds its query flags into and
+    /// hands to every fetcher it builds.
+    ///
+    /// A property of the store and the instance (round-trip latency and
+    /// single-stream bandwidth at the fetch concurrency in use), not of the
+    /// RLOG format, which is why it is configurable rather than frozen. One
+    /// value drives three derived decisions in the logs fetch layer, so
+    /// recalibrating the store recalibrates all of them at once: the coalescing
+    /// gap, the pre-probe whole-object crossover, and the projection routing of
+    /// the whole-segment fast path (#887).
+    ///
+    /// Defaults to [`crate::DEFAULT_LOG_REQUEST_COST_BYTES`], whose doc comment
+    /// carries the derivation. Raising it above the largest object a deployment
+    /// writes collapses all three decisions to whole-object reads.
+    pub logs_request_cost_bytes: u64,
 }
 
 impl Default for EngineConfig {
@@ -184,6 +202,25 @@ impl Default for EngineConfig {
             fetch_concurrency: DEFAULT_FETCH_CONCURRENCY,
             default_evaluation_interval: DEFAULT_EVALUATION_INTERVAL,
             logs_block_range_threshold: crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+            logs_request_cost_bytes: crate::DEFAULT_LOG_REQUEST_COST_BYTES,
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_request_cost_is_the_compiled_constant() {
+        assert_eq!(
+            EngineConfig::default().logs_request_cost_bytes,
+            crate::DEFAULT_LOG_REQUEST_COST_BYTES
+        );
+        // The constant itself, not merely "nonzero": the knob ships with the
+        // measured q20 latency break-even and no behavior change (ADR-0904
+        // decision 5).
+        assert_eq!(crate::DEFAULT_LOG_REQUEST_COST_BYTES, 1_887_437);
     }
 }
