@@ -464,7 +464,7 @@ fn segment_identity(seg: &SegmentRef) -> ravel_catalog::EntryIdentity {
 /// Decode `value` as the Arrow scalar `ty` projects to, or `None` when
 /// `value`'s oneof kind does not match `ty` (a corrupt or version-mismatched
 /// stat). `Str` is unreachable here: callers check for it before ever calling
-/// this (see [`LogsScanExec::declared_min_max`]).
+/// this (see [`LogsScanExec::declared_min_max_all`]).
 fn declared_scalar(ty: DeclaredType, value: &ColumnValue) -> Option<ScalarValue> {
     match (ty, value.kind.as_ref()) {
         (DeclaredType::I64, Some(ColumnValueKind::I64(v))) => Some(ScalarValue::Int64(Some(*v))),
@@ -1028,37 +1028,124 @@ impl LogsScanExec {
     /// answer, not a fallback: every covered segment's column was entirely
     /// null, or there are zero segments, and SQL `MIN`/`MAX` over all-NULL or
     /// zero-row input is `NULL`.
-    fn declared_min_max(&self, k: usize) -> Option<(ScalarValue, ScalarValue)> {
-        let declared = self.declared.get(k)?;
-        if matches!(declared.ty, DeclaredType::Str) {
-            return None;
+    /// Exact MIN/MAX for every declared column at once, indexed by `k`
+    /// (`FIRST_DECLARED_COL + k`), resolved in a SINGLE pass over the touched
+    /// segments (ADR-0850). `result[k]` is `None` with the same meaning the
+    /// per-column form would give -- the safety lemma requires falling back to
+    /// scanning for that column: no loaded column-stats object, an unsupported
+    /// declared type (`Str`), a relevant segment with no entry in the loaded
+    /// stats, or a segment whose stat for this column is missing or decodes to
+    /// a value of the wrong kind.
+    ///
+    /// `Some((min, max))` with both a `None`-valued scalar is still exact, not
+    /// a fallback: every covered segment's column was entirely null, or there
+    /// are zero segments, and SQL `MIN`/`MAX` over all-NULL or zero-row input
+    /// is `NULL`.
+    ///
+    /// Resolving every column in one segment walk (with a per-segment
+    /// name->stat map) instead of one full walk per column keeps
+    /// `partition_statistics` cost at `O(segments x columns_per_segment)`
+    /// rather than `O(segments x declared x columns_per_segment)`; DataFusion
+    /// may call `partition_statistics` several times per plan, so the per-call
+    /// cost matters.
+    fn declared_min_max_all(&self) -> Vec<Option<(ScalarValue, ScalarValue)>> {
+        let n = self.declared.len();
+        let mut result: Vec<Option<(ScalarValue, ScalarValue)>> = vec![None; n];
+        let Some(stats) = self.column_stats.as_ref() else {
+            return result;
+        };
+
+        // Per-column running extrema plus a "declined" flag: a column declines
+        // its whole answer the moment any touched segment lacks its entry or
+        // carries a wrong-kind value, exactly as the per-column form does. A
+        // `Str` column declines up front.
+        struct Acc {
+            declined: bool,
+            min: Option<ScalarValue>,
+            max: Option<ScalarValue>,
         }
-        let stats = self.column_stats.as_ref()?;
-        let mut min: Option<ScalarValue> = None;
-        let mut max: Option<ScalarValue> = None;
+        let mut acc: Vec<Acc> = self
+            .declared
+            .iter()
+            .map(|d| Acc {
+                declined: matches!(d.ty, DeclaredType::Str),
+                min: None,
+                max: None,
+            })
+            .collect();
+
         for seg in self.segments.iter() {
-            let seg_stats = stats.segments.get(&segment_identity(seg))?;
-            let stat = seg_stats.columns.iter().find(|c| c.name == declared.key)?;
-            if let Some(min_val) = stat.min.as_ref() {
-                let v = declared_scalar(declared.ty, min_val)?;
-                min = Some(match min {
-                    Some(cur) if v.partial_cmp(&cur) != Some(std::cmp::Ordering::Less) => cur,
-                    _ => v,
-                });
-            }
-            if let Some(max_val) = stat.max.as_ref() {
-                let v = declared_scalar(declared.ty, max_val)?;
-                max = Some(match max {
-                    Some(cur) if v.partial_cmp(&cur) != Some(std::cmp::Ordering::Greater) => cur,
-                    _ => v,
-                });
+            let Some(seg_stats) = stats.segments.get(&segment_identity(seg)) else {
+                // A touched segment with no stats: every column must decline.
+                for a in acc.iter_mut() {
+                    a.declined = true;
+                }
+                break;
+            };
+            let by_name: HashMap<&str, &ravel_proto::catalog::v1::ColumnStat> = seg_stats
+                .columns
+                .iter()
+                .map(|c| (c.name.as_str(), c))
+                .collect();
+            for (k, a) in acc.iter_mut().enumerate() {
+                if a.declined {
+                    continue;
+                }
+                let declared = &self.declared[k];
+                let Some(stat) = by_name.get(declared.key.as_str()) else {
+                    a.declined = true;
+                    continue;
+                };
+                if let Some(min_val) = stat.min.as_ref() {
+                    match declared_scalar(declared.ty, min_val) {
+                        Some(v) => {
+                            a.min = Some(match a.min.take() {
+                                Some(cur)
+                                    if v.partial_cmp(&cur) != Some(std::cmp::Ordering::Less) =>
+                                {
+                                    cur
+                                }
+                                _ => v,
+                            });
+                        }
+                        None => {
+                            a.declined = true;
+                            continue;
+                        }
+                    }
+                }
+                if let Some(max_val) = stat.max.as_ref() {
+                    match declared_scalar(declared.ty, max_val) {
+                        Some(v) => {
+                            a.max = Some(match a.max.take() {
+                                Some(cur)
+                                    if v.partial_cmp(&cur) != Some(std::cmp::Ordering::Greater) =>
+                                {
+                                    cur
+                                }
+                                _ => v,
+                            });
+                        }
+                        None => {
+                            a.declined = true;
+                            continue;
+                        }
+                    }
+                }
             }
         }
-        let null_scalar = declared_null_scalar(declared.ty);
-        Some((
-            min.unwrap_or_else(|| null_scalar.clone()),
-            max.unwrap_or(null_scalar),
-        ))
+
+        for (k, a) in acc.into_iter().enumerate() {
+            if a.declined {
+                continue;
+            }
+            let null_scalar = declared_null_scalar(self.declared[k].ty);
+            result[k] = Some((
+                a.min.unwrap_or_else(|| null_scalar.clone()),
+                a.max.unwrap_or(null_scalar),
+            ));
+        }
+        result
     }
 
     /// Exact count of rows whose declared column at schema index
@@ -1066,7 +1153,7 @@ impl LogsScanExec {
     /// (ADR-0850's q02 shape: `COUNT(*) WHERE <declared column> <> <literal>`,
     /// which per SQL three-valued logic excludes NULL rows the same way the
     /// scan path's per-row `<>` evaluation would). `None` means fall back to
-    /// scanning, for every reason [`Self::declared_min_max`] does at its call
+    /// scanning, for every reason [`Self::declared_min_max_all`] does at its call
     /// site ([`Self::stats_are_exact`]: no pending erasure, no content or
     /// prune predicate, and a ts bound that clips no touched segment) plus no
     /// `Str` support, a loaded column-stats object covering every touched
@@ -1101,12 +1188,21 @@ impl LogsScanExec {
                 return None;
             }
             let mut matching: u64 = 0;
+            let mut dict_total: u64 = 0;
             for entry in &stat.dictionary {
                 let value = entry.value.as_ref()?;
                 let v = declared_scalar(declared.ty, value)?;
                 if v == *literal {
                     matching += entry.count;
                 }
+                dict_total = dict_total.checked_add(entry.count)?;
+            }
+            // Fail closed: an internally-inconsistent record (dictionary
+            // counts that do not sum to `non_null_count`) is rejected at load
+            // by `decode_column_stats`, but decline here too rather than
+            // subtract from a count this dictionary cannot account for.
+            if dict_total != stat.non_null_count {
+                return None;
             }
             total += stat.non_null_count.checked_sub(matching)?;
         }
@@ -1157,12 +1253,19 @@ impl LogsScanExec {
             if !stat.dictionary_present {
                 return None;
             }
-            null_count += stat.null_count;
+            let mut dict_total: u64 = 0;
             for entry in &stat.dictionary {
                 let value = entry.value.as_ref()?;
                 let v = declared_scalar(declared.ty, value)?;
+                dict_total = dict_total.checked_add(entry.count)?;
                 *merged.entry(v).or_insert(0) += entry.count;
             }
+            // Fail closed on an internally-inconsistent record, as in
+            // `declared_not_equal_count`: rejected at load, declined here too.
+            if dict_total != stat.non_null_count {
+                return None;
+            }
+            null_count += stat.null_count;
         }
         Some(DeclaredGroupCounts {
             counts: merged.into_iter().collect(),
@@ -1571,15 +1674,17 @@ impl ExecutionPlan for LogsScanExec {
 
             // ADR-0850: the same gate widens to a declared column's exact
             // min/max, joined against `self.column_stats` by identity rather
-            // than ordinal position. `declared_min_max` itself enforces the
-            // per-column fallback (an uncovered segment, a corrupt/type-
-            // mismatched stat, or an unsupported declared type all report
-            // `None` here, leaving the column `Absent`); this loop only
-            // decides which output index to fill.
-            for k in 0..self.declared.len() {
+            // than ordinal position. `declared_min_max_all` resolves every
+            // declared column in one segment walk and enforces the per-column
+            // fallback (an uncovered segment, a corrupt/type-mismatched stat,
+            // or an unsupported declared type all report `None`, leaving the
+            // column `Absent`); this loop only decides which output index to
+            // fill.
+            let declared_min_max = self.declared_min_max_all();
+            for (k, min_max) in declared_min_max.into_iter().enumerate() {
                 let schema_idx = FIRST_DECLARED_COL + k;
                 if let Some(out_idx) = self.projection.iter().position(|&i| i == schema_idx)
-                    && let Some((min, max)) = self.declared_min_max(k)
+                    && let Some((min, max)) = min_max
                 {
                     let col = &mut stats.column_statistics[out_idx];
                     col.min_value = Precision::Exact(min);

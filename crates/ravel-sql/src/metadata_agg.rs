@@ -193,7 +193,18 @@ fn is_count_star(agg: &physical_plan::aggregates::AggregateExec) -> bool {
         return false;
     }
     let args = expr.expressions();
-    args.len() == 1 && args[0].downcast_ref::<Literal>().is_some()
+    if args.len() != 1 {
+        return false;
+    }
+    // `count_all()` is physically `count(<non-null literal>)`; a literal NULL
+    // would make DataFusion evaluate `COUNT(NULL)` as 0, so treating it as
+    // `COUNT(*)` and answering from `non_null_count` would return a filtered
+    // or grouped count where the correct answer is 0. Require the literal to
+    // be non-null.
+    match args[0].downcast_ref::<Literal>() {
+        Some(lit) => !lit.value().is_null(),
+        None => false,
+    }
 }
 
 /// A `<declared column> <> <literal>` (or reversed) predicate's column
