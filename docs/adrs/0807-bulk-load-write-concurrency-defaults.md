@@ -1,6 +1,7 @@
 # ADR-0807: Bulk-load write concurrency ceilings and defaults
 
-Status: Proposed
+Status: Proposed. Decisions 3 and 5 are superseded by the amendment at the end
+of this file (issue #800); decisions 1, 2 and 4 stand as written.
 
 ## Context
 
@@ -285,3 +286,109 @@ the audit changed nothing.
   count near core count, exactly the condition ADR-0109 decision 8 already stated.
 
 Refs: #807
+
+## Amendment (issue #800): both bulk-loader defaults move to 4
+
+### What the audit above got wrong
+
+The audit concluded that "`max_inflight_flushes` binds first for per-shard
+overlap". Measured, that is not what happens at the shipped defaults, and the
+distinction matters because it changes which knob to reach for.
+
+The logs pipeline had no per-shard skew accounting: issue #865's
+`on_actor_ns` / `flush_permit_wait_ns` / `off_actor_ns` split was wired into
+`router.rs` and `shard.rs` only, and `ravel-cli load` drives `log_router.rs` and
+`log_shard.rs`. So the counter that says whether the flush semaphore is refusing
+work did not exist for the one workload this ADR is about, and the audit reasoned
+from the code instead. That accounting is now wired into the logs pipeline
+(`crates/ravel-ingest/tests/log_shard_skew.rs` pins it), and it says:
+
+- At `--pipeline-depth 1`, `flush_permit_wait_ns` is exactly **0**, however slow
+  the flushes are. Nothing ever parks on the per-shard semaphore, because the
+  loader never asks a shard for a second concurrent flush. The inner window is
+  not binding; it is not being consulted.
+- Submitting concurrently against one permit gives a `flush_permit_wait_ns` of
+  `2 * SLOW` on a three-flush fixture -- and **the same wall** as the serial arm.
+  A binding inner window looks different from an unconsulted one on the counter,
+  and identical on the clock.
+
+So the two windows are symmetric, not ordered: `min(p, m)` has no "first". The
+composed-ceiling formula in the audit was right; the sentence about which term
+binds first was not.
+
+The end-to-end 2x2, on a 16-batch single-shard fixture with a 40ms injected
+data-object PUT (`both_write_windows_are_needed_to_overlap_put_round_trips` in
+`services/ravel-cli/src/load.rs`), pre-registered at `16 * 40ms = 640ms` for any
+arm leaving either window at 1 and `4 * 40ms = 160ms` for the arm raising both:
+
+| depth | flushes | wall | peak concurrent object PUTs |
+|---|---|---|---|
+| 1 | 1 | 673.9 ms | 1 |
+| 4 | 1 | 671.9 ms | 1 |
+| 1 | 4 | 673.3 ms | 1 |
+| 4 | 4 | 169.3 ms | 4 |
+
+This is the apportionment the Consequences section above says was never done:
+neither window alone moves the wall at all (within 0.3%), and together they give
+3.97x. It also confirms that section's one-sided claim -- raising depth alone is
+not merely insufficient, it is worth nothing.
+
+### Why the report gap no longer blocks a higher default
+
+Decision 3 kept both defaults at 1 because `--pipeline-depth > 1` weakened the
+durable-token report, and decision 5 deferred revisiting it until `ravel-ingest`
+gained "a mechanism that provably prevents a cancelled batch from committing".
+
+That framing had one option too few. The gap did not come from batches
+committing; it came from the loader *aborting* the join handles of later writes
+and therefore never learning what they committed. The loader can simply wait
+instead: once every outstanding write has reached a terminal outcome, nothing is
+left that can commit, so the reported list is exactly what landed, at any depth.
+`harvest_after_failure` in `services/ravel-cli/src/load.rs` does this, and the
+test that used to pin the gap
+(`partial_window_failure_reports_only_earlier_batches_never_later`) now pins its
+closure as `partial_window_failure_reports_every_batch_that_committed`: on the
+same fixture the report goes from `[0, 1]` to `[0, 1, 3, 4]`, which is precisely
+the set of batches whose objects the store holds.
+
+The cost is on the failure path only and is bounded: the remaining writes were
+submitted before the failing one and run concurrently, so the wait is at most one
+`WRITE_ACK_DEADLINE` (60s). A cancellation mechanism in `ravel-ingest` would
+still be an improvement -- it would avoid the orphaned objects a doomed batch
+writes -- but it is no longer a precondition for the default, and this ADR should
+not have made it one.
+
+### Amended decisions
+
+**3 (amended). Both bulk-loader defaults are 4.** `DEFAULT_PIPELINE_DEPTH = 4`
+and `DEFAULT_MAX_INFLIGHT_FLUSHES = DEFAULT_PIPELINE_DEPTH`, pinned to each other
+by test, because an inner window below the outer one re-serialises each shard's
+PUT round trips and an inner window above it is unreachable. `4` and not higher:
+it is the largest depth with a measured result behind it, a depth of 16 against
+one permit aborted with `timed out waiting for shard ack`, and it bounds the
+memory at a stated multiple rather than at `--shards`, which an operator may
+provision far above 4.
+
+The memory cost is the outer window's alone. The loader holds at most
+`--pipeline-depth` built batches for their in-flight writes plus
+`--decode-queue-batches` queued ahead, so the resident batch working set goes
+from `1 + 2` to `4 + 2` batches of `--batch-rows` rows; against the #682 anchor
+(8 shards, 80k rows, ~6GB live under tcmalloc at depth 1) that is roughly 4x on
+the same geometry. `--max-inflight-flushes` adds nothing further here, because
+the outstanding batches are already capped by the depth -- unlike on
+`ravel-server`, where the same field has no outer window above it and ADR-0067
+decision 2's default of 1 stands untouched.
+
+**5 (amended). Reopened and closed.** The report gap is fixed by waiting rather
+than by cancelling, so there is nothing left to revisit here. A `ravel-ingest`
+flush-cancellation mechanism remains worth having for the orphaned data objects a
+doomed batch leaves behind, which is an object-count and storage-cost question,
+not a durability-report one.
+
+**Unchanged.** Decision 1 (serving defaults), decision 2 (the flag exists), and
+decision 4 (document the recipe at the point of use) stand. The Consequences
+section's statement that every published ClickBench load figure was measured at
+the old defaults also stands, and now has a second reason to be re-measured: the
+defaults themselves have moved.
+
+Refs: #800

@@ -6651,6 +6651,202 @@ type = "i64"
         );
     }
 
+    /// The loader-side counterpart of `ravel-ingest`'s
+    /// `neither_write_window_alone_moves_the_wall_and_the_counters_say_which`,
+    /// measured end to end through `load_instrumented` with a real per-PUT
+    /// latency injected (issue #800). ADR-0807 measured `4`/`4` against `1`/`1`
+    /// on the ClickBench corpus but never isolated the two windows from each
+    /// other, so the 2.94x it reports is not apportioned. This runs the full
+    /// 2x2 on one fixture.
+    ///
+    /// Sixteen single-row batches, one shard, and a 40ms delay on every
+    /// data-object PUT, so the whole load is round-trip bound by construction
+    /// and the arms differ only in the two windows.
+    ///
+    /// Pre-registered before running (the arithmetic, not a post-hoc fit):
+    /// `16 * 40ms = 640ms` for every arm that leaves either window at 1, and
+    /// `4 * 40ms = 160ms` for the arm that raises both, a 4x ratio. Peak
+    /// concurrent data-object PUTs: exactly 1, 1, 1, and 4.
+    ///
+    /// Asserted: the peak concurrency exactly, which is a count and cannot
+    /// drift with machine load; and, on the wall, only the two conclusions the
+    /// counts alone cannot give -- that raising both windows is at least 2x
+    /// (against 4x predicted, so a loaded box has 2x of headroom before this
+    /// misfires) and that neither window alone gets within 30% of that. Both
+    /// wall bounds are ratios against this run's own `1`/`1` arm, so a uniformly
+    /// slow machine moves numerator and denominator together.
+    ///
+    /// Non-vacuity (prove-the-test): the shipped-defaults arm's peak of 4 fails
+    /// against the pre-change defaults. Confirmed by setting
+    /// `DEFAULT_PIPELINE_DEPTH` back to 1: that arm reads `left: 1, right: 4`
+    /// and its wall goes to 665.99ms, indistinguishable from the fully serial
+    /// arm's 673.05ms in the same run. The `4`/`1` and `1`/`4` arms are what make
+    /// the claim "both windows, not either" falsifiable: a change that only
+    /// raised one would still pass a bare `1`/`1`-against-`4`/`4` comparison.
+    #[tokio::test]
+    async fn both_write_windows_are_needed_to_overlap_put_round_trips() {
+        use parquet::arrow::ArrowWriter;
+        use ravel_object_store::memory::MemoryStore;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Single-row batches, so each is one flush on the single shard.
+        const BATCHES: usize = 16;
+        /// Injected cost of one data-object PUT.
+        const PUT_DELAY: Duration = Duration::from_millis(40);
+
+        async fn arm(depth: usize, flushes: u32) -> (Duration, usize) {
+            let shards = 1u32;
+            let hosts: Vec<String> = (0..BATCHES).map(|i| format!("h{i}")).collect();
+
+            let dir = tempfile::tempdir().expect("tempdir");
+            let pq = dir.path().join("windows.parquet");
+            let cols: Vec<(String, ArrayRef)> = vec![
+                ("ts".to_string(), i64_col(vec![NOW_NS; BATCHES])),
+                ("svc".to_string(), str_col(vec!["api"; BATCHES])),
+                (
+                    "host".to_string(),
+                    str_col(hosts.iter().map(|h| h.as_str()).collect()),
+                ),
+            ];
+            let b = RecordBatch::try_from_iter(cols).expect("record batch");
+            let file = std::fs::File::create(&pq).expect("create parquet");
+            let mut writer = ArrowWriter::try_new(file, b.schema(), None).expect("arrow writer");
+            writer.write(&b).expect("write batch");
+            writer.close().expect("close writer");
+
+            let m = parse_mapping(
+                "ts_column = \"ts\"\nts_unit = \"nanos\"\n\n\
+                 [[resource_attribute]]\nkey = \"service.name\"\ncolumn = \"svc\"\ntype = \"str\"\n\n\
+                 [[resource_attribute]]\nkey = \"host\"\ncolumn = \"host\"\ntype = \"str\"\n",
+            )
+            .expect("valid mapping");
+
+            let max_in_flight = Arc::new(AtomicUsize::new(0));
+            let store = Arc::new(InstrumentedPutStore {
+                inner: Arc::new(MemoryStore::new()),
+                delays: vec![("/l0/", PUT_DELAY)],
+                in_flight: Arc::new(AtomicUsize::new(0)),
+                max_in_flight: Arc::clone(&max_in_flight),
+                watch_prefixes: Vec::new(),
+                watch_started: Arc::new(AtomicUsize::new(0)),
+                watch_completed: Arc::new(AtomicUsize::new(0)),
+            });
+
+            let started = Instant::now();
+            let report = load_instrumented(
+                store as Arc<dyn ObjectStoreBackend>,
+                &pq,
+                "acme",
+                &m,
+                shards,
+                1,
+                None,
+                depth,
+                flushes,
+                DEFAULT_DECODE_QUEUE_BATCHES,
+                DEFAULT_TARGET_BYTES,
+                NOW_NS,
+                Arc::new(FixedClock(NOW_NS)),
+                LoadPath::Columnar,
+                None,
+                None,
+            )
+            .await
+            .expect("the load succeeds");
+            let wall = started.elapsed();
+            assert_eq!(
+                report.rows_processed, BATCHES as u64,
+                "every row is written at depth {depth} / flushes {flushes}"
+            );
+            assert_eq!(
+                report.objects_written(),
+                BATCHES,
+                "object layout is identical across arms: {BATCHES} objects however \
+                 the windows are set, so the wall comparison is not confounded by \
+                 a different number of PUTs"
+            );
+            // The loop can only block on receiving a decoded batch or on
+            // resolving a write, so these two partition its wall.
+            assert!(
+                report.write_wait > report.decode_wait,
+                "this fixture is round-trip bound by construction, so the submit \
+                 loop must spend more time resolving writes ({:?}) than waiting \
+                 for decoded batches ({:?}) at depth {depth} / flushes {flushes}",
+                report.write_wait,
+                report.decode_wait
+            );
+            (wall, max_in_flight.load(Ordering::SeqCst))
+        }
+
+        let (wall_1_1, peak_1_1) = arm(1, 1).await;
+        let (wall_4_1, peak_4_1) = arm(4, 1).await;
+        let (wall_1_4, peak_1_4) = arm(1, 4).await;
+        let (wall_4_4, peak_4_4) = arm(4, 4).await;
+
+        println!(
+            "write-window 2x2 ({BATCHES} batches, {PUT_DELAY:?} per data PUT, 1 shard):\n  \
+             depth 1 / flushes 1: {wall_1_1:?} peak {peak_1_1}\n  \
+             depth 4 / flushes 1: {wall_4_1:?} peak {peak_4_1}\n  \
+             depth 1 / flushes 4: {wall_1_4:?} peak {peak_1_4}\n  \
+             depth 4 / flushes 4: {wall_4_4:?} peak {peak_4_4}"
+        );
+
+        assert_eq!(
+            peak_1_1, 1,
+            "at depth 1 / flushes 1 exactly one object PUT is ever outstanding"
+        );
+        assert_eq!(
+            peak_4_1, 1,
+            "raising only the loader's window still leaves the shard's flush \
+             semaphore at one permit, so exactly one PUT is outstanding"
+        );
+        assert_eq!(
+            peak_1_4, 1,
+            "raising only the shard's flush window leaves the loader awaiting each \
+             batch before submitting the next, so the extra permits are never asked \
+             for and exactly one PUT is outstanding"
+        );
+        assert_eq!(
+            peak_4_4, 4,
+            "both windows raised: exactly four object PUTs overlap, the loader's \
+             four outstanding batches each holding one of the shard's four permits"
+        );
+
+        assert!(
+            wall_4_4 * 2 <= wall_1_1,
+            "raising both windows must at least halve the wall (4x predicted): \
+             {wall_4_4:?} against {wall_1_1:?}"
+        );
+        for (label, wall) in [
+            ("depth 4 / flushes 1", wall_4_1),
+            ("depth 1 / flushes 4", wall_1_4),
+        ] {
+            assert!(
+                wall * 10 >= wall_1_1 * 7,
+                "{label} must stay within 30% of the fully serial arm, because one \
+                 window alone changes nothing: {wall:?} against {wall_1_1:?}"
+            );
+        }
+
+        // The shipped defaults, run through the same fixture: what an operator
+        // gets with neither flag given must be the overlapped arm, not the
+        // serial one. This is the assertion the default change is accountable
+        // to; against the pre-change defaults of 1 and 1 it reads a peak of 1.
+        let (wall_default, peak_default) =
+            arm(DEFAULT_PIPELINE_DEPTH, DEFAULT_MAX_INFLIGHT_FLUSHES).await;
+        println!("  shipped defaults:    {wall_default:?} peak {peak_default}");
+        assert_eq!(
+            peak_default, 4,
+            "the shipped defaults must overlap four object PUTs; a peak of 1 means \
+             the loader ships serial"
+        );
+        assert!(
+            wall_default * 2 <= wall_1_1,
+            "the shipped defaults must at least halve the fully serial wall: \
+             {wall_default:?} against {wall_1_1:?}"
+        );
+    }
+
     /// Durable-token correctness under a partial-window failure: the reported
     /// list equals what actually committed, at `--pipeline-depth` above 1
     /// (issue #800). With depth 4 and a stream of five single-shard batches, the
