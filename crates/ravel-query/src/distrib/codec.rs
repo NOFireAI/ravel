@@ -1426,15 +1426,18 @@ pub fn decode_accounting(snap: pb::QueryAccountingSnapshot) -> QueryAccountingSn
         segments_pruned: snap.segments_pruned,
         series_matched: snap.series_matched,
         bytes_reused: snap.bytes_reused,
-        // `page_bytes_fetched`/`page_bytes_decoded` (ADR-0107 decision 4) are
-        // process-local decode-time accounting and are NOT carried on this wire
-        // form: `pb::QueryAccountingSnapshot` is a frozen proto schema, and
-        // adding a field to it is an ADR-gated change out of this counter's
-        // scope. The ADR-0071 fan-out coordinator therefore does not aggregate a
-        // remote worker's page-byte totals; single-process queries account them
-        // in full. Decoded back as zero below.
+        // `page_bytes_fetched`/`page_bytes_decoded` (ADR-0107 decision 4) and
+        // `logs_whole_object_opens`/`logs_ranged_opens` (ADR-0904 decision 5)
+        // are process-local accounting and are NOT carried on this wire form:
+        // `pb::QueryAccountingSnapshot` is a frozen proto schema, and adding a
+        // field to it is an ADR-gated change out of these counters' scope. The
+        // ADR-0071 fan-out coordinator therefore does not aggregate a remote
+        // worker's page-byte or opens-by-shape totals; single-process queries
+        // account them in full. Decoded back as zero below.
         page_bytes_fetched: 0,
         page_bytes_decoded: 0,
+        logs_whole_object_opens: 0,
+        logs_ranged_opens: 0,
         peak_intermediate_bytes: snap.peak_intermediate_bytes,
     }
 }
@@ -2974,12 +2977,14 @@ mod tests {
             segments_pruned: 64,
             series_matched: 128,
             bytes_reused: 256,
-            // Non-zero on purpose: this pair is process-local decode-time
-            // accounting (ADR-0107 decision 4) and is deliberately NOT carried
-            // on the frozen wire proto, so it must decode back as zero, unlike
-            // every other field which round-trips.
+            // Non-zero on purpose: these are process-local counters deliberately
+            // NOT carried on the frozen wire proto (page bytes: ADR-0107
+            // decision 4; opens-by-shape: ADR-0904 decision 5), so they must
+            // decode back as zero, unlike every other field which round-trips.
             page_bytes_fetched: 900,
             page_bytes_decoded: 300,
+            logs_whole_object_opens: 6,
+            logs_ranged_opens: 9,
             peak_intermediate_bytes: 512,
         };
         let round = decode_accounting(encode_accounting(&snap));
@@ -2989,10 +2994,17 @@ mod tests {
         );
         assert_eq!(round.page_bytes_decoded, 0);
         assert_eq!(
+            round.logs_whole_object_opens, 0,
+            "opens-by-shape counters are not on the wire proto"
+        );
+        assert_eq!(round.logs_ranged_opens, 0);
+        assert_eq!(
             round,
             QueryAccountingSnapshot {
                 page_bytes_fetched: 0,
                 page_bytes_decoded: 0,
+                logs_whole_object_opens: 0,
+                logs_ranged_opens: 0,
                 ..snap
             },
             "every other field round-trips unchanged"

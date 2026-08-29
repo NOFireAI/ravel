@@ -130,6 +130,13 @@ struct Inner {
     /// filtering. Decode-time column-filtering measurement, NOT wire bytes; see
     /// `ops`'s `s3_bytes` for wire bytes (ADR-0107 decision 4).
     page_bytes_decoded: AtomicU64,
+    /// Logs-scan segment opens that read the whole object in one GET, tallied
+    /// per segment per query (ADR-0904 decision 5). See the snapshot field of
+    /// the same name for why cache-hit-served opens count identically.
+    logs_whole_object_opens: AtomicU64,
+    /// Logs-scan segment opens that read the object by column-chunk ranges
+    /// instead of one whole-object GET (ADR-0904 decision 5).
+    logs_ranged_opens: AtomicU64,
     /// Recorded as a running maximum (compare-and-swap loop), never a sum;
     /// see [`QueryAccounting::observe_intermediate_bytes`].
     peak_intermediate_bytes: AtomicU64,
@@ -233,6 +240,24 @@ impl QueryAccounting {
             .fetch_add(bytes, Ordering::Relaxed);
     }
 
+    /// Add to the count of logs-scan segment opens that took the whole-object
+    /// read shape (one GET), tallied per segment per query. Recorded by the log
+    /// fetcher (ADR-0904 task 904-4); this handle only accumulates. Paired with
+    /// [`Self::add_logs_ranged_opens`], the two are the exact evidence of which
+    /// read route the request-cost knob selected.
+    pub fn add_logs_whole_object_opens(&self, count: u64) {
+        self.0
+            .logs_whole_object_opens
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// Add to the count of logs-scan segment opens that took the ranged
+    /// (column-chunk) read shape instead of one whole-object GET. See
+    /// [`Self::add_logs_whole_object_opens`].
+    pub fn add_logs_ranged_opens(&self, count: u64) {
+        self.0.logs_ranged_opens.fetch_add(count, Ordering::Relaxed);
+    }
+
     /// Update the peak intermediate byte high-water mark. This is a
     /// maximum, never a sum: call it with the current intermediate size at
     /// each point it might grow, and the counter keeps the largest value
@@ -283,6 +308,11 @@ impl QueryAccounting {
         saturating_fetch_add(&self.0.bytes_reused, other.bytes_reused);
         saturating_fetch_add(&self.0.page_bytes_fetched, other.page_bytes_fetched);
         saturating_fetch_add(&self.0.page_bytes_decoded, other.page_bytes_decoded);
+        saturating_fetch_add(
+            &self.0.logs_whole_object_opens,
+            other.logs_whole_object_opens,
+        );
+        saturating_fetch_add(&self.0.logs_ranged_opens, other.logs_ranged_opens);
         self.observe_intermediate_bytes(other.peak_intermediate_bytes);
     }
 
@@ -310,6 +340,8 @@ impl QueryAccounting {
             bytes_reused: self.0.bytes_reused.load(Ordering::Relaxed),
             page_bytes_fetched: self.0.page_bytes_fetched.load(Ordering::Relaxed),
             page_bytes_decoded: self.0.page_bytes_decoded.load(Ordering::Relaxed),
+            logs_whole_object_opens: self.0.logs_whole_object_opens.load(Ordering::Relaxed),
+            logs_ranged_opens: self.0.logs_ranged_opens.load(Ordering::Relaxed),
             peak_intermediate_bytes: self.0.peak_intermediate_bytes.load(Ordering::Relaxed),
         }
     }
@@ -343,6 +375,19 @@ pub struct QueryAccountingSnapshot {
     /// gap to it is the column-filtering waste. NOT wire bytes; see
     /// [`Self::s3_bytes`] for wire bytes (ADR-0107 decision 4).
     pub page_bytes_decoded: u64,
+    /// Logs-scan segment opens that read the whole object in one GET, tallied
+    /// per segment per query (ADR-0904 decision 5). The request-cost knob
+    /// selects one of two read shapes per open; this and
+    /// [`Self::logs_ranged_opens`] are the exact, per-query evidence of which
+    /// route ran, so a benchmark proves routing rather than inferring it from
+    /// the configured value. A cache-hit-served open counts the same as a live
+    /// one: the shape is a property of the entry point the object takes, not of
+    /// whether its bytes were already resident.
+    pub logs_whole_object_opens: u64,
+    /// Logs-scan segment opens that read the object by column-chunk ranges
+    /// instead of one whole-object GET (ADR-0904 decision 5). See
+    /// [`Self::logs_whole_object_opens`].
+    pub logs_ranged_opens: u64,
     pub peak_intermediate_bytes: u64,
 }
 
@@ -414,6 +459,12 @@ impl QueryAccountingSnapshot {
             page_bytes_decoded: self
                 .page_bytes_decoded
                 .saturating_add(other.page_bytes_decoded),
+            logs_whole_object_opens: self
+                .logs_whole_object_opens
+                .saturating_add(other.logs_whole_object_opens),
+            logs_ranged_opens: self
+                .logs_ranged_opens
+                .saturating_add(other.logs_ranged_opens),
             peak_intermediate_bytes: self
                 .peak_intermediate_bytes
                 .max(other.peak_intermediate_bytes),
@@ -930,5 +981,64 @@ mod tests {
         assert_eq!(snap.s3_requests(AccountedOp::Get), 1);
         assert_eq!(snap.cache_bytes, 42);
         assert_eq!(snap.peak_intermediate_bytes, 0);
+    }
+
+    #[test]
+    fn logs_opens_by_shape_snapshot_round_trip_is_exact() {
+        // Both counters are the routing evidence a differential test asserts on
+        // (ADR-0904 task 904-4), so they must be exact, never indicative. A
+        // fresh handle reads exactly zero for both; after recording, each reads
+        // exactly what was added and the two do not contaminate each other.
+        let fresh = QueryAccounting::new().snapshot();
+        assert_eq!(fresh.logs_whole_object_opens, 0);
+        assert_eq!(fresh.logs_ranged_opens, 0);
+
+        let acc = QueryAccounting::new();
+        acc.add_logs_whole_object_opens(3);
+        acc.add_logs_ranged_opens(5);
+
+        let snap = acc.snapshot();
+        assert_eq!(snap.logs_whole_object_opens, 3, "whole-object opens exact");
+        assert_eq!(snap.logs_ranged_opens, 5, "ranged opens exact");
+    }
+
+    #[test]
+    fn merge_snapshot_sums_logs_opens_by_shape_exactly() {
+        // Two slice snapshots folded into a live handle: each opens-by-shape
+        // counter is the exact sum of the two slices' values.
+        let agg = QueryAccounting::new();
+        let s1 = QueryAccounting::new();
+        s1.add_logs_whole_object_opens(2);
+        s1.add_logs_ranged_opens(7);
+        let s2 = QueryAccounting::new();
+        s2.add_logs_whole_object_opens(4);
+        s2.add_logs_ranged_opens(1);
+
+        agg.merge_snapshot(&s1.snapshot());
+        agg.merge_snapshot(&s2.snapshot());
+
+        let merged = agg.snapshot();
+        assert_eq!(merged.logs_whole_object_opens, 6, "whole-object opens sum");
+        assert_eq!(merged.logs_ranged_opens, 8, "ranged opens sum");
+    }
+
+    #[test]
+    fn snapshot_saturating_add_sums_logs_opens_by_shape_exactly() {
+        // The per-selector sum path (saturating_add, which saturating_merge
+        // delegates to) sums each opens-by-shape counter field-for-field.
+        let a = QueryAccounting::new();
+        a.add_logs_whole_object_opens(10);
+        a.add_logs_ranged_opens(20);
+        let b = QueryAccounting::new();
+        b.add_logs_whole_object_opens(1);
+        b.add_logs_ranged_opens(2);
+
+        let sum = a.snapshot().saturating_add(&b.snapshot());
+        assert_eq!(sum.logs_whole_object_opens, 11, "whole-object opens add");
+        assert_eq!(sum.logs_ranged_opens, 22, "ranged opens add");
+        // The same math backs the coordinator merge (delegates to saturating_add).
+        let merged = a.snapshot().saturating_merge(&b.snapshot());
+        assert_eq!(merged.logs_whole_object_opens, 11);
+        assert_eq!(merged.logs_ranged_opens, 22);
     }
 }
