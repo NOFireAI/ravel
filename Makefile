@@ -1,4 +1,4 @@
-.PHONY: check fmt clippy test test-python doc-drift build minio minio-down demo quickstart quickstart-down kind-up kind-demo kind-down bench audit difftest archmap
+.PHONY: check fmt clippy test test-python test-hygiene doc-drift build minio minio-down demo quickstart quickstart-down kind-up kind-demo kind-down bench audit difftest archmap
 
 check: fmt clippy test
 
@@ -18,6 +18,13 @@ test:
 # `from process_metrics import ...` resolves without a package layout.
 test-python:
 	cd scripts && python3 -m unittest discover -p 'test_*.py' -v
+
+# Grep-shaped hygiene guard over the test sources (issue #778): wall-clock
+# assertions, unseeded randomness, untracked proptest regression seeds. Build
+# free, so run it before a commit that touches tests. Its own cases run first.
+test-hygiene:
+	bash scripts/guards/check-test-hygiene.test.sh
+	./scripts/guards/check-test-hygiene.sh
 
 # Derived counts in docs/query-engine.md's generated conformance block
 # (ADR-0053 decision 6). No build, so it is cheap enough to run before a

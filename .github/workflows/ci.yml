@@ -159,7 +159,12 @@ jobs:
   #     already slipped through once) fails CI instead of merging silently.
   #   - `make test-python` runs the stdlib unittest suite for
   #     scripts/process_metrics.py, which previously had no runner at all.
-  # Both exit non-zero on drift/failure, which fails this job.
+  #   - scripts/guards/check-test-hygiene.sh greps the test sources for the
+  #     three shapes that produce a test which cannot fail: an assertion on
+  #     elapsed real time, an entropy draw with no seed, and a proptest
+  #     regression seed left untracked. Its own cases run first, so a guard
+  #     broken into always-passing fails here rather than going quiet.
+  # All exit non-zero on drift/failure, which fails this job.
   #
   # Deliberately not gated on docs_only and not `needs: changes`: it uses no
   # cargo toolchain and no build, so it is seconds either way, and the
@@ -175,6 +180,10 @@ jobs:
         run: scripts/check-doc-drift.sh
       - name: Check workspace version drift (ADR-0086 D8)
         run: scripts/check-workspace-versions.sh
+      - name: Test-hygiene guard cases
+        run: bash scripts/guards/check-test-hygiene.test.sh
+      - name: Test-hygiene guard (issue #778)
+        run: scripts/guards/check-test-hygiene.sh
       - name: Python script unit tests
         run: make test-python
 
