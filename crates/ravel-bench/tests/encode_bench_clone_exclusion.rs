@@ -96,6 +96,12 @@ fn clone_is_in_encode_timed_region() {
     // where the writer is far slower and the clone's relative share shrinks;
     // in a `--release` run on aarch64 it was ~12-13%, which the printed line
     // above shows directly.
+    //
+    // hygiene-allow: wall-clock -- the subject of this probe IS the ratio of
+    // two real durations inside criterion's timed region, so there is no
+    // injected-clock form of the claim. It is #[ignore]d and never runs in the
+    // gate, and the threshold is a floor: a slow or loaded host inflates both
+    // measurements together rather than pushing the ratio under it.
     assert!(
         clone_fraction >= 0.005,
         "clone should be a measurable fraction of the timed region, got {:.2}%",
@@ -138,6 +144,10 @@ fn iter_batched_excludes_clone() {
         current_ns as f64 / 1e6,
         fixed_ns as f64 / 1e6
     );
+    // hygiene-allow: wall-clock -- same as the probe above: the claim is that
+    // one measured region is shorter than another, which only real time can
+    // express. #[ignore]d, and both figures are best-of-three over the same
+    // fixture on the same host, so host speed cancels.
     assert!(
         fixed_ns < current_ns,
         "excluding the clone must lower the measured time"

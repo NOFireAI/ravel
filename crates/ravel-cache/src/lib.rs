@@ -486,7 +486,14 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    /// `start_paused`: the single-flight half below orders two `get_or_fetch`
+    /// calls with `tokio::time::sleep`. On a real clock that ordering is only
+    /// probable -- the second call has to reach the cache inside the first
+    /// call's 15 ms fetch, and a loaded host can starve the task past it, at
+    /// which point the collapse never happens and the count is 0. Paused time
+    /// advances only when every task is idle, so the 1 ms timer always fires
+    /// before the 15 ms one and the interleaving is fixed.
+    #[tokio::test(start_paused = true)]
     async fn counters_match_hand_computed_sequence() {
         let limits = CacheLimits::new(1024 * 1024, 1, 1024 * 1024);
         let cache: Cache<&'static str> = Cache::new(limits);
