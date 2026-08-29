@@ -14,6 +14,10 @@ tokio = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# test-util for `#[tokio::test(start_paused = true)]`: the single-flight
+# collapse test orders two concurrent fetches by timer, which is deterministic
+# only on a paused clock.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

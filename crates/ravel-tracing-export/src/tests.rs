@@ -317,6 +317,13 @@ async fn an_unreachable_collector_never_blocks_or_errors_the_caller() {
         let _entered = span.enter();
     }
     let emit_elapsed = start.elapsed();
+    // hygiene-allow: wall-clock -- "the caller is not blocked" is a claim about
+    // real time and has no injected-clock form: the timing belongs to the OTel
+    // SDK's BatchSpanProcessor and its HTTP client, neither of which takes a
+    // clock from us. The defect being ruled out is a synchronous connect to the
+    // refused port, which costs seconds; a non-blocking emit costs microseconds,
+    // so the 1 s ceiling sits three orders of magnitude away from both and
+    // scheduling noise cannot flip it either way.
     assert!(
         emit_elapsed < Duration::from_secs(1),
         "emitting a span with an unreachable collector added latency: {emit_elapsed:?}"
