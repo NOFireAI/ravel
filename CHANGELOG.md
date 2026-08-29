@@ -6,14 +6,82 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.11.0]
+
+The log segment format moves to RLOG v4 and the logs query path becomes
+columnar end to end. Measured on the ClickBench `hits` corpus (12.03 GB, 99.99M
+rows, 42 timed statements on an r6a.4xlarge against in-region S3), the hot total
+falls from 96.40 s to 72.52 s and the cold total from 320.18 s to 222.19 s.
+
+### Added
+
+- **Typed column statistics for logs** (ADR-0850). The fold writes exact
+  per-object statistics for declared columns, and `MIN`/`MAX` over a declared
+  column can be answered from the catalog without opening a segment.
+- **SQL surface**: a fail-closed scalar and window function registry
+  (ADR-0097), `LIKE`/`NOT LIKE` on the logs table with substring pruning
+  (ADR-0105), and typed predicate pushdown for declared logs columns. Functions
+  outside the registry now produce a typed error rather than a late failure.
+- **Aggregation pushdown** for order-insensitive aggregates (ADR-0103), and a
+  metadata-only rewrite that answers predicate-free `COUNT(*)` shapes with zero
+  object-store GETs.
+- **Native histograms through range evaluation** (ADR-0108): range counter and
+  `_over_time` functions carry native histograms, and they distribute over the
+  fan-out path for the first time.
+- **Operator surfaces**: `--cache-dir` attaches the ADR-0046 disk cache tier end
+  to end; `--s3-auth` and the S3 credential flags add an instance-role
+  credential source (ADR-0106); `ravel-cli maintain compact-tenant` compacts a
+  whole tenant and can seal sooner for measurement.
+- **Intra-segment scan partitioning and a spill policy** for logs (ADR-0102),
+  and late materialization for wide `TopK` projections (ADR-0774) so a sort
+  reads the narrow set and fetches the rest only for surviving rows.
+
+### Changed
+
+- **RLOG bumped to v4** (ADR-0699): row groups plus a `PAGE_DIR` section, which
+  makes per-column extents individually addressable. A narrow projection over a
+  v4 object can fetch only the columns it needs instead of the whole object.
+  The reader accepts v3 and v4; writers emit v4.
+- **Columnar decode to Arrow** (ADR-0099). Logs and metrics scans build batches
+  from a borrowed columnar block view, and declared string columns keep their
+  dictionary form end to end rather than being materialized per row.
+- **Pruning-proportional logs fetch** (ADR-0107): the fetch layer issues block
+  ranges proportional to what pruning actually selected, and the whole-segment
+  fast path now consults projection width before choosing a whole-object read.
+- **Distributed query protocol bumped to version 4**, adding a
+  `PartialAggregate` wire frame so pushed-down aggregates cross the fan-out
+  boundary. Version 3 (ADR-0096) added per-sample dedup provenance and resolved
+  0.10.0's run-merged limitation below.
+- **Clustered compaction and object pruning** (ADR-0815), and a bulk-load
+  columnar fast path with revised write-concurrency defaults (ADR-0109,
+  ADR-0807).
+
 ### Fixed
 
 - The 0.10.0 known limitation on run-merged series and the distributed query
-  path is resolved. `ravel.queryfrag.v1` (bumped to protocol version 3,
-  ADR-0096) now carries per-sample dedup provenance on the wire, native
-  histograms distribute for the first time, and both the run-merged and
-  histogram refusals are removed. A distributed query over either shape now
-  returns results bit-identical to the same query run locally.
+  path is resolved. `ravel.queryfrag.v1` (protocol version 3, ADR-0096) carries
+  per-sample dedup provenance on the wire, native histograms distribute for the
+  first time, and both the run-merged and histogram refusals are removed. A
+  distributed query over either shape now returns results bit-identical to the
+  same query run locally.
+- Native histograms were being silently dropped in three PromQL paths; they now
+  carry through. `histogram_rate`/`sum_histograms` no longer panic on a schema
+  mismatch, and `irate`/`idelta` had their reset direction corrected.
+- Query text is guarded against a parser stack overflow.
+- A fold lifetime whose seal margin would overflow is refused rather than
+  accepted and silently sealing nothing.
+
+### Known limitations
+
+- Query latency still depends on the tenant's working set fitting in the read
+  cache. When it does not, every full-scan statement re-reads its objects from
+  object storage on each run: the eviction policy is scan-resistant (S3-FIFO,
+  ADR-0046) but cannot create reuse that a scan-everything access pattern does
+  not have. The published ClickBench figures above were measured with a cache
+  larger than the corpus and do not characterize a tenant whose data greatly
+  exceeds its cache. Removing the full-scan floor is tracked in #849.
+- One ClickBench statement (`q33`) fails on connection-pool exhaustion (#837),
+  so the totals above are over 42 of the suite's 43 statements.
 
 ## [0.10.0]
 

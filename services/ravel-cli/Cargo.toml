@@ -92,7 +92,7 @@ toml = "1"
 # `LogsTableProvider` logs path is in ravel-sql's default build (the
 # `flight-sql` feature only gates the Flight transport), so no feature is
 # needed here.
-ravel-sql = { path = "../../crates/ravel-sql", version = "0.10.0" }
+ravel-sql = { path = "../../crates/ravel-sql", version = "0.11.0" }
 # The reachability test builds a SqlExecutor's segment fetchers from ravel-query
 # (SegmentFetcher/LogSegmentFetcher/SpanSegmentFetcher); ravel-catalog is
 # already a normal dependency. Workspace pin, test construction only.
@@ -109,7 +109,7 @@ async-trait = { workspace = true }
 # ravel-server is a workspace path crate not listed in
 # `[workspace.dependencies]`, so it is named by path with a pinned version here,
 # exactly as ravel-sql above is; no new external crate enters Cargo.lock.
-ravel-server = { path = "../ravel-server", version = "0.10.0", features = ["sql"] }
+ravel-server = { path = "../ravel-server", version = "0.11.0", features = ["sql"] }
 # The reachability test's axum request/response plumbing (the same shape
 # ravel-server's own endpoint tests use). Already resolved in this workspace's
 # dependency graph; test-only.
