@@ -7,6 +7,11 @@ load time and the stored size (ADR-0100). This guide makes that workload
 runnable and repeatable against Ravel. It never fetches the dataset for you and
 never reports a number: it is the procedure, not a measurement.
 
+For running this on AWS from nothing -- bucket, credentials, IAM role, EC2 box,
+then the same load and measure steps as copy-pasteable commands -- see
+[clickbench-aws-runbook.md](clickbench-aws-runbook.md). This guide remains the
+reference for what the harness measures and how to read its report.
+
 The checked-in artifacts live under `benchmarks/clickbench/`:
 
 | File | What it is |
