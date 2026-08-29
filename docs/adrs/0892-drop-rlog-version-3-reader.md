@@ -187,7 +187,7 @@ in flight over `logs_scan.rs`.
 - Reopening a two-version window later, at first public release, is then a
   deliberate act under ADR-0066's readers-before-writers rule, rather than a
   state we drifted into ahead of schedule.
-- The exclusivity test added by point 4 means a future `n_and_prev` cannot be
+- The exclusivity test added by decision 6 means a future `n_and_prev` cannot be
   reintroduced silently.
 
 ## References
