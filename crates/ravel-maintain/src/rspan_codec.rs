@@ -805,7 +805,7 @@ pub(crate) fn estimate_record(r: &SpanRecord) -> u64 {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use bytes::Bytes;
     use proptest::prelude::*;
@@ -1754,9 +1754,10 @@ mod tests {
     /// records, so the records seeded into L0 are the records the merge sees and
     /// the part-count arithmetic in [`expected_part_count`] is exact.
     fn spec_to_record(s: &SpanSpec) -> SpanRecord {
+        let mut seen: BTreeSet<&String> = BTreeSet::new();
         let mut attrs: Vec<(String, String)> = Vec::with_capacity(s.attrs.len());
         for (k, v) in &s.attrs {
-            if !attrs.iter().any(|(seen, _)| seen == k) {
+            if seen.insert(k) {
                 attrs.push((k.clone(), v.clone()));
             }
         }

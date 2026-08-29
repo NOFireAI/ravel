@@ -62,7 +62,7 @@ async fn coalescing_cuts_page_gets_far_below_two_per_run() {
 
     let clock = FixedClock::new(sealed_now_ns());
     let bucket = bucket();
-    // Default cap (256 MiB) >> this bucket, so all SERIES land in one part /
+    // Default target (256 MiB) >> this bucket, so all SERIES land in one part /
     // one fetch batch: every input's runs coalesce to a TS GET + a VAL GET.
     let outcome = compact_bucket(&store, &clock, &CompactorConfig::default(), &bucket)
         .await
@@ -149,17 +149,17 @@ async fn small_part_target_splits_output_under_coalesced_fetch() {
         seed_input(&store, s).await;
     }
 
-    // Measure one output series' page bytes so the cap can be set to a few
-    // series' worth, forcing many part flushes (each flush caps the buffered
-    // page bytes). One output series here is INPUTS runs of small pages.
+    // The target is set to a few series' worth of stored bytes, forcing many
+    // part flushes (each flush releases the buffered part). One output series
+    // here is INPUTS runs of small pages merged into one run.
     let clock = FixedClock::new(sealed_now_ns());
     let bucket = bucket();
 
-    // A deliberately tiny cap: far below the whole bucket's page bytes, so the
-    // builder must flush many parts. If the fetch path buffered the whole
-    // bucket (ignoring the cap) this would still pass functionally, so the
-    // multi-part assertion below is what ties correctness to the cap: parts
-    // only appear when the accumulated page bytes cross the cap mid-merge.
+    // A deliberately tiny target: far below the whole bucket's stored bytes, so
+    // the builder must flush many parts. If the fetch path buffered the whole
+    // bucket (ignoring the target) this would still pass functionally, so the
+    // multi-part assertion below is what ties correctness to the target: parts
+    // only appear when the part's stored-size estimate crosses it mid-merge.
     let config = CompactorConfig {
         max_l1_part_bytes: 1024,
         ..CompactorConfig::default()
@@ -171,12 +171,12 @@ async fn small_part_target_splits_output_under_coalesced_fetch() {
 
     let record = fetch_compaction_record(&store, &bucket).await;
     println!(
-        "[mem-bound] inputs={INPUTS} series={SERIES} cap=1024B parts={}",
+        "[mem-bound] inputs={INPUTS} series={SERIES} target=1024B parts={}",
         record.parts.len()
     );
     assert!(
         record.parts.len() > 1,
-        "a sub-bucket part cap must split output into multiple parts, got {}",
+        "a sub-bucket stored-size target must split output into multiple parts, got {}",
         record.parts.len()
     );
 

@@ -3024,6 +3024,11 @@ mod tests {
         // once, at its first record, so the records-per-part arithmetic runs
         // against what is left of the target.
         let stream_charge = estimate_stored_stream(&narrow_record(0).stream_attrs);
+        assert!(
+            stream_charge < STORED_TARGET,
+            "fixture is unusable: its stream blob charges {stream_charge}B against a \
+             {STORED_TARGET}B target, leaving no room for records"
+        );
         let expected_parts = expected_part_count(stored, STORED_TARGET - stream_charge, total);
         assert!(
             expected_parts >= 3,
@@ -3032,10 +3037,11 @@ mod tests {
 
         let tracker = MergeMemoryTracker::new();
         let config = CompactorConfig {
-            // Memory bound at its shipped default: nothing this corpus does in
-            // heap comes close, so it must never be the bound that fires.
             max_l1_part_bytes: STORED_TARGET,
             merge_memory_tracker: Some(tracker.clone()),
+            // `l1_part_memory_target_bytes` is left at its shipped 256 MiB
+            // default: nothing this corpus does in heap comes close, so the
+            // memory split target can never be what fires.
             ..CompactorConfig::default()
         };
         let clock = FixedClock::new(sealed_now_ns());
@@ -3137,12 +3143,13 @@ mod tests {
     /// a `STORED_TARGET`-byte target, and each part's real object size stays
     /// within twice the target.
     ///
-    /// Demonstrated red by under-charging: adding
-    /// `&& self.charged_streams.len() == 1` to the charge in
-    /// `PartBuilder::push` (one stream per part instead of every distinct one)
-    /// yields a single part of 269_641 bytes, 4.1x the 65_536-byte target,
-    /// failing the size assertion and then the count assertion with `1 != 7`.
-    /// A flat floor low enough to be safe would have passed at both.
+    /// Demonstrated red by under-charging, with the per-part charge model
+    /// below in place: adding `&& self.charged_streams.len() == 1` to the
+    /// charge in `PartBuilder::push` (one stream per part instead of every
+    /// distinct one) yields a single part of 269_641 bytes, 4.1x the
+    /// 65_536-byte target, failing the size assertion and then the count
+    /// assertion with `1 != 7`. A flat floor low enough to be safe would have
+    /// passed at both.
     #[tokio::test]
     async fn many_streams_charge_stream_dir_against_the_stored_target() {
         const STREAMS: u32 = 96;
@@ -3166,11 +3173,23 @@ mod tests {
         }
 
         // The split rule, walked: a stream's first record in a part pays the
-        // STREAM_DIR entry plus its own payload, later records pay their payload
-        // only, and the part closes as soon as the running total reaches the
-        // target. Every stream here has the same blob length and the same
-        // record shape, so the walk does not depend on which stream id sorts
-        // first.
+        // STREAM_DIR entry plus its own payload, later records in the SAME part
+        // pay their payload only, and the part closes as soon as the running
+        // total reaches the target. Every stream here has the same blob length
+        // and the same record shape, so the walk does not depend on which
+        // stream id sorts first.
+        //
+        // The charge is per part, not per merge: `PartBuilder::push` charges a
+        // stream once into the builder it is pushed into, and `PartSink::flush`
+        // starts the next record on a fresh builder with an empty
+        // `charged_streams`. So the walk clears its own charged set at every
+        // split. A stream whose records straddle a boundary is charged in both
+        // parts, because both objects carry its STREAM_DIR entry. Modelling one
+        // charge per stream over the whole walk undercounts the accumulator and
+        // can predict fewer parts than the merge produces. At this fixture's
+        // blob and record sizes every split lands on a stream's first record,
+        // so both models happen to reach the same seven parts; the reset is
+        // what keeps the prediction exact when either size moves.
         let charge = estimate_stored_stream(&fat_stream_record(0, 0).stream_attrs);
         let per_record = estimate_stored_record(&fat_stream_record(0, 0));
         assert!(
@@ -3179,9 +3198,10 @@ mod tests {
         );
         let mut expected_parts = 0u64;
         let mut acc = 0u64;
-        for _ in 0..STREAMS {
-            for r in 0..INPUTS {
-                acc += if r == 0 {
+        let mut charged: BTreeSet<u32> = BTreeSet::new();
+        for s in 0..STREAMS {
+            for _ in 0..INPUTS {
+                acc += if charged.insert(s) {
                     charge + per_record
                 } else {
                     per_record
@@ -3189,6 +3209,7 @@ mod tests {
                 if acc >= STORED_TARGET {
                     expected_parts += 1;
                     acc = 0;
+                    charged.clear();
                 }
             }
         }
@@ -3203,10 +3224,11 @@ mod tests {
         let tracker = MergeMemoryTracker::new();
         let config = CompactorConfig {
             max_l1_part_bytes: STORED_TARGET,
-            // Memory bound at its shipped default: this corpus holds a few
-            // hundred tiny records in heap, so it can never be the bound that
-            // fires and every split below is the stored target's.
             merge_memory_tracker: Some(tracker.clone()),
+            // `l1_part_memory_target_bytes` is left at its shipped 256 MiB
+            // default: this corpus holds a few hundred tiny records in heap, so
+            // the memory split target can never be what fires and every split
+            // below is the stored target's.
             ..CompactorConfig::default()
         };
         let clock = FixedClock::new(sealed_now_ns());

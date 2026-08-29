@@ -297,7 +297,7 @@ async fn listing_pagination_is_handled() {
 #[tokio::test]
 async fn part_splitting_keeps_series_whole_and_disjoint() {
     let store = MemoryStore::new();
-    // Many distinct series so a tiny part cap forces several parts.
+    // Many distinct series so a tiny stored-size target forces several parts.
     let mut series = Vec::new();
     for i in 0..40u32 {
         series.push(raw_series(
@@ -324,7 +324,7 @@ async fn part_splitting_keeps_series_whole_and_disjoint() {
     assert!(matches!(outcome, CompactionOutcome::Compacted { .. }));
 
     let record = fetch_compaction_record(&store, &bucket).await;
-    assert!(record.parts.len() >= 2, "tiny cap must split into parts");
+    assert!(record.parts.len() >= 2, "tiny target must split into parts");
 
     // Part id ranges are disjoint and ascending (series never straddle).
     let mut prev_last: Option<[u8; 16]> = None;
