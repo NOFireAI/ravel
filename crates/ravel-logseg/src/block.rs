@@ -34,6 +34,18 @@ const MAX_RECORDS: u64 = 1 << 24;
 /// derives its own per-group caps from this (ADR-0699 decision 2).
 pub const MAX_PAGES: u64 = 4096;
 
+/// Cap on a decoded page's `column_id`, matching the field-directory cap
+/// [`crate::reader::MAX_FIELDS`] that bounds how many fields an object may
+/// declare.
+///
+/// Column ids index a dense slot vector in [`ColMap`], so the allocation is a
+/// function of the LARGEST id seen, not of how many columns a block actually
+/// carries. A page descriptor is read from the object, which is untrusted
+/// input: without this cap a single corrupt or hostile block declaring a
+/// `column_id` near `u32::MAX` would resize that vector to billions of slots
+/// and exhaust memory before any pool limit could observe it.
+const MAX_COLUMN_ID: u64 = 1 << 20;
+
 /// A cheap multiplicative mix (FxHash-style) for column ids, in place of
 /// std's default SipHash. Column ids are dense, small (a real schema tops out
 /// around a hundred, capped at [`crate::writer::RlogConfig::max_dynamic_columns`])
@@ -823,6 +835,15 @@ impl<T> ColMap<T> {
     fn values(&self) -> impl Iterator<Item = &T> {
         self.cols.iter().flatten()
     }
+
+    /// Bytes held by the slot vector itself, excluding whatever the slots point
+    /// at. The vector is sized by the largest column id in the block rather
+    /// than by how many columns it carries, so a sparse block charges more here
+    /// than its column count suggests; leaving it out under-reports resident
+    /// memory and lets a pool limit over-admit decoded blocks.
+    fn slot_bytes(&self) -> usize {
+        self.cols.capacity() * std::mem::size_of::<Option<T>>()
+    }
 }
 
 /// A byte-valued column resolved once by id: a string column (plain or
@@ -946,6 +967,12 @@ impl DecodedBlock {
     /// against the cells.
     pub fn decoded_heap_bytes(&self) -> usize {
         let mut total = 0usize;
+        // The slot vectors themselves, before the columns they hold.
+        total += self.i64_cols.slot_bytes();
+        total += self.f64_cols.slot_bytes();
+        total += self.bool_cols.slot_bytes();
+        total += self.str_cols.slot_bytes();
+        total += self.fixed_cols.slot_bytes();
         for v in self.i64_cols.values() {
             total += v.capacity() * std::mem::size_of::<Option<i64>>();
         }
@@ -1186,6 +1213,11 @@ pub fn read_block_columns(
     let mut descs: Vec<PageDesc> = Vec::with_capacity(page_count.min(MAX_PAGES as usize));
     for _ in 0..page_count {
         let column_id = get_uvarint(bytes, &mut pos)?;
+        if column_id > MAX_COLUMN_ID {
+            return Err(LogSegError::Corrupted(format!(
+                "column_id {column_id} over cap {MAX_COLUMN_ID}"
+            )));
+        }
         let column_id = u32::try_from(column_id)
             .map_err(|_| LogSegError::Corrupted("column id out of range".into()))?;
         let enc = Enc::from_u8(
@@ -1431,6 +1463,95 @@ fn decode_columns(
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// A page descriptor's `column_id` is read from the object, and `ColMap`
+    /// indexes a dense slot vector by it, so the allocation follows the largest
+    /// id rather than the column count. Without a cap a single block claiming a
+    /// `column_id` near `u32::MAX` resizes that vector to billions of slots and
+    /// exhausts memory before any pool limit can see it.
+    ///
+    /// This must fail as a typed `Corrupted` error. Deleting the `MAX_COLUMN_ID`
+    /// check makes this test attempt a multi-gigabyte allocation instead of
+    /// returning, which is how it was demonstrated failing.
+    #[test]
+    fn a_column_id_over_the_cap_is_rejected_before_it_allocates() {
+        // record_count, page_count, then one descriptor whose column_id is far
+        // past the cap: enc, comp, len, uncomp_len follow it.
+        let mut block = Vec::new();
+        put_uvarint(&mut block, 1); // record_count
+        put_uvarint(&mut block, 1); // page_count
+        put_uvarint(&mut block, u64::from(u32::MAX)); // column_id, wildly over cap
+        block.push(0); // enc
+        block.push(0); // comp
+        put_uvarint(&mut block, 0); // len
+        put_uvarint(&mut block, 0); // uncomp_len
+        let crc = crc32c::crc32c(&block);
+
+        match read_block_columns(&block, crc, &[], 1 << 20, None) {
+            Err(LogSegError::Corrupted(msg)) => assert!(
+                msg.contains("column_id") && msg.contains("over cap"),
+                "expected a column_id cap error naming the value, got: {msg}"
+            ),
+            Err(other) => panic!("expected Corrupted, got {other:?}"),
+            Ok(_) => panic!("a column_id over the cap must be rejected, not decoded"),
+        }
+    }
+
+    /// The slot vector is sized by the largest column id, not by how many
+    /// columns the block carries, so a block with one high-id column charges far
+    /// more than one column's worth. Leaving it out of `decoded_heap_bytes`
+    /// under-reports resident memory and lets a memory pool over-admit.
+    ///
+    /// This asserts through `decoded_heap_bytes`, the function that is actually
+    /// relied on, NOT through `ColMap::slot_bytes` directly. A first version of
+    /// this test called `slot_bytes` and passed with the charge removed from
+    /// `decoded_heap_bytes` entirely -- it pinned the helper while the caller
+    /// stayed broken.
+    ///
+    /// Pins a magnitude rather than non-emptiness: the reported figure must
+    /// cover the slot vector the sparse id forces into existence, on top of the
+    /// two payload columns, which are identical in both blocks.
+    #[test]
+    fn decoded_heap_bytes_charges_the_slot_vector() {
+        fn block_with(ids: [u32; 2]) -> DecodedBlock {
+            let mut i64_cols: ColMap<Vec<Option<i64>>> = ColMap::new();
+            i64_cols.insert(ids[0], vec![Some(1i64); 4]);
+            i64_cols.insert(ids[1], vec![Some(2i64); 4]);
+            DecodedBlock {
+                record_count: 4,
+                i64_cols,
+                f64_cols: ColMap::new(),
+                bool_cols: ColMap::new(),
+                str_cols: ColMap::new(),
+                fixed_cols: ColMap::new(),
+                col_lookups: Cell::new(0),
+                attrs_raw_page: false,
+                pages_decoded: 2,
+                pages_skipped: 0,
+                page_bytes_fetched: 0,
+                page_bytes_decoded: 0,
+            }
+        }
+
+        // Same two columns, same payloads; only the second id differs.
+        let dense = block_with([0, 1]).decoded_heap_bytes();
+        let sparse = block_with([0, 1000]).decoded_heap_bytes();
+
+        // The gap the id 1000 opens. Floored below 999 slots because `Vec`
+        // growth rounds the dense block's capacity up (2 slots requested, 4
+        // allocated), so the exact difference is a few slots short of the id
+        // gap. 900 still pins the magnitude: an implementation that charged
+        // only the two columns actually present would show a difference of
+        // roughly zero here, not of 900 slots.
+        let slot = std::mem::size_of::<Option<Vec<Option<i64>>>>();
+        let forced = 900 * slot;
+        assert!(
+            sparse >= dense + forced,
+            "a block whose largest column id is 1000 must charge at least \
+             {forced} B more than the same columns at ids 0 and 1: \
+             sparse={sparse} dense={dense}"
+        );
+    }
 
     fn row(stream_ref: u32, ts: i64) -> ResolvedRow {
         ResolvedRow {
