@@ -174,12 +174,20 @@ def is_metric(v):
             and math.isfinite(v))
 
 
+# Every *_ms key that is PRESENT must be a valid metric. Checking only values
+# that are already int/float would miss a string or null timing entirely: those
+# are not int/float, so they would be dropped from `present` in silence and the
+# remaining statements could still print EXACT -- a total over a quietly smaller
+# set, which is the mistake this script exists to prevent. A statement that
+# failed omits its *_ms keys altogether (verified against the reference report),
+# so this rejects corruption without rejecting a legitimate failure.
 for _sid, _r in rows.items():
     for _k, _v in _r.items():
-        if _k.endswith("_ms") and isinstance(_v, (int, float)) and not is_metric(_v):
+        if _k.endswith("_ms") and not is_metric(_v):
             abort(f"statement {_sid} has a non-numeric or non-finite {_k}: {_v!r}.",
-                  "A boolean or non-finite timing would corrupt every total that",
-                  "includes it, and the corruption would surface as exit 1.")
+                  "A statement that did not run omits its timing keys entirely; a",
+                  "present-but-unusable value is corruption, and dropping it would",
+                  "compute a total over a quietly smaller set of statements.")
 
 available = sorted({
     k for r in rows.values() for k, v in r.items()
