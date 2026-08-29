@@ -58,8 +58,8 @@ use ravel_logseg::{
 };
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::{
-    CacheFetchError, DEFAULT_FETCH_CONCURRENCY, DEFAULT_MAX_SEGMENTS, EngineConfig,
-    LogSegmentFetcher, SegmentFetcher,
+    CacheFetchError, DEFAULT_FETCH_CONCURRENCY, DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+    DEFAULT_MAX_SEGMENTS, EngineConfig, LogSegmentFetcher, ProbeMissCounter, SegmentFetcher,
 };
 use ravel_sql::{
     DEFAULT_MAX_QUERY_BYTES, DeclaredColumn, DeclaredType, SpanSegmentFetcher, SqlConfig,
@@ -412,6 +412,27 @@ pub struct RunAccounting {
     pub cache_misses: u64,
     /// Bytes served from the fetch cache on this run.
     pub cache_bytes: u64,
+    /// Tail sections (SKIP_IDX, and PAGE_DIR on a version-4 object) that this
+    /// run's PLAN-phase probes failed to reach, charged to the phase that issued
+    /// the probe (`ravel_query::ProbePhase::Plan`): the footer/skip-index reads
+    /// `plan_segment` and `plan_segment_block_stats` issue, plus the whole-object
+    /// plan fallback for a predicate the skip index cannot decide.
+    ///
+    /// Each miss costs one extra GET, so this is the request half of the trade a
+    /// shorter probe makes and belongs beside
+    /// [`Self::object_store_get_requests`]: a probe floor can only be tightened
+    /// against these numbers (issue #883, `ravel_query::LOG_SUFFIX_FLOOR_BYTES`).
+    /// It is measured against the probe WINDOW, not against cache residency, so
+    /// a warm run reports the same value as the cold one even though its GETs
+    /// fall.
+    #[serde(default)]
+    pub probe_misses_plan: u64,
+    /// Tail sections this run's SCAN-phase probes failed to reach, charged to
+    /// `ravel_query::ProbePhase::Scan`: the block/page/chunk data reads. Same
+    /// units and same window-not-cache semantics as [`Self::probe_misses_plan`];
+    /// the run's total is the two summed.
+    #[serde(default)]
+    pub probe_misses_scan: u64,
 }
 
 /// One measured statement.
@@ -798,10 +819,13 @@ fn build_read_cache(cache_bytes: u64) -> Arc<Cache<CacheFetchError>> {
 /// for every hour (ravel_catalog docs on `read_scan_generations`); the tenant
 /// lane resolves that count before calling here so a multi-shard tenant is no
 /// longer measured over shard 0 alone.
-/// The executor knobs a run configures, every one of them a flag that
-/// `ravel-server` also has. They travel together because they are only
-/// meaningful together: a statement refused by one ceiling says nothing about
-/// the others, and a table is comparable only when all of them match.
+/// The executor knobs a run configures. They travel together because they are
+/// only meaningful together: a statement refused by one ceiling says nothing
+/// about the others, and a table is comparable only when all of them match.
+///
+/// Every field but [`Self::logs_suffix_len`] is a flag `ravel-server` also has.
+/// That one is a measurement knob with no server equivalent, for the reason its
+/// own doc gives.
 // issue #720: carries `--sql-max-segments` and `--explain`.
 #[derive(Clone, Copy, Debug)]
 pub struct ExecutorSettings {
@@ -820,6 +844,19 @@ pub struct ExecutorSettings {
     /// Sealed, below-watermark segments a statement may fan out over
     /// (`--max-segments`), ADR-0073 decision 2.
     pub max_segments: usize,
+    /// Object size above which a logs read fetches only the pruning-relevant
+    /// parts instead of the whole object (ADR-0107), `ravel-server`'s
+    /// `logs_block_range_threshold`. `0` routes every object through the ranged
+    /// probe-then-fetch path, which is the only path that probes at all: at or
+    /// below the threshold an object is read whole in one GET with no suffix
+    /// probe and therefore no probe miss.
+    pub logs_block_range_threshold: u64,
+    /// Suffix-probe length to pin, or `None` for the per-object derivation
+    /// ([`ravel_query::derive_suffix_len`], #883). No server flag corresponds to
+    /// it: the probe floor is a calibrated constant, and the only sound way to
+    /// move it is to sweep the window against measured probe misses first, which
+    /// is what this knob exists for.
+    pub logs_suffix_len: Option<u64>,
 }
 
 impl Default for ExecutorSettings {
@@ -831,8 +868,22 @@ impl Default for ExecutorSettings {
             tenant_max_bytes: DEFAULT_TENANT_MAX_BYTES,
             parallel_final_aggregation: true,
             max_segments: DEFAULT_MAX_SEGMENTS,
+            logs_block_range_threshold: DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+            logs_suffix_len: None,
         }
     }
+}
+
+/// The executor plus the probe-miss counter of the log fetcher inside it
+/// (#883). The counter has to be cloned out here, before the fetcher is moved
+/// into the executor, because nothing downstream hands it back: `SqlOutcome`
+/// carries a `QueryAccountingSnapshot`, which has no probe-miss field, and
+/// widening that type would change the distributed accounting protobuf, a frozen
+/// contract. See [`measure_corpus`] for how a per-run figure is taken from an
+/// accumulating counter.
+struct ColdExecutor {
+    executor: SqlExecutor,
+    probe_misses: ProbeMissCounter,
 }
 
 fn cold_executor(
@@ -840,7 +891,7 @@ fn cold_executor(
     declared: &[DeclaredColumn],
     cache: Option<Arc<Cache<CacheFetchError>>>,
     settings: ExecutorSettings,
-) -> Result<SqlExecutor, Error> {
+) -> Result<ColdExecutor, Error> {
     let ExecutorSettings {
         max_query_bytes,
         shard_count,
@@ -848,6 +899,8 @@ fn cold_executor(
         tenant_max_bytes,
         parallel_final_aggregation,
         max_segments,
+        logs_block_range_threshold,
+        logs_suffix_len,
     } = settings;
     let catalog = Arc::new(Catalog::new(
         Arc::clone(store),
@@ -861,11 +914,20 @@ fn cold_executor(
     // more partitions than that queues on it, so the bench would measure a
     // ceiling the flag cannot move.
     let mut log_fetcher = LogSegmentFetcher::new(Arc::clone(store))
-        .with_max_concurrent_gets(fetch_concurrency.max(1));
+        .with_max_concurrent_gets(fetch_concurrency.max(1))
+        .with_block_range_threshold(logs_block_range_threshold);
+    if let Some(n) = logs_suffix_len {
+        log_fetcher = log_fetcher.with_suffix_len(n);
+    }
     if let Some(cache) = cache {
         log_fetcher = log_fetcher.with_cache(cache);
     }
-    Ok(SqlExecutor::new(
+    // Cloned after every builder, because `with_block_range_threshold` and the
+    // rest rebuild the inner `BlockRangeFetcher`; the counter itself survives
+    // them, but taking the handle last keeps that a local fact rather than an
+    // ordering the reader has to verify.
+    let probe_misses = log_fetcher.probe_miss_counter();
+    let executor = SqlExecutor::new(
         catalog,
         SegmentFetcher::new(Arc::clone(store)),
         log_fetcher,
@@ -882,7 +944,11 @@ fn cold_executor(
         },
         tenant_max_bytes.max(1),
     )
-    .with_declared_column_source(Arc::new(StaticDeclaredColumns::new(declared.to_vec()))))
+    .with_declared_column_source(Arc::new(StaticDeclaredColumns::new(declared.to_vec())));
+    Ok(ColdExecutor {
+        executor,
+        probe_misses,
+    })
 }
 
 /// The physical plan for `sql`, rendered as the indented text `--explain`
@@ -1007,7 +1073,7 @@ pub async fn measure_corpus(
         // `owned_executor` holds it alive for the run loop below. The warm path
         // borrows the one `shared_executor` instead and leaves this unused.
         let owned_executor;
-        let executor: &SqlExecutor = match &shared_executor {
+        let built: &ColdExecutor = match &shared_executor {
             Some(shared) => shared,
             None => {
                 let cache = (cache_bytes > 0).then(|| build_read_cache(cache_bytes));
@@ -1015,6 +1081,13 @@ pub async fn measure_corpus(
                 &owned_executor
             }
         };
+        let executor: &SqlExecutor = &built.executor;
+        // #883: the log fetcher's probe-miss counter accumulates for the life of
+        // the fetcher, which under `--warm-catalog` is the whole corpus. Every
+        // per-run figure below is a difference of two snapshots taken around
+        // that run, so a shared executor attributes each statement's misses to
+        // that statement and never to the ones before it.
+        let probe_misses = &built.probe_misses;
         let req = SqlRequest {
             sql: entry.sql.clone(),
             window,
@@ -1057,6 +1130,9 @@ pub async fn measure_corpus(
         };
 
         for run in 0..runs {
+            // Taken here, after the EXPLAIN side artifact above, so a plan
+            // written for `--explain-dir` is not charged to run 0.
+            let probe_misses_before = probe_misses.snapshot();
             let start = Instant::now();
             let outcome = match executor.execute(tenant_hash, &req).await {
                 Ok(outcome) => outcome,
@@ -1086,6 +1162,10 @@ pub async fn measure_corpus(
             // reads only or still fetches objects, and that is unreadable from
             // the cold figures alone (issue #767).
             let acc = &outcome.accounting;
+            // #883: this run's share of an accumulating counter. The GETs a miss
+            // costs are already in `object_store_get_requests` above; this says
+            // how many of them the probe window is responsible for.
+            let run_probe_misses = probe_misses.snapshot().saturating_sub(&probe_misses_before);
             per_run_accounting.push(RunAccounting {
                 object_store_get_requests: acc.s3_requests(AccountedOp::Get),
                 object_store_list_requests: acc.s3_requests(AccountedOp::List),
@@ -1093,6 +1173,8 @@ pub async fn measure_corpus(
                 cache_hits: acc.cache_hits,
                 cache_misses: acc.cache_misses,
                 cache_bytes: acc.cache_bytes,
+                probe_misses_plan: run_probe_misses.plan,
+                probe_misses_scan: run_probe_misses.scan,
             });
             if run == 0 {
                 // The cold run's block counters and rows go into `scan`; its
@@ -1408,6 +1490,7 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
         tenant_max_bytes: cfg.tenant_max_bytes,
         parallel_final_aggregation: cfg.parallel_final_aggregation,
         max_segments: cfg.max_segments,
+        ..ExecutorSettings::default()
     };
     let (entries, skipped, failed) = measure_corpus(
         &cfg.store,
@@ -1531,6 +1614,7 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
         tenant_max_bytes: cfg.tenant_max_bytes,
         parallel_final_aggregation: cfg.parallel_final_aggregation,
         max_segments: cfg.max_segments,
+        ..ExecutorSettings::default()
     };
     // The two lanes measure the same statements over the same dataset stanza
     // and the same declared-column set; they differ only in what executes the
@@ -1821,18 +1905,22 @@ mod tests {
         tenant: &TenantId,
         shard: u32,
         objects: usize,
-    ) {
-        write_records_as_objects(store, tenant, shard, &build_records(objects.max(1), 0)).await;
+    ) -> Vec<Vec<u8>> {
+        write_records_as_objects(store, tenant, shard, &build_records(objects.max(1), 0)).await
     }
 
     /// One RLOG object per record in `records`, each with its own commit
-    /// record, on `shard`.
+    /// record, on `shard`. Returns the object bytes in write order, so a test
+    /// that needs the object's own layout (section offsets, total size) reads it
+    /// from what was written rather than rebuilding a second copy that could
+    /// drift from it.
     async fn write_records_as_objects(
         store: &Arc<dyn ObjectStoreBackend>,
         tenant: &TenantId,
         shard: u32,
         records: &[LogRecord],
-    ) {
+    ) -> Vec<Vec<u8>> {
+        let mut written = Vec::with_capacity(records.len());
         let writer_id = Uuid::from_u128(0x5100_0100 + u128::from(shard));
         for (obj_idx, rec) in records.iter().enumerate() {
             let writer_seq = (obj_idx + 1) as u64;
@@ -1868,13 +1956,19 @@ mod tests {
             let built = record::build(new_record).expect("build commit record");
             let data_key = keys::reconstruct_data_key(&built).expect("data key");
             store
-                .put(&data_key, bytes::Bytes::from(bytes), PutOptions::default())
+                .put(
+                    &data_key,
+                    bytes::Bytes::from(bytes.clone()),
+                    PutOptions::default(),
+                )
                 .await
                 .expect("put object");
             publish::publish(store.as_ref(), &built, &RetryPolicy::default())
                 .await
                 .expect("publish commit record");
+            written.push(bytes);
         }
+        written
     }
 
     /// A tenant-lane config for the shard/cache tests: memory provenance, no
@@ -2207,10 +2301,12 @@ mod tests {
                 ..ExecutorSettings::default()
             },
         )
-        .expect("build executor");
+        .expect("build executor")
+        .executor;
         assert_eq!(executor.config().engine.max_segments, custom);
-        let executor =
-            cold_executor(&store, &[], None, ExecutorSettings::default()).expect("build executor");
+        let executor = cold_executor(&store, &[], None, ExecutorSettings::default())
+            .expect("build executor")
+            .executor;
         assert_eq!(
             executor.config().engine.max_segments,
             DEFAULT_MAX_SEGMENTS,
@@ -2440,15 +2536,17 @@ mod tests {
                 ..ExecutorSettings::default()
             },
         )
-        .expect("build executor");
+        .expect("build executor")
+        .executor;
         assert_eq!(executor.max_tenant_bytes(), custom_tenant);
         assert!(
             !executor.config().parallel_final_aggregation,
             "the false opt-out must reach the executor"
         );
 
-        let executor =
-            cold_executor(&store, &[], None, ExecutorSettings::default()).expect("build executor");
+        let executor = cold_executor(&store, &[], None, ExecutorSettings::default())
+            .expect("build executor")
+            .executor;
         assert_eq!(executor.max_tenant_bytes(), DEFAULT_TENANT_MAX_BYTES);
         assert!(
             executor.config().parallel_final_aggregation,
@@ -2842,14 +2940,16 @@ mod tests {
         // fetcher cache), one run.
         let cache = build_read_cache(64 << 20);
         let cached = cold_executor(&store, &[], Some(cache), ExecutorSettings::default())
-            .expect("build cached executor");
+            .expect("build cached executor")
+            .executor;
         let on = cached.execute(th, &req).await.expect("cached run");
 
         // Fetcher cache OFF: a fresh executor (identical cold catalog byte cache,
         // no fetcher cache), one run. The catalog contribution is the same in
         // both, so any delta is the fetcher cache alone.
         let uncached = cold_executor(&store, &[], None, ExecutorSettings::default())
-            .expect("build uncached executor");
+            .expect("build uncached executor")
+            .executor;
         let off = uncached.execute(th, &req).await.expect("uncached run");
 
         let get_on = on.accounting.s3_requests(AccountedOp::Get);
@@ -2893,7 +2993,8 @@ mod tests {
                 ..ExecutorSettings::default()
             },
         )
-        .expect("build executor");
+        .expect("build executor")
+        .executor;
         assert_eq!(executor.config().engine.fetch_concurrency, custom);
         let executor = cold_executor(
             &store,
@@ -2904,7 +3005,8 @@ mod tests {
                 ..ExecutorSettings::default()
             },
         )
-        .expect("build executor");
+        .expect("build executor")
+        .executor;
         assert_eq!(
             executor.config().engine.fetch_concurrency,
             1,
@@ -3005,6 +3107,199 @@ mod tests {
         assert_eq!(scan.cache_hits, acc[0].cache_hits);
     }
 
+    // ---- Probe misses in the per-run accounting (#883) ---------------------
+
+    /// The suffix-probe length that just fails to reach SKIP_IDX in `object`: it
+    /// starts exactly at SKIP_IDX's end, so it covers the footer (no footer
+    /// chase) and every tail section the writer emits after SKIP_IDX (PAGE_DIR
+    /// on a version-4 object), leaving SKIP_IDX -- the one section a read has to
+    /// locate blocks through -- as the only thing outside the window. Stands in
+    /// for an under-sized probe derivation on an object whose trailer exceeds it.
+    fn suffix_just_past_skip_idx(object: &[u8]) -> u64 {
+        let total = object.len() as u64;
+        let footer = ravel_logseg::footer::open(object).expect("footer");
+        let skip = *footer
+            .section(ravel_logseg::footer::kind::SKIP_IDX)
+            .expect("SKIP_IDX");
+        let suffix = total - (skip.offset + skip.len);
+        assert!(
+            suffix < total - skip.offset,
+            "the probe must not reach SKIP_IDX's start"
+        );
+        suffix
+    }
+
+    /// The `has_word` statement the probe-miss tests measure. It is deliberately
+    /// not skip-decidable: `plan_segment` falls back to a whole-object plan read
+    /// and hands no footer forward, so the scan probes the object a second time
+    /// on its own. That is what makes both phases counted, which is the split
+    /// the two `probe_misses_*` fields exist to show.
+    const PROBE_MISS_SQL: &str = "SELECT body FROM logs WHERE has_word(body, 'timeout')";
+
+    /// A trailer that EXCEEDS the probe is reported in the per-run accounting,
+    /// per phase, on every run.
+    ///
+    /// The fixture is one RLOG object read through the ranged path
+    /// (`logs_block_range_threshold: 0`, the whole-object crossover disabled --
+    /// at the default threshold this object is read whole in one GET and never
+    /// probes at all, so none of the miss-counting sites is reached and the test
+    /// would be vacuous). The probe is pinned to start at SKIP_IDX's end, so
+    /// each read that has to locate blocks through SKIP_IDX misses exactly one
+    /// tail section: one in the plan phase (`plan_segment`'s whole-object
+    /// fallback) and one in the scan phase (the data read, which re-probes
+    /// because the fallback carried no footer).
+    ///
+    /// Both runs report the same figures even though the warm run's store GETs
+    /// fall: a miss is measured against the probe WINDOW, not against what the
+    /// read cache happened to hold.
+    ///
+    /// Prove-the-test: pinned exact values, never `> 0`. Demonstrated failing
+    /// during development by deleting the
+    /// `self.probe_misses.record(phase, stats.probe_misses)` line from
+    /// `LogSegmentFetcher::record_probe_misses` in `ravel-query` (reads 0
+    /// against the expected 1), and by deleting `stats.probe_misses += 1` from
+    /// `fetch_object_v4`'s tail-section loop, the counting site this version-4
+    /// fixture actually reaches (same result, from the other end of the
+    /// plumbing). Deleting the version-3 site in `fetch_object_with_footer`
+    /// instead leaves it green, which is what says the fixture is version 4.
+    #[tokio::test]
+    async fn probe_misses_reach_per_run_accounting_when_the_trailer_exceeds_the_probe() {
+        let store = empty_store();
+        let tenant = TenantId::new("probe-miss-tenant");
+        let objects = write_shard_objects(&store, &tenant, 0, 1).await;
+        let suffix = suffix_just_past_skip_idx(&objects[0]);
+        let window = TimeRange {
+            start_ns: 0,
+            end_ns: NOW_NS,
+        };
+        let (measured, skipped, failed) = measure_corpus(
+            &store,
+            tenant.hash(),
+            &[entry("q", PROBE_MISS_SQL)],
+            &[],
+            2,
+            window,
+            NOW_NS,
+            64 << 20,
+            Duration::from_secs(30),
+            false,
+            None,
+            ExecutorSettings {
+                logs_block_range_threshold: 0,
+                logs_suffix_len: Some(suffix),
+                ..ExecutorSettings::default()
+            },
+            false,
+            None,
+        )
+        .await
+        .expect("run");
+        assert!(skipped.is_empty() && failed.is_empty());
+        let acc = measured[0]
+            .per_run_accounting
+            .as_ref()
+            .expect("an in-process lane records per-run accounting");
+        assert_eq!(acc.len(), 2, "one accounting entry per run");
+
+        assert_eq!(
+            acc[0].probe_misses_plan, 1,
+            "cold run: the plan-phase read missed SKIP_IDX exactly once"
+        );
+        assert_eq!(
+            acc[0].probe_misses_scan, 1,
+            "cold run: the scan-phase read missed SKIP_IDX exactly once"
+        );
+        assert_eq!(
+            acc[1].probe_misses_plan, 1,
+            "warm run: the same window misses the same section"
+        );
+        assert_eq!(
+            acc[1].probe_misses_scan, 1,
+            "warm run: a miss is a property of the probe window, not of the cache"
+        );
+
+        // What a measurement pass actually reads: the figure has to be in the
+        // report JSON, per statement per run, not only in the in-memory struct.
+        let v: serde_json::Value = serde_json::to_value(&measured[0]).expect("serialize entry");
+        let per_run = v["per_run_accounting"]
+            .as_array()
+            .expect("per_run_accounting is a JSON array");
+        assert_eq!(per_run[0]["probe_misses_plan"], 1);
+        assert_eq!(per_run[0]["probe_misses_scan"], 1);
+        assert_eq!(per_run[1]["probe_misses_plan"], 1);
+        assert_eq!(per_run[1]["probe_misses_scan"], 1);
+    }
+
+    /// A trailer that FITS inside the derived probe reports exactly zero, on
+    /// both phases and both runs.
+    ///
+    /// Same fixture and same ranged path as the exceeding case, with the probe
+    /// left at the per-object derivation: this object is far below
+    /// `LOG_SUFFIX_FLOOR_BYTES`, so the derived window is the whole object and
+    /// covers every tail section. Paired with the exceeding case so a plumbing
+    /// change that reported a constant zero could not pass both.
+    ///
+    /// Prove-the-test: pinned to 0, never `>= 0`. Demonstrated failing during
+    /// development by making `probe_window_covers` in `ravel-query` return
+    /// `false` unconditionally: every counting read then reports its tail
+    /// sections as missed and the first assertion reads 2 (SKIP_IDX and
+    /// PAGE_DIR) against the expected 0.
+    #[tokio::test]
+    async fn probe_misses_are_zero_when_the_derived_probe_covers_the_trailer() {
+        let store = empty_store();
+        let tenant = TenantId::new("probe-fit-tenant");
+        let objects = write_shard_objects(&store, &tenant, 0, 1).await;
+        let total = objects[0].len() as u64;
+        assert!(
+            ravel_query::derive_suffix_len(total) >= total,
+            "fixture precondition: the derived probe ({} B) must cover the whole \
+             object ({total} B), or this test would be measuring a miss",
+            ravel_query::derive_suffix_len(total)
+        );
+        let window = TimeRange {
+            start_ns: 0,
+            end_ns: NOW_NS,
+        };
+        let (measured, skipped, failed) = measure_corpus(
+            &store,
+            tenant.hash(),
+            &[entry("q", PROBE_MISS_SQL)],
+            &[],
+            2,
+            window,
+            NOW_NS,
+            64 << 20,
+            Duration::from_secs(30),
+            false,
+            None,
+            ExecutorSettings {
+                logs_block_range_threshold: 0,
+                logs_suffix_len: None,
+                ..ExecutorSettings::default()
+            },
+            false,
+            None,
+        )
+        .await
+        .expect("run");
+        assert!(skipped.is_empty() && failed.is_empty());
+        let acc = measured[0]
+            .per_run_accounting
+            .as_ref()
+            .expect("an in-process lane records per-run accounting");
+        assert_eq!(acc.len(), 2, "one accounting entry per run");
+        for (run, entry) in acc.iter().enumerate() {
+            assert_eq!(
+                entry.probe_misses_plan, 0,
+                "run {run}: the derived probe covered every plan-phase tail section"
+            );
+            assert_eq!(
+                entry.probe_misses_scan, 0,
+                "run {run}: the derived probe covered every scan-phase tail section"
+            );
+        }
+    }
+
     /// The report JSON keeps its existing shape and gains the per-run array.
     /// A cold accounting field under `scan` is unchanged (pinned), and
     /// `per_run_accounting` is an array whose length equals `runs`.
@@ -3068,7 +3363,8 @@ mod tests {
                 ..ExecutorSettings::default()
             },
         )
-        .expect("build executor");
+        .expect("build executor")
+        .executor;
         assert_eq!(executor.config().max_query_bytes, custom);
     }
 
@@ -3079,8 +3375,9 @@ mod tests {
     #[test]
     fn cold_executor_defaults_to_compiled_in_budget() {
         let store = empty_store();
-        let executor =
-            cold_executor(&store, &[], None, ExecutorSettings::default()).expect("build executor");
+        let executor = cold_executor(&store, &[], None, ExecutorSettings::default())
+            .expect("build executor")
+            .executor;
         assert_eq!(executor.config().max_query_bytes, DEFAULT_MAX_QUERY_BYTES);
     }
 
