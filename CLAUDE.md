@@ -536,6 +536,18 @@ mechanical.
   down the expected figures and the band that would count as a miss, on
   the tracking issue. A result that only gets a prediction after the
   fact cannot surprise you, and surprise is the signal.
+- Reproduce before you dispute, and quote the reproduction. A claim that
+  a published figure is wrong, unreconstructable, or computed on the
+  wrong basis is filed only after grepping the publishing document for
+  its own stated basis and running `scripts/reproduce-figure.sh`, with
+  that output quoted in the filing. Quoting is the mechanism, not the
+  running: an omitted quote is visible on the page, an omitted mental
+  step is not. The same applies to a mechanism claim, which carries its
+  count-check inline beside it. A published headline was once disputed
+  as unreconstructable while the epic body stated the rule outright and
+  a single-statement drop reproduced the total to the cent; the
+  correction moved a planning target twice. An overcorrection is a claim
+  too, and needs the same evidence as the claim it replaces.
 - A measurement has preconditions on state, not only on code: the
   catalog folded to the last write (a fold seals an ingest hour only
   `max_flush_lifetime + clock_skew_allowance + fold_safety_margin` after
