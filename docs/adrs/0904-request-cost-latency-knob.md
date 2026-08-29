@@ -143,9 +143,17 @@ intents the epic names map to values directly:
 - **Prefer speed** (default): leave it at 1,887,437, the measured latency
   break-even. No behavior change.
 - **Prefer cost on a request-billed, transfer-free backend**: set it at
-  or above the largest segment object size (1 GiB is a safe round
-  figure). All three derived decisions then collapse to whole-object
-  reads: the crossover saturates (`saturating_mul` at
+  or above the largest segment object the deployment actually writes.
+  There is no format-level object-size cap to read this from:
+  `DEFAULT_MAX_SECTION_UNCOMP` (`crates/ravel-logseg/src/footer.rs:113`)
+  bounds one SECTION at 1 GiB, and an object carries several sections, so
+  "1 GiB" is not an object bound and does not by itself guarantee
+  whole-object routing. Size it from the deployment instead: the object
+  size is set by `--batch-rows` and `--target-bytes` at write time and is
+  observable per tenant, so take the largest object the tenant holds and
+  round up. Setting it far above that costs nothing, because every
+  decision below saturates once the value exceeds the largest object.
+  All three derived decisions then collapse to whole-object reads: the crossover saturates (`saturating_mul` at
   `log_fetcher.rs:2846`), `ranged_projection_pays` can never find enough
   saved bytes, and the coalescing gap fuses everything. One GET per
   candidate segment, the pre-#887 read shape, restored by configuration
@@ -397,7 +405,7 @@ two tasks in a wave touch the same crate.
 | 904-1 | `EngineConfig::logs_request_cost_bytes` field, default = `DEFAULT_LOG_REQUEST_COST_BYTES` | ravel-query | `crates/ravel-query/src/config.rs`, `crates/ravel-query/src/lib.rs` (re-export if missing) | -- | unit test: `EngineConfig::default().logs_request_cost_bytes == DEFAULT_LOG_REQUEST_COST_BYTES`; no behavior change (existing suites green untouched) | low |
 | 904-2 | opens-by-shape counters on `QueryAccounting` (`logs_whole_object_opens`, `logs_ranged_opens`), snapshot + merge | ravel-types | `crates/ravel-types/src/accounting.rs` | -- | snapshot/merge round-trip asserts exact figures for both counters; counter absent-vs-zero distinction matches existing fields | low |
 | 904-3 | server flag `--logs-request-cost-bytes` wired to the fetcher (THE reachability task) | ravel-server | `services/ravel-server/src/config.rs`, `services/ravel-server/src/query.rs` | 904-1 | `logs_request_cost_bytes_is_reachable_from_cli` in the exact shape of `fetch_concurrency_is_reachable_from_cli` (`services/ravel-server/src/config.rs:3712`): flag value proven to arrive at the running engine's config through real startup. Behavior-changing call site: `query.rs:309-311` gains `.with_request_cost_bytes(config.engine.logs_request_cost_bytes)` | medium |
-| 904-4 | record opens-by-shape into accounting; knob-extremes differential test | ravel-query, ravel-sql (tests only) | `crates/ravel-query/src/log_fetcher.rs`, `crates/ravel-sql/tests/logs_fast_path_projection_routing.rs` | 904-1, 904-2 | extend `both_paths_return_identical_rows`: drive routing via the config field at both extremes (floor-clamped low value forces ranged; `u64::MAX` forces whole-object), assert byte-identical rows AND the exact opens-by-shape counter values per run | medium |
+| 904-4 | record opens-by-shape into accounting; knob-extremes differential test | ravel-query, ravel-sql (tests only) | `crates/ravel-query/src/log_fetcher.rs`, `crates/ravel-sql/tests/logs_fast_path_projection_routing.rs` | 904-1, 904-2, 904-3 | extend `both_paths_return_identical_rows`: drive routing via the config field at both extremes (floor-clamped low value forces ranged; `u64::MAX` forces whole-object), assert byte-identical rows AND the exact opens-by-shape counter values per run | medium |
 | 904-5 | operations-guide sizing section (list-price modelling labelled), flag interactions | (docs only) | `docs/guides/operations.md`, `docs/guides/query.md` | 904-3 | doc names all three deployment shapes, labels every dollar figure as list-price modelling, states the RSEG non-coverage; reviewed against this ADR's Decision 1/5 | low |
 | 904-6 | bench report surfaces opens-by-shape beside `backend_bills_requests` | ravel-bench | `crates/ravel-bench/src/report.rs` | 904-2, 904-4 | exact-figure fixture in the shape of the existing `RequestCounts` tests: MemoryStore workload asserts the exact opens split, present exactly once | low |
 | 904-7 | measurement: ClickBench 42-statement pass at knob = 1 GiB, reference box | (none; operational) | bench results doc under the #680 conventions | 904-3, 904-4, 904-5 | pre-registered bands posted on the epic BEFORE the run (expected direction: requests <= 203,243, bytes >= 403.97 GB, both with stated bands); report stamps verified state per the measurement rules; a figure outside band fails the task, not the write-up | low |
