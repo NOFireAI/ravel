@@ -315,7 +315,10 @@ async fn write_rlog_segment_under(tenant: TenantHash) -> (Arc<MemoryStore>, Segm
         writer_seq: 1,
         created_unix_ns: 0,
         level: SegmentLevel::L0,
-        segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+        // 3, matching the bytes `finish_v3_for_tests` wrote above. Declaring
+        // the current version here is what the comment on that call warns
+        // against: the fixture would take the whole-object fallback.
+        segment_format_version: 3,
     };
     (store, seg_ref)
 }
