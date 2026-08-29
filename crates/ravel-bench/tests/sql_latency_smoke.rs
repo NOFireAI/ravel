@@ -59,6 +59,7 @@ fn small_generate_config(store: Arc<dyn ObjectStoreBackend>, runs: usize) -> Gen
         max_segments: ravel_query::DEFAULT_MAX_SEGMENTS,
         explain_dir: None,
         warm_catalog: false,
+        logs_suffix_len: None,
     }
 }
 

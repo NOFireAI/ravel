@@ -150,6 +150,7 @@ async fn publish_dataset(store: Arc<dyn ObjectStoreBackend>) -> TenantId {
         max_segments: ravel_query::DEFAULT_MAX_SEGMENTS,
         explain_dir: None,
         warm_catalog: false,
+        logs_suffix_len: None,
     })
     .await
     .expect("generated lane publishes the dataset");
@@ -248,6 +249,7 @@ fn flight_cfg(
         explain_dir: None,
         flight: Some(flight),
         warm_catalog: false,
+        logs_suffix_len: None,
     }
 }
 
