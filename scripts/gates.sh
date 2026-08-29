@@ -54,6 +54,14 @@ fi
 echo "==> cargo --locked fmt --all --check"
 cargo --locked fmt --all --check
 
+# The test-hygiene shapes CLAUDE.md names under "Testing patterns": a
+# wall-clock assertion, an unseeded rng, an untracked proptest seed. Each
+# costs a gate rerun after the rule was already written down, so it is a
+# check rather than another paragraph. A source scan, no build, so it runs
+# ahead of the expensive lanes and fails at authoring time.
+echo "==> scripts/guards/check-test-hygiene.sh"
+"$(dirname "$0")/guards/check-test-hygiene.sh"
+
 # Match CI's `check` job: it runs `cargo nextest run --workspace
 # --cargo-profile ci`. Use nextest when it is installed so a local run
 # warms the same `ci`-profile artifacts CI reuses; fall back to `cargo
