@@ -6694,7 +6694,16 @@ type = "i64"
         /// Injected cost of one data-object PUT.
         const PUT_DELAY: Duration = Duration::from_millis(40);
 
-        async fn arm(depth: usize, flushes: u32) -> (Duration, usize) {
+        /// One arm's outcome: the wall, the peak concurrent object PUTs, and the
+        /// submit loop's own wall split into the only two things it can block on.
+        struct Arm {
+            wall: Duration,
+            peak: usize,
+            write_wait: Duration,
+            decode_wait: Duration,
+        }
+
+        async fn arm(depth: usize, flushes: u32) -> Arm {
             let shards = 1u32;
             let hosts: Vec<String> = (0..BATCHES).map(|i| format!("h{i}")).collect();
 
@@ -6775,21 +6784,35 @@ type = "i64"
                 report.write_wait,
                 report.decode_wait
             );
-            (wall, max_in_flight.load(Ordering::SeqCst))
+            Arm {
+                wall,
+                peak: max_in_flight.load(Ordering::SeqCst),
+                write_wait: report.write_wait,
+                decode_wait: report.decode_wait,
+            }
         }
 
-        let (wall_1_1, peak_1_1) = arm(1, 1).await;
-        let (wall_4_1, peak_4_1) = arm(4, 1).await;
-        let (wall_1_4, peak_1_4) = arm(1, 4).await;
-        let (wall_4_4, peak_4_4) = arm(4, 4).await;
+        let a_1_1 = arm(1, 1).await;
+        let a_4_1 = arm(4, 1).await;
+        let a_1_4 = arm(1, 4).await;
+        let a_4_4 = arm(4, 4).await;
+        let (wall_1_1, peak_1_1) = (a_1_1.wall, a_1_1.peak);
+        let (wall_4_1, peak_4_1) = (a_4_1.wall, a_4_1.peak);
+        let (wall_1_4, peak_1_4) = (a_1_4.wall, a_1_4.peak);
+        let (wall_4_4, peak_4_4) = (a_4_4.wall, a_4_4.peak);
 
-        println!(
-            "write-window 2x2 ({BATCHES} batches, {PUT_DELAY:?} per data PUT, 1 shard):\n  \
-             depth 1 / flushes 1: {wall_1_1:?} peak {peak_1_1}\n  \
-             depth 4 / flushes 1: {wall_4_1:?} peak {peak_4_1}\n  \
-             depth 1 / flushes 4: {wall_1_4:?} peak {peak_1_4}\n  \
-             depth 4 / flushes 4: {wall_4_4:?} peak {peak_4_4}"
-        );
+        println!("write-window 2x2 ({BATCHES} batches, {PUT_DELAY:?} per data PUT, 1 shard):");
+        for (label, a) in [
+            ("depth 1 / flushes 1", &a_1_1),
+            ("depth 4 / flushes 1", &a_4_1),
+            ("depth 1 / flushes 4", &a_1_4),
+            ("depth 4 / flushes 4", &a_4_4),
+        ] {
+            println!(
+                "  {label}: wall {:?} peak {} (submit loop: write_wait {:?}, decode_wait {:?})",
+                a.wall, a.peak, a.write_wait, a.decode_wait
+            );
+        }
 
         assert_eq!(
             peak_1_1, 1,
@@ -6832,9 +6855,13 @@ type = "i64"
         // gets with neither flag given must be the overlapped arm, not the
         // serial one. This is the assertion the default change is accountable
         // to; against the pre-change defaults of 1 and 1 it reads a peak of 1.
-        let (wall_default, peak_default) =
-            arm(DEFAULT_PIPELINE_DEPTH, DEFAULT_MAX_INFLIGHT_FLUSHES).await;
-        println!("  shipped defaults:    {wall_default:?} peak {peak_default}");
+        let a_default = arm(DEFAULT_PIPELINE_DEPTH, DEFAULT_MAX_INFLIGHT_FLUSHES).await;
+        let (wall_default, peak_default) = (a_default.wall, a_default.peak);
+        println!(
+            "  shipped defaults:    wall {wall_default:?} peak {peak_default} \
+             (submit loop: write_wait {:?}, decode_wait {:?})",
+            a_default.write_wait, a_default.decode_wait
+        );
         assert_eq!(
             peak_default, 4,
             "the shipped defaults must overlap four object PUTs; a peak of 1 means \
