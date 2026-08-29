@@ -333,22 +333,42 @@ mod tests {
             let Some(data) = found else {
                 return StatusCode::NOT_FOUND.into_response();
             };
+            // All three RFC 7233 byte-range forms, not just the closed one:
+            // `S3Store::get` emits `bytes=-N` for `GetRange::Suffix`, which is
+            // how every footer in this codebase is read, so a mock that parses
+            // only `bytes=A-B` fails such a request with 416 for a reason that
+            // has nothing to do with the code under test.
             let requested = headers
                 .get(header::RANGE)
                 .and_then(|value| value.to_str().ok())
                 .and_then(|spec| spec.strip_prefix("bytes=")?.split_once('-'))
-                .map(|(start, end)| (start.parse::<usize>(), end.parse::<usize>()));
+                .map(|(start, end)| {
+                    let len = data.len();
+                    match (start.trim(), end.trim()) {
+                        // bytes=-N: the last N bytes.
+                        ("", n) => n.parse::<usize>().ok().and_then(|n| {
+                            (n > 0 && len > 0).then(|| (len.saturating_sub(n), len - 1))
+                        }),
+                        // bytes=A-: from A through the end.
+                        (s, "") => s
+                            .parse::<usize>()
+                            .ok()
+                            .and_then(|s| (s < len).then(|| (s, len - 1))),
+                        // bytes=A-B, inclusive, clamped to the object.
+                        (s, e) => match (s.parse::<usize>(), e.parse::<usize>()) {
+                            (Ok(s), Ok(e)) if s < len && s <= e => Some((s, e.min(len - 1))),
+                            _ => None,
+                        },
+                    }
+                });
             let (status, body, content_range) = match requested {
                 None => (StatusCode::OK, data.clone(), None),
-                Some((Ok(start), Ok(end))) if start < data.len() => {
-                    let end = end.min(data.len() - 1);
-                    (
-                        StatusCode::PARTIAL_CONTENT,
-                        data.slice(start..end + 1),
-                        Some(format!("bytes {start}-{end}/{}", data.len())),
-                    )
-                }
-                Some(_) => return StatusCode::RANGE_NOT_SATISFIABLE.into_response(),
+                Some(Some((start, end))) => (
+                    StatusCode::PARTIAL_CONTENT,
+                    data.slice(start..end + 1),
+                    Some(format!("bytes {start}-{end}/{}", data.len())),
+                ),
+                Some(None) => return StatusCode::RANGE_NOT_SATISFIABLE.into_response(),
             };
             let mut response = (
                 status,

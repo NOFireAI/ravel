@@ -98,10 +98,14 @@ never issues an unranged GET: `GetRange::Full` is served as ranged requests of
 at most `S3HttpConfig::max_request_body_bytes()` bytes each, derived from the
 configured `request_timeout` as
 `(request_timeout - 6 s of connect/TLS/first-byte allowance) * 625 000 B/s`
-(a 5 Mbps floor rate), capped at the 8 MiB multipart part size so read and write
-share one largest-request-on-the-wire. At the default 20 s that is 8 MiB, ~13.4 s
-at the floor rate, inside the 14 s transfer budget; a compile-time assertion in
-`s3.rs` pins the inequality. A caller-supplied `GetRange::Range` is passed
+(a 5 Mbps floor rate), clamped to `[1 MiB, 8 MiB]`: the upper bound is the
+multipart part size, so read and write share one largest-request-on-the-wire,
+and the lower bound stops a tight `request_timeout` splitting a whole-object
+read so finely that the per-request round trips cost more than the bound buys
+back. At the default 20 s the derived value is 8 MiB, ~13.4 s at the floor rate,
+inside the 14 s transfer budget; a compile-time assertion in `s3.rs` pins the
+inequality. Below a `request_timeout` of about 7.7 s the 1 MiB floor binds and
+the formula above no longer predicts the chunk size. A caller-supplied `GetRange::Range` is passed
 through unsplit: the caller sized that request itself.
 
 Cost of the split, in requests and wire bytes as transferred, excluding
