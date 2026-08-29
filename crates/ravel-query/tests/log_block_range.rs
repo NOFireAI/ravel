@@ -44,7 +44,10 @@ use ravel_object_store::{
     Capabilities, DelimitedList, Etag, GetOutcome, GetRange, ListPage, ObjectMeta,
     ObjectStoreBackend, PageToken, PutOptions, PutOutcome, StoreError,
 };
-use ravel_query::{BlockRangeFetcher, CarriedFooter, LogFetchError, LogQuery, LogSegmentFetcher};
+use ravel_query::{
+    AssemblyBufferStats, BlockRangeFetcher, CarriedFooter, LogFetchError, LogQuery,
+    LogSegmentFetcher,
+};
 use ravel_types::TenantHash;
 use ravel_types::accounting::{AccountedOp, QueryAccounting};
 use uuid::Uuid;
@@ -357,6 +360,24 @@ fn subset_object() -> (Vec<LogRecord>, Vec<u8>) {
     (records, bytes)
 }
 
+/// A 20-block object over the same ts range as [`subset_object`] but with
+/// different, longer bodies, so its object bytes differ at essentially every
+/// offset and its total size is larger. Used to DIRTY a pooled assembly buffer
+/// before the object under test reuses it (issue #894).
+fn dirtying_object() -> (Vec<LogRecord>, Vec<u8>) {
+    let records: Vec<LogRecord> = (0..20)
+        .map(|ts| {
+            record(
+                "billing",
+                ts,
+                "an entirely different body, long enough that this object is the larger of the two",
+            )
+        })
+        .collect();
+    let bytes = build_object(&records);
+    (records, bytes)
+}
+
 // ---- Test 1: differential -----------------------------------------------
 
 /// The block-range path's decoded rows are byte-identical to the whole-object
@@ -412,6 +433,151 @@ async fn block_range_rows_match_whole_object_over_same_candidate_set() {
         cands.len() > 1 && cands.len() < 20,
         "candidate blocks must be a strict nontrivial subset, got {}",
         cands.len()
+    );
+}
+
+// ---- Test 1b: the assembly buffer is pooled, not allocated per object -----
+
+/// Issue #894: three ranged reads of one object cost ONE object-sized buffer
+/// allocation and ONE whole-object zeroing between them, not three of each.
+/// The figures are exact: the second and third reads check out the buffer the
+/// first returned, at no allocation and no `memset`.
+///
+/// Prove-the-test: restore `ObjectAssembler::new`'s body to
+/// `buf: vec![0u8; total_size]` (dropping the `pool.acquire` call) and this
+/// asserts `allocated: 3, reused: 0, zeroed_bytes: 3 * object_size` instead.
+#[tokio::test]
+async fn ranged_reads_reuse_one_pooled_assembly_buffer() {
+    let (records, bytes) = subset_object();
+    let (_blocks_offset, _blocks_len, tail_len) = layout(&bytes);
+    let object_size = bytes.len() as u64;
+
+    let mem = Arc::new(MemoryStore::new());
+    mem.put("logs/s.rlog", bytes.clone().into(), PutOptions::default())
+        .await
+        .expect("put");
+    let seg = seg_ref("logs/s.rlog", object_size, &records);
+    let store: Arc<dyn ObjectStoreBackend> = mem;
+
+    let br = BlockRangeFetcher::new(store)
+        .with_whole_object_threshold(0)
+        .with_suffix_len(tail_len)
+        .with_coverage_threshold(2.0);
+    assert_eq!(br.assembly_buffer_stats(), AssemblyBufferStats::default());
+
+    for _ in 0..3 {
+        let (assembled, stats) = br
+            .fetch_object(&seg, TENANT, 6, 13, &QueryAccounting::new())
+            .await
+            .expect("ranged fetch");
+        assert!(!stats.whole_object, "the ranged path ran, not a crossover");
+        assert_eq!(assembled.len() as u64, object_size);
+        // The buffer goes back to the pool when the assembled `Bytes` that
+        // borrows it is dropped, which is what the next iteration reuses.
+        drop(assembled);
+    }
+
+    assert_eq!(
+        br.assembly_buffer_stats(),
+        AssemblyBufferStats {
+            allocated: 1,
+            reused: 2,
+            zeroed_bytes: object_size,
+        }
+    );
+}
+
+// ---- Test 1c: differential ON a dirty reused buffer ----------------------
+
+/// The differential above, but with the pooled buffer already carrying ANOTHER
+/// object's bytes in the gaps: the second read's rows must still be
+/// byte-identical to the whole-object path's. Without the pool the gaps were
+/// zeros, so this is the case reuse introduced (issue #894).
+///
+/// Prove-the-test: this passes before the change too (there the buffer is
+/// freshly zeroed); it is the guard that the change did not break the
+/// invariant, and it fails if `place`/`slice` ever stop covering a byte the
+/// reader interprets -- as it does if `ObjectAssembler::new` reuses a buffer
+/// while `AssemblyBuffer::as_slice` returns the whole vector rather than
+/// `[..len]`.
+#[tokio::test]
+async fn ranged_rows_match_whole_object_on_a_buffer_dirtied_by_another_object() {
+    let (dirty_records, dirty_bytes) = dirtying_object();
+    let (records, bytes) = subset_object();
+    let (_blocks_offset, _blocks_len, tail_len) = layout(&bytes);
+    assert!(
+        dirty_bytes.len() >= bytes.len(),
+        "the dirtying object must be at least as large, or the buffer it leaves \
+         behind does not span the object under test: {} vs {}",
+        dirty_bytes.len(),
+        bytes.len()
+    );
+
+    let mem = Arc::new(MemoryStore::new());
+    mem.put(
+        "logs/dirty.rlog",
+        dirty_bytes.clone().into(),
+        PutOptions::default(),
+    )
+    .await
+    .expect("put dirty");
+    mem.put("logs/s.rlog", bytes.clone().into(), PutOptions::default())
+        .await
+        .expect("put");
+    let dirty_seg = seg_ref("logs/dirty.rlog", dirty_bytes.len() as u64, &dirty_records);
+    let seg = seg_ref("logs/s.rlog", bytes.len() as u64, &records);
+    let store: Arc<dyn ObjectStoreBackend> = mem;
+
+    let query = LogQuery::new(6, 13);
+
+    let whole = LogSegmentFetcher::new(Arc::clone(&store))
+        .fetch(&seg, &query)
+        .await
+        .expect("whole fetch")
+        .expect("in range");
+
+    let br = BlockRangeFetcher::new(Arc::clone(&store))
+        .with_whole_object_threshold(0)
+        .with_suffix_len(tail_len)
+        .with_coverage_threshold(2.0);
+    let ranged = LogSegmentFetcher::new(Arc::clone(&store))
+        .with_block_range_threshold(0)
+        .with_block_range(br.clone());
+
+    // First read: the other object, purely to leave its bytes in the buffer.
+    let dirtying = ranged
+        .fetch_accounted_with_tenant(&dirty_seg, TENANT, &query, &QueryAccounting::new())
+        .await
+        .expect("dirtying fetch")
+        .expect("in range");
+    assert!(
+        !dirtying.records.is_empty(),
+        "the dirtying read decoded rows"
+    );
+    drop(dirtying);
+    assert_eq!(
+        br.assembly_buffer_stats().allocated,
+        1,
+        "one buffer so far, now idle in the pool"
+    );
+
+    // Second read: the object under test, on that same buffer.
+    let reused = ranged
+        .fetch_accounted_with_tenant(&seg, TENANT, &query, &QueryAccounting::new())
+        .await
+        .expect("ranged fetch")
+        .expect("in range");
+    assert_eq!(
+        br.assembly_buffer_stats().reused,
+        1,
+        "the second read ran on the first read's buffer, not a fresh one"
+    );
+
+    assert!(!whole.records.is_empty(), "the subset is nontrivial");
+    assert_eq!(
+        whole.records, reused.records,
+        "a ranged read on a buffer dirtied by another object must decode the \
+         same rows as the whole-object path"
     );
 }
 

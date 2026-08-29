@@ -2389,23 +2389,168 @@ impl ByteExtent {
     }
 }
 
+/// Most idle assembly buffers one [`AssemblyBufferPool`] holds on to. A ranged
+/// read holds a buffer only for the length of one `fetch_object` call, so this
+/// bounds resident assembly memory at roughly this many objects regardless of
+/// how many reads pass through.
+const MAX_IDLE_ASSEMBLY_BUFFERS: usize = 4;
+
+/// Longest buffer the pool takes back. A buffer stays at the length of the
+/// largest object it has served (that is what makes reuse free of any
+/// `memset`), so retaining an outlier would pin its whole length for the life
+/// of the process; past this it is dropped instead.
+const MAX_POOLED_ASSEMBLY_BYTES: usize = 64 * 1024 * 1024;
+
+/// Reuse counters for one [`BlockRangeFetcher`]'s assembly-buffer pool
+/// ([`BlockRangeFetcher::assembly_buffer_stats`], issue #894). Cumulative over
+/// the fetcher's life and shared by all its clones; nothing resets them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AssemblyBufferStats {
+    /// Ranged reads that found no idle buffer and allocated one.
+    pub allocated: u64,
+    /// Ranged reads served by a buffer an earlier read returned to the pool,
+    /// with neither an allocation nor a `memset`.
+    pub reused: u64,
+    /// Bytes this pool has ever zeroed: each allocated buffer's initial length
+    /// plus each later growth. A read served by a buffer already at least as
+    /// long as its object adds nothing, which is the whole point of the pool.
+    pub zeroed_bytes: u64,
+}
+
+/// Object-sized assembly buffers, reused across the ranged reads one
+/// [`BlockRangeFetcher`] serves.
+///
+/// [`ObjectAssembler`] needs a buffer indexable at the object's absolute
+/// offsets, which used to cost one `vec![0u8; object_size]` per object: an
+/// allocation and a full-object `memset` on every read, warm ones included, for
+/// a buffer whose populated fraction is only the directory sections and the
+/// surviving blocks (issue #894). Checking one out of here costs neither once
+/// the pool is warm.
+///
+/// A buffer is kept at the length of the largest object it has served and used
+/// as `[..len]` for a shorter one, so a reuse never re-zeroes and
+/// [`Vec::resize`] runs only over real growth. That is what makes the bytes
+/// outside a read's placed regions the PREVIOUS object's rather than zeros, and
+/// why [`ObjectAssembler::slice`] refuses any range it did not place.
+#[derive(Debug, Default)]
+struct AssemblyBufferPool {
+    idle: std::sync::Mutex<Vec<Vec<u8>>>,
+    allocated: AtomicU64,
+    reused: AtomicU64,
+    zeroed_bytes: AtomicU64,
+}
+
+impl AssemblyBufferPool {
+    /// A buffer usable as `[0, len)`, from the idle set when one is there.
+    fn acquire(self: &Arc<Self>, len: usize) -> AssemblyBuffer {
+        let taken = match self.idle.lock() {
+            Ok(mut idle) => idle.pop(),
+            // A poisoned pool means some other read panicked mid-checkout. The
+            // buffers are plain bytes with no invariant to corrupt, but taking
+            // the lock's word for it and allocating fresh is the cheap, correct
+            // response: the pool degrades to the pre-pooling behavior.
+            Err(_) => None,
+        };
+        if taken.is_some() {
+            self.reused.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.allocated.fetch_add(1, Ordering::Relaxed);
+        }
+        let mut buf = taken.unwrap_or_default();
+        if buf.len() < len {
+            self.zeroed_bytes
+                .fetch_add((len - buf.len()) as u64, Ordering::Relaxed);
+            buf.resize(len, 0);
+        }
+        AssemblyBuffer {
+            buf,
+            len,
+            pool: Arc::clone(self),
+        }
+    }
+
+    fn release(&self, buf: Vec<u8>) {
+        if buf.capacity() == 0 || buf.len() > MAX_POOLED_ASSEMBLY_BYTES {
+            return;
+        }
+        if let Ok(mut idle) = self.idle.lock()
+            && idle.len() < MAX_IDLE_ASSEMBLY_BUFFERS
+        {
+            idle.push(buf);
+        }
+    }
+
+    fn stats(&self) -> AssemblyBufferStats {
+        AssemblyBufferStats {
+            allocated: self.allocated.load(Ordering::Relaxed),
+            reused: self.reused.load(Ordering::Relaxed),
+            zeroed_bytes: self.zeroed_bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// One object-sized buffer checked out of an [`AssemblyBufferPool`], returned
+/// to it when dropped -- including when it is dropped as the owner behind the
+/// [`Bytes`] [`ObjectAssembler::into_bytes`] hands the reader, so the buffer
+/// comes back only after the scan that borrows it is finished.
+///
+/// The vector may be longer than `len` (it is sized to the largest object it
+/// has served); everything outside `[0, len)` is invisible through
+/// [`AsRef`], so a shorter object never exposes the tail of a longer one.
+struct AssemblyBuffer {
+    buf: Vec<u8>,
+    len: usize,
+    pool: Arc<AssemblyBufferPool>,
+}
+
+impl AssemblyBuffer {
+    fn as_slice(&self) -> &[u8] {
+        self.buf.get(..self.len).unwrap_or_default()
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        let len = self.len;
+        self.buf.get_mut(..len).unwrap_or_default()
+    }
+}
+
+impl AsRef<[u8]> for AssemblyBuffer {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl Drop for AssemblyBuffer {
+    fn drop(&mut self) {
+        self.pool.release(std::mem::take(&mut self.buf));
+    }
+}
+
 /// Assembles an object-sized buffer from separately fetched regions so the
 /// existing whole-object reader ([`RlogReader`]/[`BlockScan`]) can decode from
 /// it unchanged: block extents are absolute offsets into the object, so the
 /// buffer must be indexable at those offsets. Only the fetched directory
-/// sections and candidate blocks are populated; the gap bytes between them (the
-/// pruned blocks) stay zero and are never read -- `BlockScan` restricted to the
-/// candidate blocks only slices the extents that were placed (ADR-0107: gap
-/// bytes "never interpreted, never verified").
+/// sections and candidate blocks are populated, and the gap bytes between them
+/// (the pruned blocks) are never read -- `BlockScan` restricted to the candidate
+/// blocks only slices the extents that were placed (ADR-0107: gap bytes "never
+/// interpreted, never verified").
+///
+/// The buffer comes from an [`AssemblyBufferPool`] and is reused across objects
+/// (issue #894), so those gap bytes are NOT zero: they are whatever the previous
+/// object left at those offsets. The "never read" claim above is therefore
+/// enforced rather than assumed -- [`slice`](Self::slice) refuses any range no
+/// [`place`](Self::place) covered, so a read that violated it fails closed with
+/// a typed [`LogFetchError::Corrupt`] instead of decoding another object's
+/// bytes.
 struct ObjectAssembler {
-    buf: Vec<u8>,
+    buf: AssemblyBuffer,
     placed: Vec<(u64, u64)>,
 }
 
 impl ObjectAssembler {
-    fn new(total_size: usize) -> Self {
+    fn new(pool: &Arc<AssemblyBufferPool>, total_size: usize) -> Self {
         ObjectAssembler {
-            buf: vec![0u8; total_size],
+            buf: pool.acquire(total_size),
             placed: Vec::new(),
         }
     }
@@ -2414,10 +2559,25 @@ impl ObjectAssembler {
         self.placed.iter().any(|(s, e)| *s <= start && end <= *e)
     }
 
-    fn slice(&self, start: u64, len: u64) -> Option<&[u8]> {
-        let s = usize::try_from(start).ok()?;
-        let e = s.checked_add(usize::try_from(len).ok()?)?;
-        self.buf.get(s..e)
+    /// The stored bytes at `[start, start + len)`, or a typed error when no
+    /// single [`place`](Self::place) call covered that whole range.
+    ///
+    /// The coverage check is the fail-closed half of the pooled buffer: outside
+    /// the placed regions the buffer holds a previous object's bytes, so
+    /// returning them would turn a read the "gap bytes are never interpreted"
+    /// invariant did not anticipate into a silent wrong answer instead of an
+    /// error (issue #894).
+    fn slice(&self, key: &str, start: u64, len: u64) -> Result<&[u8], LogFetchError> {
+        let end = start.checked_add(len).ok_or_else(|| corrupt_range(key))?;
+        if !self.covers(start, end) {
+            return Err(uncovered_range(key, start, end));
+        }
+        let s = usize::try_from(start).map_err(|_| corrupt_range(key))?;
+        let e = usize::try_from(end).map_err(|_| corrupt_range(key))?;
+        self.buf
+            .as_slice()
+            .get(s..e)
+            .ok_or_else(|| corrupt_range(key))
     }
 
     fn place(&mut self, key: &str, start: u64, bytes: &[u8]) -> Result<(), LogFetchError> {
@@ -2425,7 +2585,11 @@ impl ObjectAssembler {
         let e = s
             .checked_add(bytes.len())
             .ok_or_else(|| corrupt_range(key))?;
-        let slot = self.buf.get_mut(s..e).ok_or_else(|| corrupt_range(key))?;
+        let slot = self
+            .buf
+            .as_mut_slice()
+            .get_mut(s..e)
+            .ok_or_else(|| corrupt_range(key))?;
         slot.copy_from_slice(bytes);
         self.placed
             .push((start, start.saturating_add(bytes.len() as u64)));
@@ -2433,7 +2597,7 @@ impl ObjectAssembler {
     }
 
     fn into_bytes(self) -> Bytes {
-        Bytes::from(self.buf)
+        Bytes::from_owner(self.buf)
     }
 }
 
@@ -2459,6 +2623,19 @@ fn corrupt_range(key: &str) -> LogFetchError {
     LogFetchError::Corrupt {
         key: key.to_string(),
         source: LogSegError::Corrupted("block-range assembly out of bounds".into()),
+    }
+}
+
+/// A read of assembled bytes no fetch placed (issue #894). Distinct message
+/// from [`corrupt_range`]'s so a failure names the invariant it broke: the
+/// range is inside the object, it was simply never fetched, and the pooled
+/// buffer holds a previous object's bytes there.
+fn uncovered_range(key: &str, start: u64, end: u64) -> LogFetchError {
+    LogFetchError::Corrupt {
+        key: key.to_string(),
+        source: LogSegError::Corrupted(format!(
+            "block-range assembly read of [{start}, {end}) outside the fetched regions"
+        )),
     }
 }
 
@@ -2509,6 +2686,11 @@ pub struct BlockRangeFetcher {
     /// Bounds in-flight byte-range GETs. Its own instance, never shared with
     /// `SegmentFetcher`'s RSEG semaphore (ADR-0107 decision 1).
     get_semaphore: Arc<Semaphore>,
+    /// Reusable object-sized assembly buffers (issue #894), shared by every
+    /// clone of this fetcher the way `get_semaphore` is, so the one production
+    /// `LogSegmentFetcher` pools across every read of the process rather than
+    /// per query.
+    assembly_pool: Arc<AssemblyBufferPool>,
 }
 
 impl BlockRangeFetcher {
@@ -2523,7 +2705,17 @@ impl BlockRangeFetcher {
             coverage_threshold: DEFAULT_LOG_COVERAGE_THRESHOLD,
             request_cost_bytes: DEFAULT_LOG_REQUEST_COST_BYTES,
             get_semaphore: Arc::new(Semaphore::new(DEFAULT_LOG_MAX_CONCURRENT_GETS)),
+            assembly_pool: Arc::new(AssemblyBufferPool::default()),
         }
+    }
+
+    /// This fetcher's assembly-buffer reuse counters (issue #894): how many
+    /// ranged reads had to allocate an object-sized buffer, how many were served
+    /// by a pooled one, and how many bytes the pool has ever zeroed. Cumulative
+    /// and shared by every clone.
+    #[must_use]
+    pub fn assembly_buffer_stats(&self) -> AssemblyBufferStats {
+        self.assembly_pool.stats()
     }
 
     #[must_use]
@@ -3318,7 +3510,7 @@ impl BlockRangeFetcher {
         // footer parsed at wrong absolute offsets is a `Corrupt`.
         let total_size = seg_ref.object_size;
         let total = usize::try_from(total_size).map_err(|_| corrupt_range(key))?;
-        let mut asm = ObjectAssembler::new(total);
+        let mut asm = ObjectAssembler::new(&self.assembly_pool, total);
 
         // Footer: reused from the plan phase when carried (deliverable 2), else
         // read via the etag-establishing suffix probe. The probe is a suffix GET
@@ -3466,14 +3658,7 @@ impl BlockRangeFetcher {
         .await?;
 
         // Decode the skip index (now resident) and resolve the candidate blocks.
-        let skip_start = usize::try_from(skip_desc.offset).map_err(|_| corrupt_range(key))?;
-        let skip_end = skip_start
-            .checked_add(usize::try_from(skip_desc.len).map_err(|_| corrupt_range(key))?)
-            .ok_or_else(|| corrupt_range(key))?;
-        let skip_stored = asm
-            .buf
-            .get(skip_start..skip_end)
-            .ok_or_else(|| corrupt_range(key))?;
+        let skip_stored = asm.slice(key, skip_desc.offset, skip_desc.len)?;
         let skip_raw = decode_section(skip_stored, skip_desc, &self.cfg)
             .map_err(|source| corrupt(key, source))?;
         let skip =
@@ -4043,9 +4228,7 @@ impl BlockRangeFetcher {
         asm: &ObjectAssembler,
         desc: &SectionDesc,
     ) -> Result<Vec<u8>, LogFetchError> {
-        let stored = asm
-            .slice(desc.offset, desc.len)
-            .ok_or_else(|| corrupt_range(key))?;
+        let stored = asm.slice(key, desc.offset, desc.len)?;
         decode_section(stored, desc, &self.cfg).map_err(|source| corrupt(key, source))
     }
 
@@ -4188,11 +4371,7 @@ impl BlockRangeFetcher {
             .ok_or_else(|| corrupt(key, LogSegError::Corrupted("missing FIELD_DIR".into())))?;
         self.place_section(seg_ref, tenant_hash, &desc, pin, asm, accounting, stats)
             .await?;
-        let start = usize::try_from(desc.offset).map_err(|_| corrupt_range(key))?;
-        let end = start
-            .checked_add(usize::try_from(desc.len).map_err(|_| corrupt_range(key))?)
-            .ok_or_else(|| corrupt_range(key))?;
-        let stored = asm.buf.get(start..end).ok_or_else(|| corrupt_range(key))?;
+        let stored = asm.slice(key, desc.offset, desc.len)?;
         let raw =
             decode_section(stored, &desc, &self.cfg).map_err(|source| corrupt(key, source))?;
         FieldDir::decode(&raw, MAX_FIELDS).map_err(|source| corrupt(key, source))
@@ -4264,9 +4443,7 @@ impl BlockRangeFetcher {
             // by block, so the block-range GET count stays proportional to the
             // blocks the probe did NOT already carry.
             if asm.covers(ext.abs_start, ext.abs_end()) {
-                let block = asm
-                    .slice(ext.abs_start, ext.len)
-                    .ok_or_else(|| corrupt_range(key))?;
+                let block = asm.slice(key, ext.abs_start, ext.len)?;
                 verify_block_crc(key, block, ext)?;
                 if let Some(cache) = &self.cache {
                     let cache_key =
@@ -6498,6 +6675,185 @@ mod plan_block_stats_tests {
             .expect("plan_segment_block_stats");
         assert!(got.is_none(), "ts-irrelevant segment");
         assert_eq!(store.get_count(), 0);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod assembly_buffer_tests {
+    //! Issue #894: the ranged read's object-sized buffer is pooled and reused
+    //! instead of freshly allocated and zeroed per object, and
+    //! [`ObjectAssembler::slice`] fails closed on any range no fetch placed --
+    //! which is what makes the reuse safe, since the bytes outside the placed
+    //! regions are now a previous object's rather than zeros.
+
+    use super::*;
+
+    fn pool() -> Arc<AssemblyBufferPool> {
+        Arc::new(AssemblyBufferPool::default())
+    }
+
+    /// The exact allocation figures the fix is about: three same-sized reads
+    /// through one pool allocate ONE buffer and zero its bytes ONCE, with the
+    /// other two served by reuse. Before the fix each `ObjectAssembler::new`
+    /// ran `vec![0u8; total_size]`, so the same sequence was three allocations
+    /// and three whole-object memsets.
+    #[test]
+    fn three_reads_allocate_and_zero_one_object_sized_buffer() {
+        let pool = pool();
+        for _ in 0..3 {
+            let asm = ObjectAssembler::new(&pool, 4096);
+            drop(asm);
+        }
+        assert_eq!(
+            pool.stats(),
+            AssemblyBufferStats {
+                allocated: 1,
+                reused: 2,
+                zeroed_bytes: 4096,
+            }
+        );
+    }
+
+    /// Growth is charged once, over the growth only: a 4 KiB buffer reused for
+    /// a 6 KiB object zeroes the 2 KiB it gained and nothing else, and a later
+    /// smaller object zeroes nothing at all.
+    #[test]
+    fn a_pooled_buffer_zeroes_only_what_it_grows_by() {
+        let pool = pool();
+        drop(ObjectAssembler::new(&pool, 4096));
+        drop(ObjectAssembler::new(&pool, 6144));
+        drop(ObjectAssembler::new(&pool, 1024));
+        assert_eq!(
+            pool.stats(),
+            AssemblyBufferStats {
+                allocated: 1,
+                reused: 2,
+                zeroed_bytes: 6144,
+            }
+        );
+    }
+
+    /// A buffer longer than the object it is serving exposes exactly the
+    /// object's length, so a short object can never hand the reader the tail of
+    /// a longer predecessor.
+    #[test]
+    fn a_reused_buffer_is_truncated_to_the_current_objects_length() {
+        let pool = pool();
+        drop(ObjectAssembler::new(&pool, 4096));
+        let asm = ObjectAssembler::new(&pool, 1024);
+        assert_eq!(asm.buf.as_slice().len(), 1024);
+        assert_eq!(asm.into_bytes().len(), 1024);
+    }
+
+    /// `slice` returns the placed bytes and refuses everything else with the
+    /// typed [`LogFetchError::Corrupt`], including a range that only partly
+    /// overlaps a placed region.
+    ///
+    /// Prove-the-test: delete the `if !self.covers(start, end)` guard in
+    /// `ObjectAssembler::slice` and the two `expect_err` assertions below fail
+    /// with `Ok`, because the buffer's bytes at those offsets are readable and
+    /// the method has no other reason to refuse them.
+    #[test]
+    fn slice_refuses_any_range_no_fetch_placed() {
+        let pool = pool();
+        let mut asm = ObjectAssembler::new(&pool, 64);
+        asm.place("k", 8, &[0xABu8; 8]).expect("place");
+
+        assert_eq!(asm.slice("k", 8, 8).expect("placed range"), &[0xABu8; 8]);
+
+        let unplaced = asm.slice("k", 0, 8).expect_err("gap byte read must fail");
+        assert!(
+            matches!(
+                &unplaced,
+                LogFetchError::Corrupt { key, source: LogSegError::Corrupted(m) }
+                    if key == "k" && m == "block-range assembly read of [0, 8) outside the fetched regions"
+            ),
+            "expected the uncovered-range error, got {unplaced}"
+        );
+
+        let straddling = asm
+            .slice("k", 12, 8)
+            .expect_err("a range half outside the placed region must fail");
+        assert!(
+            matches!(&straddling, LogFetchError::Corrupt { source: LogSegError::Corrupted(m), .. }
+                if m == "block-range assembly read of [12, 20) outside the fetched regions"),
+            "expected the uncovered-range error, got {straddling}"
+        );
+    }
+
+    /// The hazard the fail-closed check exists for, demonstrated end to end: a
+    /// reused buffer really does still hold the previous object's bytes, and
+    /// `slice` refuses them rather than handing them back as this object's.
+    ///
+    /// Prove-the-test: with the `covers` guard in `ObjectAssembler::slice`
+    /// removed, `slice` returns `Ok([0xAB; 8])` -- the FIRST assembler's bytes
+    /// presented as the second's -- so `expect_err` fails.
+    #[test]
+    fn a_reused_buffer_refuses_the_previous_objects_bytes() {
+        let pool = pool();
+        let mut first = ObjectAssembler::new(&pool, 64);
+        first.place("a", 8, &[0xABu8; 8]).expect("place");
+        drop(first);
+
+        let second = ObjectAssembler::new(&pool, 64);
+        assert_eq!(pool.stats().reused, 1, "the same buffer came back");
+        assert_eq!(
+            second.buf.as_slice().get(8..16),
+            Some(&[0xABu8; 8][..]),
+            "the buffer was NOT re-zeroed: that is the saved memset"
+        );
+        second
+            .slice("b", 8, 8)
+            .expect_err("the previous object's bytes must not be readable as this object's");
+    }
+
+    /// A buffer returns to the pool only when the [`Bytes`]
+    /// [`ObjectAssembler::into_bytes`] produced is dropped, so a reader still
+    /// borrowing it can never see it reused underneath.
+    #[test]
+    fn a_buffer_returns_to_the_pool_only_after_its_bytes_are_dropped() {
+        let pool = pool();
+        let mut asm = ObjectAssembler::new(&pool, 64);
+        asm.place("a", 0, &[0xCDu8; 64]).expect("place");
+        let held = asm.into_bytes();
+
+        let concurrent = ObjectAssembler::new(&pool, 64);
+        assert_eq!(
+            pool.stats(),
+            AssemblyBufferStats {
+                allocated: 2,
+                reused: 0,
+                zeroed_bytes: 128,
+            },
+            "a live Bytes keeps its buffer out of the pool"
+        );
+        assert_eq!(held.as_ref(), &[0xCDu8; 64], "the held bytes are intact");
+        drop(concurrent);
+        drop(held);
+
+        drop(ObjectAssembler::new(&pool, 64));
+        assert_eq!(pool.stats().reused, 1, "both buffers are back");
+    }
+
+    /// The pool bounds what it retains: past
+    /// [`MAX_IDLE_ASSEMBLY_BUFFERS`] idle buffers the extras are dropped rather
+    /// than held for the life of the process.
+    #[test]
+    fn the_idle_set_is_bounded() {
+        let pool = pool();
+        let live: Vec<ObjectAssembler> = (0..MAX_IDLE_ASSEMBLY_BUFFERS + 2)
+            .map(|_| ObjectAssembler::new(&pool, 64))
+            .collect();
+        assert_eq!(
+            pool.stats().allocated,
+            (MAX_IDLE_ASSEMBLY_BUFFERS + 2) as u64
+        );
+        drop(live);
+        assert_eq!(
+            pool.idle.lock().expect("idle").len(),
+            MAX_IDLE_ASSEMBLY_BUFFERS
+        );
     }
 }
 
