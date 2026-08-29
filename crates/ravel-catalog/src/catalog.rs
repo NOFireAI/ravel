@@ -137,6 +137,21 @@ fn clone_store_error(err: &StoreError) -> StoreError {
     }
 }
 
+/// One tenant/signal's last-resolved column-statistics object, cached so a
+/// repeated eligible plan reuses it instead of re-fetching the same object
+/// (ADR-0850, issue #888). Keyed for validity by the object's own content hash
+/// (`stats_blake3`) AND the folded HEAD's covered part set (`part_blake3`):
+/// the stats object is bound to the CURRENT folded HEAD, not the pinned query
+/// snapshot, so a fold that changes either value must re-resolve. Every load
+/// still reads HEAD (one GET) to learn the current `(blake3, parts)`, so a
+/// changed fold is always detected; the cache only ever avoids the SECOND GET,
+/// the stats-object fetch, and only when both keys still match.
+struct CachedColumnStats {
+    stats_blake3: [u8; 32],
+    part_blake3: Vec<[u8; 32]>,
+    stats: Arc<LoadedColumnStats>,
+}
+
 /// Listing-based catalog over an object store backend (Phase 1, ADR-0003).
 /// A future compaction phase folds commit records into immutable snapshot
 /// objects behind a CAS'd HEAD pointer; this type's public API does not
@@ -231,6 +246,13 @@ pub struct Catalog {
     /// backwards across callers with skewed clocks, which only ever delays an
     /// eviction, never causes a wrong one.
     tenant_activity: Mutex<HashMap<TenantHash, i64>>,
+    /// Last-resolved column-statistics object per `(tenant, signal)` (ADR-0850,
+    /// issue #888). Consulted in [`Catalog::load_column_stats`] after the HEAD
+    /// GET and before the stats-object GET, so a repeated eligible plan against
+    /// an unchanged folded HEAD reuses the decoded object instead of
+    /// re-fetching it. Swept per tenant by [`Catalog::evict_idle_tenants`]
+    /// alongside the other re-derivable per-tenant caches.
+    column_stats_cache: Mutex<HashMap<(TenantHash, Signal), CachedColumnStats>>,
 }
 
 /// Adapts [`Catalog::guarded_get`] to the provisioning module's
@@ -292,6 +314,7 @@ impl Catalog {
             enforce_provisioning: false,
             provisioning_checked: Mutex::new(HashSet::new()),
             tenant_activity: Mutex::new(HashMap::new()),
+            column_stats_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -761,7 +784,45 @@ impl Catalog {
             catalog: self,
             accounting,
         };
-        column_stats_resolve::load_column_stats(&getter, tenant, signal).await
+        // Always read HEAD (one GET): the stats object is bound to the CURRENT
+        // folded HEAD, not the pinned snapshot, so this is the only way to
+        // detect a fold that superseded a cached object (ADR-0850, issue #888).
+        let Some(resolved) =
+            column_stats_resolve::resolve_stats_ref(&getter, tenant, signal).await?
+        else {
+            return Ok(None);
+        };
+        // Reuse the cached object only when its content hash AND the HEAD's
+        // covered part set both still match `resolved`: a changed fold produces
+        // a different `blake3` (a rebuilt object) or a different part set (the
+        // binding a stale object fails), and either misses. This skips the
+        // second GET, the stats-object fetch, and nothing else.
+        let cache_hit = {
+            let cache = self.column_stats_cache.lock();
+            cache.get(&(*tenant, signal)).and_then(|cached| {
+                (cached.stats_blake3 == resolved.blake3
+                    && cached.part_blake3 == resolved.expected_part_blake3)
+                    .then(|| Arc::clone(&cached.stats))
+            })
+        };
+        if let Some(stats) = cache_hit {
+            return Ok(Some((*stats).clone()));
+        }
+        let Some(loaded) =
+            column_stats_resolve::fetch_stats_object(&getter, tenant, &resolved).await?
+        else {
+            return Ok(None);
+        };
+        let stats = Arc::new(loaded);
+        self.column_stats_cache.lock().insert(
+            (*tenant, signal),
+            CachedColumnStats {
+                stats_blake3: resolved.blake3,
+                part_blake3: resolved.expected_part_blake3,
+                stats: Arc::clone(&stats),
+            },
+        );
+        Ok(Some((*stats).clone()))
     }
 
     /// Evict every per-tenant cache outer-map entry for tenants last touched
@@ -806,6 +867,11 @@ impl Catalog {
             self.head_cache.evict_tenant(tenant);
             self.part_cache.evict_tenant(tenant);
             self.postings_cache.evict_tenant(tenant);
+        }
+        if !idle.is_empty() {
+            self.column_stats_cache
+                .lock()
+                .retain(|(tenant, _), _| !idle.contains(tenant));
         }
         idle.len()
     }
@@ -5350,6 +5416,201 @@ mod tests {
             catalog.request_semaphore.available_permits(),
             MAX_CONCURRENT_REQUESTS,
             "every acquired permit was released"
+        );
+    }
+
+    /// Write a folded HEAD plus its `.cstat` object for `Signal::Logs`, whose
+    /// one segment carries a single I64 `status` column with the exact value
+    /// `value` (min == max == `value`, one non-null row). `part_hash` binds the
+    /// HEAD's part set to the stats object; reusing the same `part_hash` across
+    /// calls keeps the part binding fixed so a re-resolve is driven purely by
+    /// the stats object's content hash changing with `value`.
+    async fn install_logs_stats(store: &MemoryStore, part_hash: [u8; 32], value: i64) {
+        let signal = Signal::Logs;
+        let signal_num = signal::to_proto(signal) as u32;
+
+        let segments = vec![ravel_proto::catalog::v1::ColumnStatsSegment {
+            ingest_hour_bucket: 1,
+            shard: 0,
+            writer_id: vec![0xAA; 16],
+            writer_epoch: 1,
+            writer_seq: 1,
+            columns: vec![ravel_proto::catalog::v1::ColumnStat {
+                name: "status".to_string(),
+                declared_type: 2,
+                non_null_count: 1,
+                null_count: 0,
+                min: Some(ravel_proto::catalog::v1::ColumnValue {
+                    kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(value)),
+                }),
+                max: Some(ravel_proto::catalog::v1::ColumnValue {
+                    kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(value)),
+                }),
+                dictionary_present: true,
+                dictionary: vec![ravel_proto::catalog::v1::DictEntry {
+                    value: Some(ravel_proto::catalog::v1::ColumnValue {
+                        kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(value)),
+                    }),
+                    count: 1,
+                }],
+            }],
+        }];
+        let stats_bytes = crate::snapshot_format::encode_column_stats(
+            tenant().0,
+            signal_num,
+            vec![part_hash.to_vec()],
+            &segments,
+        )
+        .expect("encode column stats");
+        let stats_hash = *blake3::hash(&stats_bytes).as_bytes();
+        let stats_key = format!("t/{}/catalog/l/cstat/one.cstat", tenant().to_hex());
+        store
+            .put(
+                &stats_key,
+                Bytes::from(stats_bytes.clone()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put stats");
+
+        let head = ravel_proto::catalog::v1::SnapshotHead {
+            format_version: crate::snapshot_format::HEAD_FORMAT_VERSION,
+            tenant_hash: tenant().0.to_vec(),
+            signal: signal_num,
+            shard_count: 8,
+            watermark_hour: 10,
+            parts: vec![ravel_proto::catalog::v1::SnapshotPartRef {
+                key: format!("t/{}/catalog/l/snap/empty.csnap", tenant().to_hex()),
+                blake3: part_hash.to_vec(),
+                size: 1,
+                entry_count: 0,
+                watermark_hour: 10,
+                min_hour: 0,
+            }],
+            folder_id: Uuid::new_v4().into_bytes().to_vec(),
+            created_unix_ns: 0,
+            postings: None,
+            shard_generation_count: 1,
+            column_stats: Some(ravel_proto::catalog::v1::SnapshotColumnStatsRef {
+                key: stats_key,
+                blake3: stats_hash.to_vec(),
+                size: stats_bytes.len() as u64,
+                segment_count: 1,
+                part_blake3: vec![part_hash.to_vec()],
+            }),
+        };
+        let head_bytes = crate::snapshot_format::encode_head(&head).expect("encode head");
+        store
+            .put(
+                &crate::fold::head_object_key(&tenant(), signal),
+                Bytes::from(head_bytes),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put head");
+    }
+
+    /// The exact I64 `status` value carried by the one segment of a loaded
+    /// column-stats object built by [`install_logs_stats`].
+    fn loaded_value(loaded: &LoadedColumnStats) -> i64 {
+        let segment = loaded.segments.values().next().expect("one segment");
+        match &segment.columns[0].min.as_ref().expect("min present").kind {
+            Some(ravel_proto::catalog::v1::column_value::Kind::I64(v)) => *v,
+            other => panic!("expected an I64 min, got {other:?}"),
+        }
+    }
+
+    /// Issue #888, deliverable 2: two consecutive loads against an UNCHANGED
+    /// folded HEAD resolve the stats object exactly once. The first load pays
+    /// both GETs (HEAD + `.cstat`); the second re-reads HEAD (one GET, to
+    /// detect a fold) and serves the cached object, skipping the second GET.
+    /// Both return the same statistics.
+    ///
+    /// Pre-cache demonstration: without the cache the second load also fetches
+    /// the stats object, so its accounted GET count is 2, not 1.
+    #[tokio::test]
+    async fn load_column_stats_reuses_cache_on_unchanged_head() {
+        let store = Arc::new(MemoryStore::new());
+        let part_hash = *blake3::hash(b"part-0").as_bytes();
+        install_logs_stats(&store, part_hash, 42).await;
+
+        let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
+
+        let acc1 = QueryAccounting::new();
+        let first = catalog
+            .load_column_stats(&tenant(), Signal::Logs, &acc1)
+            .await
+            .expect("load ok")
+            .expect("stats present");
+        assert_eq!(
+            acc1.snapshot().s3_requests(AccountedOp::Get),
+            2,
+            "first load pays the HEAD GET and the column-stats GET"
+        );
+
+        let acc2 = QueryAccounting::new();
+        let second = catalog
+            .load_column_stats(&tenant(), Signal::Logs, &acc2)
+            .await
+            .expect("load ok")
+            .expect("stats present");
+        assert_eq!(
+            acc2.snapshot().s3_requests(AccountedOp::Get),
+            1,
+            "unchanged HEAD: only the HEAD GET, the stats object is served from cache"
+        );
+
+        assert_eq!(loaded_value(&first), 42);
+        assert_eq!(
+            loaded_value(&second),
+            42,
+            "the cached object is the same one"
+        );
+    }
+
+    /// Issue #888, deliverable 2: a fold that changes the folded HEAD must
+    /// re-resolve, never serve the superseded object. Because the stats object
+    /// is keyed by its own content hash (not the pinned snapshot), a rewritten
+    /// object gets a new `blake3`, misses the cache, and is re-fetched. The
+    /// reload pays both GETs again and returns the NEW statistics.
+    ///
+    /// A cache keyed by anything a fold does not change (the pinned snapshot,
+    /// say) would return the stale `42` here.
+    #[tokio::test]
+    async fn load_column_stats_rereleases_after_head_change() {
+        let store = Arc::new(MemoryStore::new());
+        let part_hash = *blake3::hash(b"part-0").as_bytes();
+        install_logs_stats(&store, part_hash, 42).await;
+
+        let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
+
+        let acc1 = QueryAccounting::new();
+        let first = catalog
+            .load_column_stats(&tenant(), Signal::Logs, &acc1)
+            .await
+            .expect("load ok")
+            .expect("stats present");
+        assert_eq!(loaded_value(&first), 42);
+
+        // A new fold: same part set, but the stats object's content changes, so
+        // HEAD now references a different `blake3`.
+        install_logs_stats(&store, part_hash, 99).await;
+
+        let acc2 = QueryAccounting::new();
+        let second = catalog
+            .load_column_stats(&tenant(), Signal::Logs, &acc2)
+            .await
+            .expect("load ok")
+            .expect("stats present");
+        assert_eq!(
+            acc2.snapshot().s3_requests(AccountedOp::Get),
+            2,
+            "a changed HEAD re-resolves: HEAD GET plus a fresh column-stats GET"
+        );
+        assert_eq!(
+            loaded_value(&second),
+            99,
+            "the reload returns the new object, never the cached stale one"
         );
     }
 }
