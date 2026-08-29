@@ -125,5 +125,18 @@ check "boolean timing aborts" 3 "non-numeric or non-finite" "$TMP/boolmetric.jso
 printf '{"id":"qA","min_ms":1e999}\n{"id":"qB","min_ms":1000.0}\n' > "$TMP/infmetric.json"
 check "non-finite timing aborts" 3 "non-numeric or non-finite" "$TMP/infmetric.json" min_ms 1.00
 
+# A string or null timing is NOT int/float, so a guard that only inspects
+# already-numeric values skips it: the statement is dropped from the metric in
+# silence and the survivors can still print EXACT over a smaller set. That is a
+# total computed on a basis nobody chose.
+printf '{"id":"qA","min_ms":"fast"}\n{"id":"qB","min_ms":1000.0}\n' > "$TMP/strmetric.json"
+check "string timing aborts"  3 "non-numeric or non-finite" "$TMP/strmetric.json" min_ms 1.00
+printf '{"id":"qA","min_ms":null}\n{"id":"qB","min_ms":1000.0}\n' > "$TMP/nullmetric.json"
+check "null timing aborts"    3 "non-numeric or non-finite" "$TMP/nullmetric.json" min_ms 1.00
+
+# The regression it prevents, stated as its own case: without the guard the
+# string report above reports EXACT at 1.00 s over one statement.
+check "string timing does not yield a spurious EXACT" 3 "non-numeric or non-finite" "$TMP/strmetric.json" auto 1.00
+
 if [ "$fails" -ne 0 ]; then echo; echo "$fails case(s) failed"; exit 1; fi
 echo; echo "all reproduce-figure cases passed"
