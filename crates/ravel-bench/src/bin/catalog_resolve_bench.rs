@@ -219,6 +219,10 @@ async fn publish_lightweight(
         max_event_ts_ns: created_unix_ns,
         min_ingest_ts_ns: created_unix_ns - 1_000,
         max_ingest_ts_ns: created_unix_ns,
+        // format-version-literal-ok: this payload is arbitrary bench bytes, not
+        // a real RSEG object, and the catalog-resolve gate never decodes it.
+        // There is no writer whose footer this should track; a real segment is
+        // published by `publish_real_segment` below.
         segment_format_version: 1,
         created_unix_ns,
         ingest_hour_bucket,
@@ -291,7 +295,7 @@ async fn publish_real_segment(
         max_event_ts_ns: written.summary.max_event_ts_ns,
         min_ingest_ts_ns: written.summary.min_event_ts_ns,
         max_ingest_ts_ns: written.summary.max_event_ts_ns,
-        segment_format_version: 1,
+        segment_format_version: u32::from(ravel_segment::VERSION_V7),
         created_unix_ns,
         ingest_hour_bucket,
     };

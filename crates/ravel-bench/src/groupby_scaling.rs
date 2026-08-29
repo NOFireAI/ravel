@@ -676,7 +676,7 @@ async fn publish_part(
         max_event_ts_ns: written.summary.max_event_ts_ns,
         min_ingest_ts_ns: written.summary.min_event_ts_ns,
         max_ingest_ts_ns: written.summary.max_event_ts_ns,
-        segment_format_version: 1,
+        segment_format_version: u32::from(ravel_segment::VERSION_V7),
         created_unix_ns: 10,
         ingest_hour_bucket: 0,
     })
@@ -1217,7 +1217,7 @@ async fn publish_distinct_dataset(
             max_event_ts_ns: max,
             min_ingest_ts_ns: min,
             max_ingest_ts_ns: max,
-            segment_format_version: 1,
+            segment_format_version: u32::from(ravel_logseg::footer::VERSION),
             created_unix_ns: 10,
             ingest_hour_bucket: 0,
         })
