@@ -102,6 +102,7 @@ async fn l0_object_count_equals_distinct_data_object_keys() {
         max_segments: ravel_query::DEFAULT_MAX_SEGMENTS,
         explain_dir: None,
         warm_catalog: false,
+        logs_suffix_len: None,
     };
     let report = run_generated(&cfg).await.expect("generated lane runs");
 

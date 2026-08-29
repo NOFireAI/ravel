@@ -100,6 +100,19 @@ struct Args {
     /// that is already process-warm, so this flag does not reach it.
     #[arg(long)]
     warm_catalog: bool,
+    /// Pin the logs suffix-probe window to this many bytes, overriding the
+    /// per-object derivation (`ravel_query::derive_suffix_len`, issue #883).
+    /// Unset leaves that derivation byte-for-byte unchanged; set, every log
+    /// read probes exactly this many trailing bytes. This is the seam a probe
+    /// sweep sets the window through: the probe floor can only be tightened
+    /// against measured `BlockRangeStats::probe_misses`, and a sweep needs to
+    /// set the window from outside the fetcher. No `ravel-server` flag
+    /// corresponds to it (it is a measurement knob, not a server setting), and
+    /// under `--flight` it does not reach the server, so it changes nothing
+    /// there. Applies to the in-process lanes only; recorded in the report's
+    /// provenance as `logs_suffix_len` (null when unset).
+    #[arg(long = "logs-suffix-len", value_name = "BYTES")]
+    logs_suffix_len: Option<u64>,
 
     // --- generated lane knobs ---------------------------------------------
     /// Distinct log records to generate.
@@ -355,6 +368,7 @@ async fn run(args: &Args) -> Result<SqlLatencyReport, ravel_bench::sql_latency::
                 max_segments: args.sql_max_segments,
                 explain_dir: explain_dir.clone(),
                 warm_catalog: args.warm_catalog,
+                logs_suffix_len: args.logs_suffix_len,
                 flight: args.flight.as_ref().map(|endpoint| FlightTarget {
                     endpoint: endpoint.clone(),
                     token: args.flight_token.clone().or_else(|| {
@@ -391,6 +405,7 @@ async fn run(args: &Args) -> Result<SqlLatencyReport, ravel_bench::sql_latency::
                 max_segments: args.sql_max_segments,
                 explain_dir: explain_dir.clone(),
                 warm_catalog: args.warm_catalog,
+                logs_suffix_len: args.logs_suffix_len,
             };
             run_generated(&cfg).await
         }
@@ -481,6 +496,10 @@ fn print_human_table(report: &SqlLatencyReport) {
         println!("  read cache : {} bytes", p.cache_bytes);
     } else {
         println!("  read cache : off");
+    }
+    match p.logs_suffix_len {
+        Some(n) => println!("  suffix len : {n} bytes (pinned; overrides per-object derivation)"),
+        None => println!("  suffix len : per-object derivation"),
     }
     println!();
     // `get` is the cold run's object-store GETs; the `w_` columns are the warm
