@@ -22,7 +22,7 @@
 # in the publishing document. Hence the reminder printed at the end: grep the
 # publishing document for its own stated basis before concluding anything.
 #
-# EXIT CODES ARE LOad-BEARING, because this script's output is meant to be
+# EXIT CODES ARE LOAD-BEARING, because this script's output is meant to be
 # quoted as evidence:
 #   0  a basis reproducing the figure was found
 #   1  no single-statement basis reproduces it -- a real negative result
@@ -57,7 +57,7 @@ EXPECT_N="${4:-}"
 [ -r "$REPORT" ] || { echo "reproduce-figure: cannot read $REPORT" >&2; exit 2; }
 
 REPORT="$REPORT" FIELD="$FIELD" CLAIMED="$CLAIMED" EXPECT_N="$EXPECT_N" python3 - <<'PY'
-import json, os, sys
+import json, math, os, sys
 
 ABORT = 3
 
@@ -81,6 +81,12 @@ try:
 except ValueError:
     abort(f"claimed total {raw_claimed!r} is not a number.",
           "Pass the published total in SECONDS, e.g. 310.97")
+if not math.isfinite(claimed):
+    # nan compares False against everything, so a nan claim would sail past the
+    # matching loop and exit 1 -- "no basis reproduces the figure", the one
+    # output meant to be quoted as evidence. Same trap as a misspelled field.
+    abort(f"claimed total {raw_claimed!r} is not finite.",
+          "A non-finite claim matches nothing and would read as a real negative result.")
 
 raw_expect = (os.environ.get("EXPECT_N") or "").strip()
 expect_n = None
@@ -89,6 +95,8 @@ if raw_expect:
         expect_n = int(raw_expect)
     except ValueError:
         abort(f"expected-count {raw_expect!r} is not an integer.")
+    if expect_n < 0:
+        abort(f"expected-count {expect_n} is negative.")
 
 # Bench output is JSON-LINES. json.load() over the whole file raises "Extra
 # data" on the second document, which has cost real time in this repo. Use
@@ -159,9 +167,23 @@ if not rows:
 # Every numeric *_ms key any statement carries. Used both for `auto` and to
 # validate an explicit field, so a typo aborts instead of masquerading as a
 # negative result.
+def is_metric(v):
+    # bool is a subclass of int, so `"min_ms": true` would otherwise sum as 1;
+    # a non-finite value would poison the total into nan and reach exit 1.
+    return (isinstance(v, (int, float)) and not isinstance(v, bool)
+            and math.isfinite(v))
+
+
+for _sid, _r in rows.items():
+    for _k, _v in _r.items():
+        if _k.endswith("_ms") and isinstance(_v, (int, float)) and not is_metric(_v):
+            abort(f"statement {_sid} has a non-numeric or non-finite {_k}: {_v!r}.",
+                  "A boolean or non-finite timing would corrupt every total that",
+                  "includes it, and the corruption would surface as exit 1.")
+
 available = sorted({
     k for r in rows.values() for k, v in r.items()
-    if k.endswith("_ms") and isinstance(v, (int, float))
+    if k.endswith("_ms") and is_metric(v)
 })
 
 if field == "auto":
@@ -202,7 +224,7 @@ def count_note(surviving):
 
 
 for f in fields:
-    present = {k: v for k, v in rows.items() if isinstance(v.get(f), (int, float))}
+    present = {k: v for k, v in rows.items() if is_metric(v.get(f))}
     missing = sorted(set(rows) - set(present))
     if not present:
         # Unreachable for an explicit field (validated above) and for `auto`
