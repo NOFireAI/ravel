@@ -351,9 +351,10 @@ closure as `partial_window_failure_reports_every_batch_that_committed`: on the
 same fixture the report goes from `[0, 1]` to `[0, 1, 3, 4]`, which is precisely
 the set of batches whose objects the store holds.
 
-The cost is on the failure path only and is bounded: the remaining writes were
-submitted before the failing one and run concurrently, so the wait is at most one
-`WRITE_ACK_DEADLINE` (60s). A cancellation mechanism in `ravel-ingest` would
+The cost is on the failure path only and is bounded: the remaining writes are
+those still outstanding when the failure was observed -- at a depth above 1 that
+includes batches submitted after it -- and they run concurrently, so the wait is
+at most one `WRITE_ACK_DEADLINE` (60s). A cancellation mechanism in `ravel-ingest` would
 still be an improvement -- it would avoid the orphaned objects a doomed batch
 writes -- but it is no longer a precondition for the default, and this ADR should
 not have made it one.
@@ -372,9 +373,10 @@ provision far above 4.
 The memory cost is the outer window's alone. The loader holds at most
 `--pipeline-depth` built batches for their in-flight writes plus
 `--decode-queue-batches` queued ahead, so the resident batch working set goes
-from `1 + 2` to `4 + 2` batches of `--batch-rows` rows; against the #682 anchor
-(8 shards, 80k rows, ~6GB live under tcmalloc at depth 1) that is roughly 4x on
-the same geometry. `--max-inflight-flushes` adds nothing further here, because
+from `1 + 2` to `4 + 2` batches of `--batch-rows` rows: the in-flight term alone
+goes up 4x, but the resident batch working set goes from 3 to 6 batches, so
+against the #682 anchor (8 shards, 80k rows, ~6GB live under tcmalloc at depth 1)
+it is roughly 2x on the same geometry. `--max-inflight-flushes` adds nothing further here, because
 the outstanding batches are already capped by the depth -- unlike on
 `ravel-server`, where the same field has no outer window above it and ADR-0067
 decision 2's default of 1 stands untouched.

@@ -782,12 +782,15 @@ What this measurement supports and what it does not:
 The CPU numbers above measure one write path against another; they do not
 measure how much of the object-storage round trip is hidden behind other work.
 On the reference box a 100M-row ClickBench load ran at 2.33 of 16 cores busy
-with 0.06% iowait, because the bulk loader serialized its writes at the
-then-current defaults. Two nested concurrency windows bound the bulk write path:
+with 0.06% iowait, because the bulk loader serialized its batches at the
+then-current defaults (within one batch the involved shards still wrote
+concurrently; it was the cross-batch barrier that cost the cores). Two nested concurrency windows bound the bulk write path:
 `--pipeline-depth` (batches the loader keeps outstanding) and
 `max_inflight_flushes` (flushes per shard, the per-shard semaphore above). The
 concurrent-write ceiling is
-`shards * min(pipeline_depth, max_inflight_flushes)`.
+`shards * min(pipeline_depth, max_inflight_flushes)`, reached only when a batch
+routes rows to every configured shard; with narrower fan-out the active shard
+count replaces `shards` and the real ceiling is lower.
 
 Because that term is a `min`, neither window alone changes anything, which is
 measured rather than argued: on a 16-batch single-shard fixture with a 40ms
