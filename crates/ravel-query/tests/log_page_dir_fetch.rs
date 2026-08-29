@@ -452,8 +452,13 @@ async fn version_4_projected_read_fetches_one_range_per_group_and_column() {
     // to move this number, not just keep two derivations agreeing.
     assert_eq!(stats.block_range_gets, 9, "G*k chunk ranges");
     assert_eq!(stats.block_range_gets, runs.len() as u64);
-    // STREAM_DIR and FIELD_DIR sit at the object's front; no suffix probe of
-    // any length reaches them, so they are one GET each on every ranged read.
+    // STREAM_DIR and FIELD_DIR sit at the object's front; no suffix probe of any
+    // length reaches them. On this narrow-projection path FIELD_DIR is fetched
+    // early (before the coverage crossover, to resolve the projection) on its own
+    // per-section key, and STREAM_DIR follows after the crossover, so the two are
+    // one GET each here -- the front-section coalescing (deliverable 4) applies
+    // to the all-columns path where both arrive cold together (see
+    // `tests/log_block_range.rs`'s GET-count test).
     assert_eq!(stats.metadata_gets, 2, "the two front sections");
     assert_eq!(
         recording.gets(),
