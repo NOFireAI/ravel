@@ -32,11 +32,18 @@
 //! had no ranged `.rlog` section reader); that gap is now closed.
 //!
 //! [`crate::rspan_codec::SpanCodec`] (RSPAN, spans) is the third
-//! implementation and now holds the same bound: `ravel-rspan`'s `RspanRangeReader` fetches SKIP_IDX by
+//! implementation and holds the same shape: `ravel-rspan`'s `RspanRangeReader` fetches SKIP_IDX by
 //! range at catalog load, then the merge streams BLOCKS bytes one block per
-//! input at a time (`rspan_codec.rs`'s own module doc). So "bounded decoded
-//! memory" is now a trait-wide guarantee across all three codecs, not a
-//! two-out-of-three contract.
+//! input at a time (`rspan_codec.rs`'s own module doc). So "one part plus one
+//! decode unit per input, never the whole bucket at once" is a trait-wide
+//! property across all three codecs, not a two-out-of-three contract.
+//!
+//! What "one part" costs is a separate question, and it is a target rather than
+//! a bound ([`crate::config::CompactorConfig::l1_part_memory_target_bytes`]):
+//! the RLOG merge checks it after every record, the RSPAN merge only at a trace
+//! boundary (so a bucket carrying one large trace really is one part), and the
+//! RSEG builder does not read it. The trait-wide claim is about not holding the
+//! bucket's inputs at once; it is not a ceiling on the output part.
 //!
 //! [`RsegCodec`] wraps the existing `read.rs`/`build.rs` RSEG logic: the
 //! verbatim page-copy merge for current-version inputs, plus ADR-0066 decision

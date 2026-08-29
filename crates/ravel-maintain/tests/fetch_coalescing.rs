@@ -129,13 +129,17 @@ async fn adjacent_runs_in_one_object_coalesce() {
     );
 }
 
-/// The memory bound holds under the concurrent, coalesced fetch: with a part
-/// cap small enough to force many parts, the builder still splits on series
-/// boundaries, so it never buffers more than one part's page bytes at a time.
-/// Proven by (a) the output splitting into several parts and (b) the samples
-/// still round-tripping exactly across those parts.
+/// The stored-size target still splits parts under the concurrent, coalesced
+/// fetch: with a target small enough to force many parts, the builder splits on
+/// series boundaries rather than accumulating the bucket into one part. Proven
+/// by (a) the output splitting into several parts and (b) the samples still
+/// round-tripping exactly across those parts.
+///
+/// This is about where parts split, not about a ceiling on the builder's heap:
+/// finished parts are retained until publish, and one series is materialized
+/// whole, neither of which any config knob sizes (`build.rs` header comment).
 #[tokio::test]
-async fn memory_bound_holds_under_small_part_cap() {
+async fn small_part_target_splits_output_under_coalesced_fetch() {
     const INPUTS: usize = 6;
     const SERIES: usize = 30;
 
