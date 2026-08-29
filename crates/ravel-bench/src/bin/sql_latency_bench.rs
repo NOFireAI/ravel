@@ -581,6 +581,41 @@ fn print_human_table(report: &SqlLatencyReport) {
             warm_hits,
         );
     }
+    // Fetch amplification (#913), cold run. Kept in its own block rather than
+    // added to the dense table above because its figures are two DIFFERENT byte
+    // kinds that must never be read as one column: `scan_wire`/`plan_wire` are
+    // WIRE bytes (transferred), `decoded` is STORED bytes (on-object page size
+    // after projection), and `amp` is the first over the last. The labels carry
+    // the kind so a reader cannot sum or compare them by accident.
+    let amp_rows: Vec<_> = report
+        .entries
+        .iter()
+        .filter_map(|e| match e.per_run_accounting.as_deref() {
+            Some([cold, ..]) => Some((e.id.as_str(), cold)),
+            _ => None,
+        })
+        .collect();
+    if !amp_rows.is_empty() {
+        println!("\n  fetch amplification (cold run): BLOCKS wire bytes / decoded page bytes");
+        println!(
+            "  {:<32} | {:>13} | {:>13} | {:>13} | {:>7}",
+            "id", "scan_wire (B)", "plan_wire (B)", "decoded (B)", "amp"
+        );
+        println!(
+            "  {:-<32}-+-{:-<13}-+-{:-<13}-+-{:-<13}-+-{:-<7}",
+            "", "", "", "", ""
+        );
+        for (id, acc) in amp_rows {
+            println!(
+                "  {:<32} | {:>13} | {:>13} | {:>13} | {:>7.3}",
+                id,
+                acc.scan_blocks_wire_bytes,
+                acc.plan_wire_bytes,
+                acc.projected_page_decoded_bytes,
+                acc.fetch_amplification,
+            );
+        }
+    }
     if !report.skipped.is_empty() {
         println!("\n  skipped (unsatisfied declared column):");
         for s in &report.skipped {

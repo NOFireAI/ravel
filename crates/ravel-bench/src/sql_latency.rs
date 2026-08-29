@@ -59,7 +59,8 @@ use ravel_logseg::{
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::{
     CacheFetchError, DEFAULT_FETCH_CONCURRENCY, DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
-    DEFAULT_MAX_SEGMENTS, EngineConfig, LogSegmentFetcher, ProbeMissCounter, SegmentFetcher,
+    DEFAULT_MAX_SEGMENTS, EngineConfig, FetchByteCounter, LogSegmentFetcher, ProbeMissCounter,
+    SegmentFetcher, fetch_amplification_ratio,
 };
 use ravel_sql::{
     DEFAULT_MAX_QUERY_BYTES, DeclaredColumn, DeclaredType, SpanSegmentFetcher, SqlConfig,
@@ -452,6 +453,39 @@ pub struct RunAccounting {
     /// the run's total is the two summed.
     #[serde(default)]
     pub probe_misses_scan: u64,
+    /// PLAN-phase WIRE bytes this run's log fetcher transferred: the footer
+    /// suffix probe, SKIP_IDX, PAGE_DIR, FIELD_DIR, and STREAM_DIR of the log
+    /// data objects (issue #913, `ravel_query::FetchByteCounts::plan_wire_bytes`).
+    /// WIRE bytes, i.e. bytes moved over the network -- the same kind as
+    /// [`Self::object_store_bytes`] and [`Self::scan_blocks_wire_bytes`], and a
+    /// different kind from the STORED [`Self::projected_page_decoded_bytes`].
+    /// Reported SEPARATELY from the fetch-amplification numerator: this is the
+    /// directory/probe overhead the numerator deliberately excludes.
+    #[serde(default)]
+    pub plan_wire_bytes: u64,
+    /// SCAN-phase WIRE bytes this run's log fetcher transferred: the
+    /// BLOCKS-section data ranges a query's column projection pulled, retries
+    /// and coalescing holes included (issue #913,
+    /// `ravel_query::FetchByteCounts::scan_wire_bytes`). WIRE bytes. This is the
+    /// NUMERATOR of [`Self::fetch_amplification`].
+    #[serde(default)]
+    pub scan_blocks_wire_bytes: u64,
+    /// STORED bytes of the pages this run decoded after column projection
+    /// (`ravel_types::QueryAccountingSnapshot::page_bytes_decoded`, issue #913).
+    /// STORED bytes, NOT wire bytes: the on-object size of the pages the decode
+    /// touched, never a network transfer figure, so it must not be summed or
+    /// compared with the WIRE fields above. This is the DENOMINATOR of
+    /// [`Self::fetch_amplification`].
+    #[serde(default)]
+    pub projected_page_decoded_bytes: u64,
+    /// Fetch amplification: [`Self::scan_blocks_wire_bytes`] (WIRE) divided by
+    /// [`Self::projected_page_decoded_bytes`] (STORED), issue #913. The ratio of
+    /// BLOCKS-section bytes moved over the wire to the stored page bytes the
+    /// statement actually decoded after projection. `0.0` when nothing was
+    /// decoded. Unitless, but formed from two different byte kinds; see the two
+    /// source fields for which is which.
+    #[serde(default)]
+    pub fetch_amplification: f64,
 }
 
 /// One measured statement.
@@ -920,6 +954,10 @@ impl Default for ExecutorSettings {
 struct ColdExecutor {
     executor: SqlExecutor,
     probe_misses: ProbeMissCounter,
+    /// The same clone-and-snapshot pattern as `probe_misses`, for the per-phase
+    /// WIRE-byte counter behind fetch amplification (#913): cloned out here
+    /// before the fetcher moves into the executor, snapshotted around each run.
+    fetch_bytes: FetchByteCounter,
 }
 
 fn cold_executor(
@@ -963,6 +1001,7 @@ fn cold_executor(
     // them, but taking the handle last keeps that a local fact rather than an
     // ordering the reader has to verify.
     let probe_misses = log_fetcher.probe_miss_counter();
+    let fetch_bytes = log_fetcher.fetch_byte_counter();
     let executor = SqlExecutor::new(
         catalog,
         SegmentFetcher::new(Arc::clone(store)),
@@ -984,6 +1023,7 @@ fn cold_executor(
     Ok(ColdExecutor {
         executor,
         probe_misses,
+        fetch_bytes,
     })
 }
 
@@ -1124,6 +1164,9 @@ pub async fn measure_corpus(
         // that run, so a shared executor attributes each statement's misses to
         // that statement and never to the ones before it.
         let probe_misses = &built.probe_misses;
+        // #913: the same shared-counter/per-run-snapshot pattern for the log
+        // fetcher's per-phase WIRE-byte counter behind fetch amplification.
+        let fetch_bytes = &built.fetch_bytes;
         let req = SqlRequest {
             sql: entry.sql.clone(),
             window,
@@ -1169,6 +1212,7 @@ pub async fn measure_corpus(
             // Taken here, after the EXPLAIN side artifact above, so a plan
             // written for `--explain-dir` is not charged to run 0.
             let probe_misses_before = probe_misses.snapshot();
+            let fetch_bytes_before = fetch_bytes.snapshot();
             let start = Instant::now();
             let outcome = match executor.execute(tenant_hash, &req).await {
                 Ok(outcome) => outcome,
@@ -1202,6 +1246,12 @@ pub async fn measure_corpus(
             // costs are already in `object_store_get_requests` above; this says
             // how many of them the probe window is responsible for.
             let run_probe_misses = probe_misses.snapshot().saturating_sub(&probe_misses_before);
+            // #913: this run's per-phase WIRE bytes, and the fetch amplification
+            // they form with the STORED decoded page bytes on the pooled
+            // accounting snapshot. `page_bytes_decoded` is the denominator; the
+            // scan-phase WIRE bytes are the numerator.
+            let run_fetch_bytes = fetch_bytes.snapshot().saturating_sub(&fetch_bytes_before);
+            let projected_page_decoded_bytes = acc.page_bytes_decoded;
             per_run_accounting.push(RunAccounting {
                 object_store_get_requests: acc.s3_requests(AccountedOp::Get),
                 object_store_list_requests: acc.s3_requests(AccountedOp::List),
@@ -1211,6 +1261,13 @@ pub async fn measure_corpus(
                 cache_bytes: acc.cache_bytes,
                 probe_misses_plan: run_probe_misses.plan,
                 probe_misses_scan: run_probe_misses.scan,
+                plan_wire_bytes: run_fetch_bytes.plan_wire_bytes,
+                scan_blocks_wire_bytes: run_fetch_bytes.scan_wire_bytes,
+                projected_page_decoded_bytes,
+                fetch_amplification: fetch_amplification_ratio(
+                    run_fetch_bytes.scan_wire_bytes,
+                    projected_page_decoded_bytes,
+                ),
             });
             if run == 0 {
                 // The cold run's block counters and rows go into `scan`; its
@@ -3921,5 +3978,61 @@ mod tests {
             json.get("load_wall_ms").is_some(),
             "load_wall_ms must be present in JSON when the lane actually loaded: {json}"
         );
+    }
+
+    /// T4 (#913): each fetch-amplification figure appears EXACTLY ONCE per phase
+    /// in the report structure -- one plan-phase WIRE-byte field, one scan-phase
+    /// WIRE-byte field, one decoded-page STORED-byte field, and one ratio -- with
+    /// no duplication that could double-count a transfer, and each round-trips
+    /// through serde with its value intact.
+    #[test]
+    fn fetch_amplification_figures_are_each_present_once() {
+        let run = RunAccounting {
+            object_store_get_requests: 3,
+            object_store_list_requests: 0,
+            object_store_bytes: 1080,
+            cache_hits: 0,
+            cache_misses: 3,
+            cache_bytes: 0,
+            probe_misses_plan: 0,
+            probe_misses_scan: 0,
+            plan_wire_bytes: 1008,
+            scan_blocks_wire_bytes: 72,
+            projected_page_decoded_bytes: 72,
+            fetch_amplification: 1.0,
+        };
+        let json = serde_json::to_string(&run).expect("RunAccounting serializes");
+        for key in [
+            "plan_wire_bytes",
+            "scan_blocks_wire_bytes",
+            "projected_page_decoded_bytes",
+            "fetch_amplification",
+        ] {
+            assert_eq!(
+                json.matches(&format!("\"{key}\"")).count(),
+                1,
+                "`{key}` must appear exactly once in the report structure: {json}"
+            );
+        }
+        let back: RunAccounting = serde_json::from_str(&json).expect("round-trips");
+        assert_eq!(back.plan_wire_bytes, 1008);
+        assert_eq!(back.scan_blocks_wire_bytes, 72);
+        assert_eq!(back.projected_page_decoded_bytes, 72);
+        assert_eq!(back.fetch_amplification, 1.0);
+
+        // An older report that predates these fields still deserializes: the new
+        // fields carry `#[serde(default)]`, exactly as `probe_misses_*` do.
+        let legacy = serde_json::json!({
+            "object_store_get_requests": 3u64,
+            "object_store_list_requests": 0u64,
+            "object_store_bytes": 1080u64,
+            "cache_hits": 0u64,
+            "cache_misses": 3u64,
+            "cache_bytes": 0u64,
+        });
+        let old: RunAccounting =
+            serde_json::from_value(legacy).expect("legacy report without the new fields");
+        assert_eq!(old.scan_blocks_wire_bytes, 0);
+        assert_eq!(old.fetch_amplification, 0.0);
     }
 }

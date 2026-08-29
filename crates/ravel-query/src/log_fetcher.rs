@@ -542,6 +542,12 @@ pub struct LogSegmentFetcher {
     /// served (#883). Shared by every clone, like `block_range`'s GET semaphore,
     /// and read through [`probe_miss_counter`](Self::probe_miss_counter).
     probe_misses: ProbeMissCounter,
+    /// Per-phase WIRE bytes across every read this fetcher has served (#913),
+    /// the BLOCKS-section data ranges (scan) split from the footer/SKIP_IDX/
+    /// PAGE_DIR/directory probing (plan). Shared by every clone exactly as
+    /// `probe_misses` is, and read through
+    /// [`fetch_byte_counter`](Self::fetch_byte_counter).
+    fetch_bytes: FetchByteCounter,
 }
 
 impl LogSegmentFetcher {
@@ -553,6 +559,7 @@ impl LogSegmentFetcher {
             block_range_threshold: DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
             block_range: BlockRangeFetcher::new(store),
             probe_misses: ProbeMissCounter::new(),
+            fetch_bytes: FetchByteCounter::new(),
         }
     }
 
@@ -569,11 +576,28 @@ impl LogSegmentFetcher {
         self.probe_misses.clone()
     }
 
-    /// Record one block-range read's probe misses on both channels that report
-    /// them: the `page_fetch` span field, beside the `s3_requests`/`s3_bytes`
-    /// the same read produced, and this fetcher's [`ProbeMissCounter`] under
-    /// `phase`. Written by one call so the span and the counter cannot drift
-    /// apart into two accounting channels that disagree.
+    /// This fetcher's accumulating per-phase WIRE-byte counter (#913). Cloned
+    /// out and snapshotted around each execution exactly like
+    /// [`probe_miss_counter`](Self::probe_miss_counter), to attribute the
+    /// BLOCKS-section data ranges (the fetch-amplification numerator) and the
+    /// footer/SKIP_IDX/PAGE_DIR probing separately to that execution. Survives
+    /// every builder, including [`with_block_range`](Self::with_block_range).
+    #[must_use]
+    pub fn fetch_byte_counter(&self) -> FetchByteCounter {
+        self.fetch_bytes.clone()
+    }
+
+    /// Record one block-range read's cross-execution accounting on the channels
+    /// that report it: the `page_fetch` span's `probe_misses` field, this
+    /// fetcher's [`ProbeMissCounter`] under `phase`, and its
+    /// [`FetchByteCounter`]'s per-phase WIRE bytes (#913, BLOCKS-section data
+    /// ranges split from footer/SKIP_IDX/PAGE_DIR probing). Written by one call
+    /// so the span and the counters cannot drift apart into accounting channels
+    /// that disagree. The WIRE-byte split is derived from `stats` itself
+    /// ([`BlockRangeStats::block_bytes_fetched`] to scan,
+    /// [`BlockRangeStats::plan_wire_bytes`] to plan), independent of `phase`:
+    /// block bytes are always scan work and directory probing is always plan
+    /// work, whichever entry point issued the read.
     fn record_probe_misses(
         &self,
         span: &tracing::Span,
@@ -582,6 +606,7 @@ impl LogSegmentFetcher {
     ) {
         span.record("probe_misses", stats.probe_misses);
         self.probe_misses.record(phase, stats.probe_misses);
+        self.fetch_bytes.record(stats);
     }
 
     /// Overrides the [`RlogConfig`] used for section-size caps when decoding.
@@ -2177,8 +2202,26 @@ pub struct BlockRangeStats {
     pub block_range_gets: u64,
     /// Candidate blocks served from the read cache with no store round trip.
     pub block_cache_hits: u64,
-    /// Stored bytes of candidate blocks read from the store (cache hits excluded).
+    /// WIRE bytes transferred for BLOCKS-section data ranges (cache hits
+    /// excluded), retries and coalescing holes included: a coalesced run that
+    /// spans an unwanted page transferred those bytes, and they are counted
+    /// here. Summed from each range GET's response length, not from stored page
+    /// or block descriptor sizes. This is the numerator of fetch amplification
+    /// (#913); the denominator is the STORED
+    /// `QueryAccountingSnapshot::page_bytes_decoded`, a different byte kind
+    /// (stored, not wire) that must never be summed with this one. On a
+    /// whole-object crossover this is the whole object's wire bytes, which then
+    /// span every section, not just BLOCKS.
     pub block_bytes_fetched: u64,
+    /// WIRE bytes transferred for this read's non-BLOCKS sections (cache hits
+    /// excluded): the footer suffix probe and any footer-range chase, plus
+    /// SKIP_IDX, PAGE_DIR, FIELD_DIR, and STREAM_DIR. The plan/probe phase's
+    /// share of the read, reported SEPARATELY from the fetch-amplification
+    /// numerator ([`Self::block_bytes_fetched`]) and never folded into it.
+    /// Same byte kind (wire) as `block_bytes_fetched`, so the two DO sum to the
+    /// total wire bytes this read charged to its accounting handle; that sum is
+    /// what the per-phase split is checked against.
+    pub plan_wire_bytes: u64,
     /// Candidate blocks resolved from the skip index for this query.
     pub candidate_blocks: u64,
     /// Set when a crossover (size-threshold pre-probe, or coverage-based
@@ -2329,6 +2372,116 @@ impl ProbeMissCounts {
             ProbePhase::Scan => self.scan,
         }
     }
+}
+
+/// Per-phase WIRE bytes (bytes transferred from the object store, retries and
+/// coalescing holes included) the log fetcher moved for a data object's
+/// sections, accumulated across every read one [`LogSegmentFetcher`] served
+/// (#913). The split is what makes fetch amplification measurable per phase:
+/// the BLOCKS-section data ranges a query's [`ColumnSelection`] actually pulled
+/// (`scan`) versus the footer/SKIP_IDX/PAGE_DIR/directory probing that located
+/// them (`plan`).
+///
+/// This tracks WIRE bytes only. The fetch-amplification DENOMINATOR -- the
+/// STORED bytes of the pages decoded after projection -- is a different byte
+/// kind and lives on `QueryAccountingSnapshot::page_bytes_decoded`; see
+/// [`fetch_amplification_ratio`].
+///
+/// It is an accumulator, not a per-query handle, and shares the semantics of
+/// [`ProbeMissCounter`]: the counters only ever grow, so a caller measuring one
+/// execution takes a [`snapshot`](Self::snapshot) before and after and reads
+/// [`FetchByteCounts::saturating_sub`] of the two. Cheap to clone (one `Arc`),
+/// and every clone of the owning `LogSegmentFetcher` shares the same counters.
+#[derive(Debug, Clone, Default)]
+pub struct FetchByteCounter(Arc<FetchByteInner>);
+
+#[derive(Debug, Default)]
+struct FetchByteInner {
+    plan_wire_bytes: AtomicU64,
+    scan_wire_bytes: AtomicU64,
+}
+
+impl FetchByteCounter {
+    /// New counter with both phases at zero.
+    #[must_use]
+    pub fn new() -> Self {
+        FetchByteCounter::default()
+    }
+
+    /// Add one read's per-phase WIRE bytes from its [`BlockRangeStats`]:
+    /// [`BlockRangeStats::block_bytes_fetched`] (BLOCKS-section data ranges) to
+    /// `scan`, and [`BlockRangeStats::plan_wire_bytes`] (footer/SKIP_IDX/
+    /// PAGE_DIR/directory probing) to `plan`. A read that moved nothing on a
+    /// phase adds zero, so a fully cache-served read is not skipped.
+    fn record(&self, stats: &BlockRangeStats) {
+        self.0
+            .scan_wire_bytes
+            .fetch_add(stats.block_bytes_fetched, Ordering::Relaxed);
+        self.0
+            .plan_wire_bytes
+            .fetch_add(stats.plan_wire_bytes, Ordering::Relaxed);
+    }
+
+    /// Point-in-time copy of both phases' totals.
+    #[must_use]
+    pub fn snapshot(&self) -> FetchByteCounts {
+        FetchByteCounts {
+            plan_wire_bytes: self.0.plan_wire_bytes.load(Ordering::Relaxed),
+            scan_wire_bytes: self.0.scan_wire_bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Point-in-time copy of a [`FetchByteCounter`]'s per-phase WIRE byte totals
+/// (#913).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FetchByteCounts {
+    /// Plan/probe phase WIRE bytes: the footer suffix probe (and any chase),
+    /// SKIP_IDX, PAGE_DIR, FIELD_DIR, and STREAM_DIR. Reported SEPARATELY from
+    /// the fetch-amplification numerator.
+    pub plan_wire_bytes: u64,
+    /// Scan phase WIRE bytes: BLOCKS-section data ranges transferred (retries
+    /// and coalescing holes included). The fetch-amplification NUMERATOR.
+    pub scan_wire_bytes: u64,
+}
+
+impl FetchByteCounts {
+    /// Field-wise difference `self - earlier`, the WIRE bytes one measured
+    /// execution added to a counter that keeps accumulating across executions.
+    /// Saturating, for the same reason [`ProbeMissCounts::saturating_sub`] is.
+    #[must_use]
+    pub fn saturating_sub(&self, earlier: &FetchByteCounts) -> FetchByteCounts {
+        FetchByteCounts {
+            plan_wire_bytes: self.plan_wire_bytes.saturating_sub(earlier.plan_wire_bytes),
+            scan_wire_bytes: self.scan_wire_bytes.saturating_sub(earlier.scan_wire_bytes),
+        }
+    }
+
+    /// WIRE bytes across both phases.
+    #[must_use]
+    pub fn total(&self) -> u64 {
+        self.plan_wire_bytes.saturating_add(self.scan_wire_bytes)
+    }
+}
+
+/// Fetch amplification (#913): BLOCKS-section WIRE bytes transferred divided by
+/// the STORED bytes of the projected pages the statement decoded.
+///
+/// `blocks_wire_bytes` is [`FetchByteCounts::scan_wire_bytes`] (equivalently
+/// [`BlockRangeStats::block_bytes_fetched`]), the numerator -- wire bytes, with
+/// retries and coalescing holes included. `projected_page_stored_bytes` is
+/// `QueryAccountingSnapshot::page_bytes_decoded`, the denominator -- STORED page
+/// bytes decoded after column projection, a different byte kind that must never
+/// be summed with the numerator.
+///
+/// Returns `0.0` when the denominator is `0` (nothing decoded, so no ratio is
+/// defined) rather than a non-finite value a report would have to special-case.
+#[must_use]
+pub fn fetch_amplification_ratio(blocks_wire_bytes: u64, projected_page_stored_bytes: u64) -> f64 {
+    if projected_page_stored_bytes == 0 {
+        return 0.0;
+    }
+    blocks_wire_bytes as f64 / projected_page_stored_bytes as f64
 }
 
 /// A [`footer::LogFooter`] a prior plan read produced for this exact (immutable)
@@ -3074,6 +3227,9 @@ impl BlockRangeFetcher {
             .await?;
         if probe_live {
             stats.probe_gets = 1;
+            stats.plan_wire_bytes = stats
+                .plan_wire_bytes
+                .saturating_add(probe_bytes.len() as u64);
         }
         let mut resident = vec![(probe_start, probe_bytes.clone())];
 
@@ -3100,6 +3256,8 @@ impl BlockRangeFetcher {
                     .await?;
                 if live {
                     stats.probe_gets += 1;
+                    stats.plan_wire_bytes =
+                        stats.plan_wire_bytes.saturating_add(bytes.len() as u64);
                 }
                 resident.push((offset, bytes.clone()));
                 match open_from_suffix(&bytes, total_size).map_err(|source| corrupt(key, source))? {
@@ -3244,6 +3402,7 @@ impl BlockRangeFetcher {
                 .await?;
             if live {
                 stats.metadata_gets += 1;
+                stats.plan_wire_bytes = stats.plan_wire_bytes.saturating_add(bytes.len() as u64);
             }
             resident.push((run.abs_start, bytes));
         }
@@ -3286,6 +3445,8 @@ impl BlockRangeFetcher {
                     .await?;
                 if live {
                     stats.metadata_gets += 1;
+                    stats.plan_wire_bytes =
+                        stats.plan_wire_bytes.saturating_add(bytes.len() as u64);
                 }
                 bytes
             }
@@ -3579,6 +3740,9 @@ impl BlockRangeFetcher {
                     .await?;
                 if probe_live {
                     stats.probe_gets = 1;
+                    stats.plan_wire_bytes = stats
+                        .plan_wire_bytes
+                        .saturating_add(probe_bytes.len() as u64);
                 }
                 asm.place(key, probe_start, &probe_bytes)?;
                 // Parse from the probe suffix, chasing one range if the suffix
@@ -3606,6 +3770,8 @@ impl BlockRangeFetcher {
                             .await?;
                         if live {
                             stats.probe_gets += 1;
+                            stats.plan_wire_bytes =
+                                stats.plan_wire_bytes.saturating_add(bytes.len() as u64);
                         }
                         asm.place(key, offset, &bytes)?;
                         match open_from_suffix(&bytes, total_size)
@@ -3817,6 +3983,8 @@ impl BlockRangeFetcher {
                     .await?;
                 if live {
                     stats.metadata_gets += 1;
+                    stats.plan_wire_bytes =
+                        stats.plan_wire_bytes.saturating_add(bytes.len() as u64);
                 }
                 asm.place(key, tail_start, &bytes)?;
             }
@@ -3972,6 +4140,7 @@ impl BlockRangeFetcher {
                 .await?;
             if live {
                 stats.probe_gets += 1;
+                stats.plan_wire_bytes = stats.plan_wire_bytes.saturating_add(bytes.len() as u64);
             }
             asm.place(key, probe_start, &bytes)?;
         }
@@ -4104,6 +4273,8 @@ impl BlockRangeFetcher {
                     .await?;
                 if live {
                     stats.metadata_gets += 1;
+                    stats.plan_wire_bytes =
+                        stats.plan_wire_bytes.saturating_add(bytes.len() as u64);
                 }
                 asm.place(key, tail_start, &bytes)?;
             }
@@ -4254,6 +4425,7 @@ impl BlockRangeFetcher {
                 .await?;
             if live {
                 stats.metadata_gets += 1;
+                stats.plan_wire_bytes = stats.plan_wire_bytes.saturating_add(bytes.len() as u64);
             }
             asm.place(key, run.abs_start, &bytes)?;
         }
@@ -4374,6 +4546,7 @@ impl BlockRangeFetcher {
             .await?;
         if live {
             stats.metadata_gets += 1;
+            stats.plan_wire_bytes = stats.plan_wire_bytes.saturating_add(bytes.len() as u64);
         }
         asm.place(key, start, &bytes)
     }
@@ -4452,6 +4625,7 @@ impl BlockRangeFetcher {
             .await?;
         if live {
             stats.metadata_gets += 1;
+            stats.plan_wire_bytes = stats.plan_wire_bytes.saturating_add(bytes.len() as u64);
         }
         asm.place(key, section.offset, &bytes)
     }
@@ -7055,6 +7229,249 @@ mod ranged_projection_cost_tests {
         assert!(
             !f.ranged_projection_pays(1, 1.0),
             "a full projection still saves nothing"
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod fetch_amplification_tests {
+    //! Fetch amplification (#913): the BLOCKS-section WIRE bytes a narrow
+    //! projection actually transfers over the stored page bytes it decodes,
+    //! measured on a version-4 object whose PAGE_DIR lets the read bring one
+    //! coalesced range per surviving `(row group, projected column)` and skip
+    //! every unprojected column's chunk. The point of the metric is that it is
+    //! STRICTLY below the pre-v4 counterfactual (`page_bytes_fetched /
+    //! page_bytes_decoded`, which counts every present page's descriptor), by
+    //! exactly the bytes v4 avoids reading.
+    use super::*;
+    use ravel_catalog::SegmentLevel;
+    use ravel_logseg::writer::ObjectIdentity;
+    use ravel_logseg::{RlogWriter, stream_attrs_bytes};
+    use ravel_object_store::PutOptions;
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_types::logstream::log_stream_id;
+    use uuid::Uuid;
+
+    const TENANT: TenantHash = TenantHash([7u8; 16]);
+    const CONTENT_HASH: [u8; 32] = [9u8; 32];
+    const KEY: &str = "t/amp.rlog";
+
+    fn identity() -> ObjectIdentity {
+        ObjectIdentity {
+            tenant_hash: [7u8; 16],
+            shard: 0,
+            writer_id: [2u8; 16],
+            writer_epoch: 1,
+            writer_seq: 1,
+        }
+    }
+    fn record(ts: i64) -> LogRecord {
+        let resource = vec![(
+            "service.name".to_string(),
+            AttrValue::Str("svc".to_string()),
+        )];
+        // Deterministic, low-redundancy bytes so the payload column dominates the
+        // BLOCKS section and does not compress away (a repeated-char string would
+        // collapse to nothing, leaving no unprojected bytes for the narrow
+        // projection to avoid).
+        let payload: String = (0..600u32)
+            .map(|i| (b'!' + ((ts as u32 * 131 + i * 97) % 90) as u8) as char)
+            .collect();
+        let attrs = vec![
+            ("latency".to_string(), AttrValue::F64(ts as f64 * 1.5)),
+            ("code".to_string(), AttrValue::I64(ts * 7)),
+            ("payload".to_string(), AttrValue::Str(payload)),
+        ];
+        LogRecord {
+            stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+            stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+            ts_ns: ts,
+            observed_ts_ns: ts,
+            severity_num: 9,
+            severity_text: "INFO".into(),
+            body: "hello world".into(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs,
+        }
+    }
+    fn build_object(records: &[LogRecord]) -> Vec<u8> {
+        let cfg = RlogConfig {
+            block_target_records: 4,
+            ..RlogConfig::default()
+        };
+        let mut w = RlogWriter::new(cfg, identity());
+        for r in records {
+            w.push(r.clone()).expect("push");
+        }
+        w.finish().expect("finish")
+    }
+    fn seg_ref(size: u64, records: &[LogRecord]) -> SegmentRef {
+        let min = records.iter().map(|r| r.ts_ns).min().expect("nonempty");
+        let max = records.iter().map(|r| r.ts_ns).max().expect("nonempty");
+        SegmentRef {
+            data_object_key: KEY.to_string(),
+            object_size: size,
+            min_event_ts_ns: min,
+            max_event_ts_ns: max,
+            ingest_hour_bucket: 0,
+            sample_count: records.len() as u64,
+            series_count: 0,
+            shard: 0,
+            content_hash: CONTENT_HASH,
+            writer_id: Uuid::from_u128(1),
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+        }
+    }
+
+    /// The object's footer+trailer byte length: a probe suffix of exactly this
+    /// parses the footer with no range chase yet reaches neither a BLOCKS byte
+    /// nor a tail directory section, so SKIP_IDX/PAGE_DIR are their own metadata
+    /// GETs (plan phase) and the candidate blocks are their own range GETs
+    /// (scan phase).
+    fn footer_region_len(bytes: &[u8]) -> u64 {
+        let trailer = &bytes[bytes.len() - footer::TRAILER_LEN..];
+        let footer_len = u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
+        u64::from(footer_len) + footer::TRAILER_LEN as u64
+    }
+
+    const N: usize = 16;
+
+    /// A fetcher forced onto the ranged version-4 FETCH-projection path: routing
+    /// threshold and the block-range size crossover both `0`, coalescing gap `0`
+    /// (so no unprojected page is pulled inside a coalesced run and the numerator
+    /// is exactly the projected chunk bytes), and a suffix probe pinned to the
+    /// footer region so SKIP_IDX/PAGE_DIR are their own plan-phase GETs and the
+    /// candidate blocks are their own scan-phase GETs.
+    fn ranged_fetcher(store: Arc<MemoryStore>, suffix: u64) -> LogSegmentFetcher {
+        LogSegmentFetcher::new(store.clone())
+            .with_block_range_threshold(0)
+            .with_block_range(
+                BlockRangeFetcher::new(store)
+                    .with_whole_object_threshold(0)
+                    .with_coalesce_gap(0)
+                    .with_suffix_len(suffix),
+            )
+    }
+
+    /// One scan through the ranged path with `columns`, drained to completion.
+    /// Returns this scan's per-phase WIRE-byte delta, its [`ScanStats`], and the
+    /// pooled object-store bytes it charged.
+    async fn run_scan(columns: &ColumnSelection) -> (FetchByteCounts, ScanStats, u64) {
+        let records: Vec<LogRecord> = (0..N as i64).map(record).collect();
+        let bytes = build_object(&records);
+        let total = bytes.len() as u64;
+        let suffix = footer_region_len(&bytes);
+        let seg = seg_ref(total, &records);
+        let store = Arc::new(MemoryStore::new());
+        store
+            .put(KEY, Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("put");
+        let f = ranged_fetcher(store, suffix);
+        let counter = f.fetch_byte_counter();
+        let before = counter.snapshot();
+        let acc = QueryAccounting::new();
+        let query = LogQuery::new(i64::MIN, i64::MAX);
+        let mut scan = f
+            .scan_accounted_with_tenant(&seg, TENANT, &query, columns, &acc)
+            .await
+            .expect("scan")
+            .expect("relevant");
+        while scan.next_block().expect("next_block").is_some() {}
+        let stats = scan.stats();
+        let delta = counter.snapshot().saturating_sub(&before);
+        let pooled = acc.snapshot().total_s3_bytes();
+        (delta, stats, pooled)
+    }
+
+    /// The narrow projection every test uses: `SELECT ts, body` resolves to the
+    /// three fixed columns `{ts, stream_ref, body}` and never the `latency`/
+    /// `code`/`payload` attribute columns, so the fetch brings a strict subset
+    /// of each block's pages.
+    fn narrow() -> ColumnSelection {
+        ColumnSelection::fixed_only().with_body()
+    }
+
+    /// T1: the exact numerator, denominator, and ratio for a narrow projection.
+    ///
+    /// Numerator is the BLOCKS-section WIRE bytes the projected chunks
+    /// transferred; denominator is the STORED bytes of the pages the scan
+    /// decoded after projection. On the version-4 ranged path with a zero
+    /// coalescing gap the read brings exactly the pages it decodes, so the two
+    /// are equal and the ratio is exactly 1.0 -- the read is not amplified.
+    ///
+    /// Non-vacuity / prove-the-test: replacing the numerator with the pre-v4
+    /// counterfactual (sum of `PageDesc::len` over ALL present pages, which is
+    /// exactly `ScanStats::page_bytes_fetched`) makes `num` read 785 instead of
+    /// 72, so `assert_eq!(num, 72)` fails `left: 785, right: 72` and the ratio
+    /// becomes 785/72 = 10.90 rather than 1.0 (confirmed by computing the ratio
+    /// from `page_bytes_fetched` and rerunning).
+    #[tokio::test]
+    async fn narrow_projection_amplification_is_exact() {
+        let (delta, stats, _pooled) = run_scan(&narrow()).await;
+        let num = delta.scan_wire_bytes;
+        let den = stats.page_bytes_decoded;
+        assert_eq!(num, 72, "BLOCKS-section WIRE bytes transferred (numerator)");
+        assert_eq!(den, 72, "decoded projected page STORED bytes (denominator)");
+        let ratio = fetch_amplification_ratio(num, den);
+        assert_eq!(
+            ratio, 1.0,
+            "a version-4 narrow projection fetches exactly the pages it decodes"
+        );
+    }
+
+    /// T2: the per-phase WIRE bytes sum to the pooled object-store bytes, so the
+    /// plan/scan split can neither drop nor double-count a transfer.
+    #[tokio::test]
+    async fn per_phase_wire_bytes_sum_to_pooled() {
+        let (delta, _stats, pooled) = run_scan(&narrow()).await;
+        assert!(
+            delta.scan_wire_bytes > 0,
+            "the scan phase moved block bytes"
+        );
+        assert!(
+            delta.plan_wire_bytes > 0,
+            "the plan phase moved footer/SKIP_IDX/PAGE_DIR bytes"
+        );
+        assert_eq!(
+            delta.plan_wire_bytes + delta.scan_wire_bytes,
+            pooled,
+            "plan + scan WIRE bytes must equal the pooled object_store bytes"
+        );
+        assert_eq!(delta.total(), pooled, "FetchByteCounts::total is that sum");
+    }
+
+    /// T3: on a narrow projection the new ratio is STRICTLY below the legacy
+    /// `page_bytes_fetched / page_bytes_decoded`. The gap is exactly the bytes
+    /// version-4's PAGE_DIR-driven fetch avoids, and it is the property this task
+    /// exists to expose. Equality would mean the fetcher is not narrowing (or the
+    /// numerator is being taken from descriptors), and the task says to stop and
+    /// report that; the strict inequality is the guard against it.
+    #[tokio::test]
+    async fn new_ratio_is_strictly_below_legacy() {
+        let (delta, stats, _pooled) = run_scan(&narrow()).await;
+        let num = delta.scan_wire_bytes;
+        let den = stats.page_bytes_decoded;
+        // The legacy counterfactual numerator: stored bytes of every present
+        // page, kept or not (`ScanStats::page_bytes_fetched`).
+        let legacy_num = stats.page_bytes_fetched;
+        assert!(
+            num < legacy_num,
+            "version-4 must transfer fewer BLOCKS bytes ({num}) than the sum of \
+             all present page descriptors ({legacy_num}); equal means no narrowing"
+        );
+        let new_ratio = fetch_amplification_ratio(num, den);
+        let legacy_ratio = fetch_amplification_ratio(legacy_num, den);
+        assert!(
+            new_ratio < legacy_ratio,
+            "new ratio {new_ratio} must be below legacy {legacy_ratio}"
         );
     }
 }
