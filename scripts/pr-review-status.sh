@@ -89,9 +89,18 @@ cr_last_state=$(echo "${reviews_json}" | jq -r --arg sha "${head_sha}" \
 # The walkthrough names the exact commit range it reviewed, so requiring the
 # head sha in the body keeps this as strict as the commit_id match above: a
 # stale walkthrough from before the last push does not count.
+#
+# The sha alone is NOT enough. The bot posts other comment kinds that quote a
+# commit without being a review at all -- a rate-limit notice is the one that
+# bit: on #788 those comments carry two 40-hex shas and zero verdict markers,
+# so keying on the sha alone would have cleared the review gate for a PR the
+# bot had not reviewed. That is the false-CLEAR direction, which is worse than
+# the false-block this whole change set out to fix. So also require a verdict
+# marker: one of the two lines the bot emits only when a review actually
+# completed, whether it found something or nothing.
 issue_comments_json="$(gh api "repos/${repo}/issues/${pr}/comments" --paginate | jq -s 'add')"
 cr_walkthroughs=$(echo "${issue_comments_json}" | jq --arg sha "${head_sha}" \
-  '[.[] | select(.user.login=="coderabbitai[bot]" and (.body | contains($sha)))] | length')
+  -f "$(dirname "$0")/lib/coderabbit-verdict.jq")
 
 # The REST review-comments endpoint carries no resolved/unresolved field
 # (resolution is a review-THREAD concept, GraphQL-only) -- this reports the
