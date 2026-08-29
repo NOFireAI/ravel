@@ -1032,12 +1032,18 @@ async fn publish_dataset(
             total += 1;
         }
         let bytes = writer.finish().expect("finish object");
-        // Mechanical drift guard: the scan path routes off the object's own
-        // trailer, never the declared segment_format_version (a resolved
-        // SegmentRef drops the field), so a wrong declaration is invisible at
-        // query time and the smoke test passes either way. Comparing the
-        // declaration against the trailer the writer just produced is the one
-        // place both are visible, so it catches the drift here instead.
+        // Mechanical drift guard. This bench's scan reaches the object through
+        // its own trailer, so a wrong declaration here does not change what it
+        // reads and the smoke test passes either way. Comparing the declaration
+        // against the trailer the writer just produced is the one place both
+        // are visible, so the drift is caught at the write site instead.
+        //
+        // Scope note, because the inverse would be a serious claim: the field
+        // is NOT dropped in general. It is carried from the commit record
+        // through fold.rs and snapshot_resolve.rs onto the SegmentRef, and
+        // ravel-sql reads it to choose the whole-segment ranged route
+        // (logs_scan.rs, open_by_column_chunk). A declaration that lies there
+        // does change which read path runs.
         let declared_segment_format_version = u32::from(ravel_logseg::footer::VERSION);
         assert_eq!(
             u32::from(ravel_logseg::footer::trailer_version(&bytes).expect("trailer version")),
