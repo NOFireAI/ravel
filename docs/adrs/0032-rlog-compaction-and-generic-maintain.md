@@ -330,3 +330,32 @@ one `BlockCursor` per input and partitions survivors into
 `max_l1_part_bytes`-bounded parts, so neither the logs nor the spans
 erasure rewrite is unbounded any longer, and both emit N parts for the same
 reason a compaction does.
+
+## Amendment 2026-08-29: the heap knob is a split target, not a bound
+
+Status: accepted. Amends the wording of the 2026-08-26 amendment above.
+Issues #872, #680.
+
+The knob that amendment calls `max_l1_part_bytes` was split in two
+(issue #872), because one name covered two quantities about 74x apart:
+`max_l1_part_bytes` keeps the name and now means encoded/on-object bytes,
+and the heap quantity this amendment is about is
+`l1_part_memory_target_bytes`. Read the invariant above against that
+second name.
+
+The invariant is also stated too strongly for the codebase as a whole.
+"A part never exceeds ... of estimated live record heap" holds on the
+RLOG path this ADR governs, where the check runs after every merged
+record, so a part exceeds the target by at most one record. It does not
+hold elsewhere, and the knob is shared:
+
+- RSPAN (`rspan_codec::merge`) compares the target only at a `trace_id`
+  transition, so that a trace never straddles two parts. A part runs past
+  the target by up to one whole trace, and a single trace larger than the
+  target is buffered in full.
+- The RSEG metrics builder (`build.rs`) does not read the target at all.
+
+So the number is where parts split, not a ceiling on resident bytes, and
+it is named for that. Sizing a host from it alone is safe only for logs;
+for spans the figure to survive is the target plus the largest single
+trace a tenant sends.

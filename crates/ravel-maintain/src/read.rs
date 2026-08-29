@@ -10,7 +10,10 @@
 //! small and bounded by the ingest admission cap, so they stay inside this
 //! metadata bound. The verbatim TS/VAL/HIST page bytes are
 //! fetched lazily during the merge ([`crate::build`]) with ranged GETs, so
-//! peak memory is bounded by catalog metadata plus one in-flight part buffer, not by the whole bucket's page data.
+//! peak memory is catalog metadata plus one fetch window, plus the series being
+//! materialized, plus the parts held until publish -- not the whole bucket's
+//! page data ([`crate::build`]'s header comment splits those terms and says
+//! which of them a config knob sizes).
 
 use std::future::Future;
 use std::pin::Pin;

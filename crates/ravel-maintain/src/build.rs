@@ -48,8 +48,12 @@
 //! re-encoded) in ascending id order and the window's fetched buffers are then
 //! dropped, so peak fetch buffering is one window's worth. A part accumulates
 //! re-encoded series across windows until its OUTPUT page bytes reach
-//! `max_l1_part_bytes`; the encoded parts held until publish, plus one series'
-//! decoded samples at a time, dominate peak memory.
+//! `max_l1_part_bytes`, checked between series; the encoded parts held until
+//! publish, plus one series' decoded samples at a time, dominate peak memory.
+//! Neither of those two terms is sized by a config knob: the retained parts grow
+//! with the bucket's output, and one series' decoded samples grow with that
+//! series. `l1_part_memory_target_bytes` governs the RLOG and RSPAN merges and
+//! is not read on this path.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
@@ -238,12 +242,15 @@ pub async fn build_parts(
     //
     // On this RSEG path `max_l1_part_bytes` is used for exactly what its name
     // (the stored-size target, issue #872) means: real encoded output bytes.
-    // There is no separate memory bound here because this builder never holds a
-    // whole stream's decoded records the way the RLOG merge does -- it
-    // materializes and flushes series by series -- so its peak is already the
-    // output part, which `max_l1_part_bytes` bounds directly. `max_l1_part_bytes`
-    // is the encoded budget; the RLOG-only `max_l1_part_memory_bytes` does not
-    // apply.
+    // `l1_part_memory_target_bytes` is not read here at all, so no configured
+    // number sizes this builder's heap. What it holds at once is one fetch
+    // window's raw pages (the same figure applied to INPUT page bytes), one
+    // series' decoded samples while `materialize_series` decodes, merges, and
+    // re-encodes its runs (bounded by that series' own size and by nothing
+    // configurable), and every finished part's encoded bytes, which are retained
+    // until publish so convergence repair can re-PUT one. The pending output
+    // part is the only term `max_l1_part_bytes` sizes, and it is checked between
+    // series, so that term runs one whole series past the target.
     let mut pending: Vec<SeriesInputV7> = Vec::new();
     let mut pending_exemplars: Vec<ExemplarInput> = Vec::new();
     let mut pending_output_bytes: u64 = 0;

@@ -12,9 +12,10 @@
 //!   step -- see the `# Memory` section below for why there is no per-trace
 //!   outer loop the way RLOG has a per-stream one;
 //! - pushes the merged records into a fresh [`RspanWriter`] and splits a part
-//!   on a *trace boundary* once it reaches the size cap (so a trace never
+//!   on a *trace boundary* once it reaches the split target (so a trace never
 //!   straddles two parts, giving parts disjoint, ascending `trace_id` ranges
-//!   -- the span analogue of RLOG's stream-boundary split);
+//!   -- the span analogue of RLOG's stream-boundary split, and the reason the
+//!   target is a split point rather than a bound on the part's heap);
 //! - lets the writer re-sort each part by `(trace_id, start_ts)` (a no-op on
 //!   already-sorted input), re-chunk the blocks, and rebuild the
 //!   interval-aware SKIP_IDX over the merged contents.
@@ -50,9 +51,10 @@
 //! catalog metadata: an [`RspanRangeReader`] holding the decoded SKIP_IDX plus
 //! the object key and footer, never block bytes.
 //!
-//! The merge itself is a **k-way block-streaming merge**, so its peak resident
-//! memory is bounded independently of any one trace's size, the same fix RLOG
-//! got. Unlike RLOG, there is no per-stream (here, per-trace) outer loop:
+//! The merge itself is a **k-way block-streaming merge**, so its decode-side
+//! peak resident memory is bounded independently of any one trace's size, the
+//! same fix RLOG got. Its writer-side residency is not: see the split rule
+//! below. Unlike RLOG, there is no per-stream (here, per-trace) outer loop:
 //! RSPAN's SKIP_IDX has no directory of the distinct `trace_id`s an
 //! object holds (a block entry records only its own boundary
 //! `min_trace_id`/`max_trace_id`, not every trace_id that starts inside it),
@@ -83,9 +85,18 @@
 //!
 //! Peak resident memory is then: per-input catalog metadata (KBs per input),
 //! plus at most one decoded block per input (`O(input_count * block_size)`,
-//! independent of trace size), plus the in-progress part's writer buffer
-//! (bounded by the memory bound `max_l1_part_memory_bytes`). RSPAN splits on
-//! trace boundaries and carries only that one memory bound; the stored-size
+//! independent of trace size), plus the in-progress part's writer buffer.
+//!
+//! That last term is where RSPAN differs from RLOG, and it is not a bound. The
+//! split target `l1_part_memory_target_bytes` is compared against the part's
+//! record heap ONLY at a `trace_id` transition, because a trace must not
+//! straddle two parts, so the writer holds up to the target plus one whole
+//! trace, and a single trace larger than the target is held in full however
+//! large it grows. A host running span compaction has to survive the largest
+//! single trace a tenant sends, not the configured target; `merge`'s
+//! [`PartBuilder`] and
+//! [`CompactorConfig::l1_part_memory_target_bytes`] say the same thing.
+//! RSPAN carries only that one target; the stored-size
 //! target the RLOG merge grew (issue #872) has no RSPAN counterpart yet. The
 //! [`crate::config::MergeMemoryTracker`]
 //! seam accounts these terms at their real allocation/decode points, the same
@@ -321,14 +332,20 @@ impl RecordCounts {
 
 /// The shared flat k-way block-streaming merge: every input's span records, in
 /// global `(trace_id, start_ts_ns)` order, filtered through `keep`, partitioned
-/// into parts of at most `max_l1_part_memory_bytes` (the memory bound) on trace
-/// boundaries.
+/// into parts on trace boundaries, at the split target
+/// `l1_part_memory_target_bytes`.
+///
+/// The target is compared against the part's record heap only when the merged
+/// stream moves to a new `trace_id`, so a part runs past it by up to one whole
+/// trace and a single trace larger than the target is never split at all. It is
+/// where parts split, not a ceiling on resident bytes
+/// ([`CompactorConfig::l1_part_memory_target_bytes`]).
 ///
 /// Both callers of the RSPAN merge run through here (issue #742). Compaction
 /// ([`SpanCodec::build_parts`]) keeps every record; the ADR-0064 erasure
 /// rewrite (`erasure_rewrite::build_rewrite_spans`) keeps the records no
 /// pending request's matcher drops. Sharing the driver is what gives the
-/// rewrite the same memory bound the compactor has: peak resident memory is one
+/// rewrite the same split rule the compactor has: resident memory is one
 /// decoded block per input plus the in-progress part, never the bucket. It also
 /// means the two cannot drift on merge order, on where a part splits, or on the
 /// per-input footer cross-check ([`BlockCursor::refill`]).
@@ -341,8 +358,8 @@ impl RecordCounts {
 /// order), so selecting the globally-minimum `(trace_id, start_ts_ns,
 /// input_index)` head across all cursors reproduces byte-for-byte the ordering
 /// the old "gather everything then stable-sort" produced (see the module memory
-/// note). A part flushes on a `trace_id` transition once it reaches the size
-/// cap, so a trace never straddles two parts; since the sort key puts
+/// note). A part flushes on a `trace_id` transition once it reaches the split
+/// target, so a trace never straddles two parts; since the sort key puts
 /// `trace_id` first, all of one trace's records across every input are
 /// contiguous here, so a plain `last_trace != current` check (inside
 /// [`PartBuilder::push`]) counts distinct traces correctly without a set. A
@@ -417,9 +434,15 @@ pub(crate) async fn merge(
         // merged stream, independent of `keep`: a part is closed before the
         // first record of a new trace so a trace never straddles two parts.
         // Only surviving records open or push into a part.
+        //
+        // This transition is the only place the split target is consulted, so
+        // the part's heap is whatever the traces it already holds weigh: past
+        // the target by up to one trace, and unbounded for one trace larger
+        // than the target.
         if current_trace != Some(trace_id) {
             if let Some(part) = &current {
-                let over_cap = part.estimate >= config.max_l1_part_memory_bytes && !part.is_empty();
+                let over_cap =
+                    part.estimate >= config.l1_part_memory_target_bytes && !part.is_empty();
                 if over_cap && let Some(builder) = current.take() {
                     let built = builder
                         .finish(store, bucket, input_set_hash, part_index, dry_run)
@@ -479,9 +502,11 @@ async fn open_cursor<'a>(
 
 /// One in-progress L1 part: the shared [`RspanWriter`] merged records push
 /// into directly, plus the running record-byte estimate that decides where
-/// the part splits (a trace boundary once the estimate reaches the memory
-/// bound `max_l1_part_memory_bytes`) and feeds the [`MergeMemoryTracker`]'s
-/// writer term.
+/// the part splits (the first trace boundary at or after the estimate reaches
+/// the split target `l1_part_memory_target_bytes`) and feeds the
+/// [`MergeMemoryTracker`]'s writer term. Between two such boundaries the
+/// estimate grows unchecked, which is why the target is a split point rather
+/// than a bound on this part's heap.
 struct PartBuilder {
     writer: RspanWriter,
     estimate: u64,
@@ -1205,7 +1230,7 @@ mod tests {
 
         let clock = FixedClock::new(sealed_now_ns());
         let config = CompactorConfig {
-            max_l1_part_memory_bytes: 256,
+            l1_part_memory_target_bytes: 256,
             ..CompactorConfig::default()
         };
         compact_bucket(&store, &clock, &config, &bucket())
@@ -1400,6 +1425,66 @@ mod tests {
         }
     }
 
+    /// The split target is a target, not a bound: one trace larger than it is
+    /// buffered whole, because the target is only consulted at a `trace_id`
+    /// transition and a trace never straddles two parts.
+    ///
+    /// This is the claim
+    /// [`CompactorConfig::l1_part_memory_target_bytes`] makes about the RSPAN
+    /// path, pinned as a magnitude rather than a direction: one hot trace at a
+    /// 4 KiB target produces a single part whose record heap, and whose recorded
+    /// residency, are both more than 10x the target. If RSPAN ever grew a
+    /// mid-trace split, this fails and the doc it pins has to change with it.
+    #[tokio::test]
+    async fn one_trace_runs_past_the_memory_split_target() {
+        const INPUTS: u32 = 2;
+        const PER_INPUT: i64 = 600;
+        const TARGET: u64 = 4 * 1024;
+
+        let store = MemoryStore::new();
+        for j in 0..INPUTS {
+            // All one trace (trace 0), start_ts interleaved across inputs.
+            let recs: Vec<SpanRecord> = (0..PER_INPUT)
+                .map(|i| {
+                    let ts = i * i64::from(INPUTS) + i64::from(j);
+                    span_tagged(0, ts as u32, ts, "hot")
+                })
+                .collect();
+            seed(
+                &store,
+                Uuid::from_u128(u128::from(j) + 1),
+                u64::from(j) + 1,
+                &recs,
+            )
+            .await;
+        }
+
+        let tracker = MergeMemoryTracker::new();
+        let config = CompactorConfig {
+            l1_part_memory_target_bytes: TARGET,
+            merge_memory_tracker: Some(tracker.clone()),
+            ..CompactorConfig::default()
+        };
+        let clock = FixedClock::new(sealed_now_ns());
+        compact_bucket(&store, &clock, &config, &bucket())
+            .await
+            .expect("compact");
+
+        let (_rec, parts) = read_output(&store).await;
+        assert_eq!(parts.len(), 1, "one trace is one part at any target");
+        let heap: u64 = decode_all(&parts[0]).iter().map(estimate_record).sum();
+        assert!(
+            heap > 10 * TARGET,
+            "the single part's heap {heap} must run well past the {TARGET}-byte target, \
+             which is what makes the target a split point and not a bound"
+        );
+        assert!(
+            tracker.peak_total_bytes() > 10 * TARGET,
+            "the overshoot is real residency, not only an estimate: peak {} vs target {TARGET}",
+            tracker.peak_total_bytes()
+        );
+    }
+
     /// Acceptance test (mirroring RLOG's): the RSPAN
     /// compaction merge's peak resident decode memory is bounded by block size
     /// times input count, independent of how large one hot trace grows.
@@ -1489,7 +1574,7 @@ mod tests {
                 "[mem:rspan #908] records/input={records_per_input} trace~={trace_bytes}B \
                  peak_transient={transient}B peak_total={total}B transient_bound={TRANSIENT_BOUND}B \
                  mem_bound={}B",
-                config.max_l1_part_memory_bytes
+                config.l1_part_memory_target_bytes
             );
 
             // The decode-side peak is under the fixed bound.
@@ -1503,11 +1588,14 @@ mod tests {
                  (block size x input count)"
             );
             // The only trace-dependent residency is the writer's in-progress
-            // part, bounded by the part cap (content-addressing needs the
-            // whole part before its key exists).
+            // part (content-addressing needs the whole part before its key
+            // exists). This fixture is one trace, so the part holds all of it:
+            // the assertion passes because the default target is far above this
+            // corpus, not because the target caps the part. See
+            // `one_trace_runs_past_the_memory_split_target`.
             assert!(
-                total < TRANSIENT_BOUND + config.max_l1_part_memory_bytes,
-                "total peak {total} exceeded transient bound + memory bound"
+                total < TRANSIENT_BOUND + config.l1_part_memory_target_bytes,
+                "total peak {total} exceeded transient bound + memory split target"
             );
             peaks.push(transient);
         }
@@ -1696,7 +1784,7 @@ mod tests {
     const BOUNDARY_MEMORY_CAP: u64 = 512;
 
     /// How many L1 parts [`merge`] must produce for `corpus` at
-    /// `max_l1_part_memory_bytes = memory_cap`, derived from the split rule
+    /// `l1_part_memory_target_bytes = memory_cap`, derived from the split rule
     /// rather than observed: records merge in `(trace_id, start_ts_ns)` order,
     /// so one trace's records are contiguous, and the in-progress part is closed
     /// at a trace transition once its [`estimate_record`] total has reached the
@@ -1729,7 +1817,7 @@ mod tests {
     /// Compact `corpus` under `memory_cap` and return the number of L1 parts it
     /// produced.
     ///
-    /// The cap goes to `max_l1_part_memory_bytes`, the field [`merge`] reads.
+    /// The cap goes to `l1_part_memory_target_bytes`, the field [`merge`] reads.
     /// It used to be written to `max_l1_part_bytes`, which the RSPAN merge does
     /// not consult at all, so every corpus produced one part and the
     /// part-boundary case below crossed no boundary. The part-count assertion
@@ -1752,7 +1840,7 @@ mod tests {
 
         let clock = FixedClock::new(sealed_now_ns());
         let config = CompactorConfig {
-            max_l1_part_memory_bytes: memory_cap,
+            l1_part_memory_target_bytes: memory_cap,
             ..CompactorConfig::default()
         };
         compact_bucket(&store, &clock, &config, &bucket())
@@ -1859,7 +1947,7 @@ mod tests {
                 .unwrap();
             rt.block_on(differential_check(
                 corpus,
-                CompactorConfig::default().max_l1_part_memory_bytes,
+                CompactorConfig::default().l1_part_memory_target_bytes,
             ));
         }
 
