@@ -377,7 +377,10 @@ async fn publish_logs(store: &dyn ObjectStoreBackend, tenant: &TenantId) {
         max_event_ts_ns: 1_000 + LOG_RECORD_COUNT as i64 - 1,
         min_ingest_ts_ns: 1_000,
         max_ingest_ts_ns: 1_000 + LOG_RECORD_COUNT as i64 - 1,
-        segment_format_version: 1,
+        // The version the RlogWriter above actually stamped. A commit record
+        // that names another one is refused before any GET is issued
+        // (ADR-0892 decision 4), so this cannot be a placeholder.
+        segment_format_version: u32::from(ravel_logseg::footer::VERSION),
         created_unix_ns: 10,
         ingest_hour_bucket: 0,
     };

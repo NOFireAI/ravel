@@ -4,10 +4,6 @@
 //! encode path. RLOG v4 is a frozen persistent contract; this test is the
 //! tripwire for an accidental format change.
 //!
-//! The same fixture `tests/golden_bytes_v3.rs` pins for the N-1 reader, written
-//! through the current writer instead, so the two files differ in exactly the
-//! layout ADR-0699 changed and nothing else.
-//!
 //! To regenerate `golden_rlog_v4.bin` after a deliberate, versioned format
 //! change (never for an internal refactor), run:
 //!   cargo test -p ravel-logseg --test golden_bytes_v4 -- --ignored --nocapture
@@ -30,8 +26,8 @@ fn fixed_identity() -> ObjectIdentity {
     }
 }
 
-/// The same records `golden_bytes_v3.rs` pins, so the two fixtures differ only
-/// in the BLOCKS layout, the block crc definition, and the added PAGE_DIR.
+/// The representative corpus the golden fixture is built from: two streams,
+/// four records each, exercising fixed and dynamic columns of every type.
 fn golden_records() -> Vec<LogRecord> {
     let streams: [(LogStreamId, &str); 2] = [
         (LogStreamId([0x11; 16]), "checkout"),

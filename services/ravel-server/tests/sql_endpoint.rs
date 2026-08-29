@@ -217,7 +217,10 @@ async fn publish_log_segment(
         max_event_ts_ns,
         min_ingest_ts_ns: min_event_ts_ns,
         max_ingest_ts_ns: max_event_ts_ns,
-        segment_format_version: 1,
+        // The version the RlogWriter above actually stamped. A commit record
+        // that names another one is refused before any GET is issued
+        // (ADR-0892 decision 4), so this cannot be a placeholder.
+        segment_format_version: u32::from(ravel_ingest::LOG_SEGMENT_FORMAT_VERSION),
         created_unix_ns: 10 + index as i64,
         ingest_hour_bucket: 0,
     })
