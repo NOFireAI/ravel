@@ -488,8 +488,15 @@ fn print_human_table(report: &SqlLatencyReport) {
     // whether the second execution dropped to plan reads only or still fetched
     // objects (issue #767). The warm columns are `-` for a single-run report or
     // the Flight lane (no per-run accounting on the wire).
+    //
+    // `pmiss` is the cold run's tail-section probe misses, plan phase plus scan
+    // phase (issue #883). It sits next to `get` because it is part of it: each
+    // miss is one of those GETs, spent because the derived suffix probe did not
+    // reach SKIP_IDX/PAGE_DIR. A `get` column that rises with `pmiss` is a probe
+    // too short; one that rises without it is not. The per-phase split is in the
+    // report JSON's `per_run_accounting`.
     println!(
-        "  {:<32} | {:>9} | {:>9} | {:>9} | {:>9} | {:>7} | {:>7} | {:>7} | {:>7} | {:>7} | {:>9} | {:>7}",
+        "  {:<32} | {:>9} | {:>9} | {:>9} | {:>9} | {:>7} | {:>7} | {:>7} | {:>7} | {:>7} | {:>7} | {:>9} | {:>7}",
         "id",
         "min ms",
         "med ms",
@@ -499,13 +506,14 @@ fn print_human_table(report: &SqlLatencyReport) {
         "blk_tot",
         "blk_scn",
         "get",
+        "pmiss",
         "w_get",
         "w_bytes",
         "w_hit"
     );
     println!(
-        "  {:-<32}-+-{:-<9}-+-{:-<9}-+-{:-<9}-+-{:-<9}-+-{:-<7}-+-{:-<7}-+-{:-<7}-+-{:-<7}-+-{:-<7}-+-{:-<9}-+-{:-<7}",
-        "", "", "", "", "", "", "", "", "", "", "", ""
+        "  {:-<32}-+-{:-<9}-+-{:-<9}-+-{:-<9}-+-{:-<9}-+-{:-<7}-+-{:-<7}-+-{:-<7}-+-{:-<7}-+-{:-<7}-+-{:-<7}-+-{:-<9}-+-{:-<7}",
+        "", "", "", "", "", "", "", "", "", "", "", "", ""
     );
     for e in &report.entries {
         // The Flight lane has no scan diagnostics to print (they are executor
@@ -529,8 +537,14 @@ fn print_human_table(report: &SqlLatencyReport) {
             ),
             _ => ("-".to_string(), "-".to_string(), "-".to_string()),
         };
+        // The cold run is run index 0, so this needs no minimum run count, only
+        // the per-run array the Flight lane does not carry.
+        let probe_misses = match e.per_run_accounting.as_deref() {
+            Some([cold, ..]) => (cold.probe_misses_plan + cold.probe_misses_scan).to_string(),
+            _ => "-".to_string(),
+        };
         println!(
-            "  {:<32} | {:>9.3} | {:>9.3} | {:>9.3} | {:>9.3} | {:>7} | {:>7} | {:>7} | {:>7} | {:>7} | {:>9} | {:>7}",
+            "  {:<32} | {:>9.3} | {:>9.3} | {:>9.3} | {:>9.3} | {:>7} | {:>7} | {:>7} | {:>7} | {:>7} | {:>7} | {:>9} | {:>7}",
             e.id,
             e.min_ms,
             e.median_ms,
@@ -540,6 +554,7 @@ fn print_human_table(report: &SqlLatencyReport) {
             blocks_total,
             blocks_scanned,
             gets,
+            probe_misses,
             warm_gets,
             warm_bytes,
             warm_hits,

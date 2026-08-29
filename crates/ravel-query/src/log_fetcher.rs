@@ -48,10 +48,11 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::erasure::ErasurePredicate;
 use crate::fetcher::ReadCache;
-use crate::phase_accounting::PhaseAccounting;
+use crate::phase_accounting::{PhaseAccounting, QueryPhase};
 use bytes::Bytes;
 use ravel_cache::{CacheKey, SingleFlightError, Source};
 use ravel_catalog::SegmentRef;
@@ -537,6 +538,10 @@ pub struct LogSegmentFetcher {
     /// The block-range fetcher used for objects above `block_range_threshold`.
     /// Kept in sync with `store`/`cfg`/`cache` by the builders.
     block_range: BlockRangeFetcher,
+    /// Per-phase tail-section probe misses across every read this fetcher has
+    /// served (#883). Shared by every clone, like `block_range`'s GET semaphore,
+    /// and read through [`probe_miss_counter`](Self::probe_miss_counter).
+    probe_misses: ProbeMissCounter,
 }
 
 impl LogSegmentFetcher {
@@ -547,7 +552,36 @@ impl LogSegmentFetcher {
             cache: None,
             block_range_threshold: DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
             block_range: BlockRangeFetcher::new(store),
+            probe_misses: ProbeMissCounter::new(),
         }
+    }
+
+    /// This fetcher's accumulating per-phase probe-miss counter (#883). Clone it
+    /// out before handing the fetcher to whatever will own it, then read
+    /// [`ProbeMissCounter::snapshot`] around each execution to attribute misses
+    /// to that execution; the counter itself never resets.
+    ///
+    /// Survives every builder below, including
+    /// [`with_block_range`](Self::with_block_range), which replaces the
+    /// `BlockRangeFetcher` but not this.
+    #[must_use]
+    pub fn probe_miss_counter(&self) -> ProbeMissCounter {
+        self.probe_misses.clone()
+    }
+
+    /// Record one block-range read's probe misses on both channels that report
+    /// them: the `page_fetch` span field, beside the `s3_requests`/`s3_bytes`
+    /// the same read produced, and this fetcher's [`ProbeMissCounter`] under
+    /// `phase`. Written by one call so the span and the counter cannot drift
+    /// apart into two accounting channels that disagree.
+    fn record_probe_misses(
+        &self,
+        span: &tracing::Span,
+        stats: &BlockRangeStats,
+        phase: ProbePhase,
+    ) {
+        span.record("probe_misses", stats.probe_misses);
+        self.probe_misses.record(phase, stats.probe_misses);
     }
 
     /// Overrides the [`RlogConfig`] used for section-size caps when decoding.
@@ -594,6 +628,18 @@ impl LogSegmentFetcher {
     #[must_use]
     pub fn with_max_concurrent_gets(mut self, n: usize) -> Self {
         self.block_range = self.block_range.with_max_concurrent_gets(n);
+        self
+    }
+
+    /// Pins the block-range fetcher's suffix-probe length
+    /// ([`BlockRangeFetcher::with_suffix_len`]), overriding the per-object
+    /// derivation ([`derive_suffix_len`], #883). This is the seam a measurement
+    /// pass sweeps the probe length through: the probe floor can only be
+    /// tightened against measured [`BlockRangeStats::probe_misses`], and a sweep
+    /// needs to set the window from outside the fetcher.
+    #[must_use]
+    pub fn with_suffix_len(mut self, n: u64) -> Self {
+        self.block_range = self.block_range.with_suffix_len(n);
         self
     }
 
@@ -890,7 +936,14 @@ impl LogSegmentFetcher {
         let all = ColumnSelection::all();
         let result = async {
             let Some(bytes) = self
-                .tenant_bytes(seg_ref, tenant_hash, query, &all, accounting)
+                .tenant_bytes(
+                    seg_ref,
+                    tenant_hash,
+                    query,
+                    &all,
+                    ProbePhase::Scan,
+                    accounting,
+                )
                 .await?
             else {
                 return Ok(None);
@@ -952,7 +1005,14 @@ impl LogSegmentFetcher {
         accounting: &QueryAccounting,
     ) -> Result<Option<LogSegmentScan>, LogFetchError> {
         let Some(bytes) = self
-            .tenant_bytes(seg_ref, tenant_hash, query, columns, accounting)
+            .tenant_bytes(
+                seg_ref,
+                tenant_hash,
+                query,
+                columns,
+                ProbePhase::Scan,
+                accounting,
+            )
             .await?
         else {
             return Ok(None);
@@ -1155,7 +1215,7 @@ impl LogSegmentFetcher {
                 // not cover, reported alongside the request and byte counts for
                 // this plan phase. A nonzero value here is the extra request a
                 // too-small derivation costs.
-                fetch_span.record("probe_misses", stats.probe_misses);
+                self.record_probe_misses(&fetch_span, &stats, ProbePhase::Plan);
 
                 let refs: Vec<&Predicate> = query.prune.iter().collect();
                 let numeric = field_dir.numeric_range_arms(&refs);
@@ -1189,7 +1249,14 @@ impl LogSegmentFetcher {
             // report can see which queries still pay it.
             let all = ColumnSelection::all();
             let Some(bytes) = self
-                .tenant_bytes(seg_ref, tenant_hash, query, &all, accounting)
+                .tenant_bytes(
+                    seg_ref,
+                    tenant_hash,
+                    query,
+                    &all,
+                    ProbePhase::Plan,
+                    accounting,
+                )
                 .await?
             else {
                 return Ok(None);
@@ -1293,7 +1360,7 @@ impl LogSegmentFetcher {
         fetch_span.record("s3_bytes", stats.block_bytes_fetched);
         // Probe misses (#883): a footer chase here is a probe too short to reach
         // even the footer, reported per phase beside the request/byte counts.
-        fetch_span.record("probe_misses", stats.probe_misses);
+        self.record_probe_misses(&fetch_span, &stats, ProbePhase::Plan);
 
         let n = usize::try_from(footer.block_count).map_err(|_| LogFetchError::Corrupt {
             key: seg_ref.data_object_key.clone(),
@@ -1402,7 +1469,7 @@ impl LogSegmentFetcher {
         fetch_span.record("s3_bytes", stats.block_bytes_fetched);
         // Probe misses (#883): SKIP_IDX not covered by the derived probe window,
         // reported per phase beside the request/byte counts.
-        fetch_span.record("probe_misses", stats.probe_misses);
+        self.record_probe_misses(&fetch_span, &stats, ProbePhase::Plan);
 
         let (ts_min, ts_max) = (query.ts_min_ns, query.ts_max_ns);
         let mut record_count = 0u64;
@@ -1470,7 +1537,15 @@ impl LogSegmentFetcher {
         accounting: &QueryAccounting,
     ) -> Result<Option<LogSegmentScan>, LogFetchError> {
         let Some(bytes) = self
-            .tenant_bytes_with_footer(seg_ref, tenant_hash, query, columns, footer, accounting)
+            .tenant_bytes_with_footer(
+                seg_ref,
+                tenant_hash,
+                query,
+                columns,
+                footer,
+                ProbePhase::Scan,
+                accounting,
+            )
             .await?
         else {
             return Ok(None);
@@ -1494,16 +1569,31 @@ impl LogSegmentFetcher {
     /// the `page_fetch` span and the accounting both entry points share.
     /// `Ok(None)` means the catalog summary proved the object irrelevant and no
     /// GET was issued.
+    ///
+    /// `phase` is which of the caller's phases this read belongs to, for the
+    /// probe-miss charge (#883). It is a parameter rather than a constant
+    /// because this funnel serves both: the scan funnels below reach it as a
+    /// data read, and [`plan_segment`](Self::plan_segment)'s fallback reaches it
+    /// as a planning read for a predicate the skip index cannot decide.
     async fn tenant_bytes(
         &self,
         seg_ref: &SegmentRef,
         tenant_hash: TenantHash,
         query: &LogQuery,
         columns: &ColumnSelection,
+        phase: ProbePhase,
         accounting: &QueryAccounting,
     ) -> Result<Option<Bytes>, LogFetchError> {
-        self.tenant_bytes_with_footer(seg_ref, tenant_hash, query, columns, None, accounting)
-            .await
+        self.tenant_bytes_with_footer(
+            seg_ref,
+            tenant_hash,
+            query,
+            columns,
+            None,
+            phase,
+            accounting,
+        )
+        .await
     }
 
     /// [`tenant_bytes`](Self::tenant_bytes), optionally carrying a plan-phase
@@ -1530,6 +1620,7 @@ impl LogSegmentFetcher {
         query: &LogQuery,
         columns: &ColumnSelection,
         footer: Option<&footer::LogFooter>,
+        phase: ProbePhase,
         accounting: &QueryAccounting,
     ) -> Result<Option<Bytes>, LogFetchError> {
         if !Self::ts_range_relevant(seg_ref, query.ts_min_ns, query.ts_max_ns) {
@@ -1587,9 +1678,9 @@ impl LogSegmentFetcher {
             fetch_span.record("s3_requests", requests);
             fetch_span.record("s3_bytes", stats.block_bytes_fetched);
             // Probe misses (#883): SKIP_IDX/PAGE_DIR (and any footer chase) not
-            // covered by the derived probe window on this scan-phase read,
-            // reported beside the request/byte counts.
-            fetch_span.record("probe_misses", stats.probe_misses);
+            // covered by the derived probe window on this read, reported beside
+            // the request/byte counts and charged to the caller's phase.
+            self.record_probe_misses(&fetch_span, &stats, phase);
             return Ok(Some(bytes));
         }
 
@@ -2065,6 +2156,137 @@ pub struct BlockRangeStats {
     /// one per section: the missed tail sections are adjacent in the object and
     /// are fetched as one coalesced range.
     pub probe_misses: u64,
+}
+
+/// The query phase a tail-section probe miss is charged to (#883).
+///
+/// Only two of [`QueryPhase`]'s four can issue a suffix probe: `Resolve` reads
+/// commit records and `Probe` is the RSEG segment-catalog fetch, neither of
+/// which touches an RLOG object's tail. Naming the two that can, rather than
+/// taking a `QueryPhase` with two impossible arms, keeps the charge total: every
+/// value here maps to a real phase, so a miss can never be recorded against a
+/// phase that issued no request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProbePhase {
+    /// A probe issued to build a fetch plan: [`LogSegmentFetcher::plan_segment`]
+    /// and [`LogSegmentFetcher::plan_segment_block_stats`], which read the
+    /// footer, SKIP_IDX, and FIELD_DIR and no block byte.
+    Plan,
+    /// A probe issued by a data read: the block/page/chunk fetch behind
+    /// [`LogSegmentFetcher::fetch_accounted_with_tenant`] and
+    /// [`LogSegmentFetcher::scan_accounted_with_tenant`].
+    Scan,
+}
+
+impl ProbePhase {
+    /// This phase in [`QueryPhase`]'s vocabulary, which is what
+    /// `docs/query-engine.md` and the per-phase request and byte counters use.
+    #[must_use]
+    pub fn query_phase(self) -> QueryPhase {
+        match self {
+            ProbePhase::Plan => QueryPhase::Plan,
+            ProbePhase::Scan => QueryPhase::Scan,
+        }
+    }
+
+    /// Lower-case, stable name for a report column or a JSON key, identical to
+    /// [`QueryPhase::name`] for the same phase.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        self.query_phase().name()
+    }
+}
+
+/// Per-phase tail-section probe misses ([`BlockRangeStats::probe_misses`])
+/// accumulated across every read one [`LogSegmentFetcher`] served (#883).
+///
+/// `BlockRangeStats` reports one read's misses and is dropped at the fetch
+/// boundary, so a caller that measures whole statements -- the SQL latency bench
+/// -- never sees the figure: it reaches `ravel-sql` only as a `tracing` span
+/// field, and nothing aggregates spans into a report. This is the same number on
+/// a channel a caller can read, so a measurement pass can put probe misses
+/// beside the request and byte counts they explain, which is what gates any
+/// tightening of the probe floor ([`LOG_SUFFIX_FLOOR_BYTES`]).
+///
+/// It is an accumulator, not a per-query handle: the counters only ever grow, so
+/// a caller measuring one execution takes a [`snapshot`](Self::snapshot) before
+/// and after and reads [`ProbeMissCounts::saturating_sub`] of the two. Cheap to
+/// clone (one `Arc`), and every clone of the owning `LogSegmentFetcher` shares
+/// the same counters, exactly as its GET semaphore does.
+#[derive(Debug, Clone, Default)]
+pub struct ProbeMissCounter(Arc<ProbeMissInner>);
+
+#[derive(Debug, Default)]
+struct ProbeMissInner {
+    plan: AtomicU64,
+    scan: AtomicU64,
+}
+
+impl ProbeMissCounter {
+    /// New counter with both phases at zero.
+    #[must_use]
+    pub fn new() -> Self {
+        ProbeMissCounter::default()
+    }
+
+    /// Add one read's probe misses to `phase`. `n` is
+    /// [`BlockRangeStats::probe_misses`] verbatim, including zero: a read that
+    /// missed nothing must not be skipped, or the counter would only be written
+    /// on the paths that already have a problem.
+    fn record(&self, phase: ProbePhase, n: u64) {
+        let cell = match phase {
+            ProbePhase::Plan => &self.0.plan,
+            ProbePhase::Scan => &self.0.scan,
+        };
+        cell.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Point-in-time copy of both phases' totals.
+    #[must_use]
+    pub fn snapshot(&self) -> ProbeMissCounts {
+        ProbeMissCounts {
+            plan: self.0.plan.load(Ordering::Relaxed),
+            scan: self.0.scan.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Point-in-time copy of a [`ProbeMissCounter`]'s per-phase totals (#883).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProbeMissCounts {
+    /// Misses charged to [`ProbePhase::Plan`].
+    pub plan: u64,
+    /// Misses charged to [`ProbePhase::Scan`].
+    pub scan: u64,
+}
+
+impl ProbeMissCounts {
+    /// Field-wise difference `self - earlier`, the misses one measured
+    /// execution added to a counter that keeps accumulating across executions.
+    /// Saturating: a snapshot pair read out of order reports zero rather than
+    /// wrapping to a huge count that would read as a catastrophic probe miss.
+    #[must_use]
+    pub fn saturating_sub(&self, earlier: &ProbeMissCounts) -> ProbeMissCounts {
+        ProbeMissCounts {
+            plan: self.plan.saturating_sub(earlier.plan),
+            scan: self.scan.saturating_sub(earlier.scan),
+        }
+    }
+
+    /// Misses across both phases.
+    #[must_use]
+    pub fn total(&self) -> u64 {
+        self.plan.saturating_add(self.scan)
+    }
+
+    /// One phase's total, named through [`ProbePhase`] rather than by field.
+    #[must_use]
+    pub fn phase(&self, phase: ProbePhase) -> u64 {
+        match phase {
+            ProbePhase::Plan => self.plan,
+            ProbePhase::Scan => self.scan,
+        }
+    }
 }
 
 /// A [`footer::LogFooter`] a prior plan read produced for this exact (immutable)

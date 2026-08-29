@@ -530,6 +530,27 @@ column paid. A full-window statement over an N-object tenant reads every
 object, because the plan phase reads the whole dataset; issues #693 and #699
 are the two open changes to that. So the figure to compare across runs is bytes
 per second at the reported `host_logical_cores`, not the statement's row count.
+
+### The per-statement `per_run_accounting` block
+
+One entry per run, in run order, so index 0 is the cold run and index 1 the
+warm one. It carries the same object-store and cache figures as `scan` plus
+`probe_misses_plan` and `probe_misses_scan`: tail sections (SKIP_IDX, and
+PAGE_DIR on a version-4 object) that the run's suffix probe did not reach,
+split by the phase that issued the probe.
+
+Read them against `object_store_get_requests`. Each miss is one of those GETs,
+spent because the derived probe was too short for that object's trailer, so a
+run whose GETs rose along with its probe misses paid for the probe length, and
+one whose GETs rose with probe misses flat did not. This is the number that
+gates any tightening of the probe floor (`LOG_SUFFIX_FLOOR_BYTES`): a change
+that trades probe bytes for requests is a win only if these stay where they
+were. They are measured against the probe window rather than against the read
+cache, so the warm run reports the same counts as the cold one; a difference
+between the two runs means the plan shape changed, not that the cache helped.
+The `pmiss` column in the bench's text table is the cold run's two phases
+summed.
+
 ## 6. Through the server (Flight SQL)
 
 Everything above measures the SQL executor as a library, in the bench's own
