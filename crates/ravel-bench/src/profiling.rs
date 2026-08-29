@@ -298,28 +298,38 @@ mod imp {
     /// one that worked until the flamegraph comes back as `[unknown]`, so this
     /// checks the produced binary rather than trusting the build. On any arch
     /// other than x86-64 the prologue pattern differs and this is a no-op.
-    /// Exits the process on failure: profiling this binary would waste the whole
-    /// run producing an unattributable profile.
+    /// Exits the process on failure, INCLUDING when the check itself cannot run
+    /// (the executable cannot be located or read): profiling an unverified
+    /// binary would waste the whole run producing an unattributable profile, and
+    /// a guard that degrades to "allow" when it cannot check is not a guard. On
+    /// any arch other than x86-64 the prologue pattern differs and this is a
+    /// no-op.
     fn enforce_frame_pointer_build() {
         #[cfg(target_arch = "x86_64")]
         {
+            // Fail CLOSED on both paths. A guard that cannot run its check must
+            // refuse, not wave the run through: arming the sampler here would
+            // produce exactly the unattributable profile this exists to prevent,
+            // and the operator would have no signal that the check never ran.
             let exe = match std::env::current_exe() {
                 Ok(p) => p,
                 Err(err) => {
                     eprintln!(
-                        "profiling: could not locate current executable to verify frame pointers: {err}"
+                        "profiling: could not locate current executable to verify frame pointers: {err}. \
+                         Refusing to profile: an unverified build produces an unattributable profile."
                     );
-                    return;
+                    std::process::exit(1);
                 }
             };
             let image = match std::fs::read(&exe) {
                 Ok(bytes) => bytes,
                 Err(err) => {
                     eprintln!(
-                        "profiling: could not read {} to verify frame pointers: {err}",
+                        "profiling: could not read {} to verify frame pointers: {err}. \
+                         Refusing to profile: an unverified build produces an unattributable profile.",
                         exe.display()
                     );
-                    return;
+                    std::process::exit(1);
                 }
             };
             match super::check_frame_pointers(&image) {
