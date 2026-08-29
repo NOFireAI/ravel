@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Cases for reproduce-figure.sh. Add a case here before changing a behaviour,
+# the way .claude/guards/pretooluse.test.sh works for the hook.
+#
+# The fixture is the shape that motivated the script: a run measuring N
+# statements, one of which failed and carries no timings, and a headline quoting
+# a total over N-1.
+set -uo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT="$HERE/reproduce-figure.sh"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+fails=0
+check() { # check <name> <expected-exit> <expected-substring> <args...>
+  local name="$1" want_rc="$2" want_sub="$3"; shift 3
+  local out rc=0
+  out="$("$SCRIPT" "$@" 2>&1)" || rc=$?
+  if [ "$rc" != "$want_rc" ]; then
+    echo "FAIL $name: exit $rc, wanted $want_rc"; echo "$out" | sed 's/^/    /'; fails=$((fails+1)); return
+  fi
+  case "$out" in
+    *"$want_sub"*) echo "ok   $name" ;;
+    *) echo "FAIL $name: output missing '$want_sub'"; echo "$out" | sed 's/^/    /'; fails=$((fails+1)) ;;
+  esac
+}
+
+# JSON-LINES on purpose: a single json.load() over this file raises "Extra data",
+# which is the parsing bug this repo keeps rediscovering.
+cat > "$TMP/report.json" <<'JSON'
+{"id":"qA_alpha","min_ms":1000.0,"cold_ms":5000.0}
+{"id":"qB_beta","min_ms":2000.0,"cold_ms":6000.0}
+{"id":"qC_gamma","min_ms":3000.0,"cold_ms":7000.0}
+{"id":"qD_failed","error":"pool exhausted"}
+JSON
+
+# Full set is 6.00 s of min_ms; dropping qB leaves 4.00 s.
+check "exact on a single drop" 0 "EXACT: drop qB_beta" "$TMP/report.json" min_ms 4.00 2
+check "exact on the full set"  0 "the claimed total is the FULL set" "$TMP/report.json" min_ms 6.00
+check "no basis reproduces it" 1 "No single-statement basis reproduces" "$TMP/report.json" min_ms 4.44
+check "unreachable total still refuses to guess" 1 "QUOTE THIS OUTPUT" "$TMP/report.json" cold_ms 99.00
+
+# A failed statement must be excluded from the metric, never counted as zero:
+# counting it as zero would reproduce a lower total for the wrong reason, which
+# is precisely the class of mistake this script exists to prevent.
+check "failed statement excluded, not zeroed" 0 "missing on ['qD_failed']" "$TMP/report.json" min_ms 6.00
+
+# The node count and the metric count are reported separately, because a
+# statement present-but-untimed is not the same as a statement absent, and
+# conflating them produced a wrong claim in the incident that motivated this.
+check "counts nodes and metrics separately" 0 "statements    : 4" "$TMP/report.json" min_ms 6.00
+
+# auto tries every numeric *_ms key, so a caller who does not know which metric
+# the headline used still gets an answer.
+check "auto finds the cold_ms basis" 0 "EXACT: drop qB_beta" "$TMP/report.json" auto 12.00
+
+# A headline count that disagrees with the surviving set is flagged rather than
+# silently accepted: reproducing the number on the wrong-sized basis is a
+# near-miss dressed as a hit.
+check "count mismatch is flagged" 0 "WARNING: yields 2 statements, headline claims 7" "$TMP/report.json" min_ms 4.00 7
+
+check "unreadable report exits 2" 2 "cannot read" "$TMP/nonexistent.json" min_ms 1.0
+
+if [ "$fails" -ne 0 ]; then echo; echo "$fails case(s) failed"; exit 1; fi
+echo; echo "all reproduce-figure cases passed"
