@@ -1,0 +1,28 @@
+# Frame-pointer profiling build for ravel-bench (issue #884).
+#
+# A release build omits frame pointers, so `perf --call-graph dwarf` (and
+# pprof's unwinder) fail to unwind inlined generic code and attribute Ravel's
+# own hot path to `[unknown]`. That produced a false negative (#847) and then
+# hid the true positive (#876/#881). This alias makes a profiling build carry
+# `-C force-frame-pointers=yes` so an operator does not have to remember the
+# RUSTFLAGS incantation.
+#
+# The flag is injected via `--config build.rustflags` rather than a bare
+# `[build] rustflags` key here for two reasons:
+#
+#   1. `build.rustflags` propagates to EVERY crate compiled in the build, its
+#      dependencies included. That is the whole point: the frames this profile
+#      must attribute (ravel-ingest, ravel-query, and their deps) live in
+#      dependency crates, so a mechanism that reached only ravel-bench itself --
+#      a `build.rs` emitting `cargo:rustc-flags` does exactly this -- would
+#      leave the frames that matter as `[unknown]`.
+#   2. Scoping it to this alias, not to a `[build]` table, keeps ordinary
+#      `cargo test`/gate runs from this directory on their normal rustflags, so
+#      they do not get a different fingerprint and a full rebuild.
+#
+# Caveat: `build.rustflags` is discovered by the current directory and is
+# overridden by a set `RUSTFLAGS` environment variable or a
+# `target.<triple>.rustflags`. Run this from `crates/ravel-bench/` with
+# `RUSTFLAGS` unset. See PROFILING.md.
+[alias]
+profile-build = ["build", "--release", "--features", "profiling", "--config", "build.rustflags=[\"-C\", \"force-frame-pointers=yes\"]"]

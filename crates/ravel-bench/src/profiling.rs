@@ -171,6 +171,106 @@ pub fn profile_requested() -> bool {
     false
 }
 
+/// Maximum share of profile samples that may be unattributed (`[unknown]`)
+/// before [`check_attribution`] refuses the profile.
+///
+/// A frame-pointer build of this workload measured 0.00% unattributed: the
+/// issue #884 evidence is that rebuilding the same profile with
+/// `-C force-frame-pointers=yes` took `[unknown]` from 33.95% to 0.00%. The
+/// healthy value is therefore essentially zero, and this threshold is pure
+/// headroom above it: a handful of genuinely unwindable ticks (a leaf entered
+/// before its prologue ran, a boundary frame of the sampler itself) may resolve
+/// to nothing without the profile being wrong. 2% sits an order of magnitude
+/// below the 33.95% a build without frame pointers produced, so the failure this
+/// guards -- a profile attributing tens of percent to `[unknown]` -- cannot
+/// reach it, and a genuinely healthy profile cannot exceed it. The constant is
+/// pinned by a test so loosening it is a deliberate edit, not a silent drift.
+pub const MAX_UNATTRIBUTED_SHARE: f64 = 0.02;
+
+/// Fraction of `total` samples that were unattributed. Returns `0.0` for an
+/// empty profile: no samples means nothing to attribute, which is a different
+/// failure (an empty workload) from an unattributable one and not what
+/// [`check_attribution`] guards.
+pub fn unattributed_share(unattributed: u64, total: u64) -> f64 {
+    if total == 0 {
+        return 0.0;
+    }
+    unattributed as f64 / total as f64
+}
+
+/// Refuse a profile whose unattributed (`[unknown]`) share exceeds
+/// [`MAX_UNATTRIBUTED_SHARE`]. Returns the measured share on success so the
+/// caller can report it either way; the error names the likely cause (a build
+/// without frame pointers) rather than the symptom, because that is the action
+/// the operator must take. See issue #884: this exact ratio, read as "the hash
+/// is cheap", was the unwinder failing, and the false negative shipped as #847.
+pub fn check_attribution(unattributed: u64, total: u64) -> Result<f64, String> {
+    let share = unattributed_share(unattributed, total);
+    if share > MAX_UNATTRIBUTED_SHARE {
+        return Err(format!(
+            "[unknown] is {:.2}% of samples (threshold {:.2}%): this is almost certainly a build \
+             without frame pointers, not a genuinely unattributable workload. Rebuild with \
+             -C force-frame-pointers=yes (run `cargo profile-build` from crates/ravel-bench). Do \
+             not draw conclusions from this profile.",
+            share * 100.0,
+            MAX_UNATTRIBUTED_SHARE * 100.0
+        ));
+    }
+    Ok(share)
+}
+
+/// The canonical x86-64 frame-pointer function prologue: `push %rbp` (0x55)
+/// followed by `mov %rsp, %rbp` (0x48 0x89 0xe5). A `-C force-frame-pointers=yes`
+/// build emits this at the head of essentially every non-leaf function; an
+/// omit-frame-pointers build emits it for almost none. Scanning for the 4-byte
+/// sequence needs no `objdump` and no debug info.
+#[cfg(target_arch = "x86_64")]
+const FP_PROLOGUE_X86_64: [u8; 4] = [0x55, 0x48, 0x89, 0xe5];
+
+/// Plausibility floor for [`count_fp_prologues`] over a real bench binary.
+///
+/// The bench bins statically link every ravel-* crate and their dependencies,
+/// so a frame-pointer build carries many thousands of these prologues (tens of
+/// thousands is typical). An omit-frame-pointers build carries essentially none:
+/// the 4-byte sequence turns up in arbitrary bytes at a rate near 1 in 2^32 per
+/// position, so even a multi-megabyte binary yields at most a handful by chance.
+/// 1000 sits far above that coincidental-match noise and far below the real
+/// frame-pointer count, so it separates "the flag worked" from "the flag
+/// silently did nothing" without depending on any one bin's exact function
+/// count. Pinned by a test.
+pub const MIN_FP_PROLOGUES: usize = 1000;
+
+/// Count canonical x86-64 frame-pointer prologues in a binary image. Pure over
+/// the byte slice so it is testable without a real binary; the live check in
+/// [`ProfileSession`] scans `std::env::current_exe`.
+#[cfg(target_arch = "x86_64")]
+pub fn count_fp_prologues(image: &[u8]) -> usize {
+    image
+        .windows(FP_PROLOGUE_X86_64.len())
+        .filter(|w| *w == FP_PROLOGUE_X86_64)
+        .count()
+}
+
+/// Refuse a binary carrying implausibly few frame-pointer prologues, which means
+/// the profiling build's `-C force-frame-pointers=yes` did not take effect
+/// (something overrode it, or it was never applied). Returns the count on
+/// success. See issue #884, deliverable 3: a flag that silently did nothing
+/// looks identical to one that worked, so verify the produced binary, not the
+/// build configuration.
+#[cfg(target_arch = "x86_64")]
+pub fn check_frame_pointers(image: &[u8]) -> Result<usize, String> {
+    let count = count_fp_prologues(image);
+    if count < MIN_FP_PROLOGUES {
+        return Err(format!(
+            "profiling build carries only {count} x86-64 frame-pointer prologues (floor \
+             {MIN_FP_PROLOGUES}): -C force-frame-pointers=yes did not take effect. Build with \
+             `cargo profile-build` from crates/ravel-bench so the flag reaches every crate. Do \
+             not profile this binary: its stacks will not unwind."
+        ));
+    }
+    Ok(count)
+}
+
 /// Sampling frequency in Hz for the ingest lane. 997 (a prime near 1 kHz)
 /// avoids aliasing against any periodic timer in the workload.
 #[cfg(feature = "profiling")]
@@ -190,6 +290,75 @@ mod imp {
     use std::path::PathBuf;
 
     use super::{PROFILE_ENV, QUERY_SAMPLE_HZ, SAMPLE_HZ};
+
+    /// Verify the running bench binary was built with frame pointers before a
+    /// real profiled run arms the sampler (issue #884, deliverable 3). A build
+    /// that carries `-C force-frame-pointers=yes` in its configuration but did
+    /// not actually apply it (an override, a stale binary) looks identical to
+    /// one that worked until the flamegraph comes back as `[unknown]`, so this
+    /// checks the produced binary rather than trusting the build. On any arch
+    /// other than x86-64 the prologue pattern differs and this is a no-op.
+    /// Exits the process on failure: profiling this binary would waste the whole
+    /// run producing an unattributable profile.
+    fn enforce_frame_pointer_build() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let exe = match std::env::current_exe() {
+                Ok(p) => p,
+                Err(err) => {
+                    eprintln!(
+                        "profiling: could not locate current executable to verify frame pointers: {err}"
+                    );
+                    return;
+                }
+            };
+            let image = match std::fs::read(&exe) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    eprintln!(
+                        "profiling: could not read {} to verify frame pointers: {err}",
+                        exe.display()
+                    );
+                    return;
+                }
+            };
+            match super::check_frame_pointers(&image) {
+                Ok(count) => {
+                    eprintln!(
+                        "profiling: verified {count} frame-pointer prologues in {}",
+                        exe.display()
+                    );
+                }
+                Err(msg) => {
+                    eprintln!("profiling: {msg}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
+    /// Count total and unattributed samples in a resolved report. A stack is
+    /// unattributed when it resolves to no application frame: `pprof` drops a
+    /// frame that yields no symbol at all and gives an unresolved frame the
+    /// placeholder name `Unknown`, so a stack with neither a named frame nor any
+    /// non-`Unknown` symbol is one the unwinder failed on -- the `[unknown]`
+    /// share this guards. Returns `(unattributed, total)`.
+    fn attribution_counts(report: &pprof::Report) -> (u64, u64) {
+        let mut total: u64 = 0;
+        let mut unattributed: u64 = 0;
+        for (frames, count) in &report.data {
+            let c = (*count).max(0) as u64;
+            total += c;
+            let has_named_frame = frames.frames.iter().flatten().any(|s| {
+                let name = s.name();
+                !name.is_empty() && name != "Unknown"
+            });
+            if !has_named_frame {
+                unattributed += c;
+            }
+        }
+        (unattributed, total)
+    }
 
     /// The query lanes run their statements across many worker threads
     /// concurrently, and each `SIGPROF` tick unwinds through libgcc, which is
@@ -217,16 +386,31 @@ mod imp {
         guard: pprof::ProfilerGuard<'static>,
         path: PathBuf,
         label: String,
+        /// Whether [`ProfileSession::finish`] exits the process when the
+        /// unattributed-share check fails. True for a real profiled run started
+        /// from [`ProfileSession::from_env`] (refuse a profile that cannot
+        /// attribute itself), false for [`ProfileSession::to_path`] callers such
+        /// as this crate's own tests (report the share, do not kill the run).
+        enforce: bool,
     }
 
     impl ProfileSession {
         /// Starts a session iff [`PROFILE_ENV`] names a path; otherwise returns
         /// an inert session whose `finish` does nothing.
         ///
+        /// Before arming the sampler it verifies the running binary was built
+        /// with frame pointers (issue #884): a profile off a binary without them
+        /// is worthless, so refuse up front rather than produce it. This is the
+        /// real-run path, so its profile is enforced -- `finish` refuses a
+        /// profile that cannot attribute itself.
+        ///
         /// See issue #680: the sampler must survive a concurrent query plan.
         pub fn from_env(label: &str) -> Self {
             match std::env::var_os(PROFILE_ENV) {
-                Some(p) if !p.is_empty() => Self::to_path(label, PathBuf::from(p)),
+                Some(p) if !p.is_empty() => {
+                    enforce_frame_pointer_build();
+                    Self::build(label, PathBuf::from(p), true)
+                }
                 _ => ProfileSession { active: None },
             }
         }
@@ -242,8 +426,19 @@ mod imp {
 
         /// Starts a session writing to an explicit path, ignoring the
         /// environment. Used by the crate's own test and by any caller that has
-        /// already resolved an output path.
+        /// already resolved an output path. Does not enforce the
+        /// unattributed-share check on `finish` (it reports the share instead)
+        /// nor the frame-pointer build check, so a test can drive the sampler
+        /// without the process exiting under it.
         pub fn to_path(label: &str, path: PathBuf) -> Self {
+            Self::build(label, path, false)
+        }
+
+        /// Shared constructor for [`from_env`](Self::from_env) and
+        /// [`to_path`](Self::to_path). `enforce` records whether `finish` refuses
+        /// (exits) or merely reports when the profile fails the attribution
+        /// check.
+        fn build(label: &str, path: PathBuf, enforce: bool) -> Self {
             let hz = sample_hz_for(label);
             match pprof::ProfilerGuardBuilder::default()
                 .frequency(hz)
@@ -257,6 +452,7 @@ mod imp {
                             guard,
                             path,
                             label: label.to_string(),
+                            enforce,
                         }),
                     }
                 }
@@ -280,6 +476,27 @@ mod imp {
                     return None;
                 }
             };
+            // Refuse a profile that cannot attribute itself (issue #884). On the
+            // enforced (real-run) path a failure exits the process before the
+            // SVG is written, so a bogus flamegraph is never mistaken for a
+            // finding; the unenforced path (tests, direct callers) reports the
+            // share and continues.
+            let (unattributed, total) = attribution_counts(&report);
+            match super::check_attribution(unattributed, total) {
+                Ok(share) => {
+                    eprintln!(
+                        "profiling: {:.2}% of {total} samples unattributed (threshold {:.2}%)",
+                        share * 100.0,
+                        super::MAX_UNATTRIBUTED_SHARE * 100.0
+                    );
+                }
+                Err(msg) => {
+                    eprintln!("profiling: {msg}");
+                    if active.enforce {
+                        std::process::exit(1);
+                    }
+                }
+            }
             let file = match std::fs::File::create(&active.path) {
                 Ok(file) => file,
                 Err(err) => {
@@ -435,6 +652,140 @@ mod refusal_tests {
         );
         // A boundary: exactly one run is never refused, profiler or not.
         assert!(runs_supported_with_profiling(false, 1).is_ok());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod attribution_tests {
+    use super::{MAX_UNATTRIBUTED_SHARE, check_attribution, unattributed_share};
+
+    /// The threshold is pinned so a change is a deliberate edit that fails this
+    /// test, not a silent loosening (issue #884). If this fails, the constant
+    /// moved: justify the new value in its doc comment before updating the pin.
+    #[test]
+    fn threshold_is_pinned() {
+        assert_eq!(MAX_UNATTRIBUTED_SHARE, 0.02);
+    }
+
+    /// The check must reject the exact ratio that caused the damage (33.95%) and
+    /// name the cause -- a build without frame pointers -- since the whole value
+    /// of the message is telling the next operator what to do. Asserting only on
+    /// an obviously-bad 90% input would let 33.95% through.
+    #[test]
+    fn rejects_the_damaging_ratio_and_names_the_cause() {
+        let err = check_attribution(3395, 10_000).expect_err("33.95% unattributed must be refused");
+        assert!(
+            err.contains("33.95% of samples"),
+            "message must report the measured share, got: {err}"
+        );
+        assert!(
+            err.contains("frame pointers"),
+            "message must name the likely cause, got: {err}"
+        );
+        assert!(
+            err.contains("-C force-frame-pointers=yes"),
+            "message must name the fix, got: {err}"
+        );
+    }
+
+    /// The boundary is what matters: a check that only rejects 90% would let
+    /// 30% through. Exactly at the threshold passes (`>` not `>=`), one sample
+    /// over fails, and the pass case reports the measured share.
+    #[test]
+    fn boundary_at_the_threshold() {
+        // Exactly 2.00% (200 / 10_000): at the threshold, not over it -> pass.
+        let at = check_attribution(200, 10_000).expect("exactly at threshold passes");
+        assert!(
+            (at - 0.02).abs() < 1e-12,
+            "share reported back is 2%, got {at}"
+        );
+
+        // One sample over 2.00% (201 / 10_000 = 2.01%) -> fail.
+        let over = check_attribution(201, 10_000);
+        assert!(
+            over.is_err(),
+            "201/10000 = 2.01% is over the 2% threshold and must fail, got {over:?}"
+        );
+
+        // Well under -> pass.
+        assert!(
+            check_attribution(100, 10_000).is_ok(),
+            "1% is under the threshold"
+        );
+
+        // Empty profile is not an attribution failure.
+        assert_eq!(check_attribution(0, 0).expect("empty profile passes"), 0.0);
+    }
+
+    #[test]
+    fn share_is_zero_for_empty_profile() {
+        assert_eq!(unattributed_share(0, 0), 0.0);
+        assert_eq!(unattributed_share(1, 4), 0.25);
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod frame_pointer_tests {
+    use super::{FP_PROLOGUE_X86_64, MIN_FP_PROLOGUES, check_frame_pointers, count_fp_prologues};
+
+    /// The floor is pinned so lowering it is a deliberate edit that fails this
+    /// test (issue #884, deliverable 3).
+    #[test]
+    fn floor_is_pinned() {
+        assert_eq!(MIN_FP_PROLOGUES, 1000);
+    }
+
+    /// A buffer holding exactly N non-overlapping prologues counts as N, and
+    /// bytes that are not the pattern are not counted.
+    #[test]
+    fn counts_exact_prologues() {
+        let mut image = Vec::new();
+        for _ in 0..5 {
+            image.extend_from_slice(&FP_PROLOGUE_X86_64);
+            // Filler that is not the prologue between occurrences.
+            image.extend_from_slice(&[0x90, 0x90, 0x90]);
+        }
+        assert_eq!(count_fp_prologues(&image), 5);
+        assert_eq!(count_fp_prologues(&[0x90; 64]), 0);
+        assert_eq!(count_fp_prologues(&[]), 0);
+    }
+
+    /// The plausibility floor separates a frame-pointer build from an
+    /// omit-frame-pointers one at the boundary specifically: exactly
+    /// `MIN_FP_PROLOGUES` passes, one fewer fails and reports the count it saw.
+    #[test]
+    fn boundary_at_the_floor() {
+        let make = |n: usize| -> Vec<u8> {
+            let mut v = Vec::with_capacity(n * FP_PROLOGUE_X86_64.len());
+            for _ in 0..n {
+                v.extend_from_slice(&FP_PROLOGUE_X86_64);
+            }
+            v
+        };
+
+        // Exactly at the floor -> pass, returns the count.
+        assert_eq!(
+            check_frame_pointers(&make(MIN_FP_PROLOGUES)).expect("at the floor passes"),
+            MIN_FP_PROLOGUES
+        );
+
+        // One below the floor -> fail, and the message reports the shortfall
+        // and the fix.
+        let err = check_frame_pointers(&make(MIN_FP_PROLOGUES - 1))
+            .expect_err("below the floor must fail");
+        assert!(
+            err.contains(&format!("only {} x86-64", MIN_FP_PROLOGUES - 1)),
+            "message must report the count it saw, got: {err}"
+        );
+        assert!(
+            err.contains("-C force-frame-pointers=yes"),
+            "message must name the fix, got: {err}"
+        );
+
+        // A stripped-looking image (near zero prologues) fails hard.
+        assert!(check_frame_pointers(&[0x90; 4096]).is_err());
     }
 }
 
