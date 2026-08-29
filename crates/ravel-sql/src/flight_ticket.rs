@@ -226,6 +226,18 @@
 //! never reinterpreted under the v6 layout. Consistent with every earlier
 //! extension, this is a version bump on an ephemeral MAC'd blob, not a `.proto`
 //! schema change and not an ADR of its own.
+//!
+//! Version 7 (issue #862) carries each segment's on-object format version
+//! ([`SegmentPin::segment_format_version`], mirroring the field added to
+//! [`SegmentRef`]). The whole-segment fast path routes the ranged column-chunk
+//! read on that version -- it is a v4 capability (ADR-0699 decision 5) -- so a
+//! worker reconstructing the snapshot from the ticket must see each segment's
+//! real version, or it would misroute a v3 logs segment onto the ranged path
+//! and pay a probe to fetch the same whole-object bytes. A v6 (or earlier)
+//! ticket is rejected with [`FlightTicketError::UnsupportedVersion`], never
+//! reinterpreted under the v7 layout. Consistent with every earlier extension,
+//! this is a version bump on an ephemeral MAC'd blob, not a `.proto` schema
+//! change and not an ADR of its own.
 
 use ravel_catalog::{SegmentLevel, SegmentRef};
 use ravel_proto::commit::v1::{ErasurePredicateMatcher, ErasureRequest};
@@ -241,7 +253,7 @@ use crate::declared::{DeclaredColumn, DeclaredType};
 pub const MAX_STATEMENT_LEN: usize = 64 * 1024;
 
 const MAGIC: [u8; 4] = *b"RFT1";
-const VERSION: u8 = 6;
+const VERSION: u8 = 7;
 
 /// Length in bytes of the trailing keyed-MAC tag ([`mac`]).
 const MAC_LEN: usize = 32;
@@ -344,6 +356,13 @@ pub struct SegmentPin {
     /// L1 part as if it were L0 (or vice versa) and read it against the wrong
     /// footer contract.
     pub level: SegmentLevel,
+    /// On-object format version, mirrored from
+    /// [`SegmentRef::segment_format_version`]. Pinned so `DoGet` reconstructs
+    /// the same read-shape routing the coordinator's snapshot carried: the
+    /// whole-segment fast path keeps the ranged column-chunk read on RLOG v4
+    /// objects and off v3 (issue #862). Without it a worker would reconstruct
+    /// every segment at a default version and misroute a v3 logs segment.
+    pub segment_format_version: u32,
 }
 
 impl SegmentPin {
@@ -364,6 +383,7 @@ impl SegmentPin {
             writer_seq: seg.writer_seq,
             created_unix_ns: seg.created_unix_ns,
             level: seg.level.clone(),
+            segment_format_version: seg.segment_format_version,
         }
     }
 
@@ -388,6 +408,7 @@ impl SegmentPin {
             writer_seq: self.writer_seq,
             created_unix_ns: self.created_unix_ns,
             level: self.level.clone(),
+            segment_format_version: self.segment_format_version,
         }
     }
 }
@@ -488,6 +509,7 @@ impl FlightTicket {
             buf.extend_from_slice(seg.writer_id.as_bytes());
             write_len_prefixed(&mut buf, seg.data_object_key.as_bytes())?;
             write_segment_level(&mut buf, &seg.level);
+            write_u32(&mut buf, seg.segment_format_version);
         }
 
         write_u32(&mut buf, u32_len(self.pending_erasure.len())?);
@@ -574,6 +596,7 @@ impl FlightTicket {
             let data_object_key =
                 std::str::from_utf8(key).map_err(|_| FlightTicketError::InvalidUtf8)?;
             let level = read_segment_level(&mut cur)?;
+            let segment_format_version = cur.read_u32()?;
             segments.push(SegmentPin {
                 data_object_key: data_object_key.to_owned(),
                 object_size,
@@ -589,6 +612,7 @@ impl FlightTicket {
                 writer_seq,
                 created_unix_ns,
                 level,
+                segment_format_version,
             });
         }
 
@@ -993,6 +1017,7 @@ mod tests {
             writer_seq: seed * 1_000 + 9,
             created_unix_ns: seed as i64 * 1_000 + 10,
             level,
+            segment_format_version: seed as u32 + 12,
         }
     }
 
@@ -1057,6 +1082,7 @@ mod tests {
                 writer_seq: 4_294_967_296,
                 created_unix_ns: 1_699_999_999_999_999_999,
                 level: level.clone(),
+                segment_format_version: 4,
             };
             let pin = SegmentPin::from_segment_ref(&seg);
             assert_eq!(pin.to_segment_ref(), seg);
@@ -1539,7 +1565,7 @@ mod tests {
             any::<u128>(),
             (any::<u64>(), any::<u64>(), any::<i64>(), any::<u64>()),
             (any::<i64>(), any::<i64>(), any::<u64>(), any::<u64>()),
-            (any::<u32>(), any::<u32>()),
+            (any::<u32>(), any::<u32>(), any::<u32>()),
             segment_level_strategy(),
         )
             .prop_map(
@@ -1549,7 +1575,7 @@ mod tests {
                     writer_id,
                     (writer_epoch, writer_seq, created_unix_ns, object_size),
                     (min_event_ts_ns, max_event_ts_ns, sample_count, series_count),
-                    (ingest_hour_bucket, shard),
+                    (ingest_hour_bucket, shard, segment_format_version),
                     level,
                 )| SegmentPin {
                     data_object_key,
@@ -1566,6 +1592,7 @@ mod tests {
                     writer_seq,
                     created_unix_ns,
                     level,
+                    segment_format_version,
                 },
             )
     }

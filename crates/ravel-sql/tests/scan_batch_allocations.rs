@@ -122,6 +122,7 @@ async fn fixture() -> (Arc<dyn ObjectStoreBackend>, Snapshot) {
             writer_seq: 1,
             created_unix_ns: 1,
             level: SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_segment::SUPPORTED_VERSIONS.newest()),
         }],
         segments_pruned: 0,
         pending_erasure: Vec::new(),

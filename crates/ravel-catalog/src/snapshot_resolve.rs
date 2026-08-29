@@ -1000,6 +1000,7 @@ fn build_segment_ref_from_entry(
                 input_set_hash,
                 part_index,
             },
+            segment_format_version: entry.segment_format_version,
         });
     }
 
@@ -1039,6 +1040,7 @@ fn build_segment_ref_from_entry(
         writer_seq: entry.writer_seq,
         created_unix_ns: entry.created_unix_ns,
         level: SegmentLevel::L0,
+        segment_format_version: entry.segment_format_version,
     })
 }
 
