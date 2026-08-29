@@ -233,6 +233,50 @@ so it joins the assignment rather than vetoing it (ADR-0102 amendment
 2026-08-26, #739 -- as a query-wide conjunct the threshold let one small tail
 object per `(shard, hour)` disqualify an entire 8,424-object snapshot).
 
+### Which read shape each assigned segment takes (#862)
+
+The conjuncts above decide the ASSIGNMENT: no plan phase, one owner per
+segment. They say nothing about the read, because every one of them is about
+which BLOCKS survive and none is about which COLUMNS the projection wants.
+Under RLOG v3 those were the same question — reading every block meant needing
+every byte — and the fast path read every segment whole regardless of
+projection. Under v4 they are independent: a block's pages sit one per column
+chunk inside its row group, so a statement projecting one column of 105 can
+read every block and still leave most of the object untouched.
+
+So the read shape is a per-segment decision taken at open time, arbitrated by
+`LogSegmentFetcher::ranged_projection_pays`:
+
+- **Wide projection** (`SELECT *`, any reference to the merged `attrs` map, or
+  simply enough columns): one whole-object `GetRange::Full`, unchanged. The
+  ranged path would fetch the same bytes and pay a probe and a section GET per
+  object on top.
+- **Narrow projection**: the probe-and-range entry
+  (`scan_accounted_with_tenant`), which brings one coalesced range per surviving
+  `(row group, projected column)` from the same `ColumnSelection` the decode
+  uses (ADR-0699 decision 5).
+
+The arbiter is the fetch layer's existing request-cost model, not a second
+threshold. A saved request is worth `request_cost_bytes` saved bytes
+(`DEFAULT_LOG_REQUEST_COST_BYTES`, ~1.8 MiB, a latency-bandwidth product of the
+store and instance); the ranged protocol adds `WHOLE_OBJECT_REQUEST_MULTIPLE`
+round trips over one whole-object GET; so it pays exactly when it saves more
+than their product. That product is the size crossover the fetch layer already
+compares whole object sizes against, and this is the same comparison with the
+projection moved into the saving: at a projected fraction of 0 the two are the
+same test. Note that `--logs-block-range-threshold` pins BOTH the funnel's
+routing threshold and that crossover, so at its 512 KiB default the effective
+break-even is 512 KiB of saving, not the request-cost-derived 8.9 MiB.
+
+The projected fraction is estimated from column counts (the selection's width
+over the object's column population), because the exact projected byte volume
+is not known until PAGE_DIR is read. It only decides whether reading the
+directory is worth it; the byte-exact call is still the 75% coverage crossover
+one layer down, which falls back to a single whole-object GET when the projected
+pages turn out to cover the object after all. `LogsScanExec` publishes
+`fast_path_ranged_segments` and `fast_path_whole_object_segments` so
+`EXPLAIN ANALYZE` shows the split without counting store requests.
+
 ## Selective (predicated) logs scan: request count
 
 A statement with a block-level predicate — a declared-column or `attrs`
@@ -1842,11 +1886,16 @@ was what measured whether block-level pruning alone captured enough before
 PAGE_DIR shrank the wire fetch to columns.
 
 The predicate-free full-window whole-segment fast path (#693 part 3, above)
-is the one shape where the two axes never move together, by design (#790).
-It issues exactly one whole-object `GetRange::Full` GET per segment
-regardless of projection -- that request count is the fast path's entire
-reason to exist, and #790 does not change it -- so `page_bytes_fetched`
-always equals the object's full stored page bytes, on every projection.
+was, until #862, the one shape where the two axes never moved together, by
+design (#790). It issued exactly one whole-object `GetRange::Full` GET per
+segment regardless of projection, so `page_bytes_fetched` always equalled the
+object's full stored page bytes, on every projection. Since #862 that holds
+only for the projections the fast path still routes to the whole-object read
+(a wide one; see "Which read shape each assigned segment takes" above). A
+narrow projection now takes the ranged entry from inside the fast path, and
+the two axes move together there exactly as they do on every other ranged
+read. The paragraphs below describe the whole-object branch.
+
 What #790 fixed is `page_bytes_decoded`: `scan_whole_accounted_with_tenant`
 already threaded the caller's `ColumnSelection` into the same
 `decode_v4_block` page-level skip every other read path uses, so a one-column
@@ -1867,10 +1916,13 @@ bytes -- those stay exactly where the #693-part-3 fast path already put them. Th
 read cache serves it with zero store requests and zero wire bytes, as the
 tracing section states.
 Reachable from any predicate-free, fully-contained, narrow-projection
-statement that takes the fast path. `SELECT ts, body FROM logs` is the
+statement whose segments the fast path still routes to the whole-object read
+-- since #862 that means one whose saving does not clear the request-cost
+break-even, typically a small object. `SELECT ts, body FROM logs` is the
 worked example below: two selected SQL columns, and the reader also decodes
 the required `stream_ref`, which is why three pages per block survive and not
-one.
+one. The same page-level narrowing applies unchanged on the ranged branch,
+where it also shrinks the wire fetch.
 Object size does not gate it: since #739 the fast path is chosen for a
 segment at or below the block-range threshold too, which is what the
 request-count paragraph above already states.

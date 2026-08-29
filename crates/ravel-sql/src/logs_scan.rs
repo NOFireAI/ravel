@@ -80,11 +80,20 @@
 //!   window fully contains every relevant segment, and there are at least
 //!   `target_partitions` of them, the plan phase is skipped entirely
 //!   ([`LogsScanExec::whole_segment_fast_path`]): whole segments are assigned
-//!   round-robin (the same rule the un-cached path uses), and each is read in one
+//!   round-robin (the same rule the un-cached path uses), with no plan phase and
+//!   no suffix probe from it. How each assigned segment is then READ is a
+//!   separate, per-segment decision (#862, [`PartitionCtx::open_by_column_chunk`]):
+//!   a projection wide enough to want most of the object's bytes takes the one
 //!   whole-object GET ([`LogSegmentFetcher::scan_whole_accounted_with_tenant`]),
-//!   so the request count is exactly one GET per relevant segment, zero suffix
-//!   probes. Object size does not enter into it: a segment at or below the
-//!   block-range threshold is read whole by both entries, on the same
+//!   and a narrow one takes the probe-and-range path
+//!   ([`LogSegmentFetcher::scan_accounted_with_tenant`]), which brings one
+//!   coalesced range per surviving `(row group, projected column)`. Every block
+//!   surviving is what the fast path's conjuncts prove; under RLOG v4 that no
+//!   longer implies every byte is needed. The arbiter is the fetch layer's
+//!   request-cost model ([`LogSegmentFetcher::ranged_projection_pays`]), so the
+//!   ranged path is taken only where the bytes it skips outweigh the round trips
+//!   it adds. Object size does not enter into the ASSIGNMENT: a segment at or
+//!   below the block-range threshold is read whole by both entries, on the same
 //!   `(0, object_size)` cache key, so it joins the assignment without changing
 //!   what is read (#739 -- as a query-wide conjunct the threshold let one small
 //!   tail object per `(shard, hour)` veto an entire 8,424-object snapshot).
@@ -212,7 +221,7 @@
 //! the key to the record's value, which wins). The merged column and the
 //! residual are the whole correctness story.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -311,6 +320,58 @@ fn attr_value_memory(v: &AttrValue) -> usize {
     }
 }
 
+/// Block columns every RLOG object carries whatever the tenant declares: the
+/// ten fixed columns of `ravel_logseg::record` (`ts`, `observed_ts`,
+/// `stream_ref`, `severity_num`, `severity_text`, `body`, `trace_id`, `span_id`,
+/// `flags`, `attrs_raw`). The denominator of [`ResolvedColumns::fraction_of`],
+/// alongside the tenant's declared attribute columns.
+const FIXED_OBJECT_COLUMNS: usize = 10;
+
+/// Object columns a [`ColumnSelection`] decodes whatever it names: `ts` (the
+/// exact ts re-check) and `stream_ref` (stream identity). See
+/// `ravel_logseg::columns`.
+const IMPLICIT_OBJECT_COLUMNS: usize = 2;
+
+/// The column selection one query resolves to, and how wide it is.
+///
+/// The width is what makes the whole-segment fast path's routing decision
+/// possible (issue #862): whether reading a segment by column chunk beats
+/// reading it whole is a question about how much of the object the projection
+/// wants, and `ColumnSelection` itself exposes no count. Both come out of one
+/// walk over the projection in [`resolve_columns`], so they cannot disagree.
+struct ResolvedColumns {
+    /// What the reader decodes, and on a version-4 object what the fetch brings
+    /// (ADR-0699 decision 5).
+    selection: ColumnSelection,
+    /// Distinct object columns the selection names, or `None` when it names
+    /// every column (`SELECT *`, any reference to the merged `attrs` map, or
+    /// the fail-open widening).
+    width: Option<usize>,
+}
+
+impl ResolvedColumns {
+    /// The share of an object's bytes this selection is expected to read, as a
+    /// column-count ratio over the object's column population (the fixed
+    /// columns plus `declared_columns` dynamic ones).
+    ///
+    /// A ratio of counts, not of bytes: per-column byte volumes are not known
+    /// until PAGE_DIR is read, and the point of this figure is to be available
+    /// with no I/O at all. It feeds
+    /// [`LogSegmentFetcher::ranged_projection_pays`], whose threshold is an
+    /// order of magnitude away from the borderline cases, and the byte-exact
+    /// decision still runs one layer down in the fetcher's coverage crossover.
+    /// A tenant carrying dynamic attributes it never declared has more object
+    /// columns than this denominator counts, which over-states the fraction and
+    /// so errs toward the unchanged whole-object read.
+    fn fraction_of(&self, declared_columns: usize) -> f64 {
+        let Some(width) = self.width else {
+            return 1.0;
+        };
+        let total = FIXED_OBJECT_COLUMNS + declared_columns;
+        (width as f64 / total as f64).min(1.0)
+    }
+}
+
 /// The block columns one query needs decoded (ADR-0087 decision 3, extended by
 /// ADR-0090 decision 4).
 ///
@@ -357,22 +418,33 @@ fn resolve_columns(
     content: &[Predicate],
     erasure: &[ErasurePredicate],
     declared: &[DeclaredColumn],
-) -> ColumnSelection {
-    let mut sel = ColumnSelection::fixed_only();
+) -> ResolvedColumns {
+    // Accumulated as sets first, and turned into a `ColumnSelection` below, so
+    // the same walk that decides what to decode also counts how many distinct
+    // object columns that is. Counting from the finished selection is not an
+    // option (it exposes no width), and a second walk beside this one would be
+    // free to drift from it.
+    let mut all = false;
+    let mut all_attrs = false;
+    let mut fixed: BTreeSet<usize> = BTreeSet::new();
+    let mut attrs: BTreeSet<String> = BTreeSet::new();
+
     for &i in projection {
-        sel = match i {
+        match i {
             // `ts` is always decoded; naming it changes nothing.
-            LOG_COL_TS => sel,
-            LOG_COL_OBSERVED_TS => sel.with_observed_ts(),
-            LOG_COL_SEVERITY_NUM => sel.with_severity_num(),
-            LOG_COL_SEVERITY_TEXT => sel.with_severity_text(),
-            LOG_COL_BODY => sel.with_body(),
-            LOG_COL_TRACE_ID => sel.with_trace_id(),
-            LOG_COL_SPAN_ID => sel.with_span_id(),
-            LOG_COL_FLAGS => sel.with_flags(),
+            LOG_COL_TS => {}
+            LOG_COL_OBSERVED_TS
+            | LOG_COL_SEVERITY_NUM
+            | LOG_COL_SEVERITY_TEXT
+            | LOG_COL_BODY
+            | LOG_COL_TRACE_ID
+            | LOG_COL_SPAN_ID
+            | LOG_COL_FLAGS => {
+                fixed.insert(i);
+            }
             // The merged `attrs` map exposes every key, so referencing it at
             // all means every dynamic column plus the overflow.
-            LOG_COL_ATTRS => sel.with_all_attrs(),
+            LOG_COL_ATTRS => all_attrs = true,
             // A declared typed attribute column (index >= FIRST_DECLARED_COL):
             // decode exactly that key's dynamic column, the same per-key path
             // an erasure predicate uses. `i` here is never a fixed index
@@ -384,35 +456,78 @@ fn resolve_columns(
                 .checked_sub(FIRST_DECLARED_COL)
                 .and_then(|k| declared.get(k))
             {
-                Some(dc) => sel.with_attr(dc.key.clone()),
-                None => ColumnSelection::all(),
+                Some(dc) => {
+                    attrs.insert(dc.key.clone());
+                }
+                None => all = true,
             },
-        };
+        }
     }
     for p in content {
-        sel = content_columns(p, sel);
+        content_columns(p, &mut fixed, &mut attrs);
     }
     for p in erasure {
         for (key, _) in p.matchers() {
-            sel = sel.with_attr(key);
+            attrs.insert(key.clone());
         }
     }
-    sel
+
+    let selection = if all {
+        ColumnSelection::all()
+    } else {
+        let mut sel = ColumnSelection::fixed_only();
+        for &i in &fixed {
+            sel = match i {
+                LOG_COL_OBSERVED_TS => sel.with_observed_ts(),
+                LOG_COL_SEVERITY_NUM => sel.with_severity_num(),
+                LOG_COL_SEVERITY_TEXT => sel.with_severity_text(),
+                LOG_COL_BODY => sel.with_body(),
+                LOG_COL_TRACE_ID => sel.with_trace_id(),
+                LOG_COL_SPAN_ID => sel.with_span_id(),
+                // `fixed` is only ever filled from the arm above, which admits
+                // exactly the seven names matched here; `flags` is the last.
+                _ => sel.with_flags(),
+            };
+        }
+        if all_attrs {
+            sel = sel.with_all_attrs();
+        }
+        for key in &attrs {
+            sel = sel.with_attr(key.clone());
+        }
+        sel
+    };
+    let width = if all || all_attrs {
+        None
+    } else {
+        Some(IMPLICIT_OBJECT_COLUMNS + fixed.len() + attrs.len())
+    };
+    ResolvedColumns { selection, width }
 }
 
 /// Add every column an exact content predicate reads. `TsRange` and `StreamIn`
 /// need only the two always-decoded fixed columns.
-fn content_columns(pred: &Predicate, sel: ColumnSelection) -> ColumnSelection {
+fn content_columns(pred: &Predicate, fixed: &mut BTreeSet<usize>, attrs: &mut BTreeSet<String>) {
     match pred {
-        Predicate::And(arms) => arms.iter().fold(sel, |acc, a| content_columns(a, acc)),
+        Predicate::And(arms) => {
+            for a in arms {
+                content_columns(a, fixed, attrs);
+            }
+        }
         // `NumRange` is prune-only (ADR-0095 decision 6): it never reaches the
         // exact content channel, so it reads no columns, same as ts/stream. The
         // planner-side pushdown that would emit it is #278's job.
-        Predicate::TsRange { .. } | Predicate::StreamIn(_) | Predicate::NumRange { .. } => sel,
+        Predicate::TsRange { .. } | Predicate::StreamIn(_) | Predicate::NumRange { .. } => {}
         Predicate::HasWord { field, .. } | Predicate::Equals { field, .. } => match field {
-            FieldSel::Body => sel.with_body(),
-            FieldSel::SeverityText => sel.with_severity_text(),
-            FieldSel::Attr(name) => sel.with_attr(name.clone()),
+            FieldSel::Body => {
+                fixed.insert(LOG_COL_BODY);
+            }
+            FieldSel::SeverityText => {
+                fixed.insert(LOG_COL_SEVERITY_TEXT);
+            }
+            FieldSel::Attr(name) => {
+                attrs.insert(name.clone());
+            }
         },
     }
 }
@@ -545,6 +660,12 @@ pub struct LogsScanExec {
     /// `projection`, `content`, `erasure`, and `declared` (see
     /// [`resolve_columns`]).
     columns: ColumnSelection,
+    /// The share of an object's bytes `columns` is expected to read
+    /// ([`ResolvedColumns::fraction_of`]), resolved once beside it. This is what
+    /// the whole-segment fast path routes on (issue #862): it is the only input
+    /// [`LogSegmentFetcher::ranged_projection_pays`] needs that the catalog
+    /// summary does not already carry.
+    projected_fraction: f64,
     /// The tenant's declared typed attribute columns (ADR-0090), in schema-
     /// append order. Index `k` here is schema index `FIRST_DECLARED_COL + k`.
     /// Empty for a zero-declaration query, which is byte-identical to the
@@ -678,6 +799,14 @@ struct BlockMetrics {
     /// Published once by partition 0, so a report can tell a fully-skip-planned
     /// query from one still paying the plan-phase read.
     plan_full_reads: Count,
+    /// Whole-segment fast-path segments this partition opened with one
+    /// whole-object GET, and the ones it opened by column chunk instead (issue
+    /// #862). Which way the request-cost model routed a statement is otherwise
+    /// invisible short of counting store requests, and the two together are this
+    /// partition's fast-path segment count, so a report can see both the split
+    /// and that nothing fell through it.
+    fast_path_whole_object_segments: Count,
+    fast_path_ranged_segments: Count,
 }
 
 impl BlockMetrics {
@@ -692,6 +821,21 @@ impl BlockMetrics {
             columnar_batches: MetricBuilder::new(metrics).counter("columnar_batches", partition),
             rowpath_batches: MetricBuilder::new(metrics).counter("rowpath_batches", partition),
             plan_full_reads: MetricBuilder::new(metrics).counter("plan_full_reads", partition),
+            fast_path_whole_object_segments: MetricBuilder::new(metrics)
+                .counter("fast_path_whole_object_segments", partition),
+            fast_path_ranged_segments: MetricBuilder::new(metrics)
+                .counter("fast_path_ranged_segments", partition),
+        }
+    }
+
+    /// Records which way the whole-segment fast path routed one segment (issue
+    /// #862). Called once per segment, at its first open; an `attrs_raw`
+    /// fallback re-opens the same segment the same way and does not re-count.
+    fn record_fast_path_route(&self, by_column_chunk: bool) {
+        if by_column_chunk {
+            self.fast_path_ranged_segments.add(1);
+        } else {
+            self.fast_path_whole_object_segments.add(1);
         }
     }
 
@@ -923,7 +1067,9 @@ impl LogsScanExec {
                 )));
             }
         }
-        let columns = resolve_columns(&projection, &content, &erasure, &declared);
+        let resolved = resolve_columns(&projection, &content, &erasure, &declared);
+        let projected_fraction = resolved.fraction_of(declared.len());
+        let columns = resolved.selection;
         let projected = full.project(&projection)?;
         // The row-ref column is synthesized per row from the scan's own cursor
         // position, not decoded, so it contributes nothing to `columns` and
@@ -951,6 +1097,7 @@ impl LogsScanExec {
             erasure,
             projection: Arc::new(projection),
             columns,
+            projected_fraction,
             declared,
             column_stats: None,
             full_schema: full,
@@ -1317,6 +1464,19 @@ impl LogsScanExec {
     /// state. So a sub-threshold segment reads identically whichever entry opens
     /// it, and it can join the whole-segment assignment while the above-threshold
     /// segments around it keep the probe the fast path removes.
+    ///
+    /// # This decides the assignment, not the read (issue #862)
+    ///
+    /// Every conjunct here is about which BLOCKS survive, and the answer it
+    /// establishes is always "all of them" -- which is what lets the plan phase
+    /// go. None of them is about which COLUMNS the projection wants, and under
+    /// RLOG v4 those are independent questions: reading every block no longer
+    /// means needing every byte. So the read shape is chosen per segment at open
+    /// time by [`PartitionCtx::open_by_column_chunk`], and a narrow projection
+    /// takes the probe-and-range path from inside this fast path rather than
+    /// falling out of it. Rejecting here instead would be strictly worse: the
+    /// plan-then-stripe path it falls to adds a whole plan pass per segment, so
+    /// a narrow statement would pay MORE requests to move fewer bytes.
     fn whole_segment_fast_path(&self, query: &LogQuery) -> Result<usize, FastPathRejection> {
         // Checked ahead of `is_block_predicate_free` (which folds erasure in)
         // only so the recorded reason names erasure rather than the generic
@@ -1721,6 +1881,7 @@ impl ExecutionPlan for LogsScanExec {
             tenant_hash: self.tenant_hash,
             query,
             columns: self.columns.clone(),
+            projected_fraction: self.projected_fraction,
             accounting: self.accounting.clone(),
         });
 
@@ -2030,7 +2191,36 @@ struct PartitionCtx {
     tenant_hash: TenantHash,
     query: LogQuery,
     columns: ColumnSelection,
+    /// [`LogsScanExec::projected_fraction`], carried so the whole-segment fast
+    /// path can route each segment as it opens it (issue #862).
+    projected_fraction: f64,
     accounting: QueryAccounting,
+}
+
+impl PartitionCtx {
+    /// Whether the whole-segment fast path should open `seg` by column chunk
+    /// rather than with one whole-object GET (issue #862).
+    ///
+    /// The fast path's own conjuncts ([`LogsScanExec::whole_segment_fast_path`])
+    /// prove every block of `seg` survives, which is why the whole-object read
+    /// was unconditionally optimal under RLOG v3: reading every block meant
+    /// needing every byte. Under v4 it does not. Every block surviving says
+    /// nothing about how many COLUMNS the projection wants, and the ranged entry
+    /// point ([`open_segment_ranged`]) already fetches one coalesced range per
+    /// surviving `(row group, projected column)` from the very same
+    /// [`ColumnSelection`] (ADR-0699 decision 5), so a narrow projection can
+    /// leave most of the object unread.
+    ///
+    /// The arbiter is the fetch layer's request-cost model, not a threshold
+    /// invented here: the ranged path pays only when the bytes the projection
+    /// skips outweigh the round trips the protocol adds. That keeps a wide
+    /// projection (`SELECT *`, or any reference to the merged `attrs` map) on
+    /// the unchanged whole-object read, where it belongs -- the ranged path
+    /// would fetch the same bytes and pay a probe on top.
+    fn open_by_column_chunk(&self, seg: &SegmentRef) -> bool {
+        self.fetcher
+            .ranged_projection_pays(seg.object_size, self.projected_fraction)
+    }
 }
 
 type OpenFuture = Pin<Box<dyn Future<Output = DFResult<Option<LogSegmentScan>>> + Send>>;
@@ -2068,7 +2258,9 @@ fn open_segment_subset(
 /// column-projected scan over all of its blocks (#693 part 3, deliverable 1).
 /// Used only on the predicate-free full-window whole-segment path, where the
 /// segment is assigned to exactly one partition and every block survives, so a
-/// whole-object read is optimal and no plan phase or suffix probe is needed.
+/// whole-object read is optimal for a projection wide enough to want most of
+/// the object's bytes ([`PartitionCtx::open_by_column_chunk`]) and no plan phase
+/// or suffix probe is needed.
 fn open_segment_whole(ctx: Arc<PartitionCtx>, seg: SegmentRef) -> OpenFuture {
     Box::pin(async move {
         let scan = ctx
@@ -2084,6 +2276,45 @@ fn open_segment_whole(ctx: Arc<PartitionCtx>, seg: SegmentRef) -> OpenFuture {
             .map_err(SqlError::from)?;
         Ok(scan)
     })
+}
+
+/// The whole-segment fast path's other entry point (issue #862): open the same
+/// whole segment through the probe-and-range protocol, which brings one
+/// coalesced range per surviving `(row group, projected column)` instead of
+/// every byte of the object.
+///
+/// Taken when [`PartitionCtx::open_by_column_chunk`] judges the skipped bytes
+/// worth the extra round trips. It passes the SAME [`ColumnSelection`] the
+/// decode uses, which is what ADR-0699 decision 5 requires of a version-4 fetch,
+/// and no block-index subset: the fast path's conjuncts already proved every
+/// block of this segment survives, so the ranged read's candidate set is the
+/// whole segment and the rows it yields are the rows
+/// [`open_segment_whole`] would have yielded.
+fn open_segment_ranged(ctx: Arc<PartitionCtx>, seg: SegmentRef) -> OpenFuture {
+    Box::pin(async move {
+        let scan = ctx
+            .fetcher
+            .scan_accounted_with_tenant(
+                &seg,
+                ctx.tenant_hash,
+                &ctx.query,
+                &ctx.columns,
+                &ctx.accounting,
+            )
+            .await
+            .map_err(SqlError::from)?;
+        Ok(scan)
+    })
+}
+
+/// One segment's open on the whole-segment fast path, routed by
+/// [`PartitionCtx::open_by_column_chunk`].
+fn open_segment_fast(ctx: Arc<PartitionCtx>, seg: SegmentRef, by_column_chunk: bool) -> OpenFuture {
+    if by_column_chunk {
+        open_segment_ranged(ctx, seg)
+    } else {
+        open_segment_whole(ctx, seg)
+    }
 }
 
 enum LogScanState {
@@ -2238,10 +2469,11 @@ struct LogScanStream {
     stripe_blocks: bool,
     /// The predicate-free full-window whole-segment fast path (#693 part 3,
     /// deliverable 1). When set, `work` was filled by [`owned_whole_segments`]
-    /// with no plan phase, each segment is opened with one whole-object GET
-    /// ([`open_segment_whole`]), and the segment's whole-segment prune totals are
-    /// recorded per segment at exhaustion (each segment has one owner, so no
-    /// double count) instead of by partition 0 during planning.
+    /// with no plan phase, each segment is opened through [`open_segment_fast`]
+    /// (one whole-object GET, or the ranged path when the projection is narrow
+    /// enough to pay for it -- #862), and the segment's whole-segment prune
+    /// totals are recorded per segment at exhaustion (each segment has one owner,
+    /// so no double count) instead of by partition 0 during planning.
     fast_whole_segment: bool,
     /// Every segment in the snapshot, snapshot order, shared with the exec. The
     /// owned-work computation indexes this by segment position.
@@ -2515,10 +2747,18 @@ impl Stream for LogScanStream {
                         this.seg_columnar_blocks = 0;
                         this.block_cursor = 0;
                         // Whole-segment fast path reads the object in one GET
-                        // (#693 part 3); the striped path opens only this
-                        // partition's subset, reusing the plan footer if any.
+                        // (#693 part 3), or by column chunk when the projection
+                        // is narrow enough to pay for the extra round trips
+                        // (#862); the striped path opens only this partition's
+                        // subset, reusing the plan footer if any.
                         this.state = if this.fast_whole_segment {
-                            LogScanState::Opening(open_segment_whole(Arc::clone(&this.ctx), seg))
+                            let by_chunk = this.ctx.open_by_column_chunk(&seg);
+                            this.blocks.record_fast_path_route(by_chunk);
+                            LogScanState::Opening(open_segment_fast(
+                                Arc::clone(&this.ctx),
+                                seg,
+                                by_chunk,
+                            ))
                         } else {
                             LogScanState::Opening(open_segment_subset(
                                 Arc::clone(&this.ctx),
@@ -2679,8 +2919,13 @@ impl Stream for LogScanStream {
                                     ));
                                 }
                             };
+                            // Re-opened through the same routing decision the
+                            // first open took (#862), and deliberately not
+                            // re-counted: the route metric counts segments, not
+                            // opens.
                             let fut = if this.fast_whole_segment {
-                                open_segment_whole(Arc::clone(&this.ctx), seg)
+                                let by_chunk = this.ctx.open_by_column_chunk(&seg);
+                                open_segment_fast(Arc::clone(&this.ctx), seg, by_chunk)
                             } else {
                                 open_segment_subset(
                                     Arc::clone(&this.ctx),
@@ -3689,5 +3934,112 @@ mod columnar_lookup_tests {
             assert!(ints.is_valid(i), "row {i} is non-null");
             assert_eq!(ints.value(i), want, "row {i}");
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod projection_width_tests {
+    //! [`ResolvedColumns::width`] and the fraction it feeds the whole-segment
+    //! fast path's routing decision (issue #862).
+    //!
+    //! The width counts DISTINCT OBJECT COLUMNS, which is not the length of the
+    //! projection: `ts` and `stream_ref` are always decoded and never named, a
+    //! declared column and an erasure matcher on the same key are one column,
+    //! and the merged `attrs` map is every dynamic column at once.
+
+    use super::*;
+
+    /// Ten declared columns, so the object's column population is
+    /// `FIXED_OBJECT_COLUMNS + 10 = 20`, the denominator every case below uses.
+    fn declared() -> Vec<DeclaredColumn> {
+        (0..10)
+            .map(|k| DeclaredColumn::new(format!("d{k:02}"), DeclaredType::Str))
+            .collect()
+    }
+
+    fn resolve(projection: &[usize]) -> ResolvedColumns {
+        resolve_columns(projection, &[], &[], &declared())
+    }
+
+    /// `ts` plus one declared column: three object columns, the q07 shape.
+    #[test]
+    fn a_single_declared_column_is_three_object_columns() {
+        let r = resolve(&[LOG_COL_TS, FIRST_DECLARED_COL]);
+        assert_eq!(r.width, Some(3));
+        assert_eq!(r.fraction_of(10), 3.0 / 20.0);
+        assert!(!r.selection.is_all());
+        assert!(!r.selection.wants_all_attrs());
+    }
+
+    /// Naming `ts` alone adds nothing: it is decoded either way.
+    #[test]
+    fn ts_alone_is_the_two_implicit_columns() {
+        let r = resolve(&[LOG_COL_TS]);
+        assert_eq!(r.width, Some(IMPLICIT_OBJECT_COLUMNS));
+        assert_eq!(r.fraction_of(10), 2.0 / 20.0);
+    }
+
+    /// The merged `attrs` map means every dynamic column plus the overflow, so
+    /// the width is unknown-and-wide and the fraction saturates. This is the
+    /// `SELECT *` case, which must keep the whole-object read.
+    #[test]
+    fn the_attrs_map_widens_to_every_column() {
+        let r = resolve(&[LOG_COL_TS, LOG_COL_BODY, LOG_COL_ATTRS]);
+        assert_eq!(r.width, None);
+        assert_eq!(r.fraction_of(10), 1.0);
+        assert!(r.selection.wants_all_attrs());
+    }
+
+    /// Every fixed column and every declared column, but not `attrs`: nineteen
+    /// of twenty, which is wide by arithmetic rather than by the `attrs`
+    /// shortcut.
+    #[test]
+    fn every_column_but_attrs_is_nineteen_of_twenty() {
+        let mut projection: Vec<usize> = (0..LOG_COL_ATTRS).collect();
+        projection.extend((0..10).map(|k| FIRST_DECLARED_COL + k));
+        let r = resolve(&projection);
+        assert_eq!(r.width, Some(19));
+        assert_eq!(r.fraction_of(10), 19.0 / 20.0);
+    }
+
+    /// A repeated key counts once, whichever contributor names it: the declared
+    /// projection and an erasure matcher on the same attribute resolve to the
+    /// same object column.
+    #[test]
+    fn a_key_named_twice_counts_once() {
+        let erasure = vec![ErasurePredicate::windowless(vec![(
+            "d00".to_string(),
+            "v".to_string(),
+        )])];
+        let r = resolve_columns(
+            &[LOG_COL_TS, FIRST_DECLARED_COL],
+            &[],
+            &erasure,
+            &declared(),
+        );
+        assert_eq!(r.width, Some(3));
+    }
+
+    /// A content predicate contributes its column to both the selection and the
+    /// width, so a residual filter's column is never counted as free.
+    #[test]
+    fn a_content_predicate_widens_the_count() {
+        let content = vec![Predicate::HasWord {
+            field: FieldSel::Body,
+            word: "x".to_string(),
+        }];
+        let r = resolve_columns(&[LOG_COL_TS], &content, &[], &declared());
+        assert_eq!(r.width, Some(3), "ts, stream_ref, body");
+    }
+
+    /// A tenant with no declared columns has a ten-column object population, so
+    /// the same two-column selection is a larger share of it. The denominator is
+    /// the tenant's, not a constant.
+    #[test]
+    fn the_denominator_follows_the_declared_set() {
+        let r = resolve_columns(&[LOG_COL_TS], &[], &[], &[]);
+        assert_eq!(r.width, Some(2));
+        assert_eq!(r.fraction_of(0), 2.0 / 10.0);
     }
 }
