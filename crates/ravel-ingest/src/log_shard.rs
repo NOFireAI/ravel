@@ -854,10 +854,35 @@ impl LogShardActor {
                 msg = self.rx.recv() => {
                     match msg {
                         Some(LogShardMsg::Write { tenant, records, ack, charge }) => {
-                            self.handle_write(tenant, records, ack, charge).await;
+                            // Per-shard skew (issue #865), identical bracketing
+                            // to `crate::shard::ShardActor::run`: time the
+                            // serial on-actor section only. `handle_write`
+                            // returns once the flush task is spawned, so this
+                            // delta excludes the flush -- but NOT the
+                            // `max_inflight_flushes` acquire that precedes the
+                            // spawn, which at the bound parks here for a prior
+                            // flush's remaining duration. That wait is
+                            // backpressure, not actor work, and is already
+                            // counted (once) as `flush_permit_wait_ns`, so
+                            // subtract it rather than let it read as "the actor
+                            // is busy" whenever flushing is the real bottleneck.
+                            let started_ns = self.clock.now_ns();
+                            let permit_wait_ns =
+                                self.handle_write(tenant, records, ack, charge).await;
+                            let elapsed_ns =
+                                self.clock.now_ns().saturating_sub(started_ns).max(0) as u64;
+                            let on_actor_ns = elapsed_ns.saturating_sub(permit_wait_ns);
+                            self.metrics.record_shard_processed(self.shard, on_actor_ns);
                         }
                         Some(LogShardMsg::WriteColumnar { tenant, batch, ack, charge }) => {
-                            self.handle_write_columnar(tenant, *batch, ack, charge).await;
+                            let started_ns = self.clock.now_ns();
+                            let permit_wait_ns = self
+                                .handle_write_columnar(tenant, *batch, ack, charge)
+                                .await;
+                            let elapsed_ns =
+                                self.clock.now_ns().saturating_sub(started_ns).max(0) as u64;
+                            let on_actor_ns = elapsed_ns.saturating_sub(permit_wait_ns);
+                            self.metrics.record_shard_processed(self.shard, on_actor_ns);
                         }
                         Some(LogShardMsg::FlushNow { done }) => {
                             self.flush_all(FlushTrigger::Manual).await;
@@ -901,16 +926,20 @@ impl LogShardActor {
         }
     }
 
+    /// Returns the injected-`Clock` nanoseconds this call spent parked on the
+    /// `max_inflight_flushes` semaphore (0 when it opened no flush), so the
+    /// actor loop can subtract that wait from the `on_actor_ns` it reports
+    /// (issue #865).
     async fn handle_write(
         &mut self,
         tenant: TenantId,
         records: Vec<NormalizedLogRecord>,
         ack: Option<LogAck>,
         charge: Option<Arc<IngestByteCharge>>,
-    ) {
+    ) -> u64 {
         if records.is_empty() && ack.is_none() {
             // Nothing buffered: dropping `charge` here refunds its bytes.
-            return;
+            return 0;
         }
         let arrival_ns = self.clock.now_ns();
         let records_len = records.len() as u64;
@@ -934,7 +963,7 @@ impl LogShardActor {
                 if let Some(ack) = ack {
                     let _ = ack.send(Err(err));
                 }
-                return;
+                return 0;
             }
         };
         #[cfg(feature = "stage-timing")]
@@ -956,25 +985,27 @@ impl LogShardActor {
             .map(|b| b.est_bytes >= target_bytes)
             .unwrap_or(false);
         if should_flush && let Some(buf) = self.tenants.remove(&tenant) {
-            self.flush_tenant(tenant, buf, FlushTrigger::Size).await;
+            return self.flush_tenant(tenant, buf, FlushTrigger::Size).await;
         }
+        0
     }
 
     /// The columnar counterpart of [`Self::handle_write`] (ADR-0109 decision 5):
     /// buffers one already-partitioned [`ColumnarLogBatch`] for `tenant`,
     /// refusing fail-loud if the buffer already holds row-major records. The
     /// flush-trigger accounting (`est_bytes >= target_bytes`), the charge and
-    /// waiter handling, and the size-flush path are identical to the row path.
+    /// waiter handling, and the size-flush path are identical to the row path,
+    /// as is the flush-permit wait it returns (see [`Self::handle_write`]).
     async fn handle_write_columnar(
         &mut self,
         tenant: TenantId,
         batch: ColumnarLogBatch,
         ack: Option<LogAck>,
         charge: Option<Arc<IngestByteCharge>>,
-    ) {
+    ) -> u64 {
         if batch.is_empty() && ack.is_none() {
             // Nothing buffered: dropping `charge` here refunds its bytes.
-            return;
+            return 0;
         }
         let arrival_ns = self.clock.now_ns();
         let records_len = batch.num_rows as u64;
@@ -995,7 +1026,7 @@ impl LogShardActor {
                 if let Some(ack) = ack {
                     let _ = ack.send(Err(err));
                 }
-                return;
+                return 0;
             }
         };
         #[cfg(feature = "stage-timing")]
@@ -1015,8 +1046,9 @@ impl LogShardActor {
             .map(|b| b.est_bytes >= target_bytes)
             .unwrap_or(false);
         if should_flush && let Some(buf) = self.tenants.remove(&tenant) {
-            self.flush_tenant(tenant, buf, FlushTrigger::Size).await;
+            return self.flush_tenant(tenant, buf, FlushTrigger::Size).await;
         }
+        0
     }
 
     /// A buffer with a strict-mode waiter or at least `min_flush_bytes`
@@ -1048,7 +1080,10 @@ impl LogShardActor {
             .collect();
         for tenant in due {
             if let Some(buf) = self.tenants.remove(&tenant) {
-                self.flush_tenant(tenant, buf, FlushTrigger::Age).await;
+                // The permit wait is reported by `flush_tenant` itself; there is
+                // no `on_actor_ns` span to subtract it from here, because an age
+                // tick is not a `Write` message.
+                let _permit_wait_ns = self.flush_tenant(tenant, buf, FlushTrigger::Age).await;
             }
         }
     }
@@ -1064,7 +1099,7 @@ impl LogShardActor {
         let tenants: Vec<TenantId> = self.tenants.keys().cloned().collect();
         for tenant in tenants {
             if let Some(buf) = self.tenants.remove(&tenant) {
-                self.flush_tenant(tenant, buf, trigger).await;
+                let _permit_wait_ns = self.flush_tenant(tenant, buf, trigger).await;
             }
         }
         self.join_all_flushes().await;
@@ -1097,7 +1132,17 @@ impl LogShardActor {
     /// An empty buffer never reaches the semaphore or a spawned task: there is
     /// nothing to encode, and a flush identity pinned for nothing would burn a
     /// `seq` for no object.
-    async fn flush_tenant(&mut self, tenant: TenantId, buf: LogTenantBuf, trigger: FlushTrigger) {
+    ///
+    /// Returns the injected-`Clock` nanoseconds spent parked on the
+    /// `max_inflight_flushes` semaphore (0 on every path that returns before
+    /// reaching it), which the caller subtracts from its own `on_actor_ns`
+    /// (issue #865).
+    async fn flush_tenant(
+        &mut self,
+        tenant: TenantId,
+        buf: LogTenantBuf,
+        trigger: FlushTrigger,
+    ) -> u64 {
         let LogTenantBuf {
             content,
             min_ingest_ts_ns,
@@ -1118,13 +1163,13 @@ impl LogShardActor {
             BufContent::Empty => {
                 drop(charges);
                 debug_assert!(waiters.is_empty());
-                return;
+                return 0;
             }
             BufContent::Rows(records) => {
                 if records.is_empty() {
                     drop(charges);
                     debug_assert!(waiters.is_empty());
-                    return;
+                    return 0;
                 }
                 FlushPayload::Rows(records)
             }
@@ -1132,7 +1177,7 @@ impl LogShardActor {
                 if batches.iter().all(|b| b.is_empty()) {
                     drop(charges);
                     debug_assert!(waiters.is_empty());
-                    return;
+                    return 0;
                 }
                 FlushPayload::Columnar(batches)
             }
@@ -1149,7 +1194,7 @@ impl LogShardActor {
                 self.metrics.record_abandoned_input_rejected();
                 self.ctx
                     .ack_waiters(waiters, Err(LogWriteError::SegmentBuild(msg)));
-                return;
+                return 0;
             }
         };
         let deadline_ns =
@@ -1185,6 +1230,17 @@ impl LogShardActor {
         // awaited from `handle_write`/`flush_aged`/`flush_all`, that park keeps
         // the actor from pulling its next channel message, exactly the
         // backpressure path the bounded mpsc already relies on.
+        //
+        // Per-shard skew (issue #865), same bracketing as
+        // `crate::shard::ShardActor::flush_tenant`: that park is its own span,
+        // and it belongs to neither the actor's merge-and-pin work nor the
+        // spawned flush's own span. What elapses here is a PRIOR flush's
+        // remaining duration, so folding it into `on_actor_ns` would report an
+        // actor bottleneck at exactly the moment flushing is the bottleneck.
+        // This is the figure that says whether `max_inflight_flushes` is the
+        // binding window on a bulk load (issue #800): it stays at zero unless a
+        // shard is actually asked for a second concurrent flush.
+        let permit_wait_start_ns = self.clock.now_ns();
         let permit = match Arc::clone(&self.semaphore).acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => panic!(
@@ -1192,17 +1248,37 @@ impl LogShardActor {
                 self.shard
             ),
         };
+        let permit_wait_ns = self
+            .clock
+            .now_ns()
+            .saturating_sub(permit_wait_start_ns)
+            .max(0) as u64;
+        self.metrics
+            .record_shard_flush_permit_wait_ns(self.shard, permit_wait_ns);
         self.metrics.record_inflight_flush_delta(self.shard, 1);
         let guard = InFlightFlushGuard {
             metrics: Arc::clone(&self.metrics),
             shard: self.shard,
         };
         let ctx = Arc::clone(&self.ctx);
+        // Per-shard skew (issue #865): time the whole flush, which runs here off
+        // the actor (ADR-0067). Bracketing `run_flush` from outside, rather than
+        // inside it, keeps the measurement out of the pinned-identity path and
+        // captures every exit `run_flush` takes, abandonment included. The
+        // bracket opens inside the spawned task, with the permit already held,
+        // so the wait for that permit is not counted twice.
+        let clock = Arc::clone(&self.clock);
+        let metrics = Arc::clone(&self.metrics);
+        let shard = self.shard;
         self.flushes.spawn(async move {
             let _permit = permit;
             let _guard = guard;
+            let started_ns = clock.now_ns();
             ctx.run_flush(pinned).await;
+            let off_actor_ns = clock.now_ns().saturating_sub(started_ns).max(0) as u64;
+            metrics.record_shard_off_actor_ns(shard, off_actor_ns);
         });
+        permit_wait_ns
     }
 }
 

@@ -209,7 +209,11 @@ pub struct IngestMetrics {
     /// slice is still dropped rather than counted, matching the best-effort
     /// nature of this observability; [`SHARD_SKEW_CAPACITY`] is chosen so no
     /// generation the catalog accepts can reach that case.
-    shard_skew: Box<[ShardSkewAtomics]>,
+    ///
+    /// The accumulator itself is [`ShardSkew`], shared with the logs pipeline's
+    /// [`crate::log_metrics::LogIngestMetrics`] so both report the same three
+    /// spans under the same ordering rules.
+    shard_skew: ShardSkew,
     /// Metadata-record GETs issued by the metric metadata sink's flush window
     /// (ADR-0085 decision 1). The ADR budgets one GET per tenant per window
     /// with a non-empty pending set, so this is the counter an operator checks
@@ -281,6 +285,122 @@ struct ShardSkewAtomics {
     on_actor_ns: AtomicU64,
     flush_permit_wait_ns: AtomicU64,
     off_actor_ns: AtomicU64,
+}
+
+/// The per-shard skew accumulator (issue #865), shared by the metrics pipeline's
+/// [`IngestMetrics`] and the logs pipeline's
+/// [`crate::log_metrics::LogIngestMetrics`]. Both pipelines have the same
+/// actor/semaphore/spawned-flush shape (ADR-0067), so both partition a shard's
+/// flush pipeline into the same three spans described on [`ShardSkewStats`];
+/// keeping one implementation keeps the ordering guarantee documented on
+/// [`ShardSkewAtomics`] from having to hold in two places.
+///
+/// Lock-free: one [`ShardSkewAtomics`] per shard index, addressed by a single
+/// bounds-checked index. The per-message path must not serialise every shard on
+/// one lock, or it would add a contention point to the very path #865 measures.
+#[derive(Debug, Default)]
+pub(crate) struct ShardSkew {
+    shards: Box<[ShardSkewAtomics]>,
+}
+
+impl ShardSkew {
+    /// Preallocates `max(shard_count, SHARD_SKEW_CAPACITY)` per-shard cells. See
+    /// [`SHARD_SKEW_CAPACITY`] for why the capacity is not `shard_count`.
+    /// `ShardSkew::default()` allocates none, so an accumulator built that way
+    /// records nothing.
+    pub(crate) fn with_capacity(shard_count: u32) -> Self {
+        let capacity = shard_count.max(SHARD_SKEW_CAPACITY) as usize;
+        ShardSkew {
+            shards: (0..capacity).map(|_| ShardSkewAtomics::default()).collect(),
+        }
+    }
+
+    /// One `Write` message sent into shard `shard`'s channel, counted at the
+    /// router's `send`, so `messages_enqueued - messages_processed` is the depth
+    /// still in the channel.
+    pub(crate) fn record_enqueued(&self, shard: u32) {
+        if let Some(s) = self.shards.get(shard as usize) {
+            s.messages_enqueued.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// One `Write` message pulled and handled by shard `shard`'s actor, plus the
+    /// injected-`Clock` nanoseconds the actor spent handling it. The
+    /// `on_actor_ns` addend is stored before the processed count is bumped, and
+    /// the count is bumped with `Release` against the `Acquire` load in
+    /// [`Self::by_shard`], so a concurrent reader is at worst one message behind
+    /// on the count and never credits a processed message with no time. See
+    /// [`ShardSkewAtomics`] for why that one direction is the one worth paying
+    /// an ordering for.
+    pub(crate) fn record_processed(&self, shard: u32, on_actor_ns: u64) {
+        if let Some(s) = self.shards.get(shard as usize) {
+            s.on_actor_ns.fetch_add(on_actor_ns, Ordering::Relaxed);
+            s.messages_processed.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    /// One flush trigger's injected-`Clock` wait on shard `shard`'s
+    /// `max_inflight_flushes` semaphore. The caller subtracts the same figure
+    /// from the `on_actor_ns` it reports for that message: the wait is a prior
+    /// flush's duration, so charging it as actor work would say "the actor is
+    /// busy" exactly when the truth is "flushes are backed up".
+    pub(crate) fn record_flush_permit_wait_ns(&self, shard: u32, wait_ns: u64) {
+        if let Some(s) = self.shards.get(shard as usize) {
+            s.flush_permit_wait_ns.fetch_add(wait_ns, Ordering::Relaxed);
+        }
+    }
+
+    /// One completed flush task's injected-`Clock` nanoseconds. Bracketed inside
+    /// the spawned task with the permit already held (ADR-0067), so it re-counts
+    /// neither `on_actor_ns` nor the `flush_permit_wait_ns` that preceded the
+    /// spawn.
+    pub(crate) fn record_off_actor_ns(&self, shard: u32, off_actor_ns: u64) {
+        if let Some(s) = self.shards.get(shard as usize) {
+            s.off_actor_ns.fetch_add(off_actor_ns, Ordering::Relaxed);
+        }
+    }
+
+    /// Point-in-time per-shard figures, sorted by shard index. A shard with no
+    /// recorded activity is simply absent. `queue_depth` is derived here as
+    /// `messages_enqueued - messages_processed`, saturating at 0.
+    pub(crate) fn by_shard(&self) -> Vec<(u32, ShardSkewStats)> {
+        // Preallocated by shard index, so iteration is already shard-ordered. A
+        // shard that never enqueued or processed a message reads all-zero and is
+        // omitted, matching the prior map's "absent, equivalent to all-zero".
+        self.shards
+            .iter()
+            .enumerate()
+            .filter_map(|(shard, s)| {
+                let messages_enqueued = s.messages_enqueued.load(Ordering::Relaxed);
+                // Acquire, and before `on_actor_ns`: pairs with the `Release`
+                // in `record_processed` so every counted message's time addend
+                // is already visible below.
+                let messages_processed = s.messages_processed.load(Ordering::Acquire);
+                let on_actor_ns = s.on_actor_ns.load(Ordering::Relaxed);
+                let flush_permit_wait_ns = s.flush_permit_wait_ns.load(Ordering::Relaxed);
+                let off_actor_ns = s.off_actor_ns.load(Ordering::Relaxed);
+                if messages_enqueued == 0
+                    && messages_processed == 0
+                    && on_actor_ns == 0
+                    && flush_permit_wait_ns == 0
+                    && off_actor_ns == 0
+                {
+                    return None;
+                }
+                Some((
+                    shard as u32,
+                    ShardSkewStats {
+                        messages_enqueued,
+                        messages_processed,
+                        queue_depth: messages_enqueued.saturating_sub(messages_processed),
+                        on_actor_ns,
+                        flush_permit_wait_ns,
+                        off_actor_ns,
+                    },
+                ))
+            })
+            .collect()
+    }
 }
 
 /// Point-in-time per-shard ingest-skew figures (issue #865). Read via
@@ -410,9 +530,8 @@ impl IngestMetrics {
     /// `IngestMetrics::default()` allocates none, which suits the many tests
     /// and sinks that never touch the per-shard counters.
     pub fn new(shard_count: u32) -> Self {
-        let capacity = shard_count.max(SHARD_SKEW_CAPACITY) as usize;
         IngestMetrics {
-            shard_skew: (0..capacity).map(|_| ShardSkewAtomics::default()).collect(),
+            shard_skew: ShardSkew::with_capacity(shard_count),
             ..Default::default()
         }
     }
@@ -462,9 +581,7 @@ impl IngestMetrics {
     /// `messages_enqueued - messages_processed` is the depth still in the
     /// channel.
     pub(crate) fn record_shard_enqueued(&self, shard: u32) {
-        if let Some(s) = self.shard_skew.get(shard as usize) {
-            s.messages_enqueued.fetch_add(1, Ordering::Relaxed);
-        }
+        self.shard_skew.record_enqueued(shard);
     }
 
     /// One `Write` message pulled and handled by shard `shard`'s actor, plus
@@ -478,10 +595,7 @@ impl IngestMetrics {
     /// processed message with no time. See [`ShardSkewAtomics`] for why that
     /// one direction is the one worth paying an ordering for.
     pub(crate) fn record_shard_processed(&self, shard: u32, on_actor_ns: u64) {
-        if let Some(s) = self.shard_skew.get(shard as usize) {
-            s.on_actor_ns.fetch_add(on_actor_ns, Ordering::Relaxed);
-            s.messages_processed.fetch_add(1, Ordering::Release);
-        }
+        self.shard_skew.record_processed(shard, on_actor_ns);
     }
 
     /// One flush trigger's injected-`Clock` wait on shard `shard`'s
@@ -491,9 +605,7 @@ impl IngestMetrics {
     /// so charging it as actor work would say "the actor is busy" exactly when
     /// the truth is "flushes are backed up".
     pub(crate) fn record_shard_flush_permit_wait_ns(&self, shard: u32, wait_ns: u64) {
-        if let Some(s) = self.shard_skew.get(shard as usize) {
-            s.flush_permit_wait_ns.fetch_add(wait_ns, Ordering::Relaxed);
-        }
+        self.shard_skew.record_flush_permit_wait_ns(shard, wait_ns);
     }
 
     /// One completed flush task's injected-`Clock` nanoseconds, attributed to
@@ -504,9 +616,7 @@ impl IngestMetrics {
     /// what pipelining is for; see [`ShardSkewStats`] for why that is not
     /// double-counting.
     pub(crate) fn record_shard_off_actor_ns(&self, shard: u32, off_actor_ns: u64) {
-        if let Some(s) = self.shard_skew.get(shard as usize) {
-            s.off_actor_ns.fetch_add(off_actor_ns, Ordering::Relaxed);
-        }
+        self.shard_skew.record_off_actor_ns(shard, off_actor_ns);
     }
 
     /// Point-in-time per-shard skew figures, sorted by shard index (issue
@@ -520,42 +630,7 @@ impl IngestMetrics {
     /// belongs to; see [`ShardSkewAtomics`] for the ordering and for the bound
     /// on the tear in the other direction.
     pub fn shard_skew_by_shard(&self) -> Vec<(u32, ShardSkewStats)> {
-        // Preallocated by shard index, so iteration is already shard-ordered. A
-        // shard that never enqueued or processed a message reads all-zero and is
-        // omitted, matching the prior map's "absent, equivalent to all-zero".
-        self.shard_skew
-            .iter()
-            .enumerate()
-            .filter_map(|(shard, s)| {
-                let messages_enqueued = s.messages_enqueued.load(Ordering::Relaxed);
-                // Acquire, and before `on_actor_ns`: pairs with the `Release`
-                // in `record_shard_processed` so every counted message's time
-                // addend is already visible below.
-                let messages_processed = s.messages_processed.load(Ordering::Acquire);
-                let on_actor_ns = s.on_actor_ns.load(Ordering::Relaxed);
-                let flush_permit_wait_ns = s.flush_permit_wait_ns.load(Ordering::Relaxed);
-                let off_actor_ns = s.off_actor_ns.load(Ordering::Relaxed);
-                if messages_enqueued == 0
-                    && messages_processed == 0
-                    && on_actor_ns == 0
-                    && flush_permit_wait_ns == 0
-                    && off_actor_ns == 0
-                {
-                    return None;
-                }
-                Some((
-                    shard as u32,
-                    ShardSkewStats {
-                        messages_enqueued,
-                        messages_processed,
-                        queue_depth: messages_enqueued.saturating_sub(messages_processed),
-                        on_actor_ns,
-                        flush_permit_wait_ns,
-                        off_actor_ns,
-                    },
-                ))
-            })
-            .collect()
+        self.shard_skew.by_shard()
     }
 
     /// Attribute one completed flush's PUTs to `tenant` (success-time,
