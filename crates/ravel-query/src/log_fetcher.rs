@@ -1891,7 +1891,7 @@ pub const DEFAULT_LOG_COALESCE_GAP: u64 = 64 * 1024;
 /// GETs/object measured on q20), so it cannot save enough bytes to pay for
 /// itself until the object exceeds this many request-costs. 5 x 1.8 MiB ~= 8.9
 /// MiB reproduces q20's measured whole-object break-even.
-const WHOLE_OBJECT_REQUEST_MULTIPLE: u64 = 5;
+pub const WHOLE_OBJECT_REQUEST_MULTIPLE: u64 = 5;
 
 /// Floor on the size-threshold pre-probe crossover, under the
 /// request-cost-derived default. An object at or below the effective threshold

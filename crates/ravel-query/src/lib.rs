@@ -31,7 +31,7 @@ pub use log_fetcher::{
     BlockRangeFetcher, BlockRangeStats, BlockStatsReport, ColumnarBlockOutcome,
     DEFAULT_LOG_COALESCE_GAP, DEFAULT_LOG_COVERAGE_THRESHOLD, DEFAULT_LOG_MAX_CONCURRENT_GETS,
     DEFAULT_LOG_SUFFIX_LEN, DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD, LogFetchError, LogFetchOutput,
-    LogQuery, LogSegmentFetcher, LogSegmentScan, StreamAttrEquals,
+    LogQuery, LogSegmentFetcher, LogSegmentScan, StreamAttrEquals, WHOLE_OBJECT_REQUEST_MULTIPLE,
 };
 pub use phase_accounting::{PhaseAccounting, PhaseAccountingSnapshot, QueryPhase};
 pub use query_admission::{

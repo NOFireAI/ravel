@@ -1378,7 +1378,8 @@ async fn page_decode_accounting_is_a_separate_axis_from_wire_bytes() {
 // whole-object one.
 
 /// The size-threshold crossover is request-cost driven: with the request cost
-/// set so the break-even (`WHOLE_OBJECT_REQUEST_MULTIPLE` = 5 request-costs)
+/// set so the break-even (`WHOLE_OBJECT_REQUEST_MULTIPLE` request-costs, read
+/// from the production constant rather than restated here)
 /// lands at 700 KiB, the crossover sits at 700 KiB and not at the 512 KiB
 /// byte-only floor, WITHOUT any explicit `with_whole_object_threshold` -- the
 /// decision consults the request cost alone. Request counts are exact, not
@@ -1405,7 +1406,10 @@ async fn whole_object_vs_ranged_is_driven_by_the_request_cost() {
     // 5 * 140 KiB = 700 KiB break-even, above the 512 KiB floor so the
     // request-derived value (not the floor) is what decides.
     const REQUEST_COST: u64 = 140 * 1024;
-    let break_even = 5 * REQUEST_COST;
+    // Derived from the production constant, never a literal: if the policy's
+    // multiple changes, the fixture bounds below must move with it or this test
+    // silently stops covering the interval where the two rules disagree.
+    let break_even = ravel_query::WHOLE_OBJECT_REQUEST_MULTIPLE * REQUEST_COST;
 
     // Small side: the 20-block subset object, far under the break-even.
     let (small_recs, small_bytes) = subset_object();
