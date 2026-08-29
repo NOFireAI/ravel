@@ -622,12 +622,22 @@ impl SqlExecutor {
         // pass costs nothing when the feature is disabled. Classified against
         // `extras.declared` (the same declared columns the real logs provider
         // installs), before it is moved into the table below.
-        let exact_typed_aggregates = if self.config.parallel_final_aggregation {
-            self.classify_exact_typed(tenant_hash, sql, &extras.declared)
+        //
+        // ONE analyzed plan serves both consumers below. Each of them used to
+        // build its own throwaway session and analyze the same SQL, so a logs
+        // query with declared columns planned three times before executing
+        // once. The build happens only when a consumer will read it.
+        let wants_stats_gate = matches!(Self::target_signal(sql), Ok(TargetSignal::Logs))
+            && !extras.declared.is_empty();
+        let analyzed = if self.config.parallel_final_aggregation || wants_stats_gate {
+            self.analyzed_classification_plan(tenant_hash, sql, &extras.declared)
                 .await
         } else {
-            false
+            None
         };
+        // Fail CLOSED, unchanged: an unbuildable plan is not exact-typed.
+        let exact_typed_aggregates = self.config.parallel_final_aggregation
+            && analyzed.as_ref().is_some_and(plan_is_exact_typed);
         // Build the one table the query targets over the snapshot resolved for
         // its signal. `resolve` already resolved `snapshot` against exactly
         // this signal, so the provider and the snapshot always agree.
@@ -669,10 +679,11 @@ impl SqlExecutor {
                     // tenant with no declared columns reading zero objects, and
                     // reproduces the pre-ADR-0850 provider exactly.
                     None
-                } else if !self
-                    .logs_column_stats_eligible(tenant_hash, &snapshot, sql, &extras.declared)
-                    .await
-                {
+                } else if !self.logs_column_stats_eligible(
+                    &snapshot,
+                    analyzed.as_ref(),
+                    &extras.declared,
+                ) {
                     // Issue #888: no metadata-only column path can fire for this
                     // plan (decided from the plan and the resolved snapshot
                     // alone, ahead of the load), so skip the two GETs
@@ -694,7 +705,7 @@ impl SqlExecutor {
                         accounting.clone(),
                     )
                     .with_declared_columns(extras.declared)
-                    .with_column_stats(column_stats.map(Arc::new)),
+                    .with_column_stats(column_stats),
                 ))
             }
             // The spans provider drives `SpanSegmentFetcher::fetch_accounted`
@@ -927,6 +938,13 @@ impl SqlExecutor {
     /// classifies the query as NOT exact, because wrongly admitting an
     /// unclassifiable query could repartition an aggregate this check never
     /// verified.
+    // Test-only since the shared-plan change: the production path composes the
+    // same two pieces inline (`analyzed_classification_plan` then
+    // `plan_is_exact_typed`) against the plan it shares with the column-stats
+    // gate, rather than building a second throwaway session. This composition
+    // is identical to prod's, so the ADR-0094 cases below still exercise the
+    // shipped classification.
+    #[cfg(test)]
     async fn classify_exact_typed(
         &self,
         tenant_hash: TenantHash,
@@ -991,11 +1009,10 @@ impl SqlExecutor {
     /// all are aggregates referencing a declared column. This mirrors exactly
     /// those necessary conditions; anything they cannot prove is left to
     /// decline downstream and still loads here.
-    async fn logs_column_stats_eligible(
+    fn logs_column_stats_eligible(
         &self,
-        tenant_hash: TenantHash,
         snapshot: &Snapshot,
-        sql: &str,
+        analyzed: Option<&LogicalPlan>,
         declared: &[DeclaredColumn],
     ) -> bool {
         // Pending selective erasure (ADR-0064) rejects the ENTIRE query for
@@ -1008,17 +1025,17 @@ impl SqlExecutor {
         // The analyzed logical plan carries both the aggregate shape and the
         // filter conjuncts this check needs. If it cannot be built, fall back
         // to loading (the pre-hoist behavior always loaded).
-        let Some(plan) = self
-            .analyzed_classification_plan(tenant_hash, sql, declared)
-            .await
-        else {
+        // Fail OPEN, unchanged: no plan means keep the load. The caller shares
+        // one analyzed plan with the exact-typed classification rather than
+        // building a second throwaway session for the same SQL.
+        let Some(plan) = analyzed else {
             return true;
         };
         // Every path is an aggregate over a declared column. A non-aggregate
         // (a raw select, a top-N) or an aggregate touching no declared column
         // (a predicate-free `COUNT(*)`, answered from `sample_count` with no
         // column stats) can never consume the loaded object.
-        if !plan_has_aggregate(&plan) || !plan_references_declared(&plan, declared) {
+        if !plan_has_aggregate(plan) || !plan_references_declared(plan, declared) {
             return false;
         }
         // Re-derive the reader pushdown from the plan's filter conjuncts with
@@ -1028,7 +1045,7 @@ impl SqlExecutor {
         // fewer such predicates than the scan ultimately sees, so a match here
         // is real and skipping is safe, while a miss merely loads.
         let mut filters = Vec::new();
-        collect_filter_predicates(&plan, &mut filters);
+        collect_filter_predicates(plan, &mut filters);
         let pushdown = extract_logs(&filters, declared);
         if !pushdown.content.is_empty() || !pushdown.prune.is_empty() {
             return false;
