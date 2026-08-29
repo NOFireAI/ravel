@@ -1659,7 +1659,19 @@ mod tests {
             })
     }
 
+    /// Attribute keys are drawn from a small set, so a generated spec can name
+    /// one twice. The writer keeps one entry per key, so a record built with a
+    /// repeated key decodes back narrower than it was written and its
+    /// [`estimate_record`] shrinks with it. Dedup here, where specs become
+    /// records, so the records seeded into L0 are the records the merge sees and
+    /// the part-count arithmetic in [`expected_part_count`] is exact.
     fn spec_to_record(s: &SpanSpec) -> SpanRecord {
+        let mut attrs: Vec<(String, String)> = Vec::with_capacity(s.attrs.len());
+        for (k, v) in &s.attrs {
+            if !attrs.iter().any(|(seen, _)| seen == k) {
+                attrs.push((k.clone(), v.clone()));
+            }
+        }
         SpanRecord {
             trace_id: [s.trace; 16],
             span_id: [s.span; 8],
@@ -1669,7 +1681,7 @@ mod tests {
             end_ts_ns: s.start.saturating_add(s.dur),
             status_code: StatusCode::Unset,
             status_message: s.msg.clone(),
-            attrs: s.attrs.clone(),
+            attrs,
         }
     }
 
@@ -1678,7 +1690,52 @@ mod tests {
         prop::collection::vec(prop::collection::vec(spec_strategy(), 1..15), 2..6)
     }
 
-    async fn differential_check(corpus: Vec<Vec<SpanSpec>>, max_l1_part_bytes: u64) {
+    /// The part cap the boundary test runs under: small enough that a corpus of
+    /// a few dozen spans splits, large enough that a part still holds several
+    /// traces.
+    const BOUNDARY_MEMORY_CAP: u64 = 512;
+
+    /// How many L1 parts [`merge`] must produce for `corpus` at
+    /// `max_l1_part_memory_bytes = memory_cap`, derived from the split rule
+    /// rather than observed: records merge in `(trace_id, start_ts_ns)` order,
+    /// so one trace's records are contiguous, and the in-progress part is closed
+    /// at a trace transition once its [`estimate_record`] total has reached the
+    /// cap. Only whole traces and their heap totals decide the boundaries, so
+    /// the intra-trace merge order does not enter this count.
+    fn expected_part_count(corpus: &[Vec<SpanSpec>], memory_cap: u64) -> usize {
+        let mut by_trace: BTreeMap<[u8; 16], u64> = BTreeMap::new();
+        for input in corpus {
+            for spec in input {
+                let r = spec_to_record(spec);
+                let e = by_trace.entry(r.trace_id).or_insert(0);
+                *e = e.saturating_add(estimate_record(&r));
+            }
+        }
+        let mut parts = 0usize;
+        let mut open: u64 = 0;
+        for trace_bytes in by_trace.into_values() {
+            if open >= memory_cap {
+                parts += 1;
+                open = 0;
+            }
+            open = open.saturating_add(trace_bytes);
+        }
+        if open > 0 {
+            parts += 1;
+        }
+        parts
+    }
+
+    /// Compact `corpus` under `memory_cap` and return the number of L1 parts it
+    /// produced.
+    ///
+    /// The cap goes to `max_l1_part_memory_bytes`, the field [`merge`] reads.
+    /// It used to be written to `max_l1_part_bytes`, which the RSPAN merge does
+    /// not consult at all, so every corpus produced one part and the
+    /// part-boundary case below crossed no boundary. The part-count assertion
+    /// keeps that silent: a cap that stops reaching the split rule shows up as a
+    /// count mismatch, not as a property that holds vacuously.
+    async fn differential_check(corpus: Vec<Vec<SpanSpec>>, memory_cap: u64) -> usize {
         let store = MemoryStore::new();
         let mut all_input_records: Vec<SpanRecord> = Vec::new();
         for (i, input) in corpus.iter().enumerate() {
@@ -1695,7 +1752,7 @@ mod tests {
 
         let clock = FixedClock::new(sealed_now_ns());
         let config = CompactorConfig {
-            max_l1_part_bytes,
+            max_l1_part_memory_bytes: memory_cap,
             ..CompactorConfig::default()
         };
         compact_bucket(&store, &clock, &config, &bucket())
@@ -1703,6 +1760,12 @@ mod tests {
             .expect("compact");
         let (rec, parts) = read_output(&store).await;
         assert_eq!(rec.level, 1);
+        assert_eq!(
+            parts.len(),
+            expected_part_count(&corpus, memory_cap),
+            "the cap must reach the merge's split rule: part count is arithmetic over \
+             the corpus's per-trace heap"
+        );
 
         // Decode every L1 part (concatenated in part order) and compare its
         // record set to the inputs decoded directly, as an order-independent
@@ -1726,6 +1789,59 @@ mod tests {
             sorted.sort();
             assert_eq!(order, sorted, "part records in (trace, start_ts) order");
         }
+
+        parts.len()
+    }
+
+    /// A corpus whose per-trace heap totals actually cross
+    /// [`BOUNDARY_MEMORY_CAP`], so the boundary property below has a boundary to
+    /// cross. Corpora of a couple of tiny single-trace spans cannot split (a
+    /// trace never straddles a part) and are filtered out rather than asserted
+    /// against.
+    fn splitting_corpus_strategy() -> impl Strategy<Value = Vec<Vec<SpanSpec>>> {
+        corpus_strategy().prop_filter(
+            "corpus must split into more than one part at the boundary cap",
+            |c| expected_part_count(c, BOUNDARY_MEMORY_CAP) > 1,
+        )
+    }
+
+    /// A fixed corpus at [`BOUNDARY_MEMORY_CAP`] splits into a known number of
+    /// parts, so the boundary-crossing differential above is provably armed at
+    /// one concrete input rather than only at whatever the generator samples.
+    ///
+    /// Demonstrated red by writing the cap to `max_l1_part_bytes` (the field the
+    /// RSPAN merge does not read) in `differential_check`: the merge then runs
+    /// at the 256 MiB memory default, the whole corpus lands in one part, and
+    /// this fails with `1 != 4`.
+    #[tokio::test]
+    async fn boundary_corpus_splits_into_several_parts() {
+        // 3 inputs x 4 traces x 5 spans: every trace's heap is a few hundred
+        // bytes, so a 512-byte cap closes a part every second trace or so.
+        let corpus: Vec<Vec<SpanSpec>> = (0..3)
+            .map(|input| {
+                (0..4u8)
+                    .flat_map(|trace| {
+                        (0..5u8).map(move |s| SpanSpec {
+                            trace,
+                            span: s,
+                            start: i64::from(s) * 10 + input,
+                            dur: 5,
+                            name: "query".into(),
+                            msg: Some("msg-abcd".into()),
+                            attrs: vec![("k0".into(), "p".into()), ("k1".into(), "q".into())],
+                        })
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let expected = expected_part_count(&corpus, BOUNDARY_MEMORY_CAP);
+        assert_eq!(
+            expected, 4,
+            "fixture must cross several part boundaries at the boundary cap"
+        );
+        let parts = differential_check(corpus, BOUNDARY_MEMORY_CAP).await;
+        assert_eq!(parts, expected, "observed part count must match the rule");
     }
 
     proptest! {
@@ -1741,21 +1857,26 @@ mod tests {
                 .enable_all()
                 .build()
                 .unwrap();
-            rt.block_on(differential_check(corpus, CompactorConfig::default().max_l1_part_bytes));
+            rt.block_on(differential_check(
+                corpus,
+                CompactorConfig::default().max_l1_part_memory_bytes,
+            ));
         }
 
         /// The same union-equality property under a tiny part cap that forces
         /// the merge to split across multiple parts on trace boundaries, so the
         /// "concatenate all parts" side of the differential actually crosses
-        /// part boundaries. Single-trace corpora stay one part (a trace never
-        /// straddles) and still exercise the property.
+        /// part boundaries. The generator only yields corpora that do split, and
+        /// the part count is asserted here, so a cap that stops reaching the
+        /// merge fails this test instead of making it pass vacuously.
         #[test]
-        fn differential_holds_across_part_boundaries(corpus in corpus_strategy()) {
+        fn differential_holds_across_part_boundaries(corpus in splitting_corpus_strategy()) {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .unwrap();
-            rt.block_on(differential_check(corpus, 512));
+            let parts = rt.block_on(differential_check(corpus, BOUNDARY_MEMORY_CAP));
+            prop_assert!(parts > 1, "boundary corpus must produce more than one part, got {parts}");
         }
     }
 }
