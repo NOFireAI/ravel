@@ -306,9 +306,16 @@ pub fn build_sql_state(
     // decision 1, separate from RSEG's), so the bound has to be handed to it
     // here or the pool stays at its compiled-in 16 whatever the flag says
     // (issue #700).
+    // ADR-0904's request-cost knob, from `--logs-request-cost-bytes` via
+    // `QueryBudgets::apply_to_engine`. It has to be handed to the fetcher here:
+    // this is the one production `LogSegmentFetcher` construction site, and the
+    // three fetch-layer thresholds it derives (coalescing gap, whole-object
+    // crossover, #887 projection routing) otherwise stay at the compiled-in
+    // `DEFAULT_LOG_REQUEST_COST_BYTES` whatever the flag says.
     let mut logs_fetcher = LogSegmentFetcher::new(store.clone())
         .with_block_range_threshold(config.engine.logs_block_range_threshold)
-        .with_max_concurrent_gets(config.engine.fetch_concurrency);
+        .with_max_concurrent_gets(config.engine.fetch_concurrency)
+        .with_request_cost_bytes(config.engine.logs_request_cost_bytes);
     // The spans fetcher (RSPAN) reads the same object store, with the default
     // RspanConfig (ADR-0045 decision 5). It attaches no fetcher cache: unlike
     // the RSEG/RLOG fetchers it has no `with_cache` seam, and none is wired
