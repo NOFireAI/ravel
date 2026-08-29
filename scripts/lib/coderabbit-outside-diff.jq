@@ -1,0 +1,55 @@
+# Counts the findings CodeRabbit reports in a REVIEW BODY rather than as an
+# inline comment, for the commit in $sha. Input is the array from
+# `gh api repos/<repo>/pulls/<pr>/reviews`. Shared by pr-review-status.sh and
+# its test so the two cannot drift apart.
+#
+# When a finding falls outside the diff range GitHub will accept an inline
+# comment on, the bot cannot post it inline, so it folds it into the review
+# body under a heading like:
+#
+#   > <details>
+#   > <summary>⚠️ Outside diff range comments (1)</summary>
+#
+# Nothing in the inline-comment count sees those.
+#
+# Two conditions, both required:
+#
+#   the review's own commit_id equals $sha -- the same head discipline the
+#   review count uses, and stricter than a body-text sha match, since a body
+#   on a superseded commit describes code that no longer exists;
+#
+#   the literal heading text appears in the body. The pattern is the heading
+#   phrase and nothing looser on purpose: the verdict filter beside this one
+#   had to be tightened after keying on a loose signal (a bare sha) produced a
+#   false CLEAR on #788, and the same direction is the danger here. Keying on
+#   "the body is non-empty" would count every summary and walkthrough as a
+#   finding, which trains an operator to pass --confirm-addressed reflexively
+#   and puts us back where #908 started.
+#
+# The pattern requires "Outside diff range" and, on the SAME line, the word
+# "comment"/"comments". That is the shape of every emitted heading, including
+# the older "Outside diff range and nitpick comments (N)" variant, and it does
+# not fire on prose that merely uses the phrase across a sentence.
+#
+# Counting rule: the heading carries the number of findings in the block in
+# parentheses, so a heading with a count contributes that count, and a heading
+# without one contributes 1. Multiple headings in one body, and multiple
+# reviews at the same head, sum.
+def outside_diff_count:
+  [
+    match("Outside diff range[^\\n]*comments?[^\\n]*"; "g")
+    | .string
+    | ((capture("\\((?<n>[0-9]+)\\)") | .n | tonumber) // 1)
+  ]
+  | add // 0;
+
+[
+  .[]?
+  | select(
+      .user.login == "coderabbitai[bot]"
+      and .commit_id == $sha
+    )
+  | (.body // "")
+  | outside_diff_count
+]
+| add // 0
