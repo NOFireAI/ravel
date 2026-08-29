@@ -8,7 +8,9 @@ use ravel_catalog::{
     NamePostings, PartLimits, PostingsLimits, decode_head, decode_part, decode_postings,
     encode_head, encode_part, encode_postings,
 };
-use ravel_proto::catalog::v1::{SnapshotEntry, SnapshotHead, SnapshotPartRef, SnapshotPostingsRef};
+use ravel_proto::catalog::v1::{
+    SnapshotColumnStatsRef, SnapshotEntry, SnapshotHead, SnapshotPartRef, SnapshotPostingsRef,
+};
 
 fn entry_key(e: &SnapshotEntry) -> (u32, u32, Vec<u8>, u64, u64) {
     (
@@ -137,6 +139,30 @@ fn arb_postings_ref(
     ]
 }
 
+fn arb_column_stats_ref(
+    parts: &[SnapshotPartRef],
+) -> impl Strategy<Value = Option<SnapshotColumnStatsRef>> + use<> {
+    let part_blake3: Vec<Vec<u8>> = parts.iter().map(|p| p.blake3.clone()).collect();
+    prop_oneof![
+        Just(None),
+        (
+            "[a-z0-9/]{1,40}",
+            prop::collection::vec(any::<u8>(), 32),
+            any::<u64>(),
+            any::<u32>(),
+        )
+            .prop_map(move |(key, blake3, size, segment_count)| {
+                Some(SnapshotColumnStatsRef {
+                    key,
+                    blake3,
+                    size,
+                    segment_count,
+                    part_blake3: part_blake3.clone(),
+                })
+            }),
+    ]
+}
+
 fn arb_head() -> impl Strategy<Value = SnapshotHead> {
     // Each raw part carries a (gap, span) plus its arbitrary content fields.
     // `arb_head` folds the gaps/spans into ascending, strictly-disjoint hour
@@ -176,22 +202,24 @@ fn arb_head() -> impl Strategy<Value = SnapshotHead> {
                     }
                 })
                 .collect();
-            arb_postings_ref(&parts).prop_map(move |postings| {
-                let watermark_hour = parts.iter().map(|p| p.watermark_hour).max().unwrap_or(0);
-                SnapshotHead {
-                    format_version: 1,
-                    tenant_hash: vec![0x33u8; 16],
-                    signal: 1,
-                    shard_count: 8,
-                    watermark_hour,
-                    parts: parts.clone(),
-                    postings,
-                    folder_id: folder_id.clone(),
-                    created_unix_ns,
-                    shard_generation_count: 1,
-                    column_stats: None,
-                }
-            })
+            (arb_postings_ref(&parts), arb_column_stats_ref(&parts)).prop_map(
+                move |(postings, column_stats)| {
+                    let watermark_hour = parts.iter().map(|p| p.watermark_hour).max().unwrap_or(0);
+                    SnapshotHead {
+                        format_version: 1,
+                        tenant_hash: vec![0x33u8; 16],
+                        signal: 1,
+                        shard_count: 8,
+                        watermark_hour,
+                        parts: parts.clone(),
+                        postings,
+                        folder_id: folder_id.clone(),
+                        created_unix_ns,
+                        shard_generation_count: 1,
+                        column_stats,
+                    }
+                },
+            )
         })
 }
 

@@ -21,8 +21,11 @@
 //! that dictionary earns its complexity for a huge flat cross-segment name
 //! space, which per-segment column statistics don't have.
 
+use std::collections::HashSet;
+
 use prost::Message;
-use ravel_proto::catalog::v1::{ColumnStatsHeader, ColumnStatsSegment};
+use ravel_proto::catalog::v1::column_value::Kind;
+use ravel_proto::catalog::v1::{ColumnStat, ColumnStatsHeader, ColumnStatsSegment, ColumnValue};
 
 use super::error::SnapshotFormatError;
 use super::{
@@ -185,7 +188,11 @@ pub fn decode_column_stats(
 
 /// Sort/uniqueness/field validation shared by `encode_column_stats`
 /// (defensive check of caller input) and `decode_column_stats` (untrusted-
-/// bytes check).
+/// bytes check). Beyond segment identity this also validates every
+/// `ColumnStat`'s internal semantics (ADR-0850): a record the metadata-only
+/// query path could read (`declared_not_equal_count`/`declared_group_counts`)
+/// is rejected here before it can ever be loaded, so those paths can never
+/// derive a wrong answer from an internally-inconsistent record. Fail closed.
 fn validate_segments(segments: &[ColumnStatsSegment]) -> Result<(), SnapshotFormatError> {
     for (i, segment) in segments.iter().enumerate() {
         if segment.writer_id.len() != 16 {
@@ -206,8 +213,137 @@ fn validate_segments(segments: &[ColumnStatsSegment]) -> Result<(), SnapshotForm
                 }
             }
         }
+        validate_columns(&segment.columns)?;
     }
     Ok(())
+}
+
+/// Per-segment column-list validation: no duplicate column name, and every
+/// column internally consistent.
+fn validate_columns(columns: &[ColumnStat]) -> Result<(), SnapshotFormatError> {
+    let mut names: HashSet<&str> = HashSet::with_capacity(columns.len());
+    for column in columns {
+        if !names.insert(column.name.as_str()) {
+            return Err(SnapshotFormatError::ColumnStatsDuplicateColumnName {
+                name: column.name.clone(),
+            });
+        }
+        validate_column(column)?;
+    }
+    Ok(())
+}
+
+/// One column's internal-consistency rules (ADR-0850). A record failing any
+/// of these could make the metadata-only path answer a query wrong, so it is
+/// a typed rejection, never silently trusted:
+///
+/// - `declared_type` names a known typed-attribute type;
+/// - every `min`/`max`/dictionary value's kind matches `declared_type`;
+/// - `min`/`max` are absent when `non_null_count == 0` and `min <= max`;
+/// - a present dictionary has no duplicate value and its counts sum to
+///   exactly `non_null_count`; an absent dictionary carries no entries.
+fn validate_column(column: &ColumnStat) -> Result<(), SnapshotFormatError> {
+    if !(1..=4).contains(&column.declared_type) {
+        return Err(SnapshotFormatError::ColumnStatsUnknownDeclaredType {
+            name: column.name.clone(),
+            declared_type: column.declared_type,
+        });
+    }
+
+    if column.non_null_count == 0 && (column.min.is_some() || column.max.is_some()) {
+        return Err(SnapshotFormatError::ColumnStatsUnexpectedMinMax {
+            name: column.name.clone(),
+        });
+    }
+    if let Some(min) = &column.min {
+        check_value_kind(column, min, "min")?;
+    }
+    if let Some(max) = &column.max {
+        check_value_kind(column, max, "max")?;
+    }
+    if let (Some(min), Some(max)) = (&column.min, &column.max)
+        && compare_values(min, max) == Some(std::cmp::Ordering::Greater)
+    {
+        return Err(SnapshotFormatError::ColumnStatsMinMaxInverted {
+            name: column.name.clone(),
+        });
+    }
+
+    if column.dictionary_present {
+        let mut seen: HashSet<Vec<u8>> = HashSet::with_capacity(column.dictionary.len());
+        let mut total: u64 = 0;
+        for entry in &column.dictionary {
+            let value = entry.value.as_ref().ok_or_else(|| {
+                SnapshotFormatError::ColumnStatsDictEntryMissingValue {
+                    name: column.name.clone(),
+                }
+            })?;
+            check_value_kind(column, value, "dictionary")?;
+            if !seen.insert(value.encode_to_vec()) {
+                return Err(SnapshotFormatError::ColumnStatsDuplicateDictValue {
+                    name: column.name.clone(),
+                });
+            }
+            total = total.saturating_add(entry.count);
+        }
+        if total != column.non_null_count {
+            return Err(SnapshotFormatError::ColumnStatsDictCountMismatch {
+                name: column.name.clone(),
+                dict_total: total,
+                non_null_count: column.non_null_count,
+            });
+        }
+    } else if !column.dictionary.is_empty() {
+        return Err(SnapshotFormatError::ColumnStatsDictPresentMismatch {
+            name: column.name.clone(),
+            entries: column.dictionary.len(),
+        });
+    }
+
+    Ok(())
+}
+
+/// Whether `value`'s wire kind matches the `ColumnStat.declared_type` tag
+/// (1=Str, 2=I64, 3=Bool, 4=Bytes; the `declared_type_to_stats_tag` mapping
+/// the fold writes with).
+fn value_kind_matches(declared_type: u32, value: &ColumnValue) -> bool {
+    matches!(
+        (declared_type, value.kind.as_ref()),
+        (1, Some(Kind::StrUtf8(_)))
+            | (2, Some(Kind::I64(_)))
+            | (3, Some(Kind::B(_)))
+            | (4, Some(Kind::BytesVal(_)))
+    )
+}
+
+fn check_value_kind(
+    column: &ColumnStat,
+    value: &ColumnValue,
+    field: &'static str,
+) -> Result<(), SnapshotFormatError> {
+    if value_kind_matches(column.declared_type, value) {
+        Ok(())
+    } else {
+        Err(SnapshotFormatError::ColumnStatsValueTypeMismatch {
+            name: column.name.clone(),
+            field,
+            declared_type: column.declared_type,
+        })
+    }
+}
+
+/// Total order over two same-kind values. `None` when the kinds differ (the
+/// caller has already kind-checked both against `declared_type`, so this
+/// never happens for a valid record); a `None` never triggers the inverted
+/// check, keeping the failure attributable to the kind rule instead.
+fn compare_values(a: &ColumnValue, b: &ColumnValue) -> Option<std::cmp::Ordering> {
+    match (a.kind.as_ref(), b.kind.as_ref()) {
+        (Some(Kind::I64(x)), Some(Kind::I64(y))) => Some(x.cmp(y)),
+        (Some(Kind::B(x)), Some(Kind::B(y))) => Some(x.cmp(y)),
+        (Some(Kind::StrUtf8(x)), Some(Kind::StrUtf8(y))) => Some(x.cmp(y)),
+        (Some(Kind::BytesVal(x)), Some(Kind::BytesVal(y))) => Some(x.cmp(y)),
+        _ => None,
+    }
 }
 
 fn segment_key(segment: &ColumnStatsSegment) -> (u32, u32, &[u8], u64, u64) {
@@ -254,11 +390,25 @@ fn take_u64_le(bytes: &[u8], pos: &mut usize) -> Result<u64, SnapshotFormatError
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use ravel_proto::catalog::v1::{ColumnStat, ColumnStatsSegment, ColumnValue};
+    use ravel_proto::catalog::v1::{ColumnStat, ColumnStatsSegment, ColumnValue, DictEntry};
 
     use super::*;
 
+    fn i64_value(v: i64) -> ColumnValue {
+        ColumnValue {
+            kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(v)),
+        }
+    }
+
     fn segment(hour: u32, shard: u32, seq: u64) -> ColumnStatsSegment {
+        // A consistent I64 column: values 0..=9, each seen once, so the
+        // dictionary counts sum to non_null_count and min/max bracket it.
+        let dictionary: Vec<DictEntry> = (0..10)
+            .map(|v| DictEntry {
+                value: Some(i64_value(v)),
+                count: 1,
+            })
+            .collect();
         ColumnStatsSegment {
             ingest_hour_bucket: hour,
             shard,
@@ -270,14 +420,10 @@ mod tests {
                 declared_type: 2,
                 non_null_count: 10,
                 null_count: 0,
-                min: Some(ColumnValue {
-                    kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(0)),
-                }),
-                max: Some(ColumnValue {
-                    kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(9)),
-                }),
+                min: Some(i64_value(0)),
+                max: Some(i64_value(9)),
                 dictionary_present: true,
-                dictionary: vec![],
+                dictionary,
             }],
         }
     }
@@ -306,6 +452,139 @@ mod tests {
         let err =
             encode_column_stats([0x11; 16], 3, vec![], &segments).expect_err("duplicate rejected");
         assert_eq!(err, SnapshotFormatError::ColumnStatsDuplicateSegment);
+    }
+
+    /// Finding 4's exact example: a column claiming `non_null_count = 10`
+    /// with `dictionary_present = true` but an empty dictionary is internally
+    /// inconsistent (the metadata-only path would treat all 10 rows as
+    /// not-equal to any literal). It must be rejected at encode/decode, not
+    /// trusted.
+    #[test]
+    fn empty_dictionary_with_nonzero_non_null_rejected() {
+        let mut seg = segment(1, 0, 1);
+        seg.columns[0].dictionary = vec![];
+        let err = encode_column_stats([0x11; 16], 3, vec![], &[seg]).expect_err("rejected");
+        assert_eq!(
+            err,
+            SnapshotFormatError::ColumnStatsDictCountMismatch {
+                name: "AdvEngineID".to_string(),
+                dict_total: 0,
+                non_null_count: 10,
+            }
+        );
+    }
+
+    #[test]
+    fn dictionary_counts_not_summing_to_non_null_rejected() {
+        let mut seg = segment(1, 0, 1);
+        // Drop one entry so the counts total 9 but non_null_count stays 10.
+        seg.columns[0].dictionary.pop();
+        let err = encode_column_stats([0x11; 16], 3, vec![], &[seg]).expect_err("rejected");
+        assert_eq!(
+            err,
+            SnapshotFormatError::ColumnStatsDictCountMismatch {
+                name: "AdvEngineID".to_string(),
+                dict_total: 9,
+                non_null_count: 10,
+            }
+        );
+    }
+
+    #[test]
+    fn wrong_value_kind_rejected() {
+        let mut seg = segment(1, 0, 1);
+        seg.columns[0].dictionary[0].value = Some(ColumnValue {
+            kind: Some(ravel_proto::catalog::v1::column_value::Kind::B(true)),
+        });
+        let err = encode_column_stats([0x11; 16], 3, vec![], &[seg]).expect_err("rejected");
+        assert_eq!(
+            err,
+            SnapshotFormatError::ColumnStatsValueTypeMismatch {
+                name: "AdvEngineID".to_string(),
+                field: "dictionary",
+                declared_type: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn duplicate_dictionary_value_rejected() {
+        let mut seg = segment(1, 0, 1);
+        // Two entries with the same value; total still 10.
+        seg.columns[0].dictionary = vec![
+            DictEntry {
+                value: Some(i64_value(0)),
+                count: 5,
+            },
+            DictEntry {
+                value: Some(i64_value(0)),
+                count: 5,
+            },
+        ];
+        let err = encode_column_stats([0x11; 16], 3, vec![], &[seg]).expect_err("rejected");
+        assert_eq!(
+            err,
+            SnapshotFormatError::ColumnStatsDuplicateDictValue {
+                name: "AdvEngineID".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn duplicate_column_name_rejected() {
+        let mut seg = segment(1, 0, 1);
+        let dup = seg.columns[0].clone();
+        seg.columns.push(dup);
+        let err = encode_column_stats([0x11; 16], 3, vec![], &[seg]).expect_err("rejected");
+        assert_eq!(
+            err,
+            SnapshotFormatError::ColumnStatsDuplicateColumnName {
+                name: "AdvEngineID".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn min_greater_than_max_rejected() {
+        let mut seg = segment(1, 0, 1);
+        seg.columns[0].min = Some(i64_value(9));
+        seg.columns[0].max = Some(i64_value(0));
+        let err = encode_column_stats([0x11; 16], 3, vec![], &[seg]).expect_err("rejected");
+        assert_eq!(
+            err,
+            SnapshotFormatError::ColumnStatsMinMaxInverted {
+                name: "AdvEngineID".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn min_max_present_with_zero_non_null_rejected() {
+        let mut seg = segment(1, 0, 1);
+        seg.columns[0].non_null_count = 0;
+        seg.columns[0].dictionary = vec![];
+        // min/max still populated: inconsistent with an all-null column.
+        let err = encode_column_stats([0x11; 16], 3, vec![], &[seg]).expect_err("rejected");
+        assert_eq!(
+            err,
+            SnapshotFormatError::ColumnStatsUnexpectedMinMax {
+                name: "AdvEngineID".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn dictionary_entries_without_present_flag_rejected() {
+        let mut seg = segment(1, 0, 1);
+        seg.columns[0].dictionary_present = false;
+        let err = encode_column_stats([0x11; 16], 3, vec![], &[seg]).expect_err("rejected");
+        assert_eq!(
+            err,
+            SnapshotFormatError::ColumnStatsDictPresentMismatch {
+                name: "AdvEngineID".to_string(),
+                entries: 10,
+            }
+        );
     }
 
     #[test]

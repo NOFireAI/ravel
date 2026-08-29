@@ -211,4 +211,38 @@ pub enum SnapshotFormatError {
     },
     #[error("column-stats header part_blake3 does not match the expected covered parts")]
     ColumnStatsPartBindingMismatch,
+    #[error("column-stats segment carries duplicate column name {name:?}")]
+    ColumnStatsDuplicateColumnName { name: String },
+    #[error("column-stats column {name:?} has an unknown declared_type {declared_type}")]
+    ColumnStatsUnknownDeclaredType { name: String, declared_type: u32 },
+    #[error(
+        "column-stats column {name:?} carries a {field} value whose kind does not match its declared_type {declared_type}"
+    )]
+    ColumnStatsValueTypeMismatch {
+        name: String,
+        field: &'static str,
+        declared_type: u32,
+    },
+    #[error("column-stats column {name:?} carries a dictionary entry with no value")]
+    ColumnStatsDictEntryMissingValue { name: String },
+    #[error("column-stats column {name:?} carries duplicate dictionary value")]
+    ColumnStatsDuplicateDictValue { name: String },
+    #[error(
+        "column-stats column {name:?} dictionary counts total {dict_total} but non_null_count is {non_null_count}"
+    )]
+    ColumnStatsDictCountMismatch {
+        name: String,
+        dict_total: u64,
+        non_null_count: u64,
+    },
+    #[error(
+        "column-stats column {name:?} has dictionary_present=false but carries {entries} dictionary entries"
+    )]
+    ColumnStatsDictPresentMismatch { name: String, entries: usize },
+    #[error(
+        "column-stats column {name:?} carries min/max but non_null_count is zero (must be absent)"
+    )]
+    ColumnStatsUnexpectedMinMax { name: String },
+    #[error("column-stats column {name:?} has min greater than max")]
+    ColumnStatsMinMaxInverted { name: String },
 }

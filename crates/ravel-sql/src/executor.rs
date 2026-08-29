@@ -670,7 +670,7 @@ impl SqlExecutor {
                     None
                 } else {
                     self.catalog
-                        .load_column_stats(&tenant_hash, Signal::Logs)
+                        .load_column_stats(&tenant_hash, Signal::Logs, accounting)
                         .await?
                 };
                 SessionTable::Logs(Arc::new(

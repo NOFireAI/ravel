@@ -1,37 +1,42 @@
 //! Column-statistics load for the query-time metadata-only path (ADR-0850).
-//! Mirrors [`crate::covering_postings::load_covering_postings`] exactly:
-//! fetch HEAD, follow its `column_stats` ref, GET/blake3-verify/tenant-check/
-//! decode. A query engine (`ravel-sql`'s `LogsScanExec`) consumes the result
-//! by joining its own resolved snapshot's live segments against
+//! Like [`crate::covering_postings::load_covering_postings`] it fetches HEAD,
+//! follows its `column_stats` ref, and GET/blake3-verifies/tenant-checks/
+//! decodes the object, but it fetches NO snapshot part: it needs only each
+//! part's blake3 (already carried in `SnapshotHead.parts`) to bind the stats
+//! object to this HEAD's part set. Every GET runs through the caller's
+//! accounted, semaphore-bounded funnel (issue #850), so the two GETs this
+//! path issues are counted and rate-limited exactly like every other query
+//! read. A query engine (`ravel-sql`'s `LogsScanExec`) consumes the result by
+//! joining its own resolved snapshot's live segments against
 //! [`LoadedColumnStats::segments`] by identity; a segment with no entry there
 //! (never built, build failed, or the segment postdates this stats object)
 //! has no exact statistics and the query must fall back to scanning it.
 //!
 //! # Degrade-to-`None`, one loud exception
 //!
-//! Same discipline as postings: every failure short of an isolation breach
-//! degrades to `Ok(None)` (no HEAD yet, no column-stats ref, any GET error, a
-//! blake3 mismatch, a decode error, a part-binding mismatch against the
-//! current HEAD's parts). `decode_column_stats` does not itself check
-//! part-binding against a caller-supplied part list (unlike
-//! `decode_postings`, which takes the expected part_blake3 as an argument);
-//! this loader performs that check itself, exactly as
+//! Column statistics are an OPTIONAL metadata artifact, so every failure
+//! short of an isolation breach degrades to `Ok(None)` and the query scans:
+//! no HEAD yet, no column-stats ref, any GET error, a blake3 mismatch, a
+//! decode error, or a part-binding mismatch against the current HEAD's parts.
+//! `decode_column_stats` does not itself check part-binding against a
+//! caller-supplied part list (unlike `decode_postings`, which takes the
+//! expected part_blake3 as an argument); this loader performs that check
+//! itself, exactly as
 //! [`crate::column_stats_build::decode_previous_column_stats`] does on the
-//! fold side. A genuinely unparseable HEAD or part is a real catalog defect,
-//! surfaced the same way `load_covering_postings` surfaces one; a
-//! column-stats object declaring a foreign `tenant_hash` is an ADR-0050 §2
-//! isolation breach, never absorbed into a silent degrade.
+//! fold side. The only two loud exceptions are a genuinely unparseable HEAD
+//! (a real catalog defect, not an optional artifact) and a column-stats
+//! object declaring a foreign `tenant_hash` (an ADR-0050 §2 isolation
+//! breach): neither is absorbed into a silent degrade.
 
 use std::collections::HashMap;
 
-use ravel_object_store::{GetRange, ObjectStoreBackend};
 use ravel_proto::catalog::v1::ColumnStatsSegment;
 use ravel_types::{Signal, TenantHash};
 
 use crate::EntryIdentity;
+use crate::provisioning::AccountedRecordGet;
 use crate::snapshot_format::{
-    ColumnStatsLimits, PartLimits, SnapshotFormatError, decode_column_stats, decode_head,
-    decode_part,
+    ColumnStatsLimits, SnapshotFormatError, decode_column_stats, decode_head,
 };
 
 /// The owned column-statistics inputs a query-time metadata-only plan needs:
@@ -50,20 +55,13 @@ pub struct LoadedColumnStats {
     pub part_blake3: Vec<[u8; 32]>,
 }
 
-/// A genuinely unparseable HEAD/part, or an isolation breach, encountered
-/// while loading column statistics: the only conditions
-/// [`load_column_stats`] surfaces as an error rather than degrading to
-/// `Ok(None)`.
+/// A genuinely unparseable HEAD, or an isolation breach, encountered while
+/// loading column statistics: the only conditions [`load_column_stats`]
+/// surfaces as an error rather than degrading to `Ok(None)`.
 #[derive(Debug, thiserror::Error)]
 pub enum LoadColumnStatsError {
     #[error("HEAD at {key} is corrupt: {source}")]
     HeadCorrupt {
-        key: String,
-        #[source]
-        source: SnapshotFormatError,
-    },
-    #[error("snapshot part {key} is corrupt: {source}")]
-    PartCorrupt {
         key: String,
         #[source]
         source: SnapshotFormatError,
@@ -94,19 +92,25 @@ fn head_key(tenant: &TenantHash, signal: Signal) -> String {
 /// column-stats object exists right now (nothing folded yet, no configured
 /// typed columns, or the last fold's column-stats build/PUT failed).
 ///
-/// Metadata-cost: reads the HEAD and the one column-stats object, never a
-/// data segment or a snapshot part (unlike `load_covering_postings`, this
-/// loader does not need the covered-entry universe -- callers already have
-/// their own resolved snapshot to join against). See the [module
-/// docs](self) for the full degrade-to-`Ok(None)` contract.
-pub async fn load_column_stats(
-    store: &dyn ObjectStoreBackend,
+/// Every GET is issued through `getter`, so it is credited to the caller's
+/// [`QueryAccounting`](ravel_types::accounting::QueryAccounting) and bounded
+/// by the catalog request semaphore, the same funnel every other query read
+/// path uses (issue #850). The requests charge to `AccountedOp::Get`.
+///
+/// Metadata-cost: exactly two GETs -- the HEAD and the one column-stats
+/// object. Unlike `load_covering_postings`, this loader fetches no snapshot
+/// part: it needs only each part's blake3 (already carried in
+/// `SnapshotHead.parts`) for the binding check, and callers join against
+/// their own resolved snapshot rather than a rebuilt covered-entry universe.
+/// See the [module docs](self) for the full degrade-to-`Ok(None)` contract.
+pub(crate) async fn load_column_stats(
+    getter: &impl AccountedRecordGet,
     tenant: &TenantHash,
     signal: Signal,
 ) -> Result<Option<LoadedColumnStats>, LoadColumnStatsError> {
     let key = head_key(tenant, signal);
 
-    let head_bytes = match store.get(&key, GetRange::Full).await {
+    let head_bytes = match getter.accounted_get_full(&key).await {
         Ok(got) => got.data,
         Err(_) => return Ok(None),
     };
@@ -119,30 +123,20 @@ pub async fn load_column_stats(
         return Ok(None);
     };
 
-    let part_limits = PartLimits::default();
+    // The parts are NOT fetched: this loader needs only their blake3 (which
+    // HEAD already carries) to bind the stats object to this HEAD's part set.
+    // A per-part GET here would GET every snapshot part in full only to
+    // discard it, and would turn a fault in an optional metadata artifact into
+    // a hard error on the logs query path.
     let mut expected_part_blake3: Vec<[u8; 32]> = Vec::with_capacity(head.parts.len());
     for part_ref in &head.parts {
         let Ok(blake3) = <[u8; 32]>::try_from(part_ref.blake3.as_slice()) else {
             return Ok(None);
         };
         expected_part_blake3.push(blake3);
-        // Parts are fetched only to prove liveness/decodability of the HEAD
-        // this stats ref is bound to, mirroring `load_covering_postings`'s
-        // hard-error-on-corrupt-part precedent; their entries are not needed
-        // here.
-        let got = match store.get(&part_ref.key, GetRange::Full).await {
-            Ok(got) => got,
-            Err(_) => return Ok(None),
-        };
-        if let Err(source) = decode_part(&got.data, &part_limits) {
-            return Err(LoadColumnStatsError::PartCorrupt {
-                key: part_ref.key.clone(),
-                source,
-            });
-        }
     }
 
-    let data = match store.get(&stats_ref.key, GetRange::Full).await {
+    let data = match getter.accounted_get_full(&stats_ref.key).await {
         Ok(got) => got.data,
         Err(_) => return Ok(None),
     };

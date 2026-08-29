@@ -751,8 +751,17 @@ impl Catalog {
         &self,
         tenant: &TenantHash,
         signal: Signal,
+        accounting: &QueryAccounting,
     ) -> Result<Option<LoadedColumnStats>, LoadColumnStatsError> {
-        column_stats_resolve::load_column_stats(self.store(), tenant, signal).await
+        // Route every GET through the same semaphore-bounded, accounted funnel
+        // (`guarded_get`) every other query read uses, so this path's requests
+        // and bytes are credited to `accounting` under `AccountedOp::Get` and
+        // bounded by the request semaphore (issue #850).
+        let getter = GuardedRecordGet {
+            catalog: self,
+            accounting,
+        };
+        column_stats_resolve::load_column_stats(&getter, tenant, signal).await
     }
 
     /// Evict every per-tenant cache outer-map entry for tenants last touched
@@ -5202,5 +5211,145 @@ mod tests {
             other => panic!("expected tenant_hash FieldMismatch, got {other:?}"),
         }
         assert_eq!(catalog.isolation_breaches(), 2);
+    }
+
+    /// Issue #850, Finding 1: `load_column_stats` routes every GET through the
+    /// accounted, semaphore-bounded funnel (`guarded_get`), so the caller's
+    /// `QueryAccounting` counts them under `AccountedOp::Get`. The exact charge
+    /// is TWO GETs -- the HEAD and the one column-stats object -- and no snapshot
+    /// part is fetched (Finding 2). A regression that re-added the raw
+    /// `store.get` path would credit zero requests; one that re-added the
+    /// per-part GET would credit three. Both fail this assertion.
+    #[tokio::test]
+    async fn load_column_stats_charges_exactly_two_accounted_gets() {
+        let store = Arc::new(MemoryStore::new());
+        let signal = Signal::Logs;
+        let signal_num = signal::to_proto(signal) as u32;
+
+        // One empty snapshot part.
+        let part_bytes =
+            crate::snapshot_format::encode_part(tenant().0, signal_num, 8, 10, &[]).expect("part");
+        let part_hash = *blake3::hash(&part_bytes).as_bytes();
+        let part_key = format!("t/{}/catalog/l/snap/empty.csnap", tenant().to_hex());
+        store
+            .put(
+                &part_key,
+                Bytes::from(part_bytes.clone()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put part");
+
+        // A consistent single-segment column-stats object bound to that part.
+        let segments = vec![ravel_proto::catalog::v1::ColumnStatsSegment {
+            ingest_hour_bucket: 1,
+            shard: 0,
+            writer_id: vec![0xAA; 16],
+            writer_epoch: 1,
+            writer_seq: 1,
+            columns: vec![ravel_proto::catalog::v1::ColumnStat {
+                name: "status".to_string(),
+                declared_type: 2,
+                non_null_count: 1,
+                null_count: 0,
+                min: Some(ravel_proto::catalog::v1::ColumnValue {
+                    kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(1)),
+                }),
+                max: Some(ravel_proto::catalog::v1::ColumnValue {
+                    kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(1)),
+                }),
+                dictionary_present: true,
+                dictionary: vec![ravel_proto::catalog::v1::DictEntry {
+                    value: Some(ravel_proto::catalog::v1::ColumnValue {
+                        kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(1)),
+                    }),
+                    count: 1,
+                }],
+            }],
+        }];
+        let stats_bytes = crate::snapshot_format::encode_column_stats(
+            tenant().0,
+            signal_num,
+            vec![part_hash.to_vec()],
+            &segments,
+        )
+        .expect("encode column stats");
+        let stats_hash = *blake3::hash(&stats_bytes).as_bytes();
+        let stats_key = format!("t/{}/catalog/l/cstat/one.cstat", tenant().to_hex());
+        store
+            .put(
+                &stats_key,
+                Bytes::from(stats_bytes.clone()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put stats");
+
+        let head = ravel_proto::catalog::v1::SnapshotHead {
+            format_version: crate::snapshot_format::HEAD_FORMAT_VERSION,
+            tenant_hash: tenant().0.to_vec(),
+            signal: signal_num,
+            shard_count: 8,
+            watermark_hour: 10,
+            parts: vec![ravel_proto::catalog::v1::SnapshotPartRef {
+                key: part_key,
+                blake3: part_hash.to_vec(),
+                size: part_bytes.len() as u64,
+                entry_count: 0,
+                watermark_hour: 10,
+                min_hour: 0,
+            }],
+            folder_id: Uuid::new_v4().into_bytes().to_vec(),
+            created_unix_ns: 0,
+            postings: None,
+            shard_generation_count: 1,
+            column_stats: Some(ravel_proto::catalog::v1::SnapshotColumnStatsRef {
+                key: stats_key,
+                blake3: stats_hash.to_vec(),
+                size: stats_bytes.len() as u64,
+                segment_count: 1,
+                part_blake3: vec![part_hash.to_vec()],
+            }),
+        };
+        let head_bytes = crate::snapshot_format::encode_head(&head).expect("encode head");
+        store
+            .put(
+                &crate::fold::head_object_key(&tenant(), signal),
+                Bytes::from(head_bytes),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put head");
+
+        let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
+        let acc = QueryAccounting::new();
+        let loaded = catalog
+            .load_column_stats(&tenant(), signal, &acc)
+            .await
+            .expect("load ok")
+            .expect("stats present");
+        assert_eq!(loaded.segments.len(), 1, "the one segment's stats loaded");
+
+        let snap = acc.snapshot();
+        assert_eq!(
+            snap.s3_requests(AccountedOp::Get),
+            2,
+            "exactly the HEAD GET and the column-stats GET, no per-part GET"
+        );
+        assert_eq!(
+            snap.s3_requests(AccountedOp::List),
+            0,
+            "no listing on this path"
+        );
+        assert_eq!(
+            snap.s3_requests(AccountedOp::Head),
+            0,
+            "no HEAD op on this path"
+        );
+        assert_eq!(
+            catalog.request_semaphore.available_permits(),
+            MAX_CONCURRENT_REQUESTS,
+            "every acquired permit was released"
+        );
     }
 }
