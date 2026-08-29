@@ -39,7 +39,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use ravel_types::TenantHash;
 
 use crate::attribution::TenantPutAttribution;
-use crate::metrics::FlushTrigger;
+use crate::metrics::{FlushTrigger, ShardSkew, ShardSkewStats};
 
 #[derive(Debug, Default)]
 pub struct LogIngestMetrics {
@@ -151,6 +151,21 @@ pub struct LogIngestMetrics {
     /// gauge with a per-shard dimension, unlike everything else here; read it
     /// via [`LogIngestMetrics::in_flight_flushes_by_shard`].
     in_flight_flushes: Mutex<HashMap<u32, i64>>,
+    /// Per-shard ingest-skew accounting (issue #865), the log-pipeline
+    /// counterpart of [`crate::IngestMetrics`]'s own: message throughput and the
+    /// on-actor / flush-permit-wait / off-actor time split. Same accumulator
+    /// type, so the three spans mean exactly what [`ShardSkewStats`] documents.
+    ///
+    /// This is the metric that tells a bulk load which tier is the bottleneck:
+    /// a rising `flush_permit_wait_ns` says the per-shard
+    /// `max_inflight_flushes` window is binding, a rising `on_actor_ns` says the
+    /// single-threaded actor is, and a large `off_actor_ns` against a small
+    /// wall-clock share says the shard is idle between batches because nothing
+    /// upstream handed it work (issue #800).
+    ///
+    /// Preallocated by [`LogIngestMetrics::new`]; `default()` allocates none and
+    /// therefore records nothing, exactly as [`crate::IngestMetrics`] does.
+    shard_skew: ShardSkew,
     /// Bounded-cardinality per-tenant PUT attribution (ADR-0076 decision 2),
     /// the log-pipeline counterpart of [`crate::IngestMetrics`]'s own. Carries
     /// a per-tenant dimension, so it stays bounded by a top-K cap rather than
@@ -190,6 +205,62 @@ pub struct LogIngestMetricsSnapshot {
 }
 
 impl LogIngestMetrics {
+    /// Metrics for a log router whose generation-0 set has `shard_count`
+    /// shards. Preallocates the lock-free per-shard skew accumulators (issue
+    /// #865) so the per-message path indexes straight into the slice with no
+    /// lock; see [`crate::metrics::SHARD_SKEW_CAPACITY`] for why the capacity is
+    /// not `shard_count`.
+    ///
+    /// `LogIngestMetrics::default()` allocates none, matching
+    /// [`crate::IngestMetrics::default`], which suits the tests and sinks that
+    /// never read the per-shard counters.
+    pub fn new(shard_count: u32) -> Self {
+        LogIngestMetrics {
+            shard_skew: ShardSkew::with_capacity(shard_count),
+            ..Default::default()
+        }
+    }
+
+    /// One `Write`/`WriteColumnar` message sent by the router into shard
+    /// `shard`'s channel (issue #865). Enqueue-time, so
+    /// `messages_enqueued - messages_processed` is the depth still in the
+    /// channel.
+    pub(crate) fn record_shard_enqueued(&self, shard: u32) {
+        self.shard_skew.record_enqueued(shard);
+    }
+
+    /// One write message pulled and handled by shard `shard`'s actor, plus the
+    /// injected-`Clock` nanoseconds the actor spent handling it, excluding both
+    /// the flush that runs off the actor and any flush-permit wait nested inside
+    /// the call.
+    pub(crate) fn record_shard_processed(&self, shard: u32, on_actor_ns: u64) {
+        self.shard_skew.record_processed(shard, on_actor_ns);
+    }
+
+    /// One flush trigger's injected-`Clock` wait on shard `shard`'s
+    /// `max_inflight_flushes` semaphore (ADR-0067 decision 2). This is the
+    /// figure that says whether the per-shard flush window is the binding
+    /// concurrency bound: at `max_inflight_flushes` it accrues, below it, it
+    /// stays at zero however slow the flushes are.
+    pub(crate) fn record_shard_flush_permit_wait_ns(&self, shard: u32, wait_ns: u64) {
+        self.shard_skew.record_flush_permit_wait_ns(shard, wait_ns);
+    }
+
+    /// One completed flush task's injected-`Clock` nanoseconds (encode plus both
+    /// PUTs), attributed to the shard it flushed. Bracketed inside the spawned
+    /// task with the permit already held, so it re-counts neither `on_actor_ns`
+    /// nor the permit wait that preceded the spawn.
+    pub(crate) fn record_shard_off_actor_ns(&self, shard: u32, off_actor_ns: u64) {
+        self.shard_skew.record_off_actor_ns(shard, off_actor_ns);
+    }
+
+    /// Point-in-time per-shard skew figures, sorted by shard index (issue #865),
+    /// the log counterpart of [`crate::IngestMetrics::shard_skew_by_shard`]. A
+    /// shard with no recorded activity is simply absent.
+    pub fn shard_skew_by_shard(&self) -> Vec<(u32, ShardSkewStats)> {
+        self.shard_skew.by_shard()
+    }
+
     pub(crate) fn record_flush(&self, trigger: FlushTrigger) {
         let counter = match trigger {
             FlushTrigger::Size => &self.flushes_by_size,

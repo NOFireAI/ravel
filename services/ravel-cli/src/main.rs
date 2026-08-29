@@ -253,50 +253,51 @@ enum Command {
         #[arg(long, value_name = "K")]
         read_cursors: Option<usize>,
         /// Number of Strict writes allowed in flight at once. Each batch's
-        /// write is one S3 PUT round trip per involved shard; with depth `1`
-        /// (the default) the loader submits one write and waits for its ack
-        /// before building or submitting the next, so that round-trip latency
-        /// is serial. Raising the depth lets up to this many writes overlap,
-        /// hiding the PUT latency behind later batches' encode and I/O. The
-        /// cost is memory: each in-flight write keeps its built batch resident
-        /// until its ack, so the live working set scales by roughly the depth
-        /// (see docs/guides/clickbench.md for how this stacks with the
-        /// `--batch-rows` x `--shards` product). The reported durable-token
-        /// list is unaffected by the depth: on a partial-load failure it is
-        /// always exactly the batches strictly before the failing one, in
-        /// submission order, never a later batch that happened to finish
-        /// first. But at depth greater than 1, a batch AFTER the failing one
-        /// may already have committed its data in the background at the
-        /// moment of failure -- the loader cancels its own wait for that
-        /// write's acknowledgement, not the underlying write itself -- so that
-        /// batch's rows can become query-visible without being reported as
-        /// durable. A resume from the reported tokens can therefore
-        /// re-ingest rows that already landed; this is safe only if your
-        /// downstream is tolerant of duplicate rows for the same commit
-        /// window. `1` preserves today's one-write-at-a-time behavior, where
-        /// this gap cannot occur. `0` is rejected.
-        #[arg(long, default_value_t = 1)]
+        /// write is one S3 PUT round trip per involved shard; at depth `1` the
+        /// loader submits one write and waits for its ack before building or
+        /// submitting the next, so that round-trip latency is serial and the
+        /// machine has nothing to run in between. Raising the depth lets up to
+        /// this many writes overlap, hiding the PUT latency behind later
+        /// batches' encode and I/O. Defaults to `DEFAULT_PIPELINE_DEPTH` (4),
+        /// which is where the measured 2.94x on the 100M-row ClickBench corpus
+        /// comes from (ADR-0807); `1` restores the old one-batch-at-a-time
+        /// behavior. The cost is memory: each in-flight write keeps its built
+        /// batch resident until its ack, so the live working set scales by
+        /// roughly the depth (see docs/guides/clickbench.md for how this stacks
+        /// with the `--batch-rows` x `--shards` product). The reported
+        /// durable-token list is unaffected by the depth. It is always exactly
+        /// the batches strictly before the failing one, in submission order,
+        /// followed by whatever a batch submitted after the failing one had
+        /// committed: on a failure the loader resolves every outstanding write
+        /// before returning rather than abandoning it, so the report equals what
+        /// landed at any depth, and a resume from it does not re-ingest rows
+        /// that already committed. `0` is rejected.
+        #[arg(long, default_value_t = ravel_cli::load::DEFAULT_PIPELINE_DEPTH)]
         pipeline_depth: usize,
         /// Number of flushes one shard may have in flight at once (issue #807).
         /// This bounds the shard actor's own flush pipeline, PER SHARD: the
-        /// loader writes one RLOG object per batch per involved shard, and with
-        /// the default `1` a shard actor must wait for the previous object's
-        /// PUT and commit-record publish before it starts the next one, so a
-        /// second batch landing on the same shard queues behind the first even
-        /// when `--pipeline-depth` has already handed both to the router. The
+        /// loader writes one RLOG object per batch per involved shard, and at
+        /// `1` a shard actor must wait for the previous object's PUT and
+        /// commit-record publish before it starts the next one, so a second
+        /// batch landing on the same shard queues behind the first even when
+        /// `--pipeline-depth` has already handed both to the router. The
         /// resulting ceiling on genuinely concurrent flushes is roughly
         /// `--shards` x this value, capped additionally by `--pipeline-depth`
         /// (the loader never keeps more than that many writes outstanding, so a
-        /// value above `--pipeline-depth` cannot be reached). The cost is
-        /// memory: each in-flight flush holds its built object, and the buffered
-        /// records it was built from, resident until that flush's terminal
-        /// outcome (its commit record published, or its retry budget exhausted),
-        /// so the per-shard resident flush working set scales by this value. A
-        /// Strict write's acknowledgement is unchanged by the setting: each
-        /// flush answers its own waiters only after its own data object and its
-        /// own commit record have landed. `1` preserves today's
-        /// one-flush-per-shard behavior. `0` is rejected: it is a semaphore no
-        /// flush can ever acquire, which would deadlock the shard.
+        /// value above `--pipeline-depth` cannot be reached). Defaults to
+        /// `DEFAULT_MAX_INFLIGHT_FLUSHES`, which tracks `--pipeline-depth`'s own
+        /// default (4) so the inner window never re-serialises what the outer
+        /// one made concurrent. Setting it below `--pipeline-depth` makes each
+        /// shard's excess batches queue on this semaphore, and they still have
+        /// to clear it inside the 60s Strict ack deadline. On this bulk path it
+        /// costs no extra memory: the resident flush working set is whatever the
+        /// outstanding batches carry and `--pipeline-depth` already caps that,
+        /// so this knob only decides whether those objects are encoded and PUT
+        /// concurrently or one at a time. A Strict write's acknowledgement is
+        /// unchanged by the setting: each flush answers its own waiters only
+        /// after its own data object and its own commit record have landed. `1`
+        /// restores one-flush-per-shard behavior. `0` is rejected: it is a
+        /// semaphore no flush can ever acquire, which would deadlock the shard.
         #[arg(long, default_value_t = ravel_cli::load::DEFAULT_MAX_INFLIGHT_FLUSHES)]
         max_inflight_flushes: u32,
         /// Number of decoded batches allowed to sit queued between the Parquet
