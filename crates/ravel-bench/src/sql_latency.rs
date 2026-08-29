@@ -59,7 +59,8 @@ use ravel_logseg::{
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::{
     CacheFetchError, DEFAULT_FETCH_CONCURRENCY, DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
-    DEFAULT_MAX_SEGMENTS, EngineConfig, LogSegmentFetcher, ProbeMissCounter, SegmentFetcher,
+    DEFAULT_MAX_SEGMENTS, EngineConfig, LogSegmentFetcher, PageByteCounter, PageByteCounts,
+    ProbeMissCounter, SegmentFetcher,
 };
 use ravel_sql::{
     DEFAULT_MAX_QUERY_BYTES, DeclaredColumn, DeclaredType, SpanSegmentFetcher, SqlConfig,
@@ -452,6 +453,45 @@ pub struct RunAccounting {
     /// the run's total is the two summed.
     #[serde(default)]
     pub probe_misses_scan: u64,
+    /// STORED bytes of the pages present in the blocks this run fetched
+    /// (ADR-0107 decision 4's `page_bytes_fetched`), across every phase.
+    ///
+    /// This is not a transfer figure and cannot be compared with
+    /// [`Self::object_store_bytes`], which counts bytes moved over the wire: a
+    /// page counted here may never have crossed the wire at all (a version-4
+    /// object's column-chunk fetch brings only the projected columns), and a
+    /// wire byte may cover object regions that are not pages. Never sum the two
+    /// kinds, and never divide one by the other.
+    #[serde(default)]
+    pub page_bytes_fetched: u64,
+    /// STORED bytes of the pages this run actually decoded after column
+    /// projection (ADR-0107 decision 4's `page_bytes_decoded`), across every
+    /// phase. The gap to [`Self::page_bytes_fetched`] is what a narrow
+    /// projection avoided decoding. Same stored-byte kind, same
+    /// not-comparable-with-`object_store_bytes` rule.
+    #[serde(default)]
+    pub page_bytes_decoded: u64,
+    /// [`Self::page_bytes_fetched`] charged to `ravel_query::ProbePhase::Plan`:
+    /// the footer/SKIP_IDX/FIELD_DIR reads. Same stored-byte kind. Reads zero
+    /// for a statement whose planning decodes no block, which is every plan path
+    /// in the log fetcher today.
+    #[serde(default)]
+    pub page_bytes_fetched_plan: u64,
+    /// [`Self::page_bytes_fetched`] charged to `ravel_query::ProbePhase::Scan`:
+    /// the block/page/chunk data reads. Same stored-byte kind. With
+    /// [`Self::page_bytes_fetched_plan`] it sums to
+    /// [`Self::page_bytes_fetched`].
+    #[serde(default)]
+    pub page_bytes_fetched_scan: u64,
+    /// [`Self::page_bytes_decoded`] charged to `ravel_query::ProbePhase::Plan`.
+    /// Same stored-byte kind.
+    #[serde(default)]
+    pub page_bytes_decoded_plan: u64,
+    /// [`Self::page_bytes_decoded`] charged to `ravel_query::ProbePhase::Scan`.
+    /// Same stored-byte kind. With [`Self::page_bytes_decoded_plan`] it sums to
+    /// [`Self::page_bytes_decoded`].
+    #[serde(default)]
+    pub page_bytes_decoded_scan: u64,
 }
 
 /// One measured statement.
@@ -910,16 +950,34 @@ impl Default for ExecutorSettings {
     }
 }
 
-/// The executor plus the probe-miss counter of the log fetcher inside it
-/// (#883). The counter has to be cloned out here, before the fetcher is moved
-/// into the executor, because nothing downstream hands it back: `SqlOutcome`
-/// carries a `QueryAccountingSnapshot`, which has no probe-miss field, and
-/// widening that type would change the distributed accounting protobuf, a frozen
-/// contract. See [`measure_corpus`] for how a per-run figure is taken from an
-/// accumulating counter.
+/// The executor plus the accumulating counters of the fetchers inside it: the
+/// log fetcher's probe misses (#883) and both fetchers' per-phase page bytes
+/// (epic #913 task T1). Each has to be cloned out here, before its fetcher is
+/// moved into the executor, because nothing downstream hands it back:
+/// `SqlOutcome` carries a `QueryAccountingSnapshot`, which has no probe-miss
+/// field and only a pooled page-byte pair, and widening that type would change
+/// the distributed accounting protobuf, a frozen contract. See
+/// [`measure_corpus`] for how a per-run figure is taken from an accumulating
+/// counter.
 struct ColdExecutor {
     executor: SqlExecutor,
     probe_misses: ProbeMissCounter,
+    /// Logs and spans page-byte counters. Both are read because the pooled
+    /// `page_bytes_*` pair in `SqlOutcome::accounting` covers both signals, so
+    /// reading only the logs one would make the per-phase figures fail to sum to
+    /// the pooled total on a spans statement.
+    page_bytes: [PageByteCounter; 2],
+}
+
+impl ColdExecutor {
+    /// Both fetchers' per-phase page-byte counters, summed. Every figure is
+    /// STORED page bytes (ADR-0107 decision 4), never bytes transferred.
+    fn page_byte_snapshot(&self) -> PageByteCounts {
+        self.page_bytes
+            .iter()
+            .map(PageByteCounter::snapshot)
+            .fold(PageByteCounts::default(), |acc, s| acc.saturating_add(&s))
+    }
 }
 
 fn cold_executor(
@@ -963,11 +1021,14 @@ fn cold_executor(
     // them, but taking the handle last keeps that a local fact rather than an
     // ordering the reader has to verify.
     let probe_misses = log_fetcher.probe_miss_counter();
+    let log_page_bytes = log_fetcher.page_byte_counter();
+    let span_fetcher = SpanSegmentFetcher::new(Arc::clone(store));
+    let span_page_bytes = span_fetcher.page_byte_counter();
     let executor = SqlExecutor::new(
         catalog,
         SegmentFetcher::new(Arc::clone(store)),
         log_fetcher,
-        SpanSegmentFetcher::new(Arc::clone(store)),
+        span_fetcher,
         SqlConfig {
             max_query_bytes,
             engine: EngineConfig {
@@ -984,6 +1045,7 @@ fn cold_executor(
     Ok(ColdExecutor {
         executor,
         probe_misses,
+        page_bytes: [log_page_bytes, span_page_bytes],
     })
 }
 
@@ -1169,6 +1231,12 @@ pub async fn measure_corpus(
             // Taken here, after the EXPLAIN side artifact above, so a plan
             // written for `--explain-dir` is not charged to run 0.
             let probe_misses_before = probe_misses.snapshot();
+            // Epic #913 task T1: same accumulating-counter treatment as the
+            // probe misses above, over both fetchers' page-byte counters. Taken
+            // around the same `execute` call the pooled pair in
+            // `outcome.accounting` covers, so the two channels describe exactly
+            // the same work and the phases sum to the pooled total.
+            let page_bytes_before = built.page_byte_snapshot();
             let start = Instant::now();
             let outcome = match executor.execute(tenant_hash, &req).await {
                 Ok(outcome) => outcome,
@@ -1202,6 +1270,10 @@ pub async fn measure_corpus(
             // costs are already in `object_store_get_requests` above; this says
             // how many of them the probe window is responsible for.
             let run_probe_misses = probe_misses.snapshot().saturating_sub(&probe_misses_before);
+            // This run's share of the accumulating page-byte counters. Stored
+            // page bytes, not wire bytes: never read against
+            // `object_store_bytes` on the line below.
+            let run_page_bytes = built.page_byte_snapshot().saturating_sub(&page_bytes_before);
             per_run_accounting.push(RunAccounting {
                 object_store_get_requests: acc.s3_requests(AccountedOp::Get),
                 object_store_list_requests: acc.s3_requests(AccountedOp::List),
@@ -1211,6 +1283,12 @@ pub async fn measure_corpus(
                 cache_bytes: acc.cache_bytes,
                 probe_misses_plan: run_probe_misses.plan,
                 probe_misses_scan: run_probe_misses.scan,
+                page_bytes_fetched: acc.page_bytes_fetched,
+                page_bytes_decoded: acc.page_bytes_decoded,
+                page_bytes_fetched_plan: run_page_bytes.fetched_plan,
+                page_bytes_fetched_scan: run_page_bytes.fetched_scan,
+                page_bytes_decoded_plan: run_page_bytes.decoded_plan,
+                page_bytes_decoded_scan: run_page_bytes.decoded_scan,
             });
             if run == 0 {
                 // The cold run's block counters and rows go into `scan`; its
@@ -3359,6 +3437,268 @@ mod tests {
                 "run {run}: the derived probe covered every scan-phase tail section"
             );
         }
+    }
+
+    // ---- Page bytes in the per-run accounting (ADR-0107 decision 4) --------
+
+    /// Every record written into ONE RLOG object, with its commit record.
+    /// [`write_records_as_objects`] writes one object per record, which gives a
+    /// block too small to hold a page per column worth pinning; the page-byte
+    /// tests need one block whose columns are all populated. Returns the object
+    /// bytes so a test can state the geometry its expected figures come from.
+    async fn write_records_as_one_object(
+        store: &Arc<dyn ObjectStoreBackend>,
+        tenant: &TenantId,
+        records: &[LogRecord],
+    ) -> Vec<u8> {
+        let writer_id = Uuid::from_u128(0x5100_0900);
+        let identity = ObjectIdentity {
+            tenant_hash: tenant.hash().0,
+            shard: 0,
+            writer_id: *writer_id.as_bytes(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let mut writer = RlogWriter::new(RlogConfig::default(), identity);
+        for rec in records {
+            writer.push(rec.clone()).expect("push record");
+        }
+        let bytes = writer.finish().expect("finish object");
+        let min = records.iter().map(|r| r.ts_ns).min().unwrap_or(0);
+        let max = records.iter().map(|r| r.ts_ns).max().unwrap_or(0);
+        let new_record = NewCommitRecord {
+            tenant_hash: tenant.hash(),
+            signal: Signal::Logs,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            object_size: bytes.len() as u64,
+            content_hash: [0u8; 32],
+            sample_count: records.len() as u64,
+            series_count: 1,
+            min_event_ts_ns: min,
+            max_event_ts_ns: max,
+            min_ingest_ts_ns: min,
+            max_ingest_ts_ns: max,
+            segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+            created_unix_ns: 10,
+            ingest_hour_bucket: 0,
+        };
+        let built = record::build(new_record).expect("build commit record");
+        let data_key = keys::reconstruct_data_key(&built).expect("data key");
+        store
+            .put(
+                &data_key,
+                bytes::Bytes::from(bytes.clone()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put object");
+        publish::publish(store.as_ref(), &built, &RetryPolicy::default())
+            .await
+            .expect("publish commit record");
+        bytes
+    }
+
+    /// The page-byte fixture: 8 records with 3 filler attribute keys each, in
+    /// one object, so the single block carries a page for every fixed column
+    /// (`ts`, `observed_ts`, `severity_num`, `severity_text`, `body`, `flags`,
+    /// ...) plus the attribute columns. A statement projecting `body` alone then
+    /// decodes a strict subset of the pages the block holds.
+    const PAGE_BYTE_RECORDS: usize = 8;
+    const PAGE_BYTE_EXTRA_ATTRS: usize = 3;
+
+    /// The object the fixture writes, pinned so a change in the writer or the
+    /// record builder surfaces here rather than as an unexplained drift in the
+    /// page-byte figures below.
+    const PAGE_BYTE_OBJECT_SIZE: usize = 1_536;
+
+    /// Stored bytes of every page in the fixture's one block: what a scan of it
+    /// reports as `page_bytes_fetched` regardless of projection.
+    const PAGE_BYTE_FETCHED: u64 = 375;
+
+    /// Stored bytes of the pages `SELECT body FROM logs` decodes: the `body`
+    /// column's page plus the fixed columns the reader always materializes. A
+    /// strict subset of [`PAGE_BYTE_FETCHED`].
+    const PAGE_BYTE_DECODED: u64 = 217;
+
+    /// A narrow projection over the fixture. Predicate-free and inside the
+    /// window, so the scan reads the whole object and decodes every block: the
+    /// only thing narrowing the decoded figure is the projection.
+    const PAGE_BYTE_SQL: &str = "SELECT body FROM logs";
+
+    /// Run the page-byte fixture and return its per-run accounting.
+    async fn page_byte_runs(runs: usize) -> Vec<RunAccounting> {
+        let store = empty_store();
+        let tenant = TenantId::new("page-byte-tenant");
+        let records = build_records(PAGE_BYTE_RECORDS, PAGE_BYTE_EXTRA_ATTRS);
+        let object = write_records_as_one_object(&store, &tenant, &records).await;
+        assert_eq!(
+            object.len(),
+            PAGE_BYTE_OBJECT_SIZE,
+            "fixture geometry changed; the pinned page-byte figures describe a different object"
+        );
+        let window = TimeRange {
+            start_ns: 0,
+            end_ns: NOW_NS,
+        };
+        let (measured, skipped, failed) = measure_corpus(
+            &store,
+            tenant.hash(),
+            &[entry("q", PAGE_BYTE_SQL)],
+            &[],
+            runs,
+            window,
+            NOW_NS,
+            64 << 20,
+            Duration::from_secs(30),
+            false,
+            None,
+            ExecutorSettings::default(),
+            false,
+            None,
+        )
+        .await
+        .expect("run");
+        assert!(skipped.is_empty() && failed.is_empty());
+        measured[0]
+            .per_run_accounting
+            .clone()
+            .expect("an in-process lane records per-run accounting")
+    }
+
+    /// The pair is pinned to exact stored-byte counts for a fixture whose page
+    /// geometry is known, and the narrow projection's decoded figure is a
+    /// STRICT subset of the fetched one.
+    ///
+    /// Both numbers are exact, never `> 0` and never `decoded < fetched` alone:
+    /// an inequality holds for any undercount that scales both sides, which is
+    /// exactly the defect this pins.
+    ///
+    /// Prove-the-test: with `LogSegmentScan::finish` in `ravel-query` changed to
+    /// record `stats.page_bytes_fetched / 2` and `stats.page_bytes_decoded / 2`,
+    /// this read 187 fetched against the expected 375 and 108 decoded against
+    /// the expected 217. The undercount was removed before the commit.
+    ///
+    /// These are STORED page bytes. They are not comparable with
+    /// `object_store_bytes` on the same row, which counts bytes moved over the
+    /// wire.
+    #[tokio::test]
+    async fn page_bytes_pair_is_pinned_for_a_known_page_geometry() {
+        let acc = page_byte_runs(1).await;
+        assert_eq!(
+            acc[0].page_bytes_fetched, PAGE_BYTE_FETCHED,
+            "stored bytes of every page in the block the statement fetched"
+        );
+        assert_eq!(
+            acc[0].page_bytes_decoded, PAGE_BYTE_DECODED,
+            "stored bytes of the pages the `body` projection actually decoded"
+        );
+        assert!(
+            PAGE_BYTE_DECODED < PAGE_BYTE_FETCHED,
+            "the fixture must leave the narrow projection a strict subset to skip"
+        );
+
+        // What a measurement pass reads: the pair has to be in the report JSON,
+        // per statement per run, not only in the in-memory struct.
+        let v: serde_json::Value = serde_json::to_value(&acc[0]).expect("serialize run");
+        assert_eq!(v["page_bytes_fetched"], PAGE_BYTE_FETCHED);
+        assert_eq!(v["page_bytes_decoded"], PAGE_BYTE_DECODED);
+    }
+
+    /// The per-phase figures SUM to the pooled pair, on every run.
+    ///
+    /// The two channels are written from one call site per scan and read around
+    /// one `execute`, so a split that dropped a phase or double-counted one
+    /// would break this equality. It is asserted against the pooled figures the
+    /// same row carries, not against a constant, so it keeps holding when the
+    /// fixture changes.
+    #[tokio::test]
+    async fn per_phase_page_bytes_sum_to_the_pooled_pair() {
+        let acc = page_byte_runs(2).await;
+        assert_eq!(acc.len(), 2, "one accounting entry per run");
+        for (run, e) in acc.iter().enumerate() {
+            assert_eq!(
+                e.page_bytes_fetched_plan + e.page_bytes_fetched_scan,
+                e.page_bytes_fetched,
+                "run {run}: the fetched phases must sum to the pooled fetched total"
+            );
+            assert_eq!(
+                e.page_bytes_decoded_plan + e.page_bytes_decoded_scan,
+                e.page_bytes_decoded,
+                "run {run}: the decoded phases must sum to the pooled decoded total"
+            );
+            // Every page decode in the log fetcher sits behind a scan funnel:
+            // the plan paths read the footer, SKIP_IDX and FIELD_DIR and decode
+            // no block. A measured zero, not an absent counter.
+            assert_eq!(
+                e.page_bytes_fetched_plan, 0,
+                "run {run}: no plan-phase read decodes a block, so it fetches no page"
+            );
+            assert_eq!(
+                e.page_bytes_decoded_plan, 0,
+                "run {run}: no plan-phase read decodes a page"
+            );
+            assert_eq!(
+                e.page_bytes_fetched_scan, PAGE_BYTE_FETCHED,
+                "run {run}: the whole fetched figure is charged to the scan phase"
+            );
+            assert_eq!(
+                e.page_bytes_decoded_scan, PAGE_BYTE_DECODED,
+                "run {run}: the whole decoded figure is charged to the scan phase"
+            );
+        }
+    }
+
+    /// Each page-byte figure appears EXACTLY ONCE per run in the report
+    /// structure. A figure emitted twice is as wrong as one outside its band: a
+    /// reader summing a report column would double it, and the two copies can
+    /// drift.
+    #[tokio::test]
+    async fn page_byte_figures_appear_exactly_once_per_run_in_the_report() {
+        let runs = 2;
+        let acc = page_byte_runs(runs).await;
+        let report = EntryReport {
+            id: "q".to_string(),
+            min_ms: 0.0,
+            median_ms: 0.0,
+            max_ms: 0.0,
+            cold_ms: 0.0,
+            rows_returned: 0,
+            scan: None,
+            per_run_accounting: Some(acc),
+            constructs: Vec::new(),
+            upstream_id: None,
+            modified: Modification::Verbatim,
+        };
+        let json = serde_json::to_string(&report).expect("serialize entry");
+        for key in [
+            "page_bytes_fetched",
+            "page_bytes_decoded",
+            "page_bytes_fetched_plan",
+            "page_bytes_fetched_scan",
+            "page_bytes_decoded_plan",
+            "page_bytes_decoded_scan",
+        ] {
+            assert_eq!(
+                json.matches(&format!("\"{key}\":")).count(),
+                runs,
+                "`{key}` must be emitted exactly once per run, and nowhere else"
+            );
+        }
+
+        // And nothing else in a run's row is a page-byte figure: six fields,
+        // the pooled pair plus one per phase per side.
+        let v: serde_json::Value = serde_json::to_value(&report).expect("serialize entry");
+        let row = v["per_run_accounting"][0]
+            .as_object()
+            .expect("a run is a JSON object");
+        assert_eq!(
+            row.keys().filter(|k| k.starts_with("page_bytes")).count(),
+            6,
+            "the pooled pair and the four per-phase figures, and no other"
+        );
     }
 
     // ---- The `--logs-suffix-len` seam (#883) -------------------------------

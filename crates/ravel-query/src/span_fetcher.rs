@@ -43,6 +43,8 @@
 use std::sync::Arc;
 
 use crate::fetcher::ReadCache;
+use crate::log_fetcher::ProbePhase;
+use crate::page_bytes::PageByteCounter;
 use bytes::Bytes;
 use ravel_cache::{CacheKey, SingleFlightError, Source};
 use ravel_catalog::SegmentRef;
@@ -181,6 +183,12 @@ pub struct SpanSegmentFetcher {
     /// builds the RAM or RAM-over-disk variant the same way the metric and log
     /// fetchers do.
     cache: Option<ReadCache>,
+    /// Per-phase stored page bytes across every scan this fetcher has served
+    /// (epic #913 task T1), the spans-side sibling of
+    /// [`LogSegmentFetcher::page_byte_counter`](crate::log_fetcher::LogSegmentFetcher::page_byte_counter)'s
+    /// counter. Shared by every clone, and read through
+    /// [`page_byte_counter`](Self::page_byte_counter).
+    page_bytes: PageByteCounter,
 }
 
 impl SpanSegmentFetcher {
@@ -189,7 +197,20 @@ impl SpanSegmentFetcher {
             store,
             cfg: RspanConfig::default(),
             cache: None,
+            page_bytes: PageByteCounter::new(),
         }
+    }
+
+    /// This fetcher's accumulating per-phase page-byte counter (epic #913 task
+    /// T1). Clone it out before the fetcher is moved, then difference two
+    /// [`PageByteCounter::snapshot`]s around an execution.
+    ///
+    /// The figures are STORED page bytes, not bytes transferred: see
+    /// [`crate::page_bytes`]. Never sum them with, or compare them against, the
+    /// wire bytes recorded through `QueryAccounting::add_s3_bytes`.
+    #[must_use]
+    pub fn page_byte_counter(&self) -> PageByteCounter {
+        self.page_bytes.clone()
     }
 
     /// Overrides the [`RspanConfig`] used for section-size caps when decoding.
@@ -471,6 +492,8 @@ impl SpanSegmentFetcher {
             cursor: 0,
             stats,
             accounting,
+            page_byte_counter: self.page_bytes.clone(),
+            phase: ProbePhase::Scan,
             page_bytes_fetched: 0,
             page_bytes_decoded: 0,
             pages_decoded: 0,
@@ -655,6 +678,14 @@ pub struct SpanColumnarScan {
     /// (ADR-0107 decision 4). A separate, additive axis from the wire bytes the
     /// fetch funnel records through `add_s3_bytes`.
     accounting: QueryAccounting,
+    /// The owning fetcher's per-phase page-byte counter, folded with the same
+    /// two totals and at the same moment as `accounting` (epic #913 task T1).
+    page_byte_counter: PageByteCounter,
+    /// The phase this scan's decode is charged to. A span scan is reached only
+    /// through the data-read funnels, so it is always
+    /// [`ProbePhase::Scan`]; it is carried rather than assumed at the fold so
+    /// the charge is decided where the funnel is known.
+    phase: ProbePhase,
     page_bytes_fetched: u64,
     page_bytes_decoded: u64,
     /// Column pages decoded and skipped across the blocks drained so far: the
@@ -738,6 +769,10 @@ impl SpanColumnarScan {
             .add_page_bytes_fetched(self.page_bytes_fetched);
         self.accounting
             .add_page_bytes_decoded(self.page_bytes_decoded);
+        // The same two stored-byte figures, per phase (epic #913 task T1), from
+        // this one site so the pooled pair and the split cannot disagree.
+        self.page_byte_counter
+            .record(self.phase, self.page_bytes_fetched, self.page_bytes_decoded);
     }
 }
 

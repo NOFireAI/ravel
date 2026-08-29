@@ -52,6 +52,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::erasure::ErasurePredicate;
 use crate::fetcher::ReadCache;
+use crate::page_bytes::PageByteCounter;
 use crate::phase_accounting::{PhaseAccounting, QueryPhase};
 use bytes::Bytes;
 use ravel_cache::{CacheKey, SingleFlightError, Source};
@@ -326,6 +327,13 @@ pub struct LogSegmentScan {
     /// (ADR-0107 decision 4). The same handle T1's fetch path already recorded
     /// wire bytes against; these are a separate, additive axis.
     accounting: QueryAccounting,
+    /// The owning fetcher's per-phase page-byte counter, folded with the same
+    /// two totals and at the same moment as `accounting` (epic #913 task T1), so
+    /// the per-phase figures always sum to the pooled pair.
+    page_bytes: PageByteCounter,
+    /// The phase this scan's decode is charged to, taken from the funnel that
+    /// opened it -- the same value that funnel charges its probe misses to.
+    phase: ProbePhase,
     /// Set once [`next_block`](Self::next_block) has reported exhaustion, so
     /// the span's counters are recorded exactly once.
     finished: bool,
@@ -449,6 +457,14 @@ impl LogSegmentScan {
             .add_page_bytes_fetched(stats.page_bytes_fetched);
         self.accounting
             .add_page_bytes_decoded(stats.page_bytes_decoded);
+        // The same two stored-byte figures, per phase (epic #913 task T1).
+        // Written here rather than at a second site so the pooled pair and the
+        // per-phase split can never disagree about what one scan decoded.
+        self.page_bytes.record(
+            self.phase,
+            stats.page_bytes_fetched,
+            stats.page_bytes_decoded,
+        );
     }
 }
 
@@ -542,6 +558,10 @@ pub struct LogSegmentFetcher {
     /// served (#883). Shared by every clone, like `block_range`'s GET semaphore,
     /// and read through [`probe_miss_counter`](Self::probe_miss_counter).
     probe_misses: ProbeMissCounter,
+    /// Per-phase stored page bytes across every scan this fetcher has served
+    /// (epic #913 task T1). Shared by every clone like `probe_misses`, and read
+    /// through [`page_byte_counter`](Self::page_byte_counter).
+    page_bytes: PageByteCounter,
 }
 
 impl LogSegmentFetcher {
@@ -553,6 +573,7 @@ impl LogSegmentFetcher {
             block_range_threshold: DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
             block_range: BlockRangeFetcher::new(store),
             probe_misses: ProbeMissCounter::new(),
+            page_bytes: PageByteCounter::new(),
         }
     }
 
@@ -567,6 +588,22 @@ impl LogSegmentFetcher {
     #[must_use]
     pub fn probe_miss_counter(&self) -> ProbeMissCounter {
         self.probe_misses.clone()
+    }
+
+    /// This fetcher's accumulating per-phase page-byte counter (epic #913 task
+    /// T1), read exactly like [`probe_miss_counter`](Self::probe_miss_counter):
+    /// clone it out before the fetcher is moved, then difference two
+    /// [`PageByteCounter::snapshot`]s around an execution.
+    ///
+    /// The figures are STORED page bytes, not bytes transferred: see
+    /// [`crate::page_bytes`]. Never sum them with, or compare them against, the
+    /// wire bytes recorded through `QueryAccounting::add_s3_bytes`.
+    ///
+    /// Survives every builder below, including
+    /// [`with_block_range`](Self::with_block_range).
+    #[must_use]
+    pub fn page_byte_counter(&self) -> PageByteCounter {
+        self.page_bytes.clone()
     }
 
     /// Record one block-range read's probe misses on both channels that report
@@ -1069,6 +1106,8 @@ impl LogSegmentFetcher {
             span,
             key: key.to_string(),
             accounting: accounting.clone(),
+            page_bytes: self.page_bytes.clone(),
+            phase: ProbePhase::Scan,
             finished: false,
         }))
     }
@@ -1124,6 +1163,8 @@ impl LogSegmentFetcher {
             span,
             key: key.to_string(),
             accounting: accounting.clone(),
+            page_bytes: self.page_bytes.clone(),
+            phase: ProbePhase::Scan,
             finished: false,
         }))
     }
@@ -1602,6 +1643,8 @@ impl LogSegmentFetcher {
             span,
             key: key.to_string(),
             accounting: accounting.clone(),
+            page_bytes: self.page_bytes.clone(),
+            phase: ProbePhase::Scan,
             finished: false,
         }))
     }
@@ -2200,7 +2243,10 @@ pub struct BlockRangeStats {
     pub probe_misses: u64,
 }
 
-/// The query phase a tail-section probe miss is charged to (#883).
+/// The query phase a tail-section probe miss is charged to (#883), and the same
+/// axis the stored page-byte pair is split along ([`crate::page_bytes`], epic
+/// #913 task T1). One vocabulary for both, so a report column can be read
+/// against another without translating between two phase namings.
 ///
 /// Only two of [`QueryPhase`]'s four can issue a suffix probe: `Resolve` reads
 /// commit records and `Probe` is the RSEG segment-catalog fetch, neither of

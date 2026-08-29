@@ -11,6 +11,7 @@ mod error;
 mod fetcher;
 pub mod http;
 mod log_fetcher;
+mod page_bytes;
 mod phase_accounting;
 mod query_admission;
 mod segment_admission;
@@ -36,6 +37,7 @@ pub use log_fetcher::{
     ProbeMissCounts, ProbePhase, StreamAttrEquals, WHOLE_OBJECT_REQUEST_MULTIPLE,
     derive_suffix_len,
 };
+pub use page_bytes::{PageByteCounter, PageByteCounts};
 pub use phase_accounting::{PhaseAccounting, PhaseAccountingSnapshot, QueryPhase};
 pub use query_admission::{
     QueryAdmissionController, QueryConcurrencyLimit, QueryPermit, QueryRejected,
