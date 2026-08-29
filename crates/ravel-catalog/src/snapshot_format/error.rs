@@ -243,6 +243,12 @@ pub enum SnapshotFormatError {
         "column-stats column {name:?} carries min/max but non_null_count is zero (must be absent)"
     )]
     ColumnStatsUnexpectedMinMax { name: String },
+    /// A column reports non-null rows but omits `min` or `max`, so it cannot
+    /// support a MIN/MAX answer.
+    #[error(
+        "column-stats column {name:?} has non_null_count > 0 but omits min or max (both required)"
+    )]
+    ColumnStatsMissingMinMax { name: String },
     #[error("column-stats column {name:?} has min greater than max")]
     ColumnStatsMinMaxInverted { name: String },
 }

@@ -1260,3 +1260,56 @@ async fn inconsistent_record_declines_at_use_and_scans_correct_answer() {
         "the scan returns the true count, unaffected by the corrupt stat"
     );
 }
+
+/// A column with non-null rows but no recorded extremum cannot answer MIN/MAX.
+/// Before the fix the accumulator stayed `None` and the caller substituted a
+/// NULL scalar reported as `Precision::Exact`, so the plan claimed the minimum
+/// of non-null data was exactly NULL. That is a wrong answer, not a missing
+/// optimisation, and it is the third defect of this shape on this path: the
+/// scan's ts window was ignored, a dictionary could be empty while rows were
+/// counted, and now an extremum can be absent while rows exist.
+///
+/// Asserts the SCANNED answer, not merely that a decline happened: a test that
+/// only checked for the decline would pass against an implementation that
+/// declines on everything and silently deletes the optimisation.
+///
+/// Prove-the-test: removing the `stat.non_null_count > 0 && (min.is_none() ||
+/// max.is_none())` decline in `declared_min_max_all` makes the plan report
+/// MetadataOnlyExec and the assertion below fails on the plan shape.
+#[tokio::test]
+async fn a_missing_extremum_with_non_null_rows_declines_and_scans() {
+    let corpus = RealCorpus::build().await;
+
+    // Segment A keeps its row count but loses both extrema.
+    let mut bad_a = stat_from_rows(SEG_A_ROWS);
+    bad_a.min = None;
+    bad_a.max = None;
+    let bad_stats = loaded_stats(vec![
+        (&corpus.a, stats_segment(&corpus.a, vec![bad_a])),
+        (
+            &corpus.b,
+            stats_segment(&corpus.b, vec![stat_from_rows(SEG_B_ROWS)]),
+        ),
+    ]);
+
+    let snapshot = snapshot_of(vec![corpus.a.clone(), corpus.b.clone()], Vec::new());
+    let ctx = logs_session(provider(
+        &corpus.store,
+        snapshot,
+        status_col(),
+        Some(bad_stats),
+    ))
+    .expect("session");
+    let plan = ctx
+        .sql("SELECT MIN(status), MAX(status) FROM logs")
+        .await
+        .expect("plan")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+    let shown = plan_str(&plan);
+    assert!(
+        shown.contains("LogsScanExec") && !shown.contains("MetadataOnlyExec"),
+        "non-null rows with no extremum must decline and fall back to a scan; plan was:\n{shown}"
+    );
+}

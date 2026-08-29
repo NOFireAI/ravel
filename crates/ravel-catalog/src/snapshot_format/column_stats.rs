@@ -255,6 +255,14 @@ fn validate_column(column: &ColumnStat) -> Result<(), SnapshotFormatError> {
             name: column.name.clone(),
         });
     }
+    // The symmetric case: non-null rows must carry both extrema. A record with
+    // rows but no min/max cannot support a MIN/MAX answer, and a reader that
+    // trusted it would report the extremum of non-null data as exactly NULL.
+    if column.non_null_count > 0 && (column.min.is_none() || column.max.is_none()) {
+        return Err(SnapshotFormatError::ColumnStatsMissingMinMax {
+            name: column.name.clone(),
+        });
+    }
     if let Some(min) = &column.min {
         check_value_kind(column, min, "min")?;
     }
