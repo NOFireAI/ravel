@@ -172,6 +172,9 @@ jobs:
   # docs/query-engine.md must still be checked, which a docs_only skip would
   # miss. It is one lightweight runner, not a workspace compile.
   doc-scripts:
+    # The guard only reads the checkout; nothing here needs write scope.
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

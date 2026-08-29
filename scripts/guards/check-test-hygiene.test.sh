@@ -9,6 +9,14 @@
 # Run: bash scripts/guards/check-test-hygiene.test.sh
 set -uo pipefail
 
+# A developer's ambient git config can change what this suite measures: the
+# guard runs `git check-ignore --no-index` before `git ls-files`, so a global
+# core.excludesFile rule can make the tracked-seed case report a finding that
+# has nothing to do with the fixture. Pin the fixtures to no system or global
+# config so the cases assert the guard, not the host.
+export GIT_CONFIG_NOSYSTEM=1
+export GIT_CONFIG_GLOBAL=/dev/null
+
 HERE="$(cd "$(dirname "$0")" && pwd)"
 GUARD="${HERE}/check-test-hygiene.sh"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/check-test-hygiene-test.XXXXXX")"
@@ -303,6 +311,30 @@ if [[ "${rc}" == "64" && "${out}" == *"unknown option"* ]]; then
   passes=$((passes + 1))
 else
   printf 'FAIL  an unknown option exits 64: got %s / %s\n' "${rc}" "${out}"
+  fails=$((fails + 1))
+fi
+
+# The two remaining documented usage paths. Both are behaviours the Makefile
+# and CI depend on, and neither was asserted.
+out="$(cd "${d}" && bash scripts/guards/check-test-hygiene.sh --help 2>&1)"
+rc=$?
+if [[ "${rc}" == "0" && "${out}" == *"test-hygiene"* ]]; then
+  printf 'ok    --help prints the header and exits 0\n'
+  passes=$((passes + 1))
+else
+  printf 'FAIL  --help prints the header and exits 0: got %s / %s\n' "${rc}" "${out}"
+  fails=$((fails + 1))
+fi
+
+empty="$(new_repo empty_root)"
+mkdir -p "${empty}/crates"
+out="$(cd "${empty}" && bash scripts/guards/check-test-hygiene.sh crates 2>&1)"
+rc=$?
+if [[ "${rc}" == "64" && "${out}" == *"no Rust sources"* ]]; then
+  printf 'ok    a root with no Rust source exits 64\n'
+  passes=$((passes + 1))
+else
+  printf 'FAIL  a root with no Rust source exits 64: got %s / %s\n' "${rc}" "${out}"
   fails=$((fails + 1))
 fi
 
