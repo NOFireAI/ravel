@@ -26,7 +26,7 @@ two bulk data formats do not:
 | **RLOG** | **`ravel-logseg`** | **`SupportedVersions::n_and_prev(VERSION)`** |
 
 RSEG's exclusivity is pinned by its own test
-(`crates/ravel-segment/src/format.rs:302`, `assert!(!SUPPORTED_VERSIONS.contains(VERSION_V6))`),
+(`crates/ravel-segment/src/format.rs`, `assert!(!SUPPORTED_VERSIONS.contains(VERSION_V6))`),
 so this is not an accident of drift in one direction. RLOG is the only bulk
 format carrying a two-wide window.
 
@@ -53,13 +53,13 @@ already decided twice; RLOG is out of step with it.
 graph LR
   subgraph now["main today"]
     RN["RLOG reader<br/>accepts v3 and v4"]
-    GN["logs_scan.rs:2243<br/>version gate on the<br/>#887 projection route"]
-    TN["v3 writer kept for tests<br/>v3_bytes, finish_v3_for_tests<br/>golden_rlog_v3.bin"]
+    GN["logs_scan.rs version gate<br/>on the #887<br/>projection route"]
+    TN["6 test-only v3 artifacts<br/>5 in ravel-logseg<br/>1 routing test in ravel-sql"]
   end
   subgraph after["after this ADR"]
     RA["RLOG reader<br/>accepts v4 only"]
-    GA["projection route<br/>unconditional"]
-    TA["removed"]
+    GA["projection route<br/>unconditional;<br/>version rejected<br/>before any request"]
+    TA["5 removed,<br/>routing test rewritten<br/>as a rejection test"]
   end
   RN --> RA
   GN --> GA
@@ -70,14 +70,34 @@ graph LR
 
 The v3 read path spans seven source files in `ravel-logseg` (`block.rs`,
 `writer.rs`, `reader.rs`, `footer.rs`, `skip_index.rs`, `ranged.rs`,
-`record.rs`), plus test-only machinery that exists solely to feed it:
-`BlockBuilder::v3_bytes`, `RlogWriter::finish_v3_for_tests`, the checked-in
-`tests/fixtures/golden_rlog_v3.bin`, and the `golden_bytes_v3.rs` and
-`numstat_v3.rs` suites.
+`record.rs`), plus six test-only artifacts that exist solely to feed it:
+
+| Artifact | Crate |
+|---|---|
+| `BlockBuilder::v3_bytes` | `ravel-logseg` |
+| `RlogWriter::finish_v3_for_tests` | `ravel-logseg` |
+| `tests/fixtures/golden_rlog_v3.bin` | `ravel-logseg` |
+| `tests/golden_bytes_v3.rs` | `ravel-logseg` |
+| `tests/numstat_v3.rs` (and its proptest regression file) | `ravel-logseg` |
+| `tests/logs_fast_path_projection_routing.rs` (its `RlogVersion::V3` arm) | **`ravel-sql`** |
+
+The last one is not a bystander and is the reason the inventory crosses a crate
+boundary. It pins today's routing law for a v3 object:
+
+```rust
+assert_eq!(
+    (shape.full_gets, shape.suffix_gets, shape.range_gets),
+    (SEGMENTS as u64, 0, 0),
+    "a v3 segment keeps the whole-object read however narrow the projection"
+);
+```
+
+Zero probes and zero range reads. That is the version gate doing the work: it
+routes a v3 object away from the ranged path before any request is issued.
 
 Two costs are load-bearing beyond the line count:
 
-1. **The #887 routing gate.** `crates/ravel-sql/src/logs_scan.rs:2243` reads
+1. **The #887 routing gate.** `crates/ravel-sql/src/logs_scan.rs` reads
    `seg.segment_format_version >= u32::from(ravel_logseg::footer::VERSION)`.
    That condition exists only to keep version-3 segments on the whole-object
    route, because v3 blocks are monolithic and have no addressable per-column
@@ -92,14 +112,28 @@ Two costs are load-bearing beyond the line count:
 Drop RLOG to a single supported version.
 
 1. `SUPPORTED_VERSIONS` becomes `SupportedVersions::single(VERSION)`, matching
-   RSPAN and RSEG. A v3 object is then rejected by the existing version check at
-   `footer.rs:357` with the typed error it already produces for an unsupported
-   version; no new error path is introduced.
+   RSPAN and RSEG. A v3 object is then rejected by the existing version check in
+   `footer.rs` with the typed `LogSegError::UnsupportedVersion` it already
+   produces; no new error path is introduced.
 2. Delete the version-3 read path across the seven files above, and the
-   test-only v3 producers and fixtures that exist only to exercise it.
-3. Make the #887 projection route unconditional by removing the version gate at
-   `logs_scan.rs:2243`.
-4. Add a test pinning exclusivity in the shape RSEG already uses:
+   `ravel-logseg` test-only producers and fixtures that exist only to exercise
+   it.
+3. Make the #887 projection route unconditional by removing the version gate in
+   `logs_scan.rs`.
+4. **Reject an unsupported version before issuing any request.** Removing the
+   gate is not purely subtractive. The gate is what currently routes a v3 object
+   away from the ranged path, and without it an unsupported object reaches the
+   suffix probe, and possibly a footer-range read, before `open_from_suffix`
+   returns `UnsupportedVersion`. The rejection moves ahead of the probe so an
+   unreadable object costs no round trips.
+5. Rewrite the `RlogVersion::V3` arm of `ravel-sql`'s
+   `logs_fast_path_projection_routing.rs` as a **rejection** test rather than
+   deleting it. It is the only coverage of what a v3 object costs, and this
+   change is exactly what alters that cost: it asserts
+   `(full_gets, suffix_gets, range_gets) == (SEGMENTS, 0, 0)` today, and must
+   assert `UnsupportedVersion` with the probe, `SKIP_IDX`, `PAGE_DIR`, and
+   block-range counters all zero afterwards.
+6. Add a test pinning exclusivity in the shape RSEG already uses:
    `assert!(!SUPPORTED_VERSIONS.contains(VERSION - 1))`. Deleting a reader
    without pinning its absence lets the window silently reopen.
 
@@ -141,10 +175,11 @@ in flight over `logs_scan.rs`.
 
 ## Consequences
 
-- One read path, one routing branch, and four test artifacts removed. The
+- One read path, one routing branch, and six test artifacts removed or
+  rewritten. The
   `ravel-logseg` reader surface stops being version-conditional.
 - **No performance gain, and this ADR should not be scheduled as if there were
-  one.** The ClickBench tenants are already v4, so the gate at `logs_scan.rs:2243`
+  one.** The ClickBench tenants are already v4, so the gate in `logs_scan.rs`
   passes today and the narrow-projection route already applies to them. The
   return is maintenance: fewer paths, and a defect class removed.
 - Any development store still holding v3 objects becomes unreadable and must be
