@@ -1096,6 +1096,15 @@ impl LogsScanExec {
                     a.declined = true;
                     continue;
                 };
+                // Non-null rows with no recorded extremum cannot answer MIN/MAX.
+                // Without this the accumulator stays `None` and the loop below
+                // substitutes a NULL scalar, which is then reported as
+                // `Precision::Exact` -- claiming the extremum of non-null data is
+                // exactly NULL. Fail closed and let the scan answer instead.
+                if stat.non_null_count > 0 && (stat.min.is_none() || stat.max.is_none()) {
+                    a.declined = true;
+                    continue;
+                }
                 if let Some(min_val) = stat.min.as_ref() {
                     match declared_scalar(declared.ty, min_val) {
                         Some(v) => {
