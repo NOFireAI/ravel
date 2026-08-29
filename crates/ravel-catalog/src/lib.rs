@@ -31,7 +31,7 @@ pub use auth_token_map::{
 };
 pub use catalog::Catalog;
 pub use catalog::resolve_rewrite_supersession;
-pub use column_stats_resolve::{LoadColumnStatsError, LoadedColumnStats, load_column_stats};
+pub use column_stats_resolve::{LoadColumnStatsError, LoadedColumnStats};
 pub use config::{
     CatalogConfig, DEFAULT_BYTE_CACHE_MAX_BYTES, DEFAULT_BYTE_CACHE_MAX_ENTRIES,
     DEFAULT_BYTE_CACHE_MAX_ENTRY_BYTES, DEFAULT_CACHE_CAPACITY_PER_TENANT,

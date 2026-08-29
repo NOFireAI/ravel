@@ -1450,7 +1450,24 @@ impl Catalog {
                     match self.store().get(&stats_ref.key, GetRange::Full).await {
                         Ok(got) => {
                             counters.get_requests += 1;
-                            let expected_part_blake3: Vec<[u8; 32]> = part_hashes.clone();
+                            // The previous fold's `.cstat` header is bound to
+                            // the parts THAT fold recorded on this HEAD, not to
+                            // the parts this fold just encoded (`part_hashes`).
+                            // Any incremental fold that appends entries rewrites
+                            // at least the tail part's hash, so binding against
+                            // `part_hashes` would reject the baseline on every
+                            // append and recompute every L0 segment. Bind
+                            // against `head.parts`, exactly as
+                            // `load_previous_postings` does. A malformed part
+                            // blake3 (never for a validated HEAD) yields an
+                            // empty expected set, so the binding check below
+                            // fails and the baseline is dropped -- fail safe.
+                            let expected_part_blake3: Vec<[u8; 32]> = head
+                                .parts
+                                .iter()
+                                .map(|p| <[u8; 32]>::try_from(p.blake3.as_slice()))
+                                .collect::<Result<_, _>>()
+                                .unwrap_or_default();
                             match column_stats_build::decode_previous_column_stats(
                                 &got.data,
                                 &expected_part_blake3,
@@ -2572,6 +2589,277 @@ mod tests {
             .await
             .expect("publish");
         record
+    }
+
+    /// A MemoryStore wrapper that records the key of every `get`, so a test can
+    /// assert exactly which objects a fold read.
+    struct RecordingStore {
+        inner: MemoryStore,
+        get_keys: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingStore {
+        fn new() -> Self {
+            RecordingStore {
+                inner: MemoryStore::new(),
+                get_keys: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn clear_gets(&self) {
+            self.get_keys.lock().expect("lock").clear();
+        }
+
+        fn count_gets_of(&self, key: &str) -> usize {
+            self.get_keys
+                .lock()
+                .expect("lock")
+                .iter()
+                .filter(|k| k.as_str() == key)
+                .count()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for RecordingStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, StoreError> {
+            self.get_keys.lock().expect("lock").push(key.to_string());
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ravel_object_store::ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// Publish one real L0 RLOG logs segment carrying an I64 `status` attribute
+    /// on every row, plus its commit record, exactly as ingest would. Returns
+    /// the record so the caller can reconstruct its data-object key.
+    async fn publish_logs_segment(
+        store: &dyn ObjectStoreBackend,
+        writer_seq: u64,
+        ingest_hour_bucket: u32,
+        statuses: &[i64],
+    ) -> CommitRecord {
+        use ravel_logseg::writer::ObjectIdentity;
+        use ravel_logseg::{LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
+        use ravel_types::logstream::{AttrValue, log_stream_id};
+
+        let writer_id = Uuid::from_u128(u128::from(writer_seq));
+        let resource = vec![(
+            "service.name".to_string(),
+            AttrValue::Str("api".to_string()),
+        )];
+        let mut w = RlogWriter::new(
+            RlogConfig::default(),
+            ObjectIdentity {
+                tenant_hash: tenant().0,
+                shard: 0,
+                writer_id: *writer_id.as_bytes(),
+                writer_epoch: 1,
+                writer_seq,
+            },
+        );
+        let base_ts = i64::from(ingest_hour_bucket) * NS_PER_HOUR + 60_000_000_000;
+        let mut min_ts = i64::MAX;
+        let mut max_ts = i64::MIN;
+        for (i, status) in statuses.iter().enumerate() {
+            let ts = base_ts + i as i64;
+            min_ts = min_ts.min(ts);
+            max_ts = max_ts.max(ts);
+            w.push(LogRecord {
+                stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+                stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+                ts_ns: ts,
+                observed_ts_ns: ts,
+                severity_num: 9,
+                severity_text: "INFO".into(),
+                body: format!("row {i}"),
+                trace_id: None,
+                span_id: None,
+                flags: 0,
+                attrs: vec![("status".to_string(), AttrValue::I64(*status))],
+            })
+            .expect("push");
+        }
+        let bytes = w.finish().expect("finish");
+        let content_hash = *blake3::hash(&bytes).as_bytes();
+        let record = record::build(NewCommitRecord {
+            tenant_hash: tenant(),
+            signal: Signal::Logs,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq,
+            object_size: bytes.len() as u64,
+            content_hash,
+            sample_count: statuses.len() as u64,
+            series_count: 1,
+            min_event_ts_ns: min_ts,
+            max_event_ts_ns: max_ts,
+            min_ingest_ts_ns: min_ts,
+            max_ingest_ts_ns: max_ts,
+            segment_format_version: 1,
+            created_unix_ns: max_ts,
+            ingest_hour_bucket,
+        })
+        .expect("valid record");
+        let data_key = keys::reconstruct_data_key(&record).expect("data key");
+        publish::put_data_object(store, &data_key, Bytes::from(bytes))
+            .await
+            .expect("put data object");
+        publish::publish(store, &record, &RetryPolicy::default())
+            .await
+            .expect("publish");
+        record
+    }
+
+    /// Issue #850, Finding 3: an incremental fold that appends entries must
+    /// REUSE the previous fold's column-statistics baseline for the segments it
+    /// already covered, re-fetching only the genuinely new segment. The reuse
+    /// binding is checked against the parts the baseline was actually built with
+    /// (the previous HEAD's parts), not the parts this fold just encoded.
+    ///
+    /// Asserted by a count of OBJECTS READ: after the second fold, the two
+    /// first-fold segment data objects are never GET again (reuse), while the
+    /// new segment is. Against the pre-fix code (`expected_part_blake3 =
+    /// part_hashes`), the append changes the tail part's hash, the baseline is
+    /// rejected, and both old segments are re-fetched, so `count_gets_of` for
+    /// each old data key is 1 and this test fails.
+    #[tokio::test]
+    async fn incremental_fold_reuses_column_stats_baseline() {
+        let store = Arc::new(RecordingStore::new());
+
+        // Declare `status` as an I64 typed logs column so the fold builds
+        // column statistics.
+        let cfg = crate::tenant_config::TenantConfig {
+            typed_attr_columns: Some(vec![crate::tenant_config::DeclaredTypedColumn {
+                key: "status".to_string(),
+                ty: crate::tenant_config::DeclaredColumnType::I64,
+            }]),
+            ..crate::tenant_config::TenantConfig::new(
+                crate::tenant_config::TenantLifecycleState::Active,
+            )
+        };
+        crate::tenant_config::set_tenant_config(store.as_ref(), &tenant(), &cfg, 1)
+            .await
+            .expect("write tenant config");
+
+        // Two segments in hour 10.
+        let rec_a = publish_logs_segment(store.as_ref(), 1, 10, &[200, 404, 200]).await;
+        let rec_b = publish_logs_segment(store.as_ref(), 2, 10, &[500, 200]).await;
+        let key_a = keys::reconstruct_data_key(&rec_a).expect("key a");
+        let key_b = keys::reconstruct_data_key(&rec_b).expect("key b");
+
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        let first = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(10),
+                &[],
+                None,
+            )
+            .await
+            .expect("first fold");
+        assert!(first.rebuilt, "first fold rebuilds from the commit layout");
+        assert!(
+            first.column_stats_built,
+            "the first fold builds column statistics over both hour-10 segments"
+        );
+
+        // A new segment in a later hour, then an incremental second fold.
+        let rec_c = publish_logs_segment(store.as_ref(), 3, 11, &[200, 200]).await;
+        let key_c = keys::reconstruct_data_key(&rec_c).expect("key c");
+
+        store.clear_gets();
+        let second = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(11),
+                &[],
+                None,
+            )
+            .await
+            .expect("second fold");
+        assert!(!second.rebuilt, "the second fold is incremental");
+        assert!(
+            second.column_stats_built,
+            "the second fold rebuilds the artifact"
+        );
+
+        // The reuse assertion, by objects read. Segment B is the clean
+        // discriminator: on the second fold it is fetched ONLY if the
+        // column-stats baseline was rejected and B recomputed. With reuse it is
+        // never read; with the pre-fix `part_hashes` binding it is read once.
+        //
+        // (Segment A is read once regardless, by the name-postings pass, which
+        // aborts on the first L0 entry because a logs RLOG object is not a
+        // metrics RSEG -- unrelated to column-stats reuse, so it is not asserted
+        // on. `key_a` is bound only to document that.)
+        let _ = &key_a;
+        assert_eq!(
+            store.count_gets_of(&key_b),
+            0,
+            "segment B's stats were reused, not recomputed"
+        );
+        assert!(
+            store.count_gets_of(&key_c) >= 1,
+            "the new hour-11 segment must be fetched to build its stats"
+        );
+
+        // Reuse still produced a complete artifact covering all three segments.
+        let acc = QueryAccounting::new();
+        let loaded = catalog
+            .load_column_stats(&tenant(), Signal::Logs, &acc)
+            .await
+            .expect("load ok")
+            .expect("stats present");
+        assert_eq!(
+            loaded.segments.len(),
+            3,
+            "the reused baseline plus the new segment cover all three"
+        );
     }
 
     #[test]
