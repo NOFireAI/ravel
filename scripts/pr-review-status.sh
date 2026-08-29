@@ -81,6 +81,18 @@ cr_reviews=$(echo "${reviews_json}" | jq --arg sha "${head_sha}" \
 cr_last_state=$(echo "${reviews_json}" | jq -r --arg sha "${head_sha}" \
   '[.[] | select(.user.login=="coderabbitai[bot]" and .commit_id==$sha)] | last | .state // "none"')
 
+# When CodeRabbit finds nothing it posts an ISSUE comment ("No actionable
+# comments were generated in the recent review") and files no formal review at
+# all, so the review count above stays 0 for a PR that was reviewed and came
+# back clean. Counting only reviews therefore held a clean PR indefinitely,
+# which is how a wait-for-the-bot rule gets bypassed rather than followed.
+# The walkthrough names the exact commit range it reviewed, so requiring the
+# head sha in the body keeps this as strict as the commit_id match above: a
+# stale walkthrough from before the last push does not count.
+issue_comments_json="$(gh api "repos/${repo}/issues/${pr}/comments" --paginate | jq -s 'add')"
+cr_walkthroughs=$(echo "${issue_comments_json}" | jq --arg sha "${head_sha}" \
+  '[.[] | select(.user.login=="coderabbitai[bot]" and (.body | contains($sha)))] | length')
+
 # The REST review-comments endpoint carries no resolved/unresolved field
 # (resolution is a review-THREAD concept, GraphQL-only) -- this reports the
 # raw inline-comment count. A nonzero count needs a human/session read of
@@ -99,16 +111,16 @@ fi
 if [[ "${failing}" != "0" ]]; then
   summary="${summary} (${failing_names})"
 fi
-summary="${summary} | CodeRabbit: reviews@head=${cr_reviews} last=${cr_last_state} inline_comments=${cr_comments}"
+summary="${summary} | CodeRabbit: reviews@head=${cr_reviews} walkthroughs@head=${cr_walkthroughs} last=${cr_last_state} inline_comments=${cr_comments}"
 echo "${summary}"
 
 if [[ "${state}" != "OPEN" ]]; then
   echo "  -> PR is ${state}, not open; nothing to merge"
 elif [[ "${merge_state}" == "DIRTY" || "${merge_state}" == "DRAFT" || "${merge_state}" == "BEHIND" ]]; then
   echo "  -> mergeState is ${merge_state}; not mergeable regardless of CI/CodeRabbit state below"
-elif [[ "${cr_reviews}" == "0" ]]; then
+elif [[ "${cr_reviews}" == "0" && "${cr_walkthroughs}" == "0" ]]; then
   echo "  -> no CodeRabbit review against the current head commit yet; do not merge until one lands"
-elif [[ "${cr_last_state}" != "APPROVED" && "${cr_last_state}" != "COMMENTED" ]]; then
+elif [[ "${cr_reviews}" != "0" && "${cr_last_state}" != "APPROVED" && "${cr_last_state}" != "COMMENTED" ]]; then
   echo "  -> CodeRabbit's current-head review state is ${cr_last_state} (need APPROVED or COMMENTED); not clean"
 elif [[ "${failing}" != "0" ]]; then
   echo "  -> CI has failing/cancelled checks; not clean to merge"
