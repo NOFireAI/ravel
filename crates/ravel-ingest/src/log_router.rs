@@ -154,7 +154,7 @@ impl LogIngestRouter {
         indexed_fields: Arc<IndexedFieldsOverlay>,
         rng: Arc<dyn RngSource>,
     ) -> Self {
-        let metrics = Arc::new(LogIngestMetrics::default());
+        let metrics = Arc::new(LogIngestMetrics::new(config.shard_count));
         #[cfg(feature = "stage-timing")]
         let stage_timings = Arc::new(LogStageTimings::new());
         let factory = {
@@ -387,6 +387,10 @@ impl LogIngestRouter {
                 self.mark_shard_dead(&set[shard as usize]);
                 return Err(LogWriteError::ShardUnavailable);
             }
+            // The message is now in the shard's channel (issue #865): count it
+            // as enqueued. The actor counts it processed when it pulls it, so
+            // enqueued-minus-processed is the shard's current queue depth.
+            self.metrics.record_shard_enqueued(shard);
         }
         // Routing ends at dispatch: the strict-mode ack wait below is downstream
         // durability (merge/encode/PUT happen in the shard), not a router stage.
@@ -544,6 +548,11 @@ impl LogIngestRouter {
                 self.mark_shard_dead(&set[shard as usize]);
                 return Err(LogWriteError::ShardUnavailable);
             }
+            // Enqueue-time, exactly as the row path above (issue #865). The
+            // bulk loader drives this path (ADR-0109), so omitting it here would
+            // leave the queue-depth figure blank for the one workload the
+            // measurement exists for.
+            self.metrics.record_shard_enqueued(shard);
         }
 
         if mode == WriteMode::Buffered {

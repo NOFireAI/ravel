@@ -82,12 +82,64 @@ pub const DEFAULT_TARGET_BYTES: usize = 1;
 /// with `--pipeline-depth`'s own in-flight-write working set.
 pub const DEFAULT_DECODE_QUEUE_BATCHES: usize = 2;
 
-/// Default per-shard bound on concurrently in-flight flushes (issue #807), the
-/// `--max-inflight-flushes` lever. Pinned to
-/// [`IngestConfig::max_inflight_flushes`]'s own default by
-/// `default_max_inflight_flushes_matches_ingest_config`, so the loader's
-/// out-of-the-box flush pipelining stays exactly the server's.
-pub const DEFAULT_MAX_INFLIGHT_FLUSHES: u32 = 1;
+/// Default number of Strict batch writes the loader keeps outstanding (issues
+/// #800, #807), the `--pipeline-depth` lever and the OUTER of the two write
+/// concurrency windows.
+///
+/// At `1` the submit loop awaits a batch's every-shard ack before it submits the
+/// next, so each batch's encode, data PUT, and commit-record PUT are serial with
+/// every other batch's, and the machine has nothing to run in between. Measured
+/// on the logs pipeline's own per-shard skew counters (issue #865), that idle is
+/// where a bulk load's wall goes: the shards report their whole flush duration
+/// as `off_actor_ns` and a `flush_permit_wait_ns` of exactly zero, so the flush
+/// tier is never the constraint at depth 1 -- the loader simply stops asking it
+/// for work.
+///
+/// `4` is chosen, not `--shards` and not higher:
+///
+/// - It is the largest depth with a *measured* result behind it. ADR-0807
+///   measured `--pipeline-depth 4 --max-inflight-flushes 4` at 1,519.75 s
+///   against 4,466.76 s at `1`/`1` on the 100M-row ClickBench corpus, with the
+///   object count unchanged at 8,424. A depth of 16 with the inner window left
+///   at 1 aborted outright with `timed out waiting for shard ack`, because a
+///   depth the inner window cannot absorb just queues batches behind the
+///   [`WRITE_ACK_DEADLINE`].
+/// - It bounds the memory cost at a stated multiple rather than at the shard
+///   count, which is a provisioning decision an operator may set far above 4.
+///   The loader holds at most `--pipeline-depth` built batches for their
+///   in-flight writes, plus `--decode-queue-batches` queued ahead, so this
+///   default takes the resident batch working set from `1 + 2` to `4 + 2`
+///   batches of `--batch-rows` rows.
+/// - It is at least the default `--shards` (4), so every shard of a
+///   default-provisioned signal can hold a write at once.
+pub const DEFAULT_PIPELINE_DEPTH: usize = 4;
+
+/// Default per-shard bound on concurrently in-flight flushes (issues #800,
+/// #807), the `--max-inflight-flushes` lever and the INNER of the two write
+/// concurrency windows.
+///
+/// Pinned to [`DEFAULT_PIPELINE_DEPTH`] by
+/// `default_max_inflight_flushes_matches_pipeline_depth`, because the two
+/// windows compose as `shards * min(pipeline_depth, max_inflight_flushes)`
+/// (ADR-0807): an inner window below the outer one re-serialises each shard's
+/// PUT round trips and makes batches queue behind a semaphore they will still
+/// have to clear before [`WRITE_ACK_DEADLINE`] elapses, and an inner window
+/// above the outer one is unreachable, since the loader never hands any shard
+/// more concurrent work than `--pipeline-depth` batches.
+///
+/// Unlike the outer window this one costs no additional memory on the bulk path.
+/// The resident flush working set is whatever the outstanding batches carry, and
+/// `--pipeline-depth` already caps that; this knob only decides whether that
+/// same bounded set of objects is encoded and PUT concurrently or one at a time.
+/// (On `ravel-server` the same field does bound memory, because there is no
+/// outer window upstream of it; ADR-0067 decision 2 governs that default, which
+/// this does not change.)
+///
+/// This deliberately no longer tracks [`IngestConfig::max_inflight_flushes`]'s
+/// own default of 1: that default governs the client-facing serving path, whose
+/// Strict ack contract ADR-0067 froze, and the bulk loader is a different
+/// workload with a different memory owner.
+pub const DEFAULT_MAX_INFLIGHT_FLUSHES: u32 = DEFAULT_PIPELINE_DEPTH as u32;
 
 /// Ack deadline for each Strict write. Generous: a bulk load values completing
 /// over racing a slow store.
@@ -479,6 +531,23 @@ pub struct LoadReport {
     /// [`LoadReport::objects_written`] for the object count.
     pub tokens: Vec<CommitToken>,
     pub elapsed: Duration,
+    /// Wall time the submit loop spent blocked waiting for a decoded batch to
+    /// arrive from the decode/build stage (issue #800). Together with
+    /// [`LoadReport::write_wait`] this partitions the loop's own wall clock into
+    /// the two things it can be waiting on, so "the load is slow" resolves to a
+    /// side without guessing: a large `decode_wait` means the single decoder
+    /// task is the constraint, a large `write_wait` means the write path is.
+    ///
+    /// Bracketed on [`Instant`], not the injected `Clock`: these are
+    /// measurements of the loader process, and a test clock (which the loader
+    /// itself never installs) would report them as zero.
+    pub decode_wait: Duration,
+    /// Wall time the submit loop spent blocked resolving an in-flight write
+    /// (issue #800). At `--pipeline-depth 1` this is the cross-batch barrier:
+    /// the loop resolves each batch's every-shard ack before submitting the
+    /// next, so this figure approaches the whole load and nothing else runs
+    /// while it accrues. Raising the depth is what turns it back into overlap.
+    pub write_wait: Duration,
     /// The router's cumulative write metrics, snapshotted once the load
     /// finished. Carries the dynamic-column counters (ADR-0100 decision 1) the
     /// caller reads to emit an overflow or near-cap warning; there is no other
@@ -581,6 +650,19 @@ impl LoadError {
             | LoadError::Flush { durable, .. } => durable,
         }
     }
+
+    /// The durable-token list, for a caller that still has outstanding writes to
+    /// fold into it ([`harvest_after_failure`]). `None` for
+    /// [`LoadError::Setup`], which carries no list because it never occurs once
+    /// a batch could have flushed.
+    fn durable_tokens_mut(&mut self) -> Option<&mut Vec<CommitToken>> {
+        match self {
+            LoadError::Setup(_) => None,
+            LoadError::BatchFailed { durable, .. }
+            | LoadError::RowRejected { durable, .. }
+            | LoadError::Flush { durable, .. } => Some(durable),
+        }
+    }
 }
 
 /// Bulk-import `parquet_path` into `tenant`'s logs signal.
@@ -594,9 +676,11 @@ impl LoadError {
 ///   fixed [`DEFAULT_TARGET_BYTES`] flush target that is also one flush, and so
 ///   one RLOG object per involved shard; [`load_instrumented`] takes the target
 ///   as a parameter and documents what a larger one changes.
-/// - The per-shard flush window is [`DEFAULT_MAX_INFLIGHT_FLUSHES`] and the
-///   decode-queue depth [`DEFAULT_DECODE_QUEUE_BATCHES`]; [`load_instrumented`]
-///   is the seam that takes either as a parameter.
+/// - `pipeline_depth` is the outer write window; [`DEFAULT_PIPELINE_DEPTH`] is
+///   what the CLI passes. The per-shard flush window is
+///   [`DEFAULT_MAX_INFLIGHT_FLUSHES`] and the decode-queue depth
+///   [`DEFAULT_DECODE_QUEUE_BATCHES`]; [`load_instrumented`] is the seam that
+///   takes either as a parameter.
 /// - `now_ns` is the ingest-time anchor for the future-skew check (the past-lag
 ///   check is deliberately omitted per ADR-0089). Bucketing is by the router's
 ///   own clock (load-time wall clock), independent of the records' event times.
@@ -605,7 +689,9 @@ impl LoadError {
 /// returns `Ok` has every row durable; a run that returns `Err` reports the
 /// tokens durable from batches that completed before the failure, plus any
 /// shard of the failing batch that acked durable before a sibling shard failed
-/// (recovered from the router error, issue #296) — a partial load, re-running
+/// (recovered from the router error, issue #296), plus whatever any batch
+/// submitted after the failing one had already committed by the time its write
+/// resolved ([`harvest_after_failure`], issue #800) — a partial load, re-running
 /// re-ingests the whole file, there is no resumability or dedup in this
 /// version. On a [`LoadError::Flush`], the reported tokens are exact for a
 /// partial flush where a sibling committed; they can still undercount only when
@@ -887,7 +973,13 @@ async fn load_instrumented(
     let mut decoder_done = false;
 
     loop {
-        let built = match rx.recv().await {
+        // Wall attribution (issue #800): everything the loop blocks on is either
+        // this receive or a write resolution below, so timing both partitions
+        // the loop's own wall clock with no third bucket to hide in.
+        let decode_wait_start = Instant::now();
+        let received = rx.recv().await;
+        report.decode_wait += decode_wait_start.elapsed();
+        let built = match received {
             Some(Prefetched::Done) => {
                 decoder_done = true;
                 break;
@@ -974,27 +1066,27 @@ async fn load_instrumented(
         // is the only place `report.tokens` grows during the loop, and it grows
         // strictly oldest-first, so a later batch's write finishing early can
         // never record its token ahead of an earlier one (or ahead of an earlier
-        // failure). On a write error, abort every still-queued write's
-        // `JoinHandle`: this cancels the loader's own ack wait so it does not
-        // block returning on a write it has already decided to fail, but it
-        // does NOT stop the batch's underlying shard-actor flush (see
-        // `LogIngestRouter::write` in crates/ravel-ingest/src/log_router.rs --
-        // the actor holds only a channel `tx`, no join handle of its own). A
-        // later batch can therefore still commit its data object and publish
-        // its commit record in the background after the loader has returned an
-        // error; the durable-token accounting excludes it regardless (see
-        // `resolve_write_entry`/`drain_inflight` below), so the reported list
-        // stays correct, but the object itself may still land. Tracked as a
-        // known gap pending a `ravel-ingest` cancellation mechanism.
+        // failure). On a write error, every still-outstanding later write is
+        // resolved too, and whatever it committed is folded into the reported
+        // durable list (`harvest_after_failure`): the loader cannot stop a
+        // shard-actor flush it has already handed off, so awaiting the outcome
+        // is what keeps the report equal to what landed.
+        //
+        // This is also where the loop's wall time goes at `pipeline_depth 1`,
+        // which is why it is timed (issue #800): the window is full after every
+        // single spawn, so the loop resolves each batch's every-shard ack before
+        // it can even receive the next batch.
+        //
         // Only one write is spawned per iteration, so the window exceeds its
         // bound by at most one and this resolves exactly one oldest entry; the
         // `while` + `let`-else form avoids unwrapping a `pop_front` that is
         // always `Some` here (the bound is >= 1).
+        let write_wait_start = Instant::now();
         while inflight.len() >= pipeline_depth {
             let Some(entry) = inflight.pop_front() else {
                 break;
             };
-            if let Err(e) = resolve_write_entry(
+            if let Err(mut e) = resolve_write_entry(
                 entry,
                 &mut report,
                 &mut shards_seen,
@@ -1003,12 +1095,12 @@ async fn load_instrumented(
             )
             .await
             {
-                for (_, handle) in inflight.drain(..) {
-                    handle.abort();
-                }
+                harvest_after_failure(&mut inflight, &mut e).await;
+                report.write_wait += write_wait_start.elapsed();
                 return Err(e);
             }
         }
+        report.write_wait += write_wait_start.elapsed();
     }
 
     // The channel is drained. If it closed without a `Done`, the decoder task
@@ -1183,15 +1275,9 @@ async fn resolve_write_entry(
 }
 
 /// Resolve every write still in the window, oldest-first. On the first write
-/// error it aborts every remaining (later) write's `JoinHandle` before
-/// returning. This only cancels the loader's own ack wait on those writes --
-/// it does not stop their underlying shard-actor flush, which has no join
-/// handle of its own to cancel (see the loop comment above and
-/// `crates/ravel-ingest/src/log_router.rs`) -- so a later batch can still
-/// commit independently in the background even after the loader has reported
-/// failure. The durable-token list is unaffected either way: it only ever
-/// grows from a popped, successfully-resolved entry strictly oldest-first, so
-/// an aborted entry's outcome (commit or not) is never consulted.
+/// error every remaining (later) write is resolved too and whatever it
+/// committed is folded into that error's durable-token list; see
+/// [`harvest_after_failure`] for why the loader waits rather than aborts.
 async fn drain_inflight(
     inflight: &mut std::collections::VecDeque<(
         u64,
@@ -1203,16 +1289,66 @@ async fn drain_inflight(
     shards: u32,
 ) -> Result<(), LoadError> {
     while let Some(entry) = inflight.pop_front() {
-        if let Err(e) =
+        if let Err(mut e) =
             resolve_write_entry(entry, report, shards_seen, data_batches_flushed, shards).await
         {
-            for (_, handle) in inflight.drain(..) {
-                handle.abort();
-            }
+            harvest_after_failure(inflight, &mut e).await;
             return Err(e);
         }
     }
     Ok(())
+}
+
+/// After the first write failure, resolve every write still outstanding and
+/// append whatever it committed to `err`'s durable-token list, in submission
+/// order behind the tokens already there.
+///
+/// The loader cannot cancel a write it has handed off. `JoinHandle::abort`
+/// cancels only the loader's own wait for the ack; the shard actor holds a
+/// channel `tx` and no join handle of the spawned flush (see
+/// `LogIngestRouter::write` in `crates/ravel-ingest/src/log_router.rs`), so an
+/// aborted batch's data object and commit record can still land afterwards.
+/// Aborting therefore does not prevent a later batch from committing, it only
+/// prevents the loader from *knowing* that it did -- which is precisely the gap
+/// that makes rows query-visible while the report calls them not durable, and
+/// makes a resume from that report re-ingest them as duplicates
+/// (docs/consistency-model.md: a logs re-ingest is user-visible duplication).
+///
+/// Waiting closes the gap without needing a cancellation mechanism in
+/// `ravel-ingest`: once every outstanding write has reached a terminal outcome
+/// there is nothing left that can commit, so the reported list is exactly what
+/// landed, at any `--pipeline-depth`. The cost is on the failure path only, and
+/// it is bounded: the remaining writes were submitted before the failing one and
+/// run concurrently, so this waits at most one [`WRITE_ACK_DEADLINE`].
+///
+/// A later write's own error is deliberately discarded apart from its recovered
+/// tokens: the returned error stays the first failure in submission order, which
+/// is the one the operator needs to act on.
+async fn harvest_after_failure(
+    inflight: &mut std::collections::VecDeque<(
+        u64,
+        tokio::task::JoinHandle<Result<LogWriteReceipt, LogWriteError>>,
+    )>,
+    err: &mut LoadError,
+) {
+    let Some(durable) = err.durable_tokens_mut() else {
+        // `Setup` carries no token list because it cannot occur once a batch
+        // could have flushed; there is nothing outstanding to harvest into.
+        inflight.clear();
+        return;
+    };
+    while let Some((_, handle)) = inflight.pop_front() {
+        match handle.await {
+            Ok(Ok(receipt)) => durable.extend(receipt.tokens),
+            // A partial failure still committed the shards it reports
+            // (`LogWriteError::PartialWrite`, issue #296); those objects are
+            // query-visible and belong in the list.
+            Ok(Err(write_err)) => durable.extend_from_slice(write_err.durable_tokens()),
+            // The write task itself panicked or was cancelled: no ack was
+            // observed, so nothing can be attributed to it.
+            Err(_) => {}
+        }
+    }
 }
 
 /// The Parquet reader shuttled through each stride cursor's decode/build task.
@@ -3811,16 +3947,38 @@ type = "i64"
         );
     }
 
-    /// The loader's `--max-inflight-flushes` default is the ingest layer's own
-    /// default, not an independent literal that can drift from it: omitting the
-    /// flag must leave a load running exactly the flush pipelining
-    /// `IngestConfig` ships with.
+    /// The loader's two write windows compose as
+    /// `shards * min(pipeline_depth, max_inflight_flushes)` (ADR-0807), so the
+    /// inner default must equal the outer one, not be an independent literal
+    /// that can drift below it. Below it, each shard's excess batches re-queue
+    /// on the flush semaphore and the outer window buys nothing; above it, the
+    /// value is unreachable because the loader never hands a shard more
+    /// concurrent work than `--pipeline-depth` batches.
     #[test]
-    fn default_max_inflight_flushes_matches_ingest_config() {
+    fn default_max_inflight_flushes_matches_pipeline_depth() {
         assert_eq!(
-            DEFAULT_MAX_INFLIGHT_FLUSHES,
+            DEFAULT_MAX_INFLIGHT_FLUSHES as usize, DEFAULT_PIPELINE_DEPTH,
+            "the inner flush window's default must track the outer pipeline depth's"
+        );
+    }
+
+    /// The loader's `--max-inflight-flushes` default deliberately does NOT track
+    /// `IngestConfig::max_inflight_flushes` (issue #800). That field's default of
+    /// 1 governs the client-facing serving path, whose Strict ack contract
+    /// ADR-0067 decision 2 froze and whose memory has no outer window capping
+    /// it; the bulk loader is a different workload. This pins the divergence so
+    /// that raising the serving default later is a deliberate edit here too,
+    /// rather than something that silently re-couples the two.
+    #[test]
+    fn loader_flush_window_default_diverges_from_the_serving_default() {
+        assert_eq!(
             IngestConfig::default().max_inflight_flushes,
-            "the CLI default must track IngestConfig::max_inflight_flushes"
+            1,
+            "the serving default is unchanged at 1 (ADR-0067 decision 2)"
+        );
+        assert!(
+            DEFAULT_MAX_INFLIGHT_FLUSHES > IngestConfig::default().max_inflight_flushes,
+            "the bulk loader pipelines flushes where the serving path does not"
         );
     }
 
@@ -6493,52 +6651,45 @@ type = "i64"
         );
     }
 
-    /// Durable-token correctness under a partial-window failure (the correctness
-    /// constraint this ticket turns on): with `--pipeline-depth 4` and a stream
-    /// of five single-shard batches, the data PUT for the *middle* batch (index
-    /// 2, shard 2) is held ~300ms before failing permanently. The batches
-    /// strictly after it (indices 3 and 4, shards 3 and 4) have no artificial
-    /// delay at all, so their shard actors race far ahead of shard 2's held PUT
-    /// and commit their objects *independently*, well before shard 2's failure
-    /// is even detected -- because the loader routes each batch to its own
-    /// shard actor and a shard actor's flush is downstream of the write future
-    /// the loader holds, aborting that future's `JoinHandle` does not stop the
-    /// shard actor already mid-PUT (see `LogIngestRouter::write` in
+    /// Durable-token correctness under a partial-window failure: the reported
+    /// list equals what actually committed, at `--pipeline-depth` above 1
+    /// (issue #800). With depth 4 and a stream of five single-shard batches, the
+    /// data PUT for the *middle* batch (index 2, shard 2) is held ~300ms before
+    /// failing permanently. The batches strictly after it (indices 3 and 4,
+    /// shards 3 and 4) have no artificial delay at all, so their shard actors
+    /// race far ahead of shard 2's held PUT and commit their objects
+    /// *independently*, well before shard 2's failure is even detected. The
+    /// loader cannot prevent that: it routes each batch to its own shard actor,
+    /// and a shard actor's flush is downstream of the write future the loader
+    /// holds, so aborting that future's `JoinHandle` does not stop an actor
+    /// already mid-PUT (see `LogIngestRouter::write` in
     /// `crates/ravel-ingest/src/log_router.rs`: the actor has no join handle of
-    /// its own, only a channel). That independent, unstoppable success is
-    /// exactly the trap: the reported durable list must still exclude them, even
-    /// though the objects genuinely landed.
+    /// its own, only a channel).
     ///
-    /// Asserted: the reported durable list is exactly the tokens of the batches
-    /// strictly before the failing one (shards 0 and 1), in submission order; it
-    /// carries no token for the failing batch (a full single-shard PUT failure
-    /// has no partial survivor) and none for the later batches -- even though
-    /// `watch_completed` reading 2 proves batches 3 and 4's writes did in fact
-    /// succeed and commit (the direct, non-inferred proof the spec requires:
-    /// their objects landed in the underlying store, not merely "absent from
-    /// the returned list"). This is the "even if their own write happens to
-    /// succeed independently" clause made observable: the durable list grows
-    /// only by consuming the queue oldest-first, never by whichever write
-    /// finishes, and it stays correct even though the loader's own abort of the
-    /// post-failure handles has no effect on whether those batches commit.
+    /// Since it cannot stop them, it waits for them ([`harvest_after_failure`]).
+    /// Asserted: the reported durable list is exactly shards `[0, 1, 3, 4]`, in
+    /// submission order -- the two batches before the failure, then the two
+    /// after it that committed anyway -- and carries no token for the failing
+    /// batch itself (a full single-shard PUT failure has no partial survivor).
+    /// `watch_completed` reading 2 is the direct, non-inferred proof that
+    /// batches 3 and 4's objects genuinely landed in the underlying store, so
+    /// the list equality is a claim about what happened, not about what the
+    /// loader chose to look at.
     ///
-    /// Non-vacuity (prove-the-test): the discriminating shape is the *failing*
-    /// batch being slow and a *post-failure* batch being fast, not the other way
-    /// around. A wrong resolver that consumed the window via
-    /// `select_all`/whichever-finishes-first instead of strict FIFO pop-front
-    /// would, on this exact fixture, resolve shard 3's (and shard 4's) zero-delay
-    /// success long before shard 2's ~300ms-delayed failure is ever observed --
-    /// recording a shard-3 (or shard-4) token as durable, which the
-    /// `durable.iter().all(|t| t.shard == 0 || t.shard == 1)` assertion rejects.
-    /// The ordering is deterministic because a zero-delay in-memory PUT
-    /// completes in microseconds while shard 2 is held 300ms: a 6000x margin
-    /// leaves no scheduling jitter that could invert it. (An earlier version of
-    /// this fixture delayed the *post-failure* batches instead of the failing
-    /// one; that shape is vacuous -- delaying batches 3/4 stops them finishing
-    /// early under any resolver, correct or not, so it can't distinguish FIFO
-    /// from `select_all`. The failing batch must be the slow one.)
+    /// Non-vacuity (prove-the-test): this exact assertion fails against the
+    /// pre-change code, which aborted the post-failure handles
+    /// (`for (_, handle) in inflight.drain(..) { handle.abort(); }` at the two
+    /// error sites). Confirmed by running it against that code: it panicked with
+    /// `durable.len() == 2`, the two pre-failure shards only, while
+    /// `watch_completed` still read 2 -- the gap this closes, stated as its own
+    /// failure. The ordering is deterministic because a zero-delay in-memory PUT
+    /// completes in microseconds while shard 2 is held 300ms, a 6000x margin
+    /// that no scheduling jitter inverts; and the harvest pops the window
+    /// front-to-back, so 3 precedes 4. A resolver that recorded whichever write
+    /// finished first would report the post-failure shards ahead of the
+    /// pre-failure ones and fail the exact-sequence assertion.
     #[tokio::test]
-    async fn partial_window_failure_reports_only_earlier_batches_never_later() {
+    async fn partial_window_failure_reports_every_batch_that_committed() {
         use parquet::arrow::ArrowWriter;
         use ravel_object_store::fault::{
             FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
@@ -6627,29 +6778,21 @@ type = "i64"
         // in-memory write, leaving no scheduling-jitter window that could catch
         // them mid-flight instead. This is the direct, non-inferred proof the
         // spec requires: the objects genuinely landed in the underlying store,
-        // not merely "absent from the returned list" (which a lucky race could
-        // satisfy even under a wrong implementation).
+        // not merely "present in the returned list" (which a wrong
+        // implementation could also produce, by reporting a token for a batch
+        // that never committed).
         let durable = match &err {
             LoadError::Flush { durable, .. } => durable.clone(),
             other => panic!("expected LoadError::Flush, got {other:?}"),
         };
+        let shard_sequence: Vec<u32> = durable.iter().map(|t| t.shard).collect();
         assert_eq!(
-            durable.len(),
-            2,
-            "only the two batches strictly before the failing one are durable, got {durable:?}"
-        );
-        assert_eq!(
-            durable[0].shard, 0,
-            "first durable token is batch 0 (shard 0), in submission order"
-        );
-        assert_eq!(
-            durable[1].shard, 1,
-            "second durable token is batch 1 (shard 1), in submission order"
-        );
-        assert!(
-            durable.iter().all(|t| t.shard == 0 || t.shard == 1),
-            "no token from the failing batch (shard 2) or any later batch (shards 3, 4) is \
-             reported durable, got {durable:?}"
+            shard_sequence,
+            vec![0, 1, 3, 4],
+            "the durable list is exactly the batches that committed, in submission order: the two \
+             before the failure, then the two after it whose independent writes landed anyway. It \
+             carries no token for the failing batch (shard 2), which had no partial survivor. Got \
+             {durable:?}"
         );
 
         assert_eq!(
@@ -6666,12 +6809,11 @@ type = "i64"
         assert_eq!(
             watch_completed.load(Ordering::SeqCst),
             2,
-            "batches 3 and 4's writes did in fact succeed and commit -- the loader's abort of \
-             their write handles only cancels its own ack wait, it does not stop the shard actor \
-             already mid-PUT -- yet both are still excluded from the durable list above. Operators \
-             resuming from a partial-window failure at depth > 1 must treat this as a known gap: \
-             see the --pipeline-depth documentation in clickbench.md and the ravel-ingest \
-             follow-up tracked from this test's discovery."
+            "batches 3 and 4's writes did in fact succeed and commit. The loader cannot stop a \
+             shard actor already mid-PUT, so it waits for the outcome instead of abandoning it, \
+             and both appear in the durable list above. That is what makes the report equal to \
+             what landed at any --pipeline-depth: a resume from it re-ingests neither rows that \
+             committed nor rows that did not."
         );
     }
 
