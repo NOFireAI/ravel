@@ -50,9 +50,14 @@
 //! catalog metadata: an [`RspanRangeReader`] holding the decoded SKIP_IDX plus
 //! the object key and footer, never block bytes.
 //!
-//! The merge itself is a **k-way block-streaming merge**, so its peak resident
-//! memory is bounded independently of any one trace's size, the same fix RLOG
-//! got. Unlike RLOG, there is no per-stream (here, per-trace) outer loop:
+//! The merge itself is a **k-way block-streaming merge**, so its *decode-side*
+//! peak resident memory is bounded independently of any one trace's size, the
+//! same fix RLOG got. (The in-progress part's writer buffer is a separate term:
+//! since a part closes only on a trace boundary, one trace larger than the
+//! memory target holds that whole trace live, so total residency is bounded by
+//! the largest single trace, not the target -- see `build_parts` and
+//! [`crate::config::CompactorConfig::l1_part_memory_target_bytes`].) Unlike
+//! RLOG, there is no per-stream (here, per-trace) outer loop:
 //! RSPAN's SKIP_IDX has no directory of the distinct `trace_id`s an
 //! object holds (a block entry records only its own boundary
 //! `min_trace_id`/`max_trace_id`, not every trace_id that starts inside it),
@@ -83,10 +88,15 @@
 //!
 //! Peak resident memory is then: per-input catalog metadata (KBs per input),
 //! plus at most one decoded block per input (`O(input_count * block_size)`,
-//! independent of trace size), plus the in-progress part's writer buffer
-//! (bounded by the memory bound `max_l1_part_memory_bytes`). RSPAN splits on
-//! trace boundaries and carries only that one memory bound; the stored-size
-//! target the RLOG merge grew (issue #872) has no RSPAN counterpart yet. The
+//! independent of trace size), plus the in-progress part's writer buffer. That
+//! last term tracks the memory target `l1_part_memory_target_bytes` but is not
+//! bounded by it: RSPAN closes a part only on a trace boundary, so a single
+//! trace whose decoded records exceed the target is held whole and the writer
+//! term grows to that trace's size (see
+//! [`crate::config::CompactorConfig::l1_part_memory_target_bytes`]). RSPAN
+//! splits on trace boundaries and carries only that one memory target; the
+//! stored-size target the RLOG merge grew (issue #872) has no RSPAN counterpart
+//! yet. The
 //! [`crate::config::MergeMemoryTracker`]
 //! seam accounts these terms at their real allocation/decode points, the same
 //! seam RLOG's merge feeds.
@@ -321,15 +331,19 @@ impl RecordCounts {
 
 /// The shared flat k-way block-streaming merge: every input's span records, in
 /// global `(trace_id, start_ts_ns)` order, filtered through `keep`, partitioned
-/// into parts of at most `max_l1_part_memory_bytes` (the memory bound) on trace
-/// boundaries.
+/// into parts on trace boundaries once the in-progress part's decoded-heap
+/// estimate reaches the memory target `l1_part_memory_target_bytes`. Because a
+/// part closes only on a trace boundary, a single trace larger than the target
+/// is held whole and not split (the target is not a hard bound; see
+/// [`crate::config::CompactorConfig::l1_part_memory_target_bytes`]).
 ///
 /// Both callers of the RSPAN merge run through here (issue #742). Compaction
 /// ([`SpanCodec::build_parts`]) keeps every record; the ADR-0064 erasure
 /// rewrite (`erasure_rewrite::build_rewrite_spans`) keeps the records no
 /// pending request's matcher drops. Sharing the driver is what gives the
-/// rewrite the same memory bound the compactor has: peak resident memory is one
-/// decoded block per input plus the in-progress part, never the bucket. It also
+/// rewrite the same memory profile the compactor has: peak resident memory is
+/// one decoded block per input plus the in-progress part, so it is the largest
+/// single trace rather than the whole bucket. It also
 /// means the two cannot drift on merge order, on where a part splits, or on the
 /// per-input footer cross-check ([`BlockCursor::refill`]).
 ///
@@ -419,7 +433,8 @@ pub(crate) async fn merge(
         // Only surviving records open or push into a part.
         if current_trace != Some(trace_id) {
             if let Some(part) = &current {
-                let over_cap = part.estimate >= config.max_l1_part_memory_bytes && !part.is_empty();
+                let over_cap =
+                    part.estimate >= config.l1_part_memory_target_bytes && !part.is_empty();
                 if over_cap && let Some(builder) = current.take() {
                     let built = builder
                         .finish(store, bucket, input_set_hash, part_index, dry_run)
@@ -480,7 +495,7 @@ async fn open_cursor<'a>(
 /// One in-progress L1 part: the shared [`RspanWriter`] merged records push
 /// into directly, plus the running record-byte estimate that decides where
 /// the part splits (a trace boundary once the estimate reaches the memory
-/// bound `max_l1_part_memory_bytes`) and feeds the [`MergeMemoryTracker`]'s
+/// bound `l1_part_memory_target_bytes`) and feeds the [`MergeMemoryTracker`]'s
 /// writer term.
 struct PartBuilder {
     writer: RspanWriter,
@@ -1205,7 +1220,7 @@ mod tests {
 
         let clock = FixedClock::new(sealed_now_ns());
         let config = CompactorConfig {
-            max_l1_part_memory_bytes: 256,
+            l1_part_memory_target_bytes: 256,
             ..CompactorConfig::default()
         };
         compact_bucket(&store, &clock, &config, &bucket())
@@ -1489,7 +1504,7 @@ mod tests {
                 "[mem:rspan #908] records/input={records_per_input} trace~={trace_bytes}B \
                  peak_transient={transient}B peak_total={total}B transient_bound={TRANSIENT_BOUND}B \
                  mem_bound={}B",
-                config.max_l1_part_memory_bytes
+                config.l1_part_memory_target_bytes
             );
 
             // The decode-side peak is under the fixed bound.
@@ -1506,7 +1521,7 @@ mod tests {
             // part, bounded by the part cap (content-addressing needs the
             // whole part before its key exists).
             assert!(
-                total < TRANSIENT_BOUND + config.max_l1_part_memory_bytes,
+                total < TRANSIENT_BOUND + config.l1_part_memory_target_bytes,
                 "total peak {total} exceeded transient bound + memory bound"
             );
             peaks.push(transient);
@@ -1678,24 +1693,75 @@ mod tests {
         prop::collection::vec(prop::collection::vec(spec_strategy(), 1..15), 2..6)
     }
 
-    async fn differential_check(corpus: Vec<Vec<SpanSpec>>, max_l1_part_bytes: u64) {
+    /// The exact number of L1 parts `merge` must produce for `corpus` under a
+    /// memory target of `mem_target`, computed arithmetically from the same
+    /// split rule the merge runs: records are grouped by `trace_id` in ascending
+    /// order (every record survives in this harness), and a part is closed at a
+    /// trace boundary once its accumulated [`estimate_record`] heap estimate has
+    /// reached the target. Pinning the exact count (not just "the property
+    /// holds") is what makes the boundary variant discriminate: if `merge`
+    /// stopped consulting the memory target, or the harness stopped configuring
+    /// it, every corpus would collapse to one part and this prediction would
+    /// diverge from the observed count.
+    ///
+    /// `input_records` must be the records as the merge sees them -- decoded
+    /// back from the seeded L0 objects, not the raw specs. The L0 `RspanWriter`
+    /// canonicalises each record (notably folding duplicate attribute keys), so
+    /// `estimate_record` over a decoded record can be smaller than over its
+    /// spec; predicting from specs would over-count the heap and diverge from
+    /// the merge on exactly those corpora.
+    fn predict_part_count(input_records: &[SpanRecord], mem_target: u64) -> usize {
+        let mut per_trace: BTreeMap<[u8; 16], u64> = BTreeMap::new();
+        for r in input_records {
+            *per_trace.entry(r.trace_id).or_insert(0) += estimate_record(r);
+        }
+        let mut parts = 0usize;
+        let mut current = 0u64;
+        let mut started = false;
+        for (_, trace_bytes) in per_trace {
+            // The merge checks `estimate >= target` at each trace boundary,
+            // before the first record of the next trace opens/pushes.
+            if started && current >= mem_target {
+                parts += 1;
+                current = 0;
+            }
+            current += trace_bytes;
+            started = true;
+        }
+        if started {
+            parts += 1;
+        }
+        parts
+    }
+
+    async fn differential_check(corpus: Vec<Vec<SpanSpec>>, mem_target: u64) {
         let store = MemoryStore::new();
         let mut all_input_records: Vec<SpanRecord> = Vec::new();
+        // The records as the merge decodes them from L0 (post writer
+        // canonicalisation), which is what the split prediction must be built
+        // from.
+        let mut decoded_inputs: Vec<SpanRecord> = Vec::new();
         for (i, input) in corpus.iter().enumerate() {
             let records: Vec<SpanRecord> = input.iter().map(spec_to_record).collect();
             all_input_records.extend(records.clone());
-            seed(
+            let bytes = seed(
                 &store,
                 Uuid::from_u128((i + 1) as u128),
                 (i + 1) as u64,
                 &records,
             )
             .await;
+            decoded_inputs.extend(decode_all(&bytes));
         }
+
+        let predicted_parts = predict_part_count(&decoded_inputs, mem_target);
 
         let clock = FixedClock::new(sealed_now_ns());
         let config = CompactorConfig {
-            max_l1_part_bytes,
+            // The merge splits on the memory target, not the stored-size target;
+            // configuring the wrong field leaves the target at its 256 MiB
+            // default so every corpus collapses to one part (issue #680).
+            l1_part_memory_target_bytes: mem_target,
             ..CompactorConfig::default()
         };
         compact_bucket(&store, &clock, &config, &bucket())
@@ -1703,6 +1769,16 @@ mod tests {
             .expect("compact");
         let (rec, parts) = read_output(&store).await;
         assert_eq!(rec.level, 1);
+
+        // The part count is exactly what the split rule predicts. This is the
+        // assertion that would fail if the target stopped reaching `merge`: the
+        // union-equality checks below held vacuously on a single part before
+        // this harness configured the field the merge actually reads.
+        assert_eq!(
+            parts.len(),
+            predicted_parts,
+            "part count must match the memory-target split prediction"
+        );
 
         // Decode every L1 part (concatenated in part order) and compare its
         // record set to the inputs decoded directly, as an order-independent
@@ -1734,21 +1810,28 @@ mod tests {
         /// The correctness core (ADR-0041): for a random corpus of span records
         /// split across N L0 objects, the full decoded record set is identical
         /// whether the N L0 inputs are decoded and concatenated or the single
-        /// compacted L1 output is decoded. Default part cap: a single L1 part.
+        /// compacted L1 output is decoded. Default memory target: a single L1
+        /// part.
         #[test]
         fn differential_l0_union_equals_l1_output(corpus in corpus_strategy()) {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .unwrap();
-            rt.block_on(differential_check(corpus, CompactorConfig::default().max_l1_part_bytes));
+            rt.block_on(differential_check(
+                corpus,
+                CompactorConfig::default().l1_part_memory_target_bytes,
+            ));
         }
 
-        /// The same union-equality property under a tiny part cap that forces
-        /// the merge to split across multiple parts on trace boundaries, so the
-        /// "concatenate all parts" side of the differential actually crosses
-        /// part boundaries. Single-trace corpora stay one part (a trace never
-        /// straddles) and still exercise the property.
+        /// The same union-equality property under a tiny memory target that
+        /// forces the merge to split across multiple parts on trace boundaries,
+        /// so the "concatenate all parts" side of the differential actually
+        /// crosses part boundaries. The target must be configured on the field
+        /// `merge` reads (`l1_part_memory_target_bytes`); `differential_check`
+        /// pins the exact predicted part count, so a corpus with several traces
+        /// whose combined heap exceeds the target produces more than one part
+        /// and a regression back to a single part fails the prediction.
         #[test]
         fn differential_holds_across_part_boundaries(corpus in corpus_strategy()) {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -1757,5 +1840,81 @@ mod tests {
                 .unwrap();
             rt.block_on(differential_check(corpus, 512));
         }
+    }
+
+    /// A fixed, deliberately multi-trace corpus under a tiny memory target: the
+    /// merge MUST split it into more than one part. This is the non-proptest
+    /// companion to `differential_holds_across_part_boundaries`: it pins a
+    /// concrete `parts.len() > 1` so the boundary coverage cannot silently
+    /// regress to a single part on every seed. If `merge` stopped reading
+    /// `l1_part_memory_target_bytes` (or this harness set the wrong field), the
+    /// target would sit at its 256 MiB default and this corpus would produce
+    /// exactly one part.
+    #[tokio::test]
+    async fn differential_boundary_corpus_splits_into_multiple_parts() {
+        // Eight distinct traces, each with several attributed spans, so the
+        // per-trace heap estimate is well above the 512-byte target and a part
+        // closes at almost every trace boundary.
+        let corpus: Vec<Vec<SpanSpec>> = (0..2u8)
+            .map(|input| {
+                (0..8u8)
+                    .flat_map(|trace| {
+                        (0..3u8).map(move |span| SpanSpec {
+                            trace,
+                            span: trace.wrapping_mul(16).wrapping_add(span),
+                            start: i64::from(span),
+                            dur: 5,
+                            name: "query".to_string(),
+                            msg: Some("hello world".to_string()),
+                            attrs: vec![
+                                ("svc".to_string(), format!("service-{input}-{trace}")),
+                                ("k0".to_string(), "payload-value".to_string()),
+                            ],
+                        })
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let store = MemoryStore::new();
+        let mut decoded_inputs: Vec<SpanRecord> = Vec::new();
+        for (i, input) in corpus.iter().enumerate() {
+            let records: Vec<SpanRecord> = input.iter().map(spec_to_record).collect();
+            let bytes = seed(
+                &store,
+                Uuid::from_u128((i + 1) as u128),
+                (i + 1) as u64,
+                &records,
+            )
+            .await;
+            decoded_inputs.extend(decode_all(&bytes));
+        }
+
+        let predicted = predict_part_count(&decoded_inputs, 512);
+        assert!(
+            predicted > 1,
+            "fixture must predict a multi-part split, got {predicted}"
+        );
+
+        let clock = FixedClock::new(sealed_now_ns());
+        let config = CompactorConfig {
+            l1_part_memory_target_bytes: 512,
+            ..CompactorConfig::default()
+        };
+        compact_bucket(&store, &clock, &config, &bucket())
+            .await
+            .expect("compact");
+        let (_, parts) = read_output(&store).await;
+        assert!(
+            parts.len() > 1,
+            "tiny memory target must split this multi-trace corpus into more \
+             than one part, got {}",
+            parts.len()
+        );
+        assert_eq!(
+            parts.len(),
+            predicted,
+            "observed split must match prediction"
+        );
     }
 }

@@ -242,7 +242,7 @@ pub async fn build_parts(
     // whole stream's decoded records the way the RLOG merge does -- it
     // materializes and flushes series by series -- so its peak is already the
     // output part, which `max_l1_part_bytes` bounds directly. `max_l1_part_bytes`
-    // is the encoded budget; the RLOG-only `max_l1_part_memory_bytes` does not
+    // is the encoded budget; the RLOG-only `l1_part_memory_target_bytes` does not
     // apply.
     let mut pending: Vec<SeriesInputV7> = Vec::new();
     let mut pending_exemplars: Vec<ExemplarInput> = Vec::new();

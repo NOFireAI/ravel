@@ -16,8 +16,13 @@ use uuid::Uuid;
 ///
 /// The RLOG k-way merge ([`crate::rlog`]) and the RSPAN k-way merge
 /// ([`crate::rspan_codec`]) drive this at their real allocation/decode points
-/// so a test can assert each merge's residency is bounded independently of a
-/// stream's or trace's size. It is deliberately *load-bearing*, not
+/// so a test can assert each merge's *decode-side* residency
+/// ([`Self::peak_transient_bytes`]) is bounded independently of a stream's or
+/// trace's size. (The total residency [`Self::peak_total_bytes`] adds the
+/// in-progress part's writer buffer, which the RSPAN whole-trace case can grow
+/// past the memory target; see that method and
+/// [`CompactorConfig::l1_part_memory_target_bytes`].) It is deliberately
+/// *load-bearing*, not
 /// decorative: the merge calls [`Self::block_fetched`] when it fetches one
 /// input block's raw bytes, [`Self::block_decoded`]/[`Self::block_released`] as
 /// each decoded block enters and leaves a cursor, and [`Self::set_writer_bytes`]
@@ -33,13 +38,17 @@ use uuid::Uuid;
 ///   one raw block plus one decoded block per input, so it is
 ///   `O(input_count * block_size)` and does NOT scale with stream/trace size.
 /// - [`Self::peak_total_bytes`]: `fetched + decoded + writer`, adding the
-///   in-progress part's writer buffer. The writer term is bounded by the
-///   memory bound `max_l1_part_memory_bytes` (a part is flushed as soon as its
-///   record-heap estimate reaches that bound, mid-stream if that is where it
-///   falls) and is the unavoidable content-addressing cost the ADR calls out:
-///   a part's key does not exist until the whole part is buffered. The RLOG
-///   merge may also close a part earlier on the stored-size target
-///   `max_l1_part_bytes` (issue #872), which only lowers this term.
+///   in-progress part's writer buffer. The writer term tracks the memory
+///   target `l1_part_memory_target_bytes`: the RLOG merge flushes as soon as a
+///   pushed record's heap estimate reaches it (mid-stream), so its writer term
+///   stays near the target; the RSPAN merge flushes only at a trace boundary,
+///   so a single trace larger than the target drives this term to the size of
+///   that trace, not the target (the target is not a hard bound on this term,
+///   see [`CompactorConfig::l1_part_memory_target_bytes`]). The writer buffer
+///   is the unavoidable content-addressing cost the ADR calls out: a part's key
+///   does not exist until the whole part is buffered. The RLOG merge may also
+///   close a part earlier on the stored-size target `max_l1_part_bytes` (issue
+///   #872), which only lowers this term.
 ///
 /// Production never installs one (`CompactorConfig::merge_memory_tracker` is
 /// `None`), so the hooks compile to a single `Option` check and add nothing.
@@ -61,7 +70,7 @@ struct MergeMemoryInner {
     /// High-water of `fetched + decoded + writer`.
     peak_total: AtomicU64,
     /// Parts closed because the decoded record-heap estimate reached
-    /// `max_l1_part_memory_bytes` (the memory bound fired).
+    /// `l1_part_memory_target_bytes` (the memory target fired).
     memory_bound_flushes: AtomicU64,
     /// Parts closed because the encoded-bytes estimate reached
     /// `max_l1_part_bytes` (the stored-size target fired).
@@ -129,8 +138,8 @@ impl MergeMemoryTracker {
         self.inner.peak_total.load(Ordering::Relaxed)
     }
 
-    /// Record that a part was closed by the memory bound (its decoded
-    /// record-heap estimate reached `max_l1_part_memory_bytes`).
+    /// Record that a part was closed by the memory target (its decoded
+    /// record-heap estimate reached `l1_part_memory_target_bytes`).
     pub fn note_memory_bound_flush(&self) {
         self.inner
             .memory_bound_flushes
@@ -145,7 +154,7 @@ impl MergeMemoryTracker {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// How many parts closed because the memory bound fired.
+    /// How many parts closed because the memory target fired.
     pub fn memory_bound_flushes(&self) -> u64 {
         self.inner.memory_bound_flushes.load(Ordering::Relaxed)
     }
@@ -172,20 +181,22 @@ pub const DEFAULT_MAX_COMPACTION_LIFETIME_NS: i64 = NS_PER_HOUR;
 /// bytes in `build.rs`; an encoded-bytes estimate in the RLOG merge). It is
 /// deliberately equal to the memory-bound default so this crate's geometry is
 /// unchanged from when one knob did both jobs: on a wide schema the memory
-/// bound reaches 256 MiB of decoded record heap long before a part's stored
-/// bytes reach 256 MiB, so the memory bound stays binding and the stored
+/// target reaches 256 MiB of decoded record heap long before a part's stored
+/// bytes reach 256 MiB, so the memory target stays binding and the stored
 /// target does not fire. Lowering it to `8..=16 MiB` is the follow-up that
 /// grows objects (issue #872); see `max_l1_part_stored_bytes`'s doc.
 pub const DEFAULT_MAX_L1_PART_BYTES: u64 = 256 * 1024 * 1024;
-/// Default `max_l1_part_memory_bytes`: 256 MiB. This is the **memory bound**:
-/// the decoded record-heap estimate the in-progress part is closed at, the
-/// invariant issue #711 added to keep compactor peak memory survivable on an
-/// 8 GB host (a bucket carrying one wide stream once held 45.7 GB resident
-/// under a nominal 256 MiB cap that was measured in stored, not heap, bytes).
+/// Default `l1_part_memory_target_bytes`: 256 MiB. This is the **memory
+/// target**: the decoded record-heap estimate the in-progress part is closed
+/// at, the mechanism issue #711 added to keep compactor peak memory survivable
+/// on an 8 GB host (a bucket carrying one wide stream once held 45.7 GB
+/// resident under a nominal 256 MiB cap that was measured in stored, not heap,
+/// bytes). It is a target rather than a bound because the RSPAN merge honours
+/// it only at trace boundaries; see [`CompactorConfig::l1_part_memory_target_bytes`].
 /// Equal to [`DEFAULT_MAX_L1_PART_BYTES`] on purpose: the two jobs were one
 /// knob before this split and their shared default reproduces the old
 /// behaviour exactly.
-pub const DEFAULT_MAX_L1_PART_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
+pub const DEFAULT_L1_PART_MEMORY_TARGET_BYTES: u64 = 256 * 1024 * 1024;
 /// Default minimum L0 records for a bucket to be worth compacting.
 pub const DEFAULT_MIN_COMPACTION_INPUTS: usize = 2;
 /// Default footer suffix-probe size. 64 KiB covers the footer + catalog of a
@@ -353,24 +364,42 @@ pub struct CompactorConfig {
     /// for the bytes it measures: it governs object geometry (object count and
     /// per-object stored size), which is what the historical `max_l1_part_bytes`
     /// name always implied. It does NOT bound memory; that is
-    /// [`Self::max_l1_part_memory_bytes`]. A part closes on whichever of the two
+    /// [`Self::l1_part_memory_target_bytes`]. A part closes on whichever of the two
     /// is reached first. Default [`DEFAULT_MAX_L1_PART_BYTES`] (256 MiB), chosen
     /// so today's geometry is unchanged (issue #872); lower it to grow objects.
     pub max_l1_part_bytes: u64,
-    /// The **memory bound**: close the in-progress L1 part once its decoded
-    /// record-heap estimate reaches this, wherever in the merged record
-    /// sequence that falls (mid-stream if need be). This is what issue #711
-    /// added and what keeps compactor peak memory bounded: the RLOG/RSPAN
-    /// merges hold one whole in-progress part's records live before its
-    /// content-addressed key can be computed, so the resident heap of that part
-    /// is what this caps ([`crate::rlog::estimate_record`] /
-    /// `rspan_codec::estimate_record`, the Rust heap of a `LogRecord`/
-    /// `SpanRecord`, an order of magnitude larger than its compressed bytes on
-    /// a wide schema). Named for the bytes it measures: decoded heap, not
-    /// stored bytes. A part closes on whichever of this and
-    /// [`Self::max_l1_part_bytes`] is reached first. Default
-    /// [`DEFAULT_MAX_L1_PART_MEMORY_BYTES`] (256 MiB).
-    pub max_l1_part_memory_bytes: u64,
+    /// The **memory target**: close the in-progress L1 part once its decoded
+    /// record-heap estimate reaches this. This is a *target*, not a hard bound,
+    /// and the name says so deliberately (issue #680): the two merges honour it
+    /// at different granularities and neither can guarantee the resident heap
+    /// never exceeds it.
+    ///
+    /// - The RLOG merge ([`crate::rlog::PartSink`]) checks after every pushed
+    ///   record and flushes immediately, so it holds this target plus at most
+    ///   one record's overshoot.
+    /// - The RSPAN merge (`rspan_codec::merge`) checks only on a `trace_id`
+    ///   transition, to keep a whole trace in one part (a part carries disjoint
+    ///   ascending `trace_id` ranges). A single trace whose decoded records
+    ///   exceed this target is therefore held whole and NOT split: the resident
+    ///   heap for that part is the size of the trace, not the target. The
+    ///   erasure rewrite (`erasure_rewrite`) runs the same RSPAN merge and
+    ///   inherits the same behaviour.
+    ///
+    /// It measures decoded Rust heap ([`crate::rlog::estimate_record`] /
+    /// `rspan_codec::estimate_record`, the heap of a `LogRecord`/`SpanRecord`,
+    /// an order of magnitude larger than its compressed bytes on a wide schema),
+    /// not stored bytes, which is why it is a separate knob from
+    /// [`Self::max_l1_part_bytes`]: the merges hold one whole in-progress part's
+    /// records live before its content-addressed key can be computed, and this
+    /// governs how large that live heap grows before a part is closed (at a
+    /// trace boundary for RSPAN, per record for RLOG). A part closes on
+    /// whichever of this and [`Self::max_l1_part_bytes`] is reached first.
+    /// Enforcing a true per-record bound on the RSPAN side would require
+    /// splitting a trace across parts, which the format's disjoint-trace-range
+    /// invariant forbids; sizing a host must therefore budget for the largest
+    /// single trace, not this target. Default
+    /// [`DEFAULT_L1_PART_MEMORY_TARGET_BYTES`] (256 MiB).
+    pub l1_part_memory_target_bytes: u64,
     /// Buckets with fewer L0 records than this are left uncompacted; set 1 for
     /// v1-retirement campaigns.
     pub min_compaction_inputs: usize,
@@ -492,7 +521,7 @@ impl Default for CompactorConfig {
             clock_skew_allowance_ns: DEFAULT_CLOCK_SKEW_ALLOWANCE_NS,
             max_compaction_lifetime_ns: DEFAULT_MAX_COMPACTION_LIFETIME_NS,
             max_l1_part_bytes: DEFAULT_MAX_L1_PART_BYTES,
-            max_l1_part_memory_bytes: DEFAULT_MAX_L1_PART_MEMORY_BYTES,
+            l1_part_memory_target_bytes: DEFAULT_L1_PART_MEMORY_TARGET_BYTES,
             min_compaction_inputs: DEFAULT_MIN_COMPACTION_INPUTS,
             footer_probe_bytes: DEFAULT_FOOTER_PROBE_BYTES,
             input_read_concurrency: DEFAULT_INPUT_READ_CONCURRENCY,

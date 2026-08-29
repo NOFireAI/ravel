@@ -51,8 +51,8 @@
 //!
 //! That scope reduction no longer covers logs or spans. [`build_rewrite_logs`]
 //! (issue #725) and [`build_rewrite_spans`] (issue #742) run their signal's own
-//! streaming compaction merge and split survivors into parts bounded by the
-//! memory bound `max_l1_part_memory_bytes` (and, for logs, the stored-size
+//! streaming compaction merge and split survivors into parts sized by the
+//! memory target `l1_part_memory_target_bytes` (and, for logs, the stored-size
 //! target `max_l1_part_bytes`, issue #872); only metrics still has the
 //! whole-object, single-part shape described above.
 //!
@@ -1188,7 +1188,7 @@ fn first_dropping_log_request(
 /// block at a time by range (never whole), `input_read_concurrency` cursor
 /// opens are in flight at once, and survivors land in a `PartSink` that closes
 /// the in-progress part as soon as its decoded-heap estimate reaches the memory
-/// bound `max_l1_part_memory_bytes` (or its encoded estimate reaches the
+/// bound `l1_part_memory_target_bytes` (or its encoded estimate reaches the
 /// stored-size target `max_l1_part_bytes`, issue #872), wherever in the merged
 /// record sequence that falls. Peak resident memory is therefore one part plus
 /// one decoded block per input, never the bucket.
@@ -1302,15 +1302,19 @@ fn first_dropping_span_request(
 ///
 /// This is [`rspan_codec::merge`], the same flat k-way block-streaming merge
 /// the compactor runs, with the erasure predicate as its per-record filter. So
-/// it inherits every bound issue #711 gave RSPAN compaction: each input is read
-/// one block at a time by range (never whole) through one `BlockCursor`,
-/// `input_read_concurrency` cursor opens are in flight at once, and survivors
-/// land in a `PartBuilder` that closes the in-progress part on a trace boundary
-/// as soon as its decoded-heap estimate reaches the memory bound
-/// `max_l1_part_memory_bytes` (RSPAN carries only that bound; the RLOG
+/// it inherits the same memory profile issue #711 gave RSPAN compaction: each
+/// input is read one block at a time by range (never whole) through one
+/// `BlockCursor`, `input_read_concurrency` cursor opens are in flight at once,
+/// and survivors land in a `PartBuilder` that closes the in-progress part on a
+/// trace boundary once its decoded-heap estimate reaches the memory target
+/// `l1_part_memory_target_bytes` (RSPAN carries only that target; the RLOG
 /// stored-size target of issue #872 has no RSPAN counterpart yet). Peak
-/// resident memory is therefore one part plus one decoded block per input,
-/// never the bucket.
+/// resident memory is therefore one part plus one decoded block per input.
+/// Because a part closes only on a trace boundary, that one part is the largest
+/// single surviving trace when a trace's decoded records exceed the target: the
+/// target is not a hard bound, so this is bounded by the largest single trace
+/// rather than the whole bucket (see
+/// [`crate::config::CompactorConfig::l1_part_memory_target_bytes`]).
 ///
 /// It did NOT always work this way: this function used to GET every input whole
 /// with `RspanReader::scan`, and push every survivor into ONE unbounded
@@ -3558,7 +3562,7 @@ mod tests {
 
         let clock = FixedClock::new(sealed_now_ns());
         let config = CompactorConfig {
-            max_l1_part_memory_bytes: CAP,
+            l1_part_memory_target_bytes: CAP,
             ..CompactorConfig::default()
         };
 
@@ -3745,7 +3749,7 @@ mod tests {
     }
 
     /// Issue #725: an erasure over a bucket whose SURVIVORS exceed
-    /// `max_l1_part_memory_bytes` several times over emits exactly the number of
+    /// `l1_part_memory_target_bytes` several times over emits exactly the number of
     /// parts the cap implies, not one part sized by the bucket. Every erased
     /// row is absent, every other row is present exactly once and in canonical
     /// order across the part sequence, and the count conserves the ADR-0064
@@ -3757,7 +3761,7 @@ mod tests {
     ///
     /// Demonstrated red by restoring the single unbounded writer: in
     /// `rlog::PartSink::push`, replace `over_memory = part.estimate >=
-    /// self.config.max_l1_part_memory_bytes` with `over_memory = false`. Every
+    /// self.config.l1_part_memory_target_bytes` with `over_memory = false`. Every
     /// survivor then lands in one part and this fails at the part-count
     /// assertion with `1 != 8`.
     #[tokio::test]
@@ -3788,7 +3792,7 @@ mod tests {
 
         let clock = FixedClock::new(sealed_now_ns());
         let config = CompactorConfig {
-            max_l1_part_memory_bytes: CAP,
+            l1_part_memory_target_bytes: CAP,
             ..CompactorConfig::default()
         };
         let mut memo = MaintainMemo::with_default_interval();
@@ -3912,7 +3916,7 @@ mod tests {
 
             let tracker = MergeMemoryTracker::new();
             let config = CompactorConfig {
-                max_l1_part_memory_bytes: CAP,
+                l1_part_memory_target_bytes: CAP,
                 merge_memory_tracker: Some(tracker.clone()),
                 ..CompactorConfig::default()
             };
@@ -3991,7 +3995,7 @@ mod tests {
             // under `/l1/`, so neither is caught here.
             let gate = store.hold(Op::Get, Some("/l0/".to_string()), Occurrence::Always);
             let config = CompactorConfig {
-                max_l1_part_memory_bytes: 64 * 1024,
+                l1_part_memory_target_bytes: 64 * 1024,
                 input_read_concurrency: concurrency,
                 ..CompactorConfig::default()
             };
@@ -4821,7 +4825,7 @@ mod tests {
     }
 
     /// Issue #742: an erasure over a SPANS bucket whose SURVIVORS exceed
-    /// `max_l1_part_memory_bytes` several times over emits exactly the number of
+    /// `l1_part_memory_target_bytes` several times over emits exactly the number of
     /// parts the cap implies, not one part sized by the bucket. Every erased span is
     /// absent, every other span is present exactly once and in canonical
     /// `(trace_id, start_ts)` order across the part sequence, and the count
@@ -4832,7 +4836,7 @@ mod tests {
     ///
     /// Demonstrated red by restoring the single unbounded writer: in
     /// `rspan_codec::merge`, replace the trace-boundary flush trigger
-    /// `let over_cap = part.estimate >= config.max_l1_part_memory_bytes && !part.is_empty();`
+    /// `let over_cap = part.estimate >= config.l1_part_memory_target_bytes && !part.is_empty();`
     /// with `let over_cap = false;`. Every survivor then lands in one part and
     /// this fails at the part-count assertion with `1 != <expected_parts>`.
     #[tokio::test]
@@ -4863,7 +4867,7 @@ mod tests {
 
         let clock = FixedClock::new(sealed_now_ns());
         let config = CompactorConfig {
-            max_l1_part_memory_bytes: CAP,
+            l1_part_memory_target_bytes: CAP,
             ..CompactorConfig::default()
         };
         let mut memo = MaintainMemo::with_default_interval();
@@ -4982,7 +4986,7 @@ mod tests {
 
             let tracker = MergeMemoryTracker::new();
             let config = CompactorConfig {
-                max_l1_part_memory_bytes: CAP,
+                l1_part_memory_target_bytes: CAP,
                 merge_memory_tracker: Some(tracker.clone()),
                 ..CompactorConfig::default()
             };
@@ -5062,7 +5066,7 @@ mod tests {
             // under `/l1/`, so neither is caught here.
             let gate = store.hold(Op::Get, Some("/l0/".to_string()), Occurrence::Always);
             let config = CompactorConfig {
-                max_l1_part_memory_bytes: 64 * 1024,
+                l1_part_memory_target_bytes: 64 * 1024,
                 input_read_concurrency: concurrency,
                 ..CompactorConfig::default()
             };

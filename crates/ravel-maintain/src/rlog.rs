@@ -99,7 +99,7 @@
 //! stream size) and the raw bytes of the range that block came from
 //! (`O(input_count * group_size)` under version 4, stored bytes rather than
 //! decoded records), plus the in-progress part's writer buffer. The writer
-//! buffer is bounded by the **memory bound** `max_l1_part_memory_bytes`:
+//! buffer is bounded by the **memory bound** `l1_part_memory_target_bytes`:
 //! [`PartSink`] closes the in-progress part as soon as its [`estimate_record`]
 //! (decoded-heap) total reaches that bound, wherever in the merged record
 //! sequence that falls, so a stream may span consecutive parts. It did NOT
@@ -119,7 +119,7 @@
 //!
 //! # Memory bound and stored-size target are two separate knobs (issue #872)
 //!
-//! `max_l1_part_memory_bytes` above bounds the decoded record heap and is what
+//! `l1_part_memory_target_bytes` above bounds the decoded record heap and is what
 //! keeps this merge survivable on a small host. It does NOT govern object
 //! geometry: on a wide schema it reaches 256 MiB of heap after only a few MB of
 //! stored bytes, so every L1 object was tiny (~3.5 MB on ClickBench, a 74x gap
@@ -412,7 +412,7 @@ pub(crate) struct MergeOutput {
 
 /// The shared k-way block-streaming merge: every input's records, in global
 /// `(stream_id, ts)` order, filtered through `keep`, partitioned into parts
-/// closed at the memory bound `max_l1_part_memory_bytes` or the stored-size
+/// closed at the memory bound `l1_part_memory_target_bytes` or the stored-size
 /// target `max_l1_part_bytes`, whichever is reached first.
 ///
 /// Both callers of the RLOG merge run through here. Compaction
@@ -491,7 +491,7 @@ pub(crate) async fn merge_catalogs(
     // k-way merged from every input carrying it (ts-ascending, canonical
     // input-order tie-break) straight into the current part's writer, and
     // the part flushes the moment its accumulated record-heap estimate
-    // reaches `max_l1_part_memory_bytes` (the memory bound) or its encoded
+    // reaches `l1_part_memory_target_bytes` (the memory bound) or its encoded
     // estimate reaches `max_l1_part_bytes` (the stored target), whichever comes
     // first -- mid-stream if that is where the bound falls (issue #711 for the
     // memory bound, issue #872 for the stored target, ADR-0032 amendment
@@ -549,7 +549,7 @@ impl RecordCounts {
 /// The split rule pushes records in the merge's canonical order and closes the
 /// in-progress part as soon as EITHER bound is reached (issue #872): its
 /// [`PartBuilder::estimate`] (decoded heap) reaches the memory bound
-/// `max_l1_part_memory_bytes`, or its [`PartBuilder::stored_estimate`] (encoded
+/// `l1_part_memory_target_bytes`, or its [`PartBuilder::stored_estimate`] (encoded
 /// bytes) reaches the stored target `max_l1_part_bytes`, wherever in the record
 /// sequence that falls. The memory bound is the whole of issue #711: the check
 /// used to run only between streams, so a bucket whose records all belong to
@@ -599,7 +599,7 @@ impl PartSink<'_> {
             // estimate reaches its target first. With the shipped defaults
             // (both 256 MiB) the memory bound binds and the stored target does
             // not fire, so this crate's geometry is unchanged.
-            over_memory = part.estimate >= self.config.max_l1_part_memory_bytes;
+            over_memory = part.estimate >= self.config.l1_part_memory_target_bytes;
             over_stored = part.stored_estimate >= self.config.max_l1_part_bytes;
         }
         if over_memory || over_stored {
@@ -663,7 +663,7 @@ impl PartSink<'_> {
 struct PartBuilder {
     writer: RlogWriter,
     /// Sum of [`estimate_record`] over every pushed record: the **memory
-    /// bound**'s trigger (compared against `max_l1_part_memory_bytes`) and the
+    /// bound**'s trigger (compared against `l1_part_memory_target_bytes`) and the
     /// writer-buffer term the tracker records. This is decoded Rust heap, not
     /// stored bytes.
     estimate: u64,
@@ -695,15 +695,28 @@ impl PartBuilder {
     }
 
     /// Push one merged record into the part's writer, updating both running
-    /// estimates (heap for the memory bound, encoded for the stored target) and
+    /// estimates (heap for the memory target, encoded for the stored target) and
     /// the part's inclusive stream-id bounds.
     fn push(&mut self, r: LogRecord, tracker: Option<&MergeMemoryTracker>) -> Result<()> {
+        // Records enter a part in ascending `(stream_id, ts)` order, so a
+        // `stream_id` that differs from the running maximum is the first record
+        // of a distinct stream. Each distinct stream contributes one STREAM_DIR
+        // entry (its `stream_attrs` blob plus fixed framing) to the encoded
+        // object exactly once, not once per record; charge it here so a part
+        // holding many streams with large resource/scope blobs reaches the
+        // stored-size target instead of undercounting by the whole directory.
+        let new_stream = self.max_stream != Some(r.stream_id);
         self.min_stream = Some(self.min_stream.map_or(r.stream_id, |m| m.min(r.stream_id)));
         self.max_stream = Some(self.max_stream.map_or(r.stream_id, |m| m.max(r.stream_id)));
         self.estimate = self.estimate.saturating_add(estimate_record(&r));
         self.stored_estimate = self
             .stored_estimate
             .saturating_add(estimate_stored_record(&r));
+        if new_stream {
+            self.stored_estimate = self.stored_estimate.saturating_add(
+                STORED_STREAM_DIR_FIXED_BYTES.saturating_add(r.stream_attrs.len() as u64),
+            );
+        }
         self.count += 1;
         self.writer.push(r)?;
         if let Some(t) = tracker {
@@ -1200,7 +1213,7 @@ const ATTR_SLOT_BYTES: u64 = std::mem::size_of::<(String, AttrValue)>() as u64;
 
 /// The Rust-side heap one merged [`LogRecord`] occupies while it waits in the
 /// in-progress part's writer, which is what the memory bound
-/// `max_l1_part_memory_bytes` caps (issue #711). This is deliberately NOT the
+/// `l1_part_memory_target_bytes` caps (issue #711). This is deliberately NOT the
 /// record's encoded size (that is [`estimate_stored_record`], which the
 /// stored-size target uses): the writer holds row-major `LogRecord`s, and for a
 /// wide log row (the ClickBench shape: ~105 attributes) the Rust representation
@@ -1284,6 +1297,15 @@ fn attr_value_estimate(v: &AttrValue) -> u64 {
 /// figure in the range those fixed-width columns cost before compression.
 const STORED_RECORD_FIXED_BYTES: u64 = 16;
 
+/// The fixed STREAM_DIR framing one distinct stream adds to a part's stored
+/// size, beyond its `stream_attrs` blob: the 16-byte `stream_id` plus the small
+/// length and block-range uvarints of its STREAM_DIR entry
+/// (docs/log-segment-format.md). [`PartBuilder::push`] charges this plus the
+/// blob length once per distinct stream in the part, since STREAM_DIR stores a
+/// stream's attributes once, not once per record. Flat and approximate, like
+/// the rest of the stored estimate.
+const STORED_STREAM_DIR_FIXED_BYTES: u64 = 24;
+
 /// The encoded/on-object bytes one merged [`LogRecord`] is estimated to add to
 /// a part, the quantity `max_l1_part_bytes` (the stored-size target) caps.
 ///
@@ -1297,11 +1319,17 @@ const STORED_RECORD_FIXED_BYTES: u64 = 16;
 /// It is a pre-compression payload proxy: the sum of the value bytes that
 /// actually enter this part's columns (timestamps and identifiers as a small
 /// fixed cost, then `severity_text`, `body`, and every dynamic attribute's key
-/// and value bytes). Two things are excluded on purpose:
+/// and value bytes). Two things are excluded from this PER-RECORD figure on
+/// purpose:
 ///
 /// - `stream_attrs` (the resource/scope blob) is stored once per stream in
 ///   STREAM_DIR, not once per record, so charging it per record would inflate
-///   the estimate on exactly the wide-stream shape this is meant to size.
+///   the estimate on exactly the wide-stream shape this is meant to size. It is
+///   not dropped from the part's stored estimate, though: [`PartBuilder::push`]
+///   charges each distinct stream's blob plus [`STORED_STREAM_DIR_FIXED_BYTES`]
+///   once (issue #680), so a part with many streams carrying large
+///   resource/scope blobs still reaches the stored-size target instead of
+///   undercounting the whole directory.
 /// - zstd compression. The estimate is the uncompressed column payload, so it
 ///   is an upper bound on the bytes those columns compress to; a target of `T`
 ///   payload bytes yields an object of `T / compression_ratio` stored bytes.
@@ -2601,6 +2629,91 @@ mod tests {
         records.div_ceil(per_part)
     }
 
+    /// Issue #680: a part's stored estimate must charge each distinct stream's
+    /// STREAM_DIR blob once. A workload with many streams carrying large
+    /// resource/scope blobs stores one blob per stream in STREAM_DIR, so an
+    /// estimate that only sums the per-record columns (which
+    /// [`estimate_stored_record`] excludes `stream_attrs` from) undercounts the
+    /// object by the whole directory and lets the part grow past
+    /// `max_l1_part_bytes`.
+    ///
+    /// The magnitude assertion is proportional to the stream count, not a flat
+    /// floor: the estimate must include ALL streams' blobs. Charging only the
+    /// first stream (the deliberate under-charge the message reports) omits
+    /// `(STREAMS - 1)` blobs and lands below the threshold.
+    #[test]
+    fn stored_estimate_charges_every_streams_stream_dir_blob() {
+        const STREAMS: u32 = 12;
+        // A large per-stream resource value, so each STREAM_DIR blob dwarfs the
+        // record's own columnar payload and the directory dominates the object.
+        let big = "x".repeat(256);
+        let mut records: Vec<LogRecord> = (0..STREAMS)
+            .map(|n| {
+                let res = vec![(
+                    "service.name".to_string(),
+                    AttrValue::Str(format!("{n:03}-{big}")),
+                )];
+                let stream_id = log_stream_id(&res, "scope", "1", &[]);
+                let stream_attrs = stream_attrs_bytes(&res, "scope", "1", &[]);
+                LogRecord {
+                    stream_id,
+                    stream_attrs,
+                    ts_ns: 0,
+                    observed_ts_ns: 0,
+                    severity_num: 9,
+                    severity_text: "INFO".into(),
+                    body: "b".into(),
+                    trace_id: None,
+                    span_id: None,
+                    flags: 0,
+                    attrs: Vec::new(),
+                }
+            })
+            .collect();
+        // Records enter a part in ascending `(stream_id, ts)` order, which is
+        // what makes each distinct stream's first record detectable.
+        records.sort_by(|a, b| a.stream_id.cmp(&b.stream_id).then(a.ts_ns.cmp(&b.ts_ns)));
+
+        let blob_bytes: u64 = records.iter().map(|r| r.stream_attrs.len() as u64).sum();
+        let per_record_stored: u64 = records.iter().map(estimate_stored_record).sum();
+
+        let identity = ObjectIdentity {
+            tenant_hash: tenant_hash().0,
+            shard: SHARD,
+            writer_id: Uuid::from_u128(1).into_bytes(),
+            writer_epoch: EPOCH,
+            writer_seq: 1,
+        };
+        let no_fields: Vec<String> = Vec::new();
+        let mut part = PartBuilder::new(&identity, &no_fields);
+        for r in &records {
+            part.push(r.clone(), None).expect("push");
+        }
+
+        // The threshold: per-record payload plus EVERY stream's blob. Its value
+        // scales with the stream count, so a fraction-of-the-streams estimate
+        // clears no version of it.
+        let threshold = per_record_stored + blob_bytes;
+        // What charging only the first stream would produce, reported so a
+        // regression's magnitude is visible in the failure.
+        let undercharged_first_stream_only = per_record_stored
+            + STORED_STREAM_DIR_FIXED_BYTES
+            + records[0].stream_attrs.len() as u64;
+        assert!(
+            undercharged_first_stream_only < threshold,
+            "the threshold must reject a first-stream-only charge: \
+             undercharged {undercharged_first_stream_only} >= threshold {threshold}"
+        );
+        assert!(
+            part.stored_estimate >= threshold,
+            "stored estimate {} must charge all {STREAMS} streams' STREAM_DIR \
+             blobs ({blob_bytes} B total); a first-stream-only charge would \
+             give {undercharged_first_stream_only}, below the threshold \
+             {threshold}",
+            part.stored_estimate
+        );
+    }
+
     /// Read a compacted logs bucket back the way a query does: through the real
     /// [`ravel_catalog::Catalog`] resolve, then decode every segment it serves,
     /// concatenated in the resolver's own segment order.
@@ -2637,7 +2750,7 @@ mod tests {
     /// delete the `if over_memory || over_stored { .. self.flush().await?; }`
     /// block from `PartSink::push` and re-add the flush to `build_parts`'s
     /// `for stream_id in merged.keys()` loop (`if part.estimate >=
-    /// config.max_l1_part_memory_bytes { sink.flush().await?; }` after
+    /// config.l1_part_memory_target_bytes { sink.flush().await?; }` after
     /// `merge_stream_into_parts`). The part count collapses to 1 and this test
     /// fails at `assert_eq!(parts.len() as u64, expected_parts)` with
     /// `1 != 10`.
@@ -2676,7 +2789,7 @@ mod tests {
         );
 
         let config = CompactorConfig {
-            max_l1_part_memory_bytes: CAP,
+            l1_part_memory_target_bytes: CAP,
             ..CompactorConfig::default()
         };
         let clock = FixedClock::new(sealed_now_ns());
@@ -2800,7 +2913,7 @@ mod tests {
 
             let tracker = MergeMemoryTracker::new();
             let config = CompactorConfig {
-                max_l1_part_memory_bytes: CAP,
+                l1_part_memory_target_bytes: CAP,
                 merge_memory_tracker: Some(tracker.clone()),
                 ..CompactorConfig::default()
             };
@@ -2893,7 +3006,7 @@ mod tests {
 
         let tracker = MergeMemoryTracker::new();
         let config = CompactorConfig {
-            max_l1_part_memory_bytes: BOUND,
+            l1_part_memory_target_bytes: BOUND,
             max_l1_part_bytes: BOUND,
             merge_memory_tracker: Some(tracker.clone()),
             ..CompactorConfig::default()
@@ -3027,7 +3140,7 @@ mod tests {
                 .await;
             }
             let config = CompactorConfig {
-                max_l1_part_memory_bytes: MEM_BOUND,
+                l1_part_memory_target_bytes: MEM_BOUND,
                 max_l1_part_bytes: stored_target,
                 ..CompactorConfig::default()
             };
@@ -3086,7 +3199,7 @@ mod tests {
 
         let tracker = MergeMemoryTracker::new();
         let config = CompactorConfig {
-            max_l1_part_memory_bytes: MEM_BOUND,
+            l1_part_memory_target_bytes: MEM_BOUND,
             max_l1_part_bytes: u64::MAX, // stored target effectively off
             merge_memory_tracker: Some(tracker.clone()),
             ..CompactorConfig::default()
@@ -3331,7 +3444,7 @@ mod tests {
                 "[mem:rlog #745] records/input={records_per_input} stream~={stream_bytes}B \
                  peak_transient={transient}B peak_total={total}B transient_bound={TRANSIENT_BOUND}B \
                  mem_bound={}B",
-                config.max_l1_part_memory_bytes
+                config.l1_part_memory_target_bytes
             );
 
             // The decode-side peak is under the fixed bound.
@@ -3348,7 +3461,7 @@ mod tests {
             // part, bounded by the part cap (content-addressing needs the whole
             // part before its key exists).
             assert!(
-                total < TRANSIENT_BOUND + config.max_l1_part_memory_bytes,
+                total < TRANSIENT_BOUND + config.l1_part_memory_target_bytes,
                 "total peak {total} exceeded transient bound + memory bound"
             );
             peaks.push(transient);
