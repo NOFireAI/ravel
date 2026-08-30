@@ -178,3 +178,61 @@ existing one) addable without a proto change, matching the additive-evolution
 discipline the rest of this record follows. Decoding enforces `family` is
 non-empty and lowercase, fail-closed on either violation, so the field is not
 an unconstrained string in practice — see `ravel_catalog::provisioning::FloorDefect`.
+
+## Amendment (2026-08-30): Class B convergence splits by binding grain
+
+Decision 4's Class B definition asserts that a derived catalog object converges
+automatically because "the fold rewrites them continuously," so a version bump
+"needs no migration tool." That premise holds only for a **whole-set-bound**
+derived object — one every fold regenerates in full (`.csnap`, `.npost`, HEAD):
+the upgraded fold emits the new version, supersession GCs the old parts, and
+convergence is free.
+
+It does **not** hold for a **part-bound** derived object — one bound to a
+specific snapshot part's content hash so that a sealed part is carried forward
+by reference and never rewritten (ADR-0913 §2a binds `.magg` state this way so
+that "sealed history's states survive every fold untouched"; ADR-0942 re-keys
+`.cstat` the same way). Continuous rewrite is exactly what Class B relies on for
+free convergence, and *not* rewriting sealed state is exactly what makes
+per-part binding economical: they are the same property with opposite signs, so
+one class rule cannot describe both. The concrete consequence, already observed:
+an idle, fully-compacted tenant folds nothing and rebuilds nothing. The
+incremental fold lists only hours after the previous watermark plus a bounded
+reconcile window, sealed parts are carried forward by reference and never
+re-listed, and the build reuses the prior baseline for any entry already in it
+(`crates/ravel-catalog/src/fold.rs:1515`, `baseline.get(&identity)`). A
+part-bound object relying on Class B's automatic convergence to gain coverage on
+such a tenant gains none, silently, because the gap degrades to fall-back-to-scan
+rather than to an error.
+
+Class B therefore has two convergence sub-cases:
+
+- **Whole-set-bound derived objects** (`.csnap`, `.npost`, HEAD) converge by
+  continuous fold rewrite, exactly as the original definition states. A version
+  bump needs no migration tool: the upgraded fold emits the new version and
+  supersession GCs the old parts, with dual-read only across the rolling-upgrade
+  window. Multi-part fold (ADR-0063) remains this sub-case's first consumer.
+- **Part-bound derived objects** (`.magg` per ADR-0913, re-keyed `.cstat` per
+  ADR-0942) converge by retention (a part ages out with its hour bucket at zero
+  marginal cost) plus rewrite-on-touch (a fold that touches a part re-emits its
+  state at the current version, so the live tail converges on its own) plus
+  **a named backfill pass**: an operator-triggered rebuild fold, with the
+  derived-state baseline forced to `None`, that re-lists and re-folds sealed
+  parts once so they gain current-version coverage. That pass is Decision 5's
+  operator-triggered migration job applied to the sealed-history tail neither
+  retention nor rewrite-on-touch reaches. The live tail is Class B as written;
+  only the sealed tail needs the pass.
+
+**Obligation.** Every format ADR that binds derived state per part must name its
+backfill trigger explicitly. A part-bound derived object without one is inert on
+a quiescent, fully-compacted tenant — precisely the reference-corpus shape — and
+the inertness reads as a slow query, not an error, so it is invisible unless the
+ADR states the trigger. ADR-0913 §7 (the "one maintenance pass that forces a
+rebuild fold over unchanged parts" for `.magg`) and ADR-0942 (the
+operator-triggered stats-rebuild pass that forces the `.cstat` baseline to
+`None` and re-folds sealed parts) are the two format ADRs that already satisfy
+this obligation.
+
+This amendment corrects only the Class B convergence claim. Classes A, C, and D,
+decision 1's readers-before-writers rule, and decision 3's format-floor
+mechanism are unchanged.
