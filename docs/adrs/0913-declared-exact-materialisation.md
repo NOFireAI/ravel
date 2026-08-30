@@ -464,9 +464,18 @@ payload is its own value. Nothing pins the scan-side `COUNT DISTINCT`'s
 f64 equality to that same partition, and a materialised distinct count
 must equal the scan's to the last row. Deferred until the scan-side f64
 distinct equality is pinned by its own decision, the same gated-deferral
-shape as §4d. Together the two sections tell one story: a declared `f64`
-column enters v1 aggregate state only through `MIN`/`MAX`, whose total
-order §4b pins to the engine's own UDAF (ADR-0023).
+shape as §4d. Together the two sections tell one story about which f64
+aggregates are deferred: `SUM`/`AVG` and `COUNT DISTINCT`, the three that
+need f64 *value* semantics — addition order in one case, an equality
+partition in the other.
+
+A declared `f64` column still enters v1 aggregate state two ways, and the
+split is the point rather than an exception. `MIN`/`MAX` are admissible
+because §4b pins their total order to the engine's own UDAF (ADR-0023),
+so the extreme is well defined without deciding what f64 equality means.
+`COUNT(col)` is admissible because it never touches the value at all: it
+counts non-null rows, so no encoding, ordering or equality question
+arises. What is deferred is exactly the set that would need one.
 
 Exact distinct state grows without bound in NDV — there is no encoding
 that does not — so at ~10^7 NDV the arithmetic alone (10^7 values at even
