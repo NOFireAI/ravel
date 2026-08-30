@@ -503,13 +503,39 @@ def cold(q):
         return None
     return pra[0]
 
+def byte_count(v, what):
+    """A byte figure from the report, or None with a recorded failure.
+
+    The producer emits these as u64, but this script reads arbitrary JSON and
+    must not trust it. Three values would otherwise pass a naive numeric check
+    and corrupt a band silently:
+
+      * `true` -- `bool` is a subclass of `int` in Python, so it would add 1.
+      * `NaN`  -- `json.loads` accepts it, and every comparison against it is
+                  False, so `amp > band` would report the band as MET. A
+                  malformed report would read as a pass, which is worse than
+                  reading as a failure.
+      * a negative -- impossible for a byte count, and it would drag a total
+                  down toward a passing figure.
+    """
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        fails.append(f"{what}: expected a byte count, got {v!r}")
+        return None
+    if v != v or v in (float("inf"), float("-inf")):      # NaN or +/-inf
+        fails.append(f"{what}: byte count is not finite ({v!r})")
+        return None
+    if v < 0:
+        fails.append(f"{what}: byte count is negative ({v!r})")
+        return None
+    return v
+
 def scan_wire(acc):
     """Scan-phase WIRE bytes: the data-block reads. The report carries per-phase
     wire BYTES but no per-phase GET count, so scan-phase bytes is the data-read
     signal. At the zero point it is exact: zero scan bytes == zero data GETs."""
     for p in acc.get("wire_bytes_by_phase") or []:
         if p.get("phase") == "scan":
-            return p.get("wire_bytes") or 0
+            return byte_count(p.get("wire_bytes"), "scan-phase wire_bytes")
     fails.append("a measured run carries no scan-phase wire_bytes entry")
     return None
 
@@ -634,17 +660,15 @@ def amplification(qs, label, band):
         sw = scan_wire(acc)
         if sw is None:
             return
-        # The denominator gets the same treatment as the numerator: absent is a
-        # FAIL, not a zero. `or 0` would let a row with no decoded-byte figure
-        # still count toward `seen` while contributing nothing to the
-        # denominator, which understates it and inflates the ratio -- an
-        # amplification computed from a partial denominator reads as a real
-        # measurement.
-        dec = acc.get("page_stored_bytes_decoded")
-        if not isinstance(dec, (int, float)):
-            fails.append(f"{label} amplification: {q} has no "
-                         "page_stored_bytes_decoded; the denominator is "
-                         "incomplete and the ratio would be overstated")
+        # The denominator gets the same treatment as the numerator: absent or
+        # malformed is a FAIL, not a zero. `or 0` would let a row with no
+        # decoded-byte figure still count toward `seen` while contributing
+        # nothing to the denominator, which understates it and inflates the
+        # ratio -- an amplification computed from a partial denominator reads
+        # as a real measurement.
+        dec = byte_count(acc.get("page_stored_bytes_decoded"),
+                         f"{label} amplification: {q} page_stored_bytes_decoded")
+        if dec is None:
             return
         scan_total    += sw
         decoded_total += dec
