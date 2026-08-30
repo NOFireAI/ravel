@@ -124,9 +124,11 @@ pub(crate) fn classify(method: &str, query: Option<&str>) -> Option<StoreOp> {
         "GET" => Some(StoreOp::Get),
         "HEAD" => Some(StoreOp::Head),
         "PUT" => Some(StoreOp::Put),
-        // `POST ?delete` is `object_store`'s bulk delete. Nothing in this
-        // adapter issues one today; classifying it keeps a future switch to
-        // `delete_stream` from landing in the unclassified slot.
+        // `POST ?delete` is S3's `DeleteObjects`, and it is the shape a
+        // single-key delete arrives in: `ObjectStoreExt::delete` routes one
+        // location through `delete_stream`, which `AmazonS3` implements as one
+        // bulk request unless `disable_bulk_delete` is set. The `DELETE
+        // /{bucket}/{key}` arm below covers that fallback.
         "POST" if query_value(query, "delete").is_some() => Some(StoreOp::Delete),
         "DELETE" => Some(StoreOp::Delete),
         _ => None,
@@ -195,7 +197,10 @@ mod tests {
     #[test]
     fn parameter_names_match_exactly() {
         assert_eq!(classify("GET", Some("not-uploads=1")), Some(StoreOp::Get));
-        assert_eq!(classify("GET", Some("uploadIdentity=1")), Some(StoreOp::Get));
+        assert_eq!(
+            classify("GET", Some("uploadIdentity=1")),
+            Some(StoreOp::Get)
+        );
         assert_eq!(query_value(Some("a=1&ab=2"), "ab"), Some("2"));
         assert_eq!(query_value(Some("a=1"), "b"), None);
         assert_eq!(query_value(None, "a"), None);

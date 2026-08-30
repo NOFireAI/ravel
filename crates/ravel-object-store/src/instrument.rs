@@ -538,9 +538,8 @@ impl StoreMetricsSnapshot {
     /// Requests across every operation kind, unclassified ones included, or
     /// [`None`] when attempts were not observed.
     pub fn attempts_total(&self) -> Option<u64> {
-        self.attempts_observed.then(|| {
-            self.attempts_by_op.iter().sum::<u64>() + self.attempts_unclassified
-        })
+        self.attempts_observed
+            .then(|| self.attempts_by_op.iter().sum::<u64>() + self.attempts_unclassified)
     }
 
     /// One operation's block, for iterating [`StoreOp::ALL`] in an exporter.
@@ -574,11 +573,7 @@ impl<S: ObjectStoreBackend> InstrumentedStore<S> {
 
     /// Wrap `inner` with an injected clock, for deterministic latency tests.
     pub fn with_clock(inner: S, clock: Arc<dyn MonotonicClock>) -> Self {
-        InstrumentedStore::with_metrics_and_clock(
-            inner,
-            Arc::new(StoreMetrics::default()),
-            clock,
-        )
+        InstrumentedStore::with_metrics_and_clock(inner, Arc::new(StoreMetrics::default()), clock)
     }
 
     /// Wrap `inner`, recording into a caller-provided [`StoreMetrics`].
@@ -818,6 +813,76 @@ mod tests {
         assert_eq!(snap.get.errors_total(), snap.get.calls - snap.get.ok);
         assert_eq!(snap.get.latency_nanos_total, 150_000);
         assert_eq!(snap.put, OpMetricsSnapshot::default(), "no put recorded");
+    }
+
+    /// Attempts read as absent, not as zero, until a layer that feeds them
+    /// declares itself: the raw counter moving is not evidence that anything
+    /// was measuring (#928).
+    #[test]
+    fn attempts_report_nothing_until_a_layer_declares_them() {
+        let metrics = StoreMetrics::default();
+        metrics.record(StoreOp::Get, 1_000, 0, None);
+        metrics.record_attempt(StoreOp::Get);
+        assert!(!metrics.attempts_observed());
+        let snap = metrics.snapshot();
+        assert_eq!(snap.attempts(StoreOp::Get), None);
+        assert_eq!(snap.retries(StoreOp::Get), None);
+        assert_eq!(snap.attempts_total(), None);
+
+        metrics.declare_attempts_observed();
+        let snap = metrics.snapshot();
+        assert_eq!(snap.attempts(StoreOp::Get), Some(1));
+        assert_eq!(snap.retries(StoreOp::Get), Some(0));
+    }
+
+    /// A declared-but-idle layer reports `Some(0)`: no request was made, which
+    /// is a measurement, unlike "nobody was counting".
+    #[test]
+    fn a_declared_layer_with_no_request_reports_zero_not_absent() {
+        let metrics = StoreMetrics::default();
+        metrics.declare_attempts_observed();
+        let snap = metrics.snapshot();
+        assert_eq!(snap.attempts(StoreOp::Get), Some(0));
+        assert_eq!(snap.attempts_total(), Some(0));
+    }
+
+    /// Attempts split per operation the same way calls do, retries are the
+    /// difference, and an attempt no mapping recognized is counted rather than
+    /// dropped into some other operation's slot.
+    #[test]
+    fn attempts_split_per_op_and_keep_unclassified_visible() {
+        let metrics = StoreMetrics::default();
+        metrics.declare_attempts_observed();
+        metrics.record(StoreOp::Get, 1_000, 4, None);
+        for _ in 0..3 {
+            metrics.record_attempt(StoreOp::Get);
+        }
+        metrics.record(StoreOp::Delete, 1_000, 0, None);
+        metrics.record_attempt(StoreOp::Delete);
+        metrics.record_unclassified_attempt();
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.attempts(StoreOp::Get), Some(3));
+        assert_eq!(snap.retries(StoreOp::Get), Some(2));
+        assert_eq!(snap.attempts(StoreOp::Delete), Some(1));
+        assert_eq!(snap.retries(StoreOp::Delete), Some(0));
+        assert_eq!(snap.attempts(StoreOp::Put), Some(0));
+        assert_eq!(snap.attempts_unclassified, 1);
+        assert_eq!(
+            snap.attempts_total(),
+            Some(5),
+            "3 gets + 1 delete + 1 unclassified"
+        );
+    }
+
+    /// A call with no attempt behind it (a backend that never declared, or a
+    /// counting gap) must not underflow into a huge retry count.
+    #[test]
+    fn retries_saturate_rather_than_underflow() {
+        let metrics = StoreMetrics::default();
+        metrics.declare_attempts_observed();
+        metrics.record(StoreOp::Head, 1_000, 0, None);
+        assert_eq!(metrics.snapshot().retries(StoreOp::Head), Some(0));
     }
 
     #[test]

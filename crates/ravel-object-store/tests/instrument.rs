@@ -488,3 +488,58 @@ async fn cloned_handles_observe_the_same_counters() {
         "metrics() must clone one shared handle, not build a new one"
     );
 }
+
+/// Attempts are `None`, not zero, for a backend with no attempt-observing layer
+/// (#928), and a fault injected *above* the store cannot change that.
+///
+/// This is the boundary of what `FaultStore` can show about retries.
+/// `object_store`'s retry loop is inside its client, below the
+/// `ObjectStoreBackend` trait, so a `FaultStore` rule fires in place of the
+/// wrapped call and its error goes straight to the caller: three throttled gets
+/// here are three failed calls the caller made, never one call retried three
+/// times. The counter says so rather than reporting a zero (or a
+/// call-shaped count) that would read as "no retries happened"; the retried-call
+/// case is pinned over real HTTP in `tests/s3_http_faults.rs`.
+#[tokio::test]
+async fn attempts_are_unobserved_for_a_backend_that_reports_none() {
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(Op::Get, ScriptedFault::Throttled { retry_after_ms: 3 })
+            .with_key_contains("throttled"),
+    );
+    let store = InstrumentedStore::new(FaultStore::new(MemoryStore::new(), plan));
+    let metrics = store.metrics();
+
+    for _ in 0..3 {
+        let err = store
+            .get("throttled/k", GetRange::Full)
+            .await
+            .expect_err("the scripted throttle must fail the get");
+        assert!(matches!(err, StoreError::Throttled { retry_after_ms: 3 }));
+    }
+
+    assert_eq!(
+        store.inner().fault_count(Op::Get, FaultKind::Throttled),
+        3,
+        "the fault must have fired on each call, not been assumed to"
+    );
+
+    let snapshot = metrics.snapshot();
+    assert_eq!(
+        snapshot.get.calls, 3,
+        "three failed calls, each one the caller's own"
+    );
+    assert!(
+        !snapshot.attempts_observed,
+        "MemoryStore under FaultStore has no layer that sees requests"
+    );
+    for op in StoreOp::ALL {
+        assert_eq!(
+            snapshot.attempts(op),
+            None,
+            "{}: an unobserved attempt count must not read as a number",
+            op.name()
+        );
+        assert_eq!(snapshot.retries(op), None, "{}: nor its retries", op.name());
+    }
+    assert_eq!(snapshot.attempts_total(), None);
+}

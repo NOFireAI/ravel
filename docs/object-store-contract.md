@@ -639,6 +639,27 @@ the wrapped backend's own declaration. `ravel-server`'s `build_store` wraps
 whichever backend it built, unconditionally in every mode, and the contract
 suite runs its full assertion set through the decorator to prove transparency.
 
+Those counters are completions of a logical call, which is not what the bill
+counts. `object_store` retries inside one operation (`RetryConfig`: up to 10
+retries within 180 s, jittered backoff), so a `get()` that succeeded on its
+tenth try is one `calls` and ten billed requests; bytes are unaffected, because
+a failed attempt returns no payload. The retry loop is private to
+`object_store`, so nothing above the logical call can see an attempt.
+`StoreMetrics` therefore carries a separate per-`StoreOp` attempt counter fed
+from *below*: `S3Store::with_attempt_metrics` installs an HTTP connector
+(`AmazonS3Builder::with_http_connector`) beneath the retry loop, which drives
+its client once per attempt, and each request is attributed to a `StoreOp` by
+its method and query. Pass the same `StoreMetrics` handle to
+`InstrumentedStore::with_metrics` and one snapshot then carries both:
+`attempts >= calls`, and `attempts - calls` is the retry count for every
+single-request operation (a `put` above the multipart threshold is several
+requests for one call, so there it is the extra-request count). A request the
+mapping does not recognize is counted as `attempts_unclassified` rather than
+dropped. A backend with no such layer reports attempts as absent, not as zero:
+`S3Store::new` and `S3Store::with_http_config` install nothing, and neither do
+`MemoryStore` or `FaultStore`, for which the request count is simply not
+knowable.
+
 The contract suite in `crates/ravel-object-store/tests/contract.rs` runs
 against all three, multipart included (`assert_multipart_upload` is part of
 `run_contract_suite`, written against the trait so it holds for the oracle, the
@@ -663,7 +684,12 @@ dropped mid-response, and a multipart sequence failing after some parts
 succeeded. Because the endpoint records every request with a timestamp, the
 assertions are on what the server saw: a throttled GET/PUT is really re-sent, a
 403 is really sent once, the pause between attempts really grows, and a failed
-multipart upload really leaves no object at the key. No live endpoint and no
+multipart upload really leaves no object at the key. It is also where the
+attempt counter above is pinned, because it is the only place a retry can be
+forced: a `FaultStore` rule fires in place of the wrapped call, above the
+client, so it produces failed calls rather than a retried one. A GET served two
+retryable faults counts 3 attempts against 1 call, 2 retries, and the same
+`bytes` as an unretried read of the same object. No live endpoint and no
 Docker, so it runs in the default `cargo test`, unlike the MinIO-gated
 assertions above.
 

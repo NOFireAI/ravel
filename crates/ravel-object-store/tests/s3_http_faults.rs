@@ -54,8 +54,9 @@ use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::Response;
 use bytes::Bytes;
 use parking_lot::Mutex;
+use ravel_object_store::instrument::{StoreMetrics, StoreOp};
 use ravel_object_store::s3::{MULTIPART_THRESHOLD, S3Config, S3HttpConfig, S3Store};
-use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, StoreError};
+use ravel_object_store::{GetRange, InstrumentedStore, ObjectStoreBackend, PutOptions, StoreError};
 
 /// Bucket name the fake serves. Path-style requests put it in the first path
 /// segment (`/{bucket}/{key}`), which is what `force_path_style: true` makes
@@ -85,7 +86,14 @@ enum Op {
     Get,
     Put,
     Head,
+    /// `DELETE /{bucket}/{key}`, the single-object form. `object_store` only
+    /// issues it with `disable_bulk_delete`, which this crate does not set, so
+    /// [`S3Store`]'s `delete()` arrives as [`Op::BulkDelete`] instead.
     Delete,
+    /// `POST /{bucket}?delete`, S3's `DeleteObjects`. `ObjectStoreExt::delete`
+    /// routes a single key through `delete_stream`, and `AmazonS3` implements
+    /// that as one bulk request, so this is the shape a one-key delete takes.
+    BulkDelete,
     CreateMultipart,
     UploadPart,
     CompleteMultipart,
@@ -235,6 +243,24 @@ impl FakeS3 {
         S3Store::with_http_config(self.config(), http).expect("a fake-endpoint S3Store must build")
     }
 
+    /// The same store under an [`InstrumentedStore`] whose [`StoreMetrics`] is
+    /// also fed by the attempt-counting HTTP layer beneath `object_store`'s
+    /// retry loop (#928), plus that shared handle. One snapshot then carries
+    /// both the logical calls and the requests they took.
+    fn instrumented_with_attempts(&self) -> (InstrumentedStore<S3Store>, Arc<StoreMetrics>) {
+        let metrics = Arc::new(StoreMetrics::default());
+        let store = S3Store::with_attempt_metrics(
+            self.config(),
+            S3HttpConfig::default(),
+            Arc::clone(&metrics),
+        )
+        .expect("a fake-endpoint S3Store must build");
+        (
+            InstrumentedStore::with_metrics(store, Arc::clone(&metrics)),
+            metrics,
+        )
+    }
+
     fn config(&self) -> S3Config {
         S3Config {
             bucket: BUCKET.to_string(),
@@ -337,12 +363,26 @@ fn classify(method: &Method, query: &HashMap<String, String>) -> Option<Op> {
         Method::POST if has_upload_id => Some(Op::CompleteMultipart),
         Method::PUT if has_upload_id => Some(Op::UploadPart),
         Method::DELETE if has_upload_id => Some(Op::AbortMultipart),
+        Method::POST if query.contains_key("delete") => Some(Op::BulkDelete),
         Method::PUT => Some(Op::Put),
         Method::GET => Some(Op::Get),
         Method::HEAD => Some(Op::Head),
         Method::DELETE => Some(Op::Delete),
         _ => None,
     }
+}
+
+/// Keys named by a `DeleteObjects` request body
+/// (`<Delete><Object><Key>k</Key></Object>...</Delete>`). Ravel's keys are
+/// plain ASCII with no XML-escapable character, so slicing between the tags is
+/// enough here and keeps the fake free of an XML parser.
+fn delete_request_keys(body: &Bytes) -> Vec<String> {
+    let text = String::from_utf8_lossy(body).into_owned();
+    text.split("<Key>")
+        .skip(1)
+        .filter_map(|tail| tail.split_once("</Key>"))
+        .map(|(key, _)| key.to_string())
+        .collect()
 }
 
 fn etag_of(data: &[u8]) -> String {
@@ -587,6 +627,21 @@ fn serve(
         Op::Delete => {
             state.objects.lock().remove(key);
             build(StatusCode::NO_CONTENT, vec![], Body::empty())
+        }
+        Op::BulkDelete => {
+            let mut deleted = String::new();
+            for requested in delete_request_keys(&data) {
+                state.objects.lock().remove(&requested);
+                deleted.push_str(&format!("<Deleted><Key>{requested}</Key></Deleted>"));
+            }
+            build(
+                StatusCode::OK,
+                vec![(header::CONTENT_TYPE, "application/xml".to_string())],
+                Body::from(format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                     <DeleteResult>{deleted}</DeleteResult>"
+                )),
+            )
         }
         Op::CreateMultipart => {
             let upload_id = {
@@ -1425,5 +1480,248 @@ async fn slow_down_in_a_200_body_retries_complete_multipart() {
         fake.object("fault/slow-complete").as_deref(),
         Some(&b"one small part"[..]),
         "the completed object must hold the uploaded part"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Attempt counting beneath the retry loop (#928)
+// ---------------------------------------------------------------------------
+
+/// Every attempt counter, in `StoreOp::index()` order, so a test can assert the
+/// whole vector at once and a stray request on an operation it did not name
+/// fails instead of going unnoticed.
+fn attempt_vector(snapshot: &ravel_object_store::StoreMetricsSnapshot) -> Vec<(&'static str, u64)> {
+    StoreOp::ALL
+        .iter()
+        .map(|op| {
+            (
+                op.name(),
+                snapshot
+                    .attempts(*op)
+                    .expect("the counting HTTP layer must have declared attempts observed"),
+            )
+        })
+        .collect()
+}
+
+/// The finding, pinned: `calls` counts one completion while the endpoint sees
+/// three requests, and only the attempt counter knows the difference.
+///
+/// Two retryable faults plus the success is three GETs. The server's own log is
+/// the oracle for that number (a client that never retried, or a counter that
+/// re-counted the logical call, could not produce it), and the exact values are
+/// asserted, not a `> 0`.
+#[tokio::test]
+async fn a_retried_get_counts_three_attempts_for_one_call() {
+    let fake = FakeS3::start().await;
+    let (store, metrics) = fake.instrumented_with_attempts();
+    fake.seed("attempts/get-retry", b"payload that survives two 503s");
+    fake.script(Op::Get, [Fault::ServiceUnavailable, Fault::TooManyRequests]);
+
+    let outcome = store
+        .get("attempts/get-retry", GetRange::Full)
+        .await
+        .expect("two retryable faults must not fail the get");
+    assert_eq!(&outcome.data[..], b"payload that survives two 503s");
+
+    // The faults fired: two of the three requests the server saw were served a
+    // scripted fault, so the retries under test really happened.
+    let seen = fake.requests(Op::Get);
+    assert_eq!(seen.len(), 3, "expected exactly three GETs, saw {seen:?}");
+    assert_eq!(
+        seen.iter()
+            .filter(|request| request.fault.is_some())
+            .count(),
+        2,
+        "both scripted faults must have been served, saw {seen:?}"
+    );
+
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.get.calls, 1, "the caller made one get() call");
+    assert_eq!(snapshot.get.ok, 1, "and it succeeded");
+    assert_eq!(
+        snapshot.attempts(StoreOp::Get),
+        Some(3),
+        "the endpoint was asked three times and S3 would bill three"
+    );
+    assert_eq!(
+        snapshot.retries(StoreOp::Get),
+        Some(2),
+        "attempts - calls is the retry count"
+    );
+    assert_eq!(
+        attempt_vector(&snapshot),
+        vec![
+            ("put", 0),
+            ("get", 3),
+            ("head", 0),
+            ("list", 0),
+            ("list_delimited", 0),
+            ("delete", 0),
+        ],
+        "a retried get must move no other operation's attempts"
+    );
+    assert_eq!(
+        snapshot.attempts_unclassified, 0,
+        "every request a get issues must be attributable to an operation"
+    );
+    assert_eq!(snapshot.attempts_total(), Some(3));
+}
+
+/// The counter cannot drift upward on its own: with no fault scripted, every
+/// operation's attempts equal its calls exactly, so an off-by-one in the
+/// counting layer (counting a redirect, a preflight, or the same request twice)
+/// fails here rather than inflating a retry figure in production.
+#[tokio::test]
+async fn a_clean_path_counts_one_attempt_per_call() {
+    let fake = FakeS3::start().await;
+    let (store, metrics) = fake.instrumented_with_attempts();
+
+    store
+        .put(
+            "attempts/clean",
+            Bytes::from_static(b"no fault anywhere"),
+            PutOptions::default(),
+        )
+        .await
+        .expect("an unfaulted put must succeed");
+    store
+        .head("attempts/clean")
+        .await
+        .expect("an unfaulted head must succeed");
+    store
+        .get("attempts/clean", GetRange::Full)
+        .await
+        .expect("an unfaulted get must succeed");
+    store
+        .delete("attempts/clean")
+        .await
+        .expect("an unfaulted delete must succeed");
+
+    let snapshot = metrics.snapshot();
+    for op in StoreOp::ALL {
+        assert_eq!(
+            snapshot.attempts(op),
+            Some(snapshot.op(op).calls),
+            "{}: attempts must equal calls with no fault scripted",
+            op.name()
+        );
+        assert_eq!(
+            snapshot.retries(op),
+            Some(0),
+            "{}: an unfaulted path has no retries",
+            op.name()
+        );
+    }
+    assert_eq!(
+        attempt_vector(&snapshot),
+        vec![
+            ("put", 1),
+            ("get", 1),
+            ("head", 1),
+            ("list", 0),
+            ("list_delimited", 0),
+            ("delete", 1),
+        ],
+        "one request per call, and nothing else on the wire"
+    );
+    assert_eq!(snapshot.attempts_unclassified, 0);
+}
+
+/// Bytes are honest where requests were optimistic. A failed attempt returns no
+/// payload, so a GET retried twice reports the same `bytes` as an unretried one
+/// while its attempt count is three times as high: the two halves of the
+/// finding, in one assertion pair.
+#[tokio::test]
+async fn retries_move_attempts_but_never_bytes() {
+    const PAYLOAD: &[u8] = b"exactly these bytes, however many attempts it takes";
+
+    let clean = FakeS3::start().await;
+    let (clean_store, clean_metrics) = clean.instrumented_with_attempts();
+    clean.seed("attempts/bytes", PAYLOAD);
+    clean_store
+        .get("attempts/bytes", GetRange::Full)
+        .await
+        .expect("the unretried get must succeed");
+    let clean_snapshot = clean_metrics.snapshot();
+
+    let retried = FakeS3::start().await;
+    let (retried_store, retried_metrics) = retried.instrumented_with_attempts();
+    retried.seed("attempts/bytes", PAYLOAD);
+    retried.script(
+        Op::Get,
+        [Fault::ServiceUnavailable, Fault::ServiceUnavailable],
+    );
+    retried_store
+        .get("attempts/bytes", GetRange::Full)
+        .await
+        .expect("the retried get must succeed");
+    let retried_snapshot = retried_metrics.snapshot();
+
+    assert_eq!(
+        retried
+            .requests(Op::Get)
+            .iter()
+            .filter(|request| request.fault.is_some())
+            .count(),
+        2,
+        "both scripted faults must have been served"
+    );
+    assert_eq!(
+        clean_snapshot.get.bytes,
+        PAYLOAD.len() as u64,
+        "the unretried read reports the payload it got"
+    );
+    assert_eq!(
+        retried_snapshot.get.bytes, clean_snapshot.get.bytes,
+        "two failed attempts returned no payload, so bytes must be identical"
+    );
+    assert_eq!(clean_snapshot.attempts(StoreOp::Get), Some(1));
+    assert_eq!(
+        retried_snapshot.attempts(StoreOp::Get),
+        Some(3),
+        "the same bytes cost three requests instead of one"
+    );
+}
+
+/// The caveat on [`StoreMetricsSnapshot::retries`], pinned rather than only
+/// documented: a put above the multipart threshold is one call and five
+/// requests (create, three parts, complete) with nothing retried, so `attempts`
+/// stays a request count and only equals `calls + retries` on the single-request
+/// paths.
+#[tokio::test]
+async fn a_multipart_put_counts_every_request_it_takes() {
+    let fake = FakeS3::start().await;
+    let (store, metrics) = fake.instrumented_with_attempts();
+
+    // 8 MiB + 8 MiB + 1 byte: three parts, so five requests in all.
+    let payload = Bytes::from(vec![3u8; MULTIPART_THRESHOLD + 1]);
+    store
+        .put("attempts/multipart", payload, PutOptions::default())
+        .await
+        .expect("an unfaulted multipart put must succeed");
+
+    assert_eq!(fake.count(Op::CreateMultipart), 1);
+    assert_eq!(fake.count(Op::UploadPart), 3);
+    assert_eq!(fake.count(Op::CompleteMultipart), 1);
+
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.put.calls, 1, "the caller made one put() call");
+    assert_eq!(
+        snapshot.attempts(StoreOp::Put),
+        Some(5),
+        "create, three parts, and complete are five billed requests"
+    );
+    assert_eq!(
+        snapshot.attempts_unclassified, 0,
+        "every multipart request must be attributed to the write path"
+    );
+    assert_eq!(
+        attempt_vector(&snapshot)
+            .into_iter()
+            .filter(|(_, count)| *count > 0)
+            .collect::<Vec<_>>(),
+        vec![("put", 5)],
+        "multipart requests belong to put, not to delete or get"
     );
 }
