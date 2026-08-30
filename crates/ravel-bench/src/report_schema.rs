@@ -460,6 +460,55 @@ pub enum ValidationError {
         /// The value recomputed from the timed medians.
         computed: f64,
     },
+    /// A configuration entry has a blank key or value, or two entries share a
+    /// key. A blank key or value is unrecorded configuration masquerading as
+    /// recorded; two entries for one key make the applied value ambiguous. Both
+    /// leave the run unreproducible while the block reads as complete, which is
+    /// worse than an obviously missing field.
+    #[error(
+        "configuration entry at index {index} is invalid: {reason}; a blank or duplicated setting \
+         is unreproducible configuration masquerading as complete"
+    )]
+    InvalidConfigEntry {
+        /// The entry's index in the config list.
+        index: usize,
+        /// What is wrong with it.
+        reason: String,
+    },
+    /// A timed measurement's timing figures are not ordered
+    /// `min_ms <= median_ms <= max_ms`. An impossible latency range (a min above
+    /// its median, or a median above its max) is a self-contradicting row; the
+    /// error carries all three so the impossible triple is visible, not just the
+    /// row id.
+    #[error(
+        "timed measurement `{id}` has timing figures out of order: min_ms {min_ms}, median_ms \
+         {median_ms}, max_ms {max_ms}; a timed row requires min_ms <= median_ms <= max_ms"
+    )]
+    TimingOutOfOrder {
+        /// The offending measurement id.
+        id: String,
+        /// The reported minimum.
+        min_ms: f64,
+        /// The reported median.
+        median_ms: f64,
+        /// The reported maximum.
+        max_ms: f64,
+    },
+    /// A comparator's `image_digest` is present but not a content digest: a
+    /// mutable tag (`latest`) or a truncated or upper-case hex string pins no
+    /// bytes. A digest that does not pin bytes defeats the reason a digest is
+    /// recorded, the same defect as a missing pin one layer out.
+    #[error(
+        "comparator at index {index} has image_digest `{value}`, which is not a content digest; a \
+         digest must be `sha256:` followed by 64 lower-case hex characters, or a moving tag pins \
+         nothing"
+    )]
+    InvalidImageDigest {
+        /// The comparator's index in the list.
+        index: usize,
+        /// The value that was not a valid digest.
+        value: String,
+    },
 }
 
 /// Whether a *present* provenance value is an absent-value sentinel rather than
@@ -514,10 +563,28 @@ fn checked_provenance_fields(p: &Provenance) -> Vec<(&'static str, &str)> {
     fields
 }
 
+/// Whether `value` is a content digest that pins bytes, rather than a mutable
+/// tag: `sha256:` followed by exactly 64 lower-case hex characters. This is the
+/// same notion `deploy/metricsbench/tests/every_comparator_pins_an_image_digest.sh`
+/// enforces on the deployment side (`@sha256:` + 64 `[0-9a-f]`), minus the `@`
+/// that belongs to a full `repo:tag@digest` image reference: this field carries
+/// the bare digest, not a whole reference. Only `sha256` is accepted: it is the
+/// only algorithm the comparator images are published under, and an open-ended
+/// `algo:hex` pattern would readmit a truncated or upper-case string that pins
+/// nothing. Upper-case hex is rejected deliberately, matching the deploy check's
+/// lower-case-only class, so the two cannot disagree on the same digest.
+fn is_content_digest(value: &str) -> bool {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        return false;
+    };
+    hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// Validate the provenance block, fail-closed. Every present identity field must
 /// carry a real value (not blank, not the `"unknown"` sentinel), the schema
-/// version must match, the hardware must name at least one logical core, and
-/// every named comparator must be completely pinned.
+/// version must match, the hardware must name at least one logical core, every
+/// named comparator must be completely pinned by a real content digest, and the
+/// configuration must carry no blank or duplicate key.
 fn validate_provenance(p: &Provenance) -> Result<(), ValidationError> {
     if p.schema_version != SCHEMA_VERSION {
         return Err(ValidationError::SchemaVersionMismatch {
@@ -548,6 +615,41 @@ fn validate_provenance(p: &Provenance) -> Result<(), ValidationError> {
             if is_absent_value(value) {
                 return Err(ValidationError::IncompleteComparator { index, field });
             }
+        }
+        // Presence is not enough: a mutable tag (`latest`) or a truncated or
+        // upper-case hex string is a digest field that pins no bytes, defeating
+        // the reason a digest is recorded.
+        if !is_content_digest(&c.image_digest) {
+            return Err(ValidationError::InvalidImageDigest {
+                index,
+                value: c.image_digest.clone(),
+            });
+        }
+    }
+    // Configuration entries: a blank key or value is unrecorded configuration
+    // masquerading as recorded, and two entries for one key make the applied
+    // value ambiguous. A duplicate key is rejected even when both values match:
+    // the gatherer emitted the same setting twice, and one copy may later
+    // diverge, so the shape is wrong now regardless of the current values.
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for (index, c) in p.config.iter().enumerate() {
+        if c.key.trim().is_empty() {
+            return Err(ValidationError::InvalidConfigEntry {
+                index,
+                reason: "a blank key".to_string(),
+            });
+        }
+        if c.value.trim().is_empty() {
+            return Err(ValidationError::InvalidConfigEntry {
+                index,
+                reason: format!("key `{}` has a blank value", c.key),
+            });
+        }
+        if !seen.insert(c.key.as_str()) {
+            return Err(ValidationError::InvalidConfigEntry {
+                index,
+                reason: format!("key `{}` appears more than once", c.key),
+            });
         }
     }
     Ok(())
@@ -604,6 +706,22 @@ fn validate_measurement(m: &Measurement) -> Result<(), ValidationError> {
                     figure,
                 });
             }
+        }
+        // Every required timing figure is present (just checked), finite, and
+        // non-negative (checked above), so the three unwraps are total and the
+        // comparison is meaningful. An impossible range (a min above its median,
+        // or a median above its max) is a self-contradicting row. `min == median
+        // == max` is legal: a single-run measurement collapses the three.
+        let min_ms = m.figure("min_ms").unwrap_or_default();
+        let median_ms = m.figure("median_ms").unwrap_or_default();
+        let max_ms = m.figure("max_ms").unwrap_or_default();
+        if !(min_ms <= median_ms && median_ms <= max_ms) {
+            return Err(ValidationError::TimingOutOfOrder {
+                id: m.id.clone(),
+                min_ms,
+                median_ms,
+                max_ms,
+            });
         }
     } else {
         // Only `ok` is timed (ADR-0927 decision 6). A non-`ok` row carrying a
@@ -904,7 +1022,9 @@ mod tests {
             comparators: vec![Comparator {
                 name: "prometheus".to_string(),
                 version: "3.13.1".to_string(),
-                image_digest: "sha256:abc123".to_string(),
+                image_digest:
+                    "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                        .to_string(),
             }],
             generator_digest: "blake3:1111".to_string(),
             corpus_digest: "blake3:2222".to_string(),
@@ -1049,8 +1169,9 @@ mod tests {
     }
 
     /// One timed (`ok`) row whose `median_ms` is `median`; `min`/`max` are set to
-    /// the same value because only `median_ms` feeds the geomean recomputation
-    /// and the ordering of the three is not validated.
+    /// the same value so the row satisfies the `min <= median <= max` ordering
+    /// rule (a single-run collapse of the three) while feeding `median` to the
+    /// geomean recomputation.
     fn timed_with_median(id: &str, median: f64) -> Measurement {
         Measurement {
             id: id.to_string(),
@@ -1406,6 +1527,310 @@ mod tests {
         let back: MetricsBenchReport = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(report, back);
         validate(&back).expect("the round-tripped report validates");
+    }
+
+    // --- FINDING 1: configuration entries are validated, not merely present. ---
+
+    /// A multi-entry configuration map with distinct non-blank keys and values
+    /// validates: the rule rejects blanks and duplicates, not a legitimate map.
+    #[test]
+    fn a_valid_config_map_validates() {
+        let mut report = valid_report();
+        report.provenance.config = vec![
+            ConfigEntry {
+                key: "max_flush_delay_ms".to_string(),
+                value: "2000".to_string(),
+            },
+            ConfigEntry {
+                key: "shard_count".to_string(),
+                value: "8".to_string(),
+            },
+        ];
+        validate(&report).expect("a distinct-key, non-blank config map validates");
+    }
+
+    /// A blank configuration key is refused: an unnamed setting is unrecorded
+    /// configuration masquerading as recorded.
+    #[test]
+    fn a_blank_config_key_fails_validation() {
+        let mut report = valid_report();
+        report.provenance.config = vec![ConfigEntry {
+            key: "   ".to_string(),
+            value: "2000".to_string(),
+        }];
+        let err = validate(&report).expect_err("a blank config key must fail");
+        assert_eq!(
+            err,
+            ValidationError::InvalidConfigEntry {
+                index: 0,
+                reason: "a blank key".to_string(),
+            }
+        );
+    }
+
+    /// A blank configuration value is refused: a named setting with no value
+    /// records nothing about how the run was configured.
+    #[test]
+    fn a_blank_config_value_fails_validation() {
+        let mut report = valid_report();
+        report.provenance.config = vec![ConfigEntry {
+            key: "max_flush_delay_ms".to_string(),
+            value: "  ".to_string(),
+        }];
+        let err = validate(&report).expect_err("a blank config value must fail");
+        assert_eq!(
+            err,
+            ValidationError::InvalidConfigEntry {
+                index: 0,
+                reason: "key `max_flush_delay_ms` has a blank value".to_string(),
+            }
+        );
+    }
+
+    /// Two entries for one key with DIFFERENT values are refused: the applied
+    /// value is ambiguous, so the block reads as complete while recording an
+    /// unreproducible setting.
+    #[test]
+    fn duplicate_config_keys_with_different_values_fail_validation() {
+        let mut report = valid_report();
+        report.provenance.config = vec![
+            ConfigEntry {
+                key: "max_flush_delay_ms".to_string(),
+                value: "2000".to_string(),
+            },
+            ConfigEntry {
+                key: "max_flush_delay_ms".to_string(),
+                value: "3000".to_string(),
+            },
+        ];
+        let err = validate(&report).expect_err("duplicate config keys must fail");
+        assert_eq!(
+            err,
+            ValidationError::InvalidConfigEntry {
+                index: 1,
+                reason: "key `max_flush_delay_ms` appears more than once".to_string(),
+            }
+        );
+    }
+
+    /// Two entries for one key with the SAME value are also refused: the gatherer
+    /// emitted the setting twice and one copy may later diverge, so the shape is
+    /// wrong now regardless of the current values.
+    #[test]
+    fn duplicate_config_keys_with_the_same_value_fail_validation() {
+        let mut report = valid_report();
+        report.provenance.config = vec![
+            ConfigEntry {
+                key: "shard_count".to_string(),
+                value: "8".to_string(),
+            },
+            ConfigEntry {
+                key: "shard_count".to_string(),
+                value: "8".to_string(),
+            },
+        ];
+        let err = validate(&report).expect_err("same-value duplicate config keys must fail");
+        assert_eq!(
+            err,
+            ValidationError::InvalidConfigEntry {
+                index: 1,
+                reason: "key `shard_count` appears more than once".to_string(),
+            }
+        );
+    }
+
+    // --- FINDING 2: timed rows require min_ms <= median_ms <= max_ms. ---
+
+    /// A timed row with `min_ms` above its median is refused, and the error
+    /// carries all three values so the impossible triple is visible.
+    ///
+    /// To watch this test FAIL against the pre-fix validator, delete the ordering
+    /// block in `validate_measurement` (the `let min_ms = ...` line through the
+    /// `TimingOutOfOrder` return, inside the `if m.status.is_timed()` arm). The
+    /// pre-fix code did not check order, so `validate` returned `Ok(())`,
+    /// `expect_err` found `Ok`, and the test failed. This was confirmed by
+    /// commenting that block out and running this test before committing.
+    #[test]
+    fn a_timed_row_with_min_above_median_fails_validation() {
+        let mut report = valid_report();
+        // min_ms = 20, median_ms = 12.5, max_ms = 10: an impossible range.
+        report.measurements[0].figures = vec![
+            Figure {
+                name: "min_ms".to_string(),
+                value: 20.0,
+            },
+            Figure {
+                name: "median_ms".to_string(),
+                value: 12.5,
+            },
+            Figure {
+                name: "max_ms".to_string(),
+                value: 10.0,
+            },
+        ];
+        // The geomean would summarize the median 12.5; keep it consistent so the
+        // ordering error is what fails, not a geomean mismatch.
+        report.geomean_ms = Some(12.5);
+        let err = validate(&report).expect_err("an out-of-order timed row must fail");
+        assert_eq!(
+            err,
+            ValidationError::TimingOutOfOrder {
+                id: "mb_fanout_total_rate".to_string(),
+                min_ms: 20.0,
+                median_ms: 12.5,
+                max_ms: 10.0,
+            }
+        );
+    }
+
+    /// A timed row whose median exceeds its max is refused, error carrying the
+    /// triple. This exercises the second half of the `min <= median <= max`
+    /// conjunction independently of the first.
+    #[test]
+    fn a_timed_row_with_median_above_max_fails_validation() {
+        let mut report = valid_report();
+        report.measurements[0].figures = vec![
+            Figure {
+                name: "min_ms".to_string(),
+                value: 5.0,
+            },
+            Figure {
+                name: "median_ms".to_string(),
+                value: 30.0,
+            },
+            Figure {
+                name: "max_ms".to_string(),
+                value: 20.0,
+            },
+        ];
+        report.geomean_ms = Some(30.0);
+        let err = validate(&report).expect_err("a median above max must fail");
+        assert_eq!(
+            err,
+            ValidationError::TimingOutOfOrder {
+                id: "mb_fanout_total_rate".to_string(),
+                min_ms: 5.0,
+                median_ms: 30.0,
+                max_ms: 20.0,
+            }
+        );
+    }
+
+    /// A single-run measurement (`min == median == max`) is legal and must not be
+    /// rejected by an over-strict comparison: the three collapse to one value.
+    #[test]
+    fn a_timed_row_with_equal_timings_validates() {
+        let mut report = valid_report();
+        report.measurements[0].figures = vec![
+            Figure {
+                name: "min_ms".to_string(),
+                value: 7.0,
+            },
+            Figure {
+                name: "median_ms".to_string(),
+                value: 7.0,
+            },
+            Figure {
+                name: "max_ms".to_string(),
+                value: 7.0,
+            },
+        ];
+        report.geomean_ms = Some(7.0);
+        validate(&report).expect("min == median == max is a legal single-run measurement");
+    }
+
+    /// The ordering rule applies only to timed statuses: a non-timed row carries
+    /// no timing figures, so there is nothing to order and it still validates.
+    #[test]
+    fn a_non_timed_row_with_absent_timings_validates() {
+        let mut report = valid_report();
+        // A timed row exists so the geomean still has a row behind it.
+        report.measurements = vec![
+            timed_measurement("mb_fanout_total_rate"),
+            Measurement {
+                id: "mb_refused_row".to_string(),
+                class: CostClass::HighFanOut,
+                status: ResultStatus::Refused,
+                figures: vec![],
+            },
+        ];
+        validate(&report).expect("a non-timed row with no timings validates");
+    }
+
+    // --- FINDING 3: image_digest must be a content digest, not a mutable tag. ---
+
+    /// A correct `sha256:` + 64 lower-case hex digest validates.
+    #[test]
+    fn a_correct_sha256_image_digest_validates() {
+        let mut report = valid_report();
+        report.provenance.comparators[0].image_digest =
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string();
+        validate(&report).expect("a sha256 + 64 lower-case hex digest validates");
+    }
+
+    /// A mutable tag masquerading as a digest is refused.
+    #[test]
+    fn a_mutable_tag_image_digest_fails_validation() {
+        let mut report = valid_report();
+        report.provenance.comparators[0].image_digest = "latest".to_string();
+        let err = validate(&report).expect_err("a `latest` tag is not a digest");
+        assert_eq!(
+            err,
+            ValidationError::InvalidImageDigest {
+                index: 0,
+                value: "latest".to_string(),
+            }
+        );
+    }
+
+    /// A free-form string with no digest structure is refused.
+    #[test]
+    fn a_non_digest_image_digest_fails_validation() {
+        let mut report = valid_report();
+        report.provenance.comparators[0].image_digest = "not-a-digest".to_string();
+        let err = validate(&report).expect_err("`not-a-digest` is not a digest");
+        assert_eq!(
+            err,
+            ValidationError::InvalidImageDigest {
+                index: 0,
+                value: "not-a-digest".to_string(),
+            }
+        );
+    }
+
+    /// A digest one hex character short is refused: 63 hex characters is a
+    /// truncated digest that pins nothing.
+    #[test]
+    fn a_63_character_hex_image_digest_fails_validation() {
+        let mut report = valid_report();
+        let short = format!("sha256:{}", "a".repeat(63));
+        report.provenance.comparators[0].image_digest = short.clone();
+        let err = validate(&report).expect_err("a 63-char hex digest must fail");
+        assert_eq!(
+            err,
+            ValidationError::InvalidImageDigest {
+                index: 0,
+                value: short,
+            }
+        );
+    }
+
+    /// An upper-case hex digest is refused, matching the deploy check's
+    /// lower-case-only class so the two notions of "digest" agree.
+    #[test]
+    fn an_uppercase_hex_image_digest_fails_validation() {
+        let mut report = valid_report();
+        let upper =
+            "sha256:0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF".to_string();
+        report.provenance.comparators[0].image_digest = upper.clone();
+        let err = validate(&report).expect_err("an upper-case hex digest must fail");
+        assert_eq!(
+            err,
+            ValidationError::InvalidImageDigest {
+                index: 0,
+                value: upper,
+            }
+        );
     }
 
     /// An unknown key in a report is a deserialization error, not a silently
