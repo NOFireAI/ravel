@@ -132,6 +132,12 @@ enum TallyState {
         min: Option<i64>,
         max: Option<i64>,
         dict: Option<std::collections::BTreeMap<i64, u64>>,
+        /// Running exact sum of the non-null values, accumulated in `i128` so
+        /// the fold itself never overflows (#861). Lowered to the proto's
+        /// `i64` sum at [`ColumnTally::into_proto`]; a value that does not fit
+        /// `i64` there is emitted as an ABSENT sum, not a truncated one, so a
+        /// reader falls back to scanning rather than reading a wrong total.
+        sum: i128,
     },
     Bool {
         min: Option<bool>,
@@ -164,6 +170,7 @@ impl ColumnTally {
                 min: None,
                 max: None,
                 dict: Some(std::collections::BTreeMap::new()),
+                sum: 0,
             },
             DeclaredColumnType::Bool => TallyState::Bool {
                 min: None,
@@ -194,8 +201,15 @@ impl ColumnTally {
             None => self.null_count += 1,
             Some(x) => {
                 self.non_null_count += 1;
-                if let TallyState::I64 { min, max, dict } = &mut self.state {
+                if let TallyState::I64 {
+                    min,
+                    max,
+                    dict,
+                    sum,
+                } = &mut self.state
+                {
                     fold_value(min, max, dict, x);
+                    *sum += i128::from(x);
                 }
             }
         }
@@ -256,19 +270,33 @@ impl ColumnTally {
 
     fn into_proto(self, name: String) -> ColumnStat {
         let declared_type = declared_type_to_stats_tag(self.ty);
+        // Integer sum for an I64 column only (#861), and only when the exact
+        // `i128` fold fits `i64`; an overflow emits an absent sum so the reader
+        // scans rather than reading a truncated total. Every non-I64 type is
+        // left `None`: a float fold would be order-dependent (ADR-0024), and
+        // Bool/Bytes/Str carry no additive semantics.
+        let mut sum: Option<i64> = None;
         let (min, max, dictionary_present, dictionary) = match self.state {
-            TallyState::I64 { min, max, dict } => (
-                min.map(column_value_i64),
-                max.map(column_value_i64),
-                dict.is_some(),
-                dict.unwrap_or_default()
-                    .into_iter()
-                    .map(|(v, count)| DictEntry {
-                        value: Some(column_value_i64(v)),
-                        count,
-                    })
-                    .collect(),
-            ),
+            TallyState::I64 {
+                min,
+                max,
+                dict,
+                sum: total,
+            } => {
+                sum = i64::try_from(total).ok();
+                (
+                    min.map(column_value_i64),
+                    max.map(column_value_i64),
+                    dict.is_some(),
+                    dict.unwrap_or_default()
+                        .into_iter()
+                        .map(|(v, count)| DictEntry {
+                            value: Some(column_value_i64(v)),
+                            count,
+                        })
+                        .collect(),
+                )
+            }
             TallyState::Bool { min, max, dict } => (
                 min.map(column_value_bool),
                 max.map(column_value_bool),
@@ -315,6 +343,7 @@ impl ColumnTally {
             max,
             dictionary_present,
             dictionary,
+            sum,
         }
     }
 }
@@ -609,5 +638,39 @@ mod tests {
         );
         assert_eq!(i64_kind(status.min.as_ref().expect("min")), 200);
         assert_eq!(i64_kind(status.max.as_ref().expect("max")), 500);
+        assert_eq!(
+            status.sum,
+            Some(1504),
+            "exact sum of the non-null values 200+200+404+200+500"
+        );
+    }
+
+    /// #861: only an I64 column carries a sum. A declared `Bool` column is
+    /// folded for min/max/null counts exactly like any other, but its stat
+    /// leaves `sum` absent -- a bool has no additive semantics, and the
+    /// metadata-only SUM/AVG path must fall back to scanning for it.
+    ///
+    /// Prove-the-test: making `into_proto` emit `sum` for the `Bool` arm makes
+    /// `status_bool.sum` non-`None` and the assertion below fails.
+    #[tokio::test]
+    async fn a_bool_column_carries_no_sum() {
+        let store = MemoryStore::new();
+        let records = vec![
+            record(1, &[("flag".to_string(), AttrValue::Bool(true))]),
+            record(2, &[("flag".to_string(), AttrValue::Bool(false))]),
+            record(3, &[("flag".to_string(), AttrValue::Bool(true))]),
+        ];
+        let entry = write_l0(&store, &records).await;
+
+        let typed = vec![declared("flag", DeclaredColumnType::Bool)];
+        let seg = fetch_segment_column_stats(&store, &TENANT, Signal::Logs, &entry, &typed)
+            .await
+            .expect("build stats");
+
+        assert_eq!(seg.columns.len(), 1, "only `flag` is present and declared");
+        let flag = &seg.columns[0];
+        assert_eq!(flag.declared_type, 3, "Bool stats tag");
+        assert_eq!(flag.non_null_count, 3);
+        assert_eq!(flag.sum, None, "a Bool column carries no integer sum");
     }
 }
