@@ -370,10 +370,48 @@ and their bands down **before** the run, then let a script fail the pass rather
 than reading totals by eye. Two statements measured out of forty-three and a
 zero exit code look identical to a clean pass otherwise.
 
+The bands below are the per-class cost-class guards registered on issue #913
+(comment "Band registration for T2's second half"). Each statement in
+`benchmarks/clickbench/hits.corpus.json` carries a typed `class`
+(`metadata_decomposable` / `selective` / `full_value`); the script reads those
+classes from the corpus and asserts the band each class is held to. **These are
+no-regression guards, not targets:** every band names the target it is not yet
+at and the issue that closes the gap. Do not loosen a guard to match a target.
+
 ```python
 #!/usr/bin/env python3
-# analyse.py -- integrity first, headline last. Exits non-zero on a miss.
+# analyse.py -- integrity first, per-class bands next, headline last.
+# Exits non-zero on any miss. Usage: analyse.py <bench.json> [hits.corpus.json]
+#
+# Every band is a NAMED CONSTANT in the one block below, so re-registering a
+# band on #913 is a one-line edit here. Each band is a no-regression guard: the
+# comment names the target it is not yet at and the issue that closes the gap.
 import json, sys
+
+# --- Pre-registered bands (issue #913, "Band registration for T2's second
+# half"). Re-register by editing exactly one line here. ---------------------
+CORPUS_BYTES        = 12.03e9      # total corpus size; the % bands are off this
+
+# Integrity (asserted BEFORE any band): 43 statements, one fails by design.
+EXPECTED_MEASURED   = 42
+EXPECTED_FAILED     = 1
+
+# Class M (metadata-decomposable): answerable from metadata, no data read.
+M_Q01_DATA_GETS_MAX = 0            # q01 issues zero data (scan-phase) reads
+M_TOTAL_GETS_MAX    = 59_800       # target: 0 for all four; #850
+M_TOTAL_BYTES       = 4.84e9       # target: 0; #850
+
+# Class S (selective): a small predicate touches a small slice of the corpus.
+S_EACH_FRAC_MAX     = 0.055        # q37..q43 EACH <= 5.5% of corpus bytes
+S_GROUP_BYTES_MAX   = 33.2e9       # q20..q24 GROUP TOTAL; target: 5% each
+
+# Class F (full-value): reads full column values corpus-wide.
+F_AMPLIFICATION_MAX = 6.1          # target: 1.25, provisional
+
+# Operator pre-registration for THIS run's wall clock (a property of the run,
+# not of #913). Fill as (LO, HI) before the pass, or leave None for a loud SKIP.
+HOT_S_BAND          = None
+COLD_S_BAND         = None
 
 def load(path):
     docs, buf = [], ""
@@ -401,42 +439,176 @@ def rows(path):
                 out[sid] = n
     return out
 
-r = rows(sys.argv[1])
+def q_prefix(sid):            # "q07" from "q07_min_max_eventdate"
+    return sid.split("_", 1)[0]
+
+def corpus_classes(path):     # {q_prefix: class-string} from the corpus file
+    doc = json.load(open(path))
+    out = {}
+    for e in doc["entries"]:
+        out[q_prefix(e["id"])] = e.get("class")
+    return out
+
+report = sys.argv[1]
+corpus = sys.argv[2] if len(sys.argv) > 2 else \
+    "/root/ravel/benchmarks/clickbench/hits.corpus.json"
+
+r = rows(report)
 timed  = {k: v for k, v in r.items() if isinstance(v.get("min_ms"), (int, float))}
 failed = sorted(k for k, v in r.items() if v.get("error"))
+cls    = corpus_classes(corpus)
+
+# Report rows keyed by q-prefix, so a band phrased over q<NN> can find its row.
+# A prefix that maps to two measured rows is ambiguous and fails, not silently
+# picks one.
+by_q, dup_q = {}, set()
+for sid, v in timed.items():
+    q = q_prefix(sid)
+    if q in by_q: dup_q.add(q)
+    by_q[q] = v
+
+fails = []
+
+def cold(q):
+    """Cold-run (run 0) accounting for statement q, or None if not measured.
+    Cold is the object-store cost; warm runs hit cache. A band figure that is
+    EXPECTED but not emitted (statement absent, or no accounting) is a FAIL,
+    never a skip."""
+    v = by_q.get(q)
+    if v is None:
+        fails.append(f"{q}: expected a measured row, none present")
+        return None
+    if q in dup_q:
+        fails.append(f"{q}: two measured rows share this prefix; ambiguous")
+        return None
+    pra = v.get("per_run_accounting") or []
+    if not pra:
+        fails.append(f"{q}: no per_run_accounting; cold cost not emitted")
+        return None
+    return pra[0]
+
+def scan_wire(acc):
+    """Scan-phase WIRE bytes: the data-block reads. The report carries per-phase
+    wire BYTES but no per-phase GET count, so scan-phase bytes is the data-read
+    signal. At the zero point it is exact: zero scan bytes == zero data GETs."""
+    for p in acc.get("wire_bytes_by_phase") or []:
+        if p.get("phase") == "scan":
+            return p.get("wire_bytes") or 0
+    fails.append("a measured run carries no scan-phase wire_bytes entry")
+    return None
+
+# Membership every band relies on. Held here AND in the corpus data; if the two
+# disagree the band is being applied to the wrong statement, so fail loudly.
+CLASS_M      = ["q01", "q02", "q07", "q08"]
+CLASS_S_EACH = ["q37", "q38", "q39", "q40", "q41", "q42", "q43"]
+CLASS_S_GRP  = ["q20", "q21", "q22", "q23", "q24"]
+for q in CLASS_M:
+    if cls.get(q) != "metadata_decomposable":
+        fails.append(f"{q}: corpus class {cls.get(q)!r}, expected metadata_decomposable")
+for q in CLASS_S_EACH + CLASS_S_GRP:
+    if cls.get(q) != "selective":
+        fails.append(f"{q}: corpus class {cls.get(q)!r}, expected selective")
 
 hot  = sum(v["min_ms"] for v in timed.values()) / 1000.0
-cold = sum((v.get("cold_ms") or 0) for v in timed.values()) / 1000.0
-
-# Cold is run 0; warm is every run after it. Summing all runs together hides
-# which is which, and a cold figure quoted in a warm sentence overstates cost.
-cb = cg = wb = wg = 0
-for v in timed.values():
-    pra = v.get("per_run_accounting") or []
-    if pra:
-        cb += pra[0].get("object_store_bytes") or 0
-        cg += pra[0].get("object_store_get_requests") or 0
-        for x in pra[1:]:
-            wb += x.get("object_store_bytes") or 0
-            wg += x.get("object_store_get_requests") or 0
+colds = sum((v.get("cold_ms") or 0) for v in timed.values()) / 1000.0
 
 print(f"measured {len(timed)}  failed {len(failed)} {failed}")
 print(f"hot  {hot:.2f} s")
-print(f"cold {cold:.2f} s")
-print(f"cold {cb/1e9:.2f} GB in {cg} GETs")
-print(f"warm {wb/1e9:.2f} GB in {wg} GETs")
+print(f"cold {colds:.2f} s")
 
-fails = []
-# Integrity: a total over a different statement count is not comparable.
+# --- Integrity FIRST: a total over a different statement count, or over a run
+# with unexpected failures, is not comparable and no band on it stands. -----
 if len(timed) != EXPECTED_MEASURED:
     fails.append(f"measured {len(timed)}, expected {EXPECTED_MEASURED}")
 if len(failed) > EXPECTED_FAILED:
     fails.append(f"{len(failed)} failures, expected at most {EXPECTED_FAILED}")
-# Then the pre-registered bands for this specific change.
-if not (HOT_LO <= hot <= HOT_HI):
-    fails.append(f"hot {hot:.2f}s outside {HOT_LO}-{HOT_HI}")
-if not (COLD_LO <= cold <= COLD_HI):
-    fails.append(f"cold {cold:.2f}s outside {COLD_LO}-{COLD_HI}")
+
+# --- Class M --------------------------------------------------------------
+acc = cold("q01")
+if acc is not None:
+    sw = scan_wire(acc)
+    if sw is not None:
+        print(f"class M q01 data (scan) wire bytes {sw}")
+        if sw > M_Q01_DATA_GETS_MAX:
+            fails.append(f"class M q01 data reads {sw} bytes, must be {M_Q01_DATA_GETS_MAX}")
+m_gets = m_bytes = 0
+m_ok = True
+for q in CLASS_M:
+    acc = cold(q)
+    if acc is None:
+        m_ok = False; continue
+    m_gets  += acc.get("object_store_get_requests") or 0
+    m_bytes += acc.get("object_store_bytes") or 0
+if m_ok:
+    print(f"class M total {m_gets} GETs, {m_bytes/1e9:.2f} GB")
+    if m_gets > M_TOTAL_GETS_MAX:
+        fails.append(f"class M total {m_gets} GETs > {M_TOTAL_GETS_MAX} (target 0; #850)")
+    if m_bytes > M_TOTAL_BYTES:
+        fails.append(f"class M total {m_bytes/1e9:.2f} GB > {M_TOTAL_BYTES/1e9:.2f} GB (target 0; #850)")
+
+# --- Class S: assert the BYTE half; SKIP the object-count half LOUDLY ------
+S_EACH_BYTES_MAX = S_EACH_FRAC_MAX * CORPUS_BYTES
+for q in CLASS_S_EACH:
+    acc = cold(q)
+    if acc is None:
+        continue
+    b = acc.get("object_store_bytes") or 0
+    print(f"class S {q} {b/1e9:.2f} GB ({100*b/CORPUS_BYTES:.1f}% of corpus)")
+    if b > S_EACH_BYTES_MAX:
+        fails.append(f"class S {q} {b/1e9:.2f} GB > {S_EACH_FRAC_MAX*100:.1f}% "
+                     f"({S_EACH_BYTES_MAX/1e9:.2f} GB) of corpus bytes")
+s_grp_bytes = 0
+s_grp_ok = True
+for q in CLASS_S_GRP:
+    acc = cold(q)
+    if acc is None:
+        s_grp_ok = False; continue
+    s_grp_bytes += acc.get("object_store_bytes") or 0
+if s_grp_ok:
+    print(f"class S q20..q24 group total {s_grp_bytes/1e9:.2f} GB")
+    if s_grp_bytes > S_GROUP_BYTES_MAX:
+        fails.append(f"class S q20..q24 group {s_grp_bytes/1e9:.2f} GB > "
+                     f"{S_GROUP_BYTES_MAX/1e9:.2f} GB (target: 5% each)")
+# The #913 Class-S target is "<=5% of corpus bytes AND object count". The report
+# records GETs, and GETs are not objects (q37..q43 issue ~9,694 requests against
+# a 3,469-object corpus, 2.8x more requests than objects exist). Comparing GETs
+# to "5% of object count" compares two different quantities, so the object half
+# is not asserted here. Closing it needs a distinct-objects-touched counter in
+# the read path; until then this is a stated gap, not a passed check.
+print("SKIP class S object-count half: report has GETs, not distinct objects "
+      "touched; see #913 (needs a distinct-objects counter)")
+
+# --- Class F: corpus-wide fetch amplification -----------------------------
+scan_total = decoded_total = 0
+f_ok = True
+for q in by_q:
+    acc = cold(q)
+    if acc is None:
+        f_ok = False; continue
+    sw = scan_wire(acc)
+    if sw is None:
+        f_ok = False; continue
+    scan_total    += sw
+    decoded_total += acc.get("page_stored_bytes_decoded") or 0
+if f_ok:
+    if decoded_total == 0:
+        fails.append("class F: no decoded page bytes; amplification not emitted")
+    else:
+        amp = scan_total / decoded_total
+        print(f"class F corpus-wide fetch amplification {amp:.2f}")
+        if amp > F_AMPLIFICATION_MAX:
+            fails.append(f"class F amplification {amp:.2f} > {F_AMPLIFICATION_MAX} "
+                         f"(target 1.25, provisional)")
+
+# --- Operator wall-clock bands: assert if pre-registered, else SKIP loudly -
+if HOT_S_BAND is None:
+    print("SKIP hot band: not pre-registered for this run")
+elif not (HOT_S_BAND[0] <= hot <= HOT_S_BAND[1]):
+    fails.append(f"hot {hot:.2f}s outside {HOT_S_BAND}")
+if COLD_S_BAND is None:
+    print("SKIP cold band: not pre-registered for this run")
+elif not (COLD_S_BAND[0] <= colds <= COLD_S_BAND[1]):
+    fails.append(f"cold {colds:.2f}s outside {COLD_S_BAND}")
 
 if fails:
     print("\nPRECONDITION FAILURES -- the pass does not stand:")
@@ -446,7 +618,7 @@ print("\nin band")
 ```
 
 ```sh
-python3 analyse.py /root/bench.json
+python3 analyse.py /root/bench.json /root/ravel/benchmarks/clickbench/hits.corpus.json
 ```
 
 Rules that make a pass trustworthy:
@@ -466,6 +638,15 @@ Rules that make a pass trustworthy:
   assert it, or the pass attributes to code that is not there.
 - **Run one thing at a time.** A concurrent build makes wall clock
   unattributable. Check for running `cargo`, `rustc`, or bench processes first.
+- **The Class-S object-count half is a stated gap, not a passed check.** Issue
+  #913 phrases the Class-S target as "<=5% of corpus bytes AND object count".
+  The script asserts the byte half and prints an explicit `SKIP` for the object
+  half: the report records object-store GET requests, and GETs are not distinct
+  objects (q37..q43 issue about 9,694 requests against a 3,469-object corpus,
+  2.8x more requests than objects exist), so comparing GETs to a fraction of the
+  object count compares two different quantities. Closing the gap needs a
+  distinct-objects-touched counter in the read path; until that counter exists,
+  the object half stays skipped rather than asserted on the wrong quantity.
 
 ## 10. Profiling a statement
 

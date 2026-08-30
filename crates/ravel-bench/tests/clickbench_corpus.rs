@@ -22,7 +22,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use ravel_bench::sql_corpus::{load_external_corpus, supported_construct_names};
+use ravel_bench::sql_corpus::{CostClass, load_external_corpus, supported_construct_names};
 
 /// The checked-in corpus, relative to this crate's manifest dir
 /// (`crates/ravel-bench`) up to the repo root.
@@ -103,6 +103,115 @@ fn every_clickbench_statement_is_run_or_a_named_gap() {
         "every ClickBench statement Q1..Q{UPSTREAM_COUNT} must be either in the corpus or a \
          named gap: neither silently absent nor invented"
     );
+}
+
+/// The `q<NN>` prefix of a corpus entry id, e.g. `q07` from
+/// `q07_min_max_eventdate`. Membership is matched on this, not on full id text.
+fn q_prefix(id: &str) -> &str {
+    id.split('_').next().unwrap_or(id)
+}
+
+/// The metadata-decomposable (M) statements, by `q<NN>` prefix (epic #913).
+const CLASS_M: &[&str] = &["q01", "q02", "q07", "q08"];
+/// The selective (S) statements, by `q<NN>` prefix (epic #913).
+const CLASS_S: &[&str] = &[
+    "q20", "q21", "q22", "q23", "q24", "q37", "q38", "q39", "q40", "q41", "q42", "q43",
+];
+
+/// The class a `q<NN>` prefix belongs to, derived from the M/S lists; every
+/// prefix not in either is full-value (F). Independent of what the JSON says, so
+/// a mislabelled entry disagrees with this and fails the membership test.
+fn expected_class(q: &str) -> CostClass {
+    if CLASS_M.contains(&q) {
+        CostClass::MetadataDecomposable
+    } else if CLASS_S.contains(&q) {
+        CostClass::Selective
+    } else {
+        CostClass::FullValue
+    }
+}
+
+#[test]
+fn every_clickbench_statement_carries_a_cost_class() {
+    let entries = load_external_corpus(corpus_path()).expect("corpus loads");
+    assert_eq!(
+        entries.len(),
+        UPSTREAM_COUNT,
+        "the corpus must hold all {UPSTREAM_COUNT} statements"
+    );
+    for e in &entries {
+        assert!(
+            e.class.is_some(),
+            "corpus entry `{}` carries no cost class; every ClickBench statement must be \
+             classed (epic #913)",
+            e.id
+        );
+    }
+}
+
+#[test]
+fn cost_class_counts_are_exactly_four_twelve_and_the_remainder() {
+    let entries = load_external_corpus(corpus_path()).expect("corpus loads");
+    let (mut m, mut s, mut f) = (0usize, 0usize, 0usize);
+    for e in &entries {
+        match e.class.expect("every entry is classed") {
+            CostClass::MetadataDecomposable => m += 1,
+            CostClass::Selective => s += 1,
+            CostClass::FullValue => f += 1,
+        }
+    }
+    assert_eq!(
+        m, 4,
+        "expected exactly 4 metadata-decomposable (M) statements"
+    );
+    assert_eq!(s, 12, "expected exactly 12 selective (S) statements");
+    assert_eq!(
+        f,
+        UPSTREAM_COUNT - 16,
+        "expected the remaining {} statements to be full-value (F)",
+        UPSTREAM_COUNT - 16
+    );
+    assert_eq!(
+        m + s + f,
+        UPSTREAM_COUNT,
+        "every statement is classed exactly once"
+    );
+}
+
+#[test]
+fn cost_class_membership_is_pinned_per_statement() {
+    let entries = load_external_corpus(corpus_path()).expect("corpus loads");
+    // Every entry's label must equal the class its q-prefix belongs to. A test
+    // that only counted would pass with the labels shuffled; this fails the
+    // moment any single statement is mislabelled.
+    for e in &entries {
+        let q = q_prefix(&e.id);
+        assert_eq!(
+            e.class.expect("classed"),
+            expected_class(q),
+            "corpus entry `{}` carries the wrong cost class",
+            e.id
+        );
+    }
+    // Named spot checks from the task, so the pin is legible without expanding
+    // the loop in your head.
+    let class_of = |q: &str| -> CostClass {
+        entries
+            .iter()
+            .find(|e| q_prefix(&e.id) == q)
+            .and_then(|e| e.class)
+            .unwrap_or_else(|| panic!("statement {q} is present and classed"))
+    };
+    for q in ["q01", "q02", "q07", "q08"] {
+        assert_eq!(
+            class_of(q),
+            CostClass::MetadataDecomposable,
+            "{q} must be M"
+        );
+    }
+    assert_eq!(class_of("q20"), CostClass::Selective, "q20 must be S");
+    assert_eq!(class_of("q43"), CostClass::Selective, "q43 must be S");
+    assert_eq!(class_of("q03"), CostClass::FullValue, "q03 must be F");
 }
 
 #[test]

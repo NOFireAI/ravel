@@ -113,6 +113,7 @@ fn two_statement_corpus() -> Vec<CorpusEntry> {
             upstream_id: None,
             modified: Modification::Verbatim,
             required_declarations: Vec::new(),
+            class: None,
         })
         .collect()
 }
@@ -134,6 +135,7 @@ async fn publish_dataset(store: Arc<dyn ObjectStoreBackend>) -> TenantId {
             upstream_id: None,
             modified: Modification::Verbatim,
             required_declarations: Vec::new(),
+            class: None,
         }],
         runs: 1,
         records: RECORDS,

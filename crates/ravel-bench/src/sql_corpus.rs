@@ -145,6 +145,27 @@ impl RequiredDeclaration {
     }
 }
 
+/// The cost class a statement falls into (epic #913): how much of the object
+/// corpus it must touch to answer, and therefore which band its object-store
+/// cost is guarded against.
+///
+/// A typed enum, not a bare string. `CorpusEntry` carries no
+/// `deny_unknown_fields`, so a misspelled `"class"` value on an entry would be
+/// silently ignored and the entry would read as unclassified; a typed field
+/// turns that typo into a deserialization error naming the bad value, which is
+/// the whole point of classing the data rather than tracking it in a comment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CostClass {
+    /// M: answerable from metadata (block stats, the skip index) without reading
+    /// value data. A `COUNT(*)`, or a `MIN`/`MAX` over a declared column.
+    MetadataDecomposable,
+    /// S: a selective predicate touches a small fraction of the corpus.
+    Selective,
+    /// F: the statement reads full column values across the corpus.
+    FullValue,
+}
+
 /// One corpus statement and everything a reader needs to judge it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CorpusEntry {
@@ -174,6 +195,14 @@ pub struct CorpusEntry {
     /// declared-column dependency carries an empty list too.
     #[serde(default)]
     pub required_declarations: Vec<RequiredDeclaration>,
+    /// The cost class this statement falls into (epic #913), or `None` for a
+    /// corpus that predates cost classes. `#[serde(default)]` so the ADR-0100
+    /// native corpus and any external corpus without classes still load; a
+    /// corpus that classes *any* entry must class *every* entry, which
+    /// [`gate_corpus`] enforces, so an unclassified entry can never silently
+    /// read as some default class where the classes are consumed.
+    #[serde(default)]
+    pub class: Option<CostClass>,
 }
 
 impl CorpusEntry {
@@ -259,6 +288,18 @@ pub enum CorpusError {
         /// The duplicated id.
         entry_id: String,
     },
+    /// A corpus that classifies some entries left this one unclassified. A
+    /// corpus uses cost classes for every entry or for none: a mix would let an
+    /// unclassified entry read as a default class where the classes are consumed
+    /// (epic #913).
+    #[error(
+        "corpus entry `{entry_id}` has no cost class, but other entries in this corpus do; \
+         a corpus that classes any entry must class every entry"
+    )]
+    UnclassifiedEntry {
+        /// The id of the unclassified entry.
+        entry_id: String,
+    },
     /// An entry is flagged modified with an empty reason, which discloses
     /// nothing.
     #[error(
@@ -288,8 +329,17 @@ pub fn supported_construct_names() -> BTreeSet<String> {
 /// for the checked-in set and for an external file.
 pub fn gate_corpus(entries: &[CorpusEntry]) -> Result<(), CorpusError> {
     let supported = supported_construct_names();
+    // A corpus either classes every entry or none. If it classes any, an
+    // unclassified entry is a hard error here where the classes are consumed,
+    // not a silent fall-through to a default class (epic #913).
+    let uses_cost_classes = entries.iter().any(|e| e.class.is_some());
     let mut seen_ids: HashSet<&str> = HashSet::new();
     for entry in entries {
+        if uses_cost_classes && entry.class.is_none() {
+            return Err(CorpusError::UnclassifiedEntry {
+                entry_id: entry.id.clone(),
+            });
+        }
         if !seen_ids.insert(entry.id.as_str()) {
             return Err(CorpusError::DuplicateId {
                 entry_id: entry.id.clone(),
@@ -366,6 +416,9 @@ fn entry(id: &str, sql: &str, constructs: &[&str], expected_rows: Option<usize>)
         // declaration; the two that query `duration_ms` state that in
         // `default_corpus` via `CorpusEntry::requiring`.
         required_declarations: Vec::new(),
+        // The ADR-0100 native corpus predates cost classes and does not use
+        // them; the ClickBench corpus (loaded from JSON) is what carries them.
+        class: None,
     }
 }
 
@@ -798,12 +851,37 @@ mod tests {
                 reason: "   ".to_string(),
             },
             required_declarations: Vec::new(),
+            class: None,
         }];
         let err = gate_corpus(&entries).expect_err("an empty reason must fail");
         assert!(
             matches!(err, CorpusError::EmptyModificationReason { .. }),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn a_partially_classified_corpus_is_rejected_where_the_classes_are_consumed() {
+        // The class field is optional for corpora that predate classes, but a
+        // corpus that classes ANY entry must class EVERY entry: an unclassified
+        // entry there is a hard error at the gate, never a silent default class.
+        let mut classed = entry("a", "SELECT count(*) FROM logs", &["count"], Some(1));
+        classed.class = Some(CostClass::FullValue);
+        let unclassed = entry("b", "SELECT count(*) FROM logs", &["count"], Some(1));
+        let err = gate_corpus(&[classed, unclassed])
+            .expect_err("a mix of classed and unclassed entries must fail");
+        assert!(
+            matches!(&err, CorpusError::UnclassifiedEntry { entry_id } if entry_id == "b"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_fully_unclassified_corpus_gates_clean() {
+        // The ADR-0100 native corpus uses no classes at all, so the gate must
+        // not demand them: the "all or none" rule triggers only once one entry
+        // carries a class.
+        checked_default_corpus().expect("the unclassed native corpus gates clean");
     }
 
     #[test]
