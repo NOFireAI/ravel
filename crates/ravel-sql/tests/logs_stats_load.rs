@@ -94,7 +94,18 @@ fn i64_stat(name: &str, dict: &[(i64, u64)], null_count: u64) -> ColumnStat {
     let non_null_count: u64 = dict.iter().map(|(_, c)| c).sum();
     let min = dict.iter().map(|(v, _)| *v).min();
     let max = dict.iter().map(|(v, _)| *v).max();
-    let sum: i64 = dict.iter().map(|(v, c)| *v * (*c as i64)).sum();
+    // Accumulated in `i128` and narrowed once, mirroring what the fold does
+    // with `checked_mul`/`checked_add`. Computing the expected value in raw
+    // `i64` would panic on overflow in a debug build and wrap silently in a
+    // release one, so a fixture with large values would either abort the test
+    // or assert against a wrong expectation. A fixture that cannot fit `i64`
+    // is a bug in the fixture, and this says which.
+    let sum_wide: i128 = dict
+        .iter()
+        .map(|(v, c)| i128::from(*v) * i128::from(*c))
+        .sum();
+    let sum =
+        i64::try_from(sum_wide).expect("fixture dictionary sums beyond i64; choose smaller values");
     ColumnStat {
         name: name.to_string(),
         declared_type: DECLARED_TYPE_I64,
