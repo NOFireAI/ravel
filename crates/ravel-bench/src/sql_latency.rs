@@ -58,9 +58,9 @@ use ravel_logseg::{
 };
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::{
-    CacheFetchError, DEFAULT_FETCH_CONCURRENCY, DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
-    DEFAULT_MAX_SEGMENTS, EngineConfig, LogSegmentFetcher, PhaseWireByteCounter,
-    PhaseWireByteCounts, ProbeMissCounter, QueryPhase, SegmentFetcher,
+    CacheFetchError, DEFAULT_FETCH_CONCURRENCY, DEFAULT_LOG_REQUEST_COST_BYTES,
+    DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD, DEFAULT_MAX_SEGMENTS, EngineConfig, LogSegmentFetcher,
+    PhaseWireByteCounter, PhaseWireByteCounts, ProbeMissCounter, QueryPhase, SegmentFetcher,
 };
 use ravel_sql::{
     DEFAULT_MAX_QUERY_BYTES, DeclaredColumn, DeclaredType, SpanSegmentFetcher, SqlConfig,
@@ -218,6 +218,15 @@ pub struct Provenance {
     /// full-scan statement is latency-bound and moves nearly linearly with it.
     #[serde(default = "default_fetch_concurrency")]
     pub fetch_concurrency: usize,
+    /// The logs per-request byte budget this run configured
+    /// (`--logs-request-cost-bytes`, ADR-0904), the value fed to
+    /// [`EngineConfig::logs_request_cost_bytes`]. Recorded because it governs
+    /// whether a logs scan routes through the ranged probe-then-fetch path, so a
+    /// pass comparing knob settings is uninterpretable without it. A report
+    /// written before this field existed deserializes to
+    /// [`ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES`].
+    #[serde(default = "default_logs_request_cost_bytes")]
+    pub logs_request_cost_bytes: u64,
     /// The per-query DataFusion memory-pool ceiling this run ASKED for
     /// (`--sql-max-query-bytes`, ADR-0088). A report written before this field
     /// existed deserializes to [`ravel_sql::DEFAULT_MAX_QUERY_BYTES`].
@@ -344,6 +353,13 @@ fn default_max_segments() -> usize {
 /// what a report written before the field existed deserializes to.
 fn default_fetch_concurrency() -> usize {
     DEFAULT_FETCH_CONCURRENCY
+}
+
+/// The logs per-request byte budget every run used before the knob was
+/// reachable from the bench (ADR-0904); also what a report written before the
+/// field existed deserializes to.
+fn default_logs_request_cost_bytes() -> u64 {
+    DEFAULT_LOG_REQUEST_COST_BYTES
 }
 
 /// The deadline every run used before it became configurable (issue #688);
@@ -756,6 +772,12 @@ pub struct GenerateConfig {
     /// flag corresponds to it: this is the seam a probe sweep sets the window
     /// through.
     pub logs_suffix_len: Option<u64>,
+    /// Logs per-request byte budget (`--logs-request-cost-bytes`, ADR-0904),
+    /// fed to [`ExecutorSettings::logs_request_cost_bytes`] and so
+    /// [`EngineConfig::logs_request_cost_bytes`]. Defaults to
+    /// [`ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES`], so an unset flag leaves
+    /// logs-scan routing byte-for-byte unchanged.
+    pub logs_request_cost_bytes: u64,
 }
 
 /// Where the Flight lane sends its statements.
@@ -879,6 +901,13 @@ pub struct TenantConfigInput {
     /// through. Reaches the in-process fetcher only; the Flight lane never
     /// applies it (the setting is not on the Flight wire).
     pub logs_suffix_len: Option<u64>,
+    /// Logs per-request byte budget (`--logs-request-cost-bytes`, ADR-0904),
+    /// fed to [`ExecutorSettings::logs_request_cost_bytes`] and so
+    /// [`EngineConfig::logs_request_cost_bytes`]. Reaches the in-process
+    /// executor only; the Flight lane never applies it (no Flight header, and
+    /// the server's own config governs there). Defaults to
+    /// [`ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES`].
+    pub logs_request_cost_bytes: u64,
 }
 
 fn percentile(sorted_ns: &[u64], pct: f64) -> u64 {
@@ -998,6 +1027,13 @@ pub struct ExecutorSettings {
     /// move it is to sweep the window against measured probe misses first, which
     /// is what this knob exists for.
     pub logs_suffix_len: Option<u64>,
+    /// Per-request byte budget the logs planner charges each object against when
+    /// deciding whether to route a scan through the ranged probe-then-fetch path
+    /// (ADR-0904), the same knob as `ravel-server --logs-request-cost-bytes`.
+    /// Reaches [`EngineConfig::logs_request_cost_bytes`]. Defaults to
+    /// [`ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES`], so an unset flag leaves
+    /// routing byte-for-byte unchanged.
+    pub logs_request_cost_bytes: u64,
 }
 
 impl Default for ExecutorSettings {
@@ -1011,6 +1047,7 @@ impl Default for ExecutorSettings {
             max_segments: DEFAULT_MAX_SEGMENTS,
             logs_block_range_threshold: DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
             logs_suffix_len: None,
+            logs_request_cost_bytes: DEFAULT_LOG_REQUEST_COST_BYTES,
         }
     }
 }
@@ -1046,6 +1083,7 @@ fn cold_executor(
         max_segments,
         logs_block_range_threshold,
         logs_suffix_len,
+        logs_request_cost_bytes,
     } = settings;
     let catalog = Arc::new(Catalog::new(
         Arc::clone(store),
@@ -1083,6 +1121,7 @@ fn cold_executor(
             engine: EngineConfig {
                 fetch_concurrency: fetch_concurrency.max(1),
                 max_segments,
+                logs_request_cost_bytes,
                 ..EngineConfig::default()
             },
             parallel_final_aggregation,
@@ -1659,6 +1698,7 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
         parallel_final_aggregation: cfg.parallel_final_aggregation,
         max_segments: cfg.max_segments,
         logs_suffix_len: cfg.logs_suffix_len,
+        logs_request_cost_bytes: cfg.logs_request_cost_bytes,
         ..ExecutorSettings::default()
     };
     let (entries, skipped, failed) = measure_corpus(
@@ -1691,6 +1731,7 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
             cache_bytes: cfg.cache_bytes,
             deadline_secs: cfg.deadline.as_secs(),
             fetch_concurrency: cfg.fetch_concurrency.max(1),
+            logs_request_cost_bytes: cfg.logs_request_cost_bytes,
             sql_max_query_bytes_requested: cfg.max_query_bytes,
             // In-process lane: the requested ceiling reaches the executor's
             // `SqlConfig`, so it is also the effective one.
@@ -1738,6 +1779,7 @@ fn tenant_executor_settings(cfg: &TenantConfigInput, shard_count: u32) -> Execut
         parallel_final_aggregation: cfg.parallel_final_aggregation,
         max_segments: cfg.max_segments,
         logs_suffix_len: cfg.logs_suffix_len,
+        logs_request_cost_bytes: cfg.logs_request_cost_bytes,
         ..ExecutorSettings::default()
     }
 }
@@ -1840,6 +1882,7 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
             cache_bytes: cfg.cache_bytes,
             deadline_secs: cfg.deadline.as_secs(),
             fetch_concurrency: cfg.fetch_concurrency.max(1),
+            logs_request_cost_bytes: cfg.logs_request_cost_bytes,
             sql_max_query_bytes_requested: cfg.max_query_bytes,
             // `settings` is passed only on the in-process arm of the match
             // above, so on the Flight lane this ceiling never left the process
@@ -2200,6 +2243,7 @@ mod tests {
             flight: None,
             warm_catalog: false,
             logs_suffix_len: None,
+            logs_request_cost_bytes: DEFAULT_LOG_REQUEST_COST_BYTES,
         }
     }
 
@@ -3205,6 +3249,49 @@ mod tests {
             1,
             "a zero is clamped to one partition, never a zero-partition plan"
         );
+    }
+
+    /// `ExecutorSettings::default()` (an unspecified `--logs-request-cost-bytes`)
+    /// must reach `EngineConfig::logs_request_cost_bytes` as the engine's own
+    /// compiled-in default, not some literal the bench keeps in sync by hand.
+    /// Asserting the constant, not a number, means a change to
+    /// `DEFAULT_LOG_REQUEST_COST_BYTES` cannot silently desynchronise the bench
+    /// from the engine.
+    #[test]
+    fn cold_executor_defaults_logs_request_cost_to_engine_default() {
+        let store = empty_store();
+        let executor = cold_executor(&store, &[], None, ExecutorSettings::default())
+            .expect("build executor")
+            .executor;
+        assert_eq!(
+            executor.config().engine.logs_request_cost_bytes,
+            DEFAULT_LOG_REQUEST_COST_BYTES
+        );
+    }
+
+    /// `--logs-request-cost-bytes` must land on
+    /// `EngineConfig::logs_request_cost_bytes`, not stop at a parsed field.
+    /// Dropping the `logs_request_cost_bytes` line from `cold_executor`'s
+    /// `EngineConfig` (leaving it at `EngineConfig::default()`) makes the config
+    /// read back `DEFAULT_LOG_REQUEST_COST_BYTES` and fail this exact-value
+    /// assertion.
+    #[test]
+    fn cold_executor_threads_logs_request_cost_override() {
+        let store = empty_store();
+        let custom = DEFAULT_LOG_REQUEST_COST_BYTES * 3 + 7;
+        assert_ne!(custom, DEFAULT_LOG_REQUEST_COST_BYTES);
+        let executor = cold_executor(
+            &store,
+            &[],
+            None,
+            ExecutorSettings {
+                logs_request_cost_bytes: custom,
+                ..ExecutorSettings::default()
+            },
+        )
+        .expect("build executor")
+        .executor;
+        assert_eq!(executor.config().engine.logs_request_cost_bytes, custom);
     }
 
     /// A one-object, cache-wired fixture measured twice. Accounting is recorded
@@ -4414,6 +4501,7 @@ mod tests {
             explain_dir: None,
             warm_catalog: false,
             logs_suffix_len: None,
+            logs_request_cost_bytes: DEFAULT_LOG_REQUEST_COST_BYTES,
         };
         let gen_report = run_generated(&gen_cfg).await.expect("generated lane runs");
         let load_ms = gen_report
