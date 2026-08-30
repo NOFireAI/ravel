@@ -1085,3 +1085,111 @@ fn map_span_fetch_error(err: SpanFetchError) -> (pb::status::Code, String) {
         SpanFetchError::TenantMismatch { .. } => (pb::status::Code::Corrupt, err.to_string()),
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use ravel_types::accounting::AccountedOp;
+
+    use super::*;
+    use crate::phase_accounting::QueryPhase;
+
+    /// The two cost fields of one summary are derived from a single
+    /// `PhaseAccountingSnapshot` and cannot disagree: the frozen `accounting`
+    /// field (1) is exactly the `pooled()` value of the per-phase split (7).
+    ///
+    /// A reader that trusted field 1 and a reader that sums field 7 therefore
+    /// get the same number for every counter. The split carries distinct values
+    /// per phase here, so a `pooled()` that returned one phase's figures, or an
+    /// encoder that wrote the pooled snapshot into every phase slot, fails.
+    #[test]
+    fn phase_accounting_field_pools_to_the_frozen_accounting_field() {
+        let phases = PhaseAccounting::new();
+        phases.resolve().record_s3_request(AccountedOp::List);
+        phases.plan().add_s3_bytes(AccountedOp::Get, 333);
+        phases.plan().record_s3_request(AccountedOp::Get);
+        phases.probe().add_s3_bytes(AccountedOp::Get, 40);
+        phases.scan().observe_intermediate_bytes(70);
+        phases.plan().observe_intermediate_bytes(50);
+        let snap = phases.snapshot();
+
+        let frame = summary_frame(
+            &snap,
+            1,
+            2,
+            pb::status::Code::Ok,
+            String::new(),
+            &FetchStats::default(),
+        );
+        let Some(pb::fetch_response::Frame::Summary(summary)) = frame.frame else {
+            panic!("summary_frame builds a summary frame");
+        };
+
+        let split = codec::decode_phase_accounting(summary.phase_accounting)
+            .expect("the encoded split has the arity the decoder requires");
+        let pooled_field =
+            codec::decode_accounting(summary.accounting.expect("field 1 is always set"));
+
+        assert_eq!(
+            split.pooled(),
+            pooled_field,
+            "field 1 must be the pooled sum of field 7"
+        );
+        // Not a pooled snapshot copied into every slot: each phase carries only
+        // its own spend.
+        assert_eq!(
+            split.phase(QueryPhase::Plan).s3_bytes(AccountedOp::Get),
+            333
+        );
+        assert_eq!(
+            split.phase(QueryPhase::Probe).s3_bytes(AccountedOp::Get),
+            40
+        );
+        assert_eq!(split.phase(QueryPhase::Scan).s3_bytes(AccountedOp::Get), 0);
+        assert_eq!(
+            split
+                .phase(QueryPhase::Resolve)
+                .s3_requests(AccountedOp::List),
+            1
+        );
+        // The peak is a high-water mark: pooling takes the max of the phases,
+        // never their sum, so field 1 reports 70 and not 120.
+        assert_eq!(pooled_field.peak_intermediate_bytes, 70);
+    }
+
+    /// Every terminal summary carries a well-formed split, including the
+    /// pre-fetch failure path that reports no spend at all. Without this a
+    /// version-skew or malformed-request slice would fail the coordinator's
+    /// arity check instead of delivering its typed status.
+    #[tokio::test]
+    async fn a_pre_fetch_failure_summary_still_carries_a_full_phase_split() {
+        let store = std::sync::Arc::new(ravel_object_store::memory::MemoryStore::new());
+        let service = SeriesFetchService::new(
+            SegmentFetcher::new(store),
+            Arc::new(SnapshotSegmentResolver::new(std::iter::empty())),
+        );
+        // A protocol version this build does not speak: rejected before any
+        // fetch, so `run_slice`'s catch-all builds the summary from a default.
+        let frames = service
+            .run_slice(pb::FetchRequest {
+                protocol_version: codec::PROTOCOL_VERSION + 1,
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(frames.len(), 1, "slice atomicity: one terminal summary");
+        let Some(pb::fetch_response::Frame::Summary(summary)) = frames[0].frame.clone() else {
+            panic!("the single frame is the terminal summary");
+        };
+        assert_eq!(
+            summary
+                .status
+                .as_ref()
+                .expect("terminal summary carries a status")
+                .code,
+            pb::status::Code::Unsupported as i32
+        );
+        let split = codec::decode_phase_accounting(summary.phase_accounting)
+            .expect("even a zero-spend summary carries one entry per phase");
+        assert_eq!(split, PhaseAccountingSnapshot::default());
+    }
+}

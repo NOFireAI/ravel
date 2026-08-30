@@ -1716,12 +1716,14 @@ mod tests {
         }
     }
 
-    /// ADR-0103 (epic #64): the protocol version is 4 now that the coordinator
-    /// sets `FetchRequest.partial_aggregate` live and `MergedSource` consumes
-    /// the reply -- see the doc comment on `PROTOCOL_VERSION`.
+    /// Issue #959: the protocol version is 5 now that `Summary` carries the
+    /// per-phase split and the coordinator merges it phase for phase -- see the
+    /// doc comment on `PROTOCOL_VERSION`. A worker one version back sends no
+    /// split at all, which is why this is a version bump and not a silently
+    /// additive field.
     #[test]
-    fn protocol_version_is_four() {
-        assert_eq!(PROTOCOL_VERSION, 4);
+    fn protocol_version_is_five() {
+        assert_eq!(PROTOCOL_VERSION, 5);
     }
 
     #[test]
@@ -3059,6 +3061,102 @@ mod tests {
             },
             "every other field round-trips unchanged"
         );
+    }
+
+    /// Every phase gets its own wire slot, and the slot a phase's counters land
+    /// in is the slot they come back out of.
+    ///
+    /// Driven off [`QueryPhase::ALL`] on both sides with a value derived from
+    /// each phase's position, so a phase added to the enum is covered here with
+    /// no edit: its slot has to carry its own distinct value. A cross-wired
+    /// encoder (two phases sharing a slot, or the order reversed) reports one
+    /// phase's spend as another's and fails.
+    #[test]
+    fn every_phase_gets_its_own_wire_slot() {
+        let mut snap = PhaseAccountingSnapshot::default();
+        for (i, phase) in QueryPhase::ALL.iter().enumerate() {
+            let slot = snap.phase_mut(*phase);
+            slot.s3_requests[AccountedOp::Get.index()] = (i as u64) + 1;
+            slot.s3_bytes[AccountedOp::Get.index()] = 1_000 * ((i as u64) + 1);
+            slot.series_matched = 10 * ((i as u64) + 1);
+        }
+        let encoded = encode_phase_accounting(&snap);
+        assert_eq!(
+            encoded.len(),
+            QueryPhase::ALL.len(),
+            "one wire entry per phase"
+        );
+        let round = decode_phase_accounting(encoded).expect("well-formed split decodes");
+        for (i, phase) in QueryPhase::ALL.iter().enumerate() {
+            let got = round.phase(*phase);
+            assert_eq!(
+                got.s3_requests(AccountedOp::Get),
+                (i as u64) + 1,
+                "{} requests",
+                phase.name()
+            );
+            assert_eq!(
+                got.s3_bytes(AccountedOp::Get),
+                1_000 * ((i as u64) + 1),
+                "{} bytes",
+                phase.name()
+            );
+            assert_eq!(
+                got.series_matched,
+                10 * ((i as u64) + 1),
+                "{}",
+                phase.name()
+            );
+        }
+        // The pooled view the frozen `Summary.accounting` field carries is the
+        // sum of the entries, so the two fields of one summary agree.
+        assert_eq!(round.pooled().s3_requests(AccountedOp::Get), 1 + 2 + 3 + 4);
+        assert_eq!(
+            round.pooled().s3_bytes(AccountedOp::Get),
+            1_000 + 2_000 + 3_000 + 4_000
+        );
+    }
+
+    /// A split of the wrong arity is a typed error, never a zero-padded or
+    /// truncated one. This is what makes a phase impossible to drop silently on
+    /// the wire: the decoder's expectation is `QueryPhase::ALL.len()`, so an
+    /// encoder that emitted one entry short of the enum is rejected rather than
+    /// reporting the missing phase's real spend as a measured zero.
+    #[test]
+    fn a_split_missing_a_phase_is_rejected_rather_than_zero_padded() {
+        let full = encode_phase_accounting(&PhaseAccountingSnapshot::default());
+
+        let mut short = full.clone();
+        short.pop();
+        assert_eq!(
+            decode_phase_accounting(short),
+            Err(CodecError::PhaseAccountingArity {
+                got: QueryPhase::ALL.len() - 1,
+                expected: QueryPhase::ALL.len(),
+            })
+        );
+
+        let mut long = full.clone();
+        long.push(pb::QueryAccountingSnapshot::default());
+        assert_eq!(
+            decode_phase_accounting(long),
+            Err(CodecError::PhaseAccountingArity {
+                got: QueryPhase::ALL.len() + 1,
+                expected: QueryPhase::ALL.len(),
+            })
+        );
+
+        // An absent field (proto3 omits an empty repeated field), which is what
+        // a worker predating this split sends.
+        assert_eq!(
+            decode_phase_accounting(Vec::new()),
+            Err(CodecError::PhaseAccountingArity {
+                got: 0,
+                expected: QueryPhase::ALL.len(),
+            })
+        );
+
+        assert!(decode_phase_accounting(full).is_ok());
     }
 
     #[test]

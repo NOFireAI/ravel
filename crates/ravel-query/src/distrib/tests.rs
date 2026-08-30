@@ -418,10 +418,16 @@ async fn assert_distributed_matches_local(
     // reports the same cost the local path does over the same disjoint
     // segments -- not `FetchStats::default()` zeros, and not a wrapped or
     // dropped accounting counter (findings 3 and 4).
+    //
+    // Compared PER PHASE, not pooled (issue #959): both sides are
+    // `PhaseAccountingSnapshot`s, so this fails if the coordinator charges a
+    // remote slice's plan/probe reads to `scan` even though the pooled totals
+    // still agree. That is exactly the degenerate split this comparison used
+    // to be blind to, over the whole proptest corpus rather than one shape.
     assert_eq!(
         accounting.snapshot(),
         local_acct,
-        "distributed accounting must equal local accounting"
+        "distributed accounting must equal local accounting, phase for phase"
     );
     assert_eq!(
         distributed_stats, local_stats,

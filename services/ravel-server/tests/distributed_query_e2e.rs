@@ -87,7 +87,7 @@ fn now_ns() -> i64 {
 /// at `base_ns`. Mirrors `query_byte_budget_e2e.rs`'s helper so a query over a
 /// window covering it resolves the snapshot, opens the segment, and (on the
 /// distributed server) produces at least one slice to fan out.
-async fn publish_segment(store: &dyn ObjectStoreBackend, tenant: &TenantId, base_ns: i64) {
+async fn publish_segment(store: &dyn ObjectStoreBackend, tenant: &TenantId, base_ns: i64) -> u64 {
     let tenant_hash = tenant.hash();
     let label_set = LabelSet::new(vec![Label {
         name: "__name__".to_string(),
@@ -156,6 +156,7 @@ async fn publish_segment(store: &dyn ObjectStoreBackend, tenant: &TenantId, base
     .expect("valid commit record");
 
     let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+    let object_size = written.bytes.len() as u64;
     store
         .put(&data_key, written.bytes, PutOptions::default())
         .await
@@ -163,6 +164,10 @@ async fn publish_segment(store: &dyn ObjectStoreBackend, tenant: &TenantId, base
     publish::publish(store, &rec, &RetryPolicy::default())
         .await
         .expect("publish");
+    // The RSEG object's byte length, so a caller asserting on a phase's wire
+    // bytes can bind the figure to what was actually stored instead of to a
+    // literal that a segment-format change would silently invalidate.
+    object_size
 }
 
 /// Zero thresholds force the cost gate open: every query with any in-scope
@@ -365,30 +370,18 @@ async fn distributed_query_http_equals_local_http() {
     // The core ADR-0071 guarantee: fanned-out results are byte-identical to
     // local. This equality is what flips if the distributed path diverges.
     //
-    // `stats.phases` is excluded, and only that field. The per-phase cost split
-    // (issue #935) is a diagnostic attribution, not part of the result: a
-    // distributed query's segment reads happen inside a remote worker, which
-    // returns one pooled `QueryAccountingSnapshot` with no phase breakdown, so
-    // the coordinator charges the whole remote fetch to the `scan` phase by
-    // construction (`QueryStats::phase_accounting`'s own doc comment states
-    // this convention). The local path splits the same reads across `plan`,
-    // `probe`, and `scan`. Every other field of `data`, including the pooled
-    // `stats.accounting` totals those phases sum to, is still compared
-    // byte-for-byte, so a real divergence in the fanned-out result still flips
-    // this assertion.
-    let strip_phases = |body: &serde_json::Value| -> serde_json::Value {
-        let mut data = body["data"].clone();
-        data["stats"]
-            .as_object_mut()
-            .expect("stats is an object")
-            .remove("phases")
-            .expect("stats carries the per-phase cost split");
-        data
-    };
+    // The whole `data` object is compared, `stats.phases` included. That field
+    // used to be excluded (issue #935): a worker returned one pooled
+    // `QueryAccountingSnapshot`, so the coordinator charged the whole remote
+    // fetch to `scan` while a local run split the same reads across `plan`,
+    // `probe`, and `scan`. Issue #959 put the split on the wire
+    // (`Summary.phase_accounting`) and made the coordinator merge each remote
+    // phase into its own same-named phase, so the two splits are now equal
+    // figure for figure and the exclusion is gone. Restoring it would hide
+    // exactly the regression it was written around.
     assert_eq!(
-        strip_phases(&distributed_body),
-        strip_phases(&local_body),
-        "distributed `data` must be byte-identical to local outside the per-phase cost attribution:\n  distributed={distributed_body}\n  local={local_body}"
+        distributed_body["data"], local_body["data"],
+        "distributed `data` must be byte-identical to local, per-phase cost split included:\n  distributed={distributed_body}\n  local={local_body}"
     );
     // Sanity: the query actually returned the published series, so the equality
     // above is not the trivial equality of two empty results.
@@ -439,6 +432,167 @@ async fn distributed_query_http_equals_local_http() {
     assert!(
         !local_metrics.contains("ravel_distrib_"),
         "a local-only server must not render the distrib metric family:\n{local_metrics}"
+    );
+
+    distributed.shutdown().await.expect("A shuts down");
+    local.shutdown().await.expect("B shuts down");
+}
+
+/// The rendered `stats.phases` array keyed by phase name, so a test can name a
+/// phase directly instead of indexing a position.
+fn phase_map(body: &serde_json::Value) -> HashMap<String, serde_json::Value> {
+    body["data"]["stats"]["phases"]
+        .as_array()
+        .expect("stats.phases is an array")
+        .iter()
+        .map(|entry| {
+            (
+                entry["phase"]
+                    .as_str()
+                    .expect("every phase entry names its phase")
+                    .to_string(),
+                entry.clone(),
+            )
+        })
+        .collect()
+}
+
+/// One phase's `u64` counter, by name.
+fn phase_counter(phases: &HashMap<String, serde_json::Value>, phase: &str, field: &str) -> u64 {
+    phases
+        .get(phase)
+        .unwrap_or_else(|| panic!("stats.phases carries a `{phase}` entry"))
+        .get(field)
+        .unwrap_or_else(|| panic!("phase `{phase}` renders `{field}`"))
+        .as_u64()
+        .unwrap_or_else(|| panic!("phase `{phase}` field `{field}` is a u64"))
+}
+
+/// The distributed per-phase cost split (issue #959) equals the local one
+/// counter for counter, and is NON-DEGENERATE: the segment's whole-object read
+/// is charged to the `plan` phase that issued it, not folded into `scan`.
+///
+/// This is the assertion the pooled wire made impossible. A worker used to
+/// return one `QueryAccountingSnapshot` with no phase breakdown, and the
+/// coordinator folded it into `PhaseAccounting::scan()`, so on this exact query
+/// the distributed split reported `plan.s3GetWireBytes = 0` and
+/// `scan.s3GetWireBytes = <the segment's whole object>` while the local split
+/// reported the reverse. Every figure below is either an exact equality against
+/// the local reference run, or bound to a quantity the test itself knows (the
+/// published RSEG object's byte length, and the pooled `stats.accounting`
+/// totals the same response renders); none is a `> 0` liveness check.
+#[tokio::test]
+async fn distributed_phase_split_equals_local_and_charges_the_segment_read_to_plan() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new(TENANT);
+    let now = now_ns();
+    let segment_object_size = publish_segment(store.as_ref(), &tenant, now - 10 * NS_PER_MIN).await;
+    let (start, end) = ((now - 15 * NS_PER_MIN) / NS_PER_SEC, now / NS_PER_SEC);
+
+    // Two fresh processes over one store: A distributes every query, B never
+    // does. Both start cold, so neither carries cache state the other lacks.
+    let distributed = start_server(Arc::clone(&store), Some(always_distribute_settings())).await;
+    let local = start_server(Arc::clone(&store), None).await;
+
+    let distributed_body =
+        query_range(&format!("http://{}", distributed.http_addr), start, end).await;
+    let local_body = query_range(&format!("http://{}", local.http_addr), start, end).await;
+
+    let dist = phase_map(&distributed_body);
+    let local_phases = phase_map(&local_body);
+
+    // Every phase the response renders, compared whole. Driven off the rendered
+    // array rather than a hand-written list of four, so a phase added to
+    // `QueryPhase::ALL` is covered here with no edit.
+    assert_eq!(
+        dist.len(),
+        PHASE_COUNT,
+        "one entry per QueryPhase: {distributed_body}"
+    );
+    assert_eq!(
+        dist, local_phases,
+        "the distributed per-phase split must equal the local one figure for figure:\n  \
+         distributed={distributed_body}\n  local={local_body}"
+    );
+
+    // Non-degeneracy, at exact values. The whole segment crosses the wire once,
+    // in the plan phase's footer/skip-index open; probe and scan then serve
+    // themselves from that already-fetched region and issue no GET of their
+    // own. Under the pooled behaviour these four assertions read
+    // plan=0/0/0 and scan=<segment_object_size>.
+    assert_eq!(
+        phase_counter(&dist, "plan", "s3GetWireBytes"),
+        segment_object_size,
+        "the segment's whole-object read belongs to `plan`: {distributed_body}"
+    );
+    assert_eq!(
+        phase_counter(&dist, "plan", "s3GetRequests"),
+        1,
+        "exactly one GET opened the one published segment: {distributed_body}"
+    );
+    assert_eq!(
+        phase_counter(&dist, "plan", "segmentsOpened"),
+        1,
+        "one published segment, opened once: {distributed_body}"
+    );
+    assert_eq!(
+        phase_counter(&dist, "scan", "s3GetWireBytes"),
+        0,
+        "`scan` re-used the plan phase's bytes and issued no GET, so charging \
+         the remote fetch to it would be the degenerate split: {distributed_body}"
+    );
+    assert_eq!(
+        phase_counter(&dist, "scan", "s3GetRequests"),
+        0,
+        "{distributed_body}"
+    );
+    assert_eq!(
+        phase_counter(&dist, "probe", "s3GetWireBytes"),
+        0,
+        "{distributed_body}"
+    );
+
+    // The split accounts for the whole pooled total the same response renders,
+    // with nothing lost and nothing double-counted: resolve's catalog GETs plus
+    // the one segment object.
+    let pooled_get_bytes = distributed_body["data"]["stats"]["accounting"]["s3GetBytes"]
+        .as_u64()
+        .expect("stats.accounting.s3GetBytes is a u64");
+    let split_get_bytes: u64 = ["resolve", "plan", "probe", "scan"]
+        .iter()
+        .map(|phase| phase_counter(&dist, phase, "s3GetWireBytes"))
+        .sum();
+    assert_eq!(
+        split_get_bytes, pooled_get_bytes,
+        "the per-phase GET bytes must sum to the pooled figure: {distributed_body}"
+    );
+    assert_eq!(
+        phase_counter(&dist, "resolve", "s3GetWireBytes"),
+        pooled_get_bytes - segment_object_size,
+        "everything the split does not charge to the segment read is the \
+         catalog resolve's: {distributed_body}"
+    );
+
+    let pooled_get_requests = distributed_body["data"]["stats"]["accounting"]["s3GetRequests"]
+        .as_u64()
+        .expect("stats.accounting.s3GetRequests is a u64");
+    let split_get_requests: u64 = ["resolve", "plan", "probe", "scan"]
+        .iter()
+        .map(|phase| phase_counter(&dist, phase, "s3GetRequests"))
+        .sum();
+    assert_eq!(
+        split_get_requests, pooled_get_requests,
+        "the per-phase GET requests must sum to the pooled figure: {distributed_body}"
+    );
+
+    // And the fan-out really happened: without this the equality above could be
+    // two local runs agreeing with each other.
+    let metrics = scrape_metrics(&format!("http://{}", distributed.http_addr)).await;
+    let slices = metric_value(&metrics, "ravel_distrib_slices_local_total");
+    assert_eq!(
+        slices, 1.0,
+        "one snapshot segment partitions into exactly one slice, and it must \
+         have run through the fragment path:\n{metrics}"
     );
 
     distributed.shutdown().await.expect("A shuts down");
