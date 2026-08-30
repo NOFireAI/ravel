@@ -95,6 +95,12 @@ use credentials::FileCredentialProvider;
 mod instance_role;
 use instance_role::{DEFAULT_IMDS_ENDPOINT, InstanceRoleCredentialProvider};
 
+mod http_attempts;
+use http_attempts::{CountingHttpConnector, HttpAttemptMetrics};
+pub use http_attempts::HttpAttemptSnapshot;
+
+use object_store::client::ReqwestConnector;
+
 /// Default entries per `ListPage`, chosen to line up with S3's own
 /// `ListObjectsV2` page size. Overridable per instance via
 /// [`S3Store::with_page_size`].
@@ -491,6 +497,13 @@ pub struct S3Store {
     /// `multipart_abort_failures`; the difference isolates the dropped case.
     /// Read via [`S3Store::multipart_uploads_unreaped`] (#864).
     multipart_uploads_unreaped: AtomicU64,
+    /// Per-operation HTTP attempt counters (#928), incremented once per request
+    /// object_store's retry loop sends through the transport, so a logical call
+    /// that object_store retried internally is visible here as more than one
+    /// attempt. Read via [`S3Store::http_attempts`]. See the
+    /// [`http_attempts`](self::http_attempts) module for why this is the only
+    /// layer at which object_store's internal retries are observable.
+    http_attempts: Arc<HttpAttemptMetrics>,
 }
 
 impl S3Store {
@@ -507,6 +520,16 @@ impl S3Store {
     /// a non-default timeout and have it reach the constructed client.
     pub fn with_http_config(config: S3Config, http: S3HttpConfig) -> Result<Self, StoreError> {
         let (builder, credential_provider, instance_role_provider) = Self::builder(&config, &http)?;
+        // Slip a counting HTTP layer under object_store's retry loop (#928):
+        // wrap the same reqwest transport object_store would build by default,
+        // so every attempt (initial plus each internal retry) is counted while
+        // behavior is unchanged. The connector receives the `ClientOptions` set
+        // in `builder`, so the #851 timeout tuning still reaches the client.
+        let http_attempts = Arc::new(HttpAttemptMetrics::default());
+        let builder = builder.with_http_connector(CountingHttpConnector::new(
+            ReqwestConnector::default(),
+            Arc::clone(&http_attempts),
+        ));
         let store = builder
             .build()
             .map_err(|e| StoreError::Permanent(format!("failed to build S3 client: {e}")))?;
@@ -518,6 +541,7 @@ impl S3Store {
             instance_role_provider,
             multipart_abort_failures: AtomicU64::new(0),
             multipart_uploads_unreaped: AtomicU64::new(0),
+            http_attempts,
         })
     }
 
@@ -574,6 +598,20 @@ impl S3Store {
     /// nothing; that case is inferable only from S3's own list of open uploads.
     pub fn multipart_uploads_unreaped(&self) -> u64 {
         self.multipart_uploads_unreaped.load(Ordering::Relaxed)
+    }
+
+    /// HTTP attempt counters, per operation kind (#928).
+    ///
+    /// object_store retries retryable failures internally, so one logical call
+    /// can send several HTTP requests; each is billed by S3 but was invisible
+    /// to every counter above this layer, which sees only the final completion.
+    /// This counts every attempt, so for any operation kind
+    /// `attempts >= StoreMetrics.calls` and the difference is the retry count.
+    /// Bytes are unaffected: a failed attempt returns no payload and is not
+    /// counted here, so the byte figures stay honest while the request count
+    /// becomes honest too.
+    pub fn http_attempts(&self) -> HttpAttemptSnapshot {
+        self.http_attempts.snapshot()
     }
 
     /// Build the `AmazonS3Builder` from a [`S3Config`], with no network
