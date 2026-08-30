@@ -525,6 +525,25 @@ pub struct Cli {
     #[arg(long = "logs-block-range-threshold", value_name = "BYTES", default_value_t = DEFAULT_LOGS_BLOCK_RANGE_THRESHOLD)]
     pub logs_block_range_threshold: u64,
 
+    /// One saved object-store round trip is worth this many saved transfer
+    /// bytes; a property of the store and the instance, not of the RLOG data
+    /// format.
+    ///
+    /// ADR-0904 decision 1, threaded into
+    /// `ravel_query::EngineConfig::logs_request_cost_bytes` and from there into
+    /// `LogSegmentFetcher::with_request_cost_bytes`, which derives the
+    /// coalescing gap, the pre-probe whole-object crossover, and the
+    /// whole-segment fast path's projection routing from this one value so they
+    /// cannot disagree. Raising it above the largest segment object the process
+    /// serves collapses all three to whole-object reads, which is the setting
+    /// for a backend that bills requests and not transfer; the existing 64 KiB
+    /// and 512 KiB floors bound the low end. Omitted defaults to
+    /// [`ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES`], whose doc comment
+    /// carries the derivation of that number, so behavior is byte-identical
+    /// when unset. Read at startup only, like every other read knob here.
+    #[arg(long = "logs-request-cost-bytes", value_name = "BYTES", default_value_t = ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES)]
+    pub logs_request_cost_bytes: u64,
+
     /// Bound on concurrent in-flight segment fetches per query (ADR-0088),
     /// threaded into `ravel_query::EngineConfig::fetch_concurrency`. This is a
     /// single knob with three coupled effects, NOT decoupled by this change: it
@@ -1031,6 +1050,11 @@ pub struct QueryBudgets {
     /// `EngineConfig::logs_block_range_threshold` and from there
     /// `LogSegmentFetcher::with_block_range_threshold`.
     pub logs_block_range_threshold: u64,
+    /// How many transferred bytes one saved object-store round trip is worth to
+    /// this deployment (ADR-0904). Reaches
+    /// `EngineConfig::logs_request_cost_bytes` and from there
+    /// `LogSegmentFetcher::with_request_cost_bytes`.
+    pub logs_request_cost_bytes: u64,
 }
 
 impl Default for QueryBudgets {
@@ -1042,13 +1066,15 @@ impl Default for QueryBudgets {
             sql_tenant_max_bytes: DEFAULT_SQL_TENANT_MAX_BYTES,
             sql_parallel_final_aggregation: true,
             logs_block_range_threshold: DEFAULT_LOGS_BLOCK_RANGE_THRESHOLD,
+            logs_request_cost_bytes: ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES,
         }
     }
 }
 
 impl QueryBudgets {
-    /// Fold the two `EngineConfig`-bound budgets (`fetch_concurrency`,
-    /// `max_segments`) onto a base `EngineConfig` that already carries the
+    /// Fold the `EngineConfig`-bound budgets (`fetch_concurrency`,
+    /// `max_segments`, `logs_block_range_threshold`, `logs_request_cost_bytes`)
+    /// onto a base `EngineConfig` that already carries the
     /// separately-resolved deadline, bytes-scanned budget, and S3 request
     /// budget. [`crate::start`] calls this so the one process-wide engine both
     /// query surfaces share enforces the operator's `--fetch-concurrency` /
@@ -1060,6 +1086,7 @@ impl QueryBudgets {
             fetch_concurrency: self.fetch_concurrency,
             max_segments: self.max_segments,
             logs_block_range_threshold: self.logs_block_range_threshold,
+            logs_request_cost_bytes: self.logs_request_cost_bytes,
             ..base
         }
     }
@@ -1736,6 +1763,7 @@ impl Cli {
             sql_tenant_max_bytes: self.sql_tenant_max_bytes,
             sql_parallel_final_aggregation: self.sql_parallel_final_aggregation,
             logs_block_range_threshold: self.logs_block_range_threshold,
+            logs_request_cost_bytes: self.logs_request_cost_bytes,
         }
     }
 
@@ -3803,6 +3831,51 @@ mod tests {
                 .apply_to_engine(EngineConfig::default())
                 .logs_block_range_threshold,
             ravel_query::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+        );
+    }
+
+    /// ADR-0904 reachability: `--logs-request-cost-bytes` must reach the
+    /// `EngineConfig` `build_sql_state` reads when it builds the logs fetcher,
+    /// not stop at a parsed field. Same wiring trace as
+    /// [`fetch_concurrency_is_reachable_from_cli`]; the last hop from there is
+    /// `LogSegmentFetcher::with_request_cost_bytes` in
+    /// `crate::query::build_sql_state`, which is what makes the coalescing gap,
+    /// the whole-object crossover, and the fast path's projection routing move
+    /// with the flag.
+    ///
+    /// 1 GiB is the value under test because it is the operator-facing point of
+    /// the flag: a value at or above the largest object the deployment writes
+    /// collapses every derived decision to whole-object reads, which is the
+    /// setting for a backend that bills requests and not transfer.
+    #[test]
+    fn logs_request_cost_bytes_is_reachable_from_cli() {
+        use ravel_query::EngineConfig;
+
+        // Sanity: the value under test differs from the compiled-in default, so
+        // the assertion cannot pass by the flag being ignored.
+        assert_ne!(
+            1024 * 1024 * 1024,
+            ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES
+        );
+
+        let cli = Cli::try_parse_from(["ravel-server", "--logs-request-cost-bytes", "1073741824"])
+            .expect("flag parses");
+        let engine = cli.query_budgets().apply_to_engine(EngineConfig::default());
+        assert_eq!(
+            engine.logs_request_cost_bytes,
+            1024 * 1024 * 1024,
+            "the logs fetcher's request cost must be the configured flag, not the compiled-in \
+             DEFAULT_LOG_REQUEST_COST_BYTES"
+        );
+
+        // Default path: unset flag leaves the request cost at the fetcher's own
+        // compiled-in constant.
+        let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        assert_eq!(
+            cli.query_budgets()
+                .apply_to_engine(EngineConfig::default())
+                .logs_request_cost_bytes,
+            ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES,
         );
     }
 
