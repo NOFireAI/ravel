@@ -103,37 +103,73 @@ fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
 }
 
 /// The commit these numbers describe. `GITHUB_SHA` (set by CI) wins so a report
-/// from a detached HEAD still names the branch tip; otherwise ask git.
-fn git_commit() -> String {
-    if let Ok(sha) = std::env::var("GITHUB_SHA")
-        && !sha.trim().is_empty()
+/// from a detached HEAD still names the branch tip; otherwise ask git. A build
+/// whose commit cannot be identified is a loud error at stamp time, never a
+/// sentinel that reads like data (ADR-0927: a figure without its provenance is
+/// not evidence).
+fn git_commit() -> Result<String, String> {
+    resolve_git_commit(
+        std::env::var("GITHUB_SHA").ok(),
+        command_stdout("git", &["rev-parse", "HEAD"]),
+    )
+}
+
+/// The decision `git_commit` makes, split out so it is testable without a git
+/// checkout: `from_git` is exactly what `command_stdout` yields, i.e. `None`
+/// when the git command is absent or fails.
+fn resolve_git_commit(env_sha: Option<String>, from_git: Option<String>) -> Result<String, String> {
+    if let Some(sha) = env_sha
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
     {
-        return sha.trim().to_string();
+        return Ok(sha);
     }
-    command_stdout("git", &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_string())
+    from_git.ok_or_else(|| {
+        "cannot determine ravel_git_commit: GITHUB_SHA is unset and `git rev-parse HEAD` produced \
+         no output (run on a git checkout with git installed, or set GITHUB_SHA)"
+            .to_string()
+    })
 }
 
-fn toolchain() -> String {
-    command_stdout("rustc", &["--version"]).unwrap_or_else(|| "unknown".to_string())
+fn toolchain() -> Result<String, String> {
+    command_stdout("rustc", &["--version"]).ok_or_else(|| {
+        "cannot determine toolchain: `rustc --version` produced no output (is rustc on PATH?)"
+            .to_string()
+    })
 }
 
+/// `uname -srm`, falling back to the compile-time OS constant. This is a genuine
+/// OS identifier, not a missing-data sentinel, so it stays infallible.
 fn os_string() -> String {
     command_stdout("uname", &["-srm"]).unwrap_or_else(|| std::env::consts::OS.to_string())
 }
 
-/// First `model name` line of `/proc/cpuinfo`, the human CPU name.
-fn cpu_model() -> String {
-    let Ok(text) = std::fs::read_to_string("/proc/cpuinfo") else {
-        return "unknown".to_string();
-    };
-    for line in text.lines() {
+/// The human CPU name from the first `model name` line of `/proc/cpuinfo`. An
+/// unreadable or `model name`-less `/proc/cpuinfo` is a loud error, never an
+/// `"unknown"` string masquerading as a real CPU.
+fn cpu_model() -> Result<String, String> {
+    let text = std::fs::read_to_string("/proc/cpuinfo")
+        .map_err(|e| format!("cannot determine hardware.cpu_model: read /proc/cpuinfo: {e}"))?;
+    parse_cpu_model(&text).ok_or_else(|| {
+        "cannot determine hardware.cpu_model: no non-empty `model name` line in /proc/cpuinfo"
+            .to_string()
+    })
+}
+
+/// The first non-empty `model name` value in `/proc/cpuinfo` content. Split from
+/// the file read so the parse is testable on fixed input.
+fn parse_cpu_model(cpuinfo: &str) -> Option<String> {
+    for line in cpuinfo.lines() {
         if let Some((key, value)) = line.split_once(':')
             && key.trim() == "model name"
         {
-            return value.trim().to_string();
+            let model = value.trim();
+            if !model.is_empty() {
+                return Some(model.to_string());
+            }
         }
     }
-    "unknown".to_string()
+    None
 }
 
 fn logical_cores() -> u32 {
@@ -216,12 +252,12 @@ fn run() -> Result<(), String> {
                 .collect::<Result<Vec<_>, _>>()?;
             let provenance = Provenance {
                 schema_version: SCHEMA_VERSION,
-                ravel_git_commit: git_commit(),
-                toolchain: toolchain(),
+                ravel_git_commit: git_commit()?,
+                toolchain: toolchain()?,
                 protocol,
                 hardware: Hardware {
                     os: os_string(),
-                    cpu_model: cpu_model(),
+                    cpu_model: cpu_model()?,
                     logical_cores: logical_cores(),
                     instance_type: std::env::var("RAVEL_INSTANCE_TYPE")
                         .ok()
@@ -296,5 +332,64 @@ fn main() -> ExitCode {
             eprintln!("metricsbench_report: {err}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// A git command that produces nothing (what `command_stdout` returns when
+    /// git is absent or fails) is an ERROR that names the missing field, not a
+    /// sentinel. `from_git = None` is exactly the failing-command case.
+    #[test]
+    fn a_failed_git_command_is_an_error_naming_the_field() {
+        let err = resolve_git_commit(None, None)
+            .expect_err("no GITHUB_SHA and a failed git command must error");
+        assert!(
+            err.contains("ravel_git_commit"),
+            "the error must name the missing field, got: {err}"
+        );
+    }
+
+    /// `GITHUB_SHA` wins over git and is trimmed.
+    #[test]
+    fn github_sha_is_used_and_trimmed() {
+        assert_eq!(
+            resolve_git_commit(Some("  abc123  ".to_string()), None).unwrap(),
+            "abc123"
+        );
+    }
+
+    /// A blank `GITHUB_SHA` falls through to git.
+    #[test]
+    fn a_blank_github_sha_falls_through_to_git() {
+        assert_eq!(
+            resolve_git_commit(Some("   ".to_string()), Some("deadbeef".to_string())).unwrap(),
+            "deadbeef"
+        );
+    }
+
+    /// A `/proc/cpuinfo` with no `model name` line yields no CPU model, so
+    /// `cpu_model` errors rather than returning `"unknown"`.
+    #[test]
+    fn cpuinfo_without_a_model_name_line_has_no_cpu_model() {
+        assert_eq!(parse_cpu_model("processor : 0\nvendor_id : X\n"), None);
+    }
+
+    /// A blank `model name` value is not a CPU model either.
+    #[test]
+    fn a_blank_model_name_value_has_no_cpu_model() {
+        assert_eq!(parse_cpu_model("model name :    \n"), None);
+    }
+
+    /// A real `model name` line parses to its trimmed value.
+    #[test]
+    fn a_model_name_line_parses_to_its_value() {
+        assert_eq!(
+            parse_cpu_model("model name : AMD EPYC 7R13\n"),
+            Some("AMD EPYC 7R13".to_string())
+        );
     }
 }

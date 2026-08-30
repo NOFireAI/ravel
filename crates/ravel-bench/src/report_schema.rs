@@ -312,8 +312,9 @@ pub enum ValidationError {
         /// The version this build reads ([`SCHEMA_VERSION`]).
         expected: u32,
     },
-    /// A required provenance field is absent (an empty string, an empty digest,
-    /// zero logical cores). An absent field is not evidence.
+    /// A required provenance field is absent (an empty string, the `"unknown"`
+    /// sentinel, an empty digest, zero logical cores). An absent field is not
+    /// evidence.
     #[error(
         "required provenance field `{field}` is missing or blank; a figure without its \
          provenance is not evidence (ADR-0927)"
@@ -408,6 +409,19 @@ pub enum ValidationError {
         /// The offending value.
         value: f64,
     },
+    /// The report carries a geometric mean but not one measurement is timed. A
+    /// summary figure with no per-query row behind it is not a result: per-query
+    /// results are the source of truth and a geomean may accompany them but never
+    /// stands in for them (ADR-0927).
+    #[error(
+        "report carries geomean_ms {value} but no measurement is timed; a summary figure with no \
+         per-query row behind it is not a result (per-query results are the source of truth, \
+         ADR-0927)"
+    )]
+    GeomeanWithoutTimedRow {
+        /// The geomean value that had nothing behind it.
+        value: f64,
+    },
 }
 
 /// One required provenance string field, paired with the human name a
@@ -439,7 +453,12 @@ fn validate_provenance(p: &Provenance) -> Result<(), ValidationError> {
         });
     }
     for (field, value) in required_provenance_fields(p) {
-        if value.trim().is_empty() {
+        // A blank field is missing; so is the `"unknown"` sentinel a gatherer on
+        // a host without git or rustc used to emit. Rejecting it here pins the
+        // validator independently of any gatherer, so a future gatherer
+        // regression that reintroduces the sentinel cannot self-validate.
+        let trimmed = value.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("unknown") {
             return Err(ValidationError::MissingProvenanceField { field });
         }
     }
@@ -562,10 +581,16 @@ pub fn validate(report: &MetricsBenchReport) -> Result<(), ValidationError> {
         }
         validate_measurement(m)?;
     }
-    if let Some(g) = report.geomean_ms
-        && !(g.is_finite() && g > 0.0)
-    {
-        return Err(ValidationError::BadGeomean { value: g });
+    if let Some(g) = report.geomean_ms {
+        if !(g.is_finite() && g > 0.0) {
+            return Err(ValidationError::BadGeomean { value: g });
+        }
+        // A geomean summarizes the timed medians; a report whose rows are all
+        // timeout/error/refused has no timed median behind it, so the geomean
+        // summarizes nothing.
+        if !report.measurements.iter().any(|m| m.status.is_timed()) {
+            return Err(ValidationError::GeomeanWithoutTimedRow { value: g });
+        }
     }
     Ok(())
 }
@@ -868,6 +893,78 @@ mod tests {
             },
             "the error must name the missing field, got {err:?}"
         );
+    }
+
+    /// The validator rejects the `"unknown"` sentinel a gatherer on a host
+    /// without git used to emit, independently of the gatherer. This test pins
+    /// the validator even after the gatherer can no longer produce the sentinel:
+    /// a future gatherer regression that reintroduces it cannot slip a report
+    /// carrying `ravel_git_commit: "unknown"` past `validate`.
+    #[test]
+    fn a_report_with_an_unknown_sentinel_git_commit_fails_validation() {
+        let mut report = valid_report();
+        report.provenance.ravel_git_commit = "unknown".to_string();
+        let err = validate(&report).expect_err("an `unknown` sentinel git commit must fail");
+        assert_eq!(
+            err,
+            ValidationError::MissingProvenanceField {
+                field: "ravel_git_commit"
+            },
+            "the sentinel is treated as a missing field, got {err:?}"
+        );
+    }
+
+    /// `instance_type` is optional: a report with it absent (not a sentinel)
+    /// still validates. An explicit absence is not a defect; a sentinel string
+    /// standing in for one would be.
+    #[test]
+    fn a_report_with_instance_type_absent_validates() {
+        let mut report = valid_report();
+        report.provenance.hardware.instance_type = None;
+        validate(&report).expect("instance_type is optional; absent still validates");
+    }
+
+    /// A geomean with at least one timed row still validates: a summary that has
+    /// per-query rows behind it is admissible.
+    #[test]
+    fn a_geomean_with_a_timed_row_validates() {
+        let report = valid_report();
+        assert!(
+            report.measurements.iter().any(|m| m.status.is_timed()),
+            "the fixture has a timed row"
+        );
+        assert!(report.geomean_ms.is_some(), "the fixture has a geomean");
+        validate(&report).expect("a geomean with a timed row validates");
+    }
+
+    /// A geomean with zero timed rows fails with the distinct typed variant: a
+    /// summary figure with no per-query row behind it is not a result (ADR-0927).
+    /// The error says the geomean had nothing behind it, not that its value was
+    /// malformed.
+    ///
+    /// This test fails against the pre-fix validator, whose geomean check was
+    ///     if let Some(g) = report.geomean_ms && !(g.is_finite() && g > 0.0) {
+    ///         return Err(ValidationError::BadGeomean { value: g });
+    ///     }
+    /// (report_schema.rs, the `geomean_ms` block near the end of `validate`): a
+    /// finite positive geomean over all-untimed rows returned `Ok(())`, so
+    /// `expect_err` found `Ok` and the test failed. The fix adds the
+    /// `GeomeanWithoutTimedRow` arm beside `BadGeomean`.
+    #[test]
+    fn a_geomean_with_no_timed_row_fails_validation() {
+        let mut report = valid_report();
+        // The only measurement becomes untimed; a non-ok row must carry no
+        // timing figures, so strip them. The geomean stays present.
+        report.measurements[0].status = ResultStatus::Timeout;
+        report.measurements[0].figures.clear();
+        assert!(
+            !report.measurements.iter().any(|m| m.status.is_timed()),
+            "no row is timed after this mutation"
+        );
+        assert_eq!(report.geomean_ms, Some(12.5));
+        let err =
+            validate(&report).expect_err("a geomean over zero timed rows must fail validation");
+        assert_eq!(err, ValidationError::GeomeanWithoutTimedRow { value: 12.5 });
     }
 
     /// Failure class: a schema version this build does not read.
