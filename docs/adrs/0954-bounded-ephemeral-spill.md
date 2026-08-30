@@ -3,14 +3,25 @@
 Status: Accepted (2026-08-30)
 
 Amends ADR-0013 (the "spilling stays disabled" clause) and ADR-0102
-decision 3 (the disabled disk manager). It does not touch either document
-in place; both stand as written and are read together with this one.
+decision 3,
+`docs/adrs/0102-intra-segment-scan-partitioning-and-spill-policy.md:270-302`
+(the disabled disk manager). It does not touch either document in place;
+both stand as written and are read together with this one.
+
+Every reference below to "ADR-0102 decision 3" means that line range, the
+normative Decision. ADR-0102's Context item 3 (same file, lines 51-63)
+describes the *pre-decision* runtime in the present tense ("A
+high-cardinality final aggregation ... most likely spills silently to local
+disk today"); it records the problem ADR-0102 then fixed, not the state
+after it. It is therefore not the text this ADR amends, and a bare
+"ADR-0102" reference that lands a reader there reads as contradicting both
+ADRs. Line ranges are given at each reference for that reason.
 
 ## Context
 
 ADR-0013 established the SQL memory model: "budget exhaustion is an error,
-never a partial result; spilling stays disabled." ADR-0102 decision 3 then
-made that literal in code, configuring
+never a partial result; spilling stays disabled." ADR-0102 decision 3
+(lines 270-302) then made that literal in code, configuring
 `RuntimeEnvBuilder::new().with_disk_manager_builder(DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled))`
 so that an aggregation or `ORDER BY` over budget fails with a typed
 `ResourcesExhausted` instead of silently spilling to DataFusion 54's
@@ -47,7 +58,8 @@ never used for recovery. No partial result is returned.
 
 This is the new invariant. It replaces "spilling stays disabled"
 (ADR-0013) and "spill is a typed error, not silent degradation, achieved
-by disabling the disk manager" (ADR-0102 decision 3). It preserves
+by disabling the disk manager" (ADR-0102 decision 3, lines 270-302). It
+preserves
 ADR-0013's actual concern -- a partial result masking a budget problem --
 because spill still produces the exact result or a typed error, never a
 partial one.
@@ -55,9 +67,10 @@ partial one.
 ### Why the old rule changed
 
 1. **ADR-0102's rationale conflated transient execution state with durable
-   state.** This is the load-bearing correction. ADR-0102 decision 3 and
-   its "Amend ADR-0013 to sanction bounded local-disk spill" rejected
-   alternative both rest on the premise that a compute node retaining query
+   state.** This is the load-bearing correction. ADR-0102 decision 3 (lines
+   270-302) and its "Amend ADR-0013 to sanction bounded local-disk spill"
+   rejected alternative (lines 345-355) both rest on the premise that a
+   compute node retaining query
    state on local disk violates "compute is disposable, only object storage
    is durable." That premise does not hold: spill files are no more durable
    than the identical query state held in RAM. If the worker dies
@@ -112,10 +125,35 @@ analysis, not as new claims.
 All nine are normative. Each states the reason it exists; a change that
 drops the reason drops the requirement.
 
-1. **A hard per-query memory cap.** Spill is triggered by the memory budget
-   being reached, so that budget must be a real ceiling first. This is the
-   existing `TenantDelegatingPool::try_grow` per-query limit; without it
-   there is no defined point at which an eligible operator begins to spill.
+1. **A hard per-query memory cap, held across spill by in-pool sort
+   headroom.** Spill is triggered by the memory budget being reached, so that
+   budget must be a real ceiling first. This is the existing
+   `TenantDelegatingPool::try_grow` per-query limit; without it there is no
+   defined point at which an eligible operator begins to spill. The cap
+   stays hard *through* the spill, not only up to it: DataFusion's
+   grouped-hash spill reserves the transient headroom it needs to sort each
+   emitted batch out of the same pool, not out of an allowance above it. In
+   the locked dependency
+   (`datafusion-physical-plan-54.1.0/src/aggregates/row_hash.rs:1241-1269`)
+   `spill()` emits all groups with `EmitTo::All`, calls `clear_shrink(0)` to
+   free the group hash state before it reserves so the pool has room, then
+   `self.reservation.try_grow`s the estimated sort memory and returns a typed
+   `ResourcesExhausted` if even that will not fit. So spilling never routes
+   around the cap: what the cap bounds is pool-accounted bytes, and the sort
+   headroom is charged to the same bound. The peak the cap must accommodate
+   is one emitted batch plus its sort reservation held together (the group
+   state having been freed first), so the effective ceiling for steady-state
+   group state is below the configured pool by that worst-case headroom; an
+   operator sizing the pool must leave that room. The gap the cap does *not*
+   close is between pool-accounted bytes and process RSS (allocator overhead,
+   Arrow buffer rounding, the emitted-batch-plus-sort peak): that gap is not
+   bounded by reasoning and is validated only by the peak-RSS measurement
+   required in the implementation-constraint section below, consistent with
+   that section's rule that the memory-bound claim is a measurement result,
+   not a consequence of enabling spill. Open question for the implementation:
+   whether to leave the sort headroom implicit (configure the pool below the
+   volume/RSS ceiling) or to model it as a named reserve. This ADR fixes the
+   validation, not that choice.
 
 2. **Per-query, per-tenant, and node-wide spill quotas.** The scratch
    budget of the invariant is three independent ceilings, mirroring the
@@ -126,10 +164,51 @@ drops the reason drops the requirement.
    the sum of tenants cannot exhaust the disk and stall every query. Any one
    exceeded produces the typed `ResourcesExhausted` of the invariant.
 
+   The three quotas are enforced by *reservation*, not by observing free
+   space: a check-then-write against observed headroom lets concurrent
+   spilling queries each see room and collectively overrun a quota. The
+   discipline this ADR requires:
+
+   - **What and when.** Before a batch is written to scratch, the query
+     reserves the bytes it is about to write against all three counters
+     (per-query, per-tenant, node-wide) in one atomic step. The reservation,
+     not the subsequent write, is the point a quota is enforced; a reservation
+     that would push any counter over its ceiling fails, and the query
+     produces `spill_budget_exhausted` (requirement 5) without writing.
+   - **Atomicity.** The per-tenant and node-wide counters are shared across
+     queries, so their check-and-increment must be a single atomic operation
+     (an atomic compare-and-add, or a lock held across check and increment),
+     never a read followed by a later add. Reserving against all three in one
+     step, and rolling back the ones already taken if a later one fails,
+     keeps the counters consistent under concurrency. This is the requirement;
+     the exact primitive (per-node in-process counters versus a shared
+     accountant) is an implementation open question, because the node-wide
+     counter's authority depends on whether one process owns the scratch
+     volume (see requirement 7's shared-directory case).
+   - **Failure mid-spill.** A query whose spill fails partway (a reservation
+     denied for a later batch, a write error, cancellation) releases its
+     entire outstanding reservation as part of the same termination path that
+     deletes its files (requirement 7). Reservation lifetime is tied to the
+     spilled bytes on disk: bytes accounted but not yet deleted stay reserved;
+     a counter is decremented only as the corresponding files are removed, so
+     a crash between write and cleanup cannot make a counter under-count live
+     usage.
+   - **Reclaim after a crash.** A process that dies mid-spill leaves both
+     orphaned files and, for any cross-process (node-wide) counter, a
+     reservation it can no longer release. The node-wide counter is therefore
+     reconstructed from the scratch volume's actual contents at startup, in
+     the same sweep that removes orphans (requirement 7), rather than
+     persisted and trusted across a restart; per-query and per-tenant counters
+     live only for the process and are gone with it. Making the node-wide
+     counter authoritative across processes that do not share memory is the
+     open question flagged above; until it is settled the safe posture is one
+     spilling process per scratch volume (requirement 7).
+
 3. **An explicitly configured spill directory, never DataFusion's
-   accidental default.** ADR-0102 documented that leaving the disk manager
-   unconfigured silently selected `DiskManagerMode::OsTmpDirectory` with a
-   100 GB ceiling -- the exact behavior it disabled. Enabling spill must not
+   accidental default.** ADR-0102's Context item 3 (lines 51-63) documented
+   that leaving the disk manager unconfigured silently selected
+   `DiskManagerMode::OsTmpDirectory` with a 100 GB ceiling -- the exact
+   behavior decision 3 (lines 270-302) then disabled. Enabling spill must not
    reintroduce that by omission: the spill directory is set explicitly to a
    path an operator chose for ephemeral storage, with its own capacity
    understood, never the OS temp directory and never the 100 GB default
@@ -166,6 +245,26 @@ drops the reason drops the requirement.
    established "budget exhaustion is a typed error" convention
    (`bytes_scanned_exceeded` in ravel-query).
 
+   `spill_budget_exhausted`, `spill_unavailable`, and the cleanup-error
+   identifier are stable, machine-readable codes, not display strings. An
+   operator alerting on spill failure keys on the code, so:
+
+   - The code is a distinct field on the error, carried alongside the
+     human-readable message, not extracted by matching the message text. It
+     surfaces wherever the typed error does: the query API response and the
+     spill accounting of requirement 6, using the same shape as the existing
+     `bytes_scanned_exceeded` identifier in ravel-query rather than a new one.
+   - The identifier is a compatibility contract: the message wording may be
+     reworded freely, but the code string is fixed once shipped and is not
+     changed by a message rewrite. Adding a new spill failure mode adds a new
+     code; it never renames or repurposes an existing one. An alert written
+     against `spill_budget_exhausted` keeps firing on the same condition
+     across releases.
+
+   The exact string spellings and where the field is declared are an
+   implementation detail; that they are stable, message-independent, and
+   append-only is the requirement.
+
 6. **Spill accounting in query diagnostics.** Bytes written and read,
    file count, the operator that spilled, spill duration, and peak disk
    usage are reported per query, under the phase that issued them, matching
@@ -181,6 +280,45 @@ drops the reason drops the requirement.
    worker that died before it could clean up -- the crash case the
    disposable-compute model explicitly allows.
 
+   Three points the cleanup rule must settle, because getting them wrong
+   ranges from a slow leak to destroying a live process's data:
+
+   - **Orphan lifetime.** An orphan lives at most until the next startup
+     sweep; it is never left indefinitely. The steady-state expectation is
+     zero orphans, because every in-process termination path deletes its own
+     files; an orphan exists only for files a crash left behind, and the
+     bound on their lifetime is the time to the next process start plus one
+     sweep. This ADR does not add a background reaper on the assumption that
+     crashes are rare and startup is frequent on disposable compute; whether a
+     periodic in-process sweep is also needed (long-lived processes, rare
+     restarts) is an open question for the implementation, not a mechanism
+     fixed here.
+   - **Cleanup failure.** A delete that itself fails (an I/O error unlinking a
+     spill file) must not be swallowed and must not fail the query's result:
+     the query has already produced the exact result or its typed error, and
+     cleanup runs after. A failed cleanup is reported through the cleanup-error
+     code of requirement 5 and surfaced in diagnostics (requirement 6), and
+     the file it could not remove is left for the startup sweep to reclaim.
+     Cleanup failure degrades to the orphan path; it never silently loses
+     track of a file.
+   - **A scratch directory shared by two processes.** Startup cleanup that
+     deletes files it does not own would destroy a concurrently running
+     process's live spill -- a data-destroying bug. This ADR requires that a
+     spill file be attributable to the process that owns it and that the
+     startup sweep delete only files no live process owns. The safe default
+     is exclusive ownership of a scratch directory: each process spills under
+     a subdirectory keyed to its own instance identity, and the sweep removes
+     only subdirectories whose owning process is provably gone (for example
+     via an OS-level advisory lock or pid-liveness check on the owner marker),
+     never the shared root wholesale. A process that cannot establish
+     exclusive ownership of its scratch path, or prove a candidate orphan's
+     owner is dead, must not sweep -- it treats the volume as read-shared and
+     leaves foreign files alone. The exact ownership mechanism (per-process
+     subdirectory plus liveness proof, or one spilling process per volume as
+     requirement 2's reclaim note assumes) is an implementation open question;
+     the invariant fixed here is that no sweep ever deletes a file a live
+     process owns.
+
 8. **Isolation and protection of spilled tenant data.** Spill holds a
    tenant's query state on a shared multi-tenant node's disk. One tenant's
    spill files must not be readable by another tenant's query and must not
@@ -191,21 +329,26 @@ drops the reason drops the requirement.
 9. **A no-spill deployment profile.** Environments without safe ephemeral
    storage (no writable scratch volume, or one whose contents could leak or
    persist) must be able to disable spill entirely, reverting to the
-   memory-budget-refuses posture. This preserves ADR-0102's disabled-disk
-   -manager behavior as an explicit deployment choice rather than deleting
+   memory-budget-refuses posture. This preserves ADR-0102 decision 3's
+   (lines 270-302) disabled-disk-manager behavior as an explicit deployment
+   choice rather than deleting
    it: an operator who cannot meet requirements 3, 7, and 8 selects this
    profile and keeps the pre-this-ADR guarantee that no query state ever
    reaches local disk.
 
 ### Implementation constraint: the memory-bound claim needs measurement
 
-DataFusion 54's grouped hash spill path materializes all current groups
-with `EmitTo::All` and sorts that batch before writing it. Enabling the
-disk manager therefore does not by itself prove a strict memory bound: the
-path may still need substantial transient headroom to hold and sort the
-full current group set at the moment it emits, and the peak can exceed the
-configured pool. Related bounded-emission limitations are tracked upstream
-as DataFusion #24072.
+DataFusion 54.1.0's grouped hash spill path materializes all current groups
+with `EmitTo::All` and sorts that batch before writing it
+(`datafusion-physical-plan-54.1.0/src/aggregates/row_hash.rs:1241-1269`,
+`spill()`). Enabling the disk manager therefore does not by itself prove a
+strict memory bound: as requirement 1 records, that sort headroom is
+reserved from the same pool via `self.reservation.try_grow` after the group
+state is freed, so the *pool-accounted* peak stays under the cap -- but
+pool-accounted bytes are not process RSS. Allocator overhead, Arrow buffer
+rounding, and the emitted batch held together with its sort reservation at
+the moment of emission can put peak RSS above the configured pool. Related
+bounded-emission limitations are tracked upstream as DataFusion #24072.
 
 The consequence for this ADR is a rule, not just a caveat: the claim that
 an eligible operator now runs within a bounded memory footprint is
@@ -213,7 +356,22 @@ established only by measuring peak RSS against a declared overhead on the
 real workload, never by reasoning from "spill is enabled." A statement that
 enabling spill makes q33 fit in budget is not a result until the peak-RSS
 measurement backs it, pre-registered with its expected band per the repo's
-measurement discipline. The `EmitTo::All`-plus-sort behavior is also the
+measurement discipline.
+
+This is a normative requirement on the implementation, not only a caution:
+the memory-bound claim must be validated by a q33-scale peak-RSS test run
+against the locked dependency version (DataFusion 54.1.0), and requirement 1
+holds only for the pool sizing that test shows keeps peak RSS within its
+declared band. The test pins peak RSS, not merely that the query completes:
+a q33 (or q33-scale) grouped aggregation is run under a configured pool with
+spill enabled, its peak RSS measured, and the assertion is that the measured
+peak stays within the pre-registered band above the pool. Because the sort
+headroom that pushes the peak up is DataFusion-version-specific
+(`EmitTo::All`-plus-sort behavior can change across releases; #24072 tracks
+the upstream direction), the test is bound to the locked 54.1.0 and is
+re-validated on any DataFusion bump before requirement 1's claim is
+re-asserted. Until that measurement exists, the memory-bound property is a
+requirement to be demonstrated, not an established result. The `EmitTo::All`-plus-sort behavior is also the
 concrete reason order-dependent float aggregation is ineligible
 (requirement 4): the sort re-orders the fold, breaking the deterministic
 folding contract that float exactness depends on.
@@ -232,8 +390,9 @@ untouched: joins reach the pool through the infallible `grow` path and are
 not among the eligible operators here, so nothing about their best-effort
 accounting changes.
 
-**ADR-0102.** Decision 3 ("Disable the disk manager explicitly; spill is a
-typed error, not silent degradation") is superseded in its mechanism: the
+**ADR-0102.** Decision 3 (lines 270-302, "Disable the disk manager
+explicitly; spill is a typed error, not silent degradation") is superseded
+in its mechanism: the
 disk manager is no longer configured to `DiskManagerMode::Disabled` for
 deployments that enable spill. Decision 3's *goal* -- that a budget
 overrun is a typed error and never a silent local-disk write -- is kept.
@@ -241,23 +400,24 @@ What changes is that the typed error now fires at the scratch-budget
 boundary rather than at the first byte of spill, and eligible operators
 reach that boundary by spilling exactly rather than by refusing at the
 memory boundary. ADR-0102's "Leave the disk manager unconfigured (status
-quo)" rejected alternative still stands: this ADR does not leave it
-unconfigured, it configures an explicit spill directory (requirement 3).
-ADR-0102's "Amend ADR-0013 to sanction bounded local-disk spill" rejected
-alternative is the decision this ADR reverses, on the corrected premise in
-"Why the old rule changed" item 1.
+quo)" rejected alternative (lines 356-361) still stands: this ADR does not
+leave it unconfigured, it configures an explicit spill directory
+(requirement 3). ADR-0102's "Amend ADR-0013 to sanction bounded local-disk
+spill" rejected alternative (lines 345-355) is the decision this ADR
+reverses, on the corrected premise in "Why the old rule changed" item 1.
 
 ADR-0102's typed-error machinery is kept and extended, not deleted. The
-#740 amendment's `MSG_SPILL_DISABLED_MARKER` re-attribution in
+issue-#740 amendment (lines 596-660) and its `MSG_SPILL_DISABLED_MARKER`
+re-attribution in
 `crates/ravel-sql/src/error.rs` (`resources_exhausted_reattributed`, which
 rewrites a refused pool error from the query's own pool figures at the
 `PinnedStream::poll_next` seam) remains the shape for producing an
 attributed typed error; the new `spill_budget_exhausted`,
 `spill_unavailable`, and cleanup errors of requirement 5 extend that
 surface rather than replacing it. Decisions 1, 2, and 4 of ADR-0102
-(intra-segment partitioning, ADR-0094 in place, the group-by scaling
-benchmark) are untouched; only decision 3's disable-the-disk-manager
-mechanism is superseded.
+(intra-segment partitioning, lines 81-147; ADR-0094 in place, lines 148-269;
+the group-by scaling benchmark, lines 304-326) are untouched; only decision
+3's disable-the-disk-manager mechanism is superseded.
 
 **ADR-0036.** ADR-0036 rejected io_uring "on structural grounds," resting
 in part on the finding that Ravel's data plane has "no local file I/O to
