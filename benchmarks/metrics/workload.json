@@ -111,7 +111,7 @@
       "samples_per_series": 120,
       "scrape_interval_secs": 15,
       "duration_secs": 1800,
-      "churn_basis_points_per_hour": 500,
+      "churn_basis_points_per_hour": 0,
       "total_samples": 120000,
       "comparability": {
         "non_comparable": {

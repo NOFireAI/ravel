@@ -255,6 +255,15 @@ enum InstanceState {
         sum: f64,
         count: u64,
     },
+    /// A native histogram's cumulative per-bucket counts, observation sum, and
+    /// observation count. A native histogram carries counter semantics
+    /// (ADR-0108): `count` and `sum` only increase apart from an injected reset,
+    /// so the absolutes are accumulated here rather than recomputed per step.
+    Native {
+        buckets: Vec<u64>,
+        sum: f64,
+        count: u64,
+    },
 }
 
 /// One family's generation plan under one profile.
@@ -272,6 +281,10 @@ struct FamilyPlan {
     fixed: Vec<(u64, u64)>,
     /// Product of the fixed cardinalities: the instance ordinal's divisor.
     fixed_product: u64,
+    /// The classic-histogram `le` bounds, cloned once at plan build so a sample
+    /// does not re-clone the generator's bounds on every emit. Carried on every
+    /// plan; only the classic-histogram branch reads it.
+    classic_bounds: Vec<f64>,
     /// Accumulated state, keyed by global instance index. Pruned at each epoch
     /// boundary so a long churn run does not grow without bound.
     state: BTreeMap<u64, InstanceState>,
@@ -346,6 +359,7 @@ impl<'a> Generator<'a> {
                 churned_per_epoch: instances * profile.churn_basis_points_per_hour / 10_000,
                 fixed,
                 fixed_product: stride,
+                classic_bounds: workload.generator.classic_histogram_bounds.clone(),
                 state: BTreeMap::new(),
             });
         }
@@ -449,7 +463,9 @@ impl<'a> Generator<'a> {
 
                     let reset = matches!(
                         family.kind,
-                        FamilyKind::Counter | FamilyKind::ClassicHistogram
+                        FamilyKind::Counter
+                            | FamilyKind::ClassicHistogram
+                            | FamilyKind::NativeHistogram
                     ) && fires(
                         anomalies.counter_reset_one_in,
                         seed,
@@ -629,7 +645,7 @@ impl<'a> Generator<'a> {
                     // A family's kind never changes mid-run, so this arm is
                     // unreachable in practice; restarting the accumulator is
                     // the recoverable answer either way.
-                    InstanceState::Classic { .. } => {
+                    _ => {
                         *entry = InstanceState::Counter { total: h % 16 };
                         h % 16
                     }
@@ -642,17 +658,13 @@ impl<'a> Generator<'a> {
                 });
             }
             FamilyKind::ClassicHistogram => {
-                let bounds = self.workload.generator.classic_histogram_bounds.clone();
-                let bucket_count = bounds.len() + 1;
-                let entry =
-                    self.plans[plan_idx]
-                        .state
-                        .entry(global)
-                        .or_insert(InstanceState::Classic {
-                            buckets: vec![0; bucket_count],
-                            sum: 0.0,
-                            count: 0,
-                        });
+                let plan = &mut self.plans[plan_idx];
+                let bucket_count = plan.classic_bounds.len() + 1;
+                let entry = plan.state.entry(global).or_insert(InstanceState::Classic {
+                    buckets: vec![0; bucket_count],
+                    sum: 0.0,
+                    count: 0,
+                });
                 if !matches!(entry, InstanceState::Classic { .. }) {
                     *entry = InstanceState::Classic {
                         buckets: vec![0; bucket_count],
@@ -679,14 +691,14 @@ impl<'a> Generator<'a> {
                         }
                         (buckets.clone(), *sum, *count)
                     }
-                    InstanceState::Counter { .. } => (vec![0; bucket_count], 0.0, 0),
+                    _ => (vec![0; bucket_count], 0.0, 0),
                 };
                 // Cumulative counts, ascending by `le`, then `_sum`, then
                 // `_count`: the order a Prometheus scrape presents them in.
                 let mut cumulative = 0u64;
                 for (b, bucket) in buckets.iter().enumerate() {
                     cumulative += *bucket;
-                    let le = match bounds.get(b) {
+                    let le = match plan.classic_bounds.get(b) {
                         Some(bound) => format!("{bound}"),
                         None => "+Inf".to_string(),
                     };
@@ -714,25 +726,56 @@ impl<'a> Generator<'a> {
                 });
             }
             FamilyKind::NativeHistogram => {
-                let buckets = self.workload.generator.native_histogram_buckets;
-                let mut positive_deltas = Vec::with_capacity(buckets as usize);
-                let mut previous = 0i64;
-                let mut count = 0u64;
-                for b in 0..buckets {
-                    let absolute =
-                        (mix(seed, &[TAG_VALUE, fam_id, global, step, b as u64]) % 32) as i64;
-                    positive_deltas.push(absolute - previous);
-                    previous = absolute;
-                    count += absolute as u64;
+                let schema = self.workload.generator.native_histogram_schema;
+                let nbuckets = self.workload.generator.native_histogram_buckets as usize;
+                let plan = &mut self.plans[plan_idx];
+                let entry = plan.state.entry(global).or_insert(InstanceState::Native {
+                    buckets: vec![0; nbuckets],
+                    sum: 0.0,
+                    count: 0,
+                });
+                if !matches!(entry, InstanceState::Native { .. }) {
+                    *entry = InstanceState::Native {
+                        buckets: vec![0; nbuckets],
+                        sum: 0.0,
+                        count: 0,
+                    };
                 }
+                // A native histogram carries counter semantics: emit the
+                // per-step GROWTH as positive deltas and accumulate the
+                // absolutes, so `count` and `sum` only rise apart from an
+                // injected reset (which zeroes the state before this step).
+                let (positive_deltas, sum, count) = match entry {
+                    InstanceState::Native {
+                        buckets,
+                        sum,
+                        count,
+                    } => {
+                        let mut deltas = Vec::with_capacity(buckets.len());
+                        for (b, bucket) in buckets.iter_mut().enumerate() {
+                            let growth =
+                                mix(seed, &[TAG_VALUE, fam_id, global, step, b as u64]) % 8;
+                            *bucket += growth;
+                            *count += growth;
+                            *sum += unit_scaled(
+                                mix(seed, &[TAG_VALUE + 1, fam_id, global, step, b as u64]),
+                                1,
+                                12,
+                            ) * growth as f64;
+                            deltas.push(growth as i64);
+                        }
+                        (deltas, *sum, *count)
+                    }
+                    _ => (vec![0i64; nbuckets], 0.0, 0),
+                };
                 out.push(GeneratedSample {
                     ts_ms,
                     metric: family.name.clone(),
                     labels: labels.to_vec(),
                     value: SampleValue::NativeHistogram(NativeHistogram {
-                        schema: self.workload.generator.native_histogram_schema,
+                        schema,
                         count,
-                        sum: unit_scaled(h, 4, 12),
+                        sum,
                         positive_deltas,
                     }),
                 });
@@ -1009,13 +1052,14 @@ mod tests {
                 drops += 1;
             }
         }
-        // Resets fire on the counter and the classic-histogram families, and a
-        // reset is observable as a drop only when the post-reset increment is
-        // smaller than the pre-reset total, so the counter-only observed-drop
-        // count is a strict subset of the reported reset count. Both figures are
-        // pinned: a generator that stopped resetting, or one that reset without
-        // reporting it, moves one of them.
-        assert_eq!(report.counter_reset_events, 20);
+        // Resets fire on the counter, classic-histogram and native-histogram
+        // families, and a reset is observable as a drop on a plain counter only
+        // when the post-reset increment is smaller than the pre-reset total, so
+        // the counter-only observed-drop count is a strict subset of the
+        // reported reset count. Both figures are pinned: a generator that
+        // stopped resetting, or one that reset without reporting it, moves one
+        // of them.
+        assert_eq!(report.counter_reset_events, 24);
         assert_eq!(
             drops, 14,
             "counter series must fall only at the resets the report counts"
@@ -1110,6 +1154,111 @@ mod tests {
                 .count();
             assert_eq!(deltas, 4, "four positive buckets were declared: {line}");
         }
+    }
+
+    #[test]
+    fn native_histogram_count_and_sum_rise_except_at_reported_resets() {
+        // A native histogram carries counter semantics (ADR-0108): `count` and
+        // `sum` only increase apart from a reset. A stateless generator that
+        // recomputes absolute bucket counts per step makes both fall at roughly
+        // half the steps, and an ingester reads every fall as an unreported
+        // reset. This walks the single native series across every step and
+        // asserts monotonicity off the injected-reset steps, and that every
+        // injected native reset is counted in `counter_reset_events`.
+        let reset_rate = 8u64;
+        let w = workload(
+            0x5EED_0001,
+            AnomalyRates {
+                missing_sample_one_in: 0,
+                stale_marker_one_in: 0,
+                counter_reset_one_in: reset_rate,
+                out_of_order_one_in: 0,
+            },
+        );
+        gate_workload(&w).expect("manifest gates clean");
+        let steps = 80u64;
+        let (bytes, report) = Generator::new(&w, "cardinality", 0)
+            .expect("generator builds")
+            .generate_bytes(steps)
+            .expect("generates");
+        let text = String::from_utf8(bytes).expect("utf8");
+
+        // Recompute, from the same fires() the generator uses, exactly which
+        // steps inject a reset for the single native instance (family index 3,
+        // global 0: 50 permille of 20 active series is one native instance).
+        let seed = w.seed;
+        let native_fam = 3u64;
+        let mut native_resets: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        for step in 0..steps {
+            if fires(reset_rate, seed, TAG_RESET, native_fam, 0, step) {
+                native_resets.insert(step);
+            }
+        }
+        assert!(
+            !native_resets.is_empty(),
+            "this seed must inject at least one native-histogram reset"
+        );
+
+        // Per-step count and sum for the one native series, in stream order.
+        let mut counts: Vec<u64> = Vec::new();
+        let mut sums: Vec<f64> = Vec::new();
+        for line in text.lines().filter(|l| l.contains("\tmb_native{")) {
+            let payload = line.split('\t').nth(2).expect("payload");
+            let count: u64 = payload
+                .split("count=")
+                .nth(1)
+                .and_then(|s| s.split(' ').next())
+                .and_then(|s| s.parse().ok())
+                .expect("count field");
+            let sum_bits = payload
+                .split("sum=0x")
+                .nth(1)
+                .and_then(|s| s.split(' ').next())
+                .and_then(|s| u64::from_str_radix(s, 16).ok())
+                .expect("sum field");
+            counts.push(count);
+            sums.push(f64::from_bits(sum_bits));
+        }
+        assert_eq!(counts.len(), steps as usize, "one native sample per step");
+
+        // Every non-reset step is non-decreasing in both count and sum. This is
+        // the assertion the stateless generator fails.
+        for step in 1..steps as usize {
+            if native_resets.contains(&(step as u64)) {
+                continue;
+            }
+            assert!(
+                counts[step] >= counts[step - 1],
+                "native count fell at step {step} with no injected reset: {counts:?}"
+            );
+            assert!(
+                sums[step] >= sums[step - 1],
+                "native sum fell at step {step} with no injected reset: {sums:?}"
+            );
+        }
+
+        // Every injected reset, native included, is counted. Reconstruct the
+        // full reset total across every reset-eligible instance (counter x3,
+        // classic x1, native x1) and assert the report equals it: a native reset
+        // that fired but went uncounted drops the report below this total.
+        let mut expected_resets = 0u64;
+        for (fam, instances) in [(1u64, 3u64), (2u64, 1u64), (3u64, 1u64)] {
+            for inst in 0..instances {
+                for step in 0..steps {
+                    if fires(reset_rate, seed, TAG_RESET, fam, inst, step) {
+                        expected_resets += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            report.counter_reset_events, expected_resets,
+            "every injected reset, native included, must be counted"
+        );
+        assert!(
+            expected_resets >= native_resets.len() as u64,
+            "the total reset count must include the native resets"
+        );
     }
 
     #[test]
