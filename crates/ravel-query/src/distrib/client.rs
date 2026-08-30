@@ -9,12 +9,12 @@
 
 use ravel_logseg::LogRecord;
 use ravel_proto::queryfrag::v1 as pb;
-use ravel_types::accounting::QueryAccountingSnapshot;
 use tonic::transport::Channel;
 
 use crate::distrib::codec::{self, CodecError};
 use crate::distrib::proto::series_fetch_client::SeriesFetchClient;
 use crate::fetcher::{FetchStats, FetchedHistogramSeries, FetchedSeriesSoa};
+use crate::phase_accounting::PhaseAccountingSnapshot;
 use crate::span_fetcher::SpanRow;
 
 /// A distributed fetch failed in a way that is not a per-slice typed status.
@@ -78,8 +78,11 @@ pub struct SliceResponse {
     /// coordinator-side combine and the planner integration are the next task,
     /// so today's callers of [`decode_slice_frames`] ignore this field.
     pub partials: Vec<codec::PartialAggregate>,
-    /// The worker's per-slice cost accounting.
-    pub accounting: ravel_types::accounting::QueryAccountingSnapshot,
+    /// The worker's per-slice cost accounting, split by the phase that issued
+    /// each request (issue #959). The coordinator merges each phase into its
+    /// own same-named phase total; `pooled()` recovers the single figure this
+    /// field used to carry.
+    pub phase_accounting: PhaseAccountingSnapshot,
     /// The worker's per-slice `FetchStats` page counters, folded (summed) by
     /// the coordinator so a distributed query reports the same raw-page cost in
     /// its stats JSON the local path would (ADR-0071).
@@ -104,8 +107,11 @@ pub struct SliceResponse {
 pub struct SliceLogResponse {
     /// Decoded RLOG records, each carrying its full per-segment merged view.
     pub records: Vec<LogRecord>,
-    /// The worker's per-slice cost accounting.
-    pub accounting: QueryAccountingSnapshot,
+    /// The worker's per-slice cost accounting, split by the phase that issued
+    /// each request (issue #959). The coordinator merges each phase into its
+    /// own same-named phase total; `pooled()` recovers the single figure this
+    /// field used to carry.
+    pub phase_accounting: PhaseAccountingSnapshot,
     /// The worker's per-slice `FetchStats` page counters.
     pub stats: FetchStats,
     /// Records the worker reported returning (carried in the summary's
@@ -125,7 +131,7 @@ impl SliceLogResponse {
     pub fn unsupported(message: impl Into<String>) -> Self {
         SliceLogResponse {
             records: Vec::new(),
-            accounting: QueryAccountingSnapshot::default(),
+            phase_accounting: PhaseAccountingSnapshot::default(),
             stats: FetchStats::default(),
             records_returned: 0,
             status: pb::status::Code::Unsupported,
@@ -145,8 +151,11 @@ impl SliceLogResponse {
 pub struct SliceSpanResponse {
     /// Decoded spans, each carrying its full per-segment merged view.
     pub spans: Vec<SpanRow>,
-    /// The worker's per-slice cost accounting.
-    pub accounting: QueryAccountingSnapshot,
+    /// The worker's per-slice cost accounting, split by the phase that issued
+    /// each request (issue #959). The coordinator merges each phase into its
+    /// own same-named phase total; `pooled()` recovers the single figure this
+    /// field used to carry.
+    pub phase_accounting: PhaseAccountingSnapshot,
     /// The worker's per-slice `FetchStats` page counters.
     pub stats: FetchStats,
     /// Spans the worker reported returning (carried in the summary's
@@ -166,7 +175,7 @@ impl SliceSpanResponse {
     pub fn unsupported(message: impl Into<String>) -> Self {
         SliceSpanResponse {
             spans: Vec::new(),
-            accounting: QueryAccountingSnapshot::default(),
+            phase_accounting: PhaseAccountingSnapshot::default(),
             stats: FetchStats::default(),
             spans_returned: 0,
             status: pb::status::Code::Unsupported,
@@ -348,15 +357,16 @@ pub fn decode_slice_frames(frames: Vec<pb::FetchResponse>) -> Result<SliceRespon
         .status
         .ok_or(DistribError::Codec(CodecError::MissingStatus))?;
     let code = codec::decode_status_code(status.code)?;
-    let accounting = summary
-        .accounting
-        .map(codec::decode_accounting)
-        .unwrap_or_default();
+    // The per-phase split is the authoritative cost field (issue #959); the
+    // frozen `accounting` field pools it and is not read here. A summary whose
+    // split has the wrong arity is a typed error, never a zero-padded split
+    // that would report a phase's real spend as a measured zero.
+    let phase_accounting = codec::decode_phase_accounting(summary.phase_accounting)?;
     Ok(SliceResponse {
         scalar,
         histogram,
         partials,
-        accounting,
+        phase_accounting,
         stats: FetchStats {
             raw_f64_pages: summary.raw_f64_pages,
             raw_f64_bytes: summary.raw_f64_bytes,
@@ -413,13 +423,14 @@ pub fn decode_log_slice_frames(
         .status
         .ok_or(DistribError::Codec(CodecError::MissingStatus))?;
     let code = codec::decode_status_code(status.code)?;
-    let accounting = summary
-        .accounting
-        .map(codec::decode_accounting)
-        .unwrap_or_default();
+    // The per-phase split is the authoritative cost field (issue #959); the
+    // frozen `accounting` field pools it and is not read here. A summary whose
+    // split has the wrong arity is a typed error, never a zero-padded split
+    // that would report a phase's real spend as a measured zero.
+    let phase_accounting = codec::decode_phase_accounting(summary.phase_accounting)?;
     Ok(SliceLogResponse {
         records,
-        accounting,
+        phase_accounting,
         stats: FetchStats {
             raw_f64_pages: summary.raw_f64_pages,
             raw_f64_bytes: summary.raw_f64_bytes,
@@ -475,13 +486,14 @@ pub fn decode_span_slice_frames(
         .status
         .ok_or(DistribError::Codec(CodecError::MissingStatus))?;
     let code = codec::decode_status_code(status.code)?;
-    let accounting = summary
-        .accounting
-        .map(codec::decode_accounting)
-        .unwrap_or_default();
+    // The per-phase split is the authoritative cost field (issue #959); the
+    // frozen `accounting` field pools it and is not read here. A summary whose
+    // split has the wrong arity is a typed error, never a zero-padded split
+    // that would report a phase's real spend as a measured zero.
+    let phase_accounting = codec::decode_phase_accounting(summary.phase_accounting)?;
     Ok(SliceSpanResponse {
         spans,
-        accounting,
+        phase_accounting,
         stats: FetchStats {
             raw_f64_pages: summary.raw_f64_pages,
             raw_f64_bytes: summary.raw_f64_bytes,
@@ -495,11 +507,12 @@ pub fn decode_span_slice_frames(
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use ravel_types::accounting::{AccountedOp, QueryAccountingSnapshot};
+    use ravel_types::accounting::AccountedOp;
     use ravel_types::{Label, LabelSet, SeriesId};
 
     use super::*;
     use crate::distrib::codec::{self, CodecError};
+    use crate::phase_accounting::QueryPhase;
 
     fn label_set() -> LabelSet {
         LabelSet::new(vec![Label {
@@ -530,15 +543,34 @@ mod tests {
         }
     }
 
+    /// One all-zero accounting entry per [`QueryPhase`], the minimum a
+    /// well-formed summary must carry (issue #959). Used by the tests below
+    /// that are about some OTHER malformation, so the arity check never fires
+    /// first and hides what they mean to assert.
+    fn zero_phases() -> Vec<pb::QueryAccountingSnapshot> {
+        vec![pb::QueryAccountingSnapshot::default(); QueryPhase::ALL.len()]
+    }
+
     /// A well-formed terminal summary carrying `code`, real accounting, and the
     /// given counts.
+    ///
+    /// The 3 GET requests and 99 GET bytes are split across two phases (2 GETs
+    /// and 90 bytes on `probe`, 1 GET and 9 bytes on `scan`) so a test that
+    /// reads the decoded split can tell a real per-phase decode from a pooled
+    /// figure copied into every slot, and `pooled()` still recovers the
+    /// original 3/99.
     fn summary_frame(code: pb::status::Code) -> pb::FetchResponse {
-        let mut snap = QueryAccountingSnapshot::default();
-        snap.s3_requests[AccountedOp::Get.index()] = 3;
-        snap.s3_bytes[AccountedOp::Get.index()] = 99;
+        let mut phases = PhaseAccountingSnapshot::default();
+        let probe = phases.phase_mut(QueryPhase::Probe);
+        probe.s3_requests[AccountedOp::Get.index()] = 2;
+        probe.s3_bytes[AccountedOp::Get.index()] = 90;
+        let scan = phases.phase_mut(QueryPhase::Scan);
+        scan.s3_requests[AccountedOp::Get.index()] = 1;
+        scan.s3_bytes[AccountedOp::Get.index()] = 9;
         pb::FetchResponse {
             frame: Some(pb::fetch_response::Frame::Summary(pb::Summary {
-                accounting: Some(codec::encode_accounting(&snap)),
+                accounting: Some(codec::encode_accounting(&phases.pooled())),
+                phase_accounting: codec::encode_phase_accounting(&phases),
                 series_returned: 1,
                 samples_returned: 3,
                 status: Some(pb::Status {
@@ -567,7 +599,44 @@ mod tests {
         assert_eq!(response.series_returned, 1);
         assert_eq!(response.samples_returned, 3);
         assert_eq!(response.stats.raw_f64_pages, 5);
-        assert_eq!(response.accounting.s3_requests(AccountedOp::Get), 3);
+        // The split, not just the pooled figure: 2 GETs on `probe` and 1 on
+        // `scan`, exactly what `summary_frame` encoded. A decoder that copied
+        // one pooled snapshot into every slot would report 3 on each phase.
+        assert_eq!(
+            response
+                .phase_accounting
+                .phase(QueryPhase::Probe)
+                .s3_requests(AccountedOp::Get),
+            2
+        );
+        assert_eq!(
+            response
+                .phase_accounting
+                .phase(QueryPhase::Scan)
+                .s3_requests(AccountedOp::Get),
+            1
+        );
+        assert_eq!(
+            response
+                .phase_accounting
+                .phase(QueryPhase::Resolve)
+                .s3_requests(AccountedOp::Get),
+            0
+        );
+        assert_eq!(
+            response
+                .phase_accounting
+                .phase(QueryPhase::Plan)
+                .s3_requests(AccountedOp::Get),
+            0
+        );
+        assert_eq!(
+            response
+                .phase_accounting
+                .pooled()
+                .s3_requests(AccountedOp::Get),
+            3
+        );
     }
 
     /// A malformed series frame (a 15-byte series id) is a typed `Codec` error,
@@ -702,6 +771,7 @@ mod tests {
         let no_status = pb::FetchResponse {
             frame: Some(pb::fetch_response::Frame::Summary(pb::Summary {
                 accounting: None,
+                phase_accounting: zero_phases(),
                 series_returned: 0,
                 samples_returned: 0,
                 status: None,
@@ -722,6 +792,7 @@ mod tests {
         let bad_code = pb::FetchResponse {
             frame: Some(pb::fetch_response::Frame::Summary(pb::Summary {
                 accounting: None,
+                phase_accounting: zero_phases(),
                 series_returned: 0,
                 samples_returned: 0,
                 status: Some(pb::Status {
@@ -777,7 +848,44 @@ mod tests {
         // The summary's `series_returned` field is reused as the span count.
         assert_eq!(response.spans_returned, 1);
         assert_eq!(response.stats.raw_f64_pages, 5);
-        assert_eq!(response.accounting.s3_requests(AccountedOp::Get), 3);
+        // The split, not just the pooled figure: 2 GETs on `probe` and 1 on
+        // `scan`, exactly what `summary_frame` encoded. A decoder that copied
+        // one pooled snapshot into every slot would report 3 on each phase.
+        assert_eq!(
+            response
+                .phase_accounting
+                .phase(QueryPhase::Probe)
+                .s3_requests(AccountedOp::Get),
+            2
+        );
+        assert_eq!(
+            response
+                .phase_accounting
+                .phase(QueryPhase::Scan)
+                .s3_requests(AccountedOp::Get),
+            1
+        );
+        assert_eq!(
+            response
+                .phase_accounting
+                .phase(QueryPhase::Resolve)
+                .s3_requests(AccountedOp::Get),
+            0
+        );
+        assert_eq!(
+            response
+                .phase_accounting
+                .phase(QueryPhase::Plan)
+                .s3_requests(AccountedOp::Get),
+            0
+        );
+        assert_eq!(
+            response
+                .phase_accounting
+                .pooled()
+                .s3_requests(AccountedOp::Get),
+            3
+        );
     }
 
     /// A span stream that never sent its mandatory terminal summary is
@@ -817,6 +925,7 @@ mod tests {
         let no_status = pb::FetchResponse {
             frame: Some(pb::fetch_response::Frame::Summary(pb::Summary {
                 accounting: None,
+                phase_accounting: zero_phases(),
                 series_returned: 0,
                 samples_returned: 0,
                 status: None,
@@ -837,6 +946,7 @@ mod tests {
         let bad_code = pb::FetchResponse {
             frame: Some(pb::fetch_response::Frame::Summary(pb::Summary {
                 accounting: None,
+                phase_accounting: zero_phases(),
                 series_returned: 0,
                 samples_returned: 0,
                 status: Some(pb::Status {

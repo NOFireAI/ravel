@@ -730,13 +730,11 @@ impl QueryEngine {
             // an `async_trait` remote fetch nested inside a fan-out combinator
             // makes the whole query future fail axum's `Handler` `Send` bound.
             //
-            // `federate_discovery` takes the whole `PhaseAccounting` (not
-            // just `.scan()`): it folds the remote's spend into the `scan`
-            // sub-handle (issue #796 finding: federation is an opaque remote
-            // fetch, not phase-splittable without a remote-side accounting
-            // change), but its budget re-check needs `pooled()` to see the
-            // local resolve/plan/probe spend `fetch_all_series` already
-            // recorded too.
+            // `federate_discovery` takes the whole `PhaseAccounting`: it
+            // merges the remote's per-phase spend (issue #959) into this
+            // handle's same-named phases, and its budget re-check needs
+            // `pooled()` to see the local resolve/plan/probe spend
+            // `fetch_all_series` already recorded too.
             let (fed_series, fed_warnings, fed_partial) = self
                 .federate_discovery(tenant_hash, matchers.to_vec(), window, &accounting)
                 .await?;
@@ -819,8 +817,9 @@ impl QueryEngine {
         // structurally preventing this cluster's tokens from leaking). The
         // operator credential is baked into the fetcher, so no client credential
         // is threaded here and the remote's tenant identity comes from its own
-        // auth, never the wire. Remote spend is charged to `scan` (issue #796
-        // finding, same treatment as `federate_scalar`).
+        // auth, never the wire. Remote spend arrives already split by phase
+        // (issue #959) and is merged phase for phase, the same treatment
+        // `federate_scalar` gives it.
         let outcome = federation
             .fetch(
                 tenant_hash,
@@ -830,7 +829,7 @@ impl QueryEngine {
                 window.start_ns,
                 window.end_ns,
                 Vec::new(),
-                accounting.scan().clone(),
+                accounting.clone(),
                 self.config,
             )
             .await?;
@@ -1125,11 +1124,10 @@ impl QueryEngine {
                 .zip(windows_ref.iter())
                 .map(|(plan, w)| (plan.matchers.clone(), w.start_ns, w.end_ns))
                 .collect();
-            // `federate_scalar` takes the whole `PhaseAccounting` (not just
-            // `.scan()`): it folds the remote's spend into the `scan`
-            // sub-handle (issue #796 finding: an opaque remote fetch has no
-            // phase breakdown of its own), but its budget re-check needs
-            // `pooled()` to see the local resolve/plan/probe spend too.
+            // `federate_scalar` takes the whole `PhaseAccounting`: it merges
+            // the remote's per-phase spend (issue #959) into this handle's
+            // same-named phases, and its budget re-check needs `pooled()` to
+            // see the local resolve/plan/probe spend too.
             let (fed_runs, fed_hist_runs, fed_stats, fed_warnings, fed_partial) = self
                 .federate_scalar(tenant_hash, fed_plans, &accounting)
                 .await?;
@@ -1501,15 +1499,17 @@ impl QueryEngine {
             let cost = estimate_cost(snapshot, 1, 0);
             if crate::distrib::partition::should_distribute(distributed.thresholds(), &cost) {
                 let erasure = snapshot_erasure_predicates(snapshot);
-                // `distributed.fetch` takes a single pooled `QueryAccounting`
-                // handle: a worker's per-slice spend crosses the
-                // coordinator/worker protobuf wire as one pooled
-                // `QueryAccountingSnapshot` (`distrib/client.rs`'s
-                // `SliceResponse.accounting`), predating issue #796 and
-                // requiring a wire-format version bump to phase-split -- out
-                // of this ticket's scope. Charged to `scan` rather than left
-                // unaccounted (issue #796 finding, same treatment as
-                // federation above).
+                // `distributed.fetch` takes the whole `PhaseAccounting` (issue
+                // #959): a worker's per-slice spend crosses the
+                // coordinator/worker wire already split by phase
+                // (`Summary.phase_accounting`), and the coordinator merges each
+                // phase into this handle's same-named phase. The worker runs
+                // the same fetch funnels this crate runs locally, so a
+                // distributed query's split has the same shape a local one's
+                // does. Until issue #959 this argument was `accounting.scan()`,
+                // which charged every remote GET to `scan` by construction and
+                // left `plan` and `probe` reporting only the coordinator's own
+                // work.
                 if let Some((triple, partials)) = distributed
                     .fetch(
                         tenant_hash,
@@ -1517,7 +1517,7 @@ impl QueryEngine {
                         snapshot,
                         matchers,
                         &erasure,
-                        accounting.scan(),
+                        accounting,
                         &self.config,
                         deadline_unix_ns,
                         partial_aggregate,
@@ -1626,10 +1626,11 @@ impl QueryEngine {
             // and commit tokens are cluster-local (also structurally prevents
             // leaking this cluster's tokens). The operator credential is baked
             // into the fetcher, so no client credential is threaded here.
-            // Owned args (accounting is an `Arc` clone that folds into the same
-            // handle) keep the fan-out future higher-ranked `Send`. Remote
-            // spend is charged to `scan` (issue #796 finding: opaque remote
-            // fetch, no phase breakdown of its own).
+            // Owned args (accounting is a clone of four `Arc`-backed handles
+            // that folds into the same counters) keep the fan-out future
+            // higher-ranked `Send`. Remote spend arrives already split by phase
+            // (issue #959) and is merged phase for phase, not pooled into
+            // `scan`.
             let outcome = federation
                 .fetch(
                     tenant_hash,
@@ -1639,7 +1640,7 @@ impl QueryEngine {
                     start_ns,
                     end_ns,
                     Vec::new(),
-                    accounting.scan().clone(),
+                    accounting.clone(),
                     self.config,
                 )
                 .await?;
@@ -5287,7 +5288,7 @@ mod prefetch_tests {
                 scalar: Vec::new(),
                 histogram: Vec::new(),
                 partials: Vec::new(),
-                accounting: ravel_types::accounting::QueryAccountingSnapshot::default(),
+                phase_accounting: crate::phase_accounting::PhaseAccountingSnapshot::default(),
                 stats: crate::fetcher::FetchStats::default(),
                 series_returned: 0,
                 samples_returned: 0,
@@ -6816,7 +6817,6 @@ mod coverage_wrapper_tests {
     use ravel_promql::MatchOp;
     use ravel_proto::queryfrag::v1 as pb;
     use ravel_types::TenantId;
-    use ravel_types::accounting::QueryAccountingSnapshot;
 
     use super::*;
     use crate::distrib::client::{DistribError, SliceFetcher, SliceResponse};
@@ -6848,7 +6848,7 @@ mod coverage_wrapper_tests {
                 scalar: Vec::new(),
                 histogram: Vec::new(),
                 partials: Vec::new(),
-                accounting: QueryAccountingSnapshot::default(),
+                phase_accounting: PhaseAccountingSnapshot::default(),
                 stats: FetchStats::default(),
                 series_returned: 0,
                 samples_returned: 0,

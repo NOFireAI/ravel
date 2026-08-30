@@ -49,6 +49,7 @@ use ravel_object_store::{
     ObjectStoreBackend, PageToken, PutOptions, PutOutcome, StoreError,
 };
 use ravel_proto::queryfrag::v1 as pb;
+use ravel_query::QueryPhase;
 use ravel_query::distrib::partition::DistribThresholds;
 use ravel_query::distrib::proto::series_fetch_client::SeriesFetchClient;
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
@@ -66,6 +67,11 @@ const FRAGMENT_KEY: [u8; 32] = [0x5au8; 32];
 const NS_PER_SEC: i64 = 1_000_000_000;
 const NS_PER_MIN: i64 = 60 * NS_PER_SEC;
 const NS_PER_HOUR: i64 = 60 * NS_PER_MIN;
+
+/// How many per-phase accounting entries a well-formed `Summary` carries
+/// (issue #959): exactly one per `QueryPhase`, read off `QueryPhase::ALL` so a
+/// phase added to the enum changes this constant without an edit here.
+const PHASE_COUNT: usize = QueryPhase::ALL.len();
 
 fn now_ns() -> i64 {
     i64::try_from(
@@ -1086,11 +1092,16 @@ fn series_frame(series_id: [u8; 16]) -> pb::FetchResponse {
     }
 }
 
-/// A terminal summary frame with the given typed status and no accounting.
+/// A terminal summary frame with the given typed status and zero accounting.
+///
+/// `phase_accounting` carries one all-zero entry per `QueryPhase` rather than
+/// an empty vector: the decoder requires the exact arity (issue #959), so an
+/// empty list would fail decode before this frame's status could be observed.
 fn summary_frame(code: pb::status::Code) -> pb::FetchResponse {
     pb::FetchResponse {
         frame: Some(pb::fetch_response::Frame::Summary(pb::Summary {
             accounting: None,
+            phase_accounting: vec![pb::QueryAccountingSnapshot::default(); PHASE_COUNT],
             series_returned: 0,
             samples_returned: 0,
             status: Some(pb::Status {

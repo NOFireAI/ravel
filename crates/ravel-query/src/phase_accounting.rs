@@ -264,6 +264,21 @@ impl PhaseAccounting {
         }
     }
 
+    /// Folds another handle's snapshot into this one, phase by phase: each
+    /// phase's counters are merged into the same-named phase's handle, never
+    /// pooled into one. This is how a coordinator absorbs a remote worker's
+    /// reported spend (issue #959): the worker runs the same funnels this
+    /// crate runs locally, so its `plan` bytes are the query's `plan` bytes.
+    ///
+    /// Delegates per phase to [`QueryAccounting::merge_snapshot`], so every
+    /// counter saturates rather than wrapping and `peak_intermediate_bytes`
+    /// merges as a maximum, exactly as a single-process fold does.
+    pub fn merge_snapshot(&self, other: &PhaseAccountingSnapshot) {
+        for phase in QueryPhase::ALL {
+            self.phase(phase).merge_snapshot(other.phase(phase));
+        }
+    }
+
     /// Point-in-time copy of every phase's counters.
     #[must_use]
     pub fn snapshot(&self) -> PhaseAccountingSnapshot {
@@ -298,6 +313,34 @@ impl PhaseAccountingSnapshot {
             QueryPhase::Probe => &self.probe,
             QueryPhase::Scan => &self.scan,
         }
+    }
+
+    /// Mutable handle on one phase's snapshot, for a decoder filling this
+    /// struct one phase at a time while iterating [`QueryPhase::ALL`] (see
+    /// `crate::distrib::codec`'s `decode_phase_accounting`). Named directly,
+    /// the mutable twin of [`Self::phase`], so adding a phase to the enum is a
+    /// non-exhaustive-match compile error here rather than a silent gap.
+    pub fn phase_mut(&mut self, phase: QueryPhase) -> &mut QueryAccountingSnapshot {
+        match phase {
+            QueryPhase::Resolve => &mut self.resolve,
+            QueryPhase::Plan => &mut self.plan,
+            QueryPhase::Probe => &mut self.probe,
+            QueryPhase::Scan => &mut self.scan,
+        }
+    }
+
+    /// Phase-wise saturating merge of two snapshots: each phase merges with
+    /// the same-named phase, never across phases. The coordinator's running
+    /// per-phase total as it folds one slice snapshot after another (issue
+    /// #959), the phase-split twin of
+    /// [`QueryAccountingSnapshot::saturating_merge`].
+    #[must_use]
+    pub fn saturating_merge(&self, other: &PhaseAccountingSnapshot) -> PhaseAccountingSnapshot {
+        let mut out = PhaseAccountingSnapshot::default();
+        for phase in QueryPhase::ALL {
+            *out.phase_mut(phase) = self.phase(phase).saturating_merge(other.phase(phase));
+        }
+        out
     }
 
     /// Field-wise saturating sum of every phase, exactly the number a caller

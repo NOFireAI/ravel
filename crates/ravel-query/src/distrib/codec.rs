@@ -32,6 +32,7 @@ use ravel_types::logstream::{AttrValue, LogStreamId};
 
 use crate::erasure::ErasurePredicate;
 use crate::fetcher::{FetchedHistogramSeries, FetchedSeriesSoa, SamplePriority};
+use crate::phase_accounting::{PhaseAccountingSnapshot, QueryPhase};
 use crate::span_fetcher::SpanRow;
 
 /// The queryfrag protocol version this build speaks. A `FetchRequest` carrying
@@ -64,7 +65,17 @@ use crate::span_fetcher::SpanRow;
 /// coordinator maps to a silent local fallback, so a rolling deploy degrades
 /// to raw fetch, never a corrupt answer -- the same pattern as the 2 -> 3
 /// bump above.
-pub const PROTOCOL_VERSION: u32 = 4;
+///
+/// Bumped 4 -> 5 for issue #959: `Summary` carries `phase_accounting`, the
+/// per-[`QueryPhase`](crate::phase_accounting::QueryPhase) split of the spend
+/// field 1 pools, and the coordinator now merges those entries into its own
+/// per-phase totals instead of charging a whole remote fetch to `scan`. This is
+/// load-bearing in the same way the 3 -> 4 bump was: a version-4 worker sends no
+/// split, so a version-5 coordinator reading its summary would have to either
+/// reject the slice or invent an attribution. The version gate makes skew
+/// degrade to coordinator-local execution, which produces a correct
+/// non-degenerate split, rather than to a silently degenerate one.
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// The fragment-capability claim-set version (ADR-0071 amendment, decision 2).
 /// Distinct from [`PROTOCOL_VERSION`]: it versions the canonical claim encoding
@@ -259,6 +270,8 @@ pub enum CodecError {
     HistogramBucketCountMismatch { spans: u64, buckets: usize },
     #[error("histogram count is less than its zero_count or its total bucket count")]
     HistogramCountInconsistent,
+    #[error("summary carried {got} per-phase accounting entries, expected {expected}")]
+    PhaseAccountingArity { got: usize, expected: usize },
 }
 
 /// Rejects any protocol version this build does not speak. `Ok(())` only for
@@ -1440,6 +1453,43 @@ pub fn decode_accounting(snap: pb::QueryAccountingSnapshot) -> QueryAccountingSn
         logs_ranged_opens: 0,
         peak_intermediate_bytes: snap.peak_intermediate_bytes,
     }
+}
+
+// ---- PhaseAccountingSnapshot <-> repeated pb::QueryAccountingSnapshot -----
+
+/// Flattens a per-phase accounting snapshot into the repeated wire field, one
+/// entry per [`QueryPhase`] in [`QueryPhase::ALL`] order (issue #959). Driven
+/// off `ALL` rather than a hand-written list of four, so a phase added to the
+/// enum is emitted here without any edit; [`decode_phase_accounting`] checks
+/// the count against the same `ALL`, so the two cannot drift.
+pub fn encode_phase_accounting(snap: &PhaseAccountingSnapshot) -> Vec<pb::QueryAccountingSnapshot> {
+    QueryPhase::ALL
+        .iter()
+        .map(|phase| encode_accounting(snap.phase(*phase)))
+        .collect()
+}
+
+/// Inverse of [`encode_phase_accounting`]. A vector of any length other than
+/// [`QueryPhase::ALL`]'s is [`CodecError::PhaseAccountingArity`], never a
+/// zero-padded or truncated split: a summary carrying too few entries would
+/// otherwise report a phase's real spend as zero, which reads as a measurement
+/// rather than as an absence. The version gate ([`check_protocol_version`])
+/// guarantees only a peer of this exact build reaches this decoder, so the
+/// arity is a hard requirement rather than a compatibility knob.
+pub fn decode_phase_accounting(
+    phases: Vec<pb::QueryAccountingSnapshot>,
+) -> Result<PhaseAccountingSnapshot, CodecError> {
+    if phases.len() != QueryPhase::ALL.len() {
+        return Err(CodecError::PhaseAccountingArity {
+            got: phases.len(),
+            expected: QueryPhase::ALL.len(),
+        });
+    }
+    let mut out = PhaseAccountingSnapshot::default();
+    for (phase, encoded) in QueryPhase::ALL.iter().zip(phases) {
+        *out.phase_mut(*phase) = decode_accounting(encoded);
+    }
+    Ok(out)
 }
 
 // ---- Status ---------------------------------------------------------------

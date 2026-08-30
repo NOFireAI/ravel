@@ -979,7 +979,9 @@ fn record_fragment_stat(
 ) {
     let (bytes_reported, status) = match result {
         Ok(response) => (
-            response.accounting.total_s3_bytes(),
+            // The pooled total across every phase (issue #959): this stat is
+            // the slice's whole reported spend, not one phase's share.
+            response.phase_accounting.pooled().total_s3_bytes(),
             if fell_back { "fallback" } else { "ok" },
         ),
         Err(_) => (0, "error"),

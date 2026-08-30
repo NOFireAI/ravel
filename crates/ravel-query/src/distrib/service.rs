@@ -54,7 +54,6 @@ use std::sync::Arc;
 use futures::Stream;
 use ravel_catalog::SegmentRef;
 use ravel_proto::queryfrag::v1 as pb;
-use ravel_types::accounting::{QueryAccounting, QueryAccountingSnapshot};
 use ravel_types::{SeriesId, Signal, TenantHash};
 
 use ravel_rspan::SpanQuery;
@@ -69,6 +68,7 @@ use crate::fetcher::{
     FetchError, FetchStats, FetchedHistogramSeries, FetchedSeriesSoa, SegmentFetcher,
 };
 use crate::log_fetcher::{LogFetchError, LogQuery, LogSegmentFetcher};
+use crate::phase_accounting::{PhaseAccounting, PhaseAccountingSnapshot};
 use crate::span_fetcher::{SpanFetchError, SpanSegmentFetcher};
 
 /// Resolves a shipped [`pb::SegmentIdentity`] back to the [`SegmentRef`] a
@@ -185,7 +185,7 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
             // (budget trip, histogram fallback) build their own summary with
             // real accounting inside `run_slice_inner`.
             Err((code, message)) => vec![summary_frame(
-                &QueryAccountingSnapshot::default(),
+                &PhaseAccountingSnapshot::default(),
                 0,
                 0,
                 code,
@@ -352,15 +352,20 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
         };
 
         // One fresh accounting handle per slice: the coordinator folds the
-        // returned snapshot into the query's aggregate (ADR-0071).
-        let accounting = QueryAccounting::new();
+        // returned snapshot into the query's aggregate (ADR-0071), phase by
+        // phase (issue #959). Phase-split rather than pooled because this
+        // worker runs the same `SegmentFetcher` funnels the local read path
+        // runs, so its plan/probe/scan attribution is already the one the
+        // coordinator wants; pooling it here is what used to force the whole
+        // remote fetch into `scan`.
+        let accounting = PhaseAccounting::new();
         let mut scalar = Vec::new();
         let mut histograms: Vec<FetchedHistogramSeries> = Vec::new();
         let mut stats = FetchStats::default();
         for seg in &segments {
             let (seg_scalar, seg_stats, seg_hist) = self
                 .fetcher
-                .fetch_soa_and_histograms_accounted(tenant_hash, seg, &matchers, &accounting)
+                .fetch_soa_and_histograms_phase_accounted(tenant_hash, seg, &matchers, &accounting)
                 .await
                 .map_err(map_fetch_error)?;
             histograms.extend(seg_hist);
@@ -374,7 +379,7 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
             // (never a lost double-spend); the message is the same typed
             // `TooManyBytesScanned` string the local path produces.
             if let Some(err) =
-                bytes_scanned_exceeded(accounting.snapshot().total_s3_bytes(), byte_limit)
+                bytes_scanned_exceeded(accounting.snapshot().pooled().total_s3_bytes(), byte_limit)
             {
                 return Ok(vec![summary_frame(
                     &accounting.snapshot(),
@@ -600,14 +605,19 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
         // threaded through the same funnel, applied per segment after decode.
         let query = LogQuery::new(window_start_ns, window_end_ns).with_erasure(erasure);
 
-        let accounting = QueryAccounting::new();
+        // Phase-split per slice (issue #959), the same handle shape the metrics
+        // path uses. `fetch_accounted_with_tenant` is a scan-phase funnel by
+        // its own documented mapping (it does data reads with no separate plan
+        // step), so it is handed the `scan` handle; nothing about what that
+        // funnel records changes.
+        let accounting = PhaseAccounting::new();
         let mut records: Vec<ravel_logseg::LogRecord> = Vec::new();
         // Logs carry no raw-f64 page counters (a metric-path concept), so
         // `FetchStats` stays zero, exactly what a local log read reports.
         let stats = FetchStats::default();
         for seg in &segments {
             let out = log_fetcher
-                .fetch_accounted_with_tenant(seg, tenant_hash, &query, &accounting)
+                .fetch_accounted_with_tenant(seg, tenant_hash, &query, accounting.scan())
                 .await
                 .map_err(map_log_fetch_error)?;
             if let Some(output) = out {
@@ -618,7 +628,7 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
             // spend so far so the coordinator folds this slice's real cost
             // before failing the query.
             if let Some(err) =
-                bytes_scanned_exceeded(accounting.snapshot().total_s3_bytes(), byte_limit)
+                bytes_scanned_exceeded(accounting.snapshot().pooled().total_s3_bytes(), byte_limit)
             {
                 return Ok(vec![summary_frame(
                     &accounting.snapshot(),
@@ -738,14 +748,17 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
         // the scan beyond the window.
         let query = SpanQuery::ts_range(window_start_ns, window_end_ns);
 
-        let accounting = QueryAccounting::new();
+        // Phase-split per slice (issue #959), as on the metrics and log paths.
+        // `SpanSegmentFetcher::fetch_accounted` is a whole-object data read
+        // with no separate plan step, so it is handed the `scan` handle.
+        let accounting = PhaseAccounting::new();
         let mut spans: Vec<crate::span_fetcher::SpanRow> = Vec::new();
         // Spans carry no raw-f64 page counters (a metric-path concept), so
         // `FetchStats` stays zero, exactly what a local span read reports.
         let stats = FetchStats::default();
         for seg in &segments {
             let out = span_fetcher
-                .fetch_accounted(seg, tenant_hash, &query, None, None, &[], &accounting)
+                .fetch_accounted(seg, tenant_hash, &query, None, None, &[], accounting.scan())
                 .await
                 .map_err(map_span_fetch_error)?;
             if let Some(output) = out {
@@ -756,7 +769,7 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
             // carries the spend so far so the coordinator folds this slice's real
             // cost before failing the query.
             if let Some(err) =
-                bytes_scanned_exceeded(accounting.snapshot().total_s3_bytes(), byte_limit)
+                bytes_scanned_exceeded(accounting.snapshot().pooled().total_s3_bytes(), byte_limit)
             {
                 return Ok(vec![summary_frame(
                     &accounting.snapshot(),
@@ -822,8 +835,17 @@ impl<R: SegmentResolver + 'static> SeriesFetch for SeriesFetchService<R> {
     }
 }
 
+/// Builds the terminal summary frame for one slice.
+///
+/// The slice's spend crosses the wire twice, from one source: `phase_accounting`
+/// carries the per-phase split (issue #959), the field the coordinator reads and
+/// merges into its own same-named phase totals, and the frozen `accounting`
+/// field carries that split's `pooled()` value so field 1 keeps the meaning it
+/// has always had. They cannot drift: both are derived here from the same
+/// `PhaseAccountingSnapshot`, and `phase_accounting_field_pools_to_the_frozen_accounting_field`
+/// pins the equality.
 fn summary_frame(
-    accounting: &QueryAccountingSnapshot,
+    accounting: &PhaseAccountingSnapshot,
     series_returned: u64,
     samples_returned: u64,
     code: pb::status::Code,
@@ -832,7 +854,8 @@ fn summary_frame(
 ) -> pb::FetchResponse {
     pb::FetchResponse {
         frame: Some(pb::fetch_response::Frame::Summary(pb::Summary {
-            accounting: Some(codec::encode_accounting(accounting)),
+            accounting: Some(codec::encode_accounting(&accounting.pooled())),
+            phase_accounting: codec::encode_phase_accounting(accounting),
             series_returned,
             samples_returned,
             status: Some(pb::Status {

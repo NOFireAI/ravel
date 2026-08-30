@@ -31,7 +31,6 @@ use ravel_segment::{
     CompactionMetaV4, IngestBounds, RunInputV7, SampleProvenance, SegmentIdentity, SegmentWriter,
     SeriesInput, SeriesInputV7, SeriesValues, encode_run_v4,
 };
-use ravel_types::accounting::{QueryAccounting, QueryAccountingSnapshot};
 use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal, TenantHash, TenantId};
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
@@ -56,6 +55,7 @@ use crate::engine::merge_soa_runs;
 use crate::erasure::{ErasurePredicate, is_erased_span};
 use crate::fetcher::SegmentFetcher;
 use crate::log_fetcher::{LogQuery, LogSegmentFetcher};
+use crate::phase_accounting::{PhaseAccounting, PhaseAccountingSnapshot, QueryPhase};
 use crate::span_fetcher::{SpanRow, SpanSegmentFetcher};
 
 const NS: i64 = 1_000_000;
@@ -239,16 +239,16 @@ async fn local_scalar(
     snapshot: &Snapshot,
 ) -> (
     Vec<Vec<crate::fetcher::FetchedSeriesSoa>>,
-    QueryAccountingSnapshot,
+    PhaseAccountingSnapshot,
     crate::fetcher::FetchStats,
 ) {
     let fetcher = SegmentFetcher::new(store);
-    let accounting = QueryAccounting::new();
+    let accounting = PhaseAccounting::new();
     let mut out = Vec::with_capacity(snapshot.segments.len());
     let mut stats = crate::fetcher::FetchStats::default();
     for seg in &snapshot.segments {
         let (scalar, seg_stats, _hist) = fetcher
-            .fetch_soa_and_histograms_accounted(TENANT, seg, &[], &accounting)
+            .fetch_soa_and_histograms_phase_accounted(TENANT, seg, &[], &accounting)
             .await
             .expect("local fetch");
         stats.raw_f64_pages += seg_stats.raw_f64_pages;
@@ -266,11 +266,11 @@ async fn local_histograms(
     snapshot: &Snapshot,
 ) -> Vec<Vec<crate::fetcher::FetchedHistogramSeries>> {
     let fetcher = SegmentFetcher::new(store);
-    let accounting = QueryAccounting::new();
+    let accounting = PhaseAccounting::new();
     let mut out = Vec::with_capacity(snapshot.segments.len());
     for seg in &snapshot.segments {
         let (_scalar, _stats, hist) = fetcher
-            .fetch_soa_and_histograms_accounted(TENANT, seg, &[], &accounting)
+            .fetch_soa_and_histograms_phase_accounted(TENANT, seg, &[], &accounting)
             .await
             .expect("local histogram fetch");
         out.push(hist);
@@ -393,7 +393,7 @@ async fn assert_distributed_matches_local(
     };
     let distributed = Distributed::new(Arc::new(fetcher), thresholds);
     let config = EngineConfig::default();
-    let accounting = QueryAccounting::new();
+    let accounting = PhaseAccounting::new();
     let triple = distributed
         .fetch(
             TENANT,
@@ -675,7 +675,7 @@ fn run_merged_series_distributed_over_the_wire_not_refused() {
                 max_parallel_slices: 1,
             },
         );
-        let accounting = QueryAccounting::new();
+        let accounting = PhaseAccounting::new();
         let triple = distributed
             .fetch(
                 TENANT,
@@ -760,7 +760,7 @@ fn run_merged_series_distributed_equals_local_bitwise() {
                 max_parallel_slices: 1,
             },
         );
-        let accounting = QueryAccounting::new();
+        let accounting = PhaseAccounting::new();
         let distributed_merged = match distributed
             .fetch(
                 TENANT,
@@ -823,7 +823,7 @@ async fn distributed_metric_names(
             max_parallel_slices: cap,
         },
     );
-    let accounting = QueryAccounting::new();
+    let accounting = PhaseAccounting::new();
     let triple = distributed
         .fetch(
             TENANT,
@@ -1029,7 +1029,7 @@ fn coordinator_reenforces_series_budget_over_honest_worker() {
             max_series: 3,
             ..EngineConfig::default()
         };
-        let accounting = QueryAccounting::new();
+        let accounting = PhaseAccounting::new();
         let err = distributed
             .fetch(
                 TENANT,
@@ -1109,7 +1109,7 @@ fn worker_trips_bytes_budget_per_segment() {
             "worker must trip its own per-segment bytes budget"
         );
         assert!(
-            response.accounting.total_s3_bytes() > 0,
+            response.phase_accounting.pooled().total_s3_bytes() > 0,
             "the BudgetExceeded summary must carry the real spend, not zeros"
         );
     });
@@ -1126,13 +1126,14 @@ struct LyingBudgetWorker {
 #[async_trait::async_trait]
 impl SliceFetcher for LyingBudgetWorker {
     async fn fetch(&self, _request: pb::FetchRequest) -> Result<SliceResponse, DistribError> {
-        let acct = QueryAccounting::new();
-        acct.add_s3_bytes(ravel_types::accounting::AccountedOp::Get, self.spend_bytes);
+        let acct = PhaseAccounting::new();
+        acct.scan()
+            .add_s3_bytes(ravel_types::accounting::AccountedOp::Get, self.spend_bytes);
         Ok(SliceResponse {
             scalar: Vec::new(),
             histogram: Vec::new(),
             partials: Vec::new(),
-            accounting: acct.snapshot(),
+            phase_accounting: acct.snapshot(),
             stats: crate::fetcher::FetchStats::default(),
             series_returned: 0,
             samples_returned: 0,
@@ -1184,7 +1185,7 @@ fn coordinator_reenforces_bytes_budget_over_lying_worker() {
             max_bytes_scanned: crate::config::ByteLimit::Bounded(100),
             ..EngineConfig::default()
         };
-        let accounting = QueryAccounting::new();
+        let accounting = PhaseAccounting::new();
         let err = distributed
             .fetch(
                 TENANT,
@@ -1206,7 +1207,7 @@ fn coordinator_reenforces_bytes_budget_over_lying_worker() {
         // The lying worker's spend was still folded into the query's reported
         // cost before the failure (never silently dropped).
         assert!(
-            accounting.snapshot().total_s3_bytes() >= 10_000,
+            accounting.snapshot().pooled().total_s3_bytes() >= 10_000,
             "the folded spend must survive on the live accounting handle"
         );
     });
@@ -1231,7 +1232,7 @@ impl SliceFetcher for RecordingBudgetWorker {
             scalar: Vec::new(),
             histogram: Vec::new(),
             partials: Vec::new(),
-            accounting: QueryAccounting::new().snapshot(),
+            phase_accounting: PhaseAccountingSnapshot::default(),
             stats: crate::fetcher::FetchStats::default(),
             series_returned: 0,
             samples_returned: 0,
@@ -1301,7 +1302,7 @@ fn distrib_fetch_scopes_byte_budget_by_actual_slice_count() {
             max_segments: 44,
             ..EngineConfig::default()
         };
-        let accounting = QueryAccounting::new();
+        let accounting = PhaseAccounting::new();
         distributed
             .fetch(
                 TENANT,
@@ -1363,7 +1364,7 @@ fn distrib_fetch_scopes_byte_budget_by_real_not_configured_slice_count() {
             max_bytes_scanned: crate::config::ByteLimit::Bounded(1_000),
             ..EngineConfig::default()
         };
-        let accounting = QueryAccounting::new();
+        let accounting = PhaseAccounting::new();
         distributed
             .fetch(
                 TENANT,
@@ -1414,7 +1415,7 @@ fn distrib_fetch_unlimited_byte_budget_stays_the_zero_sentinel_across_slices() {
             max_bytes_scanned: crate::config::ByteLimit::Unlimited,
             ..EngineConfig::default()
         };
-        let accounting = QueryAccounting::new();
+        let accounting = PhaseAccounting::new();
         distributed
             .fetch(
                 TENANT,
@@ -1459,7 +1460,7 @@ impl SliceFetcher for AlwaysInvalidated {
             scalar: Vec::new(),
             histogram: Vec::new(),
             partials: Vec::new(),
-            accounting: ravel_types::accounting::QueryAccountingSnapshot::default(),
+            phase_accounting: PhaseAccountingSnapshot::default(),
             stats: crate::fetcher::FetchStats::default(),
             series_returned: 0,
             samples_returned: 0,
@@ -1512,7 +1513,7 @@ fn many_invalidated_slices_map_to_one_retryable_error() {
                 max_parallel_slices: 3,
             },
         );
-        let accounting = QueryAccounting::new();
+        let accounting = PhaseAccounting::new();
         let err = distributed
             .fetch(
                 TENANT,
@@ -1798,13 +1799,14 @@ impl SliceFetcher for OverflowingLyingWorker {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             u64::MAX - 100
         };
-        let acct = QueryAccounting::new();
-        acct.add_s3_bytes(ravel_types::accounting::AccountedOp::Get, spend);
+        let acct = PhaseAccounting::new();
+        acct.scan()
+            .add_s3_bytes(ravel_types::accounting::AccountedOp::Get, spend);
         Ok(SliceResponse {
             scalar: Vec::new(),
             histogram: Vec::new(),
             partials: Vec::new(),
-            accounting: acct.snapshot(),
+            phase_accounting: acct.snapshot(),
             stats: crate::fetcher::FetchStats::default(),
             series_returned: 0,
             samples_returned: 0,
@@ -1862,7 +1864,7 @@ fn coordinator_fold_saturates_overflowing_worker_reports() {
             max_bytes_scanned: crate::config::ByteLimit::Bounded(1_000),
             ..EngineConfig::default()
         };
-        let accounting = QueryAccounting::new();
+        let accounting = PhaseAccounting::new();
         let err = distributed
             .fetch(
                 TENANT,
@@ -2000,7 +2002,7 @@ fn histogram_series_distributed_equals_local_bitwise() {
                 max_parallel_slices: 1,
             },
         );
-        let accounting = QueryAccounting::new();
+        let accounting = PhaseAccounting::new();
         let triple = distributed
             .fetch(
                 TENANT,
@@ -2035,7 +2037,7 @@ fn histogram_series_distributed_equals_local_bitwise() {
             "the distributed path must actually carry the histogram series"
         );
         assert!(
-            accounting.snapshot().total_s3_bytes() > 0,
+            accounting.snapshot().pooled().total_s3_bytes() > 0,
             "the worker's real spend is folded into the query accounting"
         );
     });
@@ -2150,7 +2152,7 @@ fn erased_histogram_series_is_dropped_before_the_wire() {
             "__name__".to_string(),
             metric.to_string(),
         )])];
-        let accounting = QueryAccounting::new();
+        let accounting = PhaseAccounting::new();
         let result = distributed
             .fetch(
                 TENANT,
@@ -2364,7 +2366,7 @@ async fn distributed_log_records(
             max_parallel_slices: cap,
         },
     );
-    let accounting = QueryAccounting::new();
+    let accounting = PhaseAccounting::new();
     let records = distributed
         .fetch_logs(
             TENANT,
@@ -2677,7 +2679,7 @@ fn logs_worker_serves_repeat_reads_from_the_read_cache() {
                     &snapshot,
                     &[],
                     &[],
-                    &QueryAccounting::new(),
+                    &PhaseAccounting::new(),
                     &EngineConfig::default(),
                     i64::MAX,
                 )
@@ -2865,7 +2867,7 @@ fn logs_worker_without_log_fetcher_signals_local_fallback() {
                 max_parallel_slices: 2,
             },
         );
-        let accounting = QueryAccounting::new();
+        let accounting = PhaseAccounting::new();
         let result = distributed
             .fetch_logs(
                 TENANT,
@@ -3057,7 +3059,7 @@ async fn distributed_span_rows(
             max_parallel_slices: cap,
         },
     );
-    let accounting = QueryAccounting::new();
+    let accounting = PhaseAccounting::new();
     let spans = distributed
         .fetch_spans(
             TENANT,
@@ -3427,7 +3429,7 @@ fn spans_worker_without_span_fetcher_signals_local_fallback() {
                 max_parallel_slices: 2,
             },
         );
-        let accounting = QueryAccounting::new();
+        let accounting = PhaseAccounting::new();
         let result = distributed
             .fetch_spans(
                 TENANT,
@@ -3782,6 +3784,10 @@ impl SeriesFetch for OldMetricsOnlyWorker {
         let summary = pb::FetchResponse {
             frame: Some(pb::fetch_response::Frame::Summary(pb::Summary {
                 accounting: None,
+                phase_accounting: vec![
+                    pb::QueryAccountingSnapshot::default();
+                    QueryPhase::ALL.len()
+                ],
                 series_returned: 0,
                 samples_returned: 0,
                 status: Some(pb::Status {
@@ -3964,7 +3970,7 @@ fn old_worker_rejecting_nonmetrics_signals_yields_silent_local_fallback() {
                     &snapshot,
                     &[],
                     &[],
-                    &QueryAccounting::new(),
+                    &PhaseAccounting::new(),
                     &EngineConfig::default(),
                     i64::MAX,
                 )
@@ -4014,7 +4020,7 @@ fn old_worker_rejecting_nonmetrics_signals_yields_silent_local_fallback() {
                 &span_snapshot,
                 &[],
                 &[],
-                &QueryAccounting::new(),
+                &PhaseAccounting::new(),
                 &EngineConfig::default(),
                 i64::MAX,
             )
@@ -4848,7 +4854,7 @@ fn native_histogram_pushdown_refusal_reports_real_accounting() {
             response.status_message
         );
         assert!(
-            response.accounting.total_s3_bytes() > 0,
+            response.phase_accounting.pooled().total_s3_bytes() > 0,
             "the refusal summary must carry the real fetch cost already spent, \
              not a zero-cost default"
         );
@@ -4967,7 +4973,7 @@ impl SliceFetcher for DuplicatePartialWorker {
             scalar: Vec::new(),
             histogram: Vec::new(),
             partials: vec![pa.clone(), pa],
-            accounting: QueryAccounting::new().snapshot(),
+            phase_accounting: PhaseAccountingSnapshot::default(),
             stats: crate::fetcher::FetchStats::default(),
             series_returned: 0,
             samples_returned: 0,
@@ -5005,7 +5011,7 @@ fn duplicate_partial_series_id_is_a_hard_error() {
                 max_parallel_slices: 1,
             },
         );
-        let accounting = QueryAccounting::new();
+        let accounting = PhaseAccounting::new();
         let err = distributed
             .fetch(
                 TENANT,

@@ -26,8 +26,9 @@ use ravel_promql::LabelMatcher;
 use ravel_proto::queryfrag::v1 as pb;
 use ravel_query::distrib::client::{DistribError, SliceFetcher, SliceResponse};
 use ravel_query::distrib::{Federation, RemoteCluster};
-use ravel_query::{EngineConfig, QueryEngine, QueryError, RequestLimit};
-use ravel_types::accounting::QueryAccountingSnapshot;
+use ravel_query::{
+    EngineConfig, PhaseAccountingSnapshot, QueryEngine, QueryError, QueryPhase, RequestLimit,
+};
 use ravel_types::{METRIC_NAME_LABEL, TenantId, TimeRange};
 
 const NS: i64 = 1_000_000_000;
@@ -45,14 +46,19 @@ struct FixedCostFetcher {
 #[async_trait]
 impl SliceFetcher for FixedCostFetcher {
     async fn fetch(&self, _request: pb::FetchRequest) -> Result<SliceResponse, DistribError> {
-        let mut accounting = QueryAccountingSnapshot::default();
-        accounting.s3_requests[0] = self.requests;
-        accounting.s3_bytes[0] = self.bytes;
+        // A remote's spend arrives split by phase (issue #959). This double
+        // reports it all on `scan`, the phase a segment data read lands on;
+        // the budget re-check under test reads `pooled()`, so which phase
+        // carries it does not change what is enforced.
+        let mut phase_accounting = PhaseAccountingSnapshot::default();
+        let scan = phase_accounting.phase_mut(QueryPhase::Scan);
+        scan.s3_requests[0] = self.requests;
+        scan.s3_bytes[0] = self.bytes;
         Ok(SliceResponse {
             scalar: Vec::new(),
             histogram: Vec::new(),
             partials: Vec::new(),
-            accounting,
+            phase_accounting,
             stats: Default::default(),
             series_returned: 0,
             samples_returned: 0,

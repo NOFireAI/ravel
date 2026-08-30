@@ -499,6 +499,21 @@ message Summary {
   // (ADR-0071). Additive fields, appended after the frozen 1..4.
   uint64 raw_f64_pages = 5;
   uint64 raw_f64_bytes = 6;
+  // The same spend as `accounting`, split by the phase that issued each
+  // request (issue #959): exactly one entry per ravel_query::QueryPhase, in
+  // QueryPhase::ALL order (resolve, plan, probe, scan). This field is the
+  // authoritative one: the coordinator decodes it and merges each entry into
+  // its own same-named phase total, so a distributed query's per-phase cost
+  // split is the same shape a local query's is instead of collapsing into
+  // `scan`. Field 1 stays the pooled sum of these entries (peak_intermediate_
+  // bytes merged by max, not summed) so the frozen field keeps its meaning.
+  //
+  // A decoder requires exactly QueryPhase::ALL.len() entries and rejects any
+  // other count, so a phase added to the enum cannot cross this wire silently:
+  // both encoder and decoder are driven off ALL. Carried on every terminal
+  // summary, including non-OK ones, exactly as fields 5 and 6 are. Additive,
+  // appended after 1..6.
+  repeated QueryAccountingSnapshot phase_accounting = 7;
 }
 
 // Typed per-slice status, mirroring the local query's typed errors so the

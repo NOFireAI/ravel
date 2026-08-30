@@ -59,13 +59,13 @@ use ravel_query::distrib::partition::DistribThresholds;
 use ravel_query::distrib::{Distributed, Federation, RemoteCluster};
 use ravel_query::erasure::ErasurePredicate;
 use ravel_query::{
-    EngineConfig, FetchStats, FetchedSeriesSoa, LogQuery, LogSegmentFetcher, QueryEngine,
+    EngineConfig, FetchStats, FetchedSeriesSoa, LogQuery, LogSegmentFetcher,
+    PhaseAccountingSnapshot, QueryEngine,
 };
 use ravel_segment::{
     HistogramCounts, HistogramSample, HistogramSpan, HistogramValue, IngestBounds, ResetHint,
     SegmentIdentity, SegmentWriter, SeriesInput, SeriesInputV3, SeriesValues,
 };
-use ravel_types::accounting::QueryAccountingSnapshot;
 use ravel_types::{
     CommitToken, Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, Signal, TenantHash,
     TenantId, TimeRange,
@@ -641,7 +641,7 @@ fn ok_response(scalar: Vec<FetchedSeriesSoa>) -> SliceResponse {
         scalar,
         histogram: Vec::new(),
         partials: Vec::new(),
-        accounting: QueryAccountingSnapshot::default(),
+        phase_accounting: PhaseAccountingSnapshot::default(),
         stats: FetchStats::default(),
         series_returned,
         samples_returned,

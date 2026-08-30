@@ -42,7 +42,7 @@ use ravel_catalog::{SegmentRef, Snapshot};
 use ravel_logseg::LogRecord;
 use ravel_promql::LabelMatcher;
 use ravel_proto::queryfrag::v1 as pb;
-use ravel_types::accounting::{QueryAccounting, QueryAccountingSnapshot};
+use ravel_types::accounting::QueryAccountingSnapshot;
 use ravel_types::logstream::canonical_attr_bytes;
 use ravel_types::{SeriesId, Signal, TenantHash};
 
@@ -53,6 +53,7 @@ use crate::engine::bytes_scanned_exceeded;
 use crate::erasure::ErasurePredicate;
 use crate::error::QueryError;
 use crate::fetcher::{FetchError, FetchStats, FetchedHistogramSeries, FetchedSeriesSoa};
+use crate::phase_accounting::PhaseAccounting;
 use crate::span_fetcher::SpanRow;
 
 pub use partition::{DISTRIBUTE_MIN_SEGMENTS, DISTRIBUTE_MIN_STORE_BYTES};
@@ -148,7 +149,7 @@ impl Distributed {
         snapshot: &Snapshot,
         matchers: &[LabelMatcher],
         erasure: &[ErasurePredicate],
-        accounting: &QueryAccounting,
+        accounting: &PhaseAccounting,
         config: &EngineConfig,
         deadline_unix_ns: i64,
         partial_aggregate: Option<pb::PartialAggregateRequest>,
@@ -446,7 +447,7 @@ impl Distributed {
         snapshot: &Snapshot,
         matchers: &[LabelMatcher],
         erasure: &[ErasurePredicate],
-        accounting: &QueryAccounting,
+        accounting: &PhaseAccounting,
         config: &EngineConfig,
         deadline_unix_ns: i64,
     ) -> Result<Option<Vec<LogRecord>>, QueryError> {
@@ -602,7 +603,7 @@ impl Distributed {
         snapshot: &Snapshot,
         matchers: &[LabelMatcher],
         erasure: &[ErasurePredicate],
-        accounting: &QueryAccounting,
+        accounting: &PhaseAccounting,
         config: &EngineConfig,
         deadline_unix_ns: i64,
     ) -> Result<Option<Vec<SpanRow>>, QueryError> {
@@ -734,13 +735,13 @@ impl Distributed {
 /// sums its `FetchStats` page counters. Both accounting folds saturate, so a
 /// worker reporting a counter near `u64::MAX` clamps rather than wrapping.
 fn fold_slice(
-    live: &QueryAccounting,
+    live: &PhaseAccounting,
     running: &mut QueryAccountingSnapshot,
     stats: &mut FetchStats,
     response: &client::SliceResponse,
 ) {
-    live.merge_snapshot(&response.accounting);
-    *running = running.saturating_merge(&response.accounting);
+    live.merge_snapshot(&response.phase_accounting);
+    *running = running.saturating_merge(&response.phase_accounting.pooled());
     stats.raw_f64_pages = stats
         .raw_f64_pages
         .saturating_add(response.stats.raw_f64_pages);
@@ -754,12 +755,12 @@ fn fold_slice(
 /// check). The log sibling of [`fold_slice`]; a log slice carries no `FetchStats`
 /// page counters (a metric-path concept), so there is none to sum.
 fn fold_log_slice(
-    live: &QueryAccounting,
+    live: &PhaseAccounting,
     running: &mut QueryAccountingSnapshot,
     response: &SliceLogResponse,
 ) {
-    live.merge_snapshot(&response.accounting);
-    *running = running.saturating_merge(&response.accounting);
+    live.merge_snapshot(&response.phase_accounting);
+    *running = running.saturating_merge(&response.phase_accounting.pooled());
 }
 
 /// Folds one Spans slice's accounting into the query's live handle and the
@@ -767,12 +768,12 @@ fn fold_log_slice(
 /// check). The span sibling of [`fold_log_slice`]; a span slice carries no
 /// `FetchStats` page counters (a metric-path concept), so there is none to sum.
 fn fold_span_slice(
-    live: &QueryAccounting,
+    live: &PhaseAccounting,
     running: &mut QueryAccountingSnapshot,
     response: &SliceSpanResponse,
 ) {
-    live.merge_snapshot(&response.accounting);
-    *running = running.saturating_merge(&response.accounting);
+    live.merge_snapshot(&response.phase_accounting);
+    *running = running.saturating_merge(&response.phase_accounting.pooled());
 }
 
 /// The stated cross-segment total order for RLOG records (no dedup: see below),

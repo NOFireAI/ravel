@@ -61,7 +61,7 @@ use std::time::Duration;
 
 use ravel_promql::LabelMatcher;
 use ravel_proto::queryfrag::v1 as pb;
-use ravel_types::accounting::{QueryAccounting, QueryAccountingSnapshot};
+use ravel_types::accounting::QueryAccountingSnapshot;
 use ravel_types::{SeriesId, Signal, TenantHash};
 
 use crate::config::EngineConfig;
@@ -71,6 +71,7 @@ use crate::engine::bytes_scanned_exceeded;
 use crate::erasure::ErasurePredicate;
 use crate::error::QueryError;
 use crate::fetcher::{FetchStats, FetchedHistogramSeries, FetchedSeriesSoa};
+use crate::phase_accounting::PhaseAccounting;
 
 /// The default per-remote soft timeout. A remote that has not answered within
 /// this bound is treated as unavailable (skipped or fatal per
@@ -202,7 +203,7 @@ impl Federation {
         window_start_ns: i64,
         window_end_ns: i64,
         min_commit_tokens: Vec<String>,
-        accounting: QueryAccounting,
+        accounting: PhaseAccounting,
         config: EngineConfig,
     ) -> Result<FederationOutcome, QueryError> {
         let mut outcome = FederationOutcome::default();
@@ -501,13 +502,13 @@ fn skipped_cluster_warning(name: &str) -> String {
 /// snapshot (the basis for the bytes-scanned re-check), and sums its
 /// `FetchStats` page counters. Both accounting folds saturate.
 fn fold_remote(
-    live: &QueryAccounting,
+    live: &PhaseAccounting,
     running: &mut QueryAccountingSnapshot,
     stats: &mut FetchStats,
     response: &SliceResponse,
 ) {
-    live.merge_snapshot(&response.accounting);
-    *running = running.saturating_merge(&response.accounting);
+    live.merge_snapshot(&response.phase_accounting);
+    *running = running.saturating_merge(&response.phase_accounting.pooled());
     stats.raw_f64_pages = stats
         .raw_f64_pages
         .saturating_add(response.stats.raw_f64_pages);
@@ -563,7 +564,7 @@ mod tests {
                 scalar: Vec::new(),
                 histogram: Vec::new(),
                 partials: Vec::new(),
-                accounting: QueryAccountingSnapshot::default(),
+                phase_accounting: crate::phase_accounting::PhaseAccountingSnapshot::default(),
                 stats: FetchStats::default(),
                 series_returned: 0,
                 samples_returned: 0,
@@ -599,7 +600,7 @@ mod tests {
             0,
             1_000,
             Vec::new(),
-            QueryAccounting::new(),
+            PhaseAccounting::new(),
             EngineConfig::default(),
         )
         .await
