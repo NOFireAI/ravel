@@ -62,7 +62,7 @@ fn the_manifest_declares_exactly_the_four_adr_0927_profiles_with_their_exact_fig
         ("cardinality", 1_000_000, 360, 15, 5_400, 0, 360_000_000),
         ("history", 10_000, 172_800, 15, 2_592_000, 0, 1_728_000_000),
         ("churn", 50_000, 8_640, 15, 129_600, 2_000, 432_000_000),
-        ("ci", 1_000, 120, 15, 1_800, 500, 120_000),
+        ("ci", 1_000, 120, 15, 1_800, 0, 120_000),
     ];
     for (name, active, samples, scrape, duration, churn_bp, total) in expected {
         let p = workload.profile(name).expect("profile present");
@@ -197,7 +197,7 @@ fn churn_figures_are_exact_per_profile_and_the_generator_agrees_with_the_profile
         ("cardinality", 2, 0, 1_000_000),
         ("history", 720, 0, 10_000),
         ("churn", 36, 10_000, 400_000),
-        ("ci", 1, 50, 1_000),
+        ("ci", 1, 0, 1_000),
     ];
     for (name, epochs, churned, created) in expected {
         let p = workload.profile(name).expect("profile present");
@@ -214,6 +214,76 @@ fn churn_figures_are_exact_per_profile_and_the_generator_agrees_with_the_profile
             *created,
             "the generator's plans and profile `{name}`'s own arithmetic disagree"
         );
+    }
+}
+
+#[test]
+fn every_declared_anomaly_rate_is_actually_delivered_by_the_run() {
+    // A declared anomaly rate that the run never realizes is an inert claim: the
+    // ci profile once declared 500 bp of churn over a 30-minute run that spans
+    // one churn epoch, so `churn_epochs()` was 1, no cohort was ever retired,
+    // and the profile claimed coverage it could not deliver. This pins declared
+    // == delivered for churn (arithmetic over every profile) and for every
+    // generator-level anomaly rate (a full ci run).
+    let workload = load_workload(workload_path()).expect("manifest loads");
+
+    // Churn: a nonzero rate must retire at least one cohort over the profile's
+    // own duration, and a zero rate must retire none.
+    for p in &workload.profiles {
+        let declares_churn = p.churn_basis_points_per_hour > 0;
+        let delivers_churn = p.total_series_created() > p.active_series;
+        assert_eq!(
+            declares_churn,
+            delivers_churn,
+            "profile `{}` declares {} bp of churn but {} retire a cohort: a nonzero rate over a \
+             run that never crosses an epoch boundary is an inert anomaly",
+            p.name,
+            p.churn_basis_points_per_hour,
+            if delivers_churn { "does" } else { "does not" }
+        );
+    }
+
+    // Every generator anomaly rate: a nonzero rate delivers events on the full
+    // ci run, a zero rate delivers none.
+    let ci = workload.profile("ci").expect("ci profile");
+    let mut generator = Generator::new(&workload, "ci", 0).expect("generator builds");
+    let (_, report) = generator
+        .generate_bytes(ci.samples_per_series)
+        .expect("the ci profile generates");
+    let anomalies = workload.generator.anomalies;
+    for (label, rate, delivered) in [
+        (
+            "missing samples",
+            anomalies.missing_sample_one_in,
+            report.omitted_missing_samples,
+        ),
+        (
+            "stale markers",
+            anomalies.stale_marker_one_in,
+            report.stale_markers,
+        ),
+        (
+            "counter resets",
+            anomalies.counter_reset_one_in,
+            report.counter_reset_events,
+        ),
+        (
+            "out-of-order samples",
+            anomalies.out_of_order_one_in,
+            report.out_of_order_samples,
+        ),
+    ] {
+        if rate > 0 {
+            assert!(
+                delivered > 0,
+                "{label}: rate one-in-{rate} is declared but the run delivered none"
+            );
+        } else {
+            assert_eq!(
+                delivered, 0,
+                "{label}: rate is 0 but the run delivered {delivered}"
+            );
+        }
     }
 }
 
@@ -304,12 +374,22 @@ fn every_named_construct_is_in_the_promql_registry_and_the_corpus_names_a_known_
             "construct `{construct}` is not in the PromQL conformance registry"
         );
     }
-    // The corpus is a workload sample, not a conformance suite: it names 34 of
-    // the registry's 133 constructs. Pinned exactly so adding an entry that
+    // The corpus is a workload sample, not a conformance suite. It owns how many
+    // distinct constructs it names (34, pinned exactly so adding an entry that
     // names nothing new, or dropping the only entry that names a construct, is
-    // visible.
+    // visible), and the relationship that every construct it names is a member
+    // of the registry. It does NOT own the registry's own size: a construct
+    // added to `ravel_promql_difftest::REGISTRY` is a change to that crate, not
+    // to this corpus, and must not fail a MetricsBench artifact test.
     assert_eq!(named.len(), 34);
-    assert_eq!(known.len(), 133);
+    assert!(
+        named.is_subset(&known),
+        "every construct the corpus names must be in the PromQL registry"
+    );
+    assert!(
+        named.len() <= known.len(),
+        "the corpus cannot name more distinct constructs than the registry carries"
+    );
 
     // Every entry names at least two constructs, so no entry passes the
     // non-empty check on a single generic name.
@@ -439,10 +519,11 @@ fn the_ci_profile_generates_its_exact_declared_sample_count() {
     let steps = ci.samples_per_series;
     // Instances scraped per step, from the family shares of the 1,000 active
     // series: 400 cpu gauge, 300 counter, 15 classic histogram (10 series
-    // each), 100 native, 50 build_info gauge. Staleness applies to gauges only
-    // and resets to counters and classic histograms only.
+    // each), 100 native, 50 build_info gauge. Staleness applies to gauges only;
+    // resets apply to counters, classic histograms and native histograms, which
+    // all carry counter semantics.
     let gauge_scrapes = 450 * steps;
-    let counter_scrapes = (300 + 15) * steps;
+    let counter_scrapes = (300 + 15 + 100) * steps;
     let instance_scrapes = 865 * steps;
     // The omission and out-of-order figures count series rather than instances,
     // so their nominals are instance-rate approximations; a factor of two
@@ -479,7 +560,7 @@ fn the_ci_profile_generates_its_exact_declared_sample_count() {
     // The exact figures this seed produces.
     assert_eq!(report.stale_markers, 62, "staleness markers");
     assert_eq!(report.omitted_missing_samples, 225, "missing samples");
-    assert_eq!(report.counter_reset_events, 34, "counter resets");
+    assert_eq!(report.counter_reset_events, 43, "counter resets");
     assert_eq!(report.out_of_order_samples, 182, "out-of-order samples");
 }
 
