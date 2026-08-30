@@ -1633,6 +1633,9 @@ impl Catalog {
                 parts: part_refs.clone(),
                 postings: postings_ref,
                 column_stats: column_stats_ref,
+                // ADR-0942 A1: additive field 13, not written by any path yet.
+                // Absent (None) keeps HEAD encoding byte-for-byte identical.
+                column_stats_part: None,
                 folder_id: folder_id.into_bytes().to_vec(),
                 created_unix_ns: now_ns,
                 shard_generation_count,

@@ -1127,6 +1127,7 @@ mod tests {
             postings: None,
             shard_generation_count: 1,
             column_stats: None,
+            column_stats_part: None,
         }
     }
 
@@ -1272,6 +1273,7 @@ mod tests {
             postings: None,
             shard_generation_count: 1,
             column_stats: None,
+            column_stats_part: None,
         };
         let head_bytes = snapshot_format::encode_head(&head).expect("encode head");
         let head_key = head_object_key(&tenant, Signal::Metrics);

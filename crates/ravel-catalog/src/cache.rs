@@ -700,6 +700,7 @@ mod tests {
             created_unix_ns: 0,
             shard_generation_count: 1,
             column_stats: None,
+            column_stats_part: None,
         }
     }
 

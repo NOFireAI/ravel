@@ -70,6 +70,16 @@ message SnapshotHead {
   // failed; readers must never treat absence as an error, and must fall
   // back to scanning for any statistic this ref does not cover.
   SnapshotColumnStatsRef column_stats = 11;
+  // Additive, ADR-0942 (re-key .cstat column statistics to snapshot-part
+  // binding). Points at a part-hash-keyed .cstat (envelope v2), joined to a
+  // resolved segment by the covered part's SnapshotPartRef.blake3 rather than
+  // the ADR-0850 five-field identity tuple field 11 carries. Field 12 is
+  // deliberately skipped: ADR-0913 has claimed it for
+  // SnapshotMaterializationRef. Absent means no part-bound statistics have
+  // been built; readers must never treat absence as an error, and must fall
+  // back to scanning for any statistic this ref does not cover. Field 11 is
+  // neither renumbered nor redefined and keeps its ADR-0850 meaning.
+  SnapshotColumnStatsPartRef column_stats_part = 13;
 }
 
 message SnapshotPartRef {
@@ -115,6 +125,22 @@ message SnapshotPostingsHeader {
 // SnapshotPostingsRef binds a name-postings object: a column-stats object is
 // only trustworthy against the parts whose blake3 hashes it names here.
 message SnapshotColumnStatsRef {
+  string key = 1;              // full object key of the column-stats object
+  bytes blake3 = 2;             // 32, of the column-stats object's full bytes
+  uint64 size = 3;
+  uint32 segment_count = 4;     // number of segments with an entry in this object
+  repeated bytes part_blake3 = 5;  // covered parts' blake3, same order as parts
+}
+
+// Reference to a part-hash-keyed column-statistics object (RCST envelope,
+// v2), ADR-0942. Mirrors SnapshotColumnStatsRef (field 11) field-for-field;
+// the difference is semantic, not structural: the covered .cstat binds its
+// per-segment statistics to a part's blake3 rather than to the ADR-0850
+// five-field identity tuple, so it covers L1 (and rewrite-output) segments
+// that the tuple key cannot name uniquely. Like SnapshotColumnStatsRef it is
+// bound to the exact set of parts it was built from: it is only trustworthy
+// against the parts whose blake3 hashes it names here.
+message SnapshotColumnStatsPartRef {
   string key = 1;              // full object key of the column-stats object
   bytes blake3 = 2;             // 32, of the column-stats object's full bytes
   uint64 size = 3;
