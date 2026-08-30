@@ -218,15 +218,25 @@ pub struct Provenance {
     /// full-scan statement is latency-bound and moves nearly linearly with it.
     #[serde(default = "default_fetch_concurrency")]
     pub fetch_concurrency: usize,
-    /// The logs per-request byte budget this run configured
-    /// (`--logs-request-cost-bytes`, ADR-0904), the value fed to
-    /// [`EngineConfig::logs_request_cost_bytes`]. Recorded because it governs
-    /// whether a logs scan routes through the ranged probe-then-fetch path, so a
-    /// pass comparing knob settings is uninterpretable without it. A report
-    /// written before this field existed deserializes to
+    /// The logs per-request byte budget this run ASKED for
+    /// (`--logs-request-cost-bytes`, ADR-0904). A report written before this
+    /// field existed deserializes to
     /// [`ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES`].
     #[serde(default = "default_logs_request_cost_bytes")]
-    pub logs_request_cost_bytes: u64,
+    pub logs_request_cost_bytes_requested: u64,
+    /// The budget that actually governed execution, or `None` when this process
+    /// cannot know it. Same split, and same reason, as
+    /// [`Self::sql_max_query_bytes_effective`]: the Flight lane does not send
+    /// this setting to the server, so the server's own config governed there.
+    ///
+    /// Recording the requested value as effective would be worse than recording
+    /// nothing. The whole point of stamping the knob is that a pass comparing
+    /// settings is uninterpretable without it; a stamp that names a value which
+    /// did not govern makes two Flight passes taken at different
+    /// `--logs-request-cost-bytes` values look like a controlled comparison
+    /// when both ran under the same server config.
+    #[serde(default)]
+    pub logs_request_cost_bytes_effective: Option<u64>,
     /// The per-query DataFusion memory-pool ceiling this run ASKED for
     /// (`--sql-max-query-bytes`, ADR-0088). A report written before this field
     /// existed deserializes to [`ravel_sql::DEFAULT_MAX_QUERY_BYTES`].
@@ -1731,7 +1741,10 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
             cache_bytes: cfg.cache_bytes,
             deadline_secs: cfg.deadline.as_secs(),
             fetch_concurrency: cfg.fetch_concurrency.max(1),
-            logs_request_cost_bytes: cfg.logs_request_cost_bytes,
+            logs_request_cost_bytes_requested: cfg.logs_request_cost_bytes,
+            // In-process lane, same as the ceiling below: the requested budget
+            // reaches the engine, so it is also the effective one.
+            logs_request_cost_bytes_effective: Some(cfg.logs_request_cost_bytes),
             sql_max_query_bytes_requested: cfg.max_query_bytes,
             // In-process lane: the requested ceiling reaches the executor's
             // `SqlConfig`, so it is also the effective one.
@@ -1882,7 +1895,16 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
             cache_bytes: cfg.cache_bytes,
             deadline_secs: cfg.deadline.as_secs(),
             fetch_concurrency: cfg.fetch_concurrency.max(1),
-            logs_request_cost_bytes: cfg.logs_request_cost_bytes,
+            logs_request_cost_bytes_requested: cfg.logs_request_cost_bytes,
+            // `settings` is passed only on the in-process arm of the match
+            // above, so on the Flight lane this budget never left the process
+            // and the server's own config governed the routing. Stamping the
+            // requested value as effective here would make two Flight passes
+            // at different knob settings look like a controlled comparison.
+            logs_request_cost_bytes_effective: match &cfg.flight {
+                Some(_) => None,
+                None => Some(cfg.logs_request_cost_bytes),
+            },
             sql_max_query_bytes_requested: cfg.max_query_bytes,
             // `settings` is passed only on the in-process arm of the match
             // above, so on the Flight lane this ceiling never left the process

@@ -178,9 +178,14 @@ struct Args {
     /// The logs per-request byte budget (ADR-0904), the same knob as
     /// `ravel-server --logs-request-cost-bytes`: the byte cost the logs planner
     /// charges each object against when deciding whether a scan routes through
-    /// the ranged probe-then-fetch path instead of a whole-object read. Raising
-    /// it makes the planner willing to spend more requests on a scan. Defaults
-    /// to ravel-query's compiled-in value, the one every earlier run used;
+    /// the ranged probe-then-fetch path instead of a whole-object read. The
+    /// value is how many transferred bytes one saved round trip is worth, so
+    /// RAISING it makes each request more expensive and the planner spends
+    /// FEWER of them: reads coalesce and lean toward whole objects, request
+    /// count falls and bytes rise. Lowering it does the reverse. Measured on
+    /// the ClickBench corpus at ratio 0, raising it from the default to 8 MiB
+    /// moved 763,288 GETs to 724,016 and 194 GB to 306 GB. Defaults to
+    /// ravel-query's compiled-in value, the one every earlier run used;
     /// recorded in the report header and provenance.
     #[arg(long, value_name = "BYTES", default_value_t = ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES)]
     logs_request_cost_bytes: u64,
@@ -489,8 +494,16 @@ fn provenance_header(p: &Provenance, d: &DatasetInfo) -> String {
     ));
     out.push_str(&format!("  fetch conc : {}\n", p.fetch_concurrency));
     out.push_str(&format!(
-        "  req cost   : {} bytes\n",
-        p.logs_request_cost_bytes
+        "  req cost   : requested={} bytes  effective={}\n",
+        p.logs_request_cost_bytes_requested,
+        match p.logs_request_cost_bytes_effective {
+            Some(v) => format!("{v} bytes"),
+            // A Flight run does not send the knob to the server; the routing
+            // was governed by the server's own config, which this process
+            // cannot name. Printing the requested value here would make a
+            // Flight pass look like it ran at a setting it never applied.
+            None => "unknown (server config)".to_string(),
+        }
     ));
     out.push_str(&format!(
         "  query max  : requested={} bytes  effective={}\n",
@@ -783,7 +796,8 @@ mod tests {
             cache_bytes: 0,
             deadline_secs: 30,
             fetch_concurrency: ravel_query::DEFAULT_FETCH_CONCURRENCY,
-            logs_request_cost_bytes: cost,
+            logs_request_cost_bytes_requested: cost,
+            logs_request_cost_bytes_effective: Some(cost),
             sql_max_query_bytes_requested: DEFAULT_MAX_QUERY_BYTES,
             sql_max_query_bytes_effective: Some(DEFAULT_MAX_QUERY_BYTES),
             tenant_max_bytes: 1 << 30,
@@ -806,15 +820,45 @@ mod tests {
         let cost = 4_242_424;
         let d = dataset("pre-compaction", None);
         let header = provenance_header(&provenance_with_cost(cost), &d);
-        let line = format!("  req cost   : {cost} bytes");
+        let line = format!("  req cost   : requested={cost} bytes  effective={cost} bytes");
         assert!(
             header.contains(&line),
             "header must stamp the configured request cost verbatim; got:\n{header}"
         );
         assert_eq!(
             header.matches(&format!("{cost}")).count(),
+            2,
+            "the request-cost value appears exactly twice, as requested and as \
+             effective; got:\n{header}"
+        );
+    }
+
+    /// A Flight run does not send the knob to the server, so the effective
+    /// value is the server's own and this process cannot name it. The header
+    /// must say so rather than repeating the requested value: a stamp that
+    /// names a setting which did not govern is worse than no stamp, because it
+    /// makes two Flight passes taken at different `--logs-request-cost-bytes`
+    /// values look like a controlled comparison.
+    #[test]
+    fn header_does_not_claim_a_flight_run_applied_the_requested_request_cost() {
+        let cost = 4_242_424;
+        let d = dataset("pre-compaction", None);
+        let mut p = provenance_with_cost(cost);
+        p.source = "flight".to_string();
+        p.logs_request_cost_bytes_effective = None;
+        let header = provenance_header(&p, &d);
+        assert!(
+            header.contains(&format!(
+                "  req cost   : requested={cost} bytes  effective=unknown (server config)"
+            )),
+            "a Flight run must report the effective request cost as server-controlled; \
+             got:\n{header}"
+        );
+        assert_eq!(
+            header.matches(&format!("{cost}")).count(),
             1,
-            "the request-cost value must be stamped exactly once; got:\n{header}"
+            "the requested value appears once and is NOT repeated as effective; \
+             got:\n{header}"
         );
     }
 
@@ -829,7 +873,8 @@ mod tests {
             &d,
         );
         let line = format!(
-            "  req cost   : {} bytes",
+            "  req cost   : requested={} bytes  effective={} bytes",
+            ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES,
             ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES
         );
         assert!(
