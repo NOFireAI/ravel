@@ -184,9 +184,16 @@ struct Args {
     /// FEWER of them: reads coalesce and lean toward whole objects, request
     /// count falls and bytes rise. Lowering it does the reverse. Measured on
     /// the ClickBench corpus at ratio 0, raising it from the default to 8 MiB
-    /// moved 763,288 GETs to 724,016 and 194 GB to 306 GB. Defaults to
-    /// ravel-query's compiled-in value, the one every earlier run used;
-    /// recorded in the report header and provenance.
+    /// moved 763,288 GETs to 724,016 and 194 GB to 306 GB.
+    ///
+    /// IGNORED WITH `--flight`. It is not a Flight header, so it never leaves
+    /// this process and the server's own config governs the routing. Setting
+    /// it on a Flight run does not make that run a measurement of this knob;
+    /// the report records the effective value as unknown there for exactly
+    /// that reason.
+    ///
+    /// Defaults to ravel-query's compiled-in value, the one every earlier run
+    /// used; recorded in the report header and provenance.
     #[arg(long, value_name = "BYTES", default_value_t = ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES)]
     logs_request_cost_bytes: u64,
     /// Append one JSON line per finished statement to this file as the run
