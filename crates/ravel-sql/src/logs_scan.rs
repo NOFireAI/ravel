@@ -2040,6 +2040,12 @@ async fn compute_plan_counts(
     // higher-ranked bound this `Send` boxed future needs.
     let mut prunes = Vec::with_capacity(segments.len());
     for seg in segments {
+        // Refuse an unreadable version BEFORE the plan probe, not after. This
+        // is a second entry point into the fetch layer alongside the three
+        // route choices below, and `plan_segment` issues its footer probe
+        // before the open phase can reject the version -- so without this the
+        // ordering guarantee holds on the scan path and quietly fails here.
+        refuse_unreadable_version(seg)?;
         prunes.push(
             ctx.fetcher
                 .plan_segment(seg, ctx.tenant_hash, &ctx.query, &ctx.accounting),
