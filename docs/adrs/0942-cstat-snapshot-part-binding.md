@@ -37,21 +37,23 @@ coverage. Four things stand in the way, one in the builder and three in the
 reader, and together they are why L1 coverage is a key-model problem rather
 than a fold-filter problem. Each is verified against the tree:
 
-0. **The builder refuses an L1 entry before a record exists.**
-   `build_column_stats_segment`
-   (`crates/ravel-catalog/src/column_stats_build.rs:372`) carries
-   `debug_assert_eq!(entry.level, 0)`, and at `:379` converts
-   `entry.writer_id` into `[u8; 16]`, returning
-   `ColumnStatsBuildError::BadWriterIdLen` for any other length (`:383`). An
-   L1 entry's slot holds the 32-byte `input_set_hash`, so a fold that dropped
-   the level filter fails this conversion and never constructs a
-   `ColumnStatsSegment` at all. The `debug_assert` is not the guard, since it
-   compiles out of release builds; the `BadWriterIdLen` error is, and it fires
-   on every build profile. This blocker is the cheapest of the four to clear
-   and it disappears under this ADR's decision, because part binding replaces
-   the writer-id key the conversion exists to enforce.
+First, in the builder, before any record exists:
 
-The remaining three sit on the reader side:
+- **`build_column_stats_segment` refuses an L1 entry.**
+  (`crates/ravel-catalog/src/column_stats_build.rs:372`) carries
+  `debug_assert_eq!(entry.level, 0)`, and at `:379` converts
+  `entry.writer_id` into `[u8; 16]`, returning
+  `ColumnStatsBuildError::BadWriterIdLen` for any other length (`:383`). An
+  L1 entry's slot holds the 32-byte `input_set_hash`, so a fold that dropped
+  the level filter fails this conversion and never constructs a
+  `ColumnStatsSegment` at all. The `debug_assert` is not the guard, since it
+  compiles out of release builds; the `BadWriterIdLen` error is, and it fires
+  on every build profile. This blocker is the cheapest of the four to clear
+  and it disappears under this ADR's decision, because part binding replaces
+  the writer-id key the conversion exists to enforce.
+
+The remaining three sit on the reader side, and are referred to below as
+blockers 1, 2 and 3:
 
 1. **The query-side join key is computed from the `SegmentRef`, not the
    `SnapshotEntry`.** `segment_identity`
@@ -120,17 +122,28 @@ overloading any writer-identity slot. Concretely:
   free one. Absence of field 13 means no part-bound statistics have been
   built; a reader must treat that absence as fall-back-to-scan, never as an
   error -- the same reader rule fields 9 and 11 already carry.
-- **The `.cstat` envelope version bumps from 1 to 2**, single-sourced at
-  `crates/ravel-catalog/src/snapshot_format/mod.rs:93`
-  (`pub const COLUMN_STATS_VERSION: u8 = 1`). Every use of the constant
-  (`column_stats.rs:66`, `:80`, `:115`, `:144`) reads it, so the bump edits
-  that one constant, not mirrored literals -- the single-sourcing discipline
-  ADR-0066 decision 1 requires (`VERSION_V6`, `footer::VERSION`). The version
-  byte makes a `.cstat` object self-describe its keying, so an object read
-  outside its head ref still declares whether it is L0-tuple-keyed (v1) or
-  part-keyed (v2); the head field number and the envelope version agree by
-  construction, and a disagreement is a validation failure that subtracts
-  coverage, matching ADR-0913 §4a's self-describing-state rule.
+- **The `.cstat` envelope gains a v2, and the write version is split from the
+  accepted read set.** Today `COLUMN_STATS_VERSION`
+  (`crates/ravel-catalog/src/snapshot_format/mod.rs:93`) is used for both
+  jobs: the writer stamps it (`column_stats.rs:66`, `:80`) and the decoder
+  equality-checks it twice (`:115`, `:144`). Bumping that single constant to 2
+  would therefore make `decode_column_stats` **reject every v1 object**,
+  including the field-11 objects this ADR's own reader rule still depends on
+  for L0 coverage. That is not acceptable, so the constant splits in two:
+  - a write version, stamped by the fold, which becomes 2;
+  - an accepted read set, `{1, 2}`, which the decoder checks membership
+    against instead of equality.
+
+  The v1 baseline rejection that forces a full re-fold (see the backfill
+  section) stays local to the v2-writing fold and must not be expressed by
+  narrowing the decoder, or it takes L0 coverage down with it.
+
+  The version byte still makes a `.cstat` object self-describe its keying, so
+  an object read outside its head ref declares whether it is L0-tuple-keyed
+  (v1) or part-keyed (v2); the head field number and the envelope version
+  agree by construction, and a disagreement is a validation failure that
+  subtracts that object's coverage, matching ADR-0913 §4a's
+  self-describing-state rule.
 
 Changing the meaning of the persisted `ColumnStatsSegment` key is a change to
 a frozen contract, so it takes an ADR and a version bump, never an in-place
@@ -147,15 +160,27 @@ requires of every format ADR.
 
 The Class B convergence plan:
 
-- The upgraded fold emits the new part-bound keying (envelope v2) under the
-  new field 13. The old field-11 v1 object becomes unreferenced at the next
-  fold that publishes a v2 object, and supersession GCs it under the existing
-  `sweep_unreferenced_catalog_objects` lifecycle -- no new sweep rule.
-- Dual-read is needed only across the rolling-upgrade window. A reader that
-  understands v2 uses field 13 when present; when only field 11 is present it
-  uses the ADR-0850 L0-tuple join (L0 coverage, L1 falls back to scan,
-  unchanged). An older reader that predates field 13 ignores it by proto3
-  additive semantics and reads field 11 exactly as today.
+- **The fold dual-publishes during the rollout.** The upgraded fold emits the
+  new part-bound keying (envelope v2) under field 13 **and keeps publishing
+  the field-11 v1 object**, until every process reading the bucket
+  understands field 13. Retiring field 11 at the first v2 publish would be a
+  writers-before-readers change of exactly the kind ADR-0066 decision 1
+  forbids: an older reader ignores field 13 by proto3 additive semantics,
+  finds no field 11, and silently falls back to scanning every segment. That
+  is not a crash or a wrong answer, which is precisely why it would go
+  unnoticed -- it is an L0 coverage regression that reads as a slow query.
+- **Field 11 is retired on the format floor, as its own change.** Once the
+  recorded floor for every bucket says field 13 is understood (ADR-0066
+  decision 3's mechanism), a separate reviewed change stops publishing field
+  11; the old objects then become unreferenced and supersession GCs them
+  under the existing `sweep_unreferenced_catalog_objects` lifecycle -- no new
+  sweep rule. Deleting the old field is a decision that cites the floors,
+  never a side effect of shipping the new one.
+- Dual-read spans the same window. A reader that understands v2 prefers field
+  13 and falls back to field 11's ADR-0850 L0-tuple join when field 13 is
+  absent (L0 coverage, L1 falls back to scan, unchanged). An older reader
+  that predates field 13 ignores it and reads field 11 exactly as today,
+  which is only true because of the dual-publish rule above.
 - **Reader rule for an old-keyed (v1, field-11) `.cstat`:** read it under the
   ADR-0850 L0 five-field join and gain L0 coverage only; treat the absence of
   a matching part-bound record for any segment as fall-back-to-scan, never as
@@ -174,8 +199,9 @@ quiescent tenant**, and the reason is structural, not incidental:
 
 - Column statistics are rebuilt only inside `Catalog::fold` (`fold.rs:780`),
   incrementally: the build reuses the prior `.cstat` baseline for any entry
-  whose identity already appears in it (`fold.rs:1515`, `baseline.get(&identity)`
-  then `push(existing.clone()); continue`) and only decodes entries absent
+  whose identity already appears in it (`fold.rs:1515`,
+  `baseline.get(&identity)` then `push(existing.clone()); continue`) and
+  only decodes entries absent
   from the baseline.
 - The incremental fold lists only hours strictly after the previous
   watermark plus a bounded reconcile window (`fold_reconcile_window_hours`,
@@ -183,12 +209,14 @@ quiescent tenant**, and the reason is structural, not incidental:
   fully-compacted idle tenant ingests nothing, so its incremental range is
   empty and its sealed hours sit outside the reconcile window. Sealed parts
   are carried forward by reference and never re-listed.
-- No in-tree command forces a stats-only rebuild. Verified: `ravel-cli
-  maintain` (`services/ravel-cli/src/maintain.rs`) exposes compaction and
-  audit operations but no stats rebuild; the only full-rebuild lever is
-  `ravel-cli commit reconstruct` (ADR-0058,
-  `services/ravel-cli/src/reconstruct.rs`), which rebuilds the whole snapshot
-  from commit records.
+- **No in-tree command forces a stats rebuild, and none can be borrowed.**
+  `ravel-cli maintain` (`services/ravel-cli/src/maintain.rs`) exposes
+  compaction and audit operations but no stats rebuild. `ravel-cli commit
+  reconstruct` (ADR-0058, `services/ravel-cli/src/reconstruct.rs`) is not a
+  substitute either: it writes missing commit records and never calls
+  `Catalog::fold` or touches `.cstat` at all (the only occurrence of "fold"
+  in that file is the word in a doc comment about error handling). An earlier
+  draft of this ADR cited it as an existing backfill lever. That was wrong.
 
 So an idle, already-compacted tenant folds nothing, rebuilds nothing, and
 gains no part-bound coverage from the re-key alone. The reference corpus is
@@ -213,12 +241,12 @@ None" rule), which is necessary but not sufficient on its own -- the pass
 must additionally re-list the sealed hours, which the full-rebuild path does
 and an incremental fold does not.
 
-Until that dedicated command exists, `ravel-cli commit reconstruct`
-(ADR-0058) already forces a full HEAD rebuild that re-derives `.cstat` from
-scratch under the current keying, so the backfill is achievable on an
-existing lever; the new command is the scoped, operator-facing form. Naming
-the trigger is mandatory here, not deferrable: without it the re-key is
-correct but inert on precisely the corpus it is measured against.
+**That command does not exist yet, and nothing in the tree substitutes for
+it.** This is a build obligation of the decision, not a follow-up that can
+slip: the re-key is correct and completely inert without it on precisely the
+corpus it is measured against. A plan that lands the re-key alone and reports
+progress would be reporting a change that moves no byte on any existing
+tenant.
 
 ## Rejected alternatives
 
@@ -262,8 +290,10 @@ correct but inert on precisely the corpus it is measured against.
   ceiling, its `.cstat` envelope framing and magic (`RCST`), the
   `MetadataOnlyAggregate` rule, and the entire safety lemma. Every failure
   mode still degrades to scanning; this ADR adds no way to answer
-  incorrectly. Field 11's meaning is untouched, so an unupgraded reader is
-  unaffected.
+  incorrectly. Field 11's meaning is untouched, and the dual-publish rule
+  above keeps it populated, so an unupgraded reader is unaffected. Those two
+  facts are one claim, not two: field 11 keeping its meaning is worth nothing
+  to an old reader if the fold stops writing it.
 - **The re-key alone moves no measured figure.** On a quiescent,
   already-compacted tenant -- which the reference corpus is -- no fold runs,
   so no part-bound `.cstat` is produced and coverage stays at the L0-keyed
