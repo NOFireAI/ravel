@@ -388,5 +388,52 @@ mod tests {
                 "bucket contents, body: {json}"
             );
         }
+
+        // Endpoint-level reachability of the per-phase cost split (issue #935):
+        // the same real query through the production router carries a
+        // `stats.phaseAccounting` array with exactly the four phases, in order,
+        // each once. A json.rs unit test proves the encoder; this proves a
+        // caller of `/api/v1/query_range` actually sees it.
+        let phase_acc = json["data"]["stats"]["phaseAccounting"]
+            .as_array()
+            .expect("phaseAccounting array present in the endpoint response");
+        let phase_names: Vec<&str> = phase_acc
+            .iter()
+            .map(|p| p["phase"].as_str().expect("phase name string"))
+            .collect();
+        assert_eq!(
+            phase_names,
+            vec!["resolve", "plan", "probe", "scan"],
+            "four phases, in order, each exactly once, body: {json}"
+        );
+        // This query resolves a snapshot and scans one published segment, so the
+        // resolve phase must have issued at least one catalog request and the
+        // scan phase at least one GET; a pooled-only rendering could not show
+        // this attribution. The exact per-phase figures depend on the generated
+        // object's geometry, so they are pinned in the json.rs unit test on a
+        // hand-built snapshot rather than here.
+        let by_name = |want: &str| {
+            phase_acc
+                .iter()
+                .find(|p| p["phase"] == want)
+                .unwrap_or_else(|| panic!("phase {want} present, body: {json}"))
+        };
+        let resolve_requests = by_name("resolve")["s3GetRequests"]
+            .as_u64()
+            .expect("resolve get requests")
+            + by_name("resolve")["s3ListRequests"]
+                .as_u64()
+                .expect("resolve list requests");
+        assert!(
+            resolve_requests >= 1,
+            "resolve phase issued catalog requests, body: {json}"
+        );
+        assert!(
+            by_name("scan")["s3GetRequests"]
+                .as_u64()
+                .expect("scan get requests")
+                >= 1,
+            "scan phase issued at least one data GET, body: {json}"
+        );
     }
 }

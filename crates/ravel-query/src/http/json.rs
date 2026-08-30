@@ -8,6 +8,7 @@ use ravel_types::{LabelSet, SeriesId};
 use serde::{Serialize, Serializer};
 
 use crate::http::error::ApiError;
+use crate::phase_accounting::{PhaseAccountingSnapshot, QueryPhase};
 
 #[derive(Serialize)]
 #[serde(tag = "status")]
@@ -98,6 +99,16 @@ pub struct QueryStatsJson {
     #[serde(rename = "segmentsPruned")]
     pub segments_pruned: u64,
     pub accounting: QueryAccountingJson,
+    /// The pooled `accounting` figures above, split across the four query
+    /// phases (issue #935, ADR-0044 decision 1): resolve, plan, probe, scan.
+    /// Exactly one entry per phase, in `QueryPhase::ALL` order. Additive to
+    /// `accounting`: every counter here also lands in the pooled total, so a
+    /// reader that only knows `accounting` is unaffected. Answers "which phase
+    /// issued these GETs and moved these bytes", which the pooled counter
+    /// cannot (issue #835: one statement issued 18,937 GETs against a
+    /// 3,469-object tenant and the pool could not say which phase).
+    #[serde(rename = "phaseAccounting")]
+    pub phase_accounting: Vec<PhaseAccountingJson>,
     pub estimate: CostEstimateJson,
     /// True when at least one federated remote cluster was skipped because it
     /// was unavailable and its `skip_unavailable` opt-in was set
@@ -121,6 +132,7 @@ impl From<crate::QueryStats> for QueryStatsJson {
             segments_fetched: stats.segments_fetched,
             segments_pruned: stats.segments_pruned,
             accounting: QueryAccountingJson::from_snapshot(&stats.accounting, &stats.page_stats),
+            phase_accounting: phase_accounting_json(&stats.phase_accounting),
             estimate: stats.estimate.into(),
             partial: stats.partial,
             warnings: stats.warnings.clone(),
@@ -200,6 +212,76 @@ impl QueryAccountingJson {
             raw_f64_bytes: page_stats.raw_f64_bytes,
         }
     }
+}
+
+/// One [`QueryPhase`]'s share of a query's object-store cost (issue #935),
+/// rendered as one element of `stats.phaseAccounting`. Field names are ravel's
+/// own; Prometheus has no standard shape for this.
+///
+/// Only counters that are live on a PromQL query are rendered. `AccountedOp::Head`
+/// and `AccountedOp::List` bytes are never recorded on this path (a resolve
+/// LIST is counted as a request but transfers no accounted bytes), and
+/// `peak_intermediate_bytes`/`segments_pruned` are SQL-only or unpopulated
+/// here, so none appears as a per-phase field: a rendered figure that no source
+/// can fill is worse than an absent one.
+///
+/// The three byte figures count three DIFFERENT quantities and cannot be
+/// compared or summed across kinds; each field doc names which bytes it holds.
+#[derive(Debug, Serialize)]
+pub struct PhaseAccountingJson {
+    /// The phase, as [`QueryPhase::name`] spells it: `resolve`, `plan`,
+    /// `probe`, or `scan`.
+    pub phase: &'static str,
+    /// GET requests this phase issued to object storage.
+    #[serde(rename = "s3GetRequests")]
+    pub s3_get_requests: u64,
+    /// LIST requests this phase issued to object storage (the resolve phase's
+    /// catalog prefix listings; zero on the other three phases).
+    #[serde(rename = "s3ListRequests")]
+    pub s3_list_requests: u64,
+    /// WIRE bytes this phase's GETs transferred: bytes as moved over the wire,
+    /// a coalesced run's unwanted in-between bytes and any retry included. NOT
+    /// bytes charged to a cache, NOT decompressed bytes, NOT stored object
+    /// size. GET-only: LIST and HEAD transfer no accounted bytes on this path.
+    #[serde(rename = "s3GetWireBytes")]
+    pub s3_get_wire_bytes: u64,
+    /// Bytes served from the in-process caches (`ravel-catalog`'s), which never
+    /// crossed the wire this query. A different quantity from
+    /// [`Self::s3_get_wire_bytes`]; the two are not summable.
+    #[serde(rename = "cacheBytes")]
+    pub cache_bytes: u64,
+    /// Decompressed bytes: the typed-output footprint of the samples this phase
+    /// decoded, any encoding. Not a wire figure and not comparable to one; a
+    /// decode moves no bytes over the wire.
+    #[serde(rename = "decompressedBytes")]
+    pub decompressed_bytes: u64,
+    /// Bytes served from the fetcher's already-fetched regions without a second
+    /// GET (ADR-0044 `bytes_reused`). Bytes NOT transferred; the complement of
+    /// [`Self::s3_get_wire_bytes`], not an addend to it.
+    #[serde(rename = "bytesReused")]
+    pub bytes_reused: u64,
+}
+
+/// One [`PhaseAccountingJson`] per [`QueryPhase`], in [`QueryPhase::ALL`] order,
+/// each phase exactly once. Driven off `ALL` rather than a hand-written list so
+/// a phase added to `ALL` cannot be silently dropped from the response (issue
+/// #935; same construction and same reason as ravel-bench's `phase_wire_bytes`).
+fn phase_accounting_json(phases: &PhaseAccountingSnapshot) -> Vec<PhaseAccountingJson> {
+    QueryPhase::ALL
+        .iter()
+        .map(|phase| {
+            let snap = phases.phase(*phase);
+            PhaseAccountingJson {
+                phase: phase.name(),
+                s3_get_requests: snap.s3_requests(AccountedOp::Get),
+                s3_list_requests: snap.s3_requests(AccountedOp::List),
+                s3_get_wire_bytes: snap.s3_bytes(AccountedOp::Get),
+                cache_bytes: snap.cache_bytes,
+                decompressed_bytes: snap.decompressed_bytes,
+                bytes_reused: snap.bytes_reused,
+            }
+        })
+        .collect()
 }
 
 /// Upper-envelope cost estimate (ADR-0044 decision 3), rendered under
@@ -809,6 +891,132 @@ mod tests {
             value.get("warnings").is_none(),
             "empty warnings array omitted"
         );
+    }
+
+    /// Builds a `QueryStats` whose `phase_accounting` carries a distinct,
+    /// known set of counters per phase, so a rendered figure can be pinned to
+    /// an exact value and mis-attribution across phases is visible.
+    fn stats_with_known_phase_accounting() -> crate::QueryStats {
+        use crate::phase_accounting::PhaseAccounting;
+
+        let pa = PhaseAccounting::new();
+
+        // resolve: catalog listing + record GETs.
+        pa.resolve().record_s3_request(AccountedOp::List);
+        pa.resolve().record_s3_request(AccountedOp::List);
+        pa.resolve().record_s3_request(AccountedOp::List);
+        pa.resolve().record_s3_request(AccountedOp::Get);
+        pa.resolve().add_s3_bytes(AccountedOp::Get, 700);
+        pa.resolve().add_cache_bytes(11);
+
+        // plan: footer/skip-index probing.
+        pa.plan().record_s3_request(AccountedOp::Get);
+        pa.plan().record_s3_request(AccountedOp::Get);
+        pa.plan().add_s3_bytes(AccountedOp::Get, 1_200);
+
+        // probe: segment catalog fetch, with some region reuse.
+        pa.probe().record_s3_request(AccountedOp::Get);
+        pa.probe().record_s3_request(AccountedOp::Get);
+        pa.probe().record_s3_request(AccountedOp::Get);
+        pa.probe().record_s3_request(AccountedOp::Get);
+        pa.probe().add_s3_bytes(AccountedOp::Get, 8_000);
+        pa.probe().add_bytes_reused(64);
+
+        // scan: block/page data reads, with decode.
+        for _ in 0..9 {
+            pa.scan().record_s3_request(AccountedOp::Get);
+        }
+        pa.scan().add_s3_bytes(AccountedOp::Get, 30_000);
+        pa.scan().add_decompressed_bytes(4_096);
+
+        crate::QueryStats {
+            phase_accounting: pa.snapshot(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn phase_accounting_renders_all_four_phases_exactly_once() {
+        // ACCEPTANCE TEST (issue #935): the four query phases each render
+        // exactly once, under their exact names, with their exact counters.
+        //
+        // Flip-line proof: demonstrated failing against the pre-change code by
+        // removing the `phase_accounting` field from `QueryStatsJson` and its
+        // `From` population (the `phaseAccounting` key is absent, so the first
+        // assertion's array lookup panics). Also fails if `phase_accounting_json`
+        // is rewritten to a hand-written phase list that repeats or drops one:
+        // the exact-name/exact-count assertions below catch it.
+        let json = QueryStatsJson::from(stats_with_known_phase_accounting());
+        let value = serde_json::to_value(&json).expect("serializes");
+
+        let phases = value["phaseAccounting"]
+            .as_array()
+            .expect("phaseAccounting is an array");
+        let names: Vec<&str> = phases
+            .iter()
+            .map(|p| p["phase"].as_str().expect("phase name is a string"))
+            .collect();
+        // Exact names, in QueryPhase::ALL order, each exactly once.
+        assert_eq!(
+            names,
+            vec!["resolve", "plan", "probe", "scan"],
+            "the four phase names, in order, each exactly once"
+        );
+        assert_eq!(names.len(), 4, "exactly four entries");
+        let unique: std::collections::HashSet<&str> = names.iter().copied().collect();
+        assert_eq!(unique.len(), 4, "no phase repeated");
+
+        // Every figure pinned to its exact expected value, per phase. A GET
+        // charged to the wrong phase moves one of these off its literal.
+        let by_name = |want: &str| {
+            phases
+                .iter()
+                .find(|p| p["phase"] == want)
+                .unwrap_or_else(|| panic!("phase {want} present"))
+        };
+
+        let resolve = by_name("resolve");
+        assert_eq!(resolve["s3GetRequests"], 1);
+        assert_eq!(resolve["s3ListRequests"], 3);
+        assert_eq!(resolve["s3GetWireBytes"], 700);
+        assert_eq!(resolve["cacheBytes"], 11);
+        assert_eq!(resolve["decompressedBytes"], 0);
+        assert_eq!(resolve["bytesReused"], 0);
+
+        let plan = by_name("plan");
+        assert_eq!(plan["s3GetRequests"], 2);
+        assert_eq!(plan["s3ListRequests"], 0);
+        assert_eq!(plan["s3GetWireBytes"], 1_200);
+        assert_eq!(plan["cacheBytes"], 0);
+
+        let probe = by_name("probe");
+        assert_eq!(probe["s3GetRequests"], 4);
+        assert_eq!(probe["s3GetWireBytes"], 8_000);
+        assert_eq!(probe["bytesReused"], 64);
+        assert_eq!(probe["decompressedBytes"], 0);
+
+        let scan = by_name("scan");
+        assert_eq!(scan["s3GetRequests"], 9);
+        assert_eq!(scan["s3ListRequests"], 0);
+        assert_eq!(scan["s3GetWireBytes"], 30_000);
+        assert_eq!(scan["decompressedBytes"], 4_096);
+        assert_eq!(scan["bytesReused"], 0);
+    }
+
+    #[test]
+    fn phase_accounting_entry_count_tracks_query_phase_all() {
+        // A phase added to `QueryPhase::ALL` cannot be silently dropped from the
+        // response: the rendered entry count is exactly `ALL`'s length, because
+        // `phase_accounting_json` is driven off `ALL` (never a hand-written
+        // list). Adding a `QueryPhase` variant lengthens `ALL`, this literal
+        // count, and the response together, or fails to compile.
+        let json = QueryStatsJson::from(crate::QueryStats::default());
+        assert_eq!(
+            json.phase_accounting.len(),
+            QueryPhase::ALL.len(),
+            "one rendered entry per QueryPhase::ALL member"
+        );
+        assert_eq!(QueryPhase::ALL.len(), 4);
     }
 
     #[test]
