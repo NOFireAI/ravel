@@ -308,14 +308,23 @@ drops the reason drops the requirement.
      startup sweep delete only files no live process owns. The safe default
      is exclusive ownership of a scratch directory: each process spills under
      a subdirectory keyed to its own instance identity, and the sweep removes
-     only subdirectories whose owning process is provably gone (for example
-     via an OS-level advisory lock or pid-liveness check on the owner marker),
-     never the shared root wholesale. A process that cannot establish
+     only subdirectories whose owning process is provably gone, never the
+     shared root wholesale.
+
+     **A pid-liveness check is not ownership proof and must not be used as
+     one.** A PID is reusable, so a live PID can belong to an unrelated
+     process while the original owner is gone, and a PID that looks dead can
+     be recycled between the check and the delete. Both directions produce the
+     data-destroying outcome this requirement exists to prevent. Ownership
+     must rest on an OS-level advisory lock held for the owner's lifetime, or
+     on a non-reusable process-instance token, checked atomically with the
+     removal. A process that cannot establish
      exclusive ownership of its scratch path, or prove a candidate orphan's
      owner is dead, must not sweep -- it treats the volume as read-shared and
      leaves foreign files alone. The exact ownership mechanism (per-process
-     subdirectory plus liveness proof, or one spilling process per volume as
-     requirement 2's reclaim note assumes) is an implementation open question;
+     subdirectory plus an advisory lock or instance token, or one spilling
+     process per volume as requirement 2's reclaim note assumes) is an
+     implementation open question;
      the invariant fixed here is that no sweep ever deletes a file a live
      process owns.
 
