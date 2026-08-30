@@ -82,10 +82,11 @@ pub struct QueryStats {
     /// probing), probe (segment catalog fetch), scan (block/page reads).
     /// See `crate::phase_accounting` for phase boundaries and what each
     /// byte counter counts. Federation and distributed-worker fan-out
-    /// (`federate_scalar`, `federate_discovery`, `distrib::fetch`) are
-    /// opaque remote fetches whose own internal phase breakdown is not
-    /// visible here; their GETs land on the `scan` phase by convention
-    /// (see the call sites in `prefetch`/`resolve_series_for_labels`).
+    /// (`federate_scalar`, `federate_discovery`, `distrib::fetch`) report
+    /// their own per-phase split on the wire (issue #959,
+    /// `pb::Summary.phase_accounting`), and the coordinator merges each
+    /// remote phase into this snapshot's same-named phase, so a fanned-out
+    /// query's split has the same shape a fully local one's does.
     pub phase_accounting: PhaseAccountingSnapshot,
     /// Upper-envelope cost estimate computed after snapshot resolution and
     /// before any page fetch (ADR-0044 decision 3).

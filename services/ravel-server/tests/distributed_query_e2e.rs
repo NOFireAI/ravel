@@ -73,6 +73,26 @@ const NS_PER_HOUR: i64 = 60 * NS_PER_MIN;
 /// phase added to the enum changes this constant without an edit here.
 const PHASE_COUNT: usize = QueryPhase::ALL.len();
 
+/// The `QueryPhase` names `stats.phases` renders, in `QueryPhase::ALL` order.
+const QUERY_PHASES: [&str; PHASE_COUNT] = ["resolve", "plan", "probe", "scan"];
+
+/// How far a distributed query's per-phase wire-byte figure may differ from the
+/// same query's local figure, per phase, in bytes (issue #959).
+///
+/// Zero, and it has to be zero. A worker executes the same `SegmentFetcher`
+/// funnels the coordinator would have executed locally, over the same pinned
+/// segments, from the same cold store; distribution moves WHERE a byte is
+/// fetched, never how many bytes are fetched or which phase issues the request
+/// that fetches them. So there is no source of legitimate drift for a slack
+/// band to absorb, and any non-zero band would admit exactly the degenerate
+/// attribution this test exists to reject: on the single-segment query below
+/// the whole difference between a correct split and a pooled-into-`scan` one is
+/// one object's worth of bytes moving between two phases, which a tolerance
+/// sized to "a few hundred bytes" would wave through. If a future coordinator-
+/// only cost does make the two legitimately differ, the right change is to name
+/// that cost and subtract it, not to widen this.
+const PHASE_SPLIT_TOLERANCE_WIRE_BYTES: u64 = 0;
+
 fn now_ns() -> i64 {
     i64::try_from(
         SystemTime::now()
@@ -515,6 +535,25 @@ async fn distributed_phase_split_equals_local_and_charges_the_segment_read_to_pl
          distributed={distributed_body}\n  local={local_body}"
     );
 
+    // The stated tolerance, applied per phase. Redundant with the whole-map
+    // equality above on purpose: it is the figure a future change would be
+    // tempted to widen, so it is named and justified rather than implied.
+    //
+    // `absurd_extreme_comparisons` fires here because the tolerance is zero and
+    // a `<=` band around zero is a `==`. That is the point, and the band form is
+    // what a future widening would edit, so the lint is allowed rather than the
+    // comparison rewritten into one that stops being a band.
+    #[allow(clippy::absurd_extreme_comparisons)]
+    for phase in QUERY_PHASES {
+        let d = phase_counter(&dist, phase, "s3GetWireBytes");
+        let l = phase_counter(&local_phases, phase, "s3GetWireBytes");
+        assert!(
+            d.abs_diff(l) <= PHASE_SPLIT_TOLERANCE_WIRE_BYTES,
+            "phase `{phase}` wire bytes differ by more than \
+             {PHASE_SPLIT_TOLERANCE_WIRE_BYTES}: distributed {d}, local {l}"
+        );
+    }
+
     // Non-degeneracy, at exact values. The whole segment crosses the wire once,
     // in the plan phase's footer/skip-index open; probe and scan then serve
     // themselves from that already-fetched region and issue no GET of their
@@ -558,7 +597,7 @@ async fn distributed_phase_split_equals_local_and_charges_the_segment_read_to_pl
     let pooled_get_bytes = distributed_body["data"]["stats"]["accounting"]["s3GetBytes"]
         .as_u64()
         .expect("stats.accounting.s3GetBytes is a u64");
-    let split_get_bytes: u64 = ["resolve", "plan", "probe", "scan"]
+    let split_get_bytes: u64 = QUERY_PHASES
         .iter()
         .map(|phase| phase_counter(&dist, phase, "s3GetWireBytes"))
         .sum();
@@ -576,7 +615,7 @@ async fn distributed_phase_split_equals_local_and_charges_the_segment_read_to_pl
     let pooled_get_requests = distributed_body["data"]["stats"]["accounting"]["s3GetRequests"]
         .as_u64()
         .expect("stats.accounting.s3GetRequests is a u64");
-    let split_get_requests: u64 = ["resolve", "plan", "probe", "scan"]
+    let split_get_requests: u64 = QUERY_PHASES
         .iter()
         .map(|phase| phase_counter(&dist, phase, "s3GetRequests"))
         .sum();

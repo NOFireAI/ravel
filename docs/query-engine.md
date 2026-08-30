@@ -1189,16 +1189,9 @@ seeing the same number, unchanged. `QueryStats` additionally carries the
 full `phase_accounting: PhaseAccountingSnapshot` for callers that want
 the split.
 
-Two entry points issue GETs the phase split cannot yet attribute without
+One entry point issues GETs the phase split cannot yet attribute without
 a change outside this crate's issue #796 scope:
 
-- Federation and distributed fan-out (`federate_discovery`,
-  `federate_scalar`, `distrib::client`'s `SliceFetcher`) cross a wire
-  boundary as one pooled `QueryAccountingSnapshot`
-  (`SliceResponse.accounting`) that predates #796; a worker's per-slice
-  spend is charged to `scan` on the coordinator side rather than left
-  unaccounted. Splitting it for real would need a wire-format version
-  bump to the coordinator/worker protobuf.
 - `LogSegmentFetcher`'s three streaming entry points that return a live
   `LogSegmentScan` (`scan_accounted_with_tenant`,
   `scan_whole_accounted_with_tenant`, `scan_accounted_with_tenant_subset`)
@@ -1215,6 +1208,51 @@ a change outside this crate's issue #796 scope:
 (`SqlOutcome.accounting`) entirely inside that crate, so the phase split
 does not yet reach `ravel-bench`'s `sql_latency_bench` report: doing so
 needs a `ravel-sql` change outside this crate's scope for issue #796.
+
+#### Across the fan-out boundary (issue #959)
+
+Federation and distributed fan-out used to be a third such entry point.
+A worker returned one pooled `QueryAccountingSnapshot`, so the
+coordinator charged a slice's whole spend to `scan` while the same query
+run locally split those reads across `plan`, `probe`, and `scan`. The
+result was not wrong but degenerate: near-everything landed in `scan`,
+and `resolve`/`plan`/`probe` reported only the coordinator's own work.
+
+The worker's terminal `Summary` now carries `phase_accounting`
+(`proto/ravel/queryfrag.proto`), one `QueryAccountingSnapshot` per
+`QueryPhase` in `QueryPhase::ALL` order, and the coordinator merges each
+entry into its own same-named phase (`PhaseAccounting::merge_snapshot`).
+Nothing about what is measured or where changed: the worker runs the same
+ADR-0044 funnels the local read path runs, so its `plan`/`probe`/`scan`
+attribution is already the one the coordinator wants. The frozen
+`Summary.accounting` field (1) stays the `pooled()` value of the split,
+derived from the same snapshot on the worker so the two cannot drift.
+
+The decoder requires exactly `QueryPhase::ALL.len()` entries and rejects
+any other count as a typed `CodecError::PhaseAccountingArity`, so a phase
+added to the enum cannot cross the wire silently: encoder and decoder are
+both driven off `ALL`. The queryfrag `PROTOCOL_VERSION` moved 4 to 5 for
+this, so a version-skewed worker degrades to coordinator-local execution
+(which produces a correct non-degenerate split) rather than to a silently
+degenerate one.
+
+`services/ravel-server/tests/distributed_query_e2e.rs` asserts a
+distributed query's `data` payload, `stats.phases` included, is
+byte-identical to the same query's local payload;
+`distributed_phase_split_equals_local_and_charges_the_segment_read_to_plan`
+pins the exact per-phase figures. `distributed_merge_equals_local_bitwise`
+(`crates/ravel-query/src/distrib/tests.rs`) compares
+`PhaseAccountingSnapshot`s over the whole proptest corpus.
+
+One fan-out cost still belongs to no phase, and it is a measurement gap
+rather than an attribution choice. The worker-side `build_resolver`
+(`services/ravel-server/src/distrib.rs`) calls `Catalog::resolve` without
+an accounting handle to build the interim content-hash resolver, so the
+LISTs and commit-record GETs that resolve issues are recorded nowhere.
+Threading a handle into it would be a genuine `resolve`-phase cost the
+local path never pays a second time, so it would also make a distributed
+split legitimately exceed a local one; that is a decision for the ticket
+that closes the gap, not a silent addition here.
 
 ### Pre-execution cost estimate
 
@@ -1407,6 +1445,12 @@ cost fields alongside the existing `segmentsFetched`/`segmentsPruned`:
   `s3GetRequests`, `s3GetWireBytes`, `s3ListRequests`, `cacheHits`,
   `cacheMisses`, `cacheServedBytes`, `decompressedOutputBytes`,
   `reusedRegionBytes`, `segmentsOpened`, `seriesMatched`.
+
+  A distributed or federated query renders the same split a fully local
+  one does: a worker ships its own per-phase totals and the coordinator
+  merges them phase for phase (issue #959, "Across the fan-out boundary"
+  above), so the two are equal figure for figure for the same query and
+  tenant.
 
   Additive to `stats.accounting`, which is unchanged: every per-phase
   counter sums back to its pooled counterpart there. Each byte field

@@ -734,6 +734,12 @@ impl Distributed {
 /// running snapshot (the basis for the incremental bytes-scanned check), and
 /// sums its `FetchStats` page counters. Both accounting folds saturate, so a
 /// worker reporting a counter near `u64::MAX` clamps rather than wrapping.
+///
+/// The accounting fold is PHASE FOR PHASE (issue #959): the worker's `plan`
+/// bytes become the query's `plan` bytes. Folding the pooled figure into one
+/// phase instead is what made a distributed split degenerate, with
+/// near-everything landing on `scan`. The running snapshot stays pooled: it
+/// exists only for the bytes-scanned budget, which is a total, not a split.
 fn fold_slice(
     live: &PhaseAccounting,
     running: &mut QueryAccountingSnapshot,
