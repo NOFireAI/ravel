@@ -12,12 +12,16 @@
 //! meaningful notion of "partially built", while column statistics are
 //! naturally per-segment and independently useful.
 //!
-//! Only L0 entries carry real writer identity (`fold.rs`'s
-//! `build_l1_snapshot_entry`: an L1 entry's writer_id/writer_epoch slots are
-//! repurposed for input_set_hash/part_index), so column-stats coverage is
-//! restricted to `entry.level == 0`. An L1 segment simply has no
-//! `ColumnStatsSegment` entry and its queries fall back to scanning, exactly
-//! like any other segment lacking stats.
+//! ADR-0942 extends coverage to L1: [`fetch_segment_column_stats`] builds a
+//! tally for an L0 or an L1 entry, reconstructing the L1 part key from the
+//! writer_id/writer_epoch slots an L1 entry repurposes for
+//! input_set_hash/part_index (`fold.rs`'s `build_l1_snapshot_entry`). The
+//! returned [`ColumnStatsSegment`] carries the five-field identity tuple as the
+//! builder saw it (`writer_id` is the entry's own writer_id). The fold's frozen
+//! v1 (field-11) publish path uses it unchanged, so a v1 object stays
+//! byte-for-byte as before; the v2 (field-13, part-keyed) publish path
+//! overwrites `writer_id` with the covered part's content hash (the v2 join
+//! key) before encoding.
 
 use ravel_logseg::{ColumnSelection, FieldType, LogSegError, Predicate, RlogConfig, RlogReader};
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
@@ -41,8 +45,12 @@ pub(crate) enum ColumnStatsBuildError {
     LogSeg(#[from] LogSegError),
     #[error("entry content_hash must be 32 bytes, got {0}")]
     BadContentHashLen(usize),
-    #[error("entry writer_id must be 16 bytes, got {0}")]
+    #[error("L0 entry writer_id must be 16 bytes, got {0}")]
     BadWriterIdLen(usize),
+    #[error("L1 entry writer_id (input_set_hash) must be 32 bytes, got {0}")]
+    BadInputSetHashLen(usize),
+    #[error("L1 entry writer_epoch (part_index) does not fit u32: {0}")]
+    BadPartIndex(u64),
     #[error("column {name:?} declared Str but stored bytes are not valid UTF-8")]
     NonUtf8StrValue { name: String },
 }
@@ -348,11 +356,11 @@ impl ColumnTally {
     }
 }
 
-/// Fetches one L0 logs segment and tallies exact per-column statistics for
-/// every column in `typed_columns`, over every row in the object (no content
-/// filter: `Predicate::And(vec![])` is vacuously true, matching the
-/// full-object scan `LogsScanExec`'s metadata-only path already relies on
-/// for `COUNT(*)`).
+/// Fetches one logs segment (L0 or L1, ADR-0942) and tallies exact per-column
+/// statistics for every column in `typed_columns`, over every row in the
+/// object (no content filter: `Predicate::And(vec![])` is vacuously true,
+/// matching the full-object scan `LogsScanExec`'s metadata-only path already
+/// relies on for `COUNT(*)`).
 ///
 /// A configured column absent from this object's `FIELD_DIR` -- because no
 /// row ever set it, or because it overflowed into `attrs_raw` (the overflow
@@ -369,28 +377,55 @@ pub(crate) async fn fetch_segment_column_stats(
     entry: &ravel_proto::catalog::v1::SnapshotEntry,
     typed_columns: &[DeclaredTypedColumn],
 ) -> Result<ColumnStatsSegment, ColumnStatsBuildError> {
-    debug_assert_eq!(entry.level, 0, "column stats are only built for L0 entries");
-
     let content_hash: [u8; 32] = entry
         .content_hash
         .as_slice()
         .try_into()
         .map_err(|_| ColumnStatsBuildError::BadContentHashLen(entry.content_hash.len()))?;
-    let writer_id_bytes: [u8; 16] = entry
-        .writer_id
-        .as_slice()
-        .try_into()
-        .map_err(|_| ColumnStatsBuildError::BadWriterIdLen(entry.writer_id.len()))?;
-    let writer_id = Uuid::from_bytes(writer_id_bytes);
-    let data_key = ravel_commit::keys::data_key(
-        tenant,
-        signal,
-        entry.shard,
-        writer_id,
-        entry.writer_epoch,
-        entry.writer_seq,
-        &content_hash,
-    )?;
+    // ADR-0942: both L0 and L1 entries are covered. An L0 entry carries the
+    // 16-byte flush writer uuid and addresses its RLOG object by the L0 data
+    // key; an L1 (compaction/rewrite output) entry repurposes the writer_*
+    // slots (`fold::build_l1_snapshot_entry`) to carry the 32-byte
+    // input_set_hash and the part_index, and addresses its RLOG part object by
+    // the reconstructed L1 part key. Both object shapes are RLOG and decode
+    // through the same reader below, so the tally path that follows is
+    // level-agnostic.
+    let data_key = if entry.level == 0 {
+        let writer_id_bytes: [u8; 16] = entry
+            .writer_id
+            .as_slice()
+            .try_into()
+            .map_err(|_| ColumnStatsBuildError::BadWriterIdLen(entry.writer_id.len()))?;
+        let writer_id = Uuid::from_bytes(writer_id_bytes);
+        ravel_commit::keys::data_key(
+            tenant,
+            signal,
+            entry.shard,
+            writer_id,
+            entry.writer_epoch,
+            entry.writer_seq,
+            &content_hash,
+        )?
+    } else {
+        let input_set_hash: [u8; 32] = entry
+            .writer_id
+            .as_slice()
+            .try_into()
+            .map_err(|_| ColumnStatsBuildError::BadInputSetHashLen(entry.writer_id.len()))?;
+        let part_index = u32::try_from(entry.writer_epoch)
+            .map_err(|_| ColumnStatsBuildError::BadPartIndex(entry.writer_epoch))?;
+        let input_set_hash16 = hex::encode(&input_set_hash[..8]);
+        let hash16 = hex::encode(&content_hash[..8]);
+        ravel_commit::keys::l1_part_key(
+            tenant,
+            signal,
+            entry.shard,
+            entry.ingest_hour_bucket,
+            &input_set_hash16,
+            part_index,
+            &hash16,
+        )?
+    };
     let got = store.get(&data_key, GetRange::Full).await?;
 
     let cfg = RlogConfig::default();
@@ -527,6 +562,73 @@ mod tests {
 
     fn i64_attr(key: &str, v: i64) -> (String, AttrValue) {
         (key.to_string(), AttrValue::I64(v))
+    }
+
+    /// Write `records` as a real L1 RLOG part object at its reconstructed L1
+    /// part key (`keys::l1_part_key`), and return the matching L1
+    /// [`SnapshotEntry`] in exactly the shape `fold::build_l1_snapshot_entry`
+    /// produces: `writer_id` holds the 32-byte `input_set_hash`, `writer_epoch`
+    /// holds the `part_index`. An L1 compaction output carries nil writer
+    /// identity in its own footer.
+    async fn write_l1(
+        store: &dyn ObjectStoreBackend,
+        ingest_hour_bucket: u32,
+        input_set_hash: [u8; 32],
+        part_index: u32,
+        records: &[LogRecord],
+    ) -> SnapshotEntry {
+        let cfg = RlogConfig {
+            block_target_records: 3,
+            ..RlogConfig::default()
+        };
+        let mut w = RlogWriter::new(
+            cfg,
+            ObjectIdentity {
+                tenant_hash: TENANT.0,
+                shard: 0,
+                writer_id: *Uuid::nil().as_bytes(),
+                writer_epoch: 0,
+                writer_seq: 0,
+            },
+        );
+        for r in records {
+            w.push(r.clone()).expect("push");
+        }
+        let bytes = w.finish().expect("finish");
+        let content_hash = *blake3::hash(&bytes).as_bytes();
+        let input_set_hash16 = hex::encode(&input_set_hash[..8]);
+        let hash16 = hex::encode(&content_hash[..8]);
+        let key = ravel_commit::keys::l1_part_key(
+            &TENANT,
+            Signal::Logs,
+            0,
+            ingest_hour_bucket,
+            &input_set_hash16,
+            part_index,
+            &hash16,
+        )
+        .expect("l1 part key");
+        store
+            .put(&key, bytes::Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("put");
+
+        SnapshotEntry {
+            level: 1,
+            shard: 0,
+            ingest_hour_bucket,
+            writer_id: input_set_hash.to_vec(),
+            writer_epoch: u64::from(part_index),
+            writer_seq: 0,
+            content_hash: content_hash.to_vec(),
+            object_size: 0,
+            min_event_ts_ns: 0,
+            max_event_ts_ns: 0,
+            sample_count: records.len() as u64,
+            series_count: 0,
+            segment_format_version: 2,
+            created_unix_ns: 0,
+        }
     }
 
     /// Write `records` as a real L0 RLOG object onto `store` at its true
@@ -672,5 +774,100 @@ mod tests {
         assert_eq!(flag.declared_type, 3, "Bool stats tag");
         assert_eq!(flag.non_null_count, 3);
         assert_eq!(flag.sum, None, "a Bool column carries no integer sum");
+    }
+
+    /// ADR-0942: `fetch_segment_column_stats` builds exact statistics for an L1
+    /// (compaction-output) entry, reconstructing the L1 part key from the
+    /// 32-byte `input_set_hash` and `part_index` the entry carries in its
+    /// writer_* slots, and reading the same RLOG grammar an L0 object uses.
+    ///
+    /// Prove-the-test (deliverable 5): this test fails against the pre-ADR-0942
+    /// builder. The exact line flipped is the data-key construction in
+    /// [`fetch_segment_column_stats`]: it used to be the unconditional
+    /// `let writer_id_bytes: [u8; 16] = entry.writer_id.as_slice().try_into()
+    /// .map_err(|_| ColumnStatsBuildError::BadWriterIdLen(entry.writer_id.len()))?;`
+    /// (plus a `debug_assert_eq!(entry.level, 0)` above it). Against that code
+    /// this L1 entry's 32-byte `writer_id` makes the `try_into` fail, the call
+    /// returns `Err(BadWriterIdLen(32))`, and the `.expect("build stats")` below
+    /// panics before any value is checked.
+    #[tokio::test]
+    async fn fetch_segment_column_stats_covers_l1_entry() {
+        let store = MemoryStore::new();
+        let input_set_hash = [0x33u8; 32];
+        let records = vec![
+            record(1, &[i64_attr("status", 200)]),
+            record(2, &[i64_attr("status", 404)]),
+            record(3, &[i64_attr("status", 200)]),
+            record(4, &[i64_attr("status", 500)]),
+        ];
+        let entry = write_l1(&store, 7, input_set_hash, 0, &records).await;
+
+        let typed = vec![declared("status", DeclaredColumnType::I64)];
+        let seg = fetch_segment_column_stats(&store, &TENANT, Signal::Logs, &entry, &typed)
+            .await
+            .expect("build stats");
+
+        assert_eq!(seg.columns.len(), 1, "only `status` is declared");
+        let status = &seg.columns[0];
+        assert_eq!(status.non_null_count, 4);
+        assert_eq!(status.null_count, 0);
+        assert_eq!(i64_kind(status.min.as_ref().expect("min")), 200);
+        assert_eq!(i64_kind(status.max.as_ref().expect("max")), 500);
+        assert_eq!(status.sum, Some(1304), "200+404+200+500");
+        let dict: Vec<(i64, u64)> = status
+            .dictionary
+            .iter()
+            .map(|e| (i64_kind(e.value.as_ref().expect("value")), e.count))
+            .collect();
+        assert_eq!(dict, vec![(200, 2), (404, 1), (500, 1)]);
+        // The builder passes the entry's identity tuple through unchanged:
+        // writer_id is the L1 entry's 32-byte input_set_hash. The fold's v2
+        // publish path overwrites writer_id with the part content hash (the v2
+        // join key); the builder itself does not.
+        assert_eq!(
+            seg.writer_id,
+            input_set_hash.to_vec(),
+            "builder leaves writer_id as the entry carried it"
+        );
+    }
+
+    /// ADR-0942 safety lemma at the build boundary: a part-bound (v2) object
+    /// whose covered-part binding does not match the parts asked for is a typed,
+    /// graceful mismatch. The fold turns it into "rebuild the baseline"; it is
+    /// never a hard error and never a decode of wrong data. (The query-time
+    /// reader join, task A3, applies the same rule per segment: a resolved
+    /// segment whose content_hash matches no record simply has no stats and the
+    /// query scans it.)
+    #[test]
+    fn decode_previous_column_stats_mismatched_part_binding_is_graceful() {
+        // A v2 record carries the covered part content hash in writer_id.
+        let seg = ColumnStatsSegment {
+            ingest_hour_bucket: 1,
+            shard: 0,
+            writer_id: vec![0xCC; 32],
+            writer_epoch: 0,
+            writer_seq: 0,
+            columns: vec![],
+        };
+        let part_a = [0x0Au8; 32];
+        let part_b = [0x0Bu8; 32];
+        let bytes = crate::snapshot_format::encode_column_stats_v2(
+            TENANT.0,
+            3,
+            vec![part_a.to_vec()],
+            std::slice::from_ref(&seg),
+        )
+        .expect("v2 encodes");
+        let limits = crate::snapshot_format::ColumnStatsLimits::default();
+
+        // Asked for part B: the binding does not match -> typed graceful error.
+        let err = decode_previous_column_stats(&bytes, &[part_b], &limits)
+            .expect_err("mismatched part binding is rejected");
+        assert_eq!(err, SnapshotFormatError::ColumnStatsPartBindingMismatch);
+
+        // Asked for the true binding: decodes, record is content-hash keyed.
+        let ok = decode_previous_column_stats(&bytes, &[part_a], &limits).expect("binding matches");
+        assert_eq!(ok.len(), 1);
+        assert_eq!(ok[0].writer_id, vec![0xCC; 32]);
     }
 }
