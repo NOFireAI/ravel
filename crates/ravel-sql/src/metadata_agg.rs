@@ -18,6 +18,19 @@
 //!   rule). Answered by [`LogsScanExec::declared_group_counts`]: every
 //!   touched segment's exact dictionary merged by value, plus the summed
 //!   `null_count` as a synthetic NULL group when it is nonzero.
+//! - **q03/q04**: `SUM(<declared integer column> + <literal>) FROM logs`, an
+//!   ungrouped, filter-free aggregate directly over a [`LogsScanExec`].
+//!   Answered by [`LogsScanExec::declared_column_sum`] as `sum + k *
+//!   non_null_count` (#861); `k = 0` covers the plain `SUM(col)`. `SUM` over
+//!   zero non-null rows is `NULL`, matching the scan.
+//! - **q30**: `AVG(<declared integer column>) FROM logs`, likewise ungrouped
+//!   and filter-free. Answered as `sum / non_null_count` in `f64`, `NULL` when
+//!   there are no non-null rows.
+//!
+//! The sum-backed shapes decompose only for an integer column, and only when
+//! every touched segment carries an exact sum: a would-be float column, or a
+//! per-object sum that overflowed `i64` at fold time, has no stored sum and
+//! the statement scans (the ADR-0850 safety lemma).
 //!
 //! Both delegate the actual statistics read to `LogsScanExec` (the crate's
 //! established split: `logs_scan.rs` owns every column-stats read,
@@ -44,7 +57,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{ArrayRef, Int64Array, RecordBatch};
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::error::{DataFusionError, Result as DFResult};
@@ -64,7 +77,7 @@ use datafusion::physical_plan::{
 };
 use datafusion::scalar::ScalarValue;
 
-use crate::logs_scan::{DeclaredGroupCounts, LogsScanExec};
+use crate::logs_scan::{DeclaredColumnSum, DeclaredGroupCounts, LogsScanExec};
 
 /// The rule's name, as it appears in DataFusion's optimizer diagnostics.
 pub const METADATA_ONLY_AGGREGATE_RULE: &str = "metadata_only_aggregate";
@@ -169,41 +182,104 @@ fn group_index(group_by: &physical_plan::aggregates::PhysicalGroupBy) -> Option<
     }
 }
 
-/// Whether `agg`'s aggregate list is exactly one `COUNT(*)`-shaped
-/// expression: physically `count(<non-null literal>)` (DataFusion's
-/// `count_all()`), never a zero-argument call, so this is the exact,
-/// version-grounded shape check rather than a name guess. `is_distinct` and
-/// a per-aggregate `FILTER (WHERE ...)` clause are both refused: neither
-/// changes what `non_null_count` means, but this rule does not attempt to
+/// The single aggregate this rule knows how to answer from statistics, or
+/// `None` for anything else. Every variant carries a scan-output column index
+/// (resolved to a declared column later, once the scan is in hand).
+enum AggKind {
+    /// `COUNT(*)`: physically `count(<non-null literal>)`.
+    CountStar,
+    /// `SUM(col + addend)` over an integer column; `addend == 0` is the plain
+    /// `SUM(col)`.
+    Sum { col_index: usize, addend: i128 },
+    /// `AVG(col)` over an integer column.
+    Avg { col_index: usize },
+}
+
+/// Classify `agg`'s single aggregate, or `None` when it is not exactly one
+/// non-distinct, unfiltered aggregate this rule handles. `is_distinct` and a
+/// per-aggregate `FILTER (WHERE ...)` clause are both refused: neither changes
+/// what the underlying statistics mean, but this rule does not attempt to
 /// reason about them.
-fn is_count_star(agg: &physical_plan::aggregates::AggregateExec) -> bool {
+fn classify_aggregate(agg: &physical_plan::aggregates::AggregateExec) -> Option<AggKind> {
     let aggr_exprs = agg.aggr_expr();
     let filter_exprs = agg.filter_expr();
     if aggr_exprs.len() != 1 || filter_exprs.len() != 1 {
-        return false;
+        return None;
     }
     if filter_exprs[0].is_some() {
-        return false;
+        return None;
     }
     let expr = &aggr_exprs[0];
     if expr.is_distinct() {
-        return false;
-    }
-    if expr.fun().name() != "count" {
-        return false;
+        return None;
     }
     let args = expr.expressions();
     if args.len() != 1 {
-        return false;
+        return None;
     }
-    // `count_all()` is physically `count(<non-null literal>)`; a literal NULL
-    // would make DataFusion evaluate `COUNT(NULL)` as 0, so treating it as
-    // `COUNT(*)` and answering from `non_null_count` would return a filtered
-    // or grouped count where the correct answer is 0. Require the literal to
-    // be non-null.
-    match args[0].downcast_ref::<Literal>() {
-        Some(lit) => !lit.value().is_null(),
-        None => false,
+    match expr.fun().name() {
+        // `count_all()` is physically `count(<non-null literal>)`; a literal
+        // NULL would make DataFusion evaluate `COUNT(NULL)` as 0, so treating
+        // it as `COUNT(*)` and answering from `non_null_count` would return a
+        // filtered or grouped count where the correct answer is 0. Require the
+        // literal to be non-null.
+        "count" => match args[0].downcast_ref::<Literal>() {
+            Some(lit) if !lit.value().is_null() => Some(AggKind::CountStar),
+            _ => None,
+        },
+        "sum" => {
+            let (col_index, addend) = sum_arg(&args[0])?;
+            Some(AggKind::Sum { col_index, addend })
+        }
+        "avg" => {
+            let col = args[0].downcast_ref::<Column>()?;
+            Some(AggKind::Avg {
+                col_index: col.index(),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The `(column index, integer addend)` of a `SUM` argument this rule can
+/// decompose: a plain `Column` (addend 0), or `Column + <int literal>` /
+/// `<int literal> + Column`. `None` for any other expression, and for a
+/// non-integer literal (a float addend would make the result a float the
+/// integer sum cannot answer exactly).
+fn sum_arg(expr: &Arc<dyn PhysicalExpr>) -> Option<(usize, i128)> {
+    if let Some(col) = expr.downcast_ref::<Column>() {
+        return Some((col.index(), 0));
+    }
+    let binary = expr.downcast_ref::<BinaryExpr>()?;
+    if *binary.op() != Operator::Plus {
+        return None;
+    }
+    let left = binary.left();
+    let right = binary.right();
+    if let (Some(col), Some(lit)) = (
+        left.downcast_ref::<Column>(),
+        right.downcast_ref::<Literal>(),
+    ) {
+        return Some((col.index(), scalar_to_i128(lit.value())?));
+    }
+    if let (Some(lit), Some(col)) = (
+        left.downcast_ref::<Literal>(),
+        right.downcast_ref::<Column>(),
+    ) {
+        return Some((col.index(), scalar_to_i128(lit.value())?));
+    }
+    None
+}
+
+/// An integer literal's value as `i128`, or `None` for a non-integer or NULL
+/// literal.
+fn scalar_to_i128(v: &ScalarValue) -> Option<i128> {
+    match v {
+        ScalarValue::Int64(Some(x)) => Some(i128::from(*x)),
+        ScalarValue::Int32(Some(x)) => Some(i128::from(*x)),
+        ScalarValue::Int16(Some(x)) => Some(i128::from(*x)),
+        ScalarValue::Int8(Some(x)) => Some(i128::from(*x)),
+        _ => None,
     }
 }
 
@@ -248,16 +324,16 @@ fn rewrite(node: Arc<dyn ExecutionPlan>) -> DFResult<Transformed<Arc<dyn Executi
     // Single/SinglePartitioned, or found through a chain of partition-shuffle
     // nodes over a Final/FinalPartitioned stage's Partial input.
     let mut current: Arc<dyn ExecutionPlan> = Arc::clone(&node);
-    let (group, raw_input) = loop {
+    let (group, agg_kind, raw_input) = loop {
         if let Some(a) = current.downcast_ref::<physical_plan::aggregates::AggregateExec>() {
             if a.mode().input_mode() == physical_plan::aggregates::AggregateInputMode::Raw {
                 let Some(group) = group_index(a.group_expr()) else {
                     return Ok(Transformed::no(node));
                 };
-                if !is_count_star(a) {
+                let Some(agg_kind) = classify_aggregate(a) else {
                     return Ok(Transformed::no(node));
-                }
-                break (group, Arc::clone(a.input()));
+                };
+                break (group, agg_kind, Arc::clone(a.input()));
             }
             current = Arc::clone(a.input());
             continue;
@@ -292,12 +368,12 @@ fn rewrite(node: Arc<dyn ExecutionPlan>) -> DFResult<Transformed<Arc<dyn Executi
     };
 
     let schema = node.schema();
-    let batch = match group {
+    let batch = match (group, agg_kind) {
         // q02: COUNT(*) WHERE <declared column> <> <literal>. A predicate-
         // free COUNT(*) here is already handled by DataFusion's own built-in
         // AggregateStatistics rule, so require the filter this rule exists
         // for rather than reproducing that case.
-        None => {
+        (None, AggKind::CountStar) => {
             let Some(filter) = filter else {
                 return Ok(Transformed::no(node));
             };
@@ -326,7 +402,7 @@ fn rewrite(node: Arc<dyn ExecutionPlan>) -> DFResult<Transformed<Arc<dyn Executi
         }
         // q08: <declared column>, COUNT(*) GROUP BY <declared column>. A
         // filter combined with a GROUP BY is out of scope for this rule.
-        Some(col_index) => {
+        (Some(col_index), AggKind::CountStar) => {
             if filter.is_some() {
                 return Ok(Transformed::no(node));
             }
@@ -340,6 +416,48 @@ fn rewrite(node: Arc<dyn ExecutionPlan>) -> DFResult<Transformed<Arc<dyn Executi
                 Some(batch) => batch,
                 None => return Ok(Transformed::no(node)),
             }
+        }
+        // q03/q04: SUM(<declared integer column> + k), ungrouped, no filter.
+        (None, AggKind::Sum { col_index, addend }) => {
+            if filter.is_some() {
+                return Ok(Transformed::no(node));
+            }
+            let Some(k) = scan.declared_index_for_output(col_index) else {
+                return Ok(Transformed::no(node));
+            };
+            let Some(cs) = scan.declared_column_sum(k) else {
+                return Ok(Transformed::no(node));
+            };
+            let Some(scalar) = sum_scalar(&schema, &cs, addend) else {
+                return Ok(Transformed::no(node));
+            };
+            match single_scalar_batch(&schema, scalar) {
+                Some(batch) => batch,
+                None => return Ok(Transformed::no(node)),
+            }
+        }
+        // q30: AVG(<declared integer column>), ungrouped, no filter.
+        (None, AggKind::Avg { col_index }) => {
+            if filter.is_some() {
+                return Ok(Transformed::no(node));
+            }
+            let Some(k) = scan.declared_index_for_output(col_index) else {
+                return Ok(Transformed::no(node));
+            };
+            let Some(cs) = scan.declared_column_sum(k) else {
+                return Ok(Transformed::no(node));
+            };
+            let Some(scalar) = avg_scalar(&schema, &cs) else {
+                return Ok(Transformed::no(node));
+            };
+            match single_scalar_batch(&schema, scalar) {
+                Some(batch) => batch,
+                None => return Ok(Transformed::no(node)),
+            }
+        }
+        // A grouped SUM/AVG is out of scope for this rule.
+        (Some(_), AggKind::Sum { .. }) | (Some(_), AggKind::Avg { .. }) => {
+            return Ok(Transformed::no(node));
         }
     };
 
@@ -388,6 +506,52 @@ fn group_counts_batch(schema: &SchemaRef, counts: DeclaredGroupCounts) -> Option
     let group_array = ScalarValue::iter_to_array(values).ok()?;
     let count_array: ArrayRef = Arc::new(Int64Array::from(tallies));
     RecordBatch::try_new(Arc::clone(schema), vec![group_array, count_array]).ok()
+}
+
+/// The `SUM(col + addend)` answer as a scalar: `sum + addend * non_null_count`,
+/// or SQL `NULL` when no non-null row exists (`SUM` over zero rows is `NULL`,
+/// never 0). `None` -- a decline, never a partial answer -- when the outer
+/// schema is not the single `Int64` column `SUM(<Int64>)` produces, or the
+/// arithmetic overflows `i64` (the declared output type): the ADR-0850 lemma
+/// admits no silent truncation, so an overflow falls back to the scan.
+fn sum_scalar(schema: &SchemaRef, cs: &DeclaredColumnSum, addend: i128) -> Option<ScalarValue> {
+    if schema.fields().len() != 1 || *schema.field(0).data_type() != DataType::Int64 {
+        return None;
+    }
+    if cs.non_null_count == 0 {
+        return Some(ScalarValue::Int64(None));
+    }
+    let term = addend.checked_mul(i128::from(cs.non_null_count))?;
+    let total = cs.sum.checked_add(term)?;
+    Some(ScalarValue::Int64(Some(i64::try_from(total).ok()?)))
+}
+
+/// The `AVG(col)` answer as a scalar: `sum / non_null_count` in `f64`, or SQL
+/// `NULL` when no non-null row exists (`AVG` over zero rows is `NULL`). `None`
+/// when the outer schema is not the single `Float64` column `AVG(<Int64>)`
+/// produces. The division mirrors DataFusion's integer `AVG` exactly: the exact
+/// `i128` sum and the count are each cast to `f64` and divided once, so the
+/// rewritten answer is bit-identical to the scanned one.
+fn avg_scalar(schema: &SchemaRef, cs: &DeclaredColumnSum) -> Option<ScalarValue> {
+    if schema.fields().len() != 1 || *schema.field(0).data_type() != DataType::Float64 {
+        return None;
+    }
+    if cs.non_null_count == 0 {
+        return Some(ScalarValue::Float64(None));
+    }
+    let avg = (cs.sum as f64) / (cs.non_null_count as f64);
+    Some(ScalarValue::Float64(Some(avg)))
+}
+
+/// A single-row, single-column batch carrying `scalar` under `schema`. `None`
+/// on a schema-width mismatch (an internal-error decline; see
+/// [`count_star_batch`]).
+fn single_scalar_batch(schema: &SchemaRef, scalar: ScalarValue) -> Option<RecordBatch> {
+    if schema.fields().len() != 1 {
+        return None;
+    }
+    let array = scalar.to_array().ok()?;
+    RecordBatch::try_new(Arc::clone(schema), vec![array]).ok()
 }
 
 /// `count` as `i64`, `COUNT(*)`'s declared output type. `None` on overflow,

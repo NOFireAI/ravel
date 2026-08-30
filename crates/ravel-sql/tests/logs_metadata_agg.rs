@@ -33,7 +33,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, Int64Array};
+use datafusion::arrow::array::{Array, Float64Array, Int64Array};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::physical_plan::{collect, displayable};
 use datafusion::prelude::SessionContext;
@@ -660,6 +660,44 @@ async fn pending_erasure_declines_and_keeps_the_scan() {
         shown.contains("LogsScanExec"),
         "a pending erasure must fall back to a scan; plan was:\n{shown}"
     );
+
+    // The same erasure must force the sum-backed shapes (q03/q04/q30) to
+    // decline too: a pending erasure removes rows the folded sum and count
+    // still include (`declared_column_sum` gates on the same `stats_are_exact`,
+    // logs_scan.rs). Reuse the erasure snapshot above.
+    let ctx = logs_session(provider(
+        &store,
+        snapshot_of(
+            vec![seg_ref(1, 5), seg_ref(2, 6)],
+            vec![ravel_proto::commit::v1::ErasureRequest {
+                predicate: vec![ravel_proto::commit::v1::ErasurePredicateMatcher {
+                    key: "status".to_string(),
+                    value: "404".to_string(),
+                }],
+                ..Default::default()
+            }],
+        ),
+        status_col(),
+        Some(status_stats(&seg_ref(1, 5), &seg_ref(2, 6))),
+    ))
+    .expect("session");
+    for sql in [
+        "SELECT SUM(status + 1) FROM logs",
+        "SELECT AVG(status) FROM logs",
+    ] {
+        let plan = ctx
+            .sql(sql)
+            .await
+            .expect("plan")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        let shown = plan_str(&plan);
+        assert!(
+            !shown.contains("MetadataOnlyExec") && shown.contains("LogsScanExec"),
+            "a pending erasure must force {sql} to scan; plan was:\n{shown}"
+        );
+    }
 }
 
 /// A `Str`-typed declared column is not answerable from the dictionary here
@@ -1318,4 +1356,396 @@ async fn a_missing_extremum_with_non_null_rows_declines_and_scans() {
         shown.contains("LogsScanExec") && !shown.contains("MetadataOnlyExec"),
         "non-null rows with no extremum must decline and fall back to a scan; plan was:\n{shown}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// q03/q04: SUM(<declared integer column> + k), and q30: AVG(<declared integer
+// column>) -- answered from the exact per-object integer sum (#861). Every
+// positive test pins the same two facts as the q02/q08 tests: no `LogsScanExec`
+// in the plan, and exactly zero object-store GETs.
+// ---------------------------------------------------------------------------
+
+/// The single scalar of a one-column `SUM` result, or `None` when it is SQL
+/// NULL (sum over zero non-null rows).
+fn single_i64(batches: &[RecordBatch]) -> Option<i64> {
+    for batch in batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 sum");
+        return if arr.is_null(0) {
+            None
+        } else {
+            Some(arr.value(0))
+        };
+    }
+    None
+}
+
+/// The single scalar of a one-column `AVG` result, or `None` when it is SQL
+/// NULL. Returned as raw bits so callers compare with the repo's
+/// bit-pattern float rule rather than `==`.
+fn single_f64_bits(batches: &[RecordBatch]) -> Option<u64> {
+    for batch in batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("float64 avg");
+        return if arr.is_null(0) {
+            None
+        } else {
+            Some(arr.value(0).to_bits())
+        };
+    }
+    None
+}
+
+/// q03/q04: `SUM(status + 1)` is answered from the exact per-object sums with
+/// zero GETs and no scan. Segment A sums 1408 over 5 non-null rows, segment B
+/// sums 1300 over 5; the `+ 1` applies once per non-null row, so the answer is
+/// `2708 + 10 = 2718`.
+///
+/// Prove-the-test: reverting `LogsScanExec::declared_column_sum` to `return
+/// None` makes the rule decline, restoring a `LogsScanExec` plan; both
+/// assertions fail.
+#[tokio::test]
+async fn q03_sum_plus_k_answered_from_stats_with_zero_gets() {
+    let store = CountingStore::new(Arc::new(MemoryStore::new()));
+    let (a, b) = two_status_segments();
+    let stats = status_stats(&a, &b);
+    let snapshot = snapshot_of(vec![a, b], Vec::new());
+    let ctx = logs_session(provider(&store, snapshot, status_col(), Some(stats))).expect("session");
+
+    let plan = ctx
+        .sql("SELECT SUM(status + 1) FROM logs")
+        .await
+        .expect("plan")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+    let shown = plan_str(&plan);
+    assert!(
+        !shown.contains("LogsScanExec"),
+        "q03 SUM(col + k) must be answered from stats, not scanned; plan was:\n{shown}"
+    );
+    assert!(
+        shown.contains("MetadataOnlyExec: metadata_only=true, rows=1"),
+        "q03 must report one sum row via the metadata marker; plan was:\n{shown}"
+    );
+
+    let batches = collect(Arc::clone(&plan), ctx.task_ctx())
+        .await
+        .expect("collect");
+    assert_eq!(
+        single_i64(&batches),
+        Some(2718),
+        "2708 + 1 * 10 non-null rows"
+    );
+    assert_eq!(store.gets(), 0, "the q03 answer must read no objects");
+}
+
+/// The plain `SUM(status)` (addend 0) is answered from stats with zero GETs:
+/// `1408 + 1300 = 2708`.
+#[tokio::test]
+async fn plain_sum_answered_from_stats_with_zero_gets() {
+    let store = CountingStore::new(Arc::new(MemoryStore::new()));
+    let (a, b) = two_status_segments();
+    let stats = status_stats(&a, &b);
+    let snapshot = snapshot_of(vec![a, b], Vec::new());
+    let ctx = logs_session(provider(&store, snapshot, status_col(), Some(stats))).expect("session");
+
+    let plan = ctx
+        .sql("SELECT SUM(status) FROM logs")
+        .await
+        .expect("plan")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+    let shown = plan_str(&plan);
+    assert!(
+        !shown.contains("LogsScanExec"),
+        "plain SUM(col) must be answered from stats; plan was:\n{shown}"
+    );
+
+    let batches = collect(Arc::clone(&plan), ctx.task_ctx())
+        .await
+        .expect("collect");
+    assert_eq!(single_i64(&batches), Some(2708), "1408 + 1300");
+    assert_eq!(store.gets(), 0, "the sum answer must read no objects");
+}
+
+/// q30: `AVG(status)` is answered from stats with zero GETs and no scan:
+/// `2708 / 10 = 270.8`. Compared by bit pattern, since the answer is a float.
+///
+/// Prove-the-test: reverting `declared_column_sum` to `return None` restores a
+/// `LogsScanExec` plan and both assertions fail.
+#[tokio::test]
+async fn q30_avg_answered_from_stats_with_zero_gets() {
+    let store = CountingStore::new(Arc::new(MemoryStore::new()));
+    let (a, b) = two_status_segments();
+    let stats = status_stats(&a, &b);
+    let snapshot = snapshot_of(vec![a, b], Vec::new());
+    let ctx = logs_session(provider(&store, snapshot, status_col(), Some(stats))).expect("session");
+
+    let plan = ctx
+        .sql("SELECT AVG(status) FROM logs")
+        .await
+        .expect("plan")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+    let shown = plan_str(&plan);
+    assert!(
+        !shown.contains("LogsScanExec"),
+        "q30 AVG must be answered from stats, not scanned; plan was:\n{shown}"
+    );
+    assert!(
+        shown.contains("MetadataOnlyExec: metadata_only=true, rows=1"),
+        "q30 must report one avg row via the metadata marker; plan was:\n{shown}"
+    );
+
+    let batches = collect(Arc::clone(&plan), ctx.task_ctx())
+        .await
+        .expect("collect");
+    assert_eq!(
+        single_f64_bits(&batches),
+        Some((2708f64 / 10f64).to_bits()),
+        "2708 / 10"
+    );
+    assert_eq!(store.gets(), 0, "the q30 answer must read no objects");
+}
+
+/// A column whose stat carries NO sum -- what a float column would produce, and
+/// what an i64-overflowing per-object sum produces at fold time -- must fall
+/// back to scanning rather than answer approximately (#861). There is no float
+/// declared type in this system, so a `sum = None` I64 stat is the exact state
+/// a float column reduces to on this path.
+///
+/// Over one real corpus: with the sum stripped from both segments' stats,
+/// `SUM(status + 1)` keeps its `LogsScanExec` and its answer equals the scanned
+/// answer, 3219.
+///
+/// Prove-the-test: removing the `let seg_sum = stat.sum?;` decline in
+/// `declared_column_sum` lets the rule read a phantom sum and the plan-shape
+/// assertion fails.
+#[tokio::test]
+async fn sum_without_a_stored_sum_declines_and_scans() {
+    let corpus = RealCorpus::build().await;
+
+    // Strip the sum from both segments' stats.
+    let strip = |rows: &[(i64, Option<i64>)]| {
+        let mut stat = stat_from_rows(rows);
+        stat.sum = None;
+        stat
+    };
+    let no_sum_stats = loaded_stats(vec![
+        (&corpus.a, stats_segment(&corpus.a, vec![strip(SEG_A_ROWS)])),
+        (&corpus.b, stats_segment(&corpus.b, vec![strip(SEG_B_ROWS)])),
+    ]);
+
+    let snapshot = snapshot_of(vec![corpus.a.clone(), corpus.b.clone()], Vec::new());
+    let ctx = logs_session(provider(
+        &corpus.store,
+        snapshot,
+        status_col(),
+        Some(no_sum_stats),
+    ))
+    .expect("session");
+    let plan = ctx
+        .sql("SELECT SUM(status + 1) FROM logs")
+        .await
+        .expect("plan")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+    let shown = plan_str(&plan);
+    assert!(
+        shown.contains("LogsScanExec") && !shown.contains("MetadataOnlyExec"),
+        "a missing sum must decline and fall back to a scan; plan was:\n{shown}"
+    );
+    let rewritten = collect(Arc::clone(&plan), ctx.task_ctx())
+        .await
+        .expect("collect");
+
+    // The same statement with no loaded stats at all: the ordinary scan path.
+    let (_, scanned) = corpus.run("SELECT SUM(status + 1) FROM logs", false).await;
+    assert_eq!(
+        single_i64(&rewritten),
+        single_i64(&scanned),
+        "the fallback answer must equal the scanned answer"
+    );
+    assert_eq!(single_i64(&scanned), Some(3219), "3208 + 11 non-null rows");
+}
+
+/// The q03 exactness property over one real corpus: the REWRITTEN `SUM(col + k)`
+/// equals the SCANNED one, and a clipping ts bound falls back to a scan whose
+/// answer still holds. This is what proves the stored sum is exact against a
+/// scan of the same data, and that SQL null handling (segment B has a null row,
+/// skipped by `col + k`) matches.
+#[tokio::test]
+async fn q03_rewritten_answer_equals_scanned_answer() {
+    let corpus = RealCorpus::build().await;
+
+    let unbounded = "SELECT SUM(status + 1) FROM logs";
+    let (rewritten_plan, rewritten) = corpus.run(unbounded, true).await;
+    let (_, scanned) = corpus.run(unbounded, false).await;
+    assert!(
+        !rewritten_plan.contains("LogsScanExec"),
+        "the unbounded q03 must be answered from stats, or this test compares \
+         the scan against itself; plan was:\n{rewritten_plan}"
+    );
+    assert_eq!(
+        single_i64(&rewritten),
+        single_i64(&scanned),
+        "the rewritten q03 answer must equal the scanned answer"
+    );
+    assert_eq!(single_i64(&scanned), Some(3219), "3208 + 11 non-null rows");
+
+    let clipped = &format!("SELECT SUM(status + 1) FROM logs WHERE ts < {CLIP_SQL}");
+    let (clipped_plan, clipped_rewrite) = corpus.run(clipped, true).await;
+    let (_, clipped_scan) = corpus.run(clipped, false).await;
+    assert!(
+        clipped_plan.contains("LogsScanExec"),
+        "a clipping ts bound must fall back to a scan; plan was:\n{clipped_plan}"
+    );
+    assert_eq!(
+        single_i64(&clipped_rewrite),
+        single_i64(&clipped_scan),
+        "the clipped q03 answer must not depend on whether statistics loaded"
+    );
+    assert_eq!(
+        single_i64(&clipped_scan),
+        Some(2517),
+        "2508 + 9 non-null rows"
+    );
+    assert_ne!(
+        single_i64(&clipped_scan),
+        single_i64(&scanned),
+        "the ts bound must actually remove rows, or the clipped case proves nothing"
+    );
+}
+
+/// The q30 half of the same property, for `AVG`.
+#[tokio::test]
+async fn q30_rewritten_answer_equals_scanned_answer() {
+    let corpus = RealCorpus::build().await;
+
+    let unbounded = "SELECT AVG(status) FROM logs";
+    let (rewritten_plan, rewritten) = corpus.run(unbounded, true).await;
+    let (_, scanned) = corpus.run(unbounded, false).await;
+    assert!(
+        !rewritten_plan.contains("LogsScanExec"),
+        "the unbounded q30 must be answered from stats; plan was:\n{rewritten_plan}"
+    );
+    assert_eq!(
+        single_f64_bits(&rewritten),
+        single_f64_bits(&scanned),
+        "the rewritten q30 answer must be bit-identical to the scanned answer"
+    );
+    assert_eq!(
+        single_f64_bits(&scanned),
+        Some((3208f64 / 11f64).to_bits()),
+        "3208 / 11"
+    );
+
+    let clipped = &format!("SELECT AVG(status) FROM logs WHERE ts < {CLIP_SQL}");
+    let (clipped_plan, clipped_rewrite) = corpus.run(clipped, true).await;
+    let (_, clipped_scan) = corpus.run(clipped, false).await;
+    assert!(
+        clipped_plan.contains("LogsScanExec"),
+        "a clipping ts bound must fall back to a scan; plan was:\n{clipped_plan}"
+    );
+    assert_eq!(
+        single_f64_bits(&clipped_rewrite),
+        single_f64_bits(&clipped_scan),
+        "the clipped q30 answer must not depend on whether statistics loaded"
+    );
+    assert_ne!(
+        single_f64_bits(&clipped_scan),
+        single_f64_bits(&scanned),
+        "the ts bound must actually remove rows"
+    );
+}
+
+/// SUM and AVG over an all-null column are SQL NULL, byte-identical whether
+/// answered from stats or by scanning. The metadata path answers NULL from
+/// `non_null_count == 0` without reading an object; the scan produces the same
+/// NULL. Empty-input semantics ride the same path (zero non-null rows).
+#[tokio::test]
+async fn sum_and_avg_over_all_null_is_null_byte_identical() {
+    let store = CountingStore::new(Arc::new(MemoryStore::new()));
+    let all_null: &[(i64, Option<i64>)] = &[(0, None), (100, None), (200, None)];
+    let seg = write_real_segment(&store, "logs/allnull.rlog", 1, all_null).await;
+    let stats = loaded_stats(vec![(
+        &seg,
+        stats_segment(&seg, vec![stat_from_rows(all_null)]),
+    )]);
+
+    for (sql, is_avg) in [
+        ("SELECT SUM(status + 1) FROM logs", false),
+        ("SELECT AVG(status) FROM logs", true),
+    ] {
+        // From stats: the rewrite fires and reads no object.
+        let ctx = logs_session(provider(
+            &store,
+            snapshot_of(vec![seg.clone()], Vec::new()),
+            status_col(),
+            Some(Arc::clone(&stats)),
+        ))
+        .expect("session");
+        let plan = ctx
+            .sql(sql)
+            .await
+            .expect("plan")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        let shown = plan_str(&plan);
+        assert!(
+            !shown.contains("LogsScanExec"),
+            "{sql} over all-null must be answered from stats; plan was:\n{shown}"
+        );
+        let before = store.gets();
+        let rewritten = collect(Arc::clone(&plan), ctx.task_ctx())
+            .await
+            .expect("collect");
+        assert_eq!(store.gets(), before, "the all-null answer reads no objects");
+
+        // By scanning: no stats loaded.
+        let scan_ctx = logs_session(provider(
+            &store,
+            snapshot_of(vec![seg.clone()], Vec::new()),
+            status_col(),
+            None,
+        ))
+        .expect("session");
+        let scanned = collect(
+            scan_ctx
+                .sql(sql)
+                .await
+                .expect("plan")
+                .create_physical_plan()
+                .await
+                .expect("physical plan"),
+            scan_ctx.task_ctx(),
+        )
+        .await
+        .expect("collect");
+
+        if is_avg {
+            assert_eq!(single_f64_bits(&rewritten), None, "AVG of all-null is NULL");
+            assert_eq!(single_f64_bits(&rewritten), single_f64_bits(&scanned));
+        } else {
+            assert_eq!(single_i64(&rewritten), None, "SUM of all-null is NULL");
+            assert_eq!(single_i64(&rewritten), single_i64(&scanned));
+        }
+    }
 }
