@@ -95,7 +95,9 @@ pub struct NativeHistogram {
     pub count: u64,
     /// Sum of observations.
     pub sum: f64,
-    /// Positive-bucket counts as deltas, Prometheus' own wire shape.
+    /// Positive-bucket counts in Prometheus' own wire shape: each element is
+    /// the difference against the previous bucket of this same sample, so a
+    /// decoder prefix-sums the vector to recover the absolute counts.
     pub positive_deltas: Vec<i64>,
 }
 
@@ -741,17 +743,22 @@ impl<'a> Generator<'a> {
                         count: 0,
                     };
                 }
-                // A native histogram carries counter semantics: emit the
-                // per-step GROWTH as positive deltas and accumulate the
-                // absolutes, so `count` and `sum` only rise apart from an
-                // injected reset (which zeroes the state before this step).
+                // Two different axes meet here. ACROSS STEPS the buckets
+                // accumulate, because a native histogram carries counter
+                // semantics: `count` and `sum` only rise apart from an injected
+                // reset (which zeroes the state before this step). WITHIN one
+                // sample the wire format carries `positive_deltas[i] =
+                // accumulated[i] - accumulated[i - 1]`, differences between
+                // neighbouring buckets that a decoder prefix-sums back to the
+                // absolute counts. Emitting the per-step growth here instead
+                // would type-check and stay non-negative while decoding to a
+                // bucket vector that disagrees with this sample's `count`.
                 let (positive_deltas, sum, count) = match entry {
                     InstanceState::Native {
                         buckets,
                         sum,
                         count,
                     } => {
-                        let mut deltas = Vec::with_capacity(buckets.len());
                         for (b, bucket) in buckets.iter_mut().enumerate() {
                             let growth =
                                 mix(seed, &[TAG_VALUE, fam_id, global, step, b as u64]) % 8;
@@ -762,7 +769,13 @@ impl<'a> Generator<'a> {
                                 1,
                                 12,
                             ) * growth as f64;
-                            deltas.push(growth as i64);
+                        }
+                        let mut deltas = Vec::with_capacity(buckets.len());
+                        let mut previous = 0i64;
+                        for bucket in buckets.iter() {
+                            let absolute = *bucket as i64;
+                            deltas.push(absolute - previous);
+                            previous = absolute;
                         }
                         (deltas, *sum, *count)
                     }
@@ -1258,6 +1271,117 @@ mod tests {
         assert!(
             expected_resets >= native_resets.len() as u64,
             "the total reset count must include the native resets"
+        );
+    }
+
+    /// Parse the single native series' `(count, positive_deltas)` per step, in
+    /// stream order, from a generated text stream.
+    fn native_samples(text: &str) -> Vec<(u64, Vec<i64>)> {
+        text.lines()
+            .filter(|l| l.contains("\tmb_native{"))
+            .map(|line| {
+                let payload = line.split('\t').nth(2).expect("payload");
+                let count: u64 = payload
+                    .split("count=")
+                    .nth(1)
+                    .and_then(|s| s.split(' ').next())
+                    .and_then(|s| s.parse().ok())
+                    .expect("count field");
+                let deltas: Vec<i64> = payload
+                    .split("deltas=")
+                    .nth(1)
+                    .expect("deltas field")
+                    .split(',')
+                    .map(|d| d.parse().expect("integer delta"))
+                    .collect();
+                (count, deltas)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn native_histogram_positive_deltas_prefix_sum_to_the_accumulated_buckets() {
+        // `positive_deltas` is the wire encoding of the buckets WITHIN one
+        // sample: a decoder prefix-sums it across neighbouring buckets to
+        // recover the absolute per-bucket counts, exactly as
+        // `int_side_counts` does in ravel-remote-write's normalize.rs. That
+        // axis is not the across-steps accumulation the same sample's `count`
+        // and `sum` carry. Encoding the per-step GROWTH of each bucket into
+        // `positive_deltas` type-checks and stays non-negative, so nothing but
+        // this round trip catches it: prefix-summing growths yields a vector
+        // whose total is one step's observations while `count` reports the
+        // run's, and the two disagree at every step past the first.
+        //
+        // The oracle is recomputed here from the same `mix` the generator
+        // draws from, so the assertion is against the accumulated buckets a
+        // reader can derive by hand, not against whatever the encoder emitted.
+        let reset_rate = 8u64;
+        let w = workload(
+            0x5EED_0001,
+            AnomalyRates {
+                missing_sample_one_in: 0,
+                stale_marker_one_in: 0,
+                counter_reset_one_in: reset_rate,
+                out_of_order_one_in: 0,
+            },
+        );
+        gate_workload(&w).expect("manifest gates clean");
+        let steps = 80u64;
+        let (bytes, _report) = Generator::new(&w, "cardinality", 0)
+            .expect("generator builds")
+            .generate_bytes(steps)
+            .expect("generates");
+        let text = String::from_utf8(bytes).expect("utf8");
+        let samples = native_samples(&text);
+        assert_eq!(samples.len(), steps as usize, "one native sample per step");
+
+        // Family index 3, global 0: 50 permille of 20 active series is one
+        // native instance. A reset drops the accumulated state before the step
+        // it fires on, so the step is included in the walk rather than skipped.
+        let seed = w.seed;
+        let native_fam = 3u64;
+        let nbuckets = w.generator.native_histogram_buckets as usize;
+        let mut accumulated = vec![0u64; nbuckets];
+        let mut reset_steps = 0u64;
+        for (step, (count, deltas)) in samples.iter().enumerate() {
+            let step = step as u64;
+            if fires(reset_rate, seed, TAG_RESET, native_fam, 0, step) {
+                accumulated = vec![0u64; nbuckets];
+                reset_steps += 1;
+            }
+            for (b, bucket) in accumulated.iter_mut().enumerate() {
+                *bucket += mix(seed, &[TAG_VALUE, native_fam, 0, step, b as u64]) % 8;
+            }
+
+            assert_eq!(
+                deltas.len(),
+                nbuckets,
+                "step {step}: one delta per declared positive bucket"
+            );
+            let mut decoded = Vec::with_capacity(nbuckets);
+            let mut running = 0i64;
+            for d in deltas {
+                running += *d;
+                assert!(
+                    running >= 0,
+                    "step {step}: a prefix sum of positive_deltas went negative: {deltas:?}"
+                );
+                decoded.push(running as u64);
+            }
+            assert_eq!(
+                decoded, accumulated,
+                "step {step}: prefix-summing positive_deltas must recover the \
+                 accumulated bucket counts"
+            );
+            let decoded_total: u64 = decoded.iter().sum();
+            assert_eq!(
+                decoded_total, *count,
+                "step {step}: the decoded buckets must total the sample's count"
+            );
+        }
+        assert_eq!(
+            reset_steps, 7,
+            "this seed must cover reset steps in the walk"
         );
     }
 
