@@ -151,6 +151,7 @@ async fn publish_dataset(store: Arc<dyn ObjectStoreBackend>) -> TenantId {
         explain_dir: None,
         warm_catalog: false,
         logs_suffix_len: None,
+        logs_request_cost_bytes: ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES,
     })
     .await
     .expect("generated lane publishes the dataset");
@@ -250,6 +251,7 @@ fn flight_cfg(
         flight: Some(flight),
         warm_catalog: false,
         logs_suffix_len: None,
+        logs_request_cost_bytes: ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES,
     }
 }
 

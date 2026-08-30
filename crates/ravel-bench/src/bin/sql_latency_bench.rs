@@ -26,8 +26,8 @@ use clap::Parser;
 use ravel_bench::harness::{StoreKind, store_from_env};
 use ravel_bench::sql_corpus::{checked_default_corpus, load_external_corpus};
 use ravel_bench::sql_latency::{
-    Compaction, DatasetInfo, FlightTarget, GenerateConfig, RunAccounting, SqlLatencyReport,
-    TenantConfigInput, run_generated, run_tenant,
+    Compaction, DatasetInfo, FlightTarget, GenerateConfig, Provenance, RunAccounting,
+    SqlLatencyReport, TenantConfigInput, run_generated, run_tenant,
 };
 use ravel_sql::DEFAULT_MAX_QUERY_BYTES;
 use ravel_types::TimeRange;
@@ -175,6 +175,15 @@ struct Args {
     /// earlier run used; recorded in the report's provenance.
     #[arg(long, default_value_t = ravel_query::DEFAULT_FETCH_CONCURRENCY)]
     fetch_concurrency: usize,
+    /// The logs per-request byte budget (ADR-0904), the same knob as
+    /// `ravel-server --logs-request-cost-bytes`: the byte cost the logs planner
+    /// charges each object against when deciding whether a scan routes through
+    /// the ranged probe-then-fetch path instead of a whole-object read. Raising
+    /// it makes the planner willing to spend more requests on a scan. Defaults
+    /// to ravel-query's compiled-in value, the one every earlier run used;
+    /// recorded in the report header and provenance.
+    #[arg(long, value_name = "BYTES", default_value_t = ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES)]
+    logs_request_cost_bytes: u64,
     /// Append one JSON line per finished statement to this file as the run
     /// goes (`{"outcome":"measured"|"skipped"|"failed", ...}`), flushed per
     /// line. The full report still goes to stdout at the end; this is what
@@ -362,6 +371,7 @@ async fn run(args: &Args) -> Result<SqlLatencyReport, ravel_bench::sql_latency::
                 deadline: Duration::from_secs(args.deadline_secs),
                 continue_on_error: args.continue_on_error,
                 fetch_concurrency: args.fetch_concurrency,
+                logs_request_cost_bytes: args.logs_request_cost_bytes,
                 progress_jsonl: args.progress_jsonl.clone(),
                 tenant_max_bytes: args.sql_tenant_max_bytes,
                 parallel_final_aggregation: args.sql_parallel_final_aggregation,
@@ -399,6 +409,7 @@ async fn run(args: &Args) -> Result<SqlLatencyReport, ravel_bench::sql_latency::
                 deadline: Duration::from_secs(args.deadline_secs),
                 continue_on_error: args.continue_on_error,
                 fetch_concurrency: args.fetch_concurrency,
+                logs_request_cost_bytes: args.logs_request_cost_bytes,
                 progress_jsonl: args.progress_jsonl.clone(),
                 tenant_max_bytes: args.sql_tenant_max_bytes,
                 parallel_final_aggregation: args.sql_parallel_final_aggregation,
@@ -443,27 +454,46 @@ fn dataset_line(d: &DatasetInfo) -> String {
     line
 }
 
-fn print_human_table(report: &SqlLatencyReport) {
-    let p = &report.provenance;
-    let d = &report.dataset;
-    println!("\nsql_latency_bench report");
-    println!(
-        "  backend    : {} (region={}, endpoint={})",
-        p.store_backend, p.region, p.endpoint
-    );
-    println!("  host       : {} logical cores", p.host_logical_cores);
-    println!("  source     : {}  dataset={}", p.source, p.dataset_id);
-    if let Some(flight) = &p.flight_endpoint {
-        println!("  flight sql : {flight} (scan diagnostics are not on the wire)");
-    }
-    println!("  dataset    : {}", dataset_line(d));
-    println!("  runs/query : {}", p.runs);
-    println!("  deadline   : {} s per statement", p.deadline_secs);
-    println!("  fetch conc : {}", p.fetch_concurrency);
+/// The report's provenance header, as the block of `  key : value` lines the
+/// human table prints above the per-statement rows. Built as a string rather
+/// than printed inline so a test can assert a stamped figure is present and
+/// present exactly once: a knob whose value the header drops, or stamps twice,
+/// leaves a run that cannot say which setting produced it.
+fn provenance_header(p: &Provenance, d: &DatasetInfo) -> String {
     let effective =
         parallel_final_aggregation_effective_label(p.parallel_final_aggregation_effective);
-    println!(
-        "  query max  : requested={} bytes  effective={}",
+    let mut out = String::new();
+    out.push_str("\nsql_latency_bench report\n");
+    out.push_str(&format!(
+        "  backend    : {} (region={}, endpoint={})\n",
+        p.store_backend, p.region, p.endpoint
+    ));
+    out.push_str(&format!(
+        "  host       : {} logical cores\n",
+        p.host_logical_cores
+    ));
+    out.push_str(&format!(
+        "  source     : {}  dataset={}\n",
+        p.source, p.dataset_id
+    ));
+    if let Some(flight) = &p.flight_endpoint {
+        out.push_str(&format!(
+            "  flight sql : {flight} (scan diagnostics are not on the wire)\n"
+        ));
+    }
+    out.push_str(&format!("  dataset    : {}\n", dataset_line(d)));
+    out.push_str(&format!("  runs/query : {}\n", p.runs));
+    out.push_str(&format!(
+        "  deadline   : {} s per statement\n",
+        p.deadline_secs
+    ));
+    out.push_str(&format!("  fetch conc : {}\n", p.fetch_concurrency));
+    out.push_str(&format!(
+        "  req cost   : {} bytes\n",
+        p.logs_request_cost_bytes
+    ));
+    out.push_str(&format!(
+        "  query max  : requested={} bytes  effective={}\n",
         p.sql_max_query_bytes_requested,
         match p.sql_max_query_bytes_effective {
             Some(v) => format!("{v} bytes"),
@@ -471,17 +501,17 @@ fn print_human_table(report: &SqlLatencyReport) {
             // effective value is the server's own.
             None => "unknown (server config)".to_string(),
         }
-    );
-    println!(
-        "  tenant max : {} bytes  parallel final agg: requested={} effective={}",
+    ));
+    out.push_str(&format!(
+        "  tenant max : {} bytes  parallel final agg: requested={} effective={}\n",
         p.tenant_max_bytes, p.parallel_final_aggregation_requested, effective
-    );
-    println!(
-        "  max segs   : {}  explain: {}",
+    ));
+    out.push_str(&format!(
+        "  max segs   : {}  explain: {}\n",
         p.sql_max_segments, p.explain
-    );
-    println!(
-        "  warm cat   : {}",
+    ));
+    out.push_str(&format!(
+        "  warm cat   : {}\n",
         match p.warm_catalog {
             Some(true) =>
                 "true (resolve phase warm after the first statement, as a server's would be)",
@@ -491,16 +521,25 @@ fn print_human_table(report: &SqlLatencyReport) {
             // governed nothing on the wire (issue #857 review).
             None => "n/a (Flight lane; the server governs resolve caching)",
         }
-    );
+    ));
     if p.cache_bytes > 0 {
-        println!("  read cache : {} bytes", p.cache_bytes);
+        out.push_str(&format!("  read cache : {} bytes\n", p.cache_bytes));
     } else {
-        println!("  read cache : off");
+        out.push_str("  read cache : off\n");
     }
     match p.logs_suffix_len {
-        Some(n) => println!("  suffix len : {n} bytes (pinned; overrides per-object derivation)"),
-        None => println!("  suffix len : per-object derivation"),
+        Some(n) => out.push_str(&format!(
+            "  suffix len : {n} bytes (pinned; overrides per-object derivation)\n"
+        )),
+        None => out.push_str("  suffix len : per-object derivation\n"),
     }
+    out
+}
+
+fn print_human_table(report: &SqlLatencyReport) {
+    let p = &report.provenance;
+    let d = &report.dataset;
+    print!("{}", provenance_header(p, d));
     println!();
     // `get` is the cold run's object-store GETs; the `w_` columns are the warm
     // run's (run 1) GETs, store bytes, and fetch-cache hits, so a reader can see
@@ -726,6 +765,76 @@ mod tests {
         assert_eq!(
             parallel_final_aggregation_effective_label(Some(false)),
             "false"
+        );
+    }
+
+    /// A provenance with `logs_request_cost_bytes` set to `cost` and every
+    /// other field at a plausible fixed value, for exercising the header stamp
+    /// in isolation.
+    fn provenance_with_cost(cost: u64) -> Provenance {
+        Provenance {
+            store_backend: "memory".to_string(),
+            region: "n/a".to_string(),
+            endpoint: "n/a".to_string(),
+            host_logical_cores: 4,
+            source: "generate".to_string(),
+            dataset_id: "t".to_string(),
+            runs: 3,
+            cache_bytes: 0,
+            deadline_secs: 30,
+            fetch_concurrency: ravel_query::DEFAULT_FETCH_CONCURRENCY,
+            logs_request_cost_bytes: cost,
+            sql_max_query_bytes_requested: DEFAULT_MAX_QUERY_BYTES,
+            sql_max_query_bytes_effective: Some(DEFAULT_MAX_QUERY_BYTES),
+            tenant_max_bytes: 1 << 30,
+            sql_max_segments: ravel_query::DEFAULT_MAX_SEGMENTS,
+            parallel_final_aggregation_requested: true,
+            parallel_final_aggregation_effective: Some(true),
+            explain: false,
+            warm_catalog: Some(false),
+            logs_suffix_len: None,
+            flight_endpoint: None,
+        }
+    }
+
+    /// The header stamps the configured request-cost value, in bytes, exactly
+    /// once. A distinctive value is used so the exactly-once count cannot be
+    /// satisfied by a coincidental match against another field, and the line is
+    /// asserted verbatim so a dropped `bytes` unit or a changed value fails.
+    #[test]
+    fn header_stamps_configured_request_cost_once() {
+        let cost = 4_242_424;
+        let d = dataset("pre-compaction", None);
+        let header = provenance_header(&provenance_with_cost(cost), &d);
+        let line = format!("  req cost   : {cost} bytes");
+        assert!(
+            header.contains(&line),
+            "header must stamp the configured request cost verbatim; got:\n{header}"
+        );
+        assert_eq!(
+            header.matches(&format!("{cost}")).count(),
+            1,
+            "the request-cost value must be stamped exactly once; got:\n{header}"
+        );
+    }
+
+    /// With the flag absent, the value reaching the header is
+    /// `ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES`, so the stamp shows the
+    /// constant, not a hardcoded literal that could drift from the engine.
+    #[test]
+    fn header_stamps_default_request_cost_when_absent() {
+        let d = dataset("pre-compaction", None);
+        let header = provenance_header(
+            &provenance_with_cost(ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES),
+            &d,
+        );
+        let line = format!(
+            "  req cost   : {} bytes",
+            ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES
+        );
+        assert!(
+            header.contains(&line),
+            "an unspecified run stamps the engine default; got:\n{header}"
         );
     }
 
