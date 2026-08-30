@@ -428,13 +428,59 @@ fn the_ci_profile_generates_its_exact_declared_sample_count() {
         report.float_samples + report.stale_markers + report.native_histogram_samples,
         report.emitted_samples
     );
-    // The injected anomalies all fired: a run that produced none of them would
-    // pass every count above while generating a workload the ADR does not
-    // describe.
-    assert!(report.stale_markers > 0, "no staleness markers");
-    assert!(report.omitted_missing_samples > 0, "no missing samples");
-    assert!(report.counter_reset_events > 0, "no counter resets");
-    assert!(report.out_of_order_samples > 0, "no out-of-order samples");
+    // The injected anomalies all fired at their designed rate: a run that
+    // produced one marker where the profile designs for dozens would pass every
+    // count above while generating a workload the ADR does not describe. The
+    // generator is deterministic on this seed and profile, so each figure is
+    // exact. Each is also checked against the nominal count its own one-in rate
+    // implies, so a constant that stops tracking the design is visible as more
+    // than a changed number.
+    let anomalies = workload.generator.anomalies;
+    let steps = ci.samples_per_series;
+    // Instances scraped per step, from the family shares of the 1,000 active
+    // series: 400 cpu gauge, 300 counter, 15 classic histogram (10 series
+    // each), 100 native, 50 build_info gauge. Staleness applies to gauges only
+    // and resets to counters and classic histograms only.
+    let gauge_scrapes = 450 * steps;
+    let counter_scrapes = (300 + 15) * steps;
+    let instance_scrapes = 865 * steps;
+    // The omission and out-of-order figures count series rather than instances,
+    // so their nominals are instance-rate approximations; a factor of two
+    // absorbs the per-instance series weighting without admitting a fraction of
+    // the designed rate.
+    for (label, observed, nominal) in [
+        (
+            "stale markers",
+            report.stale_markers,
+            gauge_scrapes / anomalies.stale_marker_one_in,
+        ),
+        (
+            "missing samples",
+            report.omitted_missing_samples,
+            instance_scrapes / anomalies.missing_sample_one_in,
+        ),
+        (
+            "counter resets",
+            report.counter_reset_events,
+            counter_scrapes / anomalies.counter_reset_one_in,
+        ),
+        (
+            "out-of-order samples",
+            report.out_of_order_samples,
+            instance_scrapes / anomalies.out_of_order_one_in,
+        ),
+    ] {
+        assert!(
+            observed >= nominal / 2 && observed <= nominal * 2,
+            "{label}: {observed} is not within a factor of two of the {nominal} \
+             the profile's own rate designs for"
+        );
+    }
+    // The exact figures this seed produces.
+    assert_eq!(report.stale_markers, 62, "staleness markers");
+    assert_eq!(report.omitted_missing_samples, 225, "missing samples");
+    assert_eq!(report.counter_reset_events, 34, "counter resets");
+    assert_eq!(report.out_of_order_samples, 182, "out-of-order samples");
 }
 
 /// The `metricsbench_gen` binary, resolved the way an integration test can.
