@@ -197,6 +197,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         None => Box::new(std::io::sink()),
     };
     let report = generator.generate_into(steps, &mut sink)?;
+    // Flush at the call site and propagate: a BufWriter dropped without a flush
+    // swallows the error and can lose the tail of the artifact while the process
+    // still exits zero.
+    sink.flush()?;
     drop(sink);
 
     let per_class: Vec<serde_json::Value> = class_counts(&entries)

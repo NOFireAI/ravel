@@ -73,7 +73,7 @@ pub const CORPUS_FORMAT_VERSION: u32 = 1;
 /// changing the computed result is, and a modified query cannot exist without a
 /// stated reason.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Modification {
     /// The query computes what its upstream original computes.
     #[default]
@@ -336,27 +336,48 @@ pub fn known_construct_names() -> BTreeSet<&'static str> {
 /// artifact and for an external file.
 pub fn gate_corpus(entries: &[CorpusEntry]) -> Result<(), CorpusError> {
     let known = known_construct_names();
-    // A corpus either classes every entry or none. If it classes any, an
-    // unclassified entry is a hard error here where the classes are consumed,
-    // not a silent fall-through to a default class.
+
+    // Each check runs across the WHOLE corpus before the next begins, in the
+    // order the module contract states. Sharing one loop lets a later check on
+    // an earlier entry win over an earlier check on a later entry (a duplicate
+    // id at entry 1 reported ahead of an unclassified entry at entry 5),
+    // contradicting the stated precedence.
+
+    // 1. All-or-none classification. A corpus either classes every entry or
+    //    none; a mix would let an unclassified entry read as a default class
+    //    where the classes are consumed.
     let uses_cost_classes = entries.iter().any(|e| e.class.is_some());
+    if uses_cost_classes {
+        for entry in entries {
+            if entry.class.is_none() {
+                return Err(CorpusError::UnclassifiedEntry {
+                    entry_id: entry.id.clone(),
+                });
+            }
+        }
+    }
+
+    // 2. Unique ids.
     let mut seen_ids: HashSet<&str> = HashSet::new();
     for entry in entries {
-        if uses_cost_classes && entry.class.is_none() {
-            return Err(CorpusError::UnclassifiedEntry {
-                entry_id: entry.id.clone(),
-            });
-        }
         if !seen_ids.insert(entry.id.as_str()) {
             return Err(CorpusError::DuplicateId {
                 entry_id: entry.id.clone(),
             });
         }
+    }
+
+    // 3. Non-empty construct list.
+    for entry in entries {
         if entry.constructs.is_empty() {
             return Err(CorpusError::NoConstructs {
                 entry_id: entry.id.clone(),
             });
         }
+    }
+
+    // 4. Non-blank modification reason.
+    for entry in entries {
         if let Modification::Modified { reason } = &entry.modified
             && reason.trim().is_empty()
         {
@@ -364,6 +385,10 @@ pub fn gate_corpus(entries: &[CorpusEntry]) -> Result<(), CorpusError> {
                 entry_id: entry.id.clone(),
             });
         }
+    }
+
+    // 5. Every named construct known to the registry.
+    for entry in entries {
         for construct in &entry.constructs {
             if !known.contains(construct.as_str()) {
                 return Err(CorpusError::UnknownConstruct {
@@ -463,6 +488,55 @@ mod tests {
         // rule triggers only once one entry carries a class.
         gate_corpus(&[entry("a", None), entry("b", None)])
             .expect("a fully unclassed corpus gates clean");
+    }
+
+    #[test]
+    fn the_classification_check_runs_across_the_whole_corpus_before_the_id_check() {
+        // A corpus with an EARLIER duplicate id and a LATER unclassified entry
+        // is invalid two ways. The contract (module docs, checks 1..5) runs the
+        // all-or-none classification check across the whole corpus first, so the
+        // classification failure must win regardless of entry order. A shared
+        // loop that checks id-then-class per entry returns DuplicateId instead,
+        // contradicting the stated order.
+        let a = entry("dup", Some(CostClass::HighFanOut));
+        let b = entry("dup", Some(CostClass::Join)); // duplicate id, earlier
+        let c = entry("later", None); // unclassified, later
+        let err = gate_corpus(&[a, b, c]).expect_err("the corpus is invalid two ways");
+        assert!(
+            matches!(&err, CorpusError::UnclassifiedEntry { entry_id } if entry_id == "later"),
+            "classification must be checked across the whole corpus before the id check, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_modification_with_an_unknown_field_is_a_deserialization_error() {
+        // The nested-struct instance of the deny_unknown_fields hole the
+        // top-level `CorpusEntry`/`CorpusFile` already close: without the
+        // attribute on `Modification`, `{"reason":"x","reasno":"x"}` drops
+        // `reasno` silently and the entry reads as a disclosed modification with
+        // the wrong intent recorded.
+        let typo = serde_json::json!({
+            "id": "a",
+            "promql": "up",
+            "constructs": ["vector selector"],
+            "modified": {"modified": {"reason": "x", "reasno": "x"}}
+        });
+        let err = serde_json::from_value::<CorpusEntry>(typo)
+            .expect_err("an unknown field inside `modified` must fail to deserialize");
+        assert!(
+            err.to_string().contains("reasno"),
+            "the error must name the offending field, got: {err}"
+        );
+
+        // The same entry without the typo parses and records the modification.
+        let ok = serde_json::json!({
+            "id": "a",
+            "promql": "up",
+            "constructs": ["vector selector"],
+            "modified": {"modified": {"reason": "x"}}
+        });
+        let parsed: CorpusEntry = serde_json::from_value(ok).expect("the correct shape parses");
+        assert!(parsed.modified.is_modified());
     }
 
     #[test]
