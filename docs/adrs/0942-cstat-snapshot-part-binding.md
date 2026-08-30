@@ -91,23 +91,60 @@ uniquely name a part, so it cannot be the coverage identity for L1 state.
 
 ## Decision
 
-Re-key `.cstat` state to the snapshot **part**, matching what ADR-0913 does
-for `.magg` state at `SnapshotHead` field 12. A part is the unit the fold
-already carries forward by reference for sealed hours (docs/catalog-and-mvcc.md,
-"Fold reconcile pass": "sealed parts are deliberately carried forward by
-reference and never rewritten"), and it names L0 and L1 entries uniformly by
-content hash, so binding to the part covers compacted history without
-overloading any writer-identity slot. Concretely:
+Re-key `.cstat` per-segment coverage to the covered data object's **content
+hash**, and bind the whole `.cstat` object to the snapshot part set the way
+ADR-0913 binds `.magg` state at `SnapshotHead` field 12. The fold already
+records that content hash on every entry it produces:
+`SnapshotEntry.content_hash` is the commit record's segment hash for an L0
+entry (`fold::build_snapshot_entry`) and the compaction/rewrite part's own
+object hash for an L1 entry
+(`fold::build_l1_snapshot_entry`/`build_rewrite_l1_snapshot_entry`), and a
+reader recovers the identical value from a resolved `SegmentRef.content_hash`.
+The content hash names L0 and L1 entries uniformly, so it covers compacted
+history the five-field tuple cannot name uniquely, and it is per data object,
+so two L1 parts of one bucket never collide. Concretely:
 
-- **`ColumnStatsSegment` binds the covered part's exact
-  `SnapshotPartRef.blake3`**, and a reader joins a resolved segment to its
-  statistics by that part hash, exactly the ADR-0913 §2a carrier. The
-  five-field identity tuple stops being the join key; it may remain as
-  informational content, but coverage identity is the part hash. This makes
-  blocker 1's nil collapse and blocker 3's collision impossible: two L1 parts
-  of one bucket have two distinct `blake3` values by construction (immutable,
-  content-addressed objects), and blocker 2's 16-byte requirement no longer
-  applies because the key is a 32-byte content hash, not a writer id.
+- **Each `ColumnStatsSegment` record is keyed by the covered data object's
+  content hash** -- `SnapshotEntry.content_hash`, equal to a resolved
+  `SegmentRef.content_hash` -- and a reader joins a resolved segment to its
+  statistics by that content hash. The whole `.cstat` object stays bound to
+  the covered part set the way ADR-0913 §2a binds `.magg` (the
+  `SnapshotColumnStatsPartRef.part_blake3` list validates the object against
+  the current folded HEAD's parts), but the per-segment coverage identity is
+  the data object's content hash, not the part hash. The five-field identity
+  tuple stops being the join key; it may remain as informational content, but
+  coverage identity is the content hash. This makes blocker 1's nil collapse
+  and blocker 3's collision impossible: each data object is immutable and
+  content-addressed, so the two L1 parts of one bucket have two distinct
+  content hashes by construction, and blocker 2's 16-byte requirement no
+  longer applies because the key is a 32-byte content hash, not a writer id.
+- **The key rides in the existing `ColumnStatsSegment.writer_id` slot, not a
+  new proto field.** The encoder and decoder validate and sort each record by
+  `writer_id`, whose accepted length becomes version-dependent: a 16-byte
+  identity-tuple component for a v1 record, the 32-byte data-object content
+  hash for a v2 record. This deliberately overloads a slot whose proto doc
+  comment (`ColumnStatsSegment` in `proto/ravel/catalog.proto`) still
+  describes only the v1 five-field-tuple meaning. A3 depends on this carrier;
+  documenting the overload in `proto/` is a follow-up, not part of this ADR.
+
+### Correction: the join key is the data object content hash, not the part hash
+
+An earlier accepted revision of this ADR named the join key as the covered
+part's `SnapshotPartRef.blake3` and argued that "two L1 parts of one bucket
+have two distinct `blake3` values by construction." That identifier was wrong,
+and adopting it would have re-created the exact collision this ADR exists to
+remove. A `SnapshotPartRef` is a `.csnap` snapshot part covering an hour range
+and containing many segments, so the two L1 parts of one `(shard, hour)`
+bucket live inside one snapshot part and share its single
+`SnapshotPartRef.blake3`; keying on it merges their statistics, which is
+blocker 3. The distinctness the argument relied on is a property of the data
+object, not of the snapshot part that contains many of them. The correct key
+is the data object's content hash (`SnapshotEntry.content_hash`, equal to a
+resolved `SegmentRef.content_hash`), which is per-segment and content-
+addressed, and which the implementation (issue #949) already uses. This
+correction is recorded rather than silently rewritten because the ADR is
+Accepted: a later reader must not "restore" the part reference believing it
+was the intent.
 
 ### The wire change is additive only
 
@@ -161,7 +198,7 @@ requires of every format ADR.
 The Class B convergence plan:
 
 - **The fold dual-publishes during the rollout.** The upgraded fold emits the
-  new part-bound keying (envelope v2) under field 13 **and keeps publishing
+  new content-hash keying (envelope v2) under field 13 **and keeps publishing
   the field-11 v1 object**, until every process reading the bucket
   understands field 13. Retiring field 11 at the first v2 publish would be a
   writers-before-readers change of exactly the kind ADR-0066 decision 1
@@ -183,7 +220,7 @@ The Class B convergence plan:
   which is only true because of the dual-publish rule above.
 - **Reader rule for an old-keyed (v1, field-11) `.cstat`:** read it under the
   ADR-0850 L0 five-field join and gain L0 coverage only; treat the absence of
-  a matching part-bound record for any segment as fall-back-to-scan, never as
+  a matching content-hash-keyed record for any segment as fall-back-to-scan, never as
   an error. A v1 object encountered under field 13, a v2 object under field
   11, a `blake3` mismatch, a version this reader does not understand, or a
   decode failure all subtract that object's coverage and scan -- the exact
@@ -228,7 +265,7 @@ rebuild.
 **The backfill trigger this ADR names:** an operator-triggered
 stats-rebuild pass that runs the fold's full-rebuild code path over the
 tenant, with the `.cstat` baseline forced to `None` so every sealed part is
-re-listed and re-folded once, emitting part-bound (v2, field 13) records for
+re-listed and re-folded once, emitting content-hash-keyed (v2, field 13) records for
 all L0 and L1 entries. This is ADR-0066 decision 5's operator-triggered
 migration job for the tail neither retention nor rewrite-on-touch reaches,
 and it is the same "one maintenance pass that forces a rebuild fold over
@@ -250,7 +287,7 @@ Being exact about which tenants, because the two halves of Class B behave
 differently and the distinction is the whole point of this section:
 
 - A **live** tenant converges on its own. It keeps ingesting, so it keeps
-  folding, and the upgraded fold emits part-bound v2 records for the parts it
+  folding, and the upgraded fold emits content-hash-keyed v2 records for the parts it
   touches. Its recent history gains coverage with no operator action. Its
   sealed history does not, because sealed parts are carried forward by
   reference and never re-listed.
@@ -273,13 +310,13 @@ Neither case reaches sealed history without the backfill pass.
   unchanged for L0 and adds L1 as a parallel case, so no existing L0 `.cstat`
   object changes meaning and no envelope bump is strictly required for the L0
   path. It lost because the wider key is a second identity vocabulary that
-  both crates must construct and match bit-for-bit, duplicating for `.cstat`
-  the exact L0/L1 identity split the rest of the catalog already carries once
-  on the part hash; ADR-0913 chose the part hash for `.magg` for the same
-  reason, so a level-aware `.cstat` key would leave the two sibling derived
-  objects keyed two different ways, and a reader joining both against one
-  resolved snapshot would maintain two join maps where one suffices. Part
-  binding also subsumes the L0 case (an L0 part has a `blake3` too), so the
+  both crates must construct and match bit-for-bit, reintroducing an L0/L1
+  identity split for `.cstat` when the resolved `SegmentRef` already carries
+  one uniform per-segment identity for both levels: `content_hash`. Keying on
+  that single value -- as this ADR does -- lets a reader join `.cstat` with a
+  map keyed the way it already identifies every segment, where the level-aware
+  key would force it to construct and match a two-case key. The content hash
+  also subsumes the L0 case (an L0 data object has a content hash too), so the
   level-aware key carries the tuple purely to avoid re-keying L0, which the
   Class B convergence plan makes cheap to do anyway.
 - **Defer L1 coverage again (ADR-0850's cut, unchanged).** Rejected: the
@@ -297,9 +334,9 @@ Neither case reaches sealed history without the backfill pass.
 - **What changes:** L1 (and rewrite-output) segments become coverable by
   exact column statistics, so a metadata-decomposable query
   (ADR-0850's q02/q07/q08 shapes) over a compacted tenant can answer from
-  metadata instead of scanning every part. The join is by part hash, which
-  is already unique per part, so the collision failure mode of blocker 3
-  cannot occur.
+  metadata instead of scanning every part. The join is by the data object's
+  content hash, unique per object because it is content-addressed, so the
+  collision failure mode of blocker 3 cannot occur.
 - **What does not change:** the ADR-0850 fold-time statistics builder's
   arithmetic (counts, min/max, dictionary, integer sum), its cardinality
   ceiling, its `.cstat` envelope framing and magic (`RCST`), the
@@ -334,12 +371,12 @@ flowchart TD
     OL1 -.->|"32-byte input_set_hash<br/>fails 16-byte try_from at load"| DROP["record dropped"]
   end
 
-  subgraph new["ADR-0942 join (part-hash keyed, field 13)"]
+  subgraph new["ADR-0942 join (content-hash keyed, field 13)"]
     NH["SnapshotHead.column_stats_part = 13"] --> NC[".cstat v2"]
-    NC --> NSEG["ColumnStatsSegment keyed by<br/>covered part blake3"]
-    NL0["L0 part<br/>blake3 A"] -->|"part hash matches"| NSEG
-    NL1a["L1 part 0<br/>blake3 B"] -->|"unique per part"| NSEG
-    NL1b["L1 part 1<br/>blake3 C"] -->|"unique per part"| NSEG
+    NC --> NSEG["ColumnStatsSegment keyed by<br/>data object content_hash"]
+    NL0["L0 segment<br/>content_hash A"] -->|"content hash matches"| NSEG
+    NL1a["L1 part 0<br/>content_hash B"] -->|"unique per data object"| NSEG
+    NL1b["L1 part 1<br/>content_hash C"] -->|"unique per data object"| NSEG
   end
 
   old -->|"re-key, additive field + envelope v1 to v2,<br/>backfilled by a forced rebuild fold"| new
