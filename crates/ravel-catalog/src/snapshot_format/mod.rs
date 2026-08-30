@@ -90,8 +90,28 @@ impl Default for PostingsLimits {
 /// (ADR-0850).
 pub const COLUMN_STATS_MAGIC: [u8; 4] = *b"RCST";
 
-/// Column-statistics envelope format version. This is the v1 layout.
-pub const COLUMN_STATS_VERSION: u8 = 1;
+/// Column-statistics envelope WRITE version: the version the fold stamps into
+/// every `.cstat` object it writes. It stays 1 in this change; ADR-0942's A2
+/// step raises it to 2 when the writer begins emitting part-hash-keyed
+/// objects. Single source for the stamped version so that later bump edits one
+/// literal.
+pub const COLUMN_STATS_WRITE_VERSION: u8 = 1;
+
+/// Column-statistics envelope ACCEPTED READ SET: the versions
+/// `decode_column_stats` accepts. v1 is ADR-0850's L0-tuple keying; v2 is
+/// ADR-0942's part-hash keying. The decoder checks MEMBERSHIP against this set,
+/// never equality against [`COLUMN_STATS_WRITE_VERSION`]: bumping the write
+/// version must not make the decoder reject the v1 objects the ADR-0942 L0
+/// reader rule still depends on. Single source for the accepted set so a later
+/// version is added in one place. v2 is accepted before anything writes one, so
+/// A2's writer and this decoder cannot disagree the moment v2 first appears.
+pub const COLUMN_STATS_ACCEPTED_READ_VERSIONS: [u8; 2] = [1, 2];
+
+/// Whether `version` is an accepted `.cstat` envelope read version. Membership,
+/// not equality against the write version (ADR-0942).
+pub fn column_stats_version_accepted(version: u8) -> bool {
+    COLUMN_STATS_ACCEPTED_READ_VERSIONS.contains(&version)
+}
 
 /// Reserved column-statistics envelope bytes; must always be zero in v1.
 pub const COLUMN_STATS_RESERVED: [u8; 3] = [0, 0, 0];
@@ -159,6 +179,7 @@ mod tests {
             created_unix_ns: 0,
             shard_generation_count: 1,
             column_stats: None,
+            column_stats_part: None,
         }
     }
 
@@ -369,7 +390,8 @@ mod tests {
         assert_eq!(POSTINGS_RESERVED, [0, 0, 0]);
         assert_eq!(DEFAULT_MAX_POSTINGS_BYTES, 256 << 20);
         assert_eq!(COLUMN_STATS_MAGIC, *b"RCST");
-        assert_eq!(COLUMN_STATS_VERSION, 1);
+        assert_eq!(COLUMN_STATS_WRITE_VERSION, 1);
+        assert_eq!(COLUMN_STATS_ACCEPTED_READ_VERSIONS, [1, 2]);
         assert_eq!(COLUMN_STATS_RESERVED, [0, 0, 0]);
         assert_eq!(DEFAULT_MAX_COLUMN_STATS_BYTES, 256 << 20);
         assert_eq!(DEFAULT_MAX_COLUMN_DICTIONARY_ENTRIES, 10_000);
