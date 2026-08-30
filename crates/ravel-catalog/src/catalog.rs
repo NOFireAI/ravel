@@ -3466,6 +3466,7 @@ mod tests {
             created_unix_ns: 0,
             shard_generation_count: 1,
             column_stats: None,
+            column_stats_part: None,
         }
     }
 
@@ -3963,6 +3964,7 @@ mod tests {
             postings: None,
             shard_generation_count: 1,
             column_stats: None,
+            column_stats_part: None,
         };
         let head_bytes = crate::snapshot_format::encode_head(&head).expect("encode head");
         store
@@ -4061,6 +4063,7 @@ mod tests {
             postings: None,
             shard_generation_count: 2,
             column_stats: None,
+            column_stats_part: None,
         };
         let head_bytes = crate::snapshot_format::encode_head(&head).expect("encode head");
         inner
@@ -5389,6 +5392,7 @@ mod tests {
                 segment_count: 1,
                 part_blake3: vec![part_hash.to_vec()],
             }),
+            column_stats_part: None,
         };
         let head_bytes = crate::snapshot_format::encode_head(&head).expect("encode head");
         store
@@ -5512,6 +5516,7 @@ mod tests {
                 segment_count: 1,
                 part_blake3: vec![part_hash.to_vec()],
             }),
+            column_stats_part: None,
         };
         let head_bytes = crate::snapshot_format::encode_head(&head).expect("encode head");
         store

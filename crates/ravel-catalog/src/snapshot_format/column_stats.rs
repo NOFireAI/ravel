@@ -29,8 +29,8 @@ use ravel_proto::catalog::v1::{ColumnStat, ColumnStatsHeader, ColumnStatsSegment
 
 use super::error::SnapshotFormatError;
 use super::{
-    COLUMN_STATS_MAGIC, COLUMN_STATS_RESERVED, COLUMN_STATS_VERSION, MIN_COLUMN_STATS_ENVELOPE_LEN,
-    ZSTD_LEVEL,
+    COLUMN_STATS_MAGIC, COLUMN_STATS_RESERVED, COLUMN_STATS_WRITE_VERSION,
+    MIN_COLUMN_STATS_ENVELOPE_LEN, ZSTD_LEVEL, column_stats_version_accepted,
 };
 use crate::snapshot_format::ColumnStatsLimits;
 
@@ -51,6 +51,28 @@ pub fn encode_column_stats(
     part_blake3: Vec<Vec<u8>>,
     segments: &[ColumnStatsSegment],
 ) -> Result<Vec<u8>, SnapshotFormatError> {
+    encode_column_stats_versioned(
+        COLUMN_STATS_WRITE_VERSION,
+        tenant_hash,
+        signal,
+        part_blake3,
+        segments,
+    )
+}
+
+/// Envelope framing shared by the public writer and the tests. Parameterised on
+/// `version` so a test can construct a v2 object (ADR-0942) without a v2 writer:
+/// production only ever reaches it through [`encode_column_stats`] with
+/// [`COLUMN_STATS_WRITE_VERSION`], so nothing writes a v2 object yet. Stamps
+/// `version` into both the envelope version byte and the header
+/// `format_version`, so the two always agree by construction.
+fn encode_column_stats_versioned(
+    version: u8,
+    tenant_hash: [u8; 16],
+    signal: u32,
+    part_blake3: Vec<Vec<u8>>,
+    segments: &[ColumnStatsSegment],
+) -> Result<Vec<u8>, SnapshotFormatError> {
     validate_segments(segments)?;
 
     let mut segments_raw = Vec::new();
@@ -63,7 +85,7 @@ pub fn encode_column_stats(
         .map_err(|e| SnapshotFormatError::Compress(e.to_string()))?;
 
     let header = ColumnStatsHeader {
-        format_version: u32::from(COLUMN_STATS_VERSION),
+        format_version: u32::from(version),
         tenant_hash: tenant_hash.to_vec(),
         signal,
         part_blake3,
@@ -77,7 +99,7 @@ pub fn encode_column_stats(
     let mut out =
         Vec::with_capacity(MIN_COLUMN_STATS_ENVELOPE_LEN + header_bytes.len() + body.len());
     out.extend_from_slice(&COLUMN_STATS_MAGIC);
-    out.push(COLUMN_STATS_VERSION);
+    out.push(version);
     out.extend_from_slice(&COLUMN_STATS_RESERVED);
     out.extend_from_slice(&header_len.to_le_bytes());
     out.extend_from_slice(&header_bytes);
@@ -112,7 +134,10 @@ pub fn decode_column_stats(
         return Err(SnapshotFormatError::ColumnStatsBadMagic);
     }
     let version = take_bytes(bytes, &mut pos, 1)?[0];
-    if version != COLUMN_STATS_VERSION {
+    // Membership in the accepted read set, not equality against the write
+    // version (ADR-0942): a v1 object must keep decoding after A2 bumps the
+    // write version to 2, or the L0 reader path loses coverage.
+    if !column_stats_version_accepted(version) {
         return Err(SnapshotFormatError::ColumnStatsUnsupportedVersion(version));
     }
     let reserved = take_array::<3>(bytes, &mut pos)?;
@@ -141,10 +166,15 @@ pub fn decode_column_stats(
 
     let header = ColumnStatsHeader::decode(header_bytes)
         .map_err(|e| SnapshotFormatError::ColumnStatsHeaderDecode(e.to_string()))?;
-    if header.format_version != u32::from(COLUMN_STATS_VERSION) {
+    // The header's self-declared version must agree with the accepted envelope
+    // version byte. The byte already passed the membership gate above, so this
+    // accepts any object in the read set while still rejecting a header that
+    // disagrees with its own envelope (the ADR-0942 self-describing-state rule:
+    // a v1 header under a v2 envelope, or vice versa, subtracts coverage).
+    if header.format_version != u32::from(version) {
         return Err(SnapshotFormatError::ColumnStatsHeaderVersionMismatch {
             header: header.format_version,
-            envelope: COLUMN_STATS_VERSION,
+            envelope: version,
         });
     }
     if header.tenant_hash.len() != 16 {
@@ -767,6 +797,209 @@ mod tests {
         seg.columns[0].sum = None;
         encode_column_stats([0x11; 16], 3, vec![vec![0x22; 32]], &[seg])
             .expect("an all-null column may carry no sum");
+    }
+
+    /// The regression that matters for ADR-0942 A1: the existing L0 path must
+    /// stay byte-for-byte readable after the version split. A v1 object decodes
+    /// with EXACT expected field values, not merely `is_ok()`.
+    #[test]
+    fn v1_object_decodes_with_exact_field_values() {
+        let seg = segment(1, 0, 1);
+        let bytes = encode_column_stats(
+            [0x11; 16],
+            3,
+            vec![vec![0x22; 32]],
+            std::slice::from_ref(&seg),
+        )
+        .expect("v1 encodes");
+        // The public writer stamps the write version, which is 1 in A1.
+        assert_eq!(bytes[4], 1, "envelope version byte is the v1 write version");
+        let decoded =
+            decode_column_stats(&bytes, &ColumnStatsLimits::default()).expect("v1 decodes");
+        assert_eq!(decoded.header.format_version, 1);
+        assert_eq!(decoded.header.tenant_hash, vec![0x11; 16]);
+        assert_eq!(decoded.header.signal, 3);
+        assert_eq!(decoded.header.part_blake3, vec![vec![0x22; 32]]);
+        assert_eq!(decoded.header.segment_count, 1);
+        assert_eq!(decoded.segments.len(), 1);
+        let out = &decoded.segments[0];
+        assert_eq!(out.ingest_hour_bucket, 1);
+        assert_eq!(out.shard, 0);
+        assert_eq!(out.writer_id, vec![0xAA; 16]);
+        assert_eq!(out.writer_epoch, 1);
+        assert_eq!(out.writer_seq, 1);
+        assert_eq!(out.columns.len(), 1);
+        let col = &out.columns[0];
+        assert_eq!(col.name, "AdvEngineID");
+        assert_eq!(col.declared_type, 2);
+        assert_eq!(col.non_null_count, 10);
+        assert_eq!(col.null_count, 0);
+        assert_eq!(col.min, Some(i64_value(0)));
+        assert_eq!(col.max, Some(i64_value(9)));
+        assert!(col.dictionary_present);
+        assert_eq!(col.dictionary.len(), 10);
+        assert_eq!(col.sum, Some(45));
+    }
+
+    /// ADR-0942: a v2-stamped object must decode today, even though nothing
+    /// writes one, so A2's writer and this decoder cannot disagree the moment
+    /// v2 first appears. Constructed directly via the versioned framing helper
+    /// (no v2 writer needed). This is also the test the "prove-the-test"
+    /// demonstration flips the decoder to break: change the `:115`
+    /// `column_stats_version_accepted(version)` membership check back to
+    /// `version != COLUMN_STATS_WRITE_VERSION` and this fails with
+    /// `ColumnStatsUnsupportedVersion(2)`.
+    #[test]
+    fn v2_stamped_object_decodes() {
+        let seg = segment(1, 0, 1);
+        let bytes = encode_column_stats_versioned(
+            2,
+            [0x11; 16],
+            3,
+            vec![vec![0x22; 32]],
+            std::slice::from_ref(&seg),
+        )
+        .expect("v2 framing encodes");
+        assert_eq!(bytes[4], 2, "envelope version byte is v2");
+        let decoded =
+            decode_column_stats(&bytes, &ColumnStatsLimits::default()).expect("v2 decodes");
+        assert_eq!(decoded.header.format_version, 2);
+        assert_eq!(decoded.segments, vec![seg]);
+    }
+
+    /// A version outside the accepted set is refused with the specific typed
+    /// error carrying the offending version, not merely "an error occurred".
+    #[test]
+    fn version_outside_accepted_set_rejected() {
+        for bad in [0u8, 3, 255] {
+            let seg = segment(1, 0, 1);
+            let bytes =
+                encode_column_stats_versioned(bad, [0x11; 16], 3, vec![vec![0x22; 32]], &[seg])
+                    .expect("framing encodes any version byte");
+            let err = decode_column_stats(&bytes, &ColumnStatsLimits::default())
+                .expect_err("version outside the accepted set is rejected");
+            assert_eq!(
+                err,
+                SnapshotFormatError::ColumnStatsUnsupportedVersion(bad),
+                "version {bad} must be refused with its own version"
+            );
+        }
+    }
+
+    /// The accepted read set is exactly {1, 2} and nothing else across the whole
+    /// u8 domain. The expectation is a hardcoded `1 | 2`, deliberately NOT
+    /// `COLUMN_STATS_ACCEPTED_READ_VERSIONS.contains(..)`: adding a version to
+    /// the constant later cannot silently widen what is accepted without this
+    /// literal changing too.
+    #[test]
+    fn accepted_read_set_is_exactly_v1_and_v2() {
+        for version in 0u8..=255 {
+            let seg = segment(1, 0, 1);
+            let bytes =
+                encode_column_stats_versioned(version, [0x11; 16], 3, vec![vec![0x22; 32]], &[seg])
+                    .expect("framing encodes any version byte");
+            let decoded = decode_column_stats(&bytes, &ColumnStatsLimits::default());
+            let expected_accept = matches!(version, 1 | 2);
+            assert_eq!(
+                decoded.is_ok(),
+                expected_accept,
+                "version {version} acceptance must match the hardcoded {{1, 2}} set"
+            );
+            if !expected_accept {
+                assert_eq!(
+                    decoded.expect_err("rejected"),
+                    SnapshotFormatError::ColumnStatsUnsupportedVersion(version)
+                );
+            }
+        }
+    }
+
+    /// A header whose self-declared `format_version` disagrees with its accepted
+    /// envelope version byte is rejected: a v2 envelope must not carry a v1
+    /// header. Built by decoding a v2 object, rewriting only the header's
+    /// `format_version` to 1, and re-stamping both CRCs so the object is
+    /// otherwise well-formed and the version disagreement is the sole defect.
+    #[test]
+    fn header_envelope_version_disagreement_rejected() {
+        let seg = segment(1, 0, 1);
+        // Encode a v2 object, then rebuild the envelope with the header claiming
+        // v1 while the envelope byte stays v2.
+        let header = ColumnStatsHeader {
+            format_version: 1, // disagrees with the v2 envelope byte below
+            tenant_hash: vec![0x11; 16],
+            signal: 3,
+            part_blake3: vec![vec![0x22; 32]],
+            segment_count: 1,
+            body_uncompressed_len: seg.encode_length_delimited_to_vec().len() as u64,
+        };
+        let header_bytes = header.encode_to_vec();
+        let segments_raw = seg.encode_length_delimited_to_vec();
+        let body = zstd::bulk::compress(&segments_raw, ZSTD_LEVEL).expect("compress");
+        let mut out = Vec::new();
+        out.extend_from_slice(&COLUMN_STATS_MAGIC);
+        out.push(2); // v2 envelope
+        out.extend_from_slice(&COLUMN_STATS_RESERVED);
+        out.extend_from_slice(&(header_bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(&header_bytes);
+        let header_crc = crc32c::crc32c(&out);
+        out.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        out.extend_from_slice(&body);
+        out.extend_from_slice(&crc32c::crc32c(&body).to_le_bytes());
+        out.extend_from_slice(&header_crc.to_le_bytes());
+
+        let err = decode_column_stats(&out, &ColumnStatsLimits::default())
+            .expect_err("header/envelope version disagreement is rejected");
+        assert_eq!(
+            err,
+            SnapshotFormatError::ColumnStatsHeaderVersionMismatch {
+                header: 1,
+                envelope: 2,
+            }
+        );
+    }
+
+    /// A truncated v2 envelope produces a typed error, never a panic and never
+    /// wrong data: every prefix of a well-formed v2 object is rejected.
+    #[test]
+    fn truncated_v2_envelope_is_typed_error() {
+        let seg = segment(1, 0, 1);
+        let bytes = encode_column_stats_versioned(2, [0x11; 16], 3, vec![vec![0x22; 32]], &[seg])
+            .expect("v2 framing encodes");
+        for len in 0..bytes.len() {
+            // Must return a typed error rather than panic; the whole object at
+            // full length is covered by `v2_stamped_object_decodes`.
+            let _: SnapshotFormatError =
+                decode_column_stats(&bytes[..len], &ColumnStatsLimits::default()).expect_err(
+                    "a truncated envelope must be a typed error, not Ok and not a panic",
+                );
+        }
+    }
+
+    /// A corrupted body under a v2 envelope is caught by the body CRC, a typed
+    /// error rather than a decode of wrong data.
+    #[test]
+    fn corrupt_v2_body_is_typed_error() {
+        let seg = segment(1, 0, 1);
+        let mut bytes =
+            encode_column_stats_versioned(2, [0x11; 16], 3, vec![vec![0x22; 32]], &[seg])
+                .expect("v2 framing encodes");
+        // Flip a byte inside the compressed body region (past the header,
+        // before the trailing CRCs).
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xFF;
+        let err = decode_column_stats(&bytes, &ColumnStatsLimits::default())
+            .expect_err("a corrupted body is rejected");
+        assert!(
+            matches!(
+                err,
+                SnapshotFormatError::ColumnStatsBodyCrcMismatch
+                    | SnapshotFormatError::ColumnStatsHeaderCrcMismatch
+                    | SnapshotFormatError::Decompress(_)
+                    | SnapshotFormatError::ColumnStatsDecompressedLenMismatch { .. }
+                    | SnapshotFormatError::ColumnStatsSegmentDecode(_)
+            ),
+            "unexpected error variant: {err:?}"
+        );
     }
 
     #[test]

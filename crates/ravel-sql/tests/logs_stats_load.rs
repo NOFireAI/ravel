@@ -201,6 +201,7 @@ async fn install_head_and_stats(store: &dyn ObjectStoreBackend, segments: &[Colu
             segment_count: segments.len() as u32,
             part_blake3: vec![part_hash.to_vec()],
         }),
+        column_stats_part: None,
     };
     let head_bytes = encode_head(&head).expect("encode head");
     store
