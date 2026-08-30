@@ -634,8 +634,20 @@ def amplification(qs, label, band):
         sw = scan_wire(acc)
         if sw is None:
             return
+        # The denominator gets the same treatment as the numerator: absent is a
+        # FAIL, not a zero. `or 0` would let a row with no decoded-byte figure
+        # still count toward `seen` while contributing nothing to the
+        # denominator, which understates it and inflates the ratio -- an
+        # amplification computed from a partial denominator reads as a real
+        # measurement.
+        dec = acc.get("page_stored_bytes_decoded")
+        if not isinstance(dec, (int, float)):
+            fails.append(f"{label} amplification: {q} has no "
+                         "page_stored_bytes_decoded; the denominator is "
+                         "incomplete and the ratio would be overstated")
+            return
         scan_total    += sw
-        decoded_total += acc.get("page_stored_bytes_decoded") or 0
+        decoded_total += dec
         seen += 1
     if seen == 0:
         fails.append(f"{label} amplification: no rows in this population; "
