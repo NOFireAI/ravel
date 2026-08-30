@@ -94,6 +94,7 @@ fn i64_stat(name: &str, dict: &[(i64, u64)], null_count: u64) -> ColumnStat {
     let non_null_count: u64 = dict.iter().map(|(_, c)| c).sum();
     let min = dict.iter().map(|(v, _)| *v).min();
     let max = dict.iter().map(|(v, _)| *v).max();
+    let sum: i64 = dict.iter().map(|(v, c)| *v * (*c as i64)).sum();
     ColumnStat {
         name: name.to_string(),
         declared_type: DECLARED_TYPE_I64,
@@ -109,6 +110,7 @@ fn i64_stat(name: &str, dict: &[(i64, u64)], null_count: u64) -> ColumnStat {
                 count: *c,
             })
             .collect(),
+        sum: Some(sum),
     }
 }
 

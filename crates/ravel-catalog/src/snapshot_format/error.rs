@@ -251,4 +251,23 @@ pub enum SnapshotFormatError {
     ColumnStatsMissingMinMax { name: String },
     #[error("column-stats column {name:?} has min greater than max")]
     ColumnStatsMinMaxInverted { name: String },
+    /// A non-integer column carries a `sum`. Sums are stored for I64 columns
+    /// only (#861); any other declared type carrying one is internally
+    /// inconsistent and the metadata-only SUM/AVG path must never read it.
+    #[error(
+        "column-stats column {name:?} declared_type {declared_type} carries a sum \
+         (sums are I64-only)"
+    )]
+    ColumnStatsSumOnNonInteger { name: String, declared_type: u32 },
+    /// A column's stored `sum` disagrees with the sum its own exact dictionary
+    /// implies. A reader deriving SUM/AVG from this record would return a wrong
+    /// total, so it is rejected at encode/decode rather than trusted.
+    #[error(
+        "column-stats column {name:?} sum {sum} disagrees with its dictionary total {dict_sum}"
+    )]
+    ColumnStatsSumMismatch {
+        name: String,
+        sum: i128,
+        dict_sum: i128,
+    },
 }

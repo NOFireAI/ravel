@@ -170,6 +170,14 @@ message ColumnStat {
   ColumnValue max = 6;
   bool dictionary_present = 7;
   repeated DictEntry dictionary = 8;
+  // Exact per-object sum of the column's non-null values (ADR-0850, #861).
+  // Present only for an integer (I64) column; omitted for every other declared
+  // type, and omitted for an I64 column whose exact sum overflowed i64 during
+  // the fold. Absent (proto3 `optional`, no value) means "no exact sum
+  // available": a reader must fall back to scanning rather than treat it as
+  // zero. Float columns are deliberately never summed: a sequential float fold
+  // is order-dependent, and the reader would have no way to know it was inexact.
+  optional int64 sum = 9;
 }
 
 // One segment's exact column statistics, identified the same way
