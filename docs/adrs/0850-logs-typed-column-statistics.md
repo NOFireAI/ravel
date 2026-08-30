@@ -94,16 +94,26 @@ gate from the safety lemma below, not a new special case.
 ### L1 segments are not covered
 
 This cut computes `ColumnStatsSegment` records for L0 entries only
-(`entries.iter().filter(|e| e.level == 0)` at `fold.rs:1513`). The
-fold-side filter is not the blocker, and removing it alone changes
-nothing observable: `build_l1_snapshot_entry` (`fold.rs:368`) and
+(`entries.iter().filter(|e| e.level == 0)` at `fold.rs:1513`). Removing
+that filter alone does not produce L1 coverage. The `SnapshotEntry` side
+is sound: `build_l1_snapshot_entry` (`fold.rs:368`) and
 `build_rewrite_l1_snapshot_entry` (`fold.rs:415`) each produce a
 `SnapshotEntry` whose `writer_id` carries the 32-byte `input_set_hash`
-and whose `writer_epoch` carries the `part_index`, so a fold that
-dropped the filter would build correct, uniquely-keyed L1 records. Those
-records would then be silently discarded at three later points, which is
-why L1 coverage is real design work and not a one-line fold change:
+and whose `writer_epoch` carries the `part_index`, so the identities the
+fold has to work from are unique. Four things then stand in the way, one
+in the builder and three in the reader, which is why L1 coverage is real
+design work and not a one-line fold change:
 
+- **The builder refuses an L1 entry outright.** `build_column_stats_segment`
+  (`crates/ravel-catalog/src/column_stats_build.rs:372`) carries
+  `debug_assert_eq!(entry.level, 0)`, and at `:379` converts
+  `entry.writer_id` into `[u8; 16]`, returning
+  `ColumnStatsBuildError::BadWriterIdLen` when it is any other length
+  (`:383`). An L1 entry's slot holds the 32-byte `input_set_hash`, so a
+  fold that dropped the level filter would fail this conversion before any
+  `ColumnStatsSegment` existed. The `debug_assert` compiles out of release
+  builds and is therefore not the guard; the `BadWriterIdLen` error is, and
+  it fires on every build profile.
 - **The reader's lookup key collapses.** `segment_identity`
   (`crates/ravel-sql/src/logs_scan.rs:571`) builds the join key from the
   `SegmentRef`, not the `SnapshotEntry`. An L1 `SegmentRef` carries
@@ -395,10 +405,12 @@ answer incorrectly.
   exact count of one literal value, and a truncated dictionary could
   silently omit it.
 - **Covering L1 segments in this cut.** Rejected for now: the blocker is
-  not the fold-side `level == 0` filter (dropping it alone builds correct,
-  uniquely-keyed L1 records that are then silently discarded), but the
-  reader join. An L1 `SegmentRef` carries a nil writer tuple with its real
-  `input_set_hash`/`part_index` in the `SegmentLevel::L1` variant that
+  not the fold-side `level == 0` filter. Dropping it alone fails in the
+  builder, which converts `entry.writer_id` to `[u8; 16]` and returns
+  `ColumnStatsBuildError::BadWriterIdLen` on an L1 entry's 32-byte
+  `input_set_hash` (`column_stats_build.rs:379`), and it would still not
+  reach the reader join. An L1 `SegmentRef` carries a nil writer tuple with
+  its real `input_set_hash`/`part_index` in the `SegmentLevel::L1` variant that
   `segment_identity` drops, and the resolver rejects the 32-byte
   `input_set_hash` where it expects a 16-byte writer id; matching the nil
   tuple instead collides across the parts of one bucket, a wrong answer.
