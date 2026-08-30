@@ -55,9 +55,10 @@ use ravel_object_store::{
 };
 use ravel_query::{
     BlockRangeFetcher, CacheFetchError, CarriedFooter, LogFetchError, LogQuery, LogSegmentFetcher,
+    PhaseWireByteCounts, QueryPhase, ReadPhases,
 };
 use ravel_types::TenantHash;
-use ravel_types::accounting::{AccountedOp, QueryAccounting};
+use ravel_types::accounting::{AccountedOp, QueryAccounting, QueryAccountingSnapshot};
 use uuid::Uuid;
 
 const TENANT: TenantHash = TenantHash([7u8; 16]);
@@ -527,7 +528,17 @@ async fn version_4_prune_reads_ranges_in_the_surviving_group_only() {
     let seg = seg_ref(bytes.len() as u64, &recs);
     let acc = QueryAccounting::new();
     let (_got, stats) = ranged(store, &bytes)
-        .fetch_object_with_footer(&seg, TENANT, i64::MIN, i64::MAX, &prune, &sel, None, &acc)
+        .fetch_object_with_footer(
+            &seg,
+            TENANT,
+            i64::MIN,
+            i64::MAX,
+            &prune,
+            &sel,
+            None,
+            ReadPhases::SCAN,
+            &acc,
+        )
         .await
         .expect("pruned fetch");
 
@@ -1235,6 +1246,7 @@ async fn a_scan_that_probed_counts_its_own_tail_misses() {
             &[],
             &ColumnSelection::all(),
             None,
+            ReadPhases::SCAN,
             &acc,
         )
         .await
@@ -1296,6 +1308,7 @@ async fn a_carried_footer_that_counted_nothing_leaves_the_scan_to_count() {
                 footer: &footer,
                 tail_misses_counted: false,
             }),
+            ReadPhases::SCAN,
             &acc,
         )
         .await
@@ -1358,6 +1371,7 @@ async fn a_carried_footer_that_already_counted_is_not_counted_again() {
                 footer: &footer,
                 tail_misses_counted: true,
             }),
+            ReadPhases::SCAN,
             &acc,
         )
         .await
@@ -1371,5 +1385,284 @@ async fn a_carried_footer_that_already_counted_is_not_counted_again() {
         plan_stats.probe_misses + stats.probe_misses,
         2,
         "exactly once across the plan and the scan, not twice"
+    );
+}
+
+// ---- 5. fetch amplification: WIRE bytes over STORED decoded page bytes ----
+//
+// Issue #913 T1. Two quantities appear below and they are not comparable:
+//
+//   WIRE bytes    what a store GET transferred, from
+//                 `PhaseWireByteCounts` (`QueryPhase::Scan` is the
+//                 BLOCKS-section data ranges).
+//   STORED bytes  post-compression page lengths from PAGE_DIR, from
+//                 `QueryAccountingSnapshot::page_bytes_decoded`.
+//
+// Fetch amplification is the first divided by the second. Nothing here sums
+// one with the other.
+
+/// Coalescing gap wide enough to fuse every projected chunk of the fixture into
+/// one run, so the run spans the unwanted columns' pages lying between them.
+/// Those bytes crossed the wire and belong in the numerator.
+const HOLE_GAP: u64 = 1 << 20;
+
+/// Sum of the STORED page lengths a projection decodes: an independent walk of
+/// PAGE_DIR, in the same units `DecodedBlock::page_bytes_decoded` reports.
+/// This is the denominator of fetch amplification.
+fn expected_stored_page_bytes(
+    bytes: &[u8],
+    blocks: &[usize],
+    selected: Option<&HashSet<u32>>,
+) -> u64 {
+    let dir = page_dir_of(bytes);
+    let mut total = 0u64;
+    for group in &dir.groups {
+        for chunk in &group.chunks {
+            if !selected.is_none_or(|s| s.contains(&chunk.column_id)) {
+                continue;
+            }
+            for p in &chunk.pages {
+                let whole = group.first_block as usize + p.block as usize;
+                if blocks.contains(&whole) {
+                    total += p.len;
+                }
+            }
+        }
+    }
+    total
+}
+
+/// Sum of the STORED page lengths of EVERY page present in the decoded blocks,
+/// whatever the projection: the quantity `page_bytes_fetched` reports. On a
+/// version-4 object no read moves these bytes, which is the whole point.
+fn expected_present_page_bytes(bytes: &[u8], blocks: &[usize]) -> u64 {
+    expected_stored_page_bytes(bytes, blocks, None)
+}
+
+/// One narrow-projection scan of the fixture, drained to exhaustion, with the
+/// block-range fetcher's coalescing gap pinned to `gap`.
+///
+/// Returns this execution's per-phase WIRE bytes, its accounting snapshot
+/// (whose `page_bytes_*` are STORED page bytes), and the rows it decoded.
+async fn amplification_scan(
+    bytes: &[u8],
+    recs: &[LogRecord],
+    sel: &ColumnSelection,
+    gap: u64,
+) -> (PhaseWireByteCounts, QueryAccountingSnapshot, usize) {
+    let store: Arc<dyn ObjectStoreBackend> = store_with(bytes).await;
+    let block_range = BlockRangeFetcher::new(Arc::clone(&store))
+        .with_whole_object_threshold(0)
+        .with_suffix_len(tail_len(bytes))
+        .with_coalesce_gap(gap);
+    let fetcher = LogSegmentFetcher::new(store)
+        .with_block_range(block_range)
+        .with_block_range_threshold(0);
+    let wire = fetcher.phase_wire_byte_counter();
+    let before = wire.snapshot();
+
+    let seg = seg_ref(bytes.len() as u64, recs);
+    let acc = QueryAccounting::new();
+    let query = LogQuery::new(i64::MIN, i64::MAX);
+    let mut scan = fetcher
+        .scan_accounted_with_tenant(&seg, TENANT, &query, sel, &acc)
+        .await
+        .expect("scan")
+        .expect("the segment overlaps the query window");
+    let mut rows = 0usize;
+    while let Some(block) = scan.next_block().expect("decode") {
+        rows += block.len();
+    }
+    drop(scan);
+    (
+        wire.snapshot().saturating_sub(&before),
+        acc.snapshot(),
+        rows,
+    )
+}
+
+/// The exact numerator, denominator and ratio of fetch amplification on a
+/// fixture whose page geometry is known from PAGE_DIR.
+///
+/// Two gaps, because the numerator is a transfer count and not a page-length
+/// sum. At gap 0 each projected chunk is its own GET and the wire bytes equal
+/// the stored bytes the decode consumed exactly, so the ratio is exactly 1.0.
+/// At [`HOLE_GAP`] the fetcher fuses those chunks into one run that reads
+/// through the unwanted columns' pages, and the numerator grows by exactly
+/// those bytes while the denominator does not move at all.
+///
+/// Non-vacuity: computing the numerator as the sum of `PageDesc::len` over
+/// every page present in the decoded blocks (the pre-version-4 counterfactual
+/// `page_bytes_fetched` still reports) makes the gap-0 case read the
+/// `page_bytes_fetched` total instead of the transferred total, and the exact
+/// equality below fails.
+#[tokio::test]
+async fn fetch_amplification_pins_exact_wire_and_stored_page_bytes() {
+    let recs = records();
+    let bytes = build_object(&recs);
+    let sel = ColumnSelection::fixed_only().with_flags();
+    let ids = resolved(&bytes, &sel).expect("a projection, not all columns");
+    let all_blocks: Vec<usize> = (0..BLOCKS).collect();
+
+    // Denominator oracle: the stored page bytes the projection decodes. The
+    // decode reads every block (the query carries no predicate).
+    let stored_decoded = expected_stored_page_bytes(&bytes, &all_blocks, Some(&ids));
+
+    // ---- gap 0: one GET per projected chunk, no holes -------------------
+    let runs = expected_runs(&bytes, &all_blocks, Some(&ids), 0);
+    let wire_oracle: u64 = runs.iter().map(|(_, len)| len).sum();
+    let (wire, acc, rows) = amplification_scan(&bytes, &recs, &sel, 0).await;
+    assert_eq!(rows, RECORDS, "every record decoded");
+
+    let numerator = wire.phase(QueryPhase::Scan);
+    let denominator = acc.page_bytes_decoded;
+    assert_eq!(
+        numerator, wire_oracle,
+        "scan-phase WIRE bytes are the coalesced projected page runs"
+    );
+    assert_eq!(
+        numerator, 30,
+        "exact BLOCKS-section wire bytes for this fixture and projection"
+    );
+    assert_eq!(
+        denominator, stored_decoded,
+        "the denominator is the STORED bytes of the decoded projected pages"
+    );
+    assert_eq!(
+        denominator, 30,
+        "exact stored decoded page bytes for this fixture and projection"
+    );
+    assert_eq!(
+        numerator as f64 / denominator as f64,
+        1.0,
+        "with each chunk its own GET, a version-4 read transfers exactly what it decodes"
+    );
+
+    // ---- HOLE_GAP: one fused run per contiguous span, holes included ----
+    let hole_runs = expected_runs(&bytes, &all_blocks, Some(&ids), HOLE_GAP);
+    let hole_oracle: u64 = hole_runs.iter().map(|(_, len)| len).sum();
+    let (hole_wire, hole_acc, hole_rows) = amplification_scan(&bytes, &recs, &sel, HOLE_GAP).await;
+    assert_eq!(hole_rows, RECORDS);
+
+    let hole_numerator = hole_wire.phase(QueryPhase::Scan);
+    assert_eq!(
+        hole_numerator, hole_oracle,
+        "a coalesced run's unwanted bytes crossed the wire and are counted"
+    );
+    assert_eq!(
+        hole_numerator, 74_319,
+        "exact BLOCKS-section wire bytes once the projected chunks fuse"
+    );
+    assert_eq!(
+        hole_acc.page_bytes_decoded, stored_decoded,
+        "the coalescing gap moves the numerator only; the decode is unchanged"
+    );
+    assert_eq!(
+        hole_numerator as f64 / hole_acc.page_bytes_decoded as f64,
+        74_319.0 / 30.0,
+        "exact amplification once a run reads through unwanted pages"
+    );
+}
+
+/// Every WIRE byte an execution moved is charged to exactly one phase, and the
+/// phases sum to the pooled `QueryAccounting` GET total. A call site that
+/// records into the counter without recording into the accounting handle (or
+/// twice into either) breaks this equality.
+///
+/// The metadata GETs of a data read are `Probe`, its BLOCKS-section ranges are
+/// `Scan`, and neither `Resolve` (the catalog's, which this fetcher never
+/// issues) nor `Plan` (no planning read here) is written at all.
+#[tokio::test]
+async fn per_phase_wire_bytes_sum_to_the_pooled_object_store_bytes() {
+    let recs = records();
+    let bytes = build_object(&recs);
+    let sel = ColumnSelection::fixed_only().with_flags();
+    let (wire, acc, _rows) = amplification_scan(&bytes, &recs, &sel, 0).await;
+
+    assert_eq!(
+        wire.total(),
+        acc.s3_bytes(AccountedOp::Get),
+        "the per-phase split neither drops nor double-counts a wire byte"
+    );
+    assert_eq!(
+        wire.total(),
+        acc.total_s3_bytes(),
+        "this read issues GETs only, so the pooled total is the GET total"
+    );
+
+    assert_eq!(
+        wire.phase(QueryPhase::Resolve),
+        0,
+        "the catalog resolve is not this fetcher's traffic"
+    );
+    assert_eq!(
+        wire.phase(QueryPhase::Plan),
+        0,
+        "a scan funnel issues no planning read"
+    );
+
+    // The probe is a suffix of exactly the object tail, plus the two front
+    // sections no suffix reaches.
+    let footer = footer_of(&bytes);
+    let front: u64 = [kind::STREAM_DIR, kind::FIELD_DIR]
+        .iter()
+        .map(|k| footer.section(*k).expect("front section").len)
+        .sum();
+    assert_eq!(
+        wire.phase(QueryPhase::Probe),
+        tail_len(&bytes) + front,
+        "probe-phase wire bytes are the tail probe and the two front sections"
+    );
+    assert_eq!(
+        wire.phase(QueryPhase::Probe) + wire.phase(QueryPhase::Scan),
+        wire.total(),
+        "no third phase carries any of this read's bytes"
+    );
+}
+
+/// The property this metric exists to expose: on a narrow projection over a
+/// version-4 object the new ratio is strictly below the legacy
+/// `page_bytes_fetched / page_bytes_decoded` ratio, and the gap is exactly the
+/// bytes the mandatory PAGE_DIR lets the read never fetch.
+///
+/// Equality would mean either the fetcher is not narrowing as
+/// docs/log-segment-format.md claims, or the numerator is being computed from
+/// page descriptors rather than from transfers.
+#[tokio::test]
+async fn narrow_projection_amplification_is_below_the_legacy_page_byte_ratio() {
+    let recs = records();
+    let bytes = build_object(&recs);
+    let sel = ColumnSelection::fixed_only().with_flags();
+    let all_blocks: Vec<usize> = (0..BLOCKS).collect();
+    let (wire, acc, _rows) = amplification_scan(&bytes, &recs, &sel, 0).await;
+
+    // Legacy pair, unchanged in meaning: both sides are STORED page bytes, and
+    // `page_bytes_fetched` counts every page descriptor in a decoded block
+    // whether or not the read retrieved it.
+    assert_eq!(
+        acc.page_bytes_fetched,
+        expected_present_page_bytes(&bytes, &all_blocks),
+        "the legacy numerator is every present page's stored length"
+    );
+    assert_eq!(acc.page_bytes_fetched, 74_321);
+    assert_eq!(acc.page_bytes_decoded, 30);
+
+    let legacy = acc.page_bytes_fetched as f64 / acc.page_bytes_decoded as f64;
+    let measured = wire.phase(QueryPhase::Scan) as f64 / acc.page_bytes_decoded as f64;
+    assert_eq!(legacy, 74_321.0 / 30.0, "exact legacy ratio");
+    assert_eq!(measured, 1.0, "exact measured ratio");
+    assert!(
+        measured < legacy,
+        "measured amplification {measured} must be strictly below the legacy {legacy}"
+    );
+
+    // The gap is not incidental: it is exactly the stored bytes of the pages
+    // the projection dropped, which a version-4 read never asks the store for.
+    let never_fetched = acc.page_bytes_fetched - acc.page_bytes_decoded;
+    assert_eq!(never_fetched, 74_291);
+    assert_eq!(
+        acc.page_bytes_fetched - wire.phase(QueryPhase::Scan),
+        never_fetched,
+        "the legacy numerator overstates by exactly the bytes version 4 avoids"
     );
 }

@@ -36,6 +36,9 @@
 //! crate's fetch pipelines -- and are never summed into a phase's request or
 //! wire-byte totals.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use ravel_types::accounting::{QueryAccounting, QueryAccountingSnapshot};
 
 /// The phases a query's object-store cost is split across (issue #796). See
@@ -71,6 +74,130 @@ impl QueryPhase {
             QueryPhase::Probe => "probe",
             QueryPhase::Scan => "scan",
         }
+    }
+
+    /// This phase's position in [`Self::ALL`], which is also its slot in
+    /// [`PhaseWireByteCounter`]'s array.
+    #[must_use]
+    pub fn index(self) -> usize {
+        match self {
+            QueryPhase::Resolve => 0,
+            QueryPhase::Plan => 1,
+            QueryPhase::Probe => 2,
+            QueryPhase::Scan => 3,
+        }
+    }
+}
+
+/// Accumulating per-[`QueryPhase`] count of WIRE bytes -- bytes a store GET
+/// actually transferred -- across every read one fetcher served (issue #913).
+///
+/// # Why this is not a field on `QueryAccounting`
+///
+/// `QueryAccounting` already totals wire bytes per operation kind, but it is
+/// one pooled handle per query: `ravel-sql`'s executor creates a single
+/// `QueryAccounting` per attempt and hands the same handle to the catalog
+/// resolve, the plan reads, and the scan reads alike, so the pooled total
+/// cannot say which phase moved the bytes. [`PhaseAccounting`] solves that by
+/// handing each phase its own handle, but only the callers that already thread
+/// one can use it, and the SQL read path threads the pooled handle instead.
+/// This counter is the channel that reaches a caller which cannot change that
+/// threading: it is owned by the fetcher, shared by every clone, and read the
+/// same way `ravel_query::ProbeMissCounter` is -- [`snapshot`](Self::snapshot)
+/// before and after one execution, then
+/// [`PhaseWireByteCounts::saturating_sub`].
+///
+/// # What lands where
+///
+/// The phase a byte is charged to is the phase of the request that moved it,
+/// decided at the GET call site. For the RLOG read path
+/// (`ravel_query::ReadPhases`):
+///
+/// - [`QueryPhase::Plan`]: every GET a planning read issues -- the footer probe,
+///   the footer chase, SKIP_IDX/PAGE_DIR/FIELD_DIR, and the whole-object plan
+///   fallback. A planning read fetches no block data, so all of its bytes are
+///   plan bytes.
+/// - [`QueryPhase::Probe`]: the metadata GETs of a DATA read -- its suffix
+///   probe, footer chase, SKIP_IDX, PAGE_DIR, the front directories, BLOOM and
+///   POSTINGS, and the object's trailing bytes.
+/// - [`QueryPhase::Scan`]: the BLOCKS-section data ranges of a data read, and a
+///   whole-object GET a data read issued to obtain block data.
+/// - [`QueryPhase::Resolve`]: never written by the RLOG read path. The catalog
+///   snapshot resolve's commit-record GETs are issued by `ravel-catalog`, which
+///   has no handle on this counter.
+///
+/// Cache hits move no bytes over the wire and are recorded here as nothing at
+/// all; they stay on `QueryAccounting::cache_bytes`, which is a different
+/// quantity from every figure in this type.
+#[derive(Debug, Clone, Default)]
+pub struct PhaseWireByteCounter(Arc<PhaseWireByteInner>);
+
+#[derive(Debug, Default)]
+struct PhaseWireByteInner {
+    /// One slot per [`QueryPhase`], indexed by [`QueryPhase::index`].
+    phases: [AtomicU64; 4],
+}
+
+impl PhaseWireByteCounter {
+    /// New counter with every phase at zero.
+    #[must_use]
+    pub fn new() -> Self {
+        PhaseWireByteCounter::default()
+    }
+
+    /// Add `bytes` wire bytes to `phase`. Called from the same place the same
+    /// bytes are recorded onto a `QueryAccounting` handle, so the two channels
+    /// cannot drift: every byte this counter holds is also in that handle's
+    /// GET total, and the per-phase figures sum back to it.
+    pub fn record(&self, phase: QueryPhase, bytes: u64) {
+        self.0.phases[phase.index()].fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Point-in-time copy of every phase's total.
+    #[must_use]
+    pub fn snapshot(&self) -> PhaseWireByteCounts {
+        let mut out = PhaseWireByteCounts::default();
+        for phase in QueryPhase::ALL {
+            out.phases[phase.index()] = self.0.phases[phase.index()].load(Ordering::Relaxed);
+        }
+        out
+    }
+}
+
+/// Point-in-time copy of a [`PhaseWireByteCounter`]'s per-phase totals
+/// (issue #913). Every figure is WIRE bytes: what a store GET transferred,
+/// including a coalesced run's unwanted bytes and any retry. Never stored
+/// bytes, never decompressed bytes, and never cache-served bytes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PhaseWireByteCounts {
+    /// One slot per [`QueryPhase`], indexed by [`QueryPhase::index`].
+    phases: [u64; 4],
+}
+
+impl PhaseWireByteCounts {
+    /// Wire bytes charged to `phase`.
+    #[must_use]
+    pub fn phase(&self, phase: QueryPhase) -> u64 {
+        self.phases[phase.index()]
+    }
+
+    /// Field-wise difference `self - earlier`: the wire bytes one measured
+    /// execution added to a counter that keeps accumulating. Saturating, so a
+    /// snapshot pair read out of order reports zero rather than wrapping.
+    #[must_use]
+    pub fn saturating_sub(&self, earlier: &PhaseWireByteCounts) -> PhaseWireByteCounts {
+        let mut out = PhaseWireByteCounts::default();
+        for phase in QueryPhase::ALL {
+            out.phases[phase.index()] =
+                self.phases[phase.index()].saturating_sub(earlier.phases[phase.index()]);
+        }
+        out
+    }
+
+    /// Wire bytes across every phase.
+    #[must_use]
+    pub fn total(&self) -> u64 {
+        self.phases.iter().fold(0u64, |a, b| a.saturating_add(*b))
     }
 }
 
@@ -244,6 +371,54 @@ mod tests {
             pooled.peak_intermediate_bytes, 160,
             "a field-wise sum of the peaks would report memory never held"
         );
+    }
+
+    #[test]
+    fn wire_byte_counter_keeps_each_phase_separate_and_sums_to_the_total() {
+        let wire = PhaseWireByteCounter::new();
+        wire.record(QueryPhase::Probe, 7_000);
+        wire.record(QueryPhase::Scan, 30);
+        wire.record(QueryPhase::Scan, 12);
+
+        let snap = wire.snapshot();
+        assert_eq!(snap.phase(QueryPhase::Resolve), 0);
+        assert_eq!(snap.phase(QueryPhase::Plan), 0);
+        assert_eq!(snap.phase(QueryPhase::Probe), 7_000);
+        assert_eq!(snap.phase(QueryPhase::Scan), 42);
+        assert_eq!(snap.total(), 7_042);
+    }
+
+    #[test]
+    fn wire_byte_delta_is_one_executions_share_of_an_accumulator() {
+        let wire = PhaseWireByteCounter::new();
+        wire.record(QueryPhase::Scan, 100);
+        let before = wire.snapshot();
+        wire.record(QueryPhase::Scan, 30);
+        wire.record(QueryPhase::Probe, 7_000);
+
+        let delta = wire.snapshot().saturating_sub(&before);
+        assert_eq!(delta.phase(QueryPhase::Scan), 30, "the second read only");
+        assert_eq!(delta.phase(QueryPhase::Probe), 7_000);
+        assert_eq!(delta.total(), 7_030);
+
+        // Read out of order: zero rather than a wrapped enormous figure that
+        // would present as a catastrophic amplification.
+        assert_eq!(before.saturating_sub(&wire.snapshot()).total(), 0);
+    }
+
+    #[test]
+    fn every_phase_has_its_own_wire_byte_slot() {
+        // A `QueryPhase::index` collision would silently pool two phases; this
+        // fails on the pooled figure rather than on a name.
+        let wire = PhaseWireByteCounter::new();
+        for (i, phase) in QueryPhase::ALL.iter().enumerate() {
+            wire.record(*phase, 1 << i);
+        }
+        let snap = wire.snapshot();
+        for (i, phase) in QueryPhase::ALL.iter().enumerate() {
+            assert_eq!(snap.phase(*phase), 1 << i, "{} slot", phase.name());
+        }
+        assert_eq!(snap.total(), 15);
     }
 
     #[test]

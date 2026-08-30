@@ -59,7 +59,8 @@ use ravel_logseg::{
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::{
     CacheFetchError, DEFAULT_FETCH_CONCURRENCY, DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
-    DEFAULT_MAX_SEGMENTS, EngineConfig, LogSegmentFetcher, ProbeMissCounter, SegmentFetcher,
+    DEFAULT_MAX_SEGMENTS, EngineConfig, LogSegmentFetcher, PhaseWireByteCounter,
+    PhaseWireByteCounts, ProbeMissCounter, QueryPhase, SegmentFetcher,
 };
 use ravel_sql::{
     DEFAULT_MAX_QUERY_BYTES, DeclaredColumn, DeclaredType, SpanSegmentFetcher, SqlConfig,
@@ -452,6 +453,90 @@ pub struct RunAccounting {
     /// the run's total is the two summed.
     #[serde(default)]
     pub probe_misses_scan: u64,
+    /// WIRE bytes this run transferred, split by the query phase that issued
+    /// the request, one entry per `ravel_query::QueryPhase` and no phase twice
+    /// (issue #913). Read off `LogSegmentFetcher`'s per-phase counter, so a
+    /// phase the RLOG read path does not issue (`resolve`, the catalog's own
+    /// commit-record GETs) reports zero here even though those bytes are in
+    /// [`Self::object_store_bytes`]; the difference is
+    /// [`Self::wire_bytes_unattributed`].
+    ///
+    /// Wire bytes only: what the store transferred, coalescing holes and
+    /// retries included. Never comparable with, and never summable with,
+    /// [`Self::page_stored_bytes_decoded`], which is stored page bytes.
+    #[serde(default)]
+    pub wire_bytes_by_phase: Vec<PhaseWireBytes>,
+    /// WIRE bytes in [`Self::object_store_bytes`] that no phase-attributing
+    /// funnel claimed, i.e. `object_store_bytes` minus the sum of
+    /// [`Self::wire_bytes_by_phase`]. Derived by difference, not measured: the
+    /// catalog snapshot resolve issues its commit-record GETs through
+    /// `ravel-catalog`, which records them on the query's pooled
+    /// `QueryAccounting` and has no per-phase channel. Treat it as "resolve and
+    /// anything else outside the log read path", not as a checked figure.
+    #[serde(default)]
+    pub wire_bytes_unattributed: u64,
+    /// STORED page bytes this run's decode consumed after column projection:
+    /// `QueryAccounting::page_bytes_decoded`, the sum of `PageDesc::len` over
+    /// the pages the projection kept. Post-compression bytes as they sit in the
+    /// object, NOT bytes transferred and NOT decompressed bytes.
+    ///
+    /// This is the denominator of [`Self::fetch_amplification`].
+    #[serde(default)]
+    pub page_stored_bytes_decoded: u64,
+    /// Fetch amplification: scan-phase WIRE bytes divided by
+    /// [`Self::page_stored_bytes_decoded`] STORED bytes. How many bytes the
+    /// store actually moved for each byte of page the statement went on to
+    /// decode.
+    ///
+    /// The numerator is the `scan` entry of [`Self::wire_bytes_by_phase`]: the
+    /// BLOCKS-section data ranges, with a coalesced run's unwanted bytes
+    /// included because they crossed the wire. Probe, PAGE_DIR, SKIP_IDX and
+    /// directory bytes are NOT in it; they are the `probe`/`plan` entries.
+    ///
+    /// Not the same quantity as `page_bytes_fetched / page_bytes_decoded`,
+    /// which compares two STORED page-byte figures and describes a pre-version-4
+    /// logical block: on an RLOG v4 object a page the query does not want is
+    /// never fetched, so that pair overstates amplification by exactly the
+    /// bytes v4 avoids.
+    ///
+    /// `0.0` when the run decoded no page.
+    #[serde(default)]
+    pub fetch_amplification: f64,
+}
+
+/// One phase's share of a run's WIRE bytes (issue #913).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PhaseWireBytes {
+    /// The phase, as `ravel_query::QueryPhase::name` spells it: `resolve`,
+    /// `plan`, `probe`, or `scan`.
+    pub phase: String,
+    /// Bytes the object store transferred for this phase's requests, coalescing
+    /// holes and retries included. WIRE bytes; never stored or decompressed
+    /// bytes.
+    pub wire_bytes: u64,
+}
+
+/// One entry per `QueryPhase`, in `QueryPhase::ALL` order, each phase exactly
+/// once. Driven off `ALL` rather than a hand-written list so a new phase cannot
+/// be silently dropped from the report (issue #913).
+fn phase_wire_bytes(counts: &PhaseWireByteCounts) -> Vec<PhaseWireBytes> {
+    QueryPhase::ALL
+        .iter()
+        .map(|phase| PhaseWireBytes {
+            phase: phase.name().to_string(),
+            wire_bytes: counts.phase(*phase),
+        })
+        .collect()
+}
+
+/// Scan-phase WIRE bytes over STORED decoded page bytes. `0.0` when nothing was
+/// decoded, so a statement that read no page reports no ratio rather than an
+/// infinity that would poison any aggregate over the report.
+fn amplification(scan_wire_bytes: u64, page_stored_bytes_decoded: u64) -> f64 {
+    if page_stored_bytes_decoded == 0 {
+        return 0.0;
+    }
+    scan_wire_bytes as f64 / page_stored_bytes_decoded as f64
 }
 
 /// One measured statement.
@@ -920,6 +1005,10 @@ impl Default for ExecutorSettings {
 struct ColdExecutor {
     executor: SqlExecutor,
     probe_misses: ProbeMissCounter,
+    /// Per-phase WIRE bytes of the same log fetcher (#913), cloned out for the
+    /// same reason as `probe_misses`: `SqlOutcome` carries only a pooled
+    /// `QueryAccountingSnapshot`, which has no per-phase byte field.
+    wire_bytes: PhaseWireByteCounter,
 }
 
 fn cold_executor(
@@ -963,6 +1052,7 @@ fn cold_executor(
     // them, but taking the handle last keeps that a local fact rather than an
     // ordering the reader has to verify.
     let probe_misses = log_fetcher.probe_miss_counter();
+    let wire_bytes = log_fetcher.phase_wire_byte_counter();
     let executor = SqlExecutor::new(
         catalog,
         SegmentFetcher::new(Arc::clone(store)),
@@ -984,6 +1074,7 @@ fn cold_executor(
     Ok(ColdExecutor {
         executor,
         probe_misses,
+        wire_bytes,
     })
 }
 
@@ -1124,6 +1215,9 @@ pub async fn measure_corpus(
         // that run, so a shared executor attributes each statement's misses to
         // that statement and never to the ones before it.
         let probe_misses = &built.probe_misses;
+        // #913: the same accumulate-and-difference treatment for the per-phase
+        // wire bytes, and for the same reason.
+        let wire_bytes = &built.wire_bytes;
         let req = SqlRequest {
             sql: entry.sql.clone(),
             window,
@@ -1169,6 +1263,7 @@ pub async fn measure_corpus(
             // Taken here, after the EXPLAIN side artifact above, so a plan
             // written for `--explain-dir` is not charged to run 0.
             let probe_misses_before = probe_misses.snapshot();
+            let wire_bytes_before = wire_bytes.snapshot();
             let start = Instant::now();
             let outcome = match executor.execute(tenant_hash, &req).await {
                 Ok(outcome) => outcome,
@@ -1202,6 +1297,9 @@ pub async fn measure_corpus(
             // costs are already in `object_store_get_requests` above; this says
             // how many of them the probe window is responsible for.
             let run_probe_misses = probe_misses.snapshot().saturating_sub(&probe_misses_before);
+            // #913: this run's WIRE bytes per phase, and the amplification they
+            // and the run's STORED decoded page bytes form.
+            let run_wire = wire_bytes.snapshot().saturating_sub(&wire_bytes_before);
             per_run_accounting.push(RunAccounting {
                 object_store_get_requests: acc.s3_requests(AccountedOp::Get),
                 object_store_list_requests: acc.s3_requests(AccountedOp::List),
@@ -1211,6 +1309,13 @@ pub async fn measure_corpus(
                 cache_bytes: acc.cache_bytes,
                 probe_misses_plan: run_probe_misses.plan,
                 probe_misses_scan: run_probe_misses.scan,
+                wire_bytes_by_phase: phase_wire_bytes(&run_wire),
+                wire_bytes_unattributed: acc.total_s3_bytes().saturating_sub(run_wire.total()),
+                page_stored_bytes_decoded: acc.page_bytes_decoded,
+                fetch_amplification: amplification(
+                    run_wire.phase(QueryPhase::Scan),
+                    acc.page_bytes_decoded,
+                ),
             });
             if run == 0 {
                 // The cold run's block counters and rows go into `scan`; its
@@ -3359,6 +3464,187 @@ mod tests {
                 "run {run}: the derived probe covered every scan-phase tail section"
             );
         }
+    }
+
+    // ---- Fetch amplification (#913) ---------------------------------------
+
+    /// The per-phase WIRE bytes, the STORED decoded page bytes, and the
+    /// amplification they form reach `per_run_accounting` and the report JSON,
+    /// on every run.
+    ///
+    /// Same fixture and same ranged path as the probe-miss tests above (at the
+    /// default threshold this object is read whole in one GET, which is a real
+    /// but uninteresting amplification shape and would exercise none of the
+    /// per-phase split), and with the read cache OFF. With a cache, this
+    /// statement's plan-phase whole-object fallback admits `(0, object_size)`
+    /// and the scan that follows is served entirely from it, so the scan phase
+    /// correctly reports zero wire bytes and the numerator this test is about
+    /// is never exercised.
+    ///
+    /// What is pinned exactly:
+    ///
+    /// - Every `QueryPhase` appears exactly once, in `QueryPhase::ALL` order,
+    ///   in the struct AND in the serialized report.
+    /// - The phases plus `wire_bytes_unattributed` equal `object_store_bytes`
+    ///   exactly, and the attributed part never exceeds it. A call site that
+    ///   recorded a GET into two phases would push the attributed sum above the
+    ///   pooled total and clamp the unattributed residual to zero, which the
+    ///   second assertion catches.
+    /// - `fetch_amplification` is exactly the scan-phase wire bytes over the
+    ///   stored decoded page bytes, from the two fields beside it.
+    ///
+    /// The byte totals themselves are not pinned to literals here: they are a
+    /// property of the generated corpus, not of this plumbing, and
+    /// `tests/log_page_dir_fetch.rs` pins the exact numerator, denominator and
+    /// ratio on a fixture whose page geometry is known.
+    ///
+    /// Prove-the-test: demonstrated failing during development by charging the
+    /// version-4 chunk ranges to `phases.metadata` instead of `phases.blocks`
+    /// in `fetch_object_v4` (the scan phase reads 0 and the amplification with
+    /// it), and by dropping the `self.wire_bytes.record(...)` line from
+    /// `BlockRangeFetcher::store_get` (the phase sum falls below
+    /// `object_store_bytes` and the residual absorbs it).
+    #[tokio::test]
+    async fn wire_bytes_and_amplification_reach_per_run_accounting() {
+        let store = empty_store();
+        let tenant = TenantId::new("amplification-tenant");
+        let objects = write_shard_objects(&store, &tenant, 0, 1).await;
+        let suffix = suffix_just_past_skip_idx(&objects[0]);
+        let window = TimeRange {
+            start_ns: 0,
+            end_ns: NOW_NS,
+        };
+        let (measured, skipped, failed) = measure_corpus(
+            &store,
+            tenant.hash(),
+            &[entry("q", PROBE_MISS_SQL)],
+            &[],
+            2,
+            window,
+            NOW_NS,
+            0,
+            Duration::from_secs(30),
+            false,
+            None,
+            ExecutorSettings {
+                logs_block_range_threshold: 0,
+                logs_suffix_len: Some(suffix),
+                ..ExecutorSettings::default()
+            },
+            false,
+            None,
+        )
+        .await
+        .expect("run");
+        assert!(skipped.is_empty() && failed.is_empty());
+        let acc = measured[0]
+            .per_run_accounting
+            .as_ref()
+            .expect("an in-process lane records per-run accounting");
+        assert_eq!(acc.len(), 2, "one accounting entry per run");
+
+        let names: Vec<&str> = QueryPhase::ALL.iter().map(|p| p.name()).collect();
+        for (run, entry) in acc.iter().enumerate() {
+            let phases: Vec<&str> = entry
+                .wire_bytes_by_phase
+                .iter()
+                .map(|p| p.phase.as_str())
+                .collect();
+            assert_eq!(
+                phases, names,
+                "run {run}: every phase exactly once, in QueryPhase::ALL order"
+            );
+
+            let attributed: u64 = entry.wire_bytes_by_phase.iter().map(|p| p.wire_bytes).sum();
+            assert!(
+                attributed <= entry.object_store_bytes,
+                "run {run}: attributed wire bytes {attributed} exceed the pooled \
+                 {}, so a GET was charged twice",
+                entry.object_store_bytes
+            );
+            assert_eq!(
+                attributed + entry.wire_bytes_unattributed,
+                entry.object_store_bytes,
+                "run {run}: the phases plus the residual are the pooled total"
+            );
+            assert_eq!(
+                entry.fetch_amplification,
+                amplification(
+                    entry.wire_bytes_by_phase[QueryPhase::Scan.index()].wire_bytes,
+                    entry.page_stored_bytes_decoded,
+                ),
+                "run {run}: the ratio is the two fields beside it, not a third figure"
+            );
+        }
+
+        // Cold run: this statement reads pages, and the split is not degenerate.
+        let cold = &acc[0];
+        assert!(
+            cold.page_stored_bytes_decoded > 0,
+            "the statement projects `body` and decodes its pages"
+        );
+        assert_eq!(
+            cold.wire_bytes_by_phase[QueryPhase::Resolve.index()].wire_bytes,
+            0,
+            "the RLOG read path issues no resolve request"
+        );
+        assert!(
+            cold.wire_bytes_by_phase[QueryPhase::Scan.index()].wire_bytes > 0,
+            "a data read moved BLOCKS-section bytes"
+        );
+        assert!(
+            cold.wire_bytes_by_phase[QueryPhase::Plan.index()].wire_bytes > 0,
+            "this statement is not skip-decidable, so it pays a planning read"
+        );
+        assert!(
+            cold.fetch_amplification > 0.0,
+            "a run that decoded pages has a ratio"
+        );
+
+        // What a measurement pass actually reads: the figures have to be in the
+        // report JSON, once per phase per run.
+        let v: serde_json::Value = serde_json::to_value(&measured[0]).expect("serialize entry");
+        let per_run = v["per_run_accounting"]
+            .as_array()
+            .expect("per_run_accounting is a JSON array");
+        for run in 0..2 {
+            let by_phase = per_run[run]["wire_bytes_by_phase"]
+                .as_array()
+                .expect("wire_bytes_by_phase is a JSON array");
+            assert_eq!(by_phase.len(), 4, "run {run}: four phases, no phase twice");
+            let serialized: Vec<&str> = by_phase
+                .iter()
+                .map(|p| p["phase"].as_str().expect("phase name"))
+                .collect();
+            assert_eq!(serialized, names, "run {run}: JSON phase names and order");
+            assert_eq!(
+                per_run[run]["page_stored_bytes_decoded"], acc[run].page_stored_bytes_decoded,
+                "run {run}: the denominator is in the JSON"
+            );
+        }
+    }
+
+    /// An older report, written before #913 added these fields, still
+    /// deserializes: every new field carries `#[serde(default)]`, as the
+    /// `probe_misses_*` pair does.
+    #[test]
+    fn a_pre_913_run_accounting_still_deserializes() {
+        let older = serde_json::json!({
+            "object_store_get_requests": 3,
+            "object_store_list_requests": 1,
+            "object_store_bytes": 836,
+            "cache_hits": 0,
+            "cache_misses": 2,
+            "cache_bytes": 0,
+            "probe_misses_plan": 1,
+            "probe_misses_scan": 1,
+        });
+        let acc: RunAccounting = serde_json::from_value(older).expect("older report deserializes");
+        assert_eq!(acc.object_store_bytes, 836);
+        assert!(acc.wire_bytes_by_phase.is_empty());
+        assert_eq!(acc.wire_bytes_unattributed, 0);
+        assert_eq!(acc.page_stored_bytes_decoded, 0);
+        assert_eq!(acc.fetch_amplification, 0.0);
     }
 
     // ---- The `--logs-suffix-len` seam (#883) -------------------------------

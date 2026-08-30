@@ -52,7 +52,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::erasure::ErasurePredicate;
 use crate::fetcher::ReadCache;
-use crate::phase_accounting::{PhaseAccounting, QueryPhase};
+use crate::phase_accounting::{PhaseAccounting, PhaseWireByteCounter, QueryPhase};
 use bytes::Bytes;
 use ravel_cache::{CacheKey, SingleFlightError, Source};
 use ravel_catalog::SegmentRef;
@@ -542,18 +542,45 @@ pub struct LogSegmentFetcher {
     /// served (#883). Shared by every clone, like `block_range`'s GET semaphore,
     /// and read through [`probe_miss_counter`](Self::probe_miss_counter).
     probe_misses: ProbeMissCounter,
+    /// Per-phase WIRE bytes across every read this fetcher has served (#913).
+    /// Shared by every clone, and pushed into `block_range` by every builder
+    /// below so this fetcher's own whole-object GETs and the block-range
+    /// fetcher's ranged GETs accumulate into one set of totals. Read through
+    /// [`phase_wire_byte_counter`](Self::phase_wire_byte_counter).
+    wire_bytes: PhaseWireByteCounter,
 }
 
 impl LogSegmentFetcher {
     pub fn new(store: Arc<dyn ObjectStoreBackend>) -> Self {
+        let wire_bytes = PhaseWireByteCounter::new();
         LogSegmentFetcher {
             store: store.clone(),
             cfg: RlogConfig::default(),
             cache: None,
             block_range_threshold: DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
-            block_range: BlockRangeFetcher::new(store),
+            block_range: BlockRangeFetcher::new(store).with_wire_byte_counter(wire_bytes.clone()),
             probe_misses: ProbeMissCounter::new(),
+            wire_bytes,
         }
+    }
+
+    /// This fetcher's accumulating per-phase WIRE byte counter (#913): the
+    /// numerator channel of fetch amplification. Clone it out before handing
+    /// the fetcher to whatever will own it, then read
+    /// [`PhaseWireByteCounter::snapshot`] on each side of an execution to
+    /// attribute that execution's bytes; the counter itself never resets.
+    ///
+    /// Every figure it holds is WIRE bytes, never stored or decompressed
+    /// bytes. The denominator of fetch amplification is
+    /// `QueryAccountingSnapshot::page_bytes_decoded`, which counts STORED page
+    /// bytes; the two are different quantities and must never be summed.
+    ///
+    /// Survives every builder below, including
+    /// [`with_block_range`](Self::with_block_range), which replaces the
+    /// `BlockRangeFetcher` but re-attaches this counter to the replacement.
+    #[must_use]
+    pub fn phase_wire_byte_counter(&self) -> PhaseWireByteCounter {
+        self.wire_bytes.clone()
     }
 
     /// This fetcher's accumulating per-phase probe-miss counter (#883). Clone it
@@ -660,9 +687,14 @@ impl LogSegmentFetcher {
     /// instance's `block_range_threshold`; pair it with
     /// [`with_block_range_threshold`](Self::with_block_range_threshold) to route
     /// small fixtures through it.
+    ///
+    /// The replacement is re-attached to this instance's per-phase WIRE byte
+    /// counter (#913), so a caller that took the handle from
+    /// [`phase_wire_byte_counter`](Self::phase_wire_byte_counter) before or
+    /// after this call reads the same totals either way.
     #[must_use]
     pub fn with_block_range(mut self, block_range: BlockRangeFetcher) -> Self {
-        self.block_range = block_range;
+        self.block_range = block_range.with_wire_byte_counter(self.wire_bytes.clone());
         self
     }
 
@@ -923,6 +955,10 @@ impl LogSegmentFetcher {
             .await?;
             accounting.record_s3_request(AccountedOp::Get);
             accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
+            // #913: a data read, so the whole object's wire bytes are the
+            // scan phase's (`ReadPhases::SCAN.blocks`).
+            self.wire_bytes
+                .record(ReadPhases::SCAN.blocks, got.data.len() as u64);
             // This funnel issues exactly one whole-object GET per call.
             fetch_span.record("s3_requests", 1u64);
             fetch_span.record("s3_bytes", got.data.len() as u64);
@@ -1112,7 +1148,7 @@ impl LogSegmentFetcher {
             return Ok(None);
         }
         let bytes = self
-            .whole_object_bytes(seg_ref, tenant_hash, accounting)
+            .whole_object_bytes(seg_ref, tenant_hash, ReadPhases::SCAN.blocks, accounting)
             .await?;
         let key = &seg_ref.data_object_key;
         let span = decode_span();
@@ -1669,6 +1705,11 @@ impl LogSegmentFetcher {
             return Ok(None);
         }
 
+        // #913: which phase this read's metadata GETs and its BLOCKS-section
+        // GETs charge their wire bytes to. The caller already named the phase
+        // it reads on, so the split is derived here rather than passed again.
+        let phases = phase.read_phases();
+
         // ADR-0107: an object above the block-range threshold is fetched by
         // reading only the blocks skip-index pruning proved relevant, not the
         // whole object. Small objects (all current fixtures, RLOG's typical
@@ -1710,6 +1751,7 @@ impl LogSegmentFetcher {
                         &query.prune,
                         columns,
                         carried,
+                        phases,
                         accounting,
                     )
                     .await
@@ -1727,7 +1769,7 @@ impl LogSegmentFetcher {
         }
 
         Ok(Some(
-            self.whole_object_bytes(seg_ref, tenant_hash, accounting)
+            self.whole_object_bytes(seg_ref, tenant_hash, phases.blocks, accounting)
                 .await?,
         ))
     }
@@ -1741,10 +1783,17 @@ impl LogSegmentFetcher {
     /// predicate-free full-window whole-segment path
     /// ([`scan_whole_accounted_with_tenant`](Self::scan_whole_accounted_with_tenant),
     /// #693 part 3), which reads the whole object in one GET regardless of size.
+    ///
+    /// `phase` is the [`QueryPhase`] the GET's WIRE bytes are charged to
+    /// (#913). This read exists to obtain block data, so its caller passes
+    /// [`ReadPhases::blocks`]: on a scan that is [`QueryPhase::Scan`], and on
+    /// `plan_segment`'s whole-object fallback it is [`QueryPhase::Plan`], which
+    /// keeps a planning read out of the scan-phase numerator.
     async fn whole_object_bytes(
         &self,
         seg_ref: &SegmentRef,
         tenant_hash: TenantHash,
+        phase: QueryPhase,
         accounting: &QueryAccounting,
     ) -> Result<Bytes, LogFetchError> {
         let key = &seg_ref.data_object_key;
@@ -1780,6 +1829,7 @@ impl LogSegmentFetcher {
             .await?;
             accounting.record_s3_request(AccountedOp::Get);
             accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
+            self.wire_bytes.record(phase, got.data.len() as u64);
             fetch_span.record("s3_requests", 1u64);
             fetch_span.record("s3_bytes", got.data.len() as u64);
             return Ok(got.data);
@@ -1795,6 +1845,7 @@ impl LogSegmentFetcher {
                     let got = self.store.get(key, GetRange::Full).await?;
                     accounting.record_s3_request(AccountedOp::Get);
                     accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
+                    self.wire_bytes.record(phase, got.data.len() as u64);
                     Ok(got.data)
                 })
                 .await
@@ -2231,12 +2282,67 @@ impl ProbePhase {
         }
     }
 
+    /// The [`ReadPhases`] a read issued on this phase's behalf charges its
+    /// wire bytes to.
+    #[must_use]
+    pub fn read_phases(self) -> ReadPhases {
+        match self {
+            ProbePhase::Plan => ReadPhases::PLAN,
+            ProbePhase::Scan => ReadPhases::SCAN,
+        }
+    }
+
     /// Lower-case, stable name for a report column or a JSON key, identical to
     /// [`QueryPhase::name`] for the same phase.
     #[must_use]
     pub fn name(self) -> &'static str {
         self.query_phase().name()
     }
+}
+
+/// Which [`QueryPhase`] each of one RLOG read's two GET kinds charges its WIRE
+/// bytes to (issue #913).
+///
+/// A single read of one object issues two kinds of request and they answer
+/// different questions. The metadata GETs -- the suffix probe, a footer chase,
+/// SKIP_IDX, PAGE_DIR, the front directories, BLOOM/POSTINGS, and the object's
+/// trailing bytes -- are what it costs to find out where the data is. The
+/// BLOCKS-section GETs are the data. Charging both to one phase makes fetch
+/// amplification unmeasurable: the numerator would carry directory bytes that
+/// have nothing to do with how much of a block a projection wanted.
+///
+/// The split is on the request, not on the byte: a whole-object GET a data read
+/// issued to obtain block data is charged in full to
+/// [`Self::blocks`], directory bytes included, because those bytes are exactly
+/// the amplification such a read pays. A planning read fetches no block data at
+/// all, so both of its kinds are [`QueryPhase::Plan`] and its whole-object
+/// fallback never lands in a scan figure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadPhases {
+    /// Phase for every GET that is not BLOCKS-section data.
+    pub metadata: QueryPhase,
+    /// Phase for BLOCKS-section data ranges, and for a whole-object GET issued
+    /// to obtain block data.
+    pub blocks: QueryPhase,
+}
+
+impl ReadPhases {
+    /// A data read: its metadata GETs are [`QueryPhase::Probe`] and its block
+    /// data is [`QueryPhase::Scan`]. The `scan` figure this produces is the
+    /// numerator of fetch amplification.
+    pub const SCAN: ReadPhases = ReadPhases {
+        metadata: QueryPhase::Probe,
+        blocks: QueryPhase::Scan,
+    };
+
+    /// A planning read ([`LogSegmentFetcher::plan_segment`] and
+    /// [`LogSegmentFetcher::plan_segment_block_stats`]). It decodes no block, so
+    /// everything it moves -- including its whole-object fallback -- is
+    /// [`QueryPhase::Plan`].
+    pub const PLAN: ReadPhases = ReadPhases {
+        metadata: QueryPhase::Plan,
+        blocks: QueryPhase::Plan,
+    };
 }
 
 /// Per-phase tail-section probe misses ([`BlockRangeStats::probe_misses`])
@@ -2731,6 +2837,12 @@ pub struct BlockRangeFetcher {
     /// `LogSegmentFetcher` pools across every read of the process rather than
     /// per query.
     assembly_pool: Arc<AssemblyBufferPool>,
+    /// Per-phase WIRE bytes across every read this fetcher has served (#913).
+    /// Written at [`Self::store_get`], the single GET funnel here, beside the
+    /// `QueryAccounting` write of the same bytes. Shared by every clone, and by
+    /// the owning [`LogSegmentFetcher`], which sets its own counter here so one
+    /// execution's whole-object and ranged reads land in the same totals.
+    wire_bytes: PhaseWireByteCounter,
 }
 
 impl BlockRangeFetcher {
@@ -2746,7 +2858,26 @@ impl BlockRangeFetcher {
             request_cost_bytes: DEFAULT_LOG_REQUEST_COST_BYTES,
             get_semaphore: Arc::new(Semaphore::new(DEFAULT_LOG_MAX_CONCURRENT_GETS)),
             assembly_pool: Arc::new(AssemblyBufferPool::default()),
+            wire_bytes: PhaseWireByteCounter::new(),
         }
+    }
+
+    /// Records this fetcher's WIRE bytes into `counter` instead of its own
+    /// (#913). [`LogSegmentFetcher`] calls this so its direct whole-object GETs
+    /// and this fetcher's ranged GETs accumulate into one counter a measurement
+    /// pass can read.
+    #[must_use]
+    pub fn with_wire_byte_counter(mut self, counter: PhaseWireByteCounter) -> Self {
+        self.wire_bytes = counter;
+        self
+    }
+
+    /// This fetcher's accumulating per-phase WIRE byte counter (#913). Cloned
+    /// out before the fetcher is handed away, then read with a
+    /// [`PhaseWireByteCounter::snapshot`] on each side of an execution.
+    #[must_use]
+    pub fn phase_wire_byte_counter(&self) -> PhaseWireByteCounter {
+        self.wire_bytes.clone()
     }
 
     /// This fetcher's assembly-buffer reuse counters (issue #894): how many
@@ -2878,10 +3009,16 @@ impl BlockRangeFetcher {
     /// segment maps to the existing `SnapshotInvalidated` retry path
     /// (ADR-0107 decision 1; `ravel_sql::SqlError::is_segment_not_found`) without
     /// a second mapping.
+    ///
+    /// `phase` is the [`QueryPhase`] this request's WIRE bytes are charged to
+    /// on [`Self::phase_wire_byte_counter`] (#913). Every GET this fetcher
+    /// issues passes through here, so the per-phase totals and the
+    /// `QueryAccounting` GET total are written from one place and cannot drift.
     async fn store_get(
         &self,
         key: &str,
         range: GetRange,
+        phase: QueryPhase,
         accounting: &QueryAccounting,
     ) -> Result<GetOutcome, LogFetchError> {
         let _permit = self
@@ -2902,6 +3039,7 @@ impl BlockRangeFetcher {
             })?;
         accounting.record_s3_request(AccountedOp::Get);
         accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
+        self.wire_bytes.record(phase, got.data.len() as u64);
         Ok(got)
     }
 
@@ -2914,10 +3052,11 @@ impl BlockRangeFetcher {
         &self,
         key: &str,
         range: GetRange,
+        phase: QueryPhase,
         pin: &EtagPin,
         accounting: &QueryAccounting,
     ) -> Result<GetOutcome, LogFetchError> {
-        let got = self.store_get(key, range, accounting).await?;
+        let got = self.store_get(key, range, phase, accounting).await?;
         pin.check(key, &got.etag)?;
         Ok(got)
     }
@@ -2944,6 +3083,10 @@ impl BlockRangeFetcher {
     /// caller's in-flight GET reports true as well: the same attribution
     /// convention `tenant_bytes` documents, which bounds this call's own cost
     /// and never under-counts the query total.
+    ///
+    /// `phase` is the [`QueryPhase`] a LIVE fetch's wire bytes are charged to
+    /// (#913). A cache hit crossed no network and is charged nothing: its bytes
+    /// are `QueryAccounting::cache_bytes`, a different quantity.
     #[allow(clippy::too_many_arguments)]
     async fn cached_extent(
         &self,
@@ -2952,12 +3095,15 @@ impl BlockRangeFetcher {
         start: u64,
         len: u64,
         range: GetRange,
+        phase: QueryPhase,
         pin: &EtagPin,
         accounting: &QueryAccounting,
     ) -> Result<(Bytes, bool), LogFetchError> {
         let key = seg_ref.data_object_key.as_str();
         let Some(cache) = &self.cache else {
-            let got = self.store_get_pinned(key, range, pin, accounting).await?;
+            let got = self
+                .store_get_pinned(key, range, phase, pin, accounting)
+                .await?;
             check_extent_len(key, got.data.len(), len)?;
             return Ok((got.data, true));
         };
@@ -2969,7 +3115,7 @@ impl BlockRangeFetcher {
         let (bytes, source) = cache
             .get_or_fetch(cache_key, || async move {
                 let got = self
-                    .store_get_pinned(key, range, pin, accounting)
+                    .store_get_pinned(key, range, phase, pin, accounting)
                     .await
                     .map_err(to_cache_error)?;
                 check_extent_len(key, got.data.len(), len).map_err(to_cache_error)?;
@@ -3031,8 +3177,17 @@ impl BlockRangeFetcher {
     ) -> Result<(footer::LogFooter, BlockRangeStats), LogFetchError> {
         let mut stats = BlockRangeStats::default();
         let pin = EtagPin::default();
+        // A planning read moves no BLOCKS-section data, so every byte it
+        // transfers is `Plan` wire bytes (#913, `ReadPhases::PLAN`).
         let (footer, _resident) = self
-            .probe_footer(seg_ref, tenant_hash, &pin, accounting, &mut stats)
+            .probe_footer(
+                seg_ref,
+                tenant_hash,
+                ReadPhases::PLAN.metadata,
+                &pin,
+                accounting,
+                &mut stats,
+            )
             .await?;
         Ok((footer, stats))
     }
@@ -3048,10 +3203,16 @@ impl BlockRangeFetcher {
     /// which is the same "already covered" short circuit
     /// [`place_section`](Self::place_section) gets from [`ObjectAssembler`]
     /// without materializing an object-sized buffer for a directory-only read.
+    ///
+    /// `phase` is the metadata phase of the read this probe belongs to
+    /// ([`ReadPhases::metadata`], #913): the probe and its chase read no
+    /// BLOCKS-section data.
+    #[allow(clippy::too_many_arguments)]
     async fn probe_footer(
         &self,
         seg_ref: &SegmentRef,
         tenant_hash: TenantHash,
+        phase: QueryPhase,
         pin: &EtagPin,
         accounting: &QueryAccounting,
         stats: &mut BlockRangeStats,
@@ -3068,6 +3229,7 @@ impl BlockRangeFetcher {
                 probe_start,
                 suffix,
                 GetRange::Suffix(suffix),
+                phase,
                 pin,
                 accounting,
             )
@@ -3094,6 +3256,7 @@ impl BlockRangeFetcher {
                         offset,
                         len,
                         GetRange::Range(offset, offset + len),
+                        phase,
                         pin,
                         accounting,
                     )
@@ -3152,8 +3315,9 @@ impl BlockRangeFetcher {
         let key = seg_ref.data_object_key.as_str();
         let mut stats = BlockRangeStats::default();
         let pin = EtagPin::default();
+        let phase = ReadPhases::PLAN.metadata;
         let (footer, mut resident) = self
-            .probe_footer(seg_ref, tenant_hash, &pin, accounting, &mut stats)
+            .probe_footer(seg_ref, tenant_hash, phase, &pin, accounting, &mut stats)
             .await?;
 
         let skip_desc = *footer
@@ -3170,6 +3334,7 @@ impl BlockRangeFetcher {
             tenant_hash,
             &footer,
             &[kind::SKIP_IDX],
+            phase,
             &mut resident,
             &pin,
             accounting,
@@ -3182,6 +3347,7 @@ impl BlockRangeFetcher {
                 tenant_hash,
                 &skip_desc,
                 &resident,
+                phase,
                 &pin,
                 accounting,
                 &mut stats,
@@ -3208,6 +3374,7 @@ impl BlockRangeFetcher {
         tenant_hash: TenantHash,
         footer: &footer::LogFooter,
         kinds: &[u32],
+        phase: QueryPhase,
         resident: &mut Vec<(u64, Bytes)>,
         pin: &EtagPin,
         accounting: &QueryAccounting,
@@ -3238,6 +3405,7 @@ impl BlockRangeFetcher {
                     run.abs_start,
                     run.len,
                     GetRange::Range(run.abs_start, run.abs_end()),
+                    phase,
                     pin,
                     accounting,
                 )
@@ -3264,6 +3432,7 @@ impl BlockRangeFetcher {
         tenant_hash: TenantHash,
         desc: &SectionDesc,
         resident: &[(u64, Bytes)],
+        phase: QueryPhase,
         pin: &EtagPin,
         accounting: &QueryAccounting,
         stats: &mut BlockRangeStats,
@@ -3280,6 +3449,7 @@ impl BlockRangeFetcher {
                         desc.offset,
                         desc.len,
                         GetRange::Range(start, end),
+                        phase,
                         pin,
                         accounting,
                     )
@@ -3317,8 +3487,9 @@ impl BlockRangeFetcher {
         let key = seg_ref.data_object_key.as_str();
         let mut stats = BlockRangeStats::default();
         let pin = EtagPin::default();
+        let phase = ReadPhases::PLAN.metadata;
         let (footer, mut resident) = self
-            .probe_footer(seg_ref, tenant_hash, &pin, accounting, &mut stats)
+            .probe_footer(seg_ref, tenant_hash, phase, &pin, accounting, &mut stats)
             .await?;
 
         let skip_desc = *footer
@@ -3335,6 +3506,7 @@ impl BlockRangeFetcher {
             tenant_hash,
             &footer,
             &[kind::SKIP_IDX, kind::PAGE_DIR],
+            phase,
             &mut resident,
             &pin,
             accounting,
@@ -3347,6 +3519,7 @@ impl BlockRangeFetcher {
                 tenant_hash,
                 &skip_desc,
                 &resident,
+                phase,
                 &pin,
                 accounting,
                 &mut stats,
@@ -3364,6 +3537,7 @@ impl BlockRangeFetcher {
                 tenant_hash,
                 &field_desc,
                 &resident,
+                phase,
                 &pin,
                 accounting,
                 &mut stats,
@@ -3384,6 +3558,9 @@ impl BlockRangeFetcher {
     /// selection here; stream/POSTINGS/bloom/numeric pruning still runs at decode
     /// inside the reader over the assembled buffer (it can only narrow the
     /// candidate set further, so every survivor block is fetched).
+    ///
+    /// A data read, so its wire bytes are charged under [`ReadPhases::SCAN`]
+    /// (#913).
     pub async fn fetch_object(
         &self,
         seg_ref: &SegmentRef,
@@ -3400,6 +3577,7 @@ impl BlockRangeFetcher {
             &[],
             &ColumnSelection::all(),
             None,
+            ReadPhases::SCAN,
             accounting,
         )
         .await
@@ -3429,6 +3607,7 @@ impl BlockRangeFetcher {
             &[],
             columns,
             None,
+            ReadPhases::SCAN,
             accounting,
         )
         .await
@@ -3468,6 +3647,12 @@ impl BlockRangeFetcher {
     /// selects which column chunks are fetched as well as which are decoded
     /// (ADR-0699 decision 5); on a version-3 object it is ignored by the fetch,
     /// which reads whole blocks.
+    ///
+    /// `phases` splits this read's WIRE bytes between the phase that pays for
+    /// finding the data and the phase that pays for the data (#913). A caller
+    /// scanning passes [`ReadPhases::SCAN`]; `plan_segment`'s whole-object
+    /// fallback passes [`ReadPhases::PLAN`], which keeps a planning read's
+    /// bytes out of the scan-phase numerator.
     #[allow(clippy::too_many_arguments)]
     pub async fn fetch_object_with_footer(
         &self,
@@ -3478,6 +3663,7 @@ impl BlockRangeFetcher {
         prune: &[Predicate],
         columns: &ColumnSelection,
         plan_footer: Option<CarriedFooter<'_>>,
+        phases: ReadPhases,
         accounting: &QueryAccounting,
     ) -> Result<(Bytes, BlockRangeStats), LogFetchError> {
         let key = seg_ref.data_object_key.as_str();
@@ -3505,7 +3691,9 @@ impl BlockRangeFetcher {
         // cache key, is derived from that size. Read it whole, uncached (the
         // cache key would have to claim a length too).
         if seg_ref.object_size == 0 {
-            let got = self.store_get(key, GetRange::Full, accounting).await?;
+            let got = self
+                .store_get(key, GetRange::Full, phases.blocks, accounting)
+                .await?;
             stats.probe_gets = 1;
             stats.whole_object = true;
             stats.block_bytes_fetched = got.data.len() as u64;
@@ -3529,6 +3717,7 @@ impl BlockRangeFetcher {
                     0,
                     seg_ref.object_size,
                     GetRange::Full,
+                    phases.blocks,
                     &pin,
                     accounting,
                 )
@@ -3573,6 +3762,7 @@ impl BlockRangeFetcher {
                         probe_start,
                         suffix,
                         GetRange::Suffix(suffix),
+                        phases.metadata,
                         &pin,
                         accounting,
                     )
@@ -3600,6 +3790,7 @@ impl BlockRangeFetcher {
                                 offset,
                                 len,
                                 GetRange::Range(offset, offset + len),
+                                phases.metadata,
                                 &pin,
                                 accounting,
                             )
@@ -3649,6 +3840,7 @@ impl BlockRangeFetcher {
                     count_tail_misses,
                     asm,
                     &pin,
+                    phases,
                     accounting,
                     stats,
                 )
@@ -3690,6 +3882,7 @@ impl BlockRangeFetcher {
             seg_ref,
             tenant_hash,
             skip_desc,
+            phases.metadata,
             &pin,
             &mut asm,
             accounting,
@@ -3727,6 +3920,7 @@ impl BlockRangeFetcher {
                     seg_ref,
                     tenant_hash,
                     &footer,
+                    phases.metadata,
                     &pin,
                     &mut asm,
                     accounting,
@@ -3770,6 +3964,7 @@ impl BlockRangeFetcher {
                     0,
                     total_size,
                     GetRange::Full,
+                    phases.blocks,
                     &pin,
                     accounting,
                 )
@@ -3811,6 +4006,7 @@ impl BlockRangeFetcher {
                         tail_start,
                         total_size - tail_start,
                         GetRange::Range(tail_start, total_size),
+                        phases.metadata,
                         &pin,
                         accounting,
                     )
@@ -3829,6 +4025,7 @@ impl BlockRangeFetcher {
             seg_ref,
             tenant_hash,
             &footer,
+            phases.metadata,
             &pin,
             &mut asm,
             accounting,
@@ -3851,6 +4048,7 @@ impl BlockRangeFetcher {
                 seg_ref,
                 tenant_hash,
                 section,
+                phases.metadata,
                 &pin,
                 &mut asm,
                 accounting,
@@ -3864,6 +4062,7 @@ impl BlockRangeFetcher {
             tenant_hash,
             &pin,
             &extents,
+            phases.blocks,
             &mut asm,
             accounting,
             &mut stats,
@@ -3917,6 +4116,7 @@ impl BlockRangeFetcher {
         count_tail_misses: bool,
         mut asm: ObjectAssembler,
         pin: &EtagPin,
+        phases: ReadPhases,
         accounting: &QueryAccounting,
         mut stats: BlockRangeStats,
     ) -> Result<(Bytes, BlockRangeStats), LogFetchError> {
@@ -3966,6 +4166,7 @@ impl BlockRangeFetcher {
                     probe_start,
                     suffix,
                     GetRange::Range(probe_start, total_size),
+                    phases.metadata,
                     pin,
                     accounting,
                 )
@@ -3987,6 +4188,7 @@ impl BlockRangeFetcher {
             seg_ref,
             tenant_hash,
             &[skip_desc, page_desc],
+            phases.metadata,
             pin,
             &mut asm,
             accounting,
@@ -4016,6 +4218,7 @@ impl BlockRangeFetcher {
                     seg_ref,
                     tenant_hash,
                     footer,
+                    phases.metadata,
                     pin,
                     &mut asm,
                     accounting,
@@ -4062,6 +4265,7 @@ impl BlockRangeFetcher {
                     0,
                     total_size,
                     GetRange::Full,
+                    phases.blocks,
                     pin,
                     accounting,
                 )
@@ -4098,6 +4302,7 @@ impl BlockRangeFetcher {
                         tail_start,
                         total_size - tail_start,
                         GetRange::Range(tail_start, total_size),
+                        phases.metadata,
                         pin,
                         accounting,
                     )
@@ -4117,6 +4322,7 @@ impl BlockRangeFetcher {
             seg_ref,
             tenant_hash,
             footer,
+            phases.metadata,
             pin,
             &mut asm,
             accounting,
@@ -4139,6 +4345,7 @@ impl BlockRangeFetcher {
                 seg_ref,
                 tenant_hash,
                 section,
+                phases.metadata,
                 pin,
                 &mut asm,
                 accounting,
@@ -4152,6 +4359,7 @@ impl BlockRangeFetcher {
             tenant_hash,
             pin,
             &wanted,
+            phases.blocks,
             &mut asm,
             accounting,
             &mut stats,
@@ -4167,6 +4375,11 @@ impl BlockRangeFetcher {
     /// identical runs and collapse onto one real request each rather than one
     /// per partition (ADR-0102 decision 1's premise), and the etag pin holds
     /// across the sequence.
+    ///
+    /// These are the BLOCKS-section data ranges, so `phase` is the read's
+    /// [`ReadPhases::blocks`] and the WIRE bytes recorded here are the
+    /// numerator of fetch amplification (#913). A run's coalescing holes are
+    /// included, because the store transferred them.
     #[allow(clippy::too_many_arguments)]
     async fn fetch_chunk_ranges(
         &self,
@@ -4174,6 +4387,7 @@ impl BlockRangeFetcher {
         tenant_hash: TenantHash,
         pin: &EtagPin,
         wanted: &[ByteExtent],
+        phase: QueryPhase,
         asm: &mut ObjectAssembler,
         accounting: &QueryAccounting,
         stats: &mut BlockRangeStats,
@@ -4193,6 +4407,7 @@ impl BlockRangeFetcher {
                     run.abs_start,
                     run.len,
                     GetRange::Range(run.abs_start, run.abs_end()),
+                    phase,
                     pin,
                     accounting,
                 )
@@ -4226,6 +4441,7 @@ impl BlockRangeFetcher {
         seg_ref: &SegmentRef,
         tenant_hash: TenantHash,
         sections: &[SectionDesc],
+        phase: QueryPhase,
         pin: &EtagPin,
         asm: &mut ObjectAssembler,
         accounting: &QueryAccounting,
@@ -4248,6 +4464,7 @@ impl BlockRangeFetcher {
                     run.abs_start,
                     run.len,
                     GetRange::Range(run.abs_start, run.abs_end()),
+                    phase,
                     pin,
                     accounting,
                 )
@@ -4340,6 +4557,7 @@ impl BlockRangeFetcher {
         seg_ref: &SegmentRef,
         tenant_hash: TenantHash,
         footer: &footer::LogFooter,
+        phase: QueryPhase,
         pin: &EtagPin,
         asm: &mut ObjectAssembler,
         accounting: &QueryAccounting,
@@ -4368,6 +4586,7 @@ impl BlockRangeFetcher {
                 start,
                 end - start,
                 GetRange::Range(start, end),
+                phase,
                 pin,
                 accounting,
             )
@@ -4400,6 +4619,7 @@ impl BlockRangeFetcher {
         seg_ref: &SegmentRef,
         tenant_hash: TenantHash,
         footer: &footer::LogFooter,
+        phase: QueryPhase,
         pin: &EtagPin,
         asm: &mut ObjectAssembler,
         accounting: &QueryAccounting,
@@ -4409,8 +4629,17 @@ impl BlockRangeFetcher {
         let desc = *footer
             .section(kind::FIELD_DIR)
             .ok_or_else(|| corrupt(key, LogSegError::Corrupted("missing FIELD_DIR".into())))?;
-        self.place_section(seg_ref, tenant_hash, &desc, pin, asm, accounting, stats)
-            .await?;
+        self.place_section(
+            seg_ref,
+            tenant_hash,
+            &desc,
+            phase,
+            pin,
+            asm,
+            accounting,
+            stats,
+        )
+        .await?;
         let stored = asm.slice(key, desc.offset, desc.len)?;
         let raw =
             decode_section(stored, &desc, &self.cfg).map_err(|source| corrupt(key, source))?;
@@ -4429,6 +4658,7 @@ impl BlockRangeFetcher {
         seg_ref: &SegmentRef,
         tenant_hash: TenantHash,
         section: &SectionDesc,
+        phase: QueryPhase,
         pin: &EtagPin,
         asm: &mut ObjectAssembler,
         accounting: &QueryAccounting,
@@ -4446,6 +4676,7 @@ impl BlockRangeFetcher {
                 section.offset,
                 section.len,
                 GetRange::Range(start, end),
+                phase,
                 pin,
                 accounting,
             )
@@ -4470,6 +4701,7 @@ impl BlockRangeFetcher {
         tenant_hash: TenantHash,
         pin: &EtagPin,
         extents: &[BlockExtent],
+        phase: QueryPhase,
         asm: &mut ObjectAssembler,
         accounting: &QueryAccounting,
         stats: &mut BlockRangeStats,
@@ -4524,7 +4756,7 @@ impl BlockRangeFetcher {
                 .copied()
                 .filter(|e| e.abs_start >= run.abs_start && e.abs_end() <= run.abs_end())
                 .collect();
-            self.fetch_run(seg_ref, tenant_hash, pin, *run, blocks, accounting)
+            self.fetch_run(seg_ref, tenant_hash, pin, *run, blocks, phase, accounting)
         }))
         .await;
         for outcome in outcomes {
@@ -4554,6 +4786,7 @@ impl BlockRangeFetcher {
     /// blocks resident and issues no GET of its own. A follower that still
     /// misses one -- evicted in the meantime, or larger than the cache's
     /// single-entry cap -- fetches that block alone, still single-flighted.
+    #[allow(clippy::too_many_arguments)]
     async fn fetch_run(
         &self,
         seg_ref: &SegmentRef,
@@ -4561,12 +4794,15 @@ impl BlockRangeFetcher {
         pin: &EtagPin,
         run: BlockExtent,
         blocks: Vec<BlockExtent>,
+        phase: QueryPhase,
         accounting: &QueryAccounting,
     ) -> Result<RunOutcome, LogFetchError> {
         let key = seg_ref.data_object_key.as_str();
         let range = GetRange::Range(run.abs_start, run.abs_end());
         let Some(cache) = &self.cache else {
-            let got = self.store_get_pinned(key, range, pin, accounting).await?;
+            let got = self
+                .store_get_pinned(key, range, phase, pin, accounting)
+                .await?;
             let blocks = split_run(key, run.abs_start, &got.data, &blocks)?;
             return Ok(RunOutcome {
                 blocks,
@@ -4603,7 +4839,7 @@ impl BlockRangeFetcher {
         let lead_bytes = cache
             .fetch_peeked(lead_key, || async {
                 let got = self
-                    .store_get_pinned(key, range, pin, accounting)
+                    .store_get_pinned(key, range, phase, pin, accounting)
                     .await
                     .map_err(to_cache_error)?;
                 let split =
@@ -4664,6 +4900,7 @@ impl BlockRangeFetcher {
                         .store_get_pinned(
                             key,
                             GetRange::Range(ext.abs_start, ext.abs_end()),
+                            phase,
                             pin,
                             accounting,
                         )
