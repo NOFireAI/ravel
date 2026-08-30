@@ -498,8 +498,17 @@ def cold(q):
         fails.append(f"{q}: two measured rows share this prefix; ambiguous")
         return None
     pra = v.get("per_run_accounting") or []
+    if not isinstance(pra, list):
+        fails.append(f"{q}: per_run_accounting is not a list ({pra!r})")
+        return None
     if not pra:
         fails.append(f"{q}: no per_run_accounting; cold cost not emitted")
+        return None
+    # Validate the record before handing it to a caller that will `.get` it.
+    # A null or scalar run-0 entry would otherwise raise AttributeError inside
+    # scan_wire and abort the analysis with a traceback instead of a verdict.
+    if not isinstance(pra[0], dict):
+        fails.append(f"{q}: per_run_accounting[0] is not an object ({pra[0]!r})")
         return None
     return pra[0]
 
@@ -547,14 +556,26 @@ def scan_wire(acc, q):
     if not isinstance(phases, list):
         fails.append(f"{q}: wire_bytes_by_phase is not a list ({phases!r})")
         return None
+    scan = []
     for i, p in enumerate(phases):
         if not isinstance(p, dict):
             fails.append(f"{q}: wire_bytes_by_phase[{i}] is not an object ({p!r})")
             return None
         if p.get("phase") == "scan":
-            return byte_count(p.get("wire_bytes"), f"{q} scan-phase wire_bytes")
-    fails.append(f"{q}: no scan-phase wire_bytes entry in the measured run")
-    return None
+            scan.append(p)
+    # Exactly one, not "the first one". Returning the first and ignoring the
+    # rest would silently drop scan bytes from the total and hand a wrong
+    # amplification verdict back as if it were measured. This is the same
+    # present-exactly-once rule the integrity gate applies to report rows,
+    # applied one level down.
+    if not scan:
+        fails.append(f"{q}: no scan-phase wire_bytes entry in the measured run")
+        return None
+    if len(scan) > 1:
+        fails.append(f"{q}: {len(scan)} scan-phase wire_bytes entries; expected "
+                     "exactly one, and summing them would hide which is real")
+        return None
+    return byte_count(scan[0].get("wire_bytes"), f"{q} scan-phase wire_bytes")
 
 # Membership every band relies on. Held here AND in the corpus data; if the two
 # disagree the band is being applied to the wrong statement, so fail loudly.
