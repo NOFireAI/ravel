@@ -529,14 +529,31 @@ def byte_count(v, what):
         return None
     return v
 
-def scan_wire(acc):
-    """Scan-phase WIRE bytes: the data-block reads. The report carries per-phase
-    wire BYTES but no per-phase GET count, so scan-phase bytes is the data-read
-    signal. At the zero point it is exact: zero scan bytes == zero data GETs."""
-    for p in acc.get("wire_bytes_by_phase") or []:
+def scan_wire(acc, q):
+    """Scan-phase WIRE bytes for statement `q`, or None with a recorded failure.
+
+    The report carries per-phase wire BYTES but no per-phase GET count, so
+    scan-phase bytes is the data-read signal. At the zero point it is exact:
+    zero scan bytes == zero data GETs.
+
+    Every phase entry is checked to be a mapping first. A null or scalar entry
+    would make `p.get` raise AttributeError and abort the whole analysis, which
+    is worse than a recorded failure: the run ends with a traceback instead of
+    a verdict, and a crash is easy to misread as a harness problem rather than
+    a malformed report."""
+    phases = acc.get("wire_bytes_by_phase")
+    if phases is None:
+        phases = []
+    if not isinstance(phases, list):
+        fails.append(f"{q}: wire_bytes_by_phase is not a list ({phases!r})")
+        return None
+    for i, p in enumerate(phases):
+        if not isinstance(p, dict):
+            fails.append(f"{q}: wire_bytes_by_phase[{i}] is not an object ({p!r})")
+            return None
         if p.get("phase") == "scan":
-            return byte_count(p.get("wire_bytes"), "scan-phase wire_bytes")
-    fails.append("a measured run carries no scan-phase wire_bytes entry")
+            return byte_count(p.get("wire_bytes"), f"{q} scan-phase wire_bytes")
+    fails.append(f"{q}: no scan-phase wire_bytes entry in the measured run")
     return None
 
 # Membership every band relies on. Held here AND in the corpus data; if the two
@@ -592,7 +609,7 @@ if failed_q != EXPECTED_FAILED_Q:
 # --- Class M --------------------------------------------------------------
 acc = cold("q01")
 if acc is not None:
-    sw = scan_wire(acc)
+    sw = scan_wire(acc, "q01")
     if sw is not None:
         print(f"class M q01 data (scan) wire bytes {sw}")
         if sw > M_Q01_DATA_GETS_MAX:
@@ -657,7 +674,7 @@ def amplification(qs, label, band):
         acc = cold(q)                      # `cold` already FAILS on an absent row
         if acc is None:
             return
-        sw = scan_wire(acc)
+        sw = scan_wire(acc, q)
         if sw is None:
             return
         # The denominator gets the same treatment as the numerator: absent or
