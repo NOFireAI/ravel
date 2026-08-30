@@ -123,11 +123,12 @@ single-series, selective multi-series, high-fan-out, full-range, join,
 histogram, and long-range. That class is a typed enum on the entry, not a
 comment.
 
-### 6. `unsupported` covers refusals, not just gaps
+### 6. Every outcome has a status, and refusals are not gaps
 
 This is the decision most likely to be got wrong later, so it is stated
-explicitly. A query can fail to produce a comparable number for three
-different reasons, and they are three different report categories:
+explicitly. The distinction that matters most is between an engine that
+*cannot* answer and an engine that *declines* to, but a status set has to
+cover every way a query ends, not only the interesting ones.
 
 Every outcome has exactly one status, and each status states its membership in
 three separate denominators. "The denominator" alone is ambiguous and must not
@@ -143,22 +144,38 @@ appear in a report:
 |---|---|---|---|---|
 | `ok` | answered, oracle agrees | yes | yes | **yes** |
 | `incorrect` | answered, oracle disagrees | yes | yes | no |
-| `partial` | answered from an incomplete result set (a system returned data plus a partial/warning signal, or Ravel refused partial coverage without `allow_partial`) | yes | yes | no |
+| `partial` | answered, but from an incomplete result set: the engine returned data together with a partial or warning signal | yes | yes | no |
 | `timeout` | no answer within the per-query deadline | yes | no | no |
 | `error` | transport or server error that is not one of the above | yes | no | no |
 | `unsupported_construct` | the engine does not implement it | yes | no | no |
-| `budget_refused` | the engine implements it and declines to spend | yes | no | no |
+| `refused` | the engine implements it and deliberately declined, returning no result. Carries a required `reason`: `budget` (subquery point caps, `TooManySegments`, `RequestBudgetExceeded`, per-selector ceilings) or `partial_coverage` (Ravel's 503 when coverage is incomplete and `allow_partial` was not set) | yes | no | no |
 
 Only `ok` is timed. Everything else is reported with its status and stays in
 the corpus denominator, so a coverage or success rate is always over the whole
 corpus and a system cannot improve its score by failing.
+
+**A refusal is not a correctness result.** `refused` produces no answer, so
+there is nothing for the oracle to compare and it is outside the correctness
+denominator. Folding a refusal into correctness would let an engine that
+declined to answer count as having been checked. This is why Ravel's
+partial-coverage 503 is `refused` with reason `partial_coverage` rather than
+`partial`: the 503 returns no data at all, whereas `partial` means data arrived
+with a completeness caveat attached.
+
+**Precedence, when a partial result also diverges.** Correctness is evaluated
+on whatever data was returned. A `partial` response whose returned data
+disagrees with the oracle is recorded `incorrect`, not `partial`: a wrong
+answer is a wrong answer, and the incompleteness is recorded in the same row as
+a separate flag. `partial` therefore means "incomplete and, as far as it goes,
+correct". Neither status is timed, so the precedence affects what a reader
+learns, not the performance table.
 
 `partial` and `timeout` are separate statuses rather than folded into `error`
 because they mean different things about the engine: a partial result is a
 completeness decision, a timeout is a cost outcome, and an error is neither.
 
 **The statuses are per engine, not per query.** The same query may be `ok` on
-Prometheus and `budget_refused` on Ravel. A cross-engine table shows the status
+Prometheus and `refused` on Ravel. A cross-engine table shows the status
 alongside each engine's figure, never a single row status.
 
 Prometheus and VictoriaMetrics return data for several shapes Ravel refuses on
@@ -288,15 +305,23 @@ whether Ravel is fast.
      run), the exclusion and its reason appear in the report, and the run is
      repeated to restore the minimum count. A pass excluded for being slow,
      with no named cause, is data.
-   - **The band is per regime and per query class**, never one number for the
-     whole run: a metadata-only query and a high-fan-out aggregation do not
-     share a noise floor.
+   - **The band is per query and per regime.** Not per class: a class band
+     would need an aggregation rule over its members' bands, and any such rule
+     (mean, max, a percentile) makes the pass/fail verdict for one query depend
+     on how noisy its neighbours were. A query is compared against its own
+     band, which is the only comparison that stays deterministic as the corpus
+     grows.
+
+     Class-level figures are still reported, as the **distribution** of
+     per-query bands within a class, because that is what shows a metadata-only
+     query and a high-fan-out aggregation have different noise floors. They are
+     descriptive and never a gate.
    - **Cold and warm carry different floors and are never compared to each
      other**, nor is one derived from the other.
 
-   A regression claim requires the delta to exceed the band for that query's
-   class and regime. A delta inside the band is reported as no change, not as
-   a small improvement.
+   A regression claim requires the delta to exceed **that query's own band**
+   for the regime. A delta inside the band is reported as no change, not as a
+   small improvement.
 4. Ingested sample count must equal generated sample count minus explicitly
    reported rejections. A silent drop fails the run.
 5. Every figure the report claims is present exactly once and inside its
@@ -323,7 +348,7 @@ flowchart TB
   VM -.-> ORACLE
   OSN -.-> ORACLE
   ORACLE -->|"ok"| SCORE["portable lane<br/>cross-engine table<br/>(only ok is timed)"]
-  ORACLE -->|"incorrect / partial / timeout /<br/>error / unsupported / budget_refused"| VISIBLE["reported with status,<br/>stays in the corpus<br/>denominator"]
+  ORACLE -->|"incorrect / partial / timeout /<br/>error / unsupported / refused"| VISIBLE["reported with status,<br/>stays in the corpus<br/>denominator"]
 
   RAVEL ==>|"PhaseAccounting<br/>already measured"| DIAG["Ravel diagnostic lane<br/>per-phase cost"]
   DIAG -.->|"NEVER folded in"| SCORE
