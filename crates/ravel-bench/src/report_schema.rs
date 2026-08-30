@@ -279,6 +279,27 @@ impl Measurement {
 /// `ok` is timed.
 pub const REQUIRED_TIMED_FIGURES: &[&str] = &["min_ms", "median_ms", "max_ms"];
 
+/// The relative tolerance the report-level `geomean_ms` is checked against the
+/// geometric mean recomputed from the timed rows' `median_ms`. A supplied value
+/// farther than this fraction from the recomputed one is rejected as a mismatch
+/// ([`ValidationError::GeomeanMismatch`]): "present but unverified" is the weaker
+/// half of the guarantee, so the value is checked against the rows it claims to
+/// summarize, not merely required to exist.
+///
+/// Relative, not absolute: the geomean scales with the medians, and a regime can
+/// range from microseconds to seconds (six orders of magnitude), so a fixed
+/// millisecond slop that is tight for one regime is meaningless for another.
+///
+/// The value is `1e-9`. Recomputing `exp(mean(ln median))` accumulates f64
+/// rounding error on the order of `n * f64::EPSILON` (about `1e-14` relative for
+/// dozens of rows), and a producer that computes the geomean by a
+/// different-but-valid method (a scaled product rather than a log-sum) adds a
+/// little more; `1e-9` sits several orders above that floor, so a faithfully
+/// computed value always passes. A real disagreement (a stale or hand-typed
+/// summary, or a geomean that summarizes the wrong rows) is a multiplicative
+/// factor far larger than `1e-9` and is always caught.
+pub const GEOMEAN_REL_TOLERANCE: f64 = 1e-9;
+
 /// The full reconciled report: the provenance, the per-query measurements, and
 /// an optional report-level geometric mean.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -422,29 +443,81 @@ pub enum ValidationError {
         /// The geomean value that had nothing behind it.
         value: f64,
     },
+    /// The report-level geometric mean disagrees with the geometric mean
+    /// recomputed from the timed rows' `median_ms`, beyond
+    /// [`GEOMEAN_REL_TOLERANCE`]. A summary that contradicts the rows it claims
+    /// to summarize is two results, not one; the error carries both so the
+    /// disagreement is visible, not just the field name.
+    #[error(
+        "report geomean_ms {supplied} disagrees with the geometric mean {computed} recomputed \
+         from the timed medians (relative tolerance {tolerance:e}); a summary that contradicts \
+         its rows is not a result",
+        tolerance = GEOMEAN_REL_TOLERANCE
+    )]
+    GeomeanMismatch {
+        /// The value the report supplied.
+        supplied: f64,
+        /// The value recomputed from the timed medians.
+        computed: f64,
+    },
 }
 
-/// One required provenance string field, paired with the human name a
-/// [`ValidationError::MissingProvenanceField`] reports. Held in a table so the
-/// check iterates rather than repeating the same `if blank` block per field: a
-/// new required field is one row here.
-fn required_provenance_fields(p: &Provenance) -> [(&'static str, &str); 8] {
-    [
+/// Whether a *present* provenance value is an absent-value sentinel rather than
+/// real data: blank (after trimming), or the `"unknown"` marker a gatherer on a
+/// host without git or rustc used to emit. Every present provenance string flows
+/// through this one predicate so the check cannot regress to a weaker
+/// blank-only test on any single field (the exact defect this function closes:
+/// eight fields rejected the sentinel while comparators and populated backend or
+/// hardware fields rejected only blanks).
+///
+/// `"n/a"` is deliberately NOT a sentinel here: on `backend.region` /
+/// `backend.endpoint` it is a real value meaning "this backend has none", not
+/// missing data, so a field that legitimately carries it still passes. This
+/// predicate governs the value of a field that IS present; a legitimately
+/// optional field (`hardware.instance_type`) is exempt by being absent, never by
+/// carrying a sentinel.
+fn is_absent_value(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.is_empty() || trimmed.eq_ignore_ascii_case("unknown")
+}
+
+/// Every provenance string field whose presence must be real, paired with the
+/// name a [`ValidationError::MissingProvenanceField`] reports. Coverage is by
+/// construction: a field is checked once it is listed here, and it is checked
+/// with the full [`is_absent_value`] predicate, never a hand-written weaker one,
+/// because the caller applies that single predicate to every row. Adding a
+/// provenance string field is one row here; a reviewer confirms the list against
+/// the [`Provenance`] struct.
+///
+/// Optional fields (`hardware.instance_type`) appear only when present: an
+/// absent optional field is legitimately absent, but a present one must carry a
+/// real value, not a sentinel. `backend.region` / `backend.endpoint` are
+/// included because [`is_absent_value`] treats their legitimate `"n/a"` as real
+/// data, so listing them rejects blank and `"unknown"` without breaking the
+/// no-endpoint case.
+fn checked_provenance_fields(p: &Provenance) -> Vec<(&'static str, &str)> {
+    let mut fields = vec![
         ("ravel_git_commit", p.ravel_git_commit.as_str()),
         ("toolchain", p.toolchain.as_str()),
         ("protocol", p.protocol.as_str()),
         ("hardware.os", p.hardware.os.as_str()),
         ("hardware.cpu_model", p.hardware.cpu_model.as_str()),
         ("backend.store_backend", p.backend.store_backend.as_str()),
+        ("backend.region", p.backend.region.as_str()),
+        ("backend.endpoint", p.backend.endpoint.as_str()),
         ("generator_digest", p.generator_digest.as_str()),
         ("corpus_digest", p.corpus_digest.as_str()),
-    ]
+    ];
+    if let Some(instance_type) = p.hardware.instance_type.as_deref() {
+        fields.push(("hardware.instance_type", instance_type));
+    }
+    fields
 }
 
-/// Validate the provenance block, fail-closed. Every required identity field
-/// must be present, the schema version must match, the hardware must name at
-/// least one logical core, and every named comparator must be completely
-/// pinned.
+/// Validate the provenance block, fail-closed. Every present identity field must
+/// carry a real value (not blank, not the `"unknown"` sentinel), the schema
+/// version must match, the hardware must name at least one logical core, and
+/// every named comparator must be completely pinned.
 fn validate_provenance(p: &Provenance) -> Result<(), ValidationError> {
     if p.schema_version != SCHEMA_VERSION {
         return Err(ValidationError::SchemaVersionMismatch {
@@ -452,27 +525,10 @@ fn validate_provenance(p: &Provenance) -> Result<(), ValidationError> {
             expected: SCHEMA_VERSION,
         });
     }
-    for (field, value) in required_provenance_fields(p) {
-        // A blank field is missing; so is the `"unknown"` sentinel a gatherer on
-        // a host without git or rustc used to emit. Rejecting it here pins the
-        // validator independently of any gatherer, so a future gatherer
-        // regression that reintroduces the sentinel cannot self-validate.
-        let trimmed = value.trim();
-        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("unknown") {
+    for (field, value) in checked_provenance_fields(p) {
+        if is_absent_value(value) {
             return Err(ValidationError::MissingProvenanceField { field });
         }
-    }
-    // `region`/`endpoint` carry a `"n/a"` sentinel rather than being empty, so a
-    // blank one is still a missing field.
-    if p.backend.region.trim().is_empty() {
-        return Err(ValidationError::MissingProvenanceField {
-            field: "backend.region",
-        });
-    }
-    if p.backend.endpoint.trim().is_empty() {
-        return Err(ValidationError::MissingProvenanceField {
-            field: "backend.endpoint",
-        });
     }
     if p.hardware.logical_cores == 0 {
         return Err(ValidationError::MissingProvenanceField {
@@ -480,12 +536,16 @@ fn validate_provenance(p: &Provenance) -> Result<(), ValidationError> {
         });
     }
     for (index, c) in p.comparators.iter().enumerate() {
+        // A named comparator is a populated field, so its pins reject the
+        // sentinel too, not just blanks: a comparator recorded as
+        // `prometheus=unknown=unknown` is an unreproducible pin masquerading as
+        // one, the same defect one layer out.
         for (field, value) in [
             ("name", c.name.as_str()),
             ("version", c.version.as_str()),
             ("image_digest", c.image_digest.as_str()),
         ] {
-            if value.trim().is_empty() {
+            if is_absent_value(value) {
                 return Err(ValidationError::IncompleteComparator { index, field });
             }
         }
@@ -588,8 +648,29 @@ pub fn validate(report: &MetricsBenchReport) -> Result<(), ValidationError> {
         // A geomean summarizes the timed medians; a report whose rows are all
         // timeout/error/refused has no timed median behind it, so the geomean
         // summarizes nothing.
-        if !report.measurements.iter().any(|m| m.status.is_timed()) {
+        let timed_medians: Vec<f64> = report
+            .measurements
+            .iter()
+            .filter(|m| m.status.is_timed())
+            .filter_map(|m| m.figure("median_ms"))
+            .collect();
+        if timed_medians.is_empty() {
             return Err(ValidationError::GeomeanWithoutTimedRow { value: g });
+        }
+        // Requiring a timed row to exist without checking the value is "present
+        // but unverified": recompute the geometric mean from the timed medians
+        // and reject a supplied value that disagrees. `exp(mean(ln))` rather than
+        // an nth root of a product, which would overflow over dozens of
+        // millisecond medians. Every timed row carries `median_ms`
+        // (`validate_measurement` above enforced it), so the count and the sum
+        // cover the same rows.
+        let sum_ln: f64 = timed_medians.iter().map(|m| m.ln()).sum();
+        let computed = (sum_ln / timed_medians.len() as f64).exp();
+        if (g - computed).abs() > GEOMEAN_REL_TOLERANCE * computed {
+            return Err(ValidationError::GeomeanMismatch {
+                supplied: g,
+                computed,
+            });
         }
     }
     Ok(())
@@ -965,6 +1046,165 @@ mod tests {
         let err =
             validate(&report).expect_err("a geomean over zero timed rows must fail validation");
         assert_eq!(err, ValidationError::GeomeanWithoutTimedRow { value: 12.5 });
+    }
+
+    /// One timed (`ok`) row whose `median_ms` is `median`; `min`/`max` are set to
+    /// the same value because only `median_ms` feeds the geomean recomputation
+    /// and the ordering of the three is not validated.
+    fn timed_with_median(id: &str, median: f64) -> Measurement {
+        Measurement {
+            id: id.to_string(),
+            class: CostClass::HighFanOut,
+            status: ResultStatus::Ok,
+            figures: vec![
+                Figure {
+                    name: "min_ms".to_string(),
+                    value: median,
+                },
+                Figure {
+                    name: "median_ms".to_string(),
+                    value: median,
+                },
+                Figure {
+                    name: "max_ms".to_string(),
+                    value: median,
+                },
+            ],
+        }
+    }
+
+    /// The comparator sentinel defect one layer out: a pin recorded as
+    /// `prometheus=unknown=unknown` used to validate, because the comparator
+    /// fields rejected only blanks. It now fails, naming the first sentinel pin.
+    #[test]
+    fn a_comparator_pinned_with_the_unknown_sentinel_fails_validation() {
+        let mut report = valid_report();
+        report.provenance.comparators[0] = Comparator {
+            name: "prometheus".to_string(),
+            version: "unknown".to_string(),
+            image_digest: "unknown".to_string(),
+        };
+        let err = validate(&report).expect_err("an `unknown` comparator pin must fail");
+        assert_eq!(
+            err,
+            ValidationError::IncompleteComparator {
+                index: 0,
+                field: "version",
+            }
+        );
+    }
+
+    /// A populated backend field carrying the sentinel fails: `region = "unknown"`
+    /// is a sentinel that reads like data, refused the same as a blank.
+    #[test]
+    fn a_populated_backend_field_with_the_unknown_sentinel_fails_validation() {
+        let mut report = valid_report();
+        report.provenance.backend.region = "unknown".to_string();
+        let err = validate(&report).expect_err("an `unknown` region must fail");
+        assert_eq!(
+            err,
+            ValidationError::MissingProvenanceField {
+                field: "backend.region",
+            }
+        );
+    }
+
+    /// A populated optional hardware field carrying the sentinel fails: an absent
+    /// `instance_type` is legitimate, but a present one that is `"unknown"` is a
+    /// sentinel standing in for a real value.
+    #[test]
+    fn a_populated_instance_type_with_the_unknown_sentinel_fails_validation() {
+        let mut report = valid_report();
+        report.provenance.hardware.instance_type = Some("unknown".to_string());
+        let err = validate(&report).expect_err("an `unknown` instance_type must fail");
+        assert_eq!(
+            err,
+            ValidationError::MissingProvenanceField {
+                field: "hardware.instance_type",
+            }
+        );
+    }
+
+    /// The regression the sentinel fix could easily introduce: `region` and
+    /// `endpoint` carrying the legitimate `"n/a"` value (a backend with no
+    /// region/endpoint) still VALIDATE. `"n/a"` is real data, not a sentinel.
+    #[test]
+    fn backend_region_and_endpoint_carrying_n_a_still_validate() {
+        let mut report = valid_report();
+        report.provenance.backend.region = "n/a".to_string();
+        report.provenance.backend.endpoint = "n/a".to_string();
+        validate(&report).expect("`n/a` on region/endpoint is a real value and validates");
+    }
+
+    /// FINDING 2. A geomean that disagrees with the timed medians fails with the
+    /// distinct `GeomeanMismatch` variant, and the error carries both the
+    /// supplied value and the value recomputed from the rows. One timed row of
+    /// `median_ms = 12.5` and a supplied `geomean_ms = 1.0` are two contradictory
+    /// results.
+    ///
+    /// To watch this test FAIL against the pre-fix validator, delete the
+    /// recomputation block in `validate` (the `let sum_ln: f64 = ...` line
+    /// through the `GeomeanMismatch` return, in the `if let Some(g) =
+    /// report.geomean_ms` block). The pre-fix validator required only that a
+    /// timed row EXIST, so `validate` returned `Ok(())` for a disagreeing
+    /// geomean, `expect_err` found `Ok`, and the test failed.
+    #[test]
+    fn a_geomean_disagreeing_with_the_timed_medians_fails_validation() {
+        let mut report = valid_report();
+        // The fixture's single timed row has median_ms = 12.5.
+        assert_eq!(report.measurements[0].figure("median_ms"), Some(12.5));
+        report.geomean_ms = Some(1.0);
+        let err = validate(&report).expect_err("a geomean disagreeing with the medians must fail");
+        assert_eq!(
+            err,
+            ValidationError::GeomeanMismatch {
+                supplied: 1.0,
+                computed: 12.5,
+            }
+        );
+    }
+
+    /// A geomean computed correctly from the timed medians validates, over enough
+    /// rows that the `exp(mean(ln))` accumulation is non-trivial, so the
+    /// tolerance is exercised rather than assumed. The same computation is fed as
+    /// the supplied value; the recomputation is bit-identical, so it passes well
+    /// inside [`GEOMEAN_REL_TOLERANCE`].
+    #[test]
+    fn a_geomean_matching_the_timed_medians_validates_over_many_rows() {
+        let medians: Vec<f64> = (1..=40).map(|i| 5.0 + f64::from(i) * 0.37).collect();
+        let n = medians.len() as f64;
+        let geomean = (medians.iter().map(|m| m.ln()).sum::<f64>() / n).exp();
+
+        let mut report = valid_report();
+        report.provenance.comparators.clear();
+        report.measurements = medians
+            .iter()
+            .enumerate()
+            .map(|(i, &m)| timed_with_median(&format!("mb_row_{i}"), m))
+            .collect();
+        report.geomean_ms = Some(geomean);
+        validate(&report).expect("a faithfully computed geomean validates");
+
+        // A value just outside the tolerance is rejected, proving the tolerance
+        // is a real check rather than an always-true one.
+        report.geomean_ms = Some(geomean * (1.0 + 2.0 * GEOMEAN_REL_TOLERANCE));
+        let err = validate(&report).expect_err("a geomean outside the tolerance must fail");
+        match err {
+            ValidationError::GeomeanMismatch { supplied, computed } => {
+                assert_eq!(supplied, geomean * (1.0 + 2.0 * GEOMEAN_REL_TOLERANCE));
+                assert_eq!(computed, geomean);
+            }
+            other => panic!("wrong error variant: {other:?}"),
+        }
+    }
+
+    /// A report with no geomean at all still validates: the geomean is optional
+    /// and the per-query rows stand on their own.
+    #[test]
+    fn a_report_with_no_geomean_validates() {
+        let mut report = valid_report();
+        report.geomean_ms = None;
+        validate(&report).expect("a report without a geomean validates");
     }
 
     /// Failure class: a schema version this build does not read.
