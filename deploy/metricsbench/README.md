@@ -48,9 +48,18 @@ lives outside these files.
 docker compose -f deploy/metricsbench/docker-compose.yml up -d
 ```
 
-Every image is pinned to an immutable `@sha256:` digest (see below), so this
-brings up the exact same bytes on every host. Each comparator is given identical
-CPU (2.0) and memory (4g) limits so no engine wins on hardware.
+Every image is pinned to an immutable `@sha256:` digest (see below). Each
+comparator is given identical CPU (2.0) and memory (4g) limits so no engine
+wins on hardware.
+
+**The digest pins the manifest, not the platform.** These are multi-architecture
+manifest-list digests, so the same digest resolves to different image bytes on
+`linux/amd64` than on `linux/arm64`. A pinned digest therefore makes a run
+reproducible *per platform*, not across platforms. Any run whose numbers are
+reported must record the platform it resolved on, and a cross-host comparison
+is only valid between hosts of the same architecture. Two hosts with the same
+digest and different architectures are running different binaries, which is
+exactly the kind of difference that reads as an engine result.
 
 Tear down (and drop the local volumes):
 
