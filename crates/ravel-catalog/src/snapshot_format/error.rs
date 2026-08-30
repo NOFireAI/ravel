@@ -267,7 +267,12 @@ pub enum SnapshotFormatError {
     )]
     ColumnStatsSumMismatch {
         name: String,
-        sum: i128,
-        dict_sum: i128,
+        /// The column's stored `sum` (proto `i64`).
+        sum: i64,
+        /// The sum its dictionary implies, clamped into `i64` for the message
+        /// only (an `i128` field would 16-byte-align this whole error enum and
+        /// grow every error that embeds it): a real mismatch is what matters,
+        /// not the exact overflowed magnitude.
+        dict_sum: i64,
     },
 }
