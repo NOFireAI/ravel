@@ -61,10 +61,49 @@ use serde::Deserialize;
 /// behavior from the writer unchanged (it writes no overflow logic of its own).
 pub const LOADER_MAX_ATTRIBUTES_PER_RECORD: usize = 1024;
 
-/// Default rows per Strict write. Each write is one flush per involved shard,
-/// so this bounds the RLOG object size and the memory held while building a
-/// batch. Every successful write is fully durable before the next batch starts.
+/// Rows per Strict write for an input too small for the size-aware derivation
+/// ([`resolve_batch_rows`]), and the floor that derivation never goes below.
+/// Each write is one flush per involved shard, so this bounds the RLOG object
+/// size and the memory held while building a batch. Every successful write is
+/// fully durable before the next batch starts.
 pub const DEFAULT_BATCH_ROWS: usize = 10_000;
+
+/// Row count at or above which [`resolve_batch_rows`] derives a size-aware
+/// `--batch-rows` instead of returning [`DEFAULT_BATCH_ROWS`].
+///
+/// The reason to enlarge batches is object count, and object count only costs
+/// anything at scale: below a million rows even [`DEFAULT_BATCH_ROWS`] leaves
+/// at most ~100 flush rounds (a few hundred RLOG objects at the default shard
+/// count), a per-object overhead no operator will measure, while a larger batch
+/// would raise the memory a small import holds for a benefit it cannot observe.
+/// A bulk import of one large Parquet file is above this by orders of
+/// magnitude; a fixture, a smoke load, and a per-tenant backfill are below it
+/// and load exactly as they did before the derivation existed.
+///
+/// This threshold is a stated judgement about where the object-count trade
+/// starts to matter, not a measured optimum: it decides only which of two
+/// defaults applies, and both remain overridable with `--batch-rows`.
+pub const SIZE_AWARE_BATCH_ROWS_MIN_ROWS: u64 = 1_000_000;
+
+/// Estimated in-memory budget, in bytes, for the whole resident batch working
+/// set that [`resolve_batch_rows`] is allowed to size up to.
+///
+/// The loader holds `--pipeline-depth` built batches for their in-flight writes
+/// plus `--decode-queue-batches` queued ahead of them (see
+/// [`DEFAULT_PIPELINE_DEPTH`]), so the derivation divides this budget by that
+/// batch count and then by the input's own average uncompressed bytes per row.
+/// This is what makes the derivation depend on the file's *byte* size and not
+/// only its row count: a 105-column export and a three-column one with the same
+/// row count do not deserve the same batch size.
+///
+/// The estimate is approximate by construction. Parquet's uncompressed footer
+/// size is not the Arrow working-set size (dictionaries expand, offsets and
+/// validity buffers are added), so this bounds an estimate, not the process
+/// RSS. It is a cap on how far the derivation may raise the batch size, never a
+/// limit imposed on an operator: an explicit `--batch-rows` is not checked
+/// against it, and the derivation never returns below [`DEFAULT_BATCH_ROWS`]
+/// even when the estimate says it should.
+pub const BATCH_RESIDENT_BYTES_BUDGET: u64 = 1 << 30;
 
 /// Default flush target size, in bytes, for a shard's buffer. `1` makes every
 /// Strict write flush inside its own `handle_write`, so one batch is one RLOG
@@ -334,7 +373,7 @@ pub async fn run(
     tenant: &str,
     mapping_path: &Path,
     shards: u32,
-    batch_rows: usize,
+    batch_rows: Option<usize>,
     read_cursors: Option<usize>,
     pipeline_depth: usize,
     max_inflight_flushes: u32,
@@ -374,7 +413,7 @@ pub(crate) async fn run_warning_to(
     tenant: &str,
     mapping_path: &Path,
     shards: u32,
-    batch_rows: usize,
+    batch_rows: Option<usize>,
     read_cursors: Option<usize>,
     pipeline_depth: usize,
     max_inflight_flushes: u32,
@@ -449,6 +488,12 @@ fn print_summary(report: &LoadReport) {
     println!("  rows/sec         : {rows_per_sec:.0}");
     println!("  objects written  : {}", report.objects_written());
     println!("  elapsed          : {secs:.3}s");
+    // The object count above is only reconstructable next to the knobs that
+    // decided it, and two of them are derived rather than typed by the operator.
+    println!("  effective configuration:");
+    for line in effective_config_lines(&report.effective) {
+        println!("{line}");
+    }
     #[cfg(feature = "stage-timing")]
     print_stage_timings(report);
 }
@@ -565,6 +610,11 @@ pub struct LoadReport {
     /// the reachability signal a caller of the real entry point can observe to
     /// prove the columnar path ran, not merely that its builder compiles.
     pub columnar_batches_built: u64,
+    /// Every object-layout knob resolved to the value this run actually used,
+    /// including the two the loader derives rather than reads off a flag. The
+    /// figures above are only attributable alongside the configuration that
+    /// produced them, so the report carries both.
+    pub effective: EffectiveLoadConfig,
     /// The logs pipeline's per-stage timing breakdown (ADR-0104 decision 1),
     /// snapshotted once the load finished. Present only under the
     /// `stage-timing` feature; with it off this field does not exist, so a
@@ -717,7 +767,7 @@ pub async fn load(
         tenant,
         mapping,
         shards,
-        batch_rows,
+        Some(batch_rows),
         read_cursors,
         pipeline_depth,
         DEFAULT_MAX_INFLIGHT_FLUSHES,
@@ -762,7 +812,7 @@ async fn load_instrumented(
     tenant: &str,
     mapping: &Mapping,
     shards: u32,
-    batch_rows: usize,
+    batch_rows: Option<usize>,
     read_cursors: Option<usize>,
     pipeline_depth: usize,
     max_inflight_flushes: u32,
@@ -777,10 +827,10 @@ async fn load_instrumented(
     // Reject a zero batch size with a typed error rather than silently clamping
     // it to 1: `batch_rows` is the operator-facing `--batch-rows` lever, and a
     // silent clamp would hide a misconfigured value that changes object layout.
-    if batch_rows == 0 {
+    if batch_rows == Some(0) {
         return Err(LoadError::Setup(
-            "--batch-rows must be at least 1 (each batch is one Strict flush per shard); 0 was \
-             given"
+            "--batch-rows must be at least 1 (each batch is one Strict flush per shard), or \
+             omitted for the size-aware default; 0 was given"
                 .to_string(),
         ));
     }
@@ -911,11 +961,39 @@ async fn load_instrumented(
     let metadata = read_input_metadata(&input)?;
     let row_group_lens = row_group_row_counts(&metadata);
     let cursor_count = resolve_read_cursors(read_cursors, shards, row_group_lens.len());
+    // Both defaults are chosen here rather than at the flag: each needs the
+    // footer this load has just parsed (the row-group count, and the row count
+    // and uncompressed size the batch-size derivation scales with). The writer's
+    // own block target is read from `RlogConfig::default()` rather than copied,
+    // since the router below builds its shards from that same default.
+    let batch_rows_flag = batch_rows;
+    let batch_rows = resolve_batch_rows(
+        batch_rows_flag,
+        shards,
+        row_group_lens.iter().sum(),
+        total_uncompressed_bytes(&metadata),
+        ravel_logseg::RlogConfig::default().block_target_records,
+        pipeline_depth.saturating_add(decode_queue_batches),
+    );
+    let effective = EffectiveLoadConfig {
+        shards,
+        batch_rows,
+        batch_rows_source: config_source(batch_rows_flag),
+        read_cursors: cursor_count,
+        read_cursors_source: config_source(read_cursors),
+        pipeline_depth,
+        max_inflight_flushes,
+        decode_queue_batches,
+        target_bytes,
+    };
     let cursors =
         open_stride_cursors(&input, &metadata, &row_group_lens, cursor_count, batch_rows)?;
 
     let started = Instant::now();
-    let mut report = LoadReport::default();
+    let mut report = LoadReport {
+        effective,
+        ..LoadReport::default()
+    };
     let mut shards_seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let mut data_batches_flushed: u64 = 0;
 
@@ -1704,11 +1782,180 @@ fn row_group_row_counts(metadata: &ArrowReaderMetadata) -> Vec<u64> {
         .collect()
 }
 
-/// Resolve `--read-cursors` (issue #560): absent means auto-sized to
-/// `min(shard count, row-group count)`, floored at 1; an explicit value is
-/// clamped to `[1, row_group_count.max(1)]` (more cursors than row groups
-/// cannot each get a distinct contiguous partition). Zero is rejected by the
-/// caller before this is reached, never clamped up silently.
+/// Sum of every row group's uncompressed byte size from the already-parsed
+/// footer, without decoding any data. Feeds [`resolve_batch_rows`]'s average
+/// bytes-per-row estimate.
+fn total_uncompressed_bytes(metadata: &ArrowReaderMetadata) -> u64 {
+    metadata
+        .metadata()
+        .row_groups()
+        .iter()
+        .map(|rg| u64::try_from(rg.total_byte_size()).unwrap_or(0))
+        .sum()
+}
+
+/// Resolve `--batch-rows` from the input the load is about to read.
+///
+/// An explicit value always wins and is returned unchanged (it is validated
+/// nonzero by the caller). With the flag omitted, the default is derived from
+/// the file itself, because `load --parquet` exists to import one large
+/// Parquet file and a fixed 10,000 describes a different, smaller workload:
+///
+/// 1. **Below [`SIZE_AWARE_BATCH_ROWS_MIN_ROWS`], nothing changes.** A small
+///    import keeps [`DEFAULT_BATCH_ROWS`], so fixtures and smoke loads write
+///    exactly the objects they wrote before.
+/// 2. **Otherwise start at the per-shard full-block floor,
+///    `shards * block_target_rows`.** One batch is one Strict flush, and its
+///    rows split across up to `--shards` shards, each shard's slice flushing as
+///    its own RLOG object. A shard slice below `ravel-logseg`'s
+///    `block_target_records` writes a short block, so the object count inflates
+///    while the objects themselves stay under-filled. `shards * 8192` is the
+///    smallest batch at which every shard's average slice fills one block,
+///    which is the constraint `docs/guides/clickbench.md` already states in
+///    prose; `block_target_rows` is passed in from
+///    `RlogConfig::default().block_target_records` so the two cannot drift.
+/// 3. **Cap that by what the resident batch working set can hold.** With
+///    `resident_batches` batches live at once (`--pipeline-depth` in-flight plus
+///    `--decode-queue-batches` queued) and the input's own average uncompressed
+///    bytes per row, the cap is
+///    `BATCH_RESIDENT_BYTES_BUDGET / resident_batches / bytes_per_row`. A wide
+///    export therefore gets a smaller derived batch than a narrow one at the
+///    same row count.
+/// 4. **Never below [`DEFAULT_BATCH_ROWS`].** The cap may lower the derived
+///    value toward the historical default, never past it: this function picks a
+///    default, it does not impose a memory limit the previous default already
+///    exceeded.
+///
+/// What is *not* claimed here: that the resulting value is the fastest one. The
+/// shape (scale with the input, respect the block floor, bound by the resident
+/// set) is derivable from what this repo already documents; the magnitude is a
+/// bench-box question, and `--batch-rows` remains the override for it.
+pub fn resolve_batch_rows(
+    batch_rows: Option<usize>,
+    shards: u32,
+    total_rows: u64,
+    uncompressed_bytes: u64,
+    block_target_rows: usize,
+    resident_batches: usize,
+) -> usize {
+    if let Some(explicit) = batch_rows {
+        return explicit;
+    }
+    if total_rows < SIZE_AWARE_BATCH_ROWS_MIN_ROWS {
+        return DEFAULT_BATCH_ROWS;
+    }
+    let per_shard_floor = (shards as usize)
+        .max(1)
+        .saturating_mul(block_target_rows.max(1));
+    let bytes_per_row = uncompressed_bytes.div_ceil(total_rows.max(1)).max(1);
+    let per_batch_budget = BATCH_RESIDENT_BYTES_BUDGET / resident_batches.max(1) as u64;
+    let memory_cap_rows = usize::try_from(per_batch_budget / bytes_per_row)
+        .unwrap_or(usize::MAX)
+        .max(1);
+    per_shard_floor
+        .min(memory_cap_rows)
+        .max(DEFAULT_BATCH_ROWS)
+}
+
+/// Whether a reported knob came from a flag the operator passed or from the
+/// loader's own default selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConfigSource {
+    /// The operator passed the flag; the value is theirs verbatim.
+    Explicit,
+    /// The flag was omitted and the loader derived the value.
+    #[default]
+    Derived,
+}
+
+/// A flag the operator passed is [`ConfigSource::Explicit`]; an omitted one is
+/// [`ConfigSource::Derived`].
+fn config_source<T>(flag: Option<T>) -> ConfigSource {
+    match flag {
+        Some(_) => ConfigSource::Explicit,
+        None => ConfigSource::Derived,
+    }
+}
+
+impl std::fmt::Display for ConfigSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigSource::Explicit => f.write_str("explicit"),
+            ConfigSource::Derived => f.write_str("derived"),
+        }
+    }
+}
+
+/// Every knob that decides what objects a load leaves behind, resolved to the
+/// value the run actually used.
+///
+/// Two of these are chosen by the loader rather than by the operator
+/// (`--batch-rows` from the input's size, `--read-cursors` from the shard
+/// count), so the flags an operator typed no longer describe the run. This
+/// carries what was really used, so a load's own output is enough to
+/// reconstruct the layout it produced without reading source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EffectiveLoadConfig {
+    /// Configured shard count (`--shards`).
+    pub shards: u32,
+    /// Rows per Strict write (`--batch-rows`), after [`resolve_batch_rows`].
+    pub batch_rows: usize,
+    /// Whether `batch_rows` was passed or derived.
+    pub batch_rows_source: ConfigSource,
+    /// Stride read cursors (`--read-cursors`), after [`resolve_read_cursors`].
+    pub read_cursors: usize,
+    /// Whether `read_cursors` was passed or derived.
+    pub read_cursors_source: ConfigSource,
+    /// Outer write window (`--pipeline-depth`).
+    pub pipeline_depth: usize,
+    /// Inner per-shard flush window (`--max-inflight-flushes`).
+    pub max_inflight_flushes: u32,
+    /// Decode-to-encode queue depth (`--decode-queue-batches`).
+    pub decode_queue_batches: usize,
+    /// Shard buffer flush target (`--target-bytes`).
+    pub target_bytes: usize,
+}
+
+/// Render [`EffectiveLoadConfig`] as the lines [`print_summary`] emits, one per
+/// knob, labelled with the flag's own spelling so the value can be copied back
+/// onto a command line.
+///
+/// The exhaustive destructure is the mechanism, not style: a knob added to
+/// [`EffectiveLoadConfig`] and not rendered here is an unused binding, which
+/// the workspace's `-D warnings` gate refuses.
+pub fn effective_config_lines(config: &EffectiveLoadConfig) -> Vec<String> {
+    let EffectiveLoadConfig {
+        shards,
+        batch_rows,
+        batch_rows_source,
+        read_cursors,
+        read_cursors_source,
+        pipeline_depth,
+        max_inflight_flushes,
+        decode_queue_batches,
+        target_bytes,
+    } = *config;
+    vec![
+        format!("  --shards               : {shards}"),
+        format!("  --batch-rows           : {batch_rows} ({batch_rows_source})"),
+        format!("  --read-cursors         : {read_cursors} ({read_cursors_source})"),
+        format!("  --pipeline-depth       : {pipeline_depth}"),
+        format!("  --max-inflight-flushes : {max_inflight_flushes}"),
+        format!("  --decode-queue-batches : {decode_queue_batches}"),
+        format!("  --target-bytes         : {target_bytes}"),
+    ]
+}
+
+/// Resolve `--read-cursors` (issue #560): absent means auto-sized to the
+/// configured `--shards`, clamped down to the row-group count (more cursors
+/// than row groups cannot each get a distinct contiguous partition) and floored
+/// at 1; an explicit value is clamped to `[1, row_group_count.max(1)]`.
+///
+/// Shards, not 1, is the default because a file sorted by a resource-attribute
+/// column puts one value's rows in one contiguous run, so a single sequential
+/// reader fills every batch from one stream: one shard encodes while the other
+/// `--shards - 1` sit idle. Zero is rejected by the caller before this is
+/// reached, never clamped up silently.
 fn resolve_read_cursors(read_cursors: Option<usize>, shards: u32, row_group_count: usize) -> usize {
     let max_cursors = row_group_count.max(1);
     match read_cursors {

@@ -233,10 +233,18 @@ enum Command {
         /// Rows per Strict flush. One flush is one RLOG object per involved
         /// shard, so on a large load this is the lever that controls how many
         /// RLOG objects the load leaves behind (a first-order query-cost
-        /// variable). Must be at least 1; 0 is rejected. Defaults to
-        /// `DEFAULT_BATCH_ROWS` (10000), leaving current behaviour unchanged.
-        #[arg(long, default_value_t = ravel_cli::load::DEFAULT_BATCH_ROWS)]
-        batch_rows: usize,
+        /// variable). Omit for a size-aware default derived from the input's own
+        /// row count and uncompressed byte size (`resolve_batch_rows`): an input
+        /// under a million rows keeps `DEFAULT_BATCH_ROWS` (10000) and loads
+        /// exactly as it did before, while a bulk import is sized up to
+        /// `--shards` x the RLOG block target (8192 rows), so every shard's
+        /// average per-batch slice fills one block instead of writing a short
+        /// one, capped by what the resident batch working set can hold at the
+        /// input's average row width. The value actually used is printed in the
+        /// load's effective-configuration block. An explicit value is used
+        /// verbatim and must be at least 1; 0 is rejected.
+        #[arg(long)]
+        batch_rows: Option<usize>,
         /// Number of parallel stride read cursors over the Parquet file's row
         /// groups (issue #560). A file sorted by a resource-attribute column
         /// (e.g. ClickBench's `hits.parquet`, sorted by `CounterID`) puts one
@@ -246,10 +254,11 @@ enum Command {
         /// cursors each read a disjoint, near-even, far-apart partition of the
         /// file's row groups, and each batch is assembled from a contiguous
         /// run out of every live cursor, so one batch's rows span K different
-        /// regions of the file instead of one. Omit for automatic sizing
-        /// (`min(--shards, row-group count)`, floored at 1); an explicit value
-        /// is clamped to `[1, row-group count]`. `1` is exactly today's
-        /// sequential read. `0` is rejected.
+        /// regions of the file instead of one. Omit to default to `--shards`,
+        /// clamped down to the row-group count and floored at 1, so a batch can
+        /// spread across every shard without the operator matching the two
+        /// flags by hand; an explicit value is clamped to `[1, row-group
+        /// count]`. `1` is a sequential read. `0` is rejected.
         #[arg(long, value_name = "K")]
         read_cursors: Option<usize>,
         /// Number of Strict writes allowed in flight at once. Each batch's
