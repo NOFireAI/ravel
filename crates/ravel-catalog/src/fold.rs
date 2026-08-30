@@ -24,8 +24,8 @@ use ravel_object_store::{
     Version, list_all,
 };
 use ravel_proto::catalog::v1::{
-    ColumnStatsSegment, SnapshotColumnStatsRef, SnapshotEntry, SnapshotHead, SnapshotPartRef,
-    SnapshotPostingsRef,
+    ColumnStatsSegment, SnapshotColumnStatsPartRef, SnapshotColumnStatsRef, SnapshotEntry,
+    SnapshotHead, SnapshotPartRef, SnapshotPostingsRef,
 };
 use ravel_proto::commit::v1::{CommitRecord, CompactionPart, CompactionRecord, RewriteRecord};
 use ravel_segment::{ExpectedIdentity, ReaderLimits, SegmentError};
@@ -147,6 +147,18 @@ pub struct FoldReport {
     /// Encoded size of the column-stats object, in bytes. `0` when
     /// `column_stats_built` is `false`.
     pub column_stats_bytes: u64,
+    /// `true` if this fold successfully built and attached the part-hash-keyed
+    /// (v2) column-statistics object under `SnapshotHead.column_stats_part`
+    /// (field 13, ADR-0942). Covers L0 and L1 uniformly. `false` carries the
+    /// same three-way ambiguity as [`Self::column_stats_built`]: no configured
+    /// typed columns, a no-op fold, or a build/PUT failure the fold proceeded
+    /// past. Independent of [`Self::column_stats_built`]: during the
+    /// dual-publish window both the v1 (field 11) and v2 (field 13) objects are
+    /// written each fold.
+    pub column_stats_part_built: bool,
+    /// Encoded size of the v2 part-hash-keyed column-stats object, in bytes.
+    /// `0` when `column_stats_part_built` is `false`.
+    pub column_stats_part_bytes: u64,
     /// Number of commit-bucket entries this fold skipped rather than
     /// aborting on: an unrecognized bucket-key shape, or a commit record
     /// whose identity duplicates one already folded. Both are layout drift
@@ -1619,6 +1631,185 @@ impl Catalog {
                 }
             };
 
+            // ADR-0942 part-hash-keyed column statistics (envelope v2, HEAD
+            // field 13). This is a DUAL PUBLISH, not a replacement: the v1
+            // (field-11) block above still runs and writes its L0-tuple-keyed
+            // object unchanged. This block additionally covers BOTH L0 and L1
+            // entries, binding each record to its covered part's `content_hash`
+            // so two L1 parts of one (shard, hour) bucket -- which collapse to
+            // one nil-writer tuple on the reader side -- get two distinct
+            // records. Retiring field 11 is a separate, floor-citing change
+            // (ADR-0066 decision 1); dropping it here would silently take L0
+            // coverage from any reader predating field 13.
+            //
+            // A v2 record carries its covered part's content hash in the
+            // writer_id slot (the join key; ADR-0942, the record shape is
+            // frozen so no new field is added). The baseline is joined by that
+            // content hash (a segment's exact statistics never change once its
+            // content-addressed object is written), reused from the previous
+            // fold's v2 object, and bound to the previous HEAD's parts exactly
+            // as the v1 baseline is. On the first upgraded fold there is no
+            // field-13 baseline, so every entry is fetched once; thereafter
+            // only genuinely new parts are.
+            let (column_stats_part_built, column_stats_part_size, column_stats_part_ref) =
+                if typed_attr_columns.is_empty() {
+                    (false, 0u64, None)
+                } else {
+                    let v2_baseline: HashMap<Vec<u8>, ColumnStatsSegment> = if rebuilt {
+                        HashMap::new()
+                    } else if let HeadState::Valid { head, .. } = &head_state
+                        && let Some(stats_ref) = &head.column_stats_part
+                    {
+                        match self.store().get(&stats_ref.key, GetRange::Full).await {
+                            Ok(got) => {
+                                counters.get_requests += 1;
+                                let expected_part_blake3: Vec<[u8; 32]> = head
+                                    .parts
+                                    .iter()
+                                    .map(|p| <[u8; 32]>::try_from(p.blake3.as_slice()))
+                                    .collect::<Result<_, _>>()
+                                    .unwrap_or_default();
+                                match column_stats_build::decode_previous_column_stats(
+                                    &got.data,
+                                    &expected_part_blake3,
+                                    &crate::snapshot_format::ColumnStatsLimits::default(),
+                                ) {
+                                    Ok(segments) => segments
+                                        .into_iter()
+                                        // v2 records carry the part content hash
+                                        // in writer_id; key the reuse map by it.
+                                        .map(|segment| (segment.writer_id.clone(), segment))
+                                        .collect(),
+                                    Err(err) => {
+                                        tracing::warn!(
+                                            error = %err,
+                                            tenant = %tenant.to_hex(),
+                                            "previous part-bound column-stats object failed to decode or bind to this fold's parts; rebuilding every segment's statistics"
+                                        );
+                                        HashMap::new()
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    error = %err,
+                                    tenant = %tenant.to_hex(),
+                                    "previous part-bound column-stats object GET failed; rebuilding every segment's statistics"
+                                );
+                                HashMap::new()
+                            }
+                        }
+                    } else {
+                        HashMap::new()
+                    };
+
+                    let mut part_segments: Vec<ColumnStatsSegment> = Vec::new();
+                    for entry in entries.iter() {
+                        if let Some(existing) = v2_baseline.get(&entry.content_hash) {
+                            part_segments.push(existing.clone());
+                            continue;
+                        }
+                        match column_stats_build::fetch_segment_column_stats(
+                            self.store(),
+                            tenant,
+                            signal,
+                            entry,
+                            &typed_attr_columns,
+                        )
+                        .await
+                        {
+                            Ok(mut segment) => {
+                                counters.get_requests += 1;
+                                // The v2 join key: bind the record to its
+                                // covered part's content hash (== the reader's
+                                // `SegmentRef.content_hash`), uniform for L0 and
+                                // L1 and unique per part, carried in writer_id.
+                                // This overwrites the tuple's writer_id, which
+                                // is only informational in a v2 record.
+                                segment.writer_id = entry.content_hash.clone();
+                                part_segments.push(segment);
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    error = %err,
+                                    tenant = %tenant.to_hex(),
+                                    ingest_hour_bucket = entry.ingest_hour_bucket,
+                                    shard = entry.shard,
+                                    level = entry.level,
+                                    "part-bound column-stats build failed for one segment; it has no stats entry and queries over it fall back to scanning"
+                                );
+                            }
+                        }
+                    }
+                    // v2 records sort by their content hash (in writer_id).
+                    part_segments.sort_by(|a, b| a.writer_id.cmp(&b.writer_id));
+
+                    match snapshot_format::encode_column_stats_v2(
+                        tenant.0,
+                        signal_num,
+                        part_hashes.iter().map(|h| h.to_vec()).collect(),
+                        &part_segments,
+                    ) {
+                        Ok(stats_bytes) => {
+                            let stats_crc = crc32c::crc32c(&stats_bytes);
+                            let stats_hash = blake3::hash(&stats_bytes);
+                            let stats_hash16 = &stats_hash.to_hex()[..16];
+                            let stats_key = column_stats_object_key(
+                                tenant,
+                                signal,
+                                watermark_hour,
+                                stats_hash16,
+                            );
+                            let size = stats_bytes.len() as u64;
+                            let segment_count = part_segments.len() as u32;
+                            match self
+                                .store()
+                                .put(
+                                    &stats_key,
+                                    Bytes::from(stats_bytes),
+                                    PutOptions::create_if_absent()
+                                        .with_checksum(UploadChecksum::Crc32c(stats_crc)),
+                                )
+                                .await
+                            {
+                                Ok(_) | Err(StoreError::AlreadyExists) => {
+                                    counters.put_requests += 1;
+                                    (
+                                        true,
+                                        size,
+                                        Some(SnapshotColumnStatsPartRef {
+                                            key: stats_key,
+                                            blake3: stats_hash.as_bytes().to_vec(),
+                                            size,
+                                            segment_count,
+                                            part_blake3: part_hashes
+                                                .iter()
+                                                .map(|h| h.to_vec())
+                                                .collect(),
+                                        }),
+                                    )
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        error = %err,
+                                        tenant = %tenant.to_hex(),
+                                        "part-bound column-stats PUT failed, folding without a field-13 ref"
+                                    );
+                                    (false, 0, None)
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                tenant = %tenant.to_hex(),
+                                "part-bound column-stats encode failed, folding without a field-13 ref"
+                            );
+                            (false, 0, None)
+                        }
+                    }
+                };
+
             let new_head = SnapshotHead {
                 format_version: HEAD_FORMAT_VERSION,
                 tenant_hash: tenant.0.to_vec(),
@@ -1633,9 +1824,11 @@ impl Catalog {
                 parts: part_refs.clone(),
                 postings: postings_ref,
                 column_stats: column_stats_ref,
-                // ADR-0942 A1: additive field 13, not written by any path yet.
-                // Absent (None) keeps HEAD encoding byte-for-byte identical.
-                column_stats_part: None,
+                // ADR-0942 A2: the part-hash-keyed (v2) column-stats object,
+                // covering L0 and L1. Absent (None) when the tenant has no
+                // configured typed columns or the build/PUT failed; a reader
+                // treats absence as fall-back-to-scan, never an error.
+                column_stats_part: column_stats_part_ref,
                 folder_id: folder_id.into_bytes().to_vec(),
                 created_unix_ns: now_ns,
                 shard_generation_count,
@@ -1690,6 +1883,8 @@ impl Catalog {
                         postings_bytes: postings_size,
                         column_stats_built,
                         column_stats_bytes: column_stats_size,
+                        column_stats_part_built,
+                        column_stats_part_bytes: column_stats_part_size,
                         layout_drift_count,
                         frontier_hours_reconciled,
                         frontier_hours_deferred,
@@ -2425,6 +2620,8 @@ fn no_op_report(watermark_hour: Option<u32>, counters: RequestCounters) -> FoldR
         postings_bytes: 0,
         column_stats_built: false,
         column_stats_bytes: 0,
+        column_stats_part_built: false,
+        column_stats_part_bytes: 0,
         layout_drift_count: 0,
         frontier_hours_reconciled: 0,
         frontier_hours_deferred: 0,
@@ -2862,6 +3059,388 @@ mod tests {
             loaded.segments.len(),
             3,
             "the reused baseline plus the new segment cover all three"
+        );
+    }
+
+    /// Declare `status` as an I64 typed logs column so the fold builds column
+    /// statistics for a (tenant, Logs) pair.
+    async fn set_status_column_config(store: &dyn ObjectStoreBackend) {
+        let cfg = crate::tenant_config::TenantConfig {
+            typed_attr_columns: Some(vec![crate::tenant_config::DeclaredTypedColumn {
+                key: "status".to_string(),
+                ty: crate::tenant_config::DeclaredColumnType::I64,
+            }]),
+            ..crate::tenant_config::TenantConfig::new(
+                crate::tenant_config::TenantLifecycleState::Active,
+            )
+        };
+        crate::tenant_config::set_tenant_config(store, &tenant(), &cfg, 1)
+            .await
+            .expect("write tenant config");
+    }
+
+    async fn read_logs_head(store: &dyn ObjectStoreBackend) -> SnapshotHead {
+        let got = store
+            .get(&head_object_key(&tenant(), Signal::Logs), GetRange::Full)
+            .await
+            .expect("head present");
+        snapshot_format::decode_head(&got.data).expect("head decodes")
+    }
+
+    /// Publish a compaction record for `(shard, ingest_hour_bucket)` whose parts
+    /// are REAL L1 RLOG objects, each carrying the `status` I64 column. `parts`
+    /// gives the status values per part; part `i` becomes CompactionPart
+    /// `part_index = i`. Both the part objects (at their reconstructed L1 keys)
+    /// and the compaction record are written, so a fold over the hour produces
+    /// one L1 `SnapshotEntry` per part and ADR-0942 builds part-bound stats for
+    /// each. Returns the record (its `parts[i].content_hash` is the v2 join key
+    /// for part `i`).
+    async fn publish_logs_l1(
+        store: &dyn ObjectStoreBackend,
+        shard: u32,
+        ingest_hour_bucket: u32,
+        input_set_seed: &str,
+        parts: &[&[i64]],
+    ) -> CompactionRecord {
+        use ravel_logseg::writer::ObjectIdentity;
+        use ravel_logseg::{LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
+        use ravel_types::logstream::{AttrValue, log_stream_id};
+
+        let resource = vec![(
+            "service.name".to_string(),
+            AttrValue::Str("api".to_string()),
+        )];
+        let input_set_hash = *blake3::hash(input_set_seed.as_bytes()).as_bytes();
+        let base_ts = i64::from(ingest_hour_bucket) * NS_PER_HOUR + 60_000_000_000;
+
+        let mut compaction_parts: Vec<CompactionPart> = Vec::new();
+        let mut part_bytes: Vec<Vec<u8>> = Vec::new();
+        let mut max_ts_all = i64::MIN;
+        for (part_index, statuses) in parts.iter().enumerate() {
+            let mut w = RlogWriter::new(
+                RlogConfig::default(),
+                ObjectIdentity {
+                    tenant_hash: tenant().0,
+                    shard,
+                    writer_id: *Uuid::nil().as_bytes(),
+                    writer_epoch: 0,
+                    writer_seq: 0,
+                },
+            );
+            let mut min_ts = i64::MAX;
+            let mut max_ts = i64::MIN;
+            for (i, status) in statuses.iter().enumerate() {
+                let ts = base_ts + (part_index as i64) * 1_000_000 + i as i64;
+                min_ts = min_ts.min(ts);
+                max_ts = max_ts.max(ts);
+                w.push(LogRecord {
+                    stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+                    stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+                    ts_ns: ts,
+                    observed_ts_ns: ts,
+                    severity_num: 9,
+                    severity_text: "INFO".into(),
+                    body: format!("row {part_index}-{i}"),
+                    trace_id: None,
+                    span_id: None,
+                    flags: 0,
+                    attrs: vec![("status".to_string(), AttrValue::I64(*status))],
+                })
+                .expect("push");
+            }
+            let bytes = w.finish().expect("finish");
+            let content_hash = *blake3::hash(&bytes).as_bytes();
+            max_ts_all = max_ts_all.max(max_ts);
+            compaction_parts.push(CompactionPart {
+                part_index: part_index as u32,
+                first_series_id: vec![0u8; 16],
+                last_series_id: vec![0xffu8; 16],
+                content_hash: content_hash.to_vec(),
+                object_size: bytes.len() as u64,
+                sample_count: statuses.len() as u64,
+                series_count: 1,
+                run_count: 1,
+                min_event_ts_ns: min_ts,
+                max_event_ts_ns: max_ts,
+                segment_format_version: 2,
+            });
+            part_bytes.push(bytes);
+        }
+
+        let record = CompactionRecord {
+            format_version: 1,
+            tenant_hash: tenant().0.to_vec(),
+            signal: signal::to_proto(Signal::Logs).into(),
+            shard,
+            ingest_hour_bucket,
+            level: 1,
+            inputs: Vec::new(),
+            input_set_hash: input_set_hash.to_vec(),
+            parts: compaction_parts,
+            created_unix_ns: max_ts_all,
+        };
+        for (part, bytes) in record.parts.iter().zip(part_bytes) {
+            let key = keys::reconstruct_l1_part_key(&record, part).expect("l1 part key");
+            publish::put_data_object(store, &key, Bytes::from(bytes))
+                .await
+                .expect("put l1 part object");
+        }
+        let ckey = keys::compaction_record_key_for(&record).expect("compaction key");
+        store
+            .put(
+                &ckey,
+                Bytes::from(record.encode_to_vec()),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put compaction record");
+        record
+    }
+
+    /// Assert the single declared `status` I64 column of a decoded segment has
+    /// exactly the given statistics.
+    fn assert_status_column(
+        seg: &ColumnStatsSegment,
+        non_null: u64,
+        null: u64,
+        min: i64,
+        max: i64,
+        dict: &[(i64, u64)],
+        sum: i64,
+    ) {
+        use ravel_proto::catalog::v1::ColumnValue;
+        use ravel_proto::catalog::v1::column_value::Kind;
+        let unwrap_i64 = |v: &ColumnValue| match &v.kind {
+            Some(Kind::I64(x)) => *x,
+            other => panic!("expected I64 column value, got {other:?}"),
+        };
+        assert_eq!(seg.columns.len(), 1, "only status is declared");
+        let col = &seg.columns[0];
+        assert_eq!(col.name, "status");
+        assert_eq!(col.declared_type, 2, "I64 stats tag");
+        assert_eq!(col.non_null_count, non_null);
+        assert_eq!(col.null_count, null);
+        assert_eq!(unwrap_i64(col.min.as_ref().expect("min")), min);
+        assert_eq!(unwrap_i64(col.max.as_ref().expect("max")), max);
+        assert!(col.dictionary_present, "cardinality under the ceiling");
+        let got: Vec<(i64, u64)> = col
+            .dictionary
+            .iter()
+            .map(|e| (unwrap_i64(e.value.as_ref().expect("value")), e.count))
+            .collect();
+        assert_eq!(got, dict, "exact per-value counts, ascending");
+        assert_eq!(col.sum, Some(sum));
+    }
+
+    /// ADR-0942 (deliverables 1 & 3): a fold over an L1-COMPACTED fixture builds
+    /// part-bound (v2, field 13) records for the L1 entries, with EXACT expected
+    /// values, and two L1 parts of one (shard, hour) bucket -- the collision the
+    /// old five-field tuple key could not represent, because a reconstructed L1
+    /// SegmentRef carries writer_id nil / epoch 0 / seq 0 -- produce two DISTINCT
+    /// records keyed by their distinct content hashes, neither overwriting the
+    /// other.
+    #[tokio::test]
+    async fn l1_compacted_fold_builds_part_bound_records_with_exact_values() {
+        let store = Arc::new(MemoryStore::new());
+        set_status_column_config(store.as_ref()).await;
+
+        // One compaction record, two L1 parts, both in (shard 0, hour 10).
+        let record = publish_logs_l1(
+            store.as_ref(),
+            0,
+            10,
+            "input-set-seed",
+            &[&[200, 404, 200, 500], &[500, 500, 200]],
+        )
+        .await;
+
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let report = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(10),
+                &[],
+                None,
+            )
+            .await
+            .expect("fold");
+        assert!(report.rebuilt, "first fold rebuilds from the commit layout");
+        assert_eq!(report.entry_count, 2, "two L1 parts folded");
+        assert!(
+            report.column_stats_part_built,
+            "the part-bound (field 13) object is built over the L1 entries"
+        );
+
+        let head = read_logs_head(store.as_ref()).await;
+        // Both L1 entries really are level 1 in the folded snapshot.
+        let entries = collect_head_entries(store.as_ref(), &head).await;
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|e| e.level == 1), "genuinely L1 fixture");
+
+        let stats_ref = head
+            .column_stats_part
+            .clone()
+            .expect("field 13 present after folding L1 parts");
+        let got = store
+            .get(&stats_ref.key, GetRange::Full)
+            .await
+            .expect("v2 object present");
+        let decoded = snapshot_format::decode_column_stats(
+            &got.data,
+            &crate::snapshot_format::ColumnStatsLimits::default(),
+        )
+        .expect("v2 decodes");
+        assert_eq!(
+            decoded.header.format_version, 2,
+            "part-bound object is envelope v2"
+        );
+        assert_eq!(
+            decoded.segments.len(),
+            2,
+            "two L1 parts of one bucket -> two records"
+        );
+
+        let ch0 = record.parts[0].content_hash.clone();
+        let ch1 = record.parts[1].content_hash.clone();
+        assert_ne!(ch0, ch1, "distinct parts have distinct content hashes");
+        // A v2 record is keyed by the part content hash carried in writer_id.
+        let rec0 = decoded
+            .segments
+            .iter()
+            .find(|s| s.writer_id == ch0)
+            .expect("part 0's record is present, keyed by its content hash");
+        let rec1 = decoded
+            .segments
+            .iter()
+            .find(|s| s.writer_id == ch1)
+            .expect("part 1's record is present, keyed by its content hash");
+        // Neither collapsed onto the other: exact, per-part values.
+        assert_status_column(rec0, 4, 0, 200, 500, &[(200, 2), (404, 1), (500, 1)], 1304);
+        assert_status_column(rec1, 3, 0, 200, 500, &[(200, 1), (500, 2)], 1200);
+    }
+
+    /// ADR-0942 (deliverable 2): the fold DUAL-PUBLISHES. After a fold over an
+    /// L0 fixture, HEAD carries both the v1 field-11 object and the v2 field-13
+    /// object, and the field-11 object is byte-for-byte identical to what the
+    /// pre-change fold wrote for the same input (reconstructed here from the
+    /// canonical v1 encoder over the same L0 segment stats).
+    #[tokio::test]
+    async fn fold_dual_publishes_v1_and_v2_and_v1_object_is_byte_identical() {
+        let store = Arc::new(MemoryStore::new());
+        set_status_column_config(store.as_ref()).await;
+
+        publish_logs_segment(store.as_ref(), 1, 10, &[200, 404, 200]).await;
+        publish_logs_segment(store.as_ref(), 2, 10, &[500, 200]).await;
+
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let report = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(10),
+                &[],
+                None,
+            )
+            .await
+            .expect("fold");
+        assert!(report.column_stats_built, "field 11 (v1) built");
+        assert!(report.column_stats_part_built, "field 13 (v2) built");
+
+        let head = read_logs_head(store.as_ref()).await;
+        let v1_ref = head.column_stats.clone().expect("field 11 present");
+        let v2_ref = head.column_stats_part.clone().expect("field 13 present");
+        assert_ne!(v1_ref.key, v2_ref.key, "v1 and v2 are distinct objects");
+
+        // Reconstruct the canonical v1 object over the same L0 segment stats and
+        // the same part set, exactly as the pre-change fold did.
+        let entries = collect_head_entries(store.as_ref(), &head).await;
+        let typed = vec![crate::tenant_config::DeclaredTypedColumn {
+            key: "status".to_string(),
+            ty: crate::tenant_config::DeclaredColumnType::I64,
+        }];
+        let mut l0: Vec<ColumnStatsSegment> = Vec::new();
+        for entry in entries.iter().filter(|e| e.level == 0) {
+            let seg = column_stats_build::fetch_segment_column_stats(
+                store.as_ref(),
+                &tenant(),
+                Signal::Logs,
+                entry,
+                &typed,
+            )
+            .await
+            .expect("l0 stats");
+            l0.push(seg);
+        }
+        l0.sort_by(|a, b| {
+            (
+                a.ingest_hour_bucket,
+                a.shard,
+                a.writer_id.as_slice(),
+                a.writer_epoch,
+                a.writer_seq,
+            )
+                .cmp(&(
+                    b.ingest_hour_bucket,
+                    b.shard,
+                    b.writer_id.as_slice(),
+                    b.writer_epoch,
+                    b.writer_seq,
+                ))
+        });
+        let part_blake3: Vec<Vec<u8>> = head.parts.iter().map(|p| p.blake3.clone()).collect();
+        let signal_num = signal::to_proto(Signal::Logs) as u32;
+        let expected_v1 =
+            snapshot_format::encode_column_stats(tenant().0, signal_num, part_blake3, &l0)
+                .expect("canonical v1 encodes");
+
+        let got_v1 = store
+            .get(&v1_ref.key, GetRange::Full)
+            .await
+            .expect("v1 object present")
+            .data;
+        assert_eq!(
+            got_v1.as_ref(),
+            expected_v1.as_slice(),
+            "field-11 v1 object is byte-identical to the canonical v1 encode"
+        );
+        assert_eq!(got_v1[4], 1, "field-11 object is envelope v1");
+
+        // The two objects differ only in keying: v1 records key by the tuple
+        // with a 16-byte writer_id uuid; v2 records key by the 32-byte part
+        // content hash carried in writer_id.
+        let limits = crate::snapshot_format::ColumnStatsLimits::default();
+        let dec_v1 = snapshot_format::decode_column_stats(&got_v1, &limits).expect("v1 decodes");
+        assert!(
+            dec_v1.segments.iter().all(|s| s.writer_id.len() == 16),
+            "v1 records carry the 16-byte writer uuid"
+        );
+        let got_v2 = store
+            .get(&v2_ref.key, GetRange::Full)
+            .await
+            .expect("v2 object present")
+            .data;
+        assert_eq!(got_v2[4], 2, "field-13 object is envelope v2");
+        let dec_v2 = snapshot_format::decode_column_stats(&got_v2, &limits).expect("v2 decodes");
+        assert_eq!(dec_v2.segments.len(), 2, "v2 covers both L0 segments");
+        assert!(
+            dec_v2.segments.iter().all(|s| s.writer_id.len() == 32),
+            "every v2 record is keyed by a 32-byte part content hash"
+        );
+        // Each v2 record's key is exactly the L0 entry's content hash.
+        let entry_hashes: std::collections::HashSet<Vec<u8>> = entries
+            .iter()
+            .filter(|e| e.level == 0)
+            .map(|e| e.content_hash.clone())
+            .collect();
+        assert!(
+            dec_v2
+                .segments
+                .iter()
+                .all(|s| entry_hashes.contains(&s.writer_id)),
+            "v2 keys are the covered L0 parts' content hashes"
         );
     }
 

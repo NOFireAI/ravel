@@ -10,7 +10,9 @@ mod head;
 mod part;
 mod postings;
 
-pub use column_stats::{DecodedColumnStats, decode_column_stats, encode_column_stats};
+pub use column_stats::{
+    DecodedColumnStats, decode_column_stats, encode_column_stats, encode_column_stats_v2,
+};
 pub use error::SnapshotFormatError;
 pub use head::{HEAD_FORMAT_VERSION, decode_head, encode_head};
 pub use part::{DecodedPart, decode_part, encode_part, encode_part_ranged};
@@ -91,11 +93,15 @@ impl Default for PostingsLimits {
 pub const COLUMN_STATS_MAGIC: [u8; 4] = *b"RCST";
 
 /// Column-statistics envelope WRITE version: the version the fold stamps into
-/// every `.cstat` object it writes. It stays 1 in this change; ADR-0942's A2
-/// step raises it to 2 when the writer begins emitting part-hash-keyed
-/// objects. Single source for the stamped version so that later bump edits one
-/// literal.
-pub const COLUMN_STATS_WRITE_VERSION: u8 = 1;
+/// every part-hash-keyed (v2) `.cstat` object it writes (ADR-0942 A2). Single
+/// source for the stamped v2 version so a later bump edits one literal.
+///
+/// The field-11 v1 object is NOT stamped from this constant: during the
+/// ADR-0942 dual-publish window the fold keeps writing a v1 (L0-tuple-keyed)
+/// `.cstat` under `SnapshotHead.column_stats` byte-for-byte as before, so
+/// [`column_stats::encode_column_stats`] stamps envelope version 1 explicitly.
+/// This constant governs only the new field-13 v2 object.
+pub const COLUMN_STATS_WRITE_VERSION: u8 = 2;
 
 /// Column-statistics envelope ACCEPTED READ SET: the versions
 /// `decode_column_stats` accepts. v1 is ADR-0850's L0-tuple keying; v2 is
@@ -390,7 +396,7 @@ mod tests {
         assert_eq!(POSTINGS_RESERVED, [0, 0, 0]);
         assert_eq!(DEFAULT_MAX_POSTINGS_BYTES, 256 << 20);
         assert_eq!(COLUMN_STATS_MAGIC, *b"RCST");
-        assert_eq!(COLUMN_STATS_WRITE_VERSION, 1);
+        assert_eq!(COLUMN_STATS_WRITE_VERSION, 2);
         assert_eq!(COLUMN_STATS_ACCEPTED_READ_VERSIONS, [1, 2]);
         assert_eq!(COLUMN_STATS_RESERVED, [0, 0, 0]);
         assert_eq!(DEFAULT_MAX_COLUMN_STATS_BYTES, 256 << 20);
