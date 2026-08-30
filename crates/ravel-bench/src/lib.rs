@@ -16,6 +16,7 @@ pub mod ingest;
 #[cfg(feature = "sql-latency")]
 pub mod logs_scan_scaling;
 pub mod metrics_gen;
+pub mod metrics_ingest;
 pub mod metrics_workload;
 pub mod profiling;
 pub mod promql_corpus;

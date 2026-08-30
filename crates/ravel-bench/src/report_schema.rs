@@ -588,7 +588,7 @@ fn is_content_digest(value: &str) -> bool {
 /// version must match, the hardware must name at least one logical core, every
 /// named comparator must be completely pinned by a real content digest, and the
 /// configuration must carry no blank or duplicate key.
-fn validate_provenance(p: &Provenance) -> Result<(), ValidationError> {
+pub fn validate_provenance(p: &Provenance) -> Result<(), ValidationError> {
     if p.schema_version != SCHEMA_VERSION {
         return Err(ValidationError::SchemaVersionMismatch {
             found: p.schema_version,
