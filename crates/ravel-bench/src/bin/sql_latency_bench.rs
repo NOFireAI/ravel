@@ -581,6 +581,7 @@ fn print_human_table(report: &SqlLatencyReport) {
             warm_hits,
         );
     }
+    print_open_shapes(report);
     print_fetch_amplification(report);
     if !report.skipped.is_empty() {
         println!("\n  skipped (unsatisfied declared column):");
@@ -593,6 +594,48 @@ fn print_human_table(report: &SqlLatencyReport) {
         for f in &report.failed {
             println!("    {:<32} run {}: {}", f.id, f.run, f.error);
         }
+    }
+}
+
+/// The cold run's logs-scan fast-path opens, split by the read shape the router
+/// chose (issue #904), printed next to the request accounting the main table
+/// already shows so a reader can pair the two: `backend_bills_requests` (in the
+/// report's request accounting) says whether the backend charges for requests,
+/// and this split says which read shape produced them.
+///
+/// The unit is a SEGMENT OPEN, not a request and not a statement: one statement
+/// spanning several segments contributes one open per segment and can take both
+/// routes in a single query, so the two columns each count segments. An open is
+/// NOT one GET -- a whole-object open is a single GET, a ranged open issues
+/// several -- so these columns must not be read as, or summed with, the `get`
+/// column in the table above.
+fn print_open_shapes(report: &SqlLatencyReport) {
+    let rows: Vec<(&str, &RunAccounting)> = report
+        .entries
+        .iter()
+        .filter_map(|e| match e.per_run_accounting.as_deref() {
+            Some([cold, ..]) => Some((e.id.as_str(), cold)),
+            _ => None,
+        })
+        .collect();
+    if rows.is_empty() {
+        return;
+    }
+    println!("\n  logs-scan fast-path opens, cold run: SEGMENT opens by read shape, not requests.");
+    println!(
+        "  One statement can take both routes; a ranged open issues several GETs, so these are"
+    );
+    println!("  not the `get` column above and cannot be summed with it.");
+    println!(
+        "  {:<32} | {:>18} | {:>12}",
+        "id", "whole_object_opens", "ranged_opens",
+    );
+    println!("  {:-<32}-+-{:-<18}-+-{:-<12}", "", "", "");
+    for (id, acc) in rows {
+        println!(
+            "  {:<32} | {:>18} | {:>12}",
+            id, acc.logs_whole_object_opens, acc.logs_ranged_opens,
+        );
     }
 }
 

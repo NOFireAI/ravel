@@ -502,6 +502,26 @@ pub struct RunAccounting {
     /// `0.0` when the run decoded no page.
     #[serde(default)]
     pub fetch_amplification: f64,
+    /// Logs-scan fast-path segment opens this run resolved to the WHOLE-OBJECT
+    /// read: `QueryAccountingSnapshot::logs_whole_object_opens` (ADR-0904).
+    ///
+    /// The unit is a SEGMENT OPEN, not a statement and not a request. One
+    /// statement spanning several segments contributes one open per segment and
+    /// can take both routes within the single query, so this and
+    /// [`Self::logs_ranged_opens`] each count segments, and their sum is the
+    /// fast-path segment count. An open is NOT one GET: a whole-object open
+    /// issues a single GET, but a ranged open issues several, so neither figure
+    /// is comparable with [`Self::object_store_get_requests`] beside it. Read it
+    /// as "which read shape the router chose for this run's segments", never as
+    /// a request count.
+    #[serde(default)]
+    pub logs_whole_object_opens: u64,
+    /// Logs-scan fast-path segment opens this run resolved to the RANGED
+    /// column-chunk read: `QueryAccountingSnapshot::logs_ranged_opens`
+    /// (ADR-0904). Same SEGMENT-OPEN unit and same not-a-request caveat as
+    /// [`Self::logs_whole_object_opens`]; one ranged open issues several GETs.
+    #[serde(default)]
+    pub logs_ranged_opens: u64,
 }
 
 /// One phase's share of a run's WIRE bytes (issue #913).
@@ -1316,6 +1336,13 @@ pub async fn measure_corpus(
                     run_wire.phase(QueryPhase::Scan),
                     acc.page_bytes_decoded,
                 ),
+                // #904: which read shape the logs-scan router chose for this
+                // run's fast-path segments. Read directly off the per-query
+                // snapshot (like the GET/bytes fields), not diffed against a
+                // shared accumulator: `outcome.accounting` is this execution's
+                // own handle.
+                logs_whole_object_opens: acc.logs_whole_object_opens,
+                logs_ranged_opens: acc.logs_ranged_opens,
             });
             if run == 0 {
                 // The cold run's block counters and rows go into `scan`; its
@@ -3645,6 +3672,198 @@ mod tests {
         assert_eq!(acc.wire_bytes_unattributed, 0);
         assert_eq!(acc.page_stored_bytes_decoded, 0);
         assert_eq!(acc.fetch_amplification, 0.0);
+    }
+
+    // ---- Logs-scan opens by read shape (#904) ------------------------------
+
+    /// A report written before #904 added the opens fields still deserializes:
+    /// both new fields carry `#[serde(default)]`, so they read 0 when absent,
+    /// exactly as `probe_misses_*` and the #913 fields do.
+    #[test]
+    fn a_pre_904_run_accounting_still_deserializes() {
+        let older = serde_json::json!({
+            "object_store_get_requests": 4,
+            "object_store_list_requests": 1,
+            "object_store_bytes": 900,
+            "cache_hits": 0,
+            "cache_misses": 3,
+            "cache_bytes": 0,
+            "probe_misses_plan": 0,
+            "probe_misses_scan": 0,
+            "wire_bytes_by_phase": [],
+            "wire_bytes_unattributed": 0,
+            "page_stored_bytes_decoded": 0,
+            "fetch_amplification": 0.0,
+        });
+        let acc: RunAccounting =
+            serde_json::from_value(older).expect("pre-#904 report deserializes");
+        assert_eq!(
+            acc.logs_whole_object_opens, 0,
+            "absent whole-object opens default to 0"
+        );
+        assert_eq!(acc.logs_ranged_opens, 0, "absent ranged opens default to 0");
+    }
+
+    /// One small single-segment object read WHOLE yields exactly one
+    /// whole-object open and no ranged open. Routing is controlled, not
+    /// observed: the query is `SELECT body FROM logs` (predicate-free, so the
+    /// whole-segment fast path that records opens actually runs) and the object
+    /// sits below the default 512 KiB block-range threshold, so it is read whole
+    /// in one GET whatever the projection width.
+    ///
+    /// Not `> 0`: an open miscounted, doubled, or attributed to the wrong shape
+    /// all fail this. Both figures are also asserted present in the report JSON
+    /// exactly once per run.
+    ///
+    /// Prove-the-test: swapping the two reported fields in the `RunAccounting`
+    /// construction (recording `acc.logs_ranged_opens` into
+    /// `logs_whole_object_opens` and vice versa) reads whole-object 0, ranged 1
+    /// here and fails both `assert_eq!`s.
+    #[tokio::test]
+    async fn whole_object_route_opens_reach_per_run_accounting_exactly() {
+        let store = empty_store();
+        let tenant = TenantId::new("whole-opens-tenant");
+        // A single small object, below the 512 KiB threshold, so the fast path
+        // opens it whole.
+        write_shard_objects(&store, &tenant, 0, 1).await;
+        let window = TimeRange {
+            start_ns: 0,
+            end_ns: NOW_NS,
+        };
+        let (measured, skipped, failed) = measure_corpus(
+            &store,
+            tenant.hash(),
+            &[entry("q", "SELECT body FROM logs")],
+            &[],
+            2,
+            window,
+            NOW_NS,
+            0,
+            Duration::from_secs(30),
+            false,
+            None,
+            ExecutorSettings::default(),
+            false,
+            None,
+        )
+        .await
+        .expect("run");
+        assert!(skipped.is_empty() && failed.is_empty());
+        let acc = measured[0]
+            .per_run_accounting
+            .as_ref()
+            .expect("an in-process lane records per-run accounting");
+        assert_eq!(acc.len(), 2, "one accounting entry per run");
+        for (run, entry) in acc.iter().enumerate() {
+            assert_eq!(
+                entry.logs_whole_object_opens, 1,
+                "run {run}: the one segment is opened whole, once"
+            );
+            assert_eq!(
+                entry.logs_ranged_opens, 0,
+                "run {run}: the whole-object route took no ranged open"
+            );
+        }
+
+        // Both figures are in the report JSON, exactly once per run.
+        let v: serde_json::Value = serde_json::to_value(&measured[0]).expect("serialize entry");
+        let per_run = v["per_run_accounting"]
+            .as_array()
+            .expect("per_run_accounting is a JSON array");
+        for (run, entry) in per_run.iter().enumerate() {
+            let obj = serde_json::to_string(entry).expect("serialize run entry");
+            assert_eq!(
+                obj.matches("\"logs_whole_object_opens\"").count(),
+                1,
+                "run {run}: whole-object opens appears exactly once"
+            );
+            assert_eq!(
+                obj.matches("\"logs_ranged_opens\"").count(),
+                1,
+                "run {run}: ranged opens appears exactly once"
+            );
+            assert_eq!(
+                entry["logs_whole_object_opens"], 1,
+                "run {run}: the whole-object open is in the JSON"
+            );
+            assert_eq!(
+                entry["logs_ranged_opens"], 0,
+                "run {run}: the ranged figure is in the JSON"
+            );
+        }
+    }
+
+    /// The complementary route: one big (2 MiB), poorly-compressible object read
+    /// on the RANGED path, so the exact split flips to whole-object 0, ranged 1.
+    /// Routing is again controlled, this time by object SIZE: the object clears
+    /// the default 512 KiB block-range threshold and `SELECT body` projects a
+    /// narrow slice, so the whole-segment fast path opens it by column chunk.
+    /// Together with the whole-object test this pins both routes on fixtures
+    /// whose routing the test controls, and proves the ranged field is wired to
+    /// the ranged counter rather than pinned at zero.
+    #[tokio::test]
+    async fn ranged_route_opens_reach_per_run_accounting_exactly() {
+        let store = empty_store();
+        let tenant = TenantId::new("ranged-opens-tenant");
+        // One object with a 2 MiB poorly-compressible body (same construction as
+        // `fetch_concurrency_bounds_in_flight_gets`), so it clears the 512 KiB
+        // threshold and the narrow `body` projection routes it ranged.
+        let mut records = build_records(1, 0);
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        for rec in &mut records {
+            let mut body = String::with_capacity(2 << 20);
+            while body.len() < (2 << 20) {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let sym = ((seed >> 58) as u8) % 62;
+                body.push(char::from(match sym {
+                    0..=25 => b'a' + sym,
+                    26..=51 => b'A' + (sym - 26),
+                    _ => b'0' + (sym - 52),
+                }));
+            }
+            rec.body = body;
+        }
+        write_records_as_objects(&store, &tenant, 0, &records).await;
+        let window = TimeRange {
+            start_ns: 0,
+            end_ns: NOW_NS,
+        };
+        let (measured, skipped, failed) = measure_corpus(
+            &store,
+            tenant.hash(),
+            &[entry("q", "SELECT body FROM logs")],
+            &[],
+            2,
+            window,
+            NOW_NS,
+            0,
+            Duration::from_secs(30),
+            false,
+            None,
+            ExecutorSettings::default(),
+            false,
+            None,
+        )
+        .await
+        .expect("run");
+        assert!(skipped.is_empty() && failed.is_empty());
+        let acc = measured[0]
+            .per_run_accounting
+            .as_ref()
+            .expect("an in-process lane records per-run accounting");
+        assert_eq!(acc.len(), 2, "one accounting entry per run");
+        for (run, entry) in acc.iter().enumerate() {
+            assert_eq!(
+                entry.logs_ranged_opens, 1,
+                "run {run}: the one big segment is opened on the ranged path, once"
+            );
+            assert_eq!(
+                entry.logs_whole_object_opens, 0,
+                "run {run}: the ranged route took no whole-object open"
+            );
+        }
     }
 
     // ---- The `--logs-suffix-len` seam (#883) -------------------------------
