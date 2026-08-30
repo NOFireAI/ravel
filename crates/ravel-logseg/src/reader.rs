@@ -120,16 +120,7 @@ impl<'a> RlogReader<'a> {
                 .section(kind::PAGE_DIR)
                 .ok_or_else(|| LogSegError::Corrupted("missing PAGE_DIR section".into()))?;
             let raw = read_section(bytes, desc, cfg)?;
-            let dir = PageDir::decode(&raw)?;
-            dir.validate_extents(blocks.len)?;
-            if dir.block_count() != skip.l0.len() as u64 {
-                return Err(LogSegError::Corrupted(format!(
-                    "page_dir covers {} blocks but skip index has {}",
-                    dir.block_count(),
-                    skip.l0.len()
-                )));
-            }
-            Arc::new(dir)
+            Arc::new(PageDir::decode_validated(&raw, blocks.len, skip.l0.len())?)
         };
         Ok(RlogReader {
             bytes,
