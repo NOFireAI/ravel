@@ -41,7 +41,9 @@ fn valid_report() -> MetricsBenchReport {
             comparators: vec![Comparator {
                 name: "prometheus".to_string(),
                 version: "3.13.1".to_string(),
-                image_digest: "sha256:abc".to_string(),
+                image_digest:
+                    "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                        .to_string(),
             }],
             generator_digest: "blake3:1111".to_string(),
             corpus_digest: "blake3:2222".to_string(),
