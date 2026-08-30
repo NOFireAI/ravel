@@ -1,0 +1,1079 @@
+//! The reconciled MetricsBench report schema (ADR-0927, issue #936, task T7).
+//!
+//! Two provenance types existed before this module, and ADR-0927's Consequences
+//! section names the trap directly: `sql_latency::Provenance` records the
+//! object-store backend and a long list of executor knobs but no git commit,
+//! toolchain, digest or hardware identification, while `report::Environment`
+//! records the git commit and toolchain but no object-store accounting.
+//! "T7 must reconcile them; extending one in ignorance of the other produces a
+//! third shape."
+//!
+//! This module is that reconciliation: one [`Provenance`] carrying everything
+//! either type recorded, plus everything ADR-0927 requires that neither had (a
+//! schema version, the toolchain and git commit *together with* the backend and
+//! its accounting, comparator versions and image digests, generator and corpus
+//! digests, the protocol, the hardware, and the complete non-default
+//! configuration). It does not grow a third bespoke flat struct that copies
+//! forty named fields: the two existing types' bench-specific knobs live in the
+//! generic [`ConfigEntry`] list (`store_backend`/`region` become named
+//! [`Backend`] fields, `shard_count`/`max_flush_delay_ms`/the SQL executor
+//! ceilings become config entries), so every field either type recorded is
+//! representable here without duplicating its shape.
+//!
+//! The two existing types are the serialization of two already-shipped
+//! benchmarks (`SqlLatencyReport`, `BenchReport`) and carry `#[serde(default)]`
+//! fields precisely so old reports still deserialize; nesting them under a
+//! shared core would break that back-compatibility, so they are left in place
+//! and this is the single shape MetricsBench and any bench that adopts it
+//! converge on.
+//!
+//! ## What this module guarantees
+//!
+//! - **Fail-closed validation** ([`validate`]): a missing, duplicate,
+//!   non-finite, negative, or malformed measurement all fail, and an
+//!   absent-but-expected figure fails exactly like an out-of-band one
+//!   (ADR-0927's "Bands pre-registered" decision 5). "Exit 0" from a consumer
+//!   means the report was checked and stood, not merely that the tool ran.
+//! - **A renderer** ([`render`]) that derives its table FROM the artifact and
+//!   is never hand-maintained. It follows the ClickBench runbook script's proven
+//!   design: integrity is asserted by identity before any band is applied, the
+//!   bands are named constants in one block, and a stated gap is a loud SKIP
+//!   rather than a silently unasserted figure.
+//! - **Per-query results are the source of truth.** A geometric mean may be
+//!   included but never replaces the per-query rows, and the renderer cannot
+//!   print a summary line without the rows behind it.
+//! - **Every cost estimate carries the retry caveat** ([`RETRY_CAVEAT`],
+//!   ADR-0927 decision 8, issue #928): request counts are logical-call counts,
+//!   not billed requests, and the caveat is in the rendered output rather than
+//!   only in a doc.
+//!
+//! Report-only, like the rest of `ravel-bench`: this never changes library
+//! behaviour, it only describes and checks a measurement.
+
+use std::collections::BTreeSet;
+use std::fmt::Write as _;
+
+use serde::{Deserialize, Serialize};
+
+use crate::promql_corpus::CostClass;
+
+/// The report schema version. A report declaring any other version is refused
+/// rather than parsed optimistically (the same contract
+/// [`crate::promql_corpus::CORPUS_FORMAT_VERSION`] carries): the field exists so
+/// a future schema change is a loud error, not a silently misread document.
+pub const SCHEMA_VERSION: u32 = 1;
+
+/// The retry-blindness caveat every cost estimate carries (ADR-0927 decision 8,
+/// issue #928). `object_store` retries below `InstrumentedStore` with
+/// `max_retries = 10`, so one logical `get()` that retried nine times records
+/// one request while S3 bills ten. Every request figure in this repository is a
+/// logical-call count, not a billed-request count, and under throttling the
+/// real bill exceeds every counted number. This lives in the rendered output,
+/// not only in a doc.
+pub const RETRY_CAVEAT: &str = "request counts are logical-call counts, not billed requests: \
+    object_store retries below InstrumentedStore (max_retries=10), so under throttling the real \
+    bill exceeds every counted number and nothing here measures the gap (ADR-0927 decision 8, #928)";
+
+/// The statuses ADR-0927 decision 6 fixes. Every outcome has exactly one, and
+/// only [`ResultStatus::Ok`] is admissible in a timing table. Kept as a typed
+/// enum rather than a bare string so a status the harness cannot spell is a
+/// deserialization error, not a silently dropped row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResultStatus {
+    /// Answered, and the oracle agrees. The only status that is timed.
+    Ok,
+    /// Answered, but the oracle disagrees.
+    Incorrect,
+    /// Answered from an incomplete result set, and correct as far as it goes.
+    Partial,
+    /// No answer within the per-query deadline.
+    Timeout,
+    /// A transport or server error that is none of the above.
+    Error,
+    /// The engine does not implement the query.
+    UnsupportedConstruct,
+    /// The engine implements it and deliberately declined, returning no result.
+    Refused,
+}
+
+impl ResultStatus {
+    /// Whether a latency from a measurement with this status is admissible in a
+    /// performance table. Only `ok` is timed (ADR-0927 decision 6).
+    pub fn is_timed(self) -> bool {
+        matches!(self, ResultStatus::Ok)
+    }
+
+    /// The slug this status renders as.
+    pub fn slug(self) -> &'static str {
+        match self {
+            ResultStatus::Ok => "ok",
+            ResultStatus::Incorrect => "incorrect",
+            ResultStatus::Partial => "partial",
+            ResultStatus::Timeout => "timeout",
+            ResultStatus::Error => "error",
+            ResultStatus::UnsupportedConstruct => "unsupported_construct",
+            ResultStatus::Refused => "refused",
+        }
+    }
+}
+
+/// The hardware a run measured on. `instance_type` is `Option` because it is
+/// knowable on a cloud host and not on a laptop; ADR-0927 asks for it "where
+/// knowable" and a sentinel string would read as a real instance type.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Hardware {
+    /// `uname -srm` or equivalent.
+    pub os: String,
+    /// The human CPU model string (`/proc/cpuinfo`'s `model name`).
+    pub cpu_model: String,
+    /// Logical cores on the measuring host. Zero is never valid.
+    pub logical_cores: u32,
+    /// The cloud instance type, when the host can name it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_type: Option<String>,
+}
+
+/// The object-store backend a run measured against, and whether its requests
+/// are billed. Reconciles `sql_latency::Provenance`'s
+/// `store_backend`/`region`/`endpoint` with `report::Environment`'s
+/// `store_backend`/`region` and `RequestCounts::backend_bills_requests`, so the
+/// honest "these counts are real but free" (`MemoryStore`) versus "these counts
+/// are billable" (S3) distinction rides beside the backend (ADR-0927 decision
+/// 8, ADR-0075 decision 3).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Backend {
+    /// `"memory"`, `"minio"`, or `"s3"`.
+    pub store_backend: String,
+    /// Backend region, or the sentinel `"n/a"` for a backend with none, keeping
+    /// the no-null contract.
+    pub region: String,
+    /// Backend endpoint, or `"n/a"` when the backend has none.
+    pub endpoint: String,
+    /// Whether a request against this backend is billed. `false` for
+    /// `MemoryStore` (real counts, but free); `true` for S3. Only the real-S3
+    /// lane produces a publishable cost claim (ADR-0927 decision 10).
+    pub backend_bills_requests: bool,
+}
+
+/// One comparator engine a portable-lane run was measured against, pinned by
+/// version and image digest (ADR-0927 decision 4). A Ravel-only diagnostic run
+/// carries an empty comparator list; a portable-lane run that names a comparator
+/// must name it completely, which [`validate`] enforces.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Comparator {
+    /// The engine name, e.g. `"prometheus"`, `"victoriametrics"`.
+    pub name: String,
+    /// The engine version, e.g. `"3.13.1"`.
+    pub version: String,
+    /// The container image digest the deployment was pinned to.
+    pub image_digest: String,
+}
+
+/// One non-default configuration setting the run applied. The complete
+/// non-default configuration (ADR-0927 decision requirement) is carried as a
+/// list of these rather than as a fixed set of named fields, so both
+/// `report::Environment`'s `shard_count`/`max_flush_delay_ms` and
+/// `sql_latency::Provenance`'s executor ceilings map into one shape without this
+/// type having to grow a named field per knob of every bench that adopts it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigEntry {
+    /// The setting name, as the CLI flag or config key spells it.
+    pub key: String,
+    /// The value it was set to, rendered as a string so heterogeneous knobs
+    /// share one shape.
+    pub value: String,
+}
+
+/// The reconciled provenance block: everything a MetricsBench figure needs
+/// beside it to be evidence, and a schema version so the shape cannot change
+/// silently.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Provenance {
+    /// The report schema version, which must equal [`SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// The Ravel git commit the numbers describe.
+    pub ravel_git_commit: String,
+    /// The Rust toolchain that built the measuring binary (`rustc --version`).
+    pub toolchain: String,
+    /// The ingest/query protocol the run drove, e.g. `"remote_write_1.0"` for
+    /// the portable lane or `"in_process_promql"` for a diagnostic run. Named
+    /// because a Remote Write 1.0 figure is never comparable with a 2.0 or OTLP
+    /// figure (ADR-0927 decision 2).
+    pub protocol: String,
+    /// The measuring host.
+    pub hardware: Hardware,
+    /// The object-store backend and its billing status.
+    pub backend: Backend,
+    /// The comparator engines, pinned by version and image digest. Empty for a
+    /// Ravel-only diagnostic run.
+    #[serde(default)]
+    pub comparators: Vec<Comparator>,
+    /// A digest identifying the deterministic generator, so a report names
+    /// exactly which samples it measured: the `generation.digest`
+    /// `metricsbench_gen` stamps on a real run, or the workload manifest's
+    /// content digest a provenance stamp uses before a run exists.
+    pub generator_digest: String,
+    /// The content digest of the PromQL corpus the run measured, so a report
+    /// names exactly which queries it ran.
+    pub corpus_digest: String,
+    /// The complete non-default configuration.
+    #[serde(default)]
+    pub config: Vec<ConfigEntry>,
+}
+
+/// One figure a measurement reports, named so the report is self-describing and
+/// a consumer can find a figure by name rather than by position.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Figure {
+    /// The figure name, e.g. `"median_ms"`, `"object_store_get_requests"`.
+    pub name: String,
+    /// The value. Validated finite and non-negative: a benchmark reports no
+    /// negative latency or byte count, and a NaN would make every band
+    /// comparison against it read as MET (the exact trap the runbook's
+    /// `byte_count` guards against).
+    pub value: f64,
+}
+
+/// One measured corpus query: its id, cost class, per-engine status, and the
+/// figures behind it. Per-query results are the source of truth (ADR-0927): the
+/// report-level geometric mean is derived from these and never replaces them.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Measurement {
+    /// The corpus entry id (`CorpusEntry::id`). Report rows are keyed by it, so
+    /// it must be unique within a report.
+    pub id: String,
+    /// The cost class the entry falls into (ADR-0927 decision 5).
+    pub class: CostClass,
+    /// The outcome status (ADR-0927 decision 6). Only [`ResultStatus::Ok`] is
+    /// timed.
+    pub status: ResultStatus,
+    /// The figures this measurement reports. An `ok` measurement must carry the
+    /// timing figures in [`REQUIRED_TIMED_FIGURES`]; a non-`ok` measurement is
+    /// not timed and carries none of them.
+    #[serde(default)]
+    pub figures: Vec<Figure>,
+}
+
+impl Measurement {
+    /// The value of the figure named `name`, or `None` if absent.
+    pub fn figure(&self, name: &str) -> Option<f64> {
+        self.figures
+            .iter()
+            .find(|f| f.name == name)
+            .map(|f| f.value)
+    }
+}
+
+/// The timing figures every `ok` (timed) measurement must carry. An `ok`
+/// measurement missing any of them fails validation exactly like an out-of-band
+/// figure (ADR-0927 decision 5: "absent-but-expected fails identically to
+/// out-of-band"). Non-`ok` measurements must carry none of them, because only
+/// `ok` is timed.
+pub const REQUIRED_TIMED_FIGURES: &[&str] = &["min_ms", "median_ms", "max_ms"];
+
+/// The full reconciled report: the provenance, the per-query measurements, and
+/// an optional report-level geometric mean.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsBenchReport {
+    /// The provenance block.
+    pub provenance: Provenance,
+    /// The per-query measurements, the source of truth.
+    pub measurements: Vec<Measurement>,
+    /// A report-level geometric mean of the timed medians, if the producer
+    /// computed one. It may be included but never replaces the per-query rows;
+    /// [`render`] cannot print it without them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geomean_ms: Option<f64>,
+}
+
+/// Everything [`validate`] can reject, one variant per failure class the task
+/// enumerates. Each names what is at fault and, where a figure is involved,
+/// which measurement and which figure, so the message is the signal a consumer
+/// acts on.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum ValidationError {
+    /// The report declares a schema version this build does not read.
+    #[error(
+        "report declares schema version {found}, but this build reads version {expected}; a \
+         schema change is a version bump, never a silently misread document"
+    )]
+    SchemaVersionMismatch {
+        /// The version the document declared.
+        found: u32,
+        /// The version this build reads ([`SCHEMA_VERSION`]).
+        expected: u32,
+    },
+    /// A required provenance field is absent (an empty string, an empty digest,
+    /// zero logical cores). An absent field is not evidence.
+    #[error(
+        "required provenance field `{field}` is missing or blank; a figure without its \
+         provenance is not evidence (ADR-0927)"
+    )]
+    MissingProvenanceField {
+        /// The field that was missing or blank.
+        field: &'static str,
+    },
+    /// A comparator was named without a complete pin. A portable-lane comparator
+    /// that cannot be reproduced is worse than none.
+    #[error(
+        "comparator at index {index} is missing its `{field}`; ADR-0927 decision 4 pins every \
+         comparator by version and image digest"
+    )]
+    IncompleteComparator {
+        /// The comparator's index in the list.
+        index: usize,
+        /// The field that was missing or blank.
+        field: &'static str,
+    },
+    /// The report carries no measurements. Per-query results are the source of
+    /// truth, and a report with none measures nothing.
+    #[error("report carries no measurements; per-query results are the source of truth")]
+    NoMeasurements,
+    /// Two measurements share an id. A later row silently overwriting an earlier
+    /// one keeps the count correct while changing which figures are checked (the
+    /// runbook's duplicate-id trap).
+    #[error(
+        "measurement id `{id}` appears more than once; a duplicate row would overwrite an \
+         earlier one and change which figures are checked"
+    )]
+    DuplicateMeasurement {
+        /// The duplicated id.
+        id: String,
+    },
+    /// A measurement is structurally malformed: a blank figure name, or an `ok`
+    /// row with no figures, or a non-`ok` row carrying a timing figure it must
+    /// not.
+    #[error("measurement `{id}` is malformed: {reason}")]
+    MalformedMeasurement {
+        /// The offending measurement id.
+        id: String,
+        /// What is wrong with it.
+        reason: String,
+    },
+    /// A figure value is not finite. A NaN is the worst case: every band
+    /// comparison against it is False, so a malformed report would read as a
+    /// pass (the runbook's `byte_count` trap).
+    #[error(
+        "measurement `{id}` figure `{figure}` is not finite ({value}); a NaN or infinity would \
+         make a band comparison read as met"
+    )]
+    NonFiniteFigure {
+        /// The offending measurement id.
+        id: String,
+        /// The offending figure name.
+        figure: String,
+        /// The value that was not finite.
+        value: f64,
+    },
+    /// A figure value is negative. A benchmark reports no negative latency or
+    /// byte count, and a negative would drag a total toward a passing figure.
+    #[error(
+        "measurement `{id}` figure `{figure}` is negative ({value}); no benchmark figure is \
+         negative and one would drag a total toward a passing value"
+    )]
+    NegativeFigure {
+        /// The offending measurement id.
+        id: String,
+        /// The offending figure name.
+        figure: String,
+        /// The negative value.
+        value: f64,
+    },
+    /// A timed (`ok`) measurement is missing a figure it is required to carry.
+    /// An absent-but-expected figure fails identically to an out-of-band one
+    /// (ADR-0927 decision 5).
+    #[error(
+        "timed measurement `{id}` is missing required figure `{figure}`; an absent-but-expected \
+         figure fails identically to an out-of-band one (ADR-0927 decision 5)"
+    )]
+    MissingExpectedFigure {
+        /// The offending measurement id.
+        id: String,
+        /// The figure that was expected and absent.
+        figure: &'static str,
+    },
+    /// The report-level geometric mean is present but not finite and positive. A
+    /// summary figure that is a NaN or non-positive is not a summary.
+    #[error("report geomean_ms is present but not finite and positive ({value})")]
+    BadGeomean {
+        /// The offending value.
+        value: f64,
+    },
+}
+
+/// One required provenance string field, paired with the human name a
+/// [`ValidationError::MissingProvenanceField`] reports. Held in a table so the
+/// check iterates rather than repeating the same `if blank` block per field: a
+/// new required field is one row here.
+fn required_provenance_fields(p: &Provenance) -> [(&'static str, &str); 8] {
+    [
+        ("ravel_git_commit", p.ravel_git_commit.as_str()),
+        ("toolchain", p.toolchain.as_str()),
+        ("protocol", p.protocol.as_str()),
+        ("hardware.os", p.hardware.os.as_str()),
+        ("hardware.cpu_model", p.hardware.cpu_model.as_str()),
+        ("backend.store_backend", p.backend.store_backend.as_str()),
+        ("generator_digest", p.generator_digest.as_str()),
+        ("corpus_digest", p.corpus_digest.as_str()),
+    ]
+}
+
+/// Validate the provenance block, fail-closed. Every required identity field
+/// must be present, the schema version must match, the hardware must name at
+/// least one logical core, and every named comparator must be completely
+/// pinned.
+fn validate_provenance(p: &Provenance) -> Result<(), ValidationError> {
+    if p.schema_version != SCHEMA_VERSION {
+        return Err(ValidationError::SchemaVersionMismatch {
+            found: p.schema_version,
+            expected: SCHEMA_VERSION,
+        });
+    }
+    for (field, value) in required_provenance_fields(p) {
+        if value.trim().is_empty() {
+            return Err(ValidationError::MissingProvenanceField { field });
+        }
+    }
+    // `region`/`endpoint` carry a `"n/a"` sentinel rather than being empty, so a
+    // blank one is still a missing field.
+    if p.backend.region.trim().is_empty() {
+        return Err(ValidationError::MissingProvenanceField {
+            field: "backend.region",
+        });
+    }
+    if p.backend.endpoint.trim().is_empty() {
+        return Err(ValidationError::MissingProvenanceField {
+            field: "backend.endpoint",
+        });
+    }
+    if p.hardware.logical_cores == 0 {
+        return Err(ValidationError::MissingProvenanceField {
+            field: "hardware.logical_cores",
+        });
+    }
+    for (index, c) in p.comparators.iter().enumerate() {
+        for (field, value) in [
+            ("name", c.name.as_str()),
+            ("version", c.version.as_str()),
+            ("image_digest", c.image_digest.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(ValidationError::IncompleteComparator { index, field });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate one measurement's figures and status shape, fail-closed.
+fn validate_measurement(m: &Measurement) -> Result<(), ValidationError> {
+    for f in &m.figures {
+        if f.name.trim().is_empty() {
+            return Err(ValidationError::MalformedMeasurement {
+                id: m.id.clone(),
+                reason: "a figure has a blank name".to_string(),
+            });
+        }
+        if !f.value.is_finite() {
+            return Err(ValidationError::NonFiniteFigure {
+                id: m.id.clone(),
+                figure: f.name.clone(),
+                value: f.value,
+            });
+        }
+        if f.value < 0.0 {
+            return Err(ValidationError::NegativeFigure {
+                id: m.id.clone(),
+                figure: f.name.clone(),
+                value: f.value,
+            });
+        }
+    }
+    // A figure named twice is malformed: a consumer that looks it up by name
+    // would silently read the first and ignore the second.
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for f in &m.figures {
+        if !seen.insert(f.name.as_str()) {
+            return Err(ValidationError::MalformedMeasurement {
+                id: m.id.clone(),
+                reason: format!("figure `{}` appears more than once", f.name),
+            });
+        }
+    }
+    if m.status.is_timed() {
+        // A timed row carries the full timing figure set. An absent one fails
+        // exactly like an out-of-band one.
+        if m.figures.is_empty() {
+            return Err(ValidationError::MalformedMeasurement {
+                id: m.id.clone(),
+                reason: "an ok (timed) measurement carries no figures".to_string(),
+            });
+        }
+        for figure in REQUIRED_TIMED_FIGURES {
+            if m.figure(figure).is_none() {
+                return Err(ValidationError::MissingExpectedFigure {
+                    id: m.id.clone(),
+                    figure,
+                });
+            }
+        }
+    } else {
+        // Only `ok` is timed (ADR-0927 decision 6). A non-`ok` row carrying a
+        // timing figure would let an untimed outcome sneak a latency into a
+        // performance table.
+        for figure in REQUIRED_TIMED_FIGURES {
+            if m.figure(figure).is_some() {
+                return Err(ValidationError::MalformedMeasurement {
+                    id: m.id.clone(),
+                    reason: format!(
+                        "status `{}` is not timed, but the row carries timing figure `{figure}` \
+                         (only ok is timed, ADR-0927 decision 6)",
+                        m.status.slug()
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate a whole report, fail-closed. This is the one entry point a consumer
+/// (and the renderer) runs before trusting any figure: a missing, duplicate,
+/// non-finite, negative, or malformed measurement all fail here, and an
+/// absent-but-expected figure fails exactly like an out-of-band one.
+pub fn validate(report: &MetricsBenchReport) -> Result<(), ValidationError> {
+    validate_provenance(&report.provenance)?;
+    if report.measurements.is_empty() {
+        return Err(ValidationError::NoMeasurements);
+    }
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for m in &report.measurements {
+        if !seen.insert(m.id.as_str()) {
+            return Err(ValidationError::DuplicateMeasurement { id: m.id.clone() });
+        }
+        validate_measurement(m)?;
+    }
+    if let Some(g) = report.geomean_ms
+        && !(g.is_finite() && g > 0.0)
+    {
+        return Err(ValidationError::BadGeomean { value: g });
+    }
+    Ok(())
+}
+
+// --- Renderer bands (ADR-0927 decision 5). Re-register a band by editing
+// exactly one line in this block, exactly as the ClickBench runbook script
+// does. Each band is `None` until a reference run pre-registers it, and a
+// `None` band is a loud SKIP, never a silent pass. ------------------------------
+
+/// The band on how many of the report's measurements must be timed (`ok`),
+/// registered per reference run. `None` until pre-registered, so the renderer
+/// prints a loud SKIP rather than asserting nothing. A tuple is `(lo, hi)`
+/// inclusive.
+pub const TIMED_FRACTION_BAND: Option<(f64, f64)> = None;
+
+/// The band on the report-level geometric mean, in milliseconds, registered per
+/// reference run and regime. `None` until pre-registered.
+pub const GEOMEAN_MS_BAND: Option<(f64, f64)> = None;
+
+/// Everything [`render`] can fail on: a report that does not validate, or a
+/// pre-registered band a real run missed.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum RenderError {
+    /// The report did not validate. Integrity is asserted by identity before any
+    /// band is applied, so a band verdict is never computed over a report whose
+    /// figures cannot be trusted.
+    #[error("report failed validation before any band could be applied: {0}")]
+    Invalid(#[from] ValidationError),
+    /// A pre-registered band was missed.
+    #[error("{0}")]
+    BandViolation(String),
+}
+
+/// Render the report as the human-readable table, derived entirely from the
+/// artifact. The table is never hand-maintained: every row and every figure is
+/// read off `report`.
+///
+/// The order is the runbook's proven one: validate (integrity by identity)
+/// first, then the provenance header, then the retry caveat, then the per-query
+/// rows, then the per-class distribution, then the pre-registered bands (each a
+/// loud SKIP when not registered), and only then the optional geometric mean,
+/// which cannot appear without the per-query rows above it.
+pub fn render(report: &MetricsBenchReport) -> Result<String, RenderError> {
+    validate(report)?;
+
+    let mut out = String::new();
+    let p = &report.provenance;
+    out.push_str("metricsbench report (schema v");
+    let _ = writeln!(out, "{})", p.schema_version);
+    let _ = writeln!(out, "  commit    : {}", p.ravel_git_commit);
+    let _ = writeln!(out, "  toolchain : {}", p.toolchain);
+    let _ = writeln!(out, "  protocol  : {}", p.protocol);
+    let _ = writeln!(
+        out,
+        "  backend   : {} (region={}, endpoint={}, bills_requests={})",
+        p.backend.store_backend,
+        p.backend.region,
+        p.backend.endpoint,
+        p.backend.backend_bills_requests
+    );
+    let _ = writeln!(
+        out,
+        "  hardware  : {} | {} | {} logical cores{}",
+        p.hardware.os,
+        p.hardware.cpu_model,
+        p.hardware.logical_cores,
+        match &p.hardware.instance_type {
+            Some(t) => format!(" | {t}"),
+            None => String::new(),
+        }
+    );
+    if p.comparators.is_empty() {
+        out.push_str("  comparators: none (Ravel-only diagnostic run)\n");
+    } else {
+        for c in &p.comparators {
+            let _ = writeln!(
+                out,
+                "  comparator: {} {} @ {}",
+                c.name, c.version, c.image_digest
+            );
+        }
+    }
+    let _ = writeln!(out, "  generator : {}", p.generator_digest);
+    let _ = writeln!(out, "  corpus    : {}", p.corpus_digest);
+    for c in &p.config {
+        let _ = writeln!(out, "  config    : {} = {}", c.key, c.value);
+    }
+    // The retry caveat rides in the rendered output, not only in a doc.
+    let _ = writeln!(out, "  NOTE: {RETRY_CAVEAT}");
+
+    // Per-query rows: the source of truth, always printed before any summary.
+    out.push('\n');
+    let _ = writeln!(
+        out,
+        "  {:<32} | {:<22} | {:<12} | {:>10} | {:>10} | {:>10}",
+        "id", "class", "status", "min_ms", "median_ms", "max_ms"
+    );
+    let _ = writeln!(
+        out,
+        "  {:-<32}-+-{:-<22}-+-{:-<12}-+-{:-<10}-+-{:-<10}-+-{:-<10}",
+        "", "", "", "", "", ""
+    );
+    let fig = |m: &Measurement, name: &str| {
+        m.figure(name)
+            .map_or_else(|| "-".to_string(), |v| format!("{v:.3}"))
+    };
+    for m in &report.measurements {
+        let _ = writeln!(
+            out,
+            "  {:<32} | {:<22} | {:<12} | {:>10} | {:>10} | {:>10}",
+            m.id,
+            m.class.slug(),
+            m.status.slug(),
+            fig(m, "min_ms"),
+            fig(m, "median_ms"),
+            fig(m, "max_ms"),
+        );
+    }
+
+    // Per-class distribution, derived from the rows. Every class is listed,
+    // including the empty ones, so a class with no measurement is visible rather
+    // than dropped.
+    out.push('\n');
+    out.push_str("  measurements by cost class (timed = status ok):\n");
+    for class in CostClass::ALL {
+        let in_class: Vec<&Measurement> = report
+            .measurements
+            .iter()
+            .filter(|m| m.class == *class)
+            .collect();
+        let timed = in_class.iter().filter(|m| m.status.is_timed()).count();
+        let _ = writeln!(
+            out,
+            "    {:<22} {} measured, {} timed",
+            class.slug(),
+            in_class.len(),
+            timed
+        );
+    }
+
+    // Pre-registered bands. Integrity above already stood; a band is applied
+    // only now, and a band that is not pre-registered is a loud SKIP, never a
+    // silent pass.
+    out.push('\n');
+    let total = report.measurements.len();
+    let timed = report
+        .measurements
+        .iter()
+        .filter(|m| m.status.is_timed())
+        .count();
+    let timed_fraction = timed as f64 / total as f64;
+    match TIMED_FRACTION_BAND {
+        None => {
+            let _ = writeln!(
+                out,
+                "  SKIP timed-fraction band: not pre-registered for this run (measured {timed}/{total} = {timed_fraction:.3})"
+            );
+        }
+        Some((lo, hi)) => {
+            let _ = writeln!(
+                out,
+                "  timed fraction {timed_fraction:.3} (band {lo:.3}..={hi:.3})"
+            );
+            if !(lo..=hi).contains(&timed_fraction) {
+                return Err(RenderError::BandViolation(format!(
+                    "timed fraction {timed_fraction:.3} outside band {lo:.3}..={hi:.3}"
+                )));
+            }
+        }
+    }
+
+    // The geometric mean is a summary and never a replacement: it is printed
+    // last, after the per-query rows it derives from, and only when the producer
+    // computed one. A report without those rows never reaches here (validation
+    // refuses an empty measurement list above).
+    match report.geomean_ms {
+        None => {
+            out.push_str(
+                "  geomean: not computed (per-query rows above are the source of truth)\n",
+            );
+        }
+        Some(g) => {
+            let _ = writeln!(
+                out,
+                "  geomean {g:.3} ms over {timed} timed of {total} measured rows"
+            );
+            match GEOMEAN_MS_BAND {
+                None => {
+                    out.push_str("  SKIP geomean band: not pre-registered for this run\n");
+                }
+                Some((lo, hi)) => {
+                    if !(lo..=hi).contains(&g) {
+                        return Err(RenderError::BandViolation(format!(
+                            "geomean {g:.3} ms outside band {lo:.3}..={hi:.3}"
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// A provenance block that validates clean, for a test to mutate one field
+    /// of.
+    fn valid_provenance() -> Provenance {
+        Provenance {
+            schema_version: SCHEMA_VERSION,
+            ravel_git_commit: "9fc85f421590d360e7979ee167eb38e166b45462".to_string(),
+            toolchain: "rustc 1.90.0".to_string(),
+            protocol: "remote_write_1.0".to_string(),
+            hardware: Hardware {
+                os: "Linux 6.8.0 x86_64".to_string(),
+                cpu_model: "AMD EPYC 7R13".to_string(),
+                logical_cores: 8,
+                instance_type: Some("c6a.2xlarge".to_string()),
+            },
+            backend: Backend {
+                store_backend: "s3".to_string(),
+                region: "us-east-1".to_string(),
+                endpoint: "n/a".to_string(),
+                backend_bills_requests: true,
+            },
+            comparators: vec![Comparator {
+                name: "prometheus".to_string(),
+                version: "3.13.1".to_string(),
+                image_digest: "sha256:abc123".to_string(),
+            }],
+            generator_digest: "blake3:1111".to_string(),
+            corpus_digest: "blake3:2222".to_string(),
+            config: vec![ConfigEntry {
+                key: "max_flush_delay_ms".to_string(),
+                value: "2000".to_string(),
+            }],
+        }
+    }
+
+    /// One timed (`ok`) measurement carrying the full required timing figure
+    /// set.
+    fn timed_measurement(id: &str) -> Measurement {
+        Measurement {
+            id: id.to_string(),
+            class: CostClass::HighFanOut,
+            status: ResultStatus::Ok,
+            figures: vec![
+                Figure {
+                    name: "min_ms".to_string(),
+                    value: 10.0,
+                },
+                Figure {
+                    name: "median_ms".to_string(),
+                    value: 12.5,
+                },
+                Figure {
+                    name: "max_ms".to_string(),
+                    value: 20.0,
+                },
+            ],
+        }
+    }
+
+    fn valid_report() -> MetricsBenchReport {
+        MetricsBenchReport {
+            provenance: valid_provenance(),
+            measurements: vec![timed_measurement("mb_fanout_total_rate")],
+            geomean_ms: Some(12.5),
+        }
+    }
+
+    /// The whole point of the fixtures: a report built from them validates
+    /// clean, so every failure test below isolates exactly one defect.
+    #[test]
+    fn the_fixture_report_validates_clean() {
+        validate(&valid_report()).expect("the fixture report validates");
+    }
+
+    /// ACCEPTANCE TEST (issue #936). A report whose provenance is missing a
+    /// required field fails validation, naming the field.
+    ///
+    /// To watch this test fail against a report that HAS the field, keep the
+    /// commit populated instead of blanking it: change the
+    /// `report.provenance.ravel_git_commit = String::new();` line below to
+    /// `report.provenance.ravel_git_commit = "deadbeef".to_string();`. The
+    /// report then validates, `expect_err` finds `Ok(())`, and the test fails.
+    #[test]
+    fn a_report_missing_a_required_provenance_field_fails_validation() {
+        let mut report = valid_report();
+        report.provenance.ravel_git_commit = String::new();
+        let err = validate(&report).expect_err("a blank git commit must fail validation");
+        assert_eq!(
+            err,
+            ValidationError::MissingProvenanceField {
+                field: "ravel_git_commit"
+            },
+            "the error must name the missing field, got {err:?}"
+        );
+    }
+
+    /// Failure class: a schema version this build does not read.
+    #[test]
+    fn a_wrong_schema_version_fails_validation() {
+        let mut report = valid_report();
+        report.provenance.schema_version = SCHEMA_VERSION + 7;
+        let err = validate(&report).expect_err("a wrong schema version must fail");
+        assert_eq!(
+            err,
+            ValidationError::SchemaVersionMismatch {
+                found: SCHEMA_VERSION + 7,
+                expected: SCHEMA_VERSION,
+            }
+        );
+    }
+
+    /// Failure class: duplicate measurement id.
+    #[test]
+    fn a_duplicate_measurement_id_fails_validation() {
+        let mut report = valid_report();
+        report
+            .measurements
+            .push(timed_measurement("mb_fanout_total_rate"));
+        let err = validate(&report).expect_err("a duplicate id must fail");
+        assert_eq!(
+            err,
+            ValidationError::DuplicateMeasurement {
+                id: "mb_fanout_total_rate".to_string()
+            }
+        );
+    }
+
+    /// Failure class: a non-finite figure value.
+    #[test]
+    fn a_non_finite_figure_fails_validation() {
+        let mut report = valid_report();
+        report.measurements[0].figures[1].value = f64::NAN;
+        let err = validate(&report).expect_err("a NaN figure must fail");
+        match err {
+            ValidationError::NonFiniteFigure { id, figure, value } => {
+                assert_eq!(id, "mb_fanout_total_rate");
+                assert_eq!(figure, "median_ms");
+                assert!(value.is_nan(), "the reported value is the NaN itself");
+            }
+            other => panic!("wrong error variant: {other:?}"),
+        }
+    }
+
+    /// Failure class: a negative figure value.
+    #[test]
+    fn a_negative_figure_fails_validation() {
+        let mut report = valid_report();
+        report.measurements[0].figures[0].value = -1.5;
+        let err = validate(&report).expect_err("a negative figure must fail");
+        assert_eq!(
+            err,
+            ValidationError::NegativeFigure {
+                id: "mb_fanout_total_rate".to_string(),
+                figure: "min_ms".to_string(),
+                value: -1.5,
+            }
+        );
+    }
+
+    /// Failure class: a malformed measurement (a blank figure name).
+    #[test]
+    fn a_blank_figure_name_is_a_malformed_measurement() {
+        let mut report = valid_report();
+        report.measurements[0].figures[0].name = "   ".to_string();
+        let err = validate(&report).expect_err("a blank figure name must fail");
+        assert_eq!(
+            err,
+            ValidationError::MalformedMeasurement {
+                id: "mb_fanout_total_rate".to_string(),
+                reason: "a figure has a blank name".to_string(),
+            }
+        );
+    }
+
+    /// An absent-but-expected timing figure fails exactly like an out-of-band
+    /// one (ADR-0927 decision 5): an `ok` row that drops `median_ms` is refused,
+    /// naming the missing figure, not accepted with a hole.
+    #[test]
+    fn an_ok_measurement_missing_a_timing_figure_fails_validation() {
+        let mut report = valid_report();
+        report.measurements[0]
+            .figures
+            .retain(|f| f.name != "median_ms");
+        let err = validate(&report).expect_err("a missing required figure must fail");
+        assert_eq!(
+            err,
+            ValidationError::MissingExpectedFigure {
+                id: "mb_fanout_total_rate".to_string(),
+                figure: "median_ms",
+            }
+        );
+    }
+
+    /// Only `ok` is timed: a non-`ok` row carrying a timing figure is malformed,
+    /// so an untimed outcome cannot smuggle a latency into a performance table.
+    #[test]
+    fn a_non_ok_measurement_carrying_a_timing_figure_is_malformed() {
+        let mut report = valid_report();
+        report.measurements[0].status = ResultStatus::Refused;
+        // Leaves the timing figures on a refused row.
+        let err = validate(&report).expect_err("a timed figure on a refused row must fail");
+        match err {
+            ValidationError::MalformedMeasurement { id, reason } => {
+                assert_eq!(id, "mb_fanout_total_rate");
+                assert!(reason.contains("only ok is timed"), "{reason}");
+            }
+            other => panic!("wrong error variant: {other:?}"),
+        }
+    }
+
+    /// A named comparator missing its image digest fails: a comparator that
+    /// cannot be reproduced is worse than none (ADR-0927 decision 4).
+    #[test]
+    fn an_incompletely_pinned_comparator_fails_validation() {
+        let mut report = valid_report();
+        report.provenance.comparators[0].image_digest = String::new();
+        let err = validate(&report).expect_err("an unpinned comparator must fail");
+        assert_eq!(
+            err,
+            ValidationError::IncompleteComparator {
+                index: 0,
+                field: "image_digest",
+            }
+        );
+    }
+
+    /// A report with no measurements is refused: per-query results are the
+    /// source of truth, and a report with none measures nothing.
+    #[test]
+    fn a_report_with_no_measurements_fails_validation() {
+        let mut report = valid_report();
+        report.measurements.clear();
+        report.geomean_ms = None;
+        let err = validate(&report).expect_err("an empty report must fail");
+        assert_eq!(err, ValidationError::NoMeasurements);
+    }
+
+    /// The renderer derives its table from the artifact and carries the retry
+    /// caveat in its output, not only in a doc (ADR-0927 decision 8).
+    #[test]
+    fn the_renderer_derives_the_table_and_carries_the_retry_caveat() {
+        let report = valid_report();
+        let text = render(&report).expect("the fixture report renders");
+        // Every per-query row is derived from the artifact.
+        assert!(text.contains("mb_fanout_total_rate"), "{text}");
+        assert!(text.contains("high_fan_out"), "{text}");
+        assert!(
+            text.contains("12.500"),
+            "the median figure is rendered: {text}"
+        );
+        // The retry caveat is in the output.
+        assert!(
+            text.contains(RETRY_CAVEAT),
+            "the retry caveat must be rendered: {text}"
+        );
+        assert!(text.contains("logical-call counts"), "{text}");
+        // A gap with no pre-registered band is a loud SKIP, never a silent pass.
+        assert!(
+            text.contains("SKIP timed-fraction band: not pre-registered"),
+            "an unregistered band must render a loud SKIP: {text}"
+        );
+    }
+
+    /// The renderer cannot print a summary without the per-query rows behind it:
+    /// a report that fails validation (here, an empty measurement list) is
+    /// refused before any geomean line is produced.
+    #[test]
+    fn the_renderer_refuses_to_summarize_a_report_that_does_not_validate() {
+        let mut report = valid_report();
+        report.measurements.clear();
+        let err = render(&report).expect_err("an invalid report must not render");
+        assert!(
+            matches!(err, RenderError::Invalid(ValidationError::NoMeasurements)),
+            "wrong error: {err:?}"
+        );
+    }
+
+    /// The report round-trips through JSON unchanged: this is the emission
+    /// contract a producer serializes and a consumer (the renderer binary)
+    /// reads back.
+    #[test]
+    fn a_report_round_trips_through_json() {
+        let report = valid_report();
+        let json = serde_json::to_string_pretty(&report).expect("serialize");
+        let back: MetricsBenchReport = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(report, back);
+        validate(&back).expect("the round-tripped report validates");
+    }
+
+    /// An unknown key in a report is a deserialization error, not a silently
+    /// ignored field: the schema is a frozen contract.
+    #[test]
+    fn an_unknown_report_key_is_a_deserialization_error() {
+        let report = valid_report();
+        let mut doc = serde_json::to_value(&report).expect("serialize");
+        doc.as_object_mut()
+            .expect("object")
+            .insert("measrements".to_string(), serde_json::json!([]));
+        let err = serde_json::from_value::<MetricsBenchReport>(doc)
+            .expect_err("an unknown key must fail to deserialize");
+        assert!(err.to_string().contains("measrements"), "{err}");
+    }
+}

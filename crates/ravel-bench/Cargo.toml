@@ -221,6 +221,15 @@ name = "metricsbench_gen"
 path = "src/bin/metricsbench_gen.rs"
 bench = false
 
+# MetricsBench report tool (ADR-0927, issue #936): validates and renders the
+# reconciled report artifact, and stamps its provenance. In the default feature
+# set on purpose: it is the entry point that makes the report_schema validation
+# reachable from a real caller, so a malformed artifact fails through it.
+[[bin]]
+name = "metricsbench_report"
+path = "src/bin/metricsbench_report.rs"
+bench = false
+
 [[bin]]
 name = "segment_alloc_profile"
 path = "src/bin/segment_alloc_profile.rs"
@@ -393,6 +402,14 @@ bench = false
 [[test]]
 name = "metricsbench_artifacts"
 path = "tests/metricsbench_artifacts.rs"
+bench = false
+
+# Reachability for the reconciled report schema (issue #936): a malformed report
+# artifact must fail through the shipping `metricsbench_report` binary, not only
+# through a direct `report_schema::validate` call.
+[[test]]
+name = "metricsbench_report"
+path = "tests/metricsbench_report.rs"
 bench = false
 
 [[test]]
