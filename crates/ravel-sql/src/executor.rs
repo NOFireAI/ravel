@@ -265,10 +265,13 @@ fn accumulate_block_counts(plan: &Arc<dyn ExecutionPlan>, counts: &mut BlockCoun
 /// I/O a second time.
 fn accumulate_spill_counts(plan: &Arc<dyn ExecutionPlan>, counts: &mut SpillCounts) {
     if let Some(metrics) = plan.metrics() {
-        let sum = |name: &str| metrics.sum_by_name(name).map_or(0, |v| v.as_usize() as u64);
-        counts.files += sum("spill_count");
-        counts.bytes_written += sum("spilled_bytes");
-        counts.rows += sum("spilled_rows");
+        // `spill_count`/`spilled_bytes`/`spilled_rows` are DataFusion's typed
+        // `MetricValue::Spill*` variants, which `sum_by_name` deliberately
+        // skips (it matches only the generic `Count`/`Time`/`Gauge` shapes);
+        // the dedicated `MetricsSet` accessors sum the typed variants instead.
+        counts.files += metrics.spill_count().unwrap_or(0) as u64;
+        counts.bytes_written += metrics.spilled_bytes().unwrap_or(0) as u64;
+        counts.rows += metrics.spilled_rows().unwrap_or(0) as u64;
     }
     for child in plan.children() {
         accumulate_spill_counts(child, counts);
@@ -789,8 +792,14 @@ impl SqlExecutor {
             ))),
         };
 
-        let ctx = build_session(&self.config, pool, table, exact_typed_aggregates, spill_eligible)
-            .map_err(plan_error)?;
+        let ctx = build_session(
+            &self.config,
+            pool,
+            table,
+            exact_typed_aggregates,
+            spill_eligible,
+        )
+        .map_err(plan_error)?;
         let frame = ctx.sql(sql).await.map_err(plan_error)?;
         let schema = frame.schema().inner().clone();
         Ok(PinnedQuery {
@@ -1032,6 +1041,26 @@ impl SqlExecutor {
         }
     }
 
+    /// The spill-eligibility sibling of [`Self::classify_exact_typed`], composing
+    /// the same analyze pass with [`plan_is_spill_eligible`] the production path
+    /// uses inline in `plan_pinned_with` (ADR-0954). Test-only, for the same
+    /// reason.
+    #[cfg(test)]
+    async fn classify_spill_eligible(
+        &self,
+        tenant_hash: TenantHash,
+        sql: &str,
+        declared: &[DeclaredColumn],
+    ) -> bool {
+        match self
+            .analyzed_classification_plan(tenant_hash, sql, declared)
+            .await
+        {
+            Some(plan) => plan_is_spill_eligible(&plan),
+            None => false,
+        }
+    }
+
     /// Build the throwaway empty-snapshot session for `sql`'s target signal,
     /// logical-plan `sql`, and run DataFusion's analyzer (type coercion) over
     /// the result. `None` on any error (the fail-closed source for
@@ -1236,7 +1265,12 @@ impl SqlExecutor {
         snapshot: Snapshot,
         accounting: &QueryAccounting,
         declared: &[DeclaredColumn],
-    ) -> (Result<QueryOutput, SqlError>, usize, BlockCounts, SpillCounts) {
+    ) -> (
+        Result<QueryOutput, SqlError>,
+        usize,
+        BlockCounts,
+        SpillCounts,
+    ) {
         let planned = match self
             .plan_pinned(tenant_hash, snapshot, &req.sql, accounting, declared)
             .await
@@ -1277,7 +1311,12 @@ impl SqlExecutor {
         // counters are now final, so read them off the plan we kept.
         let blocks = stream.block_counts();
         let spill = stream.spill_counts();
-        (Ok(QueryOutput::new(schema, batches)), emitted, blocks, spill)
+        (
+            Ok(QueryOutput::new(schema, batches)),
+            emitted,
+            blocks,
+            spill,
+        )
     }
 }
 
@@ -2704,6 +2743,99 @@ mod tests {
                     &[],
                 )
                 .await
+        );
+    }
+
+    /// ADR-0954: spill eligibility admits exactly the aggregates that are
+    /// exactness-preserving under the spill fold reorder, and refuses every
+    /// float accumulator/key. Fail-closed: an unclassifiable plan is not
+    /// eligible. Mirrors the exact-typed cases above, since spill eligibility is
+    /// the same order/partition-independence property applied to the spill
+    /// reorder.
+    #[tokio::test]
+    async fn classify_spill_eligible_admits_and_rejects_per_adr_0954() {
+        let exec = eviction_test_executor();
+        let t = TenantHash([4u8; 16]);
+
+        // Integer count/sum, non-float group key: eligible.
+        assert!(
+            exec.classify_spill_eligible(
+                t,
+                "SELECT ts, count(*) AS c, sum(CAST(value AS BIGINT)) AS s FROM samples GROUP BY ts",
+                &[],
+            )
+            .await
+        );
+        // count(DISTINCT float): count is always eligible.
+        assert!(
+            exec.classify_spill_eligible(t, "SELECT count(DISTINCT value) FROM samples", &[])
+                .await
+        );
+        // avg over a resolved integer input: the exact-integer avg path, eligible.
+        assert!(
+            exec.classify_spill_eligible(t, "SELECT avg(CAST(value AS BIGINT)) FROM samples", &[])
+                .await
+        );
+        // Float sum: order-dependent under the spill reorder, INELIGIBLE.
+        assert!(
+            !exec
+                .classify_spill_eligible(t, "SELECT sum(value) FROM samples", &[])
+                .await
+        );
+        // avg over a float input: INELIGIBLE.
+        assert!(
+            !exec
+                .classify_spill_eligible(t, "SELECT avg(value) FROM samples", &[])
+                .await
+        );
+        // Float GROUP BY key (aggregate itself a plain count): INELIGIBLE.
+        assert!(
+            !exec
+                .classify_spill_eligible(
+                    t,
+                    "SELECT value, count(*) FROM samples GROUP BY value",
+                    &[]
+                )
+                .await
+        );
+        // A disqualifying float avg hidden inside a scalar subquery: INELIGIBLE,
+        // proving the same subquery walk the exact-typed classifier uses.
+        assert!(
+            !exec
+                .classify_spill_eligible(
+                    t,
+                    "SELECT count(*) FROM samples \
+                     WHERE value > (SELECT avg(value) FROM samples)",
+                    &[],
+                )
+                .await
+        );
+    }
+
+    /// ADR-0954: a DataFusion `ResourcesExhausted` carrying the disk-manager's
+    /// scratch-quota marker (`max_temp_directory_size`) is re-classified into a
+    /// typed `SpillBudgetExhausted`, distinct from the disabled-disk
+    /// re-attribution and from a plain pool `try_grow` refusal.
+    #[test]
+    fn spill_quota_trip_maps_to_spill_budget_exhausted() {
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let df = DataFusionError::ResourcesExhausted(
+            "The used disk space during the spilling process has exceeded the allowable limit of \
+             64.0 KB. Please try increasing the config: datafusion.runtime.max_temp_directory_size"
+                .to_string(),
+        );
+        let err = execution_error(df, &pool);
+        assert!(
+            matches!(err, SqlError::SpillBudgetExhausted(_)),
+            "a scratch-quota trip must map to SpillBudgetExhausted; got {err:?}"
+        );
+        // It is not confused with the disabled-disk re-attribution.
+        let SqlError::SpillBudgetExhausted(msg) = &err else {
+            unreachable!("asserted above");
+        };
+        assert!(
+            !msg.contains("spill is disabled"),
+            "a quota trip is not a disabled-disk refusal: {msg:?}"
         );
     }
 

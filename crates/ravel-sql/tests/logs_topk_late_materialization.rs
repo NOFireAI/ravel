@@ -353,8 +353,14 @@ fn session(provider: LogsTableProvider, config: &SqlConfig) -> SessionContext {
         CeilingBreach::new(),
         QueryAccounting::new(),
     ));
-    build_session(config, pool, SessionTable::Logs(Arc::new(provider)), false, false)
-        .expect("session builds")
+    build_session(
+        config,
+        pool,
+        SessionTable::Logs(Arc::new(provider)),
+        false,
+        false,
+    )
+    .expect("session builds")
 }
 
 fn metric(plan: &Arc<dyn ExecutionPlan>, node: &str, name: &str) -> usize {

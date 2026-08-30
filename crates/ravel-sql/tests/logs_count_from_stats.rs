@@ -174,7 +174,13 @@ fn logs_session(provider: LogsTableProvider) -> datafusion::error::Result<Sessio
     let config = SqlConfig::default();
     let tenant = TenantMemoryAccountant::new(1 << 30);
     let (pool, _breach) = config.query_pool(tenant, QueryAccounting::new());
-    build_session(&config, pool, SessionTable::Logs(Arc::new(provider)), false, false)
+    build_session(
+        &config,
+        pool,
+        SessionTable::Logs(Arc::new(provider)),
+        false,
+        false,
+    )
 }
 
 fn provider_over(store: Arc<CountingStore>, snapshot: Snapshot) -> LogsTableProvider {
