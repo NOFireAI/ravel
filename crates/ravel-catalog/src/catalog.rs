@@ -5343,6 +5343,7 @@ mod tests {
                     }),
                     count: 1,
                 }],
+                sum: Some(1),
             }],
         }];
         let stats_bytes = crate::snapshot_format::encode_column_stats(
@@ -5465,6 +5466,7 @@ mod tests {
                     }),
                     count: 1,
                 }],
+                sum: Some(value),
             }],
         }];
         let stats_bytes = crate::snapshot_format::encode_column_stats(

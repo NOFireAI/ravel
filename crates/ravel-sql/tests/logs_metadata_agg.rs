@@ -116,6 +116,7 @@ fn i64_stat(
     let non_null_count: u64 = dict.iter().map(|(_, c)| c).sum();
     let min = dict.iter().map(|(v, _)| *v).min();
     let max = dict.iter().map(|(v, _)| *v).max();
+    let sum: i64 = dict.iter().map(|(v, c)| *v * (*c as i64)).sum();
     let dictionary = if dictionary_present {
         dict.iter()
             .map(|(v, c)| DictEntry {
@@ -135,6 +136,7 @@ fn i64_stat(
         max: max.map(i64_value),
         dictionary_present,
         dictionary,
+        sum: Some(sum),
     }
 }
 
@@ -168,6 +170,7 @@ fn str_stat(name: &str, dict: &[(&str, u64)]) -> ColumnStat {
                 count: *c,
             })
             .collect(),
+        sum: None,
     }
 }
 
@@ -185,6 +188,7 @@ fn i64_omitted_stat(name: &str, non_null_count: u64) -> ColumnStat {
         max: None,
         dictionary_present: false,
         dictionary: Vec::new(),
+        sum: None,
     }
 }
 

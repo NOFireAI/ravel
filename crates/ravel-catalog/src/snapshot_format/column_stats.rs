@@ -277,9 +277,28 @@ fn validate_column(column: &ColumnStat) -> Result<(), SnapshotFormatError> {
         });
     }
 
+    // #861: a `sum` is stored for I64 columns only. Any other declared type
+    // carrying one is internally inconsistent; reject before a reader can trust
+    // it.
+    if column.sum.is_some() && column.declared_type != 2 {
+        return Err(SnapshotFormatError::ColumnStatsSumOnNonInteger {
+            name: column.name.clone(),
+            declared_type: column.declared_type,
+        });
+    }
+
     if column.dictionary_present {
         let mut seen: HashSet<Vec<u8>> = HashSet::with_capacity(column.dictionary.len());
         let mut total: u64 = 0;
+        // Exact `Σ value * count` for an I64 column, in `i128` so it never
+        // overflows a valid record; `None` marks an accumulation that exceeded
+        // `i128`, which cannot equal the stored `i64` sum and so fails the
+        // cross-check below.
+        let mut dict_sum: Option<i128> = if column.declared_type == 2 {
+            Some(0)
+        } else {
+            None
+        };
         for entry in &column.dictionary {
             let value = entry.value.as_ref().ok_or_else(|| {
                 SnapshotFormatError::ColumnStatsDictEntryMissingValue {
@@ -293,6 +312,11 @@ fn validate_column(column: &ColumnStat) -> Result<(), SnapshotFormatError> {
                 });
             }
             total = total.saturating_add(entry.count);
+            if let (Some(acc), Some(Kind::I64(v))) = (dict_sum, value.kind.as_ref()) {
+                dict_sum = i128::from(*v)
+                    .checked_mul(i128::from(entry.count))
+                    .and_then(|term| acc.checked_add(term));
+            }
         }
         if total != column.non_null_count {
             return Err(SnapshotFormatError::ColumnStatsDictCountMismatch {
@@ -300,6 +324,20 @@ fn validate_column(column: &ColumnStat) -> Result<(), SnapshotFormatError> {
                 dict_total: total,
                 non_null_count: column.non_null_count,
             });
+        }
+        // A present dictionary AND a present sum must agree exactly: the
+        // dictionary is the ground truth the fold summed. `dict_sum == None`
+        // (an i128 overflow) can never equal an i64 sum, so it is reported as a
+        // mismatch, not silently accepted.
+        if let Some(sum) = column.sum {
+            let dict_total = dict_sum.unwrap_or(i128::MIN);
+            if dict_total != i128::from(sum) {
+                return Err(SnapshotFormatError::ColumnStatsSumMismatch {
+                    name: column.name.clone(),
+                    sum: i128::from(sum),
+                    dict_sum: dict_total,
+                });
+            }
         }
     } else if !column.dictionary.is_empty() {
         return Err(SnapshotFormatError::ColumnStatsDictPresentMismatch {
@@ -432,6 +470,7 @@ mod tests {
                 max: Some(i64_value(9)),
                 dictionary_present: true,
                 dictionary,
+                sum: Some(45), // 0 + 1 + ... + 9
             }],
         }
     }
@@ -593,6 +632,83 @@ mod tests {
                 entries: 10,
             }
         );
+    }
+
+    /// #861: a stored `sum` that disagrees with the dictionary the fold summed
+    /// is internally inconsistent, so a reader could derive a wrong SUM/AVG.
+    /// Reject it at encode/decode.
+    ///
+    /// Prove-the-test: dropping the `ColumnStatsSumMismatch` check in
+    /// `validate_column` lets this encode succeed and the assertion fails.
+    #[test]
+    fn sum_disagreeing_with_dictionary_rejected() {
+        let mut seg = segment(1, 0, 1);
+        // True dictionary sum is 45; claim 44.
+        seg.columns[0].sum = Some(44);
+        let err = encode_column_stats([0x11; 16], 3, vec![], &[seg]).expect_err("rejected");
+        assert_eq!(
+            err,
+            SnapshotFormatError::ColumnStatsSumMismatch {
+                name: "AdvEngineID".to_string(),
+                sum: 44,
+                dict_sum: 45,
+            }
+        );
+    }
+
+    /// #861: a sum is I64-only. A non-integer column carrying one is rejected.
+    ///
+    /// Prove-the-test: dropping the `ColumnStatsSumOnNonInteger` check lets a
+    /// Bool column keep a sum and the assertion fails.
+    #[test]
+    fn sum_on_non_integer_column_rejected() {
+        let mut seg = segment(1, 0, 1);
+        // Reshape the column into a consistent Bool column, then attach a sum.
+        seg.columns[0].declared_type = 3; // Bool
+        seg.columns[0].min = Some(ColumnValue {
+            kind: Some(Kind::B(false)),
+        });
+        seg.columns[0].max = Some(ColumnValue {
+            kind: Some(Kind::B(true)),
+        });
+        seg.columns[0].dictionary = vec![
+            DictEntry {
+                value: Some(ColumnValue {
+                    kind: Some(Kind::B(false)),
+                }),
+                count: 4,
+            },
+            DictEntry {
+                value: Some(ColumnValue {
+                    kind: Some(Kind::B(true)),
+                }),
+                count: 6,
+            },
+        ];
+        seg.columns[0].sum = Some(6);
+        let err = encode_column_stats([0x11; 16], 3, vec![], &[seg]).expect_err("rejected");
+        assert_eq!(
+            err,
+            SnapshotFormatError::ColumnStatsSumOnNonInteger {
+                name: "AdvEngineID".to_string(),
+                declared_type: 3,
+            }
+        );
+    }
+
+    /// A high-cardinality I64 column with its dictionary omitted still carries
+    /// an exact sum (the sum is stored independently of the dictionary), and
+    /// the codec round-trips it without a dictionary to cross-check against.
+    #[test]
+    fn sum_without_dictionary_round_trips() {
+        let mut seg = segment(1, 0, 1);
+        seg.columns[0].dictionary_present = false;
+        seg.columns[0].dictionary = vec![];
+        seg.columns[0].sum = Some(45);
+        let bytes = encode_column_stats([0x11; 16], 3, vec![vec![0x22; 32]], &[seg.clone()])
+            .expect("encodes");
+        let decoded = decode_column_stats(&bytes, &ColumnStatsLimits::default()).expect("decodes");
+        assert_eq!(decoded.segments[0].columns[0].sum, Some(45));
     }
 
     #[test]
