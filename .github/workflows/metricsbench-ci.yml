@@ -1,0 +1,123 @@
+name: metricsbench-ci
+
+# MetricsBench required CI lane (ADR-0927, issue #939, M7).
+#
+# This is the ONLY MetricsBench lane that gates a merge, and it gates on
+# DETERMINISTIC figures only: corpus validation, report-schema validation, and
+# the failure paths of both. It never gates on wall-clock latency.
+#
+# Why no latency gate here (ADR-0927 bands, ADR-0070 decision 3, and the
+# catalog_byte_gates.rs precedent): a latency threshold is advisory until its
+# variance has been measured on a pinned reference runner and the threshold
+# policy recorded. The GitHub-hosted runner this job uses is never quiet, so a
+# timing gate here would flake. Timings are REPORTED (by the scheduled MinIO and
+# real-S3 lanes, which upload the raw JSON), never gated. Bytes/counts/statuses
+# are exact and deterministic, so those are what this lane asserts, exactly as
+# crates/ravel-bench/tests/catalog_byte_gates.rs gates bytes and refuses to gate
+# time.
+#
+# What "correctness" means in this lane: the corpus construct-registry gate
+# (every corpus entry maps to a construct ravel-promql-difftest's REGISTRY
+# knows) and the classification/uniqueness/all-or-none checks in the artifacts
+# gate. Per-query RESULT correctness against the pinned Prometheus oracle is
+# owned by the existing `promql-difftest` job in ci.yml (ADR-0927 decision 4
+# reuses that oracle rather than building a second comparator); the MetricsBench
+# measurement-producing harness (ADR-0927 decision 1) that runs the corpus
+# through both engines and scores it is separate, still-unbuilt work. When it
+# lands, its oracle-scored correctness step attaches to this lane.
+#
+# ---------------------------------------------------------------------------
+# SEAM: ADR-0070 decision 3, Tier B (baseline regression compare) -- UNBUILT.
+#
+# ADR-0070 D3's Tier B (a criterion smoke compare against a committed baseline
+# under `bench/baselines/`) is specified and does NOT exist in this repo today:
+# there is no `bench/baselines/` directory and no baseline-diff job anywhere.
+# Verified on this ref. M7 deliberately does NOT build a rival comparator here.
+# When Tier B lands, a `baseline-diff` step belongs in THIS file, consuming the
+# JSON the MinIO/real-S3 lanes already upload and comparing against
+# `bench/baselines/`. Until then this comment is the named seam; do not add a
+# second comparison mechanism.
+# ---------------------------------------------------------------------------
+#
+# NOTE for the reviewer: this job is not yet a required status check. To make it
+# actually block merges, add its job name (`metricsbench-ci`) to main's
+# protect-main ruleset in a separate change, exactly as the flight-sql job note
+# in ci.yml describes. Until then it runs and reports but does not gate.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+
+# Cancel a superseded run for the same PR/merge-queue ref, but always let a
+# push to main finish (its history is built on). Mirrors ci.yml's policy.
+concurrency:
+  group: metricsbench-ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  metricsbench-ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: ./.github/actions/free-disk-space
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - name: Install sccache
+        id: sccache
+        continue-on-error: true
+        uses: ./.github/actions/setup-sccache
+      - name: Disable sccache if its install flaked
+        if: steps.sccache.outcome == 'failure'
+        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+      - name: Install nextest
+        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        with:
+          tool: nextest
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # Corpus validation: the five ordered gate_corpus checks (all-or-none
+      # classification, unique ids, non-empty construct list, non-blank
+      # modification reason, every construct known to the registry) plus the
+      # reachability proof that a corrupt artifact fails through the shipping
+      # metricsbench_gen binary, not only through a direct gate_corpus call.
+      - name: Corpus + workload validation gate
+        run: cargo nextest run --locked -p ravel-bench --cargo-profile ci --test metricsbench_artifacts
+
+      # Report-schema validation: the fail-closed contract, proven through the
+      # shipping metricsbench_report binary (a malformed artifact exits non-zero
+      # with the specific error before any table is rendered).
+      - name: Report-schema validation gate
+        run: cargo nextest run --locked -p ravel-bench --cargo-profile ci --test metricsbench_report
+
+      # Drive the shipping generator on the non-comparable `ci` profile end to
+      # end. metricsbench_gen checks every figure it prints against a
+      # pre-registered band and exits non-zero outside it, so a clean exit here
+      # means the work happened, not merely that the tool ran (ADR-0927 bands 1
+      # and 5; measurement-discipline "exit 0 means the tool ran").
+      - name: Generate the ci profile (deterministic, bounded)
+        run: |
+          cargo run --locked --profile ci -p ravel-bench --bin metricsbench_gen -- \
+            --profile ci --out "${RUNNER_TEMP}/ci-stream.bin"
+
+      # Failure path: the `ci` profile is marked non-comparable in the artifact
+      # (ADR-0927 decision 11), so a request to publish its figures must be
+      # refused. This asserts the publishability guard actually fires -- a run
+      # that let --require-comparable through on `ci` would be a lane that could
+      # mislabel a non-publishable figure as publishable. Exit code captured on
+      # the same line so the pipeline cannot mask it.
+      - name: The ci profile must refuse --require-comparable
+        run: |
+          code=0
+          cargo run --locked --profile ci -p ravel-bench --bin metricsbench_gen -- \
+            --profile ci --require-comparable || code=$?
+          if [ "${code}" -eq 0 ]; then
+            echo "::error::metricsbench_gen --profile ci --require-comparable exited 0; the non-comparable publishability guard (ADR-0927 D11) is not firing"
+            exit 1
+          fi
+          echo "::notice::ci profile correctly refused --require-comparable (exit ${code})"

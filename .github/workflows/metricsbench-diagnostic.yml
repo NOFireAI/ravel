@@ -1,0 +1,167 @@
+name: metricsbench-diagnostic
+
+# MetricsBench scheduled diagnostic lane against MinIO (ADR-0927, issue #939,
+# M7). NON-BLOCKING: it runs only on a schedule and on manual dispatch, never on
+# push/pull_request/merge_group, so it can never gate a merge.
+#
+# PUBLISHABILITY (ADR-0075 decision 3, ADR-0927 decision 10): MinIO removes
+# per-request fees entirely, which is exactly what makes a request-count defect
+# invisible. A MinIO run is VALID for correctness and conformance and NEVER a
+# basis for a performance or cost claim. This lane makes that structural rather
+# than a convention a later reader has to remember:
+#
+#   1. The provenance it stamps carries `backend_bills_requests: false`
+#      (store-backend minio, no --bills-requests flag). ADR-0927 decision 8/10:
+#      that field is the honest "these counts are real but free" marker, the
+#      distinction RequestCounts::backend_bills_requests already draws.
+#   2. It writes a PUBLISHABILITY.txt marker into the artifact bundle spelling
+#      out that the bundle is not a cost/performance basis.
+#   3. The uploaded artifact is named with a `non-publishable` suffix, so the
+#      name alone cannot be mistaken for a real-S3 result.
+#
+# SEAM: the MetricsBench measurement-producing harness (ADR-0927 decision 1) --
+# ingest the generated stream through Remote Write into a Ravel backed by this
+# MinIO, run the PromQL corpus through the Prometheus HTTP API, score each result
+# against the pinned-Prometheus oracle, and emit the reconciled report artifact
+# (report_schema) with per-phase object-store cost -- is separate, still-unbuilt
+# work. When it lands, its invocation attaches at the marked step below, writing
+# the report JSON that this lane already uploads and provenances. Until then this
+# lane validates the artifacts against the MinIO substrate, generates the
+# workload deterministically, and stamps the non-publishable provenance.
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "MetricsBench profile to generate (cardinality|history|churn|ci)"
+        required: false
+        default: "ci"
+      steps:
+        description: "Scrapes to generate (bounds the run on a hosted runner)"
+        required: false
+        default: "120"
+  schedule:
+    # Weekly, Tuesday 04:23 UTC. Off-peak and off the :00 mark; a diagnostic run
+    # needs no more than weekly currency and costs no external fees (MinIO runs
+    # in-runner), so it is deliberately infrequent.
+    - cron: "23 4 * * 2"
+
+concurrency:
+  group: metricsbench-diagnostic
+  cancel-in-progress: false
+
+jobs:
+  metricsbench-diagnostic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      MB_PROFILE: ${{ github.event.inputs.profile || 'ci' }}
+      MB_STEPS: ${{ github.event.inputs.steps || '120' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: ./.github/actions/free-disk-space
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - name: Install sccache
+        id: sccache
+        continue-on-error: true
+        uses: ./.github/actions/setup-sccache
+      - name: Disable sccache if its install flaked
+        if: steps.sccache.outcome == 'failure'
+        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # The store the measurement harness (seam below) will ingest into. Same
+      # docker-run/health-check shape as ci.yml's object-store-contract job.
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:latest server /data
+      - name: Wait for MinIO to be live
+        run: |
+          for _ in $(seq 1 30); do
+            if curl -fsS http://localhost:9000/minio/health/live; then
+              echo "MinIO is live"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "MinIO did not become healthy in time"
+          docker logs minio || true
+          exit 1
+      - name: Create the MetricsBench bucket
+        run: |
+          docker run --rm --network host --entrypoint sh minio/mc:latest -c "
+            mc alias set local http://localhost:9000 minioadmin minioadmin &&
+            mc mb -p local/ravel-metricsbench"
+
+      - name: Build the MetricsBench bins
+        run: cargo build --locked --profile ci -p ravel-bench --bin metricsbench_gen --bin metricsbench_report
+
+      - name: Prepare the artifact bundle
+        run: mkdir -p "${RUNNER_TEMP}/mb-artifacts"
+
+      # Generate the profile deterministically. Every figure is band-checked by
+      # the bin, so a clean exit means the generation happened. --steps bounds
+      # the run so a large profile stays inside a hosted runner's budget; a
+      # bounded run is not the full profile, which is why nothing here passes
+      # --require-comparable.
+      - name: Generate the workload
+        run: |
+          cargo run --locked --profile ci -p ravel-bench --bin metricsbench_gen -- \
+            --profile "${MB_PROFILE}" \
+            --steps "${MB_STEPS}" \
+            --out "${RUNNER_TEMP}/mb-artifacts/stream-${MB_PROFILE}.bin" \
+            > "${RUNNER_TEMP}/mb-artifacts/generation-${MB_PROFILE}.json"
+
+      # Stamp provenance that marks the bundle non-publishable: store-backend
+      # minio and NO --bills-requests, so backend_bills_requests is false.
+      - name: Stamp non-publishable (MinIO) provenance
+        run: |
+          cargo run --locked --profile ci -p ravel-bench --bin metricsbench_report -- \
+            provenance \
+            --workload benchmarks/metrics/workload.json \
+            --corpus benchmarks/metrics/metrics.corpus.json \
+            --store-backend minio \
+            --endpoint http://localhost:9000 \
+            > "${RUNNER_TEMP}/mb-artifacts/provenance-minio.json"
+
+      # ---------------------------------------------------------------------
+      # SEAM (ADR-0927 decision 1): the measurement harness runs HERE when it
+      # lands -- ingest stream-*.bin over Remote Write 1.0 into a Ravel on this
+      # MinIO, run the corpus via the Prometheus HTTP API, score against the
+      # pinned-Prometheus oracle, and write the reconciled report JSON (with
+      # per-phase object-store cost) into ${RUNNER_TEMP}/mb-artifacts/. This lane
+      # already uploads and provenances whatever lands there.
+      # ---------------------------------------------------------------------
+
+      - name: Write the non-publishable marker
+        run: |
+          cat > "${RUNNER_TEMP}/mb-artifacts/PUBLISHABILITY.txt" <<'EOF'
+          NON-PUBLISHABLE
+
+          These artifacts were produced against MinIO. MinIO removes per-request
+          fees entirely, which is exactly what makes a request-count defect
+          invisible (ADR-0075 decision 3, ADR-0927 decision 10). They are VALID
+          for correctness and conformance and are NEVER a basis for a performance
+          or cost claim. The stamped provenance carries backend_bills_requests:
+          false for the same reason. Only the real-S3 lane
+          (metricsbench-s3.yml) produces publishable Ravel performance and cost
+          numbers.
+          EOF
+
+      - name: Upload the non-publishable diagnostic bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: metricsbench-minio-non-publishable
+          path: ${{ runner.temp }}/mb-artifacts
+          retention-days: 30
+
+      - name: Stop MinIO
+        if: always()
+        run: docker rm -f minio || true

@@ -1,0 +1,164 @@
+name: metricsbench-s3
+
+# MetricsBench real-S3 lane (ADR-0927, issue #939, M7). This is the ONLY
+# MetricsBench lane whose output may be a publishable performance or cost
+# measurement (ADR-0075 decision 3, ADR-0927 decision 10): real S3 bills per
+# request, so a request-count defect that MinIO hides is billable and visible
+# here.
+#
+# NOT a required check and NOT gated on any PR: it costs real money per run and
+# depends on an external service. It runs only on manual dispatch and on a
+# schedule -- never on push/pull_request/merge_group -- so it can never block a
+# merge. Same trigger and credential-guard shape as bench-s3.yml.
+#
+# PUBLISHABILITY: the provenance stamped here carries store-backend s3 and
+# --bills-requests (backend_bills_requests: true), the honest "these counts are
+# billable" marker (ADR-0927 decision 8). A PUBLISHABILITY.txt marker records
+# that this bundle is the only publishable MetricsBench substrate. Even so,
+# ADR-0927's bands require five behaviour-identical passes on a pinned reference
+# runner before any performance CONCLUSION is drawn: a single run here is a
+# measurement, not yet a published number.
+#
+# SEAM: the MetricsBench measurement-producing harness (ADR-0927 decision 1) is
+# separate, still-unbuilt work; when it lands its invocation attaches at the
+# marked step below and writes the reconciled report JSON this lane uploads. See
+# metricsbench-diagnostic.yml's seam comment for the full description. This lane
+# is NOT a rival to bench-s3.yml's older `bench_report` run; it is the
+# MetricsBench (ADR-0927) contract's real-S3 lane.
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "MetricsBench profile to generate (cardinality|history|churn|ci)"
+        required: false
+        default: "cardinality"
+      steps:
+        description: "Scrapes to generate (bounds the run)"
+        required: false
+        default: "360"
+  schedule:
+    # Weekly, Monday 04:41 UTC. Off-peak and off the :00 mark, and offset from
+    # bench-s3.yml's 04:17 so the two paid S3 lanes do not start together.
+    - cron: "41 4 * * 1"
+
+concurrency:
+  group: metricsbench-s3
+  cancel-in-progress: false
+
+jobs:
+  metricsbench-s3:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      MB_PROFILE: ${{ github.event.inputs.profile || 'cardinality' }}
+      MB_STEPS: ${{ github.event.inputs.steps || '360' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # Credential guard: the org-level secret is mapped into an env var and
+      # checked for non-emptiness. On a fork or an unconfigured org the secret is
+      # empty, have_creds is false, and every real step below is skipped, so the
+      # job ends green rather than failing. Mirrors bench-s3.yml.
+      - name: Check for S3 credentials
+        id: creds
+        env:
+          RAVEL_S3_ACCESS_KEY_ID: ${{ secrets.RAVEL_S3_ACCESS_KEY_ID }}
+        run: |
+          if [ -n "${RAVEL_S3_ACCESS_KEY_ID}" ]; then
+            echo "have_creds=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::S3 credentials present, running the real-S3 MetricsBench lane"
+          else
+            echo "have_creds=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::S3 credentials absent (fork PR or unconfigured org), skipping the real-S3 MetricsBench lane cleanly"
+          fi
+      - name: Free disk space
+        if: steps.creds.outputs.have_creds == 'true'
+        uses: ./.github/actions/free-disk-space
+      - name: Install toolchain from rust-toolchain.toml
+        if: steps.creds.outputs.have_creds == 'true'
+        run: rustup show
+      - name: Install sccache
+        id: sccache
+        if: steps.creds.outputs.have_creds == 'true'
+        continue-on-error: true
+        uses: ./.github/actions/setup-sccache
+      - name: Disable sccache if its install flaked
+        if: steps.creds.outputs.have_creds == 'true' && steps.sccache.outcome == 'failure'
+        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: steps.creds.outputs.have_creds == 'true'
+
+      - name: Build the MetricsBench bins
+        if: steps.creds.outputs.have_creds == 'true'
+        run: cargo build --locked --profile ci -p ravel-bench --bin metricsbench_gen --bin metricsbench_report
+
+      - name: Prepare the artifact bundle
+        if: steps.creds.outputs.have_creds == 'true'
+        run: mkdir -p "${RUNNER_TEMP}/mb-artifacts"
+
+      - name: Generate the workload
+        if: steps.creds.outputs.have_creds == 'true'
+        run: |
+          cargo run --locked --profile ci -p ravel-bench --bin metricsbench_gen -- \
+            --profile "${MB_PROFILE}" \
+            --steps "${MB_STEPS}" \
+            --out "${RUNNER_TEMP}/mb-artifacts/stream-${MB_PROFILE}.bin" \
+            > "${RUNNER_TEMP}/mb-artifacts/generation-${MB_PROFILE}.json"
+
+      # Stamp publishable provenance: store-backend s3 and --bills-requests, so
+      # backend_bills_requests is true (ADR-0927 decision 8/10).
+      - name: Stamp publishable (real-S3) provenance
+        if: steps.creds.outputs.have_creds == 'true'
+        env:
+          RAVEL_S3_REGION: ${{ vars.RAVEL_S3_REGION }}
+        run: |
+          cargo run --locked --profile ci -p ravel-bench --bin metricsbench_report -- \
+            provenance \
+            --workload benchmarks/metrics/workload.json \
+            --corpus benchmarks/metrics/metrics.corpus.json \
+            --store-backend s3 \
+            --region "${RAVEL_S3_REGION:-n/a}" \
+            --bills-requests \
+            > "${RUNNER_TEMP}/mb-artifacts/provenance-s3.json"
+
+      # ---------------------------------------------------------------------
+      # SEAM (ADR-0927 decision 1): the measurement harness runs HERE when it
+      # lands -- ingest stream-*.bin over Remote Write 1.0 into a Ravel on real
+      # S3, run the corpus via the Prometheus HTTP API, score against the
+      # pinned-Prometheus oracle, and write the reconciled report JSON (with
+      # per-phase, per-query billable object-store cost) into
+      # ${RUNNER_TEMP}/mb-artifacts/. The RAVEL_S3_* env used by the harness are
+      # the same ones bench-s3.yml passes (crates/ravel-bench/src/harness.rs).
+      # ---------------------------------------------------------------------
+
+      - name: Write the publishable marker
+        if: steps.creds.outputs.have_creds == 'true'
+        run: |
+          cat > "${RUNNER_TEMP}/mb-artifacts/PUBLISHABILITY.txt" <<'EOF'
+          PUBLISHABLE (real S3)
+
+          These artifacts were produced against real S3, which bills per request,
+          so a request-count defect is visible here (ADR-0075 decision 3,
+          ADR-0927 decision 10). This is the only MetricsBench substrate whose
+          figures may be published. The stamped provenance carries
+          backend_bills_requests: true.
+
+          Caveat (ADR-0927 decision 8): request counts are logical-call counts,
+          not billed-request counts; object_store retries below InstrumentedStore
+          and the real bill exceeds the counted number under throttling.
+
+          A single run is a measurement, not a published number: ADR-0927's bands
+          require at least five behaviour-identical passes on a pinned reference
+          runner, with the pre-registered variance calculation, before any
+          performance conclusion is drawn.
+          EOF
+
+      - name: Upload the publishable real-S3 bundle
+        if: steps.creds.outputs.have_creds == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: metricsbench-s3-report
+          path: ${{ runner.temp }}/mb-artifacts
+          retention-days: 90
