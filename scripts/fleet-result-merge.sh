@@ -219,6 +219,78 @@ fleet_rewrite_history() {
   git rev-parse HEAD
 }
 
+# True if <sha>'s subject is an autosquash directive (`fixup!`, `squash!`, or
+# `amend!`), i.e. content git rebase --autosquash must fold into a named
+# target commit rather than land on its own.
+is_autosquash_commit() {
+  local subject
+  subject="$(git log -1 --format=%s "$1")"
+  [[ "${subject}" == "fixup! "* || "${subject}" == "squash! "* \
+     || "${subject}" == "amend! "* ]]
+}
+
+# Fold every `fixup!`/`squash!`/`amend!` commit in <base>..<result-sha> into
+# the commit it names, using git's own autosquash matching, and print the
+# resulting sha. Progress goes to stderr so the sha is the only thing on
+# stdout. Leaves HEAD on <fold-branch>.
+#
+# Unlike a wip: or a whitespace-only fmt commit, an autosquash commit carries
+# real content that belongs in the commit it names; dropping it loses work and
+# keeping it standalone lands that content under a meaningless `fixup!` subject
+# (exactly what reached main in #929). git rebase --autosquash reorders each
+# directive next to its target and squashes it in, identifying the target from
+# the subject text after the marker.
+#
+# A directive whose target is NOT on the branch is an orphan: autosquash leaves
+# it in place with its `fixup!`/`squash!` subject intact. This function detects
+# any such survivor and FAILS (return 3), naming it, rather than letting its
+# content land under that subject. A directive that git cannot fold because the
+# reorder conflicts with an intervening commit stops the rebase; that is
+# reported as a distinct failure (return 1) rather than resolved silently.
+fold_fixup_commits() {
+  local base="$1" result_sha="$2" fold_branch="$3"
+  local sha subj rc=0
+  {
+    git checkout -q -B "${fold_branch}" "${result_sha}"
+    # GIT_SEQUENCE_EDITOR=: accepts the autosquash-arranged todo list as-is;
+    # GIT_EDITOR=: accepts the default combined message a squash!/amend! yields.
+    GIT_SEQUENCE_EDITOR=: GIT_EDITOR=: \
+      git rebase -i --autosquash "${base}" || rc=$?
+    if [[ ${rc} -ne 0 ]]; then
+      git rebase --abort 2>/dev/null || true
+    fi
+  } >&2
+  if [[ ${rc} -ne 0 ]]; then
+    echo "fold_fixup_commits: autosquash rebase failed (rc=${rc}); a fixup" >&2
+    echo "  reorder likely conflicts with an intervening commit. Resolve the" >&2
+    echo "  fold on the result branch and re-run." >&2
+    return 1
+  fi
+
+  # Any autosquash directive still present after the rebase found no target:
+  # its content is now a standalone commit under a `fixup!`/`squash!` subject.
+  local -a orphans=()
+  while IFS= read -r sha; do
+    [[ -z "${sha}" ]] && continue
+    if is_autosquash_commit "${sha}"; then
+      subj="$(git log -1 --format=%s "${sha}")"
+      orphans+=("${sha:0:12} ${subj}")
+    fi
+  done < <(git rev-list --reverse "${base}..${fold_branch}")
+  if [[ ${#orphans[@]} -gt 0 ]]; then
+    {
+      echo "fold_fixup_commits: fixup!/squash! commit(s) name no commit on this branch:"
+      printf '  %s\n' "${orphans[@]}"
+      echo "  Autosquash could not fold them, so their content would land under a"
+      echo "  meaningless 'fixup!'/'squash!' subject. Rebase each onto its intended"
+      echo "  target (or drop it) on the result branch and re-run."
+    } >&2
+    return 3
+  fi
+
+  git rev-parse HEAD
+}
+
 # Sourced rather than executed: stop here, with the helpers above defined and
 # nothing run. Everything below this line performs a merge.
 if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
@@ -252,6 +324,7 @@ dry_run="${FLEET_MERGE_DRY_RUN:-0}"
 # restores the ref the script started on, and drops the temp rewrite branch.
 start_checkout=""
 rewrite_branch=""
+fold_branch=""
 _cleaned=0
 cleanup() {
   [[ ${_cleaned} -eq 1 ]] && return
@@ -265,6 +338,7 @@ cleanup() {
   if [[ -n "${gp}" && -f "${gp}" ]]; then git cherry-pick --abort 2>/dev/null || true; fi
   if [[ -n "${start_checkout}" ]]; then git checkout -q "${start_checkout}" 2>/dev/null || true; fi
   if [[ -n "${rewrite_branch}" ]]; then git branch -D "${rewrite_branch}" 2>/dev/null || true; fi
+  if [[ -n "${fold_branch}" ]]; then git branch -D "${fold_branch}" 2>/dev/null || true; fi
 }
 trap cleanup EXIT
 trap cleanup ERR
@@ -315,6 +389,35 @@ if [[ -n "$(git rev-list --merges "${base}..${result_sha}")" ]]; then
   exit 65
 fi
 
+# --- Fold fixup!/squash! commits into their targets ----------------------
+# Autosquash directives carry real content that belongs in a named commit, so
+# (unlike a wip:/fmt commit) they are folded IN, not dropped. This runs before
+# the wip/fmt and authorship rewrites. Ordering is deliberate: the authorship
+# rewrite must be the LAST pass over the range, because assert-clean-authorship
+# validates the exact history that gets pushed. Autosquash reorders commits;
+# running it AFTER the authorship rewrite would re-author only the pre-reorder
+# set and let a reordered fold escape the rewrite. So fold first, then rewrite
+# authorship over the folded result. The fold FAILS LOUDLY on an orphan
+# directive rather than letting its content land under a `fixup!` subject.
+work_ref="${result_sha}"
+need_fold=0
+while IFS= read -r c; do
+  if is_autosquash_commit "${c}"; then
+    need_fold=1
+  fi
+done < <(git rev-list --reverse "${base}..${result_sha}")
+
+if [[ ${need_fold} -eq 1 ]]; then
+  echo "==> Folding fixup!/squash! commits into their targets"
+  fold_branch="_fleet_fold_${task_id//\//_}"
+  if ! work_ref="$(fold_fixup_commits "${base}" "${result_sha}" "${fold_branch}")"; then
+    echo "fleet-result-merge.sh: could not fold fixup!/squash! commits (see above)." >&2
+    exit 65
+  fi
+  git checkout -q "${start_checkout}"
+fi
+# --- end fixup fold ------------------------------------------------------
+
 # --- Squash wip:/formatting-fixup commits out of the result branch -------
 # The detection heuristic and the fold rules are documented on
 # is_flagged_commit and fleet_rewrite_history at the top of this file.
@@ -323,14 +426,14 @@ while IFS= read -r c; do
   if is_flagged_commit "${c}"; then
     need_rewrite=1
   fi
-done < <(git rev-list --reverse "${base}..${result_sha}")
+done < <(git rev-list --reverse "${base}..${work_ref}")
 
-clean_ref="${result_sha}"
+clean_ref="${work_ref}"
 
 if [[ ${need_rewrite} -eq 1 ]]; then
   echo "==> Squashing wip:/formatting-fixup commits out of the result branch"
   rewrite_branch="_fleet_rewrite_${task_id//\//_}"
-  clean_ref="$(fleet_rewrite_history "${base}" "${result_sha}" "${rewrite_branch}" "${task_id}")"
+  clean_ref="$(fleet_rewrite_history "${base}" "${work_ref}" "${rewrite_branch}" "${task_id}")"
   git checkout -q "${start_checkout}"
 fi
 # --- end squash step -----------------------------------------------------
@@ -382,6 +485,12 @@ git checkout -q "${start_checkout}"
 # have been re-authored onto the authorship branch.
 if [[ -n "${prev_rewrite_branch}" && "${prev_rewrite_branch}" != "${authorship_branch}" ]]; then
   git branch -D "${prev_rewrite_branch}" 2>/dev/null || true
+fi
+# The fixup-fold temp branch's commits have likewise been re-authored onto the
+# authorship branch; drop it too.
+if [[ -n "${fold_branch}" ]]; then
+  git branch -D "${fold_branch}" 2>/dev/null || true
+  fold_branch=""
 fi
 
 # Prove the rewrite worked before anything is pushed: a fleet-executor
