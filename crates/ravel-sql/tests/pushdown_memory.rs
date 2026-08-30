@@ -820,6 +820,7 @@ async fn byte_budget_exceeded_returns_typed_error() {
         // ADR-0774's rewrite is a `SqlConfig` field now; keep this
         // fixture's plan shape as it was by not installing the rule.
         late_materialization_extra_columns: None,
+        spill: None,
     };
     let tenant = TenantMemoryAccountant::new(1 << 30);
     let task_ctx = task_ctx_with_pool(&config, Arc::clone(&tenant));
@@ -910,6 +911,7 @@ async fn high_cardinality_trips_query_pool_before_tenant() {
         // ADR-0774's rewrite is a `SqlConfig` field now; keep this
         // fixture's plan shape as it was by not installing the rule.
         late_materialization_extra_columns: None,
+        spill: None,
     };
     let tenant = TenantMemoryAccountant::new(1 << 30);
     let task_ctx = task_ctx_with_pool(&config, Arc::clone(&tenant));
@@ -968,6 +970,7 @@ async fn tenant_budget_trips_and_rolls_back_the_query_reservation() {
         // ADR-0774's rewrite is a `SqlConfig` field now; keep this
         // fixture's plan shape as it was by not installing the rule.
         late_materialization_extra_columns: None,
+        spill: None,
     };
     let tenant = TenantMemoryAccountant::new(8);
     let (pool, _breach) = config.query_pool(Arc::clone(&tenant), QueryAccounting::new());
@@ -1028,6 +1031,7 @@ async fn query_budget_reported_first_when_both_ceilings_are_equally_reachable() 
         // ADR-0774's rewrite is a `SqlConfig` field now; keep this
         // fixture's plan shape as it was by not installing the rule.
         late_materialization_extra_columns: None,
+        spill: None,
     };
     let tenant = TenantMemoryAccountant::new(8);
     let task_ctx = task_ctx_with_pool(&config, Arc::clone(&tenant));

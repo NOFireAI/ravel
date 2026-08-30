@@ -66,6 +66,7 @@ async fn a_join_that_overruns_the_query_ceiling_aborts_and_frees_the_tenant_budg
         // ADR-0774's rewrite is a `SqlConfig` field now; keep this
         // fixture's plan shape as it was by not installing the rule.
         late_materialization_extra_columns: None,
+        spill: None,
     };
     let fixture = Fixture::build(
         Arc::new(MemoryStore::new()),

@@ -294,6 +294,12 @@ pub fn build_sql_state(
         // is an in-process escape hatch and the regression fixture's red side,
         // not a server-level knob.
         late_materialization_extra_columns: SqlConfig::default().late_materialization_extra_columns,
+        // ADR-0954: bounded ephemeral spill. Left at the default (`None`, spill
+        // off) with no server-level flag or env plumbing yet: this line only
+        // keeps the exhaustive literal compiling now that `SqlConfig` carries
+        // the field. Wiring `--sql-spill-dir` / `RAVEL_SQL_SPILL_*` into the
+        // server is the follow-up (issue #954), not this change.
+        spill: SqlConfig::default().spill,
     };
     let max_deadline = config.engine.deadline;
     let mut metrics_fetcher = SegmentFetcher::new(store.clone());

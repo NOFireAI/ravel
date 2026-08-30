@@ -167,7 +167,7 @@ async fn publish_logs(store: &dyn ObjectStoreBackend, tenant: &TenantId) {
     for ts in 0..GROUPS {
         writer
             .push(LogRecord {
-                stream_id: stream_id.clone(),
+                stream_id,
                 stream_attrs: stream_attrs.clone(),
                 ts_ns: ts,
                 observed_ts_ns: ts,

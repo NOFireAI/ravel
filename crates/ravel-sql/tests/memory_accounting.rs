@@ -271,6 +271,7 @@ async fn a_query_that_outgrows_its_pool_still_releases_tenant_bytes() {
         // ADR-0774's rewrite is a `SqlConfig` field now; keep this
         // fixture's plan shape as it was by not installing the rule.
         late_materialization_extra_columns: None,
+        spill: None,
     };
     let accountant = TenantMemoryAccountant::new(1 << 30);
     let (pool, _breach) = config.query_pool(Arc::clone(&accountant), QueryAccounting::new());
@@ -280,7 +281,7 @@ async fn a_query_that_outgrows_its_pool_still_releases_tenant_bytes() {
         snapshot,
         tenant.hash(),
         SegmentFetcher::new(Arc::clone(&fixture.store)),
-        config,
+        config.clone(),
         QueryAccounting::new(),
     ));
     let ctx = build_session(
