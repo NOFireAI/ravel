@@ -883,10 +883,10 @@ covered more cheaply.
 This is a fact about ClickBench, not a defect in the design. The corpus is
 adversarial for pre-aggregation by construction: near-unique synthetic ids
 in the grouping sets, exact distinct over ten million users, and three
-statements that are not aggregates. The workload-declared materialisations
-exist for is the opposite shape: a tenant's dashboards, with bounded
-grouping sets over service, route and status, re-evaluated on a schedule.
-It is not represented in this corpus at all.
+statements that are not aggregates. The workload that declared
+materialisations exist for is the opposite shape: a tenant's dashboards,
+with bounded grouping sets over service, route and status, re-evaluated
+on a schedule. It is not represented in this corpus at all.
 
 The honest framing for the epic: this design is accepted on its merits for
 Ravel's real query mix, and the ClickBench Class-F residue is largely
