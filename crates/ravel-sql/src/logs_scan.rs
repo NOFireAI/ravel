@@ -2242,6 +2242,28 @@ impl PartitionCtx {
         self.fetcher
             .ranged_projection_pays(seg.object_size, self.projected_fraction)
     }
+
+    /// Record one whole-segment fast-path open on the route
+    /// [`open_by_column_chunk`](Self::open_by_column_chunk) just chose, on this
+    /// query's accounting handle (ADR-0904 decision 5).
+    ///
+    /// The plan metrics carry the same split per partition
+    /// ([`BlockMetrics::record_fast_path_route`]), but only for a statement whose
+    /// `EXPLAIN ANALYZE` output someone reads. The accounting handle is the
+    /// per-query figure a caller can assert on, which is what makes the
+    /// request-cost knob's effect on the route provable rather than inferred
+    /// from the configured value.
+    ///
+    /// Called once per segment, beside the metric and under the same rule: an
+    /// `attrs_raw` fallback re-opens the same segment the same way and does not
+    /// re-count, so the two counters sum to the fast-path segment count.
+    fn record_open_shape(&self, by_column_chunk: bool) {
+        if by_column_chunk {
+            self.accounting.add_logs_ranged_opens(1);
+        } else {
+            self.accounting.add_logs_whole_object_opens(1);
+        }
+    }
 }
 
 /// Refuse a segment whose declared RLOG format version this build cannot read,
@@ -2806,6 +2828,7 @@ impl Stream for LogScanStream {
                         this.state = if this.fast_whole_segment {
                             let by_chunk = this.ctx.open_by_column_chunk(&seg);
                             this.blocks.record_fast_path_route(by_chunk);
+                            this.ctx.record_open_shape(by_chunk);
                             LogScanState::Opening(open_segment_fast(
                                 Arc::clone(&this.ctx),
                                 seg,
@@ -2973,8 +2996,9 @@ impl Stream for LogScanStream {
                             };
                             // Re-opened through the same routing decision the
                             // first open took (#862), and deliberately not
-                            // re-counted: the route metric counts segments, not
-                            // opens.
+                            // re-counted: the route metric and the accounting
+                            // handle's opens-by-shape counters both tally
+                            // segments, not opens.
                             let fut = if this.fast_whole_segment {
                                 let by_chunk = this.ctx.open_by_column_chunk(&seg);
                                 open_segment_fast(Arc::clone(&this.ctx), seg, by_chunk)
