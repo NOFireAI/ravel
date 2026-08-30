@@ -1,6 +1,6 @@
 # ADR-0913: declared exact materialisations for aggregate answering
 
-Status: Proposed. Issue #913, task T5 of the epic. Builds on ADR-0849
+Status: Accepted (2026-08-30). Issue #913, task T5 of the epic. Builds on ADR-0849
 (snapshot-bound index plane), ADR-0850 (logs typed column statistics),
 ADR-0090/ADR-0101 (declared typed columns), and ADR-0044 (per-query cost
 accounting). The exactness rules lean on ADR-0022/ADR-0023/ADR-0024/ADR-0825.
@@ -822,5 +822,76 @@ the repo's pre-registration discipline when the build lands.
   writer should refuse the column retirement or cascade it; which, is an
   implementation-ticket decision, and the fail-closed hash makes either
   choice safe.
+
+## 10. The covered set on the reference corpus
+
+Epic #913's T5 acceptance requires naming which Class-F statements this
+design covers. Enumerated here against the §5 rule, over the 27 Class-F
+entries in `benchmarks/clickbench/hits.corpus.json`. The answer is small,
+and saying so is the point: an ADR that designs a mechanism without
+stating what it buys on the corpus it is measured against cannot be held
+to anything.
+
+### Covered (6, of which 3 are already answered by layer 1)
+
+| statement | shape | note |
+|---|---|---|
+| `q03_sum_count_avg` | scalar `SUM(i64)`, `COUNT(*)`, `AVG(i64)` | certain |
+| `q04_avg_userid` | scalar `AVG(i64)` | certain |
+| `q30_resolution_running_sums` | 90 x `SUM(col + k)` | certain, via the §4b algebraic rewrite |
+| `q13_top_search_phrases` | `GROUP BY SearchPhrase` + `COUNT(*)` | budget-borderline, ~10^6 groups |
+| `q15_engine_phrase_counts` | `GROUP BY SearchEngineID, SearchPhrase` + `COUNT(*)` | budget-borderline |
+| `q31_engine_ip_aggregates` | `GROUP BY SearchEngineID, ClientIP` + compact monoids | budget-borderline |
+
+**q03, q04 and q30 are answerable from ADR-0850 column statistics
+(issue #861) without any materialisation.** The marginal contribution of
+this design on this corpus is therefore q13, q15 and q31, all three
+subject to the §6 budget check against measured group cardinality. The
+three borderline entries are predictions from estimated NDV, not
+measurements; T7's pass settles them.
+
+### Excluded by shape (7) — certain, no measurement needed
+
+- `q25`, `q26`, `q27`: **no aggregate at all.** `SELECT "SearchPhrase" ...
+  ORDER BY ts LIMIT 10` is top-N row retrieval. There is nothing to
+  pre-aggregate, and no materialisation of any design answers them.
+- `q28`, `q29`: novel expressions — `AVG(length("URL"))`,
+  `regexp_replace("Referer", ...)`. Not declared columns, so no canonical
+  definition exists to hash.
+- `q36`: arithmetic in the grouping set, `GROUP BY "ClientIP",
+  "ClientIP" - 1, "ClientIP" - 2, "ClientIP" - 3`.
+- `q19`: `date_part('minute', ts)` used as a grouping dimension rather
+  than a declared time grain.
+
+### Excluded by the §6 budget (14)
+
+- High-NDV exact distinct, the expected §4c fallback: `q05`, `q06`,
+  `q09`, `q10`, `q11`, `q12`, `q14`. `COUNT(DISTINCT "UserID")` alone is
+  ~10^7 distinct 8-byte values, over 64 MiB as canonical values before
+  any grouping.
+- High-cardinality grouping sets: `q16`, `q17`, `q18` (`GROUP BY
+  "UserID"[, "SearchPhrase"]`), `q32`, `q33` (`GROUP BY "WatchID",
+  "ClientIP"`, ~10^8 groups), `q34`, `q35` (`GROUP BY "URL"`).
+
+### What this means for the epic's claim
+
+**T5 and T6 do not close the ClickBench hot-total gap**, and the epic
+should not imply they might. Twenty-one of twenty-seven Class-F statements
+are excluded by shape or budget, and three of the six covered are already
+covered more cheaply.
+
+This is a fact about ClickBench, not a defect in the design. The corpus is
+adversarial for pre-aggregation by construction: near-unique synthetic ids
+in the grouping sets, exact distinct over ten million users, and three
+statements that are not aggregates. The workload declared materialisations
+exist for — a tenant's dashboards, with bounded grouping sets over
+service, route and status, re-evaluated on a schedule — is the opposite
+shape, and is not represented in this corpus at all.
+
+The honest framing for the epic: this design is accepted on its merits for
+Ravel's real query mix, and the ClickBench Class-F residue is largely
+**not** the thing it addresses. Closing that residue is
+projection-proportional scanning (decision 5's accepted floor) plus
+ADR-0849's pruning, not pre-aggregation.
 
 Refs: #913, #849, #850
