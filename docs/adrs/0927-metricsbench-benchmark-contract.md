@@ -91,8 +91,20 @@ histogram-aware comparator, and per-entry float tolerance for the ADR-0025
 residue. MetricsBench consumes it rather than growing a second comparator.
 
 A query is timed for competitive reporting **only after** its result passes
-correctness. Incorrect, partial, timed-out and unsupported responses stay
-visible in the report and stay in the denominator.
+correctness, and this applies to **every participating engine, not only
+Ravel**. VictoriaMetrics and the object-storage-native system are compared
+against the same reference answer on the same terms; an engine whose result
+diverges is reported `incorrect` and is not timed, exactly as Ravel would be.
+Timing an unverified competitor result while gating our own would flatter them,
+and timing ours while gating theirs would flatter us. Neither is a measurement.
+
+Prometheus is the source of the reference answer and is therefore not compared
+against itself. Its own results are timed on the same rule, with correctness
+trivially satisfied; the report says so rather than leaving Prometheus'
+correctness column blank.
+
+Incorrect, partial, timed-out and unsupported responses stay visible in the
+report and stay in the corpus denominator.
 
 ### 5. The corpus follows the ClickBench corpus contract exactly
 
@@ -117,21 +129,67 @@ This is the decision most likely to be got wrong later, so it is stated
 explicitly. A query can fail to produce a comparable number for three
 different reasons, and they are three different report categories:
 
-| category | meaning | example |
-|---|---|---|
-| `unsupported_construct` | Ravel does not implement it | `histogram_stddev`; binary operators over native histograms (#524); instant matrix selector over histograms (#643) |
-| `budget_refused` | Ravel implements it and declines to spend | subquery point caps (ADR-0030); `TooManySegments`; `RequestBudgetExceeded`; per-selector series and sample ceilings |
-| `incorrect` | Ravel answered and the oracle disagrees | any differential mismatch |
+Every outcome has exactly one status, and each status states its membership in
+three separate denominators. "The denominator" alone is ambiguous and must not
+appear in a report:
+
+- **corpus**: the query is in the corpus for this profile. Every status below
+  is in it. This is the denominator a coverage claim divides by.
+- **correctness**: the result was comparable to the oracle's, whether or not it
+  matched.
+- **timing**: the latency figure is admissible in a performance table.
+
+| status | meaning | corpus | correctness | timing |
+|---|---|---|---|---|
+| `ok` | answered, oracle agrees | yes | yes | **yes** |
+| `incorrect` | answered, oracle disagrees | yes | yes | no |
+| `partial` | answered from an incomplete result set (a system returned data plus a partial/warning signal, or Ravel refused partial coverage without `allow_partial`) | yes | yes | no |
+| `timeout` | no answer within the per-query deadline | yes | no | no |
+| `error` | transport or server error that is not one of the above | yes | no | no |
+| `unsupported_construct` | the engine does not implement it | yes | no | no |
+| `budget_refused` | the engine implements it and declines to spend | yes | no | no |
+
+Only `ok` is timed. Everything else is reported with its status and stays in
+the corpus denominator, so a coverage or success rate is always over the whole
+corpus and a system cannot improve its score by failing.
+
+`partial` and `timeout` are separate statuses rather than folded into `error`
+because they mean different things about the engine: a partial result is a
+completeness decision, a timeout is a cost outcome, and an error is neither.
+
+**The statuses are per engine, not per query.** The same query may be `ok` on
+Prometheus and `budget_refused` on Ravel. A cross-engine table shows the status
+alongside each engine's figure, never a single row status.
 
 Prometheus and VictoriaMetrics return data for several shapes Ravel refuses on
-budget. Reporting those as `unsupported` would misattribute a deliberate
-ceiling as a capability gap. Reporting them as successes would be worse.
+budget. Reporting those as `unsupported_construct` would misattribute a
+deliberate ceiling as a capability gap. Reporting them as successes would be
+worse.
 
 **Recording rules are out of scope for v1.** Ravel has no recording-rule
 concept. `ravel-alerting` models alerting rules with a threshold condition,
 not Prometheus `record:` semantics, and there is no `/api/v1/rules`. The epic
 lists them; this ADR removes them from v1 and names the gap rather than
 carrying an acceptance criterion nothing can satisfy.
+
+**Alert expressions are in scope only as PromQL, not as rule semantics**, and
+the boundary is worth stating because "representative alert expressions" in the
+epic could otherwise be read as the whole rule surface. What is in v1: the
+PromQL *expression* an alert would evaluate, run as an ordinary instant query
+and classified by the table above like any other. What is out, with no
+counterpart in Ravel to measure:
+
+- `for:` duration and the pending-to-firing state machine;
+- alert `labels:`/`annotations:` templating;
+- `keep_firing_for:`;
+- rule-group evaluation order, interval and staleness between groups;
+- `ALERTS` / `ALERTS_FOR_STATE` synthetic series;
+- `/api/v1/rules` and `/api/v1/alerts`, which do not exist.
+
+A corpus entry that needs any of those is not written, rather than written and
+reported `unsupported_construct`: the category means the engine cannot evaluate
+a query it was given, and these are not queries. The gap is recorded here so it
+is visible without a corpus entry standing in for it.
 
 ### 7. The diagnostic lane exposes what is already measured
 
@@ -211,9 +269,34 @@ whether Ravel is fast.
 2. Correctness must be 100% of the *comparable* set. Any query whose result
    diverges from the oracle moves to `incorrect` and out of the timing
    denominator, and the run reports how many did.
-3. Two behaviour-identical passes must agree within the observed variance
-   band, and that band is recorded before any performance conclusion. Cold
-   and warm carry different floors; they are never compared to each other.
+3. **Variance is measured by a pre-registered calculation, not by judgement.**
+   "Within the observed band" is not a rule until the band is defined, and two
+   runners applying different definitions to the same results is the failure
+   this clause exists to prevent. The calculation, fixed here:
+
+   - **Minimum five behaviour-identical passes** per regime before any
+     performance conclusion. Two passes give a range, not a variance; five is
+     the smallest count at which a single outlier does not dominate the
+     statistic below.
+   - **Statistic: the per-query relative median absolute deviation**, taken
+     over each query's per-pass medians, reported as a percentage of the
+     median. Chosen over standard deviation because a single slow pass from an
+     unrelated host event should not widen the band it is being measured
+     against.
+   - **Outliers are not discarded.** A pass is excluded only for a recorded
+     external cause (a host event, a failed comparator container, an aborted
+     run), the exclusion and its reason appear in the report, and the run is
+     repeated to restore the minimum count. A pass excluded for being slow,
+     with no named cause, is data.
+   - **The band is per regime and per query class**, never one number for the
+     whole run: a metadata-only query and a high-fan-out aggregation do not
+     share a noise floor.
+   - **Cold and warm carry different floors and are never compared to each
+     other**, nor is one derived from the other.
+
+   A regression claim requires the delta to exceed the band for that query's
+   class and regime. A delta inside the band is reported as no change, not as
+   a small improvement.
 4. Ingested sample count must equal generated sample count minus explicitly
    reported rejections. A silent drop fails the run.
 5. Every figure the report claims is present exactly once and inside its
@@ -235,10 +318,12 @@ flowchart TB
   HTTP --> VM
   HTTP --> OSN
 
-  PROM -.->|"oracle: pinned v3.13.1"| ORACLE{"differential<br/>comparator"}
+  PROM -.->|"reference answer<br/>pinned v3.13.1"| ORACLE{"differential<br/>comparator"}
   RAVEL -.-> ORACLE
-  ORACLE -->|"passed"| SCORE["portable lane<br/>cross-engine table"]
-  ORACLE -->|"incorrect / unsupported /<br/>budget_refused"| VISIBLE["reported, still in<br/>the denominator"]
+  VM -.-> ORACLE
+  OSN -.-> ORACLE
+  ORACLE -->|"ok"| SCORE["portable lane<br/>cross-engine table<br/>(only ok is timed)"]
+  ORACLE -->|"incorrect / partial / timeout /<br/>error / unsupported / budget_refused"| VISIBLE["reported with status,<br/>stays in the corpus<br/>denominator"]
 
   RAVEL ==>|"PhaseAccounting<br/>already measured"| DIAG["Ravel diagnostic lane<br/>per-phase cost"]
   DIAG -.->|"NEVER folded in"| SCORE
