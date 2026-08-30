@@ -117,7 +117,7 @@ is money.
 
 One number arbitrates it:
 
-```
+```text
 avoiding k requests to move b extra bytes is a win exactly when
 b < k * request_cost
 ```
@@ -132,9 +132,12 @@ count — lives in the constant's doc comment in
 `crates/ravel-query/src/log_fetcher.rs`; read it there rather than assuming the
 default was tuned for your deployment, because it was tuned for that one.
 
-Raising the value makes the engine value a request more: fewer statements take
-the ranged route, more read whole objects, request count falls and bytes rise.
-Lowering it does the reverse.
+Raising the value makes the engine value a request more: fewer segment fetches
+take the ranged route, more read whole objects, request count falls and bytes
+rise. Lowering it does the reverse. The decision is per segment, so one
+statement spanning many segments can take both routes within a single query --
+the counters report opens by shape rather than statements by shape for exactly
+that reason.
 
 The setting never changes a query's answer. It selects which read path fetches
 the bytes; the rows returned are identical at every value, and only request
@@ -186,7 +189,7 @@ box; recorded on issue #680 and quoted in `docs/adrs/0904`, with the pass
 procedure in [clickbench-aws-runbook.md](clickbench-aws-runbook.md)). Turning
 on projection routing moved:
 
-```
+```text
 cold requests   203,243 -> 751,409    (+270%)
 cold bytes       403.97 -> 194.19 GB  (-52%)
 cold time        324.79 -> 222.19 s   (-31.6%)
@@ -209,8 +212,12 @@ constant.
 
 ### Choosing a value, cheapest lever first
 
-1. **Leave it unset** (prefer latency). Costs nothing, changes nothing, and is
-   correct for any deployment whose read path is latency-bound.
+1. **Leave it unset** (prefer latency). Costs nothing and changes nothing. It
+   is the right starting point for a latency-bound read path on a store whose
+   round-trip latency and single-stream bandwidth resemble the configuration
+   the default was measured on. A different store, region, or fetch
+   concurrency has a different break-even, so treat unset as a default to
+   measure against rather than one known to be correct everywhere.
 2. **Leave it unset on an egress-billed backend** too. The default already
    sits far above that deployment's dollar break-even, so there is no lower
    value worth inventing.
