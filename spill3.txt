@@ -1,0 +1,11 @@
+   Compiling ravel-sql v0.11.0 (/var/lib/fleet/work/8abda978-a611-4181-8014-c634af66b1dc/crates/ravel-sql)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.65s
+     Running tests/spill.rs (/var/lib/fleet/cache/cargo-target/8abda978-a611-4181-8014-c634af66b1dc/debug/deps/spill-7744170dbc48f079)
+
+thread 'the_spilling_query_holds_its_pool_accounted_peak_under_the_cap' (703968) panicked at crates/ravel-sql/tests/spill.rs:510:10:
+the eligible aggregation completes via spill: ResourcesExhausted("Failed to allocate additional 523.4 KB for RsegScanExec[0] with 13.0 MB already allocated for this reservation - 192.3 KB remain available for the total memory pool: fair(pool_size: 16.0 MB)")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'an_eligible_aggregation_over_budget_spills_and_matches_the_in_memory_result' (703963) panicked at crates/ravel-sql/tests/spill.rs:242:10:
+the eligible aggregation completes via spill: ResourcesExhausted("Failed to allocate additional 523.4 KB for RsegScanExec[0] with 13.0 MB already allocated for this reservation - 192.3 KB remain available for the total memory pool: fair(pool_size: 16.0 MB)")
+error: test failed, to rerun pass `-p ravel-sql --test spill`

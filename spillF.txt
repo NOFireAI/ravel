@@ -1,0 +1,30 @@
+   Compiling ravel-sql v0.11.0 (/var/lib/fleet/work/8abda978-a611-4181-8014-c634af66b1dc/crates/ravel-sql)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.66s
+     Running tests/spill.rs (/var/lib/fleet/cache/cargo-target/8abda978-a611-4181-8014-c634af66b1dc/debug/deps/spill-7744170dbc48f079)
+SPILLDBG tmp_files_enabled=true plan=
+ProjectionExec: expr=[k@0 as k, count(Int64(1))@1 as n]
+  AggregateExec: mode=Single, gby=[k@0 as k], aggr=[count(Int64(1))]
+    DataSourceExec: partitions=1, partition_sizes=[1]
+
+SPILLDBG rows=3000000 spill_count=0 query_bytes=8388608
+SPILLDBG tmp_files_enabled=true plan=
+ProjectionExec: expr=[k@0 as k, count(Int64(1))@1 as n]
+  AggregateExec: mode=Single, gby=[k@0 as k], aggr=[count(Int64(1))]
+    DataSourceExec: partitions=1, partition_sizes=[1]
+
+SPILLDBG rows=3000000 spill_count=0 query_bytes=1073741824
+
+thread 'an_eligible_aggregation_over_budget_spills_and_matches_the_in_memory_result' (731423) panicked at crates/ravel-sql/tests/spill.rs:362:5:
+the tight-budget aggregation must actually spill; wrote 0 files
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+SPILLDBG tmp_files_enabled=true plan=
+ProjectionExec: expr=[k@0 as k, count(Int64(1))@1 as n]
+  AggregateExec: mode=Single, gby=[k@0 as k], aggr=[count(Int64(1))]
+    DataSourceExec: partitions=1, partition_sizes=[1]
+
+SPILLDBG rows=3000000 spill_count=0 query_bytes=8388608
+spill peak measurement: pool_peak=7929920 bytes, cap=8388608 bytes, spill_files=0
+
+thread 'the_spilling_aggregation_holds_its_pool_accounted_peak_under_the_cap' (731557) panicked at crates/ravel-sql/tests/spill.rs:646:5:
+this test's subject must actually spill; wrote 0 files
+error: test failed, to rerun pass `-p ravel-sql --test spill`

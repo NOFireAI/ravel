@@ -1,0 +1,23 @@
+   Compiling ravel-sql v0.11.0 (/var/lib/fleet/work/8abda978-a611-4181-8014-c634af66b1dc/crates/ravel-sql)
+warning: field `spill_headroom_bytes` is never read
+   --> crates/ravel-sql/src/memory.rs:196:5
+    |
+166 | pub struct TenantDelegatingPool {
+    |            -------------------- field in this struct
+...
+196 |     spill_headroom_bytes: usize,
+    |     ^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `ravel-sql` (lib) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 24.14s
+     Running tests/spill.rs (/var/lib/fleet/cache/cargo-target/8abda978-a611-4181-8014-c634af66b1dc/debug/deps/spill-7744170dbc48f079)
+
+thread 'the_spilling_query_holds_its_pool_accounted_peak_under_the_cap' (721855) panicked at crates/ravel-sql/tests/spill.rs:513:5:
+this test's subject must actually spill; got SpillCounts { files: 0, bytes_written: 0, rows_written: 0, bytes_read: None, duration: 568.423267ms }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'an_eligible_aggregation_over_budget_spills_and_matches_the_in_memory_result' (721854) panicked at crates/ravel-sql/tests/spill.rs:244:5:
+the tight-budget eligible aggregation must actually spill; got SpillCounts { files: 0, bytes_written: 0, rows_written: 0, bytes_read: None, duration: 9.209792ms }
+error: test failed, to rerun pass `-p ravel-sql --test spill`

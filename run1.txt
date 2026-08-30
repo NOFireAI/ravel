@@ -1,0 +1,11 @@
+   Compiling ravel-sql v0.11.0 (/var/lib/fleet/work/8abda978-a611-4181-8014-c634af66b1dc/crates/ravel-sql)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.63s
+     Running tests/spill.rs (/var/lib/fleet/cache/cargo-target/8abda978-a611-4181-8014-c634af66b1dc/debug/deps/spill-7744170dbc48f079)
+
+thread 'the_spilling_query_holds_its_pool_accounted_peak_under_the_cap' (694923) panicked at crates/ravel-sql/tests/spill.rs:478:10:
+the eligible aggregation completes via spill: ResourcesExhausted("query memory pool exhausted: 404664 more bytes on top of 66720240 already reserved exceeds per-query limit 67108864")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'an_eligible_aggregation_over_budget_spills_and_matches_the_in_memory_result' (694922) panicked at crates/ravel-sql/tests/spill.rs:210:10:
+the eligible aggregation completes via spill: ResourcesExhausted("query memory pool exhausted: 404664 more bytes on top of 66720240 already reserved exceeds per-query limit 67108864")
+error: test failed, to rerun pass `-p ravel-sql --test spill`
