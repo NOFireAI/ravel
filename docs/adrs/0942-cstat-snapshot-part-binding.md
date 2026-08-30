@@ -23,20 +23,35 @@ targets: every compacted segment falls back to a scan.
 ADR-0850 frames the gap as a fold-time deferral -- L1 entries "reuse the
 `writer_id`/`writer_epoch` slots for compaction bookkeeping, so the
 identity-tuple join needs a different key for L1." Verified against the
-tree, the fold side is not the blocker:
+tree, the identities the fold produces are sound:
 
 - `build_l1_snapshot_entry` (`crates/ravel-catalog/src/fold.rs:368`) and
   `build_rewrite_l1_snapshot_entry` (`fold.rs:415`) each build a
   `SnapshotEntry` with `writer_id = record.input_set_hash.clone()` (32
   bytes) and `writer_epoch = u64::from(part.part_index)` (`fold.rs:393`,
   `fold.rs:440`). Every L1 part of one `(shard, hour)` bucket has a distinct
-  `part_index`, so these entry tuples are already unique per part. Dropping
-  the `level == 0` filter at `fold.rs:1513` would build correct,
-  uniquely-keyed L1 `ColumnStatsSegment` records without any new fold-side
-  design.
+  `part_index`, so these entry tuples are already unique per part.
 
-The blockers are all on the reader side, and they are why L1 coverage is a
-key-model problem, not a fold-filter problem. Three of them, each verified:
+Removing the `level == 0` filter at `fold.rs:1513` nonetheless yields no
+coverage. Four things stand in the way, one in the builder and three in the
+reader, and together they are why L1 coverage is a key-model problem rather
+than a fold-filter problem. Each is verified against the tree:
+
+0. **The builder refuses an L1 entry before a record exists.**
+   `build_column_stats_segment`
+   (`crates/ravel-catalog/src/column_stats_build.rs:372`) carries
+   `debug_assert_eq!(entry.level, 0)`, and at `:379` converts
+   `entry.writer_id` into `[u8; 16]`, returning
+   `ColumnStatsBuildError::BadWriterIdLen` for any other length (`:383`). An
+   L1 entry's slot holds the 32-byte `input_set_hash`, so a fold that dropped
+   the level filter fails this conversion and never constructs a
+   `ColumnStatsSegment` at all. The `debug_assert` is not the guard, since it
+   compiles out of release builds; the `BadWriterIdLen` error is, and it fires
+   on every build profile. This blocker is the cheapest of the four to clear
+   and it disappears under this ADR's decision, because part binding replaces
+   the writer-id key the conversion exists to enforce.
+
+The remaining three sit on the reader side:
 
 1. **The query-side join key is computed from the `SegmentRef`, not the
    `SnapshotEntry`.** `segment_identity`
