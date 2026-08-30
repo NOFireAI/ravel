@@ -70,7 +70,7 @@ use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
@@ -80,6 +80,7 @@ use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::dataframe::DataFrame;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::execution::disk_manager::DiskManager;
 use datafusion::execution::memory_pool::{MemoryLimit, MemoryPool, UnboundedMemoryPool};
 use datafusion::logical_expr::{Aggregate, Distinct, Expr, ExprSchemable, LogicalPlan};
 use datafusion::physical_plan::{ExecutionPlan, execute_stream};
@@ -101,8 +102,11 @@ use crate::memory::{CeilingBreach, TenantMemoryAccountant};
 use crate::output::QueryOutput;
 use crate::provider::RavelTableProvider;
 use crate::pushdown::extract;
-use crate::session::{LOGS_TABLE, SAMPLES_TABLE, SPANS_TABLE, SessionTable, build_session};
+use crate::session::{
+    LOGS_TABLE, SAMPLES_TABLE, SPANS_TABLE, SessionTable, SpillDecision, build_session,
+};
 use crate::spans_fetcher::SpanSegmentFetcher;
+use crate::spill::{OperatorSpill, SpillCounts, SpillScratch, accumulate_spill_counts};
 use crate::spans_provider::SpansTableProvider;
 use crate::validate::{referenced_base_tables, validate};
 
@@ -195,6 +199,16 @@ pub struct SqlStats {
     pub blocks_total: u64,
     pub blocks_scanned: u64,
     pub blocks_pruned_by_postings: u64,
+    /// This query's spill totals (ADR-0954), read off the executed plan's own
+    /// DataFusion counters after the stream stopped, the same way the block
+    /// counters above are. All zero on the default configuration, where the
+    /// disk manager is disabled and no query can spill at all.
+    ///
+    /// The totals live here because they are operator metrics; the
+    /// per-operator attribution that makes a spill traceable to the operator
+    /// that wrote it lives on [`SqlOutcome::spill_by_operator`], which does not
+    /// have to stay `Copy`.
+    pub spill: SpillCounts,
 }
 
 /// The `LogsScanExec` block counters, summed over a plan tree.
@@ -236,6 +250,13 @@ pub struct SqlOutcome {
     /// The pre-execution cost estimate (ADR-0044 "3."), from the same
     /// successful attempt's resolve.
     pub estimate: CostEstimate,
+    /// Which operator wrote this query's spill, and how much (ADR-0954). Empty
+    /// for a query that did not spill, which is every query on the default
+    /// configuration. The totals are on [`SqlStats::spill`]; this is the
+    /// attribution, because "the aggregate spilled 4 files" and "the exchange
+    /// spilled 4 files" are different findings that a pooled total cannot tell
+    /// apart.
+    pub spill_by_operator: Vec<OperatorSpill>,
 }
 
 /// Executes SQL for any tenant against one catalog and object store.
@@ -466,10 +487,15 @@ impl SqlExecutor {
             stats.attempts += 1;
             stats.segments = snapshot.segments.len();
 
-            let (result, emitted, blocks) = self
+            let (result, emitted, blocks, spill, spill_by_operator) = self
                 .attempt(tenant_hash, req, snapshot, &accounting, &declared)
                 .await;
             stats.batches_emitted += emitted;
+            // Recorded for the failing attempt too: a spill that happened
+            // before the failure is a fact about this query, and a retried
+            // attempt overwrites it with its own, matching how the block
+            // counters and `QueryAccounting` treat a discarded attempt.
+            stats.spill = spill;
 
             match result {
                 Ok(output) => {
@@ -481,6 +507,7 @@ impl SqlExecutor {
                         stats,
                         accounting: accounting.snapshot(),
                         estimate,
+                        spill_by_operator,
                     });
                 }
                 Err(err) => match retry_decision(err.is_segment_not_found(), emitted, attempt) {
@@ -629,15 +656,35 @@ impl SqlExecutor {
         // once. The build happens only when a consumer will read it.
         let wants_stats_gate = matches!(Self::target_signal(sql), Ok(TargetSignal::Logs))
             && !extras.declared.is_empty();
-        let analyzed = if self.config.parallel_final_aggregation || wants_stats_gate {
-            self.analyzed_classification_plan(tenant_hash, sql, &extras.declared)
-                .await
-        } else {
-            None
-        };
+        // ADR-0954: the spill eligibility predicate reads the same analyzed
+        // plan, so a configured-spill deployment is a third consumer of it
+        // rather than a second analyze pass.
+        let wants_spill_gate = self.config.spill.is_some();
+        let analyzed =
+            if self.config.parallel_final_aggregation || wants_stats_gate || wants_spill_gate {
+                self.analyzed_classification_plan(tenant_hash, sql, &extras.declared)
+                    .await
+            } else {
+                None
+            };
         // Fail CLOSED, unchanged: an unbuildable plan is not exact-typed.
         let exact_typed_aggregates = self.config.parallel_final_aggregation
             && analyzed.as_ref().is_some_and(plan_is_exact_typed);
+        // ADR-0954: spill needs BOTH an operator-configured scratch area and a
+        // plan whose every aggregate is exact under a changed folding order.
+        // Fail closed the same way: an unbuildable plan is not eligible, so it
+        // gets the disabled disk manager and today's typed refusal.
+        //
+        // The scratch directory is created here, before planning, so a missing
+        // or unwritable spill area is a typed `SpillUnavailable` raised with
+        // nothing written and no operator started, rather than an opaque IO
+        // failure from inside a spilling operator half way through a query.
+        let scratch = match &self.config.spill {
+            Some(spill) if analyzed.as_ref().is_some_and(plan_is_spill_eligible) => {
+                Some((SpillScratch::create(spill)?, spill.max_bytes))
+            }
+            _ => None,
+        };
         // Build the one table the query targets over the snapshot resolved for
         // its signal. `resolve` already resolved `snapshot` against exactly
         // this signal, so the provider and the snapshot always agree.
@@ -648,7 +695,7 @@ impl SqlExecutor {
                     snapshot,
                     tenant_hash,
                     self.fetcher.clone(),
-                    self.config,
+                    self.config.clone(),
                     accounting.clone(),
                 );
                 // Install the distributed samples scan for this query only, when
@@ -720,8 +767,15 @@ impl SqlExecutor {
             ))),
         };
 
-        let ctx =
-            build_session(&self.config, pool, table, exact_typed_aggregates).map_err(plan_error)?;
+        let decision = match &scratch {
+            Some((scratch, max_bytes)) => SpillDecision::Enabled {
+                dir: scratch.dir(),
+                max_bytes: *max_bytes,
+            },
+            None => SpillDecision::Disabled,
+        };
+        let ctx = build_session(&self.config, pool, table, exact_typed_aggregates, decision)
+            .map_err(plan_error)?;
         let frame = ctx.sql(sql).await.map_err(plan_error)?;
         let schema = frame.schema().inner().clone();
         Ok(PinnedQuery {
@@ -729,6 +783,7 @@ impl SqlExecutor {
             frame,
             schema,
             breach,
+            scratch: scratch.map(|(scratch, _)| scratch),
         })
     }
 
@@ -911,7 +966,16 @@ impl SqlExecutor {
         // executes, so nothing is reserved against it and it never touches the
         // tenant accountant.
         let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
-        let ctx = build_session(&self.config, pool, table, false).ok()?;
+        // Plan-inspection only: this throwaway session never executes, so it
+        // never spills whatever the query's own session was granted.
+        let ctx = build_session(
+            &self.config,
+            pool,
+            table,
+            false,
+            crate::session::SpillDecision::Disabled,
+        )
+        .ok()?;
         let plan = ctx.state().create_logical_plan(sql).await.ok()?;
         let mut predicates = Vec::new();
         collect_filter_predicates(&plan, &mut predicates);
@@ -982,7 +1046,16 @@ impl SqlExecutor {
         let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
         // `exact_typed_aggregates` is irrelevant to a plan we only inspect; the
         // classification decides the real session's value, not this throwaway.
-        let ctx = build_session(&self.config, pool, table, false).ok()?;
+        // Plan-inspection only: this throwaway session never executes, so it
+        // never spills whatever the query's own session was granted.
+        let ctx = build_session(
+            &self.config,
+            pool,
+            table,
+            false,
+            crate::session::SpillDecision::Disabled,
+        )
+        .ok()?;
         let state = ctx.state();
         let plan = state.create_logical_plan(sql).await.ok()?;
         let config_options = Arc::clone(state.config_options());
@@ -1088,7 +1161,7 @@ impl SqlExecutor {
                 empty_snapshot(),
                 tenant_hash,
                 self.fetcher.clone(),
-                self.config,
+                self.config.clone(),
                 QueryAccounting::new(),
             ))),
             TargetSignal::Logs => SessionTable::Logs(Arc::new(
@@ -1164,19 +1237,41 @@ impl SqlExecutor {
         snapshot: Snapshot,
         accounting: &QueryAccounting,
         declared: &[DeclaredColumn],
-    ) -> (Result<QueryOutput, SqlError>, usize, BlockCounts) {
+    ) -> (
+        Result<QueryOutput, SqlError>,
+        usize,
+        BlockCounts,
+        SpillCounts,
+        Vec<OperatorSpill>,
+    ) {
         let planned = match self
             .plan_pinned(tenant_hash, snapshot, &req.sql, accounting, declared)
             .await
         {
             Ok(planned) => planned,
-            Err(e) => return (Err(e), 0, BlockCounts::default()),
+            Err(e) => {
+                return (
+                    Err(e),
+                    0,
+                    BlockCounts::default(),
+                    SpillCounts::default(),
+                    Vec::new(),
+                );
+            }
         };
         let schema = planned.schema();
 
         let mut stream = match planned.execute().await {
             Ok(stream) => stream,
-            Err(e) => return (Err(e), 0, BlockCounts::default()),
+            Err(e) => {
+                return (
+                    Err(e),
+                    0,
+                    BlockCounts::default(),
+                    SpillCounts::default(),
+                    Vec::new(),
+                );
+            }
         };
 
         let mut batches = Vec::new();
@@ -1189,15 +1284,27 @@ impl SqlExecutor {
                 }
                 // The scan's block counters are final only after a clean drain,
                 // so a mid-stream error reports none: a partial prune ratio
-                // would misattribute.
-                Err(e) => return (Err(e), emitted, BlockCounts::default()),
+                // would misattribute. The spill counters are different: they
+                // record what was written, and what was written before a
+                // failure was still written, so they are read on both paths.
+                Err(e) => {
+                    let (spill, by_operator) = stream.spill_counts();
+                    return (Err(e), emitted, BlockCounts::default(), spill, by_operator);
+                }
             }
         }
 
         // The stream drained cleanly: the plan's LogsScanExec counters are now
         // final, so read them off the plan we kept.
         let blocks = stream.block_counts();
-        (Ok(QueryOutput::new(schema, batches)), emitted, blocks)
+        let (spill, by_operator) = stream.spill_counts();
+        (
+            Ok(QueryOutput::new(schema, batches)),
+            emitted,
+            blocks,
+            spill,
+            by_operator,
+        )
     }
 }
 
@@ -1215,6 +1322,12 @@ pub struct PinnedQuery {
     /// The best-effort memory ceiling's abort flag, tripped by the pool's
     /// `grow` and moved into the [`PinnedStream`] on execute.
     breach: Arc<CeilingBreach>,
+    /// This query's spill scratch directory (ADR-0954), present only when
+    /// spill is configured AND this plan passed the eligibility predicate.
+    /// Declared after `ctx` so it drops after the session that owns the files
+    /// inside it, and moved into the [`PinnedStream`] on execute so a query
+    /// abandoned mid-stream still removes its scratch.
+    scratch: Option<SpillScratch>,
 }
 
 impl PinnedQuery {
@@ -1244,6 +1357,7 @@ impl PinnedQuery {
             frame,
             schema,
             breach,
+            scratch,
         } = self;
         // Build the physical plan explicitly rather than through
         // `frame.execute_stream()` (which does the same two steps internally)
@@ -1252,7 +1366,7 @@ impl PinnedQuery {
         // are equivalent: `execute_stream` is `create_physical_plan` then
         // `execute_stream(plan, task_ctx)`.
         let plan = frame.create_physical_plan().await.map_err(plan_error)?;
-        PinnedStream::start(ctx, plan, schema, breach)
+        PinnedStream::start_with_scratch(ctx, plan, schema, breach, scratch)
     }
 }
 
@@ -1289,6 +1403,35 @@ pub struct PinnedStream {
     /// against. Derived from `ctx` in [`Self::start`] rather than threaded in
     /// separately, so no caller of `start` changes.
     pool: Arc<dyn MemoryPool>,
+    /// Spill bookkeeping for this query (ADR-0954), `None` whenever the
+    /// session's disk manager is disabled -- which is every query on the
+    /// default configuration, so the default path pays nothing for this.
+    spill: Option<SpillState>,
+    /// This query's scratch directory. Declared LAST so it drops after `_ctx`:
+    /// the session's `RuntimeEnv` owns the spill files inside it and must
+    /// release them first. Removing the directory here is what makes cleanup
+    /// hold on the completion, error, AND cancellation paths alike -- all
+    /// three end with this value dropping.
+    _scratch: Option<SpillScratch>,
+}
+
+/// The live spill bookkeeping [`PinnedStream`] keeps while a query with an
+/// enabled disk manager runs.
+struct SpillState {
+    /// The session's disk manager, for its `spilling_progress()` gauge: the
+    /// bytes currently written across this query's spill files, and how many
+    /// of those files are open.
+    disk_manager: Arc<DiskManager>,
+    /// The configured per-query scratch ceiling, echoed in
+    /// [`SqlError::spill_budget_exhausted`]. Read from the disk manager rather
+    /// than threaded in, so it is the ceiling actually installed.
+    quota: u64,
+    /// Set while the last poll observed at least one open spill file; `None`
+    /// otherwise. See [`SpillCounts::duration`] for exactly what the resulting
+    /// figure measures.
+    active_since: Option<Instant>,
+    /// Accumulated spill window across every open/close cycle so far.
+    elapsed: Duration,
 }
 
 impl PinnedStream {
@@ -1306,12 +1449,37 @@ impl PinnedStream {
         schema: SchemaRef,
         breach: Arc<CeilingBreach>,
     ) -> Result<Self, SqlError> {
+        PinnedStream::start_with_scratch(ctx, plan, schema, breach, None)
+    }
+
+    /// [`Self::start`] with this query's spill scratch directory attached
+    /// (ADR-0954), so the directory outlives the stream and is removed when the
+    /// stream drops. `None` is byte-identical to [`Self::start`].
+    pub fn start_with_scratch(
+        ctx: SessionContext,
+        plan: Arc<dyn ExecutionPlan>,
+        schema: SchemaRef,
+        breach: Arc<CeilingBreach>,
+        scratch: Option<SpillScratch>,
+    ) -> Result<Self, SqlError> {
         // The same pool `build_session` installed on `ctx`'s `RuntimeEnv`
         // (`crate::session`), read back here rather than passed in: every
         // `ResourcesExhausted` this stream maps needs it, and deriving it from
         // `ctx` keeps every `start` caller (the local path, the Flight SQL
         // worker fragment, and the panic-boundary test) unchanged.
         let pool = Arc::clone(&ctx.runtime_env().memory_pool);
+        // Same derivation for the disk manager: whether this query can spill
+        // at all is a property of the session `build_session` built, not
+        // something a caller of this constructor should be able to disagree
+        // with. `tmp_files_enabled()` is false for every `SpillDecision::
+        // Disabled` session, which is every session on the default config.
+        let disk_manager = Arc::clone(&ctx.runtime_env().disk_manager);
+        let spill = disk_manager.tmp_files_enabled().then(|| SpillState {
+            quota: disk_manager.max_temp_directory_size(),
+            disk_manager,
+            active_since: None,
+            elapsed: Duration::ZERO,
+        });
         let inner = execute_stream(Arc::clone(&plan), ctx.task_ctx()).map_err(plan_error)?;
         Ok(PinnedStream {
             _ctx: ctx,
@@ -1321,6 +1489,8 @@ impl PinnedStream {
             plan,
             panicked: false,
             pool,
+            spill,
+            _scratch: scratch,
         })
     }
 
@@ -1337,6 +1507,134 @@ impl PinnedStream {
         let mut counts = BlockCounts::default();
         accumulate_block_counts(&self.plan, &mut counts);
         counts
+    }
+
+    /// This query's spill totals and their per-operator attribution
+    /// (ADR-0954), read off the plan's own DataFusion counters the same way
+    /// [`Self::block_counts`] reads the scan's.
+    ///
+    /// Meaningful once the stream has stopped producing, whether it drained or
+    /// failed: a spill that happened before a failure is still a fact about the
+    /// query. All zero, with no operators listed, for a query that did not
+    /// spill.
+    fn spill_counts(&self) -> (SpillCounts, Vec<OperatorSpill>) {
+        let mut totals = SpillCounts::default();
+        let mut by_operator = Vec::new();
+        accumulate_spill_counts(&self.plan, &mut totals, &mut by_operator);
+        totals.duration = self
+            .spill
+            .as_ref()
+            .map_or(Duration::ZERO, SpillState::window);
+        (totals, by_operator)
+    }
+
+    /// Sample the disk manager's open-spill-file gauge and fold the interval
+    /// since the previous sample into the spill window. Called on every poll
+    /// of a spill-enabled query and never on any other, so the default path
+    /// runs none of it.
+    fn sample_spill_window(&mut self) {
+        let Some(spill) = self.spill.as_mut() else {
+            return;
+        };
+        let active = spill.disk_manager.spilling_progress().active_files_count > 0;
+        match (active, spill.active_since) {
+            (true, None) => spill.active_since = Some(Instant::now()),
+            (false, Some(since)) => {
+                spill.elapsed = spill.elapsed.saturating_add(since.elapsed());
+                spill.active_since = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// Map an execution error, classifying the two spill-specific failures
+    /// first (ADR-0954). Kept here rather than inside [`execution_error`]
+    /// because only the stream holds the disk manager the figures come from.
+    ///
+    /// Runs only for a query whose disk manager is enabled, so a query on the
+    /// default configuration reaches `execution_error` by exactly the path it
+    /// did before spill existed.
+    fn map_execution_error(&self, err: DataFusionError) -> SqlError {
+        if let Some(spill) = self.spill.as_ref()
+            && let Some(failure) = spill_failure_kind(&err)
+        {
+            return match failure {
+                // DataFusion raises the scratch-quota trip as a plain
+                // `ResourcesExhausted`, the same variant a memory-pool refusal
+                // uses, with text telling the caller to raise a DataFusion
+                // option no Ravel client can reach. The memory and scratch
+                // budgets are independently enforced, so they stay
+                // independently reportable: re-typed here, with the figures
+                // restated from the disk manager's own gauge.
+                SpillFailure::Quota => SqlError::spill_budget_exhausted(
+                    spill.disk_manager.used_disk_space(),
+                    spill.quota,
+                ),
+                // A filesystem error reaching this stream while spill is
+                // enabled is a scratch failure: every read of durable data
+                // goes through this crate's own fetchers, which surface as
+                // `SqlError::Fetch`/`LogFetch`/`SpanFetch`, never as a bare
+                // DataFusion IO error. The commonest cause is the scratch
+                // volume filling mid-write.
+                SpillFailure::Io(detail) => SqlError::SpillUnavailable(format!(
+                    "spill file write failed while the query held \
+                     {} of {} scratch bytes: {detail}",
+                    spill.disk_manager.used_disk_space(),
+                    spill.quota
+                )),
+            };
+        }
+        execution_error(err, &self.pool)
+    }
+}
+
+/// The two spill-specific failures, told apart from every other execution
+/// error.
+enum SpillFailure {
+    /// The per-query scratch quota was exceeded.
+    Quota,
+    /// The scratch area could not be written; the payload is the IO detail,
+    /// logged server-side only.
+    Io(String),
+}
+
+/// Find a spill failure at any wrapper depth, mirroring
+/// [`take_sql_error`]'s unwrapping but by reference: the error is still needed
+/// intact if this returns `None`.
+fn spill_failure_kind(err: &DataFusionError) -> Option<SpillFailure> {
+    match err {
+        DataFusionError::ResourcesExhausted(msg)
+            if msg.contains(crate::error::MSG_SPILL_QUOTA_MARKER) =>
+        {
+            Some(SpillFailure::Quota)
+        }
+        DataFusionError::IoError(io) => Some(SpillFailure::Io(io.to_string())),
+        DataFusionError::Context(_, inner) | DataFusionError::Diagnostic(_, inner) => {
+            spill_failure_kind(inner)
+        }
+        DataFusionError::Shared(inner) => spill_failure_kind(inner),
+        DataFusionError::External(boxed) => boxed
+            .downcast_ref::<DataFusionError>()
+            .and_then(spill_failure_kind),
+        DataFusionError::ArrowError(arrow, _) => match arrow.as_ref() {
+            ArrowError::ExternalError(boxed) => boxed
+                .downcast_ref::<DataFusionError>()
+                .and_then(spill_failure_kind),
+            _ => None,
+        },
+        DataFusionError::Collection(errors) => errors.iter().find_map(spill_failure_kind),
+        _ => None,
+    }
+}
+
+impl SpillState {
+    /// The spill window so far, including an interval still open at the moment
+    /// of the call.
+    fn window(&self) -> Duration {
+        match self.active_since {
+            Some(since) => self.elapsed.saturating_add(since.elapsed()),
+            None => self.elapsed,
+        }
     }
 }
 
@@ -1383,8 +1681,19 @@ impl Stream for PinnedStream {
         }));
         match polled {
             Ok(next) => {
-                let pool = Arc::clone(&self.pool);
-                next.map(|next| next.map(|batch| batch.map_err(|e| execution_error(e, &pool))))
+                // ADR-0954's spill window, sampled once per poll and only for
+                // a query whose disk manager is enabled. See
+                // `SpillCounts::duration` for what the resulting figure is and
+                // is not.
+                self.sample_spill_window();
+                match next {
+                    Poll::Ready(Some(Err(err))) => {
+                        Poll::Ready(Some(Err(self.map_execution_error(err))))
+                    }
+                    Poll::Ready(Some(Ok(batch))) => Poll::Ready(Some(Ok(batch))),
+                    Poll::Ready(None) => Poll::Ready(None),
+                    Poll::Pending => Poll::Pending,
+                }
             }
             Err(payload) => {
                 self.panicked = true;
@@ -1698,6 +2007,195 @@ fn plan_is_exact_typed(plan: &LogicalPlan) -> bool {
     let mut distincts = Vec::new();
     collect_aggregate_exprs(plan, &mut aggregates, &mut distincts);
     aggregates.iter().all(aggregate_node_is_exact) && distincts.iter().all(distinct_node_is_exact)
+}
+
+/// Whether `plan` (analyzed/type-coerced) may spill (ADR-0954).
+///
+/// This is a predicate over the plan's shape and its aggregate expressions'
+/// resolved types, deliberately NOT an operator-name allowlist: what is at
+/// stake is exactness, and "this operator can spill" says nothing about
+/// whether spilling changes its answer. Spilling a grouped aggregation makes
+/// DataFusion emit partial group state, sort it, write it, and re-merge it, so
+/// the aggregate's folding order changes. An aggregate whose merge is exact
+/// under any order is unaffected; one whose merge is order-dependent is not,
+/// and this repo's exactness invariant is the thing the spill would trade
+/// away.
+///
+/// A plan is eligible when ALL of the following hold:
+///
+/// - it contains at least one [`LogicalPlan::Aggregate`]. With no aggregate
+///   there is nothing whose exactness this predicate has reasoned about, so
+///   enabling spill could only benefit an operator it never classified.
+/// - every node is one of the shapes below. This is an allowlist, so a
+///   DataFusion release that adds a `LogicalPlan` variant makes plans using it
+///   ineligible rather than silently spillable. `Sort` is deliberately outside
+///   it: an external merge sort returns the same rows, but this ADR has no
+///   proof its tie order equals the in-memory sort's, and row order is part of
+///   an `ORDER BY` result. `Join` and `Window` are outside it for the same
+///   reason, one level up: nothing here has classified their spill behavior.
+/// - every aggregate expression is exactness-preserving under spill
+///   ([`aggregate_expr_is_spill_exact`]) and no GROUP BY or DISTINCT key is a
+///   float ([`aggregate_node_is_spill_exact`], [`distinct_node_is_exact`]).
+///
+/// Anything this predicate cannot classify -- an unresolvable expression type,
+/// an aggregate that is not an `AggregateFunction`, an unknown plan node -- is
+/// ineligible. Fail closed: the cost of a false negative is today's typed
+/// refusal, and the cost of a false positive is a silently wrong answer.
+fn plan_is_spill_eligible(plan: &LogicalPlan) -> bool {
+    if !plan_nodes_are_spill_classifiable(plan) {
+        return false;
+    }
+    let mut aggregates = Vec::new();
+    let mut distincts = Vec::new();
+    collect_aggregate_exprs(plan, &mut aggregates, &mut distincts);
+    !aggregates.is_empty()
+        && aggregates.iter().all(aggregate_node_is_spill_exact)
+        && distincts.iter().all(distinct_node_is_exact)
+}
+
+/// Whether every node in `plan` is a shape [`plan_is_spill_eligible`] has
+/// classified. Walks inputs and embedded subquery plans with the same reach
+/// [`collect_aggregate_exprs`] uses, so a `Sort` hidden inside a scalar
+/// subquery disqualifies the query exactly as a top-level one does.
+fn plan_nodes_are_spill_classifiable(plan: &LogicalPlan) -> bool {
+    let classifiable = matches!(
+        plan,
+        LogicalPlan::Projection(_)
+            | LogicalPlan::Filter(_)
+            | LogicalPlan::Aggregate(_)
+            | LogicalPlan::Distinct(_)
+            | LogicalPlan::TableScan(_)
+            | LogicalPlan::SubqueryAlias(_)
+            | LogicalPlan::Limit(_)
+            | LogicalPlan::EmptyRelation(_)
+            | LogicalPlan::Values(_)
+    );
+    if !classifiable {
+        return false;
+    }
+    if !plan
+        .inputs()
+        .iter()
+        .all(|input| plan_nodes_are_spill_classifiable(input))
+    {
+        return false;
+    }
+    for expr in plan.expressions() {
+        let mut ok = true;
+        // Never errors: the closure only inspects and returns a recursion verb.
+        let _ = expr.apply(|node| {
+            let nested = match node {
+                Expr::ScalarSubquery(subquery) => Some(&subquery.subquery),
+                Expr::InSubquery(in_subquery) => Some(&in_subquery.subquery.subquery),
+                Expr::Exists(exists) => Some(&exists.subquery.subquery),
+                _ => None,
+            };
+            if let Some(nested) = nested
+                && !plan_nodes_are_spill_classifiable(nested)
+            {
+                ok = false;
+                return Ok(TreeNodeRecursion::Stop);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
+/// Classify one [`Aggregate`] node for spill (ADR-0954): every GROUP BY key
+/// non-float, every aggregate expression exact under a changed folding order.
+///
+/// A float GROUP BY key disqualifies for the same reason it disqualifies
+/// ADR-0094's repartition classification: `-0.0` and NaN payloads are
+/// significant here, and nothing proves the sort DataFusion applies to the
+/// spilled group state picks a merge-order-stable representative bit pattern.
+fn aggregate_node_is_spill_exact(aggregate: &Aggregate) -> bool {
+    let schema = aggregate.input.schema().as_ref();
+    for key in &aggregate.group_expr {
+        match key.get_type(schema) {
+            Ok(ty) if crate::minmax::is_float(&ty) => return false,
+            Ok(_) => {}
+            // Fail closed: a key whose type will not resolve is not admitted.
+            Err(_) => return false,
+        }
+    }
+    aggregate
+        .aggr_expr
+        .iter()
+        .all(|expr| aggregate_expr_is_spill_exact(expr, schema))
+}
+
+/// Whether one aggregate expression keeps its exact answer when the spill path
+/// changes the order its partial states are folded in (ADR-0954):
+///
+/// - `count(...)` / `count(DISTINCT ...)`: eligible. Its accumulator is an
+///   integer and its merge is integer addition (a distinct count merges sets),
+///   neither of which depends on order, whatever the counted expression's type
+///   is.
+/// - `sum` over a resolved integer input: eligible. Integer addition is
+///   associative, so partial sums merged in any order give the same total.
+/// - `avg`/`mean` over a resolved `Int64` input: eligible. That is
+///   `crate::avg`'s exact integer path, an `i128` numerator with checked
+///   addition and an integer count (ADR-0825 decision 2); the analyzer coerces
+///   every admitted integer width to `Int64`, so a resolved `Int64` argument is
+///   the whole of that path.
+///
+/// Everything else is ineligible, including `sum` over a float (order-dependent
+/// IEEE addition), `avg` over a float (the same fold), `min`/`max` of any type,
+/// `sum` over a Decimal, and any expression that is not an aggregate function
+/// call. `min`/`max` are excluded because ADR-0954's core cut enumerates three
+/// eligible families and this predicate implements exactly those; admitting
+/// more is a widening that needs its own evidence, and the cost of leaving them
+/// out is today's typed refusal, not a wrong answer.
+fn aggregate_expr_is_spill_exact(expr: &Expr, schema: &DFSchema) -> bool {
+    // `aggr_expr` entries are either an `AggregateFunction` or an `Alias`
+    // wrapping one; unwrap a single alias layer.
+    let inner = match expr {
+        Expr::Alias(alias) => alias.expr.as_ref(),
+        other => other,
+    };
+    let Expr::AggregateFunction(aggregate_function) = inner else {
+        // Not an aggregate function where one is required: fail closed.
+        return false;
+    };
+    let arg_type = |wanted: fn(&datafusion::arrow::datatypes::DataType) -> bool| {
+        match aggregate_function.params.args.first() {
+            Some(arg) => match arg.get_type(schema) {
+                Ok(ty) => wanted(&ty),
+                Err(_) => false,
+            },
+            None => false,
+        }
+    };
+    match aggregate_function.func.name().to_ascii_lowercase().as_str() {
+        "count" => true,
+        "sum" => arg_type(is_exact_integer),
+        "avg" | "mean" => arg_type(|ty| matches!(ty, datafusion::arrow::datatypes::DataType::Int64)),
+        _ => false,
+    }
+}
+
+/// The integer types whose addition is exact and associative, so a partial sum
+/// merged in any order is the same total. Deliberately narrower than "not a
+/// float": `Decimal128`/`Decimal256` addition is exact too but can overflow
+/// into a different error depending on where the split falls, and neither is
+/// reachable on the v1 surface, so both fail closed here.
+fn is_exact_integer(ty: &datafusion::arrow::datatypes::DataType) -> bool {
+    use datafusion::arrow::datatypes::DataType;
+    matches!(
+        ty,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+    )
 }
 
 /// Whether `plan` (analyzed) has any [`LogicalPlan::Aggregate`] node (issue

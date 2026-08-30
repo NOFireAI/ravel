@@ -1404,6 +1404,7 @@ mod tests {
             pool,
             SessionTable::Spans(Arc::new(provider)),
             false,
+            crate::session::SpillDecision::Disabled,
         )
         .expect("spans session builds");
 
