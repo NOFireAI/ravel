@@ -115,16 +115,24 @@ column for the tenant (the materialisation vocabulary is exactly the
 ADR-0090/0101 declared-column vocabulary — a materialisation over an
 undeclared attribute has no typed identity to hash); an aggregate kind
 outside the v1 set; `AVG`/`SUM` over a non-numeric declared type;
-`SUM`/`AVG` over a declared `f64` column (deferred, §4d); a
-`time_grain_ns` that does not divide 3,600,000,000,000 evenly (grains must
-nest inside the ingest hour so a grain bucket never spans a fold
-boundary's hour partitioning).
+`SUM`/`AVG` over a declared `f64` column (deferred, §4d);
+`COUNT_DISTINCT` over a declared `f64` column (deferred, §4c); a
+`time_grain_ns` that is neither zero nor an even divisor of
+3,600,000,000,000 — explicitly, `time_grain_ns = 0` is valid and means no
+time dimension, and any nonzero grain must divide the ingest hour evenly
+(grains must nest inside the ingest hour so a grain bucket never spans a
+fold boundary's hour partitioning).
 
 ### 1b. The canonical definition hash
 
 Every declaration has a **definition hash**: 32 bytes,
 `blake3(domain || canonical encoding)` with domain separation string
-`ravel-matdef-v1`, over exactly these fields, in this order:
+`ravel-matdef-v1`, over exactly these fields, in this order. Every
+integer in the hash input is fixed-width little-endian (the widths named
+per field below); no varint or ZigZag encoding appears anywhere in it.
+Every variable-length byte string in the hash input (column keys, the
+canonical predicate text, encoded literals) is prefixed with its byte
+length as u32 LE, so field boundaries are unambiguous:
 
 1. `signal` (u32 LE);
 2. **schema and type semantics**: for every column the declaration touches
@@ -170,12 +178,17 @@ v1 predicates are a conjunction of atoms over declared columns:
 `col = literal`, `col <> literal`, `col IN (literals)`, and
 half-open/closed range atoms over `i64` columns. Canonicalisation: atoms
 sorted by (column key, operator id, literal bytes), `IN` lists sorted and
-deduplicated, literals encoded by declared type (i64 as sint64 LE, str/
-bytes length-prefixed raw bytes, bool as one byte) — never through display
-formatting. A predicate the canonicaliser cannot express is a declaration
+deduplicated, literals encoded by declared type (`i64` as 8 bytes
+two's-complement little-endian; `str`/`bytes` as u32 LE byte length
+followed by the raw bytes; `bool` as one byte, `0x00` or `0x01`) — never
+through display formatting, and never through a varint form (the §1b
+fixed-width little-endian rule governs every integer hashed anywhere in
+this ADR). A predicate the canonicaliser cannot express is a declaration
 validation error, not a silent approximation. The planner's answerability
 test (§5) compares canonical forms, so two spellings of the same
-conjunction match and anything else does not.
+conjunction match; the one admitted relaxation is §5's — extra query
+atoms over `group_by` dimensions, applied by group filtering — which only
+ever makes the query narrower than the declaration, never wider.
 
 ### 1d. Change and retirement
 
@@ -440,6 +453,21 @@ Either way the merge is exact set union on value bytes. Union preserves
 the size bound the budget check (§6) relies on: a merged state's encoded
 size never exceeds the sum of its inputs' encoded sizes.
 
+v1 distinct state is admissible over `i64`, `str`/`bytes`, and `bool`
+input columns only — exactly the types with a §1c canonical encoding.
+`COUNT DISTINCT` over a declared `f64` column is **not admissible in v1**
+(validation, §1a), and the reason parallels §4d's: the only exact
+canonical form for an f64 value is its bit pattern (`f64::to_bits` —
+ADR-0101 makes NaN payloads and `-0.0` significant and bans `==` in this
+path), under which `-0.0` and `0.0` are two distinct values and every NaN
+payload is its own value. Nothing pins the scan-side `COUNT DISTINCT`'s
+f64 equality to that same partition, and a materialised distinct count
+must equal the scan's to the last row. Deferred until the scan-side f64
+distinct equality is pinned by its own decision, the same gated-deferral
+shape as §4d. Together the two sections tell one story: a declared `f64`
+column enters v1 aggregate state only through `MIN`/`MAX`, whose total
+order §4b pins to the engine's own UDAF (ADR-0023).
+
 Exact distinct state grows without bound in NDV — there is no encoding
 that does not — so at ~10^7 NDV the arithmetic alone (10^7 values at even
 8-16 bytes each is 80-160 MB before overhead) puts any such state far past
@@ -488,7 +516,12 @@ actually contains.
 
 - **Null**: `COUNT(col)`, `SUM`, `AVG`, `MIN`/`MAX` are over non-null
   values; `null_count`/`non_null_count` are carried so `COUNT(*)`-vs-
-  `COUNT(col)` derivations stay exact. A row where the declared column's
+  `COUNT(col)` derivations stay exact. `COUNT DISTINCT(col)`'s canonical
+  value set likewise holds only non-null values: NULL never enters the
+  set and the encoding has no NULL marker, so an all-NULL input produces
+  the empty set (the §4b identity) and the materialised answer is 0,
+  exactly as SQL's `COUNT(DISTINCT col)` requires. A row where the
+  declared column's
   stored type mismatches its declaration reads NULL, exactly ADR-0090
   decision 7 — the state builder and the scan see the same NULL, by
   construction, because both decode through the same declared-column path.
@@ -524,14 +557,22 @@ before any state bytes are fetched:
 
 1. **Definition match.** The statement's canonicalised (signal, grouping
    set, aggregate list, predicate, grain) is *derivable* from one
-   declaration: its predicate's canonical form equals the declaration's
-   (v1: exact conjunction match; a weaker query predicate over grouped
-   dimensions may be applied by group filtering when every filtered
-   column is a `group_by` dimension); its grouping set is a subset of the
+   declaration: its predicate's canonical form is answerable from the
+   declaration's — either the two canonical conjunctions are equal (v1's
+   base case), or the query's conjunction is **at least as restrictive**:
+   it contains every atom of the declaration's canonical conjunction, and
+   every additional atom is over a `group_by` dimension, so the extra
+   restriction is applied exactly by filtering group tuples. The
+   direction is one-way. A query whose predicate omits any declaration
+   atom is never answerable from the state: the state holds only rows
+   the declaration's predicate admitted, and answering the wider query
+   from it would silently undercount; its grouping set is a subset of the
    declared `group_by` (merging groups is re-aggregation over the same
    monoids); its time grain is a positive integer multiple of the declared
-   grain and its time bounds align to declared-grain boundaries; every
-   aggregate is one of the declared states or an allowed algebraic
+   grain and its time bounds align to declared-grain boundaries (a
+   declaration with `time_grain_ns = 0` has no time dimension and matches
+   only statements with no time grouping and no event-time restriction);
+   every aggregate is one of the declared states or an allowed algebraic
    rewrite over them (§4b). Anything not on that list — a novel
    expression, a non-aligned bound, a differently-typed literal — is not
    provable and scans. The rule is allowlist-shaped for the same reason
@@ -741,9 +782,11 @@ the repo's pre-registration discipline when the build lands.
 - **What does not move, stated plainly.** Regexp and free-text predicates
   (no canonical predicate form); undeclared shapes (by design — this is
   the declared-only decision working as intended); high-NDV exact distinct
-  (expected fallback, §4c); float `SUM`/`AVG` (deferred, §4d); ad-hoc
-  predicates that differ from every declaration's canonical form; queries
-  with non-grain-aligned time bounds (v1 conservatism, §5). **An uncovered
+  (expected fallback, §4c); float `SUM`/`AVG` and `COUNT DISTINCT` over
+  `f64` (deferred, §4d and §4c); ad-hoc predicates that differ from every
+  declaration's canonical form other than by extra atoms over `group_by`
+  dimensions (§5); queries with non-grain-aligned time bounds (v1
+  conservatism, §5). **An uncovered
   query costs exactly what it costs today**: the full scan floor, ADR-0849
   pruning included where applicable, plus one manifest probe (bounded by
   the routing budget, cache-missable) that told the planner to scan. The
