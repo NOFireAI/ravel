@@ -3,7 +3,11 @@
 //! Thin wrapper around `ravel_bench::sql_latency`: it parses the dataset source
 //! (`--generate` or `--tenant <id>`) and the store flag, classifies the backend
 //! for the report's provenance, drives the measurement core, and prints the
-//! report as JSON plus a human table.
+//! machine-readable report as JSON on stdout and the human-readable summary on
+//! stderr. The two streams are kept separate on purpose (issue #936): stdout is
+//! the artifact alone, so it parses as one complete JSON document with nothing
+//! appended, and a check over it (`jq -e '.'`) cannot break on a trailing
+//! summary line.
 //!
 //! Gated behind the `sql-latency` feature so the default build never compiles
 //! ravel-sql/datafusion/arrow or this bin.
@@ -556,11 +560,17 @@ fn provenance_header(p: &Provenance, d: &DatasetInfo) -> String {
     out
 }
 
+/// Print the human-readable summary to STDERR, keeping stdout the
+/// machine-readable JSON artifact alone (issue #936). Writing a valid JSON
+/// document to stdout and then appending this table to the same stream left the
+/// artifact unparseable (`jq -e '.' report.json` failed at the first summary
+/// line), so nothing could assert on it. The two streams are separated here: the
+/// JSON is the only thing on stdout, and this diagnostic table goes to stderr.
 fn print_human_table(report: &SqlLatencyReport) {
     let p = &report.provenance;
     let d = &report.dataset;
-    print!("{}", provenance_header(p, d));
-    println!();
+    eprint!("{}", provenance_header(p, d));
+    eprintln!();
     // `get` is the cold run's object-store GETs; the `w_` columns are the warm
     // run's (run 1) GETs, store bytes, and fetch-cache hits, so a reader can see
     // whether the second execution dropped to plan reads only or still fetched
@@ -575,7 +585,7 @@ fn print_human_table(report: &SqlLatencyReport) {
     // rises alongside `pmiss` is a probe too short; one that rises with `pmiss`
     // flat is not. The per-phase split is in the report JSON's
     // `per_run_accounting`.
-    println!(
+    eprintln!(
         "  {:<32} | {:>9} | {:>9} | {:>9} | {:>9} | {:>7} | {:>7} | {:>7} | {:>7} | {:>7} | {:>7} | {:>9} | {:>7}",
         "id",
         "min ms",
@@ -591,7 +601,7 @@ fn print_human_table(report: &SqlLatencyReport) {
         "w_bytes",
         "w_hit"
     );
-    println!(
+    eprintln!(
         "  {:-<32}-+-{:-<9}-+-{:-<9}-+-{:-<9}-+-{:-<9}-+-{:-<7}-+-{:-<7}-+-{:-<7}-+-{:-<7}-+-{:-<7}-+-{:-<7}-+-{:-<9}-+-{:-<7}",
         "", "", "", "", "", "", "", "", "", "", "", "", ""
     );
@@ -623,7 +633,7 @@ fn print_human_table(report: &SqlLatencyReport) {
             Some([cold, ..]) => (cold.probe_misses_plan + cold.probe_misses_scan).to_string(),
             _ => "-".to_string(),
         };
-        println!(
+        eprintln!(
             "  {:<32} | {:>9.3} | {:>9.3} | {:>9.3} | {:>9.3} | {:>7} | {:>7} | {:>7} | {:>7} | {:>7} | {:>7} | {:>9} | {:>7}",
             e.id,
             e.min_ms,
@@ -643,15 +653,15 @@ fn print_human_table(report: &SqlLatencyReport) {
     print_open_shapes(report);
     print_fetch_amplification(report);
     if !report.skipped.is_empty() {
-        println!("\n  skipped (unsatisfied declared column):");
+        eprintln!("\n  skipped (unsatisfied declared column):");
         for s in &report.skipped {
-            println!("    {:<32} missing `{}`: {}", s.id, s.missing_key, s.reason);
+            eprintln!("    {:<32} missing `{}`: {}", s.id, s.missing_key, s.reason);
         }
     }
     if !report.failed.is_empty() {
-        println!("\n  failed (executed, no number):");
+        eprintln!("\n  failed (executed, no number):");
         for f in &report.failed {
-            println!("    {:<32} run {}: {}", f.id, f.run, f.error);
+            eprintln!("    {:<32} run {}: {}", f.id, f.run, f.error);
         }
     }
 }
@@ -680,18 +690,18 @@ fn print_open_shapes(report: &SqlLatencyReport) {
     if rows.is_empty() {
         return;
     }
-    println!("\n  logs-scan fast-path opens, cold run: SEGMENT opens by read shape, not requests.");
-    println!(
+    eprintln!("\n  logs-scan fast-path opens, cold run: SEGMENT opens by read shape, not requests.");
+    eprintln!(
         "  One statement can take both routes; a ranged open issues several GETs, so these are"
     );
-    println!("  not the `get` column above and cannot be summed with it.");
-    println!(
+    eprintln!("  not the `get` column above and cannot be summed with it.");
+    eprintln!(
         "  {:<32} | {:>18} | {:>12}",
         "id", "whole_object_opens", "ranged_opens",
     );
-    println!("  {:-<32}-+-{:-<18}-+-{:-<12}", "", "", "");
+    eprintln!("  {:-<32}-+-{:-<18}-+-{:-<12}", "", "", "");
     for (id, acc) in rows {
-        println!(
+        eprintln!(
             "  {:<32} | {:>18} | {:>12}",
             id, acc.logs_whole_object_opens, acc.logs_ranged_opens,
         );
@@ -718,16 +728,16 @@ fn print_fetch_amplification(report: &SqlLatencyReport) {
     if rows.is_empty() {
         return;
     }
-    println!(
+    eprintln!(
         "\n  fetch amplification, cold run: scan-phase WIRE bytes per STORED page byte decoded."
     );
-    println!(
+    eprintln!(
         "  Probe, PAGE_DIR, SKIP_IDX and directory bytes are the plan/probe phases, not the numerator."
     );
-    println!(
+    eprintln!(
         "  Not the same quantity as page_bytes_fetched / page_bytes_decoded, which is stored over stored."
     );
-    println!(
+    eprintln!(
         "  {:<32} | {:>16} | {:>16} | {:>16} | {:>16} | {:>16} | {:>25} | {:>13}",
         "id",
         "wire_bytes_scan",
@@ -738,7 +748,7 @@ fn print_fetch_amplification(report: &SqlLatencyReport) {
         "page_stored_bytes_decoded",
         "amplification",
     );
-    println!(
+    eprintln!(
         "  {:-<32}-+-{:-<16}-+-{:-<16}-+-{:-<16}-+-{:-<16}-+-{:-<16}-+-{:-<25}-+-{:-<13}",
         "", "", "", "", "", "", "", ""
     );
@@ -749,7 +759,7 @@ fn print_fetch_amplification(report: &SqlLatencyReport) {
             .map_or("-".to_string(), |p| p.wire_bytes.to_string())
     };
     for (id, acc) in rows {
-        println!(
+        eprintln!(
             "  {:<32} | {:>16} | {:>16} | {:>16} | {:>16} | {:>16} | {:>25} | {:>13.3}",
             id,
             phase(acc, "scan"),

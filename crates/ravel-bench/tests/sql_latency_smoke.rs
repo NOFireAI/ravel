@@ -310,3 +310,54 @@ async fn runs_1_reports_a_cold_number_and_equal_min_median_max() {
         );
     }
 }
+
+/// The stdout artifact parses as exactly one complete JSON document with no
+/// trailing bytes (issue #936). The bin used to write the JSON report to stdout
+/// and then append the human summary to the same stream, so `jq -e '.'` failed
+/// at the first summary line and nothing could assert on the artifact. This
+/// drives the shipping `sql_latency_bench` binary and proves stdout is the JSON
+/// alone: `serde_json::from_slice` refuses trailing non-whitespace, so a summary
+/// line leaking back onto stdout fails this test.
+#[test]
+fn the_stdout_artifact_is_one_complete_json_document_with_no_trailing_bytes() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_sql_latency_bench"))
+        .args([
+            "--generate",
+            "--store",
+            "memory",
+            "--runs",
+            "1",
+            "--records",
+            "60",
+            "--records-per-object",
+            "20",
+            "--extra-attrs",
+            "4",
+        ])
+        .output()
+        .expect("spawn sql_latency_bench");
+    assert!(
+        out.status.success(),
+        "sql_latency_bench exited non-zero: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // `from_slice` consumes the WHOLE slice as one value and errors on trailing
+    // non-whitespace, so this is the single-document-with-no-trailing-bytes
+    // assertion in one call: an appended human line makes it fail with "trailing
+    // characters".
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .expect("stdout must be exactly one complete JSON document with no trailing bytes");
+
+    // And it is the report, not some other JSON value.
+    assert!(doc.get("provenance").is_some(), "artifact carries provenance");
+    assert!(doc.get("entries").is_some(), "artifact carries entries");
+    assert!(doc.get("dataset").is_some(), "artifact carries the dataset block");
+
+    // The human summary went somewhere: it is on stderr, not stdout.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("sql_latency_bench report"),
+        "the human summary must be on stderr: {stderr}"
+    );
+}
