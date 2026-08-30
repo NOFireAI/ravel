@@ -2241,6 +2241,7 @@ mod tests {
             upstream_id: None,
             modified: Modification::Verbatim,
             required_declarations: Vec::new(),
+            class: None,
         }
     }
 
