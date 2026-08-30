@@ -3,6 +3,7 @@
   "entries": [
     {
       "id": "q01_count_all",
+      "class": "metadata_decomposable",
       "sql": "SELECT COUNT(*) FROM logs",
       "constructs": [
         "logs -> Signal::Logs",
@@ -13,6 +14,7 @@
     },
     {
       "id": "q02_count_adv_engine",
+      "class": "metadata_decomposable",
       "sql": "SELECT COUNT(*) FROM logs WHERE \"AdvEngineID\" <> 0",
       "constructs": [
         "logs -> Signal::Logs",
@@ -31,6 +33,7 @@
     },
     {
       "id": "q03_sum_count_avg",
+      "class": "full_value",
       "sql": "SELECT SUM(\"AdvEngineID\"), COUNT(*), AVG(\"ResolutionWidth\") FROM logs",
       "constructs": [
         "logs -> Signal::Logs",
@@ -54,6 +57,7 @@
     },
     {
       "id": "q04_avg_userid",
+      "class": "full_value",
       "sql": "SELECT AVG(\"UserID\") FROM logs",
       "constructs": [
         "logs -> Signal::Logs",
@@ -71,6 +75,7 @@
     },
     {
       "id": "q05_distinct_userid",
+      "class": "full_value",
       "sql": "SELECT COUNT(DISTINCT \"UserID\") FROM logs",
       "constructs": [
         "logs -> Signal::Logs",
@@ -87,6 +92,7 @@
     },
     {
       "id": "q06_distinct_searchphrase",
+      "class": "full_value",
       "sql": "SELECT COUNT(DISTINCT \"SearchPhrase\") FROM logs",
       "constructs": [
         "logs -> Signal::Logs",
@@ -103,6 +109,7 @@
     },
     {
       "id": "q07_min_max_eventdate",
+      "class": "metadata_decomposable",
       "sql": "SELECT MIN(\"EventDate\"), MAX(\"EventDate\") FROM logs",
       "constructs": [
         "logs -> Signal::Logs",
@@ -126,6 +133,7 @@
     },
     {
       "id": "q08_adv_engine_breakdown",
+      "class": "metadata_decomposable",
       "sql": "SELECT \"AdvEngineID\", COUNT(*) FROM logs WHERE \"AdvEngineID\" <> 0 GROUP BY \"AdvEngineID\" ORDER BY COUNT(*) DESC",
       "constructs": [
         "logs -> Signal::Logs",
@@ -145,6 +153,7 @@
     },
     {
       "id": "q09_region_distinct_users",
+      "class": "full_value",
       "sql": "SELECT \"RegionID\", COUNT(DISTINCT \"UserID\") AS u FROM logs GROUP BY \"RegionID\" ORDER BY u DESC LIMIT 10",
       "constructs": [
         "logs -> Signal::Logs",
@@ -167,6 +176,7 @@
     },
     {
       "id": "q10_region_aggregates",
+      "class": "full_value",
       "sql": "SELECT \"RegionID\", SUM(\"AdvEngineID\"), COUNT(*) AS c, AVG(\"ResolutionWidth\"), COUNT(DISTINCT \"UserID\") FROM logs GROUP BY \"RegionID\" ORDER BY c DESC LIMIT 10",
       "constructs": [
         "logs -> Signal::Logs",
@@ -201,6 +211,7 @@
     },
     {
       "id": "q11_mobile_model_users",
+      "class": "full_value",
       "sql": "SELECT \"MobilePhoneModel\", COUNT(DISTINCT \"UserID\") AS u FROM logs WHERE \"MobilePhoneModel\" <> '' GROUP BY \"MobilePhoneModel\" ORDER BY u DESC LIMIT 10",
       "constructs": [
         "logs -> Signal::Logs",
@@ -224,6 +235,7 @@
     },
     {
       "id": "q12_mobile_phone_model_users",
+      "class": "full_value",
       "sql": "SELECT \"MobilePhone\", \"MobilePhoneModel\", COUNT(DISTINCT \"UserID\") AS u FROM logs WHERE \"MobilePhoneModel\" <> '' GROUP BY \"MobilePhone\", \"MobilePhoneModel\" ORDER BY u DESC LIMIT 10",
       "constructs": [
         "logs -> Signal::Logs",
@@ -251,6 +263,7 @@
     },
     {
       "id": "q13_top_search_phrases",
+      "class": "full_value",
       "sql": "SELECT \"SearchPhrase\", COUNT(*) AS c FROM logs WHERE \"SearchPhrase\" <> '' GROUP BY \"SearchPhrase\" ORDER BY c DESC LIMIT 10",
       "constructs": [
         "logs -> Signal::Logs",
@@ -270,6 +283,7 @@
     },
     {
       "id": "q14_search_phrases_distinct_users",
+      "class": "full_value",
       "sql": "SELECT \"SearchPhrase\", COUNT(DISTINCT \"UserID\") AS u FROM logs WHERE \"SearchPhrase\" <> '' GROUP BY \"SearchPhrase\" ORDER BY u DESC LIMIT 10",
       "constructs": [
         "logs -> Signal::Logs",
@@ -293,6 +307,7 @@
     },
     {
       "id": "q15_engine_phrase_counts",
+      "class": "full_value",
       "sql": "SELECT \"SearchEngineID\", \"SearchPhrase\", COUNT(*) AS c FROM logs WHERE \"SearchPhrase\" <> '' GROUP BY \"SearchEngineID\", \"SearchPhrase\" ORDER BY c DESC LIMIT 10",
       "constructs": [
         "logs -> Signal::Logs",
@@ -316,6 +331,7 @@
     },
     {
       "id": "q16_top_users",
+      "class": "full_value",
       "sql": "SELECT \"UserID\", COUNT(*) FROM logs GROUP BY \"UserID\" ORDER BY COUNT(*) DESC LIMIT 10",
       "constructs": [
         "logs -> Signal::Logs",
@@ -334,6 +350,7 @@
     },
     {
       "id": "q17_top_user_phrase",
+      "class": "full_value",
       "sql": "SELECT \"UserID\", \"SearchPhrase\", COUNT(*) FROM logs GROUP BY \"UserID\", \"SearchPhrase\" ORDER BY COUNT(*) DESC LIMIT 10",
       "constructs": [
         "logs -> Signal::Logs",
@@ -356,6 +373,7 @@
     },
     {
       "id": "q18_user_phrase_limit",
+      "class": "full_value",
       "sql": "SELECT \"UserID\", \"SearchPhrase\", COUNT(*) FROM logs GROUP BY \"UserID\", \"SearchPhrase\" LIMIT 10",
       "constructs": [
         "logs -> Signal::Logs",
@@ -377,6 +395,7 @@
     },
     {
       "id": "q19_user_minute_phrase",
+      "class": "full_value",
       "sql": "SELECT \"UserID\", date_part('minute', ts) AS m, \"SearchPhrase\", COUNT(*) FROM logs GROUP BY \"UserID\", m, \"SearchPhrase\" ORDER BY COUNT(*) DESC LIMIT 10",
       "constructs": [
         "logs -> Signal::Logs",
@@ -400,6 +419,7 @@
     },
     {
       "id": "q20_userid_lookup",
+      "class": "selective",
       "sql": "SELECT \"UserID\" FROM logs WHERE \"UserID\" = 435090932899640449",
       "constructs": [
         "logs -> Signal::Logs",
@@ -417,6 +437,7 @@
     },
     {
       "id": "q21_count_google_urls",
+      "class": "selective",
       "sql": "SELECT COUNT(*) FROM logs WHERE \"URL\" LIKE '%google%'",
       "constructs": [
         "logs -> Signal::Logs",
@@ -435,6 +456,7 @@
     },
     {
       "id": "q22_google_phrase_breakdown",
+      "class": "selective",
       "sql": "SELECT \"SearchPhrase\", MIN(\"URL\"), COUNT(*) AS c FROM logs WHERE \"URL\" LIKE '%google%' AND \"SearchPhrase\" <> '' GROUP BY \"SearchPhrase\" ORDER BY c DESC LIMIT 10",
       "constructs": [
         "logs -> Signal::Logs",
@@ -460,6 +482,7 @@
     },
     {
       "id": "q23_google_title_not_google_url",
+      "class": "selective",
       "sql": "SELECT \"SearchPhrase\", MIN(\"URL\"), MIN(\"Title\"), COUNT(*) AS c, COUNT(DISTINCT \"UserID\") FROM logs WHERE \"Title\" LIKE '%Google%' AND \"URL\" NOT LIKE '%.google.%' AND \"SearchPhrase\" <> '' GROUP BY \"SearchPhrase\" ORDER BY c DESC LIMIT 10",
       "constructs": [
         "logs -> Signal::Logs",
@@ -494,6 +517,7 @@
     },
     {
       "id": "q24_google_urls_by_time",
+      "class": "selective",
       "sql": "SELECT * FROM logs WHERE \"URL\" LIKE '%google%' ORDER BY ts LIMIT 10",
       "constructs": [
         "logs -> Signal::Logs",
@@ -513,6 +537,7 @@
     },
     {
       "id": "q25_phrases_by_time",
+      "class": "full_value",
       "sql": "SELECT \"SearchPhrase\" FROM logs WHERE \"SearchPhrase\" <> '' ORDER BY ts LIMIT 10",
       "constructs": [
         "logs -> Signal::Logs",
@@ -531,6 +556,7 @@
     },
     {
       "id": "q26_phrases_alpha",
+      "class": "full_value",
       "sql": "SELECT \"SearchPhrase\" FROM logs WHERE \"SearchPhrase\" <> '' ORDER BY \"SearchPhrase\" LIMIT 10",
       "constructs": [
         "logs -> Signal::Logs",
@@ -549,6 +575,7 @@
     },
     {
       "id": "q27_phrases_time_then_phrase",
+      "class": "full_value",
       "sql": "SELECT \"SearchPhrase\" FROM logs WHERE \"SearchPhrase\" <> '' ORDER BY ts, \"SearchPhrase\" LIMIT 10",
       "constructs": [
         "logs -> Signal::Logs",
@@ -567,6 +594,7 @@
     },
     {
       "id": "q28_url_length_by_counter",
+      "class": "full_value",
       "sql": "SELECT \"CounterID\", AVG(length(\"URL\")) AS l, COUNT(*) AS c FROM logs WHERE \"URL\" <> '' GROUP BY \"CounterID\" HAVING COUNT(*) > 100000 ORDER BY l DESC LIMIT 25",
       "constructs": [
         "logs -> Signal::Logs",
@@ -594,6 +622,7 @@
     },
     {
       "id": "q29_referer_length_by_host",
+      "class": "full_value",
       "sql": "SELECT regexp_replace(\"Referer\", '^https?://(?:www\\.)?([^/]+)/.*$', '\\1') AS k, AVG(length(\"Referer\")) AS l, COUNT(*) AS c, MIN(\"Referer\") FROM logs WHERE \"Referer\" <> '' GROUP BY k HAVING COUNT(*) > 100000 ORDER BY l DESC LIMIT 25",
       "constructs": [
         "logs -> Signal::Logs",
@@ -618,6 +647,7 @@
     },
     {
       "id": "q30_resolution_running_sums",
+      "class": "full_value",
       "sql": "SELECT SUM(\"ResolutionWidth\"), SUM(\"ResolutionWidth\" + 1), SUM(\"ResolutionWidth\" + 2), SUM(\"ResolutionWidth\" + 3), SUM(\"ResolutionWidth\" + 4), SUM(\"ResolutionWidth\" + 5), SUM(\"ResolutionWidth\" + 6), SUM(\"ResolutionWidth\" + 7), SUM(\"ResolutionWidth\" + 8), SUM(\"ResolutionWidth\" + 9), SUM(\"ResolutionWidth\" + 10), SUM(\"ResolutionWidth\" + 11), SUM(\"ResolutionWidth\" + 12), SUM(\"ResolutionWidth\" + 13), SUM(\"ResolutionWidth\" + 14), SUM(\"ResolutionWidth\" + 15), SUM(\"ResolutionWidth\" + 16), SUM(\"ResolutionWidth\" + 17), SUM(\"ResolutionWidth\" + 18), SUM(\"ResolutionWidth\" + 19), SUM(\"ResolutionWidth\" + 20), SUM(\"ResolutionWidth\" + 21), SUM(\"ResolutionWidth\" + 22), SUM(\"ResolutionWidth\" + 23), SUM(\"ResolutionWidth\" + 24), SUM(\"ResolutionWidth\" + 25), SUM(\"ResolutionWidth\" + 26), SUM(\"ResolutionWidth\" + 27), SUM(\"ResolutionWidth\" + 28), SUM(\"ResolutionWidth\" + 29), SUM(\"ResolutionWidth\" + 30), SUM(\"ResolutionWidth\" + 31), SUM(\"ResolutionWidth\" + 32), SUM(\"ResolutionWidth\" + 33), SUM(\"ResolutionWidth\" + 34), SUM(\"ResolutionWidth\" + 35), SUM(\"ResolutionWidth\" + 36), SUM(\"ResolutionWidth\" + 37), SUM(\"ResolutionWidth\" + 38), SUM(\"ResolutionWidth\" + 39), SUM(\"ResolutionWidth\" + 40), SUM(\"ResolutionWidth\" + 41), SUM(\"ResolutionWidth\" + 42), SUM(\"ResolutionWidth\" + 43), SUM(\"ResolutionWidth\" + 44), SUM(\"ResolutionWidth\" + 45), SUM(\"ResolutionWidth\" + 46), SUM(\"ResolutionWidth\" + 47), SUM(\"ResolutionWidth\" + 48), SUM(\"ResolutionWidth\" + 49), SUM(\"ResolutionWidth\" + 50), SUM(\"ResolutionWidth\" + 51), SUM(\"ResolutionWidth\" + 52), SUM(\"ResolutionWidth\" + 53), SUM(\"ResolutionWidth\" + 54), SUM(\"ResolutionWidth\" + 55), SUM(\"ResolutionWidth\" + 56), SUM(\"ResolutionWidth\" + 57), SUM(\"ResolutionWidth\" + 58), SUM(\"ResolutionWidth\" + 59), SUM(\"ResolutionWidth\" + 60), SUM(\"ResolutionWidth\" + 61), SUM(\"ResolutionWidth\" + 62), SUM(\"ResolutionWidth\" + 63), SUM(\"ResolutionWidth\" + 64), SUM(\"ResolutionWidth\" + 65), SUM(\"ResolutionWidth\" + 66), SUM(\"ResolutionWidth\" + 67), SUM(\"ResolutionWidth\" + 68), SUM(\"ResolutionWidth\" + 69), SUM(\"ResolutionWidth\" + 70), SUM(\"ResolutionWidth\" + 71), SUM(\"ResolutionWidth\" + 72), SUM(\"ResolutionWidth\" + 73), SUM(\"ResolutionWidth\" + 74), SUM(\"ResolutionWidth\" + 75), SUM(\"ResolutionWidth\" + 76), SUM(\"ResolutionWidth\" + 77), SUM(\"ResolutionWidth\" + 78), SUM(\"ResolutionWidth\" + 79), SUM(\"ResolutionWidth\" + 80), SUM(\"ResolutionWidth\" + 81), SUM(\"ResolutionWidth\" + 82), SUM(\"ResolutionWidth\" + 83), SUM(\"ResolutionWidth\" + 84), SUM(\"ResolutionWidth\" + 85), SUM(\"ResolutionWidth\" + 86), SUM(\"ResolutionWidth\" + 87), SUM(\"ResolutionWidth\" + 88), SUM(\"ResolutionWidth\" + 89) FROM logs",
       "constructs": [
         "logs -> Signal::Logs",
@@ -635,6 +665,7 @@
     },
     {
       "id": "q31_engine_ip_aggregates",
+      "class": "full_value",
       "sql": "SELECT \"SearchEngineID\", \"ClientIP\", COUNT(*) AS c, SUM(\"IsRefresh\"), AVG(\"ResolutionWidth\") FROM logs WHERE \"SearchPhrase\" <> '' GROUP BY \"SearchEngineID\", \"ClientIP\" ORDER BY c DESC LIMIT 10",
       "constructs": [
         "logs -> Signal::Logs",
@@ -673,6 +704,7 @@
     },
     {
       "id": "q32_watch_ip_aggregates_filtered",
+      "class": "full_value",
       "sql": "SELECT \"WatchID\", \"ClientIP\", COUNT(*) AS c, SUM(\"IsRefresh\"), AVG(\"ResolutionWidth\") FROM logs WHERE \"SearchPhrase\" <> '' GROUP BY \"WatchID\", \"ClientIP\" ORDER BY c DESC LIMIT 10",
       "constructs": [
         "logs -> Signal::Logs",
@@ -711,6 +743,7 @@
     },
     {
       "id": "q33_watch_ip_aggregates_all",
+      "class": "full_value",
       "sql": "SELECT \"WatchID\", \"ClientIP\", COUNT(*) AS c, SUM(\"IsRefresh\"), AVG(\"ResolutionWidth\") FROM logs GROUP BY \"WatchID\", \"ClientIP\" ORDER BY c DESC LIMIT 10",
       "constructs": [
         "logs -> Signal::Logs",
@@ -744,6 +777,7 @@
     },
     {
       "id": "q34_top_urls",
+      "class": "full_value",
       "sql": "SELECT \"URL\", COUNT(*) AS c FROM logs GROUP BY \"URL\" ORDER BY c DESC LIMIT 10",
       "constructs": [
         "logs -> Signal::Logs",
@@ -762,6 +796,7 @@
     },
     {
       "id": "q35_top_urls_const_col",
+      "class": "full_value",
       "sql": "SELECT 1, \"URL\", COUNT(*) AS c FROM logs GROUP BY 1, \"URL\" ORDER BY c DESC LIMIT 10",
       "constructs": [
         "logs -> Signal::Logs",
@@ -781,6 +816,7 @@
     },
     {
       "id": "q36_clientip_offsets",
+      "class": "full_value",
       "sql": "SELECT \"ClientIP\", \"ClientIP\" - 1, \"ClientIP\" - 2, \"ClientIP\" - 3, COUNT(*) AS c FROM logs GROUP BY \"ClientIP\", \"ClientIP\" - 1, \"ClientIP\" - 2, \"ClientIP\" - 3 ORDER BY c DESC LIMIT 10",
       "constructs": [
         "logs -> Signal::Logs",
@@ -799,6 +835,7 @@
     },
     {
       "id": "q37_july_pageviews_by_url",
+      "class": "selective",
       "sql": "SELECT \"URL\", COUNT(*) AS PageViews FROM logs WHERE \"CounterID\" = 62 AND \"EventDate\" >= 15887 AND \"EventDate\" <= 15917 AND \"DontCountHits\" = 0 AND \"IsRefresh\" = 0 AND \"URL\" <> '' GROUP BY \"URL\" ORDER BY PageViews DESC LIMIT 10",
       "constructs": [
         "logs -> Signal::Logs",
@@ -840,6 +877,7 @@
     },
     {
       "id": "q38_july_pageviews_by_title",
+      "class": "selective",
       "sql": "SELECT \"Title\", COUNT(*) AS PageViews FROM logs WHERE \"CounterID\" = 62 AND \"EventDate\" >= 15887 AND \"EventDate\" <= 15917 AND \"DontCountHits\" = 0 AND \"IsRefresh\" = 0 AND \"Title\" <> '' GROUP BY \"Title\" ORDER BY PageViews DESC LIMIT 10",
       "constructs": [
         "logs -> Signal::Logs",
@@ -881,6 +919,7 @@
     },
     {
       "id": "q39_july_pageviews_link_download",
+      "class": "selective",
       "sql": "SELECT \"URL\", COUNT(*) AS PageViews FROM logs WHERE \"CounterID\" = 62 AND \"EventDate\" >= 15887 AND \"EventDate\" <= 15917 AND \"IsRefresh\" = 0 AND \"IsLink\" <> 0 AND \"IsDownload\" = 0 GROUP BY \"URL\" ORDER BY PageViews DESC LIMIT 10 OFFSET 1000",
       "constructs": [
         "logs -> Signal::Logs",
@@ -927,6 +966,7 @@
     },
     {
       "id": "q40_traffic_source_funnel",
+      "class": "selective",
       "sql": "SELECT \"TraficSourceID\", \"SearchEngineID\", \"AdvEngineID\", CASE WHEN (\"SearchEngineID\" = 0 AND \"AdvEngineID\" = 0) THEN \"Referer\" ELSE '' END AS Src, \"URL\" AS Dst, COUNT(*) AS PageViews FROM logs WHERE \"CounterID\" = 62 AND \"EventDate\" >= 15887 AND \"EventDate\" <= 15917 AND \"IsRefresh\" = 0 GROUP BY \"TraficSourceID\", \"SearchEngineID\", \"AdvEngineID\", Src, Dst ORDER BY PageViews DESC LIMIT 10 OFFSET 1000",
       "constructs": [
         "logs -> Signal::Logs",
@@ -982,6 +1022,7 @@
     },
     {
       "id": "q41_urlhash_date_pageviews",
+      "class": "selective",
       "sql": "SELECT \"URLHash\", \"EventDate\", COUNT(*) AS PageViews FROM logs WHERE \"CounterID\" = 62 AND \"EventDate\" >= 15887 AND \"EventDate\" <= 15917 AND \"IsRefresh\" = 0 AND \"TraficSourceID\" IN (-1, 6) AND \"RefererHash\" = 3594120000172545465 GROUP BY \"URLHash\", \"EventDate\" ORDER BY PageViews DESC LIMIT 10 OFFSET 100",
       "constructs": [
         "logs -> Signal::Logs",
@@ -1029,6 +1070,7 @@
     },
     {
       "id": "q42_window_dims_pageviews",
+      "class": "selective",
       "sql": "SELECT \"WindowClientWidth\", \"WindowClientHeight\", COUNT(*) AS PageViews FROM logs WHERE \"CounterID\" = 62 AND \"EventDate\" >= 15887 AND \"EventDate\" <= 15917 AND \"IsRefresh\" = 0 AND \"DontCountHits\" = 0 AND \"URLHash\" = 2868770270353813622 GROUP BY \"WindowClientWidth\", \"WindowClientHeight\" ORDER BY PageViews DESC LIMIT 10 OFFSET 10000",
       "constructs": [
         "logs -> Signal::Logs",
@@ -1079,6 +1121,7 @@
     },
     {
       "id": "q43_per_minute_pageviews",
+      "class": "selective",
       "sql": "SELECT DATE_TRUNC('minute', ts) AS M, COUNT(*) AS PageViews FROM logs WHERE \"CounterID\" = 62 AND \"EventDate\" >= 15900 AND \"EventDate\" <= 15901 AND \"IsRefresh\" = 0 AND \"DontCountHits\" = 0 GROUP BY DATE_TRUNC('minute', ts) ORDER BY DATE_TRUNC('minute', ts) LIMIT 10 OFFSET 1000",
       "constructs": [
         "logs -> Signal::Logs",

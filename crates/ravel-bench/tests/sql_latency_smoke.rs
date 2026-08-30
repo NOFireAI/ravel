@@ -225,6 +225,7 @@ async fn an_entry_with_an_unsatisfied_required_declaration_is_skipped_with_the_k
             "duration_ms",
             RequiredDeclaredType::I64,
         )],
+        class: None,
     };
     let window = TimeRange {
         start_ns: 0,
