@@ -178,16 +178,7 @@ impl RlogRangeReader {
             let raw = page_dir_raw.ok_or_else(|| {
                 LogSegError::Corrupted("object opened without its PAGE_DIR section".into())
             })?;
-            let dir = PageDir::decode(raw)?;
-            dir.validate_extents(blocks.len)?;
-            if dir.block_count() != skip.l0.len() as u64 {
-                return Err(LogSegError::Corrupted(format!(
-                    "page_dir covers {} blocks but skip index has {}",
-                    dir.block_count(),
-                    skip.l0.len()
-                )));
-            }
-            dir
+            PageDir::decode_validated(raw, blocks.len, skip.l0.len())?
         };
         Ok(RlogRangeReader {
             stream_dir,
