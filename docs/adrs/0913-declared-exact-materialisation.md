@@ -850,12 +850,12 @@ subject to the §6 budget check against measured group cardinality. The
 three borderline entries are predictions from estimated NDV, not
 measurements; T7's pass settles them.
 
-### Excluded by shape (7) — certain, no measurement needed
+### Excluded by shape (7): certain, no measurement needed
 
 - `q25`, `q26`, `q27`: **no aggregate at all.** `SELECT "SearchPhrase" ...
   ORDER BY ts LIMIT 10` is top-N row retrieval. There is nothing to
   pre-aggregate, and no materialisation of any design answers them.
-- `q28`, `q29`: novel expressions — `AVG(length("URL"))`,
+- `q28`, `q29`: novel expressions such as `AVG(length("URL"))` and
   `regexp_replace("Referer", ...)`. Not declared columns, so no canonical
   definition exists to hash.
 - `q36`: arithmetic in the grouping set, `GROUP BY "ClientIP",
@@ -883,10 +883,10 @@ covered more cheaply.
 This is a fact about ClickBench, not a defect in the design. The corpus is
 adversarial for pre-aggregation by construction: near-unique synthetic ids
 in the grouping sets, exact distinct over ten million users, and three
-statements that are not aggregates. The workload declared materialisations
-exist for — a tenant's dashboards, with bounded grouping sets over
-service, route and status, re-evaluated on a schedule — is the opposite
-shape, and is not represented in this corpus at all.
+statements that are not aggregates. The workload-declared materialisations
+exist for is the opposite shape: a tenant's dashboards, with bounded
+grouping sets over service, route and status, re-evaluated on a schedule.
+It is not represented in this corpus at all.
 
 The honest framing for the epic: this design is accepted on its merits for
 Ravel's real query mix, and the ClickBench Class-F residue is largely
