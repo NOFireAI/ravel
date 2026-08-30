@@ -616,6 +616,19 @@ pub(crate) struct DeclaredGroupCounts {
     pub(crate) null_count: u64,
 }
 
+/// Exact aggregate inputs for the `SUM(col + k)` and `AVG(col)` decompositions
+/// (ADR-0850's q03/q04/q30 shapes, #861), from
+/// [`LogsScanExec::declared_column_sum`]: the exact sum of every touched
+/// segment's non-null values, in `i128` so the cross-segment fold cannot
+/// overflow, plus the exact count of those non-null rows. `SUM(col + k)` is
+/// `sum + k * non_null_count`, `AVG(col)` is `sum / non_null_count`, and both
+/// are `NULL` when `non_null_count == 0` (SQL sum/avg over all-null or zero-row
+/// input), so the caller needs both figures.
+pub(crate) struct DeclaredColumnSum {
+    pub(crate) sum: i128,
+    pub(crate) non_null_count: u64,
+}
+
 /// Log segment scan producing block-at-a-time batches over a projection of the
 /// public `logs` schema. Declares no ordering (ADR-0087 decision 1).
 pub struct LogsScanExec {
@@ -1428,6 +1441,50 @@ impl LogsScanExec {
         Some(DeclaredGroupCounts {
             counts: merged.into_iter().collect(),
             null_count,
+        })
+    }
+
+    /// Exact sum and non-null count for the declared column at schema index
+    /// `FIRST_DECLARED_COL + k` (ADR-0850's q03/q04/q30 shapes, #861), summed
+    /// across every touched segment's exact per-object statistics. `None` means
+    /// fall back to scanning, for the same reasons
+    /// [`Self::declared_not_equal_count`] does (the [`Self::stats_are_exact`]
+    /// gate: no pending erasure, no content or prune predicate, a ts bound that
+    /// clips no touched segment), plus two specific to this path:
+    ///
+    /// - the column is not integer-typed. A sum is stored for `I64` columns
+    ///   only (#861): a float fold would be order-dependent, so a non-`I64`
+    ///   column carries no sum and its `SUM`/`AVG` scans;
+    /// - a touched segment's stat omits its sum. That happens for a would-be
+    ///   float column, for an exact per-object sum that overflowed `i64` at fold
+    ///   time, or for a segment never covered by the loaded stats. In every case
+    ///   there is no exact sum to add, so the whole answer declines rather than
+    ///   undercounting.
+    ///
+    /// Unlike the q02/q08 dictionary paths this needs no `dictionary_present`:
+    /// the sum is exact independently of whether the value dictionary was kept,
+    /// so a high-cardinality integer column still decomposes.
+    pub(crate) fn declared_column_sum(&self, k: usize) -> Option<DeclaredColumnSum> {
+        if !self.stats_are_exact() {
+            return None;
+        }
+        let declared = self.declared.get(k)?;
+        if !matches!(declared.ty, DeclaredType::I64) {
+            return None;
+        }
+        let stats = self.column_stats.as_ref()?;
+        let mut sum: i128 = 0;
+        let mut non_null_count: u64 = 0;
+        for seg in self.segments.iter() {
+            let seg_stats = stats.segments.get(&segment_identity(seg))?;
+            let stat = seg_stats.columns.iter().find(|c| c.name == declared.key)?;
+            let seg_sum = stat.sum?;
+            sum = sum.checked_add(i128::from(seg_sum))?;
+            non_null_count = non_null_count.checked_add(stat.non_null_count)?;
+        }
+        Some(DeclaredColumnSum {
+            sum,
+            non_null_count,
         })
     }
 
