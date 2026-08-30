@@ -3929,7 +3929,7 @@ type = "i64"
             "acme",
             &mapping_path,
             4,
-            10_000,
+            Some(10_000),
             None,
             1,
             DEFAULT_MAX_INFLIGHT_FLUSHES,
@@ -4122,7 +4122,7 @@ type = "i64"
             "acme",
             &m,
             4,
-            10,
+            Some(10),
             None,
             1,
             DEFAULT_MAX_INFLIGHT_FLUSHES,
@@ -4169,7 +4169,7 @@ type = "i64"
             "acme",
             &m,
             4,
-            10,
+            Some(10),
             None,
             1,
             0,
@@ -4192,6 +4192,246 @@ type = "i64"
                 .contains("--max-inflight-flushes must be at least 1"),
             "the error names the lever: {err}"
         );
+    }
+
+    /// An omitted `--read-cursors` sizes to the configured `--shards`, exactly,
+    /// for every shard count. Entity-sorted input (a file sorted by a
+    /// resource-attribute column) fills a sequential reader's every batch from
+    /// one stream, so a cursor count below the shard count leaves
+    /// `--shards - 1` shards with nothing to encode; the default must not need
+    /// the operator to notice that.
+    ///
+    /// Row groups are 64 here so the row-group clamp is never what produces the
+    /// answer: at 64 groups every one of these shard counts is reachable, and
+    /// each assertion is the shard count itself and not a coincidence of the
+    /// clamp. `read_cursors_default_is_clamped_to_the_row_group_count` below
+    /// covers the clamp on its own.
+    ///
+    /// Non-vacuity (prove-the-test): flipping `resolve_read_cursors`'s
+    /// `None => (shards as usize).min(row_group_count).max(1)` arm to
+    /// `None => 1` fails this at the first shard count above 1 (`1` against
+    /// `2`), and leaves every other test in this file passing.
+    #[test]
+    fn read_cursors_default_to_the_shard_count() {
+        const ROW_GROUPS: usize = 64;
+        assert_eq!(resolve_read_cursors(None, 1, ROW_GROUPS), 1);
+        assert_eq!(resolve_read_cursors(None, 2, ROW_GROUPS), 2);
+        assert_eq!(resolve_read_cursors(None, 4, ROW_GROUPS), 4);
+        assert_eq!(resolve_read_cursors(None, 8, ROW_GROUPS), 8);
+        assert_eq!(resolve_read_cursors(None, 16, ROW_GROUPS), 16);
+    }
+
+    /// The default is clamped down to the row-group count, because more cursors
+    /// than row groups cannot each own a distinct contiguous partition. This is
+    /// the one case where the answer is not the shard count.
+    #[test]
+    fn read_cursors_default_is_clamped_to_the_row_group_count() {
+        assert_eq!(resolve_read_cursors(None, 16, 3), 3);
+        // A file with no row groups still opens one (exhausted) cursor.
+        assert_eq!(resolve_read_cursors(None, 16, 0), 1);
+    }
+
+    /// An explicit `--read-cursors` still wins over the shard-sized default,
+    /// both below and above the shard count. The default chooses for an
+    /// operator who did not; it does not overrule one who did.
+    #[test]
+    fn explicit_read_cursors_wins_over_the_shard_default() {
+        assert_eq!(resolve_read_cursors(Some(1), 8, 64), 1);
+        assert_eq!(resolve_read_cursors(Some(3), 8, 64), 3);
+        assert_eq!(resolve_read_cursors(Some(32), 8, 64), 32);
+    }
+
+    /// Rows per batch that the size-aware `--batch-rows` default (issue #680)
+    /// produces, pinned at exact values across three input scales.
+    ///
+    /// `BLOCK` and `RESIDENT` are the production inputs: the RLOG writer's own
+    /// block target and the default resident batch count
+    /// (`--pipeline-depth 4` + `--decode-queue-batches 2`).
+    ///
+    /// Non-vacuity (prove-the-test): deleting the
+    /// `total_rows < SIZE_AWARE_BATCH_ROWS_MIN_ROWS` early return fails the
+    /// small case (32768 against 10000); deleting the `.min(memory_cap_rows)`
+    /// fails the wide case (32768 against 14913); deleting the
+    /// `.max(DEFAULT_BATCH_ROWS)` floor fails
+    /// `derived_batch_rows_never_falls_below_the_historical_default`.
+    #[test]
+    fn size_aware_batch_rows_pins_exact_values() {
+        const BLOCK: usize = 8_192;
+        const RESIDENT: usize = DEFAULT_PIPELINE_DEPTH + DEFAULT_DECODE_QUEUE_BATCHES;
+
+        // Small: 100k rows at 100 uncompressed bytes/row. Under the
+        // million-row threshold, so the historical default is unchanged and a
+        // fixture load writes exactly the objects it always wrote.
+        assert_eq!(
+            resolve_batch_rows(None, 4, 100_000, 10_000_000, BLOCK, RESIDENT),
+            10_000
+        );
+
+        // Large, narrow: 100M rows at 700 uncompressed bytes/row (the shape of
+        // ClickBench's hits.parquet). The per-shard block floor decides:
+        // 4 shards x 8192 rows, so each shard's average slice fills one block
+        // instead of writing a short one. The memory cap is 255652 rows here
+        // and does not bind.
+        assert_eq!(
+            resolve_batch_rows(None, 4, 100_000_000, 70_000_000_000, BLOCK, RESIDENT),
+            32_768
+        );
+
+        // Large, narrow, wider shard count: the floor scales with `--shards`,
+        // because a batch's rows split across all of them.
+        assert_eq!(
+            resolve_batch_rows(None, 16, 100_000_000, 70_000_000_000, BLOCK, RESIDENT),
+            131_072
+        );
+
+        // Large, wide: 2M rows at 12,000 uncompressed bytes/row. Now the
+        // resident-set cap binds below the block floor: 1 GiB / 6 batches /
+        // 12000 bytes = 14913 rows, so the derivation stops there rather than
+        // sizing a batch by row count alone.
+        assert_eq!(
+            resolve_batch_rows(None, 4, 2_000_000, 24_000_000_000, BLOCK, RESIDENT),
+            14_913
+        );
+    }
+
+    /// The memory cap can lower the derived value toward the historical
+    /// default, never past it: this derivation picks a default, it does not
+    /// impose a memory limit that the previous fixed default already exceeded.
+    /// 40,000 bytes/row caps at 4473 rows; the floor keeps it at 10,000.
+    #[test]
+    fn derived_batch_rows_never_falls_below_the_historical_default() {
+        const BLOCK: usize = 8_192;
+        const RESIDENT: usize = DEFAULT_PIPELINE_DEPTH + DEFAULT_DECODE_QUEUE_BATCHES;
+        assert_eq!(
+            resolve_batch_rows(None, 4, 2_000_000, 80_000_000_000, BLOCK, RESIDENT),
+            DEFAULT_BATCH_ROWS
+        );
+    }
+
+    /// An explicit `--batch-rows` is returned verbatim at every input scale,
+    /// including values the derivation would never choose (below the historical
+    /// default, and above both the block floor and the memory cap). The
+    /// operator's number is the object-layout lever; a default that quietly
+    /// overrode it would make a measured layout unreproducible.
+    #[test]
+    fn explicit_batch_rows_wins_over_the_derivation() {
+        const BLOCK: usize = 8_192;
+        const RESIDENT: usize = DEFAULT_PIPELINE_DEPTH + DEFAULT_DECODE_QUEUE_BATCHES;
+        assert_eq!(
+            resolve_batch_rows(Some(1), 4, 100_000_000, 70_000_000_000, BLOCK, RESIDENT),
+            1
+        );
+        assert_eq!(
+            resolve_batch_rows(Some(40_000), 4, 100_000_000, 70_000_000_000, BLOCK, RESIDENT),
+            40_000
+        );
+        // Small input, where the derivation would have returned 10,000.
+        assert_eq!(
+            resolve_batch_rows(Some(500_000), 4, 100_000, 10_000_000, BLOCK, RESIDENT),
+            500_000
+        );
+    }
+
+    /// The block target the derivation floors at is the RLOG writer's own, read
+    /// from the same `RlogConfig::default()` the loader's router builds its
+    /// shards from, not a copy that can drift. This pins both halves: the
+    /// writer's value, and that the derivation multiplies exactly it by the
+    /// shard count.
+    #[test]
+    fn derived_batch_rows_uses_the_writers_own_block_target() {
+        let block = ravel_logseg::RlogConfig::default().block_target_records;
+        assert_eq!(block, 8_192, "the RLOG writer's block target");
+        assert_eq!(
+            resolve_batch_rows(
+                None,
+                4,
+                100_000_000,
+                70_000_000_000,
+                block,
+                DEFAULT_PIPELINE_DEPTH + DEFAULT_DECODE_QUEUE_BATCHES,
+            ),
+            4 * block
+        );
+    }
+
+    /// Every knob that decides what objects a load leaves behind appears in the
+    /// effective-configuration report, under its own flag spelling, so a run is
+    /// reconstructable from its own output rather than from what the operator
+    /// remembers typing.
+    ///
+    /// The exhaustive destructure is the part that survives a future knob: a
+    /// field added to `EffectiveLoadConfig` fails to compile here until it is
+    /// named, and `effective_config_lines` destructures the same way, so a knob
+    /// that is carried but never rendered is an unused binding the `-D warnings`
+    /// gate refuses.
+    #[test]
+    fn effective_config_report_names_every_object_layout_knob() {
+        let config = EffectiveLoadConfig {
+            shards: 4,
+            batch_rows: 32_768,
+            batch_rows_source: ConfigSource::Derived,
+            read_cursors: 4,
+            read_cursors_source: ConfigSource::Derived,
+            pipeline_depth: 4,
+            max_inflight_flushes: 4,
+            decode_queue_batches: 2,
+            target_bytes: 1,
+        };
+        let EffectiveLoadConfig {
+            shards,
+            batch_rows,
+            batch_rows_source,
+            read_cursors,
+            read_cursors_source,
+            pipeline_depth,
+            max_inflight_flushes,
+            decode_queue_batches,
+            target_bytes,
+        } = config;
+        let rendered = effective_config_lines(&config).join("\n");
+
+        for (flag, value) in [
+            ("--shards", shards.to_string()),
+            ("--batch-rows", batch_rows.to_string()),
+            ("--read-cursors", read_cursors.to_string()),
+            ("--pipeline-depth", pipeline_depth.to_string()),
+            ("--max-inflight-flushes", max_inflight_flushes.to_string()),
+            ("--decode-queue-batches", decode_queue_batches.to_string()),
+            ("--target-bytes", target_bytes.to_string()),
+        ] {
+            let line = rendered
+                .lines()
+                .find(|l| l.trim_start().starts_with(flag))
+                .unwrap_or_else(|| panic!("the report must name {flag}; got:\n{rendered}"));
+            assert!(
+                line.contains(&value),
+                "{flag} must report its effective value {value}; got: {line}"
+            );
+        }
+
+        // The two derived knobs also say they were derived, so an operator can
+        // tell a value they chose from one the loader chose for them.
+        assert!(
+            rendered.contains(&format!("--batch-rows           : 32768 ({batch_rows_source})")),
+            "got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("--read-cursors         : 4 ({read_cursors_source})")),
+            "got:\n{rendered}"
+        );
+        assert_eq!(batch_rows_source, ConfigSource::Derived);
+        assert_eq!(read_cursors_source, ConfigSource::Derived);
+    }
+
+    /// A flag the operator passed is reported as explicit, one they omitted as
+    /// derived. Without this the report would be reconstructable but would not
+    /// say which half of it was the loader's choice.
+    #[test]
+    fn config_source_distinguishes_a_passed_flag_from_a_derived_one() {
+        assert_eq!(config_source(Some(4usize)), ConfigSource::Explicit);
+        assert_eq!(config_source(None::<usize>), ConfigSource::Derived);
+        assert_eq!(ConfigSource::Explicit.to_string(), "explicit");
+        assert_eq!(ConfigSource::Derived.to_string(), "derived");
     }
 
     /// The loader's two write windows compose as
@@ -4410,7 +4650,7 @@ type = "i64"
                     "acme",
                     &m,
                     4,
-                    2,
+                    Some(2),
                     None,
                     2,
                     DEFAULT_MAX_INFLIGHT_FLUSHES,
@@ -4594,7 +4834,7 @@ type = "i64"
             "acme",
             &m,
             1,
-            2,
+            Some(2),
             None,
             1,
             DEFAULT_MAX_INFLIGHT_FLUSHES,
@@ -4896,7 +5136,7 @@ type = "i64"
             "acme",
             &m,
             1,
-            2,
+            Some(2),
             None,
             1,
             DEFAULT_MAX_INFLIGHT_FLUSHES,
@@ -5121,6 +5361,98 @@ type = "i64"
         (dir, pq, m)
     }
 
+    /// A real load through the loader's own entry point reports the knobs it
+    /// ran with, including the two it derived. The pure-function tests above
+    /// prove the derivations; this proves the load actually uses them and
+    /// carries them out to the caller, which is what makes an object count
+    /// attributable to a configuration.
+    #[tokio::test]
+    async fn a_load_reports_the_defaults_it_chose() {
+        use ravel_object_store::memory::MemoryStore;
+
+        let shards = 4u32;
+        // 4 row groups, so the row-group clamp is not what sets the cursor
+        // count: `--shards` is.
+        let (_dir, pq, m) = sorted_by_shard_fixture(shards, 4);
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+
+        let report = load_instrumented(
+            store,
+            &pq,
+            "acme",
+            &m,
+            shards,
+            None,
+            None,
+            2,
+            DEFAULT_MAX_INFLIGHT_FLUSHES,
+            DEFAULT_DECODE_QUEUE_BATCHES,
+            DEFAULT_TARGET_BYTES,
+            NOW_NS,
+            Arc::new(FixedClock(NOW_NS)),
+            LoadPath::Columnar,
+            None,
+            None,
+        )
+        .await
+        .expect("load succeeds");
+
+        assert_eq!(
+            report.effective,
+            EffectiveLoadConfig {
+                shards: 4,
+                // 16 rows is far under the size-aware threshold, so a small
+                // input still loads exactly as it did before the derivation.
+                batch_rows: DEFAULT_BATCH_ROWS,
+                batch_rows_source: ConfigSource::Derived,
+                // One cursor per shard, with neither flag given.
+                read_cursors: 4,
+                read_cursors_source: ConfigSource::Derived,
+                pipeline_depth: 2,
+                max_inflight_flushes: DEFAULT_MAX_INFLIGHT_FLUSHES,
+                decode_queue_batches: DEFAULT_DECODE_QUEUE_BATCHES,
+                target_bytes: DEFAULT_TARGET_BYTES,
+            }
+        );
+    }
+
+    /// The same load with both flags passed reports the operator's values, and
+    /// says they were the operator's.
+    #[tokio::test]
+    async fn a_load_reports_explicit_flags_as_explicit() {
+        use ravel_object_store::memory::MemoryStore;
+
+        let shards = 4u32;
+        let (_dir, pq, m) = sorted_by_shard_fixture(shards, 4);
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+
+        let report = load_instrumented(
+            store,
+            &pq,
+            "acme",
+            &m,
+            shards,
+            Some(3),
+            Some(2),
+            2,
+            DEFAULT_MAX_INFLIGHT_FLUSHES,
+            DEFAULT_DECODE_QUEUE_BATCHES,
+            DEFAULT_TARGET_BYTES,
+            NOW_NS,
+            Arc::new(FixedClock(NOW_NS)),
+            LoadPath::Columnar,
+            None,
+            None,
+        )
+        .await
+        .expect("load succeeds");
+
+        assert_eq!(report.effective.batch_rows, 3);
+        assert_eq!(report.effective.batch_rows_source, ConfigSource::Explicit);
+        assert_eq!(report.effective.read_cursors, 2);
+        assert_eq!(report.effective.read_cursors_source, ConfigSource::Explicit);
+    }
+
     #[tokio::test]
     async fn stride_reading_spreads_a_sorted_batch_across_all_shards() {
         use ravel_object_store::memory::MemoryStore;
@@ -5238,7 +5570,7 @@ type = "i64"
                     "acme",
                     &m,
                     shards,
-                    rows_per_group,
+                    Some(rows_per_group),
                     Some(shards as usize),
                     // Wide enough to hold every batch that accumulates into one
                     // flush; below this the loader would block on an ack no
@@ -5328,7 +5660,7 @@ type = "i64"
             "acme",
             &m,
             shards,
-            rows_per_group,
+            Some(rows_per_group),
             Some(shards as usize),
             rows_per_group,
             DEFAULT_MAX_INFLIGHT_FLUSHES,
@@ -5378,7 +5710,7 @@ type = "i64"
             "acme",
             &m,
             4,
-            4,
+            Some(4),
             Some(4),
             1,
             DEFAULT_MAX_INFLIGHT_FLUSHES,
@@ -5523,7 +5855,7 @@ type = "i64"
             "acme",
             &mapping_path,
             shards,
-            batch_rows,
+            Some(batch_rows),
             Some(1),
             1,
             DEFAULT_MAX_INFLIGHT_FLUSHES,
@@ -5552,7 +5884,7 @@ type = "i64"
             "acme",
             &mapping_path,
             shards,
-            batch_rows,
+            Some(batch_rows),
             Some(4),
             1,
             DEFAULT_MAX_INFLIGHT_FLUSHES,
@@ -5595,7 +5927,7 @@ type = "i64"
             "acme",
             &mapping_path,
             shards,
-            batch_rows,
+            Some(batch_rows),
             Some(1),
             1,
             DEFAULT_MAX_INFLIGHT_FLUSHES,
@@ -6479,7 +6811,7 @@ type = "i64"
             tenant,
             mapping,
             shards,
-            batch_rows,
+            Some(batch_rows),
             read_cursors,
             1,
             DEFAULT_MAX_INFLIGHT_FLUSHES,
@@ -6862,7 +7194,7 @@ type = "i64"
                 "acme",
                 &m,
                 shards,
-                1,
+                Some(1),
                 None,
                 PIPELINE_DEPTH,
                 flushes,
@@ -6995,7 +7327,7 @@ type = "i64"
                 "acme",
                 &m,
                 shards,
-                1,
+                Some(1),
                 None,
                 depth,
                 flushes,

@@ -2322,6 +2322,73 @@ mod tests {
         );
     }
 
+    /// `--batch-rows` and `--read-cursors` must reach the loader as `None` when
+    /// the operator omits them, because that is what selects the size-aware and
+    /// shard-sized defaults (issue #680). A `default_value_t` on either flag
+    /// would make every run look explicit and pin the value at the flag layer,
+    /// where the input's row count and row-group count are not yet known.
+    ///
+    /// Non-vacuity (prove-the-test): the pre-change tree had
+    /// `#[arg(long, default_value_t = ravel_cli::load::DEFAULT_BATCH_ROWS)]
+    /// batch_rows: usize`, which does not compile against `assert_eq!(...,
+    /// None)` at all; restoring it as `Option<usize>` with a `default_value_t`
+    /// fails this on `Some(10000)` against `None`.
+    #[test]
+    fn load_input_sized_flags_default_to_none() {
+        let cli = Cli::try_parse_from([
+            "ravel",
+            "load",
+            "--parquet",
+            "hits.parquet",
+            "--tenant",
+            "acme",
+            "--mapping",
+            "hits.toml",
+        ])
+        .expect("a load invocation with no sizing flags parses");
+
+        let Command::Load {
+            batch_rows,
+            read_cursors,
+            ..
+        } = cli.command
+        else {
+            panic!("expected the load subcommand");
+        };
+
+        assert_eq!(
+            batch_rows, None,
+            "--batch-rows must reach the loader unset, so it derives a size-aware default"
+        );
+        assert_eq!(
+            read_cursors, None,
+            "--read-cursors must reach the loader unset, so it derives one cursor per shard"
+        );
+    }
+
+    /// An explicit `--batch-rows` still parses through to the loader verbatim.
+    #[test]
+    fn load_batch_rows_flag_is_passed_through() {
+        let cli = Cli::try_parse_from([
+            "ravel",
+            "load",
+            "--parquet",
+            "hits.parquet",
+            "--tenant",
+            "acme",
+            "--mapping",
+            "hits.toml",
+            "--batch-rows",
+            "40000",
+        ])
+        .expect("a load invocation with --batch-rows parses");
+
+        let Command::Load { batch_rows, .. } = cli.command else {
+            panic!("expected the load subcommand");
+        };
+        assert_eq!(batch_rows, Some(40_000));
+    }
+
     #[test]
     fn status_mask_names_known_bits() {
         assert_eq!(rspan_status_mask_names(0), "none");

@@ -78,18 +78,39 @@ ravel-cli --store <your-store-flags> load \
   --parquet /path/to/hits.parquet \
   --tenant clickbench \
   --mapping benchmarks/clickbench/hits.mapping.toml \
-  --shards 4 \
-  --batch-rows 40000 \
-  --read-cursors 4 \
-  --pipeline-depth 4 \
-  --max-inflight-flushes 4 \
-  --decode-queue-batches 2 \
-  --target-bytes 1
+  --shards 4
 ```
 
-The two write-concurrency flags are spelled out here only because this is a
-worked example; both already default to `4`, so omitting them loads the same
-way. Set them to `1` to reproduce the pre-issue-#800 serial behaviour.
+No tuning flags. `load --parquet` exists to import one large Parquet file, and
+its defaults are chosen for that: `--read-cursors` sizes itself to `--shards`,
+`--batch-rows` derives from the input's own row count and byte size, and the
+write-concurrency and buffering flags (`--pipeline-depth`,
+`--max-inflight-flushes`, `--decode-queue-batches`, `--target-bytes`) already
+default to the values this load wants (`4`, `4`, `2`, `1`). `--shards 4` is
+also the default; it is spelled out because the shard count is a provisioning
+decision written durably to the signal's record at first touch, not a per-load
+knob you can revisit.
+
+The load prints the values it actually ran with, so the object count it reports
+is attributable without re-deriving anything:
+
+```text
+bulk load complete
+  rows processed   : 99997497
+  ...
+  effective configuration:
+    --shards               : 4
+    --batch-rows           : 32768 (derived)
+    --read-cursors         : 4 (derived)
+    --pipeline-depth       : 4
+    --max-inflight-flushes : 4
+    --decode-queue-batches : 2
+    --target-bytes         : 1
+```
+
+`derived` means the loader chose the value because the flag was omitted;
+`explicit` means it is yours verbatim. The rest of this section is why each of
+those defaults is what it is, and when to override one.
 
 `--batch-rows` is the object-count lever. One batch is one Strict flush, which is
 one RLOG object per shard the batch's rows land on. Per-object cost (LIST,
@@ -98,41 +119,55 @@ everything the columnar and pushdown work saves, so object count is a
 first-class variable: raise `--batch-rows` for fewer, larger objects; lower it
 for the opposite. Measure both if you care where the time goes.
 
+Its default is derived from the file rather than fixed, because the same number
+cannot serve a four-row fixture and a 100M-row import. Below a million rows the
+loader keeps the historical `10000` and a small load is unchanged. Above it, the
+default is `--shards` x the RLOG block target (8192 rows) — `32768` at four
+shards — capped by what the resident batch working set can hold at the input's
+own average uncompressed bytes per row. The `--shards` term is the arithmetic in
+the next paragraph, applied for you.
+
+`hits.mapping.toml` declares `CounterID` as a `resource_attribute` (issue
+#519), so it is part of stream identity and `shard_for_log` hashes it to pick
+a shard: rows spread across all `--shards` instead of every row landing on
+shard 0. That is what makes the batch-rows arithmetic depend on the shard
+count. A batch's rows split across up to `--shards` shards, and each shard's
+slice flushes as its own object *immediately* (at the default
+`--target-bytes 1`) — before it can reach the `block_target_records` block
+target (8192 rows). At a fixed `--batch-rows 10000` with `--shards 4` a shard's
+slice averages ~2500 rows, well under one full block, and object count inflates
+well past `--shards`x rather than by a clean multiple. The derived default is
+exactly the smallest batch that keeps each shard's average slice at one full
+block (`32768 / 4 = 8192` rows/shard), and it tracks `--shards` on its own, so
+raising the shard count no longer means remembering to raise this too. Pass
+`--batch-rows` explicitly to trade further in either direction: larger for
+fewer, bigger objects at linear memory cost; smaller if the box cannot hold the
+working set.
+
+This `--batch-rows`-scales-with-`--shards` sizing floor is unaffected by
+`--read-cursors`: stride reading changes which rows a batch is assembled
+*from*, not how many rows in total each shard receives per batch, so the
+8192-rows-per-shard floor holds at any cursor count.
+
 `--read-cursors` matters because `hits.parquet` is globally sorted by
 `CounterID` (issue #560), and `CounterID` is `hits.mapping.toml`'s sole
 `resource_attribute`. A single sequential reader therefore fills every
 `--batch-rows` batch with one contiguous run of one `CounterID` value: one
 `shard_for_log` hash, one shard, and one core doing all of that batch's encode
-work while the other `--shards - 1` sit idle. `--read-cursors 4` opens 4 stride
-cursors over disjoint, near-even, far-apart row-group partitions and assembles
-each batch from a contiguous run out of every live cursor, so one batch spans 4
-different regions of the file (and, on this entity-sorted input, 4 different
-`CounterID`s) instead of one. Match it to `--shards` so a batch can spread
-across every shard; `1` reproduces today's sequential read exactly. A load that
-still reports a narrow shard spread prints a stderr warning naming the observed
-spread and this flag as one of the levers to raise it.
+work while the other `--shards - 1` sit idle. K cursors open K stride readers
+over disjoint, near-even, far-apart row-group partitions and assemble each batch
+from a contiguous run out of every live cursor, so one batch spans K different
+regions of the file (and, on this entity-sorted input, K different `CounterID`s)
+instead of one.
 
-`hits.mapping.toml` declares `CounterID` as a `resource_attribute` (issue
-#519), so it is part of stream identity and `shard_for_log` hashes it to pick
-a shard: rows spread across all `--shards` instead of every row landing on
-shard 0. That changes the batch-rows arithmetic. A batch's rows now split
-across up to `--shards` shards, and each shard's slice flushes as its own
-object *immediately* (at the default `--target-bytes 1`) — before it
-can reach the `block_target_records` block target (8192 rows). With the
-default `--batch-rows 10000` and `--shards 4`, a shard's slice averages ~2500
-rows, well under one full block, and object count would inflate well past
-`--shards`x rather than by a clean multiple. Raise `--batch-rows` to keep each
-shard's average slice at or above 8192: `40000` keeps that margin (`40000 / 4
-= 10000` rows/shard) while landing on roughly the same total object count as
-the pre-#519 single-shard `10000` batch size at ~100M rows. Lower `--shards`
-or raise `--batch-rows` further if a load still reports objects smaller than
-expected.
-
-This `--batch-rows`-scales-with-`--shards` sizing floor still applies once
-`--read-cursors` is in play: stride reading changes which rows a batch is
-assembled *from*, not how many rows in total each shard receives per batch, so
-the ~8192-rows-per-shard floor above is unchanged. Raising `--shards` still
-means raising `--batch-rows` to match, regardless of `--read-cursors`.
+That is why the default is `--shards`, not `1`: a batch can only spread across
+every shard if it was read from as many regions as there are shards, and a
+default that leaves `--shards - 1` shards idle on entity-sorted input is a
+pathology rather than a choice. The value is clamped down to the file's
+row-group count, since more cursors than row groups cannot each own a distinct
+contiguous partition. Pass `--read-cursors 1` to reproduce a purely sequential
+read. A load that still reports a narrow shard spread prints a stderr warning
+naming the observed spread and this flag as one of the levers to raise it.
 
 `--target-bytes` is the other object-size lever, and unlike `--batch-rows` it
 does not multiply Arrow batch memory. It is not free, though: a larger target
