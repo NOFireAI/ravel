@@ -154,6 +154,19 @@ Only `ok` is timed. Everything else is reported with its status and stays in
 the corpus denominator, so a coverage or success rate is always over the whole
 corpus and a system cannot improve its score by failing.
 
+**A status the harness cannot emit is a hole in this contract.** `timeout`
+specifically: the harness must enforce the per-query deadline around the
+**complete** operation, response body parsing included, and map expiry to
+`timeout` rather than to `error`. A client with no configured timeout, or one
+that bounds only the request and not the body read, records an expiry as a
+generic transport failure, and `timeout` never appears however many queries
+exceed the deadline. `reqwest::Client::new()` has no default async timeout, so
+this is the default outcome rather than an unlikely one.
+
+The same applies to every status: a harness that cannot distinguish two
+statuses must not report either, because collapsing them silently is worse
+than declaring the distinction unmeasured.
+
 **A refusal is not a correctness result.** `refused` produces no answer, so
 there is nothing for the oracle to compare and it is outside the correctness
 denominator. Folding a refusal into correctness would let an engine that
