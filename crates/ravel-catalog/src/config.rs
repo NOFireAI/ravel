@@ -67,6 +67,35 @@ pub const DEFAULT_BYTE_CACHE_MAX_ENTRIES: usize = 512;
 /// ([`DEFAULT_MAX_SNAPSHOT_PART_BYTES`](snapshot_format::DEFAULT_MAX_SNAPSHOT_PART_BYTES) ==
 /// [`DEFAULT_MAX_POSTINGS_BYTES`](snapshot_format::DEFAULT_MAX_POSTINGS_BYTES), both 256 MiB).
 pub const DEFAULT_BYTE_CACHE_MAX_ENTRY_BYTES: u64 = 256 << 20;
+/// Default byte budget for decoded column statistics retained per catalog
+/// (issue #905). A budget in BYTES, not entries: this cache holds exactly one
+/// entry per `(tenant, signal)`, and that entry carries one
+/// `ColumnStatsSegment` per live segment, so its SIZE scales with a tenant's
+/// segment count, a dimension the entry-count bound
+/// [`DEFAULT_CACHE_CAPACITY_PER_TENANT`] cannot see.
+///
+/// Sized from a real `.cstat` object's encoded size. A minimal single-typed-
+/// column L0 segment (`status`, one I64 min/max, a one-entry dictionary)
+/// encodes to 56 bytes; a realistic one (six typed string columns, each with a
+/// min, a max, and a 64-entry dictionary) encodes to about 12.4 KiB. Retained
+/// size is measured as the summed proto-encoded length of an entry's segments,
+/// which is the `.cstat` object's own encoded size less a negligible header.
+/// 128 MiB therefore retains on the order of 10,000 such realistic segments'
+/// decoded statistics at once, roughly one maximal single-tenant hot region
+/// (`DEFAULT_CACHE_CAPACITY_PER_TENANT` is sized for a 10,000-segment hot
+/// region) or the summed hot regions of many smaller tenants, before
+/// byte-budget eviction begins.
+///
+/// Undersizing is not silent (the whole point of issue #905): every eviction
+/// forced by this budget increments
+/// [`Catalog::column_stats_cache_evictions`](crate::Catalog::column_stats_cache_evictions),
+/// so a value too small to hold the working set shows up as a rising eviction
+/// count rather than as a quietly re-fetched second GET on every query.
+///
+/// `0` is the disabled sentinel: nothing is admitted and every load re-fetches
+/// the stats object, matching [`CatalogConfig::byte_cache_max_bytes`]'s own `0`
+/// sentinel.
+pub const DEFAULT_COLUMN_STATS_CACHE_MAX_BYTES: u64 = 128 << 20;
 /// Default ceiling on the pre-execution catalog-request estimate
 /// (`Catalog::estimated_catalog_requests`, ADR-0044 decision 3): a resolve whose `shard_count * hour_buckets +
 /// SNAPSHOT_WINDOW_REQUESTS_UPPER_BOUND` exceeds this is refused before any
@@ -230,6 +259,17 @@ pub struct CatalogConfig {
     /// Per-entry byte cap for the byte cache; an object larger than this is
     /// never admitted. Default [`DEFAULT_BYTE_CACHE_MAX_ENTRY_BYTES`].
     pub byte_cache_max_entry_bytes: u64,
+    /// Byte budget for decoded column statistics retained per catalog (issue
+    /// #905). Unlike the entry-count caps above, this bounds the cache in
+    /// BYTES, because one column-stats entry holds one `ColumnStatsSegment` per
+    /// live segment and so grows with a tenant's segment count, not with the
+    /// tenant count an entry cap sees. When the retained total exceeds this,
+    /// least-recently-used entries are evicted (each re-derivable from object
+    /// storage by one GET) and
+    /// [`Catalog::column_stats_cache_evictions`](crate::Catalog::column_stats_cache_evictions)
+    /// counts the pressure. `0` disables the cache: nothing is admitted and
+    /// every load re-fetches. Default [`DEFAULT_COLUMN_STATS_CACHE_MAX_BYTES`].
+    pub column_stats_cache_max_bytes: u64,
     /// Ceiling on the pre-execution catalog-request estimate (ADR-0044
     /// decision 3). A resolve whose
     /// estimate ([`Catalog::estimated_catalog_requests`](crate::Catalog::estimated_catalog_requests))
@@ -315,6 +355,7 @@ impl Default for CatalogConfig {
             byte_cache_max_bytes: DEFAULT_BYTE_CACHE_MAX_BYTES,
             byte_cache_max_entries: DEFAULT_BYTE_CACHE_MAX_ENTRIES,
             byte_cache_max_entry_bytes: DEFAULT_BYTE_CACHE_MAX_ENTRY_BYTES,
+            column_stats_cache_max_bytes: DEFAULT_COLUMN_STATS_CACHE_MAX_BYTES,
             max_catalog_list_requests: DEFAULT_MAX_CATALOG_LIST_REQUESTS,
             prefix_list_crossover_requests: DEFAULT_PREFIX_LIST_CROSSOVER_REQUESTS,
             snapshot_part_max_entries: DEFAULT_SNAPSHOT_PART_MAX_ENTRIES,
