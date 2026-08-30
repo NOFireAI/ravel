@@ -330,12 +330,12 @@ fn validate_column(column: &ColumnStat) -> Result<(), SnapshotFormatError> {
         // (an i128 overflow) can never equal an i64 sum, so it is reported as a
         // mismatch, not silently accepted.
         if let Some(sum) = column.sum {
-            let dict_total = dict_sum.unwrap_or(i128::MIN);
+            let dict_total = dict_sum.unwrap_or(i128::MAX);
             if dict_total != i128::from(sum) {
                 return Err(SnapshotFormatError::ColumnStatsSumMismatch {
                     name: column.name.clone(),
-                    sum: i128::from(sum),
-                    dict_sum: dict_total,
+                    sum,
+                    dict_sum: dict_total.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64,
                 });
             }
         }
