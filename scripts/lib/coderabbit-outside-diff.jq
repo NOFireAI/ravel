@@ -62,7 +62,14 @@
 # reviews at the same head, sum.
 def outside_diff_count:
   [
-    match("<summary>[^\\n]*Outside diff range[^\\n]*comments?[^\\n]*</summary>"; "g")
+    # `[^<\n]*` rather than `[^\n]*`: excluding `<` bounds each match to ONE
+    # element. With the greedy `[^\n]*` two qualifying <summary> elements on a
+    # single line collapsed into one match, and the count capture below then
+    # read only the first number -- two findings reported as one. The verdict
+    # was unaffected (any nonzero blocks), so this was an accuracy bug rather
+    # than a safety one, but the bound costs nothing. Verified: two-on-one-line
+    # returned 1, now returns 3.
+    match("<summary>[^<\\n]*Outside diff range[^<\\n]*comments?[^<\\n]*</summary>"; "g")
     | .string
     | ((capture("\\((?<n>[0-9]+)\\)") | .n | tonumber) // 1)
   ]
