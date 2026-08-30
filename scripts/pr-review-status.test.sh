@@ -162,6 +162,23 @@ check_outside "bot review quoting the marker in prose is NOT counted" 0 "$(cat <
 EOF
 )"
 
+# Two qualifying elements on ONE line must count as two headings, not one. A
+# greedy [^\n]* between the tags let the first match swallow both, and the
+# count capture then read only the first number: 1 + 2 reported as 1.
+check_outside "two summaries on one line count separately" 3 "$(cat <<EOF
+[{"user":{"login":"coderabbitai[bot]"},"commit_id":"${SHA}",
+  "body":"> <summary>⚠️ Outside diff range comments (1)</summary><summary>⚠️ Outside diff range comments (2)</summary>"}]
+EOF
+)"
+
+# The emitted form puts <blockquote> immediately after </summary> on the same
+# line. Bounding the match with [^<\n]* must not break that.
+check_outside "emitted form with a trailing blockquote still counts" 1 "$(cat <<EOF
+[{"user":{"login":"coderabbitai[bot]"},"commit_id":"${SHA}",
+  "body":"> <summary>⚠️ Outside diff range comments (1)</summary><blockquote>\n>\n> <details>\n> <summary>scripts/foo.sh (1)</summary><blockquote>"}]
+EOF
+)"
+
 # Backticked inline code is the same shape and must not count either.
 check_outside "bot review with the marker in inline code is NOT counted" 0 "$(cat <<EOF
 [{"user":{"login":"coderabbitai[bot]"},"commit_id":"${SHA}",
