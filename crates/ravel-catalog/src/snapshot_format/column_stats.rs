@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! magic           "RCST" (4 bytes)
-//! version         u8 = 1
+//! version         u8 = 1 (ADR-0850, L0-tuple keyed) or 2 (ADR-0942, part-keyed)
 //! reserved        u8[3] = 0
 //! header_len      u32 LE
 //! header          protobuf ravel.catalog.v1.ColumnStatsHeader
@@ -11,10 +11,21 @@
 //! body            zstd(segments)  segments = length-delimited protobuf
 //!                                 ravel.catalog.v1.ColumnStatsSegment,
 //!                                 sorted by (ingest_hour_bucket, shard,
-//!                                 writer_id, writer_epoch, writer_seq)
+//!                                 writer_id, writer_epoch, writer_seq) in v1,
+//!                                 by writer_id (the part content hash) in v2
 //! body_crc32c     u32 LE          over the compressed body bytes
 //! header_crc32c   u32 LE          over magic..header inclusive
 //! ```
+//!
+//! Two envelope versions coexist during the ADR-0942 dual-publish window. The
+//! `ColumnStatsSegment` record shape is frozen and shared; the key model is the
+//! version's. v1 keys each record by the five-field identity tuple (writer_id is
+//! the 16-byte flush-writer uuid) and covers L0 only. v2 keys by the covered
+//! part's content hash, which the writer carries in the `writer_id` slot as 32
+//! bytes (the same slot an L1 `SnapshotEntry` already repurposes for a 32-byte
+//! hash), and covers L0 and L1 uniformly. The keying is self-describing in the
+//! version byte, so an object read outside its head ref declares which key
+//! model it carries.
 //!
 //! Deliberately reuses `part.rs`'s plain length-delimited-protobuf body
 //! convention rather than `postings.rs`'s hand-rolled varint dictionary:
@@ -41,11 +52,33 @@ pub struct DecodedColumnStats {
     pub segments: Vec<ColumnStatsSegment>,
 }
 
-/// Encodes a column-statistics object. Validates `segments` against the same
-/// rules `decode_column_stats` enforces (sort order, no duplicate identity),
-/// mirroring `encode_part`'s defensive-validation precedent: an object this
-/// function writes can never fail its own decode.
+/// Encodes a **v1** (ADR-0850, L0-tuple-keyed) column-statistics object, the
+/// `SnapshotHead.column_stats` (field 11) artifact. Validates `segments`
+/// against the same rules `decode_column_stats` enforces for v1 (writer_id
+/// width, tuple sort order, no duplicate identity), mirroring `encode_part`'s
+/// defensive-validation precedent: an object this function writes can never
+/// fail its own decode.
+///
+/// Stamps envelope version 1 explicitly, NOT [`COLUMN_STATS_WRITE_VERSION`]:
+/// the ADR-0942 dual-publish window keeps writing the v1 object byte-for-byte
+/// as before even after the write version moves to 2. The v2 (part-keyed)
+/// artifact is written by [`encode_column_stats_v2`].
 pub fn encode_column_stats(
+    tenant_hash: [u8; 16],
+    signal: u32,
+    part_blake3: Vec<Vec<u8>>,
+    segments: &[ColumnStatsSegment],
+) -> Result<Vec<u8>, SnapshotFormatError> {
+    encode_column_stats_versioned(1, tenant_hash, signal, part_blake3, segments)
+}
+
+/// Encodes a **v2** (ADR-0942, part-hash-keyed) column-statistics object, the
+/// `SnapshotHead.column_stats_part` (field 13) artifact. Each segment record
+/// must carry its covered part's content hash (blake3) in its `writer_id` slot
+/// as 32 bytes; records are sorted and deduplicated by that hash, not the
+/// five-field identity tuple, so L0 and L1 parts are named uniformly and two L1
+/// parts of one bucket never collide. Stamps [`COLUMN_STATS_WRITE_VERSION`].
+pub fn encode_column_stats_v2(
     tenant_hash: [u8; 16],
     signal: u32,
     part_blake3: Vec<Vec<u8>>,
@@ -60,12 +93,11 @@ pub fn encode_column_stats(
     )
 }
 
-/// Envelope framing shared by the public writer and the tests. Parameterised on
-/// `version` so a test can construct a v2 object (ADR-0942) without a v2 writer:
-/// production only ever reaches it through [`encode_column_stats`] with
-/// [`COLUMN_STATS_WRITE_VERSION`], so nothing writes a v2 object yet. Stamps
-/// `version` into both the envelope version byte and the header
-/// `format_version`, so the two always agree by construction.
+/// Envelope framing shared by the public writers and the tests. Parameterised
+/// on `version`, which selects both the stamped version byte and the segment
+/// key model `validate_segments` enforces (v1: five-field tuple; v2:
+/// `content_hash`). Stamps `version` into both the envelope version byte and
+/// the header `format_version`, so the two always agree by construction.
 fn encode_column_stats_versioned(
     version: u8,
     tenant_hash: [u8; 16],
@@ -73,7 +105,7 @@ fn encode_column_stats_versioned(
     part_blake3: Vec<Vec<u8>>,
     segments: &[ColumnStatsSegment],
 ) -> Result<Vec<u8>, SnapshotFormatError> {
-    validate_segments(segments)?;
+    validate_segments(segments, version)?;
 
     let mut segments_raw = Vec::new();
     for segment in segments {
@@ -211,29 +243,56 @@ pub fn decode_column_stats(
             actual: segments.len() as u64,
         });
     }
-    validate_segments(&segments)?;
+    validate_segments(&segments, version)?;
 
     Ok(DecodedColumnStats { header, segments })
 }
 
-/// Sort/uniqueness/field validation shared by `encode_column_stats`
-/// (defensive check of caller input) and `decode_column_stats` (untrusted-
-/// bytes check). Beyond segment identity this also validates every
-/// `ColumnStat`'s internal semantics (ADR-0850): a record the metadata-only
-/// query path could read (`declared_not_equal_count`/`declared_group_counts`)
-/// is rejected here before it can ever be loaded, so those paths can never
-/// derive a wrong answer from an internally-inconsistent record. Fail closed.
-fn validate_segments(segments: &[ColumnStatsSegment]) -> Result<(), SnapshotFormatError> {
+/// Sort/uniqueness/field validation shared by the encoders (defensive check of
+/// caller input) and `decode_column_stats` (untrusted-bytes check). Beyond
+/// segment identity this also validates every `ColumnStat`'s internal
+/// semantics (ADR-0850): a record the metadata-only query path could read
+/// (`declared_not_equal_count`/`declared_group_counts`) is rejected here before
+/// it can ever be loaded, so those paths can never derive a wrong answer from
+/// an internally-inconsistent record. Fail closed.
+///
+/// `version` selects the segment key model (ADR-0942). Both models key on
+/// `writer_id` (field 3), differing in width and meaning:
+/// - v1 (`version < 2`): the 16-byte flush-writer uuid, one component of the
+///   five-field identity tuple the records are sorted and deduplicated by.
+/// - v2 (`version >= 2`): the covered part's 32-byte content hash (blake3),
+///   which the writer carries in the same slot an L1 `SnapshotEntry` already
+///   repurposes for a 32-byte hash. Records are sorted and deduplicated by that
+///   hash alone; the remaining tuple fields are informational.
+///
+/// Requiring the exact width per version is what makes a v1 object encountered
+/// under field 13, or a v2 object under field 11, self-evidently wrong to a
+/// reader that has already established which version it expects.
+fn validate_segments(
+    segments: &[ColumnStatsSegment],
+    version: u8,
+) -> Result<(), SnapshotFormatError> {
+    let part_keyed = version >= 2;
+    let expected_writer_id_len = if part_keyed { 32 } else { 16 };
     for (i, segment) in segments.iter().enumerate() {
-        if segment.writer_id.len() != 16 {
+        if segment.writer_id.len() != expected_writer_id_len {
             return Err(SnapshotFormatError::ColumnStatsBadFieldLen {
                 field: "writer_id",
-                expected: 16,
+                expected: expected_writer_id_len,
                 actual: segment.writer_id.len(),
             });
         }
         if i > 0 {
-            match segment_key(&segments[i - 1]).cmp(&segment_key(segment)) {
+            let ordering = if part_keyed {
+                // v2: the whole key is the content hash carried in writer_id.
+                segments[i - 1]
+                    .writer_id
+                    .as_slice()
+                    .cmp(segment.writer_id.as_slice())
+            } else {
+                segment_key(&segments[i - 1]).cmp(&segment_key(segment))
+            };
+            match ordering {
                 std::cmp::Ordering::Less => {}
                 std::cmp::Ordering::Equal => {
                     return Err(SnapshotFormatError::ColumnStatsDuplicateSegment);
@@ -851,7 +910,10 @@ mod tests {
     /// `ColumnStatsUnsupportedVersion(2)`.
     #[test]
     fn v2_stamped_object_decodes() {
-        let seg = segment(1, 0, 1);
+        // A v2 record is keyed by its covered part's content hash, carried in
+        // writer_id as 32 bytes.
+        let mut seg = segment(1, 0, 1);
+        seg.writer_id = vec![0x77; 32];
         let bytes = encode_column_stats_versioned(
             2,
             [0x11; 16],
@@ -867,12 +929,82 @@ mod tests {
         assert_eq!(decoded.segments, vec![seg]);
     }
 
+    /// v2 keys by the content hash carried in writer_id, not the rest of the
+    /// tuple: two records sharing every other tuple field but carrying distinct
+    /// content hashes are a valid v2 object with two distinct records (the
+    /// collision the v1 tuple key could not represent for L1, where the reader
+    /// side has no distinguishing writer identity). Codec-level analogue of the
+    /// fold test's "two L1 parts of one bucket produce two distinct records".
+    #[test]
+    fn v2_distinct_content_hash_round_trips() {
+        let mut a = segment(1, 0, 1);
+        a.writer_id = vec![0xA0; 32];
+        let mut b = segment(1, 0, 1); // identical remaining tuple to `a`
+        b.writer_id = vec![0xB0; 32]; // sorts after `a`
+        let bytes =
+            encode_column_stats_v2([0x11; 16], 3, vec![vec![0x22; 32]], &[a.clone(), b.clone()])
+                .expect("two distinct-part records encode under v2");
+        let decoded = decode_column_stats(&bytes, &ColumnStatsLimits::default()).expect("decodes");
+        assert_eq!(decoded.segments, vec![a, b]);
+        assert_eq!(decoded.header.format_version, 2);
+    }
+
+    /// A v2 record whose writer_id is not the 32-byte content hash (here the
+    /// 16-byte v1 uuid width) is fail-closed rejected: a reader could not bind
+    /// it, and a v1 object mislabeled v2 must not pass.
+    #[test]
+    fn v2_record_with_v1_width_writer_id_rejected() {
+        let seg = segment(1, 0, 1); // writer_id is the 16-byte v1 uuid
+        let err = encode_column_stats_v2([0x11; 16], 3, vec![vec![0x22; 32]], &[seg])
+            .expect_err("a v2 record with a 16-byte writer_id is rejected");
+        assert_eq!(
+            err,
+            SnapshotFormatError::ColumnStatsBadFieldLen {
+                field: "writer_id",
+                expected: 32,
+                actual: 16,
+            }
+        );
+    }
+
+    /// Two v2 records with the identical content hash are a duplicate part
+    /// binding, rejected the same way a v1 duplicate tuple is.
+    #[test]
+    fn v2_duplicate_content_hash_rejected() {
+        let mut a = segment(1, 0, 1);
+        a.writer_id = vec![0xC0; 32];
+        let mut b = segment(2, 0, 9); // different remaining tuple, same hash
+        b.writer_id = vec![0xC0; 32];
+        let err = encode_column_stats_v2([0x11; 16], 3, vec![vec![0x22; 32]], &[a, b])
+            .expect_err("duplicate content hash rejected");
+        assert_eq!(err, SnapshotFormatError::ColumnStatsDuplicateSegment);
+    }
+
+    /// v2 records not sorted by their content hash are rejected (the encoder
+    /// sorts; the decoder enforces).
+    #[test]
+    fn v2_unsorted_by_content_hash_rejected() {
+        let mut a = segment(1, 0, 1);
+        a.writer_id = vec![0xF0; 32];
+        let mut b = segment(1, 0, 2);
+        b.writer_id = vec![0x10; 32]; // sorts before `a`
+        let err = encode_column_stats_v2([0x11; 16], 3, vec![vec![0x22; 32]], &[a, b])
+            .expect_err("unsorted-by-content-hash rejected");
+        assert_eq!(err, SnapshotFormatError::ColumnStatsSegmentsUnsorted);
+    }
+
     /// A version outside the accepted set is refused with the specific typed
     /// error carrying the offending version, not merely "an error occurred".
     #[test]
     fn version_outside_accepted_set_rejected() {
         for bad in [0u8, 3, 255] {
-            let seg = segment(1, 0, 1);
+            // A bad version selects the v2 (part) key model in the framing
+            // helper (version >= 2 for 3/255) or the v1 model (0), so use a
+            // 32-byte writer_id: it satisfies v2's width check for 3/255. 0 is
+            // v1 mode (needs 16), handled by its own case below.
+            let writer_id_len = if bad >= 2 { 32 } else { 16 };
+            let mut seg = segment(1, 0, 1);
+            seg.writer_id = vec![0x44; writer_id_len];
             let bytes =
                 encode_column_stats_versioned(bad, [0x11; 16], 3, vec![vec![0x22; 32]], &[seg])
                     .expect("framing encodes any version byte");
@@ -894,7 +1026,13 @@ mod tests {
     #[test]
     fn accepted_read_set_is_exactly_v1_and_v2() {
         for version in 0u8..=255 {
-            let seg = segment(1, 0, 1);
+            // The framing helper validates in the version's key model, so give
+            // writer_id the width that model requires (v1: 16, v2+: 32).
+            // Acceptance is then decided by the decode version gate, which this
+            // test pins.
+            let writer_id_len = if version >= 2 { 32 } else { 16 };
+            let mut seg = segment(1, 0, 1);
+            seg.writer_id = vec![0x44; writer_id_len];
             let bytes =
                 encode_column_stats_versioned(version, [0x11; 16], 3, vec![vec![0x22; 32]], &[seg])
                     .expect("framing encodes any version byte");
@@ -962,7 +1100,8 @@ mod tests {
     /// wrong data: every prefix of a well-formed v2 object is rejected.
     #[test]
     fn truncated_v2_envelope_is_typed_error() {
-        let seg = segment(1, 0, 1);
+        let mut seg = segment(1, 0, 1);
+        seg.writer_id = vec![0x77; 32];
         let bytes = encode_column_stats_versioned(2, [0x11; 16], 3, vec![vec![0x22; 32]], &[seg])
             .expect("v2 framing encodes");
         for len in 0..bytes.len() {
@@ -979,7 +1118,8 @@ mod tests {
     /// error rather than a decode of wrong data.
     #[test]
     fn corrupt_v2_body_is_typed_error() {
-        let seg = segment(1, 0, 1);
+        let mut seg = segment(1, 0, 1);
+        seg.writer_id = vec![0x77; 32];
         let mut bytes =
             encode_column_stats_versioned(2, [0x11; 16], 3, vec![vec![0x22; 32]], &[seg])
                 .expect("v2 framing encodes");
