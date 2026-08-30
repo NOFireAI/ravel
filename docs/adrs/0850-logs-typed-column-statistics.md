@@ -93,19 +93,64 @@ gate from the safety lemma below, not a new special case.
 
 ### L1 segments are not covered
 
-`build_l1_snapshot_entry`/`build_rewrite_l1_snapshot_entry`
-(`crates/ravel-catalog/src/fold.rs`) reuse the `writer_id`/`writer_epoch`
-slots on a compacted entry to carry `input_set_hash`/`part_index`, not a
-genuine writer identity, so the identity tuple this ADR joins on doesn't
-mean the same thing for L1 as it does for L0. Computing and joining
-statistics for L1 is deferred; this cut computes `ColumnStatsSegment`
-records for L0 entries only. This is automatically safe under the same
-gate: a snapshot containing an L1 segment simply has no matching
-`ColumnStatsSegment`, so any query touching that segment's queried
-column falls back to scanning it. It is a coverage gap (a snapshot with
+This cut computes `ColumnStatsSegment` records for L0 entries only
+(`entries.iter().filter(|e| e.level == 0)` at `fold.rs:1513`). The
+fold-side filter is not the blocker, and removing it alone changes
+nothing observable: `build_l1_snapshot_entry` (`fold.rs:368`) and
+`build_rewrite_l1_snapshot_entry` (`fold.rs:415`) each produce a
+`SnapshotEntry` whose `writer_id` carries the 32-byte `input_set_hash`
+and whose `writer_epoch` carries the `part_index`, so a fold that
+dropped the filter would build correct, uniquely-keyed L1 records. Those
+records would then be silently discarded at three later points, which is
+why L1 coverage is real design work and not a one-line fold change:
+
+- **The reader's lookup key collapses.** `segment_identity`
+  (`crates/ravel-sql/src/logs_scan.rs:571`) builds the join key from the
+  `SegmentRef`, not the `SnapshotEntry`. An L1 `SegmentRef` carries
+  `writer_id = Uuid::nil()`, `writer_epoch = 0`, `writer_seq = 0`
+  (`crates/ravel-catalog/src/catalog.rs:2987`); its real `input_set_hash`
+  and `part_index` live in the `SegmentLevel::L1` variant, which
+  `segment_identity` discards. So every L1 segment in one `(shard, hour)`
+  bucket computes the same key `(bucket, shard, nil, 0, 0)`, unrelated to
+  the unique key the fold wrote.
+- **The resolver rejects the real key.**
+  `crates/ravel-catalog/src/column_stats_resolve.rs:221` hard-requires a
+  16-byte writer id (`<[u8; 16]>::try_from(segment.writer_id...)`, `continue`
+  on failure), while a correctly-built L1 record's `writer_id` slot holds
+  the 32-byte `input_set_hash`. A correctly-keyed L1 record would be
+  built, PUT, and then dropped at load before any query saw it.
+- **The nil-tuple key collides across parts.** Even if the resolver
+  accepted it, keying L1 stats on the nil tuple to match `segment_identity`
+  would collide: a `(shard, hour)` bucket routinely compacts to more than
+  one part (`SegmentLevel::L1 { part_index }`), and two entries sharing an
+  identity would silently merge their statistics. That is a wrong-answer
+  path, not a coverage gap.
+
+The current code is safe because it never reaches any of these: a
+snapshot containing an L1 segment simply has no matching
+`ColumnStatsSegment`, so any query touching that segment's queried column
+falls back to scanning it. It is a coverage gap (a snapshot with
 compacted history answers fewer queries from metadata alone), not a
-correctness gap, and is called out here as a known limitation for a
-follow-up rather than silently worked around.
+correctness gap.
+
+Covering L1 has two open shapes, and choosing between them is an owner
+decision left to a follow-up. The first keeps this ADR's join model and
+makes the stats key level-aware, carrying `input_set_hash + part_index`
+for L1 instead of the writer tuple; that touches `EntryIdentity` and the
+resolver in `ravel-catalog` and `segment_identity` in `ravel-sql`
+together, since all three must agree on the wider key. The second is
+ADR-0913, which chooses a different shape for the same problem by binding
+the statistics state to the snapshot part rather than to a writer-identity
+tuple, covering L0 and L1 uniformly and sidestepping the nil-tuple
+collision entirely. This ADR records both as the open options and does
+not pick one.
+
+Column statistics are also rebuilt only inside `Catalog::fold`
+(`fold.rs:780`), incrementally against the prior `.cstat` baseline. A
+tenant that has already compacted and gone quiescent folds nothing, so it
+rebuilds nothing, and no in-tree command forces a stats-only rebuild on an
+idle tenant. So even once L1 coverage lands, an already-compacted tenant
+gains it only on its next fold; there is no backfill path today.
 
 ## Decision
 
@@ -349,11 +394,19 @@ answer incorrectly.
   Rejected outright by the task's exactness invariant: q02 needs the
   exact count of one literal value, and a truncated dictionary could
   silently omit it.
-- **Covering L1 segments in this cut.** Rejected for now: L1 entries
-  reuse the `writer_id`/`writer_epoch` slots for compaction bookkeeping,
-  so the identity-tuple join needs a different key for L1, which is
-  real additional design work for a coverage gap that degrades safely
-  (fallback to scan) rather than incorrectly. Deferred to a follow-up.
+- **Covering L1 segments in this cut.** Rejected for now: the blocker is
+  not the fold-side `level == 0` filter (dropping it alone builds correct,
+  uniquely-keyed L1 records that are then silently discarded), but the
+  reader join. An L1 `SegmentRef` carries a nil writer tuple with its real
+  `input_set_hash`/`part_index` in the `SegmentLevel::L1` variant that
+  `segment_identity` drops, and the resolver rejects the 32-byte
+  `input_set_hash` where it expects a 16-byte writer id; matching the nil
+  tuple instead collides across the parts of one bucket, a wrong answer.
+  A level-aware stats key spanning `EntryIdentity`, the resolver, and
+  `segment_identity`, or ADR-0913's snapshot-part binding, is real design
+  work. Deferred to a follow-up; the current cut degrades safely (fallback
+  to scan) rather than incorrectly. See the "L1 segments are not covered"
+  section above.
 
 ## Consequences
 
