@@ -29,6 +29,21 @@
 //!   never double counted and no call is missed. A call cancelled by drop
 //!   before the inner future resolves records nothing at all, so `calls` is
 //!   completions, not attempts.
+//! - `attempts` counts what `calls` cannot see: the individual requests a
+//!   backend put on the wire for one logical call. `object_store` runs its own
+//!   retry loop inside every operation, so one `get()` that succeeded on its
+//!   tenth try is one `calls` and ten billed requests, and the divergence is
+//!   one-directional (the bill is never lower than `calls`). The decorator
+//!   cannot observe this from where it sits, so it does not try: the counter is
+//!   fed from *below* through [`StoreMetrics::record_attempt`] by a layer that
+//!   sees each request, and it reads as [`None`] rather than as zero until such
+//!   a layer declares itself with [`StoreMetrics::declare_attempts_observed`]
+//!   (`crates/ravel-object-store/src/s3.rs`'s HTTP connector is the one that
+//!   does, #928). `attempts >= calls` therefore holds whenever attempts are
+//!   observed at all, and `attempts - calls`
+//!   ([`StoreMetricsSnapshot::retries`]) is the retry count, with one caveat
+//!   named on that method: a `put` above the multipart threshold is several
+//!   requests for one call.
 //! - `errors[class]` is indexed by [`StoreErrorClass`], one slot per
 //!   [`StoreError`] variant. `AlreadyExists` under `CreateIfAbsent` is a
 //!   protocol signal rather than a failure (ADR-0002), so a healthy commit
@@ -53,7 +68,7 @@
 //! deterministic histogram tests.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -356,11 +371,58 @@ impl OpMetricsSnapshot {
 #[derive(Debug, Default)]
 pub struct StoreMetrics {
     ops: [OpMetrics; STORE_OP_COUNT],
+    /// Requests put on the wire per [`StoreOp`], indexed by
+    /// [`StoreOp::index`]. Not part of [`OpMetrics`] because nothing the
+    /// decorator sees can move it: it is written only by a layer beneath the
+    /// decorator, through [`StoreMetrics::record_attempt`].
+    attempts: [AtomicU64; STORE_OP_COUNT],
+    /// Attempts whose request an attempt-observing layer could not map onto a
+    /// [`StoreOp`]. Counted rather than dropped so a mapping that goes stale
+    /// shows up as a nonzero counter instead of as a silent undercount of every
+    /// other slot.
+    attempts_unclassified: AtomicU64,
+    /// Set by [`StoreMetrics::declare_attempts_observed`] when a layer that
+    /// feeds `attempts` is installed. Until then a snapshot reports attempts as
+    /// [`None`]: "nobody was counting" and "no request was made" are different
+    /// facts, and reporting the first as zero would understate a real bill.
+    attempts_observed: AtomicBool,
 }
 
 impl StoreMetrics {
     fn op(&self, op: StoreOp) -> &OpMetrics {
         &self.ops[op.index()]
+    }
+
+    /// Declare that a layer feeding [`StoreMetrics::record_attempt`] is
+    /// installed, so a snapshot reports attempt counts instead of [`None`].
+    ///
+    /// Called at install time (not on the first request), so a store that made
+    /// no request yet still reports `Some(0)` rather than `None`. Idempotent.
+    pub fn declare_attempts_observed(&self) {
+        self.attempts_observed.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether an attempt-observing layer declared itself. `false` means the
+    /// attempt counters below are not a measurement of anything.
+    pub fn attempts_observed(&self) -> bool {
+        self.attempts_observed.load(Ordering::Relaxed)
+    }
+
+    /// Record one request put on the wire for a logical `op`.
+    ///
+    /// The seam for an attempt-observing layer beneath the decorator: it is
+    /// called once per request, retries included, so the total exceeds `calls`
+    /// by exactly the number of retries. A caller that moves this without also
+    /// calling [`StoreMetrics::declare_attempts_observed`] gets counts a
+    /// snapshot deliberately refuses to report.
+    pub fn record_attempt(&self, op: StoreOp) {
+        self.attempts[op.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one request an attempt-observing layer could not attribute to a
+    /// [`StoreOp`]. See [`StoreMetricsSnapshot::attempts_unclassified`].
+    pub fn record_unclassified_attempt(&self) {
+        self.attempts_unclassified.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record one completed call. `bytes` is the payload length for `put`, the
@@ -389,6 +451,10 @@ impl StoreMetrics {
     /// show `put` from a hair later than `get`. It is a scrape, not a
     /// consistent cut, and nothing correctness-bearing reads it.
     pub fn snapshot(&self) -> StoreMetricsSnapshot {
+        let mut attempts_by_op = [0u64; STORE_OP_COUNT];
+        for (slot, counter) in attempts_by_op.iter_mut().zip(self.attempts.iter()) {
+            *slot = counter.load(Ordering::Relaxed);
+        }
         StoreMetricsSnapshot {
             put: self.op(StoreOp::Put).snapshot(),
             get: self.op(StoreOp::Get).snapshot(),
@@ -396,6 +462,9 @@ impl StoreMetrics {
             list: self.op(StoreOp::List).snapshot(),
             list_delimited: self.op(StoreOp::ListDelimited).snapshot(),
             delete: self.op(StoreOp::Delete).snapshot(),
+            attempts_by_op,
+            attempts_unclassified: self.attempts_unclassified.load(Ordering::Relaxed),
+            attempts_observed: self.attempts_observed(),
         }
     }
 }
@@ -411,6 +480,19 @@ pub struct StoreMetricsSnapshot {
     pub list: OpMetricsSnapshot,
     pub list_delimited: OpMetricsSnapshot,
     pub delete: OpMetricsSnapshot,
+    /// Requests put on the wire per [`StoreOp`], indexed by [`StoreOp::index`].
+    /// Meaningless unless `attempts_observed`; read it through
+    /// [`StoreMetricsSnapshot::attempts`], which enforces that.
+    pub attempts_by_op: [u64; STORE_OP_COUNT],
+    /// Attempts an attempt-observing layer could not attribute to a
+    /// [`StoreOp`]. Nonzero means its request mapping no longer covers every
+    /// request the backend issues, so the per-op counts above are an
+    /// undercount by this much; it is not itself an error signal.
+    pub attempts_unclassified: u64,
+    /// Whether a layer feeding the attempt counters was installed. `false`
+    /// makes every attempt figure above a non-measurement, and the accessors
+    /// return [`None`] rather than zero.
+    pub attempts_observed: bool,
 }
 
 impl StoreMetricsSnapshot {
@@ -424,6 +506,41 @@ impl StoreMetricsSnapshot {
     /// undercounting.
     pub fn list_calls(&self) -> u64 {
         self.list.calls + self.list_delimited.calls
+    }
+
+    /// Requests one operation kind put on the wire, retries included, or
+    /// [`None`] when no attempt-observing layer was installed.
+    ///
+    /// [`None`] is the honest reading for a backend nobody counted requests
+    /// under (the memory oracle, a fault wrapper over it): the operations
+    /// happened, their request count is simply not knowable from here.
+    pub fn attempts(&self, op: StoreOp) -> Option<u64> {
+        self.attempts_observed
+            .then(|| self.attempts_by_op[op.index()])
+    }
+
+    /// Requests one operation kind spent above the one attempt each call needs,
+    /// or [`None`] when attempts were not observed. This is the number the
+    /// bill has and `calls` does not.
+    ///
+    /// Exact for every operation kind except `put`, where a payload above the
+    /// multipart threshold is several requests (create, one per part, complete)
+    /// for a single call, so the figure there is "extra requests", of which
+    /// retries are one source. `put_multipart` handles are not counted as
+    /// `calls` at all (see [`InstrumentedStore::put_multipart`]) while their
+    /// requests are counted here, so a caller using them inflates this the same
+    /// way.
+    pub fn retries(&self, op: StoreOp) -> Option<u64> {
+        self.attempts(op)
+            .map(|attempts| attempts.saturating_sub(self.op(op).calls))
+    }
+
+    /// Requests across every operation kind, unclassified ones included, or
+    /// [`None`] when attempts were not observed.
+    pub fn attempts_total(&self) -> Option<u64> {
+        self.attempts_observed.then(|| {
+            self.attempts_by_op.iter().sum::<u64>() + self.attempts_unclassified
+        })
     }
 
     /// One operation's block, for iterating [`StoreOp::ALL`] in an exporter.
@@ -457,9 +574,35 @@ impl<S: ObjectStoreBackend> InstrumentedStore<S> {
 
     /// Wrap `inner` with an injected clock, for deterministic latency tests.
     pub fn with_clock(inner: S, clock: Arc<dyn MonotonicClock>) -> Self {
+        InstrumentedStore::with_metrics_and_clock(
+            inner,
+            Arc::new(StoreMetrics::default()),
+            clock,
+        )
+    }
+
+    /// Wrap `inner`, recording into a caller-provided [`StoreMetrics`].
+    ///
+    /// The seam that makes attempt counting whole: the attempt-observing layer
+    /// lives *inside* `inner` (for [`crate::s3::S3Store`], beneath
+    /// `object_store`'s retry loop), so it has to be handed the same handle the
+    /// decorator records `calls` into, and it has to be handed it at
+    /// construction. Build the [`StoreMetrics`] first, pass it to the backend's
+    /// attempt-counting constructor, then pass it here; `attempts` and `calls`
+    /// then land in one snapshot and are comparable.
+    pub fn with_metrics(inner: S, metrics: Arc<StoreMetrics>) -> Self {
+        InstrumentedStore::with_metrics_and_clock(inner, metrics, Arc::new(InstantClock::new()))
+    }
+
+    /// [`InstrumentedStore::with_metrics`] with an injected clock as well.
+    pub fn with_metrics_and_clock(
+        inner: S,
+        metrics: Arc<StoreMetrics>,
+        clock: Arc<dyn MonotonicClock>,
+    ) -> Self {
         InstrumentedStore {
             inner,
-            metrics: Arc::new(StoreMetrics::default()),
+            metrics,
             clock,
         }
     }

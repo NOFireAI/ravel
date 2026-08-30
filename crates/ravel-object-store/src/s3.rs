@@ -83,11 +83,15 @@ use object_store::{
     PutOptions as OsPutOptions, PutPayload, UpdateVersion,
 };
 
+use crate::instrument::StoreMetrics;
 use crate::{
     Capabilities, DelimitedList, Etag, GetOutcome, GetRange, ListPage, MultipartUpload, ObjectMeta,
     ObjectStoreBackend, PageToken, PartSequence, PutMode, PutOptions, PutOutcome, StoreError,
     UploadChecksum, Version, multipart_finished, multipart_poisoned,
 };
+
+mod attempts;
+use attempts::AttemptCountingConnector;
 
 mod credentials;
 use credentials::FileCredentialProvider;
@@ -506,7 +510,43 @@ impl S3Store {
     /// client tuning (#851). Exists so an unusual deployment or a test can set
     /// a non-default timeout and have it reach the constructed client.
     pub fn with_http_config(config: S3Config, http: S3HttpConfig) -> Result<Self, StoreError> {
-        let (builder, credential_provider, instance_role_provider) = Self::builder(&config, &http)?;
+        Self::build(config, http, None)
+    }
+
+    /// Build a store that counts every HTTP request it makes into `metrics`,
+    /// retries included (#928).
+    ///
+    /// `object_store` retries inside one logical operation, so the completions
+    /// [`crate::instrument::InstrumentedStore`] counts understate the requests
+    /// S3 bills, and nothing above the client can see the difference. This
+    /// installs an [`AttemptCountingConnector`] beneath the retry loop, which
+    /// counts each attempt into the same [`StoreMetrics`] the decorator records
+    /// `calls` into. Pass the same handle to
+    /// [`crate::instrument::InstrumentedStore::with_metrics`] when wrapping the
+    /// returned store; `attempts` and `calls` are then one snapshot apart and
+    /// [`crate::instrument::StoreMetricsSnapshot::retries`] is meaningful.
+    ///
+    /// The transport is unchanged: the connector delegates to `object_store`'s
+    /// own reqwest connector with the same [`ClientOptions`] this crate's
+    /// [`S3HttpConfig`] builds.
+    pub fn with_attempt_metrics(
+        config: S3Config,
+        http: S3HttpConfig,
+        metrics: Arc<StoreMetrics>,
+    ) -> Result<Self, StoreError> {
+        Self::build(config, http, Some(metrics))
+    }
+
+    fn build(
+        config: S3Config,
+        http: S3HttpConfig,
+        attempt_metrics: Option<Arc<StoreMetrics>>,
+    ) -> Result<Self, StoreError> {
+        let (mut builder, credential_provider, instance_role_provider) =
+            Self::builder(&config, &http)?;
+        if let Some(metrics) = attempt_metrics {
+            builder = builder.with_http_connector(AttemptCountingConnector::new(metrics));
+        }
         let store = builder
             .build()
             .map_err(|e| StoreError::Permanent(format!("failed to build S3 client: {e}")))?;
