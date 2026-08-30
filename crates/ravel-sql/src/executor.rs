@@ -849,7 +849,7 @@ impl SqlExecutor {
             snapshot,
             tenant_hash,
             self.fetcher.clone(),
-            self.config,
+            self.config.clone(),
             accounting.clone(),
         ));
         let plan = provider
@@ -858,11 +858,15 @@ impl SqlExecutor {
         // ADR-0094 decision 2: the worker fragment plans no new SQL and runs no
         // aggregation of its own, so it never repartitions -- always `false`,
         // never through the classification check.
+        // The worker fragment plans no SQL and runs no aggregation, so it never
+        // spills: the disk manager stays disabled regardless of the deployment's
+        // spill configuration.
         let ctx = build_session(
             &self.config,
             pool,
             SessionTable::Metrics(Arc::clone(&provider)),
             false,
+            SpillDecision::Disabled,
         )
         .map_err(plan_error)?;
         let schema = plan.schema();
