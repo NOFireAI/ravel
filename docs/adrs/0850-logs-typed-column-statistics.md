@@ -20,6 +20,13 @@ those decompose into pure metadata:
 - q08: `SELECT AdvEngineID, COUNT(*) FROM hits GROUP BY AdvEngineID` — a
   merge of exact per-object value-to-count dictionaries.
 
+Three more decompose once the pack also carries a per-object integer sum
+(#861, a cheap addition to this ADR): q03/q04 (`SUM(col + k) = SUM(col) +
+k * non_null_count`) and q30 (`AVG(col) = SUM(col) / non_null_count`). The
+sum is stored for integer (I64) columns only; a float fold would be
+order-dependent (ADR-0024) and the hits corpus has no float columns, so an
+absent sum is the exactly-correct "not decomposable, scan instead" signal.
+
 `LogsScanExec::partition_statistics` and the `stats_are_exact` gate in
 `crates/ravel-sql/src/logs_scan.rs` already prove the mechanism for
 predicate-free and contained-ts-bound `COUNT(*)`: the catalog carries
@@ -34,9 +41,10 @@ exact value dictionary, for the columns a tenant has declared
 
 Two other ClickBench shapes are explicitly out of scope. q20 (point
 postings) and q23 (gram covering) need an index pack keyed by value, not
-a per-object summary; `SUM`/`AVG` over the full corpus still has to visit
-every row's value once the column doesn't fit a dictionary. Neither is
-attempted here.
+a per-object summary. A `SUM`/`AVG` over a non-integer column, or over an
+integer column whose per-object sum overflowed `i64` at fold time, also
+still has to visit every row's value: it carries no stored sum and falls
+back to scanning. Neither index pack is attempted here.
 
 ### Why a sibling artifact, not a `SegmentRef`/`Snapshot` field
 
@@ -117,13 +125,19 @@ Additive fields/messages only, no renumbering:
   covering ADR-0090's four declared types (`F64` is not a declared
   typed-attribute-column type and is out of scope here as it is there).
 - `DictEntry { value, count }` and `ColumnStat { name, declared_type,
-  non_null_count, null_count, min, max, dictionary_present, dictionary
-  }`: one column's exact statistics for one segment. `min`/`max` are
+  non_null_count, null_count, min, max, dictionary_present, dictionary,
+  sum }`: one column's exact statistics for one segment. `min`/`max` are
   proto3-absent (not a sentinel value) when `non_null_count == 0`.
   `dictionary_present = false` means the column's distinct-value count
   in this segment exceeded the cardinality ceiling: the dictionary is
   omitted outright, never truncated, so a reader can never mistake "over
-  the ceiling" for "fewer than N distinct values."
+  the ceiling" for "fewer than N distinct values." `sum` (proto3
+  `optional`, #861) is the exact sum of the column's non-null values,
+  present for an I64 column only and omitted when the exact sum overflowed
+  `i64` at fold time; absence means "no exact sum, scan instead," and it is
+  independent of `dictionary_present` so a high-cardinality integer column
+  still decomposes `SUM`/`AVG`. The codec rejects a `sum` on a non-integer
+  column and a `sum` that disagrees with the column's own dictionary.
 - `ColumnStatsSegment { ingest_hour_bucket, shard, writer_id,
   writer_epoch, writer_seq, columns }`: the per-segment join key plus its
   columns' stats.
