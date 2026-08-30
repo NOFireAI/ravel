@@ -664,7 +664,9 @@ async fn pending_erasure_declines_and_keeps_the_scan() {
     // The same erasure must force the sum-backed shapes (q03/q04/q30) to
     // decline too: a pending erasure removes rows the folded sum and count
     // still include (`declared_column_sum` gates on the same `stats_are_exact`,
-    // logs_scan.rs). Reuse the erasure snapshot above.
+    // logs_scan.rs). Rebuilt rather than reused: the first `snapshot_of` call
+    // consumed the segment refs and the stats, so this constructs an
+    // equivalent snapshot carrying the same pending erasure.
     let ctx = logs_session(provider(
         &store,
         snapshot_of(
