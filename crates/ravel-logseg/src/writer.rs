@@ -148,6 +148,16 @@ pub struct WriteStats {
 /// value (docs/log-segment-format.md "BLOOM"): longer values are tokenized only.
 const EXACT_BLOOM_MAX: usize = 64;
 
+/// The largest [`RlogConfig::max_dynamic_columns`] an object can carry and
+/// still be read back. The writer assigns dynamic column ids
+/// `FIRST_DYNAMIC_COL + idx` for `idx` in `0..max_dynamic_columns`, so the
+/// largest id a config can assign is `FIRST_DYNAMIC_COL + max_dynamic_columns`
+/// minus one; `decode_v4_block` refuses any page whose `column_id` exceeds
+/// [`crate::block::MAX_COLUMN_ID`]. Derived from that one shared cap so the
+/// writer and decoder bounds cannot drift apart.
+pub(crate) const MAX_DYNAMIC_COLUMNS: u64 =
+    crate::block::MAX_COLUMN_ID - FIRST_DYNAMIC_COL as u64 + 1;
+
 impl RlogWriter {
     pub fn new(cfg: RlogConfig, identity: ObjectIdentity) -> Self {
         RlogWriter {
@@ -232,6 +242,17 @@ impl RlogWriter {
         part_index: u32,
         layout: Layout,
     ) -> Result<(Vec<u8>, WriteStats), LogSegError> {
+        // A config whose dynamic-column budget could assign an id past the
+        // decoder's cap writes objects that cannot be read back. Refuse it here,
+        // before any column is assigned, against the same shared cap the decoder
+        // enforces ([`MAX_DYNAMIC_COLUMNS`]), rather than letting the mismatch
+        // surface at read time as an object nothing can decode.
+        if self.cfg.max_dynamic_columns as u64 > MAX_DYNAMIC_COLUMNS {
+            return Err(LogSegError::LimitExceeded(format!(
+                "max_dynamic_columns {} exceeds {MAX_DYNAMIC_COLUMNS}, the most the decoder can read back",
+                self.cfg.max_dynamic_columns
+            )));
+        }
         if !self.batches.is_empty() {
             return self.build_object_columnar(level, input_set_hash, part_index, layout);
         }
@@ -2424,6 +2445,58 @@ mod tests {
     fn empty_input_rejected() {
         let w = RlogWriter::new(RlogConfig::default(), identity());
         assert!(matches!(w.finish(), Err(LogSegError::LimitExceeded(_))));
+    }
+
+    #[test]
+    fn dynamic_column_budget_past_decoder_cap_is_refused() {
+        // The exact boundary: a config carrying `MAX_DYNAMIC_COLUMNS` dynamic
+        // columns can assign at most FIRST_DYNAMIC_COL + MAX_DYNAMIC_COLUMNS - 1,
+        // which is exactly `block::MAX_COLUMN_ID`, the largest id
+        // `decode_v4_block` accepts. One past it would assign an id the decoder
+        // rejects, so the object could not be read back.
+        let at_cap = MAX_DYNAMIC_COLUMNS as usize;
+        assert_eq!(
+            FIRST_DYNAMIC_COL as u64 + at_cap as u64 - 1,
+            crate::block::MAX_COLUMN_ID,
+            "at-cap budget assigns exactly the largest id the decoder accepts"
+        );
+
+        // A one-record object assigns only one dynamic column, so neither config
+        // actually reaches a high id; the refusal is a property of the config
+        // and fires before any column is assigned. A config at the cap is
+        // accepted, one past it is refused with the typed limit error.
+        let record = || {
+            let mut r = base_record(0, 0);
+            r.attrs.push(("k".into(), AttrValue::I64(1)));
+            r
+        };
+
+        let mut ok = RlogWriter::new(
+            RlogConfig {
+                max_dynamic_columns: at_cap,
+                ..RlogConfig::default()
+            },
+            identity(),
+        );
+        ok.push(record()).expect("push");
+        ok.finish()
+            .expect("a config at the decoder cap is accepted");
+
+        let mut over = RlogWriter::new(
+            RlogConfig {
+                max_dynamic_columns: at_cap + 1,
+                ..RlogConfig::default()
+            },
+            identity(),
+        );
+        over.push(record()).expect("push");
+        let err = over
+            .finish()
+            .expect_err("a config one past the decoder cap is refused");
+        assert!(
+            matches!(err, LogSegError::LimitExceeded(_)),
+            "expected LimitExceeded, got {err:?}"
+        );
     }
 
     #[test]

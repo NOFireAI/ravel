@@ -731,6 +731,79 @@ async fn narrow_projection_over_v3_segment_is_refused_before_any_request() {
     );
 }
 
+/// ADR-0892 decision 4, the PLAN path: `compute_plan_counts` must refuse an
+/// unreadable version BEFORE its plan probe, with the SAME exact-zero request
+/// law the scan-path sibling above
+/// (`narrow_projection_over_v3_segment_is_refused_before_any_request`) pins.
+///
+/// The scan-path test cannot reach this guard. The predicate-free full-window
+/// whole-segment fast path skips `compute_plan_counts` entirely
+/// (`LogsScanExec::execute`'s `whole_segment_fast_path` arm), and that fixture
+/// -- predicate-free, full window, `relevant_segments == target_partitions` --
+/// takes it. This one fails exactly one fast-path conjunct, `relevant_segments
+/// >= target_partitions`, by requesting one more partition than there are
+/// segments; every other conjunct still holds. That routes the query through
+/// the plan-then-stripe path and so through `compute_plan_counts`, which calls
+/// `refuse_unreadable_version` on each segment before building its
+/// `plan_segment` probe.
+///
+/// Removing the `refuse_unreadable_version(seg)?` line from
+/// `compute_plan_counts` fails this test: each v3 segment's `plan_segment` then
+/// issues its suffix probe (and, when the probe misses the footer, a
+/// footer-range GET) before `open_from_suffix` rejects the version, so the
+/// counters are no longer all zero. The guard-removed run was observed issuing
+/// nonzero `suffix` GETs (one probe per segment) and nonzero bytes; with the
+/// guard present every counter is exactly zero.
+///
+/// Zero is asserted exactly, per counted kind, never as "fewer than before".
+#[tokio::test]
+async fn plan_path_over_v3_segment_is_refused_before_any_request() {
+    let base = Arc::new(MemoryStore::new());
+    let snapshot = build_snapshot(base.as_ref(), RlogVersion::V3).await;
+    let counting = CountingStore::new(base);
+    let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&counting) as Arc<dyn ObjectStoreBackend>;
+    let threshold = smallest_object(&snapshot) / THRESHOLD_DIVISOR;
+    let prov = Arc::new(provider(snapshot, fetcher(store, threshold)));
+
+    // One more partition than there are segments, so the fast path's
+    // `relevant_segments >= target_partitions` conjunct fails
+    // (FewerSegmentsThanPartitions) and the query takes the plan path. Every
+    // other conjunct -- no erasure, no block predicate, full window -- holds.
+    let ctx =
+        SessionContext::new_with_config(SessionConfig::new().with_target_partitions(SEGMENTS + 1));
+    let plan = TableProvider::scan(
+        prov.as_ref(),
+        &ctx.state(),
+        Some(&narrow_projection()),
+        &[],
+        None,
+    )
+    .await
+    .expect("scan");
+    let err = collect(Arc::clone(&plan), Arc::new(TaskContext::default()))
+        .await
+        .expect_err("a v3 segment is unreadable and must not produce rows");
+
+    // Same typed error the scan path produces, refused on the plan path here.
+    assert_unsupported_version(&err, ravel_logseg::footer::VERSION - 1);
+
+    // Exact request law, identical to the scan-path sibling: the plan probe
+    // (`suffix`), any front-section/footer-range read (`range`), the
+    // whole-object read (`full`), and the bytes they would have moved are each
+    // exactly zero.
+    assert_eq!(
+        (
+            counting.full.load(Ordering::SeqCst),
+            counting.suffix.load(Ordering::SeqCst),
+            counting.range.load(Ordering::SeqCst),
+            counting.bytes.load(Ordering::SeqCst),
+        ),
+        (0, 0, 0, 0),
+        "the plan path refuses an unreadable object before its plan probe: no \
+         full GET, no suffix probe, no range GET, no bytes"
+    );
+}
+
 /// Assert `err` carries `LogSegError::UnsupportedVersion(version)` through the
 /// `SqlError` boundary, whatever DataFusion wrapped it in.
 fn assert_unsupported_version(err: &datafusion::error::DataFusionError, version: u16) {

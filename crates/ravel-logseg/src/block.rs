@@ -44,7 +44,7 @@ pub const MAX_PAGES: u64 = 4096;
 /// input: without this cap a single corrupt or hostile block declaring a
 /// `column_id` near `u32::MAX` would resize that vector to billions of slots
 /// and exhaust memory before any pool limit could observe it.
-const MAX_COLUMN_ID: u64 = 1 << 20;
+pub(crate) const MAX_COLUMN_ID: u64 = 1 << 20;
 
 /// A cheap multiplicative mix (FxHash-style) for column ids, in place of
 /// std's default SipHash. Column ids are dense, small (a real schema tops out

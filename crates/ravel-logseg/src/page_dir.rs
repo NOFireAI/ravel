@@ -236,6 +236,35 @@ impl PageDir {
         self.groups.iter().map(|g| u64::from(g.block_count)).sum()
     }
 
+    /// Decode a PAGE_DIR and cross-check it against the block framing every
+    /// reader shares (ADR-0699 decision 2): its chunk extents must fit a BLOCKS
+    /// section of `blocks_len` bytes, and it must cover exactly the `l0_len`
+    /// blocks the skip index frames. A mismatch is `Corrupted`, since a
+    /// directory that disagrees with the framing would locate one block's pages
+    /// in another block's bytes.
+    ///
+    /// The two readers ([`crate::reader::RlogReader`] and
+    /// [`crate::ranged::RlogRangeReader`]) obtain the decompressed PAGE_DIR
+    /// bytes differently -- one reads the section from the whole object, the
+    /// other takes it by range -- but decode and validate them identically, so
+    /// that shared tail lives here rather than duplicated in each opener.
+    pub(crate) fn decode_validated(
+        raw: &[u8],
+        blocks_len: u64,
+        l0_len: usize,
+    ) -> Result<Self, LogSegError> {
+        let dir = PageDir::decode(raw)?;
+        dir.validate_extents(blocks_len)?;
+        if dir.block_count() != l0_len as u64 {
+            return Err(LogSegError::Corrupted(format!(
+                "page_dir covers {} blocks but skip index has {}",
+                dir.block_count(),
+                l0_len
+            )));
+        }
+        Ok(dir)
+    }
+
     /// Rejects a directory whose page extents fall outside a BLOCKS section of
     /// `blocks_len` bytes. Decode alone cannot check this: the section length
     /// is not in these bytes.
