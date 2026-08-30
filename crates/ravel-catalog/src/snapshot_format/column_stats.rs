@@ -287,6 +287,21 @@ fn validate_column(column: &ColumnStat) -> Result<(), SnapshotFormatError> {
         });
     }
 
+    // A column with no non-null values has nothing to sum, so the only exact
+    // sum is zero. Checked here rather than inside the dictionary branch
+    // below, because a record with `dictionary_present = false` never reaches
+    // that branch: without this, `non_null_count = 0` with `sum = Some(k)`
+    // validates, and `LogsScanExec::declared_column_sum` then folds `k` into
+    // the cross-segment total while adding nothing to the count. The SUM would
+    // be wrong by `k` and the AVG wrong in both terms — a wrong answer where
+    // the contract is an exact answer or a decline.
+    if column.non_null_count == 0 && column.sum.is_some_and(|s| s != 0) {
+        return Err(SnapshotFormatError::ColumnStatsSumWithoutValues {
+            name: column.name.clone(),
+            sum: column.sum.unwrap_or(0),
+        });
+    }
+
     if column.dictionary_present {
         let mut seen: HashSet<Vec<u8>> = HashSet::with_capacity(column.dictionary.len());
         let mut total: u64 = 0;
@@ -709,6 +724,49 @@ mod tests {
             .expect("encodes");
         let decoded = decode_column_stats(&bytes, &ColumnStatsLimits::default()).expect("decodes");
         assert_eq!(decoded.segments[0].columns[0].sum, Some(45));
+    }
+
+    /// An all-null column carrying a non-zero sum is rejected at encode.
+    ///
+    /// This shape reaches neither the dictionary cross-check (no dictionary)
+    /// nor the non-integer check (it is I64), so before this guard it
+    /// validated. `LogsScanExec::declared_column_sum` folds `sum` and
+    /// `non_null_count` from each segment independently, so such a record adds
+    /// to the running total while adding nothing to the count: a multi-segment
+    /// SUM comes back wrong by that amount, and AVG wrong in both terms. The
+    /// contract is an exact answer or a decline, never a wrong one.
+    #[test]
+    fn sum_without_non_null_values_rejected() {
+        let mut seg = segment(1, 0, 1);
+        seg.columns[0].dictionary_present = false;
+        seg.columns[0].dictionary = vec![];
+        seg.columns[0].non_null_count = 0;
+        // An all-null column carries no extrema either (checked above this
+        // guard), so clear them: the record must be invalid for exactly one
+        // reason, or the test would pass on the wrong error.
+        seg.columns[0].min = None;
+        seg.columns[0].max = None;
+        seg.columns[0].sum = Some(5);
+        let err = encode_column_stats([0x11; 16], 3, vec![vec![0x22; 32]], &[seg.clone()])
+            .expect_err("an all-null column with a non-zero sum must be rejected");
+        assert!(
+            matches!(
+                &err,
+                SnapshotFormatError::ColumnStatsSumWithoutValues { sum, .. } if *sum == 5
+            ),
+            "{err:?}"
+        );
+
+        // Zero is the exact sum of no values, so it stays valid: the guard
+        // rejects an impossible total, not the absence of one.
+        seg.columns[0].sum = Some(0);
+        encode_column_stats([0x11; 16], 3, vec![vec![0x22; 32]], &[seg.clone()])
+            .expect("an all-null column may carry sum 0");
+
+        // And an absent sum is likewise fine.
+        seg.columns[0].sum = None;
+        encode_column_stats([0x11; 16], 3, vec![vec![0x22; 32]], &[seg])
+            .expect("an all-null column may carry no sum");
     }
 
     #[test]

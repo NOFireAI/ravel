@@ -275,4 +275,12 @@ pub enum SnapshotFormatError {
         /// not the exact overflowed magnitude.
         dict_sum: i64,
     },
+    /// A column with no non-null values carries a non-zero `sum`. An all-null
+    /// column has nothing to sum, so zero is the only exact answer. Rejected
+    /// because the metadata-only path folds `sum` and `non_null_count` from
+    /// each segment independently: a record like this adds to the total while
+    /// adding nothing to the count, making a multi-segment SUM wrong by that
+    /// amount and an AVG wrong in both terms.
+    #[error("column-stats column {name:?} has no non-null values but carries sum {sum}")]
+    ColumnStatsSumWithoutValues { name: String, sum: i64 },
 }
