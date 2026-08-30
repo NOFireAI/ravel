@@ -244,9 +244,24 @@ and an incremental fold does not.
 **That command does not exist yet, and nothing in the tree substitutes for
 it.** This is a build obligation of the decision, not a follow-up that can
 slip: the re-key is correct and completely inert without it on precisely the
-corpus it is measured against. A plan that lands the re-key alone and reports
-progress would be reporting a change that moves no byte on any existing
-tenant.
+corpus it is measured against.
+
+Being exact about which tenants, because the two halves of Class B behave
+differently and the distinction is the whole point of this section:
+
+- A **live** tenant converges on its own. It keeps ingesting, so it keeps
+  folding, and the upgraded fold emits part-bound v2 records for the parts it
+  touches. Its recent history gains coverage with no operator action. Its
+  sealed history does not, because sealed parts are carried forward by
+  reference and never re-listed.
+- A **quiescent, fully compacted** tenant gains nothing at all. It folds
+  nothing, so it rebuilds nothing, and every segment keeps falling back to
+  scan.
+
+The reference corpus is the second kind, which is why a plan that lands the
+re-key alone and reports progress would be reporting a change that moves no
+byte *there*. On a live tenant it would move some, and only for the tail.
+Neither case reaches sealed history without the backfill pass.
 
 ## Rejected alternatives
 
