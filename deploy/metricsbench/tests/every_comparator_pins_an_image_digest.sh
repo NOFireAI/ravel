@@ -25,7 +25,12 @@ set -u
 
 # Resolve the deployment directory from this script's own location so the check
 # runs correctly from any working directory.
+# `CDPATH= cd` clears CDPATH for that one command, so a user's CDPATH cannot
+# make `cd` resolve somewhere else and print the directory it chose. The empty
+# assignment is the point, not a typo; SC1007 cannot tell the two apart.
+# shellcheck disable=SC1007
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# shellcheck disable=SC1007
 DEPLOY_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 COMPOSE_FILE="$DEPLOY_DIR/docker-compose.yml"
 
@@ -65,17 +70,24 @@ image_count=$(printf '%s\n' "$IMAGE_REFS" | grep -c .)
 
 echo "  image references found: $image_count (expected $EXPECTED_IMAGE_COUNT)"
 echo "  references:"
-# Check every reference carries an @sha256: digest.
+# A pinned reference ends in `@sha256:` followed by exactly 64 hex digits.
+# Matching the bare substring `@sha256:` is not enough: `repo:tag@sha256:` with
+# an empty or truncated digest would satisfy it while pinning nothing, which is
+# the failure this check exists to catch.
+DIGEST_RE='@sha256:[0-9a-f]\{64\}$'
+
+# Check every reference carries a complete digest.
 printf '%s\n' "$IMAGE_REFS" | while IFS= read -r ref; do
-  case "$ref" in
-    *@sha256:*) echo "    [pinned]   $ref" ;;
-    *)          echo "    [UNPINNED] $ref" ;;
-  esac
+  if printf '%s\n' "$ref" | grep -q "$DIGEST_RE"; then
+    echo "    [pinned]   $ref"
+  else
+    echo "    [UNPINNED] $ref"
+  fi
 done
 
 # The digest check drives the exit code from the parent shell (the while loop
 # above runs in a subshell and cannot set `fail`). Recount unpinned refs here.
-unpinned=$(printf '%s\n' "$IMAGE_REFS" | grep -vc '@sha256:')
+unpinned=$(printf '%s\n' "$IMAGE_REFS" | grep -vc "$DIGEST_RE")
 if [ "$unpinned" -ne 0 ]; then
   echo "FAIL: $unpinned image reference(s) lack an @sha256: digest"
   fail=1
