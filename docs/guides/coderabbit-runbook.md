@@ -2,13 +2,9 @@
 
 How to turn on, verify, operate, rotate, and remove Ravel's CodeRabbit
 integration. The design and its evidence are in
-[ADR-0091](../adrs/0091-maintainer-gated-coderabbit-reviews.md); this document
-is the operational half, and it covers the controls that cannot be expressed as
+[ADR-0091](../adrs/0091-maintainer-gated-coderabbit-reviews.md). This document is
+the operational half, and it covers the controls that cannot be expressed as
 files in this repository.
-
-Everything here was verified against CodeRabbit's and GitHub's documentation,
-the GitHub API for `NOFireAI/ravel`, and the CodeRabbit CLI binary, on
-**2026-08-19**.
 
 Read this first: **the integration cannot spend anything until the
 `coderabbit-oss` environment is protected and carries a secret.**
@@ -21,7 +17,7 @@ not stop at a missing environment. It creates an unprotected one and then fails
 on the missing key.
 
 The trap that leaves is an administrator finding `coderabbit-oss` already there
-and simply adding the secret to it, which yields no reviewer gate and no branch
+and adding the secret to it, which yields no reviewer gate and no branch
 restriction while looking configured. The `authorize` job closes it by checking
 the protection rules on every run and failing closed. **If you ever see
 `coderabbit-oss` with no required reviewers, it was auto-created. Protect it
@@ -48,14 +44,14 @@ The seven `admin` holders on `NOFireAI/ravel` today are `ananos`,
 `gh api repos/NOFireAI/ravel/collaborators --jq '.[] | select(.role_name == "admin" or .role_name == "maintain") | .login'`
 whenever CODEOWNERS or the environment reviewer list is touched.
 
-`@NOFireAI/ravel-maintainers` was created on 2026-08-19, holds `maintain` on
-this repository, and owns the trusted paths in `.github/CODEOWNERS`. It has one
-member, `pmoust`. Two consequences follow, and both are deliberate.
+`@NOFireAI/ravel-maintainers` holds `maintain` on this repository and owns the
+trusted paths in `.github/CODEOWNERS`. It has one member, `pmoust`. Two
+consequences follow, and both are deliberate.
 
 Every change to the CodeRabbit control plane needs that one person's approval
 once step 5 is applied. That is a narrow gate on exactly the right paths, and a
-bus factor of one. Add members when the set of people who should own these paths
-grows; that is a one-line change and needs no code.
+bus factor of one. Add members when the set of people who must own these paths
+grows. That is a one-line change and needs no code.
 
 The team is **not** a required reviewer on the `coderabbit-oss` environment, and
 must not become the only one while it has a single member. `prevent_self_review`
@@ -78,7 +74,7 @@ the integration work.**
 |---|---|---|---|
 | 1.1 | Plan | Subscription page | The organization backing `NOFireAI` shows **Open Source**, not Free, not Pro, not a Pro+ trial, and not "trial ends in N days" |
 | 1.2 | Repository treatment | Repository settings for `NOFireAI/ravel` | `NOFireAI/ravel` is listed and receiving OSS treatment, not generic Free-plan treatment |
-| 1.3 | Usage-based add-on | Subscription and billing | **Disabled.** The add-on is offered to Pro, Pro+, and Enterprise; a genuine OSS organization should not be able to enable it at all. If it is enabled, the organization is not on OSS |
+| 1.3 | Usage-based add-on | Subscription and billing | **Disabled.** The add-on is offered to Pro, Pro+, and Enterprise. A genuine OSS organization must not be able to enable it at all. If it is enabled, the organization is not on OSS |
 | 1.4 | Payment method | Billing | No card on file, or a card that no plan draws on. No purchased credits |
 | 1.5 | Agentic API key | Settings, API keys | An Agentic API key can be created for this organization **without a charge and without assigning a paid seat** |
 | 1.6 | Key organization | The key creation dialog | The key is bound to the organization that owns `NOFireAI/ravel`, since "API-key authentication always uses that key's organization for billing and review behavior" |
@@ -103,25 +99,22 @@ answer is the local fallback.
 
 ## Step 2: install the GitHub App for `ravel`, and restrict everything but review
 
-ADR-0091 amendment 2 restores the App's automatic review on every pull
-request. The App must therefore be installed on this organization with
-`NOFireAI/ravel` selected. On 2026-08-26 it was not: the organization's
-installed-Apps list carried no `coderabbitai` entry, so the repository's
-`.coderabbit.yaml` governed nothing. Install it from
+The App performs automatic review on every pull request, so it must be installed
+on this organization with `NOFireAI/ravel` selected. Install it from
 <https://github.com/apps/coderabbitai> (or Organization settings, Installed
 GitHub Apps, CodeRabbit, Configure), repository access `Only select
 repositories`, select `ravel`. The vendor's pricing page says "install
 CodeRabbit on a public repository, and receive free reviews forever for public
-repositories"; confirm in the dashboard that `ravel` is receiving Open Source
+repositories". Confirm in the dashboard that `ravel` is receiving Open Source
 treatment after the install, and run the cost-control checklist below.
 
 Apply these in **CodeRabbit organization settings**, which is the only layer a
 pull request cannot edit. A `.coderabbit.yaml` on `main` does not constrain the
-review of a pull request that changes it. Where the plan offers global
-overrides, mark these as overriding repository configuration. If an earlier
-enablement set the two review switches to off with a global override, that
-override is what a pull request sees, and `.coderabbit.yaml` cannot turn review
-back on: flip them here.
+review of a pull request that changes it. Where the plan offers global overrides,
+mark these as overriding repository configuration. If an earlier enablement set
+the two review switches to off with a global override, that override is what a
+pull request sees, and `.coderabbit.yaml` cannot turn review back on. Flip them
+here.
 
 - Automatic review: **on**
 - Automatic incremental review: **on**
@@ -146,10 +139,16 @@ Then **test the restrictions from real accounts.** Settings that were never
 exercised are not controls. On a scratch pull request against `main`, from each
 identity below, post each command and record what happens:
 
-Identities: anonymous or external fork contributor; outside collaborator;
-organization member with `read`; organization member with `triage`;
-organization member with `write` (`nofire-bot` and the 13 `write` collaborators
-are real examples); a maintainer; an administrator.
+Identities:
+
+- anonymous or external fork contributor
+- outside collaborator
+- organization member with `read`
+- organization member with `triage`
+- organization member with `write` (`nofire-bot` and the 13 `write`
+  collaborators are real examples)
+- a maintainer
+- an administrator
 
 Commands: `@coderabbitai review`, `@coderabbitai full review`,
 `@coderabbitai autofix`, `@coderabbitai fix-ci`,
@@ -159,19 +158,18 @@ A pass requires **every non-maintainer identity to produce no review, no
 comment, and no repository mutation.**
 
 If any non-maintainer identity can still cause a review or a mutation, then the
-App path does not satisfy Ravel's requirement, and it must not be described as
-if it does. Record the result and treat the App as an accepted, documented
-residual risk, or remove it. CodeRabbit's finest-grained chat control is
-`allow_non_org_members`, an organization-member boundary; `NOFireAI/ravel` has
-13 `write` collaborators who are not maintainers, so that boundary is not a
+App path does not satisfy Ravel's requirement, and it must not be described as if
+it does. Record the result and treat the App as an accepted, documented residual
+risk, or remove it. CodeRabbit's finest-grained chat control is
+`allow_non_org_members`, an organization-member boundary. `NOFireAI/ravel` has 13
+`write` collaborators who are not maintainers, so that boundary is not a
 maintainer-only boundary here.
 
 ## Step 3: create and protect the environment
 
 Only after step 1 passes.
 
-**Done on 2026-08-19**, with this state, which the `authorize` job now asserts
-on every run:
+Set this state, which the `authorize` job asserts on every run:
 
 - Required reviewers: `ananos`, `spirosoik`, `alextoulps`, `safts`,
   `stylianosrigas`, `asapranidis`
@@ -190,10 +188,10 @@ from approving their own dispatches, which makes their reviewer slot the one
 least often usable. Swap it with one API call if that is wrong.
 
 The cap is why a team is the better end state for the reviewer list: a team
-counts as one entry, so the cap stops binding. `@NOFireAI/ravel-maintainers`
-now exists and has replaced the hardcoded logins in `.github/CODEOWNERS`, but it
-has one member, so it is deliberately not the environment's reviewer yet. See
-"Who can change what" for why that ordering matters.
+counts as one entry, so the cap stops binding. `@NOFireAI/ravel-maintainers` has
+replaced the hardcoded logins in `.github/CODEOWNERS`, but it has one member, so
+it is deliberately not the environment's reviewer yet. See "Who can change what"
+for why that ordering matters.
 
 To recreate this from scratch:
 
@@ -226,9 +224,9 @@ gh api orgs/NOFireAI/actions/secrets --jq '.secrets[].name'          # must NOT 
 ## Step 4: workflow execution actor rules
 
 GitHub has no setting that limits `workflow_dispatch` to `maintain` and above.
-Dispatch comes with `write`. This is why ADR-0091 does not rely on GitHub's
-trigger permissions at all, and instead verifies `role_name` at runtime and puts
-the credential behind the environment.
+Dispatch comes with `write`. The workflow therefore does not rely on GitHub's
+trigger permissions. It verifies `role_name` at runtime and puts the credential
+behind the environment.
 
 Apply what GitHub does offer:
 
@@ -289,10 +287,10 @@ and both then wait for the environment approval.
 /coderabbit review
 ```
 
-The command must be the first line of the comment. A quoted command further
-down is prose and does nothing. An authorised command gets a reaction on the
-comment within a few seconds: 👀 means a review is starting, 👍 means this head
-SHA was already reviewed under this policy and nothing was spent.
+The command must be the first line of the comment. A quoted command further down
+is prose and does nothing. An authorised command gets a reaction on the comment
+within a few seconds: 👀 means a review is starting, 👍 means this head SHA was
+already reviewed under this policy and nothing was spent.
 
 A comment from a non-maintainer gets no reaction and no reply. The run fails at
 the permission check, and only people with repository access see it in the
@@ -334,28 +332,28 @@ itself, but it cannot be tested before this workflow is on `main`. On the first
 comment-triggered run, open the `authorize` job's "Assert trusted control plane"
 step and confirm it passed. If it failed on the ref, the comment trigger is
 inoperative and the workflow has failed closed rather than trusting a pull
-request; report it and use `workflow_dispatch` until it is understood.
+request. Report it and use `workflow_dispatch` until it is understood.
 
 ---
 
 ## Acceptance test matrix
 
-Run this before declaring the integration live, and again after any change to
-the workflow, the trusted policy, the ruleset, or the environment.
+Run this before declaring the integration live, and again after any change to the
+workflow, the trusted policy, the ruleset, or the environment.
 
-Everything that can be decided without a GitHub account, a CodeRabbit
-credential, or an administrator console is executable:
+Everything that can be decided without a GitHub account, a CodeRabbit credential,
+or an administrator console is executable:
 
 ```sh
 scripts/coderabbit-acceptance-tests.sh                    # offline, ~2 seconds
 VERIFY_DOWNLOAD=1 scripts/coderabbit-acceptance-tests.sh  # also verify the pinned CLI digest
 ```
 
-That suite runs the authorization gate's real shell, extracted from the
-workflow file, against a mock GitHub, so it cannot drift from what ships. It
-ends by listing the cases it could not decide, so a green run is never mistaken
-for a complete one. It is deliberately not wired into `ci.yml`: adding a job
-there would mean editing a workflow this change has no business touching.
+That suite runs the authorization gate's real shell, extracted from the workflow
+file, against a mock GitHub, so it cannot drift from what ships. It ends by
+listing the cases it could not decide, so a green run is never mistaken for a
+complete one. It is deliberately not wired into `ci.yml`: adding a job there
+would mean editing a workflow this change has no business touching.
 
 `I` marks an implementation control that a test account can exercise directly.
 `M` marks a control that lives in GitHub or CodeRabbit administration and needs
@@ -414,7 +412,7 @@ changes.
 - [ ] Deduplication marker checked before every call
 - [ ] No matrix over crates, directories, or file groups
 - [ ] Rate-limit and over-limit responses exit neutral and spend nothing
-- [ ] The trusted config disables automatic and incremental review; `.coderabbit.yaml` enables both and nothing else that writes
+- [ ] The trusted config disables automatic and incremental review, and `.coderabbit.yaml` enables both and nothing else that writes
 - [ ] App installed for `ravel`, automatic review on at organization level, every write-capable surface off
 - [ ] CodeRabbit usage page reviewed monthly and showing zero credit spend
 
@@ -427,7 +425,7 @@ changes.
 1. Create a new Agentic API key in the CodeRabbit dashboard.
 2. Update the `CODERABBIT_API_KEY` secret on the `coderabbit-oss` environment.
 3. Delete the old key in the CodeRabbit dashboard. Deleting it there is what
-   makes the old value useless; overwriting the GitHub secret alone does not.
+   makes the old value useless. Overwriting the GitHub secret alone does not.
 4. Dispatch one review to confirm the new key works.
 
 **If the key is suspected exposed:**
@@ -439,9 +437,9 @@ changes.
 3. Check the CodeRabbit usage page for reviews the maintainer set did not
    dispatch. Cross-reference against
    `gh run list --workflow coderabbit-maintainer-review.yml --json databaseId,actor,createdAt,conclusion`.
-4. Determine the exposure route. The plausible ones are: an environment
-   protection rule that was relaxed; a change to the workflow that widened the
-   secret's blast radius; a maintainer account compromise; a copy of the key
+4. Determine the exposure route. The plausible ones are an environment
+   protection rule that was relaxed, a change to the workflow that widened the
+   secret's blast radius, a maintainer account compromise, or a copy of the key
    outside GitHub. Check
    `gh api repos/NOFireAI/ravel/environments/coderabbit-oss --jq '.protection_rules'`
    and `git log --oneline -- .github/workflows/coderabbit-maintainer-review.yml .github/coderabbit/`.
@@ -463,26 +461,26 @@ merge, cannot open issues, and cannot approve or block. Follow
 Ordered from fastest to most complete. Each step is independently sufficient for
 what it claims, and none of them touches Ravel's other workflows.
 
-1. **Stop all spending immediately.** Delete the `CODERABBIT_API_KEY` secret
-   from the `coderabbit-oss` environment. The review job then fails at its first
-   step and no CodeRabbit call can be made.
+1. **Stop all spending immediately.** Delete the `CODERABBIT_API_KEY` secret from
+   the `coderabbit-oss` environment. The review job then fails at its first step
+   and no CodeRabbit call can be made.
 2. **Stop all dispatches.** Disable the workflow:
    `gh workflow disable coderabbit-maintainer-review.yml`.
 3. **Stop the App as well.** Remove `NOFireAI/ravel` from the CodeRabbit App
    installation in GitHub organization settings. This is what stops
-   `@coderabbitai` comment surfaces; disabling the workflow does not.
+   `@coderabbitai` comment surfaces. Disabling the workflow does not.
 4. **Remove the integration from the repository.** Delete
    `.github/workflows/coderabbit-maintainer-review.yml`, `.github/coderabbit/`,
    `.coderabbit.yaml`, `scripts/coderabbit-maintainer-review.sh`, and the
-   CodeRabbit entries in `.github/CODEOWNERS`, in one pull request. Mark
-   ADR-0091 superseded rather than deleting it.
+   CodeRabbit entries in `.github/CODEOWNERS`, in one pull request. Mark the
+   CodeRabbit ADR superseded rather than deleting it.
 5. **Remove the environment.**
    `gh api --method DELETE repos/NOFireAI/ravel/environments/coderabbit-oss`.
 
 None of these removes a required status check, so `main` stays mergeable
 throughout. Ravel's CI is unaffected: no file under `.github/workflows/` other
-than the CodeRabbit workflow is touched by any step, and CodeRabbit is not in
-the `protect-main` required-checks list.
+than the CodeRabbit workflow is touched by any step, and CodeRabbit is not in the
+`protect-main` required-checks list.
 
 ---
 
@@ -502,24 +500,24 @@ echo "${expected}  coderabbit.zip" | shasum -a 256 -c -
 unzip -o coderabbit.zip -d ~/.local/bin
 ```
 
-Use `coderabbit-linux-x64` or `coderabbit-linux-arm64` and the matching digest
-on Linux. Then `coderabbit auth login` with your own account, and:
+Use `coderabbit-linux-x64` or `coderabbit-linux-arm64` and the matching digest on
+Linux. Then `coderabbit auth login` with your own account, and:
 
 ```sh
 scripts/coderabbit-maintainer-review.sh 1234              # print locally
 scripts/coderabbit-maintainer-review.sh 1234 --publish    # post a COMMENT review
 ```
 
-The script refuses to run unless GitHub reports your `role_name` as `maintain`
-or `admin`. It holds no shared credential, so there is nothing here for a
+The script refuses to run unless GitHub reports your `role_name` as `maintain` or
+`admin`. It holds no shared credential, so there is nothing here for a
 non-maintainer to consume: the allowance spent is your own.
 
 ## Upgrading the pinned CLI
 
-ADR-0091's Decision 4 depends on one property of the pinned build: a non-empty
-`--config` list replaces the CLI's discovery list rather than adding to it, and
-an absolute path is used verbatim. A version bump can change that silently,
-because the vendor's own help text describes the flag as additive.
+The review depends on one property of the pinned build: a non-empty `--config`
+list replaces the CLI's discovery list rather than adding to it, and an absolute
+path is used verbatim. A version bump can change that silently, because the
+vendor's own help text describes the flag as additive.
 
 Before changing `.github/coderabbit/cli-pin.env`:
 
@@ -528,8 +526,8 @@ Before changing `.github/coderabbit/cli-pin.env`:
    deciding expression is
    `h = $.configFiles && $.configFiles.length > 0 ? $.configFiles : [".coderabbit.yaml", ...]`
    and the resolver is `if (isAbsolute($)) return [$]`.
-3. Confirm the agent output shape has not changed, since
-   `render-findings.py` parses `{"type":"finding", ...}`.
+3. Confirm the agent output shape has not changed, since `render-findings.py`
+   parses `{"type":"finding", ...}`.
 4. Confirm the CLI still executes nothing from the reviewed tree: no linter
    binaries, no linter names, `git` as its only child process.
 5. Update the pin and the digests in one pull request, with a code-owner
@@ -549,30 +547,30 @@ requirement asks for.
 
 One consequence worth knowing: for a pull request that sat stale and was then
 rebased, that merge base can be older than the branch point, so the review sees
-some commits from `main` as though the pull request wrote them. Ask the author
-to rebase and dispatch again if a review reads that way.
+some commits from `main` as though the pull request wrote them. Ask the author to
+rebase and dispatch again if a review reads that way.
 
 ## Residual risks
 
 These are real and are not closed by anything in this repository.
 
-**The CLI has no vendor integrity artifact.** No checksum, no signature, no
-image digest. The pinned digests are trust-on-first-use: they attest that CI
-runs the same bytes captured on 2026-08-19, not that those bytes are what
-CodeRabbit intended to publish. A compromise of the vendor's distribution before
-that capture is undetectable from here. Mitigating this properly needs the
-vendor to publish signed artifacts.
+**The CLI has no vendor integrity artifact.** No checksum, no signature, no image
+digest. The pinned digests are trust-on-first-use: they attest that CI runs the
+same bytes that were captured, not that those bytes are what CodeRabbit intended
+to publish. A compromise of the vendor's distribution before that capture is
+undetectable from here. Mitigating this properly needs the vendor to publish
+signed artifacts.
 
-**Three plan facts are unverified from this session.** The CodeRabbit
+**Three plan facts are unverified from a terminal.** The CodeRabbit
 organization's plan, the usage-based add-on state, and Agentic API key
 availability all live behind a dashboard login. Step 1 is where they get
 established, and the integration must not be enabled before it passes.
 
-**The App's boundary is organization membership, not maintainership.** If the
-App stays installed for OSS entitlement, and if any non-maintainer identity can
-still trigger it after step 2, then a `write` collaborator can consume the
-allowance through the App even though the workflow denies them. This is why step
-2 requires the test from real accounts rather than a settings screenshot.
+**The App's boundary is organization membership, not maintainership.** If the App
+stays installed for OSS entitlement, and if any non-maintainer identity can still
+trigger it after step 2, then a `write` collaborator can consume the allowance
+through the App even though the workflow denies them. This is why step 2 requires
+the test from real accounts rather than a settings screenshot.
 
 **The API key is passed as a process argument.** The CLI reads no environment
 variable for it, so `--api-key` is the only option. On a GitHub-hosted ephemeral
@@ -582,7 +580,7 @@ but it is not zero, and it would grow if any step in that job ever ran untrusted
 code.
 
 **The CLI carries product telemetry.** It bundles an analytics client with
-exception auto-capture. Diagnostics about a review, including error text, may
+exception auto-capture. Diagnostics about a review, including error text, can
 leave the runner. No Ravel secret is in scope, but this is not a hermetic tool.
 
 **Anyone can cause a run to start.** `workflow_dispatch` comes with `write`, and
@@ -593,16 +591,16 @@ seconds of a hosted runner, which is free on public repositories. The pre-filter
 on the `authorize` job (comment is on a pull request, author is not a bot, body
 starts with the command, author association is at least COLLABORATOR) keeps
 ordinary drive-by comments off the runner entirely. It is an extra condition and
-never the decision: MEMBER and COLLABORATOR are both far wider than maintainer.
-A determined abuser is answered by revoking their access; there is no
+never the decision: MEMBER and COLLABORATOR are both far wider than maintainer. A
+determined abuser is answered by revoking their access. There is no
 workflow-level fix, because GitHub does not expose the trigger permission this
 design would want.
 
 **Every comment in the repository now produces a workflow run record.**
-`issue_comment` has no body or path filter at the trigger level, so GitHub
-queues a run for each comment on every issue and pull request, and the
-pre-filter skips the jobs. A skipped job allocates no runner and consumes no
-minutes, so the cost is Actions-tab noise rather than money. Filter with
+`issue_comment` has no body or path filter at the trigger level, so GitHub queues
+a run for each comment on every issue and pull request, and the pre-filter skips
+the jobs. A skipped job allocates no runner and consumes no minutes, so the cost
+is Actions-tab noise rather than money. Filter with
 `gh run list --workflow coderabbit-maintainer-review.yml --json conclusion` and
 ignore the `skipped` ones.
 
@@ -612,10 +610,10 @@ authorization succeeded, touches no pull-request content, and does exactly one
 thing. Watch it in review: widening what that job does is how a reaction becomes
 a reply, and a reply is an amplifier for anyone who can type.
 
-**Ruleset and environment settings are not code.** Nothing in this repository
-can assert that `require_code_owner_review` is true or that the environment
-admits only `main`. The verification commands in steps 3 and 5 are the only
-check, and they are only as good as the cadence at which someone runs them.
+**Ruleset and environment settings are not code.** Nothing in this repository can
+assert that `require_code_owner_review` is true or that the environment admits
+only `main`. The verification commands in steps 3 and 5 are the only check, and
+they are only as good as the cadence at which someone runs them.
 
 **Maintainer set drift.** CODEOWNERS lists logins because there is no maintainer
 team on this repository yet. Reconcile it against the live collaborator list

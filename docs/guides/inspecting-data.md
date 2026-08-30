@@ -26,10 +26,10 @@ t/<tenant_hash>/m/c/<shard>/<ingest_hour>/<writer_id>.<epoch>.<seq>.cmt commit r
 ```
 
 `tenant_hash` is BLAKE3 of the tenant name, hex-encoded. `m` is the signal
-letter for metrics; logs use `l` and spans use `s`, and all three are
+letter for metrics. Logs use `l` and spans use `s`. All three are
 implemented. Logs have their own RLOG object format and an `rlog inspect`
-walkthrough further down this guide; spans have the RSPAN format
-([span-segment-format.md](../span-segment-format.md), ADR-0041) and a SQL
+walkthrough further down this guide. Spans have the RSPAN format
+([span-segment-format.md](../span-segment-format.md)) and a SQL
 query path over the `spans` table. `shard` is
 the ingest shard, zero-padded to 4 digits. `ingest_hour` is the UTC hour the
 commit landed in (`YYYYMMDDTHH`). This lets the catalog find recent
@@ -59,8 +59,8 @@ key to feed into `segment inspect` or `commit decode`.
 
 ![RSEG layout](../diagrams/rseg-layout.svg)
 
-Every segment is RSEG v7. ADR-0027 leaves one supported version at a time,
-and ADR-0092 moved it from v6 to v7. The command is:
+Every segment is RSEG v7. Ravel supports exactly one RSEG version at a
+time. The command is:
 
 ```sh
 cargo run -p ravel-cli -- segment inspect \
@@ -115,14 +115,14 @@ Field by field:
 - `total_size`, `trailer_offset`, `footer_offset`: the byte layout of the
   object. RSEG segments are footer-first-readable. The 16-byte trailer at
   the very end gives the footer's length and checksum. A reader therefore
-  needs one suffix GET to find and validate the footer before it fetches
+  needs one suffix GET to find and check the footer before it fetches
   anything else.
 - `version`: the trailer format version, always `7`. A non-7 version (a
   stray pre-release object, including a retired v6) gets a typed error; Ravel
   never half-parses it.
 - `tenant_hash`, `shard`, `writer_id`, `writer_epoch`, `writer_seq`: the
   identity components embedded in the object's key and its commit token. They
-  let you confirm that a segment and a commit token or record agree on what
+  let you check that a segment and a commit token or record agree on what
   wrote it.
 - `min/max_event_ts_ns`: the span of sample timestamps inside the segment.
 - `min/max_ingest_ts_ns`: when this server received those points.
@@ -167,14 +167,14 @@ Field by field:
   `zero_count`/`count`, then the positive and negative sides' spans
   (`(offset, length)` pairs) and bucket counts, in stored order.
 - `series_count (decoded)`: the series count from decoding the catalog, not
-  just from trusting the footer. If it matches `series_count (footer)`, the
+  from trusting the footer. If it matches `series_count (footer)`, the
   segment is internally consistent.
 
 
 ## `rlog inspect`: what's inside one log segment
 
 Log data lives in RLOG objects (`.rlog`), the columnar log segment format
-(docs/log-segment-format.md, ADR-0029; trailer version 4, ADR-0699). RLOG is
+(docs/log-segment-format.md, trailer version 4). RLOG is
 a sibling of RSEG. It shares the same 16-byte trailer, protobuf footer, and
 crc32c discipline, but it has its own sections and none of the bytes. Ingest, query, and lifecycle all run today: the production ingest path writes
 RLOG objects through `ravel-ingest`'s log shard, the `logs` SQL table on
@@ -230,11 +230,11 @@ field_dir (2 entry(ies)):
 Field by field:
 
 - `total_size`, `version`, `signal`: the byte length of the object, the
-  trailer format version (currently `4`; version 3 is still readable as the
-  N-1 half of the window, anything else gets a typed error), and the signal
+  trailer format version (always `4`; any other version gets a typed
+  error), and the signal
   byte (`2` = logs). Like
   RSEG, the object is footer-first-readable. The 16-byte trailer at the end
-  gives the footer's length and crc. A reader therefore validates the footer
+  gives the footer's length and crc. A reader therefore checks the footer
   in one suffix GET before it fetches anything else.
 - `tenant_hash`, `shard`, `writer_id`, `writer_epoch`, `writer_seq`: the
   identity components. They must match the commit record that the reader
@@ -245,7 +245,7 @@ Field by field:
   whole-object summary in the footer.
 - `record_count`, `block_count`, `stream_count`: the totals that the footer
   claims.
-- `level`, `input_set_hash`, `part_index`: compaction provenance (ADR-0032),
+- `level`, `input_set_hash`, `part_index`: compaction provenance,
   the same convention that RSEG uses. An L0 flush object (every object shown in
   this guide) stamps the sentinels `level=0`, empty `input_set_hash`, and
   `part_index=0`. A future L1 compacted object carries real values.
@@ -261,10 +261,10 @@ Field by field:
   (`comp=zstd`). BLOCKS and BLOOM are containers that a reader reads entry by
   entry, so they are `comp=none`. `comp` is printed by name (`none`/`zstd`).
 - `skip_index level 0`: one line per row block. Each line gives its byte
-  `offset` (into BLOCKS) and `len`, the `crc32c` that the reader verifies
+  `offset` (into BLOCKS) and `len`, the `crc32c` that the reader checks
   before it decodes the block, `record_count`, and the block's `ts_range` and
   `stream_ref_range` (both inclusive). The skip index prunes on those two
-  ranges. Since trailer v4 (ADR-0699) `offset` and `len` describe the block's
+  ranges. In trailer v4 `offset` and `len` describe the block's
   *page span* rather than a contiguous block: the pages of a row group are
   stored column-major, so consecutive blocks' spans overlap and the `crc32c`
   covers the block's pages concatenated in column-id order rather than a
@@ -276,7 +276,7 @@ Field by field:
   are the bit pattern that the min/max are stored as: two's complement for
   i64, and `to_bits` for f64, so f64 comparison is bit-exact. In the example,
   both blocks carry column 10 (`code`), an i64 attribute. The string column
-  `svc` is not numeric and so has no stat. Since trailer v3 (ADR-0095) a stat
+  `svc` is not numeric and so has no stat. A stat
   bounds the value each row *resolves* for the column's attribute name, not
   whatever sits in the column's value page. Resolution is what a query sees:
   the record's resource and scope attributes, overridden by the record's own,
@@ -342,7 +342,7 @@ the blake3 hash embedded in that segment's own key (`hash16` above,
 extended here to the full hash). It lets a retried commit PUT tell two cases
 apart: "already published, same content" (safe) and "already published,
 different content" (a fatal split-brain, because two different segments
-should never share a `(writer_id, epoch, seq)`). `signal` is the
+must never share a `(writer_id, epoch, seq)`). `signal` is the
 numeric signal code (`1` = metrics). `ingest_hour_bucket` is the same hour
 encoded in the object's own key, and it is what the catalog groups listings
 by.
@@ -362,7 +362,7 @@ written_count: 42
 commit_tokens: [v2:token-abc, v2:token-def]
 ```
 
-An idempotency marker (ADR-0051 section 5) is the receipt a keyed log or
+An idempotency marker is the receipt a keyed log or
 span ingest request writes after a successful flush, so a retry of the same
 request replays this receipt instead of re-ingesting. `written_count` is the
 row or span count the original request wrote; `commit_tokens` is the full

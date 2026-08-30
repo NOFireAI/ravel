@@ -42,13 +42,14 @@ delete the entire stateful tier. Ravel's job is to make that a good trade.
 Also live:
 
 - A Prometheus-compatible HTTP API, so existing Grafana dashboards work.
-  `/api/v1/metadata` returns real per-metric type, help, and unit for metrics
-  ingested after ADR-0085, and OTLP metric names get the standard
-  Prometheus-style unit and `_total` suffixes at ingest (a monotonic `foo` with
-  `unit: "By"` lands as `foo_bytes_total`), so the same metric matches whether
-  it arrives over OTLP or through a collector's Prometheus exporter.
+  `/api/v1/metadata` returns the real type, help text, and unit for each
+  metric. At ingest, OTLP metric names get the standard Prometheus unit and
+  `_total` suffixes. A monotonic `foo` with `unit: "By"` lands as
+  `foo_bytes_total`. The same metric matches whether it arrives over OTLP or
+  through a collector's Prometheus exporter.
 - Exemplars that link a metric sample to its trace.
-- Alerting that stores every rule transition as immutable, queryable data.
+- Alerting that records every rule transition as an immutable data record on
+  object storage.
 - An analytics endpoint for change point detection and summary statistics.
 - Compaction, age-based retention, and garbage collection across all signals.
 - Multi-tenancy with per-tenant SSE-KMS encryption, legal hold, and admission
@@ -57,26 +58,27 @@ Also live:
 - Distributed read fan-out and cross-cluster federation, off by default and
   byte-identical to local execution.
 - OTAP (OpenTelemetry Arrow) ingest, behind a cargo feature.
-- Per-tenant typed attribute columns on the `logs` SQL table: an operator
-  declares an attribute key (`ravel-cli typed-attr-column set acme
-  http.duration_ms:i64`, or the `--typed-attr-column` server flags) and it
-  becomes a native `Int64`/`Boolean`/`Binary` column, or
-  `Dictionary(Int32, Utf8)` for a declared string, so typed comparisons and
-  aggregates need no `CAST` over the stringified `attrs` map. A declared
-  string column keeps its dictionary encoding through Flight SQL and Arrow
-  IPC rather than being expanded per row; JSON row values are unchanged, but
-  the JSON envelope reports the dictionary type.
+- Per-tenant typed attribute columns on the `logs` SQL table. An operator
+  declares an attribute key with `ravel-cli typed-attr-column set acme
+  http.duration_ms:i64`, or with the `--typed-attr-column` server flags. The
+  key becomes a native `Int64`, `Boolean`, or `Binary` column, or a
+  `Dictionary(Int32, Utf8)` column for a declared string. Typed comparisons
+  and aggregates then need no `CAST` over the stringified `attrs` map. A
+  declared string column keeps its dictionary encoding through Flight SQL and
+  Arrow IPC. JSON row values are unchanged, but the JSON envelope reports the
+  dictionary type.
 
 Not there yet:
 
-- No downsampled tier. A wide-range query reads every raw hour ([#118](https://github.com/NOFireAI/ravel/issues/118)).
+- No downsampled tier. A wide-range query reads every raw hour.
 - Flight SQL runs ad-hoc statements. Prepared statements return `unimplemented`.
 
 The [SQL conformance table](docs/sql-conformance.md) and the PromQL conformance
 table in the [query engine spec](docs/query-engine.md) classify every construct
-as supported, intentionally rejected, or unclassified. Both are generated from a
-differential test against a real Prometheus binary, so the gaps are measured
-rather than claimed.
+as supported, intentionally rejected, or unclassified. The PromQL table comes
+from a differential test against a real Prometheus binary. The SQL table comes
+from a differential test against an independent reference implementation. The
+gaps are measured, not claimed.
 
 ## Quickstart
 
@@ -165,36 +167,39 @@ your network. None of these values are for a deployment that a network can reach
 ### Storage beyond the demo stack
 
 A real deployment points `--store s3` at any S3-compatible store with static
-keys, exactly as the quickstart points it at MinIO. On EC2 you can drop the
-static keys entirely: attach an IAM role to the instance and start with
+keys, exactly as the quickstart points it at MinIO. On EC2, you can drop the
+static keys. Attach an IAM role to the instance and start with
 
     ravel-server --store s3 --s3-bucket my-bucket --s3-region us-east-1 --s3-auth instance-role
 
-Credentials are fetched from the instance metadata service at startup and
-refreshed before they expire, so nothing long-lived is stored on the instance.
-The [operations guide](docs/guides/operations.md) documents every storage flag,
-including temporary session tokens and a rotating credentials file for
-non-EC2 deployments (ADR-0106, ADR-0072).
+Ravel fetches credentials from the instance metadata service at startup. It
+refreshes them before they expire, so the instance stores nothing long-lived.
+The [operations guide](docs/guides/operations.md) documents every storage flag.
+It also covers temporary session tokens and a rotating credentials file for
+non-EC2 deployments.
 
 ### Read cache
 
-Every query byte comes from object storage, so Ravel has an ADR-0046 read cache
-in front of it. The RAM tier is always on (bounded by `--cache-max-bytes`, or
-turned off entirely with `--disable-cache`). Adding `--cache-dir <path>` attaches
-a second, local-disk tier at that directory, so a RAM eviction is served from
-disk instead of re-paying the S3 round trip:
+Every query byte comes from object storage, so Ravel puts a read cache in front
+of it. The RAM tier is always on. `--cache-max-bytes` bounds it, and
+`--disable-cache` turns it off. Adding `--cache-dir <path>` attaches a second,
+local-disk tier at that directory. A RAM eviction is then served from disk
+instead of re-paying the S3 round trip:
 
     ravel-server --store s3 --s3-bucket my-bucket --cache-dir /var/cache/ravel
 
-The disk tier is opt-in and disposable: with no `--cache-dir` behavior is exactly
-as before, and a missing, full, or corrupt cache directory degrades to a store
-read, never a query error. Bytes written to the cache directory are **not**
-encrypted by Ravel, even with SSE-KMS configured for object storage (ADR-0046
-decision 7): SSE-KMS protects object bytes at rest in the store, not the local
-cache. If you need bytes-at-rest encryption for the cache directory, provide it
-at the filesystem/volume layer. `/metrics` splits each cache's `ravel_cache_*`
-counters by a `tier="ram"`/`tier="disk"` label once a disk tier is configured.
-See the [caching guide](docs/guides/caching.md).
+The disk tier is opt-in and disposable. With no `--cache-dir`, the cache is
+RAM-only. A missing, full, or corrupt cache directory degrades to a store read,
+never a query error.
+
+Ravel does not encrypt the bytes it writes to the cache directory, even with
+SSE-KMS configured for object storage. SSE-KMS protects object bytes at rest in
+the store, not the local cache. If you need bytes-at-rest encryption for the
+cache directory, provide it at the filesystem or volume layer.
+
+`/metrics` splits each cache's `ravel_cache_*` counters by a
+`tier="ram"`/`tier="disk"` label once a disk tier is configured. See the
+[caching guide](docs/guides/caching.md).
 
 ## How it fits together
 
@@ -213,18 +218,18 @@ All query endpoints live under `/api/v1` on the HTTP listener, which binds
 `127.0.0.1:4318` by default. They need `Authorization: Bearer <token>`, the same
 as ingest. The [query guide](docs/guides/query.md) and the
 [distributed query guide](docs/guides/distributed-query.md) cover PromQL, SQL,
-Flight SQL, exemplars, alerting, and analytics. The
+Flight SQL, exemplars, and analytics. The
 [traces guide](docs/guides/traces.md) covers querying spans over the `spans`
 SQL table.
 
-One maintenance route sits alongside them: `POST /api/v1/admin/fold` triggers
+One maintenance route sits alongside them. `POST /api/v1/admin/fold` triggers
 a catalog fold for the authenticated tenant and one named signal, instead of
-waiting for the background fold's next tick. It takes the same bearer token
-the query routes take, and its response says which of three things happened --
-a snapshot was `published`, `nothing_eligible` was found to fold, or a
-concurrent fold won the `HEAD` compare-and-swap (`lost_cas`). Right after a
-load the honest answer is `nothing_eligible`: an ingest hour is not foldable
-until the sealing window behind it has elapsed. See
+waiting for the background fold's next tick. It takes the same bearer token the
+query routes take. Its response reports which of three things happened. A
+snapshot was `published`, `nothing_eligible` was found to fold, or a concurrent
+fold won the `HEAD` compare-and-swap (`lost_cas`). Right after a load, the
+honest answer is `nothing_eligible`. An ingest hour is not foldable until the
+sealing window behind it has elapsed. See
 [architecture](docs/architecture.md#on-demand-catalog-fold).
 
 ## Kubernetes
@@ -244,9 +249,7 @@ See the [Kubernetes guide](docs/guides/kubernetes.md).
 
 `ravel-server`, `ravel-operator`, and `ravel-ingest-router` publish to the
 GitHub Container Registry on every `vX.Y.Z` release tag, built from the root
-`Dockerfile`
-(see [ADR-0037](docs/adrs/0037-container-image-ci-registry.md)). Both
-`linux/amd64` and `linux/arm64` are published.
+`Dockerfile`. The release publishes both `linux/amd64` and `linux/arm64`.
 Each published object is an OCI image index that carries an SBOM and full build
 provenance. The quickstart pins `ghcr.io/nofireai/ravel-server:0.11.0`. Override
 it with `RAVEL_IMAGE`.
@@ -285,21 +288,21 @@ Replace `v0.9.0` and `0.9.0` with the release you are verifying. The tag ref in
 Durability claims are cheap to write and hard to keep. These are the checks that
 hold Ravel to them:
 
-- A [deterministic simulation harness](docs/adrs/0068-deterministic-simulation-harness.md)
-  drives the full ingest, fold, compact, sweep, and query cycle under injected
-  faults. It checks read-your-write, strict-ack durability, compaction
-  equivalence, record-count conservation, and orphan-free sweeps every cycle.
-  Any violation prints its master seed and a one-command replay. A nightly job
-  sweeps 200 seeds.
-- The PromQL evaluator is differentially tested against a pinned real Prometheus
-  binary, and the per-construct result is published as a conformance table.
-- `unsafe` is forbidden workspace-wide, at the compiler rather than by review.
+- A deterministic simulation harness drives the full ingest, fold, compact,
+  sweep, and query cycle under injected faults. It checks read-your-write,
+  strict-ack durability, compaction equivalence, record-count conservation, and
+  orphan-free sweeps every cycle. Any violation prints its master seed and a
+  one-command replay. A nightly job sweeps 200 seeds.
+- Ravel differentially tests the PromQL evaluator against a pinned real
+  Prometheus binary. It publishes the per-construct result as a conformance
+  table.
+- The workspace denies `unsafe` everywhere, at the compiler and not by review.
 - Property tests cover every codec and parser. Fuzz targets run on the segment
   and span formats.
-- A fault-injection store fails operations by kind, key, and occurrence, and the
+- A fault-injection store fails operations by kind, key, and occurrence. The
   failure-path tests assert its counters.
-- The [consistency model](docs/consistency-model.md) is normative, and its crash
-  matrix is test-asserted.
+- The [consistency model](docs/consistency-model.md) is normative, and a test
+  asserts its crash matrix.
 
 ## Where things live
 

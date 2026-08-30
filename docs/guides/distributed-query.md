@@ -1,10 +1,9 @@
 # Distributed query and cross-cluster federation
 
 Ravel can serve one read with more than one process, and it can serve one read
-from more than one cluster. Both capabilities come from
-[ADR-0071](../adrs/0071-distributed-read-fanout.md) and both are off by
-default. This guide is the operator and user view: when distribution engages,
-how to turn it on, what a client sees, and what happens when something fails.
+from more than one cluster. Both capabilities are off by default. This guide is
+the operator and user view: when distribution engages, how to turn it on, what
+a client sees, and what happens when something fails.
 
 For the engine-internal specification (slice partitioning, the merge order,
 the budget re-enforcement rules, the credential model) read
@@ -58,8 +57,8 @@ spends its time.
 
 Distribution is cost-gated, so a cheap query never pays for the machinery. The
 coordinator computes the same pre-execution `CostEstimate` the accounting layer
-already produces (ADR-0044) over the resolved snapshot, and distributes only
-when the estimate reaches **either** threshold:
+already produces over the resolved snapshot, and distributes only when the
+estimate reaches **either** threshold:
 
 | Axis | Flag | Default |
 |---|---|---|
@@ -71,10 +70,9 @@ byte-identical to a build without the flag. A third flag,
 `--max-parallel-slices` (default 8), caps how many slices one query fans out
 into, and therefore how many concurrent remote fetches it can start.
 
-The defaults are ADR-0071's initial gate. On a zero-latency store the
-fan-out is pure overhead; it pays off when object-store latency, not CPU, is
-the bound. Tune both thresholds against your own store before leaving the
-defaults in place.
+On a zero-latency store the fan-out is pure overhead. It pays off when
+object-store latency, not CPU, is the bound. Tune both thresholds against your
+own store before leaving the defaults in place.
 
 ## The lifecycle of a distributed query
 
@@ -120,7 +118,7 @@ defaults in place.
   <path class="a" d="M660,314 L660,344"/>
   <rect class="b" x="210" y="346" width="180" height="88"/>
   <text class="h" x="222" y="364">worker (slice 1)</text>
-  <text class="t" x="222" y="380">auth: bearer token</text>
+  <text class="t" x="222" y="380">auth: capability</text>
   <text class="t" x="222" y="396">FragmentAdmission</text>
   <text class="t" x="222" y="412">windowed resolve</text>
   <text class="t" x="222" y="428">fetch/decode/prune</text>
@@ -164,55 +162,85 @@ defaults in place.
 
 ## Turning it on
 
-Distribution is enabled per query node, and the two flags below are a pair:
-either without the other fails startup rather than exposing an
-unauthenticated fetch surface or leaving a configured secret inert.
+Distribution is enabled per query node, and the two flags below are a pair.
+Either without the other fails startup, rather than exposing an unauthenticated
+fetch surface or leaving a configured key inert.
 
 ```sh
-# On every query-serving node in the cluster (same token file everywhere).
+# On every query-serving node in the cluster (same key file everywhere).
 ravel-server --mode all \
   --listen-http 0.0.0.0:4318 \
   --listen-grpc 10.0.0.11:4317 \
   --distributed-query \
-  --fragment-auth-token-file /etc/ravel/fragment.token
+  --fragment-key-file /etc/ravel/fragment.keys
 ```
 
-- `--distributed-query` opts this process in. In `--mode all` or
-  `--mode query` it does two things at once: it registers the internal
-  `SeriesFetch` fragment service on the cluster-internal gRPC listener, and it
-  makes the process a coordinator that may fan a large query out. Other modes
-  ignore it (no query surface, nothing to distribute).
-- `--fragment-auth-token-file` names a file holding the shared
-  cluster-internal bearer token. A file, never an inline value or an env var,
-  so the secret never appears in a process listing. **Every node in one
-  cluster must read the same token**: a coordinator presents exactly this
-  token on each dispatch, and a worker refuses any fragment request whose
-  bearer token is missing or unequal (compared in constant time). An
-  unreadable or empty file fails startup.
-- `--listen-grpc` is required in practice. The fragment surface is bound only
-  on the cluster-internal gRPC listener, never on the client HTTP listener and
-  never on the mTLS listener. A node with no gRPC listener never registers
-  itself as a worker, so every slice of every query runs coordinator-local.
-  That is correct, just not distributed.
+- `--distributed-query` opts this process in. In `--mode all` or `--mode query`
+  it does two things at once: it registers the `SeriesFetch` fragment service
+  on the gRPC listener, and it makes the process a coordinator that can fan a
+  large query out. Other modes ignore it (no query surface, nothing to
+  distribute).
+- `--fragment-key-file` names a file holding the cluster fragment keys. A file,
+  never an inline value or an env var, so the secret never appears in a process
+  listing. The file holds one or more 32-byte keys, one per non-empty line,
+  each line 64 hex characters (blank lines and `#` comment lines are ignored).
+  The coordinator mints one per-tenant, per-query capability per query from the
+  **first** key, and a worker verifies an inbound `Pinned` fetch against **all**
+  keys in the file. **Every node in one cluster must read the same file.** An
+  unreadable or empty file fails startup. A worker refuses any `Pinned` request
+  whose capability is missing or invalid.
+- `--listen-grpc` is required in practice. Without a dedicated fragment listener
+  (below), the fragment surface binds on the gRPC listener, never on the client
+  HTTP listener and never on the mTLS listener. A worker advertises its gRPC
+  address, so a node with no gRPC listener never registers itself as a worker,
+  and every slice of every query runs coordinator-local. That is correct, just
+  not distributed.
 - `--max-inflight-fragments` (default 32) caps how many inbound slice fetches
   this process serves concurrently for other coordinators. This is a **distinct
   admission class** from `--max-concurrent-queries`: a coordinator holding a
   client-query permit while it waits on its own dispatched fragments can never
   deadlock behind client queries queued on the client cap. Over the cap a
-  fragment request queues; it is not rejected.
+  fragment request queues. It is not rejected.
 
-The operator contract for the fragment token is the same one that governs your
-object-store credentials: the token conveys no privilege that a process
-holding the bucket's S3 credentials does not already have, so treat it as a
-cluster-internal secret and keep the gRPC listener off any network a client
-can reach. Rotating it means updating the file on every node; during a rolling
-restart, a node still holding the old token is rejected by nodes holding the
-new one, and the coordinator falls back to local execution for those slices.
+Capability rotation needs no flag day. Append the new key as the **first** line
+and roll the fleet. Every node then mints under the new key and still verifies
+capabilities minted under the old one. Drop the retired key on a later roll,
+once no capability minted under it can still be in flight.
+
+The operator contract for the fragment keys is the same one that governs your
+object-store credentials. The keys convey no privilege that a process holding
+the bucket's S3 credentials does not already have, so treat them as a
+cluster-internal secret and keep the gRPC listener off any network a client can
+reach.
 
 Adding capacity is adding processes. A new node with the same flags and the
 same bucket appears in the live worker set within one heartbeat interval and
-starts receiving slices; a removed node ages out of it. There is nothing to
+starts receiving slices. A removed node ages out of it. There is nothing to
 rebalance and no state to drain.
+
+### A dedicated TLS fragment listener
+
+By default the `SeriesFetch` surface rides the public gRPC listener. To isolate
+the intra-cluster `Pinned` fetch traffic on its own TLS listener, set
+`--fragment-listener <ADDR>` with all three of `--fragment-tls-cert`,
+`--fragment-tls-key`, and `--fragment-tls-ca`. When set:
+
+- The dedicated listener terminates TLS in-process and serves `Pinned` fetches
+  only. It rejects a `Resolve` (federation) request outright.
+- The public gRPC listener stops serving `Pinned` scope. `Resolve` and
+  federation stay there with ordinary tenant credentials.
+- The server certificate must carry a `ravel-fragment` dNSName SAN, the one
+  fixed name every coordinator verifies against. The CA bundle is dedicated to
+  this surface, so any certificate it signed means "a fragment worker of this
+  cluster". Per-process certificate identity is not required, because the
+  capability, not the certificate, is the authorization.
+- The listener address must differ from `--listen-http`, `--listen-grpc`, and
+  `--mtls-listener`. Ravel reads the certificate, key, and CA once at startup,
+  so rotation is a rolling restart.
+
+Without `--fragment-listener` the fragment surface stays on the public gRPC
+listener, so distribution keeps working during a rolling deploy that adds the
+dedicated listener.
 
 ## The worker registry and heartbeat
 
@@ -224,11 +252,10 @@ sys/query/workers/<process_id>
 ```
 
 The record is a small JSON control-plane payload carrying the process id, the
-`fragment_endpoint` (`host:port` of its cluster-internal gRPC listener), the
-`queryfrag` protocol version it speaks, and a liveness timestamp re-stamped on
-every beat. The write is an unconditional overwrite: one writer per key, no
-compare-and-swap, no contention. This is the same pattern the maintenance role
-already uses for its own heartbeats.
+`fragment_endpoint` (`host:port` of the listener that serves its fragment
+fetches), the `queryfrag` protocol version it speaks, and a liveness timestamp
+re-stamped on every beat. The write is an unconditional overwrite: one writer
+per key, no compare-and-swap, no contention.
 
 On the same cadence (`H` = 60 s by default) every node lists the prefix and
 refreshes its view. The **live set** is itself plus every sibling whose stamp
@@ -257,22 +284,21 @@ to one heartbeat interval after a restart to start fanning out again.
 
 ## Cross-cluster federation
 
-Federation is the other half of ADR-0071: a coordinator asks **independent
-Ravel clusters** — separate buckets, separate trust domains — to each resolve
-their own snapshot, and merges what they return into the same pool its own
-selectors feed. It is configured per remote, is independent of the
-intra-cluster cost gate (a federated query federates whether or not it also
-fans out locally), and is entirely absent from a deployment that configures no
-remotes.
+Federation asks **independent Ravel clusters** — separate buckets, separate
+trust domains — to each resolve their own snapshot, and merges what they return
+into the same pool the coordinator's own selectors feed. You configure it per
+remote. It is independent of the intra-cluster cost gate (a federated query
+federates whether or not it also fans out locally), and it is entirely absent
+from a deployment that configures no remotes.
 
 ```sh
 ravel-server --mode query \
   --listen-http 0.0.0.0:4318 \
   --listen-grpc 10.0.0.11:4317 \
   --distributed-query \
-  --fragment-auth-token-file /etc/ravel/fragment.token \
-  --remote-cluster name=eu,endpoint=eu.internal:9443,credential-file=/etc/ravel/eu.token,tls=on,tls-ca-file=/etc/ravel/eu-ca.pem,skip-unavailable=true \
-  --remote-cluster name=apac,endpoint=apac.internal:9443,credential-file=/etc/ravel/apac.token,tls=on,soft-timeout=15s \
+  --fragment-key-file /etc/ravel/fragment.keys \
+  --remote-cluster name=eu,endpoint=eu.internal:9443,credential-file=/etc/ravel/eu.token,tls-ca-file=/etc/ravel/eu-ca.pem,skip-unavailable=true \
+  --remote-cluster name=apac,endpoint=apac.internal:9443,credential-file=/etc/ravel/apac.token,soft-timeout=15s \
   --remote-cluster-soft-timeout 10s
 ```
 
@@ -284,18 +310,24 @@ comma-separated `key=value` spec:
 | `name` | yes | The cluster's stable operator-facing label. This is the only identity a client ever sees for the remote (in `warnings`). |
 | `endpoint` | yes | `host:port` of the remote's fragment surface. |
 | `credential-file` | yes | File holding the bearer token this coordinator presents to that remote. |
-| `tls` | no | `on` or `off`, default `off`. |
-| `tls-ca-file` | no | CA bundle for the remote's server certificate. Meaningful only with `tls=on`; setting it with TLS off fails startup. |
+| `tls` | no | `true` or `false`, default `true`. |
+| `tls-ca-file` | no | CA bundle for the remote's server certificate. Meaningful only with `tls=true`. Setting it with `tls=false` fails startup. |
 | `skip-unavailable` | no | `true` or `false`, default `false`. |
 | `soft-timeout` | no | Per-remote override of `--remote-cluster-soft-timeout`. |
 
-`--remote-cluster-soft-timeout` sets the default bound for every remote
-(default 10 s) as a humantime duration (`10s`, `500ms`). A remote that has not
-answered within its bound is treated as unavailable.
+TLS is on by default. A spec with no `tls` key dials `https://` and verifies
+the remote against the system trust roots, plus `tls-ca-file` when set.
+`tls=false` is the escape hatch for a path already encrypted at a lower layer.
+It sends the operator credential, the query, and every returned result stream
+in cleartext, and startup logs a SECURITY warning naming that remote.
 
-Every one of these is validated at startup, not at the first federated query:
-a malformed spec, an unknown key, a duplicate cluster name, `tls-ca-file`
-without `tls=on`, a zero soft timeout, or an unreadable or empty credential
+`--remote-cluster-soft-timeout` sets the default bound for every remote
+(default 10 s) as a humantime duration (`10s`, `500ms`). Ravel treats a remote
+that has not answered within its bound as unavailable.
+
+Ravel validates every one of these at startup, not at the first federated
+query. A malformed spec, an unknown key, a duplicate cluster name, `tls-ca-file`
+with `tls=false`, a zero soft timeout, or an unreadable or empty credential
 file all fail the process before it binds a listener.
 
 ### What crosses the boundary, and what does not
@@ -308,11 +340,12 @@ selective-erasure predicates, and its own budgets.
 
 The credential is an **operator** secret, and the tenant the remote serves is
 derived from that credential by the remote's own resolver chain. A coordinator
-cannot name a tenant on a remote: whatever `tenant_hash` sits on the wire is
-overwritten with the locally resolved value, never read. The calling client's
-own credential is never forwarded across a cluster boundary. A remote also
-rejects the intra-cluster fragment token outright — that token is a slice
-credential, never a federation credential.
+cannot name a tenant on a remote: the remote overwrites whatever `tenant_hash`
+sits on the wire with the locally resolved value, never reading it. Ravel never
+forwards the calling client's own credential across a cluster boundary. A
+federation request carries no intra-cluster fragment capability. It presents
+this operator credential as an ordinary tenant credential, the same way any
+client reaches the remote.
 
 `RemoteClusterConfig`'s debug formatting prints `credential: <redacted>`, so a
 config dump or a panic message never leaks the operator secret.

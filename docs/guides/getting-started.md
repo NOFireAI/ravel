@@ -1,56 +1,56 @@
 # Getting started
 
 There are two ways to run Ravel. The **container-first quickstart** pulls a
-published image and needs only Docker — it is the fastest way to see Ravel
-work, and it is presented first. The **from-source path** (`make demo`) builds
-Ravel from the current tree and is for contributors changing the code; it comes
-second here and is covered in more depth in the
-[development guide](development.md).
+published image and needs only Docker. It is the fastest way to see Ravel work,
+so it comes first. The **from-source path** (`make demo`) builds Ravel from the
+current tree. It is for contributors who change the code. It comes second, and
+the [development guide](development.md) covers it in more depth.
 
-One capability difference matters up front: the published image is built with
+One capability difference matters up front. The published image is built with
 `--features sql`, so `POST /api/v1/sql` works in the compose quickstart. `make
 demo` builds the default feature set and does not enable `sql`, so the SQL
-endpoint is unavailable on the from-source path. PromQL and ingest behave the
+endpoint is not available on the from-source path. PromQL and ingest behave the
 same on both.
 
 ## Container-first quickstart
 
-The only prerequisite is Docker with `docker compose`. No Rust toolchain.
+The only prerequisite is Docker with `docker compose`. You need no Rust
+toolchain.
 
 ```sh
 docker compose -f deploy/docker-compose/ravel.yml up -d
 ```
 
-This brings up, all from published images:
+This brings up the following, all from published images:
 
-- MinIO on `127.0.0.1:9000` (S3 API) and `127.0.0.1:9001` (console), plus a
-  one-shot that creates the `ravel-dev` bucket and a one-shot that qualifies the
-  store (ADR-0050 section 6) so `ravel-server` will start against it.
-- `ravel-server` from `ghcr.io/nofireai/ravel-server:0.9.3` (override the pin
-  with the `RAVEL_IMAGE` environment variable), listening on `127.0.0.1:4318`
-  (HTTP/OTLP) and `127.0.0.1:4317` (gRPC/OTLP), with the tenant token
-  `demo-token` mapped to tenant `demo-tenant`.
-- An OpenTelemetry Collector scraping your host's CPU, load, memory, and network
-  metrics and exporting them to Ravel over OTLP, authenticating with the demo
-  bearer token.
+- MinIO on `127.0.0.1:9000` (S3 API) and `127.0.0.1:9001` (console). It also
+  starts a one-shot that creates the `ravel-dev` bucket and a one-shot that
+  qualifies the store so `ravel-server` can start against it.
+- `ravel-server` from `ghcr.io/nofireai/ravel-server:0.11.0`. Override the pin
+  with the `RAVEL_IMAGE` environment variable. It listens on `127.0.0.1:4318`
+  (HTTP/OTLP) and `127.0.0.1:4317` (gRPC/OTLP). The tenant token `demo-token`
+  maps to tenant `demo-tenant`.
+- An OpenTelemetry Collector. It scrapes your host's CPU, load, memory, and
+  network metrics and exports them to Ravel over OTLP. It authenticates with
+  the demo bearer token.
 - Grafana on `127.0.0.1:3000` (`admin` / `admin`) with the Ravel datasource
   already provisioned.
 
-Every published port binds loopback (`127.0.0.1`) only, and every credential is
-a fixed development value (`demo-token`, and `ravel` / `ravel-dev-secret` for
+Every published port binds loopback (`127.0.0.1`) only. Every credential is a
+fixed development value (`demo-token`, and `ravel` / `ravel-dev-secret` for
 MinIO). None of it is for a network-reachable deployment.
 
 Open Grafana at <http://127.0.0.1:3000> to see your machine's metrics, or query
-Ravel directly. A PromQL instant query (the bearer token is required, the same
-as ingest):
+Ravel directly. A PromQL instant query needs the bearer token, the same as
+ingest:
 
 ```sh
 curl -s -H "Authorization: Bearer demo-token" \
   'http://127.0.0.1:4318/api/v1/query?query=system_cpu_load_average_1m'
 ```
 
-SQL over the `samples` (metrics) table, which the image serves out of the box
-because it is built `--features sql`:
+SQL over the `samples` (metrics) table works because the image is built
+`--features sql`:
 
 ```sh
 curl -s -X POST http://127.0.0.1:4318/api/v1/sql \
@@ -59,22 +59,22 @@ curl -s -X POST http://127.0.0.1:4318/api/v1/sql \
   -d '{"query":"SELECT * FROM samples LIMIT 5"}'
 ```
 
-To watch the read-your-write path end to end — ingest one export, capture its
-`x-ravel-commit-token`, and read that exact write back with `min_commit_token` —
-run [demo/walkthrough.sh](../../demo/walkthrough.sh) while the stack is up. Stop
-everything with:
+To watch the read-your-write path end to end, run
+[demo/walkthrough.sh](../../demo/walkthrough.sh) while the stack is up. It
+ingests one export, captures its `x-ravel-commit-token`, and reads that exact
+write back with `min_commit_token`. Stop everything with:
 
 ```sh
 docker compose -f deploy/docker-compose/ravel.yml down
 ```
 
-`minio-data/` on your machine persists across runs; the store-qualify one-shot
+`minio-data/` on your machine persists across runs. The store-qualify one-shot
 is idempotent, so bringing the stack up again on the same directory is safe.
 
 ## The from-source path
 
 The rest of this guide builds Ravel from the current tree with `make demo`. Use
-it when you are changing Ravel's code; otherwise the quickstart above is faster.
+it when you change Ravel's code. Otherwise the quickstart above is faster.
 
 ## Prerequisites
 
@@ -110,13 +110,14 @@ whole ingest-to-query path work. Line by line, it does this:
 
 1. It starts MinIO if it is not already running, and waits for
    `/minio/health/live`.
-2. It creates the `ravel-dev` bucket (harmless if it already exists).
+2. It creates the `ravel-dev` bucket. This is harmless if the bucket already
+   exists.
 3. It builds `ravel-server` and `ravel-cli`.
 4. It generates a fresh OTLP metrics export (`gen_otlp_fixture` example) with
    current timestamps. It generates the fixture on every run and does not check
    it in. Ingest rejects data points more than 2 hours old (see
-   [ingest.md](ingest.md#event-time-skew)), so a stale fixture would make the
-   demo fail non-deterministically.
+   [ingest.md](ingest.md#event-time-skew-bounds)), so a stale fixture would make
+   the demo fail non-deterministically.
 5. It starts `ravel-server --store s3` on `127.0.0.1:14318` (HTTP) and
    `127.0.0.1:14317` (gRPC), pointed at MinIO, with one tenant token
    (`demo-token` maps to tenant `demo-tenant`).
@@ -142,16 +143,16 @@ Then it prints `[demo] demo complete`.
 The commit token is not an opaque blob. It is base64url of
 `v2:<shard>:<writer_id>:<epoch>:<seq>:<ingest_hour_bucket>`
 ([docs/catalog-and-mvcc.md](../catalog-and-mvcc.md#commit-tokens)). Those five
-fields are exactly what the server needed to flush your data: which shard it
-landed in, which writer process flushed it, and that writer's sequence
-number and ingest-hour bucket. If you pass the token back as `min_commit_token`,
-the catalog reconstructs the commit record's key directly and GETs it, instead
-of listing and hoping a fresh listing includes it. This is what makes
-read-your-write work.
+fields are exactly what the server needs to flush your data: which shard it
+landed in, which writer process flushed it, and that writer's sequence number
+and ingest-hour bucket. If you pass the token back as `min_commit_token`, the
+catalog reconstructs the commit record's key directly and GETs it. It does not
+list and hope a fresh listing includes it. This is what makes read-your-write
+work.
 
 The token locates a **commit record**: a small protobuf that notes where the
 data lives, its content hash, and its sample and series counts. The commit
-record in turn names a **data object**: the actual RSEG segment that holds your
+record in turn names a **data object**: the RSEG segment that holds your
 samples, column-encoded and immutable. Object keys look like this
 ([docs/catalog-and-mvcc.md](../catalog-and-mvcc.md#key-layout)):
 
@@ -160,8 +161,8 @@ data key:   t/<tenant_hash>/m/l0/<shard>/<writer_id>.<epoch>.<seq>.<hash16>.rseg
 commit key: t/<tenant_hash>/m/c/<shard>/<ingest_hour>/<writer_id>.<epoch>.<seq>.cmt
 ```
 
-To see this for real, list what the demo actually wrote. This needs MinIO; run
-it after `make demo` (see [inspecting-data.md](inspecting-data.md) for more):
+To see this for real, list what the demo wrote. This needs MinIO. Run it after
+`make demo` (see [inspecting-data.md](inspecting-data.md) for more):
 
 ```sh
 RAVEL_S3_ENDPOINT=http://127.0.0.1:9000 RAVEL_S3_BUCKET=ravel-dev \
@@ -174,7 +175,7 @@ Each printed line starts with a data object key. That is the segment that your
 
 ## The same flow, by hand
 
-Start `ravel-server` yourself against MinIO (`make minio` must be running):
+Start `ravel-server` yourself against MinIO. `make minio` must be running:
 
 ```sh
 cargo run -p ravel-server -- \
@@ -186,10 +187,10 @@ cargo run -p ravel-server -- \
   --tenant-token devtoken=acme
 ```
 
-This binds the defaults, `127.0.0.1:4318` (HTTP) and `127.0.0.1:4317`
-(gRPC). It accepts requests that carry `Authorization: Bearer devtoken` for
-tenant `acme`. An OTLP HTTP export is any valid `ExportMetricsServiceRequest`
-protobuf; `cargo run -p ravel-server --example gen_otlp_fixture > fixture.pb`
+This binds the defaults, `127.0.0.1:4318` (HTTP) and `127.0.0.1:4317` (gRPC).
+It accepts requests that carry `Authorization: Bearer devtoken` for tenant
+`acme`. An OTLP HTTP export is any valid `ExportMetricsServiceRequest`
+protobuf. `cargo run -p ravel-server --example gen_otlp_fixture > fixture.pb`
 produces one with current timestamps. Send one export and capture the response
 headers:
 
@@ -204,10 +205,10 @@ grep -i ^x-ravel-commit-token headers.txt
 ```
 
 The response is a strict-mode ack. It returns only after the segment and its
-commit record are durably in the object store
+commit record are durable in the object store
 ([docs/consistency-model.md](../consistency-model.md#acknowledgement-semantics)).
-Read the `x-ravel-commit-token` header (comma-separated if your points
-landed in more than one shard) and query it back:
+Read the `x-ravel-commit-token` header, comma-separated if your points landed
+in more than one shard, and query it back:
 
 ```sh
 curl -s -G http://127.0.0.1:4318/api/v1/query \
@@ -219,3 +220,5 @@ curl -s -G http://127.0.0.1:4318/api/v1/query \
 You get the same Prometheus-style JSON envelope that the demo checks for. For
 everything else these two endpoints accept, see
 [docs/guides/ingest.md](ingest.md) and [docs/guides/query.md](query.md).
+</content>
+</invoke>

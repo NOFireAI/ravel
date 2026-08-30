@@ -2,8 +2,8 @@
 
 `spec.shardOverrides` lets an operator lower (or raise) one tenant's shard
 count without touching the cluster-wide, immutable `spec.shards`. It is the
-operator wiring for the resharding mechanism ADR-0052 already shipped, and it
-is ADR-0076 decision 2's primary operator-facing cost control: cost is linear
+operator wiring for Ravel's online resharding mechanism, and it is the
+primary operator-facing per-tenant cost control. Cost is linear
 in shards, so four shards to one is a 4x reduction in ingest PUTs and a 4x
 reduction in read LIST cost for that tenant.
 
@@ -33,7 +33,7 @@ signal) against its target here. When they differ, it drives one
 independently — through the same object store the operator already uses for
 `sys/auth` reconciliation. The new count activates `leadHours` hours after
 the reconcile that scheduled it, never immediately: this is the same future
-activation ADR-0052 and `ravel-cli provision reshard` both require, so a
+activation `ravel-cli provision reshard` requires, so a
 router already mid-flight with the old count keeps routing correctly until
 the boundary passes.
 
@@ -55,7 +55,7 @@ best-effort, exactly like the existing `sys/auth` reconcile step.
 ## What actually changes
 
 `spec.shards` still renders into every tier's `--shards` flag and stays
-immutable after creation (ADR-0034 decision 2) — that invariant is unrelated
+immutable after creation — that invariant is unrelated
 to this feature and is not relaxed by it. `shardOverrides` does not touch a
 Deployment at all. It writes directly to each tenant's durable provisioning
 record in object storage, the same record `ravel-ingest`'s router and
@@ -81,15 +81,15 @@ not discovered afterward.
   tenants. This is the mirror image of `ingestAffinity`'s subset concentration
   (`docs/guides/ingest-affinity.md`): there it is replicas, here it is shard
   indices within a tenant.
-- **Maintenance and compaction units get coarser.** ADR-0065's ownership
-  protocol partitions work as `(tenant, signal, shard)` units. Fewer shards
+- **Maintenance and compaction units get coarser.** The maintenance
+  ownership protocol partitions work as `(tenant, signal, shard)` units. Fewer shards
   means fewer, larger units per tenant-signal: less parallelism available to
   the maintain tier for that tenant, and a single compaction or GC pass over
   a bigger slice of data.
 - **This lever does not reach logs or spans' own request-cost drivers.**
   Shard count divides PUT and LIST cost the same way for every signal, but
   logs and spans carry additional per-record cost structure that a future
-  ADR-0076 decision addresses separately; lowering shard count here is not a
+  change addresses separately. Lowering shard count here is not a
   substitute for that.
 
 ## Reading it back

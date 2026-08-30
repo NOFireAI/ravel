@@ -21,8 +21,8 @@ first build, and the load.
 | EC2 instance | Builds Ravel, loads the corpus, runs the harness. |
 
 **Put the bucket and the instance in the same region.** Same-region S3 to EC2
-transfer is not billed; cross-region is. A benchmark that moves hundreds of GB
-per pass is expensive in the wrong region and its request/byte trade no longer
+transfer is not billed. Cross-region is. A benchmark that moves hundreds of GB
+per pass is expensive in the wrong region, and its request/byte trade no longer
 reflects a realistic deployment.
 
 ## 1. Choose the instance
@@ -214,7 +214,7 @@ touch /root/BOOT_DONE
 echo "BOOT DONE"
 ```
 
-`hits.parquet` is about 14 GB. Watch with `tail -f /root/bootstrap.log`; the
+`hits.parquet` is about 14 GB. Watch with `tail -f /root/bootstrap.log`. The
 run is finished when `/root/BOOT_DONE` or `/root/BOOT_FAILED` appears.
 
 ## 7. Load, compact, fold, declare
@@ -251,14 +251,14 @@ TENANT=clickbench-v4
     --batch-rows 65536
 ```
 
-`--shards 8` sets the tenant's shard count; every later command must pass the
-same value or it addresses a different shard set. `--read-cursors` sets load
+`--shards 8` sets the tenant's shard count. Every later command must pass the
+same value, or it addresses a different shard set. `--read-cursors` sets load
 parallelism.
 
 ### Compact
 
 The load writes many small L0 objects. Compaction merges them, which is the
-state a query benchmark should measure.
+state a query benchmark must measure.
 
 ```sh
 /usr/bin/time -f 'wall=%e rss_kb=%M' \
@@ -289,7 +289,7 @@ $CLI --store s3 catalog fold \
 grep -E "watermark_hour|buckets_folded|entry_count|part_bytes" /root/fold.out
 ```
 
-`entry_count` should be close to the number of objects the load wrote. If the
+`entry_count` must be close to the number of objects the load wrote. If the
 fold covered under 80% of them, the shard count or signal is wrong.
 
 ### Declare the typed columns
@@ -352,7 +352,7 @@ Flags that change what is measured:
 
 | Flag | Effect |
 |---|---|
-| `--runs 3` | Run 0 is cold; runs 1 and 2 are warm. Both figures come from one pass. |
+| `--runs 3` | Run 0 is cold. Runs 1 and 2 are warm. Both figures come from one pass. |
 | `--cache-bytes` | **Must exceed the corpus.** Smaller and every run re-reads everything, so "warm" numbers are three cold runs. |
 | `--compaction post` | Measures the compacted layout. |
 | `--fetch-concurrency` | Bounds in-flight object-store GETs. |
@@ -370,13 +370,12 @@ and their bands down **before** the run, then let a script fail the pass rather
 than reading totals by eye. Two statements measured out of forty-three and a
 zero exit code look identical to a clean pass otherwise.
 
-The bands below are the per-class cost-class guards registered on issue #913
-(comment "Band registration for T2's second half"). Each statement in
+The bands below are the per-class cost-class guards. Each statement in
 `benchmarks/clickbench/hits.corpus.json` carries a typed `class`
-(`metadata_decomposable` / `selective` / `full_value`); the script reads those
+(`metadata_decomposable` / `selective` / `full_value`). The script reads those
 classes from the corpus and asserts the band each class is held to. **These are
-no-regression guards, not targets:** every band names the target it is not yet
-at and the issue that closes the gap. Do not loosen a guard to match a target.
+no-regression guards, not targets.** Every band names the target it is not yet
+at. Do not loosen a guard to match a target.
 
 ```python
 #!/usr/bin/env python3
@@ -755,7 +754,7 @@ python3 analyse.py /root/bench.json /root/ravel/benchmarks/clickbench/hits.corpu
 Rules that make a pass trustworthy:
 
 - **Compare against a report file, never a typed-in number.** Read the previous
-  pass's JSON; a hardcoded baseline cannot be checked against the run that
+  pass's JSON. A hardcoded baseline cannot be checked against the run that
   produced it.
 - **Never pipe a measurement through `tail`, `head`, or `grep`.** The pipeline's
   exit code is the last stage's, so a real failure reads as a pass. Redirect to
@@ -769,14 +768,14 @@ Rules that make a pass trustworthy:
   assert it, or the pass attributes to code that is not there.
 - **Run one thing at a time.** A concurrent build makes wall clock
   unattributable. Check for running `cargo`, `rustc`, or bench processes first.
-- **The Class-S object-count half is a stated gap, not a passed check.** Issue
-  #913 phrases the Class-S target as "<=5% of corpus bytes AND object count".
-  The script asserts the byte half and prints an explicit `SKIP` for the object
-  half: the report records object-store GET requests, and GETs are not distinct
-  objects (q37..q43 issue about 9,694 requests against a 3,469-object corpus,
-  2.8x more requests than objects exist), so comparing GETs to a fraction of the
-  object count compares two different quantities. Closing the gap needs a
-  distinct-objects-touched counter in the read path; until that counter exists,
+- **The Class-S object-count half is a stated gap, not a passed check.** The
+  Class-S target is "<=5% of corpus bytes AND object count". The script asserts
+  the byte half and prints an explicit `SKIP` for the object half. The report
+  records object-store GET requests, and GETs are not distinct objects (q37..q43
+  issue about 9,694 requests against a 3,469-object corpus, 2.8x more requests
+  than objects exist), so comparing GETs to a fraction of the object count
+  compares two different quantities. Closing the gap needs a
+  distinct-objects-touched counter in the read path. Until that counter exists,
   the object half stays skipped rather than asserted on the wrong quantity.
 
 ## 10. Profiling a statement
@@ -807,8 +806,8 @@ identical. Before concluding a path is gone, check the symbol is present
 ## 11. Teardown
 
 Stopping preserves the EBS volume, so the corpus and pinned binaries survive
-and the box restarts ready to run. Terminating discards them; the load must be
-repeated.
+and the box restarts ready to run. Terminating discards them, and the load must
+be repeated.
 
 ```sh
 aws ec2 stop-instances      --instance-ids <id>   # keeps the volume, keeps billing for it
@@ -844,7 +843,7 @@ An idle instance bills at its full on-demand rate. Stop it when a run finishes.
 
 | Symptom | Cause |
 |---|---|
-| `linking with cc failed` mid-build | Out of disk. Check free space; the error names the wrong cause. |
+| `linking with cc failed` mid-build | Out of disk. Check free space. The error names the wrong cause. |
 | Fold reports zero entries | Ran too soon after the load, or the wrong `--signal`/`--shards`. Use `--max-flush-lifetime 0s` and pass the tenant's real shard count. |
 | Warm runs read the whole corpus | `--cache-bytes` is below the corpus size. Every run is cold. |
 | Every declared column projects NULL | Queried before the declaration was visible. The staleness horizon applies to anything going through `ravel-server`. |
