@@ -358,9 +358,31 @@ async fn distributed_query_http_equals_local_http() {
     );
     // The core ADR-0071 guarantee: fanned-out results are byte-identical to
     // local. This equality is what flips if the distributed path diverges.
+    //
+    // `stats.phases` is excluded, and only that field. The per-phase cost split
+    // (issue #935) is a diagnostic attribution, not part of the result: a
+    // distributed query's segment reads happen inside a remote worker, which
+    // returns one pooled `QueryAccountingSnapshot` with no phase breakdown, so
+    // the coordinator charges the whole remote fetch to the `scan` phase by
+    // construction (`QueryStats::phase_accounting`'s own doc comment states
+    // this convention). The local path splits the same reads across `plan`,
+    // `probe`, and `scan`. Every other field of `data`, including the pooled
+    // `stats.accounting` totals those phases sum to, is still compared
+    // byte-for-byte, so a real divergence in the fanned-out result still flips
+    // this assertion.
+    let strip_phases = |body: &serde_json::Value| -> serde_json::Value {
+        let mut data = body["data"].clone();
+        data["stats"]
+            .as_object_mut()
+            .expect("stats is an object")
+            .remove("phases")
+            .expect("stats carries the per-phase cost split");
+        data
+    };
     assert_eq!(
-        distributed_body["data"], local_body["data"],
-        "distributed `data` must be byte-identical to local:\n  distributed={distributed_body}\n  local={local_body}"
+        strip_phases(&distributed_body),
+        strip_phases(&local_body),
+        "distributed `data` must be byte-identical to local outside the per-phase cost attribution:\n  distributed={distributed_body}\n  local={local_body}"
     );
     // Sanity: the query actually returned the published series, so the equality
     // above is not the trivial equality of two empty results.

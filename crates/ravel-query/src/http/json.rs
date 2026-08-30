@@ -942,6 +942,22 @@ mod tests {
         );
     }
 
+    /// One phase's expected rendered figures, named rather than positional so a
+    /// row of eleven numbers cannot be read against the wrong field.
+    struct ExpectedPhase {
+        phase: &'static str,
+        gets: u64,
+        wire_bytes: u64,
+        lists: u64,
+        hits: u64,
+        misses: u64,
+        cache_bytes: u64,
+        decompressed: u64,
+        reused: u64,
+        opened: u64,
+        matched: u64,
+    }
+
     /// A `QueryStats` whose four phase handles carry a distinct, exactly known
     /// figure in every counter `stats.phases` renders, so a test can name the
     /// expected number per phase per field and a swapped or pooled phase is a
@@ -1067,46 +1083,85 @@ mod tests {
         }
 
         // Every figure, per phase, at its exact expected value.
-        let expected: [(&str, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64); 4] = [
-            // phase, gets, wire bytes, lists, hits, misses, cache bytes,
-            // decompressed, reused, opened, matched
-            ("resolve", 3, 1_000, 2, 1, 2, 11, 0, 0, 0, 0),
-            ("plan", 5, 2_000, 0, 3, 4, 22, 0, 0, 6, 0),
-            ("probe", 7, 4_000, 0, 8, 9, 33, 0, 0, 0, 12),
-            ("scan", 11, 8_000, 0, 13, 14, 44, 5_000, 640, 15, 16),
+        let expected = [
+            ExpectedPhase {
+                phase: "resolve",
+                gets: 3,
+                wire_bytes: 1_000,
+                lists: 2,
+                hits: 1,
+                misses: 2,
+                cache_bytes: 11,
+                decompressed: 0,
+                reused: 0,
+                opened: 0,
+                matched: 0,
+            },
+            ExpectedPhase {
+                phase: "plan",
+                gets: 5,
+                wire_bytes: 2_000,
+                lists: 0,
+                hits: 3,
+                misses: 4,
+                cache_bytes: 22,
+                decompressed: 0,
+                reused: 0,
+                opened: 6,
+                matched: 0,
+            },
+            ExpectedPhase {
+                phase: "probe",
+                gets: 7,
+                wire_bytes: 4_000,
+                lists: 0,
+                hits: 8,
+                misses: 9,
+                cache_bytes: 33,
+                decompressed: 0,
+                reused: 0,
+                opened: 0,
+                matched: 12,
+            },
+            ExpectedPhase {
+                phase: "scan",
+                gets: 11,
+                wire_bytes: 8_000,
+                lists: 0,
+                hits: 13,
+                misses: 14,
+                cache_bytes: 44,
+                decompressed: 5_000,
+                reused: 640,
+                opened: 15,
+                matched: 16,
+            },
         ];
-        for (i, want) in expected.iter().enumerate() {
-            let got = &phases[i];
-            let (
-                name,
-                gets,
-                wire_bytes,
-                lists,
-                hits,
-                misses,
-                cache_bytes,
-                decompressed,
-                reused,
-                opened,
-                matched,
-            ) = *want;
+        for (got, want) in phases.iter().zip(expected) {
+            let name = want.phase;
             assert_eq!(got["phase"], name);
-            assert_eq!(got["s3GetRequests"], gets, "{name} s3GetRequests");
-            assert_eq!(got["s3GetWireBytes"], wire_bytes, "{name} s3GetWireBytes");
-            assert_eq!(got["s3ListRequests"], lists, "{name} s3ListRequests");
-            assert_eq!(got["cacheHits"], hits, "{name} cacheHits");
-            assert_eq!(got["cacheMisses"], misses, "{name} cacheMisses");
+            assert_eq!(got["s3GetRequests"], want.gets, "{name} s3GetRequests");
             assert_eq!(
-                got["cacheServedBytes"], cache_bytes,
+                got["s3GetWireBytes"], want.wire_bytes,
+                "{name} s3GetWireBytes"
+            );
+            assert_eq!(got["s3ListRequests"], want.lists, "{name} s3ListRequests");
+            assert_eq!(got["cacheHits"], want.hits, "{name} cacheHits");
+            assert_eq!(got["cacheMisses"], want.misses, "{name} cacheMisses");
+            assert_eq!(
+                got["cacheServedBytes"], want.cache_bytes,
                 "{name} cacheServedBytes"
             );
             assert_eq!(
-                got["decompressedOutputBytes"], decompressed,
+                got["decompressedOutputBytes"], want.decompressed,
                 "{name} decompressedOutputBytes"
             );
-            assert_eq!(got["reusedRegionBytes"], reused, "{name} reusedRegionBytes");
-            assert_eq!(got["segmentsOpened"], opened, "{name} segmentsOpened");
-            assert_eq!(got["seriesMatched"], matched, "{name} seriesMatched");
+            assert_eq!(
+                got["reusedRegionBytes"], want.reused,
+                "{name} reusedRegionBytes"
+            );
+            assert_eq!(got["segmentsOpened"], want.opened, "{name} segmentsOpened");
+            assert_eq!(got["seriesMatched"], want.matched, "{name} seriesMatched");
         }
     }
 

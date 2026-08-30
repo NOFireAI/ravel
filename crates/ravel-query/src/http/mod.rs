@@ -244,6 +244,22 @@ mod tests {
         }
     }
 
+    /// One phase's expected rendered figures, named rather than positional so a
+    /// row of eleven numbers cannot be read against the wrong field.
+    struct ExpectedPhase {
+        phase: &'static str,
+        gets: u64,
+        wire_bytes: u64,
+        lists: u64,
+        hits: u64,
+        misses: u64,
+        cache_bytes: u64,
+        decompressed: u64,
+        reused: u64,
+        opened: u64,
+        matched: u64,
+    }
+
     /// Publishes one RSEG segment carrying a single scalar series with two
     /// samples (at `now - 4min` and `now - 2min`) and returns a router serving
     /// it, plus the tenant's bearer token. The per-phase cost of a query over
@@ -389,44 +405,87 @@ mod tests {
         // and decompressed bytes are four different quantities here and the
         // rows keep them apart.
         let want = [
-            // phase, gets, wire bytes, lists, hits, misses, cache bytes,
-            // decompressed, reused, opened, matched
-            ("resolve", 2, 288, 2, 1, 2, 288, 0, 0, 0, 0),
-            ("plan", 1, 341, 0, 0, 0, 0, 0, 0, 1, 0),
-            ("probe", 0, 0, 0, 0, 0, 0, 0, 102, 0, 1),
-            ("scan", 0, 0, 0, 0, 0, 0, 32, 25, 0, 0),
+            ExpectedPhase {
+                phase: "resolve",
+                gets: 2,
+                wire_bytes: 288,
+                lists: 2,
+                hits: 1,
+                misses: 2,
+                cache_bytes: 288,
+                decompressed: 0,
+                reused: 0,
+                opened: 0,
+                matched: 0,
+            },
+            ExpectedPhase {
+                phase: "plan",
+                gets: 1,
+                wire_bytes: 341,
+                lists: 0,
+                hits: 0,
+                misses: 0,
+                cache_bytes: 0,
+                decompressed: 0,
+                reused: 0,
+                opened: 1,
+                matched: 0,
+            },
+            ExpectedPhase {
+                phase: "probe",
+                gets: 0,
+                wire_bytes: 0,
+                lists: 0,
+                hits: 0,
+                misses: 0,
+                cache_bytes: 0,
+                decompressed: 0,
+                reused: 102,
+                opened: 0,
+                matched: 1,
+            },
+            ExpectedPhase {
+                phase: "scan",
+                gets: 0,
+                wire_bytes: 0,
+                lists: 0,
+                hits: 0,
+                misses: 0,
+                cache_bytes: 0,
+                decompressed: 32,
+                reused: 25,
+                opened: 0,
+                matched: 0,
+            },
         ];
         for (row, expect) in phases.iter().zip(want) {
-            let (
-                name,
-                gets,
-                wire_bytes,
-                lists,
-                hits,
-                misses,
-                cache_bytes,
-                decompressed,
-                reused,
-                opened,
-                matched,
-            ) = expect;
+            let name = expect.phase;
             assert_eq!(row["phase"], name);
-            assert_eq!(row["s3GetRequests"], gets, "{name} s3GetRequests");
-            assert_eq!(row["s3GetWireBytes"], wire_bytes, "{name} s3GetWireBytes");
-            assert_eq!(row["s3ListRequests"], lists, "{name} s3ListRequests");
-            assert_eq!(row["cacheHits"], hits, "{name} cacheHits");
-            assert_eq!(row["cacheMisses"], misses, "{name} cacheMisses");
+            assert_eq!(row["s3GetRequests"], expect.gets, "{name} s3GetRequests");
             assert_eq!(
-                row["cacheServedBytes"], cache_bytes,
+                row["s3GetWireBytes"], expect.wire_bytes,
+                "{name} s3GetWireBytes"
+            );
+            assert_eq!(row["s3ListRequests"], expect.lists, "{name} s3ListRequests");
+            assert_eq!(row["cacheHits"], expect.hits, "{name} cacheHits");
+            assert_eq!(row["cacheMisses"], expect.misses, "{name} cacheMisses");
+            assert_eq!(
+                row["cacheServedBytes"], expect.cache_bytes,
                 "{name} cacheServedBytes"
             );
             assert_eq!(
-                row["decompressedOutputBytes"], decompressed,
+                row["decompressedOutputBytes"], expect.decompressed,
                 "{name} decompressedOutputBytes"
             );
-            assert_eq!(row["reusedRegionBytes"], reused, "{name} reusedRegionBytes");
-            assert_eq!(row["segmentsOpened"], opened, "{name} segmentsOpened");
-            assert_eq!(row["seriesMatched"], matched, "{name} seriesMatched");
+            assert_eq!(
+                row["reusedRegionBytes"], expect.reused,
+                "{name} reusedRegionBytes"
+            );
+            assert_eq!(
+                row["segmentsOpened"], expect.opened,
+                "{name} segmentsOpened"
+            );
+            assert_eq!(row["seriesMatched"], expect.matched, "{name} seriesMatched");
         }
 
         // The pooled block a pre-#935 consumer reads is unchanged and is
