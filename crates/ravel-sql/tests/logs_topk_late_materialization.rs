@@ -74,7 +74,8 @@ use ravel_object_store::{
 };
 use ravel_query::{CacheFetchError, LogSegmentFetcher};
 use ravel_sql::{
-    CeilingBreach, DeclaredColumn, DeclaredType, LogsTableProvider, SessionTable, SqlConfig,
+    CeilingBreach, DeclaredColumn, DeclaredType, LogsTableProvider, SessionTable, SpillDecision,
+    SqlConfig,
     TenantDelegatingPool, TenantMemoryAccountant, build_session,
 };
 use ravel_types::TenantHash;
@@ -353,7 +354,13 @@ fn session(provider: LogsTableProvider, config: &SqlConfig) -> SessionContext {
         CeilingBreach::new(),
         QueryAccounting::new(),
     ));
-    build_session(config, pool, SessionTable::Logs(Arc::new(provider)), false)
+    build_session(
+        config,
+        pool,
+        SessionTable::Logs(Arc::new(provider)),
+        false,
+        SpillDecision::Disabled,
+    )
         .expect("session builds")
 }
 

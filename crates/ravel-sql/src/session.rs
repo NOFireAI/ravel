@@ -90,6 +90,12 @@
 //! cannot change a result -- the final stage sees the same rows and computes
 //! the same groups either way -- so it is orthogonal to the determinism rules
 //! above.
+//!
+//! Spill (ADR-0954): the disk manager is configured explicitly in both
+//! directions, never left to DataFusion's default. [`build_session`] takes a
+//! per-query [`SpillDecision`]; `Disabled` is ADR-0102 decision 3 unchanged,
+//! and `Enabled` names one directory and one byte ceiling. See
+//! [`disk_manager_builder`].
 
 use std::sync::Arc;
 
@@ -436,6 +442,57 @@ impl ObjectStoreRegistry for EmptyObjectStoreRegistry {
     }
 }
 
+/// Whether THIS query may spill, and where (ADR-0954). Decided per query by
+/// the caller ([`crate::SqlExecutor`]), never inferred here: spill needs both
+/// an operator-configured [`SpillConfig`](crate::SpillConfig) and a plan whose
+/// every aggregate is exactness-preserving under spill, and only the caller
+/// has the plan.
+#[derive(Debug, Clone, Copy)]
+pub enum SpillDecision<'a> {
+    /// No spill. Identical to the pre-ADR-0954 behavior in every respect: an
+    /// operator that wants to spill gets DataFusion's own
+    /// `"... (DiskManager is disabled)"` `ResourcesExhausted`, which
+    /// [`SqlError::resources_exhausted_reattributed`](crate::SqlError::resources_exhausted_reattributed)
+    /// then re-attributes to the pool that actually filled. This is what an
+    /// unconfigured deployment gets, and what an ineligible plan gets on a
+    /// configured one.
+    Disabled,
+    /// Spill into `dir`, capped at `max_bytes` for this query.
+    Enabled {
+        /// This query's own scratch directory (a
+        /// [`SpillScratch`](crate::spill::SpillScratch) subdirectory, not the
+        /// operator-configured root). DataFusion creates its own temporary
+        /// directory inside it and removes that on `RuntimeEnv` drop.
+        dir: &'a std::path::Path,
+        /// The per-query scratch ceiling, in spill-file bytes on disk.
+        max_bytes: u64,
+    },
+}
+
+/// The disk manager for one query.
+///
+/// [`SpillDecision::Disabled`] is `DiskManagerMode::Disabled`, unchanged from
+/// ADR-0102 decision 3 and for its reasons: budget exhaustion is a typed error,
+/// never a partial result, and no durability may depend on local disk. Leaving
+/// the disk manager unconfigured instead would restore DataFusion's
+/// `OsTmpDirectory` default with a 100 GB ceiling, which routes around the
+/// pool's `try_grow` enforcement entirely; that default is never reachable from
+/// this crate, in either arm.
+///
+/// [`SpillDecision::Enabled`] names exactly one directory and one ceiling.
+/// Both are explicit: a directory with DataFusion's default ceiling would be
+/// the same unbounded behavior in a different place.
+fn disk_manager_builder(spill: SpillDecision<'_>) -> DiskManagerBuilder {
+    match spill {
+        SpillDecision::Disabled => {
+            DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled)
+        }
+        SpillDecision::Enabled { dir, max_bytes } => DiskManagerBuilder::default()
+            .with_mode(DiskManagerMode::Directories(vec![dir.to_path_buf()]))
+            .with_max_temp_directory_size(max_bytes),
+    }
+}
+
 /// Build the per-query `SessionConfig`. Separated from [`build_session`] so
 /// the invariants above can be asserted without constructing a provider.
 ///
@@ -494,20 +551,12 @@ pub fn build_session(
     pool: Arc<dyn MemoryPool>,
     table: SessionTable,
     exact_typed_aggregates: bool,
+    spill: SpillDecision<'_>,
 ) -> DFResult<SessionContext> {
     let runtime = RuntimeEnvBuilder::new()
         .with_memory_pool(pool)
         .with_object_store_registry(Arc::new(EmptyObjectStoreRegistry))
-        // ADR-0102 decision 3: disable spill so a query over the memory budget
-        // fails as a typed `ResourcesExhausted` error instead of silently
-        // spilling to local disk (which ADR-0013 forbids: budget exhaustion is
-        // an error, never a partial result, and no durability may depend on
-        // local disk). Without this the disk manager defaults to
-        // `OsTmpDirectory` with a 100 GB ceiling and routes around the pool's
-        // `try_grow` enforcement.
-        .with_disk_manager_builder(
-            DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled),
-        )
+        .with_disk_manager_builder(disk_manager_builder(spill))
         .build_arc()?;
 
     // `SessionContext::new_with_config_rt` with one extra physical optimizer
@@ -735,6 +784,7 @@ mod tests {
             test_pool(),
             SessionTable::Spans(Arc::new(provider)),
             false,
+            SpillDecision::Disabled,
         )
         .expect("spans session builds");
 
@@ -1052,8 +1102,14 @@ mod tests {
             ("logs", logs_table(&store), set(["has_word"].iter())),
             ("spans", spans_table(&store), empty.clone()),
         ] {
-            let ctx = build_session(&SqlConfig::default(), test_pool(), table, false)
-                .expect("session builds");
+            let ctx = build_session(
+                &SqlConfig::default(),
+                test_pool(),
+                table,
+                false,
+                SpillDecision::Disabled,
+            )
+            .expect("session builds");
             let state = ctx.state();
             let reg_scalars = keys(state.scalar_functions().keys().cloned());
             let reg_windows = keys(state.window_functions().keys().cloned());
@@ -1130,6 +1186,7 @@ mod tests {
             test_pool(),
             logs_table(&store),
             false,
+            SpillDecision::Disabled,
         )
         .expect("logs session builds");
         assert!(
@@ -1142,6 +1199,7 @@ mod tests {
             test_pool(),
             metrics_table(&store),
             false,
+            SpillDecision::Disabled,
         )
         .expect("metrics session builds");
         let metrics_state = metrics.state();

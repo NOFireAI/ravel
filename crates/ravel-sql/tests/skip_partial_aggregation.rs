@@ -73,7 +73,7 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::LogSegmentFetcher;
 use ravel_sql::{
-    LogsTableProvider, SKIP_PARTIAL_AGGREGATION_PROBE_ROWS, SessionTable, SqlConfig,
+    LogsTableProvider, SKIP_PARTIAL_AGGREGATION_PROBE_ROWS, SessionTable, SpillDecision, SqlConfig,
     TenantMemoryAccountant, build_session,
 };
 use ravel_types::TenantHash;
@@ -405,7 +405,13 @@ async fn run(
         LogSegmentFetcher::new(Arc::clone(store)),
         QueryAccounting::new(),
     ));
-    let ctx = build_session(&config, pool, SessionTable::Logs(provider), false).expect("session");
+    let ctx = build_session(
+        &config,
+        pool,
+        SessionTable::Logs(provider),
+        false,
+        SpillDecision::Disabled,
+    ).expect("session");
 
     let plan = ctx
         .sql(QUERY)
