@@ -394,7 +394,8 @@ CORPUS_BYTES        = 12.03e9      # total corpus size; the % bands are off this
 
 # Integrity (asserted BEFORE any band): 43 statements, one fails by design.
 EXPECTED_MEASURED   = 42
-EXPECTED_FAILED     = 1
+EXPECTED_FAILED_Q   = {"q33"}      # by identity, not a count: q33 exhausts the
+                                   # 8 GiB per-query budget (#837)
 
 # Class M (metadata-decomposable): answerable from metadata, no data read.
 M_Q01_DATA_GETS_MAX = 0            # q01 issues zero data (scan-phase) reads
@@ -405,8 +406,15 @@ M_TOTAL_BYTES       = 4.84e9       # target: 0; #850
 S_EACH_FRAC_MAX     = 0.055        # q37..q43 EACH <= 5.5% of corpus bytes
 S_GROUP_BYTES_MAX   = 33.2e9       # q20..q24 GROUP TOTAL; target: 5% each
 
-# Class F (full-value): reads full column values corpus-wide.
-F_AMPLIFICATION_MAX = 6.1          # target: 1.25, provisional
+# Fetch amplification: scan-phase WIRE bytes per STORED page byte decoded.
+# TWO bands, because they are two populations and one number cannot be both.
+# Measured on the ratio-0 baseline (#913): all-42 5.794, Class-F-only 7.302.
+# Class F is the higher of the two; the corpus-wide figure is pulled down by
+# Class S at 2.875 over 25.4 GB of scan bytes. Banding the Class-F population
+# against the corpus-wide number would fail on the baseline it came from.
+CORPUS_AMPLIFICATION_MAX = 6.1     # all measured rows; measured 5.794 (+5%)
+F_AMPLIFICATION_MAX      = 7.7     # Class F rows only; measured 7.302 (+5%)
+                                   # target for both: 1.25, provisional
 
 # Operator pre-registration for THIS run's wall clock (a property of the run,
 # not of #913). Fill as (LO, HI) before the pass, or leave None for a loud SKIP.
@@ -431,13 +439,21 @@ def walk(o):
         for v in o: yield from walk(v)
 
 def rows(path):
-    out = {}
+    """Report rows keyed by full statement id.
+
+    Duplicate full ids are collected here, BEFORE the dict overwrites them.
+    A later duplicate silently replacing an earlier one would keep the
+    measured count correct while changing which figures are checked, so the
+    duplicate has to be caught at the point it is lost."""
+    out, dup_id = {}, set()
     for d in load(path):
         for n in walk(d):
             sid = n.get("id")
             if isinstance(sid, str) and sid[:1] == "q":
+                if sid in out:
+                    dup_id.add(sid)
                 out[sid] = n
-    return out
+    return out, dup_id
 
 def q_prefix(sid):            # "q07" from "q07_min_max_eventdate"
     return sid.split("_", 1)[0]
@@ -453,7 +469,7 @@ report = sys.argv[1]
 corpus = sys.argv[2] if len(sys.argv) > 2 else \
     "/root/ravel/benchmarks/clickbench/hits.corpus.json"
 
-r = rows(report)
+r, dup_id = rows(report)
 timed  = {k: v for k, v in r.items() if isinstance(v.get("min_ms"), (int, float))}
 failed = sorted(k for k, v in r.items() if v.get("error"))
 cls    = corpus_classes(corpus)
@@ -518,10 +534,34 @@ print(f"cold {colds:.2f} s")
 
 # --- Integrity FIRST: a total over a different statement count, or over a run
 # with unexpected failures, is not comparable and no band on it stands. -----
+#
+# Counts alone are not integrity. They are satisfied by the wrong 42 rows: an
+# omitted Class-F statement replaced by an unrecognised `q` row keeps the count
+# at 42, and "at most one failure" is also satisfied by zero failures plus one
+# statement that never ran. So the IDENTITIES are checked, not the totals.
+if dup_id:
+    fails.append(f"duplicate report rows for {sorted(dup_id)}; "
+                 "a later row overwrote an earlier one")
+
+corpus_q  = set(cls)                                    # every prefix the corpus defines
+covered_q = {q_prefix(k) for k in timed} | {q_prefix(k) for k in failed}
+missing   = corpus_q - covered_q
+unknown   = covered_q - corpus_q
+if missing:
+    fails.append(f"corpus statements absent from the report: {sorted(missing)}")
+if unknown:
+    fails.append(f"report rows not in the corpus: {sorted(unknown)}")
+
 if len(timed) != EXPECTED_MEASURED:
     fails.append(f"measured {len(timed)}, expected {EXPECTED_MEASURED}")
-if len(failed) > EXPECTED_FAILED:
-    fails.append(f"{len(failed)} failures, expected at most {EXPECTED_FAILED}")
+
+# Exactly the expected failure, by identity. Not "at most N": a pass with zero
+# failures and a missing statement would clear a <= check while measuring less
+# than the run it is compared against.
+failed_q = {q_prefix(k) for k in failed}
+if failed_q != EXPECTED_FAILED_Q:
+    fails.append(f"failed statements {sorted(failed_q)}, expected exactly "
+                 f"{sorted(EXPECTED_FAILED_Q)}")
 
 # --- Class M --------------------------------------------------------------
 acc = cold("q01")
@@ -578,27 +618,44 @@ if s_grp_ok:
 print("SKIP class S object-count half: report has GETs, not distinct objects "
       "touched; see #913 (needs a distinct-objects counter)")
 
-# --- Class F: corpus-wide fetch amplification -----------------------------
-scan_total = decoded_total = 0
-f_ok = True
-for q in by_q:
-    acc = cold(q)
-    if acc is None:
-        f_ok = False; continue
-    sw = scan_wire(acc)
-    if sw is None:
-        f_ok = False; continue
-    scan_total    += sw
-    decoded_total += acc.get("page_stored_bytes_decoded") or 0
-if f_ok:
+# --- Fetch amplification: corpus-wide AND Class-F, as two separate figures -
+#
+# The Class-F band must be measured over Class-F rows only. Summing every class
+# into one ratio and calling it "class F" is a different quantity: Class S at
+# 2.875 over 25.4 GB of scan bytes drags the corpus figure well below the
+# Class-F one (5.794 against 7.302 on the ratio-0 baseline).
+def amplification(qs, label, band):
+    scan_total = decoded_total = 0
+    seen = 0
+    for q in qs:
+        acc = cold(q)                      # `cold` already FAILS on an absent row
+        if acc is None:
+            return
+        sw = scan_wire(acc)
+        if sw is None:
+            return
+        scan_total    += sw
+        decoded_total += acc.get("page_stored_bytes_decoded") or 0
+        seen += 1
+    if seen == 0:
+        fails.append(f"{label} amplification: no rows in this population; "
+                     "a band over nothing is not a passed check")
+        return
     if decoded_total == 0:
-        fails.append("class F: no decoded page bytes; amplification not emitted")
-    else:
-        amp = scan_total / decoded_total
-        print(f"class F corpus-wide fetch amplification {amp:.2f}")
-        if amp > F_AMPLIFICATION_MAX:
-            fails.append(f"class F amplification {amp:.2f} > {F_AMPLIFICATION_MAX} "
-                         f"(target 1.25, provisional)")
+        fails.append(f"{label} amplification: no decoded page bytes; not emitted")
+        return
+    amp = scan_total / decoded_total
+    print(f"{label} fetch amplification {amp:.3f}  (n={seen})")
+    if amp > band:
+        fails.append(f"{label} amplification {amp:.3f} > {band} "
+                     f"(target 1.25, provisional)")
+
+f_qs = sorted(q for q in by_q if cls.get(q) == "full_value")
+if not f_qs:
+    fails.append("no Class-F statements found in the corpus; the Class-F band "
+                 "cannot be evaluated and must not silently pass")
+amplification(sorted(by_q), "corpus-wide", CORPUS_AMPLIFICATION_MAX)
+amplification(f_qs,         "class F",     F_AMPLIFICATION_MAX)
 
 # --- Operator wall-clock bands: assert if pre-registered, else SKIP loudly -
 if HOT_S_BAND is None:

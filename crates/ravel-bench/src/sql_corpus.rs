@@ -167,7 +167,15 @@ pub enum CostClass {
 }
 
 /// One corpus statement and everything a reader needs to judge it.
+///
+/// `deny_unknown_fields` because a typed `class` only closes half the hole: a
+/// misspelled VALUE (`"full_valu"`) is caught by [`CostClass`]'s deserializer,
+/// but a misspelled KEY (`"clas"`) would be dropped and leave the entry
+/// unclassified, and a corpus where every entry carries the same typo passes
+/// the class gate by having nothing to check. An absent `class` stays valid;
+/// an unrecognised key is now an error naming the field.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CorpusEntry {
     /// A stable short identifier, unique within a corpus. Report rows are keyed
     /// by it, so it must not change when the statement is edited in place.
@@ -874,6 +882,49 @@ mod tests {
             matches!(&err, CorpusError::UnclassifiedEntry { entry_id } if entry_id == "b"),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn a_misspelled_class_key_is_a_deserialization_error_not_an_unclassified_entry() {
+        // The typed enum catches a bad class VALUE. It cannot catch a bad class
+        // KEY: without `deny_unknown_fields` on `CorpusEntry`, `"clas"` is
+        // dropped and the entry reads as unclassified. A corpus where every
+        // entry carries the same typo would then class nothing and sail through
+        // the gate, because the "all or none" rule sees "none".
+        let typo = serde_json::json!({
+            "id": "a",
+            "sql": "SELECT count(*) FROM logs",
+            "constructs": ["count"],
+            "clas": "full_value",
+        });
+        let err = serde_json::from_value::<CorpusEntry>(typo)
+            .expect_err("a misspelled class key must fail to deserialize");
+        assert!(
+            err.to_string().contains("clas"),
+            "the error must name the offending field, got: {err}"
+        );
+
+        // The correct spelling still parses, so the guard rejects typos rather
+        // than rejecting the field.
+        let ok = serde_json::json!({
+            "id": "a",
+            "sql": "SELECT count(*) FROM logs",
+            "constructs": ["count"],
+            "class": "full_value",
+        });
+        let parsed: CorpusEntry =
+            serde_json::from_value(ok).expect("the correctly spelled key parses");
+        assert_eq!(parsed.class, Some(CostClass::FullValue));
+
+        // And an absent class is still valid, for corpora that predate classes.
+        let absent = serde_json::json!({
+            "id": "a",
+            "sql": "SELECT count(*) FROM logs",
+            "constructs": ["count"],
+        });
+        let parsed: CorpusEntry =
+            serde_json::from_value(absent).expect("an absent class is still valid");
+        assert_eq!(parsed.class, None);
     }
 
     #[test]
