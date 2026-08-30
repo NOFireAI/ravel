@@ -46,7 +46,7 @@ use ravel_object_store::{
 };
 use ravel_query::{
     AssemblyBufferStats, BlockRangeFetcher, CarriedFooter, LogFetchError, LogQuery,
-    LogSegmentFetcher,
+    LogSegmentFetcher, ReadPhases,
 };
 use ravel_types::TenantHash;
 use ravel_types::accounting::{AccountedOp, QueryAccounting};
@@ -2131,7 +2131,17 @@ async fn a_version_3_tail_miss_is_counted_once_by_whoever_probed() {
 
     // Case 1: this read issues the probe.
     let (_bytes, own) = fetcher
-        .fetch_object_with_footer(&seg, TENANT, i64::MIN, i64::MAX, &[], &all, None, &acc)
+        .fetch_object_with_footer(
+            &seg,
+            TENANT,
+            i64::MIN,
+            i64::MAX,
+            &[],
+            &all,
+            None,
+            ReadPhases::SCAN,
+            &acc,
+        )
         .await
         .expect("unprompted fetch");
     assert_eq!(own.probe_gets, 1, "the probe covered the footer, no chase");
@@ -2161,6 +2171,7 @@ async fn a_version_3_tail_miss_is_counted_once_by_whoever_probed() {
                 footer: &planned_footer,
                 tail_misses_counted: true,
             }),
+            ReadPhases::SCAN,
             &acc,
         )
         .await
@@ -2196,6 +2207,7 @@ async fn a_version_3_tail_miss_is_counted_once_by_whoever_probed() {
                 footer: &bare_footer,
                 tail_misses_counted: false,
             }),
+            ReadPhases::SCAN,
             &acc,
         )
         .await

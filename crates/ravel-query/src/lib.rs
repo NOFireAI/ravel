@@ -33,10 +33,12 @@ pub use log_fetcher::{
     DEFAULT_LOG_MAX_CONCURRENT_GETS, DEFAULT_LOG_REQUEST_COST_BYTES, DEFAULT_LOG_SUFFIX_LEN,
     DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD, LOG_SUFFIX_FLOOR_BYTES, LOG_SUFFIX_SIZE_DIVISOR,
     LogFetchError, LogFetchOutput, LogQuery, LogSegmentFetcher, LogSegmentScan, ProbeMissCounter,
-    ProbeMissCounts, ProbePhase, StreamAttrEquals, WHOLE_OBJECT_REQUEST_MULTIPLE,
+    ProbeMissCounts, ProbePhase, ReadPhases, StreamAttrEquals, WHOLE_OBJECT_REQUEST_MULTIPLE,
     derive_suffix_len,
 };
-pub use phase_accounting::{PhaseAccounting, PhaseAccountingSnapshot, QueryPhase};
+pub use phase_accounting::{
+    PhaseAccounting, PhaseAccountingSnapshot, PhaseWireByteCounter, PhaseWireByteCounts, QueryPhase,
+};
 pub use query_admission::{
     QueryAdmissionController, QueryConcurrencyLimit, QueryPermit, QueryRejected,
     query_admission_snapshot_key, reconcile_query_admission_once,

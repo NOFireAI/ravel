@@ -26,8 +26,8 @@ use clap::Parser;
 use ravel_bench::harness::{StoreKind, store_from_env};
 use ravel_bench::sql_corpus::{checked_default_corpus, load_external_corpus};
 use ravel_bench::sql_latency::{
-    Compaction, DatasetInfo, FlightTarget, GenerateConfig, SqlLatencyReport, TenantConfigInput,
-    run_generated, run_tenant,
+    Compaction, DatasetInfo, FlightTarget, GenerateConfig, RunAccounting, SqlLatencyReport,
+    TenantConfigInput, run_generated, run_tenant,
 };
 use ravel_sql::DEFAULT_MAX_QUERY_BYTES;
 use ravel_types::TimeRange;
@@ -581,6 +581,7 @@ fn print_human_table(report: &SqlLatencyReport) {
             warm_hits,
         );
     }
+    print_fetch_amplification(report);
     if !report.skipped.is_empty() {
         println!("\n  skipped (unsatisfied declared column):");
         for s in &report.skipped {
@@ -592,6 +593,71 @@ fn print_human_table(report: &SqlLatencyReport) {
         for f in &report.failed {
             println!("    {:<32} run {}: {}", f.id, f.run, f.error);
         }
+    }
+}
+
+/// The cold run's fetch amplification and the per-phase wire bytes behind it
+/// (issue #913).
+///
+/// Every label spells out which of the two byte kinds it is, because the block
+/// carries both and they cannot be summed or compared: `wire_bytes_*` is what
+/// the object store transferred (coalescing holes and retries included), and
+/// `page_stored_bytes_decoded` is the post-compression length of the pages the
+/// decode kept, as they sit in the object.
+fn print_fetch_amplification(report: &SqlLatencyReport) {
+    let rows: Vec<(&str, &RunAccounting)> = report
+        .entries
+        .iter()
+        .filter_map(|e| match e.per_run_accounting.as_deref() {
+            Some([cold, ..]) => Some((e.id.as_str(), cold)),
+            _ => None,
+        })
+        .collect();
+    if rows.is_empty() {
+        return;
+    }
+    println!(
+        "\n  fetch amplification, cold run: scan-phase WIRE bytes per STORED page byte decoded."
+    );
+    println!(
+        "  Probe, PAGE_DIR, SKIP_IDX and directory bytes are the plan/probe phases, not the numerator."
+    );
+    println!(
+        "  Not the same quantity as page_bytes_fetched / page_bytes_decoded, which is stored over stored."
+    );
+    println!(
+        "  {:<32} | {:>16} | {:>16} | {:>16} | {:>16} | {:>16} | {:>25} | {:>13}",
+        "id",
+        "wire_bytes_scan",
+        "wire_bytes_probe",
+        "wire_bytes_plan",
+        "wire_bytes_resolve",
+        "wire_bytes_unattr",
+        "page_stored_bytes_decoded",
+        "amplification",
+    );
+    println!(
+        "  {:-<32}-+-{:-<16}-+-{:-<16}-+-{:-<16}-+-{:-<16}-+-{:-<16}-+-{:-<25}-+-{:-<13}",
+        "", "", "", "", "", "", "", ""
+    );
+    let phase = |acc: &RunAccounting, name: &str| {
+        acc.wire_bytes_by_phase
+            .iter()
+            .find(|p| p.phase == name)
+            .map_or("-".to_string(), |p| p.wire_bytes.to_string())
+    };
+    for (id, acc) in rows {
+        println!(
+            "  {:<32} | {:>16} | {:>16} | {:>16} | {:>16} | {:>16} | {:>25} | {:>13.3}",
+            id,
+            phase(acc, "scan"),
+            phase(acc, "probe"),
+            phase(acc, "plan"),
+            phase(acc, "resolve"),
+            acc.wire_bytes_unattributed,
+            acc.page_stored_bytes_decoded,
+            acc.fetch_amplification,
+        );
     }
 }
 
