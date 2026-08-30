@@ -402,6 +402,7 @@ async fn a_high_cardinality_aggregation_is_refused_by_the_aggregate_not_the_scan
         pool,
         SessionTable::Metrics(Arc::new(provider)),
         false,
+        false,
     )
     .expect("metrics session builds");
 

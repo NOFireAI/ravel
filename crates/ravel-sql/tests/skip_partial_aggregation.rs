@@ -405,7 +405,8 @@ async fn run(
         LogSegmentFetcher::new(Arc::clone(store)),
         QueryAccounting::new(),
     ));
-    let ctx = build_session(&config, pool, SessionTable::Logs(provider), false).expect("session");
+    let ctx =
+        build_session(&config, pool, SessionTable::Logs(provider), false, false).expect("session");
 
     let plan = ctx
         .sql(QUERY)

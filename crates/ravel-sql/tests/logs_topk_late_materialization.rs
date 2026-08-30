@@ -353,7 +353,7 @@ fn session(provider: LogsTableProvider, config: &SqlConfig) -> SessionContext {
         CeilingBreach::new(),
         QueryAccounting::new(),
     ));
-    build_session(config, pool, SessionTable::Logs(Arc::new(provider)), false)
+    build_session(config, pool, SessionTable::Logs(Arc::new(provider)), false, false)
         .expect("session builds")
 }
 

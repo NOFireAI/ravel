@@ -14,6 +14,7 @@
 //! footprint is cardinality-dependent once labels materialize as columns, so a
 //! sample cap cannot stand in for a byte cap.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use datafusion::execution::memory_pool::MemoryPool;
@@ -21,6 +22,71 @@ use ravel_query::EngineConfig;
 use ravel_types::accounting::QueryAccounting;
 
 use crate::memory::{CeilingBreach, TenantDelegatingPool, TenantMemoryAccountant};
+
+/// Environment variable naming the ephemeral spill scratch directory
+/// (ADR-0954). Read only as a default source by [`SpillConfig::from_env`]; the
+/// `SqlConfig::spill` field is the source of truth. Set alongside
+/// [`ENV_SPILL_MAX_BYTES`]: both must be present for spill to be enabled.
+pub const ENV_SPILL_DIR: &str = "RAVEL_SQL_SPILL_DIR";
+
+/// Environment variable naming the per-query spill scratch byte quota
+/// (ADR-0954), parsed as a base-10 `usize`. Read only as a default source by
+/// [`SpillConfig::from_env`]. Set alongside [`ENV_SPILL_DIR`].
+pub const ENV_SPILL_MAX_BYTES: &str = "RAVEL_SQL_SPILL_MAX_BYTES";
+
+/// Explicit configuration for bounded ephemeral spill (ADR-0954, issue #954).
+///
+/// Both fields are required for spill to be enabled at all: a `SqlConfig`
+/// carries `Some(SpillConfig)` only when a deployment has chosen both a
+/// scratch directory and a per-query byte quota. An absent `SqlConfig::spill`
+/// (the default) keeps the disk manager `Disabled` and reproduces today's
+/// behaviour byte for byte, which is the no-spill deployment profile
+/// (requirement 9 of #954).
+///
+/// Spill is per-query ephemeral execution state: it is never committed, never
+/// read back for recovery, and cleaned up when the query's session drops (on
+/// completion, error, or cancellation). Startup orphan cleanup and
+/// node-wide/tenant quotas are explicit follow-up work, out of scope here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpillConfig {
+    /// The directory bounded spill scratch files are written under. DataFusion
+    /// creates a per-session temporary subdirectory inside it, removed when the
+    /// query's `RuntimeEnv` drops. Must exist (or be creatable) and be
+    /// writable; otherwise a spilling query fails with
+    /// [`crate::SqlError::SpillUnavailable`].
+    pub dir: PathBuf,
+    /// The per-query scratch byte quota, wired onto the query's disk manager as
+    /// `max_temp_directory_size`. A spill write that pushes a query's scratch
+    /// use over this fails with [`crate::SqlError::SpillBudgetExhausted`],
+    /// independently of the memory budget.
+    pub max_bytes: usize,
+}
+
+impl SpillConfig {
+    /// Build a [`SpillConfig`] from [`ENV_SPILL_DIR`] and [`ENV_SPILL_MAX_BYTES`].
+    ///
+    /// Returns `Some` only when BOTH variables are present and the byte quota
+    /// parses to a non-zero `usize`; any other combination (either unset, an
+    /// unparseable or zero quota) returns `None`, so a partial or malformed
+    /// environment leaves spill disabled rather than half-configured. The
+    /// `SqlConfig::spill` field is the source of truth; this only supplies a
+    /// default a deployment can fold in, and [`SqlConfig::default`] never reads
+    /// the environment (so its behaviour is deterministic and off).
+    pub fn from_env() -> Option<SpillConfig> {
+        let dir = std::env::var_os(ENV_SPILL_DIR)?;
+        if dir.is_empty() {
+            return None;
+        }
+        let max_bytes: usize = std::env::var(ENV_SPILL_MAX_BYTES).ok()?.parse().ok()?;
+        if max_bytes == 0 {
+            return None;
+        }
+        Some(SpillConfig {
+            dir: PathBuf::from(dir),
+            max_bytes,
+        })
+    }
+}
 
 /// Default per-query RecordBatch byte budget: 256 MiB. This is the shipped
 /// default, not a guess awaiting a number: an operator overrides it per process
@@ -102,7 +168,10 @@ const GROUP_VALUES_FIXED_OVERHEAD_CEILING: usize =
 
 /// Per-query ravel-sql configuration: the shared engine budgets plus the
 /// SQL-only per-query memory-pool byte budget.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// No longer `Copy`: [`SqlConfig::spill`] holds an owned [`PathBuf`]. It stays
+/// `Clone`, and the executor clones it into each query's providers.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SqlConfig {
     /// Series/segment/sample/deadline budgets shared with the PromQL path.
     pub engine: EngineConfig,
@@ -164,6 +233,20 @@ pub struct SqlConfig {
     /// surviving rows instead of for every row. So this is a cost knob, never
     /// a correctness one.
     pub late_materialization_extra_columns: Option<usize>,
+    /// Bounded ephemeral spill configuration (ADR-0954, issue #954). `None`
+    /// (the default) keeps the disk manager `Disabled` and reproduces today's
+    /// behaviour byte for byte: a query over its memory budget fails with a
+    /// typed [`crate::SqlError::ResourcesExhausted`], never a silent spill.
+    ///
+    /// `Some(SpillConfig)` enables spill for a query ONLY when the query is
+    /// also exactness-preserving under spill (the executor's eligibility
+    /// predicate; an ineligible or off query still gets the disabled path).
+    /// Both a directory and a byte quota must be set, which is what the
+    /// [`SpillConfig`] type enforces. Set once at server startup, like every
+    /// other field here; a deployment can source it from the environment via
+    /// [`SpillConfig::from_env`] without a code change, but this field is the
+    /// source of truth.
+    pub spill: Option<SpillConfig>,
 }
 
 impl Default for SqlConfig {
@@ -174,6 +257,12 @@ impl Default for SqlConfig {
             parallel_final_aggregation: true,
             skip_partial_aggregation: true,
             late_materialization_extra_columns: Some(DEFAULT_LATE_MATERIALIZATION_EXTRA_COLUMNS),
+            // Off by default: unset spill means today's disabled disk manager,
+            // byte for byte (requirement 9 of #954). `default()` never reads
+            // the environment, so it is deterministic regardless of process
+            // configuration; a deployment folds in `SpillConfig::from_env()`
+            // explicitly.
+            spill: None,
         }
     }
 }
@@ -253,6 +342,16 @@ mod tests {
     /// ClickBench shapes finish at all (`SELECT * ... ORDER BY ts LIMIT 10`
     /// exceeded a 900 s deadline without it) and belongs in the same change as
     /// this assertion, not discovered broken elsewhere.
+    /// ADR-0954 / requirement 9: spill is OFF by default. An unset
+    /// `SqlConfig::spill` is the no-spill deployment profile and keeps the disk
+    /// manager `Disabled` in `build_session`, reproducing today's behaviour
+    /// byte for byte. A change that defaults spill on is a change to that
+    /// guarantee and belongs in the same change as this assertion.
+    #[test]
+    fn spill_defaults_to_off() {
+        assert!(SqlConfig::default().spill.is_none());
+    }
+
     #[test]
     fn late_materialization_defaults_to_eight_extra_columns() {
         assert_eq!(

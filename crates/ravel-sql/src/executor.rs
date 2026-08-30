@@ -195,6 +195,39 @@ pub struct SqlStats {
     pub blocks_total: u64,
     pub blocks_scanned: u64,
     pub blocks_pruned_by_postings: u64,
+    /// Bounded ephemeral spill accounting for the successful attempt (ADR-0954),
+    /// summed from the executed plan's DataFusion spill metrics after a clean
+    /// drain. Zero for a query that did not spill (spill off, ineligible, or
+    /// within budget). See [`SpillCounts`] for what each figure counts and for
+    /// the DataFusion 54 figures this crate cannot source.
+    ///
+    /// `spill_files` is the count of scratch files created (DataFusion's
+    /// `spill_count`); `spill_bytes_written` is the bytes written to those
+    /// files (its `spilled_bytes`, IPC-encoded, as transferred to disk);
+    /// `spill_rows` is the rows written (its `spilled_rows`). Attribution: these
+    /// are summed across every spilling operator in the plan tree, the same way
+    /// [`SqlStats::blocks_scanned`] sums the scan counters; the executed plan's
+    /// own `MetricsSet` keeps the per-operator breakdown for a caller that needs
+    /// it.
+    pub spill_files: u64,
+    pub spill_bytes_written: u64,
+    pub spill_rows: u64,
+}
+
+/// The DataFusion spill metrics summed over a plan tree (ADR-0954).
+///
+/// DataFusion 54's `SpillMetrics` exposes exactly three figures per operator:
+/// `spill_count` (files), `spilled_bytes` (bytes written to disk), and
+/// `spilled_rows`. It exposes NO distinct bytes-READ counter and NO spill
+/// duration, so requirement 5's "bytes read" and "spill duration" cannot be
+/// sourced from the plan metrics without patching DataFusion; this crate
+/// surfaces the three figures it does expose and reports the gap rather than
+/// emitting a fabricated zero for the two it does not.
+#[derive(Clone, Copy, Default)]
+struct SpillCounts {
+    files: u64,
+    bytes_written: u64,
+    rows: u64,
 }
 
 /// The `LogsScanExec` block counters, summed over a plan tree.
@@ -220,6 +253,25 @@ fn accumulate_block_counts(plan: &Arc<dyn ExecutionPlan>, counts: &mut BlockCoun
     }
     for child in plan.children() {
         accumulate_block_counts(child, counts);
+    }
+}
+
+/// Sum the DataFusion spill metrics (`spill_count`, `spilled_bytes`,
+/// `spilled_rows`) over `plan` and its descendants (ADR-0954). Every
+/// spill-capable operator publishes these names into its own `MetricsSet`, so
+/// the sum is the whole query's spill total however the optimizer nested the
+/// operators, and a plan that never spilled contributes nothing. Reads the
+/// counters DataFusion already maintains rather than instrumenting the spill
+/// I/O a second time.
+fn accumulate_spill_counts(plan: &Arc<dyn ExecutionPlan>, counts: &mut SpillCounts) {
+    if let Some(metrics) = plan.metrics() {
+        let sum = |name: &str| metrics.sum_by_name(name).map_or(0, |v| v.as_usize() as u64);
+        counts.files += sum("spill_count");
+        counts.bytes_written += sum("spilled_bytes");
+        counts.rows += sum("spilled_rows");
+    }
+    for child in plan.children() {
+        accumulate_spill_counts(child, counts);
     }
 }
 
@@ -466,7 +518,7 @@ impl SqlExecutor {
             stats.attempts += 1;
             stats.segments = snapshot.segments.len();
 
-            let (result, emitted, blocks) = self
+            let (result, emitted, blocks, spill) = self
                 .attempt(tenant_hash, req, snapshot, &accounting, &declared)
                 .await;
             stats.batches_emitted += emitted;
@@ -476,6 +528,9 @@ impl SqlExecutor {
                     stats.blocks_total = blocks.total;
                     stats.blocks_scanned = blocks.scanned;
                     stats.blocks_pruned_by_postings = blocks.pruned_by_postings;
+                    stats.spill_files = spill.files;
+                    stats.spill_bytes_written = spill.bytes_written;
+                    stats.spill_rows = spill.rows;
                     return Ok(SqlOutcome {
                         output,
                         stats,
@@ -629,7 +684,14 @@ impl SqlExecutor {
         // once. The build happens only when a consumer will read it.
         let wants_stats_gate = matches!(Self::target_signal(sql), Ok(TargetSignal::Logs))
             && !extras.declared.is_empty();
-        let analyzed = if self.config.parallel_final_aggregation || wants_stats_gate {
+        // ADR-0954: spill eligibility is also decided from the analyzed plan, so
+        // the one analyze pass is needed whenever spill is configured too. When
+        // none of the three consumers wants it, the pass is skipped and every
+        // classification below falls to its closed default.
+        let analyzed = if self.config.parallel_final_aggregation
+            || wants_stats_gate
+            || self.config.spill.is_some()
+        {
             self.analyzed_classification_plan(tenant_hash, sql, &extras.declared)
                 .await
         } else {
@@ -638,6 +700,13 @@ impl SqlExecutor {
         // Fail CLOSED, unchanged: an unbuildable plan is not exact-typed.
         let exact_typed_aggregates = self.config.parallel_final_aggregation
             && analyzed.as_ref().is_some_and(plan_is_exact_typed);
+        // ADR-0954: spill is enabled for this query only when it is configured
+        // AND every aggregate in the plan is exactness-preserving under spill
+        // (`plan_is_spill_eligible`). Fail CLOSED: an unbuildable or
+        // unclassifiable plan is not eligible, so it keeps the disabled-disk
+        // path and today's typed `ResourcesExhausted` on a memory overrun.
+        let spill_eligible =
+            self.config.spill.is_some() && analyzed.as_ref().is_some_and(plan_is_spill_eligible);
         // Build the one table the query targets over the snapshot resolved for
         // its signal. `resolve` already resolved `snapshot` against exactly
         // this signal, so the provider and the snapshot always agree.
@@ -648,7 +717,7 @@ impl SqlExecutor {
                     snapshot,
                     tenant_hash,
                     self.fetcher.clone(),
-                    self.config,
+                    self.config.clone(),
                     accounting.clone(),
                 );
                 // Install the distributed samples scan for this query only, when
@@ -720,8 +789,8 @@ impl SqlExecutor {
             ))),
         };
 
-        let ctx =
-            build_session(&self.config, pool, table, exact_typed_aggregates).map_err(plan_error)?;
+        let ctx = build_session(&self.config, pool, table, exact_typed_aggregates, spill_eligible)
+            .map_err(plan_error)?;
         let frame = ctx.sql(sql).await.map_err(plan_error)?;
         let schema = frame.schema().inner().clone();
         Ok(PinnedQuery {
@@ -794,7 +863,7 @@ impl SqlExecutor {
             snapshot,
             tenant_hash,
             self.fetcher.clone(),
-            self.config,
+            self.config.clone(),
             accounting.clone(),
         ));
         let plan = provider
@@ -802,11 +871,14 @@ impl SqlExecutor {
             .map_err(plan_error)?;
         // ADR-0094 decision 2: the worker fragment plans no new SQL and runs no
         // aggregation of its own, so it never repartitions -- always `false`,
-        // never through the classification check.
+        // never through the classification check. It also never aggregates, so
+        // it is never spill-eligible: `false` for the spill argument too
+        // (ADR-0954).
         let ctx = build_session(
             &self.config,
             pool,
             SessionTable::Metrics(Arc::clone(&provider)),
+            false,
             false,
         )
         .map_err(plan_error)?;
@@ -911,7 +983,7 @@ impl SqlExecutor {
         // executes, so nothing is reserved against it and it never touches the
         // tenant accountant.
         let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
-        let ctx = build_session(&self.config, pool, table, false).ok()?;
+        let ctx = build_session(&self.config, pool, table, false, false).ok()?;
         let plan = ctx.state().create_logical_plan(sql).await.ok()?;
         let mut predicates = Vec::new();
         collect_filter_predicates(&plan, &mut predicates);
@@ -982,7 +1054,7 @@ impl SqlExecutor {
         let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
         // `exact_typed_aggregates` is irrelevant to a plan we only inspect; the
         // classification decides the real session's value, not this throwaway.
-        let ctx = build_session(&self.config, pool, table, false).ok()?;
+        let ctx = build_session(&self.config, pool, table, false, false).ok()?;
         let state = ctx.state();
         let plan = state.create_logical_plan(sql).await.ok()?;
         let config_options = Arc::clone(state.config_options());
@@ -1088,7 +1160,7 @@ impl SqlExecutor {
                 empty_snapshot(),
                 tenant_hash,
                 self.fetcher.clone(),
-                self.config,
+                self.config.clone(),
                 QueryAccounting::new(),
             ))),
             TargetSignal::Logs => SessionTable::Logs(Arc::new(
@@ -1164,19 +1236,19 @@ impl SqlExecutor {
         snapshot: Snapshot,
         accounting: &QueryAccounting,
         declared: &[DeclaredColumn],
-    ) -> (Result<QueryOutput, SqlError>, usize, BlockCounts) {
+    ) -> (Result<QueryOutput, SqlError>, usize, BlockCounts, SpillCounts) {
         let planned = match self
             .plan_pinned(tenant_hash, snapshot, &req.sql, accounting, declared)
             .await
         {
             Ok(planned) => planned,
-            Err(e) => return (Err(e), 0, BlockCounts::default()),
+            Err(e) => return (Err(e), 0, BlockCounts::default(), SpillCounts::default()),
         };
         let schema = planned.schema();
 
         let mut stream = match planned.execute().await {
             Ok(stream) => stream,
-            Err(e) => return (Err(e), 0, BlockCounts::default()),
+            Err(e) => return (Err(e), 0, BlockCounts::default(), SpillCounts::default()),
         };
 
         let mut batches = Vec::new();
@@ -1189,15 +1261,23 @@ impl SqlExecutor {
                 }
                 // The scan's block counters are final only after a clean drain,
                 // so a mid-stream error reports none: a partial prune ratio
-                // would misattribute.
-                Err(e) => return (Err(e), emitted, BlockCounts::default()),
+                // would misattribute. The same holds for the spill counters.
+                Err(e) => {
+                    return (
+                        Err(e),
+                        emitted,
+                        BlockCounts::default(),
+                        SpillCounts::default(),
+                    );
+                }
             }
         }
 
-        // The stream drained cleanly: the plan's LogsScanExec counters are now
-        // final, so read them off the plan we kept.
+        // The stream drained cleanly: the plan's LogsScanExec and spill
+        // counters are now final, so read them off the plan we kept.
         let blocks = stream.block_counts();
-        (Ok(QueryOutput::new(schema, batches)), emitted, blocks)
+        let spill = stream.spill_counts();
+        (Ok(QueryOutput::new(schema, batches)), emitted, blocks, spill)
     }
 }
 
@@ -1336,6 +1416,16 @@ impl PinnedStream {
     fn block_counts(&self) -> BlockCounts {
         let mut counts = BlockCounts::default();
         accumulate_block_counts(&self.plan, &mut counts);
+        counts
+    }
+
+    /// The `(files, bytes_written, rows)` the plan's spill-capable operators
+    /// recorded (ADR-0954). Meaningful only once the stream has drained; zero on
+    /// a plan that never spilled. Reads the existing DataFusion spill counters
+    /// off the plan handle this stream kept.
+    fn spill_counts(&self) -> SpillCounts {
+        let mut counts = SpillCounts::default();
+        accumulate_spill_counts(&self.plan, &mut counts);
         counts
     }
 }
@@ -1510,7 +1600,12 @@ fn execution_error(err: DataFusionError, pool: &Arc<dyn MemoryPool>) -> SqlError
                 MemoryLimit::Finite(limit) => limit,
                 MemoryLimit::Infinite | MemoryLimit::Unknown => usize::MAX,
             };
-            SqlError::resources_exhausted_reattributed(&msg, pool.reserved(), limit)
+            // ADR-0954: tell the spill-scratch-quota trip apart from the
+            // disabled-disk refusal and this pool's own `try_grow` text, from
+            // the substring markers DataFusion embeds. A quota trip becomes
+            // `SpillBudgetExhausted`; a disabled-disk refusal is re-attributed
+            // from the pool's occupancy exactly as before this ticket.
+            SqlError::classify_resources_exhausted(&msg, pool.reserved(), limit)
         }
         other => other,
     }
@@ -1865,6 +1960,102 @@ fn aggregate_expr_is_exact(expr: &Expr, schema: &DFSchema) -> bool {
         },
         // Any other name is outside the admitted aggregate set and fails
         // closed.
+        _ => false,
+    }
+}
+
+/// Whether every aggregate in `plan` is exactness-preserving under spill
+/// (ADR-0954, issue #954), so the plan may be allowed to spill.
+///
+/// DataFusion 54's grouped-hash spill path re-folds partial aggregates in a
+/// different order than an in-memory run (it materializes the current groups
+/// with `EmitTo::All` and sorts that batch before writing it), so only an
+/// aggregate whose fold is order-independent stays exact across a spill. This
+/// is the same order/partition-independence hazard `plan_is_exact_typed`
+/// classifies for repartitioning, applied to the spill reordering: integer
+/// `count`, `sum`/`min`/`max` over a non-float input, and the exact-integer
+/// `avg` path (crate::avg, Int64 argument) are order-independent; a float
+/// accumulator or a float group key is not.
+///
+/// This is a predicate over the plan's aggregate expressions and their
+/// resolved types, NOT a name allowlist: `sum` over a float column is
+/// ineligible while `sum` over an integer column is eligible, and the decision
+/// turns on the resolved argument type, not the function name. It fails CLOSED:
+/// an expression whose type will not resolve, an `avg` over a non-Int64 input,
+/// or any aggregate outside the exact set makes the whole plan ineligible, so
+/// an unclassifiable query keeps the disabled-disk path rather than risking an
+/// inexact spilled result. A disqualifying aggregate, group key, or DISTINCT
+/// key anywhere -- including inside a subquery -- disqualifies the whole plan,
+/// because the disk manager is one session-wide setting, not a per-node choice.
+fn plan_is_spill_eligible(plan: &LogicalPlan) -> bool {
+    let mut aggregates = Vec::new();
+    let mut distincts = Vec::new();
+    collect_aggregate_exprs(plan, &mut aggregates, &mut distincts);
+    aggregates.iter().all(aggregate_node_is_spill_eligible)
+        && distincts.iter().all(distinct_node_is_exact)
+}
+
+/// Classify one [`Aggregate`] node for spill eligibility (ADR-0954): every
+/// GROUP BY key must be non-float (a float key's `-0.0`/NaN bit pattern makes
+/// the group representative reorder-sensitive, ADR-0013), and every aggregate
+/// expression must be spill-eligible. Types resolve against the node's input
+/// schema, the same schema [`aggregate_node_is_exact`] uses.
+fn aggregate_node_is_spill_eligible(aggregate: &Aggregate) -> bool {
+    let schema = aggregate.input.schema().as_ref();
+    for key in &aggregate.group_expr {
+        match key.get_type(schema) {
+            Ok(ty) if crate::minmax::is_float(&ty) => return false,
+            Ok(_) => {}
+            // Fail closed: a key whose type will not resolve is not admitted.
+            Err(_) => return false,
+        }
+    }
+    aggregate
+        .aggr_expr
+        .iter()
+        .all(|expr| aggregate_expr_is_spill_eligible(expr, schema))
+}
+
+/// Whether one aggregate expression is exactness-preserving under spill
+/// (ADR-0954):
+///
+/// - `count(...)`/`count(DISTINCT ...)`: always, any input type (a partial
+///   count merge is exact integer addition and distinctness is per-row, so
+///   reordering the merge cannot change the result).
+/// - `sum`/`min`/`max` over a resolved non-float input: yes (integer addition
+///   is associative and exact; min/max are order-independent lattice folds).
+/// - `avg`/`mean` over a resolved Int64 input: yes (crate::avg's exact i128
+///   accumulation, order-independent).
+/// - `avg`/`mean` over any other input, `sum`/`min`/`max` over a float input,
+///   and anything unexpected: never (fail closed).
+fn aggregate_expr_is_spill_eligible(expr: &Expr, schema: &DFSchema) -> bool {
+    let inner = match expr {
+        Expr::Alias(alias) => alias.expr.as_ref(),
+        other => other,
+    };
+    let Expr::AggregateFunction(aggregate_function) = inner else {
+        // Not an aggregate function where one is required: fail closed.
+        return false;
+    };
+    match aggregate_function.func.name().to_ascii_lowercase().as_str() {
+        "count" => true,
+        "sum" | "min" | "max" => match aggregate_function.params.args.first() {
+            Some(arg) => match arg.get_type(schema) {
+                // A float accumulator re-folds in a different order under spill
+                // and is not exact. This is the line the negative demonstration
+                // flips to `Ok(_) => true` to wrongly admit a float aggregate.
+                Ok(ty) => !crate::minmax::is_float(&ty),
+                Err(_) => false,
+            },
+            None => false,
+        },
+        "avg" | "mean" => match aggregate_function.params.args.first() {
+            Some(arg) => matches!(
+                arg.get_type(schema),
+                Ok(datafusion::arrow::datatypes::DataType::Int64)
+            ),
+            None => false,
+        },
         _ => false,
     }
 }

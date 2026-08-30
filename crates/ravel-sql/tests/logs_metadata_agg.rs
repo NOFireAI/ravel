@@ -262,6 +262,7 @@ fn logs_session_with(
         pool,
         SessionTable::Logs(Arc::new(provider)),
         exact_typed_aggregates,
+        false,
     )
 }
 

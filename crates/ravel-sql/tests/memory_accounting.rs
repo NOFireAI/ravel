@@ -80,6 +80,7 @@ async fn drain(
         Arc::clone(&pool),
         SessionTable::Metrics(provider),
         false,
+        false,
     )
     .expect("session");
 
@@ -287,6 +288,7 @@ async fn a_query_that_outgrows_its_pool_still_releases_tenant_bytes() {
         Arc::clone(&pool),
         SessionTable::Metrics(provider),
         false,
+        false,
     )
     .expect("session");
     let mut stream = ctx
@@ -486,6 +488,7 @@ async fn drain_logs(
         &SqlConfig::default(),
         Arc::clone(&pool),
         SessionTable::Logs(provider),
+        false,
         false,
     )
     .expect("session");

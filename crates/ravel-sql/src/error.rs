@@ -90,6 +90,31 @@ pub const MSG_INTERNAL: &str = "internal query engine error";
 /// rewrites it from the pool's own occupancy at the moment of refusal.
 pub const MSG_SPILL_DISABLED_MARKER: &str = "DiskManager is disabled";
 
+/// Substring DataFusion embeds in the `ResourcesExhausted` its disk manager
+/// raises when a spill write pushes the configured per-query scratch quota
+/// (`max_temp_directory_size`, wired from `SqlConfig::spill`'s byte cap in
+/// [`crate::session::build_session`]) over its limit. The message reads
+/// `"The used disk space during the spilling process has exceeded the
+/// allowable limit of ...; Please try increasing the config:
+/// datafusion.runtime.max_temp_directory_size"`
+/// (`datafusion-execution`'s `DiskManager::update_disk_usage`, ADR-0954).
+///
+/// Like [`MSG_SPILL_DISABLED_MARKER`], this is a substring match on an
+/// upstream string DataFusion owns, not a structured discriminant: the disk
+/// manager surfaces the quota trip as a bare `ResourcesExhausted` with no
+/// typed variant to match on. A DataFusion upgrade that rewords the message
+/// stops the re-classification silently (the trip degrades back to a plain
+/// `ResourcesExhausted`, not a compile error), which is why the spill tests
+/// pin the live wording.
+pub const MSG_SPILL_BUDGET_MARKER: &str = "max_temp_directory_size";
+
+/// Stable client message for [`SqlError::SpillUnavailable`]. The full detail,
+/// which may embed the configured spill directory path (server-side
+/// filesystem layout), is logged server-side only, exactly like the storage
+/// faults above; a client learns only that scratch was unavailable.
+pub const MSG_SPILL_UNAVAILABLE: &str =
+    "spill scratch storage is unavailable; the query could not be served";
+
 /// The client-visible class of a [`SqlError`]. The HTTP layer maps this to
 /// a status code and an error-type tag; it never inspects the error itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,6 +245,28 @@ pub enum SqlError {
     #[error("query memory budget exhausted: {0}")]
     ResourcesExhausted(String),
 
+    /// The per-query ephemeral spill scratch quota (`SqlConfig::spill`'s byte
+    /// cap, wired onto the disk manager as `max_temp_directory_size`) was
+    /// exceeded mid-query (ADR-0954). A member of the `ResourcesExhausted`
+    /// family: spill is bounded ephemeral execution state, and exceeding its
+    /// budget is a typed error, never a partial result. The detail is
+    /// DataFusion's own disk-manager message (a byte limit and a config hint,
+    /// no object key or tenant identity), so it echoes to the client verbatim
+    /// like the other budget errors.
+    #[error("query exceeded its spill scratch budget: {0}")]
+    SpillBudgetExhausted(String),
+
+    /// Spill was configured and the query was eligible, but the scratch
+    /// directory was missing, unwritable, or out of capacity, or a spill
+    /// write otherwise failed (ADR-0954). A member of the `ResourcesExhausted`
+    /// family: unavailable scratch capacity or spill failure is a typed
+    /// error, never a partial result. The detail may embed the configured
+    /// directory path (server-side filesystem layout), so it is redacted to
+    /// [`MSG_SPILL_UNAVAILABLE`] for the client and kept in full for the log,
+    /// the same treatment the storage faults get.
+    #[error("spill scratch is unavailable: {0}")]
+    SpillUnavailable(String),
+
     /// DataFusion could not plan the query. The payload is the full
     /// DataFusion message, kept for the server-side log only; it can carry
     /// schema and column detail and is never returned to a client.
@@ -296,6 +343,31 @@ impl SqlError {
         }
     }
 
+    /// Classify a native `ResourcesExhausted` message DataFusion raised during
+    /// execution into the right member of the `ResourcesExhausted` family
+    /// (ADR-0954). The three cases are told apart by the substring markers
+    /// DataFusion embeds, since none of them carries a typed discriminant:
+    ///
+    /// - [`MSG_SPILL_BUDGET_MARKER`]: a spill write pushed the configured
+    ///   scratch quota over its limit. Becomes [`SqlError::SpillBudgetExhausted`].
+    /// - [`MSG_SPILL_DISABLED_MARKER`]: a spill-capable operator asked to spill
+    ///   while the disk manager is disabled (spill off, or the query is
+    ///   ineligible). Re-attributed from the pool's own occupancy exactly as
+    ///   before this ticket, so the disabled path is byte-for-byte unchanged
+    ///   (see [`Self::resources_exhausted_reattributed`]).
+    /// - neither: this pool's own `try_grow` refusal (already names its budget
+    ///   and figures), returned as a plain [`SqlError::ResourcesExhausted`].
+    ///
+    /// The budget marker is checked first: a quota trip and a disabled-spill
+    /// refusal are distinct strings, and only the latter needs re-attribution.
+    pub fn classify_resources_exhausted(raw: &str, used: usize, limit: usize) -> Self {
+        if raw.contains(MSG_SPILL_BUDGET_MARKER) {
+            SqlError::SpillBudgetExhausted(raw.to_string())
+        } else {
+            Self::resources_exhausted_reattributed(raw, used, limit)
+        }
+    }
+
     /// The client-visible class, for HTTP status selection.
     pub fn class(&self) -> ErrorClass {
         match self {
@@ -321,6 +393,8 @@ impl SqlError {
             | SqlError::TooManyBytesScanned { .. }
             | SqlError::RequestBudgetExceeded { .. }
             | SqlError::ResourcesExhausted(_)
+            | SqlError::SpillBudgetExhausted(_)
+            | SqlError::SpillUnavailable(_)
             | SqlError::Plan(_)
             | SqlError::Execution(_)
             | SqlError::Internal(_)
@@ -380,7 +454,14 @@ impl SqlError {
             | SqlError::TooManySeries { .. }
             | SqlError::TooManyBytesScanned { .. }
             | SqlError::RequestBudgetExceeded { .. }
-            | SqlError::ResourcesExhausted(_) => self.to_string(),
+            | SqlError::ResourcesExhausted(_)
+            // A byte limit and a config hint, no object key or tenant
+            // identity, so it echoes verbatim like the other budget errors.
+            | SqlError::SpillBudgetExhausted(_) => self.to_string(),
+            // The detail may embed the configured spill directory path
+            // (server-side filesystem layout), redacted like the storage
+            // faults; the full path stays in `Display` for the server log.
+            SqlError::SpillUnavailable(_) => MSG_SPILL_UNAVAILABLE.to_string(),
             SqlError::Plan(_) => MSG_PLAN.to_string(),
             SqlError::Execution(_) => MSG_EXECUTION.to_string(),
             SqlError::Internal(_) | SqlError::OperatorPanic(_) => MSG_INTERNAL.to_string(),

@@ -106,6 +106,7 @@ use url::Url;
 
 use crate::avg::sequential_avg_udaf;
 use crate::config::SqlConfig;
+use crate::error::SqlError;
 use crate::group_keys::DictionaryGroupKeysAsViews;
 use crate::late_materialization::TopKLateMaterialization;
 use crate::logs_provider::LogsTableProvider;
@@ -473,6 +474,41 @@ pub fn session_config(config: &SqlConfig, exact_typed_aggregates: bool) -> Sessi
     session
 }
 
+/// The disk-manager builder for a query's `RuntimeEnv` (ADR-0954).
+///
+/// `Directories` mode pointed at the configured scratch directory, with the
+/// configured per-query byte quota as `max_temp_directory_size`, ONLY when
+/// spill is configured and the query is eligible; `Disabled` (today's
+/// behaviour, byte for byte) in every other case. `with_disk_manager` taking a
+/// `DiskManagerConfig` is deprecated since DataFusion 48 and fails the
+/// `-D warnings` gate, so the builder form is used.
+fn disk_manager_builder(config: &SqlConfig, spill_eligible: bool) -> DiskManagerBuilder {
+    match (&config.spill, spill_eligible) {
+        (Some(spill), true) => DiskManagerBuilder::default()
+            .with_mode(DiskManagerMode::Directories(vec![spill.dir.clone()]))
+            // The per-query scratch quota. A spill write over it raises a
+            // `ResourcesExhausted` carrying `max_temp_directory_size`, mapped
+            // to `SpillBudgetExhausted` at the execution-error seam.
+            .with_max_temp_directory_size(u64::try_from(spill.max_bytes).unwrap_or(u64::MAX)),
+        _ => DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled),
+    }
+}
+
+/// Map a `RuntimeEnv` build failure to a typed error. With spill on, a build
+/// failure is the disk manager failing to create or open the configured
+/// scratch directory (a missing parent, an unwritable location); surface it as
+/// [`SqlError::SpillUnavailable`] so the client gets the redacted spill message
+/// and the server log keeps the full path and cause. With spill off the
+/// disabled disk manager does not touch disk, so this returns the original
+/// error unchanged.
+fn runtime_build_error(err: DataFusionError, spill_on: bool) -> DataFusionError {
+    if spill_on {
+        SqlError::SpillUnavailable(format!("spill scratch directory is not usable: {err}")).into()
+    } else {
+        err
+    }
+}
+
 /// Build a fresh, single-tenant `SessionContext` around `table` with `pool`
 /// installed as the query's memory pool.
 ///
@@ -494,21 +530,33 @@ pub fn build_session(
     pool: Arc<dyn MemoryPool>,
     table: SessionTable,
     exact_typed_aggregates: bool,
+    spill_eligible: bool,
 ) -> DFResult<SessionContext> {
+    // ADR-0954: spill is wired ONLY when it is configured (`config.spill`) AND
+    // the caller proved the query exactness-preserving under spill
+    // (`spill_eligible`). In every other case the disk manager stays
+    // `Disabled`, which is ADR-0102 decision 3's behaviour byte for byte: a
+    // query over the memory budget fails as a typed `ResourcesExhausted`
+    // instead of silently spilling to local disk (ADR-0013: budget exhaustion
+    // is an error, never a partial result, and no durability may depend on
+    // local disk). `DiskManagerMode::Disabled` is set explicitly here rather
+    // than by omission: leaving the disk manager unconfigured reinstates
+    // DataFusion's default `OsTmpDirectory` with a 100 GB ceiling, the silent
+    // behaviour ADR-0102 decision 3 exists to close.
+    let spill_on = config.spill.is_some() && spill_eligible;
     let runtime = RuntimeEnvBuilder::new()
         .with_memory_pool(pool)
         .with_object_store_registry(Arc::new(EmptyObjectStoreRegistry))
-        // ADR-0102 decision 3: disable spill so a query over the memory budget
-        // fails as a typed `ResourcesExhausted` error instead of silently
-        // spilling to local disk (which ADR-0013 forbids: budget exhaustion is
-        // an error, never a partial result, and no durability may depend on
-        // local disk). Without this the disk manager defaults to
-        // `OsTmpDirectory` with a 100 GB ceiling and routes around the pool's
-        // `try_grow` enforcement.
-        .with_disk_manager_builder(
-            DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled),
-        )
-        .build_arc()?;
+        .with_disk_manager_builder(disk_manager_builder(config, spill_eligible))
+        .build_arc()
+        // With spill on, the only new failure at build time is the disk
+        // manager creating/opening the configured scratch directory (an
+        // eager `create_local_dirs`); surface a missing, unwritable, or
+        // otherwise unusable directory as a typed `SpillUnavailable`
+        // (redacted for the client, full detail for the log) rather than a
+        // generic planning error. With spill off the disabled disk manager
+        // cannot fail here, so the mapping is a no-op on the unchanged path.
+        .map_err(|e| runtime_build_error(e, spill_on))?;
 
     // `SessionContext::new_with_config_rt` with one extra physical optimizer
     // rule. `DictionaryGroupKeysAsViews` keeps a `GROUP BY` over a declared
@@ -734,6 +782,7 @@ mod tests {
             &SqlConfig::default(),
             test_pool(),
             SessionTable::Spans(Arc::new(provider)),
+            false,
             false,
         )
         .expect("spans session builds");
@@ -1052,7 +1101,7 @@ mod tests {
             ("logs", logs_table(&store), set(["has_word"].iter())),
             ("spans", spans_table(&store), empty.clone()),
         ] {
-            let ctx = build_session(&SqlConfig::default(), test_pool(), table, false)
+            let ctx = build_session(&SqlConfig::default(), test_pool(), table, false, false)
                 .expect("session builds");
             let state = ctx.state();
             let reg_scalars = keys(state.scalar_functions().keys().cloned());
@@ -1130,6 +1179,7 @@ mod tests {
             test_pool(),
             logs_table(&store),
             false,
+            false,
         )
         .expect("logs session builds");
         assert!(
@@ -1141,6 +1191,7 @@ mod tests {
             &SqlConfig::default(),
             test_pool(),
             metrics_table(&store),
+            false,
             false,
         )
         .expect("metrics session builds");
