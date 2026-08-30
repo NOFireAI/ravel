@@ -19,6 +19,17 @@ ravel-catalog = { workspace = true }
 ravel-commit = { workspace = true }
 ravel-maintain = { workspace = true }
 ravel-promql = { workspace = true }
+# The MetricsBench PromQL corpus gate (ADR-0927 decision 5) checks every named
+# construct against `ravel_promql_difftest::scoring::REGISTRY`, the PromQL
+# analog of `ravel_sql::conformance::registry()`. A NEW dependency edge from
+# ravel-bench, and a path dependency: ravel-promql-difftest is not listed in the
+# workspace `[workspace.dependencies]`, so it is named by path and version here
+# exactly as the optional `ravel-sql` entry below is. Not optional and not a
+# dev-dependency: the corpus loads in the default build, and the generator bin
+# (`metricsbench_gen`) runs the gate, which a dev-dependency would be invisible
+# to. It is already a workspace member, so a `--workspace` build compiled it
+# before this edge existed too.
+ravel-promql-difftest = { path = "../ravel-promql-difftest", version = "0.11.0" }
 prost = { workspace = true }
 ravel-query = { workspace = true }
 tokio = { workspace = true }
@@ -201,6 +212,15 @@ name = "pushdown_crossover_bench"
 path = "src/bin/pushdown_crossover_bench.rs"
 bench = false
 
+# MetricsBench (ADR-0927, issue #933): gates the checked-in workload manifest
+# and PromQL corpus, then generates a profile's samples deterministically. In
+# the default feature set on purpose: it is the entry point that makes both
+# artifact gates reachable from a real caller.
+[[bin]]
+name = "metricsbench_gen"
+path = "src/bin/metricsbench_gen.rs"
+bench = false
+
 [[bin]]
 name = "segment_alloc_profile"
 path = "src/bin/segment_alloc_profile.rs"
@@ -364,6 +384,15 @@ bench = false
 name = "clickbench_corpus"
 path = "tests/clickbench_corpus.rs"
 required-features = ["sql-latency"]
+bench = false
+
+# Gate test for the checked-in MetricsBench artifacts (issue #933) under
+# `benchmarks/metrics/`, and the reachability proof that a corrupt artifact
+# fails through the `metricsbench_gen` binary rather than only through a direct
+# `gate_corpus` call.
+[[test]]
+name = "metricsbench_artifacts"
+path = "tests/metricsbench_artifacts.rs"
 bench = false
 
 [[test]]

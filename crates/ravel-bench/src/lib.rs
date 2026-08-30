@@ -15,7 +15,10 @@ pub mod harness;
 pub mod ingest;
 #[cfg(feature = "sql-latency")]
 pub mod logs_scan_scaling;
+pub mod metrics_gen;
+pub mod metrics_workload;
 pub mod profiling;
+pub mod promql_corpus;
 pub mod pushdown_crossover;
 pub mod query_latency;
 #[cfg(feature = "parquet-baseline")]

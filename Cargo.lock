@@ -4523,6 +4523,7 @@ dependencies = [
  "ravel-object-store",
  "ravel-otlp",
  "ravel-promql",
+ "ravel-promql-difftest",
  "ravel-proto",
  "ravel-query",
  "ravel-rspan",
