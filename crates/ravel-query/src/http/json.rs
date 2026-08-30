@@ -8,6 +8,7 @@ use ravel_types::{LabelSet, SeriesId};
 use serde::{Serialize, Serializer};
 
 use crate::http::error::ApiError;
+use crate::phase_accounting::{PhaseAccountingSnapshot, QueryPhase};
 
 #[derive(Serialize)]
 #[serde(tag = "status")]
@@ -98,6 +99,20 @@ pub struct QueryStatsJson {
     #[serde(rename = "segmentsPruned")]
     pub segments_pruned: u64,
     pub accounting: QueryAccountingJson,
+    /// The same GETs and bytes `accounting` pools, split across the four
+    /// phases of a query's object-store cost (issue #935, ADR-0927 decision 7;
+    /// the split itself is issue #796's `PhaseAccounting`, which until now
+    /// reached no reader outside the engine's own unit tests). One entry per
+    /// [`QueryPhase`], in [`QueryPhase::ALL`] order, each phase exactly once:
+    /// `resolve`, `plan`, `probe`, `scan`.
+    ///
+    /// Additive to `accounting`, never a replacement: every per-phase counter
+    /// here sums back to its pooled counterpart there, so a consumer reading
+    /// only `accounting` sees exactly the numbers it saw before this field
+    /// existed. The phases are what make a cost attributable -- a pooled GET
+    /// count cannot say whether a query spent its requests resolving the
+    /// catalog snapshot or scanning pages.
+    pub phases: Vec<PhaseCostJson>,
     pub estimate: CostEstimateJson,
     /// True when at least one federated remote cluster was skipped because it
     /// was unavailable and its `skip_unavailable` opt-in was set
@@ -121,6 +136,7 @@ impl From<crate::QueryStats> for QueryStatsJson {
             segments_fetched: stats.segments_fetched,
             segments_pruned: stats.segments_pruned,
             accounting: QueryAccountingJson::from_snapshot(&stats.accounting, &stats.page_stats),
+            phases: phase_costs(&stats.phase_accounting),
             estimate: stats.estimate.into(),
             partial: stats.partial,
             warnings: stats.warnings.clone(),
@@ -200,6 +216,121 @@ impl QueryAccountingJson {
             raw_f64_bytes: page_stats.raw_f64_bytes,
         }
     }
+}
+
+/// One [`QueryPhase`]'s share of a query's cost, rendered as one element of
+/// `stats.phases` (issue #935).
+///
+/// # Which bytes each byte figure counts
+///
+/// Every byte field names its own kind, because figures of different kinds
+/// cannot be compared with each other or summed together: wire bytes are what
+/// the network moved, cache-served bytes never crossed the wire at all, and
+/// decompressed bytes are a decode-time output size that no request paid for.
+/// Each field's doc comment below names its kind, whether retries and range
+/// reads are included, and its pooled counterpart under `stats.accounting`.
+///
+/// # Which counters are here, and which are deliberately absent
+///
+/// `stats.accounting` renders four counters this per-phase block does not,
+/// because they are structurally dead on a PromQL query and a per-phase zero
+/// would read as a measurement rather than as an absence (ADR-0927 decision
+/// 7): `s3HeadRequests`/`s3HeadBytes` (`AccountedOp::Head` is recorded
+/// nowhere on this path), `s3ListBytes` (`Catalog::guarded_list_all` counts
+/// the LIST request but no bytes for it), and `peakIntermediateBytes` (SQL
+/// executor only). They keep their pooled fields; they gain no phase fields.
+#[derive(Debug, Serialize)]
+pub struct PhaseCostJson {
+    /// The phase, as [`QueryPhase::name`] spells it: `resolve` (catalog
+    /// snapshot resolve), `plan` (footer and skip-index probing to build a
+    /// fetch plan), `probe` (segment catalog fetch), or `scan` (block, page,
+    /// and chunk data reads). See `crate::phase_accounting`'s module docs for
+    /// the full phase boundaries.
+    pub phase: &'static str,
+    /// GET requests this phase issued. A LOGICAL call count, not a billed
+    /// request count: `object_store` retries beneath `InstrumentedStore`, so
+    /// one GET that retried nine times counts once here while S3 bills ten
+    /// (ADR-0927 decision 8). Pooled counterpart: `accounting.s3GetRequests`.
+    #[serde(rename = "s3GetRequests")]
+    pub s3_get_requests: u64,
+    /// WIRE bytes this phase's GETs transferred: the byte length of each
+    /// successful response body, summed. Range reads are included and count
+    /// only the bytes their range returned; a coalesced run's unwanted
+    /// in-between bytes are included, because the wire carried them. A retried
+    /// GET's failed attempts are NOT included -- the counter is written once,
+    /// from the response that succeeded. Never stored bytes, never
+    /// decompressed bytes, never cache-served bytes. Pooled counterpart:
+    /// `accounting.s3GetBytes`.
+    #[serde(rename = "s3GetWireBytes")]
+    pub s3_get_wire_bytes: u64,
+    /// LIST requests this phase issued, on the same logical-call basis as
+    /// [`Self::s3_get_requests`]. Pooled counterpart:
+    /// `accounting.s3ListRequests`. There is deliberately no per-phase LIST
+    /// byte figure: nothing records LIST bytes.
+    #[serde(rename = "s3ListRequests")]
+    pub s3_list_requests: u64,
+    /// In-process cache lookups this phase served from cache.
+    #[serde(rename = "cacheHits")]
+    pub cache_hits: u64,
+    /// In-process cache lookups this phase had to fetch.
+    #[serde(rename = "cacheMisses")]
+    pub cache_misses: u64,
+    /// Bytes this phase's cache hits served. These bytes NEVER crossed the
+    /// wire, so they are not part of [`Self::s3_get_wire_bytes`] and must not
+    /// be added to it: a warm query moves cache-served bytes and no wire
+    /// bytes. Pooled counterpart: `accounting.cacheBytes`.
+    #[serde(rename = "cacheServedBytes")]
+    pub cache_served_bytes: u64,
+    /// DECOMPRESSED bytes: the typed-output footprint of every sample this
+    /// phase decoded, whatever the encoding. A decode-time output size that no
+    /// request paid for, so it is comparable neither with
+    /// [`Self::s3_get_wire_bytes`] nor with [`Self::cache_served_bytes`]. By
+    /// convention this lands on the `scan` phase, since decode always follows
+    /// a scan in this crate's fetch pipelines. Pooled counterpart:
+    /// `accounting.decompressedBytes`.
+    #[serde(rename = "decompressedOutputBytes")]
+    pub decompressed_output_bytes: u64,
+    /// Bytes this phase served from a region the fetcher had ALREADY fetched,
+    /// without issuing a second GET. Wire bytes that were avoided, not wire
+    /// bytes that were moved: they are absent from
+    /// [`Self::s3_get_wire_bytes`] by construction (no request carried them)
+    /// and adding the two would double-count the first fetch. Pooled
+    /// counterpart: `accounting.bytesReused`.
+    #[serde(rename = "reusedRegionBytes")]
+    pub reused_region_bytes: u64,
+    /// Segments this phase opened.
+    #[serde(rename = "segmentsOpened")]
+    pub segments_opened: u64,
+    /// Series this phase's catalog decode matched.
+    #[serde(rename = "seriesMatched")]
+    pub series_matched: u64,
+}
+
+/// One entry per [`QueryPhase`], in [`QueryPhase::ALL`] order, each phase
+/// exactly once. Driven off `ALL` rather than a hand-written list of four so a
+/// phase added to the enum cannot be silently dropped from the response, the
+/// same reason `ravel-bench`'s `sql_latency::phase_wire_bytes` is built this
+/// way (issue #913).
+fn phase_costs(snapshot: &PhaseAccountingSnapshot) -> Vec<PhaseCostJson> {
+    QueryPhase::ALL
+        .iter()
+        .map(|phase| {
+            let s = snapshot.phase(*phase);
+            PhaseCostJson {
+                phase: phase.name(),
+                s3_get_requests: s.s3_requests(AccountedOp::Get),
+                s3_get_wire_bytes: s.s3_bytes(AccountedOp::Get),
+                s3_list_requests: s.s3_requests(AccountedOp::List),
+                cache_hits: s.cache_hits,
+                cache_misses: s.cache_misses,
+                cache_served_bytes: s.cache_bytes,
+                decompressed_output_bytes: s.decompressed_bytes,
+                reused_region_bytes: s.bytes_reused,
+                segments_opened: s.segments_opened,
+                series_matched: s.series_matched,
+            }
+        })
+        .collect()
 }
 
 /// Upper-envelope cost estimate (ADR-0044 decision 3), rendered under
