@@ -357,16 +357,22 @@ and the CAS read/write helpers.
   fold the same input independently write the same key and
   `PutMode::CreateIfAbsent` `AlreadyExists` is idempotent success, exactly
   like data objects (ADR-0010 §7).
-- Superseded snapshot parts (`catalog/<signal>/snap/`) and name-postings
-  objects (`catalog/<signal>/idx/`) are swept by
+- Superseded snapshot parts (`catalog/<signal>/snap/`) and name-postings and
+  column-statistics objects (`catalog/<signal>/idx/`) are swept by
   `ravel_maintain::sweep::sweep_unreferenced_catalog_objects`, the fifth GC
   sweep rule alongside orphan GC, the
   superseded-input and unreferenced-part sweeps, and the idempotency-marker
   sweep. Every fold that rewrites a part or postings object writes a new
   content-addressed key and swaps HEAD, leaving the old object in place (the
   "orphan part" crash case); without this rule each such fold leaks one object. The rule LISTs the two
-  prefixes first, then GETs the current `catalog/<signal>/HEAD`, treats every
-  `parts[].key` and the optional `postings.key` as referenced, and deletes any
+  prefixes first, then GETs the current `catalog/<signal>/HEAD` and treats
+  every key `ravel_catalog::head_referenced_keys` derives from it as
+  referenced: `parts[].key`, the optional `postings.key`, and the optional
+  `column_stats.key` (field 11) and `column_stats_part.key` (field 13). That
+  set is derived by exhaustively destructuring `SnapshotHead`, not listed by
+  the sweeper, so a reference field added later is protected without an edit
+  to the sweep (a hand-maintained set omitted the `.cstat` refs and deleted
+  live column statistics; issue #958). It deletes any
   object under the two prefixes that HEAD does not name once its
   `last_modified` age exceeds `CompactorConfig::protection_horizon_ns`. A fresh
   re-verify GET of HEAD is taken immediately before the delete loop (the same

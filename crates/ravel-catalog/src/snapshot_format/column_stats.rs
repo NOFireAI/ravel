@@ -75,9 +75,16 @@ pub fn encode_column_stats(
 /// Encodes a **v2** (ADR-0942, part-hash-keyed) column-statistics object, the
 /// `SnapshotHead.column_stats_part` (field 13) artifact. Each segment record
 /// must carry its covered part's content hash (blake3) in its `writer_id` slot
-/// as 32 bytes; records are sorted and deduplicated by that hash, not the
-/// five-field identity tuple, so L0 and L1 parts are named uniformly and two L1
-/// parts of one bucket never collide. Stamps [`COLUMN_STATS_WRITE_VERSION`].
+/// as 32 bytes; the records' key is that hash, not the five-field identity
+/// tuple, so L0 and L1 parts are named uniformly and two L1 parts of one bucket
+/// never collide. Stamps [`COLUMN_STATS_WRITE_VERSION`].
+///
+/// Like [`encode_column_stats`] this VALIDATES the caller's ordering, it does
+/// not impose it: `segments` must already be sorted by that hash and free of
+/// duplicates, or the call fails. Sorting here instead would silently repair a
+/// caller that built two records for one part, and a duplicate is a build bug
+/// worth surfacing (the caller decides which record wins); the callee also
+/// takes a borrowed slice and could not reorder it in place.
 pub fn encode_column_stats_v2(
     tenant_hash: [u8; 16],
     signal: u32,
@@ -259,11 +266,11 @@ pub fn decode_column_stats(
 /// `version` selects the segment key model (ADR-0942). Both models key on
 /// `writer_id` (field 3), differing in width and meaning:
 /// - v1 (`version < 2`): the 16-byte flush-writer uuid, one component of the
-///   five-field identity tuple the records are sorted and deduplicated by.
+///   five-field identity tuple the records must be sorted by and unique under.
 /// - v2 (`version >= 2`): the covered part's 32-byte content hash (blake3),
 ///   which the writer carries in the same slot an L1 `SnapshotEntry` already
-///   repurposes for a 32-byte hash. Records are sorted and deduplicated by that
-///   hash alone; the remaining tuple fields are informational.
+///   repurposes for a 32-byte hash. Records must be sorted by that hash alone
+///   and unique under it; the remaining tuple fields are informational.
 ///
 /// Requiring the exact width per version is what makes a v1 object encountered
 /// under field 13, or a v2 object under field 11, self-evidently wrong to a
@@ -980,8 +987,9 @@ mod tests {
         assert_eq!(err, SnapshotFormatError::ColumnStatsDuplicateSegment);
     }
 
-    /// v2 records not sorted by their content hash are rejected (the encoder
-    /// sorts; the decoder enforces).
+    /// v2 records not sorted by their content hash are rejected: both the
+    /// encoder (defensively, over caller input) and the decoder (over
+    /// untrusted bytes) enforce the order; neither imposes it.
     #[test]
     fn v2_unsorted_by_content_hash_rejected() {
         let mut a = segment(1, 0, 1);

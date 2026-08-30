@@ -47,11 +47,15 @@
 //!    never fatal: the prefix is additive, so the `c/`-prefix fail-loud
 //!    unknown-shape rule (rules 1-3) does not apply to it.
 //! 5. **Unreferenced catalog-object sweep**: a snapshot part under
-//!    `t/<tenant_hash>/catalog/<signal>/snap/` or a name-postings object under
-//!    the sibling `.../idx/` prefix that the current
-//!    `.../catalog/<signal>/HEAD` does not name (neither a `parts[].key` nor
-//!    the optional `postings.key`), once the object's `last_modified` age
-//!    exceeds the protection horizon. Every fold that rewrites a part or
+//!    `t/<tenant_hash>/catalog/<signal>/snap/` or a name-postings or
+//!    column-statistics object under the sibling `.../idx/` prefix that the
+//!    current `.../catalog/<signal>/HEAD` does not name, once the object's
+//!    `last_modified` age exceeds the protection horizon. The protected set is
+//!    every key [`ravel_catalog::head_referenced_keys`] derives from the HEAD,
+//!    which is the whole point of deriving it: it covers `parts[].key`, the
+//!    optional `postings.key`, and both `.cstat` refs (`column_stats.key`,
+//!    `column_stats_part.key`), and a reference field added later is covered
+//!    without an edit here. Every fold that rewrites a part or
 //!    postings object supersedes the old one by writing a new
 //!    content-addressed key and swapping HEAD; the superseded object is left
 //!    in place (plan 4 step 8, the "orphan part" crash-matrix row) and leaks
@@ -1157,8 +1161,9 @@ pub async fn sweep_unreferenced_catalog_objects(
     let mut kept = 0usize;
     let mut candidates: Vec<ObjectMeta> = Vec::new();
     for meta in listed {
-        // Named by the current HEAD: a live part or the live postings object.
-        // Never delete; this is the whole safety property.
+        // Named by the current HEAD: a live part, the live postings object, or
+        // a live column-statistics object. Never delete; this is the whole
+        // safety property.
         if referenced.contains(&meta.key) {
             kept += 1;
             continue;
@@ -1219,8 +1224,8 @@ pub async fn sweep_unreferenced_catalog_objects(
 /// present but undecodable HEAD is not represented here at all, because
 /// [`read_head_reference`] fails the whole pass on it (fail-closed).
 enum HeadReference {
-    /// HEAD is present and decoded: the set of keys it names (every
-    /// `parts[].key` plus the optional `postings.key`).
+    /// HEAD is present and decoded: every key it names, as
+    /// [`ravel_catalog::head_referenced_keys`] derives it.
     Present(HashSet<String>),
     /// HEAD is absent. There is no anchor to compare against, so rule 5 sweeps
     /// nothing for this (tenant, signal) (a fold rebuilding from no HEAD adopts
@@ -1246,15 +1251,17 @@ async fn read_head_reference(
                      nothing this pass rather than treating a live snapshot as unreferenced"
                 ))
             })?;
-            let mut referenced =
-                HashSet::with_capacity(head.parts.len() + usize::from(head.postings.is_some()));
-            for part in &head.parts {
-                referenced.insert(part.key.clone());
-            }
-            if let Some(postings) = &head.postings {
-                referenced.insert(postings.key.clone());
-            }
-            Ok(HeadReference::Present(referenced))
+            // Derived from the HEAD's reference fields by
+            // `ravel_catalog::head_referenced_keys`, never listed here: that
+            // function destructures `SnapshotHead` exhaustively, so a new
+            // reference field cannot be added without a compile error there,
+            // and this rule then protects it by construction. The
+            // hand-maintained set this replaced named only `parts[].key` and
+            // `postings.key`, which made every live field-11 `.cstat` object
+            // sweepable (issue #958).
+            Ok(HeadReference::Present(ravel_catalog::head_referenced_keys(
+                &head,
+            )))
         }
         Err(StoreError::NotFound) => Ok(HeadReference::Absent),
         Err(e) => Err(MaintainError::Store(e)),
@@ -1559,7 +1566,10 @@ mod tests {
         FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
     };
     use ravel_object_store::memory::MemoryStore;
-    use ravel_proto::catalog::v1::{SnapshotHead, SnapshotPartRef, SnapshotPostingsRef};
+    use ravel_proto::catalog::v1::{
+        SnapshotColumnStatsPartRef, SnapshotColumnStatsRef, SnapshotHead, SnapshotPartRef,
+        SnapshotPostingsRef,
+    };
     use ravel_types::TenantId;
 
     use super::*;
@@ -2167,6 +2177,20 @@ mod tests {
         parts: Vec<SnapshotPartRef>,
         postings: Option<SnapshotPostingsRef>,
     ) {
+        put_head_full(store, tenant, signal, parts, postings, None, None).await;
+    }
+
+    /// [`put_head`] with the two `.cstat` refs as well: field 11 (ADR-0850,
+    /// L0-tuple-keyed) and field 13 (ADR-0942, part-keyed).
+    async fn put_head_full(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        signal: Signal,
+        parts: Vec<SnapshotPartRef>,
+        postings: Option<SnapshotPostingsRef>,
+        column_stats: Option<SnapshotColumnStatsRef>,
+        column_stats_part: Option<SnapshotColumnStatsPartRef>,
+    ) {
         let watermark_hour = parts.iter().map(|p| p.watermark_hour).max().unwrap_or(0);
         let head = SnapshotHead {
             format_version: 1,
@@ -2178,8 +2202,8 @@ mod tests {
             folder_id: vec![0u8; 16],
             created_unix_ns: 0,
             postings,
-            column_stats: None,
-            column_stats_part: None,
+            column_stats,
+            column_stats_part,
             shard_generation_count: 1,
         };
         let bytes = ravel_catalog::encode_head(&head).expect("valid HEAD encodes");
@@ -2368,6 +2392,100 @@ mod tests {
         assert!(
             !present(&store, &stale_postings).await,
             "an old unreferenced postings object must be swept"
+        );
+        assert!(
+            present(&store, &part).await,
+            "the HEAD-named part is spared"
+        );
+    }
+
+    /// Issue #958: a `.cstat` column-statistics object the HEAD names is live
+    /// and must survive the sweep, for BOTH refs -- field 11 (ADR-0850) and
+    /// field 13 (ADR-0942). `.cstat` objects sit under the same `idx/` prefix
+    /// the postings objects do, so rule 5 lists them; before
+    /// `head_referenced_keys` the protected set was built from `parts[].key`
+    /// and `postings.key` alone, so both were deleted once past the horizon.
+    /// The failure was silent: a missing `.cstat` falls back to scanning
+    /// (ADR-0850's safety lemma), so it cost coverage, never an error.
+    #[tokio::test]
+    async fn catalog_sweep_spares_referenced_column_stats() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let store = MemoryStore::new();
+        let config = CompactorConfig::default();
+        let now_ns = config.protection_horizon_ns.saturating_mul(2);
+
+        // Everything is seeded at store clock 0, so every object is older than
+        // the protection horizon and the age gate spares none of them: what
+        // survives, survives because the HEAD names it.
+        let part_blake3 = [7u8; 32];
+        let part = format!(
+            "{}20260101T00.aaaa.csnap",
+            catalog_snap_prefix(&tenant, signal)
+        );
+        let referenced_v1 = format!(
+            "{}20260101T00.1111.cstat",
+            catalog_idx_prefix(&tenant, signal)
+        );
+        let referenced_v2 = format!(
+            "{}20260101T00.2222.cstat",
+            catalog_idx_prefix(&tenant, signal)
+        );
+        let superseded = format!(
+            "{}20251231T00.3333.cstat",
+            catalog_idx_prefix(&tenant, signal)
+        );
+        for key in [&part, &referenced_v1, &referenced_v2, &superseded] {
+            put_catalog_object(&store, key).await;
+        }
+        put_head_full(
+            &store,
+            &tenant,
+            signal,
+            vec![part_ref(&part, part_blake3)],
+            None,
+            Some(SnapshotColumnStatsRef {
+                key: referenced_v1.clone(),
+                blake3: [8u8; 32].to_vec(),
+                size: 1,
+                segment_count: 1,
+                part_blake3: vec![part_blake3.to_vec()],
+            }),
+            Some(SnapshotColumnStatsPartRef {
+                key: referenced_v2.clone(),
+                blake3: [9u8; 32].to_vec(),
+                size: 1,
+                segment_count: 1,
+                part_blake3: vec![part_blake3.to_vec()],
+            }),
+        )
+        .await;
+
+        let clock = FixedClock::new(now_ns);
+        let outcome =
+            sweep_unreferenced_catalog_objects(&store, &clock, &config, &NoLeases, &tenant, signal)
+                .await
+                .expect("sweep must succeed");
+
+        assert_eq!(
+            outcome.deleted, 1,
+            "only the superseded .cstat is unreferenced"
+        );
+        assert_eq!(
+            outcome.kept, 3,
+            "the part and both HEAD-named .cstat objects are kept"
+        );
+        assert!(
+            present(&store, &referenced_v1).await,
+            "the field-11 .cstat the HEAD names must be spared"
+        );
+        assert!(
+            present(&store, &referenced_v2).await,
+            "the field-13 .cstat the HEAD names must be spared"
+        );
+        assert!(
+            !present(&store, &superseded).await,
+            "a .cstat no HEAD ref names is still collected"
         );
         assert!(
             present(&store, &part).await,

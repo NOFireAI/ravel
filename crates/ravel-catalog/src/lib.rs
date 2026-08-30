@@ -72,7 +72,7 @@ pub use snapshot_format::{
     DEFAULT_MAX_POSTINGS_BYTES, DEFAULT_MAX_SNAPSHOT_PART_BYTES, DecodedColumnStats, DecodedPart,
     DecodedPostings, HEAD_FORMAT_VERSION, MAGIC, NamePostings, PartLimits, PostingsLimits,
     SnapshotFormatError, VERSION, decode_column_stats, decode_head, decode_part, decode_postings,
-    encode_column_stats, encode_head, encode_part, encode_postings,
+    encode_column_stats, encode_head, encode_part, encode_postings, head_referenced_keys,
 };
 pub use tenant_config::{
     DeclaredColumnType, DeclaredTypedColumn, FIXED_LOGS_SQL_COLUMNS,

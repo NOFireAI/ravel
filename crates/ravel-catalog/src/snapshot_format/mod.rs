@@ -14,7 +14,7 @@ pub use column_stats::{
     DecodedColumnStats, decode_column_stats, encode_column_stats, encode_column_stats_v2,
 };
 pub use error::SnapshotFormatError;
-pub use head::{HEAD_FORMAT_VERSION, decode_head, encode_head};
+pub use head::{HEAD_FORMAT_VERSION, decode_head, encode_head, head_referenced_keys};
 pub use part::{DecodedPart, decode_part, encode_part, encode_part_ranged};
 pub use postings::{
     DecodedPostings, NamePostings, decode_postings, encode_postings, postings_declared_tenant_hash,

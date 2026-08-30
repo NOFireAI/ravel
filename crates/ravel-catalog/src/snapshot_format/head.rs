@@ -1,6 +1,8 @@
 //! HEAD record: small, mutable, CAS-updated; bare protobuf (like commit
 //! records), no envelope.
 
+use std::collections::HashSet;
+
 use prost::Message;
 use ravel_proto::catalog::v1::SnapshotHead;
 
@@ -23,6 +25,41 @@ pub fn decode_head(bytes: &[u8]) -> Result<SnapshotHead, SnapshotFormatError> {
         SnapshotHead::decode(bytes).map_err(|e| SnapshotFormatError::HeadDecode(e.to_string()))?;
     validate_head(&head)?;
     Ok(head)
+}
+
+/// Every object key `head` references: the set a garbage collector must treat
+/// as live. Deleting a key in this set breaks the snapshot the HEAD publishes,
+/// so anything that decides reachability from a HEAD derives it here rather
+/// than listing the reference fields itself.
+///
+/// The exhaustive destructuring below carries the invariant: it has no `..`
+/// rest pattern, so adding a field to `SnapshotHead` stops this function
+/// compiling until the new field is classified as a reference (contributing
+/// its key) or as not one (bound to `_`). A hand-maintained list in a caller
+/// gives a silent wrong answer instead, which for a sweeper means deleting a
+/// live object.
+pub fn head_referenced_keys(head: &SnapshotHead) -> HashSet<String> {
+    let SnapshotHead {
+        format_version: _,
+        tenant_hash: _,
+        signal: _,
+        shard_count: _,
+        watermark_hour: _,
+        parts,
+        folder_id: _,
+        created_unix_ns: _,
+        postings,
+        shard_generation_count: _,
+        column_stats,
+        column_stats_part,
+    } = head;
+
+    let mut keys = HashSet::with_capacity(parts.len() + 3);
+    keys.extend(parts.iter().map(|part| part.key.clone()));
+    keys.extend(postings.iter().map(|postings| postings.key.clone()));
+    keys.extend(column_stats.iter().map(|stats| stats.key.clone()));
+    keys.extend(column_stats_part.iter().map(|stats| stats.key.clone()));
+    keys
 }
 
 fn validate_head(head: &SnapshotHead) -> Result<(), SnapshotFormatError> {
@@ -168,4 +205,89 @@ fn validate_head(head: &SnapshotHead) -> Result<(), SnapshotFormatError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use ravel_proto::catalog::v1::{
+        SnapshotColumnStatsPartRef, SnapshotColumnStatsRef, SnapshotPartRef, SnapshotPostingsRef,
+    };
+
+    use super::*;
+
+    fn part(key: &str, blake3: u8, min_hour: u32, watermark_hour: u32) -> SnapshotPartRef {
+        SnapshotPartRef {
+            key: key.to_string(),
+            blake3: vec![blake3; 32],
+            size: 1,
+            entry_count: 1,
+            watermark_hour,
+            min_hour,
+        }
+    }
+
+    fn head(parts: Vec<SnapshotPartRef>) -> SnapshotHead {
+        SnapshotHead {
+            format_version: HEAD_FORMAT_VERSION,
+            tenant_hash: vec![0x11; 16],
+            signal: 0,
+            shard_count: 1,
+            watermark_hour: 10,
+            parts,
+            folder_id: vec![0x22; 16],
+            created_unix_ns: 0,
+            postings: None,
+            shard_generation_count: 1,
+            column_stats: None,
+            column_stats_part: None,
+        }
+    }
+
+    /// A head naming every kind of reference contributes EXACTLY one key per
+    /// reference and nothing else. The equality against the full expected set
+    /// is the point: a missing key means a garbage collector deletes a live
+    /// object, an extra one means it never collects a real orphan.
+    #[test]
+    fn referenced_keys_are_every_reference_and_only_those() {
+        let mut h = head(vec![part("snap/a", 1, 0, 5), part("snap/b", 2, 6, 10)]);
+        h.postings = Some(SnapshotPostingsRef {
+            key: "idx/p".to_string(),
+            blake3: vec![3; 32],
+            size: 1,
+            name_count: 1,
+            part_blake3: vec![vec![1; 32], vec![2; 32]],
+        });
+        h.column_stats = Some(SnapshotColumnStatsRef {
+            key: "idx/v1.cstat".to_string(),
+            blake3: vec![4; 32],
+            size: 1,
+            segment_count: 1,
+            part_blake3: vec![vec![1; 32], vec![2; 32]],
+        });
+        h.column_stats_part = Some(SnapshotColumnStatsPartRef {
+            key: "idx/v2.cstat".to_string(),
+            blake3: vec![5; 32],
+            size: 1,
+            segment_count: 1,
+            part_blake3: vec![vec![1; 32], vec![2; 32]],
+        });
+        encode_head(&h).expect("the fixture is a valid head");
+
+        let expected: HashSet<String> =
+            ["snap/a", "snap/b", "idx/p", "idx/v1.cstat", "idx/v2.cstat"]
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+        assert_eq!(head_referenced_keys(&h), expected);
+    }
+
+    /// Absent optional references contribute nothing: the set is exactly the
+    /// part keys.
+    #[test]
+    fn referenced_keys_of_a_parts_only_head_are_the_part_keys() {
+        let h = head(vec![part("snap/a", 1, 0, 10)]);
+        let expected: HashSet<String> = ["snap/a".to_string()].into_iter().collect();
+        assert_eq!(head_referenced_keys(&h), expected);
+    }
 }
