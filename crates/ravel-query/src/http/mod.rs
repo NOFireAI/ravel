@@ -171,6 +171,11 @@ mod tests {
     //! `tower::ServiceExt::oneshot`, and the rendered `histograms` field is
     //! asserted in full. A unit test on the encoder alone cannot show that a
     //! range request actually reaches it; this does.
+    //!
+    //! The per-phase cost split (issue #935) is proven the same way: a scalar
+    //! segment is published, queried through the same router, and every phase's
+    //! every figure is asserted at the exact value the fixture produces, on both
+    //! endpoints that render a stats block.
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -186,9 +191,9 @@ mod tests {
     use ravel_object_store::memory::MemoryStore;
     use ravel_segment::{
         HistogramCounts, HistogramSample, HistogramSpan, HistogramValue, IngestBounds, ResetHint,
-        SegmentIdentity, SegmentWriter, SeriesInputV3, SeriesValues, WrittenSegment,
+        SegmentIdentity, SegmentWriter, SeriesInput, SeriesInputV3, SeriesValues, WrittenSegment,
     };
-    use ravel_types::{Label, LabelSet, SeriesId, Signal, TenantId};
+    use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal, TenantId};
     use serde_json::Value as JsonValue;
     use tower::ServiceExt;
     use uuid::Uuid;
@@ -237,6 +242,245 @@ mod tests {
             },
             reset_hint: ResetHint::Unknown,
         }
+    }
+
+    /// Publishes one RSEG segment carrying a single scalar series with two
+    /// samples (at `now - 4min` and `now - 2min`) and returns a router serving
+    /// it, plus the tenant's bearer token. The per-phase cost of a query over
+    /// this fixture is deterministic: one segment, one series, one shard, so
+    /// every phase's request count is a fixed number the caller can name.
+    async fn scalar_fixture_router(tenant: &str, metric: &str, now: i64) -> Router {
+        let store = Arc::new(MemoryStore::new());
+        let tenant_id = TenantId::new(tenant.to_string());
+        let tenant_hash = tenant_id.hash();
+        let hour_bucket = u32::try_from(now / NS_PER_HOUR).expect("hour bucket");
+
+        let labels = LabelSet::new(vec![Label {
+            name: "__name__".to_string(),
+            value: metric.to_string(),
+        }])
+        .expect("valid labels");
+        let series_id = SeriesId::compute(&tenant_id, metric, &labels).expect("series id");
+        let series = vec![SeriesInput {
+            series_id,
+            labels,
+            samples: vec![
+                Sample {
+                    ts_ns: now - 4 * NS_PER_MIN,
+                    value: 1.0,
+                },
+                Sample {
+                    ts_ns: now - 2 * NS_PER_MIN,
+                    value: 2.0,
+                },
+            ],
+        }];
+
+        let writer_id = Uuid::new_v4();
+        let identity = SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard: 0,
+            writer_id: writer_id.to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 0,
+        };
+        let written: WrittenSegment =
+            SegmentWriter::write(series, identity, bounds).expect("write segment");
+
+        let new_record = NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            object_size: written.bytes.len() as u64,
+            content_hash: written.summary.blake3,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns: written.summary.min_event_ts_ns,
+            max_ingest_ts_ns: written.summary.max_event_ts_ns,
+            segment_format_version: 1,
+            created_unix_ns: now,
+            ingest_hour_bucket: hour_bucket,
+        };
+        let rec = record::build(new_record).expect("valid commit record");
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+        publish::put_data_object(backend.as_ref(), &data_key, written.bytes)
+            .await
+            .expect("put data object");
+        publish::publish(backend.as_ref(), &rec, &RetryPolicy::default())
+            .await
+            .expect("publish");
+
+        let mut tokens = HashMap::new();
+        tokens.insert("secret-phases".to_string(), tenant_id);
+        let catalog =
+            Arc::new(Catalog::new(backend.clone(), CatalogConfig::default()).expect("catalog"));
+        let engine = Arc::new(QueryEngine::new(catalog, backend, EngineConfig::default()));
+        let state = AppState::new(engine, Arc::new(StaticBearerTokenResolver::new(tokens)));
+        router(state)
+    }
+
+    async fn get_json(app: Router, uri: &str) -> (StatusCode, JsonValue) {
+        let request = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("authorization", "Bearer secret-phases")
+            .body(Body::empty())
+            .expect("build request");
+        let response = match app.oneshot(request).await {
+            Ok(response) => response,
+            Err(never) => match never {},
+        };
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json: JsonValue = serde_json::from_slice(&body).expect("parse json");
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn instant_query_endpoint_serves_the_per_phase_cost_split() {
+        // Endpoint-level reachability proof for issue #935: the per-phase cost
+        // split is not merely renderable, it is what a caller of the production
+        // router actually receives on `/api/v1/query`. Every figure is pinned to
+        // an exact expected value: over this one-segment, one-series, one-shard
+        // fixture each phase's request count is a fixed number.
+        let now = (now_ns() / NS_PER_MIN) * NS_PER_MIN;
+        let app = scalar_fixture_router("tenant-phases", "bench_gauge", now).await;
+        let time = (now - 2 * NS_PER_MIN) / NS_PER_SEC;
+        let (status, json) =
+            get_json(app, &format!("/api/v1/query?query=bench_gauge&time={time}")).await;
+        assert_eq!(status, StatusCode::OK, "body: {json}");
+        assert_eq!(json["status"], "success", "body: {json}");
+        // The query returned the sample, so the phases below describe a real
+        // read and not an empty result that touched nothing.
+        assert_eq!(json["data"]["resultType"], "vector", "body: {json}");
+        assert_eq!(
+            json["data"]["result"][0]["value"],
+            serde_json::json!([time, "2"]),
+            "body: {json}"
+        );
+
+        let stats = &json["data"]["stats"];
+        let phases = stats["phases"].as_array().expect("phases array present");
+        assert_eq!(phases.len(), 4, "four phases, body: {json}");
+        let names: Vec<&str> = phases
+            .iter()
+            .map(|p| p["phase"].as_str().expect("phase name"))
+            .collect();
+        assert_eq!(names, vec!["resolve", "plan", "probe", "scan"]);
+
+        // Every phase's every figure, at the exact value this fixture produces.
+        // What the split buys is visible in these rows and in no pooled total:
+        // the two catalog GETs are `resolve`, the segment's one whole-object
+        // read is `plan`, and `probe`/`scan` issue no request at all because
+        // they are served from the region the plan read already fetched
+        // (`reusedRegionBytes`). Wire bytes, cache-served bytes, reused bytes,
+        // and decompressed bytes are four different quantities here and the
+        // rows keep them apart.
+        let want = [
+            // phase, gets, wire bytes, lists, hits, misses, cache bytes,
+            // decompressed, reused, opened, matched
+            ("resolve", 2, 288, 2, 1, 2, 288, 0, 0, 0, 0),
+            ("plan", 1, 341, 0, 0, 0, 0, 0, 0, 1, 0),
+            ("probe", 0, 0, 0, 0, 0, 0, 0, 102, 0, 1),
+            ("scan", 0, 0, 0, 0, 0, 0, 32, 25, 0, 0),
+        ];
+        for (row, expect) in phases.iter().zip(want) {
+            let (
+                name,
+                gets,
+                wire_bytes,
+                lists,
+                hits,
+                misses,
+                cache_bytes,
+                decompressed,
+                reused,
+                opened,
+                matched,
+            ) = expect;
+            assert_eq!(row["phase"], name);
+            assert_eq!(row["s3GetRequests"], gets, "{name} s3GetRequests");
+            assert_eq!(row["s3GetWireBytes"], wire_bytes, "{name} s3GetWireBytes");
+            assert_eq!(row["s3ListRequests"], lists, "{name} s3ListRequests");
+            assert_eq!(row["cacheHits"], hits, "{name} cacheHits");
+            assert_eq!(row["cacheMisses"], misses, "{name} cacheMisses");
+            assert_eq!(
+                row["cacheServedBytes"], cache_bytes,
+                "{name} cacheServedBytes"
+            );
+            assert_eq!(
+                row["decompressedOutputBytes"], decompressed,
+                "{name} decompressedOutputBytes"
+            );
+            assert_eq!(row["reusedRegionBytes"], reused, "{name} reusedRegionBytes");
+            assert_eq!(row["segmentsOpened"], opened, "{name} segmentsOpened");
+            assert_eq!(row["seriesMatched"], matched, "{name} seriesMatched");
+        }
+
+        // The pooled block a pre-#935 consumer reads is unchanged and is
+        // exactly the sum of the rows above: 2 + 1 GETs, 288 + 341 wire bytes.
+        assert_eq!(stats["accounting"]["s3GetRequests"], 3);
+        assert_eq!(stats["accounting"]["s3GetBytes"], 629);
+        assert_eq!(stats["accounting"]["s3ListRequests"], 2);
+        assert_eq!(stats["accounting"]["bytesReused"], 127);
+        assert_eq!(stats["accounting"]["decompressedBytes"], 32);
+        assert_eq!(stats["segmentsFetched"], 1);
+    }
+
+    #[tokio::test]
+    async fn range_query_endpoint_also_serves_the_per_phase_cost_split() {
+        // The split rides on `QueryStatsJson`, so it reaches both endpoints
+        // that render a stats block. Same fixture, same exact figures: a range
+        // query over the same single segment reads it the same way, so a
+        // divergence here would mean one endpoint renders the split and the
+        // other does not.
+        let now = (now_ns() / NS_PER_MIN) * NS_PER_MIN;
+        let app = scalar_fixture_router("tenant-phases", "bench_gauge", now).await;
+        let start = (now - 4 * NS_PER_MIN) / NS_PER_SEC;
+        let end = (now - 2 * NS_PER_MIN) / NS_PER_SEC;
+        let (status, json) = get_json(
+            app,
+            &format!("/api/v1/query_range?query=bench_gauge&start={start}&end={end}&step=60s"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {json}");
+        assert_eq!(json["data"]["resultType"], "matrix", "body: {json}");
+
+        let phases = json["data"]["stats"]["phases"]
+            .as_array()
+            .expect("phases array present");
+        let rendered: Vec<(&str, u64, u64)> = phases
+            .iter()
+            .map(|p| {
+                (
+                    p["phase"].as_str().expect("phase name"),
+                    p["s3GetRequests"].as_u64().expect("gets"),
+                    p["s3GetWireBytes"].as_u64().expect("wire bytes"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                ("resolve", 2, 288),
+                ("plan", 1, 341),
+                ("probe", 0, 0),
+                ("scan", 0, 0),
+            ],
+            "body: {json}"
+        );
     }
 
     #[tokio::test]
