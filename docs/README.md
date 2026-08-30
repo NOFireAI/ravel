@@ -74,8 +74,13 @@ Start here to run Ravel, ingest into it, or query it.
 - [guides/cost-model.md](guides/cost-model.md): the PUTs/day formula
   (ADR-0076) and how tenant count, signal mix, shard count, replica
   affinity, and flush cadence each move it, with a measured before/after of
-  the flush-cadence default change. Read this to predict the S3 request
-  bill before deploying.
+  the flush-cadence default change; plus the read-side counterpart, where
+  `--logs-request-cost-bytes` sets how many transferred bytes one saved
+  object-store round trip is worth and so how often a logs scan reads whole
+  objects instead of ranges (ADR-0904, with list-price dollar modelling for
+  request-billed and egress-billed backends). Read this to predict the S3
+  request bill before deploying, and to decide whether your read path is
+  tuned for latency or for cost.
 - [guides/disaster-recovery.md](guides/disaster-recovery.md): recovering a
   deployment from object storage alone -- what state is reconstructable, the
   commit-record and catalog rebuild path, and the operator steps. Read this
