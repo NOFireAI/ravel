@@ -1380,8 +1380,8 @@ label), the same allowlist ADR-0044 sets for `/metrics` labels.
 
 ### JSON response shape
 
-`GET /api/v1/query` and `/query_range`'s `stats` object gains two new
-fields alongside the existing `segmentsFetched`/`segmentsPruned`:
+`GET /api/v1/query` and `/query_range`'s `stats` object carries these
+cost fields alongside the existing `segmentsFetched`/`segmentsPruned`:
 
 - `stats.accounting` — the `QueryAccountingSnapshot`, split by op for the
   S3 counters (`s3GetRequests`/`s3GetBytes`, `s3ListRequests`/
@@ -1396,6 +1396,36 @@ fields alongside the existing `segmentsFetched`/`segmentsPruned`:
 - `stats.estimate` — the `CostEstimate`: `estimatedRequests`,
   `estimatedStoreBytes`, `estimatedDecompressedBytes`, `segments`,
   `series`.
+- `stats.phases` — the same GETs and bytes `stats.accounting` pools, split
+  by phase (issue #935 exposing issue #796's `PhaseAccounting`; ADR-0927
+  decision 7). An array of one object per `QueryPhase`, in
+  `QueryPhase::ALL` order, each phase exactly once: `resolve` (catalog
+  snapshot resolve), `plan` (footer and skip-index probing), `probe`
+  (segment catalog fetch), `scan` (block and page data reads). The
+  rendering iterates `QueryPhase::ALL`, so a phase added to the enum
+  cannot be silently dropped. Per-phase fields: `phase`,
+  `s3GetRequests`, `s3GetWireBytes`, `s3ListRequests`, `cacheHits`,
+  `cacheMisses`, `cacheServedBytes`, `decompressedOutputBytes`,
+  `reusedRegionBytes`, `segmentsOpened`, `seriesMatched`.
+
+  Additive to `stats.accounting`, which is unchanged: every per-phase
+  counter sums back to its pooled counterpart there. Each byte field
+  names its own kind because the four are different quantities that
+  cannot be compared or summed with each other: `s3GetWireBytes` is what
+  the wire carried (range reads and a coalesced run's unwanted in-between
+  bytes included; a retried GET's failed attempts not, since the counter
+  is written once from the response that succeeded, and request counts are
+  logical calls rather than billed requests per ADR-0927 decision 8),
+  `cacheServedBytes` never crossed the wire, `decompressedOutputBytes` is
+  a decode-time output size no request paid for, and `reusedRegionBytes`
+  is wire bytes avoided by reusing an already-fetched region rather than
+  wire bytes moved.
+
+  Four counters the pooled block renders have no per-phase field, because
+  they are never recorded on a PromQL query and a per-phase zero would
+  read as a measurement rather than an absence (ADR-0927 decision 7):
+  `s3HeadRequests`/`s3HeadBytes`, `s3ListBytes`, and
+  `peakIntermediateBytes` (SQL executor only).
 
 ## PromQL conformance (ADR-0035)
 

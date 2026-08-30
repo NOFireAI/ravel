@@ -942,6 +942,306 @@ mod tests {
         );
     }
 
+    /// A `QueryStats` whose four phase handles carry a distinct, exactly known
+    /// figure in every counter `stats.phases` renders, so a test can name the
+    /// expected number per phase per field and a swapped or pooled phase is a
+    /// failing assertion rather than a plausible-looking total.
+    ///
+    /// Each phase gets its own value for every field, and no two phases share
+    /// a value in the same field, so an off-by-one in `QueryPhase::index` or a
+    /// mis-wired `snapshot.phase(..)` lookup cannot pass.
+    fn stats_with_distinct_phase_counters() -> crate::QueryStats {
+        use crate::phase_accounting::PhaseAccounting;
+        use ravel_types::accounting::AccountedOp;
+
+        let phases = PhaseAccounting::new();
+
+        // resolve: catalog LISTs and commit-record GETs.
+        for _ in 0..3 {
+            phases.resolve().record_s3_request(AccountedOp::Get);
+        }
+        phases.resolve().add_s3_bytes(AccountedOp::Get, 1_000);
+        for _ in 0..2 {
+            phases.resolve().record_s3_request(AccountedOp::List);
+        }
+        phases.resolve().record_cache_hit();
+        for _ in 0..2 {
+            phases.resolve().record_cache_miss();
+        }
+        phases.resolve().add_cache_bytes(11);
+
+        // plan: footer and skip-index probes.
+        for _ in 0..5 {
+            phases.plan().record_s3_request(AccountedOp::Get);
+        }
+        phases.plan().add_s3_bytes(AccountedOp::Get, 2_000);
+        for _ in 0..3 {
+            phases.plan().record_cache_hit();
+        }
+        for _ in 0..4 {
+            phases.plan().record_cache_miss();
+        }
+        phases.plan().add_cache_bytes(22);
+        phases.plan().add_segments_opened(6);
+
+        // probe: segment catalog fetch.
+        for _ in 0..7 {
+            phases.probe().record_s3_request(AccountedOp::Get);
+        }
+        phases.probe().add_s3_bytes(AccountedOp::Get, 4_000);
+        for _ in 0..8 {
+            phases.probe().record_cache_hit();
+        }
+        for _ in 0..9 {
+            phases.probe().record_cache_miss();
+        }
+        phases.probe().add_cache_bytes(33);
+        phases.probe().add_series_matched(12);
+
+        // scan: block and page data reads, plus decode's own byte figures.
+        for _ in 0..11 {
+            phases.scan().record_s3_request(AccountedOp::Get);
+        }
+        phases.scan().add_s3_bytes(AccountedOp::Get, 8_000);
+        for _ in 0..13 {
+            phases.scan().record_cache_hit();
+        }
+        for _ in 0..14 {
+            phases.scan().record_cache_miss();
+        }
+        phases.scan().add_cache_bytes(44);
+        phases.scan().add_decompressed_bytes(5_000);
+        phases.scan().add_bytes_reused(640);
+        phases.scan().add_segments_opened(15);
+        phases.scan().add_series_matched(16);
+
+        let snapshot = phases.snapshot();
+        crate::QueryStats {
+            // `accounting` is the pooled sum in production
+            // (`QueryStats::new`); keep that relationship here so the
+            // sums-back-to-pooled assertions test the renderer, not a
+            // hand-built inconsistency.
+            accounting: snapshot.pooled(),
+            phase_accounting: snapshot,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn phase_accounting_renders_all_four_phases_exactly_once() {
+        // ACCEPTANCE TEST (issue #935). `PhaseAccounting` splits every
+        // `QueryAccounting` counter four ways on every PromQL query, and until
+        // this field existed the split reached no reader outside the engine's
+        // own unit tests. This pins the rendered shape: the exact phase names,
+        // in `QueryPhase::ALL` order, each appearing exactly once, with every
+        // figure at its exact expected value.
+        //
+        // Flip-line proof: in `phase_costs`, change `QueryPhase::ALL.iter()` to
+        // `QueryPhase::ALL.iter().take(3)` and the count/name assertions fail;
+        // hand the mapping `snapshot.phase(QueryPhase::Resolve)` instead of
+        // `snapshot.phase(*phase)` and the per-phase value assertions fail.
+        let json = QueryStatsJson::from(stats_with_distinct_phase_counters());
+        let value = serde_json::to_value(&json).expect("serializes");
+
+        let phases = value["phases"].as_array().expect("phases is an array");
+        assert_eq!(phases.len(), 4, "four phases, no more and no fewer");
+
+        // The exact names, in order. Not a set comparison: the order is
+        // `QueryPhase::ALL`'s, and a report that pairs a phase name with the
+        // wrong row is exactly what an unordered check would miss.
+        let names: Vec<&str> = phases
+            .iter()
+            .map(|p| p["phase"].as_str().expect("phase name is a string"))
+            .collect();
+        assert_eq!(names, vec!["resolve", "plan", "probe", "scan"]);
+
+        // Each name appears exactly once. A figure emitted twice is as much a
+        // defect as one emitted wrong: a consumer summing the array would
+        // double-count that phase.
+        for want in ["resolve", "plan", "probe", "scan"] {
+            assert_eq!(
+                names.iter().filter(|n| **n == want).count(),
+                1,
+                "phase {want} must appear exactly once"
+            );
+        }
+
+        // Every figure, per phase, at its exact expected value.
+        let expected: [(&str, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64); 4] = [
+            // phase, gets, wire bytes, lists, hits, misses, cache bytes,
+            // decompressed, reused, opened, matched
+            ("resolve", 3, 1_000, 2, 1, 2, 11, 0, 0, 0, 0),
+            ("plan", 5, 2_000, 0, 3, 4, 22, 0, 0, 6, 0),
+            ("probe", 7, 4_000, 0, 8, 9, 33, 0, 0, 0, 12),
+            ("scan", 11, 8_000, 0, 13, 14, 44, 5_000, 640, 15, 16),
+        ];
+        for (i, want) in expected.iter().enumerate() {
+            let got = &phases[i];
+            let (
+                name,
+                gets,
+                wire_bytes,
+                lists,
+                hits,
+                misses,
+                cache_bytes,
+                decompressed,
+                reused,
+                opened,
+                matched,
+            ) = *want;
+            assert_eq!(got["phase"], name);
+            assert_eq!(got["s3GetRequests"], gets, "{name} s3GetRequests");
+            assert_eq!(got["s3GetWireBytes"], wire_bytes, "{name} s3GetWireBytes");
+            assert_eq!(got["s3ListRequests"], lists, "{name} s3ListRequests");
+            assert_eq!(got["cacheHits"], hits, "{name} cacheHits");
+            assert_eq!(got["cacheMisses"], misses, "{name} cacheMisses");
+            assert_eq!(
+                got["cacheServedBytes"], cache_bytes,
+                "{name} cacheServedBytes"
+            );
+            assert_eq!(
+                got["decompressedOutputBytes"], decompressed,
+                "{name} decompressedOutputBytes"
+            );
+            assert_eq!(got["reusedRegionBytes"], reused, "{name} reusedRegionBytes");
+            assert_eq!(got["segmentsOpened"], opened, "{name} segmentsOpened");
+            assert_eq!(got["seriesMatched"], matched, "{name} seriesMatched");
+        }
+    }
+
+    #[test]
+    fn phase_figures_sum_back_to_the_pooled_accounting_block() {
+        // The split is additive to `stats.accounting`, not a replacement: a
+        // consumer reading only the pooled block sees the same numbers as
+        // before `phases` existed. Asserted as exact equality per counter, so a
+        // phase whose bytes land nowhere (or twice) fails here even if the
+        // per-phase assertions above pass.
+        let json = QueryStatsJson::from(stats_with_distinct_phase_counters());
+        let value = serde_json::to_value(&json).expect("serializes");
+        let phases = value["phases"].as_array().expect("phases is an array");
+
+        let sum = |field: &str| -> u64 {
+            phases
+                .iter()
+                .map(|p| p[field].as_u64().expect("figure is an unsigned integer"))
+                .sum()
+        };
+
+        assert_eq!(sum("s3GetRequests"), 3 + 5 + 7 + 11);
+        assert_eq!(value["accounting"]["s3GetRequests"], 26);
+        assert_eq!(sum("s3GetWireBytes"), 1_000 + 2_000 + 4_000 + 8_000);
+        assert_eq!(value["accounting"]["s3GetBytes"], 15_000);
+        assert_eq!(sum("s3ListRequests"), 2);
+        assert_eq!(value["accounting"]["s3ListRequests"], 2);
+        assert_eq!(sum("cacheHits"), 1 + 3 + 8 + 13);
+        assert_eq!(value["accounting"]["cacheHits"], 25);
+        assert_eq!(sum("cacheMisses"), 2 + 4 + 9 + 14);
+        assert_eq!(value["accounting"]["cacheMisses"], 29);
+        assert_eq!(sum("cacheServedBytes"), 11 + 22 + 33 + 44);
+        assert_eq!(value["accounting"]["cacheBytes"], 110);
+        assert_eq!(sum("decompressedOutputBytes"), 5_000);
+        assert_eq!(value["accounting"]["decompressedBytes"], 5_000);
+        assert_eq!(sum("reusedRegionBytes"), 640);
+        assert_eq!(value["accounting"]["bytesReused"], 640);
+        assert_eq!(sum("segmentsOpened"), 6 + 15);
+        assert_eq!(value["accounting"]["segmentsOpened"], 21);
+        assert_eq!(sum("seriesMatched"), 12 + 16);
+        assert_eq!(value["accounting"]["seriesMatched"], 28);
+    }
+
+    #[test]
+    fn phases_render_every_phase_queryphase_all_names() {
+        // The enforcement for "a phase added to `QueryPhase::ALL` cannot be
+        // silently dropped": the renderer iterates `ALL`, and this test derives
+        // its expectation from `ALL` too, so a fifth variant added to the enum
+        // and to `ALL` must appear in the response or this fails. A test that
+        // hard-coded four names could not tell a dropped fifth phase from a
+        // correct render.
+        use crate::phase_accounting::QueryPhase;
+
+        let json = QueryStatsJson::from(crate::QueryStats::default());
+        let value = serde_json::to_value(&json).expect("serializes");
+        let phases = value["phases"].as_array().expect("phases is an array");
+
+        assert_eq!(
+            phases.len(),
+            QueryPhase::ALL.len(),
+            "one rendered entry per QueryPhase::ALL variant"
+        );
+        let names: Vec<&str> = phases
+            .iter()
+            .map(|p| p["phase"].as_str().expect("phase name is a string"))
+            .collect();
+        let want: Vec<&str> = QueryPhase::ALL.iter().map(|p| p.name()).collect();
+        assert_eq!(names, want, "rendered names are QueryPhase::ALL, in order");
+    }
+
+    #[test]
+    fn phases_carry_no_field_for_a_structurally_dead_counter() {
+        // ADR-0927 decision 7: `AccountedOp::Head`, `s3_bytes[List]`,
+        // `segments_pruned`, and `peak_intermediate_bytes` are never recorded
+        // on a PromQL query. A per-phase zero for one of them would read as a
+        // measurement, so the per-phase block has no field for it. The pooled
+        // `accounting` block keeps its own pre-existing fields untouched, which
+        // the second half of this test pins.
+        let json = QueryStatsJson::from(stats_with_distinct_phase_counters());
+        let value = serde_json::to_value(&json).expect("serializes");
+
+        for phase in value["phases"].as_array().expect("phases is an array") {
+            for dead in [
+                "s3HeadRequests",
+                "s3HeadBytes",
+                "s3ListBytes",
+                "peakIntermediateBytes",
+                "segmentsPruned",
+            ] {
+                assert!(
+                    phase.get(dead).is_none(),
+                    "per-phase block must not render the dead counter {dead}"
+                );
+            }
+        }
+
+        // The pooled block is unchanged: every field it rendered before this
+        // change is still there, dead ones included.
+        for kept in [
+            "s3GetRequests",
+            "s3GetBytes",
+            "s3ListRequests",
+            "s3ListBytes",
+            "s3HeadRequests",
+            "s3HeadBytes",
+            "cacheHits",
+            "cacheMisses",
+            "cacheBytes",
+            "decompressedBytes",
+            "segmentsOpened",
+            "seriesMatched",
+            "bytesReused",
+            "peakIntermediateBytes",
+            "rawF64Pages",
+            "rawF64Bytes",
+        ] {
+            assert!(
+                value["accounting"].get(kept).is_some(),
+                "pooled accounting field {kept} must not be removed"
+            );
+        }
+        assert!(
+            value.get("segmentsFetched").is_some(),
+            "segmentsFetched must not be removed"
+        );
+        assert!(
+            value.get("segmentsPruned").is_some(),
+            "segmentsPruned must not be removed"
+        );
+        assert!(
+            value.get("estimate").is_some(),
+            "estimate must not be removed"
+        );
+    }
+
     #[test]
     fn instant_vector_renders_native_histogram_element() {
         // A native-histogram vector element renders under Prometheus'
