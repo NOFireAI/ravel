@@ -60,6 +60,7 @@ fn small_generate_config(store: Arc<dyn ObjectStoreBackend>, runs: usize) -> Gen
         explain_dir: None,
         warm_catalog: false,
         logs_suffix_len: None,
+        logs_request_cost_bytes: ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES,
     }
 }
 
