@@ -177,7 +177,7 @@ was the intent.
 
   The version byte still makes a `.cstat` object self-describe its keying, so
   an object read outside its head ref declares whether it is L0-tuple-keyed
-  (v1) or part-keyed (v2); the head field number and the envelope version
+  (v1) or content-hash-keyed (v2); the head field number and the envelope version
   agree by construction, and a disagreement is a validation failure that
   subtracts that object's coverage, matching ADR-0913 §4a's
   self-describing-state rule.
