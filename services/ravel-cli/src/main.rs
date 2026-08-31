@@ -322,6 +322,22 @@ enum Command {
         /// `--batch-rows`, whose memory cost is linear because each batch is
         /// buffered whole.
         ///
+        /// The trigger is checked once per batch write, so the smallest object
+        /// this can produce is one whole batch's share of a shard: the shard
+        /// buffer already holds that share by the time the target is tested. A
+        /// target below one batch's per-shard ENCODED size therefore changes
+        /// nothing -- the buffer is already over it when the first batch lands,
+        /// so every batch flushes on its own exactly as at the default `1`, and
+        /// the object count stays set by batch geometry (`--batch-rows`,
+        /// `--shards`, `--read-cursors`), not by this flag. Objects only grow
+        /// once the target exceeds one batch's per-shard size, and by roughly
+        /// the number of batches that then accumulate into one flush. At a
+        /// typical bulk geometry -- a large `--batch-rows` over wide rows -- a
+        /// single batch's per-shard share is already tens of MiB, so a
+        /// few-MiB target is below the floor and is effectively inert; raise it
+        /// to several times one batch's per-shard encoded size, or lower
+        /// `--batch-rows`, to see the count actually fall.
+        ///
         /// The trade is ack timing, not durability. A Strict write's ack is
         /// still sent only after its records' object and commit record are
         /// published, so an ack always means durable. But above `1` the flush

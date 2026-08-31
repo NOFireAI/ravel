@@ -5047,6 +5047,191 @@ type = "i64"
         );
     }
 
+    /// A stride fixture like [`sorted_by_shard_fixture`], but every record also
+    /// carries one large record `[[attribute]]` (`payload`, `payload_len`
+    /// bytes) so a single record's estimated buffered size (`est_record_bytes`,
+    /// which counts the attribute value verbatim) is at least `payload_len`.
+    /// That makes one batch's per-shard share -- one record, under stride
+    /// reading with `read_cursors = shards` -- a known lower bound, which is
+    /// what the flush-target floor test below pins against.
+    fn fat_payload_by_shard_fixture(
+        shards: u32,
+        rows_per_group: usize,
+        payload_len: usize,
+    ) -> (tempfile::TempDir, std::path::PathBuf, Mapping) {
+        use parquet::arrow::ArrowWriter;
+
+        let hosts: Vec<String> = (0..shards).map(|s| host_for_shard(s, shards)).collect();
+        let payload = "x".repeat(payload_len);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pq = dir.path().join("fat_payload_by_shard.parquet");
+        let row_group = |host: &str| {
+            batch(vec![
+                ("ts", i64_col(vec![NOW_NS; rows_per_group])),
+                ("svc", str_col(vec!["api"; rows_per_group])),
+                ("host", str_col(vec![host; rows_per_group])),
+                ("payload", str_col(vec![payload.as_str(); rows_per_group])),
+            ])
+        };
+        let first = row_group(hosts[0].as_str());
+        let file = std::fs::File::create(&pq).expect("create parquet");
+        let mut writer = ArrowWriter::try_new(file, first.schema(), None).expect("arrow writer");
+        writer.write(&first).expect("write row group");
+        writer.flush().expect("flush row group");
+        for host in &hosts[1..] {
+            let rg = row_group(host.as_str());
+            writer.write(&rg).expect("write row group");
+            writer.flush().expect("flush row group");
+        }
+        writer.close().expect("close writer");
+
+        let m = parse_mapping(
+            "ts_column = \"ts\"\nts_unit = \"nanos\"\n\n\
+             [[resource_attribute]]\nkey = \"service.name\"\ncolumn = \"svc\"\ntype = \"str\"\n\n\
+             [[resource_attribute]]\nkey = \"host\"\ncolumn = \"host\"\ntype = \"str\"\n\n\
+             [[attribute]]\nkey = \"payload\"\ncolumn = \"payload\"\ntype = \"str\"\n",
+        )
+        .expect("valid mapping");
+
+        (dir, pq, m)
+    }
+
+    /// `--target-bytes` is dead below one batch's per-shard size, and this pins
+    /// the floor the ticket (#971) hit: the router tests `est_bytes >=
+    /// target_bytes` once per batch write (`LogShardActor::handle_write` /
+    /// `handle_write_columnar` in `crates/ravel-ingest/src/log_shard.rs`), so
+    /// the buffer already holds a whole batch's per-shard share before the
+    /// target is ever compared. A target below that share is over before the
+    /// first batch lands, so every batch flushes on its own exactly as at the
+    /// default `1`, and the object count is set by batch geometry, not the flag.
+    ///
+    /// Geometry: `shards = 4`, `rows_per_group = 4` written as 4 shard-sorted
+    /// row groups, stride-read with `read_cursors = 4`, so each of the 4 batches
+    /// draws one row from each row group -- one record per shard per batch. Each
+    /// record carries a 4096-byte `payload` attribute, so one record's
+    /// `est_record_bytes` is at least 4096 (the attribute value is counted
+    /// verbatim) and at most a few hundred bytes more (a host stream blob, the
+    /// key, the fixed 32, the pair header).
+    ///
+    /// The three targets and their derivable counts:
+    ///   - `1` (default): every 1-record batch flushes on its shard -> 4 batches
+    ///     x 4 shards = 16 objects.
+    ///   - `4000` (below the >=4096 floor): identical 16. A 4000x range in the
+    ///     target moves the count by nothing -- the ticket's phenomenon.
+    ///   - `256 KiB` (above 4 x one record's est, so all 4 batches accumulate
+    ///     into one object per shard, released by the age trigger): 4 objects.
+    /// So the count only falls once the target crosses the per-batch-per-shard
+    /// floor, and then by the batches-per-flush factor (4x here), not smoothly
+    /// with the target.
+    ///
+    /// Prove-the-test (each assertion demonstrated failing, not just asserted):
+    ///   - Floor equality (`floored == baseline`, both 16): raise the middle
+    ///     target from `4000` to `256 * 1024` (above the floor) and the middle
+    ///     side collapses to 4, failing `left: 16, right: 4`. That is the
+    ///     deliberate under-count that proves the equality is watched.
+    ///   - Accumulation magnitude (`accumulated == 4`): hardcode `target_bytes:
+    ///     1` into the `IngestConfig` literal in `load_instrumented` and the
+    ///     large-target side writes 16, failing `left: 16, right: 4`.
+    #[tokio::test]
+    async fn target_bytes_below_one_batchs_per_shard_size_does_not_change_object_count() {
+        use ravel_object_store::memory::MemoryStore;
+
+        let shards = 4u32;
+        let rows_per_group = 4usize; // = batch count under stride reading
+        let payload_len = 4096usize; // one record's est_bytes >= this
+        let (_dir, pq, m) = fat_payload_by_shard_fixture(shards, rows_per_group, payload_len);
+        let n_rows = (rows_per_group * shards as usize) as u64;
+        let batches = rows_per_group; // one batch per row-group depth
+        let baseline_objects = batches * shards as usize; // 16
+
+        let run = |target_bytes: usize| {
+            let pq = pq.clone();
+            let m = m.clone();
+            async move {
+                let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+                let report = load_instrumented(
+                    Arc::clone(&store),
+                    &pq,
+                    "acme",
+                    &m,
+                    shards,
+                    rows_per_group,
+                    Some(shards as usize),
+                    // Wide enough to hold every batch that accumulates into one
+                    // flush, matching the sibling difference test.
+                    rows_per_group,
+                    DEFAULT_MAX_INFLIGHT_FLUSHES,
+                    DEFAULT_DECODE_QUEUE_BATCHES,
+                    target_bytes,
+                    NOW_NS,
+                    // A real clock: above the floor the tail is released by the
+                    // router's wall-clock age trigger, which a FixedClock never
+                    // fires.
+                    Arc::new(SystemClock),
+                    LoadPath::Columnar,
+                    None,
+                    None,
+                )
+                .await
+                .expect("load succeeds");
+                let stored = list_data_objects(store.as_ref()).await.len();
+                (report, stored, decoded_records(store.as_ref()).await)
+            }
+        };
+
+        // Default target: one object per batch per shard.
+        let (base, base_stored, base_records) = run(DEFAULT_TARGET_BYTES).await;
+        // Below the >=4096 floor: a 4000x larger target, same count.
+        let (floored, floored_stored, floored_records) = run(4000).await;
+        // Above 4 x one record's est: all batches accumulate per shard.
+        let (accum, accum_stored, accum_records) = run(256 * 1024).await;
+
+        assert_eq!(base.rows_processed, n_rows);
+        assert_eq!(floored.rows_processed, n_rows);
+        assert_eq!(accum.rows_processed, n_rows);
+
+        assert_eq!(
+            base_stored, baseline_objects,
+            "target 1: each of the 4 batches flushes on its shard -> 4x4"
+        );
+        assert_eq!(
+            floored_stored, baseline_objects,
+            "target 4000 is below one record's >=4096 est, so it is already \
+             exceeded when the first batch lands: same 16 objects as target 1, \
+             the #971 floor"
+        );
+        assert_eq!(
+            floored_stored, base_stored,
+            "a 4000x range in the target below the per-batch-per-shard floor \
+             changes the object count by nothing"
+        );
+        assert_eq!(
+            accum_stored, shards as usize,
+            "target 256 KiB exceeds 4 records' est, so each shard accumulates \
+             all 4 batches into one object: 4 objects"
+        );
+        assert_eq!(
+            base_stored,
+            accum_stored * batches,
+            "the count only falls once the target crosses the floor, and then \
+             by the batches-per-flush factor (4x), not proportionally to the \
+             target"
+        );
+        assert_eq!(
+            base.objects_written(),
+            base_stored,
+            "the reported object count must equal what the store holds"
+        );
+        assert_eq!(
+            accum.objects_written(),
+            accum_stored,
+            "the reported object count must equal what the store holds"
+        );
+        assert_eq!(base_records, floored_records);
+        assert_eq!(base_records, accum_records);
+    }
+
     /// The ack semantics a larger `--target-bytes` changes (issue #801,
     /// deliverable 3). A Strict write's ack is answered from `ack_waiters` in
     /// `crates/ravel-ingest/src/log_shard.rs`, which only runs once that
