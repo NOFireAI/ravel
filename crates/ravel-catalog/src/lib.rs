@@ -31,7 +31,7 @@ pub use auth_token_map::{
 };
 pub use catalog::Catalog;
 pub use catalog::resolve_rewrite_supersession;
-pub use column_stats_resolve::{LoadColumnStatsError, LoadedColumnStats};
+pub use column_stats_resolve::{LoadColumnStatsError, LoadedColumnStats, unique_column_stat};
 pub use config::{
     CatalogConfig, DEFAULT_BYTE_CACHE_MAX_BYTES, DEFAULT_BYTE_CACHE_MAX_ENTRIES,
     DEFAULT_BYTE_CACHE_MAX_ENTRY_BYTES, DEFAULT_CACHE_CAPACITY_PER_TENANT,
@@ -72,7 +72,7 @@ pub use snapshot_format::{
     DEFAULT_MAX_POSTINGS_BYTES, DEFAULT_MAX_SNAPSHOT_PART_BYTES, DecodedColumnStats, DecodedPart,
     DecodedPostings, HEAD_FORMAT_VERSION, MAGIC, NamePostings, PartLimits, PostingsLimits,
     SnapshotFormatError, VERSION, decode_column_stats, decode_head, decode_part, decode_postings,
-    encode_column_stats, encode_head, encode_part, encode_postings,
+    encode_column_stats, encode_head, encode_part, encode_postings, validate_min_max_presence,
 };
 pub use tenant_config::{
     DeclaredColumnType, DeclaredTypedColumn, FIXED_LOGS_SQL_COLUMNS,

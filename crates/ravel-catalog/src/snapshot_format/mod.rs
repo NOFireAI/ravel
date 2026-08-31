@@ -12,6 +12,7 @@ mod postings;
 
 pub use column_stats::{
     DecodedColumnStats, decode_column_stats, encode_column_stats, encode_column_stats_v2,
+    validate_min_max_presence,
 };
 pub use error::SnapshotFormatError;
 pub use head::{HEAD_FORMAT_VERSION, decode_head, encode_head};

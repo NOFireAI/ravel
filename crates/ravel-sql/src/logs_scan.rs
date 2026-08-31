@@ -250,7 +250,7 @@ use datafusion::physical_plan::{
 };
 use datafusion::scalar::ScalarValue;
 use futures::{Stream, StreamExt, TryStreamExt};
-use ravel_catalog::{LoadedColumnStats, SegmentRef};
+use ravel_catalog::{LoadedColumnStats, SegmentRef, unique_column_stat, validate_min_max_presence};
 use ravel_logseg::footer::LogFooter;
 use ravel_logseg::{
     AttrColumn, BoolCursor, BytesCursor, ColumnSelection, ColumnarBlockView, F64BitsCursor,
@@ -1196,8 +1196,10 @@ impl LogsScanExec {
     /// per-column form would give -- the safety lemma requires falling back to
     /// scanning for that column: no loaded column-stats object, an unsupported
     /// declared type (`Str`), a relevant segment with no entry in the loaded
-    /// stats, or a segment whose stat for this column is missing or decodes to
-    /// a value of the wrong kind.
+    /// stats, or a segment whose stat for this column is missing, invalid
+    /// (#970: two entries under one name, or `min`/`max` presence disagreeing
+    /// with `non_null_count` in either direction), or decodes to a value of the
+    /// wrong kind.
     ///
     /// `Some((min, max))` with both a `None`-valued scalar is still exact, not
     /// a fallback: every covered segment's column was entirely null, or there
@@ -1244,26 +1246,45 @@ impl LogsScanExec {
                 }
                 break;
             };
-            let by_name: HashMap<&str, &ravel_proto::catalog::v1::ColumnStat> = seg_stats
-                .columns
-                .iter()
-                .map(|c| (c.name.as_str(), c))
-                .collect();
+            // One entry per name, and a name carrying more than one entry maps
+            // to `None`: collecting the pairs straight into a map would keep
+            // the LAST duplicate and answer from it, while the dictionary
+            // readers below resolve the same list with `find` and would keep
+            // the FIRST. A duplicate name is malformed either way
+            // (`decode_column_stats` refuses an object carrying one), and no
+            // rule could pick the right entry, so the name is poisoned and its
+            // column declines. Still one walk of the segment's columns.
+            let mut by_name: HashMap<&str, Option<&ravel_proto::catalog::v1::ColumnStat>> =
+                HashMap::with_capacity(seg_stats.columns.len());
+            for c in seg_stats.columns.iter() {
+                by_name
+                    .entry(c.name.as_str())
+                    .and_modify(|slot| *slot = None)
+                    .or_insert(Some(c));
+            }
             for (k, a) in acc.iter_mut().enumerate() {
                 if a.declined {
                     continue;
                 }
                 let declared = &self.declared[k];
-                let Some(stat) = by_name.get(declared.key.as_str()) else {
+                let Some(Some(stat)) = by_name.get(declared.key.as_str()) else {
+                    // No entry (the ordinary not-covered case) or a poisoned
+                    // one (a duplicate name).
                     a.declined = true;
                     continue;
                 };
-                // Non-null rows with no recorded extremum cannot answer MIN/MAX.
-                // Without this the accumulator stays `None` and the loop below
-                // substitutes a NULL scalar, which is then reported as
-                // `Precision::Exact` -- claiming the extremum of non-null data is
-                // exactly NULL. Fail closed and let the scan answer instead.
-                if stat.non_null_count > 0 && (stat.min.is_none() || stat.max.is_none()) {
+                // `min`/`max` presence must agree with `non_null_count` in both
+                // directions, or this path reports a wrong extremum as
+                // `Precision::Exact`: non-null rows with no recorded extremum
+                // leave the accumulator `None` and the loop below substitutes a
+                // NULL scalar, claiming the extremum of non-null data is exactly
+                // NULL, while an all-null column carrying extrema contributes a
+                // value describing no live row. `decode_column_stats` refuses
+                // either shape, and this calls the same clause it enforces
+                // rather than restating it, because `LoadedColumnStats` has
+                // public fields and can be populated by a carrier that never
+                // decoded an object. Fail closed and let the scan answer.
+                if validate_min_max_presence(stat).is_err() {
                     a.declined = true;
                     continue;
                 }
@@ -1354,7 +1375,7 @@ impl LogsScanExec {
         let mut total: u64 = 0;
         for seg in self.segments.iter() {
             let seg_stats = stats.segments.get(&segment_identity(seg))?;
-            let stat = seg_stats.columns.iter().find(|c| c.name == declared.key)?;
+            let stat = unique_column_stat(seg_stats, &declared.key)?;
             if !stat.dictionary_present {
                 return None;
             }
@@ -1420,7 +1441,7 @@ impl LogsScanExec {
         let mut null_count: u64 = 0;
         for seg in self.segments.iter() {
             let seg_stats = stats.segments.get(&segment_identity(seg))?;
-            let stat = seg_stats.columns.iter().find(|c| c.name == declared.key)?;
+            let stat = unique_column_stat(seg_stats, &declared.key)?;
             if !stat.dictionary_present {
                 return None;
             }
@@ -1477,7 +1498,7 @@ impl LogsScanExec {
         let mut non_null_count: u64 = 0;
         for seg in self.segments.iter() {
             let seg_stats = stats.segments.get(&segment_identity(seg))?;
-            let stat = seg_stats.columns.iter().find(|c| c.name == declared.key)?;
+            let stat = unique_column_stat(seg_stats, &declared.key)?;
             let seg_sum = stat.sum?;
             sum = sum.checked_add(i128::from(seg_sum))?;
             non_null_count = non_null_count.checked_add(stat.non_null_count)?;

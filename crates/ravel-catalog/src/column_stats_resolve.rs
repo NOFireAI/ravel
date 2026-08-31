@@ -55,6 +55,35 @@ pub struct LoadedColumnStats {
     pub part_blake3: Vec<[u8; 32]>,
 }
 
+/// The entry for column `name` in `segment`, and only when the segment carries
+/// EXACTLY one such entry. `None` covers both "no entry" (the ordinary
+/// not-covered case: the fold never built this column, so the reader declines
+/// and the scan answers) and "more than one entry", which is a malformed
+/// record: `decode_column_stats` refuses an object carrying a duplicate column
+/// name outright, so a record reaching a reader with two entries under one name
+/// arrived through some other carrier and no rule could pick the right one.
+///
+/// Duplicates cannot be resolved silently by position, because the two shapes
+/// of "silently" disagree with each other: an `iter().find()` lookup keeps the
+/// FIRST entry while collecting the same list into a by-name map keeps the
+/// LAST, so one malformed record answers one query two ways depending on which
+/// reader ran. Fail closed instead; the column is simply uncovered.
+pub fn unique_column_stat<'a>(
+    segment: &'a ColumnStatsSegment,
+    name: &str,
+) -> Option<&'a ravel_proto::catalog::v1::ColumnStat> {
+    let mut found = None;
+    for column in &segment.columns {
+        if column.name == name {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(column);
+        }
+    }
+    found
+}
+
 /// The column-stats object the current folded HEAD points at, resolved from
 /// HEAD alone (one GET) without yet fetching the object itself. Splitting the
 /// load in two lets a caller consult a reuse cache keyed by what actually
