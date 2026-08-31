@@ -781,7 +781,20 @@ mod tests {
             };
             match decode(&entry) {
                 Ok(stat) => {
-                    prop_assert_eq!(stat.declared_type(), DeclaredStatType::I64);
+                    // An accepted entry's type is exactly what the allowlist
+                    // resolved the stored tag to, and every extremum it kept
+                    // is an I64 one, because that is all this strategy
+                    // stores: a BOOL entry is only ever accepted with both
+                    // extrema absent.
+                    prop_assert_eq!(
+                        Ok(stat.declared_type()),
+                        DeclaredStatType::from_tag(declared_type)
+                    );
+                    if stat.min().is_some() || stat.max().is_some() {
+                        prop_assert_eq!(stat.declared_type(), DeclaredStatType::I64);
+                        prop_assert_eq!(stat.min(), min.map(DeclaredStatValue::I64));
+                        prop_assert_eq!(stat.max(), max.map(DeclaredStatValue::I64));
+                    }
                     prop_assert_eq!(stat.null_count(), null_count);
                     prop_assert!(!stat.name().is_empty());
                 }
