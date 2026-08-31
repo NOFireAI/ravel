@@ -136,6 +136,11 @@ pub struct PhaseWireByteCounter(Arc<PhaseWireByteInner>);
 struct PhaseWireByteInner {
     /// One slot per [`QueryPhase`], indexed by [`QueryPhase::index`].
     phases: [AtomicU64; 4],
+    /// GET REQUEST count per phase, same indexing. Recorded beside the byte
+    /// charge at every fetch site, so the two figures describe the same GETs
+    /// (issue #857: a per-phase byte split whose request counts stay pooled
+    /// cannot say whether a phase is few large reads or many small ones).
+    requests: [AtomicU64; 4],
 }
 
 impl PhaseWireByteCounter {
@@ -151,6 +156,10 @@ impl PhaseWireByteCounter {
     /// GET total, and the per-phase figures sum back to it.
     pub fn record(&self, phase: QueryPhase, bytes: u64) {
         self.0.phases[phase.index()].fetch_add(bytes, Ordering::Relaxed);
+        // One call here is one store GET (the fetch sites call once per
+        // request), so the request count rides the same call and cannot
+        // drift from the byte charge.
+        self.0.requests[phase.index()].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Point-in-time copy of every phase's total.
@@ -159,6 +168,7 @@ impl PhaseWireByteCounter {
         let mut out = PhaseWireByteCounts::default();
         for phase in QueryPhase::ALL {
             out.phases[phase.index()] = self.0.phases[phase.index()].load(Ordering::Relaxed);
+            out.requests[phase.index()] = self.0.requests[phase.index()].load(Ordering::Relaxed);
         }
         out
     }
@@ -172,6 +182,8 @@ impl PhaseWireByteCounter {
 pub struct PhaseWireByteCounts {
     /// One slot per [`QueryPhase`], indexed by [`QueryPhase::index`].
     phases: [u64; 4],
+    /// GET request count per phase, same indexing (issue #857).
+    requests: [u64; 4],
 }
 
 impl PhaseWireByteCounts {
@@ -179,6 +191,13 @@ impl PhaseWireByteCounts {
     #[must_use]
     pub fn phase(&self, phase: QueryPhase) -> u64 {
         self.phases[phase.index()]
+    }
+
+    /// GET requests charged to `phase` (issue #857): the request count the
+    /// byte figure above was accumulated over, recorded by the same call.
+    #[must_use]
+    pub fn phase_requests(&self, phase: QueryPhase) -> u64 {
+        self.requests[phase.index()]
     }
 
     /// Field-wise difference `self - earlier`: the wire bytes one measured
@@ -190,6 +209,8 @@ impl PhaseWireByteCounts {
         for phase in QueryPhase::ALL {
             out.phases[phase.index()] =
                 self.phases[phase.index()].saturating_sub(earlier.phases[phase.index()]);
+            out.requests[phase.index()] =
+                self.requests[phase.index()].saturating_sub(earlier.requests[phase.index()]);
         }
         out
     }
