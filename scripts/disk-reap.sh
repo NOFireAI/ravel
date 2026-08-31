@@ -11,23 +11,42 @@
 #   scripts/disk-reap.sh -y     # apply
 #
 # What it reaps:
-#   1. Worktrees of this repo that are clean and fully merged
-#      (HEAD is an ancestor of origin/main). Locked worktrees are skipped
-#      and reported, never removed.
-#   2. Orphaned cargo target dirs matching /tmp/wt-*-target and
-#      target/ dirs under /private/tmp/claude-*, when no cargo or rustc
-#      process is running. A live build skips this class entirely.
+#   1. Worktrees of this repo that are clean and provably landed on
+#      origin/main. `main` is protected and merged with REBASE-merge, so a
+#      landed branch's commits are rewritten and its HEAD is never an
+#      ancestor of origin/main. Ancestry is therefore only one of the ways a
+#      worktree can qualify; patch equivalence (`git cherry`) is the one that
+#      actually fires on this repo. Locked worktrees are skipped and
+#      reported, never removed.
+#   2. Orphaned cargo target dirs matching wt-*-target and target/ dirs under
+#      claude-* scratchpads, when no cargo or rustc process is running. A live
+#      build skips this class entirely.
 #
-# Never reaps: the primary checkout, dirty or unmerged worktrees, locked
-# worktrees, anything while cargo/rustc runs.
-set -euo pipefail
+# Never reaps: the primary checkout, dirty worktrees, worktrees carrying any
+# commit not already on origin/main, worktrees with an operation in progress,
+# locked worktrees, anything while cargo/rustc runs.
+#
+# Fail closed: deleting an unmerged worktree destroys work that exists
+# nowhere else, which is far worse than failing to reclaim disk. Every branch
+# below that cannot positively prove a worktree is reclaimable skips it and
+# says why.
+#
+# Test hooks (used only by scripts/disk-reap.test.sh, never in normal runs):
+#   DISK_REAP_REPO_ROOT  operate on this repo instead of the script's own
+#   DISK_REAP_TMP_ROOTS  space-separated roots to scan for orphaned targets
+set -uo pipefail
 
 apply=0
 if [[ "${1:-}" == "-y" ]]; then
   apply=1
 fi
 
-repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+repo_root="${DISK_REAP_REPO_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
+tmp_roots="${DISK_REAP_TMP_ROOTS:-/tmp /private/tmp}"
+
+reclaimed_kb=0
+reaped_count=0
+skipped_count=0
 
 act() {
   if [[ ${apply} -eq 1 ]]; then
@@ -37,37 +56,114 @@ act() {
   fi
 }
 
+# Size of a directory in KiB, 0 when it cannot be measured. Always taken
+# before the removal: after it there is nothing left to measure.
+dir_kb() {
+  local d="$1" out
+  out="$(du -sk "${d}" 2>/dev/null | awk 'NR==1 {print $1}')"
+  case "${out}" in
+    ''|*[!0-9]*) echo 0 ;;
+    *) echo "${out}" ;;
+  esac
+}
+
+human_kb() {
+  local kb="$1"
+  awk -v kb="${kb}" 'BEGIN {
+    if (kb >= 1048576) printf "%.1f GiB", kb / 1048576
+    else if (kb >= 1024) printf "%.1f MiB", kb / 1024
+    else printf "%d KiB", kb
+  }'
+}
+
+note_reaped() { # note_reaped <kb>
+  reclaimed_kb=$((reclaimed_kb + $1))
+  reaped_count=$((reaped_count + 1))
+}
+
+# An operation in progress leaves state that `status --porcelain` can report
+# as clean while a half-finished rebase or merge still holds the only copy of
+# a conflict resolution.
+operation_in_progress() { # operation_in_progress <worktree>
+  local wt="$1" p
+  for p in rebase-merge rebase-apply MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD BISECT_LOG; do
+    local resolved
+    resolved="$(git -C "${wt}" rev-parse --git-path "${p}" 2>/dev/null || true)"
+    if [[ -n "${resolved}" && -e "${wt}/${resolved}" ]] || [[ -n "${resolved}" && -e "${resolved}" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# The merged test that survives a sha change.
+#
+# `git cherry <upstream> <head>` lists each commit reachable from <head> but
+# not from <upstream>, prefixed `-` when an equivalent patch (same patch-id)
+# is already upstream and `+` when it is not. A rebase-merge rewrites commit
+# shas but replays the same patches, so every landed commit comes back `-`.
+# Empty output means <head> has no commits of its own at all.
+#
+# Reclaimable means: no `+` lines. Any `+` is a commit whose content is not
+# on origin/main, so the worktree may hold the only copy and is skipped.
+#
+# Merge commits are excluded from `git cherry`'s view, so a merge commit
+# carrying content of its own would not be reported. The caller refuses any
+# worktree with a merge commit in the range rather than reasoning about it.
+patch_equivalent() { # patch_equivalent <head-sha>
+  local head="$1" out
+  out="$(git -C "${repo_root}" cherry "${main_sha}" "${head}" 2>/dev/null)" || return 1
+  printf '%s\n' "${out}" | grep -q '^+' && return 1
+  return 0
+}
+
+has_merge_commits() { # has_merge_commits <head-sha>
+  local head="$1" out
+  out="$(git -C "${repo_root}" rev-list --merges "${main_sha}..${head}" 2>/dev/null)" || return 0
+  [[ -n "${out}" ]]
+}
+
 echo "==> free space before"
 df -h / | tail -1
 
 echo "==> pruning worktree records for deleted directories"
 act git -C "${repo_root}" worktree prune
 
-git -C "${repo_root}" fetch origin main --quiet || true
-main_sha="$(git -C "${repo_root}" rev-parse origin/main)"
+git -C "${repo_root}" fetch origin main --quiet 2>/dev/null || true
+# --verify --quiet, not a bare rev-parse: a bare `rev-parse origin/main` echoes
+# the string "origin/main" on stdout when the ref does not exist, which reads as
+# a resolved sha to every check below.
+main_sha="$(git -C "${repo_root}" rev-parse --verify --quiet origin/main^{commit} 2>/dev/null || true)"
+if [[ ! "${main_sha}" =~ ^[0-9a-f]{40,64}$ ]]; then
+  echo "FATAL: cannot resolve origin/main; refusing to judge any worktree" >&2
+  exit 1
+fi
 # The primary checkout is never a candidate, whatever its state. (git
 # refuses to remove a main working tree, but do not rely on that.)
 main_wt="$(dirname "$(git -C "${repo_root}" rev-parse --path-format=absolute --git-common-dir)")"
-# owner/name for the PR-state fallback below, derived from the remote rather
-# than hardcoded. Empty is fine: the fallback treats an unresolvable repo the
-# same as an absent gh and keeps the conservative skip.
-gh_repo="$(git -C "${repo_root}" remote get-url origin 2>/dev/null |
-  sed -E 's#^(https://[^/]+/|git@[^:]+:)##; s#\.git$##')"
 
-echo "==> merged, clean worktrees"
-# Parse `worktree list --porcelain` blocks; macOS ships bash 3.2, so no
-# associative arrays here.
+echo "==> landed, clean worktrees"
+# Parse `worktree list --porcelain` blocks into a file first: piping straight
+# into the loop would put the accumulators in a subshell and lose the
+# reclaimed byte total, which is the number this run has to report.
+# macOS ships bash 3.2, so no associative arrays here.
+cand_file="$(mktemp)"
+trap 'rm -f "${cand_file}"' EXIT
 git -C "${repo_root}" worktree list --porcelain | awk '
   /^worktree / { wt = substr($0, 10) }
   /^locked/    { print "LOCKED\t" wt; wt = "" }
   /^$/         { if (wt != "") print "CAND\t" wt; wt = "" }
   END          { if (wt != "") print "CAND\t" wt }
-' | while IFS=$'\t' read -r kind wt; do
+' >"${cand_file}"
+
+while IFS=$'\t' read -r kind wt; do
+  [[ -n "${wt}" ]] || continue
   if [[ "${wt}" == "${repo_root}" || "${wt}" == "${main_wt}" ]]; then
     continue
   fi
   if [[ "${kind}" == "LOCKED" ]]; then
     echo "skip (locked): ${wt}"
+    skipped_count=$((skipped_count + 1))
     continue
   fi
   if [[ ! -d "${wt}" ]]; then
@@ -75,84 +171,81 @@ git -C "${repo_root}" worktree list --porcelain | awk '
   fi
   if [[ -n "$(git -C "${wt}" status --porcelain 2>/dev/null)" ]]; then
     echo "skip (dirty): ${wt}"
+    skipped_count=$((skipped_count + 1))
     continue
   fi
-  head_sha="$(git -C "${wt}" rev-parse HEAD 2>/dev/null || true)"
-  if [[ -z "${head_sha}" ]]; then
+  if operation_in_progress "${wt}"; then
+    echo "skip (rebase/merge in progress): ${wt}"
+    skipped_count=$((skipped_count + 1))
+    continue
+  fi
+  head_sha="$(git -C "${wt}" rev-parse --verify --quiet HEAD 2>/dev/null || true)"
+  if [[ ! "${head_sha}" =~ ^[0-9a-f]{40,64}$ ]]; then
     echo "skip (no HEAD): ${wt}"
+    skipped_count=$((skipped_count + 1))
     continue
   fi
-  if git -C "${repo_root}" merge-base --is-ancestor "${head_sha}" "${main_sha}"; then
+  if has_merge_commits "${head_sha}"; then
+    echo "skip (merge commit not on origin/main, cannot prove its content landed): ${wt}"
+    skipped_count=$((skipped_count + 1))
+    continue
+  fi
+  if patch_equivalent "${head_sha}"; then # PROVE-FLIP: ancestry-only regression
+    kb="$(dir_kb "${wt}")"
+    echo "reap ($(human_kb "${kb}"), every commit already on origin/main): ${wt}"
     act git -C "${repo_root}" worktree remove --force "${wt}"
+    note_reaped "${kb}"
     continue
   fi
-  # Ancestry is necessary but not sufficient on this repo: `main` is
-  # protected and merges are REBASE-only, so a merged branch's commits are
-  # rewritten and its HEAD is never an ancestor of main. Ancestry alone
-  # therefore refuses every merged worktree forever -- six were sitting in
-  # that state, all with merged PRs, and this script would never have
-  # touched any of them.
-  #
-  # So fall back to the PR state, which is the authoritative signal for
-  # "has this landed". Two conditions, both required, because a merged PR
-  # does not by itself mean the worktree is disposable:
-  #   - a PR whose head is this branch is MERGED, and
-  #   - the worktree's HEAD is still exactly that PR's head commit, so any
-  #     commit added after the merge blocks the reap rather than being
-  #     silently discarded.
-  # Any uncertainty (no gh, not authenticated, no PR, a mismatched sha)
-  # keeps the old conservative skip: this script must never be the reason
-  # work disappears.
-  branch="$(git -C "${wt}" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
-  if [[ -z "${branch}" ]]; then
-    echo "skip (detached, not an ancestor of main): ${wt}"
-    continue
-  fi
-  if ! command -v gh >/dev/null 2>&1; then
-    echo "skip (not an ancestor of main; gh absent, cannot check PR state): ${wt}"
-    continue
-  fi
-  pr_head=""
-  pr_num=""
-  pr_line="$(gh pr list --repo "${gh_repo}" --head "${branch}" --state merged \
-    --limit 1 --json number,headRefOid \
-    --jq '.[0] | select(.number) | "\(.number)\t\(.headRefOid)"' 2>/dev/null || true)"
-  if [[ -n "${pr_line}" ]]; then
-    pr_num="${pr_line%%$'\t'*}"
-    pr_head="${pr_line##*$'\t'}"
-  fi
-  if [[ -z "${pr_num}" ]]; then
-    echo "skip (not an ancestor of main, no merged PR for ${branch}): ${wt}"
-    continue
-  fi
-  if [[ "${pr_head}" != "${head_sha}" ]]; then
-    echo "skip (PR #${pr_num} merged but ${wt} has moved past its head): ${wt}"
-    continue
-  fi
-  echo "reap (PR #${pr_num} merged, rebase-merged so not an ancestor): ${wt}"
-  act git -C "${repo_root}" worktree remove --force "${wt}"
-done
+  unlanded="$(git -C "${repo_root}" cherry "${main_sha}" "${head_sha}" 2>/dev/null |
+    grep -c '^+' || true)"
+  echo "skip (${unlanded:-?} commit(s) not on origin/main): ${wt}"
+  skipped_count=$((skipped_count + 1))
+done <"${cand_file}"
 
 echo "==> orphaned cargo target dirs"
 if pgrep -x cargo >/dev/null 2>&1 || pgrep -x rustc >/dev/null 2>&1; then
   echo "skip (cargo or rustc is running): target dirs left alone"
 else
   # Both patterns come from real incidents: land worktrees write
-  # /tmp/wt-<name>-land-target, and session scratchpads accumulate
-  # target/ dirs after their worktrees are gone. Only dirs idle for
-  # more than 2 hours are candidates.
-  find /tmp -maxdepth 1 -type d -name 'wt-*-target' -mmin +120 2>/dev/null \
-    | while read -r d; do
-        act rm -rf "${d}"
-      done
-  find /private/tmp -maxdepth 6 -type d -name target -path '*claude-*' -mmin +120 2>/dev/null \
-    | while read -r d; do
-        act rm -rf "${d}"
-      done
+  # wt-<name>-land-target, and session scratchpads accumulate target/ dirs
+  # after their worktrees are gone. Only dirs idle for more than 2 hours are
+  # candidates.
+  target_file="$(mktemp)"
+  for root in ${tmp_roots}; do
+    [[ -d "${root}" ]] || continue
+    find "${root}" -maxdepth 1 -type d -name 'wt-*-target' -mmin +120 2>/dev/null >>"${target_file}"
+    find "${root}" -maxdepth 6 -type d -name target -path '*claude-*' -mmin +120 2>/dev/null >>"${target_file}"
+  done
+  while read -r d; do
+    [[ -n "${d}" && -d "${d}" ]] || continue
+    kb="$(dir_kb "${d}")"
+    echo "reap ($(human_kb "${kb}")): ${d}"
+    act rm -rf "${d}"
+    note_reaped "${kb}"
+  done <"${target_file}"
+  rm -f "${target_file}"
 fi
 
 echo "==> free space after"
 df -h / | tail -1
-if [[ ${apply} -eq 0 ]]; then
+
+# The failure this reporting exists for: a run that skipped 70 worktrees and
+# freed nothing still printed a tidy summary and read as success. State the
+# number, and state a zero as a zero.
+if [[ ${apply} -eq 1 ]]; then
+  if [[ ${reaped_count} -eq 0 && ${skipped_count} -eq 0 ]]; then
+    echo "RECLAIMED NOTHING: there was nothing to reap."
+  elif [[ ${reaped_count} -eq 0 ]]; then
+    echo "RECLAIMED NOTHING: 0 of ${skipped_count} candidate(s) removed; every one was skipped for the reason printed above."
+  else
+    echo "RECLAIMED: $(human_kb "${reclaimed_kb}") from ${reaped_count} dir(s); ${skipped_count} skipped."
+  fi
+else
+  if [[ ${reaped_count} -eq 0 ]]; then
+    echo "WOULD RECLAIM NOTHING: 0 of ${skipped_count} candidate(s) are reclaimable."
+  else
+    echo "WOULD RECLAIM: $(human_kb "${reclaimed_kb}") from ${reaped_count} dir(s); ${skipped_count} skipped."
+  fi
   echo "Dry run only. Re-run with -y to apply."
 fi
