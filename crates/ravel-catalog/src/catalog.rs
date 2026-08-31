@@ -145,10 +145,13 @@ fn clone_store_error(err: &StoreError) -> StoreError {
 /// snapshot, so a fold that changes either value must re-resolve. Every load
 /// still reads HEAD (one GET) to learn the current `(blake3, parts)`, so a
 /// changed fold is always detected; the cache only ever avoids the SECOND GET,
-/// the stats-object fetch, and only when both keys still match.
+/// the stats-object fetch, and only when both keys still match. The covered
+/// part set is compared against the loaded object's own `part_blake3` (which
+/// `heap_bytes` charges), never a second copy: a duplicate buffer here would
+/// hold 32 uncharged bytes per covered part per entry, silently exceeding the
+/// budget.
 struct CachedColumnStats {
     stats_blake3: [u8; 32],
-    part_blake3: Vec<[u8; 32]>,
     stats: Arc<LoadedColumnStats>,
     /// The entry's charge against the budget, cached at insert time so the
     /// running total and an eviction's refund never re-walk the object. Equal
@@ -230,7 +233,7 @@ impl ColumnStatsCache {
         state.tick += 1;
         let tick = state.tick;
         let entry = state.entries.get_mut(&key)?;
-        if entry.stats_blake3 == *stats_blake3 && entry.part_blake3 == part_blake3 {
+        if entry.stats_blake3 == *stats_blake3 && entry.stats.part_blake3 == part_blake3 {
             entry.last_used = tick;
             Some(Arc::clone(&entry.stats))
         } else {
@@ -247,7 +250,6 @@ impl ColumnStatsCache {
         &self,
         key: (TenantHash, Signal),
         stats_blake3: [u8; 32],
-        part_blake3: Vec<[u8; 32]>,
         stats: Arc<LoadedColumnStats>,
     ) {
         let bytes = stats.heap_bytes();
@@ -294,7 +296,6 @@ impl ColumnStatsCache {
             key,
             CachedColumnStats {
                 stats_blake3,
-                part_blake3,
                 stats,
                 bytes,
                 last_used: tick,
@@ -1016,12 +1017,7 @@ impl Catalog {
         };
         let stats = Arc::new(loaded);
         if let Some(cache) = self.column_stats_cache.as_ref() {
-            cache.insert(
-                (*tenant, signal),
-                resolved.blake3,
-                resolved.expected_part_blake3,
-                Arc::clone(&stats),
-            );
+            cache.insert((*tenant, signal), resolved.blake3, Arc::clone(&stats));
         }
         Ok(Some(stats))
     }
@@ -5927,12 +5923,7 @@ mod tests {
         );
 
         let cache = ColumnStatsCache::new(1 << 20);
-        cache.insert(
-            (tenant(), Signal::Logs),
-            [1u8; 32],
-            loaded.part_blake3.clone(),
-            Arc::clone(&loaded),
-        );
+        cache.insert((tenant(), Signal::Logs), [1u8; 32], Arc::clone(&loaded));
         assert_eq!(
             cache.held_bytes(),
             expected,
@@ -5958,13 +5949,13 @@ mod tests {
         let kc = (tenant_n(3), Signal::Logs);
         let parts = entry.part_blake3.clone();
 
-        cache.insert(ka, [1u8; 32], parts.clone(), Arc::clone(&entry));
-        cache.insert(kb, [1u8; 32], parts.clone(), Arc::clone(&entry));
+        cache.insert(ka, [1u8; 32], Arc::clone(&entry));
+        cache.insert(kb, [1u8; 32], Arc::clone(&entry));
         assert_eq!(cache.held_bytes(), 2 * b, "two entries fit exactly");
         assert_eq!(cache.evictions(), 0, "no eviction at the boundary");
 
         // One over the boundary: evicts the least-recently-used entry (ka).
-        cache.insert(kc, [1u8; 32], parts.clone(), Arc::clone(&entry));
+        cache.insert(kc, [1u8; 32], Arc::clone(&entry));
         assert_eq!(cache.evictions(), 1, "exactly one eviction");
         assert_eq!(
             cache.held_bytes(),
@@ -5997,29 +5988,14 @@ mod tests {
         let parts = entry.part_blake3.clone();
 
         let cache = ColumnStatsCache::new(b);
-        cache.insert(
-            (tenant_n(1), Signal::Logs),
-            [1u8; 32],
-            parts.clone(),
-            Arc::clone(&entry),
-        );
-        cache.insert(
-            (tenant_n(2), Signal::Logs),
-            [1u8; 32],
-            parts.clone(),
-            Arc::clone(&entry),
-        );
+        cache.insert((tenant_n(1), Signal::Logs), [1u8; 32], Arc::clone(&entry));
+        cache.insert((tenant_n(2), Signal::Logs), [1u8; 32], Arc::clone(&entry));
         assert_eq!(cache.evictions(), 1, "one eviction, counted once");
         assert_eq!(cache.refusals(), 0, "an eviction is not a refusal");
 
         // An object larger than the whole budget: refused, not evicted.
         let refuse_cache = ColumnStatsCache::new(b - 1);
-        refuse_cache.insert(
-            (tenant_n(1), Signal::Logs),
-            [1u8; 32],
-            parts.clone(),
-            Arc::clone(&entry),
-        );
+        refuse_cache.insert((tenant_n(1), Signal::Logs), [1u8; 32], Arc::clone(&entry));
         assert_eq!(refuse_cache.refusals(), 1, "oversized object refused once");
         assert_eq!(
             refuse_cache.evictions(),
