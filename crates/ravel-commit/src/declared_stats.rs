@@ -28,9 +28,12 @@
 //!   of the predicate compare `null_count` against the segment's row count,
 //!   which no `DeclaredColumnMinMax` carries: for a stamp it is the carrying
 //!   record's own `sample_count` (`CommitRecord` field 11, `CompactionPart`
-//!   field 6). So [`decode`] and [`decode_all`] stay carrier-agnostic and
-//!   [`read_commit_record`] and [`read_compaction_part`] are where those two
-//!   clauses bind.
+//!   field 6). So [`decode`] stays carrier-agnostic and [`read_commit_record`]
+//!   and [`read_compaction_part`] are where those two clauses bind — and,
+//!   because those two clauses are exactly the row-count gate, they are the
+//!   only functions that produce a [`ValidatedDeclaredStats`] (ADR-0873
+//!   decision 2, "where the predicate binds": coverage is unconstructable
+//!   without the full predicate).
 //! - **The stamp side cannot express an ineligible type at all.** Encoding
 //!   takes only [`DeclaredColumnStat`]s, whose constructor is the typed
 //!   boundary that refuses ineligible types (ADR-0873 decision 2).
@@ -98,22 +101,46 @@ pub struct DroppedStatEntry {
     pub reason: DeclaredStatDefect,
 }
 
-/// The result of reading a record's declared-column statistics: the entries
-/// that are trustworthy, and the ones that were dropped.
+/// A record's declared-column statistics after the **full** statistics
+/// validity predicate has run: the entries that are trustworthy, and the ones
+/// that were dropped.
+///
+/// This type is the coverage grant of ADR-0873 decision 2. Possessing one is
+/// proof that every entry it reports as `covered` passed the entry-local
+/// clauses **and** the row-count clauses (4 and 5) against the carrying
+/// record's own row count. That guarantee is enforced by construction, not by
+/// convention: the fields are private and the constructor
+/// ([`decode_all_against_rows`]) is private to this module, so the only paths
+/// to a `ValidatedDeclaredStats` outside this module are [`read_commit_record`]
+/// and [`read_compaction_part`], each of which supplies the carrier's row
+/// count. There is no public constructor and no public `decode_all`: a caller
+/// cannot obtain coverage without the row count, which is the whole point of
+/// binding the predicate at the point of use rather than at the decode
+/// boundary (ADR-0873 decision 2, "where the predicate binds").
 ///
 /// `covered` empty with `dropped` empty is the normal permanent state of an
 /// unstamped record, not a failure.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct DecodedDeclaredStats {
-    /// Entries that passed validation, in record order.
-    pub covered: Vec<DeclaredColumnStat>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedDeclaredStats {
+    /// Entries that passed the full predicate, in record order.
+    covered: Vec<DeclaredColumnStat>,
     /// Entries that were dropped; each leaves its column uncovered for this
     /// segment. Feed the length to the defect metric (ADR-0873 decision 2).
-    pub dropped: Vec<DroppedStatEntry>,
+    dropped: Vec<DroppedStatEntry>,
 }
 
-impl DecodedDeclaredStats {
-    /// Look up one declared column's statistics by name.
+impl ValidatedDeclaredStats {
+    /// The covered entries, read-only, in record order.
+    pub fn covered(&self) -> &[DeclaredColumnStat] {
+        &self.covered
+    }
+
+    /// The dropped entries, read-only, in record order.
+    pub fn dropped(&self) -> &[DroppedStatEntry] {
+        &self.dropped
+    }
+
+    /// Look up one covered declared column's statistics by name.
     pub fn column(&self, name: &str) -> Option<&DeclaredColumnStat> {
         self.covered.iter().find(|stat| stat.name() == name)
     }
@@ -213,54 +240,50 @@ fn row_count_defect(stat: &DeclaredColumnStat, sample_count: u64) -> Option<Decl
     })
 }
 
-/// Decode a record's stamp list, dropping (and reporting) every entry that
-/// cannot be trusted. Never fails: a defective statistic leaves its column
-/// uncovered, it does not make the record unreadable.
+/// The shared read pass, and the sole constructor of [`ValidatedDeclaredStats`].
 ///
-/// Never fails on entry count either: the list is bounded by the bytes prost
-/// already decoded and allocated, so the pass below is linear in work that has
-/// already been paid for. A count cap would have to refuse a durable,
-/// immutable record whose declared-column count nothing in the tenant-config
-/// path bounds, which is the one outcome this module exists to avoid.
+/// Private to the module by design (ADR-0873 decision 2): coverage must be
+/// unconstructable without the full predicate, so the only public entry points
+/// are [`read_commit_record`] and [`read_compaction_part`], which always pass
+/// `Some(sample_count)`. `sample_count` is `None` only for the module's own
+/// tests exercising the entry-local clauses in isolation, in which case clauses
+/// 4 and 5 are not decidable and the pass checks the entry-local clauses only.
 ///
-/// This checks only the clauses an entry decides on its own. The row-count
-/// clauses need the carrying record's `sample_count`, which a bare entry slice
-/// does not carry; [`read_commit_record`] and [`read_compaction_part`] add
-/// them.
-pub fn decode_all(entries: &[DeclaredColumnMinMax]) -> DecodedDeclaredStats {
-    decode_all_against_rows(entries, None)
-}
-
-/// The shared read pass. `sample_count` is `None` when the caller holds no row
-/// count for the entries, in which case clauses 4 and 5 are not decidable and
-/// the pass checks the entry-local clauses only.
+/// Never fails: a defective statistic leaves its column uncovered, it does not
+/// make the record unreadable. Never fails on entry count either: the list is
+/// bounded by the bytes prost already decoded and allocated, so the pass is
+/// linear in work that has already been paid for. A count cap would have to
+/// refuse a durable, immutable record whose declared-column count nothing in
+/// the tenant-config path bounds, which is the one outcome this module exists
+/// to avoid.
 fn decode_all_against_rows(
     entries: &[DeclaredColumnMinMax],
     sample_count: Option<u64>,
-) -> DecodedDeclaredStats {
-    let mut out = DecodedDeclaredStats::default();
+) -> ValidatedDeclaredStats {
+    let mut covered = Vec::new();
+    let mut dropped = Vec::new();
     // Names, not decoded stats: the name is stored verbatim, and borrowing
-    // from `entries` keeps the set independent of the pushes into `out`.
+    // from `entries` keeps the set independent of the pushes into `covered`.
     let mut seen: HashSet<&str> = HashSet::with_capacity(entries.len());
     for (index, entry) in entries.iter().enumerate() {
         let reason = match decode(entry) {
             Ok(stat) => match sample_count.and_then(|rows| row_count_defect(&stat, rows)) {
                 Some(defect) => defect,
                 None if seen.insert(entry.name.as_str()) => {
-                    out.covered.push(stat);
+                    covered.push(stat);
                     continue;
                 }
                 None => DeclaredStatDefect::DuplicateName(entry.name.clone()),
             },
             Err(reason) => reason,
         };
-        out.dropped.push(DroppedStatEntry {
+        dropped.push(DroppedStatEntry {
             index,
             name: entry.name.clone(),
             reason,
         });
     }
-    out
+    ValidatedDeclaredStats { covered, dropped }
 }
 
 /// Stamp a commit record's declared-column statistics (field 20), replacing
@@ -271,8 +294,11 @@ pub fn stamp_commit_record(record: &mut CommitRecord, stats: &[DeclaredColumnSta
 }
 
 /// Read a commit record's declared-column statistics, reconciled against the
-/// record's own row count (`sample_count`, field 11).
-pub fn read_commit_record(record: &CommitRecord) -> DecodedDeclaredStats {
+/// record's own row count (`sample_count`, field 11). This is one of the only
+/// two functions that yield a [`ValidatedDeclaredStats`]: passing the row count
+/// here is what makes clauses 4 and 5 bind, so the returned coverage cannot
+/// exist without them.
+pub fn read_commit_record(record: &CommitRecord) -> ValidatedDeclaredStats {
     decode_all_against_rows(&record.declared_column_stats, Some(record.sample_count))
 }
 
@@ -284,8 +310,10 @@ pub fn stamp_compaction_part(part: &mut CompactionPart, stats: &[DeclaredColumnS
 }
 
 /// Read one compaction/rewrite output part's declared-column statistics,
-/// reconciled against the part's own row count (`sample_count`, field 6).
-pub fn read_compaction_part(part: &CompactionPart) -> DecodedDeclaredStats {
+/// reconciled against the part's own row count (`sample_count`, field 6). Like
+/// [`read_commit_record`], this is one of the only two producers of a
+/// [`ValidatedDeclaredStats`].
+pub fn read_compaction_part(part: &CompactionPart) -> ValidatedDeclaredStats {
     decode_all_against_rows(&part.declared_column_stats, Some(part.sample_count))
 }
 
@@ -303,6 +331,16 @@ mod tests {
     use uuid::Uuid;
 
     use crate::record::{self, NewCommitRecord};
+
+    /// Entry-local read used by the wave-1 tests: the shared pass with no row
+    /// count, so clauses 4 and 5 do not bind. Deliberately not a public
+    /// function -- coverage is unconstructable without a carrier's row count
+    /// (ADR-0873 decision 2), and this helper is the private route the read
+    /// functions wrap, exposed here only to pin the entry-local clauses in
+    /// isolation.
+    fn decode_all(entries: &[DeclaredColumnMinMax]) -> ValidatedDeclaredStats {
+        super::decode_all_against_rows(entries, None)
+    }
 
     /// A `CommitRecord` as a writer that predates ADR-0873 encodes it: the
     /// same field numbers 1-19 and no field 20 in the schema at all, so its
@@ -431,8 +469,8 @@ mod tests {
         stamp_commit_record(&mut record, &stats);
         let decoded = record::decode(&record::encode(&record)).expect("decode");
         let read = read_commit_record(&decoded);
-        assert_eq!(read.dropped, vec![]);
-        assert_eq!(read.covered, stats);
+        assert!(read.dropped().is_empty());
+        assert_eq!(read.covered().to_vec(), stats);
         let event_date = read.column("EventDate").expect("EventDate covered");
         assert_eq!(event_date.min(), Some(DeclaredStatValue::I64(-5)));
         assert_eq!(event_date.max(), Some(DeclaredStatValue::I64(19_000)));
@@ -448,9 +486,9 @@ mod tests {
         let bytes = part.encode_to_vec();
         let decoded = CompactionPart::decode(bytes.as_slice()).expect("decode part");
         let read = read_compaction_part(&decoded);
-        assert_eq!(read.dropped, vec![]);
-        assert_eq!(read.covered, stats);
-        assert_eq!(read.covered.len(), 1);
+        assert!(read.dropped().is_empty());
+        assert_eq!(read.covered().to_vec(), stats);
+        assert_eq!(read.covered().len(), 1);
     }
 
     #[test]
@@ -468,8 +506,8 @@ mod tests {
         // column and no defect. Not "one entry whose values are zero".
         assert_eq!(decoded.declared_column_stats.len(), 0);
         let read = read_commit_record(&decoded);
-        assert_eq!(read.covered, vec![]);
-        assert_eq!(read.dropped, vec![]);
+        assert!(read.covered().is_empty());
+        assert!(read.dropped().is_empty());
         assert_eq!(read.column("EventDate"), None);
         // Absence of the field is a different state from an entry carrying
         // present-but-zero values, which decodes to a real covered column.
@@ -477,7 +515,7 @@ mod tests {
         stamp_commit_record(&mut stamped, &[i64_stat("EventDate", 0, 0, 0)]);
         let stamped = record::decode(&record::encode(&stamped)).expect("decode stamped");
         let stamped_read = read_commit_record(&stamped);
-        assert_eq!(stamped_read.covered.len(), 1);
+        assert_eq!(stamped_read.covered().len(), 1);
         assert_eq!(
             stamped_read.column("EventDate").map(|s| s.min()),
             Some(Some(DeclaredStatValue::I64(0)))
@@ -549,10 +587,13 @@ mod tests {
         // makes a durable commit record unreadable.
         let decoded = record::decode(&record::encode(&record)).expect("record still decodes");
         let read = read_commit_record(&decoded);
-        assert_eq!(read.covered, vec![i64_stat("EventDate", 1, 2, 0)]);
-        assert_eq!(read.dropped.len(), 4);
         assert_eq!(
-            read.dropped[0],
+            read.covered().to_vec(),
+            vec![i64_stat("EventDate", 1, 2, 0)]
+        );
+        assert_eq!(read.dropped().len(), 4);
+        assert_eq!(
+            read.dropped()[0],
             DroppedStatEntry {
                 index: 0,
                 name: "URL".to_string(),
@@ -562,12 +603,12 @@ mod tests {
             }
         );
         assert_eq!(
-            read.dropped[2].reason,
+            read.dropped()[2].reason,
             DeclaredStatDefect::Invalid(DeclaredStatError::IneligibleType {
                 tag: TYPED_ATTR_COLUMN_TYPE_F64
             })
         );
-        assert_eq!(read.dropped[3].index, 3);
+        assert_eq!(read.dropped()[3].index, 3);
         assert_eq!(read.column("Ratio"), None);
     }
 
@@ -647,10 +688,10 @@ mod tests {
             },
         ];
         let read = decode_all(&entries);
-        assert_eq!(read.covered, vec![]);
-        assert_eq!(read.dropped.len(), 5);
+        assert!(read.covered().is_empty());
+        assert_eq!(read.dropped().len(), 5);
         assert_eq!(
-            read.dropped[0].reason,
+            read.dropped()[0].reason,
             DeclaredStatDefect::Invalid(DeclaredStatError::ValueTypeMismatch {
                 name: "IsRefresh".to_string(),
                 declared: DeclaredStatType::Bool,
@@ -659,7 +700,7 @@ mod tests {
             })
         );
         assert_eq!(
-            read.dropped[1].reason,
+            read.dropped()[1].reason,
             DeclaredStatDefect::Invalid(DeclaredStatError::PresenceMismatch {
                 name: "EventDate".to_string(),
                 min_state: "present",
@@ -667,7 +708,7 @@ mod tests {
             })
         );
         assert_eq!(
-            read.dropped[2].reason,
+            read.dropped()[2].reason,
             DeclaredStatDefect::Invalid(DeclaredStatError::MinAboveMax {
                 name: "Backwards".to_string(),
                 min: DeclaredStatValue::I64(9),
@@ -675,14 +716,14 @@ mod tests {
             })
         );
         assert_eq!(
-            read.dropped[3].reason,
+            read.dropped()[3].reason,
             DeclaredStatDefect::EmptyValueKind {
                 name: "Empty".to_string(),
                 which: "min",
             }
         );
         assert_eq!(
-            read.dropped[4].reason,
+            read.dropped()[4].reason,
             DeclaredStatDefect::Invalid(DeclaredStatError::EmptyName)
         );
     }
@@ -699,11 +740,11 @@ mod tests {
             let entries = vec![encode(first), encode(second)];
             let read = decode_all(&entries);
             // The exact surviving entry, not just its name or its count.
-            assert_eq!(read.covered, vec![first.clone()]);
-            assert_eq!(read.dropped.len(), 1);
+            assert_eq!(read.covered().to_vec(), vec![first.clone()]);
+            assert_eq!(read.dropped().len(), 1);
             // The exact dropped index, which the defect counter attributes by.
             assert_eq!(
-                read.dropped[0],
+                read.dropped()[0],
                 DroppedStatEntry {
                     index: 1,
                     name: "EventDate".to_string(),
@@ -726,7 +767,7 @@ mod tests {
         ];
         let read = decode_all(&entries);
         assert_eq!(
-            read.covered,
+            read.covered().to_vec(),
             vec![
                 i64_stat("Aaa", 1, 2, 0),
                 i64_stat("Bbb", 3, 4, 0),
@@ -734,7 +775,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            read.dropped
+            read.dropped()
                 .iter()
                 .map(|d| (d.index, d.name.as_str()))
                 .collect::<Vec<_>>(),
@@ -782,12 +823,12 @@ mod tests {
 
     /// One entry in, one drop out: nothing covered, exactly one dropped entry
     /// at index 0, and the column reads as uncovered.
-    fn assert_single_drop(read: &DecodedDeclaredStats, name: &str, reason: DeclaredStatDefect) {
-        assert_eq!(read.covered, vec![]);
-        assert_eq!(read.covered.len(), 0);
-        assert_eq!(read.dropped.len(), 1);
+    fn assert_single_drop(read: &ValidatedDeclaredStats, name: &str, reason: DeclaredStatDefect) {
+        assert!(read.covered().is_empty());
+        assert_eq!(read.covered().len(), 0);
+        assert_eq!(read.dropped().len(), 1);
         assert_eq!(
-            read.dropped[0],
+            read.dropped()[0],
             DroppedStatEntry {
                 index: 0,
                 name: name.to_string(),
@@ -817,8 +858,8 @@ mod tests {
         // the record layer: the same entry slice, with no row count to
         // reconcile against, is carrier-agnostically clean.
         let entry_only = decode_all(&record.declared_column_stats);
-        assert_eq!(entry_only.dropped.len(), 0);
-        assert_eq!(entry_only.covered.len(), 1);
+        assert_eq!(entry_only.dropped().len(), 0);
+        assert_eq!(entry_only.covered().len(), 1);
     }
 
     #[test]
@@ -923,15 +964,21 @@ mod tests {
             let entries = vec![encode(&stat)];
             let record = decoded_record(sample_count, entries.clone());
             let read = read_commit_record(&record);
-            assert_eq!(read.dropped, vec![], "record, sample_count {sample_count}");
-            assert_eq!(read.covered, vec![stat.clone()]);
-            assert_eq!(read.covered.len(), 1);
+            assert!(
+                read.dropped().is_empty(),
+                "record, sample_count {sample_count}"
+            );
+            assert_eq!(read.covered().to_vec(), vec![stat.clone()]);
+            assert_eq!(read.covered().len(), 1);
 
             let part = decoded_part(sample_count, entries);
             let read = read_compaction_part(&part);
-            assert_eq!(read.dropped, vec![], "part, sample_count {sample_count}");
-            assert_eq!(read.covered, vec![stat]);
-            assert_eq!(read.covered.len(), 1);
+            assert!(
+                read.dropped().is_empty(),
+                "part, sample_count {sample_count}"
+            );
+            assert_eq!(read.covered().to_vec(), vec![stat]);
+            assert_eq!(read.covered().len(), 1);
         }
     }
 
@@ -953,21 +1000,27 @@ mod tests {
         assert_eq!(record.declared_column_stats.len(), 3);
         assert_eq!(record.sample_count, 7);
         let read = read_commit_record(&record);
-        assert_eq!(read.covered, vec![valid_head.clone(), valid_tail.clone()]);
-        assert_eq!(read.covered.len(), 2);
-        assert_eq!(read.dropped.len(), 1);
-        assert_eq!(read.dropped[0].index, 1);
-        assert_eq!(read.dropped[0].name, "Status");
+        assert_eq!(
+            read.covered().to_vec(),
+            vec![valid_head.clone(), valid_tail.clone()]
+        );
+        assert_eq!(read.covered().len(), 2);
+        assert_eq!(read.dropped().len(), 1);
+        assert_eq!(read.dropped()[0].index, 1);
+        assert_eq!(read.dropped()[0].name, "Status");
         assert_eq!(read.column("Status"), None);
         assert_eq!(read.column("EventDate"), Some(&valid_head));
 
         let part = decoded_part(7, entries);
         assert_eq!(part.declared_column_stats.len(), 3);
         let read = read_compaction_part(&part);
-        assert_eq!(read.covered, vec![valid_head, valid_tail.clone()]);
-        assert_eq!(read.covered.len(), 2);
-        assert_eq!(read.dropped.len(), 1);
-        assert_eq!(read.dropped[0].index, 1);
+        assert_eq!(
+            read.covered().to_vec(),
+            vec![valid_head, valid_tail.clone()]
+        );
+        assert_eq!(read.covered().len(), 2);
+        assert_eq!(read.dropped().len(), 1);
+        assert_eq!(read.dropped()[0].index, 1);
         assert_eq!(read.column("Status"), None);
         assert_eq!(read.column("Latency"), Some(&valid_tail));
     }
@@ -984,8 +1037,8 @@ mod tests {
             .map(|i| encode(&i64_stat(&format!("Column{i}"), 0, i, 0)))
             .collect();
         let read = decode_all(&entries);
-        assert_eq!(read.covered.len(), usize::try_from(count).expect("fits"));
-        assert_eq!(read.dropped, vec![]);
+        assert_eq!(read.covered().len(), usize::try_from(count).expect("fits"));
+        assert!(read.dropped().is_empty());
         assert_eq!(
             read.column("Column4095").map(|s| s.max()),
             Some(Some(DeclaredStatValue::I64(4_095)))
@@ -1004,21 +1057,103 @@ mod tests {
         // Every prefix either fails with a typed error or decodes to a record
         // whose stats are a subset of what was written: prost decodes whole
         // length-delimited fields only, so no half-read stat is ever trusted.
-        let written = read_commit_record(&record).covered;
+        let written = read_commit_record(&record).covered().to_vec();
         assert_eq!(written.len(), 1);
         for cut in 0..bytes.len() {
             if let Ok(decoded) = record::decode(&bytes[..cut]) {
                 let read = read_commit_record(&decoded);
                 assert!(
-                    read.dropped.is_empty(),
+                    read.dropped().is_empty(),
                     "cut {cut} produced a defective stat"
                 );
                 assert!(
-                    read.covered.iter().all(|stat| written.contains(stat)),
+                    read.covered().iter().all(|stat| written.contains(stat)),
                     "cut {cut} invented a stat"
                 );
             }
         }
+    }
+
+    /// ADR-0873 decision 2 ("where the predicate binds"): a
+    /// [`ValidatedDeclaredStats`] is the coverage grant, and it is
+    /// unconstructable without the full predicate. Its fields are private and
+    /// its only constructor (`decode_all_against_rows`) is private to the
+    /// module, so outside this module the sole producers are
+    /// [`read_commit_record`] and [`read_compaction_part`], each of which
+    /// supplies the carrier's row count. A downstream (wave-2) reader that
+    /// holds a `ValidatedDeclaredStats` therefore holds proof that the
+    /// row-count clauses ran; it has no other way to build one.
+    ///
+    /// The structural half of the guarantee -- that no bypass exists -- is
+    /// enforced by that privacy and cannot be exercised from outside the
+    /// module, so it needs no runtime assertion (an attempted direct
+    /// construction in a sibling crate would simply not compile). This test
+    /// pins the constructive half: the two read functions ARE sufficient, so a
+    /// reader needs nothing beyond them to obtain coverage.
+    #[test]
+    fn the_two_read_functions_are_the_sufficient_producers_of_coverage() {
+        let mut record = base_record();
+        stamp_commit_record(&mut record, &[i64_stat("EventDate", 1, 2, 0)]);
+        let record = record::decode(&record::encode(&record)).expect("decode");
+        let from_commit: ValidatedDeclaredStats = read_commit_record(&record);
+        assert_eq!(from_commit.covered().len(), 1);
+        assert!(from_commit.column("EventDate").is_some());
+
+        let mut part = base_part(SAMPLE_COUNT);
+        stamp_compaction_part(&mut part, &[i64_stat("EventDate", 1, 2, 0)]);
+        let part = CompactionPart::decode(part.encode_to_vec().as_slice()).expect("decode part");
+        let from_part: ValidatedDeclaredStats = read_compaction_part(&part);
+        assert_eq!(from_part.covered().len(), 1);
+        assert!(from_part.column("EventDate").is_some());
+    }
+
+    /// Regression (ADR-0873 decision 2): the row-count clauses cannot be
+    /// skipped through any public path. An entry with `null_count >
+    /// sample_count` (clause 4) is dropped by BOTH public readers, because both
+    /// pass the carrier's row count to the shared pass and there is no public
+    /// route that omits it.
+    ///
+    /// The closed bypass is demonstrated against the module-private entry-local
+    /// pass: the same entries through `decode_all_against_rows(_, None)` -- the
+    /// only unvalidated route, now private -- leave the offending entry
+    /// COVERED, because with no row count clauses 4 and 5 cannot bind.
+    /// Re-exposing that route is exactly the flip that would let the
+    /// unvalidated entry grant coverage: in `read_commit_record`, passing
+    /// `None` instead of `Some(record.sample_count)` to
+    /// `decode_all_against_rows` reproduces the pre-fix hole, and it is
+    /// unreachable from outside the module.
+    #[test]
+    fn row_count_clauses_are_not_skippable_through_any_public_path() {
+        // Eight NULLs in a seven-row object: clause 4 violated.
+        let entries = vec![encode(&i64_stat("EventDate", 1, 2, 8))];
+
+        let record = decoded_record(7, entries.clone());
+        let read = read_commit_record(&record);
+        assert!(read.column("EventDate").is_none());
+        assert_eq!(read.covered().len(), 0);
+        assert_eq!(read.dropped().len(), 1);
+        assert_eq!(
+            read.dropped()[0].reason,
+            DeclaredStatDefect::NullCountAboveSampleCount {
+                name: "EventDate".to_string(),
+                null_count: 8,
+                sample_count: 7,
+            }
+        );
+
+        let part = decoded_part(7, entries);
+        let read = read_compaction_part(&part);
+        assert!(read.column("EventDate").is_none());
+        assert_eq!(read.covered().len(), 0);
+        assert_eq!(read.dropped().len(), 1);
+
+        // The unvalidated entry-local route is the bypass this change closes:
+        // with no row count, the very same entry is covered. This is the state
+        // re-exposing the flipped line would let a public reader observe.
+        let unvalidated = decode_all(&record.declared_column_stats);
+        assert_eq!(unvalidated.covered().len(), 1);
+        assert_eq!(unvalidated.dropped().len(), 0);
+        assert!(unvalidated.column("EventDate").is_some());
     }
 
     fn stat_strategy() -> impl Strategy<Value = DeclaredColumnStat> {
@@ -1079,8 +1214,8 @@ mod tests {
             stamp_commit_record(&mut record, &stats);
             let decoded = record::decode(&record::encode(&record)).expect("decode");
             let read = read_commit_record(&decoded);
-            prop_assert_eq!(&read.dropped, &vec![]);
-            prop_assert_eq!(&read.covered, &stats);
+            prop_assert!(read.dropped().is_empty());
+            prop_assert_eq!(read.covered().to_vec(), stats);
         }
 
         #[test]
@@ -1090,8 +1225,8 @@ mod tests {
             let bytes = part.encode_to_vec();
             let decoded = CompactionPart::decode(bytes.as_slice()).expect("decode");
             let read = read_compaction_part(&decoded);
-            prop_assert_eq!(&read.dropped, &vec![]);
-            prop_assert_eq!(&read.covered, &stats);
+            prop_assert!(read.dropped().is_empty());
+            prop_assert_eq!(read.covered().to_vec(), stats);
         }
 
         // Truncating a stamped record at any point is a typed error or a
@@ -1105,8 +1240,8 @@ mod tests {
             let n = cut.min(bytes.len());
             if let Ok(decoded) = record::decode(&bytes[..n]) {
                 let read = read_commit_record(&decoded);
-                prop_assert!(read.dropped.is_empty());
-                prop_assert!(read.covered.iter().all(|s| stats.contains(s)));
+                prop_assert!(read.dropped().is_empty());
+                prop_assert!(read.covered().iter().all(|s| stats.contains(s)));
             }
         }
 
@@ -1117,7 +1252,7 @@ mod tests {
         fn arbitrary_bytes_never_panic(raw in prop::collection::vec(any::<u8>(), 0..192)) {
             if let Ok(record) = CommitRecord::decode(raw.as_slice()) {
                 let read = read_commit_record(&record);
-                for stat in &read.covered {
+                for stat in read.covered() {
                     prop_assert!(!stat.name().is_empty());
                     if let (Some(min), Some(max)) = (stat.min(), stat.max()) {
                         prop_assert_eq!(min.stat_type(), stat.declared_type());
@@ -1168,8 +1303,8 @@ mod tests {
                     // Dropped, and the record-level read reports exactly one
                     // defect for it.
                     let read = decode_all(&[entry]);
-                    prop_assert_eq!(read.covered.len(), 0);
-                    prop_assert_eq!(read.dropped.len(), 1);
+                    prop_assert_eq!(read.covered().len(), 0);
+                    prop_assert_eq!(read.dropped().len(), 1);
                 }
             }
         }
