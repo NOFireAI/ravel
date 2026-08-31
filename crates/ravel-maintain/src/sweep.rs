@@ -1113,12 +1113,11 @@ pub struct CatalogSweepOutcome {
 /// [`sweep_idempotency_markers`], not inside the per-shard [`sweep_shard`]
 /// loop.
 ///
-/// No production driver calls it yet. `ravel-server`'s maintenance tick runs
-/// [`sweep_idempotency_markers`] and [`sweep_erasure_requests`] at that
-/// granularity but not this rule, so unreferenced catalog objects are
-/// currently collected by nothing outside tests. Stated here rather than left
-/// as the present-tense "the dispatcher calls this", which this doc claimed
-/// before it was true of any rule.
+/// The production driver is `ravel-server`'s maintenance tick
+/// (`services/ravel-server/src/maintain.rs`), which calls this once per
+/// (tenant, signal) for every signal, gated on ownership of shard 0 of that
+/// pair, alongside [`sweep_idempotency_markers`] and
+/// [`sweep_erasure_requests`].
 pub async fn sweep_unreferenced_catalog_objects(
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
@@ -1354,8 +1353,8 @@ pub struct ErasureRequestSweepOutcome {
 /// per-shard [`sweep_shard`] loop. That order is what makes the rule safe:
 /// the `.done` this rule waits on is written by the same tick that verified
 /// the rewrite, so a `.dreq` is only ever removed after its erasure is
-/// durably complete. ([`sweep_unreferenced_catalog_objects`] is at the same
-/// granularity but has no driver yet; see its own doc.) A listing entry under
+/// durably complete. ([`sweep_unreferenced_catalog_objects`] runs at the same
+/// granularity in that same tick; see its own doc.) A listing entry under
 /// `del/` that is neither a `.dreq` nor a `.done` is layout drift and fails
 /// the pass loud, matching the resolver's and the rewrite pass's fail-loud
 /// discipline for this keyspace.
