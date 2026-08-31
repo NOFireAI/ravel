@@ -136,14 +136,14 @@ pub fn decode(entry: &DeclaredColumnMinMax) -> Result<DeclaredColumnStat, Declar
     };
     let min = extremum(&entry.min, "min")?;
     let max = extremum(&entry.max, "max")?;
-    let stat = DeclaredColumnStat::new(
+    DeclaredColumnStat::new(
         entry.name.clone(),
         declared_type,
         min,
         max,
         entry.null_count,
-    )?;
-    Ok(stat)
+    )
+    .map_err(DeclaredStatDefect::from)
 }
 
 /// Decode a record's stamp list, dropping (and reporting) every entry that
