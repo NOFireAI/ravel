@@ -889,6 +889,15 @@ impl Catalog {
         // GET per fold regardless of how many CAS attempts the loop makes.
         counters.get_requests += 1;
 
+        // One tally cache for the WHOLE fold, CAS retries included: a lost
+        // HEAD CAS restarts the loop, and a cache constructed inside it would
+        // discard every successful tally and refetch the same objects on the
+        // next attempt. The declared columns, tenant, and signal are fixed for
+        // the fold, and a failed tally is never cached, so reuse across
+        // attempts is safe by the cache's own contract.
+        let mut column_stats_cache =
+            column_stats_build::SegmentColumnStatsCache::new(&typed_attr_columns);
+
         loop {
             let head_state = self.get_head(&head_key, &mut counters).await?;
 
@@ -1467,9 +1476,8 @@ impl Catalog {
             // One tally per covered object serves BOTH publishes (#964): the
             // two passes cover the same L0 entries, and each fetching and
             // scanning the object for itself cost two reads per L0 part where
-            // one does.
-            let mut column_stats_cache =
-                column_stats_build::SegmentColumnStatsCache::new(&typed_attr_columns);
+            // one does. The cache itself is constructed before the retry
+            // loop, so a lost CAS keeps its tallies too.
             let (column_stats_built, column_stats_size, column_stats_ref) = if typed_attr_columns
                 .is_empty()
             {
