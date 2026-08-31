@@ -484,10 +484,11 @@ fn render_store_family(out: &mut String, mode: Mode, snapshot: &StoreMetricsSnap
     write_header(
         out,
         "ravel_store_attempts_total",
-        "Billed HTTP requests including retries, by operation (issue #928). \
-         Always >= ravel_store_calls_total for an HTTP backend; the difference \
-         is the retry overhead object_store's loop hides below the call count. \
-         Zero for a non-HTTP backend.",
+        "Billed HTTP requests, by operation (issue #928). Always >= \
+         ravel_store_calls_total for an HTTP backend. Retries are one reason it \
+         exceeds the call count and not the only one: a whole-object read and a \
+         multipart write each issue several HTTP requests per logical call, so \
+         the difference is not a retry count. Zero for a non-HTTP backend.",
         "counter",
     );
     for op in StoreOp::ALL {
