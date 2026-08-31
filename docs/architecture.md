@@ -12,44 +12,7 @@ reasoning and the exact contracts. The doc index in
 
 ## The write path
 
-<svg viewBox="0 0 900 470" width="900" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Write path: clients through gateway, router, and shard actors to object storage">
-  <style>
-    .b{fill:#ffffff;stroke:#333;stroke-width:1.2;}
-    .g{fill:#f2f2f2;stroke:#333;stroke-width:1.2;}
-    .s{fill:#fff7e0;stroke:#8a6d00;stroke-width:1.2;}
-    .t{font:12px monospace;fill:#111;}
-    .h{font:bold 12px monospace;fill:#111;}
-    .a{stroke:#333;stroke-width:1.2;fill:none;marker-end:url(#awT);}
-  </style>
-  <defs>
-    <marker id="awT" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#333"/></marker>
-  </defs>
-  <rect class="b" x="240" y="8" width="420" height="30"/>
-  <text class="h" x="252" y="28">OTLP gRPC / OTLP HTTP / Remote Write 1.0 + 2.0</text>
-  <path class="a" d="M450,38 L450,64"/>
-  <rect class="b" x="240" y="66" width="420" height="46"/>
-  <text class="h" x="252" y="84">gateway: auth, tenant resolution, admission limits</text>
-  <text class="t" x="252" y="100">per-tenant body size, byte rate, series and stream caps</text>
-  <path class="a" d="M450,112 L450,138"/>
-  <rect class="b" x="240" y="140" width="420" height="46"/>
-  <text class="h" x="252" y="158">ingest router</text>
-  <text class="t" x="252" y="174">shard = hash(tenant, series or stream identity) % shards</text>
-  <path class="a" d="M450,186 L450,212"/>
-  <rect class="b" x="160" y="214" width="580" height="62"/>
-  <text class="h" x="172" y="232">shard actors, one single-threaded task per shard</text>
-  <text class="t" x="172" y="248">buffer records, then build one immutable columnar object in memory:</text>
-  <text class="t" x="172" y="264">RSEG (metrics), RLOG (logs), RSPAN (spans); blake3 over the bytes</text>
-  <path class="a" d="M450,276 L450,302"/>
-  <rect class="g" x="160" y="304" width="580" height="62"/>
-  <text class="h" x="172" y="322">object store (S3 / MinIO; memory and fault-injecting in tests)</text>
-  <text class="t" x="172" y="338">1. data PUT (create-if-absent, upload checksum)</text>
-  <text class="t" x="172" y="354">2. commit-record PUT (create-if-absent) -- the atomic publish</text>
-  <path class="a" d="M450,366 L450,392"/>
-  <rect class="s" x="160" y="394" width="580" height="62"/>
-  <text class="h" x="172" y="412">acknowledgement</text>
-  <text class="t" x="172" y="428">strict: the client is answered only after both PUTs are durable;</text>
-  <text class="t" x="172" y="444">the response carries a commit token that makes the write readable</text>
-</svg>
+![Write path: clients through gateway, router, and shard actors to object storage, then acknowledgement](diagrams/architecture-write-path.svg)
 
 A batch enters through the gateway, which resolves the tenant and applies
 that tenant's admission limits. The router hashes each record's identity to
@@ -75,51 +38,7 @@ proto/, and the object key layout (docs/catalog-and-mvcc.md).
 
 ## The catalog and the read path
 
-<svg viewBox="0 0 900 430" width="900" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Read path: commit records fold into a snapshot; queries resolve the snapshot and read segments">
-  <style>
-    .b{fill:#ffffff;stroke:#333;stroke-width:1.2;}
-    .g{fill:#f2f2f2;stroke:#333;stroke-width:1.2;}
-    .s{fill:#fff7e0;stroke:#8a6d00;stroke-width:1.2;}
-    .t{font:12px monospace;fill:#111;}
-    .h{font:bold 12px monospace;fill:#111;}
-    .a{stroke:#333;stroke-width:1.2;fill:none;marker-end:url(#arP);}
-  </style>
-  <defs>
-    <marker id="arP" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#333"/></marker>
-  </defs>
-  <rect class="g" x="60" y="8" width="780" height="58"/>
-  <text class="h" x="76" y="26">object store</text>
-  <text class="t" x="76" y="42">commit records (one per data object) | snapshot HEAD + parts | derived</text>
-  <text class="t" x="76" y="58">catalog objects: column statistics (.cstat), name postings (.npost)</text>
-  <path class="a" d="M250,66 L250,96"/>
-  <rect class="b" x="80" y="98" width="340" height="76"/>
-  <text class="h" x="92" y="116">catalog fold (background, per tenant and signal)</text>
-  <text class="t" x="92" y="132">lists sealed commit records, folds them into</text>
-  <text class="t" x="92" y="148">snapshot parts, publishes HEAD by CAS;</text>
-  <text class="t" x="92" y="164">losing the CAS is ordinary, never corruption</text>
-  <path class="a" d="M600,66 L600,96"/>
-  <rect class="b" x="480" y="98" width="340" height="76"/>
-  <text class="h" x="492" y="116">query resolve</text>
-  <text class="t" x="492" y="132">one GET of HEAD pins one immutable snapshot;</text>
-  <text class="t" x="492" y="148">the whole query runs against that snapshot,</text>
-  <text class="t" x="492" y="164">so a concurrent fold never changes its answer</text>
-  <path class="a" d="M600,174 L600,204"/>
-  <rect class="b" x="160" y="206" width="580" height="78"/>
-  <text class="h" x="172" y="224">plan and prune</text>
-  <text class="t" x="172" y="240">time window and shard bounds from the snapshot; skip indexes, bloom</text>
-  <text class="t" x="172" y="256">filters, and exact column statistics prune objects and blocks; a prune</text>
-  <text class="t" x="172" y="272">may only ever widen the read set, never narrow it below correctness</text>
-  <path class="a" d="M450,284 L450,314"/>
-  <rect class="b" x="160" y="316" width="580" height="52"/>
-  <text class="h" x="172" y="334">fetch and decode</text>
-  <text class="t" x="172" y="350">footer probe, then ranged or whole-object GETs; a read cache holds hot chunks</text>
-  <path class="a" d="M320,368 L320,398"/>
-  <path class="a" d="M580,368 L580,398"/>
-  <rect class="s" x="160" y="400" width="300" height="26"/>
-  <text class="h" x="172" y="418">PromQL evaluator (/api/v1/*)</text>
-  <rect class="s" x="480" y="400" width="340" height="26"/>
-  <text class="h" x="492" y="418">SQL: samples, logs, spans (/api/v1/sql, Flight SQL)</text>
-</svg>
+![Read path: commit records fold into a snapshot; queries pin the snapshot, prune, fetch, and evaluate](diagrams/architecture-read-path.svg)
 
 Commit records are the write-side truth, and the catalog fold turns them
 into a read-side index. The fold runs in the background per tenant and
@@ -217,57 +136,7 @@ this isolation.
 
 ## Distributed reads and cross-cluster federation
 
-<svg viewBox="0 0 900 540" width="900" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Cluster topology: symmetric query nodes over one shared bucket, with remote clusters reached only through their API">
-  <style>
-    .b{fill:#ffffff;stroke:#333;stroke-width:1.2;}
-    .g{fill:#f2f2f2;stroke:#333;stroke-width:1.2;}
-    .s{fill:#fff7e0;stroke:#8a6d00;stroke-width:1.2;}
-    .r{fill:#eef4ff;stroke:#1f4e9c;stroke-width:1.2;}
-    .t{font:12px monospace;fill:#111;}
-    .h{font:bold 12px monospace;fill:#111;}
-    .a{stroke:#333;stroke-width:1.2;fill:none;marker-end:url(#arT);}
-    .d{stroke:#1f4e9c;stroke-width:1.2;fill:none;marker-end:url(#arTd);stroke-dasharray:5 3;}
-  </style>
-  <defs>
-    <marker id="arT" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#333"/></marker>
-    <marker id="arTd" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#1f4e9c"/></marker>
-  </defs>
-  <rect class="b" x="280" y="8" width="280" height="30"/>
-  <text class="h" x="292" y="28">Clients (PromQL / SQL / Flight SQL)</text>
-  <path class="a" d="M380,38 L220,82"/>
-  <path class="a" d="M460,38 L620,82"/>
-  <rect class="b" x="60" y="84" width="320" height="100"/>
-  <text class="h" x="72" y="102">query node A -- coordinator</text>
-  <text class="t" x="72" y="118">mode all|query, --distributed-query</text>
-  <text class="t" x="72" y="134">resolves ONE pinned snapshot</text>
-  <text class="t" x="72" y="150">partitions, dispatches, merges</text>
-  <text class="t" x="72" y="166">serves SeriesFetch + Flight SQL</text>
-  <rect class="b" x="460" y="84" width="380" height="100"/>
-  <text class="h" x="472" y="102">query node B -- peer worker</text>
-  <text class="t" x="472" y="118">same binary, same flags: any node is a</text>
-  <text class="t" x="472" y="134">coordinator for the requests it receives</text>
-  <text class="t" x="472" y="150">and a worker for its peers' slices</text>
-  <text class="t" x="472" y="166">fragment surface on --listen-grpc only</text>
-  <path class="a" d="M380,118 L456,118"/>
-  <path class="a" d="M460,150 L384,150"/>
-  <text class="t" x="20" y="206">A and B exchange slices in either direction over the cluster-internal gRPC listener, bearer-token authed.</text>
-  <path class="a" d="M200,184 L200,226"/>
-  <path class="a" d="M640,184 L640,226"/>
-  <rect class="g" x="60" y="228" width="780" height="76"/>
-  <text class="h" x="76" y="246">S3 bucket = one cluster (the only durable state)</text>
-  <text class="t" x="76" y="262">immutable segments, commit records, manifests, snapshot HEAD/parts</text>
-  <text class="t" x="76" y="278">sys/gc, sys/tenancy, sys/query/workers/&lt;process_id&gt; heartbeats</text>
-  <text class="t" x="20" y="326">Membership: every distributed query node PUTs its own sys/query/workers/&lt;process_id&gt; record every</text>
-  <text class="t" x="20" y="342">60 s; readers take the live set as records within 3 x H and rendezvous-hash (tenant_hash, signal, shard).</text>
-  <path class="d" d="M450,356 L450,390"/>
-  <text class="t" x="470" y="378">reached only through their own API</text>
-  <rect class="r" x="60" y="392" width="780" height="96"/>
-  <text class="h" x="76" y="410">Remote Ravel clusters (--remote-cluster): separate buckets, separate trust domains</text>
-  <text class="t" x="76" y="426">Reached only through the remote's own API endpoint: the coordinator sends matchers and a window,</text>
-  <text class="t" x="76" y="442">the remote resolves its own snapshot under its own operator credential and its own erasure.</text>
-  <text class="t" x="76" y="458">No segment references, no S3 credentials, and no client credential ever cross this boundary.</text>
-  <text class="t" x="20" y="514">Compute stays disposable: a node can be added or removed at any time, and membership reconverges.</text>
-</svg>
+![Cluster topology: symmetric query nodes over one shared bucket, with remote clusters reached only through their API](diagrams/architecture-cluster-topology.svg)
 
 A read can span more than one process. This is off by default and
 cost-gated: the node that receives a request coordinates it, resolves one

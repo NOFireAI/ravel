@@ -24,6 +24,39 @@ code: 2026-07-27 (Phase 1 -- OTLP ingest, commit, catalog, PromQL selector
 queries -- is complete and running end to end; OTAP ingest is scaffolded but
 not wired into the gateway).
 
+## architecture-write-path.svg
+
+The write path as docs/architecture.md describes it today: clients through
+the gateway (auth, tenant, admission), the ingest router's shard hash, the
+single-threaded shard actors building one immutable columnar object per
+flush, the two-PUT publish (data object, then commit record), and the
+strict acknowledgement that answers only after both are durable.
+
+Illustrates: docs/architecture.md "The write path",
+docs/consistency-model.md.
+
+## architecture-read-path.svg
+
+Commit records fold into snapshot parts and a HEAD published by CAS; a
+query pins one snapshot with a single GET, prunes with the snapshot's
+bounds, skip indexes, blooms, and exact column statistics, fetches by
+ranged or whole-object GETs through the read cache, and evaluates through
+PromQL or SQL.
+
+Illustrates: docs/architecture.md "The catalog and the read path",
+docs/catalog-and-mvcc.md.
+
+## architecture-cluster-topology.svg
+
+Symmetric distributed query nodes over one shared bucket (the only durable
+state), heartbeat-registered workers with rendezvous hashing, and remote
+clusters as separate trust domains reached only through their own API.
+Moved out of the inline form docs/architecture.md previously carried, so
+GitHub renders it.
+
+Illustrates: docs/architecture.md "Distributed reads and cross-cluster
+federation", docs/query-engine.md.
+
 ## ingest-commit-sequence.svg
 
 A vertical sequence diagram of one strict-mode flush: pin the flush
