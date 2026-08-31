@@ -5947,6 +5947,8 @@ mod tests {
         let ka = (tenant_n(1), Signal::Logs);
         let kb = (tenant_n(2), Signal::Logs);
         let kc = (tenant_n(3), Signal::Logs);
+        // Lookups still verify the part binding against the loaded object's
+        // own copy; the cache stores no duplicate.
         let parts = entry.part_blake3.clone();
 
         cache.insert(ka, [1u8; 32], Arc::clone(&entry));
@@ -5985,7 +5987,6 @@ mod tests {
     fn column_stats_cache_eviction_counter_increments_by_one() {
         let entry = make_loaded(1);
         let b = entry.heap_bytes();
-        let parts = entry.part_blake3.clone();
 
         let cache = ColumnStatsCache::new(b);
         cache.insert((tenant_n(1), Signal::Logs), [1u8; 32], Arc::clone(&entry));
