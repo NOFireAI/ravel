@@ -239,6 +239,19 @@ impl HeadState {
     }
 }
 
+/// Orders v2 column-statistics records by their join key (the covered part's
+/// content hash, carried in `writer_id`) and collapses repeats.
+///
+/// `encode_column_stats_v2` rejects a repeated key outright, and the fold
+/// treats that error as "no field 13 this time", so one repeat would strip the
+/// tenant's part-bound statistics on this and every later fold. A repeated key
+/// means two entries cover a byte-identical part, so their records carry the
+/// same statistics and keeping one is exact rather than a narrowing.
+fn sort_and_dedup_part_segments(segments: &mut Vec<ColumnStatsSegment>) {
+    segments.sort_by(|a, b| a.writer_id.cmp(&b.writer_id));
+    segments.dedup_by(|a, b| a.writer_id == b.writer_id);
+}
+
 /// Greatest ingest-hour bucket sealed at `now_ns` (docs/catalog-and-mvcc.md,
 /// ADR-0020 "Sealed-hour watermark"): the greatest `H` such that
 /// `now_ns >= end(H) + max_flush_lifetime + clock_skew_allowance +
@@ -1742,7 +1755,15 @@ impl Catalog {
                         }
                     }
                     // v2 records sort by their content hash (in writer_id).
-                    part_segments.sort_by(|a, b| a.writer_id.cmp(&b.writer_id));
+                    // Two entries can carry the same content hash: one bucket
+                    // can hold compaction records with different input sets and
+                    // a rewrite record that all reference a byte-identical
+                    // output part. `encode_column_stats_v2` rejects the whole
+                    // artifact on a repeated key, which would drop field 13 for
+                    // the tenant on this and every later fold, so collapse the
+                    // repeats first. A shared content hash means a byte-identical
+                    // part, so the records are equal and keeping one is exact.
+                    sort_and_dedup_part_segments(&mut part_segments);
 
                     match snapshot_format::encode_column_stats_v2(
                         tenant.0,
@@ -3319,6 +3340,59 @@ mod tests {
         // Neither collapsed onto the other: exact, per-part values.
         assert_status_column(rec0, 4, 0, 200, 500, &[(200, 2), (404, 1), (500, 1)], 1304);
         assert_status_column(rec1, 3, 0, 200, 500, &[(200, 1), (500, 2)], 1200);
+    }
+
+    /// ADR-0942: one bucket can hold two entries that cover a byte-identical
+    /// output part, so they carry the same content hash under different
+    /// identity tuples (compaction records with different input sets, plus a
+    /// rewrite record's own parts). `encode_column_stats_v2` rejects a repeated
+    /// key for the WHOLE artifact, and the fold's error arm only logs, so a
+    /// single repeat would strip field 13 for that tenant on this and every
+    /// later fold. Sorting alone does not prevent it; the repeat is collapsed.
+    #[test]
+    fn duplicate_part_content_hashes_are_collapsed_before_encoding() {
+        let shared = vec![7u8; 32];
+        let other = vec![9u8; 32];
+        let seg = |hash: &Vec<u8>| ColumnStatsSegment {
+            writer_id: hash.clone(),
+            ..Default::default()
+        };
+
+        // What the pre-fix code produced: sorted, but still carrying the repeat.
+        let mut sorted_only = vec![seg(&other), seg(&shared), seg(&shared)];
+        sorted_only.sort_by(|a, b| a.writer_id.cmp(&b.writer_id));
+        let err = snapshot_format::encode_column_stats_v2(
+            [0u8; 16],
+            signal::to_proto(Signal::Logs) as u32,
+            Vec::new(),
+            &sorted_only,
+        )
+        .expect_err("a repeated key is rejected for the whole artifact");
+        assert!(
+            matches!(
+                err,
+                crate::snapshot_format::SnapshotFormatError::ColumnStatsDuplicateSegment
+            ),
+            "expected ColumnStatsDuplicateSegment, got {err:?}"
+        );
+
+        // With the collapse the artifact encodes, and the distinct part survives.
+        let mut segments = vec![seg(&other), seg(&shared), seg(&shared)];
+        sort_and_dedup_part_segments(&mut segments);
+        assert_eq!(
+            segments.len(),
+            2,
+            "the repeat collapsed to one, the distinct part kept"
+        );
+        assert_eq!(segments[0].writer_id, shared, "sorted by content hash");
+        assert_eq!(segments[1].writer_id, other);
+        snapshot_format::encode_column_stats_v2(
+            [0u8; 16],
+            signal::to_proto(Signal::Logs) as u32,
+            Vec::new(),
+            &segments,
+        )
+        .expect("encodes once the repeat is collapsed");
     }
 
     /// ADR-0942 (deliverable 2): the fold DUAL-PUBLISHES. After a fold over an
