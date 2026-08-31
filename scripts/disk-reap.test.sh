@@ -313,7 +313,8 @@ mkdir -p "$fakebin"
 printf '#!/bin/sh\nexit 2\n' >"$fakebin/pgrep"
 chmod +x "$fakebin/pgrep"
 
-out11="$(PATH="$fakebin:$PATH" DISK_REAP_TMP_ROOTS="$base11/scratch" \
+out11="$(PATH="$fakebin:$PATH" DISK_REAP_REPO_ROOT="$base11/repo" \
+  DISK_REAP_TMP_ROOTS="$base11/scratch" \
   bash "$SCRIPT" -y 2>&1)"
 if [ -d "$probe_target" ] && case "$out11" in *"assuming a build is running"*) true ;; *) false ;; esac; then
   pass "a failing pgrep probe is treated as a running build"
@@ -330,11 +331,19 @@ mkdir -p "$override_target"
 echo stale >"$override_target/blob"
 touch -t 202001010000 "$override_target/blob" "$override_target"
 
-# DISK_REAP_BUILD_STATE=idle WITHOUT DISK_REAP_REPO_ROOT: the real probe runs.
-# A broken pgrep alongside it must still win, proving the override was ignored.
+# DISK_REAP_BUILD_STATE=idle WITHOUT DISK_REAP_REPO_ROOT: the real probe runs,
+# and a broken pgrep alongside it must still win.
+#
+# This case cannot set DISK_REAP_REPO_ROOT -- its whole point is the absence of
+# that hook -- so the script would operate on the REAL repository. It therefore
+# runs WITHOUT -y and asserts on the output: a dry run enumerates and reports
+# but removes nothing. Asserting "the directory survives" would be vacuous here
+# for the same reason, so the assertion is that the scan was skipped and no
+# reap line was printed for this path.
 out12="$(PATH="$fakebin:$PATH" DISK_REAP_BUILD_STATE=idle \
-  DISK_REAP_TMP_ROOTS="$base12/scratch" bash "$SCRIPT" -y 2>&1)"
-if [ -d "$override_target" ]; then
+  DISK_REAP_TMP_ROOTS="$base12/scratch" bash "$SCRIPT" 2>&1)"
+if case "$out12" in *"assuming a build is running"*) true ;; *) false ;; esac &&
+  case "$out12" in *"reap"*"$override_target"*) false ;; *) true ;; esac; then
   pass "forced build state is ignored without the repo-root test hook"
 else
   fail "forced build state is ignored without the repo-root test hook" "override bypassed the probe"
