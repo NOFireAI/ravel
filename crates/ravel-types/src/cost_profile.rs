@@ -179,16 +179,26 @@ impl StoreCostProfile {
     /// [`CostProfileError`]; nothing here panics on malformed input.
     pub fn from_toml_str(toml_str: &str) -> Result<StoreCostProfile, CostProfileError> {
         let profile: StoreCostProfile = toml::from_str(toml_str)?;
-        if profile.name.trim().is_empty() {
-            return Err(CostProfileError::EmptyName);
-        }
+        profile.validate_name()?;
         Ok(profile)
     }
 
     /// Render this profile as a TOML document, for a config file or a
-    /// provenance stamp that carries the profile verbatim.
+    /// provenance stamp that carries the profile verbatim. Refuses the same
+    /// blank name the loader refuses: a rendered document that the loader
+    /// would reject is a round-trip trap, and an anonymous profile cannot
+    /// legally be stamped into provenance.
     pub fn to_toml_string(&self) -> Result<String, CostProfileError> {
+        self.validate_name()?;
         Ok(toml::to_string(self)?)
+    }
+
+    /// The one name rule both directions share: non-empty after trimming.
+    fn validate_name(&self) -> Result<(), CostProfileError> {
+        if self.name.trim().is_empty() {
+            return Err(CostProfileError::EmptyName);
+        }
+        Ok(())
     }
 
     /// Nanodollars per request under `class`.
@@ -538,5 +548,19 @@ retrieval_nanodollars_per_gib = 0
 "#;
         let err = StoreCostProfile::from_toml_str(doc).expect_err("blank name must be refused");
         assert!(matches!(err, CostProfileError::EmptyName), "got {err:?}");
+
+        // The renderer shares the rule: a profile the loader would reject
+        // cannot be rendered, so a blank-named stamp cannot exist.
+        let anon = StoreCostProfile {
+            name: "   ".to_string(),
+            ..StoreCostProfile::reference()
+        };
+        let render_err = anon
+            .to_toml_string()
+            .expect_err("blank name must not render");
+        assert!(
+            matches!(render_err, CostProfileError::EmptyName),
+            "got {render_err:?}"
+        );
     }
 }

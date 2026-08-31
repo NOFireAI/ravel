@@ -2984,11 +2984,11 @@ mod tests {
             segments_pruned: 64,
             series_matched: 128,
             bytes_reused: 256,
-            // Non-zero on purpose: these are process-local counters deliberately
-            // NOT carried on the frozen wire proto (page bytes: ADR-0107
-            // decision 4; opens-by-shape: ADR-0904 decision 5; object touches:
-            // ADR-0996 decision 3), so they must decode back as zero, unlike
-            // every other field which round-trips.
+            // Non-zero on purpose: page bytes (ADR-0107 decision 4) and
+            // opens-by-shape (ADR-0904 decision 5) are process-local counters
+            // deliberately NOT carried on the wire proto, so they must decode
+            // back as zero. `data_objects_touched` IS carried (field 16,
+            // ADR-0996 decision 3) and round-trips like every other field.
             page_bytes_fetched: 900,
             page_bytes_decoded: 300,
             logs_whole_object_opens: 6,
