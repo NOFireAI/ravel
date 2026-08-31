@@ -193,30 +193,31 @@ async fn peak_memory_on_rlog_input_bucket() {
     }
 }
 
-/// Issue #977: the retained closed parts are attributed to their OWN phase term
-/// and are NOT folded into the writer term.
+/// ADR-0979 decision 3: on the RLOG compaction path the retained-parts memory
+/// term is ZERO, because each closed part's encoded bytes are released the
+/// moment its PUT succeeds rather than held in `PartSink::parts` until publish.
 ///
-/// A logs compaction under a small stored-size target closes many L1 parts.
-/// Every closed part is PUT but its encoded bytes stay resident in
-/// `PartSink::parts` until publish; that retained residency is the plateau a
-/// large-bucket compaction sits at, and before this ticket it was invisible in
-/// the [`MergeMemoryTracker`]. This drives a compaction that closes at least
-/// three parts and asserts the tracker's retained-parts high-water equals the
-/// EXACT sum of those parts' encoded object sizes (read back from the published
-/// record's `object_size`, which `finalize_part` sets to the same bytes it
-/// retains). The value is derivable, so it is pinned exactly, not bounded.
+/// This is the update to the #977 test that used to pin the retained-parts
+/// high-water to the EXACT sum of the parts' encoded object sizes: that sum was
+/// the plateau a large-bucket compaction sat at, and D3 removes it. The new
+/// truth is the exact figure the charge site now produces. `finalize_part`
+/// releases `built.bytes` at PUT under `retain_bytes = false` (compaction), so
+/// `PartSink::flush` reads `built.bytes.as_ref().map_or(0, ..)` == 0 and charges
+/// `t.add_retained_part_bytes(0)` for every part; the high-water never leaves
+/// zero. It is pinned exactly (== 0), not bounded, and derived from the charge
+/// site, not the fixture's byte totals -- the parts still carry real bytes
+/// (their `object_size` is nonzero), and the point is that none of those bytes
+/// stay resident.
 ///
-/// Non-vacuity / flip proof: the retained bytes are charged at `rlog.rs`'s
-/// `PartSink::flush`, in the line `t.add_retained_part_bytes(retained);`.
-/// Deleting that line (attributing nothing to the retained phase, i.e. leaving
-/// the bytes accounted only through the writer term that `set_writer_bytes`
-/// drives) makes `peak_retained_part_bytes()` stay 0, and the exact-equality
-/// assertion below fails `0 != <sum>`. Rerouting it to `t.set_writer_bytes(
-/// retained)` (folding the retained bytes into the writer phase, the bug this
-/// test exists to catch) fails the same way. Verified failing both ways before
-/// restoring.
+/// Non-vacuity / flip proof: against the pre-D3 code (where `finalize_part`
+/// returned `bytes: object` and never released it, and `PartSink::flush` charged
+/// `built.bytes.len()`), `peak_retained_part_bytes()` equals the nonzero sum of
+/// the parts' `object_size`, so the `== 0` assertion below fails
+/// `<sum> != 0`. The flip is the exact behaviour D3 changes: retention at PUT
+/// vs release at PUT. The other phases are still asserted driven, so a merge
+/// that silently did nothing would fail here too.
 #[tokio::test]
-async fn retained_parts_are_attributed_to_their_own_phase() {
+async fn compaction_retains_no_part_bytes() {
     const INPUTS: usize = 24;
     const STREAMS: u32 = 4;
     const RECORDS_PER_STREAM: usize = 4;
@@ -264,34 +265,28 @@ async fn retained_parts_are_attributed_to_their_own_phase() {
         "the small stored target must close at least three parts, got {}",
         record.parts.len()
     );
+    // The parts really do carry bytes; the point is none of them stay resident.
+    let part_bytes_sum: u64 = record.parts.iter().map(|p| p.object_size).sum();
+    assert!(
+        part_bytes_sum > 0,
+        "the parts must carry real encoded bytes for the release to be meaningful"
+    );
 
-    // The retained-parts phase term equals the exact encoded size of every part
-    // the merge held: each `object_size` is the byte length `finalize_part`
-    // retained in `PartSink::parts`, and every closed part is retained until
-    // publish, so the high-water is their sum.
-    let expected_retained: u64 = record.parts.iter().map(|p| p.object_size).sum();
+    // The exact new truth: the retained-parts high-water is zero, because every
+    // part's bytes were released at PUT (D3), not held until publish.
     assert_eq!(
         tracker.peak_retained_part_bytes(),
-        expected_retained,
-        "retained-parts high-water must equal the exact sum of the parts' encoded sizes"
+        0,
+        "compaction must retain no part bytes; each is released at PUT (ADR-0979 D3)"
     );
 
-    // The retained term is its own phase, not the writer term. The writer term
-    // is decoded Rust heap of one in-progress part at a time; the retained term
-    // is the encoded bytes of every closed part at once. Read them back from the
-    // phase split and confirm the split reports the retained sum under the
-    // retained field, and the writer field is a different (heap) quantity that
-    // does not carry the retained bytes.
     let peaks = tracker.phase_peaks();
     assert_eq!(
-        peaks.retained_part_encoded_bytes, expected_retained,
-        "phase_peaks must carry the retained sum in its retained field"
+        peaks.retained_part_encoded_bytes, 0,
+        "phase_peaks must report zero retained bytes on the compaction path"
     );
-    assert_ne!(
-        peaks.retained_part_encoded_bytes, peaks.writer_heap_bytes,
-        "retained (encoded, all parts) must not be folded into writer (heap, one part)"
-    );
-    // Sanity: the merge really exercised the other phases too.
+    // Sanity: the merge really exercised the other phases too, so the zero above
+    // is a real release, not an inert run.
     assert!(
         peaks.writer_heap_bytes > 0,
         "the in-progress writer term must have been driven"
@@ -305,7 +300,8 @@ async fn retained_parts_are_attributed_to_their_own_phase() {
         "the finish/publish term must have been driven"
     );
     println!(
-        "[memory:rlog:977] parts={} retained_part_encoded_bytes={} writer_heap_bytes={} \
+        "[memory:rlog:979] parts={} part_bytes_sum={part_bytes_sum} \
+         retained_part_encoded_bytes={} writer_heap_bytes={} \
          cursor_bytes={} catalog_directory_decoded_bytes={} publish_record_encoded_bytes={}",
         record.parts.len(),
         peaks.retained_part_encoded_bytes,

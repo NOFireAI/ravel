@@ -954,7 +954,8 @@ mod tests {
         // irrelevant to the publish gate, which reads `part.sample_count`.
         let part = BuiltPart {
             key: "l1/synthetic".to_string(),
-            bytes: Bytes::new(),
+            bytes: Some(Bytes::new()),
+            put_already_existed: false,
             part: CompactionPart {
                 part_index: 0,
                 content_hash: vec![0u8; 32],

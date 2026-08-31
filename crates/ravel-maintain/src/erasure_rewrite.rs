@@ -1150,8 +1150,12 @@ fn build_rewrite_part(
     };
     Ok(BuiltPart {
         key,
-        bytes: written.bytes,
+        // The erasure rewrite retains part bytes until its own publish path PUTs
+        // them (ADR-0979 decision 3); it never routes through the drop-at-PUT
+        // compaction path, so `put_already_existed` stays false.
+        bytes: Some(written.bytes),
         part,
+        put_already_existed: false,
     })
 }
 
@@ -1250,6 +1254,10 @@ pub async fn build_rewrite_logs(
         &catalogs,
         input_set_hash,
         Vec::new(),
+        true,
+        // retain_bytes: true -- the erasure rewrite keeps each closed part's
+        // bytes resident because `publish_rewrite_record` is what PUTs them,
+        // after the conservation gate passes (ADR-0979 decision 3).
         true,
         &mut |record| match first_dropping_log_request(requests, &record.attrs, record.ts_ns) {
             Some(i) => {
