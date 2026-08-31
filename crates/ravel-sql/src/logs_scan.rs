@@ -4492,7 +4492,7 @@ mod columnar_lookup_tests {
                     stream,
                     100 + i64::from(half) * 10 + i64::from(stream),
                     &[
-                        ("svc", AttrValue::Str(format!("s{stream}").into())),
+                        ("svc", AttrValue::Str(format!("s{stream}"))),
                         ("k", AttrValue::I64(i64::from(stream))),
                     ],
                     &[],
