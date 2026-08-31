@@ -317,7 +317,13 @@ delivers the request-count band, but the segmented path still ASSEMBLES
 the whole object before decode — `ravel-logseg`'s `RlogReader::new`
 requires one contiguous object-indexed buffer, so resident assembly
 remains `object_size` until the per-sub-range decode lands (#1007,
-reader-side only, PAGE_DIR already carries the split offsets). Once
+reader-side only, PAGE_DIR already carries the split offsets). The
+response buffer is part of the same accounting: `GetOutcome.data` is
+copied into the assembler at placement, so both allocations coexist
+transiently — one bound-sized wire buffer per in-flight GET on top of
+the assembly — and #1007's acceptance test pins peak resident with both
+counted, unless its decode-from-the-wire-buffer design removes the copy
+outright. Once
 #1007 lands, the memory bound is `fetch permits × max(bound, B_max)` —
 `permits × bound` = 16 × 64 MiB = 1 GiB worst-case at defaults on every
 corpus without an oversized block, the only case that exceeds it being
@@ -533,7 +539,11 @@ duplicated, or out-of-band alike.
    (docs/object-store-contract.md), and changing it touches every
    backend and decorator for a bound that segmented covering GETs
    deliver within the covering-read band (floor `ceil(size/bound)`) —
-   on this corpus, zero extra requests. Revisit only if object sizes grow to make the segment count
+   zero extra requests whenever every object is at or under the bound,
+   which the 3.47 MB mean suggests but does not prove for clickbench-v4
+   (the mean is explicitly not a maximum); 996-9 records the corpus
+   maximum object size and the claim is conditional until it does.
+   Revisit only if object sizes grow to make the segment count
    material.
 6. **Auto-detecting the billing shape from the endpoint.** Lost again as
    in ADR-0904 alternative 6: S3-compatible endpoints do not disclose
