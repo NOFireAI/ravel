@@ -34,8 +34,8 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::{LogSegmentFetcher, SegmentFetcher};
 use ravel_sql::{
-    LogsTableProvider, RavelTableProvider, SessionTable, SqlConfig, TenantMemoryAccountant,
-    build_session,
+    LogsTableProvider, RavelTableProvider, SessionTable, SpillDecision, SqlConfig,
+    TenantMemoryAccountant, build_session,
 };
 use ravel_types::TenantId;
 use ravel_types::accounting::QueryAccounting;
@@ -80,6 +80,7 @@ async fn drain(
         Arc::clone(&pool),
         SessionTable::Metrics(provider),
         false,
+        SpillDecision::Disabled,
     )
     .expect("session");
 
@@ -270,6 +271,8 @@ async fn a_query_that_outgrows_its_pool_still_releases_tenant_bytes() {
         // ADR-0774's rewrite is a `SqlConfig` field now; keep this
         // fixture's plan shape as it was by not installing the rule.
         late_materialization_extra_columns: None,
+        // ADR-0954: spill off, as on the shipped default.
+        spill: None,
     };
     let accountant = TenantMemoryAccountant::new(1 << 30);
     let (pool, _breach) = config.query_pool(Arc::clone(&accountant), QueryAccounting::new());
@@ -279,7 +282,7 @@ async fn a_query_that_outgrows_its_pool_still_releases_tenant_bytes() {
         snapshot,
         tenant.hash(),
         SegmentFetcher::new(Arc::clone(&fixture.store)),
-        config,
+        config.clone(),
         QueryAccounting::new(),
     ));
     let ctx = build_session(
@@ -287,6 +290,7 @@ async fn a_query_that_outgrows_its_pool_still_releases_tenant_bytes() {
         Arc::clone(&pool),
         SessionTable::Metrics(provider),
         false,
+        SpillDecision::Disabled,
     )
     .expect("session");
     let mut stream = ctx
@@ -487,6 +491,7 @@ async fn drain_logs(
         Arc::clone(&pool),
         SessionTable::Logs(provider),
         false,
+        SpillDecision::Disabled,
     )
     .expect("session");
 

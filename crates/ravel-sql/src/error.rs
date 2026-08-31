@@ -90,6 +90,30 @@ pub const MSG_INTERNAL: &str = "internal query engine error";
 /// rewrites it from the pool's own occupancy at the moment of refusal.
 pub const MSG_SPILL_DISABLED_MARKER: &str = "DiskManager is disabled";
 
+/// Substring DataFusion embeds in the `ResourcesExhausted` its disk manager
+/// raises when a spill file's growth pushes the query's scratch past
+/// `max_temp_directory_size` (`RefCountedTempFile::update_disk_usage`,
+/// datafusion-execution 54.1.0). Ravel sets that ceiling from
+/// [`SpillConfig::max_bytes`](crate::SpillConfig), so this marker is how the
+/// per-query scratch quota's own trip is told apart from a memory-pool
+/// exhaustion that happens to reach the same DataFusion variant.
+///
+/// The upstream text ends by suggesting the caller raise
+/// `datafusion.runtime.max_temp_directory_size`, a knob no Ravel client can
+/// reach, so the message is replaced rather than echoed
+/// ([`SqlError::spill_budget_exhausted`]).
+pub const MSG_SPILL_QUOTA_MARKER: &str =
+    "The used disk space during the spilling process has exceeded";
+
+/// Stable client message for a spill scratch area that could not be used: the
+/// configured directory is missing, is not a directory, is unwritable, or the
+/// volume behind it is full. The server-side detail names the path, which is
+/// deployment layout a client never sees, so only this fixed string is
+/// returned (the same treatment [`MSG_UNAVAILABLE`] gets, for the same
+/// reason).
+pub const MSG_SPILL_UNAVAILABLE: &str =
+    "query scratch storage is unavailable; the query was not run to a partial result";
+
 /// The client-visible class of a [`SqlError`]. The HTTP layer maps this to
 /// a status code and an error-type tag; it never inspects the error itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,6 +244,29 @@ pub enum SqlError {
     #[error("query memory budget exhausted: {0}")]
     ResourcesExhausted(String),
 
+    /// The query's per-query scratch (spill) quota was exhausted (ADR-0954).
+    /// A sibling of [`SqlError::ResourcesExhausted`] rather than a reuse of it:
+    /// the memory budget and the scratch budget are independently enforced, and
+    /// an operator reading "this query needed more disk than it was allowed"
+    /// must not have to guess which of the two limits it was. Carries only
+    /// byte counts and the configured quota, so it echoes verbatim like the
+    /// other budget errors.
+    #[error("query scratch budget exhausted: {0}")]
+    SpillBudgetExhausted(String),
+
+    /// Spill was configured and the query was eligible for it, but the scratch
+    /// area could not be used: the directory is missing, is not a directory, is
+    /// unwritable, or the volume behind it is out of space (ADR-0954). The
+    /// detail names the configured path and is logged server-side only; the
+    /// client sees [`MSG_SPILL_UNAVAILABLE`].
+    ///
+    /// Distinct from [`SqlError::SpillBudgetExhausted`]: that is the query
+    /// asking for more scratch than its quota allows, this is the scratch not
+    /// being there at all. Both fail the query outright; neither returns a
+    /// partial result.
+    #[error("spill scratch unavailable: {0}")]
+    SpillUnavailable(String),
+
     /// DataFusion could not plan the query. The payload is the full
     /// DataFusion message, kept for the server-side log only; it can carry
     /// schema and column detail and is never returned to a client.
@@ -296,6 +343,24 @@ impl SqlError {
         }
     }
 
+    /// The typed per-query scratch-quota error, built from the query's own
+    /// figures rather than DataFusion's text (ADR-0954).
+    ///
+    /// `written` is the bytes this query had written to its spill files when
+    /// the disk manager refused the next write, read from the disk manager's
+    /// own `used_disk_space` gauge: bytes as they sit in the spill files (Arrow
+    /// IPC, after whatever spill compression the session configured), not
+    /// decoded Arrow bytes and not bytes moved over the network. `quota` is
+    /// [`SpillConfig::max_bytes`](crate::SpillConfig::max_bytes), the same
+    /// figure that ceiling was configured from.
+    pub fn spill_budget_exhausted(written: u64, quota: u64) -> Self {
+        SqlError::SpillBudgetExhausted(format!(
+            "{written} of {quota} bytes of scratch already written to this query's spill \
+             files when it asked for more (spill-file bytes on disk, not decoded bytes); \
+             no partial result was returned"
+        ))
+    }
+
     /// The client-visible class, for HTTP status selection.
     pub fn class(&self) -> ErrorClass {
         match self {
@@ -321,6 +386,12 @@ impl SqlError {
             | SqlError::TooManyBytesScanned { .. }
             | SqlError::RequestBudgetExceeded { .. }
             | SqlError::ResourcesExhausted(_)
+            // Both spill failures are budget/resource refusals of a
+            // well-formed request, the same 422 class as the memory pool's
+            // own exhaustion. Neither is a storage fault: object storage,
+            // the only durable backend, is untouched by a scratch failure.
+            | SqlError::SpillBudgetExhausted(_)
+            | SqlError::SpillUnavailable(_)
             | SqlError::Plan(_)
             | SqlError::Execution(_)
             | SqlError::Internal(_)
@@ -380,7 +451,14 @@ impl SqlError {
             | SqlError::TooManySeries { .. }
             | SqlError::TooManyBytesScanned { .. }
             | SqlError::RequestBudgetExceeded { .. }
-            | SqlError::ResourcesExhausted(_) => self.to_string(),
+            | SqlError::ResourcesExhausted(_)
+            // Counts and a configured quota only, built by
+            // `spill_budget_exhausted` from this query's own figures; no path,
+            // no object key, no tenant identity.
+            | SqlError::SpillBudgetExhausted(_) => self.to_string(),
+            // The detail names the configured scratch path, which is
+            // deployment filesystem layout. Redacted like a storage fault.
+            SqlError::SpillUnavailable(_) => MSG_SPILL_UNAVAILABLE.to_string(),
             SqlError::Plan(_) => MSG_PLAN.to_string(),
             SqlError::Execution(_) => MSG_EXECUTION.to_string(),
             SqlError::Internal(_) | SqlError::OperatorPanic(_) => MSG_INTERNAL.to_string(),

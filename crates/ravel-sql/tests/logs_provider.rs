@@ -598,6 +598,7 @@ fn logs_session(
         pool,
         ravel_sql::SessionTable::Logs(Arc::new(provider)),
         false,
+        ravel_sql::SpillDecision::Disabled,
     )
 }
 

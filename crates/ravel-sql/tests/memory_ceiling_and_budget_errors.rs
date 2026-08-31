@@ -16,8 +16,8 @@ use datafusion::execution::memory_pool::{
 };
 use ravel_object_store::memory::MemoryStore;
 use ravel_sql::{
-    CeilingBreach, RavelTableProvider, SessionTable, SqlConfig, SqlError, TenantDelegatingPool,
-    TenantMemoryAccountant, build_session,
+    CeilingBreach, RavelTableProvider, SessionTable, SpillDecision, SqlConfig, SqlError,
+    TenantDelegatingPool, TenantMemoryAccountant, build_session,
 };
 use ravel_types::accounting::QueryAccounting;
 use util::{Fixture, SegSpec, SeriesSpec, request, tenant_id};
@@ -195,6 +195,8 @@ async fn a_sort_or_aggregate_budget_error_keeps_its_type() {
         // ADR-0774's rewrite is a `SqlConfig` field now; keep this
         // fixture's plan shape as it was by not installing the rule.
         late_materialization_extra_columns: None,
+        // ADR-0954: spill off, as on the shipped default.
+        spill: None,
     };
     let fixture = Fixture::build(
         Arc::new(MemoryStore::new()),
@@ -275,6 +277,8 @@ async fn a_high_cardinality_aggregation_over_budget_is_resources_exhausted() {
         // ADR-0774's rewrite is a `SqlConfig` field now; keep this
         // fixture's plan shape as it was by not installing the rule.
         late_materialization_extra_columns: None,
+        // ADR-0954: spill off, as on the shipped default.
+        spill: None,
     };
     let fixture = Fixture::build(
         Arc::new(MemoryStore::new()),
@@ -363,11 +367,13 @@ async fn a_high_cardinality_aggregation_is_refused_by_the_aggregate_not_the_scan
         // ADR-0774's rewrite is a `SqlConfig` field now; keep this
         // fixture's plan shape as it was by not installing the rule.
         late_materialization_extra_columns: None,
+        // ADR-0954: spill off, as on the shipped default.
+        spill: None,
     };
     let fixture = Fixture::build(
         Arc::new(MemoryStore::new()),
         &[(&tenant, &specs)],
-        config,
+        config.clone(),
         1 << 40,
     )
     .await;
@@ -394,7 +400,7 @@ async fn a_high_cardinality_aggregation_is_refused_by_the_aggregate_not_the_scan
         snapshot,
         tenant.hash(),
         fixture.fetcher.clone(),
-        config,
+        config.clone(),
         QueryAccounting::new(),
     );
     let ctx = build_session(
@@ -402,6 +408,7 @@ async fn a_high_cardinality_aggregation_is_refused_by_the_aggregate_not_the_scan
         pool,
         SessionTable::Metrics(Arc::new(provider)),
         false,
+        SpillDecision::Disabled,
     )
     .expect("metrics session builds");
 
@@ -467,6 +474,8 @@ async fn a_large_order_by_over_budget_is_resources_exhausted() {
         // ADR-0774's rewrite is a `SqlConfig` field now; keep this
         // fixture's plan shape as it was by not installing the rule.
         late_materialization_extra_columns: None,
+        // ADR-0954: spill off, as on the shipped default.
+        spill: None,
     };
     let fixture = Fixture::build(
         Arc::new(MemoryStore::new()),

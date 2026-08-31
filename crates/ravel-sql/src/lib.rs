@@ -86,6 +86,7 @@ mod spans_provider;
 mod spans_pushdown;
 mod spans_scan;
 mod spans_schema;
+pub mod spill;
 mod udf;
 mod validate;
 
@@ -101,9 +102,10 @@ pub use audit_schema::{
     AUDIT_COL_ATTRS, AUDIT_COL_BODY, AUDIT_COL_SEVERITY_TEXT, AUDIT_COL_TS, audit_schema,
 };
 pub use config::{
-    DEFAULT_LATE_MATERIALIZATION_EXTRA_COLUMNS, DEFAULT_MAX_QUERY_BYTES,
-    GROUP_VALUES_CEILING_COMPENSATION, GROUP_VALUES_RESIZE_TRANSIENT_FACTOR,
-    GROUP_VALUES_UNDERCOUNT_FACTOR, SqlConfig, compensated_group_values_ceiling,
+    DEFAULT_LATE_MATERIALIZATION_EXTRA_COLUMNS, DEFAULT_MAX_QUERY_BYTES, ENV_SPILL_DIR,
+    ENV_SPILL_MAX_BYTES, GROUP_VALUES_CEILING_COMPENSATION, GROUP_VALUES_RESIZE_TRANSIENT_FACTOR,
+    GROUP_VALUES_UNDERCOUNT_FACTOR, SpillConfig, SpillConfigError, SqlConfig,
+    compensated_group_values_ceiling,
 };
 pub use declared::{DeclaredColumn, DeclaredColumnSource, DeclaredType, StaticDeclaredColumns};
 #[cfg(feature = "flight-sql")]
@@ -120,7 +122,7 @@ pub use distributed_rlog::{
 };
 pub use error::{
     ErrorClass, MSG_CORRUPT, MSG_EXECUTION, MSG_INTERNAL, MSG_PLAN, MSG_SPILL_DISABLED_MARKER,
-    MSG_UNAVAILABLE, MSG_UNSATISFIABLE, SqlError,
+    MSG_SPILL_QUOTA_MARKER, MSG_SPILL_UNAVAILABLE, MSG_UNAVAILABLE, MSG_UNSATISFIABLE, SqlError,
 };
 pub use executor::{PinnedQuery, PinnedStream, SqlExecutor, SqlOutcome, SqlRequest, SqlStats};
 #[cfg(feature = "flight-sql")]
@@ -156,7 +158,7 @@ pub use session::{
     ADMITTED_SCALARS, ADMITTED_TABLE_FUNCTIONS, ADMITTED_WINDOWS, EXCLUDED_SCALARS,
     EXCLUDED_TABLE_FUNCTIONS, EXCLUDED_WINDOWS, EmptyObjectStoreRegistry, LOGS_TABLE,
     SAMPLES_TABLE, SKIP_PARTIAL_AGGREGATION_PROBE_RATIO, SKIP_PARTIAL_AGGREGATION_PROBE_ROWS,
-    SPANS_TABLE, SessionTable, build_session, session_config,
+    SPANS_TABLE, SessionTable, SpillDecision, build_session, session_config,
 };
 pub use spans_fetcher::{SpanFetchError, SpanFetchOutput, SpanRow, SpanSegmentFetcher};
 pub use spans_provider::SpansTableProvider;
@@ -167,6 +169,7 @@ pub use spans_schema::{
     SPAN_COL_SERVICE_NAME, SPAN_COL_SPAN_ID, SPAN_COL_START_TS, SPAN_COL_STATUS_CODE,
     SPAN_COL_STATUS_MESSAGE, SPAN_COL_TRACE_ID, spans_schema,
 };
+pub use spill::{OperatorSpill, SpillCounts, SpillScratch};
 pub use udf::{label_match_udf, label_udf};
 pub use validate::{ValidationError, validate};
 

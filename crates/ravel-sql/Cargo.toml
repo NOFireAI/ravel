@@ -193,6 +193,11 @@ crc32c = { workspace = true }
 # heuristic fails the dict-page tests loudly instead of silently. Already a
 # workspace pin (ravel-logseg depends on it); no new supply-chain surface.
 ravel-codec = { workspace = true }
+# Dev-only: the spill tests (tests/spill.rs, crate::spill's own unit tests)
+# need a real, writable directory to configure as the spill root and a
+# read-only one to prove the `spill_unavailable` refusal. Already a workspace
+# pin, and already in the lockfile as a datafusion dependency.
+tempfile = { workspace = true }
 
 [[bench]]
 name = "samples_scan"

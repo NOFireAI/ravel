@@ -14,6 +14,7 @@
 //! footprint is cardinality-dependent once labels materialize as columns, so a
 //! sample cap cannot stand in for a byte cap.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use datafusion::execution::memory_pool::MemoryPool;
@@ -100,9 +101,94 @@ const GROUP_VALUES_FIXED_OVERHEAD_BYTES: usize = 16;
 const GROUP_VALUES_FIXED_OVERHEAD_CEILING: usize =
     (GROUP_VALUES_FIXED_OVERHEAD_BYTES as f64 * GROUP_VALUES_RESIZE_TRANSIENT_FACTOR) as usize + 1;
 
+/// Environment variable naming the directory under which a query may create
+/// its ephemeral spill scratch (ADR-0954). Read only through
+/// [`SpillConfig::from_env`]; the [`SqlConfig::spill`] field is the source of
+/// truth and this only supplies its default when the caller left it unset.
+pub const ENV_SPILL_DIR: &str = "RAVEL_SQL_SPILL_DIR";
+
+/// Environment variable carrying the per-query scratch byte quota, a positive
+/// decimal integer. See [`ENV_SPILL_DIR`].
+pub const ENV_SPILL_MAX_BYTES: &str = "RAVEL_SQL_SPILL_MAX_BYTES";
+
+/// Both halves of the spill configuration. Spill is enabled for a query only
+/// when this whole struct is present AND the query's plan is exactness-eligible
+/// (`crate::executor`'s spill eligibility predicate); either half missing means
+/// [`DiskManagerMode::Disabled`](datafusion::execution::disk_manager::DiskManagerMode::Disabled)
+/// and today's behavior byte for byte.
+///
+/// A directory alone would leave the 100 GB DataFusion default ceiling in
+/// place, and a quota alone has nowhere to write, so neither is admitted on its
+/// own: the two are one value, not two independent knobs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpillConfig {
+    /// Directory under which each query creates, and removes, its own scratch
+    /// subdirectory. It must already exist and be writable; a query that finds
+    /// otherwise fails with [`crate::SqlError::SpillUnavailable`] rather than
+    /// creating anything outside it.
+    pub dir: PathBuf,
+    /// Ceiling, in bytes, on the scratch this one query may hold on disk at
+    /// once. Enforced by DataFusion's disk manager
+    /// (`max_temp_directory_size`), which counts bytes written to spill files,
+    /// not bytes decoded from them. Exceeding it is
+    /// [`crate::SqlError::SpillBudgetExhausted`], never a partial result.
+    pub max_bytes: u64,
+}
+
+/// A [`SpillConfig`] could not be read from the environment. Loud on purpose:
+/// a half-set or unparseable spill configuration silently selects a different
+/// execution behavior than the operator asked for, and this codebase does not
+/// let a default that selects which resources a query touches stay silent.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SpillConfigError {
+    /// One of the two variables is set and the other is not.
+    #[error(
+        "RAVEL_SQL_SPILL_DIR and RAVEL_SQL_SPILL_MAX_BYTES must both be set to enable \
+         SQL spill, or both be unset to disable it; only one of the two is set"
+    )]
+    Incomplete,
+    /// `RAVEL_SQL_SPILL_MAX_BYTES` is not a positive decimal integer.
+    #[error("RAVEL_SQL_SPILL_MAX_BYTES must be a positive decimal number of bytes, got {value:?}")]
+    BadQuota { value: String },
+    /// `RAVEL_SQL_SPILL_DIR` is set to an empty string.
+    #[error("RAVEL_SQL_SPILL_DIR must name a directory, but is set to an empty string")]
+    EmptyDir,
+}
+
+impl SpillConfig {
+    /// Read both variables. `Ok(None)` when neither is set, which is the
+    /// no-spill deployment profile and the compiled-in default.
+    ///
+    /// Set-but-invalid is an error, not a fall back to `None`: turning a typo
+    /// in a deployment's spill quota into "spill silently stays off" is exactly
+    /// the silent-default failure the measurement-discipline rules forbid.
+    pub fn from_env() -> Result<Option<SpillConfig>, SpillConfigError> {
+        let dir = std::env::var_os(ENV_SPILL_DIR);
+        let quota = std::env::var_os(ENV_SPILL_MAX_BYTES);
+        let (dir, quota) = match (dir, quota) {
+            (None, None) => return Ok(None),
+            (Some(dir), Some(quota)) => (dir, quota),
+            _ => return Err(SpillConfigError::Incomplete),
+        };
+        if dir.is_empty() {
+            return Err(SpillConfigError::EmptyDir);
+        }
+        let quota = quota.to_string_lossy().trim().to_string();
+        let max_bytes: u64 = quota
+            .parse()
+            .ok()
+            .filter(|bytes| *bytes > 0)
+            .ok_or(SpillConfigError::BadQuota { value: quota })?;
+        Ok(Some(SpillConfig {
+            dir: PathBuf::from(dir),
+            max_bytes,
+        }))
+    }
+}
+
 /// Per-query ravel-sql configuration: the shared engine budgets plus the
 /// SQL-only per-query memory-pool byte budget.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SqlConfig {
     /// Series/segment/sample/deadline budgets shared with the PromQL path.
     pub engine: EngineConfig,
@@ -164,6 +250,26 @@ pub struct SqlConfig {
     /// surviving rows instead of for every row. So this is a cost knob, never
     /// a correctness one.
     pub late_materialization_extra_columns: Option<usize>,
+    /// Bounded ephemeral spill scratch (ADR-0954). `None`, the default, means
+    /// the disk manager stays
+    /// [`Disabled`](datafusion::execution::disk_manager::DiskManagerMode::Disabled)
+    /// exactly as ADR-0102 decision 3 left it: a query over its memory budget
+    /// fails typed, nothing is written to local disk, and this crate behaves
+    /// byte for byte as it did before spill existed. That is the no-spill
+    /// deployment profile, and it is the compiled-in default so this whole
+    /// mechanism is inert until an operator opts in.
+    ///
+    /// `Some` arms spill, but does not by itself grant it to a query: the
+    /// query's plan must also pass the exactness eligibility predicate
+    /// (`crate::executor::plan_is_spill_eligible`). An ineligible plan gets the
+    /// disabled disk manager and today's typed refusal, whatever this is set
+    /// to.
+    ///
+    /// This field is the source of truth. [`SqlConfig::with_spill_from_env`]
+    /// fills it from [`ENV_SPILL_DIR`]/[`ENV_SPILL_MAX_BYTES`] only when it is
+    /// still `None`, so an explicit setting is never overridden by the
+    /// environment.
+    pub spill: Option<SpillConfig>,
 }
 
 impl Default for SqlConfig {
@@ -174,6 +280,10 @@ impl Default for SqlConfig {
             parallel_final_aggregation: true,
             skip_partial_aggregation: true,
             late_materialization_extra_columns: Some(DEFAULT_LATE_MATERIALIZATION_EXTRA_COLUMNS),
+            // Spill off. See the field doc: this is requirement 9 of #954 (a
+            // no-spill deployment profile) and it is what makes enabling spill
+            // an operator decision rather than a version upgrade.
+            spill: None,
         }
     }
 }
@@ -188,6 +298,19 @@ impl From<EngineConfig> for SqlConfig {
 }
 
 impl SqlConfig {
+    /// Fill [`SqlConfig::spill`] from the environment when it is still `None`,
+    /// so a deployment can turn spill on without a code change while an
+    /// explicit in-process setting still wins.
+    ///
+    /// Call once at process startup, next to the other startup-only knobs on
+    /// this struct; nothing here live-reloads.
+    pub fn with_spill_from_env(mut self) -> Result<Self, SpillConfigError> {
+        if self.spill.is_none() {
+            self.spill = SpillConfig::from_env()?;
+        }
+        Ok(self)
+    }
+
     /// Build the query's DataFusion memory pool: a [`TenantDelegatingPool`]
     /// capped at `max_query_bytes` that forwards every grow/shrink to
     /// `tenant`. Install it on the query's `RuntimeEnv` via
@@ -221,6 +344,7 @@ impl SqlConfig {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -253,6 +377,50 @@ mod tests {
     /// ClickBench shapes finish at all (`SELECT * ... ORDER BY ts LIMIT 10`
     /// exceeded a 900 s deadline without it) and belongs in the same change as
     /// this assertion, not discovered broken elsewhere.
+    /// ADR-0954: spill is off unless an operator configures both halves. A
+    /// change that flips this default is a change to every deployment's disk
+    /// behavior and to the ADR-0102 decision 3 refusal path, so it belongs in
+    /// the same change as this assertion.
+    #[test]
+    fn spill_defaults_to_off() {
+        assert_eq!(SqlConfig::default().spill, None);
+    }
+
+    /// Both halves are required. A directory with no quota would leave
+    /// DataFusion's 100 GB default ceiling in place, and a quota with no
+    /// directory has nowhere to write; neither is a valid enable.
+    #[test]
+    fn a_half_set_environment_is_an_error_not_a_silent_disable() {
+        assert_eq!(
+            SpillConfigError::Incomplete.to_string(),
+            "RAVEL_SQL_SPILL_DIR and RAVEL_SQL_SPILL_MAX_BYTES must both be set to enable \
+             SQL spill, or both be unset to disable it; only one of the two is set"
+        );
+        let bad = SpillConfigError::BadQuota {
+            value: "1 GiB".to_string(),
+        };
+        assert!(bad.to_string().contains("positive decimal"));
+    }
+
+    /// The explicit field wins over the environment: `with_spill_from_env`
+    /// fills only an unset field, so a process that configured spill in code
+    /// cannot have it silently redirected by a stray variable.
+    #[test]
+    fn an_explicit_spill_config_is_not_overridden_by_the_environment() {
+        let explicit = SpillConfig {
+            dir: PathBuf::from("/explicit"),
+            max_bytes: 4096,
+        };
+        let config = SqlConfig {
+            spill: Some(explicit.clone()),
+            ..SqlConfig::default()
+        };
+        let after = config
+            .with_spill_from_env()
+            .expect("an already-set field reads no environment");
+        assert_eq!(after.spill, Some(explicit));
+    }
+
     #[test]
     fn late_materialization_defaults_to_eight_extra_columns() {
         assert_eq!(

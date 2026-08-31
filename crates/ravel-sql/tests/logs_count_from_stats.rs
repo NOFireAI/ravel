@@ -28,7 +28,7 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::{LogSegmentFetcher, SegmentFetcher};
 use ravel_sql::{
-    LogsTableProvider, SessionTable, SpanSegmentFetcher, SqlConfig, SqlExecutor,
+    LogsTableProvider, SessionTable, SpanSegmentFetcher, SpillDecision, SqlConfig, SqlExecutor,
     TenantMemoryAccountant, build_session,
 };
 use ravel_types::TenantHash;
@@ -174,7 +174,13 @@ fn logs_session(provider: LogsTableProvider) -> datafusion::error::Result<Sessio
     let config = SqlConfig::default();
     let tenant = TenantMemoryAccountant::new(1 << 30);
     let (pool, _breach) = config.query_pool(tenant, QueryAccounting::new());
-    build_session(&config, pool, SessionTable::Logs(Arc::new(provider)), false)
+    build_session(
+        &config,
+        pool,
+        SessionTable::Logs(Arc::new(provider)),
+        false,
+        SpillDecision::Disabled,
+    )
 }
 
 fn provider_over(store: Arc<CountingStore>, snapshot: Snapshot) -> LogsTableProvider {
