@@ -543,4 +543,11 @@ message QueryAccountingSnapshot {
   uint64 series_matched = 13;
   uint64 bytes_reused = 14;
   uint64 peak_intermediate_bytes = 15;
+  // Distinct data objects whose BLOCKS bytes this slice fetched (ADR-0996
+  // decision 3, the range-amplification denominator). Additive field: slices
+  // partition by (tenant, signal, shard), an object belongs to exactly one
+  // shard, so slice object sets are disjoint and summation is exact. An old
+  // peer omits it and it decodes as 0, degrading the merged figure to the
+  // coordinator's own count, never inflating it.
+  uint64 data_objects_touched = 16;
 }

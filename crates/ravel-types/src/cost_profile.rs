@@ -44,10 +44,11 @@ pub enum StoreOpClass {
     /// GET/SELECT class, the cheap tier. HEAD bills here: it is a GET request
     /// that returns no body.
     Get,
-    /// Not billed per request. DELETE (and multi-object delete) is free on S3;
-    /// a class rather than a zero price so a caller reading the profile cannot
-    /// mistake "free by contract" for "priced at zero in this config".
-    Free,
+    /// DELETE class, priced by its own field. Zero on the reference S3
+    /// profile, but a PRICED class rather than a hardcoded free tier: prices
+    /// are a deployment property, and an S3-compatible provider that bills
+    /// deletes gets a field to say so instead of a silent zero.
+    Delete,
 }
 
 /// Store operations a cost profile can price. Mirrors
@@ -87,7 +88,7 @@ impl CostedStoreOp {
             CostedStoreOp::Put => StoreOpClass::Put,
             CostedStoreOp::List | CostedStoreOp::ListDelimited => StoreOpClass::Put,
             CostedStoreOp::Get | CostedStoreOp::Head => StoreOpClass::Get,
-            CostedStoreOp::Delete => StoreOpClass::Free,
+            CostedStoreOp::Delete => StoreOpClass::Delete,
         }
     }
 }
@@ -126,6 +127,11 @@ pub struct StoreCostProfile {
     pub put_class_nanodollars: u64,
     /// Nanodollars per GET-class request (GET/SELECT/HEAD).
     pub get_class_nanodollars: u64,
+    /// Nanodollars per DELETE-class request. `0` on the reference S3 profile
+    /// (DELETE is free there); a field rather than a constant because other
+    /// providers bill it.
+    #[serde(default)]
+    pub delete_class_nanodollars: u64,
     /// Nanodollars per GiB transferred out. `0` on an intra-region deployment,
     /// which is what makes request-minimal fetching the cost-preferring shape
     /// there.
@@ -144,6 +150,7 @@ const S3_INTRA_REGION_2026_PRICES: StoreCostProfile = StoreCostProfile {
     name: String::new(),
     put_class_nanodollars: 5_000,
     get_class_nanodollars: 400,
+    delete_class_nanodollars: 0,
     transfer_nanodollars_per_gib: 0,
     retrieval_nanodollars_per_gib: 0,
 };
@@ -189,7 +196,7 @@ impl StoreCostProfile {
         match class {
             StoreOpClass::Put => self.put_class_nanodollars,
             StoreOpClass::Get => self.get_class_nanodollars,
-            StoreOpClass::Free => 0,
+            StoreOpClass::Delete => self.delete_class_nanodollars,
         }
     }
 
@@ -322,7 +329,13 @@ mod tests {
         assert_eq!(CostedStoreOp::Head.class(), StoreOpClass::Get);
         assert_eq!(CostedStoreOp::Put.class(), StoreOpClass::Put);
         assert_eq!(CostedStoreOp::Get.class(), StoreOpClass::Get);
-        assert_eq!(CostedStoreOp::Delete.class(), StoreOpClass::Free);
+        assert_eq!(CostedStoreOp::Delete.class(), StoreOpClass::Delete);
+        // Priced class, zero PRICE on the reference profile: a provider that
+        // bills deletes overrides the field, never a hardcoded free tier.
+        assert_eq!(
+            StoreCostProfile::reference().op_nanodollars(CostedStoreOp::Delete),
+            0
+        );
 
         let p = StoreCostProfile::reference();
         assert_eq!(
@@ -398,6 +411,7 @@ mod tests {
             name: "egress-billed".to_string(),
             put_class_nanodollars: 5_000,
             get_class_nanodollars: 400,
+            delete_class_nanodollars: 0,
             transfer_nanodollars_per_gib: 90_000_000, // $0.09/GiB
             retrieval_nanodollars_per_gib: 10_000_000,
         };
@@ -416,6 +430,7 @@ mod tests {
             name: "prorate".to_string(),
             put_class_nanodollars: 0,
             get_class_nanodollars: 0,
+            delete_class_nanodollars: 0,
             transfer_nanodollars_per_gib: 1_000_000_000, // $1/GiB
             retrieval_nanodollars_per_gib: 0,
         };
@@ -434,6 +449,7 @@ mod tests {
             name: "absurd".to_string(),
             put_class_nanodollars: u64::MAX,
             get_class_nanodollars: u64::MAX,
+            delete_class_nanodollars: u64::MAX,
             transfer_nanodollars_per_gib: u64::MAX,
             retrieval_nanodollars_per_gib: u64::MAX,
         };
@@ -451,6 +467,7 @@ mod tests {
             name: "s3-cross-region-test".to_string(),
             put_class_nanodollars: 5_500,
             get_class_nanodollars: 440,
+            delete_class_nanodollars: 0,
             transfer_nanodollars_per_gib: 20_000_000,
             retrieval_nanodollars_per_gib: 1_234,
         };

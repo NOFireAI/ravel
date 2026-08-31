@@ -458,13 +458,32 @@ pub struct QueryAccountingSnapshot {
     ///   whole point: the ratio to scan-phase GETs is exactly the range
     ///   amplification.
     ///
-    /// Distinctness is per handle, so a merge sums: the ADR-0071 slices this
-    /// folds together scan disjoint segment sets, so their touch counts add
-    /// exactly. Two sub-queries that legitimately overlap on one object (the
-    /// multi-`match[]` metadata endpoints under
-    /// [`Self::saturating_add`]) would count it twice, which inflates the
-    /// denominator and therefore *understates* range amplification; a report
-    /// combining selectors must say so rather than claim a distinct count.
+    /// Distinctness is per handle, and the merge is ADDITION, which is exact
+    /// only over disjoint object sets. Two merges exist and only one is safe
+    /// unconditionally:
+    ///
+    /// - **ADR-0071 slice merge (wire, `queryfrag.proto` field 16): exact.**
+    ///   Slices partition by `(tenant, signal, shard)` and an object belongs
+    ///   to exactly one shard, so slice object sets are disjoint by
+    ///   construction and their counts add to a true distinct count. An old
+    ///   peer omits the field and contributes zero, degrading the merged
+    ///   figure low, never inflating it.
+    /// - **Same-process combination (the multi-`match[]` metadata endpoints
+    ///   under [`Self::saturating_add`]): NOT distinct.** Two sub-queries
+    ///   that overlap on one object count it twice, inflating the
+    ///   denominator and *understating* range amplification -- the flattering
+    ///   direction. A report combining selectors must label the figure a sum
+    ///   of per-selector counts, never a distinct count.
+    ///
+    /// The RECORDING contract is designated-recorder, not
+    /// record-where-you-fetch: several partitions stripe one segment's
+    /// blocks (`ravel-sql` `logs_scan.rs`), so a per-partition recording
+    /// site would multiply the count exactly as per-partition
+    /// whole-segment totals would -- the same problem ADR-0102's
+    /// partition-0-at-planning rule already solves for
+    /// `record_segment_totals`, and the same rule binds every future
+    /// recording site of this counter, including a fast path that has no
+    /// plan phase, which must pick its single recorder explicitly.
     pub data_objects_touched: u64,
     pub peak_intermediate_bytes: u64,
 }
