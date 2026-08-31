@@ -185,10 +185,15 @@ pub(crate) fn accumulate_spill_counts(
     by_operator: &mut Vec<OperatorSpill>,
 ) {
     if let Some(metrics) = plan.metrics() {
-        let sum = |name: &str| metrics.sum_by_name(name).map_or(0, |v| v.as_usize() as u64);
-        let files = sum("spill_count");
-        let bytes_written = sum("spilled_bytes");
-        let rows_written = sum("spilled_rows");
+        // Spill figures are typed `MetricValue::SpillCount`/`SpilledBytes`/
+        // `SpilledRows` variants, not named `Count`s. DataFusion 54.1.0's
+        // `MetricsSet::sum_by_name` matches only named metrics and returns
+        // `false` for every spill variant, so reading them by name always
+        // yields zero even for a query that spilled; the typed accessors are
+        // the only way to read them.
+        let files = metrics.spill_count().unwrap_or(0) as u64;
+        let bytes_written = metrics.spilled_bytes().unwrap_or(0) as u64;
+        let rows_written = metrics.spilled_rows().unwrap_or(0) as u64;
         if files > 0 || bytes_written > 0 || rows_written > 0 {
             totals.files += files;
             totals.bytes_written += bytes_written;

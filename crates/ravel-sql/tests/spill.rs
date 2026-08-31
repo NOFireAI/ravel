@@ -232,33 +232,46 @@ async fn run_grouped_count(
         )
         .build_arc()
         .expect("runtime builds");
-    let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), runtime);
+    // One partition, matching the executor path this helper stands in for
+    // (`build_session` sets `target_partitions` from `fetch_concurrency`, which
+    // the spill fixtures pin to 1). A default `SessionConfig` would split the
+    // aggregate into `target_partitions` concurrent partial aggregates sharing
+    // this one pool, so a spilling partition's `clear_shrink(0)` could not free
+    // the pool room its sort headroom needs (the other partitions still hold
+    // their group state) and the sort reservation fails under the cap. A single
+    // partition makes the aggregate the sole pool consumer this helper's
+    // contract (and ADR-0954 requirement 1's headroom reasoning) assumes.
+    let config = SessionConfig::new().with_target_partitions(1);
+    let ctx = SessionContext::new_with_config_rt(config, runtime);
 
     let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Utf8, false)]));
-    let column = datafusion::arrow::array::StringArray::from_iter_values(keys.iter());
-    let batch =
-        RecordBatch::try_new(schema, vec![Arc::new(column)]).expect("batch builds");
-    ctx.register_batch("t", batch).expect("register in-memory table");
+    // Many small batches, not one giant one. DataFusion's grouped-hash aggregate
+    // checks its spill trigger only at input-batch boundaries
+    // (`emit_early_if_necessary`/`spill_previous_if_necessary`): fed a single
+    // 4.5M-row batch it builds the whole hash table in one call and never gets
+    // the chance to spill. Chunking into `batch_size`-row batches gives the
+    // aggregate the checkpoints at which it reserves, overruns the cap, and
+    // spills -- the behavior under test.
+    let batches: Vec<RecordBatch> = keys
+        .chunks(8192)
+        .map(|chunk| {
+            let column = datafusion::arrow::array::StringArray::from_iter_values(chunk.iter());
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(column)]).expect("batch builds")
+        })
+        .collect();
+    let table = datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![batches])
+        .expect("in-memory table builds");
+    ctx.register_table("t", Arc::new(table))
+        .expect("register in-memory table");
 
     let df = ctx
         .sql("SELECT k, count(*) AS n FROM t GROUP BY k")
         .await
         .expect("aggregation plans");
     let plan = df.create_physical_plan().await.expect("physical plan");
-    eprintln!(
-        "SPILLDBG plan=\n{}",
-        datafusion::physical_plan::displayable(plan.as_ref()).indent(false)
-    );
     let batches = collect(Arc::clone(&plan), ctx.task_ctx())
         .await
         .expect("aggregation runs to completion");
-    eprintln!(
-        "SPILLDBG spill_count={} spilled_bytes={} spilled_rows={} query_bytes={}",
-        sum_metric(&plan, "spill_count"),
-        sum_metric(&plan, "spilled_bytes"),
-        sum_metric(&plan, "spilled_rows"),
-        query_bytes,
-    );
 
     let mut rows = Vec::new();
     for batch in &batches {
@@ -280,19 +293,25 @@ async fn run_grouped_count(
 
     AggRun {
         rows,
-        spill_files: sum_metric(&plan, "spill_count"),
+        spill_files: spill_file_count(&plan),
         peak_pool_bytes: accounting.snapshot().peak_intermediate_bytes,
     }
 }
 
-/// Sum a named DataFusion metric over `plan` and its descendants.
-fn sum_metric(plan: &Arc<dyn ExecutionPlan>, name: &str) -> u64 {
+/// Sum the DataFusion spill-file count over `plan` and its descendants.
+///
+/// Spill is a typed `MetricValue::SpillCount`, not a named `Count`, so it must
+/// be read through the `MetricsSet::spill_count()` accessor: `sum_by_name`
+/// deliberately returns `false` for every spill variant and would report zero
+/// even for a query that spilled (the same defect fixed in
+/// `crate::spill::accumulate_spill_counts`).
+fn spill_file_count(plan: &Arc<dyn ExecutionPlan>) -> u64 {
     let mut total = plan
         .metrics()
-        .and_then(|m| m.sum_by_name(name))
-        .map_or(0, |v| v.as_usize() as u64);
+        .and_then(|m| m.spill_count())
+        .unwrap_or(0) as u64;
     for child in plan.children() {
-        total += sum_metric(child, name);
+        total += spill_file_count(child);
     }
     total
 }
@@ -328,9 +347,14 @@ fn spill_subdirs(root: &Path) -> Vec<PathBuf> {
 /// source reserves nothing), so a tight cap cleanly forces the aggregate -- and
 /// only the aggregate -- to spill. See [`run_grouped_count`].
 const IN_MEMORY_SPILL_BYTES: usize = 8 * 1024 * 1024;
-/// Distinct integer group keys in the in-memory aggregation, and how many of
-/// them appear twice (yielding count 2 vs 1). Sized so the group state exceeds
-/// [`IN_MEMORY_SPILL_BYTES`] and the aggregate must spill.
+/// Distinct string group keys in the in-memory aggregation, and how many of
+/// them appear twice (yielding count 2 vs 1). Sized so the group state of the
+/// single sole-consumer aggregate (see [`run_grouped_count`]) far exceeds
+/// [`IN_MEMORY_SPILL_BYTES`] and the aggregate must spill: measured against the
+/// locked DataFusion 54.1.0, one `key-NNNNNNNNN` group costs well over 100
+/// bytes of pool-accounted `GroupValues` plus sort headroom, so 1,000,000
+/// groups reserve on the order of 150 MiB against the 8 MiB cap and spill
+/// incrementally.
 const IN_MEMORY_GROUPS: i64 = 1_000_000;
 const IN_MEMORY_DOUBLED: i64 = 500_000;
 
