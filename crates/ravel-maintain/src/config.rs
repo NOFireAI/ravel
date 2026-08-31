@@ -70,9 +70,13 @@ use uuid::Uuid;
 ///   top of the retained parts.
 ///
 /// Two fields of different byte kinds (encoded vs decoded heap) must never be
-/// summed (the repo measurement rule). The tracker is one PER COMPACTION RUN:
-/// the retained-parts and catalog terms accumulate and are not released within
-/// a run, so reusing one tracker across buckets would sum their peaks.
+/// summed (the repo measurement rule). The tracker is one PER CONCURRENT
+/// COMPACTION RUN: the retained-parts and catalog terms accumulate and are
+/// not released within a run. SERIAL reuse across buckets is repaired
+/// mechanically -- `rewrite_and_publish` calls [`Self::reset_for_run`] before
+/// any accounting, so each bucket's figures are its own -- but two runs
+/// sharing one tracker CONCURRENTLY still combine, and that contract is the
+/// installer's to keep.
 ///
 /// Production never installs one (`CompactorConfig::merge_memory_tracker` is
 /// `None`), so the hooks compile to a single `Option` check and add nothing.
@@ -279,6 +283,34 @@ impl MergeMemoryTracker {
     /// High-water of the published compaction record's encoded payload bytes.
     pub fn peak_publish_record_bytes(&self) -> u64 {
         self.inner.peak_publish_record.load(Ordering::Relaxed)
+    }
+
+    /// Clear every counter and high-water term for a NEW run. Called at the
+    /// start of each bucket's rewrite, so a tracker left installed in a
+    /// long-lived [`CompactorConfig`] reports each bucket's own peaks under
+    /// that bucket's identity instead of a cumulative maximum, and every
+    /// post-run read (the emission, a test, a future CLI surface) stays
+    /// valid. Wrong to call mid-run; CONCURRENT runs sharing one tracker
+    /// still produce combined figures, and that contract is the installer's
+    /// to keep (one tracker per concurrent run).
+    pub fn reset_for_run(&self) {
+        for field in [
+            &self.inner.fetched,
+            &self.inner.decoded,
+            &self.inner.writer,
+            &self.inner.peak_transient,
+            &self.inner.peak_total,
+            &self.inner.memory_target_flushes,
+            &self.inner.stored_target_flushes,
+            &self.inner.retained_parts,
+            &self.inner.peak_retained_parts,
+            &self.inner.catalog_directory,
+            &self.inner.peak_catalog_directory,
+            &self.inner.peak_writer,
+            &self.inner.peak_publish_record,
+        ] {
+            field.store(0, Ordering::Relaxed);
+        }
     }
 
     /// The full phase split, each term naming its byte kind. See
