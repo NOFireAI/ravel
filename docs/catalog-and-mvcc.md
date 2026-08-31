@@ -23,6 +23,7 @@ t/<tenant_hash>/<signal>/idem/<keyhash32>.<ingest_hour>.idm              idempot
 t/<tenant_hash>/catalog/<signal>/snap/<watermark>.<hash16>.csnap         snapshot part (immutable)
 t/<tenant_hash>/catalog/<signal>/HEAD                                    head pointer (mutable, CAS)
 t/<tenant_hash>/catalog/<signal>/idx/<watermark>.<hash16>.npost         name postings (immutable, phase 5)
+t/<tenant_hash>/catalog/<signal>/idx/<watermark>.<hash16>.cstat         column statistics (immutable; ADR-0850, ADR-0942)
 sys/qualification                                                       store qualification record (write-once, additive)
 sys/qualify/<run-id>/...                                                store qualification scratch objects (transient)
 sys/tenancy                                                             tenant-hash scheme marker (write-once, additive; ADR-0050 §3)
@@ -357,16 +358,19 @@ and the CAS read/write helpers.
   fold the same input independently write the same key and
   `PutMode::CreateIfAbsent` `AlreadyExists` is idempotent success, exactly
   like data objects (ADR-0010 §7).
-- Superseded snapshot parts (`catalog/<signal>/snap/`) and name-postings
-  objects (`catalog/<signal>/idx/`) are swept by
+- Superseded snapshot parts (`catalog/<signal>/snap/`), name-postings objects
+  and column-statistics objects (both `catalog/<signal>/idx/`) are swept by
   `ravel_maintain::sweep::sweep_unreferenced_catalog_objects`, the fifth GC
   sweep rule alongside orphan GC, the
   superseded-input and unreferenced-part sweeps, and the idempotency-marker
-  sweep. Every fold that rewrites a part or postings object writes a new
+  sweep. Every fold that rewrites a part, a postings object, or a
+  column-statistics object writes a new
   content-addressed key and swaps HEAD, leaving the old object in place (the
   "orphan part" crash case); without this rule each such fold leaks one object. The rule LISTs the two
   prefixes first, then GETs the current `catalog/<signal>/HEAD`, treats every
-  `parts[].key` and the optional `postings.key` as referenced, and deletes any
+  `parts[].key`, the optional `postings.key`, and the optional
+  column-statistics keys `column_stats.key` (field 11) and
+  `column_stats_part.key` (field 13) as referenced, and deletes any
   object under the two prefixes that HEAD does not name once its
   `last_modified` age exceeds `CompactorConfig::protection_horizon_ns`. A fresh
   re-verify GET of HEAD is taken immediately before the delete loop (the same
