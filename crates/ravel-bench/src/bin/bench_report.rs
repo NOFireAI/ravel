@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use clap::Parser;
-use ravel_bench::harness::{StoreKind, store_from_env};
+use ravel_bench::harness::{StoreKind, store_and_metrics_from_env};
 use ravel_bench::report::{ReportRunConfig, WorkloadShape, run};
 
 #[derive(Parser, Debug)]
@@ -97,8 +97,10 @@ async fn main() {
         StoreKind::S3 => std::env::var("RAVEL_S3_REGION").unwrap_or_else(|_| "unknown".to_string()),
     };
 
+    let (store, store_metrics) = store_and_metrics_from_env(args.store);
     let config = ReportRunConfig {
-        store: store_from_env(args.store),
+        store,
+        store_metrics,
         store_backend: args.store.to_string(),
         region,
         backend_bills_requests: bills,
