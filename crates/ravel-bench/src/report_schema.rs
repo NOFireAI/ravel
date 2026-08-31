@@ -66,13 +66,22 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// The retry-blindness caveat every cost estimate carries (ADR-0927 decision 8,
 /// issue #928). `object_store` retries below `InstrumentedStore` with
 /// `max_retries = 10`, so one logical `get()` that retried nine times records
-/// one request while S3 bills ten. Every request figure in this repository is a
-/// logical-call count, not a billed-request count, and under throttling the
-/// real bill exceeds every counted number. This lives in the rendered output,
-/// not only in a doc.
-pub const RETRY_CAVEAT: &str = "request counts are logical-call counts, not billed requests: \
+/// one request while S3 bills ten. Every request figure in *this bench report*
+/// is a logical-call count, not a billed-request count, and under throttling the
+/// real bill exceeds every counted number.
+///
+/// The gap is no longer unmeasured: issue #928 added a per-operation `attempts`
+/// counter (`StoreMetrics::record_attempt`, surfaced as `ravel_store_attempts_total`
+/// at the server's `/metrics`) that the S3 adapter's counting HTTP connector fills
+/// in below the retry loop, so `attempts - calls` is the billed retry overhead.
+/// This bench harness does not install that connector, so its own request figures
+/// stay logical-call counts; the caveat says so rather than implying the gap is
+/// unmeasurable anywhere. This lives in the rendered output, not only in a doc.
+pub const RETRY_CAVEAT: &str = "request counts here are logical-call counts, not billed requests: \
     object_store retries below InstrumentedStore (max_retries=10), so under throttling the real \
-    bill exceeds every counted number and nothing here measures the gap (ADR-0927 decision 8, #928)";
+    bill exceeds every counted number. This bench does not install the counting HTTP connector; \
+    the billed-request count is measured separately as attempts (ravel_store_attempts_total) \
+    (ADR-0927 decision 8, #928)";
 
 /// The statuses ADR-0927 decision 6 fixes. Every outcome has exactly one, and
 /// only [`ResultStatus::Ok`] is admissible in a timing table. Kept as a typed

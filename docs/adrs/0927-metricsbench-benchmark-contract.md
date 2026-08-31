@@ -242,8 +242,14 @@ One `get()` that retried nine times records one request while S3 bills ten.
 
 Every request figure in this repository is therefore a logical-call count, not
 a billed-request count. Under throttling the real bill exceeds every counted
-number and **nothing currently measures the gap**. Every cost estimate in a
-MetricsBench report carries this caveat next to the figure, not in a footnote.
+number. Issue #928 closed the measurement gap this decision named: a
+per-operation `attempts` counter (`StoreMetrics::record_attempt`, surfaced as
+`ravel_store_attempts_total` at `/metrics`) is filled in by the S3 adapter's
+counting HTTP connector *below* `object_store`'s retry loop, so `attempts -
+calls` is the billed retry overhead. The MetricsBench harness itself does not
+install that connector, so its own request figures stay logical-call counts and
+every cost estimate in a MetricsBench report carries this caveat next to the
+figure, not in a footnote.
 
 The existing honest representation is reused rather than reinvented:
 `RequestCounts::backend_bills_requests` already distinguishes "these counts
@@ -431,10 +437,13 @@ from precedent, not an extension of it.
 lane, credentials and a bucket. Correctness, CI and MinIO diagnostic runs do
 not.
 
-**Retry blindness is now a recorded, unclosed gap.** Naming it here does not
-fix it. A follow-up may add a retry counter below `InstrumentedStore`; until
-then every published request count and every derived cost figure, including
-those already published for ClickBench, under-reports by the retry factor.
+**Retry blindness was a recorded gap, closed by #928.** Naming it here did not
+fix it; the follow-up this ADR anticipated ("a retry counter below
+`InstrumentedStore`") landed as the per-operation `attempts` counter
+(`ravel_store_attempts_total`). A published request count that was taken as a
+logical-call count (this bench, and ClickBench figures published before #928)
+still under-reports by the retry factor; the billed count is now observable
+wherever the S3 counting connector is installed (the server's `/metrics`).
 
 **One known defect will corrupt a lane if ignored.** Flight SQL records a
 statement's cost into the `/metrics` aggregator twice, pinned at
