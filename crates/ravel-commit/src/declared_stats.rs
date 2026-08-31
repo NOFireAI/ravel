@@ -27,6 +27,8 @@
 //!   takes only [`DeclaredColumnStat`]s, whose constructor is the typed
 //!   boundary that refuses ineligible types (ADR-0873 decision 2).
 
+use std::collections::HashSet;
+
 use ravel_proto::commit::v1::{
     CommitRecord, CompactionPart, DeclaredColumnMinMax, DeclaredColumnStatValue,
     declared_column_stat_value::Kind,
@@ -149,12 +151,21 @@ pub fn decode(entry: &DeclaredColumnMinMax) -> Result<DeclaredColumnStat, Declar
 /// Decode a record's stamp list, dropping (and reporting) every entry that
 /// cannot be trusted. Never fails: a defective statistic leaves its column
 /// uncovered, it does not make the record unreadable.
+///
+/// Never fails on entry count either: the list is bounded by the bytes prost
+/// already decoded and allocated, so the pass below is linear in work that has
+/// already been paid for. A count cap would have to refuse a durable,
+/// immutable record whose declared-column count nothing in the tenant-config
+/// path bounds, which is the one outcome this module exists to avoid.
 pub fn decode_all(entries: &[DeclaredColumnMinMax]) -> DecodedDeclaredStats {
     let mut out = DecodedDeclaredStats::default();
+    // Names, not decoded stats: the name is stored verbatim, and borrowing
+    // from `entries` keeps the set independent of the pushes into `out`.
+    let mut seen: HashSet<&str> = HashSet::with_capacity(entries.len());
     for (index, entry) in entries.iter().enumerate() {
         match decode(entry) {
             Ok(stat) => {
-                if out.covered.iter().any(|seen| seen.name() == stat.name()) {
+                if !seen.insert(entry.name.as_str()) {
                     out.dropped.push(DroppedStatEntry {
                         index,
                         name: entry.name.clone(),
@@ -604,20 +615,76 @@ mod tests {
 
     #[test]
     fn duplicate_column_entries_keep_only_the_first() {
+        // Both orderings of the same duplicate pair. A resolution that keeps
+        // whichever entry it prefers (widest range, highest null count, last
+        // seen) satisfies one ordering and fails the other; only first-wins
+        // satisfies both.
+        let narrow = i64_stat("EventDate", 1, 2, 0);
+        let wide = i64_stat("EventDate", 100, 200, 5);
+        for (first, second) in [(&narrow, &wide), (&wide, &narrow)] {
+            let entries = vec![encode(first), encode(second)];
+            let read = decode_all(&entries);
+            // The exact surviving entry, not just its name or its count.
+            assert_eq!(read.covered, vec![first.clone()]);
+            assert_eq!(read.dropped.len(), 1);
+            // The exact dropped index, which the defect counter attributes by.
+            assert_eq!(
+                read.dropped[0],
+                DroppedStatEntry {
+                    index: 1,
+                    name: "EventDate".to_string(),
+                    reason: DeclaredStatDefect::DuplicateName("EventDate".to_string()),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn duplicates_do_not_disturb_the_order_of_the_entries_around_them() {
+        // Order is record order for both lists, and a duplicate drops out of
+        // the middle without reordering what follows it.
         let entries = vec![
-            encode(&i64_stat("EventDate", 1, 2, 0)),
-            encode(&i64_stat("EventDate", 100, 200, 5)),
+            encode(&i64_stat("Aaa", 1, 2, 0)),
+            encode(&i64_stat("Bbb", 3, 4, 0)),
+            encode(&i64_stat("Aaa", 5, 6, 0)),
+            encode(&i64_stat("Ccc", 7, 8, 0)),
+            encode(&i64_stat("Bbb", 9, 10, 0)),
         ];
         let read = decode_all(&entries);
-        assert_eq!(read.covered, vec![i64_stat("EventDate", 1, 2, 0)]);
-        assert_eq!(read.dropped.len(), 1);
         assert_eq!(
-            read.dropped[0],
-            DroppedStatEntry {
-                index: 1,
-                name: "EventDate".to_string(),
-                reason: DeclaredStatDefect::DuplicateName("EventDate".to_string()),
-            }
+            read.covered,
+            vec![
+                i64_stat("Aaa", 1, 2, 0),
+                i64_stat("Bbb", 3, 4, 0),
+                i64_stat("Ccc", 7, 8, 0),
+            ]
+        );
+        assert_eq!(
+            read.dropped
+                .iter()
+                .map(|d| (d.index, d.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(2, "Aaa"), (4, "Bbb")]
+        );
+    }
+
+    #[test]
+    fn an_entry_count_above_any_declared_column_list_is_read_in_full() {
+        // ADR-0873 decision 2 has no entry-count cap, and nothing in the
+        // tenant-config declared-column path bounds the count either, so a
+        // record carrying far more entries than any real declaration decodes
+        // whole: no truncation, no error, no dropped entry. A cap added later
+        // would fail here, which is where its derivation belongs.
+        let count = 4_096;
+        let entries: Vec<_> = (0..count)
+            .map(|i| encode(&i64_stat(&format!("Column{i}"), 0, i, 0)))
+            .collect();
+        let read = decode_all(&entries);
+        assert_eq!(read.covered.len(), usize::try_from(count).expect("fits"));
+        assert_eq!(read.dropped, vec![]);
+        assert_eq!(
+            read.column("Column4095").map(|s| s.max()),
+            Some(Some(DeclaredStatValue::I64(4_095)))
         );
     }
 
