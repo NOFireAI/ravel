@@ -42,21 +42,29 @@
 //!   back to the `Display` heuristic when no `HttpError` is in the chain.
 //!   See [`classify_generic`] for the single, well-documented classification
 //!   path this crate uses for every `Error::Generic`.
-//! - **`upload_checksum` is unsupported (`capabilities().upload_checksum ==
-//!   false`), by contract design, not oversight.** `object_store` 0.14's
-//!   `AmazonS3` client offers only a whole-client, crate-computed checksum
-//!   algorithm (`AmazonS3Builder::with_checksum_algorithm`, SHA-256 or
-//!   CRC64NVME only) with no per-request hook and no way to attach a
-//!   caller-supplied precomputed value; `PutOptions::checksum`'s CRC32C has
-//!   nowhere to go on the wire. `put()` still runs it as a local pre-flight
-//!   against the input buffer, catching a caller/payload mismatch before we
-//!   even talk to S3, but that check proves nothing about bytes actually
-//!   received by the server. Because the limitation is permanent and affects
-//!   every S3-compatible endpoint, `upload_checksum` is not part of
-//!   [`Capabilities::mandatory`] and does not gate startup;
-//!   read-time integrity comes from the segment crc32c hierarchy instead.
-//!   See `capabilities()` below. The same gap applies per part: a multipart
-//!   part's checksum is a local pre-flight too.
+//! - **`upload_checksum` is configurable, off by default (#863).** The exact
+//!   thing the contract's [`UploadChecksum`] names — the caller's own
+//!   precomputed CRC32C attached per request as `x-amz-checksum-crc32c` — has
+//!   nowhere to go: `object_store` 0.14's `AmazonS3` client has no per-request
+//!   checksum hook and no way to attach a caller-supplied value
+//!   (`PutRequest::with_payload` computes the digest itself). Its only
+//!   upload-integrity knob is the whole-client
+//!   [`AmazonS3Builder::with_checksum_algorithm`], SHA-256 or CRC64-NVME only,
+//!   which `object_store` computes over the payload and sends as
+//!   `x-amz-checksum-{sha256,crc64nvme}` for S3 to verify-or-reject. [`S3HttpConfig::upload_integrity`]
+//!   selects it: `Off` (default) attaches nothing and reports
+//!   `upload_checksum: false`; `Crc64Nvme`/`Sha256` attach the header and report
+//!   `true`. When on, `put()`'s CRC32C pre-flight still runs over the same buffer
+//!   `object_store` then digests, so the caller's bytes are covered caller ->
+//!   buffer -> server; the wire algorithm is just not the caller's CRC32C value.
+//!   A backend that rejects the header fails the PUT loudly; one that silently
+//!   ignores it cannot be detected here (`PutResult` carries no response headers),
+//!   so a non-`Off` mode is a deployment assertion that the endpoint honors it.
+//!   `upload_checksum` is not in [`Capabilities::mandatory`] and gates no mode,
+//!   so either setting starts. See [`UploadIntegrity`] and `capabilities()`
+//!   below. The multipart per-part path keeps only the local pre-flight: a
+//!   multipart `UploadPart` takes no `with_checksum_algorithm` value in this
+//!   client, and there is no whole-object digest to attach at `complete`.
 //! - **Multipart completion is unconditional.** `object_store` 0.14's
 //!   `put_multipart_opts` takes a `PutMultipartOptions` carrying tags,
 //!   attributes, and extensions --- no `PutMode` --- so no
@@ -75,7 +83,7 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
-use object_store::aws::{AmazonS3, AmazonS3Builder, AwsCredentialProvider};
+use object_store::aws::{AmazonS3, AmazonS3Builder, AwsCredentialProvider, Checksum};
 use object_store::path::Path;
 use object_store::{
     ClientOptions, GetOptions as OsGetOptions, GetRange as OsGetRange,
@@ -214,6 +222,84 @@ pub enum S3AuthMode {
     /// Short-lived credentials from the EC2 IMDSv2 endpoint. Requires every
     /// inline credential field to be absent.
     InstanceRole,
+}
+
+/// Write-time upload-integrity mode for the S3 / MinIO adapter (#863).
+///
+/// This selects whether `put()` attaches a server-verified checksum to the
+/// outgoing request so S3 verifies-or-rejects the bytes it received, rather
+/// than corruption in transit being caught only at read time by the segment
+/// crc32c hierarchy.
+///
+/// ## What `object_store` 0.14 lets us attach, and what it does not
+///
+/// The contract's [`UploadChecksum`] is a caller-supplied CRC32C, and issue
+/// #863 asked for it on the wire as `x-amz-checksum-crc32c`. That exact
+/// mechanism does not exist in `object_store` 0.14's `AmazonS3` client: there
+/// is no per-request checksum hook and no way to hand it a precomputed digest
+/// (`PutRequest::with_payload` in `object_store`'s `aws/client.rs` computes the
+/// digest itself from the payload it is about to send). Its only upload-
+/// integrity knob is the whole-client [`AmazonS3Builder::with_checksum_algorithm`],
+/// which offers SHA-256 or CRC64-NVME only. Both are computed by `object_store`
+/// over the exact `PutPayload` bytes it puts on the wire, sent as
+/// `x-amz-checksum-{sha256,crc64nvme}`, and verified by S3 on receipt.
+///
+/// That still closes the gap this issue is about. `put()` runs
+/// [`preflight_checksum`] over the same buffer first (caller/payload mismatch,
+/// [`StoreError::Corrupted`] before any network call), and the immutable
+/// [`Bytes`] handed to `object_store` is the very buffer the pre-flight
+/// checked, so the caller's bytes are integrity-covered end to end: caller ->
+/// our buffer (pre-flight) and our buffer -> S3 (the attached checksum). It is
+/// a stronger transport check than CRC32C (64-bit vs 32-bit), just not the
+/// caller's own digest value.
+///
+/// ## Compatibility, and why the default is [`UploadIntegrity::Off`]
+///
+/// Not every S3-compatible endpoint honors these headers. A backend that
+/// *rejects* an unknown/unsupported checksum header fails the PUT loudly, which
+/// surfaces as a [`StoreError`] the caller sees — no silent data loss. A backend
+/// that *silently ignores* the header cannot be detected through this client:
+/// `object_store`'s `PutResult` exposes only `e_tag`/`version`, never the
+/// response headers S3 echoes a honored checksum in, so there is no in-adapter
+/// way to observe "the server dropped it". The visible, configurable signal is
+/// this switch plus [`Capabilities::upload_checksum`]: `Off` (the default)
+/// keeps the historical behavior and reports `upload_checksum: false`; a
+/// non-`Off` mode reports `true` and is a deployment-level assertion that the
+/// configured endpoint honors the chosen algorithm. `upload_checksum` is not in
+/// [`Capabilities::mandatory`] and gates no mode, so both settings start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UploadIntegrity {
+    /// Attach no checksum. `capabilities().upload_checksum == false`; behavior
+    /// is byte-for-byte the historical single-PUT/multipart path. The default,
+    /// because a checksum header an endpoint does not support turns every write
+    /// into an error.
+    #[default]
+    Off,
+    /// Attach `x-amz-checksum-crc64nvme` (CRC64-NVME, computed by
+    /// `object_store`). The cheaper of the two algorithms; supported by AWS S3
+    /// and recent MinIO, but not by every older S3-compatible endpoint.
+    Crc64Nvme,
+    /// Attach `x-amz-checksum-sha256` (SHA-256, computed by `object_store`).
+    /// The most broadly supported server-verified checksum, at the cost of a
+    /// cryptographic hash over every payload.
+    Sha256,
+}
+
+impl UploadIntegrity {
+    /// The `object_store` [`Checksum`] algorithm to configure on the client, or
+    /// `None` for [`UploadIntegrity::Off`].
+    fn checksum_algorithm(self) -> Option<Checksum> {
+        match self {
+            UploadIntegrity::Off => None,
+            UploadIntegrity::Crc64Nvme => Some(Checksum::CRC64NVME),
+            UploadIntegrity::Sha256 => Some(Checksum::SHA256),
+        }
+    }
+
+    /// Whether a write-time checksum is attached (i.e. not [`UploadIntegrity::Off`]).
+    fn is_enabled(self) -> bool {
+        self.checksum_algorithm().is_some()
+    }
 }
 
 /// Explicit configuration for the S3 / MinIO adapter. No environment or
@@ -389,6 +475,16 @@ pub struct S3HttpConfig {
     pub http2_keep_alive_interval: Duration,
     /// HTTP/2 keep-alive ping acknowledgement timeout. See the type note.
     pub http2_keep_alive_timeout: Duration,
+    /// Write-time upload-integrity mode (#863): whether `put()` attaches a
+    /// server-verified checksum (`x-amz-checksum-*`) so S3 verifies-or-rejects
+    /// the bytes it received. Default [`UploadIntegrity::Off`] (no checksum,
+    /// historical behavior). See [`UploadIntegrity`] for what `object_store`
+    /// 0.14 can and cannot attach and why this rides on the client-build config
+    /// rather than [`S3Config`]. It is not, strictly, HTTP *tuning*, but this is
+    /// the crate's overridable client-build config that already reaches
+    /// [`S3Store::builder`], and [`S3Config`] cannot grow fields (struct-literal
+    /// built out of this crate's edit scope).
+    pub upload_integrity: UploadIntegrity,
 }
 
 impl S3HttpConfig {
@@ -429,6 +525,7 @@ impl Default for S3HttpConfig {
             pool_idle_timeout: Duration::from_secs(30),
             http2_keep_alive_interval: Duration::from_secs(10),
             http2_keep_alive_timeout: Duration::from_secs(10),
+            upload_integrity: UploadIntegrity::Off,
         }
     }
 }
@@ -496,6 +593,11 @@ pub struct S3Store {
     /// `multipart_abort_failures`; the difference isolates the dropped case.
     /// Read via [`S3Store::multipart_uploads_unreaped`] (#864).
     multipart_uploads_unreaped: AtomicU64,
+    /// The write-time upload-integrity mode this store was built with (#863).
+    /// Drives [`Capabilities::upload_checksum`]: a non-[`UploadIntegrity::Off`]
+    /// mode configured `object_store` to attach a server-verified checksum in
+    /// [`S3Store::builder`], so the capability reports `true` truthfully.
+    upload_integrity: UploadIntegrity,
 }
 
 impl S3Store {
@@ -547,6 +649,7 @@ impl S3Store {
         http: S3HttpConfig,
         attempt_metrics: Option<Arc<StoreMetrics>>,
     ) -> Result<Self, StoreError> {
+        let upload_integrity = http.upload_integrity;
         let (mut builder, credential_provider, instance_role_provider) =
             Self::builder(&config, &http)?;
         // Count billed HTTP requests below `object_store`'s retry loop (#928).
@@ -568,6 +671,7 @@ impl S3Store {
             instance_role_provider,
             multipart_abort_failures: AtomicU64::new(0),
             multipart_uploads_unreaped: AtomicU64::new(0),
+            upload_integrity,
         })
     }
 
@@ -689,6 +793,14 @@ impl S3Store {
         // kms:GenerateDataKey/kms:Decrypt on this key (docs/object-store-contract.md).
         if let Some(kms_key_id) = &config.kms_key_id {
             builder = builder.with_sse_kms_encryption(kms_key_id);
+        }
+        // Write-time upload integrity (#863): the only server-verified checksum
+        // `object_store` 0.14 can attach is this whole-client algorithm, which it
+        // computes itself over the payload and sends as `x-amz-checksum-*`. Off
+        // by default; see `UploadIntegrity`. SigV4 signs the checksum header
+        // inside `object_store`'s request path, so no signing code changes here.
+        if let Some(algorithm) = http.upload_integrity.checksum_algorithm() {
+            builder = builder.with_checksum_algorithm(algorithm);
         }
 
         let mut credential_provider = None;
@@ -961,10 +1073,12 @@ fn classify_generic(
 /// Local CRC32C pre-flight, shared by [`S3Store::put`] and
 /// [`S3MultipartUpload::put_part`]: recomputes the digest over the buffer we
 /// are about to hand `object_store` and rejects a caller/payload mismatch
-/// before any network call. It is never attached to the outgoing request and
-/// proves nothing about bytes actually landing on S3/MinIO; see the doc
-/// comment on [`S3Store::capabilities`] for why this crate cannot close that
-/// gap with `object_store` 0.14's `AmazonS3` client.
+/// before any network call. This CRC32C value is never itself put on the wire
+/// (`object_store` 0.14 has no hook for a caller-supplied digest); under a
+/// non-`Off` [`S3HttpConfig::upload_integrity`] the on-wire, server-verified
+/// checksum is a separate SHA-256/CRC64-NVME `object_store` computes over the
+/// same buffer, so the two together cover the caller's bytes end to end. See
+/// [`UploadIntegrity`] and the doc comment on [`S3Store::capabilities`].
 fn preflight_checksum(data: &Bytes, checksum: Option<UploadChecksum>) -> Result<(), StoreError> {
     if let Some(UploadChecksum::Crc32c(expected)) = checksum {
         let actual = crc32c::crc32c(data);
@@ -1617,27 +1731,22 @@ impl ObjectStoreBackend for S3Store {
             create_if_absent: true,
             cas_version: true,
             suffix_range: true,
-            // `false`, not a placeholder: `object_store` 0.14's `AmazonS3`
-            // client has no per-request checksum hook at all. Its only
-            // upload-integrity knob is `AmazonS3Builder::with_checksum_algorithm`,
-            // which (a) is a whole-client setting, not something `put()` can
-            // apply per-call from `PutOptions::checksum`, (b) only offers
-            // `Checksum::SHA256` / `Checksum::CRC64NVME`, not CRC32C, and (c)
-            // always has the crate compute the digest itself from the
-            // payload it is about to send -- there is no way to hand it a
-            // caller-supplied precomputed value to attach to the wire
-            // request (see `Client::with_payload` in `object_store`'s
-            // `aws/client.rs`). So `put()`'s CRC32C check above can only ever
-            // be a local pre-flight against our own input buffer; it cannot
-            // catch corruption introduced in transit, so this reports the
-            // capability as unsupported rather than claiming integrity the
-            // adapter does not provide. The flag is not startup-gating: it is
-            // not in `Capabilities::mandatory()` precisely because no
-            // S3-compatible endpoint can satisfy it through this client
-            //, and read-time integrity comes from the
-            // footer/section/page crc32c hierarchy instead
+            // True exactly when a non-`Off` `UploadIntegrity` was configured
+            // (#863): that mode set `AmazonS3Builder::with_checksum_algorithm` in
+            // `builder()`, so `object_store` attaches a server-verified
+            // `x-amz-checksum-*` over the payload and S3 verifies-or-rejects the
+            // write. `object_store` 0.14 offers no per-request hook and no way to
+            // attach the caller's own precomputed CRC32C (see `UploadIntegrity`),
+            // so the attached algorithm is SHA-256 / CRC64-NVME, not the
+            // contract's CRC32C; combined with `put()`'s CRC32C pre-flight over
+            // the same buffer this still covers the caller's bytes to the server.
+            // `Off` (the default) attaches nothing and reports `false`, the
+            // historical behavior for endpoints that do not honor the header. The
+            // flag is not in `Capabilities::mandatory()` and gates no mode, so
+            // either setting starts; read-time integrity still comes from the
+            // footer/section/page crc32c hierarchy regardless
             // (docs/object-store-contract.md "Upload checksums").
-            upload_checksum: false,
+            upload_checksum: self.upload_integrity.is_enabled(),
             prefix_list: true,
             // Real: `put_multipart` above drives
             // CreateMultipartUpload/UploadPart/CompleteMultipartUpload/

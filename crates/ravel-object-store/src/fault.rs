@@ -91,6 +91,7 @@ pub enum FaultKind {
     DuplicateDelivery,
     NotFoundBlip,
     CorruptRange,
+    CorruptBody,
     EtagChange,
     Transient,
     Permanent,
@@ -124,6 +125,17 @@ pub enum ScriptedFault {
     /// `get` only: the wrapped `get` is called for real and every byte of
     /// the returned data is bit-flipped before being handed back.
     CorruptRange,
+    /// `put` only: models corruption between caller and store (a bad buffer, a
+    /// driver/DMA flip before the request is signed). Every byte of the payload
+    /// is bit-flipped and the wrapped `put` is called for real with the flipped
+    /// bytes and the caller's unchanged [`PutOptions`]. A store that verifies a
+    /// caller-supplied [`crate::UploadChecksum`] against received bytes (i.e.
+    /// reports `upload_checksum`) must reject the write with
+    /// [`StoreError::Corrupted`] and leave no object; a store that does not
+    /// stores the corrupted bytes, which is exactly the gap read-time checksums
+    /// otherwise have to catch. This is the write-side mirror of
+    /// [`ScriptedFault::CorruptRange`].
+    CorruptBody,
     /// `get` only: the wrapped `get` is called for real and its bytes are
     /// returned unchanged, but the etag is replaced with a deterministic
     /// value distinct from any this store would otherwise produce. Models a
@@ -149,6 +161,7 @@ impl ScriptedFault {
             ScriptedFault::DuplicateDelivery => FaultKind::DuplicateDelivery,
             ScriptedFault::NotFoundBlip => FaultKind::NotFoundBlip,
             ScriptedFault::CorruptRange => FaultKind::CorruptRange,
+            ScriptedFault::CorruptBody => FaultKind::CorruptBody,
             ScriptedFault::EtagChange => FaultKind::EtagChange,
             ScriptedFault::Transient(_) => FaultKind::Transient,
             ScriptedFault::Permanent(_) => FaultKind::Permanent,
@@ -558,6 +571,7 @@ fn default_fault(kind: FaultKind) -> ScriptedFault {
         FaultKind::DuplicateDelivery => ScriptedFault::DuplicateDelivery,
         FaultKind::NotFoundBlip => ScriptedFault::NotFoundBlip,
         FaultKind::CorruptRange => ScriptedFault::CorruptRange,
+        FaultKind::CorruptBody => ScriptedFault::CorruptBody,
         FaultKind::EtagChange => ScriptedFault::EtagChange,
         FaultKind::Transient => ScriptedFault::Transient("fault: random transient".into()),
         FaultKind::Permanent => ScriptedFault::Permanent("fault: random permanent".into()),
@@ -845,6 +859,15 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for FaultStore<S> {
             Some(ScriptedFault::Transient(msg)) => Err(StoreError::Transient(msg)),
             Some(ScriptedFault::Permanent(msg)) => Err(StoreError::Permanent(msg)),
             Some(ScriptedFault::NotFoundBlip) => Err(StoreError::NotFound),
+            Some(ScriptedFault::CorruptBody) => {
+                // Corrupt between caller and store: flip every byte, then call
+                // the wrapped `put` for real with the caller's unchanged
+                // `PutOptions`. A store that verifies `opts.checksum` against the
+                // received bytes rejects it; one that does not stores the flipped
+                // bytes. Empty payloads have no byte to flip and pass through.
+                let flipped: Vec<u8> = data.iter().map(|b| b ^ 0xFF).collect();
+                self.inner.put(key, Bytes::from(flipped), opts).await
+            }
             Some(ScriptedFault::CorruptRange | ScriptedFault::EtagChange) => {
                 Err(not_applicable("put"))
             }
@@ -877,9 +900,11 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for FaultStore<S> {
             }
             Some(ScriptedFault::Transient(msg)) => Err(StoreError::Transient(msg)),
             Some(ScriptedFault::Permanent(msg)) => Err(StoreError::Permanent(msg)),
-            Some(ScriptedFault::PartialWriteThenError | ScriptedFault::FailedConditionalWrite) => {
-                Err(not_applicable("get"))
-            }
+            Some(
+                ScriptedFault::PartialWriteThenError
+                | ScriptedFault::FailedConditionalWrite
+                | ScriptedFault::CorruptBody,
+            ) => Err(not_applicable("get")),
         }
     }
 
@@ -924,6 +949,7 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for FaultStore<S> {
                 ScriptedFault::PartialWriteThenError
                 | ScriptedFault::FailedConditionalWrite
                 | ScriptedFault::CorruptRange
+                | ScriptedFault::CorruptBody
                 | ScriptedFault::EtagChange,
             ) => Err(not_applicable("head")),
         }
@@ -1015,6 +1041,7 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for FaultStore<S> {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::UploadChecksum;
     use crate::memory::MemoryStore;
 
     #[tokio::test]
@@ -1157,6 +1184,62 @@ mod tests {
         let clean = store.get("k", GetRange::Full).await.expect("get");
         assert_eq!(&clean.data[..], b"hello");
         assert_eq!(store.fault_count(Op::Get, FaultKind::CorruptRange), 1);
+    }
+
+    #[tokio::test]
+    async fn corrupt_body_flips_put_and_is_rejected_by_a_checksum_verifying_store() {
+        // MemoryStore verifies `PutOptions::checksum` against received bytes and
+        // reports `upload_checksum: true`, so it must reject a body corrupted
+        // between caller and store. The caller's checksum is over the original
+        // bytes; CorruptBody flips them before the wrapped `put`, so the
+        // recomputed digest no longer matches.
+        let inner = MemoryStore::new();
+        assert!(
+            inner.capabilities().upload_checksum,
+            "oracle must claim upload_checksum for this test to mean anything"
+        );
+        let plan = FaultPlan::empty().with_rule(Rule::new(Op::Put, ScriptedFault::CorruptBody));
+        let store = FaultStore::new(inner, plan);
+
+        let data = Bytes::from_static(b"corrupt-in-flight payload");
+        let good = crc32c::crc32c(&data);
+        let err = store
+            .put(
+                "k",
+                data,
+                PutOptions::default().with_checksum(UploadChecksum::Crc32c(good)),
+            )
+            .await
+            .expect_err("a checksum-verifying store must reject a corrupted body");
+        assert!(matches!(err, StoreError::Corrupted(_)), "got {err:?}");
+        assert!(
+            matches!(store.head("k").await, Err(StoreError::NotFound)),
+            "a write failing checksum verification must leave no object"
+        );
+        // The counter proves the fault actually fired, not that some unrelated
+        // path produced the error.
+        assert_eq!(store.fault_count(Op::Put, FaultKind::CorruptBody), 1);
+    }
+
+    #[tokio::test]
+    async fn corrupt_body_is_stored_when_no_checksum_is_supplied() {
+        // Without a caller checksum the oracle has nothing to verify against, so
+        // the flipped bytes land: this is precisely the gap a server-verified
+        // upload checksum (or read-time checksums) closes, and the reason
+        // CorruptBody models a real hazard rather than a test artifact.
+        let inner = MemoryStore::new();
+        let plan = FaultPlan::empty().with_rule(Rule::new(Op::Put, ScriptedFault::CorruptBody));
+        let store = FaultStore::new(inner, plan);
+
+        let data = Bytes::from_static(b"unchecked payload");
+        store
+            .put("k", data.clone(), PutOptions::default())
+            .await
+            .expect("no checksum, nothing rejects the flipped bytes");
+        let got = store.get("k", GetRange::Full).await.expect("get");
+        let flipped: Vec<u8> = data.iter().map(|b| b ^ 0xFF).collect();
+        assert_eq!(&got.data[..], flipped.as_slice());
+        assert_eq!(store.fault_count(Op::Put, FaultKind::CorruptBody), 1);
     }
 
     #[tokio::test]

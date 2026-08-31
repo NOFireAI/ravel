@@ -341,34 +341,69 @@ assembled object stays byte-correct. The scripted-fault gap is an
 observability/testing gap, not a correctness one, and no production path
 depends on part completion order.
 
-### Upload checksums (best effort, never startup-gating)
+### Upload checksums (opt-in, never startup-gating)
 
 `upload_checksum` is a `Capabilities` flag, but it is NOT mandatory and no
-mode may require it. `PutOptions::checksum` is honored on a best-effort
-basis: backends that can put a caller-supplied CRC32C on the wire do, and
-those that cannot report `upload_checksum: false` and are still startable.
+mode may require it. When a backend reports `upload_checksum: true`, it
+guarantees a write is verified against corruption between the caller and the
+server: a body that does not match is rejected with `Corrupted` and no object
+becomes visible. When it reports `false`, only the local pre-flight below runs
+and transport corruption is caught at read time instead.
 
-This is a limitation of Ravel's S3 client library, not a gap in any
-particular server. `object_store` 0.14's `AmazonS3` client exposes no
-per-request checksum hook and no way to attach a caller-supplied precomputed
-digest to an outgoing request (its only knob,
-`AmazonS3Builder::with_checksum_algorithm`, is whole-client, SHA-256 or
-CRC64NVME only, and always computes the digest itself). So `S3Store` reports
-`upload_checksum: false` against every S3-compatible endpoint, MinIO and AWS
-S3 included, regardless of what those servers support. Requiring the flag at
-startup therefore made the only durable backend permanently unusable in
-every mode rather than catching a real regression.
+**Two-part integrity, and what each part covers.** `put()` runs the caller's
+`PutOptions::checksum` (CRC32C) as a local pre-flight against its input buffer
+on every backend, rejecting a caller/payload mismatch with `Corrupted` before
+any network call. This is the caller -> our-buffer half. The contract suite
+asserts it (`assert_upload_checksum_verification`). The our-buffer -> server
+half is what `upload_checksum: true` adds.
 
-What still holds with the flag false:
+**`MemoryStore`** verifies `PutOptions::checksum` against the bytes it received
+and always reports `upload_checksum: true`; it is the semantics oracle for the
+capability. The contract suite pins the promise with
+`upload_checksum_store_rejects_corrupt_in_flight`: `FaultStore`'s `CorruptBody`
+fault flips the payload between caller and store, and a store claiming the
+capability must reject it (asserting the fault counter proves the corruption
+fired).
 
-- `put()` runs the CRC32C as a local pre-flight against its input buffer on
-  every backend, rejecting a caller/payload mismatch with `Corrupted` before
-  any network call. The contract suite asserts this
-  (`assert_upload_checksum_verification`).
-- Read-time integrity is the real backstop against corrupted bytes
-  surviving: the footer/section/page crc32c hierarchy
-  (docs/segment-format.md) verifies data on every read of format-bearing
-  bytes, independent of whether a wire-level upload checksum existed.
+**`S3Store`** is opt-in via `S3HttpConfig::upload_integrity` (`UploadIntegrity`):
+
+- `Off` (default) attaches no checksum and reports `upload_checksum: false`.
+  This is the historical behavior, kept as the default because a checksum
+  header an endpoint does not support turns every write into an error.
+- `Crc64Nvme` / `Sha256` configure `object_store`'s whole-client
+  `AmazonS3Builder::with_checksum_algorithm`, so it computes that digest over
+  the exact payload and sends it as `x-amz-checksum-crc64nvme` /
+  `x-amz-checksum-sha256`; S3 verifies-or-rejects on receipt. The capability
+  then reports `true`.
+
+Two limits of `object_store` 0.14's `AmazonS3` client shape this. First, it
+exposes no per-request checksum hook and no way to attach a caller-supplied
+precomputed digest (`PutRequest::with_payload` computes the digest itself), and
+its algorithm knob offers only SHA-256 or CRC64-NVME. So the attached checksum
+is *not* the caller's CRC32C from `PutOptions::checksum`; it is a separate,
+stronger (64-bit) digest `object_store` computes over the same buffer the
+pre-flight just checked, so the caller's bytes are still covered end to end.
+Second, a backend that *silently ignores* the header cannot be detected in the
+adapter: `object_store`'s `PutResult` carries only `e_tag`/`version`, never the
+response headers in which S3 echoes a honored checksum. A backend that
+*rejects* the header fails the PUT loudly (a surfaced `StoreError`), so the
+detectable failure mode fails safe; the undetectable one is why a non-`Off`
+mode is a deployment-level assertion that the configured endpoint honors the
+chosen algorithm, made visible through the capability flag rather than probed.
+The startup warn/downgrade choice this implies lives in the server wiring that
+reads `capabilities()`, not in this crate.
+
+`upload_checksum` is not in `Capabilities::mandatory()` and gates no mode, so
+`S3Store` starts in every mode under either setting. Read-time integrity is the
+backstop regardless: the footer/section/page crc32c hierarchy
+(docs/segment-format.md) verifies data on every read of format-bearing bytes,
+independent of whether a wire-level upload checksum existed.
+
+There is no per-part or whole-object upload checksum for a multipart upload:
+`object_store`'s `UploadPart` takes no checksum-algorithm value and `complete`
+takes no digest, so a multipart part keeps only the local CRC32C pre-flight (see
+"Checksum coverage" under "Multipart upload"). `put()`'s own above-threshold
+multipart path is therefore not covered by `upload_integrity`.
 
 Upload checksums are CRC32C-class integrity checks against transport
 corruption; they do not verify blake3. blake3 in commit records is an
@@ -379,9 +414,13 @@ idempotency and identity discriminator, not a transport check.
 AWS S3 since Dec 2020 provides strong read-after-write and list
 consistency; S3 conditional writes (If-None-Match/If-Match) provide
 CreateIfAbsent and CAS. GCS: generation preconditions. Azure: etags +
-leases. MinIO supports the full mandatory set; like AWS S3, its
-server-side upload checksums are unreachable through `object_store`'s
-client, which is why `S3Store` reports `upload_checksum: false` for both.
+leases. MinIO supports the full mandatory set. Server-side upload checksums
+are reachable through `object_store`'s whole-client
+`with_checksum_algorithm` (SHA-256 / CRC64-NVME), which
+`S3HttpConfig::upload_integrity` opts into; SHA-256 is the broadly supported
+choice (AWS S3 and MinIO), CRC64-NVME needs a recent endpoint. The default is
+`Off`, so `S3Store` reports `upload_checksum: false` unless a mode is
+configured (see "Upload checksums").
 
 ### Credentials
 
