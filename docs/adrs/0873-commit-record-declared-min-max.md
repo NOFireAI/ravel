@@ -233,17 +233,52 @@ are per ADR-0066 decision 1):
   wrong answer, not a slow one.
 
 Enforcement is two-sided. Writers stamp only allowlisted types. Every
-decoder (commit record, compaction record, snapshot entry) validates each
-entry against the full predicate below. An entry failing **any** clause is
-dropped whole — no field of it is used, including the fields that pass on
-their own: a plausible min next to an impossible null count is evidence the
+decoder validates each entry against the full predicate below before the
+entry can grant coverage. An entry failing **any** clause is dropped
+whole — no field of it is used, including the fields that pass on their
+own: a plausible min next to an impossible null count is evidence the
 writer that produced the entry was broken, not a value to salvage. The
 dropped column is simply uncovered for that segment (the safety rule of
-decision 4), the drop is counted on a defect metric, and the record itself
-still decodes; an invalid entry is never a decode failure and never
-trusted partially.
+decision 4), the drop is counted on a defect metric labelled by carrier,
+and the carrying object itself still decodes; an invalid entry is never a
+decode failure and never trusted partially.
 
-A decoded `DeclaredColumnMinMax` entry is valid iff all of:
+The predicate below is named the **statistics validity predicate**, and it
+is **carrier-independent**: it binds every carrier that can grant coverage
+under decision 4 — the stamp, at each of its decoders (commit record,
+compaction record, snapshot entry), **and** the ADR-0850/0942 `.cstat`
+`ColumnStat` entries, at the join against the touched segments — and any
+carrier a future ADR adds. The union of decision 4 is only as sound as its
+weakest member: for any segment one carrier alone covers, that carrier's
+validation *is* the guarantee, so a predicate applied to one carrier and
+not another is not a partial safety measure, it is no guarantee at all for
+exactly the segments the unchecked carrier serves. This paragraph exists
+so a future carrier cannot be added under weaker validation by omission:
+granting coverage from any entry that has not passed this predicate is a
+violation of this ADR, not an implementation detail. (The first revision
+of this amendment made precisely that omission: it stated the predicate
+for the new stamp only, leaving `.cstat` under its pre-existing, weaker
+reader checks — which validate min/max presence shape and value kind but
+never reconcile the entry's row accounting with the joined
+`SegmentRef.sample_count`, so a `.cstat` entry claiming `non_null_count =
+1, null_count = 0` for a two-row segment passed validation and reached the
+exact `MIN`/`MAX` and `COUNT` paths.)
+
+The predicate is stated over the carrier-neutral quantities `(name,
+declared_type, min, max, null_count, sample_count)`, where `sample_count`
+is always the segment's row count as the reader resolves it: for a stamp,
+the carrying record's row count (`CommitRecord`/`SnapshotEntry` field 11,
+`CompactionPart` field 6); for a `.cstat` entry, the **joined**
+`SegmentRef.sample_count` of the segment the entry is keyed to — never a
+figure the entry carries about itself, because self-consistency of a
+broken entry proves nothing. A `ColumnStat` additionally carries the
+redundant pair (`non_null_count`, field 3, beside `null_count`, field 4),
+so it gets one carrier-specific clause instantiating the same rule over
+the redundancy: `non_null_count + null_count == sample_count`, exactly. An
+entry whose redundant fields disagree with the joined row count is dropped
+like any other invalid entry.
+
+An entry, from either carrier, is valid iff all of:
 
 1. `declared_type` is allowlisted ({I64, BOOL} today).
 2. `min` and `max` are **both present or both absent**, where present means
@@ -252,15 +287,20 @@ A decoded `DeclaredColumnMinMax` entry is valid iff all of:
    either aggregate, so it is invalid outright, never "half usable".
 3. When both are present, `min <= max` under the authoritative comparator
    defined below.
-4. `null_count <= sample_count`, the carrying record's row count for the
-   segment (`CommitRecord`/`SnapshotEntry` field 11, `CompactionPart`
-   field 6).
+4. `null_count <= sample_count`, with `sample_count` resolved as defined
+   above (the carrying record's row count for a stamp, the joined
+   `SegmentRef.sample_count` for a `.cstat` entry). For a `.cstat` entry,
+   additionally `non_null_count + null_count == sample_count`, exactly.
 5. Presence agrees with the null count: both-absent (zero non-null values)
    requires `null_count == sample_count`; both-present requires
    `null_count < sample_count`.
 6. `name` is non-empty, and at most one entry exists per
-   `(name, declared_type)` on the record; duplicates are all dropped, since
-   no rule could pick the right one.
+   `(name, declared_type)` in the carrier's entry set for the segment (the
+   record's repeated field for a stamp, the segment's `ColumnStat` list
+   for `.cstat`); duplicates are all dropped, since no rule could pick the
+   right one. A reader that keeps the last duplicate it sees — the shape
+   of the current `.cstat` join, which collects entries into a by-name map
+   — is silently picking one, which is exactly what this clause forbids.
 
 The authoritative comparator is the scan-path aggregate's, by definition:
 for I64, signed integer order (`i64::cmp`, which is what DataFusion's Int64
@@ -273,15 +313,22 @@ under any other ordering is the same class of silent wrongness as a wrong
 value — the F64 gate above exists precisely because floats are the case
 where two plausible comparators genuinely disagree.
 
-Tests that pin the predicate, one decode case per clause: a one-sided
-entry, `min > max`, `null_count > sample_count`, both-absent with
-`null_count != sample_count`, a oneof kind mismatching `declared_type`, an
-unallowlisted type, and a duplicate name. Each asserts the entry is absent
-from the decoded set, the defect metric incremented by exactly one, the
-record otherwise decoded intact, and `partition_statistics` reporting
-`Precision::Absent` for that column. The assertion that fails when the
-invariant breaks must be the entry's absence (and the resulting `Absent`
-precision), not a log line.
+Tests that pin the predicate, one case per clause **per carrier** — every
+case below runs once against a stamp and once against a `.cstat` entry,
+because a clause tested on one carrier proves nothing about the other's
+code path: a one-sided entry, `min > max`, `null_count > sample_count`,
+both-absent with `null_count != sample_count`, a oneof kind mismatching
+`declared_type`, an unallowlisted type, and a duplicate name. The `.cstat`
+lane adds the redundancy case of clause 4: an entry with `non_null_count +
+null_count != sample_count` of the joined segment — concretely, the
+defect that motivated this rule, `non_null_count = 1, null_count = 0`
+joined to a two-row segment — must be dropped and must not reach the
+exact `MIN`/`MAX` or `COUNT` paths. Each case asserts the entry is absent
+from the valid set, the carrier-labelled defect metric incremented by
+exactly one, the carrying object otherwise decoded intact, and
+`partition_statistics` reporting `Precision::Absent` for that column. The
+assertion that fails when the invariant breaks must be the entry's absence
+(and the resulting `Absent` precision), not a log line.
 
 ### 3. Capture at write time
 
@@ -315,25 +362,51 @@ precision), not a log line.
 
 **Null-count capture, end to end.** The null count is observed in exactly
 one place — the writer, at encode time — and carried unchanged to the
-record; nothing downstream recomputes it and nothing defaults it:
+record; nothing downstream recomputes it and nothing defaults it.
+
+One representation, stated once and used everywhere in this ADR: every
+per-block and whole-object figure below counts **NULL rows**. That is what
+`NumStat.null_count` stores in the tree today
+(`crates/ravel-logseg/src/block.rs`: the struct doc, and the
+`i64_stat`/`bool_stat`/`f64_stat` constructors, which increment it for
+every row whose merged-view resolved value for the column's name is absent
+or of another type). It is **not** a non-null count; the two are
+complements — `non_null(block, column) = block_rows(block) −
+nulls(block, column)` — and a fold written in one representation reading
+state stored in the other reverses every block's contribution. An earlier
+revision of this section called the two "equivalent"; they are not, and
+the fold below is therefore written in NULL units only, with `non_null`
+appearing solely as the derived complement above, never as a stored input.
 
 1. `RlogWriter` already tracks per-block, per-`(name, type)` NumStats for
-   SKIP_IDX; the implementation extends that per-block state with the
-   block's non-null row count for the column where it is not already
-   recorded (`NumStat.null_count`, equivalently `non_null`).
-2. The whole-object fold computes, per eligible declared column,
-   `null_count = Σ over blocks of (block_rows − non_null(block, column))`.
-   A block in which the column never appears contributes its **entire**
-   row count: absent-in-block reads NULL for every row of that block, so
-   the fold runs over the object's block list, not over the NumStat map —
-   summing only blocks that carry a NumStat entry undercounts.
-3. The fold cross-checks itself: total non-null plus `null_count` must
-   equal the object's row count. If the identity does not hold, or any
-   block's non-null count for the column is unavailable (a block encoded
-   before the per-column state existed, any accounting path the writer
-   cannot reconcile), the writer emits **no entry for that column on that
+   SKIP_IDX, including `NumStat.null_count`, the block's NULL row count
+   for the column. No new per-block state is needed for the count; the
+   fold consumes the field as stored.
+2. Per block, in NULL units: `nulls(block, column) =
+   NumStat(block, column).null_count` when the block carries a NumStat
+   entry for the column, and `nulls(block, column) = block_rows(block)`
+   when it does not — absent-in-block reads NULL for every row of that
+   block. The fold therefore runs over the object's block list, not over
+   the NumStat map; summing only blocks that carry an entry undercounts.
+3. Whole object, in the same NULL units:
+   `null_count(object, column) = Σ over blocks of nulls(block, column)`.
+   No term of this sum is ever `block_rows − x`; the only subtraction in
+   this section is the derived complement definition above, and it is
+   never an input to the fold.
+4. The fold cross-checks itself: per block carrying an entry,
+   `NumStat.null_count ≤ block_rows(block)`; whole object,
+   `Σ block_rows == the object's row count` and
+   `null_count(object, column) ≤ that row count`. Note what the old
+   cross-check ("total non-null plus null_count equals the row count")
+   cannot do: that identity is symmetric under swapping `null_count` and
+   `non_null`, so it holds equally well for an inverted fold and can
+   never catch the inversion — only the mixed-null test below can. If any
+   cross-check fails, or any block's NumStat for the column is
+   unavailable where one is required (a block encoded before the
+   per-column state existed, any accounting path the writer cannot
+   reconcile), the writer emits **no entry for that column on that
    object**. Never an entry with `null_count: 0`.
-4. The exact `(min, max, null_count)` triple travels as one unit through
+5. The exact `(min, max, null_count)` triple travels as one unit through
    `finish_with_stats` (L0 flush) and `finish_compacted_with_stats`
    (compaction and the ADR-0064 rewrite) to `record::build` and the part
    builder, which stamp it verbatim.
@@ -360,6 +433,23 @@ the exact figure, not "nonzero"); a writer path with an unreconcilable
 block (fault-injected) emits no entry for the column and the read side
 reports `Precision::Absent` — the assertion that fails when the invariant
 breaks must be "no entry", never "entry with zero".
+
+One capture test is mandatory and is the one that pins the representation
+itself: a **mixed-null block** — an object containing at least one block
+where the column is NULL in some rows and non-NULL in others (say 5 rows,
+2 NULL), asserting the exact whole-object `null_count`, on data chosen so
+that the column's total NULL count differs from its total non-NULL count.
+The reason it must exist is the reason the inversion above survived a
+review: on an all-NULL or no-NULL block the per-block pair
+`(null_count, non_null)` is `(R, 0)` or `(0, R)`, so a fold that swaps
+the two representations maps each such block's contribution to the other
+uniform value, a suite built only from uniform blocks can be satisfied by
+a swapped fold whenever the swapped totals coincide (for example
+equal-sized all-NULL and no-NULL blocks), and the swap-symmetric identity
+cross-check passes always. Only a block with
+`0 < null_count < block_rows` makes the two representations emit
+different figures, so only this test fails when the fold is written in
+the wrong one.
 
 Added write cost, stated for the band it must stay in: per object, one
 `O(blocks × eligible declared columns)` comparison fold over NumStats the
@@ -393,9 +483,12 @@ lets the same stock rule also answer `COUNT(col)`) with
    ts bound fully contains every touched segment (so no extremum can be
    clipped away by a bound the stats don't see).
 2. **Every** touched segment is covered for that column, where covered means:
-   a `SegmentRef` stamp with matching `(name, declared_type)` that passed
-   the decision-2 validity predicate (a dropped entry is no coverage),
-   **or** an ADR-0850/0942 `.cstat` entry for that segment and column. The
+   an entry with matching `(name, declared_type)` that passed decision 2's
+   statistics validity predicate (a dropped entry is no coverage), from
+   either carrier — a `SegmentRef` stamp or an ADR-0850/0942 `.cstat`
+   entry for that segment and column. The predicate condition is
+   carrier-independent by decision 2, and coverage is what it gates: an
+   entry from any carrier that has not passed it grants nothing. The
    two carriers are a union, per segment, per column. Any segment covered by
    neither leaves the column `Precision::Absent`, the `AggregateStatistics`
    rule silently does not fire, and the query scans — the ADR-0850 safety
@@ -413,7 +506,9 @@ one segment resolve through the same content hash, or "both carriers for
 one segment" has no meaning.
 
 Per `(content_hash, name, declared_type)` the reader resolves exactly one
-value, by cases:
+value, by cases. Only entries that passed the statistics validity
+predicate participate at all: an invalid entry is absent from the union
+(no coverage), never one side of a conflict.
 
 - **Stamp only, or `.cstat` only:** use it. This is the normal state — the
   live tail has only stamps, pre-stamp sealed history has only `.cstat`.
@@ -664,20 +759,26 @@ flowchart TD
   docs/query-engine.md's statistics-shortcut section. This ADR row is added
   to docs/adrs/README.md now.
 - **Two new defect signals an operator must know.** Invalid entries
-  dropped at decode (decision 2's predicate) and carrier conflicts
-  (decision 4's equality rule) each land on their own metric. Both mean a
+  dropped by the statistics validity predicate (decision 2, one metric
+  labelled by carrier) and carrier conflicts (decision 4's equality rule)
+  each land on their own metric. Both mean a
   writer-side or copy-side bug against immutable data, not load: a nonzero
   rate is a ticket, and the only query-visible symptom is statistics
   shortcuts quietly not firing.
 - **Tests the implementation owes** (prove-the-test discipline): the
   erasure-rewrite recompute rule (erase the max, stamp must shrink); the
-  decision-2 validity predicate, one decode case per clause (one-sided
-  min/max, `min > max`, `null_count > sample_count`, presence disagreeing
-  with null count, kind mismatch, ineligible type, duplicate name), each
-  asserting the drop, the defect metric, and the resulting `Absent`
+  statistics validity predicate of decision 2, one decode case per clause
+  **per carrier** (one-sided min/max, `min > max`,
+  `null_count > sample_count`, presence disagreeing with null count, kind
+  mismatch, ineligible type, duplicate name, each run against a stamp and
+  against a `.cstat` entry, plus the `.cstat` redundancy case
+  `non_null_count + null_count != sample_count`), each asserting the drop,
+  the carrier-labelled defect metric, and the resulting `Absent`
   precision; the null-count capture cases of decision 3 (all-NULL object,
   block missing the column counted in full, unreconcilable block emitting
-  no entry rather than zero); the union cases of decision 4 (equal
+  no entry rather than zero, and the mixed-null block asserting the exact
+  whole-object figure — the only case that distinguishes the NULL-count
+  representation from its complement); the union cases of decision 4 (equal
   carriers fire and match a scan, one unequal field yields `Absent` plus
   exactly one conflict-metric increment, `COUNT(col)` proves null_count
   is never summed across carriers); mixed coverage (stamped tail +
@@ -685,11 +786,14 @@ flowchart TD
   the `stats_are_exact` erasure refusal extended to the new columns;
   proptest round-trip of the new messages with corrupt-input rejection
   typed, seed files checked in.
-- **Amendment scope note.** The fail-closed amendments above (validity
-  predicate, entry-granular null-count exactness, equality-or-`Absent`
-  union keyed by `content_hash`) change no wire field, no field number, no
-  eligibility, and no migration class; they constrain decoders, the writer
-  fold, and the union reader that decisions 2-4 already established.
+- **Amendment scope note.** The fail-closed amendments above (the
+  carrier-independent statistics validity predicate, entry-granular
+  null-count exactness with the fold stated in NULL units only,
+  equality-or-`Absent` union keyed by `content_hash`) change no wire
+  field, no field number, no eligibility, and no migration class; they
+  constrain decoders (both carriers' — the `.cstat` join gains the row
+  accounting and duplicate checks it previously lacked), the writer fold,
+  and the union reader that decisions 2-4 already established.
 - **Interaction with ADR-0815 (clustered compaction).** ADR-0815 already
   plans additive per-part min/max bound fields for its clustering key;
   field 12 here is per *declared column* with exactness semantics, not a
