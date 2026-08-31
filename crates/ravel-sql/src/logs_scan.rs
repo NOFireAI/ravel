@@ -3542,42 +3542,102 @@ fn resource_attrs<'c>(
     }
 }
 
-/// The merged value of a declared key at surviving row `i`, under the same
-/// record-wins-over-resource precedence the row path's [`merged_attrs`] +
-/// [`find_attr`] produce: the record's own value if it sets the key (in any
-/// FIELD_DIR column), otherwise the resource/scope scalar.
+/// Per-column, per-block resolver for a declared key's merged value under the
+/// same record-wins-over-resource precedence the row path's [`merged_attrs`] +
+/// [`find_attr`] produce.
 ///
-/// Returns the record-column value directly when the record sets the key at the
-/// declared type; `None` when the record sets it at a different type (wrong
-/// variant, NULL by ADR-0090 decision 7). Only when the record does not set the
-/// key at all is the resource/scope fallback consulted, returning a cloned
-/// [`AttrValue`] whose variant the caller checks against the declared type.
-fn declared_merged_value(
-    view: &ColumnarBlockView<'_>,
-    plan: &DeclaredPlan<'_, '_>,
-    i: usize,
-    cache: &mut HashMap<u32, Arc<Vec<(String, AttrValue)>>>,
-) -> DFResult<Option<AttrValue>> {
-    if plan.single_matching() {
-        // Fused: the one matching-column read is both the presence test and the
-        // value (deliverable 2, #875). `value_at` is `Some` exactly when the
-        // record sets the key at the declared type; `None` (absent, or a `Str`
-        // cell that is not UTF-8) falls through to the resource/scope value,
-        // matching the row path.
-        if let Some(v) = plan.matching_cursor().and_then(|c| c.value_at(i)) {
-            return Ok(Some(v));
+/// Three parts of the merge that do not vary by row are resolved once here rather
+/// than in the per-row read. [`DeclaredPlan::single_matching`] and the
+/// declared-type cursor ([`DeclaredPlan::matching_cursor`]) are plan-invariant
+/// and become fields. The resource/scope fallback ([`find_attr`] over the decoded
+/// stream attributes) returns the same answer for every row sharing a
+/// `stream_ref`, so it is memoized per `stream_ref`: its scan and the one clone
+/// of its result run once per distinct stream in the block, not once per row.
+///
+/// The precedence is unchanged (ADR-0090 decision 7): the record's own value
+/// wins if it sets the key in any FIELD_DIR column; a record that sets the key at
+/// a different type yields NULL and does NOT consult the fallback; only a record
+/// that does not set the key at all reads the resource/scope value. The
+/// `single_matching` fast path still treats a `Str` cell that is not valid UTF-8
+/// as absent, falling through to the fallback.
+struct DeclaredResolver<'p, 'd, 'a> {
+    plan: &'p DeclaredPlan<'d, 'a>,
+    /// [`DeclaredPlan::single_matching`], resolved once for the block.
+    single_matching: bool,
+    /// [`DeclaredPlan::matching_cursor`], resolved once for the block.
+    matching_cursor: Option<&'p DeclaredCursor<'a>>,
+    /// Memo of the resource/scope fallback value per `stream_ref`, so the
+    /// [`find_attr`] scan runs once per distinct stream, not once per row.
+    fallback: HashMap<u32, Option<AttrValue>>,
+    /// How many times the fallback scan actually ran: exactly the number of
+    /// distinct stream refs that reached the fallback. Pinned by the
+    /// memoization test.
+    resolve_count: usize,
+}
+
+impl<'p, 'd, 'a> DeclaredResolver<'p, 'd, 'a> {
+    fn new(plan: &'p DeclaredPlan<'d, 'a>) -> Self {
+        DeclaredResolver {
+            plan,
+            single_matching: plan.single_matching(),
+            matching_cursor: plan.matching_cursor(),
+            fallback: HashMap::new(),
+            resolve_count: 0,
         }
-    } else if plan.record_sets_key(i) {
-        // Record wins. Its value is the declared-type column's cell, or NULL when
-        // the record set the key only in a different-typed column (ADR-0090
-        // decision 7); either way the resource/scope fallback is not consulted.
-        return Ok(plan.matching_cursor().and_then(|c| c.value_at(i)));
     }
-    let Some(stream_ref) = view.stream_ref(i) else {
-        return Ok(None);
-    };
-    let resource = resource_attrs(view, cache, stream_ref)?;
-    Ok(find_attr(resource, &plan.dc.key).cloned())
+
+    /// The resource/scope fallback value for `stream_ref`, memoized. The
+    /// [`find_attr`] scan and the one clone of its result run once per distinct
+    /// stream; every later row of the same stream reads the memo.
+    fn fallback_value(
+        &mut self,
+        view: &ColumnarBlockView<'_>,
+        cache: &mut HashMap<u32, Arc<Vec<(String, AttrValue)>>>,
+        stream_ref: u32,
+    ) -> DFResult<&Option<AttrValue>> {
+        match self.fallback.entry(stream_ref) {
+            std::collections::hash_map::Entry::Occupied(e) => Ok(e.into_mut()),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let resource = resource_attrs(view, cache, stream_ref)?;
+                let value = find_attr(resource, &self.plan.dc.key).cloned();
+                self.resolve_count += 1;
+                Ok(e.insert(value))
+            }
+        }
+    }
+
+    /// The merged value of the declared key at surviving row `i`. Returns the
+    /// record-column value when the record sets the key at the declared type;
+    /// `None` when the record sets it at a different type (wrong variant, NULL by
+    /// ADR-0090 decision 7). Only when the record does not set the key at all is
+    /// the resource/scope fallback consulted, whose variant the caller checks
+    /// against the declared type.
+    fn merged_value(
+        &mut self,
+        view: &ColumnarBlockView<'_>,
+        i: usize,
+        cache: &mut HashMap<u32, Arc<Vec<(String, AttrValue)>>>,
+    ) -> DFResult<Option<AttrValue>> {
+        if self.single_matching {
+            // Fused: the one matching-column read is both the presence test and
+            // the value (deliverable 2, #875). `value_at` is `Some` exactly when
+            // the record sets the key at the declared type; `None` (absent, or a
+            // `Str` cell that is not UTF-8) falls through to the resource/scope
+            // value, matching the row path.
+            if let Some(v) = self.matching_cursor.and_then(|c| c.value_at(i)) {
+                return Ok(Some(v));
+            }
+        } else if self.plan.record_sets_key(i) {
+            // Record wins. Its value is the declared-type column's cell, or NULL
+            // when the record set the key only in a different-typed column
+            // (ADR-0090 decision 7); either way the fallback is not consulted.
+            return Ok(self.matching_cursor.and_then(|c| c.value_at(i)));
+        }
+        let Some(stream_ref) = view.stream_ref(i) else {
+            return Ok(None);
+        };
+        Ok(self.fallback_value(view, cache, stream_ref)?.clone())
+    }
 }
 
 /// Build one declared typed attribute column for surviving rows `start..end`
@@ -3599,9 +3659,10 @@ fn build_declared_columnar_array(
     Ok(match plan.dc.ty {
         DeclaredType::Str => build_declared_str_columnar(view, plan, start, end, cache)?,
         DeclaredType::I64 => {
+            let mut resolver = DeclaredResolver::new(plan);
             let mut b = Int64Builder::new();
             for i in start..end {
-                match declared_merged_value(view, plan, i, cache)? {
+                match resolver.merged_value(view, i, cache)? {
                     Some(AttrValue::I64(v)) => b.append_value(v),
                     _ => b.append_null(),
                 }
@@ -3609,9 +3670,10 @@ fn build_declared_columnar_array(
             Arc::new(b.finish())
         }
         DeclaredType::Bool => {
+            let mut resolver = DeclaredResolver::new(plan);
             let mut b = BooleanBuilder::new();
             for i in start..end {
-                match declared_merged_value(view, plan, i, cache)? {
+                match resolver.merged_value(view, i, cache)? {
                     Some(AttrValue::Bool(v)) => b.append_value(v),
                     _ => b.append_null(),
                 }
@@ -3619,9 +3681,10 @@ fn build_declared_columnar_array(
             Arc::new(b.finish())
         }
         DeclaredType::Bytes => {
+            let mut resolver = DeclaredResolver::new(plan);
             let mut b = BinaryBuilder::new();
             for i in start..end {
-                match declared_merged_value(view, plan, i, cache)? {
+                match resolver.merged_value(view, i, cache)? {
                     Some(AttrValue::Bytes(bytes)) => b.append_value(bytes),
                     // Parity with the row path: a resource/scope `List`/`Map`
                     // value is canonicalized. In the eligible (no `attrs_raw`)
@@ -3671,6 +3734,7 @@ fn build_declared_str_columnar(
     cache: &mut HashMap<u32, Arc<Vec<(String, AttrValue)>>>,
 ) -> DFResult<ArrayRef> {
     let n = end - start;
+    let mut resolver = DeclaredResolver::new(plan);
     Ok(
         match plan
             .matching_col()
@@ -3709,8 +3773,7 @@ fn build_declared_str_columnar(
                             None => keys.push(None),
                         }
                     } else if let Some(stream_ref) = view.stream_ref(i) {
-                        let resource = resource_attrs(view, cache, stream_ref)?;
-                        match find_attr(resource, &plan.dc.key) {
+                        match resolver.fallback_value(view, cache, stream_ref)? {
                             Some(AttrValue::Str(s)) => {
                                 values.append_value(s);
                                 keys.push(Some(next_extra));
@@ -3747,7 +3810,7 @@ fn build_declared_str_columnar(
                     // `appended` == "this row is decided, do not consult the
                     // resource/scope fallback" (record wins over resource).
                     let mut appended = false;
-                    if plan.single_matching() {
+                    if resolver.single_matching {
                         // Fused: one cursor read is both presence and value.
                         if let Some(s) = matching_str.and_then(|c| c.str_at(i)) {
                             values.append_value(s);
@@ -3774,8 +3837,7 @@ fn build_declared_str_columnar(
                         continue;
                     }
                     if let Some(stream_ref) = view.stream_ref(i) {
-                        let resource = resource_attrs(view, cache, stream_ref)?;
-                        match find_attr(resource, &plan.dc.key) {
+                        match resolver.fallback_value(view, cache, stream_ref)? {
                             Some(AttrValue::Str(s)) => {
                                 values.append_value(s);
                                 keys.push(Some(next));
@@ -4088,6 +4150,302 @@ mod columnar_lookup_tests {
             assert!(ints.is_valid(i), "row {i} is non-null");
             assert_eq!(ints.value(i), want, "row {i}");
         }
+    }
+
+    /// A record on stream `stream`, with the given resource scalars and dynamic
+    /// per-record attributes.
+    fn rec(
+        stream: u8,
+        ts: i64,
+        resource: &[(&str, AttrValue)],
+        attrs: &[(&str, AttrValue)],
+    ) -> LogRecord {
+        let res: Vec<(String, AttrValue)> = resource
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.clone()))
+            .collect();
+        LogRecord {
+            stream_id: sid(stream),
+            stream_attrs: stream_attrs_bytes(&res, "scope", "1", &[]),
+            ts_ns: ts,
+            observed_ts_ns: ts,
+            severity_num: 9,
+            severity_text: "INFO".into(),
+            body: "b".into(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: attrs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), v.clone()))
+                .collect(),
+        }
+    }
+
+    /// Write `records` as one RLOG object and open a fresh scan over the whole
+    /// object with no predicate.
+    fn write_and_scan<'o>(
+        records: &[LogRecord],
+        cfg: &RlogConfig,
+        obj: &'o mut Vec<u8>,
+    ) -> RlogReader<'o> {
+        let mut w = RlogWriter::new(
+            *cfg,
+            ObjectIdentity {
+                tenant_hash: [0; 16],
+                shard: 0,
+                writer_id: [0; 16],
+                writer_epoch: 0,
+                writer_seq: 0,
+            },
+        );
+        for r in records {
+            w.push(r.clone()).expect("push");
+        }
+        *obj = w.finish().expect("finish");
+        RlogReader::new(obj, cfg).expect("open")
+    }
+
+    /// Byte-identity oracle at block granularity: `build_declared_columnar_array`
+    /// must produce the exact column `declared_column_array` builds from the row
+    /// path's merged view over the SAME block, across every branch of the merge in
+    /// one input.
+    ///
+    /// The input exercises, for declared I64 key `k`: a record that sets `k` at
+    /// the declared type (record wins), a record that sets `k` at a DIFFERENT type
+    /// while its stream carries `k` in resource (must be NULL and must NOT fall
+    /// through to the resource value: ADR-0090 decision 7), two rows of one stream
+    /// whose records do not set `k` and whose stream has `k` in resource (fallback
+    /// value, memoized once), and a row whose record does not set `k` and whose
+    /// stream has no `k` (NULL). Both paths read the block in the same surviving
+    /// order (`next_block` and `next_block_columnar` are documented to), so the
+    /// two arrays compare element by element.
+    ///
+    /// Failing-against-pre-change was demonstrated by flipping the
+    /// `record_sets_key` arm of `DeclaredResolver::merged_value` to fall through
+    /// to the fallback when the declared-type cell is `None`: the different-typed
+    /// row then reads its stream's resource `k=777` instead of NULL, and both the
+    /// element-wise and the sorted-multiset assertions below fail.
+    #[test]
+    fn columnar_declared_column_is_byte_identical_to_row_path() {
+        let cfg = RlogConfig {
+            block_target_records: 16,
+            max_dynamic_columns: 8,
+            ..RlogConfig::default()
+        };
+        // stream 3: resource has k=I64(777). Its two records set k -- once at the
+        // declared type (wins), once at a different type (NULL, decision 7).
+        // stream 1: resource has k=I64(999); two records set nothing (fallback).
+        // stream 2: no resource k; one record sets nothing (NULL fallback).
+        let records = vec![
+            rec(
+                3,
+                100,
+                &[
+                    ("svc", AttrValue::Str("c".into())),
+                    ("k", AttrValue::I64(777)),
+                ],
+                &[("k", AttrValue::I64(10))],
+            ),
+            rec(
+                3,
+                101,
+                &[
+                    ("svc", AttrValue::Str("c".into())),
+                    ("k", AttrValue::I64(777)),
+                ],
+                &[("k", AttrValue::Str("x".into()))],
+            ),
+            rec(
+                1,
+                102,
+                &[
+                    ("svc", AttrValue::Str("a".into())),
+                    ("k", AttrValue::I64(999)),
+                ],
+                &[],
+            ),
+            rec(
+                1,
+                103,
+                &[
+                    ("svc", AttrValue::Str("a".into())),
+                    ("k", AttrValue::I64(999)),
+                ],
+                &[],
+            ),
+            rec(2, 104, &[("svc", AttrValue::Str("b".into()))], &[]),
+        ];
+        let dc = DeclaredColumn::new("k", DeclaredType::I64);
+
+        // Row path: decode the block's records in surviving order, merge, build.
+        let mut obj = Vec::new();
+        let reader = write_and_scan(&records, &cfg, &mut obj);
+        let mut scan = reader
+            .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
+            .expect("scan");
+        let block = scan.next_block(&obj).expect("row exit").expect("one block");
+        assert!(
+            scan.next_block(&obj).expect("row exit").is_none(),
+            "the input fits one block"
+        );
+        let merged: Vec<Vec<(String, AttrValue)>> = block
+            .iter()
+            .map(|r| merged_attrs(r).expect("merge"))
+            .collect();
+        let row_arr = declared_column_array(&dc, &merged);
+        let row = row_arr
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("row I64 array");
+
+        // Columnar path over the same object.
+        let mut obj2 = Vec::new();
+        let reader2 = write_and_scan(&records, &cfg, &mut obj2);
+        let mut scan2 = reader2
+            .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
+            .expect("scan");
+        let view = scan2
+            .next_block_columnar(&obj2)
+            .expect("columnar exit")
+            .expect("one block");
+        let rows = view.surviving_count();
+        let plan = DeclaredPlan::build(&view, &dc);
+        assert!(
+            !plan.single_matching(),
+            "the key has an I64 and a Str FIELD_DIR column, so the multi-column \
+             precedence path is what runs"
+        );
+        let mut cache = HashMap::new();
+        let col_arr = build_declared_columnar_array(&view, &plan, 0, rows, &mut cache)
+            .expect("columnar array");
+        let col = col_arr
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("columnar I64 array");
+
+        // Byte-identity: same length, same null bitmap, same values, in order.
+        assert_eq!(col.len(), row.len(), "row counts match");
+        assert_eq!(col.len(), 5, "all five records survive in one block");
+        for i in 0..col.len() {
+            assert_eq!(col.is_null(i), row.is_null(i), "null bit at row {i}");
+            if !col.is_null(i) {
+                assert_eq!(col.value(i), row.value(i), "value at row {i}");
+            }
+        }
+
+        // Pin the semantic outcome independent of block ordering: the different-
+        // typed record is NULL (not 777), both fallbacks are 999, the record-wins
+        // row is 10, the no-resource row is NULL. If decision 7 were violated the
+        // second NULL would become 777 and this multiset would not match.
+        let mut got: Vec<Option<i64>> = (0..col.len())
+            .map(|i| (!col.is_null(i)).then(|| col.value(i)))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![None, None, Some(10), Some(999), Some(999)],
+            "declared column merge outcome"
+        );
+    }
+
+    /// The fallback resolve runs once per DISTINCT stream ref in the block, not
+    /// once per row: `DeclaredResolver::resolve_count` equals the number of
+    /// distinct streams, never the row count. Three streams (2 + 2 + 1 rows),
+    /// none setting the key, so every row reaches the fallback; the memo makes the
+    /// scan run exactly three times.
+    ///
+    /// Failing-against-pre-change was demonstrated by resolving per row (dropping
+    /// the memo and incrementing on every call): the count then reads 5, the row
+    /// count, and the `== 3` assertion fails.
+    #[test]
+    fn fallback_resolves_once_per_distinct_stream() {
+        let cfg = RlogConfig {
+            block_target_records: 16,
+            max_dynamic_columns: 8,
+            ..RlogConfig::default()
+        };
+        let records = vec![
+            rec(
+                1,
+                100,
+                &[
+                    ("svc", AttrValue::Str("a".into())),
+                    ("k", AttrValue::I64(1)),
+                ],
+                &[],
+            ),
+            rec(
+                1,
+                101,
+                &[
+                    ("svc", AttrValue::Str("a".into())),
+                    ("k", AttrValue::I64(1)),
+                ],
+                &[],
+            ),
+            rec(
+                2,
+                102,
+                &[
+                    ("svc", AttrValue::Str("b".into())),
+                    ("k", AttrValue::I64(2)),
+                ],
+                &[],
+            ),
+            rec(
+                2,
+                103,
+                &[
+                    ("svc", AttrValue::Str("b".into())),
+                    ("k", AttrValue::I64(2)),
+                ],
+                &[],
+            ),
+            rec(
+                3,
+                104,
+                &[
+                    ("svc", AttrValue::Str("c".into())),
+                    ("k", AttrValue::I64(3)),
+                ],
+                &[],
+            ),
+        ];
+        let dc = DeclaredColumn::new("k", DeclaredType::I64);
+
+        let mut obj = Vec::new();
+        let reader = write_and_scan(&records, &cfg, &mut obj);
+        let mut scan = reader
+            .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
+            .expect("scan");
+        let view = scan
+            .next_block_columnar(&obj)
+            .expect("columnar exit")
+            .expect("one block");
+        let rows = view.surviving_count();
+        assert_eq!(rows, 5, "five surviving rows");
+
+        let plan = DeclaredPlan::build(&view, &dc);
+        // No record sets `k`, so the fallback is consulted for every row and the
+        // resolve count is purely a function of the memoization.
+        let mut streams = std::collections::HashSet::new();
+        for i in 0..rows {
+            streams.insert(view.stream_ref(i).expect("stream ref"));
+        }
+        assert_eq!(streams.len(), 3, "three distinct streams in the block");
+
+        let mut resolver = DeclaredResolver::new(&plan);
+        let mut cache = HashMap::new();
+        for i in 0..rows {
+            resolver
+                .merged_value(&view, i, &mut cache)
+                .expect("merged value");
+        }
+        assert_eq!(
+            resolver.resolve_count, 3,
+            "the fallback scan runs once per distinct stream ref, not once per row"
+        );
     }
 }
 
