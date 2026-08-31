@@ -172,9 +172,17 @@ impl QueryAccounting {
     /// runs below this crate and holds no [`QueryAccounting`] handle (this type
     /// is passed explicitly, never via a task-local; see the [module docs](self)),
     /// so a per-query billed count is not reachable from the layer that sees the
-    /// retries. A budget that must bound billed rather than logical requests
-    /// therefore reads the process-global figure, or needs the attempt count
-    /// threaded up through the fetch return path first.
+    /// retries.
+    ///
+    /// The process-global figure is therefore for observability, not for
+    /// enforcement: it answers what the deployment was billed, and it cannot
+    /// answer what one query was billed. A budget that must bound billed rather
+    /// than logical requests, such as ADR-0075's `max_s3_requests`, cannot be
+    /// served by it at all, because a per-query ceiling needs a per-query count.
+    /// Enforcing on billed requests needs the attempt count threaded up through
+    /// the fetch return path first; until then that budget bounds logical calls
+    /// and a throttled query can spend several times its ceiling at the
+    /// provider while passing the check.
     pub fn record_s3_request(&self, op: AccountedOp) {
         self.0.ops[op.index()]
             .requests
