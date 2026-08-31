@@ -184,24 +184,36 @@ a tenant tombstone landing between our existence check and our record PUT
 lets the sweep delete it while we still intend to reference it — at which
 point a compactor that dropped its bytes cannot repair before publishing.
 So D3 drops bytes at PUT **only for a fresh PUT** (age zero, unreachable
-by the sweep inside the grace floor for the run's whole duration);
-a part whose PUT reported `AlreadyExists` keeps its bytes until the
-compaction record PUT has succeeded, then re-verifies that part with a
-HEAD and re-PUTs from the retained copy if it vanished (the fresh re-PUT
-resets its age). The retained set is normally empty — `AlreadyExists`
-requires a prior abandoned run over the identical input bytes — so the
-memory cost of the exception rounds to zero, and the race test the
-verification plan owes drives exactly this interleaving with a
-`FaultStore`-injected tombstone between check and publish.
+by the sweep inside the grace floor for the run's whole duration). A part
+whose PUT reported `AlreadyExists` is instead re-verified with a HEAD
+**after the compaction record PUT succeeds**, and this arm must itself
+stay bounded: a retry after an abandoned run that uploaded every part
+gets `AlreadyExists` for all of them, and retaining all their bytes would
+recreate the full-output term this decision exists to kill, in exactly
+the recovery scenario. So no bytes are retained for the exception either.
+If the post-publish HEAD finds an `AlreadyExists` part missing, the run
+fails loud with a typed error whose remedy is a re-run — and the re-run
+converges deterministically: it rebuilds byte-identical parts, its PUT of
+the deleted key is then a FRESH put (age reset, sweep-immune), the record
+PUT resolves `AlreadyExists`, and `resolve_already_exists` repairs from
+the bytes it has just built and still holds pre-publish. The steady-state
+memory bound is therefore unchanged in every path, the tombstone race is
+closed by verification rather than retention, and the two owed tests are
+the `FaultStore` tombstone interleaving and the all-parts-`AlreadyExists`
+retry, both asserting no retained-bytes growth.
 
 ### D4. A fail-closed cursor budget: `merge_cursor_budget_bytes`
 
 New `CompactorConfig` knob, default **20 GiB**. Admission is charged as a
 **pre-decode reservation**, not an after-the-fact measurement: before a
-cursor fetches or decodes anything, the merge reserves its ceiling cost
-(`2·G` from the section descriptors' raw lengths plus the `B_dec` ceiling
-formula evaluated from the block's row count and column count, both known
-from resident metadata), and the reservation is reconciled down to the
+cursor fetches or decodes anything, the merge reserves its ceiling cost:
+`2·G` from the section descriptors' raw lengths, plus `B_dec` summed from
+the resident PAGE_DIR's per-page `uncomp_len` for the block's pages times
+a documented allocation-overhead factor — page contents, not a shape
+formula, are what decoded string buffers actually scale with, and PAGE_DIR
+is resident before any BLOCKS byte is fetched. The rows-times-columns
+ceiling formula remains as the documented rationale and as the fallback
+for an input without a PAGE_DIR. The reservation is reconciled down to the
 cursor's actual residency (raw bytes as fetched, `heap_estimate()` once
 decoded — the same numbers the #977 tracker sees) after the decode
 completes. Reservations are taken under the same admission lock that
