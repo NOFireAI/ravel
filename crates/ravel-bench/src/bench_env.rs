@@ -43,19 +43,72 @@ fn rustc_version() -> String {
     command_stdout("rustc", &["--version"]).unwrap_or_else(|| "unknown".to_string())
 }
 
-/// First `model name` line of `/proc/cpuinfo`, the human CPU name.
-fn cpu_model() -> String {
-    let Ok(text) = std::fs::read_to_string("/proc/cpuinfo") else {
-        return "unknown".to_string();
-    };
-    for line in text.lines() {
-        if let Some((key, value)) = line.split_once(':')
-            && key.trim() == "model name"
+/// The human CPU model resolved from host files, or the string `"unknown"`
+/// when no known key form is present. Best-effort and infallible on every
+/// platform: x86 Linux names the CPU in `/proc/cpuinfo`'s `model name`, ARM
+/// Linux exposes `Model` (Raspberry Pi) or the devicetree `model` node or only
+/// a `CPU implementer`/`CPU part` pair, and a non-Linux host has no `/proc` at
+/// all. A host whose CPU cannot be named in any of these records `"unknown"`
+/// rather than aborting the stamp, mirroring the other best-effort fields here
+/// (an explicit unknown is honest; a stamper that refuses to run makes the
+/// whole artifact unavailable). Both provenance sites -- this header and
+/// `metricsbench_report` -- call this one resolver so they cannot diverge.
+pub fn cpu_model() -> String {
+    let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+    let devicetree = std::fs::read_to_string("/sys/firmware/devicetree/base/model").ok();
+    let devicetree = devicetree
+        .as_deref()
+        .map(trim_devicetree)
+        .filter(|s| !s.is_empty());
+    resolve_cpu_model(&cpuinfo, devicetree).unwrap_or_else(|| "unknown".to_string())
+}
+
+/// The resolution decision over fixed inputs, split from the file reads so
+/// every key form is testable without host files. Tries, in order: x86's
+/// `model name`, the `Model` key (Raspberry Pi and some ARM), the devicetree
+/// `model` node (`/sys/firmware/devicetree/base/model`), then a composed
+/// identifier from the `CPU implementer`/`CPU part` pair (bare ARM, no name).
+/// `None` when none of these is present, which the caller renders `"unknown"`.
+fn resolve_cpu_model(cpuinfo: &str, devicetree_model: Option<&str>) -> Option<String> {
+    if let Some(model) = cpuinfo_value(cpuinfo, "model name") {
+        return Some(model);
+    }
+    if let Some(model) = cpuinfo_value(cpuinfo, "Model") {
+        return Some(model);
+    }
+    if let Some(model) = devicetree_model.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(model.to_string());
+    }
+    if let (Some(implementer), Some(part)) = (
+        cpuinfo_value(cpuinfo, "CPU implementer"),
+        cpuinfo_value(cpuinfo, "CPU part"),
+    ) {
+        return Some(format!("ARM implementer {implementer} part {part}"));
+    }
+    None
+}
+
+/// The first non-empty value for `key` in `/proc/cpuinfo` content, matching the
+/// key exactly after trimming. `None` when the key is absent or its value is
+/// blank.
+fn cpuinfo_value(cpuinfo: &str, key: &str) -> Option<String> {
+    for line in cpuinfo.lines() {
+        if let Some((k, value)) = line.split_once(':')
+            && k.trim() == key
         {
-            return value.trim().to_string();
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
         }
     }
-    "unknown".to_string()
+    None
+}
+
+/// The devicetree `model` node is a NUL-terminated string; trim the trailing
+/// NUL(s) and surrounding whitespace.
+fn trim_devicetree(raw: &str) -> &str {
+    raw.trim_matches(|c: char| c == '\0' || c.is_whitespace())
 }
 
 fn core_count() -> String {
@@ -101,4 +154,100 @@ pub fn env_header(title: &str) -> String {
     out.push_str(&format!("commit:  {}\n", git_commit()));
     out.push_str("========================================================================\n");
     out
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::{cpu_model, resolve_cpu_model};
+
+    /// x86 Linux: the `model name` line wins and parses to its trimmed value.
+    #[test]
+    fn model_name_resolves_to_its_value() {
+        assert_eq!(
+            resolve_cpu_model("processor : 0\nmodel name : AMD EPYC 7R13\n", None),
+            Some("AMD EPYC 7R13".to_string()),
+        );
+    }
+
+    /// ARM Linux (Raspberry Pi): no `model name`, but a `Model` line names the
+    /// board. This is the abort issue #976 fixed; a resolver reverted to
+    /// requiring `model name` returns `None` here and fails this test.
+    #[test]
+    fn the_model_key_resolves_when_model_name_is_absent() {
+        assert_eq!(
+            resolve_cpu_model(
+                "processor : 0\nModel : Raspberry Pi 4 Model B Rev 1.4\n",
+                None,
+            ),
+            Some("Raspberry Pi 4 Model B Rev 1.4".to_string()),
+        );
+    }
+
+    /// The devicetree `model` node resolves when neither `model name` nor
+    /// `Model` is present in cpuinfo.
+    #[test]
+    fn the_devicetree_model_resolves_when_cpuinfo_names_no_model() {
+        assert_eq!(
+            resolve_cpu_model(
+                "processor : 0\nCPU implementer : 0x41\n",
+                Some("Raspberry Pi Compute Module 4"),
+            ),
+            Some("Raspberry Pi Compute Module 4".to_string()),
+        );
+    }
+
+    /// Bare ARM: only an implementer/part pair, composed into an identifier.
+    /// Another form the `model name`-only abort could not name.
+    #[test]
+    fn implementer_and_part_compose_when_no_name_is_present() {
+        assert_eq!(
+            resolve_cpu_model(
+                "processor : 0\nCPU implementer : 0x41\nCPU part : 0xd0c\n",
+                None,
+            ),
+            Some("ARM implementer 0x41 part 0xd0c".to_string()),
+        );
+    }
+
+    /// `model name` outranks `Model` and the implementer/part pair when more
+    /// than one form is present.
+    #[test]
+    fn model_name_outranks_the_other_forms() {
+        assert_eq!(
+            resolve_cpu_model(
+                "model name : Intel Xeon\nModel : some board\nCPU implementer : 0x41\nCPU part : 0xd0c\n",
+                Some("a devicetree model"),
+            ),
+            Some("Intel Xeon".to_string()),
+        );
+    }
+
+    /// The no-key case (empty `/proc/cpuinfo`, no devicetree) resolves to
+    /// nothing, so the caller records `"unknown"` -- WITHOUT an error. This is
+    /// the honest-unknown decision: the stamp still runs.
+    #[test]
+    fn no_recognised_key_resolves_to_none() {
+        assert_eq!(
+            resolve_cpu_model("processor : 0\nvendor_id : X\n", None),
+            None
+        );
+    }
+
+    /// A blank `model name` value is not a model; the resolver falls through it
+    /// to the next form rather than returning an empty string.
+    #[test]
+    fn a_blank_model_name_falls_through() {
+        assert_eq!(
+            resolve_cpu_model("model name :   \nModel : Pi\n", None),
+            Some("Pi".to_string()),
+        );
+    }
+
+    /// The public resolver never aborts: on any host it returns a non-empty
+    /// string, `"unknown"` at worst, so the provenance stamp always completes.
+    #[test]
+    fn cpu_model_is_infallible_and_non_empty() {
+        assert!(!cpu_model().is_empty());
+    }
 }

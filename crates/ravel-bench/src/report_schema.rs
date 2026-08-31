@@ -135,7 +135,10 @@ impl ResultStatus {
 pub struct Hardware {
     /// `uname -srm` or equivalent.
     pub os: String,
-    /// The human CPU model string (`/proc/cpuinfo`'s `model name`).
+    /// The human CPU model string, resolved best-effort from host files, or the
+    /// honest `"unknown"` when the host names its CPU in no known form (ARM,
+    /// macOS; issue #976). Descriptive, not a comparability identity: an
+    /// `"unknown"` here is visible but does not block validation.
     pub cpu_model: String,
     /// Logical cores on the measuring host. Zero is never valid.
     pub logical_cores: u32,
@@ -545,7 +548,11 @@ fn is_absent_value(value: &str) -> bool {
 /// with the full [`is_absent_value`] predicate, never a hand-written weaker one,
 /// because the caller applies that single predicate to every row. Adding a
 /// provenance string field is one row here; a reviewer confirms the list against
-/// the [`Provenance`] struct.
+/// the [`Provenance`] struct. One field is intentionally absent:
+/// `hardware.cpu_model`, which a host may legitimately record as `"unknown"`
+/// (ARM/macOS, issue #976); it is a descriptive field, visible but never
+/// blocking, so it must stay off this list -- do not "complete" the list by
+/// adding it.
 ///
 /// Optional fields (`hardware.instance_type`) appear only when present: an
 /// absent optional field is legitimately absent, but a present one must carry a
@@ -559,7 +566,15 @@ fn checked_provenance_fields(p: &Provenance) -> Vec<(&'static str, &str)> {
         ("toolchain", p.toolchain.as_str()),
         ("protocol", p.protocol.as_str()),
         ("hardware.os", p.hardware.os.as_str()),
-        ("hardware.cpu_model", p.hardware.cpu_model.as_str()),
+        // `hardware.cpu_model` is deliberately NOT checked. ARM Linux and macOS
+        // name the CPU in a form other than x86's `model name`, and a host that
+        // names it in none records the honest `"unknown"` (issue #976); an
+        // unnameable CPU must not make the whole artifact unavailable, so an
+        // `"unknown"` model is visible in the stamp but never blocks
+        // validation. It stays out of this list for the same reason the
+        // best-effort gatherer records `"unknown"` rather than aborting: this
+        // is a descriptive field, not a comparability identity the report
+        // refuses to publish without.
         ("backend.store_backend", p.backend.store_backend.as_str()),
         ("backend.region", p.backend.region.as_str()),
         ("backend.endpoint", p.backend.endpoint.as_str()),
@@ -1135,6 +1150,17 @@ mod tests {
         let mut report = valid_report();
         report.provenance.hardware.instance_type = None;
         validate(&report).expect("instance_type is optional; absent still validates");
+    }
+
+    /// `hardware.cpu_model` is descriptive, not a comparability identity: an
+    /// `"unknown"` model (the honest value a host that names its CPU in no
+    /// known form records, ARM/macOS, issue #976) is visible but does not block
+    /// validation, unlike the `"unknown"` git commit or backend field above.
+    #[test]
+    fn a_report_with_an_unknown_cpu_model_validates() {
+        let mut report = valid_report();
+        report.provenance.hardware.cpu_model = "unknown".to_string();
+        validate(&report).expect("an unknown cpu_model is visible but not blocking");
     }
 
     /// A geomean with at least one timed row still validates: a summary that has
