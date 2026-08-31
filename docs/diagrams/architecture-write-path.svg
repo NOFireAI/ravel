@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 900 470" width="900" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Write path: clients through gateway, router, and shard actors to object storage">
+  <style>
+    .b{fill:#ffffff;stroke:#333;stroke-width:1.2;}
+    .g{fill:#f2f2f2;stroke:#333;stroke-width:1.2;}
+    .s{fill:#fff7e0;stroke:#8a6d00;stroke-width:1.2;}
+    .t{font:12px monospace;fill:#111;}
+    .h{font:bold 12px monospace;fill:#111;}
+    .a{stroke:#333;stroke-width:1.2;fill:none;marker-end:url(#awT);}
+  </style>
+  <defs>
+    <marker id="awT" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#333"/></marker>
+  </defs>
+  <rect class="b" x="240" y="8" width="420" height="30"/>
+  <text class="h" x="252" y="28">OTLP gRPC / OTLP HTTP / Remote Write 1.0 + 2.0</text>
+  <path class="a" d="M450,38 L450,64"/>
+  <rect class="b" x="240" y="66" width="420" height="46"/>
+  <text class="h" x="252" y="84">gateway: auth, tenant resolution, admission limits</text>
+  <text class="t" x="252" y="100">per-tenant body size, byte rate, series and stream caps</text>
+  <path class="a" d="M450,112 L450,138"/>
+  <rect class="b" x="240" y="140" width="420" height="46"/>
+  <text class="h" x="252" y="158">ingest router</text>
+  <text class="t" x="252" y="174">shard = hash(tenant, series or stream identity) % shards</text>
+  <path class="a" d="M450,186 L450,212"/>
+  <rect class="b" x="160" y="214" width="580" height="62"/>
+  <text class="h" x="172" y="232">shard actors, one single-threaded task per shard</text>
+  <text class="t" x="172" y="248">buffer records, then build one immutable columnar object in memory:</text>
+  <text class="t" x="172" y="264">RSEG (metrics), RLOG (logs), RSPAN (spans); blake3 over the bytes</text>
+  <path class="a" d="M450,276 L450,302"/>
+  <rect class="g" x="160" y="304" width="580" height="62"/>
+  <text class="h" x="172" y="322">object store (S3 / MinIO; memory and fault-injecting in tests)</text>
+  <text class="t" x="172" y="338">1. data PUT (create-if-absent, upload checksum)</text>
+  <text class="t" x="172" y="354">2. commit-record PUT (create-if-absent) -- the atomic publish</text>
+  <path class="a" d="M450,366 L450,392"/>
+  <rect class="s" x="160" y="394" width="580" height="62"/>
+  <text class="h" x="172" y="412">acknowledgement</text>
+  <text class="t" x="172" y="428">strict: the client is answered only after both PUTs are durable;</text>
+  <text class="t" x="172" y="444">the response carries a commit token that makes the write readable</text>
+</svg>
