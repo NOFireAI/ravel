@@ -140,7 +140,18 @@ if [[ ! "${main_sha}" =~ ^[0-9a-f]{40,64}$ ]]; then
 fi
 # The primary checkout is never a candidate, whatever its state. (git
 # refuses to remove a main working tree, but do not rely on that.)
-main_wt="$(dirname "$(git -C "${repo_root}" rev-parse --path-format=absolute --git-common-dir)")"
+#
+# Validate the result before trusting it as a guard. If the rev-parse fails,
+# `dirname` of an empty string is ".", which matches no worktree path, so the
+# guard would silently stop guarding while every message still looked normal.
+# This script deletes directories, so an unverifiable guard is a stop, not a
+# warning.
+main_common_dir="$(git -C "${repo_root}" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+main_wt="$(dirname "${main_common_dir}")"
+if [[ -z "${main_common_dir}" || "${main_wt}" != /* || ! -d "${main_wt}" ]]; then
+  echo "FATAL: cannot resolve the primary checkout path; refusing to remove anything" >&2
+  exit 1
+fi
 
 echo "==> landed, clean worktrees"
 # Parse `worktree list --porcelain` blocks into a file first: piping straight
@@ -148,7 +159,10 @@ echo "==> landed, clean worktrees"
 # reclaimed byte total, which is the number this run has to report.
 # macOS ships bash 3.2, so no associative arrays here.
 cand_file="$(mktemp)"
-trap 'rm -f "${cand_file}"' EXIT
+# target_file is created later, in the orphaned-target section. Name it in the
+# trap now so an early exit between here and there cannot leak it.
+target_file=""
+trap 'rm -f "${cand_file}" "${target_file}"' EXIT
 git -C "${repo_root}" worktree list --porcelain | awk '
   /^worktree / { wt = substr($0, 10) }
   /^locked/    { print "LOCKED\t" wt; wt = "" }
@@ -197,9 +211,20 @@ while IFS=$'\t' read -r kind wt; do
     note_reaped "${kb}"
     continue
   fi
-  unlanded="$(git -C "${repo_root}" cherry "${main_sha}" "${head_sha}" 2>/dev/null |
-    grep -c '^+' || true)"
-  echo "skip (${unlanded:-?} commit(s) not on origin/main): ${wt}"
+  # Report the real reason. `git cherry` failing produces no output, which
+  # `grep -c` turns into 0, so the old message read "0 commit(s) not on
+  # origin/main" -- a count that means the opposite of what it says. The
+  # outcome is a skip either way (fail closed), but a wrong reason sends the
+  # next reader looking in the wrong place.
+  cherry_out=""
+  cherry_rc=0
+  cherry_out="$(git -C "${repo_root}" cherry "${main_sha}" "${head_sha}" 2>&1)" || cherry_rc=$?
+  if [[ "${cherry_rc}" -ne 0 ]]; then
+    echo "skip (cannot compare against origin/main, git cherry exited ${cherry_rc}): ${wt}"
+  else
+    unlanded="$(printf '%s\n' "${cherry_out}" | grep -c '^+' || true)"
+    echo "skip (${unlanded} commit(s) not on origin/main): ${wt}"
+  fi
   skipped_count=$((skipped_count + 1))
 done <"${cand_file}"
 
