@@ -150,6 +150,186 @@ struct CachedColumnStats {
     stats_blake3: [u8; 32],
     part_blake3: Vec<[u8; 32]>,
     stats: Arc<LoadedColumnStats>,
+    /// The entry's charge against the budget, cached at insert time so the
+    /// running total and an eviction's refund never re-walk the object. Equal
+    /// to [`LoadedColumnStats::heap_bytes`] of `stats`.
+    bytes: u64,
+    /// Recency tick for LRU eviction: the entry with the smallest value is the
+    /// least recently used. Stamped on insert and refreshed on every cache hit.
+    last_used: u64,
+}
+
+/// Byte-budgeted, process-wide reuse cache for resolved column-statistics
+/// objects (issue #905), one entry per `(tenant, signal)`. It fronts the
+/// stats-object GET on [`Catalog::load_column_stats`] the same way
+/// [`CachedColumnStats`] describes, but with a total byte budget so a
+/// multi-tenant process cannot accumulate one unbounded entry per served
+/// tenant for its lifetime.
+///
+/// The budget is over the bytes actually held
+/// ([`LoadedColumnStats::heap_bytes`]), not an entry count: a `.cstat`
+/// payload's size varies by orders of magnitude across tenants, so an
+/// entry-count bound would not bound memory. Admitting an object that would
+/// push the total over `max_bytes` first evicts least-recently-used entries,
+/// each counted in `evictions`; an object larger than the whole budget is not
+/// cached at all and counted in `refusals`. Both counters make an undersized
+/// budget observable: they climb while the statistics plainly exist, which an
+/// operator reads apart from ABSENT statistics (a load returning `Ok(None)`,
+/// leaving both flat). Eviction only ever forces a later cache miss and a
+/// re-resolve; a returned entry is still gated on the exact
+/// `(stats_blake3, part_blake3)` binding, so no partial or stale statistic
+/// reaches the exact MIN/MAX path (issue #905 deliverable 4, guarding against a
+/// third route past #970/#973).
+struct ColumnStatsCache {
+    /// Total byte budget. Always positive for a live cache: a `0`
+    /// `column_stats_cache_max_bytes` builds no cache at all (the catalog holds
+    /// `None`), so this type is never constructed with a zero budget.
+    max_bytes: u64,
+    state: Mutex<ColumnStatsCacheState>,
+    /// Entries dropped to keep the held bytes within `max_bytes`, cumulative.
+    evictions: AtomicU64,
+    /// Loads whose object alone exceeds `max_bytes`, so no eviction could ever
+    /// make room and the object is served but not cached, cumulative.
+    refusals: AtomicU64,
+}
+
+struct ColumnStatsCacheState {
+    entries: HashMap<(TenantHash, Signal), CachedColumnStats>,
+    /// Sum of every live entry's `bytes`; the invariant this cache bounds.
+    held_bytes: u64,
+    /// Monotonic access counter; the next recency stamp. Incremented on every
+    /// lookup and insert so `last_used` totally orders the entries by recency.
+    tick: u64,
+}
+
+impl ColumnStatsCache {
+    fn new(max_bytes: u64) -> Self {
+        ColumnStatsCache {
+            max_bytes,
+            state: Mutex::new(ColumnStatsCacheState {
+                entries: HashMap::new(),
+                held_bytes: 0,
+                tick: 0,
+            }),
+            evictions: AtomicU64::new(0),
+            refusals: AtomicU64::new(0),
+        }
+    }
+
+    /// Return the cached object for `key` only when its content hash AND covered
+    /// part set both still match a freshly resolved HEAD (the issue #888
+    /// binding), refreshing the entry's recency. A mismatch or a miss returns
+    /// `None`, and the caller re-fetches; nothing stale is ever handed back.
+    fn get(
+        &self,
+        key: (TenantHash, Signal),
+        stats_blake3: &[u8; 32],
+        part_blake3: &[[u8; 32]],
+    ) -> Option<Arc<LoadedColumnStats>> {
+        let mut state = self.state.lock();
+        state.tick += 1;
+        let tick = state.tick;
+        let entry = state.entries.get_mut(&key)?;
+        if entry.stats_blake3 == *stats_blake3 && entry.part_blake3 == part_blake3 {
+            entry.last_used = tick;
+            Some(Arc::clone(&entry.stats))
+        } else {
+            None
+        }
+    }
+
+    /// Admit a freshly resolved object for `key`, evicting least-recently-used
+    /// entries as needed to keep the held bytes within `max_bytes`. Replaces any
+    /// existing entry for `key`. An object larger than the whole budget is not
+    /// cached (a `refusals` bump); it is still returned to the caller by
+    /// `load_column_stats`, so refusing to cache never changes an answer.
+    fn insert(
+        &self,
+        key: (TenantHash, Signal),
+        stats_blake3: [u8; 32],
+        part_blake3: Vec<[u8; 32]>,
+        stats: Arc<LoadedColumnStats>,
+    ) {
+        let bytes = stats.heap_bytes();
+        let mut state = self.state.lock();
+        state.tick += 1;
+        let tick = state.tick;
+
+        // Replacing an existing entry: refund its bytes before accounting the
+        // new one, so a re-resolve of the same key never double-counts.
+        if let Some(old) = state.entries.remove(&key) {
+            state.held_bytes = state.held_bytes.saturating_sub(old.bytes);
+        }
+
+        // An object larger than the entire budget can never be made to fit by
+        // evicting others: refuse it loudly rather than evict everything for
+        // nothing. The caller still gets the object; it is just not cached.
+        if bytes > self.max_bytes {
+            self.refusals.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        // Evict the least-recently-used entry until the new one fits. `bytes <=
+        // max_bytes` guarantees this terminates with room, at worst after the
+        // map empties.
+        while state.held_bytes + bytes > self.max_bytes {
+            let victim = state
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(k, _)| *k);
+            match victim {
+                Some(victim_key) => {
+                    if let Some(removed) = state.entries.remove(&victim_key) {
+                        state.held_bytes = state.held_bytes.saturating_sub(removed.bytes);
+                        self.evictions.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                None => break,
+            }
+        }
+
+        state.held_bytes += bytes;
+        state.entries.insert(
+            key,
+            CachedColumnStats {
+                stats_blake3,
+                part_blake3,
+                stats,
+                bytes,
+                last_used: tick,
+            },
+        );
+    }
+
+    /// Drop every entry whose tenant is in `idle`, refunding its bytes. Called
+    /// from [`Catalog::evict_idle_tenants`] alongside the other per-tenant
+    /// caches; an idle-tenant drop is not counted as a budget eviction.
+    fn evict_tenants(&self, idle: &[TenantHash]) {
+        let mut state = self.state.lock();
+        let mut freed = 0u64;
+        state.entries.retain(|(tenant, _), entry| {
+            if idle.contains(tenant) {
+                freed += entry.bytes;
+                false
+            } else {
+                true
+            }
+        });
+        state.held_bytes = state.held_bytes.saturating_sub(freed);
+    }
+
+    fn evictions(&self) -> u64 {
+        self.evictions.load(Ordering::Relaxed)
+    }
+
+    fn refusals(&self) -> u64 {
+        self.refusals.load(Ordering::Relaxed)
+    }
+
+    fn held_bytes(&self) -> u64 {
+        self.state.lock().held_bytes
+    }
 }
 
 /// Listing-based catalog over an object store backend (Phase 1, ADR-0003).
@@ -252,16 +432,22 @@ pub struct Catalog {
     /// an unchanged folded HEAD reuses the decoded object instead of
     /// re-fetching it.
     ///
-    /// Reclamation, stated precisely because the two dimensions differ.
-    /// ENTRY COUNT is bounded by (tenants x signals) and
-    /// [`Catalog::evict_idle_tenants`] removes a tenant's entry once it passes
-    /// the idle TTL. ENTRY SIZE has no budget: a `LoadedColumnStats` holds one
-    /// `ColumnStatsSegment` per live segment, so an ACTIVE tenant's entry grows
-    /// with that tenant and is never reclaimed while it stays active.
-    /// `cache_capacity_per_tenant`, which bounds the sibling decoded caches,
-    /// cannot express this: it is documented in entries and this map holds
-    /// exactly one entry per key. Issue #905 carries the byte budget.
-    column_stats_cache: Mutex<HashMap<(TenantHash, Signal), CachedColumnStats>>,
+    /// Reclamation runs on both dimensions, which differ. ENTRY COUNT is
+    /// bounded by (tenants x signals) and [`Catalog::evict_idle_tenants`]
+    /// removes a tenant's entries once it passes the idle TTL. ENTRY SIZE is
+    /// bounded by [`ColumnStatsCache`]'s byte budget
+    /// ([`CatalogConfig::column_stats_cache_max_bytes`], issue #905): a
+    /// `LoadedColumnStats` holds one `ColumnStatsSegment` per live segment, so
+    /// an ACTIVE tenant's entry grows with that tenant, and without a byte
+    /// budget an active tenant's entry was never reclaimed. The cache accounts
+    /// the bytes actually held and evicts the least-recently-used entry past the
+    /// budget, counting the eviction so an undersized budget is observable.
+    ///
+    /// `None` when [`CatalogConfig::column_stats_cache_max_bytes`] is `0`: the
+    /// cache is then absent entirely, so every eligible load re-fetches the
+    /// stats object with no reuse, matching the `byte_cache_max_bytes == 0`
+    /// disabled sentinel.
+    column_stats_cache: Option<ColumnStatsCache>,
 }
 
 /// Adapts [`Catalog::guarded_get`] to the provisioning module's
@@ -306,6 +492,11 @@ impl Catalog {
                 config.byte_cache_max_entry_bytes,
             )))
         });
+        // `column_stats_cache_max_bytes == 0` is the disabled sentinel,
+        // matching `byte_cache_max_bytes`: build no cache at all, so every
+        // eligible load re-fetches the stats object with no reuse.
+        let column_stats_cache = (config.column_stats_cache_max_bytes != 0)
+            .then(|| ColumnStatsCache::new(config.column_stats_cache_max_bytes));
         Ok(Catalog {
             store,
             config,
@@ -323,7 +514,7 @@ impl Catalog {
             enforce_provisioning: false,
             provisioning_checked: Mutex::new(HashSet::new()),
             tenant_activity: Mutex::new(HashMap::new()),
-            column_stats_cache: Mutex::new(HashMap::new()),
+            column_stats_cache,
         })
     }
 
@@ -805,15 +996,16 @@ impl Catalog {
         // covered part set both still match `resolved`: a changed fold produces
         // a different `blake3` (a rebuilt object) or a different part set (the
         // binding a stale object fails), and either misses. This skips the
-        // second GET, the stats-object fetch, and nothing else.
-        let cache_hit = {
-            let cache = self.column_stats_cache.lock();
-            cache.get(&(*tenant, signal)).and_then(|cached| {
-                (cached.stats_blake3 == resolved.blake3
-                    && cached.part_blake3 == resolved.expected_part_blake3)
-                    .then(|| Arc::clone(&cached.stats))
-            })
-        };
+        // second GET, the stats-object fetch, and nothing else. An entry the
+        // byte budget evicted also misses here and re-fetches, never returning a
+        // partial or stale statistic.
+        let cache_hit = self.column_stats_cache.as_ref().and_then(|cache| {
+            cache.get(
+                (*tenant, signal),
+                &resolved.blake3,
+                &resolved.expected_part_blake3,
+            )
+        });
         if let Some(stats) = cache_hit {
             return Ok(Some(stats));
         }
@@ -823,14 +1015,14 @@ impl Catalog {
             return Ok(None);
         };
         let stats = Arc::new(loaded);
-        self.column_stats_cache.lock().insert(
-            (*tenant, signal),
-            CachedColumnStats {
-                stats_blake3: resolved.blake3,
-                part_blake3: resolved.expected_part_blake3,
-                stats: Arc::clone(&stats),
-            },
-        );
+        if let Some(cache) = self.column_stats_cache.as_ref() {
+            cache.insert(
+                (*tenant, signal),
+                resolved.blake3,
+                resolved.expected_part_blake3,
+                Arc::clone(&stats),
+            );
+        }
         Ok(Some(stats))
     }
 
@@ -877,10 +1069,12 @@ impl Catalog {
             self.part_cache.evict_tenant(tenant);
             self.postings_cache.evict_tenant(tenant);
         }
-        if !idle.is_empty() {
-            self.column_stats_cache
-                .lock()
-                .retain(|(tenant, _), _| !idle.contains(tenant));
+        if let Some(cache) = self
+            .column_stats_cache
+            .as_ref()
+            .filter(|_| !idle.is_empty())
+        {
+            cache.evict_tenants(&idle);
         }
         idle.len()
     }
@@ -917,6 +1111,41 @@ impl Catalog {
             ByteCache::Ram(_) => None,
             ByteCache::Tiered(tiered) => Some(tiered.disk_metrics()),
         }
+    }
+
+    /// Cumulative column-statistics cache evictions (issue #905): entries the
+    /// byte budget ([`CatalogConfig::column_stats_cache_max_bytes`]) dropped to
+    /// stay within its limit. The server threads this to `/metrics`. A climbing
+    /// value means the cache is UNDERSIZED for the working set of tenants a
+    /// process serves, which an operator reads apart from ABSENT statistics (a
+    /// load returning `Ok(None)`, which touches no counter): both make a query
+    /// scan, but the first is fixed by raising the budget and the second is not.
+    /// `0` when the cache is disabled (no cache exists to evict from).
+    pub fn column_stats_cache_evictions(&self) -> u64 {
+        self.column_stats_cache
+            .as_ref()
+            .map_or(0, ColumnStatsCache::evictions)
+    }
+
+    /// Cumulative column-statistics cache refusals (issue #905): loads whose
+    /// object alone exceeds the whole byte budget, so no eviction could make
+    /// room and the object was served but not cached. Distinct from an
+    /// eviction: it means the budget is below a SINGLE object's size, not merely
+    /// below the working set. `0` when the cache is disabled.
+    pub fn column_stats_cache_refusals(&self) -> u64 {
+        self.column_stats_cache
+            .as_ref()
+            .map_or(0, ColumnStatsCache::refusals)
+    }
+
+    /// Bytes currently held by the column-statistics cache (issue #905), the
+    /// sum of every cached object's [`LoadedColumnStats::heap_bytes`]. Bounded
+    /// by [`CatalogConfig::column_stats_cache_max_bytes`]. `0` when the cache is
+    /// disabled.
+    pub fn column_stats_cache_held_bytes(&self) -> u64 {
+        self.column_stats_cache
+            .as_ref()
+            .map_or(0, ColumnStatsCache::held_bytes)
     }
 
     /// `pub(crate)`: exposed for `cache`'s own tests to inspect and seed the
@@ -5436,15 +5665,23 @@ mod tests {
         );
     }
 
-    /// Write a folded HEAD plus its `.cstat` object for `Signal::Logs`, whose
+    /// Write a folded HEAD plus its `.cstat` object for `tenant`/`signal`, whose
     /// one segment carries a single I64 `status` column with the exact value
     /// `value` (min == max == `value`, one non-null row). `part_hash` binds the
     /// HEAD's part set to the stats object; reusing the same `part_hash` across
     /// calls keeps the part binding fixed so a re-resolve is driven purely by
-    /// the stats object's content hash changing with `value`.
-    async fn install_logs_stats(store: &MemoryStore, part_hash: [u8; 32], value: i64) {
-        let signal = Signal::Logs;
+    /// the stats object's content hash changing with `value`. The object keys
+    /// are namespaced by tenant hex and signal prefix so distinct
+    /// `(tenant, signal)` installs never collide in one store.
+    async fn install_stats(
+        store: &MemoryStore,
+        tenant: TenantHash,
+        signal: Signal,
+        part_hash: [u8; 32],
+        value: i64,
+    ) {
         let signal_num = signal::to_proto(signal) as u32;
+        let prefix = signal.key_prefix();
 
         let segments = vec![ravel_proto::catalog::v1::ColumnStatsSegment {
             ingest_hour_bucket: 1,
@@ -5474,14 +5711,14 @@ mod tests {
             }],
         }];
         let stats_bytes = crate::snapshot_format::encode_column_stats(
-            tenant().0,
+            tenant.0,
             signal_num,
             vec![part_hash.to_vec()],
             &segments,
         )
         .expect("encode column stats");
         let stats_hash = *blake3::hash(&stats_bytes).as_bytes();
-        let stats_key = format!("t/{}/catalog/l/cstat/one.cstat", tenant().to_hex());
+        let stats_key = format!("t/{}/catalog/{prefix}/cstat/one.cstat", tenant.to_hex());
         store
             .put(
                 &stats_key,
@@ -5493,12 +5730,12 @@ mod tests {
 
         let head = ravel_proto::catalog::v1::SnapshotHead {
             format_version: crate::snapshot_format::HEAD_FORMAT_VERSION,
-            tenant_hash: tenant().0.to_vec(),
+            tenant_hash: tenant.0.to_vec(),
             signal: signal_num,
             shard_count: 8,
             watermark_hour: 10,
             parts: vec![ravel_proto::catalog::v1::SnapshotPartRef {
-                key: format!("t/{}/catalog/l/snap/empty.csnap", tenant().to_hex()),
+                key: format!("t/{}/catalog/{prefix}/snap/empty.csnap", tenant.to_hex()),
                 blake3: part_hash.to_vec(),
                 size: 1,
                 entry_count: 0,
@@ -5521,12 +5758,18 @@ mod tests {
         let head_bytes = crate::snapshot_format::encode_head(&head).expect("encode head");
         store
             .put(
-                &crate::fold::head_object_key(&tenant(), signal),
+                &crate::fold::head_object_key(&tenant, signal),
                 Bytes::from(head_bytes),
                 PutOptions::default(),
             )
             .await
             .expect("put head");
+    }
+
+    /// [`install_stats`] for the default [`tenant`] on `Signal::Logs`, the
+    /// fixture the issue #888 reuse tests were written against.
+    async fn install_logs_stats(store: &MemoryStore, part_hash: [u8; 32], value: i64) {
+        install_stats(store, tenant(), Signal::Logs, part_hash, value).await;
     }
 
     /// The exact I64 `status` value carried by the one segment of a loaded
@@ -5631,5 +5874,259 @@ mod tests {
             99,
             "the reload returns the new object, never the cached stale one"
         );
+    }
+
+    fn tenant_n(n: u8) -> TenantHash {
+        TenantHash([n; 16])
+    }
+
+    /// A `LoadedColumnStats` carrying one segment and `parts` covered-part
+    /// hashes, for driving [`ColumnStatsCache`] directly with a known byte
+    /// weight. The segment's content is fixed, so every call produces an object
+    /// of identical [`LoadedColumnStats::heap_bytes`].
+    fn make_loaded(parts: usize) -> Arc<LoadedColumnStats> {
+        let segment = ravel_proto::catalog::v1::ColumnStatsSegment {
+            ingest_hour_bucket: 1,
+            shard: 0,
+            writer_id: vec![0xAA; 16],
+            writer_epoch: 1,
+            writer_seq: 1,
+            columns: Vec::new(),
+        };
+        let identity: crate::EntryIdentity = (1, 0, [0xAA; 16], 1, 1);
+        let mut segments = HashMap::new();
+        segments.insert(identity, segment);
+        let part_blake3 = (0..parts).map(|i| [i as u8; 32]).collect();
+        Arc::new(LoadedColumnStats {
+            segments,
+            part_blake3,
+        })
+    }
+
+    /// Issue #905, exact byte accounting: the cache reports the bytes actually
+    /// held as the exact sum of each segment's encoded protobuf length plus 32
+    /// bytes per covered part hash, not `> 0` and not an entry count.
+    ///
+    /// Flip to watch it fail: change `heap_bytes` to return the entry count
+    /// (`self.segments.len() as u64`) and the `held_bytes` assertion drops to
+    /// `1`.
+    #[test]
+    fn column_stats_cache_accounts_exact_held_bytes() {
+        let loaded = make_loaded(3);
+        // Independently summed, not via heap_bytes: the payload the budget bounds.
+        let expected: u64 = loaded
+            .segments
+            .values()
+            .map(|segment| segment.encoded_len() as u64)
+            .sum::<u64>()
+            + 3 * 32;
+        assert_eq!(
+            loaded.heap_bytes(),
+            expected,
+            "heap_bytes is the summed segment encoded length plus 32 bytes per part"
+        );
+
+        let cache = ColumnStatsCache::new(1 << 20);
+        cache.insert(
+            (tenant(), Signal::Logs),
+            [1u8; 32],
+            loaded.part_blake3.clone(),
+            Arc::clone(&loaded),
+        );
+        assert_eq!(
+            cache.held_bytes(),
+            expected,
+            "held bytes is the exact payload, not an entry count"
+        );
+    }
+
+    /// Issue #905, the budget evicts at the boundary: a budget of exactly two
+    /// entries holds two with no eviction, and the third insert evicts exactly
+    /// the least-recently-used one, leaving the exact surviving set.
+    ///
+    /// Flip to watch it fail: change the eviction guard from `held_bytes + bytes
+    /// > self.max_bytes` to `>=` and the two-entry boundary evicts one early, so
+    /// `evictions()` reads `1` after the second insert.
+    #[test]
+    fn column_stats_cache_evicts_lru_at_byte_boundary() {
+        let entry = make_loaded(1);
+        let b = entry.heap_bytes();
+        let cache = ColumnStatsCache::new(2 * b);
+
+        let ka = (tenant_n(1), Signal::Logs);
+        let kb = (tenant_n(2), Signal::Logs);
+        let kc = (tenant_n(3), Signal::Logs);
+        let parts = entry.part_blake3.clone();
+
+        cache.insert(ka, [1u8; 32], parts.clone(), Arc::clone(&entry));
+        cache.insert(kb, [1u8; 32], parts.clone(), Arc::clone(&entry));
+        assert_eq!(cache.held_bytes(), 2 * b, "two entries fit exactly");
+        assert_eq!(cache.evictions(), 0, "no eviction at the boundary");
+
+        // One over the boundary: evicts the least-recently-used entry (ka).
+        cache.insert(kc, [1u8; 32], parts.clone(), Arc::clone(&entry));
+        assert_eq!(cache.evictions(), 1, "exactly one eviction");
+        assert_eq!(
+            cache.held_bytes(),
+            2 * b,
+            "still exactly two entries' bytes"
+        );
+
+        assert!(
+            cache.get(ka, &[1u8; 32], &parts).is_none(),
+            "the least-recently-used entry was evicted"
+        );
+        assert!(cache.get(kb, &[1u8; 32], &parts).is_some(), "kb survives");
+        assert!(
+            cache.get(kc, &[1u8; 32], &parts).is_some(),
+            "the just-inserted kc survives"
+        );
+    }
+
+    /// Issue #905, an eviction increments the observability counter by exactly
+    /// one. A single insert past a one-entry budget evicts one entry and bumps
+    /// `evictions` by exactly one; an object larger than the whole budget is
+    /// refused (not evicted) and bumps `refusals` instead.
+    ///
+    /// Flip to watch it fail: drop the `self.evictions.fetch_add(1, ...)` in
+    /// `insert` and the eviction assertion reads `0`.
+    #[test]
+    fn column_stats_cache_eviction_counter_increments_by_one() {
+        let entry = make_loaded(1);
+        let b = entry.heap_bytes();
+        let parts = entry.part_blake3.clone();
+
+        let cache = ColumnStatsCache::new(b);
+        cache.insert(
+            (tenant_n(1), Signal::Logs),
+            [1u8; 32],
+            parts.clone(),
+            Arc::clone(&entry),
+        );
+        cache.insert(
+            (tenant_n(2), Signal::Logs),
+            [1u8; 32],
+            parts.clone(),
+            Arc::clone(&entry),
+        );
+        assert_eq!(cache.evictions(), 1, "one eviction, counted once");
+        assert_eq!(cache.refusals(), 0, "an eviction is not a refusal");
+
+        // An object larger than the whole budget: refused, not evicted.
+        let refuse_cache = ColumnStatsCache::new(b - 1);
+        refuse_cache.insert(
+            (tenant_n(1), Signal::Logs),
+            [1u8; 32],
+            parts.clone(),
+            Arc::clone(&entry),
+        );
+        assert_eq!(refuse_cache.refusals(), 1, "oversized object refused once");
+        assert_eq!(
+            refuse_cache.evictions(),
+            0,
+            "nothing to evict for a refusal"
+        );
+        assert_eq!(
+            refuse_cache.held_bytes(),
+            0,
+            "the oversized object is not cached"
+        );
+    }
+
+    /// Issue #905, deliverable 4: a query whose statistics were evicted returns
+    /// the SAME rows as one that never had them. An evicted entry is a cache
+    /// miss that re-fetches the object; no partial or stale statistic reaches
+    /// the caller.
+    ///
+    /// Flip to watch it fail: make `ColumnStatsCache::get` ignore the
+    /// `part_blake3`/`stats_blake3` binding and return a still-resident stale
+    /// entry, and the `segments` equality against the never-cached load breaks.
+    #[tokio::test]
+    async fn evicted_column_stats_reload_returns_same_rows() {
+        let store = Arc::new(MemoryStore::new());
+        let part_a = *blake3::hash(b"part-a").as_bytes();
+        let part_b = *blake3::hash(b"part-b").as_bytes();
+        let ta = tenant_n(1);
+        let tb = tenant_n(2);
+        install_stats(&store, ta, Signal::Logs, part_a, 42).await;
+        install_stats(&store, tb, Signal::Logs, part_b, 7).await;
+
+        // Control: the cache disabled, so tenant A "never had" cached stats.
+        let disabled = Catalog::new(
+            store.clone(),
+            CatalogConfig {
+                shard_count: 8,
+                column_stats_cache_max_bytes: 0,
+                ..Default::default()
+            },
+        )
+        .expect("catalog");
+        let fresh_a = disabled
+            .load_column_stats(&ta, Signal::Logs, &QueryAccounting::new())
+            .await
+            .expect("load ok")
+            .expect("stats present");
+        let entry_bytes = fresh_a.heap_bytes();
+        assert_eq!(
+            disabled.column_stats_cache_evictions(),
+            0,
+            "a disabled cache never evicts"
+        );
+
+        // A budget that holds exactly one entry: loading tenant B evicts A's.
+        let catalog = Catalog::new(
+            store.clone(),
+            CatalogConfig {
+                shard_count: 8,
+                column_stats_cache_max_bytes: entry_bytes,
+                ..Default::default()
+            },
+        )
+        .expect("catalog");
+
+        catalog
+            .load_column_stats(&ta, Signal::Logs, &QueryAccounting::new())
+            .await
+            .expect("load ok")
+            .expect("stats present");
+        assert_eq!(
+            catalog.column_stats_cache_held_bytes(),
+            entry_bytes,
+            "tenant A's stats are cached"
+        );
+
+        catalog
+            .load_column_stats(&tb, Signal::Logs, &QueryAccounting::new())
+            .await
+            .expect("load ok")
+            .expect("stats present");
+        assert_eq!(
+            catalog.column_stats_cache_evictions(),
+            1,
+            "loading tenant B evicted tenant A's entry"
+        );
+
+        // Reload A: its entry was evicted, so this re-fetches (two GETs).
+        let acc_reload = QueryAccounting::new();
+        let reloaded_a = catalog
+            .load_column_stats(&ta, Signal::Logs, &acc_reload)
+            .await
+            .expect("load ok")
+            .expect("stats present");
+        assert_eq!(
+            acc_reload.snapshot().s3_requests(AccountedOp::Get),
+            2,
+            "the evicted entry re-fetches: HEAD GET plus a fresh column-stats GET"
+        );
+
+        assert_eq!(
+            reloaded_a.segments, fresh_a.segments,
+            "the evicted-then-reloaded stats equal the never-cached stats, row for row"
+        );
+        assert_eq!(
+            reloaded_a.part_blake3, fresh_a.part_blake3,
+            "the covered part set is unchanged by eviction"
+        );
+        assert_eq!(loaded_value(&reloaded_a), 42, "and carry tenant A's value");
     }
 }

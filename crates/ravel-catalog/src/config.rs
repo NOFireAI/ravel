@@ -67,6 +67,19 @@ pub const DEFAULT_BYTE_CACHE_MAX_ENTRIES: usize = 512;
 /// ([`DEFAULT_MAX_SNAPSHOT_PART_BYTES`](snapshot_format::DEFAULT_MAX_SNAPSHOT_PART_BYTES) ==
 /// [`DEFAULT_MAX_POSTINGS_BYTES`](snapshot_format::DEFAULT_MAX_POSTINGS_BYTES), both 256 MiB).
 pub const DEFAULT_BYTE_CACHE_MAX_ENTRY_BYTES: u64 = 256 << 20;
+/// Default total byte budget for the column-statistics reuse cache (issue
+/// #905): the decoded `.cstat` objects the resolve path caches per
+/// `(tenant, signal)` so a repeated eligible plan against an unchanged folded
+/// HEAD skips the stats-object GET (ADR-0850, issue #888). A `.cstat` payload
+/// scales with a tenant's declared typed columns times its live segments, and
+/// before this budget the map grew one such entry per served tenant for the
+/// process lifetime, with nothing reclaiming an active tenant's entry and
+/// nothing reporting the footprint. 64 MiB holds a handful of active tenants'
+/// current stats at once; the least-recently-used entry is evicted past it and
+/// the eviction is counted
+/// ([`Catalog::column_stats_cache_evictions`](crate::Catalog::column_stats_cache_evictions)),
+/// so an operator who sees that counter climbing knows to raise this.
+pub const DEFAULT_COLUMN_STATS_CACHE_MAX_BYTES: u64 = 64 << 20;
 /// Default ceiling on the pre-execution catalog-request estimate
 /// (`Catalog::estimated_catalog_requests`, ADR-0044 decision 3): a resolve whose `shard_count * hour_buckets +
 /// SNAPSHOT_WINDOW_REQUESTS_UPPER_BOUND` exceeds this is refused before any
@@ -230,6 +243,28 @@ pub struct CatalogConfig {
     /// Per-entry byte cap for the byte cache; an object larger than this is
     /// never admitted. Default [`DEFAULT_BYTE_CACHE_MAX_ENTRY_BYTES`].
     pub byte_cache_max_entry_bytes: u64,
+    /// Total byte budget for the column-statistics reuse cache (issue #905),
+    /// the decoded `.cstat` objects cached per `(tenant, signal)` on the
+    /// [`crate::Catalog::load_column_stats`] path. The budget is over the bytes
+    /// actually held
+    /// ([`LoadedColumnStats::heap_bytes`](crate::column_stats_resolve::LoadedColumnStats::heap_bytes)),
+    /// not an entry count: a `.cstat` payload's size varies by orders of
+    /// magnitude across tenants, so an entry-count bound would not bound memory.
+    /// When admitting a freshly resolved object would exceed this, the
+    /// least-recently-used entries are evicted first, each counted by
+    /// [`crate::Catalog::column_stats_cache_evictions`], so an undersized budget
+    /// is observable rather than silent; an object larger than the whole budget
+    /// is not cached at all and counted by
+    /// [`crate::Catalog::column_stats_cache_refusals`]. Eviction only ever
+    /// forces a cache miss and a re-resolve, never a partial or stale statistic
+    /// reaching the exact MIN/MAX path.
+    ///
+    /// `0` is the disabled sentinel, matching
+    /// [`byte_cache_max_bytes`](Self::byte_cache_max_bytes): [`crate::Catalog::new`]
+    /// then builds no column-stats cache at all, so every eligible load
+    /// re-fetches the stats object with no reuse and no eviction accounting.
+    /// Default [`DEFAULT_COLUMN_STATS_CACHE_MAX_BYTES`].
+    pub column_stats_cache_max_bytes: u64,
     /// Ceiling on the pre-execution catalog-request estimate (ADR-0044
     /// decision 3). A resolve whose
     /// estimate ([`Catalog::estimated_catalog_requests`](crate::Catalog::estimated_catalog_requests))
@@ -315,6 +350,7 @@ impl Default for CatalogConfig {
             byte_cache_max_bytes: DEFAULT_BYTE_CACHE_MAX_BYTES,
             byte_cache_max_entries: DEFAULT_BYTE_CACHE_MAX_ENTRIES,
             byte_cache_max_entry_bytes: DEFAULT_BYTE_CACHE_MAX_ENTRY_BYTES,
+            column_stats_cache_max_bytes: DEFAULT_COLUMN_STATS_CACHE_MAX_BYTES,
             max_catalog_list_requests: DEFAULT_MAX_CATALOG_LIST_REQUESTS,
             prefix_list_crossover_requests: DEFAULT_PREFIX_LIST_CROSSOVER_REQUESTS,
             snapshot_part_max_entries: DEFAULT_SNAPSHOT_PART_MAX_ENTRIES,
