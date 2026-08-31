@@ -41,25 +41,65 @@ mod tests {
     use std::path::PathBuf;
     use std::process::Command;
 
-    /// Locates the shipping `ingest_bench` binary. An integration test would get
-    /// `CARGO_BIN_EXE_ingest_bench`, but this is a lib unit test (its path must
-    /// be `ravel_bench::tests::...`), which does not, so it falls back to
-    /// deriving the path from the test executable's own directory:
-    /// `target/<profile>/deps/<test>` sits one level below the bins in
-    /// `target/<profile>/`. Both the test and the bin are built with the same
-    /// feature set in the same invocation, so this resolves to a binary whose
-    /// `stage-timing` state matches this test's.
+    /// Builds the shipping `ingest_bench` binary with the SAME feature set as
+    /// this test and returns the exact path cargo reports for it.
+    ///
+    /// An integration test would get `CARGO_BIN_EXE_ingest_bench`, but this is a
+    /// lib unit test (its path must be `ravel_bench::tests::...`), which does
+    /// not. Deriving the path from the test executable's own directory instead
+    /// (the previous approach) resolves whatever `ingest_bench` binary already
+    /// sits in `target/<profile>/` -- and `cargo test --lib` does not rebuild
+    /// the bin at all, so a binary left there by an earlier `--features
+    /// stage-timing` build lingers and gets spawned by a default-feature run of
+    /// this test. Its `stage_breakdown` field then makes the feature-off
+    /// assertion below fail against a binary whose feature set never matched
+    /// this test's (issue #925). Building the bin here, forwarding this test's
+    /// own `stage-timing` state, binds the spawned binary's feature set to the
+    /// assertions that check it.
     fn ingest_bench_bin() -> PathBuf {
-        if let Some(p) = option_env!("CARGO_BIN_EXE_ingest_bench") {
-            return PathBuf::from(p);
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let mut cmd = Command::new(cargo);
+        cmd.args([
+            "build",
+            "--quiet",
+            "-p",
+            "ravel-bench",
+            "--bin",
+            "ingest_bench",
+            "--message-format=json-render-diagnostics",
+        ]);
+        if cfg!(feature = "stage-timing") {
+            cmd.args(["--features", "stage-timing"]);
         }
-        let mut path = std::env::current_exe().expect("test current_exe");
-        path.pop();
-        if path.ends_with("deps") {
-            path.pop();
-        }
-        path.push("ingest_bench");
-        path
+        let output = cmd.output().expect("spawn cargo build ingest_bench");
+        assert!(
+            output.status.success(),
+            "cargo build ingest_bench failed: status={:?} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // The JSON artifact stream carries one `compiler-artifact` message per
+        // built target; the `ingest_bench` bin's `executable` field is its path.
+        serde_json::Deserializer::from_slice(&output.stdout)
+            .into_iter::<serde_json::Value>()
+            .filter_map(Result::ok)
+            .find_map(|msg| {
+                if msg.get("reason").and_then(|v| v.as_str()) != Some("compiler-artifact") {
+                    return None;
+                }
+                if msg
+                    .get("target")
+                    .and_then(|t| t.get("name"))
+                    .and_then(|n| n.as_str())
+                    != Some("ingest_bench")
+                {
+                    return None;
+                }
+                msg.get("executable")
+                    .and_then(|e| e.as_str())
+                    .map(PathBuf::from)
+            })
+            .expect("cargo build reported no ingest_bench executable path")
     }
 
     /// Runs the real `ingest_bench` binary against an in-process `MemoryStore`
