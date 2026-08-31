@@ -4,7 +4,9 @@ Ravel is an OpenTelemetry-native telemetry database for metrics, logs, and
 traces. One rule shapes every part of it: the object store is the only
 durable component. There is no write-ahead log, no ingester quorum, and no
 local disk that matters. Any process can die at any instant, and every
-acknowledged write survives.
+STRICTLY acknowledged write survives. Buffered acknowledgement is a
+per-request opt-out with a documented loss window, described under the
+write path below.
 
 This file is the map. Each section names the ADR or spec that holds the
 reasoning and the exact contracts. The doc index in
@@ -27,7 +29,9 @@ Strict mode answers the client only after both PUTs are durable, and the
 response carries a commit token. A query that presents that token reads the
 write with no listing race. Buffered mode answers after admission and
 enqueue, and the crash window this opens is documented, bounded, and
-chosen per request, never hidden.
+chosen per request, never hidden. Only OTLP ingest offers buffered mode;
+Remote Write is strict-only, and a buffered-mode header on it is ignored
+rather than honored.
 
 All three signals share this pipeline. Remote Write payloads normalize to
 the same shape OTLP produces and enter the same router call, so there is no
@@ -81,7 +85,7 @@ same commit or CAS protocols the write path uses.
 
 - Compaction merges many small L0 objects into few larger L1 parts per
   `(tenant, signal, shard, ingest hour)` bucket, streaming blocks rather
-  than materializing inputs. Output parts are content addressed, and a
+  than materializing inputs. Output parts are content-addressed, and a
   compaction record publishes them atomically; two compactors racing on
   one bucket converge on one winner (ADR-0979 bounds the merge's memory).
 - Age-based retention and the GC sweeper delete only what nothing
@@ -204,7 +208,7 @@ written".
 
 Dependency order, no cycles:
 
-```
+```text
 ravel-types
   <- ravel-proto        (prost-generated footer/commit messages)
   <- ravel-object-store (S3/MinIO, memory, fault-injecting backends)
