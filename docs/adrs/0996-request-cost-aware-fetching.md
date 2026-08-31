@@ -310,20 +310,29 @@ total)`, `log_fetcher.rs:3742`), and `GetOutcome.data` is fully-buffered
 `Bytes` (`crates/ravel-object-store/src/lib.rs:113-118`), so streaming
 is not available at this seam without a contract change (rejected
 alternative 5); the bound is therefore a NEW protective cap on both
-policies, and the stated memory bound is `fetch permits ×
-max(bound, B_max)` — which is `permits × bound` = 16 × 64 MiB = 1 GiB
-worst-case at defaults on every corpus without an oversized block, the
-only case that exceeds it being an oversized block's own GET, resident
-at its true size and logged as such
-(`DEFAULT_LOG_MAX_CONCURRENT_GETS`, `log_fetcher.rs:2200`) — versus
-today's formally unbounded `permits × object_size`. The corpus figure
+policies. The full guarantee lands in two stages, and this ADR states
+the split rather than claiming the end state early: 996-3 bounds each
+GET's wire size at the bound (`peak_fetch_run_bytes ≤ bound`) and
+delivers the request-count band, but the segmented path still ASSEMBLES
+the whole object before decode — `ravel-logseg`'s `RlogReader::new`
+requires one contiguous object-indexed buffer, so resident assembly
+remains `object_size` until the per-sub-range decode lands (#1007,
+reader-side only, PAGE_DIR already carries the split offsets). Once
+#1007 lands, the memory bound is `fetch permits × max(bound, B_max)` —
+`permits × bound` = 16 × 64 MiB = 1 GiB worst-case at defaults on every
+corpus without an oversized block, the only case that exceeds it being
+an oversized block's own GET, resident at its true size and logged as
+such (`DEFAULT_LOG_MAX_CONCURRENT_GETS`, `log_fetcher.rs:2200`) —
+versus today's formally unbounded `permits × object_size`. The corpus figure
 is stated as what it is: 3.47 MB is the MEAN object size on
 clickbench-v4, not a maximum, so the per-corpus expectation in the
 verification plan is banded on the corpus's largest object, and the
 worst-case guarantee is the `permits × max(bound, B_max)` line above,
 nothing softer (`permits × bound` exactly, on any corpus with no
-oversized block). A 5 GiB object is never resident whole by
-construction.
+oversized block). Until #1007 lands, that guarantee holds for wire
+bytes per GET only; resident assembly is still `permits × object_size`,
+and a 5 GiB object is not resident-bounded until per-sub-range decode
+exists.
 
 **Knob relations (ADR-0904 alignment)**: `--logs-request-cost-bytes`
 stays and WINS when explicitly set — policy is the intent layer, the
@@ -589,7 +598,7 @@ quarter) EXCEPT 996-8, which is scheduled behind them by construction.
 |---|---|---|---|---|---|
 | 996-1 | `StoreCostProfile` (nanodollar arithmetic, TOML load, reference constant) + `QueryAccounting::data_objects_touched` | ravel-types | `src/cost_profile.rs` (new), `src/accounting.rs`, `src/lib.rs` | — | exact-figure unit tests; reference profile constants pinned ($5/M, $0.40/M, 12.5:1 asserted); snapshot/merge round-trip for the new counter |
 | 996-2 | ledger reads attempts: `RequestCounts` gains per-op attempts beside calls; byte-kind labels in report output | ravel-bench | `src/report.rs` | — (reads #928's existing seam) | MemoryStore fixture: attempts==0 with calls>0 labelled correctly; S3-shaped fixture via `StoreMetrics::record_attempt` asserts attempts≥calls exactly |
-| 996-3 | policy enum + `EngineConfig::logs_fetch_policy`, `logs_max_fetch_run_bytes`; exchange-rate derivation; fetch bound + segmented covering fallback; plan-probe suppression under request-minimal; record `data_objects_touched`, carried through the distributed snapshot (additive proto field + codec + merge) | ravel-query, proto (additive only) | `src/config.rs`, `src/log_fetcher.rs`, `src/distrib/*`, `proto/` | 996-1 | policy→rate mapping table pinned (saturate / default / profile-derived w/ floors); bound test: object > bound fetched in a request count inside the covering-read band (floor `ceil(size/bound)`, cap `ceil(size/(bound − B_max))`), peak buffer ≤ bound, rows byte-identical |
+| 996-3 | policy enum + `EngineConfig::logs_fetch_policy`, `logs_max_fetch_run_bytes`; exchange-rate derivation; fetch bound + segmented covering fallback; plan-probe suppression under request-minimal; record `data_objects_touched`, carried through the distributed snapshot (additive proto field + codec + merge) | ravel-query, proto (additive only) | `src/config.rs`, `src/log_fetcher.rs`, `src/distrib/*`, `proto/` | 996-1 | policy→rate mapping table pinned (saturate / default / profile-derived w/ floors); bound test: object > bound fetched in a request count inside the covering-read band (floor `ceil(size/bound)`, cap `ceil(size/(bound − B_max))`), peak per-GET wire bytes ≤ bound (resident-assembly bound deferred to #1007), rows byte-identical |
 | 996-4 | modeled cost + profile/policy provenance stamp (requested/effective split) in bench reports | ravel-bench | `src/sql_latency.rs`, `src/report.rs` (non-overlapping sections vs 996-2, sequenced anyway: W2) | 996-1, 996-2 | report fixture asserts stamp present exactly once, `effective: None` on the Flight lane, modeled cost = attempts × profile to the nanodollar |
 | 996-5 | server flags `--logs-fetch-policy`, `--store-cost-profile`; reachability test in the `logs_request_cost_bytes_is_reachable_from_cli` shape; precedence: explicit byte flag wins | ravel-server | `services/ravel-server/src/config.rs`, `src/query.rs` | 996-3 | flag proven to arrive at the running engine through real startup; precedence pinned |
 | 996-6 | per-statement `range_amplification` exposure; policy-extremes differential (rows identical at all three policies; opens/GET counters prove the route) | ravel-sql | `src/executor.rs`, `tests/logs_request_cost_knob_routing.rs`, `tests/logs_fast_path_projection_routing.rs` | 996-3 | counters, not configured values, prove which route ran (ADR-0904 904-4 rule); amplification == 1.0 exactly on the fixture under request-minimal |
