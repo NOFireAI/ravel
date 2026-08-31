@@ -410,4 +410,47 @@ accurate if it carved out part-bound derived objects as converging via
 retention/rewrite-on-touch plus a backfill pass, not via continuous fold
 rewrite alone.
 
+## Corrections
+
+Two statements in the accepted text above are factually wrong against the
+implementation. The original text is left as written; these notes state what
+holds.
+
+**2026-08-31: "an idle, already-compacted tenant folds nothing" is false.**
+The section "The Class B convergence argument has a hole, and this ADR closes
+it" builds on the premise that a tenant with no new ingest performs a no-op
+fold. The fold watermark is not derived from ingest: `sealed_watermark_hour`
+in `crates/ravel-catalog/src/fold.rs` computes the greatest sealed ingest hour
+from wall-clock `now_ns` minus `max_flush_lifetime + clock_skew_allowance +
+fold_safety_margin`, and `fold` returns a no-op report only when that
+watermark has not advanced past the HEAD's. So on any maintained tenant the
+watermark advances every wall-clock hour and the fold is non-no-op hourly,
+regardless of whether a single entry was ingested. Each such fold re-keys the
+tail part, the postings object and the `.cstat` object on the new watermark
+hour (all three key builders in that file take `watermark_hour`), which means
+it re-encodes and re-PUTs the derived objects and swaps HEAD, leaving the
+previous generation for the catalog-object sweep. The v2 (field 13) baseline
+reuse bounds the cost of re-deriving per-part statistics; it does not make the
+fold a no-op. What the original argument correctly identifies is narrower:
+sealed parts are carried forward by reference and are not re-listed by an
+incremental fold, so sealed-history coverage does not grow on its own. The
+"folds nothing" framing, and the cost model that follows from it, do not hold.
+
+**2026-08-31: the declared build obligation for an operator-triggered
+stats-rebuild command is superseded.** The section states that no in-tree
+command forces a stats rebuild and makes building one a build obligation of
+this decision. The field-13 implementation that landed is self-backfilling:
+in `crates/ravel-catalog/src/fold.rs`, the v2 baseline is loaded only from the
+previous HEAD's `column_stats_part` reference, so the first fold after the
+upgrade finds no field-13 baseline and re-derives a record for every entry it
+folds. Any fold is therefore the backfill for the entries it covers, and no
+dedicated rebuild command is needed for that. For a store that is not being
+folded at all, the operator lever already exists: `ravel-cli catalog fold`
+(`services/ravel-cli/src/catalog.rs`, wired as the `catalog fold` subcommand
+in `services/ravel-cli/src/main.rs`) runs a one-shot enforcing fold for one
+(tenant, signal). The limit the original section identifies for sealed
+history still stands on its own terms: an incremental fold does not re-list
+sealed hours, so coverage for a fully sealed tail still requires a
+full-rebuild fold rather than an ordinary one.
+
 Refs: #942
