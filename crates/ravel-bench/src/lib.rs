@@ -1,6 +1,7 @@
 //! Benchmark harness for Ravel. Report-only: this crate never changes library
 //! behavior, it only measures it.
 
+pub mod allocator;
 pub mod bench_env;
 pub mod codecs;
 #[cfg(feature = "parquet-baseline")]
