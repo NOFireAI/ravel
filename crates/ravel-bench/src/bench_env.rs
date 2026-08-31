@@ -47,8 +47,9 @@ fn rustc_version() -> String {
 /// when no known key form is present. Best-effort and infallible on every
 /// platform: x86 Linux names the CPU in `/proc/cpuinfo`'s `model name`, ARM
 /// Linux exposes `Model` (Raspberry Pi) or the devicetree `model` node or only
-/// a `CPU implementer`/`CPU part` pair, and a non-Linux host has no `/proc` at
-/// all. A host whose CPU cannot be named in any of these records `"unknown"`
+/// a `CPU implementer`/`CPU part` pair, and macOS names it through
+/// `sysctl -n machdep.cpu.brand_string`. A host whose CPU cannot be named in
+/// any of these records `"unknown"`
 /// rather than aborting the stamp, mirroring the other best-effort fields here
 /// (an explicit unknown is honest; a stamper that refuses to run makes the
 /// whole artifact unavailable). Both provenance sites -- this header and
@@ -60,7 +61,13 @@ pub fn cpu_model() -> String {
         .as_deref()
         .map(trim_devicetree)
         .filter(|s| !s.is_empty());
-    resolve_cpu_model(&cpuinfo, devicetree).unwrap_or_else(|| "unknown".to_string())
+    let sysctl = if cfg!(target_os = "macos") {
+        command_stdout("sysctl", &["-n", "machdep.cpu.brand_string"])
+    } else {
+        None
+    };
+    resolve_cpu_model(&cpuinfo, devicetree, sysctl.as_deref())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 /// The resolution decision over fixed inputs, split from the file reads so
@@ -69,7 +76,16 @@ pub fn cpu_model() -> String {
 /// `model` node (`/sys/firmware/devicetree/base/model`), then a composed
 /// identifier from the `CPU implementer`/`CPU part` pair (bare ARM, no name).
 /// `None` when none of these is present, which the caller renders `"unknown"`.
-fn resolve_cpu_model(cpuinfo: &str, devicetree_model: Option<&str>) -> Option<String> {
+fn resolve_cpu_model(
+    cpuinfo: &str,
+    devicetree_model: Option<&str>,
+    sysctl_brand: Option<&str>,
+) -> Option<String> {
+    // macOS: the sysctl brand string is the only source; /proc does not exist
+    // there, so the Linux keys below are vacuously absent.
+    if let Some(brand) = sysctl_brand.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(brand.to_string());
+    }
     if let Some(model) = cpuinfo_value(cpuinfo, "model name") {
         return Some(model);
     }
@@ -165,7 +181,7 @@ mod tests {
     #[test]
     fn model_name_resolves_to_its_value() {
         assert_eq!(
-            resolve_cpu_model("processor : 0\nmodel name : AMD EPYC 7R13\n", None),
+            resolve_cpu_model("processor : 0\nmodel name : AMD EPYC 7R13\n", None, None),
             Some("AMD EPYC 7R13".to_string()),
         );
     }
@@ -178,6 +194,7 @@ mod tests {
         assert_eq!(
             resolve_cpu_model(
                 "processor : 0\nModel : Raspberry Pi 4 Model B Rev 1.4\n",
+                None,
                 None,
             ),
             Some("Raspberry Pi 4 Model B Rev 1.4".to_string()),
@@ -192,6 +209,7 @@ mod tests {
             resolve_cpu_model(
                 "processor : 0\nCPU implementer : 0x41\n",
                 Some("Raspberry Pi Compute Module 4"),
+                None,
             ),
             Some("Raspberry Pi Compute Module 4".to_string()),
         );
@@ -204,6 +222,7 @@ mod tests {
         assert_eq!(
             resolve_cpu_model(
                 "processor : 0\nCPU implementer : 0x41\nCPU part : 0xd0c\n",
+                None,
                 None,
             ),
             Some("ARM implementer 0x41 part 0xd0c".to_string()),
@@ -218,6 +237,7 @@ mod tests {
             resolve_cpu_model(
                 "model name : Intel Xeon\nModel : some board\nCPU implementer : 0x41\nCPU part : 0xd0c\n",
                 Some("a devicetree model"),
+                None,
             ),
             Some("Intel Xeon".to_string()),
         );
@@ -226,10 +246,22 @@ mod tests {
     /// The no-key case (empty `/proc/cpuinfo`, no devicetree) resolves to
     /// nothing, so the caller records `"unknown"` -- WITHOUT an error. This is
     /// the honest-unknown decision: the stamp still runs.
+    /// macOS: the sysctl brand string wins over every Linux key form, and the
+    /// fixed input pins the exact value. Demonstrated failing by passing the
+    /// brand as None.
+    #[test]
+    fn sysctl_brand_string_names_the_macos_cpu() {
+        assert_eq!(
+            resolve_cpu_model("", None, Some("Apple M3 Pro\n")).as_deref(),
+            Some("Apple M3 Pro")
+        );
+        assert_eq!(resolve_cpu_model("", None, Some("   ")), None);
+    }
+
     #[test]
     fn no_recognised_key_resolves_to_none() {
         assert_eq!(
-            resolve_cpu_model("processor : 0\nvendor_id : X\n", None),
+            resolve_cpu_model("processor : 0\nvendor_id : X\n", None, None),
             None
         );
     }
@@ -239,7 +271,7 @@ mod tests {
     #[test]
     fn a_blank_model_name_falls_through() {
         assert_eq!(
-            resolve_cpu_model("model name :   \nModel : Pi\n", None),
+            resolve_cpu_model("model name :   \nModel : Pi\n", None, None),
             Some("Pi".to_string()),
         );
     }
