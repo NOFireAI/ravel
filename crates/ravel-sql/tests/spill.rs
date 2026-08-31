@@ -9,8 +9,14 @@
 //! - an eligible integer aggregation over the memory budget completes by
 //!   spilling and returns the byte-identical result of the same query run under
 //!   a budget large enough not to spill (requirements 1, 4);
+//! - a spill-enabled plan carries no `RepartitionExec`: the eligibility
+//!   predicate classifies logical nodes, an enabled disk manager is a
+//!   session-wide permission, and that exchange is the node between the two
+//!   scopes (it spills, and no logical predicate ever sees it);
 //! - the per-query scratch quota exceeded is a typed `SpillBudgetExhausted`,
-//!   never a partial result (requirements 2, 5);
+//!   never a partial result (requirements 2, 5), with the budget split between
+//!   the scan and the aggregate measured so the aggregate is provably the
+//!   consumer that reached its spill threshold;
 //! - a missing spill directory is a typed `SpillUnavailable` (requirements 3,
 //!   5);
 //! - an ineligible plan (order-dependent float aggregation) over budget is
@@ -70,11 +76,17 @@ use ravel_types::accounting::QueryAccounting;
 use util::{Fixture, SegSpec, SeriesSpec, request, tenant_id};
 
 /// A per-query memory budget the high-cardinality aggregation below overruns,
-/// used by the executor-path tests where the aggregate spills far enough to hit
-/// the scratch quota, or the plan is refused. 16 MiB is the same ceiling the
-/// ADR-0102 sibling tests in `memory_ceiling_and_budget_errors.rs` use to trip
-/// the same query shape, so the "over budget" precondition is shared with the
-/// pre-spill coverage rather than re-tuned here.
+/// used by the executor-path tests where the plan is refused (spill off, or an
+/// ineligible plan) or where the budget is not what the case is about at all.
+/// 16 MiB is the same ceiling the ADR-0102 sibling tests in
+/// `memory_ceiling_and_budget_errors.rs` use to trip the same query shape, so
+/// the "over budget" precondition is shared with the pre-spill coverage rather
+/// than re-tuned here.
+///
+/// It is deliberately NOT the budget of the scratch-quota case: the scan's own
+/// share of this fixture exceeds 16 MiB, so under this budget no statement can
+/// be made about which consumer reached its limit first. See
+/// [`SPLIT_QUERY_BYTES`].
 const TIGHT_QUERY_BYTES: usize = 16 * 1024 * 1024;
 
 /// A per-query scratch quota large enough that the eligible aggregation's whole
@@ -432,9 +444,104 @@ async fn an_eligible_aggregation_over_budget_spills_and_matches_the_in_memory_re
     );
 }
 
+/// The scan-only statement: the same fixture, the same decode and dedup work,
+/// but an ungrouped `count(*)` whose aggregate state is a single `i64`. Its
+/// pool-accounted peak is therefore the scan's share of the budget, which is
+/// what the split below is measured against.
+const SCAN_ONLY_SQL: &str = "SELECT count(*) AS n FROM samples";
+
+/// Per-query memory budget for the scratch-quota case, sized from the measured
+/// split rather than shared with [`TIGHT_QUERY_BYTES`].
+///
+/// `RsegScanExec` retains every decoded segment of this fixture as one
+/// non-spillable reservation, and that share measures 36,640,200 bytes
+/// ([`SCAN_ONLY_SQL`] under [`AMPLE_QUERY_BYTES`], locked DataFusion 54.1.0).
+/// At 16 MiB the scan alone cannot fit, so nothing about the AGGREGATE's spill
+/// threshold could be established from that budget: whichever consumer happened
+/// to ask at the pool boundary decided which error came back. 48 MiB is above
+/// the scan's whole share and still far below the grouped run's 68,162,568-byte
+/// peak, so the scan fits, the aggregate gets a bounded headroom to grow into,
+/// and the aggregate is the consumer that must spill. Each of those figures is
+/// asserted below.
+const SPLIT_QUERY_BYTES: usize = 48 * 1024 * 1024;
+
+/// A budget no run over this fixture approaches, for the reference run that
+/// measures the grouped query's whole demand without spilling.
+const AMPLE_QUERY_BYTES: usize = 1 << 30;
+
+/// Ceiling on the scan's share of [`SPLIT_QUERY_BYTES`] (measured 36,640,200
+/// bytes). Above this the scan would be eating the headroom the aggregate needs,
+/// and the over-quota case would stop proving anything about the aggregate's
+/// spill.
+const SCAN_PEAK_CEILING_BYTES: u64 = 40 * 1024 * 1024;
+
+/// Floor on what the scan leaves for the aggregate under [`SPLIT_QUERY_BYTES`]
+/// (measured 13,671,416 bytes). The aggregate's spill threshold IS its pool
+/// refusal, so it can only reach it if this much of the budget is actually
+/// available to it.
+const AGGREGATE_HEADROOM_FLOOR_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The `written`/`quota` figures [`SqlError::spill_budget_exhausted`] formats
+/// into its message: `"{written} of {quota} bytes of scratch already written"`.
+fn scratch_figures(err: &SqlError) -> (u64, u64) {
+    let SqlError::SpillBudgetExhausted(message) = err else {
+        panic!("expected SpillBudgetExhausted; got {err:?}");
+    };
+    let mut numbers = message
+        .split_whitespace()
+        .filter_map(|word| word.parse::<u64>().ok());
+    let written = numbers.next().expect("the message states bytes written");
+    let quota = numbers.next().expect("the message states the quota");
+    (written, quota)
+}
+
+/// Drain `sql` through the real executor path with `accounting` attached, so
+/// the run's pool-accounted peak is readable whether it succeeded or failed.
+async fn drain_with_accounting(
+    fixture: &Fixture,
+    tenant: &ravel_types::TenantId,
+    sql: &str,
+    accounting: &QueryAccounting,
+) -> Result<u64, SqlError> {
+    let snapshot = fixture.snapshot(tenant).await;
+    let mut stream = fixture
+        .executor
+        .plan_pinned(tenant.hash(), snapshot, sql, accounting, &[])
+        .await?
+        .execute()
+        .await?;
+    let mut rows = 0u64;
+    while let Some(next) = stream.next().await {
+        rows += next?.num_rows() as u64;
+    }
+    Ok(rows)
+}
+
 /// ADR-0954 requirements 2 and 5: an eligible aggregation whose spilled state
 /// exceeds the per-query scratch quota fails with the typed
 /// `SpillBudgetExhausted`, and returns no partial result.
+///
+/// The variant alone is not enough to know the query took the path this test is
+/// about. The pool is shared: `RsegScanExec` holds a whole decoded segment as a
+/// non-spillable reservation, so a budget the scan nearly fills would refuse
+/// the aggregate's first reservation and end the query in
+/// `ResourcesExhausted` from the scan side before the aggregate ever reached
+/// its spill threshold. So the split is measured and asserted with figures:
+///
+/// 1. a scan-only control ([`SCAN_ONLY_SQL`]) over the same fixture and the
+///    same budget COMPLETES, and its pool-accounted peak is the scan's share;
+/// 2. that share is under [`SCAN_PEAK_CEILING_BYTES`] and leaves at least
+///    [`AGGREGATE_HEADROOM_FLOOR_BYTES`] of the budget for the aggregate;
+/// 3. the grouped query's own demand, measured by a reference run under
+///    [`AMPLE_QUERY_BYTES`] that does not spill, exceeds that headroom by more
+///    than the headroom itself, so the aggregate cannot fit in what the scan
+///    leaves and must reach its spill threshold;
+/// 4. the failing run's own figures show scratch bytes ALREADY WRITTEN when the
+///    quota refused the next write, which is only reachable by an aggregate that
+///    reached that threshold and spilled;
+/// 5. the quota in those figures is [`TINY_SCRATCH_BYTES`], so the refusal came
+///    from this query's configured scratch ceiling and not from some other
+///    limit.
 #[tokio::test]
 async fn an_eligible_aggregation_over_the_scratch_quota_is_spill_budget_exhausted() {
     let tenant = tenant_id("acme");
@@ -447,11 +554,87 @@ async fn an_eligible_aggregation_over_the_scratch_quota_is_spill_budget_exhauste
         spill_config(
             scratch.path().to_path_buf(),
             TINY_SCRATCH_BYTES,
-            TIGHT_QUERY_BYTES,
+            SPLIT_QUERY_BYTES,
         ),
         1 << 40,
     )
     .await;
+
+    // 1 and 2: what the scan takes, and what it leaves.
+    let control_accounting = QueryAccounting::new();
+    let control_rows = drain_with_accounting(&fixture, &tenant, SCAN_ONLY_SQL, &control_accounting)
+        .await
+        .expect("the scan-only control must complete within the same budget");
+    assert_eq!(
+        control_rows, 1,
+        "the ungrouped control returns one row, so its peak is the scan's, not \
+         an aggregate's"
+    );
+    let scan_peak = control_accounting.snapshot().peak_intermediate_bytes;
+    let budget = SPLIT_QUERY_BYTES as u64;
+    let headroom = budget.saturating_sub(scan_peak);
+    assert!(
+        scan_peak > 0,
+        "the control must have reserved from the pool, else it measured nothing"
+    );
+    assert!(
+        scan_peak <= SCAN_PEAK_CEILING_BYTES,
+        "the scan's share {scan_peak} must stay under {SCAN_PEAK_CEILING_BYTES} \
+         bytes; above that the scan, not the aggregate, is the consumer that \
+         approaches the budget and this case proves nothing about the spill"
+    );
+    assert!(
+        headroom >= AGGREGATE_HEADROOM_FLOOR_BYTES,
+        "the scan must leave the aggregate at least \
+         {AGGREGATE_HEADROOM_FLOOR_BYTES} bytes of the {budget}-byte budget to \
+         grow into and spill from; it left {headroom}"
+    );
+
+    // 3: how much the grouped query actually wants, measured where nothing is
+    // refused and nothing spills. The two consumers overlap in time, so
+    // `reference_peak - scan_peak` is a LOWER bound on the aggregate's own
+    // demand, which is the direction this assertion needs.
+    let reference = Fixture::build(
+        Arc::new(MemoryStore::new()),
+        &[(&tenant, &specs)],
+        spill_config(
+            scratch.path().to_path_buf(),
+            AMPLE_SCRATCH_BYTES,
+            AMPLE_QUERY_BYTES,
+        ),
+        1 << 40,
+    )
+    .await;
+    let reference_outcome = reference
+        .executor
+        .execute(tenant.hash(), &request(SPILLING_SQL))
+        .await
+        .expect("the reference run must complete under an ample budget");
+    assert_eq!(
+        reference_outcome.output.num_rows(),
+        LONG_ROWS as usize,
+        "the reference must produce one row per distinct ts group"
+    );
+    assert_eq!(
+        reference_outcome.stats.spill,
+        Default::default(),
+        "the reference must not spill, or its peak is not the query's whole \
+         demand; got {:?}",
+        reference_outcome.stats.spill
+    );
+    let reference_peak = reference_outcome.accounting.peak_intermediate_bytes;
+    let aggregate_demand = reference_peak.saturating_sub(scan_peak);
+    eprintln!(
+        "budget split: scan_peak={scan_peak} of budget={budget}, \
+         headroom={headroom}, reference_peak={reference_peak}, \
+         aggregate_demand_lower_bound={aggregate_demand}"
+    );
+    assert!(
+        aggregate_demand > headroom,
+        "the aggregate wants at least {aggregate_demand} bytes but the scan \
+         leaves it {headroom}: it must not fit, or it never reaches its spill \
+         threshold and this case would be measuring the scan's refusal"
+    );
 
     let err = fixture
         .executor
@@ -459,10 +642,33 @@ async fn an_eligible_aggregation_over_the_scratch_quota_is_spill_budget_exhauste
         .await
         .expect_err("the tiny scratch quota must trip");
 
+    // 3 and 4: the variant, and the figures behind it.
     assert!(
         matches!(err, SqlError::SpillBudgetExhausted(_)),
         "an over-quota spill must fail SpillBudgetExhausted, distinct from a \
-         memory-pool exhaustion; got {err:?}"
+         memory-pool exhaustion from the scan side; got {err:?}"
+    );
+    let (written, quota) = scratch_figures(&err);
+    eprintln!("scratch figures at the refusal: written={written} quota={quota}");
+    assert_eq!(
+        quota, TINY_SCRATCH_BYTES,
+        "the refusal must name this query's configured scratch quota"
+    );
+    assert!(
+        written > 0,
+        "the aggregate must have reached its spill threshold and written \
+         scratch before the quota refused it; {written} bytes written means the \
+         query failed without spilling at all"
+    );
+    // The gauge the figure comes from (`DiskManager::used_disk_space`) already
+    // includes the write that pushed the query past its ceiling, so the reported
+    // total is at or above the quota, never below it. Measured: 133,312 bytes of
+    // a 65,536-byte quota. Below the quota would mean the refusal came from
+    // something other than this ceiling.
+    assert!(
+        written >= quota,
+        "the refusal must report scratch at or above the quota it tripped; \
+         got {written} of {quota}"
     );
 
     // Requirement 7: a typed error cleans up its scratch too.
@@ -551,6 +757,159 @@ async fn an_ineligible_float_aggregation_over_budget_is_refused_and_never_spills
     assert!(
         spill_subdirs(scratch.path()).is_empty(),
         "an ineligible plan must never create a scratch subdirectory"
+    );
+}
+
+/// A memory budget no plan-shape test can exhaust: the two cases below only
+/// plan, they never drain a stream, so the budget must not be part of what they
+/// measure.
+const PLAN_SHAPE_QUERY_BYTES: usize = 1 << 30;
+
+/// The config for the two plan-shape cases: aggregate repartitioning armed
+/// (`parallel_final_aggregation`, ADR-0094) and the default multi-partition
+/// scan, so `EnforceDistribution` is free to insert a hash `RepartitionExec`.
+/// `spill` is the one variable between the control and the subject.
+fn parallel_config(spill: Option<SpillConfig>) -> SqlConfig {
+    SqlConfig {
+        // The default `fetch_concurrency` (8) becomes `target_partitions`, so
+        // there is more than one partition to repartition across. Pinning it to
+        // 1 the way `spill_config` does would make the control vacuous.
+        engine: util::engine_config(),
+        max_query_bytes: PLAN_SHAPE_QUERY_BYTES,
+        parallel_final_aggregation: true,
+        skip_partial_aggregation: true,
+        late_materialization_extra_columns: None,
+        spill,
+    }
+}
+
+/// The indented physical plan text for `sql`, planned through the real
+/// `plan_pinned` path so the session it is planned in is the one the executor
+/// built (spill decision, repartition knob, and all).
+async fn physical_plan_text(
+    fixture: &Fixture,
+    tenant: &ravel_types::TenantId,
+    sql: &str,
+) -> String {
+    let accounting = QueryAccounting::new();
+    let snapshot = fixture.snapshot(tenant).await;
+    let plan = fixture
+        .executor
+        .plan_pinned(tenant.hash(), snapshot, sql, &accounting, &[])
+        .await
+        .expect("the query plans")
+        .create_physical_plan()
+        .await
+        .expect("the physical plan builds");
+    format!(
+        "{}",
+        datafusion::physical_plan::displayable(plan.as_ref()).indent(false)
+    )
+}
+
+/// ADR-0954's fail-closed argument, closed over the physical plan: a query
+/// granted spill runs its final aggregation single-partitioned, so the
+/// `RepartitionExec` that `parallel_final_aggregation` would otherwise
+/// introduce is never in a plan whose disk manager is enabled.
+///
+/// This matters because the two permissions have different scopes. Eligibility
+/// is decided by a predicate over the LOGICAL plan
+/// (`plan_is_spill_eligible`, an allowlist of logical nodes), but the disk
+/// manager it arms belongs to the session: every operator in the physical plan
+/// may then spill. `RepartitionExec` spills in DataFusion 54 -- its output
+/// channels fall back to a `SpillPool` when the pool refuses their reservation,
+/// which is where the `SpillPool (DiskManager is disabled)` message in
+/// `tests/memory_pool_attribution.rs` comes from -- and no predicate in this
+/// crate has classified an exchange spill's exactness.
+///
+/// The control half of the test is what makes it non-vacuous: the same
+/// statement, the same fixture, the same `parallel_final_aggregation`, spill
+/// off, DOES get the hash repartition and a `FinalPartitioned` aggregate.
+#[tokio::test]
+async fn a_spill_enabled_query_gets_no_unclassified_repartition_exec() {
+    let tenant = tenant_id("acme");
+    // Two segments is enough: this case reads plan shape, not data.
+    let specs = overlapping_series_specs(SEG_ROWS * 2, SEG_ROWS);
+    let scratch = tempfile::tempdir().expect("scratch root");
+
+    // Control: spill off. The statement is exact-typed (integer `count`, a
+    // non-float `ts` key), so the aggregate repartition fires.
+    let control = Fixture::build(
+        Arc::new(MemoryStore::new()),
+        &[(&tenant, &specs)],
+        parallel_config(None),
+        1 << 40,
+    )
+    .await;
+    let control_plan = physical_plan_text(&control, &tenant, SPILLING_SQL).await;
+    assert!(
+        control_plan.contains("RepartitionExec: partitioning=Hash"),
+        "the control must repartition, else this test proves nothing about the \
+         spill grant; got:\n{control_plan}"
+    );
+    assert!(
+        control_plan.contains("AggregateExec: mode=FinalPartitioned"),
+        "the control's final aggregate must be the fanned-out one; got:\n{control_plan}"
+    );
+
+    // Subject: the identical statement with spill configured. Eligible, so the
+    // disk manager is enabled for the whole session.
+    let fixture = Fixture::build(
+        Arc::new(MemoryStore::new()),
+        &[(&tenant, &specs)],
+        parallel_config(Some(SpillConfig {
+            dir: scratch.path().to_path_buf(),
+            max_bytes: AMPLE_SCRATCH_BYTES,
+        })),
+        1 << 40,
+    )
+    .await;
+
+    let accounting = QueryAccounting::new();
+    let snapshot = fixture.snapshot(&tenant).await;
+    let pinned = fixture
+        .executor
+        .plan_pinned(tenant.hash(), snapshot, SPILLING_SQL, &accounting, &[])
+        .await
+        .expect("the eligible query plans");
+    // Spill really was granted: this is the case the finding is about, not a
+    // query that was refused spill and trivially has no repartition.
+    assert_eq!(
+        spill_subdirs(scratch.path()).len(),
+        1,
+        "the subject must have been granted spill (one scratch subdirectory)"
+    );
+
+    let plan = pinned
+        .create_physical_plan()
+        .await
+        .expect("the physical plan builds");
+    let text = format!(
+        "{}",
+        datafusion::physical_plan::displayable(plan.as_ref()).indent(false)
+    );
+    assert!(
+        !text.contains("RepartitionExec"),
+        "a spill-enabled plan must contain no RepartitionExec: the eligibility \
+         predicate classified logical nodes, and an enabled disk manager would \
+         grant spill to this unclassified exchange too; got:\n{text}"
+    );
+    assert!(
+        !text.contains("FinalPartitioned"),
+        "a spill-enabled plan must keep the single-partition final aggregate; \
+         got:\n{text}"
+    );
+    // The aggregate that spill exists for is still there and still able to
+    // spill. `mode=Single` is a NON-partial aggregate mode, and DataFusion 54
+    // gives every non-partial mode with no group ordering
+    // `OutOfMemoryMode::Spill` once the disk manager is enabled
+    // (`aggregates/row_hash.rs`); it is `mode=Partial` that emits early instead
+    // of spilling. So dropping the exchange costs parallelism, not the spill.
+    assert!(
+        text.contains("AggregateExec: mode=Single"),
+        "the spill-enabled plan must still carry the grouped aggregate as a \
+         single-partition (non-partial) stage, which is the mode that spills; \
+         got:\n{text}"
     );
 }
 

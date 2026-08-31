@@ -265,6 +265,12 @@ pub struct SqlConfig {
     /// disabled disk manager and today's typed refusal, whatever this is set
     /// to.
     ///
+    /// A query that IS granted spill runs its final aggregation
+    /// single-partitioned even when [`SqlConfig::parallel_final_aggregation`]
+    /// is on: the eligibility predicate classifies logical nodes, and an
+    /// enabled disk manager would also let the `RepartitionExec` that knob
+    /// introduces spill unclassified. See `crate::session`'s module doc.
+    ///
     /// This field is the source of truth. [`SqlConfig::with_spill_from_env`]
     /// fills it from [`ENV_SPILL_DIR`]/[`ENV_SPILL_MAX_BYTES`] only when it is
     /// still `None`, so an explicit setting is never overridden by the

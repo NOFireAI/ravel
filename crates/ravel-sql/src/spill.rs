@@ -10,7 +10,8 @@
 //!
 //! # Directory layout
 //!
-//! [`SpillScratch::create`] makes `<configured dir>/ravel-spill-<pid>-<n>` and
+//! [`SpillScratch::create`] makes
+//! `<configured dir>/ravel-spill-<pid>-<nonce>-<n>` and
 //! hands only that subdirectory to DataFusion's disk manager, which in turn
 //! creates its own `datafusion-*` temporary directory inside it. Two nested
 //! guards then both have to fail for anything to survive the query: DataFusion's
@@ -40,9 +41,11 @@
 //!   records nothing, so this crate cannot source it: it is `None`, meaning
 //!   "not measured", never `0`, which would claim nothing was read.
 
+use std::hash::{BuildHasher, RandomState};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use datafusion::physical_plan::ExecutionPlan;
@@ -54,6 +57,49 @@ use crate::error::SqlError;
 /// process. Paired with the process id so two processes sharing a configured
 /// directory cannot collide either.
 static SCRATCH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Per-process random component of a scratch directory name.
+///
+/// The process id and the sequence counter are both reconstructible: a process
+/// that crashes leaves its scratch behind by design (module doc), and after the
+/// OS reuses its process id the next process starts its own sequence at 0 and
+/// would rebuild the identical name. `create_dir` then fails `AlreadyExists`
+/// and a perfectly usable spill root refuses the first eligible query. This
+/// makes the name unpredictable instead, so a stale directory cannot be named
+/// by a later process at all.
+///
+/// Not a liveness probe on purpose: ADR-0954 rejects process liveness as proof
+/// of scratch ownership (a reused pid is live and owns nothing of the dead
+/// process's), so the fix is a name that does not collide, never a decision
+/// about whether the stale directory is abandoned.
+///
+/// `RandomState`'s keys are seeded from the OS once per process, which is
+/// exactly the property needed here and needs no dependency and no clock (this
+/// crate's library logic takes no `SystemTime::now`).
+static SCRATCH_NONCE: OnceLock<u64> = OnceLock::new();
+
+/// Attempts [`SpillScratch::create`] makes before it gives up on a colliding
+/// name. Each attempt draws a fresh sequence number, so reaching this bound
+/// means every one of them collided: not a name clash any more, but a scratch
+/// root that cannot be written, which is a [`SqlError::SpillUnavailable`].
+const SCRATCH_NAME_ATTEMPTS: u32 = 8;
+
+/// This process's scratch nonce, computed once.
+fn scratch_nonce() -> u64 {
+    *SCRATCH_NONCE.get_or_init(|| RandomState::new().hash_one(std::process::id()))
+}
+
+/// The name of the next scratch subdirectory: process id, this process's
+/// nonce, and a fresh in-process sequence number, so two queries in one process
+/// never collide and no other process can reconstruct the name.
+fn next_scratch_name() -> String {
+    let sequence = SCRATCH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "ravel-spill-{}-{:016x}-{sequence}",
+        std::process::id(),
+        scratch_nonce()
+    )
+}
 
 /// One query's scratch subdirectory, removed when this value drops.
 ///
@@ -74,6 +120,12 @@ impl SpillScratch {
     /// regular file, a read-only parent, and a full volume each surface as
     /// [`SqlError::SpillUnavailable`] here, before any operator has run, rather
     /// than as an opaque IO error from deep inside a spilling operator.
+    ///
+    /// A name that is already taken is the one IO failure that is not a
+    /// refusal: it is retried with a fresh name (see [`next_scratch_name`] and
+    /// [`SpillScratch::create_named`]), because scratch left behind by a
+    /// crashed process must not make a usable spill root refuse the next
+    /// query.
     pub(crate) fn create(config: &SpillConfig) -> Result<SpillScratch, SqlError> {
         let root = config.dir.as_path();
         let metadata = std::fs::metadata(root).map_err(|err| {
@@ -88,15 +140,51 @@ impl SpillScratch {
                 root.display()
             )));
         }
-        let sequence = SCRATCH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let dir = root.join(format!("ravel-spill-{}-{sequence}", std::process::id()));
-        std::fs::create_dir(&dir).map_err(|err| {
-            SqlError::SpillUnavailable(format!(
-                "spill scratch directory {} could not be created: {err}",
-                dir.display()
-            ))
-        })?;
-        Ok(SpillScratch { dir })
+        Self::create_named(root, next_scratch_name)
+    }
+
+    /// Create the first of up to [`SCRATCH_NAME_ATTEMPTS`] names `name` yields
+    /// that is not already taken under `root`.
+    ///
+    /// Only `AlreadyExists` is retried. Every other error -- a read-only
+    /// parent, a parent removed between the check and here, a full volume --
+    /// surfaces as [`SqlError::SpillUnavailable`] on the spot, with no further
+    /// attempt: those say the scratch root is unusable, and retrying a
+    /// different name under it would only repeat the same failure.
+    ///
+    /// Takes the name generator as an argument so a test can hand it a
+    /// deliberately colliding name; production passes
+    /// [`next_scratch_name`].
+    fn create_named(
+        root: &Path,
+        mut name: impl FnMut() -> String,
+    ) -> Result<SpillScratch, SqlError> {
+        let mut collided = Vec::new();
+        for _ in 0..SCRATCH_NAME_ATTEMPTS {
+            let dir = root.join(name());
+            match std::fs::create_dir(&dir) {
+                Ok(()) => return Ok(SpillScratch { dir }),
+                Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+                    collided.push(dir);
+                }
+                Err(err) => {
+                    return Err(SqlError::SpillUnavailable(format!(
+                        "spill scratch directory {} could not be created: {err}",
+                        dir.display()
+                    )));
+                }
+            }
+        }
+        Err(SqlError::SpillUnavailable(format!(
+            "no spill scratch directory could be created under {}: \
+             all {SCRATCH_NAME_ATTEMPTS} candidate names already exist ({})",
+            root.display(),
+            collided
+                .iter()
+                .map(|dir| dir.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )))
     }
 
     /// The directory handed to DataFusion's disk manager.
@@ -270,6 +358,108 @@ mod tests {
         assert!(
             !missing.exists(),
             "the configured directory must never be created by this crate"
+        );
+    }
+
+    /// A stale scratch directory whose name collides with the one this query
+    /// would pick does not fail the query: the next name is tried, and the
+    /// stale directory is left exactly where it is (nothing here decides
+    /// whether it is abandoned, which is what ADR-0954 rejects).
+    #[test]
+    fn a_colliding_stale_directory_is_retried_not_refused() {
+        let root = tempfile::tempdir().expect("temp root");
+        let stale = root.path().join("ravel-spill-stale");
+        std::fs::create_dir(&stale).expect("stale dir");
+        std::fs::write(stale.join("left-behind"), b"from a crashed process")
+            .expect("stale contents");
+
+        let mut names = ["ravel-spill-stale", "ravel-spill-fresh"].into_iter();
+        let scratch = SpillScratch::create_named(root.path(), || {
+            names.next().expect("two names offered").to_string()
+        })
+        .expect("a taken name must be retried, not refused");
+
+        assert_eq!(
+            scratch.dir(),
+            root.path().join("ravel-spill-fresh"),
+            "create must move on to the next candidate name"
+        );
+        assert!(
+            stale.join("left-behind").is_file(),
+            "the stale directory and its contents must be left untouched"
+        );
+    }
+
+    /// Exhausting every candidate name is a `SpillUnavailable`, not a retry
+    /// loop: at that point the root is unusable, which the query must be told.
+    #[test]
+    fn every_candidate_name_taken_is_spill_unavailable() {
+        let root = tempfile::tempdir().expect("temp root");
+        std::fs::create_dir(root.path().join("ravel-spill-taken")).expect("taken dir");
+
+        let mut attempts = 0u32;
+        let err = SpillScratch::create_named(root.path(), || {
+            attempts += 1;
+            "ravel-spill-taken".to_string()
+        })
+        .expect_err("every name taken must be refused");
+
+        assert!(matches!(err, SqlError::SpillUnavailable(_)), "got {err:?}");
+        assert_eq!(
+            attempts, SCRATCH_NAME_ATTEMPTS,
+            "create must try exactly {SCRATCH_NAME_ATTEMPTS} names before refusing"
+        );
+    }
+
+    /// A name a dead process left behind cannot be reconstructed by a later
+    /// process, whatever process id the OS hands it: the nonce is per-process
+    /// and the pid-and-sequence part of the name is not sufficient to build it.
+    ///
+    /// This is the property that keeps the retry above from being the only
+    /// defense. The pre-fix name was `ravel-spill-<pid>-<sequence>` with the
+    /// sequence starting at 0 in every process, so the name below is exactly
+    /// what a crashed process with this pid would have left, and exactly what
+    /// the first eligible query of the reusing process would have asked for.
+    #[test]
+    fn a_scratch_name_cannot_be_reconstructed_from_the_process_id_alone() {
+        let root = tempfile::tempdir().expect("temp root");
+        let reused_pid_name = format!("ravel-spill-{}-0", std::process::id());
+        std::fs::create_dir(root.path().join(&reused_pid_name)).expect("stale dir");
+
+        let config = SpillConfig {
+            dir: root.path().to_path_buf(),
+            max_bytes: 1 << 20,
+        };
+        let scratch = SpillScratch::create(&config).expect("scratch created");
+        let name = scratch
+            .dir()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("a utf-8 scratch name")
+            .to_string();
+
+        assert_ne!(
+            name, reused_pid_name,
+            "the name must carry more than the process id and the sequence"
+        );
+        let nonce = name
+            .strip_prefix(&format!("ravel-spill-{}-", std::process::id()))
+            .and_then(|rest| rest.split('-').next())
+            .expect("the name is ravel-spill-<pid>-<nonce>-<sequence>")
+            .to_string();
+        assert_eq!(
+            nonce.len(),
+            16,
+            "the nonce is 16 hex digits of per-process randomness; got {nonce:?}"
+        );
+        assert!(
+            nonce.chars().all(|c| c.is_ascii_hexdigit()),
+            "the nonce is hex; got {nonce:?}"
+        );
+        assert_eq!(
+            nonce,
+            format!("{:016x}", scratch_nonce()),
+            "one nonce per process, stable across queries"
         );
     }
 
