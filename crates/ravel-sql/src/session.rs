@@ -96,6 +96,15 @@
 //! per-query [`SpillDecision`]; `Disabled` is ADR-0102 decision 3 unchanged,
 //! and `Enabled` names one directory and one byte ceiling. See
 //! [`disk_manager_builder`].
+//!
+//! A `SpillDecision::Enabled` query is also repartition-free: [`session_config`]
+//! forces `repartition_aggregations` off for it, whatever the ADR-0094
+//! classification said, and disables DataFusion's round-robin repartitioning
+//! too. The reason is a scope mismatch, not a determinism one: the spill
+//! eligibility predicate classifies LOGICAL plan nodes, while an enabled disk
+//! manager is a permission held by every operator in the session's PHYSICAL
+//! plan, and `RepartitionExec` -- which appears in no logical plan -- spills in
+//! DataFusion 54. See [`repartition_free`].
 
 use std::sync::Arc;
 
@@ -496,18 +505,29 @@ fn disk_manager_builder(spill: SpillDecision<'_>) -> DiskManagerBuilder {
 /// Build the per-query `SessionConfig`. Separated from [`build_session`] so
 /// the invariants above can be asserted without constructing a provider.
 ///
-/// `exact_typed_aggregates` (ADR-0094 decision 2) is the one per-query input:
+/// `exact_typed_aggregates` (ADR-0094 decision 2) is one per-query input:
 /// `true` only when the caller's classification proved the query's aggregates
 /// and GROUP BY keys are order/partition-independent, allowing DataFusion to
 /// fan the final aggregation across partitions. `false` for every other query,
 /// which reproduces the old single-partition plan exactly.
-pub fn session_config(config: &SqlConfig, exact_typed_aggregates: bool) -> SessionConfig {
+///
+/// `spill` is the other, and it OVERRIDES the first: a
+/// [`SpillDecision::Enabled`] query gets no `RepartitionExec` at all, so
+/// `repartition_aggregations` is forced off and DataFusion's round-robin
+/// repartitioning is disabled with it. See [`repartition_free`] for why.
+pub fn session_config(
+    config: &SqlConfig,
+    exact_typed_aggregates: bool,
+    spill: SpillDecision<'_>,
+) -> SessionConfig {
+    let repartition_free = repartition_free(spill);
     let mut session = SessionConfig::new()
         .with_information_schema(false)
         .with_target_partitions(config.engine.fetch_concurrency.max(1))
         // ADR-0094: the only knob that is ever true, and only for a query whose
         // aggregates and group keys are all exact-typed. See the module docs.
-        .with_repartition_aggregations(exact_typed_aggregates)
+        // ADR-0954 takes it back for a spill-enabled query.
+        .with_repartition_aggregations(exact_typed_aggregates && !repartition_free)
         .with_repartition_joins(false)
         .with_repartition_sorts(false)
         .with_repartition_windows(false)
@@ -527,7 +547,51 @@ pub fn session_config(config: &SqlConfig, exact_typed_aggregates: bool) -> Sessi
             .skip_partial_aggregation_probe_ratio_threshold = SKIP_PARTIAL_AGGREGATION_PROBE_RATIO;
     }
 
+    if repartition_free {
+        // The `repartition_*` knobs above do not cover DataFusion's round-robin
+        // fan-out, which `EnforceDistribution` inserts on its own whenever an
+        // operator's input has fewer partitions than `target_partitions`. It
+        // has no fluent setter either, so it is written as a typed field for
+        // the same reason.
+        session
+            .options_mut()
+            .optimizer
+            .enable_round_robin_repartition = false;
+    }
+
     session
+}
+
+/// Whether this query's plan must contain no `RepartitionExec` (ADR-0954).
+///
+/// True for exactly a [`SpillDecision::Enabled`] query, and it is the second
+/// half of the spill mechanism's fail-closed argument. The eligibility
+/// predicate that produced the decision (`executor::plan_is_spill_eligible`)
+/// classifies LOGICAL plan nodes, and it fails closed on anything it cannot
+/// classify. The permission the decision grants is not logical and not per
+/// node: an enabled disk manager lets EVERY operator in the session's physical
+/// plan spill.
+///
+/// `RepartitionExec` is the gap between those two scopes. It exists in no
+/// logical plan, so the predicate never sees it, and it spills in DataFusion 54:
+/// each output channel that the memory pool refuses falls back to a `SpillPool`
+/// channel (`datafusion::physical_plan::repartition`, whose disabled-disk-manager
+/// error is the `SpillPool (DiskManager is disabled)` message
+/// [`MSG_SPILL_DISABLED_MARKER`](crate::MSG_SPILL_DISABLED_MARKER) matches).
+/// Nothing in this crate has classified an exchange spill's exactness, so the
+/// conservative order is to remove the node rather than grant it the
+/// permission: both knobs that can introduce one are turned off for a
+/// spill-enabled query.
+///
+/// The cost is parallelism, on queries that today are refused outright, and it
+/// is bounded: `RsegScanExec` still scans its objects in parallel, and the
+/// grouped aggregate that spill exists for still spills. What is given up is
+/// the fan-out ABOVE the merged, deduplicated stream.
+fn repartition_free(spill: SpillDecision<'_>) -> bool {
+    match spill {
+        SpillDecision::Enabled { .. } => true,
+        SpillDecision::Disabled => false,
+    }
 }
 
 /// Build a fresh, single-tenant `SessionContext` around `table` with `pool`
@@ -569,7 +633,7 @@ pub fn build_session(
     // puts it: the rewrite must see the final partial/final aggregation split
     // that `EnforceDistribution` chose.
     let mut builder = SessionStateBuilder::new()
-        .with_config(session_config(config, exact_typed_aggregates))
+        .with_config(session_config(config, exact_typed_aggregates, spill))
         .with_runtime_env(runtime)
         .with_default_features()
         .with_physical_optimizer_rule(Arc::new(DictionaryGroupKeysAsViews))
@@ -820,7 +884,7 @@ mod tests {
 
     #[test]
     fn information_schema_is_disabled_and_repartitioning_is_off() {
-        let config = session_config(&SqlConfig::default(), false);
+        let config = session_config(&SqlConfig::default(), false, SpillDecision::Disabled);
         let options = config.options();
         assert!(
             !options.catalog.information_schema,
@@ -838,7 +902,7 @@ mod tests {
     /// unconditionally off, and `information_schema` stays disabled.
     #[test]
     fn exact_typed_aggregates_flips_only_repartition_aggregations() {
-        let config = session_config(&SqlConfig::default(), true);
+        let config = session_config(&SqlConfig::default(), true, SpillDecision::Disabled);
         let options = config.options();
         assert!(!options.catalog.information_schema);
         assert!(
@@ -849,6 +913,57 @@ mod tests {
         assert!(!options.optimizer.repartition_sorts);
         assert!(!options.optimizer.repartition_windows);
         assert!(!options.optimizer.repartition_file_scans);
+    }
+
+    /// ADR-0954: a spill-enabled session is repartition-free. The spill
+    /// decision overrides the ADR-0094 classification (`exact_typed_aggregates
+    /// = true` here, the case that would otherwise turn the hash exchange on),
+    /// and it also turns off the round-robin fan-out `EnforceDistribution`
+    /// inserts on its own -- no `repartition_*` knob covers that one, and it is
+    /// how a `RepartitionExec` reached a spill-enabled plan even with every
+    /// repartition knob off.
+    ///
+    /// Both are here because an enabled disk manager is a session-wide
+    /// permission and `RepartitionExec` spills: it is the node the logical
+    /// eligibility predicate cannot classify. See [`repartition_free`].
+    #[test]
+    fn a_spill_enabled_session_is_repartition_free() {
+        let dir = std::path::PathBuf::from("/tmp/does-not-need-to-exist");
+        let spill = SpillDecision::Enabled {
+            dir: dir.as_path(),
+            max_bytes: 1 << 20,
+        };
+        let config = session_config(&SqlConfig::default(), true, spill);
+        let options = config.options();
+        assert!(
+            !options.optimizer.repartition_aggregations,
+            "a spill-enabled query must not repartition its final aggregation, \
+             whatever the exact-typed classification said (ADR-0954)"
+        );
+        assert!(
+            !options.optimizer.enable_round_robin_repartition,
+            "a spill-enabled query must not get the round-robin fan-out either: \
+             no repartition_* knob covers it and RepartitionExec spills"
+        );
+        assert!(!options.optimizer.repartition_joins);
+        assert!(!options.optimizer.repartition_sorts);
+        assert!(!options.optimizer.repartition_windows);
+        assert!(!options.optimizer.repartition_file_scans);
+
+        // The override is the spill decision's, not a new unconditional
+        // default: the same config with spill off keeps both.
+        let without_spill = session_config(&SqlConfig::default(), true, SpillDecision::Disabled);
+        assert!(
+            without_spill.options().optimizer.repartition_aggregations,
+            "spill off must leave the ADR-0094 knob exactly as it was"
+        );
+        assert!(
+            without_spill
+                .options()
+                .optimizer
+                .enable_round_robin_repartition,
+            "spill off must leave DataFusion's round-robin default alone"
+        );
     }
 
     /// Issue #680: a default session tightens both skip-partial-aggregation
@@ -862,7 +977,7 @@ mod tests {
     /// promises.
     #[test]
     fn skip_partial_aggregation_sets_both_probe_thresholds() {
-        let on = session_config(&SqlConfig::default(), false);
+        let on = session_config(&SqlConfig::default(), false, SpillDecision::Disabled);
         assert_eq!(
             on.options()
                 .execution
@@ -898,6 +1013,7 @@ mod tests {
                 ..SqlConfig::default()
             },
             false,
+            SpillDecision::Disabled,
         );
         assert_eq!(
             off.options()

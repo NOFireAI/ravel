@@ -667,9 +667,6 @@ impl SqlExecutor {
             } else {
                 None
             };
-        // Fail CLOSED, unchanged: an unbuildable plan is not exact-typed.
-        let exact_typed_aggregates = self.config.parallel_final_aggregation
-            && analyzed.as_ref().is_some_and(plan_is_exact_typed);
         // ADR-0954: spill needs BOTH an operator-configured scratch area and a
         // plan whose every aggregate is exact under a changed folding order.
         // Fail closed the same way: an unbuildable plan is not eligible, so it
@@ -685,6 +682,19 @@ impl SqlExecutor {
             }
             _ => None,
         };
+        // Fail CLOSED, unchanged: an unbuildable plan is not exact-typed.
+        //
+        // A spill-enabled query is planned repartition-free whatever this says:
+        // `session_config` forces `repartition_aggregations` off (and
+        // round-robin repartitioning with it) for a `SpillDecision::Enabled`
+        // session, because the eligibility predicate above classified LOGICAL
+        // nodes while an enabled disk manager grants spill to every operator in
+        // the PHYSICAL plan, `RepartitionExec` included. The classification is
+        // still computed here so the two decisions stay independent and the
+        // override lives in exactly one place (`crate::session::
+        // repartition_free`).
+        let exact_typed_aggregates = self.config.parallel_final_aggregation
+            && analyzed.as_ref().is_some_and(plan_is_exact_typed);
         // Build the one table the query targets over the snapshot resolved for
         // its signal. `resolve` already resolved `snapshot` against exactly
         // this signal, so the provider and the snapshot always agree.
@@ -2045,6 +2055,14 @@ fn plan_is_exact_typed(plan: &LogicalPlan) -> bool {
 /// an aggregate that is not an `AggregateFunction`, an unknown plan node -- is
 /// ineligible. Fail closed: the cost of a false negative is today's typed
 /// refusal, and the cost of a false positive is a silently wrong answer.
+///
+/// This predicate reasons about the logical plan, but the permission it leads
+/// to (an enabled disk manager) is held by every operator in the physical plan
+/// the session goes on to build. Only physical nodes that correspond to the
+/// shapes above may therefore be admitted, which is why an eligible query is
+/// also planned repartition-free (`crate::session::repartition_free`): a
+/// `RepartitionExec` appears in no logical plan, so nothing here classifies it,
+/// and it spills.
 fn plan_is_spill_eligible(plan: &LogicalPlan) -> bool {
     if !plan_nodes_are_spill_classifiable(plan) {
         return false;
