@@ -30,6 +30,7 @@
 
 use std::collections::HashMap;
 
+use prost::Message;
 use ravel_proto::catalog::v1::ColumnStatsSegment;
 use ravel_types::{Signal, TenantHash};
 
@@ -53,6 +54,31 @@ pub struct LoadedColumnStats {
     /// The covered parts' blake3 hashes, in `SnapshotHead.parts` order (the
     /// binding this loader verifies before returning `Some`).
     pub part_blake3: Vec<[u8; 32]>,
+}
+
+impl LoadedColumnStats {
+    /// The exact byte weight this object charges against the catalog's
+    /// column-statistics cache budget (issue #905): the sum of every held
+    /// segment's encoded protobuf length plus 32 bytes per covered part hash.
+    ///
+    /// It counts the decoded `.cstat` payload itself, the term that scales with
+    /// a tenant's declared typed columns times its live segments and with the
+    /// number of tenants a process serves, and the term the budget exists to
+    /// bound. It deliberately does NOT count `HashMap` slot overhead or the
+    /// `Arc` control block, so the figure is an exact, reproducible function of
+    /// the cached data (identical contents in, identical bytes out) rather than
+    /// an estimate of the entry count; it is a lower bound on the process RSS
+    /// the entry costs. The bytes counted are decoded-payload bytes, not the
+    /// object's on-wire compressed size.
+    pub fn heap_bytes(&self) -> u64 {
+        let segment_bytes: u64 = self
+            .segments
+            .values()
+            .map(|segment| segment.encoded_len() as u64)
+            .sum();
+        let part_bytes = self.part_blake3.len() as u64 * 32;
+        segment_bytes + part_bytes
+    }
 }
 
 /// The column-stats object the current folded HEAD points at, resolved from
