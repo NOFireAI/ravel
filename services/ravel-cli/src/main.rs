@@ -762,6 +762,24 @@ enum MaintainCommand {
         #[arg(long, value_name = "DURATION",
               value_parser = parse_max_flush_lifetime_ns)]
         max_flush_lifetime: Option<i64>,
+        /// Bound the decoded record-heap a merge holds before it closes an L1
+        /// part (the memory split target). Lower it to cap compactor peak memory
+        /// on a small host; raise it for fewer, larger parts. Refused at 0.
+        /// Default 256 MiB (the compactor default).
+        #[arg(long, value_name = "BYTES")]
+        l1_part_memory_target_bytes: Option<u64>,
+        /// Bound the encoded/on-object bytes a merge writes before it closes an
+        /// L1 part (the stored-size target). A part closes on whichever of this
+        /// and --l1-part-memory-target-bytes is reached first. Refused at 0.
+        /// Default 256 MiB (the compactor default).
+        #[arg(long, value_name = "BYTES")]
+        max_l1_part_bytes: Option<u64>,
+        /// Number of per-input reads a compaction keeps in flight at once (the
+        /// commit-record GET and catalog load per input). Raise it to hide store
+        /// round-trip latency on a many-input bucket; it never changes output
+        /// bytes. Default 8 (the compactor default); values below 1 act as 1.
+        #[arg(long, value_name = "N")]
+        input_read_concurrency: Option<usize>,
     },
     /// Run one sweep pass (orphan GC, superseded, unreferenced parts) over a shard.
     Sweep {
@@ -1055,6 +1073,9 @@ async fn main() -> anyhow::Result<()> {
                     to_hour,
                     dry_run,
                     max_flush_lifetime,
+                    l1_part_memory_target_bytes,
+                    max_l1_part_bytes,
+                    input_read_concurrency,
                 },
         } => maintain::compact_tenant(
             store::build_store(&cli.store)?,
@@ -1065,6 +1086,9 @@ async fn main() -> anyhow::Result<()> {
             to_hour,
             dry_run,
             max_flush_lifetime,
+            l1_part_memory_target_bytes,
+            max_l1_part_bytes,
+            input_read_concurrency,
             now_ns()?,
         )
         .await
@@ -2335,6 +2359,142 @@ mod tests {
             max_inflight_flushes,
             ravel_cli::load::DEFAULT_MAX_INFLIGHT_FLUSHES,
             "--max-inflight-flushes must default to DEFAULT_MAX_INFLIGHT_FLUSHES"
+        );
+    }
+
+    use ravel_cli::maintain::{self, CompactorKnobError};
+
+    /// Destructure a parsed `maintain compact-tenant` invocation into the three
+    /// new memory knobs plus dry-run/flush overrides, panicking on any other
+    /// subcommand. Keeps each reachability test to the assertion it is about.
+    #[allow(clippy::type_complexity)]
+    fn compact_tenant_knobs(
+        cli: Cli,
+    ) -> (bool, Option<i64>, Option<u64>, Option<u64>, Option<usize>) {
+        let Command::Maintain {
+            command:
+                super::MaintainCommand::CompactTenant {
+                    dry_run,
+                    max_flush_lifetime,
+                    l1_part_memory_target_bytes,
+                    max_l1_part_bytes,
+                    input_read_concurrency,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("expected the maintain compact-tenant subcommand");
+        };
+        (
+            dry_run,
+            max_flush_lifetime,
+            l1_part_memory_target_bytes,
+            max_l1_part_bytes,
+            input_read_concurrency,
+        )
+    }
+
+    /// Each new memory knob, given on a real `compact-tenant` argument vector,
+    /// arrives verbatim in the built `CompactorConfig`, and a fresh
+    /// `MergeMemoryTracker` is installed (so the per-phase peak-memory event
+    /// `rewrite_and_publish` emits fires for each bucket).
+    ///
+    /// Distinct values (12345 / 67890 / 7) so a crossed-wire mapping cannot pass.
+    ///
+    /// Non-vacuity (prove-the-test), each flip named:
+    /// - Drop `l1_part_memory_target_bytes` from the `build_compactor_config`
+    ///   call (pass `None`): the 12345 assertion fails against the 256 MiB
+    ///   default.
+    /// - Same for `max_l1_part_bytes` (67890) and `input_read_concurrency` (7).
+    /// - Revert `merge_memory_tracker` to `None` in `build_compactor_config`:
+    ///   the `is_some()` assertion fails.
+    #[test]
+    fn compact_tenant_memory_knobs_reach_the_built_config() {
+        let cli = Cli::try_parse_from([
+            "ravel",
+            "maintain",
+            "compact-tenant",
+            "--tenant",
+            "acme",
+            "--signal",
+            "logs",
+            "--l1-part-memory-target-bytes",
+            "12345",
+            "--max-l1-part-bytes",
+            "67890",
+            "--input-read-concurrency",
+            "7",
+        ])
+        .expect("a compact-tenant invocation with the memory knobs parses");
+
+        let (dry_run, max_flush, mem_target, max_bytes, concurrency) = compact_tenant_knobs(cli);
+
+        let config = maintain::build_compactor_config(
+            dry_run,
+            max_flush,
+            mem_target,
+            max_bytes,
+            concurrency,
+        )
+        .expect("nonzero knobs build a config");
+
+        assert_eq!(
+            config.l1_part_memory_target_bytes, 12345,
+            "--l1-part-memory-target-bytes must arrive in the config"
+        );
+        assert_eq!(
+            config.max_l1_part_bytes, 67890,
+            "--max-l1-part-bytes must arrive in the config"
+        );
+        assert_eq!(
+            config.input_read_concurrency, 7,
+            "--input-read-concurrency must arrive in the config"
+        );
+        assert!(
+            config.merge_memory_tracker.is_some(),
+            "a fresh MergeMemoryTracker must be installed so the phase-split event fires"
+        );
+    }
+
+    /// A zero part-split byte target is refused with its typed error, per each
+    /// field's own doc (the byte budget a part is closed at; zero closes a part
+    /// before anything accumulates).
+    ///
+    /// Non-vacuity (prove-the-test), each flip named:
+    /// - Remove the `if bytes == 0 { return Err(...) }` guard for
+    ///   `l1_part_memory_target_bytes` in `build_compactor_config`: this
+    ///   `ZeroL1PartMemoryTarget` assertion fails (it builds `Ok`).
+    /// - Remove the matching guard for `max_l1_part_bytes`: the
+    ///   `ZeroMaxL1PartBytes` assertion fails.
+    #[test]
+    fn compact_tenant_zero_byte_targets_are_refused() {
+        assert_eq!(
+            maintain::build_compactor_config(false, None, Some(0), None, None)
+                .expect_err("--l1-part-memory-target-bytes 0 must be refused"),
+            CompactorKnobError::ZeroL1PartMemoryTarget,
+        );
+        assert_eq!(
+            maintain::build_compactor_config(false, None, None, Some(0), None)
+                .expect_err("--max-l1-part-bytes 0 must be refused"),
+            CompactorKnobError::ZeroMaxL1PartBytes,
+        );
+    }
+
+    /// `--input-read-concurrency 0` is NOT refused: its config-field doc states
+    /// "Values below 1 are treated as 1," so the CLI passes zero through rather
+    /// than enforcing more than the doc states (the merge itself clamps with
+    /// `.max(1)`). This pins that deliberate asymmetry with the byte targets.
+    ///
+    /// Non-vacuity (prove-the-test): add an `input_read_concurrency == 0` guard
+    /// to `build_compactor_config` returning an error, and this `Ok` assertion
+    /// fails.
+    #[test]
+    fn compact_tenant_zero_input_read_concurrency_is_allowed() {
+        let config = maintain::build_compactor_config(false, None, None, None, Some(0))
+            .expect("zero input-read-concurrency is tolerated, not refused");
+        assert_eq!(
+            config.input_read_concurrency, 0,
+            "zero passes through unchanged; the merge clamps below-1 to 1 itself"
         );
     }
 

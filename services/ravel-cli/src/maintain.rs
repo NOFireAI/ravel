@@ -12,8 +12,8 @@ use prost::Message;
 use ravel_commit::keys;
 use ravel_maintain::{
     Bucket, CompactionOutcome, CompactorConfig, FamilyMigrateReport, FixedClock, LegalHoldCheck,
-    MigrateBudget, PublishOutcome, SweepReport, Verification, compact_bucket, migrate_family,
-    sweep_shard,
+    MergeMemoryTracker, MigrateBudget, PublishOutcome, SweepReport, Verification, compact_bucket,
+    migrate_family, sweep_shard,
 };
 use ravel_object_store::conformance::NoncurrentVersionSource;
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError, list_all};
@@ -47,19 +47,78 @@ fn wall_clock() -> anyhow::Result<FixedClock> {
     Ok(FixedClock::new(crate::now_ns()?))
 }
 
+/// An operator override of a memory-relevant compactor knob was rejected. Typed
+/// so the message names the flag and why zero is refused, rather than surfacing
+/// as a downstream merge misbehaviour. Only the two part-split byte targets
+/// carry a floor here: their config-field docs
+/// ([`CompactorConfig::l1_part_memory_target_bytes`],
+/// [`CompactorConfig::max_l1_part_bytes`]) frame each as the byte budget an
+/// in-progress part is *closed at*, which zero cannot express (a part would be
+/// closed before any record accumulates). `input_read_concurrency` is
+/// deliberately absent: its own field doc states "Values below 1 are treated as
+/// 1," so the CLI passes a zero through unchanged rather than enforcing more
+/// than that doc states.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum CompactorKnobError {
+    #[error(
+        "--l1-part-memory-target-bytes must be greater than 0: it is the decoded record-heap \
+         budget an in-progress L1 part is closed at, and 0 would close a part before any record \
+         is buffered"
+    )]
+    ZeroL1PartMemoryTarget,
+    #[error(
+        "--max-l1-part-bytes must be greater than 0: it is the encoded/on-object byte budget an \
+         in-progress L1 part is closed at, and 0 would close a part before any bytes are written"
+    )]
+    ZeroMaxL1PartBytes,
+}
+
 /// The compactor config a `compact-bucket` / `compact-tenant` invocation runs
-/// with: defaults, plus the dry-run switch and the optional operator override
-/// of `max_flush_lifetime_ns` (which moves the seal margin, see
-/// [`crate::parse_max_flush_lifetime_ns`]).
-fn compactor_config(dry_run: bool, max_flush_lifetime_ns: Option<i64>) -> CompactorConfig {
+/// with: defaults, plus the dry-run switch and the optional operator overrides.
+///
+/// A FRESH [`MergeMemoryTracker`] is installed on every call, so the per-phase
+/// peak-memory event `ravel_maintain::rewrite_and_publish` emits fires for each
+/// bucket this invocation compacts (the tracker's `reset_for_run` runs at each
+/// bucket's start, so one tracker per CLI invocation reports each bucket's own
+/// peaks; never a shared static). `max_flush_lifetime_ns` moves the seal margin
+/// (see [`crate::parse_max_flush_lifetime_ns`]); the three part-split /
+/// concurrency knobs each replace their config default when given.
+///
+/// The two byte-target overrides are validated: zero is refused with a typed
+/// [`CompactorKnobError`] because each field's own doc frames it as the byte
+/// budget a part is closed at. `input_read_concurrency` is not floored here:
+/// its field doc already states below-1 is treated as 1.
+pub fn build_compactor_config(
+    dry_run: bool,
+    max_flush_lifetime_ns: Option<i64>,
+    l1_part_memory_target_bytes: Option<u64>,
+    max_l1_part_bytes: Option<u64>,
+    input_read_concurrency: Option<usize>,
+) -> Result<CompactorConfig, CompactorKnobError> {
     let mut config = CompactorConfig {
         dry_run,
+        merge_memory_tracker: Some(MergeMemoryTracker::new()),
         ..CompactorConfig::default()
     };
     if let Some(ns) = max_flush_lifetime_ns {
         config.max_flush_lifetime_ns = ns;
     }
-    config
+    if let Some(bytes) = l1_part_memory_target_bytes {
+        if bytes == 0 {
+            return Err(CompactorKnobError::ZeroL1PartMemoryTarget);
+        }
+        config.l1_part_memory_target_bytes = bytes;
+    }
+    if let Some(bytes) = max_l1_part_bytes {
+        if bytes == 0 {
+            return Err(CompactorKnobError::ZeroMaxL1PartBytes);
+        }
+        config.max_l1_part_bytes = bytes;
+    }
+    if let Some(n) = input_read_concurrency {
+        config.input_read_concurrency = n;
+    }
+    Ok(config)
 }
 
 /// `maintain compact-bucket`: run one compaction pass over a single bucket.
@@ -74,7 +133,7 @@ pub async fn compact(
 ) -> anyhow::Result<()> {
     let tenant_hash = TenantId::new(tenant).hash();
     let bucket = Bucket::new(tenant_hash, signal.to_signal(), shard, hour);
-    let config = compactor_config(dry_run, max_flush_lifetime_ns);
+    let config = build_compactor_config(dry_run, max_flush_lifetime_ns, None, None, None)?;
     let clock = wall_clock()?;
 
     let outcome = compact_bucket(store.as_ref(), &clock, &config, &bucket)
@@ -263,6 +322,9 @@ pub async fn compact_tenant(
     to_hour: Option<u32>,
     dry_run: bool,
     max_flush_lifetime_ns: Option<i64>,
+    l1_part_memory_target_bytes: Option<u64>,
+    max_l1_part_bytes: Option<u64>,
+    input_read_concurrency: Option<usize>,
     now_ns: i64,
 ) -> anyhow::Result<CompactTenantReport> {
     let started = std::time::Instant::now();
@@ -275,7 +337,13 @@ pub async fn compact_tenant(
     let last_hour = to_hour.unwrap_or(now_hour);
     let first_hour = from_hour.unwrap_or(0);
 
-    let config = compactor_config(dry_run, max_flush_lifetime_ns);
+    let config = build_compactor_config(
+        dry_run,
+        max_flush_lifetime_ns,
+        l1_part_memory_target_bytes,
+        max_l1_part_bytes,
+        input_read_concurrency,
+    )?;
     let clock = FixedClock::new(now_ns);
     let mut report = CompactTenantReport {
         shards: shard_count,
@@ -287,6 +355,12 @@ pub async fn compact_tenant(
     println!("shards: {shard_count}");
     println!("hour_range: [{first_hour}, {last_hour}]");
     println!("max_flush_lifetime_ns: {}", config.max_flush_lifetime_ns);
+    println!(
+        "l1_part_memory_target_bytes: {}",
+        config.l1_part_memory_target_bytes
+    );
+    println!("max_l1_part_bytes: {}", config.max_l1_part_bytes);
+    println!("input_read_concurrency: {}", config.input_read_concurrency);
     println!("dry_run: {dry_run}");
 
     for shard in 0..shard_count {
