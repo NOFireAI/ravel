@@ -13,6 +13,37 @@ enum Signal {
   SIGNAL_AUDIT = 6;
 }
 
+// The min or max of one declared column's non-null values in one object
+// (ADR-0873 decision 1). Restricted to the stamp-eligible declared types
+// (decision 2: {I64, BOOL}); a new eligible type adds a oneof arm,
+// additively. An empty oneof (no arm set) is a malformed value: decoders drop
+// the whole entry and count it on the defect metric, never trust it.
+message DeclaredColumnStatValue {
+  oneof kind {
+    sint64 i64 = 1;
+    bool b = 2;
+  }
+}
+
+// Exact whole-object min/max (and null count) for one declared typed
+// attribute column (ADR-0090), computed by the writer that encoded the
+// object (ADR-0873 decision 1). min/max are message-typed for presence: both
+// absent means the column had zero non-null values in this object, which is
+// still an exact statement. An entry is only ever written for a column that
+// resolved to a real FIELD_DIR column covering the whole object (the ADR-0850
+// attrs_raw rule); a column that overflowed gets no entry, never an entry
+// with a guess.
+message DeclaredColumnMinMax {
+  string name = 1;
+  uint32 declared_type = 2;  // ravel.sys.v1.TypedAttrColumnType as i32
+  DeclaredColumnStatValue min = 3;
+  DeclaredColumnStatValue max = 4;
+  // Rows in this object where the declared column reads NULL (name absent, or
+  // the stored variant mismatches declared_type). non_null = the record's row
+  // count minus this.
+  uint64 null_count = 5;
+}
+
 message CommitRecord {
   uint32 format_version = 1;  // = 1
   bytes tenant_hash = 2;      // 16 bytes
@@ -35,6 +66,12 @@ message CommitRecord {
   // Pinned at flush open (unix hours); names the commit key's hour bucket.
   // Never recomputed on retry (ADR-0010).
   uint32 ingest_hour_bucket = 19;
+  // Per-declared-column exact min/max/null-count for this object (ADR-0873
+  // decision 1). Additive, no format_version bump: an absent field is a
+  // permanently legal state (a pre-stamp record, or a signal that never
+  // stamps), read by the same reader as a present one. Only stamp-eligible
+  // declared types ({I64, BOOL}) ever appear here (decision 2).
+  repeated DeclaredColumnMinMax declared_column_stats = 20;
 }
 
 // One input segment identity folded into a CompactionRecord's input list
@@ -59,6 +96,14 @@ message CompactionPart {
   sfixed64 min_event_ts_ns = 9;
   sfixed64 max_event_ts_ns = 10;
   uint32 segment_format_version = 11;  // = 3
+  // Per-declared-column exact min/max/null-count for this output part
+  // (ADR-0873 decision 1), recomputed over the rows this part writes and
+  // never copied from an input stamp. Additive; RewriteRecord.parts and
+  // CompactionRecord.parts both carry CompactionPart, so erasure-rewrite
+  // outputs get the field with no further wire change. ADR-0815 plans other
+  // additive per-part fields on this message; field 12 is claimed here on a
+  // first-to-land basis (ADR-0873 decision 1).
+  repeated DeclaredColumnMinMax declared_column_stats = 12;
 }
 
 // L0 to L1 compaction record (ADR-0018). Additive; lives in the same key

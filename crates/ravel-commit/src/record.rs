@@ -97,6 +97,9 @@ pub fn build(input: NewCommitRecord) -> Result<CommitRecord, RecordError> {
         segment_format_version: input.segment_format_version,
         created_unix_ns: input.created_unix_ns,
         ingest_hour_bucket: input.ingest_hour_bucket,
+        // Stamped by the ingest flush path in a later ADR-0873 wave; a built
+        // record carries none, which is the permanently legal absent state.
+        declared_column_stats: Vec::new(),
     };
     validate(&record)?;
     Ok(record)
@@ -222,6 +225,66 @@ mod tests {
         let bytes = encode(&record);
         let decoded = decode(&bytes).expect("decode");
         assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn declared_column_stats_ride_commit_record_encode_decode() {
+        use crate::declared_stats::{DeclaredColumnStat, StatValue, decode_stats};
+        use ravel_proto::sys::v1::TypedAttrColumnType;
+
+        let mut record = build(base_input()).expect("valid record");
+        let stat = DeclaredColumnStat::stamp(
+            "EventDate",
+            TypedAttrColumnType::I64 as i32,
+            Some(StatValue::I64(-3)),
+            Some(StatValue::I64(99)),
+            5,
+        )
+        .expect("eligible I64 stamp");
+        record.declared_column_stats = vec![stat.to_proto()];
+
+        let bytes = encode(&record);
+        let decoded = decode(&bytes).expect("decode");
+        assert_eq!(decoded, record);
+
+        let stats = decode_stats(&decoded.declared_column_stats);
+        assert_eq!(stats.dropped, 0);
+        assert_eq!(stats.stats.len(), 1);
+        assert_eq!(stats.stats[0], stat);
+    }
+
+    #[test]
+    fn absent_declared_column_stats_decode_as_absent_not_zero() {
+        use crate::declared_stats::decode_stats;
+
+        // A record built without ever touching the field: the wire carries no
+        // field-20 bytes, and it decodes to an empty list. Absent (no entry at
+        // all) is a different state from "present but a zero-valued entry".
+        let record = build(base_input()).expect("valid record");
+        assert!(
+            record.declared_column_stats.is_empty(),
+            "built record leaves the field absent"
+        );
+        let bytes = encode(&record);
+        let decoded = decode(&bytes).expect("decode");
+        assert!(
+            decoded.declared_column_stats.is_empty(),
+            "absent field decodes as absent, not as a present zero entry"
+        );
+        let stats = decode_stats(&decoded.declared_column_stats);
+        assert_eq!(stats.dropped, 0);
+        assert!(stats.stats.is_empty());
+    }
+
+    #[test]
+    fn truncated_commit_record_bytes_are_a_typed_error_not_a_panic() {
+        let record = build(base_input()).expect("valid record");
+        let bytes = encode(&record);
+        // Chop the buffer mid-message: prost must return a typed decode error,
+        // never panic and never a wrong record.
+        let truncated = &bytes[..bytes.len() / 2];
+        let err = decode(truncated).expect_err("truncated bytes must not decode");
+        assert!(matches!(err, RecordError::Decode(_)));
     }
 
     #[test]
