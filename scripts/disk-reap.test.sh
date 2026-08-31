@@ -245,6 +245,34 @@ else
   printf '%s\n' "$out8" | sed 's/^/    /'
 fi
 
+# Orphaned cargo target dirs: an idle one is reaped, a fresh one is not.
+# The age rule matters as much as the pattern -- reaping a target dir a live
+# build is still writing to would destroy that build's cache mid-run, which is
+# why the script requires 2 hours of idleness.
+base9="$(new_repo case9)"
+old_target="$base9/scratch/wt-stale-target"
+new_target="$base9/scratch/wt-fresh-target"
+mkdir -p "$old_target" "$new_target"
+echo stale >"$old_target/blob"
+echo fresh >"$new_target/blob"
+# Backdate the stale one well past the 120-minute floor. touch -t is the form
+# both GNU and BSD touch accept.
+touch -t 202001010000 "$old_target/blob" "$old_target"
+
+out9="$(run_reap "$base9")"
+if [ ! -d "$old_target" ]; then
+  pass "idle orphaned target dir is reaped"
+else
+  fail "idle orphaned target dir is reaped" "stale target dir survived"
+  printf '%s\n' "$out9" | sed 's/^/    /'
+fi
+if [ -d "$new_target" ]; then
+  pass "recently-touched target dir is left alone"
+else
+  fail "recently-touched target dir is left alone" "fresh target dir was deleted"
+  printf '%s\n' "$out9" | sed 's/^/    /'
+fi
+
 echo
 if [ "$fails" != 0 ]; then
   echo "$fails failing case(s)"
