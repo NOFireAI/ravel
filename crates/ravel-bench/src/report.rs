@@ -180,46 +180,162 @@ pub struct LatencyReport {
 /// Object-store request counts for the whole workload, by operation kind --
 /// the number the S3 cost model is built from.
 ///
-/// `put`/`get`/`list` are real call counts on any backend. `backend_bills_
-/// requests` states whether this backend charges for them: `false` on
-/// `MemoryStore` (the counts are real but free), `true` on S3. This is the
-/// explicit representation of "not a billable measurement on this backend",
-/// used instead of a misleading zero -- a `MemoryStore` run still reports the
-/// true call counts, it just marks them non-billable.
+/// Two figures per op, both read from the SAME [`StoreMetricsSnapshot`]:
+///
+/// - `put`/`get`/`list` are completed *call* counts (one per logical
+///   operation the workload issued), real on any backend.
+/// - `put_attempts`/`get_attempts`/`list_attempts` are billed *HTTP attempts*
+///   (issue #928, ADR-0927 decision 8): retries and range fan-out included, so
+///   one logical GET that retried nine times bills ten attempts. This is the
+///   figure S3 charges on, and the headline request number the ledger reads
+///   (ADR-0996 decision 3).
+///
+/// `calls` stays beside `attempts` as the diagnostic: the reconciliation
+/// `calls <= attempts` holds per op on a backend that records attempts, and
+/// `attempts - calls` (the `*_retry_overhead` fields) is the retry (billed)
+/// overhead a call count alone hides. A non-HTTP backend ([`MemoryStore`] via
+/// `run`) records no attempts, leaving the attempt figures at zero; that is
+/// honest, not a billing measurement, and `backend_bills_requests` marks it.
+///
+/// `backend_bills_requests` states whether this backend charges for requests:
+/// `false` on `MemoryStore` (the counts are real but free), `true` on S3. This
+/// is the explicit representation of "not a billable measurement on this
+/// backend", used instead of a misleading zero.
+///
+/// [`MemoryStore`]: ravel_object_store::memory::MemoryStore
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RequestCounts {
     pub backend_bills_requests: bool,
+    /// Completed PUT calls (one per logical PUT).
     pub put: u64,
+    /// Completed GET calls (one per logical GET).
     pub get: u64,
+    /// Completed LIST-family calls: paged `list` plus `list_delimited`, which
+    /// S3 bills as one LIST each.
     pub list: u64,
+    /// Billed HTTP attempts for PUT: retries and multipart part requests
+    /// included, per ADR-0927 decision 8. `>= put` on a backend that records
+    /// attempts; zero on a non-HTTP backend.
+    pub put_attempts: u64,
+    /// Billed HTTP attempts for GET: retries and range fan-out included, per
+    /// ADR-0927 decision 8 (one logical GET split into N ranged requests, or
+    /// retried, bills N attempts). `>= get` on a backend that records attempts;
+    /// zero on a non-HTTP backend.
+    pub get_attempts: u64,
+    /// Billed HTTP attempts for the LIST family (`list` + `list_delimited`):
+    /// retries and continuation-page requests included, per ADR-0927 decision
+    /// 8. `>= list` on a backend that records attempts; zero on a non-HTTP
+    /// backend.
+    pub list_attempts: u64,
+    /// Retry (billed) overhead for PUT: `put_attempts - put`. The billed
+    /// requests a completed-call count hides (ADR-0996 decision 3).
+    pub put_retry_overhead: u64,
+    /// Retry (billed) overhead for GET: `get_attempts - get`.
+    pub get_retry_overhead: u64,
+    /// Retry (billed) overhead for the LIST family: `list_attempts - list`.
+    pub list_retry_overhead: u64,
 }
 
 impl RequestCounts {
     /// Build the request counts from an [`InstrumentedStore`] snapshot, pairing
     /// them with the caller-supplied billing flag.
     ///
-    /// The counts come from the store's own per-operation call counters (`put`
-    /// = every completed PUT, `get` = every completed GET, `list` = paged LIST
-    /// plus `list_delimited`, which S3 bills as one LIST each). Billing is not
-    /// something the counter knows -- a call count is identical on `MemoryStore`
-    /// and S3, only its price differs -- so `backend_bills_requests` is passed
-    /// in by whoever chose the backend, `false` for `MemoryStore` and `true`
-    /// for S3. Keeping the flag beside the true counts is the honest
-    /// representation of a non-billable measurement, not a misleading zero; see
-    /// the module docs.
+    /// Both figures per op come from one snapshot: the completed-call counters
+    /// (`put`/`get`, and `list` = paged LIST plus `list_delimited`) and the
+    /// billed-attempt counters beside them (`attempts` = every HTTP request the
+    /// op issued, retries and range fan-out included, ADR-0927 decision 8). The
+    /// LIST attempt figure sums `list` and `list_delimited` the same way the
+    /// call figure does, since S3 bills both as one LIST.
+    ///
+    /// Billing is not something the counter knows -- a call count is identical
+    /// on `MemoryStore` and S3, only its price differs -- so
+    /// `backend_bills_requests` is passed in by whoever chose the backend,
+    /// `false` for `MemoryStore` and `true` for S3.
+    ///
+    /// When `backend_bills_requests` is set the backend records attempts, so
+    /// the ADR-0996 decision-3 reconciliation `calls <= attempts` is asserted
+    /// per op here; a non-HTTP backend records no attempts and is skipped (its
+    /// attempt figures are legitimately zero, and `attempts - calls` saturates
+    /// to zero overhead rather than underflowing).
     fn from_metrics(snapshot: &StoreMetricsSnapshot, backend_bills_requests: bool) -> Self {
-        RequestCounts {
+        let put = snapshot.put.calls;
+        let get = snapshot.get.calls;
+        let list = snapshot.list_calls();
+        let put_attempts = snapshot.put.attempts;
+        let get_attempts = snapshot.get.attempts;
+        // LIST family: sum both blocks, mirroring `list_calls`.
+        let list_attempts = snapshot.list.attempts + snapshot.list_delimited.attempts;
+
+        let counts = RequestCounts {
             backend_bills_requests,
-            put: snapshot.put.calls,
-            get: snapshot.get.calls,
-            list: snapshot.list_calls(),
+            put,
+            get,
+            list,
+            put_attempts,
+            get_attempts,
+            list_attempts,
+            // Saturating so a non-HTTP backend (attempts == 0 < calls) renders
+            // zero overhead rather than underflowing; on a request-billing
+            // backend `attempts >= calls`, checked just below.
+            put_retry_overhead: put_attempts.saturating_sub(put),
+            get_retry_overhead: get_attempts.saturating_sub(get),
+            list_retry_overhead: list_attempts.saturating_sub(list),
+        };
+        if backend_bills_requests {
+            counts.assert_calls_le_attempts();
         }
+        counts
+    }
+
+    /// The ADR-0996 decision-3 reconciliation: billed `attempts` never
+    /// undercount completed `calls`, so `calls <= attempts` holds for every op
+    /// on a backend that records attempts (the wiring at
+    /// `instrument.rs:44-52`). Panics naming the first op that violates it.
+    /// Call only on a snapshot whose attempts are wired (a request-billing
+    /// backend, or a fixture that drove `StoreMetrics::record_attempt`); a
+    /// non-HTTP backend records no attempts and would fail this vacuously.
+    fn assert_calls_le_attempts(&self) {
+        assert!(
+            self.put <= self.put_attempts,
+            "reconciliation: put calls {} exceed billed attempts {}",
+            self.put,
+            self.put_attempts,
+        );
+        assert!(
+            self.get <= self.get_attempts,
+            "reconciliation: get calls {} exceed billed attempts {}",
+            self.get,
+            self.get_attempts,
+        );
+        assert!(
+            self.list <= self.list_attempts,
+            "reconciliation: list calls {} exceed billed attempts {}",
+            self.list,
+            self.list_attempts,
+        );
     }
 }
 
+/// Bytes moved over the object-store wire, by direction. Every figure names
+/// its byte kind and whether retries are included (ADR-0996 decision 3: a byte
+/// column is decoration without its kind, and two kinds are never summed).
+///
+/// Both are WIRE bytes as transferred, in the on-object (stored/compressed)
+/// form, counted at the completion decorator that sits ABOVE the S3 retry
+/// connector, so below-decorator HTTP retries are NOT included in either
+/// figure -- unlike the `*_attempts` request counts, which are. A retry moves
+/// bytes the object-store adapter re-reads; those are billed as an attempt but
+/// do not re-enter `written`/`read` here.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BytesSection {
+    /// PUT payload bytes as offered to the backend (wire, stored form). Every
+    /// logical PUT call is counted once, failures included, since the payload
+    /// was offered whether or not the backend accepted it. Retries not
+    /// included.
     pub written: u64,
+    /// GET bytes actually returned by completed calls (wire, stored form; a
+    /// ranged read counts the range, not the whole object). A failed GET adds
+    /// zero. Retries not included.
     pub read: u64,
 }
 
@@ -488,7 +604,7 @@ pub async fn run(config: &ReportRunConfig) -> BenchReport {
 mod tests {
     use bytes::Bytes;
     use ravel_object_store::memory::MemoryStore;
-    use ravel_object_store::{GetRange, PutOptions};
+    use ravel_object_store::{GetRange, PutOptions, StoreOp};
 
     use super::*;
 
@@ -530,6 +646,20 @@ mod tests {
         store.list("", None).await.expect("list");
         store.list_delimited("").await.expect("list_delimited");
 
+        // Fixture 1: attempts == calls, no retries. `MemoryStore` records no
+        // attempts on its own (it bills nothing), so drive
+        // `StoreMetrics::record_attempt` once per completed call -- exactly the
+        // shape the S3 counting connector produces when nothing retries or
+        // fans out: one billed HTTP request per logical op.
+        for _ in 0..3 {
+            metrics.record_attempt(StoreOp::Put);
+        }
+        for _ in 0..2 {
+            metrics.record_attempt(StoreOp::Get);
+        }
+        metrics.record_attempt(StoreOp::List);
+        metrics.record_attempt(StoreOp::ListDelimited);
+
         let snapshot = metrics.snapshot();
 
         // MemoryStore run: real counts, not billed.
@@ -555,9 +685,10 @@ mod tests {
         );
         assert_eq!(snapshot.get.bytes, 2 + 4, "bytes read = GET a + b");
 
-        // Request-billing backend: same counts, but now billed. Only the flag
-        // moves; the counts are identical because a call count does not depend
-        // on price.
+        // Request-billing backend: same call counts, but now billed and the
+        // reconciliation runs. Only the flag moves on the call figures; the
+        // attempt figures equal the calls exactly (no retries), so every retry
+        // overhead is exactly zero.
         let billed_counts = RequestCounts::from_metrics(&snapshot, true);
         assert!(
             billed_counts.backend_bills_requests,
@@ -575,6 +706,114 @@ mod tests {
             billed_counts.list, memory_counts.list,
             "counts are price-blind"
         );
+
+        // Attempts pinned exactly, and exactly equal to calls: no retries.
+        assert_eq!(billed_counts.put_attempts, 3, "exact PUT attempts");
+        assert_eq!(billed_counts.get_attempts, 2, "exact GET attempts");
+        assert_eq!(
+            billed_counts.list_attempts, 2,
+            "exact LIST attempts folds list + list_delimited"
+        );
+        assert_eq!(billed_counts.put_retry_overhead, 0, "no PUT retries");
+        assert_eq!(billed_counts.get_retry_overhead, 0, "no GET retries");
+        assert_eq!(billed_counts.list_retry_overhead, 0, "no LIST retries");
+    }
+
+    /// Fixture 2 (ADR-0996 decision 3): a snapshot where billed attempts exceed
+    /// completed calls, driving `StoreMetrics::record_attempt` to simulate
+    /// retries and range fan-out below the completion decorator. Both figures
+    /// are pinned exactly, and the retry overhead is `attempts - calls` to the
+    /// unit -- never `> 0`, which would pass against an off-by-a-multiple
+    /// accounting bug.
+    #[tokio::test]
+    async fn attempts_exceed_calls_pins_retry_overhead() {
+        let store = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+        let metrics = store.metrics();
+
+        // Two logical GETs, three logical PUTs, one paged LIST.
+        for (key, body) in [
+            ("a", &b"aa"[..]),
+            ("b", &b"bbbb"[..]),
+            ("c", &b"cccccc"[..]),
+        ] {
+            store
+                .put(key, Bytes::from_static(body), PutOptions::default())
+                .await
+                .expect("put");
+        }
+        for key in ["a", "b"] {
+            store.get(key, GetRange::Full).await.expect("get");
+        }
+        store.list("", None).await.expect("list");
+
+        // Billed attempts below the decorator: the first GET fanned out into 4
+        // ranged requests, the second retried once (2 attempts); one PUT
+        // retried twice (3 + 1 + 1 = 5 total across three PUTs); the LIST
+        // needed one continuation page (2 attempts).
+        for _ in 0..(4 + 2) {
+            metrics.record_attempt(StoreOp::Get);
+        }
+        for _ in 0..(3 + 2) {
+            metrics.record_attempt(StoreOp::Put);
+        }
+        for _ in 0..2 {
+            metrics.record_attempt(StoreOp::List);
+        }
+
+        let snapshot = metrics.snapshot();
+        let counts = RequestCounts::from_metrics(&snapshot, true);
+
+        // Calls: unchanged logical counts.
+        assert_eq!(counts.get, 2, "exact GET calls");
+        assert_eq!(counts.put, 3, "exact PUT calls");
+        assert_eq!(counts.list, 1, "exact LIST calls");
+
+        // Attempts: strictly above calls, pinned exactly.
+        assert_eq!(counts.get_attempts, 6, "exact GET attempts");
+        assert_eq!(counts.put_attempts, 5, "exact PUT attempts");
+        assert_eq!(counts.list_attempts, 2, "exact LIST attempts");
+
+        // Retry overhead = attempts - calls, exact.
+        assert_eq!(counts.get_retry_overhead, 4, "GET overhead = 6 - 2");
+        assert_eq!(counts.put_retry_overhead, 2, "PUT overhead = 5 - 3");
+        assert_eq!(counts.list_retry_overhead, 1, "LIST overhead = 2 - 1");
+    }
+
+    /// The reconciliation is a real assertion, not a comment: build a
+    /// `RequestCounts` with the operands swapped (calls above attempts, the
+    /// relation `calls <= attempts` inverted) and confirm the check panics.
+    /// A snapshot that genuinely satisfied `calls <= attempts` would pass this
+    /// same code, so the demonstration proves the guard fires.
+    #[test]
+    fn reconciliation_panics_when_calls_exceed_attempts() {
+        // calls > attempts on GET: attempts undercount calls, which the wiring
+        // (instrument.rs:44-52) forbids on a request-billing backend.
+        let swapped = RequestCounts {
+            backend_bills_requests: true,
+            put: 3,
+            get: 10,
+            list: 2,
+            put_attempts: 3,
+            get_attempts: 3,
+            list_attempts: 2,
+            put_retry_overhead: 0,
+            get_retry_overhead: 0,
+            list_retry_overhead: 0,
+        };
+        let panicked = std::panic::catch_unwind(|| swapped.assert_calls_le_attempts()).is_err();
+        assert!(
+            panicked,
+            "reconciliation must panic when calls exceed attempts"
+        );
+
+        // The un-swapped orientation (calls <= attempts) does not panic.
+        let ok = RequestCounts {
+            get: 3,
+            get_attempts: 10,
+            get_retry_overhead: 7,
+            ..swapped
+        };
+        ok.assert_calls_le_attempts();
     }
 
     fn memory_config() -> ReportRunConfig {
@@ -665,6 +904,27 @@ mod tests {
         assert!(report.s3_requests.put > 0, "PUT count must be > 0");
         assert!(report.s3_requests.get > 0, "GET count must be > 0");
         assert!(report.s3_requests.list > 0, "LIST count must be > 0");
+
+        // Attempts: MemoryStore is non-HTTP and records none, so every attempt
+        // figure is legitimately zero and every retry overhead saturates to
+        // zero. `backend_bills_requests == false` above is what marks these
+        // honest rather than a billing measurement; the reconciliation is
+        // skipped exactly because attempts are unwired here.
+        assert_eq!(
+            report.s3_requests.put_attempts, 0,
+            "MemoryStore records no PUT attempts"
+        );
+        assert_eq!(
+            report.s3_requests.get_attempts, 0,
+            "MemoryStore records no GET attempts"
+        );
+        assert_eq!(
+            report.s3_requests.list_attempts, 0,
+            "MemoryStore records no LIST attempts"
+        );
+        assert_eq!(report.s3_requests.put_retry_overhead, 0);
+        assert_eq!(report.s3_requests.get_retry_overhead, 0);
+        assert_eq!(report.s3_requests.list_retry_overhead, 0);
 
         // Bytes both directions.
         assert!(report.bytes.written > 0, "bytes written must be > 0");
