@@ -102,6 +102,13 @@ pub async fn rewrite_and_publish<C: SegmentCodec>(
     conservation: impl ConservationPredicate,
     start_ns: i64,
 ) -> Result<RewriteOutcome> {
+    // A new run's accounting starts from zero: a tracker left installed in a
+    // long-lived config would otherwise carry the previous bucket's peaks
+    // into this bucket's emission (serial reuse; concurrent sharing is the
+    // installer's contract to avoid).
+    if let Some(t) = config.merge_memory_tracker.as_ref() {
+        t.reset_for_run();
+    }
     let inputs = load_inputs(store, bucket, commit_keys, config.input_read_concurrency).await?;
     C::validate_rewrite_inputs(&inputs)?;
     let hash = input_set_hash(&inputs);

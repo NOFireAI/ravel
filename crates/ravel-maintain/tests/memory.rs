@@ -315,3 +315,34 @@ async fn retained_parts_are_attributed_to_their_own_phase() {
         peaks.publish_record_encoded_bytes,
     );
 }
+
+/// A tracker left installed across SERIAL runs reports each run's own peaks:
+/// `rewrite_and_publish` calls `reset_for_run` before any accounting, so the
+/// second bucket's figures are its own. Pinned here at the tracker level
+/// (accumulate, reset, accumulate less, read exactly the smaller figure);
+/// demonstrated failing by dropping the `reset_for_run` call, which reads
+/// 700, not 300.
+#[test]
+#[allow(clippy::expect_used)]
+fn reset_for_run_scopes_peaks_to_one_run() {
+    use ravel_maintain::MergeMemoryTracker;
+    let t = MergeMemoryTracker::new();
+    t.add_retained_part_bytes(700);
+    t.add_catalog_directory_bytes(50);
+    let first = t.phase_peaks();
+    assert_eq!(first.retained_part_encoded_bytes, 700);
+    assert_eq!(first.catalog_directory_decoded_bytes, 50);
+
+    t.reset_for_run();
+    let cleared = t.phase_peaks();
+    assert_eq!(cleared.retained_part_encoded_bytes, 0, "reset clears");
+    assert_eq!(cleared.catalog_directory_decoded_bytes, 0, "reset clears");
+
+    t.add_retained_part_bytes(300);
+    let second = t.phase_peaks();
+    assert_eq!(
+        second.retained_part_encoded_bytes, 300,
+        "the second run reports only its own bytes; without the reset this reads 700"
+    );
+    assert_eq!(second.catalog_directory_decoded_bytes, 0);
+}
