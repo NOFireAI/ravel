@@ -17,9 +17,10 @@ mod segment_admission;
 pub mod span_fetcher;
 
 pub use config::{
-    ByteLimit, DEFAULT_DEADLINE, DEFAULT_FETCH_CONCURRENCY, DEFAULT_MAX_SAMPLES,
-    DEFAULT_MAX_SEGMENTS, DEFAULT_MAX_SERIES, EngineConfig, REQUEST_BUDGET_FIXED_OVERHEAD,
-    RequestLimit, derive_max_s3_requests,
+    ByteLimit, DEFAULT_DEADLINE, DEFAULT_FETCH_CONCURRENCY, DEFAULT_LOG_MAX_FETCH_RUN_BYTES,
+    DEFAULT_MAX_SAMPLES, DEFAULT_MAX_SEGMENTS, DEFAULT_MAX_SERIES, EngineConfig, EngineConfigError,
+    LogsFetchPolicy, REQUEST_BUDGET_FIXED_OVERHEAD, RequestLimit, ResolvedLogsFetch,
+    derive_max_s3_requests, resolve_logs_fetch,
 };
 pub use engine::{Coverage, QueryEngine, QueryStats, snapshot_erasure_predicates};
 pub use error::QueryError;
