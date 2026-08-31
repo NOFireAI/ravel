@@ -42,7 +42,11 @@ new_repo() { # new_repo <case-name>
 run_reap() { # run_reap <base> [script-override]
   local base="$1"
   local script="${2:-$SCRIPT}"
+  # BUILD_STATE is forwarded explicitly rather than inherited: a `VAR=x
+  # run_reap ...` prefix sets a shell variable in this function, not an
+  # exported one, so it would never reach the child bash running the script.
   DISK_REAP_REPO_ROOT="$base/repo" DISK_REAP_TMP_ROOTS="$base/scratch" \
+    DISK_REAP_BUILD_STATE="${BUILD_STATE:-}" \
     bash "$script" -y 2>&1
 }
 
@@ -259,7 +263,10 @@ echo fresh >"$new_target/blob"
 # both GNU and BSD touch accept.
 touch -t 202001010000 "$old_target/blob" "$old_target"
 
-out9="$(run_reap "$base9")"
+# Force the build probe idle. Without this the case is flaky by construction:
+# the scan is skipped entirely while any cargo or rustc is running, so on a
+# busy machine this would fail for a reason unrelated to the code under test.
+out9="$(BUILD_STATE=idle run_reap "$base9")"
 if [ ! -d "$old_target" ]; then
   pass "idle orphaned target dir is reaped"
 else
@@ -271,6 +278,23 @@ if [ -d "$new_target" ]; then
 else
   fail "recently-touched target dir is left alone" "fresh target dir was deleted"
   printf '%s\n' "$out9" | sed 's/^/    /'
+fi
+
+# While a build is running, the orphaned-target scan does not run at all, even
+# for a dir old enough to qualify. This is the branch that protects a live
+# cargo's cache from being deleted mid-run, so it is asserted, not assumed.
+base10="$(new_repo case10)"
+busy_target="$base10/scratch/wt-stale-target"
+mkdir -p "$busy_target"
+echo stale >"$busy_target/blob"
+touch -t 202001010000 "$busy_target/blob" "$busy_target"
+
+out10="$(BUILD_STATE=busy run_reap "$base10")"
+if [ -d "$busy_target" ] && case "$out10" in *"cargo or rustc is running"*) true ;; *) false ;; esac; then
+  pass "a running build stops the target scan"
+else
+  fail "a running build stops the target scan" "target dir removed or no skip line"
+  printf '%s\n' "$out10" | sed 's/^/    /'
 fi
 
 echo

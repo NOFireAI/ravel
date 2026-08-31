@@ -32,8 +32,11 @@
 # says why.
 #
 # Test hooks (used only by scripts/disk-reap.test.sh, never in normal runs):
-#   DISK_REAP_REPO_ROOT  operate on this repo instead of the script's own
-#   DISK_REAP_TMP_ROOTS  space-separated roots to scan for orphaned targets
+#   DISK_REAP_REPO_ROOT   operate on this repo instead of the script's own
+#   DISK_REAP_TMP_ROOTS   space-separated roots to scan for orphaned targets
+#   DISK_REAP_BUILD_STATE force the build-activity probe to `idle` or `busy`
+#                         so both branches of the orphaned-target scan are
+#                         testable; unset runs the real probe
 set -uo pipefail
 
 apply=0
@@ -228,8 +231,22 @@ while IFS=$'\t' read -r kind wt; do
   skipped_count=$((skipped_count + 1))
 done <"${cand_file}"
 
+# Whether a build is running. Reaping a target dir out from under a live
+# cargo would destroy that build's cache mid-run, so the scan is skipped
+# entirely while one is active. Wrapped in a function with a forced-state
+# override because otherwise neither branch is testable: on a busy machine the
+# scan never runs, and a test asserting a reap fails for a reason that has
+# nothing to do with the code under test.
+build_is_running() {
+  case "${DISK_REAP_BUILD_STATE:-}" in
+  idle) return 1 ;;
+  busy) return 0 ;;
+  *) pgrep -x cargo >/dev/null 2>&1 || pgrep -x rustc >/dev/null 2>&1 ;;
+  esac
+}
+
 echo "==> orphaned cargo target dirs"
-if pgrep -x cargo >/dev/null 2>&1 || pgrep -x rustc >/dev/null 2>&1; then
+if build_is_running; then
   echo "skip (cargo or rustc is running): target dirs left alone"
 else
   # Both patterns come from real incidents: land worktrees write
