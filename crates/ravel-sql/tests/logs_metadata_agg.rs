@@ -1372,6 +1372,174 @@ async fn a_missing_extremum_with_non_null_rows_declines_and_scans() {
     );
 }
 
+/// An I64 `ColumnStat` with no value dictionary: `non_null_count` non-null
+/// rows bracketed by `min`/`max`. Used to fabricate the two malformed shapes
+/// of #970, so the assertions turn on the presence rules alone and not on a
+/// dictionary the MIN/MAX path never reads.
+fn flat_i64_stat(
+    name: &str,
+    non_null_count: u64,
+    null_count: u64,
+    min: Option<i64>,
+    max: Option<i64>,
+) -> ColumnStat {
+    ColumnStat {
+        name: name.to_string(),
+        declared_type: 2,
+        non_null_count,
+        null_count,
+        min: min.map(i64_value),
+        max: max.map(i64_value),
+        dictionary_present: false,
+        dictionary: Vec::new(),
+        sum: None,
+    }
+}
+
+/// `(min, max)` from a two-column `SELECT MIN(col), MAX(col)` result; a
+/// component is `None` when that aggregate is SQL NULL.
+fn min_max_i64(batches: &[RecordBatch]) -> (Option<i64>, Option<i64>) {
+    for batch in batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let col = |i: usize| {
+            let arr = batch
+                .column(i)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("int64 aggregate");
+            if arr.is_null(0) {
+                None
+            } else {
+                Some(arr.value(0))
+            }
+        };
+        return (col(0), col(1));
+    }
+    (None, None)
+}
+
+/// Run `SELECT MIN(status), MAX(status) FROM logs` over `corpus`'s two real
+/// segments with `stats` injected, returning the plan text and the answer.
+async fn min_max_over(
+    corpus: &RealCorpus,
+    stats: Arc<LoadedColumnStats>,
+) -> (String, (Option<i64>, Option<i64>)) {
+    let snapshot = snapshot_of(vec![corpus.a.clone(), corpus.b.clone()], Vec::new());
+    let ctx = logs_session(provider(&corpus.store, snapshot, status_col(), Some(stats)))
+        .expect("session");
+    let plan = ctx
+        .sql("SELECT MIN(status), MAX(status) FROM logs")
+        .await
+        .expect("plan")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+    let shown = plan_str(&plan);
+    let batches = collect(Arc::clone(&plan), ctx.task_ctx())
+        .await
+        .expect("collect");
+    (shown, min_max_i64(&batches))
+}
+
+/// #970 defect 1: two `ColumnStat` entries under one name in a single segment.
+/// A duplicate name is malformed -- `decode_column_stats` refuses an object
+/// carrying one -- but the join had resolved it silently by collecting the
+/// column list into a by-name map, which keeps the LAST entry. So the answer
+/// was whichever duplicate happened to sit later in the list, reported with
+/// `Precision::Exact` and with the scan deleted by `AggregateStatistics`.
+///
+/// The test runs both orderings of the same pair of duplicates and requires
+/// the identical outcome from each, which is what makes it a test rather than
+/// a coincidence: a resolution that picks one entry cannot satisfy both runs.
+/// Pre-fix each ordering answered from the duplicate that sat second, so
+/// `MIN(status)` came back as 9 in the first ordering and 1 in the second,
+/// against a true minimum of 200 over the real corpus.
+///
+/// Prove-the-test: replace the poisoned-entry map build in
+/// `declared_min_max_all` with the previous
+/// `.map(|c| (c.name.as_str(), c)).collect()` and both orderings report
+/// `MIN(status)` from a duplicate (9, then 1) with no `LogsScanExec` in the
+/// plan; the plan assertion fails first.
+#[tokio::test]
+async fn duplicate_column_name_declines_in_either_order_and_scans() {
+    for (first, second) in [(1i64, 9i64), (9i64, 1i64)] {
+        let corpus = RealCorpus::build().await;
+        let bad_stats = loaded_stats(vec![
+            (
+                &corpus.a,
+                stats_segment(
+                    &corpus.a,
+                    vec![
+                        flat_i64_stat("status", 1, 0, Some(first), Some(first)),
+                        flat_i64_stat("status", 1, 0, Some(second), Some(second)),
+                    ],
+                ),
+            ),
+            (
+                &corpus.b,
+                stats_segment(&corpus.b, vec![stat_from_rows(SEG_B_ROWS)]),
+            ),
+        ]);
+
+        let (shown, answer) = min_max_over(&corpus, bad_stats).await;
+        assert!(
+            shown.contains("LogsScanExec") && !shown.contains("MetadataOnlyExec"),
+            "a duplicate column name must decline and fall back to a scan \
+             (order {first},{second}); plan was:\n{shown}"
+        );
+        assert_eq!(
+            answer,
+            (Some(200), Some(500)),
+            "the scan answers the true MIN/MAX over the real corpus, \
+             unaffected by either duplicate (order {first},{second})"
+        );
+    }
+}
+
+/// #970 defect 2, the mirror of the missing-extremum decline above: a column
+/// reporting `non_null_count == 0` while carrying `min`/`max`. Those extrema
+/// describe no live row, so trusting them contributes a value to a MIN/MAX
+/// whose true answer over that segment is NULL. The extrema here sit OUTSIDE
+/// the real corpus range (-1 and 999) precisely so a pre-fix answer cannot
+/// coincide with the correct one.
+///
+/// Prove-the-test: delete the `stat.non_null_count == 0 && (min.is_some() ||
+/// max.is_some())` decline (the `validate_min_max_presence` call) in
+/// `declared_min_max_all` and the plan loses its `LogsScanExec` while the
+/// answer becomes `(-1, 999)`; both assertions fail.
+#[tokio::test]
+async fn all_null_column_carrying_extrema_declines_and_scans() {
+    let corpus = RealCorpus::build().await;
+    let bad_stats = loaded_stats(vec![
+        (
+            &corpus.a,
+            stats_segment(
+                &corpus.a,
+                // All six of segment A's rows NULL, yet extrema recorded.
+                vec![flat_i64_stat("status", 0, 6, Some(-1), Some(999))],
+            ),
+        ),
+        (
+            &corpus.b,
+            stats_segment(&corpus.b, vec![stat_from_rows(SEG_B_ROWS)]),
+        ),
+    ]);
+
+    let (shown, answer) = min_max_over(&corpus, bad_stats).await;
+    assert!(
+        shown.contains("LogsScanExec") && !shown.contains("MetadataOnlyExec"),
+        "an all-null column carrying extrema must decline and fall back to a scan; \
+         plan was:\n{shown}"
+    );
+    assert_eq!(
+        answer,
+        (Some(200), Some(500)),
+        "the scan answers the true MIN/MAX over the real corpus, not the fabricated extrema"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // q03/q04: SUM(<declared integer column> + k), and q30: AVG(<declared integer
 // column>) -- answered from the exact per-object integer sum (#861). Every

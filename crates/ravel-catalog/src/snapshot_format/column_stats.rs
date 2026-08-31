@@ -106,7 +106,22 @@ fn encode_column_stats_versioned(
     segments: &[ColumnStatsSegment],
 ) -> Result<Vec<u8>, SnapshotFormatError> {
     validate_segments(segments, version)?;
+    frame_column_stats(version, tenant_hash, signal, part_blake3, segments)
+}
 
+/// Envelope framing with NO validation: the byte layout only. Split out of
+/// [`encode_column_stats_versioned`] so a test can build a well-framed object
+/// carrying a record that `validate_segments` would refuse, which is the only
+/// way to reach `decode_column_stats`'s own validation call with hostile input
+/// (every public writer validates first, so an encoder-side test proves
+/// nothing about the decoder).
+fn frame_column_stats(
+    version: u8,
+    tenant_hash: [u8; 16],
+    signal: u32,
+    part_blake3: Vec<Vec<u8>>,
+    segments: &[ColumnStatsSegment],
+) -> Result<Vec<u8>, SnapshotFormatError> {
     let mut segments_raw = Vec::new();
     for segment in segments {
         segments_raw.extend_from_slice(&segment.encode_length_delimited_to_vec());
@@ -339,19 +354,7 @@ fn validate_column(column: &ColumnStat) -> Result<(), SnapshotFormatError> {
         });
     }
 
-    if column.non_null_count == 0 && (column.min.is_some() || column.max.is_some()) {
-        return Err(SnapshotFormatError::ColumnStatsUnexpectedMinMax {
-            name: column.name.clone(),
-        });
-    }
-    // The symmetric case: non-null rows must carry both extrema. A record with
-    // rows but no min/max cannot support a MIN/MAX answer, and a reader that
-    // trusted it would report the extremum of non-null data as exactly NULL.
-    if column.non_null_count > 0 && (column.min.is_none() || column.max.is_none()) {
-        return Err(SnapshotFormatError::ColumnStatsMissingMinMax {
-            name: column.name.clone(),
-        });
-    }
+    validate_min_max_presence(column)?;
     if let Some(min) = &column.min {
         check_value_kind(column, min, "min")?;
     }
@@ -450,6 +453,37 @@ fn validate_column(column: &ColumnStat) -> Result<(), SnapshotFormatError> {
         });
     }
 
+    Ok(())
+}
+
+/// The min/max presence clause of the column-statistics validity predicate:
+/// `min` and `max` are BOTH present when `non_null_count > 0` and BOTH absent
+/// when it is zero. Both directions are wrong answers on a path that reports
+/// `Precision::Exact`, in mirror-image ways:
+///
+/// - non-null rows with no recorded extremum makes the extremum of non-null
+///   data read as exactly NULL;
+/// - `non_null_count == 0` with extrema present describes no live row at all,
+///   so an all-NULL column contributes a value to a MIN/MAX the scan would
+///   answer NULL for.
+///
+/// Public because [`crate::LoadedColumnStats`] has public fields, so a reader
+/// can receive `ColumnStat` records from a carrier that never passed through
+/// [`decode_column_stats`] (an in-process construction, a cache, a test
+/// fixture). Such a reader enforces this clause by calling this function
+/// rather than restating it, so the decode boundary and the read site cannot
+/// drift into disagreeing about what a usable entry is.
+pub fn validate_min_max_presence(column: &ColumnStat) -> Result<(), SnapshotFormatError> {
+    if column.non_null_count == 0 && (column.min.is_some() || column.max.is_some()) {
+        return Err(SnapshotFormatError::ColumnStatsUnexpectedMinMax {
+            name: column.name.clone(),
+        });
+    }
+    if column.non_null_count > 0 && (column.min.is_none() || column.max.is_none()) {
+        return Err(SnapshotFormatError::ColumnStatsMissingMinMax {
+            name: column.name.clone(),
+        });
+    }
     Ok(())
 }
 
@@ -719,6 +753,81 @@ mod tests {
         assert_eq!(
             err,
             SnapshotFormatError::ColumnStatsUnexpectedMinMax {
+                name: "AdvEngineID".to_string(),
+            }
+        );
+    }
+
+    /// #970: the DECODER refuses a duplicate column name, not merely the
+    /// encoder. Every test above reaches `validate_columns` through
+    /// `encode_column_stats`, so none of them would fail if
+    /// `decode_column_stats` stopped calling `validate_segments` -- and it is
+    /// the decode path that faces bytes a reader did not write. Framed here
+    /// without validation so the malformed record is what decode actually
+    /// receives.
+    ///
+    /// Prove-the-test: delete the `validate_segments(&segments, version)?;`
+    /// call in `decode_column_stats` and this decode succeeds, so
+    /// `expect_err` panics.
+    #[test]
+    fn decode_refuses_duplicate_column_name_in_unvalidated_bytes() {
+        let mut seg = segment(1, 0, 1);
+        let dup = seg.columns[0].clone();
+        seg.columns.push(dup);
+        let bytes = frame_column_stats(1, [0x11; 16], 3, vec![], &[seg]).expect("frames");
+        let err =
+            decode_column_stats(&bytes, &ColumnStatsLimits::default()).expect_err("decode refuses");
+        assert_eq!(
+            err,
+            SnapshotFormatError::ColumnStatsDuplicateColumnName {
+                name: "AdvEngineID".to_string(),
+            }
+        );
+    }
+
+    /// #970, the mirror of the presence clause at the decode boundary: an
+    /// all-NULL column (`non_null_count == 0`) carrying extrema describes no
+    /// live row, and a reader that trusted it would report a value for a
+    /// MIN/MAX whose true answer is NULL.
+    ///
+    /// Prove-the-test: delete the `validate_segments(&segments, version)?;`
+    /// call in `decode_column_stats` and this decode succeeds.
+    #[test]
+    fn decode_refuses_min_max_with_zero_non_null_in_unvalidated_bytes() {
+        let mut seg = segment(1, 0, 1);
+        seg.columns[0].non_null_count = 0;
+        seg.columns[0].null_count = 10;
+        seg.columns[0].dictionary = vec![];
+        seg.columns[0].dictionary_present = false;
+        seg.columns[0].sum = None;
+        // min/max still populated: inconsistent with an all-null column.
+        let bytes = frame_column_stats(1, [0x11; 16], 3, vec![], &[seg]).expect("frames");
+        let err =
+            decode_column_stats(&bytes, &ColumnStatsLimits::default()).expect_err("decode refuses");
+        assert_eq!(
+            err,
+            SnapshotFormatError::ColumnStatsUnexpectedMinMax {
+                name: "AdvEngineID".to_string(),
+            }
+        );
+    }
+
+    /// The other direction of the same clause, also through decode: non-null
+    /// rows with no recorded extremum.
+    ///
+    /// Prove-the-test: delete the `validate_segments(&segments, version)?;`
+    /// call in `decode_column_stats` and this decode succeeds.
+    #[test]
+    fn decode_refuses_missing_min_max_with_non_null_rows_in_unvalidated_bytes() {
+        let mut seg = segment(1, 0, 1);
+        seg.columns[0].min = None;
+        seg.columns[0].max = None;
+        let bytes = frame_column_stats(1, [0x11; 16], 3, vec![], &[seg]).expect("frames");
+        let err =
+            decode_column_stats(&bytes, &ColumnStatsLimits::default()).expect_err("decode refuses");
+        assert_eq!(
+            err,
+            SnapshotFormatError::ColumnStatsMissingMinMax {
                 name: "AdvEngineID".to_string(),
             }
         );
