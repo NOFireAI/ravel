@@ -204,6 +204,14 @@ pub async fn publish_record_with_conservation(
 
     match store.put(&record_key, payload.into(), opts).await {
         Ok(_) => {
+            // The tombstone race is closed by verification, not retention
+            // (ADR-0979 decision 3): a part that answered `AlreadyExists` at PUT
+            // carries an abandoned run's age and could have been swept between
+            // our existence check and this record PUT. HEAD-verify exactly those
+            // parts now that the record is durable; a missing one fails loud with
+            // a re-runnable typed error rather than leaving the record pointing
+            // at a part the bounded compactor can no longer repair.
+            verify_already_existed_parts(store, parts).await?;
             tracing::info!(key = %record_key, parts = parts.len(), "compaction record published");
             Ok(PublishOutcome::Published)
         }
@@ -212,6 +220,34 @@ pub async fn publish_record_with_conservation(
         }
         Err(e) => Err(MaintainError::Store(e)),
     }
+}
+
+/// HEAD every part whose PUT answered `AlreadyExists` (ADR-0979 decision 3),
+/// after the compaction record that references them has been published. A
+/// fresh-PUT part is age-zero and unreachable by the unreferenced-part sweep
+/// for the run's whole duration, so it needs no check; an `AlreadyExists` part
+/// carries an abandoned run's `last_modified` and can be inside the sweep's age
+/// gate, so a tenant tombstone landing mid-run can delete it. If one is missing,
+/// the run failed to make the record whole and cannot repair from RAM (the
+/// bytes were released), so it fails loud with
+/// [`MaintainError::AlreadyExistsPartVanished`]; the re-run converges by
+/// re-PUTting the byte-identical part before the record resolves.
+async fn verify_already_existed_parts(
+    store: &dyn ObjectStoreBackend,
+    parts: &[BuiltPart],
+) -> Result<()> {
+    for part in parts.iter().filter(|p| p.put_already_existed) {
+        match store.head(&part.key).await {
+            Ok(_) => {}
+            Err(StoreError::NotFound) => {
+                return Err(MaintainError::AlreadyExistsPartVanished {
+                    part_key: part.key.clone(),
+                });
+            }
+            Err(e) => return Err(MaintainError::Store(e)),
+        }
+    }
+    Ok(())
 }
 
 /// Sum `sample_count`s in u64 with checked addition; an overflowing sum is
@@ -259,14 +295,31 @@ async fn resolve_already_exists(
         match store.head(&part_key).await {
             Ok(_) => {}
             Err(StoreError::NotFound) => {
-                if let Some(ours) = our_parts.iter().find(|p| p.key == part_key) {
-                    crate::build::put_part(store, ours).await?;
-                    repaired += 1;
-                } else {
-                    tracing::warn!(
-                        key = %part_key,
-                        "winner references a part this run did not build; cannot repair"
-                    );
+                // Re-PUT only a part whose bytes we still hold. A bounded
+                // compaction loser released its bytes at PUT (ADR-0979 decision
+                // 3, `bytes` is `None`), so it takes the cannot-repair arm; the
+                // record is still the truth and re-running the compaction from
+                // scratch rebuilds and re-PUTs the byte-identical part.
+                match our_parts.iter().find(|p| p.key == part_key) {
+                    Some(ours) if ours.bytes.is_some() => {
+                        crate::build::put_part(store, ours).await?;
+                        repaired += 1;
+                    }
+                    Some(_) => {
+                        tracing::warn!(
+                            key = %part_key,
+                            "winner references a part this run built but whose bytes were released \
+                             at PUT (bounded compaction); cannot repair from RAM. Re-run the \
+                             compaction to rebuild and re-PUT it"
+                        );
+                    }
+                    None => {
+                        tracing::warn!(
+                            key = %part_key,
+                            "winner references a part this run did not build; cannot repair. \
+                             Re-run the compaction to rebuild and re-PUT it"
+                        );
+                    }
                 }
             }
             Err(e) => return Err(MaintainError::Store(e)),
@@ -327,7 +380,8 @@ mod tests {
     fn part(index: u32, sample_count: u64) -> BuiltPart {
         BuiltPart {
             key: format!("part/{index}"),
-            bytes: bytes::Bytes::new(),
+            bytes: Some(bytes::Bytes::new()),
+            put_already_existed: false,
             part: CompactionPart {
                 part_index: index,
                 content_hash: vec![0u8; 32],

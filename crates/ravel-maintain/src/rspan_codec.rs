@@ -761,10 +761,15 @@ pub(crate) async fn finalize_part(
         segment_format_version: OUTPUT_FORMAT_VERSION,
         declared_column_stats: Vec::new(),
     };
+    // RSPAN keeps its current retention behaviour (ADR-0979 decision 3 wraps the
+    // bytes in `Some` mechanically; the bounded-memory fix for this codec is a
+    // follow-up, #982), so `put_already_existed` stays false and the bytes are
+    // never released here.
     let built = BuiltPart {
         key,
-        bytes: object,
+        bytes: Some(object),
         part,
+        put_already_existed: false,
     };
     if !dry_run {
         put_part(store, &built).await?;

@@ -289,6 +289,11 @@ impl SegmentCodec for RlogCodec {
             input_set_hash,
             indexed_fields,
             config.dry_run,
+            // Compaction releases each part's bytes at PUT (ADR-0979 decision 3):
+            // the retained-parts memory term goes to zero, and an `AlreadyExists`
+            // part is HEAD-verified after the record PUT instead of repaired from
+            // RAM.
+            false,
             &mut |_| Ok(true),
         )
         .await?;
@@ -447,6 +452,14 @@ pub(crate) struct MergeOutput {
 /// `dry_run` decides whether each part is PUT as it closes: compaction PUTs
 /// here, while the erasure rewrite defers every PUT to its own publish path,
 /// which writes parts only after its conservation gate passes.
+///
+/// `retain_bytes` decides whether each closed part keeps its encoded bytes
+/// resident until publish (ADR-0979 decision 3). Compaction passes `false` and
+/// releases them at PUT (the retained-parts memory term goes to zero); the
+/// erasure rewrite passes `true` because its deferred publish path is what PUTs
+/// them. When compaction's part PUT answers `AlreadyExists`, the returned
+/// [`BuiltPart::put_already_existed`] flags it for the caller's post-publish
+/// HEAD verification, since a dropped-bytes part cannot be repaired from RAM.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn merge_catalogs(
     store: &dyn ObjectStoreBackend,
@@ -456,6 +469,7 @@ pub(crate) async fn merge_catalogs(
     input_set_hash: &[u8; 32],
     indexed_fields: Vec<String>,
     dry_run: bool,
+    retain_bytes: bool,
     keep: &mut (dyn FnMut(&LogRecord) -> Result<bool> + Send),
 ) -> Result<MergeOutput> {
     // Global stream_ref remap + cross-object stream-identity check. The
@@ -500,6 +514,7 @@ pub(crate) async fn merge_catalogs(
         indexed_fields,
         tracker,
         dry_run,
+        retain_bytes,
         current: None,
         parts: Vec::new(),
         part_index: 0,
@@ -594,6 +609,12 @@ struct PartSink<'a> {
     /// writes them only after its conservation gate passes) while running with
     /// a config whose `dry_run` is false.
     dry_run: bool,
+    /// Whether each closed part keeps its encoded bytes resident until publish
+    /// (ADR-0979 decision 3). Compaction releases them at PUT (`false`), so the
+    /// retained-parts memory term is zero; the erasure rewrite keeps them
+    /// (`true`) because its own publish path PUTs them after its conservation
+    /// gate.
+    retain_bytes: bool,
     current: Option<PartBuilder>,
     parts: Vec<BuiltPart>,
     part_index: u32,
@@ -652,15 +673,21 @@ impl PartSink<'_> {
                     self.input_set_hash,
                     self.part_index,
                     self.dry_run,
+                    self.retain_bytes,
                 )
                 .await?;
-            let retained = built.bytes.len() as u64;
+            // Only bytes actually retained past PUT count toward the
+            // retained-parts term. On the compaction path (`retain_bytes =
+            // false`) `finalize_part` released them at PUT, so this is 0 and the
+            // term stays flat at zero (ADR-0979 decision 3); the erasure rewrite
+            // (`retain_bytes = true`) still charges each closed part's encoded
+            // size, unchanged.
+            let retained = built.bytes.as_ref().map_or(0, |b| b.len() as u64);
             self.parts.push(built);
             self.part_index += 1;
             if let Some(t) = self.tracker {
-                // The part is PUT but its encoded bytes stay resident in
-                // `self.parts` until publish. Charge the retained-parts term
-                // (encoded bytes) and clear the writer term (its decoded-heap
+                // Charge whatever encoded bytes remain resident in `self.parts`
+                // until publish, and clear the writer term (its decoded-heap
                 // records were handed to the writer and released on encode).
                 t.add_retained_part_bytes(retained);
                 t.set_writer_bytes(0);
@@ -760,6 +787,7 @@ impl PartBuilder {
 
     /// Encode and PUT the part through the shared writer pipeline. See
     /// [`finalize_part`] for the encode/summary/PUT detail this reuses.
+    #[allow(clippy::too_many_arguments)]
     async fn finish(
         self,
         store: &dyn ObjectStoreBackend,
@@ -767,6 +795,7 @@ impl PartBuilder {
         input_set_hash: &[u8; 32],
         part_index: u32,
         dry_run: bool,
+        retain_bytes: bool,
     ) -> Result<BuiltPart> {
         finalize_part(
             store,
@@ -777,6 +806,7 @@ impl PartBuilder {
             input_set_hash,
             part_index,
             dry_run,
+            retain_bytes,
         )
         .await
     }
@@ -1160,6 +1190,7 @@ pub(crate) async fn finalize_part(
     input_set_hash: &[u8; 32],
     part_index: u32,
     dry_run: bool,
+    retain_bytes: bool,
 ) -> Result<BuiltPart> {
     let (object, stats) =
         writer.finish_compacted_with_stats(1, input_set_hash.to_vec(), part_index)?;
@@ -1204,13 +1235,31 @@ pub(crate) async fn finalize_part(
         segment_format_version: OUTPUT_FORMAT_VERSION,
         declared_column_stats: Vec::new(),
     };
-    let built = BuiltPart {
+    let mut built = BuiltPart {
         key,
-        bytes: object,
+        bytes: Some(object),
         part,
+        put_already_existed: false,
     };
     if !dry_run {
-        put_part(store, &built).await?;
+        match put_part(store, &built).await? {
+            crate::build::PartPut::Created => {}
+            crate::build::PartPut::AlreadyExisted => built.put_already_existed = true,
+        }
+    }
+    // Release the encoded bytes unless the caller retains them for its own
+    // deferred publish path (ADR-0979 decision 3). Compaction passes
+    // `retain_bytes = false`: a fresh PUT's part is age-zero and unreachable by
+    // the unreferenced-part sweep, so its in-RAM copy was belt-and-braces, not a
+    // correctness dependency; an `AlreadyExists` part is instead HEAD-verified
+    // after the record PUT (its bytes are dropped here too, since retaining
+    // every such part on an abandoned-run retry would recreate the whole-output
+    // term this decision removes). Under `dry_run` nothing is ever PUT, so the
+    // drop happens at close. The erasure rewrite passes `retain_bytes = true`:
+    // it defers every PUT to its own post-conservation-gate publish path, so the
+    // bytes are the product itself.
+    if !retain_bytes {
+        built.bytes = None;
     }
     Ok(built)
 }

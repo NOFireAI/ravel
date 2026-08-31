@@ -63,8 +63,10 @@ use uuid::Uuid;
 /// - in-progress part writer ([`Self::peak_writer_bytes`]): the current part's
 ///   accumulated records, decoded heap.
 /// - retained closed parts ([`Self::add_retained_part_bytes`]): the encoded
-///   bytes of every part already PUT but still held until publish. This is the
-///   term the issue existed to expose; it was invisible before.
+///   bytes of every closed part still held resident until publish. Since
+///   ADR-0979 decision 3 the bounded RLOG compaction path releases each part's
+///   bytes at PUT, so this term is ZERO there; it is nonzero only for a path
+///   that defers its PUTs and keeps the bytes (the erasure rewrite).
 /// - finish and publish ([`Self::set_publish_record_bytes`]): the encoded
 ///   compaction-record payload, the only allocation the publish phase adds on
 ///   top of the retained parts.
@@ -109,9 +111,10 @@ struct MergeMemoryInner {
     /// `max_l1_part_bytes` (the stored-size target fired).
     stored_target_flushes: AtomicU64,
     /// Live sum of the encoded/on-object bytes of closed parts still retained in
-    /// [`crate::rlog::PartSink::parts`] (PUT already, not yet dropped).
-    /// Monotonic within a run: parts are held until publish, so this never
-    /// decrements before the run ends.
+    /// [`crate::rlog::PartSink::parts`] after PUT. Zero on the bounded RLOG
+    /// compaction path, which releases each part's bytes at PUT (ADR-0979
+    /// decision 3); nonzero and monotonic within a run only for a path that
+    /// keeps the bytes until its own deferred publish (the erasure rewrite).
     retained_parts: AtomicU64,
     /// High-water of `retained_parts`.
     peak_retained_parts: AtomicU64,
@@ -148,9 +151,11 @@ pub struct MergePhasePeaks {
     /// In-progress part writer: high-water of the current part builder's
     /// accumulated records. Decoded heap bytes.
     pub writer_heap_bytes: u64,
-    /// Retained closed parts: high-water of the encoded bytes of parts already
-    /// PUT but still held in [`crate::rlog::PartSink::parts`] until publish.
-    /// Encoded/on-object bytes. The term issue #977 made visible.
+    /// Retained closed parts: high-water of the encoded bytes of closed parts
+    /// still held in [`crate::rlog::PartSink::parts`] until publish.
+    /// Encoded/on-object bytes. Zero on the bounded compaction path, which
+    /// releases each part's bytes at PUT (ADR-0979 decision 3); nonzero only for
+    /// a deferred-PUT path that keeps them (the erasure rewrite).
     pub retained_part_encoded_bytes: u64,
     /// Finish and publish: the published compaction record's encoded protobuf
     /// payload, the only allocation the publish phase adds on top of the
@@ -207,13 +212,14 @@ impl MergeMemoryTracker {
         self.inner.peak_writer.fetch_max(writer, Ordering::Relaxed);
     }
 
-    /// Account `bytes` of encoded part bytes retained in
-    /// [`crate::rlog::PartSink::parts`] when a closed part is pushed there. The
-    /// part was already PUT; it stays resident until publish, so this is never
-    /// released within a run and its high-water is the retained-parts plateau a
-    /// large-bucket compaction sits at. Encoded/on-object bytes, not heap; it is
-    /// deliberately a separate term from the writer's decoded-heap bytes so a
-    /// report never folds the two together.
+    /// Account `bytes` of encoded part bytes still resident in
+    /// [`crate::rlog::PartSink::parts`] after a closed part is PUT. On the
+    /// bounded compaction path `bytes` is 0, because the part's bytes were
+    /// released at PUT (ADR-0979 decision 3), so this term stays flat at zero;
+    /// on a deferred-PUT path (the erasure rewrite) `bytes` is the part's encoded
+    /// size and the high-water is the retained-parts plateau. Encoded/on-object
+    /// bytes, not heap; it is deliberately a separate term from the writer's
+    /// decoded-heap bytes so a report never folds the two together.
     pub fn add_retained_part_bytes(&self, bytes: u64) {
         let updated = self
             .inner

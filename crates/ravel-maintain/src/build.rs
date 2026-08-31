@@ -106,11 +106,46 @@ pub const OUTPUT_FORMAT_VERSION: u32 = ravel_segment::SUPPORTED_VERSIONS.newest(
 
 /// One built (not yet published) L1 part: its content-addressed key, its
 /// bytes, and the [`CompactionPart`] describing it for the record.
+///
+/// `bytes` is `Option<Bytes>` (ADR-0979 decision 3): a caller that retains the
+/// encoded bytes for its own publish path (the erasure rewrite, and for now the
+/// RSEG/RSPAN codecs) carries `Some`; the bounded RLOG compaction path releases
+/// them the moment the part's PUT succeeds and carries `None`, so the
+/// retained-parts memory term goes to zero instead of scaling with the bucket's
+/// whole L1 output. A `None`-bytes part cannot be re-PUT by the convergence
+/// repair path, which is sound on the compaction path because every part is PUT
+/// (content-addressed) before the record is; see
+/// [`crate::publish::resolve_already_exists`].
+///
+/// `put_already_existed` records that this part's `CreateIfAbsent` PUT answered
+/// `AlreadyExists` (the content-addressed key was already present from an
+/// abandoned run). Such a part's stored `last_modified` is the abandoned run's,
+/// so it can be inside the unreferenced-part sweep's age gate and a racing
+/// tenant tombstone can delete it between our PUT and our record PUT. The
+/// bounded compaction path drops its bytes anyway (retaining them for every
+/// `AlreadyExists` part would recreate the whole-output term D3 exists to kill,
+/// in exactly the abandoned-run-retry case) and instead HEAD-verifies these
+/// parts after the record PUT succeeds
+/// ([`crate::publish::verify_already_existed_parts`]). The flag is only set on
+/// the bounded RLOG compaction path; every other constructor leaves it `false`.
 #[derive(Debug, Clone)]
 pub struct BuiltPart {
     pub key: String,
-    pub bytes: Bytes,
+    pub bytes: Option<Bytes>,
     pub part: CompactionPart,
+    pub put_already_existed: bool,
+}
+
+/// The outcome of a part's `CreateIfAbsent` PUT: whether it created the object
+/// or found the content-addressed key already present (an abandoned run's
+/// byte-identical part). [`put_part`] returns it so the bounded compaction path
+/// can flag an `AlreadyExists` part for post-publish HEAD verification (ADR-0979
+/// decision 3); most callers discard it (they retain bytes and repair from
+/// them, so the distinction does not change their behaviour).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartPut {
+    Created,
+    AlreadyExisted,
 }
 
 /// Merge all inputs into size-capped run-merged RSEG v7 parts. `catalogs` MUST
@@ -1078,26 +1113,40 @@ fn flush_part(
     };
     Ok(BuiltPart {
         key,
-        bytes: written.bytes,
+        bytes: Some(written.bytes),
         part,
+        put_already_existed: false,
     })
 }
 
 /// PUT one part `CreateIfAbsent`; `AlreadyExists` is idempotent success (the
 /// key embeds the content hash, so the stored bytes are identical by
-/// construction).
-pub async fn put_part(store: &dyn ObjectStoreBackend, part: &BuiltPart) -> Result<()> {
+/// construction). Returns [`PartPut`] naming which of the two happened, so the
+/// bounded compaction path can flag an `AlreadyExists` part for post-publish
+/// verification (ADR-0979 decision 3).
+///
+/// The part's bytes must still be present: this is only ever called at PUT
+/// time, before any release, so a `None` here is an internal invariant breach
+/// rather than a store fault.
+pub async fn put_part(store: &dyn ObjectStoreBackend, part: &BuiltPart) -> Result<PartPut> {
     use ravel_object_store::{PutOptions, StoreError, UploadChecksum};
-    let checksum = UploadChecksum::Crc32c(crc32c::crc32c(&part.bytes));
+    let bytes = part.bytes.as_ref().ok_or_else(|| {
+        MaintainError::Invariant(format!(
+            "put_part called on part {} whose bytes were already released",
+            part.key
+        ))
+    })?;
+    let checksum = UploadChecksum::Crc32c(crc32c::crc32c(bytes));
     match store
         .put(
             &part.key,
-            part.bytes.clone(),
+            bytes.clone(),
             PutOptions::create_if_absent().with_checksum(checksum),
         )
         .await
     {
-        Ok(_) | Err(StoreError::AlreadyExists) => Ok(()),
+        Ok(_) => Ok(PartPut::Created),
+        Err(StoreError::AlreadyExists) => Ok(PartPut::AlreadyExisted),
         Err(e) => Err(MaintainError::Store(e)),
     }
 }
