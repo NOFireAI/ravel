@@ -17,7 +17,9 @@
 mod common;
 
 use common::*;
-use ravel_maintain::{CompactionOutcome, CompactorConfig, FixedClock, compact_bucket};
+use ravel_maintain::{
+    CompactionOutcome, CompactorConfig, FixedClock, MergeMemoryTracker, compact_bucket,
+};
 use ravel_object_store::memory::MemoryStore;
 use uuid::Uuid;
 
@@ -189,4 +191,127 @@ async fn peak_memory_on_rlog_input_bucket() {
             println!("[memory:rlog] /proc/self/status unavailable; skipping RSS assertion");
         }
     }
+}
+
+/// Issue #977: the retained closed parts are attributed to their OWN phase term
+/// and are NOT folded into the writer term.
+///
+/// A logs compaction under a small stored-size target closes many L1 parts.
+/// Every closed part is PUT but its encoded bytes stay resident in
+/// `PartSink::parts` until publish; that retained residency is the plateau a
+/// large-bucket compaction sits at, and before this ticket it was invisible in
+/// the [`MergeMemoryTracker`]. This drives a compaction that closes at least
+/// three parts and asserts the tracker's retained-parts high-water equals the
+/// EXACT sum of those parts' encoded object sizes (read back from the published
+/// record's `object_size`, which `finalize_part` sets to the same bytes it
+/// retains). The value is derivable, so it is pinned exactly, not bounded.
+///
+/// Non-vacuity / flip proof: the retained bytes are charged at `rlog.rs`'s
+/// `PartSink::flush`, in the line `t.add_retained_part_bytes(retained);`.
+/// Deleting that line (attributing nothing to the retained phase, i.e. leaving
+/// the bytes accounted only through the writer term that `set_writer_bytes`
+/// drives) makes `peak_retained_part_bytes()` stay 0, and the exact-equality
+/// assertion below fails `0 != <sum>`. Rerouting it to `t.set_writer_bytes(
+/// retained)` (folding the retained bytes into the writer phase, the bug this
+/// test exists to catch) fails the same way. Verified failing both ways before
+/// restoring.
+#[tokio::test]
+async fn retained_parts_are_attributed_to_their_own_phase() {
+    const INPUTS: usize = 24;
+    const STREAMS: u32 = 4;
+    const RECORDS_PER_STREAM: usize = 4;
+
+    let store = MemoryStore::new();
+    // A body long enough that a handful of records exceeds the tiny stored-size
+    // target below, so the merge closes many parts rather than one.
+    let body: String = "log-line-".repeat(24);
+    for i in 0..INPUTS {
+        let mut records = Vec::new();
+        for s in 0..STREAMS {
+            for r in 0..RECORDS_PER_STREAM {
+                let ts = 1_000 + (i * RECORDS_PER_STREAM + r) as i64;
+                records.push(log_record(s, ts, &format!("{body}-{s}-{i}-{r}")));
+            }
+        }
+        seed_rlog_input(
+            &store,
+            Uuid::from_u128(i as u128 + 1),
+            1,
+            i as u64 + 1,
+            &records,
+        )
+        .await;
+    }
+
+    let tracker = MergeMemoryTracker::new();
+    let config = CompactorConfig {
+        // Small stored-size target so parts close often; this changes only where
+        // records split into parts, never their bytes.
+        max_l1_part_bytes: 2048,
+        merge_memory_tracker: Some(tracker.clone()),
+        ..CompactorConfig::default()
+    };
+    let clock = FixedClock::new(sealed_now_ns());
+    let bucket = logs_bucket();
+    let outcome = compact_bucket(&store, &clock, &config, &bucket)
+        .await
+        .expect("compact rlog bucket");
+    assert!(matches!(outcome, CompactionOutcome::Compacted { .. }));
+
+    let record = fetch_compaction_record(&store, &bucket).await;
+    assert!(
+        record.parts.len() >= 3,
+        "the small stored target must close at least three parts, got {}",
+        record.parts.len()
+    );
+
+    // The retained-parts phase term equals the exact encoded size of every part
+    // the merge held: each `object_size` is the byte length `finalize_part`
+    // retained in `PartSink::parts`, and every closed part is retained until
+    // publish, so the high-water is their sum.
+    let expected_retained: u64 = record.parts.iter().map(|p| p.object_size).sum();
+    assert_eq!(
+        tracker.peak_retained_part_bytes(),
+        expected_retained,
+        "retained-parts high-water must equal the exact sum of the parts' encoded sizes"
+    );
+
+    // The retained term is its own phase, not the writer term. The writer term
+    // is decoded Rust heap of one in-progress part at a time; the retained term
+    // is the encoded bytes of every closed part at once. Read them back from the
+    // phase split and confirm the split reports the retained sum under the
+    // retained field, and the writer field is a different (heap) quantity that
+    // does not carry the retained bytes.
+    let peaks = tracker.phase_peaks();
+    assert_eq!(
+        peaks.retained_part_encoded_bytes, expected_retained,
+        "phase_peaks must carry the retained sum in its retained field"
+    );
+    assert_ne!(
+        peaks.retained_part_encoded_bytes, peaks.writer_heap_bytes,
+        "retained (encoded, all parts) must not be folded into writer (heap, one part)"
+    );
+    // Sanity: the merge really exercised the other phases too.
+    assert!(
+        peaks.writer_heap_bytes > 0,
+        "the in-progress writer term must have been driven"
+    );
+    assert!(
+        peaks.catalog_directory_encoded_bytes > 0,
+        "the catalog-load term must have been driven"
+    );
+    assert!(
+        peaks.publish_record_encoded_bytes > 0,
+        "the finish/publish term must have been driven"
+    );
+    println!(
+        "[memory:rlog:977] parts={} retained_part_encoded_bytes={} writer_heap_bytes={} \
+         cursor_bytes={} catalog_directory_encoded_bytes={} publish_record_encoded_bytes={}",
+        record.parts.len(),
+        peaks.retained_part_encoded_bytes,
+        peaks.writer_heap_bytes,
+        peaks.cursor_bytes,
+        peaks.catalog_directory_encoded_bytes,
+        peaks.publish_record_encoded_bytes,
+    );
 }

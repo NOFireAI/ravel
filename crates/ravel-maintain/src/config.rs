@@ -28,7 +28,7 @@ use uuid::Uuid;
 /// would grow with its size and the recorded high-water would break the
 /// test's bound.
 ///
-/// Two high-water marks are kept:
+/// Two combined high-water marks are kept:
 ///
 /// - [`Self::peak_transient_bytes`]: `fetched + decoded`, the merge's *own*
 ///   decode-side buffers. This is the quantity these merges bound: at most
@@ -47,8 +47,40 @@ use uuid::Uuid;
 ///   also close a part earlier on the stored-size target `max_l1_part_bytes`
 ///   (issue #872), which only lowers this term.
 ///
+/// # Phase-attributed peaks (issue #977)
+///
+/// The two combined marks above pool bytes of different kinds (raw fetched,
+/// decoded heap, writer heap) into one figure and omit the two terms that
+/// actually dominate a large-bucket compaction: the closed parts retained in
+/// [`crate::rlog::PartSink`] and the per-input catalog directories. So the
+/// tracker also records a peak PER PHASE, read back as a [`MergePhasePeaks`]
+/// via [`Self::phase_peaks`], each field naming which bytes it counts:
+///
+/// - catalog load ([`Self::add_catalog_directory_bytes`]): encoded
+///   directory-section bytes retained per input.
+/// - merge and cursors ([`Self::peak_transient_bytes`]): the decode-side
+///   buffers above.
+/// - in-progress part writer ([`Self::peak_writer_bytes`]): the current part's
+///   accumulated records, decoded heap.
+/// - retained closed parts ([`Self::add_retained_part_bytes`]): the encoded
+///   bytes of every part already PUT but still held until publish. This is the
+///   term the issue existed to expose; it was invisible before.
+/// - finish and publish ([`Self::set_publish_record_bytes`]): the encoded
+///   compaction-record payload, the only allocation the publish phase adds on
+///   top of the retained parts.
+///
+/// Two fields of different byte kinds (encoded vs decoded heap) must never be
+/// summed (the repo measurement rule). The tracker is one PER COMPACTION RUN:
+/// the retained-parts and catalog terms accumulate and are not released within
+/// a run, so reusing one tracker across buckets would sum their peaks.
+///
 /// Production never installs one (`CompactorConfig::merge_memory_tracker` is
 /// `None`), so the hooks compile to a single `Option` check and add nothing.
+/// Wiring the service to install one (a one-line
+/// `merge_memory_tracker: Some(MergeMemoryTracker::new())` where it builds the
+/// [`CompactorConfig`]) is what surfaces [`Self::phase_peaks`] to an operator
+/// through the `tracing::info!` event `rewrite_and_publish` emits when a
+/// tracker is present.
 #[derive(Clone, Debug, Default)]
 pub struct MergeMemoryTracker {
     inner: Arc<MergeMemoryInner>,
@@ -72,6 +104,52 @@ struct MergeMemoryInner {
     /// Parts closed because the encoded-bytes estimate reached
     /// `max_l1_part_bytes` (the stored-size target fired).
     stored_target_flushes: AtomicU64,
+    /// Live sum of the encoded/on-object bytes of closed parts still retained in
+    /// [`crate::rlog::PartSink::parts`] (PUT already, not yet dropped).
+    /// Monotonic within a run: parts are held until publish, so this never
+    /// decrements before the run ends.
+    retained_parts: AtomicU64,
+    /// High-water of `retained_parts`.
+    peak_retained_parts: AtomicU64,
+    /// Live sum of encoded directory-section bytes (STREAM_DIR + FIELD_DIR +
+    /// SKIP_IDX + PAGE_DIR) retained per input during catalog load.
+    catalog_directory: AtomicU64,
+    /// High-water of `catalog_directory`.
+    peak_catalog_directory: AtomicU64,
+    /// High-water of the in-progress part writer term ALONE (decoded heap),
+    /// separate from `peak_total`, which pools it with the cursor terms.
+    peak_writer: AtomicU64,
+    /// High-water of the published compaction record's encoded protobuf payload.
+    peak_publish_record: AtomicU64,
+}
+
+/// A compaction merge's peak resident memory split by the phase that caused it
+/// (issue #977). Each field NAMES which bytes it counts; two fields of
+/// different byte kinds (encoded vs decoded heap) must never be summed (the
+/// repo measurement rule). Read from a [`MergeMemoryTracker`] via
+/// [`MergeMemoryTracker::phase_peaks`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MergePhasePeaks {
+    /// Input read / catalog load: high-water of the encoded directory-section
+    /// bytes (STREAM_DIR + FIELD_DIR + SKIP_IDX + PAGE_DIR) retained across all
+    /// inputs' catalogs. Encoded/on-object bytes.
+    pub catalog_directory_encoded_bytes: u64,
+    /// Merge and cursors: high-water of the k-way merge's own decode-side
+    /// buffers, one raw fetched unit plus one decoded block per input
+    /// (`fetched + decoded`, the existing [`MergeMemoryTracker::peak_transient_bytes`]).
+    /// Mixed raw-encoded plus decoded heap.
+    pub cursor_bytes: u64,
+    /// In-progress part writer: high-water of the current part builder's
+    /// accumulated records. Decoded heap bytes.
+    pub writer_heap_bytes: u64,
+    /// Retained closed parts: high-water of the encoded bytes of parts already
+    /// PUT but still held in [`crate::rlog::PartSink::parts`] until publish.
+    /// Encoded/on-object bytes. The term issue #977 made visible.
+    pub retained_part_encoded_bytes: u64,
+    /// Finish and publish: the published compaction record's encoded protobuf
+    /// payload, the only allocation the publish phase adds on top of the
+    /// retained parts. Encoded bytes.
+    pub publish_record_encoded_bytes: u64,
 }
 
 impl MergeMemoryTracker {
@@ -120,6 +198,49 @@ impl MergeMemoryTracker {
             .peak_transient
             .fetch_max(transient, Ordering::Relaxed);
         self.inner.peak_total.fetch_max(total, Ordering::Relaxed);
+        self.inner.peak_writer.fetch_max(writer, Ordering::Relaxed);
+    }
+
+    /// Account `bytes` of encoded part bytes retained in
+    /// [`crate::rlog::PartSink::parts`] when a closed part is pushed there. The
+    /// part was already PUT; it stays resident until publish, so this is never
+    /// released within a run and its high-water is the retained-parts plateau a
+    /// large-bucket compaction sits at. Encoded/on-object bytes, not heap; it is
+    /// deliberately a separate term from the writer's decoded-heap bytes so a
+    /// report never folds the two together.
+    pub fn add_retained_part_bytes(&self, bytes: u64) {
+        let updated = self
+            .inner
+            .retained_parts
+            .fetch_add(bytes, Ordering::Relaxed)
+            .saturating_add(bytes);
+        self.inner
+            .peak_retained_parts
+            .fetch_max(updated, Ordering::Relaxed);
+    }
+
+    /// Account `bytes` of encoded directory-section bytes (STREAM_DIR +
+    /// FIELD_DIR + SKIP_IDX + PAGE_DIR) retained for one input's catalog, called
+    /// once per input as its catalog is loaded. Accumulates across inputs and is
+    /// not released within a run.
+    pub fn add_catalog_directory_bytes(&self, bytes: u64) {
+        let updated = self
+            .inner
+            .catalog_directory
+            .fetch_add(bytes, Ordering::Relaxed)
+            .saturating_add(bytes);
+        self.inner
+            .peak_catalog_directory
+            .fetch_max(updated, Ordering::Relaxed);
+    }
+
+    /// Record the encoded protobuf payload size of the published compaction
+    /// record: the finish/publish phase's own allocation on top of the retained
+    /// parts. Encoded bytes.
+    pub fn set_publish_record_bytes(&self, bytes: u64) {
+        self.inner
+            .peak_publish_record
+            .fetch_max(bytes, Ordering::Relaxed);
     }
 
     /// High-water of the merge's decode-side buffers (`fetched + decoded`).
@@ -133,6 +254,41 @@ impl MergeMemoryTracker {
     /// in-progress part's writer buffer.
     pub fn peak_total_bytes(&self) -> u64 {
         self.inner.peak_total.load(Ordering::Relaxed)
+    }
+
+    /// High-water of the retained closed parts (encoded/on-object bytes held in
+    /// [`crate::rlog::PartSink::parts`] until publish).
+    pub fn peak_retained_part_bytes(&self) -> u64 {
+        self.inner.peak_retained_parts.load(Ordering::Relaxed)
+    }
+
+    /// High-water of the per-input catalog directory bytes (encoded STREAM_DIR +
+    /// FIELD_DIR + SKIP_IDX + PAGE_DIR, summed over the inputs held at once).
+    pub fn peak_catalog_directory_bytes(&self) -> u64 {
+        self.inner.peak_catalog_directory.load(Ordering::Relaxed)
+    }
+
+    /// High-water of the in-progress part writer term alone (decoded heap),
+    /// unmixed with the cursor terms that [`Self::peak_total_bytes`] pools in.
+    pub fn peak_writer_bytes(&self) -> u64 {
+        self.inner.peak_writer.load(Ordering::Relaxed)
+    }
+
+    /// High-water of the published compaction record's encoded payload bytes.
+    pub fn peak_publish_record_bytes(&self) -> u64 {
+        self.inner.peak_publish_record.load(Ordering::Relaxed)
+    }
+
+    /// The full phase split, each term naming its byte kind. See
+    /// [`MergePhasePeaks`]; do not sum fields of different kinds.
+    pub fn phase_peaks(&self) -> MergePhasePeaks {
+        MergePhasePeaks {
+            catalog_directory_encoded_bytes: self.peak_catalog_directory_bytes(),
+            cursor_bytes: self.peak_transient_bytes(),
+            writer_heap_bytes: self.peak_writer_bytes(),
+            retained_part_encoded_bytes: self.peak_retained_part_bytes(),
+            publish_record_encoded_bytes: self.peak_publish_record_bytes(),
+        }
     }
 
     /// Record that a part was closed by the memory split target (its decoded
