@@ -366,8 +366,9 @@ pub(crate) async fn load_catalog_from_object(
     };
     // Input read / catalog load phase (issue #977): the reader below retains a
     // decoded form of these directory sections for the whole merge. Charge the
-    // encoded section bytes as a per-input proxy; the block/bloom bytes are NOT
-    // held here (the merge streams them by range), so they are not charged.
+    // decoded section payload lengths (what `fetch_section` returns after
+    // decompression, the retained form); the block/bloom bytes are NOT held
+    // here (the merge streams them by range), so they are not charged.
     if let Some(t) = config.merge_memory_tracker.as_ref() {
         let dir_bytes = stream_dir_raw.len() as u64
             + field_dir_raw.len() as u64

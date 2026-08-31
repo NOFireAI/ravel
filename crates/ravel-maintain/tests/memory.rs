@@ -297,7 +297,7 @@ async fn retained_parts_are_attributed_to_their_own_phase() {
         "the in-progress writer term must have been driven"
     );
     assert!(
-        peaks.catalog_directory_encoded_bytes > 0,
+        peaks.catalog_directory_decoded_bytes > 0,
         "the catalog-load term must have been driven"
     );
     assert!(
@@ -306,12 +306,12 @@ async fn retained_parts_are_attributed_to_their_own_phase() {
     );
     println!(
         "[memory:rlog:977] parts={} retained_part_encoded_bytes={} writer_heap_bytes={} \
-         cursor_bytes={} catalog_directory_encoded_bytes={} publish_record_encoded_bytes={}",
+         cursor_bytes={} catalog_directory_decoded_bytes={} publish_record_encoded_bytes={}",
         record.parts.len(),
         peaks.retained_part_encoded_bytes,
         peaks.writer_heap_bytes,
         peaks.cursor_bytes,
-        peaks.catalog_directory_encoded_bytes,
+        peaks.catalog_directory_decoded_bytes,
         peaks.publish_record_encoded_bytes,
     );
 }
