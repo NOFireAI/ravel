@@ -141,6 +141,30 @@ pub async fn rewrite_and_publish<C: SegmentCodec>(
     )
     .await?;
 
+    // Issue #977: surface the compaction's peak memory split by phase. Every
+    // term is populated by now (catalog load before build_parts, cursor/writer/
+    // retained during build_parts, publish record during publish), and `parts`
+    // is still alive so the retained high-water reflects the whole set. Each
+    // field names its byte kind; they are NOT summable across kinds. Only fires
+    // when a tracker is installed (never in production today, see
+    // `MergeMemoryTracker`); installing one is the one-line service change that
+    // makes this visible to an operator.
+    if let Some(t) = config.merge_memory_tracker.as_ref() {
+        let peaks = t.phase_peaks();
+        tracing::info!(
+            signal = ?bucket.signal,
+            shard = bucket.shard,
+            ingest_hour_bucket = bucket.ingest_hour_bucket,
+            parts = parts.len(),
+            catalog_directory_encoded_bytes = peaks.catalog_directory_encoded_bytes,
+            cursor_bytes = peaks.cursor_bytes,
+            writer_heap_bytes = peaks.writer_heap_bytes,
+            retained_part_encoded_bytes = peaks.retained_part_encoded_bytes,
+            publish_record_encoded_bytes = peaks.publish_record_encoded_bytes,
+            "compaction peak memory by phase (byte kinds differ per term; do not sum)"
+        );
+    }
+
     Ok(RewriteOutcome {
         parts: parts.len(),
         publish,

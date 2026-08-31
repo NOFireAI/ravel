@@ -364,6 +364,17 @@ pub(crate) async fn load_catalog_from_object(
         Some(_) => Some(fetch_section(store, &object_key, &ftr, kind::PAGE_DIR, &cfg).await?),
         None => None,
     };
+    // Input read / catalog load phase (issue #977): the reader below retains a
+    // decoded form of these directory sections for the whole merge. Charge the
+    // encoded section bytes as a per-input proxy; the block/bloom bytes are NOT
+    // held here (the merge streams them by range), so they are not charged.
+    if let Some(t) = config.merge_memory_tracker.as_ref() {
+        let dir_bytes = stream_dir_raw.len() as u64
+            + field_dir_raw.len() as u64
+            + skip_idx_raw.len() as u64
+            + page_dir_raw.as_ref().map(|d| d.len() as u64).unwrap_or(0);
+        t.add_catalog_directory_bytes(dir_bytes);
+    }
     let record_count = ftr.record_count;
     let reader = RlogRangeReader::from_sections_with_page_dir(
         &ftr,
@@ -642,9 +653,15 @@ impl PartSink<'_> {
                     self.dry_run,
                 )
                 .await?;
+            let retained = built.bytes.len() as u64;
             self.parts.push(built);
             self.part_index += 1;
             if let Some(t) = self.tracker {
+                // The part is PUT but its encoded bytes stay resident in
+                // `self.parts` until publish. Charge the retained-parts term
+                // (encoded bytes) and clear the writer term (its decoded-heap
+                // records were handed to the writer and released on encode).
+                t.add_retained_part_bytes(retained);
                 t.set_writer_bytes(0);
             }
         }

@@ -72,8 +72,8 @@ pub use clock::{Clock, FixedClock};
 pub use codec::{RsegCodec, SegmentCodec};
 pub use compact::{CompactionOutcome, compact_bucket};
 pub use config::{
-    AuditMode, AuditPipelineConfig, CompactorConfig, MergeMemoryTracker, RetentionConfig,
-    RetentionConfigError, RetentionPolicy,
+    AuditMode, AuditPipelineConfig, CompactorConfig, MergeMemoryTracker, MergePhasePeaks,
+    RetentionConfig, RetentionConfigError, RetentionPolicy,
 };
 pub use discover::discover_tenants;
 pub use erasure_rewrite::{
