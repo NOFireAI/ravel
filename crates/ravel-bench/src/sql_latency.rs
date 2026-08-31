@@ -72,6 +72,7 @@ use ravel_types::{Signal, TenantHash, TenantId, TimeRange};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::allocator::Allocator;
 use crate::sql_corpus::CorpusEntry;
 
 /// A frozen query clock, bounding the catalog resolve's ingest-hour fan-out.
@@ -333,18 +334,21 @@ pub struct Provenance {
     /// between the system allocator and a memory-returning one, and the allocator
     /// can arrive via `LD_PRELOAD` that a compile-time `cfg!` cannot see, so it is
     /// read off `/proc/self/maps` and recorded here rather than left to a caption
-    /// (issue #972). A report written before this field existed deserializes to
-    /// [`crate::allocator::ALLOCATOR_UNKNOWN`]: a wrong value reads as verified,
-    /// worse than an explicit absent one.
+    /// (issue #972). Typed as [`Allocator`] so the value domain is shared with
+    /// `report_schema::Provenance` and an out-of-domain value is unrepresentable
+    /// rather than merely rejected. A report written before this field existed
+    /// deserializes to [`Allocator::Unknown`]: a wrong value reads as verified,
+    /// worse than an explicit absent one. A report carrying an unrecognized
+    /// allocator string is rejected at deserialize.
     #[serde(default = "default_allocator")]
-    pub allocator: String,
+    pub allocator: Allocator,
 }
 
 /// What a report written before the allocator was recorded (issue #972)
 /// deserializes to. The explicit unknown, never a guessed allocator: an old
 /// report did not measure it, so it cannot claim one.
-fn default_allocator() -> String {
-    crate::allocator::ALLOCATOR_UNKNOWN.to_string()
+fn default_allocator() -> Allocator {
+    Allocator::Unknown
 }
 
 /// The `warm_catalog` regime a report should record. `--warm-catalog` reuses
@@ -2181,8 +2185,8 @@ mod tests {
     /// explicit unknown rather than a guessed allocator (issue #972).
     ///
     /// To watch the back-compat half fail: change `default_allocator` to return
-    /// `"system".to_string()`. The `without`-field report then deserializes to
-    /// `"system"` and the final assertion reads `system == unknown`. To watch
+    /// `Allocator::System`. The `without`-field report then deserializes to
+    /// `system` and the final assertion reads `system == unknown`. To watch
     /// the serialization half fail: drop `"allocator"` from the round-tripped
     /// value's expected key.
     #[test]
@@ -2201,7 +2205,7 @@ mod tests {
             "allocator": "tcmalloc"
         });
         let p: Provenance = serde_json::from_value(with).expect("deserialize");
-        assert_eq!(p.allocator, crate::allocator::ALLOCATOR_TCMALLOC);
+        assert_eq!(p.allocator, Allocator::Tcmalloc);
         let round = serde_json::to_value(&p).expect("serialize");
         assert_eq!(round["allocator"], "tcmalloc");
 
@@ -2218,7 +2222,61 @@ mod tests {
             "cache_bytes": 0
         });
         let p: Provenance = serde_json::from_value(without).expect("deserialize");
-        assert_eq!(p.allocator, crate::allocator::ALLOCATOR_UNKNOWN);
+        assert_eq!(p.allocator, Allocator::Unknown);
+    }
+
+    /// Every allocator the probe can produce round-trips through provenance by
+    /// exact value, and an unrecognized allocator string is rejected at
+    /// deserialize rather than laundered into `unknown` (issue #972): a garbage
+    /// value in this slot would read as the honest "the probe could not answer".
+    ///
+    /// To watch the round-trip half fail: change any arm of `Allocator::as_str`
+    /// (or the `rename_all`) so a variant serializes to a different string; the
+    /// exact-value assertion for that variant then mismatches. To watch the
+    /// reject half fail: give `Allocator` a `#[serde(other)]` catch-all variant;
+    /// the unrecognized string then deserializes to it and `expect_err` panics.
+    #[test]
+    fn allocator_round_trips_by_value_and_rejects_an_unrecognized_string() {
+        for (variant, text) in [
+            (Allocator::Tcmalloc, "tcmalloc"),
+            (Allocator::Jemalloc, "jemalloc"),
+            (Allocator::Mimalloc, "mimalloc"),
+            (Allocator::System, "system"),
+            (Allocator::Unknown, "unknown"),
+        ] {
+            let doc = serde_json::json!({
+                "store_backend": "s3",
+                "region": "us-east-1",
+                "endpoint": "n/a",
+                "host_logical_cores": 8,
+                "source": "generate",
+                "dataset_id": "t",
+                "runs": 3,
+                "cache_bytes": 0,
+                "allocator": text
+            });
+            let p: Provenance = serde_json::from_value(doc).expect("deserialize a valid allocator");
+            assert_eq!(p.allocator, variant);
+            let round = serde_json::to_value(&p).expect("serialize");
+            assert_eq!(
+                round["allocator"], text,
+                "{variant} serializes to its exact value"
+            );
+        }
+
+        let bogus = serde_json::json!({
+            "store_backend": "s3",
+            "region": "us-east-1",
+            "endpoint": "n/a",
+            "host_logical_cores": 8,
+            "source": "generate",
+            "dataset_id": "t",
+            "runs": 3,
+            "cache_bytes": 0,
+            "allocator": "bogus-allocator"
+        });
+        serde_json::from_value::<Provenance>(bogus)
+            .expect_err("an unrecognized allocator string is rejected");
     }
 
     /// Write `objects` RLOG objects (one record each) on `shard` for `tenant`,

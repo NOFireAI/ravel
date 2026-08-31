@@ -828,7 +828,7 @@ mod tests {
             warm_catalog: Some(false),
             logs_suffix_len: None,
             flight_endpoint: None,
-            allocator: ravel_bench::allocator::ALLOCATOR_SYSTEM.to_string(),
+            allocator: ravel_bench::allocator::Allocator::System,
         }
     }
 

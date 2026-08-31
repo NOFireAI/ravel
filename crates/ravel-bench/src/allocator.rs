@@ -7,32 +7,69 @@
 //! a compile-time `cfg!` cannot see, so this reads the process's own mapped
 //! libraries from `/proc/self/maps` and reports what is there, `LD_PRELOAD`
 //! included. When the probe cannot answer (a platform without `/proc`, an
-//! unreadable or unrecognizable maps) it reports [`ALLOCATOR_UNKNOWN`] rather
+//! unreadable or unrecognizable maps) it reports [`Allocator::Unknown`] rather
 //! than guessing: a wrong provenance value reads as verified, which is worse
 //! than an explicit absent one.
 
-/// A memory-returning allocator mapped as `libtcmalloc`.
-pub const ALLOCATOR_TCMALLOC: &str = "tcmalloc";
-/// A memory-returning allocator mapped as `libjemalloc`.
-pub const ALLOCATOR_JEMALLOC: &str = "jemalloc";
-/// A memory-returning allocator mapped as `libmimalloc`.
-pub const ALLOCATOR_MIMALLOC: &str = "mimalloc";
-/// No known allocator library is mapped: the process runs on the system
-/// allocator (glibc/musl `malloc`). This is a positive finding read off a
-/// readable maps, not a guess.
-pub const ALLOCATOR_SYSTEM: &str = "system";
-/// The probe could not answer: `/proc/self/maps` was unreadable, empty, or
-/// unrecognizable. Reported instead of defaulting to a concrete allocator, which
-/// would read as verified while being unproven.
-pub const ALLOCATOR_UNKNOWN: &str = "unknown";
+/// The heap allocator a benchmark process ran under, resolved at runtime from
+/// its mapped libraries. This is the one value domain the two provenance schemas
+/// share (issue #972): a typed enum makes an out-of-domain allocator
+/// unrepresentable rather than merely rejected, so a provenance value in this
+/// slot can be trusted to be exactly one the probe can produce. Its serde
+/// representation is the lowercase variant name (`"tcmalloc"`, `"jemalloc"`,
+/// `"mimalloc"`, `"system"`, `"unknown"`), and an unrecognized string in a
+/// serialized report is rejected at deserialize (serde's default for an enum
+/// with no catch-all variant): a garbage value laundered into `Unknown` would
+/// read as the honest "the probe ran and could not answer", the confusion the
+/// field exists to avoid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Allocator {
+    /// A memory-returning allocator mapped as `libtcmalloc`.
+    Tcmalloc,
+    /// A memory-returning allocator mapped as `libjemalloc`.
+    Jemalloc,
+    /// A memory-returning allocator mapped as `libmimalloc`.
+    Mimalloc,
+    /// No known allocator library is mapped: the process runs on the system
+    /// allocator (glibc/musl `malloc`). This is a positive finding read off a
+    /// readable maps, not a guess.
+    System,
+    /// The probe could not answer: `/proc/self/maps` was unreadable, empty, or
+    /// unrecognizable, or a report predates the field. Recorded instead of
+    /// defaulting to a concrete allocator, which would read as verified while
+    /// being unproven.
+    Unknown,
+}
+
+impl Allocator {
+    /// The serialized form: the lowercase variant name, matching the serde
+    /// representation. Used to render provenance without going through JSON.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Allocator::Tcmalloc => "tcmalloc",
+            Allocator::Jemalloc => "jemalloc",
+            Allocator::Mimalloc => "mimalloc",
+            Allocator::System => "system",
+            Allocator::Unknown => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for Allocator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 /// The allocator this process is actually running under, read from
-/// `/proc/self/maps`. Returns [`ALLOCATOR_UNKNOWN`] when the maps cannot be read
-/// (a platform without `/proc`, or a read error), never a guessed allocator.
-pub fn active_allocator() -> String {
+/// `/proc/self/maps`. Returns [`Allocator::Unknown`] when the maps cannot be
+/// read (a platform without `/proc`, or a read error), never a guessed
+/// allocator.
+pub fn active_allocator() -> Allocator {
     match std::fs::read_to_string("/proc/self/maps") {
         Ok(maps) => allocator_from_maps(&maps),
-        Err(_) => ALLOCATOR_UNKNOWN.to_string(),
+        Err(_) => Allocator::Unknown,
     }
 }
 
@@ -41,8 +78,8 @@ pub fn active_allocator() -> String {
 /// real `/proc`. A mapped `libtcmalloc`/`libjemalloc`/`libmimalloc` wins; a
 /// readable maps with recognizable entries but none of them is the system
 /// allocator; text with no recognizable maps entry (empty or malformed) is
-/// [`ALLOCATOR_UNKNOWN`], never a guess.
-fn allocator_from_maps(maps: &str) -> String {
+/// [`Allocator::Unknown`], never a guess.
+fn allocator_from_maps(maps: &str) -> Allocator {
     let mut saw_entry = false;
     for line in maps.lines() {
         if !is_maps_entry(line) {
@@ -51,20 +88,20 @@ fn allocator_from_maps(maps: &str) -> String {
         saw_entry = true;
         if let Some(path) = maps_line_pathname(line) {
             if path.contains("libtcmalloc") {
-                return ALLOCATOR_TCMALLOC.to_string();
+                return Allocator::Tcmalloc;
             }
             if path.contains("libjemalloc") {
-                return ALLOCATOR_JEMALLOC.to_string();
+                return Allocator::Jemalloc;
             }
             if path.contains("libmimalloc") {
-                return ALLOCATOR_MIMALLOC.to_string();
+                return Allocator::Mimalloc;
             }
         }
     }
     if saw_entry {
-        ALLOCATOR_SYSTEM.to_string()
+        Allocator::System
     } else {
-        ALLOCATOR_UNKNOWN.to_string()
+        Allocator::Unknown
     }
 }
 
@@ -127,7 +164,7 @@ mod tests {
     /// allocator and the assertion reads `tcmalloc == system`.
     #[test]
     fn a_mapped_tcmalloc_is_reported_as_tcmalloc() {
-        assert_eq!(allocator_from_maps(TCMALLOC_MAPS), ALLOCATOR_TCMALLOC);
+        assert_eq!(allocator_from_maps(TCMALLOC_MAPS), Allocator::Tcmalloc);
     }
 
     /// A mapped jemalloc is reported as `jemalloc`.
@@ -136,7 +173,7 @@ mod tests {
     /// in `allocator_from_maps`.
     #[test]
     fn a_mapped_jemalloc_is_reported_as_jemalloc() {
-        assert_eq!(allocator_from_maps(JEMALLOC_MAPS), ALLOCATOR_JEMALLOC);
+        assert_eq!(allocator_from_maps(JEMALLOC_MAPS), Allocator::Jemalloc);
     }
 
     /// A mapped mimalloc is reported as `mimalloc`.
@@ -147,27 +184,27 @@ mod tests {
     fn a_mapped_mimalloc_is_reported_as_mimalloc() {
         let maps =
             "7f2a10000000-7f2a10025000 r-xp 00000000 08:01 200 /usr/lib/libmimalloc.so.2.1\n";
-        assert_eq!(allocator_from_maps(maps), ALLOCATOR_MIMALLOC);
+        assert_eq!(allocator_from_maps(maps), Allocator::Mimalloc);
     }
 
     /// A readable maps naming no known allocator is the system allocator, not
     /// unknown: the probe answered.
     ///
     /// To watch it fail: change the final `if saw_entry` block to return
-    /// `ALLOCATOR_UNKNOWN` unconditionally. The assertion then reads
+    /// `Allocator::Unknown` unconditionally. The assertion then reads
     /// `system == unknown`.
     #[test]
     fn maps_without_a_known_allocator_is_the_system_allocator() {
-        assert_eq!(allocator_from_maps(SYSTEM_MAPS), ALLOCATOR_SYSTEM);
+        assert_eq!(allocator_from_maps(SYSTEM_MAPS), Allocator::System);
     }
 
     /// Empty maps is the explicit unknown, never a guessed allocator.
     ///
     /// To watch it fail: change the final `else` arm of `allocator_from_maps` to
-    /// return `ALLOCATOR_SYSTEM`. The assertion then reads `unknown == system`.
+    /// return `Allocator::System`. The assertion then reads `unknown == system`.
     #[test]
     fn empty_maps_is_unknown_not_a_guess() {
-        assert_eq!(allocator_from_maps(""), ALLOCATOR_UNKNOWN);
+        assert_eq!(allocator_from_maps(""), Allocator::Unknown);
     }
 
     /// Text that is not a maps at all is the explicit unknown: no entry parses,
@@ -175,10 +212,10 @@ mod tests {
     /// allocator.
     ///
     /// To watch it fail: change the final `else` arm of `allocator_from_maps` to
-    /// return `ALLOCATOR_SYSTEM`.
+    /// return `Allocator::System`.
     #[test]
     fn malformed_maps_is_unknown_not_a_guess() {
         let maps = "this is not /proc/self/maps\njust some random text\n";
-        assert_eq!(allocator_from_maps(maps), ALLOCATOR_UNKNOWN);
+        assert_eq!(allocator_from_maps(maps), Allocator::Unknown);
     }
 }
