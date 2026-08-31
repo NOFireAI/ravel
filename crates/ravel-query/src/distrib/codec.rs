@@ -3048,6 +3048,7 @@ mod tests {
                 part_index: 4,
             },
             segment_format_version: u32::from(ravel_segment::SUPPORTED_VERSIONS.newest()),
+            declared_column_stats: Default::default(),
         };
         let identity = encode_segment_identity(&seg);
         assert_eq!(identity.level, 1);
@@ -3096,6 +3097,7 @@ mod tests {
             created_unix_ns: 0,
             level: SegmentLevel::L0,
             segment_format_version: u32::from(ravel_segment::SUPPORTED_VERSIONS.newest()),
+            declared_column_stats: Default::default(),
         };
         let stamped = encode_segment_identity(&seg).segment_format_version;
         assert_eq!(

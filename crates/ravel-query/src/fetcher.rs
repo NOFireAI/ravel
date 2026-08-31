@@ -2654,6 +2654,7 @@ mod tests {
             created_unix_ns: 42,
             level: ravel_catalog::SegmentLevel::L0,
             segment_format_version: u32::from(ravel_segment::SUPPORTED_VERSIONS.newest()),
+            declared_column_stats: Default::default(),
         };
         (store, tenant_hash, seg_ref)
     }
@@ -2821,6 +2822,7 @@ mod tests {
             created_unix_ns: 42,
             level: ravel_catalog::SegmentLevel::L0,
             segment_format_version: u32::from(ravel_segment::SUPPORTED_VERSIONS.newest()),
+            declared_column_stats: Default::default(),
         };
         (store, tenant_hash, seg_ref)
     }
@@ -3004,6 +3006,7 @@ mod tests {
                 part_index: 0,
             },
             segment_format_version: u32::from(ravel_segment::SUPPORTED_VERSIONS.newest()),
+            declared_column_stats: Default::default(),
         };
         (store, seg_ref)
     }
@@ -3049,6 +3052,7 @@ mod tests {
             created_unix_ns,
             level: SegmentLevel::L0,
             segment_format_version: u32::from(ravel_segment::SUPPORTED_VERSIONS.newest()),
+            declared_column_stats: Default::default(),
         };
         (store, seg_ref)
     }
@@ -3357,6 +3361,7 @@ mod tests {
             created_unix_ns: 77,
             level: ravel_catalog::SegmentLevel::L0,
             segment_format_version: u32::from(ravel_segment::SUPPORTED_VERSIONS.newest()),
+            declared_column_stats: Default::default(),
         };
         (store, tenant_hash, seg_ref)
     }
@@ -3457,6 +3462,7 @@ mod tests {
             created_unix_ns: 99,
             level: ravel_catalog::SegmentLevel::L0,
             segment_format_version: u32::from(ravel_segment::SUPPORTED_VERSIONS.newest()),
+            declared_column_stats: Default::default(),
         };
         (written.bytes, tenant_hash, seg_ref)
     }

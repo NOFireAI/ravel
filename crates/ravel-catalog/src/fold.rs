@@ -36,6 +36,7 @@ use uuid::Uuid;
 use crate::catalog::Catalog;
 use crate::column_stats_build;
 use crate::config::CatalogConfig;
+use crate::declared_stats;
 use crate::error::CatalogError;
 use crate::provisioning::{DEFAULT_SCAN_SLACK_HOURS, ShardGeneration, scan_count};
 use crate::snapshot_format::{
@@ -377,6 +378,12 @@ fn build_snapshot_entry(key: &str, record: &CommitRecord) -> Result<SnapshotEntr
         series_count: record.series_count,
         segment_format_version: record.segment_format_version,
         created_unix_ns: record.created_unix_ns,
+        // ADR-0873 decision 4: the stamps are copied from the record the fold
+        // is already reading, through the gated read that binds the row-count
+        // clauses against this record's own sample_count. A defective entry is
+        // dropped here rather than sealed into a part that outlives the record
+        // proving it wrong.
+        declared_column_stats: declared_stats::carry_commit_record(record),
     })
 }
 
@@ -426,6 +433,10 @@ fn build_l1_snapshot_entry(
         series_count: part.series_count,
         segment_format_version: part.segment_format_version,
         created_unix_ns: record.created_unix_ns,
+        // The part's own stamps (CompactionPart field 12), gated against the
+        // part's own row count exactly as the L0 path gates a commit record's
+        // (ADR-0873 decision 4).
+        declared_column_stats: declared_stats::carry_compaction_part(part),
     })
 }
 
@@ -473,6 +484,10 @@ fn build_rewrite_l1_snapshot_entry(
         series_count: part.series_count,
         segment_format_version: part.segment_format_version,
         created_unix_ns: record.created_unix_ns,
+        // The part's own stamps (CompactionPart field 12), gated against the
+        // part's own row count exactly as the L0 path gates a commit record's
+        // (ADR-0873 decision 4).
+        declared_column_stats: declared_stats::carry_compaction_part(part),
     })
 }
 

@@ -9,7 +9,8 @@ use ravel_catalog::{
     encode_head, encode_part, encode_postings,
 };
 use ravel_proto::catalog::v1::{
-    SnapshotColumnStatsRef, SnapshotEntry, SnapshotHead, SnapshotPartRef, SnapshotPostingsRef,
+    DeclaredColumnMinMax, DeclaredColumnStatValue, SnapshotColumnStatsRef, SnapshotEntry,
+    SnapshotHead, SnapshotPartRef, SnapshotPostingsRef, declared_column_stat_value::Kind,
 };
 
 fn entry_key(e: &SnapshotEntry) -> (u32, u32, Vec<u8>, u64, u64) {
@@ -19,6 +20,33 @@ fn entry_key(e: &SnapshotEntry) -> (u32, u32, Vec<u8>, u64, u64) {
         e.writer_id.clone(),
         e.writer_epoch,
         e.writer_seq,
+    )
+}
+
+/// One `declared_column_stats` entry (ADR-0873 field 15), generated over the
+/// whole wire domain rather than over valid stamps only: the codec's contract
+/// is that it transports entries unchanged, and dropping an invalid one is the
+/// reader's job at the point of use. A codec that quietly normalised anything
+/// here would hide a writer defect from the predicate that must convict it.
+fn arb_declared_stat() -> impl Strategy<Value = DeclaredColumnMinMax> {
+    let value = prop_oneof![
+        Just(None),
+        Just(Some(DeclaredColumnStatValue { kind: None })),
+        any::<i64>().prop_map(|v| Some(DeclaredColumnStatValue {
+            kind: Some(Kind::I64(v))
+        })),
+        any::<bool>().prop_map(|b| Some(DeclaredColumnStatValue {
+            kind: Some(Kind::B(b))
+        })),
+    ];
+    (".{0,12}", 0u32..8, value.clone(), value, any::<u64>()).prop_map(
+        |(name, declared_type, min, max, null_count)| DeclaredColumnMinMax {
+            name,
+            declared_type,
+            min,
+            max,
+            null_count,
+        },
     )
 }
 
@@ -41,6 +69,7 @@ fn arb_entry(watermark_hour: u32) -> impl Strategy<Value = SnapshotEntry> {
             0u32..4,
             any::<i64>(),
         ),
+        prop::collection::vec(arb_declared_stat(), 0..4),
     )
         .prop_map(
             |(
@@ -61,6 +90,7 @@ fn arb_entry(watermark_hour: u32) -> impl Strategy<Value = SnapshotEntry> {
                     segment_format_version,
                     created_unix_ns,
                 ),
+                declared_column_stats,
             )| SnapshotEntry {
                 level: 0,
                 shard,
@@ -76,6 +106,7 @@ fn arb_entry(watermark_hour: u32) -> impl Strategy<Value = SnapshotEntry> {
                 series_count,
                 segment_format_version,
                 created_unix_ns,
+                declared_column_stats,
             },
         )
 }
@@ -311,6 +342,7 @@ fn mixed_l0_l1_part_roundtrips() {
         series_count: 1,
         segment_format_version: 5,
         created_unix_ns: 1_000,
+        declared_column_stats: Vec::new(),
     };
     let l1 = SnapshotEntry {
         level: 1,
@@ -329,6 +361,7 @@ fn mixed_l0_l1_part_roundtrips() {
         series_count: 2,
         segment_format_version: 5,
         created_unix_ns: 2_000,
+        declared_column_stats: Vec::new(),
     };
     // Sorted by (hour, shard, writer_id bytes, ...): the 16-byte L0 writer_id
     // sorts before the 32-byte L1 one.

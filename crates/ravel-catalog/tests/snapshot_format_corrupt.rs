@@ -11,7 +11,8 @@ use ravel_catalog::{
 };
 use ravel_proto::catalog::v1::SnapshotPostingsHeader;
 use ravel_proto::catalog::v1::{
-    SnapshotEntry, SnapshotHead, SnapshotPartHeader, SnapshotPartRef, SnapshotPostingsRef,
+    DeclaredColumnMinMax, DeclaredColumnStatValue, SnapshotEntry, SnapshotHead, SnapshotPartHeader,
+    SnapshotPartRef, SnapshotPostingsRef, declared_column_stat_value::Kind,
 };
 
 fn base_entries() -> Vec<SnapshotEntry> {
@@ -31,6 +32,7 @@ fn base_entries() -> Vec<SnapshotEntry> {
             series_count: 1,
             segment_format_version: 1,
             created_unix_ns: 1_000,
+            declared_column_stats: Vec::new(),
         },
         SnapshotEntry {
             level: 0,
@@ -47,6 +49,7 @@ fn base_entries() -> Vec<SnapshotEntry> {
             series_count: 1,
             segment_format_version: 1,
             created_unix_ns: 1_000,
+            declared_column_stats: Vec::new(),
         },
     ]
 }
@@ -421,6 +424,68 @@ fn truncation_never_panics_at_any_boundary() {
         // Must return a typed error, never panic.
         let _ = decode_part(&full[..len], &PartLimits::default());
     }
+}
+
+/// Entries carrying ADR-0873 declared-column stamps (field 15).
+fn stamped_entries() -> Vec<SnapshotEntry> {
+    let mut entries = base_entries();
+    entries[0].declared_column_stats = vec![DeclaredColumnMinMax {
+        name: "EventDate".to_string(),
+        declared_type: 2,
+        min: Some(DeclaredColumnStatValue {
+            kind: Some(Kind::I64(-5)),
+        }),
+        max: Some(DeclaredColumnStatValue {
+            kind: Some(Kind::I64(19_000)),
+        }),
+        null_count: 0,
+    }];
+    entries
+}
+
+/// A stamped entry whose field-15 submessage is cut short inside the body is a
+/// typed decode error, never a panic and never a half-read stat.
+///
+/// The cut is made in the uncompressed entry stream and the envelope is then
+/// assembled around it, so the CRCs are consistent and the failure is forced to
+/// surface at the protobuf layer rather than at the checksum.
+#[test]
+fn a_truncated_declared_stat_submessage_is_a_typed_entry_decode_error() {
+    let entries = stamped_entries();
+    let full = encode_entries_raw(&entries);
+    let stamp_free = encode_entries_raw(&base_entries());
+    assert!(
+        full.len() > stamp_free.len(),
+        "the stamp occupies bytes on the wire"
+    );
+    // Cut inside the stamp: the first entry's length prefix still promises the
+    // stamped length, so the entry stream ends mid-submessage.
+    let raw = full[..full.len() - (full.len() - stamp_free.len()) / 2].to_vec();
+    let header = base_header(&entries, raw.len() as u64);
+    let bytes = assemble(&header, &raw, None, None);
+    let err = decode_part(&bytes, &PartLimits::default()).expect_err("decode must fail");
+    assert!(
+        matches!(err, SnapshotFormatError::EntryDecode(_)),
+        "got {err:?}"
+    );
+}
+
+/// Truncation at every byte boundary of a stamped part is a typed error or a
+/// clean decode, never a panic.
+#[test]
+fn truncating_a_stamped_part_never_panics() {
+    let entries = stamped_entries();
+    let raw = encode_entries_raw(&entries);
+    let header = base_header(&entries, raw.len() as u64);
+    let full = assemble(&header, &raw, None, None);
+    for len in 0..full.len() {
+        let _ = decode_part(&full[..len], &PartLimits::default());
+    }
+    // The untruncated part still decodes, stamps intact: the loop above is
+    // about panics, this is the positive control that the corpus is stamped.
+    let decoded = decode_part(&full, &PartLimits::default()).expect("stamped part decodes");
+    assert_eq!(decoded.entries, entries);
+    assert_eq!(decoded.entries[0].declared_column_stats.len(), 1);
 }
 
 // --- HEAD ---

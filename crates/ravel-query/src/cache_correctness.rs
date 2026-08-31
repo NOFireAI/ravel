@@ -231,6 +231,7 @@ async fn write_rseg_segment_under(tenant: TenantHash) -> (Arc<MemoryStore>, Segm
         created_unix_ns: 123,
         level: SegmentLevel::L0,
         segment_format_version: u32::from(ravel_segment::SUPPORTED_VERSIONS.newest()),
+        declared_column_stats: Default::default(),
     };
     (store, seg_ref)
 }
@@ -311,6 +312,7 @@ async fn write_rlog_segment_under(tenant: TenantHash) -> (Arc<MemoryStore>, Segm
         created_unix_ns: 0,
         level: SegmentLevel::L0,
         segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+        declared_column_stats: Default::default(),
     };
     (store, seg_ref)
 }
@@ -1500,6 +1502,7 @@ async fn write_span_segment_under(tenant: TenantHash) -> (Arc<MemoryStore>, Segm
         created_unix_ns: 0,
         level: SegmentLevel::L0,
         segment_format_version: u32::from(ravel_rspan::footer::VERSION),
+        declared_column_stats: Default::default(),
     };
     (store, seg_ref)
 }

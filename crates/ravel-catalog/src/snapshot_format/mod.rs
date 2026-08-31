@@ -303,6 +303,7 @@ mod tests {
             series_count: 1,
             segment_format_version: 1,
             created_unix_ns: 1_000,
+            declared_column_stats: Vec::new(),
         };
         let part =
             encode_part([0x11; 16], 1, 8, 5, std::slice::from_ref(&entry)).expect("encode part");
@@ -335,6 +336,7 @@ mod tests {
             series_count: 1,
             segment_format_version: 1,
             created_unix_ns: 1_000,
+            declared_column_stats: Vec::new(),
         };
 
         // Level 0 accepts exactly the 16-byte flush writer uuid.

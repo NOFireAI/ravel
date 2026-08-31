@@ -5352,6 +5352,7 @@ mod plan_fast_path_tests {
             created_unix_ns: 0,
             level: SegmentLevel::L0,
             segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+            declared_column_stats: Default::default(),
         }
     }
 
@@ -5701,6 +5702,7 @@ mod whole_segment_projection_tests {
             created_unix_ns: 0,
             level: SegmentLevel::L0,
             segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+            declared_column_stats: Default::default(),
         }
     }
 
@@ -5905,6 +5907,7 @@ mod plan_skip_decidable_span_tests {
             created_unix_ns: 0,
             level: SegmentLevel::L0,
             segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+            declared_column_stats: Default::default(),
         }
     }
 
@@ -6403,6 +6406,7 @@ mod plan_block_stats_tests {
             created_unix_ns: 0,
             level: SegmentLevel::L0,
             segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+            declared_column_stats: Default::default(),
         }
     }
 
