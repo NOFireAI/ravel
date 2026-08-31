@@ -724,6 +724,32 @@ mod tests {
         );
     }
 
+    /// The mirror of the case above: non-null rows exist but neither extremum
+    /// was recorded. A reader that trusted such a record would report the
+    /// extremum of non-null data as exactly NULL, so the decode boundary
+    /// rejects it once for every reader rather than leaving each read site to
+    /// re-derive the rule (issue #970).
+    ///
+    /// Prove-the-test: dropping the `non_null_count > 0 && (min.is_none() ||
+    /// max.is_none())` check in `validate_column` lets this encode succeed and
+    /// the assertion fails.
+    #[test]
+    fn non_null_rows_without_min_max_rejected() {
+        let mut seg = segment(1, 0, 1);
+        // Keep the 10 non-null rows (and their dictionary) but drop both
+        // extrema: an internally-inconsistent record that cannot answer
+        // MIN/MAX.
+        seg.columns[0].min = None;
+        seg.columns[0].max = None;
+        let err = encode_column_stats([0x11; 16], 3, vec![], &[seg]).expect_err("rejected");
+        assert_eq!(
+            err,
+            SnapshotFormatError::ColumnStatsMissingMinMax {
+                name: "AdvEngineID".to_string(),
+            }
+        );
+    }
+
     #[test]
     fn dictionary_entries_without_present_flag_rejected() {
         let mut seg = segment(1, 0, 1);
