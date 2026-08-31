@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Cases for the two filters behind scripts/pr-review-status.sh:
-# lib/coderabbit-verdict.jq, which decides whether CodeRabbit has actually
-# reviewed a PR's current head, and lib/coderabbit-outside-diff.jq, which
-# counts the findings the bot reports in a review BODY instead of inline.
+# Cases for the three filters behind scripts/pr-review-status.sh:
+# lib/coderabbit-risk.jq, which extracts the walkthrough's Merge Risk sha and
+# so decides whether CodeRabbit's assessment covers the current head;
+# lib/coderabbit-verdict.jq, the older review-presence count; and
+# lib/coderabbit-outside-diff.jq, which counts the findings the bot reports in
+# a review BODY instead of inline.
 #
 # Fixtures only: no network, no gh. Each case is a comment or review shape
 # observed on a real PR, named with the PR it came from.
@@ -14,6 +16,8 @@ FILTER="$(dirname "$0")/lib/coderabbit-verdict.jq"
 [[ -r "${FILTER}" ]] || { echo "missing ${FILTER}" >&2; exit 64; }
 OUTSIDE_FILTER="$(dirname "$0")/lib/coderabbit-outside-diff.jq"
 [[ -r "${OUTSIDE_FILTER}" ]] || { echo "missing ${OUTSIDE_FILTER}" >&2; exit 64; }
+RISK_FILTER="$(dirname "$0")/lib/coderabbit-risk.jq"
+[[ -r "${RISK_FILTER}" ]] || { echo "missing ${RISK_FILTER}" >&2; exit 64; }
 
 SHA="0c65a3d3983384d663189257a25cc2d40ca95d32"
 OTHER="1111111111111111111111111111111111111111"
@@ -34,6 +38,19 @@ run_case() {
 
 check() { run_case "${FILTER}" "$@"; }
 check_outside() { run_case "${OUTSIDE_FILTER}" "$@"; }
+# The risk filter emits a two-field TSV line, so its expectations are written
+# as "<sha>|<paused>" and the tab is translated before comparison.
+check_risk() {
+  local name="$1" want="$2" json="$3" got
+  got="$(printf '%s' "${json}" | jq -r -f "${RISK_FILTER}" | tr '\t' '|')" || got="ERROR"
+  if [[ "${got}" == "${want}" ]]; then
+    printf 'ok    %s\n' "${name}"
+    passes=$((passes + 1))
+  else
+    printf 'FAIL  %s: want %s, got %s\n' "${name}" "${want}" "${got}"
+    fails=$((fails + 1))
+  fi
+}
 
 # The clean case (#893): zero findings, reported as an issue comment, no formal
 # review filed at all. This is what used to be missed, holding a reviewed PR
@@ -186,6 +203,92 @@ check_outside "bot review with the marker in inline code is NOT counted" 0 "$(ca
 EOF
 )"
 
+# --- lib/coderabbit-risk.jq ----------------------------------------------
+#
+# Input is the issues/<pr>/comments array. Expectations are "<sha>|<paused>".
+#
+# The signal exists because CodeRabbit re-reviews by EDITING one walkthrough
+# comment in place: a review object at head can be absent after a real
+# re-review and present after a stale one, so the sha on the risk line is the
+# only thing that tracks what was actually assessed (issue #950).
+
+check_risk "risk line yields its short sha" "6f458|active" "$(cat <<'EOF'
+[{"user":{"login":"coderabbitai[bot]"},"created_at":"2026-01-01T00:00:00Z",
+  "body":"<details>\n<summary>Walkthrough</summary>\n</details>\n\nMerge Risk: Moderate . up to `6f458`"}]
+EOF
+)"
+
+# The emitted form bolds the label; the substring is unchanged.
+check_risk "bolded risk label still parses" "6f458|active" "$(cat <<'EOF'
+[{"user":{"login":"coderabbitai[bot]"},"body":"**Merge Risk: Low** . up to `6f458`"}]
+EOF
+)"
+
+# A risk line that backticks something before the sha (a file name, a label)
+# must still yield the trailing "up to" sha, not the first backticked token.
+check_risk "the last backticked token on the line wins" "6f458|active" "$(cat <<'EOF'
+[{"user":{"login":"coderabbitai[bot]"},"body":"Merge Risk: Moderate for `scripts/foo.sh` . up to `6f458`"}]
+EOF
+)"
+
+# A backticked token on a LATER line is not part of the risk line. Without the
+# [^\n]* bound the greedy match would cross the newline and report the wrong
+# commit, which is a false freshness signal in either direction.
+check_risk "a backticked token on a later line is not the risk sha" "6f458|active" "$(cat <<'EOF'
+[{"user":{"login":"coderabbitai[bot]"},"body":"Merge Risk: Moderate . up to `6f458`\n\nFiles reviewed: `deadbeef`"}]
+EOF
+)"
+
+# Newest wins. Two walkthroughs, the older one fresh and the newer one stale:
+# reading the older would clear a PR whose latest assessment is behind.
+check_risk "newest walkthrough wins when the older one is fresher" "aaaaa|active" "$(cat <<'EOF'
+[{"user":{"login":"coderabbitai[bot]"},"created_at":"2026-01-02T00:00:00Z",
+  "body":"Merge Risk: Low . up to `bbbbb`"},
+ {"user":{"login":"coderabbitai[bot]"},"created_at":"2026-01-03T00:00:00Z",
+  "body":"Merge Risk: Low . up to `aaaaa`"}]
+EOF
+)"
+
+# Array order is not trusted: created_at decides.
+check_risk "out-of-order comments are ordered by created_at" "aaaaa|active" "$(cat <<'EOF'
+[{"user":{"login":"coderabbitai[bot]"},"created_at":"2026-01-03T00:00:00Z",
+  "body":"Merge Risk: Low . up to `aaaaa`"},
+ {"user":{"login":"coderabbitai[bot]"},"created_at":"2026-01-02T00:00:00Z",
+  "body":"Merge Risk: Low . up to `bbbbb`"}]
+EOF
+)"
+
+# A newer bot comment with no risk line (a chat reply, a rate-limit notice)
+# does not erase the newest ASSESSMENT; only risk-carrying comments are ranked.
+check_risk "a newer non-walkthrough comment does not hide the risk line" "6f458|active" "$(cat <<'EOF'
+[{"user":{"login":"coderabbitai[bot]"},"created_at":"2026-01-02T00:00:00Z",
+  "body":"Merge Risk: Low . up to `6f458`"},
+ {"user":{"login":"coderabbitai[bot]"},"created_at":"2026-01-04T00:00:00Z",
+  "body":"@user I have resolved that thread."}]
+EOF
+)"
+
+check_risk "paused reviews are reported alongside the sha" "6f458|paused" "$(cat <<'EOF'
+[{"user":{"login":"coderabbitai[bot]"},"created_at":"2026-01-02T00:00:00Z",
+  "body":"Merge Risk: Low . up to `6f458`\n\n> Reviews paused"}]
+EOF
+)"
+
+check_risk "paused with no risk line yields an empty sha" "|paused" "$(cat <<'EOF'
+[{"user":{"login":"coderabbitai[bot]"},"body":"⏸️ Reviews paused\n\nUse @coderabbitai resume to restart."}]
+EOF
+)"
+
+# A human quoting a risk line is not an assessment.
+check_risk "a human risk line does not count" "|active" "$(cat <<'EOF'
+[{"user":{"login":"pmoust"},"body":"CodeRabbit said Merge Risk: Low . up to `6f458`, merging."}]
+EOF
+)"
+
+check_risk "no comments at all" "|active" '[]'
+check_risk "null body is tolerated" "|active" \
+  '[{"user":{"login":"coderabbitai[bot]"},"body":null}]'
+
 # --- end-to-end verdict, pr-review-status.sh ------------------------------
 #
 # The count above only matters if it flips the verdict. These run the real
@@ -209,8 +312,20 @@ SHIM
 chmod +x "${E2E_DIR}/bin/gh"
 
 # Everything except the review body is held constant and clean: CI green,
-# mergeState CLEAN, one COMMENTED review at head, zero inline comments. So the
-# only thing that can move the verdict is the body.
+# mergeState CLEAN, one COMMENTED review at head, zero inline comments, and a
+# walkthrough whose risk line names the head. So the only thing that can move
+# the verdict is the body -- or, in the risk cases below, E2E_ISSUE_COMMENTS.
+#
+# The default walkthrough deliberately carries neither the full head sha nor a
+# verdict marker, so walkthroughs@head stays 0 and these cases keep exercising
+# the outside-diff path rather than accidentally depending on the verdict
+# filter as well.
+FRESH_WALKTHROUGH="$(cat <<EOF
+[{"user":{"login":"coderabbitai[bot]"},"created_at":"2026-01-02T00:00:00Z",
+  "body":"<details>\n<summary>Walkthrough</summary>\nAdds a guard.\n</details>\n\n**Merge Risk: Low** . up to \`${SHA:0:5}\`"}]
+EOF
+)"
+
 e2e() {
   local review_body="$1"
   shift
@@ -221,10 +336,10 @@ e2e() {
     "${SHA}" >"${fx}/pr-view.json"
   printf '[{"user":{"login":"coderabbitai[bot]"},"state":"COMMENTED","commit_id":"%s","body":%s}]\n' \
     "${SHA}" "${review_body}" >"${fx}/reviews.json"
-  printf '[]\n' >"${fx}/issue-comments.json"
+  printf '%s\n' "${E2E_ISSUE_COMMENTS:-${FRESH_WALKTHROUGH}}" >"${fx}/issue-comments.json"
   printf '[]\n' >"${fx}/review-comments.json"
   FIXTURES="${fx}" PATH="${E2E_DIR}/bin:${PATH}" \
-    bash "$(dirname "$0")/pr-review-status.sh" 908 "$@"
+    bash "${E2E_SCRIPT:-$(dirname "$0")/pr-review-status.sh}" 908 "$@"
 }
 
 check_eq() {
@@ -251,10 +366,10 @@ confirmed_out="$(e2e "${FINDING_BODY_JSON}" --confirm-addressed)"
 # A body with no findings prints exactly what it printed before this field
 # existed: no extra summary field, and the unchanged clean verdict.
 check_eq "walkthrough-only body: summary line carries no outside-diff field" \
-  "PR #908 @ ${SHA}: state=OPEN mergeState=CLEAN CI=1 pass/0 pending/0 fail | CodeRabbit: reviews@head=1 walkthroughs@head=0 last=COMMENTED inline_comments=0" \
+  "PR #908 @ ${SHA}: state=OPEN mergeState=CLEAN CI=1 pass/0 pending/0 fail | CodeRabbit: risk_line=head reviews@head=1 walkthroughs@head=0 last=COMMENTED inline_comments=0" \
   "$(printf '%s\n' "${clean_out}" | sed -n 1p)"
 check_eq "walkthrough-only body: verdict is unchanged clean" \
-  "  -> clean: CI green, CodeRabbit reviewed the current head with zero inline comments" \
+  "  -> clean: CI green, CodeRabbit's risk line names the current head with zero inline comments" \
   "$(printf '%s\n' "${clean_out}" | sed -n 2p)"
 check_eq "walkthrough-only body: merge command still printed" \
   "  -> gh pr merge 908 --rebase --delete-branch --match-head-commit ${SHA}" \
@@ -263,7 +378,7 @@ check_eq "walkthrough-only body: merge command still printed" \
 # The #908 regression: same PR, same green CI, same zero inline comments, one
 # outside-diff finding in the body. It must be visible and it must block.
 check_eq "outside-diff body finding: counted on the summary line" \
-  "PR #908 @ ${SHA}: state=OPEN mergeState=CLEAN CI=1 pass/0 pending/0 fail | CodeRabbit: reviews@head=1 walkthroughs@head=0 last=COMMENTED inline_comments=0 outside_diff_body_findings@head=1" \
+  "PR #908 @ ${SHA}: state=OPEN mergeState=CLEAN CI=1 pass/0 pending/0 fail | CodeRabbit: risk_line=head reviews@head=1 walkthroughs@head=0 last=COMMENTED inline_comments=0 outside_diff_body_findings@head=1" \
   "$(printf '%s\n' "${finding_out}" | sed -n 1p)"
 check_eq "outside-diff body finding: verdict is not clean" \
   "  -> 1 CodeRabbit outside-diff finding(s) in the review BODY at head, not inline; read the body with \`gh api repos/NOFireAI/ravel/pulls/908/reviews --jq '.[] | select(.commit_id==\"${SHA}\") | .body'\`, then re-run with --confirm-addressed once each is fixed or answered" \
@@ -274,11 +389,125 @@ check_eq "outside-diff body finding: no merge command offered" \
 
 # --confirm-addressed overrides it, in the same shape as the inline branch.
 check_eq "outside-diff body finding: --confirm-addressed clears it" \
-  "  -> clean (operator confirmed all 1 outside-diff body finding(s) addressed): CI green, CodeRabbit reviewed the current head" \
+  "  -> clean (operator confirmed all 1 outside-diff body finding(s) addressed): CI green, CodeRabbit's risk line names the current head" \
   "$(printf '%s\n' "${confirmed_out}" | sed -n 2p)"
 check_eq "outside-diff body finding: --confirm-addressed prints the merge command" \
   "  -> gh pr merge 908 --rebase --delete-branch --match-head-commit ${SHA}" \
   "$(printf '%s\n' "${confirmed_out}" | sed -n 3p)"
+
+# --- risk-line freshness end-to-end (issue #950) --------------------------
+#
+# Everything else in these fixtures is clean and constant -- CI green,
+# mergeState CLEAN, one COMMENTED review at head, no findings anywhere -- so
+# the ONLY thing that moves the verdict is the walkthrough's risk line. That is
+# the point: under the old rule this exact fixture read as reviewed and clean.
+
+STALE_WALKTHROUGH="$(cat <<'EOF'
+[{"user":{"login":"coderabbitai[bot]"},"created_at":"2026-01-02T00:00:00Z",
+  "body":"<details>\n<summary>Walkthrough</summary>\nAdds a guard.\n</details>\n\n**Merge Risk: Moderate** . up to `6f458`"}]
+EOF
+)"
+
+E2E_ISSUE_COMMENTS="${STALE_WALKTHROUGH}"
+stale_out="$(e2e "${CLEAN_BODY_JSON}")"
+unset E2E_ISSUE_COMMENTS
+
+check_eq "stale risk line: reported on the summary line" \
+  "PR #908 @ ${SHA}: state=OPEN mergeState=CLEAN CI=1 pass/0 pending/0 fail | CodeRabbit: risk_line=stale:6f458 reviews@head=1 walkthroughs@head=0 last=COMMENTED inline_comments=0" \
+  "$(printf '%s\n' "${stale_out}" | sed -n 1p)"
+check_eq "stale risk line: verdict blocks the merge" \
+  "  -> CodeRabbit's risk line is at STALE sha 6f458 vs head ${SHA} (do not merge yet)" \
+  "$(printf '%s\n' "${stale_out}" | sed -n 2p)"
+check_eq "stale risk line: no merge command offered" \
+  "" \
+  "$(printf '%s\n' "${stale_out}" | sed -n 3p)"
+
+# Proof this pins the fix rather than passing anyway: flip the single marked
+# condition off, which leaves the pre-#950 behaviour (a review object at head
+# decides), and the SAME fixture must come back clean with a merge command.
+FLIP_DIR="${E2E_DIR}/flip"
+mkdir -p "${FLIP_DIR}"
+ln -s "$(cd "$(dirname "$0")" && pwd)/lib" "${FLIP_DIR}/lib"
+sed 's/^elif .*# PROVE-FLIP$/elif false; then/' \
+  "$(dirname "$0")/pr-review-status.sh" >"${FLIP_DIR}/pr-review-status.sh"
+if grep -q '^elif false; then$' "${FLIP_DIR}/pr-review-status.sh"; then
+  printf 'ok    %s\n' "prove: PROVE-FLIP line found and flipped"
+  passes=$((passes + 1))
+else
+  printf 'FAIL  %s\n' "prove: PROVE-FLIP line found and flipped: sed did not match the marked line"
+  fails=$((fails + 1))
+fi
+
+E2E_ISSUE_COMMENTS="${STALE_WALKTHROUGH}" E2E_SCRIPT="${FLIP_DIR}/pr-review-status.sh"
+flipped_out="$(e2e "${CLEAN_BODY_JSON}")"
+unset E2E_ISSUE_COMMENTS E2E_SCRIPT
+
+check_eq "prove: the pre-#950 rule calls the stale fixture clean" \
+  "  -> clean: CI green, CodeRabbit's risk line names the current head with zero inline comments" \
+  "$(printf '%s\n' "${flipped_out}" | sed -n 2p)"
+check_eq "prove: the pre-#950 rule even offers the merge command" \
+  "  -> gh pr merge 908 --rebase --delete-branch --match-head-commit ${SHA}" \
+  "$(printf '%s\n' "${flipped_out}" | sed -n 3p)"
+
+# Degraded mode 1: no CodeRabbit comment at all. Nothing to parse, and the
+# script must say so explicitly rather than fall through to clean.
+E2E_ISSUE_COMMENTS='[]'
+none_out="$(e2e "${CLEAN_BODY_JSON}")"
+unset E2E_ISSUE_COMMENTS
+
+check_eq "no CodeRabbit comment: risk_line=none on the summary line" \
+  "PR #908 @ ${SHA}: state=OPEN mergeState=CLEAN CI=1 pass/0 pending/0 fail | CodeRabbit: risk_line=none reviews@head=1 walkthroughs@head=0 last=COMMENTED inline_comments=0" \
+  "$(printf '%s\n' "${none_out}" | sed -n 1p)"
+check_eq "no CodeRabbit comment: verdict says not assessed" \
+  "  -> no CodeRabbit Merge Risk line found: CodeRabbit has not assessed this PR; do not merge until a risk line naming the head commit appears" \
+  "$(printf '%s\n' "${none_out}" | sed -n 2p)"
+
+# Degraded mode 2: reviews paused, no assessment. The pause is the reason the
+# risk line will never arrive, so it is named in the same line.
+E2E_ISSUE_COMMENTS='[{"user":{"login":"coderabbitai[bot]"},"created_at":"2026-01-02T00:00:00Z","body":"⏸️ Reviews paused\n\nUse `@coderabbitai resume` to restart."}]'
+paused_out="$(e2e "${CLEAN_BODY_JSON}")"
+unset E2E_ISSUE_COMMENTS
+
+check_eq "paused reviews: flagged on the summary line" \
+  "PR #908 @ ${SHA}: state=OPEN mergeState=CLEAN CI=1 pass/0 pending/0 fail | CodeRabbit: risk_line=none reviews@head=1 walkthroughs@head=0 last=COMMENTED inline_comments=0 reviews_paused=yes" \
+  "$(printf '%s\n' "${paused_out}" | sed -n 1p)"
+check_eq "paused reviews: verdict names the pause as the reason" \
+  "  -> no CodeRabbit Merge Risk line found: CodeRabbit has not assessed this PR; CodeRabbit reviews are PAUSED on this PR, so the assessment will not refresh until they resume; do not merge until a risk line naming the head commit appears" \
+  "$(printf '%s\n' "${paused_out}" | sed -n 2p)"
+
+# A pause AFTER a head-fresh assessment is not a blocker: the assessment that
+# exists already covers the head. Blocking here would be a false block that
+# only an unrelated bot state caused.
+E2E_ISSUE_COMMENTS="$(printf '[{"user":{"login":"coderabbitai[bot]"},"created_at":"2026-01-02T00:00:00Z","body":"**Merge Risk: Low** . up to `%s`\\n\\n⏸️ Reviews paused"}]' "${SHA:0:5}")"
+paused_fresh_out="$(e2e "${CLEAN_BODY_JSON}")"
+unset E2E_ISSUE_COMMENTS
+
+check_eq "paused after a head-fresh assessment still merges" \
+  "  -> clean: CI green, CodeRabbit's risk line names the current head with zero inline comments" \
+  "$(printf '%s\n' "${paused_fresh_out}" | sed -n 2p)"
+
+# Degraded mode 3: several walkthrough comments. The bot posts a fresh one
+# after a force-push or a re-summon, and the older one still carries its own
+# risk line. Newest by created_at decides; here the newest is stale, so a
+# reader that took the first (or the freshest-looking) one would clear a PR
+# whose latest assessment is behind the head.
+E2E_ISSUE_COMMENTS="$(printf '[{"user":{"login":"coderabbitai[bot]"},"created_at":"2026-01-01T00:00:00Z","body":"**Merge Risk: Low** . up to `%s`"},{"user":{"login":"coderabbitai[bot]"},"created_at":"2026-01-05T00:00:00Z","body":"**Merge Risk: High** . up to `6f458`"}]' "${SHA:0:5}")"
+multi_out="$(e2e "${CLEAN_BODY_JSON}")"
+unset E2E_ISSUE_COMMENTS
+
+check_eq "multiple walkthroughs: the newest one decides, stale blocks" \
+  "  -> CodeRabbit's risk line is at STALE sha 6f458 vs head ${SHA} (do not merge yet)" \
+  "$(printf '%s\n' "${multi_out}" | sed -n 2p)"
+
+# The mirror: newest fresh, older stale. Newest wins in both directions, so the
+# case above cannot be passing merely because something always blocks.
+E2E_ISSUE_COMMENTS="$(printf '[{"user":{"login":"coderabbitai[bot]"},"created_at":"2026-01-01T00:00:00Z","body":"**Merge Risk: Low** . up to `6f458`"},{"user":{"login":"coderabbitai[bot]"},"created_at":"2026-01-05T00:00:00Z","body":"**Merge Risk: High** . up to `%s`"}]' "${SHA:0:5}")"
+multi_fresh_out="$(e2e "${CLEAN_BODY_JSON}")"
+unset E2E_ISSUE_COMMENTS
+
+check_eq "multiple walkthroughs: the newest one decides, fresh clears" \
+  "  -> clean: CI green, CodeRabbit's risk line names the current head with zero inline comments" \
+  "$(printf '%s\n' "${multi_fresh_out}" | sed -n 2p)"
 
 printf '\n%d passed, %d failed\n' "${passes}" "${fails}"
 [[ "${fails}" -eq 0 ]]
