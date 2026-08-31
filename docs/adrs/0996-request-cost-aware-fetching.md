@@ -235,7 +235,13 @@ layer already runs on (`BlockRangeFetcher::request_cost_bytes`,
   so the arithmetic multiplies BEFORE it divides, in `u128`:
   `request_cost_bytes = get_class_nanodollars × BYTES_PER_GIB /
   (transfer_nanodollars_per_gib + retrieval_nanodollars_per_gib)`,
-  floor-rounded with a documented minimum of one byte — retrieval is a
+  floor-rounded with a documented minimum of one byte and SATURATED HIGH
+  at `u64::MAX` — a near-free byte price (one nanodollar per GiB against
+  a large GET price) produces a quotient above `u64::MAX`, and saturating
+  is the correct semantic there, since an astronomically high rate means
+  "whole-object always", exactly what a near-free byte price implies; the
+  saturation is logged at startup naming the profile, and a boundary
+  fixture pins it. Retrieval is a
   per-byte charge exactly like transfer and enters the byte price the
   same way, in the same `u128` multiply-before-divide path; a profile
   with `transfer = 0, retrieval > 0` therefore routes byte-minimally
@@ -265,7 +271,21 @@ the ranged path (`ObjectAssembler::new(&pool, total)`,
 still let one 5 GiB object reserve 5 GiB. Under this ADR the assembler
 allocates per covering sub-range, at most the bound, with split points
 chosen at block boundaries from the resident PAGE_DIR so every
-sub-range decodes independently. Whole-object
+sub-range decodes independently. The covering-read contract has exactly two regimes with a stated
+precedence: an object AT OR UNDER the bound is always ONE covering GET
+(`GetRange::Full`, no segmentation, no probe under request-minimal); an
+object ABOVE the bound is read as segmented covering sub-ranges, each
+the longest block-aligned prefix that fits the bound. Block alignment
+makes the request count a band, not a point: `ceil(size / bound)` is
+the floor, and because every sub-range except the last covers more than
+`bound − B_max` bytes (`B_max` = the object's largest single block's
+stored size, known from the resident PAGE_DIR), the cap is
+`ceil(size / (bound − B_max))`. A single block larger than the bound
+cannot be split and is fetched as its own oversized GET, which the
+tracker charges at its true size — legal but logged, and impossible on
+this corpus (blocks are far under 64 MiB). Every request-cost
+consequence in this ADR uses the floor for expected figures and the cap
+for bands. Whole-object
 reads apply only to objects ≤ the bound; a larger object falls back to
 covering sequential sub-range GETs of at most the bound each
 (`ceil(size/bound)` GETs — a 5 GiB object costs 80 GETs, never one
@@ -383,6 +403,17 @@ truth):
   field number (frozen-contract additive rule; never renumber), decoded
   and merged like every other snapshot counter, or a coordinator would
   report amplification over a denominator missing every remote touch.
+  The additive merge is exact because the distributed cut is SHARD-MAJOR:
+  `partition_snapshot` groups segments by shard and never splits a
+  shard across slices (`crates/ravel-query/src/distrib/partition.rs`,
+  "a shard's segments are never split across slices", pinned by
+  `partition_is_total_and_disjoint_and_bounded`), and an object belongs
+  to exactly one segment and one shard, so no two workers can touch one
+  object in a single query. The (segment, surviving-block) striping that
+  CAN share an object across partitions is the INTRA-process DataFusion
+  partitioning, which is why the recording contract below is
+  designated-recorder within a process; across the wire, disjointness is
+  structural.
   `StoreMetrics` attempts stay process-global and are deliberately NOT
   snapshot fields: billing is a per-process ledger, shape metrics are
   per-query. Task 996-3's scope grows the proto/codec/merge addition.
