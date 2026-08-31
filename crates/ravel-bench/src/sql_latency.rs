@@ -326,6 +326,25 @@ pub struct Provenance {
     /// machines in any deployment worth measuring.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flight_endpoint: Option<String>,
+    /// The heap allocator this run actually executed under, resolved at runtime
+    /// from the process's mapped libraries (`crate::allocator::active_allocator`):
+    /// `"tcmalloc"`, `"jemalloc"`, `"mimalloc"`, `"system"` (glibc/musl), or
+    /// `"unknown"` when the probe could not answer. Peak RSS moves by about 2x
+    /// between the system allocator and a memory-returning one, and the allocator
+    /// can arrive via `LD_PRELOAD` that a compile-time `cfg!` cannot see, so it is
+    /// read off `/proc/self/maps` and recorded here rather than left to a caption
+    /// (issue #972). A report written before this field existed deserializes to
+    /// [`crate::allocator::ALLOCATOR_UNKNOWN`]: a wrong value reads as verified,
+    /// worse than an explicit absent one.
+    #[serde(default = "default_allocator")]
+    pub allocator: String,
+}
+
+/// What a report written before the allocator was recorded (issue #972)
+/// deserializes to. The explicit unknown, never a guessed allocator: an old
+/// report did not measure it, so it cannot claim one.
+fn default_allocator() -> String {
+    crate::allocator::ALLOCATOR_UNKNOWN.to_string()
 }
 
 /// The `warm_catalog` regime a report should record. `--warm-catalog` reuses
@@ -1763,6 +1782,7 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
             // reaches the fetcher, so the requested value is the effective one.
             logs_suffix_len: cfg.logs_suffix_len,
             flight_endpoint: None,
+            allocator: crate::allocator::active_allocator(),
         },
         dataset,
         entries,
@@ -1939,6 +1959,10 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
                 None => cfg.logs_suffix_len,
             },
             flight_endpoint: cfg.flight.as_ref().map(|t| t.endpoint.clone()),
+            // Read off this process's own maps regardless of lane: the allocator
+            // governs the benchmark process's RSS, and on the Flight lane the
+            // server's allocator is its own concern, not recorded here.
+            allocator: crate::allocator::active_allocator(),
         },
         dataset,
         entries,
@@ -2150,6 +2174,51 @@ mod tests {
 
     fn empty_store() -> Arc<dyn ObjectStoreBackend> {
         Arc::new(MemoryStore::new())
+    }
+
+    /// The allocator is stamped into provenance and serializes with its exact
+    /// value, and a report written before the field existed deserializes to the
+    /// explicit unknown rather than a guessed allocator (issue #972).
+    ///
+    /// To watch the back-compat half fail: change `default_allocator` to return
+    /// `"system".to_string()`. The `without`-field report then deserializes to
+    /// `"system"` and the final assertion reads `system == unknown`. To watch
+    /// the serialization half fail: drop `"allocator"` from the round-tripped
+    /// value's expected key.
+    #[test]
+    fn provenance_records_the_allocator_and_defaults_it_to_unknown() {
+        // A report written after this field exists carries it verbatim, and it
+        // round-trips through JSON with its exact value.
+        let with = serde_json::json!({
+            "store_backend": "s3",
+            "region": "us-east-1",
+            "endpoint": "n/a",
+            "host_logical_cores": 8,
+            "source": "generate",
+            "dataset_id": "t",
+            "runs": 3,
+            "cache_bytes": 0,
+            "allocator": "tcmalloc"
+        });
+        let p: Provenance = serde_json::from_value(with).expect("deserialize");
+        assert_eq!(p.allocator, crate::allocator::ALLOCATOR_TCMALLOC);
+        let round = serde_json::to_value(&p).expect("serialize");
+        assert_eq!(round["allocator"], "tcmalloc");
+
+        // A report written before the field existed omits it, and deserializes
+        // to the explicit unknown, never a guessed allocator.
+        let without = serde_json::json!({
+            "store_backend": "s3",
+            "region": "us-east-1",
+            "endpoint": "n/a",
+            "host_logical_cores": 8,
+            "source": "generate",
+            "dataset_id": "t",
+            "runs": 3,
+            "cache_bytes": 0
+        });
+        let p: Provenance = serde_json::from_value(without).expect("deserialize");
+        assert_eq!(p.allocator, crate::allocator::ALLOCATOR_UNKNOWN);
     }
 
     /// Write `objects` RLOG objects (one record each) on `shard` for `tenant`,

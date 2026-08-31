@@ -488,6 +488,7 @@ fn provenance_header(p: &Provenance, d: &DatasetInfo) -> String {
         "  host       : {} logical cores\n",
         p.host_logical_cores
     ));
+    out.push_str(&format!("  allocator  : {}\n", p.allocator));
     out.push_str(&format!(
         "  source     : {}  dataset={}\n",
         p.source, p.dataset_id
@@ -827,6 +828,7 @@ mod tests {
             warm_catalog: Some(false),
             logs_suffix_len: None,
             flight_endpoint: None,
+            allocator: ravel_bench::allocator::ALLOCATOR_SYSTEM.to_string(),
         }
     }
 
