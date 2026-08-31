@@ -70,7 +70,12 @@ message DeclaredColumnStatValue {
 // guess.
 message DeclaredColumnMinMax {
   string name = 1;
-  uint32 declared_type = 2;  // ravel.sys.v1.TypedAttrColumnType as i32
+  // ravel.sys.v1.TypedAttrColumnType's number as a uint32 (no cross-file
+  // proto import in this repo; same convention as SnapshotPartHeader.signal).
+  // Every defined number is non-negative, so no negative discriminant is
+  // representable here: an out-of-range value is a decode-time drop, never a
+  // sign question.
+  uint32 declared_type = 2;
   DeclaredColumnStatValue min = 3;
   DeclaredColumnStatValue max = 4;
   // Rows in this object where the declared column reads NULL (name absent,
