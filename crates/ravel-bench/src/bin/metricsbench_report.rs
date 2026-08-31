@@ -144,34 +144,6 @@ fn os_string() -> String {
     command_stdout("uname", &["-srm"]).unwrap_or_else(|| std::env::consts::OS.to_string())
 }
 
-/// The human CPU name from the first `model name` line of `/proc/cpuinfo`. An
-/// unreadable or `model name`-less `/proc/cpuinfo` is a loud error, never an
-/// `"unknown"` string masquerading as a real CPU.
-fn cpu_model() -> Result<String, String> {
-    let text = std::fs::read_to_string("/proc/cpuinfo")
-        .map_err(|e| format!("cannot determine hardware.cpu_model: read /proc/cpuinfo: {e}"))?;
-    parse_cpu_model(&text).ok_or_else(|| {
-        "cannot determine hardware.cpu_model: no non-empty `model name` line in /proc/cpuinfo"
-            .to_string()
-    })
-}
-
-/// The first non-empty `model name` value in `/proc/cpuinfo` content. Split from
-/// the file read so the parse is testable on fixed input.
-fn parse_cpu_model(cpuinfo: &str) -> Option<String> {
-    for line in cpuinfo.lines() {
-        if let Some((key, value)) = line.split_once(':')
-            && key.trim() == "model name"
-        {
-            let model = value.trim();
-            if !model.is_empty() {
-                return Some(model.to_string());
-            }
-        }
-    }
-    None
-}
-
 fn logical_cores() -> u32 {
     std::thread::available_parallelism()
         .map(|n| n.get() as u32)
@@ -257,7 +229,13 @@ fn run() -> Result<(), String> {
                 protocol,
                 hardware: Hardware {
                     os: os_string(),
-                    cpu_model: cpu_model()?,
+                    // Best-effort and infallible: ARM and macOS name the CPU in
+                    // a form other than x86's `model name`, and a host that
+                    // names it in none records `"unknown"` rather than aborting
+                    // the stamp (issue #976). `hardware.cpu_model` is
+                    // deliberately not a checked identity field, so an
+                    // `"unknown"` here is visible but not blocking.
+                    cpu_model: ravel_bench::bench_env::cpu_model(),
                     logical_cores: logical_cores(),
                     instance_type: std::env::var("RAVEL_INSTANCE_TYPE")
                         .ok()
@@ -372,25 +350,7 @@ mod tests {
         );
     }
 
-    /// A `/proc/cpuinfo` with no `model name` line yields no CPU model, so
-    /// `cpu_model` errors rather than returning `"unknown"`.
-    #[test]
-    fn cpuinfo_without_a_model_name_line_has_no_cpu_model() {
-        assert_eq!(parse_cpu_model("processor : 0\nvendor_id : X\n"), None);
-    }
-
-    /// A blank `model name` value is not a CPU model either.
-    #[test]
-    fn a_blank_model_name_value_has_no_cpu_model() {
-        assert_eq!(parse_cpu_model("model name :    \n"), None);
-    }
-
-    /// A real `model name` line parses to its trimmed value.
-    #[test]
-    fn a_model_name_line_parses_to_its_value() {
-        assert_eq!(
-            parse_cpu_model("model name : AMD EPYC 7R13\n"),
-            Some("AMD EPYC 7R13".to_string())
-        );
-    }
+    // The CPU-model resolution moved to `ravel_bench::bench_env` (one shared
+    // resolver for both provenance sites, issue #976); its per-key-form tests
+    // live beside it there.
 }
