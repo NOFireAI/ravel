@@ -118,7 +118,10 @@ cr_walkthroughs=$(echo "${issue_comments_json}" | jq --arg sha "${head_sha}" \
 # head, is the signal. The two counts stay on the summary line as
 # informational context and no longer gate.
 risk_fields="$(echo "${issue_comments_json}" | jq -r -f "$(dirname "$0")/lib/coderabbit-risk.jq")"
-risk_sha="$(printf '%s' "${risk_fields}" | cut -f1)"
+# Lowercase before the prefix test: the jq capture admits uppercase hex and
+# headRefOid is lowercase, and a case mismatch would report a fresh assessment
+# as stale, blocking a valid merge.
+risk_sha="$(printf '%s' "${risk_fields}" | cut -f1 | tr '[:upper:]' '[:lower:]')"
 risk_pause="$(printf '%s' "${risk_fields}" | cut -f2)"
 # The risk sha is a short prefix of the commit it covers, so this is a prefix
 # test, guarded on a non-empty sha first: an empty prefix matches every head.
