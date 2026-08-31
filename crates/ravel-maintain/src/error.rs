@@ -89,6 +89,14 @@ pub enum MaintainError {
         /// absent at post-publish HEAD verification.
         part_key: String,
     },
+    #[error(
+        "compaction converged on a prior record that references part {part_key:?}, which is absent and cannot be repaired from this run (its bytes were released at PUT under bounded compaction, or this run never built it). Reporting convergence here would leave a published record pointing at a hole that later L0 cleanup turns into data loss. Re-run the compaction: the rerun rebuilds the byte-identical part and its PUT of the now-absent key is a fresh put that restores it before the record resolves"
+    )]
+    ConvergedWinnerPartMissing {
+        /// Object key the winner record references that answered NotFound at
+        /// convergence HEAD verification and could not be re-PUT from RAM.
+        part_key: String,
+    },
     #[error("compaction invariant breach: {0}")]
     Invariant(String),
     #[error(

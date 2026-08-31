@@ -393,3 +393,107 @@ async fn rerun_after_vanished_part_converges_by_presence() {
         .await
         .expect("inputs still live");
 }
+
+/// The unrepairable convergence arms fail closed (review findings on PR
+/// #1004). Same tombstone-race prologue as
+/// `rerun_after_vanished_part_converges_by_presence`, but the winner's part is
+/// deleted AGAIN after the rerun's `build_parts` (which restored it) and
+/// before the rerun's `publish_record`. The rerun's own copy of the part
+/// released its bytes at PUT (bounded compaction), so `resolve_already_exists`
+/// HEADs an absent key it cannot re-PUT: reporting
+/// `Converged { parts_repaired: 0 }` there would leave the published record
+/// referencing a hole that later L0 cleanup turns into data loss. Both
+/// cannot-repair arms must return `ConvergedWinnerPartMissing`.
+///
+/// Flip proof (non-vacuous): revert the `Some(_) | None =>` arm in
+/// `publish.rs::resolve_already_exists` to the pre-fix `tracing::warn!` +
+/// fall-through, and both assertions here fail with
+/// `Ok(Converged { parts_repaired: 0 })`.
+#[tokio::test]
+async fn rerun_with_revanished_part_fails_typed_not_converged() {
+    let store = MemoryStore::new();
+    let bucket = seed_one_part_bucket(&store).await;
+    let config = CompactorConfig::default();
+    let commit_keys = list_bucket(&store, &bucket)
+        .await
+        .expect("list")
+        .commit_keys;
+
+    // Reach the loud-failure state exactly as the convergence test does.
+    let abandoned_keys = abandoned_build(&store, &config, &bucket, &commit_keys).await;
+    let vanished = abandoned_keys[0].clone();
+
+    let inputs = load_inputs(&store, &bucket, &commit_keys, config.input_read_concurrency)
+        .await
+        .expect("inputs");
+    let hash = input_set_hash(&inputs);
+    let catalogs = load_catalogs(&store, &config, &inputs).await;
+    let parts = RlogCodec::build_parts(&store, &config, &bucket, &inputs, catalogs, &hash)
+        .await
+        .expect("race build_parts");
+    store.delete(&vanished).await.expect("delete part");
+
+    let clock = FixedClock::new(sealed_now_ns());
+    let loud = publish_record(
+        &store,
+        &config,
+        &clock,
+        &bucket,
+        &inputs,
+        &hash,
+        &parts,
+        sealed_now_ns(),
+    )
+    .await;
+    assert!(
+        matches!(loud, Err(MaintainError::AlreadyExistsPartVanished { .. })),
+        "the race run fails loud, got {loud:?}"
+    );
+
+    // Rerun: build_parts restores the part with a fresh PUT and releases its
+    // bytes; then the part vanishes AGAIN before the record resolves (the same
+    // sweep/tombstone window, one step later).
+    let rerun_catalogs = load_catalogs(&store, &config, &inputs).await;
+    let rerun_parts =
+        RlogCodec::build_parts(&store, &config, &bucket, &inputs, rerun_catalogs, &hash)
+            .await
+            .expect("rerun build_parts");
+    let ours = rerun_parts
+        .iter()
+        .find(|p| p.key == vanished)
+        .expect("the rerun rebuilds the same content-addressed key");
+    assert!(
+        ours.bytes.is_none(),
+        "bounded compaction released the rerun part's bytes at PUT, so no \
+         in-RAM repair exists (the premise of the cannot-repair arm)"
+    );
+    store.delete(&vanished).await.expect("delete part again");
+
+    // Some(_) arm: this run built the part but holds no bytes.
+    let outcome = publish_record(
+        &store,
+        &config,
+        &clock,
+        &bucket,
+        &inputs,
+        &hash,
+        &rerun_parts,
+        sealed_now_ns(),
+    )
+    .await;
+    match outcome {
+        Err(MaintainError::ConvergedWinnerPartMissing { part_key }) => {
+            assert_eq!(part_key, vanished, "the error names the absent part");
+        }
+        other => panic!("an unrepairable missing winner part must fail typed, got {other:?}"),
+    }
+
+    // The None arm (a winner part this run never built) shares the same
+    // `Some(_) | None` return in `resolve_already_exists`, so the assertion
+    // above covers its behaviour. It cannot be reached through
+    // `publish_record`'s front door: sample-count conservation rejects a part
+    // set that omits content (`ConservationViolation`), and a same-hash winner
+    // referencing a key this deterministic, content-addressed build did not
+    // produce would require a corrupted record. The arm stays as
+    // defense-in-depth against exactly that corruption.
+}

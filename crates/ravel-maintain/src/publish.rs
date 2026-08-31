@@ -23,7 +23,11 @@ pub enum PublishOutcome {
     /// This run's `CreateIfAbsent` landed the record; we are the winner.
     Published,
     /// A prior or racing run already published an equivalent record (same
-    /// `input_set_hash`); we HEAD-and-repaired its parts and converged.
+    /// `input_set_hash`); we HEAD-verified its parts, re-PUT any we could,
+    /// and every referenced part is present. A part that is missing and not
+    /// repairable from this run is a typed
+    /// [`crate::MaintainError::ConvergedWinnerPartMissing`], never this
+    /// variant: `Converged` means whole, not merely resolved.
     Converged { parts_repaired: usize },
     /// The `max_compaction_lifetime` deadline passed before the record PUT;
     /// the run abandoned and did NOT publish. Its parts
@@ -265,7 +269,10 @@ fn checked_sample_sum(counts: impl Iterator<Item = u64>) -> Result<u64> {
 
 /// GET the record that beat us. Same `input_set_hash`: HEAD every part it
 /// references and re-PUT any our-built part that is missing (content-addressed
-/// keys make this safe), then report convergence. Different `input_set_hash`:
+/// keys make this safe), then report convergence. A missing part this run
+/// cannot re-PUT (bytes released at PUT, or never built here) is a typed
+/// [`MaintainError::ConvergedWinnerPartMissing`], never a silent convergence:
+/// the record would reference an absent object. Different `input_set_hash`:
 /// a sealed bucket cannot legitimately hold two input sets, so alarm and stop
 /// without deleting anything.
 async fn resolve_already_exists(
@@ -305,20 +312,16 @@ async fn resolve_already_exists(
                         crate::build::put_part(store, ours).await?;
                         repaired += 1;
                     }
-                    Some(_) => {
-                        tracing::warn!(
-                            key = %part_key,
-                            "winner references a part this run built but whose bytes were released \
-                             at PUT (bounded compaction); cannot repair from RAM. Re-run the \
-                             compaction to rebuild and re-PUT it"
-                        );
-                    }
-                    None => {
-                        tracing::warn!(
-                            key = %part_key,
-                            "winner references a part this run did not build; cannot repair. \
-                             Re-run the compaction to rebuild and re-PUT it"
-                        );
+                    // Cannot repair (bytes released at PUT, or a part this run
+                    // never built): fail closed. Returning Converged here would
+                    // hand the driver a whole bucket over a record that
+                    // references an absent object, and later L0 cleanup turns
+                    // that hole into data loss. The typed error carries the
+                    // remedy (re-run; the rerun's fresh PUT restores the key),
+                    // matching the fresh-record arm's
+                    // AlreadyExistsPartVanished loudness.
+                    Some(_) | None => {
+                        return Err(MaintainError::ConvergedWinnerPartMissing { part_key });
                     }
                 }
             }
