@@ -215,6 +215,7 @@ fn commit_with_max_event(max_event_ts_ns: i64) -> CommitRecord {
         segment_format_version: 1,
         created_unix_ns: 0,
         ingest_hour_bucket: 0,
+        declared_column_stats: Vec::new(),
     }
 }
 

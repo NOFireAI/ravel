@@ -2896,6 +2896,7 @@ mod tests {
             min_event_ts_ns: 1_000,
             max_event_ts_ns: 1_000,
             segment_format_version: 3,
+            declared_column_stats: Vec::new(),
         };
         let inputs = vec![superseded.clone()];
         let applied = vec![request_id.to_string()];

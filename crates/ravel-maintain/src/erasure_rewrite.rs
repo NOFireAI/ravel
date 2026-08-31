@@ -1146,6 +1146,7 @@ fn build_rewrite_part(
         min_event_ts_ns: written.summary.min_event_ts_ns,
         max_event_ts_ns: written.summary.max_event_ts_ns,
         segment_format_version: OUTPUT_FORMAT_VERSION,
+        declared_column_stats: Vec::new(),
     };
     Ok(BuiltPart {
         key,

@@ -675,7 +675,24 @@ only after `grace + max_flush_lifetime` with a re-verify before delete
 Commit record: `ravel.commit.v1.CommitRecord` protobuf: tenant_hash, signal,
 shard, writer_id, epoch, seq, ingest_hour_bucket, object_key, object_size,
 content_hash (32B), sample_count, series_count, min/max event ts, min/max
-ingest ts, format_version, created_unix_ns.
+ingest ts, format_version, created_unix_ns, declared_column_stats.
+
+`declared_column_stats` (field 20, ADR-0873) carries the writer-computed
+exact whole-object min, max, and null count for each stamp-eligible declared
+typed attribute column (I64 and BOOL only; STR, BYTES, and ADR-0101's `f64`
+are refused by the allowlist in `ravel-types::declared_stats`). It is
+additive and permanently optional, and `format_version` stays 1: an empty
+list means the object is uncovered for every declared column, which is the
+normal state of every record written before ADR-0873, of every
+metrics/spans record, and of any column declared after the flush opened.
+Absence costs a reader the statistics shortcut and never yields a wrong
+answer, so it is never an error. A decoder validates each entry against the
+allowlist and drops (and counts) an entry whose declared type is ineligible
+or whose min/max kinds disagree with it; a defective statistic leaves that
+column uncovered and never makes the record unreadable.
+`CompactionPart.declared_column_stats` (field 12) is the same statement per
+compaction or erasure-rewrite output part, recomputed over the rows that
+part holds and never copied from an input's stamp.
 
 `object_key` is informational. Readers MUST reconstruct the data key from
 (tenant_hash, signal, shard, writer_id, epoch, seq, content_hash) and treat

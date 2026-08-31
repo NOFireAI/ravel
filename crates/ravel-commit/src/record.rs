@@ -97,6 +97,10 @@ pub fn build(input: NewCommitRecord) -> Result<CommitRecord, RecordError> {
         segment_format_version: input.segment_format_version,
         created_unix_ns: input.created_unix_ns,
         ingest_hour_bucket: input.ingest_hour_bucket,
+        // Stamped by the writer that encoded the object, through
+        // [`crate::declared_stats::stamp_commit_record`] (ADR-0873 decision
+        // 3), never derived here. Empty is a permanently legal state.
+        declared_column_stats: Vec::new(),
     };
     validate(&record)?;
     Ok(record)

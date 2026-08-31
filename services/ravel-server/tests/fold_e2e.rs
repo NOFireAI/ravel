@@ -715,6 +715,7 @@ async fn seed_compaction(
         min_event_ts_ns: i64::from(hour) * NS_PER_HOUR + 1,
         max_event_ts_ns: i64::from(hour) * NS_PER_HOUR + NS_PER_HOUR / 2,
         segment_format_version: 3,
+        declared_column_stats: Vec::new(),
     };
     let record = CompactionRecord {
         format_version: 1,

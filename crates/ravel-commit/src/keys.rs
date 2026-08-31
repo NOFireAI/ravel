@@ -1516,6 +1516,7 @@ mod tests {
             segment_format_version: 1,
             created_unix_ns: 0,
             ingest_hour_bucket: 0,
+            declared_column_stats: Vec::new(),
         };
         assert_eq!(
             reconstruct_data_key(&record).expect("reconstruct"),
@@ -1549,6 +1550,7 @@ mod tests {
             segment_format_version: 1,
             created_unix_ns: 0,
             ingest_hour_bucket: 0,
+            declared_column_stats: Vec::new(),
         };
         let err = verify_object_key(&record).expect_err("must be fatal mismatch");
         assert!(matches!(err, ReconstructionError::ObjectKeyMismatch { .. }));
@@ -1798,6 +1800,7 @@ mod tests {
                 min_event_ts_ns: 0,
                 max_event_ts_ns: 0,
                 segment_format_version: 3,
+                declared_column_stats: Vec::new(),
             }],
             created_unix_ns: 0,
         }

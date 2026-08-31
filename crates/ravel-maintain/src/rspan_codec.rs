@@ -759,6 +759,7 @@ pub(crate) async fn finalize_part(
         min_event_ts_ns: ftr.min_start_ts_ns,
         max_event_ts_ns: ftr.max_end_ts_ns,
         segment_format_version: OUTPUT_FORMAT_VERSION,
+        declared_column_stats: Vec::new(),
     };
     let built = BuiltPart {
         key,
