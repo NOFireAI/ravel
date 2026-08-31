@@ -24,7 +24,7 @@ one immutable columnar object in memory, and writes it with two PUTs: the
 data object first, then a commit record. The commit record is the publish:
 readers see only data that a commit record names.
 
-Acknowledgement has two modes (docs/consistency-model.md is normative).
+Acknowledgement has two modes ([docs/consistency-model.md](consistency-model.md) is normative).
 Strict mode answers the client only after both PUTs are durable, and the
 response carries a commit token. A query that presents that token reads the
 write with no listing race. Buffered mode answers after admission and
@@ -36,9 +36,9 @@ rather than honored.
 All three signals share this pipeline. Remote Write payloads normalize to
 the same shape OTLP produces and enter the same router call, so there is no
 second flush or commit path to hold correct. Every persistent layout the
-path writes is a frozen contract: the RSEG layout (docs/segment-format.md),
-the RLOG layout (docs/log-segment-format.md), the protobuf schemas under
-proto/, and the object key layout (docs/catalog-and-mvcc.md).
+path writes is a frozen contract: the RSEG layout ([docs/segment-format.md](segment-format.md)),
+the RLOG layout ([docs/log-segment-format.md](log-segment-format.md)), the protobuf schemas under
+proto/, and the object key layout ([docs/catalog-and-mvcc.md](catalog-and-mvcc.md)).
 
 ## The catalog and the read path
 
@@ -52,7 +52,7 @@ compare-and-swap. Two folders can race safely: the loser's CAS fails and
 nothing is corrupted. An hour seals only after
 `max_flush_lifetime + clock_skew_allowance + fold_safety_margin` has passed,
 so a fold that runs right after a write finds nothing eligible. That is the
-expected answer, not a failure. docs/catalog-and-mvcc.md holds the exact
+expected answer, not a failure. [docs/catalog-and-mvcc.md](catalog-and-mvcc.md) holds the exact
 protocol.
 
 A query starts with one GET of HEAD, which pins one immutable snapshot.
@@ -159,8 +159,8 @@ under an ordinary per-remote credential. The remote resolves its own
 snapshot under its own erasure state. No segment reference, S3 credential,
 or client credential ever crosses the boundary. A slow or unreachable
 remote degrades to partial coverage, and that state is always visible in
-the query's stats and warnings. docs/query-engine.md and
-docs/guides/distributed-query.md hold the full contract.
+the query's stats and warnings. [docs/query-engine.md](query-engine.md) and
+[docs/guides/distributed-query.md](guides/distributed-query.md) hold the full contract.
 
 ## Analytics and alerting
 
@@ -231,5 +231,5 @@ ravel-test-util (types, object-store) used by all dev-deps
 ```
 
 Each crate's normative doc is listed in the doc map in CLAUDE.md and in
-[docs/README.md](README.md). docs/consistency-model.md governs
+[docs/README.md](README.md). [docs/consistency-model.md](consistency-model.md) governs
 acknowledgement, visibility, and crash behavior everywhere.
