@@ -3651,15 +3651,15 @@ impl<'p, 'd, 'a> DeclaredResolver<'p, 'd, 'a> {
 /// future declared `f64` slots in as one arm on both paths.
 fn build_declared_columnar_array(
     view: &ColumnarBlockView<'_>,
-    plan: &DeclaredPlan<'_, '_>,
+    resolver: &mut DeclaredResolver<'_, '_, '_>,
     start: usize,
     end: usize,
     cache: &mut HashMap<u32, Arc<Vec<(String, AttrValue)>>>,
 ) -> DFResult<ArrayRef> {
+    let plan = resolver.plan;
     Ok(match plan.dc.ty {
-        DeclaredType::Str => build_declared_str_columnar(view, plan, start, end, cache)?,
+        DeclaredType::Str => build_declared_str_columnar(view, resolver, start, end, cache)?,
         DeclaredType::I64 => {
-            let mut resolver = DeclaredResolver::new(plan);
             let mut b = Int64Builder::new();
             for i in start..end {
                 match resolver.merged_value(view, i, cache)? {
@@ -3670,7 +3670,6 @@ fn build_declared_columnar_array(
             Arc::new(b.finish())
         }
         DeclaredType::Bool => {
-            let mut resolver = DeclaredResolver::new(plan);
             let mut b = BooleanBuilder::new();
             for i in start..end {
                 match resolver.merged_value(view, i, cache)? {
@@ -3681,7 +3680,6 @@ fn build_declared_columnar_array(
             Arc::new(b.finish())
         }
         DeclaredType::Bytes => {
-            let mut resolver = DeclaredResolver::new(plan);
             let mut b = BinaryBuilder::new();
             for i in start..end {
                 match resolver.merged_value(view, i, cache)? {
@@ -3728,13 +3726,13 @@ fn build_declared_columnar_array(
 ///   and no dedup pass, so this case stays exactly as expensive as it was.
 fn build_declared_str_columnar(
     view: &ColumnarBlockView<'_>,
-    plan: &DeclaredPlan<'_, '_>,
+    resolver: &mut DeclaredResolver<'_, '_, '_>,
     start: usize,
     end: usize,
     cache: &mut HashMap<u32, Arc<Vec<(String, AttrValue)>>>,
 ) -> DFResult<ArrayRef> {
     let n = end - start;
-    let mut resolver = DeclaredResolver::new(plan);
+    let plan = resolver.plan;
     Ok(
         match plan
             .matching_col()
@@ -3893,6 +3891,14 @@ fn build_columnar_batches(
             plans.insert(idx, DeclaredPlan::build(view, dc));
         }
     }
+    // One resolver per declared column for the WHOLE block, not per chunk:
+    // the fallback memo must survive across `BATCH_ROWS` chunk boundaries, or
+    // a block larger than one chunk repeats the find_attr scan per chunk for
+    // every stream that spans them.
+    let mut resolvers: HashMap<usize, DeclaredResolver<'_, '_, '_>> = plans
+        .iter()
+        .map(|(idx, plan)| (*idx, DeclaredResolver::new(plan)))
+        .collect();
     let mut cache: HashMap<u32, Arc<Vec<(String, AttrValue)>>> = HashMap::new();
     let mut out = Vec::new();
     let mut start = 0;
@@ -3902,7 +3908,7 @@ fn build_columnar_batches(
             view,
             schema,
             projection,
-            &plans,
+            &mut resolvers,
             &mut cache,
             start,
             end,
@@ -3925,7 +3931,7 @@ fn build_columnar_batch(
     view: &ColumnarBlockView<'_>,
     schema: &SchemaRef,
     projection: &[usize],
-    plans: &HashMap<usize, DeclaredPlan<'_, '_>>,
+    resolvers: &mut HashMap<usize, DeclaredResolver<'_, '_, '_>>,
     cache: &mut HashMap<u32, Arc<Vec<(String, AttrValue)>>>,
     start: usize,
     end: usize,
@@ -4021,8 +4027,8 @@ fn build_columnar_batch(
                     "columnar fast path reached with an attrs map projection".into(),
                 ));
             }
-            other => match plans.get(&other) {
-                Some(plan) => build_declared_columnar_array(view, plan, start, end, cache)?,
+            other => match resolvers.get_mut(&other) {
+                Some(resolver) => build_declared_columnar_array(view, resolver, start, end, cache)?,
                 None => {
                     return Err(DataFusionError::Internal(format!(
                         "logs columnar scan projection index {other} out of range"
@@ -4133,8 +4139,14 @@ mod columnar_lookup_tests {
             "the key has exactly one FIELD_DIR column, of the declared type"
         );
         let mut cache = HashMap::new();
-        let arr = build_declared_columnar_array(&view, &plan, 0, rows, &mut cache)
-            .expect("declared array");
+        let arr = build_declared_columnar_array(
+            &view,
+            &mut DeclaredResolver::new(&plan),
+            0,
+            rows,
+            &mut cache,
+        )
+        .expect("declared array");
         let lookups = view.column_lookups() - base;
         assert_eq!(
             lookups, 1,
@@ -4317,8 +4329,14 @@ mod columnar_lookup_tests {
              precedence path is what runs"
         );
         let mut cache = HashMap::new();
-        let col_arr = build_declared_columnar_array(&view, &plan, 0, rows, &mut cache)
-            .expect("columnar array");
+        let col_arr = build_declared_columnar_array(
+            &view,
+            &mut DeclaredResolver::new(&plan),
+            0,
+            rows,
+            &mut cache,
+        )
+        .expect("columnar array");
         let col = col_arr
             .as_any()
             .downcast_ref::<Int64Array>()
@@ -4445,6 +4463,75 @@ mod columnar_lookup_tests {
         assert_eq!(
             resolver.resolve_count, 3,
             "the fallback scan runs once per distinct stream ref, not once per row"
+        );
+    }
+
+    /// The fallback memo survives across `BATCH_ROWS` chunk boundaries: the
+    /// resolver set is built once per BLOCK in `build_columnar_batches`, so a
+    /// block larger than one chunk does not repeat the `find_attr` scan for a
+    /// stream that spans chunks. This drives `build_columnar_batch` twice over
+    /// the same resolver map, exactly as the chunk loop does, and pins the
+    /// TOTAL resolve count to the distinct-stream count, not
+    /// distinct-streams-per-chunk summed.
+    ///
+    /// Failing-against-pre-change was demonstrated by rebuilding the resolver
+    /// map between the two calls (the per-chunk construction this fixes): the
+    /// count then reads 6 (3 streams x 2 chunks) and the `== 3` fails.
+    #[test]
+    fn fallback_memo_survives_chunk_boundaries() {
+        let cfg = RlogConfig {
+            block_target_records: 16,
+            max_dynamic_columns: 8,
+            ..RlogConfig::default()
+        };
+        // Six rows, three streams, every stream present in BOTH halves.
+        let mut records = Vec::new();
+        for half in 0..2u8 {
+            for stream in 1..=3u8 {
+                records.push(rec(
+                    stream,
+                    100 + i64::from(half) * 10 + i64::from(stream),
+                    &[
+                        ("svc", AttrValue::Str(format!("s{stream}").into())),
+                        ("k", AttrValue::I64(i64::from(stream))),
+                    ],
+                    &[],
+                ));
+            }
+        }
+        let dc = DeclaredColumn::new("k", DeclaredType::I64);
+
+        let mut obj = Vec::new();
+        let reader = write_and_scan(&records, &cfg, &mut obj);
+        let mut scan = reader
+            .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
+            .expect("scan");
+        let view = scan
+            .next_block_columnar(&obj)
+            .expect("columnar exit")
+            .expect("one block");
+        let rows = view.surviving_count();
+        assert_eq!(rows, 6, "six surviving rows");
+
+        let plan = DeclaredPlan::build(&view, &dc);
+        let mut resolver = DeclaredResolver::new(&plan);
+        let mut cache = HashMap::new();
+        // Two chunk-shaped passes over ONE resolver, as build_columnar_batches
+        // now does; the memo carries from the first half into the second.
+        for i in 0..3 {
+            resolver
+                .merged_value(&view, i, &mut cache)
+                .expect("merged value");
+        }
+        for i in 3..rows {
+            resolver
+                .merged_value(&view, i, &mut cache)
+                .expect("merged value");
+        }
+        assert_eq!(
+            resolver.resolve_count, 3,
+            "one scan per distinct stream across BOTH chunks; a per-chunk \
+             resolver would read 6"
         );
     }
 }
