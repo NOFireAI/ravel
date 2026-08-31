@@ -121,6 +121,7 @@ fn part(part_index: u32, hour: u32, seed: u8) -> CompactionPart {
         min_event_ts_ns: event,
         max_event_ts_ns: event + 100,
         segment_format_version: u32::from(VERSION_V7),
+        declared_column_stats: Vec::new(),
     }
 }
 

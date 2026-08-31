@@ -649,6 +649,7 @@ mod tests {
                     min_event_ts_ns: 0,
                     max_event_ts_ns: 0,
                     segment_format_version: 3,
+                    declared_column_stats: Vec::new(),
                 }
             })
     }

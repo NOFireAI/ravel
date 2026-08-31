@@ -97,6 +97,7 @@ fn part(part_index: u32, min_event_ts_ns: i64, max_event_ts_ns: i64, seed: u8) -
         min_event_ts_ns,
         max_event_ts_ns,
         segment_format_version: u32::from(VERSION_V7),
+        declared_column_stats: Vec::new(),
     }
 }
 
