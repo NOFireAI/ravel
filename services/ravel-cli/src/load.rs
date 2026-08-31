@@ -376,7 +376,11 @@ pub fn target_bytes_no_effect_warning(
         "warning: --target-bytes {target_bytes} did not change this load's object layout. All \
          {writes} (batch, shard) writes flushed as their own object ({objects} objects), which is \
          what --target-bytes 1 produces, and at least one shard took two or more writes without \
-         accumulating them. The target is compared against the shard buffer's ESTIMATED in-memory \
+         accumulating them. This is the OBSERVED layout, not proof the target was the lever: \
+         with --pipeline-depth 1, or when the gap between a shard's writes exceeds the \
+         max-flush-delay clock, the age trigger flushes a waiting buffer before the next \
+         batch arrives and no target value can make it accumulate -- check the pipeline \
+         depth and write cadence before changing the target. Separately, the target is compared against the shard buffer's ESTIMATED in-memory \
          footprint, not the encoded object size: every attribute occurrence charges a {pair}-byte \
          (name, value) pair header plus its key and uncompressed value bytes, plus the \
          stream-attribute blob and 32 bytes per row, and the check runs once per write after a \
