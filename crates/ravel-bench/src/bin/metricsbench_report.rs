@@ -273,6 +273,7 @@ fn run() -> Result<(), String> {
                 generator_digest: file_digest(&workload)?,
                 corpus_digest: file_digest(&corpus)?,
                 config,
+                allocator: ravel_bench::allocator::active_allocator(),
             };
             // Prove the stamp we emit is one a report would accept: a producer
             // that pasted this block into a report and then failed validation on

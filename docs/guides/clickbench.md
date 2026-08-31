@@ -567,8 +567,13 @@ Tick every line before putting two reports side by side.
   not recorded here, so the two runs are comparable on it only if you know both
   servers were configured the same.
 - Same allocator. An `LD_PRELOAD` of tcmalloc against the default glibc changes
-  peak RSS by about 2x, and the allocator is not in the provenance, so it goes
-  in the report's caption.
+  peak RSS by about 2x. The allocator is in the provenance (the `allocator`
+  field, resolved at runtime by reading the process's mapped libraries from
+  `/proc/self/maps`, so an `LD_PRELOAD` shows up as `tcmalloc`/`jemalloc`/
+  `mimalloc` and a plain run as `system`), so compare on that field, not on a
+  caption. A run whose allocator could not be probed records `unknown`; two
+  reports are comparable on peak RSS only if both name the same allocator and
+  neither is `unknown`.
 - Same dataset stanza: object count, rows, and the layout label from
   `--compaction`.
 

@@ -225,6 +225,26 @@ pub struct Provenance {
     /// The complete non-default configuration.
     #[serde(default)]
     pub config: Vec<ConfigEntry>,
+    /// The heap allocator the measuring process actually ran under, resolved at
+    /// runtime from its mapped libraries (`crate::allocator::active_allocator`):
+    /// `"tcmalloc"`, `"jemalloc"`, `"mimalloc"`, `"system"` (glibc/musl), or
+    /// `"unknown"` when the probe could not answer. Peak RSS moves by about 2x
+    /// between the system allocator and a memory-returning one, and the allocator
+    /// can arrive via `LD_PRELOAD` a compile-time `cfg!` cannot see, so it is read
+    /// off `/proc/self/maps` (issue #972). Unlike the identity fields above,
+    /// `"unknown"` is a legitimate recorded value here (the probe ran and could
+    /// not answer), so it is deliberately NOT in [`checked_provenance_fields`]:
+    /// an explicit unknown is honest, and a guessed allocator that read as
+    /// verified would be the defect this closes. A report written before this
+    /// field existed deserializes to [`crate::allocator::ALLOCATOR_UNKNOWN`].
+    #[serde(default = "default_allocator")]
+    pub allocator: String,
+}
+
+/// What a report written before the allocator was recorded (issue #972)
+/// deserializes to: the explicit unknown, never a guessed allocator.
+fn default_allocator() -> String {
+    crate::allocator::ALLOCATOR_UNKNOWN.to_string()
 }
 
 /// One figure a measurement reports, named so the report is self-describing and
@@ -864,6 +884,7 @@ pub fn render(report: &MetricsBenchReport) -> Result<String, RenderError> {
             None => String::new(),
         }
     );
+    let _ = writeln!(out, "  allocator : {}", p.allocator);
     if p.comparators.is_empty() {
         out.push_str("  comparators: none (Ravel-only diagnostic run)\n");
     } else {
@@ -1035,6 +1056,7 @@ mod tests {
                 key: "max_flush_delay_ms".to_string(),
                 value: "2000".to_string(),
             }],
+            allocator: crate::allocator::ALLOCATOR_TCMALLOC.to_string(),
         }
     }
 
@@ -1530,6 +1552,39 @@ mod tests {
         let back: MetricsBenchReport = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(report, back);
         validate(&back).expect("the round-tripped report validates");
+    }
+
+    /// The allocator is serialized into provenance with its exact value, and a
+    /// report written before the field existed deserializes to the explicit
+    /// unknown rather than a guessed allocator (issue #972).
+    ///
+    /// To watch the serialization half fail: change `valid_provenance`'s
+    /// `allocator` to `ALLOCATOR_JEMALLOC`; the exact-value assertion then reads
+    /// `jemalloc == tcmalloc`. To watch the back-compat half fail: change
+    /// `default_allocator` to return `"system"`; the field-stripped report then
+    /// deserializes to `system` and the last assertion reads `system == unknown`.
+    #[test]
+    fn provenance_records_the_allocator_and_defaults_it_to_unknown() {
+        let report = valid_report();
+        let value = serde_json::to_value(&report).expect("serialize");
+        assert_eq!(
+            value["provenance"]["allocator"], "tcmalloc",
+            "the allocator serializes with its exact value: {value}"
+        );
+
+        // A report written before the field existed omits it, and deserializes
+        // to the explicit unknown, never a guessed allocator.
+        let mut doc = value;
+        doc["provenance"]
+            .as_object_mut()
+            .expect("provenance object")
+            .remove("allocator");
+        let back: MetricsBenchReport =
+            serde_json::from_value(doc).expect("deserialize a report with no allocator field");
+        assert_eq!(
+            back.provenance.allocator,
+            crate::allocator::ALLOCATOR_UNKNOWN
+        );
     }
 
     // --- FINDING 1: configuration entries are validated, not merely present. ---

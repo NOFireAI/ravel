@@ -48,6 +48,7 @@ fn valid_report() -> MetricsBenchReport {
             generator_digest: "blake3:1111".to_string(),
             corpus_digest: "blake3:2222".to_string(),
             config: vec![],
+            allocator: ravel_bench::allocator::ALLOCATOR_SYSTEM.to_string(),
         },
         measurements: vec![Measurement {
             id: "mb_fanout_total_rate".to_string(),
