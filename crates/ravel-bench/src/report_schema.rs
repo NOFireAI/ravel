@@ -58,11 +58,92 @@ use serde::{Deserialize, Serialize};
 use crate::allocator::Allocator;
 use crate::promql_corpus::CostClass;
 
-/// The report schema version. A report declaring any other version is refused
+/// The report schema version every writer stamps: the newest version this build
+/// emits. A report declaring a version outside [`SUPPORTED_VERSIONS`] is refused
 /// rather than parsed optimistically (the same contract
 /// [`crate::promql_corpus::CORPUS_FORMAT_VERSION`] carries): the field exists so
-/// a future schema change is a loud error, not a silently misread document.
-pub const SCHEMA_VERSION: u32 = 1;
+/// a schema change is a loud error, not a silently misread document.
+///
+/// Version 2 adds `Provenance::allocator` (issue #972). Two document shapes
+/// under one version number would defeat the field: a reader built before the
+/// allocator existed would accept a version-1 document it cannot fully read, and
+/// nothing would tell a consumer which shape it holds.
+pub const SCHEMA_VERSION: u32 = 2;
+
+/// The set of report schema versions this build reads. Writers always stamp
+/// [`SCHEMA_VERSION`]; readers accept that version and the immediately preceding
+/// one, so a report emitted before version 2 added the allocator field still
+/// parses (its absent `allocator` takes [`Allocator::Unknown`] from the serde
+/// default) instead of being refused for a field it could not have carried.
+///
+/// The shape follows the persistent-format crates' `SUPPORTED_VERSIONS`
+/// (`ravel_segment::format`, `ravel_logseg::footer`) so a reviewer reads one
+/// idiom everywhere: a window at most two versions wide, never accepting
+/// anything below its floor, and the single source both [`validate`] and the
+/// error message read.
+pub const SUPPORTED_VERSIONS: SupportedVersions = SupportedVersions::n_and_prev(SCHEMA_VERSION);
+
+/// A window of accepted schema versions, the report-schema counterpart of the
+/// persistent-format crates' type of the same name. `u32` here because
+/// `schema_version` is a JSON number field rather than a packed trailer field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SupportedVersions {
+    newest: u32,
+    oldest: u32,
+}
+
+impl SupportedVersions {
+    /// A window accepting exactly one version. The shape to return to once the
+    /// version-1 reader is retired.
+    pub const fn single(version: u32) -> Self {
+        Self {
+            newest: version,
+            oldest: version,
+        }
+    }
+
+    /// The N/N-1 window: accept `newest` and the immediately preceding version.
+    /// The shape today, so a version-1 report (no `allocator` key) still parses.
+    pub const fn n_and_prev(newest: u32) -> Self {
+        // `newest` is always a real schema version (>= 1), so the predecessor
+        // never underflows.
+        Self {
+            newest,
+            oldest: newest - 1,
+        }
+    }
+
+    /// The newest (always-written) version.
+    pub const fn newest(&self) -> u32 {
+        self.newest
+    }
+
+    /// The oldest accepted version, the window floor.
+    pub const fn oldest(&self) -> u32 {
+        self.oldest
+    }
+
+    /// Whether `version` is inside the accepted window.
+    pub const fn contains(&self, version: u32) -> bool {
+        version >= self.oldest && version <= self.newest
+    }
+}
+
+impl std::fmt::Display for SupportedVersions {
+    /// Renders every accepted version as a set (`{1, 2}`). A window is a set of
+    /// versions, and an error message that printed one number while several are
+    /// accepted would send a reader looking for the wrong mismatch.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("{")?;
+        for (position, version) in (self.oldest..=self.newest).enumerate() {
+            if position > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{version}")?;
+        }
+        f.write_str("}")
+    }
+}
 
 /// The retry-blindness caveat every cost estimate carries (ADR-0927 decision 8,
 /// issue #928). `object_store` retries below `InstrumentedStore` with
@@ -205,7 +286,8 @@ pub struct ConfigEntry {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Provenance {
-    /// The report schema version, which must equal [`SCHEMA_VERSION`].
+    /// The report schema version, which must be one of [`SUPPORTED_VERSIONS`].
+    /// A writer always stamps [`SCHEMA_VERSION`].
     pub schema_version: u32,
     /// The Ravel git commit the numbers describe.
     pub ravel_git_commit: String,
@@ -248,9 +330,11 @@ pub struct Provenance {
     /// (the probe ran and could not answer), so it is deliberately NOT in
     /// [`checked_provenance_fields`]: an explicit unknown is honest, and a
     /// guessed allocator that read as verified would be the defect this closes.
-    /// A report written before this field existed deserializes to
-    /// [`Allocator::Unknown`]; a report carrying an unrecognized allocator
-    /// string is rejected at deserialize.
+    /// Added at schema version 2, so a version-1 report (which cannot carry the
+    /// key) deserializes to [`Allocator::Unknown`]; a version-2 report that omits
+    /// the key reads as `Unknown` too, which is the same honest answer rather
+    /// than a defect. A report carrying an unrecognized allocator string is
+    /// rejected at deserialize.
     #[serde(default = "default_allocator")]
     pub allocator: Allocator,
 }
@@ -356,16 +440,18 @@ pub struct MetricsBenchReport {
 /// acts on.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum ValidationError {
-    /// The report declares a schema version this build does not read.
+    /// The report declares a schema version this build does not read. The error
+    /// names the whole accepted set, not one number: several versions are
+    /// readable, and reporting a single one would misdescribe the mismatch.
     #[error(
-        "report declares schema version {found}, but this build reads version {expected}; a \
+        "report declares schema version {found}, but this build reads versions {expected}; a \
          schema change is a version bump, never a silently misread document"
     )]
-    SchemaVersionMismatch {
+    UnsupportedSchemaVersion {
         /// The version the document declared.
         found: u32,
-        /// The version this build reads ([`SCHEMA_VERSION`]).
-        expected: u32,
+        /// The versions this build reads ([`SUPPORTED_VERSIONS`]).
+        expected: SupportedVersions,
     },
     /// A required provenance field is absent (an empty string, the `"unknown"`
     /// sentinel, an empty digest, zero logical cores). An absent field is not
@@ -619,14 +705,15 @@ fn is_content_digest(value: &str) -> bool {
 
 /// Validate the provenance block, fail-closed. Every present identity field must
 /// carry a real value (not blank, not the `"unknown"` sentinel), the schema
-/// version must match, the hardware must name at least one logical core, every
-/// named comparator must be completely pinned by a real content digest, and the
-/// configuration must carry no blank or duplicate key.
+/// version must be one this build reads ([`SUPPORTED_VERSIONS`]), the hardware
+/// must name at least one logical core, every named comparator must be
+/// completely pinned by a real content digest, and the configuration must carry
+/// no blank or duplicate key.
 fn validate_provenance(p: &Provenance) -> Result<(), ValidationError> {
-    if p.schema_version != SCHEMA_VERSION {
-        return Err(ValidationError::SchemaVersionMismatch {
+    if !SUPPORTED_VERSIONS.contains(p.schema_version) {
+        return Err(ValidationError::UnsupportedSchemaVersion {
             found: p.schema_version,
-            expected: SCHEMA_VERSION,
+            expected: SUPPORTED_VERSIONS,
         });
     }
     for (field, value) in checked_provenance_fields(p) {
@@ -1383,11 +1470,119 @@ mod tests {
         let err = validate(&report).expect_err("a wrong schema version must fail");
         assert_eq!(
             err,
-            ValidationError::SchemaVersionMismatch {
+            ValidationError::UnsupportedSchemaVersion {
                 found: SCHEMA_VERSION + 7,
-                expected: SCHEMA_VERSION,
+                expected: SUPPORTED_VERSIONS,
             }
         );
+    }
+
+    /// The supported-version window is the shape the rest of this module assumes:
+    /// the writer stamps the newest version, the previous one is still read, and
+    /// nothing below the floor or above the newest is accepted.
+    #[test]
+    fn the_supported_version_window_accepts_exactly_1_and_2() {
+        assert_eq!(SCHEMA_VERSION, 2, "the writer stamps version 2");
+        assert_eq!(SUPPORTED_VERSIONS.newest(), SCHEMA_VERSION);
+        assert_eq!(SUPPORTED_VERSIONS.oldest(), 1);
+        assert!(SUPPORTED_VERSIONS.contains(1));
+        assert!(SUPPORTED_VERSIONS.contains(2));
+        assert!(!SUPPORTED_VERSIONS.contains(0));
+        assert!(!SUPPORTED_VERSIONS.contains(3));
+        // The one-version shape this returns to once the version-1 reader is
+        // retired accepts only its own version.
+        let single = SupportedVersions::single(SCHEMA_VERSION);
+        assert!(single.contains(SCHEMA_VERSION));
+        assert!(!single.contains(SCHEMA_VERSION - 1));
+        assert_eq!(single.to_string(), "{2}");
+    }
+
+    /// A version-1 document carries NO `allocator` key (the field did not exist
+    /// at version 1) and must keep validating, reading as the explicit unknown.
+    /// This is the whole reason the exact-equality check became a window: a
+    /// version bump that refused every already-emitted report would break the
+    /// artifacts it was supposed to disambiguate.
+    ///
+    /// To watch it fail: change `SUPPORTED_VERSIONS` to
+    /// `SupportedVersions::single(SCHEMA_VERSION)`. Version 1 leaves the window,
+    /// `validate` returns `UnsupportedSchemaVersion`, and `expect` panics.
+    #[test]
+    fn a_version_1_report_without_an_allocator_key_still_validates_as_unknown() {
+        let mut doc = serde_json::to_value(valid_report()).expect("serialize");
+        let provenance = doc["provenance"]
+            .as_object_mut()
+            .expect("provenance object");
+        provenance.insert("schema_version".to_string(), serde_json::json!(1));
+        provenance
+            .remove("allocator")
+            .expect("the version-2 fixture carried an allocator key to remove");
+        let report: MetricsBenchReport =
+            serde_json::from_value(doc).expect("a version-1 document deserializes");
+        assert_eq!(report.provenance.schema_version, 1);
+        assert_eq!(
+            report.provenance.allocator,
+            Allocator::Unknown,
+            "an absent allocator is the explicit unknown, never a guess"
+        );
+        validate(&report).expect("a version-1 report still validates");
+    }
+
+    /// A version-2 document carrying an allocator validates and round-trips the
+    /// exact value: the bump is what makes the allocator's presence readable from
+    /// the version number alone.
+    ///
+    /// To watch it fail against the pre-change validator: change the version
+    /// check in `validate_provenance` from
+    /// `if !SUPPORTED_VERSIONS.contains(p.schema_version)` to
+    /// `if p.schema_version != 1`, which is the exact-equality check against the
+    /// old `SCHEMA_VERSION`. A version-2 document is then refused and the first
+    /// `expect` panics.
+    #[test]
+    fn a_version_2_report_with_an_allocator_validates_and_round_trips() {
+        let mut report = valid_report();
+        report.provenance.schema_version = 2;
+        report.provenance.allocator = Allocator::Jemalloc;
+        validate(&report).expect("a version-2 report validates");
+
+        let doc = serde_json::to_value(&report).expect("serialize");
+        assert_eq!(doc["provenance"]["schema_version"], 2);
+        assert_eq!(doc["provenance"]["allocator"], "jemalloc");
+        let back: MetricsBenchReport = serde_json::from_value(doc).expect("deserialize");
+        assert_eq!(back.provenance.schema_version, 2);
+        assert_eq!(back.provenance.allocator, Allocator::Jemalloc);
+        assert_eq!(back, report, "the version-2 document round-trips exactly");
+        validate(&back).expect("the round-tripped version-2 report validates");
+    }
+
+    /// A version outside the window is still refused, above and below, and the
+    /// message names the accepted SET rather than one number: a reader told
+    /// "reads version 2" would go looking for the wrong mismatch when 1 is also
+    /// accepted.
+    ///
+    /// To watch it fail: widen the window wrongly, with
+    /// `SUPPORTED_VERSIONS = SupportedVersions { newest: 99, oldest: 0 }`. Every
+    /// version this test tries is then inside the window, `validate` returns
+    /// `Ok(())`, and `expect_err` panics.
+    #[test]
+    fn a_report_with_an_unsupported_schema_version_is_refused_naming_the_set() {
+        for unsupported in [0, 3, 99] {
+            let mut report = valid_report();
+            report.provenance.schema_version = unsupported;
+            let err = validate(&report).expect_err("an unsupported version must be refused");
+            assert_eq!(
+                err,
+                ValidationError::UnsupportedSchemaVersion {
+                    found: unsupported,
+                    expected: SUPPORTED_VERSIONS,
+                },
+                "version {unsupported} must be refused by the version check"
+            );
+            let message = err.to_string();
+            assert!(
+                message.contains("versions {1, 2}"),
+                "the message must name the supported set, got: {message}"
+            );
+        }
     }
 
     /// Failure class: duplicate measurement id.
