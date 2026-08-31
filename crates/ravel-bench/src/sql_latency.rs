@@ -942,11 +942,23 @@ fn total_get_wire_bytes(entries: &[EntryReport]) -> u64 {
         })
 }
 
-/// Model the pass's cost at `profile`. This harness has no attempt source, so
-/// the request term is always absent (the ABSENT-attempts contract, never a
-/// cost from calls); the byte terms price `entries`' GET wire bytes and appear
-/// only when `profile` carries a nonzero byte price.
-fn model_pass_cost(profile: &StoreCostProfile, entries: &[EntryReport]) -> ModeledCost {
+/// Model the pass's cost at `profile`, or model nothing on the Flight lane.
+///
+/// This harness has no attempt source, so the request term is always absent
+/// (the ABSENT-attempts contract, never a cost from calls); the byte terms
+/// price `entries`' GET wire bytes and appear only when `profile` carries a
+/// nonzero byte price. The Flight lane has no effective profile AND no
+/// wire-byte accounting in this process, so modeling it from the requested
+/// profile would price zero recorded bytes and emit `Some(0)` byte terms —
+/// an unknown cost dressed as a known zero. Every term stays absent instead.
+fn model_pass_cost(
+    is_flight: bool,
+    profile: &StoreCostProfile,
+    entries: &[EntryReport],
+) -> ModeledCost {
+    if is_flight {
+        return ModeledCost::default();
+    }
     let wire_bytes = total_get_wire_bytes(entries);
     ModeledCost::model(profile, None, None, wire_bytes, wire_bytes)
 }
@@ -2057,7 +2069,8 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
             store_cost_profile_effective: Some(cfg.store_cost_profile.clone()),
         },
         dataset,
-        modeled_cost: model_pass_cost(&cfg.store_cost_profile, &entries),
+        // Generate is always in process (never Flight).
+        modeled_cost: model_pass_cost(false, &cfg.store_cost_profile, &entries),
         entries,
         skipped,
         failed,
@@ -2247,10 +2260,10 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
             },
         },
         dataset,
-        // The request term is absent on every lane (no attempt source); the
-        // byte terms price this pass's GET wire bytes, which the Flight lane
-        // does not record, so a Flight pass models no byte cost either.
-        modeled_cost: model_pass_cost(&cfg.store_cost_profile, &entries),
+        // The request term is absent on every lane (no attempt source). The
+        // Flight lane models nothing at all: it records no wire bytes, so a
+        // nonzero byte price would produce Some(0), a fake known-zero.
+        modeled_cost: model_pass_cost(cfg.flight.is_some(), &cfg.store_cost_profile, &entries),
         entries,
         skipped,
         failed,
@@ -4530,6 +4543,63 @@ mod tests {
             suffix,
             objects[0].clone(),
         )
+    }
+
+    // ---- Lane-aware modeled cost (PR #1008 review) -------------------------
+
+    /// The Flight lane models NOTHING: it has no effective profile and no
+    /// wire-byte accounting in this process, so pricing zero recorded bytes at
+    /// a nonzero byte price would emit `Some(0)` byte terms -- an unknown cost
+    /// dressed as a known zero. The in-process lane over the SAME entries and
+    /// the SAME priced profile emits both byte terms at exactly
+    /// `price x wire_bytes / GiB` (floor), proving the suppression is the lane,
+    /// not an accident of empty accounting.
+    ///
+    /// Non-vacuity (prove-the-test): make `model_pass_cost` ignore `is_flight`
+    /// and the Flight assertion fails with `Some(0)` transfer/retrieval terms.
+    #[tokio::test]
+    async fn flight_lane_models_no_cost_even_at_nonzero_byte_prices() {
+        let (entry_report, _, _, _) = probe_miss_fixture_run().await;
+        let entries = vec![entry_report];
+        let wire = total_get_wire_bytes(&entries);
+        assert!(
+            wire > 0,
+            "fixture precondition: the fixture run must record wire bytes"
+        );
+        let profile = ravel_types::cost_profile::StoreCostProfile {
+            name: "egress-and-retrieval".to_string(),
+            put_class_nanodollars: 5_000,
+            get_class_nanodollars: 400,
+            delete_class_nanodollars: 0,
+            transfer_nanodollars_per_gib: 90_000_000,
+            retrieval_nanodollars_per_gib: 10_000_000,
+        };
+
+        let flight = model_pass_cost(true, &profile, &entries);
+        assert_eq!(
+            flight,
+            crate::report::ModeledCost::default(),
+            "every Flight term is absent, never Some(0)"
+        );
+
+        let in_process = model_pass_cost(false, &profile, &entries);
+        const GIB: u128 = 1024 * 1024 * 1024;
+        let expect_transfer = u64::try_from(90_000_000u128 * wire as u128 / GIB).expect("fits");
+        let expect_retrieval = u64::try_from(10_000_000u128 * wire as u128 / GIB).expect("fits");
+        assert_eq!(
+            in_process.modeled_transfer_cost_nanodollars,
+            Some(expect_transfer),
+            "in-process transfer term prices the recorded wire bytes exactly"
+        );
+        assert_eq!(
+            in_process.modeled_retrieval_cost_nanodollars,
+            Some(expect_retrieval),
+            "in-process retrieval term prices the recorded wire bytes exactly"
+        );
+        assert_eq!(
+            in_process.modeled_request_cost_nanodollars, None,
+            "no attempt source on this harness, so the request term stays absent"
+        );
     }
 
     // ---- Logs-scan opens by read shape (#904) ------------------------------
