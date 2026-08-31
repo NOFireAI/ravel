@@ -10,9 +10,9 @@
 use std::sync::Arc;
 
 use clap::ValueEnum;
-use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::s3::{S3AuthMode, S3Config, S3Store};
+use ravel_object_store::{ObjectStoreBackend, StoreMetrics};
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
 pub enum StoreKind {
@@ -79,10 +79,26 @@ fn s3_config_from_lookup(lookup: impl Fn(&str) -> Option<String>) -> S3Config {
 /// Builds the store backing a bench bin's `--store` flag: an in-process
 /// `MemoryStore`, or a real `S3Store` configured from `RAVEL_S3_*`.
 pub fn store_from_env(kind: StoreKind) -> Arc<dyn ObjectStoreBackend> {
+    store_and_metrics_from_env(kind).0
+}
+
+/// Like [`store_from_env`], also returning the `StoreMetrics` handle the
+/// store's own HTTP connector records billed attempts into, when it has one.
+/// The S3 store is built with [`S3Store::with_metrics`] so a report's
+/// `InstrumentedStore` can share the SAME handle -- that shared wiring is what
+/// makes `calls <= attempts` assertable (issue #928). `MemoryStore` has no
+/// HTTP connector and returns `None`: its attempt figures are absent, not
+/// zero.
+pub fn store_and_metrics_from_env(
+    kind: StoreKind,
+) -> (Arc<dyn ObjectStoreBackend>, Option<Arc<StoreMetrics>>) {
     match kind {
-        StoreKind::Memory => Arc::new(MemoryStore::new()),
+        StoreKind::Memory => (Arc::new(MemoryStore::new()), None),
         StoreKind::S3 => {
-            Arc::new(S3Store::new(s3_config_from_env()).expect("build S3Store from RAVEL_S3_* env"))
+            let metrics = Arc::new(StoreMetrics::default());
+            let store = S3Store::with_metrics(s3_config_from_env(), Arc::clone(&metrics))
+                .expect("build S3Store from RAVEL_S3_* env");
+            (Arc::new(store), Some(metrics))
         }
     }
 }

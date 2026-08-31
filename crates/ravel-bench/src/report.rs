@@ -81,6 +81,15 @@ pub struct WorkloadShape {
 /// rev-parse` and `rustc --version`.
 pub struct ReportRunConfig {
     pub store: Arc<dyn ObjectStoreBackend>,
+    /// The `StoreMetrics` handle the store's own HTTP connector records billed
+    /// attempts into, when the backend has one (`S3Store::with_metrics`).
+    /// `None` for a store with no attempt source (`MemoryStore`); the report
+    /// then renders every attempt figure as absent, never zero. Sharing THIS
+    /// handle with the run's `InstrumentedStore` is what makes
+    /// `calls <= attempts` a property the reconciliation may assert
+    /// (`instrument.rs`: the relation "is a property of the wiring, not a
+    /// guarantee of this type").
+    pub store_metrics: Option<Arc<ravel_object_store::StoreMetrics>>,
     /// Backend that actually ran: `"memory"` or `"s3"`.
     pub store_backend: String,
     /// Region the backend ran in. Free-form and always populated: a
@@ -214,26 +223,38 @@ pub struct RequestCounts {
     /// S3 bills as one LIST each.
     pub list: u64,
     /// Billed HTTP attempts for PUT: retries and multipart part requests
-    /// included, per ADR-0927 decision 8. `>= put` on a backend that records
-    /// attempts; zero on a non-HTTP backend.
-    pub put_attempts: u64,
+    /// included, per ADR-0927 decision 8. `>= put` when present. `None` when
+    /// the store has no attempt source (no HTTP connector wired a shared
+    /// `StoreMetrics` handle): absence is NOT zero, and rendering it as zero
+    /// would be the flattering figure ADR-0104's billing flag exists to
+    /// prevent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub put_attempts: Option<u64>,
     /// Billed HTTP attempts for GET: retries and range fan-out included, per
     /// ADR-0927 decision 8 (one logical GET split into N ranged requests, or
-    /// retried, bills N attempts). `>= get` on a backend that records attempts;
-    /// zero on a non-HTTP backend.
-    pub get_attempts: u64,
+    /// retried, bills N attempts). `>= get` when present; `None` when no
+    /// attempt source exists (see `put_attempts`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub get_attempts: Option<u64>,
     /// Billed HTTP attempts for the LIST family (`list` + `list_delimited`):
     /// retries and continuation-page requests included, per ADR-0927 decision
-    /// 8. `>= list` on a backend that records attempts; zero on a non-HTTP
-    /// backend.
-    pub list_attempts: u64,
+    /// 8. `>= list` when present; `None` when no attempt source exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list_attempts: Option<u64>,
     /// Retry (billed) overhead for PUT: `put_attempts - put`. The billed
-    /// requests a completed-call count hides (ADR-0996 decision 3).
-    pub put_retry_overhead: u64,
-    /// Retry (billed) overhead for GET: `get_attempts - get`.
-    pub get_retry_overhead: u64,
-    /// Retry (billed) overhead for the LIST family: `list_attempts - list`.
-    pub list_retry_overhead: u64,
+    /// requests a completed-call count hides (ADR-0996 decision 3). `None`
+    /// exactly when `put_attempts` is `None`: an unmeasured overhead is not a
+    /// zero overhead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub put_retry_overhead: Option<u64>,
+    /// Retry (billed) overhead for GET: `get_attempts - get`; `None` when
+    /// unmeasured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub get_retry_overhead: Option<u64>,
+    /// Retry (billed) overhead for the LIST family: `list_attempts - list`;
+    /// `None` when unmeasured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list_retry_overhead: Option<u64>,
 }
 
 impl RequestCounts {
@@ -252,19 +273,37 @@ impl RequestCounts {
     /// `backend_bills_requests` is passed in by whoever chose the backend,
     /// `false` for `MemoryStore` and `true` for S3.
     ///
-    /// When `backend_bills_requests` is set the backend records attempts, so
-    /// the ADR-0996 decision-3 reconciliation `calls <= attempts` is asserted
-    /// per op here; a non-HTTP backend records no attempts and is skipped (its
-    /// attempt figures are legitimately zero, and `attempts - calls` saturates
-    /// to zero overhead rather than underflowing).
-    fn from_metrics(snapshot: &StoreMetricsSnapshot, backend_bills_requests: bool) -> Self {
+    /// `attempts_wired` says whether the underlying store records billed
+    /// attempts into the SAME `StoreMetrics` handle this snapshot came from
+    /// (an `S3Store::with_metrics` sharing the `InstrumentedStore`'s handle).
+    /// It is a property of the WIRING, not of billing: `instrument.rs` states
+    /// `attempts >= calls` "holds exactly when every store this decorator
+    /// counts a `calls` on records its attempts into the same handle". Gating
+    /// on the billing flag instead panics precisely on the real S3 path when
+    /// the wiring is absent, after the paid workload already ran.
+    ///
+    /// When wired, the ADR-0996 decision-3 reconciliation `calls <= attempts`
+    /// is asserted per op. When not wired, every attempt and overhead figure
+    /// is `None`: absence is not zero, and a zero here would be the
+    /// flattering figure ADR-0104 forbids.
+    fn from_metrics(
+        snapshot: &StoreMetricsSnapshot,
+        backend_bills_requests: bool,
+        attempts_wired: bool,
+    ) -> Self {
         let put = snapshot.put.calls;
         let get = snapshot.get.calls;
         let list = snapshot.list_calls();
-        let put_attempts = snapshot.put.attempts;
-        let get_attempts = snapshot.get.attempts;
-        // LIST family: sum both blocks, mirroring `list_calls`.
-        let list_attempts = snapshot.list.attempts + snapshot.list_delimited.attempts;
+        let (put_attempts, get_attempts, list_attempts) = if attempts_wired {
+            (
+                Some(snapshot.put.attempts),
+                Some(snapshot.get.attempts),
+                // LIST family: sum both blocks, mirroring `list_calls`.
+                Some(snapshot.list.attempts + snapshot.list_delimited.attempts),
+            )
+        } else {
+            (None, None, None)
+        };
 
         let counts = RequestCounts {
             backend_bills_requests,
@@ -274,14 +313,11 @@ impl RequestCounts {
             put_attempts,
             get_attempts,
             list_attempts,
-            // Saturating so a non-HTTP backend (attempts == 0 < calls) renders
-            // zero overhead rather than underflowing; on a request-billing
-            // backend `attempts >= calls`, checked just below.
-            put_retry_overhead: put_attempts.saturating_sub(put),
-            get_retry_overhead: get_attempts.saturating_sub(get),
-            list_retry_overhead: list_attempts.saturating_sub(list),
+            put_retry_overhead: put_attempts.map(|a| a.saturating_sub(put)),
+            get_retry_overhead: get_attempts.map(|a| a.saturating_sub(get)),
+            list_retry_overhead: list_attempts.map(|a| a.saturating_sub(list)),
         };
-        if backend_bills_requests {
+        if attempts_wired {
             counts.assert_calls_le_attempts();
         }
         counts
@@ -295,24 +331,21 @@ impl RequestCounts {
     /// backend, or a fixture that drove `StoreMetrics::record_attempt`); a
     /// non-HTTP backend records no attempts and would fail this vacuously.
     fn assert_calls_le_attempts(&self) {
-        assert!(
-            self.put <= self.put_attempts,
-            "reconciliation: put calls {} exceed billed attempts {}",
-            self.put,
-            self.put_attempts,
-        );
-        assert!(
-            self.get <= self.get_attempts,
-            "reconciliation: get calls {} exceed billed attempts {}",
-            self.get,
-            self.get_attempts,
-        );
-        assert!(
-            self.list <= self.list_attempts,
-            "reconciliation: list calls {} exceed billed attempts {}",
-            self.list,
-            self.list_attempts,
-        );
+        for (name, calls, attempts) in [
+            ("put", self.put, self.put_attempts),
+            ("get", self.get, self.get_attempts),
+            ("list", self.list, self.list_attempts),
+        ] {
+            let Some(attempts) = attempts else {
+                // Only reachable if a caller asserts on an unwired snapshot;
+                // an absent figure reconciles vacuously rather than as zero.
+                continue;
+            };
+            assert!(
+                calls <= attempts,
+                "reconciliation: {name} calls {calls} exceed billed attempts {attempts}",
+            );
+        }
     }
 }
 
@@ -349,8 +382,17 @@ fn lock<'a, T>(m: &'a Mutex<T>, what: &str) -> MutexGuard<'a, T> {
 /// `s3_requests`/`bytes` reflect the entire workload, ingest and query
 /// together.
 pub async fn run(config: &ReportRunConfig) -> BenchReport {
-    let instrumented = Arc::new(InstrumentedStore::new(Arc::clone(&config.store)));
+    let instrumented = Arc::new(match &config.store_metrics {
+        // The store's connector already records attempts into this handle;
+        // the decorator records its calls into the SAME block, which is the
+        // wiring the calls <= attempts reconciliation is defined over.
+        Some(handle) => {
+            InstrumentedStore::with_metrics(Arc::clone(&config.store), Arc::clone(handle))
+        }
+        None => InstrumentedStore::new(Arc::clone(&config.store)),
+    });
     let metrics = instrumented.metrics();
+    let attempts_wired = config.store_metrics.is_some();
     let store: Arc<dyn ObjectStoreBackend> = instrumented;
     let w = &config.workload;
 
@@ -562,7 +604,8 @@ pub async fn run(config: &ReportRunConfig) -> BenchReport {
     }
 
     let snapshot = metrics.snapshot();
-    let request_counts = RequestCounts::from_metrics(&snapshot, config.backend_bills_requests);
+    let request_counts =
+        RequestCounts::from_metrics(&snapshot, config.backend_bills_requests, attempts_wired);
     let bytes_written = snapshot.put.bytes;
     let bytes_read = snapshot.get.bytes;
     let write_amplification = if logical_bytes == 0 {
@@ -663,12 +706,21 @@ mod tests {
         let snapshot = metrics.snapshot();
 
         // MemoryStore run: real counts, not billed.
-        let memory_counts = RequestCounts::from_metrics(&snapshot, false);
+        let memory_counts = RequestCounts::from_metrics(&snapshot, false, false);
         assert_eq!(memory_counts.put, 3, "exact PUT count");
         assert_eq!(memory_counts.get, 2, "exact GET count");
         assert_eq!(
             memory_counts.list, 2,
             "exact LIST count folds list + list_delimited"
+        );
+        assert_eq!(
+            memory_counts.put_attempts, None,
+            "no attempt source: absent, never zero"
+        );
+        assert_eq!(memory_counts.get_attempts, None, "absent, never zero");
+        assert_eq!(
+            memory_counts.get_retry_overhead, None,
+            "unmeasured overhead is not zero"
         );
         assert!(
             !memory_counts.backend_bills_requests,
@@ -689,7 +741,7 @@ mod tests {
         // reconciliation runs. Only the flag moves on the call figures; the
         // attempt figures equal the calls exactly (no retries), so every retry
         // overhead is exactly zero.
-        let billed_counts = RequestCounts::from_metrics(&snapshot, true);
+        let billed_counts = RequestCounts::from_metrics(&snapshot, true, true);
         assert!(
             billed_counts.backend_bills_requests,
             "a request-billing backend must report backend_bills_requests true"
@@ -708,15 +760,20 @@ mod tests {
         );
 
         // Attempts pinned exactly, and exactly equal to calls: no retries.
-        assert_eq!(billed_counts.put_attempts, 3, "exact PUT attempts");
-        assert_eq!(billed_counts.get_attempts, 2, "exact GET attempts");
+        assert_eq!(billed_counts.put_attempts, Some(3), "exact PUT attempts");
+        assert_eq!(billed_counts.get_attempts, Some(2), "exact GET attempts");
         assert_eq!(
-            billed_counts.list_attempts, 2,
+            billed_counts.list_attempts,
+            Some(2),
             "exact LIST attempts folds list + list_delimited"
         );
-        assert_eq!(billed_counts.put_retry_overhead, 0, "no PUT retries");
-        assert_eq!(billed_counts.get_retry_overhead, 0, "no GET retries");
-        assert_eq!(billed_counts.list_retry_overhead, 0, "no LIST retries");
+        assert_eq!(billed_counts.put_retry_overhead, Some(0), "no PUT retries");
+        assert_eq!(billed_counts.get_retry_overhead, Some(0), "no GET retries");
+        assert_eq!(
+            billed_counts.list_retry_overhead,
+            Some(0),
+            "no LIST retries"
+        );
     }
 
     /// Fixture 2 (ADR-0996 decision 3): a snapshot where billed attempts exceed
@@ -761,7 +818,7 @@ mod tests {
         }
 
         let snapshot = metrics.snapshot();
-        let counts = RequestCounts::from_metrics(&snapshot, true);
+        let counts = RequestCounts::from_metrics(&snapshot, true, true);
 
         // Calls: unchanged logical counts.
         assert_eq!(counts.get, 2, "exact GET calls");
@@ -769,14 +826,14 @@ mod tests {
         assert_eq!(counts.list, 1, "exact LIST calls");
 
         // Attempts: strictly above calls, pinned exactly.
-        assert_eq!(counts.get_attempts, 6, "exact GET attempts");
-        assert_eq!(counts.put_attempts, 5, "exact PUT attempts");
-        assert_eq!(counts.list_attempts, 2, "exact LIST attempts");
+        assert_eq!(counts.get_attempts, Some(6), "exact GET attempts");
+        assert_eq!(counts.put_attempts, Some(5), "exact PUT attempts");
+        assert_eq!(counts.list_attempts, Some(2), "exact LIST attempts");
 
         // Retry overhead = attempts - calls, exact.
-        assert_eq!(counts.get_retry_overhead, 4, "GET overhead = 6 - 2");
-        assert_eq!(counts.put_retry_overhead, 2, "PUT overhead = 5 - 3");
-        assert_eq!(counts.list_retry_overhead, 1, "LIST overhead = 2 - 1");
+        assert_eq!(counts.get_retry_overhead, Some(4), "GET overhead = 6 - 2");
+        assert_eq!(counts.put_retry_overhead, Some(2), "PUT overhead = 5 - 3");
+        assert_eq!(counts.list_retry_overhead, Some(1), "LIST overhead = 2 - 1");
     }
 
     /// The reconciliation is a real assertion, not a comment: build a
@@ -793,12 +850,12 @@ mod tests {
             put: 3,
             get: 10,
             list: 2,
-            put_attempts: 3,
-            get_attempts: 3,
-            list_attempts: 2,
-            put_retry_overhead: 0,
-            get_retry_overhead: 0,
-            list_retry_overhead: 0,
+            put_attempts: Some(3),
+            get_attempts: Some(3),
+            list_attempts: Some(2),
+            put_retry_overhead: Some(0),
+            get_retry_overhead: Some(0),
+            list_retry_overhead: Some(0),
         };
         let panicked = std::panic::catch_unwind(|| swapped.assert_calls_le_attempts()).is_err();
         assert!(
@@ -809,8 +866,8 @@ mod tests {
         // The un-swapped orientation (calls <= attempts) does not panic.
         let ok = RequestCounts {
             get: 3,
-            get_attempts: 10,
-            get_retry_overhead: 7,
+            get_attempts: Some(10),
+            get_retry_overhead: Some(7),
             ..swapped
         };
         ok.assert_calls_le_attempts();
@@ -819,6 +876,7 @@ mod tests {
     fn memory_config() -> ReportRunConfig {
         ReportRunConfig {
             store: Arc::new(MemoryStore::new()),
+            store_metrics: None,
             store_backend: "memory".to_string(),
             region: "n/a-memory".to_string(),
             backend_bills_requests: false,
@@ -905,26 +963,19 @@ mod tests {
         assert!(report.s3_requests.get > 0, "GET count must be > 0");
         assert!(report.s3_requests.list > 0, "LIST count must be > 0");
 
-        // Attempts: MemoryStore is non-HTTP and records none, so every attempt
-        // figure is legitimately zero and every retry overhead saturates to
-        // zero. `backend_bills_requests == false` above is what marks these
-        // honest rather than a billing measurement; the reconciliation is
-        // skipped exactly because attempts are unwired here.
+        // Attempts: MemoryStore has no attempt source, so every attempt and
+        // overhead figure is ABSENT -- never a zero standing in for "not
+        // measured" (the flattering-zero ADR-0104 forbids). The fields are
+        // skipped in JSON entirely, which is what keeps the no-null contract.
         assert_eq!(
-            report.s3_requests.put_attempts, 0,
-            "MemoryStore records no PUT attempts"
+            report.s3_requests.put_attempts, None,
+            "MemoryStore has no PUT attempt source: absent, not zero"
         );
-        assert_eq!(
-            report.s3_requests.get_attempts, 0,
-            "MemoryStore records no GET attempts"
-        );
-        assert_eq!(
-            report.s3_requests.list_attempts, 0,
-            "MemoryStore records no LIST attempts"
-        );
-        assert_eq!(report.s3_requests.put_retry_overhead, 0);
-        assert_eq!(report.s3_requests.get_retry_overhead, 0);
-        assert_eq!(report.s3_requests.list_retry_overhead, 0);
+        assert_eq!(report.s3_requests.get_attempts, None, "absent, not zero");
+        assert_eq!(report.s3_requests.list_attempts, None, "absent, not zero");
+        assert_eq!(report.s3_requests.put_retry_overhead, None);
+        assert_eq!(report.s3_requests.get_retry_overhead, None);
+        assert_eq!(report.s3_requests.list_retry_overhead, None);
 
         // Bytes both directions.
         assert!(report.bytes.written > 0, "bytes written must be > 0");
