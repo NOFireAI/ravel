@@ -36,7 +36,9 @@
 #   DISK_REAP_TMP_ROOTS   space-separated roots to scan for orphaned targets
 #   DISK_REAP_BUILD_STATE force the build-activity probe to `idle` or `busy`
 #                         so both branches of the orphaned-target scan are
-#                         testable; unset runs the real probe
+#                         testable. Honoured ONLY when DISK_REAP_REPO_ROOT is
+#                         set as well, so it cannot disable a safety check on
+#                         a real run; unset runs the real probe
 set -uo pipefail
 
 apply=0
@@ -238,11 +240,34 @@ done <"${cand_file}"
 # scan never runs, and a test asserting a reap fails for a reason that has
 # nothing to do with the code under test.
 build_is_running() {
-  case "${DISK_REAP_BUILD_STATE:-}" in
-  idle) return 1 ;;
-  busy) return 0 ;;
-  *) pgrep -x cargo >/dev/null 2>&1 || pgrep -x rustc >/dev/null 2>&1 ;;
-  esac
+  # The forced state is honoured only when DISK_REAP_REPO_ROOT is set too, so
+  # it cannot bypass the probe on a real run: that variable is what points the
+  # script at a throwaway test repo in the first place.
+  if [[ -n "${DISK_REAP_REPO_ROOT:-}" ]]; then
+    case "${DISK_REAP_BUILD_STATE:-}" in
+    idle) return 1 ;;
+    busy) return 0 ;;
+    esac
+  fi
+  # pgrep exits 0 when it matches, 1 when it does not, and something else when
+  # the probe itself failed (127 when pgrep is not installed, for one). Only
+  # exit 1 means "no build running". Anything else means the probe is unusable,
+  # and an unusable probe must not read as permission to delete a target dir a
+  # live build may be writing to.
+  local probe rc
+  for probe in cargo rustc; do
+    rc=0
+    pgrep -x "${probe}" >/dev/null 2>&1 || rc=$?
+    case "${rc}" in
+    0) return 0 ;;
+    1) ;;
+    *)
+      echo "warn: pgrep ${probe} exited ${rc}; assuming a build is running" >&2
+      return 0
+      ;;
+    esac
+  done
+  return 1
 }
 
 echo "==> orphaned cargo target dirs"
@@ -259,8 +284,17 @@ else
     find "${root}" -maxdepth 1 -type d -name 'wt-*-target' -mmin +120 2>/dev/null >>"${target_file}"
     find "${root}" -maxdepth 6 -type d -name target -path '*claude-*' -mmin +120 2>/dev/null >>"${target_file}"
   done
+  # Re-check before each removal, not once for the whole list. The find scan
+  # and the removals are not instantaneous, and a build starting in between
+  # would otherwise have its cache deleted out from under it by a decision
+  # taken before it existed. pgrep is cheap next to an rm -rf of a target dir.
   while read -r d; do
     [[ -n "${d}" && -d "${d}" ]] || continue
+    if build_is_running; then
+      echo "skip (a build started during the scan): ${d}"
+      skipped_count=$((skipped_count + 1))
+      continue
+    fi
     kb="$(dir_kb "${d}")"
     echo "reap ($(human_kb "${kb}")): ${d}"
     act rm -rf "${d}"

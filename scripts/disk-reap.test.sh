@@ -297,6 +297,50 @@ else
   printf '%s\n' "$out10" | sed 's/^/    /'
 fi
 
+# A broken build probe must read as "a build is running", never as "idle".
+# pgrep exits 1 for no-match but something else when the probe itself failed
+# (127 when it is not installed). Treating that like no-match would delete a
+# target dir a live build may be writing to, on the strength of a check that
+# did not actually run.
+base11="$(new_repo case11)"
+probe_target="$base11/scratch/wt-stale-target"
+mkdir -p "$probe_target"
+echo stale >"$probe_target/blob"
+touch -t 202001010000 "$probe_target/blob" "$probe_target"
+
+fakebin="$base11/fakebin"
+mkdir -p "$fakebin"
+printf '#!/bin/sh\nexit 2\n' >"$fakebin/pgrep"
+chmod +x "$fakebin/pgrep"
+
+out11="$(PATH="$fakebin:$PATH" DISK_REAP_TMP_ROOTS="$base11/scratch" \
+  bash "$SCRIPT" -y 2>&1)"
+if [ -d "$probe_target" ] && case "$out11" in *"assuming a build is running"*) true ;; *) false ;; esac; then
+  pass "a failing pgrep probe is treated as a running build"
+else
+  fail "a failing pgrep probe is treated as a running build" "target dir removed or no warning"
+  printf '%s\n' "$out11" | sed 's/^/    /'
+fi
+
+# The forced build state must not be honoured on a real run: it is a test seam,
+# not a way to switch off a safety check in production.
+base12="$(new_repo case12)"
+override_target="$base12/scratch/wt-stale-target"
+mkdir -p "$override_target"
+echo stale >"$override_target/blob"
+touch -t 202001010000 "$override_target/blob" "$override_target"
+
+# DISK_REAP_BUILD_STATE=idle WITHOUT DISK_REAP_REPO_ROOT: the real probe runs.
+# A broken pgrep alongside it must still win, proving the override was ignored.
+out12="$(PATH="$fakebin:$PATH" DISK_REAP_BUILD_STATE=idle \
+  DISK_REAP_TMP_ROOTS="$base12/scratch" bash "$SCRIPT" -y 2>&1)"
+if [ -d "$override_target" ]; then
+  pass "forced build state is ignored without the repo-root test hook"
+else
+  fail "forced build state is ignored without the repo-root test hook" "override bypassed the probe"
+  printf '%s\n' "$out12" | sed 's/^/    /'
+fi
+
 echo
 if [ "$fails" != 0 ]; then
   echo "$fails failing case(s)"
