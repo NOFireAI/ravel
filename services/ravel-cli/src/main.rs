@@ -312,15 +312,40 @@ enum Command {
         /// to 2. Must be at least 1; 0 is rejected.
         #[arg(long, default_value_t = ravel_cli::load::DEFAULT_DECODE_QUEUE_BATCHES)]
         decode_queue_batches: usize,
-        /// Bytes a shard's buffer accumulates before it flushes as one RLOG
-        /// object (issue #801). At the default `1` every batch flushes as its
-        /// own object the moment it is written: one object per involved shard
-        /// per batch, `--batch-rows` sets its size, and no buffer lingers. A
-        /// larger value lets a shard accumulate ENCODED records across several
-        /// batches until the target is reached, so objects grow without any
-        /// more Arrow batches being held in memory -- unlike raising
-        /// `--batch-rows`, whose memory cost is linear because each batch is
-        /// buffered whole.
+        /// Estimated in-memory bytes a shard's buffer accumulates before it
+        /// flushes as one RLOG object (issue #801). At the default `1` every
+        /// batch flushes as its own object the moment it is written: one object
+        /// per involved shard per batch, `--batch-rows` sets its size, and no
+        /// buffer lingers. A larger value lets a shard hold several batches'
+        /// records in one buffer until the target is reached, so objects grow
+        /// without any more Arrow batches being held in memory -- unlike
+        /// raising `--batch-rows`, whose memory cost is linear because each
+        /// batch is buffered whole.
+        ///
+        /// Two facts decide whether a given value can do anything at all
+        /// (issue #971), and both bite at ClickBench scale:
+        ///
+        /// - The unit is the router's buffered-footprint ESTIMATE, not encoded
+        ///   object bytes. Every attribute occurrence charges a 56-byte
+        ///   (name, value) pair header plus its key bytes and its uncompressed
+        ///   value bytes, plus the stream-attribute blob and 32 bytes per row.
+        ///   For the 104-column ClickBench mapping that is roughly 8 KB per
+        ///   row, while the objects the same load writes average a bit over
+        ///   100 bytes per row. A target picked from an observed object size is
+        ///   therefore tens of times too small to matter.
+        /// - The check runs once per write, after a whole batch's per-shard
+        ///   slice has merged. A target at or below one slice's estimated
+        ///   footprint (`--batch-rows / --shards` rows' worth of the estimate
+        ///   above) is already exceeded by the first write into an empty
+        ///   buffer, so it flushes every write and reproduces the `1` layout
+        ///   exactly. At `--batch-rows 40000 --shards 4` that threshold is tens
+        ///   of megabytes: a target of a few MiB changes nothing, and only the
+        ///   small slices a batch leaves on a lightly-hit shard accumulate at
+        ///   all.
+        ///
+        /// A load whose `--target-bytes` turned out to lay the objects out
+        /// exactly as `1` would have says so on stderr, with the threshold it
+        /// missed.
         ///
         /// The trade is ack timing, not durability. A Strict write's ack is
         /// still sent only after its records' object and commit record are
