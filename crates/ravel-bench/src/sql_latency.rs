@@ -470,6 +470,21 @@ pub struct RunAccounting {
     pub object_store_list_requests: u64,
     /// Bytes transferred from the object store across every operation kind.
     pub object_store_bytes: u64,
+    /// Bytes transferred by this run's GET requests alone:
+    /// `QueryAccountingSnapshot::s3_bytes(AccountedOp::Get)`. WIRE bytes, the
+    /// same kind and the same funnel as [`Self::wire_bytes_by_phase`], which is
+    /// what makes this the figure the per-phase split reconciles against
+    /// (issue #857). [`Self::object_store_bytes`] cannot serve that role: it
+    /// sums every operation kind, so a LIST response's bytes are in it and no
+    /// phase can ever claim them.
+    ///
+    /// Always less than or equal to [`Self::object_store_bytes`], and always
+    /// greater than or equal to the sum of [`Self::wire_bytes_by_phase`]. That
+    /// second bound is checked on every run by
+    /// [`reconcile_run_accounting`]; see its docs for the phases that
+    /// legitimately fall short of it.
+    #[serde(default)]
+    pub object_store_get_bytes: u64,
     /// Fetch-cache hits on this run.
     pub cache_hits: u64,
     /// Fetch-cache misses on this run.
@@ -606,6 +621,105 @@ fn amplification(scan_wire_bytes: u64, page_stored_bytes_decoded: u64) -> f64 {
         return 0.0;
     }
     scan_wire_bytes as f64 / page_stored_bytes_decoded as f64
+}
+
+/// Check one run's per-phase split against the pooled figures beside it, and
+/// fail the measurement loudly when they do not reconcile (issue #857).
+///
+/// Run for every statement and every run of a real measurement pass, not only
+/// in tests: a per-phase figure that nobody asserts on is decoration, and the
+/// defect this catches -- a GET whose bytes the plumbing charges to two phases,
+/// or a phase dropped from the report entirely -- is invisible in the printed
+/// table, where an under-attributed phase reads as a genuinely cheap phase.
+///
+/// # What is checked
+///
+/// 1. Every `QueryPhase` appears exactly once, in `QueryPhase::ALL` order, with
+///    no unknown phase name. A report is built from `ALL`, so this holds by
+///    construction for a freshly measured run; it does not for a report read
+///    back from JSON, which is how a comparison pass consumes one.
+/// 2. The attributed sum never EXCEEDS [`RunAccounting::object_store_get_bytes`].
+///    This is the double-count detector: both channels are written from one
+///    place per GET (`LogSegmentFetcher::store_get` records the bytes onto the
+///    query's `QueryAccounting` and onto the phase counter in adjacent lines),
+///    so the phase total is a subset of the pooled GET total and can only
+///    exceed it if some call site recorded one GET into two phases.
+/// 3. The attributed sum plus [`RunAccounting::wire_bytes_unattributed`] is
+///    exactly [`RunAccounting::object_store_bytes`], which is what makes the
+///    residual auditable rather than a number derived and then forgotten.
+/// 4. [`RunAccounting::fetch_amplification`] is exactly the ratio of the two
+///    fields printed beside it, compared on bit patterns, so the table cannot
+///    show a ratio that its own numerator and denominator do not produce.
+///
+/// # Why this is NOT an exact equality
+///
+/// The obvious check -- attributed equals pooled -- would fail on every real
+/// statement, because three sources put bytes in the pooled figure that no
+/// phase can claim. They are reported as
+/// [`RunAccounting::wire_bytes_unattributed`], not asserted away:
+///
+/// - The catalog snapshot resolve issues its commit-record GETs through
+///   `ravel-catalog`, which records them on the query's pooled
+///   `QueryAccounting` and holds no handle on the per-phase counter. Every
+///   statement pays this, so the residual is never zero.
+/// - Only `LogSegmentFetcher` attributes by phase. A metrics or spans statement
+///   reads through `SegmentFetcher`/`SpanSegmentFetcher`, which have no phase
+///   counter at all, so its whole read is residual.
+/// - `object_store_bytes` sums every operation kind, so a LIST response's bytes
+///   are in it and in no phase. Check 2 uses the GET-only figure for exactly
+///   this reason; check 3 uses the all-kinds total because that is the
+///   quantity the residual is defined against.
+pub fn reconcile_run_accounting(id: &str, run: usize, acc: &RunAccounting) -> Result<(), String> {
+    let expected: Vec<&str> = QueryPhase::ALL.iter().map(|p| p.name()).collect();
+    let got: Vec<&str> = acc
+        .wire_bytes_by_phase
+        .iter()
+        .map(|p| p.phase.as_str())
+        .collect();
+    if got != expected {
+        return Err(format!(
+            "entry `{id}` run {run}: wire_bytes_by_phase must carry every phase exactly once in \
+             QueryPhase::ALL order, got {got:?}, expected {expected:?}"
+        ));
+    }
+
+    let attributed = acc
+        .wire_bytes_by_phase
+        .iter()
+        .fold(0u64, |a, p| a.saturating_add(p.wire_bytes));
+    if attributed > acc.object_store_get_bytes {
+        return Err(format!(
+            "entry `{id}` run {run}: per-phase wire bytes sum to {attributed}, above the pooled \
+             GET total {}, so a GET was charged to more than one phase",
+            acc.object_store_get_bytes
+        ));
+    }
+    if acc.object_store_get_bytes > acc.object_store_bytes {
+        return Err(format!(
+            "entry `{id}` run {run}: GET bytes {} exceed the all-kinds total {}",
+            acc.object_store_get_bytes, acc.object_store_bytes
+        ));
+    }
+    if attributed.saturating_add(acc.wire_bytes_unattributed) != acc.object_store_bytes {
+        return Err(format!(
+            "entry `{id}` run {run}: per-phase wire bytes {attributed} plus the unattributed \
+             residual {} are {}, not the pooled {}",
+            acc.wire_bytes_unattributed,
+            attributed.saturating_add(acc.wire_bytes_unattributed),
+            acc.object_store_bytes
+        ));
+    }
+
+    let scan_wire_bytes = acc.wire_bytes_by_phase[QueryPhase::Scan.index()].wire_bytes;
+    let expected_amplification = amplification(scan_wire_bytes, acc.page_stored_bytes_decoded);
+    if acc.fetch_amplification.to_bits() != expected_amplification.to_bits() {
+        return Err(format!(
+            "entry `{id}` run {run}: fetch_amplification {} is not scan wire bytes \
+             {scan_wire_bytes} over stored decoded page bytes {} ({expected_amplification})",
+            acc.fetch_amplification, acc.page_stored_bytes_decoded
+        ));
+    }
+    Ok(())
 }
 
 /// One measured statement.
@@ -1396,6 +1510,9 @@ pub async fn measure_corpus(
                 object_store_get_requests: acc.s3_requests(AccountedOp::Get),
                 object_store_list_requests: acc.s3_requests(AccountedOp::List),
                 object_store_bytes: acc.total_s3_bytes(),
+                // #857: the GET-only figure the per-phase split reconciles
+                // against. The all-kinds total above cannot serve that role.
+                object_store_get_bytes: acc.s3_bytes(AccountedOp::Get),
                 cache_hits: acc.cache_hits,
                 cache_misses: acc.cache_misses,
                 cache_bytes: acc.cache_bytes,
@@ -1416,6 +1533,19 @@ pub async fn measure_corpus(
                 logs_whole_object_opens: acc.logs_whole_object_opens,
                 logs_ranged_opens: acc.logs_ranged_opens,
             });
+            // #857: check the split against the pooled figures the moment it is
+            // recorded. This is not a statement failure, so `continue_on_error`
+            // does not swallow it: a statement that fails to execute is a
+            // result the report exists to carry, while a phase total that does
+            // not reconcile means every per-phase figure in this pass is
+            // untrustworthy.
+            reconcile_run_accounting(
+                &entry.id,
+                run,
+                per_run_accounting
+                    .last()
+                    .expect("the entry just pushed above"),
+            )?;
             if run == 0 {
                 // The cold run's block counters and rows go into `scan`; its
                 // object-store/cache figures are kept there too (as the
@@ -3909,6 +4039,307 @@ mod tests {
         assert_eq!(acc.wire_bytes_unattributed, 0);
         assert_eq!(acc.page_stored_bytes_decoded, 0);
         assert_eq!(acc.fetch_amplification, 0.0);
+    }
+
+    // ---- Phase reconciliation in the bench itself (#857) -------------------
+
+    /// Measure the #913 fixture and pin the cold run's per-phase WIRE bytes to
+    /// EXACT literals, every one of them derived from the section table of the
+    /// object the fixture wrote rather than transcribed from a passing run.
+    ///
+    /// The geometry is known by construction. `logs_block_range_threshold: 0`
+    /// disables the whole-object crossover, so the reads go through the ranged
+    /// path; `logs_suffix_len: Some(suffix)` pins the probe window to start
+    /// exactly at SKIP_IDX's end, so every probe misses SKIP_IDX and chases it;
+    /// and `PROBE_MISS_SQL` is not skip-decidable, so `plan_segment` gives up
+    /// and reads the whole object, handing no footer forward, which is why the
+    /// data read that follows probes the object again on its own account.
+    ///
+    /// That makes each phase a named list of GETs whose lengths the section
+    /// table gives:
+    ///
+    /// - `resolve`: nothing. The RLOG read path issues no resolve request at
+    ///   all; the catalog's commit-record GETs are the unattributed residual.
+    /// - `plan`: the pinned suffix probe, the SKIP_IDX chase it forces, and the
+    ///   whole-object fallback. `suffix + skip_idx_len + object_len`.
+    /// - `probe`: the data read's own suffix probe, its SKIP_IDX chase, and
+    ///   FIELD_DIR. `suffix + skip_idx_len + field_dir_len`.
+    /// - `scan`: one whole-object GET for the block data. `object_len`.
+    ///
+    /// Prove-the-test: the four `reconcile_rejects_*` tests below perturb one
+    /// field of this same measured run and show the reconciler failing on each.
+    #[tokio::test]
+    async fn reconcile_accepts_a_measured_run_with_an_exact_phase_split() {
+        let (measured, object_len, suffix, object) = probe_miss_fixture_run().await;
+        let footer = ravel_logseg::footer::open(&object).expect("footer");
+        let section = |kind: u32| {
+            footer
+                .section(kind)
+                .unwrap_or_else(|| panic!("section {kind}"))
+                .len
+        };
+        let skip_idx_len = section(ravel_logseg::footer::kind::SKIP_IDX);
+        let field_dir_len = section(ravel_logseg::footer::kind::FIELD_DIR);
+
+        let acc = measured
+            .per_run_accounting
+            .as_ref()
+            .expect("an in-process lane records per-run accounting");
+        let cold = &acc[0];
+
+        // The reconciler passes on a real run, which is the claim the bench
+        // wiring makes for every statement of every run of every pass.
+        reconcile_run_accounting("q", 0, cold).expect("a measured cold run reconciles");
+
+        let phase = |p: QueryPhase| cold.wire_bytes_by_phase[p.index()].wire_bytes;
+        assert_eq!(
+            phase(QueryPhase::Resolve),
+            0,
+            "the RLOG read path issues no resolve request"
+        );
+        assert_eq!(
+            phase(QueryPhase::Plan),
+            suffix + skip_idx_len + object_len,
+            "plan: the {suffix}-byte suffix probe, the {skip_idx_len}-byte \
+             SKIP_IDX chase, and the {object_len}-byte whole-object fallback"
+        );
+        assert_eq!(
+            phase(QueryPhase::Probe),
+            suffix + skip_idx_len + field_dir_len,
+            "probe: the data read's own {suffix}-byte suffix probe, its \
+             {skip_idx_len}-byte SKIP_IDX chase, and {field_dir_len} bytes of FIELD_DIR"
+        );
+        assert_eq!(
+            phase(QueryPhase::Scan),
+            object_len,
+            "scan: one whole-object GET for the block data"
+        );
+
+        // The residual is the catalog's, and it is the whole of the difference:
+        // nothing else in this statement's read path goes unattributed.
+        let attributed =
+            suffix + skip_idx_len + object_len + suffix + skip_idx_len + field_dir_len + object_len;
+        assert_eq!(
+            attributed + cold.wire_bytes_unattributed,
+            cold.object_store_bytes,
+            "the four phases plus the catalog residual are the pooled total"
+        );
+        assert_eq!(
+            cold.object_store_get_bytes, cold.object_store_bytes,
+            "this statement issues no LIST that moves bytes, so the GET-only \
+             basis and the all-kinds total coincide here"
+        );
+        assert!(
+            cold.wire_bytes_unattributed > 0,
+            "the catalog resolve's commit-record GETs are never phase-attributed"
+        );
+
+        // The new basis is in the report JSON, per run, not aggregated over
+        // runs: a diff pass reads the artifact, not this struct.
+        let v = serde_json::to_value(&measured).expect("serialize entry");
+        let per_run = v["per_run_accounting"]
+            .as_array()
+            .expect("per_run_accounting is a JSON array");
+        assert_eq!(per_run.len(), 2, "one entry per run");
+        for (run, entry) in acc.iter().enumerate() {
+            assert_eq!(
+                per_run[run]["object_store_get_bytes"], entry.object_store_get_bytes,
+                "run {run}: the GET-only basis round-trips"
+            );
+            reconcile_run_accounting("q", run, entry).expect("every run reconciles");
+        }
+        assert_ne!(
+            acc[0].object_store_get_bytes, acc[1].object_store_get_bytes,
+            "the warm run reads less, so the per-run figures are not one \
+             aggregate repeated"
+        );
+    }
+
+    /// The flip that shows the reconciler is not vacuous: drop one phase from
+    /// the vector of a run that just passed, and it fails.
+    #[tokio::test]
+    async fn reconcile_rejects_a_dropped_phase() {
+        let (measured, _, _, _) = probe_miss_fixture_run().await;
+        let mut cold = measured
+            .per_run_accounting
+            .as_ref()
+            .expect("per-run accounting")[0]
+            .clone();
+        reconcile_run_accounting("q", 0, &cold).expect("green before the flip");
+
+        cold.wire_bytes_by_phase.remove(QueryPhase::Scan.index());
+        let err = reconcile_run_accounting("q", 0, &cold)
+            .expect_err("a report missing the scan phase must not reconcile");
+        assert!(
+            err.contains("every phase exactly once"),
+            "the failure names the phase-coverage rule, got: {err}"
+        );
+    }
+
+    /// The same flip in the other direction: keep all four phases but charge
+    /// one GET's bytes to two of them, which is what a call site that recorded
+    /// into the wrong handle alongside the right one would produce. The pooled
+    /// GET total does not move, so the attributed sum rises above it.
+    #[tokio::test]
+    async fn reconcile_rejects_a_get_charged_to_two_phases() {
+        let (measured, _, _, _) = probe_miss_fixture_run().await;
+        let mut cold = measured
+            .per_run_accounting
+            .as_ref()
+            .expect("per-run accounting")[0]
+            .clone();
+        let scan = cold.wire_bytes_by_phase[QueryPhase::Scan.index()].wire_bytes;
+        assert!(
+            scan > 0,
+            "the fixture must have scan bytes to double-charge"
+        );
+        cold.wire_bytes_by_phase[QueryPhase::Probe.index()].wire_bytes += scan;
+
+        let err = reconcile_run_accounting("q", 0, &cold)
+            .expect_err("a doubly-charged GET must not reconcile");
+        assert!(
+            err.contains("charged to more than one phase"),
+            "the failure names the double-charge, got: {err}"
+        );
+    }
+
+    /// A ratio the two fields printed beside it do not produce is caught, so
+    /// the amplification column cannot drift from its own numerator.
+    #[test]
+    fn reconcile_rejects_a_ratio_its_own_fields_do_not_produce() {
+        let mut acc = synthetic_run_accounting();
+        reconcile_run_accounting("q", 0, &acc).expect("the synthetic run reconciles");
+
+        acc.fetch_amplification += 1.0;
+        let err = reconcile_run_accounting("q", 0, &acc)
+            .expect_err("a ratio that is not scan over decoded must not reconcile");
+        assert!(
+            err.contains("fetch_amplification"),
+            "the failure names the ratio, got: {err}"
+        );
+    }
+
+    /// The residual is checked, not merely derived: a report whose phases plus
+    /// residual do not add up to the pooled total fails, which is how a
+    /// hand-edited or truncated artifact is caught on the way back in.
+    #[test]
+    fn reconcile_rejects_a_residual_that_does_not_close_the_pooled_total() {
+        let mut acc = synthetic_run_accounting();
+        acc.wire_bytes_unattributed += 1;
+        let err = reconcile_run_accounting("s", 3, &acc)
+            .expect_err("a residual that overshoots must not reconcile");
+        assert!(
+            err.contains("not the pooled"),
+            "the failure names the pooled total, got: {err}"
+        );
+        assert!(
+            err.contains("entry `s` run 3"),
+            "the failure names the statement and run, got: {err}"
+        );
+    }
+
+    /// A report written before #857 added the GET-only basis still
+    /// deserializes: the new field carries `#[serde(default)]`, as every field
+    /// added since #883 does.
+    #[test]
+    fn a_pre_857_run_accounting_still_deserializes() {
+        let older = serde_json::json!({
+            "object_store_get_requests": 4,
+            "object_store_list_requests": 1,
+            "object_store_bytes": 900,
+            "cache_hits": 0,
+            "cache_misses": 3,
+            "cache_bytes": 0,
+            "probe_misses_plan": 0,
+            "probe_misses_scan": 0,
+            "wire_bytes_by_phase": [],
+            "wire_bytes_unattributed": 0,
+            "page_stored_bytes_decoded": 0,
+            "fetch_amplification": 0.0,
+            "logs_whole_object_opens": 1,
+            "logs_ranged_opens": 0,
+        });
+        let acc: RunAccounting =
+            serde_json::from_value(older).expect("pre-#857 report deserializes");
+        assert_eq!(
+            acc.object_store_get_bytes, 0,
+            "an absent GET-only basis defaults to 0"
+        );
+    }
+
+    /// A `RunAccounting` whose figures are chosen, not measured, so a check can
+    /// be perturbed one field at a time without a fixture run. Reconciles as
+    /// written: three phases summing to 300 wire bytes, a 40-byte residual
+    /// against a 400-byte all-kinds total whose GET share is 360, and the ratio
+    /// its own scan and decode figures produce.
+    fn synthetic_run_accounting() -> RunAccounting {
+        let by_phase = [0u64, 100, 50, 150];
+        RunAccounting {
+            object_store_get_requests: 4,
+            object_store_list_requests: 1,
+            object_store_bytes: 400,
+            object_store_get_bytes: 360,
+            cache_hits: 0,
+            cache_misses: 4,
+            cache_bytes: 0,
+            probe_misses_plan: 0,
+            probe_misses_scan: 0,
+            wire_bytes_by_phase: QueryPhase::ALL
+                .iter()
+                .map(|p| PhaseWireBytes {
+                    phase: p.name().to_string(),
+                    wire_bytes: by_phase[p.index()],
+                })
+                .collect(),
+            wire_bytes_unattributed: 400 - by_phase.iter().sum::<u64>(),
+            page_stored_bytes_decoded: 75,
+            fetch_amplification: amplification(by_phase[QueryPhase::Scan.index()], 75),
+            logs_whole_object_opens: 0,
+            logs_ranged_opens: 1,
+        }
+    }
+
+    /// One cold-plus-warm measurement over the #913 probe-miss fixture, with the
+    /// object length and pinned suffix the exact per-phase literals derive from.
+    async fn probe_miss_fixture_run() -> (EntryReport, u64, u64, Vec<u8>) {
+        let store = empty_store();
+        let tenant = TenantId::new("reconcile-tenant");
+        let objects = write_shard_objects(&store, &tenant, 0, 1).await;
+        let object_len = objects[0].len() as u64;
+        let suffix = suffix_just_past_skip_idx(&objects[0]);
+        let window = TimeRange {
+            start_ns: 0,
+            end_ns: NOW_NS,
+        };
+        let (measured, skipped, failed) = measure_corpus(
+            &store,
+            tenant.hash(),
+            &[entry("q", PROBE_MISS_SQL)],
+            &[],
+            2,
+            window,
+            NOW_NS,
+            0,
+            Duration::from_secs(30),
+            false,
+            None,
+            ExecutorSettings {
+                logs_block_range_threshold: 0,
+                logs_suffix_len: Some(suffix),
+                ..ExecutorSettings::default()
+            },
+            false,
+            None,
+        )
+        .await
+        .expect("run");
+        assert!(skipped.is_empty() && failed.is_empty());
+        (
+            measured.into_iter().next().expect("one entry"),
+            object_len,
+            suffix,
+            objects[0].clone(),
+        )
     }
 
     // ---- Logs-scan opens by read shape (#904) ------------------------------
