@@ -549,8 +549,14 @@ pub struct RunAccounting {
     /// never zero on a real statement. Attributing those resolve GETs is epic
     /// #996 workstream E; when it lands this residual shrinks toward zero and
     /// the reconciliation needs no change.
+    ///
+    /// `None` is the LEGACY marker: a report written before request counts
+    /// existed carries neither per-phase counts nor this residual, and a
+    /// defaulted zero would fail the exact-sum check against a nonzero pooled
+    /// figure. `None` skips the request reconciliation; a fresh measurement
+    /// always records `Some`.
     #[serde(default)]
-    pub get_requests_unattributed: u64,
+    pub get_requests_unattributed: Option<u64>,
     /// STORED page bytes this run's decode consumed after column projection:
     /// `QueryAccounting::page_bytes_decoded`, the sum of `PageDesc::len` over
     /// the pages the projection kept. Post-compression bytes as they sit in the
@@ -613,8 +619,9 @@ pub struct PhaseWireBytes {
     /// GET requests this phase issued, recorded by the same call that charges
     /// the bytes above, so the two describe the same GETs (issue #857).
     /// Defaulted on read so a legacy report whose phase entries predate the
-    /// field still deserializes (zero here means "not recorded", and such a
-    /// report's request reconciliation is skipped by the version gate below).
+    /// field still deserializes; zero here means "not recorded", and the
+    /// legacy report's request reconciliation is skipped through
+    /// `RunAccounting::get_requests_unattributed` being `None`.
     #[serde(default)]
     pub get_requests: u64,
 }
@@ -733,28 +740,32 @@ pub fn reconcile_run_accounting(id: &str, run: usize, acc: &RunAccounting) -> Re
     // Request-count reconciliation, same design as bytes: the attributed sum
     // is a subset of the pooled GET count (double-count detector), and the
     // sum plus the derived residual is EXACTLY the pooled figure, so the
-    // resolve-path gap is audited rather than asserted away. A legacy report
-    // whose phase entries predate `get_requests` carries all-zero counts and
-    // a residual equal to the pooled figure, which still reconciles exactly.
-    let attributed_requests = acc
-        .wire_bytes_by_phase
-        .iter()
-        .fold(0u64, |a, p| a.saturating_add(p.get_requests));
-    if attributed_requests > acc.object_store_get_requests {
-        return Err(format!(
-            "entry `{id}` run {run}: per-phase GET requests sum to {attributed_requests}, above              the pooled {}, so a GET was counted into more than one phase",
-            acc.object_store_get_requests
-        ));
-    }
-    if attributed_requests.saturating_add(acc.get_requests_unattributed)
-        != acc.object_store_get_requests
-    {
-        return Err(format!(
-            "entry `{id}` run {run}: per-phase GET requests {attributed_requests} plus the              unattributed residual {} are {}, not the pooled {}",
-            acc.get_requests_unattributed,
-            attributed_requests.saturating_add(acc.get_requests_unattributed),
-            acc.object_store_get_requests
-        ));
+    // resolve-path gap is audited rather than asserted away. A LEGACY report
+    // (written before request counts existed) carries `None` for the
+    // residual and its request reconciliation is skipped outright: its
+    // per-phase counts are absent-defaulted zeros that describe nothing, and
+    // failing it against a nonzero pooled figure would reject every old
+    // report unread.
+    if let Some(residual) = acc.get_requests_unattributed {
+        let attributed_requests = acc
+            .wire_bytes_by_phase
+            .iter()
+            .fold(0u64, |a, p| a.saturating_add(p.get_requests));
+        if attributed_requests > acc.object_store_get_requests {
+            return Err(format!(
+                "entry `{id}` run {run}: per-phase GET requests sum to {attributed_requests}, \
+                 above the pooled {}, so a GET was counted into more than one phase",
+                acc.object_store_get_requests
+            ));
+        }
+        if attributed_requests.saturating_add(residual) != acc.object_store_get_requests {
+            return Err(format!(
+                "entry `{id}` run {run}: per-phase GET requests {attributed_requests} plus the \
+                 unattributed residual {residual} are {}, not the pooled {}",
+                attributed_requests.saturating_add(residual),
+                acc.object_store_get_requests
+            ));
+        }
     }
 
     let scan_wire_bytes = acc.wire_bytes_by_phase[QueryPhase::Scan.index()].wire_bytes;
@@ -1567,9 +1578,10 @@ pub async fn measure_corpus(
                 probe_misses_scan: run_probe_misses.scan,
                 wire_bytes_by_phase: phase_wire_bytes(&run_wire),
                 wire_bytes_unattributed: acc.total_s3_bytes().saturating_sub(run_wire.total()),
-                get_requests_unattributed: acc
-                    .s3_requests(AccountedOp::Get)
-                    .saturating_sub(run_wire.total_requests()),
+                get_requests_unattributed: Some(
+                    acc.s3_requests(AccountedOp::Get)
+                        .saturating_sub(run_wire.total_requests()),
+                ),
                 page_stored_bytes_decoded: acc.page_bytes_decoded,
                 fetch_amplification: amplification(
                     run_wire.phase(QueryPhase::Scan),
@@ -4330,6 +4342,24 @@ mod tests {
         assert_eq!(entry.get_requests, 0, "absent field defaults, not fails");
     }
 
+    /// A legacy `RunAccounting` -- phase entries without `get_requests`, no
+    /// residual field -- deserializes AND reconciles: the residual reads
+    /// `None`, which skips the request checks instead of failing them against
+    /// the nonzero pooled figure. Demonstrated failing by defaulting the
+    /// residual to zero instead of `None`.
+    #[test]
+    fn legacy_run_accounting_reconciles_without_request_fields() {
+        let mut acc = synthetic_run_accounting();
+        // What a pre-field report deserializes to: counts defaulted, residual
+        // absent.
+        for p in &mut acc.wire_bytes_by_phase {
+            p.get_requests = 0;
+        }
+        acc.get_requests_unattributed = None;
+        reconcile_run_accounting("legacy", 0, &acc)
+            .expect("legacy report must reconcile with request checks skipped");
+    }
+
     /// A `RunAccounting` whose figures are chosen, not measured, so a check can
     /// be perturbed one field at a time without a fixture run. Reconciles as
     /// written: three phases summing to 300 wire bytes, a 40-byte residual
@@ -4360,7 +4390,7 @@ mod tests {
             wire_bytes_unattributed: 400 - by_phase.iter().sum::<u64>(),
             // Pooled 4 GETs minus the phase-attributed sum: the resolve-path
             // residual the exact-sum reconciliation audits.
-            get_requests_unattributed: 4 - by_phase.iter().map(|b| b / 100).sum::<u64>(),
+            get_requests_unattributed: Some(4 - by_phase.iter().map(|b| b / 100).sum::<u64>()),
             page_stored_bytes_decoded: 75,
             fetch_amplification: amplification(by_phase[QueryPhase::Scan.index()], 75),
             logs_whole_object_opens: 0,
