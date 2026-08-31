@@ -40,6 +40,64 @@ message SnapshotEntry {
   uint64 series_count = 12;
   uint32 segment_format_version = 13;
   sint64 created_unix_ns = 14;
+  // Exact whole-object min/max and null count per stamp-eligible declared
+  // typed attribute column, copied by the fold from the record it folds
+  // (ADR-0873 decision 4): CommitRecord.declared_column_stats (field 20) for
+  // a level-0 entry, CompactionPart.declared_column_stats (field 12) for a
+  // level-1 compaction or rewrite part. Only entries that passed the
+  // statistics validity predicate against the source record's own row count
+  // are copied, so a defective stamp never reaches a sealed part.
+  // Additive and permanently optional: an empty list means this segment is
+  // uncovered for every declared column, which is a normal state forever
+  // (every record written before ADR-0873, every metrics/spans entry, any
+  // column declared after the flush opened, and every part an older fold
+  // wrote), never an error and never a value to guess at.
+  // Neither the .csnap envelope version nor SnapshotPartHeader.format_version
+  // is bumped: an addition an old reader can safely ignore costs it the
+  // statistics shortcut and never a wrong answer, so raising the reader floor
+  // would force a flag day for a field whose absence is a permanently legal
+  // state (ADR-0873 decision 1; SnapshotPartHeader.min_hour, field 8, is the
+  // in-file precedent for an additive entry-side change with no bump).
+  repeated DeclaredColumnMinMax declared_column_stats = 15;
+}
+
+// The min or max of one declared column's non-null values in one object: a
+// same-file mirror of ravel.commit.v1.DeclaredColumnStatValue (ADR-0873
+// decision 1). This repository has no cross-file proto imports, so the
+// commit-side pair is redeclared here rather than imported, the same
+// convention ColumnStat.declared_type follows for the sys enum. The two
+// declarations are field-for-field identical and must stay so: a reader
+// converts one to the other to run the single shared validity predicate.
+//
+// ColumnValue (above) is deliberately NOT reused: its oneof admits
+// str_utf8/bytes_val, which are not stamp-eligible (ADR-0873 decision 2), and
+// a narrower value type makes an ineligible stamp unrepresentable rather than
+// merely rejected. A new eligible type adds a oneof arm here, additively.
+message DeclaredColumnStatValue {
+  oneof kind {
+    sint64 i64 = 1;
+    bool b = 2;
+  }
+}
+
+// Exact whole-object min/max (and null count) for one declared typed
+// attribute column (ADR-0090), as computed by the writer that encoded the
+// object and carried here verbatim by the fold. Mirror of
+// ravel.commit.v1.DeclaredColumnMinMax. min/max are message-typed for
+// presence: both absent means the column had zero non-null values in this
+// object, which is still an exact statement.
+message DeclaredColumnMinMax {
+  string name = 1;
+  // ravel.sys.v1.TypedAttrColumnType as i32 (no cross-file proto import in
+  // this repo; same convention as ColumnStat.declared_type). Only I64 (2) and
+  // BOOL (3) are stamp-eligible; any other tag is dropped by the reader.
+  uint32 declared_type = 2;
+  DeclaredColumnStatValue min = 3;
+  DeclaredColumnStatValue max = 4;
+  // Rows in this object where the declared column reads NULL (name absent, or
+  // the stored variant mismatches declared_type). non_null = the entry's
+  // sample_count (field 11) minus this.
+  uint64 null_count = 5;
 }
 
 message SnapshotHead {

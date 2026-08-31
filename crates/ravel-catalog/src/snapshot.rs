@@ -4,6 +4,8 @@
 use ravel_proto::commit::v1::ErasureRequest;
 use uuid::Uuid;
 
+use crate::declared_stats::DeclaredColumnStats;
+
 /// Which storage level a [`SegmentRef`] names
 /// (docs/catalog-and-mvcc.md "Snapshot resolution").
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +78,23 @@ pub struct SegmentRef {
     /// is a decode choice only and the ranged route would pay a probe to fetch
     /// the same whole-object bytes (issue #862).
     pub segment_format_version: u32,
+    /// Exact whole-object min/max and null count per stamp-eligible declared
+    /// typed attribute column, from whichever record this ref was resolved
+    /// through (ADR-0873 decision 4): a listed or token-resolved
+    /// `CommitRecord`, a `CompactionPart`, or a folded `SnapshotEntry`. Every
+    /// entry here passed the statistics validity predicate against that
+    /// carrier's own row count; a defective one is absent, leaving its column
+    /// uncovered for this segment.
+    ///
+    /// Empty is the normal permanent state for a segment whose record predates
+    /// ADR-0873, for every metrics and spans segment, and for a column
+    /// declared after the segment's flush opened. A reader that finds a column
+    /// uncovered here falls back to scanning; absence is never an error.
+    ///
+    /// Shared, not owned: a `SegmentRef` is cloned per query and per plan
+    /// partition, so cloning this field is a refcount bump and the empty case
+    /// costs no allocation.
+    pub declared_column_stats: DeclaredColumnStats,
 }
 
 /// A pinned, immutable set of segments for one `resolve` call (MVCC).

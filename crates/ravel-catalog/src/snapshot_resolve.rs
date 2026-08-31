@@ -26,6 +26,7 @@ use ravel_types::{Signal, TenantHash, TimeRange};
 use uuid::Uuid;
 
 use crate::catalog::Catalog;
+use crate::declared_stats::{self, DeclaredColumnStats};
 use crate::error::CatalogError;
 use crate::fold::head_object_key;
 use crate::provisioning::{ShardGeneration, shard_ceiling};
@@ -1001,6 +1002,12 @@ fn build_segment_ref_from_entry(
                 part_index,
             },
             segment_format_version: entry.segment_format_version,
+            // ADR-0873 decision 4: the stamps the fold copied off the
+            // compaction part, re-validated against this entry's own row count
+            // rather than trusted because a fold wrote them.
+            declared_column_stats: DeclaredColumnStats::from_validated(
+                &declared_stats::read_snapshot_entry(entry),
+            ),
         });
     }
 
@@ -1041,6 +1048,11 @@ fn build_segment_ref_from_entry(
         created_unix_ns: entry.created_unix_ns,
         level: SegmentLevel::L0,
         segment_format_version: entry.segment_format_version,
+        // ADR-0873 decision 4: the stamps the fold copied off the commit
+        // record, re-validated against this entry's own row count.
+        declared_column_stats: DeclaredColumnStats::from_validated(
+            &declared_stats::read_snapshot_entry(entry),
+        ),
     })
 }
 
@@ -1822,6 +1834,7 @@ mod tests {
             series_count: 1,
             segment_format_version: 1,
             created_unix_ns: 0,
+            declared_column_stats: Vec::new(),
         };
         let part0 = Arc::new(DecodedPart {
             header: SnapshotPartHeader::default(),

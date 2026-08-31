@@ -545,6 +545,7 @@ async fn write_log_segment_for_span_test() -> (Arc<MemoryStore>, SegmentRef) {
         created_unix_ns: 0,
         level: SegmentLevel::L0,
         segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+        declared_column_stats: Default::default(),
     };
     (store, seg_ref)
 }

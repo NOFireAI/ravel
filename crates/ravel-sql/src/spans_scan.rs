@@ -1374,6 +1374,7 @@ mod tests {
             created_unix_ns: 0,
             level: SegmentLevel::L0,
             segment_format_version: u32::from(ravel_rspan::footer::VERSION),
+            declared_column_stats: Default::default(),
         };
 
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
@@ -1605,6 +1606,7 @@ mod tests {
             created_unix_ns: 0,
             level: SegmentLevel::L0,
             segment_format_version: u32::from(ravel_rspan::footer::VERSION),
+            declared_column_stats: Default::default(),
         };
 
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);

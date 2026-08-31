@@ -257,6 +257,7 @@ async fn write_segment(
         created_unix_ns: 0,
         level: SegmentLevel::L0,
         segment_format_version: u32::from(format_version),
+        declared_column_stats: Default::default(),
     }
 }
 

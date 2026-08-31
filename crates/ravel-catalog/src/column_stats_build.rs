@@ -729,6 +729,7 @@ mod tests {
             series_count: 0,
             segment_format_version: 2,
             created_unix_ns: 0,
+            declared_column_stats: Vec::new(),
         }
     }
 
@@ -770,6 +771,7 @@ mod tests {
             series_count: 0,
             segment_format_version: 1,
             created_unix_ns: 0,
+            declared_column_stats: Vec::new(),
         }
     }
 

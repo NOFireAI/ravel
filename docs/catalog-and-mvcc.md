@@ -482,7 +482,22 @@ carries two entry levels: a level-0 L0 commit entry, whose `writer_id` is the
 `writer_*` slots, and `snapshot_format::part` `validate_entries` enforces the
 width per level: 16 for level 0, 32 for level 1). Every producer of a snapshot
 entry MUST honour that per-level width; a mismatch is a format violation, not a
-value to widen the reader around. `verify_seal_divergence`
+value to widen the reader around.
+
+An entry also carries `declared_column_stats` (field 15, ADR-0873), the
+per-declared-column exact min, max, and null count the fold copies from the
+record it folds: `CommitRecord.declared_column_stats` (field 20) for a level-0
+entry, `CompactionPart.declared_column_stats` (field 12) for a level-1 part.
+Only entries that passed the statistics validity predicate against the source
+record's own row count are copied, so a defective stamp never outlives the
+record that convicts it. The field is additive and permanently optional, and
+neither the `.csnap` envelope version nor `SnapshotPartHeader.format_version`
+is bumped for it: absence costs a reader the statistics shortcut and never
+yields a wrong answer, which is the same reasoning ADR-0063 applied to
+`SnapshotPartHeader.min_hour`. Entries grow by roughly `name_len + 25` bytes
+per stamped column, so a part's `entries_uncompressed_len` and the resolve
+path's per-record cache sizing note below grow by that order for a tenant with
+declared columns. `verify_seal_divergence`
 (`crates/ravel-catalog/src/seal_divergence.rs`) therefore compares only the
 level-0 entries against the L0 commit history, and mirrors the fold's
 supersession exclusion on the ground-truth side: an L0 commit record named in a
@@ -942,6 +957,18 @@ pinning are unchanged:
    records (ADR-0010 §7); dedup by data key across the snapshot/listing/
    token sources, sort by the dedup total order ("Cross-segment duplicate
    samples" below), return the pinned `Snapshot`.
+
+`SegmentRef.declared_column_stats` is filled on every one of those routes
+(ADR-0873 decision 4): from the commit record for a listed or token-resolved
+segment, from the compaction/rewrite part for a listed L1 part, and from
+`SnapshotEntry.declared_column_stats` (field 15) for a sealed entry. The
+listing routes are what cover the always-unsealed recent tail and
+token-resolved segments, which no fold-built sibling object reaches. The
+entries are re-validated against the carrier's own row count wherever they are
+read, so a stamp is never trusted because some earlier reader accepted it, and
+an entry that fails leaves its column uncovered without affecting the rest of
+the record. An empty list means the segment is uncovered for every declared
+column and is never an error; a reader that finds a column uncovered scans.
 
 Every LIST call on the resolve path, in both phases, asserts that each
 returned key begins with the requesting tenant's prefix (per ADR-0050 §2,

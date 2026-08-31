@@ -11,6 +11,7 @@ mod column_stats_build;
 mod column_stats_resolve;
 mod config;
 mod covering_postings;
+mod declared_stats;
 mod error;
 mod fold;
 mod key_epoch;
@@ -43,6 +44,7 @@ pub use config::{
     DEFAULT_PROTECTION_HORIZON_NS, DEFAULT_SNAPSHOT_CACHE_PARTS,
 };
 pub use covering_postings::{LoadPostingsError, LoadedCoveringPostings, load_covering_postings};
+pub use declared_stats::{DeclaredColumnStats, read_snapshot_entry};
 pub use error::CatalogError;
 pub use fold::{FoldReport, PostingsBuildError, Transaction, fetch_segment_names};
 pub use key_epoch::{

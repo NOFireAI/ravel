@@ -28,6 +28,7 @@ use uuid::Uuid;
 use crate::cache::{CompactionRecordCache, HeadCache, PartCache, PostingsCache, RecordCache};
 use crate::column_stats_resolve::{self, LoadColumnStatsError, LoadedColumnStats};
 use crate::config::CatalogConfig;
+use crate::declared_stats::DeclaredColumnStats;
 use crate::error::CatalogError;
 use crate::provisioning::ShardGeneration;
 use crate::snapshot::{SegmentLevel, SegmentOrigin, SegmentOrigins, SegmentRef, Snapshot};
@@ -3218,6 +3219,11 @@ fn build_l1_segment_ref(
             part_index: part.part_index,
         },
         segment_format_version: part.segment_format_version,
+        // ADR-0873 decision 4: a listed L1 part carries its own stamps
+        // (CompactionPart field 12), gated against the part's row count.
+        declared_column_stats: DeclaredColumnStats::from_validated(
+            &ravel_commit::declared_stats::read_compaction_part(part),
+        ),
     })
 }
 
@@ -3285,6 +3291,11 @@ fn build_rewrite_l1_segment_ref(
             part_index: part.part_index,
         },
         segment_format_version: part.segment_format_version,
+        // ADR-0873 decision 4: a listed L1 part carries its own stamps
+        // (CompactionPart field 12), gated against the part's row count.
+        declared_column_stats: DeclaredColumnStats::from_validated(
+            &ravel_commit::declared_stats::read_compaction_part(part),
+        ),
     })
 }
 
@@ -3442,6 +3453,13 @@ fn build_segment_ref(key: &str, record: &CommitRecord) -> Result<SegmentRef, Cat
         created_unix_ns: record.created_unix_ns,
         level: SegmentLevel::L0,
         segment_format_version: record.segment_format_version,
+        // ADR-0873 decision 4: a listed or token-resolved L0 segment carries
+        // the stamps of the very record this resolve already read, which is
+        // what covers the live tail no fold-built object can reach. The gated
+        // read binds the row-count clauses against the record's sample_count.
+        declared_column_stats: DeclaredColumnStats::from_validated(
+            &ravel_commit::declared_stats::read_commit_record(record),
+        ),
     })
 }
 
