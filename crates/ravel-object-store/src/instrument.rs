@@ -40,8 +40,16 @@
 //!   in from the layer that *can* see each retry --- the S3 adapter's counting
 //!   HTTP connector ([`crate::s3`]) records one attempt per HTTP request it
 //!   issues via [`StoreMetrics::record_attempt`], into the same per-op block, so
-//!   `attempts >= calls` always and `attempts - calls` is the retry (billed)
-//!   overhead. A backend that issues no HTTP requests (for example
+//!   `attempts - calls` is the retry (billed) overhead. `attempts >= calls`
+//!   holds exactly when every store this decorator counts a `calls` on records
+//!   its attempts into the same handle: an [`InstrumentedStore::with_metrics`]
+//!   wrapping an [`S3Store`](crate::s3::S3Store) built with
+//!   [`S3Store::new`](crate::s3::S3Store::new) (no handle) would count
+//!   `calls` while recording no `attempts`, so the relation is a property of the
+//!   wiring, not a guarantee of this type. The server wires the whole S3 chain
+//!   --- the base store and, under `--tenant-kms-config`, every per-tenant
+//!   KMS-routed store (see [`crate::KmsRoutingStore::new`]) --- onto one handle,
+//!   so it holds there (issue #928). A backend that issues no HTTP requests (for example
 //!   [`crate::memory::MemoryStore`]) leaves `attempts` at zero: there is no bill
 //!   and nothing retried. Because a single logical read may fan a whole-object
 //!   `GetRange::Full` into several bounded ranged GETs, `attempts` can exceed
@@ -360,8 +368,9 @@ pub struct OpMetricsSnapshot {
     pub errors: [u64; STORE_ERROR_CLASS_COUNT],
     /// Bytes returned (`get`) or offered (`put`); zero for every other op.
     pub bytes: u64,
-    /// Billed HTTP requests, retries included (issue #928). Always `>= calls`
-    /// for a backend that issues HTTP; `attempts - calls` is the retry (billed)
+    /// Billed HTTP requests, retries included (issue #928). `>= calls` when
+    /// every store the decorator counts shares this handle (the wiring the
+    /// module docs describe); `attempts - calls` is then the retry (billed)
     /// overhead `calls` alone hides. Zero for a non-HTTP backend. See the
     /// [module docs](self) for why this decorator does not record it itself.
     pub attempts: u64,

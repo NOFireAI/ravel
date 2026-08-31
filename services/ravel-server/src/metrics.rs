@@ -484,11 +484,14 @@ fn render_store_family(out: &mut String, mode: Mode, snapshot: &StoreMetricsSnap
     write_header(
         out,
         "ravel_store_attempts_total",
-        "Billed HTTP requests, by operation (issue #928). Always >= \
-         ravel_store_calls_total for an HTTP backend. Retries are one reason it \
-         exceeds the call count and not the only one: a whole-object read and a \
-         multipart write each issue several HTTP requests per logical call, so \
-         the difference is not a retry count. Zero for a non-HTTP backend.",
+        "Billed HTTP requests, by operation (issue #928). >= \
+         ravel_store_calls_total when every store the call counter sees shares \
+         this metrics handle, which the server wires up: the base S3 store and \
+         every per-tenant KMS-routed store record attempts into one block. \
+         Retries are one reason it exceeds the call count and not the only one: \
+         a whole-object read and a multipart write each issue several HTTP \
+         requests per logical call, so the difference is not a retry count. Zero \
+         for a non-HTTP backend.",
         "counter",
     );
     for op in StoreOp::ALL {
