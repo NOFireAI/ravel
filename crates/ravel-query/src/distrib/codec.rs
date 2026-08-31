@@ -1400,6 +1400,7 @@ pub fn encode_accounting(snap: &QueryAccountingSnapshot) -> pb::QueryAccountingS
         segments_pruned: snap.segments_pruned,
         series_matched: snap.series_matched,
         bytes_reused: snap.bytes_reused,
+        data_objects_touched: snap.data_objects_touched,
         peak_intermediate_bytes: snap.peak_intermediate_bytes,
     }
 }
@@ -1426,21 +1427,24 @@ pub fn decode_accounting(snap: pb::QueryAccountingSnapshot) -> QueryAccountingSn
         segments_pruned: snap.segments_pruned,
         series_matched: snap.series_matched,
         bytes_reused: snap.bytes_reused,
-        // `page_bytes_fetched`/`page_bytes_decoded` (ADR-0107 decision 4),
-        // `logs_whole_object_opens`/`logs_ranged_opens` (ADR-0904 decision 5),
-        // and `data_objects_touched` (ADR-0996 decision 3)
-        // are process-local accounting and are NOT carried on this wire form:
-        // `pb::QueryAccountingSnapshot` is a frozen proto schema, and adding a
-        // field to it is an ADR-gated change out of these counters' scope. The
-        // ADR-0071 fan-out coordinator therefore does not aggregate a remote
-        // worker's page-byte, opens-by-shape, or object-touch totals;
-        // single-process queries account them in full. Decoded back as zero
-        // below.
+        // `page_bytes_fetched`/`page_bytes_decoded` (ADR-0107 decision 4) and
+        // `logs_whole_object_opens`/`logs_ranged_opens` (ADR-0904 decision 5)
+        // are process-local accounting and are NOT carried on this wire form;
+        // adding them would be its own ADR-gated change. The ADR-0071 fan-out
+        // coordinator therefore does not aggregate a remote worker's page-byte
+        // or opens-by-shape totals; single-process queries account them in
+        // full. Decoded back as zero below.
+        //
+        // `data_objects_touched` IS carried (field 16, the ADR-0996 decision-3
+        // additive change): slices partition by shard, so slice object sets
+        // are disjoint and the coordinator's sum is an exact distinct count.
+        // An old peer omits the field, prost decodes 0, and the merged figure
+        // degrades to the coordinator's own count -- never inflated.
         page_bytes_fetched: 0,
         page_bytes_decoded: 0,
         logs_whole_object_opens: 0,
         logs_ranged_opens: 0,
-        data_objects_touched: 0,
+        data_objects_touched: snap.data_objects_touched,
         peak_intermediate_bytes: snap.peak_intermediate_bytes,
     }
 }
@@ -3004,8 +3008,9 @@ mod tests {
         );
         assert_eq!(round.logs_ranged_opens, 0);
         assert_eq!(
-            round.data_objects_touched, 0,
-            "the object-touch denominator is not on the wire proto"
+            round.data_objects_touched, 11,
+            "the object-touch denominator round-trips on the wire (field 16, \
+             ADR-0996 decision 3): shard-disjoint slice sets sum exactly"
         );
         assert_eq!(
             round,
@@ -3014,7 +3019,6 @@ mod tests {
                 page_bytes_decoded: 0,
                 logs_whole_object_opens: 0,
                 logs_ranged_opens: 0,
-                data_objects_touched: 0,
                 ..snap
             },
             "every other field round-trips unchanged"
