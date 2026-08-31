@@ -2,6 +2,8 @@
 
 use std::time::Duration;
 
+use ravel_types::cost_profile::StoreCostProfile;
+
 /// Default cap on segments a single query may fan out over.
 pub const DEFAULT_MAX_SEGMENTS: usize = 1024;
 /// Default cap on distinct series a single query may materialize.
@@ -124,6 +126,210 @@ impl RequestLimit {
     }
 }
 
+/// Default fetch bound ([`EngineConfig::logs_max_fetch_run_bytes`], ADR-0996
+/// decision 2). Bounds one covering GET's length: an object at or under it is
+/// read in a single [`crate::log_fetcher`] covering GET, and a larger one is
+/// read as `ceil(size / bound)` sequential covering sub-range GETs, so no
+/// single request moves more than this many bytes.
+pub const DEFAULT_LOG_MAX_FETCH_RUN_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Bytes in one GiB, the unit both of a [`StoreCostProfile`]'s per-GiB prices
+/// are quoted in. The cost-based derivation below needs a per-byte rate, so it
+/// multiplies the per-request price by this before dividing by the per-GiB
+/// byte price (ADR-0996 decision 2, "multiplies BEFORE it divides, in u128").
+const BYTES_PER_GIB: u128 = 1 << 30;
+
+/// The operator's logs fetch-policy intent (ADR-0996 decision 2). One knob
+/// (`--logs-fetch-policy`) that resolves, at startup, to the byte-denominated
+/// request cost the fetch layer already runs on
+/// ([`crate::BlockRangeFetcher`]'s `request_cost_bytes`) plus the routing
+/// threshold. It never reaches the fetch layer as a policy: prices and intent
+/// live here, the fetch layer learns only byte quantities (ADR-0904's layering,
+/// preserved).
+///
+/// The policy must never be derivable from query text, headers, or tickets
+/// (ADR-0904 decision 4, inverted: under request billing a tenant forcing
+/// `ByteMinimal` per query would multiply the deployment's request bill). It is
+/// an operator surface only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LogsFetchPolicy {
+    /// Minimize request count: saturate the exchange rate so every object is
+    /// read whole in one covering GET, no probe and no ranged read. The
+    /// cost-preferring shape on an intra-region deployment where transfer is
+    /// free.
+    RequestMinimal,
+    /// ADR-0904's byte-minimizing behaviour, byte for byte for objects at or
+    /// under the fetch bound: the derived latency break-even request cost, with
+    /// ranged reads wherever they save more bytes than a request costs. Kept for
+    /// egress-billed and network-constrained deployments.
+    ByteMinimal,
+    /// Derive the request cost from the active [`StoreCostProfile`]. At the
+    /// reference (intra-region) profile this resolves to `RequestMinimal`
+    /// behaviour; at egress prices it resolves to a small byte cost the floors
+    /// clamp. The default, so a reference deployment gets request-minimal
+    /// fetching with no operator action.
+    #[default]
+    CostBased,
+}
+
+impl LogsFetchPolicy {
+    /// The policy name as it appears on the `--logs-fetch-policy` flag and in a
+    /// provenance stamp.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LogsFetchPolicy::RequestMinimal => "request-minimal",
+            LogsFetchPolicy::ByteMinimal => "byte-minimal",
+            LogsFetchPolicy::CostBased => "cost-based",
+        }
+    }
+}
+
+/// A resolved fetch policy: the byte quantities and routing decisions the fetch
+/// layer runs on (ADR-0996 decision 2), plus the facts a startup path logs.
+///
+/// [`resolve_logs_fetch`] produces this from the policy, the active profile, and
+/// the explicit ADR-0904 overrides. The server (task 996-5) hands
+/// [`Self::request_cost_bytes`] and [`Self::block_range_threshold`] to the
+/// fetcher and logs [`Self::overridden_block_range_threshold`] and
+/// [`Self::saturated_profile`]; nothing here reads a price.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedLogsFetch {
+    /// The byte-denominated request cost, the single quantity every
+    /// range-vs-whole-object decision in the fetch layer is driven from
+    /// ([`EngineConfig::logs_request_cost_bytes`]). `u64::MAX` under
+    /// request-minimal (and a cost-based derivation whose byte price is zero or
+    /// near-zero), which saturates every derived crossover to whole-object.
+    pub request_cost_bytes: u64,
+    /// The routing threshold ([`EngineConfig::logs_block_range_threshold`]).
+    /// request-minimal saturates it to `u64::MAX` so no object is ever routed to
+    /// the ranged path, overriding an explicit `--logs-block-range-threshold`.
+    pub block_range_threshold: u64,
+    /// True under request-minimal: the plan phase suppresses its per-segment
+    /// footer probe, because the scan read is whole-object anyway and a probe
+    /// that cannot reduce requests is pure spend.
+    pub suppress_plan_footer_probe: bool,
+    /// Set to the operator's explicit `--logs-block-range-threshold` when
+    /// request-minimal overrode it, so the startup path can log the overridden
+    /// flag (ADR-0996 decision 2). `None` when no explicit threshold was set or
+    /// the policy left it in force.
+    pub overridden_block_range_threshold: Option<u64>,
+    /// Set to the active profile's name when a cost-based derivation saturated
+    /// the rate at `u64::MAX`, so the startup path can log the saturation naming
+    /// the profile. `None` otherwise.
+    pub saturated_profile: Option<String>,
+}
+
+/// Resolve a [`LogsFetchPolicy`] to the byte quantities and routing decisions
+/// the fetch layer runs on (ADR-0996 decision 2).
+///
+/// This is the one place a price becomes a byte rate; the resulting
+/// [`ResolvedLogsFetch`] carries only bytes and booleans, so the fetch layer
+/// never learns a price (ADR-0904 layering). The startup path (task 996-5)
+/// calls this and hands the byte quantities to the fetcher.
+///
+/// Precedence, from ADR-0996 decision 2 and its ADR-0904 alignment:
+///
+/// - An explicit `--logs-request-cost-bytes` (`explicit_request_cost_bytes`)
+///   WINS over policy for the rate: policy is the intent layer, the byte flag
+///   the expert escape hatch.
+/// - `RequestMinimal` still overrides BOTH routing thresholds, including an
+///   explicitly set `--logs-block-range-threshold`: a policy that saturated only
+///   the derived rate would let a low explicit threshold send projected objects
+///   down the ranged path through `ranged_projection_pays`.
+///
+/// The cost-based derivation multiplies before it divides, in `u128`:
+/// `get_class_nanodollars * BYTES_PER_GIB / (transfer + retrieval)`,
+/// floor-rounded with a one-byte minimum and saturated high at `u64::MAX`. It
+/// saturates to request-minimal only when BOTH byte prices are zero. The result
+/// is NOT clamped to the fetch bound (that would let a projection saving more
+/// than the bound re-select ranged routing under an effectively request-minimal
+/// policy); the 64 KiB gap and 512 KiB crossover floors are applied downstream
+/// in the fetch layer.
+pub fn resolve_logs_fetch(
+    policy: LogsFetchPolicy,
+    profile: &StoreCostProfile,
+    explicit_request_cost_bytes: Option<u64>,
+    configured_block_range_threshold: u64,
+    explicit_block_range_threshold: Option<u64>,
+) -> ResolvedLogsFetch {
+    // The rate: an explicit byte flag wins over policy; otherwise the policy
+    // decides. Only a cost-based derivation can saturate for a numeric reason
+    // worth logging.
+    let (request_cost_bytes, saturated_profile) = match explicit_request_cost_bytes {
+        Some(explicit) => (explicit, None),
+        None => match policy {
+            LogsFetchPolicy::RequestMinimal => (u64::MAX, None),
+            LogsFetchPolicy::ByteMinimal => (configured_block_range_threshold_rate(profile), None),
+            LogsFetchPolicy::CostBased => resolve_cost_based_rate(profile),
+        },
+    };
+
+    // Routing: request-minimal saturates the threshold so no object routes
+    // ranged, overriding an explicit flag (which is then logged). Every other
+    // policy keeps the configured threshold.
+    let request_minimal = matches!(policy, LogsFetchPolicy::RequestMinimal);
+    let (block_range_threshold, overridden_block_range_threshold) = if request_minimal {
+        (u64::MAX, explicit_block_range_threshold)
+    } else {
+        (configured_block_range_threshold, None)
+    };
+
+    ResolvedLogsFetch {
+        request_cost_bytes,
+        block_range_threshold,
+        suppress_plan_footer_probe: request_minimal,
+        overridden_block_range_threshold,
+        saturated_profile,
+    }
+}
+
+/// byte-minimal keeps today's configured request cost. It has no profile
+/// dependency; the profile argument is taken only so the signature matches the
+/// other arms and a future byte-price-aware byte-minimal has a seam. Named for
+/// clarity at the call site above.
+fn configured_block_range_threshold_rate(_profile: &StoreCostProfile) -> u64 {
+    crate::DEFAULT_LOG_REQUEST_COST_BYTES
+}
+
+/// The cost-based byte rate and, when it saturated at `u64::MAX`, the profile
+/// name to log. `get_class_nanodollars * BYTES_PER_GIB / (transfer + retrieval)`
+/// in `u128`, floored at one byte, saturated high; both byte prices zero
+/// saturates to request-minimal.
+fn resolve_cost_based_rate(profile: &StoreCostProfile) -> (u64, Option<String>) {
+    let byte_price = u128::from(profile.transfer_nanodollars_per_gib)
+        .saturating_add(u128::from(profile.retrieval_nanodollars_per_gib));
+    if byte_price == 0 {
+        // Free bytes: a saved request is worth an unbounded number of free
+        // bytes, so whole-object always. The reference profile lands here, which
+        // is why cost-based defaults to request-minimal behaviour there.
+        return (u64::MAX, Some(profile.name.clone()));
+    }
+    let quotient = u128::from(profile.get_class_nanodollars) * BYTES_PER_GIB / byte_price;
+    match u64::try_from(quotient) {
+        // Floor at one byte so a sub-nanodollar-per-byte price can never resolve
+        // to a zero rate (which would make every crossover trivially true).
+        Ok(rate) => (rate.max(1), None),
+        // A near-free byte price against a large GET price overflows u64: an
+        // astronomically high rate means whole-object always, so saturate and
+        // log the profile.
+        Err(_) => (u64::MAX, Some(profile.name.clone())),
+    }
+}
+
+/// Why an [`EngineConfig`] could not be resolved into fetch-layer quantities
+/// (ADR-0996 decision 2). A rejected value is always one of these, never a
+/// panic or a silent clamp.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum EngineConfigError {
+    /// [`EngineConfig::logs_max_fetch_run_bytes`] was zero. The segmented
+    /// covering fallback divides the object size by it, so zero is refused
+    /// rather than dividing by zero.
+    #[error(
+        "logs_max_fetch_run_bytes must be non-zero: the segmented covering fallback divides by it"
+    )]
+    ZeroFetchBound,
+}
+
 /// [`crate::QueryEngine`] resource limits and concurrency. Every limit is
 /// enforced as a typed error (docs/query-engine.md "never silent partial
 /// results"), never a truncation.
@@ -185,6 +391,32 @@ pub struct EngineConfig {
     /// carries the derivation. Raising it above the largest object a deployment
     /// writes collapses all three decisions to whole-object reads.
     pub logs_request_cost_bytes: u64,
+    /// The operator's fetch-policy intent (ADR-0996 decision 2), resolved at
+    /// startup by [`resolve_logs_fetch`] into [`Self::logs_request_cost_bytes`]
+    /// and [`Self::logs_block_range_threshold`]. Carried here, like the two
+    /// fields it resolves into, because this is the config the server folds its
+    /// query flags into and hands to every fetcher it builds. Defaults to
+    /// [`LogsFetchPolicy::CostBased`].
+    pub logs_fetch_policy: LogsFetchPolicy,
+    /// The fetch bound (ADR-0996 decision 2): one covering GET's maximum length.
+    /// An object at or under it is one covering GET; a larger one is read as
+    /// `ceil(size / bound)` sequential covering sub-range GETs, so no single
+    /// request moves more than this. Zero is refused at resolution
+    /// ([`Self::validate`]): the segmented fallback divides by it. Defaults to
+    /// [`DEFAULT_LOG_MAX_FETCH_RUN_BYTES`] (64 MiB).
+    pub logs_max_fetch_run_bytes: u64,
+}
+
+impl EngineConfig {
+    /// Refuse a configuration the fetch layer cannot run on (ADR-0996 decision
+    /// 2). Called at startup resolution; a bad value is a typed
+    /// [`EngineConfigError`], never a silent clamp.
+    pub fn validate(&self) -> Result<(), EngineConfigError> {
+        if self.logs_max_fetch_run_bytes == 0 {
+            return Err(EngineConfigError::ZeroFetchBound);
+        }
+        Ok(())
+    }
 }
 
 impl Default for EngineConfig {
@@ -203,6 +435,8 @@ impl Default for EngineConfig {
             default_evaluation_interval: DEFAULT_EVALUATION_INTERVAL,
             logs_block_range_threshold: crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
             logs_request_cost_bytes: crate::DEFAULT_LOG_REQUEST_COST_BYTES,
+            logs_fetch_policy: LogsFetchPolicy::default(),
+            logs_max_fetch_run_bytes: DEFAULT_LOG_MAX_FETCH_RUN_BYTES,
         }
     }
 }
@@ -222,5 +456,209 @@ mod tests {
         // measured q20 latency break-even and no behavior change (ADR-0904
         // decision 5).
         assert_eq!(crate::DEFAULT_LOG_REQUEST_COST_BYTES, 1_887_437);
+    }
+
+    #[test]
+    fn default_fetch_policy_is_cost_based_and_bound_is_64_mib() {
+        let cfg = EngineConfig::default();
+        assert_eq!(cfg.logs_fetch_policy, LogsFetchPolicy::CostBased);
+        assert_eq!(
+            cfg.logs_max_fetch_run_bytes,
+            DEFAULT_LOG_MAX_FETCH_RUN_BYTES
+        );
+        assert_eq!(DEFAULT_LOG_MAX_FETCH_RUN_BYTES, 64 * 1024 * 1024);
+    }
+
+    /// The policy-to-rate mapping table pinned exactly (ADR-0996 decision 2's
+    /// acceptance): saturate / default / profile-derived-with-floors /
+    /// high-saturation boundary. Each row states the rate to the byte.
+    #[test]
+    fn policy_to_rate_mapping_table_is_pinned() {
+        let reference = StoreCostProfile::reference();
+
+        // request-minimal saturates the rate AND the routing threshold,
+        // regardless of profile or an explicit block-range threshold, and
+        // suppresses the plan footer probe. An explicitly set threshold is
+        // reported for the startup log.
+        let rm = resolve_logs_fetch(
+            LogsFetchPolicy::RequestMinimal,
+            &reference,
+            None,
+            crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+            Some(4096),
+        );
+        assert_eq!(rm.request_cost_bytes, u64::MAX, "request-minimal saturates");
+        assert_eq!(rm.block_range_threshold, u64::MAX);
+        assert!(rm.suppress_plan_footer_probe);
+        assert_eq!(
+            rm.overridden_block_range_threshold,
+            Some(4096),
+            "an explicitly set block-range threshold is overridden and logged"
+        );
+        assert_eq!(rm.saturated_profile, None);
+
+        // byte-minimal keeps today's configured request cost byte for byte, and
+        // leaves the routing threshold and plan probe alone.
+        let bm = resolve_logs_fetch(
+            LogsFetchPolicy::ByteMinimal,
+            &reference,
+            None,
+            crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+            Some(4096),
+        );
+        assert_eq!(bm.request_cost_bytes, crate::DEFAULT_LOG_REQUEST_COST_BYTES);
+        assert_eq!(
+            bm.block_range_threshold,
+            crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD
+        );
+        assert!(!bm.suppress_plan_footer_probe);
+        assert_eq!(bm.overridden_block_range_threshold, None);
+
+        // cost-based at the reference (intra-region, free bytes) profile
+        // resolves to request-minimal behaviour: both byte prices zero saturate
+        // the rate, naming the profile.
+        let cb_ref = resolve_logs_fetch(
+            LogsFetchPolicy::CostBased,
+            &reference,
+            None,
+            crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+            None,
+        );
+        assert_eq!(cb_ref.request_cost_bytes, u64::MAX);
+        assert_eq!(
+            cb_ref.saturated_profile.as_deref(),
+            Some("s3-intra-region-2026")
+        );
+        // ... but cost-based is NOT request-minimal for routing: it does not
+        // saturate the routing threshold or suppress the probe. Only the rate
+        // saturates, which the downstream crossover floors handle.
+        assert_eq!(
+            cb_ref.block_range_threshold,
+            crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD
+        );
+        assert!(!cb_ref.suppress_plan_footer_probe);
+
+        // cost-based at egress prices resolves to a small byte cost:
+        //   400 * 2^30 / (90_000_000 + 10_000_000)
+        //   = 429_496_729_600 / 100_000_000 = 4294 (floor). ~4.3 KB, the
+        // ADR-0904 worked value, which the downstream floors then clamp.
+        let egress = StoreCostProfile {
+            name: "egress-billed".to_string(),
+            put_class_nanodollars: 5_000,
+            get_class_nanodollars: 400,
+            delete_class_nanodollars: 0,
+            transfer_nanodollars_per_gib: 90_000_000,
+            retrieval_nanodollars_per_gib: 10_000_000,
+        };
+        let cb_egress = resolve_logs_fetch(
+            LogsFetchPolicy::CostBased,
+            &egress,
+            None,
+            crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+            None,
+        );
+        assert_eq!(
+            cb_egress.request_cost_bytes, 4294,
+            "profile-derived rate is get*2^30/(transfer+retrieval), floored"
+        );
+        assert_eq!(cb_egress.saturated_profile, None);
+        // The raw rate is well below both floors, so the downstream fetch layer
+        // clamps it: the gap floors to 64 KiB and the crossover to 512 KiB.
+        assert!(cb_egress.request_cost_bytes < crate::DEFAULT_LOG_COALESCE_GAP);
+        assert!(cb_egress.request_cost_bytes < crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD);
+
+        // transfer=0, retrieval>0 routes byte-minimally from the retrieval
+        // price, NOT request-minimal: a naive per-byte pre-division would
+        // truncate this to zero and be unreachable.
+        //   400 * 2^30 / 10_000_000 = 429_496_729_600 / 10_000_000 = 42949.
+        let retrieval_only = StoreCostProfile {
+            name: "retrieval-only".to_string(),
+            put_class_nanodollars: 5_000,
+            get_class_nanodollars: 400,
+            delete_class_nanodollars: 0,
+            transfer_nanodollars_per_gib: 0,
+            retrieval_nanodollars_per_gib: 10_000_000,
+        };
+        let cb_retrieval = resolve_logs_fetch(
+            LogsFetchPolicy::CostBased,
+            &retrieval_only,
+            None,
+            crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+            None,
+        );
+        assert_eq!(cb_retrieval.request_cost_bytes, 42949);
+        assert_eq!(cb_retrieval.saturated_profile, None);
+    }
+
+    /// The high-saturation boundary at a one-nanodollar-per-GiB byte price
+    /// (ADR-0996 decision 2): the quotient `get * 2^30` crosses `u64::MAX` at
+    /// `get = 2^34`. One below the boundary is a large finite rate; at the
+    /// boundary it saturates and names the profile.
+    #[test]
+    fn cost_based_high_saturation_boundary_is_pinned() {
+        let below = StoreCostProfile {
+            name: "one-nd-per-gib-below".to_string(),
+            put_class_nanodollars: 0,
+            get_class_nanodollars: (1u64 << 34) - 1,
+            delete_class_nanodollars: 0,
+            transfer_nanodollars_per_gib: 1,
+            retrieval_nanodollars_per_gib: 0,
+        };
+        let r = resolve_logs_fetch(
+            LogsFetchPolicy::CostBased,
+            &below,
+            None,
+            crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+            None,
+        );
+        // ((2^34 - 1) * 2^30) / 1 = 2^64 - 2^30, one GiB below u64::MAX+1: finite.
+        assert_eq!(r.request_cost_bytes, u64::MAX - (1u64 << 30) + 1);
+        assert_eq!(
+            r.saturated_profile, None,
+            "one below the boundary is finite"
+        );
+
+        let at = StoreCostProfile {
+            name: "one-nd-per-gib-at".to_string(),
+            get_class_nanodollars: 1u64 << 34,
+            ..below.clone()
+        };
+        let r = resolve_logs_fetch(
+            LogsFetchPolicy::CostBased,
+            &at,
+            None,
+            crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+            None,
+        );
+        // 2^34 * 2^30 = 2^64 > u64::MAX: saturates, names the profile.
+        assert_eq!(r.request_cost_bytes, u64::MAX);
+        assert_eq!(r.saturated_profile.as_deref(), Some("one-nd-per-gib-at"));
+    }
+
+    #[test]
+    fn explicit_request_cost_bytes_wins_over_policy() {
+        // The expert escape hatch: an explicit --logs-request-cost-bytes wins
+        // over the policy's derived rate, even request-minimal's saturation.
+        let profile = StoreCostProfile::reference();
+        let r = resolve_logs_fetch(
+            LogsFetchPolicy::RequestMinimal,
+            &profile,
+            Some(123_456),
+            crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+            None,
+        );
+        assert_eq!(r.request_cost_bytes, 123_456);
+        // request-minimal still overrides the routing threshold: only the rate
+        // is an escape hatch, not the routing intent.
+        assert_eq!(r.block_range_threshold, u64::MAX);
+        assert!(r.suppress_plan_footer_probe);
+    }
+
+    #[test]
+    fn zero_fetch_bound_is_refused_with_a_typed_error() {
+        let mut cfg = EngineConfig::default();
+        assert_eq!(cfg.validate(), Ok(()));
+        cfg.logs_max_fetch_run_bytes = 0;
+        assert_eq!(cfg.validate(), Err(EngineConfigError::ZeroFetchBound));
     }
 }
