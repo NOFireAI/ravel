@@ -81,6 +81,14 @@ pub enum MaintainError {
         /// independent authority the decode tally is checked against.
         footer_record_count: u64,
     },
+    #[error(
+        "compaction part {part_key:?} answered AlreadyExists at PUT (an abandoned run had already uploaded it) but was gone when HEAD-verified after the record PUT: a tenant tombstone or the unreferenced-part sweep deleted it in the window between our existence check and our record PUT, and the bounded compactor released its bytes so it cannot be re-PUT from RAM (ADR-0979 decision 3). Re-run the compaction: the rerun rebuilds the byte-identical part and its PUT of the now-absent key is a fresh put that restores it before the record resolves, so the rerun converges with nothing to repair"
+    )]
+    AlreadyExistsPartVanished {
+        /// Object key of the part that answered `AlreadyExists` at PUT but was
+        /// absent at post-publish HEAD verification.
+        part_key: String,
+    },
     #[error("compaction invariant breach: {0}")]
     Invariant(String),
     #[error(
