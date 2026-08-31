@@ -217,7 +217,11 @@ layer already runs on (`BlockRangeFetcher::request_cost_bytes`,
   residual ranged read (bound-exceeding objects) fuses its selected
   ranges INCLUDING HOLES into at most one covering GET per object
   (`coalesce_byte_extents`'s fuse condition already does this at a
-  saturated gap, `log_fetcher.rs:5145-5150`). Additionally the plan
+  saturated gap, `log_fetcher.rs:5145-5150`) — subject to the fetch
+  bound: segmentation (below) runs AFTER coalescing and takes
+  precedence, so a bound-exceeding object's fused runs are re-cut into
+  block-aligned covering sub-ranges of at most the bound each, never
+  one above-bound GET. Additionally the plan
   phase suppresses its per-segment footer probe when the scan read will
   be whole-object anyway — a probe that cannot reduce requests is pure
   spend; skip-index pruning still applies at decode over the fetched
@@ -250,8 +254,12 @@ layer already runs on (`BlockRangeFetcher::request_cost_bytes`,
   sub-nanodollar-per-byte transfer price to zero and make the worked
   ~4.4 KB result unreachable, and a test pins exactly that rate. The
   result is clamped to the existing floors (64 KiB gap, 512 KiB
-  crossover, `log_fetcher.rs:2166,2186`) and saturated only when BOTH byte
-  prices are 0. At the reference profile this resolves
+  crossover, `log_fetcher.rs:2166,2186`). Two distinct cases saturate the derived
+  rate to `u64::MAX`, and both mean "whole-object always": a zero
+  denominator (BOTH byte prices 0 — no per-byte cost exists, so the
+  rate is infinite by definition), and quotient overflow (near-free but
+  nonzero byte prices, the startup-logged case above). The floor clamps
+  apply to every finite result. At the reference profile this resolves
   to request-minimal; at list egress prices it resolves to ~4.4 KB,
   which the floors clamp — reproducing ADR-0904's worked examples from
   the profile instead of prose. The fetch bound below is NOT part of this
@@ -276,34 +284,46 @@ precedence: an object AT OR UNDER the bound is always ONE covering GET
 (`GetRange::Full`, no segmentation, no probe under request-minimal); an
 object ABOVE the bound is read as segmented covering sub-ranges, each
 the longest block-aligned prefix that fits the bound. Block alignment
-makes the request count a band, not a point: `ceil(size / bound)` is
-the floor, and because every sub-range except the last covers more than
-`bound − B_max` bytes (`B_max` = the object's largest single block's
-stored size, known from the resident PAGE_DIR), the cap is
-`ceil(size / (bound − B_max))`. A single block larger than the bound
-cannot be split and is fetched as its own oversized GET, which the
-tracker charges at its true size — legal but logged, and impossible on
-this corpus (blocks are far under 64 MiB). Every request-cost
+makes the request count a band, not a point, and the band is defined
+only when `B_max < bound` (`B_max` = the object's largest single
+block's stored size, known from the resident PAGE_DIR — true of every
+corpus this ADR measures): `ceil(size / bound)` is the floor, and
+because every sub-range except the last covers more than
+`bound − B_max` bytes, the cap is `ceil(size / (bound − B_max))`. When
+a block's stored size is at or above the bound the band does not
+apply to it: such a block cannot be split and is fetched as its own
+oversized GET, which the tracker charges at its true size — legal but
+logged, and impossible on this corpus (blocks are far under 64 MiB).
+Each oversized block counts as one request, the band applies to the
+object's remaining bytes with the remainder's own `B_max`, and the
+whole-object floor no longer holds for that object — an oversized GET
+covers more than `bound` bytes in one request, so the true count can
+sit below `ceil(size / bound)`. Every request-cost
 consequence in this ADR uses the floor for expected figures and the cap
-for bands. Whole-object
+for bands, on the `B_max < bound` corpora where the band is defined. Whole-object
 reads apply only to objects ≤ the bound; a larger object falls back to
-covering sequential sub-range GETs of at most the bound each
-(`ceil(size/bound)` GETs — a 5 GiB object costs 80 GETs, never one
-5 GiB buffer). The code says today's assembler already allocates the
+covering sequential sub-range GETs of at most the bound each (the
+band above — at least `ceil(size/bound)` GETs, so a 5 GiB object costs
+80 or more GETs, never one 5 GiB buffer). The code says today's assembler already allocates the
 full object size even on the ranged path (`ObjectAssembler::new(&pool,
 total)`, `log_fetcher.rs:3742`), and `GetOutcome.data` is fully-buffered
 `Bytes` (`crates/ravel-object-store/src/lib.rs:113-118`), so streaming
 is not available at this seam without a contract change (rejected
 alternative 5); the bound is therefore a NEW protective cap on both
-policies, and the stated memory bound is `fetch permits × bound`
-= 16 × 64 MiB = 1 GiB worst-case at defaults
+policies, and the stated memory bound is `fetch permits ×
+max(bound, B_max)` — which is `permits × bound` = 16 × 64 MiB = 1 GiB
+worst-case at defaults on every corpus without an oversized block, the
+only case that exceeds it being an oversized block's own GET, resident
+at its true size and logged as such
 (`DEFAULT_LOG_MAX_CONCURRENT_GETS`, `log_fetcher.rs:2200`) — versus
 today's formally unbounded `permits × object_size`. The corpus figure
 is stated as what it is: 3.47 MB is the MEAN object size on
 clickbench-v4, not a maximum, so the per-corpus expectation in the
 verification plan is banded on the corpus's largest object, and the
-worst-case guarantee is the `permits × bound` line above, nothing
-softer. A 5 GiB object is never resident whole by construction.
+worst-case guarantee is the `permits × max(bound, B_max)` line above,
+nothing softer (`permits × bound` exactly, on any corpus with no
+oversized block). A 5 GiB object is never resident whole by
+construction.
 
 **Knob relations (ADR-0904 alignment)**: `--logs-request-cost-bytes`
 stays and WINS when explicitly set — policy is the intent layer, the
@@ -357,7 +377,7 @@ flowchart TD
     RC --> D2["ranged_projection_pays\nlog_fetcher.rs:773"]
     RC --> D3["coalesce gap (holes fuse)\nlog_fetcher.rs:2963,5140"]
     D1 -->|"size <= bound"| W["ONE covering GET per object\nGetRange::Full, no probe"]
-    D1 -->|"size > bound"| SEG["ceil(size/bound) sequential\ncovering GETs (memory-bounded)"]
+    D1 -->|"size > bound"| SEG["banded covering sub-range GETs\nfloor ceil(size/bound), memory-bounded"]
     D2 --> R["ranged path (byte-minimal keeps\nprobe + sections + chunk runs)"]
     W --> L["S3 request ledger:\nattempts (#928) + PhaseAccounting (#796)\n+ range_amplification + modeled cost"]
     SEG --> L
@@ -503,8 +523,8 @@ duplicated, or out-of-band alike.
    (`lib.rs:113-118`) under a normative contract
    (docs/object-store-contract.md), and changing it touches every
    backend and decorator for a bound that segmented covering GETs
-   deliver at `ceil(size/bound)` requests — on this corpus, zero extra
-   requests. Revisit only if object sizes grow to make the segment count
+   deliver within the covering-read band (floor `ceil(size/bound)`) —
+   on this corpus, zero extra requests. Revisit only if object sizes grow to make the segment count
    material.
 6. **Auto-detecting the billing shape from the endpoint.** Lost again as
    in ADR-0904 alternative 6: S3-compatible endpoints do not disclose
@@ -569,7 +589,7 @@ quarter) EXCEPT 996-8, which is scheduled behind them by construction.
 |---|---|---|---|---|---|
 | 996-1 | `StoreCostProfile` (nanodollar arithmetic, TOML load, reference constant) + `QueryAccounting::data_objects_touched` | ravel-types | `src/cost_profile.rs` (new), `src/accounting.rs`, `src/lib.rs` | — | exact-figure unit tests; reference profile constants pinned ($5/M, $0.40/M, 12.5:1 asserted); snapshot/merge round-trip for the new counter |
 | 996-2 | ledger reads attempts: `RequestCounts` gains per-op attempts beside calls; byte-kind labels in report output | ravel-bench | `src/report.rs` | — (reads #928's existing seam) | MemoryStore fixture: attempts==0 with calls>0 labelled correctly; S3-shaped fixture via `StoreMetrics::record_attempt` asserts attempts≥calls exactly |
-| 996-3 | policy enum + `EngineConfig::logs_fetch_policy`, `logs_max_fetch_run_bytes`; exchange-rate derivation; fetch bound + segmented covering fallback; plan-probe suppression under request-minimal; record `data_objects_touched`, carried through the distributed snapshot (additive proto field + codec + merge) | ravel-query, proto (additive only) | `src/config.rs`, `src/log_fetcher.rs`, `src/distrib/*`, `proto/` | 996-1 | policy→rate mapping table pinned (saturate / default / profile-derived w/ floors); bound test: object > bound fetched in `ceil(size/bound)` GETs, peak buffer ≤ bound, rows byte-identical |
+| 996-3 | policy enum + `EngineConfig::logs_fetch_policy`, `logs_max_fetch_run_bytes`; exchange-rate derivation; fetch bound + segmented covering fallback; plan-probe suppression under request-minimal; record `data_objects_touched`, carried through the distributed snapshot (additive proto field + codec + merge) | ravel-query, proto (additive only) | `src/config.rs`, `src/log_fetcher.rs`, `src/distrib/*`, `proto/` | 996-1 | policy→rate mapping table pinned (saturate / default / profile-derived w/ floors); bound test: object > bound fetched in a request count inside the covering-read band (floor `ceil(size/bound)`, cap `ceil(size/(bound − B_max))`), peak buffer ≤ bound, rows byte-identical |
 | 996-4 | modeled cost + profile/policy provenance stamp (requested/effective split) in bench reports | ravel-bench | `src/sql_latency.rs`, `src/report.rs` (non-overlapping sections vs 996-2, sequenced anyway: W2) | 996-1, 996-2 | report fixture asserts stamp present exactly once, `effective: None` on the Flight lane, modeled cost = attempts × profile to the nanodollar |
 | 996-5 | server flags `--logs-fetch-policy`, `--store-cost-profile`; reachability test in the `logs_request_cost_bytes_is_reachable_from_cli` shape; precedence: explicit byte flag wins | ravel-server | `services/ravel-server/src/config.rs`, `src/query.rs` | 996-3 | flag proven to arrive at the running engine through real startup; precedence pinned |
 | 996-6 | per-statement `range_amplification` exposure; policy-extremes differential (rows identical at all three policies; opens/GET counters prove the route) | ravel-sql | `src/executor.rs`, `tests/logs_request_cost_knob_routing.rs`, `tests/logs_fast_path_projection_routing.rs` | 996-3 | counters, not configured values, prove which route ran (ADR-0904 904-4 rule); amplification == 1.0 exactly on the fixture under request-minimal |
