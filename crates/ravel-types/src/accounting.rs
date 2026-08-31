@@ -159,6 +159,22 @@ impl QueryAccounting {
     }
 
     /// Record one completed store request of kind `op`.
+    ///
+    /// This is a **logical-call** count, not a billed-request count: it fires
+    /// once per store operation the query funnels through, so the `object_store`
+    /// retry loop *below* the object-store trait boundary (default
+    /// `max_retries = 10`) is invisible here --- one throttled `get` that retried
+    /// nine times is one request here while the provider bills ten (issue #928).
+    /// The billed count is measured process-globally as `attempts` on
+    /// `ravel_object_store::instrument::StoreMetrics` (surfaced as
+    /// `ravel_store_attempts_total`), filled in by the S3 adapter's counting HTTP
+    /// connector. It is deliberately *not* mirrored per query here: the connector
+    /// runs below this crate and holds no [`QueryAccounting`] handle (this type
+    /// is passed explicitly, never via a task-local; see the [module docs](self)),
+    /// so a per-query billed count is not reachable from the layer that sees the
+    /// retries. A budget that must bound billed rather than logical requests
+    /// therefore reads the process-global figure, or needs the attempt count
+    /// threaded up through the fetch return path first.
     pub fn record_s3_request(&self, op: AccountedOp) {
         self.0.ops[op.index()]
             .requests

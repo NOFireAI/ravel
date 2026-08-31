@@ -55,7 +55,9 @@ use axum::response::Response;
 use bytes::Bytes;
 use parking_lot::Mutex;
 use ravel_object_store::s3::{MULTIPART_THRESHOLD, S3Config, S3HttpConfig, S3Store};
-use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, StoreError};
+use ravel_object_store::{
+    GetRange, InstrumentedStore, ObjectStoreBackend, PutOptions, StoreError, StoreMetrics,
+};
 
 /// Bucket name the fake serves. Path-style requests put it in the first path
 /// segment (`/{bucket}/{key}`), which is what `force_path_style: true` makes
@@ -225,6 +227,16 @@ impl FakeS3 {
     /// the same field a MinIO deployment sets.
     fn store(&self) -> S3Store {
         S3Store::new(self.config()).expect("a fake-endpoint S3Store must build")
+    }
+
+    /// An [`S3Store`] pointed at this endpoint that records billed HTTP requests
+    /// (attempts, retries included) into `metrics` via its counting connector
+    /// (issue #928). The same `Arc` is shared with an
+    /// [`InstrumentedStore::with_metrics`] in the tests, so `attempts` and
+    /// `calls` land in one snapshot.
+    fn store_with_metrics(&self, metrics: Arc<StoreMetrics>) -> S3Store {
+        S3Store::with_metrics(self.config(), metrics)
+            .expect("a fake-endpoint S3Store must build with attempt metrics")
     }
 
     /// The same store under an explicit [`S3HttpConfig`]. Used by the bounded
@@ -1425,5 +1437,200 @@ async fn slow_down_in_a_200_body_retries_complete_multipart() {
         fake.object("fault/slow-complete").as_deref(),
         Some(&b"one small part"[..]),
         "the completed object must hold the uploaded part"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Billed-request (attempt) counting below the retry loop (issue #928)
+// ---------------------------------------------------------------------------
+//
+// `InstrumentedStore` counts completed logical calls; below it, `object_store`
+// retries each call, so one `get()` that retried is one `calls` but several
+// billed HTTP requests. The counting HTTP connector (`S3Store::with_metrics`)
+// records those requests as `attempts`. These tests drive `object_store`'s real
+// retry loop over the fake endpoint and assert `attempts` against the count the
+// *server* saw, so the figure is the true billed-request count, not an artifact.
+//
+// The fault-injection here is at the HTTP layer, not the `FaultStore`
+// (`ObjectStoreBackend`) decorator the issue text names: `FaultStore` sits
+// *above* `object_store`, so it returns one error per call and cannot exercise
+// the retry loop *below* the trait boundary that creates the gap. This fake
+// endpoint is the fault store for that layer, and `fake.count(op)` is its
+// fired-fault counter (asserted below), the same role `FaultStore::fault_count`
+// plays one layer up.
+
+/// A GET retried three times records four billed attempts but one completed
+/// call: `attempts - calls` is exactly the retry count, and it equals the
+/// requests the server saw, so the counter is the true billed-request count.
+///
+/// To watch this assertion fail: change `record_attempt` in
+/// `crates/ravel-object-store/src/s3/attempts.rs` from firing once per
+/// `HttpService::call` to firing once per `connect` (or delete the call
+/// entirely) and `attempts` collapses to 0 (or 1), so the
+/// `attempts - calls == 3` line below fails.
+#[tokio::test]
+async fn attempts_exceed_calls_by_the_exact_retry_count() {
+    let fake = FakeS3::start().await;
+    let metrics = Arc::new(StoreMetrics::default());
+    let store = InstrumentedStore::with_metrics(
+        fake.store_with_metrics(Arc::clone(&metrics)),
+        Arc::clone(&metrics),
+    );
+    fake.seed("attempts/get", b"served after three throttles");
+    fake.script(
+        Op::Get,
+        [
+            Fault::ServiceUnavailable,
+            Fault::TooManyRequests,
+            Fault::SlowDown,
+        ],
+    );
+
+    store
+        .get("attempts/get", GetRange::Full)
+        .await
+        .expect("three retryable faults must not fail the get");
+
+    let snap = metrics.snapshot();
+    // The fault store fired: three faults served, four GETs on the wire.
+    assert_eq!(
+        fake.count(Op::Get),
+        4,
+        "the endpoint must see one GET per attempt: three faulted, one served"
+    );
+    assert_eq!(
+        fake.requests(Op::Get)
+            .iter()
+            .filter(|seen| seen.fault.is_some())
+            .count(),
+        3,
+        "all three scripted faults must have fired"
+    );
+    // The new figure is the billed-request count, exact.
+    assert_eq!(
+        snap.get.attempts, 4,
+        "attempts count every billed HTTP request, retries included"
+    );
+    assert_eq!(snap.get.calls, 1, "exactly one logical get completed");
+    assert_eq!(
+        snap.get.attempts - snap.get.calls,
+        3,
+        "attempts exceed calls by exactly the retry count, not merely by > 0"
+    );
+    assert_eq!(
+        snap.get.attempts,
+        fake.count(Op::Get) as u64,
+        "attempts equal the server-observed billed requests"
+    );
+    // Per-operation attribution: a get's retries do not leak onto another op.
+    assert_eq!(snap.put.attempts, 0, "no put was issued");
+    assert_eq!(snap.head.attempts, 0, "no head was issued");
+    assert_eq!(snap.delete.attempts, 0, "no delete was issued");
+}
+
+/// With no fault injected, one logical call is exactly one billed request:
+/// `attempts == calls`, so the figure does not drift on a quiet path.
+///
+/// To watch this assertion fail: make `AttemptCountingService::call` record two
+/// attempts per request (a stray double `record_attempt`) and the
+/// `attempts == calls` lines below fail with 2 != 1.
+#[tokio::test]
+async fn attempts_equal_calls_with_no_faults() {
+    let fake = FakeS3::start().await;
+    let metrics = Arc::new(StoreMetrics::default());
+    let store = InstrumentedStore::with_metrics(
+        fake.store_with_metrics(Arc::clone(&metrics)),
+        Arc::clone(&metrics),
+    );
+    fake.seed("attempts/quiet", b"served on the first try");
+
+    store
+        .get("attempts/quiet", GetRange::Full)
+        .await
+        .expect("a healthy get must succeed");
+    store
+        .head("attempts/quiet")
+        .await
+        .expect("a healthy head must succeed");
+
+    let snap = metrics.snapshot();
+    // No fault fired: exactly one request per op on the wire.
+    assert_eq!(fake.count(Op::Get), 1, "a quiet get is one GET");
+    assert_eq!(fake.count(Op::Head), 1, "a quiet head is one HEAD");
+    assert_eq!(
+        fake.requests(Op::Get)
+            .iter()
+            .filter(|seen| seen.fault.is_some())
+            .count(),
+        0,
+        "no fault may have fired on the quiet path"
+    );
+    assert_eq!(snap.get.attempts, 1);
+    assert_eq!(snap.get.calls, 1);
+    assert_eq!(
+        snap.get.attempts, snap.get.calls,
+        "no retry: attempts equal calls on the get"
+    );
+    assert_eq!(snap.head.attempts, 1);
+    assert_eq!(snap.head.calls, 1);
+    assert_eq!(
+        snap.head.attempts, snap.head.calls,
+        "no retry: attempts equal calls on the head"
+    );
+}
+
+/// Attribution is per operation kind (the axis `FaultStore` injects on): a
+/// retried PUT charges its retries to `put`, by the exact fault count, and to no
+/// other op.
+///
+/// To watch this assertion fail: drop the `attempts::scope(StoreOp::Put, ..)`
+/// wrapper from `S3Store::put` so the connector sees no scoped op for the
+/// request; `snap.put.attempts` then reads 0 and the `== 3` line fails.
+#[tokio::test]
+async fn attempts_are_attributed_to_the_issuing_operation() {
+    let fake = FakeS3::start().await;
+    let metrics = Arc::new(StoreMetrics::default());
+    let store = InstrumentedStore::with_metrics(
+        fake.store_with_metrics(Arc::clone(&metrics)),
+        Arc::clone(&metrics),
+    );
+    fake.script(Op::Put, [Fault::ServiceUnavailable, Fault::SlowDown]);
+
+    store
+        .put(
+            "attempts/put",
+            Bytes::from_static(b"payload that outlives two throttles"),
+            PutOptions::default(),
+        )
+        .await
+        .expect("two retryable throttles must not fail the put");
+
+    let snap = metrics.snapshot();
+    assert_eq!(
+        fake.count(Op::Put),
+        3,
+        "two faults + one success = three PUTs on the wire"
+    );
+    assert_eq!(
+        fake.requests(Op::Put)
+            .iter()
+            .filter(|seen| seen.fault.is_some())
+            .count(),
+        2,
+        "both scripted PUT faults must have fired"
+    );
+    assert_eq!(
+        snap.put.attempts, 3,
+        "billed PUT requests include the two retries"
+    );
+    assert_eq!(snap.put.calls, 1, "exactly one logical put completed");
+    assert_eq!(
+        snap.put.attempts - snap.put.calls,
+        2,
+        "attempts exceed calls by exactly the retry count"
+    );
+    assert_eq!(
+        snap.get.attempts, 0,
+        "a put's retries must not be charged to get"
     );
 }

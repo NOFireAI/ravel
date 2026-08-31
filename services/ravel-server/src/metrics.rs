@@ -483,6 +483,24 @@ fn render_store_family(out: &mut String, mode: Mode, snapshot: &StoreMetricsSnap
 
     write_header(
         out,
+        "ravel_store_attempts_total",
+        "Billed HTTP requests including retries, by operation (issue #928). \
+         Always >= ravel_store_calls_total for an HTTP backend; the difference \
+         is the retry overhead object_store's loop hides below the call count. \
+         Zero for a non-HTTP backend.",
+        "counter",
+    );
+    for op in StoreOp::ALL {
+        write_sample(
+            out,
+            "ravel_store_attempts_total",
+            &[Label::Mode(mode), Label::Op(op)],
+            snapshot.op(op).attempts,
+        );
+    }
+
+    write_header(
+        out,
         "ravel_store_ok_total",
         "Object-store calls that returned Ok, by operation.",
         "counter",
@@ -3595,6 +3613,8 @@ mod tests {
             ok: 5,
             errors,
             bytes: 4096,
+            // Above calls: the retry (billed) overhead #928 exposes.
+            attempts: 9,
             latency_micros_buckets,
             latency_nanos_total: 900_000,
         };
@@ -3638,6 +3658,10 @@ mod tests {
         assert!(
             body.contains("ravel_store_calls_total{mode=\"all\",op=\"get\"} 7"),
             "missing calls sample:\n{body}"
+        );
+        assert!(
+            body.contains("ravel_store_attempts_total{mode=\"all\",op=\"get\"} 9"),
+            "missing attempts sample (billed requests incl. retries, #928):\n{body}"
         );
         assert!(
             body.contains("ravel_store_ok_total{mode=\"all\",op=\"get\"} 5"),
