@@ -264,6 +264,25 @@ impl PhaseAccounting {
         }
     }
 
+    /// Folds another handle's per-phase snapshot into this one, phase by phase:
+    /// every counter of `other.resolve` lands on this handle's resolve, and so
+    /// on. Each phase merges through [`QueryAccounting::merge_snapshot`], so
+    /// counters saturate and `peak_intermediate_bytes` takes the maximum rather
+    /// than a sum.
+    ///
+    /// This is how the distributed coordinator charges a worker's spend (issue
+    /// #959): the worker records its phases with the same machinery the local
+    /// path uses and returns the four snapshots, and the coordinator adds each
+    /// to the phase that issued it remotely. Folding
+    /// [`PhaseAccountingSnapshot::pooled`] into a single handle instead would
+    /// name one phase for every remote request, which is the degenerate split
+    /// this method exists to avoid.
+    pub fn merge_phase_snapshot(&self, other: &PhaseAccountingSnapshot) {
+        for phase in QueryPhase::ALL {
+            self.phase(phase).merge_snapshot(other.phase(phase));
+        }
+    }
+
     /// Point-in-time copy of every phase's counters.
     #[must_use]
     pub fn snapshot(&self) -> PhaseAccountingSnapshot {
@@ -297,6 +316,19 @@ impl PhaseAccountingSnapshot {
             QueryPhase::Plan => &self.plan,
             QueryPhase::Probe => &self.probe,
             QueryPhase::Scan => &self.scan,
+        }
+    }
+
+    /// Mutable access to one phase's snapshot, for building a snapshot up phase
+    /// by phase (the wire decode in `distrib::codec`, which reads a
+    /// phase-tagged list rather than four positional fields).
+    #[must_use]
+    pub fn phase_mut(&mut self, phase: QueryPhase) -> &mut QueryAccountingSnapshot {
+        match phase {
+            QueryPhase::Resolve => &mut self.resolve,
+            QueryPhase::Plan => &mut self.plan,
+            QueryPhase::Probe => &mut self.probe,
+            QueryPhase::Scan => &mut self.scan,
         }
     }
 
@@ -419,6 +451,63 @@ mod tests {
             assert_eq!(snap.phase(*phase), 1 << i, "{} slot", phase.name());
         }
         assert_eq!(snap.total(), 15);
+    }
+
+    #[test]
+    fn merge_phase_snapshot_keeps_every_phase_on_its_own_handle() {
+        // The distributed coordinator's fold (issue #959). Each phase of the
+        // incoming snapshot must land on the same phase of the receiving
+        // handle: a merge that pooled, or that shifted a phase, is visible
+        // because every phase here carries a distinct value.
+        let worker = PhaseAccounting::new();
+        worker.plan().record_s3_request(AccountedOp::Get);
+        worker.plan().add_s3_bytes(AccountedOp::Get, 16);
+        worker.probe().record_s3_request(AccountedOp::Get);
+        worker.probe().add_s3_bytes(AccountedOp::Get, 400);
+        worker.scan().record_s3_request(AccountedOp::Get);
+        worker.scan().record_s3_request(AccountedOp::Get);
+        worker.scan().add_s3_bytes(AccountedOp::Get, 9_000);
+
+        let coordinator = PhaseAccounting::new();
+        // Pre-existing local spend on a different phase, so the merge is a fold
+        // into a non-empty handle, not an assignment.
+        coordinator.resolve().record_s3_request(AccountedOp::Get);
+        coordinator.resolve().add_s3_bytes(AccountedOp::Get, 55);
+        coordinator.merge_phase_snapshot(&worker.snapshot());
+        // A second worker's identical spend accumulates rather than replacing.
+        coordinator.merge_phase_snapshot(&worker.snapshot());
+
+        let snap = coordinator.snapshot();
+        assert_eq!(snap.resolve.s3_requests(AccountedOp::Get), 1);
+        assert_eq!(snap.resolve.s3_bytes(AccountedOp::Get), 55);
+        assert_eq!(snap.plan.s3_requests(AccountedOp::Get), 2);
+        assert_eq!(snap.plan.s3_bytes(AccountedOp::Get), 32);
+        assert_eq!(snap.probe.s3_requests(AccountedOp::Get), 2);
+        assert_eq!(snap.probe.s3_bytes(AccountedOp::Get), 800);
+        assert_eq!(snap.scan.s3_requests(AccountedOp::Get), 4);
+        assert_eq!(snap.scan.s3_bytes(AccountedOp::Get), 18_000);
+        assert_eq!(snap.pooled().s3_requests(AccountedOp::Get), 9);
+        assert_eq!(snap.pooled().s3_bytes(AccountedOp::Get), 18_887);
+    }
+
+    #[test]
+    fn merge_phase_snapshot_takes_the_max_of_the_non_additive_peak() {
+        // `peak_intermediate_bytes` is a high-water mark per phase: two workers
+        // each peaking at 100 in the same phase never held 200 at once, and the
+        // coordinator's phase must report 100. Fails if the per-phase fold is
+        // ever changed to add that field.
+        let worker = PhaseAccounting::new();
+        worker.scan().observe_intermediate_bytes(100);
+
+        let coordinator = PhaseAccounting::new();
+        coordinator.merge_phase_snapshot(&worker.snapshot());
+        coordinator.merge_phase_snapshot(&worker.snapshot());
+
+        assert_eq!(
+            coordinator.snapshot().scan.peak_intermediate_bytes,
+            100,
+            "two slices' peaks merge by max, never by sum"
+        );
     }
 
     #[test]

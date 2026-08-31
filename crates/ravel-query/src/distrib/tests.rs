@@ -31,7 +31,7 @@ use ravel_segment::{
     CompactionMetaV4, IngestBounds, RunInputV7, SampleProvenance, SegmentIdentity, SegmentWriter,
     SeriesInput, SeriesInputV7, SeriesValues, encode_run_v4,
 };
-use ravel_types::accounting::{QueryAccounting, QueryAccountingSnapshot};
+use ravel_types::accounting::QueryAccounting;
 use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal, TenantHash, TenantId};
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
@@ -56,6 +56,7 @@ use crate::engine::merge_soa_runs;
 use crate::erasure::{ErasurePredicate, is_erased_span};
 use crate::fetcher::SegmentFetcher;
 use crate::log_fetcher::{LogQuery, LogSegmentFetcher};
+use crate::phase_accounting::{PhaseAccounting, PhaseAccountingSnapshot, QueryPhase};
 use crate::span_fetcher::{SpanRow, SpanSegmentFetcher};
 
 const NS: i64 = 1_000_000;
@@ -203,6 +204,19 @@ async fn spawn_worker_with_log_fetcher(
     // on a `Signal::Spans` request.
     let span_fetcher = SpanSegmentFetcher::new(Arc::clone(&metrics_store));
     let fetcher = SegmentFetcher::new(metrics_store);
+    spawn_worker_with_fetchers(fetcher, log_fetcher, span_fetcher, segments).await
+}
+
+/// `spawn_worker_with_log_fetcher` with an explicitly built metrics
+/// [`SegmentFetcher`] too, so a test can pin the worker's read shape (and with
+/// it the exact request count of each fetch phase) instead of inheriting the
+/// defaults.
+async fn spawn_worker_with_fetchers(
+    fetcher: SegmentFetcher,
+    log_fetcher: LogSegmentFetcher,
+    span_fetcher: SpanSegmentFetcher,
+    segments: Vec<SegmentRef>,
+) -> (RemoteSliceFetcher, JoinHandle<()>) {
     let resolver = Arc::new(SnapshotSegmentResolver::new(segments));
     let service = SeriesFetchService::new(fetcher, resolver)
         .with_log_fetcher(log_fetcher)
@@ -234,21 +248,28 @@ async fn spawn_worker_with_log_fetcher(
 /// `FetchStats` the local path reports. The distributed path must reproduce all
 /// three (finding 4: a distributed query reports the same cost and stats a
 /// local one does, not zeros).
+///
+/// The accounting reference is PER PHASE (issue #959), through the same
+/// `fetch_soa_and_histograms_phase_accounted` funnel `engine.rs` threads
+/// locally, not the pooled wrapper. A caller comparing a distributed fetch
+/// against it therefore compares four numbers per counter, not one: a
+/// distributed path that pooled its remote spend into a single phase would
+/// still match on `pooled()` and fails here.
 async fn local_scalar(
     store: Arc<MemoryStore>,
     snapshot: &Snapshot,
 ) -> (
     Vec<Vec<crate::fetcher::FetchedSeriesSoa>>,
-    QueryAccountingSnapshot,
+    PhaseAccountingSnapshot,
     crate::fetcher::FetchStats,
 ) {
     let fetcher = SegmentFetcher::new(store);
-    let accounting = QueryAccounting::new();
+    let accounting = PhaseAccounting::new();
     let mut out = Vec::with_capacity(snapshot.segments.len());
     let mut stats = crate::fetcher::FetchStats::default();
     for seg in &snapshot.segments {
         let (scalar, seg_stats, _hist) = fetcher
-            .fetch_soa_and_histograms_accounted(TENANT, seg, &[], &accounting)
+            .fetch_soa_and_histograms_phase_accounted(TENANT, seg, &[], &accounting)
             .await
             .expect("local fetch");
         stats.raw_f64_pages += seg_stats.raw_f64_pages;
@@ -393,7 +414,7 @@ async fn assert_distributed_matches_local(
     };
     let distributed = Distributed::new(Arc::new(fetcher), thresholds);
     let config = EngineConfig::default();
-    let accounting = QueryAccounting::new();
+    let accounting = PhaseAccounting::new();
     let triple = distributed
         .fetch(
             TENANT,
@@ -418,10 +439,16 @@ async fn assert_distributed_matches_local(
     // reports the same cost the local path does over the same disjoint
     // segments -- not `FetchStats::default()` zeros, and not a wrapped or
     // dropped accounting counter (findings 3 and 4).
+    // Per phase, not just pooled: the distributed fetch must charge each
+    // remote request to the phase that issued it, so its four-phase snapshot
+    // equals the local read's four-phase snapshot for the same segments. This
+    // is the assertion that catches a degenerate split -- before issue #959 the
+    // whole remote spend landed on `scan`, which matches on `pooled()` and
+    // fails on `plan`, `probe`, and `scan` here.
     assert_eq!(
         accounting.snapshot(),
         local_acct,
-        "distributed accounting must equal local accounting"
+        "distributed per-phase accounting must equal local per-phase accounting"
     );
     assert_eq!(
         distributed_stats, local_stats,
@@ -675,7 +702,7 @@ fn run_merged_series_distributed_over_the_wire_not_refused() {
                 max_parallel_slices: 1,
             },
         );
-        let accounting = QueryAccounting::new();
+        let accounting = PhaseAccounting::new();
         let triple = distributed
             .fetch(
                 TENANT,
@@ -760,7 +787,7 @@ fn run_merged_series_distributed_equals_local_bitwise() {
                 max_parallel_slices: 1,
             },
         );
-        let accounting = QueryAccounting::new();
+        let accounting = PhaseAccounting::new();
         let distributed_merged = match distributed
             .fetch(
                 TENANT,
@@ -823,7 +850,7 @@ async fn distributed_metric_names(
             max_parallel_slices: cap,
         },
     );
-    let accounting = QueryAccounting::new();
+    let accounting = PhaseAccounting::new();
     let triple = distributed
         .fetch(
             TENANT,
@@ -1029,7 +1056,7 @@ fn coordinator_reenforces_series_budget_over_honest_worker() {
             max_series: 3,
             ..EngineConfig::default()
         };
-        let accounting = QueryAccounting::new();
+        let accounting = PhaseAccounting::new();
         let err = distributed
             .fetch(
                 TENANT,
@@ -1133,6 +1160,10 @@ impl SliceFetcher for LyingBudgetWorker {
             histogram: Vec::new(),
             partials: Vec::new(),
             accounting: acct.snapshot(),
+            // No split reported: this double stands in for a worker that
+            // predates the summary's per-phase field, so the coordinator's
+            // degraded fold (pooled to `scan`) is what runs here.
+            phase_accounting: None,
             stats: crate::fetcher::FetchStats::default(),
             series_returned: 0,
             samples_returned: 0,
@@ -1184,7 +1215,7 @@ fn coordinator_reenforces_bytes_budget_over_lying_worker() {
             max_bytes_scanned: crate::config::ByteLimit::Bounded(100),
             ..EngineConfig::default()
         };
-        let accounting = QueryAccounting::new();
+        let accounting = PhaseAccounting::new();
         let err = distributed
             .fetch(
                 TENANT,
@@ -1206,7 +1237,7 @@ fn coordinator_reenforces_bytes_budget_over_lying_worker() {
         // The lying worker's spend was still folded into the query's reported
         // cost before the failure (never silently dropped).
         assert!(
-            accounting.snapshot().total_s3_bytes() >= 10_000,
+            accounting.snapshot().pooled().total_s3_bytes() >= 10_000,
             "the folded spend must survive on the live accounting handle"
         );
     });
@@ -1232,6 +1263,7 @@ impl SliceFetcher for RecordingBudgetWorker {
             histogram: Vec::new(),
             partials: Vec::new(),
             accounting: QueryAccounting::new().snapshot(),
+            phase_accounting: None,
             stats: crate::fetcher::FetchStats::default(),
             series_returned: 0,
             samples_returned: 0,
@@ -1301,7 +1333,7 @@ fn distrib_fetch_scopes_byte_budget_by_actual_slice_count() {
             max_segments: 44,
             ..EngineConfig::default()
         };
-        let accounting = QueryAccounting::new();
+        let accounting = PhaseAccounting::new();
         distributed
             .fetch(
                 TENANT,
@@ -1363,7 +1395,7 @@ fn distrib_fetch_scopes_byte_budget_by_real_not_configured_slice_count() {
             max_bytes_scanned: crate::config::ByteLimit::Bounded(1_000),
             ..EngineConfig::default()
         };
-        let accounting = QueryAccounting::new();
+        let accounting = PhaseAccounting::new();
         distributed
             .fetch(
                 TENANT,
@@ -1414,7 +1446,7 @@ fn distrib_fetch_unlimited_byte_budget_stays_the_zero_sentinel_across_slices() {
             max_bytes_scanned: crate::config::ByteLimit::Unlimited,
             ..EngineConfig::default()
         };
-        let accounting = QueryAccounting::new();
+        let accounting = PhaseAccounting::new();
         distributed
             .fetch(
                 TENANT,
@@ -1460,6 +1492,7 @@ impl SliceFetcher for AlwaysInvalidated {
             histogram: Vec::new(),
             partials: Vec::new(),
             accounting: ravel_types::accounting::QueryAccountingSnapshot::default(),
+            phase_accounting: None,
             stats: crate::fetcher::FetchStats::default(),
             series_returned: 0,
             samples_returned: 0,
@@ -1512,7 +1545,7 @@ fn many_invalidated_slices_map_to_one_retryable_error() {
                 max_parallel_slices: 3,
             },
         );
-        let accounting = QueryAccounting::new();
+        let accounting = PhaseAccounting::new();
         let err = distributed
             .fetch(
                 TENANT,
@@ -1805,6 +1838,10 @@ impl SliceFetcher for OverflowingLyingWorker {
             histogram: Vec::new(),
             partials: Vec::new(),
             accounting: acct.snapshot(),
+            // No split reported: this double stands in for a worker that
+            // predates the summary's per-phase field, so the coordinator's
+            // degraded fold (pooled to `scan`) is what runs here.
+            phase_accounting: None,
             stats: crate::fetcher::FetchStats::default(),
             series_returned: 0,
             samples_returned: 0,
@@ -1862,7 +1899,7 @@ fn coordinator_fold_saturates_overflowing_worker_reports() {
             max_bytes_scanned: crate::config::ByteLimit::Bounded(1_000),
             ..EngineConfig::default()
         };
-        let accounting = QueryAccounting::new();
+        let accounting = PhaseAccounting::new();
         let err = distributed
             .fetch(
                 TENANT,
@@ -2000,7 +2037,7 @@ fn histogram_series_distributed_equals_local_bitwise() {
                 max_parallel_slices: 1,
             },
         );
-        let accounting = QueryAccounting::new();
+        let accounting = PhaseAccounting::new();
         let triple = distributed
             .fetch(
                 TENANT,
@@ -2035,7 +2072,7 @@ fn histogram_series_distributed_equals_local_bitwise() {
             "the distributed path must actually carry the histogram series"
         );
         assert!(
-            accounting.snapshot().total_s3_bytes() > 0,
+            accounting.snapshot().pooled().total_s3_bytes() > 0,
             "the worker's real spend is folded into the query accounting"
         );
     });
@@ -2150,7 +2187,7 @@ fn erased_histogram_series_is_dropped_before_the_wire() {
             "__name__".to_string(),
             metric.to_string(),
         )])];
-        let accounting = QueryAccounting::new();
+        let accounting = PhaseAccounting::new();
         let result = distributed
             .fetch(
                 TENANT,
@@ -2364,7 +2401,7 @@ async fn distributed_log_records(
             max_parallel_slices: cap,
         },
     );
-    let accounting = QueryAccounting::new();
+    let accounting = PhaseAccounting::new();
     let records = distributed
         .fetch_logs(
             TENANT,
@@ -2677,7 +2714,7 @@ fn logs_worker_serves_repeat_reads_from_the_read_cache() {
                     &snapshot,
                     &[],
                     &[],
-                    &QueryAccounting::new(),
+                    &PhaseAccounting::new(),
                     &EngineConfig::default(),
                     i64::MAX,
                 )
@@ -2865,7 +2902,7 @@ fn logs_worker_without_log_fetcher_signals_local_fallback() {
                 max_parallel_slices: 2,
             },
         );
-        let accounting = QueryAccounting::new();
+        let accounting = PhaseAccounting::new();
         let result = distributed
             .fetch_logs(
                 TENANT,
@@ -3057,7 +3094,7 @@ async fn distributed_span_rows(
             max_parallel_slices: cap,
         },
     );
-    let accounting = QueryAccounting::new();
+    let accounting = PhaseAccounting::new();
     let spans = distributed
         .fetch_spans(
             TENANT,
@@ -3427,7 +3464,7 @@ fn spans_worker_without_span_fetcher_signals_local_fallback() {
                 max_parallel_slices: 2,
             },
         );
-        let accounting = QueryAccounting::new();
+        let accounting = PhaseAccounting::new();
         let result = distributed
             .fetch_spans(
                 TENANT,
@@ -3790,6 +3827,8 @@ impl SeriesFetch for OldMetricsOnlyWorker {
                 }),
                 raw_f64_pages: 0,
                 raw_f64_bytes: 0,
+                // A worker double that reports no per-phase split.
+                phase_accounting: None,
             })),
         };
         let stream = futures::stream::iter(vec![Ok(summary)]);
@@ -3964,7 +4003,7 @@ fn old_worker_rejecting_nonmetrics_signals_yields_silent_local_fallback() {
                     &snapshot,
                     &[],
                     &[],
-                    &QueryAccounting::new(),
+                    &PhaseAccounting::new(),
                     &EngineConfig::default(),
                     i64::MAX,
                 )
@@ -4014,7 +4053,7 @@ fn old_worker_rejecting_nonmetrics_signals_yields_silent_local_fallback() {
                 &span_snapshot,
                 &[],
                 &[],
-                &QueryAccounting::new(),
+                &PhaseAccounting::new(),
                 &EngineConfig::default(),
                 i64::MAX,
             )
@@ -4968,6 +5007,7 @@ impl SliceFetcher for DuplicatePartialWorker {
             histogram: Vec::new(),
             partials: vec![pa.clone(), pa],
             accounting: QueryAccounting::new().snapshot(),
+            phase_accounting: None,
             stats: crate::fetcher::FetchStats::default(),
             series_returned: 0,
             samples_returned: 0,
@@ -5005,7 +5045,7 @@ fn duplicate_partial_series_id_is_a_hard_error() {
                 max_parallel_slices: 1,
             },
         );
-        let accounting = QueryAccounting::new();
+        let accounting = PhaseAccounting::new();
         let err = distributed
             .fetch(
                 TENANT,
@@ -5032,6 +5072,292 @@ fn duplicate_partial_series_id_is_a_hard_error() {
                 crate::error::QueryError::DuplicatePushdownSeries { .. }
             ),
             "expected DuplicatePushdownSeries, got {err:?}"
+        );
+    });
+}
+
+// --- per-phase cost split across the slice boundary (issue #959) ------------
+//
+// The distributed coordinator used to charge every remote request to `scan` by
+// construction: a worker returned one pooled `QueryAccountingSnapshot` and
+// `engine.rs` handed `Distributed::fetch` the `scan` sub-handle. The two tests
+// below pin the fixed behavior and its version-skew fallback.
+
+/// A [`SliceFetcher`] double that reports a pooled cost and NO per-phase split,
+/// standing in for a worker that predates `Summary.phase_accounting`.
+struct NoSplitWorker {
+    get_requests: u64,
+    get_bytes: u64,
+}
+
+#[async_trait::async_trait]
+impl SliceFetcher for NoSplitWorker {
+    async fn fetch(&self, _request: pb::FetchRequest) -> Result<SliceResponse, DistribError> {
+        let acct = QueryAccounting::new();
+        for _ in 0..self.get_requests {
+            acct.record_s3_request(ravel_types::accounting::AccountedOp::Get);
+        }
+        acct.add_s3_bytes(ravel_types::accounting::AccountedOp::Get, self.get_bytes);
+        Ok(SliceResponse {
+            scalar: Vec::new(),
+            histogram: Vec::new(),
+            partials: Vec::new(),
+            accounting: acct.snapshot(),
+            phase_accounting: None,
+            stats: crate::fetcher::FetchStats::default(),
+            series_returned: 0,
+            samples_returned: 0,
+            status: pb::status::Code::Ok,
+            status_message: String::new(),
+        })
+    }
+}
+
+/// Version-skew fallback (issue #959, deliverable 3): a worker that reports no
+/// per-phase split has its pooled cost charged to the coordinator's `scan`
+/// phase, and to nothing else. That is exactly what the coordinator did for
+/// every worker before the split existed, so an old worker under a new
+/// coordinator reports today's numbers rather than failing or losing the spend.
+///
+/// Mutation proof: making `distrib::fold_phases`' `None` arm a no-op (instead of
+/// `live.scan().merge_snapshot(pooled)`) drops the slice's whole cost and the
+/// `scan` and pooled assertions below both go to zero.
+#[test]
+fn worker_reporting_no_phase_split_is_charged_to_scan() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let store = Arc::new(MemoryStore::new());
+        let descs = vec![SeriesDesc {
+            metric: "m0".to_string(),
+            samples: vec![(NS, 1.0f64.to_bits())],
+        }];
+        let seg = write_segment(&store, 0, 0, 100, &descs).await;
+        let snapshot = Snapshot {
+            segments: vec![seg],
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+        let distributed = Distributed::new(
+            Arc::new(NoSplitWorker {
+                get_requests: 7,
+                get_bytes: 4_096,
+            }),
+            DistribThresholds {
+                min_store_bytes: 0,
+                min_segments: 0,
+                max_parallel_slices: 1,
+            },
+        );
+        let accounting = PhaseAccounting::new();
+        distributed
+            .fetch(
+                TENANT,
+                Signal::Metrics,
+                &snapshot,
+                &[],
+                &[],
+                &accounting,
+                &EngineConfig::default(),
+                i64::MAX,
+                None,
+            )
+            .await
+            .expect("fetch")
+            .expect("not a fallback");
+
+        let snap = accounting.snapshot();
+        let get = ravel_types::accounting::AccountedOp::Get;
+        assert_eq!(snap.scan.s3_requests(get), 7, "pooled spend lands on scan");
+        assert_eq!(snap.scan.s3_bytes(get), 4_096);
+        for phase in [QueryPhase::Resolve, QueryPhase::Plan, QueryPhase::Probe] {
+            assert_eq!(
+                snap.phase(phase).s3_requests(get),
+                0,
+                "{} must stay empty: the worker named no phase, so inventing one \
+                 would be a fabricated attribution",
+                phase.name()
+            );
+            assert_eq!(snap.phase(phase).s3_bytes(get), 0, "{}", phase.name());
+        }
+        // The pooled total is unchanged by the degradation: no cost lost, none
+        // double-counted.
+        assert_eq!(snap.pooled().s3_requests(get), 7);
+        assert_eq!(snap.pooled().s3_bytes(get), 4_096);
+    });
+}
+
+/// ACCEPTANCE TEST (issue #959). A distributed query over a MemoryStore-backed
+/// loopback worker reports EXACT per-phase request counts on the coordinator,
+/// known by construction from the read shape the fixture pins:
+///
+/// The worker's `SegmentFetcher` is built with `whole_object_threshold == 0`
+/// (never read an object whole) and `suffix_len == 16` (a footer tail far
+/// shorter than the real footer), so every one of the two segments costs, per
+/// segment:
+///
+/// - plan: 2 GETs -- the 16-byte footer-tail probe, then the footer chase the
+///   short tail forces (`open_segment`, `FooterOutcome::NeedRange`).
+/// - probe: 1 GET -- the three contiguous catalog sections (LABEL_DICT,
+///   SERIES_IDS, SERIES_META) coalesced into one range (`decode_selected`).
+/// - scan: 1 GET -- the run's coalesced TS+VAL page ranges
+///   (`fetch_scalar_pages`).
+/// - resolve: 0 GETs -- the coordinator resolved the snapshot and shipped the
+///   pins, so a worker issues no resolve request at all.
+///
+/// Two segments, so the coordinator must see 4 plan / 2 probe / 2 scan GETs and
+/// 0 resolve GETs. Exact equality, not `> 0`: a pooled figure of 8 GETs is
+/// consistent with any split, and it was the pooled figure that hid this bug.
+///
+/// Pre-change this test fails on its FIRST phase assertion (`plan`: `left: 0,
+/// right: 4`): the whole remote spend arrived as one pooled snapshot and
+/// `engine.rs` charged it through `accounting.scan()`, so `plan` and `probe`
+/// read 0 and `scan` read 8. The three flipped lines, each shown failing this
+/// test on its own:
+///
+/// - `distrib/mod.rs`'s `fold_phases`: forcing its pooled-to-`scan` arm (the
+///   pre-change `live.merge_snapshot(&response.accounting)`) gives `plan: 0`.
+/// - `distrib/service.rs`'s `fetch_soa_and_histograms_phase_accounted` back to
+///   `fetch_soa_and_histograms_accounted` with `accounting.scan()`: the worker
+///   pools its own phases, same `plan: 0`.
+/// - `engine.rs`'s `accounting` argument to `distributed.fetch`: the pre-change
+///   `accounting.scan()` no longer type-checks (`Distributed::fetch` takes
+///   `&PhaseAccounting`), so that one is enforced by the signature rather than
+///   by an assertion; its semantic revert is the first bullet.
+///
+/// The byte figures are asserted as a relation, not a constant (object layout
+/// decides them): every phase's `s3_bytes` is WIRE bytes as transferred, they
+/// are nonzero for the three phases that issued a GET, and they sum to the
+/// pooled total. The local reference below pins them exactly anyway.
+#[test]
+fn distributed_query_reports_exact_per_phase_request_counts() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let store = Arc::new(MemoryStore::new());
+        let descs = |metric: &str| {
+            vec![SeriesDesc {
+                metric: metric.to_string(),
+                samples: vec![(NS, 1.0f64.to_bits()), (2 * NS, 2.0f64.to_bits())],
+            }]
+        };
+        // Two segments in two shards, so the shard-major partition puts them in
+        // two slices: the coordinator folds two workers' splits, not one.
+        let segments = vec![
+            write_segment(&store, 0, 0, 100, &descs("m0")).await,
+            write_segment(&store, 1, 1, 100, &descs("m1")).await,
+        ];
+        let snapshot = Snapshot {
+            segments: segments.clone(),
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+
+        // The read shape that makes the counts above exact, on the worker and on
+        // the local reference alike.
+        let shaped = |store: Arc<dyn ObjectStoreBackend>| {
+            SegmentFetcher::new(store)
+                .with_whole_object_threshold(0)
+                .with_suffix_len(16)
+        };
+        let backend: Arc<dyn ObjectStoreBackend> =
+            Arc::clone(&store) as Arc<dyn ObjectStoreBackend>;
+
+        let (fetcher, server) = spawn_worker_with_fetchers(
+            shaped(Arc::clone(&backend)),
+            LogSegmentFetcher::new(Arc::clone(&backend)),
+            SpanSegmentFetcher::new(Arc::clone(&backend)),
+            segments.clone(),
+        )
+        .await;
+        let distributed = Distributed::new(
+            Arc::new(fetcher),
+            DistribThresholds {
+                min_store_bytes: 0,
+                min_segments: 0,
+                max_parallel_slices: 2,
+            },
+        );
+        let accounting = PhaseAccounting::new();
+        let (triple, _partials) = distributed
+            .fetch(
+                TENANT,
+                Signal::Metrics,
+                &snapshot,
+                &[],
+                &[],
+                &accounting,
+                &EngineConfig::default(),
+                i64::MAX,
+                None,
+            )
+            .await
+            .expect("distributed fetch")
+            .expect("distributed produced a result (not a fallback)");
+        server.abort();
+        // The query really ran: two segments' runs came back, so the counts
+        // below are a real fetch's cost and not an empty one's.
+        assert_eq!(
+            triple.0.iter().flatten().count(),
+            2,
+            "both segments' runs must have crossed the wire"
+        );
+
+        let snap = accounting.snapshot();
+        let get = ravel_types::accounting::AccountedOp::Get;
+        assert_eq!(
+            snap.resolve.s3_requests(get),
+            0,
+            "a pinned slice issues no resolve request on the worker"
+        );
+        assert_eq!(
+            snap.plan.s3_requests(get),
+            4,
+            "2 segments x (footer-tail probe + footer chase)"
+        );
+        assert_eq!(
+            snap.probe.s3_requests(get),
+            2,
+            "2 segments x one coalesced catalog-section GET"
+        );
+        assert_eq!(
+            snap.scan.s3_requests(get),
+            2,
+            "2 segments x one coalesced page GET"
+        );
+        assert_eq!(
+            snap.pooled().s3_requests(get),
+            8,
+            "the four phases sum to the pooled total"
+        );
+
+        // Wire bytes: nonzero exactly where a GET was issued, and additive back
+        // to the pooled total (which is the same basis -- bytes as transferred,
+        // coalescing slack and retries included, cache hits excluded).
+        assert_eq!(snap.resolve.s3_bytes(get), 0);
+        assert!(snap.plan.s3_bytes(get) > 0, "the plan GETs moved bytes");
+        assert!(snap.probe.s3_bytes(get) > 0, "the probe GET moved bytes");
+        assert!(snap.scan.s3_bytes(get) > 0, "the scan GET moved bytes");
+        assert_eq!(
+            snap.plan.s3_bytes(get) + snap.probe.s3_bytes(get) + snap.scan.s3_bytes(get),
+            snap.pooled().s3_bytes(get)
+        );
+
+        // And the whole split equals the split the SAME read produces locally,
+        // counter for counter and phase for phase: the worker records phases
+        // with the local path's own machinery, so a distributed query's cost
+        // split means exactly what a local query's means.
+        let local_phases = PhaseAccounting::new();
+        let local_fetcher = shaped(Arc::clone(&backend));
+        for seg in &segments {
+            local_fetcher
+                .fetch_soa_and_histograms_phase_accounted(TENANT, seg, &[], &local_phases)
+                .await
+                .expect("local fetch");
+        }
+        assert_eq!(
+            snap,
+            local_phases.snapshot(),
+            "distributed per-phase accounting must equal the local per-phase \
+             accounting for the same segments"
         );
     });
 }

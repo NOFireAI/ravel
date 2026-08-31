@@ -642,6 +642,7 @@ fn ok_response(scalar: Vec<FetchedSeriesSoa>) -> SliceResponse {
         histogram: Vec::new(),
         partials: Vec::new(),
         accounting: QueryAccountingSnapshot::default(),
+        phase_accounting: None,
         stats: FetchStats::default(),
         series_returned,
         samples_returned,

@@ -53,6 +53,7 @@ impl SliceFetcher for FixedCostFetcher {
             histogram: Vec::new(),
             partials: Vec::new(),
             accounting,
+            phase_accounting: None,
             stats: Default::default(),
             series_returned: 0,
             samples_returned: 0,

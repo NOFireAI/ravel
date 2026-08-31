@@ -1189,16 +1189,67 @@ seeing the same number, unchanged. `QueryStats` additionally carries the
 full `phase_accounting: PhaseAccountingSnapshot` for callers that want
 the split.
 
-Two entry points issue GETs the phase split cannot yet attribute without
-a change outside this crate's issue #796 scope:
+### The split across the slice boundary (issue #959)
 
-- Federation and distributed fan-out (`federate_discovery`,
-  `federate_scalar`, `distrib::client`'s `SliceFetcher`) cross a wire
-  boundary as one pooled `QueryAccountingSnapshot`
-  (`SliceResponse.accounting`) that predates #796; a worker's per-slice
-  spend is charged to `scan` on the coordinator side rather than left
-  unaccounted. Splitting it for real would need a wire-format version
-  bump to the coordinator/worker protobuf.
+A distributed query's segment reads happen inside a remote worker, so the
+split has to cross the coordinator/worker wire or it does not exist. The
+worker records its phases with the same machinery the local path uses
+(`SegmentFetcher::fetch_soa_and_histograms_phase_accounted`, one
+`PhaseAccounting` per slice) and reports all four snapshots in its
+terminal summary; `Distributed::fetch` charges each to the coordinator
+handle for the phase that issued it (`distrib::fold_phases`). A pinned
+slice's `resolve` is always zero: the coordinator resolved the snapshot
+and shipped the pins, so a worker issues no resolve request of its own,
+and the `resolve` figure a distributed query reports is the
+coordinator's own catalog resolve.
+
+The wire form is `Summary.phase_accounting`, field 7 of
+`proto/ravel/queryfrag.proto`'s `Summary`: an additive field, no
+renumbering, and no `PROTOCOL_VERSION` bump, because both skew
+directions must degrade rather than fall back. It carries a repeated,
+phase-TAGGED list (`PhaseCost`, each naming its `QueryPhase`) rather
+than four positional fields, so entry order carries no meaning, a phase
+added later is an additive enum value, and `Summary` stays small (it is
+a variant of the `FetchResponse` oneof). A split that arrives but cannot
+be attributed -- an unknown or `UNSPECIFIED` phase discriminant, the
+same phase twice, an entry with no counters -- is a typed `CodecError`,
+never a silently dropped or guessed attribution. An omitted phase is
+zero for that phase.
+
+- A new worker read by an old coordinator: field 7 is an unknown field
+  and ignored, and field 1 (`accounting`) still carries the pooled total,
+  which the worker computes as `phase_accounting.pooled()` so the two
+  cannot disagree.
+- An old worker read by a new coordinator: field 7 is absent,
+  `SliceResponse.phase_accounting` is `None`, and the coordinator charges
+  the pooled total to `scan` -- exactly what it did for every worker
+  before the split existed. Nothing is fabricated onto a phase that did
+  not report one.
+
+Every per-phase `s3_bytes` figure is WIRE bytes as transferred, the same
+basis as the pooled total it sums to: a coalesced range's unwanted bytes
+and any retry are included, cache-served bytes are not (those are
+`cache_bytes`), and decoded/decompressed bytes are a different quantity
+that is never added into a phase's request or byte totals.
+
+The RLOG (Logs/Alerts/Audit) and RSPAN (Spans) slice paths report a
+scan-only split. That is not a shortcut: `LogSegmentFetcher`'s and
+`SpanSegmentFetcher`'s read funnels have no plan or probe step of their
+own on the local path either (see the streaming-entry-point bullet
+below), so the worker reproduces the local attribution rather than
+inventing a split the funnel cannot make.
+
+Two entry points issue GETs the phase split still cannot attribute
+without a change outside the scope of the issues above:
+
+- Cross-cluster federation (`federate_discovery`, `federate_scalar`)
+  charges a remote cluster's whole spend to `scan`. `Federation::fetch`
+  takes one pooled `QueryAccounting`, and the remote is a peer
+  coordinator with its own resolve/plan/probe/scan of its own snapshot,
+  so what its phases mean on this side is a decision issue #959 did not
+  make. The decoded response already carries the split
+  (`SliceResponse.phase_accounting`), so threading it is a call-site
+  change, not a wire change.
 - `LogSegmentFetcher`'s three streaming entry points that return a live
   `LogSegmentScan` (`scan_accounted_with_tenant`,
   `scan_whole_accounted_with_tenant`, `scan_accounted_with_tenant_subset`)
@@ -1403,7 +1454,10 @@ cost fields alongside the existing `segmentsFetched`/`segmentsPruned`:
   snapshot resolve), `plan` (footer and skip-index probing), `probe`
   (segment catalog fetch), `scan` (block and page data reads). The
   rendering iterates `QueryPhase::ALL`, so a phase added to the enum
-  cannot be silently dropped. Per-phase fields: `phase`,
+  cannot be silently dropped. A distributed query fills the same array
+  from its workers' own per-phase reports (issue #959, "The split across
+  the slice boundary" above), so `plan` and `probe` are real figures
+  there and not a local-only artifact. Per-phase fields: `phase`,
   `s3GetRequests`, `s3GetWireBytes`, `s3ListRequests`, `cacheHits`,
   `cacheMisses`, `cacheServedBytes`, `decompressedOutputBytes`,
   `reusedRegionBytes`, `segmentsOpened`, `seriesMatched`.

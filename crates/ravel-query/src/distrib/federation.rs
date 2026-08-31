@@ -564,6 +564,7 @@ mod tests {
                 histogram: Vec::new(),
                 partials: Vec::new(),
                 accounting: QueryAccountingSnapshot::default(),
+                phase_accounting: None,
                 stats: FetchStats::default(),
                 series_returned: 0,
                 samples_returned: 0,

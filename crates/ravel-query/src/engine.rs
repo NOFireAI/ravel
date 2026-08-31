@@ -81,11 +81,19 @@ pub struct QueryStats {
     /// pools: resolve (catalog snapshot resolve), plan (footer/skip-index
     /// probing), probe (segment catalog fetch), scan (block/page reads).
     /// See `crate::phase_accounting` for phase boundaries and what each
-    /// byte counter counts. Federation and distributed-worker fan-out
-    /// (`federate_scalar`, `federate_discovery`, `distrib::fetch`) are
-    /// opaque remote fetches whose own internal phase breakdown is not
-    /// visible here; their GETs land on the `scan` phase by convention
-    /// (see the call sites in `prefetch`/`resolve_series_for_labels`).
+    /// byte counter counts.
+    ///
+    /// A distributed query's remote spend is split here too (issue #959): a
+    /// worker records the phase that issued each of its requests and reports
+    /// the four-phase split in its terminal summary, which
+    /// `Distributed::fetch` charges phase by phase. A worker too old to report
+    /// a split has its pooled cost charged to `scan`, as every worker's was
+    /// before the split existed.
+    ///
+    /// Cross-cluster federation (`federate_scalar`, `federate_discovery`) is
+    /// still an opaque remote fetch here: its GETs land on the `scan` phase by
+    /// convention (see those call sites in
+    /// `prefetch`/`resolve_series_for_labels`).
     pub phase_accounting: PhaseAccountingSnapshot,
     /// Upper-envelope cost estimate computed after snapshot resolution and
     /// before any page fetch (ADR-0044 decision 3).
@@ -1501,15 +1509,16 @@ impl QueryEngine {
             let cost = estimate_cost(snapshot, 1, 0);
             if crate::distrib::partition::should_distribute(distributed.thresholds(), &cost) {
                 let erasure = snapshot_erasure_predicates(snapshot);
-                // `distributed.fetch` takes a single pooled `QueryAccounting`
-                // handle: a worker's per-slice spend crosses the
-                // coordinator/worker protobuf wire as one pooled
-                // `QueryAccountingSnapshot` (`distrib/client.rs`'s
-                // `SliceResponse.accounting`), predating issue #796 and
-                // requiring a wire-format version bump to phase-split -- out
-                // of this ticket's scope. Charged to `scan` rather than left
-                // unaccounted (issue #796 finding, same treatment as
-                // federation above).
+                // The whole `PhaseAccounting`, not its `scan` sub-handle
+                // (issue #959): a worker records each store request against
+                // the phase that issued it and returns the four-phase split
+                // in its terminal summary, and `Distributed::fetch` charges
+                // each phase to the matching handle here. Handing over
+                // `accounting.scan()` was what made a distributed query's
+                // split degenerate -- every remote request, whatever issued
+                // it, landed on `scan` by construction. A worker that reports
+                // no split still degrades to exactly that (see
+                // `distrib::fold_phases`).
                 if let Some((triple, partials)) = distributed
                     .fetch(
                         tenant_hash,
@@ -1517,7 +1526,7 @@ impl QueryEngine {
                         snapshot,
                         matchers,
                         &erasure,
-                        accounting.scan(),
+                        accounting,
                         &self.config,
                         deadline_unix_ns,
                         partial_aggregate,
@@ -5288,6 +5297,7 @@ mod prefetch_tests {
                 histogram: Vec::new(),
                 partials: Vec::new(),
                 accounting: ravel_types::accounting::QueryAccountingSnapshot::default(),
+                phase_accounting: None,
                 stats: crate::fetcher::FetchStats::default(),
                 series_returned: 0,
                 samples_returned: 0,
@@ -5652,6 +5662,118 @@ mod prefetch_tests {
         );
 
         handle.abort();
+    }
+
+    /// ACCEPTANCE TEST (issue #959) at the engine seam: a real distributed query
+    /// through `prefetch` and a REAL loopback worker reports its remote spend
+    /// under the phase that ISSUED it, and the coordinator's own local resolve
+    /// stays separate from it.
+    ///
+    /// Exact counts, known by construction. The worker's `SegmentFetcher` is the
+    /// default one, whose `whole_object_threshold` (512 KiB) is far above this
+    /// one small segment, so `open_segment` reads the object whole in its single
+    /// plan-phase GET and the catalog decode and page reads are then served from
+    /// that buffer with no further request:
+    ///
+    /// - `plan`: exactly 1 GET, the worker's whole-object open.
+    /// - `probe` and `scan`: exactly 0 GETs -- both were served from the bytes
+    ///   the plan GET already brought.
+    /// - `resolve`: nonzero, and it is the COORDINATOR's own catalog resolve
+    ///   (`Catalog::resolve_pruned_with_generations` under the resolve handle),
+    ///   not the worker's: a pinned slice issues no resolve request at all.
+    ///
+    /// Pre-change this fails on the `plan` assertion: `prefetch` handed
+    /// `distributed.fetch` the `accounting.scan()` sub-handle, so the worker's
+    /// open landed on `scan` and `plan` read 0. That argument
+    /// (`accounting.scan()` -> `accounting` in
+    /// `fetch_samples_and_histograms_maybe_distributed`) is one of the three
+    /// flipped lines; restoring it alone no longer compiles, since
+    /// `Distributed::fetch` now takes `&PhaseAccounting`. Shown failing by
+    /// reverting the semantically equivalent line -- forcing
+    /// `distrib::fold_phases` down its pooled-to-`scan` arm -- which puts the
+    /// worker's open back on `scan`: `left: 0, right: 1` here.
+    #[tokio::test]
+    async fn distributed_query_reports_the_remote_phase_that_issued_each_request() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        publish_metric_segment(
+            &store,
+            tenant_hash,
+            1,
+            "m",
+            vec![
+                Sample {
+                    ts_ns: BASE_NS - NS_PER_MIN,
+                    value: 1.0,
+                },
+                Sample {
+                    ts_ns: BASE_NS - 2 * NS_PER_MIN,
+                    value: 2.0,
+                },
+            ],
+            u32::try_from(BASE_NS / (3_600 * NS_PER_SEC)).expect("hour bucket"),
+            BASE_NS,
+        )
+        .await;
+
+        let segments = resolve_metric_segments(Arc::clone(&store), tenant_hash, BASE_NS).await;
+        assert_eq!(segments.len(), 1, "one published segment resolves");
+        let (worker, handle) = spawn_metric_worker(Arc::clone(&store), segments).await;
+        let eng = engine(Arc::clone(&store)).with_distributed(Arc::new(
+            crate::distrib::Distributed::new(Arc::new(worker), zero_thresholds()),
+        ));
+
+        // `sum_over_time`, not `count_over_time`: this must take the RAW
+        // distributed fetch path, not ADR-0103's aggregation pushdown (whose
+        // worker branch fetches the same way but returns partials).
+        let plans = plan_selectors("sum_over_time(m[5m])", BASE_MS, BASE_MS).expect("plans");
+        assert!(
+            !plans[0].count_over_time_pushdown_candidate,
+            "the raw fetch path must run, or this measures the pushdown branch"
+        );
+        let (source, stats) = eng
+            .prefetch(
+                tenant_hash,
+                &plans,
+                &EvalWindow::Instant { t_ns: BASE_NS },
+                &[],
+                BASE_NS,
+            )
+            .await
+            .expect("prefetch succeeds");
+        handle.abort();
+        assert!(
+            !source.series.is_empty(),
+            "the distributed fetch returned the segment's raw series"
+        );
+
+        let phases = stats.phase_accounting;
+        let get = AccountedOp::Get;
+        assert_eq!(
+            phases.plan.s3_requests(get),
+            1,
+            "the worker's whole-object open is one PLAN GET, not a scan GET"
+        );
+        assert_eq!(
+            phases.probe.s3_requests(get),
+            0,
+            "the catalog decode was served from the plan GET's bytes"
+        );
+        assert_eq!(
+            phases.scan.s3_requests(get),
+            0,
+            "the page reads were served from the plan GET's bytes"
+        );
+        assert!(
+            phases.resolve.s3_requests(get) > 0,
+            "the coordinator's own catalog resolve is charged to resolve"
+        );
+        // The pooled total is unchanged by the split: it is still the sum.
+        assert_eq!(
+            stats.accounting.s3_requests(get),
+            phases.resolve.s3_requests(get) + 1,
+            "pooled = the coordinator's resolve GETs plus the worker's one plan GET"
+        );
     }
 
     /// ADR-0103 (epic #64) differential: the pushed-down result is identical to
@@ -6849,6 +6971,7 @@ mod coverage_wrapper_tests {
                 histogram: Vec::new(),
                 partials: Vec::new(),
                 accounting: QueryAccountingSnapshot::default(),
+                phase_accounting: None,
                 stats: FetchStats::default(),
                 series_returned: 0,
                 samples_returned: 0,

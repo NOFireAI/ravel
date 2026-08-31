@@ -499,6 +499,18 @@ message Summary {
   // (ADR-0071). Additive fields, appended after the frozen 1..4.
   uint64 raw_f64_pages = 5;
   uint64 raw_f64_bytes = 6;
+  // The same cost `accounting` (field 1) pools, split by the phase that ISSUED
+  // it (issue #959). Additive field, appended after 1..6; never renumbered.
+  //
+  // Field 1 stays the pooled total and is built as this field's `pooled()`
+  // (field-wise sum, peak_intermediate_bytes merged by max), so the two can
+  // never disagree, and a coordinator that does not know this field reads
+  // exactly the number it read before it existed. Absent means the worker
+  // reported no split: a coordinator that wants one charges the pooled total to
+  // its scan phase, which is what every coordinator did before this field.
+  // Both directions of skew therefore degrade rather than fail, which is why
+  // adding it needs no PROTOCOL_VERSION bump.
+  PhaseAccountingSnapshot phase_accounting = 7;
 }
 
 // Typed per-slice status, mirroring the local query's typed errors so the
@@ -543,4 +555,58 @@ message QueryAccountingSnapshot {
   uint64 series_matched = 13;
   uint64 bytes_reused = 14;
   uint64 peak_intermediate_bytes = 15;
+}
+
+// One slice's cost split by the phase that issued it (issue #959), mirroring
+// ravel_query::PhaseAccountingSnapshot: one entry per ravel_query::QueryPhase,
+// each naming its own phase. The phase a request is charged to is decided at the
+// GET call site on the worker, by the same SegmentFetcher machinery the local
+// read path uses, so a distributed query's split means exactly what a local
+// query's split means. See QueryPhase below for what each phase covers.
+//
+// A repeated, phase-TAGGED list rather than four named submessages: the entry
+// order carries no meaning, an unrecognized phase is a typed decode error rather
+// than a silently misattributed cost, and a phase added later is an additive
+// enum value. It also keeps Summary small, which matters because Summary is a
+// variant of the FetchResponse oneof.
+//
+// A phase with nothing to report may be omitted; a missing phase decodes as that
+// phase's zero counters. A repeated phase is a decode error (two costs for one
+// phase cannot be resolved into one), and so is an unknown phase discriminant.
+// An EMPTY list is distinct from an absent Summary.phase_accounting: absent
+// means "this worker reported no split at all", empty means "a split of nothing".
+//
+// Every s3_bytes figure here is WIRE bytes as transferred, on the same basis as
+// the pooled QueryAccountingSnapshot it sums to: a coalesced range's unwanted
+// bytes and any retry are included, and cache-served bytes are not (they stay
+// on cache_bytes). Decoded/decompressed bytes are a different quantity and are
+// never added into a phase's request or wire-byte totals.
+message PhaseAccountingSnapshot {
+  repeated PhaseCost phases = 1;
+}
+
+// One phase's share of a slice's cost (issue #959): the phase, named, and the
+// counters charged to it.
+message PhaseCost {
+  QueryPhase phase = 1;
+  QueryAccountingSnapshot accounting = 2;
+}
+
+// The phases a slice's object-store cost is split across, mirroring
+// ravel_query::QueryPhase (docs/query-engine.md's own vocabulary).
+enum QueryPhase {
+  // Never sent. proto3 requires a zero value; a worker always names a real
+  // phase, so receiving this is a typed decode error rather than a default.
+  QUERY_PHASE_UNSPECIFIED = 0;
+  // The catalog snapshot resolve's commit-record GETs. Always absent or zero on
+  // a Pinned slice: the coordinator resolved the snapshot and shipped the pins,
+  // so a worker issues no resolve request of its own.
+  QUERY_PHASE_RESOLVE = 1;
+  // Footer/skip-index probing (SegmentFetcher::open_segment).
+  QUERY_PHASE_PLAN = 2;
+  // The segment catalog fetch (SegmentFetcher::decode_selected).
+  QUERY_PHASE_PROBE = 3;
+  // The block/page/chunk data reads
+  // (SegmentFetcher::fetch_scalar_pages/fetch_histogram_pages).
+  QUERY_PHASE_SCAN = 4;
 }

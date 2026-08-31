@@ -32,6 +32,7 @@ use ravel_types::logstream::{AttrValue, LogStreamId};
 
 use crate::erasure::ErasurePredicate;
 use crate::fetcher::{FetchedHistogramSeries, FetchedSeriesSoa, SamplePriority};
+use crate::phase_accounting::{PhaseAccountingSnapshot, QueryPhase};
 use crate::span_fetcher::SpanRow;
 
 /// The queryfrag protocol version this build speaks. A `FetchRequest` carrying
@@ -259,6 +260,14 @@ pub enum CodecError {
     HistogramBucketCountMismatch { spans: u64, buckets: usize },
     #[error("histogram count is less than its zero_count or its total bucket count")]
     HistogramCountInconsistent,
+    #[error(
+        "per-phase cost entry names phase discriminant {0}, which this build does not model          (0 is the never-sent proto3 default)"
+    )]
+    UnknownQueryPhase(i32),
+    #[error("per-phase cost names the {0} phase twice; two costs for one phase cannot be merged")]
+    DuplicateQueryPhase(&'static str),
+    #[error("per-phase cost entry for the {0} phase carried no accounting snapshot")]
+    MissingPhaseAccounting(&'static str),
 }
 
 /// Rejects any protocol version this build does not speak. `Ok(())` only for
@@ -1440,6 +1449,95 @@ pub fn decode_accounting(snap: pb::QueryAccountingSnapshot) -> QueryAccountingSn
         logs_ranged_opens: 0,
         peak_intermediate_bytes: snap.peak_intermediate_bytes,
     }
+}
+
+// ---- PhaseAccountingSnapshot <-> pb::PhaseAccountingSnapshot --------------
+
+/// The wire discriminant for one [`QueryPhase`]. The mapping is explicit rather
+/// than a cast: the proto enum reserves 0 for its never-sent `UNSPECIFIED`
+/// default, so the discriminants are deliberately not `QueryPhase::index`.
+fn phase_to_pb(phase: QueryPhase) -> pb::QueryPhase {
+    match phase {
+        QueryPhase::Resolve => pb::QueryPhase::Resolve,
+        QueryPhase::Plan => pb::QueryPhase::Plan,
+        QueryPhase::Probe => pb::QueryPhase::Probe,
+        QueryPhase::Scan => pb::QueryPhase::Scan,
+    }
+}
+
+/// Inverse of [`phase_to_pb`]. An unrecognized discriminant, and the never-sent
+/// `UNSPECIFIED` zero, are typed errors: a cost this build cannot attribute must
+/// not be silently dropped or parked on an arbitrary phase.
+fn phase_from_pb(got: i32) -> Result<QueryPhase, CodecError> {
+    match pb::QueryPhase::try_from(got) {
+        Ok(pb::QueryPhase::Resolve) => Ok(QueryPhase::Resolve),
+        Ok(pb::QueryPhase::Plan) => Ok(QueryPhase::Plan),
+        Ok(pb::QueryPhase::Probe) => Ok(QueryPhase::Probe),
+        Ok(pb::QueryPhase::Scan) => Ok(QueryPhase::Scan),
+        Ok(pb::QueryPhase::Unspecified) | Err(_) => Err(CodecError::UnknownQueryPhase(got)),
+    }
+}
+
+/// Flattens the per-phase accounting snapshot into its wire form (issue #959):
+/// one phase-tagged [`encode_accounting`] payload per [`QueryPhase`], emitted in
+/// [`QueryPhase::ALL`] order (the order is not load-bearing -- each entry names
+/// its own phase -- but a fixed one keeps the encoding deterministic).
+///
+/// Every phase is emitted, including one with all-zero counters, so a reader can
+/// tell "this phase issued nothing" from "this worker did not report this
+/// phase". Each phase carries the same counters, on the same basis, that
+/// [`encode_accounting`] carries for the pooled total: `s3_bytes` is WIRE bytes
+/// as transferred (coalesced-range slack and retries included, cache hits
+/// excluded), and the per-phase figures sum back to the pooled snapshot the
+/// summary's `accounting` field carries.
+pub fn encode_phase_accounting(snap: &PhaseAccountingSnapshot) -> pb::PhaseAccountingSnapshot {
+    pb::PhaseAccountingSnapshot {
+        phases: QueryPhase::ALL
+            .iter()
+            .map(|phase| pb::PhaseCost {
+                phase: phase_to_pb(*phase) as i32,
+                accounting: Some(encode_accounting(snap.phase(*phase))),
+            })
+            .collect(),
+    }
+}
+
+/// Inverse of [`encode_phase_accounting`], and fallible where the wire form can
+/// be ambiguous about which phase paid what:
+///
+/// - an unknown (or `UNSPECIFIED`) phase discriminant is
+///   [`CodecError::UnknownQueryPhase`]: this build cannot say which phase the
+///   cost belongs to, and attributing it to a guess would be worse than
+///   refusing;
+/// - a phase named twice is [`CodecError::DuplicateQueryPhase`]: two costs for
+///   one phase cannot be resolved into one, and summing them would invent a
+///   figure the worker never reported;
+/// - an entry with no accounting submessage is
+///   [`CodecError::MissingPhaseAccounting`], distinct from an omitted entry.
+///
+/// An omitted phase decodes as that phase's zero snapshot, which is what a
+/// worker that issued no request in it would report anyway. Each phase decodes
+/// through [`decode_accounting`], so the counters that wire form does not carry
+/// (`page_bytes_fetched`/`page_bytes_decoded`,
+/// `logs_whole_object_opens`/`logs_ranged_opens`) come back as zero per phase
+/// exactly as they do pooled.
+pub fn decode_phase_accounting(
+    snap: pb::PhaseAccountingSnapshot,
+) -> Result<PhaseAccountingSnapshot, CodecError> {
+    let mut out = PhaseAccountingSnapshot::default();
+    let mut seen = [false; QueryPhase::ALL.len()];
+    for entry in snap.phases {
+        let phase = phase_from_pb(entry.phase)?;
+        if seen[phase.index()] {
+            return Err(CodecError::DuplicateQueryPhase(phase.name()));
+        }
+        seen[phase.index()] = true;
+        let accounting = entry
+            .accounting
+            .ok_or(CodecError::MissingPhaseAccounting(phase.name()))?;
+        *out.phase_mut(phase) = decode_accounting(accounting);
+    }
+    Ok(out)
 }
 
 // ---- Status ---------------------------------------------------------------

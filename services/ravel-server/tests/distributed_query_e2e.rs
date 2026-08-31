@@ -1086,7 +1086,10 @@ fn series_frame(series_id: [u8; 16]) -> pb::FetchResponse {
     }
 }
 
-/// A terminal summary frame with the given typed status and no accounting.
+/// A terminal summary frame with the given typed status and no accounting: not
+/// even a per-phase split (issue #959), which is what a worker predating that
+/// field sends. The coordinator then charges this slice's (zero) pooled cost to
+/// its scan phase, exactly as it did before the split existed.
 fn summary_frame(code: pb::status::Code) -> pb::FetchResponse {
     pb::FetchResponse {
         frame: Some(pb::fetch_response::Frame::Summary(pb::Summary {
@@ -1099,6 +1102,7 @@ fn summary_frame(code: pb::status::Code) -> pb::FetchResponse {
             }),
             raw_f64_pages: 0,
             raw_f64_bytes: 0,
+            phase_accounting: None,
         })),
     }
 }

@@ -42,7 +42,7 @@ use ravel_catalog::{SegmentRef, Snapshot};
 use ravel_logseg::LogRecord;
 use ravel_promql::LabelMatcher;
 use ravel_proto::queryfrag::v1 as pb;
-use ravel_types::accounting::{QueryAccounting, QueryAccountingSnapshot};
+use ravel_types::accounting::QueryAccountingSnapshot;
 use ravel_types::logstream::canonical_attr_bytes;
 use ravel_types::{SeriesId, Signal, TenantHash};
 
@@ -53,6 +53,7 @@ use crate::engine::bytes_scanned_exceeded;
 use crate::erasure::ErasurePredicate;
 use crate::error::QueryError;
 use crate::fetcher::{FetchError, FetchStats, FetchedHistogramSeries, FetchedSeriesSoa};
+use crate::phase_accounting::PhaseAccounting;
 use crate::span_fetcher::SpanRow;
 
 pub use partition::{DISTRIBUTE_MIN_SEGMENTS, DISTRIBUTE_MIN_STORE_BYTES};
@@ -148,7 +149,7 @@ impl Distributed {
         snapshot: &Snapshot,
         matchers: &[LabelMatcher],
         erasure: &[ErasurePredicate],
-        accounting: &QueryAccounting,
+        accounting: &PhaseAccounting,
         config: &EngineConfig,
         deadline_unix_ns: i64,
         partial_aggregate: Option<pb::PartialAggregateRequest>,
@@ -446,7 +447,7 @@ impl Distributed {
         snapshot: &Snapshot,
         matchers: &[LabelMatcher],
         erasure: &[ErasurePredicate],
-        accounting: &QueryAccounting,
+        accounting: &PhaseAccounting,
         config: &EngineConfig,
         deadline_unix_ns: i64,
     ) -> Result<Option<Vec<LogRecord>>, QueryError> {
@@ -602,7 +603,7 @@ impl Distributed {
         snapshot: &Snapshot,
         matchers: &[LabelMatcher],
         erasure: &[ErasurePredicate],
-        accounting: &QueryAccounting,
+        accounting: &PhaseAccounting,
         config: &EngineConfig,
         deadline_unix_ns: i64,
     ) -> Result<Option<Vec<SpanRow>>, QueryError> {
@@ -733,13 +734,30 @@ impl Distributed {
 /// running snapshot (the basis for the incremental bytes-scanned check), and
 /// sums its `FetchStats` page counters. Both accounting folds saturate, so a
 /// worker reporting a counter near `u64::MAX` clamps rather than wrapping.
+///
+/// The live fold is per phase (issue #959): each of the worker's four phase
+/// snapshots lands on the coordinator handle for the phase that ISSUED it
+/// remotely, so a distributed query's split is the same split the same read
+/// produces locally. The `None` fallback is the version-skew case -- a worker
+/// that reported no split -- and charges the pooled total to `scan`, which is
+/// what this function did for every worker before the split existed.
+///
+/// `running`, the bytes-scanned basis, keeps reading the pooled `accounting`
+/// field on both paths. The worker builds that field as its own
+/// `PhaseAccountingSnapshot::pooled()`, so it agrees with the split by
+/// construction, and enforcement is then byte-identical whether or not the
+/// worker reported phases.
 fn fold_slice(
-    live: &QueryAccounting,
+    live: &PhaseAccounting,
     running: &mut QueryAccountingSnapshot,
     stats: &mut FetchStats,
     response: &client::SliceResponse,
 ) {
-    live.merge_snapshot(&response.accounting);
+    fold_phases(
+        live,
+        response.phase_accounting.as_ref(),
+        &response.accounting,
+    );
     *running = running.saturating_merge(&response.accounting);
     stats.raw_f64_pages = stats
         .raw_f64_pages
@@ -754,11 +772,15 @@ fn fold_slice(
 /// check). The log sibling of [`fold_slice`]; a log slice carries no `FetchStats`
 /// page counters (a metric-path concept), so there is none to sum.
 fn fold_log_slice(
-    live: &QueryAccounting,
+    live: &PhaseAccounting,
     running: &mut QueryAccountingSnapshot,
     response: &SliceLogResponse,
 ) {
-    live.merge_snapshot(&response.accounting);
+    fold_phases(
+        live,
+        response.phase_accounting.as_ref(),
+        &response.accounting,
+    );
     *running = running.saturating_merge(&response.accounting);
 }
 
@@ -767,12 +789,41 @@ fn fold_log_slice(
 /// check). The span sibling of [`fold_log_slice`]; a span slice carries no
 /// `FetchStats` page counters (a metric-path concept), so there is none to sum.
 fn fold_span_slice(
-    live: &QueryAccounting,
+    live: &PhaseAccounting,
     running: &mut QueryAccountingSnapshot,
     response: &SliceSpanResponse,
 ) {
-    live.merge_snapshot(&response.accounting);
+    fold_phases(
+        live,
+        response.phase_accounting.as_ref(),
+        &response.accounting,
+    );
     *running = running.saturating_merge(&response.accounting);
+}
+
+/// Charges one slice's reported cost to the coordinator's phase handles (issue
+/// #959), shared by the metrics, log, and span folds above.
+///
+/// With a `split` the charge is per phase: the worker recorded each request
+/// against the phase that issued it, using the same `PhaseAccounting` machinery
+/// the local read path threads, so the coordinator adds each phase to its own
+/// handle for that phase and nothing is attributed to a phase that did not
+/// issue it.
+///
+/// Without one (`None`: a worker that predates the summary's per-phase field)
+/// the whole `pooled` total goes to `scan`. That is a real loss of resolution,
+/// not a guess dressed up as data: it is exactly the behavior every coordinator
+/// had before the split, so a version-skewed pair reports the same numbers it
+/// reports today rather than failing or dropping the remote spend.
+fn fold_phases(
+    live: &PhaseAccounting,
+    split: Option<&crate::phase_accounting::PhaseAccountingSnapshot>,
+    pooled: &QueryAccountingSnapshot,
+) {
+    match split {
+        Some(split) => live.merge_phase_snapshot(split),
+        None => live.scan().merge_snapshot(pooled),
+    }
 }
 
 /// The stated cross-segment total order for RLOG records (no dedup: see below),

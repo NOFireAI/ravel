@@ -15,6 +15,7 @@ use tonic::transport::Channel;
 use crate::distrib::codec::{self, CodecError};
 use crate::distrib::proto::series_fetch_client::SeriesFetchClient;
 use crate::fetcher::{FetchStats, FetchedHistogramSeries, FetchedSeriesSoa};
+use crate::phase_accounting::PhaseAccountingSnapshot;
 use crate::span_fetcher::SpanRow;
 
 /// A distributed fetch failed in a way that is not a per-slice typed status.
@@ -78,8 +79,23 @@ pub struct SliceResponse {
     /// coordinator-side combine and the planner integration are the next task,
     /// so today's callers of [`decode_slice_frames`] ignore this field.
     pub partials: Vec<codec::PartialAggregate>,
-    /// The worker's per-slice cost accounting.
+    /// The worker's per-slice cost accounting, pooled across every phase.
     pub accounting: ravel_types::accounting::QueryAccountingSnapshot,
+    /// The same cost [`accounting`](Self::accounting) pools, split by the phase
+    /// that issued it on the worker (issue #959). `None` means the worker
+    /// reported no split (a build predating the summary's `phase_accounting`
+    /// field), in which case a coordinator that wants a split charges the pooled
+    /// total to its own scan phase -- exactly what every coordinator did before
+    /// this field existed (`distrib::fold_phases`). A split that arrived but
+    /// cannot be attributed (an unknown or repeated phase) never reaches this
+    /// field as `None`: it is a typed [`DistribError::Codec`] at decode time.
+    ///
+    /// Every `s3_bytes` figure in it is WIRE bytes as transferred, on the same
+    /// basis as `accounting`: coalesced-range slack and retries included,
+    /// cache-served bytes excluded (those stay on `cache_bytes`). It sums back to
+    /// `accounting` field-wise, so the two are two views of one number, never
+    /// two costs to add up.
+    pub phase_accounting: Option<PhaseAccountingSnapshot>,
     /// The worker's per-slice `FetchStats` page counters, folded (summed) by
     /// the coordinator so a distributed query reports the same raw-page cost in
     /// its stats JSON the local path would (ADR-0071).
@@ -104,8 +120,12 @@ pub struct SliceResponse {
 pub struct SliceLogResponse {
     /// Decoded RLOG records, each carrying its full per-segment merged view.
     pub records: Vec<LogRecord>,
-    /// The worker's per-slice cost accounting.
+    /// The worker's per-slice cost accounting, pooled across every phase.
     pub accounting: QueryAccountingSnapshot,
+    /// Per-phase split of [`accounting`](Self::accounting); see
+    /// [`SliceResponse::phase_accounting`] for the exact meaning and the `None`
+    /// degradation.
+    pub phase_accounting: Option<PhaseAccountingSnapshot>,
     /// The worker's per-slice `FetchStats` page counters.
     pub stats: FetchStats,
     /// Records the worker reported returning (carried in the summary's
@@ -126,6 +146,9 @@ impl SliceLogResponse {
         SliceLogResponse {
             records: Vec::new(),
             accounting: QueryAccountingSnapshot::default(),
+            // A synthetic response, not a worker's: no request was issued at
+            // all, so there is no phase to attribute and no split to report.
+            phase_accounting: None,
             stats: FetchStats::default(),
             records_returned: 0,
             status: pb::status::Code::Unsupported,
@@ -145,8 +168,12 @@ impl SliceLogResponse {
 pub struct SliceSpanResponse {
     /// Decoded spans, each carrying its full per-segment merged view.
     pub spans: Vec<SpanRow>,
-    /// The worker's per-slice cost accounting.
+    /// The worker's per-slice cost accounting, pooled across every phase.
     pub accounting: QueryAccountingSnapshot,
+    /// Per-phase split of [`accounting`](Self::accounting); see
+    /// [`SliceResponse::phase_accounting`] for the exact meaning and the `None`
+    /// degradation.
+    pub phase_accounting: Option<PhaseAccountingSnapshot>,
     /// The worker's per-slice `FetchStats` page counters.
     pub stats: FetchStats,
     /// Spans the worker reported returning (carried in the summary's
@@ -167,6 +194,9 @@ impl SliceSpanResponse {
         SliceSpanResponse {
             spans: Vec::new(),
             accounting: QueryAccountingSnapshot::default(),
+            // A synthetic response, not a worker's: no request was issued at
+            // all, so there is no phase to attribute and no split to report.
+            phase_accounting: None,
             stats: FetchStats::default(),
             spans_returned: 0,
             status: pb::status::Code::Unsupported,
@@ -352,11 +382,22 @@ pub fn decode_slice_frames(frames: Vec<pb::FetchResponse>) -> Result<SliceRespon
         .accounting
         .map(codec::decode_accounting)
         .unwrap_or_default();
+    // Absent on a worker that predates the summary's per-phase field: `None`
+    // reaches the coordinator's fold, which then charges the pooled total to
+    // one phase exactly as it did before the field existed (issue #959). A
+    // present-but-malformed split (an unknown or repeated phase) is a typed
+    // codec error, never silently reinterpreted as absent: that would hide a
+    // real disagreement about which phase paid what behind a plausible number.
+    let phase_accounting = summary
+        .phase_accounting
+        .map(codec::decode_phase_accounting)
+        .transpose()?;
     Ok(SliceResponse {
         scalar,
         histogram,
         partials,
         accounting,
+        phase_accounting,
         stats: FetchStats {
             raw_f64_pages: summary.raw_f64_pages,
             raw_f64_bytes: summary.raw_f64_bytes,
@@ -417,9 +458,20 @@ pub fn decode_log_slice_frames(
         .accounting
         .map(codec::decode_accounting)
         .unwrap_or_default();
+    // Absent on a worker that predates the summary's per-phase field: `None`
+    // reaches the coordinator's fold, which then charges the pooled total to
+    // one phase exactly as it did before the field existed (issue #959). A
+    // present-but-malformed split (an unknown or repeated phase) is a typed
+    // codec error, never silently reinterpreted as absent: that would hide a
+    // real disagreement about which phase paid what behind a plausible number.
+    let phase_accounting = summary
+        .phase_accounting
+        .map(codec::decode_phase_accounting)
+        .transpose()?;
     Ok(SliceLogResponse {
         records,
         accounting,
+        phase_accounting,
         stats: FetchStats {
             raw_f64_pages: summary.raw_f64_pages,
             raw_f64_bytes: summary.raw_f64_bytes,
@@ -479,9 +531,20 @@ pub fn decode_span_slice_frames(
         .accounting
         .map(codec::decode_accounting)
         .unwrap_or_default();
+    // Absent on a worker that predates the summary's per-phase field: `None`
+    // reaches the coordinator's fold, which then charges the pooled total to
+    // one phase exactly as it did before the field existed (issue #959). A
+    // present-but-malformed split (an unknown or repeated phase) is a typed
+    // codec error, never silently reinterpreted as absent: that would hide a
+    // real disagreement about which phase paid what behind a plausible number.
+    let phase_accounting = summary
+        .phase_accounting
+        .map(codec::decode_phase_accounting)
+        .transpose()?;
     Ok(SliceSpanResponse {
         spans,
         accounting,
+        phase_accounting,
         stats: FetchStats {
             raw_f64_pages: summary.raw_f64_pages,
             raw_f64_bytes: summary.raw_f64_bytes,
@@ -500,6 +563,7 @@ mod tests {
 
     use super::*;
     use crate::distrib::codec::{self, CodecError};
+    use crate::phase_accounting::{PhaseAccounting, QueryPhase};
 
     fn label_set() -> LabelSet {
         LabelSet::new(vec![Label {
@@ -532,13 +596,17 @@ mod tests {
 
     /// A well-formed terminal summary carrying `code`, real accounting, and the
     /// given counts.
+    ///
+    /// The accounting is what a current worker sends: the per-phase split (1
+    /// probe GET of 29 bytes, 2 scan GETs of 70 bytes) plus the pooled total
+    /// that split sums to (3 GETs, 99 bytes) in the legacy field. The two agree
+    /// by construction, as they do on the worker (`service::summary_frame`
+    /// derives the pooled field from the split).
     fn summary_frame(code: pb::status::Code) -> pb::FetchResponse {
-        let mut snap = QueryAccountingSnapshot::default();
-        snap.s3_requests[AccountedOp::Get.index()] = 3;
-        snap.s3_bytes[AccountedOp::Get.index()] = 99;
+        let phase = phase_split();
         pb::FetchResponse {
             frame: Some(pb::fetch_response::Frame::Summary(pb::Summary {
-                accounting: Some(codec::encode_accounting(&snap)),
+                accounting: Some(codec::encode_accounting(&phase.pooled())),
                 series_returned: 1,
                 samples_returned: 3,
                 status: Some(pb::Status {
@@ -547,8 +615,22 @@ mod tests {
                 }),
                 raw_f64_pages: 5,
                 raw_f64_bytes: 40,
+                phase_accounting: Some(codec::encode_phase_accounting(&phase)),
             })),
         }
+    }
+
+    /// The per-phase split [`summary_frame`] carries: 1 probe GET of 29 bytes
+    /// and 2 scan GETs of 70 bytes, pooling to the 3 GETs / 99 bytes every
+    /// pre-existing assertion in this module reads off the legacy field.
+    fn phase_split() -> PhaseAccountingSnapshot {
+        let phases = PhaseAccounting::new();
+        phases.probe().record_s3_request(AccountedOp::Get);
+        phases.probe().add_s3_bytes(AccountedOp::Get, 29);
+        phases.scan().record_s3_request(AccountedOp::Get);
+        phases.scan().record_s3_request(AccountedOp::Get);
+        phases.scan().add_s3_bytes(AccountedOp::Get, 70);
+        phases.snapshot()
     }
 
     /// The happy path: a series frame plus one terminal summary decodes to a
@@ -707,6 +789,7 @@ mod tests {
                 status: None,
                 raw_f64_pages: 0,
                 raw_f64_bytes: 0,
+                phase_accounting: None,
             })),
         };
         assert!(matches!(
@@ -730,6 +813,7 @@ mod tests {
                 }),
                 raw_f64_pages: 0,
                 raw_f64_bytes: 0,
+                phase_accounting: None,
             })),
         };
         assert!(matches!(
@@ -822,6 +906,7 @@ mod tests {
                 status: None,
                 raw_f64_pages: 0,
                 raw_f64_bytes: 0,
+                phase_accounting: None,
             })),
         };
         assert!(matches!(
@@ -845,6 +930,7 @@ mod tests {
                 }),
                 raw_f64_pages: 0,
                 raw_f64_bytes: 0,
+                phase_accounting: None,
             })),
         };
         assert!(matches!(
@@ -985,5 +1071,303 @@ mod tests {
             decode_span_slice_frames(vec![partial_frame(), summary_frame(pb::status::Code::Ok)]),
             Err(DistribError::FrameSignalUnsupported("partial-aggregate"))
         ));
+    }
+
+    // --- version skew across the per-phase field (issue #959) ---------------
+    //
+    // The per-phase split is an additive protobuf field (`Summary.phase_accounting`,
+    // number 7) and carries NO `PROTOCOL_VERSION` bump, so both skew directions
+    // must interoperate rather than fall back. The two tests below pin each
+    // direction at the wire level, encoding with prost and decoding with the
+    // other side's message shape.
+
+    /// The `Summary` shape a build predating field 7 compiles: fields 1..6 only,
+    /// at the same numbers. Decoding new bytes with this proves an old
+    /// coordinator ignores the additive field (proto3 unknown-field rule) and
+    /// still reads the pooled total; encoding with it produces exactly the bytes
+    /// an old worker sends.
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct LegacySummary {
+        #[prost(message, optional, tag = "1")]
+        accounting: Option<pb::QueryAccountingSnapshot>,
+        #[prost(uint64, tag = "2")]
+        series_returned: u64,
+        #[prost(uint64, tag = "3")]
+        samples_returned: u64,
+        #[prost(message, optional, tag = "4")]
+        status: Option<pb::Status>,
+        #[prost(uint64, tag = "5")]
+        raw_f64_pages: u64,
+        #[prost(uint64, tag = "6")]
+        raw_f64_bytes: u64,
+    }
+
+    /// NEW worker -> OLD coordinator. A current worker's summary, decoded by a
+    /// build that has no `phase_accounting` field, decodes cleanly and reports
+    /// the pooled total: 3 GETs and 99 bytes, the field-wise sum of the split
+    /// the worker also sent. Exactly today's behavior, never a decode failure
+    /// and never a lost slice cost.
+    ///
+    /// This is what makes the additive field safe without a PROTOCOL_VERSION
+    /// bump. It fails if the worker ever stops writing field 1 (or writes
+    /// something other than the split's `pooled()` into it): the old
+    /// coordinator's only cost figure would then be zero or wrong.
+    #[test]
+    fn new_worker_summary_read_by_an_old_coordinator_reports_the_pooled_total() {
+        use prost::Message;
+
+        let Some(pb::fetch_response::Frame::Summary(new_summary)) =
+            summary_frame(pb::status::Code::Ok).frame
+        else {
+            panic!("summary_frame builds a summary frame");
+        };
+        assert!(
+            new_summary.phase_accounting.is_some(),
+            "the fixture must be a NEW worker's summary, or this proves nothing"
+        );
+
+        let bytes = new_summary.encode_to_vec();
+        let old = LegacySummary::decode(bytes.as_slice())
+            .expect("an old coordinator decodes a new worker's summary");
+
+        let accounting = codec::decode_accounting(old.accounting.expect("pooled accounting"));
+        assert_eq!(accounting.s3_requests(AccountedOp::Get), 3);
+        assert_eq!(accounting.s3_bytes(AccountedOp::Get), 99);
+        // The pooled field is the split's own sum, so the old coordinator's
+        // total is the new coordinator's total.
+        let pooled = phase_split().pooled();
+        assert_eq!(accounting, pooled);
+        // Every other field an old coordinator reads is untouched.
+        assert_eq!(old.series_returned, 1);
+        assert_eq!(old.samples_returned, 3);
+        assert_eq!(old.raw_f64_pages, 5);
+        assert_eq!(old.raw_f64_bytes, 40);
+        assert_eq!(
+            old.status.expect("status").code,
+            pb::status::Code::Ok as i32
+        );
+    }
+
+    /// OLD worker -> NEW coordinator. An old worker's summary bytes (no field
+    /// 7 on the wire at all) decode into the current `Summary` with
+    /// `phase_accounting: None`, and `decode_slice_frames` carries that `None`
+    /// through to the `SliceResponse` while the pooled `accounting` is intact.
+    ///
+    /// `None` is the coordinator's signal to charge the pooled total to its scan
+    /// phase, which is what every coordinator did before the split existed; the
+    /// coordinator-side half of this degradation is pinned by
+    /// `worker_reporting_no_phase_split_is_charged_to_scan` in `distrib::tests`.
+    /// It fails if a decoder ever fabricates a split for an old worker (say by
+    /// defaulting the field to a zero split instead of `None`): a fabricated
+    /// zero split would silently drop the slice's whole cost.
+    #[test]
+    fn old_worker_summary_read_by_a_new_coordinator_carries_no_split() {
+        use prost::Message;
+
+        let mut pooled = QueryAccountingSnapshot::default();
+        pooled.s3_requests[AccountedOp::Get.index()] = 3;
+        pooled.s3_bytes[AccountedOp::Get.index()] = 99;
+        let old = LegacySummary {
+            accounting: Some(codec::encode_accounting(&pooled)),
+            series_returned: 1,
+            samples_returned: 3,
+            status: Some(pb::Status {
+                code: pb::status::Code::Ok as i32,
+                message: String::new(),
+            }),
+            raw_f64_pages: 5,
+            raw_f64_bytes: 40,
+        };
+
+        let bytes = old.encode_to_vec();
+        let new = pb::Summary::decode(bytes.as_slice())
+            .expect("a new coordinator decodes an old worker's summary");
+        assert!(
+            new.phase_accounting.is_none(),
+            "an old worker sends no split, so the field must stay absent"
+        );
+
+        let response = decode_slice_frames(vec![pb::FetchResponse {
+            frame: Some(pb::fetch_response::Frame::Summary(new)),
+        }])
+        .expect("an old worker's summary decodes");
+        assert_eq!(response.phase_accounting, None);
+        assert_eq!(response.accounting, pooled);
+        assert_eq!(response.stats.raw_f64_pages, 5);
+        assert_eq!(response.status, pb::status::Code::Ok);
+    }
+
+    /// A current worker's split reaches the coordinator per phase, on all three
+    /// signals' decoders: the `SliceResponse` carries the four phase snapshots
+    /// the worker sent (1 probe GET, 2 scan GETs, nothing on resolve or plan),
+    /// and the pooled field is their sum, not a second cost.
+    ///
+    /// It fails if a decoder drops the field (`phase_accounting: None`) or maps
+    /// it onto the wrong phase: the probe/scan assertions are asymmetric, so a
+    /// swapped pair is visible.
+    #[test]
+    fn phase_split_survives_the_wire_on_every_signal_decoder() {
+        let split = phase_split();
+        let expect = |got: Option<PhaseAccountingSnapshot>, pooled: QueryAccountingSnapshot| {
+            let got = got.expect("the worker sent a split");
+            assert_eq!(got, split);
+            assert_eq!(
+                got.phase(QueryPhase::Resolve).s3_requests(AccountedOp::Get),
+                0
+            );
+            assert_eq!(got.phase(QueryPhase::Plan).s3_requests(AccountedOp::Get), 0);
+            assert_eq!(
+                got.phase(QueryPhase::Probe).s3_requests(AccountedOp::Get),
+                1
+            );
+            assert_eq!(got.phase(QueryPhase::Probe).s3_bytes(AccountedOp::Get), 29);
+            assert_eq!(got.phase(QueryPhase::Scan).s3_requests(AccountedOp::Get), 2);
+            assert_eq!(got.phase(QueryPhase::Scan).s3_bytes(AccountedOp::Get), 70);
+            assert_eq!(got.pooled(), pooled, "the split sums to the pooled field");
+        };
+
+        let metrics = decode_slice_frames(vec![summary_frame(pb::status::Code::Ok)])
+            .expect("metrics summary decodes");
+        expect(metrics.phase_accounting, metrics.accounting);
+
+        let logs = decode_log_slice_frames(vec![summary_frame(pb::status::Code::Ok)])
+            .expect("log summary decodes");
+        expect(logs.phase_accounting, logs.accounting);
+
+        let spans = decode_span_slice_frames(vec![summary_frame(pb::status::Code::Ok)])
+            .expect("span summary decodes");
+        expect(spans.phase_accounting, spans.accounting);
+    }
+
+    /// A summary whose split this build cannot attribute is a typed error on the
+    /// production decode path, never a silently reinterpreted or partially
+    /// applied cost. Three malformations, each with its own variant:
+    ///
+    /// - a phase discriminant this build does not model (a future fifth phase,
+    ///   or the never-sent `UNSPECIFIED` zero): the cost belongs to a phase this
+    ///   coordinator cannot name;
+    /// - the same phase twice: two costs for one phase cannot be merged into
+    ///   one, and summing them would report a figure the worker never sent;
+    /// - an entry with no accounting submessage, distinct from an omitted entry.
+    ///
+    /// It fails if a decoder ever swallows a malformed split (mapping it to
+    /// `None`, or skipping the bad entry): the slice's cost would then be
+    /// misattributed or dropped behind a response that looks well-formed.
+    #[test]
+    fn a_split_this_build_cannot_attribute_is_a_typed_error() {
+        let with_phases = |phases: Vec<pb::PhaseCost>| {
+            let mut pooled = QueryAccountingSnapshot::default();
+            pooled.s3_requests[AccountedOp::Get.index()] = 1;
+            vec![pb::FetchResponse {
+                frame: Some(pb::fetch_response::Frame::Summary(pb::Summary {
+                    accounting: Some(codec::encode_accounting(&pooled)),
+                    series_returned: 0,
+                    samples_returned: 0,
+                    status: Some(pb::Status {
+                        code: pb::status::Code::Ok as i32,
+                        message: String::new(),
+                    }),
+                    raw_f64_pages: 0,
+                    raw_f64_bytes: 0,
+                    phase_accounting: Some(pb::PhaseAccountingSnapshot { phases }),
+                })),
+            }]
+        };
+        let scan = |accounting: Option<pb::QueryAccountingSnapshot>| pb::PhaseCost {
+            phase: pb::QueryPhase::Scan as i32,
+            accounting,
+        };
+        let zero = || Some(codec::encode_accounting(&QueryAccountingSnapshot::default()));
+
+        // An unmodelled discriminant, and proto3's never-sent zero.
+        for bad in [99, pb::QueryPhase::Unspecified as i32] {
+            let frames = with_phases(vec![pb::PhaseCost {
+                phase: bad,
+                accounting: zero(),
+            }]);
+            assert!(
+                matches!(
+                    decode_slice_frames(frames),
+                    Err(DistribError::Codec(CodecError::UnknownQueryPhase(got))) if got == bad
+                ),
+                "phase discriminant {bad} must be a typed error"
+            );
+        }
+
+        // The same phase twice.
+        assert!(matches!(
+            decode_slice_frames(with_phases(vec![scan(zero()), scan(zero())])),
+            Err(DistribError::Codec(CodecError::DuplicateQueryPhase("scan")))
+        ));
+
+        // An entry that names a phase but carries no counters.
+        assert!(matches!(
+            decode_slice_frames(with_phases(vec![scan(None)])),
+            Err(DistribError::Codec(CodecError::MissingPhaseAccounting(
+                "scan"
+            )))
+        ));
+
+        // The log and span decoders reject the same malformations: they share
+        // the one decode implementation, so a divergence here would mean one
+        // signal's slice cost is trusted where another's is not.
+        assert!(matches!(
+            decode_log_slice_frames(with_phases(vec![scan(zero()), scan(zero())])),
+            Err(DistribError::Codec(CodecError::DuplicateQueryPhase("scan")))
+        ));
+        assert!(matches!(
+            decode_span_slice_frames(with_phases(vec![scan(zero()), scan(zero())])),
+            Err(DistribError::Codec(CodecError::DuplicateQueryPhase("scan")))
+        ));
+    }
+
+    /// A phase a worker simply omitted decodes as that phase's zero counters,
+    /// not as a missing split: a worker that issued no request in a phase has
+    /// nothing to report for it, and the remaining phases must still be charged.
+    /// A `Some(..)` with an EMPTY list stays distinct from `None`, which is the
+    /// version-skew signal (`phase_accounting` absent entirely).
+    #[test]
+    fn an_omitted_phase_decodes_as_zero_and_an_empty_split_is_not_absent() {
+        let mut pooled = QueryAccountingSnapshot::default();
+        pooled.s3_requests[AccountedOp::Get.index()] = 4;
+        let build = |phases: Vec<pb::PhaseCost>| {
+            vec![pb::FetchResponse {
+                frame: Some(pb::fetch_response::Frame::Summary(pb::Summary {
+                    accounting: Some(codec::encode_accounting(&pooled)),
+                    series_returned: 0,
+                    samples_returned: 0,
+                    status: Some(pb::Status {
+                        code: pb::status::Code::Ok as i32,
+                        message: String::new(),
+                    }),
+                    raw_f64_pages: 0,
+                    raw_f64_bytes: 0,
+                    phase_accounting: Some(pb::PhaseAccountingSnapshot { phases }),
+                })),
+            }]
+        };
+
+        // Only `probe` reported: the other three decode as zero.
+        let mut probe_only = QueryAccountingSnapshot::default();
+        probe_only.s3_requests[AccountedOp::Get.index()] = 4;
+        let response = decode_slice_frames(build(vec![pb::PhaseCost {
+            phase: pb::QueryPhase::Probe as i32,
+            accounting: Some(codec::encode_accounting(&probe_only)),
+        }]))
+        .expect("a partial split decodes");
+        let split = response.phase_accounting.expect("a split was reported");
+        assert_eq!(split.probe.s3_requests(AccountedOp::Get), 4);
+        assert_eq!(split.resolve, QueryAccountingSnapshot::default());
+        assert_eq!(split.plan, QueryAccountingSnapshot::default());
+        assert_eq!(split.scan, QueryAccountingSnapshot::default());
+
+        // An empty list is a reported split of nothing, NOT the absent field.
+        let empty = decode_slice_frames(build(Vec::new())).expect("an empty split decodes");
+        assert_eq!(
+            empty.phase_accounting,
+            Some(PhaseAccountingSnapshot::default()),
+            "an empty list must stay distinct from the absent field, which means \
+             the worker reported no split at all"
+        );
     }
 }
