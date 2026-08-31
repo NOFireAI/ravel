@@ -24,7 +24,7 @@ use ravel_object_store::s3::{MULTIPART_THRESHOLD, S3Config, S3Store};
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, InstrumentedStore, ListPage,
     MULTIPART_MIN_PART_SIZE, ObjectMeta, ObjectStoreBackend, PageToken, PutMode, PutOptions,
-    PutOutcome, StoreError, UploadChecksum, list_all,
+    PutOutcome, StoreError, StoreMetrics, UploadChecksum, list_all,
 };
 use std::sync::Arc;
 
@@ -1095,7 +1095,11 @@ async fn fault_store_empty_plan_contract() {
 /// tenant has opted into per-tenant SSE-KMS.
 #[tokio::test]
 async fn kms_routing_store_contract_with_no_configured_tenants() {
-    let store = KmsRoutingStore::new(Arc::new(MemoryStore::new()), test_s3_config());
+    let store = KmsRoutingStore::new(
+        Arc::new(MemoryStore::new()),
+        test_s3_config(),
+        Arc::new(StoreMetrics::default()),
+    );
     run_contract_suite(&store, "kms-routing-unconfigured").await;
 }
 

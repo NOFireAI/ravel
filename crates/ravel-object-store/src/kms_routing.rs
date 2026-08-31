@@ -53,7 +53,7 @@ use parking_lot::Mutex;
 use crate::s3::{S3Config, S3Store};
 use crate::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, MultipartUpload, ObjectMeta,
-    ObjectStoreBackend, PageToken, PutOptions, PutOutcome, StoreError,
+    ObjectStoreBackend, PageToken, PutOptions, PutOutcome, StoreError, StoreMetrics,
 };
 
 /// Builds a per-tenant backend from a fully-configured [`S3Config`] (the
@@ -61,7 +61,9 @@ use crate::{
 /// inject a fake that records the config it was built with instead of a real
 /// [`S3Store`], which has no live endpoint under test. The default
 /// implementation (see [`KmsRoutingStore::new`]) builds an [`S3Store`] the same
-/// way the default store was built.
+/// way the default store was built, against the SAME [`StoreMetrics`] handle so
+/// its billed HTTP requests land in the one snapshot the whole chain shares
+/// (issue #928).
 type TenantStoreBuilder =
     Box<dyn Fn(&S3Config) -> Result<Box<dyn ObjectStoreBackend>, StoreError> + Send + Sync>;
 
@@ -140,13 +142,29 @@ pub fn routes_through_tenant_key(key: &str) -> bool {
 impl KmsRoutingStore {
     /// Wrap `default` (the deployment-default store) and build per-tenant stores
     /// by cloning `default_config`, overriding only `kms_key_id`, and calling
-    /// [`S3Store::new`] --- the same construction path the default store used.
-    pub fn new(default: Arc<dyn ObjectStoreBackend>, default_config: S3Config) -> Self {
+    /// [`S3Store::with_metrics`] against `metrics` --- the same construction path
+    /// the default store used, against the same metrics handle.
+    ///
+    /// `metrics` must be the very handle the base [`S3Store`] and the outer
+    /// [`InstrumentedStore`](crate::InstrumentedStore) already share, so every store the decorator counts a
+    /// `calls` on also records its billed HTTP requests (`attempts`) into that
+    /// one block. Using [`S3Store::new`] here (no metrics handle) would count a
+    /// routed write's `calls` while dropping its `attempts` on the floor, making
+    /// `ravel_store_attempts_total` under-report to zero for per-tenant traffic
+    /// (issue #928).
+    pub fn new(
+        default: Arc<dyn ObjectStoreBackend>,
+        default_config: S3Config,
+        metrics: Arc<StoreMetrics>,
+    ) -> Self {
         Self::with_builder(
             default,
             default_config,
-            Box::new(|config: &S3Config| {
-                Ok(Box::new(S3Store::new(config.clone())?) as Box<dyn ObjectStoreBackend>)
+            Box::new(move |config: &S3Config| {
+                Ok(
+                    Box::new(S3Store::with_metrics(config.clone(), Arc::clone(&metrics))?)
+                        as Box<dyn ObjectStoreBackend>,
+                )
             }),
         )
     }

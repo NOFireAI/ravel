@@ -408,9 +408,15 @@ pub fn build_store(cli: &Cli) -> anyhow::Result<BuiltStore> {
             // decision 2): off by default. Without --tenant-kms-config this builds exactly
             // today's store, byte-for-byte, no KmsRoutingStore in the chain.
             if cli.tenant_kms_config.is_some() {
+                // Thread the SAME metrics handle into the per-tenant store
+                // factory: each KMS-routed S3Store records its billed HTTP
+                // requests (attempts) into the one block the base store and the
+                // InstrumentedStore below already share, so a routed write's
+                // attempts are counted, not dropped (issue #928).
                 let kms = Arc::new(KmsRoutingStore::new(
                     Arc::new(store) as Arc<dyn ObjectStoreBackend>,
                     config,
+                    Arc::clone(&metrics),
                 ));
                 let instrumented = InstrumentedStore::with_metrics(
                     SharedKmsStore(kms.clone()),
@@ -826,6 +832,177 @@ mod tests {
         );
     }
 
+    /// A path-style mock S3, a `--tenant-kms-config` build, and one registered
+    /// tenant key, so a `t/<hash>/...` write routes to a per-tenant KMS store.
+    /// Returns the parsed CLI, the built store bundle, and the mock so a test
+    /// can drive a routed (or unrouted) write and read both the metrics handle
+    /// and the requests the endpoint served.
+    async fn kms_routed_build(
+        tenant_hash: &str,
+    ) -> (Arc<dyn ObjectStoreBackend>, Arc<StoreMetrics>, Arc<MockS3>) {
+        use clap::Parser;
+        use std::io::Write;
+
+        let (s3_endpoint, mock) = spawn_mock_s3().await;
+
+        let mut file = tempfile::NamedTempFile::new().expect("create temp tenant-kms-config file");
+        file.write_all(
+            br#"
+                [tenants]
+                acme = "arn:aws:kms:us-east-1:111122223333:key/acme"
+            "#,
+        )
+        .expect("write temp file");
+
+        let cli = Cli::try_parse_from([
+            "ravel-server",
+            "--store",
+            "s3",
+            "--s3-bucket",
+            "ravel-test",
+            "--s3-endpoint",
+            &s3_endpoint,
+            "--s3-access-key",
+            "test",
+            "--s3-secret-key",
+            "test",
+            "--tenant-kms-config",
+            file.path().to_str().expect("temp path is valid utf-8"),
+        ])
+        .expect("flags parse");
+
+        let BuiltStore {
+            foreground: store,
+            metrics,
+            kms,
+            ..
+        } = build_store(&cli).expect("dummy S3 config must build without network access");
+        let kms = kms.expect("--tenant-kms-config must yield a KmsRoutingStore handle");
+
+        // `build_store` leaves the tenant-key map empty (main.rs installs it
+        // later, once the tenant-hash scheme is up), so register one here. The
+        // hash text is arbitrary: routing keys on the exact `t/<hash>/` segment.
+        kms.set_tenant_key(
+            tenant_hash.to_string(),
+            "arn:aws:kms:us-east-1:111122223333:key/acme".to_string(),
+        );
+
+        (store, metrics, mock)
+    }
+
+    /// A KMS-routed write's billed HTTP requests are counted into the SAME
+    /// metrics handle the base store and the outer `InstrumentedStore` share
+    /// (issue #928). Before the fix, `KmsRoutingStore` built its per-tenant
+    /// stores with `S3Store::new` (no metrics handle), so a routed write's
+    /// `attempts` were dropped on the floor while its `calls` were still
+    /// counted, making `ravel_store_attempts_total` under-report to zero for
+    /// exactly the per-tenant traffic.
+    ///
+    /// The count is pinned EXACTLY to what the mock endpoint served, not `> 0`:
+    /// a fraction of the truth passes a `> 0` assertion, which is the very
+    /// failure being fixed. Reverting the per-tenant factory in
+    /// `KmsRoutingStore::new` from `S3Store::with_metrics` back to
+    /// `S3Store::new` turns this red: the routed put's store then records no
+    /// attempt, so `put.attempts` reads 0 while the mock still served a PUT.
+    #[tokio::test]
+    async fn kms_routed_write_counts_attempts_into_shared_metrics() {
+        use std::sync::atomic::Ordering;
+
+        let tenant_hash = "00112233445566778899aabbccddeeff";
+        let (store, metrics, mock) = kms_routed_build(tenant_hash).await;
+
+        assert_eq!(
+            metrics.snapshot().put.attempts,
+            0,
+            "precondition: no attempt recorded before any write"
+        );
+
+        let key = format!("t/{tenant_hash}/seg/0001");
+        store
+            .put(&key, Bytes::from_static(b"payload"), PutOptions::default())
+            .await
+            .expect("routed put through the per-tenant KMS store");
+
+        // Ground truth: the number of PUTs that reached the wire.
+        let served = mock.put_count.load(Ordering::SeqCst) as u64;
+        assert!(
+            served >= 1,
+            "the mock must have served the routed PUT (proves the per-tenant path ran)"
+        );
+        assert!(
+            mock.objects
+                .lock()
+                .expect("objects lock")
+                .contains_key(&key),
+            "the routed object must have landed under its tenant key"
+        );
+
+        let snap = metrics.snapshot();
+        assert_eq!(
+            snap.put.attempts, served,
+            "every billed HTTP request the per-tenant store issued is counted into the shared \
+             handle, exactly as many as the mock saw"
+        );
+        assert_eq!(
+            snap.put.calls, 1,
+            "the outer decorator counts exactly one logical put call"
+        );
+    }
+
+    /// The relation the `ravel_store_attempts_total` help text claims ---
+    /// `attempts >= calls` when every store in the chain shares the metrics
+    /// handle --- pinned across BOTH branches of `KmsRoutingStore`: an unrouted
+    /// write handled by the base store, and a routed write handled by a
+    /// per-tenant store. One snapshot covers the whole chain, so `put.attempts`
+    /// sees both stores' billed requests. Reverting the per-tenant factory to
+    /// `S3Store::new` turns this red: the routed write then records no attempt,
+    /// so `attempts` (1) falls below `calls` (2), the exact regression the help
+    /// text would otherwise only describe.
+    #[tokio::test]
+    async fn attempts_stay_at_or_above_calls_across_the_kms_chain() {
+        use std::sync::atomic::Ordering;
+
+        let tenant_hash = "ffeeddccbbaa99887766554433221100";
+        let (store, metrics, mock) = kms_routed_build(tenant_hash).await;
+
+        // Unrouted: `sys/` is never tenant-scoped, so this goes to the base
+        // store. Routed: `t/<hash>/` routes to the per-tenant store.
+        store
+            .put("sys/base", Bytes::from_static(b"a"), PutOptions::default())
+            .await
+            .expect("unrouted put through the base store");
+        store
+            .put(
+                &format!("t/{tenant_hash}/seg/0001"),
+                Bytes::from_static(b"b"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("routed put through the per-tenant store");
+
+        let served = mock.put_count.load(Ordering::SeqCst) as u64;
+        assert_eq!(
+            served, 2,
+            "both writes must reach the wire (base and per-tenant)"
+        );
+
+        let snap = metrics.snapshot();
+        assert_eq!(
+            snap.put.calls, 2,
+            "two logical put calls were counted by the outer decorator"
+        );
+        assert_eq!(
+            snap.put.attempts, served,
+            "both stores record their billed requests into the one shared handle"
+        );
+        assert!(
+            snap.put.attempts >= snap.put.calls,
+            "attempts ({}) must stay >= calls ({}) once every store shares the handle",
+            snap.put.attempts,
+            snap.put.calls,
+        );
+    }
+
     /// `build_store`'s error text, panicking with `context` if it succeeded.
     /// `BuiltStore` is not `Debug`, so `expect_err` is unavailable.
     fn build_store_error(cli: &Cli, context: &str) -> String {
@@ -874,6 +1051,10 @@ mod tests {
     struct MockS3 {
         objects: std::sync::Mutex<std::collections::HashMap<String, Bytes>>,
         signed_with: std::sync::Mutex<Option<(String, String)>>,
+        /// Count of PUT requests the endpoint actually served, so a test can
+        /// pin `attempts` to the exact number of billed requests on the wire
+        /// rather than to `> 0` (issue #928).
+        put_count: std::sync::atomic::AtomicUsize,
     }
 
     async fn spawn_mock_s3() -> (String, Arc<MockS3>) {
@@ -900,6 +1081,9 @@ mod tests {
                 header_text("authorization"),
                 header_text("x-amz-security-token"),
             ));
+            state
+                .put_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             state
                 .objects
                 .lock()
