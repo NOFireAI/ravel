@@ -132,6 +132,11 @@ pub const MULTIPART_PART_SIZE: usize = 8 * 1024 * 1024;
 /// would leave large L1/L2 compaction outputs on the single-PUT path, whose
 /// failure mode is re-sending the entire object.
 pub const MULTIPART_THRESHOLD: usize = 2 * MULTIPART_PART_SIZE;
+/// S3's single-request PUT ceiling. With upload integrity enabled, `put`
+/// stays on the single-PUT path (server-verified checksum, one billed
+/// request) up to this size and refuses above it rather than silently
+/// taking the unverified multipart path.
+pub const SINGLE_PUT_MAX_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
 // The chunking constants satisfy S3's part rules by construction, checked at
 // compile time rather than by a test: non-final parts at or above the 5 MiB
@@ -1528,8 +1533,24 @@ impl ObjectStoreBackend for S3Store {
             // the single-PUT path at every size (S3's 5 GiB single-request limit
             // is the ceiling there). See docs/object-store-contract.md,
             // "Multipart upload".
-            if matches!(opts.mode, PutMode::Overwrite) && data.len() > MULTIPART_THRESHOLD {
+            if matches!(opts.mode, PutMode::Overwrite)
+                && data.len() > MULTIPART_THRESHOLD
+                && !self.upload_integrity.is_enabled()
+            {
                 return self.put_via_multipart(key, data).await;
+            }
+            // With upload integrity enabled the multipart path is excluded:
+            // its parts carry no server-verified checksum, and advertising
+            // `upload_checksum` while a large overwrite bypasses verification
+            // would be a lie. The single-PUT path covers every size up to
+            // S3's 5 GiB per-request ceiling -- which also costs ONE billed
+            // PUT where multipart costs parts + 2 -- and a payload above the
+            // ceiling is refused loudly rather than silently downgraded.
+            if self.upload_integrity.is_enabled() && data.len() as u64 > SINGLE_PUT_MAX_BYTES {
+                return Err(StoreError::Permanent(format!(
+                    "put of {key}: {} bytes exceeds the {SINGLE_PUT_MAX_BYTES}-byte single-PUT                      ceiling, and multipart uploads carry no server-verified checksum; disable                      upload integrity (UploadIntegrity::Off) to write objects this large",
+                    data.len(),
+                )));
             }
             let os_mode = match &opts.mode {
                 PutMode::Overwrite => OsPutMode::Overwrite,

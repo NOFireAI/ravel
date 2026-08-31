@@ -1388,6 +1388,40 @@ async fn multipart_part_failure_yields_permanent_and_no_visible_object() {
 /// above [`MULTIPART_THRESHOLD`] chunks internally, and a part refused by the
 /// endpoint must abort the upload and surface the error with no object at the
 /// key.
+/// #993 review finding: with upload integrity enabled, an Overwrite put above
+/// [`MULTIPART_THRESHOLD`] must NOT take the multipart path -- multipart parts
+/// carry no server-verified checksum, so the capability would overstate; the
+/// single-PUT path covers every size to the 5 GiB ceiling and costs one billed
+/// request where multipart costs parts + 2. The op counters are the proof.
+///
+/// Demonstrated failing against the unguarded routing (dropping the
+/// `!upload_integrity.is_enabled()` term from `put`): CreateMultipart then
+/// counts 1 and the zero assertion fails.
+#[tokio::test]
+async fn integrity_enabled_put_above_threshold_stays_single_put() {
+    let fake = FakeS3::start().await;
+    let store = fake.store_with_upload_integrity(UploadIntegrity::Crc64Nvme);
+    let payload = Bytes::from(vec![9u8; MULTIPART_THRESHOLD + 1]);
+    store
+        .put("integrity/large", payload.clone(), PutOptions::default())
+        .await
+        .expect("a large put under integrity must succeed on the single-PUT path");
+    assert_eq!(
+        fake.count(Op::CreateMultipart),
+        0,
+        "under upload integrity the multipart path must not be taken"
+    );
+    assert_eq!(
+        fake.count(Op::Put),
+        1,
+        "exactly one billed PUT request carries the whole object"
+    );
+    let got = fake
+        .object("integrity/large")
+        .expect("the object must be visible");
+    assert!(got[..] == payload[..], "byte-identical stored object");
+}
+
 #[tokio::test]
 async fn put_above_threshold_leaves_no_object_when_a_part_fails() {
     let fake = FakeS3::start().await;
