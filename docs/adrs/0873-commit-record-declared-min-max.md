@@ -232,17 +232,116 @@ are per ADR-0066 decision 1):
   shortcut that orders floats differently from the executor it replaces is a
   wrong answer, not a slow one.
 
-Enforcement is two-sided. Writers stamp only allowlisted types. Every
-decoder validates each entry against the predicate below — the structural
-clauses plus the entry's own carrier's vocabulary clause — before the
-entry can grant coverage. An entry failing **any** applicable clause is dropped
-whole — no field of it is used, including the fields that pass on their
-own: a plausible min next to an impossible null count is evidence the
-writer that produced the entry was broken, not a value to salvage. The
-dropped column is simply uncovered for that segment (the safety rule of
-decision 4), the drop is counted on a defect metric labelled by carrier,
-and the carrying object itself still decodes; an invalid entry is never a
-decode failure and never trusted partially.
+Enforcement is two-sided. Writers stamp only allowlisted types. On the
+read side the predicate has exactly one binding point, and it is not the
+decode boundary: an entry must have passed the predicate — the
+structural clauses plus its own carrier's vocabulary clause — **at the
+point where it grants coverage** under decision 4. Decoding an object is
+one place the checks can run; it is not where the guarantee lives (the
+"Where the predicate binds" section below, added after implementation
+evidence, states why). An entry failing **any** applicable clause is
+dropped whole — no field of it is used, including the fields that pass
+on their own: a plausible min next to an impossible null count is
+evidence the writer that produced the entry was broken, not a value to
+salvage. The dropped column is simply uncovered for that segment (the
+safety rule of decision 4), and the drop is counted on a defect metric
+labelled by carrier.
+
+**Failure granularity is per-carrier, and the difference is
+deliberate.** An earlier revision stated one granularity rule for both
+carriers: "the carrying object itself still decodes; an invalid entry is
+never a decode failure". That is the law for the stamp and it is wrong
+for `.cstat`, whose shipped decoder does the opposite:
+`decode_column_stats`
+(`crates/ravel-catalog/src/snapshot_format/column_stats.rs`) refuses the
+whole object when `validate_segments` rejects any entry, so one
+malformed record uncovers every column of every segment the object
+describes. Both behaviours are fail-closed — the failure mode is a scan,
+never a wrong answer — so the choice between them is a blast-radius and
+evidence question, and the answer differs per carrier because the
+carriers differ in what else the object carries and in who wrote it:
+
+- **The stamp is entry-granular, and must be.** Its carrying objects are
+  the commit-family records and `.csnap` parts — objects resolution
+  itself needs for visibility and MVCC. Escalating an invalid statistics
+  entry to a decode failure there would convert a defect in an optional
+  shortcut into unreadable data: the segment vanishes from resolution,
+  which is an availability outage, not a slow query. So for the stamp
+  the old sentence stands verbatim: the record decodes, the entry is
+  dropped, the column is uncovered. Independently, commit records are
+  written by many flush and compaction processes over time; one broken
+  writer's entry is no evidence against entries on other records, so the
+  entry is also the correct conviction boundary.
+- **`.cstat` is object-granular at decode, and the shipped behaviour is
+  affirmed, not amended to match the stamp.** A `.cstat` object is the
+  output of one fold build, sealed under a body CRC. An invalid entry
+  inside a CRC-valid body is not corruption in flight; it is proof that
+  the single builder which produced every entry in the object was
+  broken, and there is no independent evidence that any sibling entry is
+  right. Refusing the object is refusing one build's output, which is
+  the correct conviction boundary for a single-writer derived object.
+  The blast radius — an entire tenant's sealed-history coverage — is
+  large in extent but shallow in kind: the object is derived state, a
+  forced rebuild fold (ADR-0942) regenerates it from the records,
+  queries scan in the meantime, and the refusal lands on the
+  carrier-labelled defect metric as a ticket-shaped signal. Salvaging
+  the sibling entries of a provably broken build would trade that
+  bounded, repairable coverage loss for trust in output the decoder just
+  watched fail.
+
+The split is decode-time only. The join-dependent structural clauses —
+clause 4's reconciliation against the joined `SegmentRef.sample_count`,
+clause 6 over the segment's entry set — are decidable for `.cstat` only
+at the join, after the object decoded. An entry failing there is dropped
+entry-granular, exactly like a stamp entry; it is not escalated to
+condemn the already-loaded object. Escalation at use time would buy no
+safety (both outcomes are fail-closed and both land on the same metric)
+and would make a loaded object's validity depend on which segments a
+particular query happens to touch.
+
+**Where the predicate binds: the point of use, enforced by
+construction.** The first three revisions of this amendment said "every
+decoder validates". Implementing issue #970 (PR #973) measured that
+rule's exact failure: `decode_column_stats` already rejected both of
+that issue's defect shapes via `validate_columns`, and both still
+reached the exact `MIN`/`MAX` path — because `LoadedColumnStats` has
+public fields and entries reach the read path from carriers that never
+decode an object (ravel-sql's own tests inject them through
+`LogsTableProvider::with_column_stats`). "Validate at the decode
+boundary" is therefore a rule a future carrier can satisfy to the letter
+while reintroducing the hole: the decode boundary is a property of one
+data path, and the guarantee must hold on all of them, including paths
+that have no decode step.
+
+The normative statement: the predicate binds wherever an entry is about
+to grant coverage, and an entry's provenance — decoded, cached,
+injected, copied — is irrelevant to whether it must have passed. For a
+type whose fields are public this cannot remain a prose rule, because
+the type system hands every caller a way around it and #970 is the
+measured proof that the way gets taken. This ADR therefore requires the
+validated form to be **unconstructable without validation**: a distinct
+type (a constructor-gated newtype or equivalent) whose only public
+constructor runs the full predicate, whose fields are not publicly
+writable, and which is the only type the coverage-granting surfaces
+accept — `declared_min_max_all` and its sibling readers, the decision-4
+union, `partition_statistics`. The raw decoded forms (`ColumnStat`,
+`LoadedColumnStats`, the stamp messages) may keep public fields; they
+are honest about being untrusted input. Nothing downstream of the
+predicate accepts them.
+
+The argument for requiring this rather than merely noting it: the
+alternative is the rule this repository already had — stated in this
+ADR, implemented in a shipping decoder — and it was bypassed by the
+first construction path that did not route through the decoder. A
+convention that failed while written down does not become reliable by
+being written down twice; a constructor cannot be satisfied to the
+letter and bypassed in substance. The cost is one newtype and the
+mechanical narrowing of a few signatures. The benefit is that the next
+carrier cannot be wired into coverage without the compiler asking where
+its entries were validated. Test injection survives intact: a test that
+wants valid entries constructs them through the same constructor, and a
+test that wants invalid entries asserts the constructor refuses them —
+which is the predicate test.
 
 The predicate below is named the **statistics validity predicate**. Its
 clauses split into two groups with different binding scopes, and the split
@@ -250,10 +349,13 @@ is itself normative (the grouping criterion follows the clause list, so a
 future clause is placed by argument, not by analogy):
 
 - **The structural clauses (2-6) are carrier-independent.** They bind
-  every carrier that can grant coverage under decision 4 — the stamp, at
-  each of its decoders (commit record, compaction record, snapshot
-  entry), **and** the ADR-0850/0942 `.cstat` `ColumnStat` entries, at the
-  join against the touched segments — and any carrier a future ADR adds.
+  every carrier that can grant coverage under decision 4 — the stamp and
+  the ADR-0850/0942 `.cstat` `ColumnStat` entries alike, and any carrier
+  a future ADR adds. The checks run today at the stamp's decoders
+  (commit record, compaction record, snapshot entry) and at the `.cstat`
+  join against the touched segments, but those are checkpoints, not the
+  binding point: what binds is the coverage grant itself ("Where the
+  predicate binds", above).
   The union of decision 4 is only as sound as its weakest member: for any
   segment one carrier alone covers, that carrier's validation *is* the
   guarantee, so a structural clause applied to one carrier and not
@@ -285,6 +387,15 @@ to every carrier, which would have invalidated every `STR`/`BYTES`
 extremum `.cstat` legitimately carries under ADR-0850 and silently
 degraded declared string columns from `Precision::Exact` answers to
 scans. The explicit grouping exists so neither mistake has a third form.
+A fourth revision followed implementation evidence (issue #970, PR
+#973) rather than review: it scoped the entry-granular drop rule to the
+stamp and affirmed `.cstat`'s object-granular decode refusal (the
+granularity split above), moved the predicate's binding point from the
+decode boundary to the coverage grant with the
+unconstructable-without-validation requirement, and promoted reader
+agreement from a corollary of clause 6 to its own structurally enforced
+requirement — each because the shipped tree was measured doing
+otherwise while the previous text read as satisfied.
 
 The predicate is stated over the carrier-neutral quantities `(name,
 declared_type, min, max, null_count, sample_count)`, where `sample_count`
@@ -331,9 +442,36 @@ An entry, from either carrier, is valid iff all of:
    `(name, declared_type)` in the carrier's entry set for the segment (the
    record's repeated field for a stamp, the segment's `ColumnStat` list
    for `.cstat`); duplicates are all dropped, since no rule could pick the
-   right one. A reader that keeps the last duplicate it sees — the shape
-   of the current `.cstat` join, which collects entries into a by-name map
-   — is silently picking one, which is exactly what this clause forbids.
+   right one. A reader that keeps any one duplicate is silently picking,
+   which this clause forbids — and the tree has been measured making both
+   picks at once: of the four `.cstat` readers over the same records,
+   `declared_min_max_all` kept the **last** duplicate while
+   `declared_not_equal_count`, `declared_group_counts`, and
+   `declared_column_sum` kept the **first**, so one malformed record
+   answered one query two different ways depending on which reader ran.
+
+**Reader agreement is a requirement of its own, not a corollary.**
+Clause 6 makes each reader individually correct; that is necessary and
+not sufficient. All readers of one record must resolve it identically,
+because divergence between readers is a distinct failure from any one
+reader being wrong — its signature is two answers to one question from
+one immutable input — and it is reachable even between readers that
+each satisfy some defensible rule: first-wins and last-wins are each "a"
+rule, and the pre-fix tree shipped both simultaneously (above).
+Enforcement is structural, not conventional: one shared resolution
+helper, living beside the predicate and its constructor-gated type,
+takes a carrier's raw entry set for a segment and returns the validated,
+deduplicated map, and every reader consumes that helper's output. A
+reader that iterates raw entries and applies the rules itself violates
+this decision even while its output agrees, because per-reader
+reimplementation is the mechanism by which the measured divergence
+arose. The pinning test is differential: one record set through every
+reader, asserting identical resolved views — and the duplicate case runs
+with **both orderings** of the same pair, because a resolution that
+picks one entry passes whichever single ordering places the picked entry
+where the test expects it; only the pair of orderings fails every
+pick-one implementation. Clause 6 fixes what the agreed answer is: no
+coverage at all, from every reader, under either ordering.
 
 **The grouping criterion.** A clause is **structural** iff it is decidable
 over the carrier-neutral tuple `(name, declared_type, min, max,
@@ -412,10 +550,44 @@ joined to a two-row segment — must be dropped and must not reach the
 exact `MIN`/`MAX` or `COUNT` paths. Each negative case asserts the entry
 is absent
 from the valid set, the carrier-labelled defect metric incremented by
-exactly one, the carrying object otherwise decoded intact, and
-`partition_statistics` reporting `Precision::Absent` for that column. The
+exactly one, and
+`partition_statistics` reporting `Precision::Absent` for that column;
+on the stamp lane it additionally asserts the carrying record decoded
+intact (the granularity split above — object-intact is a stamp
+property, not a shared one). The
 assertion that fails when the invariant breaks must be the entry's absence
 (and the resulting `Absent` precision), not a log line.
+
+Three further cases pin this revision's measured facts, one each:
+
+- **Granularity, stamp lane:** a commit record carrying one invalid
+  entry beside a valid one still decodes; the segment resolves, the
+  valid entry grants coverage, the invalid one is dropped (defect metric
+  plus one), and only its column reads `Precision::Absent`. The
+  assertion that fails if stamp decoding ever goes object-granular is
+  the record decoding and the sibling entry's surviving coverage.
+- **Granularity, `.cstat` lane:** an object with one invalid entry among
+  many valid ones is refused whole — `decode_column_stats` returns its
+  typed error, nothing loads, every column of every covered segment
+  reads `Absent`, and the query scans. The assertions are the typed
+  decode error and the total coverage absence, not a partial load; this
+  pins the affirmed object-granular behaviour so a future
+  salvage-the-valid-entries patch fails a test instead of silently
+  relitigating this decision.
+- **Point of use:** an entry violating a structural clause is presented
+  through a path that never decodes an object (the
+  `with_column_stats`-shaped injection ravel-sql tests already use) and
+  must not grant coverage. Under the constructor requirement the
+  injection is expressible only as an attempted construction, and the
+  assertion is that the constructor refuses; the behavioural mirror
+  asserts the plan carries no statistics literal and
+  `partition_statistics` reports `Absent` — the pre-fix signatures were
+  fabricated literals reaching the plan, `ProjectionExec:
+  expr=[... 500 as max(logs.status)]` from a duplicate pair (reversing
+  the pair yields 1; the true MIN is 200) and
+  `expr=[-1 as min(logs.status), ...]` from an all-NULL column.
+  Asserting on the decode path instead of the injection path would
+  re-prove exactly what #970 already proved insufficient.
 
 ### 3. Capture at write time
 
@@ -659,7 +831,10 @@ lets the same stock rule also answer `COUNT(col)`) with
    entry for that segment and column. The predicate's structural clauses
    bind both carriers by decision 2 (each carrier additionally enforcing
    its own vocabulary clause), and coverage is what they gate: an
-   entry from any carrier that has not passed them grants nothing. The
+   entry from any carrier that has not passed them grants nothing.
+   Passage is proven by type, not by provenance: the union consumes only
+   decision 2's constructor-gated validated form, produced by the shared
+   resolution helper, never a raw entry — whatever path delivered it. The
    two carriers are a union, per segment, per column. Any segment covered by
    neither leaves the column `Precision::Absent`, the `AggregateStatistics`
    rule silently does not fire, and the query scans — the ADR-0850 safety
@@ -940,7 +1115,11 @@ flowchart TD
   each land on their own metric. Both mean a
   writer-side or copy-side bug against immutable data, not load: a nonzero
   rate is a ticket, and the only query-visible symptom is statistics
-  shortcuts quietly not firing.
+  shortcuts quietly not firing. A `.cstat` object-granular decode
+  refusal (decision 2's granularity split) is the same class at maximal
+  extent: the per-query coverage figure drops to zero on the `.cstat`
+  carrier for every touched sealed segment at once, which is what makes
+  it visible without a slow-query hunt.
 - **Tests the implementation owes** (prove-the-test discipline): the
   erasure-rewrite recompute rule (erase the max, stamp must shrink); the
   statistics validity predicate of decision 2, one decode case per
@@ -954,7 +1133,16 @@ flowchart TD
   against a `.cstat` entry, plus the `.cstat` redundancy case
   `non_null_count + null_count != sample_count`), each asserting the drop,
   the carrier-labelled defect metric, and the resulting `Absent`
-  precision; the vocabulary cases (a `STR` stamp dropped, `F64` dropped
+  precision; the granularity pair (a stamp record with one invalid entry
+  decodes and keeps its valid entry's coverage; a `.cstat` object with
+  one invalid entry is refused whole with the typed error and total
+  coverage absence); the point-of-use case (an invalid entry injected
+  past every decoder is refused by the validated form's constructor and
+  no statistics literal reaches the plan); the reader-agreement
+  differential (one record set through all four `.cstat` readers via the
+  shared resolution helper, identical resolved views, the duplicate case
+  in **both** orderings of the pair — a pick-one resolution passes any
+  single ordering); the vocabulary cases (a `STR` stamp dropped, `F64` dropped
   on both carriers) and their positive mirror, the regression this
   amendment's third revision fixes: a valid `.cstat` `STR` (and `BYTES`)
   extremum passes, grants coverage, and yields `Precision::Exact`;
@@ -978,14 +1166,24 @@ flowchart TD
   clauses and per-carrier vocabulary, entry-granular
   null-count exactness with the fold stated in NULL units only and the
   block-statistics completeness invariant named with the code that
-  upholds it, equality-or-`Absent` union keyed by `content_hash`)
+  upholds it, equality-or-`Absent` union keyed by `content_hash`, and
+  the fourth revision's three: the per-carrier granularity split,
+  point-of-use binding through a constructor-gated validated type, and
+  reader agreement through one shared resolution helper)
   change no wire
   field, no field number, no stamp eligibility, and no migration class;
   they
   constrain decoders (both carriers' — the `.cstat` join gains the row
   accounting and duplicate checks it previously lacked, while keeping
-  its ADR-0850 `STR`/`BYTES` vocabulary), the writer fold,
-  and the union reader that decisions 2-4 already established.
+  its ADR-0850 `STR`/`BYTES` vocabulary), the read-side types
+  (`LoadedColumnStats` and the stamp's decoded forms stay raw and
+  untrusted; coverage flows only through the validated type), the
+  writer fold,
+  and the union reader that decisions 2-4 already established. The
+  `.cstat` object-granular decode refusal is existing shipped behaviour
+  affirmed, not a behaviour change; the reader-side dedup unification
+  and the constructor gate are separate implementation work tracked
+  with #970's fix, not part of this document's wire surface.
 - **Interaction with ADR-0815 (clustered compaction).** ADR-0815 already
   plans additive per-part min/max bound fields for its clustering key;
   field 12 here is per *declared column* with exactness semantics, not a
