@@ -203,8 +203,8 @@ pub struct LatencyReport {
 /// `calls <= attempts` holds per op on a backend that records attempts, and
 /// `attempts - calls` (the `*_retry_overhead` fields) is the retry (billed)
 /// overhead a call count alone hides. A non-HTTP backend ([`MemoryStore`] via
-/// `run`) records no attempts, leaving the attempt figures at zero; that is
-/// honest, not a billing measurement, and `backend_bills_requests` marks it.
+/// `run`) records no attempts, so every attempt and overhead figure is
+/// `None`: absence, never a zero standing in for unmeasured.
 ///
 /// `backend_bills_requests` states whether this backend charges for requests:
 /// `false` on `MemoryStore` (the counts are real but free), `true` on S3. This
