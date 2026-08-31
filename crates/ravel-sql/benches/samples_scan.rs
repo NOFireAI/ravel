@@ -115,6 +115,7 @@ async fn build(specs: &[SegSpec]) -> (Arc<dyn ObjectStoreBackend>, Snapshot) {
             created_unix_ns: spec.created_unix_ns,
             level: SegmentLevel::L0,
             segment_format_version: u32::from(ravel_segment::SUPPORTED_VERSIONS.newest()),
+            declared_column_stats: Default::default(),
         });
     }
     segments.sort_by_key(|s| (s.created_unix_ns, s.writer_epoch, s.writer_seq, s.shard));

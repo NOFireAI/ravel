@@ -78,6 +78,7 @@ fn seg_ref(seq: u64, sample_count: u64) -> SegmentRef {
         // other ravel-sql fixtures, rather than a literal that would be a lie
         // if anything later did read it.
         segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+        declared_column_stats: Default::default(),
     }
 }
 

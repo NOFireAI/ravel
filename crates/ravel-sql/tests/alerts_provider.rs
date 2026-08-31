@@ -153,6 +153,7 @@ async fn write_object(store: &MemoryStore, key: &str, records: &[LogRecord]) -> 
         created_unix_ns: 0,
         level: SegmentLevel::L0,
         segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+        declared_column_stats: Default::default(),
     }
 }
 
@@ -496,6 +497,7 @@ async fn real_ravel_alerting_record_decodes_identically() {
         created_unix_ns: 0,
         level: SegmentLevel::L0,
         segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+        declared_column_stats: Default::default(),
     };
 
     let provider = provider(store, vec![seg]);

@@ -389,9 +389,14 @@ impl SegmentPin {
 
     /// Rebuild the [`SegmentRef`] this pin was projected from.
     ///
-    /// Total and lossless: version 2 carries every `SegmentRef` field, which
-    /// is what lets `DoGet` reconstruct the resolved `Snapshot` without a
-    /// second `Catalog::resolve`.
+    /// Version 2 carries every identity, pruning, and routing field, which is
+    /// what lets `DoGet` reconstruct the resolved `Snapshot` without a second
+    /// `Catalog::resolve`. It does not carry
+    /// [`SegmentRef::declared_column_stats`] (ADR-0873): the pin's wire layout
+    /// has its own version byte, so adding them is a ticket format change of
+    /// its own. A rebuilt ref is therefore uncovered for every declared
+    /// column, which costs `DoGet` the statistics shortcut and never a wrong
+    /// answer.
     pub fn to_segment_ref(&self) -> SegmentRef {
         SegmentRef {
             data_object_key: self.data_object_key.clone(),
@@ -409,6 +414,9 @@ impl SegmentPin {
             created_unix_ns: self.created_unix_ns,
             level: self.level.clone(),
             segment_format_version: self.segment_format_version,
+            // Not carried by the pin's wire layout (see this method's docs):
+            // uncovered, which is a legal permanent state for any segment.
+            declared_column_stats: Default::default(),
         }
     }
 }
@@ -1083,6 +1091,7 @@ mod tests {
                 created_unix_ns: 1_699_999_999_999_999_999,
                 level: level.clone(),
                 segment_format_version: 4,
+                declared_column_stats: Default::default(),
             };
             let pin = SegmentPin::from_segment_ref(&seg);
             assert_eq!(pin.to_segment_ref(), seg);

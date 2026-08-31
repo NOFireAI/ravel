@@ -135,6 +135,7 @@ async fn fixture() -> (Arc<dyn ObjectStoreBackend>, Vec<SegmentRef>) {
         created_unix_ns: 0,
         level: SegmentLevel::L0,
         segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+        declared_column_stats: Default::default(),
     };
     (Arc::new(store), vec![seg])
 }

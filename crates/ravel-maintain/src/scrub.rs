@@ -673,6 +673,7 @@ mod tests {
             series_count: record.series_count,
             segment_format_version: record.segment_format_version,
             created_unix_ns: record.created_unix_ns,
+            declared_column_stats: Vec::new(),
         }
     }
 

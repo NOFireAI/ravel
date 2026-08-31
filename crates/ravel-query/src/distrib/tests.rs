@@ -173,6 +173,7 @@ async fn write_segment_prov(
         created_unix_ns,
         level: SegmentLevel::L0,
         segment_format_version: u32::from(ravel_segment::SUPPORTED_VERSIONS.newest()),
+        declared_column_stats: Default::default(),
     }
 }
 
@@ -623,6 +624,7 @@ async fn write_l1_merged_provenance(store: &MemoryStore) -> SegmentRef {
             part_index: 0,
         },
         segment_format_version: u32::from(ravel_segment::SUPPORTED_VERSIONS.newest()),
+        declared_column_stats: Default::default(),
     }
 }
 
@@ -1981,6 +1983,7 @@ fn histogram_series_distributed_equals_local_bitwise() {
             created_unix_ns: 0,
             level: SegmentLevel::L0,
             segment_format_version: u32::from(ravel_segment::SUPPORTED_VERSIONS.newest()),
+            declared_column_stats: Default::default(),
         };
         let snapshot = Snapshot {
             segments: vec![seg.clone()],
@@ -2128,6 +2131,7 @@ fn erased_histogram_series_is_dropped_before_the_wire() {
             created_unix_ns: 0,
             level: SegmentLevel::L0,
             segment_format_version: u32::from(ravel_segment::SUPPORTED_VERSIONS.newest()),
+            declared_column_stats: Default::default(),
         };
         let snapshot = Snapshot {
             segments: vec![seg.clone()],
@@ -2293,6 +2297,7 @@ async fn write_log_segment(
         // RLOG and RSPAN are both on trailer version 4; this helper's segment
         // set is format-agnostic to the distributed path under test.
         segment_format_version: 4,
+        declared_column_stats: Default::default(),
     }
 }
 
@@ -2995,6 +3000,7 @@ async fn write_span_segment(
         // RLOG and RSPAN are both on trailer version 4; this helper's segment
         // set is format-agnostic to the distributed path under test.
         segment_format_version: 4,
+        declared_column_stats: Default::default(),
     }
 }
 
@@ -4816,6 +4822,7 @@ fn native_histogram_pushdown_refusal_reports_real_accounting() {
             created_unix_ns: 0,
             level: SegmentLevel::L0,
             segment_format_version: u32::from(ravel_segment::SUPPORTED_VERSIONS.newest()),
+            declared_column_stats: Default::default(),
         };
         let segments = vec![seg];
 
