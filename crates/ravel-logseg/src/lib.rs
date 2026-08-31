@@ -46,7 +46,7 @@ pub use columnar_batch::{Bitmap, ColumnarLogBatch, DynColumn, StrColumnDict, Var
 pub use columns::ColumnSelection;
 pub use error::LogSegError;
 pub use footer::{SuffixOutcome, open_from_suffix};
-pub use ranged::{RlogRangeReader, StreamBlockLoc, StreamBlockSpan};
+pub use ranged::{RlogRangeReader, StreamBlockLoc, StreamBlockRows, StreamBlockSpan};
 pub use reader::{BlockScan, RlogReader, ScanStats, decode_section, read_section};
 pub use record::{FieldSel, FieldType, LogRecord, Predicate, stream_attrs_bytes};
 pub use writer::{ObjectIdentity, RlogConfig, RlogWriter};

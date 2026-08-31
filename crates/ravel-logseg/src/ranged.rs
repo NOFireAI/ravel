@@ -30,7 +30,7 @@ use crate::page_dir::PageDir;
 use crate::reader::{
     MAX_BLOCKS, MAX_FIELDS, MAX_STREAMS, column_plans, decode_v4_block, i64_at, rebuild_record,
 };
-use crate::record::{COL_STREAM_REF, LogRecord};
+use crate::record::{COL_STREAM_REF, COL_TS, LogRecord};
 use crate::skip_index::SkipIndex;
 use crate::stream_dir::StreamDir;
 
@@ -377,6 +377,52 @@ impl RlogRangeReader {
         Ok(Some(locs))
     }
 
+    /// The `(min_ts, max_ts)` envelope of one stream's candidate blocks, or
+    /// `None` if the object does not carry the stream. Computed from the
+    /// resident SKIP_IDX alone: no BLOCKS byte is read and no I/O is issued, so
+    /// a merge can ask this of every input before it opens any cursor.
+    ///
+    /// Soundness, which is what makes this usable as an admission bound: the
+    /// returned `min_ts` is a LOWER bound on the first timestamp any cursor for
+    /// this stream can yield from this object, and `max_ts` an UPPER bound on
+    /// the last. An over-wide envelope is sound (it admits an input the merge
+    /// then finds nothing useful in); a too-narrow one is not (it would let the
+    /// merge skip an input that still holds a record inside the window, and
+    /// silently drop it). Two things keep it wide rather than narrow. The
+    /// candidate set comes from
+    /// [`SkipIndex::candidate_blocks`](crate::skip_index::SkipIndex::candidate_blocks),
+    /// which excludes a block only when its bounds prove no row of the stream
+    /// is in it, so no block holding one of the stream's records is left out.
+    /// And a level-0 entry's `[min_ts, max_ts]` covers every record in the
+    /// block, including rows of the neighbouring streams a boundary block also
+    /// holds, so the envelope of the stream's blocks contains every timestamp
+    /// the stream carries and generally a little more.
+    ///
+    /// This reads the same ts bounds the reader already holds, so it stays
+    /// correct across a stream whose blocks have disjoint ts ranges and one
+    /// whose blocks overlap: the envelope is a min/max fold, not an assumption
+    /// that the blocks are ordered or disjoint.
+    pub fn stream_ts_bounds(&self, stream_id: &LogStreamId) -> Option<(i64, i64)> {
+        let stream_ref = self.stream_dir.stream_ref(stream_id)?;
+        let blocks = self
+            .skip
+            .candidate_blocks(i64::MIN, i64::MAX, Some(&[stream_ref]), &[]);
+        let mut min_ts = i64::MAX;
+        let mut max_ts = i64::MIN;
+        let mut any = false;
+        for &b in &blocks {
+            // A candidate index always addresses an l0 entry (it was produced
+            // by walking l0); a missing one contributes no bound rather than
+            // narrowing the envelope.
+            if let Some(entry) = self.skip.l0.get(b) {
+                min_ts = min_ts.min(entry.min_ts);
+                max_ts = max_ts.max(entry.max_ts);
+                any = true;
+            }
+        }
+        if any { Some((min_ts, max_ts)) } else { None }
+    }
+
     /// Decode exactly one block's records for its stream, given that one block's
     /// bytes (the object's `[loc.start, loc.end)` range). Only rows whose
     /// `stream_ref` matches `loc`'s stream are rebuilt (a boundary block can
@@ -440,6 +486,38 @@ impl RlogRangeReader {
         Ok(out)
     }
 
+    /// Decode exactly one of `loc`'s blocks out of `loc`'s fetched bytes and
+    /// keep it in columnar form, as a view that materializes the stream's rows
+    /// one [`LogRecord`] at a time.
+    ///
+    /// Arguments and validation are exactly [`Self::decode_block_in_group`]'s:
+    /// `block` must be one of [`StreamBlockLoc::block_indices`] and
+    /// `group_bytes` must be the object's `[loc.start, loc.end)` range. The
+    /// difference is only what comes back. `decode_block_in_group` returns the
+    /// block's rows already rebuilt into a `Vec<LogRecord>`, so its caller holds
+    /// every record of the block at once; this returns the decoded columnar
+    /// block itself, and the caller pulls records out of it one at a time (see
+    /// [`StreamBlockRows`]). Draining the view yields byte-for-byte the same
+    /// records, in the same order, that `decode_block_in_group` returns for the
+    /// same arguments: both rebuild through
+    /// [`crate::reader::rebuild_record`], over the same rows in ascending row
+    /// order.
+    pub fn block_rows_in_group<'r>(
+        &'r self,
+        loc: &StreamBlockLoc,
+        block: usize,
+        group_bytes: &[u8],
+    ) -> Result<StreamBlockRows<'r>, LogSegError> {
+        let plans = self.check_loc_bytes(loc, group_bytes)?;
+        if !loc.blocks.contains(&block) {
+            return Err(LogSegError::Corrupted(
+                "block index is not in this loc".into(),
+            ));
+        }
+        let decoded = self.decode_one_block(block, loc.start, group_bytes, &plans)?;
+        StreamBlockRows::new(self, decoded, loc.stream_ref)
+    }
+
     /// Check that `bytes` is exactly `loc`'s fetched range and return the column
     /// plans a decode of it needs.
     fn check_loc_bytes(
@@ -476,6 +554,167 @@ impl RlogRangeReader {
             }
         }
         Ok(())
+    }
+}
+
+/// One decoded block, held in its compact columnar form, materializing one
+/// stream's rows into [`LogRecord`]s one at a time.
+///
+/// This is what lets a k-way compaction merge hold a block without holding the
+/// block's records. [`RlogRangeReader::decode_block_in_group`] returns a
+/// `Vec<LogRecord>`, in which every record re-owns its own copy of every
+/// attribute key and every stream blob; the columnar block those records were
+/// built from stores each key once per column, so the row form is much larger
+/// than the decode intermediate it comes from, and a cursor per merge input
+/// pays that multiple. This view keeps the intermediate and rebuilds one row on
+/// demand, so the row-form residency is one record per cursor rather than one
+/// block.
+///
+/// Rows come back in stored order (records are stored by `(stream_ref, ts)`, so
+/// that is ts-ascending within one stream), rebuilt through the same
+/// [`crate::reader::rebuild_record`] the eager path uses, over the same rows in
+/// the same order. Draining this view therefore yields exactly the records
+/// [`RlogRangeReader::decode_block_in_group`] returns for the same block.
+///
+/// The [`Iterator`] item is a `Result`: rebuilding a record reads stored bytes
+/// (a body's utf-8, a canonical attribute blob), so a corrupt block surfaces
+/// the same typed [`LogSegError`] the eager path returns for that row instead
+/// of panicking. The block's `ts` and `stream_ref` columns are the exception --
+/// they are validated when the view is built, so [`Self::peek_ts`] needs no
+/// error path (a merge peeks far more often than it pops).
+pub struct StreamBlockRows<'r> {
+    /// The object's directories, for the rebuild. Borrowed rather than owned:
+    /// STREAM_DIR and FIELD_DIR are per-object, one per merge input, and a
+    /// cursor holding a block is already scoped to the reader it decoded the
+    /// block from ([`crate::RlogRangeReader`] is not cheap to clone -- cloning
+    /// it per block would reintroduce, per block, the duplication this type
+    /// exists to remove).
+    reader: &'r RlogRangeReader,
+    /// The decoded block, OWNED: the point of the type is that the caller can
+    /// drop the row group's raw bytes as soon as this exists and still pull
+    /// rows out for as long as it wants.
+    block: DecodedBlock,
+    /// The rows of `block` that belong to this view's stream, ascending. A
+    /// boundary block also holds the neighbouring streams' rows, so this is the
+    /// same `stream_ref`-equality filter the eager path applies, resolved once
+    /// when the view is built instead of once per `next`.
+    rows: Vec<u32>,
+    /// Index into `rows` of the next row to yield.
+    pos: usize,
+}
+
+impl<'r> StreamBlockRows<'r> {
+    /// Resolve `decoded`'s rows for `stream_ref` and take ownership of the
+    /// block.
+    ///
+    /// The `stream_ref` and `ts` columns are read for every row here. That is
+    /// the same read the eager path does per row, so a block whose `stream_ref`
+    /// column is malformed fails with the same typed error, and it additionally
+    /// makes a broken `ts` column fail when the view is built rather than
+    /// mid-merge. It is why [`Self::peek_ts`] is infallible. One consequence to
+    /// know when comparing the two paths byte for byte: for a block that is
+    /// corrupt in more than one way at once, the two paths can name a different
+    /// column first in the `Corrupted` message, because this validates the
+    /// whole `ts` column before any record is rebuilt while the eager path
+    /// rebuilds each row as it reaches it. The error variant, and the fact that
+    /// no wrong record is ever produced, are the same either way.
+    fn new(
+        reader: &'r RlogRangeReader,
+        decoded: DecodedBlock,
+        stream_ref: u32,
+    ) -> Result<Self, LogSegError> {
+        let mut rows = Vec::new();
+        for row in 0..decoded.record_count() {
+            let sref = u32::try_from(i64_at(&decoded, COL_STREAM_REF, row)?)
+                .map_err(|_| LogSegError::Corrupted("stream_ref range".into()))?;
+            if sref != stream_ref {
+                continue;
+            }
+            // Checked, not kept: `peek_ts` reads the column itself, and this is
+            // what lets it do so without an error path.
+            i64_at(&decoded, COL_TS, row)?;
+            rows.push(
+                u32::try_from(row).map_err(|_| LogSegError::Corrupted("block row index".into()))?,
+            );
+        }
+        Ok(StreamBlockRows {
+            reader,
+            block: decoded,
+            rows,
+            pos: 0,
+        })
+    }
+
+    /// The next row's `ts_ns`, read straight out of the decoded timestamp
+    /// column, without rebuilding the record. This is the merge's comparison
+    /// key, so it must cost a slice index and nothing else.
+    ///
+    /// `None` means the view is exhausted, and only that: every row this view
+    /// will yield was checked to carry a timestamp when the view was built.
+    /// Peeking does not advance -- the next [`Iterator::next`] yields the record
+    /// whose `ts_ns` this returned.
+    pub fn peek_ts(&self) -> Option<i64> {
+        let &row = self.rows.get(self.pos)?;
+        self.block
+            .i64_col(COL_TS)
+            .and_then(|c| c.get(row as usize).copied())
+            .flatten()
+    }
+
+    /// Rows of this view's stream not yet yielded.
+    pub fn remaining(&self) -> usize {
+        self.rows.len().saturating_sub(self.pos)
+    }
+
+    /// Whether the view has no rows left to yield.
+    pub fn is_exhausted(&self) -> bool {
+        self.remaining() == 0
+    }
+
+    /// The heap bytes this view holds resident, for a merge charging a memory
+    /// pool per open cursor.
+    ///
+    /// Counts exactly two things: the decoded columnar buffers
+    /// ([`crate::block::DecodedBlock::decoded_heap_bytes`] -- every column
+    /// vector's allocation at capacity, plus each present string or
+    /// fixed-width cell's own buffer, with a dictionary column's distinct
+    /// values counted once rather than once per row), and this view's own
+    /// row-index vector at capacity.
+    ///
+    /// It does NOT count the stored (still compressed) block or row-group bytes
+    /// the block was decoded from: those are the caller's buffer, charged
+    /// separately and droppable as soon as the view exists. It does NOT count
+    /// the row-form estimate of the records the view can still yield: a
+    /// materialized [`LogRecord`] is the caller's, and the whole point of the
+    /// type is that only one is alive at a time. Nor does it count `self`'s own
+    /// stack size or the borrowed reader's directories, which are per object,
+    /// not per block.
+    pub fn heap_estimate(&self) -> u64 {
+        let columnar = self.block.decoded_heap_bytes() as u64;
+        let row_index = (self.rows.capacity() * std::mem::size_of::<u32>()) as u64;
+        columnar.saturating_add(row_index)
+    }
+}
+
+impl Iterator for StreamBlockRows<'_> {
+    type Item = Result<LogRecord, LogSegError>;
+
+    /// Materialize exactly one row, in stored order, through the shared
+    /// [`crate::reader::rebuild_record`].
+    fn next(&mut self) -> Option<Self::Item> {
+        let &row = self.rows.get(self.pos)?;
+        self.pos += 1;
+        Some(rebuild_record(
+            &self.reader.stream_dir,
+            &self.reader.field_dir,
+            &self.block,
+            row as usize,
+        ))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.remaining();
+        (n, Some(n))
     }
 }
 
@@ -561,7 +800,7 @@ mod tests {
         out
     }
 
-    fn write_object() -> Vec<u8> {
+    fn write_records(records: Vec<LogRecord>) -> Vec<u8> {
         let cfg = RlogConfig {
             block_target_records: BLOCK_RECORDS,
             group_target_blocks: GROUP_BLOCKS,
@@ -575,10 +814,14 @@ mod tests {
             writer_seq: 2,
         };
         let mut w = RlogWriter::new(cfg, identity);
-        for r in corpus() {
+        for r in records {
             w.push(r).expect("push");
         }
         w.finish().expect("finish")
+    }
+
+    fn write_object() -> Vec<u8> {
+        write_records(corpus())
     }
 
     fn reader_of(object: &[u8]) -> RlogRangeReader {
@@ -710,6 +953,395 @@ mod tests {
         assert!(
             matches!(err, LogSegError::Corrupted(_)),
             "expected Corrupted, got {err:?}"
+        );
+    }
+
+    // --- StreamBlockRows: the lazy, columnar-held row view ------------------
+
+    /// Every record of one stream, pulled one at a time out of the columnar
+    /// blocks: the lazy path's whole-stream output, in the order it yields.
+    fn drain_lazy(reader: &RlogRangeReader, object: &[u8], stream: &LogStreamId) -> Vec<LogRecord> {
+        let locs = reader
+            .stream_blocks(stream)
+            .expect("stream_blocks")
+            .expect("stream present");
+        let mut out = Vec::new();
+        for loc in &locs {
+            let bytes = slice(object, loc.start(), loc.end());
+            for &b in loc.block_indices() {
+                let rows = reader
+                    .block_rows_in_group(loc, b, &bytes)
+                    .expect("block rows");
+                // One row at a time: the view yields records, it does not hand
+                // back a block's worth.
+                for rec in rows {
+                    out.push(rec.expect("rebuild row"));
+                }
+            }
+        }
+        out
+    }
+
+    /// The differential T1 exists to pin: draining `StreamBlockRows` yields the
+    /// SAME records, by full struct equality and in the same order, as the eager
+    /// `decode_block_in_group` / `decode_stream` path, across block and row-group
+    /// boundaries. Full records, not counts or timestamps: a lazy path that
+    /// dropped one optional column (`span_id`, `trace_id`, an attribute) would
+    /// keep both counts and every timestamp intact.
+    #[test]
+    fn draining_stream_block_rows_equals_the_eager_decode() {
+        let object = write_object();
+        let reader = reader_of(&object);
+
+        for s in 0..2u8 {
+            let stream = sid(s);
+            let locs = reader
+                .stream_blocks(&stream)
+                .expect("stream_blocks")
+                .expect("stream present");
+            // The fixture must really cross boundaries, or the comparison is
+            // one block against itself.
+            assert!(
+                locs.len() > 1,
+                "stream {s} must span several row groups, got {}",
+                locs.len()
+            );
+            assert!(
+                locs.iter().any(|l| l.block_indices().len() > 1),
+                "a row group must hold more than one of stream {s}'s blocks"
+            );
+
+            // Eager, block by block: the exact sequence T3 will replace.
+            let mut eager = Vec::new();
+            for loc in &locs {
+                let bytes = slice(&object, loc.start(), loc.end());
+                for &b in loc.block_indices() {
+                    eager.extend(
+                        reader
+                            .decode_block_in_group(loc, b, &bytes)
+                            .expect("decode one block"),
+                    );
+                }
+            }
+
+            let lazy = drain_lazy(&reader, &object, &stream);
+            let span = reader
+                .stream_block_span(&stream)
+                .expect("span")
+                .expect("stream present");
+            let whole = reader
+                .decode_stream(&span, &slice(&object, span.start(), span.end()))
+                .expect("decode_stream");
+            let expected: Vec<LogRecord> = (0..PER_STREAM).map(|i| rec(s, i)).collect();
+
+            assert_eq!(lazy.len() as i64, PER_STREAM, "exact record count");
+            assert_eq!(lazy, eager, "lazy drain == eager per-block decode");
+            assert_eq!(lazy, whole, "lazy drain == eager whole-stream decode");
+            assert_eq!(lazy, expected, "and all three equal the written records");
+        }
+    }
+
+    /// `peek_ts` reads the next row's timestamp out of the decoded ts column and
+    /// does not advance: peeking twice returns the same value, leaves the
+    /// remaining count untouched, and the record the following `next` yields
+    /// carries exactly the peeked `ts_ns`. Once drained, `peek_ts` is `None`.
+    #[test]
+    fn peek_ts_matches_the_next_record_and_never_advances() {
+        let object = write_object();
+        let reader = reader_of(&object);
+        let stream = sid(1);
+        let locs = reader
+            .stream_blocks(&stream)
+            .expect("stream_blocks")
+            .expect("stream present");
+
+        let mut peeked_all = Vec::new();
+        for loc in &locs {
+            let bytes = slice(&object, loc.start(), loc.end());
+            for &b in loc.block_indices() {
+                let mut rows = reader
+                    .block_rows_in_group(loc, b, &bytes)
+                    .expect("block rows");
+                while !rows.is_exhausted() {
+                    let before = rows.remaining();
+                    let first = rows.peek_ts().expect("a ts for a pending row");
+                    let second = rows.peek_ts().expect("peeking twice still peeks");
+                    assert_eq!(first, second, "two peeks must agree");
+                    assert_eq!(rows.remaining(), before, "peeking must not consume a row");
+                    let rec = rows.next().expect("a pending row").expect("rebuild row");
+                    assert_eq!(rec.ts_ns, first, "next yields the peeked timestamp");
+                    assert_eq!(rows.remaining(), before - 1, "next consumes one row");
+                    peeked_all.push(first);
+                }
+                assert_eq!(rows.peek_ts(), None, "an exhausted view peeks None");
+                assert!(rows.next().is_none(), "an exhausted view yields None");
+            }
+        }
+        let expected: Vec<i64> = (0..PER_STREAM).collect();
+        assert_eq!(peeked_all, expected, "every ts, in stored order");
+    }
+
+    /// `heap_estimate` charges the columnar block, not the raw bytes it was
+    /// decoded from and not the row form it can produce. It must be positive for
+    /// a block with rows, and far below the row-form size of the same records:
+    /// the whole reason the type exists.
+    #[test]
+    fn heap_estimate_charges_the_columnar_block() {
+        let object = write_object();
+        let reader = reader_of(&object);
+        let stream = sid(1);
+        let locs = reader
+            .stream_blocks(&stream)
+            .expect("stream_blocks")
+            .expect("stream present");
+        let loc = &locs[0];
+        let bytes = slice(&object, loc.start(), loc.end());
+        let block = loc.block_indices()[0];
+        let rows = reader
+            .block_rows_in_group(loc, block, &bytes)
+            .expect("block rows");
+        assert!(rows.remaining() > 0, "the first block must hold rows");
+        assert!(
+            rows.heap_estimate() > 0,
+            "a decoded block with rows holds heap"
+        );
+        // Draining does not change what is held: the columnar buffers stay
+        // resident until the view is dropped, which is what the caller charges.
+        let before = rows.heap_estimate();
+        let mut rows = rows;
+        while rows.next().is_some() {}
+        assert_eq!(
+            rows.heap_estimate(),
+            before,
+            "the columnar residency is per block, not per remaining row"
+        );
+    }
+
+    /// A corrupt block is the same typed error through the lazy path as through
+    /// the eager one, and never a record: a flipped page byte, a block index
+    /// from another group, and a short buffer.
+    #[test]
+    fn block_rows_in_group_rejects_corrupt_input_like_the_eager_path() {
+        let object = write_object();
+        let reader = reader_of(&object);
+        let stream = sid(1);
+        let locs = reader
+            .stream_blocks(&stream)
+            .expect("stream_blocks")
+            .expect("stream present");
+        let loc = &locs[0];
+        let block = loc.block_indices()[0];
+        let bytes = slice(&object, loc.start(), loc.end());
+        let other = locs
+            .iter()
+            .flat_map(|l| l.block_indices())
+            .find(|b| !loc.block_indices().contains(b))
+            .copied()
+            .expect("another group's block");
+
+        let mut flipped = bytes.clone();
+        flipped[0] ^= 0xff;
+        let cases: Vec<(&str, usize, Vec<u8>)> = vec![
+            ("a flipped page byte", block, flipped),
+            ("a block outside the loc", other, bytes.clone()),
+            ("a short buffer", block, bytes[..bytes.len() - 1].to_vec()),
+        ];
+        for (what, b, buf) in cases {
+            let eager = reader
+                .decode_block_in_group(loc, b, &buf)
+                .expect_err(&format!("{what} must not decode eagerly"));
+            let lazy = reader
+                .block_rows_in_group(loc, b, &buf)
+                .err()
+                .unwrap_or_else(|| panic!("{what} must not decode lazily either"));
+            assert!(
+                matches!(eager, LogSegError::Corrupted(_)),
+                "{what}: eager expected Corrupted, got {eager:?}"
+            );
+            assert!(
+                matches!(lazy, LogSegError::Corrupted(_)),
+                "{what}: lazy expected Corrupted, got {lazy:?}"
+            );
+            assert_eq!(
+                eager.to_string(),
+                lazy.to_string(),
+                "{what}: both paths must fail the same way"
+            );
+        }
+    }
+
+    // --- stream_ts_bounds --------------------------------------------------
+
+    /// The stream's true `(min, max)` from the records that were written, the
+    /// ground truth `stream_ts_bounds` must contain.
+    fn true_bounds(records: &[LogRecord], stream: &LogStreamId) -> (i64, i64) {
+        let ts: Vec<i64> = records
+            .iter()
+            .filter(|r| r.stream_id == *stream)
+            .map(|r| r.ts_ns)
+            .collect();
+        assert!(!ts.is_empty(), "the stream must have records");
+        (
+            ts.iter().copied().min().expect("min"),
+            ts.iter().copied().max().expect("max"),
+        )
+    }
+
+    fn rec_at(stream: u8, i: i64, ts: i64) -> LogRecord {
+        LogRecord {
+            ts_ns: ts,
+            observed_ts_ns: ts + 1,
+            ..rec(stream, i)
+        }
+    }
+
+    /// Blocks with distinct, disjoint ts ranges: 40 records per stream at 4 to a
+    /// block divides exactly, so no block mixes the two streams and each
+    /// stream's blocks tile its ts range without overlap. The envelope must
+    /// still contain every timestamp the stream carries.
+    #[test]
+    fn stream_ts_bounds_contains_every_ts_over_disjoint_blocks() {
+        let records = corpus();
+        let object = write_records(records.clone());
+        let reader = reader_of(&object);
+        for s in 0..2u8 {
+            let stream = sid(s);
+            // No block is shared, which is what makes this the disjoint case.
+            let mine = reader
+                .stream_blocks(&stream)
+                .expect("stream_blocks")
+                .expect("present");
+            let theirs = reader
+                .stream_blocks(&sid(1 - s))
+                .expect("stream_blocks")
+                .expect("present");
+            let mine: Vec<usize> = mine
+                .iter()
+                .flat_map(|l| l.block_indices())
+                .copied()
+                .collect();
+            let theirs: Vec<usize> = theirs
+                .iter()
+                .flat_map(|l| l.block_indices())
+                .copied()
+                .collect();
+            assert!(
+                !mine.iter().any(|b| theirs.contains(b)),
+                "stream {s} must not share a block in the disjoint fixture"
+            );
+
+            let (min, max) = reader.stream_ts_bounds(&stream).expect("bounds");
+            let (true_min, true_max) = true_bounds(&records, &stream);
+            assert!(
+                min <= true_min && max >= true_max,
+                "stream {s}: envelope ({min}, {max}) must contain ({true_min}, {true_max})"
+            );
+            for r in records.iter().filter(|r| r.stream_id == stream) {
+                assert!(
+                    min <= r.ts_ns && r.ts_ns <= max,
+                    "stream {s}: ts {} outside envelope ({min}, {max})",
+                    r.ts_ns
+                );
+            }
+        }
+        assert_eq!(
+            reader.stream_ts_bounds(&sid(9)),
+            None,
+            "a stream the object does not carry has no envelope"
+        );
+    }
+
+    /// Blocks whose ts ranges overlap: the two streams' ts ranges interleave and
+    /// 10 records per stream at 4 to a block leaves a boundary block holding
+    /// both, so the block a stream shares with its neighbour carries a ts range
+    /// that overlaps the stream's own next block. The envelope must still
+    /// contain every timestamp, and the shared block is what makes it wider than
+    /// the stream's own data.
+    #[test]
+    fn stream_ts_bounds_contains_every_ts_over_overlapping_blocks() {
+        // stream 0: 0, 10, .. 90;  stream 1: 45, 55, .. 135.
+        let mut records = Vec::new();
+        for i in 0..10i64 {
+            records.push(rec_at(0, i, i * 10));
+        }
+        for i in 0..10i64 {
+            records.push(rec_at(1, i, 45 + i * 10));
+        }
+        let object = write_records(records.clone());
+        let reader = reader_of(&object);
+
+        let b0: Vec<usize> = reader
+            .stream_blocks(&sid(0))
+            .expect("stream_blocks")
+            .expect("present")
+            .iter()
+            .flat_map(|l| l.block_indices())
+            .copied()
+            .collect();
+        let b1: Vec<usize> = reader
+            .stream_blocks(&sid(1))
+            .expect("stream_blocks")
+            .expect("present")
+            .iter()
+            .flat_map(|l| l.block_indices())
+            .copied()
+            .collect();
+        assert!(
+            b0.iter().any(|b| b1.contains(b)),
+            "the fixture must leave a boundary block holding both streams, \
+             got {b0:?} and {b1:?}"
+        );
+
+        for s in 0..2u8 {
+            let stream = sid(s);
+            let (min, max) = reader.stream_ts_bounds(&stream).expect("bounds");
+            let (true_min, true_max) = true_bounds(&records, &stream);
+            assert!(
+                min <= true_min && max >= true_max,
+                "stream {s}: envelope ({min}, {max}) must contain ({true_min}, {true_max})"
+            );
+        }
+    }
+
+    /// The soundness direction, stated as an assertion: the returned min is a
+    /// LOWER bound, not the stream's exact first timestamp. Two streams with
+    /// well-separated ts ranges share one boundary block, so stream 1's
+    /// envelope starts at stream 0's timestamps, strictly below any record
+    /// stream 1 carries. An over-wide envelope is correct here; a narrower one
+    /// would be the bug.
+    #[test]
+    fn stream_ts_bounds_is_a_lower_bound_not_the_exact_minimum() {
+        let mut records = Vec::new();
+        for i in 0..10i64 {
+            records.push(rec_at(0, i, i));
+        }
+        for i in 0..10i64 {
+            records.push(rec_at(1, i, 100 + i));
+        }
+        let object = write_records(records.clone());
+        let reader = reader_of(&object);
+
+        let (min, max) = reader.stream_ts_bounds(&sid(1)).expect("bounds");
+        let (true_min, true_max) = true_bounds(&records, &sid(1));
+        assert_eq!((true_min, true_max), (100, 109), "the fixture's own range");
+        assert!(
+            min <= true_min && max >= true_max,
+            "envelope ({min}, {max}) must contain ({true_min}, {true_max})"
+        );
+        assert!(
+            min < true_min,
+            "the shared boundary block must widen the envelope below {true_min}, got {min}"
+        );
+
+        // And the first record any cursor for the stream yields is inside it,
+        // which is the property T4's admission test needs.
+        let first = drain_lazy(&reader, &object, &sid(1))
+            .first()
+            .expect("stream 1 has records")
+            .ts_ns;
+        assert!(
+            min <= first,
+            "the envelope's min ({min}) must not exceed the first yielded ts ({first})"
         );
     }
 }
