@@ -175,17 +175,50 @@ HEAD — a window in which the in-RAM copy was belt-and-braces, not a
 correctness dependency. The convergence outcome (`Converged`) and the
 divergence alarm (`InputSetHashDivergence`) are untouched.
 
+One PUT outcome is excluded from the drop, and it closes a real race: a
+part PUT that returns **`AlreadyExists`** (the same content-addressed key
+was PUT by an abandoned run) does not refresh the stored object's
+`last_modified`, so the object's age is the abandoned run's, not ours. An
+old-enough such part is inside the unreferenced-part sweep's age gate, and
+a tenant tombstone landing between our existence check and our record PUT
+lets the sweep delete it while we still intend to reference it — at which
+point a compactor that dropped its bytes cannot repair before publishing.
+So D3 drops bytes at PUT **only for a fresh PUT** (age zero, unreachable
+by the sweep inside the grace floor for the run's whole duration);
+a part whose PUT reported `AlreadyExists` keeps its bytes until the
+compaction record PUT has succeeded, then re-verifies that part with a
+HEAD and re-PUTs from the retained copy if it vanished (the fresh re-PUT
+resets its age). The retained set is normally empty — `AlreadyExists`
+requires a prior abandoned run over the identical input bytes — so the
+memory cost of the exception rounds to zero, and the race test the
+verification plan owes drives exactly this interleaving with a
+`FaultStore`-injected tombstone between check and publish.
+
 ### D4. A fail-closed cursor budget: `merge_cursor_budget_bytes`
 
-New `CompactorConfig` knob, default **20 GiB**. The merge charges each open
-cursor's actual residency (raw loc bytes as fetched, `heap_estimate()` as
-decoded — the same numbers the #977 tracker sees) against the budget. If
-admitting a cursor that merge order *requires* would exceed the budget, the
-run aborts with a typed error, before publish:
+New `CompactorConfig` knob, default **20 GiB**. Admission is charged as a
+**pre-decode reservation**, not an after-the-fact measurement: before a
+cursor fetches or decodes anything, the merge reserves its ceiling cost
+(`2·G` from the section descriptors' raw lengths plus the `B_dec` ceiling
+formula evaluated from the block's row count and column count, both known
+from resident metadata), and the reservation is reconciled down to the
+cursor's actual residency (raw bytes as fetched, `heap_estimate()` once
+decoded — the same numbers the #977 tracker sees) after the decode
+completes. Reservations are taken under the same admission lock that
+orders cursor opens, so concurrent admissions cannot each pass the check
+and then jointly allocate past the budget: the budget is enforced at
+reserve time, which is what makes D4 fail-closed rather than
+fail-after-allocating. If reserving a cursor that merge order *requires*
+would exceed the budget, the run aborts with a typed error, before
+publish:
 
-```
+```rust
 MaintainError::MergeCursorBudgetExceeded {
     stream_id, open_cursors, charged_bytes, budget_bytes,
+    required_bytes,         // prospective total had this cursor been admitted:
+                            // charged + this cursor's reservation, so a first
+                            // admission over budget still names the number a
+                            // retry must budget for
     inputs_carrying_stream, // so the operator can size the fix
 }
 ```
@@ -212,7 +245,7 @@ cursor fan-out term).
 
 ### The memory bound, as an operator evaluates it
 
-```
+```text
 peak ≈ C_cat + min(D × (2·G + B_dec), merge_cursor_budget_bytes) + W
 
 C_cat  = per-input catalog metadata ≈ 30 KB × input_objects        (~220 MB here)
