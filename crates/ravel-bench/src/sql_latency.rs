@@ -598,6 +598,9 @@ pub struct PhaseWireBytes {
     /// holes and retries included. WIRE bytes; never stored or decompressed
     /// bytes.
     pub wire_bytes: u64,
+    /// GET requests this phase issued, recorded by the same call that charges
+    /// the bytes above, so the two describe the same GETs (issue #857).
+    pub get_requests: u64,
 }
 
 /// One entry per `QueryPhase`, in `QueryPhase::ALL` order, each phase exactly
@@ -609,6 +612,7 @@ fn phase_wire_bytes(counts: &PhaseWireByteCounts) -> Vec<PhaseWireBytes> {
         .map(|phase| PhaseWireBytes {
             phase: phase.name().to_string(),
             wire_bytes: counts.phase(*phase),
+            get_requests: counts.phase_requests(*phase),
         })
         .collect()
 }
@@ -4289,6 +4293,9 @@ mod tests {
                 .map(|p| PhaseWireBytes {
                     phase: p.name().to_string(),
                     wire_bytes: by_phase[p.index()],
+                    // One request per 100 wire bytes in the fixture: exact and
+                    // derivable, so the JSON schema test pins a real figure.
+                    get_requests: by_phase[p.index()] / 100,
                 })
                 .collect(),
             wire_bytes_unattributed: 400 - by_phase.iter().sum::<u64>(),
