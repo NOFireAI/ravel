@@ -639,6 +639,24 @@ the wrapped backend's own declaration. `ravel-server`'s `build_store` wraps
 whichever backend it built, unconditionally in every mode, and the contract
 suite runs its full assertion set through the decorator to prove transparency.
 
+`calls` is completions, not attempts: it counts one per logical operation, so
+the `object_store` retry loop that runs *below* this decorator (`RetryConfig`,
+default `max_retries = 10`) is invisible to it --- one `get()` that retried nine
+times is one `calls`/`get` while the provider bills ten HTTP requests (issue
+#928). The billed count is carried in a separate per-operation `attempts`
+counter on the same `StoreMetrics` block, filled in by the S3 adapter's counting
+HTTP connector (`S3Store::with_metrics`, installed via
+`AmazonS3Builder::with_http_connector`), which records one attempt per HTTP
+request `object_store` issues, retries included. `attempts >= calls` always;
+`attempts - calls` is the billed retry overhead, and `attempts` can exceed
+`calls` for `get`/`put` even with no retry, because a whole-object read and a
+multipart write each issue several HTTP requests per logical call. The connector
+wraps the default reqwest client and delegates unchanged, so `RetryConfig` and
+every retry behavior above stay exactly as documented: this observes the loop,
+it does not alter it. A backend that issues no HTTP (`MemoryStore`) leaves
+`attempts` at zero. `ravel-server` exports it as `ravel_store_attempts_total`
+beside `ravel_store_calls_total`.
+
 The contract suite in `crates/ravel-object-store/tests/contract.rs` runs
 against all three, multipart included (`assert_multipart_upload` is part of
 `run_contract_suite`, written against the trait so it holds for the oracle, the

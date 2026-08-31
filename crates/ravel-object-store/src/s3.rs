@@ -95,6 +95,11 @@ use credentials::FileCredentialProvider;
 mod instance_role;
 use instance_role::{DEFAULT_IMDS_ENDPOINT, InstanceRoleCredentialProvider};
 
+mod attempts;
+use attempts::AttemptCountingConnector;
+
+use crate::instrument::{StoreMetrics, StoreOp};
+
 /// Default entries per `ListPage`, chosen to line up with S3's own
 /// `ListObjectsV2` page size. Overridable per instance via
 /// [`S3Store::with_page_size`].
@@ -506,7 +511,52 @@ impl S3Store {
     /// client tuning (#851). Exists so an unusual deployment or a test can set
     /// a non-default timeout and have it reach the constructed client.
     pub fn with_http_config(config: S3Config, http: S3HttpConfig) -> Result<Self, StoreError> {
-        let (builder, credential_provider, instance_role_provider) = Self::builder(&config, &http)?;
+        Self::build(config, http, None)
+    }
+
+    /// Build recording billed HTTP requests (attempts, retries included) into
+    /// the shared `metrics`, using the default HTTP tuning (issue #928).
+    ///
+    /// This installs a counting HTTP connector *below* `object_store`'s retry
+    /// loop, so `metrics`'s `attempts` counter sees every retry a completed
+    /// [`InstrumentedStore`](crate::InstrumentedStore) `calls` count hides. Pass
+    /// the same `Arc` to
+    /// [`InstrumentedStore::with_metrics`](crate::InstrumentedStore::with_metrics)
+    /// so `attempts` and `calls` share one snapshot. `new`/`with_http_config`
+    /// install no connector and record no attempts, byte-for-byte the historical
+    /// build path.
+    pub fn with_metrics(config: S3Config, metrics: Arc<StoreMetrics>) -> Result<Self, StoreError> {
+        Self::build(config, S3HttpConfig::default(), Some(metrics))
+    }
+
+    /// Build with an explicit [`S3HttpConfig`] and an attempt-metrics sink.
+    pub fn with_http_config_and_metrics(
+        config: S3Config,
+        http: S3HttpConfig,
+        metrics: Arc<StoreMetrics>,
+    ) -> Result<Self, StoreError> {
+        Self::build(config, http, Some(metrics))
+    }
+
+    /// The shared build path. When `attempt_metrics` is `Some`, an
+    /// [`AttemptCountingConnector`] is installed so every HTTP request the
+    /// client issues is counted; when `None`, the default `object_store`
+    /// connector is used and no attempts are recorded.
+    fn build(
+        config: S3Config,
+        http: S3HttpConfig,
+        attempt_metrics: Option<Arc<StoreMetrics>>,
+    ) -> Result<Self, StoreError> {
+        let (mut builder, credential_provider, instance_role_provider) =
+            Self::builder(&config, &http)?;
+        // Count billed HTTP requests below `object_store`'s retry loop (#928).
+        // The connector wraps the default reqwest client and delegates unchanged,
+        // so this changes what is measured, never how a request runs; `retry`/
+        // `RetryConfig` stay at `object_store`'s defaults. Absent a sink, the
+        // default connector is used and no attempts are recorded.
+        if let Some(metrics) = attempt_metrics {
+            builder = builder.with_http_connector(AttemptCountingConnector::new(metrics));
+        }
         let store = builder
             .build()
             .map_err(|e| StoreError::Permanent(format!("failed to build S3 client: {e}")))?;
@@ -1353,42 +1403,45 @@ impl ObjectStoreBackend for S3Store {
         data: Bytes,
         opts: PutOptions,
     ) -> Result<PutOutcome, StoreError> {
-        preflight_checksum(&data, opts.checksum)?;
-        // Large payloads go out as a multipart upload, but only under
-        // `Overwrite`: `object_store` 0.14 has no conditional
-        // `CompleteMultipartUpload` (`PutMultipartOptions` carries tags and
-        // attributes, no `PutMode`), so routing a conditional put through
-        // multipart would silently drop the precondition the commit protocol
-        // depends on. A `CreateIfAbsent`/`CasVersion` put therefore stays on
-        // the single-PUT path at every size (S3's 5 GiB single-request limit
-        // is the ceiling there). See docs/object-store-contract.md,
-        // "Multipart upload".
-        if matches!(opts.mode, PutMode::Overwrite) && data.len() > MULTIPART_THRESHOLD {
-            return self.put_via_multipart(key, data).await;
-        }
-        let os_mode = match &opts.mode {
-            PutMode::Overwrite => OsPutMode::Overwrite,
-            PutMode::CreateIfAbsent => OsPutMode::Create,
-            PutMode::CasVersion(version) => OsPutMode::Update(UpdateVersion {
-                e_tag: Some(version.0.clone()),
-                version: Some(version.0.clone()),
-            }),
-        };
-        let path = path_of(key);
-        let payload = PutPayload::from(data);
-        let result = self
-            .store
-            .put_opts(
-                &path,
-                payload,
-                OsPutOptions {
-                    mode: os_mode,
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|e| map_put_error(e, &opts.mode))?;
-        outcome_of(key, result)
+        attempts::scope(StoreOp::Put, async move {
+            preflight_checksum(&data, opts.checksum)?;
+            // Large payloads go out as a multipart upload, but only under
+            // `Overwrite`: `object_store` 0.14 has no conditional
+            // `CompleteMultipartUpload` (`PutMultipartOptions` carries tags and
+            // attributes, no `PutMode`), so routing a conditional put through
+            // multipart would silently drop the precondition the commit protocol
+            // depends on. A `CreateIfAbsent`/`CasVersion` put therefore stays on
+            // the single-PUT path at every size (S3's 5 GiB single-request limit
+            // is the ceiling there). See docs/object-store-contract.md,
+            // "Multipart upload".
+            if matches!(opts.mode, PutMode::Overwrite) && data.len() > MULTIPART_THRESHOLD {
+                return self.put_via_multipart(key, data).await;
+            }
+            let os_mode = match &opts.mode {
+                PutMode::Overwrite => OsPutMode::Overwrite,
+                PutMode::CreateIfAbsent => OsPutMode::Create,
+                PutMode::CasVersion(version) => OsPutMode::Update(UpdateVersion {
+                    e_tag: Some(version.0.clone()),
+                    version: Some(version.0.clone()),
+                }),
+            };
+            let path = path_of(key);
+            let payload = PutPayload::from(data);
+            let result = self
+                .store
+                .put_opts(
+                    &path,
+                    payload,
+                    OsPutOptions {
+                        mode: os_mode,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|e| map_put_error(e, &opts.mode))?;
+            outcome_of(key, result)
+        })
+        .await
     }
 
     async fn put_multipart<'a>(
@@ -1410,62 +1463,71 @@ impl ObjectStoreBackend for S3Store {
     }
 
     async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
-        let os_range = match range {
-            // The one request whose size the caller does not choose, so the one
-            // that has to be bounded here to stay inside
-            // `S3HttpConfig::request_timeout`.
-            GetRange::Full => return self.get_whole_object(key).await,
-            GetRange::Range(start, end) => {
-                if start >= end {
-                    return Err(StoreError::InvalidRange(format!(
-                        "empty or inverted range [{start}, {end})"
-                    )));
+        attempts::scope(StoreOp::Get, async move {
+            let os_range = match range {
+                // The one request whose size the caller does not choose, so the one
+                // that has to be bounded here to stay inside
+                // `S3HttpConfig::request_timeout`.
+                GetRange::Full => return self.get_whole_object(key).await,
+                GetRange::Range(start, end) => {
+                    if start >= end {
+                        return Err(StoreError::InvalidRange(format!(
+                            "empty or inverted range [{start}, {end})"
+                        )));
+                    }
+                    Some(OsGetRange::Bounded(start..end))
                 }
-                Some(OsGetRange::Bounded(start..end))
-            }
-            GetRange::Suffix(0) => {
-                return Err(StoreError::InvalidRange("zero-length suffix".into()));
-            }
-            GetRange::Suffix(n) => Some(OsGetRange::Suffix(n)),
-        };
-        let chunk = self.get_one(key, os_range, None).await?;
-        Ok(GetOutcome {
-            data: chunk.data,
-            etag: Etag(chunk.etag.clone()),
-            version: Version(chunk.etag),
-            total_size: chunk.total_size,
+                GetRange::Suffix(0) => {
+                    return Err(StoreError::InvalidRange("zero-length suffix".into()));
+                }
+                GetRange::Suffix(n) => Some(OsGetRange::Suffix(n)),
+            };
+            let chunk = self.get_one(key, os_range, None).await?;
+            Ok(GetOutcome {
+                data: chunk.data,
+                etag: Etag(chunk.etag.clone()),
+                version: Version(chunk.etag),
+                total_size: chunk.total_size,
+            })
         })
+        .await
     }
 
     async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
-        let path = path_of(key);
-        let meta = self.store.head(&path).await.map_err(map_error_common)?;
-        map_meta(meta)
+        attempts::scope(StoreOp::Head, async move {
+            let path = path_of(key);
+            let meta = self.store.head(&path).await.map_err(map_error_common)?;
+            map_meta(meta)
+        })
+        .await
     }
 
     async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
-        let prefix_path = prefix_of(prefix);
-        let mut stream = match &page {
-            Some(PageToken(after)) => {
-                let offset = Path::from(after.as_str());
-                self.store.list_with_offset(prefix_path.as_ref(), &offset)
+        attempts::scope(StoreOp::List, async move {
+            let prefix_path = prefix_of(prefix);
+            let mut stream = match &page {
+                Some(PageToken(after)) => {
+                    let offset = Path::from(after.as_str());
+                    self.store.list_with_offset(prefix_path.as_ref(), &offset)
+                }
+                None => self.store.list(prefix_path.as_ref()),
+            };
+            let mut out = Vec::with_capacity(self.page_size.min(1024));
+            while out.len() < self.page_size {
+                match stream.next().await {
+                    Some(Ok(meta)) => out.push(map_meta(meta)?),
+                    Some(Err(e)) => return Err(map_error_common(e)),
+                    None => break,
+                }
             }
-            None => self.store.list(prefix_path.as_ref()),
-        };
-        let mut out = Vec::with_capacity(self.page_size.min(1024));
-        while out.len() < self.page_size {
-            match stream.next().await {
-                Some(Ok(meta)) => out.push(map_meta(meta)?),
-                Some(Err(e)) => return Err(map_error_common(e)),
-                None => break,
-            }
-        }
-        let next = if out.len() == self.page_size {
-            out.last().map(|m| PageToken(m.key.clone()))
-        } else {
-            None
-        };
-        Ok(ListPage { objects: out, next })
+            let next = if out.len() == self.page_size {
+                out.last().map(|m| PageToken(m.key.clone()))
+            } else {
+                None
+            };
+            Ok(ListPage { objects: out, next })
+        })
+        .await
     }
 
     async fn list_after(
@@ -1474,69 +1536,78 @@ impl ObjectStoreBackend for S3Store {
         start_after: Option<&str>,
         page: Option<PageToken>,
     ) -> Result<ListPage, StoreError> {
-        let prefix_path = prefix_of(prefix);
-        // A page token resumes strictly after the previous page's last key;
-        // on the first page `start_after` plays the same role. Both map to
-        // `object_store`'s `list_with_offset`, whose offset is exclusive
-        // (ListObjectsV2 `start-after`), so keys equal to the offset are
-        // skipped server-side and never transferred. A present page token is
-        // always past `start_after`, so it takes precedence.
-        let offset = match (&page, start_after) {
-            (Some(PageToken(after)), _) => Some(Path::from(after.as_str())),
-            (None, Some(after)) => Some(Path::from(after)),
-            (None, None) => None,
-        };
-        let mut stream = match &offset {
-            Some(offset) => self.store.list_with_offset(prefix_path.as_ref(), offset),
-            None => self.store.list(prefix_path.as_ref()),
-        };
-        let mut out = Vec::with_capacity(self.page_size.min(1024));
-        while out.len() < self.page_size {
-            match stream.next().await {
-                Some(Ok(meta)) => out.push(map_meta(meta)?),
-                Some(Err(e)) => return Err(map_error_common(e)),
-                None => break,
+        attempts::scope(StoreOp::List, async move {
+            let prefix_path = prefix_of(prefix);
+            // A page token resumes strictly after the previous page's last key;
+            // on the first page `start_after` plays the same role. Both map to
+            // `object_store`'s `list_with_offset`, whose offset is exclusive
+            // (ListObjectsV2 `start-after`), so keys equal to the offset are
+            // skipped server-side and never transferred. A present page token is
+            // always past `start_after`, so it takes precedence.
+            let offset = match (&page, start_after) {
+                (Some(PageToken(after)), _) => Some(Path::from(after.as_str())),
+                (None, Some(after)) => Some(Path::from(after)),
+                (None, None) => None,
+            };
+            let mut stream = match &offset {
+                Some(offset) => self.store.list_with_offset(prefix_path.as_ref(), offset),
+                None => self.store.list(prefix_path.as_ref()),
+            };
+            let mut out = Vec::with_capacity(self.page_size.min(1024));
+            while out.len() < self.page_size {
+                match stream.next().await {
+                    Some(Ok(meta)) => out.push(map_meta(meta)?),
+                    Some(Err(e)) => return Err(map_error_common(e)),
+                    None => break,
+                }
             }
-        }
-        let next = if out.len() == self.page_size {
-            out.last().map(|m| PageToken(m.key.clone()))
-        } else {
-            None
-        };
-        Ok(ListPage { objects: out, next })
+            let next = if out.len() == self.page_size {
+                out.last().map(|m| PageToken(m.key.clone()))
+            } else {
+                None
+            };
+            Ok(ListPage { objects: out, next })
+        })
+        .await
     }
 
     async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
-        let prefix_path = prefix_of(prefix);
-        let result = self
-            .store
-            .list_with_delimiter(prefix_path.as_ref())
-            .await
-            .map_err(map_error_common)?;
-        let objects = result
-            .objects
-            .into_iter()
-            .map(map_meta)
-            .collect::<Result<Vec<_>, _>>()?;
-        let common_prefixes = result
-            .common_prefixes
-            .into_iter()
-            .map(|p| format!("{p}/"))
-            .collect();
-        Ok(DelimitedList {
-            objects,
-            common_prefixes,
+        attempts::scope(StoreOp::ListDelimited, async move {
+            let prefix_path = prefix_of(prefix);
+            let result = self
+                .store
+                .list_with_delimiter(prefix_path.as_ref())
+                .await
+                .map_err(map_error_common)?;
+            let objects = result
+                .objects
+                .into_iter()
+                .map(map_meta)
+                .collect::<Result<Vec<_>, _>>()?;
+            let common_prefixes = result
+                .common_prefixes
+                .into_iter()
+                .map(|p| format!("{p}/"))
+                .collect();
+            Ok(DelimitedList {
+                objects,
+                common_prefixes,
+            })
         })
+        .await
     }
 
     async fn delete(&self, key: &str) -> Result<(), StoreError> {
-        let path = path_of(key);
-        match self.store.delete(&path).await {
-            Ok(()) => Ok(()),
-            // Idempotent per the contract: deleting a missing key succeeds.
-            Err(object_store::Error::NotFound { .. }) => Ok(()),
-            Err(e) => Err(map_error_common(e)),
-        }
+        attempts::scope(StoreOp::Delete, async move {
+            let path = path_of(key);
+            match self.store.delete(&path).await {
+                Ok(()) => Ok(()),
+                // Idempotent per the contract: deleting a missing key succeeds.
+                Err(object_store::Error::NotFound { .. }) => Ok(()),
+                Err(e) => Err(map_error_common(e)),
+            }
+        })
+        .await
     }
 
     fn capabilities(&self) -> Capabilities {

@@ -29,6 +29,26 @@
 //!   never double counted and no call is missed. A call cancelled by drop
 //!   before the inner future resolves records nothing at all, so `calls` is
 //!   completions, not attempts.
+//! - `attempts` counts billed HTTP requests, retries included, and is the one
+//!   figure this decorator does **not** record itself: the retry loop it would
+//!   need to see runs *below* the [`ObjectStoreBackend`] boundary, inside
+//!   `object_store`'s S3 client (`RetryConfig`, default `max_retries = 10`), so
+//!   one `get()` that retried nine times is a single completed `calls`/`get`
+//!   here while the provider bills ten requests (issue #928, ADR-0927
+//!   decision 8). The gap is one-directional: the real bill is never below
+//!   `calls` and, under throttling, is strictly above it. `attempts` is filled
+//!   in from the layer that *can* see each retry --- the S3 adapter's counting
+//!   HTTP connector ([`crate::s3`]) records one attempt per HTTP request it
+//!   issues via [`StoreMetrics::record_attempt`], into the same per-op block, so
+//!   `attempts >= calls` always and `attempts - calls` is the retry (billed)
+//!   overhead. A backend that issues no HTTP requests (for example
+//!   [`crate::memory::MemoryStore`]) leaves `attempts` at zero: there is no bill
+//!   and nothing retried. Because a single logical read may fan a whole-object
+//!   `GetRange::Full` into several bounded ranged GETs, `attempts` can exceed
+//!   `calls` for `get` even with no retry at all; each ranged request is a real
+//!   billed request. `attempts` for `put` likewise counts every request a
+//!   multipart upload issues (create, each part, complete), not one per logical
+//!   `put`.
 //! - `errors[class]` is indexed by [`StoreErrorClass`], one slot per
 //!   [`StoreError`] variant. `AlreadyExists` under `CreateIfAbsent` is a
 //!   protocol signal rather than a failure (ADR-0002), so a healthy commit
@@ -272,11 +292,20 @@ pub struct OpMetrics {
     ok: AtomicU64,
     errors: [AtomicU64; STORE_ERROR_CLASS_COUNT],
     bytes: AtomicU64,
+    /// Billed HTTP requests, retries included. Recorded by the S3 adapter's
+    /// counting connector, never by this decorator; see the [module docs](self).
+    attempts: AtomicU64,
     latency_micros_buckets: [AtomicU64; LATENCY_BUCKET_COUNT],
     latency_nanos_total: AtomicU64,
 }
 
 impl OpMetrics {
+    /// One billed HTTP request (an attempt, retries included). Separate from
+    /// [`record`](Self::record), which counts one completed logical call.
+    fn record_attempt(&self) {
+        self.attempts.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn record(&self, elapsed_nanos: u64, bytes: u64, err: Option<&StoreError>) {
         self.calls.fetch_add(1, Ordering::Relaxed);
         match err {
@@ -312,6 +341,7 @@ impl OpMetrics {
             ok: self.ok.load(Ordering::Relaxed),
             errors,
             bytes: self.bytes.load(Ordering::Relaxed),
+            attempts: self.attempts.load(Ordering::Relaxed),
             latency_micros_buckets,
             latency_nanos_total: self.latency_nanos_total.load(Ordering::Relaxed),
         }
@@ -330,6 +360,11 @@ pub struct OpMetricsSnapshot {
     pub errors: [u64; STORE_ERROR_CLASS_COUNT],
     /// Bytes returned (`get`) or offered (`put`); zero for every other op.
     pub bytes: u64,
+    /// Billed HTTP requests, retries included (issue #928). Always `>= calls`
+    /// for a backend that issues HTTP; `attempts - calls` is the retry (billed)
+    /// overhead `calls` alone hides. Zero for a non-HTTP backend. See the
+    /// [module docs](self) for why this decorator does not record it itself.
+    pub attempts: u64,
     /// Fixed histogram over [`LATENCY_BUCKET_BOUNDS_MICROS`] plus overflow.
     pub latency_micros_buckets: [u64; LATENCY_BUCKET_COUNT],
     /// Summed latency of every completed call, for an exact mean the buckets
@@ -367,6 +402,18 @@ impl StoreMetrics {
     /// returned data length for a successful `get`, and 0 otherwise.
     fn record(&self, op: StoreOp, elapsed_nanos: u64, bytes: u64, err: Option<&StoreError>) {
         self.op(op).record(elapsed_nanos, bytes, err);
+    }
+
+    /// Record one billed HTTP request (an attempt, retries included) for `op`,
+    /// into the same per-op block [`snapshot`](Self::snapshot) reads as
+    /// `attempts`. This is the seam the S3 adapter's counting HTTP connector
+    /// ([`crate::s3`]) records through: it fires once per HTTP request it issues,
+    /// so `attempts` sees `object_store`'s internal retries that a completed
+    /// `calls` never does (issue #928). It touches no other counter, so a caller
+    /// that records attempts and a decorator that records completions never
+    /// contend on the same field. See the [module docs](self).
+    pub fn record_attempt(&self, op: StoreOp) {
+        self.op(op).record_attempt();
     }
 
     /// Record one completed call from outside this module, using the same
@@ -457,9 +504,30 @@ impl<S: ObjectStoreBackend> InstrumentedStore<S> {
 
     /// Wrap `inner` with an injected clock, for deterministic latency tests.
     pub fn with_clock(inner: S, clock: Arc<dyn MonotonicClock>) -> Self {
+        Self::with_clock_and_metrics(inner, clock, Arc::new(StoreMetrics::default()))
+    }
+
+    /// Wrap `inner` recording into a caller-supplied [`StoreMetrics`], so the
+    /// `attempts` counter the S3 adapter's counting connector fills in
+    /// ([`StoreMetrics::record_attempt`], issue #928) and the `calls` counter
+    /// this decorator fills in land in one shared block, read by a single
+    /// [`snapshot`](StoreMetrics::snapshot). Build the `Arc` first, hand a clone
+    /// to `S3Store` so its connector records attempts into it, and pass the same
+    /// `Arc` here; [`metrics`](Self::metrics) then returns it. `new`/`with_clock`
+    /// keep their own private block (no attempts source), unchanged.
+    pub fn with_metrics(inner: S, metrics: Arc<StoreMetrics>) -> Self {
+        Self::with_clock_and_metrics(inner, Arc::new(InstantClock::new()), metrics)
+    }
+
+    /// Wrap `inner` with both an injected clock and a shared [`StoreMetrics`].
+    pub fn with_clock_and_metrics(
+        inner: S,
+        clock: Arc<dyn MonotonicClock>,
+        metrics: Arc<StoreMetrics>,
+    ) -> Self {
         InstrumentedStore {
             inner,
-            metrics: Arc::new(StoreMetrics::default()),
+            metrics,
             clock,
         }
     }
@@ -675,6 +743,34 @@ mod tests {
         assert_eq!(snap.get.errors_total(), snap.get.calls - snap.get.ok);
         assert_eq!(snap.get.latency_nanos_total, 150_000);
         assert_eq!(snap.put, OpMetricsSnapshot::default(), "no put recorded");
+    }
+
+    #[test]
+    fn attempts_are_separate_from_calls_and_do_not_touch_other_counters() {
+        // A get() that the backend retried twice below the trait boundary: the
+        // connector records three billed attempts, the decorator one completion.
+        // `attempts` must read 3 and `calls` 1, so `attempts - calls` is exactly
+        // the retry overhead #928 exists to expose, and no other counter moves.
+        let metrics = StoreMetrics::default();
+        metrics.record_attempt(StoreOp::Get);
+        metrics.record_attempt(StoreOp::Get);
+        metrics.record_attempt(StoreOp::Get);
+        metrics.record(StoreOp::Get, 10_000, 42, None);
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.get.attempts, 3, "three billed HTTP requests");
+        assert_eq!(snap.get.calls, 1, "one completed logical call");
+        assert_eq!(snap.get.ok, 1);
+        assert_eq!(snap.get.bytes, 42);
+        assert_eq!(
+            snap.get.errors_total(),
+            0,
+            "recording attempts must not move any error class"
+        );
+        // A quiet op with no attempts recorded reads exactly zero, so the figure
+        // never drifts on a backend that issues no HTTP (e.g. MemoryStore).
+        assert_eq!(snap.put.attempts, 0);
+        assert_eq!(snap.head.attempts, 0);
     }
 
     #[test]

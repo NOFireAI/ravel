@@ -393,7 +393,15 @@ pub fn build_store(cli: &Cli) -> anyhow::Result<BuiltStore> {
                 auth,
                 instance_metadata_endpoint: cli.s3_instance_metadata_endpoint.clone(),
             };
-            let store = S3Store::new(config.clone())
+            // One shared metrics block for the whole S3 chain: the counting HTTP
+            // connector inside `S3Store` records billed HTTP requests (attempts,
+            // retries included) into it below `object_store`'s retry loop, and
+            // the `InstrumentedStore` decorator records completed calls into the
+            // same block, so `ravel_store_attempts_total` and
+            // `ravel_store_calls_total` come from one snapshot (issue #928). Built
+            // before the store so the connector and the decorator share it.
+            let metrics = Arc::new(StoreMetrics::default());
+            let store = S3Store::with_metrics(config.clone(), Arc::clone(&metrics))
                 .map_err(|err| anyhow::anyhow!("failed to build S3 store: {err}"))?;
 
             // Per-tenant SSE-KMS routing (ADR-0062 decision 1, ADR-0072
@@ -404,12 +412,13 @@ pub fn build_store(cli: &Cli) -> anyhow::Result<BuiltStore> {
                     Arc::new(store) as Arc<dyn ObjectStoreBackend>,
                     config,
                 ));
-                let instrumented = InstrumentedStore::new(SharedKmsStore(kms.clone()));
-                let metrics = instrumented.metrics();
+                let instrumented = InstrumentedStore::with_metrics(
+                    SharedKmsStore(kms.clone()),
+                    Arc::clone(&metrics),
+                );
                 (Arc::new(instrumented), metrics, Some(kms))
             } else {
-                let instrumented = InstrumentedStore::new(store);
-                let metrics = instrumented.metrics();
+                let instrumented = InstrumentedStore::with_metrics(store, Arc::clone(&metrics));
                 (Arc::new(instrumented), metrics, None)
             }
         }
