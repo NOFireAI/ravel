@@ -183,6 +183,13 @@ pub async fn publish_record_with_conservation(
 
     let record_key = keys::compaction_record_key_for(&record)?;
     let payload = record.encode_to_vec();
+    // Finish/publish phase (issue #977): the encoded record payload is the only
+    // allocation this phase adds on top of the parts still retained in the
+    // merge's `PartSink`. Recording it here lets a report show the publish phase
+    // is small next to the retained-parts plateau, not the source of a spike.
+    if let Some(t) = config.merge_memory_tracker.as_ref() {
+        t.set_publish_record_bytes(payload.len() as u64);
+    }
     let checksum = UploadChecksum::Crc32c(crc32c::crc32c(&payload));
     let opts = PutOptions::create_if_absent().with_checksum(checksum);
 
