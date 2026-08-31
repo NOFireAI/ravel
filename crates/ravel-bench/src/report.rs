@@ -43,6 +43,7 @@ use ravel_ingest::{Clock, IngestConfig, IngestRouter, SystemClock, WriteMode};
 use ravel_object_store::{InstrumentedStore, ObjectStoreBackend, StoreMetricsSnapshot};
 use ravel_promql::Value;
 use ravel_query::{EngineConfig, QueryEngine};
+use ravel_types::cost_profile::StoreCostProfile;
 use ravel_types::{Signal, TenantId, TimeRange};
 use serde::{Deserialize, Serialize};
 
@@ -105,6 +106,12 @@ pub struct ReportRunConfig {
     pub ack_timeout_secs: u64,
     pub git_commit: String,
     pub toolchain: String,
+    /// The active store cost profile this run is priced at (ADR-0996 decision
+    /// 1). Stamped verbatim into the environment block and used to model the
+    /// pass's request/transfer/retrieval cost. Defaults to
+    /// [`StoreCostProfile::reference`]; no CLI flag sets it here (epic #996
+    /// task 996-5 owns the server/CLI surface).
+    pub store_cost_profile: StoreCostProfile,
 }
 
 fn percentile(sorted_ns: &[u64], pct: f64) -> u64 {
@@ -136,6 +143,12 @@ pub struct BenchReport {
     pub query: QuerySection,
     pub s3_requests: RequestCounts,
     pub bytes: BytesSection,
+    /// Modeled object-store cost of the whole workload at the stamped profile
+    /// (ADR-0996 decision 3). Defaulted on read so a report written before it
+    /// existed still deserializes; every leaf is optional and absence is never
+    /// a zero.
+    #[serde(default)]
+    pub modeled_cost: ModeledCost,
 }
 
 /// The provenance block. A number without this is not evidence.
@@ -151,6 +164,91 @@ pub struct Environment {
     pub workload: WorkloadShape,
     pub git_commit: String,
     pub toolchain: String,
+    /// The active store cost profile this report was priced at (ADR-0996
+    /// decision 1): name and all price fields, verbatim, so a modeled-cost
+    /// figure can be reconciled against the exact prices that produced it. A
+    /// figure without this stamp is not a result (the allocator lesson).
+    ///
+    /// Named `requested`/`effective` to match the split the SQL-latency report
+    /// needs on its Flight lane, where a foreign server's own profile governs.
+    /// This report always prices in process, so the requested profile is also
+    /// the effective one and `store_cost_profile_effective` is always `Some`.
+    #[serde(default = "default_store_cost_profile")]
+    pub store_cost_profile_requested: StoreCostProfile,
+    /// The profile that actually governed pricing, or `None` on a lane that
+    /// cannot know it. Always `Some` on this in-process report; the field
+    /// exists so the schema matches the SQL-latency stamp rule. Skipped in JSON
+    /// when `None`, keeping the no-null contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_cost_profile_effective: Option<StoreCostProfile>,
+}
+
+/// The profile a report written before the cost stamp existed deserializes to,
+/// and the default a run uses when no profile was chosen: the reference profile.
+fn default_store_cost_profile() -> StoreCostProfile {
+    StoreCostProfile::reference()
+}
+
+/// Modeled object-store cost of a pass at the active cost profile (ADR-0996
+/// decision 3). Every figure is integer nanodollars, and every figure is
+/// optional: an absent figure is ABSENT, never a zero.
+///
+/// - `modeled_request_cost_nanodollars` prices BILLED ATTEMPTS per class through
+///   the profile (PUT-class = PUT + LIST, GET-class = GET). `None` when the
+///   backend has no attempt source: the request cost is never modeled from
+///   completed CALLS, which would understate a retrying backend and read as a
+///   real bill instead of a model.
+/// - `modeled_transfer_cost_nanodollars` / `modeled_retrieval_cost_nanodollars`
+///   are present ONLY when the stamped profile carries a nonzero transfer /
+///   retrieval per-GiB price, priced from the wire-byte counters and NEVER
+///   folded into the request term (ADR-0996 decision 3: a profile with byte
+///   prices must not stamp them while reporting request fees alone).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ModeledCost {
+    /// Requests priced per class from BILLED ATTEMPTS. `None` when attempts are
+    /// absent (no attempt source). Skipped in JSON when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modeled_request_cost_nanodollars: Option<u64>,
+    /// Transfer (egress) cost from the wire-byte counter. `None` unless the
+    /// profile's transfer price is nonzero. Never folded into the request term.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modeled_transfer_cost_nanodollars: Option<u64>,
+    /// Retrieval cost from the wire-byte counter. `None` unless the profile's
+    /// retrieval price is nonzero. Never folded into the request term.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modeled_retrieval_cost_nanodollars: Option<u64>,
+}
+
+impl ModeledCost {
+    /// Model a pass's cost at `profile`.
+    ///
+    /// `put_class_attempts`/`get_class_attempts` are BILLED ATTEMPTS already
+    /// folded into their billing class (PUT-class carries LIST, since S3 bills a
+    /// LIST as a PUT). Either being `None` means the backend has no attempt
+    /// source, so the request term is `None` rather than a cost modeled from
+    /// calls. `transfer_bytes`/`retrieval_bytes` are wire-byte counters; each
+    /// byte term appears only when its per-GiB price is nonzero.
+    pub fn model(
+        profile: &StoreCostProfile,
+        put_class_attempts: Option<u64>,
+        get_class_attempts: Option<u64>,
+        transfer_bytes: u64,
+        retrieval_bytes: u64,
+    ) -> ModeledCost {
+        let modeled_request_cost_nanodollars = match (put_class_attempts, get_class_attempts) {
+            (Some(puts), Some(gets)) => Some(profile.modeled_nanodollars(puts, gets, 0)),
+            _ => None,
+        };
+        let modeled_transfer_cost_nanodollars = (profile.transfer_nanodollars_per_gib > 0)
+            .then(|| profile.modeled_nanodollars(0, 0, transfer_bytes));
+        let modeled_retrieval_cost_nanodollars = (profile.retrieval_nanodollars_per_gib > 0)
+            .then(|| profile.retrieval_nanodollars(retrieval_bytes));
+        ModeledCost {
+            modeled_request_cost_nanodollars,
+            modeled_transfer_cost_nanodollars,
+            modeled_retrieval_cost_nanodollars,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -321,6 +419,16 @@ impl RequestCounts {
             counts.assert_calls_le_attempts();
         }
         counts
+    }
+
+    /// Billed attempts in the PUT billing class: `put_attempts + list_attempts`
+    /// (S3 bills a LIST as a PUT). `None` exactly when attempts are unwired, so
+    /// the modeled request cost is absent rather than a cost from calls.
+    pub fn put_class_attempts(&self) -> Option<u64> {
+        match (self.put_attempts, self.list_attempts) {
+            (Some(put), Some(list)) => Some(put.saturating_add(list)),
+            _ => None,
+        }
     }
 
     /// The ADR-0996 decision-3 reconciliation: billed `attempts` never
@@ -608,6 +716,18 @@ pub async fn run(config: &ReportRunConfig) -> BenchReport {
         RequestCounts::from_metrics(&snapshot, config.backend_bills_requests, attempts_wired);
     let bytes_written = snapshot.put.bytes;
     let bytes_read = snapshot.get.bytes;
+    // Model the pass at the active profile. The request term prices BILLED
+    // ATTEMPTS per class, so it is absent on a backend with no attempt source
+    // (MemoryStore) rather than a cost read off free calls. The transfer and
+    // retrieval terms price the GET wire bytes moved (`bytes_read`), and appear
+    // only when the profile carries a nonzero byte price.
+    let modeled_cost = ModeledCost::model(
+        &config.store_cost_profile,
+        request_counts.put_class_attempts(),
+        request_counts.get_attempts,
+        bytes_read,
+        bytes_read,
+    );
     let write_amplification = if logical_bytes == 0 {
         0.0
     } else {
@@ -623,6 +743,10 @@ pub async fn run(config: &ReportRunConfig) -> BenchReport {
             workload: w.clone(),
             git_commit: config.git_commit.clone(),
             toolchain: config.toolchain.clone(),
+            store_cost_profile_requested: config.store_cost_profile.clone(),
+            // In process: the requested profile priced the run, so it is also
+            // the effective one.
+            store_cost_profile_effective: Some(config.store_cost_profile.clone()),
         },
         ingest: IngestSection {
             strict_ack_latency_ms: latency_report(ack_latencies_ns),
@@ -640,6 +764,7 @@ pub async fn run(config: &ReportRunConfig) -> BenchReport {
             written: bytes_written,
             read: bytes_read,
         },
+        modeled_cost,
     }
 }
 
@@ -893,6 +1018,7 @@ mod tests {
             ack_timeout_secs: 5,
             git_commit: "0000000000000000000000000000000000000000".to_string(),
             toolchain: "rustc 0.0.0-test".to_string(),
+            store_cost_profile: StoreCostProfile::reference(),
         }
     }
 
@@ -981,11 +1107,235 @@ mod tests {
         assert!(report.bytes.written > 0, "bytes written must be > 0");
         assert!(report.bytes.read > 0, "bytes read must be > 0");
 
+        // Cost profile stamp: the reference profile, verbatim, present exactly
+        // once, with `effective` populated (this report always prices in
+        // process). A MemoryStore run has no attempt source, so the modeled
+        // request cost is ABSENT (never a zero modeled from calls), and the
+        // reference profile's byte prices are zero, so the transfer/retrieval
+        // terms are absent too.
+        assert_eq!(
+            report.environment.store_cost_profile_requested,
+            StoreCostProfile::reference()
+        );
+        assert_eq!(
+            report.environment.store_cost_profile_effective,
+            Some(StoreCostProfile::reference()),
+            "in-process run: the requested profile is also the effective one"
+        );
+        assert_eq!(
+            report.modeled_cost.modeled_request_cost_nanodollars, None,
+            "MemoryStore has no attempt source: modeled request cost is absent, not zero"
+        );
+        assert_eq!(report.modeled_cost.modeled_transfer_cost_nanodollars, None);
+        assert_eq!(report.modeled_cost.modeled_retrieval_cost_nanodollars, None);
+
         // The whole thing serializes to JSON with no null anywhere.
         let json = serde_json::to_value(&report).expect("serialize report");
         assert!(
             !json_has_null(&json),
             "report JSON must contain no null: {json}"
+        );
+        // The profile stamp appears exactly once (one requested, one effective).
+        assert_eq!(
+            count_keys(&json, "store_cost_profile_requested"),
+            1,
+            "the requested profile stamp must appear exactly once"
+        );
+        assert_eq!(
+            count_keys(&json, "store_cost_profile_effective"),
+            1,
+            "the effective profile stamp must appear exactly once"
+        );
+        // Absent modeled figures are SKIPPED, not null: the no-null contract is
+        // kept by omission, so the modeled_cost object carries no cost key here.
+        assert_eq!(
+            count_keys(&json, "modeled_request_cost_nanodollars"),
+            0,
+            "an absent modeled request cost is skipped, never serialized as a zero or null"
+        );
+    }
+
+    /// Count how many times `key` appears as an object key anywhere in `v`.
+    /// Used to assert a stamp is present *exactly once*, which a bare
+    /// serialize-and-check-non-null cannot (ADR-0996's present-exactly-once
+    /// discipline).
+    fn count_keys(v: &serde_json::Value, key: &str) -> usize {
+        match v {
+            serde_json::Value::Array(a) => a.iter().map(|e| count_keys(e, key)).sum(),
+            serde_json::Value::Object(o) => {
+                let here = o.contains_key(key) as usize;
+                here + o.values().map(|e| count_keys(e, key)).sum::<usize>()
+            }
+            _ => 0,
+        }
+    }
+
+    /// A `RequestCounts` with billed attempts wired: `put`/`get`/`list` calls
+    /// and their attempts, so the modeled request cost can be pinned to the
+    /// nanodollar. `list` bills PUT-class, so PUT-class attempts are
+    /// `put_attempts + list_attempts`.
+    fn counts_with_attempts(
+        put_attempts: u64,
+        get_attempts: u64,
+        list_attempts: u64,
+    ) -> RequestCounts {
+        RequestCounts {
+            backend_bills_requests: true,
+            put: put_attempts,
+            get: get_attempts,
+            list: list_attempts,
+            put_attempts: Some(put_attempts),
+            get_attempts: Some(get_attempts),
+            list_attempts: Some(list_attempts),
+            put_retry_overhead: Some(0),
+            get_retry_overhead: Some(0),
+            list_retry_overhead: Some(0),
+        }
+    }
+
+    #[test]
+    fn modeled_request_cost_is_attempts_times_profile_to_the_nanodollar() {
+        // 3 PUT + 2 LIST attempts = 5 PUT-class attempts; 7 GET-class attempts.
+        // At the reference profile (PUT $5/M = 5_000, GET $0.40/M = 400):
+        //   5 * 5_000 + 7 * 400 = 25_000 + 2_800 = 27_800 nanodollars.
+        let counts = counts_with_attempts(3, 7, 2);
+        assert_eq!(
+            counts.put_class_attempts(),
+            Some(5),
+            "PUT-class folds LIST in: 3 PUT + 2 LIST"
+        );
+        let profile = StoreCostProfile::reference();
+        let cost = ModeledCost::model(
+            &profile,
+            counts.put_class_attempts(),
+            counts.get_attempts,
+            0,
+            0,
+        );
+        assert_eq!(cost.modeled_request_cost_nanodollars, Some(27_800));
+        // Derived from the prices, not a repeated literal: 5 PUT-class at the
+        // PUT price plus 7 GET at the GET price, nothing else.
+        assert_eq!(
+            cost.modeled_request_cost_nanodollars,
+            Some(5 * profile.put_class_nanodollars + 7 * profile.get_class_nanodollars)
+        );
+        // Reference profile has zero byte prices, so no byte term is modeled
+        // even though bytes moved.
+        assert_eq!(cost.modeled_transfer_cost_nanodollars, None);
+        assert_eq!(cost.modeled_retrieval_cost_nanodollars, None);
+    }
+
+    #[test]
+    fn absent_attempts_give_an_absent_modeled_request_cost() {
+        // No attempt source: the request term is ABSENT, never a zero modeled
+        // from the (real, free) call counts. Skipped in JSON, keeping no-null.
+        let profile = StoreCostProfile::reference();
+        let cost = ModeledCost::model(&profile, None, None, 4096, 4096);
+        assert_eq!(
+            cost.modeled_request_cost_nanodollars, None,
+            "attempts absent => request cost absent, not zero"
+        );
+        let json = serde_json::to_value(&cost).expect("serialize");
+        assert!(
+            json.get("modeled_request_cost_nanodollars").is_none(),
+            "an absent request cost must be skipped, not null: {json}"
+        );
+        assert!(!json_has_null(&json), "no null anywhere: {json}");
+    }
+
+    #[test]
+    fn nonzero_byte_prices_add_labelled_terms_without_moving_the_request_term() {
+        // A profile that bills transfer and retrieval. The request term is
+        // computed from attempts exactly as at the reference profile (the byte
+        // prices must NOT fold into it); the two byte terms appear, each
+        // labelled, priced from the wire-byte counters.
+        let profile = StoreCostProfile {
+            name: "egress-and-retrieval".to_string(),
+            put_class_nanodollars: 5_000,
+            get_class_nanodollars: 400,
+            delete_class_nanodollars: 0,
+            transfer_nanodollars_per_gib: 90_000_000, // $0.09/GiB
+            retrieval_nanodollars_per_gib: 10_000_000, // $0.01/GiB
+        };
+        let counts = counts_with_attempts(3, 7, 2);
+        let two_gib: u64 = 2 * 1024 * 1024 * 1024;
+        let cost = ModeledCost::model(
+            &profile,
+            counts.put_class_attempts(),
+            counts.get_attempts,
+            two_gib,
+            two_gib,
+        );
+        // Request term unchanged from the reference-profile figure above: byte
+        // prices do not touch it.
+        assert_eq!(
+            cost.modeled_request_cost_nanodollars,
+            Some(27_800),
+            "the request term is priced from attempts alone, never folded with byte prices"
+        );
+        // Byte terms present and labelled: 2 GiB at each per-GiB price.
+        assert_eq!(cost.modeled_transfer_cost_nanodollars, Some(2 * 90_000_000));
+        assert_eq!(
+            cost.modeled_retrieval_cost_nanodollars,
+            Some(2 * 10_000_000)
+        );
+
+        // A profile that bills only transfer omits the retrieval term entirely.
+        let transfer_only = StoreCostProfile {
+            retrieval_nanodollars_per_gib: 0,
+            ..profile.clone()
+        };
+        let cost = ModeledCost::model(
+            &transfer_only,
+            counts.put_class_attempts(),
+            counts.get_attempts,
+            two_gib,
+            two_gib,
+        );
+        assert_eq!(cost.modeled_transfer_cost_nanodollars, Some(2 * 90_000_000));
+        assert_eq!(
+            cost.modeled_retrieval_cost_nanodollars, None,
+            "a zero retrieval price omits the retrieval term, not a zero"
+        );
+        assert_eq!(cost.modeled_request_cost_nanodollars, Some(27_800));
+    }
+
+    #[test]
+    fn the_profile_moves_the_modeled_figure_from_identical_counts() {
+        // Same attempt counts, two profiles: the modeled cost must differ. This
+        // is the redundant-figure check ADR-0996 wants -- a price change with an
+        // unchanged count still moves the reported cost.
+        let counts = counts_with_attempts(3, 7, 2);
+        let reference = StoreCostProfile::reference();
+        let custom = StoreCostProfile::from_toml_str(
+            "name = \"s3-cross-region\"\n\
+             put_class_nanodollars = 5500\n\
+             get_class_nanodollars = 440\n\
+             transfer_nanodollars_per_gib = 0\n\
+             retrieval_nanodollars_per_gib = 0\n",
+        )
+        .expect("parse custom profile");
+
+        let ref_cost = ModeledCost::model(
+            &reference,
+            counts.put_class_attempts(),
+            counts.get_attempts,
+            0,
+            0,
+        );
+        let custom_cost = ModeledCost::model(
+            &custom,
+            counts.put_class_attempts(),
+            counts.get_attempts,
+            0,
+            0,
+        );
+        // Reference: 5*5000 + 7*400 = 27_800. Custom: 5*5500 + 7*440 = 30_580.
+        assert_eq!(ref_cost.modeled_request_cost_nanodollars, Some(27_800));
+        assert_eq!(custom_cost.modeled_request_cost_nanodollars, Some(30_580));
+        assert_ne!(
+            ref_cost.modeled_request_cost_nanodollars, custom_cost.modeled_request_cost_nanodollars,
+            "identical counts under different profiles must model different costs"
         );
     }
 

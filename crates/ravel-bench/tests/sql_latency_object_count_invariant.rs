@@ -104,6 +104,7 @@ async fn l0_object_count_equals_distinct_data_object_keys() {
         warm_catalog: false,
         logs_suffix_len: None,
         logs_request_cost_bytes: ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES,
+        store_cost_profile: ravel_types::cost_profile::StoreCostProfile::reference(),
     };
     let report = run_generated(&cfg).await.expect("generated lane runs");
 

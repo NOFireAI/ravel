@@ -28,6 +28,7 @@ use ravel_bench::sql_latency::{GenerateConfig, measure_corpus, run_generated};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::memory::MemoryStore;
 use ravel_sql::DEFAULT_MAX_QUERY_BYTES;
+use ravel_types::cost_profile::StoreCostProfile;
 use ravel_types::{TenantId, TimeRange};
 
 /// The frozen query clock the generated lane uses (`4h` in ns); the generated
@@ -61,6 +62,7 @@ fn small_generate_config(store: Arc<dyn ObjectStoreBackend>, runs: usize) -> Gen
         warm_catalog: false,
         logs_suffix_len: None,
         logs_request_cost_bytes: ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES,
+        store_cost_profile: StoreCostProfile::reference(),
     }
 }
 
@@ -366,4 +368,73 @@ fn the_stdout_artifact_is_one_complete_json_document_with_no_trailing_bytes() {
         stderr.contains("sql_latency_bench report"),
         "the human summary must be on stderr: {stderr}"
     );
+}
+
+/// The generated (in-process) lane stamps the active cost profile and models
+/// the pass's cost (ADR-0996 decision 1 and 3). The stamp is present exactly
+/// once with `effective` populated (this lane prices in process); the modeled
+/// REQUEST cost is ABSENT, because this harness has no attempt source and a
+/// request cost is never modeled from calls; and the reference profile's zero
+/// byte prices leave the transfer/retrieval terms absent too. Absence is by
+/// omission, so the report still carries no null.
+#[tokio::test]
+async fn generated_lane_stamps_the_cost_profile_and_models_absent_request_cost() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let report = run_generated(&small_generate_config(Arc::clone(&store), 2))
+        .await
+        .expect("generated lane runs");
+
+    assert_eq!(
+        report.provenance.store_cost_profile_requested,
+        StoreCostProfile::reference()
+    );
+    assert_eq!(
+        report.provenance.store_cost_profile_effective,
+        Some(StoreCostProfile::reference()),
+        "in-process lane: the requested profile is also the effective one"
+    );
+    assert_eq!(
+        report.modeled_cost.modeled_request_cost_nanodollars, None,
+        "no attempt source: the modeled request cost is absent, never a zero from calls"
+    );
+    assert_eq!(report.modeled_cost.modeled_transfer_cost_nanodollars, None);
+    assert_eq!(report.modeled_cost.modeled_retrieval_cost_nanodollars, None);
+
+    // Present exactly once, and no null anywhere: the absent modeled figures
+    // are skipped, not serialized as zero or null.
+    let json = serde_json::to_value(&report).expect("serialize report");
+    assert_eq!(
+        count_keys(&json, "store_cost_profile_requested"),
+        1,
+        "the requested profile stamp appears exactly once"
+    );
+    assert_eq!(count_keys(&json, "store_cost_profile_effective"), 1);
+    // The modeled cost object carries no request-cost key: an absent figure is
+    // skipped, not serialized as a zero. (The report as a whole does carry
+    // nulls in unrelated optional fields such as `logs_suffix_len`, so a
+    // report-wide no-null assertion does not belong here; the modeled-cost and
+    // stamp fields keep the contract by omission, checked above.)
+    assert_eq!(
+        count_keys(&json, "modeled_request_cost_nanodollars"),
+        0,
+        "an absent modeled request cost is skipped entirely"
+    );
+    assert_eq!(
+        count_keys(&json, "modeled_transfer_cost_nanodollars"),
+        0,
+        "a zero transfer price omits the transfer term entirely"
+    );
+    assert_eq!(count_keys(&json, "modeled_retrieval_cost_nanodollars"), 0);
+}
+
+/// Count how many times `key` appears as an object key anywhere in `v`.
+fn count_keys(v: &serde_json::Value, key: &str) -> usize {
+    match v {
+        serde_json::Value::Array(a) => a.iter().map(|e| count_keys(e, key)).sum(),
+        serde_json::Value::Object(o) => {
+            let here = o.contains_key(key) as usize;
+            here + o.values().map(|e| count_keys(e, key)).sum::<usize>()
+        }
+        _ => 0,
+    }
 }
