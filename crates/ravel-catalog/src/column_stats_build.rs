@@ -21,7 +21,8 @@
 //! v1 (field-11) publish path uses it unchanged, so a v1 object stays
 //! byte-for-byte as before; the v2 (field-13, part-keyed) publish path
 //! overwrites `writer_id` with the covered part's content hash (the v2 join
-//! key) before encoding.
+//! key) before encoding. Both records come from one read of the object, via
+//! [`SegmentColumnStatsCache`].
 
 use ravel_logseg::{ColumnSelection, FieldType, LogSegError, Predicate, RlogConfig, RlogReader};
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
@@ -377,6 +378,17 @@ pub(crate) async fn fetch_segment_column_stats(
     entry: &ravel_proto::catalog::v1::SnapshotEntry,
     typed_columns: &[DeclaredTypedColumn],
 ) -> Result<ColumnStatsSegment, ColumnStatsBuildError> {
+    let data_key = segment_data_key(tenant, signal, entry)?;
+    let columns = tally_object_columns(store, &data_key, typed_columns).await?;
+    Ok(segment_from_columns(entry, columns))
+}
+
+/// The key of the RLOG object `entry` addresses.
+fn segment_data_key(
+    tenant: &TenantHash,
+    signal: Signal,
+    entry: &ravel_proto::catalog::v1::SnapshotEntry,
+) -> Result<String, ColumnStatsBuildError> {
     let content_hash: [u8; 32] = entry
         .content_hash
         .as_slice()
@@ -388,9 +400,8 @@ pub(crate) async fn fetch_segment_column_stats(
     // slots (`fold::build_l1_snapshot_entry`) to carry the 32-byte
     // input_set_hash and the part_index, and addresses its RLOG part object by
     // the reconstructed L1 part key. Both object shapes are RLOG and decode
-    // through the same reader below, so the tally path that follows is
-    // level-agnostic.
-    let data_key = if entry.level == 0 {
+    // through the same reader, so the tally path itself is level-agnostic.
+    if entry.level == 0 {
         let writer_id_bytes: [u8; 16] = entry
             .writer_id
             .as_slice()
@@ -405,7 +416,8 @@ pub(crate) async fn fetch_segment_column_stats(
             entry.writer_epoch,
             entry.writer_seq,
             &content_hash,
-        )?
+        )
+        .map_err(ColumnStatsBuildError::from)
     } else {
         let input_set_hash: [u8; 32] = entry
             .writer_id
@@ -424,9 +436,21 @@ pub(crate) async fn fetch_segment_column_stats(
             &input_set_hash16,
             part_index,
             &hash16,
-        )?
-    };
-    let got = store.get(&data_key, GetRange::Full).await?;
+        )
+        .map_err(ColumnStatsBuildError::from)
+    }
+}
+
+/// Reads the object at `data_key` and tallies one [`ColumnStat`] per
+/// `typed_columns` entry the object actually carries. Depends only on the
+/// object's bytes and `typed_columns`, which is what makes the per-object
+/// memoization in [`SegmentColumnStatsCache`] exact.
+async fn tally_object_columns(
+    store: &dyn ObjectStoreBackend,
+    data_key: &str,
+    typed_columns: &[DeclaredTypedColumn],
+) -> Result<Vec<ColumnStat>, ColumnStatsBuildError> {
+    let got = store.get(data_key, GetRange::Full).await?;
 
     let cfg = RlogConfig::default();
     let reader = RlogReader::new(&got.data, &cfg)?;
@@ -473,19 +497,96 @@ pub(crate) async fn fetch_segment_column_stats(
         }
     }
 
-    let columns = tallies
+    Ok(tallies
         .into_iter()
         .map(|(name, tally)| tally.into_proto(name))
-        .collect();
+        .collect())
+}
 
-    Ok(ColumnStatsSegment {
+/// Wraps one object's tallied columns in the record shape the fold publishes:
+/// the five-field identity tuple as `entry` carries it (see this module's docs
+/// for how the v1 and v2 publish paths each treat `writer_id`).
+fn segment_from_columns(
+    entry: &ravel_proto::catalog::v1::SnapshotEntry,
+    columns: Vec<ColumnStat>,
+) -> ColumnStatsSegment {
+    ColumnStatsSegment {
         ingest_hour_bucket: entry.ingest_hour_bucket,
         shard: entry.shard,
         writer_id: entry.writer_id.clone(),
         writer_epoch: entry.writer_epoch,
         writer_seq: entry.writer_seq,
         columns,
-    })
+    }
+}
+
+/// Whether a [`SegmentColumnStatsCache`] lookup issued a store GET, so the
+/// caller charges `get_requests` for the reads that really happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StatsFetch {
+    Issued,
+    Reused,
+}
+
+/// One fold's per-object column-statistics tallies, so the dual publish reads
+/// each covered object once (#964).
+///
+/// The v1 (field 11) publish covers the L0 entries and the v2 (field 13)
+/// publish covers the same L0 entries plus the L1 ones. Each pass building its
+/// own tally cost two GETs and two full object scans per L0 part where one
+/// serves both.
+///
+/// Keyed by the object key an entry addresses, not by the entry's identity
+/// tuple or its content hash alone: a hit is then provably the same immutable
+/// object (docs/object-store-contract.md), so the memoized columns are exactly
+/// what a second read would have tallied, while two entries that share a
+/// content hash under different identities still read their own objects. The
+/// record's identity fields always come from the requesting entry, never from
+/// whichever entry populated the tally.
+///
+/// Failures are not memoized: a segment whose fetch, decode, or tally fails
+/// keeps its per-pass behavior (dropped from that publish, retried by the
+/// next), so a transient store error cannot change what either object holds.
+pub(crate) struct SegmentColumnStatsCache<'a> {
+    typed_columns: &'a [DeclaredTypedColumn],
+    tallied: std::collections::HashMap<String, Vec<ColumnStat>>,
+}
+
+impl<'a> SegmentColumnStatsCache<'a> {
+    /// The declared columns are fixed for the cache's whole life: they are part
+    /// of what a tally depends on, and the cache key does not carry them.
+    pub(crate) fn new(typed_columns: &'a [DeclaredTypedColumn]) -> Self {
+        Self {
+            typed_columns,
+            tallied: std::collections::HashMap::new(),
+        }
+    }
+
+    /// The column-statistics record for `entry`, tallying its object on the
+    /// first request for that object and reusing the tally afterwards. Equal to
+    /// what [`fetch_segment_column_stats`] returns for the same entry, which is
+    /// what the miss path calls: deriving the key is pure and cheap, so it costs
+    /// nothing to derive it here for the lookup and let the builder derive it
+    /// again for the read.
+    pub(crate) async fn segment_column_stats(
+        &mut self,
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        signal: Signal,
+        entry: &ravel_proto::catalog::v1::SnapshotEntry,
+    ) -> Result<(ColumnStatsSegment, StatsFetch), ColumnStatsBuildError> {
+        let data_key = segment_data_key(tenant, signal, entry)?;
+        if let Some(columns) = self.tallied.get(&data_key) {
+            return Ok((
+                segment_from_columns(entry, columns.clone()),
+                StatsFetch::Reused,
+            ));
+        }
+        let segment =
+            fetch_segment_column_stats(store, tenant, signal, entry, self.typed_columns).await?;
+        self.tallied.insert(data_key, segment.columns.clone());
+        Ok((segment, StatsFetch::Issued))
+    }
 }
 
 /// Decodes and part-binding-checks the previous fold's column-stats
@@ -520,7 +621,7 @@ mod tests {
     use ravel_logseg::writer::ObjectIdentity;
     use ravel_logseg::{LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
     use ravel_object_store::memory::MemoryStore;
-    use ravel_object_store::{ObjectStoreBackend, PutOptions};
+    use ravel_object_store::{InstrumentedStore, ObjectStoreBackend, PutOptions};
     use ravel_proto::catalog::v1::SnapshotEntry;
     use ravel_proto::catalog::v1::column_value::Kind;
     use ravel_types::logstream::{AttrValue, log_stream_id};
@@ -828,6 +929,69 @@ mod tests {
             seg.writer_id,
             input_set_hash.to_vec(),
             "builder leaves writer_id as the entry carried it"
+        );
+    }
+
+    /// #964: [`SegmentColumnStatsCache`] reads each covered object once. The
+    /// second publish's request for an entry the first publish already tallied
+    /// returns the same record with no second GET, while a different object
+    /// still gets its own read.
+    ///
+    /// Prove-the-test: having `segment_column_stats` skip its cache lookup and
+    /// always call `fetch_segment_column_stats` makes the repeat request report
+    /// `StatsFetch::Issued` and the store's GET count 2 instead of 1.
+    #[tokio::test]
+    async fn cache_reads_each_covered_object_once() {
+        let store = InstrumentedStore::new(MemoryStore::new());
+        let entry_a = write_l0(&store, &[record(1, &[i64_attr("status", 200)])]).await;
+        let entry_b = write_l0(
+            &store,
+            &[
+                record(2, &[i64_attr("status", 404)]),
+                record(3, &[i64_attr("status", 500)]),
+            ],
+        )
+        .await;
+        assert_ne!(
+            entry_a.content_hash, entry_b.content_hash,
+            "two distinct objects"
+        );
+
+        let typed = vec![declared("status", DeclaredColumnType::I64)];
+        let mut cache = SegmentColumnStatsCache::new(&typed);
+        let gets = || store.metrics().snapshot().get.calls;
+        let before = gets();
+
+        let (first, fetch) = cache
+            .segment_column_stats(&store, &TENANT, Signal::Logs, &entry_a)
+            .await
+            .expect("first request");
+        assert_eq!(fetch, StatsFetch::Issued);
+        assert_eq!(gets() - before, 1, "one read for the first request");
+
+        // The second publish asking for the same entry.
+        let (again, fetch) = cache
+            .segment_column_stats(&store, &TENANT, Signal::Logs, &entry_a)
+            .await
+            .expect("repeat request");
+        assert_eq!(fetch, StatsFetch::Reused);
+        assert_eq!(gets() - before, 1, "the repeat request reads nothing");
+        assert_eq!(again, first, "the repeat request returns the same record");
+
+        // The reused record is exactly what a fresh build produces.
+        let fresh = fetch_segment_column_stats(&store, &TENANT, Signal::Logs, &entry_a, &typed)
+            .await
+            .expect("fresh build");
+        assert_eq!(again, fresh);
+
+        let (other, fetch) = cache
+            .segment_column_stats(&store, &TENANT, Signal::Logs, &entry_b)
+            .await
+            .expect("second object");
+        assert_eq!(fetch, StatsFetch::Issued, "a different object is read");
+        assert_ne!(
+            other.columns, first.columns,
+            "the second object's own statistics, not the cached ones"
         );
     }
 
