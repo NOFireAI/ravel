@@ -16,11 +16,13 @@ use std::env;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use ravel_object_store::fault::{FaultPlan, FaultStore};
+use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
 use ravel_object_store::instrument::{StoreErrorClass, StoreOp};
 use ravel_object_store::kms_routing::KmsRoutingStore;
 use ravel_object_store::memory::MemoryStore;
-use ravel_object_store::s3::{MULTIPART_THRESHOLD, S3Config, S3Store};
+use ravel_object_store::s3::{
+    MULTIPART_THRESHOLD, S3Config, S3HttpConfig, S3Store, UploadIntegrity,
+};
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, InstrumentedStore, ListPage,
     MULTIPART_MIN_PART_SIZE, ObjectMeta, ObjectStoreBackend, PageToken, PutMode, PutOptions,
@@ -47,8 +49,9 @@ async fn run_contract_suite(store: &dyn ObjectStoreBackend, root: &str) {
 /// Every backend the suite runs must report at least the capability set
 /// ravel-server's startup gate requires (`Capabilities::mandatory`, checked by
 /// `ravel_server::store::check_capabilities` for every non-maintain mode). A
-/// backend may report more than the mandatory set: `MemoryStore` supports
-/// `upload_checksum` on the wire, `S3Store` cannot, and both are
+/// backend may report more than the mandatory set: `MemoryStore` always
+/// supports `upload_checksum`, `S3Store` does only when a non-`Off`
+/// `UploadIntegrity` is configured (#863), and all are
 /// startable. Asserting `satisfies` rather than equality keeps that difference
 /// legal while still failing the moment a backend loses a flag production
 /// needs.
@@ -1167,19 +1170,18 @@ async fn instrumented_memory_store_contract() {
     );
 }
 
-/// Proves why `upload_checksum` is unsupported: `object_store` 0.14's
+/// With the default config (`UploadIntegrity::Off`), `S3Store` attaches no
+/// upload checksum and reports `upload_checksum: false`: `object_store` 0.14's
 /// `AmazonS3` client has no per-request checksum hook and no way to attach a
-/// caller-supplied CRC32C to an outgoing `put` (its only integrity knob,
-/// `AmazonS3Builder::with_checksum_algorithm`, is a whole-client setting
-/// limited to SHA-256/CRC64NVME, and always has the crate compute the
-/// digest itself). So `S3Store` must report `upload_checksum` as unsupported
-/// rather than claim on-the-wire integrity it cannot honor.
+/// caller-supplied CRC32C to an outgoing `put`, so with integrity off there is
+/// nothing on the wire for S3 to verify. (#863 makes a non-`Off` mode attach a
+/// whole-client SHA-256/CRC64NVME instead; see
+/// `s3_store_reports_upload_checksum_when_integrity_configured`.)
 ///
-/// Because that gap is permanent and applies to every S3-compatible endpoint,
-/// `upload_checksum` is not startup-gating: it is not in
+/// `upload_checksum` is not startup-gating in either mode: it is not in
 /// `Capabilities::mandatory()` and no mode may require it
-/// (docs/object-store-contract.md, "Upload checksums"). This test
-/// therefore also pins `S3Store`'s reported set to the mandatory set plus
+/// (docs/object-store-contract.md, "Upload checksums"). This test therefore
+/// also pins the default `S3Store`'s reported set to the mandatory set plus
 /// `multipart`, so the server's startup gate cannot start rejecting
 /// `--store s3` again.
 /// No `RAVEL_MINIO_URL` gate needed: `AmazonS3Builder::build` only
@@ -1203,13 +1205,100 @@ fn s3_store_reports_upload_checksum_unsupported() {
     let store = S3Store::new(config).expect("dummy config must build without network access");
     assert!(
         !store.capabilities().upload_checksum,
-        "S3Store must not claim upload_checksum support object_store 0.14 cannot provide"
+        "with UploadIntegrity::Off, S3Store must not claim upload_checksum"
     );
     assert_eq!(
         store.capabilities(),
         s3_expected_capabilities(),
-        "S3Store must report exactly the mandatory set plus multipart, so the \
-         server's startup gate accepts --store s3 in every mode"
+        "the default (integrity off) S3Store must report exactly the mandatory \
+         set plus multipart, so the server's startup gate accepts --store s3 in \
+         every mode"
+    );
+}
+
+/// #863: an `S3Store` built with a non-`Off` `UploadIntegrity` reports
+/// `upload_checksum: true`, because that mode configured
+/// `AmazonS3Builder::with_checksum_algorithm` so `object_store` attaches a
+/// server-verified `x-amz-checksum-*` on every `put`. This is the flip of the
+/// line `S3Store::capabilities` returns for `upload_checksum` (hardcoded
+/// `false` before #863); reverting that one line to `false` fails this test.
+///
+/// No `RAVEL_MINIO_URL` gate: `AmazonS3Builder::build` only validates config.
+/// The on-the-wire proof that the header is actually attached lives in
+/// `tests/s3_http_faults.rs` (`put_attaches_server_verified_checksum_...`),
+/// which puts against a fake endpoint and asserts the recorded request headers.
+#[test]
+fn s3_store_reports_upload_checksum_when_integrity_configured() {
+    let config = S3Config {
+        bucket: "test-bucket".to_string(),
+        region: "us-east-1".to_string(),
+        endpoint: Some("http://localhost:0".to_string()),
+        access_key_id: "test".to_string(),
+        secret_access_key: "test".to_string(),
+        allow_http: true,
+        force_path_style: true,
+        kms_key_id: None,
+        session_token: None,
+        credentials_file: None,
+        auth: Default::default(),
+        instance_metadata_endpoint: None,
+    };
+    for mode in [UploadIntegrity::Crc64Nvme, UploadIntegrity::Sha256] {
+        let http = S3HttpConfig {
+            upload_integrity: mode,
+            ..Default::default()
+        };
+        let store = S3Store::with_http_config(config.clone(), http)
+            .expect("dummy config must build without network access");
+        assert!(
+            store.capabilities().upload_checksum,
+            "UploadIntegrity::{mode:?} must report upload_checksum: true"
+        );
+    }
+}
+
+/// #863 (semantics oracle, deliverable 5): a store that reports
+/// `upload_checksum` must reject a body corrupted between caller and store.
+/// `MemoryStore` is the oracle (it verifies `PutOptions::checksum` against the
+/// received bytes); `FaultStore`'s `CorruptBody` fault flips the payload after
+/// the caller computed its checksum, modeling corruption before the bytes are
+/// signed. The store must fail the write with `Corrupted` and leave no object,
+/// and the fault counter must prove the corruption actually fired.
+///
+/// This pins the promise of the capability flag: a backend may only claim
+/// `upload_checksum` if it demonstrably rejects such a write. Reverting
+/// `MemoryStore::verify_checksum`'s mismatch `return` (memory.rs) makes the
+/// oracle claim the capability while silently storing the flipped bytes, and
+/// this assertion then fails.
+#[tokio::test]
+async fn upload_checksum_store_rejects_corrupt_in_flight() {
+    let inner = MemoryStore::new();
+    assert!(
+        inner.capabilities().upload_checksum,
+        "the oracle must claim upload_checksum for this property to apply"
+    );
+    let plan = FaultPlan::empty().with_rule(Rule::new(Op::Put, ScriptedFault::CorruptBody));
+    let store = FaultStore::new(inner, plan);
+
+    let data = Bytes::from_static(b"contract-suite-corrupt-in-flight");
+    let good = crc32c::crc32c(&data);
+    let err = store
+        .put(
+            "corrupt/k",
+            data,
+            PutOptions::default().with_checksum(UploadChecksum::Crc32c(good)),
+        )
+        .await
+        .expect_err("a store claiming upload_checksum must reject a corrupted body");
+    assert!(matches!(err, StoreError::Corrupted(_)), "got {err:?}");
+    assert!(
+        matches!(store.head("corrupt/k").await, Err(StoreError::NotFound)),
+        "a write failing checksum verification must leave no object"
+    );
+    assert_eq!(
+        store.fault_count(Op::Put, FaultKind::CorruptBody),
+        1,
+        "the corruption fault must have fired exactly once"
     );
 }
 

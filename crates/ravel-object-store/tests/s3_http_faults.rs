@@ -54,7 +54,9 @@ use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::Response;
 use bytes::Bytes;
 use parking_lot::Mutex;
-use ravel_object_store::s3::{MULTIPART_THRESHOLD, S3Config, S3HttpConfig, S3Store};
+use ravel_object_store::s3::{
+    MULTIPART_THRESHOLD, S3Config, S3HttpConfig, S3Store, UploadIntegrity,
+};
 use ravel_object_store::{
     GetRange, InstrumentedStore, ObjectStoreBackend, PutOptions, StoreError, StoreMetrics,
 };
@@ -138,6 +140,12 @@ struct Seen {
     /// Inclusive `[start, end]` from the request's `Range` header, absent for
     /// an unranged request.
     range: Option<(u64, u64)>,
+    /// The value of the `x-amz-checksum-{crc64nvme,sha256,...}` request header,
+    /// if the client attached a server-verified upload checksum (#863). Absent
+    /// under `UploadIntegrity::Off`. The `x-amz-checksum-algorithm` header is
+    /// deliberately not what this captures: the value header is what carries the
+    /// digest S3 verifies.
+    checksum_header: Option<(String, String)>,
 }
 
 impl Seen {
@@ -180,13 +188,21 @@ impl FakeState {
         self.always.lock().get(&op).copied()
     }
 
-    fn record(&self, op: Op, key: &str, fault: Option<Fault>, range: Option<(u64, u64)>) {
+    fn record(
+        &self,
+        op: Op,
+        key: &str,
+        fault: Option<Fault>,
+        range: Option<(u64, u64)>,
+        checksum_header: Option<(String, String)>,
+    ) {
         self.log.lock().push(Seen {
             op,
             key: key.to_string(),
             at: Instant::now(),
             fault,
             range,
+            checksum_header,
         });
     }
 }
@@ -244,6 +260,16 @@ impl FakeS3 {
     /// `request_timeout`, so a shorter timeout gives a small enough chunk to
     /// exercise splitting on a test-sized object.
     fn store_with_http(&self, http: S3HttpConfig) -> S3Store {
+        S3Store::with_http_config(self.config(), http).expect("a fake-endpoint S3Store must build")
+    }
+
+    /// The same store with a write-time upload-integrity mode configured
+    /// (#863), so `put` attaches a server-verified `x-amz-checksum-*` header.
+    fn store_with_upload_integrity(&self, mode: UploadIntegrity) -> S3Store {
+        let http = S3HttpConfig {
+            upload_integrity: mode,
+            ..Default::default()
+        };
         S3Store::with_http_config(self.config(), http).expect("a fake-endpoint S3Store must build")
     }
 
@@ -436,6 +462,21 @@ fn requested_range(headers: &HeaderMap) -> Option<(u64, u64)> {
     Some((start.parse().ok()?, end.parse().ok()?))
 }
 
+/// The upload-checksum value header the client attached, if any (#863):
+/// `x-amz-checksum-crc64nvme` / `-sha256` / etc., returned as `(name, value)`.
+/// The `-algorithm` header is skipped: it names the algorithm, it does not
+/// carry the digest S3 verifies.
+fn checksum_header(headers: &HeaderMap) -> Option<(String, String)> {
+    headers.iter().find_map(|(name, value)| {
+        let name = name.as_str();
+        if name.starts_with("x-amz-checksum-") && name != "x-amz-checksum-algorithm" {
+            Some((name.to_string(), value.to_str().ok()?.to_string()))
+        } else {
+            None
+        }
+    })
+}
+
 /// Serve a `Range` header against `data`, or the whole object when absent.
 /// Returns the response body slice plus the `Content-Range` header value for a
 /// partial response.
@@ -492,7 +533,13 @@ async fn handle(
         .unwrap_or_default();
 
     let fault = state.take_fault(op);
-    state.record(op, &key, fault, requested_range(&headers));
+    state.record(
+        op,
+        &key,
+        fault,
+        requested_range(&headers),
+        checksum_header(&headers),
+    );
 
     match fault {
         Some(Fault::ServiceUnavailable) => error_response(
@@ -839,6 +886,66 @@ async fn put_retries_through_503_and_slow_down() {
         Some(&b"payload that outlives two throttles"[..]),
         "the retried PUT must land the caller's exact bytes"
     );
+}
+
+/// #863, on the wire: a store built with `UploadIntegrity::Off` attaches no
+/// checksum header (today's behavior), and a store built with a non-`Off` mode
+/// attaches the corresponding `x-amz-checksum-*` value header so S3 verifies-
+/// or-rejects the write. The fake endpoint records the request headers it saw,
+/// so this proves the attach reaches the wire and is not merely reflected in
+/// `capabilities()`. It also exercises the SigV4 path: `object_store` signs the
+/// checksum header, and a signing break would surface as a client error before
+/// any request reached the fake (which does not itself verify signatures).
+///
+/// Reverting the `with_checksum_algorithm` wiring in `S3Store::builder` makes
+/// the `Crc64Nvme`/`Sha256` cases send no header, failing this test.
+#[tokio::test]
+async fn put_attaches_server_verified_checksum_only_when_configured() {
+    let fake = FakeS3::start().await;
+
+    // Off: no checksum header on the wire.
+    fake.store()
+        .put(
+            "checksum/off",
+            Bytes::from_static(b"no integrity configured"),
+            PutOptions::default(),
+        )
+        .await
+        .expect("put must succeed with integrity off");
+    let off = fake.requests(Op::Put);
+    assert_eq!(off.len(), 1, "one PUT expected");
+    assert!(
+        off[0].checksum_header.is_none(),
+        "UploadIntegrity::Off must attach no x-amz-checksum-* header, got {:?}",
+        off[0].checksum_header
+    );
+
+    for (mode, expected) in [
+        (UploadIntegrity::Crc64Nvme, "x-amz-checksum-crc64nvme"),
+        (UploadIntegrity::Sha256, "x-amz-checksum-sha256"),
+    ] {
+        let fake = FakeS3::start().await;
+        let store = fake.store_with_upload_integrity(mode);
+        store
+            .put(
+                "checksum/on",
+                Bytes::from_static(b"integrity configured payload"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("put with {mode:?} must succeed: {e:?}"));
+        let puts = fake.requests(Op::Put);
+        assert_eq!(puts.len(), 1, "one PUT expected for {mode:?}");
+        let (name, value) = puts[0]
+            .checksum_header
+            .as_ref()
+            .unwrap_or_else(|| panic!("{mode:?} must attach {expected}, saw no checksum header"));
+        assert_eq!(name, expected, "wrong checksum header for {mode:?}");
+        assert!(
+            !value.is_empty(),
+            "the checksum header must carry a base64 digest value"
+        );
+    }
 }
 
 /// `AccessDenied` is permanent per the contract, and the proof is that the
