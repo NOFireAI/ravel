@@ -488,6 +488,8 @@ fn task_ctx_with_query_bytes(max_query_bytes: usize) -> Arc<TaskContext> {
         // Named explicitly rather than spread from the default so a new field
         // keeps failing this initializer closed.
         late_materialization_extra_columns: None,
+        // ADR-0954: spill off, as on the shipped default.
+        spill: None,
     };
     let tenant = TenantMemoryAccountant::new(1 << 30);
     let (pool, _breach) = config.query_pool(tenant, QueryAccounting::new());

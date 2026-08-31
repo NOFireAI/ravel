@@ -294,7 +294,14 @@ pub fn build_sql_state(
         // is an in-process escape hatch and the regression fixture's red side,
         // not a server-level knob.
         late_materialization_extra_columns: SqlConfig::default().late_materialization_extra_columns,
-    };
+        // ADR-0954: bounded ephemeral spill is off by default (requirement 9's
+        // no-spill deployment profile). `with_spill_from_env` below fills this
+        // from `RAVEL_SQL_SPILL_DIR`/`RAVEL_SQL_SPILL_MAX_BYTES` when both are
+        // set, so a deployment can arm spill without a code change; unset leaves
+        // it `None` and the memory budget refuses as before.
+        spill: None,
+    }
+    .with_spill_from_env()?;
     let max_deadline = config.engine.deadline;
     let mut metrics_fetcher = SegmentFetcher::new(store.clone());
     // ADR-0107's read-shape crossover, from `--logs-block-range-threshold` via

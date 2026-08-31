@@ -45,7 +45,7 @@ use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_proto::catalog::v1::{ColumnStat, ColumnStatsSegment, ColumnValue, DictEntry};
 use ravel_query::LogSegmentFetcher;
 use ravel_sql::{
-    DeclaredColumn, DeclaredType, LogsTableProvider, SessionTable, SqlConfig,
+    DeclaredColumn, DeclaredType, LogsTableProvider, SessionTable, SpillDecision, SqlConfig,
     TenantMemoryAccountant, build_session,
 };
 use ravel_types::TenantHash;
@@ -262,6 +262,7 @@ fn logs_session_with(
         pool,
         SessionTable::Logs(Arc::new(provider)),
         exact_typed_aggregates,
+        SpillDecision::Disabled,
     )
 }
 

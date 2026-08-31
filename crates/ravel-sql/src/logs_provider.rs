@@ -509,7 +509,13 @@ mod tests {
         let config = SqlConfig::default();
         let tenant = TenantMemoryAccountant::new(1 << 30);
         let (pool, _breach) = config.query_pool(tenant, QueryAccounting::new());
-        build_session(&config, pool, SessionTable::Logs(Arc::new(provider)), false)
+        build_session(
+            &config,
+            pool,
+            SessionTable::Logs(Arc::new(provider)),
+            false,
+            crate::session::SpillDecision::Disabled,
+        )
     }
 
     /// Every test here selects exactly `SELECT ts, body FROM logs WHERE ...`,

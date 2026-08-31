@@ -74,8 +74,8 @@ use ravel_object_store::{
 };
 use ravel_query::{CacheFetchError, LogSegmentFetcher};
 use ravel_sql::{
-    CeilingBreach, DeclaredColumn, DeclaredType, LogsTableProvider, SessionTable, SqlConfig,
-    TenantDelegatingPool, TenantMemoryAccountant, build_session,
+    CeilingBreach, DeclaredColumn, DeclaredType, LogsTableProvider, SessionTable, SpillDecision,
+    SqlConfig, TenantDelegatingPool, TenantMemoryAccountant, build_session,
 };
 use ravel_types::TenantHash;
 use ravel_types::accounting::{AccountedOp, QueryAccounting};
@@ -353,8 +353,14 @@ fn session(provider: LogsTableProvider, config: &SqlConfig) -> SessionContext {
         CeilingBreach::new(),
         QueryAccounting::new(),
     ));
-    build_session(config, pool, SessionTable::Logs(Arc::new(provider)), false)
-        .expect("session builds")
+    build_session(
+        config,
+        pool,
+        SessionTable::Logs(Arc::new(provider)),
+        false,
+        SpillDecision::Disabled,
+    )
+    .expect("session builds")
 }
 
 fn metric(plan: &Arc<dyn ExecutionPlan>, node: &str, name: &str) -> usize {
