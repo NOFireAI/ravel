@@ -332,11 +332,9 @@ pub async fn compact_tenant(
     let sig = signal.to_signal();
     let now_hour = u32::try_from(now_ns / ravel_maintain::config::NS_PER_HOUR)
         .map_err(|_| anyhow::anyhow!("current ingest hour {now_ns} ns does not fit u32"))?;
-    let shard_count =
-        resolve_shard_count(store.as_ref(), &tenant_hash, tenant, sig, shards, now_hour).await?;
-    let last_hour = to_hour.unwrap_or(now_hour);
-    let first_hour = from_hour.unwrap_or(0);
-
+    // Knob validation runs before any store access: a zero byte target must
+    // surface as its CompactorKnobError even on a tenant with no provisioning
+    // record, not be masked by NoProvisioningRecord.
     let config = build_compactor_config(
         dry_run,
         max_flush_lifetime_ns,
@@ -344,6 +342,10 @@ pub async fn compact_tenant(
         max_l1_part_bytes,
         input_read_concurrency,
     )?;
+    let shard_count =
+        resolve_shard_count(store.as_ref(), &tenant_hash, tenant, sig, shards, now_hour).await?;
+    let last_hour = to_hour.unwrap_or(now_hour);
+    let first_hour = from_hour.unwrap_or(0);
     let clock = FixedClock::new(now_ns);
     let mut report = CompactTenantReport {
         shards: shard_count,

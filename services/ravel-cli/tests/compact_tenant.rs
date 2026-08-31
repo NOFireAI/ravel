@@ -409,3 +409,40 @@ async fn from_hour_and_to_hour_bound_the_walk() {
         );
     }
 }
+
+/// Knob validation precedes shard resolution: a zero byte target on a tenant
+/// with NO provisioning record surfaces as its `CompactorKnobError`, never
+/// masked by `NoProvisioningRecord` (review finding on PR #1005).
+///
+/// Non-vacuity (prove-the-test): move the `build_compactor_config` call in
+/// `maintain::compact_tenant` back below `resolve_shard_count` and this
+/// downcast fails with `CompactTenantError::NoProvisioningRecord` instead.
+#[tokio::test]
+async fn zero_knob_is_refused_before_shard_resolution() {
+    let store = seed_tenant().await;
+
+    let err = compact_tenant(
+        store,
+        TENANT,
+        SignalArg::Logs,
+        None,
+        None,
+        None,
+        true,
+        None,
+        Some(0),
+        None,
+        None,
+        now_ns(),
+    )
+    .await
+    .expect_err("a zero byte target must be refused before any store access");
+
+    let typed = err
+        .downcast_ref::<ravel_cli::maintain::CompactorKnobError>()
+        .expect("typed CompactorKnobError, not NoProvisioningRecord");
+    assert_eq!(
+        *typed,
+        ravel_cli::maintain::CompactorKnobError::ZeroL1PartMemoryTarget
+    );
+}

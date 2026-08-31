@@ -762,9 +762,11 @@ enum MaintainCommand {
         #[arg(long, value_name = "DURATION",
               value_parser = parse_max_flush_lifetime_ns)]
         max_flush_lifetime: Option<i64>,
-        /// Bound the decoded record-heap a merge holds before it closes an L1
-        /// part (the memory split target). Lower it to cap compactor peak memory
-        /// on a small host; raise it for fewer, larger parts. Refused at 0.
+        /// The decoded record-heap size at which a merge closes an in-progress
+        /// L1 part (a split target, not a peak-memory bound: a merge can
+        /// overshoot it, e.g. by a whole trace on the RSPAN path, so size the
+        /// host for path-specific overshoot). Lower it for smaller parts on a
+        /// small host; raise it for fewer, larger parts. Refused at 0.
         /// Default 256 MiB (the compactor default).
         #[arg(long, value_name = "BYTES")]
         l1_part_memory_target_bytes: Option<u64>,
