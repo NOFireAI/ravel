@@ -233,8 +233,9 @@ are per ADR-0066 decision 1):
   wrong answer, not a slow one.
 
 Enforcement is two-sided. Writers stamp only allowlisted types. Every
-decoder validates each entry against the full predicate below before the
-entry can grant coverage. An entry failing **any** clause is dropped
+decoder validates each entry against the predicate below — the structural
+clauses plus the entry's own carrier's vocabulary clause — before the
+entry can grant coverage. An entry failing **any** applicable clause is dropped
 whole — no field of it is used, including the fields that pass on their
 own: a plausible min next to an impossible null count is evidence the
 writer that produced the entry was broken, not a value to salvage. The
@@ -243,26 +244,47 @@ decision 4), the drop is counted on a defect metric labelled by carrier,
 and the carrying object itself still decodes; an invalid entry is never a
 decode failure and never trusted partially.
 
-The predicate below is named the **statistics validity predicate**, and it
-is **carrier-independent**: it binds every carrier that can grant coverage
-under decision 4 — the stamp, at each of its decoders (commit record,
-compaction record, snapshot entry), **and** the ADR-0850/0942 `.cstat`
-`ColumnStat` entries, at the join against the touched segments — and any
-carrier a future ADR adds. The union of decision 4 is only as sound as its
-weakest member: for any segment one carrier alone covers, that carrier's
-validation *is* the guarantee, so a predicate applied to one carrier and
-not another is not a partial safety measure, it is no guarantee at all for
-exactly the segments the unchecked carrier serves. This paragraph exists
-so a future carrier cannot be added under weaker validation by omission:
-granting coverage from any entry that has not passed this predicate is a
-violation of this ADR, not an implementation detail. (The first revision
-of this amendment made precisely that omission: it stated the predicate
-for the new stamp only, leaving `.cstat` under its pre-existing, weaker
-reader checks — which validate min/max presence shape and value kind but
-never reconcile the entry's row accounting with the joined
-`SegmentRef.sample_count`, so a `.cstat` entry claiming `non_null_count =
-1, null_count = 0` for a two-row segment passed validation and reached the
-exact `MIN`/`MAX` and `COUNT` paths.)
+The predicate below is named the **statistics validity predicate**. Its
+clauses split into two groups with different binding scopes, and the split
+is itself normative (the grouping criterion follows the clause list, so a
+future clause is placed by argument, not by analogy):
+
+- **The structural clauses (2-6) are carrier-independent.** They bind
+  every carrier that can grant coverage under decision 4 — the stamp, at
+  each of its decoders (commit record, compaction record, snapshot
+  entry), **and** the ADR-0850/0942 `.cstat` `ColumnStat` entries, at the
+  join against the touched segments — and any carrier a future ADR adds.
+  The union of decision 4 is only as sound as its weakest member: for any
+  segment one carrier alone covers, that carrier's validation *is* the
+  guarantee, so a structural clause applied to one carrier and not
+  another is not a partial safety measure, it is no guarantee at all for
+  exactly the segments the unchecked carrier serves. This paragraph
+  exists so a future carrier cannot be added under weaker validation by
+  omission: granting coverage from any entry that has not passed the
+  structural clauses is a violation of this ADR, not an implementation
+  detail.
+- **The vocabulary clause (1) is per-carrier.** It states what a given
+  carrier may transport, and each carrier's defining ADR sets its
+  vocabulary: {I64, BOOL} for the stamp (this decision), ADR-0090's four
+  declared types for `.cstat` (ADR-0850). It is not a property of the
+  statistic — a `.cstat` `STR` extremum is a perfectly coherent exact
+  statistic that ADR-0850 ships and `declared_min_max_all` answers from
+  today — so applying it carrier-independently is itself a defect.
+
+Revision history, kept because both mis-scoping directions have now
+occurred. The first revision of this amendment under-scoped the
+structural clauses: it stated the predicate for the new stamp only,
+leaving `.cstat` under its pre-existing, weaker reader checks — which
+validate min/max presence shape and value kind but never reconcile the
+entry's row accounting with the joined `SegmentRef.sample_count`, so a
+`.cstat` entry claiming `non_null_count = 1, null_count = 0` for a
+two-row segment passed validation and reached the exact `MIN`/`MAX` and
+`COUNT` paths. The second revision over-corrected by over-scoping the
+vocabulary clause: it bound the whole predicate, type allowlist included,
+to every carrier, which would have invalidated every `STR`/`BYTES`
+extremum `.cstat` legitimately carries under ADR-0850 and silently
+degraded declared string columns from `Precision::Exact` answers to
+scans. The explicit grouping exists so neither mistake has a third form.
 
 The predicate is stated over the carrier-neutral quantities `(name,
 declared_type, min, max, null_count, sample_count)`, where `sample_count`
@@ -280,21 +302,32 @@ like any other invalid entry.
 
 An entry, from either carrier, is valid iff all of:
 
-1. `declared_type` is allowlisted ({I64, BOOL} today).
-2. `min` and `max` are **both present or both absent**, where present means
-   the message is set and its oneof kind matches `declared_type`. A
+1. *(vocabulary, per-carrier)* `declared_type` is in the entry's own
+   carrier's vocabulary: for a stamp, the allowlist of this decision
+   ({I64, BOOL} today); for a `.cstat` entry, the four ADR-0090 declared
+   types ({I64, BOOL, STR, BYTES}, ADR-0850's `ColumnValue` oneof). A
+   stamp carrying `STR`, and an entry on any carrier carrying a type no
+   carrier admits (`F64`, until an amendment admits it somewhere), are
+   equally invalid; a `.cstat` entry carrying `STR` or `BYTES` is valid
+   under this clause — dropping it was the second revision's regression.
+2. *(structural)* `min` and `max` are **both present or both absent**,
+   where present means the message is set and its value kind matches
+   `declared_type` under the carrier's value message
+   (`DeclaredColumnStatValue` for the stamp, ADR-0850's `ColumnValue`
+   for `.cstat`). A
    one-sided entry is not a usable range: it admits no exact answer for
    either aggregate, so it is invalid outright, never "half usable".
-3. When both are present, `min <= max` under the authoritative comparator
-   defined below.
-4. `null_count <= sample_count`, with `sample_count` resolved as defined
+3. *(structural)* When both are present, `min <= max` under the
+   authoritative comparator defined below for the entry's type.
+4. *(structural)* `null_count <= sample_count`, with `sample_count` resolved as defined
    above (the carrying record's row count for a stamp, the joined
    `SegmentRef.sample_count` for a `.cstat` entry). For a `.cstat` entry,
    additionally `non_null_count + null_count == sample_count`, exactly.
-5. Presence agrees with the null count: both-absent (zero non-null values)
+5. *(structural)* Presence agrees with the null count, **in both
+   directions**: both-absent (zero non-null values)
    requires `null_count == sample_count`; both-present requires
    `null_count < sample_count`.
-6. `name` is non-empty, and at most one entry exists per
+6. *(structural)* `name` is non-empty, and at most one entry exists per
    `(name, declared_type)` in the carrier's entry set for the segment (the
    record's repeated field for a stamp, the segment's `ColumnStat` list
    for `.cstat`); duplicates are all dropped, since no rule could pick the
@@ -302,28 +335,82 @@ An entry, from either carrier, is valid iff all of:
    of the current `.cstat` join, which collects entries into a by-name map
    — is silently picking one, which is exactly what this clause forbids.
 
+**The grouping criterion.** A clause is **structural** iff it is decidable
+over the carrier-neutral tuple `(name, declared_type, min, max,
+null_count, sample_count)` alone and its violation convicts the producing
+writer of being broken regardless of which carrier transported the entry
+and regardless of who consumes it — it tests the internal coherence of
+one entry against the one immutable segment it describes. Name
+uniqueness, `min <= max`, presence agreeing with the null count in both
+directions, and the counts reconciling against the segment's
+`sample_count` are all of this kind: no correct writer produces an entry
+violating any of them, for any carrier, ever. A clause is **vocabulary**
+iff it restricts what a particular carrier may transport, on grounds that
+belong to the carrier rather than to the entry's coherence: the stamp
+excludes `STR`/`BYTES` because of record size on the hot resolve path and
+excludes `F64` pending a comparator decision (both above) — neither
+reason says anything against the same statistic riding `.cstat`, where
+ADR-0850 admits and serves it. A future clause is placed by asking which
+of those two arguments carries it; a clause that needs carrier-specific
+inputs to state (like clause 4's `non_null_count` redundancy arm) is
+still structural when it instantiates a carrier-neutral rule over fields
+only that carrier happens to carry.
+
 The authoritative comparator is the scan-path aggregate's, by definition:
 for I64, signed integer order (`i64::cmp`, which is what DataFusion's Int64
-`MIN`/`MAX` accumulators apply); for BOOL, `false < true`. The single-
-sourced allowlist constant (opening of this decision) names the comparator
-beside each type, and the writer's fold, the decoder's clause 3, and the
+`MIN`/`MAX` accumulators apply); for BOOL, `false < true`; for STR and
+BYTES — reachable only through the `.cstat` vocabulary — bytewise
+lexicographic order over the raw bytes, which is what DataFusion's
+Utf8/Binary `MIN`/`MAX` accumulators apply (UTF-8 makes code-point order
+and byte order coincide, so the two readings of "string order" agree).
+The single-sourced allowlist constant (opening of this decision) names
+the comparator beside each type it admits, the `.cstat` vocabulary's two
+extra types get theirs in the same constant module, and the writer's
+fold, the decoder's clause 3, and the
 read-side union all use that one definition. This is load-bearing, not
 pedantry: the stamp *replaces* the aggregate's answer, so a stamp computed
 under any other ordering is the same class of silent wrongness as a wrong
 value — the F64 gate above exists precisely because floats are the case
 where two plausible comparators genuinely disagree.
 
-Tests that pin the predicate, one case per clause **per carrier** — every
+Tests that pin the predicate, one case per structural clause **per
+carrier** — every
 case below runs once against a stamp and once against a `.cstat` entry,
 because a clause tested on one carrier proves nothing about the other's
 code path: a one-sided entry, `min > max`, `null_count > sample_count`,
-both-absent with `null_count != sample_count`, a oneof kind mismatching
-`declared_type`, an unallowlisted type, and a duplicate name. The `.cstat`
+both-absent with `null_count != sample_count`, **both-present with
+`null_count == sample_count`** (extrema claimed for an all-NULL column),
+a value kind mismatching
+`declared_type`, and a duplicate name. The both-present-all-NULL case is
+listed by name because it is not hypothetical: it is defect 2 of issue
+#970, live on `main` today — `declared_min_max_all`
+(`crates/ravel-sql/src/logs_scan.rs:1266`) checks `non_null_count > 0 &&
+(stat.min.is_none() || stat.max.is_none())` and never the mirror, so an
+entry carrying extrema for an all-NULL column passes and its fabricated
+extrema reach the exact `MIN`/`MAX` path. A validator that checks only
+the both-absent branch of clause 5 passes every other case in this matrix
+and still accepts that entry; only this case fails it, so a matrix
+without it does not pin the clause.
+
+The vocabulary clause gets per-carrier cases in both directions: a stamp
+carrying `STR` is dropped; an `F64` entry is dropped on both carriers;
+and the positive regression case this amendment's third revision exists
+for — a `.cstat` entry for a declared `STR` column with extrema valid
+under bytewise order and counts reconciling against the joined
+`sample_count` **passes** the predicate, appears in the valid set, grants
+coverage, and `partition_statistics` still reports `Precision::Exact`
+min/max for that column with zero increments on the defect metric (same
+case once more with `BYTES`). The assertion that fails if the vocabulary
+clause is ever applied carrier-independently again is that entry's
+presence and the `Exact` precision.
+
+The `.cstat`
 lane adds the redundancy case of clause 4: an entry with `non_null_count +
 null_count != sample_count` of the joined segment — concretely, the
 defect that motivated this rule, `non_null_count = 1, null_count = 0`
 joined to a two-row segment — must be dropped and must not reach the
-exact `MIN`/`MAX` or `COUNT` paths. Each case asserts the entry is absent
+exact `MIN`/`MAX` or `COUNT` paths. Each negative case asserts the entry
+is absent
 from the valid set, the carrier-labelled defect metric incremented by
 exactly one, the carrying object otherwise decoded intact, and
 `partition_statistics` reporting `Precision::Absent` for that column. The
@@ -388,6 +475,54 @@ appearing solely as the derived complement above, never as a stored input.
    when it does not — absent-in-block reads NULL for every row of that
    block. The fold therefore runs over the object's block list, not over
    the NumStat map; summing only blocks that carry an entry undercounts.
+
+   The missing-entry arm is sound only under a writer invariant this
+   amendment states explicitly instead of assuming, because
+   `BlockWriteOut` carries `stats: Vec<NumStat>` with no availability
+   field: on the wire between writer and fold, a missing entry would
+   otherwise be ambiguous between "column absent from this block"
+   (contribute `block_rows` NULLs) and "statistics unavailable"
+   (the object must get no entry for the column at all) — two states
+   whose correct outcomes are opposite, so guessing either way is a
+   wrong exact answer waiting to happen.
+
+   **Writer invariant (block-statistics completeness).** `write_block`
+   and `write_block_columnar` (`crates/ravel-logseg/src/block.rs`) emit
+   exactly one `NumStat` for every I64/F64/Bool column in the block's
+   plan set, unconditionally: each numeric arm of the per-plan match
+   pushes its stat with no skip path, and a column that no row of the
+   block resolves a value for still emits a real entry with
+   `null_count == block_rows` and zeroed bit patterns (the
+   no-contributor branches of `i64_stat`/`bool_stat`/`f64_stat`), never
+   no entry. Conversely, the plan-set construction in `build_object`
+   (`crates/ravel-logseg/src/writer.rs`: a block's plan set is the
+   columns present in its rows union the columns any of its rows
+   resolves a stat winner for) guarantees that a numeric column missing
+   from a block's stats was not planned for that block, which by that
+   construction means no row of the block resolves a value for its
+   `(name, type)` — exactly the state where a reader materializing the
+   declared column produces NULL for every row of the block. A missing
+   entry therefore has one meaning, `block_rows` NULLs. "Computed but
+   unavailable" is unreachable in the current writers: all blocks of an
+   object are encoded in one `build_object` pass by one writer instance
+   under one column allocation, so no block can predate the per-column
+   state; no path drops or truncates a computed stat; and the stat
+   constructors' saturating `u32` null-count adds cannot fire because
+   block row counts sit orders of magnitude below `u32` range (writer
+   chunking targets, and the format's own 2^24 per-block record cap,
+   `MAX_RECORDS`).
+
+   **What must change if that code changes.** Any future writer path
+   that can plan a numeric column without emitting its stat, or can
+   compute a stat it cannot vouch for (a partial decode of an input, an
+   accounting failure it cannot reconcile), must not express that state
+   as a missing entry — missing already means all-NULL. It must add an
+   explicit availability signal to `BlockWriteOut` (an
+   unavailable-marked entry, not an absent one), and the fold must map
+   "unavailable" to emitting no object-level entry for that column,
+   through step 4's fail-closed rule. The completeness test below pins
+   the invariant so such a change fails at authoring time instead of
+   silently inverting a block's NULL accounting.
 3. Whole object, in the same NULL units:
    `null_count(object, column) = Σ over blocks of nulls(block, column)`.
    No term of this sum is ever `block_rows − x`; the only subtraction in
@@ -401,11 +536,26 @@ appearing solely as the derived complement above, never as a stored input.
    cannot do: that identity is symmetric under swapping `null_count` and
    `non_null`, so it holds equally well for an inverted fold and can
    never catch the inversion — only the mixed-null test below can. If any
-   cross-check fails, or any block's NumStat for the column is
-   unavailable where one is required (a block encoded before the
-   per-column state existed, any accounting path the writer cannot
-   reconcile), the writer emits **no entry for that column on that
+   cross-check fails, the writer emits **no entry for that column on that
    object**. Never an entry with `null_count: 0`.
+
+   An earlier revision listed a further trigger here: "any block's
+   NumStat for the column is unavailable where one is required (a block
+   encoded before the per-column state existed, any accounting path the
+   writer cannot reconcile)". That trigger named a state the current
+   writers cannot produce (the completeness invariant of step 2) and
+   that the fold could not detect if they did — with no availability
+   field on `BlockWriteOut`, "unavailable" and "absent from the block"
+   are the same missing entry, so a fold clause conditioned on
+   unavailability is unimplementable as stated, and keeping it in the
+   normative text implied a detection that does not exist. The
+   fail-closed obligation it gestured at stands and transfers: a future
+   writer change that introduces a real unavailability state arrives
+   together with the explicit availability signal step 2 requires, and
+   the fold maps that signal to no-entry through this step's rule.
+   Under the invariant, the cross-checks above are reachable only
+   through a writer bug; they are defensive, and they are tested as
+   such (below).
 5. The exact `(min, max, null_count)` triple travels as one unit through
    `finish_with_stats` (L0 flush) and `finish_compacted_with_stats`
    (compaction and the ADR-0064 rewrite) to `record::build` and the part
@@ -429,10 +579,30 @@ Tests that pin the capture: an all-NULL object stamps min/max absent with
 `null_count == sample_count` and the read side answers `COUNT(col) = 0`
 exactly; an object where one block lacks the column entirely stamps the
 exact null count including that block's full row count (the assertion is
-the exact figure, not "nonzero"); a writer path with an unreconcilable
-block (fault-injected) emits no entry for the column and the read side
-reports `Precision::Absent` — the assertion that fails when the invariant
-breaks must be "no entry", never "entry with zero".
+the exact figure, not "nonzero").
+
+Two tests pin the step-2 invariant and the step-4 defense, split by what
+each can honestly reach:
+
+- **Completeness (ravel-logseg).** A block written with a plan set
+  containing a numeric column that no row of the block carries must
+  return a `stats` vector whose column-id set equals exactly the plan
+  set's numeric (I64/F64/Bool) column-id set, with the all-NULL column's
+  entry present and `null_count == record_count`. The assertions that
+  fail if emission ever becomes conditional are the set equality and
+  that entry's **presence** (with its exact count), not any downstream
+  figure. Run against both `write_block` and `write_block_columnar`,
+  which are documented as line-for-line mirrors and can drift apart.
+- **Cross-check fail-closed (fold unit test).** The whole-object fold is
+  a pure function over per-block `(stats, block_rows)` and the object
+  row count; feed it hand-built inconsistent inputs — a per-block
+  `null_count` exceeding its `block_rows`, and block rows not summing to
+  the object row count — and assert no entry is emitted for the column,
+  never an entry with zero. Hand-built, not fault-injected through the
+  real writer: the integrated writer cannot produce these states
+  (that is the invariant), so an end-to-end fault-injection version of
+  this test would be vacuous, and a `FaultStore`-style counter proving
+  the fault fired has nothing to fire on.
 
 One capture test is mandatory and is the one that pins the representation
 itself: a **mixed-null block** — an object containing at least one block
@@ -486,9 +656,10 @@ lets the same stock rule also answer `COUNT(col)`) with
    an entry with matching `(name, declared_type)` that passed decision 2's
    statistics validity predicate (a dropped entry is no coverage), from
    either carrier — a `SegmentRef` stamp or an ADR-0850/0942 `.cstat`
-   entry for that segment and column. The predicate condition is
-   carrier-independent by decision 2, and coverage is what it gates: an
-   entry from any carrier that has not passed it grants nothing. The
+   entry for that segment and column. The predicate's structural clauses
+   bind both carriers by decision 2 (each carrier additionally enforcing
+   its own vocabulary clause), and coverage is what they gate: an
+   entry from any carrier that has not passed them grants nothing. The
    two carriers are a union, per segment, per column. Any segment covered by
    neither leaves the column `Precision::Absent`, the `AggregateStatistics`
    rule silently does not fire, and the query scans — the ADR-0850 safety
@@ -512,6 +683,11 @@ predicate participate at all: an invalid entry is absent from the union
 
 - **Stamp only, or `.cstat` only:** use it. This is the normal state — the
   live tail has only stamps, pre-stamp sealed history has only `.cstat`.
+  A declared `STR`/`BYTES` column is *always* in this state: the stamp
+  vocabulary excludes those types (decision 2), so the stamp side of the
+  union is empty by construction, coverage is `.cstat`'s or nothing, and
+  the ADR-0850 read path for string extrema continues unchanged — the
+  union degenerating to one carrier is not an error and not a conflict.
 - **Both:** the triples must be equal — min, max, and null_count each
   compared for exact equality (for the allowlisted types value equality
   and bit-identity coincide; a future F64 amendment must say which, and
@@ -767,15 +943,26 @@ flowchart TD
   shortcuts quietly not firing.
 - **Tests the implementation owes** (prove-the-test discipline): the
   erasure-rewrite recompute rule (erase the max, stamp must shrink); the
-  statistics validity predicate of decision 2, one decode case per clause
+  statistics validity predicate of decision 2, one decode case per
+  structural clause
   **per carrier** (one-sided min/max, `min > max`,
-  `null_count > sample_count`, presence disagreeing with null count, kind
-  mismatch, ineligible type, duplicate name, each run against a stamp and
+  `null_count > sample_count`, presence disagreeing with null count in
+  **both** directions — both-absent with `null_count != sample_count`
+  and both-present with `null_count == sample_count`, the latter being
+  #970's live defect 2 — kind
+  mismatch, duplicate name, each run against a stamp and
   against a `.cstat` entry, plus the `.cstat` redundancy case
   `non_null_count + null_count != sample_count`), each asserting the drop,
   the carrier-labelled defect metric, and the resulting `Absent`
-  precision; the null-count capture cases of decision 3 (all-NULL object,
-  block missing the column counted in full, unreconcilable block emitting
+  precision; the vocabulary cases (a `STR` stamp dropped, `F64` dropped
+  on both carriers) and their positive mirror, the regression this
+  amendment's third revision fixes: a valid `.cstat` `STR` (and `BYTES`)
+  extremum passes, grants coverage, and yields `Precision::Exact`;
+  the null-count capture cases of decision 3 (all-NULL object,
+  block missing the column counted in full, the ravel-logseg
+  completeness test pinning that a planned numeric column always gets a
+  stats entry — presence and set equality, on both block writers — the
+  fold-unit cross-check test on hand-built inconsistent inputs emitting
   no entry rather than zero, and the mixed-null block asserting the exact
   whole-object figure — the only case that distinguishes the NULL-count
   representation from its complement); the union cases of decision 4 (equal
@@ -787,12 +974,17 @@ flowchart TD
   proptest round-trip of the new messages with corrupt-input rejection
   typed, seed files checked in.
 - **Amendment scope note.** The fail-closed amendments above (the
-  carrier-independent statistics validity predicate, entry-granular
-  null-count exactness with the fold stated in NULL units only,
-  equality-or-`Absent` union keyed by `content_hash`) change no wire
-  field, no field number, no eligibility, and no migration class; they
+  statistics validity predicate with carrier-independent structural
+  clauses and per-carrier vocabulary, entry-granular
+  null-count exactness with the fold stated in NULL units only and the
+  block-statistics completeness invariant named with the code that
+  upholds it, equality-or-`Absent` union keyed by `content_hash`)
+  change no wire
+  field, no field number, no stamp eligibility, and no migration class;
+  they
   constrain decoders (both carriers' — the `.cstat` join gains the row
-  accounting and duplicate checks it previously lacked), the writer fold,
+  accounting and duplicate checks it previously lacked, while keeping
+  its ADR-0850 `STR`/`BYTES` vocabulary), the writer fold,
   and the union reader that decisions 2-4 already established.
 - **Interaction with ADR-0815 (clustered compaction).** ADR-0815 already
   plans additive per-part min/max bound fields for its clustering key;
