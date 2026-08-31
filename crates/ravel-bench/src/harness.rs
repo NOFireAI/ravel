@@ -79,6 +79,10 @@ fn s3_config_from_lookup(lookup: impl Fn(&str) -> Option<String>) -> S3Config {
 /// Builds the store backing a bench bin's `--store` flag: an in-process
 /// `MemoryStore`, or a real `S3Store` configured from `RAVEL_S3_*`.
 pub fn store_from_env(kind: StoreKind) -> Arc<dyn ObjectStoreBackend> {
+    // The dropped handle is not lost metrics: the S3 store keeps its own Arc
+    // clone and records attempts into it regardless; this entry point is for
+    // callers that never report attempts, and the ones that do use
+    // `store_and_metrics_from_env`.
     store_and_metrics_from_env(kind).0
 }
 
