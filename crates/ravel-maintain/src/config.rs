@@ -56,8 +56,8 @@ use uuid::Uuid;
 /// tracker also records a peak PER PHASE, read back as a [`MergePhasePeaks`]
 /// via [`Self::phase_peaks`], each field naming which bytes it counts:
 ///
-/// - catalog load ([`Self::add_catalog_directory_bytes`]): encoded
-///   directory-section bytes retained per input.
+/// - catalog load ([`Self::add_catalog_directory_bytes`]): decoded
+///   directory-section payload bytes retained per input.
 /// - merge and cursors ([`Self::peak_transient_bytes`]): the decode-side
 ///   buffers above.
 /// - in-progress part writer ([`Self::peak_writer_bytes`]): the current part's
@@ -130,10 +130,12 @@ struct MergeMemoryInner {
 /// [`MergeMemoryTracker::phase_peaks`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MergePhasePeaks {
-    /// Input read / catalog load: high-water of the encoded directory-section
-    /// bytes (STREAM_DIR + FIELD_DIR + SKIP_IDX + PAGE_DIR) retained across all
-    /// inputs' catalogs. Encoded/on-object bytes.
-    pub catalog_directory_encoded_bytes: u64,
+    /// Input read / catalog load: high-water of the decoded directory-section
+    /// payload bytes (STREAM_DIR + FIELD_DIR + SKIP_IDX + PAGE_DIR, after
+    /// section decompression) retained across all inputs' catalogs. Decoded
+    /// payload bytes, NOT on-object encoded lengths: the reader retains the
+    /// decoded form, and this is a residency figure.
+    pub catalog_directory_decoded_bytes: u64,
     /// Merge and cursors: high-water of the k-way merge's own decode-side
     /// buffers, one raw fetched unit plus one decoded block per input
     /// (`fetched + decoded`, the existing [`MergeMemoryTracker::peak_transient_bytes`]).
@@ -283,7 +285,7 @@ impl MergeMemoryTracker {
     /// [`MergePhasePeaks`]; do not sum fields of different kinds.
     pub fn phase_peaks(&self) -> MergePhasePeaks {
         MergePhasePeaks {
-            catalog_directory_encoded_bytes: self.peak_catalog_directory_bytes(),
+            catalog_directory_decoded_bytes: self.peak_catalog_directory_bytes(),
             cursor_bytes: self.peak_transient_bytes(),
             writer_heap_bytes: self.peak_writer_bytes(),
             retained_part_encoded_bytes: self.peak_retained_part_bytes(),

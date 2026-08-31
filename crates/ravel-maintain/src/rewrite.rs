@@ -156,7 +156,7 @@ pub async fn rewrite_and_publish<C: SegmentCodec>(
             shard = bucket.shard,
             ingest_hour_bucket = bucket.ingest_hour_bucket,
             parts = parts.len(),
-            catalog_directory_encoded_bytes = peaks.catalog_directory_encoded_bytes,
+            catalog_directory_decoded_bytes = peaks.catalog_directory_decoded_bytes,
             cursor_bytes = peaks.cursor_bytes,
             writer_heap_bytes = peaks.writer_heap_bytes,
             retained_part_encoded_bytes = peaks.retained_part_encoded_bytes,
