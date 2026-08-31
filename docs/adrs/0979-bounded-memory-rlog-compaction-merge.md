@@ -193,10 +193,14 @@ recreate the full-output term this decision exists to kill, in exactly
 the recovery scenario. So no bytes are retained for the exception either.
 If the post-publish HEAD finds an `AlreadyExists` part missing, the run
 fails loud with a typed error whose remedy is a re-run — and the re-run
-converges deterministically: it rebuilds byte-identical parts, its PUT of
-the deleted key is then a FRESH put (age reset, sweep-immune), the record
-PUT resolves `AlreadyExists`, and `resolve_already_exists` repairs from
-the bytes it has just built and still holds pre-publish. The steady-state
+converges without needing any retained bytes at all: it rebuilds
+byte-identical parts, and its PUT of the deleted key is a FRESH put (the
+key is absent, so `AlreadyExists` cannot recur for it) that restores the
+part and resets its age BEFORE the record resolution runs. Every part the
+winner record references is then either still present or just re-PUT, so
+`resolve_already_exists` finds nothing to repair; the repair-from-bytes
+arm is never the rerun's convergence mechanism, and its no-bytes warn arm
+is unreachable on this path. The steady-state
 memory bound is therefore unchanged in every path, the tombstone race is
 closed by verification rather than retention, and the two owed tests are
 the `FaultStore` tombstone interleaving and the all-parts-`AlreadyExists`
@@ -206,14 +210,24 @@ retry, both asserting no retained-bytes growth.
 
 New `CompactorConfig` knob, default **20 GiB**. Admission is charged as a
 **pre-decode reservation**, not an after-the-fact measurement: before a
-cursor fetches or decodes anything, the merge reserves its ceiling cost:
-`2·G` from the section descriptors' raw lengths, plus `B_dec` summed from
-the resident PAGE_DIR's per-page `uncomp_len` for the block's pages times
-a documented allocation-overhead factor — page contents, not a shape
-formula, are what decoded string buffers actually scale with, and PAGE_DIR
-is resident before any BLOCKS byte is fetched. The rows-times-columns
-ceiling formula remains as the documented rationale and as the fallback
-for an input without a PAGE_DIR. The reservation is reconciled down to the
+cursor fetches or decodes anything, the merge reserves its ceiling cost,
+and the ceiling covers everything the cursor retains for its lifetime:
+`2·G` from the section descriptors' raw lengths; the cursor's location
+metadata (the owned `Vec<StreamBlockLoc>` and each loc's block list,
+sized from the same resident directory that produced it); and `B_dec`
+taken as the MAXIMUM over the cursor's candidate blocks of the per-block
+sum of PAGE_DIR `uncomp_len` values, times a documented
+allocation-overhead factor — the max, not the first block's cost, because
+`refill` decodes later blocks after releasing earlier ones and a later,
+larger block must not exceed the reconciled reservation (the owed test is
+first-small/next-large). Page contents, not a shape formula, are what
+decoded string buffers scale with, and PAGE_DIR is resident before any
+BLOCKS byte is fetched. An input WITHOUT a PAGE_DIR cannot be
+admission-priced (its string-page term is unknowable before the fetch),
+so the bounded merge refuses it with a typed error naming the object and
+its format version rather than guessing — in practice the fleet is
+RLOG v4 everywhere (PAGE_DIR is mandatory in v4), so the refusal arm is
+a version gate, not a live path. The reservation is reconciled down to the
 cursor's actual residency (raw bytes as fetched, `heap_estimate()` once
 decoded — the same numbers the #977 tracker sees) after the decode
 completes. Reservations are taken under the same admission lock that
