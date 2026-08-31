@@ -69,9 +69,16 @@ pub const DEFAULT_BATCH_ROWS: usize = 10_000;
 /// Default flush target size, in bytes, for a shard's buffer. `1` makes every
 /// Strict write flush inside its own `handle_write`, so one batch is one RLOG
 /// object per involved shard and every ack is answered by that write's own
-/// flush. Any larger value lets a shard accumulate encoded records across
-/// several batches before it flushes, which defers those earlier batches' acks
-/// (see [`load_instrumented`]).
+/// flush. A larger value lets a shard hold several batches' records in one
+/// buffer before it flushes, which defers those earlier batches' acks (see
+/// [`load_instrumented`]).
+///
+/// The target is compared against the shard buffer's *estimated in-memory
+/// footprint* (`est_bytes`), not against encoded RLOG bytes, and the comparison
+/// runs once per write after a whole batch's slice has merged, so a target at or
+/// below one batch's per-shard slice produces exactly the layout `1` does. See
+/// [`target_bytes_no_effect_warning`] for the arithmetic and for what the loader
+/// reports when a target turns out to change nothing.
 pub const DEFAULT_TARGET_BYTES: usize = 1;
 
 /// Default number of decoded batches allowed to sit queued between the Parquet
@@ -313,6 +320,76 @@ pub fn dynamic_column_warnings(
     Vec::new()
 }
 
+/// Warning for a load whose `--target-bytes` above [`DEFAULT_TARGET_BYTES`] laid
+/// the objects out exactly as `1` would have (issue #971). `None` when the
+/// target was the default, when some buffer did span several writes, or when no
+/// shard ever received two writes to accumulate in the first place.
+///
+/// Why a target of a few MiB is a no-op on a wide corpus. The value reaches
+/// `IngestConfig::target_bytes` unmodified and the shard actor does consult it,
+/// but against `est_bytes`: the buffer's *estimated in-memory footprint*
+/// (`est_record_bytes`/`est_columnar_bytes` in
+/// crates/ravel-ingest/src/log_shard.rs), where every attribute occurrence
+/// charges a `size_of::<(String, AttrValue)>()` pair header plus its key bytes
+/// and its uncompressed value bytes. For the 104-column ClickBench mapping that
+/// is roughly 8 KB per row, against objects the same load writes at a bit over
+/// 100 bytes per row. A target read off an observed object size is therefore
+/// tens of times below the footprint of the rows that object holds. On top of
+/// that the comparison runs once per write, after a whole batch's per-shard
+/// slice has merged, so any target at or below one slice's footprint
+/// (`--batch-rows / --shards` rows' worth) is already exceeded by the first
+/// write into an empty buffer and flushes it, exactly as `1` does.
+///
+/// The loader cannot compute that footprint before it runs, so this reports the
+/// outcome from figures [`LoadReport`] already carries. `tokens` holds one entry
+/// per (batch, shard) Strict ack, and a flush that answered several batches
+/// repeats its own token once per batch, so `objects_written() == tokens.len()`
+/// means no buffer ever spanned two writes. That is evidence about the target
+/// only if some shard took at least two writes, which is the second condition.
+pub fn target_bytes_no_effect_warning(
+    target_bytes: usize,
+    report: &LoadReport,
+    batch_rows: usize,
+    shards: u32,
+) -> Option<String> {
+    if target_bytes <= DEFAULT_TARGET_BYTES {
+        return None;
+    }
+    let writes = report.tokens.len();
+    let objects = report.objects_written();
+    if objects < writes {
+        // At least one flush answered more than one batch: the target held a
+        // buffer open, which is what it is for.
+        return None;
+    }
+    let mut writes_per_shard: std::collections::HashMap<u32, usize> =
+        std::collections::HashMap::new();
+    for token in &report.tokens {
+        *writes_per_shard.entry(token.shard).or_default() += 1;
+    }
+    if writes_per_shard.values().copied().max().unwrap_or(0) < 2 {
+        // No shard was written twice, so nothing could have accumulated at any
+        // target. Saying the target did nothing would blame the wrong lever.
+        return None;
+    }
+    Some(format!(
+        "warning: --target-bytes {target_bytes} did not change this load's object layout. All \
+         {writes} (batch, shard) writes flushed as their own object ({objects} objects), which is \
+         what --target-bytes 1 produces, and at least one shard took two or more writes without \
+         accumulating them. The target is compared against the shard buffer's ESTIMATED in-memory \
+         footprint, not the encoded object size: every attribute occurrence charges a {pair}-byte \
+         (name, value) pair header plus its key and uncompressed value bytes, plus the \
+         stream-attribute blob and 32 bytes per row, and the check runs once per write after a \
+         whole batch has merged. So a target at or below one batch's per-shard slice (about \
+         {slice} rows here, at --batch-rows {batch_rows} over {shards} shards) is already exceeded \
+         by the first write into an empty buffer and flushes it. For objects that span several \
+         batches, raise --target-bytes above that slice's estimated footprint, or lower \
+         --batch-rows.",
+        pair = size_of::<(String, AttrValue)>(),
+        slice = batch_rows / (shards.max(1) as usize),
+    ))
+}
+
 /// CLI entry point for `ravel-cli load --parquet`: read the mapping and Parquet
 /// file paths, run the load, and print a summary on success or the error plus
 /// the known-durable commit tokens on failure.
@@ -420,6 +497,16 @@ pub(crate) async fn run_warning_to(
             // known, ahead of the end-of-load dynamic-column pressure warnings.
             if let Some(skew) = &report.skew_warning {
                 let _ = writeln!(warnings, "{skew}");
+            }
+            // A `--target-bytes` above the default that laid the objects out
+            // exactly as the default would have is reported rather than left
+            // silent (issue #971): the flag's threshold is a footprint estimate
+            // the operator cannot see, so the only honest place to state that
+            // the value did nothing is after the load that proves it.
+            if let Some(warning) =
+                target_bytes_no_effect_warning(target_bytes, &report, batch_rows, shards)
+            {
+                let _ = writeln!(warnings, "{warning}");
             }
             // The loader's writer uses `RlogConfig::default()` (log_shard.rs), so
             // its per-object dynamic-column budget is that default.
@@ -749,12 +836,17 @@ type BuildStartHook = Arc<dyn Fn() + Send + Sync>;
 ///
 /// `target_bytes` is the shard buffer's flush target (`--target-bytes`). At `1`
 /// every Strict write flushes inside its own `handle_write`, so a write's ack is
-/// answered by its own flush. Above that, a shard accumulates encoded records
-/// across batches, so an earlier batch's ack is not answered until a later batch
-/// pushes the buffer over the target or the router's age trigger
+/// answered by its own flush. Above that, a shard holds several batches'
+/// records in one buffer, so an earlier batch's ack is not answered until a
+/// later batch pushes the buffer over the target or the router's age trigger
 /// (`max_flush_delay`) fires. The ack still means durable when it arrives; it
 /// just arrives later, and the loader's in-flight window must be wide enough to
 /// submit the batch that releases it (see the flush-target comment inside).
+///
+/// The target is measured in the router's estimated buffered footprint and is
+/// tested once per write, so a value at or below one batch's per-shard slice
+/// changes nothing at all; [`target_bytes_no_effect_warning`] documents that
+/// arithmetic and is what reports the case to the operator.
 #[allow(clippy::too_many_arguments)]
 async fn load_instrumented(
     store: Arc<dyn ObjectStoreBackend>,
@@ -879,6 +971,12 @@ async fn load_instrumented(
     // is released by the wall-clock age trigger instead. The loader's in-flight
     // window must therefore be wide enough to hold the batches that accumulate
     // into one flush, or every flush waits out `max_flush_delay`.
+    //
+    // "Larger" is measured against the shard's `est_bytes` footprint estimate,
+    // not the encoded object, and tested once per write after a whole batch's
+    // slice has merged: below one slice's footprint the target is unreachable
+    // as a lever, whatever byte figure it names
+    // (`target_bytes_no_effect_warning`).
     //
     // `Arc` so each batch's write can be `tokio::spawn`ed onto its own task and
     // run genuinely concurrently up to `pipeline_depth` (a constructed-but-
@@ -4874,6 +4972,69 @@ type = "i64"
         (dir, pq, m)
     }
 
+    /// [`sorted_by_shard_fixture`] plus one fat record attribute, and the
+    /// mapping written to disk so the real entry point can be driven over the
+    /// same file.
+    ///
+    /// `payload_len` bytes of filler per row is what makes the shard buffer's
+    /// footprint estimate large enough for the `--target-bytes` regimes to be
+    /// distinguishable at unit-test row counts: the estimate charges every
+    /// attribute occurrence's key and uncompressed value bytes once per row,
+    /// dictionary-encoded or not (`est_columnar_bytes`,
+    /// crates/ravel-ingest/src/log_shard.rs), so one row's footprint is about
+    /// `payload_len` and one (batch, shard) slice's is that times its rows.
+    /// `payload` is a record attribute, not a resource attribute, so stream
+    /// identity and therefore the shard each row lands on are unchanged.
+    fn fat_attr_sorted_by_shard_fixture(
+        shards: u32,
+        rows_per_group: usize,
+        payload_len: usize,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        Mapping,
+    ) {
+        use parquet::arrow::ArrowWriter;
+
+        let hosts: Vec<String> = (0..shards).map(|s| host_for_shard(s, shards)).collect();
+        let payload = "p".repeat(payload_len);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pq = dir.path().join("fat_attr_sorted_by_shard.parquet");
+        let mapping_path = dir.path().join("fat_attr_mapping.toml");
+
+        let group = |host: &str| {
+            batch(vec![
+                ("ts", i64_col(vec![NOW_NS; rows_per_group])),
+                ("svc", str_col(vec!["api"; rows_per_group])),
+                ("host", str_col(vec![host; rows_per_group])),
+                ("payload", str_col(vec![payload.as_str(); rows_per_group])),
+            ])
+        };
+        let first = group(hosts[0].as_str());
+        let file = std::fs::File::create(&pq).expect("create parquet");
+        let mut writer = ArrowWriter::try_new(file, first.schema(), None).expect("arrow writer");
+        writer.write(&first).expect("write row group");
+        writer.flush().expect("flush row group");
+        for host in &hosts[1..] {
+            writer
+                .write(&group(host.as_str()))
+                .expect("write row group");
+            writer.flush().expect("flush row group");
+        }
+        writer.close().expect("close writer");
+
+        let toml = "ts_column = \"ts\"\nts_unit = \"nanos\"\n\n\
+             [[resource_attribute]]\nkey = \"service.name\"\ncolumn = \"svc\"\ntype = \"str\"\n\n\
+             [[resource_attribute]]\nkey = \"host\"\ncolumn = \"host\"\ntype = \"str\"\n\n\
+             [[attribute]]\nkey = \"payload\"\ncolumn = \"payload\"\ntype = \"str\"\n";
+        std::fs::write(&mapping_path, toml).expect("write mapping");
+        let m = parse_mapping(toml).expect("valid mapping");
+
+        (dir, pq, mapping_path, m)
+    }
+
     #[tokio::test]
     async fn stride_reading_spreads_a_sorted_batch_across_all_shards() {
         use ravel_object_store::memory::MemoryStore;
@@ -5044,6 +5205,274 @@ type = "i64"
         assert_eq!(
             records_small, records_large,
             "the same rows, decoded, regardless of how many objects hold them"
+        );
+    }
+
+    /// Issue #971: what `--target-bytes` regime a value falls into is decided by
+    /// one batch's PER-SHARD SLICE footprint, not by how large the byte figure
+    /// looks next to the objects the load writes. Four targets over one input,
+    /// each with a derivable object count.
+    ///
+    /// Geometry: 4 row groups of 16 rows, one shard's `host` value per group,
+    /// read with `--read-cursors 4 --batch-rows 16`, so there are 4 batches and
+    /// each batch puts 4 rows on every one of the 4 shards: 16 (batch, shard)
+    /// writes over 64 rows. Every row carries a 4000-byte record attribute, so
+    /// one row's estimated footprint is about 4.1 KB (the 4000 value bytes, a
+    /// 56-byte pair header, the 7-byte key, the stream-attribute blob and 32
+    /// fixed bytes), one slice's about 16.6 KB, and a shard's whole share of the
+    /// file about 66 KB.
+    ///
+    /// - `1`: every write flushes itself. 4 x 4 = 16 objects.
+    /// - `4096`: a quarter of one slice, so every write still reaches the target
+    ///   on its own and flushes. 16 objects, IDENTICAL to `1`. This is the
+    ///   reported defect in miniature: a byte figure that looks generous beside
+    ///   the objects it produces (4 rows each) but sits far below the footprint
+    ///   estimate it is actually compared against.
+    /// - `24576`: above one slice and below two, so each shard flushes on every
+    ///   second batch. 4 shards x 2 = 8 objects, exactly half of 16.
+    /// - `1 MiB`: above a shard's whole 66 KB share, so each shard flushes once,
+    ///   released by the age trigger. 4 objects, one per shard.
+    ///
+    /// Prove-the-test: hardcode `target_bytes: 1` into the `IngestConfig` in
+    /// `load_instrumented` and both effective regimes fail (`left: 16, right:
+    /// 8`), while the two no-effect regimes stay green, which is exactly the
+    /// asymmetry the issue reported. Under-counting the magnitudes fails too:
+    /// asserting 4 objects for the `24576` regime (a floor a fraction of the
+    /// truth would clear) fails at `left: 8, right: 4`.
+    #[tokio::test]
+    async fn target_bytes_regimes_are_set_by_one_batchs_per_shard_slice() {
+        use ravel_object_store::memory::MemoryStore;
+
+        let shards = 4u32;
+        let rows_per_group = 16usize;
+        let batch_rows = 16usize;
+        let (_dir, pq, _mapping_path, m) =
+            fat_attr_sorted_by_shard_fixture(shards, rows_per_group, 4000);
+        let n_rows = (rows_per_group * shards as usize) as u64;
+        let batches = rows_per_group / (batch_rows / shards as usize);
+        assert_eq!(batches, 4, "the geometry must yield 4 batches");
+
+        let run = |target_bytes: usize| {
+            let pq = pq.clone();
+            let m = m.clone();
+            async move {
+                let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+                let report = load_instrumented(
+                    Arc::clone(&store),
+                    &pq,
+                    "acme",
+                    &m,
+                    shards,
+                    batch_rows,
+                    Some(shards as usize),
+                    // Wide enough to hold every batch that accumulates into one
+                    // flush; below this the loader would block on an ack no
+                    // later batch can release.
+                    batches,
+                    DEFAULT_MAX_INFLIGHT_FLUSHES,
+                    DEFAULT_DECODE_QUEUE_BATCHES,
+                    target_bytes,
+                    NOW_NS,
+                    // A real clock: above the size trigger the tail of a load is
+                    // released by the router's wall-clock age trigger, which a
+                    // `FixedClock` can never fire.
+                    Arc::new(SystemClock),
+                    LoadPath::Columnar,
+                    None,
+                    None,
+                )
+                .await
+                .expect("load succeeds");
+                let stored = list_data_objects(store.as_ref()).await.len();
+                (report, stored, decoded_records(store.as_ref()).await)
+            }
+        };
+
+        let (default, objects_default, records_default) = run(DEFAULT_TARGET_BYTES).await;
+        let (below, objects_below, records_below) = run(4096).await;
+        let (mid, objects_mid, _) = run(24_576).await;
+        let (whole, objects_whole, records_whole) = run(1024 * 1024).await;
+
+        for report in [&default, &below, &mid, &whole] {
+            assert_eq!(report.rows_processed, n_rows, "every run loads every row");
+        }
+        assert_eq!(
+            objects_default, 16,
+            "target 1: each of the 4 batches flushes on all 4 shards at once"
+        );
+        assert_eq!(
+            objects_below, objects_default,
+            "target 4096 is a quarter of one (batch, shard) slice's estimated footprint, so every \
+             write still flushes itself: the same layout target 1 produces"
+        );
+        assert_eq!(
+            objects_below, 16,
+            "and that layout is 4 batches x 4 shards, pinned rather than compared"
+        );
+        assert_eq!(
+            objects_mid, 8,
+            "target 24576 sits above one slice and below two, so each shard flushes every second \
+             batch: 4 shards x 2 flushes"
+        );
+        assert_eq!(
+            objects_whole, 4,
+            "target 1 MiB is above a shard's whole share of the file, so each shard flushes once"
+        );
+        for report in [&default, &below, &mid, &whole] {
+            assert_eq!(
+                report.tokens.len(),
+                16,
+                "every run acks the same 16 (batch, shard) writes whatever the target; only how \
+                 many distinct objects answer them changes"
+            );
+        }
+        assert_eq!(
+            below.objects_written(),
+            objects_below,
+            "the reported object count must equal what the store holds"
+        );
+        assert_eq!(
+            mid.objects_written(),
+            objects_mid,
+            "the reported object count must equal what the store holds"
+        );
+        assert_eq!(
+            whole.objects_written(),
+            objects_whole,
+            "the reported object count must equal what the store holds"
+        );
+        assert_eq!(
+            records_below, records_default,
+            "the same rows, decoded, regardless of how many objects hold them"
+        );
+        assert_eq!(
+            records_whole, records_default,
+            "the same rows, decoded, regardless of how many objects hold them"
+        );
+    }
+
+    /// The no-effect case reaches the operator through the real entry point
+    /// (issue #971): a target that reproduced the `1` layout is reported on the
+    /// warning stream, and one that changed the layout is not.
+    ///
+    /// Same fixture and geometry as
+    /// `target_bytes_regimes_are_set_by_one_batchs_per_shard_slice`, driven
+    /// through [`run_warning_to`] so the mapping file, the router, and the
+    /// warning stream are the CLI's own.
+    ///
+    /// Prove-the-test: delete the `target_bytes_no_effect_warning` emit block in
+    /// `run_warning_to` and the first assertion fails; make the helper return
+    /// its message unconditionally and the 1 MiB case fails instead.
+    #[tokio::test]
+    async fn the_entry_point_reports_a_target_bytes_that_changed_nothing() {
+        use ravel_object_store::memory::MemoryStore;
+
+        let shards = 4u32;
+        let (_dir, pq, mapping_path, _m) = fat_attr_sorted_by_shard_fixture(shards, 16, 4000);
+
+        let run = |target_bytes: usize| {
+            let pq = pq.clone();
+            let mapping_path = mapping_path.clone();
+            async move {
+                let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+                let mut sink: Vec<u8> = Vec::new();
+                run_warning_to(
+                    store,
+                    &pq,
+                    "acme",
+                    &mapping_path,
+                    shards,
+                    16,
+                    Some(shards as usize),
+                    4,
+                    DEFAULT_MAX_INFLIGHT_FLUSHES,
+                    DEFAULT_DECODE_QUEUE_BATCHES,
+                    target_bytes,
+                    NOW_NS,
+                    &mut sink,
+                )
+                .await
+                .expect("the load itself succeeds; an ineffective target is a warning");
+                String::from_utf8(sink).expect("warnings are utf-8")
+            }
+        };
+
+        let emitted = run(4096).await;
+        assert!(
+            emitted.contains("--target-bytes 4096 did not change this load's object layout"),
+            "the ineffective target is named with its value: {emitted}"
+        );
+        assert!(
+            emitted.contains("ESTIMATED in-memory footprint")
+                && emitted.contains("about 4 rows here"),
+            "and the message states the unit and the slice it had to clear: {emitted}"
+        );
+
+        let effective = run(1024 * 1024).await;
+        assert!(
+            !effective.contains("did not change this load's object layout"),
+            "a target that collapsed 16 writes into 4 objects must not be reported as inert: \
+             {effective}"
+        );
+    }
+
+    /// [`target_bytes_no_effect_warning`]'s three preconditions, each pinned by
+    /// the case that would misfire without it. `writes` is
+    /// `LoadReport::tokens`, one entry per (batch, shard) ack, so a flush that
+    /// answered several batches shows up as a repeated token.
+    ///
+    /// Prove-the-test: delete the `objects < writes` early return and the
+    /// accumulating case starts warning (its `is_none` assertion fails at
+    /// "a repeated token is a flush that answered two batches"); delete the
+    /// `< 2` writes-per-shard guard and the one-write-per-shard case starts
+    /// warning; change the `target_bytes <= DEFAULT_TARGET_BYTES` guard to `<`
+    /// and the default-target case starts warning.
+    #[test]
+    fn the_no_effect_warning_fires_only_when_the_target_is_what_did_nothing() {
+        let token = |shard: u32, seq: u64| CommitToken {
+            shard,
+            writer_id: uuid::Uuid::nil(),
+            epoch: 1,
+            seq,
+            ingest_hour_bucket: 7,
+        };
+        let report = |tokens: Vec<CommitToken>| LoadReport {
+            tokens,
+            ..LoadReport::default()
+        };
+
+        // Two writes on one shard, two distinct objects: nothing accumulated.
+        let inert = report(vec![token(0, 1), token(0, 2)]);
+        let warning = target_bytes_no_effect_warning(4096, &inert, 16, 4)
+            .expect("two writes, two objects, one shard: the target did nothing");
+        assert!(
+            warning.contains("All 2 (batch, shard) writes flushed as their own object (2 objects)"),
+            "the message reports the observed counts: {warning}"
+        );
+        assert!(
+            warning.contains("about 4 rows here, at --batch-rows 16 over 4 shards"),
+            "and the slice threshold it derives from the geometry: {warning}"
+        );
+
+        assert!(
+            target_bytes_no_effect_warning(DEFAULT_TARGET_BYTES, &inert, 16, 4).is_none(),
+            "the default target is not a no-op, it is the documented per-batch layout"
+        );
+
+        // Two writes answered by one flush: the same token repeats, so the
+        // target held a buffer open.
+        let accumulating = report(vec![token(0, 1), token(0, 1)]);
+        assert!(
+            target_bytes_no_effect_warning(4096, &accumulating, 16, 4).is_none(),
+            "a repeated token is a flush that answered two batches: the target worked"
+        );
+
+        // One write per shard: no buffer could have spanned two writes at any
+        // target, so the target is not what to blame.
+        let single = report(vec![token(0, 1), token(1, 1), token(2, 1), token(3, 1)]);
+        assert!(
+            target_bytes_no_effect_warning(4096, &single, 16, 4).is_none(),
+            "no shard was written twice, so nothing could have accumulated"
         );
     }
 
