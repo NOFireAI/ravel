@@ -522,6 +522,7 @@ mod tests {
             min_event_ts_ns: created_unix_ns - 1_000,
             max_event_ts_ns: created_unix_ns,
             segment_format_version: 3,
+            declared_column_stats: Vec::new(),
         };
         let record = CompactionRecord {
             format_version: 1,

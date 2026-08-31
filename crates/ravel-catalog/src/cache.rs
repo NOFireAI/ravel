@@ -559,6 +559,7 @@ mod tests {
             segment_format_version: 1,
             created_unix_ns: 0,
             ingest_hour_bucket: 0,
+            declared_column_stats: Vec::new(),
         }
     }
 

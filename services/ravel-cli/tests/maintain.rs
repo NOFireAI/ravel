@@ -95,6 +95,7 @@ async fn seed_compaction(store: &MemoryStore, tenant: &str, inputs: &[(Uuid, u64
         min_event_ts_ns: 100,
         max_event_ts_ns: 200,
         segment_format_version: u32::from(VERSION_V7),
+        declared_column_stats: Vec::new(),
     };
     let record = CompactionRecord {
         format_version: 1,
@@ -499,6 +500,7 @@ fn decode_compaction_record_prints_fields() {
             min_event_ts_ns: 100,
             max_event_ts_ns: 200,
             segment_format_version: u32::from(VERSION_V7),
+            declared_column_stats: Vec::new(),
         }],
         created_unix_ns: 999,
     };

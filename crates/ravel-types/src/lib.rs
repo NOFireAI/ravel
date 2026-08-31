@@ -7,6 +7,7 @@
 //! string, never an in-place edit.
 
 pub mod accounting;
+pub mod declared_stats;
 pub mod exemplar;
 pub mod logstream;
 
