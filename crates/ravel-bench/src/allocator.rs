@@ -75,12 +75,29 @@ pub fn active_allocator() -> Allocator {
 
 /// Resolve the allocator from the text of a `/proc/self/maps`, split out from
 /// the `/proc` read so the parsing is testable against fixture text without a
-/// real `/proc`. A mapped `libtcmalloc`/`libjemalloc`/`libmimalloc` wins; a
-/// readable maps with recognizable entries but none of them is the system
-/// allocator; text with no recognizable maps entry (empty or malformed) is
-/// [`Allocator::Unknown`], never a guess.
+/// real `/proc`. The whole maps is scanned and the DISTINCT recognized
+/// allocator libraries (`libtcmalloc`/`libjemalloc`/`libmimalloc`) collected,
+/// then:
+///
+/// - exactly one distinct recognized allocator is that allocator;
+/// - two or more distinct recognized allocators is [`Allocator::Unknown`]: the
+///   maps is ambiguous (e.g. `LD_PRELOAD=libjemalloc.so` on a process that also
+///   has `libtcmalloc.so` mapped as a transitive dependency of another library),
+///   and a wrong allocator recorded as fact is worse than an honest unknown;
+/// - zero recognized allocators but at least one well-formed maps entry is the
+///   system allocator;
+/// - no well-formed maps entry at all (empty or malformed) is
+///   [`Allocator::Unknown`], never a guess.
+///
+/// The same library mapped across several segments (`r--p`/`r-xp`/`rw-p`, the
+/// normal shape of a real maps) is ONE distinct allocator, not several: the
+/// decision is over the set of recognized libraries, not the count of matching
+/// lines.
 fn allocator_from_maps(maps: &str) -> Allocator {
     let mut saw_entry = false;
+    let mut tcmalloc = false;
+    let mut jemalloc = false;
+    let mut mimalloc = false;
     for line in maps.lines() {
         if !is_maps_entry(line) {
             continue;
@@ -88,20 +105,37 @@ fn allocator_from_maps(maps: &str) -> Allocator {
         saw_entry = true;
         if let Some(path) = maps_line_pathname(line) {
             if path.contains("libtcmalloc") {
-                return Allocator::Tcmalloc;
-            }
-            if path.contains("libjemalloc") {
-                return Allocator::Jemalloc;
-            }
-            if path.contains("libmimalloc") {
-                return Allocator::Mimalloc;
+                tcmalloc = true;
+            } else if path.contains("libjemalloc") {
+                jemalloc = true;
+            } else if path.contains("libmimalloc") {
+                mimalloc = true;
             }
         }
     }
-    if saw_entry {
-        Allocator::System
-    } else {
-        Allocator::Unknown
+    let recognized = [
+        (tcmalloc, Allocator::Tcmalloc),
+        (jemalloc, Allocator::Jemalloc),
+        (mimalloc, Allocator::Mimalloc),
+    ];
+    let mut distinct = recognized
+        .into_iter()
+        .filter_map(|(seen, allocator)| seen.then_some(allocator));
+    match (distinct.next(), distinct.next()) {
+        // Exactly one distinct recognized allocator governs the process.
+        (Some(allocator), None) => allocator,
+        // Two or more distinct recognized allocators: the maps cannot say which
+        // one governs allocation, so record the honest unknown.
+        (Some(_), Some(_)) => Allocator::Unknown,
+        // No recognized allocator: the system allocator if the maps was
+        // readable, unknown if it had no well-formed entry at all.
+        (None, _) => {
+            if saw_entry {
+                Allocator::System
+            } else {
+                Allocator::Unknown
+            }
+        }
     }
 }
 
@@ -196,6 +230,56 @@ mod tests {
     #[test]
     fn maps_without_a_known_allocator_is_the_system_allocator() {
         assert_eq!(allocator_from_maps(SYSTEM_MAPS), Allocator::System);
+    }
+
+    /// A maps naming BOTH tcmalloc and jemalloc is ambiguous: neither can be
+    /// recorded as the governing allocator, so the probe reports the honest
+    /// unknown rather than the first one in scan order. This is the defect issue
+    /// #972 closes: `LD_PRELOAD=libjemalloc.so` on a process that also has
+    /// `libtcmalloc.so` mapped (a transitive dependency of another library) used
+    /// to report `tcmalloc`, a wrong value recorded as fact.
+    ///
+    /// To watch it fail: change the `(Some(_), Some(_))` arm of
+    /// `allocator_from_maps` back to returning the first allocator (e.g.
+    /// `(Some(allocator), _) => allocator`). The blob then reports `tcmalloc`
+    /// and the assertion reads `tcmalloc == unknown`.
+    #[test]
+    fn a_maps_with_two_distinct_allocators_is_unknown() {
+        let maps = "\
+55a1c0000000-55a1c0021000 r--p 00000000 08:01 100 /usr/bin/ravel-bench
+7f2a10000000-7f2a10025000 r-xp 00000000 08:01 200 /usr/lib/x86_64-linux-gnu/libtcmalloc.so.4.5.9
+7f2a20000000-7f2a20025000 r-xp 00000000 08:01 201 /usr/lib/x86_64-linux-gnu/libjemalloc.so.2
+7f2a30000000-7f2a30030000 r-xp 00000000 08:01 202 /usr/lib/x86_64-linux-gnu/libc.so.6
+";
+        assert_eq!(allocator_from_maps(maps), Allocator::Unknown);
+    }
+
+    /// One allocator mapped across the realistic several-segment shape
+    /// (`r--p`/`r-xp`/`rw-p` for one object), with an unrelated library mapped
+    /// the same way, is that allocator, NOT unknown: the decision is over the
+    /// distinct recognized libraries, not the count of matching lines. This is
+    /// the regression guard for a naive "two matching lines means two
+    /// allocators" implementation, which would report `unknown` for every
+    /// single-allocator process (the normal case), a worse regression than the
+    /// bug being fixed.
+    ///
+    /// To watch it fail: make `allocator_from_maps` count matching lines rather
+    /// than distinct libraries (treat each `libjemalloc` line as its own
+    /// allocator). The three jemalloc segments then read as three allocators,
+    /// the `(Some(_), Some(_))` arm fires, and the assertion reads
+    /// `unknown == jemalloc`.
+    #[test]
+    fn one_allocator_across_several_segments_is_that_allocator() {
+        let maps = "\
+55a1c0000000-55a1c0021000 r--p 00000000 08:01 100 /usr/bin/ravel-bench
+7f2a10000000-7f2a10025000 r--p 00000000 08:01 200 /usr/lib/x86_64-linux-gnu/libjemalloc.so.2
+7f2a10025000-7f2a10040000 r-xp 00025000 08:01 200 /usr/lib/x86_64-linux-gnu/libjemalloc.so.2
+7f2a10040000-7f2a10041000 rw-p 00040000 08:01 200 /usr/lib/x86_64-linux-gnu/libjemalloc.so.2
+7f2a20000000-7f2a20025000 r--p 00000000 08:01 201 /usr/lib/x86_64-linux-gnu/libc.so.6
+7f2a20025000-7f2a20040000 r-xp 00025000 08:01 201 /usr/lib/x86_64-linux-gnu/libc.so.6
+7f2a20040000-7f2a20041000 rw-p 00040000 08:01 201 /usr/lib/x86_64-linux-gnu/libc.so.6
+";
+        assert_eq!(allocator_from_maps(maps), Allocator::Jemalloc);
     }
 
     /// Empty maps is the explicit unknown, never a guessed allocator.

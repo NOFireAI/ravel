@@ -58,11 +58,24 @@ use serde::{Deserialize, Serialize};
 use crate::allocator::Allocator;
 use crate::promql_corpus::CostClass;
 
-/// The report schema version. A report declaring any other version is refused
-/// rather than parsed optimistically (the same contract
-/// [`crate::promql_corpus::CORPUS_FORMAT_VERSION`] carries): the field exists so
-/// a future schema change is a loud error, not a silently misread document.
-pub const SCHEMA_VERSION: u32 = 1;
+/// The report schema version the writer stamps: the newest shape a build
+/// produces. Version 1 was the pre-allocator shape; version 2 adds the
+/// `allocator` provenance field (issue #972). A reader accepts any version in
+/// [`SUPPORTED_VERSIONS`] and refuses the rest rather than parsing optimistically
+/// (the same contract [`crate::promql_corpus::CORPUS_FORMAT_VERSION`] carries):
+/// the field exists so a schema change is a loud error, not a silently misread
+/// document, and two document shapes sharing one number is exactly what would
+/// defeat that.
+pub const SCHEMA_VERSION: u32 = 2;
+
+/// The report schema versions this build reads, following the `SUPPORTED_VERSIONS`
+/// idiom the persistent-format crates carry (`ravel_segment::SUPPORTED_VERSIONS`,
+/// `ravel_logseg::SUPPORTED_VERSIONS`). A version-1 document has no `allocator`
+/// key and takes [`Allocator::Unknown`] from the serde default; a version-2
+/// document carries the field. Both parse; every other version is refused with
+/// the supported set named, not a single number. This is a bench report, not a
+/// frozen on-object format, so widening the set is not an ADR-and-bump event.
+pub const SUPPORTED_VERSIONS: &[u32] = &[1, 2];
 
 /// The retry-blindness caveat every cost estimate carries (ADR-0927 decision 8,
 /// issue #928). `object_store` retries below `InstrumentedStore` with
@@ -349,14 +362,16 @@ pub struct MetricsBenchReport {
 pub enum ValidationError {
     /// The report declares a schema version this build does not read.
     #[error(
-        "report declares schema version {found}, but this build reads version {expected}; a \
+        "report declares schema version {found}, but this build reads versions {supported:?}; a \
          schema change is a version bump, never a silently misread document"
     )]
     SchemaVersionMismatch {
         /// The version the document declared.
         found: u32,
-        /// The version this build reads ([`SCHEMA_VERSION`]).
-        expected: u32,
+        /// The versions this build reads ([`SUPPORTED_VERSIONS`]). Reported as
+        /// the whole set, not a single number, so the message stays honest once
+        /// more than one version is accepted.
+        supported: &'static [u32],
     },
     /// A required provenance field is absent (an empty string, the `"unknown"`
     /// sentinel, an empty digest, zero logical cores). An absent field is not
@@ -610,14 +625,15 @@ fn is_content_digest(value: &str) -> bool {
 
 /// Validate the provenance block, fail-closed. Every present identity field must
 /// carry a real value (not blank, not the `"unknown"` sentinel), the schema
-/// version must match, the hardware must name at least one logical core, every
+/// version must be one of [`SUPPORTED_VERSIONS`], the hardware must name at least
+/// one logical core, every
 /// named comparator must be completely pinned by a real content digest, and the
 /// configuration must carry no blank or duplicate key.
 fn validate_provenance(p: &Provenance) -> Result<(), ValidationError> {
-    if p.schema_version != SCHEMA_VERSION {
+    if !SUPPORTED_VERSIONS.contains(&p.schema_version) {
         return Err(ValidationError::SchemaVersionMismatch {
             found: p.schema_version,
-            expected: SCHEMA_VERSION,
+            supported: SUPPORTED_VERSIONS,
         });
     }
     for (field, value) in checked_provenance_fields(p) {
@@ -1366,19 +1382,90 @@ mod tests {
         validate(&report).expect("a report without a geomean validates");
     }
 
-    /// Failure class: a schema version this build does not read.
+    /// Failure class: a schema version this build does not read. An unsupported
+    /// version (here 0, below the supported set) is refused, and the error names
+    /// the whole supported set rather than a single number.
+    ///
+    /// To watch it fail against a wrongly widened set: add `0` to
+    /// [`SUPPORTED_VERSIONS`] (`&[0, 1, 2]`). Version 0 then validates,
+    /// `expect_err` finds `Ok(())`, and the test fails.
     #[test]
-    fn a_wrong_schema_version_fails_validation() {
+    fn an_unsupported_low_schema_version_fails_validation() {
         let mut report = valid_report();
-        report.provenance.schema_version = SCHEMA_VERSION + 7;
-        let err = validate(&report).expect_err("a wrong schema version must fail");
+        report.provenance.schema_version = 0;
+        let err = validate(&report).expect_err("schema version 0 is unsupported and must fail");
         assert_eq!(
             err,
             ValidationError::SchemaVersionMismatch {
-                found: SCHEMA_VERSION + 7,
-                expected: SCHEMA_VERSION,
+                found: 0,
+                supported: SUPPORTED_VERSIONS,
             }
         );
+        // The rendered error names the supported set, not one number.
+        assert!(
+            err.to_string().contains("[1, 2]"),
+            "the error reports the supported set: {err}"
+        );
+    }
+
+    /// Failure class: a schema version above the supported set (here 3) is still
+    /// refused. A future version this build predates is not readable.
+    ///
+    /// To watch it fail against a wrongly widened set: add `3` to
+    /// [`SUPPORTED_VERSIONS`] (`&[1, 2, 3]`). Version 3 then validates,
+    /// `expect_err` finds `Ok(())`, and the test fails.
+    #[test]
+    fn an_unsupported_high_schema_version_fails_validation() {
+        let mut report = valid_report();
+        report.provenance.schema_version = 3;
+        let err = validate(&report).expect_err("schema version 3 is unsupported and must fail");
+        assert_eq!(
+            err,
+            ValidationError::SchemaVersionMismatch {
+                found: 3,
+                supported: SUPPORTED_VERSIONS,
+            }
+        );
+    }
+
+    /// A version-1 document (the pre-allocator shape) with NO `allocator` key
+    /// still validates, and its allocator reads as the explicit unknown from the
+    /// serde default: a reader built after this change reads a document a reader
+    /// before it produced.
+    ///
+    /// To watch it fail: remove `1` from [`SUPPORTED_VERSIONS`] (`&[2]`). The
+    /// version-1 document is then refused with `SchemaVersionMismatch`,
+    /// `expect` panics on the `Err`, and the test fails.
+    #[test]
+    fn a_version_1_document_without_an_allocator_key_validates_as_unknown() {
+        let mut doc = serde_json::to_value(valid_report()).expect("serialize");
+        doc["provenance"]["schema_version"] = serde_json::json!(1);
+        doc["provenance"]
+            .as_object_mut()
+            .expect("provenance object")
+            .remove("allocator");
+        let report: MetricsBenchReport =
+            serde_json::from_value(doc).expect("a version-1 document with no allocator parses");
+        assert_eq!(report.provenance.schema_version, 1);
+        assert_eq!(report.provenance.allocator, Allocator::Unknown);
+        validate(&report).expect("a version-1 document validates");
+    }
+
+    /// A version-2 document carrying an allocator validates and round-trips the
+    /// exact value: the new shape is a first-class supported document, not merely
+    /// tolerated.
+    #[test]
+    fn a_version_2_document_with_an_allocator_validates_and_round_trips() {
+        let mut report = valid_report();
+        report.provenance.schema_version = 2;
+        report.provenance.allocator = Allocator::Jemalloc;
+        validate(&report).expect("a version-2 document validates");
+
+        let json = serde_json::to_string(&report).expect("serialize");
+        let back: MetricsBenchReport = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.provenance.schema_version, 2);
+        assert_eq!(back.provenance.allocator, Allocator::Jemalloc);
+        validate(&back).expect("the round-tripped version-2 document validates");
     }
 
     /// Failure class: duplicate measurement id.
