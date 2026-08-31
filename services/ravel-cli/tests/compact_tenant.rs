@@ -202,6 +202,9 @@ async fn compact_tenant_compacts_only_the_sealed_hour_of_every_shard() {
         None,
         false,
         None,
+        None,
+        None,
+        None,
         now_ns(),
     )
     .await
@@ -248,9 +251,12 @@ async fn max_flush_lifetime_zero_seals_and_compacts_every_hour() {
         // collapses to the 5m clock-skew allowance, so the hour that ended ten
         // minutes ago is sealed too. Ignoring this argument (dropping the
         // `config.max_flush_lifetime_ns = ns` assignment in
-        // `maintain::compactor_config`) flips `report.compacted` back to 2 and
-        // fails this assertion.
+        // `maintain::build_compactor_config`) flips `report.compacted` back to 2
+        // and fails this assertion.
         Some(0),
+        None,
+        None,
+        None,
         now_ns(),
     )
     .await
@@ -288,6 +294,9 @@ async fn dry_run_reports_the_same_plan_and_writes_nothing() {
         None,
         true,
         None,
+        None,
+        None,
+        None,
         now_ns(),
     )
     .await
@@ -316,6 +325,9 @@ async fn dry_run_reports_the_same_plan_and_writes_nothing() {
         None,
         false,
         None,
+        None,
+        None,
+        None,
         now_ns(),
     )
     .await
@@ -335,6 +347,9 @@ async fn missing_shards_and_no_provisioning_record_is_a_typed_error_naming_the_t
         None,
         None,
         true,
+        None,
+        None,
+        None,
         None,
         now_ns(),
     )
@@ -372,6 +387,9 @@ async fn from_hour_and_to_hour_bound_the_walk() {
         Some(HOUR_OLD + 1),
         false,
         Some(0),
+        None,
+        None,
+        None,
         now_ns(),
     )
     .await
