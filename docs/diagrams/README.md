@@ -18,11 +18,11 @@ above it is disposable and stateless.
 
 Illustrates: docs/architecture.md, docs/adrs/0001-object-native-l0.md.
 
-Updated 2026-07-27 to add the SQL query path (ravel-sql, DataFusion, ADR-0013):
-in progress, not yet wired to a service endpoint. Last verified against the
-code: 2026-07-27 (Phase 1 -- OTLP ingest, commit, catalog, PromQL selector
-queries -- is complete and running end to end; OTAP ingest is scaffolded but
-not wired into the gateway).
+The SQL query path (ravel-sql, DataFusion, ADR-0013) is shipped: served at
+`POST /api/v1/sql` under the `sql` cargo feature and over Flight SQL under
+`flight-sql`, both off by default. OTAP ingest is likewise shipped behind a
+cargo feature. The three architecture-*.svg diagrams below supersede this
+file's system overview for the current shapes.
 
 ## architecture-write-path.svg
 
@@ -41,7 +41,7 @@ Commit records fold into snapshot parts and a HEAD published by CAS; a
 query pins one snapshot with a single GET, prunes with the snapshot's
 bounds, skip indexes, blooms, and exact column statistics, fetches by
 ranged or whole-object GETs through the read cache, and evaluates through
-PromQL or SQL.
+PromQL or SQL (SQL behind the `sql`/`flight-sql` cargo features).
 
 Illustrates: docs/architecture.md "The catalog and the read path",
 docs/catalog-and-mvcc.md.
