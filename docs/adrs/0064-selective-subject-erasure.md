@@ -520,8 +520,10 @@ contract:
    retention (ADR-0019) is the only sanctioned age-out mechanism.
    Instant-access storage-class transitions (e.g. to IA) are permitted.
 3. **Exactly two sanctioned lifecycle rules**:
-   `AbortIncompleteMultipartUpload` (recommended, 7 days — this also
-   converts an undocumented dependency into a documented one), and
+   `AbortIncompleteMultipartUpload` (required with a cleanup period of 7
+   days or less per docs/object-store-contract.md, because nothing in Ravel
+   reaps abandoned multipart parts — this also converts an undocumented
+   dependency into a documented one), and
    the noncurrent-version expiration of point 1 when versioning is on.
 4. **Object Lock**: bucket-default retention is supported but extends the
    erasure bound per §6; scoped legal holds (ADR-0042) are the recommended
