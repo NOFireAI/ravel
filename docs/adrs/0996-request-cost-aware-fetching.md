@@ -223,7 +223,9 @@ layer already runs on (`BlockRangeFetcher::request_cost_bytes`,
   spend; skip-index pruning still applies at decode over the fetched
   buffer, which is sound because it only ever skips fetched bytes
   (same argument as `log_fetcher.rs:3558-3560`).
-- **`byte-minimal`**: today's behaviour, byte for byte — the ADR-0904
+- **`byte-minimal`**: today's behaviour, byte for byte for objects at or
+  under the fetch bound (above it the new resident bound segments the
+  assembly on every policy, which today's code does not) — the ADR-0904
   latency break-even default (1,887,437) and all three derived
   decisions unchanged. Kept for egress-billed and network-constrained
   deployments, where ADR-0904 showed the default is already the
@@ -232,18 +234,26 @@ layer already runs on (`BlockRangeFetcher::request_cost_bytes`,
   The profile stores transfer per GiB and the derivation needs per byte,
   so the arithmetic multiplies BEFORE it divides, in `u128`:
   `request_cost_bytes = get_class_nanodollars × BYTES_PER_GIB /
-  transfer_nanodollars_per_gib`, floor-rounded with a documented minimum
-  of one byte — a naive per-byte pre-division would truncate every
+  (transfer_nanodollars_per_gib + retrieval_nanodollars_per_gib)`,
+  floor-rounded with a documented minimum of one byte — retrieval is a
+  per-byte charge exactly like transfer and enters the byte price the
+  same way, in the same `u128` multiply-before-divide path; a profile
+  with `transfer = 0, retrieval > 0` therefore routes byte-minimally
+  rather than reporting retrieval dollars a request-minimal plan just
+  spent, and a fixture at that profile pins it — a naive per-byte pre-division would truncate every
   sub-nanodollar-per-byte transfer price to zero and make the worked
   ~4.4 KB result unreachable, and a test pins exactly that rate. The
   result is clamped to the existing floors (64 KiB gap, 512 KiB
-  crossover, `log_fetcher.rs:2166,2186`) and saturated when transfer
-  is 0. At the reference profile this resolves
+  crossover, `log_fetcher.rs:2166,2186`) and saturated only when BOTH byte
+  prices are 0. At the reference profile this resolves
   to request-minimal; at list egress prices it resolves to ~4.4 KB,
   which the floors clamp — reproducing ADR-0904's worked examples from
-  the profile instead of prose. A bounded resource penalty rides the
-  derivation: the resolved rate is capped so a single GET's buffered
-  length never exceeds the fetch bound below.
+  the profile instead of prose. The fetch bound below is NOT part of this
+  derivation: capping the resolved rate to the bound would let a
+  projection that saves more than the bound re-select ranged routing
+  under an effectively request-minimal policy. Routing economics and the
+  resident bound stay decoupled — the rate decides WHICH shape, the
+  bound only segments HOW a chosen covering read is laid out.
 
 **The fetch bound (the memory consequence, stated)**: new
 `EngineConfig::logs_max_fetch_run_bytes`, default 64 MiB, validated at
@@ -367,7 +377,15 @@ truth):
   data object per query at the two open funnels (the fast-path
   `record_open_shape` site, `logs_scan.rs:2338`, and the
   plan-then-stripe fetch entry) — the existing opens-by-shape counters
-  cover only the fast path, so they cannot be the denominator alone.
+  cover only the fast path, so they cannot be the denominator alone. The
+  counter also crosses the DISTRIBUTED boundary: the worker snapshot
+  protobuf gains `data_objects_touched` as an ADDITIVE field with a new
+  field number (frozen-contract additive rule; never renumber), decoded
+  and merged like every other snapshot counter, or a coordinator would
+  report amplification over a denominator missing every remote touch.
+  `StoreMetrics` attempts stay process-global and are deliberately NOT
+  snapshot fields: billing is a per-process ledger, shape metrics are
+  per-query. Task 996-3's scope grows the proto/codec/merge addition.
 - **Every byte figure names its kind** — already the wired discipline
   (wire: `PhaseWireByteCounter`; stored: `page_bytes_fetched/decoded`;
   cache: `cache_bytes`; `accounting.rs:111-142`,
@@ -520,7 +538,7 @@ quarter) EXCEPT 996-8, which is scheduled behind them by construction.
 |---|---|---|---|---|---|
 | 996-1 | `StoreCostProfile` (nanodollar arithmetic, TOML load, reference constant) + `QueryAccounting::data_objects_touched` | ravel-types | `src/cost_profile.rs` (new), `src/accounting.rs`, `src/lib.rs` | — | exact-figure unit tests; reference profile constants pinned ($5/M, $0.40/M, 12.5:1 asserted); snapshot/merge round-trip for the new counter |
 | 996-2 | ledger reads attempts: `RequestCounts` gains per-op attempts beside calls; byte-kind labels in report output | ravel-bench | `src/report.rs` | — (reads #928's existing seam) | MemoryStore fixture: attempts==0 with calls>0 labelled correctly; S3-shaped fixture via `StoreMetrics::record_attempt` asserts attempts≥calls exactly |
-| 996-3 | policy enum + `EngineConfig::logs_fetch_policy`, `logs_max_fetch_run_bytes`; exchange-rate derivation; fetch bound + segmented covering fallback; plan-probe suppression under request-minimal; record `data_objects_touched` | ravel-query | `src/config.rs`, `src/log_fetcher.rs` | 996-1 | policy→rate mapping table pinned (saturate / default / profile-derived w/ floors); bound test: object > bound fetched in `ceil(size/bound)` GETs, peak buffer ≤ bound, rows byte-identical |
+| 996-3 | policy enum + `EngineConfig::logs_fetch_policy`, `logs_max_fetch_run_bytes`; exchange-rate derivation; fetch bound + segmented covering fallback; plan-probe suppression under request-minimal; record `data_objects_touched`, carried through the distributed snapshot (additive proto field + codec + merge) | ravel-query, proto (additive only) | `src/config.rs`, `src/log_fetcher.rs`, `src/distrib/*`, `proto/` | 996-1 | policy→rate mapping table pinned (saturate / default / profile-derived w/ floors); bound test: object > bound fetched in `ceil(size/bound)` GETs, peak buffer ≤ bound, rows byte-identical |
 | 996-4 | modeled cost + profile/policy provenance stamp (requested/effective split) in bench reports | ravel-bench | `src/sql_latency.rs`, `src/report.rs` (non-overlapping sections vs 996-2, sequenced anyway: W2) | 996-1, 996-2 | report fixture asserts stamp present exactly once, `effective: None` on the Flight lane, modeled cost = attempts × profile to the nanodollar |
 | 996-5 | server flags `--logs-fetch-policy`, `--store-cost-profile`; reachability test in the `logs_request_cost_bytes_is_reachable_from_cli` shape; precedence: explicit byte flag wins | ravel-server | `services/ravel-server/src/config.rs`, `src/query.rs` | 996-3 | flag proven to arrive at the running engine through real startup; precedence pinned |
 | 996-6 | per-statement `range_amplification` exposure; policy-extremes differential (rows identical at all three policies; opens/GET counters prove the route) | ravel-sql | `src/executor.rs`, `tests/logs_request_cost_knob_routing.rs`, `tests/logs_fast_path_projection_routing.rs` | 996-3 | counters, not configured values, prove which route ran (ADR-0904 904-4 rule); amplification == 1.0 exactly on the fixture under request-minimal |
