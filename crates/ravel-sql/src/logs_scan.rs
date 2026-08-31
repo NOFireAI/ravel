@@ -2342,6 +2342,42 @@ impl PartitionCtx {
             self.accounting.add_logs_whole_object_opens(1);
         }
     }
+
+    /// Record `count` distinct data objects admitted to this query's fetch
+    /// (ADR-0996 decision 3), on this query's accounting handle.
+    ///
+    /// The handle only accumulates, so the caller owes the distinctness: the
+    /// counter is the denominator of `range_amplification = data_GET_requests /
+    /// data_objects_touched`, and an object counted twice understates the
+    /// ratio. The contract is designated-recorder, not record-where-you-fetch,
+    /// because several partitions stripe one segment's blocks (ADR-0102) and a
+    /// per-partition site would multiply the count the same way per-partition
+    /// whole-segment totals would. The two routes name their single recorder
+    /// explicitly:
+    ///
+    /// - The plan-then-stripe path records at planning, by partition 0 only,
+    ///   over the segments the prune left with a surviving block. A segment
+    ///   pruned to zero survivors is not counted: the plan phase read its
+    ///   footer or skip index and the query then fetched no block from it,
+    ///   which is exactly the probe the counter excludes.
+    /// - The whole-segment fast path has no plan phase, so each segment is
+    ///   counted by its one owning partition at the open, beside
+    ///   [`Self::record_open_shape`] and under the same rule: an `attrs_raw`
+    ///   fallback re-opens the same object and does not re-count.
+    ///
+    /// The count is per object, not per GET, so a ranged open that brings one
+    /// coalesced range per `(row group, projected column)` counts once, and a
+    /// block served entirely from the read cache counts the same as one that
+    /// went to the store: the figure is the query's object working set, not its
+    /// cache misses.
+    ///
+    /// The TopK late-materialization second phase
+    /// ([`RowFetchSource::fetch_block`]) needs no recorder of its own. Its row
+    /// refs come from phase 1, so every object it re-reads was already admitted
+    /// to the fetch, and counting it again would double the denominator.
+    fn record_data_objects_touched(&self, count: u64) {
+        self.accounting.add_data_objects_touched(count);
+    }
 }
 
 /// Refuse a segment whose declared RLOG format version this build cannot read,
@@ -2866,11 +2902,21 @@ impl Stream for LogScanStream {
                             .min(counts.total_blocks.max(1));
                         // Partition 0 publishes every relevant segment's
                         // whole-segment prune totals, once, so striping a segment
-                        // across partitions does not multiply them.
+                        // across partitions does not multiply them. It is the
+                        // designated recorder of the query's touched data objects
+                        // for the same reason (ADR-0996 decision 3): a segment
+                        // with a surviving block is admitted to the fetch here,
+                        // once, whichever partitions go on to open it and in
+                        // whatever read shape.
                         if this.partition == 0 {
+                            let mut touched = 0u64;
                             for plan in counts.segs.iter().flatten() {
                                 this.blocks.record_segment_totals(&plan.stats);
+                                if plan.survivors > 0 {
+                                    touched += 1;
+                                }
                             }
+                            this.ctx.record_data_objects_touched(touched);
                             this.blocks.plan_full_reads.add(counts.full_reads);
                         }
                         this.work = owned_work(
@@ -2907,6 +2953,12 @@ impl Stream for LogScanStream {
                             let by_chunk = this.ctx.open_by_column_chunk(&seg);
                             this.blocks.record_fast_path_route(by_chunk);
                             this.ctx.record_open_shape(by_chunk);
+                            // This path has no plan phase, so the object is
+                            // counted here (ADR-0996 decision 3): the fast path
+                            // assigns whole segments, so the partition opening
+                            // this one is its only owner and this site runs once
+                            // per object per query.
+                            this.ctx.record_data_objects_touched(1);
                             LogScanState::Opening(open_segment_fast(
                                 Arc::clone(&this.ctx),
                                 seg,
