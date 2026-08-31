@@ -147,16 +147,35 @@ fn allocator_from_maps(maps: &str) -> Allocator {
 /// entries, none naming an allocator, so the system allocator) from
 /// unrecognizable text (no entries, so unknown).
 fn is_maps_entry(line: &str) -> bool {
-    let Some(range) = line.split_whitespace().next() else {
+    let mut fields = line.split_whitespace();
+    let Some(range) = fields.next() else {
         return false;
     };
     let Some((start, end)) = range.split_once('-') else {
         return false;
     };
-    !start.is_empty()
+    let range_ok = !start.is_empty()
         && !end.is_empty()
         && start.bytes().all(|b| b.is_ascii_hexdigit())
-        && end.bytes().all(|b| b.is_ascii_hexdigit())
+        && end.bytes().all(|b| b.is_ascii_hexdigit());
+    if !range_ok {
+        return false;
+    }
+    // A hex range alone is not a maps record: `7f-80 not-a-maps-record` must
+    // read as unrecognizable text (Unknown), never as evidence of a readable
+    // maps (System). Require the mandatory columns too: a permissions field of
+    // exactly four bytes from the maps alphabet, then offset, dev, and inode.
+    let Some(perms) = fields.next() else {
+        return false;
+    };
+    let perms_ok = perms.len() == 4
+        && perms.bytes().zip(*b"rwxp").all(|(got, kind)| match kind {
+            b'r' => got == b'r' || got == b'-',
+            b'w' => got == b'w' || got == b'-',
+            b'x' => got == b'x' || got == b'-',
+            _ => got == b'p' || got == b's',
+        });
+    perms_ok && fields.next().is_some() && fields.next().is_some() && fields.next().is_some()
 }
 
 /// The pathname field of a maps entry (the file backing the mapping): the sixth
@@ -171,6 +190,16 @@ fn maps_line_pathname(line: &str) -> Option<&str> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_near_miss_line_is_not_a_maps_entry_and_reads_unknown() {
+        // The mandatory columns (perms, offset, dev, inode) are what separate
+        // a maps record from text that merely starts with a hex range; without
+        // them the probe must answer Unknown, never a guessed System.
+        assert_eq!(allocator_from_maps(NEAR_MISS_MAPS), Allocator::Unknown);
+        // And a real record still parses: the fixture set stays recognized.
+        assert_eq!(allocator_from_maps(SYSTEM_MAPS), Allocator::System);
+    }
+
     /// A maps blob with tcmalloc preloaded, shaped like a real one: the
     /// executable, the preloaded allocator, and libc.
     const TCMALLOC_MAPS: &str = "\
@@ -184,6 +213,15 @@ mod tests {
 55a1c0000000-55a1c0021000 r--p 00000000 08:01 100 /usr/bin/ravel-bench
 7f2a10000000-7f2a10025000 r-xp 00000000 08:01 200 /usr/lib/x86_64-linux-gnu/libjemalloc.so.2
 7f2a20000000-7f2a20030000 r-xp 00000000 08:01 201 /usr/lib/x86_64-linux-gnu/libc.so.6
+";
+
+    /// Near-miss text: a hex range followed by junk is NOT a maps record.
+    /// Before the column validation, `7f-80 not-a-maps-record` set `saw_entry`
+    /// and the probe answered `System` for unrecognizable text -- a guessed
+    /// allocator, the exact thing this module must never produce.
+    const NEAR_MISS_MAPS: &str = "\
+7f-80 not-a-maps-record
+deadbeef-cafebabe junk junk
 ";
 
     /// A readable maps with no allocator library mapped: only the executable,
