@@ -21,6 +21,7 @@ use std::process::Command;
 use clap::Parser;
 use ravel_bench::harness::{StoreKind, store_and_metrics_from_env};
 use ravel_bench::report::{ReportRunConfig, WorkloadShape, run};
+use ravel_types::cost_profile::StoreCostProfile;
 
 #[derive(Parser, Debug)]
 #[command(about = "Emit a machine-readable ravel benchmark report as JSON")]
@@ -117,6 +118,9 @@ async fn main() {
         ack_timeout_secs: args.ack_timeout_secs,
         git_commit: git_commit(),
         toolchain: toolchain(),
+        // The reference profile prices this run; epic #996 task 996-5 owns the
+        // CLI surface that would override it.
+        store_cost_profile: StoreCostProfile::reference(),
     };
 
     let report = run(&config).await;

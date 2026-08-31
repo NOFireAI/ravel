@@ -40,6 +40,7 @@ use ravel_sql::{
     SpanSegmentFetcher, SqlConfig, SqlExecutor,
 };
 use ravel_types::accounting::NoopQueryCostRecorder;
+use ravel_types::cost_profile::StoreCostProfile;
 use ravel_types::{CommitToken, TenantHash, TenantId, TimeRange};
 use tonic::metadata::MetadataMap;
 use tonic::transport::Server;
@@ -154,6 +155,7 @@ async fn publish_dataset(store: Arc<dyn ObjectStoreBackend>) -> TenantId {
         warm_catalog: false,
         logs_suffix_len: None,
         logs_request_cost_bytes: ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES,
+        store_cost_profile: StoreCostProfile::reference(),
     })
     .await
     .expect("generated lane publishes the dataset");
@@ -254,6 +256,7 @@ fn flight_cfg(
         warm_catalog: false,
         logs_suffix_len: None,
         logs_request_cost_bytes: ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES,
+        store_cost_profile: StoreCostProfile::reference(),
     }
 }
 
@@ -364,6 +367,27 @@ async fn flight_lane_measures_every_statement_over_the_wire_without_scan_diagnos
         report.provenance.sql_max_query_bytes_effective, None,
         "a Flight run does not send the ceiling, so the effective value is unknown"
     );
+    // The cost profile stamp follows the same requested/effective split: the
+    // Flight lane stamps the profile it ASKED for, but its effective profile is
+    // None because the foreign server's own --store-cost-profile governed
+    // pricing (ADR-0996 decision 1). The stamp is present exactly once each.
+    assert_eq!(
+        report.provenance.store_cost_profile_requested,
+        StoreCostProfile::reference(),
+        "the requested field carries this run's profile (flight_cfg's default)"
+    );
+    assert_eq!(
+        report.provenance.store_cost_profile_effective, None,
+        "a Flight run cannot know the server's profile, so the effective value is unknown"
+    );
+    // The Flight lane carries no per-run accounting, so it models no cost: the
+    // request term is absent (no attempt source) and no byte term is present.
+    assert_eq!(
+        report.modeled_cost.modeled_request_cost_nanodollars, None,
+        "no attempt source on the Flight lane: the modeled request cost is absent"
+    );
+    assert_eq!(report.modeled_cost.modeled_transfer_cost_nanodollars, None);
+    assert_eq!(report.modeled_cost.modeled_retrieval_cost_nanodollars, None);
     // The dataset stanza is still resolved from the store directly: a Flight
     // client cannot read the catalog.
     assert_eq!(report.dataset.object_count, 3);

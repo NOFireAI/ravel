@@ -67,12 +67,14 @@ use ravel_sql::{
     SqlExecutor, SqlRequest, StaticDeclaredColumns,
 };
 use ravel_types::accounting::{AccountedOp, QueryAccounting};
+use ravel_types::cost_profile::StoreCostProfile;
 use ravel_types::logstream::log_stream_id;
 use ravel_types::{Signal, TenantHash, TenantId, TimeRange};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::allocator::Allocator;
+use crate::report::ModeledCost;
 use crate::sql_corpus::CorpusEntry;
 
 /// A frozen query clock, bounding the catalog resolve's ingest-hour fan-out.
@@ -342,6 +344,31 @@ pub struct Provenance {
     /// allocator string is rejected at deserialize.
     #[serde(default = "default_allocator")]
     pub allocator: Allocator,
+    /// The active store cost profile this run ASKED to price at (ADR-0996
+    /// decision 1): name and all price fields, verbatim, so a modeled-cost
+    /// figure is reconcilable against the exact prices that produced it. A
+    /// report written before the stamp existed deserializes to
+    /// [`StoreCostProfile::reference`].
+    #[serde(default = "default_store_cost_profile")]
+    pub store_cost_profile_requested: StoreCostProfile,
+    /// The profile that actually governed pricing, or `None` when this process
+    /// cannot know it. `Some` for an in-process lane (`generate`/`tenant`),
+    /// which prices with the profile it was handed; `None` for the Flight lane,
+    /// whose statements ran against a foreign server whose own
+    /// `--store-cost-profile` governed -- exactly the requested/effective split
+    /// the `logs_request_cost_bytes` fields use, and for the same reason:
+    /// stamping the requested value as effective would make two Flight passes at
+    /// different profiles look like a controlled comparison. Skipped in JSON
+    /// when `None`, keeping the no-null contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_cost_profile_effective: Option<StoreCostProfile>,
+}
+
+/// The profile a report written before the cost stamp existed deserializes to,
+/// and the default a run prices at when no profile was chosen: the reference
+/// profile (ADR-0996 decision 1).
+fn default_store_cost_profile() -> StoreCostProfile {
+    StoreCostProfile::reference()
 }
 
 /// What a report written before the allocator was recorded (issue #972)
@@ -890,6 +917,38 @@ pub struct SqlLatencyReport {
     pub skipped: Vec<SkippedEntry>,
     #[serde(default)]
     pub failed: Vec<FailedEntry>,
+    /// Modeled object-store cost of the whole pass at the stamped profile
+    /// (ADR-0996 decision 3). The request term prices BILLED ATTEMPTS per class;
+    /// this harness has no attempt source (the in-process lanes count CALLS
+    /// through `QueryAccounting`, the Flight lane carries no accounting at all),
+    /// so the request term is ABSENT here, never a cost modeled from calls. The
+    /// transfer and retrieval terms price the pass's GET wire bytes and appear
+    /// only when the profile carries a nonzero byte price. Defaulted on read so
+    /// a report written before it existed still deserializes.
+    #[serde(default)]
+    pub modeled_cost: ModeledCost,
+}
+
+/// Total GET wire bytes the pass moved: summed over every recorded run of every
+/// measured statement (`RunAccounting::object_store_get_bytes`, WIRE bytes). The
+/// Flight lane records no per-run accounting, so its entries contribute zero;
+/// combined with its `None` effective profile, a Flight pass models no byte cost.
+fn total_get_wire_bytes(entries: &[EntryReport]) -> u64 {
+    entries
+        .iter()
+        .flat_map(|e| e.per_run_accounting.iter().flatten())
+        .fold(0u64, |acc, run| {
+            acc.saturating_add(run.object_store_get_bytes)
+        })
+}
+
+/// Model the pass's cost at `profile`. This harness has no attempt source, so
+/// the request term is always absent (the ABSENT-attempts contract, never a
+/// cost from calls); the byte terms price `entries`' GET wire bytes and appear
+/// only when `profile` carries a nonzero byte price.
+fn model_pass_cost(profile: &StoreCostProfile, entries: &[EntryReport]) -> ModeledCost {
+    let wire_bytes = total_get_wire_bytes(entries);
+    ModeledCost::model(profile, None, None, wire_bytes, wire_bytes)
 }
 
 /// Inputs for the generated lane.
@@ -983,6 +1042,11 @@ pub struct GenerateConfig {
     /// [`ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES`], so an unset flag leaves
     /// logs-scan routing byte-for-byte unchanged.
     pub logs_request_cost_bytes: u64,
+    /// The store cost profile the pass is priced at (ADR-0996 decision 1),
+    /// stamped verbatim into provenance and used to model the pass's cost.
+    /// Defaults to [`StoreCostProfile::reference`]; no CLI flag sets it here
+    /// (epic #996 task 996-5 owns the server/CLI surface).
+    pub store_cost_profile: StoreCostProfile,
 }
 
 /// Where the Flight lane sends its statements.
@@ -1113,6 +1177,14 @@ pub struct TenantConfigInput {
     /// the server's own config governs there). Defaults to
     /// [`ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES`].
     pub logs_request_cost_bytes: u64,
+    /// The store cost profile the pass is priced at (ADR-0996 decision 1),
+    /// stamped verbatim into provenance and used to model the pass's cost. On
+    /// the Flight lane it is stamped as the REQUESTED profile only; the
+    /// effective profile is `None`, because the foreign server's own
+    /// `--store-cost-profile` governed there. Defaults to
+    /// [`StoreCostProfile::reference`]; no CLI flag sets it here (epic #996
+    /// task 996-5 owns the server/CLI surface).
+    pub store_cost_profile: StoreCostProfile,
 }
 
 fn percentile(sorted_ns: &[u64], pct: f64) -> u64 {
@@ -1979,8 +2051,13 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
             logs_suffix_len: cfg.logs_suffix_len,
             flight_endpoint: None,
             allocator: crate::allocator::active_allocator(),
+            store_cost_profile_requested: cfg.store_cost_profile.clone(),
+            // Generate is always in process: the requested profile priced the
+            // run, so it is also the effective one.
+            store_cost_profile_effective: Some(cfg.store_cost_profile.clone()),
         },
         dataset,
+        modeled_cost: model_pass_cost(&cfg.store_cost_profile, &entries),
         entries,
         skipped,
         failed,
@@ -2159,8 +2236,21 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
             // governs the benchmark process's RSS, and on the Flight lane the
             // server's allocator is its own concern, not recorded here.
             allocator: crate::allocator::active_allocator(),
+            store_cost_profile_requested: cfg.store_cost_profile.clone(),
+            // The Flight lane's statements ran against a foreign server whose
+            // own `--store-cost-profile` governed pricing, unknown to this
+            // process: stamp `None`. An in-process tenant run prices with the
+            // profile it was handed, so it is effective.
+            store_cost_profile_effective: match &cfg.flight {
+                Some(_) => None,
+                None => Some(cfg.store_cost_profile.clone()),
+            },
         },
         dataset,
+        // The request term is absent on every lane (no attempt source); the
+        // byte terms price this pass's GET wire bytes, which the Flight lane
+        // does not record, so a Flight pass models no byte cost either.
+        modeled_cost: model_pass_cost(&cfg.store_cost_profile, &entries),
         entries,
         skipped,
         failed,
@@ -2585,6 +2675,7 @@ mod tests {
             warm_catalog: false,
             logs_suffix_len: None,
             logs_request_cost_bytes: DEFAULT_LOG_REQUEST_COST_BYTES,
+            store_cost_profile: StoreCostProfile::reference(),
         }
     }
 
@@ -5182,6 +5273,7 @@ mod tests {
             warm_catalog: false,
             logs_suffix_len: None,
             logs_request_cost_bytes: DEFAULT_LOG_REQUEST_COST_BYTES,
+            store_cost_profile: StoreCostProfile::reference(),
         };
         let gen_report = run_generated(&gen_cfg).await.expect("generated lane runs");
         let load_ms = gen_report

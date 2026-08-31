@@ -35,6 +35,7 @@ use ravel_bench::sql_latency::{
 };
 use ravel_sql::DEFAULT_MAX_QUERY_BYTES;
 use ravel_types::TimeRange;
+use ravel_types::cost_profile::StoreCostProfile;
 
 #[derive(Parser, Debug)]
 #[command(about = "Per-query SQL latency over the ADR-0100 corpus (cold/warm, min/median/max)")]
@@ -403,6 +404,9 @@ async fn run(args: &Args) -> Result<SqlLatencyReport, ravel_bench::sql_latency::
                             .filter(|t| !t.is_empty())
                     }),
                 }),
+                // The reference profile prices this pass; epic #996 task 996-5
+                // owns the CLI surface that would override it.
+                store_cost_profile: StoreCostProfile::reference(),
             };
             run_tenant(&cfg).await
         }
@@ -433,6 +437,9 @@ async fn run(args: &Args) -> Result<SqlLatencyReport, ravel_bench::sql_latency::
                 explain_dir: explain_dir.clone(),
                 warm_catalog: args.warm_catalog,
                 logs_suffix_len: args.logs_suffix_len,
+                // The reference profile prices this pass; epic #996 task 996-5
+                // owns the CLI surface that would override it.
+                store_cost_profile: StoreCostProfile::reference(),
             };
             run_generated(&cfg).await
         }
@@ -844,6 +851,8 @@ mod tests {
             logs_suffix_len: None,
             flight_endpoint: None,
             allocator: ravel_bench::allocator::Allocator::System,
+            store_cost_profile_requested: StoreCostProfile::reference(),
+            store_cost_profile_effective: Some(StoreCostProfile::reference()),
         }
     }
 
