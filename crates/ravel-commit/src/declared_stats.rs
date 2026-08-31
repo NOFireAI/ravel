@@ -18,11 +18,19 @@
 //!   worth logging.
 //! - **A defective entry is dropped, never trusted, and never fatal.** An
 //!   ineligible `declared_type`, a value kind that disagrees with it, a
-//!   half-present min/max pair, a min above its max, an empty name, or a
+//!   half-present min/max pair, a min above its max, an empty name, a null
+//!   count that disagrees with the carrying record's row count, or a
 //!   duplicate column all leave that one column uncovered for that segment
 //!   and are counted for the caller's defect metric. The record itself still
 //!   decodes: a bad statistic must not make a durable commit record
 //!   unreadable.
+//! - **Two clauses belong to the record, not to the entry.** Clauses 4 and 5
+//!   of the predicate compare `null_count` against the segment's row count,
+//!   which no `DeclaredColumnMinMax` carries: for a stamp it is the carrying
+//!   record's own `sample_count` (`CommitRecord` field 11, `CompactionPart`
+//!   field 6). So [`decode`] and [`decode_all`] stay carrier-agnostic and
+//!   [`read_commit_record`] and [`read_compaction_part`] are where those two
+//!   clauses bind.
 //! - **The stamp side cannot express an ineligible type at all.** Encoding
 //!   takes only [`DeclaredColumnStat`]s, whose constructor is the typed
 //!   boundary that refuses ineligible types (ADR-0873 decision 2).
@@ -48,6 +56,30 @@ pub enum DeclaredStatDefect {
     /// values" statement: a present-but-empty value names no extremum at all.
     #[error("declared column {name:?}: {which} value message is present but sets no kind")]
     EmptyValueKind { name: String, which: &'static str },
+    /// Clause 4: more NULLs than the segment has rows. Impossible for any
+    /// correct writer, so nothing on the entry is trusted.
+    #[error(
+        "declared column {name:?}: null_count {null_count} exceeds the record's sample_count {sample_count}: an object cannot hold more NULLs than rows"
+    )]
+    NullCountAboveSampleCount {
+        name: String,
+        null_count: u64,
+        sample_count: u64,
+    },
+    /// Clause 5: the presence of the extrema and the null count contradict
+    /// each other. `extrema` says which direction fired: `"absent"` for a
+    /// zero-non-null-values claim on a record that has non-NULL rows,
+    /// `"present"` for extrema claimed over a column that reads NULL in every
+    /// row.
+    #[error(
+        "declared column {name:?}: min and max are both {extrema}, so null_count {null_count} disagrees with sample_count {sample_count}: both-absent requires them equal, both-present requires null_count below sample_count"
+    )]
+    PresenceDisagreesWithNullCount {
+        name: String,
+        extrema: &'static str,
+        null_count: u64,
+        sample_count: u64,
+    },
     /// Two entries name the same column. Which one wins is undefined, so
     /// neither is trusted beyond the first.
     #[error("duplicate entry for declared column {0:?}")]
@@ -148,6 +180,39 @@ pub fn decode(entry: &DeclaredColumnMinMax) -> Result<DeclaredColumnStat, Declar
     .map_err(DeclaredStatDefect::from)
 }
 
+/// Clauses 4 and 5 of the predicate, checked against the row count of the
+/// segment the entry describes.
+///
+/// Both compare `null_count` to `sample_count`, so both are decidable only
+/// where a row count exists. A one-sided min/max pair never reaches here: it
+/// is [`DeclaredStatError::PresenceMismatch`] at the entry layer.
+fn row_count_defect(stat: &DeclaredColumnStat, sample_count: u64) -> Option<DeclaredStatDefect> {
+    let null_count = stat.null_count();
+    if null_count > sample_count {
+        return Some(DeclaredStatDefect::NullCountAboveSampleCount {
+            name: stat.name().to_string(),
+            null_count,
+            sample_count,
+        });
+    }
+    // Absent extrema state zero non-null values, so every row must be NULL;
+    // present extrema state at least one non-null value, so at least one row
+    // must not be. Both directions are the same clause, and an implementation
+    // that checks only the first accepts fabricated extrema over an all-NULL
+    // column (issue #970 defect 2).
+    let extrema = match (stat.min(), stat.max()) {
+        (None, None) if null_count != sample_count => "absent",
+        (Some(_), Some(_)) if null_count == sample_count => "present",
+        _ => return None,
+    };
+    Some(DeclaredStatDefect::PresenceDisagreesWithNullCount {
+        name: stat.name().to_string(),
+        extrema,
+        null_count,
+        sample_count,
+    })
+}
+
 /// Decode a record's stamp list, dropping (and reporting) every entry that
 /// cannot be trusted. Never fails: a defective statistic leaves its column
 /// uncovered, it does not make the record unreadable.
@@ -157,30 +222,43 @@ pub fn decode(entry: &DeclaredColumnMinMax) -> Result<DeclaredColumnStat, Declar
 /// already been paid for. A count cap would have to refuse a durable,
 /// immutable record whose declared-column count nothing in the tenant-config
 /// path bounds, which is the one outcome this module exists to avoid.
+///
+/// This checks only the clauses an entry decides on its own. The row-count
+/// clauses need the carrying record's `sample_count`, which a bare entry slice
+/// does not carry; [`read_commit_record`] and [`read_compaction_part`] add
+/// them.
 pub fn decode_all(entries: &[DeclaredColumnMinMax]) -> DecodedDeclaredStats {
+    decode_all_against_rows(entries, None)
+}
+
+/// The shared read pass. `sample_count` is `None` when the caller holds no row
+/// count for the entries, in which case clauses 4 and 5 are not decidable and
+/// the pass checks the entry-local clauses only.
+fn decode_all_against_rows(
+    entries: &[DeclaredColumnMinMax],
+    sample_count: Option<u64>,
+) -> DecodedDeclaredStats {
     let mut out = DecodedDeclaredStats::default();
     // Names, not decoded stats: the name is stored verbatim, and borrowing
     // from `entries` keeps the set independent of the pushes into `out`.
     let mut seen: HashSet<&str> = HashSet::with_capacity(entries.len());
     for (index, entry) in entries.iter().enumerate() {
-        match decode(entry) {
-            Ok(stat) => {
-                if !seen.insert(entry.name.as_str()) {
-                    out.dropped.push(DroppedStatEntry {
-                        index,
-                        name: entry.name.clone(),
-                        reason: DeclaredStatDefect::DuplicateName(entry.name.clone()),
-                    });
-                } else {
+        let reason = match decode(entry) {
+            Ok(stat) => match sample_count.and_then(|rows| row_count_defect(&stat, rows)) {
+                Some(defect) => defect,
+                None if seen.insert(entry.name.as_str()) => {
                     out.covered.push(stat);
+                    continue;
                 }
-            }
-            Err(reason) => out.dropped.push(DroppedStatEntry {
-                index,
-                name: entry.name.clone(),
-                reason,
-            }),
-        }
+                None => DeclaredStatDefect::DuplicateName(entry.name.clone()),
+            },
+            Err(reason) => reason,
+        };
+        out.dropped.push(DroppedStatEntry {
+            index,
+            name: entry.name.clone(),
+            reason,
+        });
     }
     out
 }
@@ -192,9 +270,10 @@ pub fn stamp_commit_record(record: &mut CommitRecord, stats: &[DeclaredColumnSta
     record.declared_column_stats = encode_all(stats);
 }
 
-/// Read a commit record's declared-column statistics.
+/// Read a commit record's declared-column statistics, reconciled against the
+/// record's own row count (`sample_count`, field 11).
 pub fn read_commit_record(record: &CommitRecord) -> DecodedDeclaredStats {
-    decode_all(&record.declared_column_stats)
+    decode_all_against_rows(&record.declared_column_stats, Some(record.sample_count))
 }
 
 /// Stamp one compaction/rewrite output part's declared-column statistics
@@ -204,9 +283,10 @@ pub fn stamp_compaction_part(part: &mut CompactionPart, stats: &[DeclaredColumnS
     part.declared_column_stats = encode_all(stats);
 }
 
-/// Read one compaction/rewrite output part's declared-column statistics.
+/// Read one compaction/rewrite output part's declared-column statistics,
+/// reconciled against the part's own row count (`sample_count`, field 6).
 pub fn read_compaction_part(part: &CompactionPart) -> DecodedDeclaredStats {
-    decode_all(&part.declared_column_stats)
+    decode_all_against_rows(&part.declared_column_stats, Some(part.sample_count))
 }
 
 #[cfg(test)]
@@ -269,6 +349,13 @@ mod tests {
         ingest_hour_bucket: u32,
     }
 
+    /// Row count of the carriers these tests build, and the row count every
+    /// generated stat is made consistent with. Clauses 4 and 5 tie
+    /// `null_count` to the carrier's row count, so a strategy that drew
+    /// `null_count` freely would generate entries the read side is required to
+    /// drop.
+    const SAMPLE_COUNT: u64 = 1_000;
+
     fn base_record() -> CommitRecord {
         record::build(NewCommitRecord {
             tenant_hash: TenantHash([0x11; 16]),
@@ -279,7 +366,7 @@ mod tests {
             writer_seq: 9,
             object_size: 4096,
             content_hash: [0x22; 32],
-            sample_count: 1_000,
+            sample_count: SAMPLE_COUNT,
             series_count: 4,
             min_event_ts_ns: 1_000,
             max_event_ts_ns: 2_000,
@@ -355,20 +442,7 @@ mod tests {
 
     #[test]
     fn compaction_part_round_trips_stamped_stats() {
-        let mut part = CompactionPart {
-            part_index: 0,
-            first_series_id: vec![0x01; 16],
-            last_series_id: vec![0x02; 16],
-            content_hash: vec![0x03; 32],
-            object_size: 8192,
-            sample_count: 2_000,
-            series_count: 8,
-            run_count: 1,
-            min_event_ts_ns: 10,
-            max_event_ts_ns: 20,
-            segment_format_version: 3,
-            declared_column_stats: vec![],
-        };
+        let mut part = base_part(2_000);
         let stats = vec![i64_stat("EventDate", 3, 4, 1)];
         stamp_compaction_part(&mut part, &stats);
         let bytes = part.encode_to_vec();
@@ -668,6 +742,236 @@ mod tests {
         );
     }
 
+    fn base_part(sample_count: u64) -> CompactionPart {
+        CompactionPart {
+            part_index: 0,
+            first_series_id: vec![0x01; 16],
+            last_series_id: vec![0x02; 16],
+            content_hash: vec![0x03; 32],
+            object_size: 8192,
+            sample_count,
+            series_count: 8,
+            run_count: 1,
+            min_event_ts_ns: 10,
+            max_event_ts_ns: 20,
+            segment_format_version: 3,
+            declared_column_stats: vec![],
+        }
+    }
+
+    /// A commit record of `sample_count` rows carrying `entries`, round-tripped
+    /// through the wire so every assertion is about a decoded record.
+    fn decoded_record(sample_count: u64, entries: Vec<DeclaredColumnMinMax>) -> CommitRecord {
+        let mut record = base_record();
+        record.sample_count = sample_count;
+        record.declared_column_stats = entries;
+        record::decode(&record::encode(&record)).expect("record decodes")
+    }
+
+    /// The same for the compaction-part carrier, whose row count is field 6.
+    fn decoded_part(sample_count: u64, entries: Vec<DeclaredColumnMinMax>) -> CompactionPart {
+        let mut part = base_part(sample_count);
+        part.declared_column_stats = entries;
+        CompactionPart::decode(part.encode_to_vec().as_slice()).expect("part decodes")
+    }
+
+    fn all_null_stat(name: &str, null_count: u64) -> DeclaredColumnStat {
+        DeclaredColumnStat::new(name, DeclaredStatType::I64, None, None, null_count)
+            .expect("valid all-null stat")
+    }
+
+    /// One entry in, one drop out: nothing covered, exactly one dropped entry
+    /// at index 0, and the column reads as uncovered.
+    fn assert_single_drop(read: &DecodedDeclaredStats, name: &str, reason: DeclaredStatDefect) {
+        assert_eq!(read.covered, vec![]);
+        assert_eq!(read.covered.len(), 0);
+        assert_eq!(read.dropped.len(), 1);
+        assert_eq!(
+            read.dropped[0],
+            DroppedStatEntry {
+                index: 0,
+                name: name.to_string(),
+                reason,
+            }
+        );
+        assert_eq!(read.column(name), None);
+    }
+
+    // Clause 4: more NULLs than the segment has rows.
+
+    #[test]
+    fn null_count_above_sample_count_is_dropped_on_a_commit_record() {
+        // Eight NULLs in a seven-row object.
+        let entries = vec![encode(&i64_stat("EventDate", 1, 2, 8))];
+        let record = decoded_record(7, entries);
+        assert_single_drop(
+            &read_commit_record(&record),
+            "EventDate",
+            DeclaredStatDefect::NullCountAboveSampleCount {
+                name: "EventDate".to_string(),
+                null_count: 8,
+                sample_count: 7,
+            },
+        );
+        // The clause is not decidable one layer down, which is why it lives at
+        // the record layer: the same entry slice, with no row count to
+        // reconcile against, is carrier-agnostically clean.
+        let entry_only = decode_all(&record.declared_column_stats);
+        assert_eq!(entry_only.dropped.len(), 0);
+        assert_eq!(entry_only.covered.len(), 1);
+    }
+
+    #[test]
+    fn null_count_above_sample_count_is_dropped_on_a_compaction_part() {
+        let part = decoded_part(7, vec![encode(&i64_stat("EventDate", 1, 2, 8))]);
+        assert_single_drop(
+            &read_compaction_part(&part),
+            "EventDate",
+            DeclaredStatDefect::NullCountAboveSampleCount {
+                name: "EventDate".to_string(),
+                null_count: 8,
+                sample_count: 7,
+            },
+        );
+    }
+
+    // Clause 5, absent direction: both extrema absent claims zero non-null
+    // values, so every row must be NULL.
+
+    #[test]
+    fn absent_extrema_disagreeing_with_the_null_count_are_dropped_on_a_commit_record() {
+        let record = decoded_record(7, vec![encode(&all_null_stat("EventDate", 4))]);
+        assert_single_drop(
+            &read_commit_record(&record),
+            "EventDate",
+            DeclaredStatDefect::PresenceDisagreesWithNullCount {
+                name: "EventDate".to_string(),
+                extrema: "absent",
+                null_count: 4,
+                sample_count: 7,
+            },
+        );
+    }
+
+    #[test]
+    fn absent_extrema_disagreeing_with_the_null_count_are_dropped_on_a_compaction_part() {
+        let part = decoded_part(7, vec![encode(&all_null_stat("EventDate", 4))]);
+        assert_single_drop(
+            &read_compaction_part(&part),
+            "EventDate",
+            DeclaredStatDefect::PresenceDisagreesWithNullCount {
+                name: "EventDate".to_string(),
+                extrema: "absent",
+                null_count: 4,
+                sample_count: 7,
+            },
+        );
+    }
+
+    // Clause 5, present direction: issue #970 defect 2. Extrema claimed for a
+    // column whose own null count says every row reads NULL are fabricated. A
+    // validator that checks only the absent direction above passes every other
+    // case in this matrix and still accepts this entry.
+
+    #[test]
+    fn present_extrema_over_an_all_null_column_are_dropped_on_a_commit_record() {
+        let record = decoded_record(7, vec![encode(&i64_stat("EventDate", 1, 2, 7))]);
+        assert_single_drop(
+            &read_commit_record(&record),
+            "EventDate",
+            DeclaredStatDefect::PresenceDisagreesWithNullCount {
+                name: "EventDate".to_string(),
+                extrema: "present",
+                null_count: 7,
+                sample_count: 7,
+            },
+        );
+    }
+
+    #[test]
+    fn present_extrema_over_an_all_null_column_are_dropped_on_a_compaction_part() {
+        let part = decoded_part(7, vec![encode(&i64_stat("EventDate", 1, 2, 7))]);
+        assert_single_drop(
+            &read_compaction_part(&part),
+            "EventDate",
+            DeclaredStatDefect::PresenceDisagreesWithNullCount {
+                name: "EventDate".to_string(),
+                extrema: "present",
+                null_count: 7,
+                sample_count: 7,
+            },
+        );
+    }
+
+    #[test]
+    fn row_count_boundaries_that_are_valid_keep_their_coverage() {
+        // Each pair is (the carrier's row count, the entry), and each is one
+        // step from a case the two clauses above drop. A clause written with
+        // the wrong comparison silently uncovers a valid column, which is
+        // worse than the gap it closes.
+        let cases = [
+            // Both absent, null_count == sample_count: every row is NULL.
+            (7, all_null_stat("EventDate", 7)),
+            // Both present, one row short of all-NULL: exactly one non-null.
+            (7, i64_stat("EventDate", 1, 2, 6)),
+            // An empty object: 0 == 0 is agreement, not a defect.
+            (0, all_null_stat("EventDate", 0)),
+            // No NULLs at all, the common case.
+            (7, i64_stat("EventDate", 1, 2, 0)),
+        ];
+        for (sample_count, stat) in cases {
+            let entries = vec![encode(&stat)];
+            let record = decoded_record(sample_count, entries.clone());
+            let read = read_commit_record(&record);
+            assert_eq!(read.dropped, vec![], "record, sample_count {sample_count}");
+            assert_eq!(read.covered, vec![stat.clone()]);
+            assert_eq!(read.covered.len(), 1);
+
+            let part = decoded_part(sample_count, entries);
+            let read = read_compaction_part(&part);
+            assert_eq!(read.dropped, vec![], "part, sample_count {sample_count}");
+            assert_eq!(read.covered, vec![stat]);
+            assert_eq!(read.covered.len(), 1);
+        }
+    }
+
+    #[test]
+    fn one_row_count_defect_does_not_poison_the_rest_of_its_carrier() {
+        // ADR-0873 decision 2, granularity split: the stamp is entry-granular.
+        let valid_head = i64_stat("EventDate", 1, 2, 6);
+        let valid_tail = i64_stat("Latency", 3, 4, 0);
+        let entries = vec![
+            encode(&valid_head),
+            // Extrema over an all-NULL column, at index 1.
+            encode(&i64_stat("Status", 200, 500, 7)),
+            encode(&valid_tail),
+        ];
+
+        let record = decoded_record(7, entries.clone());
+        // The carrying record decoded intact: a defective statistic never
+        // makes a durable commit record unreadable.
+        assert_eq!(record.declared_column_stats.len(), 3);
+        assert_eq!(record.sample_count, 7);
+        let read = read_commit_record(&record);
+        assert_eq!(read.covered, vec![valid_head.clone(), valid_tail.clone()]);
+        assert_eq!(read.covered.len(), 2);
+        assert_eq!(read.dropped.len(), 1);
+        assert_eq!(read.dropped[0].index, 1);
+        assert_eq!(read.dropped[0].name, "Status");
+        assert_eq!(read.column("Status"), None);
+        assert_eq!(read.column("EventDate"), Some(&valid_head));
+
+        let part = decoded_part(7, entries);
+        assert_eq!(part.declared_column_stats.len(), 3);
+        let read = read_compaction_part(&part);
+        assert_eq!(read.covered, vec![valid_head, valid_tail.clone()]);
+        assert_eq!(read.covered.len(), 2);
+        assert_eq!(read.dropped.len(), 1);
+        assert_eq!(read.dropped[0].index, 1);
+        assert_eq!(read.column("Status"), None);
+        assert_eq!(read.column("Latency"), Some(&valid_tail));
+    }
+
     #[test]
     fn an_entry_count_above_any_declared_column_list_is_read_in_full() {
         // ADR-0873 decision 2 has no entry-count cap, and nothing in the
@@ -740,7 +1044,15 @@ mod tests {
             prop::sample::select(vec![DeclaredStatType::I64, DeclaredStatType::Bool])
                 .prop_map(|ty| (ty, (None, None))),
         ];
-        (name, extrema, any::<u64>()).prop_map(|(name, (ty, (min, max)), null_count)| {
+        // Both-present admits any null count below the row count; both-absent
+        // admits exactly the row count, which is what "every row is NULL"
+        // means.
+        (name, extrema, 0..SAMPLE_COUNT).prop_map(|(name, (ty, (min, max)), non_null_nulls)| {
+            let null_count = if min.is_some() {
+                non_null_nulls
+            } else {
+                SAMPLE_COUNT
+            };
             DeclaredColumnStat::new(name, ty, min, max, null_count).expect("strategy builds valid")
         })
     }
@@ -773,20 +1085,7 @@ mod tests {
 
         #[test]
         fn stamped_stats_round_trip_through_a_compaction_part(stats in stats_strategy()) {
-            let mut part = CompactionPart {
-                part_index: 1,
-                first_series_id: vec![0x01; 16],
-                last_series_id: vec![0x02; 16],
-                content_hash: vec![0x03; 32],
-                object_size: 1,
-                sample_count: 1,
-                series_count: 1,
-                run_count: 1,
-                min_event_ts_ns: 0,
-                max_event_ts_ns: 0,
-                segment_format_version: 3,
-                declared_column_stats: vec![],
-            };
+            let mut part = base_part(SAMPLE_COUNT);
             stamp_compaction_part(&mut part, &stats);
             let bytes = part.encode_to_vec();
             let decoded = CompactionPart::decode(bytes.as_slice()).expect("decode");
