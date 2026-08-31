@@ -681,6 +681,17 @@ impl LogSegmentFetcher {
         self
     }
 
+    /// Sets the fetch bound ([`BlockRangeFetcher::with_max_fetch_run_bytes`],
+    /// ADR-0996 decision 2): one covering GET's maximum length. An object above
+    /// the bound is read as `ceil(object_size / n)` sequential covering
+    /// sub-range GETs on every read shape, whole-object funnel included. Zero is
+    /// refused earlier at config resolution ([`EngineConfig::validate`]).
+    #[must_use]
+    pub fn with_max_fetch_run_bytes(mut self, n: u64) -> Self {
+        self.block_range = self.block_range.with_max_fetch_run_bytes(n);
+        self
+    }
+
     /// Replaces the block-range fetcher (ADR-0107) with a fully configured one,
     /// for callers and tests that need to set the coalescing gap, coverage
     /// crossover, or concurrency bound directly. The replacement keeps this
@@ -1346,6 +1357,21 @@ impl LogSegmentFetcher {
         }
         .await;
         caller_accounting.merge_snapshot(&phase.snapshot().pooled());
+        // ADR-0996 decision 3: record this data object as touched, once, at the
+        // plan-then-stripe designated-recorder point. `plan_segment` runs once
+        // per segment -- `ravel_sql::logs_scan` awaits the shared plan pass
+        // behind a barrier before any partition drains -- so a striped
+        // multi-partition scan still records exactly one touch per object here,
+        // over however many GETs the plan and its subset scans issue. An object
+        // belongs to exactly one segment, so this is one touch per distinct
+        // object. A `None` result means the catalog summary proved the segment
+        // irrelevant with NO fetch, which is not a touch. The predicate-free
+        // full-window fast path skips this method entirely (#693 part 3); its
+        // per-segment touch is recorded at ravel-sql's `record_open_shape` site,
+        // left for task 996-6 (this task must not touch ravel-sql).
+        if matches!(result, Ok(Some(_))) {
+            caller_accounting.add_data_objects_touched(1);
+        }
         result
     }
 
@@ -1797,6 +1823,33 @@ impl LogSegmentFetcher {
         accounting: &QueryAccounting,
     ) -> Result<Bytes, LogFetchError> {
         let key = &seg_ref.data_object_key;
+
+        // Fetch bound (ADR-0996 decision 2): an object above the bound is read
+        // as `ceil(object_size / bound)` sequential covering sub-range GETs
+        // instead of one whole-object GET, so no single request moves more than
+        // the bound. Under request-minimal the routing threshold is saturated,
+        // so every object takes this whole-object funnel and this is where a
+        // large one is segmented. On the reference corpus every object is far
+        // under the 64 MiB default, so this branch is a protective cap only. The
+        // segmented read routes through the block-range fetcher's covering read,
+        // which shares this fetcher's cache and wire-byte counter, and whose
+        // per-sub-range accounting records the same GET total this funnel would.
+        if seg_ref.object_size > self.block_range.max_fetch_run_bytes() {
+            let pin = EtagPin::default();
+            let (bytes, _live_gets) = self
+                .block_range
+                .covering_read(
+                    seg_ref,
+                    tenant_hash,
+                    seg_ref.object_size,
+                    GetRange::Full,
+                    phase,
+                    &pin,
+                    accounting,
+                )
+                .await?;
+            return Ok(bytes);
+        }
 
         // Same two phases as `fetch_accounted`, spanned on the path production
         // log/alerts/audit traffic actually takes (ADR-0044 decision 5): the
@@ -2829,6 +2882,23 @@ pub struct BlockRangeFetcher {
     /// from ([`DEFAULT_LOG_REQUEST_COST_BYTES`]). A property of the store and
     /// instance, so it is a tunable, not a constant.
     request_cost_bytes: u64,
+    /// The fetch bound (ADR-0996 decision 2): one covering GET's maximum length.
+    /// An object at or under it is read in one covering `GetRange::Full`; a
+    /// larger one is read as `ceil(object_size / max_fetch_run_bytes)`
+    /// sequential covering sub-range GETs, each at most the bound, so no single
+    /// request moves more than this. Decoupled from `request_cost_bytes`: the
+    /// rate decides WHICH read shape, the bound only segments HOW a chosen
+    /// covering read is laid out. [`DEFAULT_LOG_MAX_FETCH_RUN_BYTES`] by default;
+    /// zero is refused before it reaches here ([`EngineConfig::validate`]).
+    max_fetch_run_bytes: u64,
+    /// The largest single covering sub-range GET this fetcher (and every clone)
+    /// has issued, in bytes: the peak wire size of one request on the segmented
+    /// covering path, which never exceeds `max_fetch_run_bytes`. The resident
+    /// assembly buffer is NOT bounded by this -- the frozen `ravel-logseg`
+    /// reader ([`RlogReader::new`]) needs a contiguous object-indexed buffer, so
+    /// a covering read of an object above the bound still holds `object_size` --
+    /// but the request wire size is, which is what this records.
+    peak_fetch_run: Arc<AtomicU64>,
     /// Bounds in-flight byte-range GETs. Its own instance, never shared with
     /// `SegmentFetcher`'s RSEG semaphore (ADR-0107 decision 1).
     get_semaphore: Arc<Semaphore>,
@@ -2856,6 +2926,8 @@ impl BlockRangeFetcher {
             whole_object_threshold: None,
             coverage_threshold: DEFAULT_LOG_COVERAGE_THRESHOLD,
             request_cost_bytes: DEFAULT_LOG_REQUEST_COST_BYTES,
+            max_fetch_run_bytes: crate::DEFAULT_LOG_MAX_FETCH_RUN_BYTES,
+            peak_fetch_run: Arc::new(AtomicU64::new(0)),
             get_semaphore: Arc::new(Semaphore::new(DEFAULT_LOG_MAX_CONCURRENT_GETS)),
             assembly_pool: Arc::new(AssemblyBufferPool::default()),
             wire_bytes: PhaseWireByteCounter::new(),
@@ -2953,6 +3025,120 @@ impl BlockRangeFetcher {
     pub fn with_request_cost_bytes(mut self, n: u64) -> Self {
         self.request_cost_bytes = n;
         self
+    }
+
+    /// Sets the fetch bound (ADR-0996 decision 2): one covering GET's maximum
+    /// length. An object at or under it is one covering GET; a larger one is
+    /// segmented into `ceil(object_size / n)` covering sub-range GETs. `n` is
+    /// clamped up to 1 here as a last-resort guard; zero is refused earlier at
+    /// config resolution ([`EngineConfig::validate`]), which is where the typed
+    /// error belongs.
+    #[must_use]
+    pub fn with_max_fetch_run_bytes(mut self, n: u64) -> Self {
+        self.max_fetch_run_bytes = n.max(1);
+        self
+    }
+
+    /// The largest single covering sub-range GET this fetcher has issued, in
+    /// bytes (ADR-0996 decision 2). Never exceeds `max_fetch_run_bytes`; a test
+    /// reads it to prove the segmented covering path bounded each request's wire
+    /// size. Cumulative and shared by every clone; nothing resets it.
+    #[must_use]
+    pub fn peak_fetch_run_bytes(&self) -> u64 {
+        self.peak_fetch_run.load(Ordering::Relaxed)
+    }
+
+    /// The fetch bound in effect ([`Self::with_max_fetch_run_bytes`], ADR-0996
+    /// decision 2). Read by [`LogSegmentFetcher::whole_object_bytes`] to route an
+    /// above-bound object through the segmented covering read.
+    #[must_use]
+    pub fn max_fetch_run_bytes(&self) -> u64 {
+        self.max_fetch_run_bytes
+    }
+
+    /// Record one covering sub-range GET's length against the peak, keeping the
+    /// running maximum. Called on the segmented covering path so
+    /// [`Self::peak_fetch_run_bytes`] reflects the largest single request.
+    fn observe_fetch_run(&self, len: u64) {
+        self.peak_fetch_run.fetch_max(len, Ordering::Relaxed);
+    }
+
+    /// A covering read of `[0, total_size)` bounded by
+    /// [`Self::max_fetch_run_bytes`] (ADR-0996 decision 2's covering-read
+    /// contract).
+    ///
+    /// - `total_size <= max_fetch_run_bytes`: ONE covering GET. `full_range` is
+    ///   the range the single read uses (`GetRange::Full` at a whole-object
+    ///   crossover, so it keys `(0, object_size)` and single-flights with the
+    ///   other whole-object funnels).
+    /// - `total_size > max_fetch_run_bytes`: `ceil(total_size /
+    ///   max_fetch_run_bytes)` sequential covering sub-range GETs, each at most
+    ///   the bound, assembled into the object buffer. Bounds each request's wire
+    ///   size; the request count is `ceil(total_size / bound)` (the ADR's floor,
+    ///   and its cap too on this unaligned split, since no run is short of the
+    ///   bound except the last).
+    ///
+    /// NOTE (reported for ADR-0996): the assembled buffer is still `object_size`
+    /// on the segmented path, because [`RlogReader::new`] in the frozen
+    /// `ravel-logseg` crate needs a contiguous object-indexed buffer. Bounding
+    /// the RESIDENT buffer below the bound would need a decode-side change
+    /// (independent per-sub-range decode) in `ravel-logseg`/`ravel-sql`, out of
+    /// this task's scope; [`Self::peak_fetch_run_bytes`] bounds the request wire
+    /// size, which is what stays in scope here.
+    #[allow(clippy::too_many_arguments)]
+    async fn covering_read(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        total_size: u64,
+        full_range: GetRange,
+        phase: QueryPhase,
+        pin: &EtagPin,
+        accounting: &QueryAccounting,
+    ) -> Result<(Bytes, u64), LogFetchError> {
+        if total_size <= self.max_fetch_run_bytes {
+            self.observe_fetch_run(total_size);
+            let (bytes, live) = self
+                .cached_extent(
+                    seg_ref,
+                    tenant_hash,
+                    0,
+                    total_size,
+                    full_range,
+                    phase,
+                    pin,
+                    accounting,
+                )
+                .await?;
+            return Ok((bytes, u64::from(live)));
+        }
+
+        let key = seg_ref.data_object_key.as_str();
+        let total = usize::try_from(total_size).map_err(|_| corrupt_range(key))?;
+        let mut asm = ObjectAssembler::new(&self.assembly_pool, total);
+        let mut live_gets = 0u64;
+        let mut start = 0u64;
+        while start < total_size {
+            let len = self.max_fetch_run_bytes.min(total_size - start);
+            let end = start + len;
+            self.observe_fetch_run(len);
+            let (bytes, live) = self
+                .cached_extent(
+                    seg_ref,
+                    tenant_hash,
+                    start,
+                    len,
+                    GetRange::Range(start, end),
+                    phase,
+                    pin,
+                    accounting,
+                )
+                .await?;
+            asm.place(key, start, &bytes)?;
+            live_gets += u64::from(live);
+            start = end;
+        }
+        Ok((asm.into_bytes(), live_gets))
     }
 
     /// The coalescing gap in effect: an explicit [`Self::with_coalesce_gap`]
@@ -3710,11 +3896,15 @@ impl BlockRangeFetcher {
         // selectivity, so the whole-object read is the faster option even though
         // it moves the most bytes.
         if seg_ref.object_size <= self.effective_whole_object_threshold() {
-            let (bytes, live) = self
-                .cached_extent(
+            // Covering read, bounded by the fetch bound (ADR-0996 decision 2):
+            // one `GetRange::Full` for an object at or under the bound, else
+            // `ceil(object_size / bound)` sequential covering sub-range GETs.
+            // Under request-minimal the crossover is saturated, so this is the
+            // path every above-`block_range_threshold` object takes.
+            let (bytes, live_gets) = self
+                .covering_read(
                     seg_ref,
                     tenant_hash,
-                    0,
                     seg_ref.object_size,
                     GetRange::Full,
                     phases.blocks,
@@ -3722,8 +3912,11 @@ impl BlockRangeFetcher {
                     accounting,
                 )
                 .await?;
-            if live {
+            if live_gets > 0 {
+                // The first covering GET keeps the historical `probe_gets`
+                // name; any further segmented GETs are block-data reads.
                 stats.probe_gets = 1;
+                stats.block_range_gets = live_gets.saturating_sub(1);
                 stats.block_bytes_fetched = bytes.len() as u64;
             }
             stats.whole_object = true;
@@ -3956,12 +4149,13 @@ impl BlockRangeFetcher {
             // Keyed and single-flighted like every other GET here, on the same
             // `(0, object_size)` key the whole-object funnel uses: without that,
             // N partitions all crossing over would issue N whole-object GETs,
-            // which is the amplification this path exists to avoid.
-            let (bytes, live) = self
-                .cached_extent(
+            // which is the amplification this path exists to avoid. Bounded by
+            // the fetch bound (ADR-0996 decision 2): one covering GET at or under
+            // the bound, else segmented covering sub-ranges.
+            let (bytes, live_gets) = self
+                .covering_read(
                     seg_ref,
                     tenant_hash,
-                    0,
                     total_size,
                     GetRange::Full,
                     phases.blocks,
@@ -3969,8 +4163,8 @@ impl BlockRangeFetcher {
                     accounting,
                 )
                 .await?;
-            if live {
-                stats.block_range_gets = 1;
+            if live_gets > 0 {
+                stats.block_range_gets = live_gets;
                 stats.block_bytes_fetched = bytes.len() as u64;
             }
             stats.whole_object = true;
@@ -4258,11 +4452,12 @@ impl BlockRangeFetcher {
         let wanted_bytes: u64 = wanted.iter().map(|e| e.len).sum();
         let coverage = wanted_bytes as f64 / blocks_desc.len.max(1) as f64;
         if coverage >= self.coverage_threshold {
-            let (bytes, live) = self
-                .cached_extent(
+            // Bounded by the fetch bound (ADR-0996 decision 2), like the
+            // version-3 coverage crossover above.
+            let (bytes, live_gets) = self
+                .covering_read(
                     seg_ref,
                     tenant_hash,
-                    0,
                     total_size,
                     GetRange::Full,
                     phases.blocks,
@@ -4270,8 +4465,8 @@ impl BlockRangeFetcher {
                     accounting,
                 )
                 .await?;
-            if live {
-                stats.block_range_gets = 1;
+            if live_gets > 0 {
+                stats.block_range_gets = live_gets;
                 stats.block_bytes_fetched = bytes.len() as u64;
             }
             stats.whole_object = true;
