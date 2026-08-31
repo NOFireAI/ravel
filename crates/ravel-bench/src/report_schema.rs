@@ -55,6 +55,7 @@ use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
 
+use crate::allocator::Allocator;
 use crate::promql_corpus::CostClass;
 
 /// The report schema version. A report declaring any other version is refused
@@ -240,20 +241,24 @@ pub struct Provenance {
     /// `"unknown"` when the probe could not answer. Peak RSS moves by about 2x
     /// between the system allocator and a memory-returning one, and the allocator
     /// can arrive via `LD_PRELOAD` a compile-time `cfg!` cannot see, so it is read
-    /// off `/proc/self/maps` (issue #972). Unlike the identity fields above,
-    /// `"unknown"` is a legitimate recorded value here (the probe ran and could
-    /// not answer), so it is deliberately NOT in [`checked_provenance_fields`]:
-    /// an explicit unknown is honest, and a guessed allocator that read as
-    /// verified would be the defect this closes. A report written before this
-    /// field existed deserializes to [`crate::allocator::ALLOCATOR_UNKNOWN`].
+    /// off `/proc/self/maps` (issue #972). Typed as [`Allocator`] so the value
+    /// domain is shared with `sql_latency::Provenance` and an out-of-domain
+    /// value is unrepresentable rather than merely rejected. Unlike the identity
+    /// fields above, [`Allocator::Unknown`] is a legitimate recorded value here
+    /// (the probe ran and could not answer), so it is deliberately NOT in
+    /// [`checked_provenance_fields`]: an explicit unknown is honest, and a
+    /// guessed allocator that read as verified would be the defect this closes.
+    /// A report written before this field existed deserializes to
+    /// [`Allocator::Unknown`]; a report carrying an unrecognized allocator
+    /// string is rejected at deserialize.
     #[serde(default = "default_allocator")]
-    pub allocator: String,
+    pub allocator: Allocator,
 }
 
 /// What a report written before the allocator was recorded (issue #972)
 /// deserializes to: the explicit unknown, never a guessed allocator.
-fn default_allocator() -> String {
-    crate::allocator::ALLOCATOR_UNKNOWN.to_string()
+fn default_allocator() -> Allocator {
+    Allocator::Unknown
 }
 
 /// One figure a measurement reports, named so the report is self-describing and
@@ -1065,7 +1070,7 @@ mod tests {
                 key: "max_flush_delay_ms".to_string(),
                 value: "2000".to_string(),
             }],
-            allocator: crate::allocator::ALLOCATOR_TCMALLOC.to_string(),
+            allocator: Allocator::Tcmalloc,
         }
     }
 
@@ -1567,10 +1572,10 @@ mod tests {
     /// report written before the field existed deserializes to the explicit
     /// unknown rather than a guessed allocator (issue #972).
     ///
-    /// To watch the serialization half fail: change `valid_provenance`'s
-    /// `allocator` to `ALLOCATOR_JEMALLOC`; the exact-value assertion then reads
+    /// To watch the serialization half fail: change `valid_report`'s provenance
+    /// `allocator` to `Allocator::Jemalloc`; the exact-value assertion then reads
     /// `jemalloc == tcmalloc`. To watch the back-compat half fail: change
-    /// `default_allocator` to return `"system"`; the field-stripped report then
+    /// `default_allocator` to return `Allocator::System`; the field-stripped report then
     /// deserializes to `system` and the last assertion reads `system == unknown`.
     #[test]
     fn provenance_records_the_allocator_and_defaults_it_to_unknown() {
@@ -1590,10 +1595,45 @@ mod tests {
             .remove("allocator");
         let back: MetricsBenchReport =
             serde_json::from_value(doc).expect("deserialize a report with no allocator field");
-        assert_eq!(
-            back.provenance.allocator,
-            crate::allocator::ALLOCATOR_UNKNOWN
-        );
+        assert_eq!(back.provenance.allocator, Allocator::Unknown);
+    }
+
+    /// Every allocator the probe can produce round-trips through provenance by
+    /// exact value, and an unrecognized allocator string is rejected at
+    /// deserialize rather than laundered into `unknown` (issue #972): a garbage
+    /// value in this slot would read as the honest "the probe could not answer".
+    ///
+    /// To watch the round-trip half fail: change any arm of `Allocator::as_str`
+    /// (or the `rename_all`) so a variant serializes to a different string; the
+    /// exact-value assertion for that variant then mismatches. To watch the
+    /// reject half fail: add `#[serde(other)] Unknown` semantics (a catch-all)
+    /// to `Allocator`; the unrecognized string then deserializes to `unknown`
+    /// and `expect_err` panics.
+    #[test]
+    fn allocator_round_trips_by_value_and_rejects_an_unrecognized_string() {
+        for (variant, text) in [
+            (Allocator::Tcmalloc, "tcmalloc"),
+            (Allocator::Jemalloc, "jemalloc"),
+            (Allocator::Mimalloc, "mimalloc"),
+            (Allocator::System, "system"),
+            (Allocator::Unknown, "unknown"),
+        ] {
+            let mut report = valid_report();
+            report.provenance.allocator = variant;
+            let value = serde_json::to_value(&report).expect("serialize");
+            assert_eq!(
+                value["provenance"]["allocator"], text,
+                "{variant} serializes to its exact value"
+            );
+            let back: MetricsBenchReport =
+                serde_json::from_value(value).expect("deserialize a valid allocator");
+            assert_eq!(back.provenance.allocator, variant);
+        }
+
+        let mut doc = serde_json::to_value(valid_report()).expect("serialize");
+        doc["provenance"]["allocator"] = serde_json::json!("bogus-allocator");
+        serde_json::from_value::<MetricsBenchReport>(doc)
+            .expect_err("an unrecognized allocator string is rejected");
     }
 
     // --- FINDING 1: configuration entries are validated, not merely present. ---
