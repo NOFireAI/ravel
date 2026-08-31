@@ -266,16 +266,25 @@ fn decode_all_against_rows(
     // from `entries` keeps the set independent of the pushes into `covered`.
     let mut seen: HashSet<&str> = HashSet::with_capacity(entries.len());
     for (index, entry) in entries.iter().enumerate() {
-        let reason = match decode(entry) {
-            Ok(stat) => match sample_count.and_then(|rows| row_count_defect(&stat, rows)) {
-                Some(defect) => defect,
-                None if seen.insert(entry.name.as_str()) => {
-                    covered.push(stat);
-                    continue;
-                }
-                None => DeclaredStatDefect::DuplicateName(entry.name.clone()),
-            },
-            Err(reason) => reason,
+        // The name is claimed by its FIRST occurrence in record order, valid
+        // or not: which of two same-name entries wins is undefined, so a
+        // later entry must never gain coverage because an earlier one was
+        // dropped for its own defect. Reserving before validation is what
+        // enforces that.
+        let first_occurrence = seen.insert(entry.name.as_str());
+        let reason = if !first_occurrence {
+            DeclaredStatDefect::DuplicateName(entry.name.clone())
+        } else {
+            match decode(entry) {
+                Ok(stat) => match sample_count.and_then(|rows| row_count_defect(&stat, rows)) {
+                    Some(defect) => defect,
+                    None => {
+                        covered.push(stat);
+                        continue;
+                    }
+                },
+                Err(reason) => reason,
+            }
         };
         dropped.push(DroppedStatEntry {
             index,
@@ -1023,6 +1032,41 @@ mod tests {
         assert_eq!(read.dropped()[0].index, 1);
         assert_eq!(read.column("Status"), None);
         assert_eq!(read.column("Latency"), Some(&valid_tail));
+    }
+
+    #[test]
+    fn an_invalid_first_duplicate_never_lets_a_later_one_gain_coverage() {
+        // A name is claimed by its FIRST occurrence in record order, valid or
+        // not: which of two same-name entries wins is undefined (the
+        // DuplicateName clause), so the column stays uncovered even when the
+        // first occurrence was dropped for a defect of its own and the later
+        // occurrence is individually valid. Before the reserve-first fix the
+        // later entry entered `covered`.
+        let entries = vec![
+            // Index 0: row-count defect (extrema present over an all-NULL
+            // column) -- dropped for its own reason, but it still claims "d".
+            encode(&i64_stat("d", 1, 9, 7)),
+            // Index 1: individually valid, same name -- must NOT be covered.
+            encode(&i64_stat("d", 1, 9, 3)),
+            // Index 2: unrelated valid entry keeps its coverage.
+            encode(&i64_stat("ok", 5, 6, 0)),
+        ];
+        let read = read_commit_record(&decoded_record(7, entries));
+        assert_eq!(read.covered().len(), 1);
+        assert_eq!(read.column("d"), None);
+        assert_eq!(read.column("ok").map(|s| s.name()), Some("ok"));
+        assert_eq!(read.dropped().len(), 2);
+        assert_eq!(read.dropped()[0].index, 0);
+        assert!(matches!(
+            read.dropped()[0].reason,
+            DeclaredStatDefect::Invalid(DeclaredStatError::PresenceMismatch { .. })
+                | DeclaredStatDefect::PresenceDisagreesWithNullCount { .. }
+        ));
+        assert_eq!(read.dropped()[1].index, 1);
+        assert!(matches!(
+            read.dropped()[1].reason,
+            DeclaredStatDefect::DuplicateName(ref n) if n == "d"
+        ));
     }
 
     #[test]
