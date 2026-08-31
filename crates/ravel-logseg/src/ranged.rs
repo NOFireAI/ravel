@@ -599,6 +599,12 @@ pub struct StreamBlockRows<'r> {
     /// same `stream_ref`-equality filter the eager path applies, resolved once
     /// when the view is built instead of once per `next`.
     rows: Vec<u32>,
+    /// Each retained row's `ts_ns`, parallel to `rows`. Kept, not re-read:
+    /// [`Self::peek_ts`] is the merge's per-comparison key and must cost a
+    /// slice index and nothing else, and `new` already reads every retained
+    /// row's timestamp to validate the column, so keeping the value removes a
+    /// per-peek column resolution.
+    row_ts: Vec<i64>,
     /// Index into `rows` of the next row to yield.
     pos: usize,
 }
@@ -624,23 +630,27 @@ impl<'r> StreamBlockRows<'r> {
         stream_ref: u32,
     ) -> Result<Self, LogSegError> {
         let mut rows = Vec::new();
+        let mut row_ts = Vec::new();
         for row in 0..decoded.record_count() {
             let sref = u32::try_from(i64_at(&decoded, COL_STREAM_REF, row)?)
                 .map_err(|_| LogSegError::Corrupted("stream_ref range".into()))?;
             if sref != stream_ref {
                 continue;
             }
-            // Checked, not kept: `peek_ts` reads the column itself, and this is
-            // what lets it do so without an error path.
-            i64_at(&decoded, COL_TS, row)?;
+            // Checked AND kept: `peek_ts` reads this vec by index, so the
+            // validation read here is also the last time the column is
+            // resolved.
+            let ts = i64_at(&decoded, COL_TS, row)?;
             rows.push(
                 u32::try_from(row).map_err(|_| LogSegError::Corrupted("block row index".into()))?,
             );
+            row_ts.push(ts);
         }
         Ok(StreamBlockRows {
             reader,
             block: decoded,
             rows,
+            row_ts,
             pos: 0,
         })
     }
@@ -654,11 +664,7 @@ impl<'r> StreamBlockRows<'r> {
     /// Peeking does not advance -- the next [`Iterator::next`] yields the record
     /// whose `ts_ns` this returned.
     pub fn peek_ts(&self) -> Option<i64> {
-        let &row = self.rows.get(self.pos)?;
-        self.block
-            .i64_col(COL_TS)
-            .and_then(|c| c.get(row as usize).copied())
-            .flatten()
+        self.row_ts.get(self.pos).copied()
     }
 
     /// Rows of this view's stream not yet yielded.
@@ -692,7 +698,8 @@ impl<'r> StreamBlockRows<'r> {
     pub fn heap_estimate(&self) -> u64 {
         let columnar = self.block.decoded_heap_bytes() as u64;
         let row_index = (self.rows.capacity() * std::mem::size_of::<u32>()) as u64;
-        columnar.saturating_add(row_index)
+        let ts_index = (self.row_ts.capacity() * std::mem::size_of::<i64>()) as u64;
+        columnar.saturating_add(row_index).saturating_add(ts_index)
     }
 }
 
