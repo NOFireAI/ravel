@@ -5192,7 +5192,9 @@ dependencies = [
  "blake3",
  "hex",
  "proptest",
+ "serde",
  "thiserror",
+ "toml",
  "uuid",
 ]
 

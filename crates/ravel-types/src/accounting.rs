@@ -137,6 +137,10 @@ struct Inner {
     /// Logs-scan segment opens that read the object by column-chunk ranges
     /// instead of one whole-object GET (ADR-0904 decision 5).
     logs_ranged_opens: AtomicU64,
+    /// Distinct DATA objects whose BLOCKS bytes this query fetched, counted
+    /// once per object (ADR-0996 decision 3). See the snapshot field of the
+    /// same name for the exact contract, including what it excludes.
+    data_objects_touched: AtomicU64,
     /// Recorded as a running maximum (compare-and-swap loop), never a sum;
     /// see [`QueryAccounting::observe_intermediate_bytes`].
     peak_intermediate_bytes: AtomicU64,
@@ -282,6 +286,24 @@ impl QueryAccounting {
         self.0.logs_ranged_opens.fetch_add(count, Ordering::Relaxed);
     }
 
+    /// Add to the count of distinct data objects this query fetched blocks
+    /// bytes from (ADR-0996 decision 3). This handle only accumulates: the
+    /// caller owes the distinctness, so it must call this exactly once per
+    /// object per query, at the point the object is first admitted to the
+    /// fetch, and never again for the same object even if the query issues
+    /// several ranged GETs against it.
+    ///
+    /// This is the denominator of `range_amplification = data_GET_requests /
+    /// data_objects_touched`, which is why the numerator's exclusions are the
+    /// counter's contract and not a detail: see the snapshot field
+    /// [`QueryAccountingSnapshot::data_objects_touched`] for exactly what
+    /// counts.
+    pub fn add_data_objects_touched(&self, count: u64) {
+        self.0
+            .data_objects_touched
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
     /// Update the peak intermediate byte high-water mark. This is a
     /// maximum, never a sum: call it with the current intermediate size at
     /// each point it might grow, and the counter keeps the largest value
@@ -337,6 +359,7 @@ impl QueryAccounting {
             other.logs_whole_object_opens,
         );
         saturating_fetch_add(&self.0.logs_ranged_opens, other.logs_ranged_opens);
+        saturating_fetch_add(&self.0.data_objects_touched, other.data_objects_touched);
         self.observe_intermediate_bytes(other.peak_intermediate_bytes);
     }
 
@@ -366,6 +389,7 @@ impl QueryAccounting {
             page_bytes_decoded: self.0.page_bytes_decoded.load(Ordering::Relaxed),
             logs_whole_object_opens: self.0.logs_whole_object_opens.load(Ordering::Relaxed),
             logs_ranged_opens: self.0.logs_ranged_opens.load(Ordering::Relaxed),
+            data_objects_touched: self.0.data_objects_touched.load(Ordering::Relaxed),
             peak_intermediate_bytes: self.0.peak_intermediate_bytes.load(Ordering::Relaxed),
         }
     }
@@ -412,6 +436,36 @@ pub struct QueryAccountingSnapshot {
     /// instead of one whole-object GET (ADR-0904 decision 5). See
     /// [`Self::logs_whole_object_opens`].
     pub logs_ranged_opens: u64,
+    /// Distinct **data** objects whose **blocks** bytes this query fetched,
+    /// counted once per object no matter how many GETs the query issued
+    /// against it (ADR-0996 decision 3).
+    ///
+    /// This is the denominator of `range_amplification = data_GET_requests /
+    /// data_objects_touched`, so its exclusions are the contract:
+    ///
+    /// - A footer or index probe does **not** count. A probe reads the
+    ///   object's trailer to decide what to fetch; if the query then decides
+    ///   to fetch no blocks from that object, the object was never touched in
+    ///   this sense.
+    /// - A catalog, manifest, or commit-record object does **not** count.
+    ///   Those are resolve-phase reads of a different object kind, and folding
+    ///   them in would deflate range amplification by inflating the
+    ///   denominator with objects the scan phase never ranged over.
+    /// - A block read served entirely from cache **does** count: the counter
+    ///   measures the query's object working set, not its cache misses (the
+    ///   same rule [`Self::logs_whole_object_opens`] follows).
+    /// - Several ranged GETs against one object count **once**. That is the
+    ///   whole point: the ratio to scan-phase GETs is exactly the range
+    ///   amplification.
+    ///
+    /// Distinctness is per handle, so a merge sums: the ADR-0071 slices this
+    /// folds together scan disjoint segment sets, so their touch counts add
+    /// exactly. Two sub-queries that legitimately overlap on one object (the
+    /// multi-`match[]` metadata endpoints under
+    /// [`Self::saturating_add`]) would count it twice, which inflates the
+    /// denominator and therefore *understates* range amplification; a report
+    /// combining selectors must say so rather than claim a distinct count.
+    pub data_objects_touched: u64,
     pub peak_intermediate_bytes: u64,
 }
 
@@ -489,6 +543,9 @@ impl QueryAccountingSnapshot {
             logs_ranged_opens: self
                 .logs_ranged_opens
                 .saturating_add(other.logs_ranged_opens),
+            data_objects_touched: self
+                .data_objects_touched
+                .saturating_add(other.data_objects_touched),
             peak_intermediate_bytes: self
                 .peak_intermediate_bytes
                 .max(other.peak_intermediate_bytes),
@@ -1064,5 +1121,73 @@ mod tests {
         let merged = a.snapshot().saturating_merge(&b.snapshot());
         assert_eq!(merged.logs_whole_object_opens, 11);
         assert_eq!(merged.logs_ranged_opens, 22);
+    }
+
+    #[test]
+    fn data_objects_touched_snapshot_and_merge_round_trip_is_exact() {
+        // The denominator of range_amplification (ADR-0996 decision 3), so it
+        // must be exact, never indicative: a fresh handle reads zero, a
+        // recorded handle reads exactly what was added, the value survives the
+        // snapshot as a value type, and folding slice snapshots sums it. The
+        // recording sites (ravel-query) owe the per-object distinctness; this
+        // asserts the plumbing carries whatever they record without loss.
+        assert_eq!(QueryAccounting::new().snapshot().data_objects_touched, 0);
+
+        let acc = QueryAccounting::new();
+        acc.add_data_objects_touched(3);
+        acc.add_data_objects_touched(1);
+        let snap = acc.snapshot();
+        assert_eq!(snap.data_objects_touched, 4, "touches accumulate exactly");
+        acc.add_data_objects_touched(10);
+        assert_eq!(
+            snap.data_objects_touched, 4,
+            "an already-taken snapshot is a value, unaffected by later touches"
+        );
+        assert_eq!(acc.snapshot().data_objects_touched, 14);
+
+        // Two slices over disjoint segment sets, folded into a coordinator's
+        // live handle and through both snapshot combiners.
+        let s1 = QueryAccounting::new();
+        s1.add_data_objects_touched(7);
+        let s2 = QueryAccounting::new();
+        s2.add_data_objects_touched(5);
+
+        let agg = QueryAccounting::new();
+        agg.merge_snapshot(&s1.snapshot());
+        agg.merge_snapshot(&s2.snapshot());
+        assert_eq!(
+            agg.snapshot().data_objects_touched,
+            12,
+            "merge_snapshot sums disjoint slices' touches"
+        );
+        assert_eq!(
+            s1.snapshot()
+                .saturating_add(&s2.snapshot())
+                .data_objects_touched,
+            12
+        );
+        assert_eq!(
+            s1.snapshot()
+                .saturating_merge(&s2.snapshot())
+                .data_objects_touched,
+            12
+        );
+    }
+
+    #[test]
+    fn data_objects_touched_saturates_instead_of_wrapping() {
+        // A wrapped-low denominator would fabricate an enormous range
+        // amplification out of a fine query; clamp instead (the same rule
+        // every other merged counter follows).
+        let agg = QueryAccounting::new();
+        agg.merge_snapshot(&QueryAccountingSnapshot {
+            data_objects_touched: u64::MAX - 1,
+            ..QueryAccountingSnapshot::default()
+        });
+        agg.merge_snapshot(&QueryAccountingSnapshot {
+            data_objects_touched: 10,
+            ..QueryAccountingSnapshot::default()
+        });
+        assert_eq!(agg.snapshot().data_objects_touched, u64::MAX);
     }
 }

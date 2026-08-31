@@ -1426,18 +1426,21 @@ pub fn decode_accounting(snap: pb::QueryAccountingSnapshot) -> QueryAccountingSn
         segments_pruned: snap.segments_pruned,
         series_matched: snap.series_matched,
         bytes_reused: snap.bytes_reused,
-        // `page_bytes_fetched`/`page_bytes_decoded` (ADR-0107 decision 4) and
-        // `logs_whole_object_opens`/`logs_ranged_opens` (ADR-0904 decision 5)
+        // `page_bytes_fetched`/`page_bytes_decoded` (ADR-0107 decision 4),
+        // `logs_whole_object_opens`/`logs_ranged_opens` (ADR-0904 decision 5),
+        // and `data_objects_touched` (ADR-0996 decision 3)
         // are process-local accounting and are NOT carried on this wire form:
         // `pb::QueryAccountingSnapshot` is a frozen proto schema, and adding a
         // field to it is an ADR-gated change out of these counters' scope. The
         // ADR-0071 fan-out coordinator therefore does not aggregate a remote
-        // worker's page-byte or opens-by-shape totals; single-process queries
-        // account them in full. Decoded back as zero below.
+        // worker's page-byte, opens-by-shape, or object-touch totals;
+        // single-process queries account them in full. Decoded back as zero
+        // below.
         page_bytes_fetched: 0,
         page_bytes_decoded: 0,
         logs_whole_object_opens: 0,
         logs_ranged_opens: 0,
+        data_objects_touched: 0,
         peak_intermediate_bytes: snap.peak_intermediate_bytes,
     }
 }
@@ -2979,12 +2982,14 @@ mod tests {
             bytes_reused: 256,
             // Non-zero on purpose: these are process-local counters deliberately
             // NOT carried on the frozen wire proto (page bytes: ADR-0107
-            // decision 4; opens-by-shape: ADR-0904 decision 5), so they must
-            // decode back as zero, unlike every other field which round-trips.
+            // decision 4; opens-by-shape: ADR-0904 decision 5; object touches:
+            // ADR-0996 decision 3), so they must decode back as zero, unlike
+            // every other field which round-trips.
             page_bytes_fetched: 900,
             page_bytes_decoded: 300,
             logs_whole_object_opens: 6,
             logs_ranged_opens: 9,
+            data_objects_touched: 11,
             peak_intermediate_bytes: 512,
         };
         let round = decode_accounting(encode_accounting(&snap));
@@ -2999,12 +3004,17 @@ mod tests {
         );
         assert_eq!(round.logs_ranged_opens, 0);
         assert_eq!(
+            round.data_objects_touched, 0,
+            "the object-touch denominator is not on the wire proto"
+        );
+        assert_eq!(
             round,
             QueryAccountingSnapshot {
                 page_bytes_fetched: 0,
                 page_bytes_decoded: 0,
                 logs_whole_object_opens: 0,
                 logs_ranged_opens: 0,
+                data_objects_touched: 0,
                 ..snap
             },
             "every other field round-trips unchanged"
