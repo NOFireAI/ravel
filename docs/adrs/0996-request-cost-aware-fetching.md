@@ -172,9 +172,15 @@ money. The reference profile ships as a named constant
 (`PUT 5_000`, `GET 400`, transfer 0, retrieval 0 — $5/M and $0.40/M) and
 a TOML file can override it (`--store-cost-profile <path>` on the server
 and the same file on `ravel-bench`), so the bench and any cost-based
-planner read the one artifact. LIST and HEAD price at the class rates
-they bill under (LIST is PUT-class on S3; HEAD is GET-class) — the
-profile maps `StoreOp` to a class, it does not grow one field per op.
+planner read the one artifact. The profile maps every `StoreOp` variant
+to a class through an EXHAUSTIVE match (no wildcard arm, so a new op
+fails to compile until it is classified): `Put`/`Copy`/`Post`/`List`/
+`ListDelimited` are PUT-class, `Get`/`Head` are GET-class, and `Delete`
+is its own delete class with its own price, 0 on the reference profile —
+priced rather than excluded, because other S3-compatible providers do
+charge it. One modeled-cost fixture exists per operation, so a
+misclassified or omitted op fails a test rather than silently
+mispricing a report.
 
 **Provenance rule**: every report that carries a request or modeled-cost
 figure stamps the ACTIVE profile — name, all four prices, and the
@@ -222,11 +228,17 @@ layer already runs on (`BlockRangeFetcher::request_cost_bytes`,
   decisions unchanged. Kept for egress-billed and network-constrained
   deployments, where ADR-0904 showed the default is already the
   cost-preferring setting.
-- **`cost-based`**: derive the exchange rate from the active profile:
-  `request_cost_bytes = get_class_nanodollars /
-  transfer_nanodollars_per_byte`, clamped to the existing floors
-  (64 KiB gap, 512 KiB crossover, `log_fetcher.rs:2166,2186`) and
-  saturated when transfer is 0. At the reference profile this resolves
+- **`cost-based`**: derive the exchange rate from the active profile.
+  The profile stores transfer per GiB and the derivation needs per byte,
+  so the arithmetic multiplies BEFORE it divides, in `u128`:
+  `request_cost_bytes = get_class_nanodollars × BYTES_PER_GIB /
+  transfer_nanodollars_per_gib`, floor-rounded with a documented minimum
+  of one byte — a naive per-byte pre-division would truncate every
+  sub-nanodollar-per-byte transfer price to zero and make the worked
+  ~4.4 KB result unreachable, and a test pins exactly that rate. The
+  result is clamped to the existing floors (64 KiB gap, 512 KiB
+  crossover, `log_fetcher.rs:2166,2186`) and saturated when transfer
+  is 0. At the reference profile this resolves
   to request-minimal; at list egress prices it resolves to ~4.4 KB,
   which the floors clamp — reproducing ADR-0904's worked examples from
   the profile instead of prose. A bounded resource penalty rides the
@@ -234,8 +246,16 @@ layer already runs on (`BlockRangeFetcher::request_cost_bytes`,
   length never exceeds the fetch bound below.
 
 **The fetch bound (the memory consequence, stated)**: new
-`EngineConfig::logs_max_fetch_run_bytes`, default 64 MiB, bounding the
-buffered length of any single data GET on the query path — whole-object
+`EngineConfig::logs_max_fetch_run_bytes`, default 64 MiB, validated at
+config resolution — zero is refused with a typed error, since the
+segmented fallback divides by it. It bounds RESIDENT assembly, not just
+GET length: today's assembler allocates the full `object_size` even on
+the ranged path (`ObjectAssembler::new(&pool, total)`,
+`log_fetcher.rs:3742`), so a bound that only capped request ranges would
+still let one 5 GiB object reserve 5 GiB. Under this ADR the assembler
+allocates per covering sub-range, at most the bound, with split points
+chosen at block boundaries from the resident PAGE_DIR so every
+sub-range decodes independently. Whole-object
 reads apply only to objects ≤ the bound; a larger object falls back to
 covering sequential sub-range GETs of at most the bound each
 (`ceil(size/bound)` GETs — a 5 GiB object costs 80 GETs, never one
@@ -245,16 +265,29 @@ total)`, `log_fetcher.rs:3742`), and `GetOutcome.data` is fully-buffered
 `Bytes` (`crates/ravel-object-store/src/lib.rs:113-118`), so streaming
 is not available at this seam without a contract change (rejected
 alternative 5); the bound is therefore a NEW protective cap on both
-policies, and the stated memory bound is `fetch permits ×
-min(object_size, bound)` = 16 × 64 MiB = 1 GiB worst-case at defaults
+policies, and the stated memory bound is `fetch permits × bound`
+= 16 × 64 MiB = 1 GiB worst-case at defaults
 (`DEFAULT_LOG_MAX_CONCURRENT_GETS`, `log_fetcher.rs:2200`) — versus
-today's formally unbounded `permits × object_size`. A 3.5 MB
-whole-object GET is fine; a 5 GiB one is refused by construction.
+today's formally unbounded `permits × object_size`. The corpus figure
+is stated as what it is: 3.47 MB is the MEAN object size on
+clickbench-v4, not a maximum, so the per-corpus expectation in the
+verification plan is banded on the corpus's largest object, and the
+worst-case guarantee is the `permits × bound` line above, nothing
+softer. A 5 GiB object is never resident whole by construction.
 
 **Knob relations (ADR-0904 alignment)**: `--logs-request-cost-bytes`
 stays and WINS when explicitly set — policy is the intent layer, the
-byte flag the expert escape hatch; `--logs-block-range-threshold` keeps
-its ADR-0904 role. The policy must never be derivable from query text,
+byte flag the expert escape hatch. `request-minimal` overrides BOTH
+routing thresholds: `with_block_range_threshold` pins the inner
+crossover to the outer flag's value (`log_fetcher.rs:644-648`), so a
+policy that saturated only the derived rate would still let a low
+explicit `--logs-block-range-threshold` send projected objects down the
+ranged path through `ranged_projection_pays`. Under `request-minimal`
+the resolved crossover and gap both saturate regardless of that flag,
+a set-but-overridden flag is logged at startup, and the combined
+routing test (both flags set, policy request-minimal, ranged opens
+asserted zero) pins it. `--logs-block-range-threshold` keeps its
+ADR-0904 role under the other two policies. The policy must never be derivable from query text,
 headers, or tickets (ADR-0904 decision 4's cost-DoS argument, inverted:
 under request billing a tenant forcing `byte-minimal` per query would
 5× the deployment's request bill). The row-identity invariant carries
@@ -276,8 +309,13 @@ parallelism (the permit pool) and removes the probe→sections→runs
 sequential chain (~3 dependent RTTs → 1). With transfer free, the
 recovery lever is `--fetch-concurrency` (more parallel streams cost
 requests nothing). Whether that recovers the 46% is a measurement, not a
-claim — it is pre-registered below with a hard guardrail, and the
-default demotes to `byte-minimal` if the guardrail fails.
+claim — it is pre-registered below with a hard guardrail. Demotion is an
+OPERATOR ROLLOUT ACTION, not a feedback loop: if 996-9's measurement
+misses the guardrail, the epic changes the shipped default to
+`byte-minimal` and deployments set `--logs-fetch-policy` accordingly;
+the running engine never changes its own policy (a self-changing policy
+would make the provenance stamp describe a moving target), and the
+stamped effective policy is what makes the state auditable either way.
 
 ```mermaid
 flowchart TD
@@ -303,15 +341,23 @@ flowchart TD
 Extend, never duplicate (#928's seam is the single source of billed
 truth):
 
-- **Requests are billed ATTEMPTS.** The ledger's headline request figures
-  read `StoreMetrics.attempts` per op (`instrument.rs:305,424-427`);
-  `calls` stays beside them as the diagnostic (retry overhead =
-  `attempts − calls`). NEW: `RequestCounts` gains `put_attempts` /
-  `get_attempts` / `list_attempts` next to today's `calls`-based fields
-  (`report.rs:210-217` currently reads calls only) and the per-statement
-  SQL-latency rows gain the attempt figures beside the existing
-  `object_store_get_requests` (`sql_latency.rs:422-447`). No second
-  counter is built anywhere (rejected alternative 4).
+- **Requests are billed ATTEMPTS, and absence is not zero.** The
+  ledger's headline BILLING figures read `StoreMetrics.attempts` per op
+  (`instrument.rs:305,424-427`); `calls` stays beside them as the
+  diagnostic (retry overhead = `attempts − calls`). A store with no
+  attempt source (`MemoryStore` has no HTTP connector) reports attempts
+  as UNAVAILABLE (`Option::None` in the ledger, rendered as `n/a`),
+  never as zero: zero would fail the `calls ≤ attempts` reconciliation
+  and would read as a free pass. The reconciliation row asserts only
+  when attempts are present. SHAPE metrics — `range_amplification` and
+  the data-GETs-per-touched-object gate — use completed data-GET CALLS,
+  because they measure the plan's shape, which a transport retry must
+  not move; BILLING figures and modeled cost use attempts. NEW:
+  `RequestCounts` gains optional `put_attempts` / `get_attempts` /
+  `list_attempts` beside today's calls-based fields (`report.rs:210-217`
+  reads calls only) and the per-statement SQL-latency rows gain the same
+  beside `object_store_get_requests` (`sql_latency.rs:422-447`). No
+  second counter is built anywhere (rejected alternative 4).
 - **`range_amplification = data_GET_requests /
   unique_query_object_touches`**, DATA GETs only: the numerator is
   scan-phase GET requests (`ReadPhases::blocks` charges to
@@ -334,10 +380,16 @@ truth):
   structural — one reconciliation row in the report asserting
   `sum(phase GET requests) ≤ store GET calls ≤ GET attempts`, which
   holds by the wiring documented at `instrument.rs:44-52`.
-- **Modeled cost** = profile × attempts per class, an output column of
-  bench and per-query stats, integer nanodollars, always beside the
-  profile stamp. The engine never reads it back (observability-only, the
-  `InstrumentedStore` rule, `instrument.rs:5-13`).
+- **Modeled cost is named for what it prices.** The request term is
+  `modeled_request_cost_nanodollars` = profile × attempts per class. When
+  the stamped profile carries a nonzero transfer or retrieval price, the
+  report adds separately labelled `modeled_transfer_cost_nanodollars` and
+  `modeled_retrieval_cost_nanodollars` terms computed from the wire-byte
+  counters, never folded into the request term — a profile with byte
+  prices must not stamp them while reporting request fees alone, and a
+  fixture with nonzero byte prices pins this. Integer nanodollars, always
+  beside the profile stamp. The engine never reads any of it back
+  (observability-only, the `InstrumentedStore` rule, `instrument.rs:5-13`).
 
 ### 4. The regression gate
 
