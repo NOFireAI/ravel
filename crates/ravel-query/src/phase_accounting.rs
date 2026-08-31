@@ -220,6 +220,12 @@ impl PhaseWireByteCounts {
     pub fn total(&self) -> u64 {
         self.phases.iter().fold(0u64, |a, b| a.saturating_add(*b))
     }
+
+    /// Sum of every phase's GET request count (issue #857).
+    #[must_use]
+    pub fn total_requests(&self) -> u64 {
+        self.requests.iter().fold(0u64, |a, b| a.saturating_add(*b))
+    }
 }
 
 /// Four independent [`QueryAccounting`] handles, one per [`QueryPhase`]
