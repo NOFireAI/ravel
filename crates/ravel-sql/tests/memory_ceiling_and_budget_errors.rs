@@ -17,8 +17,7 @@ use datafusion::execution::memory_pool::{
 use ravel_object_store::memory::MemoryStore;
 use ravel_sql::{
     CeilingBreach, RavelTableProvider, SessionTable, SpillDecision, SqlConfig, SqlError,
-    TenantDelegatingPool,
-    TenantMemoryAccountant, build_session,
+    TenantDelegatingPool, TenantMemoryAccountant, build_session,
 };
 use ravel_types::accounting::QueryAccounting;
 use util::{Fixture, SegSpec, SeriesSpec, request, tenant_id};

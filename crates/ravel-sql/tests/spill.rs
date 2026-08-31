@@ -227,7 +227,9 @@ async fn run_grouped_count(
         .with_memory_pool(pool)
         .with_disk_manager_builder(
             DiskManagerBuilder::default()
-                .with_mode(DiskManagerMode::Directories(vec![scratch_dir.to_path_buf()]))
+                .with_mode(DiskManagerMode::Directories(vec![
+                    scratch_dir.to_path_buf(),
+                ]))
                 .with_max_temp_directory_size(scratch_bytes),
         )
         .build_arc()
@@ -306,10 +308,7 @@ async fn run_grouped_count(
 /// even for a query that spilled (the same defect fixed in
 /// `crate::spill::accumulate_spill_counts`).
 fn spill_file_count(plan: &Arc<dyn ExecutionPlan>) -> u64 {
-    let mut total = plan
-        .metrics()
-        .and_then(|m| m.spill_count())
-        .unwrap_or(0) as u64;
+    let mut total = plan.metrics().and_then(|m| m.spill_count()).unwrap_or(0) as u64;
     for child in plan.children() {
         total += spill_file_count(child);
     }
@@ -380,13 +379,8 @@ async fn an_eligible_aggregation_over_budget_spills_and_matches_the_in_memory_re
         AMPLE_SCRATCH_BYTES,
     )
     .await;
-    let reference = run_grouped_count(
-        ref_scratch.path(),
-        &keys,
-        1 << 30,
-        AMPLE_SCRATCH_BYTES,
-    )
-    .await;
+    let reference =
+        run_grouped_count(ref_scratch.path(), &keys, 1 << 30, AMPLE_SCRATCH_BYTES).await;
 
     assert!(
         spilled.spill_files > 0,
@@ -412,7 +406,10 @@ async fn an_eligible_aggregation_over_budget_spills_and_matches_the_in_memory_re
     // of counts, which pins the spilled merge produced the right per-group total.
     let twos = spilled.rows.iter().filter(|(_, c)| *c == 2).count();
     let ones = spilled.rows.iter().filter(|(_, c)| *c == 1).count();
-    assert_eq!(twos, IN_MEMORY_DOUBLED as usize, "doubled keys must count 2");
+    assert_eq!(
+        twos, IN_MEMORY_DOUBLED as usize,
+        "doubled keys must count 2"
+    );
     assert_eq!(
         ones,
         (IN_MEMORY_GROUPS - IN_MEMORY_DOUBLED) as usize,
@@ -447,7 +444,11 @@ async fn an_eligible_aggregation_over_the_scratch_quota_is_spill_budget_exhauste
     let fixture = Fixture::build(
         Arc::new(MemoryStore::new()),
         &[(&tenant, &specs)],
-        spill_config(scratch.path().to_path_buf(), TINY_SCRATCH_BYTES, TIGHT_QUERY_BYTES),
+        spill_config(
+            scratch.path().to_path_buf(),
+            TINY_SCRATCH_BYTES,
+            TIGHT_QUERY_BYTES,
+        ),
         1 << 40,
     )
     .await;
@@ -520,7 +521,11 @@ async fn an_ineligible_float_aggregation_over_budget_is_refused_and_never_spills
     let fixture = Fixture::build(
         Arc::new(MemoryStore::new()),
         &[(&tenant, &specs)],
-        spill_config(scratch.path().to_path_buf(), AMPLE_SCRATCH_BYTES, TIGHT_QUERY_BYTES),
+        spill_config(
+            scratch.path().to_path_buf(),
+            AMPLE_SCRATCH_BYTES,
+            TIGHT_QUERY_BYTES,
+        ),
         1 << 40,
     )
     .await;
@@ -612,7 +617,11 @@ async fn a_cancelled_spilling_stream_cleans_up_its_scratch() {
     let fixture = Fixture::build(
         Arc::new(MemoryStore::new()),
         &[(&tenant, &specs)],
-        spill_config(scratch.path().to_path_buf(), AMPLE_SCRATCH_BYTES, TIGHT_QUERY_BYTES),
+        spill_config(
+            scratch.path().to_path_buf(),
+            AMPLE_SCRATCH_BYTES,
+            TIGHT_QUERY_BYTES,
+        ),
         1 << 40,
     )
     .await;

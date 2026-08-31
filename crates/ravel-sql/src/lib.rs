@@ -81,12 +81,12 @@ mod rlog_attrs;
 mod scan;
 mod schema;
 mod session;
-pub mod spill;
 mod spans_fetcher;
 mod spans_provider;
 mod spans_pushdown;
 mod spans_scan;
 mod spans_schema;
+pub mod spill;
 mod udf;
 mod validate;
 
@@ -160,7 +160,6 @@ pub use session::{
     SAMPLES_TABLE, SKIP_PARTIAL_AGGREGATION_PROBE_RATIO, SKIP_PARTIAL_AGGREGATION_PROBE_ROWS,
     SPANS_TABLE, SessionTable, SpillDecision, build_session, session_config,
 };
-pub use spill::{OperatorSpill, SpillCounts, SpillScratch};
 pub use spans_fetcher::{SpanFetchError, SpanFetchOutput, SpanRow, SpanSegmentFetcher};
 pub use spans_provider::SpansTableProvider;
 pub use spans_pushdown::{SpansPushdown, extract_spans};
@@ -170,6 +169,7 @@ pub use spans_schema::{
     SPAN_COL_SERVICE_NAME, SPAN_COL_SPAN_ID, SPAN_COL_START_TS, SPAN_COL_STATUS_CODE,
     SPAN_COL_STATUS_MESSAGE, SPAN_COL_TRACE_ID, spans_schema,
 };
+pub use spill::{OperatorSpill, SpillCounts, SpillScratch};
 pub use udf::{label_match_udf, label_udf};
 pub use validate::{ValidationError, validate};
 

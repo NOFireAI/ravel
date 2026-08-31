@@ -148,9 +148,7 @@ pub enum SpillConfigError {
     )]
     Incomplete,
     /// `RAVEL_SQL_SPILL_MAX_BYTES` is not a positive decimal integer.
-    #[error(
-        "RAVEL_SQL_SPILL_MAX_BYTES must be a positive decimal number of bytes, got {value:?}"
-    )]
+    #[error("RAVEL_SQL_SPILL_MAX_BYTES must be a positive decimal number of bytes, got {value:?}")]
     BadQuota { value: String },
     /// `RAVEL_SQL_SPILL_DIR` is set to an empty string.
     #[error("RAVEL_SQL_SPILL_DIR must name a directory, but is set to an empty string")]
@@ -346,6 +344,7 @@ impl SqlConfig {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

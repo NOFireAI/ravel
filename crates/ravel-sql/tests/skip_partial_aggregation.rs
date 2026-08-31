@@ -411,7 +411,8 @@ async fn run(
         SessionTable::Logs(provider),
         false,
         SpillDecision::Disabled,
-    ).expect("session");
+    )
+    .expect("session");
 
     let plan = ctx
         .sql(QUERY)

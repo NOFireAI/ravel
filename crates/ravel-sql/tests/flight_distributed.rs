@@ -346,7 +346,7 @@ impl WorkerSliceClient for InProcessWorker {
             snapshot,
             TENANT,
             self.fetcher.clone(),
-            self.config,
+            self.config.clone(),
             QueryAccounting::new(),
         );
         let plan = provider.worker_fragment(segments.len().max(1), &segments)?;

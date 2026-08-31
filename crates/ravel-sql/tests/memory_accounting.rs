@@ -35,8 +35,7 @@ use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::{LogSegmentFetcher, SegmentFetcher};
 use ravel_sql::{
     LogsTableProvider, RavelTableProvider, SessionTable, SpillDecision, SqlConfig,
-    TenantMemoryAccountant,
-    build_session,
+    TenantMemoryAccountant, build_session,
 };
 use ravel_types::TenantId;
 use ravel_types::accounting::QueryAccounting;

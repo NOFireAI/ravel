@@ -75,8 +75,7 @@ use ravel_object_store::{
 use ravel_query::{CacheFetchError, LogSegmentFetcher};
 use ravel_sql::{
     CeilingBreach, DeclaredColumn, DeclaredType, LogsTableProvider, SessionTable, SpillDecision,
-    SqlConfig,
-    TenantDelegatingPool, TenantMemoryAccountant, build_session,
+    SqlConfig, TenantDelegatingPool, TenantMemoryAccountant, build_session,
 };
 use ravel_types::TenantHash;
 use ravel_types::accounting::{AccountedOp, QueryAccounting};
@@ -361,7 +360,7 @@ fn session(provider: LogsTableProvider, config: &SqlConfig) -> SessionContext {
         false,
         SpillDecision::Disabled,
     )
-        .expect("session builds")
+    .expect("session builds")
 }
 
 fn metric(plan: &Arc<dyn ExecutionPlan>, node: &str, name: &str) -> usize {

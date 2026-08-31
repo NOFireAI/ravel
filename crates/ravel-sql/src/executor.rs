@@ -106,8 +106,8 @@ use crate::session::{
     LOGS_TABLE, SAMPLES_TABLE, SPANS_TABLE, SessionTable, SpillDecision, build_session,
 };
 use crate::spans_fetcher::SpanSegmentFetcher;
-use crate::spill::{OperatorSpill, SpillCounts, SpillScratch, accumulate_spill_counts};
 use crate::spans_provider::SpansTableProvider;
+use crate::spill::{OperatorSpill, SpillCounts, SpillScratch, accumulate_spill_counts};
 use crate::validate::{referenced_base_tables, validate};
 
 /// Which of the three v1 tables (and thus which `Signal`) a query targets.
@@ -2165,19 +2165,24 @@ fn aggregate_expr_is_spill_exact(expr: &Expr, schema: &DFSchema) -> bool {
         // Not an aggregate function where one is required: fail closed.
         return false;
     };
-    let arg_type = |wanted: fn(&datafusion::arrow::datatypes::DataType) -> bool| {
-        match aggregate_function.params.args.first() {
+    let arg_type =
+        |wanted: fn(&datafusion::arrow::datatypes::DataType) -> bool| match aggregate_function
+            .params
+            .args
+            .first()
+        {
             Some(arg) => match arg.get_type(schema) {
                 Ok(ty) => wanted(&ty),
                 Err(_) => false,
             },
             None => false,
-        }
-    };
+        };
     match aggregate_function.func.name().to_ascii_lowercase().as_str() {
         "count" => true,
         "sum" => arg_type(is_exact_integer),
-        "avg" | "mean" => arg_type(|ty| matches!(ty, datafusion::arrow::datatypes::DataType::Int64)),
+        "avg" | "mean" => {
+            arg_type(|ty| matches!(ty, datafusion::arrow::datatypes::DataType::Int64))
+        }
         _ => false,
     }
 }
