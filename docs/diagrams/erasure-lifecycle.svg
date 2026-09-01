@@ -1,70 +1,70 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 500" font-family="'Segoe Print','Bradley Hand','Comic Sans MS',cursive" font-size="15">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 500" font-family="system-ui, sans-serif" font-size="15" role="img" aria-label="Selective subject erasure lifecycle: an erase request excludes matching records from queries immediately, a maintain rewrite drops the subject and publishes a .done record, then a horizon- and hold-gated sweep physically deletes the superseded objects, reaching absence in under four days on defaults.">
   <defs>
-    <marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-      <path d="M 1 1.5 Q 6 4 8.5 5 Q 6 6 1 8.5" fill="none" stroke="#444" stroke-width="1.6" stroke-linecap="round"/>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#383e46"/>
     </marker>
-    <marker id="arrR" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-      <path d="M 1 1.5 Q 6 4 8.5 5 Q 6 6 1 8.5" fill="none" stroke="#b3423a" stroke-width="1.6" stroke-linecap="round"/>
+    <marker id="arrR" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#6b7280"/>
     </marker>
   </defs>
-  <rect width="940" height="500" fill="#fdfcf8"/>
-  <text x="24" y="34" font-size="20" fill="#1b2230">Selective subject erasure lifecycle (ADR-0064)</text>
-  <text x="24" y="56" font-size="12" fill="#5b6472">submit &#8594; query exclusion &#8594; rewrite &#8594; .done &#8594; physical sweep &#8594; absence</text>
+  <rect x="0" y="0" width="940" height="500" fill="#f4f5f7"/>
+  <text x="24" y="34" font-size="20" font-weight="bold" fill="#17191c">Selective subject erasure lifecycle (ADR-0064)</text>
+  <text x="24" y="56" font-size="12" fill="#4a4f57">submit &#8594; query exclusion &#8594; rewrite &#8594; .done &#8594; physical sweep &#8594; absence</text>
 
-  <!-- 1. erase submit (gold, Admin) -->
-  <path d="M 20 103 Q 18 100 24 100 L 264 98 Q 271 99 270 105 L 271 191 Q 270 197 264 196 L 25 198 Q 19 197 20 191 Z" fill="#f5eede" stroke="#8a6d1f" stroke-width="2.2" stroke-linecap="round"/>
-  <text x="38" y="127" fill="#8a6d1f">1. erase submit</text>
-  <text x="38" y="150" font-size="12" fill="#5b6472">.dreq CreateIfAbsent (Admin)</text>
-  <text x="38" y="169" font-size="12" fill="#5b6472">durable predicate; immutable</text>
-  <text x="38" y="188" font-size="12" fill="#b3423a">t = 0  (ack starts the clock)</text>
+  <!-- 1. erase submit (amber, immutable request object) -->
+  <rect x="20" y="98" width="251" height="100" rx="8" fill="#f4c869" stroke="#8a5a10" stroke-width="2"/>
+  <text x="38" y="127" font-size="15" font-weight="bold" fill="#8a5a10">1. erase submit</text>
+  <text x="38" y="150" font-size="12" fill="#17191c">.dreq CreateIfAbsent (Admin)</text>
+  <text x="38" y="169" font-size="12" fill="#17191c">durable predicate; immutable</text>
+  <text x="38" y="188" font-size="12" fill="#a3302a">t = 0  (ack starts the clock)</text>
 
-  <!-- 2. query exclusion (blue) -->
-  <path d="M 315 101 Q 313 98 319 98 L 559 100 Q 566 99 565 105 L 566 191 Q 565 197 559 196 L 320 198 Q 314 197 315 191 Z" fill="#eef3f7" stroke="#31536b" stroke-width="2.2" stroke-linecap="round"/>
-  <text x="333" y="127" fill="#31536b">2. query exclusion</text>
-  <text x="333" y="150" font-size="12" fill="#5b6472">no matching records returned,</text>
-  <text x="333" y="169" font-size="12" fill="#5b6472">store or any cache tier</text>
-  <text x="333" y="188" font-size="12" fill="#b3423a">immediate; drain &#8804; 30s</text>
+  <!-- 2. query exclusion (blue, service action) -->
+  <rect x="315" y="98" width="251" height="100" rx="8" fill="#a9c9e6" stroke="#1f4e79" stroke-width="2"/>
+  <text x="333" y="127" font-size="15" font-weight="bold" fill="#1f4e79">2. query exclusion</text>
+  <text x="333" y="150" font-size="12" fill="#17191c">no matching records returned,</text>
+  <text x="333" y="169" font-size="12" fill="#17191c">store or any cache tier</text>
+  <text x="333" y="188" font-size="12" fill="#a3302a">immediate; drain &#8804; 30s</text>
 
-  <!-- 3. maintain rewrite (teal) -->
-  <path d="M 610 103 Q 608 100 614 99 L 854 98 Q 861 99 860 105 L 861 191 Q 860 197 854 196 L 615 198 Q 609 197 610 191 Z" fill="#e8f3f2" stroke="#0e7c86" stroke-width="2.2" stroke-linecap="round"/>
-  <text x="628" y="127" fill="#0e7c86">3. maintain rewrite</text>
-  <text x="628" y="150" font-size="12" fill="#5b6472">decode &#8211; filter &#8211; re-encode</text>
-  <text x="628" y="169" font-size="12" fill="#5b6472">publishes RewriteRecord</text>
-  <text x="628" y="188" font-size="12" fill="#5b6472">on the owning Maintain worker</text>
+  <!-- 3. maintain rewrite (blue, service action) -->
+  <rect x="610" y="98" width="251" height="100" rx="8" fill="#a9c9e6" stroke="#1f4e79" stroke-width="2"/>
+  <text x="628" y="127" font-size="15" font-weight="bold" fill="#1f4e79">3. maintain rewrite</text>
+  <text x="628" y="150" font-size="12" fill="#17191c">decode &#8211; filter &#8211; re-encode</text>
+  <text x="628" y="169" font-size="12" fill="#17191c">publishes RewriteRecord</text>
+  <text x="628" y="188" font-size="12" fill="#17191c">on the owning Maintain worker</text>
 
-  <!-- 4. .done completion (green) -->
-  <path d="M 610 313 Q 608 310 614 310 L 854 308 Q 861 309 860 315 L 861 401 Q 860 407 854 406 L 615 408 Q 609 407 610 401 Z" fill="#eaf1ea" stroke="#4c6b45" stroke-width="2.2" stroke-linecap="round"/>
-  <text x="628" y="337" fill="#4c6b45">4. .done (completion)</text>
-  <text x="628" y="360" font-size="12" fill="#5b6472">verified, not assumed;</text>
-  <text x="628" y="379" font-size="12" fill="#5b6472">hash only, no subject id;</text>
-  <text x="628" y="398" font-size="12" fill="#5b6472">permanent, deny-delete</text>
+  <!-- 4. .done completion (green, verified) -->
+  <rect x="610" y="308" width="251" height="100" rx="8" fill="#a9dcae" stroke="#2f6b34" stroke-width="2"/>
+  <text x="628" y="337" font-size="15" font-weight="bold" fill="#2f6b34">4. .done (completion)</text>
+  <text x="628" y="360" font-size="12" fill="#17191c">verified, not assumed;</text>
+  <text x="628" y="379" font-size="12" fill="#17191c">hash only, no subject id;</text>
+  <text x="628" y="398" font-size="12" fill="#17191c">permanent, deny-delete</text>
 
-  <!-- 5. physical sweep (red) -->
-  <path d="M 315 311 Q 313 308 319 308 L 559 310 Q 566 309 565 315 L 566 401 Q 565 407 559 406 L 320 408 Q 314 407 315 401 Z" fill="#f7ecec" stroke="#b3423a" stroke-width="2.2" stroke-linecap="round"/>
-  <text x="333" y="337" fill="#b3423a">5. physical sweep</text>
-  <text x="333" y="360" font-size="12" fill="#5b6472">superseded inputs deleted,</text>
-  <text x="333" y="379" font-size="12" fill="#5b6472">horizon- and hold-gated</text>
-  <text x="333" y="398" font-size="12" fill="#5b6472">.done + protection_horizon</text>
+  <!-- 5. physical sweep (neutral, gated deletion) -->
+  <rect x="315" y="308" width="251" height="100" rx="8" fill="#dde1e7" stroke="#454b54" stroke-width="2"/>
+  <text x="333" y="337" font-size="15" font-weight="bold" fill="#454b54">5. physical sweep</text>
+  <text x="333" y="360" font-size="12" fill="#17191c">superseded inputs deleted,</text>
+  <text x="333" y="379" font-size="12" fill="#17191c">horizon- and hold-gated</text>
+  <text x="333" y="398" font-size="12" fill="#17191c">.done + protection_horizon</text>
 
-  <!-- 6. absence (green) -->
-  <path d="M 20 313 Q 18 310 24 310 L 264 308 Q 271 309 270 315 L 271 401 Q 270 407 264 406 L 25 408 Q 19 407 20 401 Z" fill="#eef3ee" stroke="#4c6b45" stroke-width="2.4" stroke-linecap="round"/>
-  <text x="38" y="337" fill="#4c6b45">6. physically absent</text>
-  <text x="38" y="360" font-size="12" fill="#5b6472">bytes gone from the bucket</text>
-  <text x="38" y="384" font-size="13" fill="#b3423a">&#60; 4 days end to end</text>
-  <text x="38" y="401" font-size="12" fill="#5b6472">(unmodified defaults)</text>
+  <!-- 6. absence (green, verified end state) -->
+  <rect x="20" y="308" width="251" height="100" rx="8" fill="#a9dcae" stroke="#2f6b34" stroke-width="2"/>
+  <text x="38" y="337" font-size="15" font-weight="bold" fill="#2f6b34">6. physically absent</text>
+  <text x="38" y="360" font-size="12" fill="#17191c">bytes gone from the bucket</text>
+  <text x="38" y="384" font-size="13" fill="#a3302a">&#60; 4 days end to end</text>
+  <text x="38" y="401" font-size="12" fill="#17191c">(unmodified defaults)</text>
 
   <!-- flow arrows -->
-  <path d="M 271 145 Q 292 141 314 145" fill="none" stroke="#444" stroke-width="1.8" marker-end="url(#arr)" stroke-linecap="round"/>
-  <path d="M 566 145 Q 588 149 609 145" fill="none" stroke="#444" stroke-width="1.8" marker-end="url(#arr)" stroke-linecap="round"/>
-  <path d="M 735 199 Q 739 255 735 309" fill="none" stroke="#444" stroke-width="1.8" marker-end="url(#arr)" stroke-linecap="round"/>
-  <path d="M 609 355 Q 588 351 566 355" fill="none" stroke="#b3423a" stroke-width="1.8" marker-end="url(#arrR)" stroke-linecap="round"/>
-  <path d="M 314 355 Q 292 359 271 355" fill="none" stroke="#b3423a" stroke-width="1.8" marker-end="url(#arrR)" stroke-linecap="round"/>
+  <path d="M271,145 L312,145" fill="none" stroke="#383e46" stroke-width="1.8" marker-end="url(#arr)"/>
+  <path d="M566,145 L607,145" fill="none" stroke="#383e46" stroke-width="1.8" marker-end="url(#arr)"/>
+  <path d="M735,198 L735,306" fill="none" stroke="#383e46" stroke-width="1.8" marker-end="url(#arr)"/>
+  <path d="M607,355 L568,355" fill="none" stroke="#6b7280" stroke-width="1.8" marker-end="url(#arrR)"/>
+  <path d="M312,355 L273,355" fill="none" stroke="#6b7280" stroke-width="1.8" marker-end="url(#arrR)"/>
 
   <!-- modifiers strip -->
-  <path d="M 20 435 Q 18 432 24 432 L 856 430 Q 863 431 862 437 L 863 475 Q 862 481 856 480 L 25 482 Q 19 481 20 475 Z" fill="#fff" stroke="#8a6d1f" stroke-width="1.8" stroke-dasharray="6 4" stroke-linecap="round"/>
-  <text x="38" y="452" font-size="12" fill="#8a6d1f">bound extends by:</text>
-  <text x="150" y="452" font-size="12" fill="#5b6472">+D  bucket-default Object Lock retention</text>
-  <text x="440" y="452" font-size="12" fill="#5b6472">+E_v  noncurrent-version expiry (versioned bucket)</text>
-  <text x="150" y="471" font-size="12" fill="#b3423a">paused</text>
-  <text x="205" y="471" font-size="12" fill="#5b6472">under an overlapping legal hold, until an authorized human clears it</text>
+  <rect x="20" y="430" width="843" height="52" rx="6" fill="#eceef1" stroke="#454b54" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text x="38" y="452" font-size="12" fill="#454b54">bound extends by:</text>
+  <text x="150" y="452" font-size="12" fill="#17191c">+D  bucket-default Object Lock retention</text>
+  <text x="440" y="452" font-size="12" fill="#17191c">+E_v  noncurrent-version expiry (versioned bucket)</text>
+  <text x="150" y="471" font-size="12" fill="#a3302a">paused</text>
+  <text x="205" y="471" font-size="12" fill="#17191c">under an overlapping legal hold, until an authorized human clears it</text>
 </svg>
