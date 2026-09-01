@@ -206,13 +206,16 @@ async fn build_fixture_with_tail(
     (snapshot, want, tail_size)
 }
 
+fn provider_with_accounting(
+    snapshot: Snapshot,
+    fetcher: LogSegmentFetcher,
+    accounting: QueryAccounting,
+) -> LogsTableProvider {
+    LogsTableProvider::new(snapshot, TenantHash([7u8; 16]), fetcher, accounting)
+}
+
 fn provider(snapshot: Snapshot, fetcher: LogSegmentFetcher) -> LogsTableProvider {
-    LogsTableProvider::new(
-        snapshot,
-        TenantHash([7u8; 16]),
-        fetcher,
-        QueryAccounting::new(),
-    )
+    provider_with_accounting(snapshot, fetcher, QueryAccounting::new())
 }
 
 async fn collect_plan(plan: Arc<dyn ExecutionPlan>) -> Vec<RecordBatch> {
@@ -721,4 +724,314 @@ async fn rejection_reason_fewer_segments_than_partitions() {
         &plan,
         Some(("fast_path_rejected_fewer_segments_than_partitions", parts)),
     );
+}
+
+// ---- issue #1006: the fast path's `data_objects_touched` recorder ---------
+//
+// ADR-0996 decision 3 makes `data_objects_touched` the denominator of
+// `range_amplification = data_GET_requests / data_objects_touched`, and the
+// fast path is exactly the full-scan shape the amplification gate targets. It
+// has no plan phase, so it must pick its own single recorder:
+// `PartitionCtx::record_data_object_touched`, called from the owning partition
+// once per relevant segment. These tests pin the count exactly, because the
+// failure that matters is a per-partition site multiplying it by
+// `target_partitions` rather than one that never fires.
+
+/// The fast path records exactly one touch per segment: `SEGMENTS`, not
+/// `SEGMENTS * PARTS`. The equality against the store's whole-object GET count
+/// is the amplification ratio this counter exists to make computable -- one
+/// data GET per object here, so the ratio is exactly 1.
+#[tokio::test]
+async fn fast_path_records_one_data_object_touched_per_segment() {
+    let base = Arc::new(MemoryStore::new());
+    let (snapshot, want) = build_fixture(base.as_ref()).await;
+
+    let counting = ShapeCountingStore::new(base);
+    let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&counting) as Arc<dyn ObjectStoreBackend>;
+    let accounting = QueryAccounting::new();
+    let plan =
+        provider_with_accounting(snapshot, above_threshold_fetcher(store), accounting.clone())
+            .plan(PARTS)
+            .expect("plan");
+    let batches = collect_plan(Arc::clone(&plan)).await;
+
+    // The run really is on the fast path, and really did read the data.
+    assert_rejection(&plan, None);
+    assert_eq!(batches_to_rows(&batches), want, "every written row once");
+
+    let snap = accounting.snapshot();
+    assert_eq!(
+        snap.data_objects_touched,
+        SEGMENTS as u64,
+        "one touch per distinct data object; a per-partition recording site would \
+         report {} instead",
+        SEGMENTS * PARTS
+    );
+    assert_eq!(
+        snap.data_objects_touched,
+        counting.full_gets(),
+        "the denominator matches the scan-phase data GETs, so range amplification \
+         is exactly 1 for a whole-object fast-path read"
+    );
+    // The counter is fast-path-only, so it equals the fast path's own open
+    // count; the planned route's recorder lives elsewhere (see
+    // `one_statement_takes_exactly_one_route`).
+    assert_eq!(
+        snap.data_objects_touched,
+        snap.logs_whole_object_opens + snap.logs_ranged_opens,
+        "one touch per fast-path open"
+    );
+}
+
+/// A second run of the same statement over the same read cache issues no store
+/// request at all and still records `SEGMENTS`: the counter is the query's
+/// object working set, not its cache misses (the snapshot field's third
+/// exclusion).
+#[tokio::test]
+async fn fast_path_counts_segments_served_entirely_from_cache() {
+    let base = Arc::new(MemoryStore::new());
+    let (snapshot, want) = build_fixture(base.as_ref()).await;
+
+    let counting = ShapeCountingStore::new(base);
+    let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&counting) as Arc<dyn ObjectStoreBackend>;
+    // One cache shared by both runs, so the second run finds every segment's
+    // bytes already resident.
+    let cache = build_read_cache(64 << 20);
+    let fetcher = || {
+        LogSegmentFetcher::new(Arc::clone(&store))
+            .with_cache(Arc::clone(&cache))
+            .with_block_range_threshold(0)
+    };
+
+    let warm_accounting = QueryAccounting::new();
+    let warm_plan = provider_with_accounting(snapshot.clone(), fetcher(), warm_accounting.clone())
+        .plan(PARTS)
+        .expect("warming plan");
+    let warm_rows = batches_to_rows(&collect_plan(Arc::clone(&warm_plan)).await);
+    assert_rejection(&warm_plan, None);
+    let gets_after_warm = counting.full_gets();
+    assert_eq!(
+        gets_after_warm, SEGMENTS as u64,
+        "the warming run reads each segment once from the store"
+    );
+    assert_eq!(
+        warm_accounting.snapshot().data_objects_touched,
+        SEGMENTS as u64,
+        "the warming run touches each segment once"
+    );
+
+    let cached_accounting = QueryAccounting::new();
+    let cached_plan = provider_with_accounting(snapshot, fetcher(), cached_accounting.clone())
+        .plan(PARTS)
+        .expect("cached plan");
+    let cached_rows = batches_to_rows(&collect_plan(Arc::clone(&cached_plan)).await);
+    assert_rejection(&cached_plan, None);
+
+    // The precondition the test's claim rests on: the second run issued no
+    // store request of any shape, so every block it read came from the cache.
+    assert_eq!(
+        counting.full_gets(),
+        gets_after_warm,
+        "the second run must be served entirely from cache"
+    );
+    assert_eq!(counting.suffix_gets(), 0, "and probe nothing");
+    assert_eq!(counting.range_gets(), 0, "and range over nothing");
+
+    assert_eq!(
+        cached_accounting.snapshot().data_objects_touched,
+        SEGMENTS as u64,
+        "a fully cache-served fast-path statement still touches every segment: the \
+         counter measures the query's object working set, not its misses"
+    );
+    assert_eq!(cached_rows, want, "and returns every written row once");
+    assert_eq!(
+        cached_rows, warm_rows,
+        "identical to the warming run's rows"
+    );
+}
+
+/// A statement with a content predicate defeats the fast path and plans
+/// instead, so this crate's recorder must not fire for it.
+///
+/// The total is asserted at zero rather than at `SEGMENTS` because on this tree
+/// the planned route has no recorder yet: 996-3 adds one at
+/// `ravel_query::LogSegmentFetcher::plan_segment`, which owns that route. When
+/// it lands, this assertion moves to the fast-path counters alone (already
+/// asserted zero here) and the total becomes `SEGMENTS`.
+#[tokio::test]
+async fn planned_route_records_nothing_at_the_fast_path_site() {
+    use datafusion::logical_expr::{col, lit};
+
+    let base = Arc::new(MemoryStore::new());
+    let (snapshot, _want) = build_fixture(base.as_ref()).await;
+
+    let counting = ShapeCountingStore::new(base);
+    let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&counting) as Arc<dyn ObjectStoreBackend>;
+    let accounting = QueryAccounting::new();
+    let expr = ravel_sql::has_word_udf().call(vec![col("body"), lit("s0-r0")]);
+    let plan =
+        provider_with_accounting(snapshot, above_threshold_fetcher(store), accounting.clone())
+            .plan_filters(PARTS, &[expr])
+            .expect("plan");
+    let _ = collect_plan(Arc::clone(&plan)).await;
+
+    // The run really planned: every partition rejected the fast path, and the
+    // plan phase probed once per segment.
+    assert_rejection(&plan, Some(("fast_path_rejected_block_predicate", PARTS)));
+    assert_eq!(
+        counting.suffix_gets(),
+        SEGMENTS as u64,
+        "the plan phase issues one suffix probe per segment"
+    );
+
+    let snap = accounting.snapshot();
+    assert_eq!(
+        snap.logs_whole_object_opens + snap.logs_ranged_opens,
+        0,
+        "no fast-path open ran, so the fast path's recorder was never reached"
+    );
+    assert_eq!(
+        snap.data_objects_touched, 0,
+        "this crate's fast-path recorder does not fire on the planned route"
+    );
+}
+
+/// What one statement's run reveals about which route it took.
+struct RouteObservation {
+    /// `data_objects_touched`, recorded only by the fast path's site.
+    touched: u64,
+    /// Fast-path opens by either read shape, recorded only by the fast path.
+    fast_opens: u64,
+    /// `fast_path_rejected_*` increments summed over every reason and partition.
+    rejected: usize,
+    /// Suffix probes, which only the plan phase issues on this fixture.
+    suffix_gets: u64,
+}
+
+async fn observe_route(
+    filters: &[datafusion::logical_expr::Expr],
+    parts: usize,
+    pending_erasure: Vec<ravel_proto::commit::v1::ErasureRequest>,
+) -> RouteObservation {
+    let base = Arc::new(MemoryStore::new());
+    let (mut snapshot, _want) = build_fixture(base.as_ref()).await;
+    snapshot.pending_erasure = pending_erasure;
+
+    let counting = ShapeCountingStore::new(base);
+    let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&counting) as Arc<dyn ObjectStoreBackend>;
+    let accounting = QueryAccounting::new();
+    let plan =
+        provider_with_accounting(snapshot, above_threshold_fetcher(store), accounting.clone())
+            .plan_filters(parts, filters)
+            .expect("plan");
+    let _ = collect_plan(Arc::clone(&plan)).await;
+
+    let snap = accounting.snapshot();
+    RouteObservation {
+        touched: snap.data_objects_touched,
+        fast_opens: snap.logs_whole_object_opens + snap.logs_ranged_opens,
+        rejected: REJECTION_METRICS
+            .iter()
+            .map(|name| sum_metric(&plan, name))
+            .sum(),
+        suffix_gets: counting.suffix_gets(),
+    }
+}
+
+/// Route exclusivity: one statement takes the fast path or the planned path,
+/// never both, so the fast path's recorder and 996-3's `plan_segment` recorder
+/// can never both count the same object.
+///
+/// Both routes are observed across the fast-path shape and every conjunct that
+/// defeats it. A statement is on the fast path for ALL of its partitions (zero
+/// rejections, zero plan probes) or on the planned path for all of them (one
+/// rejection per partition, one plan probe per segment) -- the routing decision
+/// reads only the snapshot and the query, so it cannot differ by partition. And
+/// in every case `data_objects_touched` equals the fast-path open count, which
+/// is what makes this crate's recorder provably fast-path-only.
+#[tokio::test]
+async fn one_statement_takes_exactly_one_route() {
+    use datafusion::common::ScalarValue;
+    use datafusion::logical_expr::{Expr, col, lit};
+
+    let global_max = ((SEGMENTS - 1) * 1000 + (RECORDS_PER_SEG - 1)) as i64;
+    let erasure = vec![ravel_proto::commit::v1::ErasureRequest {
+        predicate: vec![ravel_proto::commit::v1::ErasurePredicateMatcher {
+            key: "service.name".to_string(),
+            value: "svc".to_string(),
+        }],
+        ..Default::default()
+    }];
+
+    let cases: Vec<(&str, Vec<Expr>, usize, Vec<_>, bool)> = vec![
+        (
+            "predicate-free full window",
+            Vec::new(),
+            PARTS,
+            Vec::new(),
+            true,
+        ),
+        (
+            "content predicate",
+            vec![ravel_sql::has_word_udf().call(vec![col("body"), lit("s0-r0")])],
+            PARTS,
+            Vec::new(),
+            false,
+        ),
+        (
+            "segment-cutting ts bound",
+            vec![col("ts").lt_eq(lit(ScalarValue::TimestampNanosecond(
+                Some(global_max - 1),
+                None,
+            )))],
+            PARTS,
+            Vec::new(),
+            false,
+        ),
+        ("pending erasure", Vec::new(), PARTS, erasure, false),
+        (
+            "fewer segments than partitions",
+            Vec::new(),
+            SEGMENTS * 2,
+            Vec::new(),
+            false,
+        ),
+    ];
+
+    for (label, filters, parts, pending_erasure, expect_fast) in cases {
+        let obs = observe_route(&filters, parts, pending_erasure).await;
+        if expect_fast {
+            assert_eq!(
+                obs.rejected, 0,
+                "{label}: no partition may reject the fast path"
+            );
+            assert_eq!(
+                obs.suffix_gets, 0,
+                "{label}: the fast path runs no plan phase"
+            );
+            assert_eq!(
+                obs.touched, SEGMENTS as u64,
+                "{label}: one touch per segment, recorded by the fast path's site"
+            );
+        } else {
+            assert_eq!(
+                obs.rejected, parts,
+                "{label}: every partition must reject the fast path"
+            );
+            assert_eq!(
+                obs.suffix_gets, SEGMENTS as u64,
+                "{label}: the plan phase probes once per segment"
+            );
+            assert_eq!(
+                obs.touched, 0,
+                "{label}: the planned route is 996-3's `plan_segment` recorder's, \
+                 not this site's"
+            );
+        }
+        assert_eq!(
+            obs.touched, obs.fast_opens,
+            "{label}: touches are recorded exactly where fast-path opens are, so a \
+             statement cannot be counted by both routes' recorders"
+        );
+    }
 }
