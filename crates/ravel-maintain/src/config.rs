@@ -144,6 +144,12 @@ struct MergeMemoryInner {
     /// Parts closed because the encoded-bytes estimate reached
     /// `max_l1_part_bytes` (the stored-size target fired).
     stored_target_flushes: AtomicU64,
+    /// Exact-encode probes the RLOG merge ran: one per
+    /// [`crate::rlog::PartBuilder::encode_clone`] call, whether or not it closed
+    /// the part. A probe is an O(part) encode, so this is the cost side of the
+    /// stored-size target, and it is zero whenever the payload proxy never
+    /// reaches `max_l1_part_bytes` (the shipped defaults).
+    probes_run: AtomicU64,
     /// Live sum of the encoded/on-object bytes of closed parts still retained in
     /// [`crate::rlog::PartSink::parts`] after PUT. Zero on the bounded RLOG
     /// compaction path, which releases each part's bytes at PUT (ADR-0979
@@ -391,6 +397,7 @@ impl MergeMemoryTracker {
             &self.inner.peak_total,
             &self.inner.memory_target_flushes,
             &self.inner.stored_target_flushes,
+            &self.inner.probes_run,
             &self.inner.retained_parts,
             &self.inner.peak_retained_parts,
             &self.inner.catalog_directory,
@@ -440,6 +447,19 @@ impl MergeMemoryTracker {
     pub fn stored_target_flushes(&self) -> u64 {
         self.inner.stored_target_flushes.load(Ordering::Relaxed)
     }
+
+    /// Record that the RLOG merge ran one exact-encode probe (an O(part)
+    /// encode), whether or not it closed the part.
+    pub fn note_probe_run(&self) {
+        self.inner.probes_run.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many exact-encode probes the run made. Zero when the payload proxy
+    /// never reached `max_l1_part_bytes`, which is the case at the shipped
+    /// defaults; a test asserts that rather than assuming it.
+    pub fn probes_run(&self) -> u64 {
+        self.inner.probes_run.load(Ordering::Relaxed)
+    }
 }
 
 /// Nanoseconds in one hour; an ingest-hour bucket spans exactly this.
@@ -460,8 +480,16 @@ pub const DEFAULT_MAX_COMPACTION_LIFETIME_NS: i64 = NS_PER_HOUR;
 /// unchanged from when one knob did both jobs: on a wide schema the memory
 /// target reaches 256 MiB of decoded record heap long before a part's stored
 /// bytes reach 256 MiB, so the memory target stays binding, the RLOG payload
-/// proxy never reaches 256 MiB, and no probe runs. Lowering it to `8..=16 MiB`
-/// is the follow-up that grows objects (issue #872); see
+/// proxy never reaches 256 MiB, and no probe runs.
+///
+/// Which target binds at these defaults therefore decides object size: it is
+/// [`DEFAULT_L1_PART_MEMORY_TARGET_BYTES`], and objects come out at 256 MiB
+/// divided by the schema's decoded-heap-to-stored ratio, well under this knob.
+/// Lowering this one does not grow objects, it caps them lower: once it drops
+/// below the size the memory target already yields it becomes the binding
+/// target and every part closes at it. Growing objects means raising
+/// `l1_part_memory_target_bytes` (with this knob at or above the object size
+/// wanted), which is the issue #872 follow-up; see
 /// [`CompactorConfig::max_l1_part_bytes`].
 pub const DEFAULT_MAX_L1_PART_BYTES: u64 = 256 * 1024 * 1024;
 /// Default `l1_part_memory_target_bytes`: 256 MiB. This is the **memory split
@@ -729,8 +757,18 @@ pub struct CompactorConfig {
     ///   payload proxy ([`crate::rlog::estimate_stored_record`] per record plus
     ///   one STREAM_DIR entry per distinct stream) only to SCHEDULE an
     ///   exact-encode probe, and closes the part on the probe's real byte count.
-    ///   A part overshoots by at most one probe interval, the same
-    ///   at-most-one-unit discipline the memory split target has.
+    ///   Overshoot is bounded by how the probes are spaced: they sit at least a
+    ///   4 KiB floor apart on the proxy axis (`PROBE_MIN_STEP_BYTES` in
+    ///   `rlog.rs`), and the next one is never aimed past the proxy value where
+    ///   the part would reach this target at the highest encoded-per-proxy rate
+    ///   any interval of it has measured so far (never assumed below 1:1). So a
+    ///   part closes at this target plus at most that floor plus the last
+    ///   record's proxy charge. The rate model inside that cap is an ESTIMATE,
+    ///   not a bound: it only shortens the step, when the proxy is
+    ///   undercharging. The band holds while the records still to come encode no
+    ///   denser per proxy byte than the densest interval already measured; a
+    ///   section the proxy does not model (POSTINGS, SKIP_IDX, PAGE_DIR) growing
+    ///   faster than the payload it does model can carry a part past it.
     ///
     /// Named for the bytes it measures: it governs object geometry (object count
     /// and per-object stored size), which is what the historical
@@ -738,7 +776,12 @@ pub struct CompactorConfig {
     /// does [`Self::l1_part_memory_target_bytes`], which is a split target in
     /// decoded heap. A part closes on whichever of the two is reached first.
     /// Default [`DEFAULT_MAX_L1_PART_BYTES`] (256 MiB), chosen so today's geometry
-    /// is unchanged (issue #872); lower it to grow objects.
+    /// is unchanged (issue #872): at the defaults the binding target is
+    /// [`Self::l1_part_memory_target_bytes`], not this one, so objects come out
+    /// at the memory target divided by the schema's heap-to-stored ratio.
+    /// Lowering this knob therefore does not grow objects, it caps them lower;
+    /// growing objects means raising [`Self::l1_part_memory_target_bytes`] and
+    /// keeping this one at or above the object size wanted.
     pub max_l1_part_bytes: u64,
     /// The **memory split target**: close the in-progress L1 part once its
     /// decoded record-heap estimate reaches this
