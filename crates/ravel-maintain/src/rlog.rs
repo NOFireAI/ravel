@@ -190,6 +190,7 @@ use futures::stream::{StreamExt, TryStreamExt, iter as stream_iter};
 use ravel_commit::keys;
 use ravel_logseg::field_dir::FieldDir;
 use ravel_logseg::footer::{self, SuffixOutcome, kind};
+use ravel_logseg::page_dir::PageDir;
 use ravel_logseg::postings::PostingsSection;
 use ravel_logseg::{
     AttrValue, LogRecord, LogStreamId, RlogConfig, RlogRangeReader, RlogWriter, StreamBlockLoc,
@@ -201,7 +202,7 @@ use ravel_proto::commit::v1::CompactionPart;
 use crate::bucket::Bucket;
 use crate::build::{BuiltPart, put_part};
 use crate::codec::SegmentCodec;
-use crate::config::{CompactorConfig, MergeMemoryTracker};
+use crate::config::{AdmissionMode, CompactorConfig, MergeMemoryTracker};
 use crate::error::{MaintainError, Result};
 use crate::read::InputRecord;
 
@@ -256,6 +257,17 @@ pub struct RlogInputCatalog {
     /// it from here is what lets that gate keep working without the
     /// whole-object GET it used to read the footer from.
     pub record_count: u64,
+    /// Per whole-object block index, the sum of that block's PAGE_DIR
+    /// `uncomp_len` values: the decompressed page-byte total the block expands
+    /// to before per-cell allocation overhead. This is the term the bounded
+    /// merge's pre-decode cursor reservation is sized from (ADR-0979
+    /// decision 4): a cursor's decoded columnar block costs about this times an
+    /// allocation-overhead factor, and it is known from the resident PAGE_DIR
+    /// before any BLOCKS byte is fetched. A candidate block index from
+    /// [`RlogRangeReader::stream_blocks`] indexes straight into it. Never empty
+    /// on a loaded catalog: an input with no PAGE_DIR is refused at load with
+    /// [`MaintainError::MergeCursorInputMissingPageDir`].
+    pub block_uncomp_lens: Vec<u64>,
 }
 
 /// The logs codec: implements the [`SegmentCodec`] seam for `.rlog` objects.
@@ -376,12 +388,27 @@ pub(crate) async fn load_catalog_from_object(
         Vec::new()
     };
 
-    // PAGE_DIR is present exactly on a version-4 input (ADR-0699
-    // decision 2), and locating its blocks' pages is impossible without it.
-    let page_dir_raw = match ftr.section(kind::PAGE_DIR) {
-        Some(_) => Some(fetch_section(store, &object_key, &ftr, kind::PAGE_DIR, &cfg).await?),
-        None => None,
+    // PAGE_DIR is present exactly on a version-4 input (ADR-0699 decision 2),
+    // and the bounded merge cannot admission-price a cursor over an input
+    // without it (its decoded string-page term is unknowable before the fetch,
+    // ADR-0979 decision 4), so refuse it by object key and format version
+    // rather than read it under a guessed cost. PAGE_DIR is mandatory in v4, so
+    // in practice this is a version/corruption gate, not a live path.
+    let Some(_) = ftr.section(kind::PAGE_DIR) else {
+        return Err(MaintainError::MergeCursorInputMissingPageDir {
+            object_key,
+            format_version: OUTPUT_FORMAT_VERSION,
+        });
     };
+    let page_dir_raw = fetch_section(store, &object_key, &ftr, kind::PAGE_DIR, &cfg).await?;
+    // The per-block decompressed page-byte totals the bounded merge reserves a
+    // cursor's decode against (ADR-0979 decision 4). Decoded here, once, from
+    // the PAGE_DIR bytes already fetched: `PageDir::decode` is the same decode
+    // the range reader runs internally, and this keeps only the per-block sum
+    // (one u64 per block) rather than a second copy of the directory. The
+    // reader's own `from_sections_with_page_dir` below re-decodes and fully
+    // validates the same bytes, so a corrupt directory still fails loud there.
+    let block_uncomp_lens = block_uncomp_lens_from_page_dir(&page_dir_raw)?;
     // Input read / catalog load phase (issue #977): the reader below retains a
     // decoded form of these directory sections for the whole merge. Charge the
     // decoded section payload lengths (what `fetch_section` returns after
@@ -391,7 +418,11 @@ pub(crate) async fn load_catalog_from_object(
         let dir_bytes = stream_dir_raw.len() as u64
             + field_dir_raw.len() as u64
             + skip_idx_raw.len() as u64
-            + page_dir_raw.as_ref().map(|d| d.len() as u64).unwrap_or(0);
+            + page_dir_raw.len() as u64
+            // The retained per-block reservation figures are derived from
+            // PAGE_DIR but held past it, so charge them too: one u64 per block.
+            + (block_uncomp_lens.len() as u64)
+                .saturating_mul(std::mem::size_of::<u64>() as u64);
         t.add_catalog_directory_bytes(dir_bytes);
     }
     let record_count = ftr.record_count;
@@ -400,14 +431,41 @@ pub(crate) async fn load_catalog_from_object(
         &stream_dir_raw,
         &field_dir_raw,
         &skip_idx_raw,
-        page_dir_raw.as_deref(),
+        Some(&page_dir_raw),
     )?;
     Ok(RlogInputCatalog {
         object_key,
         reader,
         indexed_fields,
         record_count,
+        block_uncomp_lens,
     })
+}
+
+/// The per-block decompressed page-byte totals a bounded merge reserves cursor
+/// decode against (ADR-0979 decision 4), decoded from one input's PAGE_DIR
+/// section bytes. Entry `b` is the sum of `uncomp_len` over every page whole-
+/// object block `b` contributes to any column chunk of its row group -- the
+/// decompressed columnar payload the block decodes to, which the cursor's
+/// [`StreamBlockRows::heap_estimate`] scales with. Read from resident PAGE_DIR
+/// alone; the decode is the same one the range reader runs internally.
+fn block_uncomp_lens_from_page_dir(page_dir_raw: &[u8]) -> Result<Vec<u64>> {
+    let page_dir = PageDir::decode(page_dir_raw)?;
+    let block_count = page_dir.block_count();
+    let mut out = Vec::with_capacity(block_count as usize);
+    for b in 0..block_count {
+        let index = u32::try_from(b)
+            .map_err(|_| MaintainError::Invariant("page_dir block index range".to_string()))?;
+        let pages = page_dir.block_pages(index).ok_or_else(|| {
+            MaintainError::Invariant("page_dir block absent from its own directory".to_string())
+        })?;
+        let mut sum = 0u64;
+        for p in pages {
+            sum = sum.saturating_add(p.desc.uncomp_len);
+        }
+        out.push(sum);
+    }
+    Ok(out)
 }
 
 /// One catalog per object key, `input_read_concurrency` loads in flight.
@@ -885,6 +943,13 @@ struct StreamCursor<'a> {
     /// the prefetch is one loc ahead, so the cursor's raw-byte residency is
     /// two locs, not the stream.
     prefetched: Option<(StreamBlockLoc, bytes::Bytes)>,
+    /// The pre-decode reservation charged against
+    /// [`CompactorConfig::merge_cursor_budget_bytes`] when this cursor was
+    /// admitted (ADR-0979 decision 4). Held for the cursor's lifetime and
+    /// released back to the stream's running charge when the cursor drains, so
+    /// the charge tracks the concurrent overlap `D`, not the input count. Set by
+    /// the merge after [`Self::open`]; 0 until then.
+    reservation: u64,
 }
 
 impl<'a> StreamCursor<'a> {
@@ -911,6 +976,7 @@ impl<'a> StreamCursor<'a> {
             block: None,
             block_bytes: 0,
             prefetched: None,
+            reservation: 0,
         }))
     }
 
@@ -1109,6 +1175,89 @@ async fn fetch_block(
     Ok(got.data)
 }
 
+/// One input queued for overlap-gated admission (ADR-0979 decision 2): its
+/// canonical `input_index`, the SKIP_IDX ts lower bound its cursor's first
+/// record cannot precede, and the pre-decode reservation admitting it charges
+/// against the merge budget (ADR-0979 decision 4).
+struct PendingCursor {
+    input_index: usize,
+    lower_bound: i64,
+    reservation: u64,
+}
+
+/// Allocation-overhead factor applied to a block's decompressed page bytes to
+/// size the decoded columnar block's reservation ceiling (ADR-0979
+/// decision 4). A cursor's [`StreamBlockRows::heap_estimate`] is the decoded
+/// column buffers plus per-cell allocation headers and `Vec` slack over the raw
+/// decompressed page payload PAGE_DIR's `uncomp_len` measures, so a factor above
+/// one is needed for the reservation to bound the decoded residency. Two is a
+/// documented heuristic ceiling over that payload, consistent with
+/// `heap_estimate` itself being an estimate rather than a measurement. The
+/// reservation is held at this ceiling for the cursor's lifetime rather than
+/// reconciled down to the decoded figure after decode: the ceiling already
+/// covers the cursor's whole lifetime residency, so holding it keeps the budget
+/// conservative (it never under-charges) and the reserve-time check
+/// deterministic.
+const CURSOR_DECODE_OVERHEAD_FACTOR: u64 = 2;
+
+/// The pre-decode reservation one input's cursor over `stream_id` is charged
+/// against the merge budget (ADR-0979 decision 4), or `None` if the input does
+/// not carry the stream. Computed from resident metadata alone, before any
+/// BLOCKS byte is fetched:
+///
+/// - `2 * G`: the two row groups' stored bytes a cursor holds at once (the loc
+///   being decoded from plus the one prefetched behind it), sized as twice the
+///   largest of the stream's locs so a later, larger group cannot exceed it;
+/// - the cursor's location metadata: its owned `Vec<StreamBlockLoc>` and each
+///   loc's block-index list;
+/// - `B_dec`: the MAXIMUM over the stream's candidate blocks of that block's
+///   decompressed page-byte total ([`RlogInputCatalog::block_uncomp_lens`]),
+///   times [`CURSOR_DECODE_OVERHEAD_FACTOR`]. The max, not the first block's
+///   cost, because [`StreamCursor::refill`] decodes later blocks after
+///   releasing earlier ones, so a later, larger block must not exceed the
+///   reservation.
+fn cursor_reservation_bytes(
+    catalog: &RlogInputCatalog,
+    stream_id: &LogStreamId,
+) -> Result<Option<u64>> {
+    let Some(locs) = catalog.reader.stream_blocks(stream_id)? else {
+        return Ok(None);
+    };
+    if locs.is_empty() {
+        return Ok(None);
+    }
+    // 2*G: twice the largest loc's stored row-group bytes.
+    let max_group = locs.iter().map(|l| l.byte_len()).max().unwrap_or(0);
+    let two_g = max_group.saturating_mul(2);
+    // Location metadata: the owned locs vector plus each loc's block-index list.
+    let loc_slot = std::mem::size_of::<StreamBlockLoc>() as u64;
+    let idx_slot = std::mem::size_of::<usize>() as u64;
+    let mut loc_meta = (locs.len() as u64).saturating_mul(loc_slot);
+    for l in &locs {
+        loc_meta =
+            loc_meta.saturating_add((l.block_indices().len() as u64).saturating_mul(idx_slot));
+    }
+    // B_dec: the max decompressed page bytes over the stream's candidate blocks.
+    let mut max_b_dec = 0u64;
+    for l in &locs {
+        for &block in l.block_indices() {
+            let uncomp = catalog
+                .block_uncomp_lens
+                .get(block)
+                .copied()
+                .ok_or_else(|| {
+                    MaintainError::Invariant(
+                        "stream candidate block index past the input's PAGE_DIR block count"
+                            .to_string(),
+                    )
+                })?;
+            max_b_dec = max_b_dec.max(uncomp);
+        }
+    }
+    let b_dec = max_b_dec.saturating_mul(CURSOR_DECODE_OVERHEAD_FACTOR);
+    Ok(Some(two_g.saturating_add(loc_meta).saturating_add(b_dec)))
+}
+
 /// K-way merge one stream from every input carrying it into `part`, in
 /// ts-ascending order with ties broken by canonical input order. This is
 /// byte-for-byte the ordering the old "concatenate every input's decoded
@@ -1126,10 +1275,39 @@ async fn fetch_block(
 /// rejects is released here, so the ADR-0064 erasure rewrite's peak memory is
 /// bounded by its survivors' part, not by everything it read (issue #725).
 ///
-/// The cursors are opened concurrently (`input_read_concurrency` at a time):
-/// each open costs one ranged GET for the stream's first block, so a stream
-/// carried by hundreds of inputs would otherwise serialize hundreds of round
-/// trips before the first record merges.
+/// # Overlap-gated cursor admission (ADR-0979 decision 2)
+///
+/// Cursors are not all opened up front. Each input carrying the stream is
+/// queued with its SKIP_IDX ts lower bound (`stream_ts_bounds`, a sound lower
+/// bound on the first timestamp that input's cursor can yield). The merge
+/// maintains the invariant: before emitting a record with key `(ts,
+/// input_index)`, every queued cursor whose lower bound is `<= ts` is opened.
+/// Because a queued cursor's true first timestamp is `>= its lower bound`, an
+/// unopened cursor left behind (lower bound `> ts`) can hold no record that
+/// precedes the candidate, and equality forces admission so exact-`ts` ties
+/// still resolve by `input_index` exactly as an all-open merge would. The
+/// emitted sequence -- and therefore every part boundary and every part byte --
+/// is identical to opening every cursor at once; only WHEN a cursor opens
+/// changes. The number of simultaneously open cursors becomes `D`, the max
+/// concurrent ts-overlap of the stream's input slices, instead of `n`, the
+/// input count. Admitted cursors open `input_read_concurrency` at a time in
+/// canonical order (so a stream carried by hundreds of inputs does not
+/// serialize hundreds of round trips), and a drained cursor releases its
+/// residency immediately. [`AdmissionMode::EagerAll`] opens every cursor up
+/// front instead, the pre-decision-2 behaviour, retained so the differential
+/// test can assert the two produce byte-identical parts.
+///
+/// # Fail-closed cursor budget (ADR-0979 decision 4)
+///
+/// Admitting a cursor first reserves its ceiling cost
+/// ([`cursor_reservation_bytes`]) against
+/// [`CompactorConfig::merge_cursor_budget_bytes`]. The reservation is charged
+/// BEFORE the cursor fetches or decodes anything, so the budget is enforced at
+/// reserve time and the merge fails closed rather than after allocating: if
+/// admitting a cursor that merge order requires would exceed the budget, the
+/// run aborts with [`MaintainError::MergeCursorBudgetExceeded`] before
+/// publishing. A drained cursor releases its reservation, so the charge tracks
+/// `D`, not `n`.
 async fn merge_stream_into_parts(
     store: &dyn ObjectStoreBackend,
     catalogs: &[RlogInputCatalog],
@@ -1140,32 +1318,138 @@ async fn merge_stream_into_parts(
     counts: &mut RecordCounts,
 ) -> Result<()> {
     let concurrency = sink.config.input_read_concurrency.max(1);
+    let budget = sink.config.merge_cursor_budget_bytes;
+    let mode = sink.config.merge_admission;
+
+    // The admission queue: one entry per input carrying the stream, ordered by
+    // (lower_bound, input_index) so opens follow the frontier and ties keep
+    // canonical order.
+    let mut pending: Vec<PendingCursor> = Vec::new();
+    for (idx, catalog) in catalogs.iter().enumerate() {
+        let Some((lower_bound, _upper)) = catalog.reader.stream_ts_bounds(stream_id) else {
+            continue;
+        };
+        let Some(reservation) = cursor_reservation_bytes(catalog, stream_id)? else {
+            continue;
+        };
+        pending.push(PendingCursor {
+            input_index: idx,
+            lower_bound,
+            reservation,
+        });
+    }
+    pending.sort_by_key(|a| (a.lower_bound, a.input_index));
+
     // Box each open-and-first-refill with an explicit `+ Send` bound before
-    // `buffered`, the workaround `crate::build::fetch_batch_pages` documents
-    // for futures that borrow the `&dyn ObjectStoreBackend`. `buffered` keeps
+    // `buffered`, the workaround `crate::build::fetch_batch_pages` documents for
+    // futures that borrow the `&dyn ObjectStoreBackend`. `buffered` keeps
     // canonical input order, which is the k-way merge's tie-break.
     type CursorFuture<'f, 'a> =
         Pin<Box<dyn Future<Output = Result<Option<StreamCursor<'a>>>> + Send + 'f>>;
-    let opens: Vec<CursorFuture<'_, '_>> = catalogs
-        .iter()
-        .enumerate()
-        .map(|(idx, catalog)| {
-            Box::pin(open_cursor(store, catalog, idx, stream_id, tracker)) as CursorFuture<'_, '_>
-        })
-        .collect();
-    let opened: Vec<Option<StreamCursor>> = stream_iter(opens)
-        .buffered(concurrency)
-        .try_collect()
-        .await?;
-    let mut cursors: Vec<StreamCursor> = opened.into_iter().flatten().collect();
+
+    let mut open: Vec<StreamCursor> = Vec::new();
+    let mut charged: u64 = 0;
+    let mut pos = 0usize;
+
     loop {
+        // Admission (ADR-0979 decision 2): open every queued cursor the
+        // invariant requires before the next emit. The frontier is the min
+        // peek_ts over open cursors; under `Overlap` a queued cursor is admitted
+        // when its lower bound is at or below the frontier (with a single
+        // bootstrap open when nothing is open yet so a frontier exists), under
+        // `EagerAll` every remaining cursor is admitted regardless.
+        loop {
+            let frontier = open.iter().filter_map(|c| c.peek_ts()).min();
+            // The prefix of `pending` (sorted by lower bound) to admit this
+            // round.
+            let mut batch_len = 0usize;
+            while let Some(p) = pending.get(pos + batch_len) {
+                let admit = match mode {
+                    AdmissionMode::EagerAll => true,
+                    AdmissionMode::Overlap => match frontier {
+                        // Nothing open yet: bootstrap with the single
+                        // lowest-lower-bound cursor, then re-derive the frontier
+                        // from it on the next round.
+                        None => batch_len == 0,
+                        Some(ts) => p.lower_bound <= ts,
+                    },
+                };
+                if !admit {
+                    break;
+                }
+                batch_len += 1;
+                if matches!(mode, AdmissionMode::Overlap) && frontier.is_none() {
+                    break;
+                }
+            }
+            if batch_len == 0 {
+                break;
+            }
+            // Reserve the whole batch at reserve time (ADR-0979 decision 4):
+            // check the budget before any cursor fetches or decodes, so the
+            // merge fails closed rather than after allocating.
+            for k in 0..batch_len {
+                let reservation = pending[pos + k].reservation;
+                let required = charged.saturating_add(reservation);
+                if required > budget {
+                    return Err(MaintainError::MergeCursorBudgetExceeded {
+                        stream_id: stream_id.to_hex(),
+                        open_cursors: open.len(),
+                        charged_bytes: charged,
+                        budget_bytes: budget,
+                        required_bytes: required,
+                        inputs_carrying_stream: pending.len(),
+                    });
+                }
+                charged = required;
+            }
+            let opens: Vec<CursorFuture<'_, '_>> = (0..batch_len)
+                .map(|k| {
+                    let p = &pending[pos + k];
+                    Box::pin(open_cursor(
+                        store,
+                        &catalogs[p.input_index],
+                        p.input_index,
+                        stream_id,
+                        tracker,
+                    )) as CursorFuture<'_, '_>
+                })
+                .collect();
+            let opened: Vec<Option<StreamCursor>> = stream_iter(opens)
+                .buffered(concurrency)
+                .try_collect()
+                .await?;
+            for (k, cursor_opt) in opened.into_iter().enumerate() {
+                let reservation = pending[pos + k].reservation;
+                match cursor_opt {
+                    Some(mut cursor) => {
+                        cursor.reservation = reservation;
+                        open.push(cursor);
+                    }
+                    // Carried the stream in STREAM_DIR but materialized no row
+                    // (its candidate blocks were all a neighbour's boundary
+                    // blocks): it holds nothing, so release its reservation.
+                    None => charged = charged.saturating_sub(reservation),
+                }
+            }
+            pos += batch_len;
+            if let Some(t) = tracker {
+                t.note_open_cursors(open.len() as u64);
+            }
+        }
+
         // Pick the cursor whose next row has the minimum (ts_ns, input_index).
         // input_index is unique per cursor, so the key is a total order and the
-        // tie-break is deterministic. The comparison reads each cursor's
-        // decoded ts column and materializes nothing (ADR-0979 decision 1);
-        // only the winner rebuilds a record.
+        // tie-break is deterministic. peek_ts is only valid immediately after a
+        // refill: every open cursor was refilled when it was admitted or after
+        // it last emitted, so the column read here is live. Skipping a refill
+        // would leave a drained block reading as exhausted and silently drop the
+        // records behind it; the record-count conservation gate downstream is
+        // what fails closed if that protocol is ever broken. The comparison
+        // reads each cursor's decoded ts column and materializes nothing
+        // (ADR-0979 decision 1); only the winner rebuilds a record.
         let mut best: Option<(usize, i64, usize)> = None;
-        for (i, cursor) in cursors.iter().enumerate() {
+        for (i, cursor) in open.iter().enumerate() {
             if let Some(ts) = cursor.peek_ts() {
                 let key = (ts, cursor.input_index);
                 match best {
@@ -1174,17 +1458,27 @@ async fn merge_stream_into_parts(
                 }
             }
         }
+        // No open cursor has a record: since admission above opens every queued
+        // cursor the invariant needs (and bootstraps when nothing is open),
+        // reaching here with an empty best means the queue is drained too.
         let Some((bi, _, _)) = best else {
             break;
         };
-        if let Some(rec) = cursors[bi].next_record()? {
+        if let Some(rec) = open[bi].next_record()? {
             counts.add_input()?;
             if keep(&rec)? {
                 counts.add_output()?;
                 sink.push(rec).await?;
             }
         }
-        cursors[bi].refill(store, tracker).await?;
+        open[bi].refill(store, tracker).await?;
+        // A drained cursor releases its residency (refill already dropped its
+        // last block) and its reservation, so both the open-cursor high-water
+        // and the budget charge track the concurrent overlap `D`, not `n`.
+        if open[bi].peek_ts().is_none() {
+            let cursor = open.swap_remove(bi);
+            charged = charged.saturating_sub(cursor.reservation);
+        }
     }
     Ok(())
 }
@@ -1664,7 +1958,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        Bucket, CompactionOutcome, CompactorConfig, FixedClock, MergeMemoryTracker, compact_bucket,
+        AdmissionMode, Bucket, CompactionOutcome, CompactorConfig, FixedClock, MergeMemoryTracker,
+        compact_bucket,
     };
 
     /// FIELD_DIR entry-count cap for the test-only `field_dir_len` decode (a
@@ -4101,10 +4396,13 @@ mod tests {
     /// The fixture pins the geometry so the expected value is arithmetic, not
     /// an observation: three inputs, one stream, one row group of one block
     /// each, and records identical in every column but `ts_ns`, so all three
-    /// blocks cost the same and all three cursors are open at once (the merge
-    /// opens every input's cursor before it emits a record, and releases a
-    /// block only when it is drained). The peak is therefore `3 x
-    /// heap_estimate` and nothing else.
+    /// blocks cost the same. Their timestamps INTERLEAVE across the three inputs
+    /// (input `j` carries `i * 3 + j`), so the three slices fully overlap in ts
+    /// and overlap-gated admission (ADR-0979 decision 2) opens all three cursors
+    /// at once -- the case where `D = n`, worst for admission and the one that
+    /// keeps this a `3 x heap_estimate` peak. A block is released only when it is
+    /// drained, so at the peak all three are resident and the peak is therefore
+    /// `3 x heap_estimate` and nothing else.
     ///
     /// Demonstrated red by adding the old charge back beside the new one in
     /// `StreamCursor::decode_next_block` -- `let decoded_bytes =
@@ -4126,7 +4424,10 @@ mod tests {
                 .map(|i| {
                     record(
                         0,
-                        (j as i64) * 1_000 + i,
+                        // Interleave ts across the three inputs so their slices
+                        // overlap and overlap-gated admission opens all three
+                        // cursors at once (ADR-0979 decision 2).
+                        i * (INPUTS as i64) + (j as i64),
                         "row",
                         vec![
                             ("svc".into(), AttrValue::Str("v".into())),
@@ -4198,6 +4499,342 @@ mod tests {
             "a cursor must never be charged under both the columnar and the \
              row-form term in one phase snapshot"
         );
+    }
+
+    // --- ADR-0979 D2/D4 admission and budget ---------------------------------
+
+    /// Compact `inputs` on a fresh store under `config` and return each L1
+    /// part's `content_hash`, in `part_index` order.
+    async fn compact_part_hashes(
+        inputs: &[(Uuid, u64, Vec<LogRecord>)],
+        config: &CompactorConfig,
+    ) -> Vec<Vec<u8>> {
+        let store = MemoryStore::new();
+        for (writer_id, seq, recs) in inputs {
+            seed(&store, *writer_id, *seq, recs).await;
+        }
+        let clock = FixedClock::new(sealed_now_ns());
+        compact_bucket(&store, &clock, config, &bucket())
+            .await
+            .expect("compact");
+        let (rec, _parts) = read_output(&store).await;
+        rec.parts.iter().map(|p| p.content_hash.clone()).collect()
+    }
+
+    /// A three-input fixture whose stream bounds are disjoint on one stream and
+    /// overlapping on another: stream 0 is carried by inputs A and B with
+    /// interleaved (overlapping) timestamps, and stream 1 is carried by A and C
+    /// with time-disjoint slices (A's `[1000, 1014]` ahead-of-C's... C's
+    /// `[5000, 5007]`). So both admission regimes -- concurrent overlap and
+    /// admit-only-after-drain -- are exercised in one merge.
+    fn admission_mixed_fixture() -> Vec<(Uuid, u64, Vec<LogRecord>)> {
+        let a: Vec<LogRecord> = (0..8i64)
+            .map(|i| record(0, i * 2, "a0", vec![("k".into(), AttrValue::I64(i))]))
+            .chain((0..8i64).map(|i| record(1, 1000 + i * 2, "a1", Vec::new())))
+            .collect();
+        let b: Vec<LogRecord> = (0..8i64)
+            .map(|i| record(0, i * 2 + 1, "b0", vec![("k".into(), AttrValue::I64(i))]))
+            .collect();
+        let c: Vec<LogRecord> = (0..8i64)
+            .map(|i| record(1, 5000 + i, "c1", Vec::new()))
+            .collect();
+        vec![
+            (Uuid::from_u128(1), 1, a),
+            (Uuid::from_u128(2), 2, b),
+            (Uuid::from_u128(3), 3, c),
+        ]
+    }
+
+    /// ADR-0979 decision 2's named test: overlap-gated admission
+    /// ([`AdmissionMode::Overlap`]) and eager all-open admission
+    /// ([`AdmissionMode::EagerAll`]) produce byte-identical parts. D2 changes
+    /// only WHEN a cursor opens, never which record is the `(ts, input_index)`
+    /// minimum, so every part boundary and every part `content_hash` must match.
+    ///
+    /// Demonstrated red by making the overlap predicate drop the second input:
+    /// in the admission loop, replacing `AdmissionMode::Overlap => match frontier
+    /// { ... Some(ts) => p.lower_bound <= ts }` so `p.input_index != 1` is
+    /// additionally required to admit -- input 1 (B) is then never opened, B's
+    /// stream-0 records vanish from the overlap run, and the two hash vectors
+    /// diverge (or the record-count gate aborts the run).
+    #[tokio::test]
+    async fn admission_on_and_off_produce_identical_part_hashes() {
+        let inputs = admission_mixed_fixture();
+        // A small memory split target so the bucket splits into several parts
+        // and the equality pin covers part boundaries and `part_index`, not one
+        // object; identical for both modes.
+        let overlap = CompactorConfig {
+            merge_admission: AdmissionMode::Overlap,
+            l1_part_memory_target_bytes: 1024,
+            ..CompactorConfig::default()
+        };
+        let eager = CompactorConfig {
+            merge_admission: AdmissionMode::EagerAll,
+            l1_part_memory_target_bytes: 1024,
+            ..CompactorConfig::default()
+        };
+        let on = compact_part_hashes(&inputs, &overlap).await;
+        let off = compact_part_hashes(&inputs, &eager).await;
+        assert!(on.len() > 1, "the fixture must split into several parts");
+        assert_eq!(
+            on, off,
+            "overlap-gated admission must produce byte-identical parts to eager all-open admission"
+        );
+    }
+
+    /// Compact `inputs` (all on stream 0) with a tracker installed and return the
+    /// recorded `max_open_cursors_per_stream`.
+    async fn max_open_cursors_for(inputs: &[(Uuid, u64, Vec<LogRecord>)]) -> u64 {
+        let tracker = MergeMemoryTracker::new();
+        let config = CompactorConfig {
+            merge_memory_tracker: Some(tracker.clone()),
+            ..CompactorConfig::default()
+        };
+        let store = MemoryStore::new();
+        for (writer_id, seq, recs) in inputs {
+            seed(&store, *writer_id, *seq, recs).await;
+        }
+        let clock = FixedClock::new(sealed_now_ns());
+        compact_bucket(&store, &clock, &config, &bucket())
+            .await
+            .expect("compact");
+        tracker.max_open_cursors_per_stream()
+    }
+
+    /// ADR-0979 decision 2's acceptance phrasing: with all three inputs'
+    /// stream-0 slices overlapping, `max_open_cursors_per_stream` is exactly 3;
+    /// making one input's slice time-disjoint (far ahead of the other two) drops
+    /// it by exactly 1, to 2 -- the assertion that admission, not luck, bounds
+    /// the count. The disjoint slice's cursor is admitted only after the other
+    /// two drain, so it is never open alongside them.
+    ///
+    /// Demonstrated red by making admission ignore the frontier (admit every
+    /// queued cursor immediately, as `AdmissionMode::EagerAll` does): the
+    /// disjoint slice then opens up front alongside the other two and both
+    /// fixtures report 3, so the `2` assertion fails.
+    #[tokio::test]
+    async fn admission_bounds_open_cursors_to_the_overlap_degree() {
+        // input j carries ts i*3 + j, so all three stream-0 slices overlap.
+        let overlap_all: Vec<(Uuid, u64, Vec<LogRecord>)> = (0..3u128)
+            .map(|j| {
+                let recs = (0..10i64)
+                    .map(|i| record(0, i * 3 + j as i64, "r", Vec::new()))
+                    .collect();
+                (Uuid::from_u128(j + 1), (j + 1) as u64, recs)
+            })
+            .collect();
+        // Two inputs interleave in [0, 19]; the third sits far ahead in
+        // [10_000, 10_009], time-disjoint from them.
+        let one_disjoint: Vec<(Uuid, u64, Vec<LogRecord>)> = vec![
+            (
+                Uuid::from_u128(1),
+                1,
+                (0..10i64)
+                    .map(|i| record(0, i * 2, "r", Vec::new()))
+                    .collect(),
+            ),
+            (
+                Uuid::from_u128(2),
+                2,
+                (0..10i64)
+                    .map(|i| record(0, i * 2 + 1, "r", Vec::new()))
+                    .collect(),
+            ),
+            (
+                Uuid::from_u128(3),
+                3,
+                (0..10i64)
+                    .map(|i| record(0, 10_000 + i, "r", Vec::new()))
+                    .collect(),
+            ),
+        ];
+        assert_eq!(
+            max_open_cursors_for(&overlap_all).await,
+            3,
+            "three overlapping slices need all three cursors open at once"
+        );
+        assert_eq!(
+            max_open_cursors_for(&one_disjoint).await,
+            2,
+            "the disjoint third slice admits only after the first two drain, so at most two are open"
+        );
+    }
+
+    /// The pre-decode reservation the merge charges one input's cursor over
+    /// stream 0, loaded and computed exactly as the merge does.
+    async fn stream0_reservation(
+        store: &MemoryStore,
+        writer_id: Uuid,
+        seq: u64,
+        bytes: &Bytes,
+    ) -> u64 {
+        let key = seeded_data_key(writer_id, seq, bytes);
+        let catalog = load_catalog_from_object(store, &CompactorConfig::default(), key, true)
+            .await
+            .expect("catalog");
+        let (stream_id, _) = stream_ident(0);
+        cursor_reservation_bytes(&catalog, &stream_id)
+            .expect("reservation")
+            .expect("input carries stream 0")
+    }
+
+    /// ADR-0979 decision 4: a budget one byte below the minimum admissible
+    /// cursor set fails with [`MaintainError::MergeCursorBudgetExceeded`] naming
+    /// the exact figures, and one byte above succeeds with part hashes identical
+    /// to an unbudgeted run.
+    ///
+    /// The fixture is two inputs carrying stream 0 with interleaved (fully
+    /// overlapping) timestamps, so both cursors must be open at the merge's
+    /// peak: the minimum admissible set is both, and its reservation is
+    /// `r_a + r_b`, computed here from the same [`cursor_reservation_bytes`] the
+    /// merge uses so the threshold is exact, not observed.
+    ///
+    /// Demonstrated red by raising the budget the failing run is given from
+    /// `min_admissible - 1` to `min_admissible`: the second cursor then fits and
+    /// no error is returned, so `expect_err` panics.
+    #[tokio::test]
+    async fn cursor_budget_fails_closed_one_byte_below_the_minimum_admissible_set() {
+        let a: Vec<LogRecord> = (0..10i64)
+            .map(|i| record(0, i * 2, "a", Vec::new()))
+            .collect();
+        let b: Vec<LogRecord> = (0..10i64)
+            .map(|i| record(0, i * 2 + 1, "b", Vec::new()))
+            .collect();
+
+        // Reservations, from a throwaway store seeded identically.
+        let probe = MemoryStore::new();
+        let a_bytes = seed(&probe, Uuid::from_u128(1), 1, &a).await;
+        let b_bytes = seed(&probe, Uuid::from_u128(2), 2, &b).await;
+        let r_a = stream0_reservation(&probe, Uuid::from_u128(1), 1, &a_bytes).await;
+        let r_b = stream0_reservation(&probe, Uuid::from_u128(2), 2, &b_bytes).await;
+        let min_admissible = r_a + r_b;
+
+        let inputs = vec![(Uuid::from_u128(1), 1, a), (Uuid::from_u128(2), 2, b)];
+        let (stream_id, _) = stream_ident(0);
+
+        // One byte below the minimum admissible set: the second cursor's
+        // admission overruns and the run fails closed, naming the exact figures.
+        let under = CompactorConfig {
+            merge_cursor_budget_bytes: min_admissible - 1,
+            ..CompactorConfig::default()
+        };
+        let store = MemoryStore::new();
+        for (writer_id, seq, recs) in &inputs {
+            seed(&store, *writer_id, *seq, recs).await;
+        }
+        let clock = FixedClock::new(sealed_now_ns());
+        let err = compact_bucket(&store, &clock, &under, &bucket())
+            .await
+            .expect_err("a budget below the minimum admissible set must fail closed");
+        match err {
+            MaintainError::MergeCursorBudgetExceeded {
+                stream_id: got_stream,
+                open_cursors,
+                charged_bytes,
+                budget_bytes,
+                required_bytes,
+                inputs_carrying_stream,
+            } => {
+                assert_eq!(got_stream, stream_id.to_hex());
+                assert_eq!(
+                    open_cursors, 1,
+                    "the first cursor was open when the second was refused"
+                );
+                assert_eq!(
+                    charged_bytes, r_a,
+                    "only the first cursor's reservation was charged"
+                );
+                assert_eq!(budget_bytes, min_admissible - 1);
+                assert_eq!(
+                    required_bytes, min_admissible,
+                    "charged + the refused cursor's reservation"
+                );
+                assert_eq!(inputs_carrying_stream, 2);
+            }
+            other => panic!("expected MergeCursorBudgetExceeded, got {other:?}"),
+        }
+
+        // One byte above: the whole minimum admissible set fits, the merge
+        // completes, and the parts are byte-identical to an unbudgeted run.
+        let exact = CompactorConfig {
+            merge_cursor_budget_bytes: min_admissible,
+            ..CompactorConfig::default()
+        };
+        let with_budget = compact_part_hashes(&inputs, &exact).await;
+        let unbudgeted = compact_part_hashes(&inputs, &CompactorConfig::default()).await;
+        assert!(!with_budget.is_empty());
+        assert_eq!(
+            with_budget, unbudgeted,
+            "a budget at exactly the minimum admissible set must not change the output"
+        );
+    }
+
+    /// Rewrite `obj` with its PAGE_DIR descriptor dropped from the footer,
+    /// leaving an object that still OPENS (PAGE_DIR is not one of the
+    /// footer-mandatory section kinds) but that the bounded merge cannot
+    /// admission-price. The section's bytes stay in the body; only its footer
+    /// descriptor is removed, and the footer crc is recomputed by
+    /// [`footer::write_footer_and_trailer`].
+    fn strip_page_dir_descriptor(obj: &[u8]) -> Vec<u8> {
+        // footer_len(4) + footer_crc(4) + version(2) + signal(1) + reserved(1)
+        // + magic(4).
+        const TRAILER_LEN: usize = 16;
+        let total = obj.len();
+        let footer_len = u32::from_le_bytes([
+            obj[total - TRAILER_LEN],
+            obj[total - TRAILER_LEN + 1],
+            obj[total - TRAILER_LEN + 2],
+            obj[total - TRAILER_LEN + 3],
+        ]) as usize;
+        let footer_start = total - TRAILER_LEN - footer_len;
+        let mut ftr = footer::open(obj).expect("open seeded object");
+        assert!(
+            ftr.section(kind::PAGE_DIR).is_some(),
+            "the seeded v4 object must carry PAGE_DIR to strip it"
+        );
+        ftr.sections.retain(|s| s.kind != kind::PAGE_DIR);
+        let mut out = obj[..footer_start].to_vec();
+        footer::write_footer_and_trailer(&mut out, &ftr);
+        out
+    }
+
+    /// ADR-0979 decision 4: an input carrying no PAGE_DIR cannot be
+    /// admission-priced (its decoded page term is unknowable before the fetch),
+    /// so the bounded merge refuses it at catalog load with a typed error naming
+    /// the object and its format version, rather than reading it under a guessed
+    /// cost. PAGE_DIR is mandatory in v4, so this is a version/corruption gate.
+    #[tokio::test]
+    async fn page_dir_less_input_is_refused_with_typed_error() {
+        let store = MemoryStore::new();
+        let recs = vec![record(0, 1, "x", Vec::new())];
+        let bytes = seed(&store, Uuid::from_u128(1), 1, &recs).await;
+        let stripped = strip_page_dir_descriptor(&bytes);
+        // Re-open to confirm the stripped object still parses (the refusal is a
+        // deliberate policy, not a decode failure).
+        let reopened = footer::open(&stripped).expect("stripped object still opens");
+        assert!(
+            reopened.section(kind::PAGE_DIR).is_none(),
+            "the stripped object must carry no PAGE_DIR"
+        );
+
+        let key = "l0/synthetic-no-page-dir".to_string();
+        store
+            .put(&key, Bytes::from(stripped), PutOptions::default())
+            .await
+            .expect("put");
+        let err = load_catalog_from_object(&store, &CompactorConfig::default(), key.clone(), true)
+            .await
+            .expect_err("a PAGE_DIR-less input must be refused");
+        match err {
+            MaintainError::MergeCursorInputMissingPageDir {
+                object_key,
+                format_version,
+            } => {
+                assert_eq!(object_key, key);
+                assert_eq!(format_version, OUTPUT_FORMAT_VERSION);
+            }
+            other => panic!("expected MergeCursorInputMissingPageDir, got {other:?}"),
+        }
     }
 
     // --- keystone differential property test ---------------------------------

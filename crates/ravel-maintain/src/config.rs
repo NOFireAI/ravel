@@ -156,6 +156,15 @@ struct MergeMemoryInner {
     peak_writer: AtomicU64,
     /// High-water of the published compaction record's encoded protobuf payload.
     peak_publish_record: AtomicU64,
+    /// High-water of the number of cursors open at once for one stream
+    /// (ADR-0979 decision 2). The RLOG merge admits a stream's per-input cursors
+    /// only when their SKIP_IDX ts-envelope overlaps the merge frontier and
+    /// releases each as it drains, so this is the max concurrent ts-overlap `D`
+    /// of the stream's input slices, not the number `n` of inputs carrying the
+    /// stream. `fetch_max` across streams keeps the largest per-stream peak, so
+    /// the field answers "the most cursors any single stream needed open at
+    /// once", the quantity that bounds the merge's cursor fan-out.
+    max_open_cursors: AtomicU64,
 }
 
 /// A compaction merge's peak resident memory split by the phase that caused it
@@ -292,6 +301,25 @@ impl MergeMemoryTracker {
             .fetch_max(bytes, Ordering::Relaxed);
     }
 
+    /// Note that `open` cursors are simultaneously open for the stream being
+    /// merged (ADR-0979 decision 2). Called by the RLOG merge each time a
+    /// cursor is admitted, so the recorded high-water is the largest number of
+    /// cursors any single stream held open at once. `fetch_max`, so a later
+    /// stream that opened fewer never lowers it.
+    pub fn note_open_cursors(&self, open: u64) {
+        self.inner
+            .max_open_cursors
+            .fetch_max(open, Ordering::Relaxed);
+    }
+
+    /// High-water of the number of cursors open at once for any single stream
+    /// (ADR-0979 decision 2): the max concurrent ts-overlap `D` of a stream's
+    /// input slices, the quantity overlap-gated admission bounds. Read like
+    /// [`Self::peak_cursor_decoded_bytes`], after the merge.
+    pub fn max_open_cursors_per_stream(&self) -> u64 {
+        self.inner.max_open_cursors.load(Ordering::Relaxed)
+    }
+
     /// High-water of the merge's decode-side buffers (`fetched + decoded`).
     /// Bounded by `O(input_count * block_size)`, independent of stream size.
     pub fn peak_transient_bytes(&self) -> u64 {
@@ -363,6 +391,7 @@ impl MergeMemoryTracker {
             &self.inner.peak_catalog_directory,
             &self.inner.peak_writer,
             &self.inner.peak_publish_record,
+            &self.inner.max_open_cursors,
         ] {
             field.store(0, Ordering::Relaxed);
         }
@@ -446,6 +475,35 @@ pub const DEFAULT_MIN_COMPACTION_INPUTS: usize = 2;
 pub const DEFAULT_FOOTER_PROBE_BYTES: u64 = 64 * 1024;
 /// Default `input_read_concurrency`: 8 input reads in flight at once.
 pub const DEFAULT_INPUT_READ_CONCURRENCY: usize = 8;
+/// Default `merge_cursor_budget_bytes`: 20 GiB (ADR-0979 decision 4). Sized so
+/// the reference box completes the ClickBench worst case: the top stream's ~617
+/// inputs at a per-cursor ceiling of ~25 MB reserve ~15.4 GiB, under 20 GiB,
+/// leaving headroom on a 30 GB box for the writer buffer, catalogs, and process
+/// overhead. See [`CompactorConfig::merge_cursor_budget_bytes`] for what the
+/// budget bounds and what happens at the limit.
+pub const DEFAULT_MERGE_CURSOR_BUDGET_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+
+/// How the RLOG merge admits a stream's per-input cursors (ADR-0979 decision 2).
+/// A knob only because the differential test asserts the two modes produce
+/// byte-identical parts; production always uses [`Self::Overlap`], the bounded
+/// path, and no code changes output bytes between the two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AdmissionMode {
+    /// Overlap-gated admission: a stream's cursor on an input opens only once
+    /// the merge frontier reaches that input's SKIP_IDX ts lower bound, so the
+    /// number of simultaneously open cursors is the max concurrent ts-overlap
+    /// `D` of the stream's input slices rather than the input count `n`. This is
+    /// the bound this ADR exists to establish; the default.
+    #[default]
+    Overlap,
+    /// Eagerly open every input's cursor for the stream up front, the pre-D2
+    /// behaviour. Retained so the differential test can assert the emitted
+    /// record sequence, every part boundary, and every part `content_hash` are
+    /// identical to the overlap-gated path. The [`CompactorConfig::merge_cursor_budget_bytes`]
+    /// reservation still applies (every cursor is charged), so this is not an
+    /// escape from the budget, only from the deferral.
+    EagerAll,
+}
 
 /// Default `grace`: 24 hours (docs/consistency-model.md "Deletion and GC").
 /// A shared floor for the orphan and unreferenced-part age gates.
@@ -673,6 +731,36 @@ pub struct CompactorConfig {
     /// order -- so raising it can change timing but never content. Default
     /// [`DEFAULT_INPUT_READ_CONCURRENCY`] (8).
     pub input_read_concurrency: usize,
+    /// The RLOG merge's per-stream cursor-memory budget (ADR-0979 decision 4).
+    /// Unlike the two part-split targets and `input_read_concurrency`, this one
+    /// DOES bound resident memory: it caps the sum, over the cursors open at
+    /// once for one stream, of each cursor's pre-decode reservation ceiling (two
+    /// row groups' stored bytes, the cursor's location metadata, and the
+    /// decoded columnar block sized from the block's PAGE_DIR `uncomp_len`
+    /// times an allocation-overhead factor).
+    ///
+    /// The reservation is charged BEFORE a cursor fetches or decodes anything,
+    /// so the budget is enforced at reserve time and the merge fails closed
+    /// rather than after allocating: if opening a cursor that merge order
+    /// requires would push the charge over the budget, the run aborts with a
+    /// typed [`crate::error::MaintainError::MergeCursorBudgetExceeded`] naming
+    /// the stream, the reservation, and the budget, before publishing anything.
+    /// Nothing is published, the L0 inputs stay live and queryable, and any
+    /// parts already PUT age out under the unreferenced-part sweep exactly like
+    /// an abandoned run's. This converts an out-of-memory kill at an arbitrary
+    /// point into a refusal naming the stream and the number to raise. Because
+    /// overlap-gated admission ([`AdmissionMode::Overlap`]) releases each
+    /// cursor's reservation as it drains, the charge tracks the concurrent
+    /// overlap `D`, not the input count. Default
+    /// [`DEFAULT_MERGE_CURSOR_BUDGET_BYTES`] (20 GiB); a budget so small that
+    /// even one stream's minimum admissible cursor set does not fit refuses that
+    /// stream's merge.
+    pub merge_cursor_budget_bytes: u64,
+    /// How the RLOG merge admits a stream's cursors (ADR-0979 decision 2).
+    /// Default [`AdmissionMode::Overlap`] (the bounded path). Only the
+    /// differential part-hash test sets [`AdmissionMode::EagerAll`]; output
+    /// bytes are identical either way.
+    pub merge_admission: AdmissionMode,
     /// This compactor process's uuid. Informational only: it is recorded in
     /// each part's footer `writer_id` and never enters dedup priority.
     /// Default is the nil uuid; the service sets a real one.
@@ -779,6 +867,8 @@ impl Default for CompactorConfig {
             min_compaction_inputs: DEFAULT_MIN_COMPACTION_INPUTS,
             footer_probe_bytes: DEFAULT_FOOTER_PROBE_BYTES,
             input_read_concurrency: DEFAULT_INPUT_READ_CONCURRENCY,
+            merge_cursor_budget_bytes: DEFAULT_MERGE_CURSOR_BUDGET_BYTES,
+            merge_admission: AdmissionMode::Overlap,
             compactor_writer_id: Uuid::nil(),
             grace_ns: DEFAULT_GRACE_NS,
             protection_horizon_ns: DEFAULT_PROTECTION_HORIZON_NS,
