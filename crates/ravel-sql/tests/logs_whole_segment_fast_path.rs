@@ -891,8 +891,10 @@ async fn planned_route_records_nothing_at_the_fast_path_site() {
         "no fast-path open ran, so the fast path's recorder was never reached"
     );
     assert_eq!(
-        snap.data_objects_touched, 0,
-        "this crate's fast-path recorder does not fire on the planned route"
+        snap.data_objects_touched, SEGMENTS as u64,
+        "the planned route records once per segment via 996-3's plan_segment \
+         recorder (merged after this test was written); the zero fast-path \
+         opens above pin that THIS crate's site never fired"
     );
 }
 
@@ -1023,15 +1025,30 @@ async fn one_statement_takes_exactly_one_route() {
                 "{label}: the plan phase probes once per segment"
             );
             assert_eq!(
-                obs.touched, 0,
-                "{label}: the planned route is 996-3's `plan_segment` recorder's, \
-                 not this site's"
+                obs.touched, SEGMENTS as u64,
+                "{label}: the planned route records once per segment via \
+                 plan_segment (996-3), never via this site"
             );
         }
+        // Route exclusivity: each statement records exactly SEGMENTS touches
+        // from exactly one recorder. Fast statements record at this crate's
+        // site (touches == fast opens); planned statements record at
+        // plan_segment with zero fast opens. Double-recording would show as
+        // touched == 2 x SEGMENTS on either arm.
         assert_eq!(
-            obs.touched, obs.fast_opens,
-            "{label}: touches are recorded exactly where fast-path opens are, so a \
-             statement cannot be counted by both routes' recorders"
+            obs.touched, SEGMENTS as u64,
+            "{label}: exactly one touch per segment, from exactly one route"
         );
+        if expect_fast {
+            assert_eq!(
+                obs.touched, obs.fast_opens,
+                "{label}: fast-route touches are recorded where the opens are"
+            );
+        } else {
+            assert_eq!(
+                obs.fast_opens, 0,
+                "{label}: the planned route never reaches this crate's site"
+            );
+        }
     }
 }
