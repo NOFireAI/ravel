@@ -131,6 +131,189 @@ are reported separately. With no `--cache-dir`, no `tier=` label appears and
 the exposition is byte-for-byte as before. See
 [guides/caching.md](caching.md) for the full metric list.
 
+## Logs fetch policy and store cost profile (ADR-0996)
+
+The logs read path chooses, per object, whether to fetch the whole object in
+one GET or to fetch only the projected byte ranges. On an intra-region S3
+deployment transfer is free and the bill is requests, so a ranged read spends
+a billed request to save bytes that cost nothing. Three flags size this
+trade-off, all read at startup only like every other read knob above:
+`--logs-fetch-policy`, `--store-cost-profile`, and `--logs-max-fetch-run-bytes`.
+The ADR-0904 byte knob `--logs-request-cost-bytes` stays as the expert escape
+hatch (precedence below).
+
+### The three fetch policies
+
+`--logs-fetch-policy` takes one of three values, spelled exactly as here. Its
+default is `cost-based`.
+
+| Value | Optimizes for | Pick it when |
+|---|---|---|
+| `request-minimal` | Fewest object-store requests. Every object at or under the fetch bound is read whole in one covering GET with no footer probe; a larger object is read as covering sub-range GETs (the bound below). | The backend bills requests and not transfer (intra-region S3), so a saved request is a saved dollar and the bytes it costs are free. |
+| `byte-minimal` | Fewest transferred bytes. ADR-0904's behavior byte for byte: ranged reads wherever they save more bytes than a request is worth. | The backend bills egress, or the network is the constraint, so moved bytes are the cost that matters. |
+| `cost-based` | The cheaper of the two under the active store cost profile. Resolves the byte-denominated exchange rate from the profile's prices at startup. | You want the shape that the deployment's actual prices imply. At the reference intra-region profile this resolves to request-minimal. |
+
+The policy is an operator surface only. It is never derivable from query text,
+headers, or a ticket: under request billing a tenant that could force
+`byte-minimal` per query would multiply the deployment's request bill by the
+measured amplification factor. For any policy value a query returns exactly the
+same rows; only request counts and timing differ.
+
+The running engine never changes its own policy. If a measurement shows the
+default is wrong for a deployment, the operator sets `--logs-fetch-policy`
+explicitly; the process does not adapt on its own, so the effective policy
+stamped into a report (below) describes the whole process lifetime.
+
+### The store cost profile
+
+`--store-cost-profile <path>` names a TOML file of this deployment's
+object-store prices. It is read only by `cost-based` policy resolution; no
+price ever reaches the fetch layer, which runs on byte quantities alone. The
+same file is read by `ravel-bench` so the engine and the ledger price a run the
+same way. With the flag omitted, the reference profile `s3-intra-region-2026`
+is used.
+
+The TOML shape and the reference profile's values:
+
+```toml
+name = "s3-intra-region-2026"
+put_class_nanodollars = 5000          # PUT/COPY/POST/LIST class, per request
+get_class_nanodollars = 400           # GET/SELECT/HEAD class, per request
+delete_class_nanodollars = 0          # optional; DELETE class, per request
+transfer_nanodollars_per_gib = 0      # egress, per GiB
+retrieval_nanodollars_per_gib = 0     # per-GiB retrieval on classes that bill it
+```
+
+Prices are integer nanodollars, never floats: they are exact decimal contract
+figures. The reference values model S3 standard intra-region 2026 list prices,
+PUT-class $5.00 per million requests and GET-class $0.40 per million, transfer
+and retrieval free. One PUT costs 12.5 GETs at those prices, the ratio the ADR
+reasons from. Every price above is a modeled figure under a named profile, not
+a billed amount; the same run under a different profile reprices to different
+numbers.
+
+`name`, `put_class_nanodollars`, `get_class_nanodollars`,
+`transfer_nanodollars_per_gib`, and `retrieval_nanodollars_per_gib` are
+required; `delete_class_nanodollars` defaults to zero when omitted. Loading is
+fail-closed: an unreadable file, invalid TOML, an unknown or misspelled key, or
+a blank name refuses startup with a typed error naming the flag. There is no
+silent fallback to the reference prices, because a deployment that named a
+profile and got the reference prices instead would stamp one profile into its
+reports while resolving its fetch policy from another.
+
+**How `cost-based` derives the fetch bound.** The resolution converts the
+profile's prices into the one byte quantity the fetch layer runs on, the
+request cost in bytes: how many transferred bytes one saved request is worth.
+The arithmetic multiplies before it divides, in `u128`, so a sub-nanodollar
+per-byte price does not truncate to zero:
+
+```
+request_cost_bytes = get_class_nanodollars × BYTES_PER_GIB
+                     / (transfer_nanodollars_per_gib + retrieval_nanodollars_per_gib)
+```
+
+`BYTES_PER_GIB` is 2^30. Retrieval is a per-byte charge exactly like transfer
+and enters the denominator the same way, so a profile with transfer free but
+retrieval priced still routes byte-minimally rather than reporting retrieval
+dollars a request-minimal plan would never have spent. The result is
+floor-rounded, held at a minimum of one byte, and clamped to the existing 64
+KiB coalescing-gap and 512 KiB routing-threshold floors. Two cases saturate the
+rate to `u64::MAX`, both meaning "read whole always": a zero denominator (both
+per-byte prices zero, so no per-byte cost exists) and quotient overflow (a
+near-free but nonzero per-byte price against a large GET price, logged at
+startup naming the profile).
+
+At the reference profile transfer and retrieval are both zero, so the rate
+saturates and `cost-based` resolves to request-minimal behavior. At egress list
+prices (for example GET-class $0.40 per million against $0.09 per GiB transfer
+plus $0.01 per GiB retrieval) the rate resolves to about 4.4 KB, which the
+floors then clamp, reproducing ADR-0904's worked break-even from the profile
+rather than from prose.
+
+### The covering-read bound
+
+`--logs-max-fetch-run-bytes` caps the length of one covering GET. Its default
+is 64 MiB. Zero is refused at config resolution with a typed error, because the
+segmented fallback divides the object size by it. It applies on every policy,
+not only request-minimal.
+
+The bound has two regimes with a stated precedence:
+
+- An object at or under the bound is always read in one covering GET
+  (`GetRange::Full`), with no probe under request-minimal.
+- An object above the bound is read as sequential block-aligned covering
+  sub-range GETs, each the longest block-aligned prefix that fits the bound, so
+  no single request moves more than the bound however large an object grows.
+
+Block alignment makes the request count for a large object a band rather than a
+single number. The band is defined only when `B_max < bound`, where `B_max` is
+the object's largest single block's stored size (known from the resident
+PAGE_DIR). Within that condition:
+
+```
+floor = ceil(size / bound)
+cap   = ceil(size / (bound − B_max))
+```
+
+The floor holds because each GET carries at most `bound` bytes; the cap holds
+because every sub-range except the last covers more than `bound − B_max` bytes.
+Expected figures use the floor; bands use the cap. When a single block's stored
+size is at or above the bound the band does not apply to it: that block cannot
+be split and is fetched as its own oversized GET, charged at its true size,
+which is legal but logged and does not occur on the corpora this project
+measures (blocks sit far under 64 MiB).
+
+### Report provenance: requested versus effective
+
+Every report that carries a request or modeled-cost figure stamps the active
+store cost profile (its name and all its prices) and the resolved fetch policy,
+using a requested-versus-effective split. The requested value is what the
+operator asked for; the effective value is what actually governed the run. A
+lane that cannot know what governed the fetch (a Flight query against a foreign
+server, until the distributed per-phase accounting lands) stamps its effective
+value as `None`, rendered `n/a`, rather than echoing the requested value as if
+it were confirmed.
+
+A figure without this stamp cannot be compared against another. The active
+profile is a variable that moves the reported cost of the same run by more than
+a factor of three, so two request or dollar figures are comparable only once
+both are known to have priced the run the same way. A report that omits the
+stamp is not a result.
+
+### Flag precedence
+
+`--logs-request-cost-bytes`, when set explicitly, wins over the policy-derived
+rate. The policy is the intent layer; the byte flag is the expert escape hatch
+that pins the exact ADR-0904 behavior. So a deployment can select `cost-based`
+and still override the single derived quantity when it has measured a better
+value.
+
+`request-minimal` additionally overrides an explicitly set
+`--logs-block-range-threshold`: it saturates both routing thresholds regardless
+of that flag, and a set-but-overridden threshold is logged at startup so the
+override is visible. Under the other two policies `--logs-block-range-threshold`
+keeps its ADR-0904 role.
+
+### Modeled cost is a model, not a bill
+
+Every dollar figure a report derives from a profile is a modeled cost: it
+prices the run's requests (and, when the profile has nonzero per-byte prices,
+its bytes) under the named profile. It is not a billed amount from the provider.
+A different profile reprices the same run to different dollars, which is why the
+profile stamp travels with every dollar figure. For example, a cold 43-statement
+pass that issues about 160,000 GETs models to about $0.064 under the reference
+profile (160,000 requests at GET-class $0.40 per million); the same request
+count reprices under any other profile.
+
+### What the policy does not touch
+
+The fetch policy and the store cost profile govern the logs read path only.
+RSEG metrics fetching does not consult either: its fetch constants (the suffix
+probe window, the coalescing gap, the whole-object threshold, the concurrency
+limit) are fixed in `crates/ravel-query/src/fetcher.rs` and are not
+policy-driven. An operator tuning metrics-fetch behavior will not find a knob
+for it here, because there is none; the constants are compiled in at that file.
+
 ## Admission limits file
 
 `--limits-file` (ADR-0051 section 3) points at a TOML file with a

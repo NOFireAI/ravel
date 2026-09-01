@@ -37,8 +37,11 @@ Start here to run Ravel, ingest into it, or query it.
   this to go from a metric point to its trace.
 - [guides/operations.md](guides/operations.md): full `ravel-server`/`ravel-cli`
   flag and env reference, storage backend setup, tenancy, the disposability
-  model, and what garbage collection does and does not do today. Read this to
-  deploy or operate Ravel.
+  model, what garbage collection does and does not do today, and the ADR-0996
+  logs fetch policy and store cost profile sizing (the three
+  `--logs-fetch-policy` values, the profile TOML and its derived fetch bound,
+  the covering-read bound, and the requested-versus-effective provenance stamp).
+  Read this to deploy or operate Ravel.
 - [guides/observability.md](guides/observability.md): the `GET /metrics`
   Prometheus endpoint -- every metric family it renders, the closed label
   allowlist and the `tenant_hash="other"` fold, how to read the per-query
