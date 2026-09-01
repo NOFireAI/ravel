@@ -316,26 +316,30 @@ GET's wire size at the bound (`peak_fetch_run_bytes ≤ bound`) and
 delivers the request-count band, but the segmented path still ASSEMBLES
 the whole object before decode — `ravel-logseg`'s `RlogReader::new`
 requires one contiguous object-indexed buffer, so resident assembly
-remains `object_size` until the per-sub-range decode lands (#1007,
-reader-side only, PAGE_DIR already carries the split offsets). The
-response buffer is part of the same accounting: `GetOutcome.data` is
-copied into the assembler at placement, so both allocations coexist
+remains `object_size` until the per-sub-range decode lands (issue
+#1007, reader-side only, PAGE_DIR already carries the split offsets).
+The response buffer is part of the same accounting: `GetOutcome.data`
+is copied into the assembler at placement, so both allocations coexist
 transiently — one bound-sized wire buffer per in-flight GET on top of
 the assembly — and #1007's acceptance test pins peak resident with both
-counted, unless its decode-from-the-wire-buffer design removes the copy
-outright. Once
-#1007 lands, the memory bound is `fetch permits × max(bound, B_max)` —
-`permits × bound` = 16 × 64 MiB = 1 GiB worst-case at defaults on every
-corpus without an oversized block, the only case that exceeds it being
-an oversized block's own GET, resident at its true size and logged as
-such (`DEFAULT_LOG_MAX_CONCURRENT_GETS`, `log_fetcher.rs:2200`) —
+counted. Once #1007 lands, the memory bound is therefore
+`fetch permits × (bound + max(bound, B_max))` —
+`permits × 2·bound` = 16 × 128 MiB = 2 GiB worst-case at defaults on
+every corpus without an oversized block — unless #1007's design decodes
+directly from the wire buffer and removes the copy, in which case the
+one-buffer formula `permits × max(bound, B_max)` = 1 GiB applies;
+whichever #1007 ships, its acceptance test pins the matching formula.
+The only case exceeding either bound is an oversized block's own GET,
+resident at its true size and logged as such
+(`DEFAULT_LOG_MAX_CONCURRENT_GETS`, `log_fetcher.rs:2200`) —
 versus today's formally unbounded `permits × object_size`. The corpus figure
 is stated as what it is: 3.47 MB is the MEAN object size on
 clickbench-v4, not a maximum, so the per-corpus expectation in the
 verification plan is banded on the corpus's largest object, and the
-worst-case guarantee is the `permits × max(bound, B_max)` line above,
-nothing softer (`permits × bound` exactly, on any corpus with no
-oversized block). Until #1007 lands, that guarantee holds for wire
+worst-case guarantee is the two-buffer formula above
+(`permits × (bound + max(bound, B_max))`, collapsing to
+`permits × max(bound, B_max)` only if #1007 removes the placement
+copy), nothing softer. Until #1007 lands, even that holds for wire
 bytes per GET only; resident assembly is still `permits × object_size`,
 and a 5 GiB object is not resident-bounded until per-sub-range decode
 exists.
