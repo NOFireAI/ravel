@@ -208,6 +208,65 @@ The ts/content/prune declines are gated by `LogsScanExec::stats_are_exact`,
 which requires no pending erasure, an empty `content`, an empty `prune`, and a
 `ts` bound that contains every touched segment.
 
+## Declared-column MIN/MAX from two statistics carriers
+
+`SELECT MIN(<declared column>), MAX(<declared column>) FROM logs` (ClickBench
+q07's shape) is answered at plan time, with no `LogsScanExec` in the plan and
+zero data GETs, through DataFusion's stock `AggregateStatistics` rule rather
+than through `MetadataOnlyAggregate`: `LogsScanExec::partition_statistics`
+reports the column's `min_value`/`max_value` as `Precision::Exact`, and its
+`null_count` too where that figure is proven, so `COUNT(<declared column>)`
+takes the same path. A statement answered this way records zero
+`data_objects_touched`, since no segment is opened on either read route.
+
+Two carriers feed it, unioned per segment and per column (ADR-0873 decision
+4):
+
+- the `SegmentRef` stamp (`SegmentRef::declared_column_stats`, ADR-0873), an
+  exact whole-object min/max and NULL count per eligible declared column,
+  written by the flush and compaction writers onto the commit record and the
+  compaction part and carried through the fold onto `SnapshotEntry`. Because
+  it rides the records resolution already reads, it covers the live tail above
+  the fold watermark and token-resolved segments, which no fold-built sibling
+  object can;
+- the ADR-0850/0942 `.cstat` entry, joined by segment identity, which is the
+  carrier for pre-stamp sealed history and the only carrier for `Str`/`Bytes`
+  extrema.
+
+Stamp eligibility is an allowlist, `I64` and `BOOL`
+(`ravel_types::declared_stats`). `Str`/`Bytes` are excluded because a stamped
+extremum is an unbounded byte string on the hot resolve path, and `F64`
+(ADR-0101) is excluded pending a decided comparator, NaN rule, and `-0.0` rule
+that provably agree with the scan-path aggregate's.
+
+The column reports `Absent` -- the rule silently does not fire and the query
+scans, ADR-0849's safety lemma -- whenever any of the following holds, on top
+of the `stats_are_exact` gate above:
+
+- a touched segment that neither carrier covers: never stamped and no `.cstat`
+  entry, which is the permanent state of every pre-ADR-0873 record and of
+  every metrics/spans segment;
+- an entry either carrier's reader refuses: a stamp of an ineligible type, a
+  stamp whose type disagrees with the tenant's declaration, a duplicated
+  entry name (ADR-0873 clause 6 drops every occurrence, so a duplicate never
+  reaches a reader as coverage), or a `.cstat` entry whose extrema presence
+  disagrees with its `non_null_count`;
+- the two carriers disagreeing about one segment in `min`, `max`, or
+  `null_count`. Nothing is ever combined across carriers: both claim to
+  describe the same rows of one immutable object exactly, so a disagreement
+  means one of them is wrong and no answer is safe.
+
+Two process-wide tallies make the defect classes visible, since a coverage
+regression otherwise reads as a slow query:
+`ravel_commit::declared_stats::dropped_stamp_entries` counts every stamp entry
+a reader dropped (one per entry, on every read route), and
+`ravel_sql::declared_stat_carrier_conflicts` counts every carrier
+disagreement. A `null_count` is reported `Exact` only when every covering
+carrier proved it, which today means the stamp: a `.cstat` entry's row
+accounting is not reconciled against the joined `SegmentRef::sample_count` on
+this path, and an unreconciled figure would answer `COUNT(col)` from something
+nothing checked. The extrema are exact either way.
+
 ## Predicate-free full-window logs scan: request count
 
 Every OTHER predicate-free, full-window logs statement — `SUM`, `AVG`,
