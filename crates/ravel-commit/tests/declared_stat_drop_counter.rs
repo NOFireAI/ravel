@@ -1,14 +1,19 @@
 //! The ADR-0873 decision 2 defect metric: every stamp entry a reader drops is
-//! counted, so a writer emitting stamps no reader will spend is detectable
-//! exactly where coverage is spent rather than showing up as a mysteriously
-//! slow query.
+//! counted, under the label of the carrier that was read, so a writer emitting
+//! stamps no reader will spend is detectable exactly where coverage is spent
+//! rather than showing up as a mysteriously slow query.
+//!
+//! The metric has OBSERVATION semantics, which the tests here pin as intended
+//! behaviour rather than as an accident: each read of a defective carrier
+//! increments it again, because a per-entry dedup would need unbounded state
+//! keyed by (object, column) on a path walked once per segment per query.
 //!
 //! This lives in its own integration binary on purpose.
-//! `ravel_commit::declared_stats::dropped_stamp_entries` is a process-wide
-//! monotonic tally, so an exact-delta assertion is only meaningful when the
-//! test knows every other reader running in the same process. Here that set is
-//! this file, and the lock below serialises it; in the crate's `--lib` binary
-//! it would be every predicate test at once, racing.
+//! `ravel_commit::declared_stats::declared_stat_drops_observed` is a
+//! process-wide monotonic tally, so an exact-delta assertion is only meaningful
+//! when the test knows every other reader running in the same process. Here
+//! that set is this file, and the lock below serialises it; in the crate's
+//! `--lib` binary it would be every predicate test at once, racing.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -16,8 +21,9 @@ use std::sync::{Mutex, MutexGuard};
 
 use prost::Message;
 use ravel_commit::declared_stats::{
-    DeclaredStatDefect, ValidatedDeclaredStats, dropped_stamp_entries, encode, read_commit_record,
-    read_compaction_part, stamp_commit_record,
+    DeclaredStatDefect, StatCarrier, ValidatedDeclaredStats, declared_stat_drops_observed,
+    declared_stat_drops_observed_total, encode, observe_declared_stat_drops, read_commit_record,
+    read_compaction_part, read_snapshot_entry_twin, stamp_commit_record,
 };
 use ravel_commit::record::{self, NewCommitRecord};
 use ravel_proto::commit::v1::{
@@ -113,13 +119,36 @@ fn decoded_part(entries: Vec<DeclaredColumnMinMax>) -> CompactionPart {
     CompactionPart::decode(p.encode_to_vec().as_slice()).expect("part decodes")
 }
 
-/// Run `read` and return its result plus the exact movement of the defect
-/// metric across it.
-fn with_delta<T>(read: impl FnOnce() -> T) -> (T, u64) {
+/// Every label's tally, in [`StatCarrier::ALL`] order.
+fn observed_all() -> Vec<u64> {
+    StatCarrier::ALL
+        .iter()
+        .map(|carrier| declared_stat_drops_observed(*carrier))
+        .collect()
+}
+
+/// Run `read` and return its result, `carrier`'s observation delta across it,
+/// and the summed delta of every OTHER label.
+///
+/// The second figure is the label assertion: a metric that counts the right
+/// number of drops under the wrong carrier is as unusable as one that does not
+/// count them, since the label is what names the writer to look at.
+fn with_delta<T>(carrier: StatCarrier, read: impl FnOnce() -> T) -> (T, u64, u64) {
     let _guard = counter_lock();
-    let before = dropped_stamp_entries();
+    let before = observed_all();
     let out = read();
-    (out, dropped_stamp_entries() - before)
+    let after = observed_all();
+    let mut mine = 0;
+    let mut others = 0;
+    for ((label, b), a) in StatCarrier::ALL.iter().zip(before.iter()).zip(after.iter()) {
+        let delta = a - b;
+        if *label == carrier {
+            mine = delta;
+        } else {
+            others += delta;
+        }
+    }
+    (out, mine, others)
 }
 
 /// A stamp entry whose `declared_type` is ADR-0101's `F64` tag: representable
@@ -140,12 +169,15 @@ fn f64_tagged_entry(name: &str) -> DeclaredColumnMinMax {
 }
 
 /// Test 5: a validation-failed stamp moves the metric exactly once per dropped
-/// entry, on both commit-side read routes, and the valid entries beside it
-/// keep their coverage (the metric counts drops, not records).
+/// entry, on both commit-side read routes and under each route's OWN label, and
+/// the valid entries beside it keep their coverage (the metric counts drops, not
+/// records).
 ///
-/// Prove-the-test: delete the `record_dropped(dropped.len())` call in
-/// `decode_all_against_rows` (crates/ravel-commit/src/declared_stats.rs) and
-/// both delta assertions read 0 instead of 2.
+/// Prove-the-test: delete the `observe_declared_stat_drops(carrier,
+/// dropped.len())` call in `decode_all_against_rows`
+/// (crates/ravel-commit/src/declared_stats.rs) and both delta assertions read 0
+/// instead of 2; pass `StatCarrier::CommitRecord` from `read_compaction_part`
+/// and the part route's `others` assertion reads 2 with `mine` at 0.
 #[test]
 fn validation_failures_move_the_metric_once_per_dropped_entry() {
     let entries = vec![
@@ -159,8 +191,11 @@ fn validation_failures_move_the_metric_once_per_dropped_entry() {
         encode(&i64_stat("Latency", 1, 2, 0)),
     ];
 
-    let (read, delta) = with_delta(|| read_commit_record(&decoded_record(entries.clone())));
+    let (read, delta, others) = with_delta(StatCarrier::CommitRecord, || {
+        read_commit_record(&decoded_record(entries.clone()))
+    });
     assert_eq!(delta, 2, "exactly the two defective entries");
+    assert_eq!(others, 0, "under the commit-record label only");
     assert_eq!(read.dropped().len(), 2);
     assert_eq!(read.covered().len(), 2);
     assert!(matches!(
@@ -172,9 +207,75 @@ fn validation_failures_move_the_metric_once_per_dropped_entry() {
         DeclaredStatDefect::Invalid(_)
     ));
 
-    let (read, delta) = with_delta(|| read_compaction_part(&decoded_part(entries)));
+    let (read, delta, others) = with_delta(StatCarrier::CompactionPart, || {
+        read_compaction_part(&decoded_part(entries))
+    });
     assert_eq!(delta, 2, "the part route counts the same two drops");
+    assert_eq!(
+        others, 0,
+        "and counts them under compaction-part, not under the record label"
+    );
     assert_eq!(read.covered().len(), 2);
+}
+
+/// The third stamp carrier's label: a snapshot entry read through
+/// [`read_snapshot_entry_twin`] observes its drops under `snapshot-entry`, so a
+/// defective fold copy is distinguishable from a defective record.
+///
+/// Prove-the-test: change `read_snapshot_entry_twin` to pass
+/// `StatCarrier::CommitRecord` and `mine` reads 0 with `others` at 1.
+#[test]
+fn a_snapshot_entry_twin_observes_under_its_own_label() {
+    let twin = decoded_record(vec![f64_tagged_entry("Ratio")]);
+    let (read, delta, others) = with_delta(StatCarrier::SnapshotEntry, || {
+        read_snapshot_entry_twin(&twin)
+    });
+    assert_eq!(delta, 1, "one ineligible entry on the fold's copy");
+    assert_eq!(others, 0);
+    assert!(read.covered().is_empty());
+}
+
+/// The `.cstat` label, which no reader in this crate produces: `ravel_sql`'s
+/// `.cstat` reader reports its refusals through
+/// [`observe_declared_stat_drops`], and they land under `cstat` and nowhere
+/// else. The total is the sum over labels, so it moves with them.
+#[test]
+fn the_cstat_label_is_reportable_from_outside_this_crate() {
+    let before_total = declared_stat_drops_observed_total();
+    let ((), delta, others) = with_delta(StatCarrier::Cstat, || {
+        observe_declared_stat_drops(StatCarrier::Cstat, 3);
+    });
+    assert_eq!(delta, 3);
+    assert_eq!(others, 0, "a .cstat refusal is not a stamp-carrier drop");
+    assert_eq!(
+        declared_stat_drops_observed_total() - before_total,
+        3,
+        "the total sums the labels"
+    );
+
+    // Zero is not an event: a reader that refuses nothing must not move the
+    // metric, or every clean read would look like a defect.
+    let ((), delta, others) = with_delta(StatCarrier::Cstat, || {
+        observe_declared_stat_drops(StatCarrier::Cstat, 0);
+    });
+    assert_eq!((delta, others), (0, 0));
+}
+
+/// The label set is complete and its strings are the ones ADR-0873 decision 2
+/// names, since a dashboard query is written against the string and a renamed
+/// label is a silently empty panel.
+#[test]
+fn every_carrier_has_its_adr_label() {
+    let labels: Vec<&str> = StatCarrier::ALL.iter().map(|c| c.label()).collect();
+    assert_eq!(
+        labels,
+        vec![
+            "commit-record",
+            "compaction-part",
+            "snapshot-entry",
+            "cstat"
+        ]
+    );
 }
 
 /// Test 4, metric half: a record stamping one name twice drops BOTH entries
@@ -192,8 +293,11 @@ fn a_duplicated_name_moves_the_metric_by_both_entries() {
             encode(&i64_stat("EventDate", b, b + 10, 0)),
             encode(&i64_stat("Latency", 7, 8, 0)),
         ];
-        let (read, delta) = with_delta(|| read_commit_record(&decoded_record(entries)));
+        let (read, delta, others) = with_delta(StatCarrier::CommitRecord, || {
+            read_commit_record(&decoded_record(entries))
+        });
         assert_eq!(delta, 2, "both occurrences of the duplicated name");
+        assert_eq!(others, 0);
         assert_eq!(
             read.column("EventDate"),
             None,
@@ -209,28 +313,53 @@ fn a_duplicated_name_moves_the_metric_by_both_entries() {
 /// report every pre-ADR-0873 record in the tenant as a writer bug.
 #[test]
 fn absence_and_full_validity_leave_the_metric_untouched() {
-    let (read, delta) = with_delta(|| read_commit_record(&base_record()));
+    let (read, delta, others) = with_delta(StatCarrier::CommitRecord, || {
+        read_commit_record(&base_record())
+    });
     assert_eq!(delta, 0, "an unstamped record is not a defect");
+    assert_eq!(others, 0, "and moves no other label either");
     assert!(read.covered().is_empty());
     assert!(read.dropped().is_empty());
 
     let mut stamped = base_record();
     stamp_commit_record(&mut stamped, &[i64_stat("EventDate", 0, 19_000, 3)]);
     let stamped = record::decode(&record::encode(&stamped)).expect("decodes");
-    let (read, delta) = with_delta(|| read_commit_record(&stamped));
+    let (read, delta, others) =
+        with_delta(StatCarrier::CommitRecord, || read_commit_record(&stamped));
     assert_eq!(delta, 0, "a valid stamp is not a defect");
+    assert_eq!(others, 0);
     assert_eq!(read.covered().len(), 1);
 }
 
-/// The metric only ever moves forward, and only through the predicate pass:
-/// reading the same defective record twice counts two drops, because coverage
-/// is judged per read and each read spent (and refused) the entry again.
+/// Observation semantics, asserted as the intended contract and not as an
+/// incidental consequence: the metric counts one observation per READ of a
+/// defective carrier, so reading the same defective record twice moves it twice.
+///
+/// This is what the name `declared_stat_drops_observed` states, and it is a
+/// deliberate trade rather than a missing dedup. A "distinct defective entries"
+/// figure would need unbounded state keyed by (object, column) held for the life
+/// of the process, on a path walked once per segment per query; the figure it
+/// would buy is only ever read as "nonzero, go look". The consequence a reader
+/// of the metric must know is exactly what this test pins: the magnitude scales
+/// with read rate, so it is comparable across equal windows and meaningless as
+/// an absolute count of defects.
+///
+/// Prove-the-test: memoise the pass's drop count per record (or count only the
+/// first read of a given `content_hash`) and the second delta reads 0.
 #[test]
-fn the_metric_is_monotonic_across_repeated_reads() {
+fn each_read_of_a_defective_record_is_its_own_observation() {
     let record = decoded_record(vec![f64_tagged_entry("Ratio")]);
-    let (_, first) = with_delta(|| read_commit_record(&record));
-    let (_, second) = with_delta(|| read_commit_record(&record));
-    assert_eq!((first, second), (1, 1));
+    let (_, first, first_others) =
+        with_delta(StatCarrier::CommitRecord, || read_commit_record(&record));
+    let (_, second, second_others) =
+        with_delta(StatCarrier::CommitRecord, || read_commit_record(&record));
+    assert_eq!(
+        (first, second),
+        (1, 1),
+        "one observation per read, by design: the second read spent and refused \
+         the same entry again"
+    );
+    assert_eq!((first_others, second_others), (0, 0));
 }
 
 /// A `ValidatedDeclaredStats` is the coverage grant, and this file reads one

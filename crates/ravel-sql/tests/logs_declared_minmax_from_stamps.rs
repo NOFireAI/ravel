@@ -3,6 +3,11 @@
 //! GETs (issue #873's ClickBench q07 shape, `SELECT MIN(EventDate),
 //! MAX(EventDate) FROM hits`).
 //!
+//! `COUNT(<declared column>)` rides the same statistics object, since the exact
+//! NULL count is reported beside the extrema and DataFusion rewrites the
+//! aggregate into `num_rows - null_count`; both statement shapes are covered
+//! here, over both stamp-eligible types (`I64` and `BOOL`).
+//!
 //! Every positive test pins the same four facts, the way
 //! `logs_count_from_stats.rs` pins them for `COUNT(*)`: the answer equals what
 //! a scan of the same objects returns, the physical plan carries no
@@ -29,7 +34,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, Int64Array};
+use datafusion::arrow::array::{Array, BooleanArray, Int64Array};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::stats::Precision;
 use datafusion::physical_plan::{Statistics, collect, displayable};
@@ -76,6 +81,20 @@ const COL: &str = "EventDate";
 const SEG_A_ROWS: &[(i64, Option<i64>)] = &[(100, Some(19_000)), (101, None), (102, Some(18_500))];
 /// Segment B's rows, holding both the corpus minimum and its maximum.
 const SEG_B_ROWS: &[(i64, Option<i64>)] = &[(200, Some(17_100)), (201, Some(19_400))];
+/// A segment whose declared column reads NULL in every row: the stamp carries
+/// no extrema and `null_count == sample_count`, which is the exact statement
+/// "zero non-null values" rather than a gap (ADR-0873 clause 5).
+const ALL_NULL_ROWS: &[(i64, Option<i64>)] = &[(300, None), (301, None), (302, None)];
+
+/// The BOOL declared column under test, the other half of ADR-0873 decision
+/// 2's stamp allowlist. ClickBench's `IsRefresh` is the shape.
+const BOOL_COL: &str = "IsRefresh";
+/// The BOOL corpus, split over two objects: every value in the first is
+/// `false`, so the corpus maximum lives in the second and an implementation
+/// that answered from one segment alone would report `false` for `MAX`.
+const BOOL_SEG_A_ROWS: &[(i64, Option<bool>)] =
+    &[(100, Some(false)), (101, None), (102, Some(false))];
+const BOOL_SEG_B_ROWS: &[(i64, Option<bool>)] = &[(200, Some(true)), (201, Some(false))];
 
 /// The true extrema and NULL count over both segments, computed from the same
 /// constants the objects are written from.
@@ -88,13 +107,15 @@ fn true_answer() -> (Option<i64>, Option<i64>) {
     (vals.iter().min().copied(), vals.iter().max().copied())
 }
 
-fn record(ts: i64, event_date: Option<i64>) -> LogRecord {
+/// One record carrying `value` under `attr_key`, or carrying no attribute at
+/// all when `value` is `None` (which is how a NULL declared column reads).
+fn record(ts: i64, attr_key: &str, value: Option<AttrValue>) -> LogRecord {
     let resource: Vec<(String, AttrValue)> = vec![(
         "service.name".to_string(),
         AttrValue::Str("api".to_string()),
     )];
-    let attrs = match event_date {
-        Some(v) => vec![(COL.to_string(), AttrValue::I64(v))],
+    let attrs = match value {
+        Some(v) => vec![(attr_key.to_string(), v)],
         None => Vec::new(),
     };
     LogRecord {
@@ -112,13 +133,15 @@ fn record(ts: i64, event_date: Option<i64>) -> LogRecord {
     }
 }
 
-/// Write `rows` as one real RLOG object and return its unstamped
-/// [`SegmentRef`].
-async fn write_segment(
+/// Write `rows` (`(ts, attribute value)`, a `None` value meaning the record
+/// carries no such attribute) as one real RLOG object under `attr_key`, and
+/// return its unstamped [`SegmentRef`].
+async fn write_attr_segment(
     store: &Arc<CountingStore>,
     key: &str,
     seq: u64,
-    rows: &[(i64, Option<i64>)],
+    attr_key: &str,
+    rows: &[(i64, Option<AttrValue>)],
 ) -> SegmentRef {
     let mut w = RlogWriter::new(
         RlogConfig::default(),
@@ -131,7 +154,7 @@ async fn write_segment(
         },
     );
     for (ts, v) in rows {
-        w.push(record(*ts, *v)).expect("push");
+        w.push(record(*ts, attr_key, v.clone())).expect("push");
     }
     let bytes = w.finish().expect("finish");
     let object_size = bytes.len() as u64;
@@ -159,6 +182,34 @@ async fn write_segment(
     }
 }
 
+/// The I64 corpus writer: `rows` as one real RLOG object under [`COL`].
+async fn write_segment(
+    store: &Arc<CountingStore>,
+    key: &str,
+    seq: u64,
+    rows: &[(i64, Option<i64>)],
+) -> SegmentRef {
+    let rows: Vec<(i64, Option<AttrValue>)> = rows
+        .iter()
+        .map(|(ts, v)| (*ts, v.map(AttrValue::I64)))
+        .collect();
+    write_attr_segment(store, key, seq, COL, &rows).await
+}
+
+/// The same for the BOOL corpus, under [`BOOL_COL`].
+async fn write_bool_segment(
+    store: &Arc<CountingStore>,
+    key: &str,
+    seq: u64,
+    rows: &[(i64, Option<bool>)],
+) -> SegmentRef {
+    let rows: Vec<(i64, Option<AttrValue>)> = rows
+        .iter()
+        .map(|(ts, v)| (*ts, v.map(AttrValue::Bool)))
+        .collect();
+    write_attr_segment(store, key, seq, BOOL_COL, &rows).await
+}
+
 /// The exact stamp a correct writer produces for `rows`: extrema over the
 /// non-null values, absent when there are none, and the exact NULL count.
 fn stamp_for(rows: &[(i64, Option<i64>)]) -> DeclaredColumnStat {
@@ -172,6 +223,21 @@ fn stamp_for(rows: &[(i64, Option<i64>)]) -> DeclaredColumnStat {
         null_count,
     )
     .expect("valid stamp")
+}
+
+/// The same for the BOOL corpus: `false` sorts below `true`, so the extrema of
+/// a mixed segment are exactly `(false, true)`.
+fn bool_stamp_for(rows: &[(i64, Option<bool>)]) -> DeclaredColumnStat {
+    let vals: Vec<bool> = rows.iter().filter_map(|(_, v)| *v).collect();
+    let null_count = u64::try_from(rows.len() - vals.len()).expect("fits");
+    DeclaredColumnStat::new(
+        BOOL_COL,
+        DeclaredStatType::Bool,
+        vals.iter().min().map(|v| DeclaredStatValue::Bool(*v)),
+        vals.iter().max().map(|v| DeclaredStatValue::Bool(*v)),
+        null_count,
+    )
+    .expect("valid bool stamp")
 }
 
 fn i64_stamp_entry(name: &str, min: i64, max: i64, null_count: u64) -> DeclaredColumnMinMax {
@@ -301,11 +367,19 @@ fn declared_cols() -> Vec<DeclaredColumn> {
     vec![DeclaredColumn::new(COL, DeclaredType::I64)]
 }
 
-fn provider(
+/// The tenant's declaration for the BOOL tests: one BOOL column, so it sits at
+/// [`ravel_sql::FIRST_DECLARED_COL`] exactly as the I64 column does in the
+/// others.
+fn bool_declared_cols() -> Vec<DeclaredColumn> {
+    vec![DeclaredColumn::new(BOOL_COL, DeclaredType::Bool)]
+}
+
+fn provider_with(
     store: &Arc<CountingStore>,
     snapshot: Snapshot,
     accounting: &QueryAccounting,
     stats: Option<Arc<LoadedColumnStats>>,
+    declared: Vec<DeclaredColumn>,
 ) -> LogsTableProvider {
     let backend: Arc<dyn ObjectStoreBackend> = Arc::clone(store) as Arc<dyn ObjectStoreBackend>;
     LogsTableProvider::new(
@@ -314,7 +388,7 @@ fn provider(
         LogSegmentFetcher::new(backend),
         accounting.clone(),
     )
-    .with_declared_columns(declared_cols())
+    .with_declared_columns(declared)
     .with_column_stats(stats)
 }
 
@@ -329,6 +403,52 @@ fn logs_session(provider: LogsTableProvider) -> datafusion::error::Result<Sessio
         false,
         SpillDecision::Disabled,
     )
+}
+
+/// The single `COUNT(...)` value from a one-row, one-column result, or `None`
+/// when the aggregate is SQL NULL (which `COUNT` never is, so a `None` here is
+/// a failure the caller should assert on).
+fn count_value(batches: &[RecordBatch]) -> Option<i64> {
+    for batch in batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 count");
+        return if arr.is_null(0) {
+            None
+        } else {
+            Some(arr.value(0))
+        };
+    }
+    None
+}
+
+/// `(min, max)` from `SELECT MIN(bool_col), MAX(bool_col)`; a component is
+/// `None` when the aggregate is SQL NULL.
+fn min_max_bool(batches: &[RecordBatch]) -> (Option<bool>, Option<bool>) {
+    for batch in batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let col = |i: usize| {
+            let arr = batch
+                .column(i)
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .expect("boolean aggregate");
+            if arr.is_null(0) {
+                None
+            } else {
+                Some(arr.value(0))
+            }
+        };
+        return (col(0), col(1));
+    }
+    (None, None)
 }
 
 /// `(min, max)` from `SELECT MIN(col), MAX(col)`; a component is `None` when
@@ -365,18 +485,31 @@ struct Outcome {
     objects_touched: u64,
 }
 
-/// Run `SELECT MIN("EventDate"), MAX("EventDate") FROM logs` over `snapshot`,
-/// against the objects already written into `store`.
-async fn min_max_over_store(
+/// One statement's raw outcome, for the statements whose answer the caller
+/// reads out of the batches itself.
+struct Run {
+    plan: String,
+    batches: Vec<RecordBatch>,
+    gets: u64,
+    accounted_gets: u64,
+    objects_touched: u64,
+}
+
+/// Run `sql` over `snapshot` against the objects already written into `store`,
+/// with `declared` as the tenant's declared columns.
+async fn run_over_store(
     store: &Arc<CountingStore>,
     snapshot: Snapshot,
     stats: Option<Arc<LoadedColumnStats>>,
-) -> Outcome {
+    declared: Vec<DeclaredColumn>,
+    sql: &str,
+) -> Run {
     let accounting = QueryAccounting::new();
     let before_gets = store.gets();
-    let ctx = logs_session(provider(store, snapshot, &accounting, stats)).expect("session");
+    let ctx = logs_session(provider_with(store, snapshot, &accounting, stats, declared))
+        .expect("session");
     let plan = ctx
-        .sql(&format!("SELECT MIN(\"{COL}\"), MAX(\"{COL}\") FROM logs"))
+        .sql(sql)
         .await
         .expect("plan")
         .create_physical_plan()
@@ -387,24 +520,56 @@ async fn min_max_over_store(
         .await
         .expect("collect");
     let snap = accounting.snapshot();
-    Outcome {
+    Run {
         plan: text,
-        answer: min_max_i64(&batches),
+        batches,
         gets: store.gets() - before_gets,
         accounted_gets: snap.s3_requests[AccountedOp::Get.index()],
         objects_touched: snap.data_objects_touched,
     }
 }
 
+/// Run `SELECT MIN("EventDate"), MAX("EventDate") FROM logs` over `snapshot`,
+/// against the objects already written into `store`.
+async fn min_max_over_store(
+    store: &Arc<CountingStore>,
+    snapshot: Snapshot,
+    stats: Option<Arc<LoadedColumnStats>>,
+) -> Outcome {
+    let run = run_over_store(
+        store,
+        snapshot,
+        stats,
+        declared_cols(),
+        &format!("SELECT MIN(\"{COL}\"), MAX(\"{COL}\") FROM logs"),
+    )
+    .await;
+    Outcome {
+        answer: min_max_i64(&run.batches),
+        plan: run.plan,
+        gets: run.gets,
+        accounted_gets: run.accounted_gets,
+        objects_touched: run.objects_touched,
+    }
+}
+
 /// The whole-plan statistics of the bare scan over `snapshot`, which is the
 /// entry point `AggregateStatistics` consults. No object-store I/O.
-fn scan_stats(snapshot: Snapshot, stats: Option<Arc<LoadedColumnStats>>) -> Arc<Statistics> {
+fn scan_stats_for(
+    snapshot: Snapshot,
+    stats: Option<Arc<LoadedColumnStats>>,
+    declared: Vec<DeclaredColumn>,
+) -> Arc<Statistics> {
     let store = CountingStore::new(Arc::new(MemoryStore::new()));
     let accounting = QueryAccounting::new();
-    let provider = provider(&store, snapshot, &accounting, stats);
+    let provider = provider_with(&store, snapshot, &accounting, stats, declared);
     let plan = provider.plan_filters(4, &[]).expect("plan_filters");
     plan.partition_statistics(None)
         .expect("partition_statistics")
+}
+
+fn scan_stats(snapshot: Snapshot, stats: Option<Arc<LoadedColumnStats>>) -> Arc<Statistics> {
+    scan_stats_for(snapshot, stats, declared_cols())
 }
 
 /// The declared column's statistics in `stats`. The scan projects every schema
@@ -837,4 +1002,309 @@ async fn carriers_disagreeing_about_one_segment_decline() {
         (Some(18_500), Some(19_000)),
         "the scan answers segment A's real extrema, not the fabricated -1"
     );
+}
+
+// ---------------------------------------------------------------------------
+// `COUNT(<declared column>)`, the second statement shape this statistics
+// object answers (ADR-0873: the exact NULL count is reported beside the
+// extrema, so DataFusion's `Count::value_from_stats` rewrites the aggregate
+// into `num_rows - null_count`).
+// ---------------------------------------------------------------------------
+
+/// `COUNT(<declared column>)` over a stamped tenant is a plan-time literal,
+/// equal to `sample_count - null_count` with the NULL count taken ONCE.
+///
+/// Both segments here are covered by BOTH carriers, in agreement, which is what
+/// makes the exact value the assertion: a union that summed the carriers'
+/// `null_count`s instead of taking one would answer 3, and one that dropped the
+/// NULL count entirely would leave the column `Absent` and scan. The corpus has
+/// 5 rows and exactly one NULL, so the only correct answer is 4.
+///
+/// Prove-the-test: in `LogsScanExec::declared_min_max_all`
+/// (crates/ravel-sql/src/logs_scan.rs) replace the union's
+/// `null_count_proven: stamp.null_count_proven || cstat.null_count_proven,
+/// ..stamp` arm with an arm that sums (`null_count: stamp.null_count +
+/// cstat.null_count`) and this reads 3; delete the `col.null_count =
+/// Precision::Exact(nulls)` assignment in `partition_statistics` and the plan
+/// keeps its `LogsScanExec` with 2 GETs while the count still answers 4.
+#[tokio::test]
+async fn count_of_a_stamped_column_subtracts_the_null_count_exactly_once() {
+    let store = CountingStore::new(Arc::new(MemoryStore::new()));
+    let a = write_segment(&store, "logs/a.rlog", 1, SEG_A_ROWS).await;
+    let b = write_segment(&store, "logs/b.rlog", 2, SEG_B_ROWS).await;
+    let stats = loaded_stats(vec![
+        (&a, vec![cstat_for(SEG_A_ROWS, Some(18_500), Some(19_000))]),
+        (&b, vec![cstat_for(SEG_B_ROWS, Some(17_100), Some(19_400))]),
+    ]);
+    let snapshot = snapshot_of(vec![
+        stamped(&a, vec![encode_stamp(&stamp_for(SEG_A_ROWS))]),
+        stamped(&b, vec![encode_stamp(&stamp_for(SEG_B_ROWS))]),
+    ]);
+
+    // The seam `Count::value_from_stats` reads: both figures exact, and the
+    // NULL count is 1 rather than the 2 a carrier-summing union would report.
+    let col_stats = scan_stats(snapshot.clone(), Some(Arc::clone(&stats)));
+    assert_eq!(col_stats.num_rows, Precision::Exact(5), "3 + 2 rows");
+    assert_eq!(
+        declared_col_stats(&col_stats).null_count,
+        Precision::Exact(1),
+        "one NULL row, counted once across two agreeing carriers"
+    );
+
+    let run = run_over_store(
+        &store,
+        snapshot,
+        Some(stats),
+        declared_cols(),
+        &format!("SELECT COUNT(\"{COL}\") FROM logs"),
+    )
+    .await;
+    assert!(
+        !run.plan.contains("LogsScanExec"),
+        "a stamped COUNT(col) must be a plan-time literal; plan was:\n{}",
+        run.plan
+    );
+    assert_eq!(
+        count_value(&run.batches),
+        Some(4),
+        "5 rows minus the one NULL row, taken once (3 if the carriers were summed)"
+    );
+    assert_eq!(run.gets, 0, "no data object may be read");
+    assert_eq!(run.accounted_gets, 0, "and none may be accounted either");
+    assert_eq!(run.objects_touched, 0);
+}
+
+/// The same count is what a scan of the same objects returns, which is what
+/// makes the test above a statistics test rather than an agreement between two
+/// fabrications.
+#[tokio::test]
+async fn the_stamped_count_equals_the_scanned_count() {
+    let store = CountingStore::new(Arc::new(MemoryStore::new()));
+    let a = write_segment(&store, "logs/a.rlog", 1, SEG_A_ROWS).await;
+    let b = write_segment(&store, "logs/b.rlog", 2, SEG_B_ROWS).await;
+    let sql = format!("SELECT COUNT(\"{COL}\") FROM logs");
+
+    let scanned = run_over_store(
+        &store,
+        snapshot_of(vec![a.clone(), b.clone()]),
+        None,
+        declared_cols(),
+        &sql,
+    )
+    .await;
+    assert!(
+        scanned.plan.contains("LogsScanExec"),
+        "an unstamped snapshot has nothing to answer from; plan was:\n{}",
+        scanned.plan
+    );
+    assert!(scanned.gets > 0, "the reference answer comes from the data");
+
+    let from_stats = run_over_store(
+        &store,
+        snapshot_of(vec![
+            stamped(&a, vec![encode_stamp(&stamp_for(SEG_A_ROWS))]),
+            stamped(&b, vec![encode_stamp(&stamp_for(SEG_B_ROWS))]),
+        ]),
+        None,
+        declared_cols(),
+        &sql,
+    )
+    .await;
+    assert_eq!(
+        count_value(&from_stats.batches),
+        count_value(&scanned.batches)
+    );
+    assert_eq!(count_value(&from_stats.batches), Some(4));
+    assert_eq!(from_stats.gets, 0);
+}
+
+/// An all-NULL declared column: the stamp carries no extrema and
+/// `null_count == sample_count`, which is an exact statement about the segment
+/// and not a gap. `COUNT(col)` is then exactly 0, answered at plan time with
+/// zero GETs, and `MIN`/`MAX` are SQL NULL.
+///
+/// The `MIN`/`MAX` half of that answer does NOT come from statistics, and the
+/// assertions say so: this scan reports `Precision::Exact(Int64(None))`, but
+/// DataFusion's `FromColumnStatistics for Min`/`for Max`
+/// (datafusion-functions-aggregate, `min_max.rs`) refuse an exact extremum that
+/// is null (`!val.is_null()`), so the rule does not fire and the statement
+/// scans to the same NULL. Only the count is a literal here.
+///
+/// Prove-the-test: replace `row_count_defect`'s `(Some(_), Some(_)) if
+/// null_count == sample_count => "present"` arm with `_ => return None`
+/// (crates/ravel-commit/src/declared_stats.rs) and a fabricated-extrema stamp
+/// over an all-NULL column becomes coverage; delete the
+/// `col.null_count = Precision::Exact(nulls)` assignment in
+/// `partition_statistics` (crates/ravel-sql/src/logs_scan.rs) and the count
+/// assertion fails with a `LogsScanExec` in the plan and 1 GET.
+#[tokio::test]
+async fn an_all_null_stamped_column_counts_zero_and_answers_null() {
+    let store = CountingStore::new(Arc::new(MemoryStore::new()));
+    let seg = write_segment(&store, "logs/all-null.rlog", 3, ALL_NULL_ROWS).await;
+    let stamp = stamp_for(ALL_NULL_ROWS);
+    assert_eq!(
+        (stamp.min(), stamp.max(), stamp.null_count()),
+        (None, None, 3),
+        "zero non-null values, stated exactly"
+    );
+    let snapshot = snapshot_of(vec![stamped(&seg, vec![encode_stamp(&stamp)])]);
+
+    let col_stats = scan_stats(snapshot.clone(), None);
+    let col = declared_col_stats(&col_stats);
+    assert_eq!(col_stats.num_rows, Precision::Exact(3));
+    assert_eq!(
+        col.min_value,
+        Precision::Exact(ScalarValue::Int64(None)),
+        "the exact extremum of zero non-null values is NULL"
+    );
+    assert_eq!(col.max_value, Precision::Exact(ScalarValue::Int64(None)));
+    assert_eq!(col.null_count, Precision::Exact(3), "every row is NULL");
+
+    let counted = run_over_store(
+        &store,
+        snapshot.clone(),
+        None,
+        declared_cols(),
+        &format!("SELECT COUNT(\"{COL}\") FROM logs"),
+    )
+    .await;
+    assert!(
+        !counted.plan.contains("LogsScanExec"),
+        "COUNT over an all-NULL stamped column is a plan-time literal; plan was:\n{}",
+        counted.plan
+    );
+    assert_eq!(
+        count_value(&counted.batches),
+        Some(0),
+        "3 rows minus 3 NULLs, exactly"
+    );
+    assert_eq!(counted.gets, 0);
+    assert_eq!(counted.accounted_gets, 0);
+    assert_eq!(counted.objects_touched, 0);
+
+    let out = min_max_over_store(&store, snapshot, None).await;
+    assert_eq!(
+        out.answer,
+        (None, None),
+        "SQL MIN/MAX over an all-NULL column is NULL"
+    );
+    assert!(
+        out.plan.contains("LogsScanExec"),
+        "DataFusion refuses a null exact extremum, so MIN/MAX scans here even \
+         though the statistics are exact; plan was:\n{}",
+        out.plan
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The BOOL half of the stamp allowlist.
+// ---------------------------------------------------------------------------
+
+/// `MIN`/`MAX` over a stamped BOOL declared column is answered at plan time
+/// with zero GETs, under `false < true`: the corpus holds `false` in both
+/// objects and `true` only in the second, so the exact answer is
+/// `(false, true)` and an implementation that reversed the comparator or read
+/// one segment alone would answer `(false, false)` or `(true, true)`.
+///
+/// Prove-the-test: return `None` from `stamp_type_of`'s
+/// `DeclaredType::Bool` arm (crates/ravel-sql/src/logs_scan.rs) and the plan
+/// regains its `LogsScanExec` with 2 GETs; swap the `Ordering::Less`/
+/// `Ordering::Greater` arguments in the `keep_extreme` calls in
+/// `declared_min_max_all` and the answer becomes `(true, false)`.
+#[tokio::test]
+async fn stamped_bool_min_max_orders_false_below_true_with_zero_gets() {
+    let store = CountingStore::new(Arc::new(MemoryStore::new()));
+    let a = write_bool_segment(&store, "logs/bool-a.rlog", 1, BOOL_SEG_A_ROWS).await;
+    let b = write_bool_segment(&store, "logs/bool-b.rlog", 2, BOOL_SEG_B_ROWS).await;
+    let a_stamp = bool_stamp_for(BOOL_SEG_A_ROWS);
+    assert_eq!(
+        (a_stamp.min(), a_stamp.max()),
+        (
+            Some(DeclaredStatValue::Bool(false)),
+            Some(DeclaredStatValue::Bool(false))
+        ),
+        "the all-false segment stamps false for both extrema"
+    );
+    let snapshot = snapshot_of(vec![
+        stamped(&a, vec![encode_stamp(&a_stamp)]),
+        stamped(&b, vec![encode_stamp(&bool_stamp_for(BOOL_SEG_B_ROWS))]),
+    ]);
+
+    let col_stats = scan_stats_for(snapshot.clone(), None, bool_declared_cols());
+    let col = declared_col_stats(&col_stats);
+    assert_eq!(
+        col.min_value,
+        Precision::Exact(ScalarValue::Boolean(Some(false)))
+    );
+    assert_eq!(
+        col.max_value,
+        Precision::Exact(ScalarValue::Boolean(Some(true)))
+    );
+    assert_eq!(col.null_count, Precision::Exact(1), "one NULL row, in A");
+
+    let run = run_over_store(
+        &store,
+        snapshot,
+        None,
+        bool_declared_cols(),
+        &format!("SELECT MIN(\"{BOOL_COL}\"), MAX(\"{BOOL_COL}\") FROM logs"),
+    )
+    .await;
+    assert!(
+        !run.plan.contains("LogsScanExec"),
+        "a stamped BOOL MIN/MAX must be a plan-time literal; plan was:\n{}",
+        run.plan
+    );
+    assert_eq!(
+        min_max_bool(&run.batches),
+        (Some(false), Some(true)),
+        "false < true, over both objects"
+    );
+    assert_eq!(run.gets, 0, "no data object may be read");
+    assert_eq!(run.accounted_gets, 0);
+    assert_eq!(run.objects_touched, 0);
+}
+
+/// And the stamped BOOL answer is the scanned BOOL answer: the stamps are
+/// derived from the same rows the objects were written from, so the scan is the
+/// reference implementation for the comparator too.
+#[tokio::test]
+async fn the_stamped_bool_answer_equals_the_scanned_answer() {
+    let store = CountingStore::new(Arc::new(MemoryStore::new()));
+    let a = write_bool_segment(&store, "logs/bool-a.rlog", 1, BOOL_SEG_A_ROWS).await;
+    let b = write_bool_segment(&store, "logs/bool-b.rlog", 2, BOOL_SEG_B_ROWS).await;
+    let sql = format!("SELECT MIN(\"{BOOL_COL}\"), MAX(\"{BOOL_COL}\") FROM logs");
+
+    let scanned = run_over_store(
+        &store,
+        snapshot_of(vec![a.clone(), b.clone()]),
+        None,
+        bool_declared_cols(),
+        &sql,
+    )
+    .await;
+    assert!(
+        scanned.plan.contains("LogsScanExec"),
+        "an unstamped snapshot has nothing to answer from; plan was:\n{}",
+        scanned.plan
+    );
+    assert!(scanned.gets > 0);
+    assert_eq!(min_max_bool(&scanned.batches), (Some(false), Some(true)));
+
+    let from_stats = run_over_store(
+        &store,
+        snapshot_of(vec![
+            stamped(&a, vec![encode_stamp(&bool_stamp_for(BOOL_SEG_A_ROWS))]),
+            stamped(&b, vec![encode_stamp(&bool_stamp_for(BOOL_SEG_B_ROWS))]),
+        ]),
+        None,
+        bool_declared_cols(),
+        &sql,
+    )
+    .await;
+    assert_eq!(
+        min_max_bool(&from_stats.batches),
+        min_max_bool(&scanned.batches)
+    );
+    assert_eq!(from_stats.gets, 0);
 }
