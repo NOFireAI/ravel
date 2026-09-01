@@ -64,7 +64,13 @@ use uuid::Uuid;
 ///   overshoots by up to one whole trace
 ///   ([`CompactorConfig::l1_part_memory_target_bytes`]). The RLOG merge may
 ///   also close a part earlier on the stored-size target `max_l1_part_bytes`
-///   (issue #872), which only lowers this term.
+///   (issue #872), which only lowers this term. Testing that target does add a
+///   short-lived, uncharged transient: the exact-encode probe encodes a CLONE
+///   of the buffered records, so while it runs the resident set briefly holds a
+///   second copy of the part's row heap plus its encoded object bytes (bounded
+///   by `2 * writer + max_l1_part_bytes`, released as the probe returns). It
+///   only runs once the payload proxy reaches the stored target, so never at the
+///   shipped defaults where the memory target binds first.
 ///
 /// # Phase-attributed peaks (issue #977)
 ///
@@ -417,8 +423,8 @@ impl MergeMemoryTracker {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record that a part was closed by the stored-size target (its
-    /// encoded-bytes estimate reached `max_l1_part_bytes`).
+    /// Record that a part was closed by the stored-size target (an exact-encode
+    /// probe showed its object bytes reaching `max_l1_part_bytes`).
     pub fn note_stored_target_flush(&self) {
         self.inner
             .stored_target_flushes
@@ -449,13 +455,14 @@ pub const DEFAULT_CLOCK_SKEW_ALLOWANCE_NS: i64 = 300_000_000_000;
 pub const DEFAULT_MAX_COMPACTION_LIFETIME_NS: i64 = NS_PER_HOUR;
 /// Default `max_l1_part_bytes`: 256 MiB. This is the **stored-size target**:
 /// the encoded/on-object byte budget a part is closed at, estimated per section
-/// in `build.rs` and per record plus per stream in the RLOG merge. It is
+/// in `build.rs` and measured by an exact-encode probe in the RLOG merge. It is
 /// deliberately equal to the memory-target default so this crate's geometry is
 /// unchanged from when one knob did both jobs: on a wide schema the memory
 /// target reaches 256 MiB of decoded record heap long before a part's stored
-/// bytes reach 256 MiB, so the memory target stays binding and the stored
-/// target does not fire. Lowering it to `8..=16 MiB` is the follow-up that
-/// grows objects (issue #872); see [`CompactorConfig::max_l1_part_bytes`].
+/// bytes reach 256 MiB, so the memory target stays binding, the RLOG payload
+/// proxy never reaches 256 MiB, and no probe runs. Lowering it to `8..=16 MiB`
+/// is the follow-up that grows objects (issue #872); see
+/// [`CompactorConfig::max_l1_part_bytes`].
 pub const DEFAULT_MAX_L1_PART_BYTES: u64 = 256 * 1024 * 1024;
 /// Default `l1_part_memory_target_bytes`: 256 MiB. This is the **memory split
 /// target**: the decoded record-heap estimate the in-progress part is closed
@@ -704,26 +711,34 @@ pub struct CompactorConfig {
     /// measured from the run's start via the clock.
     pub max_compaction_lifetime_ns: i64,
     /// The **stored-size target**: close the in-progress L1 part once its
-    /// encoded/on-object bytes reach this. On the RSEG path (`build.rs`) this
-    /// is the part's stored-size estimate, which charges every section that
-    /// grows with what the part carries: the TS/VAL/HIST pages (ADR-0092
-    /// decision 3), each series' SERIES_IDS entry and SERIES_META cells, the
-    /// per-sample provenance columns a run-merged run adds, each distinct
-    /// LABEL_DICT string, and the EXEMPLARS records. On the
-    /// RLOG path (`rlog.rs`) it is an encoded-bytes estimate summed per record
-    /// ([`crate::rlog::estimate_stored_record`]) plus one STREAM_DIR entry per
-    /// distinct stream in the part, because the RLOG writer holds
-    /// row-major records and does not expose an incremental encoded size. Both
-    /// estimates are pre-compression proxies over zstd-compressed sections, so
-    /// they charge at or above what those sections store, which is the
-    /// conservative direction. Named
-    /// for the bytes it measures: it governs object geometry (object count and
-    /// per-object stored size), which is what the historical `max_l1_part_bytes`
-    /// name always implied. It does NOT bound memory; neither does
-    /// [`Self::l1_part_memory_target_bytes`], which is a split target in decoded
-    /// heap. A part closes on whichever of the two
-    /// is reached first. Default [`DEFAULT_MAX_L1_PART_BYTES`] (256 MiB), chosen
-    /// so today's geometry is unchanged (issue #872); lower it to grow objects.
+    /// encoded/on-object bytes reach this. Measured in on-object bytes on both
+    /// paths, so a part closes when the object it is about to write reaches this
+    /// size (issue #872).
+    ///
+    /// - RSEG (`build.rs`): the part's stored-size estimate, which charges every
+    ///   section that grows with what the part carries: the TS/VAL/HIST pages
+    ///   (ADR-0092 decision 3, actual encoded page bytes), each series'
+    ///   SERIES_IDS entry and SERIES_META cells, the per-sample provenance
+    ///   columns a run-merged run adds, each distinct LABEL_DICT string, and the
+    ///   EXEMPLARS records. The page bytes are exact; the metadata sections are a
+    ///   pre-compression proxy over their zstd-compressed form (an upper bound).
+    /// - RLOG (`rlog.rs`): the ACTUAL encoded object size. The RLOG writer holds
+    ///   row-major records and only encodes at
+    ///   [`ravel_logseg::RlogWriter::finish_compacted`], so it exposes no
+    ///   incremental encoded size; the merge keeps a cheap pre-compression
+    ///   payload proxy ([`crate::rlog::estimate_stored_record`] per record plus
+    ///   one STREAM_DIR entry per distinct stream) only to SCHEDULE an
+    ///   exact-encode probe, and closes the part on the probe's real byte count.
+    ///   A part overshoots by at most one probe interval, the same
+    ///   at-most-one-unit discipline the memory split target has.
+    ///
+    /// Named for the bytes it measures: it governs object geometry (object count
+    /// and per-object stored size), which is what the historical
+    /// `max_l1_part_bytes` name always implied. It does NOT bound memory; neither
+    /// does [`Self::l1_part_memory_target_bytes`], which is a split target in
+    /// decoded heap. A part closes on whichever of the two is reached first.
+    /// Default [`DEFAULT_MAX_L1_PART_BYTES`] (256 MiB), chosen so today's geometry
+    /// is unchanged (issue #872); lower it to grow objects.
     pub max_l1_part_bytes: u64,
     /// The **memory split target**: close the in-progress L1 part once its
     /// decoded record-heap estimate reaches this
