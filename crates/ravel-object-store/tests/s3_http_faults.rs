@@ -1542,6 +1542,56 @@ async fn successful_multipart_abort_leaves_failure_counter_at_zero() {
     );
 }
 
+/// The happy path moves neither #864 counter: a multipart upload whose parts
+/// and `CompleteMultipartUpload` all succeed is reaped by the completion, so no
+/// abort is ever attempted and both counters read exactly 0. Without this, a
+/// counter that also fired on success would still pass the two failure tests
+/// above; this pins that a clean upload is silent, which is the baseline the
+/// failure counts are read against.
+#[tokio::test]
+async fn successful_multipart_upload_moves_neither_counter() {
+    let fake = FakeS3::start().await;
+    let store = fake.store();
+    // No fault scripted anywhere: every UploadPart and the CompleteMultipart
+    // succeed, so the upload is reaped by completion and never aborted.
+    let payload = Bytes::from(vec![4u8; MULTIPART_THRESHOLD + 1]);
+    store
+        .put("multipart/clean", payload.clone(), PutOptions::default())
+        .await
+        .expect("a clean multipart put must succeed");
+
+    assert_eq!(
+        fake.count(Op::CreateMultipart),
+        1,
+        "the put must have taken the multipart path"
+    );
+    assert_eq!(
+        fake.count(Op::CompleteMultipart),
+        1,
+        "a clean multipart put completes exactly once"
+    );
+    assert_eq!(
+        fake.count(Op::AbortMultipart),
+        0,
+        "a completed upload issues no abort"
+    );
+    assert_eq!(
+        store.multipart_abort_failures(),
+        0,
+        "no abort was attempted, so the failed-abort counter must be exactly 0"
+    );
+    assert_eq!(
+        store.multipart_uploads_unreaped(),
+        0,
+        "a cleanly completed upload did not end without a successful reap"
+    );
+    assert_eq!(
+        fake.object("multipart/clean").as_deref(),
+        Some(&payload[..]),
+        "the completed object must hold the uploaded bytes"
+    );
+}
+
 /// `SlowDown` inside a 200 response body is S3's documented behavior for
 /// `CompleteMultipartUpload`, and it is a protocol signal rather than a
 /// success: the client must retry it, and the upload must complete correctly

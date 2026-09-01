@@ -1446,6 +1446,20 @@ and lifecycle-rule requirements, is enforced at the bucket/IAM layer
 (ADR-0042 decision 3) -- nothing in `ravel-server` configures or verifies it
 in-process, because `object_store` 0.14 exposes no such API.
 
+One of those lifecycle-rule requirements is not optional for any bucket Ravel
+writes to: **configure `AbortIncompleteMultipartUpload`** with a cleanup period
+of 7 days or less. Nothing in `ravel-server` reaps orphaned multipart parts, so
+a best-effort abort that itself fails, or an upload future dropped mid-flight,
+leaves parts billed until this rule reaps them. Two `S3Store` counters make that
+otherwise-silent failure observable: `multipart_abort_failures` (best-effort
+aborts whose request returned an error) and `multipart_uploads_unreaped`
+(multipart uploads that ended without a confirmed successful abort for any
+reason -- a failed abort, or a future dropped with its abort unresolved). A
+sustained rise in either means the lifecycle rule is the only thing bounding
+orphaned-part cost on that bucket; confirm the rule is present. See
+`docs/object-store-contract.md`'s "Required bucket configuration" for the
+normative statement and the exact semantics of both counters.
+
 `--require-bucket-protection` turns the existing, previously
 informational-only conformance probes into a startup gate so a deployment
 cannot go into production silently unprotected:
