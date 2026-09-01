@@ -316,8 +316,8 @@ GET's wire size at the bound (`peak_fetch_run_bytes ≤ bound`) and
 delivers the request-count band, but the segmented path still ASSEMBLES
 the whole object before decode — `ravel-logseg`'s `RlogReader::new`
 requires one contiguous object-indexed buffer, so resident assembly
-remains `object_size` until the per-sub-range decode lands (issue
-#1007, reader-side only, PAGE_DIR already carries the split offsets).
+remains `object_size` until the per-sub-range decode lands (the
+reader-side issue #1007; PAGE_DIR already carries the split offsets).
 The response buffer is part of the same accounting: `GetOutcome.data`
 is copied into the assembler at placement, so both allocations coexist
 transiently — one bound-sized wire buffer per in-flight GET on top of
