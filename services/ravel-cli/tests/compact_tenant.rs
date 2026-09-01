@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use ravel_cli::maintain::{CompactTenantError, SignalArg, compact_tenant};
+use ravel_cli::store::{DefaultedMemoryEmptyWalk, StoreKind, StoreSelection};
 use ravel_commit::keys;
 use ravel_commit::record::{self, NewCommitRecord};
 use ravel_logseg::{AttrValue, LogRecord, LogStreamId, ObjectIdentity, RlogConfig, RlogWriter};
@@ -29,6 +30,12 @@ const TENANT: &str = "clickbench";
 const HOUR_OLD: u32 = 500_000;
 const SHARDS: u32 = 2;
 const EPOCH: u64 = 1;
+
+/// The seeded fixtures below build their own `MemoryStore`, which is the
+/// explicit `--store memory` case (issue #1024): the report header reads
+/// `store: memory` and an empty walk stays a zero-count success. The defaulted
+/// case is [`StoreSelection::defaulted_memory`], exercised on its own below.
+const MEMORY: StoreSelection = StoreSelection::explicit(StoreKind::Memory);
 
 /// Ten minutes past the end of the newer hour. Under the default
 /// `max_flush_lifetime` (1 h) the seal margin is 1 h 5 min, so only `HOUR_OLD`
@@ -195,6 +202,7 @@ async fn compact_tenant_compacts_only_the_sealed_hour_of_every_shard() {
 
     let report = compact_tenant(
         store.clone(),
+        MEMORY,
         TENANT,
         SignalArg::Logs,
         Some(SHARDS),
@@ -211,6 +219,15 @@ async fn compact_tenant_compacts_only_the_sealed_hour_of_every_shard() {
     .expect("compact-tenant runs");
 
     assert_eq!(report.shards, 2, "walked both shards");
+    assert_eq!(
+        report.store, MEMORY,
+        "the report carries the store the walk ran against"
+    );
+    assert_eq!(
+        report.store.header(),
+        "store: memory",
+        "an explicit --store memory is reported without the (default) marker"
+    );
     assert_eq!(report.compacted, 2, "one sealed hour per shard");
     assert_eq!(
         report.not_sealed, 2,
@@ -241,6 +258,7 @@ async fn max_flush_lifetime_zero_seals_and_compacts_every_hour() {
 
     let report = compact_tenant(
         store.clone(),
+        MEMORY,
         TENANT,
         SignalArg::Logs,
         Some(SHARDS),
@@ -287,6 +305,7 @@ async fn dry_run_reports_the_same_plan_and_writes_nothing() {
 
     let dry = compact_tenant(
         store.clone(),
+        MEMORY,
         TENANT,
         SignalArg::Logs,
         Some(SHARDS),
@@ -318,6 +337,7 @@ async fn dry_run_reports_the_same_plan_and_writes_nothing() {
     // dry run said it would.
     let wet = compact_tenant(
         store.clone(),
+        MEMORY,
         TENANT,
         SignalArg::Logs,
         Some(SHARDS),
@@ -341,6 +361,7 @@ async fn missing_shards_and_no_provisioning_record_is_a_typed_error_naming_the_t
 
     let err = compact_tenant(
         store,
+        MEMORY,
         TENANT,
         SignalArg::Logs,
         None,
@@ -380,6 +401,7 @@ async fn from_hour_and_to_hour_bound_the_walk() {
     // hour is below `--from-hour` and is never visited.
     let report = compact_tenant(
         store.clone(),
+        MEMORY,
         TENANT,
         SignalArg::Logs,
         Some(SHARDS),
@@ -423,6 +445,7 @@ async fn zero_knob_is_refused_before_shard_resolution() {
 
     let err = compact_tenant(
         store,
+        MEMORY,
         TENANT,
         SignalArg::Logs,
         None,
@@ -444,5 +467,228 @@ async fn zero_knob_is_refused_before_shard_resolution() {
     assert_eq!(
         *typed,
         ravel_cli::maintain::CompactorKnobError::ZeroL1PartMemoryTarget
+    );
+}
+
+/// Issue #1024: `--store` omitted means the empty in-process memory store, and
+/// a walk over a tenant that holds nothing there is refused with a typed error
+/// naming the tenant and the remedy, instead of the healthy-looking
+/// `compacted: 0, not_sealed: 0` and exit 0 that burned two measurement runs
+/// against a 100M-row S3 tenant.
+///
+/// Non-vacuity (prove-the-test): the pre-change tree had no store selection at
+/// all and returned `Ok(CompactTenantReport { compacted: 0, .. })` here; this
+/// `expect_err` fails against it. Against the post-change tree, deleting the
+/// `require_tenant_data_present` call in `maintain::compact_tenant` flips this
+/// back to that `Ok` (the `--shards 2` override means shard resolution does not
+/// refuse first), and deleting only the `DefaultedMemoryEmptyWalk::check` call
+/// leaves this test passing but fails
+/// `defaulted_store_refuses_when_no_hour_resolves_under_a_provisioned_tenant`.
+#[tokio::test]
+async fn defaulted_store_with_nothing_under_the_tenant_prefix_is_a_typed_refusal() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+
+    let err = compact_tenant(
+        store,
+        StoreSelection::defaulted_memory(),
+        TENANT,
+        SignalArg::Logs,
+        Some(SHARDS),
+        None,
+        None,
+        false,
+        None,
+        None,
+        None,
+        None,
+        now_ns(),
+    )
+    .await
+    .expect_err("a walk over an unchosen empty store must refuse, not report zeros");
+
+    let typed = err
+        .downcast_ref::<DefaultedMemoryEmptyWalk>()
+        .expect("typed DefaultedMemoryEmptyWalk");
+    assert_eq!(
+        *typed,
+        DefaultedMemoryEmptyWalk {
+            command: "maintain compact-tenant",
+            tenant: TENANT.to_string(),
+            searched: "objects",
+        }
+    );
+    let text = err.to_string();
+    assert!(
+        text.contains(TENANT),
+        "the error must name the tenant: {text}"
+    );
+    assert!(
+        text.contains("--store defaulted to memory") && text.contains("--store s3"),
+        "the error must name the situation and the remedy: {text}"
+    );
+}
+
+/// The same refusal for the exact condition issue #1024 states: zero present
+/// ingest-hour buckets resolved across every shard. The tenant prefix here is
+/// NOT empty (it holds the shard-count provisioning record the walk resolves
+/// its shard range from), so this is the post-walk check firing, not the
+/// precondition above.
+///
+/// Non-vacuity (prove-the-test): delete the `DefaultedMemoryEmptyWalk::check`
+/// call at the end of `maintain::compact_tenant` and this returns
+/// `Ok(CompactTenantReport { shards: 2, compacted: 0, .. })`; the `expect_err`
+/// fails. The `searched` field is what separates the two guards: swap it for
+/// `"objects"` and the `assert_eq!` below fails.
+#[tokio::test]
+async fn defaulted_store_refuses_when_no_hour_resolves_under_a_provisioned_tenant() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    ravel_catalog::validate_or_adopt(
+        store.as_ref(),
+        &tenant_hash(),
+        Signal::Logs,
+        SHARDS,
+        0,
+        ravel_catalog::AbsentPolicy::CreateFromConfig,
+    )
+    .await
+    .expect("write the shard-count provisioning record");
+
+    let err = compact_tenant(
+        store,
+        StoreSelection::defaulted_memory(),
+        TENANT,
+        SignalArg::Logs,
+        // No --shards: the shard count resolves from the provisioning record,
+        // so the walk reaches the per-shard hour listing and finds nothing.
+        None,
+        None,
+        None,
+        false,
+        None,
+        None,
+        None,
+        None,
+        now_ns(),
+    )
+    .await
+    .expect_err("zero present hours across every shard must refuse on the defaulted store");
+
+    let typed = err
+        .downcast_ref::<DefaultedMemoryEmptyWalk>()
+        .expect("typed DefaultedMemoryEmptyWalk");
+    assert_eq!(
+        *typed,
+        DefaultedMemoryEmptyWalk {
+            command: "maintain compact-tenant",
+            tenant: TENANT.to_string(),
+            searched: "present ingest-hour buckets",
+        }
+    );
+}
+
+/// An EXPLICIT `--store memory` keeps today's behavior on the same emptiness:
+/// a zero-counter report, exit 0, with the header naming the store the operator
+/// chose. This is what every in-process test does, and the reason the refusal
+/// keys on the defaulted store rather than on emptiness alone.
+///
+/// Non-vacuity (prove-the-test): make `StoreSelection::is_defaulted_memory`
+/// return `self.kind == StoreKind::Memory` (dropping the `defaulted` term) and
+/// this `expect` fails with the #1024 refusal.
+#[tokio::test]
+async fn explicit_memory_with_an_empty_store_still_reports_zero_counters() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+
+    let report = compact_tenant(
+        store,
+        MEMORY,
+        TENANT,
+        SignalArg::Logs,
+        Some(SHARDS),
+        None,
+        None,
+        false,
+        None,
+        None,
+        None,
+        None,
+        now_ns(),
+    )
+    .await
+    .expect("an explicitly chosen empty memory store is a zero-count success");
+
+    assert_eq!(
+        report,
+        ravel_cli::maintain::CompactTenantReport {
+            store: MEMORY,
+            shards: SHARDS,
+            compacted: 0,
+            already: 0,
+            not_sealed: 0,
+            below_min: 0,
+            tombstoned: 0,
+            parts_written: 0,
+        },
+        "the zero-count report is unchanged from before issue #1024"
+    );
+    assert_eq!(report.store.header(), "store: memory");
+}
+
+/// The refusal keys on emptiness, not on the flag being omitted: the same
+/// defaulted selection over a populated store walks and compacts exactly as an
+/// explicit `--store memory` does, and its header carries the `(default)`
+/// marker so the choice is visible in the output either way.
+#[tokio::test]
+async fn a_defaulted_store_that_does_hold_data_walks_normally() {
+    let store = seed_tenant().await;
+    let defaulted = StoreSelection::defaulted_memory();
+
+    let report = compact_tenant(
+        store,
+        defaulted,
+        TENANT,
+        SignalArg::Logs,
+        Some(SHARDS),
+        None,
+        None,
+        false,
+        None,
+        None,
+        None,
+        None,
+        now_ns(),
+    )
+    .await
+    .expect("a defaulted store holding data is walked, not refused");
+
+    assert_eq!(report.compacted, 2, "one sealed hour per shard, as always");
+    assert_eq!(report.not_sealed, 2);
+    assert_eq!(report.store, defaulted);
+    assert_eq!(
+        report.store.header(),
+        "store: memory (default)",
+        "the header marks a store nobody chose, even when the walk finds data"
+    );
+}
+
+/// The report header text for every effective store, including the
+/// s3-configured invocation: `StoreSelection` is the report builder unit the
+/// walk commands print their first line from, so this pins all three spellings
+/// in one place.
+///
+/// Non-vacuity (prove-the-test): drop the `(default)` branch from
+/// `StoreSelection::header` and the first assertion fails.
+#[test]
+fn the_report_header_names_the_effective_store() {
+    assert_eq!(
+        StoreSelection::defaulted_memory().header(),
+        "store: memory (default)"
+    );
+    assert_eq!(
+        StoreSelection::explicit(StoreKind::Memory).header(),
+        "store: memory"
+    );
+    assert_eq!(
+        StoreSelection::explicit(StoreKind::S3).header(),
+        "store: s3"
     );
 }

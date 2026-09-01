@@ -1005,6 +1005,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             ravel_cli::reconstruct::reconstruct(
                 store::build_store(&cli.store)?,
+                cli.store.selection(),
                 &tenant,
                 signal,
                 shard,
@@ -1029,6 +1030,7 @@ async fn main() -> anyhow::Result<()> {
                 },
         } => catalog::fold(
             store::build_store(&cli.store)?,
+            cli.store.selection(),
             &tenant,
             shards,
             signal,
@@ -1039,10 +1041,26 @@ async fn main() -> anyhow::Result<()> {
         .map(|_report| ()),
         Command::Catalog {
             command: CatalogCommand::Inspect { tenant, signal },
-        } => catalog::inspect(store::build_store(&cli.store)?, &tenant, signal).await,
+        } => {
+            catalog::inspect(
+                store::build_store(&cli.store)?,
+                cli.store.selection(),
+                &tenant,
+                signal,
+            )
+            .await
+        }
         Command::Catalog {
             command: CatalogCommand::Verify { tenant, signal },
-        } => catalog::verify(store::build_store(&cli.store)?, &tenant, signal).await,
+        } => {
+            catalog::verify(
+                store::build_store(&cli.store)?,
+                cli.store.selection(),
+                &tenant,
+                signal,
+            )
+            .await
+        }
         Command::Maintain {
             command:
                 MaintainCommand::CompactBucket {
@@ -1056,6 +1074,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             maintain::compact(
                 store::build_store(&cli.store)?,
+                cli.store.selection(),
                 &tenant,
                 signal,
                 shard,
@@ -1081,6 +1100,7 @@ async fn main() -> anyhow::Result<()> {
                 },
         } => maintain::compact_tenant(
             store::build_store(&cli.store)?,
+            cli.store.selection(),
             &tenant,
             signal,
             shards,
@@ -1107,6 +1127,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             maintain::sweep(
                 store::build_store(&cli.store)?,
+                cli.store.selection(),
                 &tenant,
                 signal,
                 shard,
@@ -1126,6 +1147,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             maintain::status(
                 store::build_store(&cli.store)?,
+                cli.store.selection(),
                 &tenant,
                 signal,
                 shard,
@@ -1135,7 +1157,15 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Maintain {
             command: MaintainCommand::AuditVersions { tenant, shards },
-        } => maintain::audit_versions(store::build_store(&cli.store)?, &tenant, shards).await,
+        } => {
+            maintain::audit_versions(
+                store::build_store(&cli.store)?,
+                cli.store.selection(),
+                &tenant,
+                shards,
+            )
+            .await
+        }
         Command::Maintain {
             command:
                 MaintainCommand::VerifyCustody {
@@ -1146,6 +1176,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             maintain::verify_custody(
                 store::build_store(&cli.store)?,
+                cli.store.selection(),
                 &tenant,
                 shards,
                 versioning_aware,
@@ -1165,6 +1196,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             maintain::migrate(
                 store::build_store(&cli.store)?,
+                cli.store.selection(),
                 &tenant,
                 signal,
                 shards,
@@ -2269,6 +2301,17 @@ async fn catalog_list(
     shard_count: u32,
 ) -> anyhow::Result<()> {
     let store = store::build_store(store_args)?;
+    let selection = store_args.selection();
+    let tenant_hash = TenantId::new(tenant).hash();
+    selection.print_header();
+    store::require_tenant_data_present(
+        selection,
+        store.as_ref(),
+        "catalog list",
+        tenant,
+        &tenant_hash,
+    )
+    .await?;
     let catalog_config = ravel_catalog::CatalogConfig {
         shard_count,
         ..ravel_catalog::CatalogConfig::default()
@@ -2282,7 +2325,6 @@ async fn catalog_list(
         .map_err(|err| anyhow::anyhow!("failed to build catalog: {err}"))?
         .with_provisioning_enforcement();
 
-    let tenant_hash = TenantId::new(tenant).hash();
     let now = now_ns()?;
     let range = TimeRange {
         start_ns: now.saturating_sub(hours.saturating_mul(NS_PER_HOUR)),
