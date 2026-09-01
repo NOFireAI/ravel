@@ -4,17 +4,27 @@
 # those defaults so the two never drift.
 #
 # Each entry is a band on one figure CLASS: kind = "exact" | "percent" |
-# "absolute". A `percent`/`absolute` band allows the candidate to exceed the
-# baseline by at most `allowance` (percent, or the figure's own units); a
-# decrease is always an improvement and passes. `exact` fails on any difference.
+# "percent_two_sided" | "absolute". A `percent`/`absolute` band allows the
+# candidate to exceed the baseline by at most `allowance` (percent, or the
+# figure's own units); a decrease is always an improvement and passes.
+# `percent_two_sided` fails on a move past `allowance` in EITHER direction.
+# `exact` fails on any difference.
+#
+# `expected` says whether at least one figure of the class must appear in both
+# reports. A class expected but absent fails naming the class, never a silent
+# skip; it defaults to true, so only the classes no report source emits yet are
+# spelled out below.
 #
 # The comparison loop reads ONLY these bands, never a hardcoded constant, so a
 # threshold is data with a named home. Omit any class to keep its default;
 # override the ones a particular lane needs.
 
 # Object geometry is deterministic; any drift is a real regression, not noise.
+# Not expected: the shipping `BenchReport` (src/report.rs) carries no object
+# count, so requiring it would fail the gate on every report the bench emits.
 [object_count]
 kind = "exact"
+expected = false
 
 # Read-policy changes must not move the write (PUT) class at all. The request
 # floor is an exact figure (ADR-0996 verification plan: "requests and object
@@ -30,14 +40,21 @@ kind = "exact"
 
 # The ADR bands full-scan amplification at <= 1.05 over the 1.0 floor; a
 # comparison allows the candidate the same +0.05 headroom over the baseline.
+# Not expected: `BenchReport` carries `write_amplification` (stored bytes over
+# logical bytes), which is a different figure; the scan-phase ratio lives in the
+# sql-latency lane's `RunAccounting::fetch_amplification`.
 [range_amplification]
 kind = "absolute"
 allowance = 0.05
+expected = false
 
 # Modeled from billed attempts, so it tracks the request count; 1% absorbs
-# profile-rounding while still flagging real cost growth.
+# profile-rounding. TWO-SIDED because the figure is a redundant cross-check:
+# under an unchanged stamp and unchanged request counts the modeled cost must
+# not move, so a DROP (a model bug that underprices) fails the same as a rise
+# rather than passing as an improvement.
 [modeled_request_cost]
-kind = "percent"
+kind = "percent_two_sided"
 allowance = 1.0
 
 # Wire bytes carry coalesced holes that shift with object geometry; 5% covers
@@ -59,12 +76,37 @@ kind = "percent"
 allowance = 5.0
 
 # The ADR peak-residency band is +/-10% vs baseline; the regression gate keeps
-# the +10% upper half.
+# the +10% upper half. Not expected: `BenchReport` carries no peak-residency
+# figure (`peak_rss_bytes` lives on the metrics-ingest report, not this one).
 [peak_memory]
 kind = "percent"
 allowance = 10.0
+expected = false
 
 # Plan-shape rule: a request-minimal full scan opens zero ranged segments, so
-# any nonzero delta is a regression.
+# any nonzero delta is a regression. Not expected: `BenchReport` carries no
+# ranged-open count (`logs_ranged_opens` lives on the sql-latency lane's
+# `RunAccounting`).
 [ranged_opens]
 kind = "exact"
+expected = false
+
+# Baseline-independent gates: these judge EACH report on its own, so a defect
+# both reports share cannot compare equal and pass.
+[absolute]
+# ADR-0996: full-scan amplification is bounded above at 1.05 over the 1.0
+# physical floor. A value BELOW the floor is a broken measurement -- a scan
+# cannot move fewer bytes than the data holds -- so it fails rather than reading
+# as an improvement.
+range_amplification_ceiling = 1.05
+range_amplification_floor = 1.0
+# A request-minimal run reads every object whole, so it opens zero ranged
+# segments. Enforced only on a report that stamps `effective_policy =
+# "request-minimal"`; without the stamp the tool cannot know the run was
+# request-minimal and does not assert it.
+ranged_opens_max = 0.0
+# Corpus-scale ceilings, left UNSET here on purpose: they are figures of one
+# corpus and would fail any other. The values below are the cb-bigbatch corpus
+# ceilings; uncomment them only in a bands document used against cb-bigbatch.
+# cold_gets_max = 160000.0
+# modeled_cost_max_nanodollars = 64000000.0

@@ -8,6 +8,7 @@ pub mod codecs;
 pub mod columnar_load;
 pub mod concurrent;
 pub mod cost_regression;
+pub mod cost_report_source;
 pub mod distrib_crossover;
 pub mod e2e;
 pub mod generator;
