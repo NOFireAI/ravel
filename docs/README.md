@@ -112,6 +112,14 @@ Start here to run Ravel, ingest into it, or query it.
   CodeRabbit administration rather than in this repository. Read this before
   touching anything CodeRabbit-related.
 
+## Reference
+
+- [reference/ravel-server-flags.md](reference/ravel-server-flags.md):
+  every `ravel-server` command-line flag, its environment variable, and its
+  default, generated from the binary's clap definition.
+- [reference/ravel-cli-flags.md](reference/ravel-cli-flags.md): every
+  `ravel-cli` flag by subcommand, generated from the binary's clap definition.
+
 ## Specs
 
 These are implementer-facing design documents. Read them to change Ravel's

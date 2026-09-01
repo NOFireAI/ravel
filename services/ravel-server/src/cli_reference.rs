@@ -70,7 +70,9 @@ fn first_line(text: &str) -> &str {
 
 /// Escape a table cell so a `|` or newline in help text cannot split the row.
 fn escape_cell(cell: &str) -> String {
-    cell.replace('\\', "\\\\").replace('\n', " ").replace('|', "\\|")
+    cell.replace('\\', "\\\\")
+        .replace('\n', " ")
+        .replace('|', "\\|")
 }
 
 /// Build the row for one argument from its clap accessors.

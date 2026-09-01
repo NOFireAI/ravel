@@ -2735,3 +2735,123 @@ mod tests {
         assert!(out.contains("bit3"), "unnamed bit position must appear");
     }
 }
+
+#[cfg(test)]
+mod cli_reference_tests {
+    //! Drift check for `docs/reference/ravel-cli-flags.md` (ADR-1040 decision
+    //! 4). The tables are rendered from `Cli`'s clap definition by the shared
+    //! renderer in `ravel-server` and compared to the committed file;
+    //! `RAVEL_UPDATE_CLI_REFERENCE=1` rewrites the file instead of asserting.
+    //!
+    //! The renderer lives in `ravel-server` (already a dev-dependency of this
+    //! crate) so the two binaries share one table format rather than
+    //! duplicating it.
+
+    use std::env;
+    use std::path::{Path, PathBuf};
+
+    use clap::CommandFactory;
+    use ravel_server::cli_reference::{
+        BEGIN_MARKER, END_MARKER, count_data_rows, render_command_tree_block, splice, user_args,
+    };
+
+    use super::Cli;
+
+    const UPDATE_ENV: &str = "RAVEL_UPDATE_CLI_REFERENCE";
+    const REGEN: &str = "RAVEL_UPDATE_CLI_REFERENCE=1 cargo test -p ravel-cli";
+
+    /// `docs/reference/ravel-cli-flags.md`, resolved from this crate's manifest
+    /// directory so the path is stable regardless of the test's working
+    /// directory.
+    fn reference_doc() -> PathBuf {
+        let manifest = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is always set");
+        Path::new(&manifest)
+            .join("..")
+            .join("..")
+            .join("docs")
+            .join("reference")
+            .join("ravel-cli-flags.md")
+    }
+
+    /// Total user-defined arguments across the whole command tree: the global
+    /// flags plus every subcommand's own arguments, counted from the command
+    /// definition rather than from rendered text.
+    fn total_args(cmd: &clap::Command) -> usize {
+        let mut count = user_args(cmd).count();
+        for sub in cmd.get_subcommands() {
+            if sub.get_name() == "help" {
+                continue;
+            }
+            count += total_args(sub);
+        }
+        count
+    }
+
+    /// Every argument clap reports across the tree becomes exactly one rendered
+    /// row, so a generator that walked only the top level (or emitted one row)
+    /// would fail here.
+    #[test]
+    fn tree_has_one_row_per_argument() {
+        let cmd = Cli::command();
+        let expected = total_args(&cmd);
+        let block = render_command_tree_block(&cmd);
+        let rows = count_data_rows(&block);
+        assert!(
+            expected > 50,
+            "only {expected} arguments found across the ravel-cli tree, so the \
+             definition did not load"
+        );
+        assert_eq!(
+            rows, expected,
+            "the generated ravel-cli tables have {rows} rows but the command \
+             tree defines {expected} arguments"
+        );
+    }
+
+    /// The block carries a table for the global flags and a heading per
+    /// subcommand, walked rather than hard-coded.
+    #[test]
+    fn every_subcommand_has_a_heading() {
+        let cmd = Cli::command();
+        let block = render_command_tree_block(&cmd);
+        for sub in cmd.get_subcommands() {
+            if sub.get_name() == "help" {
+                continue;
+            }
+            let heading = format!("## {}\n", sub.get_name());
+            assert!(
+                block.contains(&heading),
+                "no heading for subcommand `{}` in the generated block",
+                sub.get_name()
+            );
+        }
+    }
+
+    /// The committed reference matches what the current command tree renders.
+    #[test]
+    fn cli_reference_is_current() {
+        let cmd = Cli::command();
+        let block = render_command_tree_block(&cmd);
+
+        let path = reference_doc();
+        let doc = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+        let updated = splice(&doc, &block)
+            .unwrap_or_else(|| panic!("{} is missing the generated markers", path.display()));
+
+        if env::var(UPDATE_ENV).as_deref() == Ok("1") {
+            if updated != doc {
+                std::fs::write(&path, &updated)
+                    .unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
+                eprintln!("rewrote {}", path.display());
+            }
+            return;
+        }
+
+        assert_eq!(
+            updated, doc,
+            "docs/reference/ravel-cli-flags.md is stale. Regenerate it with:\n  \
+             {REGEN}\nMarkers: {BEGIN_MARKER} .. {END_MARKER}"
+        );
+    }
+}

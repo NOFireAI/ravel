@@ -17,8 +17,7 @@ use ravel_server::cli_reference::{
 const UPDATE_ENV: &str = "RAVEL_UPDATE_CLI_REFERENCE";
 
 /// The exact command a failing run prints so the fix is copy-pasteable.
-const REGEN: &str =
-    "RAVEL_UPDATE_CLI_REFERENCE=1 cargo test -p ravel-server --test cli_reference";
+const REGEN: &str = "RAVEL_UPDATE_CLI_REFERENCE=1 cargo test -p ravel-server --test cli_reference";
 
 /// `docs/reference/ravel-server-flags.md`, resolved from this crate's manifest
 /// directory rather than the process working directory (which differs between
