@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1320" height="1150" viewBox="0 0 1320 1150" font-family="system-ui, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" width="1320" height="1150" viewBox="0 0 1320 1150" font-family="system-ui, sans-serif" role="img" aria-label="Query path: a PromQL request resolves a catalog snapshot, suffix-GETs each segment footer, prunes series through SERIES_META and LABEL_DICT, coalesces ranges into a few GETs, decodes pages, dedups across segments, evaluates PromQL, and returns the Prometheus JSON envelope.">
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M0,0 L10,5 L0,10 z" fill="#383e46"/>

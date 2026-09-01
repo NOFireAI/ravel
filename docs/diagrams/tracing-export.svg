@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1015" viewBox="0 0 1200 1015" font-family="system-ui, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1015" viewBox="0 0 1200 1015" font-family="system-ui, sans-serif" role="img" aria-label="Tracing export: the six query-path phase spans nested inside the request-level span with their recorded fields and levels, and the subscriber wiring one EnvFilter over both the always-on fmt layer and the off-by-default OpenTelemetry layer through a batch span processor to an OTLP gRPC collector, plus the two export-failure modes.">
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M0,0 L10,5 L0,10 z" fill="#383e46"/>
