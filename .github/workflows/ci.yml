@@ -181,6 +181,11 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Check derived-doc drift (docs/query-engine.md)
         run: scripts/check-doc-drift.sh
+      # Documentation gate (ADR-1040 D3). Run UNPIPED: a pipeline's exit code is
+      # the last stage's, so a real failure piped through tail/grep would report
+      # as a pass. No cargo toolchain, matching this job.
+      - name: Documentation gate (ADR-1040 D3)
+        run: python3 scripts/check_docs.py
       - name: Check workspace version drift (ADR-0086 D8)
         run: scripts/check-workspace-versions.sh
       - name: Test-hygiene guard cases

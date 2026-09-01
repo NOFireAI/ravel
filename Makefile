@@ -1,4 +1,4 @@
-.PHONY: check fmt clippy test test-python test-hygiene doc-drift build minio minio-down demo quickstart quickstart-down kind-up kind-demo kind-down bench audit difftest archmap
+.PHONY: check fmt clippy test test-python test-hygiene doc-drift check-docs build minio minio-down demo quickstart quickstart-down kind-up kind-demo kind-down bench audit difftest archmap
 
 check: fmt clippy test
 
@@ -37,6 +37,14 @@ archmap:
 
 doc-drift:
 	./scripts/check-doc-drift.sh
+
+# Documentation gate (ADR-1040 decision 3): links, anchors, terminology,
+# provenance, orphaned pages, SVG validity, and index completeness. Python
+# stdlib only, so like test-python and doc-drift it is cheap enough to run
+# before a commit. Findings tolerated today live in scripts/docs_lint_baseline.txt;
+# a finding not in the baseline fails the gate.
+check-docs:
+	python3 scripts/check_docs.py
 
 build:
 	cargo build --workspace --release
