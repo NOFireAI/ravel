@@ -1,19 +1,20 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg viewBox="0 0 900 540" width="900" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Cluster topology: symmetric query nodes over one shared bucket, with remote clusters reached only through their API">
   <style>
-    .b{fill:#ffffff;stroke:#333;stroke-width:1.2;}
-    .g{fill:#f2f2f2;stroke:#333;stroke-width:1.2;}
-    .s{fill:#fff7e0;stroke:#8a6d00;stroke-width:1.2;}
-    .r{fill:#eef4ff;stroke:#1f4e9c;stroke-width:1.2;}
-    .t{font:12px monospace;fill:#111;}
-    .h{font:bold 12px monospace;fill:#111;}
-    .a{stroke:#333;stroke-width:1.2;fill:none;marker-end:url(#arT);}
-    .d{stroke:#1f4e9c;stroke-width:1.2;fill:none;marker-end:url(#arTd);stroke-dasharray:5 3;}
+    .b{fill:#a9c9e6;stroke:#1f4e79;stroke-width:1.5;}
+    .g{fill:#f4c869;stroke:#8a5a10;stroke-width:1.5;}
+    .s{fill:#a9dcae;stroke:#2f6b34;stroke-width:1.5;}
+    .r{fill:#eceef1;stroke:#454b54;stroke-width:1.5;stroke-dasharray:6 4;}
+    .t{font:12px system-ui, sans-serif;fill:#17191c;}
+    .h{font:bold 12px system-ui, sans-serif;fill:#17191c;}
+    .a{stroke:#383e46;stroke-width:1.5;fill:none;marker-end:url(#arT);}
+    .d{stroke:#6b7280;stroke-width:1.5;fill:none;marker-end:url(#arTd);stroke-dasharray:5 3;}
   </style>
   <defs>
-    <marker id="arT" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#333"/></marker>
-    <marker id="arTd" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#1f4e9c"/></marker>
+    <marker id="arT" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#383e46"/></marker>
+    <marker id="arTd" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#6b7280"/></marker>
   </defs>
+  <rect x="0" y="0" width="900" height="540" fill="#f4f5f7"/>
   <rect class="b" x="280" y="8" width="280" height="30"/>
   <text class="h" x="292" y="28">Clients (PromQL / SQL / Flight SQL)</text>
   <path class="a" d="M380,38 L220,82"/>
