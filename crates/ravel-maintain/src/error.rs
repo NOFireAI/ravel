@@ -97,6 +97,34 @@ pub enum MaintainError {
         /// convergence HEAD verification and could not be re-PUT from RAM.
         part_key: String,
     },
+    #[error(
+        "bounded RLOG compaction merge for stream {stream_id} would exceed its cursor-memory budget: {open_cursors} cursors already open charging {charged_bytes} bytes, admitting the next cursor merge order requires needs {required_bytes} bytes total against a budget of {budget_bytes} ({inputs_carrying_stream} inputs carry this stream); nothing published, the L0 inputs stay live, any parts already PUT age out under the unreferenced-part sweep (ADR-0979 decision 4). Raise merge_cursor_budget_bytes to at least {required_bytes} to compact this bucket"
+    )]
+    MergeCursorBudgetExceeded {
+        /// Hex canonical id of the stream whose cursor set overran the budget.
+        stream_id: String,
+        /// Cursors already open for this stream when the reservation was refused.
+        open_cursors: usize,
+        /// Sum of the open cursors' reservations at the point of refusal.
+        charged_bytes: u64,
+        /// The configured [`crate::config::CompactorConfig::merge_cursor_budget_bytes`].
+        budget_bytes: u64,
+        /// Prospective total had the refused cursor been admitted (`charged_bytes`
+        /// plus its reservation), so a first admission already over budget still
+        /// names the number a retry must budget for.
+        required_bytes: u64,
+        /// How many inputs carry this stream, so the operator can size the fix.
+        inputs_carrying_stream: usize,
+    },
+    #[error(
+        "bounded RLOG compaction cannot admission-price input {object_key:?}: it carries no PAGE_DIR section, so a cursor's decode cost is unknowable before the fetch and the pre-decode reservation (ADR-0979 decision 4) cannot be charged. PAGE_DIR is mandatory in RLOG format version {format_version} (ADR-0699 decision 2), so this is a version/corruption gate, not a live path on a current-format fleet; nothing published, the L0 inputs stay live"
+    )]
+    MergeCursorInputMissingPageDir {
+        /// Data-object key of the input that carries no PAGE_DIR section.
+        object_key: String,
+        /// The RLOG output format version PAGE_DIR is mandatory in.
+        format_version: u32,
+    },
     #[error("compaction invariant breach: {0}")]
     Invariant(String),
     #[error(
