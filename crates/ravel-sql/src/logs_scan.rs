@@ -2342,6 +2342,52 @@ impl PartitionCtx {
             self.accounting.add_logs_whole_object_opens(1);
         }
     }
+
+    /// Record this query's one touch of the data object the caller is about to
+    /// open, for the whole-segment fast path (ADR-0996 decision 3, issue
+    /// #1006).
+    ///
+    /// # Why this site is the fast path's single recorder
+    ///
+    /// The counter is the denominator of `range_amplification =
+    /// data_GET_requests / data_objects_touched`, so it must count each data
+    /// object once per query however many GETs are issued against it. That
+    /// makes it a designated-recorder question rather than a
+    /// record-where-you-fetch one: the striped path splits one segment's blocks
+    /// across partitions, so a per-partition site would multiply the count by
+    /// the partition count, the same way per-partition
+    /// [`BlockMetrics::record_segment_totals`] would (ADR-0102's
+    /// partition-0-at-planning rule).
+    ///
+    /// Here the owning partition is the recorder. [`owned_whole_segments`]
+    /// assigns relevant segment `j` whole to partition `j % n`, so the caller
+    /// below runs exactly once per relevant segment across the whole query, not
+    /// once per partition. Both routes it guards fetch blocks bytes (whole
+    /// object or coalesced column-chunk ranges), so the object is touched in the
+    /// counter's sense and not merely probed; and both are reached only after
+    /// [`LogsScanExec::whole_segment_fast_path`] proved the segment relevant on
+    /// the same ts bounds the fetch re-checks, so neither can decline the fetch
+    /// underneath a recorded touch. An `attrs_raw` fallback re-opens the same
+    /// segment without coming back through here, which is what keeps several
+    /// opens of one object at one touch, exactly as it does for
+    /// [`record_open_shape`](Self::record_open_shape).
+    ///
+    /// # Route exclusivity: no object can be recorded twice
+    ///
+    /// The planned route records the same counter in the fetch layer, at
+    /// `ravel_query::LogSegmentFetcher::plan_segment`, and no statement reaches
+    /// both recorders. [`LogsScanExec::execute`] decides from
+    /// [`LogsScanExec::whole_segment_fast_path`]: on `Ok` the partition drains
+    /// whole segments through the caller of this method and never builds a
+    /// [`plan_counts_future`], and on `Err` it plans and never sets
+    /// `fast_whole_segment`, so this method is unreachable. That decision reads
+    /// only the resolved snapshot and the query, both fixed for the statement
+    /// and neither dependent on the partition, so every partition of one
+    /// statement takes the same route and exactly one of the two recorders can
+    /// fire for a given object.
+    fn record_data_object_touched(&self) {
+        self.accounting.add_data_objects_touched(1);
+    }
 }
 
 /// Refuse a segment whose declared RLOG format version this build cannot read,
@@ -2907,6 +2953,12 @@ impl Stream for LogScanStream {
                             let by_chunk = this.ctx.open_by_column_chunk(&seg);
                             this.blocks.record_fast_path_route(by_chunk);
                             this.ctx.record_open_shape(by_chunk);
+                            // The fast path's owning-partition recorder for
+                            // ADR-0996 decision 3; see
+                            // `PartitionCtx::record_data_object_touched` for why
+                            // this site is once per segment per query and why
+                            // the planned route's recorder cannot also fire.
+                            this.ctx.record_data_object_touched();
                             LogScanState::Opening(open_segment_fast(
                                 Arc::clone(&this.ctx),
                                 seg,
