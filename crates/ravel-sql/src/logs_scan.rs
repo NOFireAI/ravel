@@ -680,7 +680,9 @@ fn record_carrier_conflict(
 /// [`stamp_coverage`]'s parameter type ([`DeclaredColumnStats`], constructable
 /// non-empty only from a `ValidatedDeclaredStats`) rather than a convention its
 /// caller is trusted to have followed; false for a `.cstat` entry, whose row
-/// accounting this path does not reconcile.
+/// accounting [`cstat_coverage`] reconciles against the segment's
+/// `sample_count` before any grant but whose NULL count is deliberately not
+/// promoted to proven here.
 #[derive(Clone)]
 struct SegmentCoverage {
     min: Option<ScalarValue>,
@@ -701,9 +703,10 @@ impl SegmentCoverage {
 /// The exact statistics one declared column's carriers prove over every
 /// segment a scan touches, from [`LogsScanExec::declared_min_max_all`].
 ///
-/// `null_count` is `None` when at least one covering carrier's NULL count was
-/// not reconciled against the segment's row count; the extrema are still
-/// exact in that case (see the method's docs).
+/// `null_count` is `None` when at least one covering carrier's NULL count is
+/// not proven (a `.cstat` entry is reconciled against the segment's row count
+/// before any grant, but its NULL count is deliberately not promoted to
+/// proven); the extrema are still exact in that case (see the method's docs).
 #[derive(Clone)]
 pub(crate) struct DeclaredExactStats {
     pub(crate) min: ScalarValue,
@@ -2244,7 +2247,7 @@ impl ExecutionPlan for LogsScanExec {
                     col.min_value = Precision::Exact(exact.min);
                     col.max_value = Precision::Exact(exact.max);
                     // An unproven NULL count leaves `null_count` `Absent`
-                    // rather than reporting an unreconciled figure as exact;
+                    // rather than reporting an unproven figure as exact;
                     // the extrema stay exact either way.
                     if let Some(nulls) = exact.null_count
                         && let Ok(nulls) = usize::try_from(nulls)
