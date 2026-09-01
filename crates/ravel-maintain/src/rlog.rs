@@ -75,15 +75,28 @@
 //! Instead, [`build_parts`] merges each stream through one
 //! [`StreamCursor`] per input that decodes exactly one block at a time
 //! ([`RlogRangeReader::stream_blocks`] +
-//! [`RlogRangeReader::decode_block_in_group`]), fetching the next range only
+//! [`RlogRangeReader::block_rows_in_group`]), fetching the next range only
 //! once the previous one is drained (one ahead: the fetch for range `n + 1`
 //! rides along with range `n`'s, so the cursor advances two ranges per round
 //! trip while its raw residency stays at two). The fetched range is one block
 //! under version 3 and one row group under version 4, whose blocks' pages are
 //! spread across its column chunks (ADR-0699 decision 1); the group's raw
 //! bytes are held while its blocks are decoded out of them one at a time, so
-//! the decoded term is a block in both versions (issue #748). A record's
-//! `(stream_ref, ts)`
+//! the decoded term is a block in both versions (issue #748).
+//!
+//! That decoded block is held in its COLUMNAR form, as a
+//! [`StreamBlockRows`], and its records are materialized one at a time as the
+//! merge consumes them (ADR-0979 decision 1). A block's row form re-owns every
+//! attribute key and every stream blob per record, where the columnar form
+//! stores each once per column, so holding the block as records cost several
+//! times what holding it as columns costs -- per cursor, and the number of
+//! simultaneously open cursors is the number of inputs carrying the stream.
+//! The merge's ordering key is read straight out of the decoded timestamp
+//! column ([`StreamBlockRows::peek_ts`]), so choosing the next record
+//! materializes nothing; exactly one record is materialized per record
+//! emitted, through the same `rebuild_record` path the eager decode used, in
+//! the same order. Total decode and rebuild work is unchanged; only when a row
+//! is rebuilt moves. A record's `(stream_ref, ts)`
 //! stored order makes each input's stream one ts-ascending sequence spread
 //! across ascending blocks, so N inputs carrying the same stream are a standard
 //! k-way merge ordered by `ts_ns`, ties broken by canonical input order. That
@@ -94,11 +107,11 @@
 //! `Vec<LogRecord>` batch.
 //!
 //! Peak resident memory is then: per-input catalog metadata (KBs per input,
-//! unchanged by the k-way merge), plus at most one decoded block per input
-//! carrying the current stream (`O(input_count * block_size)`, independent of
-//! stream size) and the raw bytes of the range that block came from
-//! (`O(input_count * group_size)` under version 4, stored bytes rather than
-//! decoded records), plus the in-progress part's writer buffer. The writer
+//! unchanged by the k-way merge), plus at most one decoded columnar block per
+//! input carrying the current stream (`O(input_count * block_size)`,
+//! independent of stream size) and the raw bytes of the range that block came
+//! from (`O(input_count * group_size)` under version 4, stored bytes rather
+//! than decoded records), plus the in-progress part's writer buffer. The writer
 //! buffer tracks the **memory split target** `l1_part_memory_target_bytes`:
 //! [`PartSink`] closes the in-progress part as soon as its [`estimate_record`]
 //! (decoded-heap) total reaches that target, wherever in the merged record
@@ -180,7 +193,7 @@ use ravel_logseg::footer::{self, SuffixOutcome, kind};
 use ravel_logseg::postings::PostingsSection;
 use ravel_logseg::{
     AttrValue, LogRecord, LogStreamId, RlogConfig, RlogRangeReader, RlogWriter, StreamBlockLoc,
-    decode_section, writer::ObjectIdentity,
+    StreamBlockRows, decode_section, writer::ObjectIdentity,
 };
 use ravel_object_store::{GetRange, ObjectStoreBackend};
 use ravel_proto::commit::v1::CompactionPart;
@@ -814,11 +827,23 @@ impl PartBuilder {
 
 /// One input's cursor over a single stream's records, yielding them in stored
 /// (ts-ascending) order one block at a time. At most one decoded block is
-/// resident: `head` is the next record to merge, `block` holds the rest of the
-/// current block, and the next block is decoded only once the current one is
-/// drained. `input_index` is the cursor's
-/// canonical position in `catalogs`, the k-way merge's tie-break on equal
-/// `ts_ns`.
+/// resident, held in COLUMNAR form: `block` is the current block's
+/// [`StreamBlockRows`] view, positioned at the next row to merge, and the next
+/// block is decoded only once the current one is drained. `input_index` is the
+/// cursor's canonical position in `catalogs`, the k-way merge's tie-break on
+/// equal `ts_ns`.
+///
+/// The cursor holds NO materialized records (ADR-0979 decision 1). The merge
+/// orders cursors by [`Self::peek_ts`], which reads the decoded timestamp
+/// column directly, and materializes a record only when it is the one being
+/// emitted ([`Self::next_record`]). Row form is several times the size of the
+/// columnar form it is rebuilt from -- every record re-owns its attribute keys
+/// and stream blob, which the columnar block stores once per column -- so a
+/// cursor holding its block as records held the dominant term of a merge whose
+/// open-cursor count is the number of inputs carrying the stream. Every row is
+/// still rebuilt exactly once, through the same `rebuild_record` path and in
+/// the same order, so the merged record sequence and every part byte are
+/// unchanged.
 ///
 /// The fetch unit and the decode unit differ under RLOG version 4. A version-4
 /// block's pages are spread across its row group's column chunks (ADR-0699
@@ -846,23 +871,26 @@ struct StreamCursor<'a> {
     group_raw_bytes: u64,
     /// How many of `group`'s blocks have been decoded already.
     decoded_in_group: usize,
-    /// Remaining records of the current decoded block.
-    block: std::vec::IntoIter<LogRecord>,
-    /// The current block's decoded-byte estimate, held live in the tracker
-    /// until the block is released.
+    /// The current decoded block, columnar, positioned at the next row of this
+    /// stream it will yield. `None` before the first decode and once the cursor
+    /// is exhausted; a `Some` that is exhausted is a drained block awaiting
+    /// release in the next [`Self::refill`].
+    block: Option<StreamBlockRows<'a>>,
+    /// The current block's [`StreamBlockRows::heap_estimate`], held live in the
+    /// tracker's decoded term until the block is released. Read once at decode
+    /// so the release subtracts exactly what the charge added, even though the
+    /// view's own estimate does not change as rows are drained out of it.
     block_bytes: u64,
     /// The next loc's raw bytes, already fetched (issue #711). At most one:
     /// the prefetch is one loc ahead, so the cursor's raw-byte residency is
     /// two locs, not the stream.
     prefetched: Option<(StreamBlockLoc, bytes::Bytes)>,
-    /// The next record to merge, or `None` once the cursor is exhausted.
-    head: Option<LogRecord>,
 }
 
 impl<'a> StreamCursor<'a> {
     /// Open a cursor over `stream_id` in `catalog`, or `None` if the input does
     /// not carry the stream. Does not fetch yet; call [`Self::refill`] once to
-    /// load the first record.
+    /// load the first block.
     fn open(
         catalog: &'a RlogInputCatalog,
         input_index: usize,
@@ -880,21 +908,41 @@ impl<'a> StreamCursor<'a> {
             group: None,
             group_raw_bytes: 0,
             decoded_in_group: 0,
-            block: Vec::new().into_iter(),
+            block: None,
             block_bytes: 0,
             prefetched: None,
-            head: None,
         }))
     }
 
-    /// Take the current head record; the caller must [`Self::refill`] before
-    /// the next merge step.
-    fn take_head(&mut self) -> Option<LogRecord> {
-        self.head.take()
+    /// The `ts_ns` of the record this cursor would yield next, or `None` once
+    /// it is exhausted. This is the k-way merge's ordering key, and it is read
+    /// out of the decoded timestamp column: choosing the next record to emit
+    /// materializes nothing.
+    ///
+    /// Only valid immediately after [`Self::refill`], which is what
+    /// re-establishes "the current block has a row left" across a block or loc
+    /// boundary. A drained-but-unreleased block reads as exhausted, which is
+    /// exactly what a cursor that has run out of records also reads as; the
+    /// merge distinguishes them by refilling the cursor it just consumed from
+    /// before the next comparison.
+    fn peek_ts(&self) -> Option<i64> {
+        self.block.as_ref().and_then(|b| b.peek_ts())
     }
 
-    /// Release the current decoded block's residency from the tracker.
+    /// Materialize the record [`Self::peek_ts`] just reported, rebuilding
+    /// exactly one row out of the decoded columnar block. The caller must
+    /// [`Self::refill`] before the next merge step.
+    fn next_record(&mut self) -> Result<Option<LogRecord>> {
+        match self.block.as_mut().and_then(|b| b.next()) {
+            Some(rec) => Ok(Some(rec?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Release the current decoded block: drop the columnar buffers and take
+    /// their bytes back out of the tracker's decoded term.
     fn release_block(&mut self, tracker: Option<&MergeMemoryTracker>) {
+        self.block = None;
         if self.block_bytes > 0 {
             if let Some(t) = tracker {
                 t.block_released(self.block_bytes);
@@ -903,33 +951,27 @@ impl<'a> StreamCursor<'a> {
         }
     }
 
-    /// Load the next record into `head`: the next record of the current block,
-    /// or the first record of the next non-empty block (decoded here out of the
-    /// current loc's bytes, fetching the next loc by range when the current one
-    /// is spent), or `None` when the stream is exhausted in this input. At most
-    /// one decoded block plus at most two locs' raw bytes (the one being decoded
-    /// from and the one prefetched behind it) are resident at a time.
+    /// Make the cursor ready to yield: leave `block` on a row of this stream,
+    /// decoding the next block out of the current loc's bytes (fetching the next
+    /// loc by range when the current one is spent) until one has a row or the
+    /// stream is exhausted in this input. At most one decoded block plus at most
+    /// two locs' raw bytes (the one being decoded from and the one prefetched
+    /// behind it) are resident at a time, and no record is materialized here.
     async fn refill(
         &mut self,
         store: &dyn ObjectStoreBackend,
         tracker: Option<&MergeMemoryTracker>,
     ) -> Result<()> {
-        if let Some(rec) = self.block.next() {
-            self.head = Some(rec);
-            return Ok(());
-        }
-        // Current block drained: release it and decode the next non-empty one.
-        self.release_block(tracker);
         loop {
-            if let Some(recs) = self.decode_next_block(tracker)? {
-                self.block = recs.into_iter();
-                if let Some(rec) = self.block.next() {
-                    self.head = Some(rec);
-                    return Ok(());
-                }
-                // A candidate block with no row for this stream (a neighbour's
-                // boundary block): release and try the next.
-                self.release_block(tracker);
+            if self.block.as_ref().is_some_and(|b| !b.is_exhausted()) {
+                return Ok(());
+            }
+            // The current block is drained (or there is none): release it and
+            // decode the next. A candidate block with no row for this stream (a
+            // neighbour's boundary block) simply comes back exhausted and is
+            // released on the next turn of this loop.
+            self.release_block(tracker);
+            if self.decode_next_block(tracker)? {
                 continue;
             }
             // The current loc is fully decoded: fetch the next one.
@@ -939,27 +981,28 @@ impl<'a> StreamCursor<'a> {
                     self.decoded_in_group = 0;
                     self.group = Some((loc, data));
                 }
-                None => {
-                    self.head = None;
-                    return Ok(());
-                }
+                None => return Ok(()),
             }
         }
     }
 
-    /// Decode the current loc's next undecoded block, or `None` when the loc is
-    /// spent (or absent).
+    /// Decode the current loc's next undecoded block into `block`, returning
+    /// whether one was decoded (`false` when the loc is spent, or absent).
     ///
     /// The loc's raw bytes stay resident across this call so the following block
     /// can be decoded from them, and are dropped as the last block is decoded:
     /// the tracker's raw term is therefore per loc (one row group under version
     /// 4, one block under version 3) while its decoded term is per block.
-    fn decode_next_block(
-        &mut self,
-        tracker: Option<&MergeMemoryTracker>,
-    ) -> Result<Option<Vec<LogRecord>>> {
+    ///
+    /// The decoded term charged is the columnar block's
+    /// [`StreamBlockRows::heap_estimate`], the bytes this cursor actually holds
+    /// until the block is released (ADR-0979 decision 1). It is NOT the row-form
+    /// `estimate_record` sum the eager decode charged: the records that sum
+    /// measured are no longer built here, and charging both would count one
+    /// cursor twice in the same phase snapshot.
+    fn decode_next_block(&mut self, tracker: Option<&MergeMemoryTracker>) -> Result<bool> {
         let Some((loc, data)) = self.group.take() else {
-            return Ok(None);
+            return Ok(false);
         };
         let Some(&block) = loc.block_indices().get(self.decoded_in_group) else {
             // `stream_blocks` never returns a loc with no blocks; release the
@@ -969,17 +1012,20 @@ impl<'a> StreamCursor<'a> {
             }
             self.group_raw_bytes = 0;
             self.decoded_in_group = 0;
-            return Ok(None);
+            return Ok(false);
         };
         let last = self.decoded_in_group + 1 == loc.block_indices().len();
-        let recs = self
-            .reader
-            .decode_block_in_group(&loc, block, data.as_ref())?;
+        // Copied out of `self` before the call so the view's lifetime is the
+        // catalog's, not this `&mut self` borrow's. The view owns its decoded
+        // block and borrows only the reader's directories, so `data` is free to
+        // drop below.
+        let reader: &'a RlogRangeReader = self.reader;
+        let rows = reader.block_rows_in_group(&loc, block, data.as_ref())?;
         self.decoded_in_group += 1;
-        let decoded_bytes: u64 = recs.iter().map(estimate_record).sum();
+        let decoded_bytes = rows.heap_estimate();
         if last {
-            // Both the raw loc and this block's records are resident at this
-            // instant; the raw buffer is dropped right after.
+            // Both the raw loc and this block's columnar buffers are resident at
+            // this instant; the raw buffer is dropped right after.
             let raw_len = self.group_raw_bytes;
             if let Some(t) = tracker {
                 t.block_decoded(raw_len, decoded_bytes);
@@ -995,8 +1041,9 @@ impl<'a> StreamCursor<'a> {
             }
             self.group = Some((loc, data));
         }
+        self.block = Some(rows);
         self.block_bytes = decoded_bytes;
-        Ok(Some(recs))
+        Ok(true)
     }
 
     /// The next candidate block's raw bytes, or `None` once the candidate list
@@ -1112,23 +1159,25 @@ async fn merge_stream_into_parts(
         .await?;
     let mut cursors: Vec<StreamCursor> = opened.into_iter().flatten().collect();
     loop {
-        // Pick the cursor whose head has the minimum (ts_ns, input_index).
+        // Pick the cursor whose next row has the minimum (ts_ns, input_index).
         // input_index is unique per cursor, so the key is a total order and the
-        // tie-break is deterministic.
+        // tie-break is deterministic. The comparison reads each cursor's
+        // decoded ts column and materializes nothing (ADR-0979 decision 1);
+        // only the winner rebuilds a record.
         let mut best: Option<(usize, i64, usize)> = None;
         for (i, cursor) in cursors.iter().enumerate() {
-            if let Some(head) = &cursor.head {
-                let key = (head.ts_ns, cursor.input_index);
+            if let Some(ts) = cursor.peek_ts() {
+                let key = (ts, cursor.input_index);
                 match best {
                     Some((_, bts, bidx)) if (bts, bidx) <= key => {}
-                    _ => best = Some((i, head.ts_ns, cursor.input_index)),
+                    _ => best = Some((i, ts, cursor.input_index)),
                 }
             }
         }
         let Some((bi, _, _)) = best else {
             break;
         };
-        if let Some(rec) = cursors[bi].take_head() {
+        if let Some(rec) = cursors[bi].next_record()? {
             counts.add_input()?;
             if keep(&rec)? {
                 counts.add_output()?;
@@ -1140,7 +1189,7 @@ async fn merge_stream_into_parts(
     Ok(())
 }
 
-/// Open one input's cursor over `stream_id` and load its first record. Named
+/// Open one input's cursor over `stream_id` and load its first block. Named
 /// (not an inline `async` block) so its future is `Send`-general over the
 /// borrowed store; see the call site in [`merge_stream_into_parts`]. Returns
 /// `None` when the input does not carry the stream, or carries no record for
@@ -1156,7 +1205,7 @@ async fn open_cursor<'a>(
         return Ok(None);
     };
     cursor.refill(store, tracker).await?;
-    Ok(cursor.head.is_some().then_some(cursor))
+    Ok(cursor.peek_ts().is_some().then_some(cursor))
 }
 
 /// Encode one in-progress part's writer into an L1 object and PUT it: run the
@@ -3570,7 +3619,10 @@ mod tests {
     /// cursor then holds those *stored* bytes and decodes the group's blocks
     /// one at a time out of them, releasing each before the next (issue #748).
     /// So the decoded term is one block per input, as it was under version 3,
-    /// and the raw term is one row group of compressed bytes.
+    /// and the raw term is one row group of compressed bytes. Since ADR-0979
+    /// decision 1 that decoded block is held columnar and its charge is the
+    /// view's `heap_estimate()`, so the same bound is stated over a smaller
+    /// per-record figure (see `PER_RECORD_BOUND`).
     ///
     /// A single hot stream (the common log shape: one busy service carrying
     /// most of a sealed hour) is grown 10x across two runs. The
@@ -3583,11 +3635,15 @@ mod tests {
     /// accumulator, so peak scaled with stream size; a regression to that shape
     /// would push the `decoded` term to `O(stream)` and break the bound below.
     ///
-    /// Demonstrated red against the per-row-group decode issue #748 replaced:
-    /// flipping `StreamCursor::decode_next_block` back to
-    /// `decode_block(&loc, ..)` with `last` forced true doubles the decoded
-    /// term at this fixture's 2-block groups (transient 1452268 B against the
-    /// 1098000 B bound), failing `transient < TRANSIENT_BOUND`.
+    /// Demonstrated red against the row-form cursor ADR-0979 decision 1
+    /// replaced: charging `decode_block_in_group(&loc, block, ..)`'s
+    /// `estimate_record` sum in `StreamCursor::decode_next_block` instead of
+    /// the columnar view's `heap_estimate()` -- the shape where the cursor
+    /// holds the block's records -- raises the decoded term to the row form
+    /// (transient 726480 B against the 498000 B bound), failing
+    /// `transient < TRANSIENT_BOUND`. The earlier red, against the
+    /// per-row-group decode issue #748 replaced, was the same assertion at the
+    /// old bound: decoding a whole 2-block group doubled the term.
     ///
     /// Deterministic: it asserts on the tracker's accounting, never on process
     /// RSS or allocator hooks, and runs against [`MemoryStore`].
@@ -3602,12 +3658,13 @@ mod tests {
         // than this many blocks per input, so the bound genuinely binds rather
         // than happening to cover the whole stream.
         const L0_GROUP_BLOCKS: u64 = 2;
-        // Per-record upper bound on the decoded term. `estimate_record` charges
-        // the record's Rust-side heap since issue #711, so these tiny records
-        // estimate at ~242 bytes rather than the ~53 payload bytes this bound
-        // was first sized against. It is deliberately close to that figure:
-        // decoding a whole 2-block group instead of one block has to break it.
-        const PER_RECORD_BOUND: u64 = 350;
+        // Per-record upper bound on the decoded term. Since ADR-0979 decision 1
+        // a cursor holds its block COLUMNAR and the term is the block's
+        // `heap_estimate()`, which for these tiny records works out at ~108
+        // bytes per row against the ~242 the row form estimated. The bound is
+        // resized to match and stays deliberately close to it: a cursor that
+        // went back to holding the block's records has to break it.
+        const PER_RECORD_BOUND: u64 = 150;
         // Per-record upper bound on the raw term. Those are stored, compressed
         // bytes: a whole 3000-record input object here is 890 bytes, so this is
         // an order of magnitude of headroom.
@@ -3968,6 +4025,178 @@ mod tests {
         assert_eq!(
             hashes, EXPECTED_PART_HASHES,
             "part content_hash vector diverged from the pre-columnar-cursor pin"
+        );
+    }
+
+    // --- ADR-0979 D1 cursor-phase accounting ---------------------------------
+
+    /// The data object key [`seed_l0`] PUT for `(writer_id, seq)`, recomputed
+    /// from the bytes it returned exactly as it computed it.
+    fn seeded_data_key(writer_id: Uuid, seq: u64, bytes: &Bytes) -> String {
+        let content_hash: [u8; 32] = *blake3::hash(bytes).as_bytes();
+        keys::data_key(
+            &tenant_hash(),
+            Signal::Logs,
+            SHARD,
+            writer_id,
+            EPOCH,
+            seq,
+            &content_hash,
+        )
+        .expect("data key")
+    }
+
+    /// What one input's single candidate block costs a cursor, computed
+    /// independently of the compaction run: the columnar view's
+    /// `heap_estimate()` (what the cursor now holds) and the row-form
+    /// `estimate_record` sum over the same block (what it used to hold, and
+    /// what the tracker used to charge).
+    async fn cursor_block_terms(store: &MemoryStore, object_key: String) -> (u64, u64) {
+        // A tracker-free config: this reader is the test's own, and charging
+        // its catalog load would disturb the figures under assertion.
+        let catalog =
+            load_catalog_from_object(store, &CompactorConfig::default(), object_key, true)
+                .await
+                .expect("catalog");
+        let (stream_id, _) = stream_ident(0);
+        let locs = catalog
+            .reader
+            .stream_blocks(&stream_id)
+            .expect("stream blocks")
+            .expect("input carries the stream");
+        assert_eq!(locs.len(), 1, "fixture input is one row group");
+        assert_eq!(
+            locs[0].block_indices(),
+            &[0],
+            "fixture input is one block in that group"
+        );
+        let data = store
+            .get(
+                &catalog.object_key,
+                GetRange::Range(locs[0].start(), locs[0].end()),
+            )
+            .await
+            .expect("group bytes")
+            .data;
+        let heap = catalog
+            .reader
+            .block_rows_in_group(&locs[0], 0, data.as_ref())
+            .expect("columnar view")
+            .heap_estimate();
+        let row_form: u64 = catalog
+            .reader
+            .decode_block_in_group(&locs[0], 0, data.as_ref())
+            .expect("eager rows")
+            .iter()
+            .map(estimate_record)
+            .sum();
+        (heap, row_form)
+    }
+
+    /// ADR-0979 decision 1's accounting rebase: at its peak the cursor phase's
+    /// decoded term is EXACTLY the sum of the live cursors'
+    /// `StreamBlockRows::heap_estimate()`, and the row-form `estimate_record`
+    /// term the pre-D1 cursor charged is gone rather than added to.
+    ///
+    /// The fixture pins the geometry so the expected value is arithmetic, not
+    /// an observation: three inputs, one stream, one row group of one block
+    /// each, and records identical in every column but `ts_ns`, so all three
+    /// blocks cost the same and all three cursors are open at once (the merge
+    /// opens every input's cursor before it emits a record, and releases a
+    /// block only when it is drained). The peak is therefore `3 x
+    /// heap_estimate` and nothing else.
+    ///
+    /// Demonstrated red by adding the old charge back beside the new one in
+    /// `StreamCursor::decode_next_block` -- `let decoded_bytes =
+    /// rows.heap_estimate() + reader.decode_block_in_group(&loc, block,
+    /// data.as_ref())?.iter().map(estimate_record).sum::<u64>();` -- which
+    /// makes the peak `3 x (heap_estimate + row_form)` and fails the equality
+    /// below, the silent double-count the ADR names as this task's trap.
+    #[tokio::test]
+    async fn cursor_phase_charges_heap_estimate_once_per_open_cursor() {
+        const INPUTS: u64 = 3;
+        const ROWS_PER_INPUT: i64 = 6;
+
+        let store = MemoryStore::new();
+        let mut keys_seeded = Vec::new();
+        for j in 0..INPUTS {
+            // Identical in every column but ts_ns, so the three blocks are the
+            // same shape and the same size.
+            let recs: Vec<LogRecord> = (0..ROWS_PER_INPUT)
+                .map(|i| {
+                    record(
+                        0,
+                        (j as i64) * 1_000 + i,
+                        "row",
+                        vec![
+                            ("svc".into(), AttrValue::Str("v".into())),
+                            ("n".into(), AttrValue::I64(7)),
+                        ],
+                    )
+                })
+                .collect();
+            let writer_id = Uuid::from_u128(u128::from(j) + 1);
+            let seq = j + 1;
+            let bytes = seed_l0(
+                &store,
+                writer_id,
+                seq,
+                &recs,
+                RlogConfig::default(),
+                &["svc"],
+            )
+            .await;
+            keys_seeded.push(seeded_data_key(writer_id, seq, &bytes));
+        }
+
+        let mut terms = Vec::new();
+        for key in keys_seeded {
+            terms.push(cursor_block_terms(&store, key).await);
+        }
+        let (per_block, row_form) = terms[0];
+        assert!(
+            terms.iter().all(|&t| t == (per_block, row_form)),
+            "fixture inputs must be identical in geometry, got {terms:?}"
+        );
+        assert!(
+            row_form > 0,
+            "the old row-form term must be nonzero, or \
+             the double-charge below would be indistinguishable from the single charge"
+        );
+
+        let tracker = MergeMemoryTracker::new();
+        let config = CompactorConfig {
+            merge_memory_tracker: Some(tracker.clone()),
+            ..CompactorConfig::default()
+        };
+        let clock = FixedClock::new(sealed_now_ns());
+        compact_bucket(&store, &clock, &config, &bucket())
+            .await
+            .expect("compact");
+
+        let (_rec, parts) = read_output(&store).await;
+        let rows: usize = parts.iter().map(|p| decode_all(p).len()).sum();
+        assert_eq!(
+            rows as u64,
+            INPUTS * ROWS_PER_INPUT as u64,
+            "every seeded record survived the merge"
+        );
+
+        let peak = tracker.peak_cursor_decoded_bytes();
+        let both_charges = INPUTS * (per_block + row_form);
+        assert_eq!(
+            peak,
+            INPUTS * per_block,
+            "cursor-phase decoded peak must be exactly {INPUTS} x heap_estimate \
+             ({per_block} B each); {both_charges} would mean the deleted row-form \
+             charge ({row_form} B per block) is still applied alongside it"
+        );
+        // Stated separately so a regression that reintroduces the old charge
+        // fails on a message that names it, not only on the arithmetic above.
+        assert_ne!(
+            peak, both_charges,
+            "a cursor must never be charged under both the columnar and the \
+             row-form term in one phase snapshot"
         );
     }
 
