@@ -59,6 +59,16 @@ fn run(baseline: &Path, candidate: &Path) -> std::process::Output {
         .expect("run cost_regression_check")
 }
 
+fn run_with_bands(baseline: &Path, candidate: &Path, bands: &Path) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_cost_regression_check"))
+        .arg(baseline)
+        .arg(candidate)
+        .arg("--bands")
+        .arg(bands)
+        .output()
+        .expect("run cost_regression_check --bands")
+}
+
 #[test]
 fn identical_reports_exit_zero_and_list_every_figure() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -154,5 +164,73 @@ fn a_legacy_report_missing_the_request_surface_exits_two() {
     assert!(
         stderr.contains("request surface"),
         "names the missing surface: {stderr}"
+    );
+}
+
+#[test]
+fn a_malformed_report_exits_two_without_crashing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let base = write_report(dir.path(), "base.json", &baseline_report());
+    let bad = dir.path().join("bad.json");
+    std::fs::write(&bad, "{ not json").expect("write malformed fixture");
+
+    let out = run(&base, &bad);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a malformed report is a typed refusal: {out:?}"
+    );
+    let stderr = String::from_utf8(out.stderr).expect("utf8 stderr");
+    assert!(
+        stderr.contains("candidate: malformed report"),
+        "names which report failed to parse and why: {stderr}"
+    );
+    // A refusal is not a regression verdict, so no table was printed.
+    assert!(
+        String::from_utf8(out.stdout)
+            .expect("utf8 stdout")
+            .is_empty(),
+        "a refusal prints no comparison table"
+    );
+}
+
+#[test]
+fn the_checked_in_bands_toml_is_loadable_through_the_cli() {
+    // The `--bands` surface is what makes a threshold configuration rather
+    // than a constant, and the checked-in defaults document must be a file
+    // the shipping binary actually accepts.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let base = write_report(dir.path(), "base.json", &baseline_report());
+    let mut raised = baseline_report();
+    raised
+        .figures
+        .iter_mut()
+        .find(|f| f.name == "data_gets")
+        .expect("data_gets")
+        .value = Some(149167.0 * 1.02); // +2%
+    let cand = write_report(dir.path(), "cand.json", &raised);
+
+    let defaults = dir.path().join("defaults.toml");
+    std::fs::write(&defaults, include_str!("../cost_regression_bands.toml"))
+        .expect("write the checked-in bands");
+    let out = run_with_bands(&base, &cand, &defaults);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "the checked-in defaults keep data_gets exact, so +2% regresses: {out:?}"
+    );
+
+    // The same pair under a loosened band passes, proving the CLI reads the
+    // document rather than ignoring it and falling back to the defaults.
+    let loose = dir.path().join("loose.toml");
+    std::fs::write(
+        &loose,
+        "[data_gets]\nkind = \"percent\"\nallowance = 10.0\n",
+    )
+    .expect("write the override");
+    let out = run_with_bands(&base, &cand, &loose);
+    assert!(
+        out.status.success(),
+        "a 10% data_gets band admits the same +2%: {out:?}"
     );
 }
