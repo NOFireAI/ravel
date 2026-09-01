@@ -246,11 +246,22 @@ completes. The reconcile is MANDATORY, not an optimization: the default
 budget's sizing (the config doc's per-cursor residency figure) is
 derived from actual residency, so an implementation that holds the
 pre-decode ceiling for the cursor's lifetime over-charges against that
-sizing and aborts runs the default was chosen to admit. The paired
-invariant is pinned by a test in both directions: for every decoded
-block, `reservation ≥ heap_estimate()` (the ceiling really is a
-ceiling), and after reconcile the charged figure equals
-`heap_estimate()` exactly. Reservations are taken under the same admission lock that
+sizing and aborts runs the default was chosen to admit. The reconcile
+target is the cursor's COMPLETE resident footprint, all three D4 terms
+at their actuals: loc metadata + raw group bytes still retained (the
+cursor keeps raw bytes while decoding non-final blocks) +
+`heap_estimate()` for the decoded block. `reservation ==
+heap_estimate()` alone is wrong while raw bytes remain resident. On
+`refill`, before decoding block k+1 the charge GROWS atomically (under
+the same admission lock as the initial reserve) to at least
+`metadata + retained raw + ceiling(block k+1)` — a later, larger block
+must clear the budget before its decode starts, never after — then
+reconciles down to actuals once the decode completes. The paired
+invariant is pinned by a test in both directions and across the
+first-small/next-large sequence: at every point in a cursor's life the
+charge is ≥ its actual resident footprint (the ceiling really is a
+ceiling), and after each reconcile the charge equals that footprint
+exactly. Reservations are taken under the same admission lock that
 orders cursor opens, so concurrent admissions cannot each pass the check
 and then jointly allocate past the budget: the budget is enforced at
 reserve time, which is what makes D4 fail-closed rather than
