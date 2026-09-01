@@ -429,7 +429,10 @@ fn truncation_never_panics_at_any_boundary() {
 /// Entries carrying ADR-0873 declared-column stamps (field 15).
 fn stamped_entries() -> Vec<SnapshotEntry> {
     let mut entries = base_entries();
-    entries[0].declared_column_stats = vec![DeclaredColumnMinMax {
+    // Stamp the LAST entry: the tail truncation below then lands inside the
+    // stamp's field-15 submessage, not in a trailing unstamped entry.
+    let last = entries.len() - 1;
+    entries[last].declared_column_stats = vec![DeclaredColumnMinMax {
         name: "EventDate".to_string(),
         declared_type: 2,
         min: Some(DeclaredColumnStatValue {
@@ -458,8 +461,8 @@ fn a_truncated_declared_stat_submessage_is_a_typed_entry_decode_error() {
         full.len() > stamp_free.len(),
         "the stamp occupies bytes on the wire"
     );
-    // Cut inside the stamp: the first entry's length prefix still promises the
-    // stamped length, so the entry stream ends mid-submessage.
+    // Cut inside the stamp: the stamped (last) entry's length prefix still
+    // promises the stamped length, so the entry stream ends mid-submessage.
     let raw = full[..full.len() - (full.len() - stamp_free.len()) / 2].to_vec();
     let header = base_header(&entries, raw.len() as u64);
     let bytes = assemble(&header, &raw, None, None);
@@ -485,7 +488,8 @@ fn truncating_a_stamped_part_never_panics() {
     // about panics, this is the positive control that the corpus is stamped.
     let decoded = decode_part(&full, &PartLimits::default()).expect("stamped part decodes");
     assert_eq!(decoded.entries, entries);
-    assert_eq!(decoded.entries[0].declared_column_stats.len(), 1);
+    let stamped = decoded.entries.last().expect("entries nonempty");
+    assert_eq!(stamped.declared_column_stats.len(), 1);
 }
 
 // --- HEAD ---
