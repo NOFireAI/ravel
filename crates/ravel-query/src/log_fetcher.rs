@@ -1914,7 +1914,13 @@ impl LogSegmentFetcher {
         // per-sub-range accounting records the same GET total this funnel would.
         if seg_ref.object_size > self.block_range.max_fetch_run_bytes() {
             let pin = EtagPin::default();
-            let (bytes, _live_gets) = self
+            let fetch_span = tracing::debug_span!(
+                "page_fetch",
+                signal = "logs",
+                s3_requests = tracing::field::Empty,
+                s3_bytes = tracing::field::Empty,
+            );
+            let (bytes, live_gets, live_bytes) = self
                 .block_range
                 .covering_read(
                     seg_ref,
@@ -1925,7 +1931,10 @@ impl LogSegmentFetcher {
                     &pin,
                     accounting,
                 )
+                .instrument(fetch_span.clone())
                 .await?;
+            fetch_span.record("s3_requests", live_gets);
+            fetch_span.record("s3_bytes", live_bytes);
             return Ok(bytes);
         }
 
@@ -3188,7 +3197,7 @@ impl BlockRangeFetcher {
         phase: QueryPhase,
         pin: &EtagPin,
         accounting: &QueryAccounting,
-    ) -> Result<(Bytes, u64), LogFetchError> {
+    ) -> Result<(Bytes, u64, u64), LogFetchError> {
         if total_size <= self.max_fetch_run_bytes {
             let (bytes, live) = self
                 .cached_extent(
@@ -3205,13 +3214,18 @@ impl BlockRangeFetcher {
             if live {
                 self.observe_fetch_run(total_size);
             }
-            return Ok((bytes, u64::from(live)));
+            let live_bytes = if live { total_size } else { 0 };
+            return Ok((bytes, u64::from(live), live_bytes));
         }
 
         let key = seg_ref.data_object_key.as_str();
         let total = usize::try_from(total_size).map_err(|_| corrupt_range(key))?;
         let mut asm = ObjectAssembler::new(&self.assembly_pool, total);
         let mut live_gets = 0u64;
+        // Wire bytes actually moved: a sub-range served from cache moves none,
+        // so `bytes.len()` (the whole object) must never be charged as fetched
+        // on a partially cached covering read.
+        let mut live_bytes = 0u64;
         let mut start = 0u64;
         while start < total_size {
             let len = self.max_fetch_run_bytes.min(total_size - start);
@@ -3233,9 +3247,12 @@ impl BlockRangeFetcher {
             }
             asm.place(key, start, &bytes)?;
             live_gets += u64::from(live);
+            if live {
+                live_bytes += len;
+            }
             start = end;
         }
-        Ok((asm.into_bytes(), live_gets))
+        Ok((asm.into_bytes(), live_gets, live_bytes))
     }
 
     /// The coalescing gap in effect: an explicit [`Self::with_coalesce_gap`]
@@ -3998,7 +4015,7 @@ impl BlockRangeFetcher {
             // `ceil(object_size / bound)` sequential covering sub-range GETs.
             // Under request-minimal the crossover is saturated, so this is the
             // path every above-`block_range_threshold` object takes.
-            let (bytes, live_gets) = self
+            let (bytes, live_gets, live_bytes) = self
                 .covering_read(
                     seg_ref,
                     tenant_hash,
@@ -4014,7 +4031,7 @@ impl BlockRangeFetcher {
                 // name; any further segmented GETs are block-data reads.
                 stats.probe_gets = 1;
                 stats.block_range_gets = live_gets.saturating_sub(1);
-                stats.block_bytes_fetched = bytes.len() as u64;
+                stats.block_bytes_fetched = live_bytes;
             }
             stats.whole_object = true;
             return Ok((bytes, stats));
@@ -4249,7 +4266,7 @@ impl BlockRangeFetcher {
             // which is the amplification this path exists to avoid. Bounded by
             // the fetch bound (ADR-0996 decision 2): one covering GET at or under
             // the bound, else segmented covering sub-ranges.
-            let (bytes, live_gets) = self
+            let (bytes, live_gets, live_bytes) = self
                 .covering_read(
                     seg_ref,
                     tenant_hash,
@@ -4262,7 +4279,7 @@ impl BlockRangeFetcher {
                 .await?;
             if live_gets > 0 {
                 stats.block_range_gets = live_gets;
-                stats.block_bytes_fetched = bytes.len() as u64;
+                stats.block_bytes_fetched = live_bytes;
             }
             stats.whole_object = true;
             // Still admit per-block cache entries so a later partition's fetch of
@@ -4551,7 +4568,7 @@ impl BlockRangeFetcher {
         if coverage >= self.coverage_threshold {
             // Bounded by the fetch bound (ADR-0996 decision 2), like the
             // version-3 coverage crossover above.
-            let (bytes, live_gets) = self
+            let (bytes, live_gets, live_bytes) = self
                 .covering_read(
                     seg_ref,
                     tenant_hash,
@@ -4564,7 +4581,7 @@ impl BlockRangeFetcher {
                 .await?;
             if live_gets > 0 {
                 stats.block_range_gets = live_gets;
-                stats.block_bytes_fetched = bytes.len() as u64;
+                stats.block_bytes_fetched = live_bytes;
             }
             stats.whole_object = true;
             // No per-block cache admission from the whole object here, unlike
