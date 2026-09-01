@@ -15,7 +15,19 @@
 //! a FAILURE naming it, never a silent skip. The one exception is the
 //! absent-not-zero convention ([`crate::report::RequestCounts`] renders a
 //! backend that cannot bill as `None`, never `0`): a figure whose VALUE is
-//! absent in BOTH reports passes as equally-absent and says so.
+//! absent in BOTH reports passes as equally-absent and says so. A figure CLASS
+//! the bands declare expected but that no figure in a report carries fails
+//! naming the class, for the same reason: a band nobody emitted a figure for is
+//! a band that passed vacuously.
+//!
+//! # Absolutes
+//!
+//! Beside the per-figure bands sit the baseline-independent gates
+//! ([`Absolutes`]): a physical amplification ceiling and floor, the
+//! request-minimal plan-shape rule on ranged opens, and the optional
+//! corpus-scale ceilings. These judge EACH report on its own, so a defect both
+//! reports share (an amplification of 0.999, which no real scan can produce)
+//! fails instead of comparing equal.
 //!
 //! # Profile guard
 //!
@@ -181,6 +193,13 @@ fn price_digest(profile: Option<&StoreCostProfile>) -> String {
     }
 }
 
+/// The effective-policy stamp value the plan-shape absolutes are defined over:
+/// the name [`ravel_query::LogsFetchPolicy::RequestMinimal`] renders itself as.
+/// `as_str` is not `const`, so the string is spelled once here and pinned to
+/// that enum by `the_request_minimal_stamp_matches_the_policys_own_name`; a
+/// rename there fails that test rather than silently disabling a gate.
+const REQUEST_MINIMAL_POLICY: &str = "request-minimal";
+
 /// A machine-readable cost report: the profile it was priced at and every
 /// compared figure. A `Vec` (not a map) so a figure emitted twice survives
 /// deserialization as a duplicate rather than collapsing to last-wins.
@@ -188,6 +207,13 @@ fn price_digest(profile: Option<&StoreCostProfile>) -> String {
 pub struct CostReport {
     /// The cost-profile stamp; the profile guard reads its effective profile.
     pub profile: ProfileStamp,
+    /// The effective logs-fetch policy the run executed under, as
+    /// [`ravel_query::LogsFetchPolicy::as_str`] renders it, or `None` on a lane
+    /// that does not record one. The plan-shape absolutes are defined only over
+    /// a request-minimal run, so without this stamp the tool does not assert
+    /// them (see [`Absolutes`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_policy: Option<String>,
     /// Every figure, in emission order.
     pub figures: Vec<Figure>,
 }
@@ -197,6 +223,13 @@ impl CostReport {
     /// refusal rather than a panic.
     pub fn from_json_str(s: &str) -> Result<CostReport, CompareError> {
         serde_json::from_str(s).map_err(|e| CompareError::Malformed(e.to_string()))
+    }
+
+    /// Whether this report stamps a request-minimal effective policy. An absent
+    /// stamp is NOT request-minimal: the tool cannot know what the run did, so
+    /// it does not assert the plan-shape rule against it.
+    fn is_request_minimal(&self) -> bool {
+        self.effective_policy.as_deref() == Some(REQUEST_MINIMAL_POLICY)
     }
 
     /// The request surface a real measurement always carries: at least one
@@ -210,10 +243,17 @@ impl CostReport {
     }
 }
 
+/// A tiny relative epsilon so float noise at a *ranged* band edge does not read
+/// as a regression. Applied only to the `Percent`/`PercentTwoSided`/`Absolute`
+/// arms and to the absolute gates; an `Exact` band never uses it (see
+/// [`Band::regresses`]).
+fn edge_eps(x: f64) -> f64 {
+    x.abs() * 1e-9 + f64::EPSILON
+}
+
 /// A per-figure band. The comparison loop reads only this, never a hardcoded
 /// constant, so every threshold is configuration.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Band {
     /// Candidate must equal baseline exactly. Any difference, up or down,
     /// fails. Used for deterministic geometry (object count, ranged opens) and
@@ -222,6 +262,11 @@ pub enum Band {
     /// Candidate may exceed baseline by at most `allowance` percent. A decrease
     /// is an improvement and passes.
     Percent { allowance: f64 },
+    /// Candidate must stay within `allowance` percent of baseline in EITHER
+    /// direction: a decrease past the band fails too. Used for a redundant
+    /// cross-check figure (modeled request cost) where a drop under an
+    /// unchanged stamp signals a model bug, not an improvement.
+    PercentTwoSided { allowance: f64 },
     /// Candidate may exceed baseline by at most `allowance` in the figure's own
     /// units. A decrease passes.
     Absolute { allowance: f64 },
@@ -229,64 +274,263 @@ pub enum Band {
 
 impl Band {
     /// Whether `candidate` regresses past this band relative to `baseline`.
-    /// Only an INCREASE past the allowance is a regression; a decrease is an
-    /// improvement. `Exact` treats any difference as a regression.
     ///
-    /// The comparison carries a tiny relative epsilon so float noise at the
-    /// band edge does not read as a regression; an exact band on integer-valued
-    /// figures is unaffected because whole f64 values compare exactly.
+    /// For `Percent`/`Absolute` only an INCREASE past the allowance is a
+    /// regression; a decrease is an improvement. `PercentTwoSided` fails on a
+    /// move past the allowance in either direction. `Exact` means EXACT at all
+    /// magnitudes: any difference fails, with no epsilon (a relative epsilon
+    /// would silently admit drift at large baselines, e.g. `2e9` admitting
+    /// `2e9 + 1`). Whole f64 values compare exactly, so an integer-valued exact
+    /// figure is unaffected.
     fn regresses(self, baseline: f64, candidate: f64) -> bool {
-        let eps = |x: f64| x.abs() * 1e-9 + f64::EPSILON;
         match self {
-            Band::Exact => (candidate - baseline).abs() > eps(baseline),
+            Band::Exact => candidate != baseline,
             Band::Percent { allowance } => {
                 let threshold = baseline * (1.0 + allowance / 100.0);
-                candidate - threshold > eps(threshold)
+                candidate - threshold > edge_eps(threshold)
+            }
+            Band::PercentTwoSided { allowance } => {
+                let margin = baseline.abs() * (allowance / 100.0);
+                (candidate - baseline).abs() - margin > edge_eps(baseline)
             }
             Band::Absolute { allowance } => {
                 let threshold = baseline + allowance;
-                candidate - threshold > eps(threshold)
+                candidate - threshold > edge_eps(threshold)
             }
         }
     }
 
     /// A compact rendering for the report table, e.g. `"exact"`, `"+5%"`,
-    /// `"+0.05"`.
+    /// `"±1%"`, `"+0.05"`.
     fn render(self) -> String {
         match self {
             Band::Exact => "exact".to_string(),
             Band::Percent { allowance } => format!("+{allowance}%"),
+            Band::PercentTwoSided { allowance } => format!("±{allowance}%"),
             Band::Absolute { allowance } => format!("+{allowance}"),
         }
     }
 }
 
-/// The band for every figure class. The comparison loop resolves a figure's
-/// band through `Self::for_class`; defaults live in [`Self::defaults`] and are
-/// mirrored by the checked-in TOML, so a threshold is data with a named home,
-/// never a magic number in the loop.
+/// Absolute, baseline-independent gates (ADR-0996 verification plan). Unlike a
+/// [`Band`], which judges a candidate against a baseline, these judge EACH
+/// report on its own: a physical ceiling/floor that no comparison can excuse.
+///
+/// - `range_amplification_ceiling` / `range_amplification_floor`: full-scan
+///   amplification is bounded above (`<= 1.05`) and floored at the physical
+///   `1.0`. A value below the floor is a broken measurement (you cannot move
+///   fewer bytes than the data holds), so it FAILS rather than passing as an
+///   improvement.
+/// - `ranged_opens_max`: a request-minimal full scan opens zero ranged
+///   segments. Enforced only when the report stamps a request-minimal effective
+///   policy ([`CostReport::effective_policy`]); without the stamp the tool
+///   cannot know the run was request-minimal, so it does not assert it.
+/// - `cold_gets_max` / `modeled_cost_max_nanodollars`: corpus-scale absolutes.
+///   Corpus-specific, so the checked-in defaults leave them unset (`None`) and
+///   the TOML ships them commented out with the corpus named; setting one gates
+///   the [`FigureClass::DataGets`] / [`FigureClass::ModeledRequestCost`]
+///   figures against that ceiling.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Absolutes {
+    /// Upper bound on any range-amplification figure. `None` disables.
+    pub range_amplification_ceiling: Option<f64>,
+    /// Physical floor; a value below it is a broken measurement. `None`
+    /// disables.
+    pub range_amplification_floor: Option<f64>,
+    /// Max ranged opens under a request-minimal effective policy stamp. `None`
+    /// disables.
+    pub ranged_opens_max: Option<f64>,
+    /// Corpus-scale max cold GETs. `None` (default) disables.
+    pub cold_gets_max: Option<f64>,
+    /// Corpus-scale max modeled request cost, nanodollars. `None` (default)
+    /// disables.
+    pub modeled_cost_max_nanodollars: Option<f64>,
+}
+
+impl Absolutes {
+    /// The checked-in defaults: the ADR figures for amplification and ranged
+    /// opens; the corpus-scale ceilings unset, since they must not fail a corpus
+    /// other than the one they were measured on.
+    pub fn defaults() -> Absolutes {
+        Absolutes {
+            range_amplification_ceiling: Some(1.05),
+            range_amplification_floor: Some(1.0),
+            ranged_opens_max: Some(0.0),
+            cold_gets_max: None,
+            modeled_cost_max_nanodollars: None,
+        }
+    }
+
+    /// Judge ONE value of `class` from ONE report on its own, with no baseline
+    /// in play, and return the reason a gate refuses it.
+    ///
+    /// `request_minimal` is that report's own effective-policy stamp
+    /// ([`CostReport::effective_policy`]): the ranged-opens gate states the
+    /// plan-shape rule for a request-minimal run and says nothing about any
+    /// other policy, so an unstamped or differently-stamped report skips it.
+    /// The relative [`edge_eps`] applies here for the same reason it applies to
+    /// the ranged bands: these are ratio and cost figures, not exact geometry.
+    fn violation(&self, class: FigureClass, value: f64, request_minimal: bool) -> Option<String> {
+        match class {
+            FigureClass::RangeAmplification => {
+                if let Some(ceiling) = self.range_amplification_ceiling
+                    && value - ceiling > edge_eps(ceiling)
+                {
+                    return Some(format!(
+                        "range amplification {} exceeds the absolute ceiling {}",
+                        render_number(value),
+                        render_number(ceiling),
+                    ));
+                }
+                let floor = self.range_amplification_floor?;
+                (floor - value > edge_eps(floor)).then(|| {
+                    format!(
+                        "range amplification {} is below the physical floor {}: a scan cannot \
+                         move fewer bytes than the data holds, so this is a broken measurement, \
+                         never an improvement",
+                        render_number(value),
+                        render_number(floor),
+                    )
+                })
+            }
+            // Gated on the stamp, not asserted blindly: a byte-minimal run opens
+            // ranged segments on purpose and is not a regression.
+            FigureClass::RangedOpens if request_minimal => {
+                let max = self.ranged_opens_max?;
+                (value - max > edge_eps(max)).then(|| {
+                    format!(
+                        "{} ranged opens under a `{REQUEST_MINIMAL_POLICY}` effective policy, \
+                         which reads every object whole and so opens at most {}",
+                        render_number(value),
+                        render_number(max),
+                    )
+                })
+            }
+            FigureClass::DataGets => {
+                let max = self.cold_gets_max?;
+                (value - max > edge_eps(max)).then(|| {
+                    format!(
+                        "{} data GETs exceeds the corpus-scale ceiling {}",
+                        render_number(value),
+                        render_number(max),
+                    )
+                })
+            }
+            FigureClass::ModeledRequestCost => {
+                let max = self.modeled_cost_max_nanodollars?;
+                (value - max > edge_eps(max)).then(|| {
+                    format!(
+                        "modeled request cost {} nanodollars exceeds the corpus-scale ceiling {}",
+                        render_number(value),
+                        render_number(max),
+                    )
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The band for every figure class, whether the class is expected present, and
+/// the absolute gates. The comparison loop resolves a figure's band through
+/// `Self::for_class`; defaults live in [`Self::defaults`] and are mirrored by
+/// the checked-in TOML, so a threshold is data with a named home, never a magic
+/// number in the loop.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Bands {
     bands: BTreeMap<FigureClass, Band>,
+    /// Per class, whether at least one figure of that class must appear in both
+    /// reports. A class expected but absent from both is a failure naming it,
+    /// not a silent skip.
+    expected: BTreeMap<FigureClass, bool>,
+    /// Baseline-independent gates applied to each report.
+    absolutes: Absolutes,
 }
 
-/// The overridable TOML surface: one optional band per class. A document that
-/// sets a subset leaves the rest at their default; an unknown key is refused so
-/// a misspelled figure name fails loudly instead of leaving a default silently
-/// in force.
+/// One band table in the TOML: `kind` plus the `allowance` its kind needs, plus
+/// the optional per-class `expected` flag. A dedicated struct (not
+/// `Option<Band>`) so `deny_unknown_fields` refuses a stray key INSIDE the
+/// table too -- an internally-tagged enum cannot carry `deny_unknown_fields`,
+/// so a misspelled `allowanace` would otherwise slip through as a default band.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BandToml {
+    kind: BandKind,
+    #[serde(default)]
+    allowance: Option<f64>,
+    #[serde(default)]
+    expected: Option<bool>,
+}
+
+/// The band kinds a TOML table may name. Kept separate from [`Band`] so the
+/// wire form is a flat `kind = "..."` string plus an `allowance`, validated
+/// into a [`Band`] where a missing allowance is a typed refusal.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum BandKind {
+    Exact,
+    Percent,
+    PercentTwoSided,
+    Absolute,
+}
+
+impl BandToml {
+    /// Validate this table into a [`Band`], refusing a kind whose required
+    /// `allowance` is missing.
+    fn to_band(&self, class: FigureClass) -> Result<Band, CompareError> {
+        let allowance = || {
+            self.allowance.ok_or_else(|| {
+                CompareError::MalformedBands(format!(
+                    "band `{class}` requires an `allowance` for its kind"
+                ))
+            })
+        };
+        Ok(match self.kind {
+            BandKind::Exact => Band::Exact,
+            BandKind::Percent => Band::Percent {
+                allowance: allowance()?,
+            },
+            BandKind::PercentTwoSided => Band::PercentTwoSided {
+                allowance: allowance()?,
+            },
+            BandKind::Absolute => Band::Absolute {
+                allowance: allowance()?,
+            },
+        })
+    }
+}
+
+/// The overridable TOML surface: one optional band table per class plus an
+/// optional `[absolute]` section. A document that sets a subset leaves the rest
+/// at their default; an unknown key is refused so a misspelled figure name
+/// fails loudly instead of leaving a default silently in force.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BandsToml {
-    object_count: Option<Band>,
-    write_class_requests: Option<Band>,
-    data_gets: Option<Band>,
-    range_amplification: Option<Band>,
-    modeled_request_cost: Option<Band>,
-    bytes: Option<Band>,
-    latency_p50: Option<Band>,
-    latency_p95: Option<Band>,
-    peak_memory: Option<Band>,
-    ranged_opens: Option<Band>,
+    object_count: Option<BandToml>,
+    write_class_requests: Option<BandToml>,
+    data_gets: Option<BandToml>,
+    range_amplification: Option<BandToml>,
+    modeled_request_cost: Option<BandToml>,
+    bytes: Option<BandToml>,
+    latency_p50: Option<BandToml>,
+    latency_p95: Option<BandToml>,
+    peak_memory: Option<BandToml>,
+    ranged_opens: Option<BandToml>,
+    #[serde(default)]
+    absolute: Option<AbsolutesToml>,
+}
+
+/// The `[absolute]` TOML table. Every key optional; an omitted key keeps its
+/// compiled default (TOML has no null, so a present key is always an override).
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AbsolutesToml {
+    range_amplification_ceiling: Option<f64>,
+    range_amplification_floor: Option<f64>,
+    ranged_opens_max: Option<f64>,
+    cold_gets_max: Option<f64>,
+    modeled_cost_max_nanodollars: Option<f64>,
 }
 
 impl Bands {
@@ -305,9 +549,12 @@ impl Bands {
     /// - `range_amplification`: ABSOLUTE +0.05. The ADR bands full-scan
     ///   amplification at <= 1.05 over the 1.0 floor; a comparison allows the
     ///   candidate the same +0.05 headroom over the baseline.
-    /// - `modeled_request_cost`: PERCENT +1%. Modeled from billed attempts, so
-    ///   it tracks the request count; 1% absorbs profile-rounding while still
-    ///   flagging real growth.
+    /// - `modeled_request_cost`: PERCENT TWO-SIDED ±1%. Modeled from billed
+    ///   attempts, so it tracks the request count; 1% absorbs profile-rounding.
+    ///   Two-sided because the figure is a redundant cross-check: under an
+    ///   unchanged stamp and unchanged request counts the modeled cost must not
+    ///   move, so a DROP (a model bug that underprices) fails the same as a
+    ///   rise, rather than passing as an improvement.
     /// - `bytes`: PERCENT +5%. Wire bytes carry coalesced holes that shift with
     ///   object geometry; 5% covers that jitter.
     /// - `latency_p50`: PERCENT +1%. The repo's hot-path noise floor is
@@ -317,6 +564,13 @@ impl Bands {
     ///   a tail figure, so 5% is the matching floor.
     /// - `peak_memory`: PERCENT +10%. The ADR peak-residency band is +/-10% vs
     ///   baseline; the regression gate keeps the +10% upper half.
+    ///
+    /// Expected presence: every class defaults to expected, EXCEPT the four the
+    /// shipping [`crate::report::BenchReport`] does not yet carry a figure for
+    /// (`object_count`, `range_amplification`, `ranged_opens`, `peak_memory`).
+    /// Defaulting those expected would fail the gate on every real report until
+    /// their counters exist (task 996-7 STOP-and-report); the checked-in TOML
+    /// mirrors this so the gate is usable now on the figures the bench emits.
     pub fn defaults() -> Bands {
         let mut bands = BTreeMap::new();
         bands.insert(FigureClass::ObjectCount, Band::Exact);
@@ -328,14 +582,34 @@ impl Bands {
         );
         bands.insert(
             FigureClass::ModeledRequestCost,
-            Band::Percent { allowance: 1.0 },
+            Band::PercentTwoSided { allowance: 1.0 },
         );
         bands.insert(FigureClass::Bytes, Band::Percent { allowance: 5.0 });
         bands.insert(FigureClass::LatencyP50, Band::Percent { allowance: 1.0 });
         bands.insert(FigureClass::LatencyP95, Band::Percent { allowance: 5.0 });
         bands.insert(FigureClass::PeakMemory, Band::Percent { allowance: 10.0 });
         bands.insert(FigureClass::RangedOpens, Band::Exact);
-        Bands { bands }
+
+        let mut expected = BTreeMap::new();
+        for class in FigureClass::ALL {
+            expected.insert(class, true);
+        }
+        // Not yet emitted by BenchReport (STOP-and-report, task 996-7): do not
+        // require their presence or the gate fails on every real report.
+        for class in [
+            FigureClass::ObjectCount,
+            FigureClass::RangeAmplification,
+            FigureClass::RangedOpens,
+            FigureClass::PeakMemory,
+        ] {
+            expected.insert(class, false);
+        }
+
+        Bands {
+            bands,
+            expected,
+            absolutes: Absolutes::defaults(),
+        }
     }
 
     /// Load bands from a TOML document, filling any class the document omits
@@ -356,9 +630,30 @@ impl Bands {
             (FigureClass::PeakMemory, parsed.peak_memory),
             (FigureClass::RangedOpens, parsed.ranged_opens),
         ];
-        for (class, band) in overrides {
-            if let Some(band) = band {
-                bands.bands.insert(class, band);
+        for (class, table) in overrides {
+            if let Some(table) = table {
+                bands.bands.insert(class, table.to_band(class)?);
+                if let Some(expected) = table.expected {
+                    bands.expected.insert(class, expected);
+                }
+            }
+        }
+        if let Some(abs) = parsed.absolute {
+            let base = &mut bands.absolutes;
+            if let Some(v) = abs.range_amplification_ceiling {
+                base.range_amplification_ceiling = Some(v);
+            }
+            if let Some(v) = abs.range_amplification_floor {
+                base.range_amplification_floor = Some(v);
+            }
+            if let Some(v) = abs.ranged_opens_max {
+                base.ranged_opens_max = Some(v);
+            }
+            if let Some(v) = abs.cold_gets_max {
+                base.cold_gets_max = Some(v);
+            }
+            if let Some(v) = abs.modeled_cost_max_nanodollars {
+                base.modeled_cost_max_nanodollars = Some(v);
             }
         }
         Ok(bands)
@@ -373,6 +668,18 @@ impl Bands {
             .get(&class)
             .copied()
             .unwrap_or(Band::Percent { allowance: 0.0 })
+    }
+
+    /// Whether a figure of `class` must appear in both reports. Defaults to
+    /// true for a class not named (a new class is expected until told
+    /// otherwise).
+    fn is_expected(&self, class: FigureClass) -> bool {
+        self.expected.get(&class).copied().unwrap_or(true)
+    }
+
+    /// The absolute gates.
+    pub fn absolutes(&self) -> &Absolutes {
+        &self.absolutes
     }
 }
 
@@ -494,17 +801,33 @@ pub struct Row {
     pub verdict: Verdict,
 }
 
-/// The full comparison result: one row per compared figure.
+/// A figure class the bands declare expected that a report carries no figure
+/// of. Not a row (there is no figure to put in one), and not a silent skip: an
+/// expected class nobody emitted would otherwise pass the gate by never being
+/// compared.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MissingClass {
+    /// The class no figure carried.
+    pub class: FigureClass,
+    /// Where it is missing: `"both reports"`, `"the baseline report"`, or
+    /// `"the candidate report"`.
+    pub which: String,
+}
+
+/// The full comparison result: one row per compared figure, plus any expected
+/// class that no figure carried.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Comparison {
     /// Rows, sorted by figure name for a stable table.
     pub rows: Vec<Row>,
+    /// Expected classes absent from a report. Non-empty fails the gate.
+    pub missing_expected: Vec<MissingClass>,
 }
 
 impl Comparison {
-    /// Whether any figure regressed.
+    /// Whether any figure regressed, or an expected class was absent.
     pub fn regressed(&self) -> bool {
-        self.rows.iter().any(|r| r.verdict.is_fail())
+        self.rows.iter().any(|r| r.verdict.is_fail()) || !self.missing_expected.is_empty()
     }
 
     /// Render the comparison as an aligned table a human reads.
@@ -567,6 +890,15 @@ impl Comparison {
                 out.push_str(&format!("{:width$}  ^ {reason}\n", "", width = name_w));
             }
         }
+        // An expected class nobody emitted has no row to fail, so it is named
+        // under the table rather than left to a reader noticing an absence.
+        for missing in &self.missing_expected {
+            out.push_str(&format!(
+                "MISSING: the bands declare `{}` expected, but no figure of that class appears in \
+                 {}\n",
+                missing.class, missing.which,
+            ));
+        }
         out
     }
 }
@@ -627,6 +959,14 @@ fn unpriced_modeled_costs(baseline: &CostReport, candidate: &CostReport) -> Vec<
 /// different effective profiles. Otherwise returns a [`Comparison`] whose
 /// [`Comparison::regressed`] is the gate result; the comparison always carries
 /// one row per compared figure, pass or fail.
+///
+/// Three independent checks feed that verdict:
+///
+/// 1. the per-figure [`Band`], candidate against baseline;
+/// 2. the [`Absolutes`], judging EACH report's value on its own, so a physical
+///    ceiling or floor cannot be excused by a baseline that shares the defect;
+/// 3. expected-class presence ([`Comparison::missing_expected`]), so a class
+///    the bands declare expected cannot pass by never being emitted.
 pub fn compare(
     baseline: &CostReport,
     candidate: &CostReport,
@@ -665,14 +1005,20 @@ pub fn compare(
         }
     }
 
-    let base_index = FigureIndex::build(baseline);
-    let cand_index = FigureIndex::build(candidate);
+    let ctx = CompareContext {
+        base_index: FigureIndex::build(baseline),
+        cand_index: FigureIndex::build(candidate),
+        bands,
+        base_request_minimal: baseline.is_request_minimal(),
+        cand_request_minimal: candidate.is_request_minimal(),
+    };
 
     // The union of figure names across both reports, sorted for a stable table.
-    let mut names: Vec<&str> = base_index
+    let mut names: Vec<&str> = ctx
+        .base_index
         .by_name
         .keys()
-        .chain(cand_index.by_name.keys())
+        .chain(ctx.cand_index.by_name.keys())
         .copied()
         .collect();
     names.sort_unstable();
@@ -680,29 +1026,65 @@ pub fn compare(
 
     let mut rows = Vec::with_capacity(names.len());
     for name in names {
-        let base_fig = base_index.by_name.get(name).copied();
-        let cand_fig = cand_index.by_name.get(name).copied();
-        rows.push(compare_one(
-            name,
-            base_fig,
-            cand_fig,
-            &base_index,
-            &cand_index,
-            bands,
-        ));
+        let base_fig = ctx.base_index.by_name.get(name).copied();
+        let cand_fig = ctx.cand_index.by_name.get(name).copied();
+        rows.push(compare_one(&ctx, name, base_fig, cand_fig));
     }
 
-    Ok(Comparison { rows })
+    Ok(Comparison {
+        rows,
+        missing_expected: missing_expected_classes(baseline, candidate, bands),
+    })
+}
+
+/// Every class the bands declare expected that carries no figure in one or both
+/// reports. A class expected and never emitted passes every band it never
+/// produced a row for, which is exactly the vacuous pass the present-exactly-
+/// once discipline forbids.
+fn missing_expected_classes(
+    baseline: &CostReport,
+    candidate: &CostReport,
+    bands: &Bands,
+) -> Vec<MissingClass> {
+    let mut missing = Vec::new();
+    for class in FigureClass::ALL {
+        if !bands.is_expected(class) {
+            continue;
+        }
+        let carries = |report: &CostReport| report.figures.iter().any(|f| f.class == class);
+        let which = match (carries(baseline), carries(candidate)) {
+            (true, true) => continue,
+            (false, false) => "both reports",
+            (false, true) => "the baseline report",
+            (true, false) => "the candidate report",
+        };
+        missing.push(MissingClass {
+            class,
+            which: which.to_string(),
+        });
+    }
+    missing
+}
+
+/// Everything `compare_one` reads that is the same for every figure: the two
+/// reports' indexes, the bands, and each report's own effective-policy stamp
+/// (the absolute gates judge each report on its own, so the two stamps do not
+/// collapse into one flag).
+struct CompareContext<'a> {
+    base_index: FigureIndex<'a>,
+    cand_index: FigureIndex<'a>,
+    bands: &'a Bands,
+    base_request_minimal: bool,
+    cand_request_minimal: bool,
 }
 
 fn compare_one(
+    ctx: &CompareContext<'_>,
     name: &str,
     base_fig: Option<&Figure>,
     cand_fig: Option<&Figure>,
-    base_index: &FigureIndex<'_>,
-    cand_index: &FigureIndex<'_>,
-    bands: &Bands,
 ) -> Row {
+    let (base_index, cand_index, bands) = (&ctx.base_index, &ctx.cand_index, ctx.bands);
     // Class is whichever report carries the figure; if both carry it and the
     // classes disagree, that is itself a wrong-basis failure.
     let class = base_fig
@@ -786,6 +1168,24 @@ fn compare_one(
         return row;
     }
 
+    // Absolute gates first: they judge each report on its own, so a value a
+    // physical ceiling or floor rejects is a broken measurement, and naming it
+    // that way says more than "regressed against a baseline" would. A baseline
+    // that violates one fails too -- the gate is not a comparison, and a broken
+    // baseline cannot excuse a candidate.
+    let absolutes = bands.absolutes();
+    for (value, request_minimal, which) in [
+        (base_fig.value, ctx.base_request_minimal, "baseline"),
+        (cand_fig.value, ctx.cand_request_minimal, "candidate"),
+    ] {
+        if let Some(value) = value
+            && let Some(reason) = absolutes.violation(class, value, request_minimal)
+        {
+            row.verdict = Verdict::Fail(format!("figure `{name}` in the {which} report: {reason}"));
+            return row;
+        }
+    }
+
     row.verdict = match (base_fig.value, cand_fig.value) {
         // The absent-not-zero convention: equally absent in both reports is an
         // equal absence, not a regression.
@@ -827,13 +1227,16 @@ mod tests {
     }
 
     /// A full baseline report carrying one figure of every class, all present
-    /// and priced at the reference profile.
+    /// and priced at the reference profile. No effective-policy stamp: the
+    /// request-minimal plan-shape absolute is exercised by
+    /// [`request_minimal_report`], not by every case here.
     fn baseline_report() -> CostReport {
         CostReport {
             profile: ProfileStamp {
                 requested: StoreCostProfile::reference(),
                 effective: Some(StoreCostProfile::reference()),
             },
+            effective_policy: None,
             figures: vec![
                 fig("object_count", FigureClass::ObjectCount, Some(3469.0), None),
                 fig(
@@ -1096,20 +1499,49 @@ mod tests {
 
         // Without a valued cost figure there is nothing to denominate, so an
         // unstamped pair compares normally: the guard is scoped to priced
-        // figures, it does not ban the Flight lane from the gate outright.
+        // figures, it does not ban the Flight lane from the gate outright. Such
+        // a lane declares the class unexpected in its bands document; that is
+        // what makes dropping the figure a decision on the record rather than an
+        // absence the gate cannot see.
         let strip = |mut r: CostReport| {
             r.figures
                 .retain(|f| f.class != FigureClass::ModeledRequestCost);
             r.profile.effective = None;
             r
         };
+        let unpriced_lane = Bands::from_toml_str(
+            "[modeled_request_cost]\nkind = \"percent_two_sided\"\nallowance = 1.0\nexpected = \
+             false\n",
+        )
+        .expect("parse the unpriced-lane bands");
+        let cmp = compare(
+            &strip(baseline_report()),
+            &strip(baseline_report()),
+            &unpriced_lane,
+        )
+        .expect("an unstamped pair with no priced figure is comparable");
+        assert!(!cmp.regressed());
+
+        // And the same pair under the SHIPPING defaults, which do expect the
+        // class, fails naming it: an expected class nobody emitted must not pass
+        // by never being compared.
         let cmp = compare(
             &strip(baseline_report()),
             &strip(baseline_report()),
             &Bands::defaults(),
         )
-        .expect("an unstamped pair with no priced figure is comparable");
-        assert!(!cmp.regressed());
+        .expect("comparable");
+        assert!(
+            cmp.regressed(),
+            "an expected class dropped from both reports"
+        );
+        assert_eq!(
+            cmp.missing_expected,
+            vec![MissingClass {
+                class: FigureClass::ModeledRequestCost,
+                which: "both reports".to_string(),
+            }]
+        );
     }
 
     #[test]
@@ -1156,6 +1588,7 @@ mod tests {
                 requested: StoreCostProfile::reference(),
                 effective: Some(StoreCostProfile::reference()),
             },
+            effective_policy: None,
             figures: vec![fig(
                 "latency_p95",
                 FigureClass::LatencyP95,
@@ -1312,21 +1745,69 @@ mod tests {
     }
 
     #[test]
-    fn an_improvement_is_not_a_regression_on_a_ranged_band() {
-        // A percent/absolute-band figure moving DOWN is an improvement, never a
-        // regression. (An EXACT-band figure fails on any drift, up or down, by
-        // design: it is a drift detector, not a one-sided guard -- see
-        // `Band::Exact`.)
+    fn an_improvement_is_not_a_regression_on_a_one_sided_band() {
+        // A ONE-SIDED percent/absolute-band figure moving DOWN is an
+        // improvement, never a regression. `bytes` (+5%) and `latency_p95`
+        // (+5%) are one-sided, so both drops pass.
+        //
+        // Two classes are deliberately excluded: an EXACT-band figure fails on
+        // any drift by design (`Band::Exact` is a drift detector), and
+        // `modeled_request_cost` is TWO-SIDED, so its drop fails -- see
+        // `a_modeled_cost_drop_fails_the_two_sided_band`.
         let base = baseline_report();
         let cand = with_value(
-            with_value(baseline_report(), "modeled_request_cost", Some(50_000.0)),
+            with_value(baseline_report(), "wire_bytes", Some(800_000.0)),
             "latency_p95",
             Some(80.0),
         );
         let cmp = compare(&base, &cand, &Bands::defaults()).expect("comparable");
         assert!(
             !cmp.regressed(),
-            "ranged-band figures moving down do not regress"
+            "one-sided ranged-band figures moving down do not regress:\n{}",
+            cmp.render_table()
+        );
+    }
+
+    #[test]
+    fn a_modeled_cost_drop_fails_the_two_sided_band() {
+        // The redundant-cross-check rule: under an UNCHANGED profile stamp and
+        // unchanged request counts, the modeled cost cannot legitimately fall.
+        // A drop is a model bug that underprices the pass, so the two-sided band
+        // fails it exactly as it fails a rise, rather than reading it as a
+        // saving. Every other figure is unchanged, so the drop is the only
+        // candidate explanation.
+        let base = baseline_report();
+        let cand = with_value(baseline_report(), "modeled_request_cost", Some(50_000.0));
+        let cmp = compare(&base, &cand, &Bands::defaults()).expect("comparable");
+        let failing: Vec<&str> = cmp
+            .rows
+            .iter()
+            .filter(|r| r.verdict.is_fail())
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(
+            failing,
+            vec!["modeled_request_cost"],
+            "a modeled-cost DROP is a failure, not an improvement"
+        );
+
+        // The band is two-sided, not merely inverted: a rise past the same 1%
+        // fails too, and a move INSIDE it in either direction passes.
+        for inside in [59_667.0 * 0.995, 59_667.0 * 1.005] {
+            let cand = with_value(baseline_report(), "modeled_request_cost", Some(inside));
+            assert!(
+                !compare(&base, &cand, &Bands::defaults())
+                    .expect("comparable")
+                    .regressed(),
+                "{inside} is inside the +/-1% band"
+            );
+        }
+        let cand = with_value(baseline_report(), "modeled_request_cost", Some(60_264.0));
+        assert!(
+            compare(&base, &cand, &Bands::defaults())
+                .expect("comparable")
+                .regressed(),
+            "a rise past +1% fails the same band"
         );
     }
 
@@ -1339,5 +1820,157 @@ mod tests {
         let cand = with_value(baseline_report(), "object_count", Some(3468.0));
         let cmp = compare(&base, &cand, &Bands::defaults()).expect("comparable");
         assert!(cmp.regressed(), "an exact band fails on downward drift too");
+    }
+
+    /// The hand-copied stamp string the ranged-opens gate matches on must be
+    /// the exact rendering of the policy enum; a rename there would otherwise
+    /// silently disable the gate rather than fail a test.
+    #[test]
+    fn the_request_minimal_stamp_matches_the_policys_own_name() {
+        assert_eq!(
+            REQUEST_MINIMAL_POLICY,
+            ravel_query::LogsFetchPolicy::RequestMinimal.as_str(),
+            "the absolute gate's stamp string must track the policy enum"
+        );
+    }
+
+    fn failing_names(cmp: &Comparison) -> Vec<&str> {
+        cmp.rows
+            .iter()
+            .filter(|r| r.verdict.is_fail())
+            .map(|r| r.name.as_str())
+            .collect()
+    }
+
+    /// The physical floor: amplification below 1.0 is a broken measurement,
+    /// never an improvement. Both reports carry 0.999 so no relative band can
+    /// fire; only the absolute floor can produce the failure. Demonstrated
+    /// failing: with `range_amplification_floor` flipped to `None` in
+    /// `Absolutes::defaults`, this test's first assertion goes red.
+    #[test]
+    fn amplification_below_the_physical_floor_fails_as_broken_measurement() {
+        let base = with_value(baseline_report(), "range_amplification", Some(0.999));
+        let cand = with_value(baseline_report(), "range_amplification", Some(0.999));
+        let cmp = compare(&base, &cand, &Bands::defaults()).expect("comparable");
+        assert!(cmp.regressed(), "0.999 must fail the 1.0 floor");
+        assert_eq!(failing_names(&cmp), vec!["range_amplification"]);
+        let row = cmp
+            .rows
+            .iter()
+            .find(|r| r.name == "range_amplification")
+            .expect("row present");
+        match &row.verdict {
+            Verdict::Fail(reason) => assert!(
+                reason.contains("broken measurement"),
+                "the floor failure names the broken-measurement cause: {reason}"
+            ),
+            other => panic!("expected Fail, got {other:?}"),
+        }
+    }
+
+    /// The absolute ceiling fires even when the baseline is equally bad, which
+    /// is exactly the case the relative band can never catch.
+    #[test]
+    fn amplification_past_the_absolute_ceiling_fails_with_an_equal_baseline() {
+        let base = with_value(baseline_report(), "range_amplification", Some(1.051));
+        let cand = with_value(baseline_report(), "range_amplification", Some(1.051));
+        let cmp = compare(&base, &cand, &Bands::defaults()).expect("comparable");
+        assert!(cmp.regressed(), "1.051 must fail the 1.05 ceiling");
+        assert_eq!(failing_names(&cmp), vec!["range_amplification"]);
+        // At the ceiling exactly: passes.
+        let base = with_value(baseline_report(), "range_amplification", Some(1.05));
+        let cand = with_value(baseline_report(), "range_amplification", Some(1.05));
+        let cmp = compare(&base, &cand, &Bands::defaults()).expect("comparable");
+        assert!(!cmp.regressed(), "1.05 sits on the ceiling and passes");
+    }
+
+    fn with_policy(mut report: CostReport, policy: &str) -> CostReport {
+        report.effective_policy = Some(policy.to_string());
+        report
+    }
+
+    /// The plan-shape rule: one ranged open under a request-minimal stamp
+    /// fails absolutely (the baseline carries the same value, so no relative
+    /// band can be the cause); the same figures without the stamp pass, since
+    /// a byte-minimal run opens ranges on purpose.
+    #[test]
+    fn ranged_opens_under_request_minimal_fail_and_unstamped_pass() {
+        let base = with_policy(
+            with_value(baseline_report(), "ranged_opens", Some(1.0)),
+            REQUEST_MINIMAL_POLICY,
+        );
+        let cand = with_policy(
+            with_value(baseline_report(), "ranged_opens", Some(1.0)),
+            REQUEST_MINIMAL_POLICY,
+        );
+        let cmp = compare(&base, &cand, &Bands::defaults()).expect("comparable");
+        assert!(cmp.regressed(), "one ranged open under request-minimal");
+        assert_eq!(failing_names(&cmp), vec!["ranged_opens"]);
+
+        // Unstamped: the gate is policy-scoped and must not fire.
+        let base = with_value(baseline_report(), "ranged_opens", Some(1.0));
+        let cand = with_value(baseline_report(), "ranged_opens", Some(1.0));
+        let cmp = compare(&base, &cand, &Bands::defaults()).expect("comparable");
+        assert!(
+            !cmp.regressed(),
+            "without the stamp the plan-shape gate stays out of the way"
+        );
+    }
+
+    /// A Flight-lane report (effective profile None) against a stamped one is
+    /// the wrong-basis comparison the guard exists for.
+    #[test]
+    fn a_none_effective_profile_refuses_against_a_stamped_one() {
+        let mut base = baseline_report();
+        base.profile.effective = None;
+        let cand = baseline_report();
+        let err = compare(&base, &cand, &Bands::defaults()).expect_err("must refuse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("<none>"),
+            "the refusal renders the absent side as <none>: {msg}"
+        );
+        assert!(
+            msg.contains(&StoreCostProfile::reference().name),
+            "the refusal names the stamped side's profile: {msg}"
+        );
+    }
+
+    /// `deny_unknown_fields` must reach inside a band table, so a misspelled
+    /// key in an override fails loudly instead of silently keeping the default.
+    #[test]
+    fn an_unknown_key_inside_a_band_table_is_refused() {
+        let err = Bands::from_toml_str("[data_gets]\nkind = \"exact\"\nallowanec = 10.0\n")
+            .expect_err("a misspelled key inside a band table must refuse");
+        assert!(
+            matches!(err, CompareError::MalformedBands(_)),
+            "typed malformed-bands refusal, got {err:?}"
+        );
+    }
+
+    /// The same figure name carrying different classes in the two reports is a
+    /// wrong-basis comparison, not a band question. The mismatched figure is a
+    /// latency one so the request-surface guard stays out of the way and the
+    /// class check itself produces the failure.
+    #[test]
+    fn a_class_mismatch_on_one_name_fails_its_row() {
+        let base = baseline_report();
+        let mut cand = baseline_report();
+        for f in &mut cand.figures {
+            if f.name == "latency_p95" {
+                f.class = FigureClass::LatencyP50;
+            }
+        }
+        let cmp = compare(&base, &cand, &Bands::defaults()).expect("comparable");
+        let row = cmp
+            .rows
+            .iter()
+            .find(|r| r.name == "latency_p95")
+            .expect("row present");
+        assert!(
+            row.verdict.is_fail(),
+            "a figure whose class differs between the reports must fail its row, got {:?}",
+            row.verdict
+        );
     }
 }

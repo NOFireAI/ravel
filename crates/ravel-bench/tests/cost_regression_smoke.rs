@@ -24,6 +24,7 @@ fn baseline_report() -> CostReport {
             requested: StoreCostProfile::reference(),
             effective: Some(StoreCostProfile::reference()),
         },
+        effective_policy: None,
         figures: vec![
             fig("object_count", FigureClass::ObjectCount, Some(3469.0), None),
             fig(
@@ -40,6 +41,13 @@ fn baseline_report() -> CostReport {
                 None,
             ),
             fig("latency_p95", FigureClass::LatencyP95, Some(100.0), None),
+            fig("latency_p50", FigureClass::LatencyP50, Some(10.0), None),
+            fig(
+                "bytes_read",
+                FigureClass::Bytes,
+                Some(1_000_000.0),
+                Some("wire"),
+            ),
         ],
     }
 }
@@ -145,6 +153,7 @@ fn a_legacy_report_missing_the_request_surface_exits_two() {
             requested: StoreCostProfile::reference(),
             effective: Some(StoreCostProfile::reference()),
         },
+        effective_policy: None,
         figures: vec![fig(
             "latency_p95",
             FigureClass::LatencyP95,
@@ -232,5 +241,110 @@ fn the_checked_in_bands_toml_is_loadable_through_the_cli() {
     assert!(
         out.status.success(),
         "a 10% data_gets band admits the same +2%: {out:?}"
+    );
+}
+
+/// A shipping `BenchReport`, built from the crate's own report types and
+/// serialized by the same serde surface `bench_report --out` writes, drives
+/// the bin end to end under `--format bench-report`. This is the reachability
+/// case: the gate reads what the bench actually emits, not only its own
+/// fixture schema.
+#[test]
+fn bench_report_format_compares_a_real_report_end_to_end() {
+    use ravel_bench::report::{
+        BenchReport, BytesSection, Environment, IngestSection, LatencyReport, ModeledCost,
+        QuerySection, RequestCounts, WorkloadShape,
+    };
+
+    let latency = |p50: f64, p95: f64| LatencyReport {
+        p50,
+        p95,
+        p99: p95,
+        max: p95,
+        count: 10,
+    };
+    let requests = RequestCounts {
+        backend_bills_requests: true,
+        put: 11,
+        get: 23,
+        list: 7,
+        put_attempts: Some(13),
+        get_attempts: Some(29),
+        list_attempts: Some(7),
+        put_retry_overhead: Some(2),
+        get_retry_overhead: Some(6),
+        list_retry_overhead: Some(0),
+    };
+    let report = BenchReport {
+        environment: Environment {
+            store_backend: "memory".to_string(),
+            region: "n/a-memory".to_string(),
+            shard_count: 2,
+            max_flush_delay_ms: 500,
+            workload: WorkloadShape {
+                target_series: 20,
+                points_per_sec: 4_000,
+                duration_secs: 1,
+                batch_size: 50,
+                query: "bench_gauge".to_string(),
+                warm_query_count: 5,
+            },
+            git_commit: "0".repeat(40),
+            toolchain: "rustc 0.0.0-test".to_string(),
+            store_cost_profile_requested: StoreCostProfile::reference(),
+            store_cost_profile_effective: Some(StoreCostProfile::reference()),
+        },
+        ingest: IngestSection {
+            strict_ack_latency_ms: latency(10.0, 100.0),
+            accepted_points: 4_000,
+            accepted_points_per_sec: 4_000.0,
+            write_amplification: 1.5,
+        },
+        query: QuerySection {
+            cold_latency_ms: latency(20.0, 20.0),
+            warm_latency_ms: latency(2.0, 4.0),
+            matched_series: 20,
+        },
+        modeled_cost: ModeledCost::model(
+            &StoreCostProfile::reference(),
+            requests.put_class_attempts(),
+            requests.get_attempts,
+            48_000,
+            48_000,
+        ),
+        s3_requests: requests,
+        bytes: BytesSection {
+            written: 96_000,
+            read: 48_000,
+        },
+    };
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("bench.json");
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&report).expect("serialize BenchReport"),
+    )
+    .expect("write BenchReport fixture");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_cost_regression_check"))
+        .arg(&path)
+        .arg(&path)
+        .arg("--format")
+        .arg("bench-report")
+        .output()
+        .expect("run cost_regression_check --format bench-report");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "an identical real BenchReport compares clean: {out:?}"
+    );
+    assert!(
+        stdout.contains("source format:"),
+        "the header names the source format: {stdout}"
+    );
+    assert!(
+        stdout.contains("NOTE:"),
+        "the header names the classes a BenchReport cannot enforce: {stdout}"
     );
 }
