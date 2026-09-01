@@ -958,10 +958,15 @@ pinning are unchanged:
    token sources, sort by the dedup total order ("Cross-segment duplicate
    samples" below), return the pinned `Snapshot`.
 
-`SegmentRef.declared_column_stats` is filled on every one of those routes
+`SegmentRef.declared_column_stats` is filled on every catalog route
 (ADR-0873 decision 4): from the commit record for a listed or token-resolved
-segment, from the compaction/rewrite part for a listed L1 part, and from
-`SnapshotEntry.declared_column_stats` (field 15) for a sealed entry. The
+segment, from the compaction part for a listed L1 part, and from
+`SnapshotEntry.declared_column_stats` (field 15) for a sealed entry. Two
+routes are deliberately always empty: a rewrite output's parts (the rewrite
+dropped rows, so a pre-drop stamp is stale; ADR-0873 decision 3), and a
+`SegmentRef` rebuilt from a Flight `SegmentPin` (its wire layout does not
+carry the field yet), so a segment covered in the catalog reads as uncovered
+after a pin round trip -- costing the shortcut there, never an answer. The
 listing routes are what cover the always-unsealed recent tail and
 token-resolved segments, which no fold-built sibling object reaches. The
 entries are re-validated against the carrier's own row count wherever they are

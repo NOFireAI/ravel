@@ -3291,11 +3291,12 @@ fn build_rewrite_l1_segment_ref(
             part_index: part.part_index,
         },
         segment_format_version: part.segment_format_version,
-        // ADR-0873 decision 4: a listed L1 part carries its own stamps
-        // (CompactionPart field 12), gated against the part's row count.
-        declared_column_stats: DeclaredColumnStats::from_validated(
-            &ravel_commit::declared_stats::read_compaction_part(part),
-        ),
+        // NEVER carried for a rewrite output (ADR-0873 decision 3): the
+        // rewrite dropped rows, so a stamp computed before the drop is stale
+        // for the surviving rows. Rewrite writers emit empty stamps today;
+        // forcing empty here also refuses a stamped rewrite part from a buggy
+        // or future writer until the recompute path lands with its own tests.
+        declared_column_stats: DeclaredColumnStats::default(),
     })
 }
 

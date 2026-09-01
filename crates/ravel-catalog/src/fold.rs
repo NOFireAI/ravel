@@ -484,10 +484,13 @@ fn build_rewrite_l1_snapshot_entry(
         series_count: part.series_count,
         segment_format_version: part.segment_format_version,
         created_unix_ns: record.created_unix_ns,
-        // The part's own stamps (CompactionPart field 12), gated against the
-        // part's own row count exactly as the L0 path gates a commit record's
-        // (ADR-0873 decision 4).
-        declared_column_stats: declared_stats::carry_compaction_part(part),
+        // NEVER carried for a rewrite output (ADR-0873 decision 3): the
+        // rewrite dropped rows, so a stamp computed before the drop is stale
+        // for the surviving rows. Every rewrite writer emits empty stamps
+        // today; forcing empty here also refuses a stamped rewrite part from
+        // a buggy or future writer until the recompute path lands with its
+        // own tests and flips this line deliberately.
+        declared_column_stats: Vec::new(),
     })
 }
 
