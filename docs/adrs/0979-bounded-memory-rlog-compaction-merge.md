@@ -218,9 +218,10 @@ sized from the same resident directory that produced it); and `B_dec`
 taken as the MAXIMUM over the cursor's candidate blocks of the D1
 ceiling evaluated per block from pre-decode metadata:
 `16 B × rows × total_cols + string-page uncomp_len + 40 B × rows ×
-string_cols + 48 B × (max column id + 1) × 5` (the last term is the
-decoder's five slot-vector spines at doubled-capacity bound; see the
-D1 ceiling's spine note) — rows from the resident loc metadata,
+string_cols + 2 × Σ(slot sizes) × (max column id + 1)` (the last term
+is the decoder's five slot-vector spines at doubled-capacity bound,
+Σ(slot sizes) read from the per-kind `Option<T>` sizes -- 144 B per
+width unit today; see the D1 ceiling's spine note) — rows from the resident loc metadata,
 `total_cols` from FIELD_DIR, the string-page term as the block's PAGE_DIR `uncomp_len`
 restricted to string pages, and every string column priced as plain
 (the conservative arm; dictionary encoding only shrinks it). The max,
@@ -317,19 +318,23 @@ B_dec  = one decoded columnar block                                  (~18-25 MB 
          ≤ 16 B × rows_per_block × cols                              ceiling ~14 MB numeric
            + uncompressed string-page bytes                          + string pages
            + 40 B × rows_per_block × plain_string_cols
-           + 48 B × (max column id + 1) × 5)                         + decoder slot spines
+           + 2 × Σ(slot sizes) × (max column id + 1))               + decoder slot spines
          The last term is the decoder's five per-kind slot-vector
          spines, indexed by column id; on very small blocks it can
          exceed the per-row terms, so a ceiling that omits it is not
-         a ceiling there. The charge is over ALLOCATED capacity, and
-         Vec growth can round capacity past the logical width, so the
-         pre-decode bound prices 24 B × capacity with capacity bounded
-         by the doubling rule (capacity < 2 × requested width), hence
-         the 48 B factor. A decoder that allocates each spine at
-         exactly the FIELD_DIR width may tighten this to 24 B, with a
-         growth-boundary test over all five maps pinning that no spine
-         exceeds its requested capacity. `max column id + 1` comes
-         from FIELD_DIR, pre-decode, like the other shape inputs.
+         a ceiling there. Each spine is charged at ALLOCATED capacity
+         times its own per-kind slot size (`size_of::<Option<T>>`,
+         currently 24/24/24/48/24 B on the reference target,
+         Σ = 144 B per width unit -- read the sizes from the types,
+         never hardcode a flattened per-map constant). Vec growth can
+         round capacity past the logical width, so the pre-decode
+         bound applies the doubling rule: 2 × Σ(slot sizes) × width
+         = 288 B × width today. A decoder that enforces exact-width
+         allocation in `ColMap::insert` may tighten the factor to
+         Σ(slot sizes), with a growth-boundary test over all five
+         maps pinning that no spine exceeds its requested capacity.
+         `max column id + 1` comes from FIELD_DIR, pre-decode, like
+         the other shape inputs.
 W      = in-progress part writer buffer ≤ ~1.3 × l1_part_memory_target_bytes  (~340 MB default)
 ```
 
