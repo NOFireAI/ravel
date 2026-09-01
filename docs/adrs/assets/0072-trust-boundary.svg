@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 560" font-family="'Segoe Print','Bradley Hand','Comic Sans MS',cursive" font-size="15">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 560" font-family="'Segoe Print','Bradley Hand','Comic Sans MS',cursive" font-size="15" role="img" aria-label="Trust boundaries after ADR-0072: each service holds its own role credential, and a KMS-routing store wired at store.rs picks the per-tenant key on PUTs under t/&lt;hash&gt;/.">
   <defs>
     <marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M 1 1.5 Q 6 4 8.5 5 Q 6 6 1 8.5" fill="none" stroke="#444" stroke-width="1.6" stroke-linecap="round"/>
