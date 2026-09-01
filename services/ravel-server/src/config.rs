@@ -637,18 +637,51 @@ pub struct Cli {
     #[arg(long = "logs-max-fetch-run-bytes", value_name = "BYTES", default_value_t = ravel_query::DEFAULT_LOG_MAX_FETCH_RUN_BYTES)]
     pub logs_max_fetch_run_bytes: u64,
 
-    /// Bound on concurrent in-flight segment fetches per query (ADR-0088),
-    /// threaded into `ravel_query::EngineConfig::fetch_concurrency`. This is a
-    /// single knob with three coupled effects, NOT decoupled by this change: it
-    /// governs the PromQL/analytics per-query segment fetch fan-out, the SQL
-    /// scan partition count (`target_partitions` in
-    /// `crates/ravel-sql/src/session.rs`), and S3 GET concurrency (ADR-0087).
-    /// Raising it widens all three together; sizing it is a memory-vs-latency
-    /// trade against the host's cores and the store's request budget. Omitted
+    /// Bound on concurrent in-flight object-store GETs per query (issue #846),
+    /// threaded into `ravel_query::EngineConfig::fetch_concurrency`. This is the
+    /// permit pool the fetch layer acquires against: it caps the
+    /// PromQL/analytics per-query segment fetch fan-out and sizes the logs read
+    /// path's GET permit pool (`LogSegmentFetcher::with_max_concurrent_gets`,
+    /// wired in `crate::query::build_sql_state`). It bounds concurrency at the
+    /// STORE, not partition count in the plan (see `--scan-partitions`): a scan
+    /// planned at more partitions than this value only queues the surplus GETs
+    /// on the pool. Sizing it is a throughput-vs-memory trade against the store's
+    /// per-connection bandwidth and round-trip latency (issue #845). Unset
     /// defaults to [`ravel_query::DEFAULT_FETCH_CONCURRENCY`] (8, today's
     /// compiled-in value), so behavior is byte-identical when unset.
-    #[arg(long = "fetch-concurrency", value_name = "N", default_value_t = ravel_query::DEFAULT_FETCH_CONCURRENCY)]
-    pub fetch_concurrency: usize,
+    ///
+    /// This is the meaning the pre-split `--fetch-concurrency` dominantly
+    /// controlled (ADR-0088 documented it as "the knob that bounds S3 GET
+    /// concurrency"); that flag is now a deprecated alias for this one, and the
+    /// two conflict.
+    #[arg(
+        long = "max-concurrent-gets",
+        value_name = "N",
+        conflicts_with = "fetch_concurrency"
+    )]
+    pub max_concurrent_gets: Option<usize>,
+
+    /// Deprecated alias of `--max-concurrent-gets` (issue #846). Before the
+    /// split this single flag set BOTH the in-flight GET bound and the SQL scan
+    /// partition count (`target_partitions`), so no tuning result using it was
+    /// attributable to one or the other. It now controls only the GET bound it
+    /// dominantly governed; set `--max-concurrent-gets` for the permit pool and
+    /// `--scan-partitions` for the partition count. Kept so existing invocations
+    /// keep parsing; supplying it logs a deprecation warning and conflicts with
+    /// `--max-concurrent-gets`.
+    #[arg(long = "fetch-concurrency", value_name = "N")]
+    pub fetch_concurrency: Option<usize>,
+
+    /// The SQL scan partition count (`target_partitions`), issue #846, threaded
+    /// into `ravel_query::EngineConfig::scan_partitions`. This bounds PLAN
+    /// parallelism -- how many independent scan streams a tenant's segment list
+    /// is fanned across -- not concurrency at the store: every partition's
+    /// fetches share `--max-concurrent-gets`'s permit pool, so the two compose as
+    /// parallelism-times-per-store-bound. Unset couples the partition count to
+    /// the GET bound (the pre-split behavior), so leaving it off is
+    /// byte-identical to before this flag existed.
+    #[arg(long = "scan-partitions", value_name = "N")]
+    pub scan_partitions: Option<usize>,
 
     /// Cap on the number of segments a single query may fan out over (ADR-0088),
     /// threaded into `ravel_query::EngineConfig::max_segments`. A wide scan over
@@ -1121,10 +1154,16 @@ pub const DEFAULT_SQL_TENANT_MAX_BYTES: usize = 1024 * 1024 * 1024;
 /// budget bit-for-bit identical to before they existed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryBudgets {
-    /// Per-query segment fetch concurrency, also the SQL scan partition count
-    /// and S3 GET concurrency (ADR-0087; not decoupled). Reaches
-    /// `EngineConfig::fetch_concurrency`.
+    /// Per-query bound on concurrent in-flight object-store GETs: the fetch
+    /// permit pool (issue #846). Reaches `EngineConfig::fetch_concurrency`. Split
+    /// from the SQL scan partition count, which is now [`Self::scan_partitions`].
     pub fetch_concurrency: usize,
+    /// The SQL scan partition count, or `None` to couple it to
+    /// [`Self::fetch_concurrency`] (issue #846). Reaches
+    /// `EngineConfig::scan_partitions`; the effective value is resolved through
+    /// `EngineConfig::effective_scan_partitions`. `None` is the pre-split
+    /// coupling, so an unset value is byte-for-byte unchanged.
+    pub scan_partitions: Option<usize>,
     /// Per-query segment fan-out cap. Reaches `EngineConfig::max_segments`.
     pub max_segments: usize,
     /// Per-query SQL memory-pool ceiling. Reaches `SqlConfig::max_query_bytes`.
@@ -1169,6 +1208,7 @@ impl Default for QueryBudgets {
     fn default() -> Self {
         QueryBudgets {
             fetch_concurrency: ravel_query::DEFAULT_FETCH_CONCURRENCY,
+            scan_partitions: None,
             max_segments: ravel_query::DEFAULT_MAX_SEGMENTS,
             sql_max_query_bytes: DEFAULT_SQL_MAX_QUERY_BYTES,
             sql_tenant_max_bytes: DEFAULT_SQL_TENANT_MAX_BYTES,
@@ -1253,6 +1293,7 @@ impl QueryBudgets {
         let resolved = self.logs_fetch_resolution();
         let config = ravel_query::EngineConfig {
             fetch_concurrency: self.fetch_concurrency,
+            scan_partitions: self.scan_partitions,
             max_segments: self.max_segments,
             logs_block_range_threshold: resolved.block_range_threshold,
             logs_request_cost_bytes: resolved.request_cost_bytes,
@@ -2007,9 +2048,34 @@ impl Cli {
     /// rather than falling back to the reference profile, so the prices a
     /// deployment's figures are modelled at are always the ones its operator
     /// declared.
+    /// The effective in-flight GET bound (issue #846): `--max-concurrent-gets`
+    /// when set, otherwise the deprecated `--fetch-concurrency` alias, otherwise
+    /// the compiled-in [`ravel_query::DEFAULT_FETCH_CONCURRENCY`]. clap rejects
+    /// setting both flags, so at most one of the two `Option`s is `Some`.
+    pub fn resolve_max_concurrent_gets(&self) -> usize {
+        self.max_concurrent_gets
+            .or(self.fetch_concurrency)
+            .unwrap_or(ravel_query::DEFAULT_FETCH_CONCURRENCY)
+    }
+
+    /// True when the deprecated `--fetch-concurrency` alias supplied the GET
+    /// bound, so the startup path can log a deprecation warning (issue #846).
+    pub fn fetch_concurrency_alias_used(&self) -> bool {
+        self.fetch_concurrency.is_some()
+    }
+
     pub fn query_budgets(&self) -> anyhow::Result<QueryBudgets> {
+        if self.fetch_concurrency_alias_used() {
+            tracing::warn!(
+                max_concurrent_gets = self.resolve_max_concurrent_gets(),
+                "--fetch-concurrency is deprecated (issue #846): it now sets only the in-flight \
+                 GET bound it dominantly governed. Use --max-concurrent-gets for the permit pool \
+                 and --scan-partitions for the SQL scan partition count."
+            );
+        }
         Ok(QueryBudgets {
-            fetch_concurrency: self.fetch_concurrency,
+            fetch_concurrency: self.resolve_max_concurrent_gets(),
+            scan_partitions: self.scan_partitions,
             max_segments: self.max_segments,
             sql_max_query_bytes: self.sql_max_query_bytes,
             sql_tenant_max_bytes: self.sql_tenant_max_bytes,
@@ -4043,6 +4109,101 @@ mod tests {
             engine_from(&cli).fetch_concurrency,
             EngineConfig::default().fetch_concurrency,
         );
+    }
+
+    /// Issue #846: `--max-concurrent-gets` is the honest successor for the
+    /// in-flight GET bound, and the deprecated `--fetch-concurrency` is an alias
+    /// for exactly that meaning -- the one it dominantly governed. Both reach
+    /// `EngineConfig::fetch_concurrency`; only the alias trips the deprecation
+    /// predicate; setting a partition count is a separate flag, so neither GET
+    /// flag perturbs `scan_partitions`.
+    ///
+    /// Prove-the-test: point `resolve_max_concurrent_gets` at
+    /// `self.scan_partitions` instead of the GET flags and the first assertion
+    /// reads 8 (the default) against the expected 24.
+    #[test]
+    fn get_bound_flag_and_deprecated_alias_map_to_the_permit_pool() {
+        use ravel_query::EngineConfig;
+
+        assert_ne!(24, ravel_query::DEFAULT_FETCH_CONCURRENCY);
+
+        // The honest successor reaches the GET bound and is not deprecated.
+        let cli = Cli::try_parse_from(["ravel-server", "--max-concurrent-gets", "24"])
+            .expect("flag parses");
+        assert_eq!(engine_from(&cli).fetch_concurrency, 24);
+        assert!(!cli.fetch_concurrency_alias_used());
+        // It does not touch the partition count: that stays coupled (unset).
+        assert_eq!(engine_from(&cli).scan_partitions, None);
+
+        // The deprecated alias maps to the same successor meaning and warns.
+        let cli = Cli::try_parse_from(["ravel-server", "--fetch-concurrency", "24"])
+            .expect("deprecated alias parses");
+        assert_eq!(
+            engine_from(&cli).fetch_concurrency,
+            24,
+            "the deprecated --fetch-concurrency aliases the in-flight GET bound it \
+             dominantly governed"
+        );
+        assert!(
+            cli.fetch_concurrency_alias_used(),
+            "using the deprecated alias must be observable so the startup path warns"
+        );
+        assert_eq!(engine_from(&cli).scan_partitions, None);
+
+        // The two GET flags conflict: clap refuses both at once, so a run cannot
+        // set the pool twice with two names.
+        assert!(
+            Cli::try_parse_from([
+                "ravel-server",
+                "--max-concurrent-gets",
+                "24",
+                "--fetch-concurrency",
+                "24",
+            ])
+            .is_err(),
+            "--max-concurrent-gets and its deprecated alias must conflict"
+        );
+
+        // Default path: neither flag set, engine carries the compiled-in value
+        // and the alias is not in use.
+        let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        assert_eq!(
+            engine_from(&cli).fetch_concurrency,
+            EngineConfig::default().fetch_concurrency
+        );
+        assert!(!cli.fetch_concurrency_alias_used());
+    }
+
+    /// Issue #846: `--scan-partitions` reaches `EngineConfig::scan_partitions`
+    /// independently of the GET bound, so the plan's partition count is set by
+    /// its own flag. Same wiring trace as
+    /// [`get_bound_flag_and_deprecated_alias_map_to_the_permit_pool`].
+    #[test]
+    fn scan_partitions_is_reachable_from_cli() {
+        use ravel_query::EngineConfig;
+
+        let cli =
+            Cli::try_parse_from(["ravel-server", "--scan-partitions", "32"]).expect("flag parses");
+        let engine = engine_from(&cli);
+        assert_eq!(
+            engine.scan_partitions,
+            Some(32),
+            "the running engine's scan_partitions must be the configured flag"
+        );
+        // Set independently of the GET bound, which stays at its default.
+        assert_eq!(
+            engine.fetch_concurrency,
+            EngineConfig::default().fetch_concurrency
+        );
+        assert_eq!(
+            engine.effective_scan_partitions(),
+            32,
+            "the effective partition count is the flag, decoupled from the GET bound"
+        );
+
+        // Unset leaves it coupled to the GET bound (byte-for-byte unchanged).
+        let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        assert_eq!(engine_from(&cli).scan_partitions, None);
     }
 
     /// ADR-0088 reachability: `--max-segments` must reach the `EngineConfig` the
