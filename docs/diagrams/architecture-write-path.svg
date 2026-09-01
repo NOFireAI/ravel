@@ -1,16 +1,17 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg viewBox="0 0 900 470" width="900" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Write path: clients through gateway, router, and shard actors to object storage">
   <style>
-    .b{fill:#ffffff;stroke:#333;stroke-width:1.2;}
-    .g{fill:#f2f2f2;stroke:#333;stroke-width:1.2;}
-    .s{fill:#fff7e0;stroke:#8a6d00;stroke-width:1.2;}
-    .t{font:12px monospace;fill:#111;}
-    .h{font:bold 12px monospace;fill:#111;}
-    .a{stroke:#333;stroke-width:1.2;fill:none;marker-end:url(#awT);}
+    .b{fill:#a9c9e6;stroke:#1f4e79;stroke-width:1.5;}
+    .g{fill:#f4c869;stroke:#8a5a10;stroke-width:1.5;}
+    .s{fill:#a9dcae;stroke:#2f6b34;stroke-width:1.5;}
+    .t{font:12px system-ui, sans-serif;fill:#17191c;}
+    .h{font:bold 12px system-ui, sans-serif;fill:#17191c;}
+    .a{stroke:#383e46;stroke-width:1.5;fill:none;marker-end:url(#awT);}
   </style>
   <defs>
-    <marker id="awT" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#333"/></marker>
+    <marker id="awT" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#383e46"/></marker>
   </defs>
+  <rect x="0" y="0" width="900" height="470" fill="#f4f5f7"/>
   <rect class="b" x="240" y="8" width="420" height="30"/>
   <text class="h" x="252" y="28">OTLP gRPC / OTLP HTTP / Remote Write 1.0 + 2.0</text>
   <path class="a" d="M450,38 L450,64"/>
