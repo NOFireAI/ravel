@@ -151,6 +151,19 @@ pub struct LogIngestMetrics {
     /// gauge with a per-shard dimension, unlike everything else here; read it
     /// via [`LogIngestMetrics::in_flight_flushes_by_shard`].
     in_flight_flushes: Mutex<HashMap<u32, i64>>,
+    /// Per-shard flush counts split by the trigger that opened each flush
+    /// (issue #983), so two loads of the same input can be compared honestly:
+    /// object count is not a function of the command line (input order
+    /// concentrates consecutive rows on one shard, and the wall-clock age
+    /// trigger makes host speed change the layout), but the trigger mix that
+    /// produced it is. Recorded at flush open on the actor, alongside the
+    /// process-wide `flushes_by_*` counters, from the `FlushTrigger` the
+    /// decision site passed; the cause is never inferred after the fact. Carries
+    /// a per-shard dimension like `in_flight_flushes`, so it is read via
+    /// [`LogIngestMetrics::flush_trigger_mix_by_shard`] rather than folded into
+    /// the flat snapshot. A shard that never flushed is simply absent,
+    /// equivalent to an all-zero [`FlushTriggerMix`].
+    flush_trigger_mix: Mutex<HashMap<u32, FlushTriggerMix>>,
     /// Per-shard ingest-skew accounting (issue #865), the log-pipeline
     /// counterpart of [`crate::IngestMetrics`]'s own: message throughput and the
     /// on-actor / flush-permit-wait / off-actor time split. Same accumulator
@@ -202,6 +215,36 @@ pub struct LogIngestMetricsSnapshot {
     pub dynamic_columns_used_total: u64,
     pub dynamic_columns_overflowed_total: u64,
     pub dynamic_columns_used_max: u64,
+}
+
+/// One shard's flush count split by the trigger that opened each flush (issue
+/// #983). The three causes are disjoint and every flush lands in exactly one,
+/// so [`FlushTriggerMix::total`] equals the shard's flushes-opened count. Read
+/// via [`LogIngestMetrics::flush_trigger_mix_by_shard`].
+///
+/// Attempt-time, like the process-wide `flushes_by_*` counters: a flush is
+/// counted here when it is opened, so one later abandoned still counts. On a
+/// load that abandons nothing, the per-shard total equals the objects the shard
+/// wrote, and the sum across shards equals the load's object count.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FlushTriggerMix {
+    /// Flushes opened because the tenant buffer reached `target_bytes`
+    /// ([`FlushTrigger::Size`]).
+    pub size: u64,
+    /// Flushes opened because the tenant buffer aged past `max_flush_delay`
+    /// ([`FlushTrigger::Age`], and the metrics-only [`FlushTrigger::AgeAdaptive`]
+    /// the log actor never raises).
+    pub age: u64,
+    /// Flushes opened by the final drain at close: a [`FlushTrigger::Manual`]
+    /// shutdown drain, channel-close drain, or explicit flush request.
+    pub final_drain: u64,
+}
+
+impl FlushTriggerMix {
+    /// The shard's flushes-opened count, the sum of the three disjoint causes.
+    pub fn total(&self) -> u64 {
+        self.size + self.age + self.final_drain
+    }
 }
 
 impl LogIngestMetrics {
@@ -261,7 +304,7 @@ impl LogIngestMetrics {
         self.shard_skew.by_shard()
     }
 
-    pub(crate) fn record_flush(&self, trigger: FlushTrigger) {
+    pub(crate) fn record_flush(&self, shard: u32, trigger: FlushTrigger) {
         let counter = match trigger {
             FlushTrigger::Size => &self.flushes_by_size,
             // The log shard actor has no adaptive-delay trigger of its own
@@ -272,6 +315,33 @@ impl LogIngestMetrics {
             FlushTrigger::Manual => &self.flushes_manual,
         };
         counter.fetch_add(1, Ordering::Relaxed);
+
+        // Per-shard split (issue #983), from the same `trigger` the process-wide
+        // counter above used, so the two can never disagree on the cause.
+        let mut map = self
+            .flush_trigger_mix
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = map.entry(shard).or_default();
+        match trigger {
+            FlushTrigger::Size => entry.size += 1,
+            FlushTrigger::Age | FlushTrigger::AgeAdaptive => entry.age += 1,
+            FlushTrigger::Manual => entry.final_drain += 1,
+        }
+    }
+
+    /// Point-in-time per-shard flush trigger mix, sorted by shard index (issue
+    /// #983). A shard that never flushed is absent, equivalent to an all-zero
+    /// [`FlushTriggerMix`]. This is the honest comparison basis between two
+    /// loads of the same input, which the raw object count is not.
+    pub fn flush_trigger_mix_by_shard(&self) -> Vec<(u32, FlushTriggerMix)> {
+        let map = self
+            .flush_trigger_mix
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut mix: Vec<(u32, FlushTriggerMix)> = map.iter().map(|(&s, &m)| (s, m)).collect();
+        mix.sort_unstable_by_key(|&(shard, _)| shard);
+        mix
     }
 
     /// Attribute one completed flush's PUTs to `tenant` (success-time,
@@ -472,21 +542,21 @@ mod tests {
     #[test]
     fn each_record_method_increments_only_its_own_counter() {
         assert_only(
-            |m| m.record_flush(FlushTrigger::Size),
+            |m| m.record_flush(0, FlushTrigger::Size),
             LogIngestMetricsSnapshot {
                 flushes_by_size: 1,
                 ..Default::default()
             },
         );
         assert_only(
-            |m| m.record_flush(FlushTrigger::Age),
+            |m| m.record_flush(0, FlushTrigger::Age),
             LogIngestMetricsSnapshot {
                 flushes_by_age: 1,
                 ..Default::default()
             },
         );
         assert_only(
-            |m| m.record_flush(FlushTrigger::Manual),
+            |m| m.record_flush(0, FlushTrigger::Manual),
             LogIngestMetricsSnapshot {
                 flushes_manual: 1,
                 ..Default::default()
@@ -600,8 +670,8 @@ mod tests {
     #[test]
     fn counters_accumulate_across_calls() {
         let metrics = LogIngestMetrics::default();
-        metrics.record_flush(FlushTrigger::Age);
-        metrics.record_flush(FlushTrigger::Age);
+        metrics.record_flush(0, FlushTrigger::Age);
+        metrics.record_flush(0, FlushTrigger::Age);
         metrics.record_buffered(10, 1);
         metrics.record_buffered(5, 2);
 
@@ -609,6 +679,79 @@ mod tests {
         assert_eq!(snap.flushes_by_age, 2);
         assert_eq!(snap.buffered_bytes_total, 15);
         assert_eq!(snap.buffered_records_total, 3);
+    }
+
+    #[test]
+    fn flush_trigger_mix_splits_by_shard_and_cause() {
+        let metrics = LogIngestMetrics::default();
+        // Shard 0: two size, one age, one final. Shard 3: one final only.
+        metrics.record_flush(0, FlushTrigger::Size);
+        metrics.record_flush(0, FlushTrigger::Size);
+        metrics.record_flush(0, FlushTrigger::Age);
+        metrics.record_flush(0, FlushTrigger::Manual);
+        metrics.record_flush(3, FlushTrigger::Manual);
+
+        let mix = metrics.flush_trigger_mix_by_shard();
+        assert_eq!(
+            mix,
+            vec![
+                (
+                    0,
+                    FlushTriggerMix {
+                        size: 2,
+                        age: 1,
+                        final_drain: 1,
+                    }
+                ),
+                (
+                    3,
+                    FlushTriggerMix {
+                        size: 0,
+                        age: 0,
+                        final_drain: 1,
+                    }
+                ),
+            ],
+            "each cause lands in its own field, keyed by the flushing shard, sorted by shard index"
+        );
+        // total() is the shard's flushes-opened count.
+        assert_eq!(mix[0].1.total(), 4);
+        assert_eq!(mix[1].1.total(), 1);
+        // The process-wide flat counters equal the mix summed across shards.
+        let snap = metrics.snapshot();
+        assert_eq!(snap.flushes_by_size, 2);
+        assert_eq!(snap.flushes_by_age, 1);
+        assert_eq!(snap.flushes_manual, 2);
+    }
+
+    #[test]
+    fn adaptive_age_folds_into_the_age_cause() {
+        // The log actor never raises AgeAdaptive, but the shared enum has it;
+        // if a call ever does, it must count as age, not silently vanish.
+        let metrics = LogIngestMetrics::default();
+        metrics.record_flush(1, FlushTrigger::AgeAdaptive);
+        let mix = metrics.flush_trigger_mix_by_shard();
+        assert_eq!(
+            mix,
+            vec![(
+                1,
+                FlushTriggerMix {
+                    size: 0,
+                    age: 1,
+                    final_drain: 0
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn fresh_flush_trigger_mix_is_empty() {
+        assert!(
+            LogIngestMetrics::default()
+                .flush_trigger_mix_by_shard()
+                .is_empty(),
+            "a router that never flushed reports no shards, not zeroed ones"
+        );
     }
 
     #[test]

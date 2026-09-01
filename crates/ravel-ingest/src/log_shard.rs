@@ -1182,7 +1182,7 @@ impl LogShardActor {
                 FlushPayload::Columnar(batches)
             }
         };
-        self.metrics.record_flush(trigger);
+        self.metrics.record_flush(self.shard, trigger);
 
         let tenant_hash = tenant.hash();
         let seq = self.next_seq;
@@ -1303,6 +1303,7 @@ mod tests {
 
     use super::*;
     use crate::budget::{IngestByteBudget, IngestByteBudgetLimit};
+    use crate::log_metrics::FlushTriggerMix;
 
     const BASE_NS: i64 = 1_700_000_000_000_000_000;
 
@@ -1372,6 +1373,10 @@ mod tests {
             shard_count: 1,
             target_bytes: 8 * 1024 * 1024,
             max_flush_delay,
+            // Age a buffer with no strict waiter on the same clock, so a
+            // buffered (no-ack) fixture ages deterministically rather than
+            // waiting out the much longer idle threshold.
+            max_flush_delay_idle: max_flush_delay,
             flush_tick: Duration::from_millis(10),
             put_retry_base_delay: Duration::from_millis(1),
             put_retry_max_delay: Duration::from_millis(5),
@@ -1427,6 +1432,37 @@ mod tests {
             let _ = self.tx.send(LogShardMsg::Shutdown { done: done_tx }).await;
             let _ = done_rx.await;
             let _ = self.task.await;
+        }
+
+        /// This single-shard harness's trigger mix for shard 0, or an all-zero
+        /// mix if it never flushed.
+        fn shard0_mix(&self) -> crate::log_metrics::FlushTriggerMix {
+            self.metrics
+                .flush_trigger_mix_by_shard()
+                .into_iter()
+                .find(|(shard, _)| *shard == 0)
+                .map(|(_, mix)| mix)
+                .unwrap_or_default()
+        }
+
+        /// Buffered (no-ack) write of one record for `tenant`. The record only
+        /// reaches the store via an age or shutdown flush, never a size one on
+        /// the `no_size_flush` config.
+        async fn buffer_one(&self, tenant: &TenantId, body: &str) {
+            self.tx
+                .send(LogShardMsg::Write {
+                    tenant: tenant.clone(),
+                    records: vec![norm_record(
+                        &[("service.name", "api")],
+                        "scope",
+                        1_000,
+                        body,
+                    )],
+                    ack: None,
+                    charge: None,
+                })
+                .await
+                .expect("send buffered write");
         }
     }
 
@@ -1594,6 +1630,183 @@ mod tests {
             "the shutdown drain stored a commit record"
         );
         assert_eq!(metrics.snapshot().flushes_manual, 1);
+    }
+
+    /// Count the RLOG data objects (`/l0/`) durable in the store: one per flush
+    /// that reached a commit, the ground truth the trigger mix must sum to.
+    async fn data_object_count(store: &dyn ObjectStoreBackend) -> u64 {
+        let objects = list_all(store, "t/").await.expect("list");
+        objects.iter().filter(|o| o.key.contains("/l0/")).count() as u64
+    }
+
+    /// Test 1a (issue #983): a shard filled to the size target records exactly
+    /// one size-triggered flush per write and zero age flushes. `flush_on_first`
+    /// sets `target_bytes: 1`, so each Strict write flushes inside its own
+    /// `handle_write`; N writes are N size flushes, and nothing is left to age
+    /// or drain at close.
+    #[tokio::test]
+    async fn size_flushes_record_exact_count_and_no_age() {
+        const N: u64 = 3;
+        let h = Harness::spawn(flush_on_first());
+        let tenant = TenantId::new("acme");
+        for i in 0..N {
+            let (ack_tx, ack_rx) = oneshot::channel();
+            h.tx.send(LogShardMsg::Write {
+                tenant: tenant.clone(),
+                records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "x")],
+                ack: Some(ack_tx),
+                charge: None,
+            })
+            .await
+            .expect("send write");
+            ack_rx
+                .await
+                .expect("ack sender not dropped")
+                .unwrap_or_else(|_| panic!("size flush {i} commits"));
+        }
+
+        let mix = h.shard0_mix();
+        assert_eq!(
+            mix,
+            FlushTriggerMix {
+                size: N,
+                age: 0,
+                final_drain: 0,
+            },
+            "each of the N size-target writes is one size flush, none age or drain"
+        );
+        // Every flush already committed before shutdown, so the drain adds none.
+        h.shutdown().await;
+    }
+
+    /// Test 1b (issue #983): buffers that trickle below the size target and are
+    /// released only when the injected clock passes `max_flush_delay` record
+    /// exactly M age flushes, zero size flushes. M distinct tenants buffer one
+    /// record each (no size flush can fire on `no_size_flush`'s huge target),
+    /// then a single clock advance ages all M at once. Time is injected, never
+    /// slept.
+    #[tokio::test]
+    async fn age_flushes_record_exact_count() {
+        const M: u64 = 3;
+        let h = Harness::spawn(no_size_flush(Duration::from_millis(50)));
+        let tenants: Vec<TenantId> = (0..M).map(|i| TenantId::new(format!("t{i}"))).collect();
+        for t in &tenants {
+            h.buffer_one(t, "x").await;
+        }
+        // All M records buffered before the clock moves, so their arrival is the
+        // pre-advance time and one advance ages every one of them.
+        while h.metrics.snapshot().buffered_records_total < M {
+            tokio::task::yield_now().await;
+        }
+        h.clock.advance_ns(100_000_000);
+        while h.shard0_mix().age < M {
+            tokio::task::yield_now().await;
+        }
+
+        let mix = h.shard0_mix();
+        assert_eq!(
+            mix,
+            FlushTriggerMix {
+                size: 0,
+                age: M,
+                final_drain: 0,
+            },
+            "each of the M aged buffers is one age flush, none by size"
+        );
+        h.shutdown().await;
+    }
+
+    /// Test 1c (issue #983): the final drain at close records exactly the
+    /// buffered-tenant count as final flushes. `no_size_flush` with an hour-long
+    /// delay means neither size nor age can fire; only the shutdown drain
+    /// flushes, once per buffered tenant.
+    #[tokio::test]
+    async fn close_records_exact_final_drain_count() {
+        const K: u64 = 3;
+        let h = Harness::spawn(no_size_flush(Duration::from_secs(3600)));
+        let tenants: Vec<TenantId> = (0..K).map(|i| TenantId::new(format!("t{i}"))).collect();
+        for t in &tenants {
+            h.buffer_one(t, "x").await;
+        }
+        while h.metrics.snapshot().buffered_records_total < K {
+            tokio::task::yield_now().await;
+        }
+
+        let store = Arc::clone(&h.store);
+        let metrics = Arc::clone(&h.metrics);
+        h.shutdown().await;
+
+        let mix = metrics
+            .flush_trigger_mix_by_shard()
+            .into_iter()
+            .find(|(shard, _)| *shard == 0)
+            .map(|(_, mix)| mix)
+            .unwrap_or_default();
+        assert_eq!(
+            mix,
+            FlushTriggerMix {
+                size: 0,
+                age: 0,
+                final_drain: K,
+            },
+            "the shutdown drain flushes each buffered tenant once, as final"
+        );
+        assert_eq!(data_object_count(store.as_ref()).await, K);
+    }
+
+    /// Test 2 (issue #983): the sum invariant on known geometry. Two tenants age
+    /// out, a third drains at close; size never fires. The per-cause counts are
+    /// exactly (0, 2, 1), and `size + age + final == total == objects written`
+    /// holds as exact equality, not a lower bound.
+    #[tokio::test]
+    async fn trigger_mix_sum_equals_total_and_objects_written() {
+        let h = Harness::spawn(no_size_flush(Duration::from_millis(50)));
+        let aged = [TenantId::new("aged0"), TenantId::new("aged1")];
+        for t in &aged {
+            h.buffer_one(t, "x").await;
+        }
+        while h.metrics.snapshot().buffered_records_total < 2 {
+            tokio::task::yield_now().await;
+        }
+        h.clock.advance_ns(100_000_000);
+        while h.shard0_mix().age < 2 {
+            tokio::task::yield_now().await;
+        }
+
+        // A third tenant buffered after the advance: its arrival is now, the
+        // clock does not move again, so it cannot age and drains at close.
+        let drained = TenantId::new("drained");
+        h.buffer_one(&drained, "x").await;
+        while h.metrics.snapshot().buffered_records_total < 3 {
+            tokio::task::yield_now().await;
+        }
+
+        let store = Arc::clone(&h.store);
+        let metrics = Arc::clone(&h.metrics);
+        h.shutdown().await;
+
+        let mix = metrics
+            .flush_trigger_mix_by_shard()
+            .into_iter()
+            .find(|(shard, _)| *shard == 0)
+            .map(|(_, m)| m)
+            .unwrap_or_default();
+        assert_eq!(
+            mix,
+            FlushTriggerMix {
+                size: 0,
+                age: 2,
+                final_drain: 1,
+            }
+        );
+        let objects = data_object_count(store.as_ref()).await;
+        assert_eq!(mix.size + mix.age + mix.final_drain, mix.total());
+        assert_eq!(mix.total(), 3, "known geometry: two aged, one drained");
+        assert_eq!(
+            mix.total(),
+            objects,
+            "every counted flush wrote exactly one object; the sum is the object count"
+        );
     }
 
     #[tokio::test]

@@ -56,7 +56,7 @@ pub use lifecycle::{
     overlay_admission_limits, refresh_tenant_limits_once,
 };
 pub use log_error::LogWriteError;
-pub use log_metrics::{LogIngestMetrics, LogIngestMetricsSnapshot};
+pub use log_metrics::{FlushTriggerMix, LogIngestMetrics, LogIngestMetricsSnapshot};
 pub use log_router::{LogIndexedFields, LogIngestRouter, LogWriteReceipt, NoIndexedFields};
 pub use metrics::{FlushTrigger, IngestMetrics, IngestMetricsSnapshot, ShardSkewStats};
 pub use metrics_meta_sink::{
