@@ -149,6 +149,38 @@ impl ProfileStamp {
     }
 }
 
+/// Render the two effective profiles for a refusal message.
+///
+/// Distinct names identify the profiles on their own. Two profiles that SHARE
+/// a name but carry different prices are the trap the stamp exists to catch (a
+/// profile edited in place under its old name), and there the name alone would
+/// print twice and say nothing, so the prices are appended.
+fn profile_labels(baseline: &ProfileStamp, candidate: &ProfileStamp) -> (String, String) {
+    let (base_name, cand_name) = (baseline.effective_name(), candidate.effective_name());
+    if base_name != cand_name {
+        return (base_name.to_string(), cand_name.to_string());
+    }
+    (
+        format!("{base_name} {}", price_digest(baseline.effective.as_ref())),
+        format!("{cand_name} {}", price_digest(candidate.effective.as_ref())),
+    )
+}
+
+/// Every priced field of a profile, for the same-name refusal above.
+fn price_digest(profile: Option<&StoreCostProfile>) -> String {
+    match profile {
+        None => "(no prices)".to_string(),
+        Some(p) => format!(
+            "(put={} get={} delete={} transfer_per_gib={} retrieval_per_gib={})",
+            p.put_class_nanodollars,
+            p.get_class_nanodollars,
+            p.delete_class_nanodollars,
+            p.transfer_nanodollars_per_gib,
+            p.retrieval_nanodollars_per_gib,
+        ),
+    }
+}
+
 /// A machine-readable cost report: the profile it was priced at and every
 /// compared figure. A `Vec` (not a map) so a figure emitted twice survives
 /// deserialization as a duplicate rather than collapsing to last-wins.
@@ -363,10 +395,19 @@ pub enum CompareError {
     /// The two reports priced under different effective cost profiles. Their
     /// request and cost figures are the wrong basis to compare.
     ProfileMismatch {
-        /// Effective profile name in the baseline.
+        /// Effective profile name in the baseline, with its prices appended
+        /// when the two reports share a name but not a price list.
         baseline: String,
-        /// Effective profile name in the candidate.
+        /// Effective profile name in the candidate, likewise.
         candidate: String,
+    },
+    /// Neither report records the effective profile it was priced under, yet a
+    /// modeled-cost figure carries a value. Two absent stamps are not evidence
+    /// of an equal basis, so the costs are denominated in unknown and possibly
+    /// different currencies.
+    UnknownProfileForPricedFigure {
+        /// The modeled-cost figures that carry a value nothing can denominate.
+        figures: Vec<String>,
     },
 }
 
@@ -387,6 +428,17 @@ impl fmt::Display for CompareError {
                 f,
                 "refusing to compare reports priced under different effective cost profiles: \
                  baseline `{baseline}` vs candidate `{candidate}`"
+            ),
+            CompareError::UnknownProfileForPricedFigure { figures } => write!(
+                f,
+                "refusing to compare: neither report records an effective cost profile, yet \
+                 modeled-cost figures carry values ({}); two absent stamps are not an equal \
+                 pricing basis",
+                figures
+                    .iter()
+                    .map(|n| format!("`{n}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
         }
     }
@@ -461,10 +513,15 @@ impl Comparison {
             None => "absent".to_string(),
             Some(x) => render_number(*x),
         };
+        // A byte figure's unit names WHICH bytes it counts (wire, charged,
+        // decompressed). Two kinds never compare, so the table shows the kind
+        // beside the values rather than leaving a reader to guess the basis.
+        let fmt_unit = |u: &Option<String>| u.clone().unwrap_or_else(|| "-".to_string());
         let name_h = "figure";
         let class_h = "class";
         let base_h = "baseline";
         let cand_h = "candidate";
+        let unit_h = "unit";
         let band_h = "band";
         let verdict_h = "verdict";
 
@@ -472,30 +529,35 @@ impl Comparison {
         let mut class_w = class_h.len();
         let mut base_w = base_h.len();
         let mut cand_w = cand_h.len();
+        let mut unit_w = unit_h.len();
         let mut band_w = band_h.len();
         for r in &self.rows {
             name_w = name_w.max(r.name.len());
             class_w = class_w.max(r.class.as_str().len());
             base_w = base_w.max(fmt_val(&r.baseline).len());
             cand_w = cand_w.max(fmt_val(&r.candidate).len());
+            unit_w = unit_w.max(fmt_unit(&r.unit).len());
             band_w = band_w.max(r.band.render().len());
         }
 
         let mut out = String::new();
         out.push_str(&format!(
             "{name_h:<name_w$}  {class_h:<class_w$}  {base_h:>base_w$}  {cand_h:>cand_w$}  \
-             {band_h:<band_w$}  {verdict_h}\n"
+             {unit_h:<unit_w$}  {band_h:<band_w$}  {verdict_h}\n"
         ));
         for r in &self.rows {
             let base = fmt_val(&r.baseline);
             let cand = fmt_val(&r.candidate);
+            let unit = fmt_unit(&r.unit);
             let band = r.band.render();
             out.push_str(&format!(
-                "{:<name_w$}  {:<class_w$}  {:>base_w$}  {:>cand_w$}  {:<band_w$}  {}\n",
+                "{:<name_w$}  {:<class_w$}  {:>base_w$}  {:>cand_w$}  {:<unit_w$}  {:<band_w$}  \
+                 {}\n",
                 r.name,
                 r.class.as_str(),
                 base,
                 cand,
+                unit,
                 band,
                 r.verdict.render(),
             ));
@@ -542,6 +604,22 @@ impl<'a> FigureIndex<'a> {
     }
 }
 
+/// Names of the modeled-cost figures that carry a value in either report,
+/// sorted and deduplicated. Used only when neither report knows its effective
+/// profile, to name what cannot be denominated.
+fn unpriced_modeled_costs(baseline: &CostReport, candidate: &CostReport) -> Vec<String> {
+    let mut figures: Vec<String> = baseline
+        .figures
+        .iter()
+        .chain(candidate.figures.iter())
+        .filter(|f| f.class == FigureClass::ModeledRequestCost && f.value.is_some())
+        .map(|f| f.name.clone())
+        .collect();
+    figures.sort();
+    figures.dedup();
+    figures
+}
+
 /// Compare a candidate report against a baseline under `bands`.
 ///
 /// Refuses (returns `Err`) when the two cannot be compared on the same basis:
@@ -566,12 +644,25 @@ pub fn compare(
     }
 
     // Profile guard: the effective profile is the one that governed pricing.
-    // Two reports whose effective profiles differ cannot be compared.
+    // Two reports whose effective profiles differ cannot be compared. Equality
+    // is over the whole profile, not its name: a profile edited in place keeps
+    // its name while repricing every figure stamped with it.
     if baseline.profile.effective != candidate.profile.effective {
+        let (baseline, candidate) = profile_labels(&baseline.profile, &candidate.profile);
         return Err(CompareError::ProfileMismatch {
-            baseline: baseline.profile.effective_name().to_string(),
-            candidate: candidate.profile.effective_name().to_string(),
+            baseline,
+            candidate,
         });
+    }
+
+    // Equal stamps that are equally ABSENT are not an equal basis: neither run
+    // knows what it priced at, so a modeled cost carrying a value cannot be
+    // compared to another. Refuse rather than pass it vacuously.
+    if baseline.profile.effective.is_none() {
+        let figures = unpriced_modeled_costs(baseline, candidate);
+        if !figures.is_empty() {
+            return Err(CompareError::UnknownProfileForPricedFigure { figures });
+        }
     }
 
     let base_index = FigureIndex::build(baseline);
@@ -604,7 +695,6 @@ pub fn compare(
     Ok(Comparison { rows })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn compare_one(
     name: &str,
     base_fig: Option<&Figure>,
@@ -664,7 +754,16 @@ fn compare_one(
             ));
             return row;
         }
-        (None, None) => unreachable!("a name in the union comes from at least one report"),
+        // A name in the union always comes from at least one report, so this
+        // arm is unreachable through `compare`. It fails closed rather than
+        // panicking: a gate that aborts tells a caller less than one that
+        // names the figure it could not resolve.
+        (None, None) => {
+            row.verdict = Verdict::Fail(format!(
+                "figure `{name}` resolved to neither report; the comparison index is inconsistent"
+            ));
+            return row;
+        }
     };
 
     // A figure present in both under different classes prices two different
@@ -807,16 +906,27 @@ mod tests {
 
     #[test]
     fn each_regressed_figure_fails_naming_exactly_that_figure() {
-        // One value past its band per class. Exact-band figures regress by +1;
-        // percent/absolute figures regress just past their threshold.
-        let cases: [(&str, f64); 6] = [
-            ("data_gets", 149168.0),           // exact +1
-            ("modeled_request_cost", 60500.0), // > +1% of 59667 (= 60263.67)
-            ("object_count", 3470.0),          // exact +1
-            ("latency_p95", 105.5),            // > +5% of 100
-            ("peak_memory", 1_200_000.0),      // > +10% of 1_000_000
-            ("range_amplification", 1.10),     // > +0.05 over 1.0
+        // Every figure class, moved ONE step past its own band and no further.
+        // Exact-band figures regress by +1; percent and absolute figures sit
+        // just past the threshold their default band computes, so a band even
+        // slightly wider than documented would let the case through.
+        let cases: [(&str, f64); 10] = [
+            ("object_count", 3470.0),          // exact, +1
+            ("write_class_requests", 14501.0), // exact, +1
+            ("data_gets", 149168.0),           // exact, +1
+            ("range_amplification", 1.0501),   // past +0.05 over 1.0
+            ("modeled_request_cost", 60264.0), // past +1% of 59667 (60263.67)
+            ("wire_bytes", 1_050_001.0),       // past +5% of 1_000_000
+            ("latency_p50", 10.101),           // past +1% of 10
+            ("latency_p95", 105.1),            // past +5% of 100
+            ("peak_memory", 1_100_001.0),      // past +10% of 1_000_000
+            ("ranged_opens", 1.0),             // exact, +1 (plan-shape rule)
         ];
+        assert_eq!(
+            cases.len(),
+            FigureClass::ALL.len(),
+            "every figure class carries a one-past-band case"
+        );
         for (name, regressed) in cases {
             let base = baseline_report();
             let cand = with_value(baseline_report(), name, Some(regressed));
@@ -942,6 +1052,101 @@ mod tests {
     }
 
     #[test]
+    fn one_profile_name_over_two_price_lists_refuses_and_shows_the_prices() {
+        // The trap the stamp exists to catch: a profile repriced in place
+        // keeps its name, so a name-only refusal message would print the same
+        // string twice and identify nothing. The prices disambiguate it.
+        let base = baseline_report();
+        let mut repriced = StoreCostProfile::reference();
+        repriced.get_class_nanodollars = 800;
+        let mut cand = baseline_report();
+        cand.profile.effective = Some(repriced);
+
+        let err = compare(&base, &cand, &Bands::defaults()).expect_err("must refuse");
+        let msg = err.to_string();
+        assert!(
+            matches!(err, CompareError::ProfileMismatch { .. }),
+            "expected a profile mismatch, got {err:?}"
+        );
+        assert!(msg.contains("get=400"), "shows the baseline price: {msg}");
+        assert!(msg.contains("get=800"), "shows the candidate price: {msg}");
+    }
+
+    #[test]
+    fn two_absent_profile_stamps_refuse_when_a_cost_figure_carries_a_value() {
+        // Equal stamps that are equally ABSENT are not an equal basis: neither
+        // run knows what it priced at, so comparing modeled costs would pass
+        // vacuously on an unknown denominator.
+        let mut base = baseline_report();
+        let mut cand = baseline_report();
+        base.profile.effective = None;
+        cand.profile.effective = None;
+
+        let err = compare(&base, &cand, &Bands::defaults()).expect_err("must refuse");
+        match &err {
+            CompareError::UnknownProfileForPricedFigure { figures } => {
+                assert_eq!(figures, &vec!["modeled_request_cost".to_string()]);
+            }
+            other => panic!("expected an unknown-profile refusal, got {other:?}"),
+        }
+        assert!(
+            err.to_string().contains("modeled_request_cost"),
+            "names the figure that cannot be denominated: {err}"
+        );
+
+        // Without a valued cost figure there is nothing to denominate, so an
+        // unstamped pair compares normally: the guard is scoped to priced
+        // figures, it does not ban the Flight lane from the gate outright.
+        let strip = |mut r: CostReport| {
+            r.figures
+                .retain(|f| f.class != FigureClass::ModeledRequestCost);
+            r.profile.effective = None;
+            r
+        };
+        let cmp = compare(
+            &strip(baseline_report()),
+            &strip(baseline_report()),
+            &Bands::defaults(),
+        )
+        .expect("an unstamped pair with no priced figure is comparable");
+        assert!(!cmp.regressed());
+    }
+
+    #[test]
+    fn the_table_names_the_byte_kind_of_every_byte_figure() {
+        // A byte figure's unit says WHICH bytes it counts; a table that omits
+        // it leaves the reader to guess the basis of the only rows where the
+        // basis is ambiguous.
+        let cmp = compare(&baseline_report(), &baseline_report(), &Bands::defaults())
+            .expect("comparable");
+        let table = cmp.render_table();
+        let byte_row = table
+            .lines()
+            .find(|l| l.starts_with("wire_bytes"))
+            .expect("the byte figure has a row");
+        // Past the name column: the figure is NAMED `wire_bytes`, so a match
+        // anywhere in the row would pass without a unit column existing.
+        let after_name = byte_row
+            .strip_prefix("wire_bytes")
+            .expect("the row starts with the figure name");
+        assert!(
+            after_name.contains("wire"),
+            "the byte row names its kind in the unit column: {byte_row}"
+        );
+        // Header carries the column, and a unitless figure renders a dash
+        // rather than an empty gap that reads as a truncated table.
+        assert!(table.lines().next().expect("header").contains("unit"));
+        let count_row = table
+            .lines()
+            .find(|l| l.starts_with("object_count"))
+            .expect("object_count has a row");
+        assert!(
+            count_row.contains(" - "),
+            "unitless renders a dash: {count_row}"
+        );
+    }
+
+    #[test]
     fn legacy_report_missing_request_surface_is_a_typed_refusal() {
         // A well-formed report that parses but carries no data-GET figure: the
         // legacy shape from before request counts existed. Comparing it would
@@ -968,6 +1173,86 @@ mod tests {
         // And a genuinely malformed JSON is a typed refusal too, not a crash.
         let err = CostReport::from_json_str("{ not json").expect_err("malformed");
         assert!(matches!(err, CompareError::Malformed(_)));
+    }
+
+    #[test]
+    fn each_default_band_admits_its_edge_and_rejects_one_step_past_it() {
+        // What pins a band to the value it documents. Every other test would
+        // still pass if `latency_p95` were secretly 1% instead of 5%, or
+        // `peak_memory` 50% instead of 10%: they only ever check that a big
+        // move fails. This brackets each default from both sides -- a
+        // candidate exactly AT the band edge passes, and the next meaningful
+        // step past it fails -- so widening or narrowing any default breaks
+        // exactly one case here.
+        //
+        // (class, baseline, at-the-edge candidate, one step past the edge)
+        let cases: [(FigureClass, f64, f64, f64); 10] = [
+            (FigureClass::ObjectCount, 3469.0, 3469.0, 3470.0),
+            (FigureClass::WriteClassRequests, 14500.0, 14500.0, 14501.0),
+            (FigureClass::DataGets, 149167.0, 149167.0, 149168.0),
+            // absolute +0.05
+            (FigureClass::RangeAmplification, 1.0, 1.05, 1.0501),
+            // +1%: 59667 -> 60263.67
+            (FigureClass::ModeledRequestCost, 59667.0, 60263.67, 60264.0),
+            // +5%: 1_000_000 -> 1_050_000
+            (FigureClass::Bytes, 1_000_000.0, 1_050_000.0, 1_050_001.0),
+            // +1%: 1000 -> 1010
+            (FigureClass::LatencyP50, 1000.0, 1010.0, 1010.1),
+            // +5%: 100 -> 105
+            (FigureClass::LatencyP95, 100.0, 105.0, 105.1),
+            // +10%: 1_000_000 -> 1_100_000
+            (
+                FigureClass::PeakMemory,
+                1_000_000.0,
+                1_100_000.0,
+                1_100_001.0,
+            ),
+            (FigureClass::RangedOpens, 0.0, 0.0, 1.0),
+        ];
+        assert_eq!(
+            cases.len(),
+            FigureClass::ALL.len(),
+            "every figure class has its band edge pinned"
+        );
+        let bands = Bands::defaults();
+        for (class, baseline, edge, past) in cases {
+            let band = bands.for_class(class);
+            assert!(
+                !band.regresses(baseline, edge),
+                "`{class}` band {} must admit its edge {edge} over baseline {baseline}",
+                band.render()
+            );
+            assert!(
+                band.regresses(baseline, past),
+                "`{class}` band {} must reject {past} over baseline {baseline}",
+                band.render()
+            );
+        }
+    }
+
+    #[test]
+    fn defaults_and_the_toml_cover_every_figure_class() {
+        // `for_class` falls back to a 0% band for a class the map lacks, which
+        // would silently make a new class the tightest band in the tool rather
+        // than the documented one. Both the compiled defaults and the
+        // checked-in TOML must name every class explicitly.
+        let defaults = Bands::defaults();
+        let toml = include_str!("../cost_regression_bands.toml");
+        for class in FigureClass::ALL {
+            assert!(
+                defaults.bands.contains_key(&class),
+                "`{class}` has no compiled default band"
+            );
+            assert!(
+                toml.contains(&format!("[{class}]")),
+                "`{class}` has no section in cost_regression_bands.toml"
+            );
+        }
+        assert_eq!(
+            defaults.bands.len(),
+            FigureClass::ALL.len(),
+            "the defaults table carries exactly one band per class"
+        );
     }
 
     #[test]
