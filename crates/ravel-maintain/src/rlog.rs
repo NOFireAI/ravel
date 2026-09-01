@@ -4537,6 +4537,12 @@ mod tests {
              the part heap: peak_total={peak_total} is {multiple:.2}x \
              peak_writer={peak_writer}, expected 2x to 3x"
         );
+        assert_eq!(
+            tracker.phase_peaks().probe_bytes,
+            peak_probe,
+            "the operator-facing phase split must carry the probe term the \
+             total already includes"
+        );
     }
 
     /// Padding bytes in a fat stream's resource blob. The padding is

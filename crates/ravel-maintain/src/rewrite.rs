@@ -168,6 +168,7 @@ pub async fn rewrite_and_publish<C: SegmentCodec>(
             writer_heap_bytes = peaks.writer_heap_bytes,
             retained_part_encoded_bytes = peaks.retained_part_encoded_bytes,
             publish_record_encoded_bytes = peaks.publish_record_encoded_bytes,
+            probe_bytes = peaks.probe_bytes,
             "compaction peak memory by phase (byte kinds differ per term; do not sum)"
         );
     }

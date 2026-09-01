@@ -219,6 +219,11 @@ pub struct MergePhasePeaks {
     /// payload, the only allocation the publish phase adds on top of the
     /// retained parts. Encoded bytes.
     pub publish_record_encoded_bytes: u64,
+    /// In-progress part measurement: high-water of the exact-encode probe term
+    /// (the cloned record heap plus the encoded probe object, mixed decoded
+    /// plus encoded kinds). Zero for a run that never probed, which is the
+    /// case at the shipped defaults where the two split targets coincide.
+    pub probe_bytes: u64,
 }
 
 impl MergeMemoryTracker {
@@ -456,6 +461,7 @@ impl MergeMemoryTracker {
             writer_heap_bytes: self.peak_writer_bytes(),
             retained_part_encoded_bytes: self.peak_retained_part_bytes(),
             publish_record_encoded_bytes: self.peak_publish_record_bytes(),
+            probe_bytes: self.peak_probe_bytes(),
         }
     }
 
