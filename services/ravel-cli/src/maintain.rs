@@ -625,17 +625,25 @@ pub async fn compact_tenant_to(
 /// tracker is `Arc`-shared on `clone`, and ADR-0979's per-bucket memory
 /// accounting requires one tracker per concurrent run: two runs sharing one
 /// combine their figures) and, per ADR-0979's whole-box sizing, a per-bucket
-/// share of the merge cursor budget: `base.merge_cursor_budget_bytes /
-/// concurrency` (integer floor). The base carries the default 20 GiB
-/// ([`ravel_maintain::config::DEFAULT_MERGE_CURSOR_BUDGET_BYTES`]) unless the
-/// operator configured it, so at N buckets each holds up to 20 GiB / N and the
-/// whole N-bucket envelope stays inside the one 30 GB reference box the default
-/// was sized against. N=1 is the full budget, unchanged. Every other config
-/// field is `base`, copied verbatim.
+/// share of the merge cursor budget, applied ONLY while `base` carries the
+/// default 20 GiB
+/// ([`ravel_maintain::config::DEFAULT_MERGE_CURSOR_BUDGET_BYTES`]): the
+/// default was sized against the whole 30 GB reference box, so at N buckets
+/// each holds up to 20 GiB / N (integer floor) and the N-bucket envelope
+/// stays inside the box. A budget the operator configured away from the
+/// default is an explicit whole-box decision and is passed through per
+/// bucket undivided; dividing it would also make
+/// `MergeCursorBudgetExceeded`'s raise-to-`required_bytes` remediation wrong
+/// at N > 1. N=1 is the full budget either way. A `concurrency` of zero is
+/// clamped to one (callers refuse it upstream with a typed error). Every
+/// other config field is `base`, copied verbatim.
 pub fn per_bucket_config(base: &CompactorConfig, concurrency: usize) -> CompactorConfig {
     let mut config = base.clone();
     config.merge_memory_tracker = Some(MergeMemoryTracker::new());
-    config.merge_cursor_budget_bytes = base.merge_cursor_budget_bytes / concurrency as u64;
+    if base.merge_cursor_budget_bytes == ravel_maintain::config::DEFAULT_MERGE_CURSOR_BUDGET_BYTES {
+        config.merge_cursor_budget_bytes =
+            base.merge_cursor_budget_bytes / (concurrency.max(1) as u64);
+    }
     config
 }
 

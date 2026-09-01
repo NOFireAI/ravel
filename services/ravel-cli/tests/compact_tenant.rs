@@ -1102,15 +1102,20 @@ async fn streaming_preserves_walk_order_across_out_of_order_completion() {
         // Wait until index 1's first GET is parked on the gate.
         gate.wait_until_held(1).await;
         // Let the two shard-1 buckets (refilled after index 0's failed join)
-        // run to completion while index 1 stays parked.
-        loop {
-            let s1_old = bucket_output(store.as_ref(), 1, HOUR_OLD).await;
-            let s1_new = bucket_output(store.as_ref(), 1, HOUR_OLD + 1).await;
-            if s1_old == (1, 1) && s1_new == (1, 1) {
-                break;
+        // run to completion while index 1 stays parked. Bounded so a broken
+        // premise fails the test instead of hanging it forever.
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            loop {
+                let s1_old = bucket_output(store.as_ref(), 1, HOUR_OLD).await;
+                let s1_new = bucket_output(store.as_ref(), 1, HOUR_OLD + 1).await;
+                if s1_old == (1, 1) && s1_new == (1, 1) {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
+        })
+        .await
+        .expect("shard-1 buckets did not complete while index 1 was held");
         // Completion order provably differs from walk order at this instant:
         // the later-walk-order shard-1 buckets have published, but index 1
         // (walk-order second) has not, because it is still held.
@@ -1251,5 +1256,23 @@ fn per_bucket_merge_budget_is_the_default_divided_by_n() {
     assert!(
         per_bucket_config(&base, 4).merge_memory_tracker.is_some(),
         "each bucket carries its own tracker"
+    );
+    // An explicitly configured budget is a whole-box decision and passes
+    // through undivided at any N; only the box-sized default is split.
+    let explicit = CompactorConfig {
+        merge_cursor_budget_bytes: 7 * 1024 * 1024 * 1024,
+        ..CompactorConfig::default()
+    };
+    assert_eq!(
+        per_bucket_config(&explicit, 4).merge_cursor_budget_bytes,
+        7 * 1024 * 1024 * 1024,
+        "an operator-configured budget is not divided"
+    );
+    // A zero concurrency cannot reach here through the CLI (refused typed
+    // upstream); the division clamps rather than panicking.
+    assert_eq!(
+        per_bucket_config(&base, 0).merge_cursor_budget_bytes,
+        DEFAULT_MERGE_CURSOR_BUDGET_BYTES,
+        "concurrency zero clamps to one instead of dividing by zero"
     );
 }

@@ -798,8 +798,9 @@ enum MaintainCommand {
         /// division, floor). So each concurrent bucket may hold up to ~20 GiB / N
         /// of cursor budget plus its in-progress writer split target (256 MiB by
         /// default): at N=1 one bucket may hold ~20 GiB + 256 MiB; at N=4 each of
-        /// the four holds up to ~5 GiB + 256 MiB, ~21 GiB + 1 GiB resident in
-        /// aggregate, still inside the one reference box. Dividing the budget is
+        /// the four holds up to ~5 GiB + 256 MiB, so the aggregate stays ~20 GiB
+        /// of cursor budget plus ~1 GiB of writer targets, still inside the one
+        /// reference box. Dividing the budget is
         /// what keeps N times the envelope inside one box instead of needing N
         /// boxes. A bucket whose merge no longer fits its 20 GiB / N share fails
         /// closed with the typed MergeCursorBudgetExceeded naming the figure to
