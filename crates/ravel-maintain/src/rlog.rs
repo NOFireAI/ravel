@@ -142,15 +142,21 @@
 //! geometry: on a wide schema it reaches 256 MiB of heap after only a few MB of
 //! stored bytes, so every L1 object was tiny (~3.5 MB on ClickBench, a 74x gap
 //! below the 256 MiB the knob's old name implied). Object geometry is a second,
-//! independent knob, the **stored-size target** `max_l1_part_bytes`: [`PartSink`]
-//! also sums [`estimate_stored_record`] (an encoded-bytes proxy) per record,
-//! plus [`estimate_stored_stream`] once per distinct stream in the part (the
-//! STREAM_DIR entry the object stores once per stream), and closes the part when
-//! that total reaches the target. A part closes on
-//! whichever target is reached first. With the shipped defaults (both 256 MiB)
-//! the memory split target still fires first on every real schema, so this split is
-//! behaviour-neutral until an operator lowers the stored target to grow
-//! objects.
+//! independent knob, the **stored-size target** `max_l1_part_bytes`, and it is
+//! measured in the bytes its name promises: the part's ACTUAL encoded object
+//! size (issue #872). The RLOG writer holds row-major records and only encodes
+//! at [`RlogWriter::finish_compacted`], so there is no incremental encoded size
+//! to read; instead [`PartBuilder`] keeps a cheap pre-compression payload proxy
+//! ([`estimate_stored_record`] per record plus [`estimate_stored_stream`] once
+//! per distinct stream) that SCHEDULES an exact-encode probe once it reaches the
+//! target, and the part closes on the probe's real byte count. Closing on the
+//! proxy directly would have sized every object at the target divided by the
+//! compression ratio (the proxy is an upper bound over the zstd-compressed
+//! sections), the same ratio-times-smaller objects issue #872 names. A part
+//! closes on whichever target is reached first. With the shipped defaults (both
+//! 256 MiB) the memory split target still fires first on every real schema and
+//! the payload proxy never reaches 256 MiB, so no probe runs and this split is
+//! behaviour-neutral until an operator lowers the stored target to grow objects.
 //!
 //! The first RLOG merge held every input object whole (RLOG then had no ranged
 //! section reader); [`ravel_logseg::open_from_suffix`] is now the RLOG analogue
@@ -199,7 +205,8 @@ use ravel_logseg::record::{
 use ravel_logseg::skip_index::SkipIndex;
 use ravel_logseg::{
     AttrValue, FieldType, LogRecord, LogStreamId, RlogConfig, RlogRangeReader, RlogWriter,
-    StreamBlockLoc, StreamBlockRows, decode_section, writer::ObjectIdentity,
+    StreamBlockLoc, StreamBlockRows, decode_section,
+    writer::{ObjectIdentity, WriteStats},
 };
 use ravel_object_store::{GetRange, ObjectStoreBackend};
 use ravel_proto::commit::v1::CompactionPart;
@@ -767,11 +774,11 @@ pub(crate) async fn merge_catalogs(
     // k-way merged from every input carrying it (ts-ascending, canonical
     // input-order tie-break) straight into the current part's writer, and
     // the part flushes the moment its accumulated record-heap estimate
-    // reaches `l1_part_memory_target_bytes` (the memory split target) or its encoded
-    // estimate reaches `max_l1_part_bytes` (the stored target), whichever comes
-    // first -- mid-stream if that is where the target falls (issue #711 for the
-    // memory split target, issue #872 for the stored target, ADR-0032 amendment
-    // 2026-08-26). No intermediate
+    // reaches `l1_part_memory_target_bytes` (the memory split target) or an
+    // exact-encode probe shows its object bytes reaching `max_l1_part_bytes`
+    // (the stored target), whichever comes first -- mid-stream if that is where
+    // the target falls (issue #711 for the memory split target, issue #872 for
+    // the stored target, ADR-0032 amendment 2026-08-26). No intermediate
     // `Vec<LogRecord>` and no per-stream dedup: distinct submissions of
     // identical content are distinct records (ADR-0032).
     for stream_id in merged.keys() {
@@ -823,14 +830,31 @@ impl RecordCounts {
 /// closed and a new one opened.
 ///
 /// The split rule pushes records in the merge's canonical order and closes the
-/// in-progress part as soon as EITHER target is reached (issue #872): its
-/// [`PartBuilder::estimate`] (decoded heap) reaches the memory split target
-/// `l1_part_memory_target_bytes`, or its [`PartBuilder::stored_estimate`] (encoded
-/// bytes) reaches the stored target `max_l1_part_bytes`, wherever in the record
-/// sequence that falls. The memory split target is the whole of issue #711: the check
-/// used to run only between streams, so a bucket whose records all belong to
-/// one stream (one OTLP resource/scope, the common shape for a single busy
-/// service) held its entire row set live in one writer.
+/// in-progress part as soon as EITHER target is reached (issue #872), whichever
+/// falls first in the record sequence:
+///
+/// - the **memory split target** `l1_part_memory_target_bytes`, reached when the
+///   part's [`PartBuilder::estimate`] (decoded record heap) does. This is
+///   checked after every record, so the writer buffer exceeds it by at most one
+///   record; it is the whole of issue #711 (the check used to run only between
+///   streams, so a bucket whose records all belong to one stream held its entire
+///   row set live in one writer).
+/// - the **stored-size target** `max_l1_part_bytes`, reached when the part's
+///   ACTUAL encoded object bytes do. The RLOG writer holds row-major records and
+///   only encodes at [`RlogWriter::finish_compacted`], so there is no incremental
+///   encoded size to read; instead [`PartBuilder::stored_estimate`] (a cheap
+///   pre-compression payload proxy) schedules an exact-encode probe
+///   ([`PartBuilder::encode_clone`]), and the part closes on the probe's real
+///   byte count, not on the proxy. The proxy only decides WHEN to probe, never
+///   whether to close, so the compression ratio between payload and object no
+///   longer sizes the part: on a wide, compressible schema a proxy-driven close
+///   produced objects a ratio-times smaller than the target
+///   (`estimate_stored_record` is documented as an upper bound over the
+///   zstd-compressed sections), which is the bug issue #872 names. The probe is
+///   gated on the proxy first reaching the target, so at the shipped defaults
+///   (both 256 MiB) it never fires: the memory target closes every part on a
+///   real schema long before the payload proxy reaches 256 MiB, so this crate's
+///   geometry is unchanged until an operator lowers the stored target.
 ///
 /// Consecutive parts may therefore carry the same `stream_id` at their shared
 /// boundary, with adjacent, non-overlapping `(series_id, ts)` ranges. Records
@@ -864,39 +888,52 @@ struct PartSink<'a> {
 
 impl PartSink<'_> {
     /// Push one merged record, opening a part if none is in progress and
-    /// closing it once the cap is reached.
+    /// closing it once a target is reached.
     async fn push(&mut self, r: LogRecord) -> Result<()> {
         if self.current.is_none() {
             self.current = Some(PartBuilder::new(&self.identity, &self.indexed_fields));
         }
         let mut over_memory = false;
-        let mut over_stored = false;
+        // Encoded object bytes from a stored-target probe that showed the part
+        // reached the target, carried to `flush` so the closing object is
+        // encoded once, not re-encoded (the probe already produced the exact
+        // bytes for this `part_index` and `input_set_hash`).
+        let mut stored_close: Option<(Vec<u8>, WriteStats)> = None;
         if let Some(part) = self.current.as_mut() {
             part.push(r, self.tracker)?;
-            // Two independent targets; a part closes when EITHER is reached
-            // (issue #872). The memory split target sizes compactor peak memory
-            // (issue #711); the stored target governs object geometry. Both are
-            // checked here, after every record, so a part exceeds whichever
-            // fires by at most one record. On a
-            // wide schema the heap estimate reaches its target first (small
-            // objects); on a narrow, highly compressible schema the encoded
-            // estimate reaches its target first. With the shipped defaults
-            // (both 256 MiB) the memory split target fires and the stored target
-            // does not, so this crate's geometry is unchanged.
+            // The memory split target sizes compactor peak memory (issue #711)
+            // and is checked cheaply after every record, so it takes priority
+            // when both would fire.
             over_memory = part.estimate >= self.config.l1_part_memory_target_bytes;
-            over_stored = part.stored_estimate >= self.config.max_l1_part_bytes;
-        }
-        if over_memory || over_stored {
-            if let Some(t) = self.tracker {
-                // The memory split target is the one that keeps the host alive;
-                // when both fire at once attribute the flush to it.
-                if over_memory {
-                    t.note_memory_target_flush();
+            if !over_memory
+                && part.stored_estimate >= self.config.max_l1_part_bytes
+                && part.stored_estimate >= part.next_probe_stored
+            {
+                // The stored target governs object geometry, so it closes on the
+                // object's ACTUAL encoded size, not on the payload proxy (issue
+                // #872). The proxy only schedules this probe; encoding is what
+                // measures the bytes the knob is named for. `encode_clone`
+                // encodes a clone of the buffered records, so the builder can
+                // keep accumulating when the part is not yet full.
+                let (object, stats) = part.encode_clone(self.input_set_hash, self.part_index)?;
+                let encoded = object.len() as u64;
+                if encoded >= self.config.max_l1_part_bytes {
+                    stored_close = Some((object, stats));
                 } else {
-                    t.note_stored_target_flush();
+                    part.schedule_next_probe(encoded, self.config.max_l1_part_bytes);
                 }
             }
-            self.flush().await?;
+        }
+        if over_memory {
+            if let Some(t) = self.tracker {
+                t.note_memory_target_flush();
+            }
+            self.flush(None).await?;
+        } else if let Some(enc) = stored_close {
+            if let Some(t) = self.tracker {
+                t.note_stored_target_flush();
+            }
+            self.flush(Some(enc)).await?;
         }
         Ok(())
     }
@@ -904,20 +941,36 @@ impl PartSink<'_> {
     /// Close the in-progress part, if any, and PUT it. A part is never empty
     /// here: [`Self::push`] only ever calls this after pushing a record, and
     /// [`Self::finish`] guards on `is_empty`.
-    async fn flush(&mut self) -> Result<()> {
+    ///
+    /// `pre_encoded` reuses the bytes a stored-target probe already produced for
+    /// this part; `None` (a memory-target close or the trailing part) encodes
+    /// the part here, consuming its records so no clone is made on the common
+    /// path.
+    async fn flush(&mut self, pre_encoded: Option<(Vec<u8>, WriteStats)>) -> Result<()> {
         // The `if let` (rather than an `unwrap`/`expect`) keeps the critical
         // path free of a panic path; a `None` here is a no-op, not a lie.
         if let Some(builder) = self.current.take() {
-            let built = builder
-                .finish(
-                    self.store,
-                    self.bucket,
-                    self.input_set_hash,
-                    self.part_index,
-                    self.dry_run,
-                    self.retain_bytes,
-                )
-                .await?;
+            // Copy the Copy-typed stream bounds before the encode consumes the
+            // builder.
+            let first_stream_id = builder.min_stream;
+            let last_stream_id = builder.max_stream;
+            let (object, stats) = match pre_encoded {
+                Some(enc) => enc,
+                None => builder.into_encoded(self.input_set_hash, self.part_index)?,
+            };
+            let built = finalize_part(
+                self.store,
+                self.bucket,
+                object,
+                stats,
+                first_stream_id,
+                last_stream_id,
+                self.input_set_hash,
+                self.part_index,
+                self.dry_run,
+                self.retain_bytes,
+            )
+            .await?;
             // Only bytes actually retained past PUT count toward the
             // retained-parts term. On the compaction path (`retain_bytes =
             // false`) `finalize_part` released them at PUT, so this is 0 and the
@@ -941,37 +994,64 @@ impl PartSink<'_> {
     /// Close the trailing part and yield every part built, in part-index order.
     async fn finish(mut self) -> Result<Vec<BuiltPart>> {
         if self.current.as_ref().is_some_and(|p| !p.is_empty()) {
-            self.flush().await?;
+            self.flush(None).await?;
         }
         Ok(self.parts)
     }
 }
 
-/// One in-progress L1 part: the shared [`RlogWriter`] the merged records push
-/// into directly, plus the two running estimates that decide where the part
-/// splits (the decoded-heap `estimate` against the memory split target and the encoded
-/// `stored_estimate` against the stored target, whichever is reached first, see
-/// [`PartSink`]); the heap estimate also feeds the [`MergeMemoryTracker`]'s
-/// writer term. Holding a
-/// whole part's records before [`PartBuilder::finish`] stamps its
-/// content-addressed key is unavoidable (the key is a hash of the whole
-/// object); the k-way merge is what keeps everything *else* bounded.
+/// The floor on how far apart two stored-target probes may sit on the payload
+/// proxy axis. A probe encodes the whole part (an O(part) cost), so the
+/// scheduler in [`PartBuilder::schedule_next_probe`] aims the next one near the
+/// target rather than running one per record; this floor keeps a momentarily
+/// flat encoded/proxy rate from scheduling the next probe in the past. It also
+/// bounds how far a part overshoots the stored target: a closing probe fires at
+/// most one interval's worth of records past the crossing, the same
+/// at-most-one-unit discipline the memory split target has (issue #711).
+const PROBE_MIN_STEP_BYTES: u64 = 4096;
+
+/// One in-progress L1 part: the merged records buffered in canonical order, the
+/// decoded-heap estimate that drives the memory split target and the tracker's
+/// writer term, and the payload proxy that schedules the stored-target probe
+/// (see [`PartSink`]).
+///
+/// Holding one whole part's records before its content-addressed key exists is
+/// unavoidable (the key hashes the whole object); the k-way merge keeps
+/// everything *else* bounded. The records are buffered here rather than pushed
+/// into one long-lived [`RlogWriter`] so the part can be encoded to measure its
+/// real size ([`Self::encode_clone`]) without being consumed.
 struct PartBuilder {
-    writer: RlogWriter,
-    /// Sum of [`estimate_record`] over every pushed record: the **memory
-    /// bound**'s trigger (compared against `l1_part_memory_target_bytes`) and the
-    /// writer-buffer term the tracker records. This is decoded Rust heap, not
-    /// stored bytes.
+    /// The compaction identity every encode stamps into the footer. Combined
+    /// with the caller's `input_set_hash` and `part_index` it makes each encode
+    /// deterministic, so a probe's bytes are byte-identical to the close's.
+    identity: ObjectIdentity,
+    /// The POSTINGS field list every part is written with (ADR-0049 decision 6).
+    indexed_fields: Vec<String>,
+    /// The merged records buffered for this part, in canonical `(stream_id, ts)`
+    /// order.
+    records: Vec<LogRecord>,
+    /// Sum of [`estimate_record`] over every pushed record: the **memory split
+    /// target**'s trigger (compared against `l1_part_memory_target_bytes`) and
+    /// the writer-buffer term the tracker records. Decoded Rust heap, not stored
+    /// bytes.
     estimate: u64,
     /// Sum of [`estimate_stored_record`] over every pushed record, plus
-    /// [`estimate_stored_stream`] once per distinct stream in this part: the
-    /// **stored-size target**'s trigger (compared against `max_l1_part_bytes`).
-    /// This estimates encoded/on-object bytes, not heap.
+    /// [`estimate_stored_stream`] once per distinct stream in this part: a cheap
+    /// pre-compression payload proxy. It does NOT close the part (issue #872):
+    /// it only schedules the exact-encode probe that measures the object's real
+    /// bytes, the quantity `max_l1_part_bytes` is named for. See
+    /// [`PartSink::push`] and [`Self::next_probe_stored`].
     stored_estimate: u64,
-    /// The streams whose STREAM_DIR entry this part has already been charged
-    /// for. A set rather than a "did the stream change" check so the charge is
-    /// once per distinct stream whatever order records arrive in; it holds one
-    /// 16-byte id per stream in the part, which is negligible beside the part's
+    /// The `stored_estimate` value at which the next stored-target probe runs.
+    /// Starts at 0, so the first probe runs as soon as `stored_estimate` first
+    /// reaches `max_l1_part_bytes`; [`Self::schedule_next_probe`] advances it
+    /// past a probe that found the part still short of the target, so probing is
+    /// a few encodes per part, not one per record.
+    next_probe_stored: u64,
+    /// The streams whose STREAM_DIR entry this part has already been charged for
+    /// in `stored_estimate`. A set rather than a "did the stream change" check so
+    /// the charge is once per distinct stream whatever order records arrive in;
+    /// it holds one 16-byte id per stream in the part, negligible beside the
     /// records.
     charged_streams: BTreeSet<LogStreamId>,
     min_stream: Option<LogStreamId>,
@@ -981,12 +1061,13 @@ struct PartBuilder {
 
 impl PartBuilder {
     fn new(identity: &ObjectIdentity, indexed_fields: &[String]) -> Self {
-        let writer = RlogWriter::new(RlogConfig::default(), *identity)
-            .with_indexed_fields(indexed_fields.to_vec());
         PartBuilder {
-            writer,
+            identity: *identity,
+            indexed_fields: indexed_fields.to_vec(),
+            records: Vec::new(),
             estimate: 0,
             stored_estimate: 0,
+            next_probe_stored: 0,
             charged_streams: BTreeSet::new(),
             min_stream: None,
             max_stream: None,
@@ -998,15 +1079,15 @@ impl PartBuilder {
         self.count == 0
     }
 
-    /// Push one merged record into the part's writer, updating both running
-    /// estimates (heap for the memory split target, encoded for the stored target) and
-    /// the part's inclusive stream-id bounds.
+    /// Push one merged record, updating the decoded-heap estimate (the memory
+    /// split target's trigger and the tracker's writer term), the payload proxy
+    /// that schedules the stored-target probe, and the part's inclusive
+    /// stream-id bounds.
     ///
     /// A record whose stream this part has not seen before also charges the
-    /// stored estimate for that stream's STREAM_DIR entry
-    /// ([`estimate_stored_stream`]): the blob is written once per stream in the
-    /// object, so it belongs in the encoded estimate once per stream, not once
-    /// per record and not never.
+    /// proxy for that stream's STREAM_DIR entry ([`estimate_stored_stream`]): the
+    /// blob is written once per stream in the object, so it belongs in the proxy
+    /// once per stream, not once per record and not never.
     fn push(&mut self, r: LogRecord, tracker: Option<&MergeMemoryTracker>) -> Result<()> {
         self.min_stream = Some(self.min_stream.map_or(r.stream_id, |m| m.min(r.stream_id)));
         self.max_stream = Some(self.max_stream.map_or(r.stream_id, |m| m.max(r.stream_id)));
@@ -1020,37 +1101,79 @@ impl PartBuilder {
             .stored_estimate
             .saturating_add(estimate_stored_record(&r));
         self.count += 1;
-        self.writer.push(r)?;
+        self.records.push(r);
         if let Some(t) = tracker {
             t.set_writer_bytes(self.estimate);
         }
         Ok(())
     }
 
-    /// Encode and PUT the part through the shared writer pipeline. See
-    /// [`finalize_part`] for the encode/summary/PUT detail this reuses.
-    #[allow(clippy::too_many_arguments)]
-    async fn finish(
-        self,
-        store: &dyn ObjectStoreBackend,
-        bucket: &Bucket,
+    /// Build a fresh writer over `records`. `RlogConfig::default()` and the
+    /// indexed-field list match the L0 write path, so an L0 write and this L1
+    /// merge cannot drift on encoding.
+    fn build_writer(
+        identity: &ObjectIdentity,
+        indexed_fields: &[String],
+        records: Vec<LogRecord>,
+    ) -> Result<RlogWriter> {
+        let mut w = RlogWriter::new(RlogConfig::default(), *identity)
+            .with_indexed_fields(indexed_fields.to_vec());
+        for r in records {
+            w.push(r)?;
+        }
+        Ok(w)
+    }
+
+    /// Encode this part WITHOUT consuming the builder, by cloning its records.
+    /// Used by the stored-target probe to measure the object's real encoded
+    /// size; when the probe decides to close, the caller reuses the returned
+    /// bytes as the closing object (they are byte-identical to what
+    /// [`Self::into_encoded`] would produce for the same `part_index`, the encode
+    /// being deterministic).
+    fn encode_clone(
+        &self,
         input_set_hash: &[u8; 32],
         part_index: u32,
-        dry_run: bool,
-        retain_bytes: bool,
-    ) -> Result<BuiltPart> {
-        finalize_part(
-            store,
-            bucket,
-            self.writer,
-            self.min_stream,
-            self.max_stream,
-            input_set_hash,
-            part_index,
-            dry_run,
-            retain_bytes,
-        )
-        .await
+    ) -> Result<(Vec<u8>, WriteStats)> {
+        let w = Self::build_writer(&self.identity, &self.indexed_fields, self.records.clone())?;
+        Ok(w.finish_compacted_with_stats(1, input_set_hash.to_vec(), part_index)?)
+    }
+
+    /// Encode this part, consuming the builder (no clone). Used to close a part
+    /// on the memory split target, or the trailing part.
+    fn into_encoded(
+        self,
+        input_set_hash: &[u8; 32],
+        part_index: u32,
+    ) -> Result<(Vec<u8>, WriteStats)> {
+        let PartBuilder {
+            identity,
+            indexed_fields,
+            records,
+            ..
+        } = self;
+        let w = Self::build_writer(&identity, &indexed_fields, records)?;
+        Ok(w.finish_compacted_with_stats(1, input_set_hash.to_vec(), part_index)?)
+    }
+
+    /// Schedule the next stored-target probe after one found the part still
+    /// short of the target. Models encoded size as ~linear in the payload proxy
+    /// and aims the next probe at the proxy value where the encoded size should
+    /// reach `target`, so a part converges to the target in a few probes even
+    /// when the compression ratio is large, rather than encoding once per
+    /// record. The step is floored at [`PROBE_MIN_STEP_BYTES`] so a momentarily
+    /// flat rate cannot schedule the probe in the past.
+    fn schedule_next_probe(&mut self, encoded_now: u64, target: u64) {
+        let deficit = target.saturating_sub(encoded_now);
+        // Encoded bytes produced per unit of payload proxy so far. A probe only
+        // runs once `stored_estimate >= target > 0` and an encoded part is never
+        // empty, so `encoded_now` and `stored_estimate` are both positive; the
+        // clamp guards the ratio against a degenerate zero rather than being a
+        // live case.
+        let rate = (encoded_now as f64 / self.stored_estimate.max(1) as f64).max(f64::MIN_POSITIVE);
+        let step = ((deficit as f64) / rate).ceil() as u64;
+        let step = step.max(PROBE_MIN_STEP_BYTES);
+        self.next_probe_stored = self.stored_estimate.saturating_add(step);
     }
 }
 
@@ -1874,20 +1997,21 @@ async fn open_cursor<'a>(
     Ok(cursor.peek_ts().is_some().then_some(cursor))
 }
 
-/// Encode one in-progress part's writer into an L1 object and PUT it: run the
-/// shared writer pipeline via [`RlogWriter::finish_compacted_with_stats`]
-/// (stamping `level = 1`, the `input_set_hash`, and `part_index`), then PUT it
-/// `CreateIfAbsent`. The part's summary stats are read back from the produced
-/// object's own footer, so they describe exactly what was written.
+/// Turn one part's already-encoded L1 object bytes into a [`BuiltPart`] and PUT
+/// it `CreateIfAbsent`. The object was produced by
+/// [`PartBuilder::into_encoded`]/[`PartBuilder::encode_clone`] via the shared
+/// [`RlogWriter::finish_compacted_with_stats`] pipeline (stamping `level = 1`,
+/// the `input_set_hash`, and `part_index`); the part's summary stats are read
+/// back from the object's own footer, so they describe exactly what was
+/// written.
 ///
-/// The writer was built with the same [`RlogWriter::with_indexed_fields`] the
-/// L0 write path uses, so this part's POSTINGS is built by the one writer
-/// implementation from this part's own blocks (ADR-0049 decision 6). The
-/// per-field distinct-value cap therefore applies to the merged part; when it
-/// fires the writer drops that field's postings and reports it in
-/// `WriteStats`, which is logged here because a silently unindexed field is
-/// invisible in the object bytes (they are simply absent, which is always
-/// legal).
+/// The object was encoded with the same [`RlogWriter::with_indexed_fields`] the
+/// L0 write path uses, so its POSTINGS is built by the one writer implementation
+/// from this part's own blocks (ADR-0049 decision 6). The per-field
+/// distinct-value cap therefore applies to the merged part; when it fires the
+/// writer drops that field's postings and reports it in `stats`, logged here
+/// because a silently unindexed field is invisible in the object bytes (they are
+/// simply absent, which is always legal).
 ///
 /// `first_stream_id`/`last_stream_id` are the part's inclusive stream-id bounds
 /// accumulated as records were pushed (streams are merged in sorted id order,
@@ -1899,7 +2023,8 @@ async fn open_cursor<'a>(
 pub(crate) async fn finalize_part(
     store: &dyn ObjectStoreBackend,
     bucket: &Bucket,
-    writer: RlogWriter,
+    object: Vec<u8>,
+    stats: WriteStats,
     first_stream_id: Option<LogStreamId>,
     last_stream_id: Option<LogStreamId>,
     input_set_hash: &[u8; 32],
@@ -1907,8 +2032,6 @@ pub(crate) async fn finalize_part(
     dry_run: bool,
     retain_bytes: bool,
 ) -> Result<BuiltPart> {
-    let (object, stats) =
-        writer.finish_compacted_with_stats(1, input_set_hash.to_vec(), part_index)?;
     if stats.postings_capped_fields > 0 {
         tracing::warn!(
             part_index,
@@ -2095,15 +2218,20 @@ fn attr_value_estimate(v: &AttrValue) -> u64 {
 /// figure in the range those fixed-width columns cost before compression.
 const STORED_RECORD_FIXED_BYTES: u64 = 16;
 
-/// The encoded/on-object bytes one merged [`LogRecord`] is estimated to add to
-/// a part, the quantity `max_l1_part_bytes` (the stored-size target) caps.
+/// A cheap upper bound on the encoded/on-object bytes one merged [`LogRecord`]
+/// adds to a part. It does NOT close the part on `max_l1_part_bytes` (the
+/// stored-size target): the part closes on its object's ACTUAL encoded size,
+/// measured by an exact-encode probe ([`PartBuilder::encode_clone`]). This
+/// figure's only job is to SCHEDULE that probe -- summed per record into
+/// [`PartBuilder::stored_estimate`], it says when the object is plausibly large
+/// enough to be worth encoding to check (issue #872).
 ///
 /// This is deliberately NOT [`estimate_record`], which measures the record's
-/// Rust *heap* for the memory split target. The two answer different questions and are
-/// an order of magnitude apart on a wide schema, which is the whole point of
-/// issue #872: the memory split target reached 256 MiB of heap after only ~3.5 MB of
-/// stored bytes on the ClickBench tenant, so a single knob measured in heap
-/// could not also govern object geometry.
+/// Rust *heap* for the memory split target. The two answer different questions
+/// and are an order of magnitude apart on a wide schema: the memory split target
+/// reaches 256 MiB of heap after only ~3.5 MB of stored bytes on the ClickBench
+/// tenant, so a single knob measured in heap could not also govern object
+/// geometry.
 ///
 /// It is a pre-compression payload proxy: the sum of the value bytes that
 /// actually enter this part's columns (timestamps and identifiers as a small
@@ -2112,21 +2240,18 @@ const STORED_RECORD_FIXED_BYTES: u64 = 16;
 ///
 /// - `stream_attrs` (the resource/scope blob) is stored once per stream in
 ///   STREAM_DIR, not once per record, so charging it per record would inflate
-///   the estimate on exactly the wide-stream shape this is meant to size. It is
+///   the proxy on exactly the wide-stream shape this is meant to size. It is
 ///   not free, though: [`estimate_stored_stream`] charges each distinct stream's
-///   blob once per part it appears in, so a part carrying many streams with
-///   large resource blobs still reaches the target. Charging neither made the
-///   estimate blind to the whole STREAM_DIR section, and a many-stream,
-///   fat-blob bucket then ran far past the target while the estimate stayed
-///   small.
-/// - zstd compression. The estimate is the uncompressed column payload, so it
-///   is an upper bound on the bytes those columns compress to; a target of `T`
-///   payload bytes yields an object of `T / compression_ratio` stored bytes.
-///   That makes the target conservative (objects no larger than `T`), which is
-///   the safe direction for a memory-adjacent geometry knob, and it is why the
-///   size-target default is left at 256 MiB: on the current corpus the memory
-///   bound still fires first, so no stored target value can change today's
-///   geometry.
+///   blob once per part it appears in, so the proxy over a part carrying many
+///   streams with large resource blobs still grows toward the probe threshold.
+///   Charging neither made the proxy blind to the whole STREAM_DIR section.
+/// - zstd compression. The proxy is the uncompressed column payload, so it is an
+///   upper bound on the bytes those columns compress to. That is the direction
+///   that matters for a scheduling gate: the proxy reaches the target no later
+///   than the object's real bytes would, so the probe is never scheduled too
+///   late to catch the crossing. (Under the old proxy-as-close design this same
+///   upper bound made objects `T / compression_ratio` in size, a ratio-times
+///   miss; closing on the probe removes it.)
 ///
 /// Like [`estimate_record`] it only decides where parts split, never
 /// correctness: the frozen [`RlogWriter`] produces identical bytes for a given
@@ -2159,11 +2284,11 @@ const STORED_STREAM_DIR_ENTRY_BYTES: u64 = 32;
 /// it out). A part that opens a stream, closes, and reopens the same stream in
 /// the next part is charged in both, because both parts carry the entry.
 ///
-/// Without this charge the stored estimate ignored STREAM_DIR entirely, so a
-/// bucket with many streams and large resource or scope blobs could run far past
-/// `max_l1_part_bytes` in real object bytes while its estimate stayed near the
-/// (tiny) sum of its record payloads. The estimate is only meaningful as a
-/// proxy for object size if it counts every section that grows with the data.
+/// Without this charge the proxy would ignore STREAM_DIR entirely, so a bucket
+/// with many streams and large resource or scope blobs would grow real object
+/// bytes the proxy could not see, scheduling the exact-encode probe too late and
+/// overshooting `max_l1_part_bytes`. The proxy is only a sound probe-scheduling
+/// coordinate if it counts every section that grows with the data.
 fn estimate_stored_stream(stream_attrs: &[u8]) -> u64 {
     STORED_STREAM_DIR_ENTRY_BYTES.saturating_add(stream_attrs.len() as u64)
 }
@@ -3478,10 +3603,10 @@ mod tests {
     /// straddles every boundary.
     ///
     /// Demonstrated red by restoring the pre-#711 between-streams-only check:
-    /// delete the `if over_memory || over_stored { .. self.flush().await?; }`
-    /// block from `PartSink::push` and re-add the flush to `build_parts`'s
-    /// `for stream_id in merged.keys()` loop (`if part.estimate >=
-    /// config.l1_part_memory_target_bytes { sink.flush().await?; }` after
+    /// delete the `if over_memory { .. self.flush(None).await?; }` block from
+    /// `PartSink::push` and re-add the flush to `build_parts`'s `for stream_id in
+    /// merged.keys()` loop (`if part.estimate >=
+    /// config.l1_part_memory_target_bytes { sink.flush(None).await?; }` after
     /// `merge_stream_into_parts`). The part count collapses to 1 and this test
     /// fails at `assert_eq!(parts.len() as u64, expected_parts)` with
     /// `1 != 10`.
@@ -3684,14 +3809,28 @@ mod tests {
 
     // --- memory split target vs stored-size target (issue #872) ---------------------
 
-    /// One narrow record of stream 0: a tiny body and no attributes, so its
-    /// encoded [`estimate_stored_record`] is a handful of bytes while its
-    /// decoded [`estimate_record`] still carries the per-record Rust-slot and
-    /// resource-blob overhead. This is the "narrow rows, high compression"
-    /// direction: stored bytes accumulate far slower than heap, so the
-    /// stored-size target can be made to fire first.
-    fn narrow_record(i: i64) -> LogRecord {
-        record(0, SPLIT_BASE_NS + i, "x", Vec::new())
+    /// One record of stream 0 with a deliberately KNOWN encoded/decoded ratio: a
+    /// short per-ordinal-unique prefix (so blocks do not collapse to nothing and
+    /// parts fill in a bounded record count) followed by a long repeated filler
+    /// (so the pre-compression payload proxy runs several times ahead of the
+    /// bytes the columns actually compress to). Every record is the same width,
+    /// so each contributes about the same object bytes and the geometry band is
+    /// uniform. Fixed single stream, so STREAM_DIR is a one-time per-part charge.
+    ///
+    /// This is the fixture the stored-target geometry rests on: the gap between
+    /// its payload proxy and its compressed object bytes is exactly the ratio the
+    /// old proxy-as-close design mis-sized parts by (issue #872).
+    fn ratio_record(i: i64) -> LogRecord {
+        // A high-entropy prefix (does not compress, so it sets the object bytes
+        // and parts fill in a bounded record count) followed by a long
+        // compressible filler (inflates the payload proxy well past the object
+        // bytes). The gap is a stable ratio near 4.
+        let body = format!(
+            "{}{}",
+            incompressible_pad(i as u64, 48),
+            "compressible-".repeat(16)
+        );
+        record(0, SPLIT_BASE_NS + i, &body, Vec::new())
     }
 
     /// Issue #872: on a wide schema the MEMORY bound fires first. With both
@@ -3776,23 +3915,71 @@ mod tests {
         }
     }
 
-    /// Issue #872: on a narrow, highly compressible schema the STORED target
-    /// fires first. The memory split target is left at its 256 MiB default (far above
-    /// anything this corpus reaches in heap) and the stored target is set small,
-    /// so every part closes on encoded bytes and none on memory. This is the
-    /// follow-up's shape: lowering the stored target is what grows/shrinks
-    /// objects, independently of the memory invariant.
+    /// Compact the [`ratio_record`] fixture into a FRESH store with both targets
+    /// effectively disabled, so the whole bucket is one part, and return its
+    /// decoded record sequence: the pre-split baseline the differential check
+    /// compares against.
+    async fn ratio_fixture_single_part(per_input: i64, inputs: i64) -> Vec<LogRecord> {
+        let store = MemoryStore::new();
+        for j in 0..inputs {
+            let recs: Vec<LogRecord> = (0..per_input)
+                .map(|i| ratio_record(i * inputs + j))
+                .collect();
+            seed(&store, Uuid::from_u128(j as u128 + 1), j as u64 + 1, &recs).await;
+        }
+        let config = CompactorConfig {
+            max_l1_part_bytes: u64::MAX,
+            l1_part_memory_target_bytes: u64::MAX,
+            ..CompactorConfig::default()
+        };
+        let clock = FixedClock::new(sealed_now_ns());
+        compact_bucket(&store, &clock, &config, &bucket())
+            .await
+            .expect("compact");
+        let (_rec, parts) = read_output(&store).await;
+        assert_eq!(parts.len(), 1, "baseline must be a single part");
+        let mut rows = Vec::new();
+        for p in &parts {
+            rows.extend(decode_all(p));
+        }
+        rows
+    }
+
+    /// Issue #872 acceptance (geometry): the stored-size target closes each part
+    /// on its ACTUAL encoded object bytes, so every non-final part reaches the
+    /// target rather than coming out a compression-ratio-times-smaller object,
+    /// which is what closing on the pre-compression payload proxy produced. The
+    /// memory split target is left at its 256 MiB default (far above anything
+    /// this corpus reaches in heap), so the stored target is the only thing that
+    /// can fire.
+    ///
+    /// The band is exact from the fixture, never merely `> 0`: a part closes the
+    /// moment a probe shows its object reaching `STORED_TARGET`, and probes are
+    /// spaced at least [`PROBE_MIN_STEP_BYTES`] of payload proxy apart, whose
+    /// records encode to fewer than that many object bytes (the proxy is an upper
+    /// bound over the compressed sections). So every stored-closed part sits in
+    /// `[STORED_TARGET, STORED_TARGET + PROBE_MIN_STEP_BYTES]`; only the trailing
+    /// part, closed by `finish` on the remainder, sits below.
+    ///
+    /// Demonstrated red against the old proxy-as-close design: replace the probe
+    /// block in `PartSink::push` with `over_stored = part.stored_estimate >=
+    /// self.config.max_l1_part_bytes` and flush on it. The same fixture then
+    /// closes each part when its PAYLOAD reaches the target, so the objects come
+    /// out `ratio` times smaller -- below `STORED_TARGET / 2` -- and the
+    /// lower-bound assertion below fails. The `ratio` sub-assertion pins that
+    /// this fixture's gap is well above 2, so the old design provably misses the
+    /// band low.
     #[tokio::test]
-    async fn narrow_rows_close_the_part_on_the_stored_target() {
-        const PER_INPUT: i64 = 500;
+    async fn stored_target_closes_parts_on_actual_encoded_object_bytes() {
+        const PER_INPUT: i64 = 2500;
         const INPUTS: i64 = 2;
-        const STORED_TARGET: u64 = 4 * 1024;
+        const STORED_TARGET: u64 = 16 * 1024;
         let total = (PER_INPUT * INPUTS) as u64;
 
         let store = Arc::new(MemoryStore::new());
         for j in 0..INPUTS {
             let recs: Vec<LogRecord> = (0..PER_INPUT)
-                .map(|i| narrow_record(i * INPUTS + j))
+                .map(|i| ratio_record(i * INPUTS + j))
                 .collect();
             seed(
                 store.as_ref(),
@@ -3803,29 +3990,35 @@ mod tests {
             .await;
         }
 
-        let stored = estimate_stored_record(&narrow_record(0));
-        // Every part also pays this fixture's single stream's STREAM_DIR entry
-        // once, at its first record, so the records-per-part arithmetic runs
-        // against what is left of the target.
-        let stream_charge = estimate_stored_stream(&narrow_record(0).stream_attrs);
+        // The fixture's encoded/decoded gap, measured not assumed: encode a
+        // sample exactly as the merge does and compare the payload proxy the old
+        // design closed on to the object bytes the new design closes on. A ratio
+        // above 2 is what puts the old design's parts (~STORED_TARGET / ratio)
+        // below the STORED_TARGET/2 band floor.
+        let sample: Vec<LogRecord> = (0..200).map(ratio_record).collect();
+        let proxy: u64 = sample.iter().map(estimate_stored_record).sum::<u64>()
+            + estimate_stored_stream(&ratio_record(0).stream_attrs);
+        let identity = compactor_identity(&bucket(), &CompactorConfig::default());
+        let mut w = RlogWriter::new(RlogConfig::default(), identity);
+        for r in &sample {
+            w.push(r.clone()).expect("push");
+        }
+        let object_len = w
+            .finish_compacted(1, vec![0u8; 32], 0)
+            .expect("encode")
+            .len() as u64;
+        let ratio = proxy as f64 / object_len as f64;
         assert!(
-            stream_charge < STORED_TARGET,
-            "fixture is unusable: its stream blob charges {stream_charge}B against a \
-             {STORED_TARGET}B target, leaving no room for records"
-        );
-        let expected_parts = expected_part_count(stored, STORED_TARGET - stream_charge, total);
-        assert!(
-            expected_parts >= 3,
-            "fixture must split several times, got {expected_parts}"
+            ratio > 2.0,
+            "fixture must have a real compression gap: payload proxy {proxy} vs object \
+             {object_len} is only {ratio:.2}x; the old proxy-close bug needs ratio > 2 to \
+             land parts below STORED_TARGET/2"
         );
 
         let tracker = MergeMemoryTracker::new();
         let config = CompactorConfig {
             max_l1_part_bytes: STORED_TARGET,
             merge_memory_tracker: Some(tracker.clone()),
-            // `l1_part_memory_target_bytes` is left at its shipped 256 MiB
-            // default: nothing this corpus does in heap comes close, so the
-            // memory split target can never be what fires.
             ..CompactorConfig::default()
         };
         let clock = FixedClock::new(sealed_now_ns());
@@ -3833,11 +4026,11 @@ mod tests {
             .await
             .expect("compact");
 
-        let (_rec, parts) = read_output(store.as_ref()).await;
-        assert_eq!(
-            parts.len() as u64,
-            expected_parts,
-            "part count is the stored arithmetic"
+        let (rec, parts) = read_output(store.as_ref()).await;
+        assert!(
+            parts.len() >= 4,
+            "fixture must split several times, got {}",
+            parts.len()
         );
         assert_eq!(
             tracker.memory_target_flushes(),
@@ -3845,9 +4038,53 @@ mod tests {
             "no part may close on the memory split target for this corpus"
         );
         assert_eq!(
-            tracker.stored_target_flushes(),
-            expected_parts - 1,
+            tracker.stored_target_flushes() as usize,
+            parts.len() - 1,
             "every closed part (all but the trailing one) closed on the stored target"
+        );
+
+        // The geometry band: every non-final part reached the target, and none
+        // ran more than one probe interval past it. The lower bound is the
+        // target itself, which the old proxy-close (object ~ STORED_TARGET /
+        // ratio) could not clear.
+        let last = parts.len() - 1;
+        for (i, p) in rec.parts.iter().enumerate() {
+            if i == last {
+                assert!(
+                    p.object_size > 0 && p.object_size <= STORED_TARGET + PROBE_MIN_STEP_BYTES,
+                    "trailing part of {} bytes out of band",
+                    p.object_size
+                );
+            } else {
+                assert!(
+                    p.object_size >= STORED_TARGET
+                        && p.object_size <= STORED_TARGET + PROBE_MIN_STEP_BYTES,
+                    "part {i} of {} bytes is outside [{STORED_TARGET}, {}] -- the stored \
+                     target must close on real object bytes, not {}x-smaller payload",
+                    p.object_size,
+                    STORED_TARGET + PROBE_MIN_STEP_BYTES,
+                    ratio as u64
+                );
+            }
+        }
+
+        // Conservation and decode-equality (issue #872 deliverable 5): moving
+        // part boundaries changes content hashes legitimately but never adds,
+        // drops, or reorders a record. The split run's decoded record sequence
+        // must equal a single-part run of the same inputs.
+        let mut split_rows: Vec<LogRecord> = Vec::new();
+        for p in &parts {
+            split_rows.extend(decode_all(p));
+        }
+        assert_eq!(
+            split_rows.len() as u64,
+            total,
+            "every record survives the split exactly once"
+        );
+        let baseline = ratio_fixture_single_part(PER_INPUT, INPUTS).await;
+        assert_eq!(
+            split_rows, baseline,
+            "the decoded record sequence must be identical whatever the split"
         );
     }
 
@@ -3912,28 +4149,29 @@ mod tests {
         }
     }
 
-    /// A part's STREAM_DIR is charged against the stored-size target once per
-    /// distinct stream, so a bucket of many streams with large resource blobs
-    /// splits on those blobs rather than running past the target on them.
+    /// A part's STREAM_DIR bytes must count toward the payload proxy that
+    /// schedules the stored-target probe, so a bucket of many streams with large
+    /// resource blobs splits on those blobs rather than making one giant object.
     ///
     /// `estimate_stored_record` excludes `stream_attrs`, correctly: the blob is
-    /// stored once per stream, not once per record. Nothing charged it per
-    /// stream either, so STREAM_DIR was invisible to the target: this fixture's
-    /// records are a few bytes each, so its estimate stayed near 4 KiB while its
-    /// single object held ~96 fat blobs.
+    /// stored once per stream, not once per record. If nothing charged it per
+    /// stream either, the proxy would stay near the tiny sum of this fixture's
+    /// few-byte records and never reach the target, so the exact-encode probe
+    /// would never be scheduled and the merge would run every stream's blob into
+    /// one object. [`estimate_stored_stream`] charging each distinct stream once
+    /// keeps the proxy tracking the object it schedules a probe for.
     ///
-    /// Both assertions are magnitudes proportional to the fixture, not floors:
-    /// the part count is the stream-charge arithmetic over `STREAMS` streams and
-    /// a `STORED_TARGET`-byte target, and each part's real object size stays
-    /// within twice the target.
+    /// The fat blobs are incompressible (pseudo-random), so the object cannot
+    /// compress far below its STREAM_DIR bytes: each non-final part therefore
+    /// closes AT the target (the probe measures real object bytes) and stays
+    /// under twice it.
     ///
-    /// Demonstrated red by under-charging, with the per-part charge model
-    /// below in place: adding `&& self.charged_streams.len() == 1` to the
-    /// charge in `PartBuilder::push` (one stream per part instead of every
-    /// distinct one) yields a single part of 269_641 bytes, 4.1x the
-    /// 65_536-byte target, failing the size assertion and then the count
-    /// assertion with `1 != 7`. A flat floor low enough to be safe would have
-    /// passed at both.
+    /// Demonstrated red by under-charging: gate the STREAM_DIR charge in
+    /// `PartBuilder::push` to the first stream only (`&& self.charged_streams
+    /// .len() == 1`). The proxy then stays a few KiB over the whole bucket, never
+    /// reaches the 64 KiB target, no probe is ever scheduled, and the merge emits
+    /// a single ~270 KiB object, failing the `object_size < 2 * STORED_TARGET`
+    /// assertion.
     #[tokio::test]
     async fn many_streams_charge_stream_dir_against_the_stored_target() {
         const STREAMS: u32 = 96;
@@ -3956,53 +4194,11 @@ mod tests {
             .await;
         }
 
-        // The split rule, walked: a stream's first record in a part pays the
-        // STREAM_DIR entry plus its own payload, later records in the SAME part
-        // pay their payload only, and the part closes as soon as the running
-        // total reaches the target. Every stream here has the same blob length
-        // and the same record shape, so the walk does not depend on which
-        // stream id sorts first.
-        //
-        // The charge is per part, not per merge: `PartBuilder::push` charges a
-        // stream once into the builder it is pushed into, and `PartSink::flush`
-        // starts the next record on a fresh builder with an empty
-        // `charged_streams`. So the walk clears its own charged set at every
-        // split. A stream whose records straddle a boundary is charged in both
-        // parts, because both objects carry its STREAM_DIR entry. Modelling one
-        // charge per stream over the whole walk undercounts the accumulator and
-        // can predict fewer parts than the merge produces. At this fixture's
-        // blob and record sizes every split lands on a stream's first record,
-        // so both models happen to reach the same seven parts; the reset is
-        // what keeps the prediction exact when either size moves.
         let charge = estimate_stored_stream(&fat_stream_record(0, 0).stream_attrs);
         let per_record = estimate_stored_record(&fat_stream_record(0, 0));
         assert!(
             charge > per_record * 100,
             "fixture must be STREAM_DIR-dominated: charge {charge} vs record {per_record}"
-        );
-        let mut expected_parts = 0u64;
-        let mut acc = 0u64;
-        let mut charged: BTreeSet<u32> = BTreeSet::new();
-        for s in 0..STREAMS {
-            for _ in 0..INPUTS {
-                acc += if charged.insert(s) {
-                    charge + per_record
-                } else {
-                    per_record
-                };
-                if acc >= STORED_TARGET {
-                    expected_parts += 1;
-                    acc = 0;
-                    charged.clear();
-                }
-            }
-        }
-        if acc > 0 {
-            expected_parts += 1;
-        }
-        assert!(
-            expected_parts >= 5,
-            "fixture must split several times, got {expected_parts}"
         );
 
         let tracker = MergeMemoryTracker::new();
@@ -4021,26 +4217,39 @@ mod tests {
             .expect("compact");
 
         let (rec, parts) = read_output(store.as_ref()).await;
+        assert!(
+            parts.len() >= 5,
+            "fixture must split several times, got {}",
+            parts.len()
+        );
         assert_eq!(
             tracker.memory_target_flushes(),
             0,
             "no part may close on the memory split target for this corpus"
         );
-        // The estimate is only worth having if it tracks the object it names.
-        // Each part's real stored size stays within twice the target; uncharged,
-        // one part carried every stream's blob.
-        for p in &rec.parts {
+        assert_eq!(
+            tracker.stored_target_flushes() as usize,
+            parts.len() - 1,
+            "every closed part (all but the trailing one) closed on the stored target"
+        );
+        // The probe measures the object it names: with the STREAM_DIR charge
+        // scheduling it, each non-final part reaches the target and none runs
+        // past twice it; uncharged, one part would carry every stream's blob.
+        let last = parts.len() - 1;
+        for (i, p) in rec.parts.iter().enumerate() {
             assert!(
                 p.object_size < 2 * STORED_TARGET,
-                "part of {} bytes exceeded twice the {STORED_TARGET}-byte stored target",
+                "part {i} of {} bytes exceeded twice the {STORED_TARGET}-byte stored target",
                 p.object_size
             );
+            if i != last {
+                assert!(
+                    p.object_size >= STORED_TARGET,
+                    "non-final part {i} of {} bytes did not reach the {STORED_TARGET}-byte target",
+                    p.object_size
+                );
+            }
         }
-        assert_eq!(
-            parts.len() as u64,
-            expected_parts,
-            "part count is the STREAM_DIR-charge arithmetic"
-        );
 
         // Records are conserved across the split.
         let mut l1: Vec<LogRecord> = Vec::new();
@@ -4203,8 +4412,13 @@ mod tests {
             // Hold every commit-record GET (".cmt" names commit records and
             // nothing else) so the in-flight count is observable.
             let gate = store.hold(Op::Get, Some(".cmt".to_string()), Occurrence::Always);
+            // Split on the memory target: wide records are far larger in heap
+            // than on the object, so this reliably produces several parts, and
+            // (unlike the stored target) needs no encoded-size probe. The point
+            // under test is byte-identity across concurrency, not which target
+            // fires.
             let config = CompactorConfig {
-                max_l1_part_bytes: 64 * 1024,
+                l1_part_memory_target_bytes: 64 * 1024,
                 input_read_concurrency: concurrency,
                 ..CompactorConfig::default()
             };
@@ -4625,8 +4839,11 @@ mod tests {
         }
         let config = CompactorConfig {
             // Small enough that the bucket splits into several parts, so the
-            // pin covers part boundaries and `part_index`, not one object.
-            max_l1_part_bytes: 4096,
+            // pin covers part boundaries and `part_index`, not one object. Split
+            // on the memory target: it is unaffected by the issue #872 stored-
+            // target change, so this pin stays reproducible independently of
+            // object-geometry knobs.
+            l1_part_memory_target_bytes: 32 * 1024,
             ..CompactorConfig::default()
         };
         let clock = FixedClock::new(sealed_now_ns());
@@ -4653,35 +4870,46 @@ mod tests {
         (hashes, rows)
     }
 
-    /// ADR-0979 verification item 2: the bounded merge's output parts are
-    /// byte-identical to what the pre-D1 cursor produced.
+    /// A pinned byte-stability guard: this exact fixture and config must keep
+    /// producing the same part `content_hash` vector, so an accidental change to
+    /// the merge, the writer pipeline, or the split logic shows up as a diff
+    /// here.
     ///
-    /// The expected hashes are PINNED, not recomputed. They were produced by
-    /// this exact fixture on commit 76c90a3 -- the last commit before the
-    /// columnar cursor swap, when `StreamCursor` still held one block's
-    /// eagerly decoded `Vec<LogRecord>` -- so this compares the new path
-    /// against the old path's real bytes rather than against itself. The old
-    /// path is deleted by the swap, which is why the constants exist at all.
-    ///
-    /// The fixture is built so the comparison cannot pass by accident:
-    /// [`differential_hash_inputs`] pins the two-way and three-way equal-ts
+    /// The pin covers part boundaries and `part_index`, not one object:
+    /// [`differential_hash_inputs`] fixes the two-way and three-way equal-ts
     /// tie-break order in the record bodies, [`differential_l0_cfg`] makes each
     /// stream span several blocks and several row groups per input with
-    /// stream-boundary blocks, and `max_l1_part_bytes` splits the bucket into
-    /// several parts.
+    /// stream-boundary blocks, and the run splits into several parts on the
+    /// memory split target.
+    ///
+    /// The vector was REGENERATED for issue #872: the original pin was taken
+    /// under `max_l1_part_bytes: 4096` on commit 76c90a3 (the last commit before
+    /// the ADR-0979 D1 columnar-cursor swap), but #872 changed the stored-size
+    /// target to close a part on its ACTUAL encoded bytes rather than the payload
+    /// proxy, which moves every stored-target boundary the original pin used, so
+    /// those hashes are unreproducible. This run instead splits on the #711
+    /// memory split target, which neither D1 nor #872 touches; the pre-D1
+    /// record-level equivalence the original pin guarded now rests on
+    /// [`streaming_merge_output_is_byte_identical_to_stable_sort_order`] and
+    /// [`admission_on_and_off_produce_identical_part_hashes`], and content
+    /// preservation across the moved #872 boundaries on
+    /// [`stored_target_closes_parts_on_actual_encoded_object_bytes`]'s
+    /// decode-equality check.
     #[tokio::test]
     async fn differential_part_hashes_match_the_pre_columnar_cursor() {
         /// Total records seeded across the three inputs: 4 streams x
         /// (30 + 1) + 4 x (30 + 1) + 4 x (40 + 1).
         const EXPECTED_ROWS: usize = 4 * 31 + 4 * 31 + 4 * 41;
-        /// Part `content_hash` values, in `part_index` order, as produced on
-        /// commit 76c90a3.
+        /// Part `content_hash` values, in `part_index` order, as produced by the
+        /// current merge under a 32 KiB memory split target (see the note above
+        /// on why they were regenerated for issue #872).
         const EXPECTED_PART_HASHES: &[&str] = &[
-            "ff8136ed3914f1e7735129ed727750abd700f035fac8546905ca24d256a9b012",
-            "6fae530b2b49e81d44e371a67237522730fa54a0ffc70955f79de924eaa9babe",
-            "e13ab6be5d9c740c3dead134402c47ac5165f00b8715b1c9adf5b3705adc51d7",
-            "5e8d796720a814bbc5cd8c760ce232f7e6405eed6d73c8cac3f0e24c7c24dfe9",
-            "088f8f8045e6b693ea944d8d9a0c4db46ab897625e3783653561c428a9485908",
+            "853fb59210a344a2e656f6e1a29aa2feeeab0ec486373f3d37fd8975f74cb7ac",
+            "dca4d7e8b9729de6c64f132fa1eb52028ab85de629d17e1f8b85d7b916c883a4",
+            "6669e7d418d5e42b1bcd46e664c9b00503e3cbdbf6ed35e9ddd49d493e386459",
+            "29d933b58b29a40ee80a1587ecf91021bdc747376131f86fcef8dfdca9b1679a",
+            "f6c414a7fc62039e3000817c8ab65e36060bd20cee30fab61d1cb2eb4f166dd1",
+            "5641cc650be9829ca9bfb88d203ca98872ddf4fd1149815d25ed8bb4ddd44e46",
         ];
 
         let (hashes, rows) = differential_hash_run().await;
