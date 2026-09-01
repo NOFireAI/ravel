@@ -2368,6 +2368,12 @@ impl Cli {
         // it so a malformed future extension fails startup, not first ingest.
         self.parse_ingest_buffer_budget()?;
 
+        // Read the cost profile here, not only at ServerConfig build: by the
+        // time query_budgets runs, startup has already written qualification,
+        // tenancy, and key-epoch state. A mistyped path must be a pure
+        // pre-flight failure, like --limits-file and the credential files.
+        self.resolve_store_cost_profile()?;
+
         if self.max_inflight_flushes == 0 {
             anyhow::bail!(
                 "--max-inflight-flushes '0' would deadlock every flush: a shard could never \
@@ -4433,6 +4439,29 @@ mod tests {
     /// `resolve_store_cost_profile` with `.unwrap_or_else(|_|
     /// StoreCostProfile::reference())` and the three `expect_err` calls below
     /// panic instead.
+    /// A bad --store-cost-profile fails Cli::validate itself (PR #1017 review):
+    /// the refusal must precede the qualification gate, tenancy pin, and
+    /// key-epoch writes that run before ServerConfig is built.
+    ///
+    /// Non-vacuity: remove the resolve_store_cost_profile call from
+    /// Cli::validate and this assertion fails (validate returns Ok).
+    #[test]
+    fn bad_store_cost_profile_fails_cli_validate_preflight() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nope.toml");
+        std::fs::write(&path, "not toml at all [").expect("write");
+        let mut cli = Cli::parse_from(["ravel-server"]);
+        cli.store_cost_profile = Some(path);
+        let err = cli
+            .validate()
+            .expect_err("a bad profile must fail pre-flight");
+        assert!(
+            err.to_string().contains("store-cost-profile")
+                || err.to_string().contains("cost profile"),
+            "the pre-flight error names the flag: {err}"
+        );
+    }
+
     #[test]
     fn store_cost_profile_reaches_the_derivation_and_refuses_a_bad_file() {
         // An egress-billed profile: 400 * 2^30 / (90_000_000 + 10_000_000)
