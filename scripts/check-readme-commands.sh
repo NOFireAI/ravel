@@ -209,7 +209,12 @@ SHIM
 resolve_block_status() {
   local status_file=$1
   local -a codes=()
-  mapfile -t codes <"$status_file"
+  # bash 3.2 (macOS system bash) has no `mapfile`; read line by line instead. The
+  # `|| [[ -n $line ]]` keeps the final line when the file has no trailing newline.
+  local line
+  while IFS= read -r line || [[ -n $line ]]; do
+    codes+=("$line")
+  done <"$status_file"
   if (( ${#codes[@]} == 0 )); then
     printf 'none'
     return 0
@@ -265,9 +270,15 @@ run_one_command() {
       captured=$(resolve_block_status "$status_file")
       # Evaluate the last request's body, not the concatenated block stdout.
       local -a body_paths=()
-      mapfile -t body_paths <"$body_index"
+      # bash 3.2 has no `mapfile`; read line by line, keeping a final unterminated
+      # line. bash 3.2 also has no negative array subscript, so index the last
+      # element explicitly rather than with [-1].
+      local body_line
+      while IFS= read -r body_line || [[ -n $body_line ]]; do
+        body_paths+=("$body_line")
+      done <"$body_index"
       if (( ${#body_paths[@]} > 0 )); then
-        cp "${body_paths[-1]}" "$body_file"
+        cp "${body_paths[$(( ${#body_paths[@]} - 1 ))]}" "$body_file"
       fi
     fi
     rm -rf "$cap_dir"
