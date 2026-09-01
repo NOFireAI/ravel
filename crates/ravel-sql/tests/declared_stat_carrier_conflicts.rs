@@ -1,7 +1,14 @@
 //! The ADR-0873 decision 4 conflict metric: when the `SegmentRef` stamp and
 //! the ADR-0850 `.cstat` entry disagree about one segment and one column, the
-//! column degrades to a scan AND the disagreement is counted, so an operator
-//! sees a ticket-shaped signal instead of a mysteriously slow query.
+//! column degrades to a scan AND the disagreement is counted and logged, so an
+//! operator sees a ticket-shaped signal instead of a mysteriously slow query.
+//!
+//! The counter is observations, not distinct defective segments: one increment
+//! per (column, conflicting segment, `partition_statistics` call), with no
+//! dedup across calls. Each delta asserted here is therefore scoped to exactly
+//! one `partition_statistics` call. The log line that carries the detail a
+//! report is filed from is asserted in tests/declared_stat_conflict_log.rs,
+//! which needs a process to itself.
 //!
 //! Own integration binary, all tests synchronous, all tests holding one lock:
 //! `ravel_sql::declared_stat_carrier_conflicts` is a process-wide monotonic
@@ -183,7 +190,7 @@ fn resolve(
 /// A disagreement on `min` leaves the column `Absent` and moves the tally by
 /// exactly one.
 ///
-/// Prove-the-test: delete the `record_carrier_conflict()` call in
+/// Prove-the-test: delete the `record_carrier_conflict(...)` call in
 /// `declared_min_max_all` (crates/ravel-sql/src/logs_scan.rs) and the delta
 /// reads 0; replace the `agrees_with` check with `true` and the precision
 /// assertion fails as well.

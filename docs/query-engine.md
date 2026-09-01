@@ -223,15 +223,29 @@ Two carriers feed it, unioned per segment and per column (ADR-0873 decision
 4):
 
 - the `SegmentRef` stamp (`SegmentRef::declared_column_stats`, ADR-0873), an
-  exact whole-object min/max and NULL count per eligible declared column,
-  written by the flush and compaction writers onto the commit record and the
-  compaction part and carried through the fold onto `SnapshotEntry`. Because
-  it rides the records resolution already reads, it covers the live tail above
-  the fold watermark and token-resolved segments, which no fold-built sibling
-  object can;
+  exact whole-object min/max and NULL count per eligible declared column, read
+  off the commit record (field 20), the compaction part (field 12), or the
+  snapshot entry (field 15) that resolution already reads. Because it rides
+  those records, it covers the live tail above the fold watermark and
+  token-resolved segments, which no fold-built sibling object can;
 - the ADR-0850/0942 `.cstat` entry, joined by segment identity, which is the
   carrier for pre-stamp sealed history and the only carrier for `Str`/`Bytes`
   extrema.
+
+**The write side of the stamp carrier does not exist yet.** Nothing in the
+flush or compaction path calls the stamp writers in
+`ravel_commit::declared_stats` (`stamp_commit_record`,
+`stamp_compaction_part`); their only callers are tests.
+Issue #1022 (ADR-0873 wave 5) is where the writers start emitting stamps. Until
+it lands, every record a real tenant has ever written carries an empty list, so
+the stamp half of the union is empty for every segment of every tenant, every
+answer above comes from `.cstat` alone, and the stamp path is exercised only by
+tests that stamp a record directly and by the fold's carriage of whatever a
+record happens to carry. The read side landed first on purpose (a reader that
+refuses a defective stamp has to exist before any writer can emit one), but the
+consequence is worth stating plainly: on today's deployments this shortcut is
+inert on the stamp side, and no coverage change is observable from it until
+#1022 ships.
 
 Stamp eligibility is an allowlist, `I64` and `BOOL`
 (`ravel_types::declared_stats`). `Str`/`Bytes` are excluded because a stamped
@@ -256,16 +270,56 @@ of the `stats_are_exact` gate above:
   describe the same rows of one immutable object exactly, so a disagreement
   means one of them is wrong and no answer is safe.
 
+A `null_count` is reported `Exact` only when every covering carrier proved it,
+which means the stamp: a `.cstat` entry's row accounting is not reconciled
+against the joined `SegmentRef::sample_count` on this path, and an unreconciled
+figure would answer `COUNT(col)` from something nothing checked. The extrema are
+exact either way.
+
+One statistics shape is exact and still does not shortcut the query. A declared
+column that reads NULL in every touched row has an exactly-NULL extremum, and
+this scan reports it as `Precision::Exact(<typed null>)`, but DataFusion's
+`FromColumnStatistics` implementations for `Min`/`Max` refuse an exact extremum
+that is null, so `MIN`/`MAX` over such a column keeps its `LogsScanExec` and
+scans to the same NULL. `COUNT(<declared column>)` on that same column is still
+a plan-time literal (`num_rows - null_count`, exactly 0).
+
+### Defect metrics for the two carriers
+
 Two process-wide tallies make the defect classes visible, since a coverage
-regression otherwise reads as a slow query:
-`ravel_commit::declared_stats::dropped_stamp_entries` counts every stamp entry
-a reader dropped (one per entry, on every read route), and
-`ravel_sql::declared_stat_carrier_conflicts` counts every carrier
-disagreement. A `null_count` is reported `Exact` only when every covering
-carrier proved it, which today means the stamp: a `.cstat` entry's row
-accounting is not reconciled against the joined `SegmentRef::sample_count` on
-this path, and an unreconciled figure would answer `COUNT(col)` from something
-nothing checked. The extrema are exact either way.
+regression otherwise reads as a slow query. Both count OBSERVATIONS, which is
+what their names and these paragraphs say, because the distinction decides how
+the numbers may be read.
+
+`ravel_commit::declared_stats::declared_stat_drops_observed(carrier)` counts
+statistics entries a reader dropped, one per dropped entry, labelled by the
+carrier that was read: `commit-record`, `compaction-part`, `snapshot-entry`, and
+`cstat`. The first three are the stamp reads in `ravel-commit`; the `cstat`
+label is reported by `ravel-sql`'s `.cstat` reader, which counts exactly two
+refusals as defects (a duplicated column name, and extrema presence that
+contradicts the row accounting) and treats a missing object, segment, or column
+entry as the ordinary uncovered state. Each READ of a defective carrier
+increments the label again: there is no per-entry deduplication, because it
+would need unbounded state keyed by (object, column) on a path walked once per
+segment per query. So the magnitude scales with query rate and is not a count of
+distinct defects. `ravel_catalog::read_snapshot_entry` still reads its entries
+through `read_commit_record`, so snapshot-entry drops are observed under the
+`commit-record` label until that call site moves to
+`read_snapshot_entry_twin`.
+
+`ravel_sql::declared_stat_carrier_conflicts` counts carrier disagreements, one
+per (declared column, conflicting segment, `partition_statistics` call).
+Within one call a column counts at most once, since the first conflicting
+segment declines it; across calls nothing is deduplicated, and DataFusion may
+call `partition_statistics` several times while building one plan, so repeated
+statements over one defective segment keep incrementing it. Each observation
+also emits a `warn` log line carrying the segment's `content_hash` and both
+claimed `(min, max, null_count)` triples, which is the artefact a report is
+filed from; the counter is only its rate.
+
+A per-query coverage figure (segments stamped over segments touched, per
+carrier, under phase accounting) is owed to the 996-9 measurement wave and is
+deliberately not built here.
 
 ## Predicate-free full-window logs scan: request count
 

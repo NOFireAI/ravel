@@ -5127,6 +5127,7 @@ dependencies = [
  "criterion",
  "datafusion",
  "futures",
+ "hex",
  "proptest",
  "prost",
  "rand 0.10.2",
