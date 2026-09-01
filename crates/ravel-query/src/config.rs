@@ -201,17 +201,14 @@ pub struct ResolvedLogsFetch {
     /// near-zero), which saturates every derived crossover to whole-object.
     pub request_cost_bytes: u64,
     /// The routing threshold ([`EngineConfig::logs_block_range_threshold`]).
-    /// request-minimal saturates it to `u64::MAX` so no object is ever routed to
-    /// the ranged path, overriding an explicit `--logs-block-range-threshold`.
+    /// Saturated to `u64::MAX` whenever the resolved rate saturates, so no
+    /// object is ever routed to the ranged path, overriding an explicit
+    /// `--logs-block-range-threshold`.
     pub block_range_threshold: u64,
-    /// True under request-minimal: the plan phase suppresses its per-segment
-    /// footer probe, because the scan read is whole-object anyway and a probe
-    /// that cannot reduce requests is pure spend.
-    pub suppress_plan_footer_probe: bool,
-    /// Set to the operator's explicit `--logs-block-range-threshold` when
-    /// request-minimal overrode it, so the startup path can log the overridden
-    /// flag (ADR-0996 decision 2). `None` when no explicit threshold was set or
-    /// the policy left it in force.
+    /// Set to the operator's explicit `--logs-block-range-threshold` when the
+    /// resolution overrode it, so the startup path can log the overridden flag
+    /// (ADR-0996 decision 2). `None` when no explicit threshold was set or the
+    /// resolution left it in force.
     pub overridden_block_range_threshold: Option<u64>,
     /// Set to the active profile's name when a cost-based derivation saturated
     /// the rate at `u64::MAX`, so the startup path can log the saturation naming
@@ -232,10 +229,20 @@ pub struct ResolvedLogsFetch {
 /// - An explicit `--logs-request-cost-bytes` (`explicit_request_cost_bytes`)
 ///   WINS over policy for the rate: policy is the intent layer, the byte flag
 ///   the expert escape hatch.
-/// - `RequestMinimal` still overrides BOTH routing thresholds, including an
-///   explicitly set `--logs-block-range-threshold`: a policy that saturated only
-///   the derived rate would let a low explicit threshold send projected objects
-///   down the ranged path through `ranged_projection_pays`.
+/// - A SATURATED resolved rate overrides BOTH routing thresholds, including an
+///   explicitly set `--logs-block-range-threshold`. A rate of `u64::MAX` means
+///   "one covering GET per object, always", and the fetch layer cannot express
+///   that through the rate alone: `LogSegmentFetcher::with_block_range_threshold`
+///   pins the inner crossover to the outer flag's value, bypassing the
+///   `5 x request_cost` derivation entirely, so a threshold left at 512 KiB
+///   would keep sending narrow projections of larger objects down the ranged
+///   path through `ranged_projection_pays`. Cost-based at a free-byte profile
+///   resolves to exactly that rate, so it must route exactly the way
+///   request-minimal does; the override is therefore keyed on the rate, not on
+///   the policy that produced it.
+/// - `RequestMinimal` overrides the routing threshold even when an explicit
+///   `--logs-request-cost-bytes` replaced its saturated rate: the byte flag is
+///   an escape hatch for the rate, not for the routing intent.
 ///
 /// The cost-based derivation multiplies before it divides, in `u128`:
 /// `get_class_nanodollars * BYTES_PER_GIB / (transfer + retrieval)`,
@@ -249,6 +256,7 @@ pub fn resolve_logs_fetch(
     policy: LogsFetchPolicy,
     profile: &StoreCostProfile,
     explicit_request_cost_bytes: Option<u64>,
+    configured_request_cost_bytes: u64,
     configured_block_range_threshold: u64,
     explicit_block_range_threshold: Option<u64>,
 ) -> ResolvedLogsFetch {
@@ -259,16 +267,20 @@ pub fn resolve_logs_fetch(
         Some(explicit) => (explicit, None),
         None => match policy {
             LogsFetchPolicy::RequestMinimal => (u64::MAX, None),
-            LogsFetchPolicy::ByteMinimal => (configured_block_range_threshold_rate(profile), None),
+            // byte-minimal is today's behaviour byte for byte, which includes a
+            // configured (non-default) `--logs-request-cost-bytes`: ADR-0904's
+            // knob keeps its meaning under this policy rather than being
+            // silently replaced by the compiled default.
+            LogsFetchPolicy::ByteMinimal => (configured_request_cost_bytes, None),
             LogsFetchPolicy::CostBased => resolve_cost_based_rate(profile),
         },
     };
 
-    // Routing: request-minimal saturates the threshold so no object routes
-    // ranged, overriding an explicit flag (which is then logged). Every other
-    // policy keeps the configured threshold.
-    let request_minimal = matches!(policy, LogsFetchPolicy::RequestMinimal);
-    let (block_range_threshold, overridden_block_range_threshold) = if request_minimal {
+    // Routing: a saturated rate saturates the threshold too, whichever policy
+    // produced it, overriding an explicit flag (which is then logged).
+    let saturates_routing =
+        request_cost_bytes == u64::MAX || matches!(policy, LogsFetchPolicy::RequestMinimal);
+    let (block_range_threshold, overridden_block_range_threshold) = if saturates_routing {
         (u64::MAX, explicit_block_range_threshold)
     } else {
         (configured_block_range_threshold, None)
@@ -277,18 +289,9 @@ pub fn resolve_logs_fetch(
     ResolvedLogsFetch {
         request_cost_bytes,
         block_range_threshold,
-        suppress_plan_footer_probe: request_minimal,
         overridden_block_range_threshold,
         saturated_profile,
     }
-}
-
-/// byte-minimal keeps today's configured request cost. It has no profile
-/// dependency; the profile argument is taken only so the signature matches the
-/// other arms and a future byte-price-aware byte-minimal has a seam. Named for
-/// clarity at the call site above.
-fn configured_block_range_threshold_rate(_profile: &StoreCostProfile) -> u64 {
-    crate::DEFAULT_LOG_REQUEST_COST_BYTES
 }
 
 /// The cost-based byte rate and, when it saturated at `u64::MAX`, the profile
@@ -477,19 +480,18 @@ mod tests {
         let reference = StoreCostProfile::reference();
 
         // request-minimal saturates the rate AND the routing threshold,
-        // regardless of profile or an explicit block-range threshold, and
-        // suppresses the plan footer probe. An explicitly set threshold is
-        // reported for the startup log.
+        // regardless of profile or an explicit block-range threshold. An
+        // explicitly set threshold is reported for the startup log.
         let rm = resolve_logs_fetch(
             LogsFetchPolicy::RequestMinimal,
             &reference,
             None,
+            crate::DEFAULT_LOG_REQUEST_COST_BYTES,
             crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
             Some(4096),
         );
         assert_eq!(rm.request_cost_bytes, u64::MAX, "request-minimal saturates");
         assert_eq!(rm.block_range_threshold, u64::MAX);
-        assert!(rm.suppress_plan_footer_probe);
         assert_eq!(
             rm.overridden_block_range_threshold,
             Some(4096),
@@ -498,11 +500,12 @@ mod tests {
         assert_eq!(rm.saturated_profile, None);
 
         // byte-minimal keeps today's configured request cost byte for byte, and
-        // leaves the routing threshold and plan probe alone.
+        // leaves the routing threshold alone.
         let bm = resolve_logs_fetch(
             LogsFetchPolicy::ByteMinimal,
             &reference,
             None,
+            crate::DEFAULT_LOG_REQUEST_COST_BYTES,
             crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
             Some(4096),
         );
@@ -511,7 +514,6 @@ mod tests {
             bm.block_range_threshold,
             crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD
         );
-        assert!(!bm.suppress_plan_footer_probe);
         assert_eq!(bm.overridden_block_range_threshold, None);
 
         // cost-based at the reference (intra-region, free bytes) profile
@@ -521,6 +523,7 @@ mod tests {
             LogsFetchPolicy::CostBased,
             &reference,
             None,
+            crate::DEFAULT_LOG_REQUEST_COST_BYTES,
             crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
             None,
         );
@@ -529,14 +532,14 @@ mod tests {
             cb_ref.saturated_profile.as_deref(),
             Some("s3-intra-region-2026")
         );
-        // ... but cost-based is NOT request-minimal for routing: it does not
-        // saturate the routing threshold or suppress the probe. Only the rate
-        // saturates, which the downstream crossover floors handle.
-        assert_eq!(
-            cb_ref.block_range_threshold,
-            crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD
-        );
-        assert!(!cb_ref.suppress_plan_footer_probe);
+        // ... and the routing threshold saturates WITH the rate. The fetch layer
+        // pins its inner crossover to whatever threshold it is handed
+        // (`with_block_range_threshold` sets `whole_object_threshold`, which
+        // `effective_whole_object_threshold` then returns verbatim, bypassing the
+        // `5 x request_cost` derivation and its floors), so leaving this at
+        // 512 KiB would route a narrow projection of any larger object ranged and
+        // deliver none of ADR-0996's outcome at the default policy.
+        assert_eq!(cb_ref.block_range_threshold, u64::MAX);
 
         // cost-based at egress prices resolves to a small byte cost:
         //   400 * 2^30 / (90_000_000 + 10_000_000)
@@ -554,6 +557,7 @@ mod tests {
             LogsFetchPolicy::CostBased,
             &egress,
             None,
+            crate::DEFAULT_LOG_REQUEST_COST_BYTES,
             crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
             None,
         );
@@ -562,6 +566,12 @@ mod tests {
             "profile-derived rate is get*2^30/(transfer+retrieval), floored"
         );
         assert_eq!(cb_egress.saturated_profile, None);
+        // A finite rate leaves the routing threshold in force: only saturation
+        // overrides it.
+        assert_eq!(
+            cb_egress.block_range_threshold,
+            crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD
+        );
         // The raw rate is well below both floors, so the downstream fetch layer
         // clamps it: the gap floors to 64 KiB and the crossover to 512 KiB.
         assert!(cb_egress.request_cost_bytes < crate::DEFAULT_LOG_COALESCE_GAP);
@@ -583,11 +593,107 @@ mod tests {
             LogsFetchPolicy::CostBased,
             &retrieval_only,
             None,
+            crate::DEFAULT_LOG_REQUEST_COST_BYTES,
             crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
             None,
         );
         assert_eq!(cb_retrieval.request_cost_bytes, 42949);
         assert_eq!(cb_retrieval.saturated_profile, None);
+        assert_eq!(
+            cb_retrieval.block_range_threshold,
+            crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD
+        );
+    }
+
+    /// byte-minimal is "today's behaviour, byte for byte", which includes a
+    /// configured non-default `--logs-request-cost-bytes` (ADR-0904's knob). The
+    /// resolution must thread the configured value through rather than
+    /// substituting the compiled default, or selecting byte-minimal would
+    /// silently discard the operator's calibration.
+    ///
+    /// Prove-the-test: resolve the byte-minimal arm from
+    /// `crate::DEFAULT_LOG_REQUEST_COST_BYTES` instead of
+    /// `configured_request_cost_bytes` and the first assertion reads 1_887_437
+    /// against the expected 700_000.
+    #[test]
+    fn byte_minimal_keeps_a_configured_request_cost() {
+        let reference = StoreCostProfile::reference();
+        let configured = 700_000u64;
+        assert_ne!(
+            configured,
+            crate::DEFAULT_LOG_REQUEST_COST_BYTES,
+            "the fixture must differ from the default or it proves nothing"
+        );
+        let bm = resolve_logs_fetch(
+            LogsFetchPolicy::ByteMinimal,
+            &reference,
+            None,
+            configured,
+            crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+            None,
+        );
+        assert_eq!(
+            bm.request_cost_bytes, configured,
+            "byte-minimal keeps the configured request cost, not the compiled default"
+        );
+        assert_eq!(
+            bm.block_range_threshold,
+            crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+            "a finite rate leaves the routing threshold in force"
+        );
+
+        // The profile is irrelevant to byte-minimal: the same configured value
+        // resolves at an egress-billed profile too.
+        let egress = StoreCostProfile {
+            name: "egress-billed".to_string(),
+            put_class_nanodollars: 5_000,
+            get_class_nanodollars: 400,
+            delete_class_nanodollars: 0,
+            transfer_nanodollars_per_gib: 90_000_000,
+            retrieval_nanodollars_per_gib: 10_000_000,
+        };
+        let bm_egress = resolve_logs_fetch(
+            LogsFetchPolicy::ByteMinimal,
+            &egress,
+            None,
+            configured,
+            crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+            None,
+        );
+        assert_eq!(bm_egress.request_cost_bytes, configured);
+    }
+
+    /// A saturated rate saturates the routing threshold whichever policy
+    /// produced it, and an explicitly set `--logs-block-range-threshold` is
+    /// overridden and reported for the startup log -- exactly as the
+    /// request-minimal arm already does.
+    ///
+    /// Prove-the-test: key the override on `matches!(policy,
+    /// LogsFetchPolicy::RequestMinimal)` alone (the pre-fix condition) and both
+    /// assertions below fail: the threshold reads 512 KiB and the overridden
+    /// flag reads `None`.
+    #[test]
+    fn a_saturated_cost_based_rate_overrides_an_explicit_routing_threshold() {
+        let reference = StoreCostProfile::reference();
+        let r = resolve_logs_fetch(
+            LogsFetchPolicy::CostBased,
+            &reference,
+            None,
+            crate::DEFAULT_LOG_REQUEST_COST_BYTES,
+            4096,
+            Some(4096),
+        );
+        assert_eq!(r.request_cost_bytes, u64::MAX);
+        assert_eq!(
+            r.block_range_threshold,
+            u64::MAX,
+            "a saturated rate saturates the routing threshold too"
+        );
+        assert_eq!(
+            r.overridden_block_range_threshold,
+            Some(4096),
+            "the overridden flag is reported for the startup log"
+        );
     }
 
     /// The high-saturation boundary at a one-nanodollar-per-GiB byte price
@@ -608,6 +714,7 @@ mod tests {
             LogsFetchPolicy::CostBased,
             &below,
             None,
+            crate::DEFAULT_LOG_REQUEST_COST_BYTES,
             crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
             None,
         );
@@ -616,6 +723,11 @@ mod tests {
         assert_eq!(
             r.saturated_profile, None,
             "one below the boundary is finite"
+        );
+        assert_eq!(
+            r.block_range_threshold,
+            crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+            "a finite rate, however large, leaves the routing threshold in force"
         );
 
         let at = StoreCostProfile {
@@ -627,12 +739,18 @@ mod tests {
             LogsFetchPolicy::CostBased,
             &at,
             None,
+            crate::DEFAULT_LOG_REQUEST_COST_BYTES,
             crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
             None,
         );
         // 2^34 * 2^30 = 2^64 > u64::MAX: saturates, names the profile.
         assert_eq!(r.request_cost_bytes, u64::MAX);
         assert_eq!(r.saturated_profile.as_deref(), Some("one-nd-per-gib-at"));
+        assert_eq!(
+            r.block_range_threshold,
+            u64::MAX,
+            "the overflow saturation routes whole-object like the zero-price one"
+        );
     }
 
     #[test]
@@ -644,6 +762,7 @@ mod tests {
             LogsFetchPolicy::RequestMinimal,
             &profile,
             Some(123_456),
+            crate::DEFAULT_LOG_REQUEST_COST_BYTES,
             crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
             None,
         );
@@ -651,7 +770,24 @@ mod tests {
         // request-minimal still overrides the routing threshold: only the rate
         // is an escape hatch, not the routing intent.
         assert_eq!(r.block_range_threshold, u64::MAX);
-        assert!(r.suppress_plan_footer_probe);
+
+        // The same escape hatch under cost-based: an explicit finite rate
+        // replaces the profile's saturated one, so nothing saturates and the
+        // configured routing threshold stays in force.
+        let cb = resolve_logs_fetch(
+            LogsFetchPolicy::CostBased,
+            &profile,
+            Some(123_456),
+            crate::DEFAULT_LOG_REQUEST_COST_BYTES,
+            crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+            None,
+        );
+        assert_eq!(cb.request_cost_bytes, 123_456);
+        assert_eq!(
+            cb.block_range_threshold,
+            crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD
+        );
+        assert_eq!(cb.saturated_profile, None);
     }
 
     #[test]
