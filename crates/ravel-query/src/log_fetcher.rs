@@ -50,6 +50,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::config::EngineConfigError;
 use crate::erasure::ErasurePredicate;
 use crate::fetcher::ReadCache;
 use crate::phase_accounting::{PhaseAccounting, PhaseWireByteCounter, QueryPhase};
@@ -685,11 +686,11 @@ impl LogSegmentFetcher {
     /// ADR-0996 decision 2): one covering GET's maximum length. An object above
     /// the bound is read as `ceil(object_size / n)` sequential covering
     /// sub-range GETs on every read shape, whole-object funnel included. Zero is
-    /// refused earlier at config resolution ([`EngineConfig::validate`]).
-    #[must_use]
-    pub fn with_max_fetch_run_bytes(mut self, n: u64) -> Self {
-        self.block_range = self.block_range.with_max_fetch_run_bytes(n);
-        self
+    /// refused with the same typed error
+    /// [`EngineConfig::validate`](crate::EngineConfig::validate) returns.
+    pub fn with_max_fetch_run_bytes(mut self, n: u64) -> Result<Self, EngineConfigError> {
+        self.block_range = self.block_range.with_max_fetch_run_bytes(n)?;
+        Ok(self)
     }
 
     /// Replaces the block-range fetcher (ADR-0107) with a fully configured one,
@@ -1364,12 +1365,33 @@ impl LogSegmentFetcher {
         // multi-partition scan still records exactly one touch per object here,
         // over however many GETs the plan and its subset scans issue. An object
         // belongs to exactly one segment, so this is one touch per distinct
-        // object. A `None` result means the catalog summary proved the segment
-        // irrelevant with NO fetch, which is not a touch. The predicate-free
-        // full-window fast path skips this method entirely (#693 part 3); its
-        // per-segment touch is recorded at ravel-sql's `record_open_shape` site,
-        // left for task 996-6 (this task must not touch ravel-sql).
-        if matches!(result, Ok(Some(_))) {
+        // object. The predicate-free full-window fast path skips this method
+        // entirely (#693 part 3); its per-segment touch is recorded at
+        // ravel-sql's `record_open_shape` site, left for task 996-6 (this task
+        // must not touch ravel-sql).
+        //
+        // `data_objects_touched` counts objects whose BLOCK bytes the query
+        // fetched, and its contract
+        // (`ravel_types::accounting::QueryAccountingSnapshot::data_objects_touched`)
+        // excludes a probe outright: "if the query then decides to fetch no
+        // blocks from that object, the object was never touched". Two of the
+        // three outcomes here are not touches, and both would inflate the
+        // denominator of `range_amplification` in the flattering direction:
+        //
+        // - `Ok(None)`: the catalog summary proved the segment irrelevant with
+        //   no fetch at all.
+        // - `Ok(Some((0, .., Some(footer))))`: the skip-decidable branch (#761)
+        //   read only the probe, SKIP_IDX and FIELD_DIR and pruned every block
+        //   away. `owned_work` assigns a zero-survivor segment to no partition,
+        //   so no scan GET ever follows and not one block byte moves.
+        //
+        // A `None` footer is the whole-object fallback, which fetched the object
+        // (blocks included) to compute its survivor count, so it is a touch even
+        // at zero survivors. The two footer-carrying branches always precede a
+        // scan when they report survivors.
+        if let Ok(Some((survivors, _, footer))) = &result
+            && (*survivors > 0 || footer.is_none())
+        {
             caller_accounting.add_data_objects_touched(1);
         }
         result
@@ -3029,20 +3051,33 @@ impl BlockRangeFetcher {
 
     /// Sets the fetch bound (ADR-0996 decision 2): one covering GET's maximum
     /// length. An object at or under it is one covering GET; a larger one is
-    /// segmented into `ceil(object_size / n)` covering sub-range GETs. `n` is
-    /// clamped up to 1 here as a last-resort guard; zero is refused earlier at
-    /// config resolution ([`EngineConfig::validate`]), which is where the typed
-    /// error belongs.
-    #[must_use]
-    pub fn with_max_fetch_run_bytes(mut self, n: u64) -> Self {
-        self.max_fetch_run_bytes = n.max(1);
-        self
+    /// segmented into `ceil(object_size / n)` covering sub-range GETs.
+    ///
+    /// Zero is REFUSED, with the same typed error
+    /// [`EngineConfig::validate`](crate::EngineConfig::validate) returns. The two
+    /// checks are not redundant: `validate` guards the config surface, and this
+    /// guards every other way a bound reaches the fetcher (a direct builder call
+    /// in a test or an embedding crate, a value that never passed through an
+    /// `EngineConfig` at all). Clamping to 1 here instead would turn a
+    /// misconfigured bound into a silent one-byte-per-GET read of every object,
+    /// which is a far worse outcome than the refusal and is invisible in the
+    /// counters until the request bill arrives.
+    pub fn with_max_fetch_run_bytes(mut self, n: u64) -> Result<Self, EngineConfigError> {
+        if n == 0 {
+            return Err(EngineConfigError::ZeroFetchBound);
+        }
+        self.max_fetch_run_bytes = n;
+        Ok(self)
     }
 
-    /// The largest single covering sub-range GET this fetcher has issued, in
+    /// The largest single covering sub-range GET this fetcher has ISSUED, in
     /// bytes (ADR-0996 decision 2). Never exceeds `max_fetch_run_bytes`; a test
     /// reads it to prove the segmented covering path bounded each request's wire
     /// size. Cumulative and shared by every clone; nothing resets it.
+    ///
+    /// A read served from the cache issues no request and moves no wire bytes,
+    /// so it never enters this figure: the observation is taken after
+    /// [`Self::cached_extent`] reports the miss, not before it.
     #[must_use]
     pub fn peak_fetch_run_bytes(&self) -> u64 {
         self.peak_fetch_run.load(Ordering::Relaxed)
@@ -3056,9 +3091,11 @@ impl BlockRangeFetcher {
         self.max_fetch_run_bytes
     }
 
-    /// Record one covering sub-range GET's length against the peak, keeping the
-    /// running maximum. Called on the segmented covering path so
-    /// [`Self::peak_fetch_run_bytes`] reflects the largest single request.
+    /// Record one ISSUED covering sub-range GET's length against the peak,
+    /// keeping the running maximum. Called on the covering path once the read is
+    /// known to have crossed the network, so
+    /// [`Self::peak_fetch_run_bytes`] reflects the largest single request rather
+    /// than the largest extent a cache happened to serve.
     fn observe_fetch_run(&self, len: u64) {
         self.peak_fetch_run.fetch_max(len, Ordering::Relaxed);
     }
@@ -3097,7 +3134,6 @@ impl BlockRangeFetcher {
         accounting: &QueryAccounting,
     ) -> Result<(Bytes, u64), LogFetchError> {
         if total_size <= self.max_fetch_run_bytes {
-            self.observe_fetch_run(total_size);
             let (bytes, live) = self
                 .cached_extent(
                     seg_ref,
@@ -3110,6 +3146,9 @@ impl BlockRangeFetcher {
                     accounting,
                 )
                 .await?;
+            if live {
+                self.observe_fetch_run(total_size);
+            }
             return Ok((bytes, u64::from(live)));
         }
 
@@ -3121,7 +3160,6 @@ impl BlockRangeFetcher {
         while start < total_size {
             let len = self.max_fetch_run_bytes.min(total_size - start);
             let end = start + len;
-            self.observe_fetch_run(len);
             let (bytes, live) = self
                 .cached_extent(
                     seg_ref,
@@ -3134,6 +3172,9 @@ impl BlockRangeFetcher {
                     accounting,
                 )
                 .await?;
+            if live {
+                self.observe_fetch_run(len);
+            }
             asm.place(key, start, &bytes)?;
             live_gets += u64::from(live);
             start = end;
