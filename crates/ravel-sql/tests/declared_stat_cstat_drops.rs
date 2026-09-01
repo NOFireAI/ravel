@@ -254,3 +254,101 @@ fn absence_and_validity_leave_the_cstat_label_untouched() {
     assert_eq!(col.min_value, Precision::Absent);
     assert_eq!((mine, others), (0, 0), "nor is an entryless segment");
 }
+
+/// A raw `ColumnStat`: unlike [`cstat`], it does not force
+/// `non_null_count + null_count == SAMPLE_COUNT`, so the reconciliation half of
+/// #1023 can be exercised with a deliberately unbalanced entry.
+fn raw_stat(
+    non_null_count: u64,
+    null_count: u64,
+    min: Option<i64>,
+    max: Option<i64>,
+) -> ColumnStat {
+    ColumnStat {
+        name: COL.to_string(),
+        declared_type: 2, // ravel.sys.v1.TypedAttrColumnType::I64
+        non_null_count,
+        null_count,
+        min: min.map(i64_value),
+        max: max.map(i64_value),
+        dictionary_present: false,
+        dictionary: Vec::new(),
+        sum: None,
+    }
+}
+
+/// #1023 reconciliation: an entry whose row accounting disagrees with the
+/// joined `SegmentRef::sample_count` grants NOTHING for the column -- the
+/// extrema included, not only the unproven null count -- and is counted once
+/// under `cstat`. Here `non_null_count(2) + null_count(1) = 3`, but the segment
+/// carries `SAMPLE_COUNT = 4` rows, so the entry describes an object that does
+/// not exist. Its extrema are internally consistent (non-null rows, both
+/// present), so `validate_min_max_presence` passes and only the sample_count
+/// reconciliation refuses it.
+///
+/// Prove-the-test: delete the `accounted != Some(seg.sample_count)` refusal
+/// block in `cstat_coverage` (crates/ravel-sql/src/logs_scan.rs). Both extrema
+/// then reach `Precision::Exact(200)`/`Exact(500)` from an unreconciled entry
+/// and the delta reads 0, which is the exact state #1023 item 3 was filed
+/// about; the `Absent` and `mine == 1` assertions both fail.
+#[test]
+fn a_row_accounting_mismatch_grants_nothing_and_is_counted() {
+    let (col, mine, others) = resolve(seg_ref(7), vec![raw_stat(2, 1, Some(200), Some(500))]);
+    assert_eq!(
+        col.min_value,
+        Precision::Absent,
+        "an unreconciled entry grants no MIN"
+    );
+    assert_eq!(
+        col.max_value,
+        Precision::Absent,
+        "nor a MAX: the whole entry is refused, not only its null count"
+    );
+    assert_eq!(mine, 1, "one unreconciled entry, counted once");
+    assert_eq!(others, 0, "and under the cstat label only");
+}
+
+/// #1023 reconciliation, the checkpoint's stale-all-NULL case: an entry claiming
+/// all-NULL (both extrema absent, `non_null_count == 0`) whose row accounting
+/// cannot be all-null, because `0 + null_count(0)` does not reach the segment's
+/// `SAMPLE_COUNT = 4` rows. Such an entry is internally consistent by the
+/// presence rule (`validate_min_max_presence` accepts absent extrema with zero
+/// non-null rows), so before reconciliation it was accepted as covering the
+/// segment while contributing nothing: the column's MIN/MAX then read as an
+/// exact NULL over a segment that actually holds four rows.
+///
+/// Prove-the-test: delete the same `accounted != Some(seg.sample_count)` block.
+/// The entry is then accepted, the single-segment column reports
+/// `Precision::Exact(Int64(None))` (an exact NULL) with the delta at 0, and the
+/// `Absent`/`mine == 1` assertions fail -- the silent nothing-contribution the
+/// wave-4 checkpoint named.
+#[test]
+fn a_stale_all_null_entry_grants_nothing_and_is_counted() {
+    let (col, mine, others) = resolve(seg_ref(8), vec![raw_stat(0, 0, None, None)]);
+    assert_eq!(
+        col.min_value,
+        Precision::Absent,
+        "a stale all-NULL entry that cannot be all-null is refused, not accepted \
+         as an exact NULL"
+    );
+    assert_eq!(col.max_value, Precision::Absent);
+    assert_eq!(mine, 1, "one stale entry, counted once");
+    assert_eq!(others, 0, "and under the cstat label only");
+}
+
+/// A reconciled, consistent entry keeps today's behavior exactly: the
+/// [`cstat`] helper balances `non_null_count + null_count` to `SAMPLE_COUNT`, so
+/// the reconciliation is a no-op and the entry answers with `Exact` extrema and
+/// no drop, identical to `absence_and_validity_leave_the_cstat_label_untouched`
+/// above. Pinned separately so a reconciliation that rejected a VALID entry
+/// (an off-by-one, a wrong comparand) would fail here rather than pass silently.
+#[test]
+fn a_reconciled_entry_keeps_todays_behavior() {
+    let (col, mine, others) = resolve(seg_ref(9), vec![cstat(COL, 200, 500, 1)]);
+    assert_eq!(
+        col.min_value,
+        Precision::Exact(ScalarValue::Int64(Some(200))),
+        "3 non-null + 1 null == 4 == sample_count, so the entry still answers"
+    );
+    assert_eq!((mine, others), (0, 0), "a reconciled entry is not a defect");
+}

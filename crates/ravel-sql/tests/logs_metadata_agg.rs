@@ -1542,6 +1542,54 @@ async fn all_null_column_carrying_extrema_declines_and_scans() {
     );
 }
 
+/// #1023 reconciliation, end to end: an entry whose row accounting disagrees
+/// with the joined `SegmentRef::sample_count` must decline and fall back to a
+/// scan, reading objects. Segment A's real object holds six rows, but its entry
+/// claims `non_null_count(3) + null_count(1) = 4`; the extrema are internally
+/// consistent (both present, non-null rows) and sit OUTSIDE the real corpus
+/// range (-1 and 999), so a pre-fix answer that trusts them cannot coincide with
+/// the correct one. The plan keeps its `LogsScanExec`, the answer is the true
+/// scanned `(200, 500)`, and the scan reads objects (`gets() > 0`).
+///
+/// Prove-the-test: delete the `accounted != Some(seg.sample_count)` refusal
+/// block in `cstat_coverage` (crates/ravel-sql/src/logs_scan.rs). The entry is
+/// then accepted, the plan loses its `LogsScanExec` for a `MetadataOnlyExec`,
+/// the answer becomes `(-1, 999)`, and `gets()` drops to 0; all three
+/// assertions fail.
+#[tokio::test]
+async fn a_row_accounting_mismatch_declines_and_scans() {
+    let corpus = RealCorpus::build().await;
+    let bad_stats = loaded_stats(vec![
+        (
+            &corpus.a,
+            // 3 + 1 = 4, but segment A holds six rows: unreconciled.
+            stats_segment(
+                &corpus.a,
+                vec![flat_i64_stat("status", 3, 1, Some(-1), Some(999))],
+            ),
+        ),
+        (
+            &corpus.b,
+            stats_segment(&corpus.b, vec![stat_from_rows(SEG_B_ROWS)]),
+        ),
+    ]);
+
+    let (shown, answer) = min_max_over(&corpus, bad_stats).await;
+    assert!(
+        shown.contains("LogsScanExec") && !shown.contains("MetadataOnlyExec"),
+        "an unreconciled row count must decline and fall back to a scan; plan was:\n{shown}"
+    );
+    assert_eq!(
+        answer,
+        (Some(200), Some(500)),
+        "the scan answers the true MIN/MAX, not the fabricated out-of-range extrema"
+    );
+    assert!(
+        corpus.store.gets() > 0,
+        "a declined statement must read objects"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // q03/q04: SUM(<declared integer column> + k), and q30: AVG(<declared integer
 // column>) -- answered from the exact per-object integer sum (#861). Every
