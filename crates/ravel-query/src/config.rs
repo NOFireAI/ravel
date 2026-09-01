@@ -309,6 +309,10 @@ fn resolve_cost_based_rate(profile: &StoreCostProfile) -> (u64, Option<String>) 
     }
     let quotient = u128::from(profile.get_class_nanodollars) * BYTES_PER_GIB / byte_price;
     match u64::try_from(quotient) {
+        // A quotient of exactly u64::MAX converts cleanly but still saturates
+        // the routing threshold downstream; attribute the profile so the
+        // startup override log never lacks a name.
+        Ok(u64::MAX) => (u64::MAX, Some(profile.name.clone())),
         // Floor at one byte so a sub-nanodollar-per-byte price can never resolve
         // to a zero rate (which would make every crossover trivially true).
         Ok(rate) => (rate.max(1), None),
