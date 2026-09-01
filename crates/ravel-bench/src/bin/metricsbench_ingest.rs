@@ -26,7 +26,7 @@ use ravel_bench::harness::{StoreKind, store_and_metrics_from_env};
 use ravel_bench::metrics_gen::Generator;
 use ravel_bench::metrics_ingest::{
     HttpReplayConfig, LogicalSample, MetricsIngestReport, RavelReplayConfig, parse_logical_stream,
-    replay_into_ravel, replay_over_http,
+    query_after_replay, replay_into_ravel, replay_over_http,
 };
 use ravel_bench::metrics_workload::{WorkloadFile, load_workload};
 use ravel_ingest::{Clock, SystemClock};
@@ -124,6 +124,8 @@ enum RunError {
          nothing is a failed run, not an empty result"
     )]
     NothingIngested,
+    #[error("the post-ingest read-your-write query phase failed: {0}")]
+    Query(String),
 }
 
 /// Steps to generate: the flag if set, else the profile's full
@@ -190,6 +192,21 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunError> {
         return Err(RunError::NothingIngested);
     }
 
+    // Post-ingest read-your-write query phase (ADR-0927 decision 3): pass the
+    // strict writes' commit tokens as `min_commit_token` and evaluate an instant
+    // query at the replay's newest sample, so the read resolves the exact
+    // committed segments deterministically. Recorded as its own phase, separate
+    // from ingest (decision 9). Runs while `ravel` is still whole, before its
+    // result row is moved into `rows`.
+    let query_expr = stream
+        .iter()
+        .find(|s| s.validate().is_ok())
+        .map(|s| s.metric.clone())
+        .ok_or(RunError::NothingIngested)?;
+    let query = query_after_replay(&ravel, &query_expr)
+        .await
+        .map_err(|e| RunError::Query(e.to_string()))?;
+
     let mut rows = vec![ravel.result];
 
     // Comparators, only those a caller supplied an endpoint for.
@@ -215,7 +232,7 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunError> {
         rows.push(row);
     }
 
-    Ok(MetricsIngestReport::new(rows))
+    Ok(MetricsIngestReport::new(rows).with_query(query))
 }
 
 #[tokio::main]
@@ -234,6 +251,16 @@ async fn main() {
                     row.ingest.rejected_samples,
                     row.ingest.dropped_samples,
                     row.ingest.ack_latency_ms.p99,
+                );
+            }
+            for q in &report.queries {
+                eprintln!(
+                    "{:>16}  query={:<20} matched_series={} tokens={} eval_ts_ms={}",
+                    q.system,
+                    q.query,
+                    q.matched_series,
+                    q.min_commit_tokens.len(),
+                    q.eval_ts_ms,
                 );
             }
         }

@@ -83,4 +83,35 @@ fn the_ingest_lane_is_reachable_from_the_bin_and_ravel_is_durable_on_ack() {
         offered,
         "the sample accounting must close (ADR-0927 band 4)"
     );
+
+    // FIX 1 (issue #937 review finding 1): the binary runs the post-ingest
+    // read-your-write query phase and records it as its own row, separate from
+    // ingest (ADR-0927 decision 9). The row is token-bound: it carries the
+    // min_commit_token set it read against, and matches the series just written
+    // without sleeping past the flush delay (decision 3).
+    //
+    // TO SEE THIS FAIL against the pre-fix binary: drop the `.with_query(query)`
+    // in `metricsbench_ingest`'s `run`; `queries` is then absent and the
+    // assertions below fail.
+    let queries = report["queries"].as_array().expect("queries array present");
+    let ravel_query = queries
+        .iter()
+        .find(|q| q["system"] == "ravel")
+        .expect("a ravel query-phase row exists");
+    assert!(
+        ravel_query["min_commit_tokens"]
+            .as_array()
+            .is_some_and(|t| !t.is_empty()),
+        "the query phase is token-bound: it carries the min_commit_token set"
+    );
+    assert!(
+        ravel_query["matched_series"]
+            .as_u64()
+            .is_some_and(|m| m > 0),
+        "the token-bound read-your-write query matched the just-written series"
+    );
+    assert!(
+        ravel_query["eval_ts_ms"].as_i64().is_some(),
+        "the query records the instant it evaluated at (the replay's newest sample)"
+    );
 }
