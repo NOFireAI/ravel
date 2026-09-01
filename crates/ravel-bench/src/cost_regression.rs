@@ -13,9 +13,9 @@
 //! Every figure is PRESENT EXACTLY ONCE in each report and inside its band, or
 //! the check fails. A figure absent from one report but present in the other is
 //! a FAILURE naming it, never a silent skip. The one exception is the
-//! absent-not-zero convention ([`report::RequestCounts`] renders a backend that
-//! cannot bill as `None`, never `0`): a figure whose VALUE is absent in BOTH
-//! reports passes as equally-absent and says so.
+//! absent-not-zero convention ([`crate::report::RequestCounts`] renders a
+//! backend that cannot bill as `None`, never `0`): a figure whose VALUE is
+//! absent in BOTH reports passes as equally-absent and says so.
 //!
 //! # Profile guard
 //!
@@ -262,7 +262,7 @@ impl Band {
 }
 
 /// The band for every figure class. The comparison loop resolves a figure's
-/// band through [`Self::for_class`]; defaults live in [`Self::defaults`] and are
+/// band through `Self::for_class`; defaults live in [`Self::defaults`] and are
 /// mirrored by the checked-in TOML, so a threshold is data with a named home,
 /// never a magic number in the loop.
 #[derive(Debug, Clone, PartialEq)]
