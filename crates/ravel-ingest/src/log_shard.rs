@@ -262,9 +262,9 @@ impl LogTenantBuf {
     /// Appends row-major `records` to this buffer and returns the estimated
     /// byte cost added (per [`est_record_bytes`]). Refuses fail-loud if the
     /// buffer already holds columnar batches (ADR-0109 decision 5); no state is
-    /// mutated on that refusal. Unlike the metrics buffer this never fails on
-    /// stream identity: that collision check is deferred to
-    /// [`RlogWriter::finish`] at flush time.
+    /// mutated on that refusal, the declared-column accumulator included.
+    /// Unlike the metrics buffer this never fails on stream identity: that
+    /// collision check is deferred to [`RlogWriter::finish`] at flush time.
     fn merge_rows(
         &mut self,
         records: Vec<NormalizedLogRecord>,
@@ -272,16 +272,23 @@ impl LogTenantBuf {
     ) -> Result<usize, LogWriteError> {
         let bytes_added: usize = records.iter().map(est_record_bytes).sum();
         // ADR-0873 wave 5a: fold this write's eligible declared-column extrema
-        // in the one pass that already visits the records, before they move
-        // into the buffer content below.
-        self.declared_stats.observe_records(&records);
+        // in the one pass that already visits the records, on the accepted arms
+        // only. Extrema folded for a refused write would be stamped onto the
+        // next flush, whose object does not hold those records, and the wave-4
+        // reader answers MIN/MAX from a stamp as exact (issue #1036).
         match &mut self.content {
-            BufContent::Empty => self.content = BufContent::Rows(records),
-            BufContent::Rows(existing) => existing.extend(records),
             BufContent::Columnar(_) => {
                 return Err(LogWriteError::MixedBufferRepresentation(
                     "row-major write into a tenant buffer already holding columnar batches".into(),
                 ));
+            }
+            BufContent::Empty => {
+                self.declared_stats.observe_records(&records);
+                self.content = BufContent::Rows(records);
+            }
+            BufContent::Rows(existing) => {
+                self.declared_stats.observe_records(&records);
+                existing.extend(records);
             }
         }
         self.note_arrival(arrival_ns);
@@ -293,23 +300,30 @@ impl LogTenantBuf {
     /// byte cost added (per [`est_columnar_bytes`], equal to the row path's
     /// number for the same records). Refuses fail-loud if the buffer already
     /// holds row-major records (ADR-0109 decision 5); no state is mutated on
-    /// that refusal. The caller passes only non-empty batches.
+    /// that refusal, the declared-column accumulator included. The caller
+    /// passes only non-empty batches.
     fn merge_columnar(
         &mut self,
         batch: ColumnarLogBatch,
         arrival_ns: i64,
     ) -> Result<usize, LogWriteError> {
         let bytes_added = est_columnar_bytes(&batch);
-        // ADR-0873 wave 5a: fold this batch's eligible declared-column extrema
-        // before it moves into the buffer content below.
-        self.declared_stats.observe_batch(&batch);
+        // ADR-0873 wave 5a, on the accepted arms only, for the reason
+        // [`Self::merge_rows`] gives: a refused batch's extrema would otherwise
+        // be stamped onto a flush that does not carry its rows (issue #1036).
         match &mut self.content {
-            BufContent::Empty => self.content = BufContent::Columnar(vec![batch]),
-            BufContent::Columnar(existing) => existing.push(batch),
             BufContent::Rows(_) => {
                 return Err(LogWriteError::MixedBufferRepresentation(
                     "columnar write into a tenant buffer already holding row-major records".into(),
                 ));
+            }
+            BufContent::Empty => {
+                self.declared_stats.observe_batch(&batch);
+                self.content = BufContent::Columnar(vec![batch]);
+            }
+            BufContent::Columnar(existing) => {
+                self.declared_stats.observe_batch(&batch);
+                existing.push(batch);
             }
         }
         self.note_arrival(arrival_ns);
