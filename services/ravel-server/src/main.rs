@@ -453,7 +453,9 @@ async fn main() -> anyhow::Result<()> {
         max_s3_requests: cli
             .resolve_max_s3_requests()
             .context("failed to resolve --max-s3-requests")?,
-        query_budgets: cli.query_budgets(),
+        query_budgets: cli
+            .query_budgets()
+            .context("failed to resolve the query budgets and logs fetch policy")?,
         scrub_period: cli
             .parse_scrub_period()
             .context("failed to parse --scrub-period")?,

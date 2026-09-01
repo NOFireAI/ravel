@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
 use ravel_maintain::RetentionPolicy;
+use ravel_types::cost_profile::StoreCostProfile;
 use ravel_types::{TenantHash, TenantId};
 
 use crate::alert_sink::{AlertSink, Credential};
@@ -54,6 +55,37 @@ impl S3Auth {
         match self {
             S3Auth::Static => ravel_object_store::s3::S3AuthMode::Static,
             S3Auth::InstanceRole => ravel_object_store::s3::S3AuthMode::InstanceRole,
+        }
+    }
+}
+
+/// The `--logs-fetch-policy` values (ADR-0996 decision 2). The CLI-facing
+/// mirror of [`ravel_query::LogsFetchPolicy`], which lives in a crate that does
+/// not depend on clap. The spellings clap derives from these variant names are
+/// the ADR's: `request-minimal`, `byte-minimal`, `cost-based`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum LogsFetchPolicyArg {
+    /// Minimize object-store requests: every object is read whole in one
+    /// covering GET, with no probe and no ranged read.
+    RequestMinimal,
+    /// ADR-0904's byte-minimizing behaviour: ranged reads wherever they save
+    /// more bytes than a request costs. The setting for an egress-billed or
+    /// network-constrained deployment.
+    ByteMinimal,
+    /// Derive the request cost from the active store cost profile. At the
+    /// reference (intra-region) profile this resolves to request-minimal
+    /// behaviour; at egress prices it resolves to a small byte cost.
+    #[default]
+    CostBased,
+}
+
+impl LogsFetchPolicyArg {
+    /// The engine-level policy this flag value selects.
+    pub fn policy(self) -> ravel_query::LogsFetchPolicy {
+        match self {
+            LogsFetchPolicyArg::RequestMinimal => ravel_query::LogsFetchPolicy::RequestMinimal,
+            LogsFetchPolicyArg::ByteMinimal => ravel_query::LogsFetchPolicy::ByteMinimal,
+            LogsFetchPolicyArg::CostBased => ravel_query::LogsFetchPolicy::CostBased,
         }
     }
 }
@@ -515,15 +547,22 @@ pub struct Cli {
     /// `ravel_query::EngineConfig::logs_block_range_threshold` and from there
     /// into `LogSegmentFetcher::with_block_range_threshold`.
     ///
-    /// Defaults to [`DEFAULT_LOGS_BLOCK_RANGE_THRESHOLD`] (512 KiB), the
-    /// compiled-in crossover, so an unset flag is byte-identical to before it
-    /// existed. This is the mitigation knob for that path: set it to
+    /// Unset, the crossover is [`DEFAULT_LOGS_BLOCK_RANGE_THRESHOLD`]
+    /// (512 KiB), the compiled-in value, so an unset flag is byte-identical to
+    /// before it existed. This is the mitigation knob for that path: set it to
     /// `18446744073709551615` (`u64::MAX`) to read every object whole, the
     /// pre-ADR-0107 shape, without a rollback; set it to `0` to send every
     /// object through the block-range path. Read at startup only, like
     /// `--disable-cache` and every other cache/read knob here.
-    #[arg(long = "logs-block-range-threshold", value_name = "BYTES", default_value_t = DEFAULT_LOGS_BLOCK_RANGE_THRESHOLD)]
-    pub logs_block_range_threshold: u64,
+    ///
+    /// `Option`-typed rather than defaulted (ADR-0996 decision 2's "Knob
+    /// relations"): the fetch-policy resolution must distinguish a value the
+    /// operator set from the compiled-in one, because a saturated policy
+    /// OVERRIDES an explicitly set threshold and says so at startup. A
+    /// defaulted `u64` cannot express "unset", so a threshold left alone and a
+    /// threshold pinned to 512 KiB would log identically.
+    #[arg(long = "logs-block-range-threshold", value_name = "BYTES")]
+    pub logs_block_range_threshold: Option<u64>,
 
     /// One saved object-store round trip is worth this many saved transfer
     /// bytes; a property of the store and the instance, not of the RLOG data
@@ -537,12 +576,66 @@ pub struct Cli {
     /// cannot disagree. Raising it above the largest segment object the process
     /// serves collapses all three to whole-object reads, which is the setting
     /// for a backend that bills requests and not transfer; the existing 64 KiB
-    /// and 512 KiB floors bound the low end. Omitted defaults to
-    /// [`ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES`], whose doc comment
-    /// carries the derivation of that number, so behavior is byte-identical
-    /// when unset. Read at startup only, like every other read knob here.
-    #[arg(long = "logs-request-cost-bytes", value_name = "BYTES", default_value_t = ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES)]
-    pub logs_request_cost_bytes: u64,
+    /// and 512 KiB floors bound the low end. Read at startup only, like every
+    /// other read knob here.
+    ///
+    /// The expert escape hatch of ADR-0996 decision 2: SET, it WINS over
+    /// `--logs-fetch-policy`'s derived rate and the deployment keeps exactly
+    /// the ADR-0904 behaviour it had. UNSET, the policy derives the rate (at
+    /// the default `cost-based` policy, from the active store cost profile).
+    /// `Option`-typed for that reason: "the operator asked for this many bytes"
+    /// and "nobody asked, use the compiled-in default" are different inputs to
+    /// the resolution, and a `default_value_t` would erase the difference.
+    #[arg(long = "logs-request-cost-bytes", value_name = "BYTES")]
+    pub logs_request_cost_bytes: Option<u64>,
+
+    /// The operator's logs fetch-policy intent (ADR-0996 decision 2), resolved
+    /// at startup into the byte quantities the fetch layer runs on
+    /// (`--logs-request-cost-bytes` and `--logs-block-range-threshold`'s
+    /// engine-side fields) by `ravel_query::resolve_logs_fetch`.
+    ///
+    /// `request-minimal` reads every object whole in one covering GET (the
+    /// cost-preferring shape where transfer is free and the bill is requests);
+    /// `byte-minimal` is ADR-0904's behaviour, ranged reads wherever they save
+    /// more bytes than a request costs; `cost-based` (the default) derives the
+    /// rate from `--store-cost-profile`, which at the reference intra-region
+    /// profile means request-minimal behaviour. Read at startup only: the
+    /// running engine never changes its own policy, so the stamped effective
+    /// policy describes the whole process lifetime.
+    #[arg(long = "logs-fetch-policy", value_enum, default_value_t = LogsFetchPolicyArg::CostBased)]
+    pub logs_fetch_policy: LogsFetchPolicyArg,
+
+    /// Path to a TOML `StoreCostProfile` (ADR-0996 decision 1): this
+    /// deployment's object-store prices, in integer nanodollars per request
+    /// class and per GiB. Omitted, the reference profile
+    /// (`s3-intra-region-2026`: PUT-class $5.00/M, GET-class $0.40/M, transfer
+    /// and retrieval free) is used.
+    ///
+    /// The only consumer at startup is `--logs-fetch-policy cost-based`, which
+    /// derives the byte-denominated request cost from the profile's ratio; no
+    /// price ever reaches the fetch layer (ADR-0904's layering, preserved). A
+    /// file that is unreadable, is not valid TOML, carries an unknown key, or
+    /// names no profile fails startup with the typed error rather than falling
+    /// back to the reference profile: a silent fallback would make every
+    /// figure the deployment reports irreconcilable with the prices its
+    /// operator believes are in force.
+    #[arg(long = "store-cost-profile", value_name = "PATH")]
+    pub store_cost_profile: Option<PathBuf>,
+
+    /// The fetch bound (ADR-0996 decision 2): the maximum length of one
+    /// covering GET on the logs read path, threaded into
+    /// `ravel_query::EngineConfig::logs_max_fetch_run_bytes` and from there
+    /// into `LogSegmentFetcher::with_max_fetch_run_bytes`.
+    ///
+    /// An object at or under it is read in a single covering GET; a larger one
+    /// is read as sequential block-aligned covering sub-range GETs of at most
+    /// this many bytes each, so no single request moves more than this however
+    /// large an object grows. Applies on every policy. Defaults to
+    /// [`ravel_query::DEFAULT_LOG_MAX_FETCH_RUN_BYTES`] (64 MiB). `0` is
+    /// refused at config resolution with a typed error: the segmented covering
+    /// fallback divides the object size by it.
+    #[arg(long = "logs-max-fetch-run-bytes", value_name = "BYTES", default_value_t = ravel_query::DEFAULT_LOG_MAX_FETCH_RUN_BYTES)]
+    pub logs_max_fetch_run_bytes: u64,
 
     /// Bound on concurrent in-flight segment fetches per query (ADR-0088),
     /// threaded into `ravel_query::EngineConfig::fetch_concurrency`. This is a
@@ -1026,7 +1119,7 @@ pub const DEFAULT_SQL_TENANT_MAX_BYTES: usize = 1024 * 1024 * 1024;
 /// ceilings to `build_sql_state`. Every field's [`Default`] is exactly today's
 /// compiled-in value, so a server built with none of the four flags carries a
 /// budget bit-for-bit identical to before they existed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryBudgets {
     /// Per-query segment fetch concurrency, also the SQL scan partition count
     /// and S3 GET concurrency (ADR-0087; not decoupled). Reaches
@@ -1045,16 +1138,31 @@ pub struct QueryBudgets {
     /// `--sql-parallel-final-aggregation=false` opt-out restores the
     /// single-partition final.
     pub sql_parallel_final_aggregation: bool,
-    /// Object size above which a logs scan reads only the pruning-relevant RLOG
-    /// blocks instead of the whole object (ADR-0107). Reaches
-    /// `EngineConfig::logs_block_range_threshold` and from there
-    /// `LogSegmentFetcher::with_block_range_threshold`.
-    pub logs_block_range_threshold: u64,
-    /// How many transferred bytes one saved object-store round trip is worth to
-    /// this deployment (ADR-0904). Reaches
-    /// `EngineConfig::logs_request_cost_bytes` and from there
-    /// `LogSegmentFetcher::with_request_cost_bytes`.
-    pub logs_request_cost_bytes: u64,
+    /// The operator's explicit `--logs-block-range-threshold`, or `None` when
+    /// the flag was not set (ADR-0107). Feeds the ADR-0996 resolution as both
+    /// the configured value (`None` meaning
+    /// [`DEFAULT_LOGS_BLOCK_RANGE_THRESHOLD`]) and the explicit-flag input a
+    /// saturated policy overrides and reports.
+    pub logs_block_range_threshold: Option<u64>,
+    /// The operator's explicit `--logs-request-cost-bytes`: how many
+    /// transferred bytes one saved object-store round trip is worth to this
+    /// deployment (ADR-0904). `None` when the flag was not set, which is what
+    /// lets [`Self::logs_fetch_resolution`] derive the rate from the policy
+    /// instead; `Some` wins over the policy (ADR-0996 decision 2).
+    pub logs_request_cost_bytes: Option<u64>,
+    /// The operator's `--logs-fetch-policy` intent (ADR-0996 decision 2),
+    /// resolved into the two byte quantities above by
+    /// [`Self::logs_fetch_resolution`].
+    pub logs_fetch_policy: ravel_query::LogsFetchPolicy,
+    /// The active store cost profile (ADR-0996 decision 1), from
+    /// `--store-cost-profile` or the reference profile. Read only by the
+    /// cost-based rate derivation; no price reaches the fetch layer.
+    pub store_cost_profile: StoreCostProfile,
+    /// The fetch bound: one covering GET's maximum length, from
+    /// `--logs-max-fetch-run-bytes`. Reaches
+    /// `EngineConfig::logs_max_fetch_run_bytes` and from there
+    /// `LogSegmentFetcher::with_max_fetch_run_bytes`.
+    pub logs_max_fetch_run_bytes: u64,
 }
 
 impl Default for QueryBudgets {
@@ -1065,29 +1173,168 @@ impl Default for QueryBudgets {
             sql_max_query_bytes: DEFAULT_SQL_MAX_QUERY_BYTES,
             sql_tenant_max_bytes: DEFAULT_SQL_TENANT_MAX_BYTES,
             sql_parallel_final_aggregation: true,
-            logs_block_range_threshold: DEFAULT_LOGS_BLOCK_RANGE_THRESHOLD,
-            logs_request_cost_bytes: ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES,
+            logs_block_range_threshold: None,
+            logs_request_cost_bytes: None,
+            logs_fetch_policy: ravel_query::LogsFetchPolicy::default(),
+            store_cost_profile: StoreCostProfile::reference(),
+            logs_max_fetch_run_bytes: ravel_query::DEFAULT_LOG_MAX_FETCH_RUN_BYTES,
         }
     }
 }
 
 impl QueryBudgets {
-    /// Fold the `EngineConfig`-bound budgets (`fetch_concurrency`,
-    /// `max_segments`, `logs_block_range_threshold`, `logs_request_cost_bytes`)
-    /// onto a base `EngineConfig` that already carries the
-    /// separately-resolved deadline, bytes-scanned budget, and S3 request
-    /// budget. [`crate::start`] calls this so the one process-wide engine both
-    /// query surfaces share enforces the operator's `--fetch-concurrency` /
-    /// `--max-segments`, not `EngineConfig::default()`'s compiled-in 8 / 1024.
-    /// The single wiring point, so a reachability test that drives it proves the
-    /// running engine carries the flag values.
-    pub fn apply_to_engine(&self, base: ravel_query::EngineConfig) -> ravel_query::EngineConfig {
-        ravel_query::EngineConfig {
+    /// Resolve `--logs-fetch-policy` against the active profile and the two
+    /// ADR-0904 byte flags (ADR-0996 decision 2). This is the server's single
+    /// call into `ravel_query::resolve_logs_fetch`, and what turns the policy
+    /// from an intent into the byte quantities [`Self::apply_to_engine`] hands
+    /// the fetcher builders.
+    ///
+    /// The explicit/configured split the resolution takes is exactly the
+    /// `Option`-typing of the two flags: `Some` is "the operator set this", and
+    /// the fallback inside `unwrap_or` is the compiled-in value a policy that
+    /// keeps today's behaviour (`byte-minimal`) resolves to.
+    pub fn logs_fetch_resolution(&self) -> ravel_query::ResolvedLogsFetch {
+        ravel_query::resolve_logs_fetch(
+            self.logs_fetch_policy,
+            &self.store_cost_profile,
+            self.logs_request_cost_bytes,
+            self.logs_request_cost_bytes
+                .unwrap_or(ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES),
+            self.logs_block_range_threshold
+                .unwrap_or(DEFAULT_LOGS_BLOCK_RANGE_THRESHOLD),
+            self.logs_block_range_threshold,
+        )
+    }
+
+    /// The effective logs fetch configuration this process resolved, for the
+    /// startup stamp (ADR-0996 decision 2: "the stamped effective policy is
+    /// what makes the state auditable"). Built from the same
+    /// [`Self::logs_fetch_resolution`] the engine config is, so the stamp
+    /// cannot describe a resolution the engine did not get.
+    pub fn logs_fetch_stamp(&self) -> LogsFetchStamp {
+        let resolved = self.logs_fetch_resolution();
+        LogsFetchStamp {
+            policy: self.logs_fetch_policy.as_str(),
+            profile: self.store_cost_profile.name.clone(),
+            request_cost_bytes: resolved.request_cost_bytes,
+            request_cost_source: match self.logs_request_cost_bytes {
+                Some(_) => REQUEST_COST_SOURCE_EXPLICIT_FLAG,
+                None => REQUEST_COST_SOURCE_POLICY,
+            },
+            block_range_threshold: resolved.block_range_threshold,
+            overridden_block_range_threshold: resolved.overridden_block_range_threshold,
+            saturated_profile: resolved.saturated_profile,
+            max_fetch_run_bytes: self.logs_max_fetch_run_bytes,
+        }
+    }
+
+    /// Fold the `EngineConfig`-bound budgets onto a base `EngineConfig` that
+    /// already carries the separately-resolved deadline, bytes-scanned budget,
+    /// and S3 request budget. [`crate::start`] calls this so the one
+    /// process-wide engine both query surfaces share enforces the operator's
+    /// `--fetch-concurrency` / `--max-segments`, not
+    /// `EngineConfig::default()`'s compiled-in 8 / 1024. The single wiring
+    /// point, so a reachability test that drives it proves the running engine
+    /// carries the flag values.
+    ///
+    /// The two logs fetch quantities folded here are the RESOLVED ones
+    /// ([`Self::logs_fetch_resolution`]), not the raw flags: `--logs-fetch-policy`
+    /// would otherwise be inert, since the fetcher builders in
+    /// [`crate::query::build_sql_state`] read `EngineConfig` and nothing else.
+    ///
+    /// Fallible because this is the config resolution ADR-0996 decision 2 puts
+    /// the fetch bound's validation at: a zero `--logs-max-fetch-run-bytes`
+    /// comes back as [`ravel_query::EngineConfigError::ZeroFetchBound`] and
+    /// refuses startup, rather than reaching a fetch layer that divides by it.
+    pub fn apply_to_engine(
+        &self,
+        base: ravel_query::EngineConfig,
+    ) -> Result<ravel_query::EngineConfig, ravel_query::EngineConfigError> {
+        let resolved = self.logs_fetch_resolution();
+        let config = ravel_query::EngineConfig {
             fetch_concurrency: self.fetch_concurrency,
             max_segments: self.max_segments,
-            logs_block_range_threshold: self.logs_block_range_threshold,
-            logs_request_cost_bytes: self.logs_request_cost_bytes,
+            logs_block_range_threshold: resolved.block_range_threshold,
+            logs_request_cost_bytes: resolved.request_cost_bytes,
+            logs_fetch_policy: self.logs_fetch_policy,
+            logs_max_fetch_run_bytes: self.logs_max_fetch_run_bytes,
             ..base
+        };
+        config.validate()?;
+        Ok(config)
+    }
+}
+
+/// [`LogsFetchStamp::request_cost_source`] when `--logs-request-cost-bytes` was
+/// set: the explicit byte flag won over the policy's derivation (ADR-0996
+/// decision 2's expert escape hatch).
+pub const REQUEST_COST_SOURCE_EXPLICIT_FLAG: &str = "explicit-flag";
+/// [`LogsFetchStamp::request_cost_source`] when the flag was unset and
+/// `--logs-fetch-policy` derived the rate.
+pub const REQUEST_COST_SOURCE_POLICY: &str = "policy";
+
+/// The effective logs fetch configuration a process resolved at startup, the
+/// provenance stamp of ADR-0996 decision 2.
+///
+/// The server exposes no config-provenance endpoint, so this is emitted as one
+/// structured startup log line ([`Self::emit`]) naming the effective policy,
+/// the active profile, and every resolved quantity. It is a value rather than a
+/// bare `tracing::info!` at the call site so a test can assert on exactly what
+/// the operator reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogsFetchStamp {
+    /// `--logs-fetch-policy` as the operator spelled it.
+    pub policy: &'static str,
+    /// The active profile's name, from `--store-cost-profile` or the reference
+    /// profile.
+    pub profile: String,
+    /// The resolved byte-denominated request cost the fetch layer runs on.
+    pub request_cost_bytes: u64,
+    /// Whether [`Self::request_cost_bytes`] came from the explicit byte flag or
+    /// from the policy: [`REQUEST_COST_SOURCE_EXPLICIT_FLAG`] or
+    /// [`REQUEST_COST_SOURCE_POLICY`].
+    pub request_cost_source: &'static str,
+    /// The resolved logs routing threshold.
+    pub block_range_threshold: u64,
+    /// The operator's `--logs-block-range-threshold` when the resolution
+    /// overrode it (a saturated rate routes every object whole-object
+    /// regardless of the flag), for the override log line. `None` when the flag
+    /// was unset or left in force.
+    pub overridden_block_range_threshold: Option<u64>,
+    /// The profile whose prices saturated a cost-based derivation at
+    /// `u64::MAX`, for the saturation log line. `None` when the derived rate is
+    /// finite or the policy derived nothing.
+    pub saturated_profile: Option<String>,
+    /// The resolved fetch bound (`--logs-max-fetch-run-bytes`).
+    pub max_fetch_run_bytes: u64,
+}
+
+impl LogsFetchStamp {
+    /// Emit this stamp at startup. One INFO line with the whole effective
+    /// configuration, plus a WARN naming the overridden
+    /// `--logs-block-range-threshold` when the resolution saturated past it:
+    /// an operator who set a flag that no longer governs must be told, not left
+    /// to infer it from a query's shape.
+    pub fn emit(&self) {
+        tracing::info!(
+            policy = self.policy,
+            profile = %self.profile,
+            request_cost_bytes = self.request_cost_bytes,
+            request_cost_source = self.request_cost_source,
+            block_range_threshold = self.block_range_threshold,
+            max_fetch_run_bytes = self.max_fetch_run_bytes,
+            saturated_profile = self.saturated_profile.as_deref().unwrap_or(""),
+            "logs fetch policy resolved"
+        );
+        if let Some(overridden) = self.overridden_block_range_threshold {
+            tracing::warn!(
+                policy = self.policy,
+                profile = %self.profile,
+                overridden_block_range_threshold = overridden,
+                effective_block_range_threshold = self.block_range_threshold,
+                "--logs-block-range-threshold is overridden by the resolved fetch policy: \
+                 every logs object is read whole-object"
+            );
         }
     }
 }
@@ -1748,15 +1995,20 @@ impl Cli {
         })
     }
 
-    /// The four ADR-0088 query budgets sourced directly from the CLI flags.
-    /// `main` threads this into [`crate::ServerConfig::query_budgets`], and
-    /// [`crate::start`] folds it into the process-wide `EngineConfig` and the
-    /// SQL executor, so a flag set here is the value the query/SQL execution
-    /// path enforces. Infallible: clap has already parsed each flag to its
-    /// typed field (an unset flag is its compiled-in default), and none of the
-    /// four has a rejected value the way `--max-s3-requests 0` does.
-    pub fn query_budgets(&self) -> QueryBudgets {
-        QueryBudgets {
+    /// The ADR-0088 query budgets and the ADR-0996 logs fetch configuration,
+    /// sourced from the CLI flags. `main` threads this into
+    /// [`crate::ServerConfig::query_budgets`], and [`crate::start`] folds it
+    /// into the process-wide `EngineConfig` and the SQL executor, so a flag set
+    /// here is the value the query/SQL execution path enforces.
+    ///
+    /// Fallible only for `--store-cost-profile`, which reads a file: every
+    /// other field is a clap-parsed value (an unset flag is its compiled-in
+    /// default). A profile that cannot be read or parsed refuses startup here
+    /// rather than falling back to the reference profile, so the prices a
+    /// deployment's figures are modelled at are always the ones its operator
+    /// declared.
+    pub fn query_budgets(&self) -> anyhow::Result<QueryBudgets> {
+        Ok(QueryBudgets {
             fetch_concurrency: self.fetch_concurrency,
             max_segments: self.max_segments,
             sql_max_query_bytes: self.sql_max_query_bytes,
@@ -1764,7 +2016,33 @@ impl Cli {
             sql_parallel_final_aggregation: self.sql_parallel_final_aggregation,
             logs_block_range_threshold: self.logs_block_range_threshold,
             logs_request_cost_bytes: self.logs_request_cost_bytes,
-        }
+            logs_fetch_policy: self.logs_fetch_policy.policy(),
+            store_cost_profile: self.resolve_store_cost_profile()?,
+            logs_max_fetch_run_bytes: self.logs_max_fetch_run_bytes,
+        })
+    }
+
+    /// The active store cost profile (ADR-0996 decision 1): the TOML document
+    /// at `--store-cost-profile`, or [`StoreCostProfile::reference`] when the
+    /// flag is unset.
+    ///
+    /// Every failure is a startup refusal naming the path and the typed
+    /// [`ravel_types::cost_profile::CostProfileError`] beneath it. There is no
+    /// fallback path: a deployment that names a profile file and silently gets
+    /// the reference prices would stamp one profile into its reports while
+    /// resolving its fetch policy from another.
+    pub fn resolve_store_cost_profile(&self) -> anyhow::Result<StoreCostProfile> {
+        let Some(path) = self.store_cost_profile.as_deref() else {
+            return Ok(StoreCostProfile::reference());
+        };
+        let raw = std::fs::read_to_string(path).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to read --store-cost-profile {}: {e}",
+                path.display()
+            )
+        })?;
+        StoreCostProfile::from_toml_str(&raw)
+            .map_err(|e| anyhow::anyhow!("invalid --store-cost-profile {}: {e}", path.display()))
     }
 
     /// Parse `--max-inflight-ingest-requests` into an
@@ -3746,7 +4024,7 @@ mod tests {
 
         let cli = Cli::try_parse_from(["ravel-server", "--fetch-concurrency", "16"])
             .expect("flag parses");
-        let engine = cli.query_budgets().apply_to_engine(EngineConfig::default());
+        let engine = engine_from(&cli);
         assert_eq!(
             engine.fetch_concurrency, 16,
             "the running engine's fetch_concurrency must be the configured flag, \
@@ -3756,9 +4034,7 @@ mod tests {
         // Default path: unset flag leaves the engine's value byte-identical.
         let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
         assert_eq!(
-            cli.query_budgets()
-                .apply_to_engine(EngineConfig::default())
-                .fetch_concurrency,
+            engine_from(&cli).fetch_concurrency,
             EngineConfig::default().fetch_concurrency,
         );
     }
@@ -3774,7 +4050,7 @@ mod tests {
 
         let cli =
             Cli::try_parse_from(["ravel-server", "--max-segments", "4096"]).expect("flag parses");
-        let engine = cli.query_budgets().apply_to_engine(EngineConfig::default());
+        let engine = engine_from(&cli);
         assert_eq!(
             engine.max_segments, 4096,
             "the running engine's max_segments must be the configured flag, \
@@ -3783,9 +4059,7 @@ mod tests {
 
         let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
         assert_eq!(
-            cli.query_budgets()
-                .apply_to_engine(EngineConfig::default())
-                .max_segments,
+            engine_from(&cli).max_segments,
             EngineConfig::default().max_segments,
         );
     }
@@ -3800,10 +4074,14 @@ mod tests {
     /// `u64::MAX` is the value under test because it is the operator-facing
     /// point of the flag: it turns the ADR-0107 block-range path off for every
     /// object, which is the mitigation for a regression on that path.
+    ///
+    /// Driven under `--logs-fetch-policy byte-minimal` (ADR-0996 decision 2's
+    /// "Knob relations"): that is the policy under which this flag keeps its
+    /// ADR-0904 role. Under a saturated policy the resolution overrides it on
+    /// purpose, which
+    /// [`request_minimal_overrides_an_explicit_block_range_threshold`] pins.
     #[test]
     fn logs_block_range_threshold_is_reachable_from_cli() {
-        use ravel_query::EngineConfig;
-
         assert_ne!(
             u64::MAX,
             ravel_query::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
@@ -3812,24 +4090,24 @@ mod tests {
 
         let cli = Cli::try_parse_from([
             "ravel-server",
+            "--logs-fetch-policy",
+            "byte-minimal",
             "--logs-block-range-threshold",
             "18446744073709551615",
         ])
         .expect("flag parses");
-        let engine = cli.query_budgets().apply_to_engine(EngineConfig::default());
         assert_eq!(
-            engine.logs_block_range_threshold,
+            engine_from(&cli).logs_block_range_threshold,
             u64::MAX,
             "the logs fetcher's crossover must be the configured flag, not the compiled-in 512 KiB"
         );
 
         // Default path: unset flag leaves the crossover at the fetcher's own
         // compiled-in constant.
-        let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        let cli = Cli::try_parse_from(["ravel-server", "--logs-fetch-policy", "byte-minimal"])
+            .expect("defaults parse");
         assert_eq!(
-            cli.query_budgets()
-                .apply_to_engine(EngineConfig::default())
-                .logs_block_range_threshold,
+            engine_from(&cli).logs_block_range_threshold,
             ravel_query::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
         );
     }
@@ -3849,8 +4127,6 @@ mod tests {
     /// setting for a backend that bills requests and not transfer.
     #[test]
     fn logs_request_cost_bytes_is_reachable_from_cli() {
-        use ravel_query::EngineConfig;
-
         // Sanity: the value under test differs from the compiled-in default, so
         // the assertion cannot pass by the flag being ignored.
         assert_ne!(
@@ -3860,21 +4136,22 @@ mod tests {
 
         let cli = Cli::try_parse_from(["ravel-server", "--logs-request-cost-bytes", "1073741824"])
             .expect("flag parses");
-        let engine = cli.query_budgets().apply_to_engine(EngineConfig::default());
         assert_eq!(
-            engine.logs_request_cost_bytes,
+            engine_from(&cli).logs_request_cost_bytes,
             1024 * 1024 * 1024,
             "the logs fetcher's request cost must be the configured flag, not the compiled-in \
              DEFAULT_LOG_REQUEST_COST_BYTES"
         );
 
-        // Default path: unset flag leaves the request cost at the fetcher's own
-        // compiled-in constant.
-        let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        // Default path: with the flag unset, `byte-minimal` is the policy that
+        // means "today's behaviour byte for byte", so the request cost is the
+        // fetcher's own compiled-in constant. (Unset under the default
+        // `cost-based` policy resolves from the profile instead, which
+        // [`logs_fetch_policy_is_reachable_from_cli`] pins.)
+        let cli = Cli::try_parse_from(["ravel-server", "--logs-fetch-policy", "byte-minimal"])
+            .expect("defaults parse");
         assert_eq!(
-            cli.query_budgets()
-                .apply_to_engine(EngineConfig::default())
-                .logs_request_cost_bytes,
+            engine_from(&cli).logs_request_cost_bytes,
             ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES,
         );
     }
@@ -3889,7 +4166,8 @@ mod tests {
 
         let budgets = Cli::try_parse_from(["ravel-server"])
             .expect("defaults parse")
-            .query_budgets();
+            .query_budgets()
+            .expect("budgets resolve");
         assert_eq!(budgets, QueryBudgets::default());
         assert_eq!(
             budgets.fetch_concurrency,
@@ -3902,11 +4180,350 @@ mod tests {
             budgets.sql_parallel_final_aggregation,
             "ADR-0094 amendment (#741): exact-typed final-aggregation repartitioning defaults on"
         );
-        // The two EngineConfig-bound defaults leave a base config untouched.
         assert_eq!(
-            budgets.apply_to_engine(EngineConfig::default()),
-            EngineConfig::default(),
-            "unset --fetch-concurrency/--max-segments must not perturb the engine config"
+            budgets.logs_max_fetch_run_bytes,
+            EngineConfig::default().logs_max_fetch_run_bytes,
+            "the --logs-max-fetch-run-bytes default is the engine's own 64 MiB bound"
+        );
+        // The concurrency/segment defaults leave a base config untouched. The
+        // two logs fetch quantities do NOT: ADR-0996 decision 2 ships
+        // `cost-based` as the default policy, and at the reference profile
+        // (transfer and retrieval free) that resolves to request-minimal
+        // behaviour. That is the ADR's argued default, not an accident, so it
+        // is pinned to the exact resolved values here.
+        let engine = budgets
+            .apply_to_engine(EngineConfig::default())
+            .expect("the default configuration resolves");
+        assert_eq!(
+            engine,
+            EngineConfig {
+                logs_request_cost_bytes: u64::MAX,
+                logs_block_range_threshold: u64::MAX,
+                ..EngineConfig::default()
+            },
+            "unset flags must perturb only the two quantities the default cost-based policy \
+             resolves at the reference profile"
+        );
+    }
+
+    /// The `EngineConfig` a parsed CLI produces through the exact wiring
+    /// `crate::start` uses: `Cli::query_budgets` ->
+    /// `QueryBudgets::apply_to_engine`. Every reachability assertion below
+    /// drives this rather than reading a parsed field, so a green result means
+    /// a running binary's engine carries the value.
+    fn engine_from(cli: &Cli) -> ravel_query::EngineConfig {
+        cli.query_budgets()
+            .expect("budgets resolve")
+            .apply_to_engine(ravel_query::EngineConfig::default())
+            .expect("engine config resolves")
+    }
+
+    /// The [`LogsFetchStamp`] a parsed CLI resolves, the provenance surface
+    /// `start` logs.
+    fn stamp_from(cli: &Cli) -> LogsFetchStamp {
+        cli.query_budgets()
+            .expect("budgets resolve")
+            .logs_fetch_stamp()
+    }
+
+    /// Write `contents` to a uniquely named TOML file in a fresh temp dir and
+    /// return its path (the dir is returned too, and dropping it deletes the
+    /// file). A per-call temp dir, not a shared name: these tests run on
+    /// threads inside one binary.
+    fn profile_file(contents: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("cost-profile.toml");
+        std::fs::write(&path, contents).expect("write profile");
+        (dir, path)
+    }
+
+    /// ADR-0996 decision 2 reachability, the flag this task exists for:
+    /// `--logs-fetch-policy` must reach the two byte quantities
+    /// `crate::query::build_sql_state` hands the logs fetcher, RESOLVED. Before
+    /// the wiring, `apply_to_engine` copied the raw flags and the policy
+    /// resolution ran nowhere, so a server started with `request-minimal` still
+    /// routed ranged.
+    ///
+    /// Prove-the-test: restore `logs_block_range_threshold: self
+    /// .logs_block_range_threshold.unwrap_or(DEFAULT_LOGS_BLOCK_RANGE_THRESHOLD)`
+    /// and `logs_request_cost_bytes: self.logs_request_cost_bytes
+    /// .unwrap_or(ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES)` in
+    /// `apply_to_engine` (the pre-wiring body) and the first two assertions
+    /// read 524288 and 1887437 against the expected `u64::MAX`.
+    #[test]
+    fn logs_fetch_policy_is_reachable_from_cli() {
+        // request-minimal: both quantities saturate, so every object is read
+        // whole in one covering GET.
+        let cli = Cli::try_parse_from(["ravel-server", "--logs-fetch-policy", "request-minimal"])
+            .expect("flag parses");
+        let engine = engine_from(&cli);
+        assert_eq!(
+            engine.logs_request_cost_bytes,
+            u64::MAX,
+            "request-minimal must reach the fetcher as a saturated request cost"
+        );
+        assert_eq!(
+            engine.logs_block_range_threshold,
+            u64::MAX,
+            "request-minimal must also saturate the routing threshold, or a narrow projection \
+             of a larger object still routes ranged"
+        );
+        assert_eq!(
+            engine.logs_fetch_policy,
+            ravel_query::LogsFetchPolicy::RequestMinimal
+        );
+
+        // cost-based at the reference profile (the shipped default, with no
+        // flags at all) resolves to the same two quantities.
+        let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        let engine = engine_from(&cli);
+        assert_eq!(engine.logs_request_cost_bytes, u64::MAX);
+        assert_eq!(engine.logs_block_range_threshold, u64::MAX);
+        assert_eq!(
+            engine.logs_fetch_policy,
+            ravel_query::LogsFetchPolicy::CostBased,
+            "cost-based is the shipped default (ADR-0996 decision 2)"
+        );
+
+        // byte-minimal is today's behaviour byte for byte: the exact
+        // pre-wiring values, asserted as the constants themselves.
+        let cli = Cli::try_parse_from(["ravel-server", "--logs-fetch-policy", "byte-minimal"])
+            .expect("flag parses");
+        let engine = engine_from(&cli);
+        assert_eq!(
+            engine.logs_request_cost_bytes,
+            ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES
+        );
+        assert_eq!(engine.logs_request_cost_bytes, 1_887_437);
+        assert_eq!(
+            engine.logs_block_range_threshold,
+            ravel_query::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD
+        );
+        assert_eq!(engine.logs_block_range_threshold, 524_288);
+    }
+
+    /// ADR-0996 decision 2's "Knob relations": `request-minimal` overrides an
+    /// explicitly set `--logs-block-range-threshold`, and the overridden flag
+    /// is reported in the startup stamp rather than silently dropped.
+    ///
+    /// Prove-the-test: pass the resolution `None` for
+    /// `explicit_block_range_threshold` in `logs_fetch_resolution` and the
+    /// overridden-flag assertion reads `None` against the expected
+    /// `Some(4096)`.
+    #[test]
+    fn request_minimal_overrides_an_explicit_block_range_threshold() {
+        let cli = Cli::try_parse_from([
+            "ravel-server",
+            "--logs-fetch-policy",
+            "request-minimal",
+            "--logs-block-range-threshold",
+            "4096",
+        ])
+        .expect("flags parse");
+        assert_eq!(
+            engine_from(&cli).logs_block_range_threshold,
+            u64::MAX,
+            "the explicit low threshold must not survive request-minimal"
+        );
+        let stamp = stamp_from(&cli);
+        assert_eq!(stamp.overridden_block_range_threshold, Some(4096));
+        assert_eq!(stamp.policy, "request-minimal");
+
+        // Unset, there is nothing to report as overridden.
+        let cli = Cli::try_parse_from(["ravel-server", "--logs-fetch-policy", "request-minimal"])
+            .expect("flag parses");
+        assert_eq!(stamp_from(&cli).overridden_block_range_threshold, None);
+    }
+
+    /// ADR-0996 decision 2's expert escape hatch, end to end through the
+    /// server's own resolution: an explicit `--logs-request-cost-bytes` WINS
+    /// over the policy's derived rate and is reported as explicit; unset, the
+    /// policy derives it and the stamp says so. This is the
+    /// configured-vs-explicit seam the `Option`-typed flag exists for -- with a
+    /// `default_value_t` the two cases are indistinguishable at this layer.
+    ///
+    /// Prove-the-test: pass `Some(self.logs_request_cost_bytes.unwrap_or(
+    /// ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES))` as the resolution's
+    /// explicit input (erasing the unset case) and the derived-rate assertion
+    /// reads 1887437 against the expected `u64::MAX`.
+    #[test]
+    fn explicit_request_cost_wins_over_policy_and_unset_derives() {
+        // Explicit, under the default cost-based policy whose derived rate
+        // would otherwise saturate at the reference profile.
+        let cli = Cli::try_parse_from(["ravel-server", "--logs-request-cost-bytes", "123456"])
+            .expect("flag parses");
+        let engine = engine_from(&cli);
+        assert_eq!(
+            engine.logs_request_cost_bytes, 123_456,
+            "the explicit byte flag wins over the policy's derivation"
+        );
+        assert_eq!(
+            engine.logs_block_range_threshold,
+            ravel_query::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+            "a finite resolved rate leaves the routing threshold in force, so a deployment \
+             that already passes the flag keeps byte-identical behaviour"
+        );
+        let stamp = stamp_from(&cli);
+        assert_eq!(stamp.request_cost_bytes, 123_456);
+        assert_eq!(stamp.request_cost_source, REQUEST_COST_SOURCE_EXPLICIT_FLAG);
+
+        // Explicit under request-minimal: the rate is the operator's, but the
+        // routing intent is still the policy's (ADR-0996 decision 2).
+        let cli = Cli::try_parse_from([
+            "ravel-server",
+            "--logs-fetch-policy",
+            "request-minimal",
+            "--logs-request-cost-bytes",
+            "123456",
+        ])
+        .expect("flags parse");
+        let engine = engine_from(&cli);
+        assert_eq!(engine.logs_request_cost_bytes, 123_456);
+        assert_eq!(engine.logs_block_range_threshold, u64::MAX);
+
+        // Unset: the policy derives the rate, and the stamp attributes it to
+        // the policy rather than to a flag nobody passed.
+        let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        let stamp = stamp_from(&cli);
+        assert_eq!(stamp.request_cost_bytes, u64::MAX);
+        assert_eq!(stamp.request_cost_source, REQUEST_COST_SOURCE_POLICY);
+        assert_eq!(
+            stamp.saturated_profile.as_deref(),
+            Some("s3-intra-region-2026"),
+            "the saturated-override log names the profile that saturated the rate"
+        );
+    }
+
+    /// ADR-0996 decision 2: a zero fetch bound is refused AT SERVER CONFIG
+    /// RESOLUTION with the typed error, not clamped and not left to divide by
+    /// zero in the fetch layer. This is what makes `EngineConfig::validate`
+    /// reachable from a running binary: before this wiring nothing called it.
+    ///
+    /// Prove-the-test: drop the `config.validate()?` line from
+    /// `apply_to_engine` and this reads `Ok` against the expected
+    /// `Err(ZeroFetchBound)`.
+    #[test]
+    fn zero_fetch_bound_is_refused_at_server_config_resolution() {
+        let cli = Cli::try_parse_from(["ravel-server", "--logs-max-fetch-run-bytes", "0"])
+            .expect("flag parses");
+        let resolved = cli
+            .query_budgets()
+            .expect("budgets resolve")
+            .apply_to_engine(ravel_query::EngineConfig::default());
+        assert_eq!(
+            resolved.err(),
+            Some(ravel_query::EngineConfigError::ZeroFetchBound),
+            "a zero --logs-max-fetch-run-bytes must refuse startup with the typed error"
+        );
+
+        // One byte is a legal (absurd) bound, so the refusal is exactly of
+        // zero and not of "small", and a real bound reaches the engine.
+        let cli = Cli::try_parse_from(["ravel-server", "--logs-max-fetch-run-bytes", "1048576"])
+            .expect("flag parses");
+        assert_eq!(engine_from(&cli).logs_max_fetch_run_bytes, 1024 * 1024);
+    }
+
+    /// ADR-0996 decision 1: `--store-cost-profile` reaches the cost-based
+    /// derivation, and a profile that fails validation refuses startup with the
+    /// typed `CostProfileError` beneath a message naming the path. Never a
+    /// silent fallback to the reference profile: that would resolve the fetch
+    /// policy from prices the operator did not declare.
+    ///
+    /// Prove-the-test: replace the `from_toml_str` error arm in
+    /// `resolve_store_cost_profile` with `.unwrap_or_else(|_|
+    /// StoreCostProfile::reference())` and the three `expect_err` calls below
+    /// panic instead.
+    #[test]
+    fn store_cost_profile_reaches_the_derivation_and_refuses_a_bad_file() {
+        // An egress-billed profile: 400 * 2^30 / (90_000_000 + 10_000_000)
+        // = 4294 bytes per saved request, the ADR-0904 worked value.
+        let (_dir, path) = profile_file(
+            "name = \"egress-billed\"\n\
+             put_class_nanodollars = 5000\n\
+             get_class_nanodollars = 400\n\
+             transfer_nanodollars_per_gib = 90000000\n\
+             retrieval_nanodollars_per_gib = 10000000\n",
+        );
+        let cli = Cli::try_parse_from([
+            "ravel-server",
+            "--store-cost-profile",
+            &path.display().to_string(),
+        ])
+        .expect("flag parses");
+        let engine = engine_from(&cli);
+        assert_eq!(
+            engine.logs_request_cost_bytes, 4294,
+            "cost-based must derive the rate from the loaded profile's prices"
+        );
+        assert_eq!(
+            engine.logs_block_range_threshold,
+            ravel_query::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+            "a finite derived rate leaves the routing threshold in force"
+        );
+        assert_eq!(stamp_from(&cli).profile, "egress-billed");
+
+        // A misspelled price key: refused, naming the key and the path.
+        let (_dir, path) = profile_file(
+            "name = \"typo\"\n\
+             put_class_nanodollars = 5000\n\
+             get_class_nanodollars = 400\n\
+             transfer_nanodollars_per_gib = 0\n\
+             retrieval_nanodollars_per_gib = 0\n\
+             get_class_nanodollar = 1\n",
+        );
+        let cli = Cli::try_parse_from([
+            "ravel-server",
+            "--store-cost-profile",
+            &path.display().to_string(),
+        ])
+        .expect("flag parses");
+        let err = cli
+            .query_budgets()
+            .expect_err("an unknown key must refuse startup")
+            .to_string();
+        assert!(
+            err.contains("invalid --store-cost-profile") && err.contains("get_class_nanodollar"),
+            "the refusal names the flag and the offending key: {err}"
+        );
+
+        // A blank name: refused, because a profile that cannot be stamped
+        // cannot govern a figure.
+        let (_dir, path) = profile_file(
+            "name = \"   \"\n\
+             put_class_nanodollars = 5000\n\
+             get_class_nanodollars = 400\n\
+             transfer_nanodollars_per_gib = 0\n\
+             retrieval_nanodollars_per_gib = 0\n",
+        );
+        let cli = Cli::try_parse_from([
+            "ravel-server",
+            "--store-cost-profile",
+            &path.display().to_string(),
+        ])
+        .expect("flag parses");
+        let err = cli
+            .query_budgets()
+            .expect_err("a blank profile name must refuse startup")
+            .to_string();
+        assert!(
+            err.contains("name must not be empty"),
+            "the refusal carries the typed cost-profile error: {err}"
+        );
+
+        // A path that does not exist: refused, not silently ignored.
+        let cli = Cli::try_parse_from([
+            "ravel-server",
+            "--store-cost-profile",
+            "/nonexistent/ravel-cost-profile.toml",
+        ])
+        .expect("flag parses");
+        let err = cli
+            .query_budgets()
+            .expect_err("an unreadable profile must refuse startup")
+            .to_string();
+        assert!(
+            err.contains("failed to read --store-cost-profile"),
+            "the refusal names the flag and the path: {err}"
         );
     }
 
