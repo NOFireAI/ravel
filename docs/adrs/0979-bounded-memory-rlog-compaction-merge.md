@@ -293,6 +293,19 @@ reference box completes the ClickBench worst case: 617 × ~25 MB ≈ 15.4 GiB
 < 20 GiB, leaving ~10 GB of the 30 GB box for the writer buffer, catalogs,
 and process overhead.
 
+The default is sized against the WHOLE box, so a concurrent bucket walk
+(`compact-tenant --bucket-concurrency N`, issue #1028) divides it per
+bucket: each bucket receives `DEFAULT / N` (integer floor) and the
+N-bucket envelope stays inside the box the default was sized for. The
+division applies only while the budget still carries the default. A
+budget the operator configured explicitly is a whole-box decision and is
+passed through per bucket undivided; dividing it would also make
+`MergeCursorBudgetExceeded`'s raise-to-`required_bytes` remediation wrong
+at N > 1. A merge that no longer fits its `DEFAULT / N` share fails
+closed with the same typed refusal naming the divided figure, which is
+the deliberate, visible outcome; the operator lowers N or sets the
+budget explicitly.
+
 ### D5. CLI exposure
 
 `maintain compact-tenant` and `compact-bucket` gain
