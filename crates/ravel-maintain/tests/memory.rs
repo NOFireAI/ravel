@@ -223,7 +223,7 @@ async fn compaction_retains_no_part_bytes() {
     const RECORDS_PER_STREAM: usize = 4;
 
     let store = MemoryStore::new();
-    // A body long enough that a handful of records exceeds the tiny stored-size
+    // A body long enough that a handful of records exceeds the tiny memory split
     // target below, so the merge closes many parts rather than one.
     let body: String = "log-line-".repeat(24);
     for i in 0..INPUTS {
@@ -246,9 +246,14 @@ async fn compaction_retains_no_part_bytes() {
 
     let tracker = MergeMemoryTracker::new();
     let config = CompactorConfig {
-        // Small stored-size target so parts close often; this changes only where
-        // records split into parts, never their bytes.
-        max_l1_part_bytes: 2048,
+        // Small memory split target so parts close often; this changes only where
+        // records split into parts, never their bytes. The memory target is used
+        // rather than the stored-size target because D3 (retention released at
+        // PUT) holds on whichever target closes the part, and the memory target
+        // splits reliably regardless of how far the bodies compress (the stored
+        // target closes on real object bytes since issue #872, so a compressible
+        // fixture reaches it far more slowly).
+        l1_part_memory_target_bytes: 2048,
         merge_memory_tracker: Some(tracker.clone()),
         ..CompactorConfig::default()
     };
@@ -262,7 +267,7 @@ async fn compaction_retains_no_part_bytes() {
     let record = fetch_compaction_record(&store, &bucket).await;
     assert!(
         record.parts.len() >= 3,
-        "the small stored target must close at least three parts, got {}",
+        "the small memory split target must close at least three parts, got {}",
         record.parts.len()
     );
     // The parts really do carry bytes; the point is none of them stay resident.
