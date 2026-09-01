@@ -213,27 +213,54 @@ fn a_conflict_logs_the_segment_content_hash_and_both_triples() {
 
     let logged = String::from_utf8(buffer.lock().expect("log buffer lock").clone())
         .expect("utf8 log output");
-    // Field NAMES and the exact plain-integer figures are the contract; the
+    // Field NAMES bound to their exact figures are the contract; the
     // Option/ScalarValue wrapper text is DataFusion's Debug representation
-    // and may change across upgrades without changing conflict behaviour, so
-    // the extrema are matched by their digits, not their wrapper.
-    for needle in [
-        COL,
-        &hex::encode(CONTENT_HASH),
-        "stamp_min=",
-        "200",
-        "stamp_max=",
-        "500",
-        "stamp_null_count=1",
-        "cstat_min=",
-        "-1",
-        "cstat_max=",
-        "499",
-        "cstat_null_count=2",
-    ] {
+    // and may change across upgrades without changing conflict behaviour. For
+    // each field, the FIRST numeric token after `name=` must equal the
+    // expected value exactly -- independent substring checks would accept
+    // swapped extrema or a superstring like -10 for -1.
+    for needle in [COL, hex::encode(CONTENT_HASH).as_str()] {
         assert!(
             logged.contains(needle),
             "the conflict log line must carry {needle:?}; logged:\n{logged}"
+        );
+    }
+    // The field's whitespace-delimited token (e.g. `stamp_min=Some(Int64(200))`
+    // or a future plain `stamp_min=200`) carries the value as its LAST numeric
+    // run -- the first can be the wrapper's own `64`.
+    let value_of = |field: &str| -> String {
+        let at = logged
+            .find(field)
+            .unwrap_or_else(|| panic!("field {field:?} absent; logged:\n{logged}"))
+            + field.len();
+        let token: &str = logged[at..].split_whitespace().next().unwrap_or("");
+        let mut runs: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        for c in token.chars() {
+            if c.is_ascii_digit() || (c == '-' && cur.is_empty()) {
+                cur.push(c);
+            } else if !cur.is_empty() {
+                runs.push(std::mem::take(&mut cur));
+            }
+        }
+        if !cur.is_empty() {
+            runs.push(cur);
+        }
+        runs.pop()
+            .unwrap_or_else(|| panic!("no numeric token in {token:?} after {field:?}"))
+    };
+    for (field, expected) in [
+        ("stamp_min=", "200"),
+        ("stamp_max=", "500"),
+        ("stamp_null_count=", "1"),
+        ("cstat_min=", "-1"),
+        ("cstat_max=", "499"),
+        ("cstat_null_count=", "2"),
+    ] {
+        assert_eq!(
+            value_of(field),
+            expected,
+            "field {field:?} must bind exactly to {expected:?}; logged:\n{logged}"
         );
     }
 }
