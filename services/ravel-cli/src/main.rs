@@ -789,16 +789,23 @@ enum MaintainCommand {
         /// at once. Default 1, which is today's fully sequential behavior
         /// byte-for-byte (report line order included). Refused at 0.
         ///
-        /// MEMORY: each bucket's merge carries its OWN budget and tracker
-        /// (ADR-0979); there is NO global budget across concurrent buckets,
-        /// because the per-bucket budgets are independent by design. Total peak
-        /// resident memory therefore scales as roughly N times the per-bucket
-        /// envelope, where the per-bucket envelope is the merge budget plus the
-        /// in-progress writer target (ADR-0979). At the defaults (256 MiB writer
-        /// split target, the default merge budget) N=4 holds roughly 4 times the
-        /// per-bucket envelope resident at once. Size N against the box's RAM,
-        /// not its core count: a 16-core box with only enough RAM for two
-        /// per-bucket envelopes must run N=2, not N=16.
+        /// MEMORY: each bucket's merge carries its OWN tracker (ADR-0979), and
+        /// each is given a per-bucket SHARE of the merge cursor budget so the
+        /// whole N-bucket run still fits one box. ADR-0979's default merge cursor
+        /// budget is DEFAULT_MERGE_CURSOR_BUDGET_BYTES = 20 GiB, sized against a
+        /// single 30 GB reference box; when you have not configured a budget,
+        /// compact-tenant sets each bucket's budget to 20 GiB / N (integer
+        /// division, floor). So each concurrent bucket may hold up to ~20 GiB / N
+        /// of cursor budget plus its in-progress writer split target (256 MiB by
+        /// default): at N=1 one bucket may hold ~20 GiB + 256 MiB; at N=4 each of
+        /// the four holds up to ~5 GiB + 256 MiB, ~21 GiB + 1 GiB resident in
+        /// aggregate, still inside the one reference box. Dividing the budget is
+        /// what keeps N times the envelope inside one box instead of needing N
+        /// boxes. A bucket whose merge no longer fits its 20 GiB / N share fails
+        /// closed with the typed MergeCursorBudgetExceeded naming the figure to
+        /// raise (a deliberate, visible refusal, not an out-of-memory kill), so
+        /// on a small box prefer a lower N over hoping a large merge fits a thin
+        /// share. Size N against the box's RAM, not its core count.
         ///
         /// This flag governs how many buckets run at once; --input-read-
         /// concurrency governs the read fan-out WITHIN one bucket. They compose:

@@ -14,12 +14,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use bytes::Bytes;
-use ravel_cli::maintain::{CompactTenantError, SignalArg, compact_tenant};
+use ravel_cli::maintain::{
+    CompactTenantError, SignalArg, compact_tenant, compact_tenant_to, per_bucket_config,
+};
 use ravel_cli::store::{DefaultedMemoryEmptyWalk, StoreKind, StoreSelection};
 use ravel_commit::keys;
 use ravel_commit::record::{self, NewCommitRecord};
 use ravel_logseg::{AttrValue, LogRecord, LogStreamId, ObjectIdentity, RlogConfig, RlogWriter};
-use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+use ravel_maintain::CompactorConfig;
+use ravel_maintain::config::DEFAULT_MERGE_CURSOR_BUDGET_BYTES;
+use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, list_all};
 use ravel_types::{Signal, TenantHash, TenantId};
@@ -826,7 +830,13 @@ async fn bucket_concurrency_one_is_todays_sequential_report() {
 /// change the N=4 argument to 4 while asserting `report_n4 != report_n1` and the
 /// equality assertion fails, or change `all_objects` equality to `!=` and it
 /// fails, showing the objects really are identical.
-#[tokio::test]
+///
+/// Runs on a MULTI-THREAD runtime with four worker threads: under the default
+/// `#[tokio::test]` current-thread runtime every `MemoryStore` future resolves on
+/// its first poll, so the four `JoinSet` tasks complete in dispatch order and the
+/// N=4 run is operationally serial -- the concurrency this test exists to
+/// exercise is never exercised. The flavor line below is the fix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bucket_concurrency_four_writes_identical_objects_to_n1() {
     let store_n4: Arc<dyn ObjectStoreBackend> = Arc::new(seed_tenant_det().await);
     let store_n1: Arc<dyn ObjectStoreBackend> = Arc::new(seed_tenant_det().await);
@@ -1011,4 +1021,235 @@ async fn zero_bucket_concurrency_is_refused_typed() {
         .downcast_ref::<CompactTenantError>()
         .expect("typed CompactTenantError");
     assert_eq!(*typed, CompactTenantError::ZeroBucketConcurrency);
+}
+
+/// One fixture closing three spec properties at once, over the 4-bucket corpus
+/// (both hours sealed via `--max-flush-lifetime 0s`) at `--bucket-concurrency 2`:
+///
+/// - shard 0's OLD-hour bucket (walk index 0) is rigged to FAIL (a `FaultStore`
+///   Permanent error on every PUT under its path), and it is dispatched in the
+///   first N=2 batch, so it fails early and frees a slot before the walk ends.
+/// - shard 0's NEW-hour bucket (walk index 1) has its FIRST GET HELD by a
+///   `FaultStore` gate, so it cannot complete until the test releases it. It is
+///   also in the first batch. The test releases it only AFTER both shard-1
+///   buckets (walk indices 2 and 3, dispatched by the refill path once the
+///   failed bucket freed its slot) have already published. So completion order
+///   is provably 0, 2, 3, 1 -- index 1 finishes LAST -- while walk order is
+///   0, 1, 2, 3.
+///
+/// (a) The captured per-bucket lines are in walk order (shard then hour) despite
+///     that differing completion order: contiguous-prefix streaming holds index
+///     1's line (and, behind it, 2 and 3) until index 1 completes, then flushes
+///     all three in order.
+/// (b) The failed bucket prints its OWN line in the exact `shard={} hour={}
+///     outcome=Failed error=...` shape carrying its typed error, not only the
+///     aggregate.
+/// (c) The refill path works across a failed join: indices 2 and 3, dispatched
+///     only after index 0's failed join freed a slot, both start and publish.
+///
+/// Prove-the-test (each flip names the line it breaks):
+/// - Drop the contiguous-prefix drain in `run_bucket_walk` (emit in completion
+///   order instead): the captured lines become 0, 2, 3, 1, so `lines[1]` is
+///   `shard=1 hour={HOUR_OLD} ...` and the `lines[1]` walk-order assertion fails.
+/// - Break the Failed line shape in `emit_bucket_outcome` (e.g. drop the
+///   `error={err}` tail): the `lines[0]` Failed-shape assertion fails.
+/// - Abort the walk on the first `Err` (propagate with `?` and drop the
+///   `JoinSet` instead of capturing the slot): indices 2 and 3 are never spawned,
+///   so `bucket_output(1, HOUR_OLD)` stays `(0, 0)` and the refill assertion
+///   fails (and the released index-1 bucket is aborted, never publishing).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn streaming_preserves_walk_order_across_out_of_order_completion() {
+    let mem = seed_tenant_det().await;
+    // Fail every PUT under shard 0's OLD-hour bucket: walk index 0 fails on its
+    // first L1-part PUT.
+    let failed_path = format!("/{:04}/{}/", 0, keys::ingest_hour_string(HOUR_OLD));
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(
+            Op::Put,
+            ScriptedFault::Permanent("injected compaction fault".into()),
+        )
+        .with_key_contains(failed_path),
+    );
+    let fault = FaultStore::new(mem, plan);
+    // Hold the FIRST GET under shard 0's NEW-hour bucket (walk index 1), so that
+    // bucket parks until released. Nth(1) holds only the first match, so later
+    // reads (including the test's own `bucket_output` probes) pass through.
+    let held_path = format!("/{:04}/{}/", 0, keys::ingest_hour_string(HOUR_OLD + 1));
+    let gate = fault.hold(Op::Get, Some(held_path), Occurrence::Nth(1));
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(fault);
+
+    let mut out: Vec<u8> = Vec::new();
+    let walk = compact_tenant_to(
+        &mut out,
+        store.clone(),
+        MEMORY,
+        TENANT,
+        SignalArg::Logs,
+        Some(SHARDS),
+        None,
+        None,
+        false,
+        // Seal both hours so all four buckets are compacted (bar the rigged one).
+        Some(0),
+        None,
+        None,
+        None,
+        2,
+        now_ns(),
+    );
+
+    let releaser = async {
+        // Wait until index 1's first GET is parked on the gate.
+        gate.wait_until_held(1).await;
+        // Let the two shard-1 buckets (refilled after index 0's failed join)
+        // run to completion while index 1 stays parked.
+        loop {
+            let s1_old = bucket_output(store.as_ref(), 1, HOUR_OLD).await;
+            let s1_new = bucket_output(store.as_ref(), 1, HOUR_OLD + 1).await;
+            if s1_old == (1, 1) && s1_new == (1, 1) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        // Completion order provably differs from walk order at this instant:
+        // the later-walk-order shard-1 buckets have published, but index 1
+        // (walk-order second) has not, because it is still held.
+        assert_eq!(
+            bucket_output(store.as_ref(), 0, HOUR_OLD + 1).await,
+            (0, 0),
+            "held bucket (walk index 1) must not have completed while later-walk-order buckets did"
+        );
+        let held = gate.held();
+        assert_eq!(held.len(), 1, "exactly index 1's GET is held");
+        assert!(gate.release(held[0]), "releasing the held GET succeeds");
+    };
+
+    let (result, ()) = tokio::join!(walk, releaser);
+
+    // The run exits non-zero: one bucket failed.
+    let err = result.expect_err("a failed bucket makes the run exit non-zero");
+    match err
+        .downcast_ref::<CompactTenantError>()
+        .expect("typed BucketsFailed")
+    {
+        CompactTenantError::BucketsFailed {
+            failed, succeeded, ..
+        } => {
+            assert_eq!(*failed, 1);
+            assert_eq!(*succeeded, 3);
+        }
+        other => panic!("expected BucketsFailed, got {other:?}"),
+    }
+
+    let text = String::from_utf8(out).expect("output is utf-8");
+    let lines: Vec<&str> = text.lines().filter(|l| l.starts_with("shard=")).collect();
+    assert_eq!(lines.len(), 4, "one per-bucket line each: {text}");
+
+    // (a) Emitted in walk order (shard then hour), NOT completion order 0,2,3,1.
+    assert!(
+        lines[0].starts_with(&format!("shard=0 hour={HOUR_OLD} outcome=")),
+        "line 0 is shard 0's old hour: {}",
+        lines[0]
+    );
+    assert!(
+        lines[1].starts_with(&format!("shard=0 hour={} outcome=", HOUR_OLD + 1)),
+        "line 1 is shard 0's new hour despite completing last: {}",
+        lines[1]
+    );
+    assert!(
+        lines[2].starts_with(&format!("shard=1 hour={HOUR_OLD} outcome=")),
+        "line 2 is shard 1's old hour: {}",
+        lines[2]
+    );
+    assert!(
+        lines[3].starts_with(&format!("shard=1 hour={} outcome=", HOUR_OLD + 1)),
+        "line 3 is shard 1's new hour: {}",
+        lines[3]
+    );
+
+    // (b) The failed bucket's own line, exact shape, carrying its typed error.
+    assert!(
+        lines[0].starts_with(&format!("shard=0 hour={HOUR_OLD} outcome=Failed error=")),
+        "failed bucket prints its own Failed line: {}",
+        lines[0]
+    );
+    assert!(
+        lines[0].contains("injected compaction fault"),
+        "the failed bucket's typed error rides its line: {}",
+        lines[0]
+    );
+    // The three survivors each print a Compacted line, exact shape.
+    assert_eq!(
+        lines[1],
+        format!(
+            "shard=0 hour={} outcome=Compacted parts=1 publish=Published",
+            HOUR_OLD + 1
+        )
+    );
+    assert_eq!(
+        lines[2],
+        format!("shard=1 hour={HOUR_OLD} outcome=Compacted parts=1 publish=Published")
+    );
+    assert_eq!(
+        lines[3],
+        format!(
+            "shard=1 hour={} outcome=Compacted parts=1 publish=Published",
+            HOUR_OLD + 1
+        )
+    );
+
+    // (c) Refill across the failed join: indices 2 and 3 (dispatched only after
+    // index 0's failed join freed a slot) both published; the held index 1
+    // published after release; the failed index 0 published nothing.
+    assert_eq!(
+        bucket_output(store.as_ref(), 1, HOUR_OLD).await,
+        (1, 1),
+        "refill bucket (walk index 2) published"
+    );
+    assert_eq!(
+        bucket_output(store.as_ref(), 1, HOUR_OLD + 1).await,
+        (1, 1),
+        "refill bucket (walk index 3) published"
+    );
+    assert_eq!(
+        bucket_output(store.as_ref(), 0, HOUR_OLD + 1).await,
+        (1, 1),
+        "held bucket (walk index 1) published after release"
+    );
+    assert_eq!(
+        bucket_output(store.as_ref(), 0, HOUR_OLD).await,
+        (0, 0),
+        "failed bucket (walk index 0) published nothing"
+    );
+}
+
+/// F8 (ADR-0979 whole-box sizing under concurrency): with no operator-configured
+/// merge cursor budget, each concurrent bucket's `CompactorConfig` carries a
+/// per-bucket SHARE of the default 20 GiB budget, `DEFAULT_MERGE_CURSOR_BUDGET_BYTES
+/// / N` (integer floor), so N buckets' merges still fit the one reference box the
+/// default was sized against. This pins the exact figure each bucket receives.
+///
+/// Prove-the-test: change the divisor in `per_bucket_config` from `concurrency`
+/// to `1` (no division) and the N=4 assertion fails (5 GiB expected, 20 GiB
+/// seen); change the expected `/ 4` here to `/ 2` and it fails too.
+#[test]
+fn per_bucket_merge_budget_is_the_default_divided_by_n() {
+    let base = CompactorConfig::default();
+    // N=1 is unchanged: the full default budget.
+    assert_eq!(
+        per_bucket_config(&base, 1).merge_cursor_budget_bytes,
+        DEFAULT_MERGE_CURSOR_BUDGET_BYTES,
+        "N=1 carries the full default budget"
+    );
+    // N=4 splits it exactly four ways (20 GiB / 4 = 5 GiB).
+    assert_eq!(
+        per_bucket_config(&base, 4).merge_cursor_budget_bytes,
+        DEFAULT_MERGE_CURSOR_BUDGET_BYTES / 4,
+        "each of four concurrent buckets holds a quarter of the default budget"
+    );
+    // A fresh per-bucket tracker is installed (never the shared base tracker).
+    assert!(
+        per_bucket_config(&base, 4).merge_memory_tracker.is_some(),
+        "each bucket carries its own tracker"
+    );
 }
