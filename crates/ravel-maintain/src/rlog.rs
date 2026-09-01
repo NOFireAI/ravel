@@ -156,7 +156,9 @@
 //! closes on whichever target is reached first. With the shipped defaults (both
 //! 256 MiB) the memory split target still fires first on every real schema and
 //! the payload proxy never reaches 256 MiB, so no probe runs and this split is
-//! behaviour-neutral until an operator lowers the stored target to grow objects.
+//! behaviour-neutral until an operator lowers the stored target below the size
+//! the memory split target already yields. Lowering it caps objects lower;
+//! growing them means raising `l1_part_memory_target_bytes`.
 //!
 //! The first RLOG merge held every input object whole (RLOG then had no ranged
 //! section reader); [`ravel_logseg::open_from_suffix`] is now the RLOG analogue
@@ -916,6 +918,12 @@ impl PartSink<'_> {
                 // encodes a clone of the buffered records, so the builder can
                 // keep accumulating when the part is not yet full.
                 let (object, stats) = part.encode_clone(self.input_set_hash, self.part_index)?;
+                if let Some(t) = self.tracker {
+                    // Counted whether or not it closes the part: this is the
+                    // O(part) encode the stored target costs, and "no probe runs
+                    // at the shipped defaults" is a claim a test asserts on.
+                    t.note_probe_run();
+                }
                 let encoded = object.len() as u64;
                 if encoded >= self.config.max_l1_part_bytes {
                     stored_close = Some((object, stats));
@@ -1004,10 +1012,15 @@ impl PartSink<'_> {
 /// proxy axis. A probe encodes the whole part (an O(part) cost), so the
 /// scheduler in [`PartBuilder::schedule_next_probe`] aims the next one near the
 /// target rather than running one per record; this floor keeps a momentarily
-/// flat encoded/proxy rate from scheduling the next probe in the past. It also
-/// bounds how far a part overshoots the stored target: a closing probe fires at
-/// most one interval's worth of records past the crossing, the same
-/// at-most-one-unit discipline the memory split target has (issue #711).
+/// flat encoded/proxy rate from scheduling the next probe in the past.
+///
+/// It is also the width of the stored target's overshoot band. The scheduler
+/// never aims a probe past the proxy value where the part would reach the target
+/// at the densest encoded-per-proxy rate it has already measured (and never
+/// assumes a rate below 1:1), so between two probes the encoded size can grow by
+/// at most the remaining deficit plus this floor plus the last record's proxy
+/// charge -- see [`PartBuilder::schedule_next_probe`] for the derivation and for
+/// what the band is conditional on.
 const PROBE_MIN_STEP_BYTES: u64 = 4096;
 
 /// One in-progress L1 part: the merged records buffered in canonical order, the
@@ -1048,6 +1061,20 @@ struct PartBuilder {
     /// past a probe that found the part still short of the target, so probing is
     /// a few encodes per part, not one per record.
     next_probe_stored: u64,
+    /// `stored_estimate` as of the last probe (0 before the first): the left edge
+    /// of the interval [`Self::schedule_next_probe`] measures the MARGINAL
+    /// encoded-per-proxy rate over. A cumulative rate (encoded/proxy since the
+    /// part opened) is the wrong estimator for a part whose compressibility
+    /// changes along the record sequence, which is the case that overshoots.
+    last_probe_stored: u64,
+    /// Encoded object bytes the last probe measured (0 before the first), the
+    /// other end of that interval.
+    last_probe_encoded: u64,
+    /// The densest encoded-per-proxy rate any probe interval of this part has
+    /// shown. The scheduler assumes the next interval runs at least this dense
+    /// (and never below 1:1), which is what bounds the overshoot; see
+    /// [`Self::schedule_next_probe`].
+    max_probe_rate: f64,
     /// The streams whose STREAM_DIR entry this part has already been charged for
     /// in `stored_estimate`. A set rather than a "did the stream change" check so
     /// the charge is once per distinct stream whatever order records arrive in;
@@ -1068,6 +1095,9 @@ impl PartBuilder {
             estimate: 0,
             stored_estimate: 0,
             next_probe_stored: 0,
+            last_probe_stored: 0,
+            last_probe_encoded: 0,
+            max_probe_rate: 1.0,
             charged_streams: BTreeSet::new(),
             min_stream: None,
             max_stream: None,
@@ -1157,22 +1187,62 @@ impl PartBuilder {
     }
 
     /// Schedule the next stored-target probe after one found the part still
-    /// short of the target. Models encoded size as ~linear in the payload proxy
-    /// and aims the next probe at the proxy value where the encoded size should
-    /// reach `target`, so a part converges to the target in a few probes even
-    /// when the compression ratio is large, rather than encoding once per
-    /// record. The step is floored at [`PROBE_MIN_STEP_BYTES`] so a momentarily
-    /// flat rate cannot schedule the probe in the past.
+    /// short of the target, and bound how far past the target the part can then
+    /// close.
+    ///
+    /// The step is the proxy distance to the next probe. Two things set it:
+    ///
+    /// - a CAP, which is what bounds the overshoot. The step never exceeds the
+    ///   deficit divided by [`Self::max_probe_rate`], the densest
+    ///   encoded-per-proxy rate any interval of this part has shown, held at 1:1
+    ///   or above. So if the records over the next interval encode at that rate,
+    ///   the part lands exactly on the target; they have to encode DENSER than
+    ///   every interval so far to go past it.
+    /// - the [`PROBE_MIN_STEP_BYTES`] floor, so a part whose deficit is a
+    ///   handful of bytes does not encode once per record.
+    ///
+    /// The band that follows: a probe found `encoded_now < target`, the next one
+    /// fires at the first record on or after `stored_estimate + step`, so the
+    /// proxy advances by at most `step` plus that record's own charge, and the
+    /// encoded size by at most that interval's rate times that. While that rate
+    /// stays at or below [`Self::max_probe_rate`] the close lands in
+    /// `[target, target + PROBE_MIN_STEP_BYTES + one record's proxy charge]`, and
+    /// the same arithmetic bounds a trailing part (its records simply run out
+    /// before the next probe). It is conditional on that rate assumption, which
+    /// holds for the sections the proxy models -- the payload columns and
+    /// STREAM_DIR, where the proxy counts uncompressed bytes and the object
+    /// stores compressed ones -- and not on the ones it does not (POSTINGS,
+    /// SKIP_IDX, PAGE_DIR). It is not the "one record" tightness the memory
+    /// split target has, and the rate model inside the cap is an estimate, never
+    /// a guarantee: without the cap, a compressible prefix followed by an
+    /// incompressible suffix closes tens of times past the target.
+    ///
+    /// The cost of the cap is probes: a part converges on the target from below
+    /// in steps of the remaining deficit, so a stream whose payload compresses
+    /// `r`-fold takes on the order of `r` encodes per part rather than the two
+    /// or three an uncapped rate model would take. That cost is only paid when
+    /// an operator lowers `max_l1_part_bytes` below the memory split target; at
+    /// the shipped defaults no probe runs at all.
     fn schedule_next_probe(&mut self, encoded_now: u64, target: u64) {
         let deficit = target.saturating_sub(encoded_now);
-        // Encoded bytes produced per unit of payload proxy so far. A probe only
-        // runs once `stored_estimate >= target > 0` and an encoded part is never
-        // empty, so `encoded_now` and `stored_estimate` are both positive; the
-        // clamp guards the ratio against a degenerate zero rather than being a
-        // live case.
-        let rate = (encoded_now as f64 / self.stored_estimate.max(1) as f64).max(f64::MIN_POSITIVE);
-        let step = ((deficit as f64) / rate).ceil() as u64;
+        // The rate over THIS interval, not since the part opened. Both ends are
+        // measured quantities: `d_proxy` is at least PROBE_MIN_STEP_BYTES after
+        // the first probe and at least `target` at it, so the `max(1)` guards a
+        // degenerate zero rather than being a live case.
+        let d_proxy = self
+            .stored_estimate
+            .saturating_sub(self.last_probe_stored)
+            .max(1);
+        let d_encoded = encoded_now.saturating_sub(self.last_probe_encoded);
+        let marginal = d_encoded as f64 / d_proxy as f64;
+        if marginal > self.max_probe_rate {
+            self.max_probe_rate = marginal;
+        }
+        // `max_probe_rate` starts at 1.0 and only grows, so `step <= deficit`.
+        let step = ((deficit as f64) / self.max_probe_rate).ceil() as u64;
         let step = step.max(PROBE_MIN_STEP_BYTES);
+        self.last_probe_stored = self.stored_estimate;
+        self.last_probe_encoded = encoded_now;
         self.next_probe_stored = self.stored_estimate.saturating_add(step);
     }
 }
@@ -3953,13 +4023,19 @@ mod tests {
     /// this corpus reaches in heap), so the stored target is the only thing that
     /// can fire.
     ///
-    /// The band is exact from the fixture, never merely `> 0`: a part closes the
-    /// moment a probe shows its object reaching `STORED_TARGET`, and probes are
-    /// spaced at least [`PROBE_MIN_STEP_BYTES`] of payload proxy apart, whose
-    /// records encode to fewer than that many object bytes (the proxy is an upper
-    /// bound over the compressed sections). So every stored-closed part sits in
-    /// `[STORED_TARGET, STORED_TARGET + PROBE_MIN_STEP_BYTES]`; only the trailing
-    /// part, closed by `finish` on the remainder, sits below.
+    /// The band is exact from the fixture, never merely `> 0`, and its width is
+    /// the scheduler's guarantee rather than this fixture's luck. A part closes
+    /// the moment a probe shows its object reaching `STORED_TARGET`. Probes sit
+    /// at least [`PROBE_MIN_STEP_BYTES`] of payload proxy apart, and
+    /// [`PartBuilder::schedule_next_probe`] never aims one further ahead than the
+    /// remaining deficit at the densest encoded-per-proxy rate the part has
+    /// measured (never assumed below 1:1), so between two probes the encoded size
+    /// grows by at most that deficit plus the floor plus the charge of the record
+    /// that crosses. Every part therefore sits in `[STORED_TARGET, STORED_TARGET
+    /// + PROBE_MIN_STEP_BYTES + one record's proxy charge]`. The trailing part
+    /// loses only the lower bound (its records run out before the next probe
+    /// rather than a probe closing it); the same upper bound covers it by the
+    /// same arithmetic, so it is asserted, not excused.
     ///
     /// Demonstrated red against the old proxy-as-close design: replace the probe
     /// block in `PartSink::push` with `over_stored = part.stored_estimate >=
@@ -3968,7 +4044,9 @@ mod tests {
     /// out `ratio` times smaller -- below `STORED_TARGET / 2` -- and the
     /// lower-bound assertion below fails. The `ratio` sub-assertion pins that
     /// this fixture's gap is well above 2, so the old design provably misses the
-    /// band low.
+    /// band low. This corpus is uniformly compressible, so it cannot show the
+    /// upper bound failing: the fixture that does is
+    /// [`stored_target_overshoot_is_bounded_when_compressibility_collapses`].
     #[tokio::test]
     async fn stored_target_closes_parts_on_actual_encoded_object_bytes() {
         const PER_INPUT: i64 = 2500;
@@ -3996,17 +4074,7 @@ mod tests {
         // above 2 is what puts the old design's parts (~STORED_TARGET / ratio)
         // below the STORED_TARGET/2 band floor.
         let sample: Vec<LogRecord> = (0..200).map(ratio_record).collect();
-        let proxy: u64 = sample.iter().map(estimate_stored_record).sum::<u64>()
-            + estimate_stored_stream(&ratio_record(0).stream_attrs);
-        let identity = compactor_identity(&bucket(), &CompactorConfig::default());
-        let mut w = RlogWriter::new(RlogConfig::default(), identity);
-        for r in &sample {
-            w.push(r.clone()).expect("push");
-        }
-        let object_len = w
-            .finish_compacted(1, vec![0u8; 32], 0)
-            .expect("encode")
-            .len() as u64;
+        let (proxy, object_len) = proxy_and_object_bytes(&sample);
         let ratio = proxy as f64 / object_len as f64;
         assert!(
             ratio > 2.0,
@@ -4043,26 +4111,37 @@ mod tests {
             "every closed part (all but the trailing one) closed on the stored target"
         );
 
-        // The geometry band: every non-final part reached the target, and none
-        // ran more than one probe interval past it. The lower bound is the
-        // target itself, which the old proxy-close (object ~ STORED_TARGET /
-        // ratio) could not clear.
+        // The geometry band: every non-final part reached the target, and no
+        // part -- trailing one included -- ran past the scheduler's overshoot
+        // bound. The upper edge is the probe-spacing floor plus the proxy charge
+        // of one record (the granularity at which a probe can fire), computed
+        // from the fixture rather than guessed; the lower edge is the target
+        // itself, which the old proxy-close (object ~ STORED_TARGET / ratio)
+        // could not clear.
+        let max_record_charge = estimate_stored_record(&ratio_record(0))
+            + estimate_stored_stream(&ratio_record(0).stream_attrs);
+        let band_top = STORED_TARGET + PROBE_MIN_STEP_BYTES + max_record_charge;
+        println!(
+            "[geom:rlog #872] target={STORED_TARGET}B parts={} probes={} band_top={band_top}B \
+             sizes={:?}",
+            parts.len(),
+            tracker.probes_run(),
+            rec.parts.iter().map(|p| p.object_size).collect::<Vec<_>>()
+        );
         let last = parts.len() - 1;
         for (i, p) in rec.parts.iter().enumerate() {
-            if i == last {
+            assert!(
+                p.object_size > 0 && p.object_size <= band_top,
+                "part {i} of {} bytes ran past the overshoot bound {band_top} \
+                 (= {STORED_TARGET} + {PROBE_MIN_STEP_BYTES} + {max_record_charge})",
+                p.object_size
+            );
+            if i != last {
                 assert!(
-                    p.object_size > 0 && p.object_size <= STORED_TARGET + PROBE_MIN_STEP_BYTES,
-                    "trailing part of {} bytes out of band",
-                    p.object_size
-                );
-            } else {
-                assert!(
-                    p.object_size >= STORED_TARGET
-                        && p.object_size <= STORED_TARGET + PROBE_MIN_STEP_BYTES,
-                    "part {i} of {} bytes is outside [{STORED_TARGET}, {}] -- the stored \
+                    p.object_size >= STORED_TARGET,
+                    "part {i} of {} bytes is below {STORED_TARGET} -- the stored \
                      target must close on real object bytes, not {}x-smaller payload",
                     p.object_size,
-                    STORED_TARGET + PROBE_MIN_STEP_BYTES,
                     ratio as u64
                 );
             }
@@ -4085,6 +4164,208 @@ mod tests {
         assert_eq!(
             split_rows, baseline,
             "the decoded record sequence must be identical whatever the split"
+        );
+    }
+
+    /// Body bytes every [`collapsing_record`] carries, compressible or not. Equal
+    /// widths keep the payload proxy advancing at exactly the same rate on both
+    /// sides of the switch, so the fixture's only variable is how many object
+    /// bytes those proxy bytes turn into. 13 * 20: the filler's unit width.
+    const COLLAPSE_BODY_BYTES: usize = 260;
+
+    /// Record `i` of a corpus whose compressibility COLLAPSES at ordinal
+    /// `prefix`: below it a repeated filler zstd takes to almost nothing, from it
+    /// pseudo-random alphanumerics that do not compress.
+    ///
+    /// This is the adversarial shape for the probe scheduler. A rate model fitted
+    /// on the prefix concludes the part needs a very large number of further
+    /// payload bytes to reach the stored target; if the next probe may be aimed
+    /// that far ahead, every record of the incompressible suffix in between lands
+    /// in the same part.
+    fn collapsing_record(i: i64, prefix: i64) -> LogRecord {
+        let body = if i < prefix {
+            "compressible-".repeat(COLLAPSE_BODY_BYTES / 13)
+        } else {
+            incompressible_pad(i as u64, COLLAPSE_BODY_BYTES)
+        };
+        record(0, SPLIT_BASE_NS + i, &body, Vec::new())
+    }
+
+    /// Encode `recs` exactly as the merge encodes a part, and return
+    /// `(payload proxy bytes, object bytes)` for them.
+    fn proxy_and_object_bytes(recs: &[LogRecord]) -> (u64, u64) {
+        let proxy: u64 = recs.iter().map(estimate_stored_record).sum::<u64>()
+            + recs
+                .first()
+                .map_or(0, |r| estimate_stored_stream(&r.stream_attrs));
+        let identity = compactor_identity(&bucket(), &CompactorConfig::default());
+        let mut w = RlogWriter::new(RlogConfig::default(), identity);
+        for r in recs {
+            w.push(r.clone()).expect("push");
+        }
+        let object = w
+            .finish_compacted(1, vec![0u8; 32], 0)
+            .expect("encode")
+            .len() as u64;
+        (proxy, object)
+    }
+
+    /// Issue #872 finding 2: the stored target's overshoot is bounded by the
+    /// scheduler's DESIGN, not by a corpus happening to compress uniformly.
+    ///
+    /// A rate model on its own only says how far ahead the next probe should sit
+    /// to be worth running; it puts no ceiling on the object that probe then
+    /// measures. Fitted on a compressible prefix, the step it asks for is tens of
+    /// times the remaining deficit, and an incompressible suffix inside that step
+    /// closes a part many times over the target. What bounds
+    /// it is the cap in [`PartBuilder::schedule_next_probe`]: the step never
+    /// exceeds the remaining deficit at the densest encoded-per-proxy rate the
+    /// part has measured, and never assumes a rate below 1:1, so the encoded size
+    /// cannot pass the target by more than [`PROBE_MIN_STEP_BYTES`] plus the
+    /// proxy charge of the record that crosses -- the same band the uniform
+    /// fixture asserts, now over a corpus that breaks the rate model.
+    ///
+    /// Demonstrated red against the uncapped scheduler this replaced: restore the
+    /// cumulative rate and the uncapped step in `schedule_next_probe` --
+    /// `let rate = (encoded_now as f64 / self.stored_estimate.max(1) as f64)
+    /// .max(f64::MIN_POSITIVE); let step = ((deficit as f64) / rate).ceil() as
+    /// u64;` (dropping the `max_probe_rate` update, whose floor of 1.0 is the
+    /// cap) -- and this fixture emits 29 parts whose first object is 150_646
+    /// bytes, 9.2x the 16 KiB target, failing the band assertion below at part 0.
+    /// The remaining parts land between 16_853 and 18_893 bytes, inside the band,
+    /// which is why the assertion covers every part and not just the largest. The
+    /// uniformly compressible corpus of
+    /// [`stored_target_closes_parts_on_actual_encoded_object_bytes`] passes under
+    /// both schedulers, which is exactly why this fixture exists.
+    #[tokio::test]
+    async fn stored_target_overshoot_is_bounded_when_compressibility_collapses() {
+        const PER_INPUT: i64 = 2000;
+        const INPUTS: i64 = 2;
+        /// Ordinal where the corpus stops compressing. Enough compressible
+        /// payload ahead of it that the first part's early probes all land inside
+        /// it and fit a low rate (its 200 records charge the proxy 56_061 bytes,
+        /// 3.4 targets' worth, and encode to 1_220), and thousands of incompressible
+        /// records after it for that rate to be wrong about.
+        const PREFIX: i64 = 200;
+        const STORED_TARGET: u64 = 16 * 1024;
+        let total = (PER_INPUT * INPUTS) as u64;
+
+        let store = Arc::new(MemoryStore::new());
+        for j in 0..INPUTS {
+            let recs: Vec<LogRecord> = (0..PER_INPUT)
+                .map(|i| collapsing_record(i * INPUTS + j, PREFIX))
+                .collect();
+            seed(
+                store.as_ref(),
+                Uuid::from_u128(j as u128 + 1),
+                j as u64 + 1,
+                &recs,
+            )
+            .await;
+        }
+
+        // The collapse is real, measured in the quantity the scheduler fits: the
+        // encoded bytes each phase produces per payload proxy byte. Both samples
+        // are the same width and the same record count, so only compressibility
+        // differs.
+        const SAMPLE: i64 = 200;
+        let pre: Vec<LogRecord> = (0..SAMPLE).map(|i| collapsing_record(i, PREFIX)).collect();
+        let post: Vec<LogRecord> = (PREFIX..PREFIX + SAMPLE)
+            .map(|i| collapsing_record(i, PREFIX))
+            .collect();
+        let (pre_proxy, pre_object) = proxy_and_object_bytes(&pre);
+        let (post_proxy, post_object) = proxy_and_object_bytes(&post);
+        assert_eq!(
+            pre_proxy, post_proxy,
+            "both phases must charge the same proxy"
+        );
+        let pre_rate = pre_object as f64 / pre_proxy as f64;
+        let post_rate = post_object as f64 / post_proxy as f64;
+        println!(
+            "[geom:rlog #872] collapse proxy={pre_proxy}B pre_object={pre_object}B \
+             post_object={post_object}B pre_rate={pre_rate:.4} post_rate={post_rate:.4}"
+        );
+        assert!(
+            post_rate > 10.0 * pre_rate,
+            "fixture must collapse: pre_rate {pre_rate:.4} vs post_rate {post_rate:.4} is \
+             only {:.1}x, too flat to break a rate model",
+            post_rate / pre_rate
+        );
+
+        let tracker = MergeMemoryTracker::new();
+        let config = CompactorConfig {
+            max_l1_part_bytes: STORED_TARGET,
+            merge_memory_tracker: Some(tracker.clone()),
+            ..CompactorConfig::default()
+        };
+        let clock = FixedClock::new(sealed_now_ns());
+        compact_bucket(store.as_ref(), &clock, &config, &bucket())
+            .await
+            .expect("compact");
+
+        let (rec, parts) = read_output(store.as_ref()).await;
+        assert_eq!(
+            tracker.memory_target_flushes(),
+            0,
+            "the memory split target is at its 256 MiB default and must not fire"
+        );
+        assert_eq!(
+            tracker.stored_target_flushes() as usize,
+            parts.len() - 1,
+            "every closed part must have closed on the stored target"
+        );
+        assert!(
+            tracker.probes_run() > 0,
+            "the fixture must actually exercise the probe scheduler"
+        );
+
+        // The band, identical to the uniform fixture's because it is the
+        // scheduler's guarantee and not the corpus's: the probe-spacing floor
+        // plus one record's proxy charge above the target. Every part is checked,
+        // trailing one included.
+        let max_record_charge = estimate_stored_record(&collapsing_record(PREFIX, PREFIX))
+            + estimate_stored_stream(&collapsing_record(0, PREFIX).stream_attrs);
+        let band_top = STORED_TARGET + PROBE_MIN_STEP_BYTES + max_record_charge;
+        let sizes: Vec<u64> = rec.parts.iter().map(|p| p.object_size).collect();
+        let largest = sizes.iter().copied().max().unwrap_or(0);
+        println!(
+            "[geom:rlog #872] collapse target={STORED_TARGET}B parts={} probes={} \
+             band_top={band_top}B largest={largest}B",
+            parts.len(),
+            tracker.probes_run()
+        );
+        assert!(
+            parts.len() >= 4,
+            "fixture must split several times, got {}",
+            parts.len()
+        );
+        let last = parts.len() - 1;
+        for (i, p) in rec.parts.iter().enumerate() {
+            assert!(
+                p.object_size > 0 && p.object_size <= band_top,
+                "part {i} of {} bytes ran past the overshoot bound {band_top} \
+                 (= {STORED_TARGET} + {PROBE_MIN_STEP_BYTES} + {max_record_charge}); \
+                 sizes {sizes:?}",
+                p.object_size
+            );
+            if i != last {
+                assert!(
+                    p.object_size >= STORED_TARGET,
+                    "non-final part {i} of {} bytes did not reach the target",
+                    p.object_size
+                );
+            }
+        }
+
+        // Content is conserved across the collapse boundary too.
+        let mut split_rows: Vec<LogRecord> = Vec::new();
+        for p in &parts {
+            split_rows.extend(decode_all(p));
+        }
+        assert_eq!(
+            split_rows.len() as u64,
+            total,
+            "every record survives the split exactly once"
         );
     }
 
@@ -4319,6 +4600,109 @@ mod tests {
         );
     }
 
+    /// Issue #872: at the shipped defaults NO exact-encode probe runs. The
+    /// "geometry is unchanged" argument for shipping equal targets rests on that
+    /// claim, and the equal-geometry test above cannot see it: a probe that runs
+    /// and finds the part short changes no object byte, it just spends an O(part)
+    /// encode. So this asserts the probe counter directly.
+    ///
+    /// The relationship under test is the shipped one -- both targets equal --
+    /// scaled to 64 KiB each so a small corpus reaches it. Why it holds is the
+    /// two estimators, not this corpus: `estimate_record` charges strictly more
+    /// per record than `estimate_stored_record`, term for term (the same payload
+    /// lengths plus `ALLOC_OVERHEAD_BYTES` per allocation, `RECORD_SLOT_BYTES` =
+    /// `size_of::<LogRecord>()` against the proxy's flat
+    /// `STORED_RECORD_FIXED_BYTES`, and a per-record copy of `stream_attrs` the
+    /// proxy charges once per stream instead). With equal targets the heap sum
+    /// therefore crosses first on every record shape, the part closes on the
+    /// memory split target, the proxy never reaches `max_l1_part_bytes`, and the
+    /// probe is never even scheduled. The per-record figures are asserted below
+    /// on two fixtures of opposite shape (wide rows, and the compressible
+    /// single-stream row the stored-target tests use), so an estimator change
+    /// that inverts the inequality fails here rather than silently starting to
+    /// probe at the defaults.
+    ///
+    /// Demonstrated red by probing early: in `PartSink::push`, relax the probe
+    /// gate to `part.stored_estimate >= self.config.max_l1_part_bytes / 8`. The
+    /// geometry is untouched -- 15 parts and 14 memory-target closes either way,
+    /// since a probe that finds the part short changes nothing -- and
+    /// `probes_run` goes from 0 to 14, so the counter assertion below is the only
+    /// thing in the suite that catches it.
+    #[tokio::test]
+    async fn no_probe_runs_when_both_targets_are_equal() {
+        const PER_INPUT: i64 = 400;
+        const INPUTS: i64 = 2;
+        /// The shipped defaults are equal (256 MiB each); this is that same
+        /// relationship at a size an 800-record corpus reaches.
+        const BOTH: u64 = 64 * 1024;
+        assert_eq!(
+            crate::config::DEFAULT_MAX_L1_PART_BYTES,
+            crate::config::DEFAULT_L1_PART_MEMORY_TARGET_BYTES,
+            "this test stands in for the shipped defaults, which are equal"
+        );
+
+        for (name, mk) in [
+            ("wide", wide_record as fn(i64) -> LogRecord),
+            ("ratio", ratio_record as fn(i64) -> LogRecord),
+        ] {
+            let heap = estimate_record(&mk(0));
+            let stored =
+                estimate_stored_record(&mk(0)) + estimate_stored_stream(&mk(0).stream_attrs);
+            assert!(
+                heap > stored,
+                "{name}: the memory target can only fire first if the heap charge {heap} \
+                 exceeds the proxy charge {stored} per record"
+            );
+        }
+
+        let store = Arc::new(MemoryStore::new());
+        for j in 0..INPUTS {
+            let recs: Vec<LogRecord> = (0..PER_INPUT)
+                .map(|i| wide_record(i * INPUTS + j))
+                .collect();
+            seed(
+                store.as_ref(),
+                Uuid::from_u128(j as u128 + 1),
+                j as u64 + 1,
+                &recs,
+            )
+            .await;
+        }
+
+        let tracker = MergeMemoryTracker::new();
+        let config = CompactorConfig {
+            l1_part_memory_target_bytes: BOTH,
+            max_l1_part_bytes: BOTH,
+            merge_memory_tracker: Some(tracker.clone()),
+            ..CompactorConfig::default()
+        };
+        let clock = FixedClock::new(sealed_now_ns());
+        compact_bucket(store.as_ref(), &clock, &config, &bucket())
+            .await
+            .expect("compact");
+
+        let (_rec, parts) = read_output(store.as_ref()).await;
+        assert!(parts.len() > 1, "the fixture must split");
+        assert_eq!(
+            tracker.memory_target_flushes() as usize,
+            parts.len() - 1,
+            "every closed part must have closed on the memory split target"
+        );
+        assert_eq!(
+            tracker.stored_target_flushes(),
+            0,
+            "the stored target must not fire when the targets are equal"
+        );
+        assert_eq!(
+            tracker.probes_run(),
+            0,
+            "no exact-encode probe may run when the memory target fires first: \
+             {} parts, {} memory flushes",
+            parts.len(),
+            tracker.memory_target_flushes()
+        );
+    }
+
     /// Issue #872 constraint: raising the stored target far above the memory
     /// bound does not weaken the memory split target. With the stored target at
     /// `u64::MAX` the memory split target is the only thing that can close a part, so
@@ -4390,11 +4774,32 @@ mod tests {
     /// simultaneously while at concurrency 1 only ever 1 is. Without the
     /// fan-out the `wait_until_held(8)` below never returns and the test hangs
     /// rather than passing vacuously.
+    ///
+    /// Run at BOTH split targets (issue #872), because the two close paths write
+    /// the object differently: a memory-target close consumes the builder's
+    /// records into a fresh writer, while a stored-target close reuses the bytes
+    /// an exact-encode probe already produced. Byte-identity across concurrency
+    /// has to hold on both, and it is the probe-reuse path -- where the object
+    /// comes from an encode taken at a moment the concurrency could in principle
+    /// influence -- that most needs saying. Each run asserts which target fired,
+    /// so neither config can silently fall back to the other and cover the same
+    /// path twice: give the `SplitOn::Memory` arm the stored config
+    /// (`max_l1_part_bytes: 8 * 1024`) and it fails with "memory mode closed 0 on
+    /// memory and 3 on stored" rather than passing on a duplicated path.
     #[tokio::test]
     async fn input_read_concurrency_changes_timing_not_bytes() {
         const INPUTS: u64 = 16;
 
-        async fn compact_at(concurrency: usize) -> (Vec<[u8; 32]>, usize) {
+        /// Which target the run under test closes its parts on.
+        #[derive(Copy, Clone, Debug)]
+        enum SplitOn {
+            /// The memory split target: closes by consuming the builder.
+            Memory,
+            /// The stored-size target: closes on the bytes a probe measured.
+            Stored,
+        }
+
+        async fn compact_at(concurrency: usize, split: SplitOn) -> (Vec<[u8; 32]>, usize) {
             let store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
             for j in 0..INPUTS {
                 let recs: Vec<LogRecord> = (0..40i64)
@@ -4412,15 +4817,24 @@ mod tests {
             // Hold every commit-record GET (".cmt" names commit records and
             // nothing else) so the in-flight count is observable.
             let gate = store.hold(Op::Get, Some(".cmt".to_string()), Occurrence::Always);
-            // Split on the memory target: wide records are far larger in heap
-            // than on the object, so this reliably produces several parts, and
-            // (unlike the stored target) needs no encoded-size probe. The point
-            // under test is byte-identity across concurrency, not which target
-            // fires.
-            let config = CompactorConfig {
-                l1_part_memory_target_bytes: 64 * 1024,
-                input_read_concurrency: concurrency,
-                ..CompactorConfig::default()
+            // Wide records are far larger in heap than on the object, so a 64 KiB
+            // memory target and an 8 KiB stored target each split this corpus
+            // several times while leaving the other target far away, which is
+            // what the flush-counter assertions below check.
+            let tracker = MergeMemoryTracker::new();
+            let config = match split {
+                SplitOn::Memory => CompactorConfig {
+                    l1_part_memory_target_bytes: 64 * 1024,
+                    input_read_concurrency: concurrency,
+                    merge_memory_tracker: Some(tracker.clone()),
+                    ..CompactorConfig::default()
+                },
+                SplitOn::Stored => CompactorConfig {
+                    max_l1_part_bytes: 8 * 1024,
+                    input_read_concurrency: concurrency,
+                    merge_memory_tracker: Some(tracker.clone()),
+                    ..CompactorConfig::default()
+                },
             };
             let task = tokio::spawn({
                 let store = Arc::clone(&store);
@@ -4459,6 +4873,22 @@ mod tests {
 
             let (_rec, parts) = read_output(store.as_ref()).await;
             releaser.abort();
+            // The run really closed its parts on the target this config names,
+            // so neither mode can quietly exercise the other's close path.
+            let (memory, stored) = (
+                tracker.memory_target_flushes(),
+                tracker.stored_target_flushes(),
+            );
+            match split {
+                SplitOn::Memory => assert!(
+                    memory > 0 && stored == 0,
+                    "memory mode closed {memory} on memory and {stored} on stored"
+                ),
+                SplitOn::Stored => assert!(
+                    stored > 0 && memory == 0,
+                    "stored mode closed {stored} on stored and {memory} on memory"
+                ),
+            }
             let hashes = parts
                 .iter()
                 .map(|p| *blake3::hash(p).as_bytes())
@@ -4466,25 +4896,28 @@ mod tests {
             (hashes, peak_in_flight)
         }
 
-        let (serial_hashes, serial_in_flight) = compact_at(1).await;
-        let (concurrent_hashes, concurrent_in_flight) = compact_at(8).await;
+        for split in [SplitOn::Memory, SplitOn::Stored] {
+            let (serial_hashes, serial_in_flight) = compact_at(1, split).await;
+            let (concurrent_hashes, concurrent_in_flight) = compact_at(8, split).await;
 
-        assert_eq!(
-            serial_in_flight, 1,
-            "concurrency 1 must never have two commit-record GETs in flight"
-        );
-        assert_eq!(
-            concurrent_in_flight, 8,
-            "concurrency 8 must hold exactly 8 commit-record GETs at once"
-        );
-        assert!(
-            serial_hashes.len() > 1,
-            "the fixture must split into several parts"
-        );
-        assert_eq!(
-            serial_hashes, concurrent_hashes,
-            "concurrent input reads must produce byte-identical parts"
-        );
+            assert_eq!(
+                serial_in_flight, 1,
+                "{split:?}: concurrency 1 must never have two commit-record GETs in flight"
+            );
+            assert_eq!(
+                concurrent_in_flight, 8,
+                "{split:?}: concurrency 8 must hold exactly 8 commit-record GETs at once"
+            );
+            assert!(
+                serial_hashes.len() > 1,
+                "{split:?}: the fixture must split into several parts, got {}",
+                serial_hashes.len()
+            );
+            assert_eq!(
+                serial_hashes, concurrent_hashes,
+                "{split:?}: concurrent input reads must produce byte-identical parts"
+            );
+        }
     }
 
     // --- bounded-memory k-way merge ------------------------------
@@ -4882,27 +5315,37 @@ mod tests {
     /// stream-boundary blocks, and the run splits into several parts on the
     /// memory split target.
     ///
-    /// The vector was REGENERATED for issue #872: the original pin was taken
-    /// under `max_l1_part_bytes: 4096` on commit 76c90a3 (the last commit before
-    /// the ADR-0979 D1 columnar-cursor swap), but #872 changed the stored-size
-    /// target to close a part on its ACTUAL encoded bytes rather than the payload
-    /// proxy, which moves every stored-target boundary the original pin used, so
-    /// those hashes are unreproducible. This run instead splits on the #711
-    /// memory split target, which neither D1 nor #872 touches; the pre-D1
-    /// record-level equivalence the original pin guarded now rests on
-    /// [`streaming_merge_output_is_byte_identical_to_stable_sort_order`] and
-    /// [`admission_on_and_off_produce_identical_part_hashes`], and content
-    /// preservation across the moved #872 boundaries on
-    /// [`stored_target_closes_parts_on_actual_encoded_object_bytes`]'s
-    /// decode-equality check.
+    /// The vector is a RE-CAPTURE, not a regeneration from the code under
+    /// review. The original pin was taken under `max_l1_part_bytes: 4096`, a
+    /// stored-target split, and issue #872 moved every stored-target boundary by
+    /// closing on actual encoded bytes instead of the payload proxy, so those
+    /// constants are genuinely unreproducible. Rather than accept whatever the
+    /// new code prints, the fixture was ported back onto commit 76c90a3 -- the
+    /// last commit before the ADR-0979 D1 columnar-cursor swap, where
+    /// `l1_part_memory_target_bytes` already existed -- in a scratch checkout,
+    /// run there with the config below (`l1_part_memory_target_bytes: 32 *
+    /// 1024`, `max_l1_part_bytes` at its 256 MiB default, which this corpus's
+    /// payload proxy never approaches), and the six hashes it printed there are
+    /// the six constants below. So this still compares the current merge against
+    /// the pre-D1 path's real bytes, now over the memory-target boundaries: the
+    /// memory-target close, the trailing-part close, and every part in between,
+    /// which is what the #872 change moved onto records plus a fresh writer at
+    /// close. The comparison is meaningful because `ravel-logseg` (the frozen
+    /// writer that turns a record set into bytes) has no commits between 76c90a3
+    /// and here, so a diff can only come from this crate.
+    ///
+    /// The stored-target geometry #872 introduced is pinned separately, by
+    /// [`stored_target_closes_parts_on_actual_encoded_object_bytes`] (band plus
+    /// decode-equality against a single-part baseline) and
+    /// [`stored_target_overshoot_is_bounded_when_compressibility_collapses`].
     #[tokio::test]
     async fn differential_part_hashes_match_the_pre_columnar_cursor() {
         /// Total records seeded across the three inputs: 4 streams x
         /// (30 + 1) + 4 x (30 + 1) + 4 x (40 + 1).
         const EXPECTED_ROWS: usize = 4 * 31 + 4 * 31 + 4 * 41;
-        /// Part `content_hash` values, in `part_index` order, as produced by the
-        /// current merge under a 32 KiB memory split target (see the note above
-        /// on why they were regenerated for issue #872).
+        /// Part `content_hash` values, in `part_index` order, as printed by this
+        /// fixture ported onto commit 76c90a3 under
+        /// `l1_part_memory_target_bytes: 32 * 1024` (see the note above).
         const EXPECTED_PART_HASHES: &[&str] = &[
             "853fb59210a344a2e656f6e1a29aa2feeeab0ec486373f3d37fd8975f74cb7ac",
             "dca4d7e8b9729de6c64f132fa1eb52028ab85de629d17e1f8b85d7b916c883a4",
