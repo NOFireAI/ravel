@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 520" font-family="'Segoe Print','Bradley Hand','Comic Sans MS',cursive" font-size="15">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 520" font-family="'Segoe Print','Bradley Hand','Comic Sans MS',cursive" font-size="15" role="img" aria-label="One snapshot, two admission rules from ADR-0073: a single query snapshot with the fold watermark separating the sealed hours from the recent, still-admitting hours.">
   <defs>
     <marker id="a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M 1 1.5 Q 6 4 8.5 5 Q 6 6 1 8.5" fill="none" stroke="#444" stroke-width="1.6" stroke-linecap="round"/>
