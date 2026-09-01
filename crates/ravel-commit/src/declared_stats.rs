@@ -28,9 +28,10 @@
 //!   of the predicate compare `null_count` against the segment's row count,
 //!   which no `DeclaredColumnMinMax` carries: for a stamp it is the carrying
 //!   record's own `sample_count` (`CommitRecord` field 11, `CompactionPart`
-//!   field 6). So [`decode`] stays carrier-agnostic and [`read_commit_record`]
-//!   and [`read_compaction_part`] are where those two clauses bind — and,
-//!   because those two clauses are exactly the row-count gate, they are the
+//!   field 6). So [`decode`] stays carrier-agnostic and [`read_commit_record`],
+//!   [`read_compaction_part`], and [`read_snapshot_entry_twin`] are where those
+//!   two clauses bind, and because those two clauses are exactly the row-count
+//!   gate, they are the
 //!   only functions that produce a [`ValidatedDeclaredStats`] (ADR-0873
 //!   decision 2, "where the predicate binds": coverage is unconstructable
 //!   without the full predicate).
@@ -49,36 +50,129 @@ use ravel_types::declared_stats::{
     DeclaredColumnStat, DeclaredStatError, DeclaredStatType, DeclaredStatValue,
 };
 
-/// Process-wide tally behind [`dropped_stamp_entries`].
-static DROPPED_STAMP_ENTRIES: AtomicU64 = AtomicU64::new(0);
+/// Which carrier a drop observation belongs to (ADR-0873 decision 2: the
+/// defect metric carries a carrier label, because "which writer do I look at"
+/// is the first question a nonzero value asks).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StatCarrier {
+    /// `CommitRecord.declared_column_stats` (field 20), read by
+    /// [`read_commit_record`]: a flush's own stamp.
+    CommitRecord,
+    /// `CompactionPart.declared_column_stats` (field 12), read by
+    /// [`read_compaction_part`]: a compaction or erasure-rewrite output part's
+    /// recomputed stamp.
+    CompactionPart,
+    /// `SnapshotEntry.declared_column_stats` (field 15), the fold's copy, read
+    /// through [`read_snapshot_entry_twin`].
+    SnapshotEntry,
+    /// The ADR-0850/0942 `.cstat` object's `ColumnStat` entries. Not a stamp
+    /// carrier and not read by this module at all: it is the second carrier of
+    /// the same statistics (ADR-0873 decision 4), its reader lives in
+    /// `ravel_sql`, and its refusals are reported here through
+    /// [`observe_declared_stat_drops`] so one metric covers both carriers of
+    /// one union.
+    Cstat,
+}
 
-/// How many declared-column stamp entries this process has dropped since it
-/// started: the ADR-0873 decision 2 defect metric, counted one per dropped
-/// entry.
+impl StatCarrier {
+    /// Every label, for a scrape that reports the whole set rather than only
+    /// the carriers that happened to move.
+    pub const ALL: [StatCarrier; 4] = [
+        StatCarrier::CommitRecord,
+        StatCarrier::CompactionPart,
+        StatCarrier::SnapshotEntry,
+        StatCarrier::Cstat,
+    ];
+
+    /// The stable metric label, in the dashed form ADR-0873 decision 2 names
+    /// the carriers in.
+    pub fn label(self) -> &'static str {
+        match self {
+            StatCarrier::CommitRecord => "commit-record",
+            StatCarrier::CompactionPart => "compaction-part",
+            StatCarrier::SnapshotEntry => "snapshot-entry",
+            StatCarrier::Cstat => "cstat",
+        }
+    }
+
+    /// Index into [`DROPS_OBSERVED`]. Private: the numbering is an
+    /// implementation detail of the tally, not part of the label contract.
+    fn index(self) -> usize {
+        match self {
+            StatCarrier::CommitRecord => 0,
+            StatCarrier::CompactionPart => 1,
+            StatCarrier::SnapshotEntry => 2,
+            StatCarrier::Cstat => 3,
+        }
+    }
+}
+
+/// Per-carrier tallies behind [`declared_stat_drops_observed`], indexed by
+/// [`StatCarrier::index`].
+static DROPS_OBSERVED: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// How many declared-column statistic drops this process has OBSERVED under
+/// `carrier` since it started: the ADR-0873 decision 2 defect metric.
 ///
-/// Every read route funnels through the one predicate pass, so this covers all
-/// three carriers: a commit record ([`read_commit_record`]), a compaction or
-/// erasure-rewrite part ([`read_compaction_part`]), and a snapshot entry
-/// (`ravel_catalog::read_snapshot_entry`, which reads its entries through the
-/// same pass). A nonzero value means a writer produced a stamp no reader will
-/// spend, which is a writer defect and not a query problem: the query merely
-/// scans. Absence of stamps never touches it -- an unstamped record is the
-/// permanent, legal state of everything written before ADR-0873.
+/// Observation semantics, and the name says so because the difference matters
+/// when reading the number. Each READ of a defective carrier increments this by
+/// that read's drop count, so one defective commit record read by a thousand
+/// queries is a thousand observations, not one defect. The magnitude therefore
+/// scales with query rate and states nothing about how many distinct defective
+/// entries exist; what it states is that a defect is still being read. Alert on
+/// "nonzero", and compare rates over equal windows, never magnitudes over
+/// windows of different query volume.
+///
+/// Per-entry deduplication is deliberately absent rather than pending: it would
+/// need unbounded state keyed by (object, column) on a path walked once per
+/// segment per query, which is a memory leak in exchange for a figure whose
+/// only use is "nonzero means investigate".
+///
+/// The label names the carrier the read was over, which is what points at a
+/// writer: `commit-record` and `compaction-part` are read here,
+/// `snapshot-entry` through [`read_snapshot_entry_twin`], and `cstat` is
+/// reported by `ravel_sql`'s `.cstat` reader through
+/// [`observe_declared_stat_drops`]. Absence of statistics never touches any
+/// label: an unstamped record is the permanent, legal state of everything
+/// written before ADR-0873, and a `.cstat` object that simply carries no entry
+/// for a column is the ordinary uncovered case.
 ///
 /// Monotonic and process-local, like every other in-process anomaly tally
 /// here: a scrape reads the delta between samples.
-pub fn dropped_stamp_entries() -> u64 {
-    DROPPED_STAMP_ENTRIES.load(Ordering::Relaxed)
+pub fn declared_stat_drops_observed(carrier: StatCarrier) -> u64 {
+    DROPS_OBSERVED[carrier.index()].load(Ordering::Relaxed)
 }
 
-/// Add `count` dropped entries to the defect metric. Called once per read
-/// pass, with the pass's whole drop count, so the metric moves by exactly the
-/// number of entries no reader will spend.
-fn record_dropped(count: usize) {
+/// The same metric summed over every carrier label, for a caller that wants the
+/// one-number "is anything defective at all" signal. Same observation
+/// semantics as [`declared_stat_drops_observed`], and the sum of a set of
+/// per-carrier reads that are not taken atomically together, so it is a
+/// snapshot for alerting and not an accounting identity.
+pub fn declared_stat_drops_observed_total() -> u64 {
+    StatCarrier::ALL
+        .iter()
+        .map(|carrier| declared_stat_drops_observed(*carrier))
+        .sum()
+}
+
+/// Record `count` drop observations under `carrier`.
+///
+/// Public because one carrier of the ADR-0873 decision 4 union is read outside
+/// this crate: `ravel_sql`'s `.cstat` reader refuses a duplicated column name
+/// and an entry whose extrema presence disagrees with its row accounting, and
+/// those refusals are the same defect class as a dropped stamp entry, under the
+/// [`StatCarrier::Cstat`] label. Call it once per refusal, at the site that
+/// refuses.
+pub fn observe_declared_stat_drops(carrier: StatCarrier, count: usize) {
     if count == 0 {
         return;
     }
-    DROPPED_STAMP_ENTRIES.fetch_add(count as u64, Ordering::Relaxed);
+    DROPS_OBSERVED[carrier.index()].fetch_add(count as u64, Ordering::Relaxed);
 }
 
 /// Why one `DeclaredColumnMinMax` entry was dropped on decode.
@@ -147,8 +241,9 @@ pub struct DroppedStatEntry {
 /// record's own row count. That guarantee is enforced by construction, not by
 /// convention: the fields are private and the constructor
 /// ([`decode_all_against_rows`]) is private to this module, so the only paths
-/// to a `ValidatedDeclaredStats` outside this module are [`read_commit_record`]
-/// and [`read_compaction_part`], each of which supplies the carrier's row
+/// to a `ValidatedDeclaredStats` outside this module are [`read_commit_record`],
+/// [`read_compaction_part`], and [`read_snapshot_entry_twin`], each of which
+/// supplies the carrier's row
 /// count. There is no public constructor and no public `decode_all`: a caller
 /// cannot obtain coverage without the row count, which is the whole point of
 /// binding the predicate at the point of use rather than at the decode
@@ -280,10 +375,15 @@ fn row_count_defect(stat: &DeclaredColumnStat, sample_count: u64) -> Option<Decl
 ///
 /// Private to the module by design (ADR-0873 decision 2): coverage must be
 /// unconstructable without the full predicate, so the only public entry points
-/// are [`read_commit_record`] and [`read_compaction_part`], which always pass
-/// `Some(sample_count)`. `sample_count` is `None` only for the module's own
-/// tests exercising the entry-local clauses in isolation, in which case clauses
-/// 4 and 5 are not decidable and the pass checks the entry-local clauses only.
+/// are [`read_commit_record`], [`read_compaction_part`], and
+/// [`read_snapshot_entry_twin`], which always pass `Some(sample_count)`.
+/// `sample_count` is `None` only for the module's own tests exercising the
+/// entry-local clauses in isolation, in which case clauses 4 and 5 are not
+/// decidable and the pass checks the entry-local clauses only.
+///
+/// `carrier` labels this pass's drop observations. It is a parameter rather
+/// than a property of the entries because the entries of all three stamp
+/// carriers are the same message: only the caller knows which record it read.
 ///
 /// Never fails: a defective statistic leaves its column uncovered, it does not
 /// make the record unreadable. Never fails on entry count either: the list is
@@ -295,6 +395,7 @@ fn row_count_defect(stat: &DeclaredColumnStat, sample_count: u64) -> Option<Decl
 fn decode_all_against_rows(
     entries: &[DeclaredColumnMinMax],
     sample_count: Option<u64>,
+    carrier: StatCarrier,
 ) -> ValidatedDeclaredStats {
     let mut covered = Vec::new();
     let mut dropped = Vec::new();
@@ -337,7 +438,7 @@ fn decode_all_against_rows(
             reason,
         });
     }
-    record_dropped(dropped.len());
+    observe_declared_stat_drops(carrier, dropped.len());
     ValidatedDeclaredStats { covered, dropped }
 }
 
@@ -349,12 +450,41 @@ pub fn stamp_commit_record(record: &mut CommitRecord, stats: &[DeclaredColumnSta
 }
 
 /// Read a commit record's declared-column statistics, reconciled against the
-/// record's own row count (`sample_count`, field 11). This is one of the only
-/// two functions that yield a [`ValidatedDeclaredStats`]: passing the row count
+/// record's own row count (`sample_count`, field 11). This is one of the three
+/// functions that yield a [`ValidatedDeclaredStats`]: passing the row count
 /// here is what makes clauses 4 and 5 bind, so the returned coverage cannot
 /// exist without them.
 pub fn read_commit_record(record: &CommitRecord) -> ValidatedDeclaredStats {
-    decode_all_against_rows(&record.declared_column_stats, Some(record.sample_count))
+    decode_all_against_rows(
+        &record.declared_column_stats,
+        Some(record.sample_count),
+        StatCarrier::CommitRecord,
+    )
+}
+
+/// Read a snapshot entry's stamps through the commit-record twin the catalog
+/// side builds for them (`SnapshotEntry.declared_column_stats`, field 15, whose
+/// message is a field-for-field mirror of the commit-side one, ADR-0873
+/// decision 1), labelling this pass's drop observations
+/// [`StatCarrier::SnapshotEntry`].
+///
+/// The predicate is identical to [`read_commit_record`]'s -- a second
+/// implementation is a second thing to keep in agreement -- and so is the row
+/// count it binds against: `twin.sample_count` must be the ENTRY's own row
+/// count. The only thing this function adds is the label, which exists because a
+/// drop on the fold's copy points at a different writer than a drop on the
+/// record the fold copied from.
+///
+/// `ravel_catalog::read_snapshot_entry` still calls [`read_commit_record`] on
+/// its twin, so today's snapshot-entry drops are observed under the
+/// `commit-record` label; re-pointing that one call site here is the remaining
+/// step, and lives in a crate ADR-0873 wave 4 does not touch.
+pub fn read_snapshot_entry_twin(twin: &CommitRecord) -> ValidatedDeclaredStats {
+    decode_all_against_rows(
+        &twin.declared_column_stats,
+        Some(twin.sample_count),
+        StatCarrier::SnapshotEntry,
+    )
 }
 
 /// Stamp one compaction/rewrite output part's declared-column statistics
@@ -366,10 +496,14 @@ pub fn stamp_compaction_part(part: &mut CompactionPart, stats: &[DeclaredColumnS
 
 /// Read one compaction/rewrite output part's declared-column statistics,
 /// reconciled against the part's own row count (`sample_count`, field 6). Like
-/// [`read_commit_record`], this is one of the only two producers of a
+/// [`read_commit_record`], this is one of the three producers of a
 /// [`ValidatedDeclaredStats`].
 pub fn read_compaction_part(part: &CompactionPart) -> ValidatedDeclaredStats {
-    decode_all_against_rows(&part.declared_column_stats, Some(part.sample_count))
+    decode_all_against_rows(
+        &part.declared_column_stats,
+        Some(part.sample_count),
+        StatCarrier::CompactionPart,
+    )
 }
 
 #[cfg(test)]
@@ -394,7 +528,7 @@ mod tests {
     /// functions wrap, exposed here only to pin the entry-local clauses in
     /// isolation.
     fn decode_all(entries: &[DeclaredColumnMinMax]) -> ValidatedDeclaredStats {
-        super::decode_all_against_rows(entries, None)
+        super::decode_all_against_rows(entries, None, StatCarrier::CommitRecord)
     }
 
     /// A `CommitRecord` as a writer that predates ADR-0873 encodes it: the

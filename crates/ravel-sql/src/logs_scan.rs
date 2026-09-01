@@ -251,7 +251,11 @@ use datafusion::physical_plan::{
 };
 use datafusion::scalar::ScalarValue;
 use futures::{Stream, StreamExt, TryStreamExt};
-use ravel_catalog::{LoadedColumnStats, SegmentRef, unique_column_stat, validate_min_max_presence};
+use ravel_catalog::{
+    DeclaredColumnStats, LoadedColumnStats, SegmentRef, unique_column_stat,
+    validate_min_max_presence,
+};
+use ravel_commit::declared_stats::{StatCarrier, observe_declared_stat_drops};
 use ravel_logseg::footer::LogFooter;
 use ravel_logseg::{
     AttrColumn, BoolCursor, BytesCursor, ColumnSelection, ColumnarBlockView, F64BitsCursor,
@@ -265,7 +269,7 @@ use ravel_query::{
 };
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
-use ravel_types::declared_stats::{DeclaredColumnStat, DeclaredStatType, DeclaredStatValue};
+use ravel_types::declared_stats::{DeclaredStatType, DeclaredStatValue};
 use ravel_types::logstream::AttrValue;
 use tokio::sync::OnceCell;
 
@@ -598,8 +602,8 @@ fn declared_scalar(ty: DeclaredType, value: &ColumnValue) -> Option<ScalarValue>
 /// Process-wide tally behind [`declared_stat_carrier_conflicts`].
 static CARRIER_CONFLICTS: AtomicU64 = AtomicU64::new(0);
 
-/// How many times this process has found the two declared-statistics carriers
-/// disagreeing about one segment and one column (ADR-0873 decision 4).
+/// How many times this process has OBSERVED the two declared-statistics
+/// carriers disagreeing about one segment and one column (ADR-0873 decision 4).
 ///
 /// A segment is immutable and both the `SegmentRef` stamp and the `.cstat`
 /// entry claim to be exact derivations of its contents, so a disagreement in
@@ -608,13 +612,63 @@ static CARRIER_CONFLICTS: AtomicU64 = AtomicU64::new(0);
 /// to a scan (never a wrong answer), which is exactly why the tally exists: it
 /// makes the defect a ticket instead of a mysteriously slow query.
 ///
+/// Call multiplicity, stated rather than deduplicated: one increment per
+/// (declared column, conflicting segment, `partition_statistics` call). Within
+/// one call a column increments at most once, because the first conflicting
+/// segment declines the column and the remaining segments skip it. Across
+/// calls nothing is deduplicated, and DataFusion may call
+/// `partition_statistics` several times while building one plan, so N
+/// statements over one defective segment observe some multiple of N. A
+/// per-query dedup is deliberately not built: it would need per-plan state
+/// keyed by (segment, column) threaded through a `&self` statistics call, for a
+/// figure whose only use is "nonzero, go read the log line". Alert on nonzero
+/// and compare rates over equal windows; the magnitude is not a count of
+/// defective segments. [`record_carrier_conflict`] logs each observation with
+/// the segment's content hash and both triples, which is the artefact that
+/// names the defect; this counter only says how often one was hit.
+///
+/// A per-query coverage figure (segments stamped over segments touched, per
+/// carrier) belongs beside this under phase accounting and is owed to the
+/// 996-9 measurement wave, not built here.
+///
 /// Monotonic and process-local; a scrape reads the delta between samples.
 pub fn declared_stat_carrier_conflicts() -> u64 {
     CARRIER_CONFLICTS.load(Ordering::Relaxed)
 }
 
-fn record_carrier_conflict() {
+/// Count one conflict observation and log what conflicted, at `warn`.
+///
+/// The log line is the ADR-0873 decision 4 artefact and the counter is only its
+/// rate: an operator who sees the tally move needs the segment and both claimed
+/// triples to file anything, and neither is recoverable from a number. The
+/// segment is named by `content_hash` rather than by object key because the
+/// hash names the exact bytes both carriers claim to describe, which is what a
+/// stamp-fold or `.cstat`-build report is filed against.
+///
+/// Emitted once per observation, so it inherits the multiplicity documented on
+/// [`declared_stat_carrier_conflicts`]: a hot statement over a defective
+/// segment repeats this line. It stays at `warn` and unsampled anyway, because
+/// the defect it reports is a durable object disagreeing with itself, which no
+/// amount of repetition makes less urgent.
+fn record_carrier_conflict(
+    seg: &SegmentRef,
+    column: &str,
+    stamp: &SegmentCoverage,
+    cstat: &SegmentCoverage,
+) {
     CARRIER_CONFLICTS.fetch_add(1, Ordering::Relaxed);
+    tracing::warn!(
+        column,
+        segment_content_hash = %hex::encode(seg.content_hash),
+        segment_key = %seg.data_object_key,
+        stamp_min = ?stamp.min,
+        stamp_max = ?stamp.max,
+        stamp_null_count = stamp.null_count,
+        cstat_min = ?cstat.min,
+        cstat_max = ?cstat.max,
+        cstat_null_count = cstat.null_count,
+        "declared-column statistics carriers disagree about one segment; the column degrades to a scan"
+    );
 }
 
 /// One segment's coverage of one declared column as one carrier states it.
@@ -622,9 +676,11 @@ fn record_carrier_conflict() {
 /// `min`/`max` both absent is a coverage statement, not a gap: the column had
 /// zero non-null values in that segment, which is exact. `null_count_proven`
 /// records whether the carrier's NULL count was reconciled against the
-/// segment's row count before it got here (true for a stamp, whose validated
-/// form is proof of clauses 4 and 5; false for a `.cstat` entry, whose row
-/// accounting this path does not reconcile).
+/// segment's row count before it got here: true for a stamp, where the proof is
+/// [`stamp_coverage`]'s parameter type ([`DeclaredColumnStats`], constructable
+/// non-empty only from a `ValidatedDeclaredStats`) rather than a convention its
+/// caller is trusted to have followed; false for a `.cstat` entry, whose row
+/// accounting this path does not reconcile.
 #[derive(Clone)]
 struct SegmentCoverage {
     min: Option<ScalarValue>,
@@ -709,16 +765,26 @@ fn stamp_scalar(ty: DeclaredType, value: DeclaredStatValue) -> Option<ScalarValu
 /// declares the column as). An entry that grants nothing is absent from the
 /// union, never one side of a conflict.
 ///
-/// The list is the validated form, so at most one entry names the column
-/// (ADR-0873 clause 6 drops every occurrence of a duplicated name, so a
-/// duplicate arrives here as no entry at all) and `find` is a lookup rather
+/// The parameter is [`DeclaredColumnStats`], the validated container, not a
+/// slice of entries, and the signature is the argument: `null_count_proven` is
+/// set unconditionally below, so this function's correctness rests on the
+/// entries having passed the full statistics validity predicate, row-count
+/// clauses included. `DeclaredColumnStats`'s only non-empty constructor is
+/// `from_validated`, so possessing one is that proof (ADR-0873 decision 2), and
+/// a caller cannot satisfy this signature with entries it decoded itself. A
+/// `&[DeclaredColumnStat]` parameter would leave the same claim resting on a
+/// caller invariant nothing checks, which is the #970 shape.
+///
+/// Because the container is the validated form, at most one entry names the
+/// column (ADR-0873 clause 6 drops every occurrence of a duplicated name, so a
+/// duplicate arrives here as no entry at all) and the lookup is a lookup rather
 /// than a pick between claims.
 fn stamp_coverage(
     declared: &DeclaredColumn,
-    stamps: &[DeclaredColumnStat],
+    stamps: &DeclaredColumnStats,
 ) -> Option<SegmentCoverage> {
     let stat_type = stamp_type_of(declared.ty)?;
-    let stat = stamps.iter().find(|s| s.name() == declared.key)?;
+    let stat = stamps.column(&declared.key)?;
     if stat.declared_type() != stat_type {
         return None;
     }
@@ -746,15 +812,47 @@ fn stamp_coverage(
 /// name (`unique_column_stat` refuses to pick), an entry whose extrema
 /// presence disagrees with its `non_null_count` in either direction (#970), or
 /// a value of the wrong kind.
+///
+/// Two of those refusals are DEFECTS rather than absences, and each reports one
+/// drop observation under [`StatCarrier::Cstat`] (ADR-0873 decision 2's metric,
+/// whose stamp-carrier labels are fed by the carrier reads in `ravel-commit`):
+/// a duplicated column name, and a presence/row-accounting contradiction. The
+/// other refusals are not counted, and the distinction is the point of the
+/// metric: an absent object, an absent segment entry, and an absent column
+/// entry are the ordinary uncovered state of every tenant whose fold never
+/// built that column, while a value of a kind the tenant's current declared
+/// type does not match is a legal consequence of re-declaring a column, not a
+/// writer bug.
 fn cstat_coverage(
     declared: &DeclaredColumn,
     seg_stats: Option<&ravel_proto::catalog::v1::ColumnStatsSegment>,
 ) -> Option<SegmentCoverage> {
-    let stat = unique_column_stat(seg_stats?, &declared.key)?;
+    let seg_stats = seg_stats?;
+    let stat = match unique_column_stat(seg_stats, &declared.key) {
+        Some(stat) => stat,
+        None => {
+            // `unique_column_stat` folds "no entry" and "more than one entry"
+            // into one `None`, and only the second is a defect: a duplicated
+            // name means no rule can pick the right claim about one immutable
+            // object. Re-deriving which case it was costs one pass over the
+            // entries of one segment, on the refusal path only.
+            let duplicated = seg_stats
+                .columns
+                .iter()
+                .any(|column| column.name == declared.key);
+            if duplicated {
+                observe_declared_stat_drops(StatCarrier::Cstat, 1);
+            }
+            return None;
+        }
+    };
     // The presence clause is called, not restated: `LoadedColumnStats` has
     // public fields and can be populated by a carrier that never decoded an
     // object, so the check has to bind here, where coverage is granted.
-    validate_min_max_presence(stat).ok()?;
+    if validate_min_max_presence(stat).is_err() {
+        observe_declared_stat_drops(StatCarrier::Cstat, 1);
+        return None;
+    }
     let min = match stat.min.as_ref() {
         Some(v) => Some(declared_scalar(declared.ty, v)?),
         None => None,
@@ -1363,10 +1461,12 @@ impl LogsScanExec {
     /// - the `SegmentRef` stamp (`SegmentRef::declared_column_stats`,
     ///   ADR-0873), which rides snapshot resolution itself and so covers the
     ///   live tail and token-resolved segments that no fold-built object can
-    ///   reach. Its entries are the constructor-gated validated form: holding
-    ///   one is proof the statistics validity predicate ran, row-count clauses
-    ///   included, so this reader re-checks only what is local to the query
-    ///   (the declared type it was resolved under);
+    ///   reach. It is a `DeclaredColumnStats`, the constructor-gated validated
+    ///   container, and [`stamp_coverage`] takes that type rather than a slice
+    ///   of its entries: holding one is proof the statistics validity predicate
+    ///   ran, row-count clauses included, so this reader re-checks only what is
+    ///   local to the query (the declared type it was resolved under) and its
+    ///   `null_count` needs no reconciliation here;
     /// - the ADR-0850/0942 `.cstat` entry from `self.column_stats`, joined by
     ///   segment identity, which is the only carrier for pre-stamp sealed
     ///   history and for `Str`/`Bytes` extrema the stamp vocabulary excludes.
@@ -1434,7 +1534,7 @@ impl LogsScanExec {
                 .column_stats
                 .as_ref()
                 .and_then(|stats| stats.segments.get(&segment_identity(seg)));
-            let stamps = seg.declared_column_stats.as_slice();
+            let stamps = &seg.declared_column_stats;
             for (k, a) in acc.iter_mut().enumerate() {
                 if a.declined {
                     continue;
@@ -1459,7 +1559,7 @@ impl LogsScanExec {
                         // conflict is a writer/fold/build defect, so it is
                         // counted rather than only degraded.
                         if !stamp.agrees_with(&cstat) {
-                            record_carrier_conflict();
+                            record_carrier_conflict(seg, &declared.key, &stamp, &cstat);
                             a.declined = true;
                             continue;
                         }
@@ -2042,8 +2142,15 @@ impl ExecutionPlan for LogsScanExec {
     /// request gets `Absent`, because a partition's count is its lazily
     /// resolved striped share of the blocks, not known here. Under the same
     /// condition the `ts` column's `column_statistics` report an `Exact`
-    /// min/max spanning every touched segment; every other column's stays
-    /// `Absent`. `total_byte_size` stays `Absent`.
+    /// min/max spanning every touched segment.
+    ///
+    /// A declared typed column reports an `Exact` min/max too, and an `Exact`
+    /// `null_count` where a carrier proves one, whenever
+    /// [`Self::declared_min_max_all`] resolves it from the ADR-0850 `.cstat`
+    /// entry, the ADR-0873 `SegmentRef` stamp, or both in agreement. Every
+    /// column that is neither `ts` nor a resolved declared column stays
+    /// `Absent`, as does a declared column any touched segment leaves
+    /// uncovered. `total_byte_size` stays `Absent`.
     fn partition_statistics(&self, partition: Option<usize>) -> DFResult<Arc<Statistics>> {
         // Validate the partition index exactly as the trait default does, so an
         // out-of-range request is an internal error, never a silent answer.
