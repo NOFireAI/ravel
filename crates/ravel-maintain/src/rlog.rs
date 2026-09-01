@@ -3826,6 +3826,151 @@ mod tests {
         );
     }
 
+    // --- ADR-0979 D1 differential part-hash fixture ---------------------------
+
+    /// The ts every stream carries in ALL THREE differential inputs, chosen
+    /// outside every input's own grid so no input holds two records at it: the
+    /// only tie it creates is the cross-input one the merge resolves by
+    /// `input_index`.
+    const TRIPLE_TIE_TS: i64 = 1001;
+
+    /// The differential fixture's three L0 inputs, in canonical input order.
+    ///
+    /// Every stream is carried by all three. `a` and `b` share an even ts grid
+    /// and their ranges straddle (a covers `[0, 58]`, b covers `[30, 88]`), so
+    /// every even ts in `[30, 58]` is a two-way cross-input tie with different
+    /// bodies; `c` uses the odd grid `[1, 79]` and interleaves both without
+    /// tying; and every stream carries one record at [`TRIPLE_TIE_TS`] in all
+    /// three, a three-way tie. A wrong tie-break, or a materialization that
+    /// yields a block's rows in any other order, reorders records that differ
+    /// in their bodies and changes the part bytes.
+    fn differential_hash_inputs() -> [Vec<LogRecord>; 3] {
+        let mk = |tag: &str, ks: std::ops::Range<i64>, odd: i64| -> Vec<LogRecord> {
+            let mut v = Vec::new();
+            for s in 0..4u32 {
+                for k in ks.clone() {
+                    v.push(record(
+                        s,
+                        k * 2 + odd,
+                        &format!("{tag}-{s}-{k:02}"),
+                        vec![
+                            ("svc".into(), AttrValue::Str(format!("v{}", k % 3))),
+                            ("seq".into(), AttrValue::I64(k)),
+                        ],
+                    ));
+                }
+                v.push(record(
+                    s,
+                    TRIPLE_TIE_TS,
+                    &format!("{tag}-tie-{s}"),
+                    vec![("svc".into(), AttrValue::Str("tie".into()))],
+                ));
+            }
+            v
+        };
+        [mk("a", 0..30, 0), mk("b", 15..45, 0), mk("c", 0..40, 1)]
+    }
+
+    /// Blocking for the differential fixture's inputs: 8 records per block, 2
+    /// blocks per row group. A stream then spans several blocks and several row
+    /// groups per input, so the cursor crosses both a block boundary and a loc
+    /// boundary mid-stream, and a block on a stream boundary carries the
+    /// neighbouring stream's rows too (the `stream_ref` filter).
+    fn differential_l0_cfg() -> RlogConfig {
+        RlogConfig {
+            block_target_records: 8,
+            group_target_blocks: 2,
+            ..RlogConfig::default()
+        }
+    }
+
+    /// Seed [`differential_hash_inputs`], compact, and return each L1 part's
+    /// `content_hash` as hex plus the total record count over the parts.
+    async fn differential_hash_run() -> (Vec<String>, usize) {
+        let store = MemoryStore::new();
+        for (i, recs) in differential_hash_inputs().iter().enumerate() {
+            seed_l0(
+                &store,
+                Uuid::from_u128(i as u128 + 1),
+                i as u64 + 1,
+                recs,
+                differential_l0_cfg(),
+                &["svc"],
+            )
+            .await;
+        }
+        let config = CompactorConfig {
+            // Small enough that the bucket splits into several parts, so the
+            // pin covers part boundaries and `part_index`, not one object.
+            max_l1_part_bytes: 4096,
+            ..CompactorConfig::default()
+        };
+        let clock = FixedClock::new(sealed_now_ns());
+        compact_bucket(&store, &clock, &config, &bucket())
+            .await
+            .expect("compact");
+        let (recrd, parts) = read_output(&store).await;
+        // The pin is on the record's own content_hash field, not on a hash
+        // recomputed here: that is the value every downstream key and repair
+        // check is built from.
+        let hashes: Vec<String> = recrd
+            .parts
+            .iter()
+            .map(|p| hex::encode(&p.content_hash))
+            .collect();
+        for (p, bytes) in recrd.parts.iter().zip(parts.iter()) {
+            assert_eq!(
+                hex::encode(p.content_hash.as_slice()),
+                hex::encode(blake3::hash(bytes).as_bytes()),
+                "the record's content_hash must be the part object's hash"
+            );
+        }
+        let rows: usize = parts.iter().map(|p| decode_all(p).len()).sum();
+        (hashes, rows)
+    }
+
+    /// ADR-0979 verification item 2: the bounded merge's output parts are
+    /// byte-identical to what the pre-D1 cursor produced.
+    ///
+    /// The expected hashes are PINNED, not recomputed. They were produced by
+    /// this exact fixture on commit 76c90a3 -- the last commit before the
+    /// columnar cursor swap, when `StreamCursor` still held one block's
+    /// eagerly decoded `Vec<LogRecord>` -- so this compares the new path
+    /// against the old path's real bytes rather than against itself. The old
+    /// path is deleted by the swap, which is why the constants exist at all.
+    ///
+    /// The fixture is built so the comparison cannot pass by accident:
+    /// [`differential_hash_inputs`] pins the two-way and three-way equal-ts
+    /// tie-break order in the record bodies, [`differential_l0_cfg`] makes each
+    /// stream span several blocks and several row groups per input with
+    /// stream-boundary blocks, and `max_l1_part_bytes` splits the bucket into
+    /// several parts.
+    #[tokio::test]
+    async fn differential_part_hashes_match_the_pre_columnar_cursor() {
+        /// Total records seeded across the three inputs: 4 streams x
+        /// (30 + 1) + 4 x (30 + 1) + 4 x (40 + 1).
+        const EXPECTED_ROWS: usize = 4 * 31 + 4 * 31 + 4 * 41;
+        /// Part `content_hash` values, in `part_index` order, as produced on
+        /// commit 76c90a3.
+        const EXPECTED_PART_HASHES: &[&str] = &[
+            "ff8136ed3914f1e7735129ed727750abd700f035fac8546905ca24d256a9b012",
+            "6fae530b2b49e81d44e371a67237522730fa54a0ffc70955f79de924eaa9babe",
+            "e13ab6be5d9c740c3dead134402c47ac5165f00b8715b1c9adf5b3705adc51d7",
+            "5e8d796720a814bbc5cd8c760ce232f7e6405eed6d73c8cac3f0e24c7c24dfe9",
+            "088f8f8045e6b693ea944d8d9a0c4db46ab897625e3783653561c428a9485908",
+        ];
+
+        let (hashes, rows) = differential_hash_run().await;
+        assert_eq!(
+            rows, EXPECTED_ROWS,
+            "every seeded record survived the merge"
+        );
+        assert_eq!(
+            hashes, EXPECTED_PART_HASHES,
+            "part content_hash vector diverged from the pre-columnar-cursor pin"
+        );
+    }
+
     // --- keystone differential property test ---------------------------------
 
     #[derive(Debug, Clone)]
