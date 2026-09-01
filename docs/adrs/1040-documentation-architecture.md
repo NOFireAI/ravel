@@ -196,6 +196,10 @@ standard library, matching the checkers already in `scripts/`. It checks:
 3. User-facing pages carry no repository archaeology: no source-file line
    references, no commit hashes, no issue or pull-request numbers, no
    "last verified against the code" stamps, no agent or AI language.
+   `CHANGELOG.md` is exempt from the citation half of this rule. A
+   changelog entry naming the decision behind a shipped feature is doing
+   its job, and the file carries 23 such citations. It is still held to
+   the rest: no source paths, no commit hashes, no stamps.
 4. User-facing pages carry no unsupported superlatives, and no em-dash.
 5. Terminology follows D2, for the terms D2 names and only those. The
    check is a qualifier rule, not a word ban: "role" is an error when it
@@ -223,6 +227,18 @@ that exists at that moment. The gate fails on any finding not in the
 baseline. Each documentation task deletes the baseline entries it fixes,
 and the final task deletes the file. The baseline's line count is the
 epic's progress measure, and it reaches zero before the epic closes.
+
+The starting count, measured on the tree rather than estimated: 382
+decision-record citations and 53 issue references across the user-facing
+pages, 44 source paths, 178 em-dashes, 16 unreachable pages, 15 records
+missing from their own index, 5 dead anchors. The operations guide alone
+holds 147 citations, 10 source paths and 47 em-dashes, which is one more
+reason it is split rather than edited in place.
+
+Two of those counts overlap by construction. The 15 unreachable decision
+records are exactly the 15 missing from the index, because the index is
+what links them. Fixing the index clears both sets at once, and if it
+clears only one, a rule is keying on something unstable.
 
 `scripts/check-readme-commands.sh` is fixed to run under bash 3.2, so the
 README's commands can be verified on a developer's machine and not only in
