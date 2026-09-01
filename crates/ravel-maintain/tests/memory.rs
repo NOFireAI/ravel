@@ -216,22 +216,33 @@ async fn peak_memory_on_rlog_input_bucket() {
 /// `<sum> != 0`. The flip is the exact behaviour D3 changes: retention at PUT
 /// vs release at PUT. The other phases are still asserted driven, so a merge
 /// that silently did nothing would fail here too.
-#[tokio::test]
-async fn compaction_retains_no_part_bytes() {
+///
+/// Run once per CLOSE PATH ([`ClosePath`]), because D3 releases at PUT whichever
+/// target closed the part and only one of the two paths reaches `finalize_part`
+/// per run: the memory split target closes on the decoded record heap, the
+/// stored-size target on an exact-encode probe's real object bytes (issue #872).
+/// Each variant asserts the flush counter of ITS target equals the number of
+/// closed parts, so a variant that silently closed on the other target fails
+/// instead of passing as coverage it does not have.
+async fn assert_compaction_retains_no_part_bytes(close_path: ClosePath) {
     const INPUTS: usize = 24;
     const STREAMS: u32 = 4;
     const RECORDS_PER_STREAM: usize = 4;
 
     let store = MemoryStore::new();
-    // A body long enough that a handful of records exceeds the tiny memory split
-    // target below, so the merge closes many parts rather than one.
-    let body: String = "log-line-".repeat(24);
     for i in 0..INPUTS {
         let mut records = Vec::new();
         for s in 0..STREAMS {
             for r in 0..RECORDS_PER_STREAM {
                 let ts = 1_000 + (i * RECORDS_PER_STREAM + r) as i64;
-                records.push(log_record(s, ts, &format!("{body}-{s}-{i}-{r}")));
+                // A body long enough that a handful of records exceeds the tiny
+                // memory split target, and INCOMPRESSIBLE so it also grows the
+                // real object bytes the stored-size target closes on: a repeated
+                // filler would zstd the whole bucket down to one object well
+                // under any workable stored target and the StoredTarget variant
+                // would never split.
+                let body = incompressible_body(((i * 100 + s as usize) * 100 + r) as u64, 216);
+                records.push(log_record(s, ts, &body));
             }
         }
         seed_rlog_input(
@@ -245,15 +256,17 @@ async fn compaction_retains_no_part_bytes() {
     }
 
     let tracker = MergeMemoryTracker::new();
+    // A small target on the axis under test, and the other left at its shipped
+    // 256 MiB default so it cannot fire. This changes only where records split
+    // into parts, never their bytes.
+    let defaults = CompactorConfig::default();
+    let (memory_target, stored_target) = match close_path {
+        ClosePath::MemoryTarget => (2048, defaults.max_l1_part_bytes),
+        ClosePath::StoredTarget => (defaults.l1_part_memory_target_bytes, 2048),
+    };
     let config = CompactorConfig {
-        // Small memory split target so parts close often; this changes only where
-        // records split into parts, never their bytes. The memory target is used
-        // rather than the stored-size target because D3 (retention released at
-        // PUT) holds on whichever target closes the part, and the memory target
-        // splits reliably regardless of how far the bodies compress (the stored
-        // target closes on real object bytes since issue #872, so a compressible
-        // fixture reaches it far more slowly).
-        l1_part_memory_target_bytes: 2048,
+        l1_part_memory_target_bytes: memory_target,
+        max_l1_part_bytes: stored_target,
         merge_memory_tracker: Some(tracker.clone()),
         ..CompactorConfig::default()
     };
@@ -267,8 +280,29 @@ async fn compaction_retains_no_part_bytes() {
     let record = fetch_compaction_record(&store, &bucket).await;
     assert!(
         record.parts.len() >= 3,
-        "the small memory split target must close at least three parts, got {}",
+        "the small {close_path:?} target must close at least three parts, got {}",
         record.parts.len()
+    );
+    // The parts closed on the path this variant is for, not on the other one,
+    // and the exact-encode probe count is the deterministic figure that path
+    // implies: zero on the memory path, one per probe the stored path scheduled.
+    let closed = (record.parts.len() - 1) as u64;
+    let (expected_flushes, expected_probes) = match close_path {
+        ClosePath::MemoryTarget => ((closed, 0), 0),
+        ClosePath::StoredTarget => ((0, closed), 28),
+    };
+    assert_eq!(
+        (
+            tracker.memory_target_flushes(),
+            tracker.stored_target_flushes()
+        ),
+        expected_flushes,
+        "the {close_path:?} variant's parts must all close on that target"
+    );
+    assert_eq!(
+        tracker.probes_run(),
+        expected_probes,
+        "the {close_path:?} variant's probe count is deterministic for this corpus"
     );
     // The parts really do carry bytes; the point is none of them stay resident.
     let part_bytes_sum: u64 = record.parts.iter().map(|p| p.object_size).sum();
@@ -305,16 +339,59 @@ async fn compaction_retains_no_part_bytes() {
         "the finish/publish term must have been driven"
     );
     println!(
-        "[memory:rlog:979] parts={} part_bytes_sum={part_bytes_sum} \
+        "[memory:rlog:979] close_path={close_path:?} parts={} \
+         part_bytes_sum={part_bytes_sum} \
          retained_part_encoded_bytes={} writer_heap_bytes={} \
-         cursor_bytes={} catalog_directory_decoded_bytes={} publish_record_encoded_bytes={}",
+         cursor_bytes={} catalog_directory_decoded_bytes={} publish_record_encoded_bytes={} \
+         probes={}",
         record.parts.len(),
         peaks.retained_part_encoded_bytes,
         peaks.writer_heap_bytes,
         peaks.cursor_bytes,
         peaks.catalog_directory_decoded_bytes,
         peaks.publish_record_encoded_bytes,
+        tracker.probes_run(),
     );
+}
+
+/// `n` bytes of deterministic pseudo-random alphanumerics, distinct per `seed`
+/// (an LCG, so the fixture is reproducible). Used for log bodies that must not
+/// compress across records.
+fn incompressible_body(seed: u64, n: usize) -> String {
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut state = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut out = String::with_capacity(n);
+    for _ in 0..n {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        out.push(ALPHABET[(state >> 33) as usize % ALPHABET.len()] as char);
+    }
+    out
+}
+
+/// Which split target closes the parts in
+/// [`assert_compaction_retains_no_part_bytes`]. ADR-0979 D3 releases a part's
+/// bytes at PUT on both, and only the target that fires reaches that code, so
+/// both are exercised.
+#[derive(Copy, Clone, Debug)]
+enum ClosePath {
+    /// `l1_part_memory_target_bytes`: the part's decoded record-heap estimate
+    /// reaches the target.
+    MemoryTarget,
+    /// `max_l1_part_bytes`: an exact-encode probe shows the part's real object
+    /// bytes reaching the target (issue #872).
+    StoredTarget,
+}
+
+#[tokio::test]
+async fn compaction_retains_no_part_bytes() {
+    assert_compaction_retains_no_part_bytes(ClosePath::MemoryTarget).await;
+}
+
+#[tokio::test]
+async fn compaction_retains_no_part_bytes_on_stored_target_close() {
+    assert_compaction_retains_no_part_bytes(ClosePath::StoredTarget).await;
 }
 
 /// A tracker left installed across SERIAL runs reports each run's own peaks:
