@@ -10,6 +10,59 @@ use ravel_object_store::StoreError;
 use ravel_rspan::SpanSegError;
 use ravel_segment::SegmentError;
 
+/// Where in a cursor's life the merge cursor budget refused
+/// (ADR-0979 decision 4 as amended). Both sites check the same budget against
+/// the same running charge; they differ in what the refused bytes would have
+/// paid for, and an operator reading the error needs to know which, because
+/// only the admission site is fixed by admitting fewer cursors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeCursorBudgetSite {
+    /// Admitting a new cursor: the reservation of the batch member at
+    /// `batch_position` (0-based) of a batch of `batch_len` crossed the budget.
+    /// The whole batch is what merge order requires before the next emit, so a
+    /// refusal at any position aborts the run.
+    Admission {
+        /// Position, within the admission batch, of the cursor whose
+        /// reservation crossed the budget (0-based).
+        batch_position: usize,
+        /// How many cursors the refused admission batch holds.
+        batch_len: usize,
+    },
+    /// Growing an already-open cursor's charge to cover the block it is about
+    /// to decode. The growth is checked BEFORE the decode starts, so the
+    /// refusal costs nothing but the run: the larger block was never
+    /// materialized.
+    BlockGrow {
+        /// Whole-object index of the block whose decode was refused.
+        block_index: usize,
+        /// How much the cursor's charge had to grow to cover that block's
+        /// pre-decode ceiling on top of the metadata and raw bytes it already
+        /// holds.
+        grow_bytes: u64,
+    },
+}
+
+impl std::fmt::Display for MergeCursorBudgetSite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Admission {
+                batch_position,
+                batch_len,
+            } => write!(
+                f,
+                "admitting the batch merge order requires (position {batch_position} of {batch_len})"
+            ),
+            Self::BlockGrow {
+                block_index,
+                grow_bytes,
+            } => write!(
+                f,
+                "growing an open cursor by {grow_bytes} bytes to decode block {block_index} before that decode starts"
+            ),
+        }
+    }
+}
+
 /// A compaction run's failure. Retryable store faults surface as
 /// [`MaintainError::Store`] carrying the underlying [`StoreError`]; the caller
 /// decides whether to re-run the whole bucket (the idempotent recovery path). The `*Divergence` and `*Mismatch` variants are invariant
@@ -98,36 +151,33 @@ pub enum MaintainError {
         part_key: String,
     },
     #[error(
-        "bounded RLOG compaction merge for stream {stream_id} would exceed its cursor-memory budget: {open_cursors} cursors already open charging {charged_bytes} bytes, and admitting the batch merge order requires (position {admission_batch_position} of {admission_batch_len}) needs {required_bytes} bytes total against a budget of {budget_bytes} ({inputs_carrying_stream} inputs carry this stream); nothing published, the L0 inputs stay live, any parts already PUT age out under the unreferenced-part sweep (ADR-0979 decision 4). Raise merge_cursor_budget_bytes to at least {required_bytes} to compact this bucket"
+        "bounded RLOG compaction merge for stream {stream_id} would exceed its cursor-memory budget: {open_cursors} cursors already open charging {charged_bytes} bytes, and {site} needs {required_bytes} bytes total against a budget of {budget_bytes} ({inputs_carrying_stream} inputs carry this stream); nothing published, the L0 inputs stay live, any parts already PUT age out under the unreferenced-part sweep (ADR-0979 decision 4). Raise merge_cursor_budget_bytes to at least {required_bytes} to compact this bucket"
     )]
     MergeCursorBudgetExceeded {
         /// Hex canonical id of the stream whose cursor set overran the budget.
         stream_id: String,
-        /// Cursors already open for this stream when the reservation was refused.
-        /// Batch members before the refused one are not counted here: they were
-        /// never opened, so they hold nothing.
+        /// Cursors already open for this stream when the charge was refused.
+        /// On the admission site, batch members before the refused one are not
+        /// counted here: they were never opened, so they hold nothing. On the
+        /// block-growth site the cursor asking to grow IS open and is counted.
         open_cursors: usize,
         /// What the OPEN cursors charge at the point of refusal: their reconciled
         /// residency, not counting any member of the refused admission batch.
         charged_bytes: u64,
         /// The configured [`crate::config::CompactorConfig::merge_cursor_budget_bytes`].
         budget_bytes: u64,
-        /// Prospective total had the batch been admitted through this position:
-        /// `charged_bytes` plus the reservations of batch members `0..=
-        /// admission_batch_position`. The whole batch is what merge order
-        /// requires before the next record can be emitted, so this is the figure
-        /// a retry must budget for, and a first admission already over budget
-        /// still names a number.
+        /// Prospective total had the refused charge been taken: `charged_bytes`
+        /// plus the reservations of batch members `0..=batch_position` on the
+        /// admission site, `charged_bytes + grow_bytes` on the block-growth
+        /// site. Either way it is what merge order requires before the next
+        /// record can be emitted, so it is the figure a retry must budget for,
+        /// and a first admission already over budget still names a number.
         required_bytes: u64,
         /// How many inputs carry this stream, so the operator can size the fix.
         inputs_carrying_stream: usize,
-        /// Position, within the admission batch, of the cursor whose reservation
-        /// crossed the budget (0-based).
-        admission_batch_position: usize,
-        /// How many cursors the refused admission batch holds. The whole batch is
-        /// admitted before the next emit, so a refusal at any position aborts the
-        /// run.
-        admission_batch_len: usize,
+        /// Which point in a cursor's life refused, and its site-specific
+        /// figures.
+        site: MergeCursorBudgetSite,
     },
     #[error(
         "bounded RLOG compaction cannot admission-price input {object_key:?}: it carries no PAGE_DIR section, so a cursor's decode cost is unknowable before the fetch and the pre-decode reservation (ADR-0979 decision 4) cannot be charged. PAGE_DIR is mandatory in RLOG format version {format_version} (ADR-0699 decision 2), so this is a version/corruption gate, not a live path on a current-format fleet; nothing published, the L0 inputs stay live"

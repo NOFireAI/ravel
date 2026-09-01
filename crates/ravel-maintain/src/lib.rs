@@ -82,7 +82,7 @@ pub use erasure_rewrite::{
     bucket_may_overlap, build_rewrite, erasure_rewrite_bucket, pending_erasure_requests,
     publish_rewrite_record,
 };
-pub use error::{MaintainError, Result};
+pub use error::{MaintainError, MergeCursorBudgetSite, Result};
 pub use gc_config::{
     GC_CONFIG_KEY, GcConfigError, GcConfigValues, SetOutcome, bootstrap_gc_config, read_gc_config,
     set_gc_config, validate_flight_ceiling, validate_maintain, validate_maintain_skew,
