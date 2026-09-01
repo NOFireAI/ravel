@@ -810,21 +810,29 @@ fn stamp_coverage(
 /// `None` when that carrier grants nothing: no object, no entry for this
 /// segment, no entry for the column, more than one entry under the column's
 /// name (`unique_column_stat` refuses to pick), an entry whose extrema
-/// presence disagrees with its `non_null_count` in either direction (#970), or
-/// a value of the wrong kind.
+/// presence disagrees with its `non_null_count` in either direction (#970), an
+/// entry whose row accounting (`non_null_count + null_count`) does not
+/// reconcile against the joined [`SegmentRef::sample_count`] (#1023), or a
+/// value of the wrong kind.
 ///
-/// Two of those refusals are DEFECTS rather than absences, and each reports one
-/// drop observation under [`StatCarrier::Cstat`] (ADR-0873 decision 2's metric,
-/// whose stamp-carrier labels are fed by the carrier reads in `ravel-commit`):
-/// a duplicated column name, and a presence/row-accounting contradiction. The
-/// other refusals are not counted, and the distinction is the point of the
-/// metric: an absent object, an absent segment entry, and an absent column
-/// entry are the ordinary uncovered state of every tenant whose fold never
-/// built that column, while a value of a kind the tenant's current declared
-/// type does not match is a legal consequence of re-declaring a column, not a
-/// writer bug.
+/// Three of those refusals are DEFECTS rather than absences, and each reports
+/// one drop observation under [`StatCarrier::Cstat`] (ADR-0873 decision 2's
+/// metric, whose stamp-carrier labels are fed by the carrier reads in
+/// `ravel-commit`): a duplicated column name, a presence contradiction, and a
+/// row-accounting disagreement with the joined `sample_count`. The other
+/// refusals are not counted, and the distinction is the point of the metric: an
+/// absent object, an absent segment entry, and an absent column entry are the
+/// ordinary uncovered state of every tenant whose fold never built that column,
+/// while a value of a kind the tenant's current declared type does not match is
+/// a legal consequence of re-declaring a column, not a writer bug.
+///
+/// The reconciliation is a fail-closed gate on the WHOLE entry, extrema
+/// included: a stale or miscounted entry describes rows this immutable object
+/// does not have (or omits rows it does), so no figure it carries -- not just
+/// its null count -- may be granted `Precision::Exact`.
 fn cstat_coverage(
     declared: &DeclaredColumn,
+    seg: &SegmentRef,
     seg_stats: Option<&ravel_proto::catalog::v1::ColumnStatsSegment>,
 ) -> Option<SegmentCoverage> {
     let seg_stats = seg_stats?;
@@ -850,6 +858,17 @@ fn cstat_coverage(
     // public fields and can be populated by a carrier that never decoded an
     // object, so the check has to bind here, where coverage is granted.
     if validate_min_max_presence(stat).is_err() {
+        observe_declared_stat_drops(StatCarrier::Cstat, 1);
+        return None;
+    }
+    // Reconcile the entry's row accounting against the immutable segment it is
+    // joined to before granting any figure (ADR-0873 decision 2, clause 4's
+    // `.cstat` arm): `non_null_count + null_count` must equal the joined
+    // `SegmentRef::sample_count`. A checked add is used so an overflowing sum is
+    // itself a disagreement rather than a wrap, and either shape refuses the
+    // whole entry -- extrema included -- and is counted as a drop.
+    let accounted = stat.non_null_count.checked_add(stat.null_count);
+    if accounted != Some(seg.sample_count) {
         observe_declared_stat_drops(StatCarrier::Cstat, 1);
         return None;
     }
@@ -1489,13 +1508,14 @@ impl LogsScanExec {
     /// already pinned both to the same value, so one proof covers both);
     /// today the proving carrier is the stamp: a stamp's
     /// `null_count` passed clauses 4 and 5 against the carrying record's own
-    /// row count before the type existed, while a `.cstat` entry's row
-    /// accounting is not reconciled against the joined
-    /// `SegmentRef::sample_count` anywhere on this path (ADR-0873 decision 2
-    /// requires it of that carrier; the tree does not yet do it). An
-    /// unreconciled `null_count` reported as `Precision::Exact` would answer
-    /// `COUNT(col)` from a figure nothing checked, so it stays `Absent` and
-    /// only the extrema are claimed.
+    /// row count before the type existed. A `.cstat` entry's row accounting is
+    /// now reconciled against the joined `SegmentRef::sample_count` in
+    /// [`cstat_coverage`] (ADR-0873 decision 2, clause 4's arm), but that
+    /// reconciliation is a fail-closed gate on what the entry may grant --
+    /// extrema included -- not a promotion of its `null_count` to a proven
+    /// figure: the entry still reports `null_count_proven = false`, so a
+    /// `.cstat`-only column still answers `COUNT(col)` as `Absent` rather than
+    /// from a count no carrier proved. Only the extrema are claimed.
     ///
     /// Resolving every column in one segment walk instead of one full walk per
     /// column keeps `partition_statistics` cost at
@@ -1544,7 +1564,7 @@ impl LogsScanExec {
                 let declared = &self.declared[k];
                 let coverage = match (
                     stamp_coverage(declared, stamps),
-                    cstat_coverage(declared, seg_stats),
+                    cstat_coverage(declared, seg, seg_stats),
                 ) {
                     // Covered by neither: the ordinary uncovered state,
                     // never an error, and the column falls back to a scan.
