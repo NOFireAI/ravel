@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="780" viewBox="0 0 1180 780" font-family="system-ui, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="852" viewBox="0 0 1180 852" font-family="system-ui, sans-serif" role="img" aria-label="Request cost levers: where the S3 request bill comes from and which levers reach it. PUTs per day scale with tenants, signals, shards, replicas, and flush cadence; replica affinity, shard count, log and span pipelining, and flush cadence are the levers, while the commit protocol stays.">
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M0,0 L10,5 L0,10 z" fill="#383e46"/>
@@ -8,7 +8,7 @@
     </marker>
   </defs>
 
-  <rect x="0" y="0" width="1180" height="780" fill="#f4f5f7"/>
+  <rect x="0" y="0" width="1180" height="852" fill="#f4f5f7"/>
 
   <text x="40" y="46" font-size="21" font-weight="640" fill="#1d2228">Where the S3 request bill comes from, and which levers reach it</text>
   <text x="40" y="70" font-size="14" fill="#5b636d">Requests are ~97% of the bill. The commit protocol is not the cause.</text>
@@ -81,4 +81,10 @@
   <rect x="40" y="682" width="1100" height="56" rx="6" fill="#e6efe6" stroke="#3f7042"/>
   <text x="60" y="706" font-size="13" font-weight="640" fill="#2f5533">Unchanged by every decision above: the acknowledgement still follows the commit PUT.</text>
   <text x="60" y="726" font-size="12.5" fill="#2f5533">Flush identity is still pinned at flush-open and reused verbatim on retry; create-if-absent still elects a single winner. Durability is not traded here.</text>
+
+  <!-- historical-arithmetic note -->
+  <rect x="40" y="762" width="1100" height="72" rx="6" fill="#fbe6b9" stroke="#8a5a10" stroke-width="1.5"/>
+  <text x="60" y="785" font-size="12.5" font-weight="600" fill="#7a5200">Historical figures &#8212; the worked ~4.7 KiB flush and the ~1,750&#215; distance from the 8 MiB size trigger assume the 500 ms flush</text>
+  <text x="60" y="804" font-size="12.5" fill="#7a5200">cadence that was the default when the ADR-0076 decision was made. The current default cadence is 2 s (~18.8 KiB per flush,</text>
+  <text x="60" y="823" font-size="12.5" fill="#7a5200">~437&#215; from the trigger); the age trigger still fires first. The figures above are kept as decided, not updated.</text>
 </svg>
