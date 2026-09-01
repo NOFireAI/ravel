@@ -8,7 +8,7 @@
   <rect x="0" y="0" width="1440" height="620" fill="#f4f5f7"/>
 
   <text x="30" y="34" font-size="22" font-weight="bold" fill="#17191c">kind local development environment</text>
-  <text x="30" y="54" font-size="13" fill="#4a4f57">docs/guides/kubernetes.md — what scripts/kind-up.sh does, in order</text>
+  <text x="30" y="54" font-size="13" fill="#4a4f57">docs/guides/kubernetes.md: what scripts/kind-up.sh does, in order</text>
 
   <!-- Legend -->
   <g>
@@ -100,9 +100,9 @@
   <!-- failure path note -->
   <rect x="40" y="440" width="1050" height="80" rx="6" fill="#f7d4d0" stroke="#a13d2f" stroke-width="1.5"/>
   <text x="60" y="462" font-size="12" font-weight="bold" fill="#7a2418">On any step failing</text>
-  <text x="60" y="480" font-size="11" fill="#7a2418">kind-up.sh dumps the namespace's objects, the RavelCluster's status, pod descriptions, and the operator's logs — then leaves the</text>
+  <text x="60" y="480" font-size="11" fill="#7a2418">kind-up.sh dumps the namespace's objects, the RavelCluster's status, pod descriptions, and the operator's logs: then leaves the</text>
   <text x="60" y="496" font-size="11" fill="#7a2418">cluster running instead of tearing it down, so the state that caused the failure is still there to look at.</text>
 
   <text x="40" y="560" font-size="11.5" fill="#4a4f57">All three scripts read the same env vars (RAVEL_KIND_CLUSTER, RAVEL_SERVER_IMAGE, RAVEL_OPERATOR_IMAGE, RAVEL_FAKE_S3_BACKEND, ...),</text>
-  <text x="40" y="577" font-size="11.5" fill="#4a4f57">so there is exactly one place each setting is defined — this is also the exact sequence CI's k8s-integration job drives, see k8s-ci-integration.svg.</text>
+  <text x="40" y="577" font-size="11.5" fill="#4a4f57">so there is exactly one place each setting is defined: this is also the exact sequence CI's k8s-integration job drives, see k8s-ci-integration.svg.</text>
 </svg>

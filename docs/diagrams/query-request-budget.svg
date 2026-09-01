@@ -66,7 +66,7 @@
 
   <!-- where the flat cap holds -->
   <rect x="40" y="392" width="468" height="26" rx="4" fill="#e6efe6" stroke="#3f7042"/>
-  <text x="56" y="410" font-size="12" fill="#2f5533">3 shards &#215; 7,200 = 21,600 &#8212; fits, which is why the comment reads as correct</text>
+  <text x="56" y="410" font-size="12" fill="#2f5533">3 shards &#215; 7,200 = 21,600: fits, which is why the comment reads as correct</text>
 
   <!-- the fix -->
   <text x="40" y="556" font-size="13" font-weight="640" fill="#383e46">The decision: derive the default instead of fixing it</text>
@@ -80,7 +80,7 @@
 
   <!-- historical-arithmetic note -->
   <rect x="40" y="716" width="1020" height="60" rx="6" fill="#fbe6b9" stroke="#8a5a10" stroke-width="1.5"/>
-  <text x="56" y="738" font-size="12" font-weight="600" fill="#7a5200">Historical figures &#8212; this diagram illustrates the ADR-0075 decision as it was made, when the default flush cadence was 500 ms.</text>
+  <text x="56" y="738" font-size="12" font-weight="600" fill="#7a5200">Historical figures: this diagram illustrates the ADR-0075 decision as it was made, when the default flush cadence was 500 ms.</text>
   <text x="56" y="757" font-size="12" fill="#7a5200">The current default cadence is 2 s (3600 / 2 = 1,800 segments per shard-hour), and no flat cap exists: the default is derived from</text>
   <text x="56" y="772" font-size="12" fill="#7a5200">shard_count when max_s3_requests is omitted. The 500 ms and 25,000-request figures above are kept as decided, not updated.</text>
 </svg>

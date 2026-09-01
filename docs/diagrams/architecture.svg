@@ -8,7 +8,7 @@
   <rect x="0" y="0" width="1440" height="1040" fill="#f4f5f7"/>
 
   <text x="30" y="34" font-size="22" font-weight="bold" fill="#17191c">Ravel architecture</text>
-  <text x="30" y="54" font-size="13" fill="#4a4f57">docs/architecture.md — the object store is the only durable component; everything else may crash and restart empty</text>
+  <text x="30" y="54" font-size="13" fill="#4a4f57">docs/architecture.md: the object store is the only durable component; everything else may crash and restart empty</text>
 
   <!-- Legend -->
   <g>
@@ -104,7 +104,7 @@
 
   <!-- OBJECT STORE band -->
   <rect x="40" y="560" width="1340" height="230" rx="10" fill="#fbe6b9" stroke="#8a5a10" stroke-width="4"/>
-  <text x="710" y="590" font-size="17" font-weight="bold" text-anchor="middle" fill="#17191c">OBJECT STORE (S3-compatible) — single durable center</text>
+  <text x="710" y="590" font-size="17" font-weight="bold" text-anchor="middle" fill="#17191c">OBJECT STORE (S3-compatible): single durable center</text>
 
   <rect x="100" y="618" width="560" height="140" rx="6" fill="#f4c869" stroke="#8a5a10" stroke-width="2.5"/>
   <text x="380" y="644" font-size="14" font-weight="bold" text-anchor="middle" fill="#17191c">L0 RSEG objects (data)</text>
@@ -127,7 +127,7 @@
 
   <!-- SQL query path (ravel-sql) -->
   <rect x="40" y="878" width="1340" height="90" rx="6" fill="#eceef1" stroke="#1f4e79" stroke-width="2"/>
-  <text x="710" y="904" font-size="14" font-weight="bold" text-anchor="middle" fill="#17191c">SQL query path (ravel-sql, DataFusion) — POST /api/v1/sql, feature "sql" (off by default)</text>
+  <text x="710" y="904" font-size="14" font-weight="bold" text-anchor="middle" fill="#17191c">SQL query path (ravel-sql, DataFusion): POST /api/v1/sql, feature "sql" (off by default)</text>
   <text x="710" y="924" font-size="11" text-anchor="middle" fill="#17191c">RsegScanExec -&gt; SortPreservingMergeExec -&gt; RsegDedupExec over DataFusion; matches PromQL's dedup total order bit-for-bit (ADR-0013)</text>
   <text x="710" y="942" font-size="11" text-anchor="middle" fill="#17191c">Also: /api/v1/analytics (always on); Flight SQL (feature "flight-sql") serves statement queries; prepared statements return Unimplemented</text>
 
