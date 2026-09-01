@@ -31,6 +31,23 @@ ravel-promql = { workspace = true }
 # before this edge existed too.
 ravel-promql-difftest = { path = "../ravel-promql-difftest", version = "0.11.0" }
 prost = { workspace = true }
+# MetricsBench Remote Write 1.0 ingest lane (ADR-0927, issue #937, task M5).
+# `ravel-remote-write` supplies the `prometheus.WriteRequest`/`TimeSeries`/
+# `Label`/`Sample` prost types the lane encodes the portable RW1.0 body from
+# (`proto::prometheus`), so the bench builds the exact wire shape every
+# comparator receives rather than hand-rolling a second copy of the schema. It
+# is a workspace path crate already linked by ravel-server; a new dependency
+# EDGE from ravel-bench, not a new external crate to the workspace.
+ravel-remote-write = { workspace = true }
+# The RW1.0 body is snappy block format (not framed): `snap::raw::Encoder`
+# compresses the prost-encoded `WriteRequest`. Already the workspace pin
+# `ravel-remote-write` itself decompresses with, so no second copy resolves.
+snap = { workspace = true }
+# The comparator senders (Prometheus/VictoriaMetrics/object-storage-native)
+# POST the RW1.0 body to config-supplied endpoints; no hardcoded hosts. reuses
+# the workspace reqwest pin ravel-server/ravel-promql-difftest already link, so
+# a new dependency EDGE from ravel-bench, not a new external crate.
+reqwest = { workspace = true }
 ravel-query = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
@@ -230,6 +247,17 @@ name = "metricsbench_report"
 path = "src/bin/metricsbench_report.rs"
 bench = false
 
+# MetricsBench Remote Write 1.0 ingest lane (ADR-0927, issue #937, task M5):
+# replays one logical sample stream into the in-process Ravel path (strict,
+# durable-on-ack, commit tokens) and, behind config-supplied endpoints, the
+# Prometheus/VictoriaMetrics/object-storage-native comparators over portable
+# RW1.0. In the default feature set: it is the entry point that makes the lane
+# reachable from a real caller.
+[[bin]]
+name = "metricsbench_ingest"
+path = "src/bin/metricsbench_ingest.rs"
+bench = false
+
 [[bin]]
 name = "segment_alloc_profile"
 path = "src/bin/segment_alloc_profile.rs"
@@ -410,6 +438,15 @@ bench = false
 [[test]]
 name = "metricsbench_report"
 path = "tests/metricsbench_report.rs"
+bench = false
+
+# Reachability for the Remote Write 1.0 ingest lane (issue #937, M5): the
+# shipping `metricsbench_ingest` binary replays into the in-process Ravel path
+# and prints a valid report with a durable-on-ack Ravel row, proving the lane is
+# reachable from the bin a caller runs, not only from the lib unit tests.
+[[test]]
+name = "metricsbench_ingest_smoke"
+path = "tests/metricsbench_ingest_smoke.rs"
 bench = false
 
 [[test]]
