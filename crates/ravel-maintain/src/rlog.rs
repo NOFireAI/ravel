@@ -513,9 +513,13 @@ const DECODED_STRING_SLOT_BYTES: u64 = 40;
 /// arm holds two vectors (a dictionary's distinct values and its per-row ids),
 /// so 48 bytes covers every kind.
 ///
-/// ADR-0979 decision 1 states this term as `24 B x (max column id + 1) x 5`.
-/// That figure is the narrow slot's, and it does not bound the string kind's or
-/// the growth step below: on the eight-one-record-block fixture of
+/// ADR-0979's amended ceiling states this term as `2 x SUM(slot sizes) x
+/// width` -- 288 B per width unit at the current sizes (24/24/24/48/24). The
+/// 48-B-per-kind constant here covers the widest slot uniformly, so 48 x 5 x
+/// the growth factor = 480 B per width unit sits above that floor at every
+/// width: a valid, deliberately conservative instantiation. A flat 24 B per
+/// kind at exact width would not bound the string kind or the growth step:
+/// on the eight-one-record-block fixture of
 /// `the_slot_spine_term_is_what_bounds_a_small_block` it prices a block at
 /// 2,154 B against the 2,232 B it decodes to.
 const DECODED_SLOT_SPINE_BYTES: u64 = 48;
@@ -5299,7 +5303,8 @@ mod tests {
     }
 
     /// ADR-0979 decision 1's ceiling includes the decoder's five per-kind slot
-    /// vectors (`24 B x column-id width x 5`), and on a small block that term is
+    /// vectors (the ADR's amended `2 x SUM(slot sizes) x width` floor, priced
+    /// here at the conservative 480 B per width unit), and on a small block that term is
     /// what makes the ceiling a ceiling: the vectors are indexed by column id,
     /// so they cost the id-space width whatever the block holds, while every
     /// other term scales with rows.
@@ -5311,7 +5316,7 @@ mod tests {
     /// holds.
     ///
     /// It also pins the two corrections this crate applies to ADR-0979's
-    /// `24 B x width x 5` statement of the term. At the ADR's figure the
+    /// flat 24-B-per-kind exact-width pricing of the term. At that figure the
     /// ceiling here is 2,154 B, below the 2,232 B the block decodes to: the
     /// string kind's slot is an enum wider than a `Vec` handle, and a slot
     /// vector's capacity is a `Vec` growth step above the id-space width rather
