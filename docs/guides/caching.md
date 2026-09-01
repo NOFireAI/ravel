@@ -28,6 +28,13 @@ The cache stores byte ranges read from two kinds of objects:
   threshold to `18446744073709551615` to read every log object whole, as
   before this split existed.
 
+  On default flags the whole-object read is what happens anyway:
+  `--logs-fetch-policy` defaults to `cost-based`, and at the shipped
+  reference cost profile (intra-region, where transferred bytes are free
+  and the bill is requests) it resolves to reading every object whole in
+  one GET. Set `--logs-fetch-policy byte-minimal` for the block-range
+  shape, where the threshold above governs. See the flag table below.
+
 Both PromQL queries and SQL queries over the `samples` table use the
 metric path. SQL queries over the `logs` table use the log path.
 
@@ -79,7 +86,10 @@ provide it at the filesystem/volume layer (an encrypted volume mounted at
 | `--cache-max-bytes <n>` | `268435456` (256 MiB) | Maximum bytes the RAM tier holds. Bounds **every** ADR-0046 cache in the process from one number: the fetcher cache and the catalog's byte cache both. Read once at startup; there is no live resize. |
 | `--cache-dir <path>` | none | Directory for the local-disk tier. Set, both the fetcher cache and the catalog byte cache gain a disk tier at this path, each bounded by the same `--cache-max-bytes` number (there is no separate disk-tier capacity flag). Absent, only the RAM tier exists. Bytes written here are not SSE-KMS encrypted (see "Two tiers" above). |
 | `--disable-cache` | off | Turns **every** ADR-0046 cache off: the fetcher cache and the catalog's byte cache both. No cache is constructed at all, so query *results* are byte-for-byte the same as a build with no cache code, and the process holds no read-cache memory. This is the flag to set in a memory-constrained container. |
-| `--logs-block-range-threshold <bytes>` | `524288` (512 KiB) | Log-object size above which a `logs` query reads only the pruning-relevant blocks (a tail probe plus per-block ranges, cached per block) instead of the whole object. Set it to `18446744073709551615` to read every log object whole, the shape before this split existed; set it to `0` to use the block-range path for every object. Read once at startup. |
+| `--logs-block-range-threshold <bytes>` | `524288` (512 KiB) | Log-object size above which a `logs` query reads only the pruning-relevant blocks (a tail probe plus per-block ranges, cached per block) instead of the whole object. Set it to `18446744073709551615` to read every log object whole, the shape before this split existed; set it to `0` to use the block-range path for every object. Read once at startup. Under a resolved fetch policy that reads every object whole (`--logs-fetch-policy request-minimal`, or `cost-based` at a profile whose bytes are free) this flag is **overridden**, and startup logs a WARN naming the value it overrode. |
+| `--logs-fetch-policy <policy>` | `cost-based` | The logs read shape (ADR-0996). `request-minimal` reads every object whole in one covering GET, with no tail probe and no ranged read: the cost-preferring shape where transfer is free and the object-store bill is requests. `byte-minimal` is the older behaviour, ranged reads wherever they save more bytes than a request costs, for egress-billed and network-constrained deployments. `cost-based` derives the choice from `--store-cost-profile`; at the shipped reference profile (intra-region, transfer free) that resolves to request-minimal behaviour, so **a deployment on default flags reads log objects whole**. Read once at startup; the running process never changes its own policy. The resolved policy, profile, and byte quantities are logged at startup on the `logs fetch policy resolved` line. |
+| `--store-cost-profile <path>` | reference profile (`s3-intra-region-2026`) | TOML file carrying this deployment's object-store prices in integer nanodollars: `name`, `put_class_nanodollars`, `get_class_nanodollars`, `transfer_nanodollars_per_gib`, `retrieval_nanodollars_per_gib`, and optionally `delete_class_nanodollars`. Only `--logs-fetch-policy cost-based` reads it, to derive how many transferred bytes one saved request is worth; no price reaches the fetch layer. An unreadable file, invalid TOML, an unknown key, or a blank `name` fails startup rather than falling back to the reference prices. |
+| `--logs-max-fetch-run-bytes <bytes>` | `67108864` (64 MiB) | The fetch bound: the maximum length of one covering GET on the log path, on every policy. An object at or under it is read in a single request; a larger one is read as sequential block-aligned covering sub-ranges of at most this many bytes each, so one oversized object cannot pull an unbounded response into memory. `0` is refused at startup. |
 
 ### Disk-tier max-age sweep
 

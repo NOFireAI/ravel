@@ -319,10 +319,21 @@ pub fn build_sql_state(
     // compiled-in `DEFAULT_LOG_REQUEST_COST_BYTES` whatever the flag says, and
     // with it the coalescing gap, the whole-object crossover, and the fast
     // path's projection routing that are all derived from it.
+    // ADR-0996 decision 2: the two quantities above are the RESOLVED ones.
+    // `QueryBudgets::apply_to_engine` runs `--logs-fetch-policy` through
+    // `ravel_query::resolve_logs_fetch` before this config exists, so
+    // `request-minimal` (and `cost-based` at a free-byte profile) arrives here
+    // as a saturated request cost AND a saturated routing threshold, which is
+    // what makes the policy select the read shape instead of being inert.
+    // `--logs-max-fetch-run-bytes` is the fetch bound: it caps one covering
+    // GET's length on every policy, so it has to be handed to the fetcher here
+    // like the other three or the fetcher keeps its compiled-in 64 MiB.
     let mut logs_fetcher = LogSegmentFetcher::new(store.clone())
         .with_block_range_threshold(config.engine.logs_block_range_threshold)
         .with_max_concurrent_gets(config.engine.fetch_concurrency)
-        .with_request_cost_bytes(config.engine.logs_request_cost_bytes);
+        .with_request_cost_bytes(config.engine.logs_request_cost_bytes)
+        .with_max_fetch_run_bytes(config.engine.logs_max_fetch_run_bytes)
+        .map_err(|err| anyhow::anyhow!("invalid logs fetch bound: {err}"))?;
     // The spans fetcher (RSPAN) reads the same object store, with the default
     // RspanConfig (ADR-0045 decision 5). It attaches no fetcher cache: unlike
     // the RSEG/RLOG fetchers it has no `with_cache` seam, and none is wired
@@ -630,7 +641,8 @@ mod tests {
         .expect("catalog");
         let budgets = crate::Cli::try_parse_from(argv)
             .expect("flags parse")
-            .query_budgets();
+            .query_budgets()
+            .expect("budgets resolve");
         build_sql_state(
             catalog,
             store,
