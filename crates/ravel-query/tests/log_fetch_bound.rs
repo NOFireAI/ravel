@@ -111,6 +111,7 @@ fn seg_ref(key: &str, size: u64, records: &[LogRecord]) -> SegmentRef {
         created_unix_ns: 0,
         level: SegmentLevel::L0,
         segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+        declared_column_stats: Default::default(),
     }
 }
 
@@ -252,9 +253,17 @@ fn coded_record(ts: i64, code: i64) -> LogRecord {
 fn above_threshold_object() -> (Vec<LogRecord>, Vec<u8>) {
     let records: Vec<LogRecord> = (0..700i64).map(|ts| coded_record(ts, 500)).collect();
     let bytes = build_object(&records);
+    // The tightest consumer is `cost_based_at_the_reference_profile_routes_whole_object`'s
+    // 0.9x counterfactual (`ranged_projection_pays(size, 0.1)`): it needs the
+    // projection's SAVED bytes, `size * (1.0 - 0.1)`, to exceed the routing
+    // threshold, which is a strictly larger object than merely `size >
+    // threshold`. Guard the exact bound that assertion depends on rather than the
+    // looser one, so a smaller fixture fails here instead of there.
     assert!(
-        bytes.len() as u64 > DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
-        "the fixture must exceed the 512 KiB routing threshold, got {} bytes",
+        bytes.len() as f64 * 0.9 > DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD as f64,
+        "the fixture must clear the 0.9x counterfactual bound (size * 0.9 > {} \
+         bytes), got {} bytes",
+        DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
         bytes.len()
     );
     (records, bytes)
@@ -799,6 +808,134 @@ async fn a_surviving_skip_decidable_plan_records_exactly_one_touch() {
         accounting.snapshot().data_objects_touched,
         1,
         "a plan whose survivors a scan will fetch touches the object exactly once"
+    );
+}
+
+/// A content arm plus a prune arm over `code`. The content arm (`HasWord` on the
+/// body) defeats `plan_skip_decidable`, so `plan_segment` cannot take the
+/// skip-decidable branch and falls through to the ranged whole-object fallback
+/// even above the routing threshold. The `NumRange` prune arm still drives which
+/// blocks the ranged fetch resolves.
+fn content_and_prune_query(code_min: i64, code_max: i64) -> LogQuery {
+    LogQuery::new(0, 399)
+        .with_content(Predicate::HasWord {
+            field: FieldSel::Body,
+            word: "deadbeef".into(),
+        })
+        .with_prune(Predicate::NumRange {
+            field: FieldSel::Attr("code".into()),
+            ty: FieldType::I64,
+            min: Some(code_min as u64),
+            max: Some(code_max as u64),
+        })
+}
+
+/// ADR-0996 decision 3 and the `data_objects_touched` contract in
+/// `ravel_types::accounting` ("if the query then decides to fetch no blocks from
+/// that object, the object was never touched"), on the FALLBACK path this time.
+///
+/// A content arm defeats `plan_skip_decidable`, so an above-threshold object
+/// takes `plan_segment`'s ranged whole-object fallback rather than the
+/// skip-decidable branch. When a disjoint `NumRange` arm prunes every block, the
+/// ranged fetch resolves ZERO candidate-block extents and moves no block byte:
+/// it reads only the footer, SKIP_IDX, FIELD_DIR and front/tail sections. That is
+/// a probe-only read, not a touch, so this must record ZERO -- counting it would
+/// inflate `range_amplification`'s denominator in the flattering direction.
+///
+/// Prove-the-test: this is the residual the fix removes. Flip the recorder in
+/// `plan_segment` back to `*survivors > 0 || footer.is_none()` (the `touched`
+/// flag replaced it): the fallback hands a `None` footer, so `footer.is_none()`
+/// is true and this reads 1 instead of 0. The fix keys on the blocks the fetch
+/// actually resolved (`Some(0)` here) instead.
+#[tokio::test]
+async fn a_zero_candidate_fallback_plan_records_no_touch() {
+    let (records, bytes) = above_threshold_object();
+    let (seg, counting, store) = counted_store("logs/fallback-zero.rlog", &bytes, &records).await;
+
+    // `with_block_range_threshold` pins the inner whole-object crossover to the
+    // same value, so an object above it takes the TRUE ranged path rather than
+    // the size-threshold whole-object crossover (which would read every block and
+    // legitimately be a touch). This is the band the residual lives in.
+    let fetcher = LogSegmentFetcher::new(store)
+        .with_block_range_threshold(DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD);
+    assert_eq!(
+        fetcher.block_range_threshold(),
+        DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+        "the object is above the routing threshold, so the ranged fallback runs"
+    );
+    let accounting = QueryAccounting::new();
+
+    // `code` is 500 on every record, so this arm is disjoint from every block's
+    // numeric stat and prunes them all; the content arm forces the fallback.
+    let (survivors, _stats, footer) = fetcher
+        .plan_segment(
+            &seg,
+            TENANT,
+            &content_and_prune_query(9_000, 10_000),
+            &accounting,
+        )
+        .await
+        .expect("plan")
+        .expect("the segment is ts-relevant, so this is not the irrelevant None");
+    assert_eq!(
+        survivors, 0,
+        "the disjoint prune arm eliminates every block"
+    );
+    assert!(
+        footer.is_none(),
+        "the content arm defeats skip-decidable, so this is the ranged fallback, \
+         whose footer is not carried forward"
+    );
+    assert!(
+        counting.probe_count() > 0,
+        "the ranged fallback issued its suffix probe, so the branch under test ran"
+    );
+
+    assert_eq!(
+        accounting.snapshot().data_objects_touched,
+        0,
+        "a fallback that resolved zero candidate blocks fetched no block byte and \
+         is not a touch"
+    );
+}
+
+/// The sibling of the test above, same fixture and same fallback branch, with a
+/// prune arm that keeps every block. The ranged fetch resolves one or more
+/// candidate-block extents and decodes them, so the object is touched exactly
+/// once -- even if row filtering (the content arm) then leaves zero survivors,
+/// because the blocks were fetched and decoded before that decision.
+#[tokio::test]
+async fn a_block_decoding_fallback_plan_records_exactly_one_touch() {
+    let (records, bytes) = above_threshold_object();
+    let (seg, counting, store) = counted_store("logs/fallback-live.rlog", &bytes, &records).await;
+
+    let fetcher = LogSegmentFetcher::new(store)
+        .with_block_range_threshold(DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD);
+    let accounting = QueryAccounting::new();
+
+    // `code = 500` on every record falls inside this arm, so every block is a
+    // candidate and the ranged fetch resolves and decodes blocks.
+    let (_survivors, _stats, footer) = fetcher
+        .plan_segment(
+            &seg,
+            TENANT,
+            &content_and_prune_query(0, 1_000),
+            &accounting,
+        )
+        .await
+        .expect("plan")
+        .expect("relevant");
+    assert!(
+        footer.is_none(),
+        "same content-armed fallback branch as the sibling"
+    );
+    assert!(counting.probe_count() > 0, "same branch, same probe");
+
+    assert_eq!(
+        accounting.snapshot().data_objects_touched,
+        1,
+        "a fallback that decoded one or more blocks touches the object exactly \
+         once, regardless of surviving rows"
     );
 }
 

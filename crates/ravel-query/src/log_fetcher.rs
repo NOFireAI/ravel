@@ -1025,7 +1025,7 @@ impl LogSegmentFetcher {
         // chunk of every surviving block (ADR-0699 decision 5).
         let all = ColumnSelection::all();
         let result = async {
-            let Some(bytes) = self
+            let Some((bytes, _blocks_read)) = self
                 .tenant_bytes(
                     seg_ref,
                     tenant_hash,
@@ -1094,7 +1094,7 @@ impl LogSegmentFetcher {
         columns: &ColumnSelection,
         accounting: &QueryAccounting,
     ) -> Result<Option<LogSegmentScan>, LogFetchError> {
-        let Some(bytes) = self
+        let Some((bytes, _blocks_read)) = self
             .tenant_bytes(
                 seg_ref,
                 tenant_hash,
@@ -1258,7 +1258,9 @@ impl LogSegmentFetcher {
                 let (n, stats, footer) = self
                     .plan_segment_fast(seg_ref, tenant_hash, accounting)
                     .await?;
-                return Ok(Some((n, stats, Some(footer))));
+                // Footer-carrying branch: no block byte is read here, so the
+                // touch is the scan that follows a nonzero survivor count.
+                return Ok(Some((n, stats, Some(footer), n > 0)));
             }
 
             // Skip-index-only survivor count (#761): when every block-level predicate
@@ -1326,7 +1328,10 @@ impl LogSegmentFetcher {
                     bloom_degraded: false,
                     postings_degraded: false,
                 };
-                return Ok(Some((survivors, plan_stats, Some(footer))));
+                // Footer-carrying branch: only the probe, SKIP_IDX and FIELD_DIR
+                // were read, no block byte, so the touch is the scan a nonzero
+                // survivor count will drive.
+                return Ok(Some((survivors, plan_stats, Some(footer), survivors > 0)));
             }
 
             // Fallback: a predicate the skip index cannot decide (a `has_word`/text
@@ -1338,7 +1343,7 @@ impl LogSegmentFetcher {
             // it (a `None` footer on a relevant segment) as a `plan_full_reads` so a
             // report can see which queries still pay it.
             let all = ColumnSelection::all();
-            let Some(bytes) = self
+            let Some((bytes, blocks_read)) = self
                 .tenant_bytes(
                     seg_ref,
                     tenant_hash,
@@ -1354,7 +1359,17 @@ impl LogSegmentFetcher {
             let key = &seg_ref.data_object_key;
             let span = decode_span();
             let scan = span.in_scope(|| self.open_scan(key, &bytes, query, &all))?;
-            Ok(Some((scan.remaining_blocks(), scan.stats(), None)))
+            // This fallback read fetched blocks iff `tenant_bytes` resolved at
+            // least one (ranged path) or read the whole object (`None`, every
+            // block present). A ranged read that pruned every block resolved zero
+            // extents and moved no block byte, so it is NOT a touch even though it
+            // read the directory sections; a read that decoded one or more blocks
+            // IS a touch even if row filtering then leaves zero survivors.
+            let touched = match blocks_read {
+                None => true,
+                Some(n) => n > 0,
+            };
+            Ok(Some((scan.remaining_blocks(), scan.stats(), None, touched)))
         }
         .await;
         caller_accounting.merge_snapshot(&phase.snapshot().pooled());
@@ -1385,16 +1400,24 @@ impl LogSegmentFetcher {
         //   away. `owned_work` assigns a zero-survivor segment to no partition,
         //   so no scan GET ever follows and not one block byte moves.
         //
-        // A `None` footer is the whole-object fallback, which fetched the object
-        // (blocks included) to compute its survivor count, so it is a touch even
-        // at zero survivors. The two footer-carrying branches always precede a
-        // scan when they report survivors.
-        if let Ok(Some((survivors, _, footer))) = &result
-            && (*survivors > 0 || footer.is_none())
+        // The fallback (a `None` footer) is a touch only when it actually read
+        // this object's blocks. Above the routing threshold it takes the ranged
+        // path, which resolves candidate-block extents from the skip index: when
+        // a prune arm eliminates every block (e.g. a content arm defeats
+        // skip-decidable while a disjoint NumRange arm prunes all blocks) it
+        // resolves zero extents and fetches only the directory sections, moving
+        // no block byte -- not a touch. So the recorder keys on the blocks each
+        // branch actually read (the `touched` flag), not on footer presence: the
+        // footer-carrying branches set it from their survivor count, and the
+        // fallback from whether `tenant_bytes` read any block (contract:
+        // `ravel_types::accounting`, blocks read are cache-inclusive, so the
+        // signal is resolved blocks, never wire bytes).
+        if let Ok(Some((_, _, _, touched))) = &result
+            && *touched
         {
             caller_accounting.add_data_objects_touched(1);
         }
-        result
+        result.map(|opt| opt.map(|(survivors, stats, footer, _)| (survivors, stats, footer)))
     }
 
     /// Whether [`plan_segment`](Self::plan_segment)'s survivor count can be read
@@ -1662,7 +1685,7 @@ impl LogSegmentFetcher {
         footer: Option<&footer::LogFooter>,
         accounting: &QueryAccounting,
     ) -> Result<Option<LogSegmentScan>, LogFetchError> {
-        let Some(bytes) = self
+        let Some((bytes, _blocks_read)) = self
             .tenant_bytes_with_footer(
                 seg_ref,
                 tenant_hash,
@@ -1701,6 +1724,15 @@ impl LogSegmentFetcher {
     /// because this funnel serves both: the scan funnels below reach it as a
     /// data read, and [`plan_segment`](Self::plan_segment)'s fallback reaches it
     /// as a planning read for a predicate the skip index cannot decide.
+    ///
+    /// The second element of the returned tuple reports how many logical BLOCKS
+    /// this read brought into the buffer, cache-inclusive, so a caller that must
+    /// decide whether the object was TOUCHED (its blocks read) can key on the
+    /// blocks actually resolved rather than on wire bytes: `None` means the whole
+    /// object was read (every block is present, so a decode of any of them is a
+    /// touch), and `Some(n)` means the ranged path resolved exactly `n`
+    /// candidate-block extents into the buffer (a touch iff `n > 0`). See
+    /// [`tenant_bytes_with_footer`](Self::tenant_bytes_with_footer).
     async fn tenant_bytes(
         &self,
         seg_ref: &SegmentRef,
@@ -1709,7 +1741,7 @@ impl LogSegmentFetcher {
         columns: &ColumnSelection,
         phase: ProbePhase,
         accounting: &QueryAccounting,
-    ) -> Result<Option<Bytes>, LogFetchError> {
+    ) -> Result<Option<(Bytes, Option<u64>)>, LogFetchError> {
         self.tenant_bytes_with_footer(
             seg_ref,
             tenant_hash,
@@ -1738,6 +1770,15 @@ impl LogSegmentFetcher {
     /// it fetched with would address pages this never brought, which is a typed
     /// `Corrupted` error rather than wrong data, so the two must be the same
     /// value.
+    ///
+    /// The second element of the returned tuple is the count of logical BLOCKS
+    /// brought into the buffer (see [`tenant_bytes`](Self::tenant_bytes)):
+    /// `Some(candidate_blocks)` on the ranged (above-threshold) path, the exact
+    /// number of block extents the fetch resolved and decoded, and `None` on the
+    /// whole-object (below-threshold) path, where every block is present. It lets
+    /// a caller decide "were this object's blocks read" from the blocks actually
+    /// resolved, not from wire bytes, which a fully-pruned ranged read moves none
+    /// of even though the read happened.
     #[allow(clippy::too_many_arguments)]
     async fn tenant_bytes_with_footer(
         &self,
@@ -1748,7 +1789,7 @@ impl LogSegmentFetcher {
         footer: Option<&footer::LogFooter>,
         phase: ProbePhase,
         accounting: &QueryAccounting,
-    ) -> Result<Option<Bytes>, LogFetchError> {
+    ) -> Result<Option<(Bytes, Option<u64>)>, LogFetchError> {
         if !Self::ts_range_relevant(seg_ref, query.ts_min_ns, query.ts_max_ns) {
             return Ok(None);
         }
@@ -1813,13 +1854,28 @@ impl LogSegmentFetcher {
             // covered by the derived probe window on this read, reported beside
             // the request/byte counts and charged to the caller's phase.
             self.record_probe_misses(&fetch_span, &stats, phase);
-            return Ok(Some(bytes));
+            // Blocks read on the ranged path: the candidate extents the fetch
+            // resolved, EXCEPT when a crossover (size-threshold or coverage) took
+            // the whole object anyway, where every block is present -- reported as
+            // `None`, the same "whole object" signal the below-threshold branch
+            // returns, so the caller counts a touch without a block count it does
+            // not have here. A non-crossover ranged read that resolved zero
+            // candidates moved no block bytes and is `Some(0)`.
+            let blocks_read = if stats.whole_object {
+                None
+            } else {
+                Some(stats.candidate_blocks)
+            };
+            return Ok(Some((bytes, blocks_read)));
         }
 
-        Ok(Some(
+        // Whole-object (below-threshold) read: the entire object is in the buffer,
+        // so every block is present; `None` signals that to the caller.
+        Ok(Some((
             self.whole_object_bytes(seg_ref, tenant_hash, phases.blocks, accounting)
                 .await?,
-        ))
+            None,
+        )))
     }
 
     /// One whole-object [`GetRange::Full`] read, cache-keyed `(0, object_size)`,
