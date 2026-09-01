@@ -15,6 +15,7 @@ mod generation;
 mod idempotency;
 mod indexed_fields;
 mod lifecycle;
+mod log_declared_stats;
 mod log_error;
 mod log_metrics;
 mod log_router;

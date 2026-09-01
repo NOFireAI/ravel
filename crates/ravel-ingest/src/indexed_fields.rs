@@ -35,7 +35,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use ravel_catalog::read_config_values;
+use ravel_catalog::{DeclaredTypedColumn, read_config_values};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_types::TenantHash;
 
@@ -75,6 +75,14 @@ const NEVER: i64 = i64::MIN;
 #[derive(Debug, Clone)]
 struct CacheEntry {
     fields: Vec<String>,
+    /// The tenant's durable declared typed columns (ADR-0090), read from the
+    /// same `TenantConfig` GET that resolves `fields` (ADR-0873 wave 5a: "the
+    /// same durable-config bounded-staleness read that already supplies indexed
+    /// fields"). Empty when the config declares none, or on a base-only entry
+    /// captured before any successful read. Advisory like `fields`: a stale or
+    /// empty list only costs a segment its stamp coverage (it scans), never a
+    /// wrong answer, so it follows the identical failure discipline.
+    typed_columns: Vec<DeclaredTypedColumn>,
     refreshed_at_ns: i64,
     attempted_at_ns: i64,
     last_touched_ns: i64,
@@ -199,6 +207,28 @@ impl IndexedFieldsOverlay {
         }
     }
 
+    /// The tenant's declared typed columns as last resolved into the cache
+    /// (ADR-0873 wave 5a). Read after the flush has already resolved this
+    /// tenant's indexed fields for the same tick (fast path or `refresh`), so
+    /// the entry exists and its `typed_columns` came from the same durable read;
+    /// returns an empty list when no entry exists yet or the config declares
+    /// none. Stamps `last_touched_ns` so reading declared columns keeps an entry
+    /// live exactly as a field read does. `now_ns` is the flush's pinned clock.
+    pub(crate) fn typed_columns_cached(
+        &self,
+        tenant: &TenantHash,
+        now_ns: i64,
+    ) -> Vec<DeclaredTypedColumn> {
+        let mut inner = self.lock();
+        match inner.cache.get_mut(tenant) {
+            Some(entry) => {
+                entry.last_touched_ns = now_ns;
+                entry.typed_columns.clone()
+            }
+            None => Vec::new(),
+        }
+    }
+
     /// Async refresh on a miss or stale entry: read this one tenant's
     /// `TenantConfig`, validate a present durable list, overlay it onto the base,
     /// install the result, and return it. Reads the store at most once per call,
@@ -238,6 +268,13 @@ impl IndexedFieldsOverlay {
         // path that installs a fresh value and clears the backoff.
         match read_config_values(store, tenant).await {
             Ok(config) => {
+                // The declared typed columns ride the same read (ADR-0873 wave
+                // 5a); an absent list is the ordinary "no declared columns"
+                // state, never an error.
+                let typed_columns = config
+                    .as_ref()
+                    .and_then(|c| c.typed_attr_columns.clone())
+                    .unwrap_or_default();
                 let durable = config.and_then(|c| c.indexed_fields);
                 match durable {
                     // A present durable override: validate before it can replace
@@ -246,12 +283,12 @@ impl IndexedFieldsOverlay {
                     Some(list) if validate_indexed_list(&list).is_err() => {
                         self.serve_on_failure(tenant, now_ns)
                     }
-                    Some(list) => self.install_fresh(tenant, list, now_ns),
+                    Some(list) => self.install_fresh(tenant, list, typed_columns, now_ns),
                     // No override: the base's own tenant-override-or-default
                     // resolution stands unchanged.
                     None => {
                         let base_fields = self.base.fields_for(tenant);
-                        self.install_fresh(tenant, base_fields, now_ns)
+                        self.install_fresh(tenant, base_fields, typed_columns, now_ns)
                     }
                 }
             }
@@ -265,6 +302,7 @@ impl IndexedFieldsOverlay {
         &self,
         tenant: &TenantHash,
         fields: Vec<String>,
+        typed_columns: Vec<DeclaredTypedColumn>,
         now_ns: i64,
     ) -> RefreshOutcome {
         let mut inner = self.lock();
@@ -272,6 +310,7 @@ impl IndexedFieldsOverlay {
             *tenant,
             CacheEntry {
                 fields: fields.clone(),
+                typed_columns,
                 refreshed_at_ns: now_ns,
                 attempted_at_ns: NEVER,
                 last_touched_ns: now_ns,
@@ -305,6 +344,10 @@ impl IndexedFieldsOverlay {
             *tenant,
             CacheEntry {
                 fields: base_fields.clone(),
+                // No config ever read for this tenant: no declared columns are
+                // known, so no segment it flushes is stamped until a read
+                // succeeds. Fail-closed to uncovered, never to a wrong stamp.
+                typed_columns: Vec::new(),
                 refreshed_at_ns: NEVER,
                 attempted_at_ns: now_ns,
                 last_touched_ns: now_ns,
