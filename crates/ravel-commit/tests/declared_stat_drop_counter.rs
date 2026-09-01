@@ -241,11 +241,25 @@ fn a_snapshot_entry_twin_observes_under_its_own_label() {
 /// else. The total is the sum over labels, so it moves with them.
 #[test]
 fn the_cstat_label_is_reportable_from_outside_this_crate() {
+    // Hold the serialising lock across the WHOLE assertion: with_delta's
+    // internal guard alone leaves windows before and after it in which a
+    // parallel test in this binary can move the process-wide total.
+    let _guard = counter_lock();
     let before_total = declared_stat_drops_observed_total();
-    let ((), delta, others) = with_delta(StatCarrier::Cstat, || {
-        observe_declared_stat_drops(StatCarrier::Cstat, 3);
-    });
-    assert_eq!(delta, 3);
+    let before = observed_all();
+    observe_declared_stat_drops(StatCarrier::Cstat, 3);
+    let after = observed_all();
+    let mut mine = 0;
+    let mut others = 0;
+    for ((label, b), a) in StatCarrier::ALL.iter().zip(before.iter()).zip(after.iter()) {
+        let delta = a - b;
+        if *label == StatCarrier::Cstat {
+            mine = delta;
+        } else {
+            others += delta;
+        }
+    }
+    assert_eq!(mine, 3);
     assert_eq!(others, 0, "a .cstat refusal is not a stamp-carrier drop");
     assert_eq!(
         declared_stat_drops_observed_total() - before_total,
@@ -254,11 +268,13 @@ fn the_cstat_label_is_reportable_from_outside_this_crate() {
     );
 
     // Zero is not an event: a reader that refuses nothing must not move the
-    // metric, or every clean read would look like a defect.
-    let ((), delta, others) = with_delta(StatCarrier::Cstat, || {
-        observe_declared_stat_drops(StatCarrier::Cstat, 0);
-    });
-    assert_eq!((delta, others), (0, 0));
+    // metric, or every clean read would look like a defect. Still under the
+    // held guard above, so no parallel test can interleave (and calling
+    // with_delta here would deadlock on the same lock).
+    let zero_before = observed_all();
+    observe_declared_stat_drops(StatCarrier::Cstat, 0);
+    let zero_after = observed_all();
+    assert_eq!(zero_before, zero_after, "a zero observation moves nothing");
 }
 
 /// The label set is complete and its strings are the ones ADR-0873 decision 2

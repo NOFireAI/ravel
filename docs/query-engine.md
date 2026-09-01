@@ -244,8 +244,8 @@ tests that stamp a record directly and by the fold's carriage of whatever a
 record happens to carry. The read side landed first on purpose (a reader that
 refuses a defective stamp has to exist before any writer can emit one), but the
 consequence is worth stating plainly: on today's deployments this shortcut is
-inert on the stamp side, and no coverage change is observable from it until
-#1022 ships.
+inert on the stamp side, and no coverage change is observable from it
+until issue #1022 ships.
 
 Stamp eligibility is an allowlist, `I64` and `BOOL`
 (`ravel_types::declared_stats`). `Str`/`Bytes` are excluded because a stamped
@@ -1001,8 +1001,8 @@ distributed slice set against a local read of the same segments.
 
 The two sections above describe the engine-level (queryfrag) machinery. The SQL
 surface has its own distributed scan that drives log and trace *search* over the
-`logs`, `alerts`, `audit`, and `spans` tables (ADR-0071 task T6, shipped as T6a
-#326 for the RLOG family and T6b #327 for spans;
+`logs`, `alerts`, `audit`, and `spans` tables (ADR-0071 task T6, shipped
+as T6a #326 for the RLOG family and T6b #327 for spans;
 `crates/ravel-sql/src/distributed_rlog.rs`). It fans a table scan out to worker
 slices instead of scanning the local snapshot, then merges the per-slice streams
 at the coordinator.

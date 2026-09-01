@@ -1484,8 +1484,10 @@ impl LogsScanExec {
     /// there are zero segments, and SQL `MIN`/`MAX` over all-NULL or zero-row
     /// input is `NULL`.
     ///
-    /// [`DeclaredExactStats::null_count`] is `Some` only when every covering
-    /// carrier proved its figure, which today means the stamp: a stamp's
+    /// [`DeclaredExactStats::null_count`] is `Some` when the carriers agree
+    /// on the figure AND at least one carrier proved it (`agrees_with` has
+    /// already pinned both to the same value, so one proof covers both);
+    /// today the proving carrier is the stamp: a stamp's
     /// `null_count` passed clauses 4 and 5 against the carrying record's own
     /// row count before the type existed, while a `.cstat` entry's row
     /// accounting is not reconciled against the joined
@@ -2204,7 +2206,15 @@ impl ExecutionPlan for LogsScanExec {
             // carriers that disagree, a refused entry, or an unsupported
             // declared type all report `None`, leaving the column `Absent`);
             // this loop only decides which output index to fill.
-            let declared_min_max = self.declared_min_max_all();
+            // Skip the whole walk when the projection carries no declared
+            // column: partition_statistics runs several times per plan, and a
+            // ts-only statement must not pay one lookup per (segment, column).
+            let projects_declared = self.projection.iter().any(|&i| i >= FIRST_DECLARED_COL);
+            let declared_min_max = if projects_declared {
+                self.declared_min_max_all()
+            } else {
+                Vec::new()
+            };
             for (k, exact) in declared_min_max.into_iter().enumerate() {
                 let schema_idx = FIRST_DECLARED_COL + k;
                 if let Some(out_idx) = self.projection.iter().position(|&i| i == schema_idx)
