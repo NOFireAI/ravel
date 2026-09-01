@@ -370,7 +370,13 @@ impl Absolutes {
     /// other policy, so an unstamped or differently-stamped report skips it.
     /// The relative [`edge_eps`] applies here for the same reason it applies to
     /// the ranged bands: these are ratio and cost figures, not exact geometry.
-    fn violation(&self, class: FigureClass, value: f64, request_minimal: bool) -> Option<String> {
+    fn violation(
+        &self,
+        class: FigureClass,
+        name: &str,
+        value: f64,
+        request_minimal: bool,
+    ) -> Option<String> {
         match class {
             FigureClass::RangeAmplification => {
                 if let Some(ceiling) = self.range_amplification_ceiling
@@ -406,7 +412,12 @@ impl Absolutes {
                     )
                 })
             }
-            FigureClass::DataGets => {
+            // Both corpus ceilings are scoped by figure NAME, not only class:
+            // `data_get_calls` shares the DataGets class as the diagnostic
+            // beside the billed attempts, and the transfer/retrieval cost terms
+            // share ModeledRequestCost as unsummable siblings. A ceiling
+            // measured for one quantity must judge exactly that quantity.
+            FigureClass::DataGets if name == "data_gets" => {
                 let max = self.cold_gets_max?;
                 (value - max > edge_eps(max)).then(|| {
                     format!(
@@ -416,7 +427,7 @@ impl Absolutes {
                     )
                 })
             }
-            FigureClass::ModeledRequestCost => {
+            FigureClass::ModeledRequestCost if name == "modeled_request_cost" => {
                 let max = self.modeled_cost_max_nanodollars?;
                 (value - max > edge_eps(max)).then(|| {
                     format!(
@@ -486,7 +497,16 @@ impl BandToml {
             })
         };
         Ok(match self.kind {
-            BandKind::Exact => Band::Exact,
+            BandKind::Exact => {
+                if self.allowance.is_some() {
+                    return Err(CompareError::MalformedBands(format!(
+                        "band `{class}` is `exact` and takes no `allowance`: an exact band \
+                         admits zero drift, so a supplied allowance is a misconfiguration, \
+                         not a widening"
+                    )));
+                }
+                Band::Exact
+            }
             BandKind::Percent => Band::Percent {
                 allowance: allowance()?,
             },
@@ -1179,7 +1199,7 @@ fn compare_one(
         (cand_fig.value, ctx.cand_request_minimal, "candidate"),
     ] {
         if let Some(value) = value
-            && let Some(reason) = absolutes.violation(class, value, request_minimal)
+            && let Some(reason) = absolutes.violation(class, name, value, request_minimal)
         {
             row.verdict = Verdict::Fail(format!("figure `{name}` in the {which} report: {reason}"));
             return row;
@@ -1945,6 +1965,82 @@ mod tests {
         assert!(
             matches!(err, CompareError::MalformedBands(_)),
             "typed malformed-bands refusal, got {err:?}"
+        );
+    }
+
+    /// An `allowance` beside `kind = "exact"` is the same misconfiguration
+    /// class: the key is structurally valid, so only `to_band` can refuse it.
+    #[test]
+    fn an_allowance_on_an_exact_band_is_refused() {
+        let err = Bands::from_toml_str("[data_gets]\nkind = \"exact\"\nallowance = 10.0\n")
+            .expect_err("an exact band with an allowance must refuse");
+        assert!(
+            matches!(err, CompareError::MalformedBands(_)),
+            "typed malformed-bands refusal, got {err:?}"
+        );
+    }
+
+    /// The corpus ceilings are name-scoped: `data_get_calls` shares the
+    /// DataGets class as a diagnostic, and the transfer/retrieval cost terms
+    /// share ModeledRequestCost, so a ceiling measured for the billed figure
+    /// must not judge its class siblings.
+    #[test]
+    fn corpus_ceilings_judge_only_their_named_figure() {
+        let bands = Bands::from_toml_str(
+            "[absolute]\ncold_gets_max = 100.0\nmodeled_cost_max_nanodollars = 1000.0\n",
+        )
+        .expect("valid absolute overrides");
+
+        let mut base = baseline_report();
+        let mut cand = baseline_report();
+        for report in [&mut base, &mut cand] {
+            // Class siblings far past both ceilings: must pass untouched.
+            report.figures.push(fig(
+                "data_get_calls",
+                FigureClass::DataGets,
+                Some(1_000_000.0),
+                Some("calls"),
+            ));
+            report.figures.push(fig(
+                "modeled_transfer_cost",
+                FigureClass::ModeledRequestCost,
+                Some(1_000_000_000.0),
+                Some("nanodollars-transfer"),
+            ));
+            // The named figures inside their ceilings.
+            for f in &mut report.figures {
+                if f.name == "data_gets" {
+                    f.value = Some(90.0);
+                }
+                if f.name == "modeled_request_cost" {
+                    f.value = Some(900.0);
+                }
+            }
+        }
+        let cmp = compare(&base, &cand, &bands).expect("comparable");
+        assert!(
+            !cmp.regressed(),
+            "class siblings past the ceilings must not be judged by them: {:?}",
+            cmp.rows
+                .iter()
+                .filter(|r| r.verdict.is_fail())
+                .map(|r| &r.name)
+                .collect::<Vec<_>>()
+        );
+
+        // The named figure past its ceiling still fails (the other named
+        // figure held inside its own ceiling so exactly one row fails).
+        let base = with_value(
+            with_value(baseline_report(), "modeled_request_cost", Some(900.0)),
+            "data_gets",
+            Some(101.0),
+        );
+        let cand = base.clone();
+        let cmp = compare(&base, &cand, &bands).expect("comparable");
+        assert_eq!(
+            failing_names(&cmp),
+            vec!["data_gets"],
+            "the named figure is still gated by its ceiling"
         );
     }
 
