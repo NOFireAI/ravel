@@ -918,9 +918,9 @@ async fn one_carrier_each_still_covers_the_whole_snapshot() {
     assert_eq!(out.gets, 0);
 
     // The NULL count, by contrast, stays `Absent`: segment B's figure comes
-    // from a `.cstat` entry, whose row accounting nothing on this path
-    // reconciles against the joined `sample_count`. The extrema are exact
-    // regardless.
+    // from a `.cstat` entry, which is reconciled against the joined
+    // `sample_count` before any grant but whose NULL count is deliberately
+    // not promoted to proven. The extrema are exact regardless.
     let col_stats = scan_stats(snapshot, Some(stats));
     let col = declared_col_stats(&col_stats);
     assert_eq!(

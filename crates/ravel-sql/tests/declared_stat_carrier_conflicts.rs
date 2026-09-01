@@ -264,8 +264,8 @@ fn one_carrier_alone_is_not_a_conflict() {
     assert_eq!(
         col.null_count,
         Precision::Absent,
-        "a .cstat NULL count is not reconciled against the joined sample_count \
-         on this path, so it is never reported as exact"
+        "a .cstat NULL count is reconciled against the joined sample_count but \
+         deliberately not promoted to proven, so it is never reported as exact"
     );
     assert_eq!(delta, 0);
 }
