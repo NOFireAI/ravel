@@ -1450,7 +1450,9 @@ One of those lifecycle-rule requirements is not optional for any bucket Ravel
 writes to: **configure `AbortIncompleteMultipartUpload`** with a cleanup period
 of 7 days or less. Nothing in `ravel-server` reaps orphaned multipart parts, so
 a best-effort abort that itself fails, or an upload future dropped mid-flight,
-leaves parts billed until this rule reaps them. Two `S3Store` counters make that
+leaves cleanup unconfirmed: S3 can apply an abort and still return an error
+(docs/object-store-contract.md), so parts may remain billed until this rule
+reaps them. Two `S3Store` counters make that
 otherwise-silent failure observable: `multipart_abort_failures` (best-effort
 aborts whose request returned an error) and `multipart_uploads_unreaped`
 (multipart uploads that ended without a confirmed successful abort for any
