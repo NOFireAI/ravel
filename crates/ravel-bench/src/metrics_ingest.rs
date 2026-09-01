@@ -727,7 +727,7 @@ pub async fn replay_into_ravel(
     // comparators, whose encode IS genuine client work inside their own window.
     // `wire_bytes` is finalized here and immutable through the timed loop. Move
     // this accumulation into the timed `write_values` loop below to see
-    // `tests::ravel_window_excludes_the_rw1_encode` observe the change.
+    // `tests::wire_bytes_equal_the_precomputed_rw1_body_sum` observe the change.
     let mut precomputed_wire_bytes: u64 = 0;
     for chunk in valid.chunks(batch_size) {
         let logical: Vec<LogicalSample> = chunk.iter().map(|(_, s)| s.clone()).collect();
@@ -888,9 +888,19 @@ pub async fn query_after_replay(
         .map_err(|e| LaneError::Query(e.to_string()))?;
     let elapsed_secs = wall_start.elapsed().as_secs_f64();
 
+    // A non-vector result is a typed error, never matched_series: 0 -- a
+    // scalar evaluation and "the token-bound read matched no series" must not
+    // be the same figure (the module's ABSENT-not-zero rule). The binary
+    // passes a bare metric name so a vector is produced there; this guards
+    // every other caller of the public query_after_replay.
     let matched_series = match value {
         Value::Vector(v) => v.len() as u64,
-        _ => 0,
+        other => {
+            return Err(LaneError::Query(format!(
+                "the read-your-write query produced a non-vector result ({});                  matched_series is defined only for vector evaluations",
+                other.type_name()
+            )));
+        }
     };
 
     Ok(SystemQueryResult {
@@ -1603,19 +1613,17 @@ mod tests {
         );
     }
 
-    /// FIX 5 (issue #937 review finding 5): the RW1.0 encode is precomputed
-    /// OUTSIDE the Ravel timed window, so `elapsed_secs` measures only the
-    /// in-process writes (which never serialize an RW1.0 body), and `wire_bytes`
-    /// is unchanged: it still equals the exact sum of the per-batch snappy body
-    /// lengths, computed here independently of the timed run.
-    ///
-    /// TO SEE THE WINDOW REGRESS: move the `wire_bytes += encode_rw1_body(...)`
-    /// accumulation in `replay_into_ravel` from the pre-`wall_start` precompute
-    /// loop back into the timed `write_values` loop. `wire_bytes` still equals
-    /// this precomputed value, but `elapsed_secs` then folds in the encode the
-    /// in-process path never performs -- the skew this fix removes.
+    /// FIX 5 (issue #937 review finding 5): pins the VALUE side of the fix --
+    /// `wire_bytes` equals the exact sum of the per-batch snappy body lengths,
+    /// recomputed here independently. The WINDOW side (the encode running
+    /// before `wall_start`) is not observable from a value assertion: moving
+    /// the accumulation back into the timed loop leaves `wire_bytes`
+    /// unchanged. That property is enforced by code structure -- the
+    /// precompute loop completes before `wall_start` is taken in
+    /// `replay_into_ravel` -- and the name of this test claims only what it
+    /// asserts.
     #[tokio::test]
-    async fn ravel_window_excludes_the_rw1_encode() {
+    async fn wire_bytes_equal_the_precomputed_rw1_body_sum() {
         let n = 40usize;
         let batch_size = 8usize;
         let stream = valid_stream(n, 8);
