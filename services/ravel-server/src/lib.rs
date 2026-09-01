@@ -7,6 +7,7 @@ pub mod alerting;
 pub mod analytics;
 pub mod bucket_protection;
 pub mod cache_warm;
+pub mod cli_reference;
 pub mod config;
 #[cfg(feature = "sql")]
 pub mod declared_columns;
