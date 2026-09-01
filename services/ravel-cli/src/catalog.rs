@@ -19,6 +19,7 @@ use ravel_types::{Signal, TenantHash, TenantId};
 use uuid::Uuid;
 
 use crate::maintain::SignalArg;
+use crate::store::{StoreSelection, require_tenant_data_present};
 
 /// HEAD object key (docs/catalog-and-mvcc.md key layout, frozen format).
 /// Duplicated here rather than imported: `ravel-catalog` only exposes the
@@ -61,8 +62,14 @@ fn seal_margin_ns(config: &CatalogConfig) -> anyhow::Result<i64> {
 /// `clock_skew_allowance_ns` and `fold_safety_margin_ns` keep their defaults:
 /// the override asserts that no writer is still flushing, not that the
 /// folder's clock is exact.
+///
+/// `selection` is which store `--store` resolved to. It is the report's first
+/// line, and a fold over a tenant prefix that holds nothing at all on the
+/// defaulted memory store is refused rather than reported as a fold that
+/// sealed nothing (issue #1024).
 pub async fn fold(
     store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
     tenant: &str,
     shard_count: u32,
     signal: SignalArg,
@@ -77,6 +84,15 @@ pub async fn fold(
         catalog_config.max_flush_lifetime_ns = ns;
     }
     let seal_margin_ns = seal_margin_ns(&catalog_config)?;
+    let tenant_hash = TenantId::new(tenant).hash();
+    require_tenant_data_present(
+        selection,
+        store.as_ref(),
+        "catalog fold",
+        tenant,
+        &tenant_hash,
+    )
+    .await?;
     // Enforcing, exactly as the server's query path (`ravel_server::query`) is:
     // an enforcing fold reads the tenant's real shard-generation history and
     // stamps a correct `shard_generation_count` and fan-out ceiling, instead of
@@ -87,7 +103,6 @@ pub async fn fold(
         .map_err(|err| anyhow::anyhow!("failed to build catalog: {err}"))?
         .with_provisioning_enforcement();
 
-    let tenant_hash = TenantId::new(tenant).hash();
     let folder_id = Uuid::new_v4();
     let report = catalog
         .fold(
@@ -102,6 +117,7 @@ pub async fn fold(
         .map_err(|err| anyhow::anyhow!("fold failed: {err}"))?;
 
     let mut out = String::new();
+    out.push_str(&format!("{}\n", selection.header()));
     out.push_str(&format!("signal: {}\n", signal_word(signal.to_signal())));
     out.push_str(&format!("no_op: {}\n", report.no_op));
     out.push_str(&format!("rebuilt: {}\n", report.rebuilt));
@@ -128,11 +144,12 @@ pub async fn fold(
 
 pub async fn inspect(
     store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
     tenant: &str,
     signal: SignalArg,
 ) -> anyhow::Result<()> {
     let mut out = String::new();
-    let result = render_inspect(store, tenant, signal, &mut out).await;
+    let result = render_inspect(store, selection, tenant, signal, &mut out).await;
     // Print whatever was rendered even on error: a part fetch/decode failure
     // partway through must not discard the HEAD fields and every earlier
     // part's ref this call already rendered -- an operator inspecting a
@@ -156,11 +173,21 @@ pub async fn inspect(
 /// one part whose range starts at hour 0.
 pub async fn render_inspect(
     store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
     tenant: &str,
     signal: SignalArg,
     out: &mut String,
 ) -> anyhow::Result<()> {
     let tenant_hash = TenantId::new(tenant).hash();
+    out.push_str(&format!("{}\n", selection.header()));
+    require_tenant_data_present(
+        selection,
+        store.as_ref(),
+        "catalog inspect",
+        tenant,
+        &tenant_hash,
+    )
+    .await?;
     let key = head_key(&tenant_hash, signal.to_signal());
 
     let head_bytes = match store.get(&key, GetRange::Full).await {
@@ -284,10 +311,20 @@ fn format_uuid_bytes(bytes: &[u8]) -> String {
 /// expected, not a divergence.
 pub async fn verify(
     store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
     tenant: &str,
     signal: SignalArg,
 ) -> anyhow::Result<()> {
     let tenant_hash = TenantId::new(tenant).hash();
+    selection.print_header();
+    require_tenant_data_present(
+        selection,
+        store.as_ref(),
+        "catalog verify",
+        tenant,
+        &tenant_hash,
+    )
+    .await?;
 
     // The comparison itself lives in `ravel-catalog` (ADR-0059 decision 2) so
     // the scheduled scrubber and this CLI share one implementation. This
@@ -419,9 +456,15 @@ mod tests {
             .expect("put head");
 
         let mut report = String::new();
-        render_inspect(store.clone(), tenant, SignalArg::Metrics, &mut report)
-            .await
-            .expect("inspect renders");
+        render_inspect(
+            store.clone(),
+            StoreSelection::explicit(crate::store::StoreKind::Memory),
+            tenant,
+            SignalArg::Metrics,
+            &mut report,
+        )
+        .await
+        .expect("inspect renders");
 
         // Total part count.
         assert!(
@@ -478,9 +521,17 @@ mod tests {
         .await
         .expect("append generation 1");
 
-        fold(store.clone(), tenant, 1, SignalArg::Metrics, None, now)
-            .await
-            .expect("cli fold");
+        fold(
+            store.clone(),
+            StoreSelection::explicit(crate::store::StoreKind::Memory),
+            tenant,
+            1,
+            SignalArg::Metrics,
+            None,
+            now,
+        )
+        .await
+        .expect("cli fold");
 
         let head_bytes = store
             .get(&head_key(&tenant_hash, Signal::Metrics), GetRange::Full)

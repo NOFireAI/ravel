@@ -227,6 +227,30 @@ Every subcommand shares the same store flags as `ravel-server`
 `--s3-access-key`, `--s3-secret-key` (same `RAVEL_S3_*` env names as
 above).
 
+`--store` unset still means `memory`, the empty in-process store, but the
+fallback is no longer silent (issue #1024). Every command that walks tenant
+data (`maintain compact-bucket`, `compact-tenant`, `sweep`, `status`,
+`audit-versions`, `migrate`, `verify-custody`; `catalog list`, `fold`,
+`inspect`, `verify`; `commit reconstruct`) opens its report with the
+effective store:
+
+    store: memory (default)
+    store: memory
+    store: s3
+
+and, on the defaulted memory store only, refuses a walk that reaches no data
+at all rather than printing zero counters and exiting 0:
+
+    --store defaulted to memory, which holds no data for tenant "clickbench";
+    maintain compact-tenant found no objects there and would have reported a
+    healthy zero-work result. Pass --store s3 (with RAVEL_S3_BUCKET and its
+    credentials) to run against the real bucket, or load data first.
+
+`maintain compact-tenant` also refuses when the tenant prefix holds something
+but no ingest-hour bucket resolves across any shard. An explicit
+`--store memory` keeps the zero-count report: that store was chosen, so an
+empty result is an answer.
+
 | Command | Args | Does |
 |---|---|---|
 | `ravel-cli segment inspect <path>` | local file path or object store key | Parses one RSEG segment: trailer, footer fields, section list, decoded series count. |

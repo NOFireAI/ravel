@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use ravel_cli::maintain::SignalArg;
 use ravel_cli::reconstruct::reconstruct;
+use ravel_cli::store::{StoreKind, StoreSelection};
 use ravel_commit::keys;
 use ravel_commit::record::{self, NewCommitRecord};
 use ravel_logseg::{
@@ -32,6 +33,11 @@ use uuid::Uuid;
 
 const NS_PER_HOUR: i64 = 3_600_000_000_000;
 const MS_PER_HOUR: u64 = 3_600_000;
+
+/// These fixtures build their own store, which is the explicit
+/// `--store memory` case (issue #1024): the report header reads
+/// `store: memory` and an empty shard stays a success.
+const MEMORY: StoreSelection = StoreSelection::explicit(StoreKind::Memory);
 
 /// Event/ingest timestamp 30 minutes into ingest hour 495_734.
 const INGEST_HOUR: u32 = 495_734;
@@ -114,6 +120,7 @@ async fn reconstruct_makes_a_record_less_segment_resolvable_again() {
 
     reconstruct(
         store.clone() as Arc<dyn ObjectStoreBackend>,
+        MEMORY,
         tenant,
         SignalArg::Metrics,
         shard,
@@ -338,6 +345,7 @@ async fn create_if_absent_never_clobbers_an_existing_record() {
     // from LIST), so it genuinely attempts the write; it must not fail the run.
     reconstruct(
         store as Arc<dyn ObjectStoreBackend>,
+        MEMORY,
         tenant,
         SignalArg::Logs,
         shard,

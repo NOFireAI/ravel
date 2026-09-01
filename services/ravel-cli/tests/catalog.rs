@@ -13,6 +13,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use ravel_cli::catalog;
 use ravel_cli::maintain::SignalArg;
+use ravel_cli::store::{DefaultedMemoryEmptyWalk, StoreKind, StoreSelection};
 use ravel_commit::keys;
 use ravel_commit::publish::{self, RetryPolicy};
 use ravel_commit::record::{self, NewCommitRecord};
@@ -30,6 +31,11 @@ use uuid::Uuid;
 /// margin with room to spare (matches `services/ravel-server/tests/fold_e2e.rs`'s
 /// `SEALED_AGE`).
 const SEALED_AGE_NS: i64 = 3 * 60 * 60 * 1_000_000_000;
+
+/// Every fixture here builds its own `MemoryStore`, which is the explicit
+/// `--store memory` case (issue #1024): the reports carry `store: memory` and
+/// an empty result stays a success, unlike a walk on the defaulted store.
+const MEMORY: StoreSelection = StoreSelection::explicit(StoreKind::Memory);
 
 fn now_ns() -> i64 {
     ravel_cli::now_ns().expect("system clock readable")
@@ -85,6 +91,7 @@ async fn fold_then_inspect_then_verify_round_trips_cleanly() {
 
     catalog::fold(
         store.clone() as Arc<dyn ObjectStoreBackend>,
+        MEMORY,
         tenant,
         1,
         SignalArg::Metrics,
@@ -96,6 +103,7 @@ async fn fold_then_inspect_then_verify_round_trips_cleanly() {
 
     catalog::inspect(
         store.clone() as Arc<dyn ObjectStoreBackend>,
+        MEMORY,
         tenant,
         SignalArg::Metrics,
     )
@@ -104,6 +112,7 @@ async fn fold_then_inspect_then_verify_round_trips_cleanly() {
 
     catalog::verify(
         store.clone() as Arc<dyn ObjectStoreBackend>,
+        MEMORY,
         tenant,
         SignalArg::Metrics,
     )
@@ -120,6 +129,7 @@ async fn verify_fails_when_a_sealed_record_is_missing_from_the_snapshot() {
 
     catalog::fold(
         store.clone() as Arc<dyn ObjectStoreBackend>,
+        MEMORY,
         tenant,
         1,
         SignalArg::Metrics,
@@ -135,6 +145,7 @@ async fn verify_fails_when_a_sealed_record_is_missing_from_the_snapshot() {
 
     let err = catalog::verify(
         store.clone() as Arc<dyn ObjectStoreBackend>,
+        MEMORY,
         tenant,
         SignalArg::Metrics,
     )
@@ -151,12 +162,61 @@ async fn inspect_and_verify_report_cleanly_with_no_head_yet() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let tenant = "acme";
 
-    catalog::inspect(store.clone(), tenant, SignalArg::Metrics)
+    catalog::inspect(store.clone(), MEMORY, tenant, SignalArg::Metrics)
         .await
         .expect("inspect on an absent HEAD reports rather than errors");
-    catalog::verify(store.clone(), tenant, SignalArg::Metrics)
+    catalog::verify(store.clone(), MEMORY, tenant, SignalArg::Metrics)
         .await
         .expect("verify on an absent HEAD reports rather than errors");
+}
+
+/// Issue #1024 for `catalog fold`, the other command the incident names: with
+/// `--store` omitted the fold runs against the empty in-process store, and
+/// rather than publishing an empty HEAD and reporting `buckets_folded: 0` at
+/// exit 0 it refuses with the typed error, naming the tenant and the remedy.
+///
+/// Non-vacuity (prove-the-test): delete the `require_tenant_data_present` call
+/// in `catalog::fold` and this returns `Ok` with `buckets_folded == 0`, exactly
+/// the shape the incident reported; the HEAD assertion below then also fails,
+/// because the refused fold no longer leaves the catalog untouched.
+#[tokio::test]
+async fn fold_on_the_defaulted_memory_store_refuses_instead_of_sealing_nothing() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = "acme";
+
+    let err = catalog::fold(
+        store.clone(),
+        StoreSelection::defaulted_memory(),
+        tenant,
+        1,
+        SignalArg::Metrics,
+        None,
+        now_ns(),
+    )
+    .await
+    .expect_err("a fold over an unchosen empty store must refuse");
+
+    let typed = err
+        .downcast_ref::<DefaultedMemoryEmptyWalk>()
+        .expect("typed DefaultedMemoryEmptyWalk");
+    assert_eq!(
+        *typed,
+        DefaultedMemoryEmptyWalk {
+            command: "catalog fold",
+            tenant: tenant.to_string(),
+            searched: "objects",
+        }
+    );
+    assert!(
+        err.to_string().contains("--store s3"),
+        "the error must name the remedy: {err}"
+    );
+
+    let listed = store.list("t/", None).await.expect("list").objects;
+    assert!(
+        listed.is_empty(),
+        "the refusal happens before any catalog write; found {listed:?}"
+    );
 }
 
 #[tokio::test]
@@ -179,6 +239,7 @@ async fn inspect_rejects_a_corrupt_head() {
 
     let err = catalog::inspect(
         store as Arc<dyn ObjectStoreBackend>,
+        MEMORY,
         "acme",
         SignalArg::Metrics,
     )
@@ -264,6 +325,7 @@ async fn inspect_preserves_partial_output_when_a_part_fetch_fails() {
     let mut out = String::new();
     let err = catalog::render_inspect(
         store as Arc<dyn ObjectStoreBackend>,
+        MEMORY,
         "acme",
         SignalArg::Metrics,
         &mut out,
