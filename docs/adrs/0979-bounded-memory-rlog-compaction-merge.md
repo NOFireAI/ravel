@@ -306,6 +306,13 @@ closed with the same typed refusal naming the divided figure, which is
 the deliberate, visible outcome; the operator lowers N or sets the
 budget explicitly.
 
+Until D5's `--merge-cursor-budget-bytes` flag exists there is no way to
+set the budget explicitly, so "carries the default" is currently exact.
+When that flag lands, explicitness travels as an `Option` from the flag
+into the walk rather than being inferred by comparing the resolved value
+against the default, so an operator who explicitly sets the default
+value is honored undivided too.
+
 ### D5. CLI exposure
 
 `maintain compact-tenant` and `compact-bucket` gain
