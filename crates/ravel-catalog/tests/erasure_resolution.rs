@@ -1172,3 +1172,61 @@ async fn sibling_rewrites_alarm_on_the_folded_snapshot_path_too() {
          snapshot never reaches process_bucket, so nothing else would"
     );
 }
+
+/// A rewrite output part carrying declared-column stamps resolves to a
+/// SegmentRef with EMPTY coverage (PR #1009 review; ADR-0873 decision 3): the
+/// rewrite dropped rows, so a pre-drop stamp is stale for the surviving rows.
+/// Rewrite writers emit empty stamps today; this pins the reader-side refusal
+/// against a buggy or future writer until the recompute path lands and flips
+/// it deliberately with its own tests.
+///
+/// Non-vacuity: revert build_rewrite_l1_segment_ref to carry
+/// read_compaction_part(part) and the empty assertion fails with the stamp
+/// present.
+#[tokio::test]
+async fn rewrite_part_stamps_are_never_carried_onto_the_ref() {
+    let store = Arc::new(MemoryStore::new());
+    let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+    let (range, now) = hour_range_and_now();
+    let start = range.start_ns;
+
+    let a = l0_record(Uuid::new_v4(), 0, 1, HOUR, now, start, start + 100);
+    put_l0(store.as_ref(), &a).await;
+
+    let mut stamped_part = part(0, start, start + 100, 1);
+    ravel_commit::declared_stats::stamp_compaction_part(
+        &mut stamped_part,
+        &[ravel_types::declared_stats::DeclaredColumnStat::new(
+            "EventDate",
+            ravel_types::declared_stats::DeclaredStatType::I64,
+            Some(ravel_types::declared_stats::DeclaredStatValue::I64(1)),
+            Some(ravel_types::declared_stats::DeclaredStatValue::I64(2)),
+            0,
+        )
+        .expect("valid stat")],
+    );
+    let rw = build_rewrite(
+        0,
+        HOUR,
+        &[&a],
+        None,
+        vec![stamped_part],
+        &[Uuid::new_v4()],
+        now,
+    );
+    put_rewrite(store.as_ref(), &rw).await;
+
+    let snapshot = catalog
+        .resolve(&tenant(), Signal::Metrics, range, &[], now)
+        .await
+        .expect("resolve");
+    assert_eq!(snapshot.segments.len(), 1, "the one rewrite output part");
+    assert!(
+        snapshot.segments[0]
+            .declared_column_stats
+            .as_slice()
+            .is_empty(),
+        "a rewrite part's stamps are never carried: got {:?}",
+        snapshot.segments[0].declared_column_stats
+    );
+}

@@ -30,6 +30,12 @@ pub enum SegmentLevel {
 }
 
 /// One immutable segment reference in a resolved snapshot.
+///
+/// The derived equality includes `declared_column_stats`, so two views of one
+/// segment with different coverage compare unequal -- in particular a
+/// Flight-pin-rebuilt ref (always uncovered) versus a catalog-resolved one.
+/// No production path compares `SegmentRef`s across routes; the derive stays
+/// because weakening it would let a carriage bug hide behind test equality.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentRef {
     /// Data-object key, reconstructed from identity fields, never a stored
