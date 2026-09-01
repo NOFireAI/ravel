@@ -230,11 +230,22 @@ CI.
 
 ### D4. Reference material is generated where the source exists
 
-`docs/reference/cli.md` is generated from the clap definitions of
-`ravel-server` and `ravel-cli`, and a drift check in the `doc-scripts` job
-fails when the committed file no longer matches the binaries' help output.
+`docs/reference/ravel-server-flags.md` and
+`docs/reference/ravel-cli-flags.md` are generated from the clap
+definitions of the two binaries. One file per binary, because the
+generator is a test inside each crate and a single shared file would give
+two test targets one output to race on. A drift check fails when a
+committed file no longer matches its command definition.
+
+The check is a test, not a script in the `doc-scripts` job, because that
+job installs no Rust toolchain by design. The test renders from the
+command definition rather than executing a built binary: help output
+wraps to terminal width, which would make the comparison
+non-deterministic.
+
 A hand-written flag table drifts on the first pull request that adds a
-flag, and the current one already has.
+flag. The current one already has: it claims to be verified against the
+server's configuration source and is missing 22 registered flags.
 
 Endpoint and metric references are hand-written but pinned: every endpoint
 row names the route it documents, and the docs gate checks that each
