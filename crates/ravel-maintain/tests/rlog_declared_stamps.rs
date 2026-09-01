@@ -65,9 +65,11 @@ const CACHE: &str = "cache.hit";
 /// without depending on the exact per-record slot overhead.
 const BODY_LEN: usize = 20_000;
 
-/// Two records fit under this decoded-heap target and three do not: at
+/// One record fits under this decoded-heap target and two do not: at
 /// `BODY_LEN` = 20_000 each record's estimate is ~20_400, so one is ~20_400
-/// (< 30_000) and two are ~40_800 (>= 30_000). `max_l1_part_bytes` stays at its
+/// (< 30_000) and two are ~40_800 (>= 30_000). The second record crosses the
+/// target and closes the part with both records in it, which is why the split
+/// lands on a boundary every two records. `max_l1_part_bytes` stays at its
 /// 256 MiB default so only the memory split target ever fires here.
 const SPLIT_TARGET_BYTES: u64 = 30_000;
 
