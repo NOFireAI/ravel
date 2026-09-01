@@ -7,12 +7,166 @@ use clap::{Parser, ValueEnum};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::s3::{S3AuthMode, S3Config, S3Store};
 use ravel_object_store::{GetRange, ObjectStoreBackend};
+use ravel_types::TenantHash;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum StoreKind {
     Memory,
     #[value(name = "s3")]
     S3,
+}
+
+impl StoreKind {
+    /// The `--store` spelling of this backend, so a report names the store with
+    /// the same word the flag accepts.
+    pub const fn flag_value(self) -> &'static str {
+        match self {
+            StoreKind::Memory => "memory",
+            StoreKind::S3 => "s3",
+        }
+    }
+}
+
+/// Which backend a command runs against, and whether the operator chose it.
+///
+/// An explicit `--store memory` and an omitted `--store` both resolve to the
+/// in-process [`MemoryStore`], but they are different operator intents: the
+/// first asked for the empty store, the second got it by fallback. Every
+/// walk-shaped command over tenant data reports which one it is
+/// ([`StoreSelection::header`]) and refuses a walk that reaches no data at all
+/// on the fallback ([`require_tenant_data_present`]), because a walk over an
+/// unchosen empty store reports zero counters and exit 0, which reads as a
+/// healthy no-op (issue #1024).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoreSelection {
+    kind: StoreKind,
+    defaulted: bool,
+}
+
+impl StoreSelection {
+    /// The operator passed `--store <kind>`.
+    pub const fn explicit(kind: StoreKind) -> Self {
+        Self {
+            kind,
+            defaulted: false,
+        }
+    }
+
+    /// No `--store` was given, so the command runs against the empty
+    /// in-process memory store.
+    pub const fn defaulted_memory() -> Self {
+        Self {
+            kind: StoreKind::Memory,
+            defaulted: true,
+        }
+    }
+
+    /// The backend this invocation runs against.
+    pub const fn kind(self) -> StoreKind {
+        self.kind
+    }
+
+    /// Whether this is the fallback memory store rather than a chosen one.
+    pub const fn is_defaulted_memory(self) -> bool {
+        self.defaulted && matches!(self.kind, StoreKind::Memory)
+    }
+
+    /// The `store:` line every walk-shaped command's report header carries, so
+    /// the choice of backend is never invisible in the output an operator
+    /// reads: `store: memory (default)`, `store: memory`, or `store: s3`.
+    pub fn header(self) -> String {
+        if self.defaulted {
+            format!("store: {} (default)", self.kind.flag_value())
+        } else {
+            format!("store: {}", self.kind.flag_value())
+        }
+    }
+
+    /// Print [`StoreSelection::header`] as the first line of a command's
+    /// report.
+    pub fn print_header(self) {
+        println!("{}", self.header());
+    }
+}
+
+impl Default for StoreSelection {
+    /// The fallback, matching an omitted `--store`: the shape that has to be
+    /// caught, never the safe one, so a report built without an explicit
+    /// selection cannot claim the operator chose its store.
+    fn default() -> Self {
+        Self::defaulted_memory()
+    }
+}
+
+/// A walk-shaped command found nothing to walk on a memory store the operator
+/// never asked for (issue #1024).
+///
+/// Typed so the message names the situation and the remedy rather than
+/// surfacing as zero counters and exit 0. The same emptiness under an explicit
+/// `--store memory` is a successful zero-count report: the operator chose that
+/// store, which is what every in-process test does.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error(
+    "--store defaulted to memory, which holds no data for tenant {tenant:?}; {command} found no \
+     {searched} there and would have reported a healthy zero-work result. Pass --store s3 (with \
+     RAVEL_S3_BUCKET and its credentials) to run against the real bucket, or load data first. An \
+     explicit --store memory keeps the zero-count report."
+)]
+pub struct DefaultedMemoryEmptyWalk {
+    /// The subcommand as an operator types it, e.g. `maintain compact-tenant`.
+    pub command: &'static str,
+    /// The `--tenant` the walk was asked for.
+    pub tenant: String,
+    /// What the command looked for under the tenant prefix and did not find.
+    pub searched: &'static str,
+}
+
+impl DefaultedMemoryEmptyWalk {
+    /// The refusal for `command`, or `Ok(())` when the operator chose this
+    /// store or the walk did reach something (`found > 0`).
+    pub fn check(
+        selection: StoreSelection,
+        command: &'static str,
+        tenant: &str,
+        searched: &'static str,
+        found: usize,
+    ) -> Result<(), Self> {
+        if found > 0 || !selection.is_defaulted_memory() {
+            return Ok(());
+        }
+        Err(Self {
+            command,
+            tenant: tenant.to_string(),
+            searched,
+        })
+    }
+}
+
+/// The precondition every walk-shaped command over tenant data runs before it
+/// reports anything: on a defaulted memory store, a tenant prefix that holds
+/// no object at all means the command was pointed at the empty in-process
+/// store by fallback, so it refuses instead of walking nothing.
+///
+/// Costs one `list_delimited` and only when `--store` defaulted: a real
+/// backend never pays for this check.
+pub async fn require_tenant_data_present(
+    selection: StoreSelection,
+    store: &dyn ObjectStoreBackend,
+    command: &'static str,
+    tenant: &str,
+    tenant_hash: &TenantHash,
+) -> anyhow::Result<()> {
+    if !selection.is_defaulted_memory() {
+        return Ok(());
+    }
+    let prefix = format!("t/{}/", tenant_hash.to_hex());
+    let listed = store
+        .list_delimited(&prefix)
+        .await
+        .map_err(|err| anyhow::anyhow!("failed to list {prefix}: {err}"))?;
+    let found = listed.objects.len() + listed.common_prefixes.len();
+    DefaultedMemoryEmptyWalk::check(selection, command, tenant, "objects", found)?;
+    Ok(())
 }
 
 /// Which credential source `--store s3` uses (ADR-0106). The CLI-facing mirror
@@ -42,8 +196,20 @@ impl S3Auth {
 
 #[derive(Debug, Parser)]
 pub struct StoreArgs {
-    #[arg(long, value_enum, default_value = "memory")]
-    pub store: StoreKind,
+    /// Which object store to run against. Unset resolves to `memory`, the
+    /// empty in-process store, exactly as before; what changes is that the
+    /// fallback stays distinguishable from an explicit `--store memory`.
+    /// Walk-shaped commands over tenant data report `store: memory (default)`
+    /// in their header and refuse a walk that reaches no data at all, instead
+    /// of reporting zero counters and exit 0 (issue #1024).
+    ///
+    /// `Option`-typed rather than `default_value = "memory"` for that reason,
+    /// the same treatment ravel-server's resolution-sensitive flags got: a
+    /// defaulted `StoreKind` cannot express "nobody asked", so an operator who
+    /// meant the real bucket and one who meant the empty store would be
+    /// indistinguishable.
+    #[arg(long, value_enum)]
+    pub store: Option<StoreKind>,
 
     #[arg(long, env = "RAVEL_S3_ENDPOINT")]
     pub s3_endpoint: Option<String>,
@@ -93,12 +259,27 @@ pub struct StoreArgs {
 }
 
 impl StoreArgs {
+    /// The backend this invocation runs against: `--store` when given, memory
+    /// otherwise.
+    pub fn store_kind(&self) -> StoreKind {
+        self.store.unwrap_or(StoreKind::Memory)
+    }
+
+    /// The same choice, carrying whether the operator made it, for the report
+    /// header and the empty-walk refusal.
+    pub fn selection(&self) -> StoreSelection {
+        match self.store {
+            Some(kind) => StoreSelection::explicit(kind),
+            None => StoreSelection::defaulted_memory(),
+        }
+    }
+
     /// Human-readable backend identity for display and for the
     /// `sys/qualification` record (ADR-0050 section 6): distinguishes which
     /// bucket/endpoint a qualification result belongs to, without leaking
     /// credentials.
     pub fn backend_identity(&self) -> String {
-        match self.store {
+        match self.store_kind() {
             StoreKind::Memory => "memory".to_string(),
             StoreKind::S3 => {
                 let bucket = self.s3_bucket.as_deref().unwrap_or("<unset>");
@@ -153,7 +334,7 @@ fn instance_role_credential_conflict(args: &StoreArgs) -> Option<anyhow::Error> 
 }
 
 pub fn build_store(args: &StoreArgs) -> anyhow::Result<Arc<dyn ObjectStoreBackend>> {
-    match args.store {
+    match args.store_kind() {
         StoreKind::Memory => Ok(Arc::new(MemoryStore::new())),
         StoreKind::S3 => {
             let bucket = args
@@ -549,6 +730,111 @@ mod tests {
             "--store s3 requires RAVEL_S3_SECRET_KEY",
             "the secret-key error text must be unchanged"
         );
+    }
+
+    /// Issue #1024: `--store` is `Option`-typed, so an omitted flag and an
+    /// explicit `--store memory` are distinguishable, and each parsed
+    /// invocation renders the report header line that names its effective
+    /// store. The s3 case is asserted here rather than against a live bucket:
+    /// the header comes from the parsed flag, before any construction.
+    ///
+    /// Non-vacuity (prove-the-test): restore `default_value = "memory"` on the
+    /// flag (making the field a plain `StoreKind`, so `selection()` can no
+    /// longer see the difference) and the first two assertions collapse onto
+    /// the same string.
+    #[test]
+    fn the_store_flag_distinguishes_unset_from_an_explicit_choice() {
+        let unset = StoreArgs::try_parse_from(["ravel-cli"]).expect("no flags parse");
+        assert_eq!(unset.store, None, "an omitted --store stays unset");
+        assert_eq!(unset.selection(), StoreSelection::defaulted_memory());
+        assert_eq!(unset.selection().header(), "store: memory (default)");
+        assert!(unset.selection().is_defaulted_memory());
+        // Unchanged behavior: the fallback is still the memory store.
+        assert_eq!(unset.store_kind(), StoreKind::Memory);
+        assert_eq!(unset.backend_identity(), "memory");
+        build_store(&unset).expect("an unset --store still builds the memory store");
+
+        let explicit_memory = StoreArgs::try_parse_from(["ravel-cli", "--store", "memory"])
+            .expect("--store memory parses");
+        assert_eq!(explicit_memory.store, Some(StoreKind::Memory));
+        assert_eq!(
+            explicit_memory.selection(),
+            StoreSelection::explicit(StoreKind::Memory)
+        );
+        assert_eq!(explicit_memory.selection().header(), "store: memory");
+        assert!(
+            !explicit_memory.selection().is_defaulted_memory(),
+            "a chosen memory store is never the defaulted one"
+        );
+
+        let s3 = StoreArgs::try_parse_from([
+            "ravel-cli",
+            "--store",
+            "s3",
+            "--s3-bucket",
+            "ravel-test",
+            "--s3-endpoint",
+            "http://127.0.0.1:9000",
+            "--s3-access-key",
+            "test",
+            "--s3-secret-key",
+            "test",
+        ])
+        .expect("s3 flags parse");
+        assert_eq!(s3.selection().header(), "store: s3");
+        assert!(!s3.selection().is_defaulted_memory());
+        assert_eq!(
+            s3.backend_identity(),
+            "s3://ravel-test@http://127.0.0.1:9000"
+        );
+        build_store(&s3).expect("the s3-configured invocation still constructs");
+    }
+
+    /// The empty-walk precondition (issue #1024) fires only on the defaulted
+    /// memory store with nothing under the tenant prefix, and it is silent for
+    /// an explicit choice or for a prefix that holds anything at all.
+    ///
+    /// Non-vacuity (prove-the-test): drop the `!selection.is_defaulted_memory()`
+    /// early return in `require_tenant_data_present` and the explicit-memory
+    /// case below starts failing.
+    #[tokio::test]
+    async fn the_empty_walk_precondition_fires_only_on_the_defaulted_store() {
+        let store = MemoryStore::new();
+        let tenant = "cli-empty-walk";
+        let tenant_hash = ravel_types::TenantId::new(tenant).hash();
+        let defaulted = StoreSelection::defaulted_memory();
+        let chosen = StoreSelection::explicit(StoreKind::Memory);
+
+        let err =
+            require_tenant_data_present(defaulted, &store, "maintain sweep", tenant, &tenant_hash)
+                .await
+                .expect_err("an empty tenant prefix on the defaulted store must refuse");
+        assert_eq!(
+            *err.downcast_ref::<DefaultedMemoryEmptyWalk>()
+                .expect("typed DefaultedMemoryEmptyWalk"),
+            DefaultedMemoryEmptyWalk {
+                command: "maintain sweep",
+                tenant: tenant.to_string(),
+                searched: "objects",
+            }
+        );
+
+        require_tenant_data_present(chosen, &store, "maintain sweep", tenant, &tenant_hash)
+            .await
+            .expect("an explicitly chosen empty memory store is not refused");
+
+        // One object anywhere under the tenant prefix is data reached.
+        store
+            .put(
+                &format!("t/{}/l/prov", tenant_hash.to_hex()),
+                Bytes::from_static(b"prov"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed one object under the tenant prefix");
+        require_tenant_data_present(defaulted, &store, "maintain sweep", tenant, &tenant_hash)
+            .await
+            .expect("a tenant prefix that holds something is walked, not refused");
     }
 
     /// The ADR-0072 decision 1 flags reach `S3Config` rather than being parsed

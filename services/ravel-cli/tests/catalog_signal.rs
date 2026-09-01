@@ -14,6 +14,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use ravel_cli::catalog;
 use ravel_cli::maintain::SignalArg;
+use ravel_cli::store::{StoreKind, StoreSelection};
 use ravel_commit::keys;
 use ravel_commit::publish::{self, RetryPolicy};
 use ravel_commit::record::{self, NewCommitRecord};
@@ -28,6 +29,11 @@ use ravel_types::{Signal, TenantHash, TenantId, TimeRange};
 use uuid::Uuid;
 
 const NS_PER_HOUR: i64 = 3_600_000_000_000;
+
+/// Every fixture here builds its own `MemoryStore`, which is the explicit
+/// `--store memory` case (issue #1024): the reports carry `store: memory` and
+/// an empty result stays a success, unlike a walk on the defaulted store.
+const MEMORY: StoreSelection = StoreSelection::explicit(StoreKind::Memory);
 
 /// Default seal margins sum to 1h20m, but hour-bucket quantization means
 /// anything under ~2h20m can land on the wrong side of
@@ -189,6 +195,7 @@ async fn fold_signal_logs_folds_the_logs_snapshot_and_a_logs_resolve_reads_no_co
 
     let (report, _printed) = catalog::fold(
         inner.clone() as Arc<dyn ObjectStoreBackend>,
+        MEMORY,
         tenant,
         SHARD_COUNT,
         FOLD_SIGNAL,
@@ -283,6 +290,7 @@ async fn inspect_signal_logs_prints_the_signal_word() {
 
     catalog::fold(
         store.clone() as Arc<dyn ObjectStoreBackend>,
+        MEMORY,
         tenant,
         SHARD_COUNT,
         SignalArg::Logs,
@@ -295,6 +303,7 @@ async fn inspect_signal_logs_prints_the_signal_word() {
     let mut out = String::new();
     catalog::render_inspect(
         store.clone() as Arc<dyn ObjectStoreBackend>,
+        MEMORY,
         tenant,
         SignalArg::Logs,
         &mut out,
@@ -324,6 +333,7 @@ async fn verify_signal_logs_checks_the_logs_snapshot() {
 
     catalog::fold(
         store.clone() as Arc<dyn ObjectStoreBackend>,
+        MEMORY,
         tenant,
         SHARD_COUNT,
         SignalArg::Logs,
@@ -335,6 +345,7 @@ async fn verify_signal_logs_checks_the_logs_snapshot() {
 
     catalog::verify(
         store.clone() as Arc<dyn ObjectStoreBackend>,
+        MEMORY,
         tenant,
         SignalArg::Logs,
     )
@@ -353,6 +364,7 @@ async fn verify_signal_logs_checks_the_logs_snapshot() {
     .await;
     let err = catalog::verify(
         store.clone() as Arc<dyn ObjectStoreBackend>,
+        MEMORY,
         tenant,
         SignalArg::Logs,
     )
@@ -367,6 +379,7 @@ async fn verify_signal_logs_checks_the_logs_snapshot() {
     // reports exactly that rather than the logs divergence above.
     catalog::verify(
         store.clone() as Arc<dyn ObjectStoreBackend>,
+        MEMORY,
         tenant,
         SignalArg::Metrics,
     )

@@ -21,6 +21,8 @@ use ravel_proto::commit::v1::{CompactionRecord, RetentionTombstone};
 use ravel_types::{Signal, TenantHash, TenantId};
 use uuid::Uuid;
 
+use crate::store::{DefaultedMemoryEmptyWalk, StoreSelection, require_tenant_data_present};
+
 /// CLI signal selector for the `--signal` flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum SignalArg {
@@ -122,8 +124,14 @@ pub fn build_compactor_config(
 }
 
 /// `maintain compact-bucket`: run one compaction pass over a single bucket.
+///
+/// `selection` is which store `--store` resolved to: it heads the report, and a
+/// tenant prefix holding nothing at all on the defaulted memory store is
+/// refused rather than compacted as an empty bucket (issue #1024).
+#[allow(clippy::too_many_arguments)]
 pub async fn compact(
     store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
     tenant: &str,
     signal: SignalArg,
     shard: u32,
@@ -135,6 +143,16 @@ pub async fn compact(
     let bucket = Bucket::new(tenant_hash, signal.to_signal(), shard, hour);
     let config = build_compactor_config(dry_run, max_flush_lifetime_ns, None, None, None)?;
     let clock = wall_clock()?;
+
+    selection.print_header();
+    require_tenant_data_present(
+        selection,
+        store.as_ref(),
+        "maintain compact-bucket",
+        tenant,
+        &tenant_hash,
+    )
+    .await?;
 
     let outcome = compact_bucket(store.as_ref(), &clock, &config, &bucket)
         .await
@@ -197,6 +215,10 @@ pub enum CompactTenantError {
 /// never returned, so a test can pin this whole struct.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CompactTenantReport {
+    /// Which store the walk ran against, and whether the operator chose it.
+    /// The report header names it (`store: memory (default)`, `store: s3`), so
+    /// a zero-count report can never hide which data it looked at.
+    pub store: StoreSelection,
     /// Shards walked (`0..shards`).
     pub shards: u32,
     /// Buckets newly compacted (or, under `--dry-run`, that would have been).
@@ -312,9 +334,19 @@ async fn shard_hours(
 /// `NotSealed` is a reported outcome, not a failure; only a compaction error
 /// aborts the run (and it aborts the whole run, so the operator sees the fault
 /// instead of a summary that quietly omits shards).
+///
+/// `selection` is which store `--store` resolved to. It heads the report, and
+/// on the defaulted memory store a walk that resolves zero present ingest-hour
+/// buckets across every shard is refused with
+/// [`DefaultedMemoryEmptyWalk`] rather than reported as
+/// `compacted: 0, not_sealed: 0` with exit 0, which is indistinguishable from a
+/// tenant that had nothing left to compact (issue #1024). An explicit
+/// `--store memory` keeps that zero-count report: the operator chose the empty
+/// store.
 #[allow(clippy::too_many_arguments)]
 pub async fn compact_tenant(
     store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
     tenant: &str,
     signal: SignalArg,
     shards: Option<u32>,
@@ -342,12 +374,22 @@ pub async fn compact_tenant(
         max_l1_part_bytes,
         input_read_concurrency,
     )?;
+    selection.print_header();
+    require_tenant_data_present(
+        selection,
+        store.as_ref(),
+        "maintain compact-tenant",
+        tenant,
+        &tenant_hash,
+    )
+    .await?;
     let shard_count =
         resolve_shard_count(store.as_ref(), &tenant_hash, tenant, sig, shards, now_hour).await?;
     let last_hour = to_hour.unwrap_or(now_hour);
     let first_hour = from_hour.unwrap_or(0);
     let clock = FixedClock::new(now_ns);
     let mut report = CompactTenantReport {
+        store: selection,
         shards: shard_count,
         ..CompactTenantReport::default()
     };
@@ -365,8 +407,14 @@ pub async fn compact_tenant(
     println!("input_read_concurrency: {}", config.input_read_concurrency);
     println!("dry_run: {dry_run}");
 
+    // Present ingest-hour buckets resolved across every shard, counted before
+    // the `[first_hour, last_hour]` filter: this is what the walk found in the
+    // store, which is the figure the empty-walk refusal below is about.
+    let mut hours_present = 0usize;
     for shard in 0..shard_count {
-        for hour in shard_hours(store.as_ref(), &tenant_hash, sig, shard).await? {
+        let shard_hours = shard_hours(store.as_ref(), &tenant_hash, sig, shard).await?;
+        hours_present += shard_hours.len();
+        for hour in shard_hours {
             if hour < first_hour {
                 continue;
             }
@@ -425,6 +473,15 @@ pub async fn compact_tenant(
     println!("tombstoned: {}", report.tombstoned);
     println!("parts ({verb}): {}", report.parts_written);
     println!("wall_time_ms: {}", started.elapsed().as_millis());
+    // The counters above are printed first even on the refusal path: an
+    // operator who sees the zeros also sees why they are not a result.
+    DefaultedMemoryEmptyWalk::check(
+        selection,
+        "maintain compact-tenant",
+        tenant,
+        "present ingest-hour buckets",
+        hours_present,
+    )?;
     Ok(report)
 }
 
@@ -438,6 +495,7 @@ pub async fn compact_tenant(
 /// delete pass.
 pub async fn sweep(
     store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
     tenant: &str,
     signal: SignalArg,
     shard: u32,
@@ -451,6 +509,16 @@ pub async fn sweep(
         ..CompactorConfig::default()
     };
     let clock = wall_clock()?;
+
+    selection.print_header();
+    require_tenant_data_present(
+        selection,
+        store.as_ref(),
+        "maintain sweep",
+        tenant,
+        &tenant_hash,
+    )
+    .await?;
 
     let hold = LegalHoldCheck::refresh(store.as_ref(), &tenant_hash)
         .await
@@ -505,6 +573,7 @@ pub async fn sweep(
 /// mutating anything (so it needs no `--dry-run`).
 pub async fn status(
     store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
     tenant: &str,
     signal: SignalArg,
     shard: u32,
@@ -515,6 +584,16 @@ pub async fn status(
     let bucket = Bucket::new(tenant_hash, sig, shard, hour);
     let config = CompactorConfig::default();
     let now = crate::now_ns()?;
+
+    selection.print_header();
+    require_tenant_data_present(
+        selection,
+        store.as_ref(),
+        "maintain status",
+        tenant,
+        &tenant_hash,
+    )
+    .await?;
 
     let listing = ravel_maintain::read::list_bucket(store.as_ref(), &bucket)
         .await
@@ -631,12 +710,22 @@ async fn generation_scan_shards(
 /// record's parts (live L1 objects). Exits nonzero if any anomaly is found.
 pub async fn audit_versions(
     store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
     tenant: &str,
     shards: u32,
 ) -> anyhow::Result<()> {
     use std::collections::BTreeMap;
 
     let tenant_hash = TenantId::new(tenant).hash();
+    selection.print_header();
+    require_tenant_data_present(
+        selection,
+        store.as_ref(),
+        "maintain audit-versions",
+        tenant,
+        &tenant_hash,
+    )
+    .await?;
     let mut anomalies = 0usize;
     for signal in [Signal::Metrics, Signal::Logs, Signal::Spans] {
         let window = signal_supported_versions(signal)?;
@@ -836,6 +925,7 @@ fn signal_current_version(signal: Signal) -> anyhow::Result<u32> {
 #[allow(clippy::too_many_arguments)]
 pub async fn migrate(
     store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
     tenant: &str,
     signal: SignalArg,
     shards: u32,
@@ -844,6 +934,15 @@ pub async fn migrate(
     budget_records: u64,
 ) -> anyhow::Result<()> {
     let tenant_hash = TenantId::new(tenant).hash();
+    selection.print_header();
+    require_tenant_data_present(
+        selection,
+        store.as_ref(),
+        "maintain migrate",
+        tenant,
+        &tenant_hash,
+    )
+    .await?;
     let sig = signal.to_signal();
     let target = match target_version {
         Some(v) => v,
@@ -1063,11 +1162,21 @@ fn check_object_epoch(
 /// Exits nonzero if any anomaly is found.
 pub async fn verify_custody(
     store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
     tenant: &str,
     shards: u32,
     versioning_aware: bool,
 ) -> anyhow::Result<()> {
     let tenant_hash = TenantId::new(tenant).hash();
+    selection.print_header();
+    require_tenant_data_present(
+        selection,
+        store.as_ref(),
+        "maintain verify-custody",
+        tenant,
+        &tenant_hash,
+    )
+    .await?;
     let mut anomalies = 0usize;
 
     // The tenant's key-epoch history (ADR-0062 decision 1b), read once and
@@ -1522,9 +1631,14 @@ pub fn decode_retention_tombstone(bytes: &[u8]) -> anyhow::Result<()> {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::store::StoreKind;
     use ravel_commit::publish::{self, RetryPolicy};
     use ravel_commit::record::{self, NewCommitRecord};
     use ravel_object_store::memory::MemoryStore;
+
+    /// These fixtures build their own `MemoryStore`, which is the explicit
+    /// `--store memory` case (issue #1024): an empty result stays a success.
+    const MEMORY: StoreSelection = StoreSelection::explicit(StoreKind::Memory);
 
     /// Both CLI consumers of the supported-version window derive from the one
     /// crate source (ADR-0066 decision 1): `audit-versions`' anomaly predicate
@@ -1651,7 +1765,7 @@ mod tests {
         // the widened count 4).
         publish_commit_at(&store, &tenant_hash, 3, 99).await;
 
-        let err = audit_versions(store.clone(), tenant, 2)
+        let err = audit_versions(store.clone(), MEMORY, tenant, 2)
             .await
             .expect_err("audit must visit the post-reshard shard 3 and find the anomaly");
         assert!(
@@ -1678,7 +1792,7 @@ mod tests {
             .await
             .expect("record epoch 0 activated before the object's write time");
 
-        verify_custody(store.clone(), tenant, 1, false)
+        verify_custody(store.clone(), MEMORY, tenant, 1, false)
             .await
             .expect("every object's write time is inside a recorded epoch");
     }
@@ -1699,7 +1813,7 @@ mod tests {
             .await
             .expect("record epoch 0 activated after the object's write time");
 
-        let err = verify_custody(store.clone(), tenant, 1, false)
+        let err = verify_custody(store.clone(), MEMORY, tenant, 1, false)
             .await
             .expect_err("an object predating the first epoch must be a custody anomaly");
         let msg = err.to_string();
@@ -1724,7 +1838,7 @@ mod tests {
 
         publish_commit_at(&store, &tenant_hash, 0, 6).await;
 
-        verify_custody(store.clone(), tenant, 1, false)
+        verify_custody(store.clone(), MEMORY, tenant, 1, false)
             .await
             .expect("no epoch record means no epoch check; the object passes clean");
     }

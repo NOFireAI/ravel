@@ -20,6 +20,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use ravel_cli::catalog;
 use ravel_cli::maintain::SignalArg;
+use ravel_cli::store::{StoreKind, StoreSelection};
 use ravel_commit::keys;
 use ravel_commit::publish::{self, RetryPolicy};
 use ravel_commit::record::{self, NewCommitRecord};
@@ -30,6 +31,11 @@ use uuid::Uuid;
 
 const NS_PER_HOUR: i64 = 3_600_000_000_000;
 const NS_PER_MINUTE: i64 = 60_000_000_000;
+
+/// Every fixture here builds its own `MemoryStore`, which is the explicit
+/// `--store memory` case (issue #1024): the fold reports `store: memory` and
+/// an empty result stays a success, unlike a walk on the defaulted store.
+const MEMORY: StoreSelection = StoreSelection::explicit(StoreKind::Memory);
 
 const SHARD_COUNT: u32 = 2;
 
@@ -145,6 +151,7 @@ async fn max_flush_lifetime_zero_seals_the_finished_hour_a_default_fold_leaves_a
     //    tenant has, so it lists nothing and publishes an empty HEAD.
     let (default_report, default_printed) = catalog::fold(
         store.clone() as Arc<dyn ObjectStoreBackend>,
+        MEMORY,
         tenant,
         SHARD_COUNT,
         SignalArg::Metrics,
@@ -173,11 +180,18 @@ async fn max_flush_lifetime_zero_seals_the_finished_hour_a_default_fold_leaves_a
         default_printed.contains("seal_margin: 1h 20m\n"),
         "the default fold reports the default margin, got:\n{default_printed}"
     );
+    // Issue #1024: the effective store heads every walk-shaped command's
+    // report, so a fold that seals nothing can never hide which store it read.
+    assert!(
+        default_printed.starts_with("store: memory\n"),
+        "the fold report must open with the effective store, got:\n{default_printed}"
+    );
 
     // 2. The same fold with the override. `0s` removes only the flush-lifetime
     //    term: 5m + 15m still stand, so the current hour stays unsealed.
     let (override_report, override_printed) = catalog::fold(
         store.clone() as Arc<dyn ObjectStoreBackend>,
+        MEMORY,
         tenant,
         SHARD_COUNT,
         SignalArg::Metrics,
@@ -228,6 +242,7 @@ async fn a_default_fold_after_an_override_fold_is_a_no_op_at_the_reached_waterma
 
     let (override_report, _) = catalog::fold(
         store.clone() as Arc<dyn ObjectStoreBackend>,
+        MEMORY,
         tenant,
         SHARD_COUNT,
         SignalArg::Metrics,
@@ -241,6 +256,7 @@ async fn a_default_fold_after_an_override_fold_is_a_no_op_at_the_reached_waterma
 
     let (second_report, second_printed) = catalog::fold(
         store.clone() as Arc<dyn ObjectStoreBackend>,
+        MEMORY,
         tenant,
         SHARD_COUNT,
         SignalArg::Metrics,
@@ -356,6 +372,7 @@ async fn a_lifetime_that_overflows_the_seal_margin_is_refused() {
 
     let err = catalog::fold(
         store.clone() as Arc<dyn ObjectStoreBackend>,
+        MEMORY,
         tenant,
         SHARD_COUNT,
         SignalArg::Metrics,

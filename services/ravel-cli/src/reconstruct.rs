@@ -49,6 +49,7 @@ use ravel_types::{Signal, TenantHash, TenantId};
 use uuid::Uuid;
 
 use crate::maintain::SignalArg;
+use crate::store::{StoreSelection, require_tenant_data_present};
 
 /// Nanoseconds per ingest-hour bucket (mirrors `ravel_commit::record`'s own
 /// private `NS_PER_HOUR`, kept local since that one is not exported).
@@ -78,6 +79,7 @@ enum Outcome {
 /// decision 2).
 pub async fn reconstruct(
     store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
     tenant: &str,
     signal: SignalArg,
     shard: u32,
@@ -92,6 +94,10 @@ pub async fn reconstruct(
     }
     let tenant_hash = TenantId::new(tenant).hash();
     let store = store.as_ref();
+
+    selection.print_header();
+    require_tenant_data_present(selection, store, "commit reconstruct", tenant, &tenant_hash)
+        .await?;
 
     // Phase (a): list the shard's L0 data objects and the identities that
     // already have a commit record; the set difference (by identity) is the

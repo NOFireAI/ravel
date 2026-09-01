@@ -14,6 +14,7 @@ use ravel_cli::maintain::{
     SignalArg, audit_versions, compact, decode_compaction_record, decode_retention_tombstone,
     migrate, status, sweep, verify_custody,
 };
+use ravel_cli::store::{StoreKind, StoreSelection};
 use ravel_commit::keys;
 use ravel_commit::publish::{self, RetryPolicy};
 use ravel_commit::record::{self, NewCommitRecord};
@@ -29,6 +30,12 @@ use uuid::Uuid;
 fn store() -> Arc<dyn ObjectStoreBackend> {
     Arc::new(MemoryStore::new())
 }
+
+/// These tests build their own `MemoryStore`, which is the explicit
+/// `--store memory` case (issue #1024): each report header reads
+/// `store: memory`, and the empty-store cases below stay successes rather than
+/// becoming the defaulted-store refusal.
+const MEMORY: StoreSelection = StoreSelection::explicit(StoreKind::Memory);
 
 /// Publish one L0 metrics segment (data object + commit record) and return the
 /// content-addressed data-object key, so a test can later corrupt the object
@@ -235,14 +242,23 @@ async fn seed_orphan_l0(store: &MemoryStore, tenant: &str, shard: u32, seq: u64)
 async fn compact_empty_bucket_is_below_min() {
     // Hour 0 is long sealed; an empty bucket has zero inputs, below the
     // min-inputs trigger, so a dry run reports it and writes nothing.
-    compact(store(), "acme", SignalArg::Metrics, 0, 0, true, None)
-        .await
-        .expect("compact dry-run runs");
+    compact(
+        store(),
+        MEMORY,
+        "acme",
+        SignalArg::Metrics,
+        0,
+        0,
+        true,
+        None,
+    )
+    .await
+    .expect("compact dry-run runs");
 }
 
 #[tokio::test]
 async fn sweep_empty_shard_dry_run_is_clean() {
-    sweep(store(), "acme", SignalArg::Logs, 0, true, false)
+    sweep(store(), MEMORY, "acme", SignalArg::Logs, 0, true, false)
         .await
         .expect("sweep dry-run runs");
 }
@@ -288,6 +304,7 @@ async fn sweep_does_not_delete_data_under_legal_hold() {
 
     sweep(
         store.clone() as Arc<dyn ObjectStoreBackend>,
+        MEMORY,
         tenant,
         SignalArg::Metrics,
         0,
@@ -329,6 +346,7 @@ async fn override_orphan_breaker_runs_exactly_one_forced_pass() {
     // the shard's listed L0 objects), deleting nothing.
     sweep(
         store.clone() as Arc<dyn ObjectStoreBackend>,
+        MEMORY,
         tenant,
         SignalArg::Metrics,
         0,
@@ -343,6 +361,7 @@ async fn override_orphan_breaker_runs_exactly_one_forced_pass() {
     // With override: this one pass deletes despite the breaker's threshold.
     sweep(
         store.clone() as Arc<dyn ObjectStoreBackend>,
+        MEMORY,
         tenant,
         SignalArg::Metrics,
         0,
@@ -365,6 +384,7 @@ async fn override_orphan_breaker_runs_exactly_one_forced_pass() {
     }
     sweep(
         store.clone() as Arc<dyn ObjectStoreBackend>,
+        MEMORY,
         tenant,
         SignalArg::Metrics,
         0,
@@ -383,21 +403,21 @@ async fn override_orphan_breaker_runs_exactly_one_forced_pass() {
 
 #[tokio::test]
 async fn status_empty_bucket_is_clean() {
-    status(store(), "acme", SignalArg::Metrics, 0, 0)
+    status(store(), MEMORY, "acme", SignalArg::Metrics, 0, 0)
         .await
         .expect("status runs");
 }
 
 #[tokio::test]
 async fn audit_versions_empty_store_finds_no_anomaly() {
-    audit_versions(store(), "acme", 4)
+    audit_versions(store(), MEMORY, "acme", 4)
         .await
         .expect("audit over an empty store reports no live objects and no anomaly");
 }
 
 #[tokio::test]
 async fn verify_custody_empty_store_is_clean() {
-    verify_custody(store(), "acme", 4, false)
+    verify_custody(store(), MEMORY, "acme", 4, false)
         .await
         .expect("empty store has no live objects and no anomaly");
 }
@@ -411,9 +431,15 @@ async fn verify_custody_clean_store_verifies_every_object() {
     // that was legitimately swept (no L0 object seeded for it).
     seed_compaction(&store, "acme", &[(Uuid::new_v4(), 1, 1)]).await;
 
-    verify_custody(store as Arc<dyn ObjectStoreBackend>, "acme", 1, false)
-        .await
-        .expect("a clean store passes custody verification");
+    verify_custody(
+        store as Arc<dyn ObjectStoreBackend>,
+        MEMORY,
+        "acme",
+        1,
+        false,
+    )
+    .await
+    .expect("a clean store passes custody verification");
 }
 
 #[tokio::test]
@@ -431,9 +457,15 @@ async fn verify_custody_catches_a_corrupted_data_object() {
         .await
         .expect("overwrite the data object");
 
-    let err = verify_custody(store as Arc<dyn ObjectStoreBackend>, "acme", 1, false)
-        .await
-        .expect_err("a corrupted data object must fail verification");
+    let err = verify_custody(
+        store as Arc<dyn ObjectStoreBackend>,
+        MEMORY,
+        "acme",
+        1,
+        false,
+    )
+    .await
+    .expect_err("a corrupted data object must fail verification");
     assert!(
         err.to_string().contains("content-hash mismatch"),
         "unexpected error: {err}"
@@ -448,9 +480,15 @@ async fn verify_custody_treats_a_legitimately_swept_input_as_no_anomaly() {
     // part is present and matches. This must not be an anomaly.
     seed_compaction(&store, "acme", &[(Uuid::new_v4(), 1, 1)]).await;
 
-    verify_custody(store as Arc<dyn ObjectStoreBackend>, "acme", 1, false)
-        .await
-        .expect("a swept (missing) compaction input is expected, not an anomaly");
+    verify_custody(
+        store as Arc<dyn ObjectStoreBackend>,
+        MEMORY,
+        "acme",
+        1,
+        false,
+    )
+    .await
+    .expect("a swept (missing) compaction input is expected, not an anomaly");
 }
 
 #[tokio::test]
@@ -464,9 +502,15 @@ async fn verify_custody_catches_a_compaction_input_with_a_mismatched_hash() {
     put_l0_object_at(&store, "acme", 0, identity, content_hash, b"corrupted").await;
     seed_compaction(&store, "acme", &[identity]).await;
 
-    let err = verify_custody(store as Arc<dyn ObjectStoreBackend>, "acme", 1, false)
-        .await
-        .expect_err("an existing-but-mismatched input must fail verification");
+    let err = verify_custody(
+        store as Arc<dyn ObjectStoreBackend>,
+        MEMORY,
+        "acme",
+        1,
+        false,
+    )
+    .await
+    .expect_err("an existing-but-mismatched input must fail verification");
     assert!(
         err.to_string().contains("content-hash mismatch"),
         "unexpected error: {err}"
@@ -528,9 +572,18 @@ async fn migrate_raises_floor_on_a_clean_tenant() {
     .await
     .expect("provision");
 
-    migrate(store.clone(), tenant, SignalArg::Metrics, 4, None, None, 0)
-        .await
-        .expect("migrate raises the floor on a clean tenant");
+    migrate(
+        store.clone(),
+        MEMORY,
+        tenant,
+        SignalArg::Metrics,
+        4,
+        None,
+        None,
+        0,
+    )
+    .await
+    .expect("migrate raises the floor on a clean tenant");
 
     let floor = ravel_catalog::current_floor_from_store(
         store.as_ref(),
@@ -576,9 +629,18 @@ async fn migrate_exits_nonzero_and_holds_the_floor_when_a_straggler_survives() {
     let now = ravel_cli::now_ns().expect("wall clock");
     publish_l0(mem.as_ref(), tenant, 0, 1, now).await;
 
-    let err = migrate(store.clone(), tenant, SignalArg::Metrics, 4, None, None, 0)
-        .await
-        .expect_err("a fresh straggler must make migrate exit nonzero");
+    let err = migrate(
+        store.clone(),
+        MEMORY,
+        tenant,
+        SignalArg::Metrics,
+        4,
+        None,
+        None,
+        0,
+    )
+    .await
+    .expect_err("a fresh straggler must make migrate exit nonzero");
     assert!(
         err.to_string().contains("refused to raise"),
         "the error must report the refused floor raise: {err}"
