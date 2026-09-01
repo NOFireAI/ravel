@@ -10,7 +10,7 @@
 //! sealed" is a property of the fixture, not of when the suite runs.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -19,8 +19,9 @@ use ravel_cli::store::{DefaultedMemoryEmptyWalk, StoreKind, StoreSelection};
 use ravel_commit::keys;
 use ravel_commit::record::{self, NewCommitRecord};
 use ravel_logseg::{AttrValue, LogRecord, LogStreamId, ObjectIdentity, RlogConfig, RlogWriter};
+use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Rule, ScriptedFault};
 use ravel_object_store::memory::MemoryStore;
-use ravel_object_store::{ObjectStoreBackend, PutOptions, list_all};
+use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, list_all};
 use ravel_types::{Signal, TenantHash, TenantId};
 use uuid::Uuid;
 
@@ -76,10 +77,24 @@ fn log_record(stream: u8, ts_ns: i64, body: &str) -> LogRecord {
 }
 
 /// Seed one L0 `.rlog` object plus its commit record into `(shard, hour)`,
-/// exactly as the ingest log shard would.
+/// exactly as the ingest log shard would. The writer id is random, so two
+/// independently seeded stores are NOT byte-identical; use [`seed_l0_with`] for
+/// a deterministic writer id when a cross-run object comparison needs it.
 async fn seed_l0(store: &dyn ObjectStoreBackend, shard: u32, hour: u32, seq: u64) {
+    seed_l0_with(store, shard, hour, seq, Uuid::new_v4()).await;
+}
+
+/// [`seed_l0`] with an explicit `writer_id`, so two stores seeded with the same
+/// ids hold byte-identical L0 objects and therefore compact to byte-identical
+/// L1 output (the concurrency-determinism test relies on this).
+async fn seed_l0_with(
+    store: &dyn ObjectStoreBackend,
+    shard: u32,
+    hour: u32,
+    seq: u64,
+    writer_id: Uuid,
+) {
     let th = tenant_hash();
-    let writer_id = Uuid::new_v4();
     let base_ns = i64::from(hour) * NS_PER_HOUR;
     let records: Vec<LogRecord> = (0..4)
         .map(|i| {
@@ -165,6 +180,45 @@ async fn seed_tenant() -> Arc<dyn ObjectStoreBackend> {
     store
 }
 
+/// A deterministic writer id for `(shard, hour, seq)`, so two independently
+/// seeded stores are byte-identical.
+fn det_writer_id(shard: u32, hour: u32, seq: u64) -> Uuid {
+    Uuid::from_u128((u128::from(shard) << 96) | (u128::from(hour) << 32) | u128::from(seq))
+}
+
+/// The same 2-shard, 4-bucket logs fixture [`seed_tenant`] builds, but with
+/// DETERMINISTIC writer ids, so two stores seeded this way hold byte-identical
+/// L0 objects and compact to byte-identical L1 output. Returns the concrete
+/// `MemoryStore` so a caller can wrap it (e.g. in a `FaultStore`) before the run.
+async fn seed_tenant_det() -> MemoryStore {
+    let store = MemoryStore::new();
+    for shard in 0..SHARDS {
+        for hour in [HOUR_OLD, HOUR_OLD + 1] {
+            for seq in 1..=2u64 {
+                seed_l0_with(&store, shard, hour, seq, det_writer_id(shard, hour, seq)).await;
+            }
+        }
+    }
+    store
+}
+
+/// Every object under the tenant prefix as a `key -> bytes` map: the whole
+/// physical state, for the concurrency-determinism comparison.
+async fn all_objects(store: &dyn ObjectStoreBackend) -> BTreeMap<String, Vec<u8>> {
+    let mut objects = BTreeMap::new();
+    for meta in list_all(store, &format!("t/{}/", tenant_hash().to_hex()))
+        .await
+        .expect("list tenant prefix")
+    {
+        let got = store
+            .get(&meta.key, GetRange::Full)
+            .await
+            .expect("get object");
+        objects.insert(meta.key, got.data.to_vec());
+    }
+    objects
+}
+
 /// Every object key under the tenant prefix, for the dry-run no-write check.
 async fn all_keys(store: &dyn ObjectStoreBackend) -> Vec<String> {
     let mut keys: Vec<String> = list_all(store, &format!("t/{}/", tenant_hash().to_hex()))
@@ -213,6 +267,7 @@ async fn compact_tenant_compacts_only_the_sealed_hour_of_every_shard() {
         None,
         None,
         None,
+        1,
         now_ns(),
     )
     .await
@@ -275,6 +330,7 @@ async fn max_flush_lifetime_zero_seals_and_compacts_every_hour() {
         None,
         None,
         None,
+        1,
         now_ns(),
     )
     .await
@@ -316,6 +372,7 @@ async fn dry_run_reports_the_same_plan_and_writes_nothing() {
         None,
         None,
         None,
+        1,
         now_ns(),
     )
     .await
@@ -348,6 +405,7 @@ async fn dry_run_reports_the_same_plan_and_writes_nothing() {
         None,
         None,
         None,
+        1,
         now_ns(),
     )
     .await
@@ -372,6 +430,7 @@ async fn missing_shards_and_no_provisioning_record_is_a_typed_error_naming_the_t
         None,
         None,
         None,
+        1,
         now_ns(),
     )
     .await
@@ -412,6 +471,7 @@ async fn from_hour_and_to_hour_bound_the_walk() {
         None,
         None,
         None,
+        1,
         now_ns(),
     )
     .await
@@ -456,6 +516,7 @@ async fn zero_knob_is_refused_before_shard_resolution() {
         Some(0),
         None,
         None,
+        1,
         now_ns(),
     )
     .await
@@ -501,6 +562,7 @@ async fn defaulted_store_with_nothing_under_the_tenant_prefix_is_a_typed_refusal
         None,
         None,
         None,
+        1,
         now_ns(),
     )
     .await
@@ -568,6 +630,7 @@ async fn defaulted_store_refuses_when_no_hour_resolves_under_a_provisioned_tenan
         None,
         None,
         None,
+        1,
         now_ns(),
     )
     .await
@@ -611,6 +674,7 @@ async fn explicit_memory_with_an_empty_store_still_reports_zero_counters() {
         None,
         None,
         None,
+        1,
         now_ns(),
     )
     .await
@@ -655,6 +719,7 @@ async fn a_defaulted_store_that_does_hold_data_walks_normally() {
         None,
         None,
         None,
+        1,
         now_ns(),
     )
     .await
@@ -691,4 +756,259 @@ fn the_report_header_names_the_effective_store() {
         StoreSelection::explicit(StoreKind::S3).header(),
         "store: s3"
     );
+}
+
+/// `--bucket-concurrency 1` (the default) is today's behavior byte-for-byte on
+/// a multi-bucket fixture: the exact same report struct the pre-flag sequential
+/// walk returned (two shards, one sealed hour compacted per shard, one unsealed
+/// hour reported not-sealed per shard, one L1 part per compacted bucket). The
+/// per-bucket lines are emitted in walk order (shard then hour) by construction,
+/// since N=1 dispatches and joins one bucket at a time.
+///
+/// Non-vacuity (prove-the-test): change the `bucket_concurrency` argument below
+/// from 1 to 0 and the call returns `Err(ZeroBucketConcurrency)` instead of this
+/// `Ok`; change `report.compacted`'s expected value to 1 and the struct
+/// assertion fails.
+#[tokio::test]
+async fn bucket_concurrency_one_is_todays_sequential_report() {
+    let store = seed_tenant().await;
+
+    let report = compact_tenant(
+        store.clone(),
+        MEMORY,
+        TENANT,
+        SignalArg::Logs,
+        Some(SHARDS),
+        None,
+        None,
+        false,
+        None,
+        None,
+        None,
+        None,
+        1,
+        now_ns(),
+    )
+    .await
+    .expect("N=1 compact-tenant runs");
+
+    assert_eq!(
+        report,
+        ravel_cli::maintain::CompactTenantReport {
+            store: MEMORY,
+            shards: SHARDS,
+            compacted: 2,
+            already: 0,
+            not_sealed: 2,
+            below_min: 0,
+            tombstoned: 0,
+            parts_written: 2,
+        },
+        "N=1 must report exactly today's sequential outcome"
+    );
+}
+
+/// `--bucket-concurrency 4` over a 4-bucket fixture (both hours sealed via
+/// `--max-flush-lifetime 0s`) compacts all four and, critically, writes the
+/// EXACT SAME stored objects as the N=1 run: content-addressed keys and bytes
+/// are byte-identical, proving concurrency changes no part of the output. Both
+/// stores are seeded with deterministic writer ids so their pre-compaction L0
+/// state is identical; if compaction were order-sensitive the L1 parts or
+/// records would diverge.
+///
+/// Non-vacuity (prove-the-test): in `run_bucket_walk`, drop the
+/// `collected.sort_by_key(|(idx, ..)| *idx)` line so outcomes come back in
+/// completion order -- the reports still match (counts are order-free) but this
+/// stays green because objects are content-addressed; instead, to see it fail,
+/// give every concurrent bucket the SAME shared tracker (replace the
+/// per-bucket `MergeMemoryTracker::new()` with a clone of `base`'s) and the
+/// determinism argument the doc makes no longer holds. The strongest flip:
+/// change the N=4 argument to 4 while asserting `report_n4 != report_n1` and the
+/// equality assertion fails, or change `all_objects` equality to `!=` and it
+/// fails, showing the objects really are identical.
+#[tokio::test]
+async fn bucket_concurrency_four_writes_identical_objects_to_n1() {
+    let store_n4: Arc<dyn ObjectStoreBackend> = Arc::new(seed_tenant_det().await);
+    let store_n1: Arc<dyn ObjectStoreBackend> = Arc::new(seed_tenant_det().await);
+
+    // Identical fixtures before either run.
+    assert_eq!(
+        all_objects(store_n4.as_ref()).await,
+        all_objects(store_n1.as_ref()).await,
+        "the two deterministic fixtures must start byte-identical"
+    );
+
+    let report_n4 = compact_tenant(
+        store_n4.clone(),
+        MEMORY,
+        TENANT,
+        SignalArg::Logs,
+        Some(SHARDS),
+        None,
+        None,
+        false,
+        Some(0),
+        None,
+        None,
+        None,
+        4,
+        now_ns(),
+    )
+    .await
+    .expect("N=4 compact-tenant runs");
+
+    let report_n1 = compact_tenant(
+        store_n1.clone(),
+        MEMORY,
+        TENANT,
+        SignalArg::Logs,
+        Some(SHARDS),
+        None,
+        None,
+        false,
+        Some(0),
+        None,
+        None,
+        None,
+        1,
+        now_ns(),
+    )
+    .await
+    .expect("N=1 compact-tenant runs");
+
+    assert_eq!(report_n4.compacted, 4, "all four buckets compacted at N=4");
+    assert_eq!(report_n4.parts_written, 4);
+    assert_eq!(
+        report_n4, report_n1,
+        "N=4 and N=1 must report identical counters"
+    );
+
+    assert_eq!(
+        all_objects(store_n4.as_ref()).await,
+        all_objects(store_n1.as_ref()).await,
+        "N=4 must write byte-identical objects (content-addressed keys and bytes) to N=1"
+    );
+}
+
+/// One bucket rigged to fail (a `FaultStore` Permanent error on every PUT under
+/// shard 0's older hour) does NOT abort its siblings: the other three sealed
+/// buckets still publish their L1 part and compaction record, the run exits
+/// non-zero with a typed `BucketsFailed { failed: 1, succeeded: 3 }`, and the
+/// failed bucket's own typed error is carried in the aggregate detail.
+///
+/// Non-vacuity (prove-the-test): in `run_bucket_walk`, propagate the first
+/// bucket error with `?` instead of capturing it as the slot's `Err` (i.e.
+/// abort the run on the first failure) and the three siblings no longer publish
+/// -- `bucket_output(1, HOUR_OLD)` flips from `(1, 1)` to `(0, 0)`. Change the
+/// expected `failed`/`succeeded` to `2`/`2` and the field assertions fail.
+#[tokio::test]
+async fn one_bucket_failure_does_not_abort_its_siblings() {
+    let mem = seed_tenant_det().await;
+    // Fail every PUT under shard 0's older-hour bucket: its L1-part PUT (the
+    // first PUT compaction issues for that bucket) errors, so that bucket alone
+    // fails while the other three sealed buckets publish normally.
+    let bucket_path = format!("/{:04}/{}/", 0, keys::ingest_hour_string(HOUR_OLD));
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(
+            Op::Put,
+            ScriptedFault::Permanent("injected compaction fault".into()),
+        )
+        .with_key_contains(bucket_path),
+    );
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(FaultStore::new(mem, plan));
+
+    let err = compact_tenant(
+        store.clone(),
+        MEMORY,
+        TENANT,
+        SignalArg::Logs,
+        Some(SHARDS),
+        None,
+        None,
+        false,
+        // Seal both hours of both shards, so all four buckets are compacted
+        // (except the rigged one).
+        Some(0),
+        None,
+        None,
+        None,
+        4,
+        now_ns(),
+    )
+    .await
+    .expect_err("a failed bucket must make the run exit non-zero");
+
+    let typed = err
+        .downcast_ref::<CompactTenantError>()
+        .expect("typed CompactTenantError::BucketsFailed");
+    match typed {
+        CompactTenantError::BucketsFailed {
+            failed,
+            succeeded,
+            details,
+        } => {
+            assert_eq!(*failed, 1, "exactly one bucket failed");
+            assert_eq!(*succeeded, 3, "the other three buckets succeeded");
+            assert!(
+                details.contains(&format!("shard 0 hour {HOUR_OLD}")),
+                "the failed bucket must be named in the aggregate: {details}"
+            );
+            assert!(
+                details.contains("injected compaction fault"),
+                "the failed bucket's typed error must be carried: {details}"
+            );
+        }
+        other => panic!("expected BucketsFailed, got {other:?}"),
+    }
+
+    // The failed bucket published nothing; the three siblings all published.
+    assert_eq!(
+        bucket_output(store.as_ref(), 0, HOUR_OLD).await,
+        (0, 0),
+        "the rigged bucket wrote no compaction record or L1 part"
+    );
+    for (shard, hour) in [(0, HOUR_OLD + 1), (1, HOUR_OLD), (1, HOUR_OLD + 1)] {
+        assert_eq!(
+            bucket_output(store.as_ref(), shard, hour).await,
+            (1, 1),
+            "sibling bucket shard {shard} hour {hour} published despite the failure"
+        );
+    }
+}
+
+/// `--bucket-concurrency 0` is refused with its typed error before any bucket
+/// runs. A fan-out of zero compacts nothing, which is an operator mistake, not a
+/// no-op success.
+///
+/// Non-vacuity (prove-the-test): delete the `if bucket_concurrency == 0` guard
+/// in `maintain::compact_tenant` and this `expect_err` fails -- the walk then
+/// runs with a zero-slot dispatch loop that spawns nothing and returns an empty,
+/// misleadingly-clean report.
+#[tokio::test]
+async fn zero_bucket_concurrency_is_refused_typed() {
+    let store = seed_tenant().await;
+
+    let err = compact_tenant(
+        store,
+        MEMORY,
+        TENANT,
+        SignalArg::Logs,
+        Some(SHARDS),
+        None,
+        None,
+        false,
+        None,
+        None,
+        None,
+        None,
+        0,
+        now_ns(),
+    )
+    .await
+    .expect_err("--bucket-concurrency 0 must be refused");
+
+    let typed = err
+        .downcast_ref::<CompactTenantError>()
+        .expect("typed CompactTenantError");
+    assert_eq!(*typed, CompactTenantError::ZeroBucketConcurrency);
 }

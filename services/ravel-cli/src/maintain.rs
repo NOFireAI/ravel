@@ -19,6 +19,7 @@ use ravel_object_store::conformance::NoncurrentVersionSource;
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError, list_all};
 use ravel_proto::commit::v1::{CompactionRecord, RetentionTombstone};
 use ravel_types::{Signal, TenantHash, TenantId};
+use tokio::task::JoinSet;
 use uuid::Uuid;
 
 use crate::store::{DefaultedMemoryEmptyWalk, StoreSelection, require_tenant_data_present};
@@ -208,6 +209,19 @@ pub enum CompactTenantError {
         ceiling: u32,
         hour: u32,
     },
+    #[error(
+        "--bucket-concurrency must be greater than 0: it is the number of buckets compacted at \
+         once, and 0 would compact nothing"
+    )]
+    ZeroBucketConcurrency,
+    #[error(
+        "compact-tenant: {failed} bucket(s) failed to compact, {succeeded} succeeded: {details}"
+    )]
+    BucketsFailed {
+        failed: usize,
+        succeeded: usize,
+        details: String,
+    },
 }
 
 /// Per-outcome bucket counts for one `maintain compact-tenant` run, plus the
@@ -331,9 +345,29 @@ async fn shard_hours(
 /// also unsealed. No advisory cursor is read or written: a one-shot operator
 /// invocation covers the range it was asked for, every time.
 ///
-/// `NotSealed` is a reported outcome, not a failure; only a compaction error
-/// aborts the run (and it aborts the whole run, so the operator sees the fault
-/// instead of a summary that quietly omits shards).
+/// `NotSealed` is a reported outcome, not a failure. A bucket whose compaction
+/// errors does NOT abort its siblings: every in-flight bucket runs to
+/// completion, each bucket's outcome is reported (a failed bucket on its own
+/// `outcome=Failed error=...` line carrying its typed error), and the run exits
+/// non-zero with a summary of how many buckets succeeded and failed. This holds
+/// at every `bucket_concurrency`, including the default 1.
+///
+/// `bucket_concurrency` runs up to N buckets' compactions at once. Buckets are
+/// independent by construction (disjoint per-(shard, hour) input sets, separate
+/// content-addressed parts, separate CAS-published records), so the walk is
+/// embarrassingly parallel; [`compact_bucket`]'s own contract confirms it is
+/// safe to call concurrently against one store. Each concurrent bucket runs
+/// with its OWN [`CompactorConfig`] carrying a FRESH [`MergeMemoryTracker`],
+/// because ADR-0979's per-bucket memory model gives each bucket its own merge
+/// budget and tracker and a shared tracker would combine two runs' figures.
+/// There is deliberately no global memory budget: the per-bucket budgets are
+/// independent by design, and total peak scales as roughly N times the
+/// per-bucket envelope (see the `--bucket-concurrency` flag doc). Per-bucket
+/// report lines are emitted in DETERMINISTIC walk order (each bucket's outcome
+/// is buffered and replayed in shard-then-hour order), never interleaved by
+/// completion order, so N=1 output is byte-for-byte today's and the stored
+/// objects are identical across any N. `bucket_concurrency` of 0 is refused
+/// with a typed [`CompactTenantError::ZeroBucketConcurrency`].
 ///
 /// `selection` is which store `--store` resolved to. It heads the report, and
 /// on the defaulted memory store a walk that resolves zero present ingest-hour
@@ -357,6 +391,7 @@ pub async fn compact_tenant(
     l1_part_memory_target_bytes: Option<u64>,
     max_l1_part_bytes: Option<u64>,
     input_read_concurrency: Option<usize>,
+    bucket_concurrency: usize,
     now_ns: i64,
 ) -> anyhow::Result<CompactTenantReport> {
     let started = std::time::Instant::now();
@@ -374,6 +409,11 @@ pub async fn compact_tenant(
         max_l1_part_bytes,
         input_read_concurrency,
     )?;
+    // A zero fan-out is refused before any store access, like the byte-target
+    // knobs above: it is an operator error, not a walk that compacts nothing.
+    if bucket_concurrency == 0 {
+        return Err(CompactTenantError::ZeroBucketConcurrency.into());
+    }
     selection.print_header();
     require_tenant_data_present(
         selection,
@@ -387,7 +427,6 @@ pub async fn compact_tenant(
         resolve_shard_count(store.as_ref(), &tenant_hash, tenant, sig, shards, now_hour).await?;
     let last_hour = to_hour.unwrap_or(now_hour);
     let first_hour = from_hour.unwrap_or(0);
-    let clock = FixedClock::new(now_ns);
     let mut report = CompactTenantReport {
         store: selection,
         shards: shard_count,
@@ -407,10 +446,19 @@ pub async fn compact_tenant(
     println!("input_read_concurrency: {}", config.input_read_concurrency);
     println!("dry_run: {dry_run}");
 
-    // Present ingest-hour buckets resolved across every shard, counted before
-    // the `[first_hour, last_hour]` filter: this is what the walk found in the
-    // store, which is the figure the empty-walk refusal below is about.
+    // Build the walk in deterministic order (shard ascending, then hour
+    // ascending), truncating each shard at and including its first unsealed
+    // hour: hours ascend, so once a bucket is unsealed every later one in that
+    // shard is too. `Bucket::is_sealed` is a pure function of `now_ns` and the
+    // config, exactly the check `compact_bucket` runs internally, so this walk
+    // covers the identical set of buckets the old sequential walk did -- the
+    // first unsealed bucket is kept so it still reports its `NotSealed` outcome.
+    //
+    // `hours_present` still counts every present hour before the
+    // `[first_hour, last_hour]` filter, because that is the figure the
+    // empty-walk refusal below is about, unchanged by the seal truncation.
     let mut hours_present = 0usize;
+    let mut work: Vec<(u32, u32)> = Vec::new();
     for shard in 0..shard_count {
         let shard_hours = shard_hours(store.as_ref(), &tenant_hash, sig, shard).await?;
         hours_present += shard_hours.len();
@@ -421,46 +469,71 @@ pub async fn compact_tenant(
             if hour > last_hour {
                 break;
             }
-            let bucket = Bucket::new(tenant_hash, sig, shard, hour);
-            let outcome = compact_bucket(store.as_ref(), &clock, &config, &bucket)
-                .await
-                .map_err(|err| {
-                    anyhow::anyhow!("compaction failed for shard {shard} hour {hour}: {err}")
-                })?;
-            match outcome {
-                CompactionOutcome::NotSealed => {
-                    report.not_sealed += 1;
-                    println!("shard={shard} hour={hour} outcome=NotSealed");
-                    // Hours ascend, so every later bucket is unsealed too.
-                    break;
-                }
-                CompactionOutcome::Tombstoned => {
-                    report.tombstoned += 1;
-                    println!("shard={shard} hour={hour} outcome=Tombstoned");
-                }
-                CompactionOutcome::AlreadyCompacted => {
-                    report.already += 1;
-                    println!("shard={shard} hour={hour} outcome=AlreadyCompacted");
-                }
-                CompactionOutcome::BelowMinInputs { count } => {
-                    report.below_min += 1;
-                    println!("shard={shard} hour={hour} outcome=BelowMinInputs l0_records={count}");
-                }
-                CompactionOutcome::Compacted { parts, publish } => {
-                    report.compacted += 1;
-                    report.parts_written += parts;
-                    let publish = match publish {
-                        PublishOutcome::Published => "Published".to_string(),
-                        PublishOutcome::Converged { parts_repaired } => {
-                            format!("Converged(parts_repaired={parts_repaired})")
-                        }
-                        PublishOutcome::Abandoned => "Abandoned".to_string(),
-                    };
-                    println!(
-                        "shard={shard} hour={hour} outcome=Compacted parts={parts} \
-                         publish={publish}"
-                    );
-                }
+            let sealed = Bucket::new(tenant_hash, sig, shard, hour).is_sealed(now_ns, &config);
+            work.push((shard, hour));
+            if !sealed {
+                break;
+            }
+        }
+    }
+
+    // Compact the walk with up to `bucket_concurrency` buckets in flight,
+    // collecting each outcome. The buffered join returns outcomes in walk
+    // order regardless of completion order, so the per-bucket lines below are
+    // emitted deterministically and never interleaved.
+    let outcomes = run_bucket_walk(
+        &store,
+        &config,
+        now_ns,
+        tenant_hash,
+        sig,
+        &work,
+        bucket_concurrency,
+    )
+    .await?;
+
+    let mut failed = 0usize;
+    let mut failure_details: Vec<String> = Vec::new();
+    for (shard, hour, outcome) in outcomes {
+        match outcome {
+            Ok(CompactionOutcome::NotSealed) => {
+                report.not_sealed += 1;
+                println!("shard={shard} hour={hour} outcome=NotSealed");
+            }
+            Ok(CompactionOutcome::Tombstoned) => {
+                report.tombstoned += 1;
+                println!("shard={shard} hour={hour} outcome=Tombstoned");
+            }
+            Ok(CompactionOutcome::AlreadyCompacted) => {
+                report.already += 1;
+                println!("shard={shard} hour={hour} outcome=AlreadyCompacted");
+            }
+            Ok(CompactionOutcome::BelowMinInputs { count }) => {
+                report.below_min += 1;
+                println!("shard={shard} hour={hour} outcome=BelowMinInputs l0_records={count}");
+            }
+            Ok(CompactionOutcome::Compacted { parts, publish }) => {
+                report.compacted += 1;
+                report.parts_written += parts;
+                let publish = match publish {
+                    PublishOutcome::Published => "Published".to_string(),
+                    PublishOutcome::Converged { parts_repaired } => {
+                        format!("Converged(parts_repaired={parts_repaired})")
+                    }
+                    PublishOutcome::Abandoned => "Abandoned".to_string(),
+                };
+                println!(
+                    "shard={shard} hour={hour} outcome=Compacted parts={parts} \
+                     publish={publish}"
+                );
+            }
+            Err(err) => {
+                failed += 1;
+                // The bucket's own typed error rides its report line, and the
+                // aggregate below names it too, so a MergeCursorBudgetExceeded
+                // (or any typed failure) is attributable to the bucket it hit.
+                println!("shard={shard} hour={hour} outcome=Failed error={err}");
+                failure_details.push(format!("shard {shard} hour {hour}: {err}"));
             }
         }
     }
@@ -473,6 +546,16 @@ pub async fn compact_tenant(
     println!("tombstoned: {}", report.tombstoned);
     println!("parts ({verb}): {}", report.parts_written);
     println!("wall_time_ms: {}", started.elapsed().as_millis());
+    // Buckets that reported any non-error outcome (compacted, already,
+    // not-sealed, below-min, tombstoned). `failed` is the count of buckets
+    // whose compaction returned a typed error.
+    let succeeded = report.compacted
+        + report.already
+        + report.not_sealed
+        + report.below_min
+        + report.tombstoned;
+    println!("failed: {failed}");
+    println!("bucket_concurrency: {bucket_concurrency}");
     // The counters above are printed first even on the refusal path: an
     // operator who sees the zeros also sees why they are not a result.
     DefaultedMemoryEmptyWalk::check(
@@ -482,7 +565,88 @@ pub async fn compact_tenant(
         "present ingest-hour buckets",
         hours_present,
     )?;
+    if failed > 0 {
+        // Siblings already ran to completion and are reported above; the run
+        // exits non-zero so a failed bucket is never mistaken for a clean pass.
+        return Err(CompactTenantError::BucketsFailed {
+            failed,
+            succeeded,
+            details: failure_details.join("; "),
+        }
+        .into());
+    }
     Ok(report)
+}
+
+/// Compact every bucket in `work` (already in deterministic walk order) with up
+/// to `concurrency` buckets in flight at once, returning each bucket's outcome
+/// in walk order regardless of completion order.
+///
+/// Each bucket runs on its own task with its OWN [`CompactorConfig`] carrying a
+/// FRESH [`MergeMemoryTracker`]: the tracker is `Arc`-shared on `clone`, and
+/// ADR-0979's per-bucket memory accounting requires one tracker per concurrent
+/// run (two runs sharing one combine their figures). Every other config field
+/// is the validated `base`, copied verbatim. `compact_bucket` takes `&store`
+/// and a per-call config and clock, and its own contract states it is safe to
+/// call concurrently against one store, so the disjoint per-(shard, hour)
+/// buckets never contend.
+///
+/// A bucket whose compaction errors is captured as the `Err` of its slot; it
+/// does not cancel or abort its siblings, which all run to completion.
+async fn run_bucket_walk(
+    store: &Arc<dyn ObjectStoreBackend>,
+    base: &CompactorConfig,
+    now_ns: i64,
+    tenant_hash: TenantHash,
+    signal: Signal,
+    work: &[(u32, u32)],
+    concurrency: usize,
+) -> anyhow::Result<Vec<(u32, u32, Result<CompactionOutcome, String>)>> {
+    // `concurrency >= 1` is guaranteed by the caller's ZeroBucketConcurrency
+    // check.
+    let mut set: JoinSet<(usize, u32, u32, Result<CompactionOutcome, String>)> = JoinSet::new();
+    let mut next = 0usize;
+
+    let spawn_at = |set: &mut JoinSet<(usize, u32, u32, Result<CompactionOutcome, String>)>,
+                    idx: usize| {
+        let (shard, hour) = work[idx];
+        let store = Arc::clone(store);
+        // Fresh tracker per bucket (see the fn docs); all other knobs are the
+        // validated base config.
+        let mut config = base.clone();
+        config.merge_memory_tracker = Some(MergeMemoryTracker::new());
+        set.spawn(async move {
+            let clock = FixedClock::new(now_ns);
+            let bucket = Bucket::new(tenant_hash, signal, shard, hour);
+            let result = compact_bucket(store.as_ref(), &clock, &config, &bucket)
+                .await
+                .map_err(|err| err.to_string());
+            (idx, shard, hour, result)
+        });
+    };
+
+    while next < work.len() && next < concurrency {
+        spawn_at(&mut set, next);
+        next += 1;
+    }
+    let mut collected: Vec<(usize, u32, u32, Result<CompactionOutcome, String>)> =
+        Vec::with_capacity(work.len());
+    while let Some(joined) = set.join_next().await {
+        let outcome =
+            joined.map_err(|err| anyhow::anyhow!("compaction task join failed: {err}"))?;
+        collected.push(outcome);
+        if next < work.len() {
+            spawn_at(&mut set, next);
+            next += 1;
+        }
+    }
+
+    // Completion order is arbitrary; restore walk order by the dispatch index.
+    collected.sort_by_key(|(idx, ..)| *idx);
+    Ok(collected
+        .into_iter()
+        .map(|(_, shard, hour, result)| (shard, hour, result))
+        .collect())
 }
 
 /// `maintain sweep`: run one sweep pass (all three GC rules) over a shard.
