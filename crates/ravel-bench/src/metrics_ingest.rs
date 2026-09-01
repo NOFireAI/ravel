@@ -725,9 +725,11 @@ pub async fn replay_into_ravel(
     // ingest; timing that encode would fold work the in-process path never
     // performs into `elapsed_secs`, skewing Ravel's throughput against the HTTP
     // comparators, whose encode IS genuine client work inside their own window.
-    // `wire_bytes` is finalized here and immutable through the timed loop. Move
-    // this accumulation into the timed `write_values` loop below to see
-    // `tests::wire_bytes_equal_the_precomputed_rw1_body_sum` observe the change.
+    // `wire_bytes` is finalized here and immutable through the timed loop.
+    // Window placement is enforced by this code structure alone: moving the
+    // accumulation into the timed loop leaves the value unchanged, so
+    // `tests::wire_bytes_equal_the_precomputed_rw1_body_sum` stays green (it
+    // pins only the value).
     let mut precomputed_wire_bytes: u64 = 0;
     for chunk in valid.chunks(batch_size) {
         let logical: Vec<LogicalSample> = chunk.iter().map(|(_, s)| s.clone()).collect();
