@@ -81,6 +81,14 @@ reqwest = { version = "0.13", features = ["json"] }
 # hand-rolled JWT code.
 jsonwebtoken = { version = "10.4", default-features = false, features = ["use_pem", "aws_lc_rs"] }
 
+# Global allocator for the binary targets (issue #972). jemalloc via
+# tikv-jemallocator, which builds the allocator vendored into the binary: no
+# system library and no LD_PRELOAD, so the allocator cannot be forgotten or
+# vary by environment. Linked only by the two service binaries (and, in a
+# follow-up, ravel-bench) through a `cfg(not(target_env = "msvc"))` target
+# table; never by a library crate, whose test binaries install their own.
+tikv-jemallocator = "0.7"
+
 # telemetry protocol types
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "metrics", "logs", "trace"] }
 

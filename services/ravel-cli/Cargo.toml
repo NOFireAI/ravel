@@ -82,6 +82,20 @@ arrow = { workspace = true }
 # a new direct dependency of ravel-cli per CLAUDE.md.
 toml = "1"
 
+# Global allocator, compiled into this binary (issue #972). Kept off the msvc
+# target, which tikv-jemallocator does not support (its own documented cfg);
+# this repo builds on Linux and macOS. The `#[global_allocator]` lives in
+# src/main.rs, a binary root, never in a library crate.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { workspace = true }
+
+[target.'cfg(not(target_env = "msvc"))'.dev-dependencies]
+# Honest runtime check that the binary is actually running under jemalloc: the
+# smoke test in main.rs reads jemalloc's own allocated-bytes stat. Pinned
+# directly (not via [workspace.dependencies]) matching this crate's convention
+# for deps the single authorized root line does not cover.
+tikv-jemalloc-ctl = { version = "0.7", features = ["stats"] }
+
 [dev-dependencies]
 # Writing small Parquet fixtures in the loader tests uses the same parquet/arrow
 # reader deps declared above; ArrowWriter comes from the `parquet` dep.
