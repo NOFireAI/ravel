@@ -782,6 +782,29 @@ enum MaintainCommand {
         /// bytes. Default 8 (the compactor default); values below 1 act as 1.
         #[arg(long, value_name = "N")]
         input_read_concurrency: Option<usize>,
+        /// Number of buckets to compact CONCURRENTLY. Buckets are independent by
+        /// construction (disjoint per-(shard, hour) input sets, separate
+        /// content-addressed parts, separate CAS-published records), so the walk
+        /// is embarrassingly parallel: N > 1 runs up to N buckets' compactions
+        /// at once. Default 1, which is today's fully sequential behavior
+        /// byte-for-byte (report line order included). Refused at 0.
+        ///
+        /// MEMORY: each bucket's merge carries its OWN budget and tracker
+        /// (ADR-0979); there is NO global budget across concurrent buckets,
+        /// because the per-bucket budgets are independent by design. Total peak
+        /// resident memory therefore scales as roughly N times the per-bucket
+        /// envelope, where the per-bucket envelope is the merge budget plus the
+        /// in-progress writer target (ADR-0979). At the defaults (256 MiB writer
+        /// split target, the default merge budget) N=4 holds roughly 4 times the
+        /// per-bucket envelope resident at once. Size N against the box's RAM,
+        /// not its core count: a 16-core box with only enough RAM for two
+        /// per-bucket envelopes must run N=2, not N=16.
+        ///
+        /// This flag governs how many buckets run at once; --input-read-
+        /// concurrency governs the read fan-out WITHIN one bucket. They compose:
+        /// total in-flight reads can reach N times --input-read-concurrency.
+        #[arg(long, value_name = "N", default_value_t = 1)]
+        bucket_concurrency: usize,
     },
     /// Run one sweep pass (orphan GC, superseded, unreferenced parts) over a shard.
     Sweep {
@@ -1097,6 +1120,7 @@ async fn main() -> anyhow::Result<()> {
                     l1_part_memory_target_bytes,
                     max_l1_part_bytes,
                     input_read_concurrency,
+                    bucket_concurrency,
                 },
         } => maintain::compact_tenant(
             store::build_store(&cli.store)?,
@@ -1111,6 +1135,7 @@ async fn main() -> anyhow::Result<()> {
             l1_part_memory_target_bytes,
             max_l1_part_bytes,
             input_read_concurrency,
+            bucket_concurrency,
             now_ns()?,
         )
         .await
