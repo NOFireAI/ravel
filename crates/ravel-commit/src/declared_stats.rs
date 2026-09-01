@@ -38,7 +38,7 @@
 //!   takes only [`DeclaredColumnStat`]s, whose constructor is the typed
 //!   boundary that refuses ineligible types (ADR-0873 decision 2).
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use ravel_proto::commit::v1::{
     CommitRecord, CompactionPart, DeclaredColumnMinMax, DeclaredColumnStatValue,
@@ -83,8 +83,12 @@ pub enum DeclaredStatDefect {
         null_count: u64,
         sample_count: u64,
     },
-    /// Two entries name the same column. Which one wins is undefined, so
-    /// neither is trusted beyond the first.
+    /// Two or more entries name the same column. No rule can pick between two
+    /// claims on one immutable record, so EVERY occurrence is dropped and the
+    /// name gains no coverage at all (ADR-0873 clause 6). Keeping either the
+    /// first or the last would be a silent pick, and the tree has shipped
+    /// readers making both picks at once against one record; the only
+    /// resolution that agrees under either ordering is to drop all.
     #[error("duplicate entry for declared column {0:?}")]
     DuplicateName(String),
 }
@@ -138,6 +142,21 @@ impl ValidatedDeclaredStats {
     /// The dropped entries, read-only, in record order.
     pub fn dropped(&self) -> &[DroppedStatEntry] {
         &self.dropped
+    }
+
+    /// The number of entries this read dropped: the declared-stamp defect
+    /// counter of ADR-0873 decision 2/4, one increment per entry the statistics
+    /// validity predicate refused (an ineligible type, a value-kind mismatch, a
+    /// half-present min/max pair, a row-count contradiction, or a duplicated
+    /// name). A nonzero value is a writer- or copy-side bug against an
+    /// immutable record, surfaced exactly where coverage is spent: without it a
+    /// bad writer shows up only as a query that quietly stopped taking the
+    /// statistics shortcut. Following the `layout_drift_count` anomaly-counter
+    /// convention (`ravel_catalog::FoldReport`): a plain count a caller feeds to
+    /// its defect metric, exact by construction because every drop pushes one
+    /// entry onto `dropped`.
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped.len() as u64
     }
 
     /// Look up one covered declared column's statistics by name.
@@ -262,17 +281,24 @@ fn decode_all_against_rows(
 ) -> ValidatedDeclaredStats {
     let mut covered = Vec::new();
     let mut dropped = Vec::new();
-    // Names, not decoded stats: the name is stored verbatim, and borrowing
-    // from `entries` keeps the set independent of the pushes into `covered`.
-    let mut seen: HashSet<&str> = HashSet::with_capacity(entries.len());
+    // Count each name's occurrences up front (ADR-0873 clause 6): a name
+    // carried more than once yields NO coverage at all -- every occurrence is
+    // dropped, none is kept. First-wins (or last-wins) would silently pick
+    // between two claims on one immutable record, and the tree has shipped
+    // readers making both picks at once against the same record; the only
+    // resolution that agrees under either ordering is to drop all. Names, not
+    // decoded stats: the name is stored verbatim, and borrowing from `entries`
+    // keeps the map independent of the pushes into `covered`.
+    let mut counts: HashMap<&str, usize> = HashMap::with_capacity(entries.len());
+    for entry in entries {
+        *counts.entry(entry.name.as_str()).or_insert(0) += 1;
+    }
     for (index, entry) in entries.iter().enumerate() {
-        // The name is claimed by its FIRST occurrence in record order, valid
-        // or not: which of two same-name entries wins is undefined, so a
-        // later entry must never gain coverage because an earlier one was
-        // dropped for its own defect. Reserving before validation is what
-        // enforces that.
-        let first_occurrence = seen.insert(entry.name.as_str());
-        let reason = if !first_occurrence {
+        // A duplicated name is dropped before its own contents are even
+        // decoded: no field of a name that appears twice is trusted, whether
+        // an occurrence is otherwise valid or not.
+        let duplicated = counts.get(entry.name.as_str()).copied().unwrap_or(0) > 1;
+        let reason = if duplicated {
             DeclaredStatDefect::DuplicateName(entry.name.clone())
         } else {
             match decode(entry) {
@@ -738,22 +764,34 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_column_entries_keep_only_the_first() {
-        // Both orderings of the same duplicate pair. A resolution that keeps
-        // whichever entry it prefers (widest range, highest null count, last
-        // seen) satisfies one ordering and fails the other; only first-wins
-        // satisfies both.
+    fn duplicate_column_entries_yield_zero_coverage_under_either_ordering() {
+        // ADR-0873 clause 6: a name carried twice grants NO coverage at all,
+        // both occurrences dropped. Run both orderings of the same pair: a
+        // resolution that keeps whichever entry it prefers (first, last, widest
+        // range, highest null count) satisfies one ordering and fails the
+        // other, so only "drop all" passes the pair. The counter moves by
+        // exactly the number of dropped entries -- two, one per occurrence.
         let narrow = i64_stat("EventDate", 1, 2, 0);
         let wide = i64_stat("EventDate", 100, 200, 5);
         for (first, second) in [(&narrow, &wide), (&wide, &narrow)] {
             let entries = vec![encode(first), encode(second)];
             let read = decode_all(&entries);
-            // The exact surviving entry, not just its name or its count.
-            assert_eq!(read.covered().to_vec(), vec![first.clone()]);
-            assert_eq!(read.dropped().len(), 1);
-            // The exact dropped index, which the defect counter attributes by.
+            // No coverage for the duplicated name, from either ordering.
+            assert!(read.covered().is_empty());
+            assert_eq!(read.column("EventDate"), None);
+            // Both occurrences dropped, in record order, each a DuplicateName.
+            assert_eq!(read.dropped().len(), 2);
+            assert_eq!(read.dropped_count(), 2);
             assert_eq!(
                 read.dropped()[0],
+                DroppedStatEntry {
+                    index: 0,
+                    name: "EventDate".to_string(),
+                    reason: DeclaredStatDefect::DuplicateName("EventDate".to_string()),
+                }
+            );
+            assert_eq!(
+                read.dropped()[1],
                 DroppedStatEntry {
                     index: 1,
                     name: "EventDate".to_string(),
@@ -764,9 +802,12 @@ mod tests {
     }
 
     #[test]
-    fn duplicates_do_not_disturb_the_order_of_the_entries_around_them() {
-        // Order is record order for both lists, and a duplicate drops out of
-        // the middle without reordering what follows it.
+    fn a_duplicated_name_uncovers_all_its_occurrences_leaving_the_unique_ones() {
+        // Aaa and Bbb each appear twice, Ccc once. Every occurrence of a
+        // duplicated name is dropped (ADR-0873 clause 6), only the unique Ccc
+        // survives, and the surviving entry keeps its record position. The
+        // dropped list is record order, so both duplicates of each name appear
+        // at their own indices.
         let entries = vec![
             encode(&i64_stat("Aaa", 1, 2, 0)),
             encode(&i64_stat("Bbb", 3, 4, 0)),
@@ -775,20 +816,95 @@ mod tests {
             encode(&i64_stat("Bbb", 9, 10, 0)),
         ];
         let read = decode_all(&entries);
-        assert_eq!(
-            read.covered().to_vec(),
-            vec![
-                i64_stat("Aaa", 1, 2, 0),
-                i64_stat("Bbb", 3, 4, 0),
-                i64_stat("Ccc", 7, 8, 0),
-            ]
-        );
+        assert_eq!(read.covered().to_vec(), vec![i64_stat("Ccc", 7, 8, 0)]);
+        assert_eq!(read.column("Aaa"), None);
+        assert_eq!(read.column("Bbb"), None);
+        assert_eq!(read.dropped_count(), 4);
         assert_eq!(
             read.dropped()
                 .iter()
                 .map(|d| (d.index, d.name.as_str()))
                 .collect::<Vec<_>>(),
-            vec![(2, "Aaa"), (4, "Bbb")]
+            vec![(0, "Aaa"), (1, "Bbb"), (2, "Aaa"), (4, "Bbb")]
+        );
+    }
+
+    #[test]
+    fn the_defect_counter_moves_once_per_validation_failed_stamp() {
+        // ADR-0873 decision 4's dropped-stamp counter: every entry the
+        // predicate refuses moves it by exactly one, and a valid entry moves it
+        // by zero. Three distinct validation failures beside two valid entries:
+        // the counter is exactly three, and it equals `dropped().len()` because
+        // each drop pushes exactly one entry.
+        let entries = vec![
+            // Ineligible type (STR is not stamp-eligible).
+            DeclaredColumnMinMax {
+                name: "URL".to_string(),
+                declared_type: TYPED_ATTR_COLUMN_TYPE_STR,
+                min: None,
+                max: None,
+                null_count: 3,
+            },
+            encode(&i64_stat("EventDate", 1, 2, 0)),
+            // min above max.
+            DeclaredColumnMinMax {
+                name: "Backwards".to_string(),
+                declared_type: DeclaredStatType::I64.tag(),
+                min: Some(DeclaredColumnStatValue {
+                    kind: Some(Kind::I64(9)),
+                }),
+                max: Some(DeclaredColumnStatValue {
+                    kind: Some(Kind::I64(8)),
+                }),
+                null_count: 0,
+            },
+            encode(&i64_stat("Latency", 5, 6, 1)),
+            // Present extrema over an all-NULL column (row-count clause 5).
+            encode(&i64_stat("Status", 200, 500, 7)),
+        ];
+        let read = read_commit_record(&decoded_record(7, entries));
+        assert_eq!(read.covered().len(), 2);
+        assert_eq!(read.dropped_count(), 3);
+        assert_eq!(read.dropped_count() as usize, read.dropped().len());
+    }
+
+    #[test]
+    fn a_float_stamp_is_dropped_so_a_float_column_never_shortcuts() {
+        // ADR-0873 decision 2's float gate, asserted even though `F64` is
+        // unrepresentable in the stamp today: a record carrying an F64-tagged
+        // entry (a broken or future writer) yields NO coverage for that column,
+        // so it can never reach a `SegmentRef` stamp and the read-side shortcut
+        // never fires for a float column. The allowlist is the single gate:
+        // `from_tag` refuses `F64` by name, so admitting it later is a
+        // deliberate edit, never something that starts working when its tag
+        // exists.
+        assert_eq!(
+            DeclaredStatType::from_tag(TYPED_ATTR_COLUMN_TYPE_F64),
+            Err(DeclaredStatError::IneligibleType {
+                tag: TYPED_ATTR_COLUMN_TYPE_F64
+            })
+        );
+        let entries = vec![DeclaredColumnMinMax {
+            name: "Ratio".to_string(),
+            declared_type: TYPED_ATTR_COLUMN_TYPE_F64,
+            // Plausible-looking values a naive reader might trust.
+            min: Some(DeclaredColumnStatValue {
+                kind: Some(Kind::I64(0)),
+            }),
+            max: Some(DeclaredColumnStatValue {
+                kind: Some(Kind::I64(100)),
+            }),
+            null_count: 0,
+        }];
+        let read = read_commit_record(&decoded_record(7, entries));
+        assert!(read.covered().is_empty());
+        assert_eq!(read.column("Ratio"), None);
+        assert_eq!(read.dropped_count(), 1);
+        assert_eq!(
+            read.dropped()[0].reason,
+            DeclaredStatDefect::Invalid(DeclaredStatError::IneligibleType {
+                tag: TYPED_ATTR_COLUMN_TYPE_F64
+            })
         );
     }
 
@@ -1035,18 +1151,19 @@ mod tests {
     }
 
     #[test]
-    fn an_invalid_first_duplicate_never_lets_a_later_one_gain_coverage() {
-        // A name is claimed by its FIRST occurrence in record order, valid or
-        // not: which of two same-name entries wins is undefined (the
-        // DuplicateName clause), so the column stays uncovered even when the
-        // first occurrence was dropped for a defect of its own and the later
-        // occurrence is individually valid. Before the reserve-first fix the
-        // later entry entered `covered`.
+    fn neither_occurrence_of_a_duplicated_name_gains_coverage() {
+        // A duplicated name grants no coverage regardless of whether either
+        // occurrence is individually valid (ADR-0873 clause 6): both are dropped
+        // as DuplicateName before their own contents are decoded, so a later
+        // individually-valid occurrence never slips through on the back of an
+        // earlier one that was dropped for a defect of its own. The unrelated
+        // valid entry keeps its coverage; the counter counts exactly the two
+        // duplicate occurrences.
         let entries = vec![
-            // Index 0: row-count defect (extrema present over an all-NULL
-            // column) -- dropped for its own reason, but it still claims "d".
+            // Index 0: also carries a row-count defect (extrema present over an
+            // all-NULL column), but the duplicate rule fires first.
             encode(&i64_stat("d", 1, 9, 7)),
-            // Index 1: individually valid, same name -- must NOT be covered.
+            // Index 1: individually valid, same name -- still not covered.
             encode(&i64_stat("d", 1, 9, 3)),
             // Index 2: unrelated valid entry keeps its coverage.
             encode(&i64_stat("ok", 5, 6, 0)),
@@ -1055,12 +1172,11 @@ mod tests {
         assert_eq!(read.covered().len(), 1);
         assert_eq!(read.column("d"), None);
         assert_eq!(read.column("ok").map(|s| s.name()), Some("ok"));
-        assert_eq!(read.dropped().len(), 2);
+        assert_eq!(read.dropped_count(), 2);
         assert_eq!(read.dropped()[0].index, 0);
         assert!(matches!(
             read.dropped()[0].reason,
-            DeclaredStatDefect::Invalid(DeclaredStatError::PresenceMismatch { .. })
-                | DeclaredStatDefect::PresenceDisagreesWithNullCount { .. }
+            DeclaredStatDefect::DuplicateName(ref n) if n == "d"
         ));
         assert_eq!(read.dropped()[1].index, 1);
         assert!(matches!(

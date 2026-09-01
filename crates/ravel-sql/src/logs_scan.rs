@@ -264,6 +264,7 @@ use ravel_query::{
 };
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
+use ravel_types::declared_stats::{DeclaredStatType, DeclaredStatValue};
 use ravel_types::logstream::AttrValue;
 use tokio::sync::OnceCell;
 
@@ -603,6 +604,55 @@ fn declared_null_scalar(ty: DeclaredType) -> ScalarValue {
         DeclaredType::Bytes => ScalarValue::Binary(None),
         DeclaredType::Str => ScalarValue::Utf8(None),
     }
+}
+
+/// Whether the ADR-0873 stamp carrier may answer a declared column of type
+/// `ty`. The allowlist is exactly `{I64, BOOL}`: both have a total order and a
+/// fixed-width stamped value the writer already folds. `Str`/`Bytes` never
+/// carry a stamp (their extrema are unbounded user bytes, excluded from the
+/// stamp vocabulary), so they decline here too.
+///
+/// The float gate is explicit and enforced by construction: the match is
+/// exhaustive, so when `DeclaredType` gains an `f64` variant this stops
+/// compiling until that variant is handled, and the only sound handling is to
+/// decline it -- a stamp shortcut that ordered floats differently from the scan
+/// aggregate it replaces is a wrong answer, not a slow one (ADR-0873 decision
+/// 2). A declared float column keeps scanning.
+fn stamp_eligible(ty: DeclaredType) -> bool {
+    match ty {
+        DeclaredType::I64 | DeclaredType::Bool => true,
+        DeclaredType::Str | DeclaredType::Bytes => false,
+    }
+}
+
+/// Whether a stamp's stored type agrees with the query's declared type for the
+/// column. A disagreement means the tenant redeclared the column's type after
+/// the segment flushed; the stamp describes the old type's values, so it grants
+/// no coverage and the column scans.
+fn stamp_type_matches(ty: DeclaredType, stamped: DeclaredStatType) -> bool {
+    matches!(
+        (ty, stamped),
+        (DeclaredType::I64, DeclaredStatType::I64) | (DeclaredType::Bool, DeclaredStatType::Bool)
+    )
+}
+
+/// The Arrow scalar an eligible stamp value carries. Total over the stamp
+/// vocabulary (`{I64, BOOL}`), matching [`declared_scalar`]'s mapping for the
+/// same two types.
+fn stamp_scalar(value: DeclaredStatValue) -> ScalarValue {
+    match value {
+        DeclaredStatValue::I64(v) => ScalarValue::Int64(Some(v)),
+        DeclaredStatValue::Bool(b) => ScalarValue::Boolean(Some(b)),
+    }
+}
+
+/// Exact whole-object stamp (ADR-0873) statistics for one declared column,
+/// aggregated across the segments a scan touches: the min of mins, the max of
+/// maxes, and the exact sum of null counts.
+struct DeclaredStampStat {
+    min: ScalarValue,
+    max: ScalarValue,
+    null_count: u64,
 }
 
 /// Exact `GROUP BY <declared column>, COUNT(*)` result from
@@ -1340,6 +1390,114 @@ impl LogsScanExec {
         result
     }
 
+    /// Exact min/max and null count for every declared column, read from the
+    /// ADR-0873 stamps each touched [`SegmentRef`] carries directly (its
+    /// `declared_column_stats`), resolved in one pass over the segments.
+    /// `result[k]` is `None` when the stamp carrier does not cover column `k`
+    /// on EVERY touched segment, so the column grants no coverage and its
+    /// aggregate scans (the ADR-0850 safety lemma, extended to this carrier):
+    ///
+    /// - the declared type is not stamp-eligible (`{I64, BOOL}` only; the float
+    ///   gate of ADR-0873 decision 2 lives in [`stamp_eligible`]),
+    /// - some touched segment carries no valid stamp for the column -- an
+    ///   unstamped (pre-ADR-0873) record, a metrics/spans segment, a column
+    ///   declared after the flush opened, or an entry the wave-2 predicate
+    ///   dropped. A `SegmentRef` only ever carries stamps that already passed
+    ///   the statistics validity predicate against their record's own row count
+    ///   (wave 3), so a dropped entry is simply absent from the list and there
+    ///   is nothing to re-validate here: coverage is proven by type, or
+    /// - a stamp's stored type disagrees with the query's declared type (a
+    ///   redeclaration since the flush). Fail closed.
+    ///
+    /// `Some` with both extrema a `None`-valued scalar is still exact, not a
+    /// fallback: every covered segment's column was entirely null, or there are
+    /// zero segments, and SQL `MIN`/`MAX` over all-null or zero-row input is
+    /// `NULL`. The null count is the exact cross-segment sum, which is what lets
+    /// the stock `AggregateStatistics` rule also answer `COUNT(col)` as
+    /// `num_rows - null_count`.
+    ///
+    /// This is the stamp half of ADR-0873 decision 4's carrier union; the
+    /// `.cstat` half is [`Self::declared_min_max_all`]. The per-carrier conflict
+    /// reconciliation of decision 4 is not implemented here (issue #873 wave 4
+    /// scopes the stamp carrier); on the tenants this wave targets a column is
+    /// served by at most one carrier.
+    fn declared_stamp_stats_all(&self) -> Vec<Option<DeclaredStampStat>> {
+        // Per-column running extrema and null-count sum plus a "declined" flag,
+        // mirroring `declared_min_max_all`: a column declines the moment any
+        // touched segment lacks a valid stamp for it. An ineligible type
+        // declines up front.
+        struct Acc {
+            declined: bool,
+            min: Option<ScalarValue>,
+            max: Option<ScalarValue>,
+            null_count: u64,
+        }
+        let mut acc: Vec<Acc> = self
+            .declared
+            .iter()
+            .map(|d| Acc {
+                declined: !stamp_eligible(d.ty),
+                min: None,
+                max: None,
+                null_count: 0,
+            })
+            .collect();
+
+        for seg in self.segments.iter() {
+            for (k, a) in acc.iter_mut().enumerate() {
+                if a.declined {
+                    continue;
+                }
+                let declared = &self.declared[k];
+                let Some(stat) = seg.declared_column_stats.column(declared.key.as_str()) else {
+                    // Uncovered on this segment: the whole column declines.
+                    a.declined = true;
+                    continue;
+                };
+                if !stamp_type_matches(declared.ty, stat.declared_type()) {
+                    a.declined = true;
+                    continue;
+                }
+                if let Some(min_val) = stat.min() {
+                    let v = stamp_scalar(min_val);
+                    a.min = Some(match a.min.take() {
+                        Some(cur) if v.partial_cmp(&cur) != Some(std::cmp::Ordering::Less) => cur,
+                        _ => v,
+                    });
+                }
+                if let Some(max_val) = stat.max() {
+                    let v = stamp_scalar(max_val);
+                    a.max = Some(match a.max.take() {
+                        Some(cur) if v.partial_cmp(&cur) != Some(std::cmp::Ordering::Greater) => {
+                            cur
+                        }
+                        _ => v,
+                    });
+                }
+                match a.null_count.checked_add(stat.null_count()) {
+                    Some(sum) => a.null_count = sum,
+                    // A null-count sum wider than u64 cannot be exact; decline.
+                    None => a.declined = true,
+                }
+            }
+        }
+
+        acc.into_iter()
+            .enumerate()
+            .map(|(k, a)| {
+                if a.declined {
+                    return None;
+                }
+                let null_scalar = declared_null_scalar(self.declared[k].ty);
+                Some(DeclaredStampStat {
+                    min: a.min.unwrap_or_else(|| null_scalar.clone()),
+                    max: a.max.unwrap_or(null_scalar),
+                    null_count: a.null_count,
+                })
+            })
+            .collect()
+    }
+
     /// Exact count of rows whose declared column at schema index
     /// `FIRST_DECLARED_COL + k` is non-null and not equal to `literal`
     /// (ADR-0850's q02 shape: `COUNT(*) WHERE <declared column> <> <literal>`,
@@ -1938,6 +2096,36 @@ impl ExecutionPlan for LogsScanExec {
                     let col = &mut stats.column_statistics[out_idx];
                     col.min_value = Precision::Exact(min);
                     col.max_value = Precision::Exact(max);
+                }
+            }
+
+            // ADR-0873: the same gate widens to the stamp carrier each
+            // `SegmentRef` carries directly (`declared_column_stats`), which
+            // covers the live tail and token-resolved segments no fold-built
+            // `.cstat` can ever reach. `declared_stamp_stats_all` reports a
+            // column only when EVERY touched segment carries a valid stamp for
+            // it, and also sums the exact null count, so the same stock
+            // `AggregateStatistics` rule answers `MIN`/`MAX(col)` from the
+            // extrema and `COUNT(col)` as `num_rows - null_count`, both with
+            // zero data GETs. A stamp column and a `.cstat` column agree by
+            // ADR-0873 decision 4 wherever both cover; this fill lands after the
+            // `.cstat` fill so a stamp-covered live-tail column is populated
+            // even on a tenant whose sealed history is `.cstat`-only.
+            let declared_stamp = self.declared_stamp_stats_all();
+            for (k, stamp) in declared_stamp.into_iter().enumerate() {
+                let schema_idx = FIRST_DECLARED_COL + k;
+                if let Some(out_idx) = self.projection.iter().position(|&i| i == schema_idx)
+                    && let Some(stamp) = stamp
+                {
+                    let col = &mut stats.column_statistics[out_idx];
+                    col.min_value = Precision::Exact(stamp.min);
+                    col.max_value = Precision::Exact(stamp.max);
+                    // usize::try_from cannot fail on the 64-bit targets this
+                    // runs on; if it ever did, leaving null_count Absent only
+                    // makes COUNT(col) scan, never a wrong count.
+                    if let Ok(null_count) = usize::try_from(stamp.null_count) {
+                        col.null_count = Precision::Exact(null_count);
+                    }
                 }
             }
         }
@@ -4116,6 +4304,35 @@ mod columnar_lookup_tests {
         let mut a = [0u8; 16];
         a[0] = n;
         LogStreamId(a)
+    }
+
+    #[test]
+    fn stamp_eligibility_is_the_i64_bool_allowlist() {
+        // ADR-0873 decision 2: the stamp carrier answers I64 and BOOL only.
+        assert!(stamp_eligible(DeclaredType::I64));
+        assert!(stamp_eligible(DeclaredType::Bool));
+        // Str/Bytes carry no stamp. A declared float column, once DeclaredType
+        // gains the variant, is excluded by the exhaustive match in
+        // `stamp_eligible` (it stops compiling until handled, and the only sound
+        // handling is to decline), so a float column never takes the shortcut:
+        // the explicit float gate.
+        assert!(!stamp_eligible(DeclaredType::Str));
+        assert!(!stamp_eligible(DeclaredType::Bytes));
+        // A stamp whose stored type disagrees with the query's declared type
+        // grants no coverage.
+        assert!(stamp_type_matches(DeclaredType::I64, DeclaredStatType::I64));
+        assert!(stamp_type_matches(
+            DeclaredType::Bool,
+            DeclaredStatType::Bool
+        ));
+        assert!(!stamp_type_matches(
+            DeclaredType::I64,
+            DeclaredStatType::Bool
+        ));
+        assert!(!stamp_type_matches(
+            DeclaredType::Bool,
+            DeclaredStatType::I64
+        ));
     }
 
     fn rec_k(ts: i64, k: Option<i64>) -> LogRecord {

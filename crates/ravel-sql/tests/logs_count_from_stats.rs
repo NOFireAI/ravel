@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::Int64Array;
+use datafusion::arrow::array::{Array, Int64Array};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::stats::Precision;
 use datafusion::functions_aggregate::expr_fn::count;
@@ -21,18 +21,21 @@ use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::{Statistics, collect, displayable};
 use datafusion::prelude::{SessionContext, col, lit};
 use datafusion::scalar::ScalarValue;
-use ravel_catalog::{Catalog, CatalogConfig, SegmentLevel, SegmentRef, Snapshot};
+use ravel_catalog::{
+    Catalog, CatalogConfig, DeclaredColumnStats, SegmentLevel, SegmentRef, Snapshot,
+};
 use ravel_logseg::writer::ObjectIdentity;
 use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::{LogSegmentFetcher, SegmentFetcher};
 use ravel_sql::{
-    LogsTableProvider, SessionTable, SpanSegmentFetcher, SpillDecision, SqlConfig, SqlExecutor,
-    TenantMemoryAccountant, build_session,
+    DeclaredColumn, DeclaredType, LogsTableProvider, SessionTable, SpanSegmentFetcher,
+    SpillDecision, SqlConfig, SqlExecutor, TenantMemoryAccountant, build_session,
 };
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
+use ravel_types::declared_stats::{DeclaredColumnStat, DeclaredStatType, DeclaredStatValue};
 use uuid::Uuid;
 
 use futures::StreamExt;
@@ -642,4 +645,276 @@ async fn no_ts_bound_reports_exact_count_and_span() {
         ts_ns(312)
     );
     assert_eq!(store.gets(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// ADR-0873 (issue #873) wave 4: MIN/MAX/COUNT over a declared column answered
+// from the per-declared-column stamps each `SegmentRef` carries directly
+// (`declared_column_stats`), with zero data GETs. These mirror the ts-span
+// tests above one carrier over: the stamp rides snapshot resolution, so it
+// covers the live tail and token-resolved segments no fold-built `.cstat` can
+// reach, and no `.cstat` object is loaded here at all.
+
+/// A valid I64 stamp for `name` with the given extrema and null count.
+fn i64_stat(name: &str, min: i64, max: i64, null_count: u64) -> DeclaredColumnStat {
+    DeclaredColumnStat::new(
+        name,
+        DeclaredStatType::I64,
+        Some(DeclaredStatValue::I64(min)),
+        Some(DeclaredStatValue::I64(max)),
+        null_count,
+    )
+    .expect("valid i64 stat")
+}
+
+/// Attach ADR-0873 declared-column stamps to `seg`, taking the same validated
+/// route production does: build the stamps onto a `CommitRecord`, read them
+/// back through the wave-2 gated reader against the record's own row count, and
+/// share the validated result onto the ref. A `SegmentRef` can only ever carry
+/// validated stamps, so this constructor-gated path is the only way to build
+/// one, and it asserts the test's own stamps are clean.
+fn stamp_seg(mut seg: SegmentRef, stats: &[DeclaredColumnStat]) -> SegmentRef {
+    let mut record = ravel_proto::commit::v1::CommitRecord {
+        sample_count: seg.sample_count,
+        ..Default::default()
+    };
+    ravel_commit::declared_stats::stamp_commit_record(&mut record, stats);
+    let validated = ravel_commit::declared_stats::read_commit_record(&record);
+    assert!(
+        validated.dropped().is_empty(),
+        "a test stamp must pass the predicate; dropped {:?}",
+        validated.dropped()
+    );
+    seg.declared_column_stats = DeclaredColumnStats::from_validated(&validated);
+    seg
+}
+
+/// One declared I64 column named `EventDate` (the ClickBench q07 column).
+fn event_date() -> Vec<DeclaredColumn> {
+    vec![DeclaredColumn::new("EventDate", DeclaredType::I64)]
+}
+
+/// A provider over `snapshot` with declared columns and an observable
+/// accounting handle, built as [`SqlExecutor`] builds one.
+fn provider_declared(
+    store: Arc<CountingStore>,
+    snapshot: Snapshot,
+    declared: Vec<DeclaredColumn>,
+    accounting: QueryAccounting,
+) -> LogsTableProvider {
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+    LogsTableProvider::new(
+        snapshot,
+        TENANT,
+        LogSegmentFetcher::new(backend),
+        accounting,
+    )
+    .with_declared_columns(declared)
+}
+
+/// The Int64 value at column `col` of the single result row, or `None` when it
+/// is SQL NULL.
+fn i64_at(batches: &[RecordBatch], col: usize) -> Option<i64> {
+    for batch in batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let arr = batch
+            .column(col)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 column");
+        return if arr.is_null(0) {
+            None
+        } else {
+            Some(arr.value(0))
+        };
+    }
+    None
+}
+
+/// The issue's acceptance shape: `SELECT MIN(EventDate), MAX(EventDate)` over a
+/// tenant whose every touched segment carries a valid stamp is answered from
+/// those stamps with EXACTLY ZERO data GETs and no `LogsScanExec` in the plan,
+/// and the whole statement touches no data object (`data_objects_touched == 0`).
+/// The extrema are the min of the per-segment mins and the max of the maxes, and
+/// the null count is the exact cross-segment sum (which is what lets the same
+/// stock rule also answer `COUNT(EventDate)`).
+///
+/// Pre-fix (delete the `declared_stamp_stats_all` fill in
+/// `partition_statistics`): EventDate's min/max/null_count stay `Absent`, the
+/// `AggregateStatistics` rule does not fire, `LogsScanExec` stays in the plan,
+/// and the query reads three objects.
+#[tokio::test]
+async fn declared_stamp_min_max_answered_from_catalog_with_zero_gets() {
+    let store = CountingStore::new(Arc::new(MemoryStore::new()));
+    let s1 = stamp_seg(
+        write_object(&*store, "logs/o1.rlog", &seg_records(100, 7)).await,
+        &[i64_stat("EventDate", -5, 10, 1)],
+    );
+    let s2 = stamp_seg(
+        write_object(&*store, "logs/o2.rlog", &seg_records(200, 11)).await,
+        &[i64_stat("EventDate", 3, 42, 0)],
+    );
+    let s3 = stamp_seg(
+        write_object(&*store, "logs/o3.rlog", &seg_records(300, 13)).await,
+        &[i64_stat("EventDate", 7, 90, 4)],
+    );
+    let snapshot = snapshot_of(vec![s1, s2, s3], Vec::new());
+
+    // Direct `partition_statistics`: EventDate min/max/null_count are Exact and
+    // no object is read or touched.
+    let acc = QueryAccounting::new();
+    let provider = provider_declared(
+        Arc::clone(&store),
+        snapshot.clone(),
+        event_date(),
+        acc.clone(),
+    );
+    let plan = provider.plan_filters(4, &[]).expect("plan_filters");
+    let stats = plan
+        .partition_statistics(None)
+        .expect("partition_statistics");
+    let idx = plan
+        .schema()
+        .index_of("EventDate")
+        .expect("EventDate column");
+    assert_eq!(stats.num_rows, Precision::Exact(31), "7 + 11 + 13");
+    assert_eq!(
+        stats.column_statistics[idx].min_value,
+        Precision::Exact(ScalarValue::Int64(Some(-5))),
+        "min of the per-segment mins"
+    );
+    assert_eq!(
+        stats.column_statistics[idx].max_value,
+        Precision::Exact(ScalarValue::Int64(Some(90))),
+        "max of the per-segment maxes"
+    );
+    assert_eq!(
+        stats.column_statistics[idx].null_count,
+        Precision::Exact(5),
+        "1 + 0 + 4 null rows, summed exactly across segments"
+    );
+    assert_eq!(store.gets(), 0, "answering from stamps reads no objects");
+    assert_eq!(
+        acc.snapshot().data_objects_touched,
+        0,
+        "a stats-answered statement touches no data object"
+    );
+
+    // Whole plan: MIN/MAX(EventDate) rewrite to literals, so no LogsScanExec
+    // survives; the query reads zero objects and touches nothing.
+    let plan_acc = QueryAccounting::new();
+    let ctx = logs_session(provider_declared(
+        Arc::clone(&store),
+        snapshot,
+        event_date(),
+        plan_acc.clone(),
+    ))
+    .expect("session");
+    let plan = ctx
+        .sql("SELECT min(\"EventDate\"), max(\"EventDate\") FROM logs")
+        .await
+        .expect("plan")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+    let plan_str = displayable(plan.as_ref()).indent(true).to_string();
+    assert!(
+        !plan_str.contains("LogsScanExec"),
+        "min/max over a fully stamped column must answer from stats, not \
+         scan; plan was:\n{plan_str}"
+    );
+    let batches = collect(Arc::clone(&plan), ctx.task_ctx())
+        .await
+        .expect("collect");
+    assert_eq!(i64_at(&batches, 0), Some(-5), "min(EventDate)");
+    assert_eq!(i64_at(&batches, 1), Some(90), "max(EventDate)");
+    assert_eq!(store.gets(), 0, "the min/max answer reads no objects");
+    assert_eq!(
+        plan_acc.snapshot().data_objects_touched,
+        0,
+        "the whole stats-answered statement touches no data object"
+    );
+}
+
+/// Deliverable 2's fail-closed half: one touched segment lacking the stamp
+/// leaves the column `Precision::Absent` and the statement scans. Coverage is
+/// all-or-nothing per column -- a single uncovered segment poisons it, exactly
+/// as one clipped segment poisons the ts span above.
+///
+/// Pre-fix demonstration: make `declared_stamp_stats_all` skip the per-segment
+/// coverage check (never set `declined`) and it would answer from the one
+/// stamped segment alone, reporting a wrong `Exact` min/max and eliding the
+/// scan; both assertions below then fail.
+#[tokio::test]
+async fn a_segment_without_the_stamp_falls_back_to_scanning() {
+    let store = CountingStore::new(Arc::new(MemoryStore::new()));
+    let stamped = stamp_seg(
+        write_object(&*store, "logs/o1.rlog", &seg_records(100, 7)).await,
+        &[i64_stat("EventDate", 1, 9, 0)],
+    );
+    let unstamped = write_object(&*store, "logs/o2.rlog", &seg_records(200, 11)).await;
+    assert!(
+        unstamped.declared_column_stats.is_empty(),
+        "the second segment carries no stamp"
+    );
+    let snapshot = snapshot_of(vec![stamped, unstamped], Vec::new());
+
+    // Direct: EventDate stays Absent because one segment is uncovered.
+    let provider = provider_declared(
+        Arc::clone(&store),
+        snapshot.clone(),
+        event_date(),
+        QueryAccounting::new(),
+    );
+    let plan = provider.plan_filters(4, &[]).expect("plan_filters");
+    let stats = plan
+        .partition_statistics(None)
+        .expect("partition_statistics");
+    let idx = plan
+        .schema()
+        .index_of("EventDate")
+        .expect("EventDate column");
+    assert_eq!(
+        stats.column_statistics[idx].min_value,
+        Precision::Absent,
+        "one unstamped segment uncovers the whole column"
+    );
+    assert_eq!(stats.column_statistics[idx].max_value, Precision::Absent);
+    assert_eq!(stats.column_statistics[idx].null_count, Precision::Absent);
+    assert_eq!(store.gets(), 0, "computing statistics reads no objects");
+
+    // Whole plan: the scan survives and reads objects.
+    let ctx = logs_session(provider_declared(
+        Arc::clone(&store),
+        snapshot,
+        event_date(),
+        QueryAccounting::new(),
+    ))
+    .expect("session");
+    let plan = ctx
+        .sql("SELECT min(\"EventDate\"), max(\"EventDate\") FROM logs")
+        .await
+        .expect("plan")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+    let plan_str = displayable(plan.as_ref()).indent(true).to_string();
+    assert!(
+        plan_str.contains("LogsScanExec"),
+        "an uncovered segment must fail closed to a scan; plan was:\n{plan_str}"
+    );
+    let batches = collect(Arc::clone(&plan), ctx.task_ctx())
+        .await
+        .expect("collect");
+    // Neither object carries an EventDate attribute, so the scanned extremum is
+    // NULL; the point pinned here is the plan shape and the reads, not the
+    // value.
+    assert_eq!(
+        i64_at(&batches, 0),
+        None,
+        "no EventDate attribute in the data"
+    );
+    assert!(store.gets() > 0, "a scanning min/max must read objects");
 }
