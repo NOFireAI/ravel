@@ -226,6 +226,7 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
 use datafusion::arrow::array::{
@@ -264,6 +265,7 @@ use ravel_query::{
 };
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
+use ravel_types::declared_stats::{DeclaredColumnStat, DeclaredStatType, DeclaredStatValue};
 use ravel_types::logstream::AttrValue;
 use tokio::sync::OnceCell;
 
@@ -591,6 +593,182 @@ fn declared_scalar(ty: DeclaredType, value: &ColumnValue) -> Option<ScalarValue>
         }
         _ => None,
     }
+}
+
+/// Process-wide tally behind [`declared_stat_carrier_conflicts`].
+static CARRIER_CONFLICTS: AtomicU64 = AtomicU64::new(0);
+
+/// How many times this process has found the two declared-statistics carriers
+/// disagreeing about one segment and one column (ADR-0873 decision 4).
+///
+/// A segment is immutable and both the `SegmentRef` stamp and the `.cstat`
+/// entry claim to be exact derivations of its contents, so a disagreement in
+/// `min`, `max`, or `null_count` means the writer's stamp fold, the fold's
+/// copy, the `.cstat` build, or the object itself is wrong. The query degrades
+/// to a scan (never a wrong answer), which is exactly why the tally exists: it
+/// makes the defect a ticket instead of a mysteriously slow query.
+///
+/// Monotonic and process-local; a scrape reads the delta between samples.
+pub fn declared_stat_carrier_conflicts() -> u64 {
+    CARRIER_CONFLICTS.load(Ordering::Relaxed)
+}
+
+fn record_carrier_conflict() {
+    CARRIER_CONFLICTS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// One segment's coverage of one declared column as one carrier states it.
+///
+/// `min`/`max` both absent is a coverage statement, not a gap: the column had
+/// zero non-null values in that segment, which is exact. `null_count_proven`
+/// records whether the carrier's NULL count was reconciled against the
+/// segment's row count before it got here (true for a stamp, whose validated
+/// form is proof of clauses 4 and 5; false for a `.cstat` entry, whose row
+/// accounting this path does not reconcile).
+#[derive(Clone)]
+struct SegmentCoverage {
+    min: Option<ScalarValue>,
+    max: Option<ScalarValue>,
+    null_count: u64,
+    null_count_proven: bool,
+}
+
+impl SegmentCoverage {
+    /// Whether two carriers state the same triple for one segment and column.
+    /// Exact equality on all three fields, with no widening, narrowing, or
+    /// preference for the fresher carrier: the union has no arithmetic in it.
+    fn agrees_with(&self, other: &SegmentCoverage) -> bool {
+        self.min == other.min && self.max == other.max && self.null_count == other.null_count
+    }
+}
+
+/// The exact statistics one declared column's carriers prove over every
+/// segment a scan touches, from [`LogsScanExec::declared_min_max_all`].
+///
+/// `null_count` is `None` when at least one covering carrier's NULL count was
+/// not reconciled against the segment's row count; the extrema are still
+/// exact in that case (see the method's docs).
+#[derive(Clone)]
+pub(crate) struct DeclaredExactStats {
+    pub(crate) min: ScalarValue,
+    pub(crate) max: ScalarValue,
+    pub(crate) null_count: Option<u64>,
+}
+
+/// Keep whichever of `current` and `candidate` is the extreme in the `want`
+/// direction, under `ScalarValue`'s own ordering (the comparator DataFusion's
+/// `MIN`/`MAX` accumulators apply, which is what makes the shortcut answer the
+/// same question the scan would). A tie keeps the incumbent.
+fn keep_extreme(
+    current: Option<ScalarValue>,
+    candidate: ScalarValue,
+    want: std::cmp::Ordering,
+) -> Option<ScalarValue> {
+    match current {
+        Some(cur) if candidate.partial_cmp(&cur) != Some(want) => Some(cur),
+        _ => Some(candidate),
+    }
+}
+
+/// The stamp type a declared column of `ty` may carry, or `None` when the
+/// ADR-0873 decision 2 allowlist excludes the type.
+///
+/// The float gate is here, and it is a gate rather than an accident of the
+/// current vocabulary: `DeclaredType` has no float variant today (ADR-0090
+/// declares four types), and when ADR-0101's declarable `f64` lands, this
+/// exhaustive match stops compiling until someone decides its comparator, its
+/// NaN rule, and its `-0.0` rule -- rather than the new type quietly reaching
+/// a `Precision::Exact` extremum through a wildcard arm. The stamp side of the
+/// union is simply empty for an excluded type, which is not an error: `.cstat`
+/// carries `Str`/`Bytes` extrema under ADR-0850 and keeps answering them.
+fn stamp_type_of(ty: DeclaredType) -> Option<DeclaredStatType> {
+    match ty {
+        DeclaredType::I64 => Some(DeclaredStatType::I64),
+        DeclaredType::Bool => Some(DeclaredStatType::Bool),
+        // Unbounded byte strings: a stamped extremum would put arbitrary user
+        // data on the commit record and the hot resolve path, and truncating
+        // it would make the stat a bound rather than an extremum.
+        DeclaredType::Str | DeclaredType::Bytes => None,
+    }
+}
+
+/// One stamped extremum as the Arrow scalar `ty` projects to, or `None` when
+/// the stamp's value kind disagrees with `ty`.
+fn stamp_scalar(ty: DeclaredType, value: DeclaredStatValue) -> Option<ScalarValue> {
+    match (ty, value) {
+        (DeclaredType::I64, DeclaredStatValue::I64(v)) => Some(ScalarValue::Int64(Some(v))),
+        (DeclaredType::Bool, DeclaredStatValue::Bool(b)) => Some(ScalarValue::Boolean(Some(b))),
+        _ => None,
+    }
+}
+
+/// What the `SegmentRef` stamps say about `declared` for one segment, or
+/// `None` when the stamp side of the union is empty for it: an excluded type,
+/// no entry for the column, or an entry this query cannot read (its
+/// `declared_type` or a value kind disagreeing with the type the tenant
+/// declares the column as). An entry that grants nothing is absent from the
+/// union, never one side of a conflict.
+///
+/// The list is the validated form, so at most one entry names the column
+/// (ADR-0873 clause 6 drops every occurrence of a duplicated name, so a
+/// duplicate arrives here as no entry at all) and `find` is a lookup rather
+/// than a pick between claims.
+fn stamp_coverage(
+    declared: &DeclaredColumn,
+    stamps: &[DeclaredColumnStat],
+) -> Option<SegmentCoverage> {
+    let stat_type = stamp_type_of(declared.ty)?;
+    let stat = stamps.iter().find(|s| s.name() == declared.key)?;
+    if stat.declared_type() != stat_type {
+        return None;
+    }
+    // A one-sided pair cannot exist in the validated form (clause 2), so
+    // mapping each side independently cannot produce one here either.
+    let min = match stat.min() {
+        Some(v) => Some(stamp_scalar(declared.ty, v)?),
+        None => None,
+    };
+    let max = match stat.max() {
+        Some(v) => Some(stamp_scalar(declared.ty, v)?),
+        None => None,
+    };
+    Some(SegmentCoverage {
+        min,
+        max,
+        null_count: stat.null_count(),
+        null_count_proven: true,
+    })
+}
+
+/// What the loaded `.cstat` object says about `declared` for one segment, or
+/// `None` when that carrier grants nothing: no object, no entry for this
+/// segment, no entry for the column, more than one entry under the column's
+/// name (`unique_column_stat` refuses to pick), an entry whose extrema
+/// presence disagrees with its `non_null_count` in either direction (#970), or
+/// a value of the wrong kind.
+fn cstat_coverage(
+    declared: &DeclaredColumn,
+    seg_stats: Option<&ravel_proto::catalog::v1::ColumnStatsSegment>,
+) -> Option<SegmentCoverage> {
+    let stat = unique_column_stat(seg_stats?, &declared.key)?;
+    // The presence clause is called, not restated: `LoadedColumnStats` has
+    // public fields and can be populated by a carrier that never decoded an
+    // object, so the check has to bind here, where coverage is granted.
+    validate_min_max_presence(stat).ok()?;
+    let min = match stat.min.as_ref() {
+        Some(v) => Some(declared_scalar(declared.ty, v)?),
+        None => None,
+    };
+    let max = match stat.max.as_ref() {
+        Some(v) => Some(declared_scalar(declared.ty, v)?),
+        None => None,
+    };
+    Some(SegmentCoverage {
+        min,
+        max,
+        null_count: stat.null_count,
+        null_count_proven: false,
+    })
 }
 
 /// The `None`-valued Arrow scalar `ty` projects to, for a declared column
@@ -1175,58 +1353,67 @@ impl LogsScanExec {
                 .all(|seg| self.ts_min <= seg.min_event_ts_ns && seg.max_event_ts_ns <= self.ts_max)
     }
 
-    /// Exact MIN/MAX for the declared column at schema index
-    /// `FIRST_DECLARED_COL + k` over every segment this scan touches
-    /// (ADR-0850), joined against `self.column_stats` by identity. `None`
-    /// means the safety lemma from #849 requires falling back to scanning:
-    /// no loaded column-stats object at all, an unsupported declared type
-    /// (`Str`, projected as `Dictionary(Int32, Utf8)`; not implemented here),
-    /// a relevant segment with no entry in the loaded stats (never built, or
-    /// postdates the fold that built them), or a segment whose stat for this
-    /// column has no entry or decodes to a value of the wrong kind (a
-    /// corrupt/version-mismatched stat).
-    ///
-    /// `Some((min, max))` with both a `None`-valued scalar is still an exact
-    /// answer, not a fallback: every covered segment's column was entirely
-    /// null, or there are zero segments, and SQL `MIN`/`MAX` over all-NULL or
-    /// zero-row input is `NULL`.
-    /// Exact MIN/MAX for every declared column at once, indexed by `k`
+    /// Exact MIN/MAX (plus the exact NULL count, where a carrier proves one)
+    /// for every declared column at once, indexed by `k`
     /// (`FIRST_DECLARED_COL + k`), resolved in a SINGLE pass over the touched
-    /// segments (ADR-0850). `result[k]` is `None` with the same meaning the
-    /// per-column form would give -- the safety lemma requires falling back to
-    /// scanning for that column: no loaded column-stats object, an unsupported
-    /// declared type (`Str`), a relevant segment with no entry in the loaded
-    /// stats, or a segment whose stat for this column is missing, invalid
-    /// (#970: two entries under one name, or `min`/`max` presence disagreeing
-    /// with `non_null_count` in either direction), or decodes to a value of the
-    /// wrong kind.
+    /// segments.
     ///
-    /// `Some((min, max))` with both a `None`-valued scalar is still exact, not
-    /// a fallback: every covered segment's column was entirely null, or there
-    /// are zero segments, and SQL `MIN`/`MAX` over all-NULL or zero-row input
-    /// is `NULL`.
+    /// Two carriers, unioned per segment and per column (ADR-0873 decision 4):
     ///
-    /// Resolving every column in one segment walk (with a per-segment
-    /// name->stat map) instead of one full walk per column keeps
-    /// `partition_statistics` cost at `O(segments x columns_per_segment)`
-    /// rather than `O(segments x declared x columns_per_segment)`; DataFusion
-    /// may call `partition_statistics` several times per plan, so the per-call
-    /// cost matters.
-    fn declared_min_max_all(&self) -> Vec<Option<(ScalarValue, ScalarValue)>> {
+    /// - the `SegmentRef` stamp (`SegmentRef::declared_column_stats`,
+    ///   ADR-0873), which rides snapshot resolution itself and so covers the
+    ///   live tail and token-resolved segments that no fold-built object can
+    ///   reach. Its entries are the constructor-gated validated form: holding
+    ///   one is proof the statistics validity predicate ran, row-count clauses
+    ///   included, so this reader re-checks only what is local to the query
+    ///   (the declared type it was resolved under);
+    /// - the ADR-0850/0942 `.cstat` entry from `self.column_stats`, joined by
+    ///   segment identity, which is the only carrier for pre-stamp sealed
+    ///   history and for `Str`/`Bytes` extrema the stamp vocabulary excludes.
+    ///
+    /// `result[k]` is `None` when the #849 safety lemma requires falling back
+    /// to scanning for that column: a touched segment that neither carrier
+    /// covers (never stamped, no `.cstat` built, or an entry either carrier's
+    /// reader refuses), the two carriers disagreeing about one segment
+    /// (counted on [`declared_stat_carrier_conflicts`]), or an unsupported
+    /// declared type (`Str`, projected as `Dictionary(Int32, Utf8)`, has no
+    /// scalar form on this path).
+    ///
+    /// A result whose `min`/`max` are `None`-valued scalars is still exact,
+    /// not a fallback: every covered segment's column was entirely null, or
+    /// there are zero segments, and SQL `MIN`/`MAX` over all-NULL or zero-row
+    /// input is `NULL`.
+    ///
+    /// [`DeclaredExactStats::null_count`] is `Some` only when every covering
+    /// carrier proved its figure, which today means the stamp: a stamp's
+    /// `null_count` passed clauses 4 and 5 against the carrying record's own
+    /// row count before the type existed, while a `.cstat` entry's row
+    /// accounting is not reconciled against the joined
+    /// `SegmentRef::sample_count` anywhere on this path (ADR-0873 decision 2
+    /// requires it of that carrier; the tree does not yet do it). An
+    /// unreconciled `null_count` reported as `Precision::Exact` would answer
+    /// `COUNT(col)` from a figure nothing checked, so it stays `Absent` and
+    /// only the extrema are claimed.
+    ///
+    /// Resolving every column in one segment walk instead of one full walk per
+    /// column keeps `partition_statistics` cost at
+    /// `O(segments x columns_per_segment)` rather than
+    /// `O(segments x declared x columns_per_segment)`; DataFusion may call
+    /// `partition_statistics` several times per plan, so the per-call cost
+    /// matters.
+    fn declared_min_max_all(&self) -> Vec<Option<DeclaredExactStats>> {
         let n = self.declared.len();
-        let mut result: Vec<Option<(ScalarValue, ScalarValue)>> = vec![None; n];
-        let Some(stats) = self.column_stats.as_ref() else {
-            return result;
-        };
+        let mut result: Vec<Option<DeclaredExactStats>> = vec![None; n];
 
-        // Per-column running extrema plus a "declined" flag: a column declines
-        // its whole answer the moment any touched segment lacks its entry or
-        // carries a wrong-kind value, exactly as the per-column form does. A
+        // Per-column running extrema and NULL-count sum, plus a "declined"
+        // flag: a column declines its whole answer the moment one touched
+        // segment is covered by neither carrier or the carriers conflict. A
         // `Str` column declines up front.
         struct Acc {
             declined: bool,
             min: Option<ScalarValue>,
             max: Option<ScalarValue>,
+            null_count: Option<u64>,
         }
         let mut acc: Vec<Acc> = self
             .declared
@@ -1235,95 +1422,73 @@ impl LogsScanExec {
                 declined: matches!(d.ty, DeclaredType::Str),
                 min: None,
                 max: None,
+                null_count: Some(0),
             })
             .collect();
 
         for seg in self.segments.iter() {
-            let Some(seg_stats) = stats.segments.get(&segment_identity(seg)) else {
-                // A touched segment with no stats: every column must decline.
-                for a in acc.iter_mut() {
-                    a.declined = true;
-                }
-                break;
-            };
-            // One entry per name, and a name carrying more than one entry maps
-            // to `None`: collecting the pairs straight into a map would keep
-            // the LAST duplicate and answer from it, while the dictionary
-            // readers below resolve the same list with `find` and would keep
-            // the FIRST. A duplicate name is malformed either way
-            // (`decode_column_stats` refuses an object carrying one), and no
-            // rule could pick the right entry, so the name is poisoned and its
-            // column declines. Still one walk of the segment's columns.
-            let mut by_name: HashMap<&str, Option<&ravel_proto::catalog::v1::ColumnStat>> =
-                HashMap::with_capacity(seg_stats.columns.len());
-            for c in seg_stats.columns.iter() {
-                by_name
-                    .entry(c.name.as_str())
-                    .and_modify(|slot| *slot = None)
-                    .or_insert(Some(c));
-            }
+            // Either carrier may be absent for this segment, and neither
+            // absence short-circuits the other: a live-tail segment has a
+            // stamp and no `.cstat`, a pre-stamp sealed segment the reverse.
+            let seg_stats = self
+                .column_stats
+                .as_ref()
+                .and_then(|stats| stats.segments.get(&segment_identity(seg)));
+            let stamps = seg.declared_column_stats.as_slice();
             for (k, a) in acc.iter_mut().enumerate() {
                 if a.declined {
                     continue;
                 }
                 let declared = &self.declared[k];
-                let Some(Some(stat)) = by_name.get(declared.key.as_str()) else {
-                    // No entry (the ordinary not-covered case) or a poisoned
-                    // one (a duplicate name).
-                    a.declined = true;
-                    continue;
+                let coverage = match (
+                    stamp_coverage(declared, stamps),
+                    cstat_coverage(declared, seg_stats),
+                ) {
+                    // Covered by neither: the ordinary uncovered state,
+                    // never an error, and the column falls back to a scan.
+                    (None, None) => {
+                        a.declined = true;
+                        continue;
+                    }
+                    (Some(only), None) | (None, Some(only)) => only,
+                    (Some(stamp), Some(cstat)) => {
+                        // Nothing is combined across carriers: both claim
+                        // to describe the same rows of the same immutable
+                        // object exactly, so they agree (use either) or
+                        // one of them is wrong and no answer is safe. A
+                        // conflict is a writer/fold/build defect, so it is
+                        // counted rather than only degraded.
+                        if !stamp.agrees_with(&cstat) {
+                            record_carrier_conflict();
+                            a.declined = true;
+                            continue;
+                        }
+                        SegmentCoverage {
+                            null_count_proven: stamp.null_count_proven || cstat.null_count_proven,
+                            ..stamp
+                        }
+                    }
                 };
-                // `min`/`max` presence must agree with `non_null_count` in both
-                // directions, or this path reports a wrong extremum as
-                // `Precision::Exact`: non-null rows with no recorded extremum
-                // leave the accumulator `None` and the loop below substitutes a
-                // NULL scalar, claiming the extremum of non-null data is exactly
-                // NULL, while an all-null column carrying extrema contributes a
-                // value describing no live row. `decode_column_stats` refuses
-                // either shape, and this calls the same clause it enforces
-                // rather than restating it, because `LoadedColumnStats` has
-                // public fields and can be populated by a carrier that never
-                // decoded an object. Fail closed and let the scan answer.
-                if validate_min_max_presence(stat).is_err() {
-                    a.declined = true;
-                    continue;
+
+                if let Some(min) = coverage.min {
+                    a.min = keep_extreme(a.min.take(), min, std::cmp::Ordering::Less);
                 }
-                if let Some(min_val) = stat.min.as_ref() {
-                    match declared_scalar(declared.ty, min_val) {
-                        Some(v) => {
-                            a.min = Some(match a.min.take() {
-                                Some(cur)
-                                    if v.partial_cmp(&cur) != Some(std::cmp::Ordering::Less) =>
-                                {
-                                    cur
-                                }
-                                _ => v,
-                            });
-                        }
-                        None => {
-                            a.declined = true;
-                            continue;
-                        }
-                    }
+                if let Some(max) = coverage.max {
+                    a.max = keep_extreme(a.max.take(), max, std::cmp::Ordering::Greater);
                 }
-                if let Some(max_val) = stat.max.as_ref() {
-                    match declared_scalar(declared.ty, max_val) {
-                        Some(v) => {
-                            a.max = Some(match a.max.take() {
-                                Some(cur)
-                                    if v.partial_cmp(&cur) != Some(std::cmp::Ordering::Greater) =>
-                                {
-                                    cur
-                                }
-                                _ => v,
-                            });
-                        }
-                        None => {
-                            a.declined = true;
-                            continue;
-                        }
-                    }
-                }
+                a.null_count = if coverage.null_count_proven {
+                    a.null_count
+                        .and_then(|sum| sum.checked_add(coverage.null_count))
+                } else {
+                    None
+                };
+            }
+            // Nothing left to resolve once every column has declined, which is
+            // the common shape on a tenant with neither carrier: one segment
+            // decides it and the remaining segments would only be walked to
+            // re-skip every column.
+            if acc.iter().all(|a| a.declined) {
+                break;
             }
         }
 
@@ -1332,10 +1497,11 @@ impl LogsScanExec {
                 continue;
             }
             let null_scalar = declared_null_scalar(self.declared[k].ty);
-            result[k] = Some((
-                a.min.unwrap_or_else(|| null_scalar.clone()),
-                a.max.unwrap_or(null_scalar),
-            ));
+            result[k] = Some(DeclaredExactStats {
+                min: a.min.unwrap_or_else(|| null_scalar.clone()),
+                max: a.max.unwrap_or(null_scalar),
+                null_count: a.null_count,
+            });
         }
         result
     }
@@ -1921,23 +2087,33 @@ impl ExecutionPlan for LogsScanExec {
                 col.max_value = Precision::Exact(ScalarValue::TimestampNanosecond(Some(max), None));
             }
 
-            // ADR-0850: the same gate widens to a declared column's exact
-            // min/max, joined against `self.column_stats` by identity rather
-            // than ordinal position. `declared_min_max_all` resolves every
-            // declared column in one segment walk and enforces the per-column
-            // fallback (an uncovered segment, a corrupt/type-mismatched stat,
-            // or an unsupported declared type all report `None`, leaving the
-            // column `Absent`); this loop only decides which output index to
-            // fill.
+            // ADR-0850 and ADR-0873: the same gate widens to a declared
+            // column's exact min/max (and its exact NULL count, where a
+            // carrier proves one), taken from the union of the `SegmentRef`
+            // stamp and the `.cstat` entry, both joined by segment identity
+            // rather than ordinal position. `declared_min_max_all` resolves
+            // every declared column in one segment walk and enforces the
+            // per-column fallback (a segment covered by neither carrier,
+            // carriers that disagree, a refused entry, or an unsupported
+            // declared type all report `None`, leaving the column `Absent`);
+            // this loop only decides which output index to fill.
             let declared_min_max = self.declared_min_max_all();
-            for (k, min_max) in declared_min_max.into_iter().enumerate() {
+            for (k, exact) in declared_min_max.into_iter().enumerate() {
                 let schema_idx = FIRST_DECLARED_COL + k;
                 if let Some(out_idx) = self.projection.iter().position(|&i| i == schema_idx)
-                    && let Some((min, max)) = min_max
+                    && let Some(exact) = exact
                 {
                     let col = &mut stats.column_statistics[out_idx];
-                    col.min_value = Precision::Exact(min);
-                    col.max_value = Precision::Exact(max);
+                    col.min_value = Precision::Exact(exact.min);
+                    col.max_value = Precision::Exact(exact.max);
+                    // An unproven NULL count leaves `null_count` `Absent`
+                    // rather than reporting an unreconciled figure as exact;
+                    // the extrema stay exact either way.
+                    if let Some(nulls) = exact.null_count
+                        && let Ok(nulls) = usize::try_from(nulls)
+                    {
+                        col.null_count = Precision::Exact(nulls);
+                    }
                 }
             }
         }
