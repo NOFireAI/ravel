@@ -1,0 +1,48 @@
+[package]
+name = "ravel-logseg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ravel-codec = { workspace = true }
+ravel-proto = { workspace = true }
+ravel-types = { workspace = true }
+thiserror = { workspace = true }
+zstd = { workspace = true }
+crc32c = { workspace = true }
+blake3 = { workspace = true }
+prost = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+criterion = { workspace = true }
+# Peak-live-bytes measurement for the columnar writer memory test. Pinned to
+# the same 0.1.10 the ravel-sql/ravel-otlp allocation tests already use; the
+# workspace forbids `unsafe_code`, so a hand-rolled counting allocator will not
+# compile and the instrumented global allocator this crate provides is used
+# instead (issue #682).
+stats_alloc = "0.1.10"
+
+[lints]
+workspace = true
+
+[lib]
+# Only the criterion `[[bench]]` targets below understand `cargo bench`'s
+# `--quick` flag; leaving the lib's own `bench = true` default would make
+# `cargo bench -p ravel-logseg -- --quick` also run its unit tests under the
+# plain libtest harness, which rejects that flag (mirrors ravel-bench).
+bench = false
+
+[[bench]]
+name = "logseg_encode"
+harness = false
+
+[[bench]]
+name = "logseg_scan"
+harness = false
+
+[[bench]]
+name = "wide_gather"
+harness = false

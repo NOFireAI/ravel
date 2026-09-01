@@ -1,0 +1,194 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "services/*"]
+
+[workspace.package]
+version = "0.11.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.97"
+
+[workspace.lints.rust]
+# forbid, not deny: deny can be silently overridden by a scoped
+# #[allow(unsafe_code)], which is exactly how a generated test or a fleet
+# executor's change could smuggle unsafe past `cargo clippy -D warnings`
+# without anyone noticing the override. forbid rejects the allow attempt
+# itself as a compile error, closing the class at the compiler instead of
+# relying on a reviewer to catch it.
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+
+[workspace.dependencies]
+# internal crates
+# Version fields pin each path dependency so cargo-deny does not count them as
+# wildcards. allow-wildcard-paths is not usable here because these
+# crates are not marked publish = false, so it does not exempt them.
+ravel-types = { path = "crates/ravel-types", version = "0.11.0" }
+ravel-tenant-resolve = { path = "crates/ravel-tenant-resolve", version = "0.11.0" }
+ravel-proto = { path = "crates/ravel-proto", version = "0.11.0" }
+ravel-codec = { path = "crates/ravel-codec", version = "0.11.0" }
+ravel-object-store = { path = "crates/ravel-object-store", version = "0.11.0" }
+ravel-segment = { path = "crates/ravel-segment", version = "0.11.0" }
+ravel-logseg = { path = "crates/ravel-logseg", version = "0.11.0" }
+ravel-rspan = { path = "crates/ravel-rspan", version = "0.11.0" }
+ravel-commit = { path = "crates/ravel-commit", version = "0.11.0" }
+ravel-catalog = { path = "crates/ravel-catalog", version = "0.11.0" }
+ravel-cache = { path = "crates/ravel-cache", version = "0.11.0" }
+ravel-maintain = { path = "crates/ravel-maintain", version = "0.11.0" }
+ravel-fleet = { path = "crates/ravel-fleet", version = "0.11.0" }
+ravel-otlp = { path = "crates/ravel-otlp", version = "0.11.0" }
+ravel-otap = { path = "crates/ravel-otap", version = "0.11.0" }
+ravel-remote-write = { path = "crates/ravel-remote-write", version = "0.11.0" }
+ravel-alerting = { path = "crates/ravel-alerting", version = "0.11.0" }
+ravel-ingest = { path = "crates/ravel-ingest", version = "0.11.0" }
+ravel-promql = { path = "crates/ravel-promql", version = "0.11.0" }
+ravel-query = { path = "crates/ravel-query", version = "0.11.0" }
+ravel-analytics = { path = "crates/ravel-analytics", version = "0.11.0" }
+ravel-tracing-export = { path = "crates/ravel-tracing-export", version = "0.11.0" }
+ravel-affinity = { path = "crates/ravel-affinity", version = "0.11.0" }
+
+# async runtime / rpc / http
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "io-util"] }
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+axum = "0.8"
+tower = "0.5"
+hyper = "1.11"
+futures = "0.3"
+async-trait = "0.1"
+# HTTP client. Used by services/ravel-server (alert/webhook sinks) and, for the
+# OIDC JWKS fetch, by ravel-query (ADR-0042 decision 6). Pinned once here so the
+# two crates resolve the same reqwest.
+reqwest = { version = "0.13", features = ["json"] }
+
+# JWT validation for OIDC tenant resolution (ADR-0042 decision 6).
+# Pinned to >= 10.3.0: 9.3.1 is vulnerable to CVE-2026-25537 / GHSA-h395-gr6q-cpjc
+# (a claim sent with the wrong JSON type is treated as absent rather than
+# malformed unless it is also in required_spec_claims); 10.3.0 is the first patched
+# release. 10.x drops the bundled default crypto backend, so a backend is now
+# selected explicitly: aws_lc_rs, not rust_crypto. rust_crypto pulls in the `rsa`
+# crate, which carries an unpatched timing side-channel (RUSTSEC-2023-0071, the
+# Marvin Attack) in its RSA signature verification - exactly the RS256 path most
+# real-world OIDC issuers use. aws_lc_rs avoids `rsa` entirely and adds no new
+# toolchain burden: aws-lc-sys is already in this workspace's dependency tree via
+# rustls's own TLS backend. use_pem (from_ec_pem, on by default) and the `jwk`
+# module are both retained. Signature verification, issuer/audience/expiry
+# checks, and the algorithm allow-list all come from this crate rather than any
+# hand-rolled JWT code.
+jsonwebtoken = { version = "10.4", default-features = false, features = ["use_pem", "aws_lc_rs"] }
+
+# telemetry protocol types
+opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "metrics", "logs", "trace"] }
+
+# object storage
+object_store = { version = "0.14", features = ["aws"] }
+
+# arrow (isolated to ravel-otap for now; Phase 3 query work reuses it)
+arrow = { version = "59", default-features = false, features = ["ipc"] }
+arrow-ipc = { version = "59", features = ["zstd"] }
+
+# Flight SQL transport, used only by ravel-sql and services/ravel-server behind
+# their `flight-sql` features. Pinned
+# to 58 on purpose: it must share arrow with the arrow 58 that datafusion 54
+# carries, which is a different major than the direct `arrow = "59"` pin above
+# that ravel-otap and ravel-segment use. The two arrow majors coexist in the
+# graph; nothing passes arrow types across the boundary. 58.4.0 resolves tonic
+# 0.14, matching the workspace `tonic` pin, so the Flight service registers on
+# the same tonic server as the OTLP one.
+arrow-flight = { version = "58.4.0", default-features = false, features = ["flight-sql"] }
+
+# encoding / compression / hashing
+bytes = "1"
+blake3 = "1.8"
+crc32c = "0.6"
+zstd = "0.13"
+lz4_flex = "0.14"
+snap = "1.1"
+flate2 = "1"
+
+# query
+promql-parser = "0.10"
+regex = "1"
+
+# serde for control-plane/config docs only (never for on-object formats)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# util
+thiserror = "2"
+anyhow = "1"
+parking_lot = "0.12"
+rand = "0.10"
+uuid = { version = "1.24", features = ["v4"] }
+hex = "0.4"
+base64 = "0.23"
+clap = { version = "4.6", features = ["derive"] }
+humantime = "2"
+
+# observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Query-path OTLP trace export (ADR-0060), used only by ravel-tracing-export.
+# opentelemetry and opentelemetry_sdk pin the 0.32 line already fixed by
+# opentelemetry-proto's transitive opentelemetry 0.32.0 / opentelemetry_sdk
+# 0.32.1; declared explicitly (not left implicit) because
+# ravel-tracing-export's own code imports their traits directly (TracerProvider,
+# the SDK batch processor, Resource), not just opentelemetry-otlp/
+# tracing-opentelemetry's re-exports. opentelemetry-otlp uses the
+# `grpc-tonic` transport so it reuses the workspace's tonic 0.14 rather than
+# pulling a second HTTP client stack (ADR-0060 decision 1, rejected
+# alternative 4). tracing-opentelemetry 0.33, not 0.32, is the release that
+# targets opentelemetry 0.32 -- its own version numbering doesn't track
+# opentelemetry's.
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["trace"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace"] }
+tracing-opentelemetry = { version = "0.33", default-features = false }
+
+# kubernetes operator (services/ravel-operator, ADR-0034). These four are the
+# only new external dependencies the operator introduces. kube pulls in the
+# client, the CustomResource derive, and the rustls TLS stack; kube-runtime is
+# the controller/watcher runtime; k8s-openapi carries the generated Kubernetes
+# API types (v1_34 is a current, stable Kubernetes release); schemars derives
+# the CRD's OpenAPI v3 schema from the Rust spec structs. The operator renders
+# Kubernetes objects from the CRD only, so it depends on none of the ravel-*
+# crates or object_store.
+kube = { version = "4.2", default-features = false, features = ["client", "derive", "rustls-tls", "ring"] }
+kube-runtime = { version = "4.2" }
+k8s-openapi = { version = "0.28", features = ["v1_34"] }
+schemars = { version = "1.2", features = ["derive"] }
+
+# build
+prost-build = "0.14"
+tonic-prost-build = "0.14"
+protox = "0.9"
+
+# test / bench
+proptest = "1.11"
+criterion = "0.8"
+tempfile = "3"
+
+[profile.dev]
+# Shrink debug info in dev and test binaries to keep the workspace's total
+# on-disk build size within CI runner limits. profile.test inherits from
+# profile.dev, so this covers every test binary too.
+debug = "line-tables-only"
+
+[profile.ci]
+# Gate runs on CI runners and fleet executors: no debug info at all, for
+# faster codegen and smaller artifacts. Backtraces there are read from
+# panic messages and test names, not debuggers.
+inherits = "dev"
+debug = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = 1
+
+[profile.bench]
+inherits = "release"

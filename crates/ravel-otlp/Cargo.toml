@@ -1,0 +1,48 @@
+[package]
+name = "ravel-otlp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ravel-types = { workspace = true }
+ravel-segment = { workspace = true }
+ravel-logseg = { workspace = true }
+# ravel-rspan (ADR-0041) is new and not yet listed in the workspace
+# [workspace.dependencies]; the root Cargo.toml is out of this task's scope, so
+# this is a version-pinned path dependency (the pin keeps cargo-deny from
+# counting it as a wildcard, matching the workspace's path-dep convention).
+# Used for the span record's StatusCode and the frozen resource+scope+span
+# attribute merge rule, so trace normalization and the RSPAN writer cannot
+# drift apart on either.
+ravel-rspan = { path = "../ravel-rspan", version = "0.11.0" }
+opentelemetry-proto = { workspace = true }
+# Span events and links are stored as an opaque serialized blob in RSPAN v1
+# (ADR-0041 decision 4), which needs prost's own length-delimited encoding.
+prost = { workspace = true }
+thiserror = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+blake3 = { workspace = true }
+proptest = { workspace = true }
+criterion = { workspace = true }
+# Same version already vendored by ravel-otap and ravel-bench; not a
+# workspace.dependencies entry, so it is pinned here to match theirs.
+stats_alloc = "0.1.10"
+
+[features]
+# Compiles the SeriesIdMemo hit/miss counters (normalize::memo_stats) into the
+# build. Off by default: the counters are otherwise present only under
+# `cfg(test)`, so the production normalize path carries none of them. The
+# normalize_alloc bench enables this to report the memo hit rate.
+memo-stats = []
+
+[[bench]]
+name = "normalize_alloc"
+harness = false
+
+[lints]
+workspace = true

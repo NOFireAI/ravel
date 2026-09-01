@@ -1,0 +1,66 @@
+[package]
+name = "ravel-ingest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+# Per-stage ingest timing seam (ADR-0104 decision 1). Off by default: with it
+# off the crate compiles and behaves exactly as today, so no shipping build
+# links the seam. On, it compiles in the `Instant`-based accumulator and wires
+# the logs pipeline's admit/route/merge/encode boundaries through it, read only
+# by the bench reporter. A CI lane must build and run this feature.
+stage-timing = []
+
+[dependencies]
+ravel-types = { workspace = true }
+ravel-segment = { workspace = true }
+ravel-commit = { workspace = true }
+ravel-object-store = { workspace = true }
+ravel-otlp = { workspace = true }
+ravel-proto = { workspace = true }
+ravel-logseg = { workspace = true }
+# The router live switch (ADR-0052, EK1) consumes the shard-generation history
+# and the pure routing rule (`active_shard_count`) from ravel-catalog's
+# provisioning module, so ravel-catalog is a build-time dependency, not only a
+# dev one. ravel-catalog does not depend on ravel-ingest, so this is acyclic.
+ravel-catalog = { workspace = true }
+# ravel-rspan (ADR-0041) is new and not yet listed in the workspace
+# [workspace.dependencies]; the root Cargo.toml is out of this task's scope, so
+# this is a version-pinned path dependency (the pin keeps cargo-deny from
+# counting it as a wildcard, matching the workspace's path-dep convention).
+ravel-rspan = { path = "../ravel-rspan", version = "0.11.0" }
+# The router live switch (ADR-0052) decodes the provisioning record read for a
+# generation refresh; prost's Message trait provides `decode`.
+prost = { workspace = true }
+blake3 = { workspace = true }
+bytes = { workspace = true }
+crc32c = { workspace = true }
+hex = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+ravel-query = { workspace = true }
+ravel-promql = { workspace = true }
+# ADR-0873 wave 5a end-to-end reachability test only: load a tenant through the
+# real log-ingest path, resolve its snapshot, and prove the wave-4 SQL reader
+# answers MIN/MAX/COUNT over a declared column from the flush's own stamps with
+# zero data GETs. ravel-sql depends on ravel-catalog/ravel-query/ravel-commit/
+# ravel-logseg, none of which depend on ravel-ingest, so this dev-only edge adds
+# no cycle. No feature flag: ravel-sql's SQL surface is unconditional.
+ravel-sql = { path = "../ravel-sql", version = "0.11.0" }
+# Match ravel-sql's datafusion pin exactly (same arrow 58 line) so the test's
+# SessionContext/collect interop with ravel-sql's plan types.
+datafusion = { version = "54", default-features = false, features = ["sql"] }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+proptest = { workspace = true }
+
+[lints]
+workspace = true

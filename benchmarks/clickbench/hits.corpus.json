@@ -1,0 +1,1163 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "id": "q01_count_all",
+      "class": "metadata_decomposable",
+      "sql": "SELECT COUNT(*) FROM logs",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "count"
+      ],
+      "expected_rows": 1,
+      "upstream_id": "Q1"
+    },
+    {
+      "id": "q02_count_adv_engine",
+      "class": "metadata_decomposable",
+      "sql": "SELECT COUNT(*) FROM logs WHERE \"AdvEngineID\" <> 0",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "Filter (WHERE)",
+        "count",
+        "declared i64 typed comparison"
+      ],
+      "expected_rows": 1,
+      "upstream_id": "Q2",
+      "required_declarations": [
+        {
+          "key": "AdvEngineID",
+          "ty": "i64"
+        }
+      ]
+    },
+    {
+      "id": "q03_sum_count_avg",
+      "class": "full_value",
+      "sql": "SELECT SUM(\"AdvEngineID\"), COUNT(*), AVG(\"ResolutionWidth\") FROM logs",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "sum",
+        "count",
+        "avg",
+        "declared i64 typed aggregate"
+      ],
+      "expected_rows": 1,
+      "upstream_id": "Q3",
+      "required_declarations": [
+        {
+          "key": "AdvEngineID",
+          "ty": "i64"
+        },
+        {
+          "key": "ResolutionWidth",
+          "ty": "i64"
+        }
+      ]
+    },
+    {
+      "id": "q04_avg_userid",
+      "class": "full_value",
+      "sql": "SELECT AVG(\"UserID\") FROM logs",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "avg",
+        "declared i64 typed aggregate"
+      ],
+      "expected_rows": 1,
+      "upstream_id": "Q4",
+      "required_declarations": [
+        {
+          "key": "UserID",
+          "ty": "i64"
+        }
+      ]
+    },
+    {
+      "id": "q05_distinct_userid",
+      "class": "full_value",
+      "sql": "SELECT COUNT(DISTINCT \"UserID\") FROM logs",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "count(DISTINCT)"
+      ],
+      "expected_rows": 1,
+      "upstream_id": "Q5",
+      "required_declarations": [
+        {
+          "key": "UserID",
+          "ty": "i64"
+        }
+      ]
+    },
+    {
+      "id": "q06_distinct_searchphrase",
+      "class": "full_value",
+      "sql": "SELECT COUNT(DISTINCT \"SearchPhrase\") FROM logs",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "count(DISTINCT)"
+      ],
+      "expected_rows": 1,
+      "upstream_id": "Q6",
+      "required_declarations": [
+        {
+          "key": "SearchPhrase",
+          "ty": "str"
+        }
+      ]
+    },
+    {
+      "id": "q07_min_max_eventdate",
+      "class": "metadata_decomposable",
+      "sql": "SELECT MIN(\"EventDate\"), MAX(\"EventDate\") FROM logs",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "min",
+        "max",
+        "declared i64 typed aggregate"
+      ],
+      "expected_rows": 1,
+      "upstream_id": "Q7",
+      "modified": {
+        "modified": {
+          "reason": "EventDate is declared i64 in its native epoch-DAY unit (Date32 days), so MIN/MAX return epoch-day integers, not DATE values (ADR-0100 decision 2)."
+        }
+      },
+      "required_declarations": [
+        {
+          "key": "EventDate",
+          "ty": "i64"
+        }
+      ]
+    },
+    {
+      "id": "q08_adv_engine_breakdown",
+      "class": "metadata_decomposable",
+      "sql": "SELECT \"AdvEngineID\", COUNT(*) FROM logs WHERE \"AdvEngineID\" <> 0 GROUP BY \"AdvEngineID\" ORDER BY COUNT(*) DESC",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "Filter (WHERE)",
+        "count",
+        "GROUP BY",
+        "ORDER BY",
+        "declared i64 typed comparison"
+      ],
+      "upstream_id": "Q8",
+      "required_declarations": [
+        {
+          "key": "AdvEngineID",
+          "ty": "i64"
+        }
+      ]
+    },
+    {
+      "id": "q09_region_distinct_users",
+      "class": "full_value",
+      "sql": "SELECT \"RegionID\", COUNT(DISTINCT \"UserID\") AS u FROM logs GROUP BY \"RegionID\" ORDER BY u DESC LIMIT 10",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "count(DISTINCT)",
+        "GROUP BY",
+        "ORDER BY",
+        "LIMIT"
+      ],
+      "upstream_id": "Q9",
+      "required_declarations": [
+        {
+          "key": "RegionID",
+          "ty": "i64"
+        },
+        {
+          "key": "UserID",
+          "ty": "i64"
+        }
+      ]
+    },
+    {
+      "id": "q10_region_aggregates",
+      "class": "full_value",
+      "sql": "SELECT \"RegionID\", SUM(\"AdvEngineID\"), COUNT(*) AS c, AVG(\"ResolutionWidth\"), COUNT(DISTINCT \"UserID\") FROM logs GROUP BY \"RegionID\" ORDER BY c DESC LIMIT 10",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "sum",
+        "count",
+        "avg",
+        "count(DISTINCT)",
+        "GROUP BY",
+        "ORDER BY",
+        "LIMIT",
+        "declared i64 typed aggregate"
+      ],
+      "upstream_id": "Q10",
+      "required_declarations": [
+        {
+          "key": "RegionID",
+          "ty": "i64"
+        },
+        {
+          "key": "AdvEngineID",
+          "ty": "i64"
+        },
+        {
+          "key": "ResolutionWidth",
+          "ty": "i64"
+        },
+        {
+          "key": "UserID",
+          "ty": "i64"
+        }
+      ]
+    },
+    {
+      "id": "q11_mobile_model_users",
+      "class": "full_value",
+      "sql": "SELECT \"MobilePhoneModel\", COUNT(DISTINCT \"UserID\") AS u FROM logs WHERE \"MobilePhoneModel\" <> '' GROUP BY \"MobilePhoneModel\" ORDER BY u DESC LIMIT 10",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "Filter (WHERE)",
+        "count(DISTINCT)",
+        "GROUP BY",
+        "ORDER BY",
+        "LIMIT"
+      ],
+      "upstream_id": "Q11",
+      "required_declarations": [
+        {
+          "key": "MobilePhoneModel",
+          "ty": "str"
+        },
+        {
+          "key": "UserID",
+          "ty": "i64"
+        }
+      ]
+    },
+    {
+      "id": "q12_mobile_phone_model_users",
+      "class": "full_value",
+      "sql": "SELECT \"MobilePhone\", \"MobilePhoneModel\", COUNT(DISTINCT \"UserID\") AS u FROM logs WHERE \"MobilePhoneModel\" <> '' GROUP BY \"MobilePhone\", \"MobilePhoneModel\" ORDER BY u DESC LIMIT 10",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "Filter (WHERE)",
+        "count(DISTINCT)",
+        "GROUP BY",
+        "ORDER BY",
+        "LIMIT"
+      ],
+      "upstream_id": "Q12",
+      "required_declarations": [
+        {
+          "key": "MobilePhone",
+          "ty": "i64"
+        },
+        {
+          "key": "MobilePhoneModel",
+          "ty": "str"
+        },
+        {
+          "key": "UserID",
+          "ty": "i64"
+        }
+      ]
+    },
+    {
+      "id": "q13_top_search_phrases",
+      "class": "full_value",
+      "sql": "SELECT \"SearchPhrase\", COUNT(*) AS c FROM logs WHERE \"SearchPhrase\" <> '' GROUP BY \"SearchPhrase\" ORDER BY c DESC LIMIT 10",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "Filter (WHERE)",
+        "count",
+        "GROUP BY",
+        "ORDER BY",
+        "LIMIT"
+      ],
+      "upstream_id": "Q13",
+      "required_declarations": [
+        {
+          "key": "SearchPhrase",
+          "ty": "str"
+        }
+      ]
+    },
+    {
+      "id": "q14_search_phrases_distinct_users",
+      "class": "full_value",
+      "sql": "SELECT \"SearchPhrase\", COUNT(DISTINCT \"UserID\") AS u FROM logs WHERE \"SearchPhrase\" <> '' GROUP BY \"SearchPhrase\" ORDER BY u DESC LIMIT 10",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "Filter (WHERE)",
+        "count(DISTINCT)",
+        "GROUP BY",
+        "ORDER BY",
+        "LIMIT"
+      ],
+      "upstream_id": "Q14",
+      "required_declarations": [
+        {
+          "key": "SearchPhrase",
+          "ty": "str"
+        },
+        {
+          "key": "UserID",
+          "ty": "i64"
+        }
+      ]
+    },
+    {
+      "id": "q15_engine_phrase_counts",
+      "class": "full_value",
+      "sql": "SELECT \"SearchEngineID\", \"SearchPhrase\", COUNT(*) AS c FROM logs WHERE \"SearchPhrase\" <> '' GROUP BY \"SearchEngineID\", \"SearchPhrase\" ORDER BY c DESC LIMIT 10",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "Filter (WHERE)",
+        "count",
+        "GROUP BY",
+        "ORDER BY",
+        "LIMIT"
+      ],
+      "upstream_id": "Q15",
+      "required_declarations": [
+        {
+          "key": "SearchEngineID",
+          "ty": "i64"
+        },
+        {
+          "key": "SearchPhrase",
+          "ty": "str"
+        }
+      ]
+    },
+    {
+      "id": "q16_top_users",
+      "class": "full_value",
+      "sql": "SELECT \"UserID\", COUNT(*) FROM logs GROUP BY \"UserID\" ORDER BY COUNT(*) DESC LIMIT 10",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "count",
+        "GROUP BY",
+        "ORDER BY",
+        "LIMIT"
+      ],
+      "upstream_id": "Q16",
+      "required_declarations": [
+        {
+          "key": "UserID",
+          "ty": "i64"
+        }
+      ]
+    },
+    {
+      "id": "q17_top_user_phrase",
+      "class": "full_value",
+      "sql": "SELECT \"UserID\", \"SearchPhrase\", COUNT(*) FROM logs GROUP BY \"UserID\", \"SearchPhrase\" ORDER BY COUNT(*) DESC LIMIT 10",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "count",
+        "GROUP BY",
+        "ORDER BY",
+        "LIMIT"
+      ],
+      "upstream_id": "Q17",
+      "required_declarations": [
+        {
+          "key": "UserID",
+          "ty": "i64"
+        },
+        {
+          "key": "SearchPhrase",
+          "ty": "str"
+        }
+      ]
+    },
+    {
+      "id": "q18_user_phrase_limit",
+      "class": "full_value",
+      "sql": "SELECT \"UserID\", \"SearchPhrase\", COUNT(*) FROM logs GROUP BY \"UserID\", \"SearchPhrase\" LIMIT 10",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "count",
+        "GROUP BY",
+        "LIMIT"
+      ],
+      "upstream_id": "Q18",
+      "required_declarations": [
+        {
+          "key": "UserID",
+          "ty": "i64"
+        },
+        {
+          "key": "SearchPhrase",
+          "ty": "str"
+        }
+      ]
+    },
+    {
+      "id": "q19_user_minute_phrase",
+      "class": "full_value",
+      "sql": "SELECT \"UserID\", date_part('minute', ts) AS m, \"SearchPhrase\", COUNT(*) FROM logs GROUP BY \"UserID\", m, \"SearchPhrase\" ORDER BY COUNT(*) DESC LIMIT 10",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "date_part(minute)",
+        "count",
+        "GROUP BY",
+        "ORDER BY",
+        "LIMIT"
+      ],
+      "upstream_id": "Q19",
+      "required_declarations": [
+        {
+          "key": "UserID",
+          "ty": "i64"
+        },
+        {
+          "key": "SearchPhrase",
+          "ty": "str"
+        }
+      ]
+    },
+    {
+      "id": "q20_userid_lookup",
+      "class": "selective",
+      "sql": "SELECT \"UserID\" FROM logs WHERE \"UserID\" = 435090932899640449",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "Projection",
+        "Filter (WHERE)",
+        "declared i64 typed comparison"
+      ],
+      "upstream_id": "Q20",
+      "required_declarations": [
+        {
+          "key": "UserID",
+          "ty": "i64"
+        }
+      ]
+    },
+    {
+      "id": "q21_count_google_urls",
+      "class": "selective",
+      "sql": "SELECT COUNT(*) FROM logs WHERE \"URL\" LIKE '%google%'",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "Filter (WHERE)",
+        "count",
+        "LIKE"
+      ],
+      "expected_rows": 1,
+      "upstream_id": "Q21",
+      "required_declarations": [
+        {
+          "key": "URL",
+          "ty": "str"
+        }
+      ]
+    },
+    {
+      "id": "q22_google_phrase_breakdown",
+      "class": "selective",
+      "sql": "SELECT \"SearchPhrase\", MIN(\"URL\"), COUNT(*) AS c FROM logs WHERE \"URL\" LIKE '%google%' AND \"SearchPhrase\" <> '' GROUP BY \"SearchPhrase\" ORDER BY c DESC LIMIT 10",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "Filter (WHERE)",
+        "min",
+        "count",
+        "LIKE",
+        "GROUP BY",
+        "ORDER BY",
+        "LIMIT"
+      ],
+      "upstream_id": "Q22",
+      "required_declarations": [
+        {
+          "key": "URL",
+          "ty": "str"
+        },
+        {
+          "key": "SearchPhrase",
+          "ty": "str"
+        }
+      ]
+    },
+    {
+      "id": "q23_google_title_not_google_url",
+      "class": "selective",
+      "sql": "SELECT \"SearchPhrase\", MIN(\"URL\"), MIN(\"Title\"), COUNT(*) AS c, COUNT(DISTINCT \"UserID\") FROM logs WHERE \"Title\" LIKE '%Google%' AND \"URL\" NOT LIKE '%.google.%' AND \"SearchPhrase\" <> '' GROUP BY \"SearchPhrase\" ORDER BY c DESC LIMIT 10",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "Filter (WHERE)",
+        "min",
+        "count",
+        "count(DISTINCT)",
+        "LIKE",
+        "GROUP BY",
+        "ORDER BY",
+        "LIMIT"
+      ],
+      "upstream_id": "Q23",
+      "required_declarations": [
+        {
+          "key": "Title",
+          "ty": "str"
+        },
+        {
+          "key": "URL",
+          "ty": "str"
+        },
+        {
+          "key": "SearchPhrase",
+          "ty": "str"
+        },
+        {
+          "key": "UserID",
+          "ty": "i64"
+        }
+      ]
+    },
+    {
+      "id": "q24_google_urls_by_time",
+      "class": "selective",
+      "sql": "SELECT * FROM logs WHERE \"URL\" LIKE '%google%' ORDER BY ts LIMIT 10",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "Projection",
+        "Filter (WHERE)",
+        "LIKE",
+        "ORDER BY",
+        "LIMIT"
+      ],
+      "upstream_id": "Q24",
+      "required_declarations": [
+        {
+          "key": "URL",
+          "ty": "str"
+        }
+      ]
+    },
+    {
+      "id": "q25_phrases_by_time",
+      "class": "full_value",
+      "sql": "SELECT \"SearchPhrase\" FROM logs WHERE \"SearchPhrase\" <> '' ORDER BY ts LIMIT 10",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "Projection",
+        "Filter (WHERE)",
+        "ORDER BY",
+        "LIMIT"
+      ],
+      "upstream_id": "Q25",
+      "required_declarations": [
+        {
+          "key": "SearchPhrase",
+          "ty": "str"
+        }
+      ]
+    },
+    {
+      "id": "q26_phrases_alpha",
+      "class": "full_value",
+      "sql": "SELECT \"SearchPhrase\" FROM logs WHERE \"SearchPhrase\" <> '' ORDER BY \"SearchPhrase\" LIMIT 10",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "Projection",
+        "Filter (WHERE)",
+        "ORDER BY",
+        "LIMIT"
+      ],
+      "upstream_id": "Q26",
+      "required_declarations": [
+        {
+          "key": "SearchPhrase",
+          "ty": "str"
+        }
+      ]
+    },
+    {
+      "id": "q27_phrases_time_then_phrase",
+      "class": "full_value",
+      "sql": "SELECT \"SearchPhrase\" FROM logs WHERE \"SearchPhrase\" <> '' ORDER BY ts, \"SearchPhrase\" LIMIT 10",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "Projection",
+        "Filter (WHERE)",
+        "ORDER BY",
+        "LIMIT"
+      ],
+      "upstream_id": "Q27",
+      "required_declarations": [
+        {
+          "key": "SearchPhrase",
+          "ty": "str"
+        }
+      ]
+    },
+    {
+      "id": "q28_url_length_by_counter",
+      "class": "full_value",
+      "sql": "SELECT \"CounterID\", AVG(length(\"URL\")) AS l, COUNT(*) AS c FROM logs WHERE \"URL\" <> '' GROUP BY \"CounterID\" HAVING COUNT(*) > 100000 ORDER BY l DESC LIMIT 25",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "Filter (WHERE)",
+        "GROUP BY",
+        "HAVING",
+        "ORDER BY",
+        "LIMIT",
+        "avg",
+        "count",
+        "length",
+        "declared i64 typed comparison"
+      ],
+      "upstream_id": "Q28",
+      "required_declarations": [
+        {
+          "key": "CounterID",
+          "ty": "i64"
+        },
+        {
+          "key": "URL",
+          "ty": "str"
+        }
+      ]
+    },
+    {
+      "id": "q29_referer_length_by_host",
+      "class": "full_value",
+      "sql": "SELECT regexp_replace(\"Referer\", '^https?://(?:www\\.)?([^/]+)/.*$', '\\1') AS k, AVG(length(\"Referer\")) AS l, COUNT(*) AS c, MIN(\"Referer\") FROM logs WHERE \"Referer\" <> '' GROUP BY k HAVING COUNT(*) > 100000 ORDER BY l DESC LIMIT 25",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "Filter (WHERE)",
+        "GROUP BY",
+        "HAVING",
+        "ORDER BY",
+        "LIMIT",
+        "avg",
+        "count",
+        "min",
+        "length",
+        "regexp_replace"
+      ],
+      "upstream_id": "Q29",
+      "required_declarations": [
+        {
+          "key": "Referer",
+          "ty": "str"
+        }
+      ]
+    },
+    {
+      "id": "q30_resolution_running_sums",
+      "class": "full_value",
+      "sql": "SELECT SUM(\"ResolutionWidth\"), SUM(\"ResolutionWidth\" + 1), SUM(\"ResolutionWidth\" + 2), SUM(\"ResolutionWidth\" + 3), SUM(\"ResolutionWidth\" + 4), SUM(\"ResolutionWidth\" + 5), SUM(\"ResolutionWidth\" + 6), SUM(\"ResolutionWidth\" + 7), SUM(\"ResolutionWidth\" + 8), SUM(\"ResolutionWidth\" + 9), SUM(\"ResolutionWidth\" + 10), SUM(\"ResolutionWidth\" + 11), SUM(\"ResolutionWidth\" + 12), SUM(\"ResolutionWidth\" + 13), SUM(\"ResolutionWidth\" + 14), SUM(\"ResolutionWidth\" + 15), SUM(\"ResolutionWidth\" + 16), SUM(\"ResolutionWidth\" + 17), SUM(\"ResolutionWidth\" + 18), SUM(\"ResolutionWidth\" + 19), SUM(\"ResolutionWidth\" + 20), SUM(\"ResolutionWidth\" + 21), SUM(\"ResolutionWidth\" + 22), SUM(\"ResolutionWidth\" + 23), SUM(\"ResolutionWidth\" + 24), SUM(\"ResolutionWidth\" + 25), SUM(\"ResolutionWidth\" + 26), SUM(\"ResolutionWidth\" + 27), SUM(\"ResolutionWidth\" + 28), SUM(\"ResolutionWidth\" + 29), SUM(\"ResolutionWidth\" + 30), SUM(\"ResolutionWidth\" + 31), SUM(\"ResolutionWidth\" + 32), SUM(\"ResolutionWidth\" + 33), SUM(\"ResolutionWidth\" + 34), SUM(\"ResolutionWidth\" + 35), SUM(\"ResolutionWidth\" + 36), SUM(\"ResolutionWidth\" + 37), SUM(\"ResolutionWidth\" + 38), SUM(\"ResolutionWidth\" + 39), SUM(\"ResolutionWidth\" + 40), SUM(\"ResolutionWidth\" + 41), SUM(\"ResolutionWidth\" + 42), SUM(\"ResolutionWidth\" + 43), SUM(\"ResolutionWidth\" + 44), SUM(\"ResolutionWidth\" + 45), SUM(\"ResolutionWidth\" + 46), SUM(\"ResolutionWidth\" + 47), SUM(\"ResolutionWidth\" + 48), SUM(\"ResolutionWidth\" + 49), SUM(\"ResolutionWidth\" + 50), SUM(\"ResolutionWidth\" + 51), SUM(\"ResolutionWidth\" + 52), SUM(\"ResolutionWidth\" + 53), SUM(\"ResolutionWidth\" + 54), SUM(\"ResolutionWidth\" + 55), SUM(\"ResolutionWidth\" + 56), SUM(\"ResolutionWidth\" + 57), SUM(\"ResolutionWidth\" + 58), SUM(\"ResolutionWidth\" + 59), SUM(\"ResolutionWidth\" + 60), SUM(\"ResolutionWidth\" + 61), SUM(\"ResolutionWidth\" + 62), SUM(\"ResolutionWidth\" + 63), SUM(\"ResolutionWidth\" + 64), SUM(\"ResolutionWidth\" + 65), SUM(\"ResolutionWidth\" + 66), SUM(\"ResolutionWidth\" + 67), SUM(\"ResolutionWidth\" + 68), SUM(\"ResolutionWidth\" + 69), SUM(\"ResolutionWidth\" + 70), SUM(\"ResolutionWidth\" + 71), SUM(\"ResolutionWidth\" + 72), SUM(\"ResolutionWidth\" + 73), SUM(\"ResolutionWidth\" + 74), SUM(\"ResolutionWidth\" + 75), SUM(\"ResolutionWidth\" + 76), SUM(\"ResolutionWidth\" + 77), SUM(\"ResolutionWidth\" + 78), SUM(\"ResolutionWidth\" + 79), SUM(\"ResolutionWidth\" + 80), SUM(\"ResolutionWidth\" + 81), SUM(\"ResolutionWidth\" + 82), SUM(\"ResolutionWidth\" + 83), SUM(\"ResolutionWidth\" + 84), SUM(\"ResolutionWidth\" + 85), SUM(\"ResolutionWidth\" + 86), SUM(\"ResolutionWidth\" + 87), SUM(\"ResolutionWidth\" + 88), SUM(\"ResolutionWidth\" + 89) FROM logs",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "sum",
+        "declared i64 typed aggregate"
+      ],
+      "expected_rows": 1,
+      "upstream_id": "Q30",
+      "required_declarations": [
+        {
+          "key": "ResolutionWidth",
+          "ty": "i64"
+        }
+      ]
+    },
+    {
+      "id": "q31_engine_ip_aggregates",
+      "class": "full_value",
+      "sql": "SELECT \"SearchEngineID\", \"ClientIP\", COUNT(*) AS c, SUM(\"IsRefresh\"), AVG(\"ResolutionWidth\") FROM logs WHERE \"SearchPhrase\" <> '' GROUP BY \"SearchEngineID\", \"ClientIP\" ORDER BY c DESC LIMIT 10",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "Filter (WHERE)",
+        "count",
+        "sum",
+        "avg",
+        "GROUP BY",
+        "ORDER BY",
+        "LIMIT",
+        "declared i64 typed aggregate"
+      ],
+      "upstream_id": "Q31",
+      "required_declarations": [
+        {
+          "key": "SearchEngineID",
+          "ty": "i64"
+        },
+        {
+          "key": "ClientIP",
+          "ty": "i64"
+        },
+        {
+          "key": "IsRefresh",
+          "ty": "i64"
+        },
+        {
+          "key": "ResolutionWidth",
+          "ty": "i64"
+        },
+        {
+          "key": "SearchPhrase",
+          "ty": "str"
+        }
+      ]
+    },
+    {
+      "id": "q32_watch_ip_aggregates_filtered",
+      "class": "full_value",
+      "sql": "SELECT \"WatchID\", \"ClientIP\", COUNT(*) AS c, SUM(\"IsRefresh\"), AVG(\"ResolutionWidth\") FROM logs WHERE \"SearchPhrase\" <> '' GROUP BY \"WatchID\", \"ClientIP\" ORDER BY c DESC LIMIT 10",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "Filter (WHERE)",
+        "count",
+        "sum",
+        "avg",
+        "GROUP BY",
+        "ORDER BY",
+        "LIMIT",
+        "declared i64 typed aggregate"
+      ],
+      "upstream_id": "Q32",
+      "required_declarations": [
+        {
+          "key": "WatchID",
+          "ty": "i64"
+        },
+        {
+          "key": "ClientIP",
+          "ty": "i64"
+        },
+        {
+          "key": "IsRefresh",
+          "ty": "i64"
+        },
+        {
+          "key": "ResolutionWidth",
+          "ty": "i64"
+        },
+        {
+          "key": "SearchPhrase",
+          "ty": "str"
+        }
+      ]
+    },
+    {
+      "id": "q33_watch_ip_aggregates_all",
+      "class": "full_value",
+      "sql": "SELECT \"WatchID\", \"ClientIP\", COUNT(*) AS c, SUM(\"IsRefresh\"), AVG(\"ResolutionWidth\") FROM logs GROUP BY \"WatchID\", \"ClientIP\" ORDER BY c DESC LIMIT 10",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "count",
+        "sum",
+        "avg",
+        "GROUP BY",
+        "ORDER BY",
+        "LIMIT",
+        "declared i64 typed aggregate"
+      ],
+      "upstream_id": "Q33",
+      "required_declarations": [
+        {
+          "key": "WatchID",
+          "ty": "i64"
+        },
+        {
+          "key": "ClientIP",
+          "ty": "i64"
+        },
+        {
+          "key": "IsRefresh",
+          "ty": "i64"
+        },
+        {
+          "key": "ResolutionWidth",
+          "ty": "i64"
+        }
+      ]
+    },
+    {
+      "id": "q34_top_urls",
+      "class": "full_value",
+      "sql": "SELECT \"URL\", COUNT(*) AS c FROM logs GROUP BY \"URL\" ORDER BY c DESC LIMIT 10",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "count",
+        "GROUP BY",
+        "ORDER BY",
+        "LIMIT"
+      ],
+      "upstream_id": "Q34",
+      "required_declarations": [
+        {
+          "key": "URL",
+          "ty": "str"
+        }
+      ]
+    },
+    {
+      "id": "q35_top_urls_const_col",
+      "class": "full_value",
+      "sql": "SELECT 1, \"URL\", COUNT(*) AS c FROM logs GROUP BY 1, \"URL\" ORDER BY c DESC LIMIT 10",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "count",
+        "GROUP BY",
+        "GROUP BY ordinal",
+        "ORDER BY",
+        "LIMIT"
+      ],
+      "upstream_id": "Q35",
+      "required_declarations": [
+        {
+          "key": "URL",
+          "ty": "str"
+        }
+      ]
+    },
+    {
+      "id": "q36_clientip_offsets",
+      "class": "full_value",
+      "sql": "SELECT \"ClientIP\", \"ClientIP\" - 1, \"ClientIP\" - 2, \"ClientIP\" - 3, COUNT(*) AS c FROM logs GROUP BY \"ClientIP\", \"ClientIP\" - 1, \"ClientIP\" - 2, \"ClientIP\" - 3 ORDER BY c DESC LIMIT 10",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "count",
+        "GROUP BY",
+        "ORDER BY",
+        "LIMIT"
+      ],
+      "upstream_id": "Q36",
+      "required_declarations": [
+        {
+          "key": "ClientIP",
+          "ty": "i64"
+        }
+      ]
+    },
+    {
+      "id": "q37_july_pageviews_by_url",
+      "class": "selective",
+      "sql": "SELECT \"URL\", COUNT(*) AS PageViews FROM logs WHERE \"CounterID\" = 62 AND \"EventDate\" >= 15887 AND \"EventDate\" <= 15917 AND \"DontCountHits\" = 0 AND \"IsRefresh\" = 0 AND \"URL\" <> '' GROUP BY \"URL\" ORDER BY PageViews DESC LIMIT 10",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "Filter (WHERE)",
+        "count",
+        "GROUP BY",
+        "ORDER BY",
+        "LIMIT",
+        "declared i64 typed comparison"
+      ],
+      "upstream_id": "Q37",
+      "modified": {
+        "modified": {
+          "reason": "EventDate is declared i64 epoch-days, so the DATE range '2013-07-01'..'2013-07-31' becomes the epoch-day integer range 15887..15917 (ADR-0100 decision 3)."
+        }
+      },
+      "required_declarations": [
+        {
+          "key": "URL",
+          "ty": "str"
+        },
+        {
+          "key": "CounterID",
+          "ty": "i64"
+        },
+        {
+          "key": "EventDate",
+          "ty": "i64"
+        },
+        {
+          "key": "DontCountHits",
+          "ty": "i64"
+        },
+        {
+          "key": "IsRefresh",
+          "ty": "i64"
+        }
+      ]
+    },
+    {
+      "id": "q38_july_pageviews_by_title",
+      "class": "selective",
+      "sql": "SELECT \"Title\", COUNT(*) AS PageViews FROM logs WHERE \"CounterID\" = 62 AND \"EventDate\" >= 15887 AND \"EventDate\" <= 15917 AND \"DontCountHits\" = 0 AND \"IsRefresh\" = 0 AND \"Title\" <> '' GROUP BY \"Title\" ORDER BY PageViews DESC LIMIT 10",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "Filter (WHERE)",
+        "count",
+        "GROUP BY",
+        "ORDER BY",
+        "LIMIT",
+        "declared i64 typed comparison"
+      ],
+      "upstream_id": "Q38",
+      "modified": {
+        "modified": {
+          "reason": "EventDate is declared i64 epoch-days, so the DATE range '2013-07-01'..'2013-07-31' becomes the epoch-day integer range 15887..15917 (ADR-0100 decision 3)."
+        }
+      },
+      "required_declarations": [
+        {
+          "key": "Title",
+          "ty": "str"
+        },
+        {
+          "key": "CounterID",
+          "ty": "i64"
+        },
+        {
+          "key": "EventDate",
+          "ty": "i64"
+        },
+        {
+          "key": "DontCountHits",
+          "ty": "i64"
+        },
+        {
+          "key": "IsRefresh",
+          "ty": "i64"
+        }
+      ]
+    },
+    {
+      "id": "q39_july_pageviews_link_download",
+      "class": "selective",
+      "sql": "SELECT \"URL\", COUNT(*) AS PageViews FROM logs WHERE \"CounterID\" = 62 AND \"EventDate\" >= 15887 AND \"EventDate\" <= 15917 AND \"IsRefresh\" = 0 AND \"IsLink\" <> 0 AND \"IsDownload\" = 0 GROUP BY \"URL\" ORDER BY PageViews DESC LIMIT 10 OFFSET 1000",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "Filter (WHERE)",
+        "count",
+        "GROUP BY",
+        "ORDER BY",
+        "LIMIT",
+        "OFFSET",
+        "declared i64 typed comparison"
+      ],
+      "upstream_id": "Q39",
+      "modified": {
+        "modified": {
+          "reason": "EventDate is declared i64 epoch-days, so the DATE range '2013-07-01'..'2013-07-31' becomes the epoch-day integer range 15887..15917 (ADR-0100 decision 3)."
+        }
+      },
+      "required_declarations": [
+        {
+          "key": "URL",
+          "ty": "str"
+        },
+        {
+          "key": "CounterID",
+          "ty": "i64"
+        },
+        {
+          "key": "EventDate",
+          "ty": "i64"
+        },
+        {
+          "key": "IsRefresh",
+          "ty": "i64"
+        },
+        {
+          "key": "IsLink",
+          "ty": "i64"
+        },
+        {
+          "key": "IsDownload",
+          "ty": "i64"
+        }
+      ]
+    },
+    {
+      "id": "q40_traffic_source_funnel",
+      "class": "selective",
+      "sql": "SELECT \"TraficSourceID\", \"SearchEngineID\", \"AdvEngineID\", CASE WHEN (\"SearchEngineID\" = 0 AND \"AdvEngineID\" = 0) THEN \"Referer\" ELSE '' END AS Src, \"URL\" AS Dst, COUNT(*) AS PageViews FROM logs WHERE \"CounterID\" = 62 AND \"EventDate\" >= 15887 AND \"EventDate\" <= 15917 AND \"IsRefresh\" = 0 GROUP BY \"TraficSourceID\", \"SearchEngineID\", \"AdvEngineID\", Src, Dst ORDER BY PageViews DESC LIMIT 10 OFFSET 1000",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "Filter (WHERE)",
+        "CASE",
+        "count",
+        "GROUP BY",
+        "ORDER BY",
+        "LIMIT",
+        "OFFSET",
+        "declared i64 typed comparison"
+      ],
+      "upstream_id": "Q40",
+      "modified": {
+        "modified": {
+          "reason": "EventDate is declared i64 epoch-days, so the DATE range '2013-07-01'..'2013-07-31' becomes the epoch-day integer range 15887..15917 (ADR-0100 decision 3)."
+        }
+      },
+      "required_declarations": [
+        {
+          "key": "TraficSourceID",
+          "ty": "i64"
+        },
+        {
+          "key": "SearchEngineID",
+          "ty": "i64"
+        },
+        {
+          "key": "AdvEngineID",
+          "ty": "i64"
+        },
+        {
+          "key": "Referer",
+          "ty": "str"
+        },
+        {
+          "key": "URL",
+          "ty": "str"
+        },
+        {
+          "key": "CounterID",
+          "ty": "i64"
+        },
+        {
+          "key": "EventDate",
+          "ty": "i64"
+        },
+        {
+          "key": "IsRefresh",
+          "ty": "i64"
+        }
+      ]
+    },
+    {
+      "id": "q41_urlhash_date_pageviews",
+      "class": "selective",
+      "sql": "SELECT \"URLHash\", \"EventDate\", COUNT(*) AS PageViews FROM logs WHERE \"CounterID\" = 62 AND \"EventDate\" >= 15887 AND \"EventDate\" <= 15917 AND \"IsRefresh\" = 0 AND \"TraficSourceID\" IN (-1, 6) AND \"RefererHash\" = 3594120000172545465 GROUP BY \"URLHash\", \"EventDate\" ORDER BY PageViews DESC LIMIT 10 OFFSET 100",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "Filter (WHERE)",
+        "IN list",
+        "count",
+        "GROUP BY",
+        "ORDER BY",
+        "LIMIT",
+        "OFFSET",
+        "declared i64 typed comparison"
+      ],
+      "upstream_id": "Q41",
+      "modified": {
+        "modified": {
+          "reason": "EventDate is declared i64 epoch-days: the DATE range '2013-07-01'..'2013-07-31' becomes epoch-day integers 15887..15917, and the projected EventDate returns epoch-day integers rather than DATE values (ADR-0100 decision 3)."
+        }
+      },
+      "required_declarations": [
+        {
+          "key": "URLHash",
+          "ty": "i64"
+        },
+        {
+          "key": "EventDate",
+          "ty": "i64"
+        },
+        {
+          "key": "CounterID",
+          "ty": "i64"
+        },
+        {
+          "key": "IsRefresh",
+          "ty": "i64"
+        },
+        {
+          "key": "TraficSourceID",
+          "ty": "i64"
+        },
+        {
+          "key": "RefererHash",
+          "ty": "i64"
+        }
+      ]
+    },
+    {
+      "id": "q42_window_dims_pageviews",
+      "class": "selective",
+      "sql": "SELECT \"WindowClientWidth\", \"WindowClientHeight\", COUNT(*) AS PageViews FROM logs WHERE \"CounterID\" = 62 AND \"EventDate\" >= 15887 AND \"EventDate\" <= 15917 AND \"IsRefresh\" = 0 AND \"DontCountHits\" = 0 AND \"URLHash\" = 2868770270353813622 GROUP BY \"WindowClientWidth\", \"WindowClientHeight\" ORDER BY PageViews DESC LIMIT 10 OFFSET 10000",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "Filter (WHERE)",
+        "count",
+        "GROUP BY",
+        "ORDER BY",
+        "LIMIT",
+        "OFFSET",
+        "declared i64 typed comparison"
+      ],
+      "upstream_id": "Q42",
+      "modified": {
+        "modified": {
+          "reason": "EventDate is declared i64 epoch-days, so the DATE range '2013-07-01'..'2013-07-31' becomes the epoch-day integer range 15887..15917 (ADR-0100 decision 3)."
+        }
+      },
+      "required_declarations": [
+        {
+          "key": "WindowClientWidth",
+          "ty": "i64"
+        },
+        {
+          "key": "WindowClientHeight",
+          "ty": "i64"
+        },
+        {
+          "key": "CounterID",
+          "ty": "i64"
+        },
+        {
+          "key": "EventDate",
+          "ty": "i64"
+        },
+        {
+          "key": "IsRefresh",
+          "ty": "i64"
+        },
+        {
+          "key": "DontCountHits",
+          "ty": "i64"
+        },
+        {
+          "key": "URLHash",
+          "ty": "i64"
+        }
+      ]
+    },
+    {
+      "id": "q43_per_minute_pageviews",
+      "class": "selective",
+      "sql": "SELECT DATE_TRUNC('minute', ts) AS M, COUNT(*) AS PageViews FROM logs WHERE \"CounterID\" = 62 AND \"EventDate\" >= 15900 AND \"EventDate\" <= 15901 AND \"IsRefresh\" = 0 AND \"DontCountHits\" = 0 GROUP BY DATE_TRUNC('minute', ts) ORDER BY DATE_TRUNC('minute', ts) LIMIT 10 OFFSET 1000",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "DATE_TRUNC",
+        "Filter (WHERE)",
+        "count",
+        "GROUP BY",
+        "ORDER BY",
+        "LIMIT",
+        "OFFSET",
+        "declared i64 typed comparison"
+      ],
+      "upstream_id": "Q43",
+      "modified": {
+        "modified": {
+          "reason": "EventDate is declared i64 epoch-days, so the DATE range '2013-07-14'..'2013-07-15' becomes the epoch-day integer range 15900..15901 (ADR-0100 decision 3)."
+        }
+      },
+      "required_declarations": [
+        {
+          "key": "CounterID",
+          "ty": "i64"
+        },
+        {
+          "key": "EventDate",
+          "ty": "i64"
+        },
+        {
+          "key": "IsRefresh",
+          "ty": "i64"
+        },
+        {
+          "key": "DontCountHits",
+          "ty": "i64"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,222 @@
+[package]
+name = "ravel-sql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ravel-types = { workspace = true }
+ravel-segment = { workspace = true }
+ravel-catalog = { workspace = true }
+# Was dev-only (the endpoint tests publish real commit records rather than
+# hand-building `Snapshot`s) and is now also a library dependency: the
+# ADR-0873 decision 2 defect metric lives in
+# `ravel_commit::declared_stats`, labelled by carrier, and the `.cstat` reader
+# in `logs_scan` is the carrier whose refusals only this crate can report.
+# Splitting that metric in two would mean two things to scrape for one defect
+# class. ravel-commit does not depend on ravel-sql, and ravel-catalog already
+# depends on it, so this adds no cycle and no new crate to the build graph.
+ravel-commit = { workspace = true }
+ravel-query = { workspace = true }
+ravel-promql = { workspace = true }
+ravel-object-store = { workspace = true }
+# The query-audit writer (ADR-0042 decision 4). The Flight SQL
+# statement path writes one `Signal::Audit` record per executed statement
+# through `ravel_maintain::write_query_audit`, the same writer the HTTP
+# `POST /api/v1/sql` endpoint uses, so a tenant's Flight query activity is
+# durably logged and cannot be forged or suppressed. Optional, pulled in only
+# with `flight-sql`: the audit hook lives in the `flight` module, which that
+# feature gates. ravel-maintain does not depend on ravel-sql, so this adds no
+# dependency cycle.
+ravel-maintain = { workspace = true, optional = true }
+# The `logs` table uses the RLOG record/predicate/tokenizer types
+# directly (Predicate, FieldSel, LogRecord, AttrValue, tokenizer::tokens);
+# ravel-query re-exports the LogSegmentFetcher surface but not these logseg
+# types, so ravel-logseg is a direct dependency here.
+ravel-logseg = { workspace = true }
+# The `spans` table reads RSPAN span segments through the
+# ravel-rspan reader/record/query types (RspanReader, SpanQuery, SpanRecord,
+# ScanStats, SpanSegError) directly; ravel-query has no span fetcher yet
+# (ADR-0041 phase 5 is the SQL table alone), so ravel-rspan is a direct
+# dependency here, the same way ravel-logseg is for the `logs` table.
+ravel-rspan = { workspace = true }
+
+# DataFusion pulls its own matching arrow (accessed via `datafusion::arrow`),
+# so this crate never depends on the workspace `arrow` pin directly. See the
+# module docs for the arrow 58 vs workspace-59 pinning note.
+#
+# `sql` is the only feature enabled on top of `default-features = false`: it
+# supplies `datafusion-sql` (the sqlparser front end and the SQL-to-LogicalPlan
+# planner) that the `/api/v1/sql` endpoint parses and plans with. The flag does
+# keep the file-format factories off: no parquet/csv/avro/json readers, so a
+# `CREATE EXTERNAL TABLE` that slipped the parse gate has nothing to bind to
+# (security invariant 1), and crypto is off (no md5/sha256 in the live surface).
+#
+# `default-features = false` is NOT the control over the expression packs, and
+# must not be read as one. datafusion 54 declares `datafusion-functions`,
+# `-aggregate`, `-table`, and `-window` as MANDATORY dependencies with their own
+# default features on; a flag on this facade edge cannot subtract a mandatory
+# sub-crate's defaults. So the full string, unicode, datetime, math, regex, and
+# encoding scalar packs, all default aggregates and window functions, and the
+# `range`/`generate_series` table functions all resolve regardless of this flag.
+# `datafusion-functions-nested` is linked too (a mandatory dependency of
+# `datafusion-sql`) but its functions are never registered, gated off by the
+# `nested_expressions` feature this flag does leave off.
+#
+# The enforcement mechanism for the SQL function surface is therefore NOT this
+# manifest: it is the per-registry allowlist enumeration in
+# `crate::session::build_session` plus the drift test
+# (`admitted_and_excluded_cover_all_registries_for_every_table`), which
+# deregister every function outside the admitted set and fail closed when an
+# upgrade adds a new one (ADR-0097).
+datafusion = { version = "54", default-features = false, features = ["sql"] }
+
+# `url::Url` appears in the `ObjectStoreRegistry` trait signature, which
+# ravel-sql implements to install a registry that holds no stores at all
+# (security invariant 1: "the SQL RuntimeEnv registers no object store").
+# datafusion does not re-export `url`, so it is named directly here; the crate
+# is already in the workspace lockfile as a transitive dependency of
+# object_store, so this adds no new supply-chain surface.
+url = "2"
+
+# Flight SQL transport for the `flight` module, off unless `flight-sql` is on.
+# It carries its own arrow 58, the same major datafusion 54 resolves, so the
+# Flight encoders and the scan pipeline's `RecordBatch`es are the same types.
+arrow-flight = { workspace = true, optional = true }
+# The rest of the `flight-sql` set, all of them already workspace pins and all
+# of them off in the default build:
+#  - `tonic` supplies `Request`/`Response`/`Status`/`MetadataMap`, which appear
+#    in every `FlightSqlService` signature. arrow-flight does not re-export it.
+#  - `prost` supplies the `Message` trait used to encode a Flight SQL command
+#    into the opaque `Ticket` bytes the protocol dispatches on.
+#  - `bytes` supplies the `Bytes` the Flight protobuf fields are typed as.
+#  - `uuid` types `SegmentPin::writer_id`, one of the `SegmentRef` fields the
+#    snapshot-pinning ticket carries.
+#  - `blake3` keys the ticket's integrity MAC; already a
+#    workspace pin, used the same way `content_hash` fields are hashed
+#    elsewhere in the workspace, just keyed here instead of unkeyed.
+#  - `rand` generates the ticket's in-process MAC key once at construction.
+tonic = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+blake3 = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+
+tokio = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+serde_json = { workspace = true }
+# `tracing` is unconditional, not gated behind `flight-sql`: two base-build
+# paths log through it. The Flight error boundary records the full, unredacted
+# error (the same discipline the HTTP endpoint follows), and
+# `logs_scan::record_carrier_conflict` records the declared-statistics carrier
+# conflict ADR-0873 decision 4 requires an operator be able to attribute to a
+# segment, which happens in `partition_statistics` with no Flight surface in
+# sight.
+tracing = { workspace = true }
+# Renders the conflicting segment's `content_hash` for that same log line: the
+# hash is what names the exact bytes both carriers claim to describe, so it is
+# the identity a report is filed against.
+hex = { workspace = true }
+# `ravel-proto` is a hard dependency, not gated behind `flight-sql`: ADR-0850's
+# metadata-only aggregate path (`logs_scan`/`metadata_agg`) reads
+# `ravel_catalog::LoadedColumnStats`, whose per-segment entries are the raw
+# `ravel_proto::catalog::v1::{ColumnStat, ColumnStatsSegment, ColumnValue}`
+# types, in the base (non-flight) build. When `flight-sql` is also on,
+# `flight_ticket::FlightTicket::snapshot` reuses this same dependency for
+# `ErasureRequest`/`ErasurePredicateMatcher` (ADR-0064 decision 3); that need
+# does not make this entry conditional, it is simply a second consumer.
+ravel-proto = { workspace = true }
+
+[features]
+# Flight SQL transport. Off by default: it links arrow-flight and tonic on top
+# of datafusion, and the Flight surface is opt-in per deployment
+# (ADR-0013 structural isolation).
+# Gates the `flight` module (the future FlightSqlService) and the
+# `flight_ticket` module (the snapshot-pinning ticket codec).
+#
+# The feature matrix writes this as "flight-sql implies sql". This
+# crate has no `sql` feature to imply: its SQL surface is unconditional
+# (datafusion is a hard dependency, and the `sql` in its feature list is
+# datafusion's own feature, not one of ours). The implication is stated where a
+# `sql` feature actually exists, in services/ravel-server, whose `flight-sql`
+# enables its `sql`.
+flight-sql = [
+    "dep:arrow-flight",
+    "dep:tonic",
+    "dep:prost",
+    "dep:bytes",
+    "dep:uuid",
+    "dep:blake3",
+    "dep:rand",
+    "dep:ravel-maintain",
+]
+
+[dev-dependencies]
+proptest = { workspace = true }
+uuid = { workspace = true }
+bytes = { workspace = true }
+# Dev-only: the distributed Flight acceptance test
+# (tests/flight_distributed.rs) hand-crafts an old-version (v3)
+# ticket envelope with a MAC that is valid under the service's in-process key,
+# so the decode rejects it on the version byte (not the MAC). Computing that MAC
+# needs the same keyed BLAKE3 the codec uses; blake3 is already a workspace pin.
+blake3 = { workspace = true }
+# Dev-only: the Flight SQL request-span test (tests/flight_span.rs) captures
+# `tracing` output through a `MakeWriter` and asserts the `flight_sql_statement`
+# span's bounded fields (ADR-0044 section 5), the same way
+# services/ravel-server's own span tests do.
+tracing-subscriber = { workspace = true }
+# Dev-only: the `alerts` table's own tests build fixtures by hand-encoding
+# RLOG attrs matching the assumed `ravel-alerting` convention, never checked
+# against that crate's actual writer. This dependency lets one test build a
+# fixture through the real `ravel_alerting::write_alert_record` path instead,
+# so a future drift between the two (a renamed attr key, a changed generation
+# type) is caught here rather than only discovered once both are wired
+# together at runtime.
+ravel-alerting = { workspace = true }
+# Dev-only: the metric-scan cache-warm test wires a real ADR-0046 read cache
+# into `SegmentFetcher` to prove exclusion still fires on cache-served bytes.
+# Already a workspace pin used elsewhere (ravel-query depends on it);
+# ravel-sql's non-test code has no need for it.
+ravel-cache = { workspace = true }
+# Dev-only: the batch-building benches (benches/samples_scan.rs and
+# benches/logs_scan.rs, ADR-0099 decision 7).
+criterion = { workspace = true }
+# Dev-only: the allocation upper bound for batch building
+# (tests/scan_batch_allocations.rs) installs stats_alloc's instrumented global
+# allocator and measures one drain in a `Region`. The workspace forbids
+# `unsafe_code`, including in tests, so allocation counting must go through a
+# dependency that owns the `unsafe impl GlobalAlloc` itself; this is the same
+# version and pattern crates/ravel-otap/benches/decode.rs uses.
+stats_alloc = "0.1.10"
+# Dev-only: tests/logs_columnar.rs assembles one RLOG object the writer cannot
+# produce (a declared `Str` column cell that is not UTF-8) by rebuilding two of
+# the writer's sections around ravel-logseg's own encoders, which means stamping
+# the section table's checksums. Same workspace pin ravel-logseg itself uses.
+crc32c = { workspace = true }
+# Dev-only: tests/logs_columnar.rs asserts a declared `Str` fixture's value set
+# actually encodes as `Enc::Dict`/`Enc::Plain` (the codec function the RLOG
+# writer stages a dynamic string column with), so a shift in the distinct-ratio
+# heuristic fails the dict-page tests loudly instead of silently. Already a
+# workspace pin (ravel-logseg depends on it); no new supply-chain surface.
+ravel-codec = { workspace = true }
+# Dev-only: the spill tests (tests/spill.rs, crate::spill's own unit tests)
+# need a real, writable directory to configure as the spill root and a
+# read-only one to prove the `spill_unavailable` refusal. Already a workspace
+# pin, and already in the lockfile as a datafusion dependency.
+tempfile = { workspace = true }
+
+[[bench]]
+name = "samples_scan"
+harness = false
+
+[[bench]]
+name = "logs_scan"
+harness = false

@@ -1,0 +1,181 @@
+# MinIO as the fallback fake-S3 backend for the kind development environment
+# (ADR-0034 decision 8). floci is the default after its capability contract
+# went green; this manifest exists so that a floci release which stops
+# satisfying `Capabilities::mandatory()` or multipart is a one-flag switch
+# (`RAVEL_FAKE_S3_BACKEND=minio` in scripts/kind-up.sh) rather than new work.
+# MinIO is the backend this repository's object-store-contract CI job has
+# proven the longest.
+#
+# This is a development backend only: no PersistentVolumeClaim, so the bucket
+# lives in the pod's ephemeral filesystem and is gone when the pod restarts.
+# Credentials match deploy/docker-compose/minio.yml so the two dev paths use
+# the same values. Production points `spec.storage.s3.endpoint` at real S3 or a
+# real MinIO with real credentials.
+#
+# The `ravel-system` Namespace is not defined here on purpose; see the same
+# note in deploy/k8s/floci.yaml.
+#
+# Apply with:
+#   kubectl apply -f deploy/k8s/minio.yaml
+#   kubectl wait --for=condition=Complete --timeout=180s \
+#     -n ravel-system job/minio-create-bucket
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  namespace: ravel-system
+  labels:
+    app.kubernetes.io/name: minio
+    app.kubernetes.io/component: fake-s3
+spec:
+  replicas: 1
+  # Recreate, not RollingUpdate: single-node MinIO stores objects on the pod's
+  # own filesystem, so overlapping replicas would serve diverging buckets.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: minio
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minio
+        app.kubernetes.io/component: fake-s3
+    spec:
+      containers:
+        - name: minio
+          image: minio/minio:latest
+          imagePullPolicy: IfNotPresent
+          # The image has no default command that serves anything; `server
+          # /data` is required, which is also why the CI job runs MinIO with
+          # `docker run ... server /data` instead of a service container.
+          args: ["server", "/data", "--console-address", ":9001"]
+          ports:
+            - name: s3
+              containerPort: 9000
+            - name: console
+              containerPort: 9001
+          env:
+            - name: MINIO_ROOT_USER
+              value: ravel
+            - name: MINIO_ROOT_PASSWORD
+              value: ravel-dev-secret
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          # MinIO's own health routes, the same ones scripts/demo.sh and the
+          # object-store-contract CI job poll.
+          livenessProbe:
+            httpGet:
+              path: /minio/health/live
+              port: s3
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /minio/health/ready
+              port: s3
+            initialDelaySeconds: 3
+            periodSeconds: 3
+            timeoutSeconds: 3
+            failureThreshold: 40
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+      volumes:
+        # emptyDir, not a PVC: dev-only, and kind's default storage class would
+        # otherwise leave a host-path volume behind after `kind-down.sh`.
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: ravel-system
+  labels:
+    app.kubernetes.io/name: minio
+    app.kubernetes.io/component: fake-s3
+spec:
+  selector:
+    app.kubernetes.io/name: minio
+  ports:
+    - name: s3
+      port: 9000
+      targetPort: s3
+    - name: console
+      port: 9001
+      targetPort: console
+---
+# Bucket creation, the direct equivalent of the `createbucket` sidecar in
+# deploy/docker-compose/minio.yml. Unlike floci, MinIO verifies SigV4
+# signatures, so this needs a real S3 client: `mc`, the same one the compose
+# file and the CI job use.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-create-bucket
+  namespace: ravel-system
+  labels:
+    app.kubernetes.io/name: minio
+    app.kubernetes.io/component: fake-s3
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minio
+        app.kubernetes.io/component: fake-s3
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: create-bucket
+          image: minio/mc:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            # Must match spec.storage.s3.bucket of the RavelCluster that uses
+            # this backend (deploy/k8s/examples/ravelcluster-dev.yaml).
+            - name: BUCKET
+              value: ravel
+            # MC_HOST_<alias> configures the alias without a separate
+            # `mc alias set` call, so no writable config directory is needed.
+            - name: MC_HOST_local
+              value: http://ravel:ravel-dev-secret@minio.ravel-system.svc:9000
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              # `mc ready` waits for the endpoint to serve S3, which the
+              # Service can route to before MinIO finishes starting.
+              i=0
+              while [ "$i" -lt 60 ]; do
+                if mc ready local; then
+                  echo "MinIO is ready"
+                  break
+                fi
+                i=$((i + 1))
+                sleep 2
+              done
+              if [ "$i" -ge 60 ]; then
+                echo "MinIO did not become ready in time" >&2
+                exit 1
+              fi
+              # -p makes an existing bucket a success rather than an error.
+              mc mb -p "local/${BUCKET}"
+              # Verify rather than trust: `mc stat` fails if the bucket is
+              # absent, so reaching the echo proves it exists.
+              mc stat "local/${BUCKET}" >/dev/null
+              echo "bucket ${BUCKET} ready"
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi

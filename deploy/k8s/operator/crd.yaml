@@ -1,0 +1,606 @@
+{
+  "apiVersion": "apiextensions.k8s.io/v1",
+  "kind": "CustomResourceDefinition",
+  "metadata": {
+    "name": "ravelclusters.ravel.nofire.ai"
+  },
+  "spec": {
+    "group": "ravel.nofire.ai",
+    "names": {
+      "kind": "RavelCluster",
+      "plural": "ravelclusters",
+      "shortNames": [
+        "rc"
+      ],
+      "singular": "ravelcluster"
+    },
+    "scope": "Namespaced",
+    "versions": [
+      {
+        "name": "v1alpha1",
+        "schema": {
+          "openAPIV3Schema": {
+            "description": "Auto-generated derived type for RavelClusterSpec via `CustomResource`",
+            "properties": {
+              "spec": {
+                "description": "`RavelCluster` spec. Each field maps onto `ravel-server`'s real CLI surface\n(`services/ravel-server/src/config.rs`); the memory store is deliberately\nunrepresentable (ADR-0034 decision 2), so `storage.s3` is mandatory.",
+                "properties": {
+                  "deploymentKeySecretRef": {
+                    "description": "Secret with a single key `key` holding the deployment's 32-byte\ndeployment key (64 hex characters or 32 raw bytes, the same format\n`--tenant-hash-key-file` reads). This one key doubles as the v2-keyed\ntenant-hash key and the `sys/auth` token-hashing key (ADR-0072\ndecision 4): when set, the operator mounts it and renders\n`--tenant-hash-key-file` instead of `--tenant-hash-unkeyed`, and\nreconciles `sys/auth` from `tenantTokensSecretRef` each cycle. Additive\nopt-in, not a migration of existing unkeyed clusters; omit to keep\nunkeyed behavior unchanged.",
+                    "nullable": true,
+                    "properties": {
+                      "name": {
+                        "description": "Name of the Secret.",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "name"
+                    ],
+                    "type": "object"
+                  },
+                  "gateway": {
+                    "default": {
+                      "replicas": 1
+                    },
+                    "description": "Gateway (ingest + query API) tier.",
+                    "properties": {
+                      "credentialsSecretRef": {
+                        "description": "Per-role S3 credential override for the gateway tier (ADR-0055 section 5).\nWhen set, the gateway Deployment sources `RAVEL_S3_ACCESS_KEY` /\n`RAVEL_S3_SECRET_KEY` from this Secret (keys `accessKeyId` /\n`secretAccessKey`) instead of the shared `storage.s3.credentialsSecretRef`,\nso an operator can scope the gateway to a narrower IAM credential. Falls\nback to the shared credential when unset, so existing single-credential\nclusters are unaffected.",
+                        "nullable": true,
+                        "properties": {
+                          "name": {
+                            "description": "Name of the Secret.",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "name"
+                        ],
+                        "type": "object"
+                      },
+                      "exposure": {
+                        "description": "Gateway API exposure (ADR-0080 decision 2), independent of\n[`GatewaySpec::ingest_affinity`]. Omit to keep today's behavior exactly:\nno `HTTPRoute`/`GRPCRoute` is rendered and exposure for a plain\ndeployment stays entirely user-managed outside Ravel.\n\nUnlike `ingest_affinity`, this renders standard\n`gateway.networking.k8s.io` routes onto a user-provided `Gateway`; it can\nbe set with affinity disabled (plain routing, no tenant pinning) or\ncombined with `backend: ravelNative`. It cannot be combined with an\nenabled `ingestAffinity` on `backend: ingressNginx`: the Gateway API path\nand the annotation-driven Ingress path are two independent routes to the\nsame Service, so traffic on the Gateway API route would bypass the nginx\nsubset annotations entirely. That combination is rejected at admission by\na CEL rule attached to the `gateway` object (see [`ravel_cluster_crd`]).",
+                        "nullable": true,
+                        "properties": {
+                          "gatewayApi": {
+                            "description": "Gateway API (`gateway.networking.k8s.io`) exposure: the operator renders\none `HTTPRoute` and, when `grpc` is true, one `GRPCRoute` attached to an\nexisting `Gateway`. Omit for no Gateway API routing.",
+                            "nullable": true,
+                            "properties": {
+                              "gatewayRef": {
+                                "description": "The existing `Gateway` the rendered routes attach to via `parentRefs`.",
+                                "properties": {
+                                  "name": {
+                                    "description": "Name of the `Gateway`.",
+                                    "type": "string"
+                                  },
+                                  "namespace": {
+                                    "description": "Namespace of the `Gateway`. Defaults to the `RavelCluster`'s own\nnamespace when omitted (Gateway API resolves an omitted `parentRefs`\nnamespace to the route's own namespace, which the operator renders into\nthe `RavelCluster`'s namespace).",
+                                    "nullable": true,
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "name"
+                                ],
+                                "type": "object"
+                              },
+                              "grpc": {
+                                "default": true,
+                                "description": "Also render a `GRPCRoute` for OTLP/gRPC (port 4317). Defaults to true,\nmirroring [`IngestAffinitySpec::grpc`]: gRPC is the main OTLP ingest\npath.",
+                                "type": "boolean"
+                              },
+                              "hostnames": {
+                                "default": [],
+                                "description": "Hostnames the rendered routes answer on. Empty renders routes with no\n`hostnames`, which match every hostname the parent `Gateway`'s listeners\naccept.",
+                                "items": {
+                                  "type": "string"
+                                },
+                                "type": "array"
+                              }
+                            },
+                            "required": [
+                              "gatewayRef"
+                            ],
+                            "type": "object"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "fold": {
+                        "description": "Catalog fold tuning. Fold is a pure query-cost optimization and only\nruns in the gateway tier, so it is a gateway-only field.",
+                        "nullable": true,
+                        "properties": {
+                          "disabled": {
+                            "default": false,
+                            "description": "Disable the background fold task entirely (`--disable-fold`). Never\nchanges query results, only their cost.",
+                            "type": "boolean"
+                          },
+                          "intervalSecs": {
+                            "description": "How often each tenant's fold task wakes, in seconds\n(`--fold-interval-secs`).",
+                            "format": "uint64",
+                            "minimum": 0.0,
+                            "nullable": true,
+                            "type": "integer"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "ingestAffinity": {
+                        "description": "Layer-7 ingest affinity (ADR-0076 decision 1). Omit to keep today's\nbehavior exactly: no Ingress is rendered and ingest traffic reaches the\ngateway Service however the platform owner already routes it.\n\nIngest buffers are per `(tenant, signal, shard)` PER REPLICA, so a\ntenant whose writes spray across every gateway replica pays one\nage-triggered flush stream per replica for the same data. Pinning a\ntenant to a stable subset divides that term. Affinity is best-effort:\n`writer_id` and `epoch` already disambiguate concurrent writers in the\nobject key, so a reroute is always correct.",
+                        "nullable": true,
+                        "properties": {
+                          "annotations": {
+                            "additionalProperties": {
+                              "type": "string"
+                            },
+                            "description": "Extra annotations merged onto both rendered Ingress objects, for an\ningress controller other than ingress-nginx or for tuning\n(`nginx.ingress.kubernetes.io/proxy-body-size` is the common one: the\ningress-nginx default of 1m rejects larger OTLP/HTTP payloads).\n\nThe affinity annotations the operator computes are applied AFTER this\nmap, so an entry here can never silently disable the affinity it is\nmeant to configure.",
+                            "type": "object"
+                          },
+                          "backend": {
+                            "default": "ingressNginx",
+                            "description": "Which implementation carries out the pinning (ADR-0080 decision 1).\nDefaults to [`AffinityBackend::IngressNginx`], so a CR written before\nthis field existed keeps the backend it already runs, with the same\n`subsetSize` and `key` semantics.\n\n`ingressNginx` is deprecated: ingress-nginx is retiring upstream, and a\ncluster using it gets an `IngestAffinityBackendDeprecated` condition on\nits `RavelCluster` status.",
+                            "enum": [
+                              "ingressNginx",
+                              "ravelNative"
+                            ],
+                            "type": "string"
+                          },
+                          "enabled": {
+                            "default": true,
+                            "description": "Whether affinity is active. Defaults to true, so declaring the block is\nenough. Set it to false to turn affinity off during an incident without\ndeleting the rest of the configuration; the Ingress objects are then\nremoved and rendering returns to the affinity-absent baseline.",
+                            "type": "boolean"
+                          },
+                          "grpc": {
+                            "default": true,
+                            "description": "Also render a second Ingress for OTLP/gRPC (port 4317) carrying\n`nginx.ingress.kubernetes.io/backend-protocol: GRPC`. Defaults to true:\ngRPC is the main OTLP ingest path, and affinity that covers only\nOTLP/HTTP would miss most of the traffic generating the request bill.\nA separate object is required because `backend-protocol` is per-Ingress.",
+                            "type": "boolean"
+                          },
+                          "hosts": {
+                            "description": "Hostnames the ingest Ingress answers on. Empty renders a single\nhost-less rule, which matches any host reaching the controller.\n\nLegacy `backend: ingressNginx` only. `gateway.exposure.gatewayAPI\n.hostnames` is the equivalent field for Gateway API exposure; the two\nare independent and neither reads the other.",
+                            "items": {
+                              "type": "string"
+                            },
+                            "type": "array"
+                          },
+                          "ingressClassName": {
+                            "description": "`spec.ingressClassName` on the rendered Ingress objects. Omit to let the\ncluster's default IngressClass apply.\n\nLegacy `backend: ingressNginx` only. Has no effect under\n`backend: ravelNative`, and no effect on `gateway.exposure.gatewayAPI`\nrouting (Gateway API attachment goes through `exposure.gatewayAPI\n.gatewayRef` instead, ADR-0080 decision 2).",
+                            "nullable": true,
+                            "type": "string"
+                          },
+                          "key": {
+                            "default": {
+                              "source": "authorizationHeader"
+                            },
+                            "description": "Where the load balancer reads tenant identity from. Defaults to the\n`Authorization` header, which is what Ravel itself resolves tenancy\nfrom.",
+                            "properties": {
+                              "headerName": {
+                                "description": "Header name when `source` is `header`. Required in that case, enforced\nby a CEL rule on this object (see [`ravel_cluster_crd`]), and\nconstrained to HTTP token characters by an OpenAPI `pattern` so nothing\nuser-supplied can reach the rendered nginx directive as syntax.",
+                                "nullable": true,
+                                "pattern": "^[A-Za-z0-9][A-Za-z0-9-]{0,62}$",
+                                "type": "string"
+                              },
+                              "source": {
+                                "default": "authorizationHeader",
+                                "description": "The identity source. Defaults to\n[`AffinityKeySource::AuthorizationHeader`].",
+                                "enum": [
+                                  "authorizationHeader",
+                                  "header",
+                                  "mtlsSubject",
+                                  "canonicalTenant"
+                                ],
+                                "type": "string"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "routerImage": {
+                            "description": "Container image for the `ravel-ingest-router` Deployment rendered under\n[`AffinityBackend::RavelNative`] (ADR-0080 decision 3).\n\nThe router is a DIFFERENT binary from `spec.image` (which is\n`ravel-server`), so its image cannot be derived from `spec.image` and is\nnamed explicitly here. Deriving it by string-manipulating `spec.image`\nwould be fragile: an image reference host can carry a port\n(`localhost:5000/ravel-server:v1`), so any split-on-`:` guess breaks.\n\nRequired when `backend: ravelNative`: the operator surfaces a `Degraded`\nstatus condition (reason `RouterImageMissing`) and renders no router\nobjects when it is absent, rather than a Deployment with an empty\n`image:` that would never schedule. Has no effect under\n`backend: ingressNginx`.",
+                            "nullable": true,
+                            "type": "string"
+                          },
+                          "subsetSize": {
+                            "default": 2,
+                            "description": "How many replicas a tenant's traffic is pinned to. Defaults to\n[`DEFAULT_AFFINITY_SUBSET_SIZE`] (two), not one, so a single replica\nloss does not concentrate a tenant on one process.\n\nA subset is a throughput ceiling by construction: a tenant can use at\nmost `subsetSize` gateway replicas no matter how many the Deployment\nruns. Raise it for a high-volume tenant (see\n`docs/guides/ingest-affinity.md`); the request-cost divisor is\n`replicas / subsetSize`.\n\nThis is a per-cluster setting, not per-tenant: ingress-nginx's subset\nsize is one number per Ingress. A tenant needing a materially larger\nsubset than its siblings belongs in its own `RavelCluster`.",
+                            "format": "uint32",
+                            "minimum": 1.0,
+                            "type": "integer"
+                          },
+                          "tlsSecretName": {
+                            "description": "TLS Secret for `spec.tls` on the rendered Ingress objects. Strongly\nrecommended and effectively required for the gRPC Ingress: ingress-nginx\nserves HTTP/2 to clients over TLS, and OTLP/gRPC needs HTTP/2. Tenant\ntokens are bearer tokens, so plaintext ingest exposes them.\n\nLegacy `backend: ingressNginx` only. Gateway API exposure terminates\nTLS at the referenced `Gateway`'s own listener, which this operator\ndoes not render; configure `tls.certificateRefs` on that Gateway\ndirectly (ADR-0080 decision 2).",
+                            "nullable": true,
+                            "type": "string"
+                          }
+                        },
+                        "type": "object",
+                        "x-kubernetes-validations": [
+                          {
+                            "message": "gateway.ingestAffinity.key.headerName is required when key.source is \"header\"",
+                            "rule": "!has(self.key) || !has(self.key.source) || self.key.source != 'header' || (has(self.key.headerName) && self.key.headerName != '')"
+                          }
+                        ]
+                      },
+                      "replicas": {
+                        "default": 1,
+                        "description": "Replica count for the gateway Deployment.",
+                        "format": "int32",
+                        "minimum": 1.0,
+                        "type": "integer"
+                      },
+                      "resources": {
+                        "description": "Container resource requests/limits.",
+                        "nullable": true,
+                        "properties": {
+                          "limits": {
+                            "additionalProperties": {
+                              "type": "string"
+                            },
+                            "description": "Resource ceilings (`resources.limits`).",
+                            "nullable": true,
+                            "type": "object"
+                          },
+                          "requests": {
+                            "additionalProperties": {
+                              "type": "string"
+                            },
+                            "description": "Minimum guaranteed resources (`resources.requests`).",
+                            "nullable": true,
+                            "type": "object"
+                          }
+                        },
+                        "type": "object"
+                      }
+                    },
+                    "type": "object",
+                    "x-kubernetes-validations": [
+                      {
+                        "message": "gateway.exposure.gatewayApi cannot be combined with an enabled gateway.ingestAffinity on backend: ingressNginx -- traffic on the Gateway API path would bypass the nginx subset annotations entirely; use backend: ravelNative or disable ingestAffinity",
+                        "rule": "!has(self.exposure) || !has(self.exposure.gatewayApi) || !has(self.ingestAffinity) || !has(self.ingestAffinity.enabled) || !self.ingestAffinity.enabled || !has(self.ingestAffinity.backend) || self.ingestAffinity.backend != 'ingressNginx'"
+                      },
+                      {
+                        "message": "gateway.ingestAffinity.key.source canonicalTenant requires backend: ravelNative -- ingress-nginx cannot run the ravel-tenant-resolve auth chain that canonical-tenant hashing needs",
+                        "rule": "!has(self.ingestAffinity) || !has(self.ingestAffinity.key) || !has(self.ingestAffinity.key.source) || self.ingestAffinity.key.source != 'canonicalTenant' || !has(self.ingestAffinity.backend) || self.ingestAffinity.backend != 'ingressNginx'"
+                      }
+                    ]
+                  },
+                  "image": {
+                    "description": "Container image for every mode's pod (`ravel-server`).",
+                    "type": "string"
+                  },
+                  "imagePullPolicy": {
+                    "description": "Image pull policy (`Always`, `IfNotPresent`, `Never`). Defaults to the\nKubernetes default (`IfNotPresent`, or `Always` for a `:latest` tag)\nwhen unset.",
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "maintain": {
+                    "default": {
+                      "enabled": true,
+                      "replicas": 1
+                    },
+                    "description": "Background maintenance tier (compaction, retention, GC). Defaults to a\nsingle replica; the bounded multi-worker ownership protocol (ADR-0065)\nmakes `replicas > 1` safe, superseding ADR-0034's single-replica\nguidance.",
+                    "properties": {
+                      "credentialsSecretRef": {
+                        "description": "Per-role S3 credential override for the maintain tier (ADR-0055 section 5).\nWhen set, the maintain Deployment sources `RAVEL_S3_ACCESS_KEY` /\n`RAVEL_S3_SECRET_KEY` from this Secret (keys `accessKeyId` /\n`secretAccessKey`) instead of the shared `storage.s3.credentialsSecretRef`.\nMaintain is the only role ADR-0055 grants delete, so this is where an\noperator points the delete-capable credential. Falls back to the shared\ncredential when unset, so existing single-credential clusters are\nunaffected.",
+                        "nullable": true,
+                        "properties": {
+                          "name": {
+                            "description": "Name of the Secret.",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "name"
+                        ],
+                        "type": "object"
+                      },
+                      "enabled": {
+                        "default": true,
+                        "description": "Whether the maintain Deployment exists at all. Defaults to true.",
+                        "type": "boolean"
+                      },
+                      "intervalSecs": {
+                        "description": "How often the maintenance task wakes, in seconds\n(`--maintain-interval-secs`).",
+                        "format": "uint64",
+                        "minimum": 0.0,
+                        "nullable": true,
+                        "type": "integer"
+                      },
+                      "replicas": {
+                        "default": 1,
+                        "description": "Replica count for the maintain Deployment. Defaults to 1. Values above 1\nare made safe by the ADR-0065 ownership protocol (rendezvous over a\nheartbeat-derived live worker set); the workers coordinate entirely\nthrough the shared object store, so no additional per-pod wiring is\nneeded beyond `--mode maintain` and the shared store flags. Omit to keep\ntoday's single-replica behavior.",
+                        "format": "int32",
+                        "minimum": 1.0,
+                        "type": "integer"
+                      },
+                      "resources": {
+                        "description": "Container resource requests/limits.",
+                        "nullable": true,
+                        "properties": {
+                          "limits": {
+                            "additionalProperties": {
+                              "type": "string"
+                            },
+                            "description": "Resource ceilings (`resources.limits`).",
+                            "nullable": true,
+                            "type": "object"
+                          },
+                          "requests": {
+                            "additionalProperties": {
+                              "type": "string"
+                            },
+                            "description": "Minimum guaranteed resources (`resources.requests`).",
+                            "nullable": true,
+                            "type": "object"
+                          }
+                        },
+                        "type": "object"
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "query": {
+                    "default": {
+                      "replicas": 1
+                    },
+                    "description": "Query tier.",
+                    "properties": {
+                      "credentialsSecretRef": {
+                        "description": "Per-role S3 credential override for the query tier (ADR-0055 section 5).\nWhen set, the query Deployment sources `RAVEL_S3_ACCESS_KEY` /\n`RAVEL_S3_SECRET_KEY` from this Secret (keys `accessKeyId` /\n`secretAccessKey`) instead of the shared `storage.s3.credentialsSecretRef`,\nso an operator can scope the query tier to a narrower IAM credential. Falls\nback to the shared credential when unset, so existing single-credential\nclusters are unaffected.",
+                        "nullable": true,
+                        "properties": {
+                          "name": {
+                            "description": "Name of the Secret.",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "name"
+                        ],
+                        "type": "object"
+                      },
+                      "replicas": {
+                        "default": 1,
+                        "description": "Replica count for the query Deployment.",
+                        "format": "int32",
+                        "minimum": 1.0,
+                        "type": "integer"
+                      },
+                      "resources": {
+                        "description": "Container resource requests/limits.",
+                        "nullable": true,
+                        "properties": {
+                          "limits": {
+                            "additionalProperties": {
+                              "type": "string"
+                            },
+                            "description": "Resource ceilings (`resources.limits`).",
+                            "nullable": true,
+                            "type": "object"
+                          },
+                          "requests": {
+                            "additionalProperties": {
+                              "type": "string"
+                            },
+                            "description": "Minimum guaranteed resources (`resources.requests`).",
+                            "nullable": true,
+                            "type": "object"
+                          }
+                        },
+                        "type": "object"
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "retention": {
+                    "description": "Age-based retention: a default window plus per-tenant overrides. Enforced\nonly by the maintain tier, so these render onto the maintain Deployment.",
+                    "nullable": true,
+                    "properties": {
+                      "default": {
+                        "description": "Default age-based retention window as a humantime duration (`30d`,\n`720h`). Omitted means no default retention.",
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "tenants": {
+                        "additionalProperties": {
+                          "type": "string"
+                        },
+                        "description": "Per-tenant retention overrides: tenant name to humantime duration.",
+                        "type": "object"
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "shardOverrides": {
+                    "description": "Per-tenant shard-count overrides (#147, ADR-0076 decision 2): the\nprimary operator-facing cost control, wired to the already-shipped\nADR-0052 online-resharding mechanism. Distinct from the immutable,\ncluster-wide `shards` field above: this drives a durable\n`append_generation` call per named tenant, never a Deployment\n`--shards` flag, and does not relax `shards`'s own CEL immutability\nrule (see [`ravel_cluster_crd`]).",
+                    "nullable": true,
+                    "properties": {
+                      "leadHours": {
+                        "default": 2,
+                        "description": "Hours of lead time before the new count activates, passed to\n`append_generation` as `activation_hour = now_hour + leadHours`.\nEnforced to be at least [`MIN_RESHARD_LEAD_HOURS`] -- the same bound\n`ravel-cli provision reshard` enforces (`services/ravel-cli/src/\nprovision.rs`) -- rejected outright rather than silently clamped up,\nsince a shorter lead could let a live writer route past the\nactivation on a view it had not yet refreshed.",
+                        "format": "uint32",
+                        "minimum": 0.0,
+                        "type": "integer"
+                      },
+                      "tenants": {
+                        "additionalProperties": {
+                          "format": "uint32",
+                          "minimum": 0.0,
+                          "type": "integer"
+                        },
+                        "description": "Per-tenant shard-count targets: tenant name to desired shard count.\nApplied independently to every ingested signal (metrics, logs, spans).\nA tenant absent here keeps whatever count its provisioning record (or,\nabsent one, the cluster's day-one `spec.shards`) already has.",
+                        "type": "object"
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "shards": {
+                    "description": "Shard count, rendered into `--shards` for gateway, query, and maintain\nalike so the must-match invariant is unrepresentable to break\n(ADR-0034 decision 2). Immutable after creation, enforced by a CEL\ntransition rule on this field's schema (see [`ravel_cluster_crd`]).",
+                    "format": "uint32",
+                    "minimum": 1.0,
+                    "type": "integer",
+                    "x-kubernetes-validations": [
+                      {
+                        "message": "shards is immutable after creation; use spec.shardOverrides for per-tenant resharding (ADR-0052)",
+                        "rule": "self == oldSelf"
+                      }
+                    ]
+                  },
+                  "storage": {
+                    "description": "Object storage backend. S3 only: a per-process memory store is\nincoherent across pods (ADR-0034 decision 2).",
+                    "properties": {
+                      "s3": {
+                        "description": "S3 (or S3-compatible) backend.",
+                        "properties": {
+                          "bucket": {
+                            "description": "Bucket name (`--s3-bucket`).",
+                            "type": "string"
+                          },
+                          "credentialsSecretRef": {
+                            "description": "Secret with keys `accessKeyId` and `secretAccessKey`, injected as the\n`RAVEL_S3_ACCESS_KEY` / `RAVEL_S3_SECRET_KEY` env vars.",
+                            "properties": {
+                              "name": {
+                                "description": "Name of the Secret.",
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "name"
+                            ],
+                            "type": "object"
+                          },
+                          "endpoint": {
+                            "description": "Custom endpoint (`--s3-endpoint`) for S3-compatible backends such as\nMinIO or floci. Omit for real AWS S3.",
+                            "nullable": true,
+                            "type": "string"
+                          },
+                          "region": {
+                            "default": "us-east-1",
+                            "description": "AWS region (`--s3-region`). Defaults to `us-east-1`.",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "bucket",
+                          "credentialsSecretRef"
+                        ],
+                        "type": "object"
+                      }
+                    },
+                    "required": [
+                      "s3"
+                    ],
+                    "type": "object"
+                  },
+                  "tenantTokensSecretRef": {
+                    "description": "Secret whose keys are tenant names and whose values are the bearer\ntokens for those tenants. The operator renders `--tenant-token\n$(VAR)=<tenant>` using kubelet `$(VAR)` expansion so token values never\nappear in the Pod spec.\n\nWARNING: `ravel-server`'s `parse_tenant_tokens`\n(`services/ravel-server/src/config.rs`) splits each `--tenant-token`\nargument on the FIRST `=` via `str::split_once('=')`. A token VALUE that\ncontains `=` is therefore mis-parsed (the suffix after the first `=` is\ntaken as part of the tenant, not the token). This is pre-existing\nbehavior in a different crate, out of this operator's scope to change;\nchoose token values without `=` until a native token source lands.",
+                    "nullable": true,
+                    "properties": {
+                      "name": {
+                        "description": "Name of the Secret.",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "name"
+                    ],
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "image",
+                  "shards",
+                  "storage"
+                ],
+                "type": "object"
+              },
+              "status": {
+                "description": "Observed status (ADR-0034 decision 2). Written by the operator on the status\nsubresource.",
+                "nullable": true,
+                "properties": {
+                  "conditions": {
+                    "description": "Standard Kubernetes conditions: `Available`, `Progressing`, `Degraded`.",
+                    "items": {
+                      "description": "A standard Kubernetes status condition (the `metav1.Condition` shape). Kept\nas a local type rather than `k8s-openapi`'s `Condition` so the status schema\nderives from `schemars` without the `k8s-openapi` schemars coupling.",
+                      "properties": {
+                        "lastTransitionTime": {
+                          "description": "RFC3339 timestamp of the last transition.",
+                          "nullable": true,
+                          "type": "string"
+                        },
+                        "message": {
+                          "description": "Human-readable message.",
+                          "type": "string"
+                        },
+                        "observedGeneration": {
+                          "description": "The `.metadata.generation` the condition was set against.",
+                          "format": "int64",
+                          "nullable": true,
+                          "type": "integer"
+                        },
+                        "reason": {
+                          "description": "Machine-readable reason (PascalCase).",
+                          "type": "string"
+                        },
+                        "status": {
+                          "description": "`True`, `False`, or `Unknown`.",
+                          "type": "string"
+                        },
+                        "type": {
+                          "description": "Condition type, e.g. `Available`.",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "message",
+                        "reason",
+                        "status",
+                        "type"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "gatewayReadyReplicas": {
+                    "description": "Ready replicas reported by the gateway Deployment.",
+                    "format": "int32",
+                    "nullable": true,
+                    "type": "integer"
+                  },
+                  "maintainReadyReplicas": {
+                    "description": "Ready replicas reported by the maintain Deployment.",
+                    "format": "int32",
+                    "nullable": true,
+                    "type": "integer"
+                  },
+                  "observedGeneration": {
+                    "description": "The `.metadata.generation` this status reflects.",
+                    "format": "int64",
+                    "nullable": true,
+                    "type": "integer"
+                  },
+                  "queryReadyReplicas": {
+                    "description": "Ready replicas reported by the query Deployment.",
+                    "format": "int32",
+                    "nullable": true,
+                    "type": "integer"
+                  }
+                },
+                "type": "object"
+              }
+            },
+            "required": [
+              "spec"
+            ],
+            "title": "RavelCluster",
+            "type": "object"
+          }
+        },
+        "served": true,
+        "storage": true,
+        "subresources": {
+          "status": {}
+        }
+      }
+    ]
+  }
+}

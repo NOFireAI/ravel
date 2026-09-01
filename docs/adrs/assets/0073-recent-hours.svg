@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 520" font-family="'Segoe Print','Bradley Hand','Comic Sans MS',cursive" font-size="15">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 1 1.5 Q 6 4 8.5 5 Q 6 6 1 8.5" fill="none" stroke="#444" stroke-width="1.6" stroke-linecap="round"/>
+    </marker>
+  </defs>
+  <rect width="940" height="520" fill="#fdfcf8"/>
+  <text x="24" y="34" font-size="20" fill="#1b2230">One snapshot, two admission rules (ADR-0073)</text>
+
+  <!-- timeline -->
+  <path d="M 60 90 Q 400 86 880 90" fill="none" stroke="#444" stroke-width="2" marker-end="url(#a)" stroke-linecap="round"/>
+  <text x="845" y="78" font-size="12" fill="#5b6472">now</text>
+  <!-- watermark tick -->
+  <path d="M 560 60 Q 562 150 558 470" fill="none" stroke="#8a6d1f" stroke-width="2" stroke-dasharray="8 5" stroke-linecap="round"/>
+  <text x="470" y="60" font-size="13" fill="#8a6d1f">fold watermark</text>
+
+  <!-- sealed region -->
+  <path d="M 60 120 Q 58 117 65 117 L 530 115 Q 537 116 536 123 L 537 260 Q 536 267 529 266 L 66 268 Q 59 267 60 260 Z" fill="#eef3f7" stroke="#31536b" stroke-width="2.2" stroke-linecap="round"/>
+  <text x="80" y="147" fill="#31536b">sealed hours (snapshot parts)</text>
+  <text x="80" y="175" font-size="13" fill="#5b6472">postings-pruned, folded, few L1 parts</text>
+  <!-- little segments -->
+  <path d="M 82 200 h 52 v 30 h -52 Z M 150 202 h 52 v 30 h -52 Z M 218 200 h 52 v 30 h -52 Z" fill="#fff" stroke="#31536b" stroke-width="1.6" stroke-linecap="round"/>
+  <text x="290" y="222" font-size="13" fill="#5b6472">counted vs max_segments</text>
+  <text x="80" y="253" font-size="12" fill="#31536b">rule: sealed count &lt;= 1024 (post-prune, all surfaces)</text>
+
+  <!-- recent region -->
+  <path d="M 585 120 Q 583 117 590 117 L 875 115 Q 882 116 881 123 L 882 260 Q 881 267 874 266 L 591 268 Q 584 267 585 260 Z" fill="#f5eede" stroke="#8a6d1f" stroke-width="2.2" stroke-linecap="round"/>
+  <text x="602" y="147" fill="#8a6d1f">open + sealing hours (listed live)</text>
+  <text x="602" y="172" font-size="13" fill="#5b6472">no postings prune, ~2 flushes/s/shard</text>
+  <!-- many tiny segments -->
+  <g fill="#fff" stroke="#8a6d1f" stroke-width="1.2">
+    <path d="M 604 192 h 16 v 14 h -16 Z M 624 194 h 16 v 14 h -16 Z M 644 191 h 16 v 14 h -16 Z M 664 193 h 16 v 14 h -16 Z M 684 192 h 16 v 14 h -16 Z M 704 194 h 16 v 14 h -16 Z M 724 191 h 16 v 14 h -16 Z M 744 193 h 16 v 14 h -16 Z M 764 192 h 16 v 14 h -16 Z M 784 194 h 16 v 14 h -16 Z M 804 191 h 16 v 14 h -16 Z M 824 193 h 16 v 14 h -16 Z M 604 212 h 16 v 14 h -16 Z M 624 214 h 16 v 14 h -16 Z M 644 211 h 16 v 14 h -16 Z M 664 213 h 16 v 14 h -16 Z M 684 212 h 16 v 14 h -16 Z M 704 214 h 16 v 14 h -16 Z" />
+  </g>
+  <text x="602" y="253" font-size="12" fill="#8a6d1f">rule: EXEMPT from count; spend metered instead</text>
+
+  <!-- before strike -->
+  <text x="602" y="292" font-size="13" fill="#b3423a">before: 7200 &gt; 1024 =&gt; TooManySegments (422)</text>
+  <path d="M 598 287 Q 740 291 892 286" fill="none" stroke="#b3423a" stroke-width="1.4" stroke-linecap="round"/>
+
+  <!-- admission seam -->
+  <path d="M 250 330 Q 248 327 255 327 L 640 325 Q 648 326 647 333 L 648 400 Q 647 407 640 406 L 256 408 Q 249 407 250 400 Z" fill="#fff" stroke="#0e7c86" stroke-width="2.4" stroke-linecap="round"/>
+  <text x="270" y="356" fill="#0e7c86">Snapshot::admit(config)  -- one seam</text>
+  <text x="270" y="380" font-size="13" fill="#5b6472">sealed: count check | recent + token: request budget</text>
+  <text x="270" y="399" font-size="12" fill="#5b6472">consumed by engine, SQL executor, 5 providers, exemplars</text>
+
+  <path d="M 300 268 Q 330 300 340 325" fill="none" stroke="#444" stroke-width="1.8" marker-end="url(#a)" stroke-linecap="round"/>
+  <path d="M 730 268 Q 660 300 560 328" fill="none" stroke="#444" stroke-width="1.8" marker-end="url(#a)" stroke-linecap="round"/>
+
+  <!-- budget meter -->
+  <path d="M 250 440 Q 248 437 255 437 L 640 435 Q 648 436 647 443 L 648 492 Q 647 499 640 498 L 256 500 Q 249 499 250 492 Z" fill="#eef3f7" stroke="#31536b" stroke-width="2" stroke-linecap="round"/>
+  <text x="270" y="466" fill="#31536b">max_s3_requests (default 25k, per-tenant)</text>
+  <text x="270" y="490" font-size="12" fill="#5b6472">incremental, on real spend; typed RequestBudgetExceeded</text>
+  <path d="M 448 408 Q 450 420 449 435" fill="none" stroke="#444" stroke-width="1.8" marker-end="url(#a)" stroke-linecap="round"/>
+
+  <!-- token note -->
+  <path d="M 700 330 Q 698 327 705 327 L 900 325 Q 907 326 906 333 L 907 420 Q 906 427 899 426 L 706 428 Q 699 427 700 420 Z" fill="#eaf1ea" stroke="#4c6b45" stroke-width="2" stroke-linecap="round"/>
+  <text x="716" y="356" fill="#4c6b45">min_commit_token</text>
+  <text x="716" y="380" font-size="12" fill="#5b6472">token segments always</text>
+  <text x="716" y="399" font-size="12" fill="#5b6472">admitted: read-your-write</text>
+  <text x="716" y="418" font-size="12" fill="#5b6472">can never 422 on count</text>
+</svg>

@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1060 625" font-family="'Segoe Print','Bradley Hand','Comic Sans MS',cursive" font-size="15">
+  <defs>
+    <marker id="m37" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 1 1.5 Q 6 4 8.5 5 Q 6 6 1 8.5" fill="none" stroke="#444" stroke-width="1.6" stroke-linecap="round"/>
+    </marker>
+  </defs>
+  <rect width="1060" height="625" fill="#fdfcf8"/>
+  <text x="24" y="34" font-size="20" fill="#1b2230">Multi-arch publish: two native builds, one signed index</text>
+  <text x="24" y="54" font-size="12" fill="#5b6472">Per target (server, operator, ingest-router). Nothing is emulated: QEMU-run rustc SIGSEGVs on this workspace.</text>
+
+  <!-- amd64 build -->
+  <path d="M 28 96 Q 25 93 31 93 L 288 91 Q 295 92 294 99 L 295 176 Q 294 182 288 181 L 32 183 Q 26 182 27 176 Z" fill="#eef3f7" stroke="#31536b" stroke-width="2.4" stroke-linecap="round"/>
+  <text x="46" y="120" fill="#31536b">build linux/amd64</text>
+  <text x="46" y="142" font-size="12" fill="#5b6472">ubuntu-latest, native</text>
+  <text x="46" y="159" font-size="12" fill="#5b6472">push-by-digest, NO tag</text>
+  <text x="46" y="176" font-size="12" fill="#5b6472">+ SBOM, provenance=max</text>
+
+  <!-- arm64 build -->
+  <path d="M 28 216 Q 25 213 31 213 L 288 211 Q 295 212 294 219 L 295 296 Q 294 302 288 301 L 32 303 Q 26 302 27 296 Z" fill="#eaf1ea" stroke="#4c6b45" stroke-width="2.4" stroke-linecap="round"/>
+  <text x="46" y="240" fill="#4c6b45">build linux/arm64</text>
+  <text x="46" y="262" font-size="12" fill="#5b6472">arm64-hosted runner, native</text>
+  <text x="46" y="279" font-size="12" fill="#5b6472">push-by-digest, NO tag</text>
+  <text x="46" y="296" font-size="12" fill="#5b6472">+ SBOM, provenance=max</text>
+
+  <line x1="297" y1="138" x2="352" y2="180" stroke="#383e46" stroke-width="2" marker-end="url(#m37)"/>
+  <line x1="297" y1="256" x2="352" y2="214" stroke="#383e46" stroke-width="2" marker-end="url(#m37)"/>
+  <text x="300" y="130" font-size="11" fill="#a04040">digest as an ARTIFACT,</text>
+  <text x="300" y="290" font-size="11" fill="#a04040">never a job output</text>
+
+  <!-- merge -->
+  <path d="M 356 156 Q 352 152 360 152 L 610 150 Q 619 151 618 159 L 620 240 Q 619 248 611 247 L 360 249 Q 353 248 354 240 Z" fill="#fff" stroke="#8a5a10" stroke-width="2.6" stroke-linecap="round"/>
+  <text x="374" y="180" fill="#8a5a10">imagetools create</text>
+  <text x="374" y="202" font-size="12" fill="#5b6472">assembles ONE manifest list</text>
+  <text x="374" y="219" font-size="12" fill="#5b6472">from the two digests, and</text>
+  <text x="374" y="236" font-size="12" fill="#5b6472">this index carries the tags</text>
+
+  <line x1="622" y1="198" x2="678" y2="198" stroke="#383e46" stroke-width="2" marker-end="url(#m37)"/>
+
+  <!-- sign -->
+  <path d="M 682 156 Q 678 152 686 152 L 1010 150 Q 1019 151 1018 159 L 1020 240 Q 1019 248 1011 247 L 686 249 Q 679 248 680 240 Z" fill="#f9eeee" stroke="#a04040" stroke-width="2.6" stroke-linecap="round"/>
+  <text x="700" y="180" fill="#a04040">cosign signs the INDEX digest</text>
+  <text x="700" y="202" font-size="12" fill="#5b6472">not either per-platform digest. Signing one of</text>
+  <text x="700" y="219" font-size="12" fill="#5b6472">those leaves the tagged index unsigned while</text>
+  <text x="700" y="236" font-size="12" fill="#5b6472">every log line still reads as success.</text>
+
+  <!-- verify -->
+  <path d="M 682 286 Q 678 282 686 282 L 1010 280 Q 1019 281 1018 289 L 1020 352 Q 1019 360 1011 359 L 686 361 Q 679 360 680 352 Z" fill="#dde1e7" stroke="#454b54" stroke-width="2.2" stroke-linecap="round"/>
+  <text x="700" y="310" fill="#3a3f47">then verify, against the IMMUTABLE tag</text>
+  <text x="700" y="332" font-size="12" fill="#5b6472">X.Y.Z or manual-&lt;sha&gt;, never latest/X/X.Y: those move.</text>
+  <text x="700" y="349" font-size="12" fill="#5b6472">Assert both platform entries, then cosign verify.</text>
+
+  <line x1="850" y1="251" x2="850" y2="278" stroke="#383e46" stroke-width="2" marker-end="url(#m37)"/>
+
+  <!-- before/after -->
+  <path d="M 28 396 Q 25 393 31 393 L 500 391 Q 507 392 506 399 L 507 468 Q 506 474 500 473 L 32 475 Q 26 474 27 468 Z" fill="#f9eeee" stroke="#a04040" stroke-width="2.2" stroke-linecap="round"/>
+  <text x="46" y="420" fill="#a04040">before: amd64 only</text>
+  <text x="46" y="442" font-size="12" fill="#5b6472">quickstart dies on Apple Silicon with a manifest error,</text>
+  <text x="46" y="459" font-size="12" fill="#5b6472">or runs emulated behind a compose platform: pin</text>
+
+  <path d="M 542 396 Q 538 393 546 393 L 1010 391 Q 1019 392 1018 399 L 1020 468 Q 1019 474 1011 473 L 546 475 Q 539 474 540 468 Z" fill="#eaf1ea" stroke="#4c6b45" stroke-width="2.2" stroke-linecap="round"/>
+  <text x="560" y="420" fill="#4c6b45">after: index with both platforms</text>
+  <text x="560" y="442" font-size="12" fill="#5b6472">docker pulls the native image on either host, and the</text>
+  <text x="560" y="459" font-size="12" fill="#5b6472">compose pins come out (decision 16, publish first)</text>
+
+  <text x="28" y="516" font-size="13" fill="#5b6472">Ordering matters at the end: publish multi-arch, verify the arm64 pull, THEN remove the pins. Unpinning against an</text>
+  <text x="28" y="536" font-size="13" fill="#5b6472">amd64-only image restores the original failure on every arm64 reader's first command.</text>
+  <text x="28" y="562" font-size="13" fill="#a04040">The digest check cannot catch a cross-target artifact mix-up: per-target/per-platform artifact names and the</text>
+  <text x="28" y="582" font-size="13" fill="#a04040">platform-entry assertion are what close that. Cost: six workspace compiles per release, pre-existing waste.</text>
+  <text x="28" y="604" font-size="13" fill="#8a5a10">arm64 build time is unmeasured; the first run sets the explicit timeout the job currently lacks.</text>
+</svg>

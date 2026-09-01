@@ -1,0 +1,216 @@
+# Binary operator corpus (docs/promql-evaluator-plan.md section P7),
+# against crates/ravel-promql-difftest/src/generator.rs's fixed dataset.
+# Every offset is relative to the dataset's base_ts_ms
+# (1_700_000_000_000 ms, i.e. 2023-11-14T22:13:20Z).
+#
+# Covers: scalar/scalar and scalar/vector arithmetic (including atan2),
+# vector/vector one-to-one matching (default, on(), ignoring()), filter-
+# and bool-mode comparisons, NaN/-0.0 comparison edge cases (diff_special_
+# values), group_left/group_right many-to-one matching with label copy,
+# set operators (and/or/unless), and matching-cardinality error cases
+# (diff_dup_left/diff_dup_right, and an implicit-many-to-one on diff_
+# group_left/diff_group_right).
+
+name: instant_scalar_scalar_add
+query: 2 + 3
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_scalar_scalar_mod
+query: 7 % 2
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_scalar_scalar_pow
+query: 2 ^ 10
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_scalar_scalar_atan2
+query: 1 atan2 2
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_scalar_vector_add
+query: diff_gauge_walk + 10
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_vector_scalar_sub
+query: diff_gauge_walk - 10
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_scalar_vector_pow
+query: diff_gauge_walk ^ 2
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_vector_scalar_atan2
+query: diff_gauge_walk atan2 1
+kind: instant
+time: +300s
+mode: unordered
+
+# `diff_agg_group` rather than `diff_gauge_walk`: the walk's sign at any
+# instant depends on the dataset seed, so `diff_gauge_walk > 0` answered with
+# an empty vector for the default seed and this entry pinned nothing about
+# keeping the metric name. The agg-group values are fixed (10/20/20 and
+# 5/5/15), so `> 10` always drops three series and keeps three.
+name: instant_filter_comparison_keeps_name
+query: diff_agg_group > 10
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_bool_comparison
+query: diff_gauge_walk > bool 0
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_le_filter_comparison_keeps_name
+query: diff_gauge_walk <= 0
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_le_bool_comparison
+query: diff_gauge_walk <= bool 0
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_nan_eq_filter_is_empty
+query: diff_special_values == diff_special_values
+kind: instant
+time: +120s
+mode: unordered
+expect: empty
+
+name: instant_nan_ne_bool_is_true
+query: diff_special_values != bool diff_special_values
+kind: instant
+time: +120s
+mode: unordered
+
+name: instant_nan_ge_bool_is_false
+query: diff_special_values >= bool 0
+kind: instant
+time: +120s
+mode: unordered
+
+name: instant_negative_zero_eq_zero
+query: diff_special_values == bool 0
+kind: instant
+time: +150s
+mode: unordered
+
+name: instant_one_to_one_default_match
+query: diff_match_left + diff_match_right
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_one_to_one_on_multi_label_bool
+query: diff_match_left > bool on(job, instance) diff_match_right
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_one_to_one_ignoring_absent_label
+query: diff_match_left != bool ignoring(nonexistent) diff_match_right
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_group_left_many_to_one
+query: diff_group_left * on(job) group_left diff_group_right
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_group_right_one_to_many
+query: diff_group_right * on(job) group_right diff_group_left
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_group_left_copies_label
+query: diff_group_left * on(job) group_left(version) diff_group_meta
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_set_and
+query: diff_match_left and diff_match_right
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_set_or
+query: diff_match_left or diff_match_right
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_set_unless
+query: diff_match_left unless diff_match_right
+kind: instant
+time: +0s
+mode: unordered
+
+name: range_vector_vector_add
+query: diff_match_left + on(job, instance) diff_match_right
+kind: range
+start: +0s
+end: +300s
+step: 30s
+mode: unordered
+
+name: error_duplicate_signature_rhs
+query: diff_dup_left * on(job) diff_dup_right
+kind: instant
+time: +0s
+mode: error
+
+name: error_implicit_many_to_one
+query: diff_group_left * on(job) diff_group_right
+kind: instant
+time: +0s
+mode: error
+
+# Native-histogram binop guard (#524): Prometheus implements real histogram
+# arithmetic/comparison semantics for these, Ravel does not yet and rejects
+# instead of silently combining the histogram element's meaningless
+# placeholder `value` (see ravel-promql's binop.rs `histogram_binop_unsupported`
+# and its unit tests for the full guard). `mode: ravel_error_prom_success`
+# (the same ADR-0030 one-sided-divergence shape used above) asserts exactly
+# this: Ravel errors, Prometheus succeeds, and any other outcome is a real
+# mismatch. `diff_native_hist` is the fixed dataset's native-histogram
+# counter series (see histogram_native.txt).
+
+name: error_scalar_vector_arith_over_histogram
+query: diff_native_hist * 2
+kind: instant
+time: +0s
+mode: ravel_error_prom_success
+
+name: error_vector_vector_arith_over_histogram
+query: diff_native_hist + diff_native_hist
+kind: instant
+time: +0s
+mode: ravel_error_prom_success
+
+name: error_comparison_over_histogram
+query: diff_native_hist > 0
+kind: instant
+time: +0s
+mode: ravel_error_prom_success

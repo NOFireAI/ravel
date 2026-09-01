@@ -1,0 +1,42 @@
+# Keep the build context to what the builder's COPY actually needs: the
+# workspace manifests, crate/service sources, and the vendored proto/ trees the
+# build.rs protox passes compile. Everything below is either a build artifact,
+# local dev state, or documentation the build never reads.
+
+# Rust build artifacts (rebuilt inside the builder stage).
+target/
+**/*.rs.bk
+*.profraw
+
+# Local dev / test state. .claude/ includes any local git worktrees a session
+# left behind (e.g. under .claude/worktrees/); each is a full duplicate source
+# tree that is never needed by the build and has been observed to inflate the
+# build context by an order of magnitude on a dev machine with a few stale
+# ones lying around.
+minio-data/
+.cache/
+.superpowers/
+.claude/
+node_modules/
+.DS_Store
+
+# Version control and CI metadata.
+.git/
+.github/
+.gitignore
+
+# Docs and top-level markdown: not read by any build.rs or by cargo.
+docs/
+*.md
+
+# Deployment manifests and shell scripts: same reason as docs/, and they matter
+# more than docs do. `COPY . .` is one layer, so before these were excluded,
+# editing a Kubernetes manifest or a kind script invalidated the cached builder
+# layer and forced a full release rebuild of the workspace (tens of minutes) to
+# produce a byte-identical binary. No build.rs or cargo target reads either
+# tree; the release binaries do not change when they do.
+deploy/
+scripts/
+
+# Editor/OS cruft.
+**/__pycache__/

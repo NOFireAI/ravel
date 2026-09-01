@@ -1,0 +1,51 @@
+# Nightly deterministic-simulation seed batch (ADR-0068 decision 6).
+#
+# The per-PR smoke batch already runs inside the normal ci.yml check job
+# (ravel-sim's seed_batch_runs_clean test, seeds 1..=5). This workflow is the
+# wide nightly sweep: a contiguous seed range through a full cycle each, every
+# failure naming its seed so it can be replayed locally with
+# RAVEL_SIM_SEED=<seed> cargo test -p ravel-sim. Flaky seeds are determinism
+# bugs by definition, so any red run here is a real bug, never a retry.
+#
+# workflow_dispatch exists both to verify the job on a pushed branch (no local
+# gate can execute a workflow) and to run ad-hoc wider or targeted ranges.
+name: sim-nightly
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      start:
+        description: "First master seed in the batch"
+        required: false
+        default: "1"
+      count:
+        description: "Number of consecutive seeds to run"
+        required: false
+        default: "200"
+
+concurrency:
+  group: sim-nightly
+  cancel-in-progress: false
+
+jobs:
+  seed-batch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: ./.github/actions/free-disk-space
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Run seed batch
+        env:
+          RAVEL_SIM_BATCH_START: ${{ github.event.inputs.start || '1' }}
+          RAVEL_SIM_BATCH_COUNT: ${{ github.event.inputs.count || '200' }}
+        run: cargo run --locked --profile ci -p ravel-sim --example nightly_seed_batch

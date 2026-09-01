@@ -1,0 +1,34 @@
+[package]
+name = "ravel-catalog"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ravel-types = { workspace = true }
+ravel-proto = { workspace = true }
+ravel-commit = { workspace = true }
+ravel-object-store = { workspace = true }
+ravel-segment = { workspace = true }
+ravel-logseg = { workspace = true }
+ravel-cache = { workspace = true }
+prost = { workspace = true }
+uuid = { workspace = true }
+parking_lot = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+zstd = { workspace = true }
+crc32c = { workspace = true }
+blake3 = { workspace = true }
+bytes = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+async-trait = { workspace = true }
+
+[lints]
+workspace = true

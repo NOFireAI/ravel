@@ -1,0 +1,67 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "GatewayList",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::my-ravel-bucket",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": ["t/", "t/*/*/l0/*", "t/*/*/c/*", "t/*/*/admission/*", "t/*/catalog/*/*"]
+        }
+      }
+    },
+    {
+      "Sid": "GatewayRead",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": [
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/l0/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/c/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/prov",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/idem/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/admission/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/*",
+        "arn:aws:s3:::my-ravel-bucket/sys/tenancy",
+        "arn:aws:s3:::my-ravel-bucket/sys/qualification",
+        "arn:aws:s3:::my-ravel-bucket/sys/gc"
+      ]
+    },
+    {
+      "Sid": "GatewayWrite",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": [
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/l0/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/c/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/idem/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/admission/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/prov",
+        "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/snap/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/HEAD",
+        "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/idx/*",
+        "arn:aws:s3:::my-ravel-bucket/sys/tenancy"
+      ]
+    },
+    {
+      "Sid": "GatewayTenantKms",
+      "Effect": "Allow",
+      "Action": ["kms:Encrypt", "kms:GenerateDataKey*", "kms:Decrypt"],
+      "Resource": "arn:aws:kms:us-east-1:111122223333:key/*"
+    },
+    {
+      "Sid": "DenyDeleteProtected",
+      "Effect": "Deny",
+      "Action": ["s3:DeleteObject", "s3:DeleteObjectVersion"],
+      "Resource": [
+        "arn:aws:s3:::my-ravel-bucket/sys/tenancy",
+        "arn:aws:s3:::my-ravel-bucket/sys/qualification",
+        "arn:aws:s3:::my-ravel-bucket/sys/gc",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/prov",
+        "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/u/*/0000/*"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+[package]
+name = "ravel-failure-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dev-dependencies]
+ravel-types = { workspace = true }
+ravel-object-store = { workspace = true }
+ravel-segment = { workspace = true }
+ravel-commit = { workspace = true }
+ravel-catalog = { workspace = true }
+ravel-otlp = { workspace = true }
+ravel-ingest = { workspace = true }
+ravel-promql = { workspace = true }
+ravel-query = { workspace = true }
+opentelemetry-proto = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+uuid = { workspace = true }
+rand = { workspace = true }
+
+[lints]
+workspace = true

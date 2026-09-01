@@ -1,0 +1,29 @@
+# Grafana datasource provisioning for the quickstart (ADR-0081 decision 1).
+#
+# Ravel serves a Prometheus-compatible query API under /api/v1 on its HTTP
+# listener, so a Prometheus-type datasource pointed at ravel-server drives
+# Grafana directly. Grafana appends `/api/v1/query` (etc.) to the URL, so the
+# URL is the base only.
+#
+# SECURITY: the bearer token below is a fixed development credential
+# (`demo-token`, matching ravel-server's --tenant-token in the compose file). It
+# is checked in on purpose, in the same class as the MinIO dev secret; it is not
+# for any network-reachable deployment.
+apiVersion: 1
+
+datasources:
+  - name: Ravel
+    uid: ravel
+    type: prometheus
+    access: proxy
+    url: http://ravel-server:4318
+    isDefault: true
+    editable: true
+    jsonData:
+      httpHeaderName1: Authorization
+      # ravel's query API is not a scrape target, so keep Grafana from probing
+      # the Prometheus buildinfo endpoint it does not serve.
+      prometheusType: Prometheus
+      timeInterval: 10s
+    secureJsonData:
+      httpHeaderValue1: Bearer demo-token

@@ -1,0 +1,93 @@
+# RBAC for the Ravel operator (ADR-0034). Grants exactly what the reconcile
+# loop needs and nothing broader:
+#   - Deployments and Services: full lifecycle for the objects it manages
+#     (create/update/patch for apply, get/list/watch for the informer cache,
+#     delete to remove the maintain Deployment when maintain.enabled is false).
+#   - Ingresses: the same lifecycle, for the ingest-affinity Ingress objects
+#     (ADR-0076 decision 1). Delete is what lets gateway.ingestAffinity.enabled
+#     go back to false without leaving an orphan routing live ingest traffic.
+#   - HTTPRoutes/GRPCRoutes (gateway.networking.k8s.io): the same lifecycle, for
+#     the Gateway API exposure routes (ADR-0080 decision 2). Delete is what lets
+#     gateway.exposure be removed without leaving an orphan route attached to
+#     the Gateway.
+#   - RavelCluster (and its status subresource): watch the spec, write status.
+#   - Secrets: get only. The operator reads the credentials and tenant-token
+#     Secrets to resolve tenant names; it never lists, writes, or watches them.
+#   - ServiceAccounts, Roles, and RoleBindings: the same lifecycle, for the
+#     ravel-native ingest router's own ServiceAccount and its namespaced,
+#     least-privilege Role/RoleBinding (ADR-0080 decision 3). The operator's own
+#     identity needs these verbs to create those objects for the router; delete
+#     is what lets backend: ravelNative be switched away without leaving the
+#     router's RBAC orphaned.
+#   - EndpointSlices (discovery.k8s.io): get/list/watch only. The operator never
+#     reads EndpointSlices itself; it needs this grant because Kubernetes RBAC
+#     escalation prevention forbids creating a Role that grants a permission the
+#     creator does not already hold, and the router's own Role
+#     (crate::reconcile::desired_router_role) grants exactly this on
+#     EndpointSlices. Without it every backend: ravelNative reconcile 403s when
+#     it tries to create the router's Role. Direct grant, not escalate/bind:
+#     least privilege.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ravel-operator
+  namespace: ravel-system
+  labels:
+    app.kubernetes.io/name: ravel-operator
+    app.kubernetes.io/managed-by: ravel-operator
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ravel-operator
+  labels:
+    app.kubernetes.io/name: ravel-operator
+    app.kubernetes.io/managed-by: ravel-operator
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["create", "update", "patch", "get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["create", "update", "patch", "get", "list", "watch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["create", "update", "patch", "get", "list", "watch", "delete"]
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["httproutes", "grpcroutes"]
+    verbs: ["create", "update", "patch", "get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["create", "update", "patch", "get", "list", "watch", "delete"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings"]
+    verbs: ["create", "update", "patch", "get", "list", "watch", "delete"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["ravel.nofire.ai"]
+    resources: ["ravelclusters"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["ravel.nofire.ai"]
+    resources: ["ravelclusters/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ravel-operator
+  labels:
+    app.kubernetes.io/name: ravel-operator
+    app.kubernetes.io/managed-by: ravel-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ravel-operator
+subjects:
+  - kind: ServiceAccount
+    name: ravel-operator
+    namespace: ravel-system

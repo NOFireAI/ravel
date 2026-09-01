@@ -1,0 +1,22 @@
+/target
+/bench/
+**/*.rs.bk
+*.profraw
+.DS_Store
+/minio-data
+/examples/otlp_metrics_fixture.pb
+__pycache__/
+/.superpowers/
+/.cache/
+node_modules/
+
+# Per-developer Claude Code config and its helper scripts. .claude/settings.json
+# is the team's; anything machine-specific belongs in these instead.
+.claude/settings.local.json
+.claude/helpers/
+
+# graft's local graph cache - regenerable, not committed (run `graft build`).
+graft/
+
+# Local, per-checkout state for .claude/guards/epic-status-nudge.mjs.
+.claude/.epic-status-nudge-state.json

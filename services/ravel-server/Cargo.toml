@@ -1,0 +1,230 @@
+[package]
+name = "ravel-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ravel-types = { workspace = true }
+ravel-object-store = { workspace = true }
+ravel-cache = { workspace = true }
+ravel-catalog = { workspace = true }
+ravel-commit = { workspace = true }
+ravel-maintain = { workspace = true }
+# Query-worker registration/liveness and rendezvous slice ownership for the
+# ADR-0071 distributed read fan-out: sys/query/workers heartbeats
+# (ravel_fleet::query_workers) and highest-random-weight slice ownership
+# (ravel_fleet::worker_set).
+ravel-fleet = { workspace = true }
+ravel-ingest = { workspace = true }
+ravel-logseg = { workspace = true }
+ravel-otlp = { workspace = true }
+ravel-remote-write = { workspace = true }
+ravel-query = { workspace = true }
+# Shared tenant-resolution primitives (ADR-0080 decision 3): FallbackResolver is
+# re-exported from `crate::tenant`, and the concrete resolvers reach the wiring
+# via ravel-query's `http` re-export. One resolver implementation, shared with
+# the future ravel-ingest-router.
+ravel-tenant-resolve = { workspace = true }
+ravel-promql = { workspace = true }
+# The exemplars endpoint (ADR-0047 decision 4) reads the RSEG
+# EXEMPLARS section back out of the segments a query already matched, using
+# ravel-segment's public `open_from_full`/`decode_catalog_v5`/
+# `decode_exemplars_section`. It was previously only a dev-dependency (for
+# tests that decode written objects); this promotes the same workspace pin to
+# a normal dependency so the query handler can call those functions.
+ravel-segment = { workspace = true }
+ravel-analytics = { workspace = true }
+# Prost types for the sys/tenancy marker and the recovery manifest
+# (ADR-0050 section 3, proto/ravel/sys.proto).
+ravel-proto = { workspace = true }
+# The sys/tenancy fingerprint hex in startup-refusal errors, and the tenant
+# hash hex in recovery-manifest keys.
+hex = { workspace = true }
+# The recovery-manifest writer's per-process "seen tenant" set.
+parking_lot = { workspace = true }
+# AES-256-GCM for the per-tenant recovery manifest (ADR-0050 section 3). ring
+# is already in this workspace's dependency graph (kube's TLS backend, rustls);
+# pinned directly here rather than through `[workspace.dependencies]` for the
+# same reason `toml` and `reqwest` above are (the workspace root Cargo.toml is
+# outside this task's scope). No new crate enters Cargo.lock: 0.17.x is already
+# resolved.
+ring = "0.17"
+# The gRPC wire-byte-count admission layer is a `tower::Layer`
+# operating on `http::Request<tonic::body::Body>`. `tower` is already a
+# normal (workspace) dependency version; promoted here from dev-only because
+# `wire_byte_count.rs` is production code, not test code. `http` and
+# `http-body` are already resolved in this workspace's dependency graph
+# (tonic/axum/hyper all depend on them); pinned directly here for the same
+# reason `ring` above is -- no new crate enters Cargo.lock.
+tower = { workspace = true }
+http = "1.4"
+http-body = "1.1"
+# OTAP (OpenTelemetry Arrow) ingest, linked only by the `otap` feature. It
+# pulls the arrow / arrow-ipc dependency tree, so it stays out of the default
+# build (docs/otap-ingest.md risk mitigation).
+ravel-otap = { workspace = true, optional = true }
+# Stream combinators. The ADR-0071 coordinator (`distrib.rs`)
+# drives the in-process fragment service's `SeriesFetch` frame stream to
+# completion for a self-mapped (no-hop) slice, so `futures` is production code
+# in the default build, not only under `otap` or in tests. The `otap` gRPC
+# service also uses it (one `BatchStatus` per batch); that link no longer needs
+# a `dep:futures` toggle now that the crate is always present.
+futures = { workspace = true }
+tokio = { workspace = true }
+# `channel` (a tonic client transport) is off in tonic's default feature set,
+# which the server binary otherwise keeps. The ADR-0071 coordinator
+# (`distrib.rs`) is a `queryfrag` gRPC *client*: it dials remote query workers
+# to dispatch slices, so the client transport is production code here, not just
+# a test dependency (the dev-dependency below keeps the same feature for the
+# Flight startup test).
+#
+# `tls-ring` + `tls-native-roots` add the client TLS transport the ADR-0071
+# cross-cluster federation client dials a `tls=on` remote cluster
+# over (`--remote-cluster ...,tls=on`): `ClientTlsConfig`/`with_native_roots`
+# come from these features. They are additive over `channel` and inert for a
+# plaintext (`tls=off`) remote and for the intra-cluster coordinator, which
+# stays plaintext `http://`.
+# `gzip` links tonic's server-side gzip decoder so the OTLP services can
+# `.accept_compressed(CompressionEncoding::Gzip)` (ADR-0084 decision 2); the
+# OpenTelemetry Collector and Grafana Alloy send gzip by default.
+tonic = { workspace = true, features = ["channel", "tls-ring", "tls-native-roots", "gzip"] }
+tonic-prost = { workspace = true }
+# rustls 0.23 links a process-level default crypto provider that must be
+# installed before the first TLS endpoint is built. This binary transitively
+# links BOTH the `ring` provider (tonic's `tls-ring` above, kube's `rustls-tls`)
+# and `aws-lc-rs` (ravel-object-store's jsonwebtoken pin), which rustls refuses
+# to disambiguate on its own -- it panics on first use. `start()` installs the
+# `ring` provider explicitly (mirroring services/ravel-operator/src/main.rs) so
+# the ADR-0071 dedicated fragment listener (`tls-ring`) can terminate TLS. The
+# dep is pinned directly, matching the operator crate; it is the same rustls
+# already resolved in the graph, not a new TLS stack.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+# The ADR-0071 `SliceFetcher` trait (ravel_query::distrib::client) is an
+# `#[async_trait]` trait the coordinator's routing fetcher implements, so
+# async-trait is production code here, not only a test dependency.
+async-trait = { workspace = true }
+axum = { workspace = true }
+opentelemetry-proto = { workspace = true }
+prost = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The `--limits-file` admission-limits config (ADR-0051 section 3) is TOML,
+# matching the ADR's chosen format; not in `[workspace.dependencies]` (the
+# workspace root Cargo.toml is outside this task's scope), so pinned directly
+# here with a version, the same convention `ravel-alerting` and `ravel-sql`
+# below use for their path dependencies.
+toml = "1"
+humantime = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+anyhow = { workspace = true }
+# Typed startup-pinning and recovery-manifest errors (ADR-0050 section 3,
+# tenancy.rs); every variant is a specific, named startup refusal.
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+# Query-path OTLP trace export (ADR-0060). Owns the subscriber construction
+# `main` installs; with no --otlp-trace-endpoint it builds today's bare fmt
+# subscriber, so the default build's behavior and runtime dependency footprint
+# are unchanged.
+ravel-tracing-export = { workspace = true }
+bytes = { workspace = true }
+# gzip decompression for OTLP HTTP ingest (ADR-0084). A genuinely new external
+# dependency: the workspace's existing zstd/snap/lz4 codecs cannot decode gzip,
+# and the OpenTelemetry Collector and Grafana Alloy send gzip by default. Used
+# for its `MultiGzDecoder`, which decodes concatenated multi-member streams
+# under one capped reader.
+flate2 = { workspace = true }
+uuid = { workspace = true }
+rand = { workspace = true }
+# The alert evaluator hashes the RLOG object it writes to build the commit
+# record's content_hash, the same hash log ingest computes (ravel-ingest
+# log_shard).
+blake3 = { workspace = true }
+# The webhook and Alertmanager alert sinks POST JSON (ADR-0043 decision 6).
+# Already present in the build graph as this crate's test HTTP client; this
+# promotes the same pinned version to a normal dependency so the sinks can use
+# it, rather than hand-rolling an HTTP/1.1 client with no TLS over
+# `tokio::net::TcpStream`.
+reqwest = { version = "0.13", features = ["json"] }
+
+# ravel-alerting is declared here as a version-pinned path dependency rather
+# than through `[workspace.dependencies]` for the same reason ravel-sql and
+# ravel-rspan below are: the workspace root Cargo.toml is outside this task's
+# scope. The pin keeps cargo-deny from counting it as a wildcard path
+# dependency.
+ravel-alerting = { path = "../../crates/ravel-alerting", version = "0.11.0" }
+
+# ravel-sql is declared here as a path dependency rather than through
+# `[workspace.dependencies]` because the workspace root Cargo.toml is outside
+# this task's scope. The version is pinned so cargo-deny does not count it as
+# a wildcard path dependency, matching how every other
+# internal crate is pinned.
+ravel-sql = { path = "../../crates/ravel-sql", version = "0.11.0", optional = true }
+
+# Flight service codegen for the `flight-sql` feature. This is arrow 58's
+# arrow-flight, a different arrow major than the `arrow` dev-dependency below;
+# the two never exchange types.
+arrow-flight = { workspace = true, optional = true }
+
+[features]
+# OTAP (OpenTelemetry Arrow) metrics ingest on the gRPC listener: registers
+# `ArrowMetricsService` alongside the OTLP gRPC services. Off by default so the
+# default server build links neither `ravel-otap` nor the arrow dependency tree
+# it carries (docs/otap-ingest.md: "the gateway builds without it by default
+# until the bench panel justifies default-on"). Metrics only for now; the OTAP
+# logs and traces services are follow-up work.
+otap = ["dep:ravel-otap"]
+
+# `POST /api/v1/sql`. Off by default: enabling it links datafusion into the
+# server binary, and the SQL surface is opt-in per deployment
+# (ADR-0013 structural isolation).
+sql = ["dep:ravel-sql"]
+
+# Flight SQL on the gRPC listener. Implies `sql`: both surfaces execute through
+# ravel-sql, so there is no deployment that wants Flight without it
+# (the ravel-sql feature matrix). Off by default for
+# the same reason `sql` is. Today this registers an unimplemented service so
+# the wiring and the version pairing are proven; the real methods arrive with
+# ravel-sql's `flight` module.
+flight-sql = ["sql", "ravel-sql/flight-sql", "dep:arrow-flight"]
+
+[dev-dependencies]
+# `query` on top of the normal dependency's `json`: the test client builds
+# query strings the server binary itself never needs to.
+reqwest = { version = "0.13", features = ["json", "query"] }
+# Test-only: `channel` is not in tonic's default feature set, and the Flight
+# startup test needs a gRPC client to call the server it just started. The
+# server binary itself keeps the default (server-only) tonic.
+tonic = { workspace = true, features = ["channel"] }
+snap = { workspace = true }
+# Test-only: the cache warmup deadline test needs virtual time
+# (`tokio::time::pause`/`advance`) to prove a `tokio::time::timeout` fires
+# without the test actually waiting out the real deadline.
+tokio = { workspace = true, features = ["test-util"] }
+# Test-only, same reason for spans: the trace ingest end-to-end test decodes the
+# RSPAN object the write flushed. ravel-rspan (ADR-0041) is new and not yet
+# listed in the workspace [workspace.dependencies]; the root Cargo.toml is out
+# of this task's scope, so this is a version-pinned path dependency (the pin
+# keeps cargo-deny from counting it as a wildcard).
+ravel-rspan = { path = "../../crates/ravel-rspan", version = "0.11.0" }
+uuid = { workspace = true }
+# Real-authn end-to-end test (tests/real_authn_e2e.rs): mint a JWT and build a
+# local oct (HMAC) JWKS so the OIDC resolver runs through a real HTTP request
+# with no network. base64url-encodes the signing secret into the JWK.
+jsonwebtoken = { workspace = true }
+base64 = { workspace = true }
+# Test-only: decodes the Arrow IPC response. This is the workspace arrow pin
+# (59), not the arrow 58 datafusion carries, so the assertion doubles as a
+# check that the IPC bytes the endpoint emits are readable by an independent
+# arrow version rather than only by the one that wrote them.
+arrow = { workspace = true }
+# Test-only: --tenant-kms-config unit tests (src/store.rs) need a real path on
+# disk; a unique NamedTempFile avoids the cross-test collision a hand-rolled
+# std::process::id()-keyed path would risk when tests run on threads within
+# one test binary.
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

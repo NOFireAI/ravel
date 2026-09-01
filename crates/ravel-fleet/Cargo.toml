@@ -1,0 +1,25 @@
+[package]
+name = "ravel-fleet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Fleet-membership primitives: heartbeat live-set and rendezvous ownership shared by maintain and query workers (ADR-0065, ADR-0071)."
+
+[dependencies]
+ravel-types = { workspace = true }
+ravel-object-store = { workspace = true }
+ravel-proto = { workspace = true }
+prost = { workspace = true }
+futures = { workspace = true }
+blake3 = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

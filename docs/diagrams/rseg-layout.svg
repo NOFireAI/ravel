@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1310" height="560" viewBox="0 0 1310 560" font-family="system-ui, sans-serif">
+  <rect x="0" y="0" width="1310" height="740" fill="#f4f5f7"/>
+
+  <text x="30" y="34" font-size="20" font-weight="bold" fill="#17191c">RSEG v7 object byte layout</text>
+  <text x="30" y="54" font-size="12" fill="#4a4f57">docs/segment-format.md + ADR-0004 + ADR-0010 §4 (checksum coverage). ADR-0027 and ADR-0092: v7 is the only readable/writable version.</text>
+
+  <!-- legend -->
+  <g>
+    <rect x="820" y="18" width="330" height="86" rx="6" fill="#eceef1" stroke="#454b54" stroke-width="1.5"/>
+    <rect x="832" y="28" width="16" height="16" rx="3" fill="#a9dcae" stroke="#2f6b34" stroke-width="1.5"/>
+    <text x="856" y="41" font-size="12" fill="#17191c">zstd whole-section (comp=2)</text>
+    <rect x="832" y="50" width="16" height="16" rx="3" fill="#dde1e7" stroke="#454b54" stroke-width="1.5"/>
+    <text x="856" y="63" font-size="12" fill="#17191c">uncompressed container (comp=0)</text>
+    <rect x="832" y="72" width="16" height="16" rx="3" fill="#c9d7ec" stroke="#1f4e79" stroke-width="1.5"/>
+    <text x="856" y="85" font-size="12" fill="#17191c">sparse catalog (at &#8805; 4096 series)</text>
+  </g>
+
+  <!-- main section tape: below-threshold v7 layout -->
+  <text x="30" y="96" font-size="13" font-weight="bold" fill="#17191c">Sections (physical order; readers locate everything through footer offsets)</text>
+
+  <g stroke-width="2">
+    <rect x="30"  y="108" width="150" height="70" rx="6" fill="#a9dcae" stroke="#2f6b34"/>
+    <rect x="184" y="108" width="150" height="70" rx="6" fill="#dde1e7" stroke="#454b54"/>
+    <rect x="338" y="108" width="200" height="70" rx="6" fill="#a9dcae" stroke="#2f6b34"/>
+    <rect x="542" y="108" width="180" height="70" rx="6" fill="#dde1e7" stroke="#454b54"/>
+    <rect x="726" y="108" width="180" height="70" rx="6" fill="#dde1e7" stroke="#454b54"/>
+    <rect x="910" y="108" width="180" height="70" rx="6" fill="#dde1e7" stroke="#454b54"/>
+    <rect x="1094" y="108" width="186" height="70" rx="6" fill="#f7e2b5" stroke="#8a6d1f" stroke-dasharray="6 4"/>
+  </g>
+  <g font-size="13" font-weight="bold" fill="#17191c" text-anchor="middle">
+    <text x="105" y="140">LABEL_DICT</text>
+    <text x="259" y="140">SERIES_IDS</text>
+    <text x="438" y="140">SERIES_META</text>
+    <text x="632" y="140">TS_PAGES</text>
+    <text x="816" y="140">VAL_PAGES</text>
+    <text x="1000" y="140">HIST_PAGES</text>
+    <text x="1187" y="140">EXEMPLARS</text>
+  </g>
+  <g font-size="11" fill="#4a4f57" text-anchor="middle">
+    <text x="105" y="160">kind 1 &#183; zstd</text>
+    <text x="259" y="160">kind 5 &#183; raw</text>
+    <text x="438" y="160">kind 6 &#183; run-major</text>
+    <text x="632" y="160">kind 3 &#183; pages</text>
+    <text x="816" y="160">kind 4 &#183; scalar</text>
+    <text x="1000" y="160">kind 7 &#183; histogram</text>
+    <text x="1187" y="160">kind 10 &#183; optional</text>
+  </g>
+
+  <!-- sparse alternative -->
+  <text x="30" y="212" font-size="13" font-weight="bold" fill="#17191c">At or above 4096 series, the whole SERIES_META (kind 6) is replaced by:</text>
+  <g stroke-width="2">
+    <rect x="338" y="224" width="200" height="56" rx="6" fill="#c9d7ec" stroke="#1f4e79"/>
+    <rect x="542" y="224" width="150" height="56" rx="6" fill="#c9d7ec" stroke="#1f4e79"/>
+  </g>
+  <g font-size="13" font-weight="bold" fill="#17191c" text-anchor="middle">
+    <text x="438" y="248">SERIES_META_CHUNKS</text>
+    <text x="617" y="248">SERIES_IDX</text>
+  </g>
+  <g font-size="11" fill="#4a4f57" text-anchor="middle">
+    <text x="438" y="266">kind 9 &#183; per-chunk zstd frames</text>
+    <text x="617" y="266">kind 8 &#183; sparse id index</text>
+  </g>
+  <text x="710" y="256" font-size="11" fill="#4a4f57">&#8212; a point lookup range-GETs one id window + one meta chunk, each crc-verified.</text>
+
+  <!-- footer + trailer -->
+  <g stroke-width="2">
+    <rect x="30"  y="322" width="470" height="60" rx="6" fill="#f4c869" stroke="#8a5a10"/>
+    <rect x="510" y="322" width="580" height="60" rx="6" fill="#f0d9a0" stroke="#8a5a10"/>
+  </g>
+  <text x="265" y="348" font-size="13" font-weight="bold" fill="#17191c" text-anchor="middle">footer: FooterProto</text>
+  <text x="265" y="368" font-size="11" fill="#4a4f57" text-anchor="middle">identity, event/ingest bounds, sections[], compaction provenance</text>
+  <text x="800" y="342" font-size="13" font-weight="bold" fill="#17191c" text-anchor="middle">trailer (16 bytes)</text>
+  <text x="800" y="362" font-size="11" fill="#4a4f57" text-anchor="middle">footer_len:u32 &#183; footer_crc32c:u32 &#183; version:u16(=7) &#183; signal:u8 &#183; reserved:u8 &#183; magic:"RSG1"</text>
+
+  <!-- checksum coverage -->
+  <text x="30" y="418" font-size="13" font-weight="bold" fill="#17191c">Checksum coverage (a reader verifies exactly the bytes it touches)</text>
+  <g font-size="12" fill="#17191c">
+    <text x="30" y="440">&#8226; footer_crc32c &#8594; FooterProto + the whole trailer except the crc field itself (covers the version byte).</text>
+    <text x="30" y="460">&#8226; Section.crc32c &#8594; each section's full stored bytes, before any content is decoded.</text>
+    <text x="30" y="480">&#8226; page crc &#8594; crc32c(series_id | enc | comp | payload): a mis-planned range or wrong-series read fails closed.</text>
+    <text x="30" y="500">&#8226; sparse partial-fetch: the SERIES_IDS id-window crc32c and the meta-chunk frame crc32c live in SERIES_IDX</text>
+    <text x="46" y="518">(itself always fetched whole and section-crc covered), so a range-GET is verifiable where a whole-section crc cannot.</text>
+    <text x="30" y="538">&#8226; whole-object blake3 recorded in the commit record; its first 16 hex chars are embedded in the data key.</text>
+  </g>
+
+</svg>

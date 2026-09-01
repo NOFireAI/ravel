@@ -1,0 +1,29 @@
+[package]
+name = "ravel-commit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ravel-types = { workspace = true }
+ravel-proto = { workspace = true }
+ravel-object-store = { workspace = true }
+prost = { workspace = true }
+bytes = { workspace = true }
+uuid = { workspace = true }
+hex = { workspace = true }
+crc32c = { workspace = true }
+blake3 = { workspace = true }
+rand = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+serde_json = { workspace = true }
+regex = { workspace = true }
+
+[lints]
+workspace = true

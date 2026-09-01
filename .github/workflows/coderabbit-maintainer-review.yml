@@ -1,0 +1,748 @@
+# Maintainer-gated CodeRabbit review (ADR-0091).
+#
+# The only supported way to obtain a CodeRabbit review of a Ravel pull request.
+# It is dispatched by hand, it proves the dispatching actor holds `maintain` or
+# `admin` on this repository before any credential is reachable, it reads its
+# entire policy from `main`, and it never executes anything from the pull
+# request under review.
+#
+# Two ways in, one gate. A maintainer either dispatches it by hand, or comments
+# `/coderabbit review` on a pull request. Both funnel through the same
+# authorization job, and neither the comment nor the dispatch is the
+# authorization: the effective repository permission of the actor is.
+#
+# Deliberately absent triggers: pull_request, pull_request_target,
+# pull_request_review, workflow_run, repository_dispatch, schedule, push. Each
+# of them would start a review with no human intent behind it at all.
+#
+# `issue_comment` is present, and it widens who can cause a workflow RUN from
+# `write` (who may dispatch) to anyone who can comment, which on a public
+# repository is anyone. It does not widen who can cause a CodeRabbit CALL: an
+# unauthorised comment reaches the `role_name` check, fails, and stops before
+# the environment is requested or a credential exists. `issue_comment` also
+# always runs the copy of this file on the default branch, so a pull request
+# cannot alter the control plane by commenting on itself. A cheap pre-filter on
+# the job keeps drive-by comments from starting a runner at all; it is a noise
+# filter, and it is never the decision.
+#
+# The `coderabbit-oss` environment must exist AND be protected before this can
+# spend anything. Note that referencing an environment that does not exist makes
+# GitHub create it, with no protection rules and no secrets, so the environment
+# existing proves nothing on its own. The `authorize` job therefore checks its
+# protection rules in band and fails closed, rather than trusting that setup
+# happened. See docs/guides/coderabbit-runbook.md.
+
+name: coderabbit-maintainer-review
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Pull request number to review (open, targeting main)"
+        required: true
+        type: string
+      force:
+        description: "Repeat a review of a head SHA already reviewed"
+        required: false
+        default: false
+        type: boolean
+      reason:
+        description: "Audit reason. Required when force is true."
+        required: false
+        default: ""
+        type: string
+  issue_comment:
+    # `created` only. On `edited`, an old comment could be rewritten into a
+    # command and re-trigger, and the edit history is a poor audit record.
+    types: [created]
+
+# Deny by default. Each job re-grants the minimum it needs.
+permissions: {}
+
+# One review in flight per pull request. Not cancel-in-progress: cancelling a
+# run that has already called CodeRabbit would spend the allowance and post
+# nothing.
+concurrency:
+  group: coderabbit-maintainer-review-${{ github.repository }}-${{ github.event.issue.number || inputs.pr_number }}
+  cancel-in-progress: false
+
+env:
+  # A slash command, not a mention. `@coderabbit` is a real and unrelated GitHub
+  # user who would be notified on every invocation, and `@coderabbitai` is the
+  # vendor App's own handle, which would make both the App and this workflow act
+  # on one comment.
+  TRIGGER_COMMAND: "/coderabbit review"
+  TRUSTED_REPOSITORY: NOFireAI/ravel
+  TRUSTED_BASE_BRANCH: main
+  TRUSTED_WORKFLOW_REF: refs/heads/main
+
+jobs:
+  # No secret and no environment reach this job. An unauthorised actor is
+  # rejected here, before the protected environment is ever requested.
+  authorize:
+    name: authorize and validate
+    # Noise filter, not authorization. It keeps an ordinary comment, a bot
+    # comment, and a comment on a plain issue from starting a runner. Author
+    # association appears here and NOWHERE else: it is an extra AND on top of
+    # the real check, never a substitute for it. MEMBER and COLLABORATOR are far
+    # wider than maintainer, and the `role_name` step below is what decides.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.issue.pull_request != null &&
+       github.event.comment.user.type != 'Bot' &&
+       startsWith(github.event.comment.body, '/coderabbit review') &&
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      pr_number: ${{ steps.req.outputs.pr_number }}
+      force: ${{ steps.req.outputs.force }}
+      reason: ${{ steps.req.outputs.reason }}
+      head_sha: ${{ steps.pr.outputs.head_sha }}
+      base_sha: ${{ steps.pr.outputs.base_sha }}
+      actor_role: ${{ steps.actor.outputs.role_name }}
+      config_hash: ${{ steps.policy.outputs.config_hash }}
+      cli_version: ${{ steps.policy.outputs.cli_version }}
+      review_needed: ${{ steps.dedupe.outputs.review_needed }}
+    steps:
+      - name: Assert trusted control plane
+        env:
+          ACTUAL_REPOSITORY: ${{ github.repository }}
+          ACTUAL_EVENT: ${{ github.event_name }}
+          ACTUAL_REF: ${{ github.ref }}
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          fail=0
+          [ "$ACTUAL_REPOSITORY" = "$TRUSTED_REPOSITORY" ] || { echo "::error::repository is $ACTUAL_REPOSITORY, expected $TRUSTED_REPOSITORY"; fail=1; }
+          case "$ACTUAL_EVENT" in
+            workflow_dispatch|issue_comment) ;;
+            *) echo "::error::event is $ACTUAL_EVENT, expected workflow_dispatch or issue_comment"; fail=1 ;;
+          esac
+          # Both events run the copy of this workflow on the default branch, so
+          # this holds for either. GitHub sets GITHUB_REF to the default branch
+          # for issue_comment; if that ever changes, this fails closed and the
+          # feature stops working rather than starting to trust a pull request.
+          [ "$ACTUAL_REF" = "$TRUSTED_WORKFLOW_REF" ] || { echo "::error::workflow ref is $ACTUAL_REF, expected $TRUSTED_WORKFLOW_REF"; fail=1; }
+          [ "$fail" = "0" ] || exit 1
+
+      # One request shape out of two event shapes. Everything downstream reads
+      # these outputs and never touches an event payload again.
+      - name: Resolve and validate the request
+        id: req
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_PR_NUMBER: ${{ inputs.pr_number }}
+          INPUT_FORCE: ${{ inputs.force }}
+          INPUT_REASON: ${{ inputs.reason }}
+          COMMENT_PR_NUMBER: ${{ github.event.issue.number }}
+          # Untrusted text. It is read as data here, matched against a fixed
+          # grammar, and never interpolated into a command.
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          set -Eeuo pipefail
+          umask 077
+
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            pr_number="$INPUT_PR_NUMBER"
+            force="$INPUT_FORCE"
+            reason="$INPUT_REASON"
+          else
+            pr_number="$COMMENT_PR_NUMBER"
+            # Only the first line is a command. A quoted command further down a
+            # comment is prose, and treating it as a command would let one
+            # person's paste act on another person's behalf.
+            first_line=${COMMENT_BODY%%$'\n'*}
+            first_line=${first_line%$'\r'}
+            if [ "$first_line" = "$TRIGGER_COMMAND" ]; then
+              force=false
+              reason=""
+            elif [[ "$first_line" =~ ^"$TRIGGER_COMMAND"[[:space:]]+force:[[:space:]]*(.+)$ ]]; then
+              force=true
+              reason="${BASH_REMATCH[1]}"
+            else
+              echo "::error::comment must be exactly '$TRIGGER_COMMAND' or '$TRIGGER_COMMAND force: <reason>'"
+              exit 1
+            fi
+          fi
+
+          # A positive integer with no leading zero, bounded so it cannot be a
+          # path, a flag, or a denial-of-service length.
+          case "$pr_number" in
+            [1-9]|[1-9][0-9]|[1-9][0-9][0-9]|[1-9][0-9][0-9][0-9]|[1-9][0-9][0-9][0-9][0-9]|[1-9][0-9][0-9][0-9][0-9][0-9]) ;;
+            *) echo "::error::pull-request number must be a positive integer of at most 6 digits"; exit 1 ;;
+          esac
+          case "$force" in
+            true|false) ;;
+            *) echo "::error::force must be true or false"; exit 1 ;;
+          esac
+          if [ "$force" = "true" ]; then
+            trimmed=$(printf '%s' "$reason" | tr -d '[:space:]')
+            if [ -z "$trimmed" ]; then
+              echo "::error::an audit reason is required to repeat a review"
+              exit 1
+            fi
+            if [ "${#reason}" -gt 500 ]; then
+              echo "::error::reason must be at most 500 characters"
+              exit 1
+            fi
+          fi
+          # Every control character out, newlines included, before this crosses
+          # a step boundary: a newline in a reason would let the value forge
+          # further `key=value` lines in GITHUB_OUTPUT. The renderer sanitises
+          # again before any of it reaches a review body.
+          reason=$(printf '%s' "$reason" | tr -d '\000-\037\177')
+
+          {
+            echo "pr_number=$pr_number"
+            echo "force=$force"
+            echo "reason=$reason"
+          } >> "$GITHUB_OUTPUT"
+
+      # Effective repository permission, from GitHub, for the actor GitHub says
+      # dispatched this run. `role_name` is the granular field: the legacy
+      # `permission` field collapses `maintain` into `write`, which would let a
+      # maintainer through only by accident and a write user through on
+      # purpose. Nothing here trusts an input, an author association, an
+      # organization membership, a team, or CODEOWNERS.
+      - name: Verify actor holds maintain or admin
+        id: actor
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          # Both identities are checked. On a re-run `github.actor` stays the
+          # original dispatcher while `github.triggering_actor` becomes whoever
+          # pressed re-run, and re-running a workflow needs only `write`.
+          # Checking one of the two would leave that as a bypass.
+          check_role() {
+            local login="$1"
+            case "$login" in
+              *[!A-Za-z0-9-]*|"") echo "::error::login '$login' has an unexpected shape"; return 1 ;;
+            esac
+            local code=0
+            gh api -H "Accept: application/vnd.github+json" \
+              "repos/${TRUSTED_REPOSITORY}/collaborators/${login}/permission" \
+              > "permission-${login}.json" || code=$?
+            if [ "$code" != "0" ]; then
+              echo "::error::could not establish the effective permission of $login; failing closed"
+              return 1
+            fi
+            local role
+            role=$(jq -r 'if has("role_name") and (.role_name | type) == "string" then .role_name else "unknown" end' "permission-${login}.json")
+            case "$role" in
+              admin|maintain) ;;
+              *)
+                echo "::error::$login has role '$role' on ${TRUSTED_REPOSITORY}; maintain or admin is required"
+                return 1
+                ;;
+            esac
+            printf '%s' "$role"
+          }
+
+          actor_role=$(check_role "$ACTOR")
+          if [ "$TRIGGERING_ACTOR" != "$ACTOR" ]; then
+            check_role "$TRIGGERING_ACTOR" > /dev/null
+          fi
+          echo "role_name=$actor_role" >> "$GITHUB_OUTPUT"
+          echo "$ACTOR is $actor_role; triggered by $TRIGGERING_ACTOR" >> "$GITHUB_STEP_SUMMARY"
+
+      # GitHub creates an environment the first time a workflow names one, with
+      # no protection rules and no secrets. So "the environment exists" is not
+      # evidence that anyone configured it, and an administrator who later adds
+      # the key to that auto-created environment gets no reviewer gate and no
+      # branch restriction while everything looks set up. This asserts the rules
+      # are really there, every run, before the environment is requested.
+      #
+      # Verified on 2026-08-19 that the default GITHUB_TOKEN with
+      # `contents: read` can read both endpoints on this repository.
+      - name: Verify the protected environment is actually protected
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          code=0
+          gh api "repos/${TRUSTED_REPOSITORY}/environments/coderabbit-oss" > env.json || code=$?
+          if [ "$code" != "0" ]; then
+            echo "::error::the coderabbit-oss environment could not be read; create and protect it per docs/guides/coderabbit-runbook.md"
+            exit 1
+          fi
+
+          fail=0
+          reviewers=$(jq '[.protection_rules[] | select(.type == "required_reviewers") | .reviewers // []] | flatten | length' env.json)
+          [ "$reviewers" -gt 0 ] || { echo "::error::coderabbit-oss has no required reviewers"; fail=1; }
+
+          self_review=$(jq -r '[.protection_rules[] | select(.type == "required_reviewers") | .prevent_self_review] | first // false' env.json)
+          [ "$self_review" = "true" ] || { echo "::error::coderabbit-oss does not prevent self-review"; fail=1; }
+
+          custom=$(jq -r '.deployment_branch_policy.custom_branch_policies // false' env.json)
+          protected_only=$(jq -r '.deployment_branch_policy.protected_branches // false' env.json)
+          [ "$custom" = "true" ] || { echo "::error::coderabbit-oss has no custom deployment branch policy"; fail=1; }
+          [ "$protected_only" = "false" ] || { echo "::error::coderabbit-oss admits every protected branch, not only ${TRUSTED_BASE_BRANCH}"; fail=1; }
+
+          gh api "repos/${TRUSTED_REPOSITORY}/environments/coderabbit-oss/deployment-branch-policies" > policies.json || code=$?
+          if [ "$code" != "0" ]; then
+            echo "::error::the coderabbit-oss deployment branch policies could not be read; failing closed"
+            exit 1
+          fi
+          policy_names=$(jq -r '[.branch_policies[] | select(.type == "branch") | .name] | sort | join(",")' policies.json)
+          policy_count=$(jq -r '.branch_policies | length' policies.json)
+          if [ "$policy_names" != "$TRUSTED_BASE_BRANCH" ] || [ "$policy_count" != "1" ]; then
+            echo "::error::coderabbit-oss deployment branches are '${policy_names}' (${policy_count} entries), expected only ${TRUSTED_BASE_BRANCH}"
+            fail=1
+          fi
+
+          [ "$fail" = "0" ] || exit 1
+          echo "coderabbit-oss: ${reviewers} required reviewer(s), self-review prevented, ${TRUSTED_BASE_BRANCH} only" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check out trusted policy from main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+          sparse-checkout: |
+            .github/coderabbit
+          path: trusted
+
+      - name: Hash the trusted policy
+        id: policy
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          cd trusted/.github/coderabbit
+          # Order-independent digest over the two policy files. The renderer is
+          # excluded on purpose: it shapes presentation, not review policy, and
+          # a presentation fix should not invalidate every existing marker.
+          config_hash=$(cat trusted-config.yaml ravel-review-instructions.md | sha256sum | cut -d' ' -f1)
+          # shellcheck disable=SC1091
+          . ./cli-pin.env
+          case "$CODERABBIT_CLI_VERSION" in
+            *[!0-9A-Za-z._-]*|"") echo "::error::pinned CLI version has an unexpected shape"; exit 1 ;;
+          esac
+          echo "config_hash=$config_hash" >> "$GITHUB_OUTPUT"
+          echo "cli_version=$CODERABBIT_CLI_VERSION" >> "$GITHUB_OUTPUT"
+
+      # Every property the rest of the run depends on is read from GitHub once,
+      # here, and treated as immutable afterwards.
+      - name: Validate the pull request
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.req.outputs.pr_number }}
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          code=0
+          gh api -H "Accept: application/vnd.github+json" \
+            "repos/${TRUSTED_REPOSITORY}/pulls/${PR_NUMBER}" > pr.json || code=$?
+          if [ "$code" != "0" ]; then
+            echo "::error::pull request ${PR_NUMBER} could not be read from ${TRUSTED_REPOSITORY}"
+            exit 1
+          fi
+
+          state=$(jq -r '.state // ""' pr.json)
+          base_repo=$(jq -r '.base.repo.full_name // ""' pr.json)
+          base_ref=$(jq -r '.base.ref // ""' pr.json)
+          head_sha=$(jq -r '.head.sha // ""' pr.json)
+          base_sha=$(jq -r '.base.sha // ""' pr.json)
+          changed=$(jq -r '.changed_files // 0' pr.json)
+          additions=$(jq -r '.additions // 0' pr.json)
+          deletions=$(jq -r '.deletions // 0' pr.json)
+
+          fail=0
+          [ "$state" = "open" ] || { echo "::error::pull request is '$state', not open"; fail=1; }
+          [ "$base_repo" = "$TRUSTED_REPOSITORY" ] || { echo "::error::base repository is '$base_repo', expected $TRUSTED_REPOSITORY"; fail=1; }
+          [ "$base_ref" = "$TRUSTED_BASE_BRANCH" ] || { echo "::error::base branch is '$base_ref', expected $TRUSTED_BASE_BRANCH"; fail=1; }
+          [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::head SHA is not a 40-character commit SHA"; fail=1; }
+          [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::base SHA is not a 40-character commit SHA"; fail=1; }
+          [ "$changed" -gt 0 ] || { echo "::error::pull request has no changed files"; fail=1; }
+          [ $((additions + deletions)) -gt 0 ] || { echo "::error::pull request has an empty diff"; fail=1; }
+          [ "$fail" = "0" ] || exit 1
+
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+          echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
+          {
+            echo "PR #${PR_NUMBER}: ${changed} changed file(s), head \`${head_sha}\`, base \`${base_sha}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # One CodeRabbit call per (head SHA, policy, CLI version). The marker is
+      # only trusted when this workflow's own identity wrote it, so a finding or
+      # a contributor comment cannot forge one to suppress a review, and cannot
+      # forge its absence either.
+      - name: Look for an existing review of this exact head
+        id: dedupe
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.req.outputs.pr_number }}
+          FORCE: ${{ steps.req.outputs.force }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          CONFIG_HASH: ${{ steps.policy.outputs.config_hash }}
+          CLI_VERSION: ${{ steps.policy.outputs.cli_version }}
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          # `--paginate` emits one JSON document per page, so the pages are
+          # slurped into a single array here rather than with `--jq`, which
+          # would run per page and leave concatenated arrays behind. pipefail is
+          # set, so a gh failure still fails this step.
+          gh api --paginate -H "Accept: application/vnd.github+json" \
+            "repos/${TRUSTED_REPOSITORY}/pulls/${PR_NUMBER}/reviews" \
+            | jq -s '[.[][] | select(.user.login == "github-actions[bot]") | .body]' > bodies.json
+
+          # Only bodies this workflow's own identity wrote are considered, and
+          # the marker is matched structurally, inside one body, by trusted code
+          # from main. See .github/coderabbit/find-marker.py.
+          found=$(python3 trusted/.github/coderabbit/find-marker.py \
+            "$HEAD_SHA" "$CONFIG_HASH" "$CLI_VERSION" < bodies.json)
+
+          if [ "$found" = "1" ] && [ "$FORCE" != "true" ]; then
+            echo "review_needed=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "### Skipped"
+              echo
+              echo "Head \`${HEAD_SHA}\` was already reviewed under policy \`${CONFIG_HASH}\` with CLI \`${CLI_VERSION}\`."
+              echo "Re-run with \`force\` and an audit reason to review it again."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "review_needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Tells the maintainer the command was heard, without giving anyone else a
+  # way to make this workflow speak. It runs only after authorization succeeded,
+  # so an unauthorised comment gets no reaction and no reply: silence, and a
+  # failed run that only maintainers can see. Both permissions below live here
+  # and nowhere else, and this job never touches pull-request content.
+  #
+  # `pull-requests: write` is required alongside `issues: write` because the
+  # triggering comment always belongs to a pull request (the `authorize` job's
+  # `if` only admits comments where `github.event.issue.pull_request != null`).
+  # The REST docs list reaction endpoints under the "Issues" permission
+  # category, but GitHub's real enforcement for a reaction on a PR-linked
+  # comment also checks `pull-requests`; without it the API returns 403
+  # "Resource not accessible by integration" even though `issues: write` is
+  # present. Confirmed against run 32361349210 on 2026-08-20.
+  ack:
+    name: acknowledge the command
+    needs: authorize
+    if: success() && github.event_name == 'issue_comment'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - name: React to the triggering comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          REVIEW_NEEDED: ${{ needs.authorize.outputs.review_needed }}
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          case "$COMMENT_ID" in
+            ''|*[!0-9]*) echo "::error::comment id has an unexpected shape"; exit 1 ;;
+          esac
+          # eyes: accepted, review starting. +1: this head SHA was already
+          # reviewed under this policy, so nothing was spent.
+          if [ "$REVIEW_NEEDED" = "true" ]; then
+            reaction="eyes"
+          else
+            reaction="+1"
+          fi
+          gh api --method POST -H "Accept: application/vnd.github+json" \
+            "repos/${TRUSTED_REPOSITORY}/issues/comments/${COMMENT_ID}/reactions" \
+            -f "content=${reaction}" > /dev/null
+
+  review:
+    name: review
+    needs: authorize
+    if: needs.authorize.outputs.review_needed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    # The credential lives here and nowhere else. Reaching this job requires a
+    # maintainer approval recorded against the environment, and the environment
+    # only admits runs whose ref is main.
+    environment: coderabbit-oss
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      PR_NUMBER: ${{ needs.authorize.outputs.pr_number }}
+      HEAD_SHA: ${{ needs.authorize.outputs.head_sha }}
+      BASE_SHA: ${{ needs.authorize.outputs.base_sha }}
+      CONFIG_HASH: ${{ needs.authorize.outputs.config_hash }}
+      CLI_VERSION: ${{ needs.authorize.outputs.cli_version }}
+      ACTOR_ROLE: ${{ needs.authorize.outputs.actor_role }}
+      CODERABBIT_CLI_DISABLE_AUTO_UPDATE: "1"
+    steps:
+      - name: Re-assert trusted control plane
+        env:
+          ACTUAL_REPOSITORY: ${{ github.repository }}
+          ACTUAL_EVENT: ${{ github.event_name }}
+          ACTUAL_REF: ${{ github.ref }}
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          [ "$ACTUAL_REPOSITORY" = "$TRUSTED_REPOSITORY" ] || { echo "::error::wrong repository"; exit 1; }
+          [ "$ACTUAL_EVENT" = "workflow_dispatch" ] || { echo "::error::wrong event"; exit 1; }
+          [ "$ACTUAL_REF" = "$TRUSTED_WORKFLOW_REF" ] || { echo "::error::wrong workflow ref"; exit 1; }
+
+      # An environment approval can sit for hours. Re-check both facts that can
+      # change while it waits: the actor's role, and the head SHA.
+      - name: Re-verify actor and pull-request state after approval
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          for login in "$ACTOR" "$TRIGGERING_ACTOR"; do
+            case "$login" in
+              *[!A-Za-z0-9-]*|"") echo "::error::login '$login' has an unexpected shape"; exit 1 ;;
+            esac
+            role=$(gh api "repos/${TRUSTED_REPOSITORY}/collaborators/${login}/permission" \
+              --jq 'if has("role_name") and (.role_name | type) == "string" then .role_name else "unknown" end')
+            case "$role" in
+              admin|maintain) ;;
+              *) echo "::error::$login is '$role' at approval time; refusing"; exit 1 ;;
+            esac
+          done
+          [ "$role" = "$ACTOR_ROLE" ] || echo "::warning::actor role changed from $ACTOR_ROLE to $role since dispatch"
+
+          gh api "repos/${TRUSTED_REPOSITORY}/pulls/${PR_NUMBER}" > pr.json
+          state=$(jq -r '.state // ""' pr.json)
+          now_head=$(jq -r '.head.sha // ""' pr.json)
+          [ "$state" = "open" ] || { echo "::error::pull request is '$state'"; exit 1; }
+          if [ "$now_head" != "$HEAD_SHA" ]; then
+            echo "::error::head moved from $HEAD_SHA to $now_head since validation; refusing to review a stale SHA"
+            exit 1
+          fi
+
+      - name: Check out trusted policy from main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+          sparse-checkout: |
+            .github/coderabbit
+          path: trusted
+
+      # The policy is staged OUTSIDE any pull-request tree, and passed to the
+      # CLI by absolute path. Two things follow. The CLI's own discovery of
+      # `.coderabbit.yaml` never runs, because a non-empty `--config` list
+      # replaces the discovery list rather than adding to it. And the trusted
+      # files cannot collide with a path in the diff, so they cannot silently
+      # replace a changed file's content in the review payload and make the
+      # reviewed diff a lie.
+      - name: Stage the trusted policy outside every pull-request tree
+        id: stage
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          policy_dir="${RUNNER_TEMP}/coderabbit-trusted"
+          mkdir -p "$policy_dir"
+          cp trusted/.github/coderabbit/trusted-config.yaml "$policy_dir/"
+          cp trusted/.github/coderabbit/ravel-review-instructions.md "$policy_dir/"
+          cp trusted/.github/coderabbit/render-findings.py "$policy_dir/"
+          cp trusted/.github/coderabbit/find-marker.py "$policy_dir/"
+          cp trusted/.github/coderabbit/cli-pin.env "$policy_dir/"
+          chmod 0400 "$policy_dir/trusted-config.yaml" "$policy_dir/ravel-review-instructions.md"
+
+          staged_hash=$(cat "$policy_dir/trusted-config.yaml" "$policy_dir/ravel-review-instructions.md" | sha256sum | cut -d' ' -f1)
+          if [ "$staged_hash" != "$CONFIG_HASH" ]; then
+            echo "::error::staged policy hash $staged_hash does not match the authorised $CONFIG_HASH"
+            exit 1
+          fi
+          echo "policy_dir=$policy_dir" >> "$GITHUB_OUTPUT"
+
+      - name: Install the pinned CodeRabbit CLI
+        id: cli
+        env:
+          POLICY_DIR: ${{ steps.stage.outputs.policy_dir }}
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          # shellcheck disable=SC1091
+          . "${POLICY_DIR}/cli-pin.env"
+          [ "$CODERABBIT_CLI_VERSION" = "$CLI_VERSION" ] || { echo "::error::pin file disagrees with the authorised version"; exit 1; }
+          [ "$(uname -m)" = "x86_64" ] || { echo "::error::runner is $(uname -m); the pinned digest covers linux-x64"; exit 1; }
+
+          cli_dir="${RUNNER_TEMP}/coderabbit-cli"
+          mkdir -p "$cli_dir"
+          # The vendor publishes no checksum and no signature. The digest below
+          # comes from .github/coderabbit/cli-pin.env, which is trusted content
+          # on main. No installer script runs, and the CLI cannot self-update.
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --max-time 300 \
+            -o "$cli_dir/coderabbit.zip" \
+            "https://cli.coderabbit.ai/releases/${CODERABBIT_CLI_VERSION}/coderabbit-linux-x64.zip"
+          echo "${CODERABBIT_CLI_SHA256_LINUX_X64}  $cli_dir/coderabbit.zip" > "$cli_dir/SHA256"
+          sha256sum -c "$cli_dir/SHA256"
+          unzip -q -o "$cli_dir/coderabbit.zip" -d "$cli_dir"
+          chmod 0500 "$cli_dir/coderabbit"
+          "$cli_dir/coderabbit" --version
+          echo "cli_bin=$cli_dir/coderabbit" >> "$GITHUB_OUTPUT"
+
+      # Inert data only. Nothing from this tree is built, executed, sourced,
+      # installed, or cached, and the tree is never the working directory of
+      # anything but git and the CodeRabbit CLI, which shells out only to git.
+      - name: Fetch the pull request as review data
+        id: fetch
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          pr_dir="${RUNNER_TEMP}/coderabbit-pr"
+          rm -rf "$pr_dir"
+          mkdir -p "$pr_dir"
+          git init -q "$pr_dir"
+          git -C "$pr_dir" config core.hooksPath /dev/null
+          git -C "$pr_dir" config transfer.fsckObjects true
+          git -C "$pr_dir" config fetch.fsckObjects true
+          git -C "$pr_dir" config receive.fsckObjects true
+          # The remote is this workflow's own constant, never a URL, a branch
+          # name, or a login taken from the pull request. Fork heads are reached
+          # through GitHub's read-only pull-request ref in the base repository.
+          git -C "$pr_dir" remote add origin "https://github.com/${TRUSTED_REPOSITORY}.git"
+          git -C "$pr_dir" fetch --no-tags --quiet origin \
+            "+refs/pull/${PR_NUMBER}/head:refs/remotes/origin/pr-head" \
+            "+refs/heads/${TRUSTED_BASE_BRANCH}:refs/remotes/origin/base"
+
+          fetched_head=$(git -C "$pr_dir" rev-parse refs/remotes/origin/pr-head)
+          if [ "$fetched_head" != "$HEAD_SHA" ]; then
+            echo "::error::pull-request ref resolved to $fetched_head, not the validated $HEAD_SHA"
+            exit 1
+          fi
+          git -C "$pr_dir" cat-file -e "${BASE_SHA}^{commit}" || {
+            echo "::error::validated base SHA $BASE_SHA is not reachable from ${TRUSTED_BASE_BRANCH}"
+            exit 1
+          }
+          # Derived from two immutable inputs, so it is itself immutable for
+          # this run and does not move when main does.
+          merge_base=$(git -C "$pr_dir" merge-base "$BASE_SHA" "$HEAD_SHA")
+          [[ "$merge_base" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::could not compute a diff base"; exit 1; }
+
+          git -C "$pr_dir" checkout -q --detach "$HEAD_SHA"
+          echo "pr_dir=$pr_dir" >> "$GITHUB_OUTPUT"
+          echo "merge_base=$merge_base" >> "$GITHUB_OUTPUT"
+
+      # The only step that can see the credential. Exactly one CodeRabbit call,
+      # for exactly one head SHA. No retry, no second attempt, no partitioning
+      # of a large pull request into several calls.
+      - name: Run CodeRabbit
+        id: run
+        working-directory: ${{ steps.fetch.outputs.pr_dir }}
+        env:
+          CODERABBIT_API_KEY: ${{ secrets.CODERABBIT_API_KEY }}
+          CLI_BIN: ${{ steps.cli.outputs.cli_bin }}
+          POLICY_DIR: ${{ steps.stage.outputs.policy_dir }}
+          MERGE_BASE: ${{ steps.fetch.outputs.merge_base }}
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          if [ -z "${CODERABBIT_API_KEY:-}" ]; then
+            echo "::error::CODERABBIT_API_KEY is not set on the coderabbit-oss environment"
+            exit 1
+          fi
+          out="${RUNNER_TEMP}/coderabbit-findings.jsonl"
+          err="${RUNNER_TEMP}/coderabbit-stderr.txt"
+          rc=0
+          "$CLI_BIN" review \
+            --api-key "$CODERABBIT_API_KEY" \
+            --base-commit "$MERGE_BASE" \
+            --agent \
+            --config "${POLICY_DIR}/trusted-config.yaml" "${POLICY_DIR}/ravel-review-instructions.md" \
+            > "$out" 2> "$err" || rc=$?
+
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          echo "findings=$out" >> "$GITHUB_OUTPUT"
+          # stderr is diagnostics, not review content. It is never echoed raw:
+          # it can carry the model's text, and a log line is a workflow-command
+          # injection surface.
+          if grep -qiE 'rate limit exceeded|too many files|payload_too_large' "$err"; then
+            echo "limited=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "limited=false" >> "$GITHUB_OUTPUT"
+          fi
+          exit 0
+
+      - name: Report a bounded status and stop when the plan limit was reached
+        if: success() && steps.run.outputs.limited == 'true'
+        run: |
+          set -Eeuo pipefail
+          {
+            echo "### CodeRabbit declined this review"
+            echo
+            echo "The Open Source plan limit for this hour was reached, or the pull request exceeds the plan's per-review file limit."
+            echo
+            echo "No retry was attempted, no credit was spent, and the pull request was not split into several reviews. Ravel's CodeRabbit integration has no paid fallback by design (ADR-0091)."
+            echo
+            echo "Dispatch this workflow again later for head \`${HEAD_SHA}\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Render the review body
+        if: success() && steps.run.outputs.limited != 'true'
+        env:
+          POLICY_DIR: ${{ steps.stage.outputs.policy_dir }}
+          FINDINGS: ${{ steps.run.outputs.findings }}
+          MERGE_BASE: ${{ steps.fetch.outputs.merge_base }}
+          ACTOR: ${{ github.actor }}
+          REASON: ${{ needs.authorize.outputs.reason }}
+          CLI_RC: ${{ steps.run.outputs.rc }}
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          if [ "$CLI_RC" != "0" ] && [ ! -s "$FINDINGS" ]; then
+            echo "::error::the CodeRabbit CLI failed (exit $CLI_RC) and produced no findings"
+            exit 1
+          fi
+          python3 "${POLICY_DIR}/render-findings.py" \
+            --findings "$FINDINGS" \
+            --head-sha "$HEAD_SHA" \
+            --base-sha "$MERGE_BASE" \
+            --config-hash "$CONFIG_HASH" \
+            --cli-version "$CLI_VERSION" \
+            --actor "$ACTOR" \
+            --actor-role "$ACTOR_ROLE" \
+            --reason "$REASON" \
+            --out "${RUNNER_TEMP}/review.json"
+
+      # Exactly one review, always COMMENT. The request body is a file, so no
+      # part of the model's output is ever interpolated into a shell word, and
+      # the state, the pull request, and the endpoint are all fixed here.
+      - name: Publish one pull-request review
+        if: success() && steps.run.outputs.limited != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          gh api --method POST -H "Accept: application/vnd.github+json" \
+            "repos/${TRUSTED_REPOSITORY}/pulls/${PR_NUMBER}/reviews" \
+            --input "${RUNNER_TEMP}/review.json" > posted.json
+          review_id=$(jq -r '.id // "unknown"' posted.json)
+          {
+            echo "### Review published"
+            echo
+            echo "Review \`${review_id}\` on PR #${PR_NUMBER} for head \`${HEAD_SHA}\` (COMMENT, policy \`${CONFIG_HASH}\`, CLI \`${CLI_VERSION}\`)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Nothing from this run is uploaded. The repository, the raw model
+      # output, and the CLI's local state all die with the runner.
+      - name: Scrub CodeRabbit state from the runner
+        if: always()
+        run: |
+          set -Eeuo pipefail
+          rm -rf "${HOME}/.coderabbit" "${HOME}/.config/coderabbit" \
+                 "${RUNNER_TEMP}/coderabbit-findings.jsonl" \
+                 "${RUNNER_TEMP}/coderabbit-stderr.txt" \
+                 "${RUNNER_TEMP}/coderabbit-pr" || true

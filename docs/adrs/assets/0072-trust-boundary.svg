@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 560" font-family="'Segoe Print','Bradley Hand','Comic Sans MS',cursive" font-size="15">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 1 1.5 Q 6 4 8.5 5 Q 6 6 1 8.5" fill="none" stroke="#444" stroke-width="1.6" stroke-linecap="round"/>
+    </marker>
+    <marker id="arrR" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 1 1.5 Q 6 4 8.5 5 Q 6 6 1 8.5" fill="none" stroke="#b3423a" stroke-width="1.6" stroke-linecap="round"/>
+    </marker>
+  </defs>
+  <rect width="920" height="560" fill="#fdfcf8"/>
+  <text x="24" y="34" font-size="20" fill="#1b2230">Trust boundaries after ADR-0072</text>
+
+  <!-- process boxes (wobbly rects) -->
+  <path d="M 30 70 Q 28 68 33 67 L 160 65 Q 166 66 165 72 L 167 128 Q 166 134 160 133 L 34 135 Q 29 134 30 128 Z" fill="#eef3f7" stroke="#31536b" stroke-width="2.2" stroke-linecap="round"/>
+  <text x="47" y="93" fill="#31536b">Gateway</text>
+  <text x="47" y="115" font-size="12" fill="#5b6472">role cred (STS ok)</text>
+
+  <path d="M 30 160 Q 27 158 33 157 L 161 156 Q 167 157 166 163 L 166 218 Q 165 224 159 223 L 33 225 Q 28 224 29 218 Z" fill="#eef3f7" stroke="#31536b" stroke-width="2.2" stroke-linecap="round"/>
+  <text x="47" y="184" fill="#31536b">Query</text>
+  <text x="47" y="206" font-size="12" fill="#5b6472">role cred (STS ok)</text>
+
+  <path d="M 30 250 Q 28 248 34 247 L 160 246 Q 167 247 166 253 L 167 308 Q 166 314 160 313 L 34 315 Q 28 314 29 308 Z" fill="#eef3f7" stroke="#31536b" stroke-width="2.2" stroke-linecap="round"/>
+  <text x="47" y="274" fill="#31536b">Maintain</text>
+  <text x="47" y="296" font-size="12" fill="#5b6472">role cred (STS ok)</text>
+
+  <path d="M 30 350 Q 28 348 34 347 L 160 346 Q 166 347 165 353 L 166 408 Q 165 414 159 413 L 33 415 Q 28 414 29 408 Z" fill="#f5eede" stroke="#8a6d1f" stroke-width="2.2" stroke-linecap="round"/>
+  <text x="47" y="374" fill="#8a6d1f">Admin (cli)</text>
+  <text x="47" y="396" font-size="12" fill="#5b6472">sys/auth writer (D4)</text>
+
+  <!-- KmsRoutingStore box -->
+  <path d="M 250 150 Q 248 147 254 147 L 400 145 Q 407 146 406 152 L 407 240 Q 406 246 400 245 L 255 247 Q 249 246 250 240 Z" fill="#fff" stroke="#0e7c86" stroke-width="2.4" stroke-linecap="round"/>
+  <text x="266" y="176" fill="#0e7c86">KmsRoutingStore</text>
+  <text x="266" y="198" font-size="12" fill="#5b6472">wired at store.rs (EL-7)</text>
+  <text x="266" y="217" font-size="12" fill="#5b6472">PUT under t/&lt;hash&gt;/ picks</text>
+  <text x="266" y="234" font-size="12" fill="#5b6472">that tenant's KMS key</text>
+
+  <!-- bucket -->
+  <path d="M 470 60 Q 467 57 474 57 L 880 55 Q 888 56 887 63 L 888 490 Q 887 497 880 496 L 475 498 Q 468 497 469 490 Z" fill="#f4f6f2" stroke="#4c6b45" stroke-width="2.6" stroke-linecap="round"/>
+  <text x="492" y="88" font-size="17" fill="#4c6b45">S3 bucket (only durable truth)</text>
+
+  <!-- tenant A -->
+  <path d="M 495 110 Q 493 108 499 107 L 700 106 Q 706 107 705 113 L 706 185 Q 705 191 699 190 L 500 192 Q 494 191 495 185 Z" fill="#eaf1ea" stroke="#4c6b45" stroke-width="1.8" stroke-dasharray="7 4" stroke-linecap="round"/>
+  <text x="510" y="134" fill="#4c6b45">t/&lt;hashA&gt;/**</text>
+  <text x="510" y="158" font-size="12" fill="#5b6472">SSE-KMS: key A only</text>
+  <text x="510" y="178" font-size="12" fill="#5b6472">cross-tenant read = ciphertext</text>
+
+  <!-- tenant B -->
+  <path d="M 495 210 Q 492 208 498 207 L 701 206 Q 707 207 706 213 L 705 285 Q 704 291 698 290 L 499 292 Q 493 291 494 285 Z" fill="#eaf1ea" stroke="#4c6b45" stroke-width="1.8" stroke-dasharray="7 4" stroke-linecap="round"/>
+  <text x="510" y="234" fill="#4c6b45">t/&lt;hashB&gt;/**</text>
+  <text x="510" y="258" font-size="12" fill="#5b6472">SSE-KMS: key B only</text>
+
+  <!-- control plane -->
+  <path d="M 495 320 Q 493 317 499 317 L 858 315 Q 865 316 864 322 L 865 462 Q 864 468 858 467 L 500 469 Q 494 468 495 462 Z" fill="#f7ecec" stroke="#b3423a" stroke-width="2.2" stroke-linecap="round"/>
+  <text x="512" y="346" fill="#b3423a">protected control plane</text>
+  <text x="512" y="372" font-size="13" fill="#5b6472">sys/*   t/*/*/prov   t/*/*/c/*   catalog HEAD</text>
+  <text x="512" y="398" font-size="12" fill="#b3423a">versioning + Object Lock required (D3)</text>
+  <text x="512" y="420" font-size="12" fill="#5b6472">--require-bucket-protection: Disabled =&gt; refuse start</text>
+  <text x="512" y="442" font-size="12" fill="#5b6472">Unknown =&gt; loud warn + gauge</text>
+
+  <!-- sys/auth note -->
+  <path d="M 728 110 Q 726 108 732 107 L 858 106 Q 864 107 863 113 L 864 240 Q 863 246 857 245 L 733 247 Q 727 246 728 240 Z" fill="#fff" stroke="#8a6d1f" stroke-width="1.8" stroke-linecap="round"/>
+  <text x="742" y="134" fill="#8a6d1f">sys/auth</text>
+  <text x="742" y="158" font-size="12" fill="#5b6472">tenant id: clear</text>
+  <text x="742" y="178" font-size="12" fill="#5b6472">token: keyed hash</text>
+  <text x="742" y="200" font-size="12" fill="#5b6472">revoke by tenant</text>
+  <text x="742" y="220" font-size="12" fill="#5b6472">name, no plaintext</text>
+
+  <!-- arrows -->
+  <path d="M 167 100 Q 215 105 245 165" fill="none" stroke="#444" stroke-width="1.8" marker-end="url(#arr)" stroke-linecap="round"/>
+  <path d="M 166 190 Q 205 192 245 195" fill="none" stroke="#444" stroke-width="1.8" marker-end="url(#arr)" stroke-linecap="round"/>
+  <path d="M 167 280 Q 212 270 246 225" fill="none" stroke="#444" stroke-width="1.8" marker-end="url(#arr)" stroke-linecap="round"/>
+  <path d="M 407 165 Q 445 150 490 145" fill="none" stroke="#444" stroke-width="1.8" marker-end="url(#arr)" stroke-linecap="round"/>
+  <path d="M 407 225 Q 445 235 490 245" fill="none" stroke="#444" stroke-width="1.8" marker-end="url(#arr)" stroke-linecap="round"/>
+  <path d="M 166 380 Q 400 420 490 390" fill="none" stroke="#8a6d1f" stroke-width="1.8" marker-end="url(#arr)" stroke-linecap="round"/>
+  <path d="M 166 372 Q 430 300 723 180" fill="none" stroke="#8a6d1f" stroke-width="1.6" stroke-dasharray="5 5" marker-end="url(#arr)" stroke-linecap="round"/>
+
+  <!-- attacker -->
+  <path d="M 250 470 Q 248 468 254 467 L 400 466 Q 406 467 405 473 L 406 520 Q 405 526 399 525 L 255 527 Q 249 526 250 520 Z" fill="#fff" stroke="#b3423a" stroke-width="2" stroke-linecap="round"/>
+  <text x="264" y="494" fill="#b3423a">leaked role cred</text>
+  <text x="264" y="514" font-size="12" fill="#5b6472">no KMS grants</text>
+  <path d="M 406 480 Q 450 400 492 250" fill="none" stroke="#b3423a" stroke-width="1.8" stroke-dasharray="4 5" marker-end="url(#arrR)" stroke-linecap="round"/>
+  <text x="418" y="330" font-size="12" fill="#b3423a" transform="rotate(-62 418 330)">GET ok, decrypt denied</text>
+</svg>

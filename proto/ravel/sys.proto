@@ -1,0 +1,621 @@
+// Bucket-root system objects under the reserved `sys/` prefix, plus the
+// per-(tenant, signal) provisioning record (ADR-0050). Persistent contract:
+// field numbers are frozen once shipped; only additive changes are allowed.
+// This file holds the tenancy marker and its per-tenant recovery manifest
+// (ADR-0050 section 3), the durable shard_count provisioning record
+// (`t/<tenant_hash>/<sig>/prov`, ADR-0050 section 5, EC5), and the durable
+// GC-config object (`sys/gc`, ADR-0050 section 4, EC4). Each object is its own
+// top-level message and never shares an envelope with the others. Protobuf
+// numbers fields per message, so a new message begins its own field-number
+// space at 1; ProvisioningRecord and GcConfig below reuse no field of
+// TenancyMarker or TenantRecoveryManifest because those are separate messages,
+// not because their low numbers are avoided.
+syntax = "proto3";
+
+package ravel.sys.v1;
+
+// Tenant-hash derivation scheme pinned for a bucket at its birth
+// (ADR-0050 section 3). Selected once and recorded in `sys/tenancy`; a
+// process whose configured scheme disagrees with the recorded one refuses to
+// start rather than opening a silent parallel namespace.
+enum TenantHashScheme {
+  SCHEME_UNSPECIFIED = 0;  // never written; an all-zero/absent marker is invalid
+  V1_UNKEYED = 1;          // unkeyed blake3("ravel-tenant-v1" || tenant_id)
+  V2_KEYED = 2;            // keyed blake3, key derived from the deployment key
+}
+
+// The immutable `sys/tenancy` marker written once (CreateIfAbsent) at the
+// bucket root, never under a tenant prefix, since its whole purpose is to
+// establish the tenant prefixes.
+message TenancyMarker {
+  uint32 format_version = 1;         // = 1
+  TenantHashScheme scheme = 2;
+  // Present only when scheme == V2_KEYED; empty for V1_UNKEYED. 16 bytes:
+  // blake3::derive_key("ravel-tenant-v2-fingerprint", deployment_key)
+  // truncated to 16 bytes. 16 was chosen to match TenantHash's own width
+  // (a familiar length in this layout) and gives 128 bits of collision
+  // resistance for the "wrong key deployed" check, which is far more than a
+  // startup accident needs. This is a fingerprint of the key for detecting a
+  // wrong key before it does damage, never the key itself.
+  bytes key_fingerprint = 3;
+  sfixed64 created_unix_ns = 4;      // informational; when the bucket was pinned
+}
+
+// Per-tenant recovery manifest at `sys/t/<tenant_hash>` (ADR-0050 section 3),
+// written once (CreateIfAbsent, immutable) at a tenant's first write in a
+// keyed bucket. Holds the tenant id encrypted under an AEAD key derived from
+// the deployment key, so bucket-plus-key always suffices to reconstruct the
+// full tenant-id-to-prefix mapping while the bucket alone reveals nothing.
+// Unkeyed buckets never write this object: an unkeyed prefix is trivially
+// reversible given the (small, known) tenant-id space, so there is nothing to
+// recover. Cipher: AES-256-GCM with a 96-bit nonce; the tenant_hash the
+// manifest is keyed under is bound as AEAD associated data, so a manifest
+// cannot be relocated to another tenant's key and still open.
+message TenantRecoveryManifest {
+  uint32 format_version = 1;   // = 1
+  bytes nonce = 2;             // 12 bytes (AES-256-GCM nonce)
+  bytes ciphertext = 3;        // sealed tenant-id UTF-8 bytes, incl. 16-byte tag
+  sfixed64 created_unix_ns = 4;
+}
+
+// Telemetry signal kind (ADR-0050 section 5). Mirrors ravel.commit.v1.Signal
+// value-for-value so a provisioning record's signal decodes to the same
+// ravel_types::Signal a commit record under the same prefix does. Defined
+// here rather than imported so this file stays self-contained; the mapping is
+// pinned by a test in ravel-catalog.
+enum Signal {
+  SIGNAL_UNSPECIFIED = 0;
+  SIGNAL_METRICS = 1;
+  SIGNAL_LOGS = 2;
+  SIGNAL_SPANS = 3;
+  SIGNAL_PROFILES = 4;
+  SIGNAL_ALERTS = 5;
+  SIGNAL_AUDIT = 6;
+}
+
+// The immutable per-(tenant, signal) provisioning record at
+// `t/<tenant_hash>/<sig>/prov` (ADR-0050 section 5, EC5). Written with
+// CreateIfAbsent at a tenant's first write for that signal, and validated on
+// every ingest/catalog/maintain touch: a process whose configured shard_count
+// disagrees with the recorded one refuses to start (static tenant) or fails
+// the request (dynamic tenant) rather than silently resolving over a subset
+// of shards.
+//
+// This is its own top-level message, keyed under the tenant's own prefix (not
+// a bucket-root `sys/` object). The scalar `shard_count` (field 4) is the
+// pinned count of generation 0; ADR-0052 (epic EK) makes the record
+// append-only under CasVersion, adding the `generations` history (field 6)
+// additively. Every existing byte of a written record stays immutable; a
+// reshard only appends one ShardGeneration.
+message ProvisioningRecord {
+  // Format floor: the minimum reader version that understands this record. A
+  // reader that only knows a lower version refuses rather than misreading a
+  // future layout as v1 (matching TenancyMarker's format_version guard). = 1.
+  //
+  // Adding `generations` (field 6) is additive and does NOT bump this floor:
+  // a pre-ADR-0052 reader that skips the unknown field 6 still reads the
+  // scalar `shard_count` as generation 0's count, and a post-0052 reader with
+  // an empty `generations` list reads exactly the same single implicit
+  // generation. There is no layout a v1 reader would misread, so the floor
+  // stays 1 (ADR-0052 section 1, "Sequencing with EC5").
+  uint32 format_version = 1;
+  bytes tenant_hash = 2;       // 16 bytes; the `t/<tenant_hash>/` prefix owner
+  Signal signal = 3;
+  // The pinned shard count for this (tenant, signal). When `generations` is
+  // non-empty this MUST equal `generations[0].shard_count`; when it is empty
+  // this is the single implicit generation 0. Never mutated once written.
+  uint32 shard_count = 4;
+  sfixed64 created_unix_ns = 5;  // informational; when the record was first written
+  // Append-only shard-generation history (ADR-0052 section 1). Empty on every
+  // record EC5 wrote, read as the single implicit generation 0 with
+  // activation_hour 0 and count `shard_count`. A reshard appends exactly one
+  // ShardGeneration whose activation_hour is strictly in the future, via a
+  // CasVersion read-append-write. Decode enforces: dense 0-based generations,
+  // strictly increasing activation_hour, adjacent counts differing, and
+  // generations[0].shard_count == the scalar shard_count above. A record
+  // violating any of these is a typed decode error (fail closed).
+  repeated ShardGeneration generations = 6;
+  // Append-only per-(tenant, signal) format-floor history (ADR-0066 decision 3,
+  // epic EM). Empty on every record written before EM: read as "no floor has
+  // ever been raised for any family". A recorded floor F for family X asserts
+  // that no live object of family X below version F exists for this (tenant,
+  // signal); it is CAS-appended by the migration job's verification step after
+  // an audit-versions enumeration comes back clean, and floors are raised only,
+  // never lowered. The load-bearing consumer is release engineering: deleting a
+  // format version's read support is legal only when every bucket's floor for
+  // that family exceeds the retired version.
+  //
+  // Adding this field is additive and does NOT bump `format_version` (field 1),
+  // for the identical reason `generations` (field 6) did not: a reader that
+  // skips this unknown field still reads every earlier field exactly as before,
+  // and a reader that understands it sees an empty list on every pre-EM record,
+  // which reads identically to "no floors raised". There is no layout a v1
+  // reader would misread, so the floor stays 1 (ADR-0066 decision 3, citing the
+  // ADR-0052 `generations` precedent verbatim).
+  //
+  // Decode enforces, per family, that floor_version is strictly increasing in
+  // append order (floors raised only); a later entry for a family at or below an
+  // earlier entry's floor_version, an empty family, or a zero floor_version is a
+  // typed decode error (fail closed).
+  repeated FormatFloor format_floors = 7;
+}
+
+// One entry in a ProvisioningRecord's append-only shard-generation history
+// (ADR-0052 section 1). Immutable once appended; a reshard adds a new entry,
+// never edits an existing one. Old generations remain valid under their
+// original shard indices forever (no data is ever moved or re-keyed).
+message ShardGeneration {
+  uint32 generation      = 1;  // dense, 0-based
+  uint32 shard_count     = 2;  // 1..=10000 (the 4-digit key field caps it)
+  uint32 activation_hour = 3;  // unix hours; ingest hours >= this route with
+                               // this generation's count
+  int64  appended_unix_ns = 4; // audit only; when this generation was appended
+}
+
+// One entry in a ProvisioningRecord's append-only format-floor history
+// (ADR-0066 decision 3, epic EM). Immutable once appended; raising a floor adds
+// a new entry, never edits an existing one. A recorded floor F for `family`
+// asserts that no live object of that format family below version F exists for
+// the (tenant, signal) the enclosing record governs.
+//
+// `family` is a lowercase format-family identifier ("rseg", "rlog", "rspan",
+// "csnap", ...). EM-T1/EM-T2 established no typed family-naming convention (their
+// `UnsupportedVersion(u16)` variants carry only a numeric version, no family
+// tag), so this string mirrors each format's own on-disk identity: the trailer
+// magics `RSG1`/`RLG1`/`RSP1` lowercased to their format short name. A free-form
+// string (rather than the ADR-0066 sketch's enum) keeps a new format family
+// addable without a proto change, matching the additive-evolution discipline
+// this whole record follows.
+message FormatFloor {
+  string family = 1;         // lowercase format-family id ("rseg", "rlog", ...)
+  uint32 floor_version = 2;  // no live object of `family` below this version; >= 1
+  sfixed64 raised_unix_ns = 3; // when this floor was raised
+  string raised_by = 4;      // job identity that raised it; informational
+}
+
+// The durable, deployment-wide GC configuration at the bucket root `sys/gc`
+// (ADR-0050 section 4, EC4). It is deployment-wide, not per-tenant, so it lives
+// at the bucket root beside `sys/tenancy`, never under a tenant prefix.
+//
+// Written once at bucket bootstrap via CreateIfAbsent (from the maintain
+// defaults, which already satisfy the constraint below) by whichever process
+// first touches a fresh bucket; a racing loser re-reads and validates against
+// the winner's object. It is mutated only by `ravel-cli gc-config set`, which
+// enforces the constraint at write time and swaps the object with CasVersion so
+// a concurrent mutation is caught, never silently overwritten.
+//
+// Every mode validates itself against this object at startup and refuses to
+// start on a real violation (ADR-0050 section 4): maintain's configured horizon
+// and grace must equal the stored values; a query engine's deadline must be
+// <= max_query_duration_ns; a Flight SQL ticket-TTL ceiling must be
+// <= protection_horizon_ns - grace_ns. A process that can read a bootstrapped
+// `sys/gc` and finds a real violation does not start; there is no
+// "assume defaults" path.
+//
+// Its own top-level message, sharing no field number with the markers above.
+message GcConfig {
+  // Format floor: the minimum reader version that understands this record. A
+  // reader that only knows a lower version refuses rather than misreading a
+  // future layout as v1 (matching TenancyMarker/ProvisioningRecord). = 1.
+  uint32 format_version = 1;
+  // The horizon between a deletion anchor and physical deletion. The invariant
+  // this whole object exists to make durable and single-sourced:
+  // protection_horizon_ns >= max_query_duration_ns + grace_ns.
+  sfixed64 protection_horizon_ns = 2;
+  // The shared grace period for the orphan and unreferenced-part age gates.
+  sfixed64 grace_ns = 3;
+  // The longest a single query may run; the query-duration term of the
+  // protection-horizon constraint.
+  sfixed64 max_query_duration_ns = 4;
+  // The longest a flush may stay open; recorded so the value is single-sourced
+  // for the deployment rather than recomputed per process.
+  sfixed64 max_flush_lifetime_ns = 5;
+  // Informational; when this record was last written (bootstrap or a
+  // `gc-config set`).
+  sfixed64 created_unix_ns = 6;
+}
+
+// One process's periodic self-owned admission-usage snapshot for fleet-global
+// admission reconciliation (ADR-0057). Written to
+// `t/<tenant_hash>/<sig>/admission/<process_id>.snapshot` with
+// PutMode::Overwrite: the key has exactly one writer (the owning process), so
+// there is no concurrent writer to race and no CAS. Every reconciliation
+// interval R each process writes its own current usage here and reads every
+// sibling's key to compute the fleet-wide picture (ADR-0057 sections 1-2).
+//
+// Its own top-level message, sharing no field number with the markers above.
+// `active_series_count`/`active_streams_count` are per-signal stocks (a
+// Metrics snapshot fills the first and leaves the second 0; a Logs snapshot the
+// reverse), summed across siblings as a deliberate upper bound (ADR-0057
+// Context: cardinality caps over-count, never under-count). The two
+// `*_consumed_since_last_snapshot` deltas are tenant-wide flow (the byte-rate
+// and creation-rate buckets are per-tenant, shared across signals per
+// ADR-0051), carried identically in every one of a tenant's signal snapshots so
+// any prefix yields the complete tenant flow once siblings are deduplicated by
+// process_id; they are naturally additive across processes.
+message AdmissionUsageSnapshot {
+  // Format floor: the minimum reader version that understands this record,
+  // matching the guard TenancyMarker/ProvisioningRecord/GcConfig use. = 1.
+  uint32 format_version = 1;
+  // Active series tracked for the active-series cap (Signal::Metrics snapshots).
+  uint64 active_series_count = 2;
+  // Active streams tracked for the active-streams cap (Signal::Logs snapshots).
+  uint64 active_streams_count = 3;
+  // Ingest bytes admitted since this process's previous snapshot (tenant-wide).
+  uint64 byte_rate_consumed_since_last_snapshot = 4;
+  // New series/stream identities admitted since the previous snapshot
+  // (tenant-wide: the creation-rate bucket is shared across signals).
+  uint64 series_creation_consumed_since_last_snapshot = 5;
+  // This process's own clock at write time, for staleness exclusion on the
+  // reading side (a sibling older than 2*R is treated as contributing zero,
+  // ADR-0057 section 3).
+  sfixed64 snapshot_unix_ns = 6;
+}
+
+// One maintain-role process's periodic self-owned liveness heartbeat for
+// worker membership (ADR-0065 decision 1, epic EI). Written to
+// `sys/maintain/workers/<process_id>` with PutMode::Overwrite: the key has
+// exactly one writer (the owning process), so there is no concurrent writer to
+// race and no CAS. Every heartbeat interval H (default 60s) each maintain
+// process writes its own snapshot here and lists the prefix to compute the live
+// worker set; a sibling whose heartbeat_unix_ns is older than 3*H at read time
+// is treated as gone and its owned work is taken over (ADR-0065 decision 1).
+// Advisory and reconstructible: losing it costs at most one membership-
+// staleness window of duplicated (idempotent) work, never correctness. This is
+// membership/ownership, deliberately not a lease (the existing LeaseCheck trait
+// is the unrelated GC reader-protection gate; ADR-0065 decision 1).
+//
+// Its own top-level message, sharing no field number with the markers above.
+message WorkerHeartbeat {
+  // Format floor: the minimum reader version that understands this record,
+  // matching the guard every other sys/ message uses. A sibling advertising a
+  // higher version is skipped (treated as absent) rather than misread. = 1.
+  uint32 format_version = 1;
+  // The writing process's UUID (16 bytes). Redundant with the <process_id> in
+  // the object key, carried here too so a snapshot is self-describing; the
+  // reader takes identity from the key.
+  bytes process_id = 2;
+  // This process's clock when it first started. Informational (fleet age and
+  // debugging); never used for the liveness decision, which reads
+  // heartbeat_unix_ns below.
+  sfixed64 started_unix_ns = 3;
+  // This process's clock at write time, for the 3*H staleness check on the
+  // reading side (a sibling older than 3*H is treated as gone, ADR-0065
+  // decision 1).
+  sfixed64 heartbeat_unix_ns = 4;
+}
+
+// The per-tenant key-epoch record at `t/<tenant_hash>/enc` (ADR-0062
+// decision 1b, epic EL). Tenant-scoped, not per-signal: a tenant's KMS key
+// applies across every signal, so this object sits directly under the tenant
+// prefix beside its per-signal `<sig>/prov` records, not under any one signal.
+//
+// Its purpose is auditability of encryption custody. The first time a tenant's
+// KMS key is configured or changed, one KeyEpoch is appended here under
+// CasVersion (the `prov`/`sys/gc` append-within-record pattern): an append-only
+// list where every object's write time locates it in exactly one epoch, so
+// "which key encrypts what" is answerable from the bucket alone, and
+// verify-custody gains an epoch-consistency check. This is a wholly new
+// additive object type (ADR-0062 authorizes it); no existing layout changes
+// and no version bump is required for existing readers.
+//
+// Its own top-level message, sharing no field number with the markers above.
+message KeyEpochRecord {
+  // Format floor: the minimum reader version that understands this record. A
+  // reader that only knows a lower version refuses rather than misreading a
+  // future layout as v1 (matching TenancyMarker/ProvisioningRecord/GcConfig).
+  // = 1.
+  uint32 format_version = 1;
+  bytes tenant_hash = 2;         // 16 bytes; the `t/<tenant_hash>/` prefix owner
+  sfixed64 created_unix_ns = 3;  // informational; when the record was first written
+  // Append-only key-epoch history (ADR-0062 decision 1b). Non-empty once the
+  // record exists: the first configured/changed key writes epoch 0. A key
+  // configuration or rotation appends exactly one KeyEpoch whose activated_ns
+  // is strictly after the last epoch's, via a CasVersion read-append-write.
+  // Decode enforces: dense 0-based epochs and strictly increasing activated_ns.
+  // A record violating either is a typed decode error (fail closed).
+  repeated KeyEpoch epochs = 4;
+}
+
+// One entry in a KeyEpochRecord's append-only key-epoch history (ADR-0062
+// decision 1b). Immutable once appended; a rotation adds a new entry, never
+// edits an existing one. Objects written while an epoch was current stay
+// encrypted under that epoch's key forever (data objects are immutable; no
+// object is ever re-keyed in place, ADR-0062 decision 1d).
+message KeyEpoch {
+  uint32 epoch = 1;          // dense, 0-based
+  // The tenant's KMS key ARN active from activated_ns onward. Empty string
+  // means the deployment default key (or bucket-default SSE), ADR-0062
+  // decision 1c.
+  string key_arn = 2;
+  // Unix ns. Objects written at or after this, and before the next epoch's
+  // activated_ns, are encrypted under this epoch's key.
+  sfixed64 activated_ns = 3;
+}
+
+// The per-tenant lifecycle state recorded in a TenantConfigRecord (ADR-0066
+// decision 6, epic EM). Written explicitly on every config record; a record
+// carrying UNSPECIFIED is corrupt and refused on decode (fail closed), the same
+// discipline every other durable record applies to its own enums (Signal,
+// TenantHashScheme). Its three real states drive the admission/query/maintenance
+// gates the EM-T8 refresh loop consumes: `active` is unrestricted; `suspended`
+// refuses ingest and query but keeps maintenance running; `offboarding` also
+// refuses ingest and query, and keeps maintenance and retention running until
+// the tenant's data is gone (the hook epic EJ / #460 consumes to delete it).
+enum TenantLifecycleState {
+  TENANT_LIFECYCLE_STATE_UNSPECIFIED = 0;  // never written; a record carrying it is corrupt
+  TENANT_LIFECYCLE_STATE_ACTIVE = 1;
+  TENANT_LIFECYCLE_STATE_SUSPENDED = 2;
+  TENANT_LIFECYCLE_STATE_OFFBOARDING = 3;
+}
+
+// The set of attribute keys promoted to indexed columns for one tenant, carried
+// as an optional sub-message of TenantConfigRecord so its three states are
+// distinct: absent sub-message means "no override, use the deployment default";
+// a present sub-message with an empty `fields` list means "override to no
+// indexed fields"; a present non-empty list is the explicit override set.
+message IndexedFieldConfig {
+  repeated string fields = 1;  // attribute keys promoted to indexed columns
+}
+
+// The logical type an operator declares for a promoted logs attribute column
+// (ADR-0090 decision 1). Exactly four declarable types in v1: str/i64/bool/
+// bytes. f64, date, and timestamp are deliberately deferred by ADR-0090
+// (f64 gated on #277's fold-order decision; date/timestamp on a lifting rule),
+// so they are absent here on purpose, not by omission. UNSPECIFIED is the
+// proto3 zero default that is never written; a stored column carrying it is
+// corrupt and refused on decode (fail closed), the same discipline
+// TenantLifecycleState/Signal apply to their own enums.
+enum TypedAttrColumnType {
+  TYPED_ATTR_COLUMN_TYPE_UNSPECIFIED = 0;  // never written; a column carrying it is corrupt
+  TYPED_ATTR_COLUMN_TYPE_STR = 1;
+  TYPED_ATTR_COLUMN_TYPE_I64 = 2;
+  TYPED_ATTR_COLUMN_TYPE_BOOL = 3;
+  TYPED_ATTR_COLUMN_TYPE_BYTES = 4;
+}
+
+// One operator-declared typed attribute column (ADR-0090 decision 1): an
+// attribute key promoted to a native typed logs SQL column, paired with the
+// logical type it is read as. The SQL column name is the key verbatim, never
+// mangled.
+message TypedAttrColumn {
+  string key = 1;                 // the attribute key; the SQL column name, verbatim
+  TypedAttrColumnType type = 2;   // the declared logical type
+}
+
+// The set of attribute keys promoted to native typed logs SQL columns for one
+// tenant (ADR-0090 decision 1), carried as an optional sub-message of
+// TenantConfigRecord so its three states are distinct, exactly like
+// IndexedFieldConfig: absent sub-message means "no override, use the deployment
+// default"; a present sub-message with an empty `columns` list means "override
+// to no declared columns"; a present non-empty list is the explicit ordered
+// declaration. Declaration order is stable and never re-sorted (ADR-0090
+// decision 3).
+message TypedAttrColumnConfig {
+  repeated TypedAttrColumn columns = 1;
+}
+
+// The durable, per-tenant configuration record at `t/<tenant_hash>/config`
+// (ADR-0066 decision 6, epic EM). Moves per-tenant lifecycle state, admission
+// limits, retention, and indexed-field config off process flags and into a
+// durable control object the EM-T8 refresh loop reads on a bounded-staleness
+// horizon (the GenerationSwitch / ADR-0057 pattern) and applies by re-invoking
+// the admission controller's existing `set_tenant_limits`. Defaults still come
+// from flags/limits-file at startup; a present field here overrides the default
+// for this tenant, an absent one leaves the default in place.
+//
+// Under the tenant's own prefix beside its per-signal `<sig>/prov` and
+// tenant-scoped `enc` records, never a bucket-root `sys/` object: it is
+// per-tenant state, like `enc`, not deployment-wide state, like `sys/gc`.
+//
+// Mutation shape: whole-record CAS-replace, mirroring `sys/gc`'s `set_gc_config`
+// (the read-current-version, swap-with-CasVersion pattern), NOT the append-only
+// repeated-field shape of `generations`/`format_floors`/`epochs`. Those histories
+// are append-only because each entry is an immutable historical fact whose order
+// is load-bearing and which must never be lost. A config override is the
+// opposite: a mutable current-state knob whose latest value is the only one that
+// matters, and which must support lowering a limit or clearing an override (a
+// revocation an append-only list cannot express). So the current value is stored
+// in place and swapped under CasVersion; a concurrent write is a caught conflict
+// the loser re-reads, never a silent overwrite.
+//
+// Its own top-level message, sharing no field number with the markers above.
+message TenantConfigRecord {
+  // Format floor: the minimum reader version that understands this record. A
+  // reader that only knows a lower version refuses rather than misreading a
+  // future layout, matching every other durable record's version guard. = 1.
+  uint32 format_version = 1;
+  bytes tenant_hash = 2;              // 16 bytes; the `t/<tenant_hash>/` prefix owner
+  TenantLifecycleState lifecycle_state = 3;
+  // Admission-limit overrides. proto3 explicit presence distinguishes "override
+  // this cap to N" (present) from "no override, use the deployment default"
+  // (absent); the four caps mirror ADR-0051's admission dimensions. A present
+  // value of 0 is a real override (an explicit zero cap), never "unset".
+  optional uint64 max_active_series = 4;
+  optional uint64 max_active_streams = 5;
+  optional uint64 max_ingest_byte_rate = 6;
+  optional uint64 max_series_creation_rate = 7;
+  // Per-tenant retention override, in ns; absent leaves the deployment default.
+  optional sfixed64 retention_ns = 8;
+  // Indexed-field override; absent leaves the deployment default (see
+  // IndexedFieldConfig for the present-but-empty vs absent distinction).
+  IndexedFieldConfig indexed_fields = 9;
+  sfixed64 created_unix_ns = 10;      // informational; when the record was first written
+  sfixed64 updated_unix_ns = 11;      // informational; when it was last swapped
+  // Per-tenant declared typed logs SQL columns (ADR-0090 decision 1); absent
+  // leaves the deployment default (see TypedAttrColumnConfig for the
+  // present-but-empty vs absent distinction). Additive field: a reader that
+  // skips this unknown field reads every earlier field exactly as before, and a
+  // reader that understands it sees an absent sub-message on every pre-ADR-0090
+  // record, identical to "no override". No format_version bump (ADR-0090
+  // Consequences).
+  TypedAttrColumnConfig typed_attr_columns = 12;
+}
+
+// One entry of the durable `sys/auth` token map (ADR-0066 decision 6, epic EM):
+// a keyed hash of a bearer token mapped to the tenant id it authenticates as.
+// The bucket NEVER holds a plaintext token; `token_hash` is
+// `blake3::keyed_hash(deployment_key, token_bytes)`, so the map is useless to an
+// attacker who reads the bucket without the deployment key, and a low-entropy
+// token is not recoverable by an offline dictionary attack (the key is
+// load-bearing, the tenant-hash-v2 keyed-hashing pattern).
+message TokenHashEntry {
+  bytes token_hash = 1;  // 32 bytes: blake3 keyed hash of the bearer token
+  string tenant_id = 2;  // the tenant this token authenticates as
+  // Which writer owns this entry's lifecycle, added in format_version 2
+  // (ADR-0072 decision 4 amendment, #897). "operator" for an entry the
+  // Kubernetes operator's reconcile loop provisioned from a
+  // tenantTokensSecretRef Secret; "cli" for one `ravel-cli tenant token
+  // upsert` wrote (directly, or via its own --managed-by override). Absent
+  // (proto3 default on an unset `optional`) means unmanaged: every entry a
+  // format_version 1 writer ever wrote, and any entry a v2+ writer creates
+  // without an explicit owner. Additive and optional by design: a
+  // format_version 1 reader that has never heard of this field decodes the
+  // message and simply never sees it, and a v1 map re-read by a v2+ reader
+  // decodes every entry as unmanaged, exactly matching what a v1 writer
+  // intended (nothing claims ownership of an entry it didn't write). This
+  // is the ownership marker the operator's remove/replace pass filters on:
+  // it touches only entries with managed_by == "operator", never an absent
+  // marker or "cli", so an unmanaged or CLI-provisioned tenant survives a
+  // reconcile whose Secret does not name it.
+  optional string managed_by = 3;
+}
+
+// The durable, deployment-wide bearer-token map at the bucket root `sys/auth`
+// (ADR-0066 decision 6, epic EM). Deployment-wide, not per-tenant, so it lives
+// at the bucket root beside `sys/tenancy` and `sys/gc`, never under a tenant
+// prefix: it maps a token to whichever tenant it grants, so it cannot be keyed
+// under any one tenant. It replaces the startup-frozen `--tenant-token` allowlist
+// with durable state the EM-T8 resolver refreshes on a bounded-staleness horizon,
+// so a provisioned token authenticates within seconds and a removed one stops
+// authenticating within the horizon, fail-closed — no fleet restart per change.
+//
+// Mutation shape: whole-record CAS-replace, mirroring `sys/gc`, for the same
+// reason as TenantConfigRecord: the map is current-state (a token is present or
+// it is not), and revocation — removing an entry — is a first-class operation an
+// append-only history cannot express. Adding, replacing, or removing a token
+// reads the current map and its version, edits the entry set, and swaps under
+// CasVersion; a concurrent write is a caught conflict, never a silent overwrite.
+//
+// Its own top-level message, sharing no field number with the markers above.
+message AuthTokenMap {
+  // Format floor: the minimum reader version that understands this object. A
+  // reader that only knows a lower version refuses rather than misread a future
+  // layout, matching every other durable object's version guard. Any writer
+  // that understands ownership (ADR-0072 decision 4 amendment, #897) always
+  // writes 2, unconditionally -- not content-dependent on whether an entry
+  // actually carries `managed_by`, since deciding that would mean the version
+  // a write stamps can flip depending on which other entries happen to be in
+  // the map at that moment (a `managed_by`-carrying entry added, then removed,
+  // then re-added by an unrelated tenant elsewhere in the map). The bump is a
+  // version-floor signal, not a wire necessity: `managed_by` is `optional` and
+  // additive, so a v1-only reader (a pre-amendment `ravel-server` build) that
+  // has never heard of it would decode the entries fine, but its version guard
+  // rejects a stored 2 outright as a future format it does not understand --
+  // this is deliberate fail-closed behavior, not a bug, but it means every
+  // `ravel-server` in a deployment MUST be upgraded to a build that
+  // understands format_version 2 before ANY writer (the operator or
+  // `ravel-cli tenant token`) that understands ownership performs its first
+  // write to `sys/auth`, even one with no `managed_by`-carrying entries at
+  // all: the object is stamped 2 from that write onward, and a lagging old
+  // server then refuses to read `sys/auth` entirely (fail-closed) until it is
+  // upgraded too. A v2+ reader accepts both a stored 1 and a stored 2
+  // (every entry decodes the same either way; an absent `managed_by` just
+  // means unmanaged).
+  uint32 format_version = 1;
+  // A 16-byte fingerprint of the deployment key the token hashes are keyed
+  // under: blake3::derive_key("ravel-auth-v1-fingerprint", deployment_key)
+  // truncated to 16 bytes, the TenancyMarker key_fingerprint pattern. A reader
+  // whose configured deployment key fingerprints differently is using the wrong
+  // key: every token hash would silently mismatch and all auth would fail
+  // opaquely, so the reader refuses rather than open that silent hole. Never the
+  // key itself.
+  bytes key_fingerprint = 2;
+  // The token->tenant entries. Decode enforces: every token_hash is 32 bytes,
+  // every tenant_id is non-empty, and no token_hash repeats (a duplicate would
+  // make resolution ambiguous). Any violation is a typed decode error (fail
+  // closed).
+  repeated TokenHashEntry entries = 3;
+  sfixed64 updated_unix_ns = 4;  // informational; when the map was last swapped
+}
+
+// The type of a metric family, as captured at ingest from whichever protocol
+// carried the point (ADR-0085 decision 1). Mirrors the Prometheus metadata
+// `type` field the `/api/v1/metadata` response reports, which is the vocabulary
+// every existing Prometheus API client already understands; OTLP/OTAP derive it
+// from the `data` oneof, Remote-Write v1/v2 carry it explicitly.
+enum MetricMetadataType {
+  METRIC_METADATA_TYPE_UNSPECIFIED = 0;  // never written; an entry carrying it is corrupt
+  METRIC_METADATA_TYPE_COUNTER = 1;
+  METRIC_METADATA_TYPE_GAUGE = 2;
+  METRIC_METADATA_TYPE_HISTOGRAM = 3;
+  METRIC_METADATA_TYPE_SUMMARY = 4;
+  // The protocol carried a point but named no type. A real, written value,
+  // unlike UNSPECIFIED: it is what a merge treats as "no opinion", so it never
+  // overwrites a known type already in the record.
+  METRIC_METADATA_TYPE_UNKNOWN = 5;
+}
+
+// One metric family's captured metadata (ADR-0085 decision 1). Keyed by the
+// family name, not by series and not by ingest process: Prometheus metadata
+// semantics are per metric name, and Ravel has no per-target scrape concept
+// that would make several type/help/unit tuples per name meaningful, so a
+// single latest-write-wins entry per name is the exact match for Ravel's
+// ingest model.
+message MetricMetadataEntry {
+  // The metric family name, as defined per ingest path in ADR-0085 decision 1:
+  // for OTLP/OTAP the name after the unit/`_total` suffix pass but before the
+  // classic histogram/summary explosion, for RW1 `metric_family_name` as
+  // parsed, for RW2 the per-series name with any structural
+  // `_bucket`/`_sum`/`_count`/`_total` suffix stripped back off.
+  string family_name = 1;
+  MetricMetadataType type = 2;
+  // Help text and unit as the protocol supplied them. Either may be empty: a
+  // protocol that carries one but not the other is normal (RW1 often supplies
+  // help without unit), and an empty incoming field never overwrites a
+  // populated stored one on merge, so the two compose instead of clobbering.
+  // For OTLP/OTAP `unit` holds the mapped Prometheus word (`bytes`,
+  // `seconds`), matching the suffix on the name, not the raw UCUM string.
+  string help = 3;
+  string unit = 4;
+  // When this entry's fields last actually changed, informational and the
+  // eviction order for a record pruned back under the entry cap. Stamped only
+  // on a genuine change, so an unchanged entry keeps its original timestamp
+  // and two processes computing the same merge produce identical bytes.
+  sfixed64 updated_unix_ns = 5;
+}
+
+// The durable per-tenant metric metadata record at `t/<tenant_hash>/m/meta`
+// (ADR-0085 decision 1). Under the metrics signal prefix `m/` like every other
+// metrics-scoped record (`m/l0`, `m/c`), never a new top-level prefix.
+//
+// Written by the one metadata sink per ingest process, read by
+// `/api/v1/metadata` on the query side. Body is this message, zstd-compressed
+// on the wire.
+//
+// Mutation shape: whole-record CAS-replace, the TenantConfigRecord/`sys/gc`
+// shape and for the same reason. The entry set is mutable current state whose
+// latest value is the only one that matters, and pruning it back under the
+// per-tenant entry cap -- dropping the oldest `updated_unix_ns` entries --
+// is a shrinking write an append-only history cannot express. The loser of a
+// concurrent write re-reads and merges rather than overwriting the winner.
+//
+// Its own top-level message, sharing no field number with the records above.
+// Field numbers are frozen from the moment this ships; only additive changes
+// are allowed, exactly like every other message in this file.
+message MetricMetadataRecord {
+  // Format floor: the minimum reader version that understands this record. A
+  // reader that only knows a lower version refuses rather than misreading a
+  // future layout, matching every other durable record's version guard. = 1.
+  uint32 format_version = 1;
+  // One entry per metric family name. Decode enforces: every family_name is
+  // non-empty, no family_name repeats (a duplicate would make a
+  // `/api/v1/metadata` lookup ambiguous), and every type is a real value
+  // rather than the UNSPECIFIED sentinel. Any violation is a typed decode
+  // error (fail closed).
+  repeated MetricMetadataEntry entries = 2;
+  // 16 bytes; the `t/<tenant_hash>/` prefix owner. Carried so a record
+  // misfiled under another tenant's key is refused rather than served as this
+  // tenant's metadata, the TenantConfigRecord misfile guard.
+  bytes tenant_hash = 3;
+}

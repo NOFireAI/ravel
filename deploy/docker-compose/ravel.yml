@@ -1,0 +1,148 @@
+# Container-first quickstart stack (ADR-0081 decisions 1-3).
+#
+# `docker compose -f deploy/docker-compose/ravel.yml up -d` brings up a full,
+# self-contained Ravel: MinIO as the S3-compatible object store, a one-shot that
+# creates the bucket, a one-shot that qualifies the store, ravel-server pulled
+# from GHCR, an OpenTelemetry Collector generating real telemetry from the host,
+# and Grafana with a provisioned Ravel datasource. No Rust toolchain, no compile.
+#
+# SECURITY: every credential and token in this file is a fixed DEVELOPMENT value
+# (the MinIO `ravel`/`ravel-dev-secret` pair and the `demo-token` bearer token),
+# and every published host port binds loopback (`127.0.0.1`) only. None of this
+# is for any deployment reachable from a network. The loopback prefixes are what
+# keep the checked-in bearer token off the reader's LAN (ADR-0081 decision 1); do
+# not drop them.
+services:
+  # MinIO and the bucket-creation one-shot mirror deploy/docker-compose/minio.yml
+  # exactly: same credentials, same `ravel-dev` bucket, same `minio-data/` host
+  # dir (gitignored, shared with that stack, and safe to reuse across runs).
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    environment:
+      MINIO_ROOT_USER: ravel
+      MINIO_ROOT_PASSWORD: ravel-dev-secret
+    volumes:
+      - ../../minio-data:/data
+
+  createbucket:
+    image: minio/mc:latest
+    depends_on: [minio]
+    # `mc alias set` fails until MinIO is reachable, so the until-loop is the
+    # readiness wait: this service completes successfully only once the bucket
+    # actually exists, which is what the qualify one-shot below depends on.
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 ravel ravel-dev-secret; do
+        echo 'waiting for minio'; sleep 1;
+      done &&
+      mc mb -p local/ravel-dev || true"
+
+  # Store qualification (ADR-0050 section 6): ravel-server refuses to start on a
+  # non-Memory store until `sys/qualification` is present, and there is
+  # deliberately no bootstrap-and-continue path for it. A freshly `mc mb`'d
+  # bucket has no such record, so it must be written before the server starts.
+  # The published image carries ravel-cli for exactly this (Dockerfile.prebuilt);
+  # override the entrypoint to run it. `store qualify` is idempotent: on an
+  # already-qualified bucket it reports the existing record and exits 0, so this
+  # tolerates a populated `minio-data/` across runs.
+  qualify:
+    image: ${RAVEL_IMAGE:-ghcr.io/nofireai/ravel-server:0.11.0}
+    depends_on:
+      createbucket:
+        condition: service_completed_successfully
+    entrypoint: ["/usr/local/bin/ravel-cli"]
+    command: ["--store", "s3", "store", "qualify"]
+    environment:
+      RAVEL_S3_ENDPOINT: http://minio:9000
+      RAVEL_S3_BUCKET: ravel-dev
+      RAVEL_S3_REGION: us-east-1
+      RAVEL_S3_ACCESS_KEY: ravel
+      RAVEL_S3_SECRET_KEY: ravel-dev-secret
+
+  # ravel-server, pulled from GHCR (override the pin with RAVEL_IMAGE). The image
+  # has no default CMD by design -- the operator supplies every argument -- so the
+  # full vector is passed here (ADR-0081 decision 2). It binds 0.0.0.0 INSIDE the
+  # container namespace; the loopback prefix on the port mapping is what keeps it
+  # off the host's other interfaces. --dev-insecure-tenant-header is deliberately
+  # not used: it refuses to enable unless --listen-http binds loopback, which the
+  # container boundary forbids, so the demo authenticates with a real bearer
+  # token against a real tenant map, exactly as a deployment does.
+  ravel-server:
+    image: ${RAVEL_IMAGE:-ghcr.io/nofireai/ravel-server:0.11.0}
+    depends_on:
+      qualify:
+        condition: service_completed_successfully
+    command:
+      - "--mode"
+      - "all"
+      - "--store"
+      - "s3"
+      - "--listen-http"
+      - "0.0.0.0:4318"
+      - "--listen-grpc"
+      - "0.0.0.0:4317"
+      - "--shards"
+      - "4"
+      - "--tenant-token"
+      - "demo-token=demo-tenant"
+      # A fresh bucket refuses to start unless a tenant-hash scheme is chosen
+      # (services/ravel-server/src/tenancy.rs: keyed is the default, an
+      # unspecified config is FreshBucketNeedsKey). The quickstart is an unkeyed
+      # dev bucket, so opt out explicitly. Safe on a reused minio-data/ too: an
+      # existing unkeyed marker validates against this, keyed would not.
+      - "--tenant-hash-unkeyed"
+    ports:
+      - "127.0.0.1:4318:4318"
+      - "127.0.0.1:4317:4317"
+    environment:
+      RAVEL_S3_ENDPOINT: http://minio:9000
+      RAVEL_S3_BUCKET: ravel-dev
+      RAVEL_S3_REGION: us-east-1
+      RAVEL_S3_ACCESS_KEY: ravel
+      RAVEL_S3_SECRET_KEY: ravel-dev-secret
+
+  # The demo's data generator (ADR-0081 decision 3): a real OpenTelemetry
+  # Collector scraping host metrics and exporting them to Ravel over OTLP/HTTP,
+  # authenticating with the demo bearer token via the bearertokenauth extension.
+  # This exercises the same OTLP path a real user configures, and the first
+  # Grafana screen shows the reader's own machine.
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    depends_on: [ravel-server]
+    command: ["--config=/etc/otel/collector-config.yaml"]
+    # The collector's own metrics, for answering "is it delivering?" without
+    # guessing from an empty dashboard (#209). Read the delivery counters with:
+    #   curl -s localhost:18888/metrics | grep otelcol_exporter
+    # A non-zero `send_failed` means Ravel is refusing the exports.
+    #
+    # Published on 18888 rather than the collector's own 8888: that port is the
+    # collector default and is contended on a developer machine, and a
+    # quickstart that fails on `docker compose up` with "port is already
+    # allocated" is a bad first command. The container side stays 8888.
+    ports:
+      - "127.0.0.1:18888:8888"
+    volumes:
+      - ../otel/collector-config.yaml:/etc/otel/collector-config.yaml:ro
+
+  # Grafana with a provisioned Prometheus-type datasource pointed at
+  # ravel-server's /api/v1 surface, carrying the demo bearer token (ADR-0081
+  # decision 1). The token lives in a checked-in provisioning file; it is a fixed
+  # development credential in the same class as the MinIO secret above.
+  grafana:
+    image: grafana/grafana:latest
+    depends_on: [ravel-server]
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      # No sign-up, no telemetry phone-home: this is a throwaway local instance.
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+    volumes:
+      - ../grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../grafana/dashboards:/var/lib/grafana/dashboards:ro

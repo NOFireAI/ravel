@@ -1,0 +1,487 @@
+[package]
+name = "ravel-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+ravel-types = { workspace = true }
+ravel-proto = { workspace = true }
+ravel-codec = { workspace = true }
+ravel-segment = { workspace = true }
+ravel-logseg = { workspace = true }
+ravel-otlp = { workspace = true }
+ravel-ingest = { workspace = true }
+ravel-object-store = { workspace = true }
+ravel-catalog = { workspace = true }
+ravel-commit = { workspace = true }
+ravel-maintain = { workspace = true }
+ravel-promql = { workspace = true }
+# The MetricsBench PromQL corpus gate (ADR-0927 decision 5) checks every named
+# construct against `ravel_promql_difftest::scoring::REGISTRY`, the PromQL
+# analog of `ravel_sql::conformance::registry()`. A NEW dependency edge from
+# ravel-bench, and a path dependency: ravel-promql-difftest is not listed in the
+# workspace `[workspace.dependencies]`, so it is named by path and version here
+# exactly as the optional `ravel-sql` entry below is. Not optional and not a
+# dev-dependency: the corpus loads in the default build, and the generator bin
+# (`metricsbench_gen`) runs the gate, which a dev-dependency would be invisible
+# to. It is already a workspace member, so a `--workspace` build compiled it
+# before this edge existed too.
+ravel-promql-difftest = { path = "../ravel-promql-difftest", version = "0.11.0" }
+prost = { workspace = true }
+# MetricsBench Remote Write 1.0 ingest lane (ADR-0927, issue #937, task M5).
+# `ravel-remote-write` supplies the `prometheus.WriteRequest`/`TimeSeries`/
+# `Label`/`Sample` prost types the lane encodes the portable RW1.0 body from
+# (`proto::prometheus`), so the bench builds the exact wire shape every
+# comparator receives rather than hand-rolling a second copy of the schema. It
+# is a workspace path crate already linked by ravel-server; a new dependency
+# EDGE from ravel-bench, not a new external crate to the workspace.
+ravel-remote-write = { workspace = true }
+# The RW1.0 body is snappy block format (not framed): `snap::raw::Encoder`
+# compresses the prost-encoded `WriteRequest`. Already the workspace pin
+# `ravel-remote-write` itself decompresses with, so no second copy resolves.
+snap = { workspace = true }
+# The comparator senders (Prometheus/VictoriaMetrics/object-storage-native)
+# POST the RW1.0 body to config-supplied endpoints; no hardcoded hosts. reuses
+# the workspace reqwest pin ravel-server/ravel-promql-difftest already link, so
+# a new dependency EDGE from ravel-bench, not a new external crate.
+reqwest = { workspace = true }
+ravel-query = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+blake3 = { workspace = true }
+crc32c = { workspace = true }
+lz4_flex = { workspace = true }
+zstd = { workspace = true }
+rand = { workspace = true }
+uuid = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# The distrib crossover bench spins in-process `tonic` loopback
+# `SeriesFetch` workers to drive the real ADR-0071 distributed fan-out, exactly
+# as ravel-query's own acceptance test does. `tonic` (default features: the
+# server transport plus the client `channel`) is already a workspace pin used by
+# ravel-query/ravel-server; here it is a plain dependency of the standard build,
+# not gated, since the crossover bin and its smoke test are part of the default
+# gate. No new external crate enters the workspace.
+tonic = { workspace = true }
+stats_alloc = "0.1.10"
+# Gated behind `parquet-baseline` (off by default). arrow reuses the
+# workspace pin (identical to ravel-otap's); parquet is pinned lockstep to
+# the same major and is a new external dependency.
+# `async` + `object_store` give the read-side accounting harness (phase b)
+# the async Parquet reader over an object store; `object_store` and
+# `futures` reuse the workspace pins already used by ravel-object-store.
+arrow = { workspace = true, optional = true }
+parquet = { version = "59", optional = true, features = ["async", "object_store"] }
+# The read-side Parquet reader is driven through the `object_store` version
+# `parquet` itself depends on (0.13), NOT the workspace pin (0.14), so the
+# counting wrapper implements the same `ObjectStore` trait the async reader
+# consumes. This is a bench-only second version, isolated to this crate; the
+# RSEG path still goes through ravel-object-store (0.14) unchanged.
+object_store = { version = "0.13", optional = true, features = ["aws"] }
+futures = { workspace = true, optional = true }
+# Gated behind `flight-egress` (off by default). The egress bench
+# drives the real Flight SQL service and the JSON encoder in-process, so it
+# links ravel-sql with its `flight-sql` feature (which pulls datafusion, arrow
+# 58, and arrow-flight) plus the transport types the DoGet path speaks.
+# ravel-sql is an internal path crate not yet listed in the workspace
+# `[workspace.dependencies]`, so it is named by path here; every other dep
+# below reuses a workspace pin.
+ravel-sql = { path = "../ravel-sql", version = "0.11.0", optional = true, features = ["flight-sql"] }
+# Gated behind `sql-latency`. The spans-scan bench lane (`src/spans_scan.rs`)
+# writes its RSPAN corpus with the real span writer and drives `SpansScanExec`
+# directly, so it needs the writer/record types (`RspanWriter`, `SpanRecord`,
+# `SpanEvent`, `reconstruct_events_raw`) and `SpanQuery` that ravel-sql does not
+# re-export. Reuses the workspace pin; ravel-sql already links ravel-rspan, so
+# no second copy enters the workspace.
+ravel-rspan = { workspace = true, optional = true }
+arrow-flight = { workspace = true, optional = true }
+# Gated behind `sql-latency` (off by default). The groupby scaling bench reads
+# the real physical plan (`displayable`, `ExecutionPlan::output_partitioning`)
+# to record what each swept combination actually did, so it needs datafusion in
+# scope. Not a new external crate to the workspace: ravel-sql already pins and
+# links datafusion 54 with the same version/features, so feature unification
+# resolves this to that same instance rather than a second copy.
+datafusion = { version = "54", default-features = false, features = ["sql"], optional = true }
+# Gated behind `sql-latency`. The logs scan-partitioning scaling bench
+# (`logs_scan_scaling`) wires ADR-0046's read cache into `LogSegmentFetcher` so
+# it can report the object-store request count with and without the cache's
+# single-flight coalescing. Reuses the workspace pin ravel-query/ravel-sql
+# already link; no new external crate enters the workspace.
+ravel-cache = { workspace = true, optional = true }
+# Gated behind `profiling` (off by default). CPU flamegraph lane for the
+# ingest and query bench bins (issue #365). pprof is a NEW external
+# dependency, NOT a workspace pin; its `flamegraph` feature pulls `inferno`
+# for the SVG writer, and the default `cpp` feature supplies the unwinder and
+# symbol demangling. It builds and its SVG test passes on both Linux and
+# macOS (darwin).
+#
+# It is an OPTIONAL regular dependency, not a dev-dependency: Cargo forbids an
+# optional dev-dependency, and the lane must be reachable from the `[[bin]]`
+# targets (dev-dependencies are visible only to tests/benches/examples, never
+# to bins or the lib). Optional + feature-gated keeps it out of a default
+# build exactly as the arrow/parquet lane above does.
+pprof = { version = "0.15", optional = true, features = ["flamegraph"] }
+
+[features]
+# Parquet baseline harness. Off by default: the standard build
+# and gates never compile arrow/parquet/object_store or the gated bins.
+# Phase a (write-side `parquet_baseline`) and phase b (read-side
+# `read_path_accounting`) share this one feature. `async-trait` moved to a
+# required dependency when `catalog_resolve_bench` needed it for a plain
+# (non-Parquet) `ObjectStoreBackend` impl, so it is no longer listed here.
+parquet-baseline = [
+    "dep:arrow",
+    "dep:parquet",
+    "dep:object_store",
+    "dep:futures",
+]
+# Flight SQL vs JSON result-egress bench. Off by default: it links
+# ravel-sql/datafusion/arrow-flight on top of the standard build, so the plain
+# gates never compile it or the `flight_sql_egress` bin.
+# `tonic` is a plain (non-optional) dependency now (the distrib crossover bench
+# needs it), so it is no longer listed here as a `dep:` activation.
+flight-egress = [
+    "dep:ravel-sql",
+    "dep:arrow-flight",
+    "dep:futures",
+]
+# CPU flamegraph lane (issue #365). Off by default: a default build and the
+# plain gates never link `pprof`/`inferno`. When on, the ingest and query
+# bench bins wrap their measured region in a sampler when
+# `RAVEL_BENCH_PROFILE_SVG` names an output path (see `src/profiling.rs`).
+profiling = ["dep:pprof"]
+# Per-stage ingest timing (ADR-0104 decision 2b). Off by default: the shipping
+# `ingest_bench` bin compiles and runs in BOTH modes and only emits the
+# stage-breakdown field with this on, so no default gate stops covering the bin
+# and the default build never fails on a cfg-gated seam. Forwards to
+# `ravel-ingest/stage-timing`, which compiles the monotonic `Instant` seam into
+# the metrics/logs actors. Adds no new external dependency.
+stage-timing = ["ravel-ingest/stage-timing"]
+# The ADR-0100 decision 3 SQL corpus (`src/sql_corpus.rs`) and, once #428
+# lands, the `sql_latency_bench` harness that runs it. Off by default: the
+# corpus gate reads `ravel_sql::conformance::registry()`, so it activates the
+# same optional `ravel-sql` entry `flight-egress` uses (no second entry, so no
+# second datafusion/arrow activation) and the plain gates never compile it.
+sql-latency = ["dep:ravel-sql", "dep:datafusion", "dep:ravel-cache", "dep:ravel-rspan", "dep:futures"]
+# The `sql_latency_bench --flight` lane (issue #680): the same corpus executed
+# through a running `ravel-server`'s Flight SQL endpoint instead of an
+# in-process executor. Off by default. No new external crate: `arrow-flight`
+# is already the optional dependency `flight-egress` activates, at the same
+# workspace pin, and `ravel-sql` is already linked with its `flight-sql`
+# feature by the `sql-latency` entry above, so the client type and the service
+# it talks to come from one arrow-flight instance.
+flight-lane = ["sql-latency", "dep:arrow-flight", "dep:futures"]
+
+[dev-dependencies]
+criterion = { workspace = true }
+proptest = { workspace = true }
+# Corpus-loader tests write malformed and well-formed corpus files to a temp
+# directory that cleans itself up; workspace pin, no new external crate.
+tempfile = { workspace = true }
+
+[lib]
+# Only the criterion `[[bench]]` targets below understand `cargo bench`'s
+# `--quick` flag; leaving the lib's own `bench = true` default would make
+# `cargo bench -p ravel-bench -- --quick` also run its unit tests under the
+# plain libtest harness, which rejects that flag.
+bench = false
+
+[[bin]]
+name = "ingest_bench"
+path = "src/bin/ingest_bench.rs"
+bench = false
+
+[[bin]]
+name = "s3_e2e_bench"
+path = "src/bin/s3_e2e_bench.rs"
+bench = false
+
+[[bin]]
+name = "bench_report"
+path = "src/bin/bench_report.rs"
+bench = false
+
+[[bin]]
+name = "concurrent_bench"
+path = "src/bin/concurrent_bench.rs"
+bench = false
+
+[[bin]]
+name = "query_latency_bench"
+path = "src/bin/query_latency_bench.rs"
+bench = false
+
+
+[[bin]]
+name = "distrib_crossover_bench"
+path = "src/bin/distrib_crossover_bench.rs"
+bench = false
+
+[[bin]]
+name = "pushdown_crossover_bench"
+path = "src/bin/pushdown_crossover_bench.rs"
+bench = false
+
+# MetricsBench (ADR-0927, issue #933): gates the checked-in workload manifest
+# and PromQL corpus, then generates a profile's samples deterministically. In
+# the default feature set on purpose: it is the entry point that makes both
+# artifact gates reachable from a real caller.
+[[bin]]
+name = "metricsbench_gen"
+path = "src/bin/metricsbench_gen.rs"
+bench = false
+
+# MetricsBench report tool (ADR-0927, issue #936): validates and renders the
+# reconciled report artifact, and stamps its provenance. In the default feature
+# set on purpose: it is the entry point that makes the report_schema validation
+# reachable from a real caller, so a malformed artifact fails through it.
+[[bin]]
+name = "metricsbench_report"
+path = "src/bin/metricsbench_report.rs"
+bench = false
+
+# MetricsBench Remote Write 1.0 ingest lane (ADR-0927, issue #937, task M5):
+# replays one logical sample stream into the in-process Ravel path (strict,
+# durable-on-ack, commit tokens) and, behind config-supplied endpoints, the
+# Prometheus/VictoriaMetrics/object-storage-native comparators over portable
+# RW1.0. In the default feature set: it is the entry point that makes the lane
+# reachable from a real caller.
+[[bin]]
+name = "metricsbench_ingest"
+path = "src/bin/metricsbench_ingest.rs"
+bench = false
+
+[[bin]]
+name = "segment_alloc_profile"
+path = "src/bin/segment_alloc_profile.rs"
+bench = false
+
+[[bin]]
+name = "histogram_size"
+path = "src/bin/histogram_size.rs"
+bench = false
+
+[[bin]]
+name = "codec_bakeoff"
+path = "src/bin/codec_bakeoff.rs"
+bench = false
+
+[[bin]]
+name = "ts_bakeoff"
+path = "src/bin/ts_bakeoff.rs"
+bench = false
+
+[[bin]]
+name = "catalog_resolve_bench"
+path = "src/bin/catalog_resolve_bench.rs"
+bench = false
+
+[[bin]]
+name = "selective_read_accounting"
+path = "src/bin/selective_read_accounting.rs"
+bench = false
+
+[[bin]]
+name = "compaction_bench"
+path = "src/bin/compaction_bench.rs"
+bench = false
+
+[[bin]]
+name = "parquet_baseline"
+path = "src/bin/parquet_baseline.rs"
+required-features = ["parquet-baseline"]
+bench = false
+
+[[bin]]
+name = "read_path_accounting"
+path = "src/bin/read_path_accounting.rs"
+required-features = ["parquet-baseline"]
+bench = false
+
+# ADR-0109 (#606) differential load bench: row path vs columnar fast path.
+# Behind `parquet-baseline` because it reads its bounded sample through the
+# arrow/parquet reader that feature gates.
+[[bin]]
+name = "columnar_load_compare"
+path = "src/bin/columnar_load_compare.rs"
+required-features = ["parquet-baseline"]
+bench = false
+
+[[bin]]
+name = "flight_sql_egress"
+path = "src/bin/flight_sql_egress.rs"
+required-features = ["flight-egress"]
+bench = false
+
+[[bin]]
+name = "groupby_scaling_bench"
+path = "src/bin/groupby_scaling_bench.rs"
+required-features = ["sql-latency"]
+bench = false
+
+[[bin]]
+name = "logs_scan_scaling_bench"
+path = "src/bin/logs_scan_scaling_bench.rs"
+required-features = ["sql-latency"]
+bench = false
+
+[[bin]]
+name = "sql_latency_bench"
+path = "src/bin/sql_latency_bench.rs"
+required-features = ["sql-latency"]
+bench = false
+
+[[bin]]
+name = "spans_scan_bench"
+path = "src/bin/spans_scan_bench.rs"
+required-features = ["sql-latency"]
+bench = false
+
+[[test]]
+name = "read_accounting"
+path = "tests/read_accounting.rs"
+bench = false
+
+# ADR-0109 (#606) acceptance test: the differential harness must drive both the
+# row and columnar paths over the same input, proven by the two reachability
+# counters. Behind `parquet-baseline` for the same reason as the bin above.
+[[test]]
+name = "columnar_load_compare"
+path = "tests/columnar_load_compare.rs"
+required-features = ["parquet-baseline"]
+bench = false
+
+[[test]]
+name = "gorilla_vs_raw"
+path = "tests/gorilla_vs_raw.rs"
+bench = false
+
+[[test]]
+name = "alignment_measurement"
+path = "tests/alignment_measurement.rs"
+bench = false
+
+[[test]]
+name = "codec_roundtrip"
+path = "tests/codec_roundtrip.rs"
+bench = false
+
+[[test]]
+name = "catalog_byte_gates"
+path = "tests/catalog_byte_gates.rs"
+bench = false
+
+[[test]]
+name = "s3_e2e_smoke"
+path = "tests/s3_e2e_smoke.rs"
+bench = false
+
+[[test]]
+name = "concurrent_smoke"
+path = "tests/concurrent_smoke.rs"
+bench = false
+
+[[test]]
+name = "query_latency_smoke"
+path = "tests/query_latency_smoke.rs"
+bench = false
+
+[[test]]
+name = "sql_latency_smoke"
+path = "tests/sql_latency_smoke.rs"
+required-features = ["sql-latency"]
+bench = false
+
+# Tripwire for the object_count invariant (issue #481): distinct data-object
+# keys reachable from the resolved snapshot equal the reported object_count.
+# Behind sql-latency because the L0 case drives the sql_latency harness.
+# The Flight SQL lane (issue #680). The body is gated on `flight-lane` (empty
+# crate without it), so this entry is harmless under every other feature set.
+[[test]]
+name = "sql_latency_flight_smoke"
+path = "tests/sql_latency_flight_smoke.rs"
+bench = false
+
+[[test]]
+name = "sql_latency_object_count_invariant"
+path = "tests/sql_latency_object_count_invariant.rs"
+required-features = ["sql-latency"]
+bench = false
+
+# Gate test for the checked-in ClickBench corpus (issue #430). It reads
+# `ravel_bench::sql_corpus`, so it lives behind the same `sql-latency` feature.
+[[test]]
+name = "clickbench_corpus"
+path = "tests/clickbench_corpus.rs"
+required-features = ["sql-latency"]
+bench = false
+
+# Gate test for the checked-in MetricsBench artifacts (issue #933) under
+# `benchmarks/metrics/`, and the reachability proof that a corrupt artifact
+# fails through the `metricsbench_gen` binary rather than only through a direct
+# `gate_corpus` call.
+[[test]]
+name = "metricsbench_artifacts"
+path = "tests/metricsbench_artifacts.rs"
+bench = false
+
+# Reachability for the reconciled report schema (issue #936): a malformed report
+# artifact must fail through the shipping `metricsbench_report` binary, not only
+# through a direct `report_schema::validate` call.
+[[test]]
+name = "metricsbench_report"
+path = "tests/metricsbench_report.rs"
+bench = false
+
+# Reachability for the Remote Write 1.0 ingest lane (issue #937, M5): the
+# shipping `metricsbench_ingest` binary replays into the in-process Ravel path
+# and prints a valid report with a durable-on-ack Ravel row, proving the lane is
+# reachable from the bin a caller runs, not only from the lib unit tests.
+[[test]]
+name = "metricsbench_ingest_smoke"
+path = "tests/metricsbench_ingest_smoke.rs"
+bench = false
+
+[[test]]
+name = "distrib_crossover_smoke"
+path = "tests/distrib_crossover_smoke.rs"
+bench = false
+
+[[test]]
+name = "pushdown_crossover_smoke"
+path = "tests/pushdown_crossover_smoke.rs"
+bench = false
+
+# The test body is gated on `sql-latency` (empty crate without it), so this
+# entry stays harmless under the default feature set and only exercises the
+# scaling bench under `--features sql-latency`.
+[[test]]
+name = "groupby_scaling_smoke"
+path = "tests/groupby_scaling_smoke.rs"
+bench = false
+
+# The test body is gated on `sql-latency` (empty crate without it), so this
+# entry stays harmless under the default feature set and only exercises the
+# logs scan-partitioning scaling bench under `--features sql-latency`.
+[[test]]
+name = "logs_scan_scaling_smoke"
+path = "tests/logs_scan_scaling_smoke.rs"
+bench = false
+
+[[bench]]
+name = "segment_encode"
+harness = false
+
+[[bench]]
+name = "series_id_hash"
+harness = false
+
+[lints]
+workspace = true

@@ -1,0 +1,129 @@
+[package]
+name = "ravel-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+# Prints the logs-pipeline per-stage timing breakdown (ADR-0104 decision 1)
+# after `load --parquet` finishes. Off by default, forwarding to
+# ravel-ingest's own off-by-default feature of the same name: with it off,
+# `LoadReport` carries no timing field and `ravel-ingest`'s accumulator is
+# compiled out entirely, so a default build is unchanged.
+stage-timing = ["ravel-ingest/stage-timing"]
+
+# CPU flamegraph lane for `load --parquet` (issue #365's pattern, mirroring
+# crates/ravel-bench/src/profiling.rs). Off by default so a default build never
+# links `pprof`. When on and RAVEL_CLI_PROFILE_SVG names a path, `load`'s
+# measured region is wrapped in a `pprof` CPU sampler and a flamegraph SVG is
+# written there.
+profiling = ["dep:pprof"]
+
+[dependencies]
+# Optional: see the `profiling` feature above. Same version/feature set as
+# crates/ravel-bench's pin so the two crates' flamegraphs are comparable.
+pprof = { version = "0.15", optional = true, features = ["flamegraph"] }
+ravel-types = { workspace = true }
+ravel-proto = { workspace = true }
+ravel-object-store = { workspace = true }
+ravel-segment = { workspace = true }
+ravel-logseg = { workspace = true }
+ravel-rspan = { workspace = true }
+ravel-commit = { workspace = true }
+ravel-catalog = { workspace = true }
+ravel-maintain = { workspace = true }
+ravel-ingest = { workspace = true }
+# `load --parquet` reuses `NormalizedLogRecord` and the `logs_limits` constants
+# (max_future_skew_ns, the length caps) rather than reimplementing the record
+# shape or re-deriving the bounds (ADR-0089). New dependency of ravel-cli;
+# already a workspace pin (ravel-otap/ravel-bench use it), adds no new external
+# crate.
+ravel-otlp = { workspace = true }
+prost = { workspace = true }
+blake3 = { workspace = true }
+crc32c = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+anyhow = { workspace = true }
+# Typed `SubmitError` for the `erase submit` conflict path (a reused
+# request_id that redefines the erasure must fail loudly, not silently
+# report success). Already a workspace pin (ravel-commit uses it); adds no
+# new external crate.
+thiserror = { workspace = true }
+# Humantime durations for the `gc-config set` GC-window flags (ADR-0050
+# section 4, EC4), matching ravel-server's `--retention-*` duration convention.
+# Already a workspace pin (ravel-server uses it); adds no new external crate.
+humantime = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+uuid = { workspace = true }
+bytes = { workspace = true }
+# Parquet reader for `load --parquet` (ADR-0089). Not in the workspace
+# `[workspace.dependencies]`; pinned directly here at the same major (59) as the
+# workspace `arrow` pin, following crates/ravel-bench/Cargo.toml's pattern, and
+# deliberately NOT added to the root Cargo.toml (ADR-0011 isolates the arrow
+# family from the ingest-critical path; ravel-cli is operator tooling). This is
+# a genuinely new external dependency for ravel-cli, flagged per CLAUDE.md.
+parquet = { version = "59", default-features = false, features = [
+    "arrow",
+    "snap",
+    "zstd",
+    "brotli",
+    "flate2-zlib-rs",
+    "lz4",
+] }
+# arrow's array/datatypes/record_batch surface, to read Parquet row batches.
+# Reuses the workspace pin (major 59, matching `parquet` above).
+arrow = { workspace = true }
+# TOML parser (serde) for the `--mapping` file. Already in the dependency tree
+# (Cargo.lock carries toml 1.x transitively); pinned directly here. Flagged as
+# a new direct dependency of ravel-cli per CLAUDE.md.
+toml = "1"
+
+[dev-dependencies]
+# Writing small Parquet fixtures in the loader tests uses the same parquet/arrow
+# reader deps declared above; ArrowWriter comes from the `parquet` dep.
+# Query loaded logs back through the real ravel-sql logs path in the
+# reachability test (ADR-0089). ravel-sql is a path-only crate not listed in the
+# workspace `[workspace.dependencies]`, so it is named by path here, exactly as
+# crates/ravel-bench/Cargo.toml names it. The in-process `SqlExecutor` +
+# `LogsTableProvider` logs path is in ravel-sql's default build (the
+# `flight-sql` feature only gates the Flight transport), so no feature is
+# needed here.
+ravel-sql = { path = "../../crates/ravel-sql", version = "0.11.0" }
+# The reachability test builds a SqlExecutor's segment fetchers from ravel-query
+# (SegmentFetcher/LogSegmentFetcher/SpanSegmentFetcher); ravel-catalog is
+# already a normal dependency. Workspace pin, test construction only.
+ravel-query = { workspace = true }
+# Implementing a small `ObjectStoreBackend` test wrapper (hide one key from
+# LIST) needs the same async-trait the trait itself uses. Already a workspace
+# pin; adds no new external crate.
+async-trait = { workspace = true }
+# The ADR-0090 reachability test (tests/typed_attr_column_reachability_e2e.rs)
+# drives a real `POST /api/v1/sql` request through ravel-server's own handler
+# and its `build_sql_state` wiring, because proving a CLI-written declaration
+# reaches a query means going through the server's declared-column source, not
+# a hand-built SqlExecutor. `sql` is the feature that compiles that surface.
+# ravel-server is a workspace path crate not listed in
+# `[workspace.dependencies]`, so it is named by path with a pinned version here,
+# exactly as ravel-sql above is; no new external crate enters Cargo.lock.
+ravel-server = { path = "../ravel-server", version = "0.11.0", features = ["sql"] }
+# The reachability test's axum request/response plumbing (the same shape
+# ravel-server's own endpoint tests use). Already resolved in this workspace's
+# dependency graph; test-only.
+axum = { workspace = true }
+tower = { workspace = true }
+# The #689 differential test drives the dynamic-column slot table against the
+# pre-change map build over generated batches (row count, column count, key
+# collisions, type mix, null density). Workspace pin; adds no new external
+# crate.
+proptest = { workspace = true }
+# A real deployment-key file on disk for the `tenant_token` CLI tests (they
+# exercise `--deployment-key-file`, not an in-memory key). Already a
+# workspace pin; adds no new external crate.
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

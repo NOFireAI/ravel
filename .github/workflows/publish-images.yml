@@ -1,0 +1,941 @@
+name: publish-images
+
+# ADR-0037. Publishes ravel-server, ravel-operator, and ravel-ingest-router
+# from the root Dockerfile to GHCR. Deliberately its own workflow, not a job added to
+# ci.yml: this is the only job in the repo that holds packages: write, and
+# it never runs on a plain push to main (see ADR-0037 decision 4 for why
+# the root Dockerfile's single COPY-then-build layer makes GHA caching
+# ineffective there, and why that would make this the most expensive job
+# in the repo on every commit).
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  # Hardcoded lowercase rather than interpolating
+  # ${{ github.repository_owner }}, which renders the org name's actual
+  # case (NOFireAI) and Docker rejects non-lowercase repository names.
+  IMAGE_OWNER: nofireai
+
+jobs:
+  # ADR-0037 amendment decision 9 (and decision 11's version match). A tag
+  # push no longer publishes unconditionally: this gate resolves the tagged
+  # commit, requires a successful ci.yml run for that exact SHA, and requires
+  # the workspace version to equal the tag, before publish may start. It holds
+  # no registry credentials. workflow_dispatch runs (no tag) skip both checks;
+  # a manual-<sha> publish is by design not gated on a tag or on CI.
+  gate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # Decision 11: the workspace version is the release version. On a tag
+      # push, [workspace.package] version from the tagged tree's Cargo.toml
+      # must equal the tag name with its leading v stripped, or the publish is
+      # refused (this is what would have caught v0.9.0 shipping as 0.1.0).
+      - name: Enforce workspace version matches tag
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          version="$(awk '
+            /^\[workspace\.package\]/ { in_wp = 1; next }
+            /^\[/                     { in_wp = 0 }
+            in_wp && /^version[[:space:]]*=/ {
+              gsub(/^version[[:space:]]*=[[:space:]]*"|".*$/, "")
+              print
+              exit
+            }
+          ' Cargo.toml)"
+          if [[ -z "$version" ]]; then
+            echo "::error::could not read [workspace.package] version from Cargo.toml"
+            exit 1
+          fi
+          echo "workspace version: $version"
+          echo "pushed tag:        $GITHUB_REF_NAME"
+          if [[ "v$version" != "$GITHUB_REF_NAME" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match workspace version v$version (decision 11)"
+            exit 1
+          fi
+          echo "version match ok: v$version == $GITHUB_REF_NAME"
+
+      # Decision 9: require a successful ci.yml run for the tagged commit.
+      # GITHUB_SHA is already the commit an annotated tag points to on a
+      # push:tags trigger (GitHub peels the tag object), so no manual peel is
+      # needed. Self-referential: repo comes from github.repository, host from
+      # github.server_url, auth from the ambient GITHUB_TOKEN. Bounded wait of
+      # 30 minutes at a 30s poll interval (60 attempts). The budget is sized
+      # against the measured ci.yml duration on main: a code-touching run took
+      # 20m 15s and 21m 08s on 2026-08-29 (runs 33277652112, 33275214028), and
+      # a release commit always touches Cargo.toml and Cargo.lock so it always
+      # draws that ~20 minute run rather than the ~30s docs-only path. 30
+      # minutes clears that with headroom to absorb the race where the tag
+      # lands while the main-push ci.yml run for the same commit is still in
+      # flight, without pinning a runner for an hour; the previous 15 minute
+      # budget timed out the real v0.11.0 tag (#914). If ci.yml's own duration
+      # grows past ~25 minutes, raise this. Fails closed on a failed run, on
+      # absence, and on timeout.
+      - name: Require successful CI run for the tagged commit
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_HOST: ${{ github.server_url }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # gh derives the API host from GH_HOST (github.server_url); strip the
+          # scheme so gh sees a bare hostname.
+          export GH_HOST="${GH_HOST#https://}"
+          export GH_HOST="${GH_HOST#http://}"
+          echo "gating on a successful ci.yml run for $REPO @ $SHA (host $GH_HOST)"
+
+          max_attempts=60      # 60 * 30s = 30 minutes (see comment above)
+          interval=30
+          attempt=1
+          start=$SECONDS
+          while (( attempt <= max_attempts )); do
+            # One API call per attempt, carrying every ci.yml run for this SHA
+            # as tab-separated status, conclusion, id, url. status/conclusion
+            # feed the terminal-state checks; id/url/status make a slow run
+            # (one exists, still in progress) distinguishable from a missing
+            # one (none exists) in the poll line below.
+            # Keep the API's own exit code. `|| true` alone would turn an auth,
+            # rate-limit or network failure into an empty `runs`, which reads
+            # downstream as "no ci.yml run exists for this SHA" -- so the gate
+            # would sleep out the whole budget reporting a missing run when the
+            # real problem is that we cannot see it. Those need opposite
+            # responses from whoever is watching the log.
+            api_rc=0
+            runs="$(gh api \
+              "repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&per_page=100" \
+              --jq '.workflow_runs[] | [.status, (.conclusion // "null"), (.id | tostring), .html_url] | @tsv' \
+              2>/dev/null)" || api_rc=$?
+
+            if (( api_rc != 0 )); then
+              # Transient by assumption, so keep polling rather than failing the
+              # release on one bad response -- but say so, and do not let this
+              # attempt's empty output be read as evidence about the run.
+              echo "attempt $attempt/$max_attempts: gh api failed (exit ${api_rc}) querying ci.yml runs for $SHA; retrying in ${interval}s"
+              sleep "$interval"
+              (( attempt++ )) || true
+              continue
+            fi
+
+            # Only completed runs carry a conclusion; a run still queued or in
+            # progress reports status but conclusion null, so we keep waiting.
+            conclusions="$(printf '%s\n' "$runs" | awk -F'\t' '$1 == "completed" { print $2 }')"
+
+            if echo "$conclusions" | grep -qx "success"; then
+              echo "found a successful ci.yml run for $SHA"
+              exit 0
+            fi
+
+            # Fail closed the moment a completed run for this SHA concluded in
+            # a non-success terminal state; do not keep polling hoping for a
+            # rerun.
+            if echo "$conclusions" | grep -qxE "failure|cancelled|timed_out|action_required|startup_failure|stale"; then
+              echo "::error::ci.yml for $SHA concluded non-success: $(echo "$conclusions" | paste -sd, -)"
+              exit 1
+            fi
+
+            elapsed=$(( SECONDS - start ))
+            if [[ -n "$runs" ]]; then
+              # Newest run first (GitHub returns runs in descending order).
+              latest="${runs%%$'\n'*}"
+              IFS=$'\t' read -r run_status run_concl run_id run_url <<< "$latest"
+              echo "attempt $attempt/$max_attempts (${elapsed}s elapsed): ci.yml run $run_id for $SHA is running (status=$run_status, conclusion=$run_concl) $run_url ; no successful run yet, sleeping ${interval}s"
+            else
+              echo "attempt $attempt/$max_attempts (${elapsed}s elapsed): no ci.yml run exists for $SHA yet; sleeping ${interval}s"
+            fi
+            sleep "$interval"
+            (( attempt++ )) || true
+          done
+
+          echo "::error::timed out after $(( SECONDS - start ))s waiting for a successful ci.yml run for $SHA (decision 9, fail closed)"
+          exit 1
+
+  # ADR-0037 multi-arch amendment, decisions 12-15 and 17, as amended by
+  # ADR-0086 decision 9. The matrix is now ONE dimension, platform: each
+  # platform job builds on its own NATIVE runner and runs the three target
+  # builds sequentially on that runner, pushing each by digest with no tag.
+  # Decision 12: QEMU-emulated rustc SIGSEGVs on this workspace, so
+  # cross-building the arm64 half on an amd64 runner would reintroduce the exact
+  # failure this whole ADR routes around. A native runner per platform is a
+  # correctness requirement, not a speed preference; there is deliberately no
+  # QEMU setup step and no multi-platform `platforms:` list that would make one
+  # runner build both.
+  #
+  # ADR-0086 decision 9: the three per-target builds share one builder stage,
+  # so the second and third invocations hit the first's LOCAL layer cache and
+  # the workspace compiles once per platform instead of three times. That local
+  # reuse is the whole point of collapsing the matrix, and it is why the target
+  # builds run sequentially in one job rather than in three parallel jobs that
+  # could never share a layer cache.
+  build:
+    needs: gate
+    timeout-minutes: 90
+    # Decision 17: a build job no longer signs anything, so it holds
+    # packages: write to push by digest and DROPS id-token entirely. A build
+    # job carrying a signing-capable token is exactly the least-privilege drift
+    # the signing amendment set out to avoid; id-token lives only on the merge
+    # job below.
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux/amd64, linux/arm64]
+        # Decision 12: pair each platform with its native runner label so
+        # runs-on resolves from the matrix. The label carries its Ubuntu
+        # version on purpose: GitHub's arm64-hosted runner is `ubuntu-24.04-arm`
+        # (or `-22.04-arm`); there is no `ubuntu-latest-arm`, so the version is
+        # part of the label and pinning it is not optional. actionlint may flag
+        # `ubuntu-24.04-arm` as unknown if its bundled label list is stale; the
+        # label is real and confirmed by a real run, not a defect.
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: ./.github/actions/free-disk-space
+
+      # Sanitise the platform for use in an artifact name: it contains a `/`
+      # (linux/amd64), which is not valid in an artifact name, so replace it
+      # with `-` (linux-amd64). Done in shell because GitHub expressions have no
+      # string-replace function.
+      - name: Prepare platform pair
+        run: |
+          set -euo pipefail
+          platform="${{ matrix.platform }}"
+          echo "PLATFORM_PAIR=${platform//\//-}" >> "$GITHUB_ENV"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      # The three target builds below share the builder stage. No
+      # cache-from/cache-to: type=gha on any of them: the builder stage's single
+      # COPY-then-build layer changes on every commit (ADR-0037 decision 4), so
+      # a GHA cache export could never hit and would only spend the 10 GB
+      # per-repo budget shared with sccache/rust-cache in ci.yml. The reuse that
+      # matters here is buildx's LOCAL layer cache on this one runner: the
+      # server build compiles the workspace, and the operator and ingest-router
+      # builds that follow reuse that builder layer instead of recompiling.
+      #
+      # Decision 13: push by digest and NO tag. `push-by-digest=true` publishes
+      # the single-platform manifest under its content digest with no tag ref;
+      # the tags decision 3 defines are applied later, by the merge job, onto
+      # the assembled manifest list. `name` is the target's canonical image
+      # reference so the digest is pushed into the right repository.
+      #
+      # Decision 15: SBOM and max-mode provenance stay on each PLATFORM build
+      # (not the merge). They attach per platform here and the merge's
+      # imagetools create carries the attestation manifests into the assembled
+      # index.
+      - name: Build and push ravel-server by digest
+        id: build-server
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          target: server
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/ravel-server,push-by-digest=true,name-canonical=true,push=true
+          sbom: true
+          provenance: mode=max
+
+      - name: Build and push ravel-operator by digest
+        id: build-operator
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          target: operator
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/ravel-operator,push-by-digest=true,name-canonical=true,push=true
+          sbom: true
+          provenance: mode=max
+
+      - name: Build and push ravel-ingest-router by digest
+        id: build-ingest-router
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          target: ingest-router
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/ravel-ingest-router,push-by-digest=true,name-canonical=true,push=true
+          sbom: true
+          provenance: mode=max
+
+      # Decision 13: each per-platform digest reaches the merge job as an
+      # uploaded artifact, NOT as a job output. A matrix's job outputs collapse
+      # to a single last-writer-wins value, so routing them through outputs
+      # would silently publish an index containing whichever build finished
+      # last. The digest travels as the artifact's filename (an empty marker
+      # file named by the digest's hex), one per-target directory so the three
+      # globs below never collide, so the merge job can reconstruct
+      # `<image>@sha256:<digest>` for each platform.
+      - name: Export digests
+        env:
+          SERVER_DIGEST: ${{ steps.build-server.outputs.digest }}
+          OPERATOR_DIGEST: ${{ steps.build-operator.outputs.digest }}
+          INGEST_ROUTER_DIGEST: ${{ steps.build-ingest-router.outputs.digest }}
+        run: |
+          set -euo pipefail
+          for pair in "server:$SERVER_DIGEST" "operator:$OPERATOR_DIGEST" \
+                      "ingest-router:$INGEST_ROUTER_DIGEST"; do
+            target="${pair%%:*}"
+            digest="${pair#*:}"
+            mkdir -p "${{ runner.temp }}/digests/$target"
+            touch "${{ runner.temp }}/digests/$target/${digest#sha256:}"
+          done
+
+      # Decision 14: the artifact name is scoped per target AND per platform
+      # (digest-server-linux-amd64), byte-identical to what the per-target merge
+      # jobs' `pattern: digest-<target>-*` expects, so collapsing the build
+      # matrix needs no change there. upload-artifact v4 rejects a duplicate
+      # name, so a cross-target or cross-platform mix-up fails the run instead
+      # of silently overwriting a digest and yielding a wrong index that still
+      # passes the digest-equality check downstream.
+      - name: Upload ravel-server digest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: digest-server-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/digests/server/*
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload ravel-operator digest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: digest-operator-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/digests/operator/*
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload ravel-ingest-router digest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: digest-ingest-router-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/digests/ingest-router/*
+          if-no-files-found: error
+          retention-days: 1
+
+      # ADR-0086 decision 3: export the non-runtime debug-symbols stage and
+      # upload the separated .debug files for task #248's release job to attach
+      # next to the stripped binaries. This build reuses the same builder layer
+      # the three image builds already compiled on this runner, so it recompiles
+      # nothing; type=local writes the stage's files to a directory.
+      #
+      # One builder stage produces all four binaries, so the debug-symbols stage
+      # carries all four .debug files and there is exactly ONE export per
+      # platform, not one per target. The artifact name is therefore
+      # debug-symbols-<platform> (per-platform-unique, so upload-artifact v4's
+      # duplicate-name guard still fails a cross-platform mix-up); a per-target
+      # name cannot fit a single export that holds four files across three
+      # targets (server alone carries ravel-server.debug and ravel-cli.debug).
+      - name: Export debug symbols
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          target: debug-symbols
+          platforms: ${{ matrix.platform }}
+          outputs: type=local,dest=${{ runner.temp }}/debug
+          # Explicit, not inherited. BuildKit rejects attestations on the local
+          # exporter, so if the action ever attached its defaults here the step
+          # would hard-fail, and a failed build job skips every merge job and
+          # blocks the whole release. The action is believed to disable them for
+          # non-image exporters already; stating it costs two lines and removes
+          # the dependency on that behaviour.
+          provenance: false
+          sbom: false
+
+      - name: Upload debug symbols
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: debug-symbols-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/debug/*.debug
+          if-no-files-found: error
+          retention-days: 1
+
+  # ADR-0037 multi-arch amendment, decisions 13-17. One merge job per target
+  # assembles that target's two per-platform digests into a single manifest
+  # list, applies the tags, signs the assembled index, and verifies the result.
+  merge:
+    needs: [gate, build]
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    # Decision 17: signing moved here, so id-token: write lives here alongside
+    # packages: write. The build jobs dropped id-token; this is the only job
+    # that requests an OIDC token, for Fulcio to bind the signature to this
+    # workflow's identity.
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [server, operator, ingest-router]
+    steps:
+      # Download only THIS target's per-platform digest artifacts. The pattern
+      # excludes the other two targets, and merge-multiple lands both platform
+      # marker files in one directory. Decision 14's per-target naming is what
+      # makes this filter possible and what keeps a server merge from ever
+      # seeing an operator digest.
+      - name: Download digests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digest-${{ matrix.target }}-*
+          merge-multiple: true
+
+      - name: Determine tags
+        id: tags
+        run: |
+          set -euo pipefail
+          image="${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/ravel-${{ matrix.target }}"
+          # event_name, not ref_type: a workflow_dispatch run can be launched
+          # from a tag ref too, and that must still take the manual-<sha>
+          # branch below, not silently move latest/X/X.Y for that tag.
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            major="${version%%.*}"
+            minor="${version%.*}"
+            tag_args="-t $image:$version -t $image:$minor -t $image:$major -t $image:latest"
+            # Decision 14: the IMMUTABLE identity tag this run owns. X.Y.Z on a
+            # tag push; never latest/X/X.Y, which move and let a concurrent
+            # publish re-point them between the merge and the checks below.
+            identity="$image:$version"
+          else
+            short_sha="${GITHUB_SHA:0:7}"
+            tag_args="-t $image:manual-$short_sha"
+            identity="$image:manual-$short_sha"
+          fi
+          {
+            echo "image=$image"
+            echo "tag_args=$tag_args"
+            echo "identity=$identity"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      # Decision 13: assemble the two per-platform digests into one manifest
+      # list and apply the tags to it. imagetools create carries each source
+      # manifest (and, per decision 15, its attestation manifests) into the
+      # index. Sources are reconstructed as `<image>@sha256:<file>` from the
+      # marker filenames downloaded above.
+      - name: Create manifest list and push
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          set -euo pipefail
+          # One marker file per platform, named by the digest hex. Assert the
+          # count before assembling: a missing artifact would otherwise build a
+          # one-platform index that only fails later, in the platform-entry
+          # check, with an error that does not name the cause.
+          count="$(find . -maxdepth 1 -type f -printf '.' | wc -c)"
+          if [[ "$count" -ne 2 ]]; then
+            echo "::error::expected 2 per-platform digest files, found $count"
+            ls -la
+            exit 1
+          fi
+          # SC2046 is deliberate on both expansions: tag_args carries several
+          # -t flags and the printf emits one `<image>@sha256:<hex>` source per
+          # platform, so word splitting is what turns each into its own
+          # argument. The values cannot contain whitespace (a tag from a
+          # v[0-9]+.[0-9]+.[0-9]+ ref or a 7-char sha; filenames are digest
+          # hex), so there is nothing for splitting to get wrong.
+          # shellcheck disable=SC2046
+          docker buildx imagetools create ${{ steps.tags.outputs.tag_args }} \
+            $(printf '${{ steps.tags.outputs.image }}@sha256:%s ' *)
+
+      # Decision 14: resolve the digest of the ASSEMBLED index from the
+      # registry, from the run's immutable identity tag. This is the digest that
+      # gets signed. imagetools inspect --format '{{json .Manifest}}' returns
+      # the top-level index descriptor for the tag; its .digest is the index
+      # digest. Chosen over trusting build-push-action's per-platform
+      # steps.build.outputs.digest (decision 14: that is now a per-platform
+      # digest, and signing it would leave the published tagged index unsigned
+      # while every log line still read as success).
+      - name: Resolve assembled index digest
+        id: index
+        run: |
+          set -euo pipefail
+          identity="${{ steps.tags.outputs.identity }}"
+          digest="$(docker buildx imagetools inspect --format '{{json .Manifest}}' "$identity" | jq -r '.digest')"
+          if [[ -z "$digest" || "$digest" != sha256:* ]]; then
+            echo "::error::could not resolve assembled index digest for $identity (got '$digest')"
+            exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
+
+      # Decision 14: cosign signs the ASSEMBLED index digest, not a per-platform
+      # digest. Keyless mode uses the id-token above; no key or secret is
+      # stored. Signing by digest (not tag) covers the exact bytes published,
+      # including the SBOM and provenance attestations carried into the index.
+      - name: Sign the assembled index digest
+        env:
+          IMAGE: ${{ steps.tags.outputs.image }}
+          DIGEST: ${{ steps.index.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      # Decision 14 verification (a): the digest that was signed must equal the
+      # digest the immutable identity tag resolves to right now.
+      #
+      # Read what this does and does not prove. Both sides trace back to one
+      # imagetools inspect of the same tag, so it does NOT prove the sign step
+      # signed the right object: a refactor that signed some other digest while
+      # still feeding steps.index.outputs.digest to this comparison would pass
+      # here. That coverage comes from check (c) below, which verifies the
+      # signature against the tag itself and fails when the two diverge.
+      #
+      # What (a) catches on its own is the race decision 14 names: a concurrent
+      # publish re-pointing this tag between the resolve and the signature.
+      # Cheap, and it fails the job rather than leaving a signature over an
+      # index this run did not publish.
+      - name: Verify signed digest matches identity tag
+        env:
+          IDENTITY: ${{ steps.tags.outputs.identity }}
+          SIGNED: ${{ steps.index.outputs.digest }}
+        run: |
+          set -euo pipefail
+          resolved="$(docker buildx imagetools inspect --format '{{json .Manifest}}' "$IDENTITY" | jq -r '.digest')"
+          echo "signed:   $SIGNED"
+          echo "resolved: $resolved"
+          if [[ "$SIGNED" != "$resolved" ]]; then
+            echo "::error::signed digest $SIGNED does not match identity tag $IDENTITY digest $resolved (decision 14)"
+            exit 1
+          fi
+
+      # Decision 14 verification (b): the assembled index must carry exactly the
+      # linux/amd64 and linux/arm64 runnable platform entries and no others.
+      # SBOM and provenance attestation manifests appear in the index with
+      # platform unknown/unknown; filtering those out means their presence does
+      # not fail the check, while a third runnable platform, a missing one, or a
+      # duplicate does (the sorted list would then differ from the expected
+      # two-line set).
+      - name: Verify index platform entries
+        env:
+          IDENTITY: ${{ steps.tags.outputs.identity }}
+        run: |
+          set -euo pipefail
+          platforms="$(docker buildx imagetools inspect --raw "$IDENTITY" \
+            | jq -r '.manifests[]
+                | select(.platform.os != "unknown" and .platform.architecture != "unknown")
+                | "\(.platform.os)/\(.platform.architecture)"' \
+            | sort)"
+          expected="$(printf 'linux/amd64\nlinux/arm64')"
+          echo "runnable platforms in $IDENTITY:"
+          echo "$platforms"
+          if [[ "$platforms" != "$expected" ]]; then
+            echo "::error::index $IDENTITY runnable platforms are not exactly linux/amd64 and linux/arm64 (decision 14)"
+            exit 1
+          fi
+
+      # Decision 14 verification (c): cosign verify against the same immutable
+      # identity tag, using the exact invocation README.md's "Verifying
+      # signatures" section documents (exact --certificate-identity, not a
+      # regex; the same OIDC issuer). The identity is this workflow's own path
+      # and ref, which is what the Fulcio certificate binds to: on a real
+      # release from the mirror this is the NOFireAI/ravel path at
+      # refs/tags/vX.Y.Z the README shows.
+      - name: Verify signature with cosign
+        env:
+          IDENTITY: ${{ steps.tags.outputs.identity }}
+          CERT_IDENTITY: ${{ github.server_url }}/${{ github.repository }}/.github/workflows/publish-images.yml@${{ github.ref }}
+        run: |
+          set -euo pipefail
+          cosign verify \
+            --certificate-identity "$CERT_IDENTITY" \
+            --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+            "$IDENTITY"
+
+  # ADR-0086 decisions 1-5. Turns the tag push into a GitHub Release carrying
+  # the binaries out of the images this run just published, their separated
+  # debug symbols, a signed checksum file, and notes.
+  #
+  # Decision 1: this needs ALL THREE per-target merge jobs (naming the matrix
+  # job once waits on every leg), so a Release cannot exist unless all three
+  # images published AND each passed its own signature and platform-entry
+  # checks. `if: github.event_name == 'push'` keeps a workflow_dispatch run,
+  # which publishes throwaway manual-<sha> tags, from ever creating one; the
+  # dispatch run SKIPS this job rather than failing it.
+  release:
+    needs: merge
+    if: github.event_name == 'push'
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    # Decision 1, exactly these two. contents: write to create the Release,
+    # id-token: write for keyless cosign over SHA256SUMS. Deliberately NO
+    # packages permission: every image this job reads is public and is pulled
+    # anonymously (there is no docker/login-action step below). Copying the
+    # merge job's block and adding contents: write would produce a job holding
+    # all three and would undo the least-privilege split ADR-0037 decision 17
+    # established, and the header comment above about which job holds
+    # packages: write would become false.
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      # The tagged tree: decision 5 reads CHANGELOG.md from it, so a section
+      # only reaches a Release if it was committed before the tag was cut.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
+
+      # The tag push is v X.Y.Z; the identity tag the merge jobs applied, and
+      # the CHANGELOG.md section heading, are both the version without the v.
+      - name: Resolve release version
+        run: |
+          set -euo pipefail
+          echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      # Decision 2: check "extracted from the signed image" instead of assuming
+      # it. This is README.md's "Verifying signatures" invocation verbatim
+      # (exact --certificate-identity, not a regex; the same OIDC issuer), run
+      # against each of the three immutable identity tags before anything is
+      # pulled out of them.
+      - name: Verify published images with cosign
+        env:
+          REGISTRY: ${{ env.REGISTRY }}
+          IMAGE_OWNER: ${{ env.IMAGE_OWNER }}
+          CERT_IDENTITY: ${{ github.server_url }}/${{ github.repository }}/.github/workflows/publish-images.yml@${{ github.ref }}
+        run: |
+          set -euo pipefail
+          for target in server operator ingest-router; do
+            identity="$REGISTRY/$IMAGE_OWNER/ravel-$target:$VERSION"
+            echo "verifying $identity"
+            cosign verify \
+              --certificate-identity "$CERT_IDENTITY" \
+              --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+              "$identity"
+          done
+
+      # Decision 3: the .debug files were separated in the BUILDER stage, one
+      # export per platform carrying all four, and uploaded by the build job as
+      # debug-symbols-<platform>. No merge-multiple: both artifacts hold the
+      # same four basenames, so merging them into one directory would have one
+      # platform's symbols silently overwrite the other's. Each artifact lands
+      # in its own <path>/<artifact-name>/ directory instead.
+      - name: Download debug symbols
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/debug
+          pattern: debug-symbols-*
+
+      # Decision 2. Per target: resolve the PLATFORM-SPECIFIC digests from the
+      # registry by inspecting the run's immutable identity tag, then extract
+      # by digest.
+      #
+      # Three shortcuts are ruled out and each is a trap this pipeline already
+      # documented:
+      #   - needs.merge.outputs: merge is a three-target matrix and a matrix's
+      #     job outputs collapse last-writer-wins (ADR-0037 decision 13), so
+      #     two of the three targets would silently get a third's digest.
+      #   - pulling the tag with --platform (ADR-0037 decision 14).
+      #   - docker run: the distroless runtime has no shell. docker create plus
+      #     docker cp is the only primitive that works, and it never executes
+      #     the image, which is why extracting the foreign-architecture half on
+      #     this amd64 runner works at all (docker create warns about the
+      #     platform mismatch and proceeds).
+      #
+      # The unknown/unknown entries filtered out here are the SBOM and
+      # provenance attestation manifests, exactly as the merge job's
+      # platform-entry check filters them.
+      #
+      # Nothing is stripped, objcopy'd or compressed: wave 2 already stripped
+      # these binaries in the builder, so what a user downloads is byte-identical
+      # to what is inside the signed image, and that only holds while this job
+      # modifies nothing. A single job could not correctly objcopy a
+      # foreign-architecture ELF anyway (decision 3).
+      - name: Extract binaries from the published images
+        env:
+          REGISTRY: ${{ env.REGISTRY }}
+          IMAGE_OWNER: ${{ env.IMAGE_OWNER }}
+          ASSETS: ${{ runner.temp }}/assets
+        run: |
+          set -euo pipefail
+          mkdir -p "$ASSETS"
+          # <target>:<binary>[,<binary>...]: the expected inventory. docker cp
+          # exits non-zero on an absent path, so a Dockerfile change that drops
+          # or renames a binary fails the release loudly here instead of
+          # publishing a Release with an asset silently missing.
+          for spec in "server:ravel-server,ravel-cli" \
+                      "operator:ravel-operator" \
+                      "ingest-router:ravel-ingest-router"; do
+            target="${spec%%:*}"
+            binaries="${spec#*:}"
+            image="$REGISTRY/$IMAGE_OWNER/ravel-$target"
+            identity="$image:$VERSION"
+
+            entries="$(docker buildx imagetools inspect --raw "$identity" \
+              | jq -r '.manifests[]
+                  | select(.platform.os != "unknown" and .platform.architecture != "unknown")
+                  | "\(.platform.os)/\(.platform.architecture) \(.digest)"' \
+              | sort)"
+            if [[ -z "$entries" ]]; then
+              echo "::error::no runnable platform entries in $identity"
+              exit 1
+            fi
+            found="$(printf '%s\n' "$entries" | wc -l | tr -d '[:space:]')"
+            if [[ "$found" -ne 2 ]]; then
+              echo "::error::expected 2 runnable platform entries in $identity, found $found"
+              printf '%s\n' "$entries"
+              exit 1
+            fi
+
+            while read -r platform digest; do
+              os="${platform%%/*}"
+              arch="${platform##*/}"
+              ref="$image@$digest"
+              echo "extracting $binaries from $ref ($platform)"
+              # </dev/null on every docker call: this loop reads $entries on
+              # stdin, and a command that consumed it would eat the second
+              # platform's line.
+              docker pull --quiet "$ref" < /dev/null
+              cid="$(docker create "$ref" < /dev/null)"
+              IFS=',' read -r -a bins <<< "$binaries"
+              for bin in "${bins[@]}"; do
+                dest="$ASSETS/$bin-$os-$arch"
+                docker cp "$cid:/usr/local/bin/$bin" "$dest" < /dev/null
+                if [[ ! -s "$dest" ]]; then
+                  echo "::error::/usr/local/bin/$bin extracted from $ref is missing or empty"
+                  exit 1
+                fi
+              done
+              docker rm --force "$cid" < /dev/null > /dev/null
+            done <<< "$entries"
+          done
+          ls -l "$ASSETS"
+
+      # Decision 3: ONE archive per platform, and the four basenames inside it
+      # are preserved exactly as the builder wrote them.
+      # --add-gnu-debuglink records a BASENAME, so the stripped ravel-server
+      # points at "ravel-server.debug"; an asset renamed to
+      # ravel-server-linux-amd64.debug would never auto-resolve in gdb and the
+      # whole point of shipping symbols would be gone while every step still
+      # exited 0. tar -C <platform dir> with bare basenames is what keeps them,
+      # and the per-platform archive name is what keeps the two platforms'
+      # identical basenames apart.
+      - name: Build debug symbol archives
+        env:
+          DEBUG_DIR: ${{ runner.temp }}/debug
+          ASSETS: ${{ runner.temp }}/assets
+        run: |
+          set -euo pipefail
+          for platform in linux/amd64 linux/arm64; do
+            os="${platform%%/*}"
+            arch="${platform##*/}"
+            src="$DEBUG_DIR/debug-symbols-$os-$arch"
+            if [[ ! -d "$src" ]]; then
+              echo "::error::artifact debug-symbols-$os-$arch was not downloaded"
+              ls -R "$DEBUG_DIR"
+              exit 1
+            fi
+            for sym in ravel-server.debug ravel-cli.debug \
+                       ravel-operator.debug ravel-ingest-router.debug; do
+              if [[ ! -s "$src/$sym" ]]; then
+                echo "::error::$sym is missing or empty in debug-symbols-$os-$arch"
+                ls -l "$src"
+                exit 1
+              fi
+            done
+            tar -czf "$ASSETS/ravel-debug-symbols-$os-$arch.tar.gz" \
+              -C "$src" \
+              ravel-server.debug ravel-cli.debug \
+              ravel-operator.debug ravel-ingest-router.debug
+          done
+
+      # Decision 4: ONE SHA256SUMS covering EVERY uploaded asset, binaries and
+      # symbol archives alike, signed once. Not one signature per asset.
+      #
+      # The expected count is asserted, not assumed: 4 binaries x 2 platforms
+      # plus 1 symbol archive x 2 platforms. If the inventory or the platform
+      # set ever changes, this fails and forces the arithmetic to be revisited
+      # rather than shipping a checksum file that covers less than the Release
+      # does. SHA256SUMS is written outside $ASSETS and moved in, so the glob
+      # that lists the assets cannot pick up the file being written.
+      - name: Write SHA256SUMS
+        working-directory: ${{ runner.temp }}/assets
+        env:
+          SUMS_TMP: ${{ runner.temp }}/SHA256SUMS
+        run: |
+          set -euo pipefail
+          mapfile -t assets < <(find . -maxdepth 1 -type f -printf '%P\n' | sort)
+          if [[ "${#assets[@]}" -ne 10 ]]; then
+            echo "::error::expected 10 assets to checksum (8 binaries + 2 symbol archives), found ${#assets[@]}"
+            printf '%s\n' "${assets[@]}"
+            exit 1
+          fi
+          sha256sum -- "${assets[@]}" > "$SUMS_TMP"
+          mv "$SUMS_TMP" SHA256SUMS
+          cat SHA256SUMS
+
+      # Decision 4: the same keyless mode ADR-0037 decision 7 uses for images,
+      # backed by this job's id-token. The detached signature and the Fulcio
+      # certificate ship beside the file so a user can verify with
+      # cosign verify-blob and no pre-shared key.
+      - name: Sign SHA256SUMS
+        working-directory: ${{ runner.temp }}/assets
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes \
+            --output-signature SHA256SUMS.sig \
+            --output-certificate SHA256SUMS.pem \
+            SHA256SUMS
+
+      # Decision 5: GitHub's generated notes (the merged pull requests since
+      # the previous tag) are the base, with the matching CHANGELOG.md section
+      # from the TAGGED TREE prepended when one exists. An absent section is a
+      # ::notice::, never a failure: a release that fails closed on a
+      # documentation lapse is a release that gets cut by hand instead.
+      - name: Compose release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_HOST: ${{ github.server_url }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          CERT_IDENTITY: ${{ github.server_url }}/${{ github.repository }}/.github/workflows/publish-images.yml@${{ github.ref }}
+          NOTES: ${{ runner.temp }}/notes.md
+        run: |
+          set -euo pipefail
+          export GH_HOST="${GH_HOST#https://}"
+          export GH_HOST="${GH_HOST#http://}"
+
+          generated="$(gh api --method POST "repos/$REPO/releases/generate-notes" \
+            -f tag_name="$TAG" --jq '.body')"
+
+          # Accepts both "## [X.Y.Z]" and "## [X.Y.Z] - <date>", and stops at
+          # the next level-2 heading.
+          changelog="$(awk -v ver="$VERSION" '
+            /^## / {
+              if (found) { exit }
+              found = ($0 == "## [" ver "]" || index($0, "## [" ver "] ") == 1)
+            }
+            found { print }
+          ' CHANGELOG.md)"
+          if [[ -z "$changelog" ]]; then
+            echo "::notice::CHANGELOG.md in the tagged tree has no [$VERSION] section; releasing with generated notes only (ADR-0086 decision 5)"
+          fi
+
+          {
+            if [[ -n "$changelog" ]]; then
+              printf '%s\n\n' "$changelog"
+            fi
+            printf '%s\n\n' "$generated"
+            sed -e "s|@CERT_IDENTITY@|$CERT_IDENTITY|" \
+                -e "s|@VERSION@|$VERSION|" <<'NOTES_TAIL'
+          ## Downloads
+
+          The attached binaries were extracted unmodified from the signed container
+          images this release published, so each one is byte-identical to the file inside
+          the image you can pull. They are **glibc-dynamic, built against Debian 12**
+          (the runtime image is `gcr.io/distroless/cc-debian12`), so they need glibc 2.36
+          or newer. On an older distribution, run the container image instead:
+
+          ```sh
+          docker pull ghcr.io/nofireai/ravel-server:@VERSION@
+          ```
+
+          One binary per platform, named `<binary>-<os>-<arch>`:
+
+          - `ravel-server-linux-amd64`, `ravel-server-linux-arm64`
+          - `ravel-cli-linux-amd64`, `ravel-cli-linux-arm64`
+          - `ravel-operator-linux-amd64`, `ravel-operator-linux-arm64`
+          - `ravel-ingest-router-linux-amd64`, `ravel-ingest-router-linux-arm64`
+
+          ### Verifying the downloads
+
+          `SHA256SUMS` covers every attached binary and symbol archive. Check the files
+          you downloaded, then verify `SHA256SUMS` itself against the signature and
+          certificate beside it. The signature is keyless, bound to this release
+          workflow's identity, so there is no key to obtain:
+
+          ```sh
+          sha256sum --check --ignore-missing SHA256SUMS
+
+          cosign verify-blob \
+            --certificate SHA256SUMS.pem \
+            --signature SHA256SUMS.sig \
+            --certificate-identity '@CERT_IDENTITY@' \
+            --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+            SHA256SUMS
+          ```
+
+          ### Debug symbols
+
+          The shipped binaries are stripped of debug info but keep their symbol table,
+          so a backtrace resolves function names with nothing extra installed. Line
+          numbers come from the matching symbols archive. Each binary records the
+          basename of its symbol file, so unpacking the archive next to the binary is
+          enough and no `symbol-file` step is needed:
+
+          ```sh
+          tar -xzf ravel-debug-symbols-linux-amd64.tar.gz
+          gdb ./ravel-server-linux-amd64
+          ```
+
+          `gdb` looks for `ravel-server.debug` in the same directory (and in
+          `.debug/`), which is the name inside the archive. Do not rename the extracted
+          `.debug` files.
+          NOTES_TAIL
+          } > "$NOTES"
+          cat "$NOTES"
+
+      # Decision 1: gh, not an action, so the Release is created by the same
+      # ambient token the permission block above scopes. Every asset built
+      # above is attached in one call. --verify-tag refuses to create a Release
+      # for a tag that does not exist rather than creating the tag itself.
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_HOST: ${{ github.server_url }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          NOTES: ${{ runner.temp }}/notes.md
+          ASSETS: ${{ runner.temp }}/assets
+        run: |
+          set -euo pipefail
+          export GH_HOST="${GH_HOST#https://}"
+          export GH_HOST="${GH_HOST#http://}"
+          mapfile -t asset_files < <(find "$ASSETS" -maxdepth 1 -type f | sort)
+          # 10 checksummed assets plus SHA256SUMS and its .sig and .pem.
+          if [[ "${#asset_files[@]}" -ne 13 ]]; then
+            echo "::error::expected 13 release assets, found ${#asset_files[@]}"
+            printf '%s\n' "${asset_files[@]}"
+            exit 1
+          fi
+          gh release create "$TAG" \
+            --verify-tag \
+            --title "$TAG" \
+            --notes-file "$NOTES" \
+            "${asset_files[@]}"

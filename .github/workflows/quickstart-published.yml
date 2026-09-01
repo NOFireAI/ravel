@@ -1,0 +1,232 @@
+name: quickstart-published
+
+# Weekly published-image README check (ADR-0081 decision 8).
+#
+# The per-PR `quickstart` job in ci.yml proves the README matches the code at
+# HEAD, by building the PR's own binaries into an image and running the marked
+# README command blocks against it. It CANNOT prove the README matches the image
+# a reader actually pulls, because a merged doc change ships before the next
+# release tag does. This lane closes that window: it runs the same
+# `scripts/check-readme-commands.sh README.md` against the PUBLISHED images, on a
+# schedule, so a drift between main's README and the shipped image surfaces here
+# rather than in a stranger's terminal.
+#
+# It runs the check TWICE (ADR-0081 decisions 8 and 1), as two independent matrix
+# legs so a failure names exactly which one broke:
+#   - `latest`         -- RAVEL_IMAGE=ghcr.io/nofireai/ravel-server:latest, the
+#                         tag a reader following the README pulls.
+#   - `pinned-default` -- the compose file's own pinned default, unmodified
+#                         (RAVEL_IMAGE left unset). This is the one configuration
+#                         nothing else exercises: the per-PR job overrides
+#                         RAVEL_IMAGE with the image it just built, and the
+#                         `latest` leg overrides it with :latest, so a stale pin
+#                         in deploy/docker-compose/ravel.yml (a tag that no longer
+#                         resolves) would otherwise first fail in a reader's first
+#                         command. It fails here instead.
+# `fail-fast: false` keeps both legs running so a green `latest` never masks a red
+# pinned default, and each leg files its own tracking issue.
+#
+# NOT a required check and NOT gated on any PR: triggers are `schedule` and
+# `workflow_dispatch` ONLY, never push / pull_request / merge_group, so this lane
+# can never block a merge (house style, matching bench-s3.yml). Unlike the per-PR
+# job it builds nothing -- no cargo, no Dockerfile.prebuilt, no image assembly. It
+# pulls the published images and brings up the same compose stack the reader runs.
+#
+# ---------------------------------------------------------------------------
+# THE ONE LEGITIMATE RED STATE (read this if you are looking at a red run at 3am)
+# ---------------------------------------------------------------------------
+# There is exactly one way this lane goes red that is NOT a defect, and the lane
+# cannot tell it apart from a real one (ADR-0081 decision 8): between merging a
+# README that documents unreleased behavior and cutting the release, `:latest`
+# genuinely does not do what the README says, so the `latest` leg fails honestly.
+#
+# The policy that resolves it, quoted from decision 8:
+#
+#   "main's README documents released behavior. A change that documents behavior
+#    not yet on a release tag either waits for the tag or ships with those blocks
+#    unmarked until it lands. If the weekly lane goes red, the remediation is to
+#    cut the release or correct the README, never to wait it out."
+#
+# So: do NOT disable this lane, do NOT wait for it to clear on its own. Either cut
+# the release that publishes the documented behavior, or correct main's README to
+# describe what the current release actually does. A `latest` leg that is red
+# because main documents unreleased behavior is main's README being out of policy,
+# not this lane being noisy. (The `pinned-default` leg has no such window: it runs
+# the compose file's committed tag, so a red there is always a real defect -- a
+# stale pin or a genuine README/image mismatch.)
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly, Sunday 06:29 UTC. Off-peak (weekend morning) and off the :00 mark,
+    # matching bench-s3.yml's convention, and on a different day/time than that
+    # lane so the two scheduled runs do not contend. One run a week is enough to
+    # catch a README/published-image drift before a reader does.
+    - cron: "29 6 * * 0"
+
+# Minimum permissions for the deliverable's failure routing: `issues: write` lets
+# a red leg file or comment on a tracking issue; `contents: read` is what
+# actions/checkout needs. Nothing else is granted.
+permissions:
+  contents: read
+  issues: write
+
+env:
+  COMPOSE_FILE: deploy/docker-compose/ravel.yml
+  # The check script's readiness poll and marked blocks talk to the loopback
+  # port the compose stack publishes; the token is the demo tenant token the
+  # compose file configures. Mirrors the per-PR quickstart job's env exactly.
+  RAVEL_HTTP_BASE: http://127.0.0.1:4318
+  RAVEL_TENANT_TOKEN: demo-token
+  # RAVEL_READY_QUERY_URL has NO default in check-readme-commands.sh and hard
+  # errors when empty, so it is exported explicitly here. `gen` is the series
+  # telemetrygen emits deterministically (ADR-0081 D5); no host-metric name is
+  # guaranteed non-empty across both generators, so it is the only safe readiness
+  # query. Same value the per-PR quickstart job uses.
+  RAVEL_READY_QUERY_URL: http://127.0.0.1:4318/api/v1/query?query=gen
+  # Label carried by every tracking issue this lane files, and the key it dedups
+  # on. Constant across both legs.
+  ISSUE_LABEL: quickstart-published
+
+jobs:
+  check-published:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      # Never let a green leg cancel or hide a red one: both runs must complete
+      # and be diagnosable on their own.
+      fail-fast: false
+      matrix:
+        include:
+          # The tag a reader pulls when they follow the README.
+          - name: latest
+            image: ghcr.io/nofireai/ravel-server:latest
+          # The compose file's own pinned default, unmodified: RAVEL_IMAGE stays
+          # unset (empty string here), so `${RAVEL_IMAGE:-<pin>}` in ravel.yml
+          # resolves to the committed pin.
+          - name: pinned-default
+            image: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      # Bring up the SAME compose stack the reader runs (ADR-0081 decisions 1-3),
+      # modelled on the per-PR quickstart job. `--pull always` forces the freshest
+      # published images so this lane tests what a reader actually pulls today,
+      # not a cached layer. The `latest` leg overrides RAVEL_IMAGE; the
+      # `pinned-default` leg leaves it unset so the compose file's pin is used.
+      - name: Bring up the compose stack
+        env:
+          RAVEL_IMAGE_OVERRIDE: ${{ matrix.image }}
+        run: |
+          if [ -n "$RAVEL_IMAGE_OVERRIDE" ]; then
+            echo "leg=${{ matrix.name }}: RAVEL_IMAGE=$RAVEL_IMAGE_OVERRIDE"
+            export RAVEL_IMAGE="$RAVEL_IMAGE_OVERRIDE"
+          else
+            echo "leg=${{ matrix.name }}: RAVEL_IMAGE unset, using the compose file's pinned default"
+          fi
+          docker compose -f "$COMPOSE_FILE" up -d --pull always
+
+      # Same bounded readiness loop as the per-PR quickstart job: poll /readyz
+      # until the server can serve, dumping compose logs and failing if it never
+      # comes up. A fixed sleep would race image-pull and startup time.
+      - name: Wait for ravel-server readiness
+        run: |
+          for _ in $(seq 1 60); do
+            if curl -fsS "${RAVEL_HTTP_BASE}/readyz" >/dev/null 2>&1; then
+              echo "ravel-server ready"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "::error::ravel-server did not become ready in time (leg=${{ matrix.name }})"
+          docker compose -f "$COMPOSE_FILE" logs --no-color || true
+          exit 1
+
+      # telemetrygen injects the deterministic `gen` series the readiness query
+      # and the marked README blocks assert on (ADR-0081 D5), alongside the
+      # collector's host metrics. --network host so 127.0.0.1:4318 resolves to the
+      # published loopback port. Same step as the per-PR quickstart job.
+      - name: Generate deterministic telemetry with telemetrygen
+        run: |
+          docker run --rm --network host \
+            ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen:latest \
+            metrics \
+            --otlp-http \
+            --otlp-endpoint 127.0.0.1:4318 \
+            --otlp-insecure \
+            --otlp-header 'Authorization="Bearer demo-token"' \
+            --metric-type Gauge \
+            --metrics 500
+
+      # The check itself: wait for a non-empty first query, then run every marked
+      # README block and assert its declared outcome (not its exit code). This is
+      # the whole point of the lane; a failure here is a README/published-image
+      # drift.
+      - name: Assert the README's marked command blocks
+        run: scripts/check-readme-commands.sh README.md
+
+      # Always capture logs on failure: a scheduled failure nobody can diagnose is
+      # a lane that gets disabled (ADR-0081 decisions 6 and 8). Same as the per-PR
+      # job.
+      - name: Dump compose logs on failure
+        if: failure()
+        run: docker compose -f "$COMPOSE_FILE" logs --no-color || true
+
+      - name: Tear down the compose stack
+        if: always()
+        run: docker compose -f "$COMPOSE_FILE" down -v || true
+
+      # Failure routing (ADR-0081 decision 8): a red leg files a labelled tracking
+      # issue linking this run, or comments on the existing open one for this leg
+      # so an ongoing breakage does not open a fresh issue every week. Per-leg, so
+      # the title names which of the two runs (latest / pinned-default) failed.
+      - name: File or update the tracking issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Deterministic (no run id): both the issue title and the dedup key, so
+          # a recurring failure for the same leg maps to one open issue.
+          MARKER: "Weekly quickstart-published lane is red (${{ matrix.name }} image)"
+        run: |
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          # Best-effort: ensure the label exists so `gh issue create --label`
+          # cannot fail on a missing label. Ignores "already exists".
+          gh label create "$ISSUE_LABEL" \
+            --color BFD4F2 \
+            --description "Weekly published-image quickstart README check failures (ADR-0081 D8)" \
+            2>/dev/null || true
+          # Find an existing open issue for THIS leg by matching the deterministic
+          # marker in the title (env.MARKER inside the jq filter, literal substring
+          # via contains -- no regex escaping). Empty when none exists.
+          existing=$(gh issue list --state open --label "$ISSUE_LABEL" \
+            --json number,title \
+            --jq 'map(select(.title | contains(env.MARKER))) | .[0].number // empty') || existing=""
+          body=$(cat <<EOF
+          The weekly \`quickstart-published\` lane failed for the **${{ matrix.name }}** image.
+
+          - Run: $run_url
+          - Compose file: \`$COMPOSE_FILE\`
+          - Check: \`scripts/check-readme-commands.sh README.md\`
+
+          This lane runs the README's marked command blocks against the PUBLISHED
+          image (ADR-0081 decision 8), so a failure means main's README does not
+          match the image it is claiming to describe.
+
+          **Before assuming a defect**, note the one legitimate red state for the
+          \`latest\` leg (ADR-0081 D8): between merging a README that documents
+          unreleased behavior and cutting the release, \`:latest\` genuinely does
+          not match. The policy is that *main's README documents released
+          behavior*, and the remediation is to **cut the release or correct the
+          README, never to wait it out**. The \`pinned-default\` leg has no such
+          window: a red there is always a real defect (a stale pin in the compose
+          file, or a genuine README/image mismatch).
+
+          See the run's "Dump compose logs on failure" step for stack logs.
+          EOF
+          )
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+            echo "commented on existing issue #$existing"
+          else
+            gh issue create --title "$MARKER" --label "$ISSUE_LABEL" --body "$body"
+          fi

@@ -1,0 +1,1565 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Cancel a superseded run for the same ref so a force-push to an open PR does
+# not leave the old run burning coverage/k8s minutes to completion (ADR-0053
+# D3). Keyed on the workflow plus the ref. `cancel-in-progress` is disabled on
+# `main` itself: a push to main is history other things build on, so its run
+# must always finish rather than be cancelled by the next push. It stays true
+# for PR and merge-queue refs, where only the latest run matters.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  # Lets a docs-only change (README, PROGRESS, ADRs, guides, diagrams) skip
+  # the whole cargo-loop straight to green instead of waiting on six
+  # compiling jobs that touch none of the changed files. Diffs against the
+  # merge-base rather than the base branch tip, so commits landing on main
+  # during an open PR don't get pulled into the changed-file list. Any file
+  # outside `*.md` / `*.svg` flips this back to the normal full run.
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      # docs_only skips every compiling job (ADR-0053 pre-D4 behaviour). The
+      # four *_area outputs (ADR-0053 D4) narrow which lanes run within a
+      # non-docs change: a lane runs only when docs_only is false AND its own
+      # area output is true. Mappings are conservative -- when a change cannot
+      # be proven irrelevant to a lane, the area is forced true so the lane
+      # runs (see the workspace-level rule and the merge_group/no-base full-run
+      # branches below).
+      docs_only: ${{ steps.check.outputs.docs_only }}
+      server_or_operator: ${{ steps.check.outputs.server_or_operator }}
+      sql_area: ${{ steps.check.outputs.sql_area }}
+      promql_area: ${{ steps.check.outputs.promql_area }}
+      object_store_area: ${{ steps.check.outputs.object_store_area }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - id: check
+        run: |
+          # Emit all five outputs from a single point so no code path forgets
+          # one. $1 is docs_only; $2..$5 are the four area flags in output
+          # order (server_or_operator, sql_area, promql_area, object_store_area).
+          emit() {
+            {
+              echo "docs_only=$1"
+              echo "server_or_operator=$2"
+              echo "sql_area=$3"
+              echo "promql_area=$4"
+              echo "object_store_area=$5"
+            } >> "$GITHUB_OUTPUT"
+          }
+          # merge_group events (the GitHub merge queue, ADR-0053 D1) carry no
+          # base SHA to diff against: the payload has merge_group.base_sha but
+          # no github.event.before, and the queued tree must exercise every
+          # lane the way main will. Force the full run (docs_only false, every
+          # area true) rather than fall through to the empty-base heuristic
+          # below, so a queued merge can never silently skip compiling lanes as
+          # if it were docs-only or a narrow single-area change.
+          if [ "${{ github.event_name }}" = "merge_group" ]; then
+            echo "::notice::merge_group event, running full CI"
+            emit false true true true true
+            exit 0
+          fi
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          else
+            base="${{ github.event.before }}"
+          fi
+          if [ -z "$base" ] || ! git cat-file -e "$base" 2>/dev/null; then
+            echo "::notice::no usable base commit, running full CI"
+            emit false true true true true
+            exit 0
+          fi
+          merge_base=$(git merge-base "$base" "${{ github.sha }}")
+          # ONE diff feeds every classification below; no per-area re-diff.
+          changed=$(git diff --name-only "$merge_base" "${{ github.sha }}")
+          if [ -z "$changed" ]; then
+            # No changed files (e.g. an empty-range push): nothing to prove
+            # irrelevant, so run everything, matching the pre-D4 docs_only=false
+            # default.
+            echo "::notice::no changed files, running full CI"
+            emit false true true true true
+            exit 0
+          fi
+          # docs-only: every changed path ends in .md or .svg (prose plus the
+          # diagrams that illustrate it). Areas are irrelevant then -- no
+          # compiling job runs at all -- so report them false.
+          if ! echo "$changed" | grep -qvE '\.(md|svg)$'; then
+            echo "::notice::docs-only change, skipping compiling jobs"
+            emit true false false false false
+            exit 0
+          fi
+          # Workspace-level paths change the build for every crate, so they
+          # force every area true: the root manifests, the lockfile, the
+          # toolchain pin, anything under .github/ (CI itself), and anything
+          # under proto/ (regenerates types every crate can depend on).
+          if echo "$changed" | grep -qE '^(Cargo\.toml|Cargo\.lock|rust-toolchain\.toml)$|^\.github/|^proto/'; then
+            echo "::notice::workspace-level change, running every area"
+            emit false true true true true
+            exit 0
+          fi
+          # Per-area path lists (conservative supersets; ravel-server and
+          # ravel-operator live under services/, not crates/). A path matching
+          # more than one list turns on every area it matches.
+          server_or_operator=false
+          sql_area=false
+          promql_area=false
+          object_store_area=false
+          if echo "$changed" | grep -qE '^services/ravel-server/|^services/ravel-operator/|^deploy/|^scripts/kind-up\.sh$|^scripts/kind-demo\.sh$|^scripts/kind-down\.sh$|^Dockerfile$|^Dockerfile\.prebuilt$|^\.dockerignore$'; then
+            server_or_operator=true
+          fi
+          if echo "$changed" | grep -qE '^crates/ravel-sql/|^services/ravel-server/|^crates/ravel-query/'; then
+            sql_area=true
+          fi
+          if echo "$changed" | grep -qE '^crates/ravel-promql/|^crates/ravel-promql-difftest/|^crates/ravel-query/'; then
+            promql_area=true
+          fi
+          if echo "$changed" | grep -qE '^crates/ravel-object-store/|^crates/ravel-bench/|^crates/ravel-commit/|^crates/ravel-catalog/|^crates/ravel-ingest/'; then
+            object_store_area=true
+          fi
+          # Catch-all: the four lists above are conservative allowlists, not a
+          # conservative superset of every workspace member -- a crate that
+          # matches none of them (ravel-types, ravel-segment, ravel-logseg,
+          # ravel-otlp, ravel-otap, and others not yet named above) would
+          # otherwise leave every area false, silently skipping required
+          # checks (sql, promql-difftest, object-store-contract) that ADR-0053
+          # D4 says must run whenever a lane "cannot be proven irrelevant".
+          # Checked per changed path, not by whether any area flag ended up
+          # true: a push that touches both a listed crate (e.g. ravel-sql,
+          # which sets sql_area true) and an unlisted one (e.g. ravel-types)
+          # in the same diff must still force every area true for the
+          # unlisted crate's sake, even though sql_area is already true.
+          area_paths='^services/ravel-server/|^services/ravel-operator/|^deploy/|^scripts/kind-up\.sh$|^scripts/kind-demo\.sh$|^scripts/kind-down\.sh$|^Dockerfile$|^Dockerfile\.prebuilt$|^\.dockerignore$|^crates/ravel-sql/|^crates/ravel-query/|^crates/ravel-promql/|^crates/ravel-promql-difftest/|^crates/ravel-object-store/|^crates/ravel-bench/|^crates/ravel-commit/|^crates/ravel-catalog/|^crates/ravel-ingest/'
+          if echo "$changed" | grep -E '^crates/|^services/' | grep -qvE "$area_paths"; then
+            echo "::notice::changed crate/service not in any named area list, running every area"
+            server_or_operator=true
+            sql_area=true
+            promql_area=true
+            object_store_area=true
+          fi
+          echo "::notice::areas server_or_operator=$server_or_operator sql=$sql_area promql=$promql_area object_store=$object_store_area"
+          emit false "$server_or_operator" "$sql_area" "$promql_area" "$object_store_area"
+
+  # Cheap, build-free guards wired in from ADR-0053 D6:
+  #   - scripts/check-doc-drift.sh recomputes the derived counts in
+  #     docs/query-engine.md's generated conformance block and diffs them, so
+  #     a stale block (the textually-clean-but-wrong parallel-merge case that
+  #     already slipped through once) fails CI instead of merging silently.
+  #   - `make test-python` runs the stdlib unittest suite for
+  #     scripts/process_metrics.py, which previously had no runner at all.
+  #   - scripts/guards/check-test-hygiene.sh greps the test sources for the
+  #     three shapes that produce a test which cannot fail: an assertion on
+  #     elapsed real time, an entropy draw with no seed, and a proptest
+  #     regression seed left untracked. Its own cases run first, so a guard
+  #     broken into always-passing fails here rather than going quiet.
+  # All exit non-zero on drift/failure, which fails this job.
+  #
+  # Deliberately not gated on docs_only and not `needs: changes`: it uses no
+  # cargo toolchain and no build, so it is seconds either way, and the
+  # doc-drift target it guards lives under docs/ -- a docs-only PR that edits
+  # docs/query-engine.md must still be checked, which a docs_only skip would
+  # miss. It is one lightweight runner, not a workspace compile.
+  doc-scripts:
+    # The guard only reads the checkout; nothing here needs write scope.
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Check derived-doc drift (docs/query-engine.md)
+        run: scripts/check-doc-drift.sh
+      - name: Check workspace version drift (ADR-0086 D8)
+        run: scripts/check-workspace-versions.sh
+      - name: Test-hygiene guard cases
+        run: bash scripts/guards/check-test-hygiene.test.sh
+      - name: Test-hygiene guard (issue #778)
+        run: scripts/guards/check-test-hygiene.sh
+      - name: Python script unit tests
+        run: make test-python
+
+  # Lint the workflow files themselves (ADR-0086 decision 7). actionlint is
+  # cheap and uses no cargo toolchain, so like doc-scripts it runs on every
+  # trigger rather than gating on `changes`.
+  #
+  # The whole point of this job is that shellcheck is GENUINELY available to
+  # actionlint. actionlint runs shellcheck over every `run:` script, but when
+  # the shellcheck binary is absent it silently skips those checks and still
+  # exits 0: a linter whose sub-checker is missing reports clean identically to
+  # one that ran everything. During epic #218 an executor hit exactly this,
+  # reporting a file clean that a shellcheck-enabled actionlint flagged twice
+  # (SC2046, SC2129). So this job installs a pinned shellcheck itself and then
+  # asserts it is on PATH before running actionlint; if that install or
+  # assertion fails, the job fails rather than linting less. Relying on the
+  # runner image's preinstalled shellcheck is exactly the silent-drift risk the
+  # ADR names, so both binaries are installed here at pinned, checksum-verified
+  # versions.
+  actionlint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # Pinned versions and their published sha256 sums (exact-version pinning,
+      # the download equivalent of the commit-SHA pins the `uses:` steps carry).
+      ACTIONLINT_VERSION: 1.7.7
+      ACTIONLINT_SHA256: 023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757
+      SHELLCHECK_VERSION: v0.10.0
+      SHELLCHECK_SHA256: 6c881ab0698e4e6ea235245f22832860544f17ba386442fe7e9d629f8cbedf87
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install pinned shellcheck and actionlint
+        run: |
+          bin_dir="${RUNNER_TEMP}/lint-bin"
+          mkdir -p "$bin_dir"
+
+          # Verify the shellcheck archive's sha256 before extracting, then
+          # place the binary on PATH for the assert and lint steps below.
+          curl -fsSL -o shellcheck.tar.xz \
+            "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          echo "${SHELLCHECK_SHA256}  shellcheck.tar.xz" | sha256sum -c -
+          tar -xJf shellcheck.tar.xz
+          mv "shellcheck-${SHELLCHECK_VERSION}/shellcheck" "$bin_dir/shellcheck"
+
+          # actionlint: same verify-then-extract shape.
+          curl -fsSL -o actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  actionlint.tar.gz" | sha256sum -c -
+          tar -xzf actionlint.tar.gz actionlint
+          mv actionlint "$bin_dir/actionlint"
+
+          echo "$bin_dir" >> "$GITHUB_PATH"
+      - name: Assert shellcheck is available
+        run: |
+          # actionlint exits 0 when shellcheck is missing, silently linting
+          # less (ADR-0086 D7). Fail the job here instead, so a missing
+          # sub-checker can never be mistaken for a clean run. This resolves
+          # on the same PATH actionlint uses in the next step.
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            echo "::error::shellcheck not on PATH; actionlint would skip its shell checks and still pass (ADR-0086 D7)"
+            exit 1
+          fi
+          shellcheck --version
+      - name: Lint workflow files
+        run: |
+          # No path args: actionlint discovers every workflow under
+          # .github/workflows/ on its own, so a new workflow is covered
+          # automatically. -shellcheck=shellcheck names the binary asserted
+          # present above explicitly rather than relying on the default lookup.
+          actionlint -color -shellcheck=shellcheck
+
+  # First-stage fail-fast gate (ADR-0053 D3). Runs fmt and the two clippy
+  # configurations the workspace has (default features, plus ravel-server's
+  # `sql` feature) as a metadata-only/lint-only compile with no test run, so a
+  # style or lint failure kills the run in a few minutes instead of after the
+  # expensive lanes have burned their minutes. `check` and `sql` used to carry
+  # these same fmt/clippy steps; they now live here alone (D3: "check and sql
+  # drop their now-duplicate fmt/clippy steps").
+  #
+  # The expensive lanes gate on this job (k8s-integration and the main-push
+  # coverage job carry `needs: lint`). The cheap lanes (`check`, `sql`, the
+  # other test jobs) deliberately do NOT gate on it: they keep fanning out
+  # behind `changes` and run their real nextest suites in parallel with lint,
+  # since that is useful work regardless of lint's outcome and D3's rejected
+  # alternatives ruled out serializing them behind a prior job.
+  #
+  # No free-disk-space: this job builds no images and runs no tests, so it does
+  # not need the headroom the heavier lanes clear. It DOES keep sccache and
+  # rust-cache: `cargo clippy --all-targets` over a 26-member workspace is a
+  # near-full compile of every crate's lib and test targets, so a cold run
+  # without the shared caches would be ~15-20m (far past the ~4-5m warm
+  # estimate ADR-0053 D3 assumes), which would undercut the whole point of a
+  # fast first-stage kill. With the caches warm from sibling jobs it lands in
+  # the ADR's window.
+  lint:
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - name: Install sccache
+        id: sccache
+        continue-on-error: true
+        uses: ./.github/actions/setup-sccache
+      - name: Disable sccache if its install flaked
+        if: steps.sccache.outcome == 'failure'
+        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Clippy (sql feature)
+        run: cargo clippy --locked -p ravel-server --features sql --all-targets -- -D warnings
+      # `sql` does not imply `flight-sql`, so the step above leaves the Flight
+      # SQL service, its stream, and their tests unlinted.
+      - name: Clippy (flight-sql feature)
+        run: cargo clippy --locked -p ravel-server -p ravel-sql --features flight-sql --all-targets -- -D warnings
+
+  check:
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      # Share compiled objects across the six workspace-compiling jobs via the
+      # GitHub Actions cache backend. rust-cache only restores the dependency
+      # registry; sccache reuses the built artifacts themselves.
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: ./.github/actions/free-disk-space
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - name: Install sccache
+        id: sccache
+        continue-on-error: true
+        uses: ./.github/actions/setup-sccache
+      - name: Disable sccache if its install flaked
+        if: steps.sccache.outcome == 'failure'
+        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+      - name: Install nextest
+        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        with:
+          tool: nextest
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Test
+        run: cargo nextest run --locked --workspace --cargo-profile ci
+      # nextest does not run doctests; keep them covered separately.
+      - name: Doctests
+        run: cargo test --locked --doc --workspace
+
+  # The SQL surface. Two things the `check` job cannot
+  # cover:
+  #
+  # 1. `POST /api/v1/sql` is behind ravel-server's `sql` cargo feature, so
+  #    `cargo clippy --workspace --all-targets` and `cargo test --workspace`
+  #    never compile the handler, its error-to-HTTP redaction boundary, or
+  #    services/ravel-server/tests/sql_endpoint.rs at all.
+  # 2. The layer-2 differential gate
+  #    (crates/ravel-sql/tests/differential.rs) is only as strong as the
+  #    number of proptest cases it runs. `check` runs it at the in-file
+  #    default; this job runs it with an elevated case count so the NaN,
+  #    signed-zero, denormal, duplicate-timestamp and multi-segment-overlap
+  #    space is explored properly.
+  #
+  # The gate must be a
+  # required test in ravel-sql CI and to re-run on every DataFusion version
+  # bump; the golden cases in that file pin DataFusion's min/max NaN and
+  # signed-zero semantics, so a bump that changes them fails here.
+  sql:
+    needs: changes
+    # docs_only skips it entirely; the sql_area gate (ADR-0053 D4) further
+    # skips it when no ravel-sql / ravel-server / ravel-query path changed.
+    # The now-removed "Clippy (sql feature)" step moved to the `lint` job (D3).
+    if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.sql_area == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: ./.github/actions/free-disk-space
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - name: Install sccache
+        id: sccache
+        continue-on-error: true
+        uses: ./.github/actions/setup-sccache
+      - name: Disable sccache if its install flaked
+        if: steps.sccache.outcome == 'failure'
+        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+      - name: Install nextest
+        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        with:
+          tool: nextest
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: SQL endpoint tests
+        run: cargo nextest run --locked -p ravel-server --features sql
+      - name: Differential correctness gate
+        env:
+          # Well above the in-file default so CI explores far more of the
+          # float edge-case and multi-segment-overlap space than a local run.
+          PROPTEST_CASES: 512
+        run: cargo nextest run --locked -p ravel-sql --test differential
+
+  # The Flight SQL surface. Until this job existed, every test
+  # behind ravel-server's `flight-sql` feature was compiled and discarded: the
+  # `features` lane below ran `cargo check` on the combination and nothing
+  # else, and no `cargo test` or `cargo nextest run` anywhere in this workflow
+  # passed the feature. `sql` does not imply it. A Flight SQL test could
+  # assert nothing, or panic on every run, and no gate would report it.
+  #
+  # A separate job rather than two more steps in `sql`, which is where these
+  # first went: `flight-sql` pulls arrow-flight, tonic, and the whole
+  # DataFusion tree, and shares no incremental state with the `sql` feature
+  # build, so linking both configurations on one runner died with
+  # `collect2: fatal error: ld terminated with signal 7 [Bus error]`. Same
+  # reason the `features` lane carries its own 30-minute budget.
+  #
+  # Gated on sql_area like `sql`, and required like `sql`. When renaming this
+  # job, update main's required status checks in the same change, or the
+  # tests silently stop blocking again.
+  flight-sql:
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.sql_area == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: ./.github/actions/free-disk-space
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - name: Install sccache
+        id: sccache
+        continue-on-error: true
+        uses: ./.github/actions/setup-sccache
+      - name: Disable sccache if its install flaked
+        if: steps.sccache.outcome == 'failure'
+        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+      - name: Install nextest
+        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        with:
+          tool: nextest
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Flight SQL tests
+        run: cargo nextest run --locked -p ravel-server -p ravel-sql --features flight-sql
+
+  # Never-compiled feature combinations (ADR-0053 D6). Five cargo
+  # features are off by default and no other job builds them, so a break in
+  # any of them -- an unreachable e2e test path, four bench binaries that
+  # never link -- ships undetected. This lane proves each combination still
+  # compiles (`cargo check`), and for one of them also runs its tests:
+  #   - ravel-server --features otap            (links ravel-otap + arrow tree)
+  #   - ravel-bench --features parquet-baseline (arrow/parquet/object_store)
+  #   - ravel-bench --features flight-egress    (ravel-sql/datafusion/flight)
+  #   - ravel-bench --features profiling        (pprof/inferno flamegraph lane)
+  #   - ravel-bench --features flight-lane      (ravel-sql/arrow-flight; the
+  #                                              Flight SQL bench lane, PR #724)
+  #   - ravel-bench --features sql-latency      (ravel-sql; the SQL corpus and
+  #                                              its construct gate, ADR-0100)
+  #   - ravel-bench --features sql-latency,profiling,flight-lane (the widest
+  #                                              combination the ClickBench box
+  #                                              builds; RUNS its tests, #714/#732)
+  #   - ravel-bench --features stage-timing     (ravel-ingest/stage-timing;
+  #                                              per-stage ingest breakdown,
+  #                                              ADR-0104. RUNS its test, does
+  #                                              not merely compile it)
+  #
+  # `flight-sql` used to be probed here too. It moved to the `flight-sql` job
+  # above, which lints and RUNS it: a compile-only probe let every test behind
+  # that feature ship unexecuted.
+  #
+  # This job is a required check (main's protect-main ruleset lists it), so a
+  # break here blocks a merge. A feature added to ravel-bench therefore
+  # belongs in the list above in the same change that adds the feature.
+  features:
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    # 30m, not 20m: four separate, mutually non-sharing compile
+    # configurations (arrow, parquet, object_store, datafusion, arrow-flight
+    # all appear across the four probes) with no shared incremental state.
+    timeout-minutes: 30
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: ./.github/actions/free-disk-space
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - name: Install sccache
+        id: sccache
+        continue-on-error: true
+        uses: ./.github/actions/setup-sccache
+      - name: Disable sccache if its install flaked
+        if: steps.sccache.outcome == 'failure'
+        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Check ravel-server --features otap
+        run: cargo check --locked -p ravel-server --features otap
+      - name: Check ravel-bench --features parquet-baseline
+        run: cargo check --locked -p ravel-bench --features parquet-baseline
+      - name: Check ravel-bench --features flight-egress
+        run: cargo check --locked -p ravel-bench --features flight-egress
+      - name: Check ravel-bench --features profiling
+        run: cargo check --locked -p ravel-bench --features profiling
+      - name: Check ravel-bench --features flight-lane
+        run: cargo check --locked -p ravel-bench --features flight-lane
+      - name: Check ravel-bench --features sql-latency
+        run: cargo check --locked -p ravel-bench --features sql-latency --all-targets
+        # The one lane here that also RUNS its tests. A compile probe is the
+        # right trade for a bench binary that only has to keep linking. It is
+        # the wrong trade for the SQL corpus, whose deliverable IS a
+        # test-enforced gate: every construct a corpus entry names must exist
+        # in the conformance registry as supported. A compile-only probe would
+        # let that gate rot while this lane stayed green, the same failure the
+        # flight-sql note above describes. The compile cost is already paid by
+        # the step above (same feature set, same target dir).
+      - name: Test ravel-bench --features sql-latency
+        run: cargo test --locked -p ravel-bench --features sql-latency
+      - name: Test ravel-bench --features sql-latency,profiling,flight-lane
+        run: cargo test --locked -p ravel-bench --features sql-latency,profiling,flight-lane
+      - name: Check ravel-bench --features stage-timing
+        run: cargo check --locked -p ravel-bench --features stage-timing --all-targets
+        # RUN the stage-timing acceptance test, not merely compile it (ADR-0104
+        # decision 2b). The test drives the default-built `ingest_bench` binary
+        # as a subprocess and asserts it emits the per-stage breakdown, so this
+        # lane proves the shipping binary is reachable, not only that
+        # ravel-ingest compiles the seam. `cargo test` also builds every
+        # consumer bin with the feature on, which is where a cfg-gated
+        # constructor param would break: it proves the CALLERS link, not just
+        # the crate that declares the feature.
+      - name: Test ravel-bench --features stage-timing
+        run: cargo test --locked -p ravel-bench --features stage-timing
+
+  # Supply-chain gate. deny.toml encodes an advisory,
+  # license, ban, and source policy that `make audit` runs locally but no
+  # CI job enforced, so a new advisory, banned license, or unknown source
+  # could merge to main undetected while CI signalled "clean". This job
+  # runs `cargo deny check`, which covers all four sub-checks; the
+  # advisories check subsumes cargo-audit, so cargo-audit is not run
+  # separately. cargo-deny is provisioned from a pinned action rather than
+  # `cargo install` to avoid a from-source build on every run. The gate
+  # passes because deny.toml is green: the bincode
+  # advisory is scoped-ignored, tiny-keccak's CC0-1.0 is a scoped license
+  # exception, and internal path deps are version-pinned.
+  supply-chain:
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        with:
+          tool: cargo-deny
+      - name: cargo deny check
+        run: cargo deny check
+
+  # Corrupt-input mutation fuzzing for the byte parsers. Runs the stable-only
+  # proptest mutation targets for the
+  # RSEG codecs (varint, gorilla, delta-varint), the RSEG footer/section
+  # reader, and the OTAP Arrow IPC decode path with an elevated but bounded
+  # case count for deeper exploration than the default `check` run. These
+  # decoders read untrusted stored bytes and must return typed errors, never
+  # panic. cargo-fuzz/libfuzzer need nightly and are deliberately not used;
+  # this stays on the pinned stable toolchain.
+  fuzz:
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # Bounded case count keeps wall-clock in check while exploring far more
+      # of the corrupt-input space than the 256-case default.
+      PROPTEST_CASES: 4096
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - name: Install sccache
+        id: sccache
+        continue-on-error: true
+        uses: ./.github/actions/setup-sccache
+      - name: Disable sccache if its install flaked
+        if: steps.sccache.outcome == 'failure'
+        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+      - name: Install nextest
+        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        with:
+          tool: nextest
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Fuzz RSEG codecs (varint, gorilla, delta-varint)
+        run: cargo nextest run --locked -p ravel-segment --lib fuzz_mutation
+      - name: Fuzz RSEG footer/section reader
+        run: cargo nextest run --locked -p ravel-segment --test fuzz_mutation
+      - name: Fuzz OTAP Arrow IPC decode
+        run: cargo nextest run --locked -p ravel-otap --test fuzz_mutation
+
+  # Runs the object-store contract suite (docs/object-store-contract.md)
+  # against real S3-compatible endpoints: MinIO, and floci. Without this job
+  # the `minio_contract` and `floci_contract` tests in
+  # crates/ravel-object-store/tests/contract.rs early-return
+  # (RAVEL_MINIO_URL / RAVEL_FLOCI_URL unset), so the only durable backend
+  # Ravel ships against -- S3 -- gets zero CI coverage and an S3Store
+  # regression passes green. This job is required: object
+  # storage is the source of truth, so a break in the S3 adapter must fail
+  # CI, not be waved through.
+  #
+  # MinIO is launched with `docker run` rather than a GitHub Actions service
+  # container because the minio/minio image needs a `server /data` command,
+  # which the `services:` syntax cannot supply. The image and default
+  # credentials mirror deploy/docker-compose/minio.yml's role.
+  #
+  # floci runs as a second container alongside MinIO on its own port, not in
+  # place of it: MinIO stays the backend this repo has proven, and ADR-0034
+  # decision 8 names it as the fallback if floci ever regresses. This is the
+  # permanent gate for the fake-S3 backend of the kind development
+  # environment and the k8s CI lane -- a floci release that stops satisfying
+  # `Capabilities::mandatory()` or multipart must fail here rather than be
+  # discovered in the k8s lane.
+  object-store-contract:
+    needs: changes
+    # object_store_area (ADR-0053 D4): only when object-store, bench, commit,
+    # catalog, ingest, or workspace-level paths changed.
+    if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.object_store_area == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: ./.github/actions/free-disk-space
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - name: Install sccache
+        id: sccache
+        continue-on-error: true
+        uses: ./.github/actions/setup-sccache
+      - name: Disable sccache if its install flaked
+        if: steps.sccache.outcome == 'failure'
+        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+      - name: Install nextest
+        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        with:
+          tool: nextest
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:latest server /data
+      - name: Wait for MinIO to be live
+        run: |
+          for _ in $(seq 1 30); do
+            if curl -fsS http://localhost:9000/minio/health/live; then
+              echo "MinIO is live"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "MinIO did not become healthy in time"
+          docker logs minio || true
+          exit 1
+      - name: Create the contract-suite bucket
+        run: |
+          docker run --rm --network host --entrypoint sh minio/mc:latest -c "
+            mc alias set local http://localhost:9000 minioadmin minioadmin &&
+            mc mb -p local/ravel-object-store-test"
+      # The contract suite's S3/MinIO case is gated on RAVEL_MINIO_URL; set it
+      # (and the credentials/bucket the docker run above provisioned) so the
+      # gated test executes instead of skipping.
+      - name: Run object-store contract suite against MinIO
+        env:
+          RAVEL_MINIO_URL: http://localhost:9000
+          RAVEL_MINIO_BUCKET: ravel-object-store-test
+          RAVEL_MINIO_ACCESS_KEY: minioadmin
+          RAVEL_MINIO_SECRET_KEY: minioadmin
+          RAVEL_MINIO_REGION: us-east-1
+        run: |
+          set -o pipefail
+          # nextest equivalent of `--test contract minio_contract -- --exact`:
+          # `--test contract` selects the binary and `-E 'test(=minio_contract)'`
+          # matches that one test name exactly. `--no-capture` replaces libtest's
+          # `--nocapture` so the guard's skip line still reaches stdout. nextest
+          # writes its run summary to stderr, so 2>&1 keeps it in the tee'd file.
+          # `--color never` overrides the workspace-wide CARGO_TERM_COLOR=always
+          # for this one command: nextest otherwise wraps the digits and words
+          # of its summary line in ANSI escapes even when piped, which breaks
+          # the pass-count grep below.
+          cargo nextest run --locked -p ravel-object-store --test contract \
+            -E 'test(=minio_contract)' --no-capture --color never 2>&1 \
+            | tee contract-output.txt
+          # Prove the suite actually ran against MinIO rather than taking the
+          # RAVEL_MINIO_URL-unset early return. If the guard printed its skip
+          # line, or nextest did not report exactly one passing test, fail the
+          # job even though `cargo nextest` itself exited 0 on a clean skip.
+          if grep -q "skipping MinIO contract test" contract-output.txt; then
+            echo "::error::minio_contract skipped despite RAVEL_MINIO_URL set"
+            exit 1
+          fi
+          # nextest summary reads e.g. "1 test run: 1 passed, 0 skipped"
+          # (singular "test" when exactly one ran), not libtest's
+          # "test result: ok. 1 passed".
+          if ! grep -qE "1 tests? run: 1 passed" contract-output.txt; then
+            echo "::error::minio_contract did not run (expected 1 passed)"
+            exit 1
+          fi
+      # floci: the fake-S3 backend ADR-0034 decision 8 gates here before the
+      # kind environment and the k8s lane are allowed to depend on it. Single
+      # native-binary container, S3 on port 4566, configured entirely by env
+      # vars, path-style addressing (which is what ravel-server hardcodes).
+      - name: Start floci
+        run: |
+          docker run -d --name floci \
+            -p 4566:4566 \
+            floci/floci:latest
+      - name: Wait for floci S3 to be live
+        run: |
+          # floci reports per-service readiness, so wait on S3 specifically
+          # rather than on the process being up: the container answers on
+          # 4566 before every handler is running.
+          for _ in $(seq 1 60); do
+            if curl -fsS http://localhost:4566/_floci/health | grep -q '"s3":"running"'; then
+              echo "floci S3 is live"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "floci did not become healthy in time"
+          docker logs floci || true
+          exit 1
+      - name: Create the contract-suite bucket in floci
+        run: |
+          # A plain CreateBucket PUT. floci accepts any credentials and does
+          # not verify request signatures, so this needs no SigV4 signing and
+          # therefore no AWS CLI and no extra container -- unlike MinIO,
+          # whose bucket step above needs `mc`. Idempotent: a repeat PUT of an
+          # existing bucket also returns 200.
+          curl -fsS -o /dev/null -X PUT http://localhost:4566/ravel-object-store-test
+          # Verify rather than trust: HEAD on a missing bucket returns 404, so
+          # a 200 here proves the bucket the test needs actually exists.
+          bucket_status=$(curl -sS -o /dev/null -w '%{http_code}' -I \
+            http://localhost:4566/ravel-object-store-test)
+          if [ "$bucket_status" != "200" ]; then
+            echo "::error::floci bucket create did not take (HEAD returned $bucket_status)"
+            docker logs floci || true
+            exit 1
+          fi
+      - name: Run object-store contract suite against floci
+        env:
+          RAVEL_FLOCI_URL: http://localhost:4566
+          RAVEL_FLOCI_BUCKET: ravel-object-store-test
+          RAVEL_FLOCI_ACCESS_KEY: test
+          RAVEL_FLOCI_SECRET_KEY: test
+          RAVEL_FLOCI_REGION: us-east-1
+        run: |
+          set -o pipefail
+          # Same invocation shape as the MinIO step above; see its comment for
+          # why `--no-capture` and `--color never` are needed for the greps.
+          cargo nextest run --locked -p ravel-object-store --test contract \
+            -E 'test(=floci_contract)' --no-capture --color never 2>&1 \
+            | tee floci-contract-output.txt
+          # Prove the suite ran against floci rather than taking the
+          # RAVEL_FLOCI_URL-unset early return.
+          if grep -q "skipping floci contract test" floci-contract-output.txt; then
+            echo "::error::floci_contract skipped despite RAVEL_FLOCI_URL set"
+            exit 1
+          fi
+          if ! grep -qE "1 tests? run: 1 passed" floci-contract-output.txt; then
+            echo "::error::floci_contract did not run (expected 1 passed)"
+            exit 1
+          fi
+      - name: Stop MinIO
+        if: always()
+        run: docker rm -f minio || true
+      - name: Stop floci
+        if: always()
+        run: docker rm -f floci || true
+
+  # End-to-end ingest+query benchmark smoke test against real MinIO (issue
+  # #266): every other ravel-bench benchmark only runs against in-process
+  # MemoryStore, so none of them ever exercise the real S3 request shape
+  # (signing, multipart, listing pagination) that ravel-server depends on in
+  # production. This is not a benchmark run for numbers -- it is a
+  # correctness gate proving `s3_e2e_bench`'s ingest-then-query path still
+  # works end to end against a real object store. Same MinIO docker-run,
+  # health-check, and bucket-creation steps as object-store-contract above
+  # (kept separate rather than shared so this job's failure signal stays
+  # about the bench harness, not the contract suite).
+  bench-smoke:
+    needs: changes
+    # Same object_store_area gate as object-store-contract (ADR-0053 D4): this
+    # bench-harness smoke test lives in ravel-bench and exercises the same
+    # object-store request path.
+    if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.object_store_area == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: ./.github/actions/free-disk-space
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - name: Install sccache
+        id: sccache
+        continue-on-error: true
+        uses: ./.github/actions/setup-sccache
+      - name: Disable sccache if its install flaked
+        if: steps.sccache.outcome == 'failure'
+        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+      - name: Install nextest
+        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        with:
+          tool: nextest
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:latest server /data
+      - name: Wait for MinIO to be live
+        run: |
+          for _ in $(seq 1 30); do
+            if curl -fsS http://localhost:9000/minio/health/live; then
+              echo "MinIO is live"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "MinIO did not become healthy in time"
+          docker logs minio || true
+          exit 1
+      - name: Create the bench-smoke bucket
+        run: |
+          docker run --rm --network host --entrypoint sh minio/mc:latest -c "
+            mc alias set local http://localhost:9000 minioadmin minioadmin &&
+            mc mb -p local/ravel-object-store-test"
+      # minio_ingest_read_smoke is gated on RAVEL_MINIO_URL, same convention
+      # as the contract suite's minio_contract; set it (and the
+      # credentials/bucket the docker run above provisioned) so the gated
+      # test executes instead of skipping.
+      - name: Run end-to-end ingest+query smoke test against MinIO
+        env:
+          RAVEL_MINIO_URL: http://localhost:9000
+          RAVEL_MINIO_BUCKET: ravel-object-store-test
+          RAVEL_MINIO_ACCESS_KEY: minioadmin
+          RAVEL_MINIO_SECRET_KEY: minioadmin
+          RAVEL_MINIO_REGION: us-east-1
+        run: |
+          set -o pipefail
+          # Same invocation shape as object-store-contract's MinIO step; see
+          # its comment for why --no-capture and --color never are needed
+          # for the greps below.
+          cargo nextest run --locked -p ravel-bench --test s3_e2e_smoke \
+            -E 'test(=minio_ingest_read_smoke)' --no-capture --color never 2>&1 \
+            | tee bench-smoke-output.txt
+          # Prove the test actually ran against MinIO rather than taking the
+          # RAVEL_MINIO_URL-unset early return.
+          if grep -q "skipping MinIO ingest+read smoke test" bench-smoke-output.txt; then
+            echo "::error::minio_ingest_read_smoke skipped despite RAVEL_MINIO_URL set"
+            exit 1
+          fi
+          if ! grep -qE "1 tests? run: 1 passed" bench-smoke-output.txt; then
+            echo "::error::minio_ingest_read_smoke did not run (expected 1 passed)"
+            exit 1
+          fi
+      - name: Stop MinIO
+        if: always()
+        run: docker rm -f minio || true
+
+  # PromQL differential test (ADR-0021 decisions 4-5): checks Ravel's PromQL
+  # evaluator
+  # against a pinned real Prometheus binary for bit-exact correctness on
+  # the selector and error corpora in crates/ravel-promql-difftest/corpus.
+  #
+  # scripts/fetch-prometheus.sh verifies the downloaded archive's sha256
+  # before extracting it and refuses to proceed otherwise. The pinned
+  # checksums are the real published digests from
+  # https://github.com/prometheus/prometheus/releases/tag/v3.13.1's
+  # sha256sums.txt, so this job fetches and verifies the real
+  # binary and runs the differential comparison rather than skipping.
+  promql-difftest:
+    needs: changes
+    # promql_area (ADR-0053 D4): only when ravel-promql, ravel-promql-difftest,
+    # ravel-query, or workspace-level paths changed.
+    if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.promql_area == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - name: Install sccache
+        id: sccache
+        continue-on-error: true
+        uses: ./.github/actions/setup-sccache
+      - name: Disable sccache if its install flaked
+        if: steps.sccache.outcome == 'failure'
+        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+      - name: Install nextest
+        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        with:
+          tool: nextest
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Fetch pinned Prometheus binary
+        id: fetch-prometheus
+        run: echo "bin_path=$(scripts/fetch-prometheus.sh)" >> "$GITHUB_OUTPUT"
+      - name: Run PromQL differential test
+        env:
+          RAVEL_DIFFTEST: "1"
+          RAVEL_DIFFTEST_PROM_BIN: ${{ steps.fetch-prometheus.outputs.bin_path }}
+        run: |
+          set -o pipefail
+          # nextest equivalent of `--test difftest_selectors -- --exact --nocapture`.
+          # The original had no positional test-name filter (the binary holds
+          # exactly one test), so no `-E` filter is needed here. `--no-capture`
+          # keeps the guard's skip line on stdout; 2>&1 keeps nextest's
+          # stderr summary in the tee'd file. `--color never` overrides the
+          # workspace-wide CARGO_TERM_COLOR=always for this one command:
+          # nextest otherwise wraps the digits and words of its summary line
+          # in ANSI escapes even when piped, which breaks the pass-count grep
+          # below.
+          cargo nextest run --locked -p ravel-promql-difftest --test difftest_selectors \
+            --no-capture --color never 2>&1 | tee difftest-output.txt
+          # Prove the gated test actually ran against the pinned binary
+          # rather than taking its RAVEL_DIFFTEST-unset early return.
+          if grep -q "skipping: set RAVEL_DIFFTEST" difftest-output.txt; then
+            echo "::error::differential test skipped despite RAVEL_DIFFTEST set"
+            exit 1
+          fi
+          # nextest summary reads "1 test run: 1 passed, 0 skipped", not
+          # libtest's "test result: ok. 1 passed".
+          if ! grep -qE "1 tests? run: 1 passed" difftest-output.txt; then
+            echo "::error::differential test did not run (expected 1 passed)"
+            exit 1
+          fi
+
+  # The Kubernetes lane (ADR-0034 decision 7). Runs the same three
+  # scripts a developer runs locally -- scripts/kind-up.sh, scripts/kind-demo.sh,
+  # scripts/kind-down.sh -- against a real kind cluster, so the local and CI
+  # paths cannot drift.
+  #
+  # What no other job covers: the operator reconciling a RavelCluster into
+  # Deployments whose pods actually reach Ready against a real S3-compatible
+  # backend, the images actually starting under Kubernetes, and an OTLP export
+  # accepted by the gateway Service being read back through the query Service.
+  # `check` compiles and unit-tests the operator; only this lane runs it.
+  #
+  # ADR-0053 D5 executes the split ci.yml already named as the remedy for this
+  # lane breaching its 25m warm-cache budget: the release binary build and image
+  # assembly live in `k8s-build`, which uploads the two assembled images as an
+  # artifact; `k8s-integration` downloads and `docker load`s them, then runs
+  # kind. The split moves work between jobs; no individual build/assemble/kind
+  # step's command, env, or order changed.
+  #
+  # The release binaries are built on the runner and the images assembled from
+  # them (Dockerfile.prebuilt) instead of letting kind-up.sh run the root
+  # Dockerfile's builder stage: that stage recompiles the whole workspace inside
+  # Docker with CARGO_BUILD_JOBS=2 and no access to this workflow's caches (57
+  # minutes measured on an 8 GiB arm64 host). RAVEL_SKIP_IMAGE_BUILD=1 exists
+  # for exactly this split, and the sccache/rust-cache setup here is the same one
+  # `check` uses, so the release build starts warm.
+  k8s-build:
+    needs: changes
+    # Same gate k8s-integration carries (docs_only plus server_or_operator,
+    # ADR-0053 D4), plus the `run-k8s` label: the kind lane is real CI minutes
+    # (k8s-build alone budgets 55m) for a class of regression most PRs don't
+    # touch, so it no longer runs by default on every PR. Add the `run-k8s`
+    # label to a PR to opt it in explicitly; every PR still gets full coverage
+    # from k8s-nightly.yml's schedule run regardless. k8s-integration
+    # additionally needs this job, so when this one skips, it skips with it.
+    if: >-
+      needs.changes.outputs.docs_only != 'true' &&
+      needs.changes.outputs.server_or_operator == 'true' &&
+      github.event_name == 'pull_request' &&
+      contains(github.event.pull_request.labels.*.name, 'run-k8s')
+    runs-on: ubuntu-latest
+    # 55m: the original single job's 60m covered the release build plus the
+    # kind half; this half is build + docker save + artifact upload only, but
+    # a cold-sccache release build alone has been observed near 45m, and the
+    # save/upload adds real minutes on top of that, not headroom to spend.
+    timeout-minutes: 55
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      # The tags the assembly step writes; k8s-integration loads them into the
+      # cluster and points the RavelCluster at them, so both jobs set the same
+      # values. Not the script's `:kind-dev` default on purpose: a developer's
+      # local kind-dev images and a CI-assembled image are built two different
+      # ways and should not share a tag.
+      RAVEL_SERVER_IMAGE: ravel-server:kind-ci
+      RAVEL_OPERATOR_IMAGE: ravel-operator:kind-ci
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # First, before anything pulls: two Ravel images and a release target
+      # directory together need real headroom.
+      - uses: ./.github/actions/free-disk-space
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - name: Install sccache
+        id: sccache
+        continue-on-error: true
+        uses: ./.github/actions/setup-sccache
+      - name: Disable sccache if its install flaked
+        if: steps.sccache.outcome == 'failure'
+        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # Exactly what the root Dockerfile's builder stage compiles for these
+      # images, including ravel-cli: scripts/kind-up.sh's store-qualification
+      # Job (ADR-0050 section 6, EC7/#623) runs it from inside the assembled
+      # server image, so it can no longer be left out (see Dockerfile.prebuilt).
+      - name: Build the release binaries on the host
+        run: |
+          cargo build --release --locked -p ravel-server --features sql
+          cargo build --release --locked -p ravel-cli
+          cargo build --release --locked -p ravel-operator
+      - name: Assemble both images from the prebuilt binaries
+        run: |
+          # A staging directory as the build context: the repo root cannot be
+          # used because .dockerignore excludes target/ from it, and the context
+          # needs nothing but the three binaries anyway.
+          ctx=$(mktemp -d)
+          cp target/release/ravel-server target/release/ravel-cli target/release/ravel-operator "$ctx/"
+          docker build --file Dockerfile.prebuilt --target server \
+            --tag "$RAVEL_SERVER_IMAGE" "$ctx"
+          docker build --file Dockerfile.prebuilt --target operator \
+            --tag "$RAVEL_OPERATOR_IMAGE" "$ctx"
+          rm -rf "$ctx"
+      - name: Smoke-run both assembled images
+        run: |
+          # `--help` in both images before kind is involved. A binary that
+          # cannot exec on the runtime base -- the glibc case Dockerfile.prebuilt
+          # documents, where a runner-built binary needs symbol versions the base
+          # image lacks -- fails here with the dynamic linker's own message,
+          # instead of as an opaque CrashLoopBackOff inside the cluster several
+          # minutes later. Kept in this job because it needs only the images, not
+          # the cluster.
+          docker run --rm "$RAVEL_SERVER_IMAGE" --help >/dev/null
+          docker run --rm "$RAVEL_OPERATOR_IMAGE" --help >/dev/null
+      # Hand the two assembled images to k8s-integration. `docker save` both into
+      # one tar so the assemble logic above stays the single source of the images
+      # (k8s-integration only `docker load`s, it never re-assembles).
+      - name: Save the assembled images
+        run: docker save -o k8s-images.tar "$RAVEL_SERVER_IMAGE" "$RAVEL_OPERATOR_IMAGE"
+      - name: Upload the assembled images
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: k8s-images
+          path: k8s-images.tar
+          retention-days: 1
+
+  # kind-demo.sh asserts the round-trip value and exits nonzero on any failure,
+  # so unlike the object-store-contract and promql-difftest jobs this needs no
+  # grep over the output to prove it really ran: it has no environment-gated
+  # skip path that could be mistaken for a pass.
+  k8s-integration:
+    # needs lint (ADR-0053 D3: expensive lanes gain needs: lint) and k8s-build
+    # (D5: it consumes the images k8s-build assembled), plus changes for the
+    # gate outputs.
+    needs: [changes, lint, k8s-build]
+    # Same run-k8s label gate as k8s-build; see its comment above.
+    if: >-
+      needs.changes.outputs.docs_only != 'true' &&
+      needs.changes.outputs.server_or_operator == 'true' &&
+      github.event_name == 'pull_request' &&
+      contains(github.event.pull_request.labels.*.name, 'run-k8s')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Same tags k8s-build wrote; used to `docker load` the artifact and, via
+      # kind-up.sh, load them into the cluster and point the RavelCluster at them.
+      RAVEL_SERVER_IMAGE: ravel-server:kind-ci
+      RAVEL_OPERATOR_IMAGE: ravel-operator:kind-ci
+      # Must match the cluster_name passed to helm/kind-action below: kind-up.sh
+      # reuses an existing cluster of this name rather than creating its own.
+      RAVEL_KIND_CLUSTER: ravel-ci
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # Still disk-hungry: a kind node image, two Ravel images, and floci all
+      # land on this runner even though the release build moved to k8s-build.
+      - uses: ./.github/actions/free-disk-space
+      # This job compiles nothing (kind-up.sh runs with RAVEL_SKIP_IMAGE_BUILD=1
+      # and the node-image resolve step is a sed), so it carries no toolchain,
+      # sccache, or rust-cache setup -- only the images k8s-build produced.
+      - name: Download the assembled images
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: k8s-images
+      - name: Load the assembled images into the docker daemon
+        run: docker load -i k8s-images.tar
+      # kubectl download is a known flake. Install it explicitly,
+      # pinned to the cluster's Kubernetes minor (v1.32, matching the pinned
+      # kindest/node:v1.32.2 that kind-up.sh sets) rather than helm/kind-action's
+      # newer default, and wrap the download in a retry loop so a transient
+      # network blip does not fail the whole lane. helm/kind-action installs
+      # its own kubectl too (pinned to the same version below) and prepends it
+      # to PATH, which would otherwise shadow this retried one for every step
+      # after cluster creation -- the "Prefer the retried kubectl" step below
+      # re-asserts this binary's directory at the front of PATH so the
+      # actually-used kubectl is the one that survived the retry loop, not the
+      # action's unretried download.
+      - name: Install kubectl (pinned, retried)
+        run: |
+          version=v1.32.2
+          # A dedicated directory, not /usr/local/bin: the runner image also
+          # ships its own kind binary there, and prepending /usr/local/bin
+          # wholesale (see the "Prefer the retried kubectl" step) would
+          # un-pin that kind install too, shadowing the action's own pinned
+          # v0.32.0 tool-cache copy with whatever the image happens to ship.
+          # A directory holding only this kubectl shadows only kubectl.
+          bin_dir="${RUNNER_TEMP}/kubectl-bin"
+          mkdir -p "$bin_dir"
+          for attempt in 1 2 3 4 5; do
+            if curl -fsSL --retry 3 -o /tmp/kubectl \
+                "https://dl.k8s.io/release/${version}/bin/linux/amd64/kubectl"; then
+              break
+            fi
+            echo "kubectl download attempt ${attempt} failed; retrying" >&2
+            sleep $((attempt * 5))
+            [ "$attempt" = 5 ] && { echo "::error::kubectl download failed after 5 attempts"; exit 1; }
+          done
+          chmod +x /tmp/kubectl
+          mv /tmp/kubectl "$bin_dir/kubectl"
+          "$bin_dir/kubectl" version --client
+      - name: Resolve the pinned kind node image
+        id: node-image
+        run: |
+          # Single source of truth: scripts/kind-up.sh pins the node image (tag
+          # plus multi-arch index digest) and helm/kind-action needs the same
+          # value, so read it out of the script instead of pinning a second copy
+          # here that could silently drift from it.
+          # shellcheck disable=SC2016  # the ${...} below is sed's pattern, not
+          # a shell expansion: it matches the script's default-value syntax.
+          image=$(sed -n 's/^NODE_IMAGE="\${RAVEL_KIND_NODE_IMAGE:-\(.*\)}"$/\1/p' \
+            scripts/kind-up.sh)
+          if [ -z "$image" ]; then
+            echo "::error::could not read the pinned node image from scripts/kind-up.sh"
+            exit 1
+          fi
+          echo "node image: $image"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+      # kind itself, and the cluster kind-up.sh then reuses. Pinned by commit
+      # SHA (v1.14.0); `version` is the kind release whose default node image is
+      # the one pinned in kind-up.sh, so the CLI and the node image match.
+      - name: Create the kind cluster
+        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc
+        with:
+          version: v0.32.0
+          node_image: ${{ steps.node-image.outputs.image }}
+          cluster_name: ravel-ci
+          # Pin kubectl to the cluster's own minor rather than the action's
+          # newer default (version skew plus a flaky download).
+          # The action installs its own copy of this same version regardless
+          # (its own download has no retry); the step right after this one
+          # re-asserts the explicit retried install's directory at the front
+          # of PATH so that copy, not the action's, is what every later step
+          # actually runs.
+          kubectl_version: v1.32.2
+          # Raised from 120s to 300s (readiness timeout with no
+          # headroom). This is the action's control-plane readiness wait before
+          # kind-up.sh runs; 300s matches the per-condition readiness timeouts
+          # kind-up.sh itself uses so control-plane bring-up on a disk-cleared
+          # runner is not the tighter gate. (kind-up.sh's own 300s pod-readiness
+          # waits are the deeper gate #587 also names, but they live in that
+          # script, out of this file's scope.)
+          wait: 300s
+      # helm/kind-action's own kubectl install prepends its directory to
+      # GITHUB_PATH, which would otherwise shadow the retried install above
+      # for every step from here on. Re-prepend the dedicated kubectl-only
+      # directory (not /usr/local/bin, which also holds the runner image's
+      # own kind binary -- prepending that wholesale would un-pin kind
+      # against the action's pinned v0.32.0 tool-cache copy too) so the
+      # binary that survived the retry loop -- not the action's unretried
+      # download -- is the one kind-up.sh, kind-demo.sh, and the diagnostics
+      # step below actually invoke, while kind stays exactly as pinned.
+      - name: Prefer the retried kubectl over the action's own install
+        run: echo "${RUNNER_TEMP}/kubectl-bin" >> "$GITHUB_PATH"
+      - name: Bring up the kind environment
+        env:
+          # The images are already built and in the runner's docker daemon;
+          # kind-up.sh verifies both tags exist, loads them into the cluster,
+          # and skips its own docker build.
+          RAVEL_SKIP_IMAGE_BUILD: "1"
+        run: |
+          # Fail loudly if the cluster name above and RAVEL_KIND_CLUSTER ever
+          # drift: kind-up.sh would otherwise quietly create a second cluster of
+          # its own and the job would still pass while testing nothing that the
+          # provisioning step did.
+          if ! kind get clusters | grep -qx "$RAVEL_KIND_CLUSTER"; then
+            echo "::error::helm/kind-action did not create cluster $RAVEL_KIND_CLUSTER"
+            kind get clusters
+            exit 1
+          fi
+          scripts/kind-up.sh
+      - name: OTLP round trip through the gateway and query Services
+        run: scripts/kind-demo.sh
+      # On any failure above (the readiness-timeout mode leaves only a
+      # bare `kubectl wait` timeout otherwise), dump what a human would ask for
+      # before the cluster is torn down. Ordered broad-to-specific: every pod's
+      # scheduling/state, then the full describe (restarts, probe failures,
+      # events per pod) narrowed to the operator's namespace kind-up.sh creates,
+      # then the cluster event stream newest-relevant last, then the operator's
+      # own logs by its Deployment label selector. Runs only on failure so a
+      # green run stays quiet; must precede the delete step so there is still a
+      # cluster to query.
+      - name: Dump cluster diagnostics on failure
+        if: failure()
+        run: |
+          kubectl get pods -A -o wide || true
+          kubectl describe pods -n ravel-system || true
+          kubectl get events -A --sort-by=.lastTimestamp || true
+          kubectl logs -n ravel-system -l app.kubernetes.io/name=ravel-operator \
+            --all-containers --tail=500 || true
+      # helm/kind-action also deletes the cluster in its own post step, so this
+      # looks redundant and is not: the teardown path a developer uses has to be
+      # exercised too, and both are idempotent (`kind delete cluster` on a
+      # cluster that is already gone exits 0), so running both is safe in either
+      # order. Stays if: always() so cleanup runs even after the diagnostics
+      # dump above fires.
+      - name: Delete the kind cluster
+        if: always()
+        run: scripts/kind-down.sh
+
+  # Builds the root Dockerfile's two shipping images (`server` and `operator`)
+  # to prove the images the project actually ships still build. No other job
+  # runs this
+  # Dockerfile: k8s-integration builds from Dockerfile.prebuilt with
+  # RAVEL_SKIP_IMAGE_BUILD=1 specifically to avoid this slow, OOM-prone build on
+  # every PR, so a broken COPY path, a bad `--target` stage name, or a
+  # toolchain-pin drift in this file would otherwise ship completely undetected.
+  #
+  # Build-only: the images are not run or smoke-tested here. k8s-integration
+  # already covers runtime behavior (via Dockerfile.prebuilt's `--help` smoke
+  # run and the kind round trip); this job's sole purpose is to prove the
+  # shipping Dockerfile itself still builds and assembles.
+  #
+  # Path-gated rather than run on every push. This Dockerfile recompiles the
+  # whole workspace inside Docker at CARGO_BUILD_JOBS=2 (the cap that keeps it
+  # from OOM-killing) with no access to this workflow's sccache --
+  # 57 minutes measured on an 8 GiB arm64 host, per k8s-integration's notes --
+  # so running it on every PR push would be by far the most expensive job here.
+  # Every regression the issue names (a broken COPY path, a bad stage name, a
+  # toolchain-pin drift) is itself an edit to the Dockerfile, so building only
+  # when the Dockerfile or .dockerignore changes catches all of them at a
+  # fraction of the cost. The detection is done inline with the same merge-base
+  # diff the `changes` job uses, rather than a top-level `on.*.paths` filter,
+  # because a top-level filter would gate the entire workflow, not this one job.
+  # It keeps the standard `needs: changes` / docs_only gate every compiling job
+  # uses (a Dockerfile change is never docs-only, so that gate is a no-op here
+  # but stays for consistency); the inline check is the additional narrowing.
+  docker-build:
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    # 60m, not the ~10m the no-op path suggests: when Dockerfile/.dockerignore
+    # actually change this job runs a full workspace compile inside Docker at
+    # CARGO_BUILD_JOBS=2 with no access to this workflow's sccache (~57m
+    # measured on a constrained host per the notes below). A single timeout
+    # covers the whole job regardless of which path it takes, so it must be
+    # sized to the build path or it would kill every real Dockerfile change;
+    # the far-more-common no-op path exits in seconds well under this ceiling.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - id: dockerfile-changed
+        run: |
+          # merge_group events carry merge_group.base_sha, not event.before;
+          # diff against that instead of falling into the empty-base branch
+          # below, which would force this ~57m image build on every single
+          # queued merge regardless of whether Dockerfile actually changed.
+          if [ "${{ github.event_name }}" = "merge_group" ]; then
+            base="${{ github.event.merge_group.base_sha }}"
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          else
+            base="${{ github.event.before }}"
+          fi
+          if [ -z "$base" ] || ! git cat-file -e "$base" 2>/dev/null; then
+            echo "::notice::no usable base commit, building images to be safe"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          merge_base=$(git merge-base "$base" "${{ github.sha }}")
+          changed=$(git diff --name-only "$merge_base" "${{ github.sha }}")
+          # Whole-line match on the two root paths only: -x stops
+          # `Dockerfile.prebuilt` (built and covered by k8s-integration) from
+          # matching, and this job never builds that file.
+          if echo "$changed" | grep -qxE 'Dockerfile|\.dockerignore'; then
+            echo "::notice::Dockerfile or .dockerignore changed, building shipping images"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::no Dockerfile change, skipping shipping-image build"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          fi
+      # This build is disk-hungry (a full workspace compile plus two runtime
+      # image layers) and OOM-prone at high parallelism; same reasoning as
+      # k8s-integration's use of this action.
+      - name: Free disk space
+        if: steps.dockerfile-changed.outputs.build == 'true'
+        uses: ./.github/actions/free-disk-space
+      # CARGO_BUILD_JOBS stays at the Dockerfile's own cap of 2; it
+      # is deliberately not raised here.
+      - name: Build the server image
+        if: steps.dockerfile-changed.outputs.build == 'true'
+        run: docker build --target server .
+      - name: Build the operator image
+        if: steps.dockerfile-changed.outputs.build == 'true'
+        run: docker build --target operator .
+
+  # Coverage is visibility, not a gate (ADR-0053 D2): it leaves the required
+  # set and no longer runs on pull_request or in the merge queue. It runs only
+  # on pushes to main, where it updates the badge and the JSON artifact. Gating
+  # the whole job on the event (rather than dropping a trigger) is the clean
+  # option now that `on:` carries push, pull_request, and merge_group: the
+  # job-level `if` names exactly the one context it should run in.
+  coverage:
+    # needs lint too (ADR-0053 D3: the main-push coverage lane gains needs:
+    # lint so a fmt/clippy failure kills it before it burns ~25m). It already
+    # only runs on pushes to main; lint runs there as well, so this adds one
+    # fail-fast dependency without changing when coverage is eligible.
+    needs: [changes, lint]
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main'
+      && needs.changes.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    # id-token:write is the Codecov upload's tokenless-OIDC grant (public
+    # repo, no CODECOV_TOKEN secret); contents:read matches the job's only
+    # other need, checking out the tree.
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: ./.github/actions/free-disk-space
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - name: Install sccache
+        id: sccache
+        continue-on-error: true
+        uses: ./.github/actions/setup-sccache
+      - name: Disable sccache if its install flaked
+        if: steps.sccache.outcome == 'failure'
+        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        with:
+          tool: cargo-llvm-cov
+      # Run the workspace suite once and keep the raw coverage data
+      # (`--no-report`), then render it from that same data in every format a
+      # consumer needs: the text summary for the step summary, and lcov for
+      # Codecov. This replaces separate `cargo llvm-cov` invocations that
+      # would each re-run the entire test suite (ADR-0053 D2).
+      - name: Measure coverage
+        run: |
+          cargo llvm-cov --locked --no-report --workspace
+          cargo llvm-cov report --locked | tee -a "$GITHUB_STEP_SUMMARY"
+          cargo llvm-cov report --locked --lcov --output-path lcov.info
+      # CODECOV_TOKEN authenticates the upload; id-token: write (job
+      # permissions above) is kept as a fallback path. Renders the README
+      # badge and per-file/diff coverage on codecov.io; never fails the job
+      # on an upload hiccup.
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5.5.5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: lcov.info
+          fail_ci_if_error: false
+
+  # Container-first quickstart verification (ADR-0081 decisions 5, 6, 7). Builds
+  # the pull request's OWN ravel-server (--features sql) and ravel-cli on the
+  # runner with the shared sccache/rust-cache, assembles a runtime image from
+  # them via Dockerfile.prebuilt (both binaries, because that file's `server`
+  # target COPYs ravel-cli for the store-qualification path too), brings up
+  # deploy/docker-compose/ravel.yml pointed at that image, drives real telemetry
+  # through it, then asserts the README's marked command blocks and the
+  # read-your-write walkthrough against the live stack.
+  #
+  # This is the epic's end-to-end reachability gate: OTLP ingest and PromQL/SQL
+  # query through the shipping binary inside the shipping image over a real
+  # network entry point, not a crate-level unit test.
+  #
+  # EXEMPT from the docs_only short-circuit (decision 7): a README-only edit is
+  # exactly the change this job exists to catch, so it does not gate on the
+  # `changes` job's docs_only/area outputs. It carries its own merge-base path
+  # filter inline (the same technique docker-build uses), and its heavy steps run
+  # only when a path in that filter changed.
+  #
+  # ADVISORY (ADR-0081 Consequences): deliberately NOT added to main's
+  # required-checks set. Its warm-cache budget is observed first, then it is
+  # promoted, matching how ADR-0070's Tier B gate was introduced.
+  quickstart:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      # The tag the assemble step writes and compose consumes via RAVEL_IMAGE.
+      RAVEL_IMAGE: ravel-server:quickstart-ci
+      COMPOSE_FILE: deploy/docker-compose/ravel.yml
+      # The readiness query has NO default in check-readme-commands.sh and hard
+      # errors when empty. `gen` is the series telemetrygen emits, which this job
+      # runs deterministically alongside the collector (ADR-0081 D5); no host
+      # metric name is guaranteed non-empty across both generators.
+      RAVEL_HTTP_BASE: http://127.0.0.1:4318
+      RAVEL_TENANT_TOKEN: demo-token
+      RAVEL_READY_QUERY_URL: http://127.0.0.1:4318/api/v1/query?query=gen
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      # Inline merge-base path filter (decision 7). Runs on a README-only change
+      # but skips the expensive build/bring-up when nothing this job covers
+      # changed, the same shape docker-build uses for its Dockerfile guard.
+      - id: filter
+        run: |
+          if [ "${{ github.event_name }}" = "merge_group" ]; then
+            base="${{ github.event.merge_group.base_sha }}"
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          else
+            base="${{ github.event.before }}"
+          fi
+          if [ -z "$base" ] || ! git cat-file -e "$base" 2>/dev/null; then
+            echo "::notice::no usable base commit, running quickstart to be safe"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          merge_base=$(git merge-base "$base" "${{ github.sha }}")
+          changed=$(git diff --name-only "$merge_base" "${{ github.sha }}")
+          filter='^README\.md$|^deploy/docker-compose/|^deploy/otel/|^deploy/grafana/|^demo/|^scripts/check-readme-commands\.sh$|^scripts/check_readme_commands\.py$|^scripts/check-collector-delivery\.sh$|^Dockerfile\.prebuilt$|^services/ravel-server/'
+          if echo "$changed" | grep -qE "$filter"; then
+            echo "::notice::quickstart-relevant path changed, running the job"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::no quickstart-relevant path changed, skipping build/bring-up"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Free disk space
+        if: steps.filter.outputs.run == 'true'
+        uses: ./.github/actions/free-disk-space
+      - name: Install toolchain from rust-toolchain.toml
+        if: steps.filter.outputs.run == 'true'
+        run: rustup show
+      - name: Install sccache
+        id: sccache
+        if: steps.filter.outputs.run == 'true'
+        continue-on-error: true
+        uses: ./.github/actions/setup-sccache
+      - name: Disable sccache if its install flaked
+        if: steps.filter.outputs.run == 'true' && steps.sccache.outcome == 'failure'
+        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: steps.filter.outputs.run == 'true'
+      # Both binaries: Dockerfile.prebuilt's `server` target COPYs ravel-server
+      # AND ravel-cli, so a context missing the CLI fails the docker build.
+      - name: Build ravel-server (sql) and ravel-cli on the host
+        if: steps.filter.outputs.run == 'true'
+        run: |
+          cargo build --release --locked -p ravel-server --features sql
+          cargo build --release --locked -p ravel-cli
+      - name: Assemble the runtime image from the prebuilt binaries
+        if: steps.filter.outputs.run == 'true'
+        run: |
+          # A staging dir as the context: the repo root cannot be used because
+          # .dockerignore excludes target/ from it. Only the two binaries the
+          # server target COPYs are needed.
+          ctx=$(mktemp -d)
+          cp target/release/ravel-server target/release/ravel-cli "$ctx/"
+          docker build --file Dockerfile.prebuilt --target server \
+            --tag "$RAVEL_IMAGE" "$ctx"
+          rm -rf "$ctx"
+      - name: Bring up the compose stack
+        if: steps.filter.outputs.run == 'true'
+        run: docker compose -f "$COMPOSE_FILE" up -d
+      - name: Wait for ravel-server readiness
+        if: steps.filter.outputs.run == 'true'
+        run: |
+          for _ in $(seq 1 60); do
+            if curl -fsS "${RAVEL_HTTP_BASE}/readyz" >/dev/null 2>&1; then
+              echo "ravel-server ready"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "::error::ravel-server did not become ready in time"
+          docker compose -f "$COMPOSE_FILE" logs --no-color || true
+          exit 1
+      # telemetrygen injects a deterministic series (`gen`) for the assertions,
+      # alongside the collector's host metrics (ADR-0081 D5). OTLP/HTTP to the
+      # published loopback port, with the demo bearer token; --network host so
+      # 127.0.0.1:4318 resolves to the mapped port.
+      - name: Generate deterministic telemetry with telemetrygen
+        if: steps.filter.outputs.run == 'true'
+        run: |
+          docker run --rm --network host \
+            ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen:latest \
+            metrics \
+            --otlp-http \
+            --otlp-endpoint 127.0.0.1:4318 \
+            --otlp-insecure \
+            --otlp-header 'Authorization="Bearer demo-token"' \
+            --metric-type Gauge \
+            --metrics 500
+      # Assert the collector is actually delivering, from its own counters
+      # (#209). telemetrygen supplies the series the README assertions query, so
+      # without this step a total collector failure is invisible to this job:
+      # that is exactly how a gzip rejection (#115) kept the quickstart's
+      # Grafana dashboard empty while CI stayed green. Runs BEFORE the README
+      # blocks so a delivery fault is reported as a delivery fault rather than
+      # as a confusing query failure downstream.
+      - name: Assert the collector is delivering to Ravel
+        if: steps.filter.outputs.run == 'true'
+        run: scripts/check-collector-delivery.sh
+      # Waits for readiness (health, then a non-empty `gen` query), then runs
+      # every marked README block and asserts its declared outcome.
+      - name: Assert the README's marked command blocks
+        if: steps.filter.outputs.run == 'true'
+        run: scripts/check-readme-commands.sh README.md
+      # The read-your-write walkthrough: ingest one export, capture its commit
+      # token, read that exact write back. Assertive on its own.
+      - name: Run the read-your-write walkthrough
+        if: steps.filter.outputs.run == 'true'
+        run: demo/walkthrough.sh
+      # The kill-and-recover demo (ADR-0081 D9): ingest under strict ack,
+      # SIGKILL ravel-server, replace it with a fresh container, read the
+      # pre-kill write back by its own commit token. Runs LAST of the assertion
+      # steps because it deliberately destroys and recreates the server
+      # container; the steps above expect the container they started. It is
+      # assertive on its own and fails the job by itself. This attachment is
+      # what makes the script trustworthy: the fleet executors that write it
+      # cannot run docker, so without a job step it would merge unproven.
+      - name: Run the kill-and-recover demo
+        if: steps.filter.outputs.run == 'true'
+        run: demo/kill-and-recover.sh
+      # Always capture logs on failure: a CI failure nobody can diagnose is a job
+      # that gets disabled (ADR-0081 D6).
+      - name: Dump compose logs on failure
+        if: failure() && steps.filter.outputs.run == 'true'
+        run: docker compose -f "$COMPOSE_FILE" logs --no-color || true
+      - name: Tear down the compose stack
+        if: always() && steps.filter.outputs.run == 'true'
+        run: docker compose -f "$COMPOSE_FILE" down -v || true

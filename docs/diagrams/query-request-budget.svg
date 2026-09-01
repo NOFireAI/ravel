@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="720" viewBox="0 0 1180 720" font-family="system-ui, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#383e46"/>
+    </marker>
+    <marker id="arrowred" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#a3302a"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1180" height="720" fill="#f4f5f7"/>
+
+  <text x="40" y="46" font-size="21" font-weight="640" fill="#1d2228">Why a flat per-query request budget is dimensionally wrong</text>
+  <text x="40" y="70" font-size="14" fill="#5b636d">One tenant's open hour, cold. Cost scales per shard; the cap does not.</text>
+
+  <!-- the open hour, fanned across shards -->
+  <text x="40" y="116" font-size="13" font-weight="640" fill="#383e46">One tenant, the open hour</text>
+  <text x="40" y="136" font-size="12" fill="#5b636d">strict-mode flush cadence 500 ms &#8594; 3600 / 0.5 = 7,200 segments per shard-hour</text>
+
+  <g>
+    <rect x="40" y="156" width="212" height="62" rx="5" fill="#fff" stroke="#c6ccd4"/>
+    <text x="56" y="181" font-size="13" font-weight="600" fill="#1d2228">shard 0</text>
+    <text x="56" y="203" font-size="13" fill="#5b636d">7,200 GETs</text>
+
+    <rect x="268" y="156" width="212" height="62" rx="5" fill="#fff" stroke="#c6ccd4"/>
+    <text x="284" y="181" font-size="13" font-weight="600" fill="#1d2228">shard 1</text>
+    <text x="284" y="203" font-size="13" fill="#5b636d">7,200 GETs</text>
+
+    <rect x="496" y="156" width="212" height="62" rx="5" fill="#fff" stroke="#c6ccd4"/>
+    <text x="512" y="181" font-size="13" font-weight="600" fill="#1d2228">shard 2</text>
+    <text x="512" y="203" font-size="13" fill="#5b636d">7,200 GETs</text>
+
+    <rect x="724" y="156" width="212" height="62" rx="5" fill="#fff" stroke="#c6ccd4"/>
+    <text x="740" y="181" font-size="13" font-weight="600" fill="#1d2228">shard 3</text>
+    <text x="740" y="203" font-size="13" fill="#5b636d">7,200 GETs</text>
+
+    <text x="960" y="181" font-size="13" fill="#5b636d">&#8230; shard N-1</text>
+    <text x="960" y="203" font-size="12" fill="#8b939c">default N = 4</text>
+  </g>
+
+  <path d="M488,236 L488,268" stroke="#383e46" stroke-width="1.6" marker-end="url(#arrow)"/>
+  <text x="500" y="262" font-size="13" fill="#383e46">one cold query fetches all of them</text>
+
+  <!-- the budget line -->
+  <text x="40" y="312" font-size="13" font-weight="640" fill="#383e46">What one query actually costs, against the cap</text>
+
+  <!-- scale: 40 -> 1040 maps 0 -> 40,000 requests -->
+  <line x1="40" y1="470" x2="1060" y2="470" stroke="#c6ccd4" stroke-width="1"/>
+  <text x="40" y="492" font-size="11" fill="#8b939c">0</text>
+  <text x="290" y="492" font-size="11" fill="#8b939c">10,000</text>
+  <text x="540" y="492" font-size="11" fill="#8b939c">20,000</text>
+  <text x="790" y="492" font-size="11" fill="#8b939c">30,000</text>
+  <text x="1030" y="492" font-size="11" fill="#8b939c">40,000</text>
+
+  <!-- actual cost bar: 28,800 -> 40 + 28800/40000*1000 = 760 -->
+  <rect x="40" y="336" width="720" height="34" rx="4" fill="#f6e3e1" stroke="#a3302a"/>
+  <text x="56" y="358" font-size="13" font-weight="600" fill="#7d2521">4 shards &#215; 7,200 = 28,800 requests</text>
+
+  <!-- cap line at 25,000 -> 40 + 625 = 665 -->
+  <line x1="665" y1="322" x2="665" y2="452" stroke="#a3302a" stroke-width="2" stroke-dasharray="6 4"/>
+  <text x="676" y="416" font-size="13" font-weight="600" fill="#a3302a">cap 25,000</text>
+  <text x="676" y="436" font-size="12" fill="#a3302a">query rejected before it answers</text>
+
+  <!-- overflow marker -->
+  <path d="M665,353 L757,353" stroke="#a3302a" stroke-width="1.6" marker-end="url(#arrowred)"/>
+
+  <!-- where the flat cap holds -->
+  <rect x="40" y="392" width="468" height="26" rx="4" fill="#e6efe6" stroke="#3f7042"/>
+  <text x="56" y="410" font-size="12" fill="#2f5533">3 shards &#215; 7,200 = 21,600 &#8212; fits, which is why the comment reads as correct</text>
+
+  <!-- the fix -->
+  <text x="40" y="556" font-size="13" font-weight="640" fill="#383e46">The decision: derive the default instead of fixing it</text>
+  <rect x="40" y="574" width="1020" height="96" rx="6" fill="#fff" stroke="#c6ccd4"/>
+  <text x="60" y="602" font-size="14" font-family="ui-monospace, Menlo, monospace" fill="#1d2228">budget = per_shard_allowance &#215; shard_count + fixed_overhead</text>
+  <text x="60" y="628" font-size="12.5" fill="#5b636d">per_shard_allowance follows the flush cadence (3600 / max_flush_delay) plus headroom;</text>
+  <text x="60" y="648" font-size="12.5" fill="#5b636d">fixed_overhead covers resolve and sealed fetches, which do not scale with shards.</text>
+  <text x="60" y="666" font-size="12.5" fill="#5b636d">An explicitly configured max_s3_requests is still used verbatim.</text>
+
+  <text x="40" y="700" font-size="11.5" fill="#8b939c">A flat cap is wrong for some shard count by construction: its unit is requests-per-query, the cost it bounds is requests-per-shard-hour.</text>
+</svg>

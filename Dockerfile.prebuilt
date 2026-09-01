@@ -1,0 +1,86 @@
+# Runtime-only image assembly from binaries built outside Docker (ADR-0034,
+# decision 7).
+#
+# This is the CI companion to the root Dockerfile, not a replacement for it.
+# The root Dockerfile is self-contained: its builder stage compiles the
+# workspace from scratch inside Docker, which is what a release build and a
+# from-nothing local build need. That is also its cost -- a cold release build
+# of this workspace with the builder's CARGO_BUILD_JOBS=2 cap took 57 minutes
+# on the 8 GiB arm64 development host, and it cannot reuse the host's cargo,
+# sccache, or GitHub Actions cache at all.
+#
+# The `k8s-integration` job in .github/workflows/ci.yml therefore builds the
+# release binaries on the runner, where the shared sccache and
+# Swatinem/rust-cache caches already hold most of the workspace, and assembles
+# the images from those binaries here. `scripts/kind-up.sh
+# RAVEL_SKIP_IMAGE_BUILD=1` exists for exactly this split.
+#
+# The build context is a directory holding just the three binaries (the repo root
+# cannot be used: .dockerignore excludes target/ from it, deliberately, so that
+# build artifacts never enter the root build context). Both stages otherwise
+# mirror the root Dockerfile's runtime stages -- same paths, same entrypoints --
+# so the lane tests the image that ships as closely as it can. One deliberate
+# difference, recorded here rather than left to be rediscovered:
+#
+# The runtime base is Debian 13 (glibc 2.41), not the shipping image's
+# Debian 12 (glibc 2.36). Forced, not preferred: these binaries are built on
+# the build host, and the ubuntu-latest runner is Ubuntu 24.04 with glibc
+# 2.39, so its binaries reference symbol versions Debian 12 does not have.
+# Measured on an Ubuntu 24.04 (glibc 2.39) host, both binaries failed to
+# exec on gcr.io/distroless/cc-debian12:nonroot:
+#   ravel-server:   version `GLIBC_2.38' not found
+#                   (__isoc23_sscanf, __isoc23_strtol -- from C dependencies
+#                   compiled against the build host's headers)
+#   ravel-operator: version `GLIBC_2.39' not found
+#                   (pidfd_getpid, pidfd_spawnp -- from Rust std)
+# The shipping image is unaffected: its builder stage compiles inside
+# rust:1.97.1-bookworm, so it produces and runs on the same glibc 2.36. The
+# alternatives were pinning this one job to an older runner image (a hidden
+# coupling that breaks when that image is retired) or rebuilding inside a
+# bookworm container in CI (which throws away the warm cache this split
+# exists to use). Override RUNTIME_BASE to build against the shipping base
+# when the build host's glibc is old enough:
+#   docker build --build-arg RUNTIME_BASE=gcr.io/distroless/cc-debian12:nonroot ...
+#
+# Usage (see the `k8s-integration` job for the real invocation):
+#
+#   ctx=$(mktemp -d)
+#   cp target/release/ravel-server target/release/ravel-cli target/release/ravel-operator "$ctx/"
+#   docker build --file Dockerfile.prebuilt --target server \
+#     --tag ravel-server:kind-ci "$ctx"
+#   docker build --file Dockerfile.prebuilt --target operator \
+#     --tag ravel-operator:kind-ci "$ctx"
+#
+# The binaries must be Linux binaries for the target architecture, dynamically
+# linked against a glibc no newer than the base image's. The job smoke-runs
+# `--help` in both images immediately after assembly, so a mismatch surfaces as
+# the dynamic linker's own message rather than as a pod CrashLoopBackOff minutes
+# later. That check is what turned the glibc problem above from a k8s-lane
+# mystery into a one-line error.
+ARG RUNTIME_BASE=gcr.io/distroless/cc-debian13:nonroot
+
+# ---- Runtime: server image --------------------------------------------------
+FROM ${RUNTIME_BASE} AS server
+
+COPY ravel-server /usr/local/bin/ravel-server
+# ravel-cli ships alongside ravel-server here too (matching the root
+# Dockerfile), not because anything in the operator or the manifests invokes
+# it, but because scripts/kind-up.sh's store-qualification Job (ADR-0050
+# section 6, EC7/#623) runs `ravel-cli store qualify` from inside this image
+# before the RavelCluster's own pods start -- there is no bootstrap path for
+# the qualification record, so this is the only place that write can happen.
+COPY ravel-cli /usr/local/bin/ravel-cli
+
+# Documentation only: HTTP (OTLP/HTTP, health) and gRPC (OTLP/gRPC) ports.
+EXPOSE 4318 4317
+
+# No default CMD, matching the root Dockerfile: the operator supplies every
+# argument from the CRD.
+ENTRYPOINT ["/usr/local/bin/ravel-server"]
+
+# ---- Runtime: operator image ------------------------------------------------
+FROM ${RUNTIME_BASE} AS operator
+
+COPY ravel-operator /usr/local/bin/ravel-operator
+
+ENTRYPOINT ["/usr/local/bin/ravel-operator"]

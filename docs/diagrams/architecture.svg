@@ -1,0 +1,136 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="1040" viewBox="0 0 1440 1040" font-family="system-ui, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#383e46"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1440" height="1040" fill="#f4f5f7"/>
+
+  <text x="30" y="34" font-size="22" font-weight="bold" fill="#17191c">Ravel architecture</text>
+  <text x="30" y="54" font-size="13" fill="#4a4f57">docs/architecture.md — the object store is the only durable component; everything else may crash and restart empty</text>
+
+  <!-- Legend -->
+  <g>
+    <rect x="1195" y="18" width="225" height="96" rx="6" fill="#eceef1" stroke="#454b54" stroke-width="1.5"/>
+    <text x="1207" y="34" font-size="12" font-weight="bold" fill="#17191c">Legend</text>
+    <rect x="1207" y="42" width="16" height="16" rx="3" fill="#a9c9e6" stroke="#1f4e79" stroke-width="1.5"/>
+    <text x="1230" y="54" font-size="11" fill="#17191c">service / actor (disposable)</text>
+    <rect x="1207" y="64" width="16" height="16" rx="3" fill="#f4c869" stroke="#8a5a10" stroke-width="1.5"/>
+    <text x="1230" y="76" font-size="11" fill="#17191c">immutable object (durable)</text>
+    <rect x="1207" y="86" width="16" height="16" rx="3" fill="#a9dcae" stroke="#2f6b34" stroke-width="1.5"/>
+    <text x="1230" y="98" font-size="11" fill="#17191c">checksum-verified region</text>
+  </g>
+
+  <!-- LEFT COLUMN: ingest path -->
+  <text x="40" y="140" font-size="13" font-weight="bold" fill="#1f4e79">INGEST PATH</text>
+
+  <rect x="40" y="150" width="160" height="55" rx="6" fill="#a9c9e6" stroke="#1f4e79" stroke-width="2"/>
+  <text x="120" y="182" font-size="13" text-anchor="middle" fill="#17191c">OTLP gRPC</text>
+
+  <rect x="210" y="150" width="160" height="55" rx="6" fill="#a9c9e6" stroke="#1f4e79" stroke-width="2"/>
+  <text x="290" y="177" font-size="13" text-anchor="middle" fill="#17191c">OTLP HTTP</text>
+  <text x="290" y="192" font-size="11" text-anchor="middle" fill="#17191c">protobuf</text>
+
+  <rect x="380" y="150" width="160" height="55" rx="6" fill="#a9c9e6" stroke="#1f4e79" stroke-width="2"/>
+  <text x="460" y="177" font-size="13" text-anchor="middle" fill="#17191c">OTAP (Arrow)</text>
+  <text x="460" y="192" font-size="11" text-anchor="middle" fill="#17191c">feature "otap"</text>
+
+  <line x1="300" y1="205" x2="300" y2="225" stroke="#383e46" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <rect x="40" y="225" width="520" height="55" rx="6" fill="#dde1e7" stroke="#454b54" stroke-width="2"/>
+  <text x="300" y="248" font-size="13" font-weight="bold" text-anchor="middle" fill="#17191c">gateway</text>
+  <text x="300" y="264" font-size="11" text-anchor="middle" fill="#17191c">auth · tenant resolve · admission limits</text>
+
+  <line x1="300" y1="280" x2="300" y2="300" stroke="#383e46" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <rect x="40" y="300" width="520" height="55" rx="6" fill="#a9c9e6" stroke="#1f4e79" stroke-width="2"/>
+  <text x="300" y="323" font-size="13" font-weight="bold" text-anchor="middle" fill="#17191c">ingest router</text>
+  <text x="300" y="339" font-size="11" text-anchor="middle" fill="#17191c">series_id % shard_count (per-tenant buffered)</text>
+
+  <line x1="300" y1="355" x2="300" y2="375" stroke="#383e46" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <g>
+    <rect x="40" y="375" width="120" height="55" rx="6" fill="#a9c9e6" stroke="#1f4e79" stroke-width="2"/>
+    <text x="100" y="407" font-size="12" text-anchor="middle" fill="#17191c">shard 0</text>
+    <rect x="173" y="375" width="120" height="55" rx="6" fill="#a9c9e6" stroke="#1f4e79" stroke-width="2"/>
+    <text x="233" y="407" font-size="12" text-anchor="middle" fill="#17191c">shard 1</text>
+    <rect x="306" y="375" width="120" height="55" rx="6" fill="#a9c9e6" stroke="#1f4e79" stroke-width="2"/>
+    <text x="366" y="407" font-size="12" text-anchor="middle" fill="#17191c">shard 2</text>
+    <rect x="439" y="375" width="120" height="55" rx="6" fill="#a9c9e6" stroke="#1f4e79" stroke-width="2"/>
+    <text x="499" y="407" font-size="12" text-anchor="middle" fill="#17191c">shard N</text>
+  </g>
+  <text x="300" y="446" font-size="11" text-anchor="middle" fill="#4a4f57">single-threaded actors: buffer in memory -&gt; RSEG L0 build -&gt; blake3</text>
+
+  <line x1="300" y1="455" x2="300" y2="558" stroke="#383e46" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="310" y="500" font-size="11" fill="#17191c">flush: data PUT</text>
+  <text x="310" y="514" font-size="11" fill="#17191c">(create-if-absent, checksum)</text>
+  <text x="310" y="528" font-size="11" fill="#17191c">+ commit PUT (create-if-absent)</text>
+
+  <!-- RIGHT COLUMN: query path -->
+  <text x="880" y="140" font-size="13" font-weight="bold" fill="#1f4e79">QUERY PATH</text>
+
+  <rect x="880" y="150" width="500" height="55" rx="6" fill="#a9c9e6" stroke="#1f4e79" stroke-width="2"/>
+  <text x="1130" y="182" font-size="13" text-anchor="middle" fill="#17191c">Prometheus API consumers</text>
+
+  <line x1="1130" y1="205" x2="1130" y2="225" stroke="#383e46" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <rect x="880" y="225" width="500" height="55" rx="6" fill="#dde1e7" stroke="#454b54" stroke-width="2"/>
+  <text x="1130" y="248" font-size="13" font-weight="bold" text-anchor="middle" fill="#17191c">/api/v1 surface</text>
+  <text x="1130" y="264" font-size="11" text-anchor="middle" fill="#17191c">query · query_range · labels · label/{name}/values · series</text>
+
+  <line x1="1130" y1="280" x2="1130" y2="300" stroke="#383e46" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <rect x="880" y="300" width="500" height="55" rx="6" fill="#a9c9e6" stroke="#1f4e79" stroke-width="2"/>
+  <text x="1130" y="323" font-size="13" font-weight="bold" text-anchor="middle" fill="#17191c">PromQL evaluator</text>
+  <text x="1130" y="339" font-size="11" text-anchor="middle" fill="#17191c">rate · aggregations · binops · lookback</text>
+
+  <line x1="1130" y1="355" x2="1130" y2="375" stroke="#383e46" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <rect x="880" y="375" width="500" height="55" rx="6" fill="#a9c9e6" stroke="#1f4e79" stroke-width="2"/>
+  <text x="1130" y="396" font-size="13" font-weight="bold" text-anchor="middle" fill="#17191c">query workers</text>
+  <text x="1130" y="412" font-size="11" text-anchor="middle" fill="#17191c">footer-first ranged reads: suffix GET -&gt; prune -&gt; coalesce -&gt; decode</text>
+
+  <line x1="1130" y1="430" x2="1130" y2="450" stroke="#383e46" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <rect x="880" y="450" width="500" height="55" rx="6" fill="#a9c9e6" stroke="#1f4e79" stroke-width="2"/>
+  <text x="1130" y="471" font-size="13" font-weight="bold" text-anchor="middle" fill="#17191c">catalog resolution</text>
+  <text x="1130" y="487" font-size="11" text-anchor="middle" fill="#17191c">LIST commit records per shard/hour + exact GET for min_commit_token</text>
+
+  <line x1="1130" y1="505" x2="1130" y2="558" stroke="#383e46" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="1140" y="528" font-size="11" fill="#17191c">reads: commit records,</text>
+  <text x="1140" y="542" font-size="11" fill="#17191c">segment footers, pages</text>
+
+  <!-- OBJECT STORE band -->
+  <rect x="40" y="560" width="1340" height="230" rx="10" fill="#fbe6b9" stroke="#8a5a10" stroke-width="4"/>
+  <text x="710" y="590" font-size="17" font-weight="bold" text-anchor="middle" fill="#17191c">OBJECT STORE (S3-compatible) — single durable center</text>
+
+  <rect x="100" y="618" width="560" height="140" rx="6" fill="#f4c869" stroke="#8a5a10" stroke-width="2.5"/>
+  <text x="380" y="644" font-size="14" font-weight="bold" text-anchor="middle" fill="#17191c">L0 RSEG objects (data)</text>
+  <text x="380" y="662" font-size="11" text-anchor="middle" fill="#17191c">t/&lt;tenant_hash&gt;/m/l0/&lt;shard&gt;/&lt;writer_id&gt;.&lt;epoch&gt;.&lt;seq&gt;.&lt;hash16&gt;.rseg</text>
+  <text x="380" y="678" font-size="11" text-anchor="middle" fill="#17191c">key embeds content hash; PUT create-if-absent</text>
+  <rect x="290" y="694" width="180" height="26" rx="13" fill="#a9dcae" stroke="#2f6b34" stroke-width="1.5"/>
+  <text x="380" y="712" font-size="11" text-anchor="middle" fill="#17191c">blake3 content hash</text>
+
+  <rect x="720" y="618" width="560" height="140" rx="6" fill="#f4c869" stroke="#8a5a10" stroke-width="2.5"/>
+  <text x="1000" y="644" font-size="14" font-weight="bold" text-anchor="middle" fill="#17191c">commit records</text>
+  <text x="1000" y="662" font-size="11" text-anchor="middle" fill="#17191c">t/&lt;tenant_hash&gt;/m/c/&lt;shard&gt;/&lt;ingest_hour&gt;/&lt;writer_id&gt;.&lt;epoch&gt;.&lt;seq&gt;.cmt</text>
+  <text x="1000" y="678" font-size="11" text-anchor="middle" fill="#17191c">existence = visibility; PUT create-if-absent is the idempotency truth</text>
+  <rect x="890" y="694" width="220" height="26" rx="13" fill="#a9dcae" stroke="#2f6b34" stroke-width="1.5"/>
+  <text x="1000" y="712" font-size="11" text-anchor="middle" fill="#17191c">AlreadyExists + same hash = success</text>
+
+  <!-- bottom annotation -->
+  <rect x="40" y="808" width="1340" height="60" rx="6" fill="#dde1e7" stroke="#454b54" stroke-width="1.5" stroke-dasharray="6,4"/>
+  <text x="710" y="832" font-size="13" text-anchor="middle" fill="#17191c" font-weight="bold">Everything above the object store is disposable and stateless.</text>
+  <text x="710" y="850" font-size="12" text-anchor="middle" fill="#17191c">Any process may crash at any instant; restart-from-empty is the only recovery path (ADR-0001). No local WAL, no local durability dependency.</text>
+
+  <!-- SQL query path (ravel-sql) -->
+  <rect x="40" y="878" width="1340" height="90" rx="6" fill="#eceef1" stroke="#1f4e79" stroke-width="2"/>
+  <text x="710" y="904" font-size="14" font-weight="bold" text-anchor="middle" fill="#17191c">SQL query path (ravel-sql, DataFusion) — POST /api/v1/sql, feature "sql" (off by default)</text>
+  <text x="710" y="924" font-size="11" text-anchor="middle" fill="#17191c">RsegScanExec -&gt; SortPreservingMergeExec -&gt; RsegDedupExec over DataFusion; matches PromQL's dedup total order bit-for-bit (ADR-0013)</text>
+  <text x="710" y="942" font-size="11" text-anchor="middle" fill="#17191c">Also: /api/v1/analytics (always on); Flight SQL (feature "flight-sql") registered on gRPC, methods not yet implemented</text>
+
+  <text x="40" y="990" font-size="11" fill="#4a4f57">Crate order: ravel-types -&gt; ravel-object-store -&gt; ravel-segment -&gt; ravel-commit -&gt; ravel-catalog -&gt; ravel-otlp -&gt; ravel-ingest -&gt; ravel-promql -&gt; ravel-query -&gt; ravel-sql (DataFusion) -&gt; services/*</text>
+  <text x="40" y="1008" font-size="11" fill="#4a4f57">Every service is a mode of one binary: ravel-server --mode all|gateway|query|maintain.</text>
+  <text x="40" y="1026" font-size="11" fill="#4a4f57">Metrics (RSEG) illustrated. Logs (RLOG, l/) and spans (RSPAN, s/) are live signals sharing this ingest, commit, query path and object-key layout.</text>
+</svg>

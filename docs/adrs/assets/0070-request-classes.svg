@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 500" font-family="'Segoe Print','Bradley Hand','Comic Sans MS',cursive" font-size="15">
+  <defs>
+    <marker id="ar" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 1 1.5 Q 6 4 8.5 5 Q 6 6 1 8.5" fill="none" stroke="#444" stroke-width="1.6" stroke-linecap="round"/>
+    </marker>
+  </defs>
+  <rect width="940" height="500" fill="#fdfcf8"/>
+  <text x="24" y="34" font-size="20" fill="#1b2230">Two-class store scheduling (ADR-0070)</text>
+
+  <!-- foreground callers -->
+  <path d="M 40 80 Q 38 77 45 77 L 250 75 Q 257 76 256 83 L 257 195 Q 256 202 249 201 L 46 203 Q 39 202 40 195 Z" fill="#eef3f7" stroke="#31536b" stroke-width="2.2" stroke-linecap="round"/>
+  <text x="58" y="106" fill="#31536b">foreground (ack-bearing)</text>
+  <text x="58" y="132" font-size="13" fill="#5b6472">ingest data + commit PUT</text>
+  <text x="58" y="154" font-size="13" fill="#5b6472">query segment GETs</text>
+  <text x="58" y="176" font-size="13" fill="#5b6472">catalog resolve LISTs</text>
+
+  <!-- background callers -->
+  <path d="M 40 240 Q 37 237 44 237 L 251 235 Q 258 236 257 243 L 258 375 Q 257 382 250 381 L 45 383 Q 38 382 39 375 Z" fill="#f5eede" stroke="#8a6d1f" stroke-width="2.2" stroke-linecap="round"/>
+  <text x="58" y="266" fill="#8a6d1f">background</text>
+  <text x="58" y="292" font-size="13" fill="#5b6472">compaction, fold</text>
+  <text x="58" y="314" font-size="13" fill="#5b6472">sweep, scrub (unbounded today!)</text>
+  <text x="58" y="336" font-size="13" fill="#5b6472">audit retention</text>
+  <text x="58" y="362" font-size="12" fill="#8a6d1f">gets first-ever cap: 8 in flight</text>
+
+  <!-- ClassedStore -->
+  <path d="M 350 130 Q 348 127 355 127 L 560 125 Q 568 126 567 133 L 568 320 Q 567 327 560 326 L 356 328 Q 349 327 350 320 Z" fill="#fff" stroke="#0e7c86" stroke-width="2.6" stroke-linecap="round"/>
+  <text x="368" y="158" fill="#0e7c86">ClassedStore</text>
+  <text x="368" y="182" font-size="12" fill="#5b6472">built once in build_store()</text>
+  <text x="368" y="206" font-size="13" fill="#31536b">.foreground() handle</text>
+  <text x="368" y="230" font-size="13" fill="#8a6d1f">.background() handle</text>
+  <text x="368" y="260" font-size="12" fill="#5b6472">class = which handle you hold</text>
+  <text x="368" y="280" font-size="12" fill="#5b6472">(keys can't tell: fg + bg read</text>
+  <text x="368" y="298" font-size="12" fill="#5b6472">the same l0/l1 objects)</text>
+  <text x="368" y="318" font-size="12" fill="#b3423a">--store-scheduling off =&gt; pass-through</text>
+
+  <!-- scheduler -->
+  <path d="M 640 160 Q 638 157 645 157 L 830 155 Q 838 156 837 163 L 838 290 Q 837 297 830 296 L 646 298 Q 639 297 640 290 Z" fill="#eef3f7" stroke="#31536b" stroke-width="2.2" stroke-linecap="round"/>
+  <text x="658" y="188" fill="#31536b">RequestScheduler</text>
+  <text x="658" y="212" font-size="13" fill="#5b6472">weighted semaphore pair</text>
+  <text x="658" y="234" font-size="12" fill="#5b6472">fg admitted to fg_permits</text>
+  <text x="658" y="254" font-size="12" fill="#5b6472">bg yields to fg waiters,</text>
+  <text x="658" y="272" font-size="12" fill="#5b6472">keeps floor of 1 (no starving)</text>
+  <text x="658" y="290" font-size="12" fill="#5b6472">sized by the panel, not guessed</text>
+
+  <!-- S3 -->
+  <path d="M 660 340 Q 658 337 665 337 L 812 335 Q 819 336 818 343 L 819 420 Q 818 427 811 426 L 666 428 Q 659 427 660 420 Z" fill="#f4f6f2" stroke="#4c6b45" stroke-width="2.4" stroke-linecap="round"/>
+  <text x="690" y="372" fill="#4c6b45">S3 / MinIO</text>
+  <text x="678" y="398" font-size="12" fill="#5b6472">one connection pool</text>
+
+  <!-- arrows -->
+  <path d="M 257 140 Q 300 150 345 195" fill="none" stroke="#31536b" stroke-width="1.9" marker-end="url(#ar)" stroke-linecap="round"/>
+  <path d="M 258 300 Q 305 280 345 230" fill="none" stroke="#8a6d1f" stroke-width="1.9" marker-end="url(#ar)" stroke-linecap="round"/>
+  <path d="M 568 210 Q 600 212 635 218" fill="none" stroke="#444" stroke-width="1.9" marker-end="url(#ar)" stroke-linecap="round"/>
+  <path d="M 740 298 Q 741 315 740 333" fill="none" stroke="#444" stroke-width="1.9" marker-end="url(#ar)" stroke-linecap="round"/>
+
+  <!-- starvation note -->
+  <path d="M 350 400 Q 348 397 355 397 L 600 395 Q 607 396 606 403 L 607 462 Q 606 469 599 468 L 356 470 Q 349 469 350 462 Z" fill="#f7ecec" stroke="#b3423a" stroke-width="2" stroke-linecap="round"/>
+  <text x="366" y="426" font-size="13" fill="#b3423a">measured: resolve probes timed out</text>
+  <text x="366" y="448" font-size="13" fill="#b3423a">behind ingest PUT backlog (s3_e2e panel)</text>
+</svg>

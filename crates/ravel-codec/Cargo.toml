@@ -1,0 +1,18 @@
+[package]
+name = "ravel-codec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Shared segment codecs: the encoding tag registry, the blocked token bloom filter, and the normative word tokenizer."
+
+[dependencies]
+thiserror = { workspace = true }
+blake3 = { workspace = true }
+crc32c = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true
