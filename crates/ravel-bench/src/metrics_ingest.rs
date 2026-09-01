@@ -19,8 +19,8 @@
 //! Remote Write 2xx from Prometheus or VictoriaMetrics means the samples were
 //! accepted into a buffer whose durability the harness cannot observe from the
 //! client, so those rows are tagged [`AckSemantics::Buffered`] and carry no
-//! tokens. A durable-on-ack latency is never placed in the same pooled column
-//! as a buffered one: [`MetricsIngestReport::pooled_ack_p99_ms`] refuses a
+//! tokens. A durable-on-ack latency is never placed in the same folded column
+//! as a buffered one: [`MetricsIngestReport::max_ack_p99_ms`] refuses a
 //! mixed-ack pool rather than reporting a number whose meaning is undefined.
 //!
 //! ## Ack is not visibility (ADR-0927 dec. 3)
@@ -52,10 +52,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use prost::Message;
+use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_ingest::{
     Clock, IngestConfig, IngestPoint, IngestRouter, IngestValue, SystemClock, WriteMode,
 };
 use ravel_object_store::{InstrumentedStore, ObjectStoreBackend, StoreMetrics, list_all};
+use ravel_promql::Value;
+use ravel_query::{EngineConfig, QueryEngine};
 use ravel_remote_write::proto::prometheus::{
     Label as PbLabel, Sample as PbSample, TimeSeries as PbTimeSeries, WriteRequest,
 };
@@ -210,7 +213,13 @@ pub struct IngestPhase {
     /// Transport retries: object-store PUT retries below `InstrumentedStore`
     /// for Ravel, HTTP 429/5xx retries for a comparator.
     pub retries: u64,
-    /// Wall time of the ingest phase.
+    /// Wall time of the ingest phase. The two lanes time DIFFERENT work, so a
+    /// throughput comparison must account for it: the Ravel window covers only
+    /// the in-process `write_values` calls (the RW1.0 encode that yields
+    /// `wire_bytes` is precomputed OUTSIDE this window, since the in-process
+    /// path never serializes an RW1.0 body to ingest), while an HTTP
+    /// comparator's window includes its genuine per-batch encode and POST,
+    /// which is real client work for that lane.
     pub elapsed_secs: f64,
     /// Accepted logical samples per second.
     pub logical_points_per_sec: f64,
@@ -360,32 +369,89 @@ impl std::fmt::Display for AckConflation {
 
 impl std::error::Error for AckConflation {}
 
-/// The whole ingest-lane report: one row per participating system.
+/// The read-your-write query phase of a system's replay. Recorded as its own
+/// phase, separate from the ingest phase (ADR-0927 decision 9): ingest and
+/// query figures never share a row. Token-bound: the ingest phase's commit
+/// tokens are passed as `min_commit_token`, so the read resolves the exact
+/// committed segments deterministically without sleeping past the flush delay
+/// (ADR-0927 decision 3).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SystemQueryResult {
+    /// The system queried: `ravel` (the only durable-on-ack, token-minting
+    /// path the bench can read deterministically).
+    pub system: String,
+    /// The instant PromQL expression evaluated.
+    pub query: String,
+    /// Milliseconds timestamp the instant query evaluated at: the replay's
+    /// newest written sample.
+    pub eval_ts_ms: i64,
+    /// The commit tokens passed as `min_commit_token`, encoded. A token-bound
+    /// read; empty only if the ingest minted none.
+    pub min_commit_tokens: Vec<String>,
+    /// Series the instant query matched.
+    pub matched_series: u64,
+    /// Wall time of the query phase.
+    pub elapsed_secs: f64,
+}
+
+/// The whole ingest-lane report: one row per participating system, plus the
+/// separately-recorded query-phase rows.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MetricsIngestReport {
     /// Report rows, in the order the systems were replayed.
     pub systems: Vec<SystemIngestResult>,
+    /// Query-phase rows, recorded separately from ingest (ADR-0927 decision 9).
+    /// Empty when no post-ingest query ran.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queries: Vec<SystemQueryResult>,
 }
 
 impl MetricsIngestReport {
-    /// Assemble a report from its rows.
+    /// Assemble a report from its ingest rows, with no query phase yet.
     pub fn new(systems: Vec<SystemIngestResult>) -> Self {
-        MetricsIngestReport { systems }
+        MetricsIngestReport {
+            systems,
+            queries: Vec::new(),
+        }
     }
 
-    /// The row for `system`, if present.
+    /// Attach a query-phase row (builder style), keeping ingest and query
+    /// figures in separate columns.
+    pub fn with_query(mut self, query: SystemQueryResult) -> Self {
+        self.queries.push(query);
+        self
+    }
+
+    /// The ingest row for `system`, if present.
     pub fn row(&self, system: &str) -> Option<&SystemIngestResult> {
         self.systems.iter().find(|r| r.system == system)
     }
 
-    /// ADR-0927 decision 3 as a mechanical guard. A single pooled ack-latency
-    /// figure across `systems` is admissible ONLY when every named row shares
-    /// one acknowledgement meaning. A mix of durable-on-ack and buffered rows
-    /// is refused with an [`AckConflation`] naming each system and its ack
-    /// meaning, because pooling a durable ack latency with a buffered one
-    /// reports a number whose meaning is undefined -- the exact conflation this
-    /// lane exists to prevent. Unknown system names are skipped.
-    pub fn pooled_ack_p99_ms(&self, systems: &[&str]) -> Result<f64, AckConflation> {
+    /// The query-phase row for `system`, if present.
+    pub fn query_row(&self, system: &str) -> Option<&SystemQueryResult> {
+        self.queries.iter().find(|r| r.system == system)
+    }
+
+    /// ADR-0927 decision 3 as a mechanical guard, and the ABSENT-not-zero rule.
+    ///
+    /// Returns the MAXIMUM of the named rows' per-row p99 ack latencies, in
+    /// milliseconds. This is deliberately NOT a pooled percentile over the
+    /// union of the rows' raw ack samples: the report carries each row's
+    /// summarized [`LatencyReport`], not its raw sample vector, so a true
+    /// pooled percentile is not computable from a report, and this figure never
+    /// claims to be one. The name says `max` because the computation is a max.
+    ///
+    /// The pool is admissible ONLY when every named row shares one
+    /// acknowledgement meaning. A mix of durable-on-ack and buffered rows is
+    /// refused with an [`AckConflation`] naming each system and its ack meaning,
+    /// because folding a durable ack latency with a buffered one reports a
+    /// number whose meaning is undefined -- the exact conflation this lane
+    /// exists to prevent. Unknown system names are skipped.
+    ///
+    /// An empty pool (no named row exists) returns `Ok(None)`: an explicit
+    /// absence, never a `0.0` standing in for an unmeasured pool, so a real
+    /// `0.0` ms max and "no rows to fold" are distinguishable (lines 38-44).
+    pub fn max_ack_p99_ms(&self, systems: &[&str]) -> Result<Option<f64>, AckConflation> {
         let rows: Vec<&SystemIngestResult> = systems.iter().filter_map(|s| self.row(s)).collect();
         let kinds: Vec<(String, AckSemantics)> = rows
             .iter()
@@ -395,10 +461,16 @@ impl MetricsIngestReport {
         if distinct.len() > 1 {
             return Err(AckConflation { systems: kinds });
         }
-        Ok(rows
-            .iter()
-            .map(|r| r.ingest.ack_latency_ms.p99)
-            .fold(0.0_f64, f64::max))
+        // Empty pool is absence, not zero. Flip this line to `Ok(Some(0.0))` to
+        // see `tests::max_ack_p99_over_an_empty_pool_is_absent` fail.
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(
+            rows.iter()
+                .map(|r| r.ingest.ack_latency_ms.p99)
+                .fold(f64::NEG_INFINITY, f64::max),
+        ))
     }
 }
 
@@ -411,6 +483,25 @@ pub enum LaneError {
     /// Snappy compression of the RW1.0 body failed.
     #[error("snappy compression of the Remote Write body failed: {0}")]
     Snappy(String),
+    /// Setting up the HTTP transport for a comparator replay failed (building
+    /// the reqwest client), before any request left the process. Distinct from
+    /// [`LaneError::Snappy`]: a transport-setup failure has nothing to do with
+    /// compressing the body, and rendering it as a snappy error misnames it.
+    #[error("setting up the Remote Write HTTP transport failed: {0}")]
+    Transport(String),
+    /// The post-ingest read-your-write query phase failed (building the catalog
+    /// or query engine, or evaluating the instant query).
+    #[error("the read-your-write query phase failed: {0}")]
+    Query(String),
+}
+
+/// Map a reqwest client-build failure to the transport-setup variant. The
+/// call site in [`replay_over_http`] routes through this, so flipping the
+/// constructed variant here (to [`LaneError::Snappy`], the pre-fix bug) is the
+/// single line that makes `tests::client_build_failure_is_a_transport_error`
+/// fail.
+fn transport_setup_error(detail: String) -> LaneError {
+    LaneError::Transport(detail)
 }
 
 /// Group logical samples into `prometheus.TimeSeries` by canonical identity.
@@ -568,12 +659,18 @@ pub struct RavelReplayOutcome {
     pub store: Arc<dyn ObjectStoreBackend>,
     /// The tenant written under.
     pub tenant: TenantId,
+    /// The shard count the replay ran under, so a read-your-write query builds
+    /// its catalog over the same shards the writes committed into.
+    pub shards: u32,
     /// The commit tokens the strict writes minted, decoded, to pass as
     /// `min_commit_token` for a deterministic read-your-write.
     pub tokens: Vec<CommitToken>,
     /// The newest sample timestamp written, in milliseconds: the instant a
-    /// read-your-write query evaluates at.
-    pub max_ts_ms: i64,
+    /// read-your-write query evaluates at. `None` when the stream wrote no
+    /// sample (empty or all-rejected): an explicit absence, never `i64::MIN`
+    /// masquerading as a real timestamp -- a downstream ms-to-ns conversion of
+    /// that sentinel overflows, so the absence must not escape as a number.
+    pub max_ts_ms: Option<i64>,
 }
 
 /// Replay `stream` into the in-process Ravel path. Valid samples are batched
@@ -608,12 +705,12 @@ pub async fn replay_into_ravel(
     // logical sample for the wire encoding) and exact rejections.
     let mut valid: Vec<(IngestPoint, LogicalSample)> = Vec::new();
     let mut rejected_samples: u64 = 0;
-    let mut max_ts_ms = i64::MIN;
+    let mut max_ts_ms: Option<i64> = None;
     for sample in stream {
         match sample.validate() {
             Ok(()) => {
                 let point = ingest_point(&config.tenant, sample)?;
-                max_ts_ms = max_ts_ms.max(sample.ts_ms);
+                max_ts_ms = Some(max_ts_ms.map_or(sample.ts_ms, |m| m.max(sample.ts_ms)));
                 valid.push((point, sample.clone()));
             }
             Err(_) => rejected_samples += 1,
@@ -622,6 +719,21 @@ pub async fn replay_into_ravel(
 
     let ack_deadline = Duration::from_secs(config.ack_timeout_secs);
     let batch_size = config.batch_size.max(1);
+
+    // Precompute the RW1.0 wire size OUTSIDE the timed window (issue #937 review
+    // finding 5). The in-process Ravel path never serializes an RW1.0 body to
+    // ingest; timing that encode would fold work the in-process path never
+    // performs into `elapsed_secs`, skewing Ravel's throughput against the HTTP
+    // comparators, whose encode IS genuine client work inside their own window.
+    // `wire_bytes` is finalized here and immutable through the timed loop. Move
+    // this accumulation into the timed `write_values` loop below to see
+    // `tests::ravel_window_excludes_the_rw1_encode` observe the change.
+    let mut precomputed_wire_bytes: u64 = 0;
+    for chunk in valid.chunks(batch_size) {
+        let logical: Vec<LogicalSample> = chunk.iter().map(|(_, s)| s.clone()).collect();
+        precomputed_wire_bytes += encode_rw1_body(&logical)?.len() as u64;
+    }
+    let wire_bytes = precomputed_wire_bytes;
 
     let cpu_before = process_cpu_secs();
     let wall_start = std::time::Instant::now();
@@ -632,12 +744,9 @@ pub async fn replay_into_ravel(
     let mut dropped_samples: u64 = 0;
     let mut dropped_batches: u64 = 0;
     let mut batches: u64 = 0;
-    let mut wire_bytes: u64 = 0;
 
     for chunk in valid.chunks(batch_size) {
         batches += 1;
-        let logical: Vec<LogicalSample> = chunk.iter().map(|(_, s)| s.clone()).collect();
-        wire_bytes += encode_rw1_body(&logical)?.len() as u64;
         let points: Vec<IngestPoint> = chunk.iter().map(|(p, _)| p.clone()).collect();
         let batch_len = points.len() as u64;
 
@@ -725,8 +834,72 @@ pub async fn replay_into_ravel(
         result,
         store,
         tenant: config.tenant.clone(),
+        shards: config.shards,
         tokens,
         max_ts_ms,
+    })
+}
+
+/// Run the post-ingest read-your-write query phase after a Ravel replay: build
+/// a catalog and query engine over the same store the writes landed in, pass
+/// the minted commit tokens as `min_commit_token`, and evaluate `query` as an
+/// instant query at the replay's newest sample timestamp. Because the tokens
+/// resolve the exact committed segments, the read sees the just-written rows
+/// deterministically without sleeping past the flush delay (ADR-0927 decision
+/// 3). Recorded as its own phase, separate from ingest (decision 9).
+///
+/// Errors with [`LaneError::Query`] if the replay wrote no sample (its
+/// `max_ts_ms` is absent), so the ms-to-ns sentinel overflow can never reach
+/// the query path.
+pub async fn query_after_replay(
+    outcome: &RavelReplayOutcome,
+    query: &str,
+) -> Result<SystemQueryResult, LaneError> {
+    let eval_ts_ms = outcome.max_ts_ms.ok_or_else(|| {
+        LaneError::Query(
+            "the replay wrote no sample, so there is no timestamp to read at".to_string(),
+        )
+    })?;
+
+    let catalog = Arc::new(
+        Catalog::new(
+            Arc::clone(&outcome.store),
+            CatalogConfig {
+                shard_count: outcome.shards,
+                ..CatalogConfig::default()
+            },
+        )
+        .map_err(|e| LaneError::Query(e.to_string()))?,
+    );
+    let engine = QueryEngine::new(catalog, Arc::clone(&outcome.store), EngineConfig::default());
+
+    let now_ns = SystemClock.now_ns();
+    let wall_start = std::time::Instant::now();
+    let (value, _coverage) = engine
+        .instant(
+            outcome.tenant.hash(),
+            query,
+            eval_ts_ms,
+            &outcome.tokens,
+            now_ns,
+            Duration::from_secs(30),
+        )
+        .await
+        .map_err(|e| LaneError::Query(e.to_string()))?;
+    let elapsed_secs = wall_start.elapsed().as_secs_f64();
+
+    let matched_series = match value {
+        Value::Vector(v) => v.len() as u64,
+        _ => 0,
+    };
+
+    Ok(SystemQueryResult {
+        system: "ravel".to_string(),
+        query: query.to_string(),
+        eval_ts_ms,
+        min_commit_tokens: outcome.tokens.iter().map(CommitToken::encode).collect(),
+        matched_series,
+        elapsed_secs,
     })
 }
 
@@ -770,7 +943,7 @@ pub async fn replay_over_http(
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(config.timeout_secs.max(1)))
         .build()
-        .map_err(|e| LaneError::Snappy(format!("building the HTTP client failed: {e}")))?;
+        .map_err(|e| transport_setup_error(format!("building the HTTP client failed: {e}")))?;
 
     let mut valid: Vec<LogicalSample> = Vec::new();
     let mut rejected_samples: u64 = 0;
@@ -928,10 +1101,7 @@ fn process_cpu_secs() -> Option<f64> {
 mod tests {
     use super::*;
 
-    use ravel_catalog::{Catalog, CatalogConfig};
     use ravel_object_store::memory::MemoryStore;
-    use ravel_promql::Value;
-    use ravel_query::{EngineConfig, QueryEngine};
 
     /// A latency report with a chosen p99, so a report fixture is a number a
     /// reader can check by hand.
@@ -989,7 +1159,7 @@ mod tests {
     /// TO SEE THIS TEST FAIL by conflating the ack kinds, flip the
     /// `ack_semantics: AckSemantics::DurableOnAck` line in
     /// [`SystemIngestResult::ravel_row`] to `AckSemantics::Buffered`: both rows
-    /// then share `Buffered`, `pooled_ack_p99_ms(&["ravel", "prometheus"])`
+    /// then share `Buffered`, `max_ack_p99_ms(&["ravel", "prometheus"])`
     /// returns `Ok` instead of the `AckConflation` error, and the
     /// `expect_err` below panics.
     #[test]
@@ -1038,7 +1208,7 @@ mod tests {
         // pool into one ack-latency figure. The pool is refused, naming both
         // ack meanings, so the two cannot be collapsed silently.
         let err = report
-            .pooled_ack_p99_ms(&["ravel", "prometheus"])
+            .max_ack_p99_ms(&["ravel", "prometheus"])
             .expect_err("a durable-on-ack and a buffered row must not pool into one ack figure");
         let kinds: BTreeSet<AckSemantics> = err.systems.iter().map(|(_, k)| *k).collect();
         assert_eq!(
@@ -1052,15 +1222,15 @@ mod tests {
         // that refused every pool unconditionally, which is not "kept separate".
         assert_eq!(
             report
-                .pooled_ack_p99_ms(&["ravel"])
+                .max_ack_p99_ms(&["ravel"])
                 .expect("one durable-on-ack row pools fine"),
-            3.0
+            Some(3.0)
         );
         assert_eq!(
             report
-                .pooled_ack_p99_ms(&["prometheus"])
+                .max_ack_p99_ms(&["prometheus"])
                 .expect("one buffered row pools fine"),
-            9.0
+            Some(9.0)
         );
 
         // The two ack meanings survive a JSON round trip as data, so a reader of
@@ -1266,42 +1436,60 @@ mod tests {
             !outcome.tokens.is_empty(),
             "a strict replay must mint commit tokens to read against"
         );
+        let newest = outcome
+            .max_ts_ms
+            .expect("a non-empty replay has a newest timestamp");
 
-        let catalog = Arc::new(
-            Catalog::new(
-                Arc::clone(&outcome.store),
-                CatalogConfig {
-                    shard_count: cfg.shards,
-                    ..CatalogConfig::default()
-                },
-            )
-            .expect("catalog"),
-        );
-        let engine = QueryEngine::new(catalog, Arc::clone(&outcome.store), EngineConfig::default());
-
-        let now_ns = SystemClock.now_ns();
-        // No sleep between the ack and this read: the tokens, not wall time,
-        // make the write visible.
-        let (value, _coverage) = engine
-            .instant(
-                outcome.tenant.hash(),
-                "mb_replay_gauge",
-                outcome.max_ts_ms,
-                &outcome.tokens,
-                now_ns,
-                Duration::from_secs(30),
-            )
+        // The query phase runs through the shared `query_after_replay` helper
+        // the binary uses: no sleep between the ack and this read, the tokens
+        // (not wall time) make the write visible.
+        let query = query_after_replay(&outcome, "mb_replay_gauge")
             .await
-            .expect("instant query");
+            .expect("read-your-write query phase");
 
-        let matched = match value {
-            Value::Vector(v) => v.len(),
-            other => panic!("expected an instant vector, got {other:?}"),
-        };
+        assert_eq!(query.system, "ravel");
         assert_eq!(
-            matched, 6,
+            query.eval_ts_ms, newest,
+            "the query evaluates at the replay's newest sample"
+        );
+        assert_eq!(
+            query.matched_series, 6,
             "read-your-write must see exactly the six series just written, no sleep"
         );
+        assert!(
+            !query.min_commit_tokens.is_empty(),
+            "the query phase is token-bound: it carries the min_commit_token set it read against"
+        );
+    }
+
+    /// FIX 4 (issue #937 review finding 4): an empty stream (or an all-rejected
+    /// one) leaves NO newest timestamp. The public `replay_into_ravel` models
+    /// that as `None`, never `i64::MIN`, so a downstream ms-to-ns conversion of
+    /// a sentinel cannot overflow, and the query phase refuses with a typed
+    /// error rather than reading at a bogus instant.
+    ///
+    /// TO SEE THIS FAIL against the pre-fix sentinel: change the `if
+    /// valid.is_empty()`/`map_or` absence in `replay_into_ravel` back to a bare
+    /// `i64::MIN` fold; `max_ts_ms` is then `Some(i64::MIN)` and the first
+    /// assertion below fails.
+    #[tokio::test]
+    async fn an_empty_stream_reports_absent_newest_ts_not_a_sentinel() {
+        let cfg = memory_config("mb-replay-empty", 8);
+        let outcome = replay_into_ravel(&cfg, &[]).await.expect("replay");
+
+        assert_eq!(
+            outcome.max_ts_ms, None,
+            "an empty replay has no newest timestamp: absent, not i64::MIN"
+        );
+        assert_eq!(outcome.result.ingest.accepted_samples, 0);
+        assert!(outcome.tokens.is_empty());
+
+        // The query phase refuses the absence with a typed error instead of
+        // reading at a sentinel instant.
+        let err = query_after_replay(&outcome, "mb_replay_gauge")
+            .await
+            .expect_err("querying an empty replay must be a typed error");
+        assert!(matches!(err, LaneError::Query(_)));
     }
 
     /// The RW1.0 body encodes to non-empty snappy-compressed protobuf and
@@ -1325,6 +1513,132 @@ mod tests {
 
         let body = encode_rw1_body(&[s(1, 1.0)]).expect("encode");
         assert!(!body.is_empty(), "the RW1.0 body is non-empty");
+    }
+
+    /// FIX 2 (issue #937 review finding 2): `max_ack_p99_ms` is the MAX of the
+    /// rows' per-row p99s, not a pooled percentile, and its name says so. With
+    /// two same-ack rows whose p99s are 3.0 and 9.0, the figure is exactly the
+    /// larger, 9.0. A true pooled percentile over the union of the two rows' raw
+    /// ack samples would be a different number (it would sit between the batches
+    /// by rank, not at the larger row's p99), which is precisely why the figure
+    /// is named `max` and not `pooled`.
+    ///
+    /// TO SEE THE MAX ASSERTION FAIL: change the fold in `max_ack_p99_ms` from
+    /// `f64::max` to `f64::min`; the figure becomes 3.0 and the assert fails.
+    #[test]
+    fn max_ack_p99_is_the_max_of_per_row_p99s_over_two_rows() {
+        let low = SystemIngestResult::buffered_http_row(
+            "prometheus",
+            "http://prom.example:9090/api/v1/write",
+            "reqwest RW1.0 sender",
+            ingest_phase(3.0),
+        );
+        let high = SystemIngestResult::buffered_http_row(
+            "victoriametrics",
+            "http://vm.example:8428/api/v1/write",
+            "reqwest RW1.0 sender",
+            ingest_phase(9.0),
+        );
+        let report = MetricsIngestReport::new(vec![low, high]);
+
+        // Both rows are buffered, so the pool is admissible; the figure is the
+        // MAX of {3.0, 9.0}, exactly 9.0.
+        assert_eq!(
+            report
+                .max_ack_p99_ms(&["prometheus", "victoriametrics"])
+                .expect("two buffered rows share one ack meaning, so the pool is admissible"),
+            Some(9.0),
+            "the figure is the max of the per-row p99s, not a pooled percentile"
+        );
+    }
+
+    /// FIX 2 (issue #937 review finding 2): an empty pool is ABSENT, not a real
+    /// 0.0 ms max. A pool naming no existing row returns `Ok(None)`, so "no rows
+    /// to fold" is distinguishable from "the max p99 is 0.0 ms".
+    ///
+    /// TO SEE THIS FAIL: flip the `if rows.is_empty() { return Ok(None); }` line
+    /// in `max_ack_p99_ms` to `Ok(Some(0.0))`; the assert on `None` fails.
+    #[test]
+    fn max_ack_p99_over_an_empty_pool_is_absent() {
+        let report = MetricsIngestReport::new(vec![SystemIngestResult::buffered_http_row(
+            "prometheus",
+            "http://prom.example:9090/api/v1/write",
+            "reqwest RW1.0 sender",
+            ingest_phase(3.0),
+        )]);
+        assert_eq!(
+            report
+                .max_ack_p99_ms(&["nonexistent"])
+                .expect("no ack-kind conflict when no row is named"),
+            None,
+            "an empty pool is absent, never a 0.0 ms max standing in for unmeasured"
+        );
+    }
+
+    /// FIX 3 (issue #937 review finding 3): an HTTP transport-setup failure maps
+    /// to [`LaneError::Transport`], NOT [`LaneError::Snappy`], so its rendered
+    /// message names the transport, not snappy compression the setup never
+    /// touched. `replay_over_http`'s client-build `map_err` routes through
+    /// `transport_setup_error`, the same constructor exercised here.
+    ///
+    /// TO SEE THIS FAIL: change `transport_setup_error` to build
+    /// `LaneError::Snappy(detail)` (the pre-fix bug); the variant match and the
+    /// message assertions below fail.
+    #[test]
+    fn client_build_failure_is_a_transport_error() {
+        let err = transport_setup_error("building the HTTP client failed: boom".to_string());
+        assert!(
+            matches!(err, LaneError::Transport(_)),
+            "a client-build failure is a transport-setup error, not a snappy error"
+        );
+        let rendered = err.to_string();
+        assert_eq!(
+            rendered,
+            "setting up the Remote Write HTTP transport failed: building the HTTP client failed: \
+             boom"
+        );
+        assert!(
+            !rendered.contains("snappy"),
+            "the transport-setup message must not claim snappy compression failed"
+        );
+    }
+
+    /// FIX 5 (issue #937 review finding 5): the RW1.0 encode is precomputed
+    /// OUTSIDE the Ravel timed window, so `elapsed_secs` measures only the
+    /// in-process writes (which never serialize an RW1.0 body), and `wire_bytes`
+    /// is unchanged: it still equals the exact sum of the per-batch snappy body
+    /// lengths, computed here independently of the timed run.
+    ///
+    /// TO SEE THE WINDOW REGRESS: move the `wire_bytes += encode_rw1_body(...)`
+    /// accumulation in `replay_into_ravel` from the pre-`wall_start` precompute
+    /// loop back into the timed `write_values` loop. `wire_bytes` still equals
+    /// this precomputed value, but `elapsed_secs` then folds in the encode the
+    /// in-process path never performs -- the skew this fix removes.
+    #[tokio::test]
+    async fn ravel_window_excludes_the_rw1_encode() {
+        let n = 40usize;
+        let batch_size = 8usize;
+        let stream = valid_stream(n, 8);
+        let cfg = memory_config("mb-replay-wire", batch_size);
+        let outcome = replay_into_ravel(&cfg, &stream).await.expect("replay");
+
+        // Every sample in `valid_stream` is valid, so the replay batches the
+        // stream in its own order; recompute the wire size the same way, from
+        // the RW1.0 encoder, entirely outside any timed region.
+        let expected_wire_bytes: u64 = stream
+            .chunks(batch_size)
+            .map(|chunk| encode_rw1_body(chunk).expect("encode").len() as u64)
+            .sum();
+
+        assert_eq!(
+            outcome.result.ingest.wire_bytes, expected_wire_bytes,
+            "wire_bytes is unchanged: the exact sum of the per-batch RW1.0 body lengths, \
+             precomputed outside the timed window"
+        );
+        assert!(
+            expected_wire_bytes > 0,
+            "a non-empty replay encodes a non-empty RW1.0 body"
+        );
     }
 
     /// The lane parses the shipping `metrics_gen` encoding: float lines become
