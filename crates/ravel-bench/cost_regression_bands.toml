@@ -1,0 +1,70 @@
+# Per-figure regression bands for `cost_regression_check` (ADR-0996 workstream
+# F, task 996-7). Defaults; mirrored by `Bands::defaults()` in
+# `src/cost_regression.rs`, and a unit test asserts this file parses back to
+# those defaults so the two never drift.
+#
+# Each entry is a band on one figure CLASS: kind = "exact" | "percent" |
+# "absolute". A `percent`/`absolute` band allows the candidate to exceed the
+# baseline by at most `allowance` (percent, or the figure's own units); a
+# decrease is always an improvement and passes. `exact` fails on any difference.
+#
+# The comparison loop reads ONLY these bands, never a hardcoded constant, so a
+# threshold is data with a named home. Omit any class to keep its default;
+# override the ones a particular lane needs.
+
+# Object geometry is deterministic; any drift is a real regression, not noise.
+[object_count]
+kind = "exact"
+
+# Read-policy changes must not move the write (PUT) class at all. The request
+# floor is an exact figure (ADR-0996 verification plan: "requests and object
+# counts exact or configured %"). Override to `percent` for a lane whose write
+# count legitimately varies.
+[write_class_requests]
+kind = "exact"
+
+# The data-GET floor is exact per the verification plan. Override to `percent`
+# for a lane whose GET count legitimately varies run to run.
+[data_gets]
+kind = "exact"
+
+# The ADR bands full-scan amplification at <= 1.05 over the 1.0 floor; a
+# comparison allows the candidate the same +0.05 headroom over the baseline.
+[range_amplification]
+kind = "absolute"
+allowance = 0.05
+
+# Modeled from billed attempts, so it tracks the request count; 1% absorbs
+# profile-rounding while still flagging real cost growth.
+[modeled_request_cost]
+kind = "percent"
+allowance = 1.0
+
+# Wire bytes carry coalesced holes that shift with object geometry; 5% covers
+# that jitter.
+[bytes]
+kind = "percent"
+allowance = 5.0
+
+# The repo's hot-path latency noise floor is ~0.2-1%; p50 is a hot/median
+# figure, so 1% is the tightest band that does not flake.
+[latency_p50]
+kind = "percent"
+allowance = 1.0
+
+# The cold/tail latency noise floor is 3-5%; p95 is a tail figure, so 5% is the
+# matching floor.
+[latency_p95]
+kind = "percent"
+allowance = 5.0
+
+# The ADR peak-residency band is +/-10% vs baseline; the regression gate keeps
+# the +10% upper half.
+[peak_memory]
+kind = "percent"
+allowance = 10.0
+
+# Plan-shape rule: a request-minimal full scan opens zero ranged segments, so
+# any nonzero delta is a regression.
+[ranged_opens]
+kind = "exact"

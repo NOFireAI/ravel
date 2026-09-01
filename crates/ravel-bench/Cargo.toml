@@ -61,6 +61,12 @@ uuid = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# The cost-regression gate (ADR-0996 task 996-7) loads its per-figure bands from
+# a checked-in TOML document (`cost_regression_bands.toml`). `toml` is not in the
+# workspace `[workspace.dependencies]`; it is named by version here exactly as
+# ravel-types names it (`toml = "1"`), so no new external crate enters the
+# workspace, only a new dependency EDGE from ravel-bench.
+toml = "1"
 thiserror = { workspace = true }
 # The distrib crossover bench spins in-process `tonic` loopback
 # `SeriesFetch` workers to drive the real ADR-0071 distributed fan-out, exactly
@@ -208,6 +214,14 @@ name = "bench_report"
 path = "src/bin/bench_report.rs"
 bench = false
 
+# ADR-0996 workstream F (task 996-7): the request-cost regression gate as a
+# comparison tool. In the default feature set: it consumes machine-readable cost
+# reports and adds no counters, so it needs no query/SQL feature.
+[[bin]]
+name = "cost_regression_check"
+path = "src/bin/cost_regression_check.rs"
+bench = false
+
 [[bin]]
 name = "concurrent_bench"
 path = "src/bin/concurrent_bench.rs"
@@ -347,6 +361,14 @@ bench = false
 [[test]]
 name = "read_accounting"
 path = "tests/read_accounting.rs"
+bench = false
+
+# ADR-0996 workstream F (task 996-7): the cost-regression gate's smoke test,
+# driving the shipping `cost_regression_check` binary over fixture reports so the
+# gate is proven reachable from the bin a caller runs, not only from lib units.
+[[test]]
+name = "cost_regression_smoke"
+path = "tests/cost_regression_smoke.rs"
 bench = false
 
 # ADR-0109 (#606) acceptance test: the differential harness must drive both the
