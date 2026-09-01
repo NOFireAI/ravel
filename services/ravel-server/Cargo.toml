@@ -168,6 +168,20 @@ ravel-sql = { path = "../../crates/ravel-sql", version = "0.11.0", optional = tr
 # the two never exchange types.
 arrow-flight = { workspace = true, optional = true }
 
+# Global allocator, compiled into this binary (issue #972). Kept off the msvc
+# target, which tikv-jemallocator does not support (its own documented cfg);
+# this repo builds on Linux and macOS. The `#[global_allocator]` lives in
+# src/main.rs, a binary root, never in a library crate.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { workspace = true }
+
+[target.'cfg(not(target_env = "msvc"))'.dev-dependencies]
+# Honest runtime check that the binary is actually running under jemalloc: the
+# smoke test in main.rs reads jemalloc's own allocated-bytes stat. Pinned
+# directly (not via [workspace.dependencies]) matching this crate's convention
+# for deps the single authorized root line does not cover.
+tikv-jemalloc-ctl = { version = "0.7", features = ["stats"] }
+
 [features]
 # OTAP (OpenTelemetry Arrow) metrics ingest on the gRPC listener: registers
 # `ArrowMetricsService` alongside the OTLP gRPC services. Off by default so the

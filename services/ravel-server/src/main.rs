@@ -15,6 +15,13 @@ use ravel_server::{
 };
 use tracing_subscriber::EnvFilter;
 
+// jemalloc is compiled into this binary so the allocator is part of the
+// binary's identity rather than an environment accident (#972); library crates
+// must never do this (their test binaries install their own global allocator).
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 /// Wall-clock unix nanoseconds for stamping the `sys/tenancy` marker's
 /// informational `created_unix_ns` at bootstrap. This is the binary entry
 /// point, not library logic, so a direct clock read here does not violate the
@@ -546,8 +553,38 @@ async fn wait_for_shutdown_signal() {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// This unit test binary is built from this binary root, so it links the
+    /// `#[global_allocator]` above; an integration test in `tests/` links the
+    /// library instead and would not. Read jemalloc's own allocated-bytes stat
+    /// and prove it accounts for a fresh large allocation: under glibc malloc
+    /// that allocation never touches jemalloc's arenas, so its counter does not
+    /// move and this assertion fails. That flip is what makes this a real
+    /// runtime check of the installed allocator, not a `cfg` echo.
+    #[cfg(not(target_env = "msvc"))]
+    #[test]
+    fn binary_runs_under_jemalloc() {
+        use tikv_jemalloc_ctl::{epoch, stats};
+
+        epoch::advance().expect("jemalloc epoch mallctl must succeed under jemalloc");
+        let before = stats::allocated::read().expect("jemalloc stats.allocated read must succeed");
+
+        let big: Vec<u8> = vec![7u8; 64 * 1024 * 1024];
+        std::hint::black_box(big.as_ptr());
+
+        epoch::advance().expect("jemalloc epoch mallctl must succeed under jemalloc");
+        let after = stats::allocated::read().expect("jemalloc stats.allocated read must succeed");
+
+        assert!(
+            after > before,
+            "jemalloc allocated bytes did not grow ({before} -> {after}) across a 64 MiB \
+             allocation: the process is not running under the jemalloc global allocator"
+        );
+        std::hint::black_box(big);
+    }
 
     /// the modes that build a query engine (and therefore spawn the alert
     /// evaluator) must not warn; the modes that do not, must warn when rules are
