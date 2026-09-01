@@ -98,23 +98,36 @@ pub enum MaintainError {
         part_key: String,
     },
     #[error(
-        "bounded RLOG compaction merge for stream {stream_id} would exceed its cursor-memory budget: {open_cursors} cursors already open charging {charged_bytes} bytes, admitting the next cursor merge order requires needs {required_bytes} bytes total against a budget of {budget_bytes} ({inputs_carrying_stream} inputs carry this stream); nothing published, the L0 inputs stay live, any parts already PUT age out under the unreferenced-part sweep (ADR-0979 decision 4). Raise merge_cursor_budget_bytes to at least {required_bytes} to compact this bucket"
+        "bounded RLOG compaction merge for stream {stream_id} would exceed its cursor-memory budget: {open_cursors} cursors already open charging {charged_bytes} bytes, and admitting the batch merge order requires (position {admission_batch_position} of {admission_batch_len}) needs {required_bytes} bytes total against a budget of {budget_bytes} ({inputs_carrying_stream} inputs carry this stream); nothing published, the L0 inputs stay live, any parts already PUT age out under the unreferenced-part sweep (ADR-0979 decision 4). Raise merge_cursor_budget_bytes to at least {required_bytes} to compact this bucket"
     )]
     MergeCursorBudgetExceeded {
         /// Hex canonical id of the stream whose cursor set overran the budget.
         stream_id: String,
         /// Cursors already open for this stream when the reservation was refused.
+        /// Batch members before the refused one are not counted here: they were
+        /// never opened, so they hold nothing.
         open_cursors: usize,
-        /// Sum of the open cursors' reservations at the point of refusal.
+        /// What the OPEN cursors charge at the point of refusal: their reconciled
+        /// residency, not counting any member of the refused admission batch.
         charged_bytes: u64,
         /// The configured [`crate::config::CompactorConfig::merge_cursor_budget_bytes`].
         budget_bytes: u64,
-        /// Prospective total had the refused cursor been admitted (`charged_bytes`
-        /// plus its reservation), so a first admission already over budget still
-        /// names the number a retry must budget for.
+        /// Prospective total had the batch been admitted through this position:
+        /// `charged_bytes` plus the reservations of batch members `0..=
+        /// admission_batch_position`. The whole batch is what merge order
+        /// requires before the next record can be emitted, so this is the figure
+        /// a retry must budget for, and a first admission already over budget
+        /// still names a number.
         required_bytes: u64,
         /// How many inputs carry this stream, so the operator can size the fix.
         inputs_carrying_stream: usize,
+        /// Position, within the admission batch, of the cursor whose reservation
+        /// crossed the budget (0-based).
+        admission_batch_position: usize,
+        /// How many cursors the refused admission batch holds. The whole batch is
+        /// admitted before the next emit, so a refusal at any position aborts the
+        /// run.
+        admission_batch_len: usize,
     },
     #[error(
         "bounded RLOG compaction cannot admission-price input {object_key:?}: it carries no PAGE_DIR section, so a cursor's decode cost is unknowable before the fetch and the pre-decode reservation (ADR-0979 decision 4) cannot be charged. PAGE_DIR is mandatory in RLOG format version {format_version} (ADR-0699 decision 2), so this is a version/corruption gate, not a live path on a current-format fleet; nothing published, the L0 inputs stay live"

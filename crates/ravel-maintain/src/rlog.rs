@@ -192,9 +192,14 @@ use ravel_logseg::field_dir::FieldDir;
 use ravel_logseg::footer::{self, SuffixOutcome, kind};
 use ravel_logseg::page_dir::PageDir;
 use ravel_logseg::postings::PostingsSection;
+use ravel_logseg::reader::MAX_BLOCKS;
+use ravel_logseg::record::{
+    COL_ATTRS_RAW, COL_BODY, COL_SEVERITY_TEXT, COL_SPAN_ID, COL_TRACE_ID, FIRST_DYNAMIC_COL,
+};
+use ravel_logseg::skip_index::SkipIndex;
 use ravel_logseg::{
-    AttrValue, LogRecord, LogStreamId, RlogConfig, RlogRangeReader, RlogWriter, StreamBlockLoc,
-    StreamBlockRows, decode_section, writer::ObjectIdentity,
+    AttrValue, FieldType, LogRecord, LogStreamId, RlogConfig, RlogRangeReader, RlogWriter,
+    StreamBlockLoc, StreamBlockRows, decode_section, writer::ObjectIdentity,
 };
 use ravel_object_store::{GetRange, ObjectStoreBackend};
 use ravel_proto::commit::v1::CompactionPart;
@@ -257,17 +262,48 @@ pub struct RlogInputCatalog {
     /// it from here is what lets that gate keep working without the
     /// whole-object GET it used to read the footer from.
     pub record_count: u64,
-    /// Per whole-object block index, the sum of that block's PAGE_DIR
-    /// `uncomp_len` values: the decompressed page-byte total the block expands
-    /// to before per-cell allocation overhead. This is the term the bounded
-    /// merge's pre-decode cursor reservation is sized from (ADR-0979
-    /// decision 4): a cursor's decoded columnar block costs about this times an
-    /// allocation-overhead factor, and it is known from the resident PAGE_DIR
-    /// before any BLOCKS byte is fetched. A candidate block index from
-    /// [`RlogRangeReader::stream_blocks`] indexes straight into it. Never empty
-    /// on a loaded catalog: an input with no PAGE_DIR is refused at load with
-    /// [`MaintainError::MergeCursorInputMissingPageDir`].
-    pub block_uncomp_lens: Vec<u64>,
+    /// Everything the bounded merge needs to price a cursor's decoded residency
+    /// from this input before any BLOCKS byte is fetched (ADR-0979 decision 4).
+    /// Never empty on a loaded catalog: an input with no PAGE_DIR is refused at
+    /// load with [`MaintainError::MergeCursorInputMissingPageDir`].
+    pub pricing: InputCursorPricing,
+}
+
+/// The pre-decode admission pricing metadata of one input: the per-block shape
+/// and string-payload figures [`block_decode_ceiling_bytes`] evaluates the
+/// ADR-0979 decision 1 decoded-block ceiling from, all read from directories the
+/// catalog already holds resident (SKIP_IDX, FIELD_DIR, PAGE_DIR).
+///
+/// The decoded block's dominant term scales with the block's SHAPE (rows times
+/// the column-id width), not with its stored or encoded size: `encode_i64` picks
+/// the smallest codec per page, so a constant or run-length column -- every
+/// one-stream block's `stream_ref`, usually `severity` and `flags` too -- stores
+/// a handful of bytes and decodes to `16 B x rows`. Only the string payload
+/// scales with page contents, and PAGE_DIR carries it per page. Pricing a
+/// cursor from raw page `uncomp_len` alone therefore under-charges by a ratio
+/// that can exceed 10,000x, which is the under-charge the budget exists to
+/// refuse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputCursorPricing {
+    /// Rows in each whole-object block, from the resident SKIP_IDX level-0
+    /// entries' `record_count`. A candidate block index from
+    /// [`RlogRangeReader::stream_blocks`] indexes straight into it.
+    pub block_rows: Vec<u32>,
+    /// Per whole-object block index, the sum of PAGE_DIR `uncomp_len` over that
+    /// block's STRING pages only: the decompressed payload the block's string
+    /// and byte-valued cells own after decode. The numeric pages' `uncomp_len`
+    /// is deliberately NOT in here; their decoded cost is the shape term.
+    pub block_string_uncomp_lens: Vec<u64>,
+    /// The width of this input's column-id space: the largest column id plus
+    /// one, over the reserved fixed ids and every dynamic id FIELD_DIR names. A
+    /// width rather than a count, because a decoded block's per-column slot
+    /// vectors are sized by the largest id it carries.
+    pub total_cols: u64,
+    /// How many of those columns decode to owned per-cell buffers (the fixed
+    /// string and byte columns plus every FIELD_DIR `Str`/`Bytes` entry). Every
+    /// one is priced as PLAIN, the conservative arm: dictionary encoding stores
+    /// the distinct values once and only shrinks the figure.
+    pub string_cols: u64,
 }
 
 /// The logs codec: implements the [`SegmentCodec`] seam for `.rlog` objects.
@@ -401,14 +437,14 @@ pub(crate) async fn load_catalog_from_object(
         });
     };
     let page_dir_raw = fetch_section(store, &object_key, &ftr, kind::PAGE_DIR, &cfg).await?;
-    // The per-block decompressed page-byte totals the bounded merge reserves a
-    // cursor's decode against (ADR-0979 decision 4). Decoded here, once, from
-    // the PAGE_DIR bytes already fetched: `PageDir::decode` is the same decode
-    // the range reader runs internally, and this keeps only the per-block sum
-    // (one u64 per block) rather than a second copy of the directory. The
+    // The per-block shape and string-payload figures the bounded merge reserves
+    // a cursor's decode against (ADR-0979 decision 4). Decoded here, once, from
+    // directory bytes already fetched: these are the same decodes the range
+    // reader runs internally, and this keeps only the per-block figures (one u32
+    // and one u64 per block) rather than a second copy of the directories. The
     // reader's own `from_sections_with_page_dir` below re-decodes and fully
     // validates the same bytes, so a corrupt directory still fails loud there.
-    let block_uncomp_lens = block_uncomp_lens_from_page_dir(&page_dir_raw)?;
+    let pricing = input_cursor_pricing(&field_dir_raw, &skip_idx_raw, &page_dir_raw)?;
     // Input read / catalog load phase (issue #977): the reader below retains a
     // decoded form of these directory sections for the whole merge. Charge the
     // decoded section payload lengths (what `fetch_section` returns after
@@ -419,9 +455,12 @@ pub(crate) async fn load_catalog_from_object(
             + field_dir_raw.len() as u64
             + skip_idx_raw.len() as u64
             + page_dir_raw.len() as u64
-            // The retained per-block reservation figures are derived from
-            // PAGE_DIR but held past it, so charge them too: one u64 per block.
-            + (block_uncomp_lens.len() as u64)
+            // The retained per-block reservation figures are derived from the
+            // directories but held past them, so charge them too: one u32 (rows)
+            // and one u64 (string payload) per block.
+            + (pricing.block_rows.len() as u64)
+                .saturating_mul(std::mem::size_of::<u32>() as u64)
+            + (pricing.block_string_uncomp_lens.len() as u64)
                 .saturating_mul(std::mem::size_of::<u64>() as u64);
         t.add_catalog_directory_bytes(dir_bytes);
     }
@@ -438,21 +477,64 @@ pub(crate) async fn load_catalog_from_object(
         reader,
         indexed_fields,
         record_count,
-        block_uncomp_lens,
+        pricing,
     })
 }
 
-/// The per-block decompressed page-byte totals a bounded merge reserves cursor
-/// decode against (ADR-0979 decision 4), decoded from one input's PAGE_DIR
-/// section bytes. Entry `b` is the sum of `uncomp_len` over every page whole-
-/// object block `b` contributes to any column chunk of its row group -- the
-/// decompressed columnar payload the block decodes to, which the cursor's
-/// [`StreamBlockRows::heap_estimate`] scales with. Read from resident PAGE_DIR
-/// alone; the decode is the same one the range reader runs internally.
-fn block_uncomp_lens_from_page_dir(page_dir_raw: &[u8]) -> Result<Vec<u64>> {
+/// The fixed column ids whose cells decode to owned per-row byte buffers:
+/// `severity_text`, `body`, `trace_id`, `span_id`, and the canonical
+/// `attrs_raw` overflow blob (docs/log-segment-format.md FIELD_DIR). The
+/// remaining reserved ids (`ts`, `observed_ts`, `stream_ref`, `severity_num`,
+/// `flags`) decode to `Option<i64>` slots and are priced by the shape term.
+const FIXED_STRING_COLS: [u32; 5] = [
+    COL_SEVERITY_TEXT,
+    COL_BODY,
+    COL_TRACE_ID,
+    COL_SPAN_ID,
+    COL_ATTRS_RAW,
+];
+
+/// Decoded bytes a numeric cell slot costs: `Option<i64>` and `Option<u64>` are
+/// 16 bytes, and every column of the decoded block carries one slot per row of
+/// the block whether or not that row has a value (`Option<bool>` is smaller,
+/// so pricing every column at this width is the conservative arm).
+const DECODED_CELL_BYTES: u64 = 16;
+
+/// Decoded bytes a string cell's SLOT costs on top of the shape term, covering
+/// the `Option<Vec<u8>>` handle a plain string column keeps per row (24 bytes)
+/// with margin for the dictionary form's id plus its distinct-value handle.
+/// The cell CONTENTS are priced separately, from the block's string-page
+/// `uncomp_len`.
+const DECODED_STRING_SLOT_BYTES: u64 = 40;
+
+/// One input's pre-decode admission pricing metadata (ADR-0979 decision 4),
+/// decoded from the FIELD_DIR, SKIP_IDX, and PAGE_DIR section bytes the catalog
+/// load already fetched. See [`InputCursorPricing`] for why each term is read
+/// from the source it is read from.
+fn input_cursor_pricing(
+    field_dir_raw: &[u8],
+    skip_idx_raw: &[u8],
+    page_dir_raw: &[u8],
+) -> Result<InputCursorPricing> {
+    let field_dir = FieldDir::decode(field_dir_raw, MAX_FIELD_DIR_ENTRIES)?;
+    // The reserved fixed ids 0..FIRST_DYNAMIC_COL never appear in FIELD_DIR but
+    // are always part of the block's column-id space, so the width starts there.
+    let mut total_cols = u64::from(FIRST_DYNAMIC_COL);
+    let mut string_ids: BTreeSet<u32> = FIXED_STRING_COLS.iter().copied().collect();
+    for entry in field_dir.entries() {
+        total_cols = total_cols.max(u64::from(entry.column_id).saturating_add(1));
+        if matches!(entry.ty, FieldType::Str | FieldType::Bytes) {
+            string_ids.insert(entry.column_id);
+        }
+    }
+    let string_cols = string_ids.len() as u64;
+
+    let skip = SkipIndex::decode(skip_idx_raw, MAX_BLOCKS)?;
+    let block_rows: Vec<u32> = skip.l0.iter().map(|e| e.record_count).collect();
+
     let page_dir = PageDir::decode(page_dir_raw)?;
     let block_count = page_dir.block_count();
-    let mut out = Vec::with_capacity(block_count as usize);
+    let mut block_string_uncomp_lens = Vec::with_capacity(block_count as usize);
     for b in 0..block_count {
         let index = u32::try_from(b)
             .map_err(|_| MaintainError::Invariant("page_dir block index range".to_string()))?;
@@ -461,11 +543,61 @@ fn block_uncomp_lens_from_page_dir(page_dir_raw: &[u8]) -> Result<Vec<u64>> {
         })?;
         let mut sum = 0u64;
         for p in pages {
-            sum = sum.saturating_add(p.desc.uncomp_len);
+            if string_ids.contains(&p.desc.column_id) {
+                sum = sum.saturating_add(p.desc.uncomp_len);
+            }
         }
-        out.push(sum);
+        block_string_uncomp_lens.push(sum);
     }
-    Ok(out)
+    if block_rows.len() != block_string_uncomp_lens.len() {
+        return Err(MaintainError::Invariant(format!(
+            "input block framing disagrees: SKIP_IDX frames {} blocks, PAGE_DIR covers {}",
+            block_rows.len(),
+            block_string_uncomp_lens.len()
+        )));
+    }
+    Ok(InputCursorPricing {
+        block_rows,
+        block_string_uncomp_lens,
+        total_cols,
+        string_cols,
+    })
+}
+
+/// The ADR-0979 decision 1 ceiling on what ONE block of `pricing`'s input
+/// decodes to, evaluated from pre-decode metadata alone:
+///
+/// ```text
+/// 16 B x rows x total_cols          every column's per-row cell slot
+///   + string-page uncomp_len        the string cells' own buffers
+///   + 40 B x rows x string_cols     those cells' per-row handles
+/// ```
+///
+/// Each term is priced from the source that actually bounds it: `rows` and the
+/// block framing from SKIP_IDX, the column-id width and the string-column count
+/// from FIELD_DIR, the string payload from PAGE_DIR's per-page `uncomp_len`
+/// restricted to string pages. Every string column is priced as plain, the
+/// conservative arm.
+fn block_decode_ceiling_bytes(pricing: &InputCursorPricing, block: usize) -> Result<u64> {
+    let rows = u64::from(*pricing.block_rows.get(block).ok_or_else(|| {
+        MaintainError::Invariant(
+            "stream candidate block index past the input's SKIP_IDX block count".to_string(),
+        )
+    })?);
+    let string_bytes = *pricing.block_string_uncomp_lens.get(block).ok_or_else(|| {
+        MaintainError::Invariant(
+            "stream candidate block index past the input's PAGE_DIR block count".to_string(),
+        )
+    })?;
+    let cells = DECODED_CELL_BYTES
+        .saturating_mul(rows)
+        .saturating_mul(pricing.total_cols);
+    let string_slots = DECODED_STRING_SLOT_BYTES
+        .saturating_mul(rows)
+        .saturating_mul(pricing.string_cols);
+    Ok(cells
+        .saturating_add(string_bytes)
+        .saturating_add(string_slots))
 }
 
 /// One catalog per object key, `input_read_concurrency` loads in flight.
@@ -943,13 +1075,19 @@ struct StreamCursor<'a> {
     /// the prefetch is one loc ahead, so the cursor's raw-byte residency is
     /// two locs, not the stream.
     prefetched: Option<(StreamBlockLoc, bytes::Bytes)>,
-    /// The pre-decode reservation charged against
-    /// [`CompactorConfig::merge_cursor_budget_bytes`] when this cursor was
-    /// admitted (ADR-0979 decision 4). Held for the cursor's lifetime and
-    /// released back to the stream's running charge when the cursor drains, so
-    /// the charge tracks the concurrent overlap `D`, not the input count. Set by
-    /// the merge after [`Self::open`]; 0 until then.
+    /// The pre-decode reservation ceiling this cursor was admitted under
+    /// (ADR-0979 decision 4). Kept after the reconcile as the ceiling the
+    /// cursor's residency is bounded by; the live charge is [`Self::charged`].
+    /// Set by the merge after [`Self::open`]; 0 until then.
     reservation: u64,
+    /// What this cursor currently charges against
+    /// [`CompactorConfig::merge_cursor_budget_bytes`]: the pre-decode
+    /// reservation ceiling from admission until its first decode completes, then
+    /// its actual residency ([`Self::resident_bytes`]), re-derived after every
+    /// block decode (ADR-0979 decision 4 as amended). Released back to the
+    /// stream's running charge when the cursor drains, so the charge tracks the
+    /// concurrent overlap `D`, not the input count.
+    charged: u64,
 }
 
 impl<'a> StreamCursor<'a> {
@@ -977,7 +1115,37 @@ impl<'a> StreamCursor<'a> {
             block_bytes: 0,
             prefetched: None,
             reservation: 0,
+            charged: 0,
         }))
+    }
+
+    /// The raw (still stored-form) bytes this cursor holds right now: the row
+    /// group it is decoding blocks out of plus the one prefetched behind it, at
+    /// most two. These are the same bytes the #977 tracker's fetched term counts.
+    fn raw_resident_bytes(&self) -> u64 {
+        let group = self.group.as_ref().map_or(0, |(_, d)| d.len() as u64);
+        let prefetched = self.prefetched.as_ref().map_or(0, |(_, d)| d.len() as u64);
+        group.saturating_add(prefetched)
+    }
+
+    /// The decoded columnar block this cursor holds right now, as
+    /// [`StreamBlockRows::heap_estimate`] reported it at decode. Zero between
+    /// blocks and once the cursor is exhausted. This is the same figure the #977
+    /// tracker's decoded term carries for this cursor.
+    fn decoded_bytes(&self) -> u64 {
+        self.block_bytes
+    }
+
+    /// What this cursor actually holds resident: its location metadata, its raw
+    /// row-group bytes, and its decoded block. This is what the merge reconciles
+    /// the pre-decode reservation down to once a decode completes (ADR-0979
+    /// decision 4 as amended), and it is bounded above by that reservation --
+    /// the raw term by `2 * G` and the decoded term by the per-block ceiling the
+    /// reservation took the maximum of.
+    fn resident_bytes(&self) -> u64 {
+        loc_metadata_bytes(&self.locs)
+            .saturating_add(self.raw_resident_bytes())
+            .saturating_add(self.decoded_bytes())
     }
 
     /// The `ts_ns` of the record this cursor would yield next, or `None` once
@@ -1185,20 +1353,19 @@ struct PendingCursor {
     reservation: u64,
 }
 
-/// Allocation-overhead factor applied to a block's decompressed page bytes to
-/// size the decoded columnar block's reservation ceiling (ADR-0979
-/// decision 4). A cursor's [`StreamBlockRows::heap_estimate`] is the decoded
-/// column buffers plus per-cell allocation headers and `Vec` slack over the raw
-/// decompressed page payload PAGE_DIR's `uncomp_len` measures, so a factor above
-/// one is needed for the reservation to bound the decoded residency. Two is a
-/// documented heuristic ceiling over that payload, consistent with
-/// `heap_estimate` itself being an estimate rather than a measurement. The
-/// reservation is held at this ceiling for the cursor's lifetime rather than
-/// reconciled down to the decoded figure after decode: the ceiling already
-/// covers the cursor's whole lifetime residency, so holding it keeps the budget
-/// conservative (it never under-charges) and the reserve-time check
-/// deterministic.
-const CURSOR_DECODE_OVERHEAD_FACTOR: u64 = 2;
+/// The heap a cursor's own location metadata holds for its whole lifetime: the
+/// owned `Vec<StreamBlockLoc>` and each loc's block-index list. Charged in the
+/// pre-decode reservation and again in the reconciled residency, because the
+/// cursor holds it in both states.
+fn loc_metadata_bytes(locs: &[StreamBlockLoc]) -> u64 {
+    let loc_slot = std::mem::size_of::<StreamBlockLoc>() as u64;
+    let idx_slot = std::mem::size_of::<usize>() as u64;
+    let mut total = (locs.len() as u64).saturating_mul(loc_slot);
+    for l in locs {
+        total = total.saturating_add((l.block_indices().len() as u64).saturating_mul(idx_slot));
+    }
+    total
+}
 
 /// The pre-decode reservation one input's cursor over `stream_id` is charged
 /// against the merge budget (ADR-0979 decision 4), or `None` if the input does
@@ -1208,14 +1375,19 @@ const CURSOR_DECODE_OVERHEAD_FACTOR: u64 = 2;
 /// - `2 * G`: the two row groups' stored bytes a cursor holds at once (the loc
 ///   being decoded from plus the one prefetched behind it), sized as twice the
 ///   largest of the stream's locs so a later, larger group cannot exceed it;
-/// - the cursor's location metadata: its owned `Vec<StreamBlockLoc>` and each
-///   loc's block-index list;
+/// - the cursor's location metadata ([`loc_metadata_bytes`]);
 /// - `B_dec`: the MAXIMUM over the stream's candidate blocks of that block's
-///   decompressed page-byte total ([`RlogInputCatalog::block_uncomp_lens`]),
-///   times [`CURSOR_DECODE_OVERHEAD_FACTOR`]. The max, not the first block's
-///   cost, because [`StreamCursor::refill`] decodes later blocks after
-///   releasing earlier ones, so a later, larger block must not exceed the
+///   decoded-block ceiling ([`block_decode_ceiling_bytes`]). The max, not the
+///   first block's cost, because [`StreamCursor::refill`] decodes later blocks
+///   after releasing earlier ones, so a later, larger block must not exceed the
 ///   reservation.
+///
+/// This is a ceiling on the cursor's residency for its whole lifetime, not a
+/// measurement of it: [`StreamCursor::resident_bytes`] is what the cursor
+/// actually holds, and the merge reconciles the charge down to that figure as
+/// soon as the decode completes (ADR-0979 decision 4 as amended; the default
+/// budget is sized from reconciled residency, so holding the ceiling for a
+/// cursor's lifetime would refuse runs the default exists to admit).
 fn cursor_reservation_bytes(
     catalog: &RlogInputCatalog,
     stream_id: &LogStreamId,
@@ -1229,32 +1401,14 @@ fn cursor_reservation_bytes(
     // 2*G: twice the largest loc's stored row-group bytes.
     let max_group = locs.iter().map(|l| l.byte_len()).max().unwrap_or(0);
     let two_g = max_group.saturating_mul(2);
-    // Location metadata: the owned locs vector plus each loc's block-index list.
-    let loc_slot = std::mem::size_of::<StreamBlockLoc>() as u64;
-    let idx_slot = std::mem::size_of::<usize>() as u64;
-    let mut loc_meta = (locs.len() as u64).saturating_mul(loc_slot);
-    for l in &locs {
-        loc_meta =
-            loc_meta.saturating_add((l.block_indices().len() as u64).saturating_mul(idx_slot));
-    }
-    // B_dec: the max decompressed page bytes over the stream's candidate blocks.
-    let mut max_b_dec = 0u64;
+    let loc_meta = loc_metadata_bytes(&locs);
+    // B_dec: the max decoded-block ceiling over the stream's candidate blocks.
+    let mut b_dec = 0u64;
     for l in &locs {
         for &block in l.block_indices() {
-            let uncomp = catalog
-                .block_uncomp_lens
-                .get(block)
-                .copied()
-                .ok_or_else(|| {
-                    MaintainError::Invariant(
-                        "stream candidate block index past the input's PAGE_DIR block count"
-                            .to_string(),
-                    )
-                })?;
-            max_b_dec = max_b_dec.max(uncomp);
+            b_dec = b_dec.max(block_decode_ceiling_bytes(&catalog.pricing, block)?);
         }
     }
-    let b_dec = max_b_dec.saturating_mul(CURSOR_DECODE_OVERHEAD_FACTOR);
     Ok(Some(two_g.saturating_add(loc_meta).saturating_add(b_dec)))
 }
 
@@ -1304,10 +1458,12 @@ fn cursor_reservation_bytes(
 /// [`CompactorConfig::merge_cursor_budget_bytes`]. The reservation is charged
 /// BEFORE the cursor fetches or decodes anything, so the budget is enforced at
 /// reserve time and the merge fails closed rather than after allocating: if
-/// admitting a cursor that merge order requires would exceed the budget, the
+/// admitting the batch that merge order requires would exceed the budget, the
 /// run aborts with [`MaintainError::MergeCursorBudgetExceeded`] before
-/// publishing. A drained cursor releases its reservation, so the charge tracks
-/// `D`, not `n`.
+/// publishing. Once a cursor's decode completes, its charge is reconciled down
+/// to what it actually holds ([`reconcile_cursor_charge`]), which is what the
+/// default budget is sized from. A drained cursor releases its charge, so the
+/// charge tracks `D`, not `n`.
 async fn merge_stream_into_parts(
     store: &dyn ObjectStoreBackend,
     catalogs: &[RlogInputCatalog],
@@ -1387,22 +1543,31 @@ async fn merge_stream_into_parts(
             }
             // Reserve the whole batch at reserve time (ADR-0979 decision 4):
             // check the budget before any cursor fetches or decodes, so the
-            // merge fails closed rather than after allocating.
+            // merge fails closed rather than after allocating. The refusal's
+            // figures separate the two: `open_charge` is what the cursors that
+            // exist hold, and the required total names the batch position that
+            // crossed the budget. Batch members before that position were never
+            // opened, so folding their reservations into the "already charged"
+            // figure would report memory nothing holds.
+            let open_charge = charged;
+            let mut batch_charge = 0u64;
             for k in 0..batch_len {
-                let reservation = pending[pos + k].reservation;
-                let required = charged.saturating_add(reservation);
+                batch_charge = batch_charge.saturating_add(pending[pos + k].reservation);
+                let required = open_charge.saturating_add(batch_charge);
                 if required > budget {
                     return Err(MaintainError::MergeCursorBudgetExceeded {
                         stream_id: stream_id.to_hex(),
                         open_cursors: open.len(),
-                        charged_bytes: charged,
+                        charged_bytes: open_charge,
                         budget_bytes: budget,
                         required_bytes: required,
                         inputs_carrying_stream: pending.len(),
+                        admission_batch_position: k,
+                        admission_batch_len: batch_len,
                     });
                 }
-                charged = required;
             }
+            charged = open_charge.saturating_add(batch_charge);
             let opens: Vec<CursorFuture<'_, '_>> = (0..batch_len)
                 .map(|k| {
                     let p = &pending[pos + k];
@@ -1424,6 +1589,12 @@ async fn merge_stream_into_parts(
                 match cursor_opt {
                     Some(mut cursor) => {
                         cursor.reservation = reservation;
+                        cursor.charged = reservation;
+                        // `open_cursor` fetched and decoded this cursor's first
+                        // block, so its actual residency is known now: reconcile
+                        // the ceiling down to it before the next admission round
+                        // reads the charge.
+                        reconcile_cursor_charge(&mut cursor, &mut charged);
                         open.push(cursor);
                     }
                     // Carried the stream in STREAM_DIR but materialized no row
@@ -1473,14 +1644,40 @@ async fn merge_stream_into_parts(
         }
         open[bi].refill(store, tracker).await?;
         // A drained cursor releases its residency (refill already dropped its
-        // last block) and its reservation, so both the open-cursor high-water
-        // and the budget charge track the concurrent overlap `D`, not `n`.
+        // last block) and its charge, so both the open-cursor high-water and the
+        // budget charge track the concurrent overlap `D`, not `n`. A cursor that
+        // is still live may have crossed into a new block or a new row group in
+        // that refill, so its charge is re-derived from what it now holds.
         if open[bi].peek_ts().is_none() {
             let cursor = open.swap_remove(bi);
-            charged = charged.saturating_sub(cursor.reservation);
+            charged = charged.saturating_sub(cursor.charged);
+        } else {
+            reconcile_cursor_charge(&mut open[bi], &mut charged);
         }
     }
     Ok(())
+}
+
+/// Reconcile one cursor's budget charge to what it actually holds resident
+/// (ADR-0979 decision 4 as amended), updating the stream's running `charged`
+/// total by the difference.
+///
+/// Mandatory, not an optimization. The pre-decode reservation is a ceiling over
+/// every block the cursor may decode, evaluated before any of them is fetched;
+/// the default budget is sized from a cursor's ACTUAL residency, so a merge that
+/// held the ceiling for each cursor's lifetime would refuse corpora the default
+/// was chosen to admit. Called once the fetch and decode that follow an
+/// admission complete, and again after each later block decode, so the charge is
+/// the cursor's residency for all but the instant between reserving and
+/// decoding. The reconciled figure can only be at or below the reservation: the
+/// raw term is bounded by the reservation's `2 * G` and the decoded term by the
+/// per-block ceiling the reservation took the maximum over.
+fn reconcile_cursor_charge(cursor: &mut StreamCursor<'_>, charged: &mut u64) {
+    let actual = cursor.resident_bytes();
+    *charged = charged
+        .saturating_sub(cursor.charged)
+        .saturating_add(actual);
+    cursor.charged = actual;
 }
 
 /// Open one input's cursor over `stream_id` and load its first block. Named
@@ -4582,6 +4779,98 @@ mod tests {
         );
     }
 
+    /// ADR-0979 decision 2, the `<=` admission boundary: a queued cursor whose
+    /// SKIP_IDX lower bound EQUALS the merge frontier exactly is admitted before
+    /// the next record is emitted, so an equal-`ts` tie between that cursor's
+    /// first record and the already-open cursor's next record resolves by
+    /// `input_index` -- and here the deferred input holds the LOWER index, so it
+    /// must be emitted FIRST.
+    ///
+    /// Geometry. Inputs sort canonically by `(writer_id, writer_epoch,
+    /// writer_seq)`, so uuid 1 is `input_index` 0 and uuid 2 is 1:
+    ///
+    /// ```text
+    /// input_index 0 (uuid 1): stream 0 at ts 30 ("b30"), 40   lower bound 30
+    /// input_index 1 (uuid 2): stream 0 at ts 10, 20, 30 ("a30")   lower bound 10
+    /// ```
+    ///
+    /// Input 1 bootstraps (lowest bound). Input 0 stays queued while the frontier
+    /// is 10 and 20, and is admitted exactly when the frontier reaches 30 --
+    /// `lower_bound <= ts` with equality. Both cursors then head at ts 30, and
+    /// the `(ts, input_index)` minimum is input 0's "b30".
+    ///
+    /// Under a `<` regression at the admission predicate, input 0 is not admitted
+    /// at the boundary: input 1 emits "a30" and drains, and only then does input 0
+    /// bootstrap. The record sequence reorders to a30-before-b30 and the part's
+    /// bytes -- and so its `content_hash` -- change. Demonstrated red by editing
+    /// the `AdmissionMode::Overlap` arm of the admission predicate in
+    /// `merge_stream_into_parts` from `p.lower_bound <= ts` to `p.lower_bound <
+    /// ts`: the decoded-sequence assertion below fails with `["a30", "b30"]` and
+    /// the pinned hash no longer matches.
+    #[tokio::test]
+    async fn admission_boundary_tie_orders_by_input_index() {
+        // The premise the fixture rests on: the DEFERRED input is the one with
+        // the lower canonical index.
+        assert!(
+            Uuid::from_u128(1).to_string() < Uuid::from_u128(2).to_string(),
+            "uuid 1 must sort before uuid 2, so the deferred input is input_index 0"
+        );
+        let deferred: Vec<LogRecord> = vec![
+            record(0, 30, "b30", Vec::new()),
+            record(0, 40, "b40", Vec::new()),
+        ];
+        let open_first: Vec<LogRecord> = vec![
+            record(0, 10, "a10", Vec::new()),
+            record(0, 20, "a20", Vec::new()),
+            record(0, 30, "a30", Vec::new()),
+        ];
+        let inputs = vec![
+            (Uuid::from_u128(1), 1, deferred),
+            (Uuid::from_u128(2), 2, open_first),
+        ];
+
+        let store = MemoryStore::new();
+        for (writer_id, seq, recs) in &inputs {
+            seed(&store, *writer_id, *seq, recs).await;
+        }
+        let clock = FixedClock::new(sealed_now_ns());
+        compact_bucket(&store, &clock, &CompactorConfig::default(), &bucket())
+            .await
+            .expect("compact");
+        let (_rec, parts) = read_output(&store).await;
+        assert_eq!(parts.len(), 1, "the fixture is one part");
+        let bodies: Vec<String> = decode_all(&parts[0]).into_iter().map(|r| r.body).collect();
+        assert_eq!(
+            bodies,
+            vec!["a10", "a20", "b30", "a30", "b40"],
+            "at the ts-30 tie the admitted-at-the-boundary input (input_index 0) sorts first"
+        );
+
+        // The exact bytes, not only the order: the part hashes under overlap-gated
+        // and eager all-open admission, pinned as literals.
+        const EXPECTED_HASHES: [&str; 1] =
+            ["bcb041dad935c2e867f943330601f9bf04da1e171faa3ebdf67cadd14eefef39"];
+        let overlap = compact_part_hashes(&inputs, &CompactorConfig::default()).await;
+        let eager = compact_part_hashes(
+            &inputs,
+            &CompactorConfig {
+                merge_admission: AdmissionMode::EagerAll,
+                ..CompactorConfig::default()
+            },
+        )
+        .await;
+        let hex: Vec<String> = overlap.iter().map(hex::encode).collect();
+        assert_eq!(
+            hex,
+            EXPECTED_HASHES.map(String::from).to_vec(),
+            "the boundary-tie fixture's part content_hash"
+        );
+        assert_eq!(
+            overlap, eager,
+            "admitting at the boundary reproduces the all-open order exactly"
+        );
+    }
+
     /// Compact `inputs` (all on stream 0) with a tracker installed and return the
     /// recorded `max_open_cursors_per_stream`.
     async fn max_open_cursors_for(inputs: &[(Uuid, u64, Vec<LogRecord>)]) -> u64 {
@@ -4660,6 +4949,19 @@ mod tests {
         );
     }
 
+    /// One seeded input's catalog, loaded exactly as the merge loads it.
+    async fn stream_catalog(
+        store: &MemoryStore,
+        writer_id: Uuid,
+        seq: u64,
+        bytes: &Bytes,
+    ) -> RlogInputCatalog {
+        let key = seeded_data_key(writer_id, seq, bytes);
+        load_catalog_from_object(store, &CompactorConfig::default(), key, true)
+            .await
+            .expect("catalog")
+    }
+
     /// The pre-decode reservation the merge charges one input's cursor over
     /// stream 0, loaded and computed exactly as the merge does.
     async fn stream0_reservation(
@@ -4668,14 +4970,256 @@ mod tests {
         seq: u64,
         bytes: &Bytes,
     ) -> u64 {
-        let key = seeded_data_key(writer_id, seq, bytes);
-        let catalog = load_catalog_from_object(store, &CompactorConfig::default(), key, true)
-            .await
-            .expect("catalog");
+        let catalog = stream_catalog(store, writer_id, seq, bytes).await;
         let (stream_id, _) = stream_ident(0);
         cursor_reservation_bytes(&catalog, &stream_id)
             .expect("reservation")
             .expect("input carries stream 0")
+    }
+
+    /// What one input's stream-0 cursor actually holds once its first block is
+    /// fetched and decoded: the figure the merge reconciles the pre-decode
+    /// reservation down to (ADR-0979 decision 4 as amended).
+    async fn stream0_resident_bytes(
+        store: &MemoryStore,
+        writer_id: Uuid,
+        seq: u64,
+        bytes: &Bytes,
+    ) -> u64 {
+        let catalog = stream_catalog(store, writer_id, seq, bytes).await;
+        let (stream_id, _) = stream_ident(0);
+        let cursor = open_cursor(store, &catalog, 0, &stream_id, None)
+            .await
+            .expect("open cursor")
+            .expect("input carries stream 0");
+        cursor.resident_bytes()
+    }
+
+    /// Per whole-object block, the sum of PAGE_DIR `uncomp_len` over EVERY page
+    /// of the block: the pre-amendment reservation basis, kept in the tests only
+    /// so the ceiling test can show what it under-charges by.
+    fn block_all_page_uncomp_lens(obj: &[u8]) -> Vec<u64> {
+        let cfg = RlogConfig::default();
+        let ftr = footer::open(obj).expect("open");
+        let raw = read_section(obj, ftr.section(kind::PAGE_DIR).unwrap(), &cfg).expect("page_dir");
+        let dir = PageDir::decode(&raw).expect("decode page_dir");
+        (0..dir.block_count() as u32)
+            .map(|b| {
+                dir.block_pages(b)
+                    .expect("block pages")
+                    .iter()
+                    .map(|p| p.desc.uncomp_len)
+                    .sum()
+            })
+            .collect()
+    }
+
+    /// Drive one input's stream-0 cursor to exhaustion, returning each decoded
+    /// block's `heap_estimate` as the cursor charged it.
+    async fn stream0_decoded_block_bytes(
+        store: &MemoryStore,
+        catalog: &RlogInputCatalog,
+        stream_id: &LogStreamId,
+    ) -> Vec<u64> {
+        let mut cursor = open_cursor(store, catalog, 0, stream_id, None)
+            .await
+            .expect("open cursor")
+            .expect("input carries the stream");
+        let mut seen: Vec<u64> = Vec::new();
+        while cursor.peek_ts().is_some() {
+            let bytes = cursor.decoded_bytes();
+            if seen.last() != Some(&bytes) {
+                seen.push(bytes);
+            }
+            cursor.next_record().expect("record");
+            cursor.refill(store, None).await.expect("refill");
+        }
+        seen
+    }
+
+    /// ADR-0979 decision 4 as amended, the ceiling direction: the pre-decode
+    /// reservation is a real ceiling on every block the cursor decodes, on a
+    /// fixture built from CONSTANT columns -- the shape the pre-amendment basis
+    /// mispriced.
+    ///
+    /// The fixture is 500 records of one stream with an identical body, severity,
+    /// and no attributes, so `stream_ref`, `severity_num`, `flags`, and the two
+    /// string columns all encode to a handful of stored bytes per block while
+    /// still decoding to a slot per row per column. The test asserts both halves:
+    /// the repriced reservation covers every decoded block, and twice the block's
+    /// total page `uncomp_len` -- the basis this amendment removed -- does NOT,
+    /// so the old code charged less than the memory the block actually takes.
+    ///
+    /// Demonstrated red by restoring the old basis in the two lines that define
+    /// it: dropping the `string_ids.contains` filter in `input_cursor_pricing`
+    /// (so the per-block figure is every page's `uncomp_len` again) and returning
+    /// `string_bytes * 2` from `block_decode_ceiling_bytes` in place of the three
+    /// terms. The `reservation >= heap` assert then fails 4,168 against 54,905 on
+    /// this 500-record fixture, and the ratio grows with rows and column count.
+    #[tokio::test]
+    async fn reservation_ceiling_bounds_every_decoded_block_of_a_constant_column_input() {
+        let recs: Vec<LogRecord> = (0..500i64)
+            .map(|i| record(0, 1_000 + i, "constant body", Vec::new()))
+            .collect();
+        let store = MemoryStore::new();
+        let bytes = seed(&store, Uuid::from_u128(1), 1, &recs).await;
+        let catalog = stream_catalog(&store, Uuid::from_u128(1), 1, &bytes).await;
+        let (stream_id, _) = stream_ident(0);
+
+        let reservation = cursor_reservation_bytes(&catalog, &stream_id)
+            .expect("reservation")
+            .expect("input carries stream 0");
+        let decoded = stream0_decoded_block_bytes(&store, &catalog, &stream_id).await;
+        assert!(!decoded.is_empty(), "the cursor decoded at least one block");
+        let max_decoded = decoded.iter().copied().max().expect("a decoded block");
+
+        for (i, heap) in decoded.iter().enumerate() {
+            assert!(
+                reservation >= *heap,
+                "block {i}: the admission reservation ({reservation} B) must bound the decoded \
+                 block's heap_estimate ({heap} B)"
+            );
+        }
+
+        // What the removed basis would have charged for the same blocks.
+        let old_basis = block_all_page_uncomp_lens(&bytes)
+            .into_iter()
+            .max()
+            .expect("a block")
+            * 2;
+        assert!(
+            old_basis < max_decoded,
+            "the fixture must exercise the under-charge: 2 x page uncomp_len ({old_basis} B) has \
+             to be below the decoded heap ({max_decoded} B) for this pin to mean anything"
+        );
+    }
+
+    /// ADR-0979 decision 4 as amended, the reconcile direction: after a cursor's
+    /// decode completes, the charge held against the budget is the cursor's ACTUAL
+    /// residency, and its decoded term equals `heap_estimate()` exactly -- not the
+    /// pre-decode ceiling, which is strictly larger here.
+    ///
+    /// Demonstrated red by making `reconcile_cursor_charge` a no-op (an early
+    /// `return` before it reads `resident_bytes`): the charge stays at the
+    /// pre-decode ceiling, and the equality assert fails 76,508 against 26,496.
+    #[tokio::test]
+    async fn reconcile_charges_actual_residency_with_the_decoded_term_exact() {
+        let recs: Vec<LogRecord> = (0..200i64)
+            .map(|i| record(0, 1_000 + i, "body", vec![("k".into(), AttrValue::I64(i))]))
+            .collect();
+        let store = MemoryStore::new();
+        let bytes = seed(&store, Uuid::from_u128(1), 1, &recs).await;
+        let catalog = stream_catalog(&store, Uuid::from_u128(1), 1, &bytes).await;
+        let (stream_id, _) = stream_ident(0);
+
+        let reservation = cursor_reservation_bytes(&catalog, &stream_id)
+            .expect("reservation")
+            .expect("input carries stream 0");
+        let mut cursor = open_cursor(&store, &catalog, 0, &stream_id, None)
+            .await
+            .expect("open cursor")
+            .expect("input carries stream 0");
+        cursor.reservation = reservation;
+        cursor.charged = reservation;
+
+        // Exactly what the merge does once the admission's fetch and decode
+        // complete.
+        let mut charged = reservation;
+        reconcile_cursor_charge(&mut cursor, &mut charged);
+
+        let heap = cursor
+            .block
+            .as_ref()
+            .expect("a decoded block")
+            .heap_estimate();
+        let loc_meta = loc_metadata_bytes(&cursor.locs);
+        let raw = cursor.raw_resident_bytes();
+        assert_eq!(
+            charged, cursor.charged,
+            "the stream's running charge and the cursor's own figure move together"
+        );
+        assert_eq!(
+            charged,
+            loc_meta + raw + heap,
+            "the reconciled charge is location metadata + raw bytes held + decoded heap"
+        );
+        assert_eq!(
+            charged - loc_meta - raw,
+            heap,
+            "the reconciled decoded term equals heap_estimate() exactly"
+        );
+        assert!(
+            charged < reservation,
+            "the pre-decode ceiling ({reservation} B) must exceed the reconciled residency \
+             ({charged} B) on this fixture, or the reconcile pins nothing"
+        );
+    }
+
+    /// ADR-0979 decision 4's owed first-small/next-large test: a cursor whose
+    /// FIRST candidate block is cheaper than its SECOND must reserve the larger
+    /// figure, because `StreamCursor::refill` decodes the second block after
+    /// releasing the first.
+    ///
+    /// The fixture is one stream in one input written with 4-record blocks and
+    /// one block per row group: block 0 holds four 4-byte bodies, block 1 four
+    /// 2,000-byte bodies, so the two blocks differ only in their string-page
+    /// payload and block 1's ceiling is the larger.
+    ///
+    /// Demonstrated red by changing `cursor_reservation_bytes`'s fold from
+    /// `b_dec = b_dec.max(block_decode_ceiling_bytes(..)?)` to taking the first
+    /// candidate block's ceiling only (`if b_dec == 0 { b_dec = ... }`): the
+    /// reservation comes back as 1,696 B against the 9,701 B the second block
+    /// needs, and the equality assert fails.
+    #[tokio::test]
+    async fn reservation_takes_the_max_over_candidate_blocks_not_the_first() {
+        let long_body = "x".repeat(2_000);
+        let recs: Vec<LogRecord> = (0..4i64)
+            .map(|i| record(0, 100 + i, "tiny", Vec::new()))
+            .chain((0..4i64).map(|i| record(0, 200 + i, &format!("{long_body}{i}"), Vec::new())))
+            .collect();
+        let cfg = RlogConfig {
+            block_target_records: 4,
+            // One block per row group, so the two blocks are two locs and the
+            // cursor really releases the first before decoding the second.
+            group_target_blocks: 1,
+            ..RlogConfig::default()
+        };
+        let store = MemoryStore::new();
+        let bytes = seed_l0(&store, Uuid::from_u128(1), 1, &recs, cfg, &[]).await;
+        let catalog = stream_catalog(&store, Uuid::from_u128(1), 1, &bytes).await;
+        let (stream_id, _) = stream_ident(0);
+
+        assert_eq!(
+            catalog.pricing.block_rows,
+            vec![4, 4],
+            "the fixture must be two four-record blocks"
+        );
+        let first = block_decode_ceiling_bytes(&catalog.pricing, 0).expect("block 0 ceiling");
+        let second = block_decode_ceiling_bytes(&catalog.pricing, 1).expect("block 1 ceiling");
+        assert!(
+            first < second,
+            "the fixture's first block ({first} B) must be cheaper than its second ({second} B)"
+        );
+
+        let locs = catalog
+            .reader
+            .stream_blocks(&stream_id)
+            .expect("stream blocks")
+            .expect("input carries stream 0");
+        assert_eq!(
+            locs.len(),
+            2,
+            "one loc per block under group_target_blocks 1"
+        );
+        let two_g = locs.iter().map(|l| l.byte_len()).max().expect("a loc") * 2;
+        let expected = two_g + loc_metadata_bytes(&locs) + second;
+        let reservation = cursor_reservation_bytes(&catalog, &stream_id)
+            .expect("reservation")
+            .expect("input carries stream 0");
+        assert_eq!(
+            reservation, expected,
+            "the reservation is 2*G + location metadata + the LARGER block's ceiling"
+        );
     }
 
     /// ADR-0979 decision 4: a budget one byte below the minimum admissible
@@ -4685,13 +5229,23 @@ mod tests {
     ///
     /// The fixture is two inputs carrying stream 0 with interleaved (fully
     /// overlapping) timestamps, so both cursors must be open at the merge's
-    /// peak: the minimum admissible set is both, and its reservation is
-    /// `r_a + r_b`, computed here from the same [`cursor_reservation_bytes`] the
-    /// merge uses so the threshold is exact, not observed.
+    /// peak. The minimum admissible figure is `resident_a + r_b`, NOT
+    /// `r_a + r_b`: the first cursor is admitted at its pre-decode ceiling and
+    /// then reconciled down to what it actually holds before the second cursor's
+    /// admission reads the charge (ADR-0979 decision 4 as amended). Both terms
+    /// are computed here from the same functions the merge uses, so the
+    /// threshold is exact rather than observed, and the run at
+    /// `resident_a + r_b` only completes because the reconcile happened.
     ///
     /// Demonstrated red by raising the budget the failing run is given from
     /// `min_admissible - 1` to `min_admissible`: the second cursor then fits and
-    /// no error is returned, so `expect_err` panics.
+    /// no error is returned, so `expect_err` panics. Demonstrated red for the
+    /// reconcile by deleting BOTH `reconcile_cursor_charge` calls in
+    /// `merge_stream_into_parts` (the admission arm and the post-refill arm --
+    /// deleting only the admission one leaves this fixture reconciled by the
+    /// other, since its second cursor is admitted after the first has emitted a
+    /// record): the charge stays at `r_a` and the `charged_bytes` assert fails
+    /// 3,731 against 1,957.
     #[tokio::test]
     async fn cursor_budget_fails_closed_one_byte_below_the_minimum_admissible_set() {
         let a: Vec<LogRecord> = (0..10i64)
@@ -4707,7 +5261,13 @@ mod tests {
         let b_bytes = seed(&probe, Uuid::from_u128(2), 2, &b).await;
         let r_a = stream0_reservation(&probe, Uuid::from_u128(1), 1, &a_bytes).await;
         let r_b = stream0_reservation(&probe, Uuid::from_u128(2), 2, &b_bytes).await;
-        let min_admissible = r_a + r_b;
+        let resident_a = stream0_resident_bytes(&probe, Uuid::from_u128(1), 1, &a_bytes).await;
+        assert!(
+            resident_a < r_a,
+            "the reconcile must lower the first cursor's charge ({r_a} B ceiling, {resident_a} B \
+             resident), or this test's threshold is not the reconciled one"
+        );
+        let min_admissible = resident_a + r_b;
 
         let inputs = vec![(Uuid::from_u128(1), 1, a), (Uuid::from_u128(2), 2, b)];
         let (stream_id, _) = stream_ident(0);
@@ -4734,6 +5294,8 @@ mod tests {
                 budget_bytes,
                 required_bytes,
                 inputs_carrying_stream,
+                admission_batch_position,
+                admission_batch_len,
             } => {
                 assert_eq!(got_stream, stream_id.to_hex());
                 assert_eq!(
@@ -4741,8 +5303,8 @@ mod tests {
                     "the first cursor was open when the second was refused"
                 );
                 assert_eq!(
-                    charged_bytes, r_a,
-                    "only the first cursor's reservation was charged"
+                    charged_bytes, resident_a,
+                    "the open cursor charges its reconciled residency, not its ceiling"
                 );
                 assert_eq!(budget_bytes, min_admissible - 1);
                 assert_eq!(
@@ -4750,6 +5312,8 @@ mod tests {
                     "charged + the refused cursor's reservation"
                 );
                 assert_eq!(inputs_carrying_stream, 2);
+                assert_eq!(admission_batch_position, 0);
+                assert_eq!(admission_batch_len, 1);
             }
             other => panic!("expected MergeCursorBudgetExceeded, got {other:?}"),
         }
@@ -4767,6 +5331,97 @@ mod tests {
             with_budget, unbudgeted,
             "a budget at exactly the minimum admissible set must not change the output"
         );
+    }
+
+    /// ADR-0979 decision 4: a refusal partway through an admission BATCH reports
+    /// only what the open cursors hold, and names the position in the batch that
+    /// crossed the budget. Batch members before that position were never opened,
+    /// so their reservations are in `required_bytes` (the number a retry must
+    /// budget for) and NOT in `charged_bytes` (what memory is actually held).
+    ///
+    /// The fixture is three inputs whose stream-0 slices all start at ts 0, so
+    /// their SKIP_IDX lower bounds are equal: the first cursor bootstraps alone,
+    /// and the remaining two are admitted together as one batch of 2. The budget
+    /// is set one byte below what the whole batch needs, so the refusal lands at
+    /// batch position 1 with one cursor open.
+    ///
+    /// Demonstrated red by restoring the pre-fix accumulation (reporting
+    /// `charged_bytes` as the open charge plus the batch members already
+    /// reserved, which is what the running `charged` held before this fix):
+    /// `charged_bytes` comes back as 3,756 B against the 1,477 B the one open
+    /// cursor holds, counting a cursor that was never opened.
+    #[tokio::test]
+    async fn cursor_budget_refusal_mid_batch_reports_only_open_cursors() {
+        // Three identical-shape inputs on stream 0, all starting at ts 0, so
+        // every lower bound is 0 and the two non-bootstrap cursors are admitted
+        // in one batch.
+        let recs = |tag: &str| -> Vec<LogRecord> {
+            (0..6i64)
+                .map(|i| record(0, i * 10, tag, Vec::new()))
+                .collect()
+        };
+        let inputs = vec![
+            (Uuid::from_u128(1), 1, recs("a")),
+            (Uuid::from_u128(2), 2, recs("b")),
+            (Uuid::from_u128(3), 3, recs("c")),
+        ];
+
+        let probe = MemoryStore::new();
+        let mut seeded = Vec::new();
+        for (writer_id, seq, r) in &inputs {
+            seeded.push(seed(&probe, *writer_id, *seq, r).await);
+        }
+        let resident_a = stream0_resident_bytes(&probe, Uuid::from_u128(1), 1, &seeded[0]).await;
+        let r_b = stream0_reservation(&probe, Uuid::from_u128(2), 2, &seeded[1]).await;
+        let r_c = stream0_reservation(&probe, Uuid::from_u128(3), 3, &seeded[2]).await;
+        let batch_total = resident_a + r_b + r_c;
+
+        let store = MemoryStore::new();
+        for (writer_id, seq, r) in &inputs {
+            seed(&store, *writer_id, *seq, r).await;
+        }
+        let config = CompactorConfig {
+            merge_cursor_budget_bytes: batch_total - 1,
+            ..CompactorConfig::default()
+        };
+        let clock = FixedClock::new(sealed_now_ns());
+        let err = compact_bucket(&store, &clock, &config, &bucket())
+            .await
+            .expect_err("a budget below the batch's total must fail closed");
+        match err {
+            MaintainError::MergeCursorBudgetExceeded {
+                open_cursors,
+                charged_bytes,
+                required_bytes,
+                budget_bytes,
+                inputs_carrying_stream,
+                admission_batch_position,
+                admission_batch_len,
+                ..
+            } => {
+                assert_eq!(
+                    admission_batch_len, 2,
+                    "the two late cursors admit together"
+                );
+                assert_eq!(
+                    admission_batch_position, 1,
+                    "the second member of the batch is the one that crossed the budget"
+                );
+                assert_eq!(open_cursors, 1, "only the bootstrap cursor was ever opened");
+                assert_eq!(
+                    charged_bytes, resident_a,
+                    "the charge names what the open cursor holds, not the batch members before \
+                     the refused one"
+                );
+                assert_eq!(
+                    required_bytes, batch_total,
+                    "the retry figure is the open charge plus the batch through this position"
+                );
+                assert_eq!(budget_bytes, batch_total - 1);
+                assert_eq!(inputs_carrying_stream, 3);
+            }
+            other => panic!("expected MergeCursorBudgetExceeded, got {other:?}"),
+        }
     }
 
     /// Rewrite `obj` with its PAGE_DIR descriptor dropped from the footer,
