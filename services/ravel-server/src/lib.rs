@@ -1222,6 +1222,12 @@ pub async fn start(
         // would keep `EngineConfig::default()`'s compiled-in 8 / 1024.
         // `fetch_concurrency` is the same knob that sets the SQL scan partition
         // count and S3 GET concurrency (ADR-0087).
+        // ADR-0996 decision 2: `apply_to_engine` also RESOLVES
+        // `--logs-fetch-policy` against the active store cost profile and the
+        // two ADR-0904 byte flags, so the quantities the fetcher builders read
+        // off this `EngineConfig` are the resolved ones. It is fallible for the
+        // fetch bound's validation (a zero `--logs-max-fetch-run-bytes` is
+        // refused here, not at a division inside the fetch layer).
         let engine_config = config
             .query_budgets
             .apply_to_engine(ravel_query::EngineConfig {
@@ -1234,7 +1240,15 @@ pub async fn start(
                 // no-deployment-context fallback.
                 max_s3_requests: config.max_s3_requests,
                 ..ravel_query::EngineConfig::default()
-            });
+            })
+            .map_err(|err| anyhow::anyhow!("invalid query engine configuration: {err}"))?;
+        // The provenance stamp of the resolved policy (ADR-0996 decision 2).
+        // The server exposes no config endpoint, so this startup line is where
+        // an operator reads which policy, profile, and byte quantities the
+        // process is actually running, and where an overridden explicit flag is
+        // reported. Emitted only in the query-serving modes, beside the engine
+        // it describes.
+        config.query_budgets.logs_fetch_stamp().emit();
         // ADR-0071 cross-cluster federation: build one gRPC
         // federation client per configured remote and install a `Federation` on
         // the engine. `None` when no `--remote-cluster` is set, leaving the
