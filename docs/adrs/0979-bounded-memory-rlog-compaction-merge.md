@@ -215,14 +215,26 @@ and the ceiling covers everything the cursor retains for its lifetime:
 `2·G` from the section descriptors' raw lengths; the cursor's location
 metadata (the owned `Vec<StreamBlockLoc>` and each loc's block list,
 sized from the same resident directory that produced it); and `B_dec`
-taken as the MAXIMUM over the cursor's candidate blocks of the per-block
-sum of PAGE_DIR `uncomp_len` values, times a documented
-allocation-overhead factor — the max, not the first block's cost, because
-`refill` decodes later blocks after releasing earlier ones and a later,
-larger block must not exceed the reconciled reservation (the owed test is
-first-small/next-large). Page contents, not a shape formula, are what
-decoded string buffers scale with, and PAGE_DIR is resident before any
-BLOCKS byte is fetched. An input WITHOUT a PAGE_DIR cannot be
+taken as the MAXIMUM over the cursor's candidate blocks of the D1
+ceiling evaluated per block from pre-decode metadata:
+`16 B × rows × total_cols + string-page uncomp_len + 40 B × rows ×
+string_cols` — rows from the resident loc metadata, `total_cols` from
+FIELD_DIR, the string-page term as the block's PAGE_DIR `uncomp_len`
+restricted to string pages, and every string column priced as plain
+(the conservative arm; dictionary encoding only shrinks it). The max,
+not the first block's cost, because `refill` decodes later blocks after
+releasing earlier ones and a later, larger block must not exceed the
+reconciled reservation (the owed test is first-small/next-large).
+A per-block sum of raw `uncomp_len` alone is NOT a valid basis and this
+amendment removes it: `encode_i64` picks the smallest codec, so a
+constant or run-length column (every one-stream block's `stream_ref`,
+usually `severity` and `flags` too) stores a few bytes and decodes to
+`16 B × rows` — a ratio that can exceed 10,000×, which is exactly the
+under-charge D4 exists to refuse. The numeric decoded term scales with
+a shape formula (rows × columns), and only the string term scales with
+page contents; the basis above prices each term from the source that
+actually bounds it, and PAGE_DIR plus loc metadata are resident before
+any BLOCKS byte is fetched. An input WITHOUT a PAGE_DIR cannot be
 admission-priced (its string-page term is unknowable before the fetch),
 so the bounded merge refuses it with a typed error naming the object and
 its format version rather than guessing — in practice the fleet is
@@ -230,7 +242,15 @@ RLOG v4 everywhere (PAGE_DIR is mandatory in v4), so the refusal arm is
 a version gate, not a live path. The reservation is reconciled down to the
 cursor's actual residency (raw bytes as fetched, `heap_estimate()` once
 decoded — the same numbers the #977 tracker sees) after the decode
-completes. Reservations are taken under the same admission lock that
+completes. The reconcile is MANDATORY, not an optimization: the default
+budget's sizing (the config doc's per-cursor residency figure) is
+derived from actual residency, so an implementation that holds the
+pre-decode ceiling for the cursor's lifetime over-charges against that
+sizing and aborts runs the default was chosen to admit. The paired
+invariant is pinned by a test in both directions: for every decoded
+block, `reservation ≥ heap_estimate()` (the ceiling really is a
+ceiling), and after reconcile the charged figure equals
+`heap_estimate()` exactly. Reservations are taken under the same admission lock that
 orders cursor opens, so concurrent admissions cannot each pass the check
 and then jointly allocate past the budget: the budget is enforced at
 reserve time, which is what makes D4 fail-closed rather than
