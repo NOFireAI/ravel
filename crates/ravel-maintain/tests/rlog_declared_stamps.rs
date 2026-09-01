@@ -393,10 +393,12 @@ async fn each_output_part_stamps_exactly_its_own_records() {
     for p in &record.parts {
         assert_eq!(p.sample_count, 2, "each part holds two records");
         for stat in read_compaction_part(p).covered() {
-            let non_null = p.sample_count - stat.null_count();
             assert!(
-                non_null <= p.sample_count,
-                "non_null + null_count must equal sample_count"
+                stat.null_count() <= p.sample_count,
+                "a stamp's null_count can never exceed its part's sample_count \
+                 (null_count={} sample_count={})",
+                stat.null_count(),
+                p.sample_count
             );
         }
     }
@@ -643,6 +645,24 @@ async fn resolve_answers_min_max_count_from_stamps_without_data_gets() {
         faulted.fault_count(Op::Get, FaultKind::Permanent),
         0,
         "resolve must answer from record metadata, never a GET on an /l1/ data object"
+    );
+    // Negative control arming the rule itself: a direct GET of a real L1 part
+    // key must trip the fault, proving the "/l1/" substring matches the keys
+    // this tenant actually writes (a typo in the rule would make the zero
+    // assertion above silently vacuous).
+    let l1_key = &snapshot.segments[0].data_object_key;
+    assert!(
+        l1_key.contains("/l1/"),
+        "resolved segment key {l1_key:?} must be an L1 part"
+    );
+    faulted
+        .get(l1_key, ravel_object_store::GetRange::Full)
+        .await
+        .expect_err("a direct GET of a real L1 key must trip the armed fault rule");
+    assert_eq!(
+        faulted.fault_count(Op::Get, FaultKind::Permanent),
+        1,
+        "the negative control must fire the rule exactly once"
     );
     assert!(
         !snapshot.segments.is_empty(),

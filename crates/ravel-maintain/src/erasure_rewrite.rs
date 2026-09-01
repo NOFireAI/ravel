@@ -1134,7 +1134,7 @@ fn build_rewrite_part(
         &hash16,
     )?;
 
-    let part = CompactionPart {
+    let mut part = CompactionPart {
         part_index: 0,
         first_series_id: first_series_id.map(|s| s.0.to_vec()).unwrap_or_default(),
         last_series_id: last_series_id.map(|s| s.0.to_vec()).unwrap_or_default(),
@@ -1148,6 +1148,11 @@ fn build_rewrite_part(
         segment_format_version: OUTPUT_FORMAT_VERSION,
         declared_column_stats: Vec::new(),
     };
+    // Rewrite parts stamp nothing (the readers force rewrite-part stamps
+    // empty, and an unstamped part can never resurrect an erased row's
+    // extremum). Routed through the validated commit-side path like every
+    // other unstamped producer.
+    ravel_commit::declared_stats::stamp_compaction_part(&mut part, &[]);
     Ok(BuiltPart {
         key,
         // The erasure rewrite retains part bytes until its own publish path PUTs

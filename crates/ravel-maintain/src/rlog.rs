@@ -1143,9 +1143,10 @@ struct DeclaredStatAccum {
 }
 
 impl DeclaredStatAccum {
-    /// Build a fold over the declared eligible columns. The set already passed
-    /// [`DeclaredStatType::from_tag`] in [`declared_columns_from_inputs`], so
-    /// every column here is I64 or BOOL.
+    /// Build a fold over the declared eligible columns. The set comes from
+    /// [`declared_columns_from_inputs`], which reads each input's decoded
+    /// stamps through the commit-side reader whose type tags admit only I64
+    /// and BOOL, so every column here is one of the two.
     fn new(declared: &[(String, DeclaredStatType)]) -> Self {
         let cols = declared
             .iter()
