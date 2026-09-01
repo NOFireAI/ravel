@@ -212,6 +212,7 @@ use ravel_logseg::{
 };
 use ravel_object_store::{GetRange, ObjectStoreBackend};
 use ravel_proto::commit::v1::CompactionPart;
+use ravel_types::declared_stats::{DeclaredColumnStat, DeclaredStatType, DeclaredStatValue};
 
 use crate::bucket::Bucket;
 use crate::build::{BuiltPart, put_part};
@@ -347,6 +348,10 @@ impl SegmentCodec for RlogCodec {
         // `input_indexed_fields`). Every part of this compaction gets the same
         // list, so a field is indexed uniformly across the output.
         let indexed_fields = merged_indexed_fields(&catalogs);
+        // The declared eligible columns to recompute per-part stamps for, learned
+        // from the inputs' own stamps (ADR-0873 decision 3). Recomputed over
+        // output rows in the merge, never copied from an input.
+        let declared = declared_columns_from_inputs(inputs);
         // Compaction drops nothing, so every merged record is kept and the
         // counts the driver returns are the input count twice over; the
         // compaction-side conservation gate reads `part.sample_count`, not
@@ -358,6 +363,7 @@ impl SegmentCodec for RlogCodec {
             &catalogs,
             input_set_hash,
             indexed_fields,
+            declared,
             config.dry_run,
             // Compaction releases each part's bytes at PUT (ADR-0979 decision 3):
             // the retained-parts memory term goes to zero, and an `AlreadyExists`
@@ -700,7 +706,11 @@ pub(crate) struct MergeOutput {
 /// splits, or on the stream-identity invariant below.
 ///
 /// `indexed_fields` is the POSTINGS field list every part is written with, and
-/// `dry_run` decides whether each part is PUT as it closes: compaction PUTs
+/// `declared` is the eligible declared columns each output part recomputes
+/// min/max/null-count stamps for (ADR-0873 decision 3): the compactor passes
+/// the set recovered from its inputs, while the erasure rewrite passes an empty
+/// set so its parts stay unstamped (the wave-3 staleness rule). `dry_run`
+/// decides whether each part is PUT as it closes: compaction PUTs
 /// here, while the erasure rewrite defers every PUT to its own publish path,
 /// which writes parts only after its conservation gate passes.
 ///
@@ -719,6 +729,7 @@ pub(crate) async fn merge_catalogs(
     catalogs: &[RlogInputCatalog],
     input_set_hash: &[u8; 32],
     indexed_fields: Vec<String>,
+    declared: Vec<(String, DeclaredStatType)>,
     dry_run: bool,
     retain_bytes: bool,
     keep: &mut (dyn FnMut(&LogRecord) -> Result<bool> + Send),
@@ -763,6 +774,7 @@ pub(crate) async fn merge_catalogs(
         input_set_hash,
         identity,
         indexed_fields,
+        declared,
         tracker,
         dry_run,
         retain_bytes,
@@ -871,6 +883,10 @@ struct PartSink<'a> {
     input_set_hash: &'a [u8; 32],
     identity: ObjectIdentity,
     indexed_fields: Vec<String>,
+    /// The declared eligible columns each output part recomputes stamps for
+    /// (ADR-0873 decision 3). Empty on the erasure-rewrite route, whose parts
+    /// stay unstamped (the wave-3 staleness rule), and on metrics/spans buckets.
+    declared: Vec<(String, DeclaredStatType)>,
     tracker: Option<&'a MergeMemoryTracker>,
     /// Whether a closed part is encoded but not PUT. Not read from `config`:
     /// the erasure rewrite defers every part PUT to its own publish path (which
@@ -893,7 +909,11 @@ impl PartSink<'_> {
     /// closing it once a target is reached.
     async fn push(&mut self, r: LogRecord) -> Result<()> {
         if self.current.is_none() {
-            self.current = Some(PartBuilder::new(&self.identity, &self.indexed_fields));
+            self.current = Some(PartBuilder::new(
+                &self.identity,
+                &self.indexed_fields,
+                &self.declared,
+            ));
         }
         let mut over_memory = false;
         // Encoded object bytes from a stored-target probe that showed the part
@@ -971,11 +991,16 @@ impl PartSink<'_> {
     async fn flush(&mut self, pre_encoded: Option<(Vec<u8>, WriteStats)>) -> Result<()> {
         // The `if let` (rather than an `unwrap`/`expect`) keeps the critical
         // path free of a panic path; a `None` here is a no-op, not a lie.
-        if let Some(builder) = self.current.take() {
+        if let Some(mut builder) = self.current.take() {
             // Copy the Copy-typed stream bounds before the encode consumes the
             // builder.
             let first_stream_id = builder.min_stream;
             let last_stream_id = builder.max_stream;
+            // Take the part's declared-column fold out before the encode consumes
+            // the builder; it carries exactly the records this part holds
+            // (ADR-0873 decision 3), stamped against the closed part's own row
+            // count in `finalize_part`.
+            let declared_accum = std::mem::take(&mut builder.declared_accum);
             let (object, stats) = match pre_encoded {
                 Some(enc) => enc,
                 None => builder.into_encoded(self.input_set_hash, self.part_index)?,
@@ -991,6 +1016,7 @@ impl PartSink<'_> {
                 self.part_index,
                 self.dry_run,
                 self.retain_bytes,
+                &declared_accum,
             )
             .await?;
             // Only bytes actually retained past PUT count toward the
@@ -1020,6 +1046,210 @@ impl PartSink<'_> {
         }
         Ok(self.parts)
     }
+}
+
+/// The declared eligible columns to recompute stamps for on a compaction's
+/// output (ADR-0873 decision 3, L1 half), recovered from the input commit
+/// records.
+///
+/// The compactor recomputes extrema over the rows it writes and never copies an
+/// input's stamp -- inputs may predate a declaration, and a copied value could
+/// name a row a later input does not carry -- but it learns WHICH columns are
+/// declared from the stamps its inputs already carry (wave 5a stamped every L0
+/// flush). The result is the union over inputs, deduplicated by name (first
+/// eligible occurrence in canonical input order wins), read through the wave-2
+/// predicate so only a trustworthy declaration seeds the fold.
+///
+/// A column declared after every input was written carries no stamp on any
+/// input and is therefore not recomputed here; it converges once a stamped
+/// flush enters a later compaction (the reachability follow-up on #1022). A
+/// metrics or spans bucket carries no declared columns and yields an empty set.
+fn declared_columns_from_inputs(inputs: &[InputRecord]) -> Vec<(String, DeclaredStatType)> {
+    let mut seen: BTreeMap<String, DeclaredStatType> = BTreeMap::new();
+    for input in inputs {
+        for stat in ravel_commit::declared_stats::read_commit_record(&input.record).covered() {
+            seen.entry(stat.name().to_string())
+                .or_insert_with(|| stat.declared_type());
+        }
+    }
+    seen.into_iter().collect()
+}
+
+/// Running min/max and non-null row count for one declared column over the
+/// records pushed to the part. `min <= max` holds by construction (both start at
+/// the first value and only widen), so a stamp built from it never trips the
+/// reader's `min <= max` clause.
+#[derive(Clone, Copy)]
+struct Running<T> {
+    min: T,
+    max: T,
+    non_null: u64,
+}
+
+impl<T: Ord + Copy> Running<T> {
+    fn start(v: T) -> Self {
+        Running {
+            min: v,
+            max: v,
+            non_null: 1,
+        }
+    }
+
+    fn observe(&mut self, v: T) {
+        if v < self.min {
+            self.min = v;
+        }
+        if v > self.max {
+            self.max = v;
+        }
+        self.non_null += 1;
+    }
+}
+
+/// One declared column's running extrema over the records pushed to a part. Only
+/// the [`Running`] matching `ty` is ever populated: a declared I64 column counts
+/// an I64 value as non-null and reads a same-named BOOL value (or an absent one)
+/// as NULL, and vice versa -- the wave-5a `(name, value kind)` rule.
+struct ColumnAccum {
+    name: String,
+    ty: DeclaredStatType,
+    i64_run: Option<Running<i64>>,
+    bool_run: Option<Running<bool>>,
+    /// First-occurrence-wins within the record currently being folded: set once
+    /// this column has taken a value from that record, cleared before the next.
+    seen_this_record: bool,
+}
+
+/// The per-part fold of declared-column extrema for the compaction output
+/// (ADR-0873 decision 3, the L1 half of wave 5). It mirrors the ingest-side
+/// wave-5a accumulator (`ravel_ingest`'s `DeclaredStatAccum`): eligible I64/BOOL
+/// declared columns only, first-occurrence-wins per record, and a stamp whose
+/// `null_count` is derived as `sample_count - non_null` so the part's own reader
+/// ([`ravel_commit::declared_stats::read_compaction_part`]) never drops it.
+///
+/// Unlike the ingest side it is seeded with the declared column set up front
+/// (from [`declared_columns_from_inputs`]), so it tracks only the columns it
+/// will stamp rather than every eligible attribute the merge sees. It rides
+/// [`PartBuilder::push`], the same per-record path `estimate` and the stream
+/// bounds ride, so the exact-encode probe ([`PartBuilder::encode_clone`], which
+/// clones the buffered records without re-pushing) folds no record twice. Each
+/// part gets its own accumulator, opened when the part opens and consumed when
+/// it closes, so a record folds into exactly the part it is written into: at a
+/// mid-stream split the record that crosses the boundary is the one that opens
+/// the next [`PartBuilder`] and is folded only there.
+#[derive(Default)]
+struct DeclaredStatAccum {
+    cols: Vec<ColumnAccum>,
+}
+
+impl DeclaredStatAccum {
+    /// Build a fold over the declared eligible columns. The set already passed
+    /// [`DeclaredStatType::from_tag`] in [`declared_columns_from_inputs`], so
+    /// every column here is I64 or BOOL.
+    fn new(declared: &[(String, DeclaredStatType)]) -> Self {
+        let cols = declared
+            .iter()
+            .map(|(name, ty)| ColumnAccum {
+                name: name.clone(),
+                ty: *ty,
+                i64_run: None,
+                bool_run: None,
+                seen_this_record: false,
+            })
+            .collect();
+        DeclaredStatAccum { cols }
+    }
+
+    /// Fold one record's attributes. Each declared column takes at most one
+    /// non-null row from the record: the first attribute matching its name AND
+    /// its declared value kind wins, and a repeat (or a same-named value of the
+    /// other kind, or an absence) is a NULL for the declaration, so no column's
+    /// non-null count can exceed the part's row count and the derived
+    /// `null_count` can never go negative.
+    fn observe_record(&mut self, attrs: &[(String, AttrValue)]) {
+        if self.cols.is_empty() {
+            return;
+        }
+        for c in &mut self.cols {
+            c.seen_this_record = false;
+        }
+        for (name, value) in attrs {
+            for c in &mut self.cols {
+                if c.seen_this_record || c.name != *name {
+                    continue;
+                }
+                match (c.ty, value) {
+                    (DeclaredStatType::I64, AttrValue::I64(v)) => {
+                        match &mut c.i64_run {
+                            Some(r) => r.observe(*v),
+                            None => c.i64_run = Some(Running::start(*v)),
+                        }
+                        c.seen_this_record = true;
+                    }
+                    (DeclaredStatType::Bool, AttrValue::Bool(b)) => {
+                        match &mut c.bool_run {
+                            Some(r) => r.observe(*b),
+                            None => c.bool_run = Some(Running::start(*b)),
+                        }
+                        c.seen_this_record = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Build the part's stamps against its own `sample_count` (the part footer's
+    /// `record_count`). A declared column the part never saw a matching-typed
+    /// value for stamps absent extrema with `null_count == sample_count`; every
+    /// returned stat is valid by construction (`min <= max` from [`Running`],
+    /// `null_count = sample_count - non_null`), so `read_compaction_part` drops
+    /// none of them.
+    fn build_stamps(&self, sample_count: u64) -> Vec<DeclaredColumnStat> {
+        let mut out = Vec::new();
+        for c in &self.cols {
+            let observed = match c.ty {
+                DeclaredStatType::I64 => c.i64_run.map(|r| {
+                    (
+                        DeclaredStatValue::I64(r.min),
+                        DeclaredStatValue::I64(r.max),
+                        r.non_null,
+                    )
+                }),
+                DeclaredStatType::Bool => c.bool_run.map(|r| {
+                    (
+                        DeclaredStatValue::Bool(r.min),
+                        DeclaredStatValue::Bool(r.max),
+                        r.non_null,
+                    )
+                }),
+            };
+            if let Some(stat) = build_one(&c.name, c.ty, observed, sample_count) {
+                out.push(stat);
+            }
+        }
+        out
+    }
+}
+
+/// Build one declared-column stamp, or `None` when the accumulated non-null
+/// count exceeds `sample_count` (impossible under the per-record dedup above,
+/// but a `None` rather than a self-dropping stamp keeps decision 3's invariant
+/// true even if that ever changes) or the typed constructor refuses the triple.
+fn build_one(
+    name: &str,
+    ty: DeclaredStatType,
+    observed: Option<(DeclaredStatValue, DeclaredStatValue, u64)>,
+    sample_count: u64,
+) -> Option<DeclaredColumnStat> {
+    let (min, max, null_count) = match observed {
+        Some((min, max, non_null)) => {
+            let null_count = sample_count.checked_sub(non_null)?;
+            (Some(min), Some(max), null_count)
+        }
+        None => (None, None, sample_count),
+    };
+    DeclaredColumnStat::new(name, ty, min, max, null_count).ok()
 }
 
 /// The floor on how far apart two stored-target probes may sit on the payload
@@ -1085,10 +1315,18 @@ struct PartBuilder {
     min_stream: Option<LogStreamId>,
     max_stream: Option<LogStreamId>,
     count: usize,
+    /// The declared-column extrema fold for this part (ADR-0873 decision 3).
+    /// Fresh per part and folded once per pushed record, so a record folds into
+    /// exactly the part it is written into.
+    declared_accum: DeclaredStatAccum,
 }
 
 impl PartBuilder {
-    fn new(identity: &ObjectIdentity, indexed_fields: &[String]) -> Self {
+    fn new(
+        identity: &ObjectIdentity,
+        indexed_fields: &[String],
+        declared: &[(String, DeclaredStatType)],
+    ) -> Self {
         PartBuilder {
             identity: *identity,
             indexed_fields: indexed_fields.to_vec(),
@@ -1100,6 +1338,7 @@ impl PartBuilder {
             min_stream: None,
             max_stream: None,
             count: 0,
+            declared_accum: DeclaredStatAccum::new(declared),
         }
     }
 
@@ -1129,6 +1368,11 @@ impl PartBuilder {
             .stored_estimate
             .saturating_add(estimate_stored_record(&r));
         self.count += 1;
+        // Fold the declared-column extrema on the same per-record path the
+        // estimates ride (ADR-0873 decision 3). Done here, once per pushed
+        // record, so the exact-encode probe -- which clones `records` without
+        // re-pushing -- never double-counts a record.
+        self.declared_accum.observe_record(&r.attrs);
         self.records.push(r);
         if let Some(t) = tracker {
             t.set_writer_bytes(self.estimate);
@@ -2084,7 +2328,7 @@ async fn open_cursor<'a>(
 /// `last` may equal the next part's `first`; the bounds are adjacent, not
 /// strictly disjoint.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn finalize_part(
+async fn finalize_part(
     store: &dyn ObjectStoreBackend,
     bucket: &Bucket,
     object: Vec<u8>,
@@ -2095,6 +2339,7 @@ pub(crate) async fn finalize_part(
     part_index: u32,
     dry_run: bool,
     retain_bytes: bool,
+    declared_accum: &DeclaredStatAccum,
 ) -> Result<BuiltPart> {
     if stats.postings_capped_fields > 0 {
         tracing::warn!(
@@ -2121,7 +2366,7 @@ pub(crate) async fn finalize_part(
         &hash16,
     )?;
 
-    let part = CompactionPart {
+    let mut part = CompactionPart {
         part_index,
         first_series_id: first_stream_id.map(|s| s.0.to_vec()).unwrap_or_default(),
         last_series_id: last_stream_id.map(|s| s.0.to_vec()).unwrap_or_default(),
@@ -2137,6 +2382,17 @@ pub(crate) async fn finalize_part(
         segment_format_version: OUTPUT_FORMAT_VERSION,
         declared_column_stats: Vec::new(),
     };
+    // Stamp the declared-column extrema recomputed over exactly this part's rows
+    // (ADR-0873 decision 3), through the validated commit-side path and against
+    // the part's own row count read back from the footer above, so
+    // `non_null + null_count == sample_count` by construction and the part's own
+    // reader never drops a stamp. An empty fold (metrics/spans, an unstamped
+    // input set, or the erasure-rewrite route) stamps nothing, which is the
+    // permanently legal state. This mutates only the record metadata: the object
+    // bytes and `content_hash` above are already fixed, so stamping cannot move a
+    // differential hash.
+    let stamps = declared_accum.build_stamps(part.sample_count);
+    ravel_commit::declared_stats::stamp_compaction_part(&mut part, &stamps);
     let mut built = BuiltPart {
         key,
         bytes: Some(object),

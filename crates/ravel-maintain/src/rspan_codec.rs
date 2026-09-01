@@ -742,7 +742,7 @@ pub(crate) async fn finalize_part(
         &hash16,
     )?;
 
-    let part = CompactionPart {
+    let mut part = CompactionPart {
         part_index,
         first_series_id: ftr.min_trace_id.to_vec(),
         last_series_id: ftr.max_trace_id.to_vec(),
@@ -761,6 +761,11 @@ pub(crate) async fn finalize_part(
         segment_format_version: OUTPUT_FORMAT_VERSION,
         declared_column_stats: Vec::new(),
     };
+    // Spans never carry declared typed columns -- they are a logs concept
+    // (ADR-0873 decision 3), so this part has no eligible columns and stamps
+    // nothing. Routed through the same validated commit-side path the logs
+    // compactor uses, so "stamps nothing" is expressed the one way.
+    ravel_commit::declared_stats::stamp_compaction_part(&mut part, &[]);
     // RSPAN keeps its current retention behaviour (ADR-0979 decision 3 wraps the
     // bytes in `Some` mechanically; the bounded-memory fix for this codec is a
     // follow-up, #982), so `put_already_existed` stays false and the bytes are
