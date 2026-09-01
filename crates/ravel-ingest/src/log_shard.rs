@@ -56,6 +56,7 @@ use uuid::Uuid;
 use crate::budget::IngestByteCharge;
 use crate::clock::Clock;
 use crate::config::{IngestConfig, LOG_SEGMENT_FORMAT_VERSION, checked_ingest_hour_bucket};
+use crate::log_declared_stats::{DeclaredStatAccum, declared_type_tag};
 use crate::log_error::LogWriteError;
 use crate::log_metrics::LogIngestMetrics;
 use crate::metrics::FlushTrigger;
@@ -238,6 +239,11 @@ struct LogTenantBuf {
     /// records this buffer holds. Dropped -- refunding the bytes -- when the
     /// buffer flushes (or its flush fails), never before.
     charges: Vec<Arc<IngestByteCharge>>,
+    /// Running per-declared-column exact min/max/null-count over this buffer's
+    /// records (ADR-0873 wave 5a), accumulated in-stream beside `est_bytes` and
+    /// the row count as each write merges, and drained onto the flush's commit
+    /// record. Sits beside the flush-trigger accounting, never a second pass.
+    declared_stats: DeclaredStatAccum,
 }
 
 impl LogTenantBuf {
@@ -265,6 +271,10 @@ impl LogTenantBuf {
         arrival_ns: i64,
     ) -> Result<usize, LogWriteError> {
         let bytes_added: usize = records.iter().map(est_record_bytes).sum();
+        // ADR-0873 wave 5a: fold this write's eligible declared-column extrema
+        // in the one pass that already visits the records, before they move
+        // into the buffer content below.
+        self.declared_stats.observe_records(&records);
         match &mut self.content {
             BufContent::Empty => self.content = BufContent::Rows(records),
             BufContent::Rows(existing) => existing.extend(records),
@@ -290,6 +300,9 @@ impl LogTenantBuf {
         arrival_ns: i64,
     ) -> Result<usize, LogWriteError> {
         let bytes_added = est_columnar_bytes(&batch);
+        // ADR-0873 wave 5a: fold this batch's eligible declared-column extrema
+        // before it moves into the buffer content below.
+        self.declared_stats.observe_batch(&batch);
         match &mut self.content {
             BufContent::Empty => self.content = BufContent::Columnar(vec![batch]),
             BufContent::Columnar(existing) => existing.push(batch),
@@ -363,6 +376,10 @@ struct LogPinnedFlush {
     /// Carried into the flush task purely so they are dropped -- and the bytes
     /// refunded -- when the flush's terminal outcome is reached, no earlier.
     charges: Vec<Arc<IngestByteCharge>>,
+    /// The buffer's accumulated per-declared-column extrema (ADR-0873 wave 5a),
+    /// pinned with the rest of the flush and drained onto the commit record in
+    /// [`LogFlushCtx::run_flush`] once the declared column set is resolved.
+    declared_stats: DeclaredStatAccum,
 }
 
 /// One flush's buffered payload, in whichever representation the tenant buffer
@@ -444,6 +461,7 @@ impl LogFlushCtx {
             payload,
             waiters,
             charges,
+            declared_stats,
         } = pinned;
         // Held to this flush's terminal outcome (every early `return` below is
         // still inside this scope), then dropped here: that drop is the
@@ -489,6 +507,16 @@ impl LogFlushCtx {
                 outcome.into_fields()
             }
         };
+        // ADR-0873 wave 5a: the declared typed columns resolved from the SAME
+        // durable read the indexed-field resolution above just performed (fast
+        // path hit, or the `refresh` that ran on a miss). An empty list leaves
+        // every column of this object uncovered, the permanent legal default.
+        let declared_columns: Vec<(String, u32)> = self
+            .indexed_fields
+            .typed_columns_cached(&tenant_hash, flush_open_ns)
+            .into_iter()
+            .map(|col| (col.key, declared_type_tag(col.ty)))
+            .collect();
         // Encode: RLOG serialization only (RlogWriter push + finish), excluding
         // the indexed-field resolution above and the object-store PUT below.
         #[cfg(feature = "stage-timing")]
@@ -564,7 +592,7 @@ impl LogFlushCtx {
             return;
         }
 
-        let record = match record::build(NewCommitRecord {
+        let mut record = match record::build(NewCommitRecord {
             tenant_hash,
             signal: Signal::Logs,
             shard: self.shard,
@@ -590,6 +618,19 @@ impl LogFlushCtx {
                 return;
             }
         };
+
+        // ADR-0873 wave 5a: stamp the accumulated declared-column extrema onto
+        // the commit record beside `sample_count`, against the same row count.
+        // `build_stamps` gates on the {I64, BOOL} allowlist and derives every
+        // `null_count` as `sample_count - non_null`, so no stamp it emits is one
+        // this flush's own reader would drop (decision 3). An empty declared set
+        // or an empty stamp list leaves the field absent, the legal default.
+        if !declared_columns.is_empty() {
+            let stamps = declared_stats.build_stamps(&declared_columns, record.sample_count);
+            if !stamps.is_empty() {
+                ravel_commit::declared_stats::stamp_commit_record(&mut record, &stamps);
+            }
+        }
 
         match self.publish_with_retry(&record, deadline_ns).await {
             Some(token) => {
@@ -1149,6 +1190,7 @@ impl LogShardActor {
             max_ingest_ts_ns,
             waiters,
             charges,
+            declared_stats,
             ..
         } = buf;
         // `waiters` is empty on the record-less paths below by construction: the
@@ -1222,6 +1264,7 @@ impl LogShardActor {
             payload,
             waiters,
             charges,
+            declared_stats,
         };
 
         // ADR-0067 decision 2: the only place a flush trigger blocks. At
