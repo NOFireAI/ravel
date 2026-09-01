@@ -28,6 +28,25 @@ use uuid::Uuid;
 /// would grow with its size and the recorded high-water would break the
 /// test's bound.
 ///
+/// # What the `decoded` term counts (ADR-0979 decision 1)
+///
+/// Whatever the caller's cursor actually holds resident for the block, and
+/// exactly one charge per cursor per block:
+///
+/// - the RLOG merge holds its block in COLUMNAR form
+///   ([`ravel_logseg::StreamBlockRows`]) and materializes one record at a
+///   time, so it charges the view's `heap_estimate()`. It used to hold the
+///   block's records and charge the `estimate_record` sum over them; that
+///   charge is gone, not additional. Charging both would count one cursor
+///   twice in the same phase snapshot, at a per-record term whose records no
+///   longer exist.
+/// - the RSPAN merge still holds row-form samples and charges their row-form
+///   estimate, which is the same rule: charge what is resident.
+///
+/// Both are decoded heap, so the term stays one byte kind and the high-water
+/// stays comparable across signals; only the shape the bytes are held in
+/// differs. [`Self::peak_cursor_decoded_bytes`] reads this term alone.
+///
 /// Two combined high-water marks are kept:
 ///
 /// - [`Self::peak_transient_bytes`]: `fetched + decoded`, the merge's *own*
@@ -96,8 +115,17 @@ pub struct MergeMemoryTracker {
 struct MergeMemoryInner {
     /// Raw block bytes fetched but not yet decoded-and-dropped.
     fetched: AtomicU64,
-    /// Decoded-record bytes currently resident across all merge cursors.
+    /// Decoded bytes currently resident across all merge cursors: the RLOG
+    /// merge's columnar `heap_estimate()` per open cursor since ADR-0979
+    /// decision 1, the RSPAN merge's row-form estimate. Decoded heap either
+    /// way, one charge per cursor.
     decoded: AtomicU64,
+    /// High-water of `decoded` ALONE, unpooled with `fetched`. The cursor
+    /// phase's two terms are different byte kinds (stored/compressed against
+    /// decoded heap), and only this one is what a cursor's columnar block
+    /// costs, so it is the term ADR-0979 decision 1's accounting is stated in
+    /// and the one a bound on open cursors is checked against.
+    peak_decoded: AtomicU64,
     /// The in-progress part's accumulated record-byte estimate in the writer.
     writer: AtomicU64,
     /// High-water of `fetched + decoded`.
@@ -176,17 +204,23 @@ impl MergeMemoryTracker {
     }
 
     /// Account a block decode: the `raw` bytes are about to be dropped and
-    /// `decoded` bytes of records take their place. Called after the decoded
-    /// records exist but before the raw buffer is released, so the high-water
-    /// captures the instant both are resident.
+    /// `decoded` bytes take their place. Called after the decoded form exists
+    /// but before the raw buffer is released, so the high-water captures the
+    /// instant both are resident.
+    ///
+    /// `decoded` is what the cursor holds resident until it releases the block:
+    /// the columnar view's `heap_estimate()` on the RLOG path, the row-form
+    /// estimate on the RSPAN path. One charge per cursor per block; see the
+    /// type docs.
     pub fn block_decoded(&self, raw: u64, decoded: u64) {
         self.inner.decoded.fetch_add(decoded, Ordering::Relaxed);
         self.note();
         self.inner.fetched.fetch_sub(raw, Ordering::Relaxed);
     }
 
-    /// Account a decoded block leaving a cursor (its records were drained into
-    /// the writer and the block's buffer is dropped).
+    /// Account a decoded block leaving a cursor (its rows were drained into the
+    /// writer and the block's buffer is dropped). `decoded` must be the value
+    /// [`Self::block_decoded`] charged for that same block.
     pub fn block_released(&self, decoded: u64) {
         self.inner.decoded.fetch_sub(decoded, Ordering::Relaxed);
     }
@@ -210,6 +244,9 @@ impl MergeMemoryTracker {
             .fetch_max(transient, Ordering::Relaxed);
         self.inner.peak_total.fetch_max(total, Ordering::Relaxed);
         self.inner.peak_writer.fetch_max(writer, Ordering::Relaxed);
+        self.inner
+            .peak_decoded
+            .fetch_max(decoded, Ordering::Relaxed);
     }
 
     /// Account `bytes` of encoded part bytes still resident in
@@ -261,6 +298,17 @@ impl MergeMemoryTracker {
         self.inner.peak_transient.load(Ordering::Relaxed)
     }
 
+    /// High-water of the cursor phase's DECODED term alone: the sum, over the
+    /// cursors open at once, of what each holds decoded for its current block.
+    /// On the RLOG path that is each open cursor's
+    /// [`ravel_logseg::StreamBlockRows::heap_estimate`] (ADR-0979 decision 1),
+    /// and nothing else -- the raw fetched bytes are stored/compressed bytes of
+    /// a different kind and are not summed in here, and no row-form
+    /// `estimate_record` term is charged alongside it.
+    pub fn peak_cursor_decoded_bytes(&self) -> u64 {
+        self.inner.peak_decoded.load(Ordering::Relaxed)
+    }
+
     /// High-water of the merge's total residency
     /// (`fetched + decoded + writer`), the decode-side buffers plus the
     /// in-progress part's writer buffer.
@@ -305,6 +353,7 @@ impl MergeMemoryTracker {
             &self.inner.decoded,
             &self.inner.writer,
             &self.inner.peak_transient,
+            &self.inner.peak_decoded,
             &self.inner.peak_total,
             &self.inner.memory_target_flushes,
             &self.inner.stored_target_flushes,
