@@ -34,8 +34,8 @@ use ravel_catalog::{AbsentPolicy, validate_or_adopt};
 #[cfg(feature = "stage-timing")]
 use ravel_ingest::LogStageSnapshot;
 use ravel_ingest::{
-    Clock, IngestConfig, LogIngestMetricsSnapshot, LogIngestRouter, LogWriteError, LogWriteReceipt,
-    SystemClock, WriteMode,
+    Clock, FlushTriggerMix, IngestConfig, LogIngestMetricsSnapshot, LogIngestRouter, LogWriteError,
+    LogWriteReceipt, SystemClock, WriteMode,
 };
 use ravel_logseg::{
     Bitmap, ColumnarLogBatch, DynColumn, FieldType, StrColumnDict, stream_attrs_bytes,
@@ -45,7 +45,7 @@ use ravel_otlp::NormalizedLogRecord;
 use ravel_otlp::logs_limits::LogIngestLimits;
 use ravel_types::logstream::{AttrValue, LogStreamId, log_stream_id};
 use ravel_types::{CommitToken, Signal, TenantId};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Per-record attribute cap for the loader (ADR-0089 relaxation of the
 /// `ravel-otlp` 128-per-record network cap).
@@ -540,8 +540,39 @@ fn print_summary(report: &LoadReport) {
     println!("  rows/sec         : {rows_per_sec:.0}");
     println!("  objects written  : {}", report.objects_written());
     println!("  elapsed          : {secs:.3}s");
+    print_flush_mix(report);
     #[cfg(feature = "stage-timing")]
     print_stage_timings(report);
+}
+
+/// Print the per-shard flush trigger mix (issue #983) under the summary totals.
+/// Object count is not a function of the command line, so the mix that produced
+/// it is what makes two loads of the same input comparable. A load whose
+/// metrics carry no per-shard mix (a router that never flushed) prints nothing
+/// rather than a zeroed line.
+fn print_flush_mix(report: &LoadReport) {
+    let mix = report.flush_mix_report();
+    if mix.shards.is_empty() {
+        return;
+    }
+    let t = &mix.totals;
+    println!(
+        "  flush triggers   : size {}, age {}, final {} (total {})",
+        t.size,
+        t.age,
+        t.final_drain,
+        t.total(),
+    );
+    for s in &mix.shards {
+        println!(
+            "    shard {:>3}      : size {}, age {}, final {} (total {})",
+            s.shard,
+            s.counts.size,
+            s.counts.age,
+            s.counts.final_drain,
+            s.counts.total(),
+        );
+    }
 }
 
 /// Print the logs pipeline's per-stage timing breakdown (ADR-0104 decision 1)
@@ -645,6 +676,15 @@ pub struct LoadReport {
     /// return path for a per-load signal (`LogIngestRouter::metrics()` is only
     /// reachable by whoever constructed the router, which is `load` itself).
     pub metrics: LogIngestMetricsSnapshot,
+    /// Per-shard flush counts split by trigger cause (size / age / final drain),
+    /// snapshotted with `metrics` once the load finished (issue #983). This is
+    /// the honest basis for comparing two loads of the same input: the raw
+    /// object count is not a function of the command line (input order
+    /// concentrates consecutive rows on one shard, and the 2-second age trigger
+    /// makes host speed change the layout), but the trigger mix that produced it
+    /// is. Sorted by shard index; a shard that never flushed is absent. Empty on
+    /// a tenant loaded before this change, which is not an error.
+    pub flush_trigger_mix: Vec<(u32, FlushTriggerMix)>,
     /// The early shard-skew warning (issue #560), set at most once, the first
     /// time the check at [`SKEW_CHECK_AFTER_BATCHES`] data batches finds the
     /// spread at or below the [`SKEW_WARN_DENOMINATOR`] threshold. `None` when
@@ -676,6 +716,77 @@ impl LoadReport {
             .filter(|t| seen.insert(t.encode()))
             .count()
     }
+
+    /// The machine-readable per-shard flush trigger mix plus its totals (issue
+    /// #983), the serializable projection of [`LoadReport::flush_trigger_mix`].
+    /// Empty `shards` on a tenant loaded before this change, which is not an
+    /// error.
+    pub fn flush_mix_report(&self) -> FlushMixReport {
+        let shards: Vec<ShardFlushMix> = self
+            .flush_trigger_mix
+            .iter()
+            .map(|(shard, mix)| ShardFlushMix {
+                shard: *shard,
+                counts: FlushMixCounts {
+                    size: mix.size,
+                    age: mix.age,
+                    final_drain: mix.final_drain,
+                },
+            })
+            .collect();
+        let mut totals = FlushMixCounts::default();
+        for s in &shards {
+            totals.size += s.counts.size;
+            totals.age += s.counts.age;
+            totals.final_drain += s.counts.final_drain;
+        }
+        FlushMixReport { shards, totals }
+    }
+}
+
+/// Flush counts split by trigger cause: how many flushes each of the three
+/// disjoint triggers opened (issue #983). The serializable counterpart of
+/// [`ravel_ingest::FlushTriggerMix`], carried per shard and as load totals. The
+/// `final` drain is serialized under that name (a Rust keyword, so the field is
+/// `final_drain`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlushMixCounts {
+    /// Flushes opened because a shard buffer reached `--target-bytes`.
+    pub size: u64,
+    /// Flushes opened because a shard buffer aged past `max_flush_delay`.
+    pub age: u64,
+    /// Flushes opened by the final drain at load close.
+    #[serde(rename = "final")]
+    pub final_drain: u64,
+}
+
+impl FlushMixCounts {
+    /// The flushes-opened count, the sum of the three disjoint causes. On a load
+    /// that abandons nothing this equals the objects written.
+    pub fn total(&self) -> u64 {
+        self.size + self.age + self.final_drain
+    }
+}
+
+/// One shard's flush trigger mix, keyed by shard index (issue #983).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShardFlushMix {
+    pub shard: u32,
+    #[serde(flatten)]
+    pub counts: FlushMixCounts,
+}
+
+/// The load's per-shard flush trigger mix and its totals (issue #983), the
+/// machine-readable form of the same figures [`print_summary`] prints. Object
+/// count is not a function of the command line, so this states the trigger mix
+/// that produced it, which is comparable between two loads of the same input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlushMixReport {
+    /// One row per shard that flushed, sorted by shard index. Empty on a tenant
+    /// loaded before issue #983, which is not an error.
+    pub shards: Vec<ShardFlushMix>,
+    /// The size / age / final counts summed across every shard.
+    pub totals: FlushMixCounts,
 }
 
 /// A load failure. Every variant that can occur after some data is already
@@ -1249,6 +1360,7 @@ async fn load_instrumented(
     // reads the dynamic-column figures to warn on overflow or near-cap pressure
     // (ADR-0100 decision 1).
     report.metrics = router.metrics().snapshot();
+    report.flush_trigger_mix = router.metrics().flush_trigger_mix_by_shard();
     #[cfg(feature = "stage-timing")]
     {
         report.stage_timings = router.stage_timings().snapshot();
@@ -3675,6 +3787,99 @@ type = "i64"
         )
         .await
         .expect("load succeeds")
+    }
+
+    /// Reachability (issue #983): a real `load` run carries the per-shard flush
+    /// trigger mix in the same report the objects-written figure lives in, and
+    /// the mix sums to the object count. One row routes to one shard and flushes
+    /// by size at the default target, so this asserts an exact (size 1, age 0,
+    /// final 0) on a single shard rather than `> 0`.
+    #[tokio::test]
+    async fn load_report_carries_the_flush_trigger_mix() {
+        let report = run_wide_load(4).await;
+        assert!(
+            !report.flush_trigger_mix.is_empty(),
+            "a real load records at least one shard's flushes"
+        );
+        let mix = report.flush_mix_report();
+        assert_eq!(mix.shards.len(), 1, "one row routes to exactly one shard");
+        assert_eq!(
+            mix.shards[0].counts,
+            FlushMixCounts {
+                size: 1,
+                age: 0,
+                final_drain: 0,
+            },
+            "the single row flushes by size, nothing ages or drains"
+        );
+        assert_eq!(
+            mix.totals,
+            FlushMixCounts {
+                size: 1,
+                age: 0,
+                final_drain: 0,
+            }
+        );
+        assert_eq!(
+            mix.totals.total(),
+            report.objects_written() as u64,
+            "the mix sums to the objects the same report reports"
+        );
+    }
+
+    /// Round-trip (issue #983): the machine-readable flush mix serializes and
+    /// deserializes without changing the counts, and the final drain is keyed
+    /// `final` in the serialized form (the Rust field is `final_drain`, since
+    /// `final` is a keyword). Test 3's serialize/deserialize half.
+    #[test]
+    fn flush_mix_report_round_trips_through_json() {
+        let report = LoadReport {
+            flush_trigger_mix: vec![
+                (
+                    0,
+                    FlushTriggerMix {
+                        size: 5,
+                        age: 2,
+                        final_drain: 1,
+                    },
+                ),
+                (
+                    2,
+                    FlushTriggerMix {
+                        size: 0,
+                        age: 0,
+                        final_drain: 3,
+                    },
+                ),
+            ],
+            ..LoadReport::default()
+        };
+        let mix = report.flush_mix_report();
+        assert_eq!(
+            mix.totals,
+            FlushMixCounts {
+                size: 5,
+                age: 2,
+                final_drain: 4,
+            },
+            "totals sum each cause across shards"
+        );
+
+        let json = serde_json::to_string(&mix).expect("serialize");
+        assert!(
+            json.contains("\"final\":"),
+            "the drain is keyed `final` in the serialized form: {json}"
+        );
+        let back: FlushMixReport = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            back, mix,
+            "the round trip preserves the exact per-shard counts and totals"
+        );
+        // The per-shard rows survive keyed by shard, not reordered or merged.
+        assert_eq!(back.shards[0].shard, 0);
+        assert_eq!(back.shards[0].counts.size, 5);
+        assert_eq!(back.shards[1].shard, 2);
+        assert_eq!(back.shards[1].counts.final_drain, 3);
     }
 
     /// A real `load --parquet` run wires and records every stage of the logs

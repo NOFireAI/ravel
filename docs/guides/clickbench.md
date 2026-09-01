@@ -255,9 +255,23 @@ working set from 3 to 6 batches, roughly `2x` on the same geometry. That is the
 memory the default spends.
 
 The loader prints a completion summary to stdout — `rows processed`,
-`objects written`, and `elapsed` (the load wall-time ClickBench reports). It also
+`objects written`, `elapsed` (the load wall-time ClickBench reports), and a
+`flush triggers` breakdown. It also
 prints a stderr warning if any object crossed, or came within 90% of, the
-per-object dynamic-column budget of 1000. The `hits` schema is 104 attribute
+per-object dynamic-column budget of 1000.
+
+`objects written` is not reproducible across runs of the same command, and is
+not a function of the command line alone (issue #983): input order concentrates
+consecutive rows on one shard, and the 2-second `max_flush_delay` age trigger
+means a slower host ages more buffers out before they reach `--target-bytes`,
+changing the layout. Two loads of the same file can therefore write different
+object counts and still be correct. The comparison basis that *is* stable is the
+`flush triggers` line, which states how many flushes each cause opened: `size`
+(a buffer reached `--target-bytes`), `age` (a buffer aged past `max_flush_delay`),
+and `final` (the drain at load close), per shard and as load totals. The three
+causes are disjoint and sum to the objects written, so a mix that shifts from
+`size` toward `age` between two runs explains an object-count difference that the
+count alone cannot. Compare the mix, not the raw count. The `hits` schema is 104 attribute
 columns (see step 3), far under that budget, so a clean load prints no such
 warning; one appearing means a per-object attribute set is wider than the schema
 suggests (stray per-record keys), which is worth investigating before trusting
