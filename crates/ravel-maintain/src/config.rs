@@ -481,19 +481,21 @@ pub const DEFAULT_INPUT_READ_CONCURRENCY: usize = 8;
 ///
 /// The charge a stream carries is the sum over its open cursors of what each
 /// holds, plus, for the instant between reserving and decoding, the pre-decode
-/// ceiling of the batch being admitted. For the ClickBench worst case the ADR
+/// ceiling of the batch being admitted or of the one block an open cursor is
+/// about to decode. For the ClickBench worst case the ADR
 /// sizes against (tenant `cb-20260831140539`, top stream carried by ~617 inputs,
 /// ~3.5 MB stored per row group, 105 mapped columns of which ~28 are
 /// string-typed, 8192-record blocks):
 ///
 /// ```text
 /// per-cursor pre-decode ceiling (rlog::cursor_reservation_bytes)
-///   16 B x 8192 rows x 115 column ids            = 14.4 MiB   shape term
-///   + string-page uncomp_len (~4 MiB measured)   =  4.0 MiB   string payload
-///   + 40 B x 8192 rows x 33 string columns       = 10.3 MiB   string slots
-///   + 2 x 3.5 MB row group                       =  6.7 MiB   raw, two locs
-///                                                  ---------
-///                                                   35.4 MiB
+///   16 B x 8192 rows x 115 column ids            = 14.375 MiB shape term
+///   + string-page uncomp_len (~4 MiB measured)   =  4.000 MiB string payload
+///   + 40 B x 8192 rows x 33 string columns       = 10.313 MiB string slots
+///   + 48 B x 115 column ids x 5 x 2 growth       =  0.053 MiB decoder spines
+///   + 2 x 3.5 MB row group                       =  6.676 MiB raw, two locs
+///                                                  ----------
+///                                                   35.416 MiB (37,136,224 B)
 ///
 /// per-cursor reconciled residency (rlog::StreamCursor::resident_bytes)
 ///   heap_estimate of the decoded block           = 17-24 MiB  (ADR: 18-25 MB)
@@ -501,9 +503,20 @@ pub const DEFAULT_INPUT_READ_CONCURRENCY: usize = 8;
 ///                                                  ---------
 ///                                                   24-30 MiB
 ///
-/// 617 cursors reconciled       617 x 30 MiB = 18.1 GiB  < 20 GiB
-/// 617 cursors at the ceiling   617 x 35.4 MiB = 21.3 GiB > 20 GiB
+/// 617 cursors reconciled       617 x 30 MiB     = 18.1 GiB  < 20 GiB
+/// 617 cursors at the ceiling   617 x 35.416 MiB = 21.3 GiB  > 20 GiB
 /// ```
+///
+/// The decoder-spine term is the five per-kind slot vectors a decoded block
+/// holds, each indexed by column id and so sized by the id-space width whatever
+/// the block carries. It does not scale with rows, so at 8192-record blocks it
+/// is 55,200 B, 0.15% of the per-cursor ceiling: adding it moves that ceiling
+/// from 37,081,024 B to 37,136,224 B and the 617-cursor line from 21.307 GiB to
+/// 21.339 GiB, both still the same rounded figures and the same side of the
+/// 20 GiB budget. It is in the ceiling for the other end of the range, a block
+/// of a few rows, where it is the dominant term and a ceiling without it is not
+/// a ceiling at all. The reconciled line is unchanged either way: it is
+/// measured, and `heap_estimate` has always counted the slot vectors.
 ///
 /// So the default admits the worst case because the reconcile is mandatory
 /// (ADR-0979 decision 4 as amended): held at their admission ceilings, the same
@@ -775,10 +788,12 @@ pub struct CompactorConfig {
     /// A cursor is admitted against a pre-decode CEILING on those terms, priced
     /// from resident directory metadata: the block's decoded size is
     /// `16 B x rows x column-id width + its string pages' uncomp_len +
-    /// 40 B x rows x string columns`, maximized over the cursor's candidate
-    /// blocks. That is a shape formula, not a stored-size one, because the page
-    /// codecs are size-adaptive: a constant column stores a few bytes per block
-    /// and still decodes to `16 B x rows`.
+    /// 40 B x rows x string columns + 48 B x column-id width x 5 slot vectors
+    /// x 2 for their growth step`,
+    /// maximized over the cursor's candidate blocks. That is a shape formula,
+    /// not a stored-size one, because the page codecs are size-adaptive: a
+    /// constant column stores a few bytes per block and still decodes to
+    /// `16 B x rows`.
     ///
     /// The reservation is charged BEFORE a cursor fetches or decodes anything,
     /// so the budget is enforced at reserve time and the merge fails closed
@@ -789,7 +804,13 @@ pub struct CompactorConfig {
     /// Once the decode completes, the charge is reconciled down to the cursor's
     /// actual residency (its decoded block's `heap_estimate`, the raw bytes it
     /// actually holds, and its location metadata), which is the basis
-    /// [`DEFAULT_MERGE_CURSOR_BUDGET_BYTES`] is sized from.
+    /// [`DEFAULT_MERGE_CURSOR_BUDGET_BYTES`] is sized from. The reconcile is a
+    /// lowering, never a release of the bound: before an open cursor decodes a
+    /// LATER block, its charge grows back to cover that block's ceiling on top
+    /// of what it still holds, and a growth the budget cannot take refuses with
+    /// the same typed error before the decode starts. Without that, the freed
+    /// budget could be spent admitting more cursors and every one of them could
+    /// then grow toward its own ceiling with nothing checking the sum again.
     /// Nothing is published, the L0 inputs stay live and queryable, and any
     /// parts already PUT age out under the unreferenced-part sweep exactly like
     /// an abandoned run's. This converts an out-of-memory kill at an arbitrary
