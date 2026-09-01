@@ -2,12 +2,21 @@
 //! `data_objects_touched` recorder, both in
 //! [`ravel_query::LogSegmentFetcher`]/[`ravel_query::BlockRangeFetcher`].
 //!
-//! The bound test drives a covering read of an object larger than the bound and
-//! pins the request-count band (`ceil(size / bound)` GETs), the per-request wire
-//! bound ([`BlockRangeFetcher::peak_fetch_run_bytes`] <= bound), and row
-//! identity with the unbounded whole-object path. The recorder test pins that
-//! `plan_segment` records exactly one touch per distinct object, and that a
-//! partition's subset scans do not double-count.
+//! The bound tests drive a covering read of an object larger than the bound and
+//! pin the request-count band (`ceil(size / bound)` GETs), the per-request wire
+//! bound ([`BlockRangeFetcher::peak_fetch_run_bytes`], which counts only ISSUED
+//! reads), the refusal of a zero bound, and row identity with the unbounded
+//! whole-object path. The recorder tests pin that `plan_segment` records exactly
+//! one touch per distinct object whose blocks a scan will fetch, that a
+//! probe-only plan records none, and that a partition's subset scans do not
+//! double-count.
+//!
+//! The routing tests pin ADR-0996's outcome at the shipped default: a saturated
+//! resolved rate saturates the routing threshold too, so `cost-based` at the
+//! reference profile routes every object whole and the plan phase issues no
+//! footer probe. They run against an object above the production 512 KiB routing
+//! threshold, which is the only band where the ranged path and the
+//! skip-decidable plan branch are reachable at all.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -15,17 +24,26 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
+use ravel_cache::{Cache, CacheLimits};
 use ravel_catalog::{SegmentLevel, SegmentRef};
 use ravel_logseg::writer::ObjectIdentity;
-use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
+use ravel_logseg::{
+    AttrValue, FieldSel, FieldType, LogRecord, Predicate, RlogConfig, RlogWriter,
+    stream_attrs_bytes,
+};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
     PageToken, PutOptions, PutOutcome, StoreError,
 };
-use ravel_query::{BlockRangeFetcher, LogQuery, LogSegmentFetcher};
+use ravel_query::{
+    BlockRangeFetcher, DEFAULT_LOG_REQUEST_COST_BYTES, DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+    EngineConfig, EngineConfigError, LogQuery, LogSegmentFetcher, LogsFetchPolicy,
+    ResolvedLogsFetch, resolve_logs_fetch,
+};
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
+use ravel_types::cost_profile::StoreCostProfile;
 use uuid::Uuid;
 
 const TENANT: TenantHash = TenantHash([7u8; 16]);
@@ -96,12 +114,16 @@ fn seg_ref(key: &str, size: u64, records: &[LogRecord]) -> SegmentRef {
     }
 }
 
-/// Counts `get` calls and records the largest single GET length seen, so a test
-/// can prove both the request count and that no single request exceeded the
-/// bound.
+/// Counts `get` calls, counts the suffix-range GETs among them (the ADR-0107
+/// etag-establishing footer probe is the only read shape that uses
+/// [`GetRange::Suffix`]), and records the largest single GET length seen. A test
+/// can therefore prove the request count, the probe count, and that no single
+/// request exceeded the fetch bound, all from real store traffic rather than
+/// from a configured value.
 struct CountingStore {
     inner: Arc<MemoryStore>,
     gets: AtomicU64,
+    suffix_gets: AtomicU64,
     max_get_len: AtomicU64,
 }
 
@@ -110,11 +132,17 @@ impl CountingStore {
         CountingStore {
             inner,
             gets: AtomicU64::new(0),
+            suffix_gets: AtomicU64::new(0),
             max_get_len: AtomicU64::new(0),
         }
     }
     fn get_count(&self) -> u64 {
         self.gets.load(Ordering::SeqCst)
+    }
+    /// Footer probes: every probe site issues `GetRange::Suffix`, and nothing
+    /// else does.
+    fn probe_count(&self) -> u64 {
+        self.suffix_gets.load(Ordering::SeqCst)
     }
     fn max_get_len(&self) -> u64 {
         self.max_get_len.load(Ordering::SeqCst)
@@ -133,6 +161,9 @@ impl ObjectStoreBackend for CountingStore {
     }
     async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
         self.gets.fetch_add(1, Ordering::SeqCst);
+        if matches!(range, GetRange::Suffix(_)) {
+            self.suffix_gets.fetch_add(1, Ordering::SeqCst);
+        }
         let got = self.inner.get(key, range).await?;
         self.max_get_len
             .fetch_max(got.data.len() as u64, Ordering::SeqCst);
@@ -171,6 +202,121 @@ fn big_object() -> (Vec<LogRecord>, Vec<u8>) {
         .collect();
     let bytes = build_object(&records);
     (records, bytes)
+}
+
+/// Deterministic pseudo-random hex. The above-threshold fixture must exceed
+/// 512 KiB as STORED bytes, and the writer zstds every page, so a repeated body
+/// would compress away to nothing and leave the object below the routing
+/// threshold the test is about.
+fn noise_body(seed: u64, len: usize) -> String {
+    const A: u64 = 6_364_136_223_846_793_005;
+    const C: u64 = 1_442_695_040_888_963_407;
+    let mut x = seed.wrapping_mul(A).wrapping_add(C);
+    let mut s = String::with_capacity(len + 16);
+    while s.len() < len {
+        x = x.wrapping_mul(A).wrapping_add(C);
+        s.push_str(&format!("{x:016x}"));
+    }
+    s.truncate(len);
+    s
+}
+
+/// A record carrying an i64 `code` attribute, which FIELD_DIR resolves to a
+/// dynamic column and SKIP_IDX carries per-block numeric stats for. That is what
+/// makes a `Predicate::NumRange` on `code` a skip-decidable prune arm.
+fn coded_record(ts: i64, code: i64) -> LogRecord {
+    let resource = vec![(
+        "service.name".to_string(),
+        AttrValue::Str("api".to_string()),
+    )];
+    LogRecord {
+        stream_id: ravel_types::logstream::log_stream_id(&resource, "scope", "1.0", &[]),
+        stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+        ts_ns: ts,
+        observed_ts_ns: ts,
+        severity_num: 9,
+        severity_text: "INFO".into(),
+        body: noise_body(ts as u64, 1_600),
+        trace_id: None,
+        span_id: None,
+        flags: 0,
+        attrs: vec![("code".to_string(), AttrValue::I64(code))],
+    }
+}
+
+/// An object comfortably above the production 512 KiB routing threshold
+/// ([`DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD`]), every record carrying `code = 500`.
+/// Above that threshold `plan_segment`'s skip-decidable branch (#761) and the
+/// ranged fetch path are reachable; below it neither is, which is why the older
+/// fixtures in this file exercise only the whole-object fallback.
+fn above_threshold_object() -> (Vec<LogRecord>, Vec<u8>) {
+    let records: Vec<LogRecord> = (0..700i64).map(|ts| coded_record(ts, 500)).collect();
+    let bytes = build_object(&records);
+    assert!(
+        bytes.len() as u64 > DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+        "the fixture must exceed the 512 KiB routing threshold, got {} bytes",
+        bytes.len()
+    );
+    (records, bytes)
+}
+
+/// A skip-decidable query (`plan_skip_decidable`: no content arm, no stream
+/// filter, a nonempty all-`NumRange` prune) over `code`, whose ts window
+/// overlaps the fixture without containing it, so the predicate-free fast path
+/// cannot take over.
+fn coded_query(code_min: i64, code_max: i64) -> LogQuery {
+    LogQuery::new(0, 399).with_prune(Predicate::NumRange {
+        field: FieldSel::Attr("code".into()),
+        ty: FieldType::I64,
+        min: Some(code_min as u64),
+        max: Some(code_max as u64),
+    })
+}
+
+/// Puts `bytes` at `key` behind a [`CountingStore`] and returns the seg ref, the
+/// counter, and the store handle.
+async fn counted_store(
+    key: &str,
+    bytes: &[u8],
+    records: &[LogRecord],
+) -> (SegmentRef, Arc<CountingStore>, Arc<dyn ObjectStoreBackend>) {
+    let mem = Arc::new(MemoryStore::new());
+    mem.put(
+        key,
+        bytes::Bytes::copy_from_slice(bytes),
+        PutOptions::default(),
+    )
+    .await
+    .expect("put");
+    let counting = Arc::new(CountingStore::new(mem));
+    let store: Arc<dyn ObjectStoreBackend> = counting.clone();
+    (seg_ref(key, bytes.len() as u64, records), counting, store)
+}
+
+/// Builds a fetcher the way `ravel-server`'s `build_sql_state` does: the
+/// resolved routing threshold and request cost are handed to the fetcher
+/// unconditionally, so `with_block_range_threshold` pins the inner crossover to
+/// whatever `resolve_logs_fetch` produced.
+fn fetcher_from(
+    resolved: &ResolvedLogsFetch,
+    store: Arc<dyn ObjectStoreBackend>,
+) -> LogSegmentFetcher {
+    LogSegmentFetcher::new(store)
+        .with_block_range_threshold(resolved.block_range_threshold)
+        .with_request_cost_bytes(resolved.request_cost_bytes)
+}
+
+/// The resolution the shipped default produces: `cost-based` at the reference
+/// (intra-region, free-byte) profile, with no explicit overrides.
+fn cost_based_at_reference() -> ResolvedLogsFetch {
+    resolve_logs_fetch(
+        LogsFetchPolicy::CostBased,
+        &StoreCostProfile::reference(),
+        None,
+        DEFAULT_LOG_REQUEST_COST_BYTES,
+        DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+        None,
+    )
 }
 
 /// ADR-0996 decision 2's covering-read contract: an object above the fetch
@@ -223,7 +369,8 @@ async fn object_above_bound_is_read_in_banded_covering_gets_rows_identical() {
     let fetcher = LogSegmentFetcher::new(store)
         .with_block_range_threshold(u64::MAX)
         .with_request_cost_bytes(u64::MAX)
-        .with_max_fetch_run_bytes(bound);
+        .with_max_fetch_run_bytes(bound)
+        .expect("a nonzero bound is accepted");
 
     let bounded = fetcher
         .fetch_accounted_with_tenant(&seg, TENANT, &query, &QueryAccounting::new())
@@ -252,10 +399,80 @@ async fn object_above_bound_is_read_in_banded_covering_gets_rows_identical() {
         "no single GET exceeded the bound: {} > {bound}",
         counting.max_get_len()
     );
-    assert!(
-        fetcher.block_range_fetcher().peak_fetch_run_bytes() <= bound,
-        "the fetcher's own peak covering sub-range is bounded: {} > {bound}",
-        fetcher.block_range_fetcher().peak_fetch_run_bytes()
+    // Exactly the bound, not merely at or under it: every sub-range except the
+    // last is a full bound-length read, and all of them were ISSUED (no cache is
+    // wired here), so the peak must have moved to the bound. `<= bound` alone
+    // would also pass if the counter never moved at all.
+    assert_eq!(
+        fetcher.block_range_fetcher().peak_fetch_run_bytes(),
+        bound,
+        "the fetcher's own peak covering sub-range is exactly the bound"
+    );
+}
+
+/// [`BlockRangeFetcher::peak_fetch_run_bytes`] counts reads this fetcher ISSUED.
+/// A covering read served entirely from the cache crosses no network and moves
+/// no wire bytes, so it must leave the peak at zero.
+///
+/// Prove-the-test: move `observe_fetch_run` back above the `cached_extent` call
+/// in `covering_read` (either regime) and the second assertion reads
+/// `object_size` instead of the first read's peak, because the cache-served
+/// second fetch re-observes an extent it never requested.
+#[tokio::test]
+async fn a_cache_served_covering_read_does_not_move_the_peak() {
+    let (records, bytes) = big_object();
+    let object_size = bytes.len() as u64;
+
+    let (seg, counting, store) = counted_store("logs/c.rlog", &bytes, &records).await;
+    let acc = QueryAccounting::new();
+
+    // One cache, shared by two fetchers, large enough to hold the whole object.
+    // `with_whole_object_threshold(u64::MAX)` sends the object down
+    // `covering_read`, which the bound then segments.
+    let cache = Arc::new(Cache::new(CacheLimits::new(1 << 20, 1024, 1 << 20)));
+    let bound = object_size / 5;
+    assert!(bound > 0, "the fixture must segment");
+
+    let warm = BlockRangeFetcher::new(Arc::clone(&store))
+        .with_whole_object_threshold(u64::MAX)
+        .with_max_fetch_run_bytes(bound)
+        .expect("a nonzero bound is accepted")
+        .with_cache(Arc::clone(&cache));
+    assert_eq!(warm.peak_fetch_run_bytes(), 0, "nothing issued yet");
+    warm.fetch_object(&seg, TENANT, 0, 39, &acc)
+        .await
+        .expect("first fetch");
+    let issued = counting.get_count();
+    assert_eq!(
+        issued,
+        object_size.div_ceil(bound),
+        "the first pass issued every covering sub-range"
+    );
+    assert_eq!(
+        warm.peak_fetch_run_bytes(),
+        bound,
+        "the issued sub-ranges set the peak to the bound"
+    );
+
+    // A second fetcher over the same cache: every covering sub-range is served
+    // from cache, so it issues nothing and its own peak must stay zero.
+    let cold = BlockRangeFetcher::new(store)
+        .with_whole_object_threshold(u64::MAX)
+        .with_max_fetch_run_bytes(bound)
+        .expect("a nonzero bound is accepted")
+        .with_cache(cache);
+    cold.fetch_object(&seg, TENANT, 0, 39, &acc)
+        .await
+        .expect("cache-served fetch");
+    assert_eq!(
+        counting.get_count(),
+        issued,
+        "no new store GET: the second fetcher hit the shared cache"
+    );
+    assert_eq!(
+        cold.peak_fetch_run_bytes(),
+        0,
+        "a covering read served from cache issued nothing, so the peak stays zero"
     );
 }
 
@@ -278,7 +495,8 @@ async fn object_at_or_under_bound_is_one_covering_get() {
     let fetcher = LogSegmentFetcher::new(store)
         .with_block_range_threshold(u64::MAX)
         .with_request_cost_bytes(u64::MAX)
-        .with_max_fetch_run_bytes(object_size); // exactly at the bound
+        .with_max_fetch_run_bytes(object_size) // exactly at the bound
+        .expect("a nonzero bound is accepted");
 
     let out = fetcher
         .fetch_accounted_with_tenant(&seg, TENANT, &query, &QueryAccounting::new())
@@ -293,30 +511,48 @@ async fn object_at_or_under_bound_is_one_covering_get() {
     );
 }
 
-/// ADR-0996 decision 2: a zero bound clamps up to one at the fetcher (the typed
-/// refusal is at config resolution, `EngineConfig::validate`), so it never
-/// divides by zero. A one-byte bound still reads the whole object, in a
-/// (large) band of single-byte-ish covering GETs, byte-identical.
-#[tokio::test]
-async fn zero_bound_clamps_to_one_and_never_divides_by_zero() {
-    let (records, bytes) = big_object();
-    let object_size = bytes.len() as u64;
-    let mem = Arc::new(MemoryStore::new());
-    mem.put("logs/z.rlog", bytes.clone().into(), PutOptions::default())
-        .await
-        .expect("put");
-    let seg = seg_ref("logs/z.rlog", object_size, &records);
-    // A BlockRangeFetcher built with a zero bound: clamped to 1, so the covering
-    // read segments into `object_size` single-byte GETs rather than panicking.
-    let br = BlockRangeFetcher::new(mem as Arc<dyn ObjectStoreBackend>)
-        .with_whole_object_threshold(u64::MAX)
-        .with_max_fetch_run_bytes(0);
-    let (assembled, _stats) = br
-        .fetch_object(&seg, TENANT, 0, 39, &QueryAccounting::new())
-        .await
-        .expect("fetch with clamped bound");
-    assert_eq!(assembled.len() as u64, object_size);
-    assert!(br.peak_fetch_run_bytes() <= 1, "clamped bound is one byte");
+/// ADR-0996 decision 2: a zero bound is REFUSED at the setter, with the same
+/// typed error `EngineConfig::validate` returns. Clamping it up to one instead
+/// would turn a misconfigured bound into a silent one-byte-per-GET read of every
+/// object -- a bound that "works" while multiplying the request bill by the
+/// object size. The two checks are complementary: `validate` guards the config
+/// surface, the setter guards every direct builder call that never passes
+/// through an `EngineConfig`.
+///
+/// Prove-the-test: restore `self.max_fetch_run_bytes = n.max(1)` in
+/// `BlockRangeFetcher::with_max_fetch_run_bytes` and both `expect_err` calls
+/// panic on an `Ok`.
+#[test]
+fn zero_bound_is_refused_by_the_setter_not_clamped() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    assert_eq!(
+        BlockRangeFetcher::new(Arc::clone(&store))
+            .with_max_fetch_run_bytes(0)
+            .err(),
+        Some(EngineConfigError::ZeroFetchBound),
+        "a zero bound is refused, not clamped to one"
+    );
+    assert_eq!(
+        LogSegmentFetcher::new(Arc::clone(&store))
+            .with_max_fetch_run_bytes(0)
+            .err(),
+        Some(EngineConfigError::ZeroFetchBound),
+        "the outer builder refuses it too"
+    );
+    // The config surface still refuses it, unchanged: the setter does not
+    // replace that check.
+    let cfg = EngineConfig {
+        logs_max_fetch_run_bytes: 0,
+        ..EngineConfig::default()
+    };
+    assert_eq!(cfg.validate(), Err(EngineConfigError::ZeroFetchBound));
+    // One byte is a legal (absurd) bound and is accepted, so the refusal is
+    // exactly of zero and not of "small".
+    assert!(
+        BlockRangeFetcher::new(store)
+            .with_max_fetch_run_bytes(1)
+            .is_ok()
+    );
 }
 
 /// ADR-0996 decision 3: `plan_segment` records exactly one
@@ -474,5 +710,228 @@ async fn striped_subset_scans_do_not_double_count_a_touch() {
         accounting.snapshot().data_objects_touched,
         1,
         "per-partition subset scans must not re-record the touch"
+    );
+}
+
+/// ADR-0996 decision 3 and the `data_objects_touched` contract in
+/// `ravel_types::accounting`: "A footer or index probe does not count ... if the
+/// query then decides to fetch no blocks from that object, the object was never
+/// touched."
+///
+/// `plan_segment`'s skip-decidable branch (#761) reads the probe, SKIP_IDX and
+/// FIELD_DIR and nothing else. When its prune arm eliminates every block the
+/// scan that would have fetched blocks never runs (`owned_work` assigns a
+/// zero-survivor segment to no partition), so this must record ZERO touches.
+/// Counting it would inflate the denominator of `range_amplification` in the
+/// flattering direction.
+///
+/// The fixture is above the 512 KiB routing threshold on purpose: at or below
+/// it `plan_segment` takes the whole-object fallback and this branch never runs,
+/// which is why the probe-count assertion below is part of the claim.
+///
+/// Prove-the-test: restore `if matches!(result, Ok(Some(_)))` as the recording
+/// predicate in `plan_segment` and the `data_objects_touched, 0` assertion reads
+/// 1.
+#[tokio::test]
+async fn a_zero_survivor_skip_decidable_plan_records_no_touch() {
+    let (records, bytes) = above_threshold_object();
+    let (seg, counting, store) = counted_store("logs/skip-zero.rlog", &bytes, &records).await;
+
+    // The shipped byte-minimal routing threshold, so the object is above it and
+    // the skip-decidable branch is the one that runs.
+    let fetcher = LogSegmentFetcher::new(store);
+    assert_eq!(
+        fetcher.block_range_threshold(),
+        DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD
+    );
+    let accounting = QueryAccounting::new();
+
+    // `code` is 500 on every record, so this arm is disjoint from every block's
+    // numeric stat and prunes them all.
+    let (survivors, _stats, footer) = fetcher
+        .plan_segment(&seg, TENANT, &coded_query(9_000, 10_000), &accounting)
+        .await
+        .expect("plan")
+        .expect("the segment is ts-relevant, so this is not the irrelevant None");
+    assert_eq!(survivors, 0, "the prune arm eliminates every block");
+    assert!(
+        footer.is_some(),
+        "the skip-decidable branch carries its footer forward; a None footer \
+         would mean the whole-object fallback ran instead"
+    );
+    assert!(
+        counting.probe_count() > 0,
+        "the skip-decidable branch issued its suffix probe, so the branch under \
+         test is the one that ran"
+    );
+
+    assert_eq!(
+        accounting.snapshot().data_objects_touched,
+        0,
+        "a probe-only plan that fetched no block bytes is not a touch"
+    );
+}
+
+/// The sibling of the test above, same fixture and same branch, with a prune arm
+/// that keeps every block: survivors > 0, a scan follows, and the object is
+/// touched exactly once.
+#[tokio::test]
+async fn a_surviving_skip_decidable_plan_records_exactly_one_touch() {
+    let (records, bytes) = above_threshold_object();
+    let (seg, counting, store) = counted_store("logs/skip-live.rlog", &bytes, &records).await;
+
+    let fetcher = LogSegmentFetcher::new(store);
+    let accounting = QueryAccounting::new();
+
+    let (survivors, _stats, footer) = fetcher
+        .plan_segment(&seg, TENANT, &coded_query(0, 1_000), &accounting)
+        .await
+        .expect("plan")
+        .expect("relevant");
+    assert!(survivors > 0, "the wide prune arm keeps blocks");
+    assert!(
+        footer.is_some(),
+        "same skip-decidable branch as the sibling"
+    );
+    assert!(counting.probe_count() > 0, "same branch, same probe");
+
+    assert_eq!(
+        accounting.snapshot().data_objects_touched,
+        1,
+        "a plan whose survivors a scan will fetch touches the object exactly once"
+    );
+}
+
+/// ADR-0996 decision 2, the outcome the whole ADR is for: at the shipped default
+/// (`cost-based` + the reference profile) a narrow projection of an object above
+/// 512 KiB must route WHOLE-OBJECT, so ravel-sql records zero ranged opens.
+///
+/// The routing predicate is `ranged_projection_pays`, which compares the
+/// projection's saved bytes against `BlockRangeFetcher::effective_whole_object_threshold`.
+/// That accessor returns the value `with_block_range_threshold` pinned VERBATIM
+/// when one was set, bypassing the `5 x request_cost` derivation and its floors
+/// -- and `ravel-server` always sets it. So a resolution that saturates only the
+/// rate and leaves the routing threshold at 512 KiB delivers none of this: the
+/// object still routes ranged, and the plan phase still issues the probe and
+/// section GETs the ADR exists to remove.
+///
+/// Prove-the-test: key the routing override on `matches!(policy,
+/// LogsFetchPolicy::RequestMinimal)` alone (the pre-fix condition in
+/// `resolve_logs_fetch`) and both halves fail -- `ranged_projection_pays` returns
+/// true, and the fetch issues a probe plus section and chunk GETs instead of the
+/// single covering GET asserted here.
+#[tokio::test]
+async fn cost_based_at_the_reference_profile_routes_whole_object() {
+    let resolved = cost_based_at_reference();
+    assert_eq!(resolved.request_cost_bytes, u64::MAX, "free bytes saturate");
+
+    let (records, bytes) = above_threshold_object();
+    let object_size = bytes.len() as u64;
+    let (seg, counting, store) = counted_store("logs/cb.rlog", &bytes, &records).await;
+    let fetcher = fetcher_from(&resolved, store);
+
+    // The routing predicate ravel-sql's `open_by_column_chunk` consumes: a
+    // one-column-out-of-many projection of this object must not pay to range.
+    assert!(
+        !fetcher.ranged_projection_pays(object_size, 0.1),
+        "cost-based at the reference profile must never choose the ranged path"
+    );
+
+    // ... and the read that follows is one covering GET with no probe, which is
+    // what makes `data_GETs_per_touched_object` 1.0.
+    let accounting = QueryAccounting::new();
+    fetcher
+        .plan_segment(&seg, TENANT, &coded_query(0, 1_000), &accounting)
+        .await
+        .expect("plan")
+        .expect("relevant");
+    assert_eq!(
+        counting.probe_count(),
+        0,
+        "no footer probe: the object never reaches the ranged path"
+    );
+    assert_eq!(
+        counting.get_count(),
+        1,
+        "one whole-object GET for the whole plan phase"
+    );
+
+    // The counterfactual the fix removes: the same saturated rate with the
+    // routing threshold left at its configured 512 KiB routes ranged.
+    let unfixed: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let stale = LogSegmentFetcher::new(unfixed)
+        .with_block_range_threshold(DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD)
+        .with_request_cost_bytes(u64::MAX);
+    assert!(
+        stale.ranged_projection_pays(object_size, 0.1),
+        "with the threshold left at 512 KiB the saturated rate changes nothing"
+    );
+}
+
+/// ADR-0996 decision 2's plan-probe claim, pinned as BEHAVIOUR rather than as a
+/// configuration flag: under a saturated resolution the plan phase issues ZERO
+/// footer probes, because `plan_segment`'s two probe-issuing branches both gate
+/// on `object_size > block_range_threshold` and the saturated threshold closes
+/// them. No separate suppression switch is needed or exists.
+///
+/// The byte-minimal arm is the flip: same object, same query, and the probe
+/// count is nonzero there, so the two zero assertions are not vacuous.
+#[tokio::test]
+async fn a_saturated_resolution_issues_no_plan_footer_probe() {
+    let (records, bytes) = above_threshold_object();
+    let reference = StoreCostProfile::reference();
+    let query = coded_query(0, 1_000);
+
+    let policies = [
+        (LogsFetchPolicy::RequestMinimal, 0u64),
+        (LogsFetchPolicy::CostBased, 0),
+    ];
+    for (policy, expected_probes) in policies {
+        let resolved = resolve_logs_fetch(
+            policy,
+            &reference,
+            None,
+            DEFAULT_LOG_REQUEST_COST_BYTES,
+            DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+            None,
+        );
+        let key = format!("logs/probe-{}.rlog", policy.as_str());
+        let (seg, counting, store) = counted_store(&key, &bytes, &records).await;
+        let fetcher = fetcher_from(&resolved, store);
+        fetcher
+            .plan_segment(&seg, TENANT, &query, &QueryAccounting::new())
+            .await
+            .expect("plan")
+            .expect("relevant");
+        assert_eq!(
+            counting.probe_count(),
+            expected_probes,
+            "{} must issue no plan-phase footer probe",
+            policy.as_str()
+        );
+    }
+
+    // byte-minimal keeps the 512 KiB threshold, so the same above-threshold
+    // object DOES take a probing branch. This is the demonstration that the
+    // zeros above are a real property of the saturated resolution.
+    let bm = resolve_logs_fetch(
+        LogsFetchPolicy::ByteMinimal,
+        &reference,
+        None,
+        DEFAULT_LOG_REQUEST_COST_BYTES,
+        DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+        None,
+    );
+    let (seg, counting, store) = counted_store("logs/probe-bm.rlog", &bytes, &records).await;
+    let fetcher = fetcher_from(&bm, store);
+    fetcher
+        .plan_segment(&seg, TENANT, &query, &QueryAccounting::new())
+        .await
+        .expect("plan")
+        .expect("relevant");
+    assert!(
+        counting.probe_count() > 0,
+        "byte-minimal probes an above-threshold object, so the zeros above are \
+         not vacuous"
     );
 }
