@@ -38,7 +38,8 @@
 //!   takes only [`DeclaredColumnStat`]s, whose constructor is the typed
 //!   boundary that refuses ineligible types (ADR-0873 decision 2).
 
-use std::collections::HashSet;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ravel_proto::commit::v1::{
     CommitRecord, CompactionPart, DeclaredColumnMinMax, DeclaredColumnStatValue,
@@ -47,6 +48,38 @@ use ravel_proto::commit::v1::{
 use ravel_types::declared_stats::{
     DeclaredColumnStat, DeclaredStatError, DeclaredStatType, DeclaredStatValue,
 };
+
+/// Process-wide tally behind [`dropped_stamp_entries`].
+static DROPPED_STAMP_ENTRIES: AtomicU64 = AtomicU64::new(0);
+
+/// How many declared-column stamp entries this process has dropped since it
+/// started: the ADR-0873 decision 2 defect metric, counted one per dropped
+/// entry.
+///
+/// Every read route funnels through the one predicate pass, so this covers all
+/// three carriers: a commit record ([`read_commit_record`]), a compaction or
+/// erasure-rewrite part ([`read_compaction_part`]), and a snapshot entry
+/// (`ravel_catalog::read_snapshot_entry`, which reads its entries through the
+/// same pass). A nonzero value means a writer produced a stamp no reader will
+/// spend, which is a writer defect and not a query problem: the query merely
+/// scans. Absence of stamps never touches it -- an unstamped record is the
+/// permanent, legal state of everything written before ADR-0873.
+///
+/// Monotonic and process-local, like every other in-process anomaly tally
+/// here: a scrape reads the delta between samples.
+pub fn dropped_stamp_entries() -> u64 {
+    DROPPED_STAMP_ENTRIES.load(Ordering::Relaxed)
+}
+
+/// Add `count` dropped entries to the defect metric. Called once per read
+/// pass, with the pass's whole drop count, so the metric moves by exactly the
+/// number of entries no reader will spend.
+fn record_dropped(count: usize) {
+    if count == 0 {
+        return;
+    }
+    DROPPED_STAMP_ENTRIES.fetch_add(count as u64, Ordering::Relaxed);
+}
 
 /// Why one `DeclaredColumnMinMax` entry was dropped on decode.
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
@@ -83,8 +116,11 @@ pub enum DeclaredStatDefect {
         null_count: u64,
         sample_count: u64,
     },
-    /// Two entries name the same column. Which one wins is undefined, so
-    /// neither is trusted beyond the first.
+    /// Two or more entries name the same column. Which one wins is undefined,
+    /// so ALL of them are dropped and the column is uncovered for this segment
+    /// (ADR-0873 clause 6: keeping any one duplicate is silently picking
+    /// between two claims about one immutable record). Every occurrence of the
+    /// name carries this reason, including the first.
     #[error("duplicate entry for declared column {0:?}")]
     DuplicateName(String),
 }
@@ -262,17 +298,26 @@ fn decode_all_against_rows(
 ) -> ValidatedDeclaredStats {
     let mut covered = Vec::new();
     let mut dropped = Vec::new();
-    // Names, not decoded stats: the name is stored verbatim, and borrowing
-    // from `entries` keeps the set independent of the pushes into `covered`.
-    let mut seen: HashSet<&str> = HashSet::with_capacity(entries.len());
+    // Clause 6 needs the whole entry set before any entry can be judged: a
+    // duplicated name yields NO coverage, so whether the first occurrence is
+    // trustworthy depends on an entry that comes after it. One counting pass,
+    // then one judging pass. Names, not decoded stats: the name is stored
+    // verbatim, so borrowing from `entries` costs no allocation per entry.
+    let mut occurrences: HashMap<&str, usize> = HashMap::with_capacity(entries.len());
+    for entry in entries.iter() {
+        *occurrences.entry(entry.name.as_str()).or_insert(0) += 1;
+    }
     for (index, entry) in entries.iter().enumerate() {
-        // The name is claimed by its FIRST occurrence in record order, valid
-        // or not: which of two same-name entries wins is undefined, so a
-        // later entry must never gain coverage because an earlier one was
-        // dropped for its own defect. Reserving before validation is what
-        // enforces that.
-        let first_occurrence = seen.insert(entry.name.as_str());
-        let reason = if !first_occurrence {
+        // A duplicated name is dropped in EVERY occurrence, first included:
+        // which of two same-name entries wins is undefined, and a reader that
+        // keeps one is silently picking between two claims about one immutable
+        // record -- the divergence ADR-0873 clause 6 forbids ("no coverage at
+        // all, from every reader, under either ordering"). The defect belongs
+        // to the name, so it is reported before the entry's own validity is
+        // consulted: an individually valid entry beside a duplicate of itself
+        // is still no coverage.
+        let duplicated = occurrences.get(entry.name.as_str()).is_some_and(|n| *n > 1);
+        let reason = if duplicated {
             DeclaredStatDefect::DuplicateName(entry.name.clone())
         } else {
             match decode(entry) {
@@ -292,6 +337,7 @@ fn decode_all_against_rows(
             reason,
         });
     }
+    record_dropped(dropped.len());
     ValidatedDeclaredStats { covered, dropped }
 }
 
@@ -738,35 +784,48 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_column_entries_keep_only_the_first() {
-        // Both orderings of the same duplicate pair. A resolution that keeps
-        // whichever entry it prefers (widest range, highest null count, last
-        // seen) satisfies one ordering and fails the other; only first-wins
-        // satisfies both.
+    fn duplicate_column_entries_all_drop() {
+        // Both orderings of the same duplicate pair, which is what makes this
+        // test able to fail: any pick-one resolution (first-wins, last-wins,
+        // widest range, highest null count) satisfies whichever ordering puts
+        // its pick where the assertion looks, so a single ordering cannot
+        // distinguish "no coverage" from "a pick that happens to match".
+        // ADR-0873 clause 6 fixes the agreed answer as no coverage at all.
         let narrow = i64_stat("EventDate", 1, 2, 0);
         let wide = i64_stat("EventDate", 100, 200, 5);
         for (first, second) in [(&narrow, &wide), (&wide, &narrow)] {
             let entries = vec![encode(first), encode(second)];
             let read = decode_all(&entries);
-            // The exact surviving entry, not just its name or its count.
-            assert_eq!(read.covered().to_vec(), vec![first.clone()]);
-            assert_eq!(read.dropped().len(), 1);
-            // The exact dropped index, which the defect counter attributes by.
+            assert!(
+                read.covered().is_empty(),
+                "a duplicated name grants no coverage at all"
+            );
+            assert_eq!(read.column("EventDate"), None);
+            // BOTH occurrences are dropped, at their exact indices, which is
+            // what the defect counter attributes by.
             assert_eq!(
-                read.dropped()[0],
-                DroppedStatEntry {
-                    index: 1,
-                    name: "EventDate".to_string(),
-                    reason: DeclaredStatDefect::DuplicateName("EventDate".to_string()),
-                }
+                read.dropped().to_vec(),
+                vec![
+                    DroppedStatEntry {
+                        index: 0,
+                        name: "EventDate".to_string(),
+                        reason: DeclaredStatDefect::DuplicateName("EventDate".to_string()),
+                    },
+                    DroppedStatEntry {
+                        index: 1,
+                        name: "EventDate".to_string(),
+                        reason: DeclaredStatDefect::DuplicateName("EventDate".to_string()),
+                    },
+                ]
             );
         }
     }
 
     #[test]
     fn duplicates_do_not_disturb_the_order_of_the_entries_around_them() {
-        // Order is record order for both lists, and a duplicate drops out of
-        // the middle without reordering what follows it.
+        // Order is record order for both lists, and a duplicated name drops
+        // out entirely -- every occurrence of it -- without reordering the
+        // singly-named entries around it.
         let entries = vec![
             encode(&i64_stat("Aaa", 1, 2, 0)),
             encode(&i64_stat("Bbb", 3, 4, 0)),
@@ -775,20 +834,13 @@ mod tests {
             encode(&i64_stat("Bbb", 9, 10, 0)),
         ];
         let read = decode_all(&entries);
-        assert_eq!(
-            read.covered().to_vec(),
-            vec![
-                i64_stat("Aaa", 1, 2, 0),
-                i64_stat("Bbb", 3, 4, 0),
-                i64_stat("Ccc", 7, 8, 0),
-            ]
-        );
+        assert_eq!(read.covered().to_vec(), vec![i64_stat("Ccc", 7, 8, 0)]);
         assert_eq!(
             read.dropped()
                 .iter()
                 .map(|d| (d.index, d.name.as_str()))
                 .collect::<Vec<_>>(),
-            vec![(2, "Aaa"), (4, "Bbb")]
+            vec![(0, "Aaa"), (1, "Bbb"), (2, "Aaa"), (4, "Bbb")]
         );
     }
 
@@ -1035,16 +1087,17 @@ mod tests {
     }
 
     #[test]
-    fn an_invalid_first_duplicate_never_lets_a_later_one_gain_coverage() {
-        // A name is claimed by its FIRST occurrence in record order, valid or
-        // not: which of two same-name entries wins is undefined (the
-        // DuplicateName clause), so the column stays uncovered even when the
-        // first occurrence was dropped for a defect of its own and the later
-        // occurrence is individually valid. Before the reserve-first fix the
-        // later entry entered `covered`.
+    fn an_invalid_duplicate_never_lets_its_twin_gain_coverage() {
+        // A duplicated name grants no coverage in any occurrence (ADR-0873
+        // clause 6), so an individually valid entry stays uncovered when
+        // another entry claims its name -- even one dropped for a defect of
+        // its own. The name is the conviction boundary, not the entry, so both
+        // occurrences report DuplicateName rather than the first reporting its
+        // own defect: the reader never got far enough to judge either entry on
+        // its merits.
         let entries = vec![
-            // Index 0: row-count defect (extrema present over an all-NULL
-            // column) -- dropped for its own reason, but it still claims "d".
+            // Index 0: individually defective too (extrema present over an
+            // all-NULL column), and it claims "d".
             encode(&i64_stat("d", 1, 9, 7)),
             // Index 1: individually valid, same name -- must NOT be covered.
             encode(&i64_stat("d", 1, 9, 3)),
@@ -1056,17 +1109,17 @@ mod tests {
         assert_eq!(read.column("d"), None);
         assert_eq!(read.column("ok").map(|s| s.name()), Some("ok"));
         assert_eq!(read.dropped().len(), 2);
-        assert_eq!(read.dropped()[0].index, 0);
-        assert!(matches!(
-            read.dropped()[0].reason,
-            DeclaredStatDefect::Invalid(DeclaredStatError::PresenceMismatch { .. })
-                | DeclaredStatDefect::PresenceDisagreesWithNullCount { .. }
-        ));
-        assert_eq!(read.dropped()[1].index, 1);
-        assert!(matches!(
-            read.dropped()[1].reason,
-            DeclaredStatDefect::DuplicateName(ref n) if n == "d"
-        ));
+        for (slot, index) in [(0usize, 0usize), (1, 1)] {
+            assert_eq!(read.dropped()[slot].index, index);
+            assert!(
+                matches!(
+                    read.dropped()[slot].reason,
+                    DeclaredStatDefect::DuplicateName(ref n) if n == "d"
+                ),
+                "got {:?}",
+                read.dropped()[slot].reason
+            );
+        }
     }
 
     #[test]
