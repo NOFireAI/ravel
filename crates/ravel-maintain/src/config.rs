@@ -53,8 +53,9 @@ use uuid::Uuid;
 ///   decode-side buffers. This is the quantity these merges bound: at most
 ///   one raw block plus one decoded block per input, so it is
 ///   `O(input_count * block_size)` and does NOT scale with stream/trace size.
-/// - [`Self::peak_total_bytes`]: `fetched + decoded + writer`, adding the
-///   in-progress part's writer buffer. The writer term tracks the memory split
+/// - [`Self::peak_total_bytes`]: `fetched + decoded + writer + probe`, adding
+///   the in-progress part's writer buffer and the in-flight exact-encode probe.
+///   The writer term tracks the memory split
 ///   target `l1_part_memory_target_bytes` (a part is flushed once its
 ///   record-heap estimate reaches that target) and is the unavoidable
 ///   content-addressing cost the ADR calls out: a part's key does not exist
@@ -64,13 +65,15 @@ use uuid::Uuid;
 ///   overshoots by up to one whole trace
 ///   ([`CompactorConfig::l1_part_memory_target_bytes`]). The RLOG merge may
 ///   also close a part earlier on the stored-size target `max_l1_part_bytes`
-///   (issue #872), which only lowers this term. Testing that target does add a
-///   short-lived, uncharged transient: the exact-encode probe encodes a CLONE
-///   of the buffered records, so while it runs the resident set briefly holds a
-///   second copy of the part's row heap plus its encoded object bytes (bounded
-///   by `2 * writer + max_l1_part_bytes`, released as the probe returns). It
-///   only runs once the payload proxy reaches the stored target, so never at the
-///   shipped defaults where the memory target binds first.
+///   (issue #872), which only lowers the writer term but adds the probe term:
+///   the exact-encode probe encodes a CLONE of the buffered records, so while
+///   it runs the resident set holds a second copy of the part's row heap plus
+///   the encoded object those records produce. That is charged, not assumed
+///   away ([`Self::set_probe_bytes`]), so a probing run's high-water is roughly
+///   `2 * writer + one part's object bytes` rather than the `writer` a run
+///   without probes reports. The probe only runs once the payload proxy reaches
+///   the stored target, so this term stays zero at the shipped defaults, where
+///   the memory target binds first.
 ///
 /// # Phase-attributed peaks (issue #977)
 ///
@@ -134,9 +137,15 @@ struct MergeMemoryInner {
     peak_decoded: AtomicU64,
     /// The in-progress part's accumulated record-byte estimate in the writer.
     writer: AtomicU64,
+    /// What an in-flight exact-encode probe holds on top of the writer buffer:
+    /// the clone of the part's records plus, once the encode returns, the
+    /// encoded object bytes. Zero whenever no probe is running.
+    probe: AtomicU64,
+    /// High-water of `probe` alone.
+    peak_probe: AtomicU64,
     /// High-water of `fetched + decoded`.
     peak_transient: AtomicU64,
-    /// High-water of `fetched + decoded + writer`.
+    /// High-water of `fetched + decoded + writer + probe`.
     peak_total: AtomicU64,
     /// Parts closed because the decoded record-heap estimate reached
     /// `l1_part_memory_target_bytes` (the memory split target fired).
@@ -253,18 +262,43 @@ impl MergeMemoryTracker {
         self.note();
     }
 
+    /// Set what the in-flight exact-encode probe holds resident, or 0 once it
+    /// has returned and its buffers are dropped.
+    ///
+    /// The RLOG stored-size target measures a part by encoding a CLONE of its
+    /// buffered records ([`crate::rlog::PartBuilder::encode_clone`]), so for the
+    /// duration of that encode the run holds a second copy of the part's record
+    /// heap and then the encoded object it produces. The merge charges the clone
+    /// before the encode and the clone plus the object as it returns, so
+    /// [`Self::peak_total_bytes`] covers the probe's residency instead of
+    /// under-reporting the peak of every run where a probe fires. Mixed byte
+    /// kinds, like [`Self::peak_total_bytes`] itself: decoded heap for the clone,
+    /// encoded object bytes for the object.
+    pub fn set_probe_bytes(&self, bytes: u64) {
+        self.inner.probe.store(bytes, Ordering::Relaxed);
+        self.note();
+    }
+
+    /// High-water of the exact-encode probe term alone (cloned record heap plus
+    /// the encoded object, mixed kinds). Zero for a run that never probed.
+    pub fn peak_probe_bytes(&self) -> u64 {
+        self.inner.peak_probe.load(Ordering::Relaxed)
+    }
+
     /// Recompute both high-water marks from the live counters.
     fn note(&self) {
         let fetched = self.inner.fetched.load(Ordering::Relaxed);
         let decoded = self.inner.decoded.load(Ordering::Relaxed);
         let writer = self.inner.writer.load(Ordering::Relaxed);
+        let probe = self.inner.probe.load(Ordering::Relaxed);
         let transient = fetched.saturating_add(decoded);
-        let total = transient.saturating_add(writer);
+        let total = transient.saturating_add(writer).saturating_add(probe);
         self.inner
             .peak_transient
             .fetch_max(transient, Ordering::Relaxed);
         self.inner.peak_total.fetch_max(total, Ordering::Relaxed);
         self.inner.peak_writer.fetch_max(writer, Ordering::Relaxed);
+        self.inner.peak_probe.fetch_max(probe, Ordering::Relaxed);
         self.inner
             .peak_decoded
             .fetch_max(decoded, Ordering::Relaxed);
@@ -350,8 +384,9 @@ impl MergeMemoryTracker {
     }
 
     /// High-water of the merge's total residency
-    /// (`fetched + decoded + writer`), the decode-side buffers plus the
-    /// in-progress part's writer buffer.
+    /// (`fetched + decoded + writer + probe`), the decode-side buffers plus the
+    /// in-progress part's writer buffer plus whatever an in-flight exact-encode
+    /// probe holds ([`Self::set_probe_bytes`]).
     pub fn peak_total_bytes(&self) -> u64 {
         self.inner.peak_total.load(Ordering::Relaxed)
     }
@@ -392,6 +427,8 @@ impl MergeMemoryTracker {
             &self.inner.fetched,
             &self.inner.decoded,
             &self.inner.writer,
+            &self.inner.probe,
+            &self.inner.peak_probe,
             &self.inner.peak_transient,
             &self.inner.peak_decoded,
             &self.inner.peak_total,
@@ -757,18 +794,18 @@ pub struct CompactorConfig {
     ///   payload proxy ([`crate::rlog::estimate_stored_record`] per record plus
     ///   one STREAM_DIR entry per distinct stream) only to SCHEDULE an
     ///   exact-encode probe, and closes the part on the probe's real byte count.
-    ///   Overshoot is bounded by how the probes are spaced: they sit at least a
-    ///   4 KiB floor apart on the proxy axis (`PROBE_MIN_STEP_BYTES` in
-    ///   `rlog.rs`), and the next one is never aimed past the proxy value where
-    ///   the part would reach this target at the highest encoded-per-proxy rate
-    ///   any interval of it has measured so far (never assumed below 1:1). So a
-    ///   part closes at this target plus at most that floor plus the last
-    ///   record's proxy charge. The rate model inside that cap is an ESTIMATE,
-    ///   not a bound: it only shortens the step, when the proxy is
-    ///   undercharging. The band holds while the records still to come encode no
-    ///   denser per proxy byte than the densest interval already measured; a
-    ///   section the proxy does not model (POSTINGS, SKIP_IDX, PAGE_DIR) growing
-    ///   faster than the payload it does model can carry a part past it.
+    ///   Overshoot is bounded by how the probes are spaced: the next probe is
+    ///   aimed the remaining encoded deficit further along the proxy axis, or a
+    ///   4 KiB floor (`PROBE_MIN_STEP_BYTES` in `rlog.rs`) if that deficit is
+    ///   smaller. The step therefore assumes only that over the interval that
+    ///   closes the part, encoded bytes grow at most 1:1 with the uncompressed
+    ///   payload proxy, and the enforced band is `[target, target + 4 KiB + one
+    ///   record's proxy charge]`. That assumption holds for the sections the
+    ///   proxy models -- the payload columns and STREAM_DIR, where the proxy
+    ///   counts uncompressed bytes and the object stores compressed ones -- and
+    ///   is the disclosed condition on the band: a section the proxy does not
+    ///   model (POSTINGS, SKIP_IDX, PAGE_DIR) growing faster than the payload it
+    ///   does model can carry a part past it.
     ///
     /// Named for the bytes it measures: it governs object geometry (object count
     /// and per-object stored size), which is what the historical

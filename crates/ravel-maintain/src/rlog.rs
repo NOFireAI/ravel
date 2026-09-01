@@ -917,13 +917,27 @@ impl PartSink<'_> {
                 // measures the bytes the knob is named for. `encode_clone`
                 // encodes a clone of the buffered records, so the builder can
                 // keep accumulating when the part is not yet full.
-                let (object, stats) = part.encode_clone(self.input_set_hash, self.part_index)?;
                 if let Some(t) = self.tracker {
+                    // The clone is a second live copy of the part's record heap,
+                    // so it belongs in the run's peak rather than being treated
+                    // as free; the object bytes join it below, once their size
+                    // is known.
+                    t.set_probe_bytes(part.estimate);
+                }
+                let probe = part.encode_clone(self.input_set_hash, self.part_index);
+                if let Some(t) = self.tracker {
+                    if let Ok((object, _)) = probe.as_ref() {
+                        t.set_probe_bytes(part.estimate.saturating_add(object.len() as u64));
+                    }
+                    // Cleared on the error path too, so a failed encode does not
+                    // leave the term charged for the rest of the run.
+                    t.set_probe_bytes(0);
                     // Counted whether or not it closes the part: this is the
                     // O(part) encode the stored target costs, and "no probe runs
                     // at the shipped defaults" is a claim a test asserts on.
                     t.note_probe_run();
                 }
+                let (object, stats) = probe?;
                 let encoded = object.len() as u64;
                 if encoded >= self.config.max_l1_part_bytes {
                     stored_close = Some((object, stats));
@@ -1011,14 +1025,15 @@ impl PartSink<'_> {
 /// The floor on how far apart two stored-target probes may sit on the payload
 /// proxy axis. A probe encodes the whole part (an O(part) cost), so the
 /// scheduler in [`PartBuilder::schedule_next_probe`] aims the next one near the
-/// target rather than running one per record; this floor keeps a momentarily
-/// flat encoded/proxy rate from scheduling the next probe in the past.
+/// target rather than running one per record; this floor keeps a deficit of a
+/// few bytes from turning the last stretch before a close into an encode per
+/// record.
 ///
 /// It is also the width of the stored target's overshoot band. The scheduler
-/// never aims a probe past the proxy value where the part would reach the target
-/// at the densest encoded-per-proxy rate it has already measured (and never
-/// assumes a rate below 1:1), so between two probes the encoded size can grow by
-/// at most the remaining deficit plus this floor plus the last record's proxy
+/// aims the next probe the remaining encoded deficit further along the proxy
+/// axis, or this floor if the deficit is smaller, so as long as encoded bytes
+/// grow at most 1:1 with the proxy over the closing interval the encoded size
+/// can pass the target by at most this floor plus the crossing record's proxy
 /// charge -- see [`PartBuilder::schedule_next_probe`] for the derivation and for
 /// what the band is conditional on.
 const PROBE_MIN_STEP_BYTES: u64 = 4096;
@@ -1061,20 +1076,6 @@ struct PartBuilder {
     /// past a probe that found the part still short of the target, so probing is
     /// a few encodes per part, not one per record.
     next_probe_stored: u64,
-    /// `stored_estimate` as of the last probe (0 before the first): the left edge
-    /// of the interval [`Self::schedule_next_probe`] measures the MARGINAL
-    /// encoded-per-proxy rate over. A cumulative rate (encoded/proxy since the
-    /// part opened) is the wrong estimator for a part whose compressibility
-    /// changes along the record sequence, which is the case that overshoots.
-    last_probe_stored: u64,
-    /// Encoded object bytes the last probe measured (0 before the first), the
-    /// other end of that interval.
-    last_probe_encoded: u64,
-    /// The densest encoded-per-proxy rate any probe interval of this part has
-    /// shown. The scheduler assumes the next interval runs at least this dense
-    /// (and never below 1:1), which is what bounds the overshoot; see
-    /// [`Self::schedule_next_probe`].
-    max_probe_rate: f64,
     /// The streams whose STREAM_DIR entry this part has already been charged for
     /// in `stored_estimate`. A set rather than a "did the stream change" check so
     /// the charge is once per distinct stream whatever order records arrive in;
@@ -1095,9 +1096,6 @@ impl PartBuilder {
             estimate: 0,
             stored_estimate: 0,
             next_probe_stored: 0,
-            last_probe_stored: 0,
-            last_probe_encoded: 0,
-            max_probe_rate: 1.0,
             charged_streams: BTreeSet::new(),
             min_stream: None,
             max_stream: None,
@@ -1190,59 +1188,55 @@ impl PartBuilder {
     /// short of the target, and bound how far past the target the part can then
     /// close.
     ///
-    /// The step is the proxy distance to the next probe. Two things set it:
+    /// The step is the proxy distance to the next probe, and it is the remaining
+    /// encoded deficit `target - encoded_now` spent along the PROXY axis, floored
+    /// at [`PROBE_MIN_STEP_BYTES`] so a part whose deficit is a handful of bytes
+    /// does not encode once per record.
     ///
-    /// - a CAP, which is what bounds the overshoot. The step never exceeds the
-    ///   deficit divided by [`Self::max_probe_rate`], the densest
-    ///   encoded-per-proxy rate any interval of this part has shown, held at 1:1
-    ///   or above. So if the records over the next interval encode at that rate,
-    ///   the part lands exactly on the target; they have to encode DENSER than
-    ///   every interval so far to go past it.
-    /// - the [`PROBE_MIN_STEP_BYTES`] floor, so a part whose deficit is a
-    ///   handful of bytes does not encode once per record.
+    /// Spending an encoded deficit as a proxy distance is the whole bound, and
+    /// the assumption it rests on is 1:1: over the interval that closes the
+    /// part, encoded bytes grow by at most as much as the uncompressed payload
+    /// proxy does. Under that assumption a probe that found `encoded_now <
+    /// target` cannot be followed by a close more than `step` of encoded growth
+    /// later, and the next probe fires at the first record on or after
+    /// `stored_estimate + step`, so the proxy -- and with it the encoded size --
+    /// advances by at most `step` plus that record's own charge. With
+    /// `step = deficit` that lands the close at `target` plus one record's
+    /// charge; with the floor binding (`deficit < PROBE_MIN_STEP_BYTES`) at
+    /// `target + PROBE_MIN_STEP_BYTES` plus one record's charge. So the enforced
+    /// band is
+    /// `[target, target + PROBE_MIN_STEP_BYTES + one record's proxy charge]`,
+    /// and the same arithmetic bounds a trailing part (its records simply run
+    /// out before the next probe).
     ///
-    /// The band that follows: a probe found `encoded_now < target`, the next one
-    /// fires at the first record on or after `stored_estimate + step`, so the
-    /// proxy advances by at most `step` plus that record's own charge, and the
-    /// encoded size by at most that interval's rate times that. While that rate
-    /// stays at or below [`Self::max_probe_rate`] the close lands in
-    /// `[target, target + PROBE_MIN_STEP_BYTES + one record's proxy charge]`, and
-    /// the same arithmetic bounds a trailing part (its records simply run out
-    /// before the next probe). It is conditional on that rate assumption, which
-    /// holds for the sections the proxy models -- the payload columns and
-    /// STREAM_DIR, where the proxy counts uncompressed bytes and the object
-    /// stores compressed ones -- and not on the ones it does not (POSTINGS,
-    /// SKIP_IDX, PAGE_DIR). It is not the "one record" tightness the memory
-    /// split target has, and the rate model inside the cap is an estimate, never
-    /// a guarantee: without the cap, a compressible prefix followed by an
-    /// incompressible suffix closes tens of times past the target.
+    /// The 1:1 assumption is the disclosed condition, not a proof: it holds for
+    /// the sections the proxy models -- the payload columns and STREAM_DIR, where
+    /// the proxy counts uncompressed bytes and the object stores compressed ones,
+    /// so encoded growth per proxy byte is at most 1 and usually far below it --
+    /// and not for the sections it does not model (POSTINGS, SKIP_IDX,
+    /// PAGE_DIR), which can grow faster than the payload they index and carry a
+    /// part past the band. It is also not the "one record" tightness the memory
+    /// split target has.
     ///
-    /// The cost of the cap is probes: a part converges on the target from below
-    /// in steps of the remaining deficit, so a stream whose payload compresses
-    /// `r`-fold takes on the order of `r` encodes per part rather than the two
-    /// or three an uncapped rate model would take. That cost is only paid when
-    /// an operator lowers `max_l1_part_bytes` below the memory split target; at
-    /// the shipped defaults no probe runs at all.
+    /// The cost is probes, and it is superlinear in compressibility rather than
+    /// the two or three encodes a per-part rate model would spend. A payload
+    /// that compresses `r`-fold turns a step of `deficit` proxy bytes into only
+    /// `deficit / r` encoded bytes, so each probe closes a `1 / r` fraction of
+    /// the deficit and the deficit decays GEOMETRICALLY by `(1 - 1 / r)` per
+    /// probe. Starting from the deficit at the first probe,
+    /// `d0 = target * (1 - 1 / r)` (the proxy reaches `target` when the object is
+    /// near `target / r`), reaching the floor takes
+    /// `ln(d0 / PROBE_MIN_STEP_BYTES) / ln(1 / (1 - 1 / r))` probes, which is
+    /// about `r * ln(d0 / PROBE_MIN_STEP_BYTES)`, and the tail below the floor
+    /// takes about `r` more (each floored step closes
+    /// `PROBE_MIN_STEP_BYTES / r`). So probes per part are about
+    /// `r * ln(d0 / PROBE_MIN_STEP_BYTES) + r`, and both stored-target geometry
+    /// tests pin the exact count their fixture produces against that formula.
+    /// The cost is only paid when an operator lowers `max_l1_part_bytes` below
+    /// the memory split target; at the shipped defaults no probe runs at all.
     fn schedule_next_probe(&mut self, encoded_now: u64, target: u64) {
         let deficit = target.saturating_sub(encoded_now);
-        // The rate over THIS interval, not since the part opened. Both ends are
-        // measured quantities: `d_proxy` is at least PROBE_MIN_STEP_BYTES after
-        // the first probe and at least `target` at it, so the `max(1)` guards a
-        // degenerate zero rather than being a live case.
-        let d_proxy = self
-            .stored_estimate
-            .saturating_sub(self.last_probe_stored)
-            .max(1);
-        let d_encoded = encoded_now.saturating_sub(self.last_probe_encoded);
-        let marginal = d_encoded as f64 / d_proxy as f64;
-        if marginal > self.max_probe_rate {
-            self.max_probe_rate = marginal;
-        }
-        // `max_probe_rate` starts at 1.0 and only grows, so `step <= deficit`.
-        let step = ((deficit as f64) / self.max_probe_rate).ceil() as u64;
-        let step = step.max(PROBE_MIN_STEP_BYTES);
-        self.last_probe_stored = self.stored_estimate;
-        self.last_probe_encoded = encoded_now;
+        let step = deficit.max(PROBE_MIN_STEP_BYTES);
         self.next_probe_stored = self.stored_estimate.saturating_add(step);
     }
 }
@@ -4027,15 +4021,42 @@ mod tests {
     /// the scheduler's guarantee rather than this fixture's luck. A part closes
     /// the moment a probe shows its object reaching `STORED_TARGET`. Probes sit
     /// at least [`PROBE_MIN_STEP_BYTES`] of payload proxy apart, and
-    /// [`PartBuilder::schedule_next_probe`] never aims one further ahead than the
-    /// remaining deficit at the densest encoded-per-proxy rate the part has
-    /// measured (never assumed below 1:1), so between two probes the encoded size
-    /// grows by at most that deficit plus the floor plus the charge of the record
-    /// that crosses. Every part therefore sits in `[STORED_TARGET, STORED_TARGET
-    /// + PROBE_MIN_STEP_BYTES + one record's proxy charge]`. The trailing part
-    /// loses only the lower bound (its records run out before the next probe
-    /// rather than a probe closing it); the same upper bound covers it by the
-    /// same arithmetic, so it is asserted, not excused.
+    /// [`PartBuilder::schedule_next_probe`] aims the next one exactly the
+    /// remaining encoded deficit further along the proxy axis, so while encoded
+    /// bytes grow at most 1:1 with the proxy the encoded size grows between two
+    /// probes by at most that deficit (or the floor, when it is larger) plus the
+    /// charge of the record that crosses. Every part therefore sits in
+    /// `[STORED_TARGET, STORED_TARGET + PROBE_MIN_STEP_BYTES + one record's proxy
+    /// charge]`. The trailing part loses only the lower bound (its records run
+    /// out before the next probe rather than a probe closing it); the same upper
+    /// bound covers it by the same arithmetic, so it is asserted, not excused.
+    ///
+    /// The probe count is pinned exactly, and the pin is checked against the
+    /// scheduler's geometric cost model rather than merely recorded. Spending an
+    /// encoded deficit as a PROXY distance closes only a `1 / r` fraction of it
+    /// on a payload that compresses `r`-fold, so the deficit decays by
+    /// `(1 - 1 / r)` per probe: from the deficit at the crossing probe,
+    /// `d0 = STORED_TARGET * (1 - 1 / r)`, the ladder takes
+    /// `ln(d0 / PROBE_MIN_STEP_BYTES) / ln(r / (r - 1))` probes to reach the
+    /// floor, about `r` more below it (each floored step closes
+    /// `PROBE_MIN_STEP_BYTES / r`), plus the crossing probe itself -- which is
+    /// `r * ln(d0 / PROBE_MIN_STEP_BYTES) + r` for large `r`.
+    ///
+    /// This fixture measures `r` = 7.08 (`ratio` below, printed by the run), so
+    /// `d0` = 14_069, the ladder is `ln(14069 / 4096) / ln(7.08 / 6.08)` = 8.1
+    /// probes, the floor tail is 7.1, and with the crossing probe that is 16.2
+    /// per part. 11 of the 12 parts close on the target (178 probes) and the
+    /// trailing part runs its own partial ladder without ever closing (its proxy
+    /// passes the target, its records run out), which accounts for the remaining
+    /// 13 of the 191 pinned below. The model treats `r` as constant along a part
+    /// and ignores that a floored step overshoots, so a few percent is the
+    /// expected agreement; a change that made probing linear in the deficit, or
+    /// per-record, would miss it by an order of magnitude. Demonstrated red by
+    /// the rate-model scheduler named in
+    /// [`stored_target_overshoot_is_bounded_when_compressibility_collapses`]
+    /// (an uncapped cumulative-rate step in place of
+    /// `let step = deficit.max(PROBE_MIN_STEP_BYTES);`), under which this fixture
+    /// runs 34 probes, not 191.
     ///
     /// Demonstrated red against the old proxy-as-close design: replace the probe
     /// block in `PartSink::push` with `over_stored = part.stored_estimate >=
@@ -4123,10 +4144,24 @@ mod tests {
         let band_top = STORED_TARGET + PROBE_MIN_STEP_BYTES + max_record_charge;
         println!(
             "[geom:rlog #872] target={STORED_TARGET}B parts={} probes={} band_top={band_top}B \
-             sizes={:?}",
+             ratio={ratio:.2} sizes={:?}",
             parts.len(),
             tracker.probes_run(),
             rec.parts.iter().map(|p| p.object_size).collect::<Vec<_>>()
+        );
+        // The probe cost, pinned exactly (the corpus is deterministic) and cross
+        // checked against the geometric model in the doc comment above:
+        // r = 7.08, d0 = STORED_TARGET * (1 - 1/r) = 14_069, ladder
+        // ln(14069/4096) / ln(7.08/6.08) = 8.1, floor tail r = 7.1, crossing
+        // probe 1, so 16.2 per part; 11 closing parts = 178, plus the trailing
+        // part's partial ladder = 191 pinned.
+        assert_eq!(
+            tracker.probes_run(),
+            191,
+            "the exact-encode probe count for this fixture is deterministic; the \
+             geometric model predicts about 16.2 probes per part for r={ratio:.2} \
+             over {} parts",
+            parts.len()
         );
         let last = parts.len() - 1;
         for (i, p) in rec.parts.iter().enumerate() {
@@ -4217,26 +4252,29 @@ mod tests {
     /// to be worth running; it puts no ceiling on the object that probe then
     /// measures. Fitted on a compressible prefix, the step it asks for is tens of
     /// times the remaining deficit, and an incompressible suffix inside that step
-    /// closes a part many times over the target. What bounds
-    /// it is the cap in [`PartBuilder::schedule_next_probe`]: the step never
-    /// exceeds the remaining deficit at the densest encoded-per-proxy rate the
-    /// part has measured, and never assumes a rate below 1:1, so the encoded size
-    /// cannot pass the target by more than [`PROBE_MIN_STEP_BYTES`] plus the
-    /// proxy charge of the record that crosses -- the same band the uniform
-    /// fixture asserts, now over a corpus that breaks the rate model.
+    /// closes a part many times over the target. What bounds it is that
+    /// [`PartBuilder::schedule_next_probe`] spends the remaining ENCODED deficit
+    /// as a PROXY distance and models no rate at all: the step assumes only that
+    /// encoded bytes grow at most 1:1 with the proxy over the closing interval,
+    /// so the encoded size cannot pass the target by more than
+    /// [`PROBE_MIN_STEP_BYTES`] plus the proxy charge of the record that crosses
+    /// -- the same band the uniform fixture asserts, now over a corpus on which
+    /// any fitted rate is wrong.
     ///
-    /// Demonstrated red against the uncapped scheduler this replaced: restore the
-    /// cumulative rate and the uncapped step in `schedule_next_probe` --
+    /// Demonstrated red against the uncapped rate-model scheduler this replaced:
+    /// substitute an uncapped cumulative-rate step in `schedule_next_probe` --
     /// `let rate = (encoded_now as f64 / self.stored_estimate.max(1) as f64)
-    /// .max(f64::MIN_POSITIVE); let step = ((deficit as f64) / rate).ceil() as
-    /// u64;` (dropping the `max_probe_rate` update, whose floor of 1.0 is the
-    /// cap) -- and this fixture emits 29 parts whose first object is 150_646
-    /// bytes, 9.2x the 16 KiB target, failing the band assertion below at part 0.
-    /// The remaining parts land between 16_853 and 18_893 bytes, inside the band,
-    /// which is why the assertion covers every part and not just the largest. The
-    /// uniformly compressible corpus of
-    /// [`stored_target_closes_parts_on_actual_encoded_object_bytes`] passes under
-    /// both schedulers, which is exactly why this fixture exists.
+    /// .max(f64::MIN_POSITIVE); let step = (((deficit as f64) / rate).ceil() as
+    /// u64).max(PROBE_MIN_STEP_BYTES);` in place of
+    /// `let step = deficit.max(PROBE_MIN_STEP_BYTES);` -- and the probe pin below
+    /// fails first at 85 against 124, then, with the pin relaxed to 85, this
+    /// fixture emits 29 parts whose first object is 150_646 bytes, 9.2x the
+    /// 16 KiB target, failing the band assertion at part 0. The remaining parts
+    /// land between 16_853 and 18_893 bytes, inside the band, which is why the
+    /// assertion covers every part and not just the largest. The uniformly
+    /// compressible corpus of
+    /// [`stored_target_closes_parts_on_actual_encoded_object_bytes`] passes the
+    /// band under both schedulers, which is exactly why this fixture exists.
     #[tokio::test]
     async fn stored_target_overshoot_is_bounded_when_compressibility_collapses() {
         const PER_INPUT: i64 = 2000;
@@ -4314,9 +4352,22 @@ mod tests {
             parts.len() - 1,
             "every closed part must have closed on the stored target"
         );
-        assert!(
-            tracker.probes_run() > 0,
-            "the fixture must actually exercise the probe scheduler"
+        // The probe cost, pinned exactly rather than as `> 0`: the corpus is
+        // deterministic, so the geometric model is checkable against it. Almost
+        // every part of this fixture lies past the collapse, where
+        // r = 1 / post_rate = 1.59, so d0 = STORED_TARGET * (1 - 1/r) = 6_072,
+        // the ladder to the floor is ln(6072/4096) / ln(1.59/0.59) = 0.4 probes,
+        // the floor tail is r = 1.6, and the crossing probe makes 3.0 per part:
+        // 40 closing parts = 120, plus the first part's longer ladder across the
+        // compressible prefix (r = 1/pre_rate = 46 there) = 124 pinned.
+        assert_eq!(
+            tracker.probes_run(),
+            124,
+            "the exact-encode probe count for this fixture is deterministic; the \
+             geometric model predicts about 3.0 probes per part for \
+             r={:.2} past the collapse, over {} parts",
+            1.0 / post_rate,
+            parts.len()
         );
 
         // The band, identical to the uniform fixture's because it is the
@@ -4366,6 +4417,125 @@ mod tests {
             split_rows.len() as u64,
             total,
             "every record survives the split exactly once"
+        );
+    }
+
+    /// ADR-0979 / issue #872: the exact-encode probe's residency is CHARGED to
+    /// the tracker, so a stored-target-bound run's peak is the real peak instead
+    /// of the writer buffer alone.
+    ///
+    /// [`PartBuilder::encode_clone`] clones the part's buffered records and
+    /// encodes the clone, so at the instant the probe returns the run holds the
+    /// writer's records, a second copy of them inside the writer the probe built,
+    /// and the encoded object those records produced. That is roughly
+    /// `2 * W + object bytes` where `W` is the part's record-heap estimate at the
+    /// probe, not the `W` a probe-free run reports, and
+    /// [`MergeMemoryTracker::peak_total_bytes`] has to cover it for a host to be
+    /// sized from it.
+    ///
+    /// Asserted proportionally against the tracker's own `peak_writer_bytes`,
+    /// which is `W` measured at the same close, so the claim needs no
+    /// hand-computed heap figure: the tracked peak must be at least 2x it (the
+    /// clone), and is expected under 3x it (the clone plus one object, an object
+    /// being a small fraction of the heap on this fixture -- the printed figures
+    /// give the exact multiple). The probe term alone is asserted to carry at
+    /// least the clone and at most the clone plus one band-width object.
+    ///
+    /// Demonstrated red by removing the charge: delete the two
+    /// `t.set_probe_bytes(part.estimate...)` calls in `PartSink::push` (keeping
+    /// the `t.set_probe_bytes(0)` and the counter), and `peak_probe_bytes()`
+    /// reads 0 -- failing the clone assertion below -- while `peak_total_bytes()`
+    /// falls from 486_654 to 252_714 against a `peak_writer_bytes()` of 217_189,
+    /// a 1.16x multiple that also misses the 2x-to-3x band.
+    #[tokio::test]
+    async fn probe_residency_is_charged_to_the_tracked_peak() {
+        const PER_INPUT: i64 = 1200;
+        const INPUTS: i64 = 2;
+        const STORED_TARGET: u64 = 16 * 1024;
+
+        let store = Arc::new(MemoryStore::new());
+        for j in 0..INPUTS {
+            let recs: Vec<LogRecord> = (0..PER_INPUT)
+                .map(|i| ratio_record(i * INPUTS + j))
+                .collect();
+            // Small L0 blocks so the decode-side terms `peak_total_bytes` pools
+            // in stay a fraction of one part's heap, and the multiple below is
+            // about the writer and the probe rather than about cursors. Blocking
+            // changes nothing about the merged record sequence, so the split
+            // points and the probe count are the same as with default blocking.
+            seed_l0(
+                store.as_ref(),
+                Uuid::from_u128(j as u128 + 1),
+                j as u64 + 1,
+                &recs,
+                RlogConfig {
+                    block_target_records: 40,
+                    group_target_blocks: 1,
+                    ..RlogConfig::default()
+                },
+                &[],
+            )
+            .await;
+        }
+
+        let tracker = MergeMemoryTracker::new();
+        let config = CompactorConfig {
+            max_l1_part_bytes: STORED_TARGET,
+            merge_memory_tracker: Some(tracker.clone()),
+            ..CompactorConfig::default()
+        };
+        let clock = FixedClock::new(sealed_now_ns());
+        compact_bucket(store.as_ref(), &clock, &config, &bucket())
+            .await
+            .expect("compact");
+
+        let (_rec, parts) = read_output(store.as_ref()).await;
+        assert!(
+            parts.len() >= 3,
+            "the fixture must close several parts on the stored target, got {}",
+            parts.len()
+        );
+        let peak_total = tracker.peak_total_bytes();
+        let peak_writer = tracker.peak_writer_bytes();
+        let peak_probe = tracker.peak_probe_bytes();
+        let multiple = peak_total as f64 / peak_writer.max(1) as f64;
+        println!(
+            "[memory:rlog #872] parts={} probes={} peak_writer={peak_writer}B \
+             peak_probe={peak_probe}B peak_total={peak_total}B multiple={multiple:.2}x",
+            parts.len(),
+            tracker.probes_run()
+        );
+        // Deterministic corpus, so the probe count is pinned here too: r = 7.08
+        // as in `stored_target_closes_parts_on_actual_encoded_object_bytes`
+        // (same `ratio_record` fixture), 16.2 probes per part by the geometric
+        // model, 5 closing parts = 81 plus the trailing part's partial ladder =
+        // 89. Under the rate-model scheduler that test names it runs 16.
+        assert_eq!(
+            tracker.probes_run(),
+            89,
+            "the probe count is deterministic for this corpus: 16.2 per part by \
+             the geometric model over the {} closing parts",
+            parts.len() - 1
+        );
+        assert!(
+            peak_writer > 0,
+            "the run must have buffered records for the charge to mean anything"
+        );
+        assert!(
+            peak_probe >= peak_writer,
+            "the probe term must carry at least the cloned record heap: \
+             peak_probe={peak_probe} peak_writer={peak_writer}"
+        );
+        assert!(
+            peak_probe <= peak_writer + 2 * STORED_TARGET,
+            "the probe term must be one clone plus one object, not more: \
+             peak_probe={peak_probe} peak_writer={peak_writer}"
+        );
+        assert!(
+            (2.0..3.0).contains(&multiple),
+            "a probing run's tracked peak must cover the probe's second copy of \
+             the part heap: peak_total={peak_total} is {multiple:.2}x \
+             peak_writer={peak_writer}, expected 2x to 3x"
         );
     }
 
@@ -4453,6 +4623,11 @@ mod tests {
     /// reaches the 64 KiB target, no probe is ever scheduled, and the merge emits
     /// a single ~270 KiB object, failing the `object_size < 2 * STORED_TARGET`
     /// assertion.
+    ///
+    /// The probe count is pinned exactly rather than left printed, and it is the
+    /// scheduler's figure, not the charge's: under the rate-model scheduler named
+    /// in [`stored_target_overshoot_is_bounded_when_compressibility_collapses`]
+    /// this fixture runs 8 probes, not 15.
     #[tokio::test]
     async fn many_streams_charge_stream_dir_against_the_stored_target() {
         const STREAMS: u32 = 96;
@@ -4481,6 +4656,17 @@ mod tests {
             charge > per_record * 100,
             "fixture must be STREAM_DIR-dominated: charge {charge} vs record {per_record}"
         );
+        // The fixture's proxy-to-object ratio, measured over one part's worth of
+        // distinct streams, for the probe-count arithmetic below. The pads are
+        // pseudo-random alphanumerics, so `r` sits just above 1.
+        let sample: Vec<LogRecord> = (0..20).map(|s| fat_stream_record(s, 0)).collect();
+        let sample_proxy: u64 = sample.iter().map(estimate_stored_record).sum::<u64>()
+            + sample
+                .iter()
+                .map(|r| estimate_stored_stream(&r.stream_attrs))
+                .sum::<u64>();
+        let (_, sample_object) = proxy_and_object_bytes(&sample);
+        let ratio = sample_proxy as f64 / sample_object as f64;
 
         let tracker = MergeMemoryTracker::new();
         let config = CompactorConfig {
@@ -4512,6 +4698,28 @@ mod tests {
             tracker.stored_target_flushes() as usize,
             parts.len() - 1,
             "every closed part (all but the trailing one) closed on the stored target"
+        );
+        // Probes pinned exactly, not left unasserted: the corpus is
+        // deterministic, and the figure agrees with the scheduler's geometric
+        // cost model (see `PartBuilder::schedule_next_probe`). r = 1.48 measured
+        // above, d0 = STORED_TARGET * (1 - 1/r) = 21_257, ladder
+        // ln(21257/4096) / ln(1.48/0.48) = 1.5, floor tail r = 1.5, crossing
+        // probe 1, so 3.9 per part; the 4 closing parts predict 15.8 against 15
+        // measured, and the trailing part never probes (its 14_400-byte object
+        // leaves the proxy short of the 64 KiB target).
+        println!(
+            "[geom:rlog #872] many-streams target={STORED_TARGET}B parts={} probes={} \
+             ratio={ratio:.2} sizes={:?}",
+            parts.len(),
+            tracker.probes_run(),
+            rec.parts.iter().map(|p| p.object_size).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            tracker.probes_run(),
+            15,
+            "the exact-encode probe count for this fixture is deterministic; the \
+             geometric model predicts 15.8 for r={ratio:.2} over the {} closing parts",
+            parts.len() - 1
         );
         // The probe measures the object it names: with the STREAM_DIR charge
         // scheduling it, each non-final part reaches the target and none runs

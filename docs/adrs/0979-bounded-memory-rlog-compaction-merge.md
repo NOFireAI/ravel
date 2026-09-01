@@ -306,7 +306,7 @@ cursor fan-out term).
 ### The memory bound, as an operator evaluates it
 
 ```text
-peak ≈ C_cat + min(D × (2·G + B_dec), merge_cursor_budget_bytes) + W
+peak ≈ C_cat + min(D × (2·G + B_dec), merge_cursor_budget_bytes) + W + P
 
 C_cat  = per-input catalog metadata ≈ 30 KB × input_objects        (~220 MB here)
 D      = max concurrent ts-overlap of one stream's input slices     (≤ objects carrying
@@ -336,10 +336,23 @@ B_dec  = one decoded columnar block                                  (~18-25 MB 
          `max column id + 1` comes from FIELD_DIR, pre-decode, like
          the other shape inputs.
 W      = in-progress part writer buffer ≤ ~1.3 × l1_part_memory_target_bytes  (~340 MB default)
+P      = exact-encode probe transient (issue #872)                   (0 at the shipped
+         Zero unless the stored-size target `max_l1_part_bytes`        defaults; ≈ W + object
+         binds: the RLOG merge measures a part by encoding a CLONE     bytes when the stored
+         of its buffered records, so while a probe runs the run        target binds)
+         holds a second copy of the part's record heap (≈ W) plus
+         the encoded object those records produce (≤ the stored
+         target plus the overshoot band). A stored-target-bound run
+         therefore peaks near 2·W + one part's object bytes, not W.
+         Charged to the tracker (`MergeMemoryTracker::set_probe_bytes`),
+         so `peak_total_bytes` reports it rather than omitting it.
 ```
 
 For `cb-20260831140539`: `0.22 + min(617 × 25 MB, 20 GiB) + 0.34 ≈ 16 GB`
-worst case, `≈ 2.8 GB` if intra-stream time order holds. Today's code:
+worst case, `≈ 2.8 GB` if intra-stream time order holds (`P` = 0 at the
+shipped defaults, where the memory target binds and no probe runs; an operator
+who lowers `max_l1_part_bytes` below it must size for `2 × 0.34` plus one
+part's object bytes instead). Today's code:
 `0.22 + 617 × 80 MB + 0.34 + retained parts ≈ 50+ GB`.
 
 ## Compatibility and convergence
