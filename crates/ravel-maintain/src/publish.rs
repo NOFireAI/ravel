@@ -490,6 +490,52 @@ mod tests {
         assert!(list_all(&store, "").await.expect("list").is_empty());
     }
 
+    /// Wave-5b (ADR-0873 decision 3): stamping a part's declared columns does
+    /// not disturb the conservation gate. A part carrying a valid
+    /// declared-column stamp but a `sample_count` one record short of the input
+    /// sum still aborts with the typed error and writes nothing -- the gate sums
+    /// `part.sample_count`, which the stamp lives beside and never changes.
+    ///
+    /// Prove-the-test: comment out the `if !conservation.conserved(..)` guard in
+    /// `publish_record_with_conservation` and this rigged mismatch publishes, so
+    /// the `expect_err` fails.
+    #[tokio::test]
+    async fn conservation_gate_still_fires_with_stamped_parts() {
+        use ravel_types::declared_stats::{
+            DeclaredColumnStat, DeclaredStatType, DeclaredStatValue,
+        };
+
+        let store = MemoryStore::new();
+        let bucket = bucket(Signal::Logs);
+        let inputs = vec![input(1, 10, &bucket), input(2, 7, &bucket)];
+        let mut p = part(0, 16); // short by one record (input sum is 17)
+        let stamp = DeclaredColumnStat::new(
+            "http.status",
+            DeclaredStatType::I64,
+            Some(DeclaredStatValue::I64(200)),
+            Some(DeclaredStatValue::I64(500)),
+            0,
+        )
+        .expect("valid stamp");
+        ravel_commit::declared_stats::stamp_compaction_part(&mut p.part, &[stamp]);
+        assert!(
+            !p.part.declared_column_stats.is_empty(),
+            "the part must actually carry a stamp for this to test the interaction"
+        );
+
+        let err = publish(&store, &bucket, &inputs, &[p])
+            .await
+            .expect_err("a lossy merge must not publish, stamped or not");
+        assert!(
+            matches!(err, MaintainError::ConservationViolation { .. }),
+            "expected ConservationViolation, got {err:?}"
+        );
+        assert!(
+            list_all(&store, "").await.expect("list").is_empty(),
+            "aborted publish must write nothing"
+        );
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig { cases: 48, ..ProptestConfig::default() })]
 

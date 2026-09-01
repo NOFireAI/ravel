@@ -1097,7 +1097,7 @@ fn flush_part(
         &hash16,
     )?;
 
-    let part = CompactionPart {
+    let mut part = CompactionPart {
         part_index,
         first_series_id: first_series_id.map(|s| s.0.to_vec()).unwrap_or_default(),
         last_series_id: last_series_id.map(|s| s.0.to_vec()).unwrap_or_default(),
@@ -1111,6 +1111,12 @@ fn flush_part(
         segment_format_version: OUTPUT_FORMAT_VERSION,
         declared_column_stats: Vec::new(),
     };
+    // Metrics never carry declared typed columns -- they are a logs concept
+    // (ADR-0873 decision 3), so this part has no eligible columns and stamps
+    // nothing. Routed through the same validated commit-side path the logs
+    // compactor uses, so "stamps nothing" is expressed the one way, not by a
+    // second hand-built empty field.
+    ravel_commit::declared_stats::stamp_compaction_part(&mut part, &[]);
     Ok(BuiltPart {
         key,
         bytes: Some(written.bytes),

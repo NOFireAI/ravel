@@ -1254,6 +1254,11 @@ pub async fn build_rewrite_logs(
         &catalogs,
         input_set_hash,
         Vec::new(),
+        // declared: empty -- a rewrite drops rows, so a stamp computed over the
+        // pre-drop set would be stale for the survivors. Rewrite parts stay
+        // unstamped (ADR-0873 decision 3 staleness rule, the wave-3 fold also
+        // forces empty); this task stamps compaction parts only.
+        Vec::new(),
         true,
         // retain_bytes: true -- the erasure rewrite keeps each closed part's
         // bytes resident because `publish_rewrite_record` is what PUTs them,
