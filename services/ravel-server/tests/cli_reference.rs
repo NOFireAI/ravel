@@ -2,6 +2,7 @@
 //! 4). The generated table is rendered from `Cli`'s clap definition and
 //! compared to the committed file; `RAVEL_UPDATE_CLI_REFERENCE=1` rewrites the
 //! file instead of asserting.
+#![allow(clippy::expect_used)]
 
 use std::env;
 use std::path::{Path, PathBuf};

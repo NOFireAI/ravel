@@ -2737,6 +2737,7 @@ mod tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod cli_reference_tests {
     //! Drift check for `docs/reference/ravel-cli-flags.md` (ADR-1040 decision
     //! 4). The tables are rendered from `Cli`'s clap definition by the shared
