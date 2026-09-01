@@ -127,9 +127,13 @@ impl DeclaredStatAccum {
                 slot @ None => *slot = Some(Running::start(v)),
             },
             None => {
-                let mut col = ColumnAccum::default();
-                col.i64 = Some(Running::start(v));
-                self.cols.insert(name.to_string(), col);
+                self.cols.insert(
+                    name.to_string(),
+                    ColumnAccum {
+                        i64: Some(Running::start(v)),
+                        boolean: None,
+                    },
+                );
             }
         }
     }
@@ -141,9 +145,13 @@ impl DeclaredStatAccum {
                 slot @ None => *slot = Some(Running::start(b)),
             },
             None => {
-                let mut col = ColumnAccum::default();
-                col.boolean = Some(Running::start(b));
-                self.cols.insert(name.to_string(), col);
+                self.cols.insert(
+                    name.to_string(),
+                    ColumnAccum {
+                        i64: None,
+                        boolean: Some(Running::start(b)),
+                    },
+                );
             }
         }
     }
@@ -161,13 +169,17 @@ impl DeclaredStatAccum {
                 }
             },
             None => {
-                let mut col = ColumnAccum::default();
-                col.i64 = Some(Running {
-                    min,
-                    max,
-                    non_null: count,
-                });
-                self.cols.insert(name.to_string(), col);
+                self.cols.insert(
+                    name.to_string(),
+                    ColumnAccum {
+                        i64: Some(Running {
+                            min,
+                            max,
+                            non_null: count,
+                        }),
+                        boolean: None,
+                    },
+                );
             }
         }
     }
@@ -185,13 +197,17 @@ impl DeclaredStatAccum {
                 }
             },
             None => {
-                let mut col = ColumnAccum::default();
-                col.boolean = Some(Running {
-                    min,
-                    max,
-                    non_null: count,
-                });
-                self.cols.insert(name.to_string(), col);
+                self.cols.insert(
+                    name.to_string(),
+                    ColumnAccum {
+                        i64: None,
+                        boolean: Some(Running {
+                            min,
+                            max,
+                            non_null: count,
+                        }),
+                    },
+                );
             }
         }
     }
@@ -392,17 +408,11 @@ mod tests {
             trace_id: None,
             span_id: None,
             flags: 0,
-            attrs: attrs
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v))
-                .collect(),
+            attrs: attrs.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
         }
     }
 
-    fn stat<'a>(
-        stamps: &'a [DeclaredColumnStat],
-        name: &str,
-    ) -> Option<&'a DeclaredColumnStat> {
+    fn stat<'a>(stamps: &'a [DeclaredColumnStat], name: &str) -> Option<&'a DeclaredColumnStat> {
         stamps.iter().find(|s| s.name() == name)
     }
 

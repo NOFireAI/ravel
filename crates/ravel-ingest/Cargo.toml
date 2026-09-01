@@ -48,6 +48,16 @@ rand = { workspace = true }
 [dev-dependencies]
 ravel-query = { workspace = true }
 ravel-promql = { workspace = true }
+# ADR-0873 wave 5a end-to-end reachability test only: load a tenant through the
+# real log-ingest path, resolve its snapshot, and prove the wave-4 SQL reader
+# answers MIN/MAX/COUNT over a declared column from the flush's own stamps with
+# zero data GETs. ravel-sql depends on ravel-catalog/ravel-query/ravel-commit/
+# ravel-logseg, none of which depend on ravel-ingest, so this dev-only edge adds
+# no cycle. No feature flag: ravel-sql's SQL surface is unconditional.
+ravel-sql = { path = "../ravel-sql", version = "0.11.0" }
+# Match ravel-sql's datafusion pin exactly (same arrow 58 line) so the test's
+# SessionContext/collect interop with ravel-sql's plan types.
+datafusion = { version = "54", default-features = false, features = ["sql"] }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 proptest = { workspace = true }
