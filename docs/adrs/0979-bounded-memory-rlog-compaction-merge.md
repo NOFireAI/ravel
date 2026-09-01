@@ -314,7 +314,13 @@ G      = one row group's stored bytes ≈ per-object stored size      (~3.5 MB h
 B_dec  = one decoded columnar block                                  (~18-25 MB at 105 cols;
          ≤ 16 B × rows_per_block × cols                              ceiling ~14 MB numeric
            + uncompressed string-page bytes                          + string pages
-           + 40 B × rows_per_block × plain_string_cols)
+           + 40 B × rows_per_block × plain_string_cols
+           + 24 B × (max column id + 1) × 5)                         + decoder slot spines
+         The last term is the decoder's five per-kind slot-vector
+         spines, indexed by column id; on very small blocks it can
+         exceed the per-row terms, so a ceiling that omits it is not
+         a ceiling there. `max column id + 1` comes from FIELD_DIR,
+         pre-decode, like the other shape inputs.
 W      = in-progress part writer buffer ≤ ~1.3 × l1_part_memory_target_bytes  (~340 MB default)
 ```
 
