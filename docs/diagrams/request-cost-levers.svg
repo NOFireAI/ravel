@@ -31,7 +31,7 @@
 
   <rect x="360" y="268" width="640" height="30" rx="3" fill="#f6f0dc" stroke="#8a5a10"/>
   <text x="1012" y="288" font-size="13" fill="#1d2228"><tspan font-weight="640">target_bytes = 8 MiB</tspan></text>
-  <text x="378" y="288" font-size="12.5" fill="#7a5410">the size trigger, ~1,750&#215; away &#8212; it never fires</text>
+  <text x="378" y="288" font-size="12.5" fill="#7a5410">the size trigger, ~1,750&#215; away: it never fires</text>
 
   <!-- levers -->
   <text x="40" y="348" font-size="14" font-weight="640" fill="#383e46">The decisions, ordered by what they cost to use</text>
@@ -73,9 +73,9 @@
   <!-- what is not a lever -->
   <text x="40" y="546" font-size="14" font-weight="640" fill="#383e46">Rejected, and why the protocol stays</text>
   <rect x="40" y="564" width="1100" height="92" rx="6" fill="#fff" stroke="#c6ccd4"/>
-  <text x="60" y="590" font-size="12.5" fill="#1d2228"><tspan font-weight="640">cross-tenant objects</tspan> &#8212; would require redesigning key derivation, format identity, per-tenant encryption, retention and erasure together</text>
-  <text x="60" y="612" font-size="12.5" fill="#1d2228"><tspan font-weight="640">cross-shard objects</tspan> &#8212; a format change for a divisor decision 2 already gives free; the orphan sweeper would delete the object</text>
-  <text x="60" y="634" font-size="12.5" fill="#1d2228"><tspan font-weight="640">dropping the commit PUT</tspan> &#8212; visibility is atomic because create-if-absent is atomic; a LIST cannot replace it, and at most 2&#215; is available anyway</text>
+  <text x="60" y="590" font-size="12.5" fill="#1d2228"><tspan font-weight="640">cross-tenant objects</tspan>would require redesigning key derivation, format identity, per-tenant encryption, retention and erasure together</text>
+  <text x="60" y="612" font-size="12.5" fill="#1d2228"><tspan font-weight="640">cross-shard objects</tspan>a format change for a divisor decision 2 already gives free; the orphan sweeper would delete the object</text>
+  <text x="60" y="634" font-size="12.5" fill="#1d2228"><tspan font-weight="640">dropping the commit PUT</tspan>visibility is atomic because create-if-absent is atomic; a LIST cannot replace it, and at most 2&#215; is available anyway</text>
 
   <!-- durability line -->
   <rect x="40" y="682" width="1100" height="56" rx="6" fill="#e6efe6" stroke="#3f7042"/>
@@ -84,7 +84,7 @@
 
   <!-- historical-arithmetic note -->
   <rect x="40" y="762" width="1100" height="72" rx="6" fill="#fbe6b9" stroke="#8a5a10" stroke-width="1.5"/>
-  <text x="60" y="785" font-size="12.5" font-weight="600" fill="#7a5200">Historical figures &#8212; the worked ~4.7 KiB flush and the ~1,750&#215; distance from the 8 MiB size trigger assume the 500 ms flush</text>
+  <text x="60" y="785" font-size="12.5" font-weight="600" fill="#7a5200">Historical figures: the worked ~4.7 KiB flush and the ~1,750&#215; distance from the 8 MiB size trigger assume the 500 ms flush</text>
   <text x="60" y="804" font-size="12.5" fill="#7a5200">cadence that was the default when the ADR-0076 decision was made. The current default cadence is 2 s (~18.8 KiB per flush,</text>
   <text x="60" y="823" font-size="12.5" fill="#7a5200">~437&#215; from the trigger); the age trigger still fires first. The figures above are kept as decided, not updated.</text>
 </svg>

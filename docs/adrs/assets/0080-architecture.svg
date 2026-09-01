@@ -96,12 +96,12 @@
 
   <!-- Ingress to pods (bypass VIP) -->
   <path d="M 260 517 Q 320 570 400 630" fill="none" stroke="#8a6d1f" stroke-width="1.8" marker-end="url(#arrO)" stroke-linecap="round"/>
-  <text x="270" y="565" font-size="11" fill="#8a6d1f" transform="rotate(28 270 565)">service-upstream: false —</text>
+  <text x="270" y="565" font-size="11" fill="#8a6d1f" transform="rotate(28 270 565)">service-upstream: false</text>
   <text x="270" y="580" font-size="11" fill="#8a6d1f" transform="rotate(28 270 580)">bypasses the Service VIP</text>
 
   <!-- router to pods (direct dial) -->
   <path d="M 550 529 Q 550 570 550 604" fill="none" stroke="#4c6b45" stroke-width="2" marker-end="url(#arrG)" stroke-linecap="round"/>
-  <text x="558" y="570" font-size="11" fill="#4c6b45">dials chosen pod directly —</text>
+  <text x="558" y="570" font-size="11" fill="#4c6b45">dials chosen pod directly</text>
   <text x="558" y="586" font-size="11" fill="#4c6b45">never the Service VIP</text>
 
   <text x="30" y="730" font-size="12" fill="#5b6472">Legacy (amber) stays functional but deprecated. Ravel-native (green) is the new, controller-independent path.</text>

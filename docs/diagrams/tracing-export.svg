@@ -10,7 +10,7 @@
 
   <rect x="0" y="0" width="1200" height="1015" fill="#f4f5f7"/>
 
-  <text x="30" y="30" font-size="20" font-weight="bold" fill="#17191c">Query-path tracing — spans and OTLP export</text>
+  <text x="30" y="30" font-size="20" font-weight="bold" fill="#17191c">Query-path tracing: spans and OTLP export</text>
   <text x="30" y="48" font-size="12" fill="#4a4f57">ADR-0044 decision 5 + ADR-0060 · docs/guides/tracing.md</text>
 
   <!-- legend -->
@@ -33,21 +33,21 @@
 
   <!-- outer request-level span -->
   <rect x="40" y="150" width="1120" height="450" rx="8" fill="#f4f7fa" stroke="#1f4e79" stroke-width="2"/>
-  <text x="56" y="168" font-size="12" font-weight="bold" fill="#17191c">sql_query span — info level (same shape for analytics_query, flight_sql_statement)</text>
-  <text x="56" y="183" font-size="10" fill="#4a4f57">fields: tenant_hash, workload_class, s3_requests, s3_bytes — recorded from the query's accounting handle once it returns</text>
+  <text x="56" y="168" font-size="12" font-weight="bold" fill="#17191c">sql_query span: info level (same shape for analytics_query, flight_sql_statement)</text>
+  <text x="56" y="183" font-size="10" fill="#4a4f57">fields: tenant_hash, workload_class, s3_requests, s3_bytes: recorded from the query's accounting handle once it returns</text>
 
   <!-- phase span 1: catalog_resolve -->
   <rect x="70" y="197" width="1060" height="46" rx="6" fill="#c9b6e4" stroke="#5b3a8a" stroke-width="2"/>
   <text x="86" y="215" font-size="11" font-weight="bold" fill="#17191c">catalog_resolve</text>
   <text x="1120" y="215" font-size="9.5" text-anchor="end" fill="#3d2a5c">debug</text>
-  <text x="86" y="232" font-size="10" fill="#17191c">tenant_hash, s3_requests, s3_bytes, segments_pruned — this resolve's own LIST/GET fan-out cost</text>
+  <text x="86" y="232" font-size="10" fill="#17191c">tenant_hash, s3_requests, s3_bytes, segments_pruned: this resolve's own LIST/GET fan-out cost</text>
   <line x1="600" y1="243" x2="600" y2="258" stroke="#383e46" stroke-width="1.5" marker-end="url(#arrow)"/>
 
   <!-- phase span 2: segment_open -->
   <rect x="70" y="258" width="1060" height="46" rx="6" fill="#c9b6e4" stroke="#5b3a8a" stroke-width="2"/>
   <text x="86" y="276" font-size="11" font-weight="bold" fill="#17191c">segment_open</text>
   <text x="1120" y="276" font-size="9.5" text-anchor="end" fill="#3d2a5c">debug</text>
-  <text x="86" y="293" font-size="10" fill="#17191c">tenant_hash, object_size, s3_requests, s3_bytes — one segment's own GET cost, zero on a warm whole-object cache hit</text>
+  <text x="86" y="293" font-size="10" fill="#17191c">tenant_hash, object_size, s3_requests, s3_bytes: one segment's own GET cost, zero on a warm whole-object cache hit</text>
   <line x1="600" y1="304" x2="600" y2="319" stroke="#383e46" stroke-width="1.5" marker-end="url(#arrow)"/>
 
   <!-- phase span 3: catalog_decode -->
@@ -61,27 +61,27 @@
   <rect x="70" y="380" width="1060" height="46" rx="6" fill="#c9b6e4" stroke="#5b3a8a" stroke-width="2"/>
   <text x="86" y="398" font-size="11" font-weight="bold" fill="#17191c">page_fetch</text>
   <text x="1120" y="398" font-size="9.5" text-anchor="end" fill="#3d2a5c">debug</text>
-  <text x="86" y="415" font-size="10" fill="#17191c">page_kind, series_count, s3_requests, s3_bytes — logs-signal variant: signal="logs" instead, no page_kind/series_count</text>
+  <text x="86" y="415" font-size="10" fill="#17191c">page_kind, series_count, s3_requests, s3_bytes: logs-signal variant: signal="logs" instead, no page_kind/series_count</text>
   <line x1="600" y1="426" x2="600" y2="441" stroke="#383e46" stroke-width="1.5" marker-end="url(#arrow)"/>
 
   <!-- phase span 5: decode -->
   <rect x="70" y="441" width="1060" height="46" rx="6" fill="#c9b6e4" stroke="#5b3a8a" stroke-width="2"/>
   <text x="86" y="459" font-size="11" font-weight="bold" fill="#17191c">decode</text>
   <text x="1120" y="459" font-size="9.5" text-anchor="end" fill="#3d2a5c">debug</text>
-  <text x="86" y="476" font-size="10" fill="#17191c">page_kind, series_count, decompressed_bytes — logs-signal variant: blocks_scanned/blocks_total, not a byte count</text>
+  <text x="86" y="476" font-size="10" fill="#17191c">page_kind, series_count, decompressed_bytes: logs-signal variant: blocks_scanned/blocks_total, not a byte count</text>
   <line x1="600" y1="487" x2="600" y2="502" stroke="#383e46" stroke-width="1.5" marker-end="url(#arrow)"/>
 
   <!-- phase span 6: evaluate -->
   <rect x="70" y="502" width="1060" height="46" rx="6" fill="#c9b6e4" stroke="#5b3a8a" stroke-width="2"/>
   <text x="86" y="520" font-size="11" font-weight="bold" fill="#17191c">evaluate</text>
   <text x="1120" y="520" font-size="9.5" text-anchor="end" fill="#3d2a5c">debug</text>
-  <text x="86" y="537" font-size="10" fill="#17191c">eval_kind (instant / range) — pure in-memory work over already-fetched data, no byte/request counts</text>
+  <text x="86" y="537" font-size="10" fill="#17191c">eval_kind (instant / range): pure in-memory work over already-fetched data, no byte/request counts</text>
 
   <text x="56" y="584" font-size="10" fill="#4a4f57">page_fetch and decode each have two call sites (scalar / histogram); the span name is the same at both.</text>
 
   <!-- ============ Section 2: filter + export ============ -->
-  <text x="30" y="624" font-size="13" font-weight="bold" fill="#17191c">Where spans go — one filter, two layers</text>
-  <text x="30" y="640" font-size="10.5" fill="#4a4f57">crates/ravel-tracing-export::init(filter, otlp) — shared by ravel-server and ravel-operator</text>
+  <text x="30" y="624" font-size="13" font-weight="bold" fill="#17191c">Where spans go: one filter, two layers</text>
+  <text x="30" y="640" font-size="10.5" fill="#4a4f57">crates/ravel-tracing-export::init(filter, otlp): shared by ravel-server and ravel-operator</text>
 
   <!-- emission -->
   <rect x="30" y="662" width="190" height="56" rx="6" fill="#dde1e7" stroke="#454b54" stroke-width="2"/>
@@ -121,7 +121,7 @@
 
   <rect x="440" y="827" width="260" height="46" rx="6" fill="#dde1e7" stroke="#454b54" stroke-width="2"/>
   <text x="570" y="849" font-size="10.5" font-weight="bold" text-anchor="middle" fill="#17191c">BatchSpanProcessor</text>
-  <text x="570" y="864" font-size="9" text-anchor="middle" fill="#17191c">background task — never blocks the caller (decision 6)</text>
+  <text x="570" y="864" font-size="9" text-anchor="middle" fill="#17191c">background task: never blocks the caller (decision 6)</text>
 
   <line x1="570" y1="873" x2="570" y2="898" stroke="#5b3a8a" stroke-width="2" marker-end="url(#arrowpurple)"/>
 
@@ -144,13 +144,13 @@
   <text x="756" y="745" font-size="9.5" fill="#17191c">fine (dialed lazily); a decorator on the exporter warns</text>
   <text x="756" y="758" font-size="9.5" fill="#17191c">once on the first failed background export attempt.</text>
   <text x="756" y="777" font-size="9.5" fill="#17191c">Exported fields are exactly the fields shown in the</text>
-  <text x="756" y="790" font-size="9.5" fill="#17191c">span boxes above — no new content, no query text,</text>
+  <text x="756" y="790" font-size="9.5" fill="#17191c">span boxes above: no new content, no query text,</text>
   <text x="756" y="803" font-size="9.5" fill="#17191c">no object keys (ADR-0060 decision 4).</text>
   <text x="756" y="822" font-size="9.5" fill="#17191c">service.name (ravel-server / ravel-operator) and</text>
   <text x="756" y="835" font-size="9.5" fill="#17191c">ravel.mode resource attributes are attached to every</text>
   <text x="756" y="848" font-size="9.5" fill="#17191c">exported span, mirroring /metrics' mode label.</text>
   <text x="756" y="867" font-size="9.5" fill="#17191c">Absent flag: byte-identical to the pre-ADR-0060</text>
-  <text x="756" y="880" font-size="9.5" fill="#17191c">subscriber — no OTLP object constructed at all.</text>
+  <text x="756" y="880" font-size="9.5" fill="#17191c">subscriber: no OTLP object constructed at all.</text>
 
   <text x="30" y="978" font-size="10" fill="#4a4f57">Illustrates: docs/guides/tracing.md, docs/adrs/0044-query-cost-accounting.md (decision 5), docs/adrs/0060-query-path-otlp-trace-export.md.</text>
 </svg>

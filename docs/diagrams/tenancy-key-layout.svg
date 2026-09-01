@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1500" height="950" viewBox="0 0 1500 950" font-family="system-ui, sans-serif" role="img" aria-label="Tenancy key layout: the object-store key tree under t/&lt;tenant_hash&gt;/, showing the metrics, logs, and spans signal prefixes with their L0 data keys and commit keys, and the catalog snapshot and HEAD objects written by the fold task.">
   <rect x="0" y="0" width="1500" height="950" fill="#f4f5f7"/>
 
-  <text x="30" y="30" font-size="20" font-weight="bold" fill="#17191c">Tenancy key layout — bucket key tree under t/&lt;tenant_hash&gt;/</text>
+  <text x="30" y="30" font-size="20" font-weight="bold" fill="#17191c">Tenancy key layout: bucket key tree under t/&lt;tenant_hash&gt;/</text>
   <text x="30" y="48" font-size="12" fill="#4a4f57">docs/catalog-and-mvcc.md key layout + ADR-0009 tenant isolation + ADR-0010 §3/§13</text>
 
   <!-- legend -->
@@ -50,8 +50,8 @@
 
   <!-- data leaf note -->
   <rect x="660" y="205" width="800" height="80" rx="6" fill="#eceef1" stroke="#454b54" stroke-width="1.5"/>
-  <text x="674" y="222" font-size="10.5" fill="#17191c">writer_id: uuidv4, freshly random per process start — never derived from hostname, pod name, shard index, or config</text>
-  <text x="674" y="238" font-size="10.5" fill="#17191c">epoch: u64 unix seconds at process startup — informational only, not used for ordering</text>
+  <text x="674" y="222" font-size="10.5" fill="#17191c">writer_id: uuidv4, freshly random per process start: never derived from hostname, pod name, shard index, or config</text>
+  <text x="674" y="238" font-size="10.5" fill="#17191c">epoch: u64 unix seconds at process startup: informational only, not used for ordering</text>
   <text x="674" y="254" font-size="10.5" fill="#17191c">seq: u64 monotonic per (writer_id, epoch, shard), 20-digit zero-padded so lexicographic = numeric order;</text>
   <text x="674" y="268" font-size="10.5" fill="#17191c">gaps are permitted (abandoned flushes) and carry no meaning</text>
   <rect x="674" y="274" width="290" height="20" rx="10" fill="#a9dcae" stroke="#2f6b34" stroke-width="1.5"/>
@@ -84,7 +84,7 @@
   <text x="674" y="392" font-size="10.5" fill="#17191c">ingest_hour = YYYYMMDDTHH UTC, formatted from the pinned ingest_hour_bucket (unix hours) at flush open;</text>
   <text x="674" y="407" font-size="10.5" fill="#17191c">never recomputed on retry</text>
   <text x="674" y="425" font-size="10.5" fill="#17191c">writer_id, epoch, seq: the same identity fields as the data key, pinned once for the whole flush</text>
-  <text x="674" y="441" font-size="10.5" fill="#17191c">.cmt fixed suffix — no content-hash component; commit-record existence is the sole visibility truth</text>
+  <text x="674" y="441" font-size="10.5" fill="#17191c">.cmt fixed suffix: no content-hash component; commit-record existence is the sole visibility truth</text>
 
   <!-- signal subtrees + catalog -->
   <line x1="280" y1="190" x2="280" y2="520" stroke="#7a808a" stroke-width="1.5"/>
@@ -117,7 +117,7 @@
   <text x="46" y="790" font-size="12" font-weight="bold" fill="#17191c">Notes</text>
   <text x="46" y="810" font-size="11" fill="#17191c">Readers never trust CommitRecord.object_key: the data key is reconstructed from (tenant_hash, signal, shard, writer_id, epoch, seq, content_hash);</text>
   <text x="46" y="826" font-size="11" fill="#17191c">a mismatch with the stored object_key is a fatal invariant breach (ADR-0010 §7).</text>
-  <text x="46" y="846" font-size="11" fill="#17191c">Commit token v2 = base64url of "v2:&lt;shard&gt;:&lt;writer_id&gt;:&lt;epoch&gt;:&lt;seq&gt;:&lt;ingest_hour_bucket&gt;" — it fully determines the commit-record key above,</text>
+  <text x="46" y="846" font-size="11" fill="#17191c">Commit token v2 = base64url of "v2:&lt;shard&gt;:&lt;writer_id&gt;:&lt;epoch&gt;:&lt;seq&gt;:&lt;ingest_hour_bucket&gt;": it fully determines the commit-record key above,</text>
   <text x="46" y="862" font-size="11" fill="#17191c">so read-your-write resolves by exact GET, never by re-listing.</text>
   <text x="46" y="882" font-size="11" fill="#17191c">Logs (l/) and spans (s/) use the same l0/ + c/ skeleton as m/, with RLOG and RSPAN segment payloads; catalog/&lt;signal&gt;/ snapshot parts and HEAD are written by the fold task.</text>
   <text x="46" y="902" font-size="11" fill="#17191c">Data objects use PutMode::CreateIfAbsent; AlreadyExists is success because the key embeds the content hash, so a retry always names the same bytes.</text>
