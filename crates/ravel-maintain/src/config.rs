@@ -475,12 +475,47 @@ pub const DEFAULT_MIN_COMPACTION_INPUTS: usize = 2;
 pub const DEFAULT_FOOTER_PROBE_BYTES: u64 = 64 * 1024;
 /// Default `input_read_concurrency`: 8 input reads in flight at once.
 pub const DEFAULT_INPUT_READ_CONCURRENCY: usize = 8;
-/// Default `merge_cursor_budget_bytes`: 20 GiB (ADR-0979 decision 4). Sized so
-/// the reference box completes the ClickBench worst case: the top stream's ~617
-/// inputs at a per-cursor ceiling of ~25 MB reserve ~15.4 GiB, under 20 GiB,
-/// leaving headroom on a 30 GB box for the writer buffer, catalogs, and process
-/// overhead. See [`CompactorConfig::merge_cursor_budget_bytes`] for what the
-/// budget bounds and what happens at the limit.
+/// Default `merge_cursor_budget_bytes`: 20 GiB (ADR-0979 decision 4), re-derived
+/// below from the arithmetic `crate::rlog` implements rather than from the ADR's
+/// summary figure.
+///
+/// The charge a stream carries is the sum over its open cursors of what each
+/// holds, plus, for the instant between reserving and decoding, the pre-decode
+/// ceiling of the batch being admitted. For the ClickBench worst case the ADR
+/// sizes against (tenant `cb-20260831140539`, top stream carried by ~617 inputs,
+/// ~3.5 MB stored per row group, 105 mapped columns of which ~28 are
+/// string-typed, 8192-record blocks):
+///
+/// ```text
+/// per-cursor pre-decode ceiling (rlog::cursor_reservation_bytes)
+///   16 B x 8192 rows x 115 column ids            = 14.4 MiB   shape term
+///   + string-page uncomp_len (~4 MiB measured)   =  4.0 MiB   string payload
+///   + 40 B x 8192 rows x 33 string columns       = 10.3 MiB   string slots
+///   + 2 x 3.5 MB row group                       =  6.7 MiB   raw, two locs
+///                                                  ---------
+///                                                   35.4 MiB
+///
+/// per-cursor reconciled residency (rlog::StreamCursor::resident_bytes)
+///   heap_estimate of the decoded block           = 17-24 MiB  (ADR: 18-25 MB)
+///   + the raw locs actually held                 <= 6.7 MiB
+///                                                  ---------
+///                                                   24-30 MiB
+///
+/// 617 cursors reconciled       617 x 30 MiB = 18.1 GiB  < 20 GiB
+/// 617 cursors at the ceiling   617 x 35.4 MiB = 21.3 GiB > 20 GiB
+/// ```
+///
+/// So the default admits the worst case because the reconcile is mandatory
+/// (ADR-0979 decision 4 as amended): held at their admission ceilings, the same
+/// 617 cursors would be refused. The residual corner is a stream whose whole
+/// 617-input queue is admitted in ONE batch (every input's SKIP_IDX lower bound
+/// at or below the first frontier), where the batch is charged at its ceiling
+/// before any of it decodes: that transient is the 21.3 GiB line and fails
+/// closed with [`crate::error::MaintainError::MergeCursorBudgetExceeded`] naming
+/// the number to raise, which is the designed behaviour at the limit rather than
+/// an out-of-memory kill. Under 20 GiB the reference box keeps ~10 GB of its
+/// 30 GB for the writer buffer, the catalogs, and process overhead. See
+/// [`CompactorConfig::merge_cursor_budget_bytes`] for what the budget bounds.
 pub const DEFAULT_MERGE_CURSOR_BUDGET_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 
 /// How the RLOG merge admits a stream's per-input cursors (ADR-0979 decision 2).
@@ -734,10 +769,16 @@ pub struct CompactorConfig {
     /// The RLOG merge's per-stream cursor-memory budget (ADR-0979 decision 4).
     /// Unlike the two part-split targets and `input_read_concurrency`, this one
     /// DOES bound resident memory: it caps the sum, over the cursors open at
-    /// once for one stream, of each cursor's pre-decode reservation ceiling (two
-    /// row groups' stored bytes, the cursor's location metadata, and the
-    /// decoded columnar block sized from the block's PAGE_DIR `uncomp_len`
-    /// times an allocation-overhead factor).
+    /// once for one stream, of what each cursor holds -- two row groups' stored
+    /// bytes, the cursor's location metadata, and its decoded columnar block.
+    ///
+    /// A cursor is admitted against a pre-decode CEILING on those terms, priced
+    /// from resident directory metadata: the block's decoded size is
+    /// `16 B x rows x column-id width + its string pages' uncomp_len +
+    /// 40 B x rows x string columns`, maximized over the cursor's candidate
+    /// blocks. That is a shape formula, not a stored-size one, because the page
+    /// codecs are size-adaptive: a constant column stores a few bytes per block
+    /// and still decodes to `16 B x rows`.
     ///
     /// The reservation is charged BEFORE a cursor fetches or decodes anything,
     /// so the budget is enforced at reserve time and the merge fails closed
@@ -745,6 +786,10 @@ pub struct CompactorConfig {
     /// requires would push the charge over the budget, the run aborts with a
     /// typed [`crate::error::MaintainError::MergeCursorBudgetExceeded`] naming
     /// the stream, the reservation, and the budget, before publishing anything.
+    /// Once the decode completes, the charge is reconciled down to the cursor's
+    /// actual residency (its decoded block's `heap_estimate`, the raw bytes it
+    /// actually holds, and its location metadata), which is the basis
+    /// [`DEFAULT_MERGE_CURSOR_BUDGET_BYTES`] is sized from.
     /// Nothing is published, the L0 inputs stay live and queryable, and any
     /// parts already PUT age out under the unreferenced-part sweep exactly like
     /// an abandoned run's. This converts an out-of-memory kill at an arbitrary
