@@ -141,4 +141,5 @@ the reservation commit that used to work around it.
 | [1029](1029-advisory-compaction-claims.md) | advisory compaction claims over object-store CAS | Proposed |
 | [1040](1040-documentation-architecture.md) | Documentation architecture, canonical vocabulary, and a docs gate | Proposed |
 | [1101](1101-alerts-and-audit-sql-tables.md) | Register the `alerts` and `audit` SQL tables | Proposed |
+| [1103](1103-promql-over-logs.md) | PromQL over logs: `ravel_log_lines` and `ravel_log_bytes` | Accepted |
 | [1113](1113-tla-verification-suite.md) | TLA+ verification suite for the commit, catalog, lifecycle, resharding, and maintenance protocols | Proposed |
