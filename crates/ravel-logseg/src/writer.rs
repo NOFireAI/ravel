@@ -362,11 +362,11 @@ impl RlogWriter {
         // from the per-record loop above, yet `service.name` on the resource is
         // the ordinary OTLP shape. Two kinds of key get one anyway:
         //
-        // - Indexed keys (ADR-0049 amendment), so `indexed_term_columns` can
-        //   key their merged-view postings by a column.
-        // - Numeric keys (I64, F64, Bool), so `stat_winner_columns` has a
-        //   column to key their NumStat by. Without it a name only ever
-        //   resolved off the stream layer gets no column, drops out of
+        // - Indexed keys (ADR-0049 amendment), so the stamp can key their
+        //   merged-view postings by a column.
+        // - Numeric keys (I64, F64, Bool), so the stamp has a column to key
+        //   their NumStat by. Without it a name only ever resolved off the
+        //   stream layer gets no column, drops out of
         //   `numstat_names`, and so gets no stat anywhere -- and a query
         //   ranging on the declared column then scans every block instead of
         //   pruning on bounds the writer could have written. Restricting this
@@ -454,10 +454,19 @@ impl RlogWriter {
             .map(|(_, _, cid)| *cid)
             .collect();
 
+        // Tracked names (indexed union numstat), interned once into a flat table
+        // so a record's tracked occurrences key by a small slot index instead of
+        // a fresh `String` and `BTreeMap` node per cell (#682, #1135). The
+        // columnar path interns the same set the same way, so both stamp through
+        // one implementation.
+        let (tracked_names, tracked_slot) = intern_tracked_names(&indexed_names, &numstat_names);
+        let stamp_index =
+            StampIndex::build(&tracked_names, &indexed_names, &numstat_names, &column_of);
+
         // Each stream's resource and scope pairs, restricted to the tracked names
         // (`indexed_names` union `numstat_names`) and resolved to
         // `(type byte, value)`. This is the seed of every record's merged-view
-        // resolution ([`resolved_tracked_values`]), which both POSTINGS and the
+        // resolution ([`StampScratch::finish`]), which both POSTINGS and the
         // SKIP_IDX NumStats are projections of. Decoded once per stream, not once
         // per record: a stream's blob is byte-identical across its records (the
         // check above refuses an object where it is not), so the per-record decode
@@ -465,38 +474,34 @@ impl RlogWriter {
         // A corrupt blob fails the write rather than silently dropping
         // stream-level values, since an under-populated posting list or an
         // under-bounded stat would prune a block a merged-view query needs.
-        let mut stream_tracked: HashMap<LogStreamId, TrackedValues> = HashMap::new();
-        if !indexed_names.is_empty() || !numstat_names.is_empty() {
+        let mut stream_seeds: HashMap<LogStreamId, StreamSeed> = HashMap::new();
+        if !tracked_names.is_empty() {
             for (id, blob) in &streams {
-                let mut pairs: TrackedValues = Vec::new();
-                for (k, v) in stream_attr_pairs(blob)? {
-                    if indexed_names.contains(k.as_str()) || numstat_names.contains(k.as_str()) {
-                        let (ty, cv) = resolve_value(&v);
-                        pairs.push((k, (ty.to_u8(), cv)));
-                    }
-                }
-                stream_tracked.insert(*id, pairs);
+                let seed =
+                    StreamSeed::build(stream_attr_pairs(blob)?, &tracked_slot, stamp_index.slots());
+                stream_seeds.insert(*id, seed);
             }
         }
 
         // Resolve every record into storage form, then sort by (stream_ref, ts).
         // `resolve_row` also computes each row's merged-view POSTINGS terms and
         // its per-name NumStat winners, both read off the one resolved merged
-        // view seeded from `stream_tracked`.
-        let mut rows: Vec<ResolvedRow> = self
-            .records
-            .iter()
-            .map(|r| {
-                resolve_row(
-                    r,
-                    &ref_of,
-                    &column_of,
-                    &indexed_names,
-                    &numstat_names,
-                    &stream_tracked,
-                )
-            })
-            .collect();
+        // view seeded from `stream_seeds`. One scratch serves every record: it is
+        // cleared per record, never rebuilt (#1135).
+        let mut stamp = StampScratch::default();
+        stamp.prepare(stamp_index.slots());
+        let mut rows: Vec<ResolvedRow> = Vec::with_capacity(self.records.len());
+        for r in &self.records {
+            rows.push(resolve_row(
+                r,
+                &ref_of,
+                &column_of,
+                &tracked_slot,
+                &stamp_index,
+                &stream_seeds,
+                &mut stamp,
+            ));
+        }
         rows.sort_by(|a, b| {
             a.stream_ref
                 .cmp(&b.stream_ref)
@@ -815,9 +820,8 @@ impl RlogWriter {
     ///
     /// Every ordering-, budget-, overflow-, merged-view-, and stats-affecting
     /// rule is reproduced from the same helpers the row path uses
-    /// (`record_level_winners`, `resolved_tracked_values`,
-    /// `indexed_term_columns`, `stat_winner_columns`, `canonical_attr_bytes`),
-    /// which is what makes the output byte-identical (decision 7). The
+    /// ([`StampScratch::finish`], `canonical_attr_bytes`), which is what makes
+    /// the output byte-identical (decision 7). The
     /// merged-view and `attrs_raw` derivations stay per row exactly as the row
     /// path's do; only the value gather and the column-id probe change shape.
     fn build_object_columnar(
@@ -928,17 +932,23 @@ impl RlogWriter {
             .map(|(_, _, cid)| *cid)
             .collect();
 
-        let mut stream_tracked: HashMap<LogStreamId, TrackedValues> = HashMap::new();
-        if !indexed_names.is_empty() || !numstat_names.is_empty() {
+        // Tracked names (indexed union numstat), interned once into a flat table
+        // so a row's tracked occurrences key by a small slot index instead of a
+        // fresh `String` and `BTreeMap` node per cell (#682). The table is
+        // name-sorted, so ascending slot order is ascending name order, which is
+        // the order the merged view appends record-level winners in. The row
+        // path interns the same set the same way and stamps through the same
+        // scratch, so the two paths cannot disagree (#1135).
+        let (tracked_names, tracked_slot) = intern_tracked_names(&indexed_names, &numstat_names);
+        let stamp_index =
+            StampIndex::build(&tracked_names, &indexed_names, &numstat_names, &column_of);
+
+        let mut stream_seeds: HashMap<LogStreamId, StreamSeed> = HashMap::new();
+        if !tracked_names.is_empty() {
             for (id, blob) in &streams {
-                let mut pairs: TrackedValues = Vec::new();
-                for (k, v) in stream_attr_pairs(blob)? {
-                    if indexed_names.contains(k.as_str()) || numstat_names.contains(k.as_str()) {
-                        let (ty, cv) = resolve_value(&v);
-                        pairs.push((k, (ty.to_u8(), cv)));
-                    }
-                }
-                stream_tracked.insert(*id, pairs);
+                let seed =
+                    StreamSeed::build(stream_attr_pairs(blob)?, &tracked_slot, stamp_index.slots());
+                stream_seeds.insert(*id, seed);
             }
         }
 
@@ -987,23 +997,22 @@ impl RlogWriter {
             }
         }
 
-        // Tracked names (indexed union numstat), interned once into a flat table
-        // so a row's tracked occurrences key by a small slot index instead of a
-        // fresh `String` and `BTreeMap` node per cell (#682). The table is
-        // name-sorted, so ascending slot order is ascending name order and
-        // [`record_level_winners_slot`] reproduces [`record_level_winners`]
-        // byte for byte.
-        let mut tracked_name_vec: Vec<&str> = indexed_names
+        // Per (batch, dyn column) constants the per-row loop below would
+        // otherwise re-derive per cell: the in-budget dynamic column the
+        // column's own `(name, type)` takes, and the tracked slot of its name.
+        // Both are properties of the column, not of the row, and each cost a
+        // SipHash of the name per cell before (#1135).
+        let col_meta: Vec<Vec<DynColMeta>> = batches
             .iter()
-            .chain(numstat_names.iter())
-            .copied()
-            .collect();
-        tracked_name_vec.sort_unstable();
-        tracked_name_vec.dedup();
-        let tracked_slot: HashMap<&str, u32> = tracked_name_vec
-            .iter()
-            .enumerate()
-            .map(|(i, n)| (*n, i as u32))
+            .map(|b| {
+                b.dyn_columns
+                    .iter()
+                    .map(|c| DynColMeta {
+                        column_id: column_lookup(&column_of, &c.name, c.field_type.to_u8()),
+                        slot: tracked_slot.get(c.name.as_str()).copied(),
+                    })
+                    .collect()
+            })
             .collect();
 
         // Per (batch, column) word-level popcount prefix over the presence
@@ -1175,6 +1184,18 @@ impl RlogWriter {
         let mut min_obs = i64::MAX;
         let mut max_obs = i64::MIN;
 
+        // The per-record stamp and its outputs, hoisted out of both loops: one
+        // scratch and one pair of flat per-block arrays serve every record, each
+        // cleared rather than rebuilt, so the stamp path allocates nothing in
+        // steady state (#1135). `blk_indexed_ends[li]` / `blk_stat_ends[li]` are
+        // the end offsets of block row `li`'s entries in the flat arrays.
+        let mut stamp = StampScratch::default();
+        stamp.prepare(stamp_index.slots());
+        let mut blk_indexed: Vec<(u32, ColumnValue)> = Vec::new();
+        let mut blk_indexed_ends: Vec<u32> = Vec::new();
+        let mut blk_stat: Vec<(u32, ColumnValue)> = Vec::new();
+        let mut blk_stat_ends: Vec<u32> = Vec::new();
+
         for (blk_idx, span) in spans.iter().enumerate() {
             let block_rows = &perm[span.clone()];
             let blk_idx_u32 = blk_idx as u32;
@@ -1186,55 +1207,56 @@ impl RlogWriter {
             // peak (#682); nothing built here is retained past the block.
             let n = block_rows.len();
             let mut blk_cols: Vec<Vec<(u32, ColumnValue)>> = Vec::with_capacity(n);
-            let mut blk_indexed: Vec<Vec<(u32, ColumnValue)>> = Vec::with_capacity(n);
-            let mut blk_stat: Vec<Vec<(u32, ColumnValue)>> = Vec::with_capacity(n);
+            blk_indexed.clear();
+            blk_indexed_ends.clear();
+            blk_stat.clear();
+            blk_stat_ends.clear();
             for &grow in block_rows {
                 let bi = g_batch[grow] as usize;
                 let b = &batches[bi];
                 let local = grow - bases[bi];
                 let mut cols: Vec<(u32, ColumnValue)> = Vec::new();
-                let mut t_cols: Vec<(u32, u8, ColumnValue)> = Vec::new();
-                let mut t_over: Vec<(u32, AttrValue)> = Vec::new();
+                stamp.begin();
                 for (ci, c) in b.dyn_columns.iter().enumerate() {
                     if !c.validity.get(local) {
                         continue;
                     }
-                    let slot = presence_rank(&col_rank[bi][ci], c.validity.bytes(), local);
-                    let cell = &c.cells[slot];
-                    let tracked = indexed_names.contains(c.name.as_str())
-                        || numstat_names.contains(c.name.as_str());
-                    let (ty, cv) = resolve_value(cell);
-                    match column_lookup(&column_of, &c.name, c.field_type.to_u8()) {
+                    let dense = presence_rank(&col_rank[bi][ci], c.validity.bytes(), local);
+                    let cell = &c.cells[dense];
+                    let meta = &col_meta[bi][ci];
+                    match meta.column_id {
                         Some(cid) => {
-                            if tracked {
-                                t_cols.push((
-                                    tracked_slot[c.name.as_str()],
-                                    ty.to_u8(),
-                                    cv.clone(),
-                                ));
+                            let (ty, cv) = resolve_value(cell);
+                            if let Some(slot) = meta.slot {
+                                stamp.push_columnar(slot, ty.to_u8(), cv.clone());
                             }
                             cols.push((cid, cv));
                         }
                         None => {
-                            if tracked {
-                                t_over.push((tracked_slot[c.name.as_str()], cell.clone()));
+                            if let Some(slot) = meta.slot {
+                                stamp.push_overflow(slot, cell.clone());
                             }
                         }
                     }
                 }
                 for (k, v) in &b.residual_attrs[local] {
-                    if indexed_names.contains(k.as_str()) || numstat_names.contains(k.as_str()) {
-                        t_over.push((tracked_slot[k.as_str()], v.clone()));
+                    if let Some(&slot) = tracked_slot.get(k.as_str()) {
+                        stamp.push_overflow(slot, v.clone());
                     }
                 }
                 cols.sort_by_key(|(cid, _)| *cid);
-                let winners = record_level_winners_slot(&t_cols, &t_over, &tracked_name_vec);
-                let seed = stream_tracked
-                    .get(&g_stream_id[grow])
-                    .map_or(&[][..], Vec::as_slice);
-                let resolved = resolved_tracked_values(seed, &winners);
-                blk_indexed.push(indexed_term_columns(&resolved, &indexed_names, &column_of));
-                blk_stat.push(stat_winner_columns(&resolved, &numstat_names, &column_of));
+                stamp.finish(
+                    &stamp_index,
+                    stream_seeds
+                        .get(&g_stream_id[grow])
+                        .unwrap_or(&EMPTY_STREAM_SEED),
+                    &mut StampOut {
+                        indexed: &mut blk_indexed,
+                        stat: &mut blk_stat,
+                    },
+                );
+                blk_indexed_ends.push(blk_indexed.len() as u32);
+                blk_stat_ends.push(blk_stat.len() as u32);
                 blk_cols.push(cols);
             }
 
@@ -1248,10 +1270,8 @@ impl RlogWriter {
                 }
             }
             let mut plan_cols: BTreeSet<u32> = present_cols.clone();
-            for stat in &blk_stat {
-                for (cid, _) in stat {
-                    plan_cols.insert(*cid);
-                }
+            for (cid, _) in &blk_stat {
+                plan_cols.insert(*cid);
             }
             let plans: Vec<ColumnPlan> = plan_cols
                 .iter()
@@ -1312,9 +1332,17 @@ impl RlogWriter {
             }
             let mut stat_v: Vec<Vec<Option<ColumnValue>>> =
                 plans.iter().map(|_| vec![None; n]).collect();
-            for (li, stat) in blk_stat.into_iter().enumerate() {
-                for (cid, cv) in stat {
-                    stat_v[plan_pos[&cid]][li] = Some(cv);
+            {
+                // Drained rather than consumed: the flat array is reused by the
+                // next block, so its capacity outlives this one.
+                let mut drain = blk_stat.drain(..);
+                let mut start = 0usize;
+                for (li, &end) in blk_stat_ends.iter().enumerate() {
+                    for _ in start..end as usize {
+                        let Some((cid, cv)) = drain.next() else { break };
+                        stat_v[plan_pos[&cid]][li] = Some(cv);
+                    }
+                    start = end as usize;
                 }
             }
             // Owned per-block dict ids (one Option<index> per block row) for
@@ -1368,10 +1396,16 @@ impl RlogWriter {
             // Bloom over body, severity_text, and string columns; POSTINGS over
             // each row's merged-view indexed terms.
             let mut builder = BloomBuilder::new(self.cfg.bloom_seed);
+            let mut terms_start = 0usize;
             for (li, &g) in block_rows.iter().enumerate() {
                 insert_text(&mut builder, COL_BODY, g_body[g]);
                 insert_text(&mut builder, COL_SEVERITY_TEXT, g_sevtext[g]);
-                for (cid, v) in &blk_indexed[li] {
+                let terms_end = blk_indexed_ends
+                    .get(li)
+                    .map_or(terms_start, |end| *end as usize);
+                let terms = blk_indexed.get(terms_start..terms_end).unwrap_or(&[]);
+                terms_start = terms_end;
+                for (cid, v) in terms {
                     if postings_capped.contains(cid) {
                         continue;
                     }
@@ -1588,11 +1622,6 @@ impl RlogWriter {
     }
 }
 
-/// Tracked attribute values as `(name, (type byte, value))`, in the order a
-/// reader merges them. Used for one stream's contribution and for one record's
-/// resolved view of it ([`resolved_tracked_values`]).
-type TrackedValues = Vec<(String, (u8, ColumnValue))>;
-
 /// Dynamic-column index: type byte to (attribute name to column id). Nesting the
 /// map this way (rather than keying one map on an owned `(String, u8)`) lets the
 /// hot per-attribute probe in [`resolve_row`] borrow the name as `&str` through
@@ -1603,6 +1632,16 @@ type TrackedValues = Vec<(String, (u8, ColumnValue))>;
 /// (issue #570). The outer map has at most one entry per [`FieldType`] variant,
 /// so its lookup is effectively free.
 type ColumnIndex = HashMap<u8, HashMap<String, u32>>;
+
+/// Everything the columnar per-row loop needs about one batch column, resolved
+/// once per `(batch, column)` instead of once per cell: the in-budget dynamic
+/// column its `(name, type)` takes (`None` when it overflowed the budget, so
+/// its cells fold into `attrs_raw`), and the tracked slot of its name (`None`
+/// when the name is neither indexed nor NumStat-eligible).
+struct DynColMeta {
+    column_id: Option<u32>,
+    slot: Option<u32>,
+}
 
 /// Resolves one `(name, type byte)` pair to its dynamic column id, borrowing the
 /// name rather than cloning it. `None` when the pair took no in-budget column
@@ -1615,10 +1654,10 @@ fn column_lookup(column_of: &ColumnIndex, name: &str, ty_byte: u8) -> Option<u32
 /// Whether a stream-level-only attribute `(name, ty)` earns a dynamic column
 /// even though no record carries it per-record. Two kinds qualify:
 ///
-/// - an indexed name (ADR-0049 amendment), so `indexed_term_columns` can key
+/// - an indexed name (ADR-0049 amendment), so [`StampScratch::finish`] can key
 ///   its merged-view postings by a column, and
-/// - a numeric type (I64/F64/Bool), so `stat_winner_columns` has a column to
-///   key its NumStat by.
+/// - a numeric type (I64/F64/Bool), so the same pass has a column to key its
+///   NumStat by.
 ///
 /// The row path ([`RlogWriter::build_object`]) and the columnar path
 /// ([`RlogWriter::build_object_columnar`]) both grant these columns, and the
@@ -1635,61 +1674,50 @@ fn stream_level_column_eligible(
 
 /// Resolves one record into storage form: dense stream ref, dynamic columns
 /// split by type, overflow attributes canonicalized into `attrs_raw`, the
-/// merged-view POSTINGS terms this record contributes
-/// ([`indexed_term_columns`]), and its per-name NumStat winners
-/// ([`stat_winner_columns`]).
+/// merged-view POSTINGS terms this record contributes, and its per-name NumStat
+/// winners.
 ///
 /// The last two are two projections of one merged view
-/// ([`resolved_tracked_values`]), not two independently derived answers: they
-/// must not disagree about which value a reader resolves for a tracked name
-/// (ADR-0095 decision 1).
+/// ([`StampScratch::finish`]), not two independently derived answers: they must
+/// not disagree about which value a reader resolves for a tracked name
+/// (ADR-0095 decision 1). The columnar path stamps through the same scratch, so
+/// the two paths cannot drift.
 fn resolve_row(
     r: &LogRecord,
     ref_of: &HashMap<LogStreamId, u32>,
     column_of: &ColumnIndex,
-    indexed_names: &std::collections::HashSet<&str>,
-    numstat_names: &std::collections::HashSet<&str>,
-    stream_tracked: &HashMap<LogStreamId, TrackedValues>,
+    slot_of: &HashMap<&str, u32>,
+    index: &StampIndex,
+    stream_seeds: &HashMap<LogStreamId, StreamSeed>,
+    stamp: &mut StampScratch,
 ) -> ResolvedRow {
     let stream_ref = ref_of.get(&r.stream_id).copied().unwrap_or(0);
     let mut cols: BTreeMap<u32, ColumnValue> = BTreeMap::new();
     let mut overflow: Vec<(String, ravel_types::logstream::AttrValue)> = Vec::new();
-    // For each *tracked* name this record carries -- indexed (POSTINGS) or
+    // Each *tracked* name this record carries -- indexed (POSTINGS) or
     // NumStat-eligible (ADR-0095 decision 1: `indexed_names` union
-    // `numstat_names`) -- its own occurrences split the same way the read side
+    // `numstat_names`), which is exactly the set `slot_of` keys -- has its own
+    // occurrences pushed into the stamp scratch the same way the read side
     // reconstructs them: the columnar ones (those that took a fresh
     // dynamic-column slot, one per distinct type, each with its type byte kept
     // alongside its value) and the overflow ones (any type, duplicates and
-    // budget overflow alike). [`record_level_winners`] reduces these to the
-    // single occurrence `rebuild_record` + `merged_attrs` report for the name
-    // (docs/adrs/0049-rlog-postings.md amendment 2026-08-20). That is the record
-    // layer only; [`resolved_tracked_values`] then lays it over the stream layer,
-    // and both consumers below read that one merged answer -- there is no second
-    // resolution rule.
-    let mut tracked_cols: BTreeMap<String, Vec<(u8, ColumnValue)>> = BTreeMap::new();
-    let mut tracked_overflow: BTreeMap<String, Vec<ravel_types::logstream::AttrValue>> =
-        BTreeMap::new();
+    // budget overflow alike).
+    stamp.begin();
     for (k, v) in &r.attrs {
         let (ty, cv) = resolve_value(v);
-        let tracked = indexed_names.contains(k.as_str()) || numstat_names.contains(k.as_str());
+        let slot = slot_of.get(k.as_str()).copied();
         match column_lookup(column_of, k, ty.to_u8()) {
             Some(cid) if !cols.contains_key(&cid) => {
-                if tracked {
-                    tracked_cols
-                        .entry(k.clone())
-                        .or_default()
-                        .push((ty.to_u8(), cv.clone()));
+                if let Some(slot) = slot {
+                    stamp.push_columnar(slot, ty.to_u8(), cv.clone());
                 }
                 cols.insert(cid, cv);
             }
             // Overflow column, or a duplicate (name,type) already columnar this
             // row: fold into attrs_raw so no value is lost.
             _ => {
-                if tracked {
-                    tracked_overflow
-                        .entry(k.clone())
-                        .or_default()
-                        .push(v.clone());
+                if let Some(slot) = slot {
+                    stamp.push_overflow(slot, v.clone());
                 }
                 overflow.push((k.clone(), v.clone()));
             }
@@ -1700,15 +1728,16 @@ fn resolve_row(
     } else {
         Some(canonical_attr_bytes(&overflow))
     };
-    let winners = record_level_winners(&tracked_cols, &tracked_overflow);
-    let resolved = resolved_tracked_values(
-        stream_tracked
-            .get(&r.stream_id)
-            .map_or(&[][..], Vec::as_slice),
-        &winners,
+    let mut indexed_terms: Vec<(u32, ColumnValue)> = Vec::new();
+    let mut stat_winners: Vec<(u32, ColumnValue)> = Vec::new();
+    stamp.finish(
+        index,
+        stream_seeds.get(&r.stream_id).unwrap_or(&EMPTY_STREAM_SEED),
+        &mut StampOut {
+            indexed: &mut indexed_terms,
+            stat: &mut stat_winners,
+        },
     );
-    let indexed_terms = indexed_term_columns(&resolved, indexed_names, column_of);
-    let stat_winners = stat_winner_columns(&resolved, numstat_names, column_of);
     ResolvedRow {
         stream_ref,
         ts_ns: r.ts_ns,
@@ -1726,242 +1755,649 @@ fn resolve_row(
     }
 }
 
-/// One record's merged view of every tracked name (`indexed_names` union
-/// `numstat_names`, ADR-0095 decision 1), in the order and with the precedence
-/// `ravel_sql::rlog_attrs::merged_attrs` produces: the stream layer first
-/// (`stream_seed`, resource pairs then scope pairs, already restricted to the
-/// tracked names by the caller), then each name's record-level winner
-/// overriding in place or appending. Each entry carries the type byte its value
-/// resolves to, so a record-level winner of a different type than the stream
-/// value is keyed by the right column downstream.
+/// The number of distinct [`FieldType`] byte values, the stride of
+/// [`StampIndex::column_of_slot`]. Tied to the highest variant so a new
+/// variant widens the stride instead of being silently dropped by
+/// [`StampIndex::column`]; `field_type_span_covers_every_decodable_type`
+/// pins it against the decoder.
+const FIELD_TYPE_SPAN: usize = FieldType::Bytes as usize;
+
+/// Sentinel for "no entry" in the slot-indexed tables below. A real index is a
+/// position in a per-record occurrence list, so it never reaches this value.
+const NO_ENTRY: u32 = u32::MAX;
+
+/// Interns the tracked names (`indexed_names` union `numstat_names`, ADR-0095
+/// decision 1) into slots, returning the name-ascending slot table and the
+/// name-to-slot map.
 ///
-/// This is the single resolution step both POSTINGS ([`indexed_term_columns`])
-/// and the SKIP_IDX NumStats ([`stat_winner_columns`]) are projections of. They
-/// used to derive their own answers, and diverged: the stats saw only the
-/// record layer, so a name a record carried only on its resource or scope
-/// contributed nothing to the stat even though a reader resolves the
-/// stream-level value for it, and the stat then under-bounded its own column
-/// (ADR-0095 decision 1, corrected). Adding a value here reaches both.
-///
-/// Precedence per layer, mirroring the read side exactly: a name absent from
-/// the record keeps its stream-level value rather than being dropped, and the
-/// record wins a collision. Duplicate names *within* the stream layer (the same
-/// key on both the resource and the scope) are kept as the blob carries them,
-/// exactly as `merged_attrs` keeps them; `find_attr` reads the first, which is
-/// what [`stat_winner_columns`] resolves to.
-///
-/// A record-level winner is the occurrence `rebuild_record` + `merged_attrs`
-/// will report, not a re-derived guess: see [`record_level_winners`] for the
-/// exact two-tier order (docs/adrs/0049-rlog-postings.md amendment 2026-08-20,
-/// closing issue #333).
-fn resolved_tracked_values(
-    stream_seed: &[(String, (u8, ColumnValue))],
-    winners: &BTreeMap<String, (u8, ColumnValue)>,
-) -> TrackedValues {
-    let mut merged: TrackedValues = stream_seed.to_vec();
-    for (name, winner) in winners {
-        if let Some(slot) = merged.iter_mut().find(|(mk, _)| mk == name) {
-            slot.1 = winner.clone();
-        } else {
-            merged.push((name.clone(), winner.clone()));
-        }
-    }
-    merged
+/// Ascending slot order is ascending name order, which is the order the
+/// merged view appends record-level winners in.
+fn intern_tracked_names<'a>(
+    indexed_names: &std::collections::HashSet<&'a str>,
+    numstat_names: &std::collections::HashSet<&'a str>,
+) -> (Vec<&'a str>, HashMap<&'a str, u32>) {
+    let mut names: Vec<&str> = indexed_names
+        .iter()
+        .chain(numstat_names.iter())
+        .copied()
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    let slot_of = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (*n, i as u32))
+        .collect();
+    (names, slot_of)
 }
 
-/// The NumStat contribution of one record: each NumStat-eligible name's
-/// resolved merged-view value, keyed by the dynamic column that value's type
-/// resolves to (ADR-0095 decision 2).
+/// Everything the per-record stamp needs about a tracked name, precomputed per
+/// object and read by slot.
 ///
-/// Read off [`resolved_tracked_values`], so a name the record carries only on
-/// its resource or scope contributes the stream-level value a reader resolves
-/// for it, and a record-level occurrence overrides that. Only the first entry
-/// per name counts, matching `rlog_attrs::find_attr`, which is how a declared
-/// typed column resolves the name.
-///
-/// A resolved value of a non-numeric type (a string or bytes occurrence that
-/// outranked the numeric one) yields no entry at all, so the name's numeric
-/// column gets none either and the row counts as a null there -- which is
-/// exactly what a reader materializing that typed column produces for the row.
-/// A value whose own type has no in-budget column likewise yields no entry,
-/// again matching the read side (no column, no value).
-fn stat_winner_columns(
-    resolved: &[(String, (u8, ColumnValue))],
-    numstat_names: &std::collections::HashSet<&str>,
-    column_of: &ColumnIndex,
-) -> Vec<(u32, ColumnValue)> {
-    let mut out: Vec<(u32, ColumnValue)> = Vec::new();
-    let mut seen: BTreeSet<&str> = BTreeSet::new();
-    for (name, (ty_byte, cv)) in resolved {
-        if !numstat_names.contains(name.as_str()) || !seen.insert(name.as_str()) {
-            continue;
-        }
-        if !matches!(
-            FieldType::from_u8(*ty_byte),
-            Some(FieldType::I64 | FieldType::F64 | FieldType::Bool)
-        ) {
-            continue;
-        }
-        if let Some(cid) = column_lookup(column_of, name, *ty_byte) {
-            out.push((cid, cv.clone()));
-        }
-    }
-    out
+/// Resolving a name to its dynamic column is a two-level hash probe over owned
+/// `String` keys ([`column_lookup`]); done per record it costs one SipHash of
+/// the name per resolved value. Here the whole `(slot, type byte)` cross
+/// product is resolved once, at the column-index level, so the hot path indexes
+/// a flat table instead (issue #1135).
+struct StampIndex {
+    /// Slot-indexed: the name may key a posting.
+    indexed: Vec<bool>,
+    /// Slot-indexed: the name may key a NumStat.
+    numstat: Vec<bool>,
+    /// `slot * FIELD_TYPE_SPAN + (type byte - 1)` to the dynamic column that
+    /// pair takes, exactly as [`column_lookup`] resolves it. `None` when the
+    /// pair took no in-budget column.
+    column_of_slot: Vec<Option<u32>>,
 }
 
-/// The merged-view POSTINGS terms one record contributes: each indexed field's
-/// resolved merged-view value(s) from [`resolved_tracked_values`], keyed by the
-/// dynamic column that value's type resolves to. That view is exactly what
-/// `ravel_sql::rlog_attrs::merged_attrs` computes for SQL's `attrs` column,
-/// reproduced in this crate so the writer does not depend on ravel-sql
-/// (docs/adrs/0049-rlog-postings.md amendment 2026-08-03).
-///
-/// `resolved` covers every tracked name (indexed and NumStat-eligible alike);
-/// only the indexed ones may key a posting, so the rest are skipped here.
-/// Letting a NumStat-only name through would write postings for a column the
-/// caller never asked to index, which the accumulation loop in `build_object`
-/// (no `indexed_column_ids` re-check) relies on not happening.
-///
-/// Every entry is emitted, including a name the resource and the scope both
-/// carry: the term set a posting list holds may be a superset of what
-/// `find_attr` resolves, which costs precision and never soundness (an extra
-/// term keeps a block, it cannot drop one).
-///
-/// A field with no matching dynamic column contributes nothing. The writer
-/// gives an indexed field a column even when it appears only at stream
-/// level, so a resource-only indexed key normally does have a column to
-/// key a posting by; a key stays column-less only when it overflowed the
-/// dynamic-column budget or is not in the indexed-field list. Absence is legal;
-/// no posting for a field means no pruning on it, never a wrong prune.
-fn indexed_term_columns(
-    resolved: &[(String, (u8, ColumnValue))],
-    indexed_names: &std::collections::HashSet<&str>,
-    column_of: &ColumnIndex,
-) -> Vec<(u32, ColumnValue)> {
-    let mut out = Vec::with_capacity(resolved.len());
-    for (name, (ty_byte, cv)) in resolved {
-        if !indexed_names.contains(name.as_str()) {
-            continue;
+impl StampIndex {
+    fn build(
+        names: &[&str],
+        indexed_names: &std::collections::HashSet<&str>,
+        numstat_names: &std::collections::HashSet<&str>,
+        column_of: &ColumnIndex,
+    ) -> Self {
+        let mut indexed = Vec::with_capacity(names.len());
+        let mut numstat = Vec::with_capacity(names.len());
+        let mut column_of_slot = vec![None; names.len() * FIELD_TYPE_SPAN];
+        for (slot, name) in names.iter().enumerate() {
+            indexed.push(indexed_names.contains(name));
+            numstat.push(numstat_names.contains(name));
+            for ty in 0..FIELD_TYPE_SPAN {
+                column_of_slot[slot * FIELD_TYPE_SPAN + ty] =
+                    column_lookup(column_of, name, ty as u8 + 1);
+            }
         }
-        if let Some(cid) = column_lookup(column_of, name, *ty_byte) {
-            out.push((cid, cv.clone()));
+        Self {
+            indexed,
+            numstat,
+            column_of_slot,
         }
     }
-    out
+
+    fn slots(&self) -> usize {
+        self.indexed.len()
+    }
+
+    fn is_indexed(&self, slot: u32) -> bool {
+        self.indexed.get(slot as usize).copied().unwrap_or(false)
+    }
+
+    fn is_numstat(&self, slot: u32) -> bool {
+        self.numstat.get(slot as usize).copied().unwrap_or(false)
+    }
+
+    fn column(&self, slot: u32, ty_byte: u8) -> Option<u32> {
+        let ty = usize::from(ty_byte).checked_sub(1)?;
+        if ty >= FIELD_TYPE_SPAN {
+            return None;
+        }
+        self.column_of_slot
+            .get(slot as usize * FIELD_TYPE_SPAN + ty)
+            .copied()
+            .flatten()
+    }
 }
 
-/// The record-level winning occurrence of each tracked key this record carries,
-/// keyed by name and carrying the winner's `(type byte, value)`.
-///
-/// "Tracked" is `indexed_names` union `numstat_names` (ADR-0095 decision 1):
-/// POSTINGS and the SKIP_IDX NumStats consume the same answer from this one
-/// function, so the two sections cannot disagree about which occurrence of a
-/// duplicated key a reader will see.
-///
-/// The winner is defined as whatever the read side already, deterministically
-/// produces: `rebuild_record` lays a record's own attributes out as its
-/// columnar entries in FIELD_DIR `(name bytes, type)`-ascending order, followed
-/// by its `attrs_raw` overflow entries in `encode_attrs`'s canonical
-/// `(key bytes, encoded value bytes)`-ascending order, and
-/// `rlog_attrs::merged_attrs` then folds that list last-wins by name. Restricted
-/// to one name, that combined order is: the columnar occurrences ascending by
-/// [`FieldType::to_u8`], then the overflow occurrences ascending by the frozen
-/// canonical encoding of the value ([`canonical_value_bytes`], which shares the
-/// exact comparator `encode_attrs` uses so the two cannot drift). The last entry
-/// of that order wins. Making the write side predict this, rather than
-/// independently pick a winner over the original write-time occurrence order the
-/// on-disk format does not preserve, is the issue #333 fix
-/// (docs/adrs/0049-rlog-postings.md amendment 2026-08-20).
-fn record_level_winners(
-    tracked_cols: &BTreeMap<String, Vec<(u8, ColumnValue)>>,
-    tracked_overflow: &BTreeMap<String, Vec<ravel_types::logstream::AttrValue>>,
-) -> BTreeMap<String, (u8, ColumnValue)> {
-    let mut names: BTreeSet<&String> = BTreeSet::new();
-    names.extend(tracked_cols.keys());
-    names.extend(tracked_overflow.keys());
+/// One stream's tracked resource and scope pairs, in blob order, resolved to
+/// `(type byte, value)` and keyed by tracked slot. This is the stream layer
+/// every record's merged view is seeded from, decoded once per stream.
+struct StreamSeed {
+    entries: Vec<SeedEntry>,
+    /// Slot-indexed: `entries` carries this slot at all. A record-level winner
+    /// for a slot that is absent here appends to the merged view instead of
+    /// overriding an entry.
+    has_slot: Vec<bool>,
+}
 
-    let mut out: BTreeMap<String, (u8, ColumnValue)> = BTreeMap::new();
-    for name in names {
-        let mut combined: Vec<(u8, ColumnValue)> = Vec::new();
-        // Columnar occurrences first, ascending by type byte (FIELD_DIR's
-        // (name, type) sort key restricted to this one name).
-        if let Some(cols) = tracked_cols.get(name) {
-            let mut cols = cols.clone();
-            cols.sort_by_key(|(ty_byte, _)| *ty_byte);
-            combined.extend(cols);
+/// One resolved stream-level pair.
+struct SeedEntry {
+    slot: u32,
+    ty_byte: u8,
+    value: ColumnValue,
+    /// The first entry for this slot. Duplicate names *within* the stream layer
+    /// (the same key on both the resource and the scope) are kept as the blob
+    /// carries them, exactly as `merged_attrs` keeps them, and a record-level
+    /// winner overrides only the first of them.
+    first_of_slot: bool,
+}
+
+/// The seed of a stream with no tracked pairs, and of a record whose stream is
+/// absent from the seed map entirely.
+static EMPTY_STREAM_SEED: StreamSeed = StreamSeed {
+    entries: Vec::new(),
+    has_slot: Vec::new(),
+};
+
+impl StreamSeed {
+    fn build(
+        pairs: impl IntoIterator<Item = (String, ravel_types::logstream::AttrValue)>,
+        slot_of: &HashMap<&str, u32>,
+        slots: usize,
+    ) -> Self {
+        let mut entries = Vec::new();
+        let mut has_slot = vec![false; slots];
+        for (k, v) in pairs {
+            let Some(&slot) = slot_of.get(k.as_str()) else {
+                continue;
+            };
+            let (ty, cv) = resolve_value(&v);
+            let first_of_slot = !has_slot[slot as usize];
+            has_slot[slot as usize] = true;
+            entries.push(SeedEntry {
+                slot,
+                ty_byte: ty.to_u8(),
+                value: cv,
+                first_of_slot,
+            });
         }
-        // Overflow occurrences next, ascending by the canonical encoding of a
-        // one-entry value set. They all share this name, so this orders by
-        // encoded value bytes exactly as `attrs_raw` stores (and the reader
-        // decodes) them.
-        if let Some(over) = tracked_overflow.get(name) {
-            let mut keyed: Vec<(Vec<u8>, (u8, ColumnValue))> = over
+        Self { entries, has_slot }
+    }
+
+    fn carries(&self, slot: u32) -> bool {
+        self.has_slot.get(slot as usize).copied().unwrap_or(false)
+    }
+}
+
+/// The per-record state of one tracked slot, held in a slot-indexed table on
+/// [`StampScratch`] and reset through its `touched` list, so a record pays for
+/// the slots it carries rather than for the object's whole slot table.
+#[derive(Clone, Copy)]
+struct SlotPick {
+    /// Index into [`StampScratch::cols`] of the winning columnar occurrence.
+    cols: u32,
+    /// Type byte of the occurrence `cols` points at.
+    cols_ty: u8,
+    /// Index into [`StampScratch::over`] of the winning overflow occurrence.
+    over: u32,
+    /// Index into [`StampScratch::winners`] once the winner is materialized.
+    winner: u32,
+    /// A merged-view entry for this slot already reached the NumStat output.
+    /// Only the first entry per name counts, matching `rlog_attrs::find_attr`.
+    stat_seen: bool,
+}
+
+impl SlotPick {
+    const EMPTY: SlotPick = SlotPick {
+        cols: NO_ENTRY,
+        cols_ty: 0,
+        over: NO_ENTRY,
+        winner: NO_ENTRY,
+        stat_seen: false,
+    };
+
+    /// Untouched by this record, so not yet on the `touched` reset list.
+    fn is_empty(&self) -> bool {
+        self.cols == NO_ENTRY && self.over == NO_ENTRY && self.winner == NO_ENTRY && !self.stat_seen
+    }
+}
+
+/// The two per-record outputs of the stamp. Both are appended to, never
+/// cleared here: the columnar path points them at one block's flat arrays, the
+/// row path at the pair its [`ResolvedRow`] takes ownership of.
+struct StampOut<'a> {
+    indexed: &'a mut Vec<(u32, ColumnValue)>,
+    stat: &'a mut Vec<(u32, ColumnValue)>,
+}
+
+/// The per-record declared-column stat stamp, and the buffers it reuses.
+///
+/// One record's tracked occurrences are pushed in
+/// ([`StampScratch::push_columnar`] / [`StampScratch::push_overflow`], slot-
+/// keyed, no name cloned), then [`StampScratch::finish`] reduces them to the
+/// merged view and projects that view onto the POSTINGS terms and the SKIP_IDX
+/// NumStat winners. Every buffer lives here and is cleared per record rather
+/// than rebuilt, so the steady-state path allocates nothing (issue #1135).
+#[derive(Default)]
+struct StampScratch {
+    /// This record's tracked columnar occurrences, `(slot, type byte, value)`,
+    /// in encounter order.
+    cols: Vec<(u32, u8, ColumnValue)>,
+    /// This record's tracked overflow occurrences, `(slot, value)`, in
+    /// encounter order.
+    over: Vec<(u32, ravel_types::logstream::AttrValue)>,
+    /// Slot-indexed pick table, sized once per object by
+    /// [`StampScratch::prepare`].
+    pick: Vec<SlotPick>,
+    /// The slots this record touched, the only entries of `pick` that need
+    /// resetting.
+    touched: Vec<u32>,
+    /// This record's winners, `(slot, type byte, value)`, ascending by slot.
+    winners: Vec<(u32, u8, ColumnValue)>,
+}
+
+impl StampScratch {
+    /// Sizes the slot-indexed table for an object's tracked-name count. Called
+    /// once per object, before the first record.
+    fn prepare(&mut self, slots: usize) {
+        self.pick.clear();
+        self.pick.resize(slots, SlotPick::EMPTY);
+    }
+
+    /// Starts a record's occurrence list.
+    fn begin(&mut self) {
+        self.cols.clear();
+        self.over.clear();
+    }
+
+    /// One tracked occurrence that took an in-budget dynamic column.
+    fn push_columnar(&mut self, slot: u32, ty_byte: u8, value: ColumnValue) {
+        self.cols.push((slot, ty_byte, value));
+    }
+
+    /// One tracked occurrence that folded into `attrs_raw`: an overflow column,
+    /// or a duplicate `(name, type)` already columnar on this record.
+    fn push_overflow(&mut self, slot: u32, value: ravel_types::logstream::AttrValue) {
+        self.over.push((slot, value));
+    }
+
+    /// Reduces this record's occurrences to its merged view and appends the two
+    /// projections of that view to `out`.
+    ///
+    /// The record-level winner of a slot is whatever the read side already,
+    /// deterministically produces: `rebuild_record` lays a record's own
+    /// attributes out as its columnar entries in FIELD_DIR `(name bytes,
+    /// type)`-ascending order, followed by its `attrs_raw` overflow entries in
+    /// `encode_attrs`'s canonical `(key bytes, encoded value bytes)`-ascending
+    /// order, and `rlog_attrs::merged_attrs` then folds that list last-wins by
+    /// name. Restricted to one name, that combined order is: the columnar
+    /// occurrences ascending by [`FieldType::to_u8`], then the overflow
+    /// occurrences ascending by the frozen canonical encoding of the value
+    /// ([`canonical_value_bytes`], which shares the exact comparator
+    /// `encode_attrs` uses so the two cannot drift). The last entry of that
+    /// order wins, so an overflow occurrence beats every columnar one, and
+    /// within a tier the last occurrence of the maximum key wins. Making the
+    /// write side predict this, rather than independently pick a winner over
+    /// the original write-time occurrence order the on-disk format does not
+    /// preserve, is the issue #333 fix (docs/adrs/0049-rlog-postings.md
+    /// amendment 2026-08-20).
+    ///
+    /// The merged view then lays those winners over the stream layer with the
+    /// precedence `ravel_sql::rlog_attrs::merged_attrs` produces: the stream
+    /// seed first, in blob order, each slot's first entry replaced by the
+    /// record-level winner when the record carries one, then the winners of
+    /// slots the seed does not carry, appended ascending by slot (which is
+    /// ascending by name). A name absent from the record keeps its stream-level
+    /// value rather than being dropped, and the record wins a collision.
+    ///
+    /// Both consumers read that one merged answer. They used to derive their
+    /// own, and diverged: the stats saw only the record layer, so a name a
+    /// record carried only on its resource or scope contributed nothing to the
+    /// stat even though a reader resolves the stream-level value for it, and
+    /// the stat then under-bounded its own column (ADR-0095 decision 1,
+    /// corrected). Adding a value here reaches both.
+    fn finish(&mut self, index: &StampIndex, seed: &StreamSeed, out: &mut StampOut<'_>) {
+        let Self {
+            cols,
+            over,
+            pick,
+            touched,
+            winners,
+        } = self;
+
+        // Group the columnar occurrences by slot in one pass. Keeping the last
+        // occurrence whose type byte is greater than or equal to the incumbent
+        // is exactly what a stable sort by type byte followed by taking the
+        // last entry produced.
+        for (i, (slot, ty_byte, _)) in cols.iter().enumerate() {
+            let Some(p) = pick.get_mut(*slot as usize) else {
+                continue;
+            };
+            if p.cols == NO_ENTRY {
+                touched.push(*slot);
+                p.cols = i as u32;
+                p.cols_ty = *ty_byte;
+            } else if *ty_byte >= p.cols_ty {
+                p.cols = i as u32;
+                p.cols_ty = *ty_byte;
+            }
+        }
+
+        // Same pass over the overflow occurrences, ordered by the canonical
+        // encoding of a one-entry value set. Only a slot carrying two of them
+        // (a key duplicated in `attrs_raw`) encodes anything at all: with one
+        // occurrence there is nothing to order it against.
+        for (i, (slot, value)) in over.iter().enumerate() {
+            let Some(p) = pick.get_mut(*slot as usize) else {
+                continue;
+            };
+            if p.cols == NO_ENTRY && p.over == NO_ENTRY {
+                touched.push(*slot);
+            }
+            match over.get(p.over as usize) {
+                None => p.over = i as u32,
+                Some((_, incumbent)) => {
+                    if canonical_value_bytes(value) >= canonical_value_bytes(incumbent) {
+                        p.over = i as u32;
+                    }
+                }
+            }
+        }
+
+        // Materialize each touched slot's winner, ascending by slot: the
+        // overflow tier wins outright when the record has one.
+        touched.sort_unstable();
+        for &slot in touched.iter() {
+            let Some(p) = pick.get_mut(slot as usize) else {
+                continue;
+            };
+            let winner = if let Some((_, value)) = over.get(p.over as usize) {
+                let (ty, cv) = resolve_value(value);
+                (slot, ty.to_u8(), cv)
+            } else if let Some((_, ty_byte, cv)) = cols.get(p.cols as usize) {
+                (slot, *ty_byte, cv.clone())
+            } else {
+                continue;
+            };
+            p.winner = winners.len() as u32;
+            winners.push(winner);
+        }
+
+        // The merged view, emitted in order: the stream layer with winners
+        // overriding in place, then the record-only winners.
+        for entry in &seed.entries {
+            let winner = if entry.first_of_slot {
+                pick.get(entry.slot as usize)
+                    .map(|p| p.winner)
+                    .filter(|w| *w != NO_ENTRY)
+                    .and_then(|w| winners.get(w as usize))
+            } else {
+                None
+            };
+            match winner {
+                Some((_, ty_byte, value)) => {
+                    emit_merged(index, pick, touched, entry.slot, *ty_byte, value, out);
+                }
+                None => emit_merged(
+                    index,
+                    pick,
+                    touched,
+                    entry.slot,
+                    entry.ty_byte,
+                    &entry.value,
+                    out,
+                ),
+            }
+        }
+        for (slot, ty_byte, value) in winners.iter() {
+            if seed.carries(*slot) {
+                continue;
+            }
+            emit_merged(index, pick, touched, *slot, *ty_byte, value, out);
+        }
+
+        for &slot in touched.iter() {
+            if let Some(p) = pick.get_mut(slot as usize) {
+                *p = SlotPick::EMPTY;
+            }
+        }
+        touched.clear();
+        winners.clear();
+        cols.clear();
+        over.clear();
+    }
+}
+
+/// Projects one merged-view entry onto the two per-record outputs.
+///
+/// POSTINGS takes every indexed entry, including a name the resource and the
+/// scope both carry: the term set a posting list holds may be a superset of
+/// what `find_attr` resolves, which costs precision and never soundness (an
+/// extra term keeps a block, it cannot drop one). A field with no matching
+/// dynamic column contributes nothing; absence is legal, no posting for a field
+/// means no pruning on it, never a wrong prune.
+///
+/// The NumStat takes only the first entry per name, matching
+/// `rlog_attrs::find_attr`, which is how a declared typed column resolves the
+/// name. A resolved value of a non-numeric type (a string or bytes occurrence
+/// that outranked the numeric one) yields no entry at all, so the name's
+/// numeric column gets none either and the row counts as a null there -- which
+/// is exactly what a reader materializing that typed column produces for the
+/// row. A value whose own type has no in-budget column likewise yields no
+/// entry, again matching the read side (no column, no value). The
+/// first-per-name mark is taken before those two checks, so a first entry that
+/// yields nothing still shadows any later entry for the name.
+fn emit_merged(
+    index: &StampIndex,
+    pick: &mut [SlotPick],
+    touched: &mut Vec<u32>,
+    slot: u32,
+    ty_byte: u8,
+    value: &ColumnValue,
+    out: &mut StampOut<'_>,
+) {
+    if index.is_indexed(slot)
+        && let Some(cid) = index.column(slot, ty_byte)
+    {
+        out.indexed.push((cid, value.clone()));
+    }
+    if !index.is_numstat(slot) {
+        return;
+    }
+    let Some(p) = pick.get_mut(slot as usize) else {
+        return;
+    };
+    if p.stat_seen {
+        return;
+    }
+    if p.is_empty() {
+        // A slot the record does not carry, reached through the stream layer
+        // alone: it needs resetting too.
+        touched.push(slot);
+    }
+    p.stat_seen = true;
+    if !matches!(
+        FieldType::from_u8(ty_byte),
+        Some(FieldType::I64 | FieldType::F64 | FieldType::Bool)
+    ) {
+        return;
+    }
+    if let Some(cid) = index.column(slot, ty_byte) {
+        out.stat.push((cid, value.clone()));
+    }
+}
+
+/// A test- and bench-only handle on the per-record declared-column stat stamp,
+/// used by the allocation pin (`tests/stamp_alloc_pin.rs`) and the stamp
+/// benchmark (`benches/stamp_declared.rs`). Both have to drive the stamp alone:
+/// the record encode around it allocates per row by construction and would
+/// swamp either figure (issue #1135).
+///
+/// Not part of the crate's supported API.
+#[doc(hidden)]
+pub mod stamp_probe {
+    use std::collections::{HashMap, HashSet};
+
+    use ravel_types::logstream::AttrValue;
+
+    use crate::record::{ColumnValue, FieldType, resolve_value};
+
+    use super::{
+        ColumnIndex, StampIndex, StampOut, StampScratch, StreamSeed, column_lookup,
+        intern_tracked_names,
+    };
+
+    /// A stamp's two projections: POSTINGS terms and NumStat winners.
+    pub type StampOutputs<'a> = (&'a [(u32, ColumnValue)], &'a [(u32, ColumnValue)]);
+
+    /// One record's tracked occurrences, split into the two tiers the winner
+    /// rule orders: those that took an in-budget dynamic column, and those that
+    /// folded into `attrs_raw` (an overflow column, or a duplicate
+    /// `(name, type)` already columnar on the record).
+    pub struct ProbeRecord {
+        cols: Vec<(u32, u8, ColumnValue)>,
+        over: Vec<(u32, AttrValue)>,
+    }
+
+    impl ProbeRecord {
+        pub fn columnar(&self) -> &[(u32, u8, ColumnValue)] {
+            &self.cols
+        }
+
+        pub fn overflow(&self) -> &[(u32, AttrValue)] {
+            &self.over
+        }
+    }
+
+    /// One object's stamp state plus a pre-split record corpus, so a caller can
+    /// time or instrument [`StampProbe::stamp`] on its own.
+    pub struct StampProbe {
+        index: StampIndex,
+        scratch: StampScratch,
+        seed: StreamSeed,
+        names: Vec<String>,
+        records: Vec<ProbeRecord>,
+        indexed: Vec<(u32, ColumnValue)>,
+        stat: Vec<(u32, ColumnValue)>,
+    }
+
+    impl StampProbe {
+        /// Builds the probe over one object's dynamic-column assignment
+        /// (`columns`, as the writer assigns it), the caller's indexed-field
+        /// list, one stream's resource and scope pairs, and the records to
+        /// stamp. Every per-record occurrence list is split here, once, so
+        /// `stamp` measures the stamp and nothing else.
+        pub fn new(
+            columns: &[(String, FieldType, u32)],
+            indexed_fields: &[String],
+            stream_attrs: &[(String, AttrValue)],
+            records: &[Vec<(String, AttrValue)>],
+        ) -> Self {
+            let mut column_of: ColumnIndex = HashMap::new();
+            for (name, ty, cid) in columns {
+                column_of
+                    .entry(ty.to_u8())
+                    .or_default()
+                    .insert(name.clone(), *cid);
+            }
+            let indexed_names: HashSet<&str> = indexed_fields.iter().map(String::as_str).collect();
+            let numstat_names: HashSet<&str> = columns
                 .iter()
-                .map(|v| {
-                    let (ty, cv) = resolve_value(v);
-                    (canonical_value_bytes(v), (ty.to_u8(), cv))
+                .filter(|(_, ty, _)| {
+                    matches!(ty, FieldType::I64 | FieldType::F64 | FieldType::Bool)
                 })
+                .map(|(name, _, _)| name.as_str())
                 .collect();
-            keyed.sort_by(|a, b| a.0.cmp(&b.0));
-            combined.extend(keyed.into_iter().map(|(_, entry)| entry));
+            let (names, slot_of) = intern_tracked_names(&indexed_names, &numstat_names);
+            let index = StampIndex::build(&names, &indexed_names, &numstat_names, &column_of);
+            let seed = StreamSeed::build(stream_attrs.iter().cloned(), &slot_of, index.slots());
+            let records = records
+                .iter()
+                .map(|attrs| split_occurrences(attrs, &column_of, &slot_of))
+                .collect();
+            let mut scratch = StampScratch::default();
+            scratch.prepare(index.slots());
+            Self {
+                index,
+                scratch,
+                seed,
+                names: names.iter().map(|n| (*n).to_string()).collect(),
+                records,
+                indexed: Vec::new(),
+                stat: Vec::new(),
+            }
         }
-        if let Some(winner) = combined.pop() {
-            out.insert(name.clone(), winner);
-        }
-    }
-    out
-}
 
-/// The slot-keyed counterpart of [`record_level_winners`], used by the columnar
-/// path. `cols` and `overflow` are one record's tracked occurrences flattened
-/// (`(tracked slot, ...)`) rather than grouped in a per-record `BTreeMap`, so no
-/// name is cloned and no map node is allocated per cell (#682). `names` maps a
-/// slot back to its name; because the slot table is name-sorted, iterating slots
-/// ascending yields the same name order [`record_level_winners`] produces, and
-/// the winner rule (columnar occurrences ascending by type byte, then overflow
-/// occurrences ascending by canonical value bytes, last wins) is identical, so
-/// the returned map is byte-for-byte the same.
-fn record_level_winners_slot(
-    cols: &[(u32, u8, ColumnValue)],
-    overflow: &[(u32, ravel_types::logstream::AttrValue)],
-    names: &[&str],
-) -> BTreeMap<String, (u8, ColumnValue)> {
-    let mut slots: BTreeSet<u32> = BTreeSet::new();
-    for (slot, _, _) in cols {
-        slots.insert(*slot);
-    }
-    for (slot, _) in overflow {
-        slots.insert(*slot);
-    }
+        /// Slot to tracked name, name-ascending.
+        pub fn tracked_names(&self) -> &[String] {
+            &self.names
+        }
 
-    let mut out: BTreeMap<String, (u8, ColumnValue)> = BTreeMap::new();
-    for slot in slots {
-        let mut combined: Vec<(u8, ColumnValue)> = Vec::new();
-        // Columnar occurrences first, ascending by type byte.
-        let mut cs: Vec<(u8, ColumnValue)> = cols
-            .iter()
-            .filter(|(s, _, _)| *s == slot)
-            .map(|(_, ty, cv)| (*ty, cv.clone()))
-            .collect();
-        cs.sort_by_key(|(ty, _)| *ty);
-        combined.extend(cs);
-        // Overflow occurrences next, ascending by the canonical encoding of a
-        // one-entry value set (the same order `attrs_raw` stores them).
-        let mut keyed: Vec<(Vec<u8>, (u8, ColumnValue))> = overflow
-            .iter()
-            .filter(|(s, _)| *s == slot)
-            .map(|(_, v)| {
-                let (ty, cv) = resolve_value(v);
-                (canonical_value_bytes(v), (ty.to_u8(), cv))
-            })
-            .collect();
-        keyed.sort_by(|a, b| a.0.cmp(&b.0));
-        combined.extend(keyed.into_iter().map(|(_, entry)| entry));
-        if let Some(winner) = combined.pop() {
-            out.insert(names[slot as usize].to_string(), winner);
+        pub fn len(&self) -> usize {
+            self.records.len()
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.records.is_empty()
+        }
+
+        pub fn record(&self, i: usize) -> Option<&ProbeRecord> {
+            self.records.get(i)
+        }
+
+        /// Stamps record `i`, leaving its POSTINGS terms and NumStat winners in
+        /// [`StampProbe::outputs`]. Out of range is a no-op.
+        pub fn stamp(&mut self, i: usize) {
+            let Self {
+                index,
+                scratch,
+                seed,
+                records,
+                indexed,
+                stat,
+                ..
+            } = self;
+            let Some(rec) = records.get(i) else {
+                return;
+            };
+            scratch.begin();
+            for (slot, ty_byte, value) in &rec.cols {
+                scratch.push_columnar(*slot, *ty_byte, value.clone());
+            }
+            for (slot, value) in &rec.over {
+                scratch.push_overflow(*slot, value.clone());
+            }
+            indexed.clear();
+            stat.clear();
+            scratch.finish(index, seed, &mut StampOut { indexed, stat });
+        }
+
+        /// The last [`StampProbe::stamp`]'s `(POSTINGS terms, NumStat winners)`.
+        pub fn outputs(&self) -> StampOutputs<'_> {
+            (&self.indexed, &self.stat)
         }
     }
-    out
+
+    /// Splits one record's attributes into the two occurrence tiers, by the
+    /// same rule `resolve_row` applies: the first occurrence of a
+    /// `(name, type)` with an in-budget column is columnar, every later or
+    /// column-less one folds into `attrs_raw`.
+    fn split_occurrences(
+        attrs: &[(String, AttrValue)],
+        column_of: &ColumnIndex,
+        slot_of: &HashMap<&str, u32>,
+    ) -> ProbeRecord {
+        let mut used: HashSet<u32> = HashSet::new();
+        let mut cols = Vec::new();
+        let mut over = Vec::new();
+        for (k, v) in attrs {
+            let (ty, cv) = resolve_value(v);
+            let slot = slot_of.get(k.as_str()).copied();
+            match column_lookup(column_of, k, ty.to_u8()) {
+                Some(cid) if used.insert(cid) => {
+                    if let Some(slot) = slot {
+                        cols.push((slot, ty.to_u8(), cv));
+                    }
+                }
+                _ => {
+                    if let Some(slot) = slot {
+                        over.push((slot, v.clone()));
+                    }
+                }
+            }
+        }
+        ProbeRecord { cols, over }
+    }
 }
 
 /// A per-64-row popcount prefix over a presence bitmap's bytes: `out[w]` is the
@@ -2397,6 +2833,22 @@ mod tests {
     use crate::reader::{RlogReader, read_section};
     use crate::record::{Predicate, stream_attrs_bytes};
     use ravel_types::logstream::{AttrValue, log_stream_id};
+
+    /// The slot-to-column stride must admit exactly the type bytes the
+    /// decoder admits: a variant added to `FieldType` without widening the
+    /// stride would make `StampIndex::column` drop that type's stamps.
+    #[test]
+    fn field_type_span_covers_every_decodable_type() {
+        for byte in 0..=u8::MAX {
+            let decodable = FieldType::from_u8(byte).is_some();
+            let in_span = (1..=FIELD_TYPE_SPAN as u8).contains(&byte);
+            assert_eq!(
+                decodable, in_span,
+                "type byte {byte}: decodable={decodable} but inside the stride={in_span}"
+            );
+        }
+        assert_eq!(FIELD_TYPE_SPAN, 5, "five field types are decodable today");
+    }
 
     fn identity() -> ObjectIdentity {
         ObjectIdentity {
@@ -3759,6 +4211,518 @@ mod tests {
             let col_counts: Vec<u32> = col_l0.iter().map(|e| e.record_count).collect();
             assert!(row_counts.len() > 1, "expected multiple blocks");
             assert_eq!(row_counts, col_counts);
+        }
+    }
+
+    /// The issue #1135 anchor: the one-pass slot-keyed stamp
+    /// ([`StampScratch::finish`]) against a reference copy of the name-keyed
+    /// path it replaced, over random records and over the 104-declared-column
+    /// shape the issue profiled.
+    ///
+    /// The reference below is the pre-#1135 code from `writer.rs` at 7c0c337,
+    /// verbatim. It is a frozen copy, not code to maintain: tidying it, or
+    /// letting it drift toward the new implementation, is what would make this
+    /// test stop meaning anything. (`benches/common/stamp_shape.rs` holds the
+    /// same copy for the benchmark and the allocation pin, which compile
+    /// against the crate from outside and cannot reach this module.)
+    mod stamp_differential {
+        use super::*;
+        use proptest::prelude::*;
+        use stamp_probe::{ProbeRecord, StampProbe};
+
+        type TrackedValues = Vec<(String, (u8, ColumnValue))>;
+        /// A stamp's two projections: POSTINGS terms and NumStat winners.
+        type StampOutputs = (Vec<(u32, ColumnValue)>, Vec<(u32, ColumnValue)>);
+
+        // ---- reference copy of the pre-#1135 path (frozen) ----------------
+
+        fn record_level_winners_slot(
+            cols: &[(u32, u8, ColumnValue)],
+            overflow: &[(u32, AttrValue)],
+            names: &[&str],
+        ) -> BTreeMap<String, (u8, ColumnValue)> {
+            let mut slots: BTreeSet<u32> = BTreeSet::new();
+            for (slot, _, _) in cols {
+                slots.insert(*slot);
+            }
+            for (slot, _) in overflow {
+                slots.insert(*slot);
+            }
+
+            let mut out: BTreeMap<String, (u8, ColumnValue)> = BTreeMap::new();
+            for slot in slots {
+                let mut combined: Vec<(u8, ColumnValue)> = Vec::new();
+                let mut cs: Vec<(u8, ColumnValue)> = cols
+                    .iter()
+                    .filter(|(s, _, _)| *s == slot)
+                    .map(|(_, ty, cv)| (*ty, cv.clone()))
+                    .collect();
+                cs.sort_by_key(|(ty, _)| *ty);
+                combined.extend(cs);
+                let mut keyed: Vec<(Vec<u8>, (u8, ColumnValue))> = overflow
+                    .iter()
+                    .filter(|(s, _)| *s == slot)
+                    .map(|(_, v)| {
+                        let (ty, cv) = resolve_value(v);
+                        (canonical_value_bytes(v), (ty.to_u8(), cv))
+                    })
+                    .collect();
+                keyed.sort_by(|a, b| a.0.cmp(&b.0));
+                combined.extend(keyed.into_iter().map(|(_, entry)| entry));
+                if let Some(winner) = combined.pop() {
+                    out.insert(names[slot as usize].to_string(), winner);
+                }
+            }
+            out
+        }
+
+        fn resolved_tracked_values(
+            stream_seed: &[(String, (u8, ColumnValue))],
+            winners: &BTreeMap<String, (u8, ColumnValue)>,
+        ) -> TrackedValues {
+            let mut merged: TrackedValues = stream_seed.to_vec();
+            for (name, winner) in winners {
+                if let Some(slot) = merged.iter_mut().find(|(mk, _)| mk == name) {
+                    slot.1 = winner.clone();
+                } else {
+                    merged.push((name.clone(), winner.clone()));
+                }
+            }
+            merged
+        }
+
+        fn stat_winner_columns(
+            resolved: &[(String, (u8, ColumnValue))],
+            numstat_names: &HashSet<&str>,
+            column_of: &ColumnIndex,
+        ) -> Vec<(u32, ColumnValue)> {
+            let mut out: Vec<(u32, ColumnValue)> = Vec::new();
+            let mut seen: BTreeSet<&str> = BTreeSet::new();
+            for (name, (ty_byte, cv)) in resolved {
+                if !numstat_names.contains(name.as_str()) || !seen.insert(name.as_str()) {
+                    continue;
+                }
+                if !matches!(
+                    FieldType::from_u8(*ty_byte),
+                    Some(FieldType::I64 | FieldType::F64 | FieldType::Bool)
+                ) {
+                    continue;
+                }
+                if let Some(cid) = column_lookup(column_of, name, *ty_byte) {
+                    out.push((cid, cv.clone()));
+                }
+            }
+            out
+        }
+
+        fn indexed_term_columns(
+            resolved: &[(String, (u8, ColumnValue))],
+            indexed_names: &HashSet<&str>,
+            column_of: &ColumnIndex,
+        ) -> Vec<(u32, ColumnValue)> {
+            let mut out = Vec::with_capacity(resolved.len());
+            for (name, (ty_byte, cv)) in resolved {
+                if !indexed_names.contains(name.as_str()) {
+                    continue;
+                }
+                if let Some(cid) = column_lookup(column_of, name, *ty_byte) {
+                    out.push((cid, cv.clone()));
+                }
+            }
+            out
+        }
+
+        // ---- driving both paths over the same inputs ----------------------
+
+        /// One object's stamp inputs.
+        struct Setup {
+            columns: Vec<(String, FieldType, u32)>,
+            indexed_fields: Vec<String>,
+            stream_attrs: Vec<(String, AttrValue)>,
+            records: Vec<Vec<(String, AttrValue)>>,
+        }
+
+        /// The per-object state the old path built once per object.
+        struct Reference<'a> {
+            names: Vec<&'a str>,
+            seed: TrackedValues,
+            indexed_names: HashSet<&'a str>,
+            numstat_names: HashSet<&'a str>,
+            column_of: ColumnIndex,
+        }
+
+        impl<'a> Reference<'a> {
+            fn new(setup: &'a Setup) -> Self {
+                let mut column_of: ColumnIndex = HashMap::new();
+                for (name, ty, cid) in &setup.columns {
+                    column_of
+                        .entry(ty.to_u8())
+                        .or_default()
+                        .insert(name.clone(), *cid);
+                }
+                let indexed_names: HashSet<&str> =
+                    setup.indexed_fields.iter().map(String::as_str).collect();
+                let numstat_names: HashSet<&str> = setup
+                    .columns
+                    .iter()
+                    .filter(|(_, ty, _)| {
+                        matches!(ty, FieldType::I64 | FieldType::F64 | FieldType::Bool)
+                    })
+                    .map(|(name, _, _)| name.as_str())
+                    .collect();
+                let mut names: Vec<&str> = indexed_names
+                    .iter()
+                    .copied()
+                    .chain(numstat_names.iter().copied())
+                    .collect();
+                names.sort_unstable();
+                names.dedup();
+
+                let mut seed: TrackedValues = Vec::new();
+                for (k, v) in &setup.stream_attrs {
+                    if indexed_names.contains(k.as_str()) || numstat_names.contains(k.as_str()) {
+                        let (ty, cv) = resolve_value(v);
+                        seed.push((k.clone(), (ty.to_u8(), cv)));
+                    }
+                }
+                Reference {
+                    names,
+                    seed,
+                    indexed_names,
+                    numstat_names,
+                    column_of,
+                }
+            }
+
+            fn stamp(&self, rec: &ProbeRecord) -> StampOutputs {
+                let winners =
+                    record_level_winners_slot(rec.columnar(), rec.overflow(), &self.names);
+                let resolved = resolved_tracked_values(&self.seed, &winners);
+                (
+                    indexed_term_columns(&resolved, &self.indexed_names, &self.column_of),
+                    stat_winner_columns(&resolved, &self.numstat_names, &self.column_of),
+                )
+            }
+        }
+
+        /// Every record's `(old, new)` stamp outputs.
+        fn old_and_new(setup: &Setup) -> Vec<(StampOutputs, StampOutputs)> {
+            let reference = Reference::new(setup);
+            let mut probe = StampProbe::new(
+                &setup.columns,
+                &setup.indexed_fields,
+                &setup.stream_attrs,
+                &setup.records,
+            );
+            let mut out = Vec::with_capacity(probe.len());
+            for i in 0..probe.len() {
+                let old = reference.stamp(probe.record(i).expect("record in range"));
+                probe.stamp(i);
+                let (indexed, stat) = probe.outputs();
+                out.push((old, (indexed.to_vec(), stat.to_vec())));
+            }
+            out
+        }
+
+        /// The per-column min and max the block's NumStat accumulator folds a
+        /// column's winners into, over every record at once. Equal winners
+        /// imply equal stamps, but the issue asks for the stamps themselves, so
+        /// they are folded here rather than left implied.
+        fn numstat_min_max(
+            per_record: impl Iterator<Item = Vec<(u32, ColumnValue)>>,
+        ) -> BTreeMap<u32, (ColumnValue, ColumnValue)> {
+            let mut out: BTreeMap<u32, (ColumnValue, ColumnValue)> = BTreeMap::new();
+            for stat in per_record {
+                for (cid, v) in stat {
+                    match out.entry(cid) {
+                        Entry::Vacant(e) => {
+                            e.insert((v.clone(), v));
+                        }
+                        Entry::Occupied(mut e) => {
+                            let (lo, hi) = e.get_mut();
+                            if numeric_lt(&v, lo) {
+                                *lo = v.clone();
+                            }
+                            if numeric_lt(hi, &v) {
+                                *hi = v;
+                            }
+                        }
+                    }
+                }
+            }
+            out
+        }
+
+        /// Numeric ordering of two NumStat-eligible values of the same column,
+        /// so the fold above is total (`f64::total_cmp` orders NaN too).
+        fn numeric_lt(a: &ColumnValue, b: &ColumnValue) -> bool {
+            match (a, b) {
+                (ColumnValue::I64(x), ColumnValue::I64(y)) => x < y,
+                (ColumnValue::F64(x), ColumnValue::F64(y)) => {
+                    f64::from_bits(*x).total_cmp(&f64::from_bits(*y)).is_lt()
+                }
+                (ColumnValue::Bool(x), ColumnValue::Bool(y)) => !x & y,
+                _ => false,
+            }
+        }
+
+        // ---- the 104-declared-column shape --------------------------------
+
+        const DECLARED_COLUMNS: usize = 104;
+        /// The names a record carries twice: once columnar, once in
+        /// `attrs_raw`, so the overflow tier decides the winner.
+        const DUPLICATED: [usize; 3] = [7, 23, 61];
+
+        fn column_name(i: usize) -> String {
+            format!("col_{i:03}")
+        }
+
+        fn column_type(i: usize) -> FieldType {
+            match i % 8 {
+                5 => FieldType::F64,
+                6 => FieldType::Bool,
+                _ => FieldType::I64,
+            }
+        }
+
+        fn declared_value(r: usize, i: usize) -> AttrValue {
+            match column_type(i) {
+                FieldType::F64 => AttrValue::F64(r as f64 + i as f64 / 128.0),
+                FieldType::Bool => AttrValue::Bool((r + i).is_multiple_of(2)),
+                _ => AttrValue::I64((r * DECLARED_COLUMNS + i) as i64),
+            }
+        }
+
+        /// The ClickBench-like shape the issue profiled: about a hundred
+        /// declared columns per record, almost all numeric, a quarter of them
+        /// also indexed, three names duplicated on the record, one occurrence
+        /// whose type has no column, and a stream layer carrying two names of
+        /// its own plus a duplicate entry.
+        fn wide_setup(n_records: usize) -> Setup {
+            let mut columns: Vec<(String, FieldType, u32)> = (0..DECLARED_COLUMNS)
+                .map(|i| (column_name(i), column_type(i), i as u32))
+                .collect();
+            columns.push((
+                "stream_only_0".to_string(),
+                FieldType::I64,
+                DECLARED_COLUMNS as u32,
+            ));
+            columns.push((
+                "stream_only_1".to_string(),
+                FieldType::I64,
+                DECLARED_COLUMNS as u32 + 1,
+            ));
+
+            let stream_attrs = vec![
+                ("service.name".to_string(), AttrValue::Str("bench".into())),
+                ("stream_only_0".to_string(), AttrValue::I64(-1)),
+                ("stream_only_1".to_string(), AttrValue::I64(-2)),
+                (column_name(0), AttrValue::I64(-3)),
+                ("stream_only_0".to_string(), AttrValue::I64(-4)),
+            ];
+
+            let records = (0..n_records)
+                .map(|r| {
+                    let mut attrs = Vec::with_capacity(DECLARED_COLUMNS + 4);
+                    for i in 0..DECLARED_COLUMNS {
+                        attrs.push((column_name(i), declared_value(r, i)));
+                    }
+                    for i in DUPLICATED {
+                        attrs.push((column_name(i), declared_value(r + 1, i)));
+                    }
+                    attrs.push((column_name(42), AttrValue::F64(r as f64 + 0.5)));
+                    attrs
+                })
+                .collect();
+
+            Setup {
+                columns,
+                indexed_fields: (0..DECLARED_COLUMNS).step_by(4).map(column_name).collect(),
+                stream_attrs,
+                records,
+            }
+        }
+
+        /// Exact expected winners on the 104-column shape, stated here rather
+        /// than read off either implementation.
+        #[test]
+        fn wide_shape_pins_exact_winners() {
+            let setup = wide_setup(1);
+            let mut probe = StampProbe::new(
+                &setup.columns,
+                &setup.indexed_fields,
+                &setup.stream_attrs,
+                &setup.records,
+            );
+            assert_eq!(probe.tracked_names().len(), DECLARED_COLUMNS + 2);
+            probe.stamp(0);
+            let (indexed, stat) = probe.outputs();
+
+            // The record's winner for a name it carries once is that
+            // occurrence; for a duplicated name it is the `attrs_raw`
+            // occurrence, which outranks every columnar one.
+            let want = |i: usize| {
+                let r = usize::from(DUPLICATED.contains(&i));
+                resolve_value(&declared_value(r, i)).1
+            };
+
+            // Stream seed order first (`stream_only_0`, `stream_only_1`,
+            // `col_000`), then the record-only winners ascending by slot, which
+            // is ascending by name. `col_042`'s winner is its `attrs_raw` F64
+            // occurrence, and the name has no F64 column, so it contributes no
+            // NumStat entry at all. The duplicate `stream_only_0` seed entry
+            // contributes none either: NumStat takes the first entry per name.
+            let mut want_stat: Vec<(u32, ColumnValue)> = vec![
+                (DECLARED_COLUMNS as u32, ColumnValue::I64(-1)),
+                (DECLARED_COLUMNS as u32 + 1, ColumnValue::I64(-2)),
+                (0, want(0)),
+            ];
+            want_stat.extend(
+                (1..DECLARED_COLUMNS)
+                    .filter(|i| *i != 42)
+                    .map(|i| (i as u32, want(i))),
+            );
+            assert_eq!(stat, want_stat.as_slice());
+            assert_eq!(stat.len(), DECLARED_COLUMNS + 1);
+
+            // Every fourth column is indexed; `col_000` is stamped from its
+            // seed position, the rest in slot order.
+            let want_indexed: Vec<(u32, ColumnValue)> = (0..DECLARED_COLUMNS)
+                .step_by(4)
+                .map(|i| (i as u32, want(i)))
+                .collect();
+            assert_eq!(indexed, want_indexed.as_slice());
+            assert_eq!(indexed.len(), 26);
+
+            // The seed value for `col_000` (-3) lost to the record, and the
+            // duplicated names took their `attrs_raw` value.
+            assert_eq!(stat[2], (0, ColumnValue::I64(0)));
+            assert_eq!(stat[9], (7, ColumnValue::I64(DECLARED_COLUMNS as i64 + 7)));
+
+            // And the old path agrees, on the shape and on both projections.
+            let reference = Reference::new(&setup);
+            let (old_indexed, old_stat) = reference.stamp(probe.record(0).expect("record 0"));
+            assert_eq!(old_indexed, want_indexed);
+            assert_eq!(old_stat, want_stat);
+        }
+
+        #[test]
+        fn wide_shape_matches_reference_over_many_records() {
+            let setup = wide_setup(64);
+            let pairs = old_and_new(&setup);
+            assert_eq!(pairs.len(), 64);
+            for (i, (old, new)) in pairs.iter().enumerate() {
+                assert_eq!(old.0, new.0, "postings terms, record {i}");
+                assert_eq!(old.1, new.1, "numstat winners, record {i}");
+            }
+            let old_stats = numstat_min_max(pairs.iter().map(|(old, _)| old.1.clone()));
+            let new_stats = numstat_min_max(pairs.iter().map(|(_, new)| new.1.clone()));
+            assert_eq!(old_stats, new_stats);
+            assert_eq!(old_stats.len(), DECLARED_COLUMNS + 1);
+        }
+
+        // ---- the differential property ------------------------------------
+
+        fn arb_value() -> impl Strategy<Value = AttrValue> {
+            let leaf = prop_oneof![
+                any::<i64>().prop_map(AttrValue::I64),
+                any::<f64>().prop_map(AttrValue::F64),
+                any::<bool>().prop_map(AttrValue::Bool),
+                "[a-z]{0,3}".prop_map(AttrValue::Str),
+                proptest::collection::vec(any::<u8>(), 0..3).prop_map(AttrValue::Bytes),
+            ];
+            leaf.prop_recursive(2, 4, 2, |inner| {
+                prop_oneof![
+                    proptest::collection::vec(inner.clone(), 0..2).prop_map(AttrValue::List),
+                    proptest::collection::vec(("[a-z]{1,2}", inner), 0..2).prop_map(AttrValue::Map),
+                ]
+            })
+        }
+
+        /// A name index, drawn either from the whole pool (so wide records
+        /// reach many slots) or from its first few entries (so one record
+        /// carries the same name several times).
+        fn arb_name_idx() -> impl Strategy<Value = usize> {
+            prop_oneof![0usize..128, 0usize..5]
+        }
+
+        fn arb_attrs(max: usize) -> impl Strategy<Value = Vec<(usize, AttrValue)>> {
+            proptest::collection::vec((arb_name_idx(), arb_value()), 0..max)
+        }
+
+        fn name_of(idx: usize, pool: usize) -> String {
+            format!("n{:03}", idx % pool)
+        }
+
+        /// Assigns dynamic columns the way the writer does: one column per
+        /// distinct `(name, type)` in `(name, type)`-ascending order, until the
+        /// budget runs out. Everything past the budget has no column, so its
+        /// occurrences fold into `attrs_raw`.
+        fn assign_columns(
+            stream_attrs: &[(String, AttrValue)],
+            records: &[Vec<(String, AttrValue)>],
+            max_dyn: usize,
+        ) -> Vec<(String, FieldType, u32)> {
+            let mut distinct: BTreeSet<(String, u8)> = BTreeSet::new();
+            for (k, v) in stream_attrs.iter().chain(records.iter().flatten()) {
+                distinct.insert((k.clone(), resolve_value(v).0.to_u8()));
+            }
+            distinct
+                .into_iter()
+                .take(max_dyn)
+                .enumerate()
+                .filter_map(|(cid, (name, ty_byte))| {
+                    FieldType::from_u8(ty_byte).map(|ty| (name, ty, cid as u32))
+                })
+                .collect()
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+
+            /// The one-pass slot-keyed stamp and the name-keyed path it
+            /// replaced produce the same POSTINGS terms, the same NumStat
+            /// winners, and the same folded min/max, over records reaching up
+            /// to 128 tracked slots, names duplicated within a record, values
+            /// of every kind (including `List`/`Map`, which canonicalize into
+            /// `Bytes`), occurrences with no column at all, and a stream layer
+            /// that seeds names the records do not carry, carries a name they
+            /// do, and repeats one of its own.
+            #[test]
+            fn slot_keyed_stamp_matches_name_keyed_reference(
+                pool in 1usize..=128,
+                max_dyn in 1usize..200,
+                stream in arb_attrs(6),
+                indexed_idx in proptest::collection::vec(arb_name_idx(), 0..8),
+                raw_records in proptest::collection::vec(arb_attrs(12), 1..8),
+            ) {
+                let stream_attrs: Vec<(String, AttrValue)> = stream
+                    .into_iter()
+                    .map(|(idx, v)| (name_of(idx, pool), v))
+                    .collect();
+                let records: Vec<Vec<(String, AttrValue)>> = raw_records
+                    .into_iter()
+                    .map(|attrs| attrs.into_iter().map(|(idx, v)| (name_of(idx, pool), v)).collect())
+                    .collect();
+                let columns = assign_columns(&stream_attrs, &records, max_dyn);
+                let mut indexed_fields: Vec<String> = indexed_idx
+                    .into_iter()
+                    .map(|idx| name_of(idx, pool))
+                    .collect();
+                indexed_fields.sort();
+                indexed_fields.dedup();
+
+                let setup = Setup { columns, indexed_fields, stream_attrs, records };
+                let pairs = old_and_new(&setup);
+                for (i, (old, new)) in pairs.iter().enumerate() {
+                    prop_assert_eq!(&old.0, &new.0, "postings terms, record {}", i);
+                    prop_assert_eq!(&old.1, &new.1, "numstat winners, record {}", i);
+                }
+                prop_assert_eq!(
+                    numstat_min_max(pairs.iter().map(|(old, _)| old.1.clone())),
+                    numstat_min_max(pairs.iter().map(|(_, new)| new.1.clone()))
+                );
+            }
         }
     }
 }
