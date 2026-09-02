@@ -189,7 +189,7 @@ fn resolve(
 /// refusal is counted once under `cstat`.
 ///
 /// Prove-the-test: delete the `observe_declared_stat_drops(StatCarrier::Cstat,
-/// 1)` call in the `unique_column_stat` `None` arm of `cstat_coverage`
+/// 1)` call in the `unique_column_stat` `None` arm of `reconciled_column_stat`
 /// (crates/ravel-sql/src/logs_scan.rs) and the delta reads 0 while the
 /// `Absent` assertion still passes, which is exactly the state this finding
 /// was filed about.
@@ -287,8 +287,8 @@ fn raw_stat(
 /// reconciliation refuses it.
 ///
 /// Prove-the-test: delete the `accounted != Some(seg.sample_count)` refusal
-/// block in `cstat_coverage` (crates/ravel-sql/src/logs_scan.rs). Both extrema
-/// then reach `Precision::Exact(200)`/`Exact(500)` from an unreconciled entry
+/// block in `reconciled_column_stat` (crates/ravel-sql/src/logs_scan.rs). Both
+/// extrema then reach `Precision::Exact(200)`/`Exact(500)` from an unreconciled entry
 /// and the delta reads 0, which is the exact state #1023 item 3 was filed
 /// about; the `Absent` and `mine == 1` assertions both fail.
 #[test]
