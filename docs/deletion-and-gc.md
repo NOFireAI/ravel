@@ -417,7 +417,8 @@ into them. An operator with erasure obligations must budget them deliberately.
     configuration" point 5). A snapshot entry whose object a rewrite
     superseded is refreshed only when the fold reconciles that hour, through
     the fixed window or the retention-frontier band (docs/catalog-and-mvcc.md,
-    "Fold reconcile pass"). Until then a query over that hour resolves the
+    "Fold reconcile pass"), or when a HEAD rebuild re-derives every hour.
+    Until then a query over that hour resolves the
     pre-rewrite inputs from the stale part, and the query-time predicate
     removes the erased records after fetch. Once `sweep_superseded` has
     deleted those inputs, the same query fails closed with
