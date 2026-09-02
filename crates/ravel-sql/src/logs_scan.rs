@@ -261,8 +261,8 @@ use ravel_logseg::{
     AttrColumn, BoolCursor, BytesCursor, ColumnSelection, ColumnarBlockView, F64BitsCursor,
     FieldSel, FieldType, I64Cursor, LogRecord, LogSegError, Predicate, ScanStats,
 };
-use ravel_proto::catalog::v1::ColumnValue;
 use ravel_proto::catalog::v1::column_value::Kind as ColumnValueKind;
+use ravel_proto::catalog::v1::{ColumnStat, ColumnStatsSegment, ColumnValue};
 use ravel_query::erasure::ErasurePredicate;
 use ravel_query::{
     ColumnarBlockOutcome, LogFetchError, LogQuery, LogSegmentFetcher, LogSegmentScan,
@@ -809,6 +809,63 @@ fn stamp_coverage(
     })
 }
 
+/// The one `.cstat` entry naming `key` in `seg_stats`, or `None` when no figure
+/// that entry carries may be granted `Precision::Exact`: no entry for the
+/// column, more than one entry under the name (`unique_column_stat` refuses to
+/// pick between two claims about one immutable object), or row accounting
+/// (`non_null_count + null_count`) that does not reconcile against the joined
+/// [`SegmentRef::sample_count`].
+///
+/// This is ADR-0873 decision 2 clause 4's `.cstat` arm, and it binds here rather
+/// than in `unique_column_stat` because the reconciliation needs the joined
+/// segment, which a lookup over one segment's entry list does not have. Every
+/// `.cstat` read on an exact path goes through this wrapper --
+/// [`cstat_coverage`], [`LogsScanExec::declared_not_equal_count`],
+/// [`LogsScanExec::declared_group_counts`] and
+/// [`LogsScanExec::declared_column_sum`] -- so a new exact path cannot reach an
+/// entry without the gate, which is how three of those four came to answer from
+/// an unreconciled entry after the gate landed at the fourth (#1037).
+///
+/// The refusal covers the WHOLE entry -- extrema, dictionary and sum alike --
+/// because a stale or miscounted entry describes rows this immutable object does
+/// not have, or omits rows it does, so no figure it carries describes the object
+/// the query reads. The add is checked, so an overflowing sum is itself a
+/// disagreement rather than a wrap.
+///
+/// The two DEFECT refusals, a duplicated column name and a row-accounting
+/// disagreement, each report one drop observation under [`StatCarrier::Cstat`]
+/// per read; the metric has observation semantics, so a defective entry read by
+/// two paths of one statement is counted by each. An absent entry is not a
+/// defect and is not counted: it is the ordinary uncovered state of every tenant
+/// whose fold never built that column.
+fn reconciled_column_stat<'a>(
+    seg_stats: &'a ColumnStatsSegment,
+    seg: &SegmentRef,
+    key: &str,
+) -> Option<&'a ColumnStat> {
+    let stat = match unique_column_stat(seg_stats, key) {
+        Some(stat) => stat,
+        None => {
+            // `unique_column_stat` folds "no entry" and "more than one entry"
+            // into one `None`, and only the second is a defect: a duplicated
+            // name means no rule can pick the right claim about one immutable
+            // object. Re-deriving which case it was costs one pass over the
+            // entries of one segment, on the refusal path only.
+            let duplicated = seg_stats.columns.iter().any(|column| column.name == key);
+            if duplicated {
+                observe_declared_stat_drops(StatCarrier::Cstat, 1);
+            }
+            return None;
+        }
+    };
+    let accounted = stat.non_null_count.checked_add(stat.null_count);
+    if accounted != Some(seg.sample_count) {
+        observe_declared_stat_drops(StatCarrier::Cstat, 1);
+        return None;
+    }
+    Some(stat)
+}
+
 /// What the loaded `.cstat` object says about `declared` for one segment, or
 /// `None` when that carrier grants nothing: no object, no entry for this
 /// segment, no entry for the column, more than one entry under the column's
@@ -821,57 +878,24 @@ fn stamp_coverage(
 /// Three of those refusals are DEFECTS rather than absences, and each reports
 /// one drop observation under [`StatCarrier::Cstat`] (ADR-0873 decision 2's
 /// metric, whose stamp-carrier labels are fed by the carrier reads in
-/// `ravel-commit`): a duplicated column name, a presence contradiction, and a
-/// row-accounting disagreement with the joined `sample_count`. The other
-/// refusals are not counted, and the distinction is the point of the metric: an
-/// absent object, an absent segment entry, and an absent column entry are the
-/// ordinary uncovered state of every tenant whose fold never built that column,
-/// while a value of a kind the tenant's current declared type does not match is
-/// a legal consequence of re-declaring a column, not a writer bug.
-///
-/// The reconciliation is a fail-closed gate on the WHOLE entry, extrema
-/// included: a stale or miscounted entry describes rows this immutable object
-/// does not have (or omits rows it does), so no figure it carries -- not just
-/// its null count -- may be granted `Precision::Exact`.
+/// `ravel-commit`): a duplicated column name and a row-accounting disagreement
+/// with the joined `sample_count`, both in [`reconciled_column_stat`], plus a
+/// presence contradiction here. The other refusals are not counted, and the
+/// distinction is the point of the metric: an absent object, an absent segment
+/// entry, and an absent column entry are the ordinary uncovered state of every
+/// tenant whose fold never built that column, while a value of a kind the
+/// tenant's current declared type does not match is a legal consequence of
+/// re-declaring a column, not a writer bug.
 fn cstat_coverage(
     declared: &DeclaredColumn,
     seg: &SegmentRef,
-    seg_stats: Option<&ravel_proto::catalog::v1::ColumnStatsSegment>,
+    seg_stats: Option<&ColumnStatsSegment>,
 ) -> Option<SegmentCoverage> {
-    let seg_stats = seg_stats?;
-    let stat = match unique_column_stat(seg_stats, &declared.key) {
-        Some(stat) => stat,
-        None => {
-            // `unique_column_stat` folds "no entry" and "more than one entry"
-            // into one `None`, and only the second is a defect: a duplicated
-            // name means no rule can pick the right claim about one immutable
-            // object. Re-deriving which case it was costs one pass over the
-            // entries of one segment, on the refusal path only.
-            let duplicated = seg_stats
-                .columns
-                .iter()
-                .any(|column| column.name == declared.key);
-            if duplicated {
-                observe_declared_stat_drops(StatCarrier::Cstat, 1);
-            }
-            return None;
-        }
-    };
+    let stat = reconciled_column_stat(seg_stats?, seg, &declared.key)?;
     // The presence clause is called, not restated: `LoadedColumnStats` has
     // public fields and can be populated by a carrier that never decoded an
     // object, so the check has to bind here, where coverage is granted.
     if validate_min_max_presence(stat).is_err() {
-        observe_declared_stat_drops(StatCarrier::Cstat, 1);
-        return None;
-    }
-    // Reconcile the entry's row accounting against the immutable segment it is
-    // joined to before granting any figure (ADR-0873 decision 2, clause 4's
-    // `.cstat` arm): `non_null_count + null_count` must equal the joined
-    // `SegmentRef::sample_count`. A checked add is used so an overflowing sum is
-    // itself a disagreement rather than a wrap, and either shape refuses the
-    // whole entry -- extrema included -- and is counted as a drop.
-    let accounted = stat.non_null_count.checked_add(stat.null_count);
-    if accounted != Some(seg.sample_count) {
         observe_declared_stat_drops(StatCarrier::Cstat, 1);
         return None;
     }
@@ -1513,7 +1537,7 @@ impl LogsScanExec {
     /// `null_count` passed clauses 4 and 5 against the carrying record's own
     /// row count before the type existed. A `.cstat` entry's row accounting is
     /// now reconciled against the joined `SegmentRef::sample_count` in
-    /// [`cstat_coverage`] (ADR-0873 decision 2, clause 4's arm), but that
+    /// [`reconciled_column_stat`] (ADR-0873 decision 2, clause 4's arm), but that
     /// reconciliation is a fail-closed gate on what the entry may grant --
     /// extrema included -- not a promotion of its `null_count` to a proven
     /// figure: the entry still reports `null_count_proven = false`, so a
@@ -1640,11 +1664,14 @@ impl LogsScanExec {
     /// site ([`Self::stats_are_exact`]: no pending erasure, no content or
     /// prune predicate, and a ts bound that clips no touched segment) plus no
     /// `Str` support, a loaded column-stats object covering every touched
-    /// segment, and one reason specific to this path: any covered segment
-    /// whose dictionary is absent because its distinct-value count exceeded
-    /// the fold's cardinality ceiling (ADR-0850 decision 3) has no exact
-    /// per-value count to subtract, so a count derived from it could be wrong
-    /// outright, not merely unavailable.
+    /// segment whose entry [`reconciled_column_stat`] grants (an entry whose
+    /// row accounting disagrees with the joined `SegmentRef::sample_count`
+    /// describes rows this object does not have, so its dictionary counts
+    /// cannot be summed either), and one reason specific to this path: any
+    /// covered segment whose dictionary is absent because its distinct-value
+    /// count exceeded the fold's cardinality ceiling (ADR-0850 decision 3) has
+    /// no exact per-value count to subtract, so a count derived from it could
+    /// be wrong outright, not merely unavailable.
     ///
     /// The [`Self::stats_are_exact`] gate is what makes a clipping ts bound
     /// safe. Segments are resolved on OVERLAP, and a pure `ts` bound is
@@ -1666,7 +1693,7 @@ impl LogsScanExec {
         let mut total: u64 = 0;
         for seg in self.segments.iter() {
             let seg_stats = stats.segments.get(&segment_identity(seg))?;
-            let stat = unique_column_stat(seg_stats, &declared.key)?;
+            let stat = reconciled_column_stat(seg_stats, seg, &declared.key)?;
             if !stat.dictionary_present {
                 return None;
             }
@@ -1711,7 +1738,8 @@ impl LogsScanExec {
     /// index `FIRST_DECLARED_COL + k` (ADR-0850's q08 shape), merging every
     /// touched segment's exact dictionary. `None` means fall back to
     /// scanning, for the same reasons [`Self::declared_not_equal_count`]
-    /// does, including the [`Self::stats_are_exact`] gate: this shape carries
+    /// does, the [`reconciled_column_stat`] gate on every entry read and the
+    /// [`Self::stats_are_exact`] gate included: this shape carries
     /// no `FilterExec` at all, so a `WHERE ts < ...` bound that clips a
     /// touched segment reaches here purely as `self.ts_min`/`self.ts_max` and
     /// nothing else in the plan would refuse for it.
@@ -1732,7 +1760,7 @@ impl LogsScanExec {
         let mut null_count: u64 = 0;
         for seg in self.segments.iter() {
             let seg_stats = stats.segments.get(&segment_identity(seg))?;
-            let stat = unique_column_stat(seg_stats, &declared.key)?;
+            let stat = reconciled_column_stat(seg_stats, seg, &declared.key)?;
             if !stat.dictionary_present {
                 return None;
             }
@@ -1762,7 +1790,10 @@ impl LogsScanExec {
     /// fall back to scanning, for the same reasons
     /// [`Self::declared_not_equal_count`] does (the [`Self::stats_are_exact`]
     /// gate: no pending erasure, no content or prune predicate, a ts bound that
-    /// clips no touched segment), plus two specific to this path:
+    /// clips no touched segment; and the [`reconciled_column_stat`] gate, which
+    /// refuses a segment's whole entry, its stored sum included, when the
+    /// entry's row accounting disagrees with the joined
+    /// `SegmentRef::sample_count`), plus two specific to this path:
     ///
     /// - the column is not integer-typed. A sum is stored for `I64` columns
     ///   only (#861): a float fold would be order-dependent, so a non-`I64`
@@ -1789,7 +1820,7 @@ impl LogsScanExec {
         let mut non_null_count: u64 = 0;
         for seg in self.segments.iter() {
             let seg_stats = stats.segments.get(&segment_identity(seg))?;
-            let stat = unique_column_stat(seg_stats, &declared.key)?;
+            let stat = reconciled_column_stat(seg_stats, seg, &declared.key)?;
             let seg_sum = stat.sum?;
             sum = sum.checked_add(i128::from(seg_sum))?;
             non_null_count = non_null_count.checked_add(stat.non_null_count)?;
@@ -4415,6 +4446,296 @@ fn build_columnar_batch(
     let options = RecordBatchOptions::new().with_row_count(Some(end - start));
     RecordBatch::try_new_with_options(Arc::clone(schema), columns, &options)
         .map_err(DataFusionError::from)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod cstat_reconcile_tests {
+    //! The ADR-0873 clause 4 row-accounting gate at the three exact aggregate
+    //! paths (#1037), pinned at the granularity the drop metric is defined on:
+    //! ONE read of the entry.
+    //!
+    //! These call [`LogsScanExec::declared_not_equal_count`],
+    //! [`LogsScanExec::declared_group_counts`] and
+    //! [`LogsScanExec::declared_column_sum`] directly rather than through a
+    //! statement, because a planned statement also resolves
+    //! `partition_statistics`, which reads the same entry again through
+    //! [`cstat_coverage`]: the metric has observation semantics (one increment
+    //! per read, no per-entry dedup), so an exact-delta assertion means
+    //! something only when the test knows how many reads it performed. The
+    //! answer-level half of these deliverables, where the fallback scan's
+    //! aggregate is compared against the truth over real RLOG objects, is in
+    //! tests/logs_metadata_agg.rs.
+    //!
+    //! All tests hold one lock: the tally is process-wide and monotonic.
+    //! Nothing here reads an object, so the segment is fabricated and the store
+    //! stays empty.
+
+    use super::*;
+    use ravel_commit::declared_stats::declared_stat_drops_observed;
+    use ravel_object_store::ObjectStoreBackend;
+    use ravel_object_store::memory::MemoryStore;
+
+    const TENANT: TenantHash = TenantHash([7u8; 16]);
+    const COL: &str = "status";
+    /// Rows in the fabricated segment, the figure an entry's
+    /// `non_null_count + null_count` must reconcile against.
+    const SAMPLE_COUNT: u64 = 5;
+
+    static DROPS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn drops_lock() -> std::sync::MutexGuard<'static, ()> {
+        match DROPS.lock() {
+            Ok(guard) => guard,
+            // A poisoned lock means a sibling test panicked; the tally is still
+            // sound to read, and re-reporting that failure here would only
+            // obscure it.
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    fn seg_ref(sample_count: u64) -> SegmentRef {
+        SegmentRef {
+            data_object_key: "logs/seg-1.rlog".to_string(),
+            object_size: 1,
+            min_event_ts_ns: 0,
+            max_event_ts_ns: 1_000,
+            ingest_hour_bucket: 0,
+            sample_count,
+            series_count: 0,
+            shard: 0,
+            content_hash: [0u8; 32],
+            writer_id: uuid::Uuid::from_u128(1),
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 0,
+            level: ravel_catalog::SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+            declared_column_stats: DeclaredColumnStats::default(),
+        }
+    }
+
+    fn i64_value(v: i64) -> ColumnValue {
+        ColumnValue {
+            kind: Some(ColumnValueKind::I64(v)),
+        }
+    }
+
+    /// A `status` entry over the dictionary `{200: 3, 404: 1}`: four non-null
+    /// rows, an exact sum of 1004, and `null_count` supplied by the caller so
+    /// the same otherwise-valid entry can be built reconciled (`null_count =
+    /// 1`, so `4 + 1 == SAMPLE_COUNT`) or divergent.
+    fn status_stat(null_count: u64) -> ColumnStat {
+        ColumnStat {
+            name: COL.to_string(),
+            declared_type: 2, // ravel.sys.v1.TypedAttrColumnType::I64
+            non_null_count: 4,
+            null_count,
+            min: Some(i64_value(200)),
+            max: Some(i64_value(404)),
+            dictionary_present: true,
+            dictionary: vec![
+                ravel_proto::catalog::v1::DictEntry {
+                    value: Some(i64_value(200)),
+                    count: 3,
+                },
+                ravel_proto::catalog::v1::DictEntry {
+                    value: Some(i64_value(404)),
+                    count: 1,
+                },
+            ],
+            sum: Some(1004),
+        }
+    }
+
+    /// A scan over one fabricated `sample_count`-row segment carrying `columns`
+    /// as its `.cstat` entries. No predicate and unbounded ts, so
+    /// `stats_are_exact` holds and the entry itself is what decides each read.
+    fn scan_with(sample_count: u64, columns: Vec<ColumnStat>) -> LogsScanExec {
+        let seg = seg_ref(sample_count);
+        let declared = vec![DeclaredColumn::new(COL, DeclaredType::I64)];
+        let mut segments = HashMap::new();
+        segments.insert(
+            segment_identity(&seg),
+            ColumnStatsSegment {
+                ingest_hour_bucket: seg.ingest_hour_bucket,
+                shard: seg.shard,
+                writer_id: seg.writer_id.as_bytes().to_vec(),
+                writer_epoch: seg.writer_epoch,
+                writer_seq: seg.writer_seq,
+                columns,
+            },
+        );
+        let stats = Arc::new(LoadedColumnStats {
+            segments,
+            part_blake3: Vec::new(),
+        });
+        let backend: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let schema = crate::logs_schema::logs_schema_with_declared(&declared);
+        LogsScanExec::new(
+            TENANT,
+            LogSegmentFetcher::new(backend),
+            std::slice::from_ref(&seg),
+            1,
+            i64::MIN,
+            i64::MAX,
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            None,
+            QueryAccounting::new(),
+            schema,
+            Arc::new(declared),
+        )
+        .expect("scan")
+        .with_column_stats(Some(stats))
+    }
+
+    /// Perform exactly one read of the entry and report what it answered plus
+    /// the `cstat`-labelled drop delta across that single read.
+    fn one_read<T>(
+        sample_count: u64,
+        columns: Vec<ColumnStat>,
+        read: impl FnOnce(&LogsScanExec) -> Option<T>,
+    ) -> (Option<T>, u64) {
+        let guard = drops_lock();
+        let scan = scan_with(sample_count, columns);
+        let before = declared_stat_drops_observed(StatCarrier::Cstat);
+        let answered = read(&scan);
+        let delta = declared_stat_drops_observed(StatCarrier::Cstat) - before;
+        drop(guard);
+        (answered, delta)
+    }
+
+    fn not_equal_404(scan: &LogsScanExec) -> Option<u64> {
+        scan.declared_not_equal_count(0, &ScalarValue::Int64(Some(404)))
+    }
+
+    /// q02 (`declared_not_equal_count`): an entry accounting for four of the
+    /// segment's five rows describes an object that does not exist, so the read
+    /// is refused and counted once. Every other reason this path declines is
+    /// excluded by construction: the dictionary is present and its counts sum
+    /// to `non_null_count`, so before this change the site subtracted from an
+    /// unreconciled entry and answered 3.
+    ///
+    /// Prove-the-test: replace `reconciled_column_stat` with
+    /// `unique_column_stat(seg_stats, &declared.key)?` at the
+    /// `declared_not_equal_count` site (logs_scan.rs) and this reads
+    /// `(Some(3), 0)`; both assertions fail.
+    #[test]
+    fn q02_read_of_an_unreconciled_entry_is_refused_and_counted_once() {
+        let (answered, delta) = one_read(SAMPLE_COUNT, vec![status_stat(0)], not_equal_404);
+        assert_eq!(answered, None, "4 + 0 != 5, so the entry grants nothing");
+        assert_eq!(delta, 1, "one refused read, counted once");
+    }
+
+    /// The reconciled half of the same site: `4 + 1 == 5`, so the entry still
+    /// answers exactly (four non-null rows less the single 404) with no drop.
+    /// Without this a reconciliation that refused every entry would satisfy the
+    /// test above.
+    #[test]
+    fn q02_read_of_a_reconciled_entry_answers_exactly_with_no_drop() {
+        let (answered, delta) = one_read(SAMPLE_COUNT, vec![status_stat(1)], not_equal_404);
+        assert_eq!(answered, Some(3), "4 non-null rows less the one 404");
+        assert_eq!(delta, 0, "a reconciled entry is not a defect");
+    }
+
+    /// q08 (`declared_group_counts`): the same divergent entry is refused and
+    /// counted once.
+    ///
+    /// Prove-the-test: revert the `declared_group_counts` site to
+    /// `unique_column_stat(seg_stats, &declared.key)?` and this reads groups
+    /// `{200: 3, 404: 1}` with a NULL group of 0 and a delta of 0.
+    #[test]
+    fn q08_read_of_an_unreconciled_entry_is_refused_and_counted_once() {
+        let (answered, delta) = one_read(SAMPLE_COUNT, vec![status_stat(0)], |scan| {
+            scan.declared_group_counts(0)
+                .map(|counts| (counts.counts, counts.null_count))
+        });
+        assert!(
+            answered.is_none(),
+            "4 + 0 != 5, so the entry grants nothing"
+        );
+        assert_eq!(delta, 1, "one refused read, counted once");
+    }
+
+    /// The reconciled half of the q08 site: the exact groups and the exact NULL
+    /// group, with no drop.
+    #[test]
+    fn q08_read_of_a_reconciled_entry_answers_exactly_with_no_drop() {
+        let (answered, delta) = one_read(SAMPLE_COUNT, vec![status_stat(1)], |scan| {
+            scan.declared_group_counts(0).map(|counts| {
+                let mut pairs: Vec<(i64, u64)> = counts
+                    .counts
+                    .into_iter()
+                    .map(|(value, count)| match value {
+                        ScalarValue::Int64(Some(v)) => (v, count),
+                        other => panic!("unexpected group key {other:?}"),
+                    })
+                    .collect();
+                pairs.sort_unstable();
+                (pairs, counts.null_count)
+            })
+        });
+        assert_eq!(
+            answered,
+            Some((vec![(200, 3), (404, 1)], 1)),
+            "the exact dictionary plus the one NULL row"
+        );
+        assert_eq!(delta, 0, "a reconciled entry is not a defect");
+    }
+
+    /// q03/q04/q30 (`declared_column_sum`): the same divergent entry is refused
+    /// and counted once. Its `sum` is present, so `stat.sum?` cannot be what
+    /// declines here.
+    ///
+    /// Prove-the-test: revert the `declared_column_sum` site to
+    /// `unique_column_stat(seg_stats, &declared.key)?` and this reads
+    /// `Some((1004, 4))` with a delta of 0.
+    #[test]
+    fn sum_read_of_an_unreconciled_entry_is_refused_and_counted_once() {
+        let (answered, delta) = one_read(SAMPLE_COUNT, vec![status_stat(0)], |scan| {
+            scan.declared_column_sum(0)
+                .map(|cs| (cs.sum, cs.non_null_count))
+        });
+        assert_eq!(answered, None, "4 + 0 != 5, so the entry grants nothing");
+        assert_eq!(delta, 1, "one refused read, counted once");
+    }
+
+    /// The reconciled half of the sum site: the exact sum and non-null count,
+    /// with no drop.
+    #[test]
+    fn sum_read_of_a_reconciled_entry_answers_exactly_with_no_drop() {
+        let (answered, delta) = one_read(SAMPLE_COUNT, vec![status_stat(1)], |scan| {
+            scan.declared_column_sum(0)
+                .map(|cs| (cs.sum, cs.non_null_count))
+        });
+        assert_eq!(answered, Some((1004, 4)), "200*3 + 404*1 over 4 rows");
+        assert_eq!(delta, 0, "a reconciled entry is not a defect");
+    }
+
+    /// The overflow arm of the same gate: `non_null_count + null_count` that
+    /// does not fit `u64` is a disagreement, not a wrap. The segment here holds
+    /// ZERO rows, which is what makes the arm observable rather than incidental:
+    /// `u64::MAX + 1` wraps to exactly 0, so a wrapping add reconciles this
+    /// entry against an empty object and grants a sum over `u64::MAX` rows that
+    /// no object holds.
+    ///
+    /// Prove-the-test: replace the `checked_add` in `reconciled_column_stat`
+    /// with `wrapping_add` and this reads `(Some((1004, u64::MAX)), 0)`; both
+    /// assertions fail.
+    #[test]
+    fn an_overflowing_row_accounting_is_refused_and_counted_once() {
+        let mut overflowing = status_stat(1);
+        overflowing.non_null_count = u64::MAX;
+        overflowing.null_count = 1;
+        let (answered, delta) = one_read(0, vec![overflowing], |scan| {
+            scan.declared_column_sum(0)
+                .map(|cs| (cs.sum, cs.non_null_count))
+        });
+        assert_eq!(answered, None, "an overflowing sum is a disagreement");
+        assert_eq!(delta, 1, "one refused read, counted once");
+    }
 }
 
 #[cfg(test)]

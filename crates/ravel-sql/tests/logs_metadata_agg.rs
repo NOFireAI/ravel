@@ -190,12 +190,17 @@ fn str_stat(name: &str, dict: &[(&str, u64)]) -> ColumnStat {
 /// false`) for exceeding the fold's cardinality ceiling, while
 /// `non_null_count` still reflects the real non-null rows. This is the state
 /// a q02/q08 answer cannot be derived from, so the rule must decline.
-fn i64_omitted_stat(name: &str, non_null_count: u64) -> ColumnStat {
+///
+/// `null_count` is a parameter so a caller can keep `non_null_count +
+/// null_count` reconciled against its segment's `sample_count`: an entry that
+/// does not reconcile is refused before the omitted dictionary is ever looked
+/// at (#1037), which would leave the dictionary gate untested at that call site.
+fn i64_omitted_stat(name: &str, non_null_count: u64, null_count: u64) -> ColumnStat {
     ColumnStat {
         name: name.to_string(),
         declared_type: 2,
         non_null_count,
-        null_count: 0,
+        null_count,
         min: None,
         max: None,
         dictionary_present: false,
@@ -960,10 +965,11 @@ async fn omitted_dictionary_declines_and_keeps_the_scan() {
         ),
         (
             &b,
-            // dictionary_present = false with 5 real non-null rows: the fold
-            // dropped this column's dictionary for exceeding the cardinality
-            // ceiling.
-            stats_segment(&b, vec![i64_omitted_stat("status", 5)]),
+            // dictionary_present = false with 5 real non-null rows and one
+            // NULL, reconciling against segment B's six rows: the fold dropped
+            // this column's dictionary for exceeding the cardinality ceiling,
+            // and nothing else about the entry is malformed.
+            stats_segment(&b, vec![i64_omitted_stat("status", 5, 1)]),
         ),
     ]);
     let snapshot = snapshot_of(vec![a, b], Vec::new());
@@ -1136,6 +1142,20 @@ impl RealCorpus {
     /// the same statement is forced down the ordinary scan path.
     async fn run(&self, sql: &str, with_stats: bool) -> (String, Vec<RecordBatch>) {
         let stats = with_stats.then(|| Arc::clone(&self.stats));
+        let (shown, batches, _) = self.run_with(sql, stats).await;
+        (shown, batches)
+    }
+
+    /// Run `sql` over this corpus with `stats` injected verbatim, returning the
+    /// plan text, the answer, and the object GETs this run alone issued. The
+    /// GET delta is what separates a granted answer (zero) from one the
+    /// fallback scan read out of the real objects.
+    async fn run_with(
+        &self,
+        sql: &str,
+        stats: Option<Arc<LoadedColumnStats>>,
+    ) -> (String, Vec<RecordBatch>, u64) {
+        let before = self.store.gets();
         let snapshot = snapshot_of(vec![self.a.clone(), self.b.clone()], Vec::new());
         let ctx =
             logs_session(provider(&self.store, snapshot, status_col(), stats)).expect("session");
@@ -1148,7 +1168,7 @@ impl RealCorpus {
             .expect("physical plan");
         let shown = plan_str(&plan);
         let batches = collect(plan, ctx.task_ctx()).await.expect("collect");
-        (shown, batches)
+        (shown, batches, self.store.gets() - before)
     }
 }
 
@@ -1274,14 +1294,20 @@ async fn q08_rewritten_answer_equals_scanned_answer() {
 /// decode), the READ side must still fail closed: `declared_not_equal_count`
 /// declines rather than subtracting from a dictionary that cannot account for
 /// the claimed rows, and the query returns the correct SCANNED answer.
+///
+/// The corruption is in the DICTIONARY, not in `non_null_count`, so the entry's
+/// row accounting still reconciles against segment A's six rows and the
+/// dictionary-sum check is the only thing that can decline here. Inflating
+/// `non_null_count` instead would be refused earlier, by the #1037 row-accounting
+/// gate, leaving this check unexercised.
 #[tokio::test]
 async fn inconsistent_record_declines_at_use_and_scans_correct_answer() {
     let corpus = RealCorpus::build().await;
 
-    // Corrupt segment A's stat: claim 100 more non-null rows than its
-    // dictionary accounts for.
+    // Corrupt segment A's stat: drop one dictionary entry, so the dictionary
+    // accounts for one fewer row than `non_null_count` claims.
     let mut bad_a = stat_from_rows(SEG_A_ROWS);
-    bad_a.non_null_count += 100;
+    bad_a.dictionary.pop().expect("a non-empty dictionary");
     let bad_stats = loaded_stats(vec![
         (&corpus.a, stats_segment(&corpus.a, vec![bad_a])),
         (
@@ -1552,7 +1578,8 @@ async fn all_null_column_carrying_extrema_declines_and_scans() {
 /// scanned `(200, 500)`, and the scan reads objects (`gets() > 0`).
 ///
 /// Prove-the-test: delete the `accounted != Some(seg.sample_count)` refusal
-/// block in `cstat_coverage` (crates/ravel-sql/src/logs_scan.rs). The entry is
+/// block in `reconciled_column_stat` (crates/ravel-sql/src/logs_scan.rs). The
+/// entry is
 /// then accepted, the plan loses its `LogsScanExec` for a `MetadataOnlyExec`,
 /// the answer becomes `(-1, 999)`, and `gets()` drops to 0; all three
 /// assertions fail.
@@ -1588,6 +1615,155 @@ async fn a_row_accounting_mismatch_declines_and_scans() {
         corpus.store.gets() > 0,
         "a declined statement must read objects"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The same reconciliation at the three exact aggregate paths (#1037): a
+// `.cstat` entry whose row accounting disagrees with the joined segment must be
+// refused by `declared_not_equal_count`, `declared_group_counts` and
+// `declared_column_sum` too, not only by the MIN/MAX coverage above. Each test
+// runs the same statement twice over one real corpus -- once with correct
+// statistics, which must still grant exactly with zero GETs, and once with the
+// divergent entry, which must fall back and answer what the scan computes.
+// ---------------------------------------------------------------------------
+
+/// Segment A's `.cstat` entry, fabricated so its row accounting cannot describe
+/// the object it is joined to: it claims two non-null rows and no NULL row,
+/// against the six rows segment A really holds. Everything else about it is well
+/// formed -- the dictionary is present and its counts sum to `non_null_count`,
+/// both extrema are present and inside the corpus range, and the stored sum
+/// matches the dictionary -- so the row-accounting gate is the only thing that
+/// can refuse it, and every misgrant below answers from a third of the object's
+/// rows.
+fn divergent_a() -> ColumnStat {
+    i64_stat("status", &[(200, 1), (404, 1)], 0, true)
+}
+
+/// Segment A divergent, segment B exact.
+fn divergent_stats(corpus: &RealCorpus) -> Arc<LoadedColumnStats> {
+    loaded_stats(vec![
+        (&corpus.a, stats_segment(&corpus.a, vec![divergent_a()])),
+        (
+            &corpus.b,
+            stats_segment(&corpus.b, vec![stat_from_rows(SEG_B_ROWS)]),
+        ),
+    ])
+}
+
+/// #1037 site 1, `declared_not_equal_count`: the divergent entry is refused, so
+/// `COUNT(*) WHERE status <> 404` falls back to the scan and answers the true 9
+/// (segment A's 6 - 2, segment B's 5 - 0). A misgrant answers 6: `(2 - 1)` from
+/// the fabricated dictionary plus segment B's 5.
+///
+/// Prove-the-test: revert the `declared_not_equal_count` site (logs_scan.rs) to
+/// `unique_column_stat(seg_stats, &declared.key)?`. The plan then carries a
+/// `MetadataOnlyExec` instead of its `LogsScanExec`, the count reads 6, and the
+/// GET count drops to 0; all three assertions fail.
+#[tokio::test]
+async fn q02_unreconciled_entry_is_refused_and_scans_the_true_count() {
+    let corpus = RealCorpus::build().await;
+    let sql = "SELECT COUNT(*) FROM logs WHERE status <> 404";
+
+    // The reconciled control: correct statistics over the same corpus still
+    // grant exactly and read nothing (6 + 0 == 6 for A, 5 + 1 == 6 for B).
+    let (granted_plan, granted, granted_gets) =
+        corpus.run_with(sql, Some(Arc::clone(&corpus.stats))).await;
+    assert!(
+        !granted_plan.contains("LogsScanExec") && granted_plan.contains("MetadataOnlyExec"),
+        "a reconciled entry must still be answered from stats; plan was:\n{granted_plan}"
+    );
+    assert_eq!(
+        count_scalar(&granted),
+        9,
+        "4 from segment A, 5 from segment B"
+    );
+    assert_eq!(granted_gets, 0, "the granted q02 answer reads no objects");
+
+    let (plan, answer, gets) = corpus.run_with(sql, Some(divergent_stats(&corpus))).await;
+    assert!(
+        plan.contains("LogsScanExec") && !plan.contains("MetadataOnlyExec"),
+        "an unreconciled entry must decline and fall back to a scan; plan was:\n{plan}"
+    );
+    assert_eq!(
+        count_scalar(&answer),
+        9,
+        "the scan's true count, not the misgrant's 6"
+    );
+    assert!(gets > 0, "a declined statement must read objects");
+}
+
+/// #1037 site 2, `declared_group_counts`: the divergent entry is refused, so the
+/// q08 grouping falls back to the scan and answers the true
+/// `{200: 7, 404: 2, 500: 2, NULL: 1}`. A misgrant answers
+/// `{200: 5, 404: 1, 500: 1, NULL: 1}` -- wrong in three groups, and wrong in
+/// total by the four rows of segment A the fabricated entry omits.
+///
+/// Prove-the-test: revert the `declared_group_counts` site to
+/// `unique_column_stat(seg_stats, &declared.key)?` and the plan loses its
+/// `LogsScanExec`, the groups read `{200: 5, 404: 1, 500: 1, NULL: 1}`, and the
+/// GET count drops to 0.
+#[tokio::test]
+async fn q08_unreconciled_entry_is_refused_and_scans_the_true_groups() {
+    let corpus = RealCorpus::build().await;
+    let sql = "SELECT status, COUNT(*) FROM logs GROUP BY status";
+    let truth: HashMap<Option<i64>, i64> =
+        HashMap::from([(Some(200), 7), (Some(404), 2), (Some(500), 2), (None, 1)]);
+
+    let (granted_plan, granted, granted_gets) =
+        corpus.run_with(sql, Some(Arc::clone(&corpus.stats))).await;
+    assert!(
+        !granted_plan.contains("LogsScanExec") && granted_plan.contains("MetadataOnlyExec"),
+        "a reconciled entry must still be answered from stats; plan was:\n{granted_plan}"
+    );
+    assert_eq!(group_counts(&granted), truth, "12 rows over four groups");
+    assert_eq!(granted_gets, 0, "the granted q08 answer reads no objects");
+
+    let (plan, answer, gets) = corpus.run_with(sql, Some(divergent_stats(&corpus))).await;
+    assert!(
+        plan.contains("LogsScanExec") && !plan.contains("MetadataOnlyExec"),
+        "an unreconciled entry must decline and fall back to a scan; plan was:\n{plan}"
+    );
+    assert_eq!(
+        group_counts(&answer),
+        truth,
+        "the scan's true groups, NULL group included"
+    );
+    assert!(gets > 0, "a declined statement must read objects");
+}
+
+/// #1037 site 3, `declared_column_sum`: the divergent entry is refused, so
+/// `SUM(status + 1)` falls back to the scan and answers the true 3219 (3208 over
+/// 11 non-null rows). A misgrant answers 1911: the fabricated 604 plus segment
+/// B's 1300, with the `+ 1` applied to 7 rows instead of 11.
+///
+/// Prove-the-test: revert the `declared_column_sum` site to
+/// `unique_column_stat(seg_stats, &declared.key)?` and the plan loses its
+/// `LogsScanExec`, the sum reads 1911, and the GET count drops to 0.
+#[tokio::test]
+async fn sum_unreconciled_entry_is_refused_and_scans_the_true_sum() {
+    let corpus = RealCorpus::build().await;
+    let sql = "SELECT SUM(status + 1) FROM logs";
+
+    let (granted_plan, granted, granted_gets) =
+        corpus.run_with(sql, Some(Arc::clone(&corpus.stats))).await;
+    assert!(
+        !granted_plan.contains("LogsScanExec") && granted_plan.contains("MetadataOnlyExec"),
+        "a reconciled entry must still be answered from stats; plan was:\n{granted_plan}"
+    );
+    assert_eq!(single_i64(&granted), Some(3219), "3208 + 11 non-null rows");
+    assert_eq!(granted_gets, 0, "the granted sum reads no objects");
+
+    let (plan, answer, gets) = corpus.run_with(sql, Some(divergent_stats(&corpus))).await;
+    assert!(
+        plan.contains("LogsScanExec") && !plan.contains("MetadataOnlyExec"),
+        "an unreconciled entry must decline and fall back to a scan; plan was:\n{plan}"
+    );
+    assert_eq!(
+        single_i64(&answer),
+        Some(3219),
+        "the scan's true sum, not the misgrant's 1911"
+    );
+    assert!(gets > 0, "a declined statement must read objects");
 }
 
 // ---------------------------------------------------------------------------
