@@ -412,14 +412,35 @@ every bound is measured.
   pass, for either reason the gate holds them, and the buckets in which it
   held the inputs of a chain it could not walk back to a raw input. The
   erasure rule holds a `.dreq` past its horizon when its request id is in the
-  first set, and also when the second set is non-empty and the request's
-  completion either names one of those buckets or names no buckets at all. No
-  part of the rule depends on the completion record enumerating buckets: a
-  completion that lists them narrows the second condition to buckets the
-  request could have touched, and a completion that lists none is treated as
-  covering every bucket where a chain was cut. The rule issues no store
-  requests of its own beyond the sweep's; it reads a verdict the sweep
-  produced while doing its own work.
+  first set, or when the second set is non-empty at all.
+
+  **The hold is computed over every supersession chain a HEAD-named part
+  still resolves, whether or not the chain is old enough to delete.** Two
+  filters decide whether a chain is collectable *yet*: the protection horizon
+  on the live record's own `created_unix_ns`, and the rule that a record
+  another present rewrite supersedes is processed only as part of that
+  rewrite's chain group. Both bound deletion only. Neither says anything about
+  whether a snapshot still resolves the chain's inputs, which is the only
+  question this hold turns on, and a chain still inside its own horizon is the
+  likeliest one a stale HEAD names. So the observation gathers and gates every
+  chain in the signal and applies neither filter. A chain that is merely young
+  contributes exactly the request ids and buckets it will contribute after its
+  horizon; that a pass could not have deleted it is not recorded and not
+  consulted.
+
+  **A completion record's bucket list is informational only.** No part of this
+  rule reads `bucket_drops`: not the hold decision, and not the scope of the
+  observation. The field is optional on the wire, is written empty by the
+  production completion writer, and a writer that does populate it is not
+  obliged to enumerate every bucket it touched, so a present list can be
+  partial. Narrowing either the decision or the observation by such a list
+  would release the filter over a bucket the request did touch. The
+  observation is therefore always whole-signal: one listing of the commit
+  keyspace enumerates the signal's shards, and every shard is observed across
+  every hour. A shard with no commit key holds nothing, so that scope costs
+  listing, never correctness. The rule issues no GET of its own beyond the
+  sweep's and the completions it must read anyway; it reads a verdict that
+  sweep produced while doing its own work.
 
 - **An erasure request's `.dreq` outlives every input any rewrite in its
   supersession chain superseded.** The hold does not look only for the record
@@ -430,8 +451,9 @@ every bound is measured.
   they still carry whatever the generation above them erased. When the walk
   cannot reach a raw input because a generation's record is already gone, the
   requests that generation applied are no longer named anywhere; the sweep
-  reports that bucket as one where a chain was cut, and every request whose
-  completion is consistent with that bucket is held with it. A chain group
+  reports that bucket as one where a chain was cut, and any candidate `.dreq`
+  is held while such a bucket exists, since no surviving record can say which
+  requests the missing generation applied. A chain group
   the legal-hold gate skipped holds its requests' `.dreq`s the same way a
   HEAD-held one does, which is what keeps a data-prefix-only hold from
   retiring a filter over data it is preserving.

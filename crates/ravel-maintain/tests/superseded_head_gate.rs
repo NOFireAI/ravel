@@ -57,6 +57,10 @@ fn old_bucket() -> Bucket {
     bucket_at(OLD_HOUR)
 }
 
+fn recent_bucket() -> Bucket {
+    bucket_at(RECENT_HOUR)
+}
+
 fn request_id() -> Uuid {
     Uuid::from_u128(REQUEST_SEED)
 }
@@ -175,18 +179,21 @@ async fn run_rewrite_with(
     clock: &FixedClock,
     pending: &[PendingErasureRequest],
 ) {
+    run_rewrite_in(store, clock, &old_bucket(), pending).await
+}
+
+/// [`run_rewrite_with`] against an arbitrary bucket of the same shard.
+async fn run_rewrite_in(
+    store: &dyn ObjectStoreBackend,
+    clock: &FixedClock,
+    bucket: &Bucket,
+    pending: &[PendingErasureRequest],
+) {
     let mut memo = MaintainMemo::with_default_interval();
-    let outcome = erasure_rewrite_bucket(
-        store,
-        clock,
-        &cfg(),
-        &NoLeases,
-        &old_bucket(),
-        pending,
-        &mut memo,
-    )
-    .await
-    .expect("rewrite");
+    let outcome =
+        erasure_rewrite_bucket(store, clock, &cfg(), &NoLeases, bucket, pending, &mut memo)
+            .await
+            .expect("rewrite");
     assert!(
         matches!(outcome, ErasureRewriteOutcome::Rewritten { .. }),
         "the rewrite must publish a record, got {outcome:?}"
@@ -330,7 +337,11 @@ async fn sweep(
 
 /// The rewrite record's own key in the old bucket.
 async fn rewrite_record_key(store: &dyn ObjectStoreBackend) -> String {
-    let b = old_bucket();
+    rewrite_record_key_in(store, &old_bucket()).await
+}
+
+/// [`rewrite_record_key`] for an arbitrary bucket.
+async fn rewrite_record_key_in(store: &dyn ObjectStoreBackend, b: &Bucket) -> String {
     let prefix =
         keys::commit_shard_hour_prefix(&b.tenant_hash, b.signal, b.shard, b.ingest_hour_bucket)
             .unwrap();
@@ -342,7 +353,7 @@ async fn rewrite_record_key(store: &dyn ObjectStoreBackend) -> String {
             return meta.key;
         }
     }
-    panic!("no rewrite record in the old bucket");
+    panic!("no rewrite record in bucket {}", b.ingest_hour_bucket);
 }
 
 /// The old bucket's rewrite record keys ordered oldest generation first: the
@@ -395,6 +406,15 @@ async fn rewrite_part_keys(store: &dyn ObjectStoreBackend, key: &str) -> BTreeSe
         .collect()
 }
 
+/// The `created_unix_ns` the rewrite record at `key` durably carries, which is
+/// the instant its own protection horizon is anchored on.
+async fn rewrite_created_ns(store: &dyn ObjectStoreBackend, key: &str) -> i64 {
+    let bytes = get_full(store, key).await;
+    erasure::decode_rewrite(&bytes)
+        .expect("rewrite record decodes")
+        .created_unix_ns
+}
+
 /// Whether a seeded `.done` carries per-bucket dropped counts.
 ///
 /// [`Drops::Absent`] is the production shape: the server's completion writer
@@ -433,6 +453,18 @@ async fn seed_dreq_and_done_for(
     completed: i64,
     drops: Drops,
 ) -> (String, String) {
+    seed_dreq_and_done_with_drops(store, id, series, completed, drops.bucket_drops()).await
+}
+
+/// [`seed_dreq_and_done_for`] with the completion's `bucket_drops` written out
+/// in full, for the shapes [`Drops`] does not cover.
+async fn seed_dreq_and_done_with_drops(
+    store: &dyn ObjectStoreBackend,
+    id: Uuid,
+    series: &str,
+    completed: i64,
+    bucket_drops: Vec<ErasureBucketDrop>,
+) -> (String, String) {
     let dreq_key = keys::erasure_request_key(&tenant_hash(), Signal::Metrics, id).unwrap();
     store
         .put(
@@ -449,7 +481,7 @@ async fn seed_dreq_and_done_for(
         signal: signal::to_proto(Signal::Metrics) as i32,
         request_id: id.to_string(),
         predicate_hash: vec![0x11; 32],
-        bucket_drops: drops.bucket_drops(),
+        bucket_drops,
         requested_unix_ns: 0,
         completed_unix_ns: completed,
         deferral_cause: 0,
@@ -983,8 +1015,8 @@ async fn superseded_predecessor_and_its_dreq_outlive_head_named_raw_inputs() {
 }
 
 /// The production-shape twin: a completion naming no buckets holds the same
-/// way, at the cost of one extra LIST to discover the signal's shards and a
-/// shard-wide commit LIST in place of the one-hour one.
+/// way, and by the same request shape, because the observation never reads the
+/// field.
 #[tokio::test]
 async fn superseded_predecessor_and_its_dreq_outlive_head_named_raw_inputs_in_production_shape() {
     superseded_predecessor_outlives_raw_inputs_case(Drops::Absent).await;
@@ -1045,21 +1077,19 @@ async fn superseded_predecessor_outlives_raw_inputs_case(drops: Drops) {
 
     // The guard's request shape is asserted, not printed: the first GET and the
     // first LIST past the expected count both fault, so the pass succeeding
-    // proves the counts.
+    // proves the counts. Both completion shapes cost the same, because the
+    // observation reads neither the field nor anything derived from it.
     //
-    // Eight GETs either way: the `.done`, R1's and R2's records read once for
-    // the pass, R1 again as the chain link the walk follows, the two input
-    // commit records, the catalog HEAD, and the one covering snapshot part.
-    // The LISTs are the only difference between the two completion shapes. A
-    // completion naming the bucket it touched narrows the observation to that
-    // one (shard, hour): the `del/` prefix and that bucket's commit prefix. A
-    // production-shape completion names none, so the observation covers the
-    // signal's shards: one LIST to discover them, plus the shard's whole
-    // commit prefix in place of the single hour's.
-    let (gets, lists) = match drops {
-        Drops::Present => (8, 2),
-        Drops::Absent => (8, 3),
-    };
+    // Three LISTs: the `del/` prefix, the commit keyspace once to enumerate the
+    // signal's shards, and that shard's whole commit prefix.
+    //
+    // Ten GETs: the `.done`; R1's and R2's records read once for the pass; the
+    // two input commit records from R1's own entry; R1 again as the chain link
+    // R2's walk follows, and the two input commit records again from that walk;
+    // the catalog HEAD; and the one covering snapshot part. The observing pass
+    // gathers R1 both ways on purpose (its own entry and its successor's chain),
+    // which is what makes a predecessor visible whatever its successor's age.
+    let (gets, lists) = (10, 3);
     let plan = FaultPlan::empty()
         .with_rule(
             Rule::new(Op::Get, ScriptedFault::Timeout).with_occurrence(Occurrence::Nth(gets + 1)),
@@ -2109,4 +2139,513 @@ async fn a_part_reference_that_excludes_its_own_entries_blocks_fail_closed() {
     for key in &commit_keys {
         assert!(mem.head(key).await.is_ok(), "and both their commit records");
     }
+}
+
+// --- (l) observing the holds is never gated on age --------------------------
+//
+// Two filters decide whether a chain is collectable YET: the protection
+// horizon, and the skip of a record another present rewrite supersedes. Neither
+// says anything about whether a stale snapshot still resolves that chain's
+// inputs, which is the only question the erasure filter's hold turns on. Apply
+// them while merely OBSERVING and a whole chain disappears from rule 6: the
+// predecessor is skipped because its successor supersedes it, the successor is
+// skipped because it is still inside its own horizon, and the pass reports no
+// hold while both raw inputs are present and HEAD-named. The same applies to
+// the scope of the observation: narrowing it by a completion's `bucket_drops`
+// trusts a non-empty list to be complete, and nothing on the wire makes it so.
+
+/// A two-generation chain whose generations were published at different
+/// instants: R1 applies [`request_id`] over `victim` at `created`, R2 applies
+/// `request_id_n(1)` over a series no input carries at `second`. That stagger
+/// is what lets R2 sit inside its own protection horizon while R1 is past its.
+async fn seed_staggered_chain(
+    mem: &Arc<MemoryStore>,
+    clock: &FixedClock,
+    created: i64,
+    second: i64,
+    reconcile: Option<u32>,
+) -> ChainFixture {
+    let commit_keys = seed_two_hours(mem.as_ref()).await;
+    let input_data_keys = seeded_input_data_keys(mem.as_ref(), &commit_keys).await;
+    fold_head(mem, created, 1, None).await;
+    clock.set(created);
+    run_rewrite_with(mem.as_ref(), clock, &[pending_request()]).await;
+    clock.set(second);
+    run_rewrite_with(
+        mem.as_ref(),
+        clock,
+        &[pending_request_for(request_id_n(1), "absent1")],
+    )
+    .await;
+    fold_head(mem, created + 3 * NS_PER_HOUR, 2, reconcile).await;
+    let chain = rewrite_chain(mem.as_ref()).await;
+    assert_eq!(chain.len(), 2, "one rewrite generation per applied request");
+    assert_eq!(
+        rewrite_created_ns(mem.as_ref(), &chain[0]).await,
+        created,
+        "R1's horizon is anchored on the first instant"
+    );
+    assert_eq!(
+        rewrite_created_ns(mem.as_ref(), &chain[1]).await,
+        second,
+        "R2's horizon is anchored on the second instant"
+    );
+    ChainFixture {
+        commit_keys,
+        input_data_keys,
+        chain,
+    }
+}
+
+/// The reviewer's scenario. R1 applies X over the two raw L0 inputs at t0. One
+/// nanosecond short of a full protection horizon later, R2 applies Y and
+/// supersedes R1. The hour is never reconciled, so HEAD still names R1's raw
+/// inputs. At X's completion horizon the `.dreq` sweep must hold `.dreq_X`: R2
+/// is younger than a horizon, which is a reason not to DELETE its chain, never
+/// a reason to stop looking at it.
+///
+/// Flip-line proof, either direction. In `sweep_superseded_impl`, drop the
+/// `deleting &&` from the `superseded_by_present.contains(key)` skip, or drop
+/// it from the rewrite arm's `created_unix_ns + protection_horizon_ns` gate.
+/// Either one leaves the observing pass with no group at all:
+/// `held_by_superseded_inputs == 1` fails with `0` and `deleted == 0` fails
+/// with `1`, while both of R1's inputs are still HEAD-named.
+#[tokio::test]
+async fn a_young_successor_does_not_hide_the_chain_it_supersedes() {
+    young_successor_hides_nothing_case(Drops::Present).await;
+}
+
+/// The production-shape twin: a completion naming no bucket holds the same way.
+#[tokio::test]
+async fn a_young_successor_does_not_hide_the_chain_in_production_shape() {
+    young_successor_hides_nothing_case(Drops::Absent).await;
+}
+
+async fn young_successor_hides_nothing_case(drops: Drops) {
+    let mem = Arc::new(MemoryStore::new());
+    let created = sealed_now_ns();
+    let clock = FixedClock::new(created);
+    let horizon = cfg().protection_horizon_ns;
+    let r2_created = created + horizon - 1;
+    let fixture = seed_staggered_chain(&mem, &clock, created, r2_created, None).await;
+
+    assert_eq!(
+        head_named_data_keys(mem.as_ref(), OLD_HOUR).await,
+        fixture.input_data_keys,
+        "the stale snapshot still names exactly the two pre-rewrite inputs"
+    );
+
+    let (dreq_x, _) =
+        seed_dreq_and_done_for(mem.as_ref(), request_id(), "victim", created, drops).await;
+    let (dreq_y, _) =
+        seed_dreq_and_done_for(mem.as_ref(), request_id_n(1), "absent1", r2_created, drops).await;
+
+    clock.set(past_horizon(created));
+    assert!(
+        past_horizon(created) < r2_created.saturating_add(horizon),
+        "R2 is still inside its own protection horizon at X's completion horizon"
+    );
+
+    let dreq = sweep_dreq(mem.as_ref(), &clock).await.expect("dreq sweep");
+    assert_eq!(
+        dreq.deleted, 0,
+        "no filter retires while R1's raw inputs are HEAD-resolvable"
+    );
+    assert_eq!(
+        dreq.held_by_superseded_inputs, 1,
+        "X is held: the observation walked R2 -> R1 regardless of R2's age"
+    );
+    assert_eq!(
+        dreq.kept, 2,
+        ".dreq_X held by the chain, .dreq_Y kept by its own horizon"
+    );
+
+    assert_eq!(
+        present_keys(mem.as_ref(), &fixture.input_data_keys).await,
+        fixture.input_data_keys,
+        "both victim inputs are still present"
+    );
+    assert_eq!(
+        head_named_data_keys(mem.as_ref(), OLD_HOUR).await,
+        fixture.input_data_keys,
+        "and are still exactly what the snapshot names"
+    );
+    let mut records: BTreeSet<String> = fixture.commit_keys.iter().cloned().collect();
+    records.insert(fixture.chain[0].clone());
+    records.insert(fixture.chain[1].clone());
+    assert_eq!(
+        present_keys(mem.as_ref(), &records).await,
+        records,
+        "both input commit records and both generations survive"
+    );
+    let filters = BTreeSet::from([dreq_x, dreq_y]);
+    assert_eq!(
+        present_keys(mem.as_ref(), &filters).await,
+        filters,
+        "both filters are physically present"
+    );
+}
+
+/// The boundary partner of the case above: R2 lands exactly one full protection
+/// horizon after R1, so R1 is past its horizon by one nanosecond at the sweep
+/// clock and R2 has exactly its own horizon still to run. The holds are
+/// identical, and rule 2 in deleting mode deletes nothing: R1 is skipped as a
+/// record a present rewrite supersedes, R2 by its own horizon. That pair of
+/// exact zeroes is how an observing pass tells "young, not deletable" from
+/// "held": the deleting pass reports no hold and no delete, while the observing
+/// pass the `.dreq` sweep runs reports the hold.
+///
+/// Flip-line proof: the same two lines as the case above, with the same two
+/// failures. The `records_deleted`/`held_by_snapshot` zeroes below pin the other
+/// direction: dropping either filter from the DELETING path would collect or
+/// hold a chain this pass must leave entirely alone.
+#[tokio::test]
+async fn a_successor_exactly_at_its_horizon_holds_the_same_and_deletes_nothing() {
+    successor_at_its_horizon_case(Drops::Present).await;
+}
+
+/// The production-shape twin.
+#[tokio::test]
+async fn a_successor_exactly_at_its_horizon_holds_the_same_in_production_shape() {
+    successor_at_its_horizon_case(Drops::Absent).await;
+}
+
+async fn successor_at_its_horizon_case(drops: Drops) {
+    let mem = Arc::new(MemoryStore::new());
+    let created = sealed_now_ns();
+    let clock = FixedClock::new(created);
+    let horizon = cfg().protection_horizon_ns;
+    let r2_created = created + horizon;
+    let fixture = seed_staggered_chain(&mem, &clock, created, r2_created, None).await;
+
+    let (dreq_x, _) =
+        seed_dreq_and_done_for(mem.as_ref(), request_id(), "victim", created, drops).await;
+    let (dreq_y, _) =
+        seed_dreq_and_done_for(mem.as_ref(), request_id_n(1), "absent1", r2_created, drops).await;
+
+    clock.set(past_horizon(created));
+
+    // Rule 2 in deleting mode, in the maintenance tick's own order.
+    let out = sweep(mem.as_ref(), &clock).await.expect("superseded sweep");
+    assert_eq!(
+        (out.records_deleted, out.data_deleted),
+        (0, 0),
+        "nothing is collectable: R2 has its whole horizon still to run"
+    );
+    assert_eq!(
+        (out.held_by_snapshot, out.held_by_unreadable_head),
+        (0, 0),
+        "and nothing is even gathered, so the deleting pass reports no hold either"
+    );
+    assert_eq!(
+        present_keys(mem.as_ref(), &fixture.input_data_keys).await,
+        fixture.input_data_keys,
+        "both victim inputs are untouched"
+    );
+
+    let dreq = sweep_dreq(mem.as_ref(), &clock).await.expect("dreq sweep");
+    assert_eq!(dreq.deleted, 0, "the filter is held, not retired");
+    assert_eq!(
+        dreq.held_by_superseded_inputs, 1,
+        "the observing pass sees the chain the deleting pass could not touch"
+    );
+    assert_eq!(dreq.kept, 2);
+    let filters = BTreeSet::from([dreq_x, dreq_y]);
+    assert_eq!(
+        present_keys(mem.as_ref(), &filters).await,
+        filters,
+        "both filters are physically present"
+    );
+}
+
+/// Termination for the staggered chain: the hold lasts exactly until the fold
+/// reconciles the hour and the chain's own horizons elapse, and not one pass
+/// longer. The inputs go before the record that erased the subject out of them,
+/// proven by faulting exactly R1's record delete, and only then do both filters
+/// retire.
+///
+/// Flip-line proof: the same two lines as the two cases above fail the first
+/// step's `held_by_superseded_inputs == 1` with `0`, and the release step then
+/// fails too, with `deleted == 1` instead of `2`, because `.dreq_X` was already
+/// gone. Moving the `chain_record_keys` delete loop in `sweep_superseded_impl`
+/// ahead of the `data_keys` loop fails the "already gone at the fault"
+/// assertions.
+#[tokio::test]
+async fn the_staggered_chain_releases_both_filters_once_the_fold_reconciles() {
+    staggered_chain_release_case(Drops::Present).await;
+}
+
+/// The production-shape twin.
+#[tokio::test]
+async fn the_staggered_chain_releases_both_filters_in_production_shape() {
+    staggered_chain_release_case(Drops::Absent).await;
+}
+
+async fn staggered_chain_release_case(drops: Drops) {
+    let mem = Arc::new(MemoryStore::new());
+    let created = sealed_now_ns();
+    let clock = FixedClock::new(created);
+    let horizon = cfg().protection_horizon_ns;
+    let r2_created = created + horizon - 1;
+    let fixture = seed_staggered_chain(&mem, &clock, created, r2_created, None).await;
+    let r1 = fixture.chain[0].clone();
+    let r2 = fixture.chain[1].clone();
+    let r1_parts = rewrite_part_keys(mem.as_ref(), &r1).await;
+    let r2_parts = rewrite_part_keys(mem.as_ref(), &r2).await;
+
+    let (dreq_x, done_x) =
+        seed_dreq_and_done_for(mem.as_ref(), request_id(), "victim", created, drops).await;
+    let (dreq_y, done_y) =
+        seed_dreq_and_done_for(mem.as_ref(), request_id_n(1), "absent1", r2_created, drops).await;
+
+    // Step 1: at X's horizon the stale snapshot still names R1's inputs, so the
+    // filter is held.
+    clock.set(past_horizon(created));
+    let dreq = sweep_dreq(mem.as_ref(), &clock).await.expect("dreq sweep");
+    assert_eq!(
+        dreq.deleted, 0,
+        "no filter retires while R1's raw inputs are HEAD-resolvable"
+    );
+    assert_eq!(dreq.held_by_superseded_inputs, 1);
+
+    // Step 2: the fold reconciles the hour, and the clock reaches past R2's own
+    // horizon, which is the last thing the chain was waiting on.
+    fold_head(&mem, r2_created + 3 * NS_PER_HOUR, 3, Some(200)).await;
+    assert_eq!(
+        head_named_data_keys(mem.as_ref(), OLD_HOUR).await,
+        r2_parts,
+        "the reconciled snapshot names exactly the live generation's parts"
+    );
+    clock.set(past_horizon(r2_created));
+
+    // Step 3: fault exactly R1's record delete. Everything the invariant
+    // requires to be gone before it must already be gone.
+    let plan = FaultPlan::empty()
+        .with_rule(Rule::new(Op::Delete, ScriptedFault::Timeout).with_key_contains(r1.clone()));
+    let store = FaultStore::new(mem.clone(), plan);
+    assert!(
+        sweep(&store, &clock).await.is_err(),
+        "the faulted delete of R1's record surfaces as a pass error"
+    );
+    assert_eq!(
+        store.fault_count(Op::Delete, FaultKind::Timeout),
+        1,
+        "exactly one delete was aimed at R1's record"
+    );
+    assert_eq!(
+        present_keys(mem.as_ref(), &fixture.input_data_keys).await,
+        BTreeSet::new(),
+        "every input R1 superseded is already gone when its record's delete is issued"
+    );
+    let commit_records: BTreeSet<String> = fixture.commit_keys.iter().cloned().collect();
+    assert_eq!(
+        present_keys(mem.as_ref(), &commit_records).await,
+        BTreeSet::new(),
+        "and so are their commit records"
+    );
+    assert_eq!(
+        present_keys(mem.as_ref(), &r1_parts).await,
+        BTreeSet::new(),
+        "R1's own parts went before R1's record too"
+    );
+    assert!(
+        mem.head(&r1).await.is_ok(),
+        "R1's record is still there: its delete is the one that faulted"
+    );
+    let filters = BTreeSet::from([dreq_x.clone(), dreq_y.clone()]);
+    assert_eq!(
+        present_keys(mem.as_ref(), &filters).await,
+        filters,
+        "both filters are live while R1's record is"
+    );
+
+    // Step 4: a clean pass finishes the job, R1's record last.
+    let out = sweep(mem.as_ref(), &clock).await.expect("superseded sweep");
+    assert_eq!(out.records_deleted, 1, "R1's record, and nothing else");
+    assert_eq!(
+        out.data_deleted, 1,
+        "R1's single part, re-issued idempotently"
+    );
+    assert_eq!((out.held_by_snapshot, out.held_by_unreadable_head), (0, 0));
+    assert!(mem.head(&r1).await.is_err(), "R1's record is gone");
+    assert!(mem.head(&r2).await.is_ok(), "the live generation survives");
+    assert_eq!(
+        present_keys(mem.as_ref(), &r2_parts).await,
+        r2_parts,
+        "with its parts"
+    );
+
+    // Step 5: with nothing left resolvable, both filters retire in one pass.
+    let dreq = sweep_dreq(mem.as_ref(), &clock).await.expect("dreq sweep");
+    assert_eq!(dreq.deleted, 2, ".dreq_X and .dreq_Y, each removed once");
+    assert_eq!(dreq.kept, 0);
+    assert_eq!(dreq.held_by_superseded_inputs, 0);
+    assert_eq!(
+        present_keys(mem.as_ref(), &filters).await,
+        BTreeSet::new(),
+        "both filters are physically gone"
+    );
+    let completions = BTreeSet::from([done_x, done_y]);
+    assert_eq!(
+        present_keys(mem.as_ref(), &completions).await,
+        completions,
+        "both .done records are permanent audit evidence, never swept"
+    );
+}
+
+/// A completion that names one of the two buckets its request touched. The
+/// bucket it omits is the one whose inputs are still HEAD-named, so narrowing
+/// the observation by that list would release the filter over data the request
+/// erased a subject out of. `bucket_drops` is informational only: the hold is
+/// decided over every chain in the signal.
+///
+/// The two touched buckets are real, not asserted: X was applied in
+/// [`OLD_HOUR`] and in [`RECENT_HOUR`], and the second fold reconciles only the
+/// recent one, which is the bucket the completion names.
+///
+/// Flip-line proof: restore the narrowing in `observe_superseded_holds` by
+/// passing the completion's buckets as the `hours` argument for their shard.
+/// The observation then covers [`RECENT_HOUR`] alone, where the gate clears,
+/// `held_by_superseded_inputs == 1` fails with `0`, and `deleted == 0` fails
+/// with `1`.
+#[tokio::test]
+async fn a_partial_bucket_list_does_not_narrow_the_observation() {
+    let mem = Arc::new(MemoryStore::new());
+    let created = sealed_now_ns();
+    let clock = FixedClock::new(created);
+    let commit_keys = seed_two_hours(mem.as_ref()).await;
+    let old_input_data_keys = seeded_input_data_keys(mem.as_ref(), &commit_keys).await;
+
+    // A second victim-carrying input in the recent hour, so the same request
+    // has something to erase in both buckets.
+    let recent_ns = i64::from(RECENT_HOUR) * NS_PER_HOUR;
+    seed_input(
+        mem.as_ref(),
+        &InputSpec::new_at(
+            RECENT_HOUR,
+            Uuid::from_u128(0xB2),
+            1,
+            2,
+            vec![raw_series(
+                "victim",
+                &[("k", "d")],
+                &[(recent_ns + 2_000, 7.0)],
+            )],
+        ),
+    )
+    .await;
+
+    fold_head(&mem, created, 1, None).await;
+    run_rewrite_with(mem.as_ref(), &clock, &[pending_request()]).await;
+    run_rewrite_in(mem.as_ref(), &clock, &recent_bucket(), &[pending_request()]).await;
+    // The default reconcile window reaches the recent hour and not the old one.
+    fold_head(&mem, created + 3 * NS_PER_HOUR, 2, None).await;
+
+    let recent_rw = rewrite_record_key_in(mem.as_ref(), &recent_bucket()).await;
+    let recent_parts = rewrite_part_keys(mem.as_ref(), &recent_rw).await;
+    assert_eq!(
+        head_named_data_keys(mem.as_ref(), RECENT_HOUR).await,
+        recent_parts,
+        "the fold reconciled the bucket the completion names, so the gate clears there"
+    );
+    assert_eq!(
+        head_named_data_keys(mem.as_ref(), OLD_HOUR).await,
+        old_input_data_keys,
+        "and left the omitted bucket naming its pre-rewrite inputs"
+    );
+
+    // The completion names the reconciled bucket only. Both counts are what the
+    // rewrites actually dropped, so the list is partial, not wrong.
+    let (dreq_x, _) = seed_dreq_and_done_with_drops(
+        mem.as_ref(),
+        request_id(),
+        "victim",
+        created,
+        vec![ErasureBucketDrop {
+            signal: signal::to_proto(Signal::Metrics) as i32,
+            shard: SHARD,
+            ingest_hour_bucket: RECENT_HOUR,
+            dropped_count: 1,
+        }],
+    )
+    .await;
+
+    clock.set(past_horizon(created));
+    let dreq = sweep_dreq(mem.as_ref(), &clock).await.expect("dreq sweep");
+    assert_eq!(
+        dreq.deleted, 0,
+        "the omitted bucket still holds the request's own pre-rewrite inputs"
+    );
+    assert_eq!(
+        dreq.held_by_superseded_inputs, 1,
+        "held by the chain in the bucket the completion does not name"
+    );
+    assert_eq!(dreq.kept, 1);
+    assert_eq!(
+        present_keys(mem.as_ref(), &old_input_data_keys).await,
+        old_input_data_keys,
+        "both victim inputs in the omitted bucket are still present"
+    );
+    assert!(
+        mem.head(&dreq_x).await.is_ok(),
+        ".dreq_X physically present"
+    );
+}
+
+/// The observing pass is an observation and nothing else: over a chain no
+/// deleting pass could touch yet, it issues zero deletes and reads the catalog
+/// exactly twice, HEAD once and the one covering part once, however many groups
+/// it gates.
+///
+/// Flip-line proof: return `SweepMode::Delete` from the `mode` argument
+/// `observe_superseded_holds` passes. The pass then reaches its delete phases
+/// (the gate blocks here, so the visible failure is the request shape and the
+/// hold, not a delete); replacing the `object_gate` match with
+/// `SnapshotGate::Clear` on top of that fires the `Op::Delete` rule and the
+/// `.expect` panics. Dropping the shared `SnapshotReachability` (a fresh one per
+/// shard, or per group) fires the third-catalog-GET rule instead.
+#[tokio::test]
+async fn the_observing_pass_deletes_nothing_and_reads_the_catalog_twice() {
+    let mem = Arc::new(MemoryStore::new());
+    let created = sealed_now_ns();
+    let clock = FixedClock::new(created);
+    let horizon = cfg().protection_horizon_ns;
+    let r2_created = created + horizon - 1;
+    let fixture = seed_staggered_chain(&mem, &clock, created, r2_created, None).await;
+
+    seed_dreq_and_done_for(mem.as_ref(), request_id(), "victim", created, Drops::Absent).await;
+
+    // Any delete faults the pass, so "zero deletes" is proven by the pass
+    // succeeding. The third catalog GET faults too: HEAD once and the covering
+    // part once, with every later group reusing the first group's verdict.
+    let plan = FaultPlan::empty()
+        .with_rule(Rule::new(Op::Delete, ScriptedFault::Timeout))
+        .with_rule(
+            Rule::new(Op::Get, ScriptedFault::Timeout)
+                .with_key_contains("/catalog/")
+                .with_occurrence(Occurrence::Nth(3)),
+        );
+    let store = FaultStore::new(mem.clone(), plan);
+
+    clock.set(past_horizon(created));
+    let dreq = sweep_dreq(&store, &clock)
+        .await
+        .expect("an observing pass deletes nothing and re-reads no catalog object");
+    assert_eq!(dreq.deleted, 0);
+    assert_eq!(dreq.held_by_superseded_inputs, 1);
+    assert_eq!(
+        store.fault_count(Op::Delete, FaultKind::Timeout),
+        0,
+        "the observing pass issued exactly zero deletes"
+    );
+    assert_eq!(
+        store.fault_count(Op::Get, FaultKind::Timeout),
+        0,
+        "exactly two catalog GETs for the whole pass: one HEAD, one part"
+    );
+    assert_eq!(
+        present_keys(mem.as_ref(), &fixture.input_data_keys).await,
+        fixture.input_data_keys,
+        "and nothing it observed was removed"
+    );
 }
