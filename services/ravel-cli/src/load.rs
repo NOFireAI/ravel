@@ -35,7 +35,7 @@ use ravel_catalog::{AbsentPolicy, validate_or_adopt};
 use ravel_ingest::LogStageSnapshot;
 use ravel_ingest::{
     Clock, FlushTriggerMix, IngestConfig, LogIngestMetricsSnapshot, LogIngestRouter, LogWriteError,
-    LogWriteReceipt, SystemClock, WriteMode,
+    LogWriteReceipt, STRICT_VISIBILITY_RESERVE_NS, SystemClock, WriteMode,
 };
 use ravel_logseg::{
     Bitmap, ColumnarLogBatch, DynColumn, FieldType, StrColumnDict, stream_attrs_bytes,
@@ -110,7 +110,7 @@ pub const DEFAULT_DECODE_QUEUE_BATCHES: usize = 2;
 ///   object count unchanged at 8,424. A depth of 16 with the inner window left
 ///   at 1 aborted outright with `timed out waiting for shard ack`, because a
 ///   depth the inner window cannot absorb just queues batches behind the
-///   [`WRITE_ACK_DEADLINE`].
+///   [`write_ack_deadline`].
 /// - It bounds the memory cost at a stated multiple rather than at the shard
 ///   count, which is a provisioning decision an operator may set far above 4.
 ///   The loader holds at most `--pipeline-depth` built batches for their
@@ -130,7 +130,7 @@ pub const DEFAULT_PIPELINE_DEPTH: usize = 4;
 /// windows compose as `shards * min(pipeline_depth, max_inflight_flushes)`
 /// (ADR-0807): an inner window below the outer one re-serialises each shard's
 /// PUT round trips and makes batches queue behind a semaphore they will still
-/// have to clear before [`WRITE_ACK_DEADLINE`] elapses, and an inner window
+/// have to clear before [`write_ack_deadline`] elapses, and an inner window
 /// above the outer one is unreachable, since the loader never hands any shard
 /// more concurrent work than `--pipeline-depth` batches.
 ///
@@ -168,18 +168,52 @@ pub(crate) fn build_ingest_config(
     max_inflight_flushes: u32,
     max_flush_delay: Option<Duration>,
 ) -> IngestConfig {
+    let delay = max_flush_delay.unwrap_or_else(|| IngestConfig::default().max_flush_delay);
     IngestConfig {
         shard_count: shards,
         target_bytes,
         max_inflight_flushes,
-        max_flush_delay: max_flush_delay.unwrap_or_else(|| IngestConfig::default().max_flush_delay),
+        max_flush_delay: delay,
+        // ADR-0076 decision 4: follows the actually-configured
+        // `max_flush_delay`, not just its default, so the adaptive corridor
+        // never contradicts the configured cadence. Must EXCEED the delay by
+        // the same reserve `IngestConfig::default()` uses; setting it equal
+        // collapses the corridor to its floor. Same derivation as
+        // `services/ravel-server/src/lib.rs`'s router construction.
+        strict_visibility_budget_ns: i64::try_from(delay.as_nanos())
+            .unwrap_or(i64::MAX)
+            .saturating_add(STRICT_VISIBILITY_RESERVE_NS),
         ..IngestConfig::default()
     }
 }
 
-/// Ack deadline for each Strict write. Generous: a bulk load values completing
-/// over racing a slow store.
-const WRITE_ACK_DEADLINE: Duration = Duration::from_secs(60);
+/// Floor for a Strict write's ack deadline. Generous: a bulk load values
+/// completing over racing a slow store.
+const WRITE_ACK_DEADLINE_FLOOR: Duration = Duration::from_secs(60);
+
+/// Headroom added over `--max-flush-delay` by [`write_ack_deadline`]: the
+/// window the released flush still needs to encode and PUT its object once the
+/// age trigger has opened it.
+const WRITE_ACK_DEADLINE_MARGIN: Duration = Duration::from_secs(60);
+
+/// Ack deadline for each Strict write, scaled to the configured age trigger.
+///
+/// A write whose shard buffer never reaches `--target-bytes` is answered by the
+/// age trigger, so its ack can legitimately take `--max-flush-delay` plus the
+/// flush itself. A fixed 60s deadline therefore turns any raised delay into a
+/// `LogWriteError::AckTimeout` on the very batches the raised delay was meant
+/// to let accumulate, failing a whole load at its documented settings. Scaling
+/// keeps the deadline what it always was for an unset flag
+/// ([`WRITE_ACK_DEADLINE_FLOOR`] exactly) while leaving a raised delay one
+/// [`WRITE_ACK_DEADLINE_MARGIN`] of room past the trigger it configured.
+pub(crate) fn write_ack_deadline(max_flush_delay: Option<Duration>) -> Duration {
+    match max_flush_delay {
+        None => WRITE_ACK_DEADLINE_FLOOR,
+        Some(delay) => {
+            WRITE_ACK_DEADLINE_FLOOR.max(delay.saturating_add(WRITE_ACK_DEADLINE_MARGIN))
+        }
+    }
+}
 
 /// Source time unit for the mapped `ts` column, converted to nanoseconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -1002,7 +1036,9 @@ type BuildStartHook = Arc<dyn Fn() + Send + Sync>;
 /// buffer flushes, beside `target_bytes` and the slice footprint: a buffer that
 /// does not reach `target_bytes` within this delay is released by the age
 /// trigger, so a large `target_bytes` is only reachable once this is raised past
-/// the time one target's worth accumulates. See [`build_ingest_config`].
+/// the time one target's worth accumulates. See [`build_ingest_config`]. It also
+/// scales every write's ack deadline ([`write_ack_deadline`]), so a buffer the
+/// age trigger releases late is still awaited rather than timed out.
 #[allow(clippy::too_many_arguments)]
 async fn load_instrumented(
     store: Arc<dyn ObjectStoreBackend>,
@@ -1124,10 +1160,12 @@ async fn load_instrumented(
     // from `ack_waiters` only after that flush's object and commit record are
     // published) but drops the other three: a shard's buffer now spans several
     // batches, so a batch's ack waits for whichever later batch pushes the
-    // buffer over the target, and a tail buffer that never reaches the target
-    // is released by the wall-clock age trigger instead. The loader's in-flight
-    // window must therefore be wide enough to hold the batches that accumulate
-    // into one flush, or every flush waits out `max_flush_delay`.
+    // buffer over the target, and mid-load a buffer that never reaches the
+    // target is released by the wall-clock age trigger instead (at the end of
+    // the input the `flush_all` below releases it, since no later batch is
+    // coming). The loader's in-flight window must therefore be wide enough to
+    // hold the batches that accumulate into one flush, or every flush waits out
+    // `max_flush_delay`.
     //
     // That age trigger (`max_flush_delay`, the `--max-flush-delay` lever) is the
     // THIRD binding constraint on object layout, beside `target_bytes` and one
@@ -1164,6 +1202,13 @@ async fn load_instrumented(
         Arc::clone(&store),
         clock,
     ));
+
+    // Every Strict write below waits this long for its ack, and the wait is
+    // whatever the age trigger the same flag configured takes to release the
+    // buffer (see `write_ack_deadline`): a buffer that misses `target_bytes`
+    // through slice variance mid-load is answered by the age trigger, so the
+    // deadline has to outlast it.
+    let ack_deadline = write_ack_deadline(max_flush_delay);
 
     // Parse the input's Parquet footer exactly once here (issue #773). The
     // shared metadata sizes the stride cursors, derives the reader schema, and
@@ -1303,7 +1348,7 @@ async fn load_instrumented(
                 let tenant = tenant_id.clone();
                 tokio::spawn(async move {
                     router
-                        .write(tenant, records, WriteMode::Strict, WRITE_ACK_DEADLINE)
+                        .write(tenant, records, WriteMode::Strict, ack_deadline)
                         .await
                 })
             }
@@ -1316,7 +1361,7 @@ async fn load_instrumented(
                 let tenant = tenant_id.clone();
                 tokio::spawn(async move {
                     router
-                        .write_columnar(tenant, *batch, WriteMode::Strict, WRITE_ACK_DEADLINE)
+                        .write_columnar(tenant, *batch, WriteMode::Strict, ack_deadline)
                         .await
                 })
             }
@@ -1388,10 +1433,26 @@ async fn load_instrumented(
         });
     }
 
-    // Clean exhaustion: reap the finished decoder task, then drain every write
-    // still in the window in the same oldest-first order before reporting
-    // success.
+    // Clean exhaustion: reap the finished decoder task first, so no further
+    // batch can be built.
     let _ = decode_handle.await;
+
+    // Publish the tail buffers BEFORE waiting on the writes that are still in
+    // the window. The input is exhausted, so no later batch will arrive to push
+    // a buffer that sits under `target_bytes` over it, and its writes' acks are
+    // then answered only by the age trigger -- which at a raised
+    // `--max-flush-delay` outlasts the ack deadline, failing the whole load at
+    // the end on exactly the settings the flag exists for. `FlushNow` travels
+    // each shard's own channel, so it merges behind the writes already queued
+    // there, publishes whatever they buffered, and answers their waiters; the
+    // drain below then resolves at PUT speed instead of on the age clock. A
+    // write whose task has not yet reached its channel send is the case
+    // `write_ack_deadline` covers: it is released by the age trigger and its
+    // ack is awaited long enough to arrive.
+    router.flush_all().await;
+
+    // Drain every write still in the window in the same oldest-first order
+    // before reporting success.
     drain_inflight(
         &mut inflight,
         &mut report,
@@ -1400,10 +1461,6 @@ async fn load_instrumented(
         shards,
     )
     .await?;
-
-    // Strict acks already guarantee durability; flush_all is a defensive
-    // no-op here (nothing is buffered after a Strict write returns).
-    router.flush_all().await;
 
     // Snapshot the router's cumulative counters before it drops: the caller
     // reads the dynamic-column figures to warn on overflow or near-cap pressure
@@ -1582,7 +1639,12 @@ async fn drain_inflight(
 /// there is nothing left that can commit, so the reported list is exactly what
 /// landed, at any `--pipeline-depth`. The cost is on the failure path only, and
 /// it is bounded: the remaining writes were submitted before the failing one and
-/// run concurrently, so this waits at most one [`WRITE_ACK_DEADLINE`].
+/// run concurrently, so this waits at most one [`write_ack_deadline`], which at
+/// a raised `--max-flush-delay` is that delay plus its margin rather than a flat
+/// minute. Reached from the clean-exhaustion drain the wait is short whatever
+/// the delay, because the tail buffers were already published by the `flush_all`
+/// that precedes that drain; only a mid-load failure can leave an outstanding
+/// write waiting on the age trigger here.
 ///
 /// A later write's own error is deliberately discarded apart from its recovered
 /// tokens: the returned error stays the first failure in submission order, which
@@ -5949,82 +6011,112 @@ type = "i64"
         );
     }
 
-    /// The `--max-flush-delay` lever is observable in the flush mix (issue #801,
-    /// deliverable 3): whether two sequential writes to one shard coalesce into
-    /// one object or split into two turns on the age trigger, holding the target
-    /// fixed. Geometry: one shard, two equal 4 KB-payload rows read one per
-    /// batch (`--batch-rows 1 --read-cursors 1`), so each write's estimated
-    /// per-shard slice is about 4.1 KB. `TARGET = 6000` sits above one slice and
-    /// below two, so a single write can never reach it on its own -- it is
-    /// released only by a later write merging in (size) or by aging out.
+    /// One side of the [`max_flush_delay_decides_whether_two_writes_coalesce`]
+    /// pair. Every argument of the load is fixed here, so the only thing the
+    /// two calls differ in is `max_flush_delay`.
     ///
-    /// - Raised delay (`Some(1h)`), both writes in flight (`--pipeline-depth
-    ///   2`), a `FixedClock` that never ages anything: whichever write the shard
-    ///   actor sees first buffers under `TARGET`, and the second merges into the
-    ///   same buffer, pushing it over `TARGET` and flushing both as ONE object by
-    ///   size. Order-independent, so no write is stranded. Mix: size 1, age 0.
-    /// - Default delay (`None` = 2s), serial writes (`--pipeline-depth 1`), an
-    ///   injected clock advanced past 2s: the loader awaits the first write's ack
-    ///   before submitting the second, so the two never share a buffer. With no
-    ///   later write to push either over `TARGET`, each is released only by the
-    ///   age trigger, which the advanced clock fires. TWO objects, both aged.
+    /// The injected clock advances 5s of load time every 20ms of real time and
+    /// stops once it has advanced `GATE_NS`; the decoder is gated on that same
+    /// point, blocking after the first batch is queued until the clock reaches
+    /// it. So batch 1's write sits alone in the shard buffer across the whole
+    /// advance, and batch 2's write arrives only once the clock has stopped
+    /// moving. Whether the first buffer survives that window is the delay's
+    /// decision and nothing else's.
+    async fn load_two_writes_across_one_clock_advance(
+        store: Arc<dyn ObjectStoreBackend>,
+        pq: &Path,
+        m: &Mapping,
+        max_flush_delay: Duration,
+    ) -> LoadReport {
+        // TARGET between one 4.1 KB slice and two, with margin on both sides,
+        // so one write never reaches it and two always do.
+        const TARGET: usize = 6_000;
+        const ADVANCE_STEP_NS: i64 = 5 * 1_000_000_000;
+        const GATE_NS: i64 = 100 * 1_000_000_000;
+
+        let clock = TestClock::new(NOW_NS);
+        let gate = Arc::clone(&clock);
+        let on_batch_queued: BuildStartHook = Arc::new(move || {
+            while gate.now_ns() < NOW_NS + GATE_NS {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+
+        let load_fut = load_instrumented(
+            store,
+            pq,
+            "acme",
+            m,
+            1,       // one shard: both writes land in the same buffer
+            1,       // one row per batch
+            Some(1), // one read cursor: batches are strictly sequential
+            4,       // pipeline depth above the write count: no mid-loop ack wait
+            DEFAULT_MAX_INFLIGHT_FLUSHES,
+            1, // one queued batch: the loader parks on `recv` between writes
+            TARGET,
+            Some(max_flush_delay),
+            NOW_NS,
+            Arc::clone(&clock) as Arc<dyn Clock>,
+            LoadPath::Columnar,
+            None,
+            Some(on_batch_queued),
+        );
+        tokio::pin!(load_fut);
+        loop {
+            tokio::select! {
+                report = &mut load_fut => break report.expect("the load completes"),
+                () = tokio::time::sleep(Duration::from_millis(20)) => {
+                    if clock.now_ns() < NOW_NS + GATE_NS {
+                        clock.advance_ns(ADVANCE_STEP_NS);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The `--max-flush-delay` lever decides an object layout, not just a config
+    /// field (issue #801, deliverable 3). Both sides run
+    /// [`load_two_writes_across_one_clock_advance`]: same two rows, same
+    /// `--target-bytes`, same `--pipeline-depth`, same injected clock advanced
+    /// by the same pattern, only the delay flipped.
     ///
-    /// The demonstrated lever is the delay: same target, same rows, one object
-    /// versus two. The age total is 2 rather than 1 because equal slices make
-    /// the second write age out too instead of flushing itself by size; equal
-    /// slices are what make the raised-delay coalesce robust to the loader's
-    /// unordered spawn of the two writes. The default-delay side drives the clock
-    /// past the age trigger in an unbounded loop, so it pins the age/size layout
-    /// the trigger produces, not the exact delay value; that the plumbed value
-    /// reaches the config is pinned directly by
-    /// [`max_flush_delay_unset_keeps_the_default_age_trigger`] and
-    /// [`max_flush_delay_set_reaches_the_config_exactly`].
+    /// - `LONG` (1h) outlasts the 100s the clock ever advances, so nothing can
+    ///   age out. The second write merges into the first's buffer, pushes it
+    ///   past the target and flushes both as ONE object by size.
+    /// - `SHORT` (1s) is shorter than a single 5s advance step, so the first
+    ///   write's buffer ages out while the decoder is gated: one object by age.
+    ///   The second write then lands in a fresh buffer with the clock already
+    ///   stopped, so nothing can age it either, and the loader's end-of-input
+    ///   flush publishes it. TWO objects, exactly one of them aged.
     ///
-    /// Prove-the-test: hardcode `target_bytes: 1` into `build_ingest_config`
-    /// regardless of its argument and the raised-delay side no longer coalesces
-    /// -- each write flushes itself by size, so it writes two objects and the
-    /// object-count assertion fails at `left: 2, right: 1`. Dropping the `age`
-    /// count from `FlushMixCounts` (reporting size where age belongs) fails the
-    /// default-delay mix assertion instead, at `age: 0` where `age: 2` is
+    /// The counts come from the real router's issue #983 trigger mix, so each
+    /// side pins which trigger opened each object, not just how many there were.
+    ///
+    /// Prove-the-test, flipping only the delay: passing `SHORT` to the coalesced
+    /// side fails its object count at `left: 2, right: 1` (the first write ages
+    /// out during the gate instead of waiting for the second), and passing
+    /// `LONG` to the split side fails at `left: 1, right: 2`, with its mix at
+    /// `size: 1, age: 0, final: 0` where `size: 0, age: 1, final: 1` is
     /// required.
     #[tokio::test]
     async fn max_flush_delay_decides_whether_two_writes_coalesce() {
         use ravel_object_store::memory::MemoryStore;
 
-        // TARGET between one 4.1 KB slice and two, with margin on both sides, so
-        // one write never reaches it and two always do.
-        const TARGET: usize = 6_000;
+        const LONG: Duration = Duration::from_secs(3600);
+        const SHORT: Duration = Duration::from_secs(1);
+
         let (_dir, pq, _mapping_path, m) = fat_attr_sorted_by_shard_fixture(1, 2, 4000);
 
-        // Raised delay, both writes concurrent, a clock that never ages: the two
-        // writes merge into one buffer and flush together by size.
         let coalesced_store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-        let coalesced = load_instrumented(
-            Arc::clone(&coalesced_store),
-            &pq,
-            "acme",
-            &m,
-            1,
-            1,
-            Some(1),
-            2,
-            DEFAULT_MAX_INFLIGHT_FLUSHES,
-            DEFAULT_DECODE_QUEUE_BATCHES,
-            TARGET,
-            Some(Duration::from_secs(3600)),
-            NOW_NS,
-            Arc::new(FixedClock(NOW_NS)),
-            LoadPath::Columnar,
-            None,
-            None,
-        )
-        .await
-        .expect("raised-delay load succeeds");
+        let coalesced =
+            load_two_writes_across_one_clock_advance(Arc::clone(&coalesced_store), &pq, &m, LONG)
+                .await;
 
         assert_eq!(
             coalesced.objects_written(),
             1,
-            "a raised delay lets the second write push the first over the target: one object"
+            "a delay longer than the advance keeps the first buffer alive for the second write: \
+             one object"
         );
         assert_eq!(
             coalesced.flush_mix_report().totals,
@@ -6033,59 +6125,29 @@ type = "i64"
                 age: 0,
                 final_drain: 0,
             },
-            "the single object is a size flush; nothing ages under a raised delay"
+            "the single object is a size flush; nothing ages under a delay longer than the advance"
         );
 
-        // Default 2s delay, serial writes, an injected clock advanced past 2s:
-        // each write is released only by aging out, into its own object.
         let split_store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-        let clock = TestClock::new(NOW_NS);
-        let load_fut = load_instrumented(
-            Arc::clone(&split_store),
-            &pq,
-            "acme",
-            &m,
-            1,
-            1,
-            Some(1),
-            1,
-            DEFAULT_MAX_INFLIGHT_FLUSHES,
-            DEFAULT_DECODE_QUEUE_BATCHES,
-            TARGET,
-            None,
-            NOW_NS,
-            std::sync::Arc::clone(&clock) as Arc<dyn Clock>,
-            LoadPath::Columnar,
-            None,
-            None,
-        );
-        tokio::pin!(load_fut);
-        // Drive the injected clock past the 2s age trigger until the load
-        // completes. Each serial write is suspended waiting for its ack;
-        // advancing the clock fires the age tick that releases it. An advance on
-        // an empty buffer is a no-op, so over-advancing is harmless.
-        let split = loop {
-            tokio::select! {
-                report = &mut load_fut => break report.expect("default-delay load succeeds"),
-                () = tokio::time::sleep(Duration::from_millis(20)) => {
-                    clock.advance_ns(3 * 1_000_000_000);
-                }
-            }
-        };
+        let split =
+            load_two_writes_across_one_clock_advance(Arc::clone(&split_store), &pq, &m, SHORT)
+                .await;
 
         assert_eq!(
             split.objects_written(),
             2,
-            "at the default 2s delay with serial writes neither write coalesces: two objects"
+            "a delay shorter than the advance ages the first write out before the second arrives: \
+             two objects"
         );
         assert_eq!(
             split.flush_mix_report().totals,
             FlushMixCounts {
                 size: 0,
-                age: 2,
-                final_drain: 0,
+                age: 1,
+                final_drain: 1,
             },
-            "each serial write is released by the age trigger, one object apiece"
+            "the first object is the aged-out buffer, the second is the tail the end-of-input \
+             flush published"
         );
 
         // Same rows either way, only their object layout differs.
@@ -6095,6 +6157,148 @@ type = "i64"
             decoded_records(coalesced_store.as_ref()).await,
             decoded_records(split_store.as_ref()).await,
             "the same two rows, decoded, regardless of how many objects hold them"
+        );
+    }
+
+    /// A load whose last slice stays under `--target-bytes` completes under a
+    /// raised `--max-flush-delay`, with that tail published by the loader's
+    /// end-of-input flush (issue #801). This is the run-burner the flag shipped
+    /// with: the tail's Strict ack has nothing left to release it by size, so
+    /// when the force-flush ran only after the in-flight window was drained,
+    /// the ack waited on the age trigger, blew the deadline, and returned an
+    /// error from a load whose every object had already landed.
+    ///
+    /// Geometry: one shard, four 4 KB-payload rows read one per batch, so each
+    /// write's estimated per-shard slice is about 4.1 KB. `TARGET = 10_000`
+    /// sits above two slices and below three, so writes 1-3 flush as one object
+    /// by size and write 4 is left alone under the target. `--pipeline-depth 5`
+    /// is above the batch count, so the loader never waits on an ack mid-loop.
+    /// The clock is fixed, which makes the assertion sharp: the age trigger
+    /// cannot fire at all here, so the tail's object exists only because the
+    /// manual flush published it.
+    ///
+    /// Prove-the-test: move `router.flush_all()` back after `drain_inflight`
+    /// and the load never returns a report -- the tail ack is answered by
+    /// nothing, and after `write_ack_deadline` (10m + 1m here) it fails with
+    /// `LoadError::Flush` carrying `timed out waiting for shard ack`.
+    #[tokio::test]
+    async fn a_tail_below_target_is_published_by_the_end_of_input_flush() {
+        use ravel_object_store::memory::MemoryStore;
+
+        const TARGET: usize = 10_000;
+        let (_dir, pq, _mapping_path, m) = fat_attr_sorted_by_shard_fixture(1, 4, 4000);
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let report = load_instrumented(
+            Arc::clone(&store),
+            &pq,
+            "acme",
+            &m,
+            1,
+            1,
+            Some(1),
+            5, // pipeline depth above the batch count: no mid-loop ack wait
+            DEFAULT_MAX_INFLIGHT_FLUSHES,
+            1,
+            TARGET,
+            Some(Duration::from_secs(600)),
+            NOW_NS,
+            Arc::new(FixedClock(NOW_NS)),
+            LoadPath::Columnar,
+            None,
+            None,
+        )
+        .await
+        .expect("a raised delay must not strand the tail buffer's ack");
+
+        assert_eq!(report.rows_processed, 4, "every row is durable");
+        assert_eq!(
+            report.objects_written(),
+            2,
+            "three slices reach the target as one object, the fourth is the tail"
+        );
+        assert_eq!(
+            report.flush_mix_report().totals,
+            FlushMixCounts {
+                size: 1,
+                age: 0,
+                final_drain: 1,
+            },
+            "the tail is published by the manual end-of-input flush, not by the age trigger"
+        );
+        assert_eq!(
+            decoded_records(store.as_ref()).await.len(),
+            4,
+            "the two objects hold all four rows"
+        );
+    }
+
+    /// The Strict ack deadline scales with the configured age trigger (issue
+    /// #801). A tail or under-target buffer is answered by the age trigger, so a
+    /// deadline that does not outlast the configured delay times out on exactly
+    /// the buffers the raised delay was set to let accumulate. An unset flag
+    /// keeps the deadline it always had, to the second.
+    ///
+    /// Prove-the-test: return `WRITE_ACK_DEADLINE_FLOOR` unconditionally from
+    /// `write_ack_deadline` and the 10m case fails at `left: 60s, right: 660s`.
+    #[test]
+    fn write_ack_deadline_scales_with_the_configured_flush_delay() {
+        assert_eq!(
+            write_ack_deadline(None),
+            Duration::from_secs(60),
+            "an unset --max-flush-delay leaves the deadline at exactly 60s"
+        );
+        assert_eq!(
+            write_ack_deadline(Some(Duration::from_secs(600))),
+            Duration::from_secs(660),
+            "--max-flush-delay 10m gives an 11m deadline: the delay plus one minute of margin"
+        );
+        assert_eq!(
+            write_ack_deadline(Some(Duration::ZERO)),
+            Duration::from_secs(60),
+            "a delay under the floor cannot shorten the deadline"
+        );
+        let long = Duration::from_secs(3600);
+        assert!(
+            write_ack_deadline(Some(long)) > long,
+            "the deadline always outlasts the age trigger it has to wait for"
+        );
+    }
+
+    /// `strict_visibility_budget_ns` follows the configured `max_flush_delay`
+    /// (ADR-0076 decision 4), exactly as ravel-server's own router construction
+    /// derives it. The field is metrics-only on this path, but the coupling is
+    /// documented on `IngestConfig` and a config that raises the delay while
+    /// leaving the budget at the 2s-based default contradicts it.
+    ///
+    /// Prove-the-test: drop the `strict_visibility_budget_ns` field from
+    /// `build_ingest_config` (falling through to `IngestConfig::default()`) and
+    /// the raised-delay case fails at `left: 2500000000, right: 600500000000`.
+    #[test]
+    fn strict_visibility_budget_follows_the_configured_flush_delay() {
+        let raised = build_ingest_config(
+            4,
+            DEFAULT_TARGET_BYTES,
+            DEFAULT_MAX_INFLIGHT_FLUSHES,
+            Some(Duration::from_secs(600)),
+        );
+        assert_eq!(
+            raised.strict_visibility_budget_ns,
+            600_000_000_000 + STRICT_VISIBILITY_RESERVE_NS,
+            "the budget is the configured delay plus the reserve, never the default's"
+        );
+        let delay_ns = i64::try_from(raised.max_flush_delay.as_nanos()).expect("delay fits i64");
+        assert!(
+            raised.strict_visibility_budget_ns > delay_ns,
+            "the budget must exceed the delay, not equal it: equal collapses the corridor"
+        );
+
+        let unset =
+            build_ingest_config(4, DEFAULT_TARGET_BYTES, DEFAULT_MAX_INFLIGHT_FLUSHES, None);
+        assert_eq!(
+            unset.strict_visibility_budget_ns,
+            IngestConfig::default().strict_visibility_budget_ns,
+            "an unset flag still builds a byte-for-byte default config"
         );
     }
 
