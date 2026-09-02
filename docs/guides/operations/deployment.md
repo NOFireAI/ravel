@@ -210,7 +210,8 @@ Alert on the first of those, not the third. It begins incrementing the moment
 refresh fails, one refresh interval apart, while the last known map still
 serves. The third only starts once the horizon has already been crossed and auth
 is failing closed. The gap between them is the grace window a fix has to land
-in. Both alert rules are on the troubleshooting page.
+in. Both alert rules are in
+[troubleshooting](troubleshooting.md#durable-auth-refresh-is-failing).
 
 <a id="the-dedicated-fragment-listener"></a>
 

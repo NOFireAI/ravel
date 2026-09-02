@@ -111,7 +111,7 @@ actually used.
 published into a bucket this fold already sealed is never picked up by a later
 incremental fold, which re-lists only hours after the watermark. The repair is
 the HEAD-deletion rebuild in
-the troubleshooting page, under queries missing recently written data.
+[troubleshooting](troubleshooting.md#queries-are-missing-recently-written-data).
 
 ### Routine verification
 
@@ -282,8 +282,8 @@ This is the one scheduled task whose cost scales with data volume rather than
 metadata volume, so size `P` against the corpus you actually have, and watch
 `ravel_scrub_cursor_position` to confirm rotations keep pace. That gauge and the
 three scrubber anomaly counters are catalogued in
-[the observability guide](../observability.md); the alarms that matter are on
-the troubleshooting page.
+[the observability guide](../observability.md); the alarms that matter are in
+[troubleshooting](troubleshooting.md).
 
 ### It needs no policy change
 
@@ -410,7 +410,7 @@ list is in [the generated CLI reference](../../reference/ravel-cli-flags.md).
 | `catalog fold` | One-shot fold for one tenant and signal. See [catalog fold and verify](#catalog-fold-and-verify). |
 | `catalog inspect --tenant <t> [--signal <s>]` | Decodes and prints that signal's HEAD and every referenced snapshot part: watermark, keys, hashes, entry counts. It names the signal both as a word and as the numeric value read off the object, so a HEAD stamped with a different signal than the one asked for is visible. It reports rather than errors when no HEAD exists yet. |
 | `catalog verify` | Diffs the sealed record history against the snapshot. See [routine verification](#routine-verification). |
-| `commit reconstruct` | Rebuilds record-less L0 data objects' commit records from their own footers. Stop maintenance first; see the troubleshooting page. |
+| `commit reconstruct` | Rebuilds record-less L0 data objects' commit records from their own footers. Stop maintenance first; see [troubleshooting](troubleshooting.md#commit-records-were-deleted-out-of-band). |
 | `segment inspect <path-or-key>` | Parses one metric segment: trailer, footer fields, section list, decoded series count. |
 | `commit decode <key>` | Decodes one commit record: identity, referenced data object key, size and hash, sample and series counts, timestamps. |
 | `commit decode-compaction <key>` | Decodes one compaction record: identity, input set hash, each input identity, and each output segment's summary. |
