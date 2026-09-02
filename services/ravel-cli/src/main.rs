@@ -2765,8 +2765,8 @@ mod cli_reference_tests {
     /// directory so the path is stable regardless of the test's working
     /// directory.
     fn reference_doc() -> PathBuf {
-        let manifest = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is always set");
-        Path::new(&manifest)
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        Path::new(manifest)
             .join("..")
             .join("..")
             .join("docs")
