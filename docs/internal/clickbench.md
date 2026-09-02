@@ -679,40 +679,51 @@ cargo run -p ravel-server --features flight-sql --bin ravel-server -- \
   --store s3 \
   --listen-grpc 127.0.0.1:4317 \
   --tenant-token "$RAVEL_FLIGHT_TOKEN=clickbench" \
-  --shards 4 \
-  --fetch-concurrency 8 \
-  --sql-max-query-bytes 1073741824 \
-  --sql-tenant-max-bytes 2147483648 \
-  --max-segments 1000000 \
-  --cache-max-bytes 25769803776
+  --shards 4
 ```
 
-`--max-segments 1000000` and `--cache-max-bytes 25769803776` match the
-`--sql-max-segments` and `--cache-bytes` values the in-process command in
-step 5 passes, so the two tables are comparable: a folded ClickBench tenant
-sits far above the 1024 default sealed-segment ceiling, so the server must
-raise it or every statement fails with `8424 exceeds max 1024`; and the cache
-must exceed the ~12 GB corpus (`25769803776` is 24 GiB) or every run is cold
-and there is no hot column to compare. Both settings live on the server only
-in this lane. The bench's
-`--cache-bytes` and `--sql-max-segments` configure the in-process fetcher and
-engine, which the Flight lane never builds, so neither flag reaches the
-server; leave them off the bench command, or the report header claims a
-client-side cache that took part in nothing.
+No performance flags. Since #1141 the server derives all six of them from the
+host at startup, and on the reference box for this benchmark (16 cores, 30 GB)
+they resolve to exactly the settings a published entry runs under: fetch
+concurrency 32, a 24 GiB read cache, an 8 GiB per-query and 16 GiB per-tenant
+SQL pool, a 1,000,000 sealed-segment cap, and an 11 minute engine deadline.
+Both of the two settings that used to be mandatory here are among them: a
+folded ClickBench tenant sits far above the old 1024 sealed-segment ceiling, so
+an un-derived server failed every statement with `8424 exceeds max 1024`, and
+the cache must exceed the ~12 GB corpus or every run is cold and there is no hot
+column to compare.
 
-The flags that must mirror the bench's, or the two tables are not comparable:
+Read the resolved values off the server's own startup log rather than assuming
+them, and record them with the entry:
+
+```
+INFO performance default resolved setting="fetch_concurrency" value=32 source="derived"
+INFO performance default resolved setting="cache_max_bytes" value=25769803776 source="derived"
+```
+
+Pass a flag only to measure a setting other than the derived one; a flag logs
+`source="flag"`, which is what an entry's record must show if it was not run at
+the defaults. The bench's `--cache-bytes` and `--sql-max-segments` configure the
+in-process fetcher and engine, which the Flight lane never builds, so neither
+reaches the server; leave them off the bench command, or the report header
+claims a client-side cache that took part in nothing.
+
+The bench-side flags must mirror what the server resolved, or the two tables are
+not comparable:
 
 - `--fetch-concurrency` is the same ADR-0088 knob as the bench's flag of the
   same name (logs scan partitions and in-flight segment fetches per query). This
-  is the one that moves a cold full scan the most; set both sides to the same
-  value and record it.
+  is the one that moves a cold full scan the most; set the bench's to the value
+  the server logged, and record it.
 - `--sql-max-query-bytes` is the per-query DataFusion memory-pool ceiling. A
   statement that fits the bench's budget and not the server's aborts on the
   server with `query memory budget exhausted` and lands in `failed`.
 - `--sql-tenant-max-bytes` has no bench counterpart: it is the server's
   per-tenant ceiling across concurrent queries, which an in-process lane running
-  one statement at a time never reaches. Set it above
-  `--sql-max-query-bytes` so it is not the binding limit for a serial run.
+  one statement at a time never reaches. The derived value is twice the derived
+  per-query pool, so it is not the binding limit for a serial run; a flag that
+  sets it below the per-query pool clamps the per-query pool down to it, and the
+  server warns when it does.
 - Cache flags: the bench's `--cache-bytes` attaches an ADR-0046 read cache to
   its own fetcher; the server's equivalent is `--cache-max-bytes` (plus
   `--cache-dir` for the disk tier, and `--disable-cache` to turn it off). To

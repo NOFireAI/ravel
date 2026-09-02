@@ -516,6 +516,46 @@ mod catalog_cache_tests {
             "an enabled catalog byte cache must expose its counters handle for /metrics"
         );
     }
+
+    /// Issue #1141 reachability for the derived `--cache-max-bytes`: the number
+    /// the resolution produced on an injected host is the number the catalog
+    /// byte cache is bounded by, through the same `build_catalog` argument
+    /// `crate::start` passes (`ServerConfig::cache_max_bytes`, which `main`
+    /// fills from `ResolvedPerformanceDefaults::cache_max_bytes`). The other
+    /// consumer of the same number, `store::build_cache`, takes it as a
+    /// parameter from the same field.
+    ///
+    /// Prove-the-test: resolve with `PerformanceFlags::default()` against
+    /// `HostProfile::new(16, None)` (the unknown-memory fallback) and the
+    /// assertion reads 268,435,456 against the expected 25,769,803,776.
+    #[test]
+    fn the_derived_cache_max_bytes_reaches_the_catalog_byte_cache() {
+        use clap::Parser;
+
+        use crate::config::HostProfile;
+
+        let cli = crate::Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        let resolved = cli
+            .resolve_performance(HostProfile::new(16, Some(32_212_254_720)))
+            .expect("performance defaults resolve");
+        assert_eq!(resolved.cache_max_bytes, 25_769_803_776);
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let catalog = build_catalog(
+            store,
+            1,
+            cli.disable_cache,
+            resolved.cache_max_bytes,
+            cli.cache_dir.clone(),
+        )
+        .expect("catalog builds");
+        assert_eq!(
+            catalog.config().byte_cache_max_bytes,
+            25_769_803_776,
+            "the host-derived cache ceiling must bound the catalog byte cache, not the \
+             compiled-in 256 MiB"
+        );
+    }
 }
 
 #[cfg(all(test, feature = "sql"))]
@@ -639,10 +679,15 @@ mod tests {
             None,
         )
         .expect("catalog");
-        let budgets = crate::Cli::try_parse_from(argv)
-            .expect("flags parse")
-            .query_budgets()
-            .expect("budgets resolve");
+        let cli = crate::Cli::try_parse_from(argv).expect("flags parse");
+        // The injected reference host of issue #1141 (16 cores, 30 GB), never
+        // the real one: an unset SQL budget flag is now a share of the host's
+        // memory, so a test that read the machine it runs on would assert a
+        // different number on every box.
+        let resolved = cli
+            .resolve_performance(crate::config::HostProfile::new(16, Some(32_212_254_720)))
+            .expect("performance defaults resolve");
+        let budgets = cli.query_budgets(&resolved).expect("budgets resolve");
         build_sql_state(
             catalog,
             store,
@@ -681,12 +726,16 @@ mod tests {
             "the SQL executor's per-query pool ceiling must be the configured flag, not the default"
         );
 
-        // Unset: byte-identical to the compiled-in per-query default.
+        // Unset: the HOST-DERIVED per-query pool reaches the executor (issue
+        // #1141), 25% of the injected reference host's 30 GB, not the
+        // compiled-in 256 MiB.
         let state = sql_state_from_cli(&["ravel-server"]);
         assert_eq!(
             state.executor.config().max_query_bytes,
-            ravel_sql::DEFAULT_MAX_QUERY_BYTES,
+            8_053_063_680,
+            "an unset --sql-max-query-bytes must reach the executor as the host-derived pool"
         );
+        assert_ne!(8_053_063_680, ravel_sql::DEFAULT_MAX_QUERY_BYTES);
     }
 
     /// ADR-0094 reachability: `--sql-parallel-final-aggregation` must reach the
@@ -737,8 +786,14 @@ mod tests {
             "the SQL executor's per-tenant ceiling must be the configured flag, not the default"
         );
 
-        // Unset: byte-identical to the compiled-in per-tenant default.
+        // Unset: the HOST-DERIVED per-tenant ceiling reaches the executor
+        // (issue #1141), 50% of the injected reference host's 30 GB.
         let state = sql_state_from_cli(&["ravel-server"]);
-        assert_eq!(state.executor.max_tenant_bytes(), DEFAULT_MAX_TENANT_BYTES);
+        assert_eq!(
+            state.executor.max_tenant_bytes(),
+            16_106_127_360,
+            "an unset --sql-tenant-max-bytes must reach the executor as the host-derived ceiling"
+        );
+        assert_ne!(16_106_127_360, DEFAULT_MAX_TENANT_BYTES);
     }
 }

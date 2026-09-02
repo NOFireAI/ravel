@@ -214,7 +214,13 @@ async fn run(argv: &[&str]) -> Routed {
     // The three hops `start` uses, in order. `apply_to_engine` is where
     // `--logs-fetch-policy` is resolved into the byte quantities below.
     let cli = Cli::try_parse_from(argv).expect("flags parse");
-    let budgets = cli.query_budgets().expect("budgets resolve");
+    let resolved = cli
+        .resolve_performance(ravel_server::config::HostProfile::new(
+            16,
+            Some(32_212_254_720),
+        ))
+        .expect("performance defaults resolve");
+    let budgets = cli.query_budgets(&resolved).expect("budgets resolve");
     let engine = budgets
         .apply_to_engine(ravel_query::EngineConfig::default())
         .expect("engine config resolves");
@@ -223,7 +229,7 @@ async fn run(argv: &[&str]) -> Routed {
         Arc::clone(&store),
         1,
         cli.disable_cache,
-        cli.cache_max_bytes,
+        ravel_server::config::DEFAULT_CACHE_MAX_BYTES,
         cli.cache_dir.clone(),
     )
     .expect("catalog");

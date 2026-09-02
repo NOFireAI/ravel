@@ -24,6 +24,18 @@ fn store() -> Arc<dyn ObjectStoreBackend> {
     Arc::new(MemoryStore::new())
 }
 
+/// The engine deadline `main` resolves for these flags: the explicit
+/// `--gc-max-query-duration`, or the host-derived default (issue #1141).
+/// Resolved against an injected host so no test here reads the real machine.
+fn query_deadline(cli: &Cli) -> std::time::Duration {
+    cli.resolve_performance(ravel_server::config::HostProfile::new(
+        16,
+        Some(32_212_254_720),
+    ))
+    .expect("performance defaults resolve")
+    .query_deadline
+}
+
 fn cli(args: &[&str]) -> Cli {
     let mut argv = vec!["ravel-server"];
     argv.extend_from_slice(args);
@@ -34,7 +46,9 @@ fn cli(args: &[&str]) -> Cli {
 /// knobs from `resolve_gc_runtime`, every other field at its default. Mirrors
 /// `main.rs` exactly so the tests exercise the same resolution the binary does.
 fn compactor_for(cli: &Cli) -> CompactorConfig {
-    let gc = cli.resolve_gc_runtime().expect("--gc-* flags resolve");
+    let gc = cli
+        .resolve_gc_runtime(query_deadline(cli))
+        .expect("--gc-* flags resolve");
     CompactorConfig {
         protection_horizon_ns: gc.protection_horizon_ns,
         grace_ns: gc.grace_ns,
@@ -250,23 +264,17 @@ async fn query_starts_after_gc_config_set_and_matching_deadline_flag() {
         .await
         .expect("reads the durable object");
 
-    // Default deadline (no flag): 30s > 10s, query refuses.
-    let default_deadline = cli(&["--mode", "query"])
-        .resolve_gc_runtime()
-        .expect("resolve")
-        .query_deadline;
+    // Derived deadline (no flag): 11m > 10s, query refuses.
+    let default_deadline = query_deadline(&cli(&["--mode", "query"]));
     let err = gc_config::validate_query(&gc, default_deadline)
-        .expect_err("the default 30s deadline exceeds the tightened 10s max_query_duration");
+        .expect_err("the derived 11m deadline exceeds the tightened 10s max_query_duration");
     assert!(
         matches!(err, GcConfigError::QueryDeadlineExceedsHorizon { .. }),
         "got: {err}"
     );
 
     // Matching flag: 10s <= 10s, query starts.
-    let matched = cli(&["--mode", "query", "--gc-max-query-duration", "10s"])
-        .resolve_gc_runtime()
-        .expect("resolve")
-        .query_deadline;
+    let matched = query_deadline(&cli(&["--mode", "query", "--gc-max-query-duration", "10s"]));
     gc_config::validate_query(&gc, matched)
         .expect("query starts: --gc-max-query-duration matches the durable max_query_duration");
 }

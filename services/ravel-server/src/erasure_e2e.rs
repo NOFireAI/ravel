@@ -367,7 +367,7 @@ fn build_metrics_app(
         Arc::clone(&store),
         shard_count,
         cli.disable_cache,
-        cli.cache_max_bytes,
+        crate::config::DEFAULT_CACHE_MAX_BYTES,
         cli.cache_dir.clone(),
     )
     .expect("catalog");
@@ -460,8 +460,11 @@ async fn metrics_erasure_reaches_query_cache_rewrite_and_physical_absence() {
     let data_key_s0 = publish_metrics_bucket(store.as_ref(), &tenant_id, 0, "a").await;
     let data_key_s1 = publish_metrics_bucket(store.as_ref(), &tenant_id, 1, "b").await;
 
-    let cache = build_cache(&Cli::try_parse_from(["ravel-server"]).expect("cli"))
-        .expect("cache enabled by default");
+    let cache = build_cache(
+        &Cli::try_parse_from(["ravel-server"]).expect("cli"),
+        crate::config::DEFAULT_CACHE_MAX_BYTES,
+    )
+    .expect("cache enabled by default");
     // The default CLI sets no --cache-dir, so this is the RAM-only variant; hold
     // its concrete `Cache` handle to assert warming (is_empty / hit counters).
     let ReadCache::Ram(ram) = cache.clone() else {
@@ -597,8 +600,11 @@ async fn metrics_erasure_reaches_query_cache_rewrite_and_physical_absence() {
     // Post-sweep, the `.dreq` is gone, so exclusion now rests PURELY on the
     // physical rewrite: a fresh query still excludes the subject and returns the
     // bystander's sample value bit-exact.
-    let cold_cache =
-        build_cache(&Cli::try_parse_from(["ravel-server"]).expect("cli")).expect("cache");
+    let cold_cache = build_cache(
+        &Cli::try_parse_from(["ravel-server"]).expect("cli"),
+        crate::config::DEFAULT_CACHE_MAX_BYTES,
+    )
+    .expect("cache");
     let fresh_app = build_metrics_app(Arc::clone(&store), cold_cache, &tenant_id, SHARD_COUNT);
     let post_sweep = query_metric_subjects(&fresh_app).await;
     assert_eq!(
@@ -747,7 +753,7 @@ mod logs {
             Arc::clone(&store),
             1,
             cli.disable_cache,
-            cli.cache_max_bytes,
+            crate::config::DEFAULT_CACHE_MAX_BYTES,
             cli.cache_dir.clone(),
         )
         .expect("catalog");
@@ -822,8 +828,11 @@ mod logs {
 
         let data_key = publish_logs_bucket(store.as_ref(), &tenant_id).await;
 
-        let cache = build_cache(&Cli::try_parse_from(["ravel-server"]).expect("cli"))
-            .expect("cache enabled by default");
+        let cache = build_cache(
+            &Cli::try_parse_from(["ravel-server"]).expect("cli"),
+            crate::config::DEFAULT_CACHE_MAX_BYTES,
+        )
+        .expect("cache enabled by default");
         // Default CLI: no --cache-dir, so the RAM-only variant; hold its concrete
         // `Cache` handle to assert warming (is_empty / hit counters).
         let ReadCache::Ram(ram) = cache.clone() else {
@@ -925,8 +934,11 @@ mod logs {
 
         // Post-sweep, `.dreq` gone: exclusion rests purely on the physical
         // rewrite, and the bystander's line survives.
-        let cold_cache =
-            build_cache(&Cli::try_parse_from(["ravel-server"]).expect("cli")).expect("cache");
+        let cold_cache = build_cache(
+            &Cli::try_parse_from(["ravel-server"]).expect("cli"),
+            crate::config::DEFAULT_CACHE_MAX_BYTES,
+        )
+        .expect("cache");
         let fresh_app = build_logs_app(Arc::clone(&store), cold_cache, &tenant_id);
         let post_sweep = query_log_bodies(&fresh_app).await;
         assert_eq!(
@@ -1050,7 +1062,7 @@ mod spans {
             Arc::clone(store),
             1,
             cli.disable_cache,
-            cli.cache_max_bytes,
+            crate::config::DEFAULT_CACHE_MAX_BYTES,
             cli.cache_dir.clone(),
         )
         .expect("catalog");

@@ -180,7 +180,8 @@ async fn cache_dir_attaches_disk_tier_and_a_query_is_served_from_a_disk_hit() {
         wiring_dir.path().to_str().expect("temp path is utf-8"),
     ])
     .expect("flags parse");
-    let wired = build_cache(&cli).expect("a cache-enabled config with --cache-dir builds a cache");
+    let wired = build_cache(&cli, ravel_server::config::DEFAULT_CACHE_MAX_BYTES)
+        .expect("a cache-enabled config with --cache-dir builds a cache");
     assert!(
         matches!(wired, ReadCache::Tiered(_)),
         "--cache-dir must make store::build_cache return the RAM-over-disk ReadCache::Tiered, \
@@ -216,7 +217,7 @@ async fn cache_dir_attaches_disk_tier_and_a_query_is_served_from_a_disk_hit() {
         backend.clone(),
         1,
         cli.disable_cache,
-        cli.cache_max_bytes,
+        ravel_server::config::DEFAULT_CACHE_MAX_BYTES,
         cli.cache_dir.clone(),
     )
     .expect("catalog");

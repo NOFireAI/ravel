@@ -499,24 +499,32 @@ pub struct Cli {
     /// Governs a single SQL query's intermediate `RecordBatch` footprint; a
     /// query whose pool grow would exceed it aborts rather than growing without
     /// bound. Process-wide, not per-tenant (per-tenant SQL budgets wait on the
-    /// limits-file's per-tenant enforcement gap, ADR-0088). Omitted defaults to
-    /// [`DEFAULT_SQL_MAX_QUERY_BYTES`] (256 MiB, today's compiled-in value), so
-    /// behavior is byte-identical when unset. Meaningful only in a build with
-    /// the `sql` feature (the SQL query surface); inert otherwise.
-    #[arg(long = "sql-max-query-bytes", value_name = "BYTES", default_value_t = DEFAULT_SQL_MAX_QUERY_BYTES)]
-    pub sql_max_query_bytes: usize,
+    /// limits-file's per-tenant enforcement gap, ADR-0088).
+    ///
+    /// Omitted, the value is DERIVED from the host
+    /// ([`resolve_performance_defaults`], ADR-0088 as amended by issue #1141):
+    /// [`SQL_QUERY_MEMORY_PERCENT`] of `MemTotal`, or
+    /// [`DEFAULT_SQL_MAX_QUERY_BYTES`] (256 MiB) when memory cannot be read.
+    /// The resolved value is clamped to `--sql-tenant-max-bytes`, never above
+    /// it. Meaningful only in a build with the `sql` feature (the SQL query
+    /// surface); inert otherwise.
+    #[arg(long = "sql-max-query-bytes", value_name = "BYTES")]
+    pub sql_max_query_bytes: Option<usize>,
 
     /// Per-tenant ceiling, in bytes, on the SQL memory a single tenant may hold
     /// across its concurrent queries (ADR-0088), threaded into the
     /// `SqlExecutor`'s per-tenant accountant. The multi-tenant isolation bound:
     /// one tenant's wide scans cannot starve another tenant's query pool. Sits
-    /// above `--sql-max-query-bytes` (the per-query ceiling); defaults to four
-    /// times it. Process-wide, not itself per-tenant-overridable (ADR-0088).
-    /// Omitted defaults to [`DEFAULT_SQL_TENANT_MAX_BYTES`] (1 GiB, today's
-    /// compiled-in value), so behavior is byte-identical when unset. Meaningful
-    /// only in a build with the `sql` feature; inert otherwise.
-    #[arg(long = "sql-tenant-max-bytes", value_name = "BYTES", default_value_t = DEFAULT_SQL_TENANT_MAX_BYTES)]
-    pub sql_tenant_max_bytes: usize,
+    /// above `--sql-max-query-bytes` (the per-query ceiling). Process-wide, not
+    /// itself per-tenant-overridable (ADR-0088).
+    ///
+    /// Omitted, the value is DERIVED from the host
+    /// ([`resolve_performance_defaults`], ADR-0088 as amended by issue #1141):
+    /// [`SQL_TENANT_MEMORY_PERCENT`] of `MemTotal`, or
+    /// [`DEFAULT_SQL_TENANT_MAX_BYTES`] (1 GiB) when memory cannot be read.
+    /// Meaningful only in a build with the `sql` feature; inert otherwise.
+    #[arg(long = "sql-tenant-max-bytes", value_name = "BYTES")]
+    pub sql_tenant_max_bytes: Option<usize>,
 
     /// Allow an exact-typed SQL query to repartition its final aggregation
     /// (ADR-0094, amended 2026-08-26 by issue #741), threaded into
@@ -644,22 +652,29 @@ pub struct Cli {
     /// scan partition count (`target_partitions` in
     /// `crates/ravel-sql/src/session.rs`), and S3 GET concurrency (ADR-0087).
     /// Raising it widens all three together; sizing it is a memory-vs-latency
-    /// trade against the host's cores and the store's request budget. Omitted
-    /// defaults to [`ravel_query::DEFAULT_FETCH_CONCURRENCY`] (8, today's
-    /// compiled-in value), so behavior is byte-identical when unset.
-    #[arg(long = "fetch-concurrency", value_name = "N", default_value_t = ravel_query::DEFAULT_FETCH_CONCURRENCY)]
-    pub fetch_concurrency: usize,
+    /// trade against the host's cores and the store's request budget.
+    ///
+    /// Omitted, the value is DERIVED from the host
+    /// ([`resolve_performance_defaults`], ADR-0088 as amended by issue #1141):
+    /// `max(MIN_DERIVED_FETCH_CONCURRENCY, FETCH_CONCURRENCY_PER_CORE *
+    /// cores)`, which is 32 on the 16-core reference host and never below the
+    /// compiled-in 8 on a small one.
+    #[arg(long = "fetch-concurrency", value_name = "N")]
+    pub fetch_concurrency: Option<usize>,
 
     /// Cap on the number of segments a single query may fan out over (ADR-0088),
     /// threaded into `ravel_query::EngineConfig::max_segments`. A wide scan over
     /// a tenant with many sealed-below-watermark L0/L1 objects hits this cap
     /// directly (only the narrow `SegmentOrigin::Recent` set, roughly the last
     /// couple of hours, is exempt); this flag is what lets an operator raise it
-    /// for such a workload. Omitted defaults to
-    /// [`ravel_query::DEFAULT_MAX_SEGMENTS`] (1024, today's compiled-in value),
-    /// so behavior is byte-identical when unset.
-    #[arg(long = "max-segments", value_name = "N", default_value_t = ravel_query::DEFAULT_MAX_SEGMENTS)]
-    pub max_segments: usize,
+    /// for such a workload.
+    ///
+    /// Omitted, the value is DERIVED ([`resolve_performance_defaults`],
+    /// ADR-0088 as amended by issue #1141): [`DERIVED_MAX_SEGMENTS`]
+    /// (1,000,000), the cap the #968 ClickBench measurement ran under. Set this
+    /// flag to restore the old compiled-in 1024 or any other bound.
+    #[arg(long = "max-segments", value_name = "N")]
+    pub max_segments: Option<usize>,
 
     /// The process-wide in-flight ingest-request ceiling: the
     /// maximum number of OTLP metrics/logs/traces and Remote Write requests
@@ -803,8 +818,13 @@ pub struct Cli {
     /// (`query::build_catalog`) both, not just the fetcher cache.
     /// Read at startup only; there is no live resize. Ignored when
     /// `--disable-cache` is set.
-    #[arg(long, default_value_t = DEFAULT_CACHE_MAX_BYTES)]
-    pub cache_max_bytes: u64,
+    ///
+    /// Omitted, the value is DERIVED from the host
+    /// ([`resolve_performance_defaults`], ADR-0088 as amended by issue #1141):
+    /// [`CACHE_MEMORY_PERCENT`] of `MemTotal`, or [`DEFAULT_CACHE_MAX_BYTES`]
+    /// (256 MiB) when memory cannot be read.
+    #[arg(long, value_name = "BYTES")]
+    pub cache_max_bytes: Option<u64>,
 
     /// Directory for the ADR-0046 read cache's local-disk tier (#97). Opt-in:
     /// absent, only the RAM tier exists and behavior is exactly today's. Set,
@@ -878,12 +898,16 @@ pub struct Cli {
     /// `30s`). Query-mode startup requires it to be `<=` the durable `sys/gc`
     /// `max_query_duration` (ADR-0050 section 4). Feeds the real
     /// `QueryEngine` (`EngineConfig::deadline`) as well as the validation, so
-    /// the value validated is the value enforced. Omitted defaults to
-    /// `ravel_query::EngineConfig::default().deadline` (30s), the compiled-in
-    /// engine deadline, so behavior is byte-identical when unset. Note this
-    /// is the *engine's* enforced query timeout, a distinct quantity from
-    /// `sys/gc`'s `max_query_duration` (the GC protection budget the timeout
-    /// must fit under); the flag governs the former. (default: 30s)
+    /// the value validated is the value enforced.
+    ///
+    /// Omitted, the value is DERIVED ([`resolve_performance_defaults`],
+    /// ADR-0088 as amended by issue #1141): [`DERIVED_QUERY_DEADLINE`]
+    /// (11 minutes), the deadline the #968 ClickBench run needed for its
+    /// longest statement, and still under the durable `sys/gc`
+    /// `max_query_duration` default of 1h. Note this is the *engine's*
+    /// enforced query timeout, a distinct quantity from `sys/gc`'s
+    /// `max_query_duration` (the GC protection budget the timeout must fit
+    /// under); the flag governs the former. (default: 11m)
     #[arg(long, value_name = "DURATION")]
     pub gc_max_query_duration: Option<String>,
 
@@ -1099,17 +1123,22 @@ pub struct Cli {
     pub store_bg_permits: usize,
 }
 
-/// Default `--sql-max-query-bytes`: the per-query SQL memory-pool ceiling
-/// (256 MiB), today's compiled-in `ravel_sql::config::DEFAULT_MAX_QUERY_BYTES`.
-/// Mirrored here (ravel-sql is an optional dependency, so this crate cannot
-/// name that constant in feature-independent code) and pinned equal to it by
-/// `sql_budget_defaults_match_compiled_in_constants`.
+/// `--sql-max-query-bytes` when the flag is unset and the host's `MemTotal`
+/// cannot be read: the per-query SQL memory-pool ceiling (256 MiB), the
+/// compiled-in `ravel_sql::config::DEFAULT_MAX_QUERY_BYTES`. Mirrored here
+/// (ravel-sql is an optional dependency, so this crate cannot name that
+/// constant in feature-independent code) and pinned equal to it by
+/// `sql_budget_fallbacks_match_compiled_in_constants`. The derived value
+/// ([`SQL_QUERY_MEMORY_PERCENT`] of `MemTotal`) is used whenever memory is
+/// known.
 pub const DEFAULT_SQL_MAX_QUERY_BYTES: usize = 256 * 1024 * 1024;
 
-/// Default `--sql-tenant-max-bytes`: the per-tenant SQL memory ceiling (1 GiB),
-/// today's compiled-in `crate::query::DEFAULT_MAX_TENANT_BYTES` (which is
-/// defined as this constant when the `sql` feature is on). Four times the
-/// per-query default.
+/// `--sql-tenant-max-bytes` when the flag is unset and the host's `MemTotal`
+/// cannot be read: the per-tenant SQL memory ceiling (1 GiB), the compiled-in
+/// `crate::query::DEFAULT_MAX_TENANT_BYTES` (which is defined as this constant
+/// when the `sql` feature is on). Four times the per-query fallback. The
+/// derived value ([`SQL_TENANT_MEMORY_PERCENT`] of `MemTotal`) is used whenever
+/// memory is known.
 pub const DEFAULT_SQL_TENANT_MAX_BYTES: usize = 1024 * 1024 * 1024;
 
 /// The four ADR-0088 operator-configurable query budgets, resolved from
@@ -1118,9 +1147,13 @@ pub const DEFAULT_SQL_TENANT_MAX_BYTES: usize = 1024 * 1024 * 1024;
 /// ([`Cli::query_budgets`]) into [`crate::ServerConfig::query_budgets`], and
 /// [`crate::start`] folds `fetch_concurrency`/`max_segments` into the one
 /// process-wide `EngineConfig` both query surfaces share and passes the two SQL
-/// ceilings to `build_sql_state`. Every field's [`Default`] is exactly today's
-/// compiled-in value, so a server built with none of the four flags carries a
-/// budget bit-for-bit identical to before they existed.
+/// ceilings to `build_sql_state`.
+///
+/// The four ADR-0088 budgets arrive here already RESOLVED
+/// ([`ResolvedPerformanceDefaults`]): an unset flag is the host-derived value,
+/// not the library constant. [`Default`] still spells the library constants,
+/// which is the baseline a test constructs from, never what an unset CLI
+/// produces.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryBudgets {
     /// Per-query segment fetch concurrency, also the SQL scan partition count
@@ -1347,10 +1380,377 @@ impl LogsFetchStamp {
 /// the fetcher's own.
 pub const DEFAULT_LOGS_BLOCK_RANGE_THRESHOLD: u64 = ravel_query::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD;
 
-/// Default `--cache-max-bytes`: generous enough to hold a working set of
-/// recently fetched segment/log byte ranges across a handful of concurrent
-/// queries, small enough that a dev process does not need tuning to pick it.
+/// `--cache-max-bytes` when the flag is unset and the host's `MemTotal` cannot
+/// be read (256 MiB): generous enough to hold a working set of recently fetched
+/// segment/log byte ranges across a handful of concurrent queries, small enough
+/// that a dev process does not need tuning to pick it. The derived value
+/// ([`CACHE_MEMORY_PERCENT`] of `MemTotal`) is used whenever memory is known.
 pub const DEFAULT_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// This process's host, read once at startup and injected into
+/// [`resolve_performance_defaults`] so the resolution itself does no I/O and is
+/// unit-testable against any host shape (ADR-0088 as amended by issue #1141).
+///
+/// `cores` has no "unknown" state: an unreadable parallelism yields the floor of
+/// 1, which resolves to the same minimum a 1-core host gets. `mem_total_bytes`
+/// does: a percentage of an unknown total is not a number, so every
+/// memory-derived default falls back to its compiled-in constant instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostProfile {
+    /// Usable parallelism, from `std::thread::available_parallelism`, floored
+    /// at 1.
+    pub cores: usize,
+    /// Total physical memory in bytes, from `/proc/meminfo`'s `MemTotal` on
+    /// Linux. `None` when it cannot be read or parsed, and on every non-Linux
+    /// target.
+    pub mem_total_bytes: Option<u64>,
+}
+
+impl HostProfile {
+    /// Build a profile from known values. `cores` is floored at 1 here, so a
+    /// caller (or a test) cannot construct a zero-core host that would resolve
+    /// a zero fetch concurrency.
+    pub fn new(cores: usize, mem_total_bytes: Option<u64>) -> Self {
+        HostProfile {
+            cores: cores.max(1),
+            mem_total_bytes,
+        }
+    }
+
+    /// Read this host's shape. Called exactly once, from `main`, before any
+    /// value is resolved: every consumer takes the resolved values, not the
+    /// profile, so no later code re-reads the host and no two resolutions can
+    /// disagree.
+    pub fn detect() -> Self {
+        HostProfile {
+            cores: std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+            mem_total_bytes: detect_mem_total_bytes(),
+        }
+    }
+}
+
+/// This host's `MemTotal` in bytes, or `None` when it is not knowable.
+#[cfg(target_os = "linux")]
+fn detect_mem_total_bytes() -> Option<u64> {
+    parse_mem_total_bytes(&std::fs::read_to_string("/proc/meminfo").ok()?)
+}
+
+/// Non-Linux targets expose no `/proc/meminfo`; every memory-derived default
+/// falls back to its compiled-in constant there rather than guessing.
+#[cfg(not(target_os = "linux"))]
+fn detect_mem_total_bytes() -> Option<u64> {
+    None
+}
+
+/// Parse `MemTotal` out of `/proc/meminfo` contents, in bytes.
+///
+/// The line is `MemTotal:       32137720 kB`: a fixed key, a decimal count, and
+/// a unit the kernel always writes as `kB` (kibibytes, despite the spelling).
+/// Anything else -- a missing line, a non-numeric count, an unrecognised unit --
+/// is `None` rather than a guess, because a wrong total silently resizes every
+/// memory-derived default.
+fn parse_mem_total_bytes(meminfo: &str) -> Option<u64> {
+    let line = meminfo.lines().find(|line| line.starts_with("MemTotal:"))?;
+    let mut fields = line.split_whitespace().skip(1);
+    let value: u64 = fields.next()?.parse().ok()?;
+    match fields.next() {
+        Some("kB") | Some("KB") => value.checked_mul(1024),
+        None => Some(value),
+        Some(_) => None,
+    }
+}
+
+/// Fetch concurrency per core in the derived default: the reference host's
+/// 16 cores resolve to 32, the setting the #968 ClickBench result was measured
+/// at.
+pub const FETCH_CONCURRENCY_PER_CORE: usize = 2;
+
+/// Floor under the derived fetch concurrency, the compiled-in
+/// `ravel_query::DEFAULT_FETCH_CONCURRENCY`: a 1- or 2-core host keeps today's
+/// fan-out rather than dropping below it.
+pub const MIN_DERIVED_FETCH_CONCURRENCY: usize = 8;
+
+/// Share of `MemTotal` the derived `--cache-max-bytes` takes. 80% on the
+/// 30 GB reference host is the ~24 GiB read cache of the #968 measurement.
+pub const CACHE_MEMORY_PERCENT: u64 = 80;
+
+/// Share of `MemTotal` the derived `--sql-max-query-bytes` takes (~8 GiB on the
+/// reference host).
+pub const SQL_QUERY_MEMORY_PERCENT: u64 = 25;
+
+/// Share of `MemTotal` the derived `--sql-tenant-max-bytes` takes (~16 GiB on
+/// the reference host), twice the per-query share so the per-tenant ceiling
+/// admits concurrent queries without the per-query clamp binding.
+pub const SQL_TENANT_MEMORY_PERCENT: u64 = 50;
+
+/// The derived `--max-segments`: the fan-out cap the #968 ClickBench result ran
+/// under. Host-independent -- a segment list is a per-query bound on plan width,
+/// not on resident bytes -- so it is the same on every host.
+pub const DERIVED_MAX_SEGMENTS: usize = 1_000_000;
+
+/// The derived `--gc-max-query-duration` (11 minutes): the engine deadline the
+/// #968 ClickBench run was configured with, far above the 30s the engine
+/// compiles in and far under the durable `sys/gc` `max_query_duration` default
+/// of 1h that query-mode startup validates against. Host-independent, like
+/// [`DERIVED_MAX_SEGMENTS`].
+pub const DERIVED_QUERY_DEADLINE: Duration = Duration::from_secs(11 * 60);
+
+/// [`ResolvedPerformanceDefaults`] source: the operator set the flag, and its
+/// value is used verbatim.
+pub const PERF_SOURCE_FLAG: &str = "flag";
+/// [`ResolvedPerformanceDefaults`] source: no flag was set and the value was
+/// derived from the [`HostProfile`] (or from a host-independent rule).
+pub const PERF_SOURCE_DERIVED: &str = "derived";
+/// [`ResolvedPerformanceDefaults`] source: no flag was set and the host's
+/// `MemTotal` was unknown, so the compiled-in constant is used.
+pub const PERF_SOURCE_FALLBACK: &str = "fallback";
+
+/// The operator's explicit performance flags: `None` per field means "derive".
+///
+/// A parsed, typed mirror of the six CLI flags rather than the CLI itself, so
+/// [`resolve_performance_defaults`] takes no `Cli`, does no string parsing, and
+/// cannot fail. [`Cli::performance_flags`] builds it (and is where the
+/// `--gc-max-query-duration` humantime parse and its error live).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PerformanceFlags {
+    /// `--fetch-concurrency`.
+    pub fetch_concurrency: Option<usize>,
+    /// `--max-segments`.
+    pub max_segments: Option<usize>,
+    /// `--cache-max-bytes`.
+    pub cache_max_bytes: Option<u64>,
+    /// `--sql-max-query-bytes`.
+    pub sql_max_query_bytes: Option<usize>,
+    /// `--sql-tenant-max-bytes`.
+    pub sql_tenant_max_bytes: Option<usize>,
+    /// `--gc-max-query-duration`, already parsed from its humantime spelling.
+    pub query_deadline: Option<Duration>,
+}
+
+/// The six performance settings this process runs with, each with the source it
+/// came from, resolved once at startup by [`resolve_performance_defaults`].
+///
+/// `main` builds this before it builds anything that consumes one of the six,
+/// and threads the values into the read cache (`store::build_store`), the
+/// process-wide `EngineConfig` (through [`QueryBudgets`]), the SQL executor's
+/// two ceilings, and the `sys/gc` deadline validation. Nothing downstream reads
+/// a raw flag, so a value that is logged here is the value that is enforced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedPerformanceDefaults {
+    /// Reaches `EngineConfig::fetch_concurrency`.
+    pub fetch_concurrency: usize,
+    /// Reaches `EngineConfig::max_segments`.
+    pub max_segments: usize,
+    /// Reaches every ADR-0046 read cache's byte ceiling.
+    pub cache_max_bytes: u64,
+    /// Reaches `SqlConfig::max_query_bytes`. Never above
+    /// [`Self::sql_tenant_max_bytes`].
+    pub sql_max_query_bytes: usize,
+    /// Reaches the `SqlExecutor`'s per-tenant accountant.
+    pub sql_tenant_max_bytes: usize,
+    /// Reaches `EngineConfig::deadline`, and the `sys/gc` query validation.
+    pub query_deadline: Duration,
+    /// Where each of the six above came from: [`PERF_SOURCE_FLAG`],
+    /// [`PERF_SOURCE_DERIVED`], or [`PERF_SOURCE_FALLBACK`].
+    pub sources: PerformanceSources,
+    /// Whether the per-query SQL pool was reduced to the per-tenant ceiling.
+    /// True only when the two would otherwise have crossed; the startup log
+    /// says so, because the operator's `--sql-max-query-bytes` is then not the
+    /// number in force.
+    pub sql_max_query_bytes_clamped: bool,
+}
+
+/// The provenance of each field of [`ResolvedPerformanceDefaults`], carried
+/// beside the values so the startup log can name it per line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PerformanceSources {
+    pub fetch_concurrency: &'static str,
+    pub max_segments: &'static str,
+    pub cache_max_bytes: &'static str,
+    pub sql_max_query_bytes: &'static str,
+    pub sql_tenant_max_bytes: &'static str,
+    pub query_deadline: &'static str,
+}
+
+/// `percent` percent of `total`, as integer arithmetic in `u128` so the product
+/// cannot overflow for any `u64` total.
+///
+/// Rounding is TRUNCATION toward zero: 80% of 8 GiB is 6,871,947,673 bytes, not
+/// 6,871,947,674. These are ceilings on resident bytes, so rounding down is the
+/// safe direction, and a fixed rule makes the resolved figure reproducible from
+/// the host's `MemTotal` by hand.
+fn percent_of(total: u64, percent: u64) -> u64 {
+    let product = u128::from(total) * u128::from(percent);
+    u64::try_from(product / 100).unwrap_or(u64::MAX)
+}
+
+/// Clamp a byte count into `usize` for the SQL ceilings, which are
+/// `usize`-typed. Saturating rather than wrapping: on a 32-bit target a host
+/// with more memory than `usize` can address resolves the largest expressible
+/// ceiling, never a wrapped small one.
+fn bytes_as_usize(bytes: u64) -> usize {
+    usize::try_from(bytes).unwrap_or(usize::MAX)
+}
+
+/// Resolve the six performance settings from the host and the operator's flags
+/// (ADR-0088 as amended by issue #1141).
+///
+/// Pure: no I/O, no clock, no global state. The rules, each of which an explicit
+/// flag overrides verbatim:
+///
+/// - `fetch_concurrency`: `max(MIN_DERIVED_FETCH_CONCURRENCY,
+///   FETCH_CONCURRENCY_PER_CORE * cores)`.
+/// - `cache_max_bytes`: [`CACHE_MEMORY_PERCENT`] of `MemTotal`, else
+///   [`DEFAULT_CACHE_MAX_BYTES`].
+/// - `sql_max_query_bytes`: [`SQL_QUERY_MEMORY_PERCENT`] of `MemTotal`, else
+///   [`DEFAULT_SQL_MAX_QUERY_BYTES`].
+/// - `sql_tenant_max_bytes`: [`SQL_TENANT_MEMORY_PERCENT`] of `MemTotal`, else
+///   [`DEFAULT_SQL_TENANT_MAX_BYTES`].
+/// - `max_segments`: [`DERIVED_MAX_SEGMENTS`].
+/// - `query_deadline`: [`DERIVED_QUERY_DEADLINE`].
+///
+/// The per-query SQL pool is then clamped to the per-tenant ceiling. The clamp
+/// only ever LOWERS the per-query pool: raising the tenant ceiling to fit a
+/// per-query flag would silently widen the multi-tenant isolation bound the
+/// operator set, which is the one direction that costs isolation rather than
+/// throughput.
+pub fn resolve_performance_defaults(
+    host: HostProfile,
+    flags: PerformanceFlags,
+) -> ResolvedPerformanceDefaults {
+    let cores = host.cores.max(1);
+
+    let (fetch_concurrency, fetch_source) = match flags.fetch_concurrency {
+        Some(n) => (n, PERF_SOURCE_FLAG),
+        None => (
+            (FETCH_CONCURRENCY_PER_CORE.saturating_mul(cores)).max(MIN_DERIVED_FETCH_CONCURRENCY),
+            PERF_SOURCE_DERIVED,
+        ),
+    };
+
+    let (max_segments, segments_source) = match flags.max_segments {
+        Some(n) => (n, PERF_SOURCE_FLAG),
+        None => (DERIVED_MAX_SEGMENTS, PERF_SOURCE_DERIVED),
+    };
+
+    let (cache_max_bytes, cache_source) = match (flags.cache_max_bytes, host.mem_total_bytes) {
+        (Some(n), _) => (n, PERF_SOURCE_FLAG),
+        (None, Some(total)) => (percent_of(total, CACHE_MEMORY_PERCENT), PERF_SOURCE_DERIVED),
+        (None, None) => (DEFAULT_CACHE_MAX_BYTES, PERF_SOURCE_FALLBACK),
+    };
+
+    let (sql_tenant_max_bytes, tenant_source) =
+        match (flags.sql_tenant_max_bytes, host.mem_total_bytes) {
+            (Some(n), _) => (n, PERF_SOURCE_FLAG),
+            (None, Some(total)) => (
+                bytes_as_usize(percent_of(total, SQL_TENANT_MEMORY_PERCENT)),
+                PERF_SOURCE_DERIVED,
+            ),
+            (None, None) => (DEFAULT_SQL_TENANT_MAX_BYTES, PERF_SOURCE_FALLBACK),
+        };
+
+    let (unclamped_query_bytes, query_bytes_source) =
+        match (flags.sql_max_query_bytes, host.mem_total_bytes) {
+            (Some(n), _) => (n, PERF_SOURCE_FLAG),
+            (None, Some(total)) => (
+                bytes_as_usize(percent_of(total, SQL_QUERY_MEMORY_PERCENT)),
+                PERF_SOURCE_DERIVED,
+            ),
+            (None, None) => (DEFAULT_SQL_MAX_QUERY_BYTES, PERF_SOURCE_FALLBACK),
+        };
+    let sql_max_query_bytes = unclamped_query_bytes.min(sql_tenant_max_bytes);
+
+    let (query_deadline, deadline_source) = match flags.query_deadline {
+        Some(d) => (d, PERF_SOURCE_FLAG),
+        None => (DERIVED_QUERY_DEADLINE, PERF_SOURCE_DERIVED),
+    };
+
+    ResolvedPerformanceDefaults {
+        fetch_concurrency,
+        max_segments,
+        cache_max_bytes,
+        sql_max_query_bytes,
+        sql_tenant_max_bytes,
+        query_deadline,
+        sources: PerformanceSources {
+            fetch_concurrency: fetch_source,
+            max_segments: segments_source,
+            cache_max_bytes: cache_source,
+            sql_max_query_bytes: query_bytes_source,
+            sql_tenant_max_bytes: tenant_source,
+            query_deadline: deadline_source,
+        },
+        sql_max_query_bytes_clamped: sql_max_query_bytes != unclamped_query_bytes,
+    }
+}
+
+impl ResolvedPerformanceDefaults {
+    /// Emit the resolved settings at startup, one INFO line per value with its
+    /// source, in the shape of [`LogsFetchStamp::emit`]'s policy line.
+    ///
+    /// The server exposes no config-provenance endpoint, so this log is the only
+    /// place an operator can see that (say) a 24 GiB read cache was derived from
+    /// the host rather than typed by whoever wrote the unit file. A clamped
+    /// per-query SQL pool gets an additional WARN, because the flag the operator
+    /// set is then not the number in force.
+    pub fn emit(&self, host: HostProfile) {
+        tracing::info!(
+            cores = host.cores,
+            mem_total_bytes = host.mem_total_bytes.unwrap_or(0),
+            mem_total_known = host.mem_total_bytes.is_some(),
+            "host profile detected"
+        );
+        tracing::info!(
+            setting = "fetch_concurrency",
+            value = self.fetch_concurrency,
+            source = self.sources.fetch_concurrency,
+            "performance default resolved"
+        );
+        tracing::info!(
+            setting = "max_segments",
+            value = self.max_segments,
+            source = self.sources.max_segments,
+            "performance default resolved"
+        );
+        tracing::info!(
+            setting = "cache_max_bytes",
+            value = self.cache_max_bytes,
+            source = self.sources.cache_max_bytes,
+            "performance default resolved"
+        );
+        // The only line that carries `clamped`: when it is true the value is
+        // the per-tenant ceiling, not what `source` resolved, and a reader who
+        // saw `source="derived"` alone would go looking for a derivation that
+        // produces this number.
+        tracing::info!(
+            setting = "sql_max_query_bytes",
+            value = self.sql_max_query_bytes,
+            source = self.sources.sql_max_query_bytes,
+            clamped = self.sql_max_query_bytes_clamped,
+            "performance default resolved"
+        );
+        tracing::info!(
+            setting = "sql_tenant_max_bytes",
+            value = self.sql_tenant_max_bytes,
+            source = self.sources.sql_tenant_max_bytes,
+            "performance default resolved"
+        );
+        tracing::info!(
+            setting = "gc_max_query_duration",
+            value = self.query_deadline.as_secs(),
+            source = self.sources.query_deadline,
+            "performance default resolved"
+        );
+        if self.sql_max_query_bytes_clamped {
+            tracing::warn!(
+                sql_max_query_bytes = self.sql_max_query_bytes,
+                sql_tenant_max_bytes = self.sql_tenant_max_bytes,
+                "--sql-max-query-bytes was clamped to --sql-tenant-max-bytes: a single query may \
+                 never hold more than its tenant's whole ceiling"
+            );
+        }
+    }
+}
 
 /// The resolved ADR-0076 decision 4 flush-cadence knobs
 /// (`--max-flush-delay`, `--max-flush-delay-idle`, `--min-flush-bytes`), all
@@ -2003,18 +2403,25 @@ impl Cli {
     /// into the process-wide `EngineConfig` and the SQL executor, so a flag set
     /// here is the value the query/SQL execution path enforces.
     ///
+    /// The four ADR-0088 budgets are taken from `resolved`, never from the raw
+    /// flags: an unset flag is a host-derived value (issue #1141), and reading
+    /// `self.fetch_concurrency` here would put the compiled-in constant back
+    /// into the engine while the startup log claimed the derived one.
+    ///
     /// Fallible only for `--store-cost-profile`, which reads a file: every
-    /// other field is a clap-parsed value (an unset flag is its compiled-in
-    /// default). A profile that cannot be read or parsed refuses startup here
-    /// rather than falling back to the reference profile, so the prices a
-    /// deployment's figures are modelled at are always the ones its operator
-    /// declared.
-    pub fn query_budgets(&self) -> anyhow::Result<QueryBudgets> {
+    /// other field is a clap-parsed value or an already-resolved default. A
+    /// profile that cannot be read or parsed refuses startup here rather than
+    /// falling back to the reference profile, so the prices a deployment's
+    /// figures are modelled at are always the ones its operator declared.
+    pub fn query_budgets(
+        &self,
+        resolved: &ResolvedPerformanceDefaults,
+    ) -> anyhow::Result<QueryBudgets> {
         Ok(QueryBudgets {
-            fetch_concurrency: self.fetch_concurrency,
-            max_segments: self.max_segments,
-            sql_max_query_bytes: self.sql_max_query_bytes,
-            sql_tenant_max_bytes: self.sql_tenant_max_bytes,
+            fetch_concurrency: resolved.fetch_concurrency,
+            max_segments: resolved.max_segments,
+            sql_max_query_bytes: resolved.sql_max_query_bytes,
+            sql_tenant_max_bytes: resolved.sql_tenant_max_bytes,
             sql_parallel_final_aggregation: self.sql_parallel_final_aggregation,
             logs_block_range_threshold: self.logs_block_range_threshold,
             logs_request_cost_bytes: self.logs_request_cost_bytes,
@@ -2684,11 +3091,58 @@ impl Cli {
         Ok(ConfiguredScheme::Unspecified)
     }
 
+    /// The six performance flags, parsed but not resolved: `None` per field
+    /// means the operator set nothing there and
+    /// [`resolve_performance_defaults`] derives it.
+    ///
+    /// This is where `--gc-max-query-duration`'s humantime spelling is parsed,
+    /// which is why this is the fallible half and the resolution itself is not.
+    /// The error message and its `must be a positive duration` /
+    /// `invalid --gc-max-query-duration` shapes are unchanged from when
+    /// `resolve_gc_runtime` did the parse.
+    pub fn performance_flags(&self) -> anyhow::Result<PerformanceFlags> {
+        let query_deadline = match self.gc_max_query_duration.as_deref() {
+            Some(s) => {
+                let ns = parse_gc_duration_ns("--gc-max-query-duration", s)?;
+                Some(Duration::from_nanos(u64::try_from(ns).unwrap_or(0)))
+            }
+            None => None,
+        };
+        Ok(PerformanceFlags {
+            fetch_concurrency: self.fetch_concurrency,
+            max_segments: self.max_segments,
+            cache_max_bytes: self.cache_max_bytes,
+            sql_max_query_bytes: self.sql_max_query_bytes,
+            sql_tenant_max_bytes: self.sql_tenant_max_bytes,
+            query_deadline,
+        })
+    }
+
+    /// The six performance settings this process will run with, resolved
+    /// against `host` (issue #1141). `main` calls this once, with
+    /// [`HostProfile::detect`], and threads the result into every consumer;
+    /// a test calls it with an injected profile.
+    pub fn resolve_performance(
+        &self,
+        host: HostProfile,
+    ) -> anyhow::Result<ResolvedPerformanceDefaults> {
+        Ok(resolve_performance_defaults(
+            host,
+            self.performance_flags()?,
+        ))
+    }
+
     /// Resolve the four `--gc-*` duration flags into the concrete values the
     /// GC-config startup path needs (ADR-0050 section 4). Each flag is
     /// optional; an omitted flag falls back to its compiled-in default, so a
     /// process that sets none of them is byte-identical to before the flags
     /// existed.
+    ///
+    /// `query_deadline` is the exception: it is passed in already resolved
+    /// (`ResolvedPerformanceDefaults::query_deadline`, from
+    /// `--gc-max-query-duration` or the derived 11 minutes) so the deadline the
+    /// `sys/gc` validation runs on is the same value the engine enforces and
+    /// the startup log named.
     ///
     /// This is the single resolution point: `main` feeds the returned values
     /// into BOTH the `sys/gc` validation (`validate_maintain` /
@@ -2697,7 +3151,7 @@ impl Cli {
     /// A flag that only satisfied validation while a `::default()` was enforced
     /// elsewhere would be the exact "looks configured, is actually inert" bug
     /// this wiring exists to prevent.
-    pub fn resolve_gc_runtime(&self) -> anyhow::Result<GcRuntimeConfig> {
+    pub fn resolve_gc_runtime(&self, query_deadline: Duration) -> anyhow::Result<GcRuntimeConfig> {
         use ravel_maintain::config::{
             DEFAULT_GRACE_NS, DEFAULT_MAX_FLUSH_LIFETIME_NS, DEFAULT_PROTECTION_HORIZON_NS,
         };
@@ -2714,18 +3168,6 @@ impl Cli {
             Some(s) => parse_gc_duration_ns("--gc-max-flush-lifetime", s)?,
             None => DEFAULT_MAX_FLUSH_LIFETIME_NS,
         };
-        let query_deadline = match self.gc_max_query_duration.as_deref() {
-            Some(s) => {
-                let ns = parse_gc_duration_ns("--gc-max-query-duration", s)?;
-                Duration::from_nanos(u64::try_from(ns).unwrap_or(0))
-            }
-            // The engine deadline's established default lives in ravel-query,
-            // and the real query engine uses it today; defaulting here to the
-            // same constant keeps a single source of truth and preserves the
-            // 30s enforced deadline exactly when the flag is unset.
-            None => ravel_query::EngineConfig::default().deadline,
-        };
-
         Ok(GcRuntimeConfig {
             protection_horizon_ns,
             grace_ns,
@@ -3909,6 +4351,11 @@ mod tests {
     /// `GcConfigValues::validate` refuses on the durable `sys/gc` write path
     /// applies equally to the process's own configured side of the
     /// must-match check.
+    ///
+    /// `--gc-max-query-duration` is parsed by [`Cli::performance_flags`] now
+    /// (issue #1141 moved the deadline into the resolved performance defaults),
+    /// the other three by [`Cli::resolve_gc_runtime`]; both are driven here, so
+    /// the move cannot drop the check for the flag it moved.
     #[test]
     fn zero_gc_duration_flag_is_rejected() {
         for flag in [
@@ -3919,9 +4366,13 @@ mod tests {
         ] {
             let cli = Cli::try_parse_from(["ravel-server", "--mode", "query", flag, "0s"])
                 .expect("flag parses at the CLI layer");
-            let err = cli
-                .resolve_gc_runtime()
-                .expect_err(&format!("{flag} 0s must be rejected as non-positive"));
+            let err = if flag == "--gc-max-query-duration" {
+                cli.performance_flags()
+                    .expect_err(&format!("{flag} 0s must be rejected as non-positive"))
+            } else {
+                cli.resolve_gc_runtime(DERIVED_QUERY_DEADLINE)
+                    .expect_err(&format!("{flag} 0s must be rejected as non-positive"))
+            };
             assert!(
                 err.to_string().contains("positive"),
                 "expected a positive-duration error for {flag}, got: {err}"
@@ -4039,11 +4490,20 @@ mod tests {
              not EngineConfig::default()'s 8"
         );
 
-        // Default path: unset flag leaves the engine's value byte-identical.
+        // Unset: the HOST-DERIVED value reaches the same field (issue #1141),
+        // not the compiled-in 8. `engine_from` resolves against the injected
+        // reference host, so this asserts an exact integer.
         let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
         assert_eq!(
             engine_from(&cli).fetch_concurrency,
+            REFERENCE_FETCH_CONCURRENCY,
+            "an unset --fetch-concurrency must reach the engine as the host-derived value"
+        );
+        assert_ne!(
+            REFERENCE_FETCH_CONCURRENCY,
             EngineConfig::default().fetch_concurrency,
+            "guard: the derived value must differ from the library constant, or this test \
+             would pass on a server that ignored the derivation"
         );
     }
 
@@ -4065,11 +4525,15 @@ mod tests {
              not EngineConfig::default()'s 1024"
         );
 
+        // Unset: the DERIVED cap reaches the same field (issue #1141), not the
+        // compiled-in 1024.
         let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
         assert_eq!(
             engine_from(&cli).max_segments,
-            EngineConfig::default().max_segments,
+            DERIVED_MAX_SEGMENTS,
+            "an unset --max-segments must reach the engine as the derived 1,000,000"
         );
+        assert_ne!(DERIVED_MAX_SEGMENTS, EngineConfig::default().max_segments);
     }
 
     /// ADR-0107 reachability: `--logs-block-range-threshold` must reach the
@@ -4164,26 +4628,28 @@ mod tests {
         );
     }
 
-    /// ADR-0088 default-unchanged guard: a server built with none of the four
-    /// new flags carries budgets bit-for-bit identical to the compiled-in
-    /// values the engine used before the flags existed. Pins each default to its
-    /// source constant so a future edit to any default fails loudly here.
+    /// ADR-0088 as amended by issue #1141: a server built with none of the four
+    /// budget flags carries the HOST-DERIVED budgets, and every other field of
+    /// [`QueryBudgets`] is still exactly its compiled-in value. Pins each to its
+    /// source constant so a future edit to any of them fails loudly here.
     #[test]
-    fn query_budget_defaults_match_compiled_in_constants() {
+    fn query_budget_defaults_are_derived_from_the_host() {
         use ravel_query::EngineConfig;
 
-        let budgets = Cli::try_parse_from(["ravel-server"])
-            .expect("defaults parse")
-            .query_budgets()
+        let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        let budgets = cli
+            .query_budgets(&resolved_from(&cli))
             .expect("budgets resolve");
-        assert_eq!(budgets, QueryBudgets::default());
-        assert_eq!(
-            budgets.fetch_concurrency,
-            EngineConfig::default().fetch_concurrency
+        assert_eq!(budgets.fetch_concurrency, REFERENCE_FETCH_CONCURRENCY);
+        assert_eq!(budgets.max_segments, DERIVED_MAX_SEGMENTS);
+        assert_eq!(budgets.sql_max_query_bytes, REFERENCE_SQL_MAX_QUERY_BYTES);
+        assert_eq!(budgets.sql_tenant_max_bytes, REFERENCE_SQL_TENANT_MAX_BYTES);
+        assert_ne!(
+            budgets,
+            QueryBudgets::default(),
+            "guard: the derived budgets must differ from the library-constant baseline, or \
+             this test would pass on a server that never derived anything"
         );
-        assert_eq!(budgets.max_segments, EngineConfig::default().max_segments);
-        assert_eq!(budgets.sql_max_query_bytes, DEFAULT_SQL_MAX_QUERY_BYTES);
-        assert_eq!(budgets.sql_tenant_max_bytes, DEFAULT_SQL_TENANT_MAX_BYTES);
         assert!(
             budgets.sql_parallel_final_aggregation,
             "ADR-0094 amendment (#741): exact-typed final-aggregation repartitioning defaults on"
@@ -4193,10 +4659,10 @@ mod tests {
             EngineConfig::default().logs_max_fetch_run_bytes,
             "the --logs-max-fetch-run-bytes default is the engine's own 64 MiB bound"
         );
-        // The concurrency/segment defaults leave a base config untouched. The
-        // two logs fetch quantities do NOT: ADR-0996 decision 2 ships
-        // `cost-based` as the default policy, and at the reference profile
-        // (transfer and retrieval free) that resolves to request-minimal
+        // Everything the derivation does NOT govern must still be untouched.
+        // The two logs fetch quantities are the exception ADR-0996 decision 2
+        // ships: `cost-based` is the default policy, and at the reference
+        // profile (transfer and retrieval free) it resolves to request-minimal
         // behaviour. That is the ADR's argued default, not an accident, so it
         // is pinned to the exact resolved values here.
         let engine = budgets
@@ -4207,11 +4673,366 @@ mod tests {
             EngineConfig {
                 logs_request_cost_bytes: u64::MAX,
                 logs_block_range_threshold: u64::MAX,
+                fetch_concurrency: REFERENCE_FETCH_CONCURRENCY,
+                max_segments: DERIVED_MAX_SEGMENTS,
                 ..EngineConfig::default()
             },
-            "unset flags must perturb only the two quantities the default cost-based policy \
-             resolves at the reference profile"
+            "unset flags must perturb only the derived budgets and the two quantities the \
+             default cost-based policy resolves at the reference profile"
         );
+    }
+
+    /// Issue #1141's headline: with no flags at all, the reference host of the
+    /// #968 ClickBench result (16 cores, 30 GB) resolves to exactly the settings
+    /// that measurement ran under. Exact integers, not ranges: a rule that
+    /// produced "about 24 GiB" would be a different rule.
+    ///
+    /// Prove-the-test: flip `CACHE_MEMORY_PERCENT` from 80 to 75 and the cache
+    /// assertion reads 24,159,191,040 against the expected 25,769,803,776; flip
+    /// `FETCH_CONCURRENCY_PER_CORE` from 2 to 1 and the concurrency assertion
+    /// reads 16 against the expected 32.
+    #[test]
+    fn reference_host_resolves_the_clickbench_settings() {
+        let resolved = resolve_performance_defaults(reference_host(), PerformanceFlags::default());
+
+        assert_eq!(resolved.fetch_concurrency, 32);
+        assert_eq!(resolved.cache_max_bytes, 25_769_803_776);
+        assert_eq!(resolved.sql_max_query_bytes, 8_053_063_680);
+        assert_eq!(resolved.sql_tenant_max_bytes, 16_106_127_360);
+        assert_eq!(resolved.max_segments, 1_000_000);
+        assert_eq!(resolved.query_deadline, Duration::from_secs(660));
+
+        // Every one of them derived, none a fallback: on a host whose memory is
+        // readable, a `fallback` source would mean the derivation silently did
+        // not run.
+        assert_eq!(resolved.sources.fetch_concurrency, PERF_SOURCE_DERIVED);
+        assert_eq!(resolved.sources.cache_max_bytes, PERF_SOURCE_DERIVED);
+        assert_eq!(resolved.sources.sql_max_query_bytes, PERF_SOURCE_DERIVED);
+        assert_eq!(resolved.sources.sql_tenant_max_bytes, PERF_SOURCE_DERIVED);
+        assert_eq!(resolved.sources.max_segments, PERF_SOURCE_DERIVED);
+        assert_eq!(resolved.sources.query_deadline, PERF_SOURCE_DERIVED);
+        assert!(!resolved.sql_max_query_bytes_clamped);
+    }
+
+    /// A smaller host gets proportional, safe values from the same rules: 4
+    /// cores and 8 GiB. The fetch concurrency lands exactly on the floor here
+    /// (2 * 4 == 8 == MIN_DERIVED_FETCH_CONCURRENCY), and the cache figure is
+    /// the truncated 80% that the documented rounding rule produces.
+    ///
+    /// Prove-the-test: round the percentage up (`(product + 99) / 100` in
+    /// `percent_of`) and the cache assertion reads 6,871,947,674 against the
+    /// expected 6,871,947,673.
+    #[test]
+    fn small_host_resolves_proportional_settings() {
+        let host = HostProfile::new(4, Some(8 * 1024 * 1024 * 1024));
+        let resolved = resolve_performance_defaults(host, PerformanceFlags::default());
+
+        assert_eq!(resolved.fetch_concurrency, 8);
+        assert_eq!(resolved.cache_max_bytes, 6_871_947_673);
+        assert_eq!(resolved.sql_max_query_bytes, 2_147_483_648);
+        assert_eq!(resolved.sql_tenant_max_bytes, 4_294_967_296);
+        // The two host-independent rules do not shrink with the host: a
+        // segment-count cap and a deadline are not resident bytes.
+        assert_eq!(resolved.max_segments, 1_000_000);
+        assert_eq!(resolved.query_deadline, Duration::from_secs(660));
+
+        // A one-core host still gets the floor, never 2.
+        let tiny = resolve_performance_defaults(
+            HostProfile::new(1, Some(8 * 1024 * 1024 * 1024)),
+            PerformanceFlags::default(),
+        );
+        assert_eq!(tiny.fetch_concurrency, MIN_DERIVED_FETCH_CONCURRENCY);
+    }
+
+    /// Memory unknown (a non-Linux host, or an unreadable `/proc/meminfo`):
+    /// every memory-derived default falls back to its compiled-in constant and
+    /// says `fallback`, while the core-derived and host-independent rules still
+    /// derive. A percentage of an unknown total is not a number, so guessing one
+    /// would size a 24 GiB cache on a host that may have 2 GB.
+    ///
+    /// Prove-the-test: make the `(None, None)` arms of `resolve_performance_defaults`
+    /// derive from an assumed total (say `percent_of(8 << 30, CACHE_MEMORY_PERCENT)`)
+    /// and the cache assertion reads 6,871,947,673 against the expected
+    /// 268,435,456.
+    #[test]
+    fn unknown_memory_falls_back_to_the_compiled_in_constants() {
+        let host = HostProfile::new(16, None);
+        let resolved = resolve_performance_defaults(host, PerformanceFlags::default());
+
+        assert_eq!(resolved.cache_max_bytes, 268_435_456);
+        assert_eq!(resolved.cache_max_bytes, DEFAULT_CACHE_MAX_BYTES);
+        assert_eq!(resolved.sql_max_query_bytes, DEFAULT_SQL_MAX_QUERY_BYTES);
+        assert_eq!(resolved.sql_tenant_max_bytes, DEFAULT_SQL_TENANT_MAX_BYTES);
+        assert_eq!(resolved.sources.cache_max_bytes, PERF_SOURCE_FALLBACK);
+        assert_eq!(resolved.sources.sql_max_query_bytes, PERF_SOURCE_FALLBACK);
+        assert_eq!(resolved.sources.sql_tenant_max_bytes, PERF_SOURCE_FALLBACK);
+
+        // Cores are still known, so fetch concurrency is still derived.
+        assert_eq!(resolved.fetch_concurrency, 32);
+        assert_eq!(resolved.sources.fetch_concurrency, PERF_SOURCE_DERIVED);
+        assert_eq!(resolved.max_segments, DERIVED_MAX_SEGMENTS);
+        assert_eq!(resolved.query_deadline, DERIVED_QUERY_DEADLINE);
+    }
+
+    /// An explicit flag wins over the derived value, one field at a time: each
+    /// case sets exactly one flag and asserts that field took the flag while
+    /// every other field kept its reference-host derivation. A resolution that
+    /// let one flag disturb another (or that ignored a flag) fails on the
+    /// untouched fields, not just the set one.
+    ///
+    /// Prove-the-test: drop the `Some(n) => (n, PERF_SOURCE_FLAG)` arm from any
+    /// one match in `resolve_performance_defaults` and that field's assertion
+    /// reads its derived value against the expected flag value (for
+    /// `cache_max_bytes`: 25,769,803,776 against the expected 4096).
+    #[test]
+    fn an_explicit_flag_overrides_each_derived_value_independently() {
+        let derived = resolve_performance_defaults(reference_host(), PerformanceFlags::default());
+
+        let with_fetch = resolve_performance_defaults(
+            reference_host(),
+            PerformanceFlags {
+                fetch_concurrency: Some(3),
+                ..PerformanceFlags::default()
+            },
+        );
+        assert_eq!(with_fetch.fetch_concurrency, 3);
+        assert_eq!(with_fetch.sources.fetch_concurrency, PERF_SOURCE_FLAG);
+        assert_eq!(with_fetch.cache_max_bytes, derived.cache_max_bytes);
+        assert_eq!(with_fetch.max_segments, derived.max_segments);
+
+        let with_segments = resolve_performance_defaults(
+            reference_host(),
+            PerformanceFlags {
+                max_segments: Some(1024),
+                ..PerformanceFlags::default()
+            },
+        );
+        assert_eq!(with_segments.max_segments, 1024);
+        assert_eq!(with_segments.sources.max_segments, PERF_SOURCE_FLAG);
+        assert_eq!(with_segments.fetch_concurrency, derived.fetch_concurrency);
+
+        let with_cache = resolve_performance_defaults(
+            reference_host(),
+            PerformanceFlags {
+                cache_max_bytes: Some(4096),
+                ..PerformanceFlags::default()
+            },
+        );
+        assert_eq!(with_cache.cache_max_bytes, 4096);
+        assert_eq!(with_cache.sources.cache_max_bytes, PERF_SOURCE_FLAG);
+        assert_eq!(
+            with_cache.sql_max_query_bytes, derived.sql_max_query_bytes,
+            "the cache flag must not disturb the SQL pools"
+        );
+
+        let with_query_pool = resolve_performance_defaults(
+            reference_host(),
+            PerformanceFlags {
+                sql_max_query_bytes: Some(7 * 1024 * 1024),
+                ..PerformanceFlags::default()
+            },
+        );
+        assert_eq!(with_query_pool.sql_max_query_bytes, 7 * 1024 * 1024);
+        assert_eq!(
+            with_query_pool.sources.sql_max_query_bytes,
+            PERF_SOURCE_FLAG
+        );
+        assert_eq!(
+            with_query_pool.sql_tenant_max_bytes, derived.sql_tenant_max_bytes,
+            "the per-query flag must never raise the per-tenant ceiling"
+        );
+        assert!(!with_query_pool.sql_max_query_bytes_clamped);
+
+        let with_tenant_pool = resolve_performance_defaults(
+            reference_host(),
+            PerformanceFlags {
+                sql_tenant_max_bytes: Some(20 * 1024 * 1024 * 1024),
+                ..PerformanceFlags::default()
+            },
+        );
+        assert_eq!(
+            with_tenant_pool.sql_tenant_max_bytes,
+            20 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            with_tenant_pool.sources.sql_tenant_max_bytes,
+            PERF_SOURCE_FLAG
+        );
+        assert_eq!(
+            with_tenant_pool.sql_max_query_bytes, derived.sql_max_query_bytes,
+            "a tenant ceiling above the derived per-query pool leaves it alone"
+        );
+
+        let with_deadline = resolve_performance_defaults(
+            reference_host(),
+            PerformanceFlags {
+                query_deadline: Some(Duration::from_secs(30)),
+                ..PerformanceFlags::default()
+            },
+        );
+        assert_eq!(with_deadline.query_deadline, Duration::from_secs(30));
+        assert_eq!(with_deadline.sources.query_deadline, PERF_SOURCE_FLAG);
+        assert_eq!(with_deadline.max_segments, derived.max_segments);
+    }
+
+    /// The per-query SQL pool is clamped to the per-tenant ceiling, and the
+    /// clamp only ever lowers the per-query pool. A tenant ceiling set below the
+    /// derived per-query pool must pull the per-query pool down to it, not raise
+    /// the ceiling the operator just set: raising it would silently widen the
+    /// multi-tenant isolation bound.
+    ///
+    /// Prove-the-test: replace the clamp with
+    /// `let sql_max_query_bytes = unclamped_query_bytes;` and the first
+    /// assertion reads 8,053,063,680 against the expected 1,048,576.
+    #[test]
+    fn the_per_query_sql_pool_is_clamped_to_the_per_tenant_ceiling() {
+        let clamped = resolve_performance_defaults(
+            reference_host(),
+            PerformanceFlags {
+                sql_tenant_max_bytes: Some(1024 * 1024),
+                ..PerformanceFlags::default()
+            },
+        );
+        assert_eq!(
+            clamped.sql_max_query_bytes,
+            1024 * 1024,
+            "the derived per-query pool must be clamped down to the flag's tenant ceiling"
+        );
+        assert_eq!(
+            clamped.sql_tenant_max_bytes,
+            1024 * 1024,
+            "the tenant ceiling the operator set must be used verbatim, never raised to fit \
+             the per-query pool"
+        );
+        assert!(clamped.sql_max_query_bytes_clamped);
+
+        // Both set, crossed: the same rule applies to two explicit flags.
+        let both = resolve_performance_defaults(
+            reference_host(),
+            PerformanceFlags {
+                sql_max_query_bytes: Some(8 * 1024 * 1024),
+                sql_tenant_max_bytes: Some(4 * 1024 * 1024),
+                ..PerformanceFlags::default()
+            },
+        );
+        assert_eq!(both.sql_max_query_bytes, 4 * 1024 * 1024);
+        assert_eq!(both.sql_tenant_max_bytes, 4 * 1024 * 1024);
+        assert!(both.sql_max_query_bytes_clamped);
+    }
+
+    /// `/proc/meminfo` parsing: the real shape, and every malformed shape
+    /// yielding `None` rather than a wrong total. A wrong total silently
+    /// resizes three of the six settings.
+    ///
+    /// Prove-the-test: drop the `checked_mul(1024)` (return `Some(value)` for
+    /// the `kB` arm) and the first assertion reads 32,137,720 against the
+    /// expected 32,909,025,280.
+    #[test]
+    fn mem_total_is_parsed_from_proc_meminfo() {
+        let real = "MemTotal:       32137720 kB\nMemFree:         1234567 kB\n";
+        assert_eq!(parse_mem_total_bytes(real), Some(32_909_025_280));
+
+        // MemTotal not first, and a key that merely starts similarly must not
+        // be mistaken for it.
+        let shuffled = "MemAvailable:    100 kB\nMemTotal:       1024 kB\n";
+        assert_eq!(parse_mem_total_bytes(shuffled), Some(1024 * 1024));
+
+        // Malformed inputs: no guess.
+        assert_eq!(parse_mem_total_bytes(""), None);
+        assert_eq!(parse_mem_total_bytes("MemFree: 100 kB\n"), None);
+        assert_eq!(parse_mem_total_bytes("MemTotal:       lots kB\n"), None);
+        assert_eq!(parse_mem_total_bytes("MemTotal:       12 furlongs\n"), None);
+    }
+
+    /// `--cache-max-bytes` reachability (issue #1141): the resolved value is
+    /// what `main` hands `store::build_store` and `ServerConfig`, whether it was
+    /// derived or typed. Both directions asserted, because a resolution that
+    /// dropped the flag and one that dropped the derivation each look correct
+    /// from one side only.
+    ///
+    /// Prove-the-test: change `main`'s `cache_max_bytes: performance.cache_max_bytes`
+    /// back to a raw flag read and the unset case can no longer produce
+    /// 25,769,803,776 at all.
+    #[test]
+    fn cache_max_bytes_resolves_from_the_flag_or_the_host() {
+        let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        assert_eq!(
+            resolved_from(&cli).cache_max_bytes,
+            REFERENCE_CACHE_MAX_BYTES
+        );
+
+        let cli = Cli::try_parse_from(["ravel-server", "--cache-max-bytes", "4096"])
+            .expect("flag parses");
+        let resolved = resolved_from(&cli);
+        assert_eq!(resolved.cache_max_bytes, 4096);
+        assert_eq!(resolved.sources.cache_max_bytes, PERF_SOURCE_FLAG);
+    }
+
+    /// `--gc-max-query-duration` reachability under the derived default: unset,
+    /// the resolved deadline is 11 minutes and it is the value the `sys/gc`
+    /// validation runs on (and passes, against the durable 1h default). Set, the
+    /// flag is used verbatim, exactly as before.
+    ///
+    /// Prove-the-test: return `ravel_query::EngineConfig::default().deadline`
+    /// from the `None` arm of the deadline match and the first assertion reads
+    /// 30s against the expected 660s.
+    #[test]
+    fn the_derived_query_deadline_is_what_sys_gc_validates() {
+        let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        let resolved = resolved_from(&cli);
+        assert_eq!(resolved.query_deadline, Duration::from_secs(660));
+        let runtime = cli
+            .resolve_gc_runtime(resolved.query_deadline)
+            .expect("resolves");
+        assert_eq!(
+            runtime.query_deadline,
+            Duration::from_secs(660),
+            "the deadline the compactor/engine path carries must be the resolved one"
+        );
+        crate::gc_config::validate_query(
+            &ravel_maintain::GcConfigValues::maintain_defaults(),
+            runtime.query_deadline,
+        )
+        .expect("11 minutes must pass validation against the durable 1h max_query_duration");
+
+        // An explicit flag still wins and is still what is validated.
+        let cli = Cli::try_parse_from(["ravel-server", "--gc-max-query-duration", "45s"])
+            .expect("flag parses");
+        let resolved = resolved_from(&cli);
+        assert_eq!(resolved.query_deadline, Duration::from_secs(45));
+        assert_eq!(resolved.sources.query_deadline, PERF_SOURCE_FLAG);
+        assert_eq!(
+            cli.resolve_gc_runtime(resolved.query_deadline)
+                .expect("resolves")
+                .query_deadline,
+            Duration::from_secs(45)
+        );
+    }
+
+    /// The reference host of issue #1141: the 16-core / 30 GB box the #968
+    /// ClickBench result was measured on. Every test in this module resolves
+    /// against this injected profile; none reads the real host, so a green run
+    /// on a 4-core CI runner means the same thing as on a 64-core one.
+    const REFERENCE_CORES: usize = 16;
+    /// The reference host's `MemTotal`, exactly 30 GiB in bytes.
+    const REFERENCE_MEM_BYTES: u64 = 32_212_254_720;
+    /// What the reference host resolves each derived budget to. Spelled as
+    /// literal integers rather than recomputed from the percentages, so a
+    /// change to the rule has to restate the number it produces.
+    const REFERENCE_FETCH_CONCURRENCY: usize = 32;
+    const REFERENCE_CACHE_MAX_BYTES: u64 = 25_769_803_776;
+    const REFERENCE_SQL_MAX_QUERY_BYTES: usize = 8_053_063_680;
+    const REFERENCE_SQL_TENANT_MAX_BYTES: usize = 16_106_127_360;
+
+    /// The reference [`HostProfile`], injected.
+    fn reference_host() -> HostProfile {
+        HostProfile::new(REFERENCE_CORES, Some(REFERENCE_MEM_BYTES))
+    }
+
+    /// The performance defaults a parsed CLI resolves on the reference host.
+    fn resolved_from(cli: &Cli) -> ResolvedPerformanceDefaults {
+        cli.resolve_performance(reference_host())
+            .expect("performance defaults resolve")
     }
 
     /// The `EngineConfig` a parsed CLI produces through the exact wiring
@@ -4220,7 +5041,7 @@ mod tests {
     /// drives this rather than reading a parsed field, so a green result means
     /// a running binary's engine carries the value.
     fn engine_from(cli: &Cli) -> ravel_query::EngineConfig {
-        cli.query_budgets()
+        cli.query_budgets(&resolved_from(cli))
             .expect("budgets resolve")
             .apply_to_engine(ravel_query::EngineConfig::default())
             .expect("engine config resolves")
@@ -4229,7 +5050,7 @@ mod tests {
     /// The [`LogsFetchStamp`] a parsed CLI resolves, the provenance surface
     /// `start` logs.
     fn stamp_from(cli: &Cli) -> LogsFetchStamp {
-        cli.query_budgets()
+        cli.query_budgets(&resolved_from(cli))
             .expect("budgets resolve")
             .logs_fetch_stamp()
     }
@@ -4415,7 +5236,7 @@ mod tests {
         let cli = Cli::try_parse_from(["ravel-server", "--logs-max-fetch-run-bytes", "0"])
             .expect("flag parses");
         let resolved = cli
-            .query_budgets()
+            .query_budgets(&resolved_from(&cli))
             .expect("budgets resolve")
             .apply_to_engine(ravel_query::EngineConfig::default());
         assert_eq!(
@@ -4509,7 +5330,7 @@ mod tests {
         ])
         .expect("flag parses");
         let err = cli
-            .query_budgets()
+            .query_budgets(&resolved_from(&cli))
             .expect_err("an unknown key must refuse startup")
             .to_string();
         assert!(
@@ -4533,7 +5354,7 @@ mod tests {
         ])
         .expect("flag parses");
         let err = cli
-            .query_budgets()
+            .query_budgets(&resolved_from(&cli))
             .expect_err("a blank profile name must refuse startup")
             .to_string();
         assert!(
@@ -4549,7 +5370,7 @@ mod tests {
         ])
         .expect("flag parses");
         let err = cli
-            .query_budgets()
+            .query_budgets(&resolved_from(&cli))
             .expect_err("an unreadable profile must refuse startup")
             .to_string();
         assert!(
@@ -4558,22 +5379,23 @@ mod tests {
         );
     }
 
-    /// ADR-0088 pins the two SQL byte defaults equal to the compiled-in
-    /// constants they mirror, so the CLI default and the ravel-sql / server
-    /// constant are one value. `sql`-gated because `DEFAULT_MAX_TENANT_BYTES`
-    /// is.
+    /// ADR-0088 pins the two SQL byte FALLBACKS equal to the compiled-in
+    /// constants they mirror, so the value an unknown-memory host resolves and
+    /// the ravel-sql / server constant are one value (issue #1141 moved the
+    /// unset-flag default to a host-derived share; these constants are what it
+    /// falls back to). `sql`-gated because `DEFAULT_MAX_TENANT_BYTES` is.
     #[cfg(feature = "sql")]
     #[test]
-    fn sql_budget_defaults_match_compiled_in_constants() {
+    fn sql_budget_fallbacks_match_compiled_in_constants() {
         assert_eq!(
             DEFAULT_SQL_MAX_QUERY_BYTES,
             ravel_sql::DEFAULT_MAX_QUERY_BYTES,
-            "the --sql-max-query-bytes default must equal ravel-sql's compiled-in per-query pool"
+            "the --sql-max-query-bytes fallback must equal ravel-sql's compiled-in per-query pool"
         );
         assert_eq!(
             DEFAULT_SQL_TENANT_MAX_BYTES,
             crate::query::DEFAULT_MAX_TENANT_BYTES,
-            "the --sql-tenant-max-bytes default must equal the compiled-in per-tenant ceiling"
+            "the --sql-tenant-max-bytes fallback must equal the compiled-in per-tenant ceiling"
         );
     }
 
@@ -4594,7 +5416,9 @@ mod tests {
         // is the same value that was validated (not silently reduced).
         let cli = Cli::try_parse_from(["ravel-server", "--gc-max-query-duration", "2h"])
             .expect("flag parses");
-        let runtime = cli.resolve_gc_runtime().expect("resolves");
+        let runtime = cli
+            .resolve_gc_runtime(resolved_from(&cli).query_deadline)
+            .expect("resolves");
         assert_eq!(runtime.query_deadline, Duration::from_secs(2 * 3600));
         let err = crate::gc_config::validate_query(&stored, runtime.query_deadline)
             .expect_err("a deadline above sys/gc.max_query_duration must be rejected, not clamped");
@@ -4612,7 +5436,9 @@ mod tests {
         // verbatim.
         let cli = Cli::try_parse_from(["ravel-server", "--gc-max-query-duration", "1h"])
             .expect("flag parses");
-        let runtime = cli.resolve_gc_runtime().expect("resolves");
+        let runtime = cli
+            .resolve_gc_runtime(resolved_from(&cli).query_deadline)
+            .expect("resolves");
         assert_eq!(runtime.query_deadline, Duration::from_secs(3600));
         crate::gc_config::validate_query(&stored, runtime.query_deadline)
             .expect("a deadline equal to sys/gc.max_query_duration must pass");
