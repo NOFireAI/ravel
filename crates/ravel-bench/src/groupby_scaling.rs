@@ -11,9 +11,10 @@
 //! `sql_latency_bench` (per-query latency across a diverse SQL corpus): this
 //! one holds the query fixed and sweeps the parallelism axis.
 //!
-//! `target_partitions` is set through `EngineConfig::fetch_concurrency`, which
-//! `ravel_sql::session::session_config` feeds straight into DataFusion's
-//! `with_target_partitions`. The dataset is deliberately multi-part (one RSEG
+//! `target_partitions` is set through `EngineConfig::scan_partitions` (issue
+//! #846's partition knob, distinct from the `fetch_concurrency` GET bound this
+//! sweep holds at its default), which `ravel_sql::session::session_config`
+//! resolves and feeds straight into DataFusion's `with_target_partitions`. The dataset is deliberately multi-part (one RSEG
 //! object per part, disjoint series): today's scan partitioning is
 //! segment-granular (`min(target_partitions, segment_count)`, ADR-0102
 //! decision 1 deferred), so a single-segment tenant would pin every scan to
@@ -424,14 +425,15 @@ async fn run_combo(
     deadline: Duration,
     total_samples: u64,
 ) -> ComboResult {
-    // `target_partitions` is set through `fetch_concurrency`; every budget is
-    // lifted so the benchmark measures execution time, not a budget rejection.
+    // `target_partitions` is set through `scan_partitions`, the knob that means
+    // only that (issue #846); every budget is lifted so the benchmark measures
+    // execution time, not a budget rejection.
     let engine = EngineConfig {
         max_series: usize::MAX,
         max_samples: usize::MAX,
         max_bytes_scanned: ByteLimit::Unlimited,
         max_s3_requests: RequestLimit::Unlimited,
-        fetch_concurrency: target_partitions.max(1),
+        scan_partitions: Some(target_partitions.max(1)),
         ..EngineConfig::default()
     };
     let sql_config = SqlConfig {
@@ -743,7 +745,7 @@ pub struct DistinctScalingConfig {
     pub store_label: String,
     /// The swept distinct counts `D` of the high-cardinality key.
     pub distinct_values: Vec<usize>,
-    /// The swept `target_partitions` values, fed through `fetch_concurrency`.
+    /// The swept `target_partitions` values, fed through `scan_partitions`.
     /// Values above `objects` cannot fan out: the fetcher here is un-cached, so
     /// `LogsScanExec` keeps the `min(target_partitions, segment_count)` bound
     /// (ADR-0102 decision 1). The report records the observed count so a
@@ -1022,7 +1024,7 @@ async fn run_distinct_combo(
         max_samples: usize::MAX,
         max_bytes_scanned: ByteLimit::Unlimited,
         max_s3_requests: RequestLimit::Unlimited,
-        fetch_concurrency: target_partitions.max(1),
+        scan_partitions: Some(target_partitions.max(1)),
         ..EngineConfig::default()
     };
     let sql_config = SqlConfig {

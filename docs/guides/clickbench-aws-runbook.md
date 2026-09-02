@@ -341,7 +341,8 @@ LD_PRELOAD="$TCMALLOC" "$PINNED" \
   --cache-bytes "$CACHE_BYTES" \
   --sql-tenant-max-bytes 17179869184 \
   --sql-max-query-bytes 8589934592 \
-  --fetch-concurrency 128 \
+  --max-concurrent-gets 128 \
+  --scan-partitions 128 \
   --explain --explain-dir /root/explain \
   --corpus /root/ravel/benchmarks/clickbench/hits.corpus.json \
   --runs 3 \
@@ -355,7 +356,8 @@ Flags that change what is measured:
 | `--runs 3` | Run 0 is cold; runs 1 and 2 are warm. Both figures come from one pass. |
 | `--cache-bytes` | **Must exceed the corpus.** Smaller and every run re-reads everything, so "warm" numbers are three cold runs. |
 | `--compaction post` | Measures the compacted layout. |
-| `--fetch-concurrency` | Bounds in-flight object-store GETs. |
+| `--max-concurrent-gets` | Bounds in-flight object-store GETs (issue #846). |
+| `--scan-partitions` | Sets the SQL scan partition count (`target_partitions`). Independent of the GET bound; unset, it couples to it. Both are stamped in the report, so a sweep of either is attributable. |
 | `--explain --explain-dir` | Captures a plan per statement. A null result cannot be diagnosed without it. |
 | `--continue-on-error` | One failing statement does not abandon the pass. |
 
@@ -789,7 +791,7 @@ LD_PRELOAD="$TCMALLOC" RAVEL_BENCH_PROFILE_SVG=/root/profile/q35.svg \
   "$PINNED" \
     --tenant clickbench-v4 --store s3 --compaction post --window-hours 200000 \
     --sql-max-segments 1000000 --deadline-secs 900 \
-    --cache-bytes "$CACHE_BYTES" --fetch-concurrency 128 \
+    --cache-bytes "$CACHE_BYTES" --max-concurrent-gets 128 --scan-partitions 128 \
     --corpus /root/q35.corpus.json --runs 1
 ```
 

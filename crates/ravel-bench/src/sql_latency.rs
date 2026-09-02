@@ -216,11 +216,34 @@ pub struct Provenance {
     /// `failed`, not as a latency.
     #[serde(default = "default_deadline_secs")]
     pub deadline_secs: u64,
-    /// The executor's `fetch_concurrency` (logs scan partitions and in-flight
-    /// segment fetches per query). Recorded because the cold floor of a
-    /// full-scan statement is latency-bound and moves nearly linearly with it.
-    #[serde(default = "default_fetch_concurrency")]
-    pub fetch_concurrency: usize,
+    /// The executor's [`EngineConfig::fetch_concurrency`]: the bound on
+    /// concurrent in-flight object-store GETs per query, the permit pool
+    /// `--max-concurrent-gets` sizes. Recorded because the cold floor of a
+    /// full-scan statement is latency-bound at the store and moves nearly
+    /// linearly with it.
+    ///
+    /// Issue #846 split this from the scan partition count
+    /// ([`Self::scan_partitions`]); before the split one value set both, so a
+    /// report written then deserializes through the `fetch_concurrency` alias
+    /// into this field with `scan_partitions: None`, which is exactly the
+    /// coupling that run had.
+    #[serde(default = "default_fetch_concurrency", alias = "fetch_concurrency")]
+    pub max_concurrent_gets: usize,
+    /// The executor's [`EngineConfig::scan_partitions`]: the SQL scan partition
+    /// count (`target_partitions`) this run ASKED for, or `None` when it was
+    /// left coupled to [`Self::max_concurrent_gets`]. Use
+    /// [`Self::effective_scan_partitions`] for the number that governed.
+    ///
+    /// Stamped alongside the GET bound (issue #846) so a sweep is attributable:
+    /// the two knobs move different resources (plan parallelism versus store
+    /// concurrency), and a report naming only one cannot say which moved. A
+    /// report written before the split deserializes to `None`, the coupling it
+    /// ran under. Skipped in JSON when `None`, keeping the no-null contract; a
+    /// consumer recovers the number that governed from
+    /// [`Self::effective_scan_partitions`], so both knobs are readable off the
+    /// report either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_partitions: Option<usize>,
     /// The logs per-request byte budget this run ASKED for
     /// (`--logs-request-cost-bytes`, ADR-0904). A report written before this
     /// field existed deserializes to
@@ -362,6 +385,18 @@ pub struct Provenance {
     /// when `None`, keeping the no-null contract.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_cost_profile_effective: Option<StoreCostProfile>,
+}
+
+impl Provenance {
+    /// The SQL scan partition count that governed this run: [`Self::scan_partitions`]
+    /// when it was set, otherwise [`Self::max_concurrent_gets`], mirroring
+    /// [`EngineConfig::effective_scan_partitions`]. A report from before issue #846
+    /// carries no partition count and resolves here to the GET bound, which is the
+    /// coupling that run actually had.
+    #[must_use]
+    pub fn effective_scan_partitions(&self) -> usize {
+        self.scan_partitions.unwrap_or(self.max_concurrent_gets)
+    }
 }
 
 /// The profile a report written before the cost stamp existed deserializes to,
@@ -999,11 +1034,17 @@ pub struct GenerateConfig {
     /// [`SqlLatencyReport::failed`] and the run moves on; when `false` the first
     /// failure aborts the run with its error.
     pub continue_on_error: bool,
-    /// [`EngineConfig::fetch_concurrency`] for the executor: the logs scan's
-    /// partition count and the bound on in-flight segment fetches per query
-    /// (ADR-0088's single coupled knob, `ravel-server --fetch-concurrency`).
+    /// [`EngineConfig::fetch_concurrency`] for the executor: the bound on
+    /// concurrent in-flight object-store GETs per query, which also sizes the
+    /// logs fetcher's permit pool (`ravel-server --max-concurrent-gets`).
     /// Defaults to [`ravel_query::DEFAULT_FETCH_CONCURRENCY`].
-    pub fetch_concurrency: usize,
+    pub max_concurrent_gets: usize,
+    /// [`EngineConfig::scan_partitions`] for the executor: the SQL scan
+    /// partition count (`target_partitions`, `ravel-server --scan-partitions`),
+    /// or `None` to leave it coupled to [`Self::max_concurrent_gets`] as it was
+    /// before issue #846 split the two. Swept independently of the GET bound so
+    /// a result names which resource it moved.
+    pub scan_partitions: Option<usize>,
     /// Append one JSON line per finished statement ([`EntryEvent`]) to this
     /// file as the run goes, flushed per line, so a run killed hours in still
     /// leaves every number it had measured. `None` writes nothing.
@@ -1125,11 +1166,17 @@ pub struct TenantConfigInput {
     /// [`SqlLatencyReport::failed`] and the run moves on; when `false` the first
     /// failure aborts the run with its error.
     pub continue_on_error: bool,
-    /// [`EngineConfig::fetch_concurrency`] for the executor: the logs scan's
-    /// partition count and the bound on in-flight segment fetches per query
-    /// (ADR-0088's single coupled knob, `ravel-server --fetch-concurrency`).
+    /// [`EngineConfig::fetch_concurrency`] for the executor: the bound on
+    /// concurrent in-flight object-store GETs per query, which also sizes the
+    /// logs fetcher's permit pool (`ravel-server --max-concurrent-gets`).
     /// Defaults to [`ravel_query::DEFAULT_FETCH_CONCURRENCY`].
-    pub fetch_concurrency: usize,
+    pub max_concurrent_gets: usize,
+    /// [`EngineConfig::scan_partitions`] for the executor: the SQL scan
+    /// partition count (`target_partitions`, `ravel-server --scan-partitions`),
+    /// or `None` to leave it coupled to [`Self::max_concurrent_gets`] as it was
+    /// before issue #846 split the two. Swept independently of the GET bound so
+    /// a result names which resource it moved.
+    pub scan_partitions: Option<usize>,
     /// Append one JSON line per finished statement ([`EntryEvent`]) to this
     /// file as the run goes, flushed per line, so a run killed hours in still
     /// leaves every number it had measured. `None` writes nothing.
@@ -1292,8 +1339,14 @@ pub struct ExecutorSettings {
     pub max_query_bytes: usize,
     /// Shards the catalog resolve scans (issue #677).
     pub shard_count: u32,
-    /// Scan partitions and in-flight segment fetches (`--fetch-concurrency`).
-    pub fetch_concurrency: usize,
+    /// In-flight object-store GETs per query: the fetch permit pool
+    /// (`--max-concurrent-gets`). Reaches `EngineConfig::fetch_concurrency` and
+    /// `LogSegmentFetcher::with_max_concurrent_gets`, never the partition count.
+    pub max_concurrent_gets: usize,
+    /// SQL scan partition count (`--scan-partitions`), or `None` to leave it
+    /// coupled to [`Self::max_concurrent_gets`]. Reaches
+    /// `EngineConfig::scan_partitions`, never the permit pool (issue #846).
+    pub scan_partitions: Option<usize>,
     /// Per-tenant ceiling across a tenant's concurrent queries
     /// (`--sql-tenant-max-bytes`), a SECOND limit under `max_query_bytes`.
     pub tenant_max_bytes: usize,
@@ -1330,7 +1383,8 @@ impl Default for ExecutorSettings {
         ExecutorSettings {
             max_query_bytes: DEFAULT_MAX_QUERY_BYTES,
             shard_count: 1,
-            fetch_concurrency: DEFAULT_FETCH_CONCURRENCY,
+            max_concurrent_gets: DEFAULT_FETCH_CONCURRENCY,
+            scan_partitions: None,
             tenant_max_bytes: DEFAULT_TENANT_MAX_BYTES,
             parallel_final_aggregation: true,
             max_segments: DEFAULT_MAX_SEGMENTS,
@@ -1366,7 +1420,8 @@ fn cold_executor(
     let ExecutorSettings {
         max_query_bytes,
         shard_count,
-        fetch_concurrency,
+        max_concurrent_gets,
+        scan_partitions,
         tenant_max_bytes,
         parallel_final_aggregation,
         max_segments,
@@ -1384,9 +1439,11 @@ fn cold_executor(
     // The same wiring `ravel-server` does (issue #700): without it the logs
     // fetcher's permit pool stays at its compiled-in 16 and a scan planned at
     // more partitions than that queues on it, so the bench would measure a
-    // ceiling the flag cannot move.
+    // ceiling the flag cannot move. Only the GET bound reaches here; the
+    // partition count travels separately, through `EngineConfig::scan_partitions`
+    // below (issue #846).
     let mut log_fetcher = LogSegmentFetcher::new(Arc::clone(store))
-        .with_max_concurrent_gets(fetch_concurrency.max(1))
+        .with_max_concurrent_gets(max_concurrent_gets.max(1))
         .with_block_range_threshold(logs_block_range_threshold);
     if let Some(n) = logs_suffix_len {
         log_fetcher = log_fetcher.with_suffix_len(n);
@@ -1408,7 +1465,8 @@ fn cold_executor(
         SqlConfig {
             max_query_bytes,
             engine: EngineConfig {
-                fetch_concurrency: fetch_concurrency.max(1),
+                fetch_concurrency: max_concurrent_gets.max(1),
+                scan_partitions,
                 max_segments,
                 logs_request_cost_bytes,
                 ..EngineConfig::default()
@@ -2002,7 +2060,8 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
     let settings = ExecutorSettings {
         max_query_bytes: cfg.max_query_bytes,
         shard_count,
-        fetch_concurrency: cfg.fetch_concurrency,
+        max_concurrent_gets: cfg.max_concurrent_gets,
+        scan_partitions: cfg.scan_partitions,
         tenant_max_bytes: cfg.tenant_max_bytes,
         parallel_final_aggregation: cfg.parallel_final_aggregation,
         max_segments: cfg.max_segments,
@@ -2039,7 +2098,8 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
             runs: cfg.runs.max(1),
             cache_bytes: cfg.cache_bytes,
             deadline_secs: cfg.deadline.as_secs(),
-            fetch_concurrency: cfg.fetch_concurrency.max(1),
+            max_concurrent_gets: cfg.max_concurrent_gets.max(1),
+            scan_partitions: cfg.scan_partitions,
             logs_request_cost_bytes_requested: cfg.logs_request_cost_bytes,
             // In-process lane, same as the ceiling below: the requested budget
             // reaches the engine, so it is also the effective one.
@@ -2093,7 +2153,8 @@ fn tenant_executor_settings(cfg: &TenantConfigInput, shard_count: u32) -> Execut
     ExecutorSettings {
         max_query_bytes: cfg.max_query_bytes,
         shard_count,
-        fetch_concurrency: cfg.fetch_concurrency,
+        max_concurrent_gets: cfg.max_concurrent_gets,
+        scan_partitions: cfg.scan_partitions,
         tenant_max_bytes: cfg.tenant_max_bytes,
         parallel_final_aggregation: cfg.parallel_final_aggregation,
         max_segments: cfg.max_segments,
@@ -2200,7 +2261,8 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
             runs: cfg.runs.max(1),
             cache_bytes: cfg.cache_bytes,
             deadline_secs: cfg.deadline.as_secs(),
-            fetch_concurrency: cfg.fetch_concurrency.max(1),
+            max_concurrent_gets: cfg.max_concurrent_gets.max(1),
+            scan_partitions: cfg.scan_partitions,
             logs_request_cost_bytes_requested: cfg.logs_request_cost_bytes,
             // `settings` is passed only on the in-process arm of the match
             // above, so on the Flight lane this budget never left the process
@@ -2520,6 +2582,71 @@ mod tests {
         assert_eq!(p.allocator, Allocator::Unknown);
     }
 
+    /// Issue #846: the report stamps BOTH knobs, and a report written before the
+    /// split still reads correctly. A pre-#846 report names only
+    /// `fetch_concurrency`; it deserializes through the alias into
+    /// `max_concurrent_gets` with no partition count, and
+    /// `effective_scan_partitions` resolves to that same value, which is exactly
+    /// the coupling that run had. A post-split report carries the two
+    /// independently, and the partition count is omitted from JSON when unset
+    /// (the no-null contract) rather than written as `null`.
+    ///
+    /// To watch the back-compat half fail: drop `alias = "fetch_concurrency"`
+    /// from the field; the pre-#846 report then deserializes to the compiled-in
+    /// default and the first assertion reads 8 against the expected 32. To watch
+    /// the attributability half fail: make `effective_scan_partitions` return
+    /// `self.max_concurrent_gets` unconditionally; the decoupled assertion then
+    /// reads 32 against the expected 128.
+    #[test]
+    fn provenance_stamps_both_knobs_and_reads_a_pre_split_report() {
+        let pre_split = serde_json::json!({
+            "store_backend": "s3",
+            "region": "us-east-1",
+            "endpoint": "n/a",
+            "host_logical_cores": 8,
+            "source": "tenant",
+            "dataset_id": "t",
+            "runs": 3,
+            "cache_bytes": 0,
+            "fetch_concurrency": 32
+        });
+        let p: Provenance = serde_json::from_value(pre_split).expect("deserialize");
+        assert_eq!(p.max_concurrent_gets, 32);
+        assert_eq!(p.scan_partitions, None);
+        assert_eq!(
+            p.effective_scan_partitions(),
+            32,
+            "a pre-split run had one value governing both, so that is what it is stamped with"
+        );
+        // Unset stays out of the JSON entirely, so no `null` is written and a
+        // reader can tell "never set" from "set to the same number".
+        let round = serde_json::to_value(&p).expect("serialize");
+        assert_eq!(round["max_concurrent_gets"], 32);
+        assert!(round.get("scan_partitions").is_none());
+
+        // A post-split run that swept the partition axis alone: the two knobs
+        // are stamped separately and neither is inferred from the other.
+        let split = serde_json::json!({
+            "store_backend": "s3",
+            "region": "us-east-1",
+            "endpoint": "n/a",
+            "host_logical_cores": 8,
+            "source": "tenant",
+            "dataset_id": "t",
+            "runs": 3,
+            "cache_bytes": 0,
+            "max_concurrent_gets": 32,
+            "scan_partitions": 128
+        });
+        let p: Provenance = serde_json::from_value(split).expect("deserialize");
+        assert_eq!(p.max_concurrent_gets, 32);
+        assert_eq!(p.scan_partitions, Some(128));
+        assert_eq!(p.effective_scan_partitions(), 128);
+        let round = serde_json::to_value(&p).expect("serialize");
+        assert_eq!(round["max_concurrent_gets"], 32);
+        assert_eq!(round["scan_partitions"], 128);
+    }
+
     /// Every allocator the probe can produce round-trips through provenance by
     /// exact value, and an unrecognized allocator string is rejected at
     /// deserialize rather than laundered into `unknown` (issue #972): a garbage
@@ -2678,7 +2805,8 @@ mod tests {
             cache_bytes,
             deadline: Duration::from_secs(30),
             continue_on_error: false,
-            fetch_concurrency: DEFAULT_FETCH_CONCURRENCY,
+            max_concurrent_gets: DEFAULT_FETCH_CONCURRENCY,
+            scan_partitions: None,
             progress_jsonl: None,
             tenant_max_bytes: DEFAULT_TENANT_MAX_BYTES,
             parallel_final_aggregation: false,
@@ -3097,16 +3225,26 @@ mod tests {
         );
     }
 
-    /// `fetch_concurrency` bounds the in-flight GETs, not just the partition
-    /// count: with every GET held behind a gate, an executor built at 24
-    /// parks 24 of them. Before issue #700 the logs fetcher kept its own
-    /// compiled-in cap of 16 whatever the knob said, so this waited forever
-    /// at 16.
+    /// `max_concurrent_gets` bounds the in-flight GETs, and (issue #846) does so
+    /// independently of the partition count: with every GET held behind a gate,
+    /// an executor built at a pool of 24 parks exactly 24 of them even though
+    /// the scan is planned at 64 partitions. Before issue #700 the logs fetcher
+    /// kept its own compiled-in cap of 16 whatever the knob said, so this waited
+    /// forever at 16.
+    ///
+    /// Prove-the-test: point `cold_executor`'s `with_max_concurrent_gets` at
+    /// `scan_partitions.unwrap_or(max_concurrent_gets)` (re-coupling the pool to
+    /// the partition count) and the equality below reads 40 against the expected
+    /// 24: every one of the fixture's 40 objects goes in flight at once, the
+    /// 64-permit pool never binding.
     #[tokio::test]
-    async fn fetch_concurrency_bounds_in_flight_gets() {
+    async fn max_concurrent_gets_bounds_in_flight_gets_independently_of_partitions() {
         use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
 
         const FETCH_CONCURRENCY: usize = 24;
+        // Deliberately larger than the pool, and larger than the object count,
+        // so a pool that followed the partition count would park more than 24.
+        const SCAN_PARTITIONS: usize = 64;
         let faulty = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
         let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&faulty) as Arc<dyn ObjectStoreBackend>;
         let tenant = TenantId::new("gets-tenant");
@@ -3159,7 +3297,8 @@ mod tests {
                     true,
                     None,
                     ExecutorSettings {
-                        fetch_concurrency: FETCH_CONCURRENCY,
+                        max_concurrent_gets: FETCH_CONCURRENCY,
+                        scan_partitions: Some(SCAN_PARTITIONS),
                         ..ExecutorSettings::default()
                     },
                     false,
@@ -3176,7 +3315,7 @@ mod tests {
         .is_err()
         {
             panic!(
-                "fetch_concurrency GETs are in flight at once, not the compiled-in 16: held {} \
+                "max_concurrent_gets GETs are in flight at once, not the compiled-in 16: held {} \
                  of {} after 5 s; held keys: {:?}",
                 gate.held_count(),
                 FETCH_CONCURRENCY,
@@ -3191,7 +3330,8 @@ mod tests {
         assert_eq!(
             gate.held_count(),
             FETCH_CONCURRENCY,
-            "in-flight GETs are bounded by fetch_concurrency"
+            "in-flight GETs are bounded by max_concurrent_gets, not by the \
+             {SCAN_PARTITIONS} partitions the scan was planned at"
         );
         run.abort();
     }
@@ -3658,12 +3798,12 @@ mod tests {
     /// reverting `cold_executor` to `SqlConfig::default()` makes this fail rather
     /// than pass on a coincidental default (its companion test covers the
     /// default itself).
-    /// `--fetch-concurrency` must land on `EngineConfig::fetch_concurrency`
-    /// (the logs scan's partition count and in-flight fetch bound), not stop at
-    /// a parsed field; reverting `cold_executor` to `EngineConfig::default()`
-    /// fails this on the distinct value.
+    /// `--max-concurrent-gets` must land on `EngineConfig::fetch_concurrency`
+    /// (the in-flight GET permit pool), not stop at a parsed field; reverting
+    /// `cold_executor` to `EngineConfig::default()` fails this on the distinct
+    /// value.
     #[test]
-    fn cold_executor_threads_fetch_concurrency_override() {
+    fn cold_executor_threads_max_concurrent_gets_override() {
         let store = empty_store();
         let custom = DEFAULT_FETCH_CONCURRENCY * 4;
         assert_ne!(custom, DEFAULT_FETCH_CONCURRENCY);
@@ -3672,7 +3812,7 @@ mod tests {
             &[],
             None,
             ExecutorSettings {
-                fetch_concurrency: custom,
+                max_concurrent_gets: custom,
                 ..ExecutorSettings::default()
             },
         )
@@ -3684,7 +3824,7 @@ mod tests {
             &[],
             None,
             ExecutorSettings {
-                fetch_concurrency: 0,
+                max_concurrent_gets: 0,
                 ..ExecutorSettings::default()
             },
         )
@@ -3693,8 +3833,67 @@ mod tests {
         assert_eq!(
             executor.config().engine.fetch_concurrency,
             1,
-            "a zero is clamped to one partition, never a zero-partition plan"
+            "a zero is clamped to one permit, never a zero-permit pool"
         );
+    }
+
+    /// Issue #846: the two knobs reach two distinct fields of the one
+    /// `EngineConfig` the executor runs on, and neither perturbs the other.
+    /// `--scan-partitions` lands on `EngineConfig::scan_partitions` (and so on
+    /// the plan's `target_partitions` through `effective_scan_partitions`) while
+    /// `--max-concurrent-gets` lands on `EngineConfig::fetch_concurrency`; an
+    /// unset partition count leaves the pre-split coupling intact.
+    ///
+    /// Prove-the-test: drop the `scan_partitions` field from `cold_executor`'s
+    /// `EngineConfig` literal and the first assertion reads `None` against the
+    /// expected `Some(48)`; feed `with_max_concurrent_gets` from
+    /// `scan_partitions` instead and the GET-bound assertion reads 48 against
+    /// the expected 6.
+    #[test]
+    fn cold_executor_threads_the_two_knobs_to_distinct_engine_fields() {
+        let store = empty_store();
+        let executor = cold_executor(
+            &store,
+            &[],
+            None,
+            ExecutorSettings {
+                max_concurrent_gets: 6,
+                scan_partitions: Some(48),
+                ..ExecutorSettings::default()
+            },
+        )
+        .expect("build executor")
+        .executor;
+        let engine = &executor.config().engine;
+        assert_eq!(
+            engine.scan_partitions,
+            Some(48),
+            "--scan-partitions reaches EngineConfig::scan_partitions"
+        );
+        assert_eq!(
+            engine.fetch_concurrency, 6,
+            "--max-concurrent-gets reaches the permit pool and is untouched by the \
+             partition count"
+        );
+        assert_eq!(engine.effective_scan_partitions(), 48);
+
+        // Unset partition count: the pre-split coupling, so a bench run that
+        // names only the GET bound is byte-for-byte what it was before #846.
+        let executor = cold_executor(
+            &store,
+            &[],
+            None,
+            ExecutorSettings {
+                max_concurrent_gets: 6,
+                scan_partitions: None,
+                ..ExecutorSettings::default()
+            },
+        )
+        .expect("build executor")
+        .executor;
+        let engine = &executor.config().engine;
+        assert_eq!(engine.scan_partitions, None);
+        assert_eq!(engine.effective_scan_partitions(), 6);
     }
 
     /// `ExecutorSettings::default()` (an unspecified `--logs-request-cost-bytes`)
@@ -5334,7 +5533,8 @@ mod tests {
             cache_bytes: 0,
             deadline: Duration::from_secs(30),
             continue_on_error: false,
-            fetch_concurrency: DEFAULT_FETCH_CONCURRENCY,
+            max_concurrent_gets: DEFAULT_FETCH_CONCURRENCY,
+            scan_partitions: None,
             progress_jsonl: None,
             tenant_max_bytes: DEFAULT_TENANT_MAX_BYTES,
             parallel_final_aggregation: false,

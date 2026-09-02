@@ -207,7 +207,7 @@ pub struct LogsScanScalingConfig {
     /// #693 part 3's fast path, rather than of a threshold override (see the
     /// module doc).
     pub body_bytes: usize,
-    /// Swept `target_partitions` values (fed through `fetch_concurrency`).
+    /// Swept `target_partitions` values (fed through `scan_partitions`).
     pub target_partitions: Vec<usize>,
     /// Timed repetitions per combination; the first is the cold run whose
     /// accounting counters are reported.
@@ -672,7 +672,12 @@ async fn run_combo(
         max_samples: usize::MAX,
         max_bytes_scanned: ByteLimit::Unlimited,
         max_s3_requests: RequestLimit::Unlimited,
-        fetch_concurrency: target_partitions.max(1),
+        // The swept axis is the SCAN PARTITION count, so it travels on the
+        // partition knob (issue #846) and the GET bound stays at its default. The
+        // logs fetcher below is built without `with_max_concurrent_gets`, so the
+        // GET bound never reached this sweep in the first place; naming the knob
+        // that does is what makes a row here attributable to plan parallelism.
+        scan_partitions: Some(target_partitions.max(1)),
         ..EngineConfig::default()
     };
     let sql_config = SqlConfig {
@@ -1095,5 +1100,165 @@ async fn publish_dataset(
         } else {
             min_object_bytes
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ravel_object_store::memory::MemoryStore;
+
+    /// Objects in the fixture. The un-cached `LogsScanExec` caps its partition
+    /// count at the segment count (ADR-0102's un-cached amendment), so the
+    /// swept values below stay at or under this and the observed count is the
+    /// requested one rather than the cap.
+    const SEGMENTS: usize = 8;
+
+    /// Publish a small logs tenant into a fresh `MemoryStore`.
+    async fn fixture() -> (Arc<dyn ObjectStoreBackend>, TenantHash) {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = TenantId::new("scan-partition-knob");
+        let config = LogsScanScalingConfig {
+            store: Arc::clone(&store),
+            store_label: "memory".to_string(),
+            segments: SEGMENTS,
+            records_per_object: 4,
+            block_target_records: 1,
+            body_bytes: 64,
+            target_partitions: Vec::new(),
+            runs: 1,
+            deadline: Duration::from_secs(30),
+        };
+        publish_dataset(store.as_ref(), &tenant, &config).await;
+        (store, tenant.hash())
+    }
+
+    /// Plan [`QUERY`] at one `(GET bound, scan partition count)` pair and return
+    /// the `LogsScanExec` node's OBSERVED output partition count, read off the
+    /// real physical plan by [`scan_partition_count`]. Nothing here reports back
+    /// what was configured: the number returned is what the plan carries, so a
+    /// knob that never reached the scan shows up as a different number rather
+    /// than as an echo of the request.
+    async fn observed_scan_partitions(
+        store: &Arc<dyn ObjectStoreBackend>,
+        tenant_hash: TenantHash,
+        max_concurrent_gets: usize,
+        scan_partitions: Option<usize>,
+    ) -> usize {
+        let engine = EngineConfig {
+            max_series: usize::MAX,
+            max_samples: usize::MAX,
+            max_bytes_scanned: ByteLimit::Unlimited,
+            max_s3_requests: RequestLimit::Unlimited,
+            fetch_concurrency: max_concurrent_gets,
+            scan_partitions,
+            ..EngineConfig::default()
+        };
+        let catalog = Arc::new(
+            Catalog::new(Arc::clone(store), CatalogConfig::default()).expect("build catalog"),
+        );
+        let executor = SqlExecutor::new(
+            Arc::clone(&catalog),
+            SegmentFetcher::new(Arc::clone(store)),
+            LogSegmentFetcher::new(Arc::clone(store)),
+            SpanSegmentFetcher::new(Arc::clone(store)),
+            SqlConfig {
+                engine,
+                ..SqlConfig::default()
+            },
+            1 << 30,
+        );
+        let window = TimeRange {
+            start_ns: 0,
+            end_ns: NOW_NS,
+        };
+        let accounting = QueryAccounting::new();
+        let snapshot = catalog
+            .resolve(&tenant_hash, Signal::Logs, window, &[], NOW_NS)
+            .await
+            .expect("resolve snapshot");
+        let planned = executor
+            .plan_pinned(tenant_hash, snapshot, QUERY, &accounting, &[])
+            .await
+            .expect("plan statement");
+        let plan = planned
+            .create_physical_plan()
+            .await
+            .expect("build physical plan");
+        scan_partition_count(&plan)
+    }
+
+    /// Issue #846: the scan-partition knob moves the plan's partitioning while
+    /// the in-flight GET bound is held constant. Both plans below run at a GET
+    /// bound of 3; only the partition count differs, and the `LogsScanExec`
+    /// node's own output partition count follows it. That is what makes a sweep
+    /// of this axis attributable to plan parallelism rather than to store
+    /// concurrency.
+    ///
+    /// Prove-the-test: revert `ravel_sql::session::session_config` (line 526) to
+    /// `.with_target_partitions(config.engine.fetch_concurrency.max(1))` and
+    /// both plans partition at the pinned GET bound, so the first assertion
+    /// reads 3 against the expected 2.
+    #[tokio::test]
+    async fn scan_partition_knob_moves_plan_partitioning_with_the_get_bound_pinned() {
+        let (store, tenant_hash) = fixture().await;
+        const PINNED_GET_BOUND: usize = 3;
+
+        let narrow = observed_scan_partitions(&store, tenant_hash, PINNED_GET_BOUND, Some(2)).await;
+        assert_eq!(
+            narrow, 2,
+            "the scan node partitions at the requested count, not at the pinned GET bound"
+        );
+
+        let wide =
+            observed_scan_partitions(&store, tenant_hash, PINNED_GET_BOUND, Some(SEGMENTS)).await;
+        assert_eq!(
+            wide, SEGMENTS,
+            "raising only the partition knob widens the scan's fan-out"
+        );
+        assert_ne!(
+            narrow, wide,
+            "the partition knob is the axis that moved; the GET bound was {PINNED_GET_BOUND} \
+             on both plans"
+        );
+    }
+
+    /// Issue #846, the converse: moving the in-flight GET bound does NOT move
+    /// the plan's partitioning. Both plans below fix the partition count at 4
+    /// and differ only in the GET bound, one of them wider than the segment
+    /// count, and the scan node partitions at 4 either way.
+    ///
+    /// Prove-the-test: revert `ravel_sql::session::session_config` (line 526) to
+    /// `.with_target_partitions(config.engine.fetch_concurrency.max(1))` and the
+    /// pair below reads `(3, 8)` against the expected `(4, 4)`: the plan starts
+    /// tracking the GET bound, capped at the segment count.
+    #[tokio::test]
+    async fn the_get_bound_does_not_move_plan_partitioning() {
+        let (store, tenant_hash) = fixture().await;
+        const PINNED_PARTITIONS: usize = 4;
+
+        let at_small_pool =
+            observed_scan_partitions(&store, tenant_hash, 3, Some(PINNED_PARTITIONS)).await;
+        let at_large_pool =
+            observed_scan_partitions(&store, tenant_hash, 32, Some(PINNED_PARTITIONS)).await;
+        assert_eq!(
+            (at_small_pool, at_large_pool),
+            (PINNED_PARTITIONS, PINNED_PARTITIONS),
+            "the plan partitions at the partition knob whatever the GET bound is"
+        );
+    }
+
+    /// Issue #846: an unset partition count still resolves to the GET bound, so
+    /// a run that never names the new knob plans exactly as it did before the
+    /// split.
+    ///
+    /// Prove-the-test: change `EngineConfig::effective_scan_partitions` to
+    /// `self.scan_partitions.unwrap_or(DEFAULT_FETCH_CONCURRENCY)` and this
+    /// reads 8 (the compiled-in default) against the expected 5.
+    #[tokio::test]
+    async fn an_unset_partition_count_still_follows_the_get_bound() {
+        let (store, tenant_hash) = fixture().await;
+        let observed = observed_scan_partitions(&store, tenant_hash, 5, None).await;
+        assert_eq!(observed, 5);
     }
 }

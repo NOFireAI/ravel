@@ -37,8 +37,9 @@ warm, pre- versus post-compaction, one `--batch-rows` layout versus another.
 Two reports go side by side only when they tick the comparability checklist in
 "Reading a report against ClickBench" below. That is why every report carries
 its own provenance (backend, region/endpoint, host logical cores, dataset id,
-runs, `cache_bytes`, `deadline_secs`, `fetch_concurrency`). A latency table
-without its backend named will mislead the first person who compares two runs.
+runs, `cache_bytes`, `deadline_secs`, `max_concurrent_gets`, `scan_partitions`).
+A latency table without its backend named will mislead the first person who
+compares two runs.
 
 Prior to #677 the `--tenant` lane resolved shard 0 only, so any earlier
 multi-shard report understates the dataset (it measured, and reported an object
@@ -425,15 +426,24 @@ cargo run -p ravel-bench --features sql-latency --bin sql_latency_bench -- \
   so a partial table cannot pass for a complete one. Pair it with `--runs 1`
   and a generous `--deadline-secs` for the first pass over a new dataset, then
   choose the deadline for the `--runs 3` table from what that pass measured.
-- `--fetch-concurrency <N>` is the executor's `fetch_concurrency` (ADR-0088),
-  the same knob as `ravel-server --fetch-concurrency`: the logs scan's
-  partition count and the bound on in-flight segment fetches per query. Default
-  8, ravel-query's compiled-in value and what every earlier run used. A
-  full-scan statement's cold time is latency-bound at the object store (a few
-  hundred KB per GET, a few MB/s per connection), so it moves nearly linearly
-  with this up to the host's cores; the value is recorded in the report's
-  provenance as `fetch_concurrency`, and two tables at different values are
-  not comparable without it.
+- `--max-concurrent-gets <N>` is the executor's `EngineConfig::fetch_concurrency`
+  (issue #846), the same knob as `ravel-server --max-concurrent-gets`: the bound
+  on concurrent in-flight object-store GETs per query. Default 8, ravel-query's
+  compiled-in value and what every earlier run used. A full-scan statement's
+  cold time is latency-bound at the object store (a few hundred KB per GET, a
+  few MB/s per connection), so it moves nearly linearly with this; the value is
+  recorded in the report's provenance as `max_concurrent_gets`.
+- `--scan-partitions <N>` is the executor's `EngineConfig::scan_partitions`, the
+  same knob as `ravel-server --scan-partitions`: the SQL scan partition count
+  (`target_partitions`). This is the CPU-side lever, so it moves a hot run that
+  reads zero bytes, which the GET bound cannot. Unset, it couples to
+  `--max-concurrent-gets` (the pre-split behavior) and the report says so.
+  Recorded in the provenance as `scan_partitions`, absent when unset.
+- Before issue #846 one `--fetch-concurrency` set both of the above, so no sweep
+  taken with it was attributable to one or the other. It is kept as a deprecated
+  alias of `--max-concurrent-gets`, warns on stderr, and conflicts with it. Two
+  tables at different values of either knob are not comparable without both
+  values, which is why the report stamps both.
 - `--progress-jsonl <PATH>` appends one JSON line per finished statement to
   `PATH` as the run goes (`{"outcome":"measured",...}`, `"skipped"`,
   `"failed"`), flushed per line. The full report still goes to stdout at the
@@ -548,7 +558,7 @@ Dataset-level, independent of any one query:
 - **rows** and the **pre-/post-compaction layout label**.
 
 Provenance (backend, region, endpoint, host logical cores, source, dataset id,
-runs, `cache_bytes`, `deadline_secs`, `fetch_concurrency`,
+runs, `cache_bytes`, `deadline_secs`, `max_concurrent_gets`, `scan_partitions`,
 `parallel_final_aggregation_requested` (the local CLI value) and
 `parallel_final_aggregation_effective` (the value that governed execution:
 equal to the request for an in-process lane, null for a `--flight` run whose
@@ -574,8 +584,8 @@ Tick every line before putting two reports side by side.
 - Same instance type and the same instance. Issue #680 measured a 1.6x to 2x
   gap between two c6a.4xlarge boxes at identical settings, so a cross-box
   comparison carries the box id or it carries nothing.
-- Same `fetch_concurrency`, `cache_bytes`, `deadline_secs`, and per-query pool
-  ceiling. All four are in the provenance; compare on
+- Same `max_concurrent_gets`, `scan_partitions`, `cache_bytes`, `deadline_secs`,
+  and per-query pool ceiling. All five are in the provenance; compare on
   `sql_max_query_bytes_effective`, not on what was requested. Where that field
   is null (a `--flight` run), the ceiling that governed is the server's and is
   not recorded here, so the two runs are comparable on it only if you know both
@@ -647,7 +657,7 @@ cargo run -p ravel-server --features flight-sql --bin ravel-server -- \
   --listen-grpc 127.0.0.1:4317 \
   --tenant-token "$RAVEL_FLIGHT_TOKEN=clickbench" \
   --shards 4 \
-  --fetch-concurrency 8 \
+  --max-concurrent-gets 8 \
   --sql-max-query-bytes 1073741824 \
   --sql-tenant-max-bytes 2147483648 \
   --max-segments 1024 \
@@ -656,10 +666,10 @@ cargo run -p ravel-server --features flight-sql --bin ravel-server -- \
 
 The flags that must mirror the bench's, or the two tables are not comparable:
 
-- `--fetch-concurrency` is the same ADR-0088 knob as the bench's flag of the
-  same name (logs scan partitions and in-flight segment fetches per query). This
-  is the one that moves a cold full scan the most; set both sides to the same
-  value and record it.
+- `--max-concurrent-gets` and `--scan-partitions` are the same issue #846 knobs
+  as the bench's flags of the same names (the in-flight GET bound and the SQL
+  scan partition count). The GET bound is the one that moves a cold full scan the
+  most; set both sides to the same values and record them.
 - `--sql-max-query-bytes` is the per-query DataFusion memory-pool ceiling. A
   statement that fits the bench's budget and not the server's aborts on the
   server with `query memory budget exhausted` and lands in `failed`.
@@ -683,7 +693,7 @@ cargo run -p ravel-bench --features sql-latency,flight-lane --bin sql_latency_be
   --tenant clickbench --store s3 --flight 127.0.0.1:4317 \
   --corpus benchmarks/clickbench/hits.corpus.json \
   --runs 3 --compaction pre --window-hours 200000 \
-  --fetch-concurrency 8 --sql-max-query-bytes 1073741824
+  --max-concurrent-gets 8 --sql-max-query-bytes 1073741824
 ```
 
 - `--flight <host:port>` is the server's `--listen-grpc` address. It needs the

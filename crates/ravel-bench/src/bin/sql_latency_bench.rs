@@ -172,14 +172,33 @@ struct Args {
     /// the report, so a partial table is never mistaken for a complete one.
     #[arg(long, default_value_t = false)]
     continue_on_error: bool,
-    /// The executor's `fetch_concurrency` (ADR-0088): logs scan partition count
-    /// and the bound on in-flight segment fetches per query, the same knob as
-    /// `ravel-server --fetch-concurrency`. A full-scan statement's cold time is
-    /// latency-bound at the object store, so it moves nearly linearly with
-    /// this. Defaults to ravel-query's compiled-in value (8), the number every
-    /// earlier run used; recorded in the report's provenance.
-    #[arg(long, default_value_t = ravel_query::DEFAULT_FETCH_CONCURRENCY)]
-    fetch_concurrency: usize,
+    /// The executor's bound on concurrent in-flight object-store GETs per query
+    /// (issue #846): `EngineConfig::fetch_concurrency` and the logs fetcher's
+    /// permit pool, the same knob as `ravel-server --max-concurrent-gets`. A
+    /// full-scan statement's cold time is latency-bound at the object store, so
+    /// it moves nearly linearly with this. It does NOT set the scan partition
+    /// count; that is `--scan-partitions`. Unset defaults to ravel-query's
+    /// compiled-in value (8), the number every earlier run used; recorded in the
+    /// report's provenance.
+    #[arg(long, value_name = "N", conflicts_with = "fetch_concurrency")]
+    max_concurrent_gets: Option<usize>,
+    /// Deprecated alias of `--max-concurrent-gets` (issue #846). Before the
+    /// split this single flag set BOTH the in-flight GET bound and the scan
+    /// partition count, so no sweep using it was attributable to one or the
+    /// other; it now sets only the GET bound it dominantly governed, prints a
+    /// deprecation warning on stderr, and conflicts with
+    /// `--max-concurrent-gets`.
+    #[arg(long, value_name = "N")]
+    fetch_concurrency: Option<usize>,
+    /// The executor's SQL scan partition count (`target_partitions`, issue
+    /// #846), the same knob as `ravel-server --scan-partitions`. This is the
+    /// CPU-side lever: it fans the plan across more scan streams without
+    /// changing how many GETs are in flight, so a hot run that reads zero bytes
+    /// still moves with it. Unset leaves it coupled to `--max-concurrent-gets`,
+    /// the pre-split behavior. Recorded in the report's provenance next to the
+    /// GET bound, so a sweep of either names which resource it moved.
+    #[arg(long, value_name = "N")]
+    scan_partitions: Option<usize>,
     /// The logs per-request byte budget (ADR-0904), the same knob as
     /// `ravel-server --logs-request-cost-bytes`: the byte cost the logs planner
     /// charges each object against when deciding whether a scan routes through
@@ -252,6 +271,24 @@ struct Args {
     /// command line lands in the shell history and in `ps`.
     #[arg(long = "flight-token", value_name = "TOKEN", requires = "flight")]
     flight_token: Option<String>,
+}
+
+impl Args {
+    /// The effective in-flight GET bound (issue #846): `--max-concurrent-gets`
+    /// when set, otherwise the deprecated `--fetch-concurrency` alias, otherwise
+    /// ravel-query's compiled-in default. clap rejects setting both flags, so at
+    /// most one of the two `Option`s is `Some`.
+    fn resolve_max_concurrent_gets(&self) -> usize {
+        self.max_concurrent_gets
+            .or(self.fetch_concurrency)
+            .unwrap_or(ravel_query::DEFAULT_FETCH_CONCURRENCY)
+    }
+
+    /// True when the deprecated `--fetch-concurrency` alias supplied the GET
+    /// bound, so the run can say so on stderr before it measures anything.
+    fn fetch_concurrency_alias_used(&self) -> bool {
+        self.fetch_concurrency.is_some()
+    }
 }
 
 #[derive(Copy, Clone, Debug, clap::ValueEnum)]
@@ -342,6 +379,16 @@ async fn run(args: &Args) -> Result<SqlLatencyReport, ravel_bench::sql_latency::
         )
         .map_err(ravel_bench::sql_latency::Error::from)?;
     }
+    // Before the corpus load, so the warning is the first thing on stderr rather
+    // than buried under a multi-minute resolve.
+    if args.fetch_concurrency_alias_used() {
+        eprintln!(
+            "sql_latency_bench: --fetch-concurrency is deprecated (issue #846): it now sets only \
+             the in-flight GET bound ({}) it dominantly governed. Use --max-concurrent-gets for \
+             the permit pool and --scan-partitions for the SQL scan partition count.",
+            args.resolve_max_concurrent_gets()
+        );
+    }
     let entries = match &args.corpus {
         Some(path) => load_external_corpus(path)?,
         None => checked_default_corpus()?,
@@ -387,7 +434,8 @@ async fn run(args: &Args) -> Result<SqlLatencyReport, ravel_bench::sql_latency::
                 cache_bytes: args.cache_bytes,
                 deadline: Duration::from_secs(args.deadline_secs),
                 continue_on_error: args.continue_on_error,
-                fetch_concurrency: args.fetch_concurrency,
+                max_concurrent_gets: args.resolve_max_concurrent_gets(),
+                scan_partitions: args.scan_partitions,
                 logs_request_cost_bytes: args.logs_request_cost_bytes,
                 progress_jsonl: args.progress_jsonl.clone(),
                 tenant_max_bytes: args.sql_tenant_max_bytes,
@@ -428,7 +476,8 @@ async fn run(args: &Args) -> Result<SqlLatencyReport, ravel_bench::sql_latency::
                 cache_bytes: args.cache_bytes,
                 deadline: Duration::from_secs(args.deadline_secs),
                 continue_on_error: args.continue_on_error,
-                fetch_concurrency: args.fetch_concurrency,
+                max_concurrent_gets: args.resolve_max_concurrent_gets(),
+                scan_partitions: args.scan_partitions,
                 logs_request_cost_bytes: args.logs_request_cost_bytes,
                 progress_jsonl: args.progress_jsonl.clone(),
                 tenant_max_bytes: args.sql_tenant_max_bytes,
@@ -511,7 +560,25 @@ fn provenance_header(p: &Provenance, d: &DatasetInfo) -> String {
         "  deadline   : {} s per statement\n",
         p.deadline_secs
     ));
-    out.push_str(&format!("  fetch conc : {}\n", p.fetch_concurrency));
+    // Both knobs, always, and each named by the resource it bounds (issue #846).
+    // A pass stamped with one number cannot say whether a delta came from plan
+    // parallelism or from store concurrency, which is the whole reason the two
+    // were split.
+    out.push_str(&format!(
+        "  get bound  : {} concurrent in-flight object-store GETs\n",
+        p.max_concurrent_gets
+    ));
+    out.push_str(&format!(
+        "  scan parts : {}{}\n",
+        p.effective_scan_partitions(),
+        match p.scan_partitions {
+            Some(_) => "",
+            // Named, not omitted: a reader has to be able to tell an explicit
+            // partition count that happens to equal the GET bound from one that
+            // was never set and merely inherited it.
+            None => " (unset, coupled to the get bound)",
+        }
+    ));
     out.push_str(&format!(
         "  req cost   : requested={} bytes  effective={}\n",
         p.logs_request_cost_bytes_requested,
@@ -837,7 +904,8 @@ mod tests {
             runs: 3,
             cache_bytes: 0,
             deadline_secs: 30,
-            fetch_concurrency: ravel_query::DEFAULT_FETCH_CONCURRENCY,
+            max_concurrent_gets: ravel_query::DEFAULT_FETCH_CONCURRENCY,
+            scan_partitions: None,
             logs_request_cost_bytes_requested: cost,
             logs_request_cost_bytes_effective: Some(cost),
             sql_max_query_bytes_requested: DEFAULT_MAX_QUERY_BYTES,
