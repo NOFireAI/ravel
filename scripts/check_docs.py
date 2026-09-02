@@ -47,6 +47,14 @@ class CheckError(Exception):
 # --------------------------------------------------------------------------
 
 
+# The pages a test renders from a clap command definition. Every other page
+# under docs/reference/ is written by hand and held to the user-page rules.
+GENERATED_PAGES = frozenset({
+    "docs/reference/ravel-server-flags.md",
+    "docs/reference/ravel-cli-flags.md",
+})
+
+
 def classify(rel):
     """Return the scope of a repo-relative (posix) markdown path, or None.
 
@@ -62,14 +70,17 @@ def classify(rel):
         return "user"
     if rel.startswith("docs/guides/") and rel.endswith(".md"):
         return "user"
-    if rel.startswith("docs/reference/") and rel.endswith(".md"):
-        # Generated from the code, so its prose is the code's prose. The
-        # citation rules would demand editing doc comments to satisfy a
-        # documentation gate, which is backwards: the page would drift from
-        # the definition it is generated from at the next regeneration.
-        # Everything else still applies, including provenance: a source path
-        # or a commit hash has no business here either.
+    if rel in GENERATED_PAGES:
+        # Rendered from the clap definitions, so its prose is the code's
+        # prose. The citation rules would demand editing doc comments to
+        # satisfy a documentation gate, which is backwards: the page would
+        # drift from the definition it is generated from at the next
+        # regeneration. Everything else still applies, including provenance:
+        # a source path or a commit hash has no business here either.
         return "generated"
+    if rel.startswith("docs/reference/") and rel.endswith(".md"):
+        # A hand-written reference page is read the way a guide is read.
+        return "user"
     if rel.startswith("docs/adrs/") and rel.endswith(".md"):
         return "history"
     if rel.startswith("docs/internal/") and rel.endswith(".md"):
