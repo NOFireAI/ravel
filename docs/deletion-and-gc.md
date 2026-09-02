@@ -267,9 +267,10 @@ window would still call a Hit.
   also names them, so an input only a loser names is left in place, because
   that raw object is where a query still reads those rows from. Deleting it on
   the strength of the losing record alone would turn duplicated rows into
-  missing rows. The losing record's own parts are nothing but unreferenced
-  objects once the record is gone, and the unreferenced-part rule collects them
-  on age as usual.
+  missing rows. The losing record's own parts are served from nowhere, but
+  they stay referenced for as long as the losing record exists, and no rule
+  removes a losing record today: the sweep reclaims neither, so an overlap
+  leaves the loser's parts in place as a bounded storage cost.
 - **A rewrite record outlives every input it superseded.** A whole
   supersession chain, from the live record back to the raw inputs its oldest
   generation superseded, is one indivisible delete unit: the HEAD gate decides
