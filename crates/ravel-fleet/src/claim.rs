@@ -493,7 +493,12 @@ pub fn jitter_ms(work_id: &WorkId, process_id: &Uuid, lease_ms: i64, cfg: &Claim
     head.copy_from_slice(&digest[..8]);
     let h = u64::from_le_bytes(head);
 
-    let span_ms = (lease_ms.max(0) as f64 * cfg.jitter_span_fraction).max(0.0) as u64;
+    // The span is clamped to the effective lease itself: jitter exists to
+    // spread retries around one expiry window, so a public, unbounded
+    // `jitter_span_fraction` above 1.0 must not stretch a reschedule past a
+    // second lease (or, at absurd values, saturate it to the end of time).
+    let lease = lease_ms.max(0);
+    let span_ms = ((lease as f64 * cfg.jitter_span_fraction).max(0.0) as u64).min(lease as u64);
     if span_ms == 0 {
         return 0;
     }
@@ -1271,6 +1276,20 @@ mod tests {
         let other =
             WorkIdentity::new(TenantId::new("acme").hash(), Signal::Logs, 4, 480_000).work_id();
         assert_ne!(jitter_ms(&other, &a, cfg.lease_ms(), &cfg), first);
+
+        // The public span fraction is unbounded; the span itself is not. An
+        // absurd fraction draws inside one lease, never to the end of time.
+        let absurd = ClaimConfig {
+            jitter_span_fraction: 1.0e15,
+            ..ClaimConfig::default()
+        };
+        for pid in [a, b] {
+            let j = jitter_ms(&work, &pid, absurd.lease_ms(), &absurd);
+            assert!(
+                (0..=absurd.lease_ms()).contains(&j),
+                "an absurd span fraction stays inside one lease: {j}"
+            );
+        }
     }
 
     /// A claim that decodes as protobuf but carries malformed UUID identity
