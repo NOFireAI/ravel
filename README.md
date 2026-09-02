@@ -72,9 +72,9 @@ management service (SSE-KMS), legal hold, and admission limits.
 - Exemplars are stored from the OpenTelemetry Protocol (OTLP) only. Remote Write
   and OTAP decode exemplars and then discard them.
 - Distributed read fan-out is off unless `--distributed-query` and
-  `--fragment-key-file` are both given, and the lane it drives is metrics only.
-  The SQL distributed scan is not wired into a running server's coordinator and
-  worker paths.
+  `--fragment-key-file` are both given. The PromQL lane is in the published
+  image; the SQL lane exists only in a `flight-sql` build, which no published
+  image is.
 
 **Who should wait.** If your dashboards range over months of high-cardinality
 metrics, the missing downsampled storage will cost you on every panel. If your
