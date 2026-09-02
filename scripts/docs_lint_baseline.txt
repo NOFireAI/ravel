@@ -35,19 +35,6 @@ CHANGELOG.md	TRACKER	ADR-0774
 CHANGELOG.md	TRACKER	ADR-0807
 CHANGELOG.md	TRACKER	ADR-0815
 CHANGELOG.md	TRACKER	ADR-0850
-README.md	TERM	ingest tier
-README.md	TERM	ingester
-README.md	TRACKER	#118
-README.md	TRACKER	ADR-0037
-README.md	TRACKER	ADR-0046
-README.md	TRACKER	ADR-0046
-README.md	TRACKER	ADR-0072
-README.md	TRACKER	ADR-0085
-README.md	TRACKER	ADR-0106
-README.md	TRACKER	docs/adrs/
-README.md	TRACKER	docs/adrs/0037-container-image-ci-registry.md
-README.md	TRACKER	docs/adrs/0068-deterministic-simulation-harness.md
-README.md	TRACKER	github.com/NOFireAI/ravel/issues/118
 docs/README.md	TERM	robust
 docs/README.md	TRACKER	ADR-0011
 docs/README.md	TRACKER	ADR-0027
@@ -345,12 +332,6 @@ docs/guides/distributed-query.md	TRACKER	ADR-0071
 docs/guides/distributed-query.md	TRACKER	ADR-0071
 docs/guides/distributed-query.md	TRACKER	ADR-0071
 docs/guides/distributed-query.md	TRACKER	ADR-0071
-docs/guides/getting-started.md	ANCHOR	../catalog-and-mvcc.md#key-layout
-docs/guides/getting-started.md	ANCHOR	ingest.md#event-time-skew
-docs/guides/getting-started.md	SUPERLATIVE	em-dash
-docs/guides/getting-started.md	SUPERLATIVE	em-dash
-docs/guides/getting-started.md	SUPERLATIVE	em-dash
-docs/guides/getting-started.md	TRACKER	ADR-0050
 docs/guides/ingest-affinity.md	SUPERLATIVE	em-dash
 docs/guides/ingest-affinity.md	SUPERLATIVE	em-dash
 docs/guides/ingest-affinity.md	SUPERLATIVE	em-dash
