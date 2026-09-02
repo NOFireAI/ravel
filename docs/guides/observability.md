@@ -144,6 +144,7 @@ Labels: `mode` and `signal`. The `signal` label carries `metrics`, `logs`, or
 | `ravel_ingest_shard_deaths_total` | Distinct shard actors observed dead by the router. |
 | `ravel_ingest_exemplars_written_total` | Exemplars stored on flushed objects. |
 | `ravel_ingest_exemplars_dropped_total` | Exemplars discarded by the per-series admission cap. |
+| `ravel_ingest_stale_provisioning_flushes_total` | Flushes failed closed because the router's cached shard-generation view was older than the refresh interval. A rising figure means the provisioning re-read is failing for longer than the grace window allows. |
 | `ravel_ingest_grace_extended_stale_flushes_total` | Flushes routed on a last-known-good provisioning view inside the bounded grace window. A rising figure means the store is slow to serve the provisioning re-read and this router is running degraded-but-available. |
 | `ravel_ingest_flushes_by_age_adaptive_total` | Flushes opened on the adaptive-delay corridor age trigger rather than the fixed max_flush_delay. A rising figure means the adaptive corridor, not the fixed delay, is driving age flushes. |
 | `ravel_ingest_in_flight_flushes` | Flush tasks spawned but not yet acked, summed across shards (a gauge). A sustained high value means flushes are not keeping up with the load. |
