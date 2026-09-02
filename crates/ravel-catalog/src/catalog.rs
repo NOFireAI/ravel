@@ -2148,6 +2148,24 @@ impl Catalog {
                 .await?;
             input_set_hashes.insert(record.input_set_hash.clone());
             newest_record_created_ns = newest_record_created_ns.max(record.created_unix_ns);
+            compaction_records.push((ckey.clone(), record));
+        }
+
+        // Overlapping input sets in one bucket (issue #1070): query-time dedup
+        // rescues only metrics, so serving both overlapping records' parts
+        // returns logs and spans rows twice. Pick one authoritative record per
+        // overlap component; its losers' parts are skipped below and only the
+        // WINNING records' inputs join `excluded`, so a loser input no winner
+        // names falls through to the raw-L0 pass. Disjoint records are not in
+        // conflict and both stay (see
+        // [`select_authoritative_compaction_records`] for the coverage
+        // argument).
+        let losing_compaction_records =
+            select_authoritative_compaction_records(&compaction_records);
+        for (ckey, record) in &compaction_records {
+            if losing_compaction_records.contains(ckey) {
+                continue;
+            }
             for input in &record.inputs {
                 excluded.insert((
                     input.writer_id.clone(),
@@ -2155,7 +2173,6 @@ impl Catalog {
                     input.writer_seq,
                 ));
             }
-            compaction_records.push((ckey.clone(), record));
         }
 
         // Load every rewrite record (ADR-0064 decision 3). Same-bucket, key
@@ -2206,7 +2223,7 @@ impl Catalog {
         // (event-bound filtered). A record whose whole output a live rewrite
         // superseded is skipped -- its parts would resurrect erased records.
         for (ckey, record) in &compaction_records {
-            if superseded_records.contains(ckey) {
+            if superseded_records.contains(ckey) || losing_compaction_records.contains(ckey) {
                 continue;
             }
             for part in &record.parts {
@@ -2246,8 +2263,10 @@ impl Catalog {
         }
 
         // Two compaction records with different input_set_hash in one bucket:
-        // both parts sets are already included above (harmless overlap); alarm
-        // loudly (docs/catalog-and-mvcc.md step 3, §3.6 row 11).
+        // disjoint sets both serve above (harmless); overlapping sets resolved
+        // to one authoritative record above (issue #1070). Either way this is
+        // an interlock anomaly worth alarming on loudly (docs/catalog-and-mvcc.md
+        // step 3, §3.6 row 11).
         if input_set_hashes.len() > 1 {
             self.compaction_input_set_conflicts
                 .fetch_add(1, Ordering::Relaxed);
@@ -3298,6 +3317,108 @@ fn build_rewrite_l1_segment_ref(
         // or future writer until the recompute path lands with its own tests.
         declared_column_stats: DeclaredColumnStats::default(),
     })
+}
+
+/// Select one authoritative compaction record per *overlap component* of a
+/// bucket, returning the keys of the records whose output parts must be
+/// IGNORED (the losers). Shared by snapshot resolution (`process_bucket`) and
+/// the index fold (`classify_bucket`) so a live resolve and a folded snapshot
+/// derive identical bucket state.
+///
+/// Two compaction records are in conflict when their input sets overlap (share
+/// at least one L0 input identity). Query-time dedup by `(series_id, ts)`
+/// collapses such an overlap for metrics, but logs and spans have no
+/// query-time dedup, so serving both records' parts returns the overlapping
+/// rows twice. Records connected transitively by overlap form one component;
+/// within each component of two or more records exactly one stays
+/// authoritative and the rest are losers. A record overlapping no other
+/// (a singleton component) is not in conflict and stays authoritative, so
+/// disjoint records keep today's behaviour (both served).
+///
+/// Tie-break: the authoritative record is the one with the lexicographically
+/// smallest `input_set_hash`, its key string breaking the impossible
+/// exact-hash tie. `input_set_hash` is a collision-resistant digest of the
+/// record's input identity set, so this is a stable total order every replica
+/// computes identically from the record bytes alone, with no dependence on
+/// wall-clock, listing order, or which compactor won the race.
+///
+/// Coverage (why dropping a loser's parts loses no data): a loser `L` shares a
+/// component with its winner `W`. Each of `L`'s inputs is either also an input
+/// of `W` (served inside `W`'s parts) or named by no authoritative record in
+/// the bucket (served as a raw L0 segment by the caller's unlisted-L0 pass) --
+/// it cannot be an input of another component's winner, since a shared input
+/// would have merged the two components. So every L0 input of the bucket is
+/// served exactly once: inside exactly one authoritative record's parts, or as
+/// one raw L0 segment. The one residual exposure is a loser input already
+/// swept behind its now-ignored compaction record; publish-time refusal in
+/// ravel-maintain (out of scope here) closes that window durably.
+pub(crate) fn select_authoritative_compaction_records(
+    records: &[(String, Arc<CompactionRecord>)],
+) -> HashSet<String> {
+    if records.len() < 2 {
+        return HashSet::new();
+    }
+
+    // Union-find over record indices: union two records whenever they name the
+    // same input identity, so a component is a maximal set of records linked by
+    // input-set overlap.
+    let mut parent: Vec<usize> = (0..records.len()).collect();
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+    let mut owner: HashMap<(String, u64, u64), usize> = HashMap::new();
+    for (i, (_key, record)) in records.iter().enumerate() {
+        for input in &record.inputs {
+            let identity = (
+                input.writer_id.clone(),
+                input.writer_epoch,
+                input.writer_seq,
+            );
+            if let Some(&j) = owner.get(&identity) {
+                let rj = find(&mut parent, j);
+                let ri = find(&mut parent, i);
+                if ri != rj {
+                    parent[ri] = rj;
+                }
+            } else {
+                owner.insert(identity, i);
+            }
+        }
+    }
+
+    // Group record indices by component root.
+    let mut components: HashMap<usize, Vec<usize>> = HashMap::new();
+    for i in 0..records.len() {
+        let root = find(&mut parent, i);
+        components.entry(root).or_default().push(i);
+    }
+
+    // Within each multi-record component keep the smallest-`input_set_hash`
+    // record; every other record in that component is a loser.
+    let mut losing: HashSet<String> = HashSet::new();
+    for members in components.values() {
+        if members.len() < 2 {
+            continue;
+        }
+        if let Some(&winner) = members.iter().min_by(|&&a, &&b| {
+            records[a]
+                .1
+                .input_set_hash
+                .cmp(&records[b].1.input_set_hash)
+                .then_with(|| records[a].0.cmp(&records[b].0))
+        }) {
+            for &m in members {
+                if m != winner {
+                    losing.insert(records[m].0.clone());
+                }
+            }
+        }
+    }
+    losing
 }
 
 /// Resolve one rewrite record's supersession into the two unified exclusion
