@@ -632,6 +632,18 @@ pub struct IngestPipelineSnapshot {
     /// for this family rather than a zero that would read as "the cap never
     /// engaged".
     pub exemplars: Option<ExemplarCounters>,
+    /// Flushes routed on a last-known-good provisioning view inside the bounded
+    /// grace window rather than failed closed (ADR-0052). Carried for every
+    /// signal, the same as `stale_provisioning_flushes`: the metrics, logs, and
+    /// spans ingest snapshots all expose it, and the two form the
+    /// degraded-vs-failed pair for a stale provisioning view.
+    pub grace_extended_stale_flushes: u64,
+    /// The two metrics-pipeline-only flush figures ADR-0067 added: the
+    /// adaptive-delay age-trigger counter and the in-flight-flush gauge.
+    /// `Some` only for the metrics pipeline; the log and span ingest snapshots
+    /// expose neither, so logs and spans render no sample for either family,
+    /// the same structural-absence convention `exemplars` uses.
+    pub adaptive_flushes: Option<AdaptiveFlushCounters>,
 }
 
 /// Exemplar admission counters, mirroring
@@ -643,6 +655,23 @@ pub struct IngestPipelineSnapshot {
 pub struct ExemplarCounters {
     pub written_total: u64,
     pub dropped_total: u64,
+}
+
+/// The two metrics-pipeline-only flush figures from ADR-0067, mirroring
+/// [`ravel_ingest::IngestMetricsSnapshot`]'s `flushes_by_age_adaptive` and
+/// `in_flight_flushes_total`. Grouped in one struct for the same reason
+/// [`ExemplarCounters`] is: they are always present or always absent together
+/// (both exist only on the metrics pipeline), which `Option<Self>` says once
+/// instead of twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AdaptiveFlushCounters {
+    /// Monotonic total: flushes opened because the tenant buffer aged past a
+    /// per-(shard, tenant) threshold computed within the adaptive-delay
+    /// corridor rather than the fixed `max_flush_delay` (ADR-0067 decision 3).
+    pub flushes_by_age_adaptive: u64,
+    /// A gauge, not a counter: the sum across shards of flush tasks spawned but
+    /// not yet acked at snapshot time (ADR-0067 decision 2 pipelining).
+    pub in_flight_flushes_total: u64,
 }
 
 /// Metric metadata sink counters (ADR-0085 decision 1), mirroring
@@ -708,6 +737,11 @@ impl IngestPipelineSnapshot {
                 written_total: snapshot.exemplars_written_total,
                 dropped_total: snapshot.exemplars_dropped_total,
             }),
+            grace_extended_stale_flushes: snapshot.grace_extended_stale_flushes,
+            adaptive_flushes: Some(AdaptiveFlushCounters {
+                flushes_by_age_adaptive: snapshot.flushes_by_age_adaptive,
+                in_flight_flushes_total: snapshot.in_flight_flushes_total,
+            }),
         }
     }
 
@@ -739,6 +773,8 @@ impl IngestPipelineSnapshot {
             }),
             metadata_sink: None,
             exemplars: None,
+            grace_extended_stale_flushes: snapshot.grace_extended_stale_flushes,
+            adaptive_flushes: None,
         }
     }
 
@@ -761,6 +797,8 @@ impl IngestPipelineSnapshot {
             postings: None,
             metadata_sink: None,
             exemplars: None,
+            grace_extended_stale_flushes: snapshot.grace_extended_stale_flushes,
+            adaptive_flushes: None,
         }
     }
 }
@@ -972,6 +1010,26 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
         );
     }
 
+    write_header(
+        out,
+        "ravel_ingest_grace_extended_stale_flushes_total",
+        "Flushes routed on a last-known-good provisioning view inside the bounded grace window \
+         because the provisioning re-read could not complete but the cached view's validity \
+         horizon had not been crossed (ADR-0052), by signal. Degraded rather than failed, and \
+         distinct from ravel_ingest_stale_provisioning_flushes_total, which counts a flush that \
+         failed closed: a sustained rise means the store is slow and this router is \
+         degraded-but-available.",
+        "counter",
+    );
+    for pipeline in pipelines {
+        write_sample(
+            out,
+            "ravel_ingest_grace_extended_stale_flushes_total",
+            &labels(mode, pipeline.signal),
+            pipeline.grace_extended_stale_flushes,
+        );
+    }
+
     // Metric metadata sink counters (ADR-0085 decision 1): only the metrics
     // pipeline builds this record, so `metadata_sink` is `Some` only there
     // (same structural-absence convention as `collisions` above), and the
@@ -1084,6 +1142,56 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
                 "ravel_ingest_exemplars_dropped_total",
                 &labels(mode, pipeline.signal),
                 counters.dropped_total,
+            );
+        }
+    }
+
+    // The adaptive-delay age trigger and the in-flight-flush gauge are
+    // metrics-pipeline-only (ADR-0067), so `adaptive_flushes` is `Some` only
+    // there (the same structural-absence convention as `exemplars` above), and
+    // both families are empty in a logs- or spans-only process.
+    let with_adaptive: Vec<_> = pipelines
+        .iter()
+        .filter_map(|pipeline| {
+            pipeline
+                .adaptive_flushes
+                .map(|counters| (pipeline, counters))
+        })
+        .collect();
+    if !with_adaptive.is_empty() {
+        write_header(
+            out,
+            "ravel_ingest_flushes_by_age_adaptive_total",
+            "Flushes opened because the tenant buffer aged past a per-(shard, tenant) threshold \
+             computed within the adaptive-delay corridor rather than the fixed max_flush_delay \
+             (ADR-0067 decision 3), by signal. Zero unless adaptive delay is enabled; a rise \
+             means the corridor, not the fixed delay, is driving age flushes.",
+            "counter",
+        );
+        for (pipeline, counters) in &with_adaptive {
+            write_sample(
+                out,
+                "ravel_ingest_flushes_by_age_adaptive_total",
+                &labels(mode, pipeline.signal),
+                counters.flushes_by_age_adaptive,
+            );
+        }
+
+        write_header(
+            out,
+            "ravel_ingest_in_flight_flushes",
+            "Flush tasks spawned but not yet acked, summed across shards at scrape time \
+             (ADR-0067 decision 2 pipelining), by signal. A gauge: it rises as flushes start and \
+             falls as they finish, so a sustained high value means flushes are not keeping up \
+             with the load.",
+            "gauge",
+        );
+        for (pipeline, counters) in &with_adaptive {
+            write_sample(
+                out,
+                "ravel_ingest_in_flight_flushes",
+                &labels(mode, pipeline.signal),
+                counters.in_flight_flushes_total,
             );
         }
     }
@@ -4406,6 +4514,168 @@ mod tests {
                 "ravel_ingest_exemplars_dropped_total{mode=\"gateway\",signal=\"metrics\"} 3"
             ),
             "conversion must carry the dropped count, not zero:\n{body}"
+        );
+    }
+
+    /// The three remaining flush figures render one sample each with the
+    /// family's `{mode, signal}` labels and the right TYPE. `grace_extended` is
+    /// carried for every signal (all three ingest snapshots expose it), so logs
+    /// and spans render it too; the two metrics-only ADR-0067 figures render no
+    /// logs or spans sample. Built by setting the fields directly, so this pins
+    /// the rendering alone; the conversion is pinned by
+    /// `flush_counters_survive_conversion_from_ingest_snapshot` below.
+    #[test]
+    fn flush_counters_render_under_the_ingest_family() {
+        let mut metrics = IngestPipelineSnapshot::from_metrics(IngestMetricsSnapshot::default());
+        metrics.grace_extended_stale_flushes = 3;
+        metrics.adaptive_flushes = Some(AdaptiveFlushCounters {
+            flushes_by_age_adaptive: 7,
+            in_flight_flushes_total: 2,
+        });
+        let ingest = vec![
+            metrics,
+            IngestPipelineSnapshot::from_log_metrics(LogIngestMetricsSnapshot::default()),
+            IngestPipelineSnapshot::from_span_metrics(SpanIngestMetricsSnapshot::default()),
+        ];
+        let body = render(
+            Mode::Gateway,
+            &StoreMetricsSnapshot::default(),
+            &ingest,
+            &CatalogCountersSnapshot::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &AdmissionCountersSnapshot::default(),
+            &[],
+            0,
+            IngestBufferBudgetSnapshot::default(),
+            None,
+            None,
+            &[],
+            None,
+        );
+
+        let adaptive =
+            "ravel_ingest_flushes_by_age_adaptive_total{mode=\"gateway\",signal=\"metrics\"} 7";
+        let grace = "ravel_ingest_grace_extended_stale_flushes_total{mode=\"gateway\",signal=\"metrics\"} 3";
+        let in_flight = "ravel_ingest_in_flight_flushes{mode=\"gateway\",signal=\"metrics\"} 2";
+        assert_eq!(
+            body.matches(adaptive).count(),
+            1,
+            "adaptive-age counter must render exactly once:\n{body}"
+        );
+        assert_eq!(
+            body.matches(grace).count(),
+            1,
+            "grace-extended counter must render exactly once:\n{body}"
+        );
+        assert_eq!(
+            body.matches(in_flight).count(),
+            1,
+            "in-flight gauge must render exactly once:\n{body}"
+        );
+        assert!(
+            body.contains("# TYPE ravel_ingest_flushes_by_age_adaptive_total counter"),
+            "adaptive-age figure must be a counter:\n{body}"
+        );
+        assert!(
+            body.contains("# TYPE ravel_ingest_grace_extended_stale_flushes_total counter"),
+            "grace-extended figure must be a counter:\n{body}"
+        );
+        assert!(
+            body.contains("# TYPE ravel_ingest_in_flight_flushes gauge"),
+            "in-flight figure must be a gauge:\n{body}"
+        );
+        // `grace_extended` is carried for every signal, so logs render it (at
+        // zero here), proving it is not gated to the metrics pipeline.
+        assert!(
+            body.contains(
+                "ravel_ingest_grace_extended_stale_flushes_total{mode=\"gateway\",signal=\"logs\"} 0"
+            ),
+            "logs pipeline must render the grace-extended counter:\n{body}"
+        );
+        // The two ADR-0067 figures are metrics-only, so logs and spans render
+        // neither.
+        assert!(
+            !body.contains(
+                "ravel_ingest_flushes_by_age_adaptive_total{mode=\"gateway\",signal=\"logs\""
+            ),
+            "logs pipeline must render no adaptive-age sample:\n{body}"
+        );
+        assert!(
+            !body.contains(
+                "ravel_ingest_flushes_by_age_adaptive_total{mode=\"gateway\",signal=\"spans\""
+            ),
+            "spans pipeline must render no adaptive-age sample:\n{body}"
+        );
+        assert!(
+            !body.contains("ravel_ingest_in_flight_flushes{mode=\"gateway\",signal=\"logs\""),
+            "logs pipeline must render no in-flight gauge sample:\n{body}"
+        );
+        assert!(
+            !body.contains("ravel_ingest_in_flight_flushes{mode=\"gateway\",signal=\"spans\""),
+            "spans pipeline must render no in-flight gauge sample:\n{body}"
+        );
+    }
+
+    /// The values travel from the ingest crate's counters to the rendered text:
+    /// a constructor that drops any of the three fields while the source
+    /// snapshot carries them fails here, not in the render test above.
+    #[test]
+    fn flush_counters_survive_conversion_from_ingest_snapshot() {
+        let ingest = vec![IngestPipelineSnapshot::from_metrics(
+            IngestMetricsSnapshot {
+                flushes_by_age_adaptive: 7,
+                grace_extended_stale_flushes: 3,
+                in_flight_flushes_total: 2,
+                ..Default::default()
+            },
+        )];
+        let body = render(
+            Mode::Gateway,
+            &StoreMetricsSnapshot::default(),
+            &ingest,
+            &CatalogCountersSnapshot::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &AdmissionCountersSnapshot::default(),
+            &[],
+            0,
+            IngestBufferBudgetSnapshot::default(),
+            None,
+            None,
+            &[],
+            None,
+        );
+
+        assert!(
+            body.contains(
+                "ravel_ingest_flushes_by_age_adaptive_total{mode=\"gateway\",signal=\"metrics\"} 7"
+            ),
+            "conversion must carry the adaptive-age count, not zero:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_ingest_grace_extended_stale_flushes_total{mode=\"gateway\",signal=\"metrics\"} 3"
+            ),
+            "conversion must carry the grace-extended count, not zero:\n{body}"
+        );
+        assert!(
+            body.contains("ravel_ingest_in_flight_flushes{mode=\"gateway\",signal=\"metrics\"} 2"),
+            "conversion must carry the in-flight gauge, not zero:\n{body}"
         );
     }
 
