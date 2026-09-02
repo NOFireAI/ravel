@@ -99,12 +99,21 @@ pub fn flag_row(arg: &Arg) -> FlagRow {
     }
 }
 
-/// A monospace cell, or an empty cell when the value is empty.
+/// A monospace cell, or an empty cell when the value is empty. A value that
+/// itself contains a backtick is fenced with a run of backticks one longer than
+/// the longest run inside it and padded with spaces (CommonMark), so the inner
+/// backtick cannot terminate the code span and split the table cell.
 fn code_cell(value: &str) -> String {
     if value.is_empty() {
-        String::new()
+        return String::new();
+    }
+    let escaped = escape_cell(value);
+    if escaped.contains('`') {
+        let longest = escaped.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+        let fence = "`".repeat(longest + 1);
+        format!("{fence} {escaped} {fence}")
     } else {
-        format!("`{}`", escape_cell(value))
+        format!("`{escaped}`")
     }
 }
 
@@ -213,4 +222,22 @@ pub fn splice(doc: &str, block: &str) -> Option<String> {
 /// header or separator line.
 pub fn count_data_rows(block: &str) -> usize {
     block.lines().filter(|line| line.starts_with("| `")).count()
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+
+    /// A value containing a backtick must render as one intact code-span cell:
+    /// the fence widens past the inner backtick (double backticks with padding
+    /// spaces) so the span cannot terminate early, while a `|` in the same value
+    /// stays escaped so it cannot split the table row. Against the unchanged
+    /// single-backtick renderer the `assert_eq!` below fails, because
+    /// `code_cell` emitted `` `a`b\|c` `` and the inner backtick closed the span.
+    #[test]
+    fn code_cell_survives_a_backtick_and_a_pipe() {
+        assert_eq!(code_cell("a`b|c"), "`` a`b\\|c ``");
+    }
 }

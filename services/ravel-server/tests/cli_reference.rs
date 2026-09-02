@@ -24,8 +24,8 @@ const REGEN: &str = "RAVEL_UPDATE_CLI_REFERENCE=1 cargo test -p ravel-server --t
 /// directory rather than the process working directory (which differs between
 /// a crate-scoped `cargo test` and one run from the workspace root).
 fn reference_doc() -> PathBuf {
-    let manifest = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is always set");
-    Path::new(&manifest)
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    Path::new(manifest)
         .join("..")
         .join("..")
         .join("docs")
