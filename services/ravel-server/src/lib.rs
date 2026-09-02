@@ -314,13 +314,14 @@ pub struct ServerConfig {
     /// enforced budget. Distinct from the flat default an
     /// `EngineConfig::default()` would carry, which knows no shard count.
     pub max_s3_requests: ravel_query::RequestLimit,
-    /// The four ADR-0088 operator-configurable query budgets, from
-    /// `--fetch-concurrency`, `--max-segments`, `--sql-max-query-bytes`, and
-    /// `--sql-tenant-max-bytes` (`main` fills this via
-    /// [`crate::config::Cli::query_budgets`]). [`start`] folds
-    /// `fetch_concurrency`/`max_segments` into the one process-wide
-    /// `EngineConfig` both query surfaces share (PromQL/HTTP and SQL/HTTP), and
-    /// passes `sql_max_query_bytes`/`sql_tenant_max_bytes` to
+    /// The ADR-0088 operator-configurable query budgets, from
+    /// `--max-concurrent-gets` (or its deprecated `--fetch-concurrency`
+    /// alias), `--scan-partitions`, `--max-segments`,
+    /// `--sql-max-query-bytes`, and `--sql-tenant-max-bytes` (`main` fills
+    /// this via [`crate::config::Cli::query_budgets`]). [`start`] folds
+    /// `fetch_concurrency`/`scan_partitions`/`max_segments` into the one
+    /// process-wide `EngineConfig` both query surfaces share (PromQL/HTTP and
+    /// SQL/HTTP), and passes `sql_max_query_bytes`/`sql_tenant_max_bytes` to
     /// [`query::build_sql_state`] so the SQL executor's per-query pool and
     /// per-tenant accountant enforce the configured ceilings. Every field's
     /// default equals today's compiled-in value, so an unset deployment is
@@ -1216,12 +1217,14 @@ pub async fn start(
         // SQL/HTTP paths alike (both `build_app_state` and `build_sql_state`
         // below take this same value). Every other engine limit stays at its
         // default.
-        // ADR-0088: fold `--fetch-concurrency` / `--max-segments` onto the base
-        // engine config via `QueryBudgets::apply_to_engine` (the single wiring
-        // point start and the reachability tests share). Without it the engine
-        // would keep `EngineConfig::default()`'s compiled-in 8 / 1024.
-        // `fetch_concurrency` is the same knob that sets the SQL scan partition
-        // count and S3 GET concurrency (ADR-0087).
+        // ADR-0088: fold `--max-concurrent-gets` / `--scan-partitions` /
+        // `--max-segments` onto the base engine config via
+        // `QueryBudgets::apply_to_engine` (the single wiring point start and
+        // the reachability tests share). Without it the engine would keep
+        // `EngineConfig::default()`'s compiled-in 8 / 1024. Since issue #846
+        // the GET bound and the SQL scan partition count are separate knobs;
+        // an unset partition count still follows the GET bound, which is the
+        // pre-split coupling ADR-0087 described.
         // ADR-0996 decision 2: `apply_to_engine` also RESOLVES
         // `--logs-fetch-policy` against the active store cost profile and the
         // two ADR-0904 byte flags, so the quantities the fetcher builders read

@@ -227,8 +227,15 @@ pub struct Provenance {
     /// report written then deserializes through the `fetch_concurrency` alias
     /// into this field with `scan_partitions: None`, which is exactly the
     /// coupling that run had.
-    #[serde(default = "default_fetch_concurrency", alias = "fetch_concurrency")]
-    pub max_concurrent_gets: usize,
+    ///
+    /// `None` on the Flight lane: the bound never leaves this process there,
+    /// the remote server's own config governs, and stamping the requested
+    /// value would make two Flight passes at different knob settings look
+    /// like a controlled comparison (the same rule every `*_effective` field
+    /// below follows). When this is `None`, [`Self::scan_partitions`] is
+    /// unknowable too and [`Self::effective_scan_partitions`] returns `None`.
+    #[serde(default = "default_gets_stamp", alias = "fetch_concurrency")]
+    pub max_concurrent_gets: Option<usize>,
     /// The executor's [`EngineConfig::scan_partitions`]: the SQL scan partition
     /// count (`target_partitions`) this run ASKED for, or `None` when it was
     /// left coupled to [`Self::max_concurrent_gets`]. Use
@@ -392,10 +399,12 @@ impl Provenance {
     /// when it was set, otherwise [`Self::max_concurrent_gets`], mirroring
     /// [`EngineConfig::effective_scan_partitions`]. A report from before issue #846
     /// carries no partition count and resolves here to the GET bound, which is the
-    /// coupling that run actually had.
+    /// coupling that run actually had. `None` on the Flight lane, where neither
+    /// knob left this process and the remote server's config governed.
     #[must_use]
-    pub fn effective_scan_partitions(&self) -> usize {
-        self.scan_partitions.unwrap_or(self.max_concurrent_gets)
+    pub fn effective_scan_partitions(&self) -> Option<usize> {
+        let gets = self.max_concurrent_gets?;
+        Some(self.scan_partitions.unwrap_or(gets))
     }
 }
 
@@ -448,6 +457,14 @@ fn default_max_segments() -> usize {
 /// what a report written before the field existed deserializes to.
 fn default_fetch_concurrency() -> usize {
     DEFAULT_FETCH_CONCURRENCY
+}
+
+/// The stamp a report written before the field existed deserializes to:
+/// `Some(default)`, because such reports came from in-process runs where the
+/// compiled-in bound really did govern. `None` is reserved for the Flight
+/// lane, which stamps it explicitly.
+fn default_gets_stamp() -> Option<usize> {
+    Some(DEFAULT_FETCH_CONCURRENCY)
 }
 
 /// The logs per-request byte budget every run used before the knob was
@@ -2098,7 +2115,8 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
             runs: cfg.runs.max(1),
             cache_bytes: cfg.cache_bytes,
             deadline_secs: cfg.deadline.as_secs(),
-            max_concurrent_gets: cfg.max_concurrent_gets.max(1),
+            // In-process lane always: both knobs reach the executor here.
+            max_concurrent_gets: Some(cfg.max_concurrent_gets.max(1)),
             scan_partitions: cfg.scan_partitions,
             logs_request_cost_bytes_requested: cfg.logs_request_cost_bytes,
             // In-process lane, same as the ceiling below: the requested budget
@@ -2261,8 +2279,18 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
             runs: cfg.runs.max(1),
             cache_bytes: cfg.cache_bytes,
             deadline_secs: cfg.deadline.as_secs(),
-            max_concurrent_gets: cfg.max_concurrent_gets.max(1),
-            scan_partitions: cfg.scan_partitions,
+            // Lane-gated like every `*_effective` field below: on the Flight
+            // lane neither knob leaves this process, the remote server's own
+            // config governs, and stamping the requested values would make two
+            // Flight passes at different settings look controlled (issue #846).
+            max_concurrent_gets: match &cfg.flight {
+                Some(_) => None,
+                None => Some(cfg.max_concurrent_gets.max(1)),
+            },
+            scan_partitions: match &cfg.flight {
+                Some(_) => None,
+                None => cfg.scan_partitions,
+            },
             logs_request_cost_bytes_requested: cfg.logs_request_cost_bytes,
             // `settings` is passed only on the in-process arm of the match
             // above, so on the Flight lane this budget never left the process
@@ -2611,11 +2639,11 @@ mod tests {
             "fetch_concurrency": 32
         });
         let p: Provenance = serde_json::from_value(pre_split).expect("deserialize");
-        assert_eq!(p.max_concurrent_gets, 32);
+        assert_eq!(p.max_concurrent_gets, Some(32));
         assert_eq!(p.scan_partitions, None);
         assert_eq!(
             p.effective_scan_partitions(),
-            32,
+            Some(32),
             "a pre-split run had one value governing both, so that is what it is stamped with"
         );
         // Unset stays out of the JSON entirely, so no `null` is written and a
@@ -2639,9 +2667,9 @@ mod tests {
             "scan_partitions": 128
         });
         let p: Provenance = serde_json::from_value(split).expect("deserialize");
-        assert_eq!(p.max_concurrent_gets, 32);
+        assert_eq!(p.max_concurrent_gets, Some(32));
         assert_eq!(p.scan_partitions, Some(128));
-        assert_eq!(p.effective_scan_partitions(), 128);
+        assert_eq!(p.effective_scan_partitions(), Some(128));
         let round = serde_json::to_value(&p).expect("serialize");
         assert_eq!(round["max_concurrent_gets"], 32);
         assert_eq!(round["scan_partitions"], 128);

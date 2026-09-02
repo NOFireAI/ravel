@@ -666,9 +666,12 @@ pub struct Cli {
     /// partition count (`target_partitions`), so no tuning result using it was
     /// attributable to one or the other. It now controls only the GET bound it
     /// dominantly governed; set `--max-concurrent-gets` for the permit pool and
-    /// `--scan-partitions` for the partition count. Kept so existing invocations
-    /// keep parsing; supplying it logs a deprecation warning and conflicts with
-    /// `--max-concurrent-gets`.
+    /// `--scan-partitions` for the partition count. Combining it with
+    /// `--scan-partitions` is coherent (the alias sets the GET bound, the new
+    /// flag sets the partition count), and an unset partition count still
+    /// follows the alias's value through the pre-split coupling. Kept so
+    /// existing invocations keep parsing; supplying it logs a deprecation
+    /// warning and conflicts with `--max-concurrent-gets`.
     #[arg(long = "fetch-concurrency", value_name = "N")]
     pub fetch_concurrency: Option<usize>,
 
@@ -2036,18 +2039,6 @@ impl Cli {
         })
     }
 
-    /// The ADR-0088 query budgets and the ADR-0996 logs fetch configuration,
-    /// sourced from the CLI flags. `main` threads this into
-    /// [`crate::ServerConfig::query_budgets`], and [`crate::start`] folds it
-    /// into the process-wide `EngineConfig` and the SQL executor, so a flag set
-    /// here is the value the query/SQL execution path enforces.
-    ///
-    /// Fallible only for `--store-cost-profile`, which reads a file: every
-    /// other field is a clap-parsed value (an unset flag is its compiled-in
-    /// default). A profile that cannot be read or parsed refuses startup here
-    /// rather than falling back to the reference profile, so the prices a
-    /// deployment's figures are modelled at are always the ones its operator
-    /// declared.
     /// The effective in-flight GET bound (issue #846): `--max-concurrent-gets`
     /// when set, otherwise the deprecated `--fetch-concurrency` alias, otherwise
     /// the compiled-in [`ravel_query::DEFAULT_FETCH_CONCURRENCY`]. clap rejects
@@ -2064,13 +2055,26 @@ impl Cli {
         self.fetch_concurrency.is_some()
     }
 
+    /// The ADR-0088 query budgets and the ADR-0996 logs fetch configuration,
+    /// sourced from the CLI flags. `main` threads this into
+    /// [`crate::ServerConfig::query_budgets`], and [`crate::start`] folds it
+    /// into the process-wide `EngineConfig` and the SQL executor, so a flag set
+    /// here is the value the query/SQL execution path enforces.
+    ///
+    /// Fallible only for `--store-cost-profile`, which reads a file: every
+    /// other field is a clap-parsed value (an unset flag is its compiled-in
+    /// default). A profile that cannot be read or parsed refuses startup here
+    /// rather than falling back to the reference profile, so the prices a
+    /// deployment's figures are modelled at are always the ones its operator
+    /// declared.
     pub fn query_budgets(&self) -> anyhow::Result<QueryBudgets> {
         if self.fetch_concurrency_alias_used() {
             tracing::warn!(
                 max_concurrent_gets = self.resolve_max_concurrent_gets(),
-                "--fetch-concurrency is deprecated (issue #846): it now sets only the in-flight \
-                 GET bound it dominantly governed. Use --max-concurrent-gets for the permit pool \
-                 and --scan-partitions for the SQL scan partition count."
+                "--fetch-concurrency is deprecated (issue #846): it sets the in-flight GET \
+                 bound, and the scan partition count still follows it unless --scan-partitions \
+                 is set. Use --max-concurrent-gets for the permit pool and --scan-partitions \
+                 for the SQL scan partition count."
             );
         }
         Ok(QueryBudgets {
@@ -4172,6 +4176,26 @@ mod tests {
             EngineConfig::default().fetch_concurrency
         );
         assert!(!cli.fetch_concurrency_alias_used());
+
+        // Deprecated alias plus the NEW partition flag is coherent, not a
+        // conflict: the alias sets the GET bound, the flag sets the partition
+        // count, and each lands on its own field. Prove-the-test: add
+        // `conflicts_with = "scan_partitions"` to the alias and this parse
+        // fails; point the partition flag at the GET resolver and the second
+        // assertion reads 24 against the expected 96.
+        let cli = Cli::try_parse_from([
+            "ravel-server",
+            "--fetch-concurrency",
+            "24",
+            "--scan-partitions",
+            "96",
+        ])
+        .expect("deprecated alias composes with --scan-partitions");
+        let engine = engine_from(&cli);
+        assert_eq!(engine.fetch_concurrency, 24);
+        assert_eq!(engine.scan_partitions, Some(96));
+        assert_eq!(engine.effective_scan_partitions(), 96);
+        assert!(cli.fetch_concurrency_alias_used());
     }
 
     /// Issue #846: `--scan-partitions` reaches `EngineConfig::scan_partitions`

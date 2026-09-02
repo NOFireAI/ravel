@@ -383,9 +383,10 @@ async fn run(args: &Args) -> Result<SqlLatencyReport, ravel_bench::sql_latency::
     // than buried under a multi-minute resolve.
     if args.fetch_concurrency_alias_used() {
         eprintln!(
-            "sql_latency_bench: --fetch-concurrency is deprecated (issue #846): it now sets only \
-             the in-flight GET bound ({}) it dominantly governed. Use --max-concurrent-gets for \
-             the permit pool and --scan-partitions for the SQL scan partition count.",
+            "sql_latency_bench: --fetch-concurrency is deprecated (issue #846): it sets the \
+             in-flight GET bound ({}), and the scan partition count still follows it unless \
+             --scan-partitions is set. Use --max-concurrent-gets for the permit pool and \
+             --scan-partitions for the SQL scan partition count.",
             args.resolve_max_concurrent_gets()
         );
     }
@@ -564,21 +565,31 @@ fn provenance_header(p: &Provenance, d: &DatasetInfo) -> String {
     // A pass stamped with one number cannot say whether a delta came from plan
     // parallelism or from store concurrency, which is the whole reason the two
     // were split.
-    out.push_str(&format!(
-        "  get bound  : {} concurrent in-flight object-store GETs\n",
-        p.max_concurrent_gets
-    ));
-    out.push_str(&format!(
-        "  scan parts : {}{}\n",
-        p.effective_scan_partitions(),
-        match p.scan_partitions {
-            Some(_) => "",
-            // Named, not omitted: a reader has to be able to tell an explicit
-            // partition count that happens to equal the GET bound from one that
-            // was never set and merely inherited it.
-            None => " (unset, coupled to the get bound)",
+    match p.max_concurrent_gets {
+        Some(gets) => {
+            out.push_str(&format!(
+                "  get bound  : {gets} concurrent in-flight object-store GETs\n"
+            ));
+            out.push_str(&format!(
+                "  scan parts : {}{}\n",
+                p.effective_scan_partitions().unwrap_or(gets),
+                match p.scan_partitions {
+                    Some(_) => "",
+                    // Named, not omitted: a reader has to be able to tell an
+                    // explicit partition count that happens to equal the GET
+                    // bound from one that was never set and merely inherited
+                    // it.
+                    None => " (unset, coupled to the get bound)",
+                }
+            ));
         }
-    ));
+        // Flight lane: neither knob left this process, so the header refuses
+        // to name values the remote server's own config governed.
+        None => {
+            out.push_str("  get bound  : unknown (server config)\n");
+            out.push_str("  scan parts : unknown (server config)\n");
+        }
+    }
     out.push_str(&format!(
         "  req cost   : requested={} bytes  effective={}\n",
         p.logs_request_cost_bytes_requested,
@@ -904,7 +915,7 @@ mod tests {
             runs: 3,
             cache_bytes: 0,
             deadline_secs: 30,
-            max_concurrent_gets: ravel_query::DEFAULT_FETCH_CONCURRENCY,
+            max_concurrent_gets: Some(ravel_query::DEFAULT_FETCH_CONCURRENCY),
             scan_partitions: None,
             logs_request_cost_bytes_requested: cost,
             logs_request_cost_bytes_effective: Some(cost),
@@ -972,6 +983,71 @@ mod tests {
             1,
             "the requested value appears once and is NOT repeated as effective; \
              got:\n{header}"
+        );
+    }
+
+    /// Both knob lines appear exactly once, with the coupling named only when
+    /// the partition count was genuinely unset (issue #846).
+    #[test]
+    fn header_stamps_both_knob_lines_exactly_once() {
+        let d = dataset("pre-compaction", None);
+        let mut p = provenance_with_cost(1);
+        p.max_concurrent_gets = Some(48);
+        p.scan_partitions = Some(96);
+        let header = provenance_header(&p, &d);
+        assert_eq!(
+            header
+                .matches("  get bound  : 48 concurrent in-flight object-store GETs")
+                .count(),
+            1,
+            "the GET bound line appears exactly once; got:\n{header}"
+        );
+        assert_eq!(
+            header.matches("  scan parts : 96\n").count(),
+            1,
+            "an explicitly set partition count carries no coupling note; got:\n{header}"
+        );
+        // Unset partitions inherit the GET bound and say so.
+        p.scan_partitions = None;
+        let header = provenance_header(&p, &d);
+        assert_eq!(
+            header
+                .matches("  scan parts : 48 (unset, coupled to the get bound)")
+                .count(),
+            1,
+            "an inherited partition count names the coupling; got:\n{header}"
+        );
+    }
+
+    /// A Flight run sends neither knob to the server, so the header must say
+    /// the server's config governed rather than repeating requested values as
+    /// if they were a controlled comparison (issue #846, same rule as the
+    /// request-cost stamp above).
+    #[test]
+    fn header_does_not_claim_a_flight_run_applied_the_requested_knobs() {
+        let d = dataset("pre-compaction", None);
+        let mut p = provenance_with_cost(1);
+        p.source = "flight".to_string();
+        p.max_concurrent_gets = None;
+        p.scan_partitions = None;
+        let header = provenance_header(&p, &d);
+        assert_eq!(
+            header
+                .matches("  get bound  : unknown (server config)")
+                .count(),
+            1,
+            "a Flight run's GET bound is the server's to name; got:\n{header}"
+        );
+        assert_eq!(
+            header
+                .matches("  scan parts : unknown (server config)")
+                .count(),
+            1,
+            "a Flight run's partition count is the server's to name; got:\n{header}"
+        );
+        assert!(
+            !header.contains("coupled to the get bound"),
+            "no coupling claim about a remote server's config; got:\n{header}"
         );
     }
 

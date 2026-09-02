@@ -36,7 +36,11 @@ Add server flags for `max_query_bytes` (SQL per-query pool), the
 per-tenant SQL ceiling, `fetch_concurrency`, and `max_segments`. Document
 `fetch_concurrency`'s relation to scan partition count: it is, today, the
 single knob governing both SQL scan fan-out and S3 GET concurrency
-(ADR-0087 does not decouple them). Document the existing
+(ADR-0087 does not decouple them). *Amended by issue #846: the knobs are
+now decoupled into `--max-concurrent-gets` and `--scan-partitions`;
+`--fetch-concurrency` survives as a deprecated alias that sets the GET
+bound, with an unset partition count still following it.* Document the
+existing
 `--max-s3-requests` flag and the limits-file `max_bytes_scanned` default,
 and how to size both for wide scans. Verify `--gc-max-query-duration` at
 multi-minute values passes validation against the tenant's durable

@@ -585,7 +585,11 @@ Tick every line before putting two reports side by side.
   gap between two c6a.4xlarge boxes at identical settings, so a cross-box
   comparison carries the box id or it carries nothing.
 - Same `max_concurrent_gets`, `scan_partitions`, `cache_bytes`, `deadline_secs`,
-  and per-query pool ceiling. All five are in the provenance; compare on
+  and per-query pool ceiling. All five are in the provenance for an in-process
+  run; on a `--flight` run the two knobs are stamped null because they never
+  left the process (the remote server's own config governed), so two Flight
+  reports are comparable on them only via the server's flags, not the bench's.
+  Compare on
   `sql_max_query_bytes_effective`, not on what was requested. Where that field
   is null (a `--flight` run), the ceiling that governed is the server's and is
   not recorded here, so the two runs are comparable on it only if you know both

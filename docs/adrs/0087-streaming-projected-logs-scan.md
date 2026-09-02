@@ -164,3 +164,6 @@ flowchart LR
   (`crates/ravel-sql/src/session.rs`); this ADR does not decouple them.
   ADR-0088 exposes `--fetch-concurrency` as the single flag governing
   both; a future decoupling is a separate decision, not implied here.
+  *That decoupling landed as issue #846: `--scan-partitions` now sets the
+  fan-out independently, and an unset value keeps the coupling described
+  here.*

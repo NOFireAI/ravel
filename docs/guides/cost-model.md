@@ -170,8 +170,8 @@ Two properties follow from what the number is:
 - It is a property of the **store and the instance** — round-trip latency and
   single-stream bandwidth at the fetch concurrency in use — not of the RLOG
   format. A different store, a cross-region bucket, or a different
-  `--fetch-concurrency` has a different right value, and changing fetch
-  concurrency changes this break-even along with it.
+  `--max-concurrent-gets` has a different right value, and changing the GET
+  bound changes this break-even along with it.
 - The `logs-` prefix is literal. Metric (RSEG) reads use fixed gap and
   crossover constants that are not request-cost-derived, and do not respond to
   this flag.
