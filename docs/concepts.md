@@ -218,12 +218,17 @@ into snapshot parts, and publishes a new HEAD. Folding is not compaction: it
 touches no telemetry bytes and produces no new segments. It is a cost
 optimisation only, and it never changes which commits a query sees.
 
-HEAD is the one mutable object per (tenant, signal): a pointer naming the
-current snapshot parts. It is the only mutable object in a tenant's
-keyspace, and it is only ever written with a compare-and-swap on its version.
-Two folders that race are therefore safe: the loser's compare-and-swap fails,
-it re-reads, and nothing is corrupted. A query begins with one GET of HEAD,
-which pins the snapshot it will use for the rest of its execution.
+HEAD is the catalog's one mutable object, one per (tenant, signal): a
+pointer naming the current snapshot parts, written only with a
+compare-and-swap on its version. Two folders that race are therefore safe:
+the loser's compare-and-swap fails, it re-reads, and nothing is corrupted. A
+query begins with one GET of HEAD, which pins the snapshot it will use for
+the rest of its execution. A few other per-tenant records change after they
+are written, each under its own rule: admission usage is overwritten on every
+reconciliation interval, alert state moves by compare-and-swap, the
+encryption key-epoch record is append-only, and tenant configuration is
+rewritten by the operator tool. None of them is part of the catalog, and a
+snapshot names none of them.
 
 One consequence surprises operators the first time. An ingest hour seals only
 after the maximum flush lifetime plus a clock-skew allowance plus a fold
@@ -238,14 +243,18 @@ is [Snapshot isolation](consistency-model.md#snapshot-isolation).
 
 ## Background maintenance: compaction, retention, sweep
 
-Three background loops reshape the bucket. All of them run in `maintain` mode
-processes, or in `all` mode where one process plays every part. Their
-supervisors derive the tenant set from storage by listing tenant prefixes,
-not from a flag, so no configuration can silently exclude a tenant from
-retention; a discovery failure skips and retries the cycle rather than
-falling back to an empty set. Work is partitioned across the live maintain
-workers by rendezvous hashing over a heartbeat-derived live set, so N
-replicas divide the work instead of each doing all of it.
+Three background loops reshape the bucket, and only a `maintain` mode
+process runs them. `all` mode runs ingest, query, the catalog fold, and
+alert evaluation in one process; it does not compact, expire, or sweep
+anything. A deployment with no `maintain` process therefore never deletes an
+object, and its L0 segments accumulate unmerged. The quickstart stack runs
+`all` mode alone, which is fine for an evaluation. Maintenance supervisors
+derive the tenant set from storage by listing tenant prefixes, not from a
+flag, so no configuration can silently exclude a tenant from retention; a
+discovery failure skips and retries the cycle rather than falling back to an
+empty set. Work is partitioned across the live maintain workers by
+rendezvous hashing over a heartbeat-derived live set, so N replicas divide
+the work instead of each doing all of it.
 
 Compaction makes L1 segments from many L0 segments of one (tenant, signal,
 shard, ingest hour) bucket, streaming blocks rather than materialising the
@@ -376,9 +385,9 @@ expanded; other pages use them bare.
   commit-record key, and presenting it to a query API is how a caller gets
   read-your-write.
 - **compaction**: making L1 segments from L0 segments of one bucket. Aliases:
-  `fold`, `merge`. Neither is correct here: a fold publishes a catalog
-  snapshot and touches no telemetry bytes, and merge names no protocol in
-  Ravel.
+  `fold`, `merge`. Neither names the operation: a fold publishes a catalog
+  snapshot and touches no telemetry bytes, and a merge is what compaction
+  does to its inputs internally.
 - **disk tier**: the read cache's optional local-disk layer, holding raw
   compressed byte ranges. See tier.
 - **fold**: publishing a catalog snapshot from commit records whose ingest
@@ -475,7 +484,9 @@ expanded; other pages use them bare.
 - **typed attribute column**: an attribute key promoted to a native column in
   a segment, so predicates and projections on it prune and decode like any
   other column. Alias: `typed column`. The `ravel-cli` subcommand that adds
-  one is spelled `declare`, and that spelling stays.
+  one is `typed-attr-column set`, and the server flag is
+  `--typed-attr-column`; their help text calls the result a declared typed
+  attribute column, which means the same thing.
 - **UDAF**: user-defined aggregate function, an aggregate Ravel registers
   with the SQL engine beyond the engine's own set.
 - **UDF**: user-defined function, a scalar function Ravel registers with the
@@ -484,9 +495,12 @@ expanded; other pages use them bare.
   rather than a value. Ravel registers none, and the SQL surface's tables are
   the registered tables only.
 - **WORM**: write once read many, a bucket policy that forbids overwriting or
-  deleting an object for a retention period. It is compatible with every
-  immutable object Ravel writes, and incompatible with HEAD, which is
-  mutated in place.
+  deleting an object version for a retention period. Ravel's bucket
+  protection contract asks for it, as Object Lock in compliance mode, on the
+  deployment records, the provisioning records, the commit records, and the
+  catalog HEAD history, paired with versioning so that a HEAD
+  compare-and-swap creates a new locked version rather than overwriting one.
+  The contract is in [docs/object-store-contract.md](object-store-contract.md).
 - **writer**: the identity a shard actor writes under, carried in commit and
   data object keys as a writer id and epoch. Commits are sequenced per
   writer and shard, and a restarted process takes a new epoch rather than

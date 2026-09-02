@@ -26,13 +26,17 @@ admission, the router, and the shard actors), the catalog (commit records,
 folds, snapshots), the read path (snapshot resolution, pruning, segment
 fetch, caching), the two query engines (a PromQL evaluator and a
 DataFusion-based SQL engine), and maintenance (compaction, retention, the
-garbage-collection sweep, alert-rule evaluation). Each mode enables a subset
-of them; `all` enables every one.
+garbage-collection sweep, the integrity scrubber). Each mode enables a
+subset. `gateway` runs ingest and the catalog fold. `query` runs the read
+path, both engines, the fold, and alert-rule evaluation. `maintain` runs
+maintenance and nothing else. `all` is `gateway` plus `query` in one
+process; it does not run maintenance, so a deployment with no `maintain`
+process never compacts or deletes anything.
 
 The ingest surfaces are OTLP over HTTP and gRPC, Prometheus Remote Write,
 and OTAP behind a cargo feature. The query surfaces are the
 Prometheus-compatible `/api/v1/*` routes, `POST /api/v1/sql`, Flight SQL
-behind a cargo feature, and `POST /api/v1/analytics`. All three signals
+behind a cargo feature, and `POST /api/v1/analytics`. The ingest protocols
 share one pipeline: Remote Write payloads normalise to the shape OTLP
 produces and enter the same router call, so there is no second flush or
 commit path to hold correct.
@@ -53,11 +57,13 @@ Objects in the bucket, and nothing else. There are five kinds:
   compaction records, rewrite records, retention tombstones, and idempotency
   markers that publish the other durable transactions.
 - Catalog objects: immutable snapshot parts and column-statistics objects,
-  plus the HEAD pointer, which is the only mutable object in a tenant's
-  keyspace and is written only under compare-and-swap.
-- Per-tenant records: the shard-count provisioning record, the encryption
-  key-epoch record, the lifecycle and limits configuration, and metric family
-  metadata.
+  plus the HEAD pointer, the catalog's one mutable object, written only
+  under compare-and-swap.
+- Per-tenant records: the shard-count provisioning record, the append-only
+  encryption key-epoch record, the tenant configuration, admission usage
+  snapshots, alert state, and metric family metadata. These are the records
+  that change after they are written, each under its own rule, and a
+  snapshot names none of them.
 - Deployment records under the bucket root: the store qualification record,
   the tenancy scheme marker, the authentication map, per-process liveness
   heartbeats, and advisory work claims.

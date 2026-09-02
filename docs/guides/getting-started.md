@@ -83,8 +83,10 @@ A PromQL instant query answers with the Prometheus JSON envelope:
   `metric` and one `[timestamp, value]` pair under `value`, with the value as a
   JSON string, exactly as Prometheus renders it.
 - HTTP 401 means the `Authorization: Bearer` header is missing or carries a
-  token the server has no tenant for. It is not an empty result, and Ravel never
-  answers an unauthenticated query with an empty one.
+  token the server has no tenant for. It is not an empty result: the query
+  routes never answer an unauthenticated request with an empty one. The single
+  exception is `/api/v1/metadata`, which returns an empty object for a tenant
+  it cannot resolve, so do not use that route to test a token.
 
 A SQL query answers with a described-schema envelope. This is the `data` object
 of a `SELECT ts, value FROM samples LIMIT 1`:
@@ -276,20 +278,37 @@ nothing useful there. `--features` is a cargo argument, not a `ravel-server`
 flag: the feature is chosen when the binary is built, so ask cargo for it and
 pass the server's own flags after `--`.
 
+Two startup gates stand between a fresh bucket and a running server. The
+compose quickstart and `make demo` clear both for you; by hand you clear them
+yourself. The server refuses to start against a bucket that carries no
+qualification record, so qualify the bucket once with `ravel-cli`. It also
+refuses to start against a fresh bucket with no tenant-hash scheme chosen, so
+choose one: keyed with `--tenant-hash-key-file` for a real deployment, or
+unkeyed with `--tenant-hash-unkeyed` for a throwaway development bucket.
+Either choice is permanent for that bucket.
+
 ```sh
+export RAVEL_S3_ENDPOINT=http://127.0.0.1:9000
+export RAVEL_S3_BUCKET=ravel-dev
+export RAVEL_S3_REGION=us-east-1
+export RAVEL_S3_ACCESS_KEY=ravel
+export RAVEL_S3_SECRET_KEY=ravel-dev-secret
+
+cargo run -p ravel-cli -- --store s3 store qualify
+
 cargo run -p ravel-server --features sql -- \
   --store s3 \
-  --s3-endpoint http://127.0.0.1:9000 \
-  --s3-bucket ravel-dev \
-  --s3-access-key ravel \
-  --s3-secret-key ravel-dev-secret \
+  --tenant-hash-unkeyed \
   --tenant-token devtoken=acme
 ```
 
 That binds the defaults, `127.0.0.1:4318` (HTTP) and `127.0.0.1:4317` (gRPC),
 and accepts requests carrying `Authorization: Bearer devtoken` for tenant
-`acme`. Drop `--features sql` and the same command gives you the PromQL and
-ingest surfaces without the SQL endpoint.
+`acme`. The environment variables stand in for the `--s3-*` flags, and both
+binaries read them the same way. `store qualify` is idempotent: on an
+already-qualified bucket it reports the existing record and exits 0. Drop
+`--features sql` and the same command gives you the PromQL and ingest surfaces
+without the SQL endpoint.
 
 ### The same round trip by hand
 
