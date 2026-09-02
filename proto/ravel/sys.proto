@@ -285,6 +285,94 @@ message WorkerHeartbeat {
   sfixed64 heartbeat_unix_ns = 4;
 }
 
+// The lifecycle state of a CompactionClaim (ADR-1029 decision 1). Two real
+// states: `running` while an attempt holds the claim, `completed` once the
+// attempt finished its merge and marked the claim under CasVersion. There is no
+// `failed` or `abandoned` state: a claim whose owner died simply stops being
+// renewed and ages out, judged by the store object's last_modified, so absence
+// of renewal is the only failure signal the protocol needs. UNSPECIFIED is the
+// proto3 zero default that is never written; a stored claim carrying it is
+// corrupt, and a reader treats it exactly as it treats an undecodable claim
+// (observe it, never steal it), the fail-closed discipline TenantLifecycleState
+// and Signal apply to their own enums.
+enum ClaimState {
+  CLAIM_STATE_UNSPECIFIED = 0;  // never written; a claim carrying it is corrupt
+  CLAIM_STATE_RUNNING = 1;
+  CLAIM_STATE_COMPLETED = 2;
+}
+
+// The advisory compaction claim at `sys/maintain/claims/compaction/<work_id_hex>`
+// (ADR-1029 decisions 1 and 2). One small mutable object per unit of expensive
+// merge work, suppressing duplicate compactions of one sealed bucket by two
+// processes the rendezvous ownership gate cannot both see (a `ravel-cli maintain
+// compact-tenant` run racing the supervisor, a membership handoff window, a
+// wedged owner).
+//
+// ADVISORY, and load-bearingly so: a claim confers zero publication rights and
+// its absence removes none. The publish path never reads this object. A paused
+// owner that lost its claim and finishes anyway still collides at
+// content-addressed part keys and at the compaction record's CreateIfAbsent, and
+// either converges or takes an existing typed error. A claim bug can waste work;
+// it cannot corrupt data (ADR-1029 decision 2). The published compaction record
+// remains the only completion marker that means anything.
+//
+// Expiry is judged from the STORE OBJECT's server-generated `last_modified`
+// (read by head() on the contention path), never from `owner_clock_ns` below:
+// the store is one time base every contender shares, while node clocks are not
+// (ADR-1029 decision 1, rejected alternative 5).
+//
+// Mutation shape: CreateIfAbsent to acquire, CasVersion to renew, steal, and
+// mark completed. Never an unconditional Overwrite and never an unconditional
+// DELETE -- a stale worker's delete would destroy a newer owner's claim
+// (ADR-1029 rejected alternative 4).
+//
+// Its own top-level message, sharing no field number with the records above.
+// Field numbers are frozen from the moment this ships; only additive changes
+// are allowed, exactly like every other message in this file.
+message CompactionClaim {
+  // Format floor: the minimum reader version that understands this claim,
+  // matching the guard every other sys/ message uses. A claim advertising a
+  // higher version is one this reader does not understand, so it is observed
+  // (and rescheduled around) but never stolen and never overwritten, rather
+  // than misread as v1. = 1.
+  uint32 format_version = 1;
+  // The claiming process's UUID (16 bytes): the ADR-0057/0065 startup id, the
+  // same identity `sys/maintain/workers/<process_id>` is keyed under. Operator
+  // forensics ("which process is merging this bucket") and nothing else; the
+  // protocol decides ownership by CAS version tokens, not by comparing ids.
+  bytes owner_process_id = 2;
+  // A fresh UUID (16 bytes) per acquisition, so two successive acquisitions by
+  // the SAME process (an acquire, an expiry, a steal back) are distinguishable
+  // in logs and in a stolen-claim assertion, which `owner_process_id` alone
+  // cannot express.
+  bytes attempt_id = 3;
+  // The owner's view of the bucket's input set, for operator forensics ONLY.
+  // Never an input to any decision, and deliberately NOT part of the work id
+  // the key is derived from: two nodes whose listings diverge on a sealed
+  // bucket must collide on ONE claim, run once, and surface the divergence
+  // through the existing InputSetHashDivergence machinery rather than run twice
+  // under two claims (ADR-1029 decision 1, rejected alternative 3).
+  bytes input_set_hash = 4;
+  ClaimState state = 5;
+  // How many times this claim has been renewed under CasVersion since it was
+  // acquired or stolen. Reset to 0 by an acquisition; incremented by each
+  // successful renewal. Informational (a steal-storm and a wedged-owner signal
+  // when exported as a metric); no decision reads it.
+  uint32 renewed_count = 6;
+  // The lease duration the owner is running under, in nanoseconds. Carried so
+  // an observer computes expiry against the duration the OWNER declared rather
+  // than against its own (possibly differently configured) default; the reader
+  // falls back to its own configured lease when this is absent or non-positive.
+  // The expiry BASE is always the store's last_modified, never a value in this
+  // message.
+  sfixed64 lease_duration_ns = 7;
+  // The owner's own clock when it last wrote this claim. Informational
+  // (operator forensics: how far a node's clock sits from the store's), never
+  // an input to expiry or to any other decision. Judging expiry from a
+  // payload-embedded node clock is ADR-1029's rejected alternative 5.
+  sfixed64 owner_clock_ns = 8;
+}
+
 // The per-tenant key-epoch record at `t/<tenant_hash>/enc` (ADR-0062
 // decision 1b, epic EL). Tenant-scoped, not per-signal: a tenant's KMS key
 // applies across every signal, so this object sits directly under the tenant

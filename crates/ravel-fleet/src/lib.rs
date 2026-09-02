@@ -15,6 +15,11 @@
 //! - [`query_workers`] is the query-worker registration for the ADR-0071 read
 //!   fan-out: the same single-writer `Overwrite` heartbeat shape and the same
 //!   staleness rule, over the `sys/query/workers/` prefix.
+//! - [`claim`] is the ADR-1029 advisory work claim: a CAS-mutated object per
+//!   unit of expensive maintenance work, suppressing duplicate merges in the
+//!   windows rendezvous ownership cannot reach. It is neither membership nor a
+//!   lease; see its module docs for the three-way disambiguation.
 
+pub mod claim;
 pub mod query_workers;
 pub mod worker_set;

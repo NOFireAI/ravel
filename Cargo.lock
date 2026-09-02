@@ -4685,6 +4685,8 @@ version = "0.11.0"
 dependencies = [
  "blake3",
  "futures",
+ "hex",
+ "proptest",
  "prost",
  "ravel-object-store",
  "ravel-proto",
