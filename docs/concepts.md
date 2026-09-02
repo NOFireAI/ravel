@@ -273,8 +273,8 @@ different but overlapping input sets are rarer, and serving both would return
 the overlapping records twice for logs and spans, which have no query-time
 deduplication. The resolver picks one authoritative record per overlap group by
 a deterministic tie-break, serves any input the winner does not name as a raw
-segment, ignores the other records' segments, and raises a metric, so every
-input is served exactly once while an operator reconciles the bucket.
+segment, ignores the other records' segments, and raises a metric, so no
+input is served twice or dropped while an operator reconciles the bucket.
 
 Retention expires data by age against the tenant's configured policy. Like
 every deletion in Ravel it is a durable transaction first, a tombstone
@@ -293,12 +293,12 @@ constraint rather than a hope. Compaction never deduplicates and conserves
 the record count exactly; a snapshot that sees a compaction record excludes
 the inputs it names, and for metrics query-time deduplication also collapses
 any duplicate that slips through, so every intermediate state of a
-compaction is query-correct. The one exception is two compaction records
-over a logs or spans bucket that name different input sets: where those
-sets overlap, the overlapping records are returned twice;
+compaction is query-correct. Two compaction records over one bucket that
+name overlapping input sets are resolved to one authoritative record, as
+above, so that state is query-correct too;
 `ravel_catalog_compaction_input_set_conflicts_total` counts the buckets in
-that state, and since no command reconciles one, a rise in it is the signal
-to investigate the bucket by hand. The sweep physically
+it, and since no command reconciles one, a rise in it is the signal to
+investigate the bucket by hand. The sweep physically
 removes only what no live
 snapshot references, and only after a protection horizon. A snapshot
 resolved before, during, or after either loop returns the same rows.
