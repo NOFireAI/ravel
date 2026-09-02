@@ -497,7 +497,7 @@ enum TypedAttrColumnCommand {
         /// positional `KEY:TYPE` specs: every `[[attribute]]` and
         /// `[[resource_attribute]]` entry becomes a typed attribute column of the
         /// same-named type. `f64`-typed entries are skipped with a per-key
-        /// warning on stderr (there is no `f64` typed attribute column type); the rest
+        /// warning on stderr (no typed attribute column can be `f64`); the rest
         /// are written through the same CAS whole-list replace. Mutually
         /// exclusive with positional `KEY:TYPE` specs.
         #[arg(long, value_name = "TOML")]

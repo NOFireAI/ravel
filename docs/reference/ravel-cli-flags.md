@@ -416,7 +416,7 @@ Replace the tenant's declaration wholesale, validating it first and swapping the
 
 | Flag | Environment variable | Default | Help |
 | --- | --- | --- | --- |
-| `--from-mapping` |  |  | Derive the declaration from a `load --mapping` TOML instead of positional `KEY:TYPE` specs: every `[[attribute]]` and `[[resource_attribute]]` entry becomes a typed attribute column of the same-named type. `f64`-typed entries are skipped with a per-key warning on stderr (there is no `f64` typed attribute column type); the rest are written through the same CAS whole-list replace. Mutually exclusive with positional `KEY:TYPE` specs |
+| `--from-mapping` |  |  | Derive the declaration from a `load --mapping` TOML instead of positional `KEY:TYPE` specs: every `[[attribute]]` and `[[resource_attribute]]` entry becomes a typed attribute column of the same-named type. `f64`-typed entries are skipped with a per-key warning on stderr (no typed attribute column can be `f64`); the rest are written through the same CAS whole-list replace. Mutually exclusive with positional `KEY:TYPE` specs |
 | `<KEY:TYPE>` |  |  | The declaration, as `KEY:TYPE` specs in schema-append order, where TYPE is one of str/i64/bool/bytes (case-insensitive). A key may contain `:`; the type is split off the right. Mutually exclusive with `--from-mapping` |
 | `<TENANT>` |  |  | The tenant whose declaration to replace |
 
