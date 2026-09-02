@@ -1051,10 +1051,14 @@ impl SupersededGroup {
     }
 
     /// Fold in a second gather of the same group (a sibling live rewrite over
-    /// the same predecessor). Only the two facts a duplicate can add are
-    /// taken: the sibling's own applied requests, and a truncation either
-    /// gather saw. The keys and objects are identical by construction, since
-    /// both walks start from the same record.
+    /// the same predecessor, or, in an observing pass, a predecessor gathered
+    /// from its own entry and again through a successor's walk). Only the two
+    /// facts a duplicate can add are taken: the sibling's own applied requests,
+    /// and a truncation either gather saw. The two gathers may differ in the
+    /// parts they collected when they started from different links, and that
+    /// difference is not merged: the first gather's keys and objects stand,
+    /// which is all a deleting pass acts on, and the observation consumes only
+    /// the request ids and the truncation flag.
     fn absorb_duplicate(&mut self, other: SupersededGroup) {
         self.request_ids.extend(other.request_ids);
         self.truncated |= other.truncated;
@@ -1395,7 +1399,7 @@ async fn gather_superseded_chain(
         }
         for id in link.applied_request_ids() {
             if !id.is_empty() {
-                request_ids.insert(id.to_string());
+                request_ids.insert(canonical_request_id(id));
             }
         }
         for (part_key, object) in link.part_targets()? {
@@ -2537,9 +2541,40 @@ fn format_shard(shard: u32) -> Result<String> {
     Ok(format!("{shard:04}"))
 }
 
+/// The form a request id takes in the hold set and in the `.dreq` check: the
+/// hyphenated UUID text, which is what a parsed `.dreq` key renders. A rewrite
+/// record carries the id as the string its writer supplied, and a UUID has
+/// more than one accepted text form, so both sides are normalised through the
+/// parser before they are compared. A string that is not a UUID is kept as
+/// written: normalising it would only make an unrelated pair compare equal.
+fn canonical_request_id(id: &str) -> String {
+    match Uuid::parse_str(id) {
+        Ok(uuid) => uuid.hyphenated().to_string(),
+        Err(_) => id.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    /// A drop that names its request in the simple UUID form still matches
+    /// the hyphenated form a `.dreq` key renders; a non-UUID id is kept as
+    /// written. Without the normalisation the first assertion fails: the two
+    /// strings differ and the hold set would miss the request.
+    #[test]
+    fn request_ids_compare_in_the_hyphenated_form() {
+        let hyphenated = "6f1c9a2e-0d3b-4b5a-9e7f-1c2d3e4f5a6b";
+        let simple = "6f1c9a2e0d3b4b5a9e7f1c2d3e4f5a6b";
+        assert_eq!(super::canonical_request_id(simple), hyphenated);
+        assert_eq!(super::canonical_request_id(hyphenated), hyphenated);
+        assert_eq!(
+            super::canonical_request_id(&simple.to_uppercase()),
+            hyphenated,
+            "case is normalised too"
+        );
+        assert_eq!(super::canonical_request_id("not-a-uuid"), "not-a-uuid");
+    }
 
     use bytes::Bytes;
     use ravel_ingest::{IdempotencyReceipt, LookupOutcome, marker_key, read_marker, write_marker};
