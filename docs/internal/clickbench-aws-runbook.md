@@ -197,7 +197,9 @@ parallel with the build.
 # bootstrap.sh -- toolchain, checkout, release binaries, dataset.
 export HOME=/root
 set -uo pipefail
-rm -f /root/BOOT_DONE /root/BOOT_FAILED
+# Clear every marker a previous attempt could have left, and drop a partial
+# dataset, so a retry never reuses stale failure state.
+rm -f /root/BOOT_DONE /root/BOOT_FAILED /root/DATASET_FAILED /root/hits.parquet
 exec > /root/bootstrap.log 2>&1
 fail() { echo "FAILED: $1"; touch /root/BOOT_FAILED; exit 1; }
 trap '[ -f /root/BOOT_DONE ] || touch /root/BOOT_FAILED' EXIT
@@ -212,6 +214,12 @@ source /root/.cargo/env
 
 git clone https://github.com/NOFireAI/ravel.git /root/ravel || fail "git clone"
 cd /root/ravel || fail "no checkout"
+# Pin the exact commit the clone checked out. Both binaries here and the
+# re-build in step 8 build from this SHA, so a later push to main never lands
+# in the measured binaries. Recorded for step 8 to read.
+CLONE_SHA=$(git rev-parse HEAD) || fail "resolve clone commit"
+git checkout -q --detach "$CLONE_SHA" || fail "detach clone commit"
+echo "$CLONE_SHA" > /root/CLONE_SHA
 rustc --version || fail "toolchain resolve"   # resolves via rust-toolchain.toml
 
 # Download runs alongside the build; both must succeed.
@@ -328,9 +336,8 @@ different binaries at the same path turn a missing flag into a wrong default.
 
 ```sh
 cd /root/ravel
-git fetch origin main --quiet
-git checkout -q --detach origin/main
-HEAD_SHA=$(git rev-parse HEAD)
+HEAD_SHA=$(cat /root/CLONE_SHA)               # the commit the bootstrap clone built
+git checkout -q --detach "$HEAD_SHA"          # never a moving origin/main
 
 export CARGO_TARGET_DIR=/root/target-fp
 RUSTFLAGS="-C force-frame-pointers=yes" \
