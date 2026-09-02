@@ -52,6 +52,7 @@ pub mod migrate;
 pub mod provision_audit;
 pub mod publish;
 pub mod query_audit;
+pub mod reachability;
 pub mod read;
 pub mod request_ledger;
 pub mod retention;
@@ -121,8 +122,8 @@ pub use scrub::{
 };
 pub use sweep::{
     CatalogSweepOutcome, ErasureRequestSweepOutcome, IdemSweepOutcome, LeaseCheck, NoLeases,
-    OrphanSweepOutcome, SweepReport, sweep_erasure_requests, sweep_idempotency_markers,
-    sweep_orphans, sweep_shard, sweep_shard_zoned, sweep_superseded,
+    OrphanSweepOutcome, SupersededSweepOutcome, SweepReport, sweep_erasure_requests,
+    sweep_idempotency_markers, sweep_orphans, sweep_shard, sweep_shard_zoned, sweep_superseded,
     sweep_unreferenced_catalog_objects, sweep_unreferenced_parts,
 };
 
