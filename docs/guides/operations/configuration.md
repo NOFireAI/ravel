@@ -33,9 +33,9 @@ mode does, silently.
 
 | Mode | Runs |
 |---|---|
-| `all` | OTLP ingest, the query API, the catalog fold, alert evaluation. No maintenance. |
-| `gateway` | OTLP ingest and the catalog fold. |
-| `query` | The query API and the catalog fold. |
+| `all` | Ingest (OTLP and Remote Write), the query API, the catalog fold, alert evaluation. No maintenance. |
+| `gateway` | Ingest and the catalog fold. |
+| `query` | The query API, the catalog fold, and alert evaluation. |
 | `maintain` | Compaction, retention, the sweeper and the at-rest scrubber. No ingest, no query API, no catalog fold. It still binds `--listen-http` for liveness, and it needs a backend that reports the `multipart` capability. |
 
 The catalog fold runs in every mode except `maintain`. Every maintenance loop
@@ -144,7 +144,7 @@ the job the process actually does means a leaked credential can only do what
 that job legitimately does, and only one of the four can delete anything.
 
 This is enforced entirely at the storage backend's own policy layer (AWS IAM, or
-MinIO policies for development and CI). Ravel's code is unchanged by it: there
+MinIO policies for development and CI). Ravel's code plays no part in it: there
 is no in-process authorization check and no change to the `RAVEL_S3_*` contract.
 You provision a narrower credential per role and attach the policy.
 
@@ -374,7 +374,7 @@ generate-data-key, so a deployment that relies on them for a routed tenant must
 grant it manually. When Admin hits this on a reconstruct write,
 `ravel-cli commit reconstruct` names this exact condition in its error text.
 Separately, the `t/<hash>/enc` epoch record needs its own read and write grant,
-which the shipped templates do not yet carry.
+which the shipped templates do not carry.
 
 Bytes written to the local read cache are not covered by any of this. See
 [read cache tiers](#read-cache-tiers).
@@ -425,10 +425,10 @@ so both epochs can be live at once:
 cap x bytes_per_entry x 2 epochs x 2 signals (series + streams)
 ```
 
-At the shipped 200,000 caps that is 28 to 45 MiB per fully active tenant, so ten
-simultaneously fully active tenants cost 280 to 450 MiB in the worst case. At a
-1,000,000 cap the same arithmetic gives 140 to 224 MiB per tenant, and 1.4 to
-2.2 GiB for ten. Raise a tenant's ceiling explicitly in its own table when it
+At the shipped 200,000 caps that is 27 to 43 MiB per fully active tenant, so ten
+simultaneously fully active tenants cost 267 to 427 MiB in the worst case. At a
+1,000,000 cap the same arithmetic gives 134 to 214 MiB per tenant, and 1.3 to
+2.1 GiB for ten. Raise a tenant's ceiling explicitly in its own table when it
 needs one, sized against this formula.
 
 ### Transient decompression memory
@@ -488,13 +488,19 @@ agree with each other or a reader can lose a segment out from under it. The
 governing inequality is:
 
 ```
-protection_horizon >= max_query_duration + grace
+protection_horizon >= max_query_duration + grace + clock_skew_allowance
 ```
 
-These values are recorded once, deployment-wide, in a durable `sys/gc` object at
-the bucket root, and every mode validates itself against it at startup. That is
-what stops three independently deployed process configurations from drifting
-apart with nothing checking the constraint.
+The first three values are recorded once, deployment-wide, in a durable
+`sys/gc` object at the bucket root, and every mode validates itself against it
+at startup. That is what stops three independently deployed process
+configurations from drifting apart with nothing checking the constraint. The
+`clock_skew_allowance` term is not stored in `sys/gc`: it is an input to the
+check, taken from `gc-config set`'s own `--clock-skew-allowance` at write time
+and from the running sweeper's allowance (default 5m) at maintain startup, so a
+horizon that does not cover the sweeper's clock skew can neither be written nor
+run against. [Deletion and garbage collection](../../deletion-and-gc.md) has the
+argument.
 
 **Bootstrap never blocks a fresh deployment.** The first process to touch a
 fresh bucket writes `sys/gc` from the maintain defaults, which satisfy the
@@ -518,7 +524,7 @@ and the others read and validate against the winner's object.
 ### The flags, and the order to change them in
 
 Each knob has a `ravel-server` flag, a humantime duration defaulting to its
-shipped value, so a process that sets none of them is unchanged:
+shipped value:
 
 - `--gc-protection-horizon` and `--gc-grace` feed the maintain compactor and
   must **equal** the durable values. Set them to whatever the last
@@ -635,9 +641,8 @@ The object-key prefix for a tenant is a hash of the tenant id, pinned per bucket
 at the bucket's birth by a `sys/tenancy` marker. One binary carries both
 schemes and selects one at startup:
 
-- **v1 unkeyed**: the original derivation. Every bucket created before the
-  marker existed is pinned to it permanently. Tenant names are not in keys, but
-  anyone with list access can confirm a guessed tenant id offline.
+- **v1 unkeyed**: a plain hash of the tenant id. Tenant names are not in keys,
+  but anyone with list access can confirm a guessed tenant id offline.
 - **v2 keyed**, the default for new buckets: the prefix is keyed by a 32-byte
   deployment key loaded from `--tenant-hash-key-file`. It is a file, never an
   inline value, so the secret never appears in a process listing. Without the
@@ -887,12 +892,11 @@ store costs at most one failed request per tenant per second. That fallback is a
 real degradation, so it is counted rather than silent, in
 `ravel_typed_attr_columns_stale_fallback_total`.
 
-**Cost note.** Promoting a key does not make equality predicates on it faster,
-and today it makes them slower: `attrs['k'] = 'v'` prunes blocks through the
-index, while `k = 'v'` on the promoted column is evaluated as a residual filter
-above the scan. Promote for typed comparisons and aggregates (`k > 5`,
-`SUM(k)`), which are impossible over the map, not to speed up an equality that
-already prunes.
+**Cost note.** A predicate on a promoted column prunes blocks before decode: an
+`i64` or `bool` comparison through the skip index, and a `str` or `bytes`
+equality through the same POSTINGS index that `attrs['k'] = 'v'` uses. Promote
+for typed comparisons and aggregates (`k > 5`, `SUM(k)`), which are impossible
+over the map; an equality that already prunes gains nothing from promotion.
 
 There is also a per-object budget on how many distinct attribute name and type
 pairs get a real column at write time. Pairs beyond the budget fold into an
@@ -901,8 +905,8 @@ overflow column and lose columnar access. Watch for that in
 
 ## Per-query budgets
 
-Four flags bound what one query may spend. Each defaults to the value that was
-compiled in before the flag existed, so leaving them unset changes nothing.
+Four flags bound what one query may spend. Each defaults to the compiled-in
+value.
 
 | Flag | Default | Choose against |
 |---|---|---|

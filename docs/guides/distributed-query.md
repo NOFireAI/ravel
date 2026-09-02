@@ -35,9 +35,8 @@ Contents:
 
 Distribution changes **where bytes are fetched and decoded**, never **what a
 query computes**. A distributed result is bit-for-bit identical to the result
-the same query would produce on one process, and a differential test
-(`distributed_merge_equals_local_bitwise`) enforces that over arbitrary
-corpora and slice partitions.
+the same query would produce on one process, over any corpus and any slice
+partition.
 
 Concretely:
 
@@ -88,18 +87,18 @@ defaults in place.
 
 <svg viewBox="0 0 980 720" width="980" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Lifecycle of a distributed query: request, resolve, cost gate, slice dispatch, merge, evaluate, respond">
   <style>
-    .b{fill:#ffffff;stroke:#3a3a3a;stroke-width:1.2;}
-    .g{fill:#f2f2f2;stroke:#3a3a3a;stroke-width:1.2;}
-    .s{fill:#fff7e0;stroke:#8a6d00;stroke-width:1.2;}
-    .r{fill:#eef4ff;stroke:#1f4e9c;stroke-width:1.2;}
-    .t{font:12px monospace;fill:#1a1a1a;}
-    .h{font:bold 12px monospace;fill:#1a1a1a;}
-    .a{stroke:#3a3a3a;stroke-width:1.2;fill:none;marker-end:url(#arL);}
-    .d{stroke:#1f4e9c;stroke-width:1.2;fill:none;marker-end:url(#arLd);stroke-dasharray:5 3;}
+    .b{fill:#ffffff;stroke:#383e46;stroke-width:1.2;}
+    .g{fill:#eceef1;stroke:#383e46;stroke-width:1.2;}
+    .s{fill:#f4c869;stroke:#8a5a10;stroke-width:1.2;}
+    .r{fill:#a9c9e6;stroke:#1f4e79;stroke-width:1.2;}
+    .t{font-size:12px;fill:#17191c;}
+    .h{font-size:12px;font-weight:bold;fill:#17191c;}
+    .a{stroke:#383e46;stroke-width:1.2;fill:none;marker-end:url(#arL);}
+    .d{stroke:#1f4e79;stroke-width:1.2;fill:none;marker-end:url(#arLd);stroke-dasharray:5 3;}
   </style>
   <defs>
-    <marker id="arL" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#3a3a3a"/></marker>
-    <marker id="arLd" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#1f4e9c"/></marker>
+    <marker id="arL" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#383e46"/></marker>
+    <marker id="arLd" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#1f4e79"/></marker>
   </defs>
   <rect class="b" x="330" y="8" width="220" height="30"/><text class="h" x="384" y="28">Client request</text>
   <path class="a" d="M440,38 L440,60"/>
@@ -520,18 +519,18 @@ operator opted that remote into it.
 
 <svg viewBox="0 0 940 580" width="940" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Failure flow: intra-cluster slice re-dispatch and local fallback, and the cross-cluster skip path">
   <style>
-    .b{fill:#ffffff;stroke:#3a3a3a;stroke-width:1.2;}
-    .g{fill:#f2f2f2;stroke:#3a3a3a;stroke-width:1.2;}
-    .s{fill:#fff7e0;stroke:#8a6d00;stroke-width:1.2;}
-    .r{fill:#eef4ff;stroke:#1f4e9c;stroke-width:1.2;}
-    .t{font:12px monospace;fill:#1a1a1a;}
-    .h{font:bold 12px monospace;fill:#1a1a1a;}
-    .a{stroke:#3a3a3a;stroke-width:1.2;fill:none;marker-end:url(#arX);}
-    .d{stroke:#1f4e9c;stroke-width:1.2;fill:none;marker-end:url(#arXd);}
+    .b{fill:#ffffff;stroke:#383e46;stroke-width:1.2;}
+    .g{fill:#eceef1;stroke:#383e46;stroke-width:1.2;}
+    .s{fill:#f4c869;stroke:#8a5a10;stroke-width:1.2;}
+    .r{fill:#a9c9e6;stroke:#1f4e79;stroke-width:1.2;}
+    .t{font-size:12px;fill:#17191c;}
+    .h{font-size:12px;font-weight:bold;fill:#17191c;}
+    .a{stroke:#383e46;stroke-width:1.2;fill:none;marker-end:url(#arX);}
+    .d{stroke:#1f4e79;stroke-width:1.2;fill:none;marker-end:url(#arXd);}
   </style>
   <defs>
-    <marker id="arX" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#3a3a3a"/></marker>
-    <marker id="arXd" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#1f4e9c"/></marker>
+    <marker id="arX" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#383e46"/></marker>
+    <marker id="arXd" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#1f4e79"/></marker>
   </defs>
   <text class="h" x="20" y="26">Intra-cluster slice failure (never partial)</text>
   <rect class="b" x="20" y="40" width="190" height="44"/>
@@ -623,13 +622,11 @@ fallback, so the reported cost never under-counts work already paid for.
 
 ## What is not distributed
 
-Deliberately, for now:
+Deliberately:
 
 - **Aggregation and evaluation.** Both stay on the coordinator. The SQL engine
   forces single-partition aggregation for bit-stable float accumulation, and
-  that reasoning applies unchanged to distributed partials. Order-insensitive
-  pushdown, and the float-tolerance policy that order-sensitive pushdown would
-  need, are separately tracked.
+  that reasoning applies unchanged to distributed partials.
 - **Logs and spans, on the engine's fan-out lane.** Only the metrics signal
   distributes there. A slice for any other signal is answered `Unsupported`,
   and the whole query runs locally.

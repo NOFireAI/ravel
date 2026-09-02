@@ -90,15 +90,15 @@ silently unprotected:
 
 - **Disabled**, or a versioning-without-expiration alarm, refuses to start.
 - **Unknown**, which is what every backend reachable only through the
-  object-store contract reports today because no adapter can answer the query,
+  object-store contract reports, because no adapter can answer the query,
   logs one warning and sets `ravel_bucket_protection_unknown` to `1` at
   `/metrics` rather than blocking startup.
 - **Enabled** with no alarms starts clean, with the gauge at `0`.
 
 The flag is off by default, so a development process that does not pass it
-starts exactly as it did before the gate existed. The Kubernetes operator sets
-it unconditionally for every cluster it reconciles: the custom resource carries
-no development or staging profile field to gate on.
+starts without the gate. The Kubernetes operator sets it unconditionally for
+every cluster it reconciles: the custom resource carries no development or
+staging profile field to gate on.
 
 ## The first deployment against a fresh bucket
 

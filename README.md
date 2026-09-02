@@ -21,7 +21,7 @@ its commit record created, and the response carries one commit token per shard
 those points flushed through. After a strict acknowledgement, no crash of any
 Ravel process loses that data.
 
-Buffered acknowledgement is the opt-out, set per tenant or per request. It
+Buffered acknowledgement is opt-in per request. It
 acknowledges after admission and enqueue to a shard actor, and it returns no
 commit token: it trades the guarantee above for write latency. A crash between
 that acknowledgement and the flush loses the buffered window, bounded by the
@@ -32,9 +32,9 @@ normative for both modes.
 ## Why it is built this way
 
 Every self-hosted observability stack ends up storing data on object storage.
-Almost none of them start there. Mimir, Loki, Tempo, and Thanos buffer writes in
-a replicated ingest layer with local disks, then ship to object storage later.
-That is why running them means running a write-ahead log,
+Almost none of them start there. The common design buffers writes in a
+replicated ingest layer with local disks, then ships to object storage later.
+That is why running one means running a write-ahead log,
 PersistentVolumeClaims, replication factors, and rollout ordering.
 
 Ravel makes the object store the first stop. An ingest shard builds an immutable
@@ -85,7 +85,7 @@ pays an object-store round trip and buffered mode gives up the crash guarantee
 above. Ravel is pre-1.0: the persistent formats are versioned contracts, and the
 surfaces around them still move.
 
-## What works today
+## What works
 
 Ravel ingests OTLP natively and answers PromQL and SQL. Everything below is
 either in the published container image or behind a named cargo feature, and the
@@ -305,12 +305,12 @@ so that is the identity in the certificate:
 
 ```sh
 cosign verify \
-  --certificate-identity 'https://github.com/NOFireAI/ravel/.github/workflows/publish-images.yml@refs/tags/v0.9.0' \
+  --certificate-identity 'https://github.com/NOFireAI/ravel/.github/workflows/publish-images.yml@refs/tags/v0.11.0' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
-  ghcr.io/nofireai/ravel-server:0.9.0
+  ghcr.io/nofireai/ravel-server:0.11.0
 ```
 
-Replace `v0.9.0` and `0.9.0` with the release you are verifying. The tag ref in
+Replace `v0.11.0` and `0.11.0` with the release you are verifying. The tag ref in
 `--certificate-identity` must be the exact tag that produced the image.
 
 ## How Ravel is verified
@@ -339,9 +339,10 @@ hold Ravel to them:
   metrics, RLOG for logs, RSPAN for spans), the commit protocol, the catalog, the
   decoders, the ingest actors, PromQL, the query engine, and DataFusion-backed
   SQL.
-- `services/` holds `ravel-server` (gateway, ingest, query, and maintain modes in
-  one binary), `ravel-cli` (a segment, commit, and catalog inspector, and the
-  Parquet bulk loader), and the Kubernetes operator.
+- `services/` holds `ravel-server` (the `all`, `gateway`, `query`, and
+  `maintain` modes in one binary), `ravel-cli` (a segment, commit, and catalog
+  inspector, and the Parquet bulk loader), `ravel-ingest-router` (the optional
+  tenant-affinity front door), and the Kubernetes operator.
 - `docs/` holds the guides, the specs, the decision records, and the diagrams.
 - `deploy/` holds the quickstart compose stack, the Collector and Grafana
   provisioning, and the Kubernetes manifests.

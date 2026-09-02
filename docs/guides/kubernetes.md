@@ -227,9 +227,9 @@ configuration.
 Tenant tokens are injected as env vars from the Secret and rendered into
 `--tenant-token $(RAVEL_TENANT_TOKEN_<i>)=<tenant>` with kubelet `$(VAR)`
 expansion, so token values never appear in the API object. They do still appear
-in process argv on the node. A native env or file token source in `ravel-server`
-is a known follow-up. A checksum annotation on each pod template rolls the pods
-when either Secret changes.
+in process argv on the node, because `ravel-server` reads tenant tokens from
+flags and has no env or file token source. A checksum annotation on each pod
+template rolls the pods when either Secret changes.
 
 ### `sys/auth` ownership
 
@@ -302,8 +302,8 @@ kubectl get -n ravel-system ravelcluster dev -o jsonpath='{.status}'
 
 `status` carries `observedGeneration`, `gatewayReadyReplicas`,
 `queryReadyReplicas`, `maintainReadyReplicas`, and conditions. The operator
-writes two condition types: `Available` and `Degraded`. A `Progressing`
-condition is designed but not emitted, so do not wait on it.
+writes two condition types: `Available` and `Degraded`. It emits no
+`Progressing` condition, so do not wait on one.
 
 `Available=True` means the gateway and query Deployments both report ready
 replicas. `kubectl wait --for=condition=Available` is therefore a usable
@@ -319,19 +319,25 @@ liveness probe and a readiness probe at them. The gRPC port has no health
 service and gets no probe.
 
 - `/healthz` (liveness): 200 whenever the HTTP listener is serving. It means
-  the event loop is alive.
-- `/readyz` (readiness): 200 after startup completes: config parsed, the store
-  capability gate passed, listeners bound. 503 before that.
+  the event loop is alive, and it never depends on store reachability, so a
+  store outage cannot get healthy pods killed.
+- `/readyz` (readiness): 200 after startup completes (config parsed, the store
+  capability gate passed, listeners bound) and while the background
+  store-reachability probe is healthy. 503 before startup completes, and after
+  four consecutive failed probes until the next successful one.
 
 `/-/healthy` and `/-/ready` are aliases for `/healthz` and `/readyz`, served by
 the same handlers for clients that probe Prometheus' own paths. Either
 spelling works in a probe.
 
-`/readyz` performs **no object-store call per probe**. This is deliberate. A
-store operation on every kubelet probe of every pod costs real money against
-real S3, and a transient S3 blip would eject every pod from its Service at the
-same time. Continuous store-health probing is a separate decision and a
-named follow-up, not an oversight.
+`/readyz` performs **no object-store call per probe**. The kubelet reads an
+in-memory value that one background probe per process maintains on
+`--store-probe-interval`, so a store operation is never paid per kubelet probe
+per pod, and a single transient blip cannot eject every pod from its Service
+at once: four failures down, one success up. See
+[readiness and the store reachability probe](operations/deployment.md#readiness-and-the-store-reachability-probe)
+for the hysteresis and the two `/metrics` samples that make an outage
+visible.
 
 ## Production notes
 
@@ -375,11 +381,11 @@ Each of the operator's three Deployments maps to one storage credential role:
 A fourth role, **Admin**, backs `ravel-cli` and is deliberately not managed by
 the operator: there is no CRD field for it and no pod runs it. It is used only
 by out-of-band operator/CI invocations. See
-[operations.md](operations.md#the-admin-credential).
+[the Admin credential](operations/deployment.md#the-admin-credential).
 
 The exact per-role AWS IAM policy JSON, the MinIO equivalent for dev/CI, and
 the first-deployment bootstrap notes all live in one place:
-[operations.md, "Storage credential roles"](operations.md#storage-credential-roles-adr-0055).
+[storage credential roles](operations/configuration.md#storage-credential-roles).
 This section covers only the Kubernetes wiring.
 
 ### Per-mode credential Secrets

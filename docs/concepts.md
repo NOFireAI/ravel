@@ -143,8 +143,8 @@ list. After a strict acknowledgement, no crash of any Ravel process may lose
 that data: object-store durability is the floor, and the data survives
 anything the object store survives.
 
-Under buffered acknowledgement, opt-in per tenant or per request, the
-response comes after admission and enqueue to a shard actor. It returns no
+Under buffered acknowledgement, opt-in per request, the response comes
+after admission and enqueue to a shard actor. It returns no
 commit token, and it is never described as durable, because a crash between
 the acknowledgement and the flush loses the buffered window, bounded by the
 maximum flush delay. A clean shutdown drains that window, so an orderly
@@ -280,14 +280,16 @@ deletions instead of amplifying them. Every sweep pass is stateless and
 restartable from zero, and every delete is idempotent.
 
 None of the three can change a query answer, and that is a design constraint
-rather than a hope. Compaction is a verbatim page copy that never
-deduplicates, and query-time deduplication collapses the duplicate candidates
+rather than a hope. Compaction never deduplicates and conserves the record
+count exactly, and query-time deduplication collapses the duplicate candidates
 if a snapshot happens to include both an L0 input and its L1 replacement, so
 every intermediate state of a compaction is query-correct. Retention and the
 sweep physically remove only what no live snapshot references, and only after
 a protection horizon. A snapshot resolved before, during, or after any of
-these loops returns the same rows. The deletion mechanics are in
-[Deletion and GC](consistency-model.md#deletion-and-gc).
+these loops returns the same rows. The guarantee is
+[Deletion and GC](consistency-model.md#deletion-and-gc) in the consistency
+model, and the mechanics are in
+[deletion and garbage collection](deletion-and-gc.md).
 
 ## Consistency boundaries
 

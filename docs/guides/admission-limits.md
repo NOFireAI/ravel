@@ -60,8 +60,8 @@ buckets (a sustained `per_sec` plus an instantaneous `burst`).
 | Series-creation rate / burst | 10,000/s / 100,000 | `series_creation_rate_per_sec` / `series_creation_burst` |
 | Query bytes-scanned budget | unlimited | `max_bytes_scanned` |
 | Fleet-wide concurrent-query ceiling | unlimited | `--max-concurrent-queries` (CLI flag, not a `--limits-file` key) |
-| Event-time future skew | 10 m | not configurable (`ravel-otlp` default) |
-| Event-time ingest lag | 2 h | not configurable (`ravel-otlp` default) |
+| Event-time future skew | 10 m | not configurable (compiled-in default) |
+| Event-time ingest lag | 2 h | not configurable (compiled-in default) |
 | Fast-tier flush delay | 2 s | `--max-flush-delay` (CLI flag) |
 | Idle-tier flush delay | 40 s | `--max-flush-delay-idle` (CLI flag) |
 | Min flush bytes | 256 KiB | `--min-flush-bytes` (CLI flag) |
@@ -73,13 +73,10 @@ byte threshold stays small does not actually slow the fast tier down. See
 [cost-model.md](cost-model.md) for what moving them costs and buys.
 
 `max_bytes_scanned` lives in the same `[defaults]`/
-`[tenants.<id>]` tables as the ingest limits above, but is not yet
-tenant-parameterized at enforcement time: the query engine holds one
-process-wide budget, so only the `[defaults]` value is actually enforced.
-A `[tenants.<id>]` override for this key is parsed and validated, but has
-no effect beyond a startup warning naming the ineffective tenant. True
-per-tenant query enforcement needs a tenant-aware engine config lookup,
-tracked separately from this ingest-side admission mechanism.
+`[tenants.<id>]` tables as the ingest limits above, but only the
+`[defaults]` value is enforced: the query engine holds one process-wide
+budget. A `[tenants.<id>]` override for this key is parsed and validated, but
+has no effect beyond a startup warning naming the ineffective tenant.
 
 `--max-concurrent-queries` is a fleet-wide, not
 per-tenant, ceiling on how many queries may execute concurrently across the
@@ -101,7 +98,7 @@ hashbrown's power-of-two table sizing at 7/8 load and allocator headroom are
 counted, so `ravel-server` ships that figure to keep the worst-case tracker
 footprint near 27-43 MiB per fully active tenant. At 1,000,000 the same
 arithmetic (cap times bytes-per-entry times two rotating epochs times two
-tracked signals) gives 140-224 MiB per tenant, before multiplying across
+tracked signals) gives 134-214 MiB per tenant, before multiplying across
 tenants and replicas. The `--limits-file` raises it per tenant where the
 memory is available.
 
@@ -166,8 +163,8 @@ rejection counters.
 
 ### Event-time skew
 
-Metrics already enforced event-time skew at admission; logs and spans now
-do too, through the same typed partial-success machinery. A record whose
+Metrics, logs, and spans all enforce event-time skew at admission, through
+the same typed partial-success machinery. A record whose
 event time falls outside `[ingest_ts - max_ingest_lag, ingest_ts +
 max_future_skew]` is rejected, never clamped: rewriting a sender's event
 time would be silent data corruption, where a rejection is visible and
