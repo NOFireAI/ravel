@@ -95,9 +95,6 @@ docs/analytics.md	TERM	robust
 docs/analytics.md	TERM	robust
 docs/analytics.md	TERM	robust
 docs/analytics.md	TERM	robust
-docs/architecture.md	TERM	ingester
-docs/architecture.md	TERM	l1 part
-docs/architecture.md	TERM	robust
 docs/catalog-and-mvcc.md	SUPERLATIVE	em-dash
 docs/catalog-and-mvcc.md	SUPERLATIVE	em-dash
 docs/catalog-and-mvcc.md	SUPERLATIVE	em-dash

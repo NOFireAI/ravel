@@ -1,235 +1,312 @@
 # Architecture
 
-Ravel is an OpenTelemetry-native telemetry database for metrics, logs, and
-traces. One rule shapes every part of it: the object store is the only
-durable component. There is no write-ahead log, no ingester quorum, and no
-local disk that matters. Any process can die at any instant, and every
-STRICTLY acknowledged write survives. Buffered acknowledgement is a
-per-request opt-out with a documented loss window, described under the
-write path below.
+This is the one-page overview: what exists, what is durable, what is
+disposable, and how the pieces meet. Every answer here is short on purpose
+and links to the document that holds the detail. Read
+[docs/concepts.md](concepts.md) first if the vocabulary is new; that page
+defines every term used below and expands every acronym.
 
-This file is the map. Each section names the ADR or spec that holds the
-reasoning and the exact contracts. The doc index in
-[docs/README.md](README.md) lists the operator guides.
+One rule shapes everything: the object store is the only durable component.
+There is no write-ahead log, no replicated block device, and no local disk
+whose loss loses data. Any process can die at any instant, and every
+strictly acknowledged write survives.
 
-## The write path
+## Which components exist
+
+`ravel-server` is one binary that runs four modes: `all`, `gateway`,
+`query`, and `maintain`, selected with `--mode`. A deployment is some number
+of processes of that binary over one bucket. `ravel-cli` is the operator and
+inspection tool. `ravel-operator` reconciles the `RavelCluster` custom
+resource on Kubernetes ([guides/kubernetes.md](guides/kubernetes.md)).
+`ravel-ingest-router` is an optional front door that pins each tenant to a
+stable subset of gateway replicas.
+
+Inside a server process, five subsystems do the work: ingest (gateway
+admission, the router, and the shard actors), the catalog (commit records,
+folds, snapshots), the read path (snapshot resolution, pruning, segment
+fetch, caching), the two query engines (a PromQL evaluator and a
+DataFusion-based SQL engine), and maintenance (compaction, retention, the
+garbage-collection sweep, alert-rule evaluation). Each mode enables a subset
+of them; `all` enables every one.
+
+The ingest surfaces are OTLP over HTTP and gRPC, Prometheus Remote Write,
+and OTAP behind a cargo feature. The query surfaces are the
+Prometheus-compatible `/api/v1/*` routes, `POST /api/v1/sql`, Flight SQL
+behind a cargo feature, and `POST /api/v1/analytics`. All three signals
+share one pipeline: Remote Write payloads normalise to the shape OTLP
+produces and enter the same router call, so there is no second flush or
+commit path to hold correct.
+
+Two capabilities that the decision records discuss do not exist in the
+shipped system: RavelQL, and Sigma or OCSF rule ingestion. Logs, spans,
+compaction, and catalog snapshots all ship.
+
+## Which state is durable
+
+Objects in the bucket, and nothing else. There are five kinds:
+
+- Data objects: immutable columnar segments, one per flush at L0 and one per
+  compaction output at L1. Their layouts are frozen contracts, one per
+  signal: [RSEG](segment-format.md), [RLOG](log-segment-format.md), and
+  [RSPAN](span-segment-format.md).
+- Commit records: immutable objects that publish a data object. Also the
+  compaction records, rewrite records, retention tombstones, and idempotency
+  markers that publish the other durable transactions.
+- Catalog objects: immutable snapshot parts and column-statistics objects,
+  plus the HEAD pointer, which is the only mutable object in a tenant's
+  keyspace and is written only under compare-and-swap.
+- Per-tenant records: the shard-count provisioning record, the encryption
+  key-epoch record, the lifecycle and limits configuration, and metric family
+  metadata.
+- Deployment records under the bucket root: the store qualification record,
+  the tenancy scheme marker, the authentication map, per-process liveness
+  heartbeats, and advisory work claims.
+
+The exact key layout and the mutability rule for every one of them is in
+[docs/catalog-and-mvcc.md](catalog-and-mvcc.md).
+
+## Which processes are disposable
+
+All of them. Disposable is a stronger claim than stateless: a process holds
+buffered records, a resolved snapshot, a read cache, and a membership view,
+but never state that another process needs in order to recover. No restart
+path reads a file another process wrote locally, and no correctness argument
+depends on a particular process returning.
+
+Concretely, that means five things. A process can be replaced by a fresh one
+with no handoff, so rolling restarts, autoscaling, and spot interruption are
+ordinary events rather than incidents. Local disk is a cache only: the read
+cache's disk tier and any scratch directory can be deleted between runs with
+no effect except a colder first pass ([guides/caching.md](guides/caching.md)).
+There is no leader to elect, no quorum to lose, and no membership state to
+repair, because the store's own conditional writes are the only arbiter.
+Alert-rule state lives in durable records rather than process memory, so a
+restarted evaluator resumes from them. And a process's identity is
+short-lived: a restarted writer takes a new epoch rather than reusing a
+sequence number, so nothing depends on a process remembering what it did
+before it died.
+
+What disposability costs is that every durable step is a network round trip.
+The floor on visibility latency is object-store latency, and request count is
+a real bill ([guides/cost-model.md](guides/cost-model.md)).
+
+Two HTTP routes exist on every mode so an orchestrator can act on this
+model. `/healthz` answers 200 whenever the HTTP loop is serving and never
+depends on store reachability, so a store outage cannot get healthy processes
+killed. `/readyz` gates on completed startup and then follows a background
+store probe with asymmetric hysteresis: four consecutive probe failures flip
+it to 503 and one success recovers it, and the kubelet path reads an
+in-memory atomic rather than touching the store. `/metrics` is the third
+unconditional route, rendering a fixed and deliberately small label set so
+Ravel's own telemetry cannot explode
+([guides/observability.md](guides/observability.md)).
+
+## How ingest, query, and maintenance interact
 
 ![Write path: clients through gateway, router, and shard actors to object storage, then acknowledgement](diagrams/architecture-write-path.svg)
 
-A batch enters through the gateway, which resolves the tenant and applies
-that tenant's admission limits. The router hashes each record's identity to
-a shard. Each shard is one single-threaded actor with a bounded queue, so
-ordering inside a shard needs no locks. The actor buffers records, builds
-one immutable columnar object in memory, and writes it with two PUTs: the
-data object first, then a commit record. The commit record is the publish:
-readers see only data that a commit record names.
-
-Acknowledgement has two modes ([docs/consistency-model.md](consistency-model.md) is normative).
-Strict mode answers the client only after both PUTs are durable, and the
-response carries a commit token. A query that presents that token reads the
-write with no listing race. Buffered mode answers after admission and
-enqueue, and the crash window this opens is documented, bounded, and
-chosen per request, never hidden. Only OTLP ingest offers buffered mode;
-Remote Write is strict-only, and a buffered-mode header on it is ignored
-rather than honored.
-
-All three signals share this pipeline. Remote Write payloads normalize to
-the same shape OTLP produces and enter the same router call, so there is no
-second flush or commit path to hold correct. Every persistent layout the
-path writes is a frozen contract: the RSEG layout ([docs/segment-format.md](segment-format.md)),
-the RLOG layout ([docs/log-segment-format.md](log-segment-format.md)), the protobuf schemas under
-proto/, and the object key layout ([docs/catalog-and-mvcc.md](catalog-and-mvcc.md)).
-
-## The catalog and the read path
+Ingest writes two objects per flush. A batch enters through the gateway,
+which resolves the tenant and applies that tenant's admission limits. The
+router hashes each record's identity to a shard, and each shard is one
+single-threaded actor with a bounded queue. The actor buffers records, builds
+one immutable columnar segment in memory, and writes it with two PUTs: the
+data object first, then the commit record that publishes it. Strict
+acknowledgement answers the client only after both PUTs are durable and
+returns one commit token per shard the request's points flushed through;
+buffered acknowledgement answers after admission and enqueue, returns no
+token, and carries a bounded loss window on an abrupt crash.
+[docs/consistency-model.md](consistency-model.md) is normative for both, and
+[docs/ingest.md](ingest.md) holds the pipeline's internals.
 
 ![Read path: commit records fold into a snapshot; queries pin the snapshot, prune, fetch, and evaluate](diagrams/architecture-read-path.svg)
 
-Commit records are the write-side truth, and the catalog fold turns them
-into a read-side index. The fold runs in the background per tenant and
-signal. It lists commit records whose ingest hour has sealed, folds them
-into content-addressed snapshot parts, and publishes a new HEAD with a
-compare-and-swap. Two folders can race safely: the loser's CAS fails and
-nothing is corrupted. An hour seals only after
-`max_flush_lifetime + clock_skew_allowance + fold_safety_margin` has passed,
-so a fold that runs right after a write finds nothing eligible. That is the
-expected answer, not a failure. [docs/catalog-and-mvcc.md](catalog-and-mvcc.md) holds the exact
-protocol.
-
-A query starts with one GET of HEAD, which pins one immutable snapshot.
-Everything the query reads comes from that snapshot, so results are stable
+Query reads from a pinned snapshot. It begins with one GET of HEAD, which
+pins one immutable snapshot for the whole execution, so results are stable
 under concurrent folds and compactions. Planning prunes with the snapshot's
 time and shard bounds, then with skip indexes, bloom filters, and exact
-per-column statistics. Pruning obeys one invariant: it may widen the read
-set, never narrow it below what correctness requires. Statements that exact
-catalog statistics can answer in full, such as a predicate-free count,
-issue zero data reads.
+per-column statistics, under one invariant: pruning may widen the read set,
+never narrow it below what correctness requires. The fetch layer probes an
+object's footer and then issues ranged GETs for the blocks the plan kept, or
+a whole-object GET where that is cheaper. A read cache holds hot chunks, and
+a cold pass and a warm pass over the same data differ only in requests
+issued, never in rows returned. [docs/query-engine.md](query-engine.md) holds
+the engine contract, and [guides/query.md](guides/query.md) the endpoints.
 
-The fetch layer probes an object's footer, then issues ranged GETs for the
-blocks the plan kept, or a whole-object GET when that is cheaper. The
-request-cost/latency trade is an operator knob, not a constant. A read
-cache holds hot chunks in memory; a cold and a warm pass over the same data
-differ only in requests issued, never in rows returned.
+Maintenance reshapes the bucket without changing any answer. Compaction
+merges many L0 segments into fewer L1 segments per (tenant, signal, shard,
+ingest hour) bucket, publishing them with one compaction record after
+checking that input and output record counts are exactly equal. Retention
+expires data by age behind a durable tombstone. The sweep physically removes
+what nothing references, behind grace periods and a mass-orphan circuit
+breaker, so a listing anomaly withholds deletions instead of amplifying them.
+The catalog fold is the fourth loop: it turns sealed commit records into
+snapshot parts and publishes a new HEAD by compare-and-swap.
 
-Two query engines sit on top of one fetch layer. The PromQL evaluator
-serves the Prometheus-compatible `/api/v1/*` routes. The SQL engine
-(ravel-sql, on DataFusion) serves the `samples`, `logs`, and `spans` tables
-over `POST /api/v1/sql` and Flight SQL. Both engines deduplicate
-cross-segment duplicates with the same bit-exact total order, and Arrow and
-DataFusion stay isolated behind the `sql` and `flight-sql` cargo features.
+The three meet at the commit record and at HEAD, and nowhere else. Ingest
+only creates commit records; the fold only reads them and writes snapshot
+parts; query only reads HEAD and the objects it names. Maintenance
+supervisors derive their tenant set by listing tenant prefixes rather than
+from a flag, so no configuration can silently exclude a tenant from
+retention, and a discovery failure skips and retries the cycle rather than
+falling back to an empty set.
 
-## Maintenance
+<a id="on-demand-catalog-fold"></a>
+One maintenance operation is also an API. `POST /api/v1/admin/fold` runs the
+same fold the background loop runs, for one tenant and one signal, under the
+credential the query surfaces take. Concurrent calls for one pair coalesce
+into a single fold, and a rate gate declines when HEAD is younger than the
+fold interval. Its response distinguishes four outcomes, because they are
+different facts for an operator: `published`, `nothing_eligible`, `lost_cas`,
+and `throttled`. Right after a load the honest answer is `nothing_eligible`,
+because an ingest hour is not foldable until its sealing window has elapsed.
 
-Compaction, retention, and garbage collection run as background work over
-the same store, and every one of their outputs is published through the
-same commit or CAS protocols the write path uses.
+## What Ravel assumes about the object store
 
-- Compaction merges many small L0 objects into few larger L1 parts per
-  `(tenant, signal, shard, ingest hour)` bucket, streaming blocks rather
-  than materializing inputs. Output parts are content-addressed, and a
-  compaction record publishes them atomically; two compactors racing on
-  one bucket converge on one winner (ADR-0979 bounds the merge's memory).
-- Age-based retention and the GC sweeper delete only what nothing
-  references, behind grace periods and a mass-orphan circuit breaker, so a
-  listing anomaly withholds deletions instead of amplifying them.
-- The fold (above) is the third background loop, and an on-demand form of
-  it exists per tenant (below).
+These are requirements, not preferences. Production startup fails if the
+configured backend under-reports any of them:
 
-The maintenance and fold supervisors derive their tenant set from storage,
-not from flags: each cycle lists the tenant prefixes under `t/` and runs
-every discovered tenant's tick. Once a tenant carries a durable
-`t/<hash>/config` lifecycle record, that record is the sole authority, and
-no flag can silently exclude the tenant from retention. A discovery failure
-skips the whole cycle and is retried; it never falls back to an empty
-tenant set, because an empty set would look exactly like a healthy idle
-cycle on the dashboard meant to catch it. The
-`ravel_maintain_tenants_discovered` and `..._maintained` gauges expose the
-gap a restriction or a bug would open.
+- Read-after-write consistency on create, so a commit record is readable the
+  instant it exists.
+- List-after-write consistency, so a commit record is discoverable by
+  listing the instant it exists.
+- Conditional create-if-absent put, which is what makes commit records and
+  data objects safe to write from many uncoordinated processes.
+- Compare-and-swap on a version, which is what makes the HEAD pointer safe to
+  publish.
+- Ranged reads including suffix ranges, which is what makes footer-first
+  segment reads possible.
+- Paginated prefix listing, used by discovery and by garbage collection.
 
-## One binary, four modes
+`--mode maintain` additionally requires multipart upload. Optional and not
+required by any mode: batch delete, lifecycle expiration, and server-side
+encryption headers.
 
-`ravel-server` runs every role as a mode of one binary: `all`, `gateway`,
-`query`, and `maintain`. Crate boundaries keep the roles separable, and
-`maintain` is a disposable worker that serves no ingest or query surface.
-Every mode binds `--listen-http` and serves three routes there
-unconditionally:
+Startup on any non-memory store is also gated on a durable qualification
+record: a deployment runs `ravel-cli store qualify` once before its first
+server starts, which proves the backend honours the semantics the commit
+protocol depends on before any data rides on them. The capability table, the
+qualification suite, and the retry and timeout contract are in
+[docs/object-store-contract.md](object-store-contract.md).
 
-- `/healthz` answers 200 whenever the HTTP loop is serving. It never
-  depends on store reachability, so a store outage cannot get healthy
-  processes killed.
-- `/readyz` gates on completed startup, then follows a background store
-  probe with asymmetric hysteresis: four consecutive probe failures flip it
-  to 503, one success recovers it. The kubelet path reads an in-memory
-  atomic and never touches the store.
-- `/metrics` renders hand-written Prometheus text from counters the process
-  already holds. The label set is fixed and small on purpose; per-shard and
-  free-form labels are excluded so Ravel's own telemetry cannot explode.
+## Where the trust and failure boundaries are
 
-Startup on any non-memory store is gated on a durable `sys/qualification`
-record: a deployment must run `ravel-cli store qualify` once before the
-first server starts. This proves the backend honors the semantics the
-commit protocol depends on, before any data rides on them.
+The tenant is the isolation boundary. A tenant never appears in an object
+key, only a hash of it does, and no query resolves across two tenants. Every
+per-tenant limit, retention policy, encryption key epoch, and shard count
+hangs off that boundary.
 
-Three listeners exist. `--listen-http` carries OTLP HTTP, Remote Write, the
-query and analytics routes, and SQL. `--listen-grpc` carries OTLP gRPC,
-Flight SQL, and the cluster-internal fragment service. `--mtls-listener` is
-a third listener for mTLS-terminated traffic; the resolver that trusts the
-forwarded client-certificate header exists only in that listener's router
-chain, so the public listeners are safe against header forgery by
-construction. Startup validation refuses any configuration that would break
-this isolation.
+The listener is the authentication boundary. `--listen-http` carries OTLP
+HTTP, Remote Write, the query and analytics routes, and SQL. `--listen-grpc`
+carries OTLP gRPC, Flight SQL, and the cluster-internal fragment service.
+`--mtls-listener` is a separate listener for mTLS-terminated traffic, and the
+resolver that trusts a forwarded client-certificate header exists only in
+that listener's router chain, so the public listeners are safe against header
+forgery by construction. Startup validation refuses any configuration that
+would break the isolation.
 
-## Distributed reads and cross-cluster federation
+A remote cluster is a separate trust domain. Federation sends matchers and a
+time window to the remote's public API under an ordinary per-remote
+credential, and the remote resolves its own snapshot under its own state. No
+segment reference, storage credential, or client credential crosses the
+boundary. A slow or unreachable remote degrades to partial coverage, and that
+state is always visible in the query's stats and warnings
+([guides/distributed-query.md](guides/distributed-query.md)).
+
+The failure boundaries are the two PUTs of a write and the compare-and-swap
+of a fold. A failure on either side of them has a defined outcome and never
+an ambiguous one for Ravel, only sometimes for the client. Storage
+credentials are scoped so that the grant set a role carries matches the
+objects its mode writes; the store itself is the last boundary, and its
+durability is the floor under every guarantee on this page.
+
+## What happens when processes run concurrently
 
 ![Cluster topology: symmetric query nodes over one shared bucket, with remote clusters reached only through their API](diagrams/architecture-cluster-topology.svg)
 
-A read can span more than one process. This is off by default and
-cost-gated: the node that receives a request coordinates it, resolves one
-pinned snapshot, and fans out only when a pre-execution estimate clears the
-gate. Cheap queries run the untouched local path. Worker membership needs
-no new durable state; nodes self-register with a heartbeat key, and
-rendezvous hashing assigns slices. The fragment service admits inbound
-slices from a pool separate from client-query admission, so a coordinator
-holding a client permit can never deadlock on fragments that need the same
-pool. A slice the coordinator owns runs through the same service in
-process, so local and remote slices cannot diverge in behavior.
+Processes are symmetric and uncoordinated. Any number of them may serve any
+mode over one bucket, and none of them exchanges state with another except
+through objects. Every race is resolved by a conditional write rather than by
+a lock: two writers on one commit key are separated by create-if-absent, two
+folders by the HEAD compare-and-swap, two compactors on one bucket by the
+create-if-absent on the compaction record. The loser of any of these
+re-reads, and its already-written objects become unreferenced and age out.
 
-Federation treats every remote cluster as a separate trust domain. The
-coordinator sends matchers and a time window to the remote's public API
-under an ordinary per-remote credential. The remote resolves its own
-snapshot under its own erasure state. No segment reference, S3 credential,
-or client credential ever crosses the boundary. A slow or unreachable
-remote degrades to partial coverage, and that state is always visible in
-the query's stats and warnings. [docs/query-engine.md](query-engine.md) and
-[docs/guides/distributed-query.md](guides/distributed-query.md) hold the full contract.
+Work is divided without a coordinator. Maintain workers and query workers
+each write a liveness heartbeat under their own key, list their siblings to
+compute a live set, and partition the work unit space over it by rendezvous
+hashing, so N replicas divide the work rather than each paying for all of it.
+Membership needs no new durable state and no lease, and a stale heartbeat is
+self-correcting on the next interval.
 
-## Analytics and alerting
+A single read can also span processes. This is off by default and cost-gated:
+the receiving node coordinates the request, resolves one pinned snapshot, and
+fans out only when a pre-execution estimate clears the gate, so cheap queries
+run the untouched local path. The fragment service admits inbound slices from
+a pool separate from client-query admission, so a coordinator holding a
+client permit cannot deadlock on fragments needing the same pool, and a slice
+the coordinator owns runs through the same service in process, so local and
+remote slices cannot diverge in behaviour.
 
-`ravel-analytics` is a post-evaluation stage of pure per-series functions:
-change point detection and robust summary statistics over
-`(timestamp_ns, f64)` slices. `POST /api/v1/analytics` runs the same range
-evaluation as `/api/v1/query_range`, then applies the requested operation
-per series. It links no Arrow and needs no cargo feature. Approximation
-exists only as an explicit, visible `downsample` option.
+Concurrency never changes an answer. A query pins its snapshot at the first
+GET, and commits, folds, compactions, and deletions that land mid-query are
+outside it.
 
-Alert rules are queries. One background task per tenant evaluates the
-tenant's rules against the same query engines the API serves from, on a
-jittered interval. State transitions, and only transitions, are written as
-immutable records under the alerts keyspace, through the same
-data-PUT-then-commit-PUT protocol as any signal. No alert state lives in
-process memory, so a restarted evaluator resumes from the records. Webhook
-and Alertmanager sinks fire only after the record is durable; delivery is
-at-least-once and never blocks the write. A firing rule re-notifies on its
-`repeat_interval`, anchored to the durable record's timestamp, so the
-schedule survives restarts.
+## How the system behaves after an interruption or a retry
 
-## On-demand catalog fold
+Nothing is repaired on startup, because nothing needs repairing. A restarted
+process reads the store and continues; there is no recovery log to replay and
+no local state to reconcile.
 
-`POST /api/v1/admin/fold` runs the same fold the background loop runs, for
-one tenant and one signal, under the same credential the query surfaces
-require. Concurrent calls for one `(tenant, signal)` coalesce into a single
-fold, and a rate gate declines to fold when HEAD is younger than the fold
-interval. Together the gates bound one caller to one fold per signal per
-interval. Every completed call reports one of four statuses, because these
-are different facts an operator has to tell apart:
+An interruption between a write's two PUTs leaves a data object that no
+commit record names. It is invisible to every query, and the sweep deletes it
+after the grace period. An interruption after the commit PUT but before the
+response leaves data that is durable and visible while the client believes
+the write failed. That is the one genuinely ambiguous case, and it is
+ambiguous for the client: an unkeyed retry stores a duplicate, and a keyed
+retry replays its idempotency marker and stores nothing new, because the
+marker PUT precedes the acknowledgement.
 
-| `status` | Meaning |
-|---|---|
-| `published` | A new snapshot was published; HEAD names different content than before. |
-| `nothing_eligible` | No commit was eligible. `head_advanced` says whether the sealing watermark still moved. |
-| `lost_cas` | A concurrent fold won the HEAD CAS; that fold's snapshot is current. |
-| `throttled` | HEAD is younger than the fold interval; nothing was listed, so no eligibility claim is made. |
+Retries are safe everywhere because no persisted step is a
+read-modify-write. Data objects are content-addressed, commit records and
+markers are created with create-if-absent, and HEAD moves only under
+compare-and-swap. Delivery is at-least-once: for metrics a duplicate
+collapses at query time by series and timestamp, and for logs and spans the
+opt-in idempotency key is what makes a retry a no-op.
 
-Authentication and validation errors (401, 400, 403) precede any store
-work. A 503 does not carry that guarantee: the fold may have written parts
-before failing, so a 503 means "outcome unknown, retry", never "nothing was
-written".
+Where an API cannot tell which side of a boundary a failure fell on, it says
+so. Authentication and validation errors precede any store work, so a 401,
+400, or 403 guarantees nothing was written; a 503 from the on-demand fold
+means the outcome is unknown and the call should be retried. The full crash
+table is [docs/consistency-model.md](consistency-model.md#crash-matrix-strict-mode),
+and recovering a whole deployment from the bucket alone is
+[guides/disaster-recovery.md](guides/disaster-recovery.md).
 
 ## Crate map
 
-Dependency order, no cycles:
+The workspace has 32 members: 28 crates under `crates/` and four binaries
+under `services/`. Grouped by dependency layer, so a crate depends only on
+crates in its own group or above:
 
 ```text
-ravel-types
-  <- ravel-proto        (prost-generated footer/commit messages)
-  <- ravel-object-store (S3/MinIO, memory, fault-injecting backends)
-  <- ravel-segment      (RSEG metrics format; types, proto)
-  <- ravel-logseg       (RLOG logs format)
-  <- ravel-commit       (commit records; types, proto, object-store)
-  <- ravel-catalog      (fold, snapshots, column statistics; commit)
-  <- ravel-otlp         (types; opentelemetry-proto)
-  <- ravel-remote-write (Remote Write 1.0/2.0 decode + normalize)
-  <- ravel-otap         (OTel Arrow ingest; arrow isolated here)
-  <- ravel-ingest       (router, shard actors, admission)
-  <- ravel-promql       (parser + evaluator; types)
-  <- ravel-query        (fetch layer, engines' shared read path)
-  <- ravel-maintain     (L0->L1 compactor, GC sweeper, retention)
-  <- ravel-analytics    (pure post-evaluation compute; types only)
-  <- ravel-alerting     (rule/condition/state/record logic, no I/O)
-  <- ravel-sql          (DataFusion engine; arrow + datafusion)
-  <- services/ravel-server, services/ravel-cli
-ravel-test-util (types, object-store) used by all dev-deps
+foundations       ravel-types, ravel-proto, ravel-codec, ravel-object-store,
+                  ravel-cache, ravel-affinity, ravel-analytics,
+                  ravel-tracing-export
+formats, identity ravel-segment, ravel-logseg, ravel-rspan,
+                  ravel-tenant-resolve, ravel-promql
+commit, members   ravel-commit, ravel-fleet
+catalog           ravel-catalog
+wire decode       ravel-otlp, ravel-remote-write, ravel-otap, ravel-alerting
+paths             ravel-ingest, ravel-maintain, ravel-query, ravel-sql
+binaries          ravel-server, ravel-cli, ravel-ingest-router,
+                  ravel-operator
+test and bench    ravel-bench, ravel-failure-tests, ravel-promql-difftest,
+                  ravel-sim
 ```
 
-Each crate's normative doc is listed in the doc map in CLAUDE.md and in
-[docs/README.md](README.md). [docs/consistency-model.md](consistency-model.md) governs
-acknowledgement, visibility, and crash behavior everywhere.
+The last group is development-only and no shipping crate depends on it.
+Arrow and DataFusion are isolated behind the `sql`, `flight-sql`, and `otap`
+cargo features, so a default build links neither.
+
+The documentation index in [docs/README.md](README.md) lists the normative
+document for each crate, and [docs/concepts.md](concepts.md) carries the
+[glossary](concepts.md#glossary) for every term on this page.
