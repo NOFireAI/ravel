@@ -45,10 +45,13 @@ disaster-recovery choice and carries no erasure cost; it is the baseline the
 commit and catalog layers already assume.
 
 Scoping the lock takes an operator-run mechanism, and it is a requirement of
-every level, not an optional extra. Object Lock is enabled per bucket, not per
-prefix, and Ravel never sets retention on an object. Objects under the
-protected prefixes carry **per-object retention** applied by a mechanism the
-operator runs outside Ravel. Check off all of these:
+levels 0 and 1, not an optional extra. Level 2 replaces it with a bucket
+default retention that reaches every object, so level 2 runs no mechanism and
+the "no bucket default retention" item below does not apply to it. Object
+Lock is enabled per bucket, not per prefix, and Ravel never sets retention on
+an object. Objects under the protected prefixes carry **per-object retention**
+applied by a mechanism the operator runs outside Ravel. Check off all of
+these:
 
 - [ ] Object Lock enabled on the bucket, with **no bucket default retention**
       (a default retention would lock the data objects too, which is level 2).
@@ -292,14 +295,16 @@ verified operation.
 4. **Verify before serving.** `verify-custody` clean, `catalog verify` clean,
    and a canary query set over known-ingested data.
 5. **Re-protect before the first process starts.** The restore bucket must
-   meet the baseline before Ravel writes to it: versioning on, Object Lock
-   enabled with no default retention, and the retention mechanism pointed at
-   the restore bucket and backfilled over the restored objects. Objects
-   restored before the mechanism runs carry no retention, so run the backfill
-   and confirm one current and one noncurrent version per protected prefix
-   family carries retention, with the commands under "Verification". The
-   startup flag checks only the bucket half of this; the mechanism is verified
-   by hand.
+   meet the baseline before Ravel writes to it: versioning on and Object Lock
+   enabled. At levels 0 and 1 that means no default retention and the
+   retention mechanism pointed at the restore bucket and backfilled over the
+   restored objects: objects restored before the mechanism runs carry no
+   retention, so run the backfill and confirm one current and one noncurrent
+   version per protected prefix family carries retention, with the commands
+   under "Verification". At level 2 it means the bucket default retention `D`
+   set on the restore bucket before the restore copy, so every restored
+   object is locked as it lands. The startup flag checks only the bucket half
+   of this; the mechanism, or the default retention, is verified by hand.
 6. **Resume.** Start Ravel against the restored bucket. Disposable compute
    pays off here: processes mint fresh writer ids and epochs, no local state
    exists to reconcile, and the operator issues fresh per-mode storage
@@ -374,7 +379,7 @@ record: a real end-to-end run against MinIO is what fills a row.
 
 | Level | Controls | Erasure-bound consequence | RPO/RTO |
 |---|---|---|---|
-| **Every level** | Object Lock enabled on the bucket with no bucket default retention, versioning ON, and an operator-run mechanism applying per-object retention in compliance mode to `sys/`, provisioning records, commit records and catalog HEAD history; `--require-bucket-protection` gates startup on the bucket half (Object Lock enabled, versioning on), and the mechanism and the absence of a default retention are verified out of band | None; those prefixes hold no erasable subject value | Not a recovery control |
+| **Every level** | Object Lock enabled on the bucket and versioning ON; at levels 0 and 1, no bucket default retention and an operator-run mechanism applying per-object retention in compliance mode to `sys/`, provisioning records, commit records and catalog HEAD history (level 2 replaces the mechanism with its bucket default retention); `--require-bucket-protection` gates startup on the bucket half (Object Lock enabled, versioning on), and the mechanism or the default retention is verified out of band | None; those prefixes hold no erasable subject value | Not a recovery control |
 | **level 0** (default) | No replication | None; bounds as in consistency-model.md | None; bucket loss is total loss |
 | **level 1** (recommended) | Primary: versioning + `NoncurrentDays = E_v` + expired-delete-marker cleanup. Replica: different region/account/KMS key, replication v2 with `DeleteMarkerReplication`, RTC recommended, `NoncurrentDays = E_v_r` | Primary `+E_v`; replica residue is replication lag + `E_v_r` (requires `DeleteMarkerReplication`) | Defined here; **unmeasured** until a rehearsal record exists. RTC gives RPO a 15-minute ceiling; without RTC, unbounded |
 | **level 2** (optional) | level 1 plus a bucket default retention `D`, which S3 applies to every object including the data objects | `max(bound, D)`; query-time exclusion still immediate | As level 1 |
