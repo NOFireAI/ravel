@@ -718,7 +718,9 @@ identical rule in `fold`'s entry sort; `crates/ravel-catalog/tests/snapshot_sort
 Both impose the stated cross-segment total order and **explicitly never dedup**;
 their doc comments cite `docs/consistency-model.md` "logs and spans" and
 ADR-0051 §5. A retry after a lost ack produces byte-identical duplicate records
-that a query returns twice.
+that a query returns twice, unless the request carried an idempotency key and
+a valid, in-window marker exists, in which case `read_marker` replays the stored
+commit tokens instead of writing again.
 
 The duplicate control for logs/spans is therefore **at ingest, not at query**:
 
@@ -1212,9 +1214,12 @@ If the model needs one sentence per plane:
    part writes commute and only the HEAD CAS serializes.
 3. **Readers** never write. A reader either uses HEAD (any of its failure modes
    degrade it to listing the commit plane) or lists directly; both derivations
-   are specified to produce the same segment set for sealed hours, and
-   `fold_compaction_differential.rs` plus `seal_divergence` are the two places
-   that claim is checked.
+   are specified to produce the same segment set for sealed hours whose buckets
+   hold only recognized key shapes, and `fold_compaction_differential.rs` plus
+   `seal_divergence` are the two places that claim is checked. The one input on
+   which they diverge is an unrecognized key shape (F18): the fold skips it and
+   advances, the live resolve fails the query. A model of the equivalence must
+   exclude that input or carry the divergence explicitly.
 4. **The one cross-plane interlock that exists** is the retention sweep's
    HEAD-reachability gate (`retention::SnapshotReachability::bucket_gate`). The
    compaction-input sweep (`sweep::sweep_superseded`) has no such gate; it relies
