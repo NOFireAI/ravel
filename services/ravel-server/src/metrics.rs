@@ -615,6 +615,10 @@ pub struct IngestPipelineSnapshot {
     pub acks_err: u64,
     pub collisions: Option<u64>,
     pub shard_deaths: u64,
+    /// Multi-shard Strict writes that committed on at least one shard and
+    /// then failed on a sibling: partial multi-shard commits, reported to the
+    /// client as a retryable error carrying the durable tokens.
+    pub partial_writes: u64,
     /// Flushes failed closed because the router's cached provisioning view for
     /// the tenant was older than the refresh interval `C` (ADR-0052 section 3).
     pub stale_provisioning_flushes: u64,
@@ -725,6 +729,7 @@ impl IngestPipelineSnapshot {
             acks_err: snapshot.acks_err,
             collisions: Some(snapshot.series_id_collisions),
             shard_deaths: snapshot.shard_deaths,
+            partial_writes: snapshot.partial_writes,
             stale_provisioning_flushes: snapshot.stale_provisioning_flushes,
             postings: None,
             metadata_sink: Some(MetadataSinkCounters {
@@ -760,6 +765,7 @@ impl IngestPipelineSnapshot {
             acks_err: snapshot.acks_err,
             collisions: Some(snapshot.stream_id_collisions),
             shard_deaths: snapshot.shard_deaths,
+            partial_writes: snapshot.partial_writes,
             stale_provisioning_flushes: snapshot.stale_provisioning_flushes,
             postings: Some(PostingsCounters {
                 objects: snapshot.postings_objects,
@@ -793,6 +799,7 @@ impl IngestPipelineSnapshot {
             acks_err: snapshot.acks_err,
             collisions: None,
             shard_deaths: snapshot.shard_deaths,
+            partial_writes: snapshot.partial_writes,
             stale_provisioning_flushes: snapshot.stale_provisioning_flushes,
             postings: None,
             metadata_sink: None,
@@ -991,6 +998,21 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
             "ravel_ingest_shard_deaths_total",
             &labels(mode, pipeline.signal),
             pipeline.shard_deaths,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_ingest_partial_writes_total",
+        "Multi-shard Strict writes that committed on some shards and failed on a sibling, by signal.",
+        "counter",
+    );
+    for pipeline in pipelines {
+        write_sample(
+            out,
+            "ravel_ingest_partial_writes_total",
+            &labels(mode, pipeline.signal),
+            pipeline.partial_writes,
         );
     }
 

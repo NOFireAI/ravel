@@ -142,6 +142,7 @@ Labels: `mode` and `signal`. The `signal` label carries `metrics`, `logs`, or
 | `ravel_ingest_acks_err_total` | Strict-mode waiters acked with a write error. |
 | `ravel_ingest_collisions_total` | Batches rejected for a series or stream identity collision. |
 | `ravel_ingest_shard_deaths_total` | Distinct shard actors observed dead by the router. |
+| `ravel_ingest_partial_writes_total` | Multi-shard strict writes that committed on some shards and then failed on a sibling. The client received a retryable error carrying the durable tokens; a rising figure means retries are re-ingesting data that already committed (see the consistency model's partial multi-shard commit section). |
 | `ravel_ingest_exemplars_written_total` | Exemplars stored on flushed objects. |
 | `ravel_ingest_exemplars_dropped_total` | Exemplars discarded by the per-series admission cap. |
 | `ravel_ingest_stale_provisioning_flushes_total` | Flushes failed closed because the router's cached shard-generation view was older than the refresh interval. A rising figure means the provisioning re-read is failing for longer than the grace window allows. |

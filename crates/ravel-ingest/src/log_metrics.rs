@@ -87,11 +87,12 @@ pub struct LogIngestMetrics {
     /// [`crate::LogWriteError::PartialWrite`] (issue #1130): at least one shard
     /// committed durably and at least one sibling then failed in the same
     /// `write()` call. A nonzero value means some clients saw a retryable error
-    /// for data already durable on the committed shards; a blind retry
-    /// re-ingests those shards' records, and unlike the metrics pipeline logs
-    /// have no read-time dedup, so retry duplicates unless the client supplies
-    /// an idempotency key (see docs/consistency-model.md). The metrics and span
-    /// pipelines keep the same counter.
+    /// for data already durable on the committed shards; a retry re-ingests
+    /// those shards' records, and unlike the metrics pipeline logs have no
+    /// read-time dedup, so the retry duplicates them. An idempotency key does
+    /// not help here: a partial commit writes no marker (see
+    /// docs/consistency-model.md). The metrics and span pipelines keep the
+    /// same counter.
     partial_writes: AtomicU64,
     /// Distinct log shard actors observed dead by the router: its send half
     /// or a strict-mode ack found the shard channel closed, meaning the actor
@@ -215,7 +216,7 @@ pub struct LogIngestMetricsSnapshot {
     pub stream_id_collisions: u64,
     /// Multi-shard Strict writes returned as
     /// [`crate::LogWriteError::PartialWrite`] (issue #1130): a partial
-    /// multi-shard commit. Exported as `ingest_partial_writes_total`.
+    /// multi-shard commit. Exported as `ravel_ingest_partial_writes_total`.
     pub partial_writes: u64,
     pub shard_deaths: u64,
     pub stale_provisioning_flushes: u64,

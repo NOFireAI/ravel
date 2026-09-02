@@ -507,7 +507,7 @@ pub struct IngestMetricsSnapshot {
     pub series_id_collisions: u64,
     /// Multi-shard Strict writes returned as `WriteError::PartialWrite`
     /// (issue #1130): a partial multi-shard commit. Exported as
-    /// `ingest_partial_writes_total`.
+    /// `ravel_ingest_partial_writes_total`.
     pub partial_writes: u64,
     pub shard_deaths: u64,
     pub exemplars_written_total: u64,
