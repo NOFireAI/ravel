@@ -32,6 +32,7 @@ sys/t/<tenant_hash>                                                     per-tena
 admission/query/<process_id>.snapshot                                   fleet-global query concurrency snapshot (root-level, per-process, Overwrite; ADR-0061 §2)
 sys/maintain/workers/<process_id>                                       maintain-worker liveness heartbeat (root-level, per-process, Overwrite; ADR-0065 §1)
 sys/maintain/memo/<process_id>                                          maintain-worker durable memo snapshot for warm start/handoff (root-level, per-process, Overwrite; ADR-0065 §3)
+sys/maintain/claims/compaction/<work_id_hex>                            advisory compaction claim (root-level, per-work-unit, CreateIfAbsent then CAS, additive; ADR-1029 §1)
 ```
 
 The compaction/retention key shapes (ADR-0018, ADR-0019) and the
@@ -104,6 +105,45 @@ deliberately **not** a lease -- and losing, staling, or corrupting it costs at
 most a rescan of the affected units, never correctness (the ADR-0003
 HEAD-pointer precedent). Nothing deletes these snapshots (staleness detection
 replaces a sweep; a bounded cleanup sweep is a future step if it ever matters).
+
+`sys/maintain/claims/compaction/<work_id_hex>` (ADR-1029 §1) is the maintain
+role's advisory work-claim keyspace, the third root-level prefix beside the
+heartbeat and memo prefixes above. One small mutable object per unit of
+expensive merge work, so two processes do not both pay for compacting the same
+sealed bucket. `work_id` is
+`blake3::derive_key("ravel-compaction-claim-v1", tenant_hash || signal ||
+shard || ingest_hour_bucket)`, hex-encoded: exactly the four fields of a
+compaction bucket, the same granularity the commit-record key prefix is built
+from, and deliberately **not** including the input-set hash or any policy or
+geometry knob, so two nodes whose listings diverge on one bucket collide on one
+claim instead of running twice under two. The body is a versioned-tag protobuf
+`CompactionClaim` (`format_version`, `owner_process_id`, `attempt_id`,
+`input_set_hash`, `state`, `renewed_count`, `lease_duration_ns`,
+`owner_clock_ns`), of which `input_set_hash` and `owner_clock_ns` are operator
+forensics that no decision reads.
+
+Unlike its two siblings this key is **contended**, so it is never written with a
+plain `Overwrite`: it is acquired with `CreateIfAbsent` and every later write --
+renew, steal, mark-completed -- is a `CasVersion` update against the version the
+writer last saw. Expiry is `last_modified + lease_duration` (default 300 s)
+against the store's own server-assigned `last_modified`, never against a node
+clock or the payload's `owner_clock_ns`; a contender that finds the claim held
+does exactly one GET plus one `head()`, reschedules its bucket past expiry with
+deterministic per-contender jitter, and never polls. Nothing deletes these
+objects: an unconditional DELETE by a worker whose claim was already stolen
+would destroy the newer owner's claim, so completion is a CAS state flip and
+reclamation is lifecycle aging. Like the heartbeat and the memo it must sit
+outside any WORM-protected prefix, since it is mutated in place.
+
+The claim is **advisory and reconstructible**: it confers zero publication
+rights and its absence removes none, the publish path never reads it, and losing
+or corrupting one costs at most a duplicated merge -- work, never correctness.
+Racing compactions still serialize at the compaction record's `CreateIfAbsent`
+and at content-addressed part keys exactly as they did before this prefix
+existed, which is what keeps "no correctness-critical distributed locks" true.
+This is a claim, deliberately **not** a lease (`LeaseCheck` is the unrelated GC
+reader-protection gate) and **not** membership (that is the
+`sys/maintain/workers/` prefix above).
 
 `sys/qualification` and the `sys/qualify/` prefix (ADR-0050 §6) are
 additive root-level keys, outside any tenant's `t/<tenant_hash>/` space.

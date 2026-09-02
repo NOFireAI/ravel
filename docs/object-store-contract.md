@@ -165,7 +165,13 @@ trait honors cancellation by drop, so the query deadline (usually well under
   adapters emit `bytes=start-(end-1)`. Boundary conformance tests required
   (exact object/section/page ends).
 - `last_modified` may have 1-second granularity. Never order commits by it;
-  it exists for GC age checks only.
+  it exists for advisory age decisions (GC age checks, claim expiry) only.
+  It is server-assigned, which is the whole point of the widening: it is the
+  one time base every contender shares, so an advisory expiry judged against
+  it needs no agreement between node clocks (ADR-1029 §1). "Advisory" is
+  load-bearing here -- an age decision read from this field may be wrong
+  under skew or granularity, so it may only cost duplicated work, never
+  correctness.
 
 ## Mandatory capabilities (production)
 
