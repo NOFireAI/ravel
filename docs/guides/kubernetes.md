@@ -6,12 +6,27 @@ maintain Deployments and their Services. This guide covers the local kind
 development environment (the fastest way to see the whole thing work), the
 `RavelCluster` field reference, and what the health probes mean.
 
-Ravel's disposability model makes this simple. Every mode is stateless, and
-object storage is the only durable state. There are therefore no StatefulSets,
-no PersistentVolumeClaims, no leader election, and nothing to back up besides
-the bucket. For the full flag reference behind the CRD fields, see
-[operations.md](operations.md). For the reason the design is shaped this way,
-see [../adrs/0034-k8s-operator.md](../adrs/0034-k8s-operator.md).
+**The custom resource is `v1alpha1`.** It makes no compatibility promise: the
+schema can change in an incompatible way, with no conversion webhook, until it
+is promoted to a stable version. Do not plan around it as a stable API.
+
+Ravel's disposability model keeps the shape small. Every mode is stateless,
+and object storage is the only durable state. There are therefore no
+StatefulSets, no PersistentVolumeClaims, no leader election, and nothing to
+back up besides the bucket. For the flag behind any custom-resource field, see
+the generated
+[server flag reference](../reference/ravel-server-flags.md); for how to choose
+a value, [operations.md](operations.md).
+
+**One of the three Deployments deletes objects, and it is the maintain one.**
+Only a `maintain` mode process runs compaction, retention, the garbage-collection
+sweep and the at-rest scrubber. The gateway and query Deployments never delete
+anything. So a cluster with `maintain.enabled: false`, or one scaled to zero
+maintain replicas, never compacts and never expires data: its L0 segments
+accumulate unmerged and nothing is ever reclaimed, however the retention fields
+below are set. That is a real operational state, not a degraded one the
+operator reports, so it is worth checking before concluding that retention is
+broken.
 
 ![Ravel Kubernetes operator reconcile loop](../diagrams/k8s-operator-reconcile.svg)
 
@@ -23,7 +38,7 @@ fake S3 backend, and one reconciled `RavelCluster`.
 ```sh
 scripts/kind-up.sh      # cluster, images, fake S3, operator, RavelCluster
 scripts/kind-demo.sh    # OTLP ingest through the gateway, query back through
-                        # the query tier, assert the value
+                        # the query Deployment, assert the value
 scripts/kind-down.sh    # delete the cluster
 ```
 
@@ -78,10 +93,10 @@ single-replica Deployment, a Service, and a bucket-create Job. The Job retries
 until the endpoint serves S3, creates the `ravel` bucket, and then verifies
 that it exists rather than assume the create took.
 
-floci is the default. The `floci_contract` test in
-`crates/ravel-object-store/tests/contract.rs` gates it. That test runs the full
-object-store contract suite plus the `Capabilities::mandatory()` and multipart
-probes against a real floci in CI. MinIO is the named fallback. If a floci
+floci is the default, gated by the `floci_contract` test in the object-store
+crate. That test runs the full object-store contract suite plus the mandatory
+capability and multipart probes against a real floci in CI. MinIO is the named
+fallback: if a floci
 release ever stops satisfying that contract, `RAVEL_FAKE_S3_BACKEND=minio`
 switches the whole environment to the backend this repository has proven
 longest. Ravel maintains both manifests regardless of which one is the default.
@@ -152,7 +167,7 @@ The operator watches `RavelCluster` cluster-wide and manages Deployments and
 Services in whatever namespace each `RavelCluster` lives in. Its ClusterRole
 grants the full lifecycle of Deployments, Services, Ingresses,
 `gateway.networking.k8s.io` HTTPRoutes/GRPCRoutes, and the ServiceAccounts,
-Roles, and RoleBindings it renders for the `ravelNative` ingest router (ADR-0080),
+Roles, and RoleBindings it renders for the `ravelNative` ingest router,
 plus `RavelCluster` and its status subresource, `get` on Secrets, and
 `get`/`list`/`watch` on `endpointslices` (needed to create the router's own
 least-privilege Role). It never lists, writes, or watches Secrets.
@@ -168,40 +183,40 @@ A minimal example is in
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `spec.image` | string | required | Server image for all three tiers. |
-| `spec.imagePullPolicy` | string | — | Standard Kubernetes values. |
+| `spec.image` | string | required | Server image for all three Deployments. |
+| `spec.imagePullPolicy` | string | none | Standard Kubernetes values. |
 | `spec.shards` | integer | required | Feeds `--shards` to the gateway, query, and maintain from one field, so nothing can break the must-match invariant. **Immutable after creation** through a CEL rule; use `spec.shardOverrides` for per-tenant resharding. |
-| `spec.shardOverrides.leadHours` | integer | `2` | Minimum hours of lead time an override needs before its shard count takes effect (ADR-0052 activation-hour semantics). Rejected below the mechanism's own floor. |
-| `spec.shardOverrides.tenants` | map | — | Per-tenant target shard count, tenant name to integer. A target that differs from the tenant's current active shard count drives a durable `append_generation` reshard (ADR-0052); a target equal to the current count is a no-op. Lowering a tenant's shard count is the primary operator-facing cost control from ADR-0076 decision 2 -- see the documented costs (single-actor throughput ceiling, shard-0 concentration, coarser ADR-0065 maintenance units) in [shard-overrides.md](shard-overrides.md). |
+| `spec.shardOverrides.leadHours` | integer | `2` | Minimum hours of lead time an override needs before its shard count takes effect, matching the resharding mechanism's activation-hour semantics. Rejected below the mechanism's own floor. |
+| `spec.shardOverrides.tenants` | map | none | Per-tenant target shard count, tenant name to integer. A target that differs from the tenant's current active shard count drives a durable `append_generation` reshard; a target equal to the current count is a no-op. Lowering a tenant's shard count is the primary operator-facing cost control, and it has costs of its own (a single-actor throughput ceiling, shard-0 concentration, coarser maintenance units) documented in [shard-overrides.md](shard-overrides.md). |
 | `spec.storage.s3.bucket` | string | required | |
 | `spec.storage.s3.region` | string | `us-east-1` | |
-| `spec.storage.s3.endpoint` | string | — | Omit for real AWS S3. Path-style addressing is always used. |
+| `spec.storage.s3.endpoint` | string | none | Omit for real AWS S3. Path-style addressing is always used. |
 | `spec.storage.s3.credentialsSecretRef.name` | string | required | Secret with keys `accessKeyId` and `secretAccessKey`. |
-| `spec.tenantTokensSecretRef.name` | string | — | Secret whose keys are tenant names and whose values are bearer tokens. |
-| `spec.deploymentKeySecretRef.name` | string | — | Secret with one key, `key` (64 hex characters or 32 raw bytes): the ADR-0072 deployment key. Enables the keyed tenant hash and `sys/auth` bearer-token reconciliation, see "`sys/auth` ownership" below. Omit to leave both off. |
+| `spec.tenantTokensSecretRef.name` | string | none | Secret whose keys are tenant names and whose values are bearer tokens. |
+| `spec.deploymentKeySecretRef.name` | string | none | Secret with one key, `key` (64 hex characters or 32 raw bytes): the deployment key. Enables the keyed tenant hash and `sys/auth` bearer-token reconciliation, see "`sys/auth` ownership" below. Omit to leave both off. |
 | `spec.gateway.replicas` | integer | `1` | |
-| `spec.gateway.resources` | object | — | `requests` / `limits` maps, as in a Pod spec. |
+| `spec.gateway.resources` | object | none | `requests` / `limits` maps, as in a Pod spec. |
 | `spec.gateway.fold.disabled` | boolean | `false` | `--disable-fold`. Fold is a query-cost optimization only; disabling it never changes results. |
-| `spec.gateway.fold.intervalSecs` | integer | — | `--fold-interval-secs`. |
-| `spec.gateway.ingestAffinity` | object | — | Layer-7 ingest affinity (ADR-0076 decision 1, ADR-0080). Omit for today's behaviour: nothing is rendered. Present, it pins tenant identity to a stable subset of gateway replicas, cutting flush PUTs by `replicas / subsetSize`, via one of two backends. Full reference, backend comparison, and sizing guidance in [ingest-affinity.md](ingest-affinity.md). |
+| `spec.gateway.fold.intervalSecs` | integer | none | `--fold-interval-secs`. |
+| `spec.gateway.ingestAffinity` | object | none | Layer-7 ingest affinity. Omit and nothing is rendered. Present, it pins tenant identity to a stable subset of gateway replicas, cutting flush PUTs by `replicas / subsetSize`, via one of two backends. Full reference, backend comparison, and sizing guidance in [ingest-affinity.md](ingest-affinity.md). |
 | `spec.gateway.ingestAffinity.enabled` | boolean | `true` | `false` deletes the rendered objects and returns to the affinity-absent render. |
 | `spec.gateway.ingestAffinity.backend` | string | `ingressNginx` | `ingressNginx` (deprecated, renders Ingress objects) or `ravelNative` (renders the `ravel-ingest-router` service). Omitting it keeps an existing CR's backend. |
-| `spec.gateway.ingestAffinity.routerImage` | string | — | The `ravel-ingest-router` image. Required under `backend: ravelNative` (a different binary from `spec.image`); unset there degrades the router with reason `RouterImageMissing`. No effect under `ingressNginx`. |
+| `spec.gateway.ingestAffinity.routerImage` | string | none | The `ravel-ingest-router` image. Required under `backend: ravelNative` (a different binary from `spec.image`); unset there degrades the router with reason `RouterImageMissing`. No effect under `ingressNginx`. |
 | `spec.gateway.ingestAffinity.subsetSize` | integer | `2` | Replicas a tenant is pinned to. Two, not one, so a single replica loss does not concentrate a tenant on one process. A subset is a throughput ceiling; raise it for a high-volume tenant. |
 | `spec.gateway.ingestAffinity.key.source` | string | `authorizationHeader` | `authorizationHeader`, `header` (with `key.headerName`), `mtlsSubject`, or `canonicalTenant` (requires `backend: ravelNative`). The key must come from authentication material: Ravel resolves tenancy server-side from the credential, so a URL path carries nothing routable. |
-| `spec.gateway.ingestAffinity.ingressClassName` | string | — | Legacy `ingressNginx` only. |
+| `spec.gateway.ingestAffinity.ingressClassName` | string | none | Legacy `ingressNginx` only. |
 | `spec.gateway.ingestAffinity.hosts` | list | `[]` | Legacy `ingressNginx` only. Empty renders one host-less rule. |
-| `spec.gateway.ingestAffinity.tlsSecretName` | string | — | Legacy `ingressNginx` only. Renders `spec.tls`. Effectively required for OTLP/gRPC, which needs HTTP/2. |
+| `spec.gateway.ingestAffinity.tlsSecretName` | string | none | Legacy `ingressNginx` only. Renders `spec.tls`. Effectively required for OTLP/gRPC, which needs HTTP/2. |
 | `spec.gateway.ingestAffinity.grpc` | boolean | `true` | Legacy `ingressNginx` only. Also render the OTLP/gRPC Ingress. |
 | `spec.gateway.ingestAffinity.annotations` | map | `{}` | Legacy `ingressNginx` only. Extra Ingress annotations, merged before the affinity annotations. `nginx.ingress.kubernetes.io/proxy-body-size` belongs here: the ingress-nginx default of `1m` rejects larger OTLP/HTTP exports. |
-| `spec.gateway.exposure.gatewayApi` | object | — | Gateway API exposure (ADR-0080 decision 2), independent of `ingestAffinity`. Renders `HTTPRoute`/`GRPCRoute` onto an existing `Gateway` instead of Ingress objects. Fields `gatewayRef.name`/`gatewayRef.namespace`, `hostnames`, `grpc` (default true). See [ingest-affinity.md](ingest-affinity.md). |
+| `spec.gateway.exposure.gatewayApi` | object | none | Gateway API exposure, independent of `ingestAffinity`. Renders `HTTPRoute`/`GRPCRoute` onto an existing `Gateway` instead of Ingress objects. Fields `gatewayRef.name`/`gatewayRef.namespace`, `hostnames`, `grpc` (default true). See [ingest-affinity.md](ingest-affinity.md). |
 | `spec.query.replicas` | integer | `1` | |
-| `spec.query.resources` | object | — | |
+| `spec.query.resources` | object | none | |
 | `spec.maintain.enabled` | boolean | `true` | `false` deletes the maintain Deployment. |
-| `spec.maintain.intervalSecs` | integer | — | `--maintain-interval-secs`. |
-| `spec.maintain.resources` | object | — | |
-| `spec.retention.default` | string | — | Duration string, e.g. `30d`. |
-| `spec.retention.tenants` | map | — | Per-tenant overrides, tenant name to duration. |
+| `spec.maintain.intervalSecs` | integer | none | `--maintain-interval-secs`. |
+| `spec.maintain.resources` | object | none | |
+| `spec.retention.default` | string | none | Duration string, e.g. `30d`. |
+| `spec.retention.tenants` | map | none | Per-tenant overrides, tenant name to duration. |
 
 There is deliberately no way to select the memory store. A non-durable
 per-process store is incoherent across multiple pods, so `storage.s3` is
@@ -216,11 +231,11 @@ in process argv on the node. A native env or file token source in `ravel-server`
 is a known follow-up. A checksum annotation on each pod template rolls the pods
 when either Secret changes.
 
-### `sys/auth` ownership (ADR-0072 decision 4)
+### `sys/auth` ownership
 
 When `spec.deploymentKeySecretRef` is set, the operator also converges
-`sys/auth` — the durable, deployment-wide bearer-token map at the bucket root
-— to `spec.tenantTokensSecretRef`'s current contents, every reconcile cycle.
+`sys/auth`, the durable deployment-wide bearer-token map at the bucket root,
+to `spec.tenantTokensSecretRef`'s current contents, every reconcile cycle.
 This runs alongside, not instead of, `ravel-cli tenant token upsert|revoke`:
 the two writers share the map, and each entry is tagged with who owns it.
 
@@ -230,12 +245,12 @@ the two writers share the map, and each entry is tagged with who owns it.
   `managed_by=operator`. A tenant provisioned by `ravel-cli tenant token
   upsert` (tagged `managed_by=cli` by default, or a value passed via
   `--managed-by`) is never touched by this pass, and neither is a v1-shaped
-  entry with no `managed_by` field at all (unmanaged — written before this
+  entry with no `managed_by` field at all (unmanaged: written before this
   field existed, or deliberately declared unowned). The operator only ever
   removes what it itself put there.
 - If the CRD sets a deployment key but no `tenantTokensSecretRef`, or the
   Secret resolves to zero tenants, the operator skips the whole `sys/auth`
-  pass for that cycle — no upserts, no removals — and logs a warning
+  pass for that cycle, with no upserts and no removals, and logs a warning
   instead. An empty read is never treated as "revoke every operator-managed
   tenant."
 - A reconcile against an unchanged token Secret performs zero `sys/auth`
@@ -244,18 +259,18 @@ the two writers share the map, and each entry is tagged with who owns it.
 - A `sys/auth` write is retried a bounded number of times against a
   concurrent writer (another operator replica, or a `ravel-cli` call racing
   it). If it still fails after that budget, the operator logs the failure
-  and continues on to reconcile the Deployments and Services below —
+  and continues on to reconcile the Deployments and Services below:
   `sys/auth` reconciliation never blocks or fails the rest of the cycle.
 - `spec.deploymentKeySecretRef`'s `resourceVersion` feeds the same
   pod-template secrets checksum as the token and credential Secrets (see
   "Tenant tokens are injected..." above), so rotating the deployment key
-  rolls every tier's pods, the same as rotating a tenant token or a
+  rolls all three Deployments' pods, the same as rotating a tenant token or a
   credential does.
 
-See [operations.md](operations.md) and
-[../adrs/0072-tenant-scoped-credentials-and-control-plane-protection.md](../adrs/0072-tenant-scoped-credentials-and-control-plane-protection.md)
-for the `sys/auth` format itself and `ravel-cli tenant token`'s own
-subcommands.
+For the `sys/auth` format itself and `ravel-cli tenant token`'s own
+subcommands, see
+[operations/configuration.md](operations/configuration.md#tenancy-setup) and
+the [CLI flag reference](../reference/ravel-cli-flags.md).
 
 ### Managed objects
 
@@ -270,8 +285,8 @@ For a `RavelCluster` named `dev`:
 | `dev-maintain` | Deployment | `--mode maintain`, one replica, `Recreate` strategy. Absent when `maintain.enabled` is `false`. |
 | `dev-gateway-ingest` | Ingress | OTLP/HTTP ingest under the tenant-affinity hash. Only under `ingestAffinity` enabled on `backend: ingressNginx`. |
 | `dev-gateway-ingest-grpc` | Ingress | The same for OTLP/gRPC. Additionally absent when `ingestAffinity.grpc` is `false`. |
-| `dev-ingest-router` | Deployment, Service, ServiceAccount, Role, RoleBinding | The `ravel-ingest-router` and its least-privilege RBAC. Only under `ingestAffinity` enabled on `backend: ravelNative` (ADR-0080). See [ingest-affinity.md](ingest-affinity.md). |
-| `dev-gateway-route` | HTTPRoute | Gateway API exposure. Only under `gateway.exposure.gatewayApi` (ADR-0080), independent of the backend. |
+| `dev-ingest-router` | Deployment, Service, ServiceAccount, Role, RoleBinding | The `ravel-ingest-router` and its least-privilege RBAC. Only under `ingestAffinity` enabled on `backend: ravelNative`. See [ingest-affinity.md](ingest-affinity.md). |
+| `dev-gateway-route` | HTTPRoute | Gateway API exposure. Only under `gateway.exposure.gatewayApi`, independent of the backend. |
 | `dev-gateway-route-grpc` | GRPCRoute | The same for OTLP/gRPC. Absent when `exposure.gatewayApi.grpc` is `false`. |
 
 Maintain is pinned to one replica with `Recreate` to avoid rolling-update
@@ -287,9 +302,8 @@ kubectl get -n ravel-system ravelcluster dev -o jsonpath='{.status}'
 
 `status` carries `observedGeneration`, `gatewayReadyReplicas`,
 `queryReadyReplicas`, `maintainReadyReplicas`, and conditions. The operator
-writes two condition types today: `Available` and `Degraded`. ADR-0034 also
-names `Progressing`, but the operator does not emit it yet, so do not wait on
-it.
+writes two condition types: `Available` and `Degraded`. A `Progressing`
+condition is designed but not emitted, so do not wait on it.
 
 `Available=True` means the gateway and query Deployments both report ready
 replicas. `kubectl wait --for=condition=Available` is therefore a usable
@@ -341,22 +355,22 @@ cluster.
   one flush stream per replica for the same data; object-storage request
   charges, not stored bytes, dominate the bill.
 
-## Storage credential roles (ADR-0055)
+## Storage credential roles
 
-By default a `RavelCluster` points every tier at one Secret
+By default a `RavelCluster` points all three Deployments at one Secret
 (`spec.storage.s3.credentialsSecretRef`), so the gateway, query, and maintain
-pods all use one bucket-wide S3 credential. ADR-0055 lets you hand each tier a
-distinct, narrower credential instead, so a leak from one tier can only do what
-that tier legitimately does — and only the maintain tier can delete anything at
-all.
+pods all use one bucket-wide S3 credential. You can hand each Deployment a
+distinct, narrower storage credential role instead, so a leak from one can only
+do what that mode legitimately does, and only the maintain Deployment can
+delete anything at all.
 
-Each of the operator's three Deployments maps to one role:
+Each of the operator's three Deployments maps to one storage credential role:
 
-| Tier / Deployment | `--mode` | Role | Scope in one line |
+| Deployment | `--mode` | Storage credential role | Scope in one line |
 |---|---|---|---|
-| `<name>-gateway` | `gateway` | Gateway | Ingest writes (L0, commit records, idempotency, adopt) plus catalog fold writes, plus fleet-admission reconciliation snapshots (ADR-0057). No delete. |
+| `<name>-gateway` | `gateway` | Gateway | Ingest writes (L0, commit records, idempotency, adopt) plus catalog fold writes, plus fleet-admission reconciliation snapshots. No delete. |
 | `<name>-query` | `query` | Query | Reads commit and catalog objects, runs fold, appends query audit. No delete. |
-| `<name>-maintain` | `maintain` | Maintain | Compaction, retention, sweep. The only tier granted any delete, and only over `l0/`, `l1/`, `c/`, `idem/`. |
+| `<name>-maintain` | `maintain` | Maintain | Compaction, retention, sweep. The only one granted any delete, and only over `l0/`, `l1/`, `c/`, `idem/`. |
 
 A fourth role, **Admin**, backs `ravel-cli` and is deliberately not managed by
 the operator: there is no CRD field for it and no pod runs it. It is used only
@@ -368,7 +382,7 @@ the first-deployment bootstrap notes all live in one place:
 [operations.md, "Storage credential roles"](operations.md#storage-credential-roles-adr-0055).
 This section covers only the Kubernetes wiring.
 
-### Per-tier credential Secrets
+### Per-mode credential Secrets
 
 Create one Secret per role you want to scope, each with the same two keys as
 the shared Secret (`accessKeyId`, `secretAccessKey`), holding that role's
@@ -383,8 +397,9 @@ kubectl create secret generic ravel-s3-maintain \
   --from-literal=accessKeyId=... --from-literal=secretAccessKey=...
 ```
 
-Then reference each from its tier with an additive `credentialsSecretRef`
-field, alongside the existing shared one under `spec.storage.s3`:
+Then reference each from its own Deployment with an additive
+`credentialsSecretRef` field, alongside the existing shared one under
+`spec.storage.s3`:
 
 ```yaml
 apiVersion: ravel.nofire.ai/v1alpha1
@@ -399,7 +414,7 @@ spec:
     s3:
       bucket: my-ravel-bucket
       region: us-west-2
-      # Shared fallback. Any tier that omits its own credentialsSecretRef
+      # Shared fallback. Any Deployment that omits its own credentialsSecretRef
       # below uses this one, exactly as in the single-credential model.
       credentialsSecretRef:
         name: ravel-s3-shared
@@ -419,17 +434,25 @@ spec:
     name: ravel-tenant-tokens
 ```
 
-The per-tier `spec.<tier>.credentialsSecretRef` fields are additive and
-optional (ADR-0055 section 5): omit a tier's override and that tier falls back
-to the shared `spec.storage.s3.credentialsSecretRef`, unchanged. A
-`RavelCluster` that sets no per-tier override at all behaves exactly as it does
-today — one shared credential across all three Deployments — so adopting the
-split is zero-migration and can be rolled out one tier at a time. Unlike the
-shared Secret, `kind-up.sh` does **not** create these per-tier Secrets: the
-local kind environment deliberately keeps using the single shared credential
-for development convenience (see "Storage credential roles" in
-docs/guides/operations.md — the per-role split is a production hardening,
-and `kind-up.sh` is not meant to be modified to adopt it). To exercise the
-split in a kind cluster anyway, create the per-tier Secrets yourself the same
+The per-Deployment `spec.<mode>.credentialsSecretRef` fields are additive and
+optional: omit one and that Deployment falls back to the shared
+`spec.storage.s3.credentialsSecretRef`, unchanged. A `RavelCluster` that sets
+no override at all runs one shared credential across all three Deployments, so
+adopting the split needs no migration and can be rolled out one Deployment at
+a time. Unlike the shared Secret, `kind-up.sh` does **not** create these
+Secrets: the local kind environment deliberately keeps the single shared
+credential for development convenience, because the per-role split is a
+production hardening (see
+[Storage credential roles](operations/configuration.md#storage-credential-roles)),
+and `kind-up.sh` is not meant to be modified to adopt it. To exercise the
+split in a kind cluster anyway, create the per-mode Secrets yourself the same
 way as above (`kubectl create secret generic ...`) before applying a
 `RavelCluster` that references them.
+
+## Background
+
+The operator's design, its condition set and its reconcile model are
+[ADR-0034](../adrs/0034-k8s-operator.md). The per-mode storage credential
+roles are ADR-0055; the deployment key and `sys/auth` ownership are ADR-0072;
+per-tenant resharding is ADR-0052; ingest affinity and the Gateway API
+exposure are ADR-0076 decision 1 and ADR-0080.
