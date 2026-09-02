@@ -140,12 +140,15 @@ pub const WORK_ID_DOMAIN_TAG: &str = "ravel-compaction-claim-v1";
 /// never overwritten.
 pub const CLAIM_FORMAT_VERSION: u32 = 1;
 
-/// Ceiling on the holder-declared lease an observer will honor: 24 hours,
-/// far above any real merge stage and far below "forever". Nothing ever
-/// deletes a claim, so an unclamped absurd lease (misconfiguration, or
-/// corruption that still decodes) would suppress claimed compaction of its
-/// bucket indefinitely; the clamp bounds the outage to one day per incident
-/// on the advisory layer.
+/// Ceiling on EVERY lease an observer honors when computing expiry: the
+/// holder-declared lease and the observer's own configured fallback alike,
+/// since a local misconfiguration above 24 hours has the same
+/// suppress-the-bucket-forever property as a holder's. 24 hours is far above
+/// any real merge stage and far below "forever". Nothing ever deletes a
+/// claim, so an unclamped absurd lease (misconfiguration, or corruption that
+/// still decodes) would suppress claimed compaction of its bucket
+/// indefinitely; the clamp bounds the outage to one day per incident on the
+/// advisory layer.
 pub const MAX_OBSERVED_LEASE_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// The prefix every compaction claim lives under: a new additive advisory
@@ -1251,6 +1254,53 @@ mod tests {
         let other =
             WorkIdentity::new(TenantId::new("acme").hash(), Signal::Logs, 4, 480_000).work_id();
         assert_ne!(jitter_ms(&other, &a, &cfg), first);
+    }
+
+    /// A claim whose payload is raw garbage (not protobuf at all) degrades
+    /// gracefully: acquire returns Held rather than panicking or erroring, the
+    /// observation falls back to the observer's configured lease for expiry,
+    /// and steal refuses it as unreadable. The operator repair for a wedged
+    /// malformed claim is a manual delete, safe because the claim is advisory
+    /// (docs/catalog-and-mvcc.md states the path).
+    #[tokio::test]
+    async fn a_corrupt_claim_payload_is_observed_and_never_stolen() {
+        let store = instrumented();
+        store.inner().set_clock_ms(1_700_000_000_000);
+        let cfg = ClaimConfig::default();
+        let key = compaction_claim_key(&identity().work_id());
+        store
+            .put(
+                &key,
+                b"\xff\xfenot a protobuf".to_vec().into(),
+                PutOptions {
+                    mode: PutMode::CreateIfAbsent,
+                    checksum: None,
+                },
+            )
+            .await
+            .expect("seed the corrupt claim");
+
+        let observed = held(
+            acquire(&store, &identity(), &owner_at(1), &cfg)
+                .await
+                .expect("acquire over a corrupt claim must not error"),
+        );
+        assert!(observed.holder.is_none(), "the payload must not decode");
+        assert_eq!(
+            observed.expiry_unix_ms,
+            1_700_000_000_000 + i64::try_from(cfg.lease_duration.as_millis()).expect("fits"),
+            "an undecodable payload falls back to the observer's own lease"
+        );
+        let refused = steal(
+            &store,
+            &observed,
+            &owner_at(2),
+            &cfg,
+            observed.expiry_unix_ms + 1,
+        )
+        .await
+        .expect("steal");
+        assert_eq!(refused_reason(refused), StealRefused::UnreadableClaim);
     }
 
     /// A claim this reader cannot understand is observed and rescheduled
