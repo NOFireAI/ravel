@@ -4,8 +4,7 @@ Ravel instruments the read path with `tracing` spans so a slow query can be
 attributed to a phase. Each crate opens a span around the work it owns, and
 every span carries the same bounded fields the `/metrics` label allowlist
 permits (a tenant hash and per-span byte and request counts), never a query
-text, a metric name, a label value, or an object key. This is the design of
-[ADR-0044](../adrs/0044-query-cost-accounting.md) section 5.
+text, a metric name, a label value, or an object key.
 
 ![query-path tracing: spans and OTLP export](../diagrams/tracing-export.svg)
 
@@ -23,21 +22,27 @@ understand a sample on the route; read this guide to attribute one query.
 
 ## The spans
 
-There are two tiers. Request-level spans wrap a whole query and are created at
-`info` level, so they appear under the default log filter. Phase spans wrap
-one stage of the read path and are created at `debug` level, so they are off
-until you widen the filter (see [Turning them on](#turning-them-on)).
+Spans come in two kinds. Request-level spans wrap a whole query and are
+created at `info` level, so they appear under the default log filter. Phase
+spans wrap one stage of the read path and are created at `debug` level, so
+they are off until you widen the filter (see
+[Turning them on](#turning-them-on)).
+
+The tables below give each span's `tracing` target, which is the name that
+appears on the log line and the name a `RUST_LOG` directive matches. That is
+the handle you actually have on a running process: to see a span, name its
+target.
 
 ### Request-level spans (info)
 
 Each transport opens one span for the whole request and records the query's
 final store-request and byte counts once it finishes.
 
-| Span | Where | Fields |
-|---|---|---|
-| `sql_query` | `services/ravel-server/src/sql.rs` | `tenant_hash`, `workload_class`, `s3_requests`, `s3_bytes` |
-| `analytics_query` | `services/ravel-server/src/analytics.rs` | `tenant_hash`, `workload_class`, `s3_requests`, `s3_bytes` |
-| `flight_sql_statement` | `crates/ravel-sql/src/flight/service.rs` | `tenant_hash`, `workload_class`, `s3_requests`, `s3_bytes` |
+| Span | Opened by | `RUST_LOG` target | Fields |
+|---|---|---|---|
+| `sql_query` | `POST /api/v1/sql` | `ravel_server` | `tenant_hash`, `workload_class`, `s3_requests`, `s3_bytes` |
+| `analytics_query` | the analytics routes | `ravel_server` | `tenant_hash`, `workload_class`, `s3_requests`, `s3_bytes` |
+| `flight_sql_statement` | a Flight SQL statement | `ravel_sql` | `tenant_hash`, `workload_class`, `s3_requests`, `s3_bytes` |
 
 `workload_class` is the literal `interactive` on all three: every query over
 these transports is client-driven. `s3_requests` and `s3_bytes` start empty
@@ -51,14 +56,14 @@ Six span names cover the read-path phases. `page_fetch`, `decode`, and
 `evaluate` each have two callsites (a scalar and a histogram variant, an
 instant and a range variant); the span name is the same at both.
 
-| Span | Where | Fields |
-|---|---|---|
-| `catalog_resolve` | `crates/ravel-catalog/src/catalog.rs` | `tenant_hash`, `s3_requests`, `s3_bytes`, `segments_pruned` |
-| `segment_open` | `crates/ravel-query/src/fetcher.rs` | `tenant_hash`, `object_size`, `s3_requests`, `s3_bytes` |
-| `catalog_decode` | `crates/ravel-query/src/fetcher.rs` | `matcher_count`, `total_size`, `series_matched` |
-| `page_fetch` | `crates/ravel-query/src/fetcher.rs` | `page_kind`, `series_count`, `s3_requests`, `s3_bytes` |
-| `decode` | `crates/ravel-query/src/fetcher.rs` | `page_kind`, `series_count`, `decompressed_bytes` |
-| `evaluate` | `crates/ravel-query/src/engine.rs` | `eval_kind` |
+| Span | Phase it wraps | `RUST_LOG` target | Fields |
+|---|---|---|---|
+| `catalog_resolve` | resolving one snapshot | `ravel_catalog` | `tenant_hash`, `s3_requests`, `s3_bytes`, `segments_pruned` |
+| `segment_open` | opening one segment | `ravel_query` | `tenant_hash`, `object_size`, `s3_requests`, `s3_bytes` |
+| `catalog_decode` | decoding a segment's series catalog | `ravel_query` | `matcher_count`, `total_size`, `series_matched` |
+| `page_fetch` | fetching sample pages | `ravel_query` | `page_kind`, `series_count`, `s3_requests`, `s3_bytes` |
+| `decode` | decompressing those pages | `ravel_query` | `page_kind`, `series_count`, `decompressed_bytes` |
+| `evaluate` | evaluating over fetched data | `ravel_query` | `eval_kind` |
 
 Field notes, all verified against the fields the code records:
 
@@ -81,10 +86,10 @@ Field notes, all verified against the fields the code records:
 
 ### The logs signal reuses two span names with a different field set
 
-The table above is the metric read path. The logs read path
-(`crates/ravel-query/src/log_fetcher.rs`, serving RLOG objects through
-`RlogReader`) reuses the `page_fetch` and `decode` span names for its own two
-phases, but carries a different field set under them. Both logs spans add
+The table above is the metric read path. The logs read path, serving RLOG
+objects, reuses the `page_fetch` and `decode` span names for its own two
+phases under the same `ravel_query` target, but carries a different field set
+under them. Both logs spans add
 `signal = "logs"`; the metric spans carry no `signal` field. Match on the span
 name alone and you will see two shapes:
 
@@ -101,11 +106,11 @@ name alone and you will see two shapes:
   `series_count`: RLOG has no scalar/histogram page kinds, and its unit of
   identity is the log stream, not the metric series, so neither field maps onto
   this path.
-- The logs `decode` records `blocks_scanned` and `blocks_total` from the
-  reader's `ScanStats` rather than `decompressed_bytes`. No decompressed-byte
-  count is available here without a structural change to `ravel-logseg`:
-  `ScanStats` counts blocks, not bytes, and per-block decompression inside the
-  reader is never summed. `blocks_scanned`/`blocks_total` are instead a real
+- The logs `decode` records `blocks_scanned` and `blocks_total` rather than
+  `decompressed_bytes`. No decompressed-byte count is available here without a
+  structural change to the log segment reader, which counts blocks rather than
+  bytes and never sums its per-block decompression.
+  `blocks_scanned`/`blocks_total` are instead a real
   pruning-effectiveness signal (how much of the object's block index the scan
   had to touch after skip-index, POSTINGS, and bloom pruning), analogous to
   `catalog_resolve`'s `segments_pruned` on the metric path, which is likewise a
@@ -114,15 +119,12 @@ name alone and you will see two shapes:
 ## Turning them on
 
 The request-level spans are `info`, so they are visible under the default
-filter. Both `services/ravel-server/src/main.rs` and
-`services/ravel-operator/src/main.rs` fall back to `EnvFilter::new("info")`
-when `RUST_LOG` is unset, and the server installs a `tracing_subscriber::fmt`
-subscriber.
+filter. Both `ravel-server` and `ravel-operator` fall back to an `info` filter
+when `RUST_LOG` is unset, and the server installs a formatting subscriber on
+its own log stream.
 
-The phase spans are `debug`. They live in two crates: `catalog_resolve` in
-`ravel-catalog`, and `segment_open`, `catalog_decode`, `page_fetch`, `decode`,
-and `evaluate` in `ravel-query`. To see all six while keeping the request-level
-spans visible, set:
+The phase spans are `debug`, under the two targets the table above names. To
+see all six while keeping the request-level spans visible, set:
 
 ```sh
 RUST_LOG=info,ravel_catalog=debug,ravel_query=debug
@@ -197,13 +199,12 @@ flag, absent by default. Point it at a collector's OTLP/gRPC endpoint (for
 example `http://otel-collector:4317`) to enable export for that process. The two
 binaries are configured independently, each with its own flag rather than a
 shared config file, because they are separately deployed processes that each
-already carry their own CLI surface
-([ADR-0060](../adrs/0060-query-path-otlp-trace-export.md) decision 3). Set the
-flag on each process you want exporting.
+already carry their own CLI surface. Set the flag on each process you want
+exporting.
 
 There is no second verbosity knob. The OTLP layer is gated by the same
-`EnvFilter` as the log stream ([ADR-0060](../adrs/0060-query-path-otlp-trace-export.md)
-decision 2), so the `RUST_LOG` filter [Turning them on](#turning-them-on)
+filter as the log stream, so the `RUST_LOG` setting
+[Turning them on](#turning-them-on)
 already teaches is exactly what export ships: whatever that filter admits to the
 log stream is what reaches the collector. Widen `RUST_LOG` to add phase spans to
 the exported stream the same way you would to see them locally.
@@ -212,8 +213,7 @@ the exported stream the same way you would to see them locally.
 
 Exactly the spans and fields the [span tables above](#the-spans) already
 document, and nothing more. Export adds a transport, not new content: no query
-text, no metric or label values, no object keys
-([ADR-0060](../adrs/0060-query-path-otlp-trace-export.md) decision 4). Nothing
+text, no metric or label values, no object keys. Nothing
 crosses to the collector that was not already on the `debug`-level log stream.
 
 Each exported span carries two resource attributes:
@@ -232,9 +232,8 @@ Together they distinguish spans from a fleet in the collector the same way
 
 Export is best-effort. A down, slow, or unreachable collector drops spans and
 never blocks a query, an ingest write, or a `/metrics` scrape, and never
-surfaces an error to the caller
-([ADR-0060](../adrs/0060-query-path-otlp-trace-export.md) decision 6); the ADR
-covers the batch-processor mechanism behind that guarantee.
+surfaces an error to the caller. A batch processor sits between the spans and
+the wire, which is what makes that hold.
 
 Two failure modes, two different signals. A malformed URL fails
 the exporter build at startup: a single "OTLP trace export disabled" warning,
@@ -255,3 +254,12 @@ a query.
   a running process requires a subscriber configured to emit span-close
   events. The programmatic capture in the acceptance test is the supported way
   to observe the span set and its recorded count fields today.
+
+## Background
+
+The bounded field set every span is held to is
+[ADR-0044](../adrs/0044-query-cost-accounting.md) section 5. The OTLP export
+surface, its single-filter design, its content bound and its best-effort
+guarantee are
+[ADR-0060](../adrs/0060-query-path-otlp-trace-export.md), decisions 3, 2, 4
+and 6 in that order.
