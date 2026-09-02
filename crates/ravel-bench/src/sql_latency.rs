@@ -1413,6 +1413,15 @@ pub struct ExecutorSettings {
 
 impl Default for ExecutorSettings {
     fn default() -> Self {
+        // The policy and the two byte quantities it resolves to are one
+        // setting: a default that named `cost-based` but carried the
+        // byte-minimal constants would route one way and report another.
+        let resolved = logs_fetch_resolution(
+            LogsFetchPolicy::default(),
+            &StoreCostProfile::reference(),
+            None,
+            None,
+        );
         ExecutorSettings {
             max_query_bytes: DEFAULT_MAX_QUERY_BYTES,
             shard_count: 1,
@@ -1420,9 +1429,9 @@ impl Default for ExecutorSettings {
             tenant_max_bytes: DEFAULT_TENANT_MAX_BYTES,
             parallel_final_aggregation: true,
             max_segments: DEFAULT_MAX_SEGMENTS,
-            logs_block_range_threshold: DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+            logs_block_range_threshold: resolved.block_range_threshold,
             logs_suffix_len: None,
-            logs_request_cost_bytes: DEFAULT_LOG_REQUEST_COST_BYTES,
+            logs_request_cost_bytes: resolved.request_cost_bytes,
             logs_fetch_policy: LogsFetchPolicy::default(),
         }
     }
@@ -2830,6 +2839,30 @@ mod tests {
     /// The executor settings the loaded-tenant lane builds from `cfg`, resolved
     /// through the same [`logs_fetch_resolution`] [`run_tenant`] calls, so a
     /// test reads the settings that lane would really hand the fetcher.
+    #[test]
+    fn default_executor_settings_route_the_way_their_policy_says() {
+        let settings = ExecutorSettings::default();
+        let resolved = logs_fetch_resolution(
+            settings.logs_fetch_policy,
+            &StoreCostProfile::reference(),
+            None,
+            None,
+        );
+        assert_eq!(
+            settings.logs_block_range_threshold, resolved.block_range_threshold,
+            "the default threshold is what the default policy resolves to"
+        );
+        assert_eq!(
+            settings.logs_request_cost_bytes, resolved.request_cost_bytes,
+            "the default request cost is what the default policy resolves to"
+        );
+        assert_eq!(
+            settings.logs_block_range_threshold,
+            u64::MAX,
+            "cost-based at the reference profile reads every object whole"
+        );
+    }
+
     fn tenant_settings_for(cfg: &TenantConfigInput, shard_count: u32) -> ExecutorSettings {
         let resolved = logs_fetch_resolution(
             cfg.logs_fetch_policy,
