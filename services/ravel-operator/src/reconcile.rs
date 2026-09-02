@@ -679,6 +679,10 @@ pub fn desired_maintain_deployment(
     instance: &str,
     ctx: &RenderCtx,
 ) -> Result<Option<Deployment>, RenderError> {
+    // Validate before the enabled check: an invalid `spec.gc` is a
+    // misconfiguration to surface even when no maintain Deployment renders,
+    // otherwise it would sit silent until the tier is turned on.
+    validate_gc_spec(spec)?;
     if !spec.maintain.enabled {
         return Ok(None);
     }
@@ -702,12 +706,10 @@ pub fn desired_maintain_deployment(
     // reinterpreted.
     if let Some(gc) = &spec.gc {
         if let Some(horizon) = &gc.protection_horizon {
-            validate_gc_duration("protectionHorizon", horizon)?;
             args.push("--gc-protection-horizon".to_string());
             args.push(horizon.clone());
         }
         if let Some(grace) = &gc.grace {
-            validate_gc_duration("grace", grace)?;
             args.push("--gc-grace".to_string());
             args.push(grace.clone());
         }
@@ -747,16 +749,37 @@ pub fn desired_maintain_deployment(
     )))
 }
 
-/// Validate a `spec.gc` horizon string as a humantime duration, the same syntax
-/// the `ravel-server` flags accept. An empty or unparseable value is a
-/// [`RenderError::GcHorizonInvalid`] naming `field`; a valid one returns `Ok`
-/// and the caller renders the original string verbatim.
+/// Validate every set `spec.gc` field, whether or not the maintain tier
+/// renders this pass.
+fn validate_gc_spec(spec: &RavelClusterSpec) -> Result<(), RenderError> {
+    if let Some(gc) = &spec.gc {
+        if let Some(horizon) = &gc.protection_horizon {
+            validate_gc_duration("protectionHorizon", horizon)?;
+        }
+        if let Some(grace) = &gc.grace {
+            validate_gc_duration("grace", grace)?;
+        }
+    }
+    Ok(())
+}
+
+/// Validate a `spec.gc` horizon string the way the `ravel-server` flags do: a
+/// humantime duration that is positive and fits in nanoseconds. An empty,
+/// unparseable, zero, or too-large value is a [`RenderError::GcHorizonInvalid`]
+/// naming `field`; a valid one returns `Ok` and the caller renders the original
+/// string verbatim.
 fn validate_gc_duration(field: &'static str, value: &str) -> Result<(), RenderError> {
-    if value.is_empty() || humantime::parse_duration(value).is_err() {
-        return Err(RenderError::GcHorizonInvalid {
-            field,
-            value: value.to_string(),
-        });
+    let invalid = || RenderError::GcHorizonInvalid {
+        field,
+        value: value.to_string(),
+    };
+    if value.is_empty() {
+        return Err(invalid());
+    }
+    let dur = humantime::parse_duration(value).map_err(|_| invalid())?;
+    let ns = i64::try_from(dur.as_nanos()).map_err(|_| invalid())?;
+    if ns <= 0 {
+        return Err(invalid());
     }
     Ok(())
 }
@@ -2119,6 +2142,68 @@ mod tests {
                 "unset spec.gc must render no --gc- flag: {args:?}"
             );
         }
+    }
+
+    #[test]
+    fn invalid_gc_horizon_is_a_render_error_even_with_maintain_disabled() {
+        // With no maintain Deployment to render, an invalid spec.gc would
+        // otherwise pass silently and only surface once the tier is enabled.
+        let mut spec = base_spec();
+        spec.maintain.enabled = false;
+        spec.gc = Some(GcSpec {
+            protection_horizon: None,
+            grace: Some("not-a-duration".to_string()),
+        });
+        assert_eq!(
+            desired_maintain_deployment(&spec, "prod", &ctx())
+                .expect_err("an invalid grace must be a render error with maintain disabled"),
+            RenderError::GcHorizonInvalid {
+                field: "grace",
+                value: "not-a-duration".to_string(),
+            }
+        );
+        assert!(
+            matches!(
+                desired_objects(&spec, "prod", "ns", &ctx()),
+                Err(RenderError::GcHorizonInvalid { field: "grace", .. })
+            ),
+            "the error must propagate out of desired_objects with maintain disabled"
+        );
+    }
+
+    #[test]
+    fn zero_gc_horizon_is_rejected_like_the_server_rejects_it() {
+        // ravel-server refuses a non-positive --gc-* duration at startup, so a
+        // zero must be a render error rather than a flag on a crash-looping pod.
+        for (horizon, grace, field, value) in [
+            (Some("0s"), None, "protectionHorizon", "0s"),
+            (Some("24h"), Some("0h"), "grace", "0h"),
+        ] {
+            let mut spec = base_spec();
+            spec.gc = Some(GcSpec {
+                protection_horizon: horizon.map(str::to_string),
+                grace: grace.map(str::to_string),
+            });
+            assert_eq!(
+                desired_maintain_deployment(&spec, "prod", &ctx())
+                    .expect_err("a zero duration must be a render error"),
+                RenderError::GcHorizonInvalid {
+                    field,
+                    value: value.to_string(),
+                }
+            );
+        }
+        // A positive value still renders.
+        let mut spec = base_spec();
+        spec.gc = Some(GcSpec {
+            protection_horizon: Some("1s".to_string()),
+            grace: None,
+        });
+        assert!(
+            desired_maintain_deployment(&spec, "prod", &ctx())
+                .expect("a positive duration renders")
+                .is_some()
+        );
     }
 
     #[test]
