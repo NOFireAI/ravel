@@ -46,15 +46,21 @@ jobs:
       sql_area: ${{ steps.check.outputs.sql_area }}
       promql_area: ${{ steps.check.outputs.promql_area }}
       object_store_area: ${{ steps.check.outputs.object_store_area }}
+      # formal_area (ADR-1113) gates the tla job. Unlike the Rust area flags it
+      # is orthogonal to docs_only: a change touching only formal/ or the TLA+
+      # harness skips every compiling job yet must still run the tla lane, so it
+      # is computed even on the docs/formal-only branch rather than forced false.
+      formal_area: ${{ steps.check.outputs.formal_area }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
       - id: check
         run: |
-          # Emit all five outputs from a single point so no code path forgets
-          # one. $1 is docs_only; $2..$5 are the four area flags in output
-          # order (server_or_operator, sql_area, promql_area, object_store_area).
+          # Emit all six outputs from a single point so no code path forgets
+          # one. $1 is docs_only; $2..$5 are the four Rust area flags in output
+          # order (server_or_operator, sql_area, promql_area, object_store_area);
+          # $6 is formal_area.
           emit() {
             {
               echo "docs_only=$1"
@@ -62,6 +68,7 @@ jobs:
               echo "sql_area=$3"
               echo "promql_area=$4"
               echo "object_store_area=$5"
+              echo "formal_area=$6"
             } >> "$GITHUB_OUTPUT"
           }
           # merge_group events (the GitHub merge queue, ADR-0053 D1) carry no
@@ -73,7 +80,7 @@ jobs:
           # if it were docs-only or a narrow single-area change.
           if [ "${{ github.event_name }}" = "merge_group" ]; then
             echo "::notice::merge_group event, running full CI"
-            emit false true true true true
+            emit false true true true true true
             exit 0
           fi
           if [ "${{ github.event_name }}" = "pull_request" ]; then
@@ -83,7 +90,7 @@ jobs:
           fi
           if [ -z "$base" ] || ! git cat-file -e "$base" 2>/dev/null; then
             echo "::notice::no usable base commit, running full CI"
-            emit false true true true true
+            emit false true true true true true
             exit 0
           fi
           merge_base=$(git merge-base "$base" "${{ github.sha }}")
@@ -94,15 +101,27 @@ jobs:
             # irrelevant, so run everything, matching the pre-D4 docs_only=false
             # default.
             echo "::notice::no changed files, running full CI"
-            emit false true true true true
+            emit false true true true true true
             exit 0
           fi
-          # docs-only: every changed path ends in .md or .svg (prose plus the
-          # diagrams that illustrate it). Areas are irrelevant then -- no
-          # compiling job runs at all -- so report them false.
-          if ! echo "$changed" | grep -qvE '\.(md|svg)$'; then
-            echo "::notice::docs-only change, skipping compiling jobs"
-            emit true false false false false
+          # formal_area (ADR-1113 D10): the TLA+ models, their harness, the
+          # implementation paths the traceability tables and D3 cite, and the
+          # normative documents the models are derived from. Computed here,
+          # before the docs/formal-only short-circuit, because a change touching
+          # only formal/, the harness, or a normative doc still runs the tla lane
+          # even when it skips every compiling job. Running the suite on a
+          # normative-doc change does not check the model still matches the
+          # prose; it puts the suite in front of that change's reviewer.
+          formal_area=false
+          if echo "$changed" | grep -qE '^formal/|^scripts/check-tla\.sh$|^crates/ravel-object-store/|^crates/ravel-commit/|^crates/ravel-catalog/|^crates/ravel-ingest/|^crates/ravel-maintain/|^crates/ravel-fleet/|^crates/ravel-query/|^services/ravel-server/|^docs/object-store-contract\.md$|^docs/consistency-model\.md$|^docs/catalog-and-mvcc\.md$|^docs/deletion-and-gc\.md$|^docs/ingest\.md$'; then
+            formal_area=true
+          fi
+          # docs/formal-only: every changed path is prose (.md/.svg), a TLA+
+          # model or config under formal/, or the TLA+ harness. No compiling job
+          # runs; the tla lane still runs when formal_area is true.
+          if ! echo "$changed" | grep -qvE '\.(md|svg)$|^formal/|^scripts/check-tla\.sh$'; then
+            echo "::notice::docs/formal-only change, skipping compiling jobs"
+            emit true false false false false "$formal_area"
             exit 0
           fi
           # Workspace-level paths change the build for every crate, so they
@@ -111,7 +130,7 @@ jobs:
           # under proto/ (regenerates types every crate can depend on).
           if echo "$changed" | grep -qE '^(Cargo\.toml|Cargo\.lock|rust-toolchain\.toml)$|^\.github/|^proto/'; then
             echo "::notice::workspace-level change, running every area"
-            emit false true true true true
+            emit false true true true true true
             exit 0
           fi
           # Per-area path lists (conservative supersets; ravel-server and
@@ -153,8 +172,8 @@ jobs:
             promql_area=true
             object_store_area=true
           fi
-          echo "::notice::areas server_or_operator=$server_or_operator sql=$sql_area promql=$promql_area object_store=$object_store_area"
-          emit false "$server_or_operator" "$sql_area" "$promql_area" "$object_store_area"
+          echo "::notice::areas server_or_operator=$server_or_operator sql=$sql_area promql=$promql_area object_store=$object_store_area formal=$formal_area"
+          emit false "$server_or_operator" "$sql_area" "$promql_area" "$object_store_area" "$formal_area"
 
   # Cheap, build-free guards wired in from ADR-0053 D6:
   #   - scripts/check-doc-drift.sh recomputes the derived counts in
@@ -198,6 +217,37 @@ jobs:
         run: scripts/guards/check-test-hygiene.sh
       - name: Python script unit tests
         run: make test-python
+
+  # TLA+ fast lane (ADR-1113). Runs only when formal_area is set: a change to
+  # formal/ or scripts/check-tla.sh. Exhaustive checking is too slow for the
+  # per-PR budget and runs in tla-nightly.yml instead. Each check is its own
+  # unpiped step so a TLC failure surfaces as the step's own exit code.
+  tla:
+    needs: changes
+    if: needs.changes.outputs.formal_area == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Smoke model check
+        run: scripts/check-tla.sh smoke
+      - name: Negative controls
+        run: scripts/check-tla.sh negative
+      - name: Traceability
+        run: scripts/check-tla.sh traceability
+      - name: Upload TLC logs on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tla-logs
+          path: .cache/tla/logs
+          if-no-files-found: ignore
 
   # Lint the workflow files themselves (ADR-0086 decision 7). actionlint is
   # cheap and uses no cargo toolchain, so like doc-scripts it runs on every
