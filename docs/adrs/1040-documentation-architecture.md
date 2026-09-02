@@ -229,6 +229,12 @@ carries retired vocabulary is a code follow-up, listed in the epic's final
 report, not a documentation defect. Every other page under
 `docs/reference/` is hand-written and is a user page.
 
+The specification pages under `docs/` keep their decision-record
+citations: an implementer contract cites the records that govern it. They
+drop issue and pull-request numbers like every other page, and a generated
+block inside one is the generator's text, fixed at the generator rather
+than in the page.
+
 The tree does not pass this on the day the checker lands, and a gate that
 is switched on later is a gate that is never switched on. So the checker
 ships with `scripts/docs_lint_baseline.txt`, a file listing every finding
