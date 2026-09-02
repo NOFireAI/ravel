@@ -58,7 +58,13 @@ def classify(rel):
     if rel.startswith("docs/guides/") and rel.endswith(".md"):
         return "user"
     if rel.startswith("docs/reference/") and rel.endswith(".md"):
-        return "user"
+        # Generated from the code, so its prose is the code's prose. The
+        # citation rules would demand editing doc comments to satisfy a
+        # documentation gate, which is backwards: the page would drift from
+        # the definition it is generated from at the next regeneration.
+        # Everything else still applies, including provenance: a source path
+        # or a commit hash has no business here either.
+        return "generated"
     if rel.startswith("docs/adrs/") and rel.endswith(".md"):
         return "history"
     if rel.startswith("docs/internal/") and rel.endswith(".md"):
@@ -389,7 +395,7 @@ def analyze_markdown(rel, repo):
                 _link_and_anchor(rel, src_dir, is_img, target, scope, repo, findings)
 
         # Scope-gated prose rules.
-        if scope in ("user", "spec"):
+        if scope in ("user", "spec", "generated"):
             _provenance(rel, line, findings)
             _superlative(rel, line, findings)
             _term(rel, line, findings)
@@ -397,7 +403,7 @@ def analyze_markdown(rel, repo):
             _tracker(rel, line, heading, findings)
             _srcpath(rel, line, findings)
 
-    if scope == "user":
+    if scope in ("user", "generated"):
         findings.extend(_sqltable(rel, lines, repo))
 
     return findings
