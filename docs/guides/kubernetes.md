@@ -455,6 +455,22 @@ split in a kind cluster anyway, create the per-mode Secrets yourself the same
 way as above (`kubectl create secret generic ...`) before applying a
 `RavelCluster` that references them.
 
+Setting any per-mode `credentialsSecretRef` also changes the order the operator
+applies the three Deployments in. Every `ravel-server` mode creates the durable
+`sys/gc` object if it is absent and then validates itself against it, but under
+the per-role policies only Maintain and Admin can write it, so on a fresh bucket
+the operator applies the maintain Deployment first and the gateway and query
+Deployments only once maintain reports a ready replica. While it waits, the
+cluster carries `Available=False` with reason `WaitingForGcBootstrap` and
+`Degraded=False`, and the operator requeues: this is progress, not a failure,
+and it needs no manual bootstrap step. With `maintain.enabled: false` no pod can
+create the object at all, so the operator renders no gateway or query Deployment
+and reports `Degraded=True` with reason `GcBootstrapUnavailable`; either enable
+maintain, or create `sys/gc` yourself with `ravel-cli gc-config set` under the
+Admin credential. A `RavelCluster` with only the shared
+`spec.storage.s3.credentialsSecretRef` keeps the original order and never waits,
+because any pod holding that credential can create the object.
+
 ## Background
 
 The operator's design, its condition set and its reconcile model are

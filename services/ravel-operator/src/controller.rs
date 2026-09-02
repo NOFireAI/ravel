@@ -16,6 +16,7 @@ use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{Secret, Service, ServiceAccount};
 use k8s_openapi::api::networking::v1::Ingress;
 use k8s_openapi::api::rbac::v1::{Role, RoleBinding};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::api::{DeleteParams, Patch, PatchParams};
 use kube::core::DynamicObject;
 use kube::{Api, Client, Resource, ResourceExt};
@@ -33,9 +34,11 @@ use crate::crd::{
     RavelClusterSpec, RavelClusterStatus, ShardOverridesSpec,
 };
 use crate::reconcile::{
-    DEPLOYMENT_KEY_SECRET_KEY, RenderCtx, RenderError, S3_ACCESS_KEY_ID_KEY,
-    S3_SECRET_ACCESS_KEY_KEY, desired_objects, grpcroute_api_resource, httproute_api_resource,
-    possible_gateway_route_names, possible_ingest_ingress_names, possible_router_object_names,
+    DEPLOYMENT_KEY_SECRET_KEY, DeploymentTier, GC_BOOTSTRAP_UNAVAILABLE_MESSAGE,
+    GC_BOOTSTRAP_UNAVAILABLE_REASON, GcBootstrapGate, RenderCtx, RenderError, S3_ACCESS_KEY_ID_KEY,
+    S3_SECRET_ACCESS_KEY_KEY, WAITING_FOR_GC_BOOTSTRAP_MESSAGE, WAITING_FOR_GC_BOOTSTRAP_REASON,
+    desired_objects, grpcroute_api_resource, httproute_api_resource, possible_gateway_route_names,
+    possible_ingest_ingress_names, possible_router_object_names,
 };
 
 /// Server-side-apply field manager name.
@@ -56,6 +59,14 @@ const RESYNC: Duration = Duration::from_secs(300);
 
 /// Requeue interval after a failed reconcile.
 const RETRY: Duration = Duration::from_secs(30);
+
+/// Requeue interval while a pass is waiting on an ordering precondition rather
+/// than on anything having failed: today that is the `sys/gc` bootstrap under
+/// per-role storage credentials (see
+/// [`crate::reconcile::GcBootstrapPlan`]). Much shorter than [`RESYNC`] so a
+/// fresh cluster starts serving within seconds of the maintain tier becoming
+/// ready, and deliberately not [`RETRY`], which is the failure path.
+const BOOTSTRAP_POLL: Duration = Duration::from_secs(10);
 
 /// Reconcile errors.
 #[derive(Debug, thiserror::Error)]
@@ -1008,12 +1019,11 @@ async fn reconcile_inner(
     // every other tier's apply and sweep still runs this pass.
     let desired = desired_objects(&obj.spec, instance, namespace, &render_ctx)?;
 
-    // Gateway.
-    let mut gateway = desired.gateway_deployment;
-    gateway.metadata.namespace = Some(namespace.to_string());
-    gateway.metadata.owner_references = owner.clone();
-    let gateway_applied = apply(&deployments, &child(instance, "gateway"), &gateway).await?;
-
+    // Services and routing first, then the three Deployments in the order the
+    // `sys/gc` bootstrap plan dictates (see the block after the router sweep).
+    // A Service selecting pods that do not exist yet is inert, so applying it
+    // ahead of its Deployment costs nothing and keeps the ordering decision in
+    // one place.
     let mut gateway_svc = desired.gateway_service;
     gateway_svc.metadata.namespace = Some(namespace.to_string());
     gateway_svc.metadata.owner_references = owner.clone();
@@ -1102,16 +1112,13 @@ async fn reconcile_inner(
     // `desired_objects` already captured the error here rather than aborting the
     // whole reconcile, so all `router_*` fields are None and the apply blocks
     // below are no-ops; the sweep then removes any stale router objects.
-    if let Some(err) = desired.router_render_error {
-        let (reason, message) = degraded_reason(&Error::Render(err));
-        extra_conditions.push(condition(
-            "Degraded",
-            true,
-            obj.metadata.generation,
-            &reason,
-            &message,
-        ));
-    }
+    // Collected rather than pushed straight onto `extra_conditions`: a
+    // conditions array is keyed by type, so a pass may record at most one
+    // `Degraded` entry, and the `sys/gc` bootstrap check below can also produce
+    // one. Resolved once, after that check.
+    let mut degraded: Option<(String, String)> = desired
+        .router_render_error
+        .map(|err| degraded_reason(&Error::Render(err)));
     let mut desired_router_names: BTreeSet<String> = BTreeSet::new();
     if let Some(mut sa) = desired.router_service_account {
         let name = sa.name_any();
@@ -1162,52 +1169,180 @@ async fn reconcile_inner(
         delete_if_present(&role_bindings, &name).await?;
     }
 
-    // Query.
-    let mut query = desired.query_deployment;
-    query.metadata.namespace = Some(namespace.to_string());
-    query.metadata.owner_references = owner.clone();
-    let query_applied = apply(&deployments, &child(instance, "query"), &query).await?;
-
     let mut query_svc = desired.query_service;
     query_svc.metadata.namespace = Some(namespace.to_string());
     query_svc.metadata.owner_references = owner.clone();
     apply(&services, &child(instance, "query"), &query_svc).await?;
 
-    // Maintain: apply when enabled, delete when not.
+    // The three Deployments, in exactly the order `gc_bootstrap` names and no
+    // other.
+    //
+    // Every `ravel-server` mode creates-if-absent and then validates `sys/gc`
+    // at startup, but under per-role storage credentials only the maintain (and
+    // Admin) role holds a write grant on it. So when the spec sets any
+    // per-Deployment `credentialsSecretRef`, maintain is applied first and the
+    // request-serving tiers are held until it reports a ready replica: applying
+    // them against a fresh bucket first would fail their create with an access
+    // error and crash-loop them until maintain got there. A single shared
+    // credential keeps the original gateway-query-maintain order and reads
+    // nothing extra, because any tier can create the object there.
+    let plan = desired.gc_bootstrap;
     let maintain_name = child(instance, "maintain");
-    let maintain_ready = match desired.maintain_deployment {
-        Some(mut maintain) => {
-            maintain.metadata.namespace = Some(namespace.to_string());
-            maintain.metadata.owner_references = owner.clone();
-            let applied = apply(&deployments, &maintain_name, &maintain).await?;
-            ready_replicas(&applied)
-        }
-        None => {
-            // Ignore a not-found error: the Deployment may never have existed.
-            if let Err(err) = deployments
-                .delete(&maintain_name, &DeleteParams::default())
-                .await
-                && !is_not_found(&err)
-            {
-                return Err(err.into());
-            }
-            None
-        }
+    let maintain_ready_before = if plan.reads_maintain_ready() {
+        live_ready_replicas(&deployments, &maintain_name).await?
+    } else {
+        None
     };
+
+    let mut tiers = TierDeployments {
+        gateway: desired.gateway_deployment,
+        query: desired.query_deployment,
+        maintain: desired.maintain_deployment,
+        applied: BTreeMap::new(),
+    };
+    // Maintain disabled: converge its Deployment away, whether that is because
+    // the spec turned the tier off or because the render withheld it.
+    if tiers.maintain.is_none() {
+        delete_if_present(&deployments, &maintain_name).await?;
+    }
+    for tier in plan.apply_sequence(maintain_ready_before) {
+        tiers
+            .apply_tier(&deployments, namespace, instance, owner.as_ref(), tier)
+            .await?;
+    }
+
+    // Report the readiness the maintain apply just observed, but decide the
+    // `Available` condition from the count the ORDERING used: that is the one
+    // that describes what this pass actually applied.
+    let maintain_ready = tiers
+        .applied(DeploymentTier::Maintain)
+        .and_then(ready_replicas)
+        .or(maintain_ready_before);
+    let waiting = plan.waiting_for_bootstrap(maintain_ready_before);
+    let available_hold = match plan.gate {
+        GcBootstrapGate::Unavailable => {
+            // No rendered tier can create `sys/gc` at all, so this is a
+            // misconfiguration to surface, not a wait to sit through. It
+            // outranks a router render error for the pass's single `Degraded`
+            // entry: it stops the whole cluster from ever becoming ready,
+            // where a router error stops only ingest routing.
+            degraded = Some((
+                GC_BOOTSTRAP_UNAVAILABLE_REASON.to_string(),
+                GC_BOOTSTRAP_UNAVAILABLE_MESSAGE.to_string(),
+            ));
+            Some((
+                GC_BOOTSTRAP_UNAVAILABLE_REASON,
+                GC_BOOTSTRAP_UNAVAILABLE_MESSAGE,
+            ))
+        }
+        _ if waiting => Some((
+            WAITING_FOR_GC_BOOTSTRAP_REASON,
+            WAITING_FOR_GC_BOOTSTRAP_MESSAGE,
+        )),
+        _ => None,
+    };
+    if let Some((reason, message)) = &degraded {
+        extra_conditions.push(condition(
+            "Degraded",
+            true,
+            obj.metadata.generation,
+            reason,
+            message,
+        ));
+    } else if waiting {
+        // Held back, not broken. An explicit `Degraded=False` says so, so
+        // `kubectl wait --for=condition=Degraded=false` succeeds while the
+        // bootstrap is still in flight and only `Available` reports the wait.
+        extra_conditions.push(condition(
+            "Degraded",
+            false,
+            obj.metadata.generation,
+            WAITING_FOR_GC_BOOTSTRAP_REASON,
+            WAITING_FOR_GC_BOOTSTRAP_MESSAGE,
+        ));
+    }
 
     write_status(
         client,
         namespace,
         instance,
         obj.metadata.generation,
-        ready_replicas(&gateway_applied),
-        ready_replicas(&query_applied),
+        tiers
+            .applied(DeploymentTier::Gateway)
+            .and_then(ready_replicas),
+        tiers
+            .applied(DeploymentTier::Query)
+            .and_then(ready_replicas),
         maintain_ready,
+        available_hold,
         extra_conditions,
     )
     .await?;
 
+    if waiting {
+        return Ok(Action::requeue(BOOTSTRAP_POLL));
+    }
     Ok(Action::requeue(RESYNC))
+}
+
+/// The rendered Deployment for each tier and the applied result for each tier
+/// that this pass got to, so [`reconcile_inner`] applies them strictly in
+/// [`crate::reconcile::GcBootstrapPlan::apply_sequence`]'s order without three
+/// hand-written apply sites that could drift back into a fixed one.
+struct TierDeployments {
+    /// The rendered gateway Deployment, taken when applied.
+    gateway: Option<Deployment>,
+    /// The rendered query Deployment, taken when applied.
+    query: Option<Deployment>,
+    /// The rendered maintain Deployment, taken when applied.
+    maintain: Option<Deployment>,
+    /// The live object each applied tier came back as.
+    applied: BTreeMap<&'static str, Deployment>,
+}
+
+impl TierDeployments {
+    /// Apply one tier's Deployment, stamping namespace and owner references.
+    /// A tier the render withheld (or one already applied this pass) is a
+    /// no-op.
+    async fn apply_tier(
+        &mut self,
+        deployments: &Api<Deployment>,
+        namespace: &str,
+        instance: &str,
+        owner: Option<&Vec<OwnerReference>>,
+        tier: DeploymentTier,
+    ) -> Result<(), Error> {
+        let rendered = match tier {
+            DeploymentTier::Gateway => self.gateway.take(),
+            DeploymentTier::Query => self.query.take(),
+            DeploymentTier::Maintain => self.maintain.take(),
+        };
+        let Some(mut deployment) = rendered else {
+            return Ok(());
+        };
+        deployment.metadata.namespace = Some(namespace.to_string());
+        deployment.metadata.owner_references = owner.cloned();
+        let name = child(instance, tier.component());
+        let applied = apply(deployments, &name, &deployment).await?;
+        self.applied.insert(tier.component(), applied);
+        Ok(())
+    }
+
+    /// The live object a tier was applied as, or `None` when this pass did not
+    /// apply it.
+    fn applied(&self, tier: DeploymentTier) -> Option<&Deployment> {
+        self.applied.get(tier.component())
+    }
+}
+
+/// Ready replicas the live Deployment `name` reports, or `None` when it does not
+/// exist yet (the fresh-cluster case) or reports none.
+async fn live_ready_replicas(api: &Api<Deployment>, name: &str) -> Result<Option<i32>, Error> {
+    match api.get(name).await {
+        Ok(deployment) => Ok(ready_replicas(&deployment)),
+        Err(err) if is_not_found(&err) => Ok(None),
+        Err(err) => Err(err.into()),
+    }
 }
 
 /// Ready-replica count from a Deployment's status, if reported yet.
@@ -1288,11 +1423,17 @@ fn spec_conditions(spec: &RavelClusterSpec, observed_generation: Option<i64>) ->
 /// an `Available` condition derived from whether the gateway and query tiers
 /// report ready replicas, and whatever spec-derived conditions this pass
 /// computed. Pure, so the condition set is testable without a cluster.
+///
+/// `unavailable_reason` names a specific reason for `Available=False` when this
+/// pass knows one better than "not ready yet": today the `sys/gc` bootstrap
+/// hold and its unavailable case. It cannot make a ready cluster unavailable,
+/// only explain an unready one.
 fn build_status(
     observed_generation: Option<i64>,
     gateway_ready: Option<i32>,
     query_ready: Option<i32>,
     maintain_ready: Option<i32>,
+    unavailable_reason: Option<(&str, &str)>,
     extra_conditions: Vec<Condition>,
 ) -> RavelClusterStatus {
     let available = gateway_ready.unwrap_or(0) > 0 && query_ready.unwrap_or(0) > 0;
@@ -1304,6 +1445,8 @@ fn build_status(
             "MinimumReplicasAvailable",
             "gateway and query tiers report ready replicas",
         )
+    } else if let Some((reason, message)) = unavailable_reason {
+        condition("Available", false, observed_generation, reason, message)
     } else {
         condition(
             "Available",
@@ -1359,6 +1502,7 @@ async fn write_status(
     gateway_ready: Option<i32>,
     query_ready: Option<i32>,
     maintain_ready: Option<i32>,
+    unavailable_reason: Option<(&str, &str)>,
     extra_conditions: Vec<Condition>,
 ) -> Result<(), Error> {
     let status = build_status(
@@ -1366,6 +1510,7 @@ async fn write_status(
         gateway_ready,
         query_ready,
         maintain_ready,
+        unavailable_reason,
         extra_conditions,
     );
     patch_status(client, namespace, instance, &status).await
@@ -1605,7 +1750,7 @@ mod tests {
             vec!["IngestAffinityBackendDeprecated"]
         );
 
-        let ok = build_status(Some(7), Some(3), Some(2), Some(1), extra.clone());
+        let ok = build_status(Some(7), Some(3), Some(2), Some(1), None, extra.clone());
         assert_eq!(
             condition_types(&ok.conditions),
             vec!["Available", "IngestAffinityBackendDeprecated"]
@@ -1678,7 +1823,7 @@ mod tests {
                 "no spec-derived condition, got {:?}",
                 condition_types(&extra)
             );
-            let ok = build_status(Some(2), Some(1), Some(1), None, extra.clone());
+            let ok = build_status(Some(2), Some(1), Some(1), None, None, extra.clone());
             assert_eq!(condition_types(&ok.conditions), vec!["Available"]);
             let degraded = build_degraded_status(Some(2), "ReconcileError", "boom", extra);
             assert_eq!(
@@ -1686,6 +1831,88 @@ mod tests {
                 vec!["Degraded", "Available"]
             );
         }
+    }
+
+    /// The two `sys/gc` bootstrap states the ordering produces, at the status
+    /// layer: a wait that must NOT read as a failure, and a misconfiguration
+    /// that must. Pure, so no cluster is needed (see the module doc).
+    #[test]
+    fn gc_bootstrap_hold_names_the_wait_on_available_without_degrading() {
+        // Held: the request-serving tiers were not applied this pass, so they
+        // report no ready replicas, and `Available=False` names the wait
+        // instead of the generic not-ready-yet reason. `Degraded` is False,
+        // not True: the cluster is progressing, not broken.
+        let waiting = build_status(
+            Some(4),
+            None,
+            None,
+            Some(0),
+            Some((
+                WAITING_FOR_GC_BOOTSTRAP_REASON,
+                WAITING_FOR_GC_BOOTSTRAP_MESSAGE,
+            )),
+            vec![condition(
+                "Degraded",
+                false,
+                Some(4),
+                WAITING_FOR_GC_BOOTSTRAP_REASON,
+                WAITING_FOR_GC_BOOTSTRAP_MESSAGE,
+            )],
+        );
+        assert_eq!(
+            condition_types(&waiting.conditions),
+            vec!["Available", "Degraded"]
+        );
+        let available = find(&waiting.conditions, "Available");
+        assert_eq!(available.status, "False");
+        assert_eq!(available.reason, "WaitingForGcBootstrap");
+        assert!(
+            available.message.contains("sys/gc"),
+            "the message names what is being waited on: {}",
+            available.message
+        );
+        assert_eq!(find(&waiting.conditions, "Degraded").status, "False");
+
+        // Unavailable: nothing can create the object, so this one degrades.
+        let unavailable = build_status(
+            Some(4),
+            None,
+            None,
+            None,
+            Some((
+                GC_BOOTSTRAP_UNAVAILABLE_REASON,
+                GC_BOOTSTRAP_UNAVAILABLE_MESSAGE,
+            )),
+            vec![condition(
+                "Degraded",
+                true,
+                Some(4),
+                GC_BOOTSTRAP_UNAVAILABLE_REASON,
+                GC_BOOTSTRAP_UNAVAILABLE_MESSAGE,
+            )],
+        );
+        assert_eq!(
+            find(&unavailable.conditions, "Available").reason,
+            "GcBootstrapUnavailable"
+        );
+        assert_eq!(find(&unavailable.conditions, "Degraded").status, "True");
+
+        // A named reason can only explain an unready cluster, never make a
+        // ready one unavailable.
+        let ready = build_status(
+            Some(4),
+            Some(1),
+            Some(1),
+            Some(1),
+            Some((
+                WAITING_FOR_GC_BOOTSTRAP_REASON,
+                WAITING_FOR_GC_BOOTSTRAP_MESSAGE,
+            )),
+            Vec::new(),
+        );
+        let available = find(&ready.conditions, "Available");
+        assert_eq!(available.status, "True");
+        assert_eq!(available.reason, "MinimumReplicasAvailable");
     }
 
     #[test]
