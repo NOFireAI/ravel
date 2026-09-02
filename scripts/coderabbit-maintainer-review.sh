@@ -26,7 +26,7 @@
 #   scripts/coderabbit-maintainer-review.sh 1234 --publish
 #
 # Requires: the pinned CodeRabbit CLI on PATH (see "Local maintainer fallback"
-# in docs/guides/coderabbit-runbook.md), gh, jq, git, python3.
+# in docs/internal/coderabbit-runbook.md), gh, jq, git, python3.
 
 set -Eeuo pipefail
 umask 077

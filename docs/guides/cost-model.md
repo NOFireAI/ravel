@@ -182,7 +182,7 @@ production query volume, not as cents.
 
 The measured example is the ClickBench corpus (42 statements, cold, reference
 box, with the pass procedure in
-[clickbench-aws-runbook.md](clickbench-aws-runbook.md)). Turning on projection
+[clickbench-aws-runbook.md](../internal/clickbench-aws-runbook.md)). Turning on projection
 routing moved:
 
 ```text
