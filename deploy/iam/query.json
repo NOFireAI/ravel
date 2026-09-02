@@ -8,7 +8,7 @@
       "Resource": "arn:aws:s3:::my-ravel-bucket",
       "Condition": {
         "StringLike": {
-          "s3:prefix": ["t/", "t/*/*/c/*", "t/*/catalog/*/*", "admission/query/*"]
+          "s3:prefix": ["t/", "t/*/*/c/*", "t/*/catalog/*/*", "admission/query/*", "sys/query/workers/*"]
         }
       }
     },
@@ -25,7 +25,8 @@
         "arn:aws:s3:::my-ravel-bucket/admission/query/*",
         "arn:aws:s3:::my-ravel-bucket/sys/tenancy",
         "arn:aws:s3:::my-ravel-bucket/sys/qualification",
-        "arn:aws:s3:::my-ravel-bucket/sys/gc"
+        "arn:aws:s3:::my-ravel-bucket/sys/gc",
+        "arn:aws:s3:::my-ravel-bucket/sys/query/workers/*"
       ]
     },
     {
@@ -38,7 +39,8 @@
         "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/idx/*",
         "arn:aws:s3:::my-ravel-bucket/t/*/u/*",
         "arn:aws:s3:::my-ravel-bucket/admission/query/*",
-        "arn:aws:s3:::my-ravel-bucket/sys/tenancy"
+        "arn:aws:s3:::my-ravel-bucket/sys/tenancy",
+        "arn:aws:s3:::my-ravel-bucket/sys/query/workers/*"
       ]
     },
     {
