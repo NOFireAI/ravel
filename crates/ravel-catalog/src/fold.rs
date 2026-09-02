@@ -2329,9 +2329,13 @@ impl Catalog {
     /// A retention tombstone makes the bucket contribute nothing: neither its
     /// L1 parts nor its L0 records are folded in (ADR-0019 section 3). Each
     /// compaction record contributes its parts as level-1 entries and
-    /// supersedes its named L0 inputs; two records with different input sets in
+    /// supersedes its named L0 inputs; two records with DISJOINT input sets in
     /// one bucket both contribute (a harmless overlap the resolver alarms on
-    /// but still serves). A selective-erasure rewrite record (ADR-0064
+    /// but still serves), while two whose input sets OVERLAP resolve to one
+    /// authoritative record through
+    /// [`crate::catalog::select_authoritative_compaction_records`] (issue
+    /// #1070), the loser's parts skipped and its uncovered inputs folded in as
+    /// raw L0. A selective-erasure rewrite record (ADR-0064
     /// decision 3, amended) contributes its own output parts as level-1
     /// entries and supersedes either its named L0 inputs directly, or -- when
     /// it names a `superseded_record_key` instead -- whatever that
@@ -2393,6 +2397,22 @@ impl Catalog {
                 .load_and_validate_compaction(tenant, signal, shard, ckey, accounting)
                 .await?;
             counters.get_requests += 1;
+            compaction_records.push(((*ckey).to_string(), record));
+        }
+
+        // Overlapping input sets in one bucket (issue #1070): pick one
+        // authoritative record per overlap component through the SAME helper
+        // snapshot resolution uses, so a folded snapshot and a live resolve
+        // never disagree on which record wins. A loser's parts are skipped
+        // below and only WINNING records' inputs join `excluded`, so a loser
+        // input no winner names is folded in as a raw L0. Disjoint records are
+        // not in conflict and both contribute.
+        let losing_compaction_records =
+            crate::catalog::select_authoritative_compaction_records(&compaction_records);
+        for (ckey, record) in &compaction_records {
+            if losing_compaction_records.contains(ckey) {
+                continue;
+            }
             for input in &record.inputs {
                 excluded.insert((
                     input.writer_id.clone(),
@@ -2400,7 +2420,6 @@ impl Catalog {
                     input.writer_seq,
                 ));
             }
-            compaction_records.push(((*ckey).to_string(), record));
         }
 
         // Load rewrite records (ADR-0064 decision 3), verified against their
@@ -2458,7 +2477,9 @@ impl Catalog {
         // bucket both contribute (a harmless overlap the resolver alarms on
         // but still serves).
         for (ckey, record) in &compaction_records {
-            if superseded_records.contains(ckey.as_str()) {
+            if superseded_records.contains(ckey.as_str())
+                || losing_compaction_records.contains(ckey)
+            {
                 continue;
             }
             for part in &record.parts {
