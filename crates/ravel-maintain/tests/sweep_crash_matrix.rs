@@ -513,7 +513,11 @@ async fn no_delete_before_horizon_boundary_stepped() {
         )
         .await
         .expect("sweep");
-        assert_eq!(before, (0, 0), "nothing before the horizon");
+        assert_eq!(
+            (before.records_deleted, before.data_deleted),
+            (0, 0),
+            "nothing before the horizon"
+        );
         assert_eq!(l0_commit_count(&store, &bucket).await, 2);
 
         // One ns before the boundary: still nothing.
@@ -529,7 +533,11 @@ async fn no_delete_before_horizon_boundary_stepped() {
         )
         .await
         .expect("sweep");
-        assert_eq!(edge, (0, 0), "nothing one ns before the horizon");
+        assert_eq!(
+            (edge.records_deleted, edge.data_deleted),
+            (0, 0),
+            "nothing one ns before the horizon"
+        );
         assert_eq!(l0_commit_count(&store, &bucket).await, 2);
 
         // Exactly at the boundary: the inputs are swept.
@@ -545,7 +553,10 @@ async fn no_delete_before_horizon_boundary_stepped() {
         )
         .await
         .expect("sweep");
-        assert_eq!(at.0, 2, "both input records deleted at the horizon");
+        assert_eq!(
+            at.records_deleted, 2,
+            "both input records deleted at the horizon"
+        );
         assert_eq!(l0_commit_count(&store, &bucket).await, 0);
         assert_l1_intact(&store, &bucket).await;
     }
