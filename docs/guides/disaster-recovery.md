@@ -103,8 +103,25 @@ modifiers apply to are in
 
 ### level 0, no replication (default)
 
-Unversioned bucket beyond the protected prefixes. Erasure bounds hold as
-stated in [consistency-model.md](../consistency-model.md) with no modifiers.
+The bucket is versioned. Versioning is not optional here and it is not
+scoped to some prefixes: the baseline above requires it, because Object Lock
+cannot be enabled without it, and S3 versioning is bucket-wide. There is no
+bucket that is versioned only under the protected prefixes. So every
+overwrite and delete of a data object leaves a noncurrent version behind.
+
+Level 0 pairs that versioning with a `NoncurrentDays = E_v`
+noncurrent-version expiration rule and expired-delete-marker cleanup, and
+adds no replica. Its physical erasure bound is the primary bound plus
+`+E_v`, the same primary half level 1 states: erased bytes persist as
+noncurrent versions until the rule reaps them. The base bounds are in
+[consistency-model.md](../consistency-model.md); the `+E_v` modifier is in
+[deletion-and-gc.md](../deletion-and-gc.md#modifiers-to-the-bound).
+
+Versioning on without that lifecycle rule is not a level. Without the rule
+the noncurrent residue is unbounded and the bounds in this guide do not
+apply: every delete becomes a soft delete that survives indefinitely while
+every layer above keeps reporting success.
+
 RPO and RTO: none; bucket loss is total loss. This remains a **supported
 posture**, but its blast radius is total: every durable byte (data objects,
 commit records, manifests, catalog snapshots, control objects under `sys/`)
@@ -112,12 +129,9 @@ lives in one bucket, and Ravel itself cannot recover from losing it.
 
 ### level 1, replicated (the recommended posture)
 
-On the primary bucket:
-
-- Versioning **ON**, paired with a `NoncurrentDays = E_v` noncurrent-version
-  expiration rule and expired-delete-marker cleanup. Versioning on without
-  that pairing is an unsupported configuration: it turns every Ravel delete
-  into a soft delete while every layer above keeps reporting success.
+Level 0 plus a replica. The primary keeps the level-0 configuration
+unchanged: versioning on, the `NoncurrentDays = E_v` noncurrent-version
+expiration rule, and expired-delete-marker cleanup.
 
 Replication to a replica bucket:
 
@@ -179,12 +193,12 @@ the cross-account replica stand in for a bucket default retention at level 1.
 
 ## `E_v` is one knob controlling two windows
 
-The load-bearing design insight of level 1: **`E_v` is one knob controlling two
-windows.**
+`E_v` is present from level 0, since the bucket is versioned there. **`E_v`
+is one knob controlling two windows.**
 
 - It is the **disaster-detection budget**: after an accidental or malicious
-  mass delete, the operator has `E_v_r`, plus `E_v` if the deletes were simple
-  deletes, to notice and restore noncurrent versions.
+  mass delete, the operator has `E_v` to notice and restore the noncurrent
+  versions on the primary, plus `E_v_r` on the replica at level 1.
 - It is simultaneously the **erasure-residue window**: erased bytes persist as
   noncurrent versions for `E_v`.
 
@@ -198,8 +212,10 @@ Ravel cannot enforce most of this and does not pretend to. `ravel-cli store
 qualify` probes whether Object Lock and versioning appear enabled and reports
 lifecycle-rule state, but **replication configuration is invisible to the
 object-store layer**, so verification of the replication controls is an
-explicit platform-CLI step and not something Ravel checked. Run these against
-the actual buckets:
+explicit platform-CLI step and not something Ravel checked. The versioning
+and `NoncurrentDays = E_v` lifecycle checks apply at level 0 and level 1
+alike; the replication checks are level 1 only. Run these against the actual
+buckets:
 
 ```sh
 # Primary: versioning ON
@@ -380,8 +396,8 @@ record: a real end-to-end run against MinIO is what fills a row.
 | Level | Controls | Erasure-bound consequence | RPO/RTO |
 |---|---|---|---|
 | **Every level** | Object Lock enabled on the bucket and versioning ON; at levels 0 and 1, no bucket default retention and an operator-run mechanism applying per-object retention in compliance mode to `sys/`, provisioning records, commit records and catalog HEAD history (level 2 replaces the mechanism with its bucket default retention); `--require-bucket-protection` gates startup on the bucket half (Object Lock enabled, versioning on), and the mechanism or the default retention is verified out of band | None; those prefixes hold no erasable subject value | Not a recovery control |
-| **level 0** (default) | No replication | None; bounds as in consistency-model.md | None; bucket loss is total loss |
-| **level 1** (recommended) | Primary: versioning + `NoncurrentDays = E_v` + expired-delete-marker cleanup. Replica: different region/account/KMS key, replication v2 with `DeleteMarkerReplication`, RTC recommended, `NoncurrentDays = E_v_r` | Primary `+E_v`; replica residue is replication lag + `E_v_r` (requires `DeleteMarkerReplication`) | Defined here; **unmeasured** until a rehearsal record exists. RTC gives RPO a 15-minute ceiling; without RTC, unbounded |
+| **level 0** (default) | Versioning + `NoncurrentDays = E_v` + expired-delete-marker cleanup; no replica | Primary `+E_v` | None; bucket loss is total loss |
+| **level 1** (recommended) | Level 0 plus a replica: different region/account/KMS key, replication v2 with `DeleteMarkerReplication`, RTC recommended, `NoncurrentDays = E_v_r` | Primary `+E_v`; replica residue is replication lag + `E_v_r` (requires `DeleteMarkerReplication`) | Defined here; **unmeasured** until a rehearsal record exists. RTC gives RPO a 15-minute ceiling; without RTC, unbounded |
 | **level 2** (optional) | level 1 plus a bucket default retention `D`, which S3 applies to every object including the data objects | `max(bound, D)`; query-time exclusion still immediate | As level 1 |
 
 `DeleteMarkerReplication` is mandatory for any erasure-obligated deployment;
