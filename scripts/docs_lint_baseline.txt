@@ -343,7 +343,6 @@ docs/guides/ingest-affinity.md	TRACKER	ADR-0080
 docs/guides/ingest-affinity.md	TRACKER	ADR-0080
 docs/guides/ingest-affinity.md	TRACKER	ADR-0080
 docs/guides/ingest-affinity.md	TRACKER	ADR-0080
-docs/guides/ingest.md	ANCHOR	query.md#sql-over-the-logs-table
 docs/guides/ingest.md	SRCPATH	crates/ravel-otlp/src/limits.rs
 docs/guides/ingest.md	SRCPATH	crates/ravel-otlp/src/limits.rs
 docs/guides/ingest.md	SRCPATH	crates/ravel-otlp/src/limits.rs
@@ -436,7 +435,6 @@ docs/guides/query.md	TERM	declared column
 docs/guides/query.md	TERM	declared column
 docs/guides/query.md	TERM	declared column
 docs/guides/query.md	TERM	declared column
-docs/guides/query.md	TRACKER	#333
 docs/guides/query.md	TRACKER	../adrs/0085-metric-metadata-and-otlp-suffixing.md
 docs/guides/query.md	TRACKER	ADR-0021
 docs/guides/query.md	TRACKER	ADR-0035
