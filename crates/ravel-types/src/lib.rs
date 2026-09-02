@@ -41,6 +41,28 @@ impl Signal {
             Signal::Audit => "u",
         }
     }
+
+    /// The number of shards a reader must always scan for this signal, because
+    /// its writers pin fixed shard indices by constant rather than hashing a
+    /// series into `0..shard_count` (ADR-1101 decision 2).
+    ///
+    /// Three writers pin themselves this way: `ALERT_SHARD` (0) on
+    /// [`Signal::Alerts`], and `AUDIT_HOLD_SHARD` (0) plus
+    /// `QUERY_AUDIT_SHARD` (1) on [`Signal::Audit`]. Alerts and audit are
+    /// never provisioned, so they resolve through the implicit generation 0 at
+    /// the process `shard_count`; a `--shards 1` deployment would derive a
+    /// scan set of shard 0 only and silently miss every query-audit record.
+    ///
+    /// This is a floor, never a cap. The generation history and a larger
+    /// configured `shard_count` can only widen the scan set above it; they can
+    /// never narrow it below.
+    pub const fn fixed_read_shards(self) -> u32 {
+        match self {
+            Signal::Alerts => 1,
+            Signal::Audit => 2,
+            Signal::Metrics | Signal::Logs | Signal::Spans | Signal::Profiles => 0,
+        }
+    }
 }
 
 /// Logical tenant identifier as resolved by authentication. Never appears in
@@ -592,6 +614,28 @@ pub enum TypeError {
 mod tests {
     use super::*;
     use crate::logstream::LogStreamId;
+
+    /// Every signal is classified explicitly, by an exhaustive match rather
+    /// than a wildcard arm, so adding a variant later fails to compile here
+    /// until someone decides whether its writers pin a shard index.
+    #[test]
+    fn fixed_read_shards_is_zero_for_every_signal_without_pinned_writers() {
+        for signal in [
+            Signal::Metrics,
+            Signal::Logs,
+            Signal::Spans,
+            Signal::Profiles,
+            Signal::Alerts,
+            Signal::Audit,
+        ] {
+            let expected = match signal {
+                Signal::Alerts => 1,
+                Signal::Audit => 2,
+                Signal::Metrics | Signal::Logs | Signal::Spans | Signal::Profiles => 0,
+            };
+            assert_eq!(signal.fixed_read_shards(), expected, "signal {signal:?}");
+        }
+    }
 
     #[test]
     fn shard_for_log_matches_leading_bytes_mod_shard_count() {

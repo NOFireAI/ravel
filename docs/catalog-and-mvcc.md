@@ -1249,6 +1249,18 @@ generation was already active for is rejected loudly with a fail-closed
 hours were written under, and serving it would silently omit data below its own
 watermark.
 
+A read-side shard floor for the pinned signals. The alerts and audit writers do
+not hash a series into `0..shard_count`; they pin fixed shard indices by
+constant (`ALERT_SHARD` 0, `AUDIT_HOLD_SHARD` 0, `QUERY_AUDIT_SHARD` 1), and
+neither signal is ever provisioned, so both resolve through the implicit
+generation 0 at the process `shard_count`. A reader's scan set for hour `h` is
+therefore `max(scan_count(h), Signal::fixed_read_shards())` for every signal:
+1 for alerts, 2 for audit, 0 elsewhere (ADR-1101 decision 2). It is a floor
+only. A wider generation history or a larger configured `shard_count` raises
+the scan set above it and nothing lowers it below, so a `--shards 1`
+deployment still lists the query-audit shard instead of silently omitting every
+record pinned to it.
+
 Commit tokens are unaffected. A token minted under any generation resolves
 forever, because token resolution reconstructs the exact key from the token's
 own fields and never consults `shard_count` (ADR-0052 section 6).

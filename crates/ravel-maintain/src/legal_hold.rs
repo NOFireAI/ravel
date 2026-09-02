@@ -81,6 +81,10 @@ use crate::sweep::LeaseCheck;
 /// colocated for the fold; it is unrelated to the data shards a hold's scope
 /// may cover.
 pub const AUDIT_HOLD_SHARD: u32 = 0;
+// Moving this writer to a shard outside the reader's floor (ADR-1101
+// decision 2) fails the build here rather than silently dropping every
+// legal-hold record from audit queries.
+const _: () = assert!(AUDIT_HOLD_SHARD < Signal::Audit.fixed_read_shards());
 
 /// `attrs` key marking an audit record as a legal-hold record. An audit record
 /// without this key (an ordinary query/admin audit entry) is ignored here.
