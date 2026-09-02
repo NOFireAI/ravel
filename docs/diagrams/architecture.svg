@@ -123,12 +123,12 @@
   <!-- bottom annotation -->
   <rect x="40" y="808" width="1340" height="60" rx="6" fill="#dde1e7" stroke="#454b54" stroke-width="1.5" stroke-dasharray="6,4"/>
   <text x="710" y="832" font-size="13" text-anchor="middle" fill="#17191c" font-weight="bold">Everything above the object store is disposable and stateless.</text>
-  <text x="710" y="850" font-size="12" text-anchor="middle" fill="#17191c">Any process may crash at any instant; restart-from-empty is the only recovery path (ADR-0001). No local WAL, no local durability dependency.</text>
+  <text x="710" y="850" font-size="12" text-anchor="middle" fill="#17191c">Any process may crash at any instant; restart-from-empty is the only recovery path. No local WAL, no local durability dependency.</text>
 
   <!-- SQL query path (ravel-sql) -->
   <rect x="40" y="878" width="1340" height="90" rx="6" fill="#eceef1" stroke="#1f4e79" stroke-width="2"/>
   <text x="710" y="904" font-size="14" font-weight="bold" text-anchor="middle" fill="#17191c">SQL query path (ravel-sql, DataFusion): POST /api/v1/sql, feature "sql" (off by default)</text>
-  <text x="710" y="924" font-size="11" text-anchor="middle" fill="#17191c">RsegScanExec -&gt; SortPreservingMergeExec -&gt; RsegDedupExec over DataFusion; matches PromQL's dedup total order bit-for-bit (ADR-0013)</text>
+  <text x="710" y="924" font-size="11" text-anchor="middle" fill="#17191c">RsegScanExec -&gt; SortPreservingMergeExec -&gt; RsegDedupExec over DataFusion; matches PromQL's dedup total order bit-for-bit</text>
   <text x="710" y="942" font-size="11" text-anchor="middle" fill="#17191c">Also: /api/v1/analytics (always on); Flight SQL (feature "flight-sql") serves statement queries; prepared statements return Unimplemented</text>
 
   <text x="40" y="990" font-size="11" fill="#4a4f57">Crate order: ravel-types -&gt; ravel-object-store -&gt; ravel-segment -&gt; ravel-commit -&gt; ravel-catalog -&gt; ravel-otlp -&gt; ravel-ingest -&gt; ravel-promql -&gt; ravel-query -&gt; ravel-sql (DataFusion) -&gt; services/*</text>

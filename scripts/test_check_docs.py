@@ -285,6 +285,30 @@ class TestSvg(RepoCase):
         })
         self.assertTrue(any("empty alt text" in x.key for x in self.rules(f, "SVG")))
 
+    CITING = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10" '
+              'role="img" aria-label="A diagram (ADR-0007)">'
+              '<text>see ADR-0042 and #123</text></svg>\n')
+
+    def test_citation_in_a_user_page_diagram_fires(self):
+        # A diagram a guide embeds is read as part of the guide, so its text
+        # and its label are held to the guide's citation rule.
+        f = self.findings({
+            "docs/d.svg": self.CITING,
+            "docs/guides/a.md": "![a diagram](../d.svg)\n",
+        })
+        keys = " ".join(x.key for x in self.rules(f, "SVG"))
+        self.assertIn("cites ADR-0042", keys)
+        self.assertIn("cites #123", keys)
+        self.assertIn("cites ADR-0007", keys)
+
+    def test_citation_in_a_record_only_diagram_is_silent(self):
+        # A diagram that only a decision record embeds may name the record.
+        f = self.findings({
+            "docs/d.svg": self.CITING,
+            "docs/adrs/0042-x.md": "# ADR\n\n![a diagram](../d.svg)\n",
+        })
+        self.assertEqual(self.rules(f, "SVG"), [])
+
 
 class TestOrphan(RepoCase):
     def test_unreachable_page_fires(self):

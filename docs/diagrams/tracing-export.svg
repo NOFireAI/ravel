@@ -11,7 +11,7 @@
   <rect x="0" y="0" width="1200" height="1015" fill="#f4f5f7"/>
 
   <text x="30" y="30" font-size="20" font-weight="bold" fill="#17191c">Query-path tracing: spans and OTLP export</text>
-  <text x="30" y="48" font-size="12" fill="#4a4f57">ADR-0044 decision 5 + ADR-0060 · docs/guides/tracing.md</text>
+  <text x="30" y="48" font-size="12" fill="#4a4f57">docs/guides/tracing.md: the query-path spans and their OTLP export</text>
 
   <!-- legend -->
   <rect x="960" y="15" width="210" height="128" rx="6" fill="#eceef1" stroke="#454b54" stroke-width="1.5"/>
@@ -94,7 +94,7 @@
   <rect x="270" y="662" width="230" height="56" rx="6" fill="#a9c9e6" stroke="#1f4e79" stroke-width="2"/>
   <text x="385" y="682" font-size="10.5" font-weight="bold" text-anchor="middle" fill="#17191c">EnvFilter (RUST_LOG)</text>
   <text x="385" y="698" font-size="9.5" text-anchor="middle" fill="#17191c">one filter gates both layers below</text>
-  <text x="385" y="711" font-size="9.5" text-anchor="middle" fill="#17191c">(ADR-0060 decision 2)</text>
+  <text x="385" y="711" font-size="9.5" text-anchor="middle" fill="#17191c">(one setting for local and exported spans)</text>
 
   <!-- split -->
   <line x1="385" y1="718" x2="385" y2="732" stroke="#5b3a8a" stroke-width="2"/>
@@ -137,7 +137,7 @@
 
   <!-- annotations column on the right of the export path -->
   <rect x="740" y="662" width="430" height="220" rx="6" fill="#eceef1" stroke="#454b54" stroke-width="1.5"/>
-  <text x="756" y="682" font-size="10.5" font-weight="bold" fill="#17191c">Failure handling (ADR-0060)</text>
+  <text x="756" y="682" font-size="10.5" font-weight="bold" fill="#17191c">Failure handling</text>
   <text x="756" y="700" font-size="9.5" fill="#17191c">Malformed --otlp-trace-endpoint: build fails, one</text>
   <text x="756" y="713" font-size="9.5" fill="#17191c">startup warning, degrades to the fmt-only subscriber.</text>
   <text x="756" y="732" font-size="9.5" fill="#17191c">Reachable-but-wrong collector: the exporter builds</text>
@@ -145,11 +145,11 @@
   <text x="756" y="758" font-size="9.5" fill="#17191c">once on the first failed background export attempt.</text>
   <text x="756" y="777" font-size="9.5" fill="#17191c">Exported fields are exactly the fields shown in the</text>
   <text x="756" y="790" font-size="9.5" fill="#17191c">span boxes above: no new content, no query text,</text>
-  <text x="756" y="803" font-size="9.5" fill="#17191c">no object keys (ADR-0060 decision 4).</text>
+  <text x="756" y="803" font-size="9.5" fill="#17191c">no object keys.</text>
   <text x="756" y="822" font-size="9.5" fill="#17191c">service.name (ravel-server / ravel-operator) and</text>
   <text x="756" y="835" font-size="9.5" fill="#17191c">ravel.mode resource attributes are attached to every</text>
   <text x="756" y="848" font-size="9.5" fill="#17191c">exported span, mirroring /metrics' mode label.</text>
-  <text x="756" y="867" font-size="9.5" fill="#17191c">Absent flag: byte-identical to the pre-ADR-0060</text>
+  <text x="756" y="867" font-size="9.5" fill="#17191c">Absent flag: byte-identical to the log-only</text>
   <text x="756" y="880" font-size="9.5" fill="#17191c">subscriber: no OTLP object constructed at all.</text>
 
   <text x="30" y="978" font-size="10" fill="#4a4f57">Illustrates: docs/guides/tracing.md, docs/adrs/0044-query-cost-accounting.md (decision 5), docs/adrs/0060-query-path-otlp-trace-export.md.</text>
