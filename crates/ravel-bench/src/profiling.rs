@@ -23,6 +23,32 @@
 //! profile). CPU sampling only accrues on-CPU time, so the pacing this implies
 //! does not dilute the flamegraph.
 //!
+//! # Frame pointers, and two refusals (issue #884)
+//!
+//! A release build omits frame pointers, and without them neither pprof's
+//! unwinder nor `perf --call-graph dwarf` can walk out of inlined generic code:
+//! Ravel's own hot path lands in `[unknown]`. One such profile put 33.95% of
+//! samples there and sent a merge after the wrong call site; the same workload
+//! rebuilt with `-C force-frame-pointers=yes` measured 0.00% and exposed the
+//! real hot frame. Nothing about the two profiles looked different except the
+//! flag.
+//!
+//! Build with `cargo profile-build` from `crates/ravel-bench` (a cargo alias in
+//! that directory's `.cargo/config.toml`, which injects the flag through
+//! `build.rustflags` so it reaches dependency crates too), or pass
+//! `RUSTFLAGS="-C force-frame-pointers=yes"` on a build invoked from the
+//! workspace root, where that alias is not discovered. Nothing inside this crate
+//! can force the flag onto a `cargo run -p ravel-bench` launched from the
+//! workspace root, so the flag is not the enforcement; these two are:
+//!
+//! - [`check_fp_prologue_count`] over the executable segments of the running
+//!   binary, before the sampler is armed. A build that carries the flag in its
+//!   configuration but did not apply it looks exactly like one that did, so the
+//!   check reads the produced binary. See [`MIN_FP_PROLOGUES`].
+//! - [`check_attribution`] over the finished profile. Above
+//!   [`MAX_UNATTRIBUTED_SHARE`] the run exits non-zero instead of writing a
+//!   flamegraph nobody should read.
+//!
 //! # The profiler perturbs the run it profiles
 //!
 //! This is a signal-based sampler: `pprof` arms `ITIMER_PROF`, and each
@@ -187,6 +213,25 @@ pub fn profile_requested() -> bool {
 /// pinned by a test so loosening it is a deliberate edit, not a silent drift.
 pub const MAX_UNATTRIBUTED_SHARE: f64 = 0.02;
 
+/// Whether a resolved frame name attributes a sample to real code.
+///
+/// A frame the unwinder failed on surfaces under several names depending on the
+/// tool that rendered it: `pprof` gives an unresolved frame the placeholder
+/// `Unknown` (and drops a frame that yields no symbol at all, leaving an empty
+/// name), `perf script` and the folded stacks inferno consumes write
+/// `[unknown]`, and an unresolved address can come through as `??`. All of them
+/// mean the same thing, so all of them count against the unattributed share.
+pub fn frame_is_attributed(name: &str) -> bool {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    !matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "unknown" | "[unknown]" | "??" | "[unknown]:0"
+    )
+}
+
 /// Fraction of `total` samples that were unattributed. Returns `0.0` for an
 /// empty profile: no samples means nothing to attribute, which is a different
 /// failure (an empty workload) from an unattributable one and not what
@@ -210,8 +255,9 @@ pub fn check_attribution(unattributed: u64, total: u64) -> Result<f64, String> {
         return Err(format!(
             "[unknown] is {:.2}% of samples (threshold {:.2}%): this is almost certainly a build \
              without frame pointers, not a genuinely unattributable workload. Rebuild with \
-             -C force-frame-pointers=yes (run `cargo profile-build` from crates/ravel-bench). Do \
-             not draw conclusions from this profile.",
+             -C force-frame-pointers=yes (`cargo profile-build` from crates/ravel-bench, or \
+             RUSTFLAGS=\"-C force-frame-pointers=yes\" on a build invoked from the workspace \
+             root). Do not draw conclusions from this profile.",
             share * 100.0,
             MAX_UNATTRIBUTED_SHARE * 100.0
         ));
@@ -227,28 +273,189 @@ pub fn check_attribution(unattributed: u64, total: u64) -> Result<f64, String> {
 #[cfg(target_arch = "x86_64")]
 const FP_PROLOGUE_X86_64: [u8; 4] = [0x55, 0x48, 0x89, 0xe5];
 
-/// Plausibility floor for [`count_fp_prologues`] over a real bench binary.
+/// Plausibility floor for [`count_fp_prologues`] over a real bench binary's
+/// executable segments.
 ///
-/// The bench bins statically link every ravel-* crate and their dependencies,
-/// so a frame-pointer build carries many thousands of these prologues (tens of
-/// thousands is typical). An omit-frame-pointers build carries essentially none:
-/// the 4-byte sequence turns up in arbitrary bytes at a rate near 1 in 2^32 per
-/// position, so even a multi-megabyte binary yields at most a handful by chance.
-/// 1000 sits far above that coincidental-match noise and far below the real
-/// frame-pointer count, so it separates "the flag worked" from "the flag
-/// silently did nothing" without depending on any one bin's exact function
-/// count. Pinned by a test.
-pub const MIN_FP_PROLOGUES: usize = 1000;
+/// Derived from measurement, not from taste. On the executor that implemented
+/// issue #884 (x86-64 Linux, rustc from `rust-toolchain.toml`), in the PF_X
+/// `PT_LOAD` segment of a release build of `ingest_bench` -- the smallest
+/// profiling bin in this crate, so the weakest case for any floor:
+///
+/// | build | prologues | text bytes |
+/// |---|---|---|
+/// | `cargo profile-build` (`-C force-frame-pointers=yes`) | 9,739 | 8,662,848 |
+/// | `cargo build --release --features profiling` (no flag) | 1,519 | 8,702,080 |
+///
+/// `query_latency_bench`, the other profiling bin, measured 12,712 with the
+/// flag. A release build without the flag still emits the sequence for the
+/// functions that genuinely need `%rbp`, which is why the no-flag figure is far
+/// from zero and why a bare `> 0` check would pass a build the profile cannot
+/// attribute.
+///
+/// The floor is 4,800: about half the 9,739 the weakest frame-pointer build
+/// produced (so a bin with fewer functions, or a compiler that inlines more
+/// aggressively, still passes), and 3.2x the 1,519 the same bin produced without
+/// the flag (so the failure this exists to catch cannot reach it). Pinned by a
+/// test.
+pub const MIN_FP_PROLOGUES: usize = 4_800;
+
+/// Byte prefix of the executable read to locate its executable segments. The
+/// ELF program header table sits immediately after the 64-byte header in every
+/// binary rustc/lld produce, so this is generous; the check reports rather than
+/// guesses if the table lies past it.
+#[cfg(target_arch = "x86_64")]
+pub const ELF_HEADER_PREFIX_BYTES: usize = 64 * 1024;
+
+/// Chunk size for [`count_fp_prologues_streamed`]. The executable segment of a
+/// bench bin runs to tens of megabytes, and the profiling host is memory-bound
+/// (the profiled run itself wants that memory), so the scan streams instead of
+/// reading the image into one buffer.
+pub const FP_SCAN_CHUNK_BYTES: usize = 64 * 1024;
 
 /// Count canonical x86-64 frame-pointer prologues in a binary image. Pure over
 /// the byte slice so it is testable without a real binary; the live check in
-/// [`ProfileSession`] scans `std::env::current_exe`.
+/// [`ProfileSession`] scans the executable segments of `std::env::current_exe`
+/// through [`count_fp_prologues_streamed`].
 #[cfg(target_arch = "x86_64")]
 pub fn count_fp_prologues(image: &[u8]) -> usize {
     image
         .windows(FP_PROLOGUE_X86_64.len())
         .filter(|w| *w == FP_PROLOGUE_X86_64)
         .count()
+}
+
+/// Count prologues over `len` bytes read from `reader` in `chunk`-sized reads.
+///
+/// Each chunk keeps the last `FP_PROLOGUE_X86_64.len() - 1` bytes of the
+/// previous one, so a prologue straddling a chunk boundary is counted exactly
+/// once: a retained tail of 3 bytes cannot hold a 4-byte match on its own, so
+/// every match it participates in extends into freshly read bytes and is seen by
+/// exactly one iteration. A scan that dropped the carry-over would undercount by
+/// up to 3 prologues per chunk boundary, which over a 30 MB segment is hundreds
+/// of missed frames.
+#[cfg(target_arch = "x86_64")]
+pub fn count_fp_prologues_streamed<R: std::io::Read>(
+    mut reader: R,
+    len: u64,
+    chunk: usize,
+) -> std::io::Result<usize> {
+    let overlap = FP_PROLOGUE_X86_64.len() - 1;
+    let chunk = chunk.max(FP_PROLOGUE_X86_64.len());
+    let mut scratch = vec![0u8; chunk];
+    let mut window: Vec<u8> = Vec::with_capacity(chunk + overlap);
+    let mut remaining = len;
+    let mut count = 0usize;
+
+    while remaining > 0 {
+        let want = chunk.min(usize::try_from(remaining).unwrap_or(chunk));
+        let read = reader.read(&mut scratch[..want])?;
+        if read == 0 {
+            break; // segment shorter than its header claims; count what exists
+        }
+        remaining -= read as u64;
+        window.extend_from_slice(&scratch[..read]);
+        count += count_fp_prologues(&window);
+        let drop_to = window.len().saturating_sub(overlap);
+        window.drain(..drop_to);
+    }
+    Ok(count)
+}
+
+/// Byte offset and length of every executable (`PT_LOAD` with `PF_X`) segment
+/// declared by an ELF64 little-endian image, read from a prefix covering its
+/// header and program header table.
+///
+/// The prologue scan reads these ranges only. Scanning the whole file would fold
+/// in read-only data, debug info, and the symbol table, where the 4-byte pattern
+/// occurs at rates that have nothing to do with whether code carries frame
+/// pointers -- the count would move with the amount of debug info, not with the
+/// flag under test.
+///
+/// Returns `Err` with a reason when the image is not an ELF64 LE binary or the
+/// header table lies outside `prefix`. That is a "the check cannot run here"
+/// answer (a Mach-O host, a truncated read), not a verdict on the binary.
+#[cfg(target_arch = "x86_64")]
+pub fn elf64_executable_ranges(prefix: &[u8]) -> Result<Vec<(u64, u64)>, String> {
+    const EI_NIDENT: usize = 16;
+    const ELFCLASS64: u8 = 2;
+    const ELFDATA2LSB: u8 = 1;
+    const PT_LOAD: u32 = 1;
+    const PF_X: u32 = 1;
+
+    if prefix.len() < EI_NIDENT {
+        return Err(format!(
+            "image is {} bytes, too short for an ELF header",
+            prefix.len()
+        ));
+    }
+    if &prefix[..4] != b"\x7fELF" {
+        return Err("image is not ELF (no \\x7fELF magic)".to_string());
+    }
+    if prefix[4] != ELFCLASS64 || prefix[5] != ELFDATA2LSB {
+        return Err(format!(
+            "image is not ELF64 little-endian (class {}, data {})",
+            prefix[4], prefix[5]
+        ));
+    }
+    if prefix.len() < 64 {
+        return Err(format!(
+            "image is {} bytes, too short for an ELF64 header",
+            prefix.len()
+        ));
+    }
+
+    let u16_at = |off: usize| u16::from_le_bytes([prefix[off], prefix[off + 1]]) as usize;
+    let u32_at = |off: usize| {
+        u32::from_le_bytes([
+            prefix[off],
+            prefix[off + 1],
+            prefix[off + 2],
+            prefix[off + 3],
+        ])
+    };
+    let u64_at = |off: usize| {
+        u64::from_le_bytes([
+            prefix[off],
+            prefix[off + 1],
+            prefix[off + 2],
+            prefix[off + 3],
+            prefix[off + 4],
+            prefix[off + 5],
+            prefix[off + 6],
+            prefix[off + 7],
+        ])
+    };
+
+    let phoff = usize::try_from(u64_at(0x20)).map_err(|_| "e_phoff exceeds usize".to_string())?;
+    let phentsize = u16_at(0x36);
+    let phnum = u16_at(0x38);
+    if phentsize < 56 {
+        return Err(format!("e_phentsize is {phentsize}, too small for ELF64"));
+    }
+    let table_end = phentsize
+        .checked_mul(phnum)
+        .and_then(|size| phoff.checked_add(size))
+        .ok_or_else(|| "program header table size overflows usize".to_string())?;
+    if table_end > prefix.len() {
+        return Err(format!(
+            "program header table ends at byte {table_end}, past the {} bytes read",
+            prefix.len()
+        ));
+    }
+
+    let mut ranges = Vec::new();
+    for i in 0..phnum {
+        let base = phoff + i * phentsize;
+        if u32_at(base) != PT_LOAD || u32_at(base + 4) & PF_X == 0 {
+            continue;
+        }
+        let offset = u64_at(base + 0x08);
+        let filesz = u64_at(base + 0x20);
+        if filesz > 0 {
+            ranges.push((offset, filesz));
+        }
+    }
+    Ok(ranges)
 }
 
 /// Refuse a binary carrying implausibly few frame-pointer prologues, which means
@@ -258,15 +465,57 @@ pub fn count_fp_prologues(image: &[u8]) -> usize {
 /// looks identical to one that worked, so verify the produced binary, not the
 /// build configuration.
 #[cfg(target_arch = "x86_64")]
-pub fn check_frame_pointers(image: &[u8]) -> Result<usize, String> {
-    let count = count_fp_prologues(image);
+pub fn check_fp_prologue_count(count: usize) -> Result<usize, String> {
     if count < MIN_FP_PROLOGUES {
         return Err(format!(
-            "profiling build carries only {count} x86-64 frame-pointer prologues (floor \
-             {MIN_FP_PROLOGUES}): -C force-frame-pointers=yes did not take effect. Build with \
-             `cargo profile-build` from crates/ravel-bench so the flag reaches every crate. Do \
-             not profile this binary: its stacks will not unwind."
+            "profiling build carries only {count} x86-64 frame-pointer prologues in its \
+             executable segments (floor {MIN_FP_PROLOGUES}): -C force-frame-pointers=yes did not \
+             take effect. Build with `cargo profile-build` from crates/ravel-bench, or with \
+             RUSTFLAGS=\"-C force-frame-pointers=yes\" from the workspace root, so the flag \
+             reaches every crate. Do not profile this binary: its stacks will not unwind."
         ));
+    }
+    Ok(count)
+}
+
+/// Count frame-pointer prologues in the executable segments of the ELF binary at
+/// `path`, streaming each segment in [`FP_SCAN_CHUNK_BYTES`] chunks.
+///
+/// `Err` means the check could not run (not ELF64 LE, or the file could not be
+/// read); the caller decides whether that is a refusal or a reported skip.
+#[cfg(target_arch = "x86_64")]
+pub fn count_exe_fp_prologues(path: &std::path::Path) -> Result<usize, String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path)
+        .map_err(|err| format!("cannot open {}: {err}", path.display()))?;
+    let mut prefix = vec![0u8; ELF_HEADER_PREFIX_BYTES];
+    let mut filled = 0usize;
+    while filled < prefix.len() {
+        let read = file
+            .read(&mut prefix[filled..])
+            .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        filled += read;
+    }
+    prefix.truncate(filled);
+
+    let ranges = elf64_executable_ranges(&prefix)?;
+    if ranges.is_empty() {
+        return Err(format!(
+            "{} declares no executable PT_LOAD segment",
+            path.display()
+        ));
+    }
+
+    let mut count = 0usize;
+    for (offset, len) in ranges {
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|err| format!("cannot seek {} to {offset}: {err}", path.display()))?;
+        count += count_fp_prologues_streamed(&mut file, len, FP_SCAN_CHUNK_BYTES)
+            .map_err(|err| format!("cannot scan {} at {offset}: {err}", path.display()))?;
     }
     Ok(count)
 }
@@ -296,21 +545,34 @@ mod imp {
     /// that carries `-C force-frame-pointers=yes` in its configuration but did
     /// not actually apply it (an override, a stale binary) looks identical to
     /// one that worked until the flamegraph comes back as `[unknown]`, so this
-    /// checks the produced binary rather than trusting the build. On any arch
-    /// other than x86-64 the prologue pattern differs and this is a no-op.
-    /// Exits the process on failure, INCLUDING when the check itself cannot run
-    /// (the executable cannot be located or read): profiling an unverified
-    /// binary would waste the whole run producing an unattributable profile, and
-    /// a guard that degrades to "allow" when it cannot check is not a guard. On
-    /// any arch other than x86-64 the prologue pattern differs and this is a
-    /// no-op.
+    /// checks the produced binary rather than trusting the build: it counts
+    /// x86-64 frame-pointer prologues in the executable segments of
+    /// `current_exe` and refuses below [`super::MIN_FP_PROLOGUES`].
+    ///
+    /// Two outcomes other than pass/refuse, neither of them silent:
+    ///
+    /// - The check cannot run at all here (an architecture whose prologue is not
+    ///   the x86-64 sequence, or an executable that is not ELF64 LE, such as a
+    ///   Mach-O host). It says so on stderr and the run continues unverified.
+    ///   Refusing would make the lane unusable on those platforms for a hazard
+    ///   this check is simply not able to speak to.
+    /// - The executable cannot be located or read on a platform where the check
+    ///   does apply. That is a failure of the check, not an absence of it, so it
+    ///   refuses: arming the sampler would produce exactly the unattributable
+    ///   profile this exists to prevent.
     fn enforce_frame_pointer_build() {
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            eprintln!(
+                "profiling: frame-pointer verification does not run on {}: the prologue byte \
+                 sequence it counts (push %rbp; mov %rsp, %rbp) is x86-64 specific. Continuing \
+                 UNVERIFIED; if the profile comes back mostly [unknown], rebuild with \
+                 -C force-frame-pointers=yes.",
+                std::env::consts::ARCH
+            );
+        }
         #[cfg(target_arch = "x86_64")]
         {
-            // Fail CLOSED on both paths. A guard that cannot run its check must
-            // refuse, not wave the run through: arming the sampler here would
-            // produce exactly the unattributable profile this exists to prevent,
-            // and the operator would have no signal that the check never ran.
             let exe = match std::env::current_exe() {
                 Ok(p) => p,
                 Err(err) => {
@@ -321,21 +583,33 @@ mod imp {
                     std::process::exit(1);
                 }
             };
-            let image = match std::fs::read(&exe) {
-                Ok(bytes) => bytes,
-                Err(err) => {
+            let count = match super::count_exe_fp_prologues(&exe) {
+                Ok(count) => count,
+                Err(msg) => {
+                    // The scan could not run over this image. Distinguish a
+                    // format the check does not understand (say so, continue)
+                    // from a file it could not read (refuse): the first is the
+                    // check being inapplicable, the second is it failing.
+                    if msg.contains("not ELF") || msg.contains("not ELF64") {
+                        eprintln!(
+                            "profiling: frame-pointer verification cannot run on this executable: \
+                             {msg}. Continuing UNVERIFIED; if the profile comes back mostly \
+                             [unknown], rebuild with -C force-frame-pointers=yes."
+                        );
+                        return;
+                    }
                     eprintln!(
-                        "profiling: could not read {} to verify frame pointers: {err}. \
-                         Refusing to profile: an unverified build produces an unattributable profile.",
-                        exe.display()
+                        "profiling: {msg}. Refusing to profile: an unverified build produces an \
+                         unattributable profile."
                     );
                     std::process::exit(1);
                 }
             };
-            match super::check_frame_pointers(&image) {
+            match super::check_fp_prologue_count(count) {
                 Ok(count) => {
                     eprintln!(
-                        "profiling: verified {count} frame-pointer prologues in {}",
+                        "profiling: verified {count} frame-pointer prologues (floor {}) in {}",
+                        super::MIN_FP_PROLOGUES,
                         exe.display()
                     );
                 }
@@ -349,20 +623,21 @@ mod imp {
 
     /// Count total and unattributed samples in a resolved report. A stack is
     /// unattributed when it resolves to no application frame: `pprof` drops a
-    /// frame that yields no symbol at all and gives an unresolved frame the
-    /// placeholder name `Unknown`, so a stack with neither a named frame nor any
-    /// non-`Unknown` symbol is one the unwinder failed on -- the `[unknown]`
-    /// share this guards. Returns `(unattributed, total)`.
+    /// frame that yields no symbol at all and gives an unresolved frame a
+    /// placeholder name, so a stack with no frame [`super::frame_is_attributed`]
+    /// accepts is one the unwinder failed on -- the `[unknown]` share this
+    /// guards. Returns `(unattributed, total)`.
     fn attribution_counts(report: &pprof::Report) -> (u64, u64) {
         let mut total: u64 = 0;
         let mut unattributed: u64 = 0;
         for (frames, count) in &report.data {
             let c = (*count).max(0) as u64;
             total += c;
-            let has_named_frame = frames.frames.iter().flatten().any(|s| {
-                let name = s.name();
-                !name.is_empty() && name != "Unknown"
-            });
+            let has_named_frame = frames
+                .frames
+                .iter()
+                .flatten()
+                .any(|s| super::frame_is_attributed(&s.name()));
             if !has_named_frame {
                 unattributed += c;
             }
@@ -699,6 +974,81 @@ mod attribution_tests {
         );
     }
 
+    /// The refusal message is the deliverable, not just the non-zero exit: it
+    /// must state the measured share AND the threshold it violated, so an
+    /// operator reading only stderr knows both numbers (issue #884,
+    /// deliverable 2). Dropping either interpolation from the message fails
+    /// here.
+    #[test]
+    fn refusal_message_names_the_measured_share_and_the_threshold() {
+        let err = check_attribution(1_000, 4_000).expect_err("25% unattributed must be refused");
+        assert!(
+            err.contains("25.00% of samples"),
+            "message must state the measured share, got: {err}"
+        );
+        assert!(
+            err.contains("threshold 2.00%"),
+            "message must state the threshold, got: {err}"
+        );
+        assert!(
+            err.contains("Do not draw conclusions from this profile"),
+            "message must say the profile is unusable, got: {err}"
+        );
+    }
+
+    /// A synthetic summary either side of the 2% line: 2.01% is refused, 1.99%
+    /// passes and reports its share back (issue #884, deliverable 4). Flipping
+    /// the comparison in `check_attribution` to `>=` leaves this passing, so the
+    /// pair below is the discriminating case, not decoration: relaxing it to
+    /// `share > 0.03` fails the first assertion and tightening it to
+    /// `share > 0.015` fails the second.
+    #[test]
+    fn synthetic_summary_fails_at_2_01_and_passes_at_1_99() {
+        // 20_100 of 1_000_000 samples = 2.01% -> refused.
+        let over = check_attribution(20_100, 1_000_000)
+            .expect_err("2.01% is over the threshold and must be refused");
+        assert!(
+            over.contains("2.01% of samples"),
+            "message must state the measured 2.01%, got: {over}"
+        );
+
+        // 19_900 of 1_000_000 samples = 1.99% -> accepted, share returned.
+        let under = check_attribution(19_900, 1_000_000).expect("1.99% is under the threshold");
+        assert!(
+            (under - 0.0199).abs() < 1e-12,
+            "share reported back is 1.99%, got {under}"
+        );
+    }
+
+    /// Every placeholder an unresolved frame arrives under counts as
+    /// unattributed, whichever tool rendered it; a real symbol does not.
+    #[test]
+    fn placeholder_frame_names_are_unattributed() {
+        for name in [
+            "",
+            "  ",
+            "Unknown",
+            "unknown",
+            "[unknown]",
+            "??",
+            "[UNKNOWN]",
+        ] {
+            assert!(
+                !super::frame_is_attributed(name),
+                "{name:?} is an unresolved frame"
+            );
+        }
+        for name in [
+            "ravel_types::series::hash_one",
+            "__memmove_avx_unaligned_erms",
+        ] {
+            assert!(
+                super::frame_is_attributed(name),
+                "{name:?} is a resolved frame"
+            );
+        }
+    }
+
     /// The boundary is what matters: a check that only rejects 90% would let
     /// 30% through. Exactly at the threshold passes (`>` not `>=`), one sample
     /// over fails, and the pass case reports the measured share.
@@ -738,13 +1088,29 @@ mod attribution_tests {
 #[cfg(all(test, target_arch = "x86_64"))]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod frame_pointer_tests {
-    use super::{FP_PROLOGUE_X86_64, MIN_FP_PROLOGUES, check_frame_pointers, count_fp_prologues};
+    use super::{
+        FP_PROLOGUE_X86_64, FP_SCAN_CHUNK_BYTES, MIN_FP_PROLOGUES, check_fp_prologue_count,
+        count_exe_fp_prologues, count_fp_prologues, count_fp_prologues_streamed,
+        elf64_executable_ranges,
+    };
 
     /// The floor is pinned so lowering it is a deliberate edit that fails this
-    /// test (issue #884, deliverable 3).
+    /// test (issue #884, deliverable 3). It is derived from measurement: 9,739
+    /// prologues in a `cargo profile-build --bin ingest_bench` binary against
+    /// 1,519 in the same bin built without the flag, so the floor sits at about
+    /// half the frame-pointer figure and above three times the other. See
+    /// `MIN_FP_PROLOGUES`.
     #[test]
     fn floor_is_pinned() {
-        assert_eq!(MIN_FP_PROLOGUES, 1000);
+        assert_eq!(MIN_FP_PROLOGUES, 4_800);
+        // Both measured builds must land on the correct side of this floor,
+        // which is the whole point of not writing `> 0`.
+        assert!(check_fp_prologue_count(1_519).is_err(), "no-flag build");
+        assert!(check_fp_prologue_count(9_739).is_ok(), "ingest_bench, flag");
+        assert!(
+            check_fp_prologue_count(12_712).is_ok(),
+            "query_latency_bench, flag"
+        );
     }
 
     /// A buffer holding exactly N non-overlapping prologues counts as N, and
@@ -762,40 +1128,209 @@ mod frame_pointer_tests {
         assert_eq!(count_fp_prologues(&[]), 0);
     }
 
+    /// Build a fixture of `len` filler bytes with a prologue planted at each
+    /// offset in `at`.
+    fn fixture_with_prologues_at(len: usize, at: &[usize]) -> Vec<u8> {
+        let mut image = vec![0x90u8; len];
+        for &offset in at {
+            image[offset..offset + FP_PROLOGUE_X86_64.len()].copy_from_slice(&FP_PROLOGUE_X86_64);
+        }
+        image
+    }
+
+    /// The streamed scan counts a known byte string exactly, including a
+    /// prologue that straddles a chunk boundary. A carry-over of fewer than 3
+    /// bytes (or none) misses the straddling one and this fails; the whole-slice
+    /// count is the oracle it must agree with.
+    #[test]
+    fn streamed_scan_counts_across_chunk_boundaries() {
+        let chunk = 16usize;
+        // Offsets: one wholly inside chunk 0, one straddling the 0/1 boundary
+        // (starts at 14, ends at 17), one wholly inside chunk 2, one straddling
+        // the 2/3 boundary by a single byte (starts at 47, ends at 50).
+        let at = [4usize, 14, 34, 47];
+        let image = fixture_with_prologues_at(64, &at);
+
+        assert_eq!(count_fp_prologues(&image), at.len(), "whole-slice oracle");
+        assert_eq!(
+            count_fp_prologues_streamed(image.as_slice(), image.len() as u64, chunk)
+                .expect("streamed scan over an in-memory fixture"),
+            at.len(),
+            "streamed scan must agree with the whole-slice count"
+        );
+
+        // Also at a chunk size of exactly the pattern length, where every
+        // boundary is a potential straddle, and at the production chunk size,
+        // where none is.
+        for chunk in [4usize, FP_SCAN_CHUNK_BYTES] {
+            assert_eq!(
+                count_fp_prologues_streamed(image.as_slice(), image.len() as u64, chunk)
+                    .expect("streamed scan"),
+                at.len(),
+                "chunk size {chunk} must not change the count"
+            );
+        }
+
+        // A prologue that begins inside the scanned range but ends past it is
+        // NOT counted: only whole occurrences inside the range count. The
+        // fixture is 66 bytes with a prologue at 62; the scan is told 64.
+        let straddles_the_end = fixture_with_prologues_at(66, &[62]);
+        assert_eq!(count_fp_prologues(&straddles_the_end[..64]), 0, "oracle");
+        assert_eq!(
+            count_fp_prologues_streamed(straddles_the_end.as_slice(), 64, chunk)
+                .expect("streamed scan"),
+            0
+        );
+    }
+
     /// The plausibility floor separates a frame-pointer build from an
     /// omit-frame-pointers one at the boundary specifically: exactly
     /// `MIN_FP_PROLOGUES` passes, one fewer fails and reports the count it saw.
     #[test]
     fn boundary_at_the_floor() {
-        let make = |n: usize| -> Vec<u8> {
-            let mut v = Vec::with_capacity(n * FP_PROLOGUE_X86_64.len());
-            for _ in 0..n {
-                v.extend_from_slice(&FP_PROLOGUE_X86_64);
-            }
-            v
-        };
-
         // Exactly at the floor -> pass, returns the count.
         assert_eq!(
-            check_frame_pointers(&make(MIN_FP_PROLOGUES)).expect("at the floor passes"),
+            check_fp_prologue_count(MIN_FP_PROLOGUES).expect("at the floor passes"),
             MIN_FP_PROLOGUES
         );
 
         // One below the floor -> fail, and the message reports the shortfall
         // and the fix.
-        let err = check_frame_pointers(&make(MIN_FP_PROLOGUES - 1))
-            .expect_err("below the floor must fail");
+        let err =
+            check_fp_prologue_count(MIN_FP_PROLOGUES - 1).expect_err("below the floor must fail");
         assert!(
             err.contains(&format!("only {} x86-64", MIN_FP_PROLOGUES - 1)),
             "message must report the count it saw, got: {err}"
+        );
+        assert!(
+            err.contains(&format!("floor {MIN_FP_PROLOGUES}")),
+            "message must report the floor it violated, got: {err}"
         );
         assert!(
             err.contains("-C force-frame-pointers=yes"),
             "message must name the fix, got: {err}"
         );
 
-        // A stripped-looking image (near zero prologues) fails hard.
-        assert!(check_frame_pointers(&[0x90; 4096]).is_err());
+        // A stripped binary (near zero prologues) fails hard.
+        assert!(check_fp_prologue_count(0).is_err());
+    }
+
+    /// Minimal ELF64 LE image: a 64-byte header plus `segments` program headers,
+    /// each `(p_type, p_flags, p_offset, p_filesz)`, and `body` appended after
+    /// the table.
+    fn elf64_image(segments: &[(u32, u32, u64, u64)], body: &[u8]) -> Vec<u8> {
+        const PHENTSIZE: usize = 56;
+        let phoff: u64 = 64;
+        let mut image = vec![0u8; 64];
+        image[..4].copy_from_slice(b"\x7fELF");
+        image[4] = 2; // ELFCLASS64
+        image[5] = 1; // ELFDATA2LSB
+        image[0x20..0x28].copy_from_slice(&phoff.to_le_bytes());
+        image[0x36..0x38].copy_from_slice(&(PHENTSIZE as u16).to_le_bytes());
+        image[0x38..0x3a].copy_from_slice(&(segments.len() as u16).to_le_bytes());
+        for &(p_type, p_flags, p_offset, p_filesz) in segments {
+            let mut phdr = vec![0u8; PHENTSIZE];
+            phdr[0..4].copy_from_slice(&p_type.to_le_bytes());
+            phdr[4..8].copy_from_slice(&p_flags.to_le_bytes());
+            phdr[0x08..0x10].copy_from_slice(&p_offset.to_le_bytes());
+            phdr[0x20..0x28].copy_from_slice(&p_filesz.to_le_bytes());
+            image.extend_from_slice(&phdr);
+        }
+        assert_eq!(
+            image.len(),
+            64 + segments.len() * PHENTSIZE,
+            "phdr table must end where the body begins"
+        );
+        image.extend_from_slice(body);
+        image
+    }
+
+    /// Only executable `PT_LOAD` segments are scanned. A non-executable load
+    /// segment (rodata, where the 4-byte pattern occurs for reasons unrelated to
+    /// frame pointers) must not contribute.
+    #[test]
+    fn only_executable_load_segments_are_scanned() {
+        const PT_LOAD: u32 = 1;
+        const PT_NOTE: u32 = 4;
+        const PF_X: u32 = 1;
+        const PF_R: u32 = 4;
+
+        let ranges = elf64_executable_ranges(&elf64_image(
+            &[
+                (PT_LOAD, PF_R, 0x1000, 0x400),        // rodata: skipped
+                (PT_LOAD, PF_R | PF_X, 0x2000, 0x800), // text: scanned
+                (PT_NOTE, PF_X, 0x3000, 0x100),        // not PT_LOAD: skipped
+                (PT_LOAD, PF_R | PF_X, 0x4000, 0),     // empty: skipped
+            ],
+            &[],
+        ))
+        .expect("parse synthetic ELF64");
+        assert_eq!(ranges, vec![(0x2000, 0x800)]);
+    }
+
+    /// A non-ELF or non-ELF64 image is reported as "the check cannot run here",
+    /// with a reason, not as a verdict on the binary. The live path keys the
+    /// continue-unverified branch off this wording.
+    #[test]
+    fn non_elf_images_report_that_the_check_cannot_run() {
+        // A 64-bit Mach-O header (the macOS case), long enough that the
+        // too-short branch cannot be what rejects it.
+        let mut macho = vec![0u8; 32];
+        macho[..8].copy_from_slice(&[0xcf, 0xfa, 0xed, 0xfe, 0x07, 0x00, 0x00, 0x01]);
+        let err = elf64_executable_ranges(&macho).expect_err("Mach-O is not ELF");
+        assert!(err.contains("not ELF"), "got: {err}");
+
+        let mut elf32 = elf64_image(&[], &[]);
+        elf32[4] = 1; // ELFCLASS32
+        let err = elf64_executable_ranges(&elf32).expect_err("ELF32 is not scanned");
+        assert!(err.contains("not ELF64"), "got: {err}");
+
+        let err = elf64_executable_ranges(&[]).expect_err("empty image");
+        assert!(err.contains("too short"), "got: {err}");
+    }
+
+    /// End to end over a file on disk: the scan reads the executable segment of
+    /// a synthetic ELF64 binary and counts exactly the prologues planted there,
+    /// ignoring the identical bytes planted in its non-executable segment.
+    #[test]
+    fn counts_prologues_in_a_file_on_disk() {
+        const PT_LOAD: u32 = 1;
+        const PF_X: u32 = 1;
+        const PF_R: u32 = 4;
+
+        // Body layout after the header + one 56-byte phdr table entry pair:
+        // rodata at offset 0x200 (len 0x100, 7 prologues, must be ignored),
+        // text at offset 0x400 (len 0x200, 3 prologues, must be counted).
+        let mut body = vec![0x90u8; 0x600];
+        let plant = |body: &mut Vec<u8>, base: usize, offsets: &[usize]| {
+            for &off in offsets {
+                let at = base + off;
+                body[at..at + FP_PROLOGUE_X86_64.len()].copy_from_slice(&FP_PROLOGUE_X86_64);
+            }
+        };
+        // Body starts at file offset 0x80 (64-byte header + 2 x 56-byte phdrs =
+        // 176 = 0xb0); index into `body` is file_offset - 0xb0.
+        let body_base = 64 + 2 * 56;
+        plant(&mut body, 0x200 - body_base, &[0, 8, 16, 24, 32, 40, 48]);
+        plant(&mut body, 0x400 - body_base, &[0, 100, 0x1fc]);
+
+        let image = elf64_image(
+            &[
+                (PT_LOAD, PF_R, 0x200, 0x100),
+                (PT_LOAD, PF_R | PF_X, 0x400, 0x200),
+            ],
+            &body,
+        );
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("synthetic-elf");
+        std::fs::write(&path, &image).expect("write fixture binary");
+
+        assert_eq!(
+            count_exe_fp_prologues(&path).expect("scan the fixture"),
+            3,
+            "only the executable segment's prologues count"
+        );
     }
 }
 

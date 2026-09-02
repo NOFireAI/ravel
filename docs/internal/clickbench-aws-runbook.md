@@ -845,7 +845,13 @@ Rules that make a pass trustworthy:
 ## 10. Profiling a statement
 
 The `profiling` feature emits a flamegraph. Use `--runs 1` so one execution
-maps to one profile.
+maps to one profile, and profile only a binary built with frame pointers --
+`$PINNED` from step 8 is one, because that build carries
+`RUSTFLAGS="-C force-frame-pointers=yes"`. Without them the unwinder cannot walk
+out of inlined generic code and Ravel's own hot path lands in `[unknown]`: one
+such profile put 33.95% of samples there and sent a merge after the wrong call
+site, and the same workload rebuilt with the flag measured 0.00% and named the
+real hot frame (issue #884).
 
 ```sh
 LD_PRELOAD="$TCMALLOC" RAVEL_BENCH_PROFILE_SVG=/root/profile/q35.svg \
@@ -862,6 +868,21 @@ Build a single-statement corpus with `jq`:
 jq '{version: .version, entries: [.entries[] | select(.id == "q35_top_urls_const_col")]}' \
   /root/ravel/benchmarks/clickbench/hits.corpus.json > /root/q35.corpus.json
 ```
+
+Two checks in the binary fail the run rather than hand back a profile nobody
+should read (issue #884). Both print to stderr and exit non-zero:
+
+- Before sampling starts, it counts x86-64 frame-pointer prologues (`push %rbp;
+  mov %rsp, %rbp`) in its own executable segments and refuses below a measured
+  floor of 4,800. A build with the flag measures around 10,000 and one without
+  it around 1,500, so this catches a `$PINNED` binary that was rebuilt without
+  the `RUSTFLAGS`, which is otherwise indistinguishable from a good one until
+  the flamegraph comes back empty. On an architecture or executable format the
+  scan does not understand it says so and continues, never skipping silently.
+- When the profile is summarised, the share of samples that resolved to no
+  symbol (`[unknown]`) is printed once and, above 2%, refused with a message
+  naming the measured share, the threshold, and the likely cause. A
+  frame-pointer profile of this corpus measures 0.00%.
 
 A profiler reporting 0% for a function and a symbol that never resolved look
 identical. Before concluding a path is gone, check the symbol is present
