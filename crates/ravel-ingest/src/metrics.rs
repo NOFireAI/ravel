@@ -134,6 +134,15 @@ pub struct IngestMetrics {
     /// Batches rejected because two points shared a `series_id` under
     /// distinct canonical label sets (ADR-0005 fail-loud collision check).
     series_id_collisions: AtomicU64,
+    /// Multi-shard Strict writes that returned `WriteError::PartialWrite`
+    /// (issue #1130): at least one shard committed durably and at least one
+    /// sibling then failed in the same `write()` call. A nonzero value means
+    /// some clients saw a retryable error for data that is already durable on
+    /// the committed shards, so a blind retry re-ingests those shards' points
+    /// (metrics dedup by `(series_id, ts)` at read time, so it is not
+    /// user-visible duplication; see docs/consistency-model.md). The logs and
+    /// span pipelines keep the same counter.
+    partial_writes: AtomicU64,
     /// Exemplars written into a flushed object's EXEMPLARS section
     /// (ADR-0047). Attempt-time, like `flushes_by_*`: counted when the flush
     /// is built, so a flush later abandoned counts here too.
@@ -496,6 +505,10 @@ pub struct IngestMetricsSnapshot {
     pub acks_ok: u64,
     pub acks_err: u64,
     pub series_id_collisions: u64,
+    /// Multi-shard Strict writes returned as `WriteError::PartialWrite`
+    /// (issue #1130): a partial multi-shard commit. Exported as
+    /// `ingest_partial_writes_total`.
+    pub partial_writes: u64,
     pub shard_deaths: u64,
     pub exemplars_written_total: u64,
     pub exemplars_dropped_total: u64,
@@ -684,6 +697,14 @@ impl IngestMetrics {
         self.series_id_collisions.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One multi-shard Strict write returned as `WriteError::PartialWrite`
+    /// (issue #1130): at least one shard committed durably before a sibling
+    /// failed. Recorded once per such write, at the router's error
+    /// construction site.
+    pub(crate) fn record_partial_write(&self) {
+        self.partial_writes.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// One flush's exemplar outcome: `written` reached the object's EXEMPLARS
     /// section, `dropped` did not (no parent sample in the flush, or lost the
     /// flush-scoped window cap).
@@ -751,6 +772,7 @@ impl IngestMetrics {
             acks_ok: self.acks_ok.load(Ordering::Relaxed),
             acks_err: self.acks_err.load(Ordering::Relaxed),
             series_id_collisions: self.series_id_collisions.load(Ordering::Relaxed),
+            partial_writes: self.partial_writes.load(Ordering::Relaxed),
             shard_deaths: self.shard_deaths.load(Ordering::Relaxed),
             exemplars_written_total: self.exemplars_written_total.load(Ordering::Relaxed),
             exemplars_dropped_total: self.exemplars_dropped_total.load(Ordering::Relaxed),
@@ -787,6 +809,7 @@ mod tests {
         metrics.record_acks(2, true);
         metrics.record_acks(1, false);
         metrics.record_series_id_collision();
+        metrics.record_partial_write();
         metrics.record_shard_death();
         metrics.record_exemplars(2, 5);
 
@@ -804,6 +827,7 @@ mod tests {
         assert_eq!(snap.acks_ok, 2);
         assert_eq!(snap.acks_err, 1);
         assert_eq!(snap.series_id_collisions, 1);
+        assert_eq!(snap.partial_writes, 1);
         assert_eq!(snap.shard_deaths, 1);
     }
 

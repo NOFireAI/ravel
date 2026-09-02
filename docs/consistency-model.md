@@ -88,6 +88,29 @@ rejected point counts and reasons.
 | After data PUT, before commit PUT | present (orphan) | absent | no | invisible; GC after grace; client retries |
 | After commit PUT, before ack | present | present | no | visible; unkeyed client retry stores a duplicate (see above); a keyed retry replays the marker and stores nothing new, since the marker PUT precedes the ack |
 | After ack | present | present | yes | durable and visible |
+| Ack round times out (flush still running) | eventually present | eventually present | no (retryable timeout) | client gets a retryable timeout with no token; each shard's flush keeps running and can commit *after* the client gave up, so the commit is durable and query-visible but its token is unobservable to that client. The retry relies on dedup, not on the ack: metrics collapse the re-ingest by `(series_id, ts)`; logs and spans have no query-time dedup, so a retry duplicates the rows/spans unless the client supplied an idempotency key (metrics have no key). |
+
+## Partial multi-shard commits
+
+A single Strict write fans out across every shard its rows hash to, and each
+shard commits independently. When at least one shard commits durably and at
+least one sibling then fails in the same write, the router reports a partial
+multi-shard commit: a retryable error that also carries the commit tokens of
+every shard that did commit, in shard order. This holds for all three signals
+-- metrics, logs, and spans alike; the durable siblings are real, query-visible
+data, not rolled back.
+
+The error is exactly as retryable as its underlying cause, so a client may
+retry the whole write. The retry re-ingests the shards that already committed,
+and dedup is what keeps that honest: metrics collapse the re-ingest by
+`(series_id, ts)`, so it is harmless; logs and spans have no query-time dedup,
+so the retry duplicates the durable siblings' rows/spans unless the client
+supplied an idempotency key (metrics have no key). A partial multi-shard commit
+writes no idempotency marker even on logs and spans, for the reason given under
+"Opt-in client idempotency key" below. Whichever gateway path took the write
+logs the durable-sibling count at `warn`; the OTLP protocol has no
+error-response channel to hand the recovered tokens back, and the bulk `load`
+path reports them in its residual token list instead.
 
 ## Duplicates and idempotency
 
@@ -134,8 +157,8 @@ The marker records the original request's written row/span count and its
 `x-ravel-commit-token` header value verbatim. A marker is written only for a
 request whose *every* shard committed durably; buffered-mode and
 fully-rejected requests commit no durable data and write no marker. A
-multi-shard request where some but not all shards committed
-(`LogWriteError::PartialWrite`) also writes no marker, even
+multi-shard request where some but not all shards committed (a partial
+multi-shard commit) also writes no marker, even
 though it did produce a partial durable commit: a hit on this marker's
 replay path reports the original commit token with zero rejections, so
 marking a partial commit as the request's receipt would make the next retry

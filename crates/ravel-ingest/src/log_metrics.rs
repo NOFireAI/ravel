@@ -83,6 +83,16 @@ pub struct LogIngestMetrics {
     /// different `stream_attrs` (the fail-loud collision check
     /// `RlogWriter::finish()` performs).
     stream_id_collisions: AtomicU64,
+    /// Multi-shard Strict writes that returned
+    /// [`crate::LogWriteError::PartialWrite`] (issue #1130): at least one shard
+    /// committed durably and at least one sibling then failed in the same
+    /// `write()` call. A nonzero value means some clients saw a retryable error
+    /// for data already durable on the committed shards; a blind retry
+    /// re-ingests those shards' records, and unlike the metrics pipeline logs
+    /// have no read-time dedup, so retry duplicates unless the client supplies
+    /// an idempotency key (see docs/consistency-model.md). The metrics and span
+    /// pipelines keep the same counter.
+    partial_writes: AtomicU64,
     /// Distinct log shard actors observed dead by the router: its send half
     /// or a strict-mode ack found the shard channel closed, meaning the actor
     /// task ended (e.g. panicked) without the router shutting it down.
@@ -203,6 +213,10 @@ pub struct LogIngestMetricsSnapshot {
     pub acks_ok: u64,
     pub acks_err: u64,
     pub stream_id_collisions: u64,
+    /// Multi-shard Strict writes returned as
+    /// [`crate::LogWriteError::PartialWrite`] (issue #1130): a partial
+    /// multi-shard commit. Exported as `ingest_partial_writes_total`.
+    pub partial_writes: u64,
     pub shard_deaths: u64,
     pub stale_provisioning_flushes: u64,
     pub grace_extended_stale_flushes: u64,
@@ -393,6 +407,14 @@ impl LogIngestMetrics {
         self.stream_id_collisions.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One multi-shard Strict write returned as
+    /// [`crate::LogWriteError::PartialWrite`] (issue #1130): at least one shard
+    /// committed durably before a sibling failed. Recorded once per such write,
+    /// at the router's error construction site.
+    pub(crate) fn record_partial_write(&self) {
+        self.partial_writes.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_shard_death(&self) {
         self.shard_deaths.fetch_add(1, Ordering::Relaxed);
     }
@@ -493,6 +515,7 @@ impl LogIngestMetrics {
             acks_ok: self.acks_ok.load(Ordering::Relaxed),
             acks_err: self.acks_err.load(Ordering::Relaxed),
             stream_id_collisions: self.stream_id_collisions.load(Ordering::Relaxed),
+            partial_writes: self.partial_writes.load(Ordering::Relaxed),
             shard_deaths: self.shard_deaths.load(Ordering::Relaxed),
             stale_provisioning_flushes: self.stale_provisioning_flushes.load(Ordering::Relaxed),
             grace_extended_stale_flushes: self.grace_extended_stale_flushes.load(Ordering::Relaxed),
@@ -587,6 +610,13 @@ mod tests {
             LogIngestMetrics::record_stream_id_collision,
             LogIngestMetricsSnapshot {
                 stream_id_collisions: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            LogIngestMetrics::record_partial_write,
+            LogIngestMetricsSnapshot {
+                partial_writes: 1,
                 ..Default::default()
             },
         );
