@@ -70,14 +70,20 @@ pub fn parse_max_flush_lifetime_ns(s: &str) -> Result<i64, String> {
 /// merely tidy: the shard's age check casts `max_flush_delay.as_nanos() as
 /// i64`, so a `Duration` past 292 years wraps to a negative threshold that
 /// every buffer's age clears on the very next flush tick. The value furthest
-/// from "never age out" would otherwise parse as its exact opposite. Negative
-/// values are unrepresentable in humantime, so the only rejections are an
-/// unparseable spelling and a value too large for `i64` nanoseconds.
+/// from "never age out" would otherwise parse as its exact opposite. The
+/// ceiling leaves room for the strict-visibility reserve on top, so the
+/// derived budget stays strictly greater than the delay instead of saturating
+/// equal to it. Negative values are unrepresentable in humantime, so the only
+/// rejections are an unparseable spelling and a value too large for the
+/// `i64`-nanosecond budget arithmetic.
 pub fn parse_max_flush_delay(s: &str) -> Result<std::time::Duration, String> {
     let dur = humantime::parse_duration(s)
         .map_err(|e| format!("invalid --max-flush-delay '{s}': {e}"))?;
-    i64::try_from(dur.as_nanos()).map_err(|_| format!("--max-flush-delay '{s}' is too large"))?;
-    Ok(dur)
+    let ceiling = i64::MAX - ravel_ingest::STRICT_VISIBILITY_RESERVE_NS;
+    match i64::try_from(dur.as_nanos()) {
+        Ok(ns) if ns <= ceiling => Ok(dur),
+        _ => Err(format!("--max-flush-delay '{s}' is too large")),
+    }
 }
 
 #[cfg(test)]
@@ -144,5 +150,18 @@ mod tests {
         // only what the cast would corrupt.
         let ok = parse_max_flush_delay("292years").expect("292 years still fits in i64 ns");
         assert!(i64::try_from(ok.as_nanos()).is_ok());
+        // Boundary: the ceiling leaves room for the strict-visibility reserve,
+        // so the derived budget is strictly greater than any accepted delay
+        // rather than saturating equal to it at the edge.
+        let ceiling = i64::MAX - ravel_ingest::STRICT_VISIBILITY_RESERVE_NS;
+        let at = std::time::Duration::from_nanos(ceiling as u64);
+        assert!(
+            parse_max_flush_delay(&format!("{}ns", at.as_nanos())).is_ok(),
+            "the largest accepted delay sits exactly at i64::MAX minus the reserve"
+        );
+        assert!(
+            parse_max_flush_delay(&format!("{}ns", at.as_nanos() + 1)).is_err(),
+            "one nanosecond past the ceiling refuses"
+        );
     }
 }
