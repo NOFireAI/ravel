@@ -522,3 +522,112 @@ class TestBaselineKeyTolerance(RepoCase):
         code, out = self.gate()
         self.assertEqual(code, 1, out)
         self.assertIn("docs/guides/b.md", out)
+
+
+class TestProvenanceAiPhrase(RepoCase):
+    """"Generated with" is ordinary English; only a named tool or AI after it
+    is agent language. A fixture "generated with current timestamps" must not
+    fail the gate, and "Generated with Claude Code" must."""
+
+    def test_plain_generated_with_is_silent(self):
+        f = self.findings({
+            "docs/guides/a.md": "# A\n\nA fixture generated with current timestamps.\n",
+        })
+        self.assertEqual(self.rules(f, "PROVENANCE"), [])
+
+    def test_named_tool_after_generated_with_fires(self):
+        f = self.findings({
+            "docs/guides/a.md": "# A\n\nGenerated with Claude Code.\n",
+        })
+        self.assertTrue(self.rules(f, "PROVENANCE"))
+
+    def test_co_authored_by_fires(self):
+        f = self.findings({"docs/guides/a.md": "# A\n\nCo-Authored-By: someone\n"})
+        self.assertTrue(self.rules(f, "PROVENANCE"))
+
+
+class TestSqlTableFunctionFromAndCte(RepoCase):
+    """A FROM inside EXTRACT, SUBSTRING, TRIM or OVERLAY names a field, and a
+    FROM naming a CTE defined in the same block names a legitimate table. Only
+    a FROM naming nothing the session registers is a finding."""
+
+    def test_extract_from_field_is_silent(self):
+        f = self.findings({
+            "docs/guides/a.md": "# A\n\n```sql\nSELECT EXTRACT(minute FROM ts) FROM samples\n```\n",
+        })
+        self.assertEqual(self.rules(f, "SQLTABLE"), [])
+
+    def test_cte_name_is_silent(self):
+        f = self.findings({
+            "docs/guides/a.md": (
+                "# A\n\n```sql\nWITH recent AS (SELECT * FROM samples)\n"
+                "SELECT count(*) FROM recent\n```\n"
+            ),
+        })
+        self.assertEqual(self.rules(f, "SQLTABLE"), [])
+
+    def test_unregistered_table_still_fires(self):
+        f = self.findings({
+            "docs/guides/a.md": "# A\n\n```sql\nSELECT * FROM metrics LIMIT 5\n```\n",
+        })
+        self.assertIn("metrics", [x.key for x in self.rules(f, "SQLTABLE")])
+
+    def test_shell_block_still_requires_select_on_the_line(self):
+        f = self.findings({
+            "docs/guides/a.md": "# A\n\n```sh\nFROM debian:bookworm\n```\n",
+        })
+        self.assertEqual(self.rules(f, "SQLTABLE"), [])
+
+
+class TestSlugifyHeadingLink(RepoCase):
+    """GitHub slugs the rendered heading text, so a link's URL is not part of
+    the anchor."""
+
+    def test_link_text_survives_url_does_not(self):
+        self.assertEqual(check_docs.slugify("See [foo](bar.md) now"), "see-foo-now")
+
+    def test_anchor_to_heading_with_link_resolves(self):
+        f = self.findings({
+            "docs/guides/bar.md": "# Bar\n",
+            "docs/guides/a.md": "## See [foo](bar.md)\n\n[x](#see-foo)\n",
+        })
+        self.assertEqual(self.rules(f, "ANCHOR"), [])
+
+
+class TestTrackerAdrIndexLink(RepoCase):
+    """Linking the decision-record index is navigation the documentation index
+    must do; linking one record is a citation."""
+
+    def test_index_links_are_silent(self):
+        f = self.findings({
+            "docs/adrs/0001-x.md": "# One\n",
+            "docs/README.md": "# Index\n\n[dir](adrs/) and [idx](adrs/README.md)\n",
+        })
+        self.assertEqual(self.rules(f, "TRACKER"), [])
+
+    def test_record_link_still_fires(self):
+        f = self.findings({
+            "docs/adrs/0001-x.md": "# One\n",
+            "docs/README.md": "# Index\n\n[one](adrs/0001-x.md)\n",
+        })
+        self.assertTrue(self.rules(f, "TRACKER"))
+
+
+class TestChangelogScope(RepoCase):
+    """CHANGELOG.md is exempt from the tracker rule and held to every other
+    one: a changelog names the decision behind a change, and still must not
+    carry a source path or a superlative."""
+
+    def test_scope(self):
+        self.assertEqual(check_docs.classify("CHANGELOG.md"), "changelog")
+
+    def test_citations_allowed_rest_enforced(self):
+        f = self.findings({
+            "CHANGELOG.md": (
+                "# Changelog\n\n- Typed statistics (ADR-0850, #123) in "
+                "crates/x/src/y.rs, a seamless change.\n"
+            ),
+        })
+        self.assertEqual(self.rules(f, "TRACKER"), [])
+        self.assertTrue(self.rules(f, "SRCPATH"))
+        self.assertTrue(self.rules(f, "SUPERLATIVE"))
