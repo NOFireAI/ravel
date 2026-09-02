@@ -437,10 +437,6 @@ class TestBaseline(RepoCase):
         self.assertIn("unused", out)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestGeneratedScope(RepoCase):
     """The two flag tables are generated from the clap definitions, so their
     prose is the code's prose. TRACKER and SRCPATH would demand editing doc
@@ -634,6 +630,59 @@ class TestTrackerAdrIndexLink(RepoCase):
         self.assertTrue(self.rules(f, "TRACKER"))
 
 
+class TestTrackerSpecScope(RepoCase):
+    """A spec page is an implementer contract: it cites the decision records
+    that govern it, and an issue or pull-request number is still repository
+    archaeology there. A generated block inside it is the generator's text."""
+
+    def test_issue_number_fires_on_a_spec_page(self):
+        self.assertEqual(check_docs.classify("docs/x.md"), "spec")
+        f = self.findings({"docs/x.md": "# X\n\nSee issue #123.\n"})
+        self.assertEqual([x.key for x in self.rules(f, "TRACKER")], ["#123"])
+
+    def test_adr_citation_and_link_are_silent_on_a_spec_page(self):
+        f = self.findings({
+            "docs/adrs/0042-x.md": "# ADR\n",
+            "docs/x.md": "# X\n\nSee ADR-0042 and [the record](adrs/0042-x.md).\n",
+        })
+        # The scaffolded docs/README.md links the record too, which is a
+        # citation on a user page; only the spec page is under test here.
+        on_spec = [x for x in self.rules(f, "TRACKER") if x.path == "docs/x.md"]
+        self.assertEqual(on_spec, [])
+
+    def test_generated_block_is_skipped_outside_it_is_not(self):
+        f = self.findings({
+            "docs/x.md": (
+                "# X\n\n<!-- BEGIN GENERATED T -->\n| a | #123 |\n"
+                "<!-- END GENERATED T -->\n\nSee #456.\n"
+            ),
+        })
+        self.assertEqual([x.key for x in self.rules(f, "TRACKER")], ["#456"])
+
+
+class TestNoBaselineFile(RepoCase):
+    """With no baseline file every finding fails and the clean message says
+    so, rather than claiming a baseline that does not exist."""
+
+    def test_finding_fails_without_a_baseline(self):
+        self.write({"docs/guides/a.md": "Promote a declared column.\n"})
+        code, out = self.gate()
+        self.assertEqual(code, 1)
+        self.assertIn("declared column", out)
+
+    def test_clean_message_names_no_baseline(self):
+        # An explicit index: the scaffolded one does not link the ADR index
+        # it also scaffolds, which would be an orphan finding of its own.
+        self.write({
+            "docs/guides/a.md": "# A\n\nClean.\n",
+            "docs/README.md": "# Index\n\n- [a](guides/a.md)\n- [records](adrs/README.md)\n",
+        })
+        code, out = self.gate()
+        self.assertEqual(code, 0, out)
+        self.assertIn("docs gate: clean.", out)
+        self.assertNotIn("against baseline", out)
+
+
 class TestChangelogScope(RepoCase):
     """CHANGELOG.md is exempt from the tracker rule and held to every other
     one: a changelog names the decision behind a change, and still must not
@@ -652,3 +701,7 @@ class TestChangelogScope(RepoCase):
         self.assertEqual(self.rules(f, "TRACKER"), [])
         self.assertTrue(self.rules(f, "SRCPATH"))
         self.assertTrue(self.rules(f, "SUPERLATIVE"))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,7 +1,7 @@
 # Consistency, Durability, and Failure Semantics
 
-Normative. Tests in tests/failure/ assert every claim here. If code and this
-document disagree, one of them is a bug and the fix updates both.
+Normative. Tests in `crates/ravel-failure-tests` assert every claim here. If
+code and this document disagree, one of them is a bug and the fix updates both.
 
 Guarantees come first in this file, mechanism second. Four distinctions run
 through it, and keeping them apart is how to read it:
@@ -36,7 +36,7 @@ Strict mode (default):
   Object-store durability is the floor: data survives anything the object
   store survives.
 
-Buffered mode (opt-in per tenant or per request, named "buffered"):
+Buffered mode (opt-in per request, named "buffered"):
 - Acknowledged after admission and enqueue to a shard actor. A crash between
   ack and flush loses the buffered window (bounded by max flush delay).
 - Never described as durable. No commit token is returned.
@@ -73,9 +73,9 @@ rejected point counts and reasons.
 - A query resolves one snapshot (a logical set of immutable segments) and
   uses it for its entire execution. Commits, compactions, and deletions that
   land mid-query do not affect it.
-- Compaction transactions (Phase 2) atomically swap inputs for outputs in
-  new snapshots; both sets remain physically present until GC clears the
-  inputs after the protection horizon.
+- Compaction transactions atomically swap inputs for outputs in new
+  snapshots; both sets remain physically present until GC clears the inputs
+  after the protection horizon.
 
 ## Crash matrix (strict mode)
 
@@ -132,16 +132,16 @@ The marker records the original request's written row/span count and its
 request whose *every* shard committed durably; buffered-mode and
 fully-rejected requests commit no durable data and write no marker. A
 multi-shard request where some but not all shards committed
-(`LogWriteError::PartialWrite`, issue #296) also writes no marker, even
+(`LogWriteError::PartialWrite`) also writes no marker, even
 though it did produce a partial durable commit: a hit on this marker's
 replay path reports the original commit token with zero rejections, so
 marking a partial commit as the request's receipt would make the next retry
 skip resending the shard that never committed, permanently losing its
 records instead of the honest at-least-once duplication an unkeyed retry
-gets today. The recovered tokens for the durable siblings are not returned
+gets. The recovered tokens for the durable siblings are not returned
 to the OTLP client (the protocol has no error-response channel for them,
 unlike the CLI's `load` path, which does report them); the gateway logs
-them at `warn` for operators instead (issue #460).
+them at `warn` for operators instead.
 
 **Replay contract.** A retry that supplies the same key first consults the
 marker (one prefix LIST over the dedup window, default 24 h, shared with
@@ -177,7 +177,7 @@ and no stronger; it does not promise a single stored copy per record.
 - Event time is never trusted for discovery. Commit records are bucketed by
   ingest hour; event-time bounds ride along for pruning. Late data is always
   discoverable; queries bound their listing by `max_ingest_lag` plus catalog
-  snapshots (Phase 2) for anything older.
+  snapshots for anything older.
 - Admission bounds event-time skew (ADR-0010 §8): points with
   `event_ts > ingest_ts + max_future_skew` (default 10 m) or
   `event_ts < ingest_ts - max_ingest_lag` (default 2 h) are rejected with a
@@ -282,9 +282,8 @@ and GC below). Guarantees:
   swap is not atomic, but it converges.
 - **Record-count conservation** is enforced pre-publish (ADR-0048): the sum of
   `sample_count` over the input set must exactly equal the sum over the built
-  parts, or the run aborts and publishes nothing. Compaction is a verbatim page
-  copy and never dedups, so any inequality means the merge dropped or invented
-  records.
+  parts, or the run aborts and publishes nothing. Compaction never dedups, so
+  any inequality means the merge dropped or invented records.
 
 The mechanism (racing-compactor resolution, `input_set_hash`, the dry-run
 gate, and reconciliation of two legitimately-different input sets) is in

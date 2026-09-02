@@ -565,7 +565,7 @@ pub fn registry() -> Vec<Construct> {
             name: name.to_string(),
             example: example.to_string(),
             classification: Classification::SupportedAndCovered { test: T_SUPPORTED },
-            rationale: "typed predicate/aggregate over a declared column (ADR-0090)",
+            rationale: "typed predicate/aggregate over a typed attribute column (ADR-0090)",
         });
     }
 
@@ -580,7 +580,7 @@ pub fn registry() -> Vec<Construct> {
         name: "LIKE".to_string(),
         example: "SELECT count(*) FROM logs WHERE body LIKE '%record 1%'".to_string(),
         classification: Classification::SupportedAndCovered { test: T_SUPPORTED },
-        rationale: "substring pattern match via the Ravel like UDF (#479)",
+        rationale: "substring pattern match via the Ravel like UDF",
     });
 
     // --- Scalar functions (ADR-0097 decisions 4, 8) ----------------------
@@ -902,7 +902,7 @@ represent a native histogram. Native-histogram samples are excluded from the
 so it is never materialized as a row and no query can observe it. `SELECT
 count(*) FROM samples`, and every other count or aggregation over the table,
 therefore undercount on tenants that ingest histograms -- the histogram samples
-are silently absent, not present with a zero or null `value` (#581). This is a
+are silently absent, not present with a zero or null `value`. This is a
 property of the table shape, not of any construct in the conformance table
 below, so it holds for every row that reads `samples`.
 

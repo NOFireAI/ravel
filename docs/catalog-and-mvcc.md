@@ -342,7 +342,7 @@ and the CAS read/write helpers.
   under a separate `t/<tenant_hash>/<signal>/del/` prefix, not in `c/`, so the
   bucket-resolution LIST never sees them; the resolver LISTs `del/` once per
   resolve to attach pending predicates (decision 2), concurrently with the
-  shard fan-out (issue #730). A `.dreq` is written
+  shard fan-out. A `.dreq` is written
   `CreateIfAbsent`, is immutable, necessarily names the subject, and is deleted
   after its `.done` exists plus the protection horizon (decision 5). A `.done`
   is written `CreateIfAbsent`, is immutable, carries no plaintext subject
@@ -797,8 +797,7 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
    every key at or above it), so a folded snapshot's sealed hours below the
    watermark are skipped server-side rather than paged through. Both group the
    returned keys client-side by `(shard, ingest_hour)` and keep the buckets in
-   the window; a shard's below-watermark history is never listed by either
-   (issue #730):
+   the window; a shard's below-watermark history is never listed by either:
    - **Bounded per-shard fan-out** (narrow/warm windows): the per-shard LISTs
      run concurrently, and each stops paging at the first key whose hour is
      past the window end (the `YYYYMMDDTHH` hour strings sort chronologically,
@@ -826,7 +825,7 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
 
    That cache is per process and outlives any one resolve, which is what
    makes a repeated resolve over an unsealed ingest hour cost its LISTs and
-   nothing else (issue #783). The newest `max_flush_lifetime +
+   nothing else. The newest `max_flush_lifetime +
    clock_skew_allowance + fold_safety_margin` of any tenant is always
    unsealed, so no snapshot part covers it and every query touching recent
    data resolves it through this step; without the cache that is one GET per
@@ -899,7 +898,7 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
    per resolve -- independent of whether any physical rewrite has run -- LIST
    `t/<th>/<sig>/del/` one time only. This LIST is started before the shard
    fan-out and joined with it, so its round trip overlaps the bucket LISTs in
-   one wave rather than following them (issue #730); it still completes before
+   one wave rather than following them; it still completes before
    the snapshot is constructed, so the visibility bound below is unchanged. For
    every `.dreq` erasure request found, decode and structurally validate it
    and verify its observed key against its own identity fields (ADR-0010 §7),

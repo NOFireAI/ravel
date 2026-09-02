@@ -257,7 +257,7 @@ caps the work a shard is offered, so raising it trades bounded extra
 per-shard memory (buffers held open by the extra in-flight flushes, up to
 `max_inflight_flushes - 1` flush windows' worth) for overlapped PUT
 latency and should be a measured decision; and **4** on `ravel-cli load`
-(`--max-inflight-flushes`, ADR-0807 as amended by issue #800), where
+(`--max-inflight-flushes`, ADR-0807 as amended), where
 `--pipeline-depth` already caps the outstanding batches, so the flush
 window costs no further memory and only decides whether that bounded set
 of objects is written concurrently. `0` is rejected at the CLI edge
@@ -720,7 +720,7 @@ stages contiguous per-column arrays and skips the `write_block` gather and the
 per-attribute `column_of` probe). Decision 8 of that ADR *argued from a
 microbench ratio* that removing the pivot addresses roughly 78 points of load
 CPU; no end-to-end number had ever been measured. This is the first one
-(`ravel-bench`'s `columnar_load_compare` bin, issue #606).
+(`ravel-bench`'s `columnar_load_compare` bin).
 
 - Host: x86_64, AMD EPYC-Rome, 8 logical cores, ~15 GiB RAM. Build profile:
   `release`.
@@ -762,7 +762,7 @@ What this measurement supports and what it does not:
   columnar batch is built through `ColumnarLogBatch::from_records`, which
   attaches no dictionaries, so the dictionary-preserving column and
   dictionary-aware bloom path never engages -- exactly as it fails to engage on
-  ClickBench-shaped plain-`BYTE_ARRAY` Parquet (issue #660, arrow-rs fuses the
+  ClickBench-shaped plain-`BYTE_ARRAY` Parquet (arrow-rs fuses the
   column's dictionary away on decode). Decision 8's arithmetic counted those
   savings; this number does not include them.
 - **The store is in-memory.** S3 latency, multi-shard fan-out scaling, and real
@@ -794,14 +794,14 @@ count replaces `shards` and the real ceiling is lower.
 
 Because that term is a `min`, neither window alone changes anything, which is
 measured rather than argued: on a 16-batch single-shard fixture with a 40ms
-injected data-object PUT (issue #800), depth 1 / flushes 1 took 673.9 ms, depth 4
+injected data-object PUT, depth 1 / flushes 1 took 673.9 ms, depth 4
 / flushes 1 took 671.9 ms, depth 1 / flushes 4 took 673.3 ms, and depth 4 /
 flushes 4 took 169.3 ms. At depth 1 the loader never asks a shard for a second
 concurrent flush, so `flush_permit_wait_ns` is exactly 0 and the per-shard window
 is not the thing the load is waiting on.
 
 ADR-0807 audits every write-path bound and exposes `--max-inflight-flushes` on
-the loader; its amendment for issue #800 moves both loader defaults to 4, having
+the loader; its amendment moves both loader defaults to 4, having
 first closed the durable-token report gap that made the speed-up opt-in (the
 loader now resolves every outstanding write on a failure instead of abandoning
 it, so the report equals what landed at any depth). `ravel-server`'s own default
@@ -855,7 +855,7 @@ Counters recorded today:
   `max_inflight_flushes` at its default of 1, this never exceeds
   `shard_count`.
 
-### Per-shard skew (issue #865)
+### Per-shard skew
 
 To make per-shard ingest skew measurable -- so an argument about shard-actor
 throughput rests on data, not assertion -- `IngestMetrics` also carries a
@@ -864,7 +864,7 @@ reachable from a benchmark through `IngestRouter::metrics()`, the same handle
 `in_flight_flushes_by_shard` is read through).
 
 `LogIngestMetrics` carries the same dimension, with the same
-`shard_skew_by_shard()` reader and the same three spans (issue #800). The two
+`shard_skew_by_shard()` reader and the same three spans. The two
 share one accumulator (`metrics::ShardSkew`), so a figure means the same thing on
 either pipeline. This matters because `ravel-cli load` drives the logs pipeline
 and not the metrics one: while the accounting existed only on the metrics side,

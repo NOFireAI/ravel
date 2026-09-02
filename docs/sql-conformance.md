@@ -39,7 +39,7 @@ represent a native histogram. Native-histogram samples are excluded from the
 so it is never materialized as a row and no query can observe it. `SELECT
 count(*) FROM samples`, and every other count or aggregation over the table,
 therefore undercount on tenants that ingest histograms -- the histogram samples
-are silently absent, not present with a zero or null `value` (#581). This is a
+are silently absent, not present with a zero or null `value`. This is a
 property of the table shape, not of any construct in the conformance table
 below, so it holds for every row that reads `samples`.
 
@@ -129,7 +129,7 @@ and stays conformant.
 | Clause / operator | `GROUP BY ordinal` | `SELECT series_id, count(value) FROM samples GROUP BY 1 ORDER BY series_id` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | analytical clause/operator over typed columns (ADR-0090 decision 8) |
 | Clause / operator | `HAVING` | `SELECT series_id, count(value) FROM samples GROUP BY series_id HAVING count(value) > 2` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | analytical clause/operator over typed columns (ADR-0090 decision 8) |
 | Clause / operator | `IN list` | `SELECT value FROM samples WHERE value IN (1, 2)` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | analytical clause/operator over typed columns (ADR-0090 decision 8) |
-| Clause / operator | `LIKE` | `SELECT count(*) FROM logs WHERE body LIKE '%record 1%'` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | substring pattern match via the Ravel like UDF (#479) |
+| Clause / operator | `LIKE` | `SELECT count(*) FROM logs WHERE body LIKE '%record 1%'` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | substring pattern match via the Ravel like UDF |
 | Clause / operator | `LIMIT` | `SELECT ts, value FROM samples ORDER BY series_id, ts LIMIT 1` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | covered by the two-layer differential gate (tests/differential.rs) |
 | Clause / operator | `OFFSET` | `SELECT value FROM samples ORDER BY value OFFSET 1` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | analytical clause/operator over typed columns (ADR-0090 decision 8) |
 | Clause / operator | `ORDER BY` | `SELECT ts, value FROM samples ORDER BY ts` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | covered by the two-layer differential gate (tests/differential.rs) |
@@ -137,8 +137,8 @@ and stays conformant.
 | Clause / operator | `REGEXP_REPLACE backreference` | `SELECT regexp_replace('ab', '(a)(b)', '\2\1') FROM samples LIMIT 1` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | analytical clause/operator over typed columns (ADR-0090 decision 8) |
 | Clause / operator | `count(DISTINCT)` | `SELECT count(DISTINCT series_id) FROM samples` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | analytical clause/operator over typed columns (ADR-0090 decision 8) |
 | Clause / operator | `date_part(minute)` | `SELECT date_part('minute', ts) FROM samples` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | analytical clause/operator over typed columns (ADR-0090 decision 8) |
-| Clause / operator | `declared i64 typed aggregate` | `SELECT sum(dur) FROM logs` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | typed predicate/aggregate over a declared column (ADR-0090) |
-| Clause / operator | `declared i64 typed comparison` | `SELECT ts FROM logs WHERE dur >= 20` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | typed predicate/aggregate over a declared column (ADR-0090) |
+| Clause / operator | `declared i64 typed aggregate` | `SELECT sum(dur) FROM logs` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | typed predicate/aggregate over a typed attribute column (ADR-0090) |
+| Clause / operator | `declared i64 typed comparison` | `SELECT ts FROM logs WHERE dur >= 20` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | typed predicate/aggregate over a typed attribute column (ADR-0090) |
 | Scalar function | `abs` | `SELECT abs(-3.5) FROM samples LIMIT 1` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | math family representative: abs(-3.5) = 3.5 |
 | Scalar function | `current_date` | `SELECT current_date FROM samples` | Intentionally rejected | `ValidationError::ExcludedScalar` | nondeterministic or environment-reading; unattestable by the differential oracle (ADR-0097 decision 4) |
 | Scalar function | `current_time` | `SELECT current_time FROM samples` | Intentionally rejected | `ValidationError::ExcludedScalar` | nondeterministic or environment-reading; unattestable by the differential oracle (ADR-0097 decision 4) |

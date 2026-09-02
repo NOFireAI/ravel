@@ -95,7 +95,7 @@ Identical in shape to RSEG v1:
    pays for it with step 3's extra ranged GET. `ravel-query`'s log fetcher
    probes 256 KiB, sized so that one probe carries the footer, SKIP_IDX and
    PAGE_DIR past the BLOOM section that sits between them (ADR-0699
-   decision 5, issue #766).
+   decision 5).
 3. Require `footer_len > 0` and `16 + footer_len <= total_size`;
    otherwise `Corrupted`. If the suffix did not cover the footer, issue
    one more ranged GET.
