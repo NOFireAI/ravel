@@ -102,9 +102,10 @@ staging profile field to gate on.
 
 ## The first deployment against a fresh bucket
 
-Two control objects are created on first contact with an empty bucket, which
-is why their write grants are slightly broader than the per-role tables imply.
-Know this before your first deployment:
+Two control objects are created on the first authorized contact with an
+empty bucket, `sys/tenancy` by any server role and `sys/gc` by Maintain or
+Admin only, which is why their write grants are slightly broader than the
+per-role tables imply. Know this before your first deployment:
 
 - **`sys/tenancy`**, the marker that pins the tenant hash scheme, is created by
   whichever of the three server roles reaches a fresh bucket first. That is why

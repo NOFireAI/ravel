@@ -978,8 +978,7 @@ range holds a whole block), and the group's blocks are decoded one at a
 time out of those bytes, each released before the next. The one term that
 scales with the data is the in-progress output segment's own buffer, bounded
 by the segment size cap, because a segment's content-addressed key does not
-exist until
-the whole part is encoded.
+exist until the whole output segment is encoded.
 
 ## Tokenizer
 
