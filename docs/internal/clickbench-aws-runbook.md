@@ -111,11 +111,11 @@ aws iam create-role --role-name ravel-clickbench-box \
 
 ACCT=$(aws sts get-caller-identity --query Account --output text)
 
-# The SecureStrings are encrypted under the account's default SSM KMS key
-# unless you created them with a customer-managed key. Set KMS_KEY_ID to that
-# key's id (the default key's id is what `aws kms describe-key --key-id
-# alias/aws/ssm --query KeyMetadata.KeyId --output text` prints).
-KMS_KEY_ID=<ssm-kms-key-id>
+# Step 3 wrote the SecureStrings without --key-id, so they are encrypted under
+# the account's default SSM key, which is the key this policy must name. If you
+# passed --key-id to put-parameter instead, set KMS_KEY_ID to that key's id.
+KMS_KEY_ID=$(aws kms describe-key --key-id alias/aws/ssm \
+  --query KeyMetadata.KeyId --output text)
 
 cat > /tmp/ssm-read.json <<EOF
 {
@@ -198,8 +198,10 @@ parallel with the build.
 export HOME=/root
 set -uo pipefail
 # Clear every marker a previous attempt could have left, and drop a partial
-# dataset, so a retry never reuses stale failure state.
-rm -f /root/BOOT_DONE /root/BOOT_FAILED /root/DATASET_FAILED /root/hits.parquet
+# dataset and checkout, so a retry never reuses stale failure state and the
+# clone below never fails on a non-empty destination.
+rm -f /root/BOOT_DONE /root/BOOT_FAILED /root/DATASET_FAILED /root/CLONE_SHA /root/hits.parquet
+rm -rf /root/ravel
 exec > /root/bootstrap.log 2>&1
 fail() { echo "FAILED: $1"; touch /root/BOOT_FAILED; exit 1; }
 trap '[ -f /root/BOOT_DONE ] || touch /root/BOOT_FAILED' EXIT
@@ -335,9 +337,14 @@ Build with frame pointers so a profile taken from the same binary resolves, and
 different binaries at the same path turn a missing flag into a wrong default.
 
 ```sh
-cd /root/ravel
-HEAD_SHA=$(cat /root/CLONE_SHA)               # the commit the bootstrap clone built
-git checkout -q --detach "$HEAD_SHA"          # never a moving origin/main
+cd /root/ravel || exit 1
+# The commit the bootstrap clone built, never a moving origin/main. Stop if the
+# record is missing or the checkout does not land on it: a build from whatever
+# is checked out would carry an unknown SHA under a pinned name.
+HEAD_SHA=$(cat /root/CLONE_SHA) && [ -n "$HEAD_SHA" ] \
+  || { echo "no /root/CLONE_SHA: the bootstrap did not finish"; exit 1; }
+git checkout -q --detach "$HEAD_SHA" || { echo "cannot check out $HEAD_SHA"; exit 1; }
+[ "$(git rev-parse HEAD)" = "$HEAD_SHA" ] || { echo "HEAD is not $HEAD_SHA"; exit 1; }
 
 export CARGO_TARGET_DIR=/root/target-fp
 RUSTFLAGS="-C force-frame-pointers=yes" \
@@ -561,22 +568,25 @@ def byte_count(v, what):
         return None
     return v
 
-def finite_nonneg(v):
-    """An object-store count or byte field coerced to a finite, non-negative
-    number, or 0 when the report value is not one.
+def finite_nonneg(v, what):
+    """An object-store count or byte field from the report, or None with a
+    recorded failure.
 
-    The class totals below sum these directly rather than gating the whole pass
-    on each field the way `byte_count` does, so an invalid value contributes 0
-    instead of aborting. The three traps `byte_count` documents apply here too:
-    `bool` is an `int` subclass and would add 1; `NaN` poisons every later
-    comparison so a band would read as MET; a negative would drag a total down
-    toward a passing figure. Each such value is worth 0."""
+    The class totals below sum these, so the same three traps `byte_count`
+    documents apply: `bool` is an `int` subclass and would add 1; `NaN` poisons
+    every later comparison so a band would read as MET; a negative would drag a
+    total down toward a passing figure. An invalid field is a failed pass, not
+    a zero: a total computed over fewer fields than the class has statements
+    would pass a band it never measured."""
     if isinstance(v, bool) or not isinstance(v, (int, float)):
-        return 0
+        fails.append(f"{what}: expected a finite non-negative number, got {v!r}")
+        return None
     if v != v or v in (float("inf"), float("-inf")):      # NaN or +/-inf
-        return 0
+        fails.append(f"{what}: value is not finite ({v!r})")
+        return None
     if v < 0:
-        return 0
+        fails.append(f"{what}: value is negative ({v!r})")
+        return None
     return v
 
 def scan_wire(acc, q):
@@ -682,8 +692,12 @@ for q in CLASS_M:
     acc = cold(q)
     if acc is None:
         m_ok = False; continue
-    m_gets  += finite_nonneg(acc.get("object_store_get_requests"))
-    m_bytes += finite_nonneg(acc.get("object_store_bytes"))
+    g = finite_nonneg(acc.get("object_store_get_requests"), f"class M {q} object_store_get_requests")
+    b = finite_nonneg(acc.get("object_store_bytes"), f"class M {q} object_store_bytes")
+    if g is None or b is None:
+        m_ok = False; continue
+    m_gets  += g
+    m_bytes += b
 if m_ok:
     print(f"class M total {m_gets} GETs, {m_bytes/1e9:.2f} GB")
     if m_gets > M_TOTAL_GETS_MAX:
@@ -697,7 +711,9 @@ for q in CLASS_S_EACH:
     acc = cold(q)
     if acc is None:
         continue
-    b = finite_nonneg(acc.get("object_store_bytes"))
+    b = finite_nonneg(acc.get("object_store_bytes"), f"class S {q} object_store_bytes")
+    if b is None:
+        continue
     print(f"class S {q} {b/1e9:.2f} GB ({100*b/CORPUS_BYTES:.1f}% of corpus)")
     if b > S_EACH_BYTES_MAX:
         fails.append(f"class S {q} {b/1e9:.2f} GB > {S_EACH_FRAC_MAX*100:.1f}% "
@@ -708,7 +724,10 @@ for q in CLASS_S_GRP:
     acc = cold(q)
     if acc is None:
         s_grp_ok = False; continue
-    s_grp_bytes += finite_nonneg(acc.get("object_store_bytes"))
+    b = finite_nonneg(acc.get("object_store_bytes"), f"class S {q} object_store_bytes")
+    if b is None:
+        s_grp_ok = False; continue
+    s_grp_bytes += b
 if s_grp_ok:
     print(f"class S q20..q24 group total {s_grp_bytes/1e9:.2f} GB")
     if s_grp_bytes > S_GROUP_BYTES_MAX:

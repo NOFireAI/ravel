@@ -364,9 +364,17 @@ cargo run -p ravel-bench --features sql-latency --bin sql_latency_bench -- \
   --corpus benchmarks/clickbench/hits.corpus.json \
   --runs 3 \
   --compaction pre \
-  --window-hours 200000
+  --window-hours 200000 \
+  --sql-max-segments 1000000 \
+  --cache-bytes 25769803776
 ```
 
+- `--sql-max-segments 1000000` lifts the engine's sealed-segment ceiling from
+  its default of 1024; a folded ClickBench tenant sits far above that and
+  every statement would otherwise fail with `8424 exceeds max 1024`.
+- `--cache-bytes 25769803776` (24 GiB) exceeds the ~12 GB corpus, so the second
+  and third runs have a hot column to report. Leave it off for a cold-only
+  pass.
 - `--tenant clickbench` measures the loaded tenant (not an in-process generated
   dataset). It resolves the tenant's real durable declaration and **skips** any
   statement whose required declared column is absent or the wrong type, rather
@@ -654,12 +662,14 @@ cargo run -p ravel-server --features flight-sql --bin ravel-server -- \
   --cache-max-bytes 25769803776
 ```
 
-`--max-segments` and `--cache-max-bytes` here match the in-process pass, so the
-two tables are comparable: a folded ClickBench tenant sits far above the 1024
-default sealed-segment ceiling (step 5), so the server must raise it or every
-statement fails with `8424 exceeds max 1024`; and the cache must exceed the
-~12 GB corpus (`25769803776` is 24 GiB) or every run is cold and there is no
-hot column to compare. Both settings live on the server only. The bench's
+`--max-segments 1000000` and `--cache-max-bytes 25769803776` match the
+`--sql-max-segments` and `--cache-bytes` values the in-process command in
+step 5 passes, so the two tables are comparable: a folded ClickBench tenant
+sits far above the 1024 default sealed-segment ceiling, so the server must
+raise it or every statement fails with `8424 exceeds max 1024`; and the cache
+must exceed the ~12 GB corpus (`25769803776` is 24 GiB) or every run is cold
+and there is no hot column to compare. Both settings live on the server only
+in this lane. The bench's
 `--cache-bytes` and `--sql-max-segments` configure the in-process fetcher and
 engine, which the Flight lane never builds, so neither flag reaches the
 server; leave them off the bench command, or the report header claims a
