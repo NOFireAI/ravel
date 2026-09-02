@@ -7,10 +7,9 @@ replicas so the same data is flushed once per subset instead of once per
 replica.
 
 It changes no format, no contract, and no acknowledgement latency. It is
-configuration. The *routing mechanism* is split into layers: a deprecated
+configuration. The *routing mechanism* comes in layers: a deprecated
 ingress-nginx path, a Ravel-owned router, and a separate Gateway API exposure
-concept. That split changed no part of the semantic contract this guide opens
-with.
+concept. The layers share the semantic contract this guide opens with.
 
 ## Why it saves requests
 
@@ -168,7 +167,7 @@ Ready it falls further down the same HRW-ranked order (position `S+1`, `S+2`, â€
 rather than narrowing to a smaller, unbalanced set.
 
 **Why it exists.** It removes the ingress-nginx dependency entirely. Subset
-selection lives in Ravel, so it no longer matters which Gateway implementation,
+selection lives in Ravel, so it does not matter which Gateway implementation,
 if any, terminates the connection. Combine it with Gateway API exposure (c)
 and you get subset pinning behind a conformant `Gateway`; run it with no
 exposure at all and it still pins, reachable however you route to the router's
@@ -200,7 +199,7 @@ share the base name `<cluster>-ingest-router`:
 
 | Object | Kind | Notes |
 |---|---|---|
-| `<cluster>-ingest-router` | Deployment | The router pods. Image is `ingestAffinity.routerImage`. HTTP-only today (see the limitation below). |
+| `<cluster>-ingest-router` | Deployment | The router pods. Image is `ingestAffinity.routerImage`. HTTP-only (see the limitation below). |
 | `<cluster>-ingest-router` | Service | ClusterIP on port 8080. Gateway API exposure (c) points its HTTPRoute here. |
 | `<cluster>-ingest-router` | ServiceAccount | The identity the Deployment runs as. |
 | `<cluster>-ingest-router` | Role | Namespaced. `get`/`list`/`watch` on `endpointslices` (`discovery.k8s.io`) and `services` (core), in this namespace only. |
@@ -231,8 +230,8 @@ resolver chain itself can do OIDC and mTLS resolution, but there is no CRD
 field that threads OIDC issuer or JWKS, or mTLS CA configuration, into the
 router. So `canonicalTenant` works
 only for clusters authenticating with static tenant tokens. If you rely on OIDC
-or mTLS for tenancy, `canonicalTenant` is not yet usable for you; use
-`authorizationHeader` (which hashes the token bytes) until that surface lands.
+or mTLS for tenancy, `canonicalTenant` is not usable for you; use
+`authorizationHeader`, which hashes the token bytes.
 
 Resolution is **fail-closed**: if the router cannot resolve a tenant for a
 request under `canonicalTenant`, it rejects the request (HTTP 401 / gRPC
@@ -256,8 +255,7 @@ Gateway implementation across all gateway pods, which for gRPC is `S=1` or
 worse, not subset-of-`S`. The reason is structural: the router resolves one
 gateway port per process and cannot proxy the gateway's distinct HTTP and gRPC
 listener ports at once. Wiring gRPC through the router would need either a
-per-listener-port surface or a two-Deployment split, and neither is designed
-yet, so this guide does not predict how it will be solved.
+per-listener-port surface or a two-Deployment split, and neither exists.
 
 If most of your ingest request bill comes from OTLP/gRPC, weigh this before
 migrating: `ravelNative` pins your OTLP/HTTP traffic but not your gRPC.
@@ -390,14 +388,10 @@ pointing at a router Service the same reconcile just swept away.
 
 ## Migrating from `ingressNginx` to `ravelNative`
 
-Moving from `backend: ingressNginx` to `backend: ravelNative` is the planned
-migration path, and it is **staged**. Four phases have landed: deprecating the
-legacy backend, splitting exposure out of affinity, the router itself, and
-`ravelNative` as the recommended choice for new deployments. The fifth,
-removing the ingress-nginx rendering path altogether, is deliberately deferred
-to a future decision, to be taken once `ravelNative` has field experience.
-There is no removal timeline; `ingressNginx` remains the schema default and
-keeps working until then.
+Moving from `backend: ingressNginx` to `backend: ravelNative` is the supported
+migration. The ingress-nginx rendering path is deprecated but not removed:
+`ingressNginx` remains the schema default and keeps working, and there is no
+removal timeline.
 
 Switching an existing production cluster is a **real migration, not a drop-in
 toggle.** It has behavior differences you must plan for:
@@ -410,10 +404,10 @@ toggle.** It has behavior differences you must plan for:
   ServiceAccount, Role, and RoleBinding. This is part of the operator's shipped
   ClusterRole (see [kubernetes.md](kubernetes.md)); confirm your deployment of
   the operator carries it.
-- **HTTP-only today.** OTLP/gRPC is not subset-pinned through the router (see
+- **HTTP-only.** OTLP/gRPC is not subset-pinned through the router (see
   [the limitation above](#current-limitation-http-only-no-grpc-through-the-router)).
   If your request bill is gRPC-dominated, the saving is smaller than the HTTP
-  math suggests until the router carries gRPC.
+  math suggests.
 - **TLS moves.** If you were relying on `ingestAffinity.tlsSecretName`, that
   field is legacy-backend-only. Under Gateway API exposure you configure
   `tls.certificateRefs` on your `Gateway`'s listener yourself, pointing at the

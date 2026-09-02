@@ -143,8 +143,9 @@ After an ingest-hour bucket is sealed, which is its end plus
 `max_flush_lifetime` and `clock_skew_allowance`, so no further commit can
 appear, the compactor rewrites its many small L0 segments into a handful of
 large L1 segments. It publishes one compaction record naming the L0 inputs it
-superseded. It copies pages verbatim and never decodes a sample, so a query over
-the L1 output returns identical results to a query over the L0 inputs.
+superseded. It never deduplicates, and it checks before publishing that the L1
+outputs hold exactly as many records as the L0 inputs, so a query over the L1
+output returns the same rows as a query over the L0 inputs.
 
 This is the primary win of running maintenance at all: object count per hour
 drops from thousands to a handful, and every query over that hour pays
@@ -336,7 +337,7 @@ This audits live on-object format versions across all three signals, reading the
 supported window from each reader's own source so a future version bump cannot
 make the audit stale. It exits nonzero on any anomaly.
 
-Each format currently supports exactly one version and carries no reader for the
+Each format supports exactly one version and carries no reader for the
 previous one, so any live object at another version is an anomaly to re-ingest,
 not a migration target:
 

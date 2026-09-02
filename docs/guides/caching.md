@@ -53,10 +53,10 @@ Two things are not cached, for two different reasons:
   and the tenant identity the log path uses to key its cache entries serves
   only as that tenant check here. A repeated span query therefore re-reads the
   same objects. This is the one genuine cache gap.
-- **Alert transitions and audit records.** These are written durably, and
-  `ravel-sql` carries table providers for them, but the SQL session registers
-  exactly three tables: `samples`, `logs`, and `spans`. No query surface can
-  read alert or audit data at all, so there is no read path to cache.
+- **Alert transitions and audit records.** These are written durably, but
+  the SQL session registers exactly three tables, `samples`, `logs`, and
+  `spans`, and no query surface can read alert or audit data at all, so there
+  is no read path to cache.
 
 Each cache entry is keyed by tenant, the content hash of the object it
 came from, and the byte offset and length. Content is immutable once
@@ -187,22 +187,23 @@ stored bytes of every page present in the blocks the query decoded, and
 `page_bytes_decoded`, the stored bytes of only the pages the query's column
 projection kept. These are a decode-time measurement, not a wire measurement:
 they count bytes a fetched block already holds, distinct from `s3_bytes` (the
-actual bytes moved over the network). Column filtering today is decode-time only
--- a narrow projection skips decompressing the pages it does not need, but the
-whole block still arrives on the wire, because RLOG has no per-page checksum to
-verify a sub-block fetch against.
+actual bytes moved over the network). On the whole-object read shape the whole
+block arrives on the wire and a narrow projection skips decompressing the
+pages it does not need; on the ranged read shape the page directory lets the
+fetch pull only the projected columns' pages, so the projection narrows the
+wire bytes as well.
 
 The ratio `page_bytes_decoded / page_bytes_fetched` is the interpretation lever.
 When it is close to 1, the query decodes nearly everything its blocks contain and
 a larger cache working set is the main way to make repeat runs cheaper. When it
 is small -- most fetched page bytes are thrown away by column filtering, the
-wide-schema, narrow-projection shape -- the same block is being fetched and cached
-in full to serve a few columns. Two responses apply: narrow the projection
-further where the query allows it (fewer columns decoded per block, though not
-fewer bytes fetched until a future per-page-crc format change lands), and size the
-cache to the *working set of whole blocks* the workload touches rather than to the
-decoded byte volume, since the cache admits and holds whole blocks regardless of
-how little of each a given query decodes. A small decoded fraction across a
+wide-schema, narrow-projection shape -- a whole-object read is fetching and
+caching the block in full to serve a few columns. Two responses apply: narrow
+the projection further where the query allows it, and size the cache to the
+*working set of whole blocks* the workload touches rather than to the decoded
+byte volume, since on the whole-object shape the cache admits and holds whole
+blocks regardless of how little of each a given query decodes. A small decoded
+fraction across a
 tenant's queries is the signal that its cache should be sized against block
 footprint, not against what its projections actually read.
 

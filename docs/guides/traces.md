@@ -13,7 +13,7 @@ durable copy. Records in a segment sort by `(trace_id, start_ts)`, so all spans
 of one trace occupy a contiguous run of blocks. Each object carries a skip
 index that holds, per block, the block's `trace_id` range, its time interval
 (`start_ts` minimum and `end_ts` maximum), its `duration_ns` range, and a
-one-byte `status_mask`. RSPAN v4 objects also carry a BLOOM section with a
+one-byte `status_mask`. RSPAN objects also carry a BLOOM section with a
 per-block bloom filter over the tokens of `service.name` and span `name`, plus a
 block-local `service_name` column. The reader uses these structures to skip
 blocks that cannot match a query.
@@ -29,13 +29,12 @@ Ingest routes each span to a shard by its `trace_id`. The router hashes the
 trace land on the same shard, and within that shard's objects they sort
 together into a contiguous block run.
 
-The query-time catalog listing does not yet exploit this routing: a
-`trace_id =` query still lists and opens every shard's segments in the
-matched time window, the same as any other query. What is bounded is the
-per-object decode: the skip index drops every block whose `trace_id` range
-excludes the target, so the reader decodes only the blocks that can hold the
-trace, on whichever shard(s) it lists. Shard-level pruning by `trace_id` is a
-later capability, not a current one.
+The query-time catalog listing does not use this routing: a `trace_id =`
+query lists and opens every shard's segments in the matched time window, the
+same as any other query. What is bounded is the per-object decode: the skip
+index drops every block whose `trace_id` range excludes the target, so the
+reader decodes only the blocks that can hold the trace, on whichever shards
+it lists.
 
 One caveat applies regardless. Online resharding can move a tenant
 to a new shard count while spans are still arriving. A trace whose spans
@@ -99,7 +98,7 @@ These predicates prune at the skip-index level:
   block whose `status_mask` clears every requested bit. A `status_code = 2`
   query skips every block with no Error span.
 
-These predicates prune at the bloom level (RSPAN v4):
+These predicates prune at the bloom level:
 
 - `service_name = <literal>` probes the block's `service.name` bloom. The
   reader skips a block whose bloom proves the token absent. A bloom never proves
@@ -116,8 +115,7 @@ blocks but still filters rows exactly. Notes on the shapes above:
 - `service_name` and `name` equality push down but are also always re-checked
   as a residual, because a bloom is a false-positive filter.
 - Attribute equality on the `attrs` map (`attrs['k'] = 'v'`) does not prune. It
-  is evaluated exactly over the merged map. Span attribute pruning is a later,
-  undecided epic, not a current capability.
+  is evaluated exactly over the merged map.
 
 ### Worked queries
 
@@ -169,13 +167,12 @@ with a status, service, name, or duration prune. Each `WHERE` clause is also
 re-applied exactly above the scan, so every result is correct whether or not a
 block was pruned.
 
-The 32-character hex form of the `trace_id` literal in the first query is
-handled by the block-pruning path, which is unit-tested for it. What is not
-proven anywhere is the residual filter that re-applies the predicate above the
-scan against a text literal: the column is `FixedSizeBinary(16)` and a hex
-string is text, and the only end-to-end test of that residual uses a binary
-literal. Treat the hex-string form as illustrative, and supply a 16-byte binary
-literal where you need the whole comparison proven end to end.
+The block-pruning path accepts the 32-character hex form of the `trace_id`
+literal in the first query. The residual filter that re-applies the predicate
+above the scan compares a `FixedSizeBinary(16)` column against the literal,
+and its behaviour with a text literal is not verified end to end. Treat the
+hex-string form as illustrative, and supply a 16-byte binary literal where you
+need the whole comparison proven.
 
 ## Incomplete traces
 
@@ -197,6 +194,5 @@ exactly the spans in view and never waits for a missing root or sibling.
 ## What Ravel does not store
 
 Span links are not stored. A link points from one span to another span in a
-different trace. Ravel deliberately keeps links out of RSPAN; they will get
-their own design decision when a query needs them. A query over the `spans`
+different trace, and RSPAN has no field for it. A query over the `spans`
 table cannot filter or return links.

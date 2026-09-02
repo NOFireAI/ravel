@@ -18,11 +18,12 @@ This guide is the catalog of `/metrics`. It names the metric families, states
 what each number means, and shows how to read the query-cost numbers. Read it
 to understand a sample you see on the route.
 
-The [operations guide](operations.md) is the runbook. It holds the default
-alert rules, the admission-usage family in operational depth, the mass-orphan
-breaker runbook, and the durable GC config. Read it to decide what to page on
-and how to respond. This guide does not repeat those procedures. It links to
-them.
+The [operations guide](operations.md) is the runbook:
+[troubleshooting](operations/troubleshooting.md) holds the alert rules and the
+mass-orphan breaker runbook, and [configuration](operations/configuration.md)
+the admission limits and the durable GC config. Read those to decide what to
+page on and how to respond. This guide does not repeat those procedures. It
+links to them.
 
 The [tracing guide](tracing.md) covers the query-path `tracing` spans. Metrics
 here answer "how much" in aggregate across the process; the per-request spans
@@ -53,7 +54,7 @@ admission-rejection counter and the scrub seal-divergence counter. `cache` and
 `tier` split the read-cache family across its two caches and, when a disk tier
 is configured, its two tiers; the [caching guide](caching.md) documents both.
 `kind` splits the maintenance merge-memory gauge into its transient and total
-high-water marks. The `level` key is reserved and no family renders it today.
+high-water marks. The `level` key is reserved and no family renders it.
 
 The allowlist is closed for two reasons. The first reason is cardinality. An
 unbounded label value multiplies the series count without a ceiling, and the
@@ -214,7 +215,7 @@ Labels: `mode`.
 
 The first two counters tally an anomaly the query resolves past. Each
 `ravel_catalog_isolation_breach_total` increment is a query that failed with
-an explicit isolation-fault error. The operations guide gives its alert rule.
+an explicit isolation-fault error. [Troubleshooting](operations/troubleshooting.md) gives its alert rule.
 
 ### Tenancy adoption (`ravel_tenancy_v1_unkeyed_adoptions_total`)
 
@@ -226,7 +227,7 @@ nonzero value is the visible signal that the one-time migration happened.
 
 Labels: `mode`. Counts dynamic-tenant provisioning checks that failed: a
 `shard_count` disagreement, an unreadable record, or a maintain-loop check
-catching either. The operations guide gives its alert rule.
+catching either. [Troubleshooting](operations/troubleshooting.md) gives its alert rule.
 
 ### Store reachability (`ravel_store_reachable`, `ravel_store_probe_failures_total`)
 
@@ -282,7 +283,8 @@ Labels: `mode`, plus `signal` on all but the legal-hold counter. These carry no
 | `ravel_maintain_orphans_withheld` | Gauge. Orphan candidates withheld by the most recent sweep pass, by signal. |
 | `ravel_maintain_orphans_present` | Gauge. Orphan candidates the most recent sweep pass found, by signal, whether or not the breaker tripped. |
 
-The operations guide gives the alert rules and the breaker runbook. A zero
+[Troubleshooting](operations/troubleshooting.md) gives the alert rules and the
+breaker runbook. A zero
 value on the `orphans_withheld` or `orphans_present` gauge does not mean a
 prior trip was resolved: it is this pass's count, not a resolution signal.
 
@@ -364,8 +366,9 @@ ratios for PromQL to compute, per `cache` and per `tier`.
 
 Labels: `mode`, `tenant_hash`, `signal`, plus `reason` on the rejection
 counter. This family folds tenants per the rule above. The
-[operations guide](operations.md) covers this family in operational depth and
-gives its alert rules.
+[admission limits guide](admission-limits.md) covers this family in
+operational depth, and [troubleshooting](operations/troubleshooting.md) gives
+its alert rules.
 
 | Metric | Meaning |
 |---|---|
@@ -403,7 +406,7 @@ per-query cost into the `ravel_query_*` family. Coverage spans
 `POST /api/v1/sql`, `POST /api/v1/analytics`, the Prometheus-shaped
 `GET /api/v1/query`, `GET /api/v1/query_range`, `GET /api/v1/labels`, and
 `GET /api/v1/series`, and every Flight SQL request. The `workload_class` label
-carries `interactive` or `background`. Only `interactive` occurs today. The
+carries `interactive` or `background`. Only `interactive` occurs. The
 [cost model guide](cost-model.md#per-query-cost-accounting) explains the
 accounting behind these numbers.
 
@@ -490,8 +493,7 @@ A ratio above 1 rules in one of two causes. The first cause is a cost-model
 gap, where the estimate omits a real source of spend. The second cause is a
 runaway query pattern the model did not anticipate. Either cause is worth an
 operator's attention, because a later admission decision could reject queries
-on this envelope. Nothing in this release rejects a query on it. This is
-measurement only.
+on this envelope. Nothing rejects a query on it; this is measurement only.
 
 ## Worked examples
 

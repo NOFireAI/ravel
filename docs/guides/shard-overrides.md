@@ -88,8 +88,9 @@ not discovered afterward.
   garbage-collection pass over a bigger slice of data.
 - **This lever does not reach logs or spans' own request-cost drivers.**
   Shard count divides PUT and LIST cost the same way for every signal, but
-  logs and spans carry additional per-record cost structure that is addressed
-  separately; lowering shard count here is not a substitute for that.
+  logs and spans carry additional per-record cost structure that shard count
+  does not touch; lowering shard count here is not a substitute for
+  addressing that.
 
 ## Reading it back
 

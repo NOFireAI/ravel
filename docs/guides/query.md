@@ -138,14 +138,14 @@ save. They take no parameters.
 build's git SHA when the build exported `RAVEL_GIT_SHA`, empty otherwise.
 
 `/api/v1/metadata` returns real per-metric type, help, and unit for any metric
-ingested after metric metadata capture shipped, in Prometheus' documented shape (`data` maps
+whose ingest carried them, in Prometheus' documented shape (`data` maps
 each family name to a length-1 array of `{type, help, unit}`). It resolves the
 requesting tenant from the same bearer credential the other query routes use and
 serves that tenant's metadata from a per-process, per-tenant cache (one object
 read per tenant per refresh horizon, never a read per request). The optional
 `metric` and `limit` query parameters filter to one family and cap the number of
-names, matching Prometheus. Metadata is best-effort: a metric ingested before
-metric metadata capture shipped, or over a path that sent no type/help/unit, has no entry, and a request
+names, matching Prometheus. Metadata is best-effort: a metric ingested over a
+path that sent no type, help, or unit has no entry, and a request
 that carries no resolvable tenant still gets `{"status": "success", "data": {}}`
 (this endpoint never returns `401`). See
 [the ingest guide](ingest.md#metric-metadata-and-otlp-name-suffixing) for the
@@ -169,18 +169,16 @@ table are in [analytics.md](../analytics.md#endpoint).
 
 ## PromQL support
 
-Ravel's evaluator (`ravel-promql`) is a full PromQL evaluator, differentially
-tested against real Prometheus. Function calls,
-aggregations, binary operators, subqueries, unary and paren expressions, the
-`@` modifier, and vector matching are all supported. The generated conformance
-table in [docs/query-engine.md](../query-engine.md#promql-conformance-adr-0035)
-is authoritative: at last regeneration it scored 124 supported constructs
-(including the 72 non-experimental functions and 12 aggregation operators
-promql-parser marks stable, all 16 binary operators, and the AST node and
-modifier categories) against 5 intentionally rejected and 2 accepted
-divergences.
+Ravel's PromQL evaluator is differentially tested against real Prometheus.
+Function calls, aggregations, binary operators, subqueries, unary and paren
+expressions, the `@` modifier, and vector matching are all supported. The
+generated conformance table in
+[docs/query-engine.md](../query-engine.md#promql-conformance-adr-0035) is
+authoritative: it classifies every construct as supported, intentionally
+rejected, or an accepted divergence, and its counts are regenerated from the
+differential test rather than written by hand.
 
-A handful of constructs are still intentionally rejected. Each answers with a
+A handful of constructs are intentionally rejected. Each answers with a
 typed `422 unprocessable_entity` error naming the construct, never a panic and
 never silently wrong data. The current set is:
 
@@ -194,8 +192,9 @@ never silently wrong data. The current set is:
 
 The experimental aggregation operators `limitk` and `limit_ratio` parse but are
 also rejected with a typed error naming the operator: they are outside the
-stable language and out of the scored surface, not implemented (see
-docs/query-engine.md). Subqueries themselves are supported; only a subquery
+stable language and out of the scored surface, and not implemented (see
+[the query engine spec](../query-engine.md)). Subqueries themselves are
+supported; only a subquery
 whose inner expression matches native-histogram data is refused.
 
 Selector details that hold for a bare vector selector:
@@ -260,10 +259,8 @@ naming the pool, never a truncated result.
 
 ### Operator-configurable budgets (server flags)
 
-Four of these budgets are process-wide server flags. Each default is
-exactly the compiled-in value, so a server started with none of the flags
-behaves byte-for-byte as before they existed. All four are process-wide, not
-per-tenant.
+Four of these budgets are process-wide server flags. Each default is the
+compiled-in value. All four are process-wide, not per-tenant.
 
 | Flag | Reaches | Default |
 |---|---|---|
@@ -272,10 +269,9 @@ per-tenant.
 | `--sql-max-query-bytes <BYTES>` | `SqlConfig::max_query_bytes` (per-query SQL memory pool) | 256 MiB |
 | `--sql-tenant-max-bytes <BYTES>` | per-tenant SQL memory ceiling | 1 GiB |
 
-`--fetch-concurrency` is a single knob with three coupled effects, **not**
-decoupled by this change: it governs the PromQL/analytics per-query segment
-fetch fan-out, the SQL scan partition count (`target_partitions`), and
-object-store GET concurrency.
+`--fetch-concurrency` is a single knob with three coupled effects: it governs
+the PromQL/analytics per-query segment fetch fan-out, the SQL scan partition
+count (`target_partitions`), and object-store GET concurrency.
 Raising it widens all three together; size it against the host's cores and the
 store's request budget.
 
@@ -290,14 +286,13 @@ raise this flag for such a workload.
 concurrent SQL queries (the multi-tenant isolation ceiling, defaulting to four
 times the per-query pool). Both apply only in a build with the `sql` feature.
 Per-tenant SQL budgets are **not** configurable in the `--limits-file`: its
-per-tenant query overrides have no per-tenant `EngineConfig` lookup at query
-time today and are inert, so these ceilings are process-wide flags
-until that gap closes.
+per-tenant query overrides are not consulted at query time and are inert, so
+these ceilings are process-wide flags.
 
 `max_bytes_scanned` is **not** a flag. It stays a `--limits-file` entry
 (`query_defaults.max_bytes_scanned`, default Unlimited); see
 [admission-limits.md](admission-limits.md). `--max-s3-requests`
-remains a flag; omitted, it is derived from `--shards` and the flush cadence.
+is a flag; omitted, it is derived from `--shards` and the flush cadence.
 
 `--gc-max-query-duration` sets the engine's enforced wall-clock deadline. It
 must be **`<=`** the tenant's durable `sys/gc.max_query_duration` (default 1h).
@@ -354,8 +349,8 @@ up within 60s. Querying a column that is not a typed attribute column is an
 unknown-column error, and a
 row whose stored value has another type reads NULL rather than being cast.
 
-A predicate on a typed attribute column now prunes blocks before decode, so
-it is no longer slower than the equivalent `attrs['k']` filter. A selective
+A predicate on a typed attribute column prunes blocks before decode, so it is
+no slower than the equivalent `attrs['k']` filter. A selective
 `i64`/`bool` comparison, `BETWEEN`, or `i64` `IN (...)` skips blocks through the
 RLOG skip index (`status_code > 500`, `is_active = true`, `status_code IN (200,
 404)`), and a `str`/`bytes` equality prunes through POSTINGS exactly like
@@ -363,12 +358,12 @@ RLOG skip index (`status_code > 500`, `is_active = true`, `status_code IN (200,
 re-applied above the scan, so the `IN` envelope's coarser range and any
 type-mismatched shape (`!=`, a range on a `str` column, a float compared to an
 `i64` column) never change which rows return, only which blocks the fetch reads.
-Two caveats carry over unchanged: the `str`/`bytes` equality half sees no
-pruning benefit on a POSTINGS section written before the write-path fix, and
-a name that also carries a non-`str` column anywhere declines equality pruning
-for that name. See
-[operations.md](operations.md#declared-typed-attribute-columns-adr-0090) and
-docs/query-engine.md for the full contract.
+Two caveats: the `str`/`bytes` equality half sees no pruning benefit on an
+object whose POSTINGS section predates the current writer, and a name that
+also carries a non-`str` column anywhere declines equality pruning for that
+name. See
+[typed attribute columns](operations/configuration.md#typed-attribute-columns)
+and [the query engine spec](../query-engine.md) for the full contract.
 
 ### Declaring typed attribute columns
 
@@ -394,7 +389,7 @@ in order:
    `bytes`). A resource (stream-level) key is legitimately declarable because a
    typed attribute column reads the merged resource+scope+record attribute view. An
    `f64`-typed entry is **skipped with a per-key warning** (there is no `f64`
-   typed attribute column type yet); the rest are still written. A key declared twice,
+   typed attribute column type); the rest are still written. A key declared twice,
    or a key colliding with a fixed logs column name, is rejected and nothing is
    written.
 
@@ -447,10 +442,11 @@ source sets the same key, the value from the record wins.
 
 A key that no record carries returns zero rows. It is not an error.
 
-Attribute equality does not prune which objects Ravel reads. The engine
-reads the objects that the `ts` range selects, then applies the attribute
-filter to the decoded records. A filter on `ts`, or a `has_word` content
-search, does prune the read.
+Attribute equality does not change which objects Ravel reads: the `ts` range
+selects them. Inside an object, an equality on an indexed field or a typed
+attribute column prunes blocks through the POSTINGS index before decode, and
+`has_word` prunes through the token bloom filter; any other attribute
+predicate is applied to the decoded records.
 
 Log rows are at-least-once, and a `SELECT` (or `COUNT(*)`) reflects that. A
 client retry after a lost ack re-ingests the batch, and unlike metrics there

@@ -193,8 +193,8 @@ what is in MinIO. See
 [kill the server, keep the data](../../README.md#kill-the-server-keep-the-data).
 
 The claim it proves is specific to strict acknowledgement, which is the default.
-Buffered acknowledgement, per tenant or per request, returns before the flush
-and carries no commit token, so a crash loses its buffered window. The
+Buffered acknowledgement, opt-in per request, returns before the flush and
+carries no commit token, so a crash loses its buffered window. The
 [consistency model](../consistency-model.md#acknowledgement-semantics) is
 normative for both.
 

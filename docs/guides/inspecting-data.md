@@ -1,9 +1,11 @@
 # Inspecting data
 
 `ravel-cli` reads segments and commit records directly from the object
-store. Nothing here needs `ravel-server` running. The examples below run
-against the bucket that `make demo` writes to
-([docs/guides/getting-started.md](getting-started.md)). Every command
+store. Nothing here needs `ravel-server` running. No published image carries
+`ravel-cli`: build it from source with `cargo build -p ravel-cli --release`,
+which leaves the binary at `target/release/ravel-cli`, and the examples below
+invoke it as `ravel-cli`. They run against the bucket that `make demo` writes
+to ([getting started](getting-started.md#building-from-source)). Every command
 needs the same store flags:
 
 ```sh
@@ -30,8 +32,8 @@ default posture it is a keyed hash: a fresh bucket refuses to start unless the
 server either names a deployment key with `--tenant-hash-key-file` or opts out
 with `--tenant-hash-unkeyed`, which selects the plain unkeyed hash instead. The
 bucket pins the choice permanently on first use. `m` is the signal
-letter for metrics; logs use `l` and spans use `s`, and all three are
-implemented. Logs have their own RLOG object format and an `rlog inspect`
+letter for metrics; logs use `l` and spans use `s`. Logs have their own RLOG
+object format and an `rlog inspect`
 walkthrough further down this guide; spans have the RSPAN format
 ([span-segment-format.md](../span-segment-format.md)) and a SQL
 query path over the `spans` table. `shard` is
@@ -43,7 +45,7 @@ bucket.
 ## `catalog list`: what's visible right now
 
 ```sh
-cargo run -p ravel-cli -- catalog list --tenant demo-tenant --hours 1
+ravel-cli catalog list --tenant demo-tenant --hours 1
 ```
 
 ```
@@ -63,11 +65,11 @@ key to feed into `segment inspect` or `commit decode`.
 
 ![RSEG layout](../diagrams/rseg-layout.svg)
 
-Every segment is RSEG v7. Ravel supports one segment version at a time,
-and the current version moved from v6 to v7. The command is:
+Every segment is RSEG v7; Ravel supports one segment version at a time. The
+command is:
 
 ```sh
-cargo run -p ravel-cli -- segment inspect \
+ravel-cli segment inspect \
   "t/c5c5.../m/l0/0000/6a9c....rseg"
 ```
 
@@ -121,9 +123,8 @@ Field by field:
   the very end gives the footer's length and checksum. A reader therefore
   needs one suffix GET to find and validate the footer before it fetches
   anything else.
-- `version`: the trailer format version, always `7`. A non-7 version (a
-  stray pre-release object, including a retired v6) gets a typed error; Ravel
-  never half-parses it.
+- `version`: the trailer format version, always `7`. A non-7 version gets a
+  typed error; Ravel never half-parses it.
 - `tenant_hash`, `shard`, `writer_id`, `writer_epoch`, `writer_seq`: the
   identity components embedded in the object's key and its commit token. They
   let you confirm that a segment and a commit token or record agree on what
@@ -178,17 +179,16 @@ Field by field:
 ## `rlog inspect`: what's inside one log segment
 
 Log data lives in RLOG objects (`.rlog`), the columnar log segment format
-(docs/log-segment-format.md; trailer version 4). RLOG is
-a sibling of RSEG. It shares the same 16-byte trailer, protobuf footer, and
-crc32c discipline, but it has its own sections and none of the bytes. Ingest, query, and lifecycle all run today: the production ingest path writes
-RLOG objects through `ravel-ingest`'s log shard, the `logs` SQL table on
-`POST /api/v1/sql` reads them back, and `ravel-maintain` compacts and retains
-them. The walkthrough below drives the writer directly (in tests and
-tooling), not through the ingest path, to show the format in isolation. The
-command is:
+([docs/log-segment-format.md](../log-segment-format.md), trailer version 4).
+RLOG is a sibling of RSEG: it shares the 16-byte trailer, the protobuf footer,
+and the crc32c discipline, and has its own sections. The ingest path writes
+RLOG objects, the `logs` SQL table on `POST /api/v1/sql` reads them back, and
+maintenance compacts and retains them. The object below was written directly
+by the format's writer, not through the ingest path, to show the format in
+isolation. The command is:
 
 ```sh
-cargo run -p ravel-cli -- rlog inspect "t/abab.../l/l0/0000/....rlog"
+ravel-cli rlog inspect "t/abab.../l/l0/0000/....rlog"
 ```
 
 ```
@@ -234,10 +234,8 @@ field_dir (2 entry(ies)):
 Field by field:
 
 - `total_size`, `version`, `signal`: the byte length of the object, the
-  trailer format version (currently `4`; the reader accepts exactly this one
-  version, and anything else, including a retired version 3, gets a typed
-  error), and the signal
-  byte (`2` = logs). Like
+  trailer format version (`4`; the reader accepts exactly this one version,
+  and anything else gets a typed error), and the signal byte (`2` = logs). Like
   RSEG, the object is footer-first-readable. The 16-byte trailer at the end
   gives the footer's length and crc. A reader therefore validates the footer
   in one suffix GET before it fetches anything else.
@@ -257,10 +255,10 @@ Field by field:
 - `sections`: the mandatory sections and their byte ranges. `kind=1`
   `STREAM_DIR` (stream_id to canonical resource+scope blob and block range),
   `kind=2` `FIELD_DIR` (dynamic attribute columns), `kind=3` `BLOCKS` (the
-  columnar row blocks, in row groups since version 4), `kind=4` `SKIP_IDX`
+  columnar row blocks, in row groups), `kind=4` `SKIP_IDX`
   (the multi-level min/max index), `kind=8` `PAGE_DIR` (per row group, per
-  column chunk, per page: offset, length, encoding, and crc32c -- version 4
-  only), `kind=5` `BLOOM` (per-block token blooms). `kind=6` `POSTINGS` is
+  column chunk, per page: offset, length, encoding, and crc32c),
+  `kind=5` `BLOOM` (per-block token blooms). `kind=6` `POSTINGS` is
   optional and present here because the object declared an indexed field.
   STREAM_DIR, FIELD_DIR, SKIP_IDX, and PAGE_DIR use whole-section zstd
   (`comp=zstd`). BLOCKS and BLOOM are containers that a reader reads entry by
@@ -269,7 +267,7 @@ Field by field:
   `offset` (into BLOCKS) and `len`, the `crc32c` that the reader verifies
   before it decodes the block, `record_count`, and the block's `ts_range` and
   `stream_ref_range` (both inclusive). The skip index prunes on those two
-  ranges. Since trailer v4 `offset` and `len` describe the block's
+  ranges. `offset` and `len` describe the block's
   *page span* rather than a contiguous block: the pages of a row group are
   stored column-major, so consecutive blocks' spans overlap and the `crc32c`
   covers the block's pages concatenated in column-id order rather than a
@@ -281,7 +279,7 @@ Field by field:
   are the bit pattern that the min/max are stored as: two's complement for
   i64, and `to_bits` for f64, so f64 comparison is bit-exact. In the example,
   both blocks carry column 10 (`code`), an i64 attribute. The string column
-  `svc` is not numeric and so has no stat. Since trailer v3 a stat
+  `svc` is not numeric and so has no stat. A stat
   bounds the value each row *resolves* for the column's attribute name, not
   whatever sits in the column's value page. Resolution is what a query sees:
   the record's resource and scope attributes, overridden by the record's own,
@@ -314,7 +312,7 @@ checksums.
 ## `commit decode`: what a commit record says
 
 ```sh
-cargo run -p ravel-cli -- commit decode \
+ravel-cli commit decode \
   "t/3f2a.../m/c/0000/20251127T18/6a9c....cmt"
 ```
 
@@ -355,7 +353,7 @@ by.
 ## `idem inspect`: what an idempotency marker says
 
 ```sh
-cargo run -p ravel-cli -- idem inspect \
+ravel-cli idem inspect \
   "t/3f2a.../l/idem/9a1c....0495972.idm"
 ```
 

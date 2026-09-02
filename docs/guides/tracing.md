@@ -65,7 +65,7 @@ instant and a range variant); the span name is the same at both.
 | `decode` | decompressing those pages | `ravel_query` | `page_kind`, `series_count`, `decompressed_bytes` |
 | `evaluate` | evaluating over fetched data | `ravel_query` | `eval_kind` |
 
-Field notes, all verified against the fields the code records:
+Field notes:
 
 - `catalog_resolve` records `s3_requests`, `s3_bytes`, and `segments_pruned`
   as the delta this resolve alone added to the query's accounting, not the
@@ -154,34 +154,9 @@ signals combine.
 - `evaluate` carries no counts. Time spent there with small fetch counts means
   the query is evaluation-bound, not store-bound.
 
-### The acceptance test as a runnable illustration
-
-The end-to-end test that proves all six phase spans fire on a real query is a
-runnable illustration of the span set and its fields:
-
-```sh
-cargo test -p ravel-query --test e2e instant_query_emits_all_six_phase_spans -- --nocapture
-```
-
-`instant_query_emits_all_six_phase_spans` runs an instant query through the
-full HTTP handler and asserts that `catalog_resolve`, `segment_open`,
-`catalog_decode`, `page_fetch`, `decode`, and `evaluate` each fire at least
-once. It captures spans with a custom `tracing` layer rather than printing
-them, so it verifies the phase set exists; it does not dump durations to the
-console.
-
-The per-span byte accounting that makes phase attribution meaningful is proven
-by a second test in the same file:
-
-```sh
-cargo test -p ravel-query --test e2e segment_open_span_bytes_are_per_segment_not_the_shared_query_total -- --nocapture
-```
-
-It opens three segments concurrently and asserts each `segment_open` span
-records only its own segment's GET bytes, and that the per-segment bytes sum to
-no more than the query's authoritative total. This is why a `segment_open`
-span's `s3_bytes` can be trusted to attribute one segment's I/O rather than the
-whole query's.
+A `segment_open` span records only its own segment's GET bytes, and the
+per-segment bytes sum to no more than the query's authoritative total, so its
+`s3_bytes` attributes one segment's I/O rather than the whole query's.
 
 ## OTLP trace export
 
@@ -226,7 +201,7 @@ Each exported span carries two resource attributes:
   literal `operator`.
 
 Together they distinguish spans from a fleet in the collector the same way
-`/metrics` scrapes are distinguished today.
+`/metrics` scrapes are distinguished.
 
 ### Best-effort, never blocking
 
@@ -252,8 +227,8 @@ a query.
   enter/close lines with wall-clock durations by default; span fields surface
   as context on events emitted within a span. Reading raw phase durations off
   a running process requires a subscriber configured to emit span-close
-  events. The programmatic capture in the acceptance test is the supported way
-  to observe the span set and its recorded count fields today.
+  events, which the OTLP export above provides: a collector receives every
+  span with its duration.
 
 ## Background
 

@@ -22,9 +22,8 @@ Exemplars are stored only from OTLP ingest. Remote Write and OTAP decode any
 exemplars a request carries and then discard them, so a metric ingested over
 those paths has none, whatever the sender attached.
 
-Ravel stores exemplars in the RSEG `EXEMPLARS` section (kind 10). The section
-was added in RSEG v6 and is unchanged in the current v7.
-Each object holds at most one `EXEMPLARS`
+Ravel stores exemplars in the RSEG `EXEMPLARS` section (kind 10). Each object
+holds at most one `EXEMPLARS`
 section. The section is present only when at least one sample in the object
 carried an exemplar. Absence is always legal and means the object has no
 exemplars.
@@ -44,7 +43,7 @@ records must key on every field that it would otherwise lose.
 To see the stored exemplars in one object, run the segment inspector.
 
 ```sh
-cargo run -p ravel-cli -- segment inspect "t/.../m/l0/0000/....rseg"
+ravel-cli segment inspect "t/.../m/l0/0000/....rseg"
 ```
 
 The inspector prints the section-level count and one line per record. Each
@@ -79,10 +78,8 @@ The ingest metrics hold two counters. The `exemplars_written_total` counter
 counts stored exemplars. The `exemplars_dropped_total` counter counts dropped
 exemplars. If the cap engages, the `exemplars_dropped_total` counter rises.
 
-`GET /metrics` does not expose these two counters yet. The server renders
-the ingest family from `IngestPipelineSnapshot`, and that structure carries
-no exemplar field. An operator therefore cannot see the cap engage from
-outside the process. Until that lands, read the drop count from the flush
+`GET /metrics` does not expose these two counters, so an operator cannot see
+the cap engage from outside the process. The drop count appears in the flush
 logs.
 
 ## How to query exemplars

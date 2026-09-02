@@ -1,7 +1,7 @@
 # Disaster recovery runbook
 
 Normative. This runbook defines Ravel's disaster-recovery posture: three
-operator-owned configuration tiers, the platform-CLI controls each requires, a
+operator-owned configuration levels, the platform-CLI controls each requires, a
 deliberate verified restore procedure, and the rehearsal record from which the
 only published recovery numbers come.
 
@@ -24,9 +24,9 @@ proven by a rehearsed restore. Object storage remains the only durable
 backend; the replica is written by the platform's replication channel, never
 by a Ravel process.
 
-## What every tier requires, before any of them
+## What every level requires, before any of them
 
-Independent of the disaster-recovery tier below, the bucket-protection
+Independent of the disaster-recovery level below, the bucket-protection
 contract in
 [object-store-contract.md](../object-store-contract.md#required-bucket-configuration-adr-0064-7-adr-0072-decision-3)
 asks for Object Lock in **compliance mode** on the protected prefixes,
@@ -52,13 +52,13 @@ clean. The flag is off by default, so an existing deployment is unchanged
 until an operator turns it on. Enforcement itself stays at the bucket and IAM
 layer either way: nothing in a Ravel process can configure Object Lock.
 
-What the tiers below add on top of that baseline is replication, and, at level
-2, **bucket-default** retention across every prefix including the data
+What the levels below add on top of that baseline is replication, and, at
+level 2, **bucket-default** retention across every prefix including the data
 objects. That last one is the choice with an erasure cost.
 
-## The three tiers
+## The three levels
 
-Each tier states its erasure-bound consequence next to its protection. This
+Each level states its erasure-bound consequence next to its protection. This
 disclosure is load-bearing, not a footnote: turning on versioning and
 bucket-wide Object Lock extends the physical erasure bound, and the tension
 between disaster recovery and the erasure guarantee is resolved by stating
@@ -179,7 +179,7 @@ aws s3api get-bucket-replication --bucket <primary>
 aws s3api get-bucket-versioning --bucket <replica>
 aws s3api get-bucket-lifecycle-configuration --bucket <replica>
 
-# Object Lock: compliance mode on the protected prefixes at every tier,
+# Object Lock: compliance mode on the protected prefixes at every level,
 # and the bucket-default retention D that makes it level 2
 aws s3api get-object-lock-configuration --bucket <primary>
 ```
@@ -211,7 +211,7 @@ verified operation.
    content-addressed, so every replicated object is bit-identical to its
    original; the only skew is presence or absence.
 3. **Reconcile to a consistency point.** This repairs replication's lack of
-   ordering, using tools that all exist today:
+   ordering, with three shipped tools:
    - `ravel-cli maintain verify-custody`, in its versioning-aware mode, finds
      **dangling commit records**: record replicated, data object not.
      Quarantine each (delete under the restore credential, with maintenance
@@ -314,15 +314,15 @@ oracle failure that script names the failed assertions and exits 2, distinct
 from 1 for an ordinary failure and from anything above 2 for a setup or usage
 error, so the distinction is legible in a rehearsal record.
 
-Record each real run here under the same discipline as the table above. An
-executor with no MinIO can only produce the `--check` result, which is not a
-rehearsal record: a real end-to-end run against MinIO is what fills a row.
+Record each real run here under the same discipline as the table above. A run
+without MinIO can only produce the `--check` result, which is not a rehearsal
+record: a real end-to-end run against MinIO is what fills a row.
 
 ## Summary
 
-| Tier | Controls | Erasure-bound consequence | RPO/RTO |
+| Level | Controls | Erasure-bound consequence | RPO/RTO |
 |---|---|---|---|
-| **Every tier** | Object Lock compliance mode on `sys/`, provisioning records, commit records and catalog HEAD history, paired with versioning; `--require-bucket-protection` to gate startup on it | None; those prefixes hold no erasable subject value | Not a recovery control |
+| **Every level** | Object Lock compliance mode on `sys/`, provisioning records, commit records and catalog HEAD history, paired with versioning; `--require-bucket-protection` to gate startup on it | None; those prefixes hold no erasable subject value | Not a recovery control |
 | **level 0** (default) | No replication | None; bounds as in consistency-model.md | None; bucket loss is total loss |
 | **level 1** (recommended) | Primary: versioning + `NoncurrentDays = E_v` + expired-delete-marker cleanup. Replica: different region/account/KMS key, replication v2 with `DeleteMarkerReplication`, RTC recommended, `NoncurrentDays = E_v_r` | Primary `+E_v`; replica residue is replication lag + `E_v_r` (requires `DeleteMarkerReplication`) | Defined here; **unmeasured** until a rehearsal record exists. RTC gives RPO a 15-minute ceiling; without RTC, unbounded |
 | **level 2** (optional) | level 1 plus bucket-default Object Lock retention `D` across every prefix | `max(bound, D)`; query-time exclusion still immediate | As level 1 |

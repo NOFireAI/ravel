@@ -16,8 +16,9 @@ that change any behavior described here are in
 ## Listeners and authentication
 
 `ravel-server` serves HTTP on one listener (`--listen-http`, default
-`127.0.0.1:4318`). OTLP metrics ingest is also served over gRPC on a second
-listener (`--listen-grpc`); this page documents the HTTP surface only.
+`127.0.0.1:4318`). OTLP ingest for metrics, logs, and traces is also served
+over gRPC on a second listener (`--listen-grpc`); this page documents the HTTP
+surface only.
 
 A tenant-scoped route resolves the request to a tenant before it does any work.
 The default resolver is a static bearer-token map (`--tenant-token`); a
@@ -41,8 +42,8 @@ by default: a 2xx means the data object and its commit record are durably
 stored. On a strict acknowledgement the OTLP responses carry an
 `x-ravel-commit-token` header, a comma-separated token per shard the request
 flushed through, which a later query replays as `min_commit_token` for
-read-your-write. Buffered acknowledgement is opt-in per tenant or per request on
-the OTLP routes only.
+read-your-write. Buffered acknowledgement is opt-in per request, with the
+`x-ravel-ingest-mode: buffered` header, on the OTLP routes only.
 
 The request body limit is 16 MiB on the wire and 64 MiB after decompression, on
 every ingest route. OTLP HTTP accepts an absent, identity, or single `gzip`
@@ -195,5 +196,5 @@ per-tenant labels on the admission and query families are opt-in
 - OTAP (OpenTelemetry Arrow Protocol) metrics ingest is a gRPC service that
   needs both the `otap` cargo feature and the `--otap` runtime flag. No published
   image builds it.
-- OTLP metrics ingest is additionally available over gRPC on the gRPC listener;
-  this page documents the HTTP form.
+- OTLP ingest for metrics, logs, and traces is additionally available over
+  gRPC on the gRPC listener; this page documents the HTTP form.

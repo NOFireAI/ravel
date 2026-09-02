@@ -2,9 +2,9 @@
 
 ## Endpoints
 
-`ravel-server` accepts OTLP metrics and logs on two transports. `--listen-http`
-(default `127.0.0.1:4318`) and `--listen-grpc` (default `127.0.0.1:4317`) bind
-them:
+`ravel-server` accepts OTLP metrics, logs, and traces on two transports.
+`--listen-http` (default `127.0.0.1:4318`) and `--listen-grpc` (default
+`127.0.0.1:4317`) bind them:
 
 - `POST /v1/metrics` over HTTP, body is a binary-encoded
   `ExportMetricsServiceRequest` (`Content-Type: application/x-protobuf`).
@@ -14,16 +14,18 @@ them:
   `ExportLogsServiceRequest` (`Content-Type: application/x-protobuf`).
   Responds with a binary `ExportLogsServiceResponse`.
 - `opentelemetry.proto.collector.logs.v1.LogsService/Export` over gRPC.
+- `POST /v1/traces` over HTTP, body is a binary-encoded
+  `ExportTraceServiceRequest` (`Content-Type: application/x-protobuf`).
+- `opentelemetry.proto.collector.trace.v1.TraceService/Export` over gRPC.
 
-All four are present only when `ravel-server` runs in `--mode all` (the
-default) or `--mode gateway`. `--mode query` starts none of them.
+All six are present only when `ravel-server` runs in `--mode all` (the
+default) or `--mode gateway`. `--mode query` starts none of them. No
+transport accepts profiles.
 
 Authentication, the strict/buffered mode header, the commit-token
-header, and the status-code mapping are identical on all four. A log export
-is a metrics export with a different payload and a different keyspace
-underneath. Traces are also ingested, over the same two transports: `POST
-/v1/traces` over HTTP and `opentelemetry.proto.collector.trace.v1.TraceService/Export`
-over gRPC. No transport accepts profiles yet.
+header, and the status-code mapping are identical on all six. A log or trace
+export is a metrics export with a different payload and a different keyspace
+underneath.
 
 ## Compressed requests
 
@@ -146,11 +148,11 @@ Every write has a mode. The default is strict:
   loses that buffered window, bounded by `max_flush_delay` (2s default).
   Ravel issues no commit token, because there is nothing yet to point one at.
 
-To use buffered mode for one request, send `x-ravel-ingest-mode: buffered` on
-an HTTP export. For strict mode, omit it or send any other value. Today Ravel
-honors this header for any tenant with no additional gate. The ingest design
-doc describes a gate on buffered mode per tenant config, but that gate is not
-implemented yet.
+To use buffered mode for one request, send `x-ravel-ingest-mode: buffered` as
+an HTTP header or as gRPC metadata on the export. For strict mode, omit it or
+send any other value. Ravel honors
+the header for any tenant; there is no per-tenant setting that enables or
+refuses buffered mode.
 
 ## Partial success and rejections
 
@@ -238,7 +240,7 @@ that predates your write.
 
 ## Admission limits
 
-Defaults. `ravel-server` flags cannot currently configure them:
+Defaults. No `ravel-server` flag configures them:
 
 | Limit | Default |
 |---|---|
@@ -308,17 +310,16 @@ that flushed, exactly like a metrics export. An unresolvable tenant returns
 pipeline cannot accept returns `503`.
 
 Log records are durable in RLOG objects under the tenant's `l` keyspace after
-the strict ack returns. **Logs are queryable via SQL**: the `logs` table is
-registered on the `POST /api/v1/sql` endpoint (ravel-sql's `LOGS_TABLE`), and
+the strict ack returns. **Logs are queryable over SQL**: the `logs` table is
+registered on the `POST /api/v1/sql` endpoint, and
 [query.md](query.md#sql-over-samples-logs-and-spans) documents its schema and usage.
-PromQL does not query logs: `ravel-promql` has no logs-reading path, so log
-data is reachable only through SQL. You can also read a log object back
-directly with `ravel-cli rlog inspect`
+PromQL does not query logs, so log data is reachable only through SQL. You can
+also read a log object back directly with `ravel-cli rlog inspect`
 ([inspecting-data.md](inspecting-data.md)).
 
 ### Log admission limits
 
-Defaults. `ravel-server` flags cannot currently configure them:
+Defaults. No `ravel-server` flag configures them:
 
 | Limit | Default |
 |---|---|
@@ -386,7 +387,7 @@ signal:
 ravel-cli load --parquet events.parquet --tenant acme --mapping map.toml --shards 4
 ```
 
-The loader is an in-process caller of the same `LogIngestRouter` OTLP uses --
+The loader is an in-process caller of the same log ingest router OTLP uses --
 the same shard actors, flush cadence, and commit protocol, not a parallel write
 path. It builds the router against the target tenant's provisioned shard count
 (validated against, or written to, the durable provisioning record exactly as
@@ -398,9 +399,9 @@ buffered-but-unflushed data.
 
 The Parquet a load reads is already columnar, and the RLOG object it writes is
 columnar too. The loader builds the storage-native columnar batch directly from
-each Arrow `RecordBatch` and hands it to the router through `write_columnar`,
-skipping the per-row `NormalizedLogRecord` pivot the record path builds and the
-per-row gather the writer runs to undo it. Every Arrow downcast and the
+each Arrow `RecordBatch` and hands it to the router as a column batch,
+skipping the per-row record pivot the record path builds and the per-row
+gather the writer runs to undo it. Every Arrow downcast and the
 `ts_unit` scaling are resolved once per column, stream identity is hashed once
 per distinct resource-attribute tuple rather than once per row, and admission
 checks (future skew, the length caps) are applied over whole columns while still
@@ -464,20 +465,20 @@ for 2024-05-16 is the integer `19876`.
   does not reach today's bucket, so the record would be permanently
   undiscoverable.
 - **Length caps (attribute key length, attribute value length, body length):
-  kept**, re-implemented identically to `ravel-otlp`'s `logs_limits.rs`. These
+  kept**, identical to the OTLP path's. These
   bound field sizes regardless of who is sending; the offline/trusted framing
   does not change that.
 - **Past-event-time lag: relaxed (not enforced).** A backfill or migration needs
   its real event times, and rewriting them would corrupt the source semantics
   this path exists to preserve. This is sound because a record buckets by the
-  *flush-open wall clock* (`checked_ingest_hour_bucket`), not by its event time,
+  *flush-open wall clock*, not by its event time,
   so an old-event record still lands in today's ingest-hour bucket. Its
   *discoverability* then depends on the query's listing window reaching that
   bucket: a caller querying with a normal `start`/`end` window already does,
   since that window is compared against event-range overlap and the listing
   upper bound is `now + max_future_skew` (which reaches today's bucket). See
-  `docs/consistency-model.md` "Late and skewed data" for the paired
-  admission/discoverability bound this relies on. **Query bulk-loaded data with
+  [late and skewed data](../consistency-model.md#late-and-skewed-data) for the
+  paired admission/discoverability bound this relies on. **Query bulk-loaded data with
   a window that reaches now, not just the records' event times.**
 - **Per-record attribute cap: relaxed** from OTLP's 128 to a loader-specific
   1024. Bulk import is an operator-initiated, offline action over a file the
@@ -489,7 +490,7 @@ for 2024-05-16 is the integer `19876`.
   over the 1024 cap is rejected; a row within it whose columns push the object
   past 1000 distinct columns is not -- its overflow columns fold into
   `attrs_raw`.
-- **Per-tenant `AdmissionController` (active-stream cap, stream-creation rate,
+- **Per-tenant admission control (active-stream cap, stream-creation rate,
   byte rate): bypassed by construction.** This control lives in the server's
   HTTP layer, above the router the loader calls directly. The loader does not go
   through it, and there is no equivalent concept for a single offline bulk load.

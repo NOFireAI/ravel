@@ -28,14 +28,13 @@ covers, in the order that costs the least to use:
 2. **Shard count** ([shard-overrides.md](shard-overrides.md)): linear in
    shards, and the primary per-tenant, operator-facing cost control. Cutting
    a tenant from 4 shards to 1 is a 4x reduction in that tenant's ingest PUTs
-   and read-side LIST cost. A tenant's shard count no longer has to equal the
+   and read-side LIST cost. A tenant's shard count does not have to equal the
    deployment-wide default once it has a provisioning record: lowering the
    global default is a new-tenant-only change and does not require touching
    any already-onboarded tenant.
 3. **Flush cadence** (`--max-flush-delay`, `--max-flush-delay-idle`,
    `--min-flush-bytes` on `ravel-server`): the shipped default is
-   2s / 40s / 256KiB, a 4x reduction from the earlier 500ms / 10s / 64KiB
-   defaults. This is the lever of last resort because, unlike the first two,
+   2s / 40s / 256KiB. This is the lever of last resort because, unlike the first two,
    it costs strict-mode acknowledgement latency directly: a strict export
    waits for the configured `max_flush_delay` plus two PUT round trips before
    its ack returns. The three knobs must move together (raising one alone does
@@ -46,38 +45,18 @@ covers, in the order that costs the least to use:
    documented OTLP export timeout of 5s minus an assumed 2s PUT tail). A value
    that violates either is refused at startup, not silently accepted.
 
-## Measured effect of the cadence default
+## What the cadence costs
 
-Measured locally with `cargo run --release -p ravel-bench --bin ingest_bench
--- --store memory --shards 4 --target-series 50000 --points-per-sec 50000
---duration-secs 30 --batch-size 200 --max-inflight-flushes 1
---flush-delay-policy fixed`, comparing the earlier defaults
-(500ms/10s/64KiB) against the shipped defaults (2s/40s/256KiB), same
-workload, in-memory store. The in-memory store isolates the ingest pipeline's
-own flush behavior from real object-store latency, which is what this
-comparison needs to measure: a request-count reduction is a property of flush
-cadence, not of the backing store.
-
-| | Before (500ms) | After (2s) | Change |
-|---|---|---|---|
-| Flushes (30s window) | 200 | 60 | 3.33x fewer |
-| Estimated PUTs | 400 | 120 | 3.33x fewer |
-| Ack latency p99 | 616.7ms | 2174.4ms | 3.5x higher |
-| Write amplification | 3.44x | 2.16x | lower (fewer, larger objects) |
-
-The measured reduction (3.33x) is close to but under the steady-state 4x
-estimate: a fixed 30-second window ends mid-interval for the slower cadence,
-undercounting its flush count relative to a true steady-state rate. A
-longer-duration run converges closer to 4x. The ack-latency increase is the
-direct, expected, and accepted cost of this decision. Durability itself is
-unchanged: a strict-mode ack still only returns once the commit PUT that
-makes the write durable has landed.
-
-The full committed S3 cost-per-request benchmark (dollar cost against real
-S3 or MinIO, not just PUT count) is tracked separately. Request-count
-reduction is a property of the ingest pipeline alone and is measured here
-without needing real object storage, but a real dollar-cost figure needs a
-real backend and is out of this guide's scope.
+Lengthening `max_flush_delay` by a factor divides the fast-tier PUT rate by
+about that factor, because every flush is two PUTs and a buffer that reaches
+neither `min_flush_bytes` nor a strict waiter flushes on age alone, and it
+raises strict-mode acknowledgement latency by up to the added delay: a strict
+export waits for the flush trigger plus two PUT round trips. Fewer, larger
+objects also lower write amplification. Durability is unchanged at any
+setting: a strict-mode ack still returns only once the commit PUT that makes
+the write durable has landed. The request-count reduction is a property of
+the ingest pipeline alone and holds on any backend; a dollar figure needs the
+backend's own price sheet, which the read-side section below applies.
 
 ## Predicting your bill
 
@@ -120,8 +99,7 @@ b < k * request_cost
 
 `--logs-request-cost-bytes <BYTES>` on `ravel-server` is that `request_cost`:
 one saved object-store round trip is worth this many saved transfer bytes.
-Unset, it takes the built-in default of 1,887,437 bytes (about 1.8 MiB), so an
-unset deployment behaves exactly as it did before the flag existed. That
+Unset, it takes the built-in default of 1,887,437 bytes (about 1.8 MiB). That
 default is a latency-bandwidth product: the transfer volume whose time, at one
 in-region S3 configuration's single-stream bandwidth, equals one request's
 round-trip latency, measured on one instance type at one fetch-permit count.
@@ -137,8 +115,7 @@ that reason.
 
 The setting never changes a query's answer. It selects which read path fetches
 the bytes; the rows returned are identical at every value, and only request
-counts, byte counts, and timing differ, pinned by a whole-versus-ranged
-row-equality test.
+counts, byte counts, and timing differ.
 
 ### Why one knob and not three
 
@@ -182,18 +159,18 @@ production query volume, not as cents.
 
 The measured example is the ClickBench corpus (42 statements, cold, reference
 box, with the pass procedure in
-[clickbench-aws-runbook.md](../internal/clickbench-aws-runbook.md)). Turning on projection
-routing moved:
+[clickbench-aws-runbook.md](../internal/clickbench-aws-runbook.md)). Reading
+every segment whole against routing narrow projections to ranged reads:
 
 ```text
-cold requests   203,243 -> 751,409    (+270%)
-cold bytes       403.97 -> 194.19 GB  (-52%)
+cold requests   203,243 whole    751,409 ranged    (+270%)
+cold bytes       403.97 GB whole  194.19 GB ranged  (-52%)
 ```
 
-Half the bytes and 3.7x the requests. The same pass finished faster despite the
-extra requests, landing at 222.19 s cold. Modeled at us-east-1 list prices that
-pass costs about 2.2x more in request charges than it did before, and it is
-faster.
+Half the bytes and 3.7x the requests. The ranged pass finished faster despite
+the extra requests, at 222.19 s cold. Modeled at us-east-1 list prices it
+costs about 2.2x more in request charges than the whole-object pass, and it
+is faster.
 
 Both of those can be true at once because of an asymmetry in the price sheet:
 same-region S3-to-EC2 transfer is not billed, so on that deployment shape
@@ -240,11 +217,11 @@ from an `EXPLAIN ANALYZE`, beside the per-operation request and byte counts. A
 large ranged-open share on statements that move few bytes, on a backend that
 bills requests, is the signal that this value is set for the wrong objective.
 
-The cost-preferring setting has no published ClickBench triple yet: the figures
-above measured the routing change, not this flag, and a high value also
-collapses ranged reads on the predicate path that were active on both sides of
-that comparison. Requests should land at or below 203,243 and bytes at or above
-403.97 GB; the measurement, not this guide, gets to say where.
+No ClickBench pass under the cost-preferring setting is published: the figures
+above compare the two read shapes, not this flag, and a high value also
+collapses the ranged reads on the predicate path that were active on both
+sides of that comparison. Such a pass lands at or below 203,243 requests and
+at or above 403.97 GB; the measurement, not this guide, says where.
 
 ## Per-query cost accounting
 
@@ -264,8 +241,8 @@ the actual, never below it. Dividing an actual by its matching estimate gives a
 ratio at or below 1 in the healthy case; a ratio above 1 means the actual
 exceeded the envelope meant to bound it, which rules in either a cost-model gap
 (the estimate omits a real source of spend) or a runaway query pattern the
-model did not anticipate. Nothing in this release rejects a query on that
-envelope. It is measurement only.
+model did not anticipate. Nothing rejects a query on that envelope. It is
+measurement only.
 
 Three gaps limit what the per-query cost family can show:
 
@@ -311,5 +288,4 @@ The two-object commit protocol and request-cost reduction through flush
 cadence and ingest affinity: ADR-0076. Per-query cost accounting and the
 `/metrics` cost family: ADR-0044. The read-side request-cost knob and its
 whole-versus-ranged routing: ADR-0904. The read-side request budget derived
-from shard count and cadence: ADR-0075. Fetch concurrency: ADR-0088. The
-dollar-cost-against-real-storage benchmark is tracked as a separate work item.
+from shard count and cadence: ADR-0075. Fetch concurrency: ADR-0088.
