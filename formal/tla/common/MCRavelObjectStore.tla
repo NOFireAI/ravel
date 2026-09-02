@@ -49,15 +49,25 @@ ASSUME MaxOps \in Nat
 ASSUME NoWrite \notin Content
 
 VARIABLES store, lastModified, versionCounter, uploads, listState,
-          opCount, createWins, lastWritten, lastOp, mpBegin, dedupSet, deliveryCount
+          opCount, createWins, lastWritten, lastOp, mpBegin, dedupSet, deliveryCount,
+          minted, mintCount
 
 INSTANCE RavelObjectStore
 
 mcStoreVars == <<store, lastModified, versionCounter, uploads, listState>>
 opGhosts    == <<opCount, createWins, lastWritten, lastOp, mpBegin>>
 listGhosts  == <<dedupSet, deliveryCount>>
+\* Version-minting ghosts: every version the counter hands out, as a set and
+\* as a count. A reused version (a counter that went backwards) makes the set
+\* smaller than the count. MintGhosts is conjoined to every action that can
+\* move the counter; the others leave both unchanged.
+versionGhosts == <<minted, mintCount>>
+MintGhosts ==
+    /\ minted'    = IF versionCounter' # versionCounter THEN minted \cup {versionCounter'} ELSE minted
+    /\ mintCount' = IF versionCounter' # versionCounter THEN mintCount + 1 ELSE mintCount
 vars == <<store, lastModified, versionCounter, uploads, listState,
-          opCount, createWins, lastWritten, lastOp, mpBegin, dedupSet, deliveryCount>>
+          opCount, createWins, lastWritten, lastOp, mpBegin, dedupSet, deliveryCount,
+          minted, mintCount>>
 
 Outcomes == {"Ok", "AlreadyExists", "PreconditionFailed", "Failure"}
 OpKinds  == {"none", "create", "overwrite", "cas", "delete",
@@ -80,6 +90,8 @@ MCInit ==
     /\ mpBegin = [u \in Clients |-> EmptyRec]
     /\ dedupSet = {}
     /\ deliveryCount = 0
+    /\ minted = {}
+    /\ mintCount = 0
 
 \* --- Mutating client actions (charged against the budget) -------------------
 
@@ -96,6 +108,7 @@ DoCreate(k, c) ==
     /\ opCount' = opCount + 1
     /\ UNCHANGED <<mpBegin>>
     /\ UNCHANGED listGhosts
+    /\ MintGhosts
 
 DoOverwrite(k, c) ==
     /\ opCount < MaxOps
@@ -108,6 +121,7 @@ DoOverwrite(k, c) ==
     /\ opCount' = opCount + 1
     /\ UNCHANGED <<createWins, mpBegin>>
     /\ UNCHANGED listGhosts
+    /\ MintGhosts
 
 \* The client does NOT pre-classify freshness; it calls the operator, which
 \* decides the effect from its own precondition, and records the outcome the
@@ -127,6 +141,7 @@ DoCas(k, v, c) ==
     /\ opCount' = opCount + 1
     /\ UNCHANGED <<createWins, mpBegin>>
     /\ UNCHANGED listGhosts
+    /\ MintGhosts
 
 DoDelete(k) ==
     /\ opCount < MaxOps
@@ -140,6 +155,7 @@ DoDelete(k) ==
     /\ opCount' = opCount + 1
     /\ UNCHANGED <<mpBegin>>
     /\ UNCHANGED listGhosts
+    /\ UNCHANGED versionGhosts
 
 \* TransientFailure: applies nothing, caller observes a retryable Failure.
 DoTransient ==
@@ -152,6 +168,7 @@ DoTransient ==
     /\ opCount' = opCount + 1
     /\ UNCHANGED <<createWins, lastWritten, mpBegin>>
     /\ UNCHANGED listGhosts
+    /\ UNCHANGED versionGhosts
 
 \* LostResponse write: the effect is applied and the caller observes Failure (an
 \* ack loss). The client's write is durable, so lastWritten records it. The
@@ -170,6 +187,7 @@ DoLostOverwrite(k, c) ==
     /\ opCount' = opCount + 1
     /\ UNCHANGED <<createWins, mpBegin>>
     /\ UNCHANGED listGhosts
+    /\ MintGhosts
 
 \* --- Multipart client actions -----------------------------------------------
 
@@ -179,11 +197,13 @@ DoMultipartBegin(u, k) ==
     /\ mpBegin' = [mpBegin EXCEPT ![u] = store[k]]
     /\ UNCHANGED <<opCount, createWins, lastWritten, lastOp>>
     /\ UNCHANGED listGhosts
+    /\ UNCHANGED versionGhosts
 
 DoMultipartPart(u, c) ==
     /\ MultipartPart(u, c)
     /\ UNCHANGED opGhosts
     /\ UNCHANGED listGhosts
+    /\ UNCHANGED versionGhosts
 
 DoMultipartComplete(u) ==
     /\ opCount < MaxOps
@@ -196,11 +216,13 @@ DoMultipartComplete(u) ==
     /\ opCount' = opCount + 1
     /\ UNCHANGED <<createWins, mpBegin>>
     /\ UNCHANGED listGhosts
+    /\ MintGhosts
 
 DoMultipartAbort(u) ==
     /\ MultipartAbort(u)
     /\ UNCHANGED opGhosts
     /\ UNCHANGED listGhosts
+    /\ UNCHANGED versionGhosts
 
 \* --- Listing client actions (not charged against the budget) -----------------
 \* Both the deduplicating and the counting consumer advance on every delivery.
@@ -217,23 +239,27 @@ DoListBegin ==
     /\ dedupSet' = {}
     /\ deliveryCount' = 0
     /\ UNCHANGED opGhosts
+    /\ UNCHANGED versionGhosts
 
 DoListReturn(k) ==
     /\ ListReturn(k)
     /\ DeliverGhosts(k)
     /\ UNCHANGED opGhosts
+    /\ UNCHANGED versionGhosts
 
 DoListProgress(k) ==
     /\ ~ListStalls
     /\ ListProgress(k)
     /\ DeliverGhosts(k)
     /\ UNCHANGED opGhosts
+    /\ UNCHANGED versionGhosts
 
 DoListEnd ==
     /\ ListEnd
     /\ dedupSet' = {}
     /\ deliveryCount' = 0
     /\ UNCHANGED opGhosts
+    /\ UNCHANGED versionGhosts
 
 \* --- Next / specs -----------------------------------------------------------
 
@@ -274,6 +300,8 @@ MCTypeOK ==
     /\ mpBegin \in [Clients -> RecType]
     /\ dedupSet \subseteq Keys
     /\ deliveryCount \in 0..(Cardinality(Keys) * MaxListMultiplicity)
+    /\ minted \subseteq 0..MaxOps
+    /\ mintCount \in Nat
 
 \* At most one CreateIfAbsent wins per presence interval (a second create on a
 \* present key gets AlreadyExists; a delete resets the interval).
@@ -337,13 +365,27 @@ DeleteIdempotent ==
 MultipartInvisibleUntilComplete ==
     \A u \in Clients : uploads[u].active => store[uploads[u].key] = mpBegin[u]
 
-\* The deduplicating consumer tracks exactly the delivered support, and the
-\* counting consumer never reports fewer than the distinct count: a duplicate
-\* delivery (a distinct step now that deliveries are counted per key) shows up
-\* as deliveryCount exceeding the deduplicated cardinality.
+\* Total deliveries so far (the size of the delivered bag).
+TotalDelivered ==
+    LET Sum[S \in SUBSET Keys] ==
+            IF S = {} THEN 0
+            ELSE LET x == CHOOSE y \in S : TRUE IN listState.delivered[x] + Sum[S \ {x}]
+    IN Sum[Keys]
+
+\* The deduplicating consumer tracks exactly the delivered support and the
+\* counting consumer counts every delivery, so a duplicate delivery makes the
+\* two disagree and a counting consumer that silently deduplicates is caught.
+\* (Broken by a DeliverGhosts that sets deliveryCount to the deduplicated
+\* cardinality.)
 ListingConsumersConsistent ==
     /\ dedupSet = Delivered
-    /\ deliveryCount >= Cardinality(dedupSet)
+    /\ deliveryCount = TotalDelivered
+
+\* Versions are never reused: every version the counter minted is distinct. A
+\* delete that reset the counter would mint a version a deleted key already
+\* carried, so a CAS holding the pre-delete token could succeed against the
+\* new object. (Broken by a Delete that resets versionCounter.)
+VersionsNeverReused == Cardinality(minted) = mintCount
 
 \* --- Liveness (checked against FairSpec only) -------------------------------
 

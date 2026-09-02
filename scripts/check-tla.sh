@@ -60,6 +60,7 @@ resolve_java() {
         exit 2
     fi
     JAVA="$java"
+    note "java: $java (version $ver)"
 }
 
 ensure_jar() {
@@ -229,6 +230,14 @@ check_bands() {
     maxd="$(echo "$row" | cut -f3)"
     mindepth="$(echo "$row" | cut -f4)"
     maxdepth="$(echo "$row" | cut -f5)"
+    local f
+    for f in "$mind" "$maxd" "$mindepth" "$maxdepth"; do
+        case "$f" in
+            ''|*[!0-9]*)
+                note "$area bands: malformed row for $cfg_name (need cfg, min_distinct, max_distinct, min_depth, max_depth as integers): '$row'"
+                return 1 ;;
+        esac
+    done
     local rc=0
     case "$distinct" in
         ''|*[!0-9]*)
@@ -295,7 +304,11 @@ check_model() {
     # Runs every MC*.tla module in the area against its cfg for this kind.
     local area="$1" kind="$2"
     local area_dir="$FORMAL_DIR/$area"
-    local rc=0 module cfg
+    local rc=0 module cfg modules
+    # Collect the modules in the parent shell: a die inside a process
+    # substitution would exit only the subshell and leave the loop with
+    # nothing to check and rc=0 (an area with no entry module must fail).
+    modules="$(area_modules "$area_dir")" || return 1
     while IFS= read -r module; do
         [ -n "$module" ] || continue
         cfg="$(module_cfg "$area_dir" "$module" "$kind")"
@@ -308,7 +321,7 @@ check_model() {
             continue
         fi
         check_one_model "$area" "$module" "$kind" "$cfg" || rc=1
-    done < <(area_modules "$area_dir")
+    done <<< "$modules"
     return $rc
 }
 
@@ -527,7 +540,7 @@ main() {
     # Model-check subcommands need the jar; traceability is pure filesystem.
     case "$cmd" in
         traceability) : ;;
-        *) ensure_jar ;;
+        *) ensure_jar; note "tlc: $JAR (tla2tools $TLA_VERSION, sha256 verified)" ;;
     esac
 
     RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$(git rev-parse 'HEAD^{tree}')"

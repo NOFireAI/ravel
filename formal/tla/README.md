@@ -191,14 +191,18 @@ merely restates one. The invariants:
 - **TransientLeavesNothing**: a transient failure applied nothing and the
   caller saw Failure.
 - **DeleteIdempotent**: after a delete the key is absent, and a delete of an
-  absent key changed no observable state (the global version counter is never
-  reset, so create/delete/create mints a fresh version).
+  absent key changed no observable state.
+- **VersionsNeverReused**: every version the global counter mints is new
+  (a minted-version set never falls behind the mint count), so a delete never
+  resets the counter, create/delete/create mints a fresh version, and a CAS
+  holding a pre-delete token cannot succeed against the new object.
 - **MultipartInvisibleUntilComplete**: no part of an in-progress multipart
   upload is visible before Complete (the target key still equals the record
   captured at begin).
-- **ListingConsumersConsistent**: the deduplicating consumer tracks exactly
-  the delivered support and the counting consumer never reports fewer, so a
-  repeated delivery is observable.
+- **ListingConsumersConsistent**: the deduplicating consumer equals the
+  delivered support and the counting consumer equals the total number of
+  deliveries, so a repeated delivery is observable and a counting consumer
+  that silently deduplicates is caught.
 - **ListEventuallyComplete** (liveness, exhaustive only): every started
   listing eventually returns every key present when it began.
 
