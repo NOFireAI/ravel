@@ -6,14 +6,17 @@ bands live in `bands.tsv` and `scripts/check-tla.sh` fails a PASS run whose
 distinct-state count or depth falls outside them.
 
 Toolchain: TLC 2.19 (tla2tools 1.7.4), Temurin JRE 21, `-workers auto`.
-Figures below are from run `RUN_ID_PLACEHOLDER` (`scripts/check-tla.sh all`).
+Figures below are from run
+`20260902T225258Z-d7b89709fd16350b11ed7006e399a0b9c8934c65`
+(`scripts/check-tla.sh all`).
 
 | Config | Spec | Distinct states | Depth | Wall time | Result |
 |---|---|---|---|---|---|
-| smoke.cfg | MCSpec (safety, symmetry-reduced) | 2011892 | 15 | ~31s | PASS |
-| exhaustive.cfg | FairSpec (safety + liveness) | 3845952 | 15 | ~329s | PASS |
+| smoke.cfg | MCSpec (safety, symmetry-reduced) | 2011892 | 15 | ~36s | PASS |
+| exhaustive.cfg | FairSpec (safety + liveness) | 3845952 | 15 | ~342s | PASS |
 | negative/lost-response-not-applied.cfg | MCSpec | short prefix | n/a | ~1s | LostResponseEffectApplied violated, exit 12 |
 | negative/cas-accepts-stale-version.cfg | MCSpec | short prefix | n/a | ~1s | CasOutcomeMatchesEffect violated, exit 12 |
+| negative/list-never-progresses.cfg | FairSpec (ListStalls) | short prefix | n/a | ~4s | ListEventuallyComplete violated, exit 13 |
 
 Bands (a run outside these is a regression to investigate, not to widen; see
 `bands.tsv`):
@@ -27,7 +30,10 @@ of margin only to absorb a future toolchain change. The negative configs are
 NOT deterministic: they stop at the first counterexample TLC finds, and under
 `-workers auto` which state that is varies between runs, so a negative gets no
 band. Each negative is pinned instead by its `.expect` file: TLC must exit
-exactly 12 and report exactly the named invariant.
+exactly the expected code (12 for a safety violation, 13 for a temporal one)
+and report exactly the named property. For the exit-13 control the harness runs
+a generated config that declares only `ListEventuallyComplete`, since TLC 1.7.4
+prints no property name on a temporal violation.
 
 The smoke config applies `SYMMETRY Symmetry` (permutations of `Clients`) to
 shrink the safety search; the exhaustive config drops symmetry because TLC does
