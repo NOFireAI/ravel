@@ -3,9 +3,8 @@
 Ravel enforces per-tenant admission limits on every ingest path (OTLP HTTP,
 OTLP gRPC, OTAP, Remote Write, logs, spans). The limits exist so that one
 tenant cannot drive fleet-wide object count, PUT spend, catalog size, or
-query fan-out without a per-tenant bound to attribute and cap it
-([ADR-0051](../adrs/0051-tenant-admission-control.md)). Each layer runs
-before the allocation it exists to bound: nothing reaches a shard buffer
+query fan-out without a per-tenant bound to attribute and cap it. Each layer
+runs before the allocation it exists to bound: nothing reaches a shard buffer
 without passing all of them.
 
 This guide covers what each knob does, its shipped default, and exactly what
@@ -39,8 +38,8 @@ limit (zero, or a burst set without its rate or vice versa) fails startup
 rather than silently falling back to defaults.
 
 Absent `--limits-file`, every tenant gets the shipped defaults below.
-Enforcement is on by default with finite defaults: ADR-0009 promised
-admission control, so its absence is the bug, not its presence. A tenant
+Enforcement is on by default with finite defaults: an unbounded tenant is the
+defect, not a capped one. A tenant
 that genuinely needs no cap on a knob sets it explicitly to the string
 `"unlimited"` on that knob's own key (e.g. `max_active_series =
 "unlimited"`, `ingest_bytes_per_sec = "unlimited"`, as shown above), which
@@ -63,10 +62,17 @@ buckets (a sustained `per_sec` plus an instantaneous `burst`).
 | Fleet-wide concurrent-query ceiling | unlimited | `--max-concurrent-queries` (CLI flag, not a `--limits-file` key) |
 | Event-time future skew | 10 m | not configurable (`ravel-otlp` default) |
 | Event-time ingest lag | 2 h | not configurable (`ravel-otlp` default) |
-| Idle flush delay | 10 s | not configurable (shard default) |
-| Min flush bytes | 64 KiB | not configurable (shard default) |
+| Fast-tier flush delay | 2 s | `--max-flush-delay` (CLI flag) |
+| Idle-tier flush delay | 40 s | `--max-flush-delay-idle` (CLI flag) |
+| Min flush bytes | 256 KiB | `--min-flush-bytes` (CLI flag) |
 
-`max_bytes_scanned` (ADR-0061 decision 1) lives in the same `[defaults]`/
+The three flush-cadence flags move as a set: setting only one or two of the
+three is refused at startup, because raising the age threshold alone while the
+byte threshold stays small does not actually slow the fast tier down. See
+[Flush cadence](#flush-cadence-cost-not-rejection) below, and
+[cost-model.md](cost-model.md) for what moving them costs and buys.
+
+`max_bytes_scanned` lives in the same `[defaults]`/
 `[tenants.<id>]` tables as the ingest limits above, but is not yet
 tenant-parameterized at enforcement time: the query engine holds one
 process-wide budget, so only the `[defaults]` value is actually enforced.
@@ -75,7 +81,7 @@ no effect beyond a startup warning naming the ineffective tenant. True
 per-tenant query enforcement needs a tenant-aware engine config lookup,
 tracked separately from this ingest-side admission mechanism.
 
-`--max-concurrent-queries` (ADR-0061 decision 2) is a fleet-wide, not
+`--max-concurrent-queries` is a fleet-wide, not
 per-tenant, ceiling on how many queries may execute concurrently across the
 whole process, guarding against total query fan-out overwhelming the fleet
 rather than any one tenant's own concurrency. It is a CLI flag, not a
@@ -89,12 +95,15 @@ rejecting every query. A rejected query gets HTTP 503 (PromQL/SQL HTTP) or
 Flight's `RESOURCE_EXHAUSTED` status (Flight SQL), the same shape as any
 other admission rejection.
 
-The active-series/stream default is 200,000, not the 1,000,000 ADR-0051
-section 3 names: the real per-entry cost of the exact two-epoch tracker was
-measured at 35-56 bytes (not the ~16 the ADR assumed), so
-`ravel-server` ships the lower figure to keep the worst-case tracker
-footprint near 27-43 MiB per fully active tenant instead of 140-224 MiB.
-The `--limits-file` raises it per tenant where the memory is available.
+The active-series/stream default is 200,000. The per-entry cost of the exact
+two-epoch tracker was measured at 35-56 bytes per live entry, once
+hashbrown's power-of-two table sizing at 7/8 load and allocator headroom are
+counted, so `ravel-server` ships that figure to keep the worst-case tracker
+footprint near 27-43 MiB per fully active tenant. At 1,000,000 the same
+arithmetic (cap times bytes-per-entry times two rotating epochs times two
+tracked signals) gives 140-224 MiB per tenant, before multiplying across
+tenants and replicas. The `--limits-file` raises it per tenant where the
+memory is available.
 
 ## What a breach looks like to a client
 
@@ -169,7 +178,7 @@ makes the catalog listing window sound), see
 For spans specifically: the span's `end_ts` is bounded on both edges -- it
 may lead ingest time by at most `max_future_skew` and lag it by at most
 `max_ingest_lag` -- and `end_ts < start_ts` is rejected outright. Both bounds
-anchor on the end, not the start (ADR-0051 amendment, 2026-08-13): a
+anchor on the end, not the start: a
 long-running span that started more than `max_ingest_lag` ago but ended
 within the window is admitted, and only a span reported more than
 `max_ingest_lag` after it *ended* is rejected as late. This lets a genuine
@@ -180,7 +189,7 @@ the end's window placement alone keeps its ingest hour listed).
 ### Receiver-clock floor
 
 Independently of the sender's timestamps, Ravel checks its own admission
-clock (ADR-0051 amendment). A reading below a compiled floor
+clock. A reading below a compiled floor
 (2020-01-01T00:00:00Z -- no host legitimately runs Ravel with a clock older
 than the system) or one that yields no representable ingest-hour bucket
 rejects the *whole* request with HTTP 503 / gRPC `UNAVAILABLE`, counted under
@@ -198,16 +207,13 @@ instead of silent pollution of the hour-partitioned layout.
 ## Raising max_ingest_lag: a coordinated change
 
 `max_ingest_lag` is one shared bound, not a per-signal one, in the sense
-that matters operationally: the admission checks (metrics, logs, spans --
-each its own crate, `ravel-otlp`'s `limits.rs`/`logs_limits.rs`/
-`traces_limits.rs`) and the catalog listing window
-(`crates/ravel-catalog/src/config.rs`) each hold their own
-`max_ingest_lag_ns` constant, duplicated rather than shared by reference
-(`ravel-maintain`'s own copy carries an explicit "MUST be kept in sync"
-comment and a startup equality assertion against it). This is exactly why
-the coordinated-raise rule below exists: nothing in code enforces the
-values staying equal, only convention and this assertion. The admission
-bound decides what old data is *admitted*;
+that matters operationally: the three admission checks (metrics, logs, spans)
+and the catalog listing window each hold their own `max_ingest_lag_ns`
+constant, duplicated rather than shared by reference. Maintenance carries a
+startup equality assertion against its own copy, and that assertion plus
+convention is the whole of the enforcement: nothing else keeps the values
+equal, which is exactly why the coordinated-raise rule below exists. The
+admission bound decides what old data is *admitted*;
 the listing window decides what old data is *discoverable*. If you raise the
 admission lag alone, you admit and acknowledge records that the listing
 window can then fail to find on any non-token query.
@@ -232,9 +238,10 @@ The hot-path check stays per-process and sub-microsecond; there is no S3
 round-trip on any admission decision. Instead each process reconciles its
 effective caps off the hot path on a fixed interval, reading every sibling's
 usage from object storage and adjusting the number its local check compares
-against ([ADR-0057](../adrs/0057-fleet-global-admission-reconciliation.md)).
-The interval is set by `--admission-reconcile-interval` (default 10s, the
-value of `ravel_ingest::DEFAULT_ADMISSION_RECONCILE_INTERVAL`).
+against. The interval is set by `--admission-reconcile-interval` (default
+10s). A zero or unparseable duration fails startup rather than reconciling in
+a tight loop, and reconciliation runs only in the ingest-serving modes (`all`,
+`gateway`).
 
 The two kinds of cap converge differently:
 
@@ -243,29 +250,40 @@ The two kinds of cap converge differently:
   deduplicating a series that two replicas both hold, so it can only drive a
   replica to reject *sooner* than the configured cap, never admit more than
   it. The fleet total is bounded within one reconciliation interval's worth
-  of admission per process (ADR-0057 section 4).
+  of admission per process.
 - **Rate caps** (`ingest_bytes_per_sec`, `series_creation_rate_per_sec`)
   converge to the configured cap as a fleet-wide total by equal-share
   division: each of the `N` live processes enforces `cap / N`, so their sum
-  is at most the configured cap (ADR-0057 section 2). When a replica joins
+  is at most the configured cap. When a replica joins
   or leaves, the fleet total settles back to the cap within one interval.
 
 Until a process's first reconciliation cycle completes (and briefly after a
 replica count change), enforcement falls back to per-process behavior, so a
 newly started fleet can transiently admit above the cap by a bounded,
-self-correcting margin. See ADR-0057 for the exact overshoot bounds and the
-reasoning behind keeping reconciliation off the hot path.
+self-correcting margin. Shortening the interval tightens that window at the
+cost of more reconciliation requests; lengthening it does the reverse.
 
 ## Flush cadence: cost, not rejection
 
-`max_flush_delay_idle` (10 s) and `min_flush_bytes` (64 KiB) are not
-admission rejections; they tune PUT cost. The 500 ms flush-age trigger fires
-promptly only when the flush window holds a strict-mode waiter or the buffer
-has reached `min_flush_bytes`; an otherwise-idle buffer waits the slower
-`max_flush_delay_idle` before flushing. This drops the volume-independent PUT
-floor for buffered-mode trickle tenants by roughly 20x. Strict-mode ack
-latency is unchanged: a strict-mode waiter is always a priority flush. These
-two values are shard defaults today and are not server-flag configurable.
+The flush cadence is not an admission rejection; it tunes PUT cost. The
+shipped defaults are `--max-flush-delay` 2 s, `--max-flush-delay-idle` 40 s,
+and `--min-flush-bytes` 256 KiB, and all three apply to all three ingest
+pipelines (metrics, logs, spans).
+
+The fast 2 s age trigger fires only when the flush window holds a strict-mode
+waiter or the buffer already holds at least `--min-flush-bytes`; an
+otherwise-idle buffer waits the slower `--max-flush-delay-idle` instead. That
+is what drops the volume-independent PUT floor for a buffered-mode trickle
+tenant by roughly 20x. Strict-mode acknowledgement latency is unchanged: a
+strict-mode waiter is always a priority flush.
+
+All three are `ravel-server` flags rather than fixed shard defaults, and they
+must be set as a set: startup refuses one or two of the three, and rejects a
+zero or unparseable duration, or a `--min-flush-bytes` of `0`. Raising
+`--max-flush-delay` also costs strict-mode acknowledgement latency directly,
+and it is validated at startup against a derived ceiling, so it is the lever
+of last resort; [cost-model.md](cost-model.md) has the measured effect and the
+order to reach for the other levers in.
 
 ## Spans have no series-count cap
 
@@ -278,11 +296,30 @@ per-tenant span-count cap to configure.
 
 ## Per-tenant usage counters
 
-The admission controller keeps per-(tenant, signal) counters (active series,
-admitted/rejected totals, rejected bytes, rejections by reason) in-process.
-As of this writing they are not exposed at `GET /metrics`: no admission
-snapshot is wired into the metrics renderer. Per-tenant attribution behind
-an opt-in `--metrics-tenant-labels` flag, and folding untracked tenants into
-`tenant_hash="other"`, is designed in ADR-0051 section 6 but not
-yet implemented -- there is currently no admission-usage surface at
-`/metrics` at all, fleet-total or per-tenant.
+The admission controller's per-(tenant, signal) counters are rendered on
+`GET /metrics`, each carrying `mode`, `tenant_hash`, and `signal` labels:
+
+| Metric | Type | What it counts |
+|---|---|---|
+| `ravel_admission_active_series` | gauge | Series (metrics) or streams (logs) tracked for the active cap. |
+| `ravel_admission_admitted_total` | counter | Requests admitted past the byte-rate layer. |
+| `ravel_admission_admitted_bytes_total` | counter | Bytes charged against the byte-rate layer, which for a compressed request is the decompressed size. |
+| `ravel_ingest_wire_bytes_total` | counter | Request-body bytes as they arrived on the wire. Its ratio to the row above is a tenant's effective compression factor. |
+| `ravel_admission_rejected_total` | counter | Rejections, with a fourth `reason` label: `byte_rate`, `series_rate`, `series_cap`, `clock`. |
+| `ravel_admission_reconciliation_failures_total` | counter | Reconciliation cycles whose sibling-snapshot read failed. The last-known threshold stays in force, so this says fleet-wide accuracy is degrading, not that ingest is down. |
+
+By default every tenant's rows fold into `tenant_hash="other"`, so the family's
+cardinality is bounded by signal and reason rather than by tenant count.
+`--metrics-tenant-labels` renders the real per-tenant `tenant_hash` instead.
+Turn it on only where the scrape network is trusted: the `/metrics` route is
+unauthenticated, and per-tenant labels let a scraper enumerate tenant hashes
+and their traffic.
+
+## Background
+
+The per-tenant admission mechanism is
+[ADR-0051](../adrs/0051-tenant-admission-control.md); the fleet-global
+reconciliation above it is
+[ADR-0057](../adrs/0057-fleet-global-admission-reconciliation.md); the query
+bytes-scanned budget and the concurrent-query ceiling are ADR-0061; the
+flush-cadence defaults are ADR-0076 decision 4.
