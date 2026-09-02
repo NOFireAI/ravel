@@ -479,7 +479,12 @@ pub enum Completion {
 ///
 /// The multiply-and-shift maps a full-width `u64` into `[0, span_ms)` without
 /// the modulo bias a `%` would introduce, in u128 so nothing overflows.
-pub fn jitter_ms(work_id: &WorkId, process_id: &Uuid, cfg: &ClaimConfig) -> i64 {
+///
+/// `lease_ms` is the EFFECTIVE lease the caller computed for this expiry --
+/// clamped by [`MAX_OBSERVED_LEASE_MS`] on the observation path -- not the raw
+/// configured one, so a misconfigured observer cannot draw a jitter that
+/// outlives the documented suppression bound.
+pub fn jitter_ms(work_id: &WorkId, process_id: &Uuid, lease_ms: i64, cfg: &ClaimConfig) -> i64 {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&work_id.0);
     hasher.update(process_id.as_bytes());
@@ -488,7 +493,7 @@ pub fn jitter_ms(work_id: &WorkId, process_id: &Uuid, cfg: &ClaimConfig) -> i64 
     head.copy_from_slice(&digest[..8]);
     let h = u64::from_le_bytes(head);
 
-    let span_ms = (cfg.lease_ms() as f64 * cfg.jitter_span_fraction).max(0.0) as u64;
+    let span_ms = (lease_ms.max(0) as f64 * cfg.jitter_span_fraction).max(0.0) as u64;
     if span_ms == 0 {
         return 0;
     }
@@ -584,7 +589,7 @@ async fn observe(
         .unwrap_or_else(|| cfg.lease_ms())
         .min(MAX_OBSERVED_LEASE_MS);
     let expiry_unix_ms = meta.last_modified_unix_ms.saturating_add(lease_ms);
-    let jitter = jitter_ms(&work_id, observer_process_id, cfg);
+    let jitter = jitter_ms(&work_id, observer_process_id, lease_ms, cfg);
     // Strictly after expiry even when the jitter draw is 0: retrying in the
     // same millisecond expiry lands on would race the boundary for nothing.
     let reschedule_after_unix_ms = expiry_unix_ms.saturating_add(jitter).saturating_add(1);
@@ -618,9 +623,15 @@ fn decode_holder(bytes: &[u8]) -> Option<ClaimHolder> {
     if state == ClaimState::Unspecified {
         return None;
     }
+    // A claim whose ownership identifiers do not parse is unreadable as a
+    // whole: treating it as held-with-unknown-owner would let steal overwrite
+    // state whose ownership it cannot attribute. Unreadable means the observer
+    // falls back to its own lease for expiry and never steals.
+    let process_id = uuid_from(&claim.owner_process_id)?;
+    let attempt_id = uuid_from(&claim.attempt_id)?;
     Some(ClaimHolder {
-        process_id: uuid_from(&claim.owner_process_id),
-        attempt_id: uuid_from(&claim.attempt_id),
+        process_id: Some(process_id),
+        attempt_id: Some(attempt_id),
         state,
         renewed_count: claim.renewed_count,
         lease_duration_ns: claim.lease_duration_ns,
@@ -929,7 +940,9 @@ mod tests {
         );
         assert_eq!(
             observed.reschedule_after_unix_ms,
-            observed.expiry_unix_ms + jitter_ms(&identity().work_id(), &b.process_id, &cfg) + 1,
+            observed.expiry_unix_ms
+                + jitter_ms(&identity().work_id(), &b.process_id, cfg.lease_ms(), &cfg)
+                + 1,
             "and is exactly expiry + this contender's jitter + 1ms"
         );
 
@@ -1231,12 +1244,16 @@ mod tests {
         let a = Uuid::from_u128(0xA);
         let b = Uuid::from_u128(0xB);
 
-        let first = jitter_ms(&work, &a, &cfg);
+        let first = jitter_ms(&work, &a, cfg.lease_ms(), &cfg);
         for _ in 0..16 {
-            assert_eq!(jitter_ms(&work, &a, &cfg), first, "jitter must not vary");
+            assert_eq!(
+                jitter_ms(&work, &a, cfg.lease_ms(), &cfg),
+                first,
+                "jitter must not vary"
+            );
         }
         assert_ne!(
-            jitter_ms(&work, &b, &cfg),
+            jitter_ms(&work, &b, cfg.lease_ms(), &cfg),
             first,
             "two contenders on one work id must draw different offsets"
         );
@@ -1245,7 +1262,7 @@ mod tests {
         // reschedule delay a contender pays.
         let span = (LEASE_MS as f64 * DEFAULT_JITTER_SPAN_FRACTION) as i64;
         for pid in [a, b, Uuid::from_u128(0xC), Uuid::from_u128(0xD)] {
-            let j = jitter_ms(&work, &pid, &cfg);
+            let j = jitter_ms(&work, &pid, cfg.lease_ms(), &cfg);
             assert!((0..span).contains(&j), "jitter {j} outside [0, {span})");
         }
 
@@ -1253,7 +1270,61 @@ mod tests {
         // buckets spread rather than firing together.
         let other =
             WorkIdentity::new(TenantId::new("acme").hash(), Signal::Logs, 4, 480_000).work_id();
-        assert_ne!(jitter_ms(&other, &a, &cfg), first);
+        assert_ne!(jitter_ms(&other, &a, cfg.lease_ms(), &cfg), first);
+    }
+
+    /// A claim that decodes as protobuf but carries malformed UUID identity
+    /// bytes is unreadable as a whole: ownership cannot be attributed, so the
+    /// holder is None, expiry falls back to the observer's lease, and steal
+    /// refuses it. Without the gate in decode_holder, this claim would be
+    /// stolen despite its ownership being undecodable.
+    #[tokio::test]
+    async fn a_claim_with_malformed_uuid_identity_is_never_stolen() {
+        let store = instrumented();
+        store.inner().set_clock_ms(1_700_000_000_000);
+        let cfg = ClaimConfig::default();
+        let key = compaction_claim_key(&identity().work_id());
+        let bad = CompactionClaim {
+            format_version: CLAIM_FORMAT_VERSION,
+            owner_process_id: vec![0xAB; 3],
+            attempt_id: vec![0xCD; 5],
+            input_set_hash: Vec::new(),
+            state: ClaimState::Running as i32,
+            renewed_count: 0,
+            lease_duration_ns: 300_000_000_000,
+            owner_clock_ns: 0,
+        };
+        store
+            .put(
+                &key,
+                bad.encode_to_vec().into(),
+                PutOptions {
+                    mode: PutMode::CreateIfAbsent,
+                    checksum: None,
+                },
+            )
+            .await
+            .expect("seed the malformed-identity claim");
+
+        let observed = held(
+            acquire(&store, &identity(), &owner_at(1), &cfg)
+                .await
+                .expect("acquire over a malformed-identity claim must not error"),
+        );
+        assert!(
+            observed.holder.is_none(),
+            "unattributable ownership makes the whole claim unreadable"
+        );
+        let refused = steal(
+            &store,
+            &observed,
+            &owner_at(2),
+            &cfg,
+            observed.expiry_unix_ms + 1,
+        )
+        .await
+        .expect("steal");
+        assert_eq!(refused_reason(refused), StealRefused::UnreadableClaim);
     }
 
     /// A claim whose payload is raw garbage (not protobuf at all) degrades
