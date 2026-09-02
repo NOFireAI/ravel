@@ -267,6 +267,11 @@ impl PhaseAccounting {
     /// completion. A caller that needs the genuine per-phase split (the PromQL
     /// engine) threads a persistent [`PhaseAccounting::new`] through the whole
     /// query instead and never routes through these pooled wrappers.
+    ///
+    /// Never fold a handle built this way back through
+    /// [`snapshot`](Self::snapshot) and [`pooled`](PhaseAccountingSnapshot::pooled):
+    /// its four phases are one counter, so pooling its snapshot would count
+    /// every request and byte four times. Read `accounting.snapshot()` instead.
     #[must_use]
     pub fn pooled_over(accounting: &QueryAccounting) -> Self {
         PhaseAccounting {

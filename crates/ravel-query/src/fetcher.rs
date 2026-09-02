@@ -3342,8 +3342,11 @@ mod tests {
                 .await
         });
 
-        // Block until the GET is genuinely parked inside the store.
-        gate.wait_until_held(1).await;
+        // Block until the GET is genuinely parked inside the store. Bounded so
+        // a fetch that stops issuing exactly one GET fails instead of hanging.
+        tokio::time::timeout(std::time::Duration::from_secs(30), gate.wait_until_held(1))
+            .await
+            .expect("the fetch issues its GET within 30 s");
         assert_eq!(
             gate.held_count(),
             1,
@@ -3367,7 +3370,11 @@ mod tests {
         for id in gate.held() {
             assert!(gate.release(id), "held id must release");
         }
-        let (soa, _stats) = handle.await.expect("join fetch task").expect("fetch");
+        let (soa, _stats) = tokio::time::timeout(std::time::Duration::from_secs(30), handle)
+            .await
+            .expect("the released fetch completes within 30 s")
+            .expect("join fetch task")
+            .expect("fetch");
         assert_eq!(soa.len(), 2);
 
         let done = accounting.snapshot();
