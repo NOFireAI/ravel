@@ -24,9 +24,10 @@ Ravel's accepted pre-release posture, not a gap to close later.
 
 **Version lifecycle and migration (ADR-0066, normative).** The pre-release
 posture above expires at first public release. RSPAN is a Class A bulk
-data-object format; from first release onward the supported-version window is
-N/N-1 (single-sourced as `ravel_rspan::footer::SUPPORTED_VERSIONS`; the writer,
-reader gate, `audit-versions`, `migrate`, and the compactor's output-version
+data-object format; from first release onward the supported-version window
+becomes N/N-1 (single-sourced as `ravel_rspan::footer::SUPPORTED_VERSIONS`,
+which holds exactly one version today; the writer, reader gate,
+`audit-versions`, `migrate`, and the compactor's output-version
 constant all read it), rolled out readers-before-writers: a release writing N+1
 requires a fleet already reading N+1, so the "no dual reader" statement above is
 the pre-release state, not a standing rule. Once an N-1 reader exists, RSPAN
@@ -220,7 +221,7 @@ carry the exception stack traces that are a primary investigation target) were
 stored in v1 as an opaque `_events_raw` attribute value (a hex blob of
 concatenated length-delimited `Span.Event` messages). v4 promotes them into
 nested columns: a per-row `event_count`, and three columns flattened one entry
-per event across the block — `event_ts` (the event `time_unix_nano`),
+per event across the block: `event_ts` (the event `time_unix_nano`),
 `event_name`, and `event_attrs_blob` (the event's opaque serialized bytes, the
 round-trip source of truth). The writer decodes a parseable `_events_raw` value
 into these columns; the reader reconstructs the identical `_events_raw` value
@@ -266,8 +267,8 @@ smallest, and the self-describing `enc` tag records the choice. Each page is
 independently wrapped in a zstd envelope (`comp = zstd`) when its encoded form
 is at least 512 bytes and zstd is strictly smaller, else stored raw. A block's
 crc32c lives in its SKIP_IDX entry, not inline; the reader verifies it before
-decoding anything, so every byte below — page descriptors, the dynamic
-directory, and every page — is under that one checksum.
+decoding anything, so every byte below (page descriptors, the dynamic
+directory, and every page) is under that one checksum.
 
 **Dynamic-column directory (v4).** RSPAN has no object-wide FIELD_DIR section;
 each block instead lists, ascending by column id, the `(column_id, name)` of
@@ -284,8 +285,8 @@ codec. A row's keys past the 1000-column budget are not columns; they live in
 
 **Nested event columns (ids 10-13, v4).** When any row of the block has an
 event, the block carries `event_count` (id 10), one i64 per row (0 for a row
-with no events), and three **flattened** columns — `event_ts` (id 11, i64),
-`event_name` (id 12, Utf8), `event_attrs_blob` (id 13, bytes) — each with
+with no events), and three **flattened** columns, `event_ts` (id 11, i64),
+`event_name` (id 12, Utf8), and `event_attrs_blob` (id 13, bytes), each with
 `sum(event_count)` entries, one per event across the whole block in row order,
 with no presence bitmap (every entry is present). The reader decodes
 `event_count`, sums it to learn the flattened length, then decodes the three
@@ -434,7 +435,7 @@ The v4 grammar adds new byte ranges only *inside* the block: the
 dynamic-column directory, the per-key attribute column pages, the `attrs_raw`
 page, and the four event columns. Every one of those bytes lives within the
 block body, and the reader verifies the block's `crc32c` (from its SKIP_IDX
-entry) over the whole block before it reads a single one of them — the block
+entry) over the whole block before it reads a single one of them: the block
 crc32c is recomputed and compared first thing in `read_block`, and decoding
 stops on a mismatch. So each new range a v4 reader interprets is under a
 checksum the reader verifies on its access path (ADR-0010 §4). No v4 field is
@@ -446,10 +447,10 @@ all of them, exactly as it already was for the v1..v3 columns.
 
 Compaction (ADR-0032's per-signal codec seam, `SpanCodec` in
 `ravel-maintain`) rewrites many small L0 RSPAN flush objects for one sealed
-`(tenant, shard, ingest-hour)` bucket into a handful of large L1 parts, the
+`(tenant, shard, ingest-hour)` bucket into a handful of large L1 segments, the
 span analogue of RSEG's and RLOG's L0→L1 compaction. The transaction
 machinery (seal detection, `CreateIfAbsent` publish, convergence,
-abandonment, the advisory cursor) is shared and signal-generic. An L1 part
+abandonment, the advisory cursor) is shared and signal-generic. An L1 segment
 is byte-for-byte a normal RSPAN object with `level = 1`; readers need no
 special path.
 
@@ -466,6 +467,6 @@ Memory: `ravel-rspan` has no ranged section reader (no equivalent of RLOG's
 `RlogRangeReader`), so the merge fetches and decodes each input object
 whole. Raw bytes are bounded to one input at a time; decoded records for
 the whole bucket are held in memory across the merge. This is the same
-tradeoff RLOG's merge once accepted, not an oversight — a ranged
+tradeoff RLOG's merge once accepted, not an oversight, and a ranged
 RSPAN reader is the natural follow-up once span bucket sizes in practice
 justify it.

@@ -73,7 +73,7 @@ Detects the most significant change in one series and classifies it.
 
    1. **Spike / Dip** (checked first, independent of the segmentation, so it
       catches excursions shorter than a segment): a point whose deviation
-      from the robust center (median, scaled MAD) exceeds 6 z-scores while
+      from the robust (median, scaled MAD) center exceeds 6 z-scores while
       such extremes stay rare enough (at most `N/50`) to be an isolated
       excursion rather than a whole regime. A peak above the center is a
       `Spike`, below is a `Dip`.
@@ -111,7 +111,8 @@ document.
 
 `kind`, `ts_ns` (the location of the change, `None` for `Stationary` and
 `Indeterminable`), `score` (the significance: a Gaussian cost reduction in
-nats for the segment-based kinds, a robust z-score for spike/dip; `0.0` when
+nats for the segment-based kinds, a robust (median, scaled MAD) z-score for
+spike/dip; `0.0` when
 no change is reported), `downsampled`, `original_points` (non-NaN points
 before any downsampling), and `nan_excluded`.
 
@@ -123,7 +124,7 @@ stage's cost, and it can never see more data than a legal range query returns.
 
 ## `summary`
 
-Robust per-series summary statistics.
+Robust (median and MAD based) per-series summary statistics.
 
 - **median**: the exact median (the central order statistic for an odd count,
   the average of the two central ones for an even count).
@@ -295,7 +296,7 @@ cluster(s). This mirrors the consent gate `/api/v1/query` and
 |---|---|---|
 | `kind` | string | One of `spike`, `dip`, `step_change`, `trend_change`, `distribution_change`, `stationary`, `indeterminable`. |
 | `ts_ns` | integer or null | Nanosecond timestamp of the change; null for `stationary` and `indeterminable`. |
-| `score` | number | Significance (Gaussian cost reduction in nats, or a robust z-score for spike/dip); `0.0` when no change is reported. |
+| `score` | number | Significance (Gaussian cost reduction in nats, or a robust (median, scaled MAD) z-score for spike/dip); `0.0` when no change is reported. |
 | `downsampled` | bool | Whether the series was downsampled before detection. |
 | `original_points` | integer | Non-NaN point count before any downsampling. |
 | `nan_excluded` | integer | NaN points excluded from detection. |

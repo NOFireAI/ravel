@@ -12,10 +12,13 @@ stray v6 object is rejected, never half-parsed.
 **Version lifecycle and migration (ADR-0066, normative).** RSEG is a Class A
 bulk data-object format. Until the first public release, ADR-0027's
 single-supported-version rule above stands. From first release onward the
-supported-version window is N/N-1: the writer always emits the current version
-N, and the reader accepts N and N-1 (the window is single-sourced as
-`ravel_segment::SUPPORTED_VERSIONS`; the writer, reader gate, `audit-versions`,
-and the `migrate` job all read it). Rollout is readers-before-writers: a release
+supported-version window becomes N/N-1: the writer always emits the current
+version N, and the reader accepts N and N-1. The window is single-sourced as
+`ravel_segment::SUPPORTED_VERSIONS`, and the writer, reader gate,
+`audit-versions`, and the `migrate` job all read it; it holds exactly one
+version today, v7, so the two-version shape is capability the code carries for
+a future bump rather than behaviour any build has now.
+Rollout is readers-before-writers: a release
 that writes N+1 requires a fleet already reading N+1. Old-version objects
 converge to the current version three ways, in preference order: retention ages
 them out; compaction and the `maintain migrate` job rewrite them
@@ -114,7 +117,7 @@ Defined in `proto/ravel/segment.proto` (`ravel.segment.v1.Footer`). Fields:
 Validation (all violations are Corrupted, never panics):
 
 - At most one section per known kind. Mandatory: LABEL_DICT (1), SERIES_IDS
-  (5), TS_PAGES (3), and exactly one catalog body — either the whole
+  (5), TS_PAGES (3), and exactly one catalog body: either the whole
   SERIES_META (kind 6) or the sparse pair SERIES_IDX (8) + SERIES_META_CHUNKS
   (9) together. Carrying both bodies, or one half of the sparse pair without
   the other, is Corrupted. VAL_PAGES (4) and HIST_PAGES (7) are each
@@ -145,7 +148,7 @@ foreign rather than plausibly parseable.
 | kind | name | status | comp (writer policy) |
 |---|---|---|---|
 | 1 | LABEL_DICT | string dictionary | zstd |
-| 2 | SERIES_TABLE | **retired with RSEG v1; never emitted, number reserved forever** | — |
+| 2 | SERIES_TABLE | **retired with RSEG v1; never emitted, number reserved forever** | n/a |
 | 3 | TS_PAGES | timestamp pages container (scalar and histogram series) | none |
 | 4 | VAL_PAGES | scalar value pages container | none |
 | 5 | SERIES_IDS | sorted series ids | none |
@@ -163,7 +166,7 @@ kind whose count is zero is Corrupted.
 
 EXEMPLARS (kind 10) is optional and independent of every other condition:
 present iff at least one sample in the object carried an exemplar. An empty
-EXEMPLARS section is never legal to emit — absence, not a zero-count
+EXEMPLARS section is never legal to emit: absence, not a zero-count
 section, is how "no exemplars" is represented. Absence is always legal, so
 a reader must treat a missing EXEMPLARS section as "this object has no
 exemplars", never as an error.
@@ -335,7 +338,7 @@ large tenant is exactly the sparse case, so the sparse form must carry them
 
 ## Sparse catalog
 
-At or above the sparse-emission threshold — `series_count >= 4096` — the
+At or above the sparse-emission threshold, `series_count >= 4096`, the
 whole-section SERIES_META (kind 6) is replaced by SERIES_META_CHUNKS (kind 9)
 and SERIES_IDX (kind 8) is added, so a point lookup on a large object fetches
 a few KB rather than the whole catalog. The two ship together. The threshold
@@ -496,7 +499,7 @@ beyond `series_count` (`ExemplarSeriesIndexOutOfRange`); any record whose
 past the section end (`Truncated`); and any byte left over after the last
 record (`TrailingBytes`).
 
-A `count` of 0 is not rejected by the decoder — it yields zero records and
+A `count` of 0 is not rejected by the decoder: it yields zero records and
 consumes the section exactly, so it is indistinguishable from a
 well-formed section that happens to be empty. The writer never emits one,
 which is why absence rather than a zero-count section is the representation
@@ -506,7 +509,7 @@ corrupt object, and treating it as zero exemplars is the safe reading.
 **Compaction rule.** Exemplar records are copied verbatim, remapping only
 `series_index` into the output's own sorted SERIES_IDS. They are never
 merged, re-sorted, or deduplicated across inputs. An exemplar carries no
-dedup priority of its own — it inherits its sample's — so any rule that
+dedup priority of its own (it inherits its sample's), so any rule that
 dropped one exemplar in favour of another would make an L1 object something
 other than the exact multiset of its inputs, which is precisely what
 ADR-0018's overlap harmlessness forbids.
@@ -615,14 +618,15 @@ records ending exactly at the page payload end; nonzero reserved flag bits.
 
 The VAL_PAGES section `offset` is congruent to 0 mod 8, and every multi-sample
 VAL_RAW_F64 (enc 17) page's payload start (page offset + 6) is congruent to 0
-mod 8 relative to the section start, so raw f64 payloads are eligible for aligned
-zero-copy views (docs/adrs/0013). The writer inserts `0x00` pad before such a
+mod 8 relative to the section start, so raw f64 payloads are eligible to back
+an Arrow buffer in place, with no copy (docs/adrs/0013). The writer inserts
+`0x00` pad before such a
 page's header and records it in that run's `val_page_gap`. TS and HIST pages
 are never aligned (varint/field-decoded, never viewed directly).
 
 Single-sample no-pad rule (ADR-0092 decision 4). A raw-`f64` VAL page holding
-exactly one sample carries no alignment pad: a one-sample page never serves an
-Arrow zero-copy view (the query path materializes it), so the pad it would pay
+exactly one sample carries no alignment pad: a one-sample page never backs an
+Arrow buffer in place (the query path materializes it), so the pad it would pay
 buys nothing. Such a page's `val_page_gap` is zero and its payload start is not
 required to be 8-aligned. Multi-sample raw pages are aligned as above. This is a
 pure byte saving; readers do not depend on the alignment of any raw page they
@@ -674,8 +678,8 @@ A selective read that already knows a target series id:
    series index (or absent).
 6. Look up the covering chunk, range-GET its stored frame, verify it against
    the chunk's `frame_crc32c`, then decompress.
-7. Decode the target row's runs from the frame — each run's provenance,
-   bounds, and TS/VAL/HIST page ranges — and range-GET those pages (per-page
+7. Decode the target row's runs from the frame (each run's provenance,
+   bounds, and TS/VAL/HIST page ranges), and range-GET those pages (per-page
    crc unchanged).
 
 Composition with the metric index (ADR-0020): postings prune which segments a

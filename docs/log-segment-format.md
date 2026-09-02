@@ -92,10 +92,10 @@ Identical in shape to RSEG v1:
    `magic`, `version`, `signal`, `reserved`. The suffix length is a reader
    choice, not a format constant: it should cover the footer and whatever tail
    sections the reader is about to need, and a reader that guesses short
-   simply issues step 3's extra ranged GET. `ravel-query`'s log fetcher probes
-   256 KiB, sized so that one probe carries the footer, SKIP_IDX and PAGE_DIR
-   past the BLOOM section that sits between them (ADR-0699 decision 5, issue
-   #766).
+   pays for it with step 3's extra ranged GET. `ravel-query`'s log fetcher
+   probes 256 KiB, sized so that one probe carries the footer, SKIP_IDX and
+   PAGE_DIR past the BLOOM section that sits between them (ADR-0699
+   decision 5, issue #766).
 3. Require `footer_len > 0` and `16 + footer_len <= total_size`;
    otherwise `Corrupted`. If the suffix did not cover the footer, issue
    one more ranged GET.
@@ -387,8 +387,8 @@ group_count groups:
 Page offsets are derived, not stored: a chunk's pages are contiguous from the
 chunk's `offset` in listed order, so the *n*th page begins at `offset` plus the
 `len`s of the pages before it. That makes the section about 14 bytes per page:
-a few KB for a two-block flush object, about 1.5 MB for a 10M-row L1 part with
-105 columns, read once per object per query.
+a few KB for a two-block flush object, about 1.5 MB for a 10M-row L1 segment
+with 105 columns, read once per object per query.
 
 Two entries may name the same `block` within one chunk: a partially present
 column contributes its presence bitmap page and then its value page, so
@@ -916,11 +916,11 @@ byte, rather than a section's presence, be what selects the layout.
 
 Compaction (ADR-0032) rewrites many small L0 `.rlog` flush
 objects for one sealed `(tenant, shard, ingest-hour)` bucket into a
-handful of large L1 parts, the log analogue of RSEG's L0→L1 compaction
+handful of large L1 segments, the log analogue of RSEG's L0→L1 compaction
 (ADR-0018). It lives in `ravel-maintain` behind a per-signal codec seam;
 the transaction machinery (seal detection, `CreateIfAbsent` publish,
 convergence, abandonment, the advisory cursor) is shared with RSEG and
-signal-generic. An L1 part is byte-for-byte a normal RLOG object with
+signal-generic. An L1 segment is byte-for-byte a normal RLOG object with
 `level = 1`; readers need no special path.
 
 The merge is defined entirely in terms of this format:
@@ -947,7 +947,7 @@ The merge is defined entirely in terms of this format:
   record block target, then placed into row groups of `group_target_blocks`
   consecutive blocks with their pages column-major (ADR-0699 decision 1).
   Compaction is where full row groups arise: an L0 flush object is usually one
-  short group, an L1 part is many full ones, which is what makes a narrow
+  short group, an L1 segment is many full ones, which is what makes a narrow
   projection over a compacted tenant a few contiguous ranges per object
   instead of one per block. There is no record-level dedup: distinct
   submissions of identical content are distinct records (the write path
@@ -955,7 +955,7 @@ The merge is defined entirely in terms of this format:
   the union of all inputs' records.
 - **Rebuilt directories and indexes.** `FIELD_DIR` is rebuilt from the
   merged column set under the same 1000-dynamic-column cap, with overflow
-  keys folded into `attrs_raw` exactly as a single-object write does — the
+  keys folded into `attrs_raw` exactly as a single-object write does: the
   union of columns across inputs can exceed the cap even when no single
   input does. `SKIP_IDX` and every per-block `BLOOM` are rebuilt from the
   merged, re-blocked contents (each bloom sized by its own block's
