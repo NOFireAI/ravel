@@ -14,7 +14,7 @@ use crate::config::CompactorConfig;
 use crate::error::{MaintainError, Result};
 use crate::publish::{PublishOutcome, conserve_exact};
 use crate::read;
-use crate::read::list_bucket;
+use crate::read::list_bucket_with_ledger;
 use crate::rewrite::rewrite_and_publish;
 use crate::rlog::RlogCodec;
 use crate::rspan_codec::SpanCodec;
@@ -52,12 +52,36 @@ pub async fn compact_bucket(
     config: &CompactorConfig,
     bucket: &Bucket,
 ) -> Result<CompactionOutcome> {
+    // This is the run's outermost driver, so it opens the request ledger's
+    // scope here, BEFORE the bucket LIST below: that LIST is the run's first
+    // store request and belongs in the run's own report, and the rewrite
+    // primitive it later dispatches to therefore must not reset (ADR-0996 task
+    // 996-8). The scope is closed on every exit path, including the gates that
+    // return before any rewrite runs.
+    if let Some(l) = config.request_ledger.as_ref() {
+        l.reset_for_run();
+    }
+    let outcome = compact_bucket_scoped(store, clock, config, bucket).await;
+    if let Some(l) = config.request_ledger.as_ref() {
+        l.end_run();
+    }
+    outcome
+}
+
+/// [`compact_bucket`]'s body, with the request ledger's run scope already
+/// opened and guaranteed to be closed by its caller.
+async fn compact_bucket_scoped(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    bucket: &Bucket,
+) -> Result<CompactionOutcome> {
     let start_ns = clock.now_ns();
     if !bucket.is_sealed(start_ns, config) {
         return Ok(CompactionOutcome::NotSealed);
     }
 
-    let listing = list_bucket(store, bucket).await?;
+    let listing = list_bucket_with_ledger(store, bucket, config.request_ledger.as_ref()).await?;
     if listing.tombstone_key.is_some() {
         return Ok(CompactionOutcome::Tombstoned);
     }

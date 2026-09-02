@@ -16,6 +16,7 @@ use crate::clock::Clock;
 use crate::config::CompactorConfig;
 use crate::error::{MaintainError, Result};
 use crate::read::InputRecord;
+use crate::request_ledger::{RequestLedger, RequestPhase, note_get, note_metadata, note_put};
 
 /// What publishing did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,7 +207,14 @@ pub async fn publish_record_with_conservation(
         return Ok(PublishOutcome::Published);
     }
 
-    match store.put(&record_key, payload.into(), opts).await {
+    let ledger = config.request_ledger.as_ref();
+    // Publish phase (ADR-0996 task 996-8): the record PUT is recorded before its
+    // outcome is inspected, so the `AlreadyExists` convergence arm below counts
+    // the request it spent exactly like the winning arm.
+    let payload_len = payload.len() as u64;
+    let put = store.put(&record_key, payload.into(), opts).await;
+    note_put(ledger, RequestPhase::Publish, payload_len);
+    match put {
         Ok(_) => {
             // The tombstone race is closed by verification, not retention
             // (ADR-0979 decision 3): a part that answered `AlreadyExists` at PUT
@@ -215,12 +223,12 @@ pub async fn publish_record_with_conservation(
             // parts now that the record is durable; a missing one fails loud with
             // a re-runnable typed error rather than leaving the record pointing
             // at a part the bounded compactor can no longer repair.
-            verify_already_existed_parts(store, parts).await?;
+            verify_already_existed_parts(store, parts, ledger).await?;
             tracing::info!(key = %record_key, parts = parts.len(), "compaction record published");
             Ok(PublishOutcome::Published)
         }
         Err(StoreError::AlreadyExists) => {
-            resolve_already_exists(store, &record_key, input_set_hash, parts).await
+            resolve_already_exists(store, &record_key, input_set_hash, parts, ledger).await
         }
         Err(e) => Err(MaintainError::Store(e)),
     }
@@ -239,9 +247,12 @@ pub async fn publish_record_with_conservation(
 async fn verify_already_existed_parts(
     store: &dyn ObjectStoreBackend,
     parts: &[BuiltPart],
+    ledger: Option<&RequestLedger>,
 ) -> Result<()> {
     for part in parts.iter().filter(|p| p.put_already_existed) {
-        match store.head(&part.key).await {
+        let head = store.head(&part.key).await;
+        note_metadata(ledger, RequestPhase::Publish);
+        match head {
             Ok(_) => {}
             Err(StoreError::NotFound) => {
                 return Err(MaintainError::AlreadyExistsPartVanished {
@@ -280,8 +291,11 @@ async fn resolve_already_exists(
     record_key: &str,
     our_hash: &[u8; 32],
     our_parts: &[BuiltPart],
+    ledger: Option<&RequestLedger>,
 ) -> Result<PublishOutcome> {
-    let existing = store.get(record_key, GetRange::Full).await?;
+    let existing = store.get(record_key, GetRange::Full).await;
+    note_get(ledger, RequestPhase::Publish, &existing);
+    let existing = existing?;
     let winner = CompactionRecord::decode(existing.data.as_ref())
         .map_err(|e| MaintainError::Invariant(format!("winner record decode failed: {e}")))?;
     // The winner's key must reconstruct to the key we fetched it at.
@@ -299,7 +313,9 @@ async fn resolve_already_exists(
     let mut repaired = 0usize;
     for part in &winner.parts {
         let part_key = keys::reconstruct_l1_part_key(&winner, part)?;
-        match store.head(&part_key).await {
+        let head = store.head(&part_key).await;
+        note_metadata(ledger, RequestPhase::Publish);
+        match head {
             Ok(_) => {}
             Err(StoreError::NotFound) => {
                 // Re-PUT only a part whose bytes we still hold. A bounded
@@ -309,7 +325,11 @@ async fn resolve_already_exists(
                 // scratch rebuilds and re-PUTs the byte-identical part.
                 match our_parts.iter().find(|p| p.key == part_key) {
                     Some(ours) if ours.bytes.is_some() => {
-                        crate::build::put_part(store, ours).await?;
+                        // A repair re-PUT is a part PUT: it is attributed to
+                        // `PartPut` by what the request writes, beside every
+                        // other L1 part write, not to the phase that noticed
+                        // the hole.
+                        crate::build::put_part_with_ledger(store, ours, ledger).await?;
                         repaired += 1;
                     }
                     // Cannot repair (bytes released at PUT, or a part this run

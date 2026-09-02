@@ -136,11 +136,12 @@ use ravel_rspan::{
 };
 
 use crate::bucket::Bucket;
-use crate::build::{BuiltPart, put_part};
+use crate::build::{BuiltPart, put_part_with_ledger};
 use crate::codec::SegmentCodec;
 use crate::config::{CompactorConfig, MergeMemoryTracker};
 use crate::error::{MaintainError, Result};
 use crate::read::InputRecord;
+use crate::request_ledger::{RequestLedger, RequestPhase, note_get};
 
 /// The RSPAN output trailer version every L1 part carries. Recorded in each
 /// part's `CompactionPart.segment_format_version`, the span analogue of RSEG's
@@ -229,16 +230,21 @@ pub(crate) async fn load_catalog_from_object(
     // growing to a second only if the probe missed the whole footer (the
     // RSPAN analogue of the RSEG/RLOG read path). This fails loud here on a
     // missing or corrupt input, before the merge fetches any block bytes.
+    let ledger = config.request_ledger.as_ref();
     let probe = store
         .get(&object_key, GetRange::Suffix(config.footer_probe_bytes))
-        .await?;
+        .await;
+    note_get(ledger, RequestPhase::CatalogRead, &probe);
+    let probe = probe?;
     let total = probe.total_size;
     let ftr = match footer::open_from_suffix(&probe.data, total)? {
         SuffixOutcome::Ready(f) => f,
         SuffixOutcome::NeedRange { offset, len } => {
             let tail = store
                 .get(&object_key, GetRange::Range(offset, offset + len))
-                .await?;
+                .await;
+            note_get(ledger, RequestPhase::CatalogRead, &tail);
+            let tail = tail?;
             match footer::open_from_suffix(&tail.data, total)? {
                 SuffixOutcome::Ready(f) => f,
                 SuffixOutcome::NeedRange { .. } => {
@@ -259,7 +265,9 @@ pub(crate) async fn load_catalog_from_object(
             &object_key,
             GetRange::Range(skip_desc.offset, skip_desc.offset + skip_desc.len),
         )
-        .await?;
+        .await;
+    note_get(ledger, RequestPhase::CatalogRead, &skip_section);
+    let skip_section = skip_section?;
     let skip_idx_raw = footer::decode_section(
         skip_section.data.as_ref(),
         skip_desc,
@@ -375,6 +383,7 @@ pub(crate) async fn merge(
     dry_run: bool,
     keep: &mut (dyn FnMut(&SpanRecord) -> Result<bool> + Send),
 ) -> Result<SpanMergeOutput> {
+    let ledger = config.request_ledger.as_ref();
     // No whole-object fetch: the per-input ranged readers are already in the
     // catalogs. Blocks are fetched by range one at a time in the flat k-way
     // merge below, so raw resident bytes stay bounded to one block per input,
@@ -394,7 +403,7 @@ pub(crate) async fn merge(
         .iter()
         .enumerate()
         .map(|(idx, catalog)| {
-            Box::pin(open_cursor(store, catalog, idx, tracker)) as CursorFuture<'_, '_>
+            Box::pin(open_cursor(store, catalog, idx, tracker, ledger)) as CursorFuture<'_, '_>
         })
         .collect();
     let mut cursors: Vec<BlockCursor> = stream_iter(opens)
@@ -445,7 +454,7 @@ pub(crate) async fn merge(
                     part.estimate >= config.l1_part_memory_target_bytes && !part.is_empty();
                 if over_cap && let Some(builder) = current.take() {
                     let built = builder
-                        .finish(store, bucket, input_set_hash, part_index, dry_run)
+                        .finish(store, bucket, input_set_hash, part_index, dry_run, ledger)
                         .await?;
                     parts.push(built);
                     part_index += 1;
@@ -462,14 +471,14 @@ pub(crate) async fn merge(
             let part = current.get_or_insert_with(|| PartBuilder::new(&identity));
             part.push(rec, tracker);
         }
-        cursors[bi].refill(store, tracker).await?;
+        cursors[bi].refill(store, tracker, ledger).await?;
     }
 
     if let Some(part) = current
         && !part.is_empty()
     {
         let built = part
-            .finish(store, bucket, input_set_hash, part_index, dry_run)
+            .finish(store, bucket, input_set_hash, part_index, dry_run, ledger)
             .await?;
         parts.push(built);
         if let Some(t) = tracker {
@@ -494,9 +503,10 @@ async fn open_cursor<'a>(
     catalog: &'a SpanInputCatalog,
     input_index: usize,
     tracker: Option<&MergeMemoryTracker>,
+    ledger: Option<&RequestLedger>,
 ) -> Result<BlockCursor<'a>> {
     let mut cursor = BlockCursor::open(catalog, input_index);
-    cursor.refill(store, tracker).await?;
+    cursor.refill(store, tracker, ledger).await?;
     Ok(cursor)
 }
 
@@ -557,6 +567,7 @@ impl PartBuilder {
         input_set_hash: &[u8; 32],
         part_index: u32,
         dry_run: bool,
+        ledger: Option<&RequestLedger>,
     ) -> Result<BuiltPart> {
         finalize_part(
             store,
@@ -566,6 +577,7 @@ impl PartBuilder {
             part_index,
             self.trace_count,
             dry_run,
+            ledger,
         )
         .await
     }
@@ -650,6 +662,7 @@ impl<'a> BlockCursor<'a> {
         &mut self,
         store: &dyn ObjectStoreBackend,
         tracker: Option<&MergeMemoryTracker>,
+        ledger: Option<&RequestLedger>,
     ) -> Result<()> {
         if let Some(rec) = self.block.next() {
             self.head = Some(rec);
@@ -661,7 +674,9 @@ impl<'a> BlockCursor<'a> {
             self.next_block += 1;
             let got = store
                 .get(self.object_key, GetRange::Range(loc.start(), loc.end()))
-                .await?;
+                .await;
+            note_get(ledger, RequestPhase::BlockRead, &got);
+            let got = got?;
             let raw_len = got.data.len() as u64;
             if let Some(t) = tracker {
                 t.block_fetched(raw_len);
@@ -711,6 +726,7 @@ impl<'a> BlockCursor<'a> {
 /// `level = 1`, the `input_set_hash`, and `part_index`), then PUT it
 /// `CreateIfAbsent`. The part's summary stats are read back from the produced
 /// object's own footer, so they describe exactly what was written.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn finalize_part(
     store: &dyn ObjectStoreBackend,
     bucket: &Bucket,
@@ -719,6 +735,7 @@ pub(crate) async fn finalize_part(
     part_index: u32,
     trace_count: u64,
     dry_run: bool,
+    ledger: Option<&RequestLedger>,
 ) -> Result<BuiltPart> {
     let object = writer.finish_compacted(1, input_set_hash.to_vec(), part_index)?;
     let object = bytes::Bytes::from(object);
@@ -777,7 +794,7 @@ pub(crate) async fn finalize_part(
         put_already_existed: false,
     };
     if !dry_run {
-        put_part(store, &built).await?;
+        put_part_with_ledger(store, &built, ledger).await?;
     }
     Ok(built)
 }

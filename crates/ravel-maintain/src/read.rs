@@ -22,7 +22,7 @@ use futures::stream::{StreamExt, TryStreamExt, iter as stream_iter};
 use ravel_commit::erasure::compute_compaction_input_set_hash;
 use ravel_commit::keys::{self, BucketEntry};
 use ravel_commit::record;
-use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError, list_all};
+use ravel_object_store::{GetRange, ObjectMeta, ObjectStoreBackend, StoreError};
 use ravel_proto::commit::v1::{CommitRecord, CompactionInputIdentity};
 use ravel_segment::{
     ExemplarInput, FooterLocation, FooterOutcome, ReaderLimits, ValueKind, decode_catalog_v4,
@@ -33,6 +33,7 @@ use ravel_types::{LabelSet, SeriesId, Signal};
 use crate::bucket::Bucket;
 use crate::config::CompactorConfig;
 use crate::error::{MaintainError, Result};
+use crate::request_ledger::{RequestLedger, RequestPhase, note_get, note_metadata};
 
 /// Persistent section-kind numbers (docs/segment-format.md); not re-exported
 /// by `ravel_segment`, named here as the format contract, same as ravel-bench.
@@ -66,13 +67,26 @@ pub struct BucketListing {
 /// A key matching no known shape is [`MaintainError::UnknownBucketEntry`]
 /// (fail loud on layout drift), never skipped.
 pub async fn list_bucket(store: &dyn ObjectStoreBackend, bucket: &Bucket) -> Result<BucketListing> {
+    list_bucket_with_ledger(store, bucket, None).await
+}
+
+/// [`list_bucket`], counting each listing page into `ledger`'s
+/// [`RequestPhase::List`] (ADR-0996 task 996-8). The listing drain is the same
+/// one [`ravel_object_store::list_all`] performs; it is spelled out here only so
+/// the per-page request count is recorded where the page is fetched, rather than
+/// inferred afterwards from a total.
+pub async fn list_bucket_with_ledger(
+    store: &dyn ObjectStoreBackend,
+    bucket: &Bucket,
+    ledger: Option<&RequestLedger>,
+) -> Result<BucketListing> {
     let prefix = keys::commit_shard_hour_prefix(
         &bucket.tenant_hash,
         bucket.signal,
         bucket.shard,
         bucket.ingest_hour_bucket,
     )?;
-    let metas = list_all(store, &prefix).await?;
+    let metas = list_all_counted(store, &prefix, ledger).await?;
     let mut listing = BucketListing::default();
     for meta in metas {
         match keys::partition_bucket_entry(&meta.key) {
@@ -91,6 +105,37 @@ pub async fn list_bucket(store: &dyn ObjectStoreBackend, bucket: &Bucket) -> Res
     listing.compaction_record_keys.sort();
     listing.rewrite_record_keys.sort();
     Ok(listing)
+}
+
+/// Drain every page of a listing, deduplicating by key per the cross-page
+/// guarantee, recording one [`RequestPhase::List`] request per page. Byte for
+/// byte the behaviour of [`ravel_object_store::list_all`]; only the counting
+/// hook is added, and a listing response body is not visible at the store seam,
+/// so no byte figure moves.
+async fn list_all_counted(
+    store: &dyn ObjectStoreBackend,
+    prefix: &str,
+    ledger: Option<&RequestLedger>,
+) -> Result<Vec<ObjectMeta>> {
+    let mut out: Vec<ObjectMeta> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut page_token = None;
+    loop {
+        // Recorded before the error check: a failed page was still spent.
+        let page = store.list(prefix, page_token).await;
+        note_metadata(ledger, RequestPhase::List);
+        let page = page?;
+        for meta in page.objects {
+            if seen.insert(meta.key.clone()) {
+                out.push(meta);
+            }
+        }
+        match page.next {
+            Some(next) => page_token = Some(next),
+            None => break,
+        }
+    }
+    Ok(out)
 }
 
 /// One decoded L0 input: its commit record plus the key it was listed at.
@@ -118,6 +163,19 @@ pub async fn load_inputs(
     commit_keys: &[String],
     concurrency: usize,
 ) -> Result<Vec<InputRecord>> {
+    load_inputs_with_ledger(store, bucket, commit_keys, concurrency, None).await
+}
+
+/// [`load_inputs`], counting each commit-record GET into `ledger`'s
+/// [`RequestPhase::RecordRead`] with the response bytes it returned (ADR-0996
+/// task 996-8).
+pub async fn load_inputs_with_ledger(
+    store: &dyn ObjectStoreBackend,
+    bucket: &Bucket,
+    commit_keys: &[String],
+    concurrency: usize,
+    ledger: Option<&RequestLedger>,
+) -> Result<Vec<InputRecord>> {
     // Box each GET future with an explicit `+ Send` bound before handing it to
     // `buffer_unordered`, the same workaround `crate::build::fetch_batch_pages`
     // documents: a bare `async` block borrowing the `&dyn ObjectStoreBackend`
@@ -126,7 +184,7 @@ pub async fn load_inputs(
     type InputFuture<'f> = Pin<Box<dyn Future<Output = Result<InputRecord>> + Send + 'f>>;
     let futures: Vec<InputFuture<'_>> = commit_keys
         .iter()
-        .map(|key| Box::pin(load_one_input(store, bucket, key)) as InputFuture<'_>)
+        .map(|key| Box::pin(load_one_input(store, bucket, key, ledger)) as InputFuture<'_>)
         .collect();
     let mut inputs: Vec<InputRecord> = stream_iter(futures)
         .buffer_unordered(concurrency.max(1))
@@ -154,8 +212,11 @@ async fn load_one_input(
     store: &dyn ObjectStoreBackend,
     bucket: &Bucket,
     key: &str,
+    ledger: Option<&RequestLedger>,
 ) -> Result<InputRecord> {
-    let got = store.get(key, GetRange::Full).await?;
+    let got = store.get(key, GetRange::Full).await;
+    note_get(ledger, RequestPhase::RecordRead, &got);
+    let got = got?;
     let record = record::decode(&got.data)?;
     // The record's key must reconstruct to the key we listed it at.
     verify_commit_key(&record, key)?;
@@ -335,18 +396,23 @@ pub async fn load_catalog_from_object(
     writer_seq: u64,
 ) -> Result<InputCatalog> {
     let limits = ReaderLimits::default();
+    let ledger = config.request_ledger.as_ref();
 
     // Locate the footer from a suffix probe.
     let probe = store
         .get(&object_key, GetRange::Suffix(config.footer_probe_bytes))
-        .await?;
+        .await;
+    note_get(ledger, RequestPhase::CatalogRead, &probe);
+    let probe = probe?;
     let total = probe.total_size;
     let loc = match open_from_suffix(&probe.data, total, limits)? {
         FooterOutcome::Ready(loc) => loc,
         FooterOutcome::NeedRange { offset, len } => {
             let tail = store
                 .get(&object_key, GetRange::Range(offset, offset + len))
-                .await?;
+                .await;
+            note_get(ledger, RequestPhase::CatalogRead, &tail);
+            let tail = tail?;
             match open_from_suffix(&tail.data, total, limits)? {
                 FooterOutcome::Ready(loc) => loc,
                 FooterOutcome::NeedRange { .. } => {
@@ -366,12 +432,13 @@ pub async fn load_catalog_from_object(
         // routine input shape, not a rare one; the whole-object GET is the
         // stated cost of the sparse catalog decode, not evidence of a corner
         // case.
-        let whole = store.get(&object_key, GetRange::Full).await?;
-        decode_catalog_v5(footer, &whole.data, limits)?
+        let whole = store.get(&object_key, GetRange::Full).await;
+        note_get(ledger, RequestPhase::CatalogRead, &whole);
+        decode_catalog_v5(footer, &whole?.data, limits)?
     } else {
-        let dict = get_section(store, &object_key, footer, LABEL_DICT).await?;
-        let ids = get_section(store, &object_key, footer, SERIES_IDS).await?;
-        let meta = get_section(store, &object_key, footer, SERIES_META).await?;
+        let dict = get_section(store, &object_key, footer, LABEL_DICT, ledger).await?;
+        let ids = get_section(store, &object_key, footer, SERIES_IDS, ledger).await?;
+        let meta = get_section(store, &object_key, footer, SERIES_META, ledger).await?;
         decode_catalog_v4(footer, &dict, &ids, &meta, limits)?
     };
 
@@ -418,7 +485,8 @@ pub async fn load_catalog_from_object(
         ));
     }
 
-    let exemplars = load_input_exemplars(store, &object_key, footer, limits, &series).await?;
+    let exemplars =
+        load_input_exemplars(store, &object_key, footer, limits, &series, ledger).await?;
 
     Ok(InputCatalog {
         object_key,
@@ -480,6 +548,7 @@ async fn load_input_exemplars(
     footer: &ravel_segment::Footer,
     limits: ReaderLimits,
     series: &[SeriesPlan],
+    ledger: Option<&RequestLedger>,
 ) -> Result<Vec<ExemplarInput>> {
     if !footer.sections.iter().any(|s| s.kind == EXEMPLARS) {
         return Ok(Vec::new());
@@ -492,8 +561,8 @@ async fn load_input_exemplars(
             footer.series_count
         )));
     }
-    let dict = get_section(store, object_key, footer, LABEL_DICT).await?;
-    let section = get_section(store, object_key, footer, EXEMPLARS).await?;
+    let dict = get_section(store, object_key, footer, LABEL_DICT, ledger).await?;
+    let section = get_section(store, object_key, footer, EXEMPLARS, ledger).await?;
     let records = decode_exemplars_section(footer, &dict, &section, limits)?;
 
     let mut out = Vec::with_capacity(records.len());
@@ -523,6 +592,7 @@ async fn get_section(
     key: &str,
     footer: &ravel_segment::Footer,
     kind: u32,
+    ledger: Option<&RequestLedger>,
 ) -> Result<bytes::Bytes> {
     let section = footer
         .sections
@@ -536,8 +606,9 @@ async fn get_section(
             key,
             GetRange::Range(section.offset, section.offset + section.len),
         )
-        .await?;
-    Ok(got.data)
+        .await;
+    note_get(ledger, RequestPhase::CatalogRead, &got);
+    Ok(got?.data)
 }
 
 #[cfg(test)]

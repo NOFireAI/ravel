@@ -13,6 +13,8 @@ use std::time::Duration;
 use ravel_types::{TenantHash, TenantId};
 use uuid::Uuid;
 
+use crate::request_ledger::RequestLedger;
+
 /// A test-injectable accounting hook for the RLOG and RSPAN compaction
 /// merges' peak resident memory (RLOG and RSPAN, ADR-0065 decision 4).
 ///
@@ -1012,6 +1014,16 @@ pub struct CompactorConfig {
     /// `..CompactorConfig::default()` call sites are unaffected. Default
     /// `None`.
     pub merge_memory_tracker: Option<MergeMemoryTracker>,
+    /// Optional test-injectable ledger of the run's store requests and wire
+    /// bytes, split by the phase that issued them (ADR-0996 task 996-8).
+    /// `None` in production (every hook is skipped); a test or an operator
+    /// build installs one and reads [`RequestLedger::report`] after the run.
+    /// Counters only: no fetch decision, coalescing choice, or budget anywhere
+    /// in this crate reads a ledger figure (see [`crate::request_ledger`]).
+    /// Carried in the config like every other merge knob, so
+    /// `..CompactorConfig::default()` call sites are unaffected. Default
+    /// `None`.
+    pub request_ledger: Option<RequestLedger>,
     /// Slow safety-net re-verify cadence for the interior zone (ADR-0065
     /// decision 3, config `maintain_interior_reverify`). A terminal interior
     /// bucket is re-evaluated no later than this after its last verification,
@@ -1046,6 +1058,7 @@ impl Default for CompactorConfig {
             audit_retention_window_ns: DEFAULT_AUDIT_RETENTION_NS,
             dry_run: false,
             merge_memory_tracker: None,
+            request_ledger: None,
             interior_reverify_ns: DEFAULT_INTERIOR_REVERIFY_NS,
         }
     }
