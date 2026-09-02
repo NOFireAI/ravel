@@ -215,6 +215,8 @@ A minimal example is in
 | `spec.maintain.enabled` | boolean | `true` | `false` deletes the maintain Deployment. |
 | `spec.maintain.intervalSecs` | integer | none | `--maintain-interval-secs`. |
 | `spec.maintain.resources` | object | none | |
+| `spec.gc.protectionHorizon` | string | none | `--gc-protection-horizon` on the maintain pods, a duration such as `25h5m`. It must equal the protection horizon stored in the bucket's `sys/gc`, read with `ravel-cli gc-config show`, or the maintain pods refuse to start. Unset renders no flag and the server's default applies. |
+| `spec.gc.grace` | string | none | `--gc-grace` on the maintain pods, a duration such as `24h`. It must equal the grace stored in the bucket's `sys/gc`, read with `ravel-cli gc-config show`, or the maintain pods refuse to start. Unset renders no flag and the server's default applies. |
 | `spec.retention.default` | string | none | Duration string, e.g. `30d`. |
 | `spec.retention.tenants` | map | none | Per-tenant overrides, tenant name to duration. |
 

@@ -1741,6 +1741,7 @@ mod tests {
             },
             query: QuerySpec::default(),
             maintain: MaintainSpec::default(),
+            gc: None,
             retention: None,
             shard_overrides: None,
         }
@@ -2446,6 +2447,7 @@ mod tests {
                 gateway: Default::default(),
                 query: Default::default(),
                 maintain: Default::default(),
+                gc: None,
                 retention: None,
                 shard_overrides: None,
             }
