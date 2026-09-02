@@ -25,9 +25,9 @@ use common::*;
 use ravel_commit::keys::{self, BucketEntry};
 use ravel_commit::{erasure, signal};
 use ravel_maintain::{
-    Bucket, CompactorConfig, ErasureRewriteOutcome, FixedClock, MaintainMemo, NoLeases,
-    PendingErasureRequest, SupersededSweepOutcome, erasure_rewrite_bucket, sweep_erasure_requests,
-    sweep_superseded,
+    Bucket, CompactorConfig, ErasureRequestSweepOutcome, ErasureRewriteOutcome, FixedClock,
+    MaintainMemo, NoLeases, PendingErasureRequest, SupersededSweepOutcome, erasure_rewrite_bucket,
+    sweep_erasure_requests, sweep_superseded,
 };
 use ravel_object_store::fault::{
     FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
@@ -58,6 +58,12 @@ fn old_bucket() -> Bucket {
 
 fn request_id() -> Uuid {
     Uuid::from_u128(REQUEST_SEED)
+}
+
+/// The `n`th distinct erasure request id; `request_id_n(0)` is
+/// [`request_id`]. Each one becomes its own rewrite generation.
+fn request_id_n(n: u128) -> Uuid {
+    Uuid::from_u128(REQUEST_SEED + n)
 }
 
 fn head_key() -> String {
@@ -123,23 +129,33 @@ async fn seed_two_hours(store: &dyn ObjectStoreBackend) -> [String; 2] {
 
 /// A windowless erasure request matching every series named `victim`.
 fn pending_request() -> PendingErasureRequest {
+    pending_request_for(request_id(), "victim")
+}
+
+/// A windowless erasure request under `id` matching every series named
+/// `series`.
+fn pending_request_for(id: Uuid, series: &str) -> PendingErasureRequest {
     PendingErasureRequest {
-        request_key: keys::erasure_request_key(&tenant_hash(), Signal::Metrics, request_id())
+        request_key: keys::erasure_request_key(&tenant_hash(), Signal::Metrics, id)
             .expect("dreq key"),
-        request: erasure_request(),
+        request: erasure_request_for(id, series),
     }
 }
 
 fn erasure_request() -> ErasureRequest {
+    erasure_request_for(request_id(), "victim")
+}
+
+fn erasure_request_for(id: Uuid, series: &str) -> ErasureRequest {
     ErasureRequest {
         format_version: 1,
         tenant_hash: tenant_hash().0.to_vec(),
         signal: signal::to_proto(Signal::Metrics) as i32,
-        request_id: request_id().to_string(),
+        request_id: id.to_string(),
         created_unix_ns: 0,
         predicate: vec![ErasurePredicateMatcher {
             key: "__name__".to_string(),
-            value: "victim".to_string(),
+            value: series.to_string(),
         }],
         window_start_ns: 0,
         window_end_ns: 0,
@@ -150,6 +166,18 @@ fn erasure_request() -> ErasureRequest {
 /// Publish a rewrite record into [`OLD_HOUR`], superseding both of its raw-L0
 /// inputs.
 async fn run_rewrite(store: &dyn ObjectStoreBackend, clock: &FixedClock) {
+    run_rewrite_with(store, clock, &[pending_request()]).await
+}
+
+/// Publish one rewrite generation into [`OLD_HOUR`] applying `pending`. The
+/// first call supersedes the bucket's raw L0 inputs; each later call with a
+/// request id no live generation has applied yet supersedes the generation
+/// before it, which is how these fixtures grow a supersession chain.
+async fn run_rewrite_with(
+    store: &dyn ObjectStoreBackend,
+    clock: &FixedClock,
+    pending: &[PendingErasureRequest],
+) {
     let mut memo = MaintainMemo::with_default_interval();
     let outcome = erasure_rewrite_bucket(
         store,
@@ -157,7 +185,7 @@ async fn run_rewrite(store: &dyn ObjectStoreBackend, clock: &FixedClock) {
         &cfg(),
         &NoLeases,
         &old_bucket(),
-        &[pending_request()],
+        pending,
         &mut memo,
     )
     .await
@@ -313,6 +341,117 @@ async fn rewrite_record_key(store: &dyn ObjectStoreBackend) -> String {
         }
     }
     panic!("no rewrite record in the old bucket");
+}
+
+/// The old bucket's rewrite record keys ordered oldest generation first: the
+/// one that superseded the raw L0 inputs, then each record that superseded the
+/// one before it. Reconstructed from the `superseded_record_key` pointers, so
+/// it never restates the sweep's own walk.
+async fn rewrite_chain(store: &dyn ObjectStoreBackend) -> Vec<String> {
+    let b = old_bucket();
+    let prefix =
+        keys::commit_shard_hour_prefix(&b.tenant_hash, b.signal, b.shard, b.ingest_hour_bucket)
+            .unwrap();
+    let mut records = Vec::new();
+    for meta in list_all(store, &prefix).await.unwrap() {
+        if matches!(
+            keys::partition_bucket_entry(&meta.key),
+            Ok(BucketEntry::RewriteRecord(_))
+        ) {
+            let bytes = get_full(store, &meta.key).await;
+            let record = erasure::decode_rewrite(&bytes).expect("rewrite record decodes");
+            records.push((meta.key, record));
+        }
+    }
+    let mut current = records
+        .iter()
+        .find(|(_, r)| !r.inputs.is_empty())
+        .expect("one generation supersedes the raw L0 inputs")
+        .0
+        .clone();
+    let mut chain = Vec::new();
+    loop {
+        chain.push(current.clone());
+        match records
+            .iter()
+            .find(|(_, r)| r.superseded_record_key == current)
+        {
+            Some((key, _)) => current = key.clone(),
+            None => return chain,
+        }
+    }
+}
+
+/// The L1 part keys the rewrite record at `key` names.
+async fn rewrite_part_keys(store: &dyn ObjectStoreBackend, key: &str) -> BTreeSet<String> {
+    let bytes = get_full(store, key).await;
+    let record = erasure::decode_rewrite(&bytes).expect("rewrite record decodes");
+    record
+        .parts
+        .iter()
+        .map(|part| keys::reconstruct_rewrite_part_key(&record, part).expect("part key"))
+        .collect()
+}
+
+/// Seed a `.dreq` for `id` over `series` and its `.done` completion, anchored
+/// at `completed` and naming [`OLD_HOUR`] as the one bucket it touched.
+async fn seed_dreq_and_done_for(
+    store: &dyn ObjectStoreBackend,
+    id: Uuid,
+    series: &str,
+    completed: i64,
+) -> (String, String) {
+    let dreq_key = keys::erasure_request_key(&tenant_hash(), Signal::Metrics, id).unwrap();
+    store
+        .put(
+            &dreq_key,
+            erasure::encode_request(&erasure_request_for(id, series)),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    let completion = ErasureCompletion {
+        format_version: 1,
+        tenant_hash: tenant_hash().0.to_vec(),
+        signal: signal::to_proto(Signal::Metrics) as i32,
+        request_id: id.to_string(),
+        predicate_hash: vec![0x11; 32],
+        bucket_drops: vec![ErasureBucketDrop {
+            signal: signal::to_proto(Signal::Metrics) as i32,
+            shard: SHARD,
+            ingest_hour_bucket: OLD_HOUR,
+            dropped_count: 2,
+        }],
+        requested_unix_ns: 0,
+        completed_unix_ns: completed,
+        deferral_cause: 0,
+    };
+    let done_key = keys::erasure_completion_key(&tenant_hash(), Signal::Metrics, id).unwrap();
+    store
+        .put(
+            &done_key,
+            erasure::encode_completion(&completion),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    (dreq_key, done_key)
+}
+
+async fn sweep_dreq(
+    store: &dyn ObjectStoreBackend,
+    clock: &FixedClock,
+) -> ravel_maintain::Result<ErasureRequestSweepOutcome> {
+    sweep_erasure_requests(
+        store,
+        clock,
+        &cfg(),
+        &NoLeases,
+        &tenant_hash(),
+        Signal::Metrics,
+    )
+    .await
 }
 
 fn past_horizon(created: i64) -> i64 {
@@ -750,4 +889,417 @@ async fn dreq_outlives_every_superseded_input_its_rewrite_left_resolvable() {
         mem.head(&done_key).await.is_ok(),
         ".done is permanent audit evidence, never swept"
     );
+}
+
+// --- (f) the erasure-invariant hole: supersession chains --------------------
+//
+// A rewrite record can itself be superseded by a later rewrite applying a
+// different request. Gating the later generation on its predecessor's OUTPUT
+// parts alone clears while a stale HEAD names the raw inputs at the end of the
+// chain, so the predecessor's record disappears and the request it applied is
+// no longer discoverable from any record. The `.dreq` guard then retires the
+// query-time exclusion filter while the raw inputs it erased the subject out of
+// are still present and HEAD-resolvable. Two rules close it: a rewrite record
+// outlives every input it superseded, and a `.dreq` outlives every input any
+// rewrite in its supersession chain superseded.
+
+/// The pieces of a supersession-chain fixture the assertions need.
+struct ChainFixture {
+    commit_keys: [String; 2],
+    input_data_keys: BTreeSet<String>,
+    /// Rewrite record keys, oldest generation first.
+    chain: Vec<String>,
+}
+
+/// Seed `generations` rewrite generations over [`OLD_HOUR`]'s two raw L0
+/// inputs. The oldest applies [`request_id`] over `victim` (the only request
+/// that erases anything here); each later one applies a fresh request id over a
+/// series name no input carries, so it republishes its predecessor's surviving
+/// rows and grows the chain without changing what is erased.
+///
+/// `reconcile` is the second fold's reconcile window: `None` leaves the hour
+/// unreconciled, so HEAD still names the raw inputs.
+async fn seed_chain(
+    mem: &Arc<MemoryStore>,
+    clock: &FixedClock,
+    created: i64,
+    generations: u128,
+    reconcile: Option<u32>,
+) -> ChainFixture {
+    let commit_keys = seed_two_hours(mem.as_ref()).await;
+    let input_data_keys = seeded_input_data_keys(mem.as_ref(), &commit_keys).await;
+    fold_head(mem, created, 1, None).await;
+    run_rewrite_with(mem.as_ref(), clock, &[pending_request()]).await;
+    for n in 1..generations {
+        run_rewrite_with(
+            mem.as_ref(),
+            clock,
+            &[pending_request_for(request_id_n(n), &format!("absent{n}"))],
+        )
+        .await;
+    }
+    fold_head(mem, created + 3 * NS_PER_HOUR, 2, reconcile).await;
+    let chain = rewrite_chain(mem.as_ref()).await;
+    assert_eq!(
+        u128::try_from(chain.len()).unwrap(),
+        generations,
+        "one rewrite generation per applied request"
+    );
+    ChainFixture {
+        commit_keys,
+        input_data_keys,
+        chain,
+    }
+}
+
+/// The reviewer's scenario. R1 applies X and supersedes the two raw L0 inputs
+/// carrying `victim`; R2 applies Y and supersedes R1; HEAD is never re-folded
+/// within reach of the hour, so it still names the raw inputs.
+///
+/// Past the horizon the sweep must delete nothing: the chain is one group, and
+/// a HEAD naming anything in it holds all of it, R1's own record included. The
+/// `.dreq` guard must then find X by walking the chain from R2 back through R1,
+/// and hold the filter.
+///
+/// Also pins the guard's request shape on this fixture: two LISTs (`del/` and
+/// the bucket's commit prefix) and five GETs (the `.done`, R1's and R2's
+/// records, and the two input commit records) for the whole pass, with the
+/// chain walk reusing the records the pass already read.
+///
+/// Flip-line proof: in `sweep_superseded_impl`, drop the
+/// `superseded_by_present.contains(key)` skip and gate each generation from its
+/// own entry again (equivalently, replace `gather_superseded_chain` with a
+/// gather of the predecessor's own record and parts). R1's record is then
+/// deleted while its raw inputs are held, the `records_deleted == 0` assertion
+/// fails, and the `.dreq` assertions fail with it.
+#[tokio::test]
+async fn superseded_predecessor_and_its_dreq_outlive_head_named_raw_inputs() {
+    let mem = Arc::new(MemoryStore::new());
+    let created = sealed_now_ns();
+    let clock = FixedClock::new(created);
+    let fixture = seed_chain(&mem, &clock, created, 2, None).await;
+    let r1 = fixture.chain[0].clone();
+    let r2 = fixture.chain[1].clone();
+    let r1_parts = rewrite_part_keys(mem.as_ref(), &r1).await;
+    assert_eq!(r1_parts.len(), 1, "R1 published exactly one part");
+
+    assert_eq!(
+        head_named_data_keys(mem.as_ref(), OLD_HOUR).await,
+        fixture.input_data_keys,
+        "the stale snapshot still names exactly the two pre-rewrite inputs"
+    );
+
+    let (dreq_x, _) = seed_dreq_and_done_for(mem.as_ref(), request_id(), "victim", created).await;
+
+    clock.set(past_horizon(created));
+    let out = sweep(mem.as_ref(), &clock).await.expect("superseded sweep");
+    assert_eq!(
+        out.records_deleted, 0,
+        "no record deleted: R1 is part of the held chain group, not its own gate"
+    );
+    assert_eq!(out.data_deleted, 0, "no data object deleted");
+    assert_eq!(
+        out.held_by_snapshot, 6,
+        "one group of six: two input commit records, two input data objects, R1's single \
+         part, and R1's own record"
+    );
+    assert_eq!(out.held_by_unreadable_head, 0);
+
+    // Exact surviving key sets.
+    assert_eq!(
+        present_keys(mem.as_ref(), &fixture.input_data_keys).await,
+        fixture.input_data_keys,
+        "both victim inputs still present"
+    );
+    let mut records: BTreeSet<String> = fixture.commit_keys.iter().cloned().collect();
+    records.insert(r1.clone());
+    records.insert(r2.clone());
+    assert_eq!(
+        present_keys(mem.as_ref(), &records).await,
+        records,
+        "R1's record survives with the inputs it superseded, and so does R2"
+    );
+    assert_eq!(
+        present_keys(mem.as_ref(), &r1_parts).await,
+        r1_parts,
+        "R1's parts survive with its record"
+    );
+
+    // The guard's request shape is asserted, not printed: the sixth GET and the
+    // third LIST of the pass both fault, so the pass succeeding proves the
+    // counts.
+    let plan = FaultPlan::empty()
+        .with_rule(Rule::new(Op::Get, ScriptedFault::Timeout).with_occurrence(Occurrence::Nth(6)))
+        .with_rule(Rule::new(Op::List, ScriptedFault::Timeout).with_occurrence(Occurrence::Nth(3)));
+    let store = FaultStore::new(mem.clone(), plan);
+    let dreq = sweep_dreq(&store, &clock)
+        .await
+        .expect("the chain walk reads each record once, so no sixth GET and no third LIST");
+    assert_eq!(
+        dreq.deleted, 0,
+        ".dreq_X outlives the inputs R1 erased the subject out of"
+    );
+    assert_eq!(dreq.kept, 1);
+    assert_eq!(
+        dreq.held_by_superseded_inputs, 1,
+        "held for the stated reason: X is found by walking R2 -> R1, whose inputs are present"
+    );
+    assert_eq!(
+        store.fault_count(Op::Get, FaultKind::Timeout),
+        0,
+        "exactly five GETs: the .done, R1's and R2's records, and the two input commit records"
+    );
+    assert_eq!(
+        store.fault_count(Op::List, FaultKind::Timeout),
+        0,
+        "exactly two LISTs: the del/ prefix and the touched bucket's commit prefix"
+    );
+    assert!(
+        mem.head(&dreq_x).await.is_ok(),
+        ".dreq_X physically present"
+    );
+}
+
+/// The same chain, once the fold has reconciled the hour: the gate clears and
+/// the whole chain is collected in the one order the invariant allows. The
+/// superseded inputs go first and R1's record goes last, proven by faulting
+/// exactly R1's record delete and observing what is already gone at that
+/// instant. A second, clean pass finishes R1, and only then does the `.dreq`
+/// sweep retire the filter.
+///
+/// Flip-line proof: move the `chain_record_keys` delete loop in
+/// `sweep_superseded_impl` ahead of the `data_keys` loop. R1's record is then
+/// deleted before the inputs it superseded, and the "already gone at the fault"
+/// assertions fail.
+#[tokio::test]
+async fn reconciled_chain_deletes_the_superseded_inputs_before_the_record_that_erased_them() {
+    let mem = Arc::new(MemoryStore::new());
+    let created = sealed_now_ns();
+    let clock = FixedClock::new(created);
+    let fixture = seed_chain(&mem, &clock, created, 2, Some(200)).await;
+    let r1 = fixture.chain[0].clone();
+    let r2 = fixture.chain[1].clone();
+    let r1_parts = rewrite_part_keys(mem.as_ref(), &r1).await;
+    let r2_parts = rewrite_part_keys(mem.as_ref(), &r2).await;
+
+    let named = head_named_data_keys(mem.as_ref(), OLD_HOUR).await;
+    assert_eq!(
+        named, r2_parts,
+        "the reconciled snapshot names exactly the live generation's parts"
+    );
+
+    let (dreq_x, done_x) =
+        seed_dreq_and_done_for(mem.as_ref(), request_id(), "victim", created).await;
+
+    // Step 1: fault exactly R1's record delete. Everything the invariant
+    // requires to be gone before it must already be gone.
+    clock.set(past_horizon(created));
+    let plan = FaultPlan::empty()
+        .with_rule(Rule::new(Op::Delete, ScriptedFault::Timeout).with_key_contains(r1.clone()));
+    let store = FaultStore::new(mem.clone(), plan);
+    let err = sweep(&store, &clock).await;
+    assert!(
+        err.is_err(),
+        "the faulted delete of R1's record surfaces as a pass error"
+    );
+    assert_eq!(
+        store.fault_count(Op::Delete, FaultKind::Timeout),
+        1,
+        "exactly one delete was aimed at R1's record"
+    );
+    assert_eq!(
+        present_keys(mem.as_ref(), &fixture.input_data_keys).await,
+        BTreeSet::new(),
+        "every input R1 superseded is already gone when its record's delete is issued"
+    );
+    for key in &fixture.commit_keys {
+        assert!(
+            mem.head(key).await.is_err(),
+            "the superseded input's commit record went before R1's record too"
+        );
+    }
+    assert_eq!(
+        present_keys(mem.as_ref(), &r1_parts).await,
+        BTreeSet::new(),
+        "R1's own parts went before R1's record"
+    );
+    assert!(
+        mem.head(&r1).await.is_ok(),
+        "R1's record is still there: its delete is the one that faulted"
+    );
+    assert!(
+        mem.head(&dreq_x).await.is_ok(),
+        "the filter is still live while R1's record is"
+    );
+
+    // Step 2: a clean pass finishes the job. The group's inputs are already
+    // gone, so it is R1's record and the parts it names, re-issued idempotently.
+    let out = sweep(mem.as_ref(), &clock).await.expect("superseded sweep");
+    assert_eq!(out.records_deleted, 1, "R1's record, and nothing else");
+    assert_eq!(
+        out.data_deleted, 1,
+        "R1's single part, deleted again now that the pass reaches past the fault"
+    );
+    assert_eq!((out.held_by_snapshot, out.held_by_unreadable_head), (0, 0));
+    assert!(mem.head(&r1).await.is_err(), "R1's record is gone");
+    assert!(mem.head(&r2).await.is_ok(), "the live generation survives");
+    assert_eq!(
+        present_keys(mem.as_ref(), &r2_parts).await,
+        r2_parts,
+        "the live generation's parts survive"
+    );
+
+    // Step 3: only with every superseded input gone does the filter retire.
+    let dreq = sweep_dreq(mem.as_ref(), &clock).await.expect("dreq sweep");
+    assert_eq!(dreq.deleted, 1, ".dreq_X is removed once, and only now");
+    assert_eq!(dreq.kept, 0);
+    assert_eq!(dreq.held_by_superseded_inputs, 0);
+    assert!(mem.head(&dreq_x).await.is_err(), ".dreq_X physically gone");
+    assert!(
+        mem.head(&done_x).await.is_ok(),
+        ".done is permanent audit evidence, never swept"
+    );
+}
+
+/// Three generations: R1 applies X, R2 applies Y and supersedes R1, R3 applies
+/// Z and supersedes R2. Only R1's raw inputs are HEAD-named, and that holds
+/// every record in the chain and every one of the three `.dreq` objects: each
+/// superseded generation's parts still carry whatever the generation above it
+/// erased, so the same rule covers Y and Z without a special case.
+///
+/// Flip-line proof: stop the walk in `gather_superseded_chain` after one
+/// generation (`break` instead of following `superseded_record_key`). R1 and its
+/// inputs then fall outside the group R3's entry gates, the chain is collected
+/// from the top down, and the `records_deleted == 0` and
+/// `held_by_superseded_inputs == 3` assertions both fail.
+#[tokio::test]
+async fn three_deep_chain_holds_every_generation_and_every_request() {
+    let mem = Arc::new(MemoryStore::new());
+    let created = sealed_now_ns();
+    let clock = FixedClock::new(created);
+    let fixture = seed_chain(&mem, &clock, created, 3, None).await;
+    let r1_parts = rewrite_part_keys(mem.as_ref(), &fixture.chain[0]).await;
+    let r2_parts = rewrite_part_keys(mem.as_ref(), &fixture.chain[1]).await;
+    assert_eq!(r1_parts.len(), 1);
+    assert_eq!(r2_parts.len(), 1);
+
+    assert_eq!(
+        head_named_data_keys(mem.as_ref(), OLD_HOUR).await,
+        fixture.input_data_keys,
+        "only R1's raw inputs are HEAD-named"
+    );
+
+    let mut dreqs = BTreeSet::new();
+    for n in 0..3u128 {
+        let series = if n == 0 {
+            "victim".to_string()
+        } else {
+            format!("absent{n}")
+        };
+        let (dreq, _) =
+            seed_dreq_and_done_for(mem.as_ref(), request_id_n(n), &series, created).await;
+        dreqs.insert(dreq);
+    }
+    assert_eq!(dreqs.len(), 3, "three distinct requests");
+
+    clock.set(past_horizon(created));
+    let out = sweep(mem.as_ref(), &clock).await.expect("superseded sweep");
+    assert_eq!(
+        (out.records_deleted, out.data_deleted),
+        (0, 0),
+        "no record in the chain is deleted while R1's inputs are present"
+    );
+    assert_eq!(
+        out.held_by_snapshot, 8,
+        "one group of eight: two input commit records, two input data objects, R1's and R2's \
+         one part each, and R1's and R2's own records"
+    );
+    assert_eq!(out.held_by_unreadable_head, 0);
+
+    let mut survivors: BTreeSet<String> = fixture.chain.iter().cloned().collect();
+    survivors.extend(fixture.commit_keys.iter().cloned());
+    survivors.extend(fixture.input_data_keys.iter().cloned());
+    survivors.extend(r1_parts.iter().cloned());
+    survivors.extend(r2_parts.iter().cloned());
+    assert_eq!(
+        present_keys(mem.as_ref(), &survivors).await,
+        survivors,
+        "every generation, its parts, and the raw inputs all survive"
+    );
+
+    let dreq = sweep_dreq(mem.as_ref(), &clock).await.expect("dreq sweep");
+    assert_eq!(dreq.deleted, 0, "no filter retires");
+    assert_eq!(dreq.kept, 3);
+    assert_eq!(
+        dreq.held_by_superseded_inputs, 3,
+        "X because R1's raw inputs are present, Y and Z because a generation each superseded \
+         is still present"
+    );
+    assert_eq!(
+        present_keys(mem.as_ref(), &dreqs).await,
+        dreqs,
+        "all three .dreq objects physically present"
+    );
+}
+
+/// The guard on its own, with deliverable 1's ordering removed by hand: R1's
+/// record is deleted directly, as an older sweep would have left it, while its
+/// raw inputs stay. The chain from R2 is then cut at a missing record, so X is
+/// named nowhere, and the guard must still hold `.dreq_X` rather than infer
+/// from "no record mentions X" that nothing is outstanding.
+///
+/// The hold terminates: once every object the missing generation could have
+/// superseded is gone, the same guard retires the filter on the next pass.
+///
+/// Flip-line proof: delete the `walk.truncated` arm of the decision in
+/// `superseded_inputs_outstanding` (keep only the
+/// `walk.request_ids.contains(request_id)` branch). The cut chain then reports
+/// nothing outstanding and the `deleted == 0` assertion fails.
+#[tokio::test]
+async fn dreq_guard_holds_when_the_record_that_applied_the_request_is_already_gone() {
+    let mem = Arc::new(MemoryStore::new());
+    let created = sealed_now_ns();
+    let clock = FixedClock::new(created);
+    let fixture = seed_chain(&mem, &clock, created, 2, None).await;
+    let r1 = fixture.chain[0].clone();
+    let r1_parts = rewrite_part_keys(mem.as_ref(), &r1).await;
+    let (dreq_x, _) = seed_dreq_and_done_for(mem.as_ref(), request_id(), "victim", created).await;
+
+    // An older sweep's leftover: the record that applied X is gone, the inputs
+    // it superseded are not.
+    mem.delete(&r1).await.expect("delete R1's record");
+    assert_eq!(
+        present_keys(mem.as_ref(), &fixture.input_data_keys).await,
+        fixture.input_data_keys,
+        "the inputs R1 superseded are still present"
+    );
+
+    clock.set(past_horizon(created));
+    let dreq = sweep_dreq(mem.as_ref(), &clock).await.expect("dreq sweep");
+    assert_eq!(
+        dreq.deleted, 0,
+        "the chain from R2 is cut at the missing record and the bucket still holds raw inputs, \
+         so the filter stays even though no record names X"
+    );
+    assert_eq!(dreq.kept, 1);
+    assert_eq!(dreq.held_by_superseded_inputs, 1);
+    assert!(
+        mem.head(&dreq_x).await.is_ok(),
+        ".dreq_X physically present"
+    );
+
+    // Remove everything the missing generation could have superseded.
+    for key in fixture
+        .commit_keys
+        .iter()
+        .chain(fixture.input_data_keys.iter())
+        .chain(r1_parts.iter())
+    {
+        mem.delete(key).await.expect("delete a residual object");
+    }
+    let dreq = sweep_dreq(mem.as_ref(), &clock).await.expect("dreq sweep");
+    assert_eq!(dreq.deleted, 1, "the hold terminates on the next pass");
+    assert_eq!(dreq.kept, 0);
+    assert_eq!(dreq.held_by_superseded_inputs, 0);
+    assert!(mem.head(&dreq_x).await.is_err(), ".dreq_X physically gone");
 }
