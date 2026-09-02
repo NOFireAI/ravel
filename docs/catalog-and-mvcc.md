@@ -615,8 +615,10 @@ already-sealed hours:
   retirement frontier is re-listed by neither pass, so its covering part
   keeps naming the pre-rewrite inputs until the frontier band reaches that
   hour, or until an operator rebuilds HEAD. Subject erasure stays correct
-  meanwhile (the query-time predicate outlives the inputs); the availability
-  cost once the sweeper deletes those inputs is stated in
+  meanwhile (the query-time predicate outlives the inputs), and the sweeper
+  does not delete an input the covering part still names: it holds it until
+  one of those two events, so a query over the hour keeps resolving normally.
+  What that hold costs, and what it guarantees, is stated in
   docs/deletion-and-gc.md, "Selective subject erasure".
 - **Skipped when redundant.** The pass does not run on the first fold for a
   tenant (no previous watermark exists) or on a rebuilt fold (absent, corrupt,
