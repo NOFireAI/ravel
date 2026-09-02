@@ -302,7 +302,7 @@ pub struct Cli {
     #[arg(long = "indexed-field-tenant", value_name = "TENANT=FIELDS")]
     pub indexed_field_tenants: Vec<String>,
 
-    /// Declared typed attribute column for the `logs` SQL table (ADR-0090
+    /// Typed attribute column for the `logs` SQL table (ADR-0090
     /// decision 1), as a repeatable `--typed-attr-column KEY:TYPE` (e.g.
     /// `--typed-attr-column http.duration_ms:i64`). The declared key becomes a
     /// native typed SQL column named exactly `KEY` (double-quote it in SQL if
@@ -311,13 +311,13 @@ pub struct Cli {
     /// case-insensitive; `f64`, date, and timestamp are deferred by ADR-0090.
     /// This is the process-wide default, applied to every tenant with no
     /// per-tenant override and no durable `TenantConfig.typed_attr_columns`
-    /// override. Unset means zero declared columns: there is no shipped
-    /// default declaration, because a declared column changes the SQL schema a
-    /// tenant's queries see.
+    /// override. Unset means zero typed attribute columns: there is no shipped
+    /// default declaration, because a typed attribute column changes the SQL
+    /// schema a tenant's queries see.
     #[arg(long = "typed-attr-column", value_name = "KEY:TYPE")]
     pub typed_attr_columns: Vec<String>,
 
-    /// Repeatable per-tenant declared typed attribute column,
+    /// Repeatable per-tenant typed attribute column,
     /// `TENANT:KEY:TYPE` (e.g. `--typed-attr-column-tenant
     /// acme:http.duration_ms:i64`). Every flag naming the same tenant
     /// accumulates into that tenant's one ordered declaration, in flag order;
@@ -726,7 +726,7 @@ pub struct Cli {
     /// would not actually slow the fast tier down for a buffered tenant
     /// that crosses it sooner. Omitted, along with the other two, defaults
     /// to [`ravel_ingest::IngestConfig::default().max_flush_delay`] (2s). A
-    /// zero or unparseable duration fails startup.
+    /// zero or unparseable duration fails startup. (default: 2s)
     #[arg(long = "max-flush-delay", value_name = "DURATION")]
     pub max_flush_delay: Option<String>,
 
@@ -740,7 +740,7 @@ pub struct Cli {
     /// for the partial-override rejection. Omitted, along with the other
     /// two, defaults to
     /// [`ravel_ingest::IngestConfig::default().max_flush_delay_idle`] (40s).
-    /// A zero or unparseable duration fails startup.
+    /// A zero or unparseable duration fails startup. (default: 40s)
     #[arg(long = "max-flush-delay-idle", value_name = "DURATION")]
     pub max_flush_delay_idle: Option<String>,
 
@@ -858,9 +858,10 @@ pub struct Cli {
     /// `ravel-cli gc-config set`. Feeds the real compactor
     /// (`CompactorConfig::protection_horizon_ns`) as well as the validation,
     /// so it is enforced, not merely checked. Omitted defaults to
-    /// `ravel_maintain::config::DEFAULT_PROTECTION_HORIZON_NS` (25h), the
+    /// `ravel_maintain::config::DEFAULT_PROTECTION_HORIZON_NS` (25h 5min), the
     /// compiled-in compactor default, so an operator who sets none of the
     /// `--gc-*` flags gets byte-identical behavior to before they existed.
+    /// (default: 25h 5min)
     #[arg(long, value_name = "DURATION")]
     pub gc_protection_horizon: Option<String>,
 
@@ -869,6 +870,7 @@ pub struct Cli {
     /// `grace` (must-match, ADR-0050 section 4). Feeds the real compactor
     /// (`CompactorConfig::grace_ns`) as well as the validation. Omitted
     /// defaults to `ravel_maintain::config::DEFAULT_GRACE_NS` (24h).
+    /// (default: 24h)
     #[arg(long, value_name = "DURATION")]
     pub gc_grace: Option<String>,
 
@@ -881,7 +883,7 @@ pub struct Cli {
     /// engine deadline, so behavior is byte-identical when unset. Note this
     /// is the *engine's* enforced query timeout, a distinct quantity from
     /// `sys/gc`'s `max_query_duration` (the GC protection budget the timeout
-    /// must fit under); the flag governs the former.
+    /// must fit under); the flag governs the former. (default: 30s)
     #[arg(long, value_name = "DURATION")]
     pub gc_max_query_duration: Option<String>,
 
@@ -902,7 +904,7 @@ pub struct Cli {
     /// `store_probe::K` consecutive failed probes `/readyz` flips to 503; a
     /// single success recovers it. Matches the `--gc-*`/`--retention-*`
     /// humantime-duration flag convention. Omitted defaults to
-    /// `store_probe::DEFAULT_STORE_PROBE_INTERVAL` (30s).
+    /// `store_probe::DEFAULT_STORE_PROBE_INTERVAL` (30s). (default: 30s)
     #[arg(long, value_name = "DURATION")]
     pub store_probe_interval: Option<String>,
 
