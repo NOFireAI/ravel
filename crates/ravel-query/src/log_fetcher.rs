@@ -2174,6 +2174,81 @@ impl LogSegmentFetcher {
         Ok(Predicate::And(arms))
     }
 
+    /// Fetch and decode just the STREAM_DIR section (ADR-1103 decision 2's
+    /// cost model): the same ADR-0107 probe [`fetch_footer`](Self::fetch_footer)
+    /// issues, then the one front section the footer's directory locates it
+    /// at, reading no BLOCKS byte and no other directory section. Mirrors
+    /// [`fetch_skip_index`](Self::fetch_skip_index)'s shape; the only
+    /// difference is that STREAM_DIR sits at the object FRONT, so unlike
+    /// SKIP_IDX it is essentially never covered by the tail suffix probe and
+    /// [`plan_section_raw`](Self::plan_section_raw) issues its own range GET
+    /// for it.
+    ///
+    /// Returns `None` when the object's footer carries no STREAM_DIR section
+    /// at all (never observed on a real object today, but the same
+    /// "kind the footer does not carry is skipped" tolerance
+    /// [`place_front_sections`](Self::place_front_sections) documents applies
+    /// here rather than treating an absent directory as corruption). Otherwise
+    /// returns every entry's stream id and its raw (still-encoded)
+    /// stream-attrs blob, for the caller to decode with
+    /// [`ravel_logseg::record::decode_stream_attrs`].
+    ///
+    /// At or below [`Self::block_range_threshold`] this takes the same
+    /// whole-object crossover [`plan_segment`](Self::plan_segment) and
+    /// [`tenant_bytes`](Self::tenant_bytes) apply, via
+    /// [`whole_object_bytes`](Self::whole_object_bytes): a ranged probe would
+    /// pay for a second cache key on an object [`fetch_footer`](Self::fetch_footer)'s
+    /// doc explains is already read whole in one GET below the threshold. Above
+    /// it, the ranged probe-then-section path below is what actually saves the
+    /// BLOCKS bytes the ADR-1103 cost model counts on.
+    pub(crate) async fn fetch_stream_dir(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        accounting: &QueryAccounting,
+    ) -> Result<Option<Vec<(LogStreamId, Vec<u8>)>>, LogFetchError> {
+        let key = seg_ref.data_object_key.as_str();
+        let dir = if seg_ref.object_size > self.block_range_threshold {
+            let mut stats = BlockRangeStats::default();
+            let pin = EtagPin::default();
+            let phase = ReadPhases::PLAN.metadata;
+            let (footer, resident) = self
+                .block_range
+                .probe_footer(seg_ref, tenant_hash, phase, &pin, accounting, &mut stats)
+                .await?;
+
+            let Some(stream_desc) = footer.section(kind::STREAM_DIR).copied() else {
+                return Ok(None);
+            };
+            let raw = self
+                .block_range
+                .plan_section_raw(
+                    seg_ref,
+                    tenant_hash,
+                    &stream_desc,
+                    &resident,
+                    phase,
+                    &pin,
+                    accounting,
+                    &mut stats,
+                )
+                .await?;
+            StreamDir::decode(&raw, MAX_STREAMS).map_err(|source| corrupt(key, source))?
+        } else {
+            let bytes = self
+                .whole_object_bytes(seg_ref, tenant_hash, QueryPhase::Plan, accounting)
+                .await?;
+            self.decode_stream_dir(&bytes)
+                .map_err(|source| corrupt(key, source))?
+        };
+        Ok(Some(
+            dir.entries()
+                .iter()
+                .map(|entry| (entry.stream_id, entry.blob.clone()))
+                .collect(),
+        ))
+    }
+
     /// Decodes the STREAM_DIR section of an object from its own public section
     /// descriptor, using the crate's public whole-section reader.
     /// This does not go through [`RlogReader`], which decodes STREAM_DIR

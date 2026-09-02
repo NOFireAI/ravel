@@ -7,38 +7,21 @@
 //! `resolve_series_inner`. This module is self-contained and has no
 //! dependency on `engine.rs`.
 //!
-//! # Plan-phase stream discovery: a known deviation from the ADR's cost model
+//! # Plan-phase stream discovery
 //!
-//! ADR-1103 decision 2 says stream-label-set discovery "costs one STREAM_DIR
-//! decode per candidate object, the same cost
-//! [`LogSegmentFetcher::plan_segment`] already pays" -- i.e. a directory-only
-//! read with no block data moved. That cost model assumes a caller can reach
-//! `LogSegmentFetcher::decode_stream_dir`, but that method carries no
-//! visibility modifier, so it is private to `log_fetcher.rs`'s own module and
-//! unreachable from this one even though both live in `ravel-query`,
-//! Rust's module-privacy default and not a byproduct of module nesting.
-//! `plan_segment` itself does not expose the decoded [`StreamDir`] entries
-//! either, only a block-survivor count. `fetch_footer` reads exactly the
-//! footer and discards the resident probe bytes STREAM_DIR would need to be
-//! sliced from. This task's scope is five named files and does not include
-//! `log_fetcher.rs`, so this module cannot add a public accessor for that
-//! read to close the gap.
-//!
-//! Given that, this module discovers per-segment stream identity with
-//! [`LogSegmentFetcher::fetch_accounted_with_tenant`] under the caller's Plan
-//! accounting handle: a full, decoded read of the segment rather than a
-//! directory-only one. This is correct -- every decoded record always
-//! carries its own `stream_id` and `stream_attrs`, so the discovered label
-//! sets and the `Predicate::StreamIn` built from them are exact, not an
-//! approximation -- but it costs strictly more than the ADR's stated model: a
-//! segment that survives the stream-match prune is read twice, once here and
-//! once by the Scan-phase projected scan. Flagging this as the report
-//! requires rather than silently absorbing the extra cost: a follow-up that
-//! marks `decode_stream_dir` `pub(crate)`, or adds a dedicated
-//! `fetch_stream_dir` mirroring `fetch_skip_index`, would let this module's
-//! Plan phase match the ADR's cost model exactly.
-//!
-//! [`StreamDir`]: ravel_logseg::stream_dir::StreamDir
+//! ADR-1103 decision 2's cost model -- stream-label-set discovery "costs one
+//! STREAM_DIR decode per candidate object, the same cost
+//! [`LogSegmentFetcher::plan_segment`] already pays" -- is implemented
+//! exactly, not approximated: [`LogSegmentFetcher::fetch_stream_dir`] reads
+//! the footer plus the STREAM_DIR section only, moving no BLOCKS byte. This
+//! module decodes each entry's stream-attrs blob once (cached by
+//! [`LogStreamId`] across segments, so a stream repeated in a later segment
+//! costs no further decode) and evaluates the selector's stream-level
+//! matchers against the resulting label set, building an exact
+//! `Predicate::StreamIn` naming every matching stream. A segment with at
+//! least one matching stream is then read exactly once, under Scan, with the
+//! projected column set the selector needs; a segment with none is pruned
+//! before any Scan-phase GET. No segment is read twice.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -326,6 +309,8 @@ pub enum LogSeriesError {
     Fetch(#[from] LogFetchError),
     #[error("corrupt stream_attrs blob: {0}")]
     Decode(#[from] LogSegError),
+    #[error("record's stream {stream_id:?} is not present in its segment's STREAM_DIR")]
+    UnknownStream { stream_id: LogStreamId },
 }
 
 /// Every stream-level matcher (every matcher other than `__name__`,
@@ -354,11 +339,21 @@ fn matches_str(m: &LabelMatcher, subject: &str) -> bool {
     }
 }
 
-fn body_matches(matchers: &[&LabelMatcher], body: &str) -> bool {
+/// Every `__body__` matcher (ADR-1103 decision 3): a matcher-only pseudo-label
+/// evaluated per decoded record with no block-level pushdown. `matchers` must
+/// come from [`body_matchers`], called on the full request matcher list --
+/// `__body__` is filtered out of [`stream_matchers`]'s stream-level list, so
+/// deriving this from that list instead silently drops every `__body__`
+/// matcher and this function then evaluates over an empty slice.
+fn body_matchers(matchers: &[LabelMatcher]) -> Vec<&LabelMatcher> {
     matchers
         .iter()
         .filter(|m| m.name == BODY_MATCHER_LABEL)
-        .all(|m| matches_str(m, body))
+        .collect()
+}
+
+fn body_matches(matchers: &[&LabelMatcher], body: &str) -> bool {
+    matchers.iter().all(|m| matches_str(m, body))
 }
 
 fn severity_content_predicate(matchers: &[LabelMatcher]) -> Option<&LabelMatcher> {
@@ -392,8 +387,7 @@ fn deadline_exceeded(deadline: Option<Instant>) -> Option<LogSeriesError> {
 
 /// Answers one log selector by planning and scanning `segments` in order
 /// (ADR-1103 decision 4). See the module doc for the Plan-phase stream
-/// discovery mechanism and its documented deviation from the ADR's cost
-/// model.
+/// discovery mechanism.
 pub async fn fetch_log_series(
     fetcher: &LogSegmentFetcher,
     tenant_hash: TenantHash,
@@ -402,8 +396,8 @@ pub async fn fetch_log_series(
     accounting: &PhaseAccounting,
 ) -> Result<LogSeriesOutput, LogSeriesError> {
     let stream_ms = stream_matchers(req.matchers);
-    let needs_body =
-        req.metric.needs_body() || stream_ms.iter().any(|m| m.name == BODY_MATCHER_LABEL);
+    let body_ms = body_matchers(req.matchers);
+    let needs_body = req.metric.needs_body() || !body_ms.is_empty();
     let severity_eq = severity_content_predicate(req.matchers);
     let severity_post = severity_postfilters(req.matchers);
 
@@ -444,36 +438,31 @@ pub async fn fetch_log_series(
             continue;
         }
 
-        // (a) Plan phase: discover this segment's distinct streams and build
-        // their label sets, caching by LogStreamId across segments so a
+        // (a) Plan phase: STREAM_DIR-only discovery (ADR-1103 decision 2) --
+        // reads the footer plus the STREAM_DIR section, no BLOCKS byte.
+        // Stream label sets are cached by LogStreamId across segments so a
         // stream repeated in a later segment costs no further decode.
-        let discovery_query = LogQuery::new(req.window.start_ns, req.window.end_ns);
-        let discovered = fetcher
-            .fetch_accounted_with_tenant(seg_ref, tenant_hash, &discovery_query, accounting.plan())
-            .await?;
-        let Some(discovered) = discovered else {
+        let Some(entries) = fetcher
+            .fetch_stream_dir(seg_ref, tenant_hash, accounting.plan())
+            .await?
+        else {
             segments_pruned += 1;
             continue;
         };
 
         let mut matching_streams: Vec<LogStreamId> = Vec::new();
-        let mut seen_streams: std::collections::HashSet<LogStreamId> =
-            std::collections::HashSet::new();
-        for record in &discovered.records {
-            if !seen_streams.insert(record.stream_id) {
-                continue;
-            }
-            let labels = match stream_label_cache.get(&record.stream_id) {
+        for (stream_id, blob) in &entries {
+            let labels = match stream_label_cache.get(stream_id) {
                 Some(labels) => labels.clone(),
                 None => {
-                    let attrs = decode_stream_attrs(&record.stream_attrs)?;
+                    let attrs = decode_stream_attrs(blob)?;
                     let labels = stream_label_set(req.metric, &attrs);
-                    stream_label_cache.insert(record.stream_id, labels.clone());
+                    stream_label_cache.insert(*stream_id, labels.clone());
                     labels
                 }
             };
             if stream_ms.iter().all(|m| m.is_match(&labels)) {
-                matching_streams.push(record.stream_id);
+                matching_streams.push(*stream_id);
             }
         }
 
@@ -517,29 +506,21 @@ pub async fn fetch_log_series(
                 {
                     continue;
                 }
-                if !body_matches(&stream_ms, &record.body) {
+                if !body_matches(&body_ms, &record.body) {
                     continue;
                 }
 
-                // Every record surviving `Predicate::StreamIn` has a
-                // stream_id from `matching_streams`, which this segment's
-                // discovery pass above always caches first; the empty
-                // fallback is unreachable in practice, not a real code path
-                // (never `.expect`/`.unwrap`, per this workspace's rule).
-                let stream_labels = stream_label_cache
-                    .get(&record.stream_id)
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        stream_label_set(
-                            req.metric,
-                            &StreamAttrs {
-                                resource: Vec::new(),
-                                scope_name: String::new(),
-                                scope_version: String::new(),
-                                scope_attrs: Vec::new(),
-                            },
-                        )
-                    });
+                // Every record surviving `Predicate::StreamIn` names a
+                // stream from `matching_streams`, which the Plan-phase
+                // STREAM_DIR discovery above always caches first: a record
+                // whose stream is absent from the same segment's STREAM_DIR
+                // is corrupt input, not a case to paper over with fabricated
+                // labels.
+                let stream_labels = stream_label_cache.get(&record.stream_id).cloned().ok_or(
+                    LogSeriesError::UnknownStream {
+                        stream_id: record.stream_id,
+                    },
+                )?;
                 let labels = series_label_set(&stream_labels, &record.severity_text);
 
                 let key = labels.iter().fold(Vec::new(), |mut acc, l| {
@@ -658,7 +639,12 @@ mod tests {
 
     #[test]
     fn log_metric_of_none_for_regex_name_matcher() {
-        let ms = [LabelMatcher::regex(METRIC_NAME_LABEL, "ravel_log.*").unwrap()];
+        // The regex's own value is the exact literal `ravel_log_lines`, so a
+        // `MatchOp::Eq`-only guard removed from `log_metric_of` would make
+        // this pass under `=~` too; pinning it to the literal (rather than a
+        // pattern like `ravel_log.*` the `MatchOp::Eq` guard trivially never
+        // equals) is what makes the guard's removal fail this test.
+        let ms = [LabelMatcher::regex(METRIC_NAME_LABEL, "ravel_log_lines").unwrap()];
         assert_eq!(log_metric_of(&ms), None);
     }
 
