@@ -67,6 +67,24 @@ pub enum RenderError {
          (canonical-tenant cannot start with no resolver)"
     )]
     CanonicalTenantResolverMissing,
+
+    /// A `spec.gc` horizon field holds a value that is not a valid humantime
+    /// duration (or is empty). Rendering it verbatim would put a flag on the
+    /// maintain pod that `ravel-server` rejects at startup, crash-looping the
+    /// tier; the render fails here instead so the controller records a
+    /// `Degraded` condition whose message names the offending field. `field` is
+    /// the camelCase CRD field name (`protectionHorizon` or `grace`).
+    #[error(
+        "spec.gc.{field} value {value:?} is not a valid humantime duration; use a duration such \
+         as 24h or 25h5m matching the value stored in sys/gc (read it with ravel-cli gc-config \
+         show)"
+    )]
+    GcHorizonInvalid {
+        /// The camelCase CRD field name that failed to validate.
+        field: &'static str,
+        /// The rejected value, as written in the spec.
+        value: String,
+    },
 }
 
 /// HTTP listener port (OTLP/HTTP, query API, and the `/healthz` `/readyz`
@@ -660,9 +678,9 @@ pub fn desired_maintain_deployment(
     spec: &RavelClusterSpec,
     instance: &str,
     ctx: &RenderCtx,
-) -> Option<Deployment> {
+) -> Result<Option<Deployment>, RenderError> {
     if !spec.maintain.enabled {
-        return None;
+        return Ok(None);
     }
     let mut args = vec![
         "--mode".to_string(),
@@ -675,6 +693,24 @@ pub fn desired_maintain_deployment(
     if let Some(secs) = spec.maintain.interval_secs {
         args.push("--maintain-interval-secs".to_string());
         args.push(secs.to_string());
+    }
+    // GC horizons (#1083): rendered only on this tier, and only when set, since
+    // maintain is the only role that validates itself against `sys/gc`. The
+    // value is validated as a humantime duration and then rendered verbatim, so
+    // an invalid string is a typed render error naming the field rather than a
+    // flag the maintain pod would reject at startup, and a valid one is never
+    // reinterpreted.
+    if let Some(gc) = &spec.gc {
+        if let Some(horizon) = &gc.protection_horizon {
+            validate_gc_duration("protectionHorizon", horizon)?;
+            args.push("--gc-protection-horizon".to_string());
+            args.push(horizon.clone());
+        }
+        if let Some(grace) = &gc.grace {
+            validate_gc_duration("grace", grace)?;
+            args.push("--gc-grace".to_string());
+            args.push(grace.clone());
+        }
     }
     if let Some(retention) = &spec.retention {
         if let Some(default) = &retention.default {
@@ -697,7 +733,7 @@ pub fn desired_maintain_deployment(
         ..Default::default()
     }];
 
-    Some(deployment(
+    Ok(Some(deployment(
         spec,
         instance,
         "maintain",
@@ -708,7 +744,21 @@ pub fn desired_maintain_deployment(
         spec.maintain.resources.as_ref(),
         "RollingUpdate",
         &tier_secrets_checksum(spec, ctx, tier_override),
-    ))
+    )))
+}
+
+/// Validate a `spec.gc` horizon string as a humantime duration, the same syntax
+/// the `ravel-server` flags accept. An empty or unparseable value is a
+/// [`RenderError::GcHorizonInvalid`] naming `field`; a valid one returns `Ok`
+/// and the caller renders the original string verbatim.
+fn validate_gc_duration(field: &'static str, value: &str) -> Result<(), RenderError> {
+    if value.is_empty() || humantime::parse_duration(value).is_err() {
+        return Err(RenderError::GcHorizonInvalid {
+            field,
+            value: value.to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Build a ClusterIP Service selecting `component`'s pods on the given ports.
@@ -1795,13 +1845,15 @@ pub struct DesiredObjects {
 
 /// Render every Kubernetes object a `RavelCluster` reconcile applies.
 ///
-/// Returns `Result` for forward compatibility with a render error that must
-/// fail the whole reconcile, but is infallible today: the one render error that
-/// currently exists (the ravel-native router's, ADR-0080 decision 3) is
-/// captured in [`DesiredObjects::router_render_error`] rather than propagated,
-/// so a misconfigured router degrades only the router and every other tier
-/// still reconciles. The controller turns a captured router error into a
-/// `Degraded` condition rather than applying a broken Deployment.
+/// Returns `Result` for a render error that must fail the whole reconcile: an
+/// invalid `spec.gc` horizon (#1083) propagates here so the controller records a
+/// `Degraded` condition rather than shipping a maintain pod with a flag the
+/// server rejects at startup. The router's render error (the ravel-native
+/// router's, ADR-0080 decision 3) is instead captured in
+/// [`DesiredObjects::router_render_error`] rather than propagated, so a
+/// misconfigured router degrades only the router and every other tier still
+/// reconciles. Both paths end at a `Degraded` condition; they differ only in
+/// blast radius.
 pub fn desired_objects(
     spec: &RavelClusterSpec,
     instance: &str,
@@ -1857,7 +1909,7 @@ pub fn desired_objects(
         router_render_error,
         query_deployment: desired_query_deployment(spec, instance, ctx),
         query_service: desired_query_service(spec, instance),
-        maintain_deployment: desired_maintain_deployment(spec, instance, ctx),
+        maintain_deployment: desired_maintain_deployment(spec, instance, ctx)?,
         gc_bootstrap,
     })
 }
@@ -1868,7 +1920,7 @@ mod tests {
     use super::*;
     use crate::crd::{
         AffinityBackend, AffinityKeySpec, DEFAULT_AFFINITY_SUBSET_SIZE, FoldSpec,
-        GatewayApiExposureSpec, GatewayExposureSpec, GatewayReference, GatewaySpec,
+        GatewayApiExposureSpec, GatewayExposureSpec, GatewayReference, GatewaySpec, GcSpec,
         IngestAffinitySpec, LocalSecretRef, MaintainSpec, QuerySpec, RetentionSpec, S3Spec,
         StorageSpec,
     };
@@ -1918,6 +1970,7 @@ mod tests {
                 resources: None,
                 credentials_secret_ref: None,
             },
+            gc: None,
             retention: Some(RetentionSpec {
                 default: Some("30d".to_string()),
                 tenants: BTreeMap::from([("acme".to_string(), "7d".to_string())]),
@@ -2002,8 +2055,127 @@ mod tests {
         assert_eq!(arg_value(&args_of(&g), "--shards").as_deref(), Some("8"));
         assert_eq!(arg_value(&args_of(&q), "--shards").as_deref(), Some("8"));
         // And also into maintain, which sweeps every shard.
-        let m = desired_maintain_deployment(&spec, "prod", &ctx()).expect("maintain enabled");
+        let m = desired_maintain_deployment(&spec, "prod", &ctx())
+            .expect("no gc render error")
+            .expect("maintain enabled");
         assert_eq!(arg_value(&args_of(&m), "--shards").as_deref(), Some("8"));
+    }
+
+    #[test]
+    fn gc_horizons_render_the_two_flags_on_maintain_only() {
+        // #1083. protectionHorizon and grace on spec.gc render as
+        // --gc-protection-horizon and --gc-grace with those exact values on the
+        // maintain container, and on no other tier: only maintain validates
+        // itself against sys/gc, so only maintain carries the horizons.
+        let mut spec = base_spec();
+        spec.gc = Some(GcSpec {
+            protection_horizon: Some("26h".to_string()),
+            grace: Some("25h".to_string()),
+        });
+        let m = desired_maintain_deployment(&spec, "prod", &ctx())
+            .expect("no gc render error")
+            .expect("maintain enabled");
+        let margs = args_of(&m);
+        assert_eq!(
+            arg_value(&margs, "--gc-protection-horizon").as_deref(),
+            Some("26h"),
+            "maintain must render the protection horizon verbatim: {margs:?}"
+        );
+        assert_eq!(
+            arg_value(&margs, "--gc-grace").as_deref(),
+            Some("25h"),
+            "maintain must render the grace verbatim: {margs:?}"
+        );
+
+        // Neither flag reaches gateway or query.
+        let g = desired_gateway_deployment(&spec, "prod", &ctx());
+        let q = desired_query_deployment(&spec, "prod", &ctx());
+        for dep in [&g, &q] {
+            let args = args_of(dep);
+            assert!(
+                !args.iter().any(|a| a.starts_with("--gc-")),
+                "no --gc- flag belongs on gateway/query: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unset_gc_renders_no_gc_flag_on_any_container() {
+        // #1083. With spec.gc unset the maintain pod carries no --gc- flag at
+        // all, so the server's compiled-in default applies, byte-identical to a
+        // cluster that never set it. Asserted as the exact absence of any
+        // --gc-* arg, not a count.
+        let spec = base_spec();
+        assert_eq!(spec.gc, None);
+        let g = desired_gateway_deployment(&spec, "prod", &ctx());
+        let q = desired_query_deployment(&spec, "prod", &ctx());
+        let m = desired_maintain_deployment(&spec, "prod", &ctx())
+            .expect("no gc render error")
+            .expect("maintain enabled");
+        for dep in [&g, &q, &m] {
+            let args = args_of(dep);
+            assert!(
+                !args.iter().any(|a| a.starts_with("--gc-")),
+                "unset spec.gc must render no --gc- flag: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_gc_horizon_is_a_render_error_naming_the_field() {
+        // #1083. A non-duration or empty value must be a typed render error
+        // naming the field, never a flag the maintain pod would reject at
+        // startup. The error propagates out of desired_objects, so the
+        // controller degrades the cluster instead of shipping a broken pod.
+        let mut spec = base_spec();
+        spec.gc = Some(GcSpec {
+            protection_horizon: Some("not-a-duration".to_string()),
+            grace: None,
+        });
+        assert_eq!(
+            desired_maintain_deployment(&spec, "prod", &ctx())
+                .expect_err("an invalid horizon must be a render error"),
+            RenderError::GcHorizonInvalid {
+                field: "protectionHorizon",
+                value: "not-a-duration".to_string(),
+            }
+        );
+        assert!(
+            matches!(
+                desired_objects(&spec, "prod", "ns", &ctx()),
+                Err(RenderError::GcHorizonInvalid {
+                    field: "protectionHorizon",
+                    ..
+                })
+            ),
+            "an invalid horizon must propagate out of desired_objects"
+        );
+
+        // An empty grace names grace specifically, not the horizon.
+        let mut spec = base_spec();
+        spec.gc = Some(GcSpec {
+            protection_horizon: Some("24h".to_string()),
+            grace: Some(String::new()),
+        });
+        assert_eq!(
+            desired_maintain_deployment(&spec, "prod", &ctx())
+                .expect_err("an empty grace must be a render error"),
+            RenderError::GcHorizonInvalid {
+                field: "grace",
+                value: String::new(),
+            }
+        );
+
+        // The error text names the field, so the Degraded message the
+        // controller derives from it points the operator at the exact knob.
+        assert!(
+            RenderError::GcHorizonInvalid {
+                field: "protectionHorizon",
+                value: "nope".to_string(),
+            }
+            .to_string()
+            .contains("spec.gc.protectionHorizon")
+        );
     }
 
     #[test]
@@ -2016,7 +2188,9 @@ mod tests {
         assert!(spec.deployment_key_secret_ref.is_none());
         let g = desired_gateway_deployment(&spec, "prod", &ctx());
         let q = desired_query_deployment(&spec, "prod", &ctx());
-        let m = desired_maintain_deployment(&spec, "prod", &ctx()).expect("maintain enabled");
+        let m = desired_maintain_deployment(&spec, "prod", &ctx())
+            .expect("no gc render error")
+            .expect("maintain enabled");
         for dep in [&g, &q, &m] {
             let args = args_of(dep);
             assert!(
@@ -2054,7 +2228,9 @@ mod tests {
         });
         let g = desired_gateway_deployment(&spec, "prod", &ctx());
         let q = desired_query_deployment(&spec, "prod", &ctx());
-        let m = desired_maintain_deployment(&spec, "prod", &ctx()).expect("maintain enabled");
+        let m = desired_maintain_deployment(&spec, "prod", &ctx())
+            .expect("no gc render error")
+            .expect("maintain enabled");
         for dep in [&g, &q, &m] {
             let args = args_of(dep);
             assert!(
@@ -2203,7 +2379,9 @@ mod tests {
         // a RollingUpdate strategy. The default (base_spec sets replicas=1) must
         // still yield exactly one pod, so an existing cluster is unaffected.
         let spec = base_spec();
-        let m = desired_maintain_deployment(&spec, "prod", &ctx()).expect("enabled");
+        let m = desired_maintain_deployment(&spec, "prod", &ctx())
+            .expect("no gc render error")
+            .expect("enabled");
         let dspec = m.spec.as_ref().expect("spec");
         assert_eq!(dspec.replicas, Some(1));
         assert_eq!(
@@ -2246,7 +2424,9 @@ mod tests {
         // env as gateway and query, using the same RenderCtx tenant list.
         let spec = base_spec();
         let ctx = ctx();
-        let m = desired_maintain_deployment(&spec, "prod", &ctx).expect("enabled");
+        let m = desired_maintain_deployment(&spec, "prod", &ctx)
+            .expect("no gc render error")
+            .expect("enabled");
         let g = desired_gateway_deployment(&spec, "prod", &ctx);
 
         let margs = args_of(&m);
@@ -2295,7 +2475,11 @@ mod tests {
     fn maintain_disabled_yields_none() {
         let mut spec = base_spec();
         spec.maintain.enabled = false;
-        assert!(desired_maintain_deployment(&spec, "prod", &ctx()).is_none());
+        assert!(
+            desired_maintain_deployment(&spec, "prod", &ctx())
+                .expect("no gc render error")
+                .is_none()
+        );
     }
 
     #[test]
@@ -2320,7 +2504,9 @@ mod tests {
         let mut spec = base_spec();
         spec.maintain.replicas = 2;
         let ctx = ctx();
-        let m = desired_maintain_deployment(&spec, "prod", &ctx).expect("enabled");
+        let m = desired_maintain_deployment(&spec, "prod", &ctx)
+            .expect("no gc render error")
+            .expect("enabled");
         let dspec = m.spec.as_ref().expect("spec");
 
         assert_eq!(dspec.replicas, Some(2), "maintain must render two pods");
@@ -2387,7 +2573,9 @@ mod tests {
         for dep in [
             desired_gateway_deployment(&spec, "prod", &ctx()),
             desired_query_deployment(&spec, "prod", &ctx()),
-            desired_maintain_deployment(&spec, "prod", &ctx()).expect("enabled"),
+            desired_maintain_deployment(&spec, "prod", &ctx())
+                .expect("no gc render error")
+                .expect("enabled"),
         ] {
             let c = container_of(&dep);
             let live = c
@@ -2424,7 +2612,9 @@ mod tests {
         for dep in [
             desired_gateway_deployment(&spec, "prod", &ctx),
             desired_query_deployment(&spec, "prod", &ctx),
-            desired_maintain_deployment(&spec, "prod", &ctx).expect("enabled"),
+            desired_maintain_deployment(&spec, "prod", &ctx)
+                .expect("no gc render error")
+                .expect("enabled"),
         ] {
             assert_eq!(
                 checksum_of(&dep).as_deref(),
@@ -2570,7 +2760,9 @@ mod tests {
 
         let g = desired_gateway_deployment(&spec, "prod", &ctx);
         let q = desired_query_deployment(&spec, "prod", &ctx);
-        let m = desired_maintain_deployment(&spec, "prod", &ctx).expect("enabled");
+        let m = desired_maintain_deployment(&spec, "prod", &ctx)
+            .expect("no gc render error")
+            .expect("enabled");
 
         for (dep, expect) in [(&g, "gw-creds"), (&q, "qy-creds"), (&m, "mt-creds")] {
             assert_eq!(
@@ -2622,8 +2814,12 @@ mod tests {
                 desired_query_deployment(&explicit_spec, "prod", &ctx),
             ),
             (
-                desired_maintain_deployment(&none_spec, "prod", &ctx).expect("enabled"),
-                desired_maintain_deployment(&explicit_spec, "prod", &ctx).expect("enabled"),
+                desired_maintain_deployment(&none_spec, "prod", &ctx)
+                    .expect("no gc render error")
+                    .expect("enabled"),
+                desired_maintain_deployment(&explicit_spec, "prod", &ctx)
+                    .expect("no gc render error")
+                    .expect("enabled"),
             ),
         ];
         for (unset, explicit) in pairs {
@@ -2643,7 +2839,9 @@ mod tests {
         // shared Secret, so they roll together exactly as before this change.
         let g = desired_gateway_deployment(&none_spec, "prod", &ctx);
         let q = desired_query_deployment(&none_spec, "prod", &ctx);
-        let m = desired_maintain_deployment(&none_spec, "prod", &ctx).expect("enabled");
+        let m = desired_maintain_deployment(&none_spec, "prod", &ctx)
+            .expect("no gc render error")
+            .expect("enabled");
         let shared_checksum = secrets_checksum(Some("tok-1"), Some("cred-1"), None);
         assert_eq!(checksum_of(&g).as_deref(), Some(shared_checksum.as_str()));
         assert_eq!(checksum_of(&q).as_deref(), Some(shared_checksum.as_str()));
@@ -2693,8 +2891,12 @@ mod tests {
         let g_after = desired_gateway_deployment(&over_spec, "prod", &after);
         let q_before = desired_query_deployment(&over_spec, "prod", &before);
         let q_after = desired_query_deployment(&over_spec, "prod", &after);
-        let m_before = desired_maintain_deployment(&over_spec, "prod", &before).expect("enabled");
-        let m_after = desired_maintain_deployment(&over_spec, "prod", &after).expect("enabled");
+        let m_before = desired_maintain_deployment(&over_spec, "prod", &before)
+            .expect("no gc render error")
+            .expect("enabled");
+        let m_after = desired_maintain_deployment(&over_spec, "prod", &after)
+            .expect("no gc render error")
+            .expect("enabled");
 
         assert_ne!(
             checksum_of(&g_before),
@@ -2736,9 +2938,12 @@ mod tests {
         let ga = desired_gateway_deployment(&shared_spec, "prod", &shared_after);
         let qb = desired_query_deployment(&shared_spec, "prod", &shared_before);
         let qa = desired_query_deployment(&shared_spec, "prod", &shared_after);
-        let mb =
-            desired_maintain_deployment(&shared_spec, "prod", &shared_before).expect("enabled");
-        let ma = desired_maintain_deployment(&shared_spec, "prod", &shared_after).expect("enabled");
+        let mb = desired_maintain_deployment(&shared_spec, "prod", &shared_before)
+            .expect("no gc render error")
+            .expect("enabled");
+        let ma = desired_maintain_deployment(&shared_spec, "prod", &shared_after)
+            .expect("no gc render error")
+            .expect("enabled");
         assert_ne!(checksum_of(&gb), checksum_of(&ga), "gateway must roll");
         assert_ne!(checksum_of(&qb), checksum_of(&qa), "query must roll");
         assert_ne!(checksum_of(&mb), checksum_of(&ma), "maintain must roll");
@@ -3565,8 +3770,12 @@ mod tests {
         let ga = desired_gateway_deployment(&spec, "prod", &after);
         let qb = desired_query_deployment(&spec, "prod", &before);
         let qa = desired_query_deployment(&spec, "prod", &after);
-        let mb = desired_maintain_deployment(&spec, "prod", &before).expect("enabled");
-        let ma = desired_maintain_deployment(&spec, "prod", &after).expect("enabled");
+        let mb = desired_maintain_deployment(&spec, "prod", &before)
+            .expect("no gc render error")
+            .expect("enabled");
+        let ma = desired_maintain_deployment(&spec, "prod", &after)
+            .expect("no gc render error")
+            .expect("enabled");
         assert_ne!(
             checksum_of(&gb),
             checksum_of(&ga),

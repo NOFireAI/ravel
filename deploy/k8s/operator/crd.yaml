@@ -157,14 +157,14 @@
                             "type": "boolean"
                           },
                           "hosts": {
-                            "description": "Hostnames the ingest Ingress answers on. Empty renders a single\nhost-less rule, which matches any host reaching the controller.\n\nLegacy `backend: ingressNginx` only. `gateway.exposure.gatewayAPI\n.hostnames` is the equivalent field for Gateway API exposure; the two\nare independent and neither reads the other.",
+                            "description": "Hostnames the ingest Ingress answers on. Empty renders a single\nhost-less rule, which matches any host reaching the controller.\n\nLegacy `backend: ingressNginx` only. `gateway.exposure.gatewayApi\n.hostnames` is the equivalent field for Gateway API exposure; the two\nare independent and neither reads the other.",
                             "items": {
                               "type": "string"
                             },
                             "type": "array"
                           },
                           "ingressClassName": {
-                            "description": "`spec.ingressClassName` on the rendered Ingress objects. Omit to let the\ncluster's default IngressClass apply.\n\nLegacy `backend: ingressNginx` only. Has no effect under\n`backend: ravelNative`, and no effect on `gateway.exposure.gatewayAPI`\nrouting (Gateway API attachment goes through `exposure.gatewayAPI\n.gatewayRef` instead, ADR-0080 decision 2).",
+                            "description": "`spec.ingressClassName` on the rendered Ingress objects. Omit to let the\ncluster's default IngressClass apply.\n\nLegacy `backend: ingressNginx` only. Has no effect under\n`backend: ravelNative`, and no effect on `gateway.exposure.gatewayApi`\nrouting (Gateway API attachment goes through `exposure.gatewayApi\n.gatewayRef` instead, ADR-0080 decision 2).",
                             "nullable": true,
                             "type": "string"
                           },
@@ -262,6 +262,23 @@
                         "rule": "!has(self.ingestAffinity) || !has(self.ingestAffinity.key) || !has(self.ingestAffinity.key.source) || self.ingestAffinity.key.source != 'canonicalTenant' || !has(self.ingestAffinity.backend) || self.ingestAffinity.backend != 'ingressNginx'"
                       }
                     ]
+                  },
+                  "gc": {
+                    "description": "Garbage-collection horizons that must match the bucket's stored `sys/gc`\nvalues. Only the maintain tier validates against `sys/gc`, so these\nrender onto the maintain Deployment. Omit the whole block, or either\nfield, to render no flag and let the server's compiled-in default apply,\nbyte-identical to a cluster that never set it.",
+                    "nullable": true,
+                    "properties": {
+                      "grace": {
+                        "description": "The GC grace period (`--gc-grace`). It must equal the grace stored in the\nbucket's `sys/gc` object, which you read with `ravel-cli gc-config show`,\nor the maintain pod refuses to start. Unset renders no flag and the\nserver's compiled-in default applies.",
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "protectionHorizon": {
+                        "description": "The GC protection horizon (`--gc-protection-horizon`). It must equal the\nprotection horizon stored in the bucket's `sys/gc` object, which you read\nwith `ravel-cli gc-config show`, or the maintain pod refuses to start.\nUnset renders no flag and the server's compiled-in default applies.",
+                        "nullable": true,
+                        "type": "string"
+                      }
+                    },
+                    "type": "object"
                   },
                   "image": {
                     "description": "Container image for every mode's pod (`ravel-server`).",

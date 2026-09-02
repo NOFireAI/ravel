@@ -568,17 +568,18 @@ conflict rather than a silent overwrite. Every value must be strictly positive:
 an all-zero configuration would satisfy the inequality trivially and be
 impossible for any mode to match, so it is rejected.
 
-The Kubernetes operator exposes no GC-horizon fields: it deploys every pod
-with the shipped defaults. On a fresh bucket with a shared credential the
-first pod bootstraps `sys/gc` from those defaults and every pod validates
+The Kubernetes operator carries a `spec.gc` block with `protectionHorizon` and
+`grace` for exactly this case. On a fresh bucket with a shared credential the
+first pod bootstraps `sys/gc` from the shipped defaults and every pod validates
 trivially; with per-role credential Secrets the operator applies the maintain
 Deployment first and its pod creates the object, as above. On a bucket whose
-stored protection horizon
-or grace differs from the shipped defaults (set with `gc-config set`), the
-operator's maintain pods refuse to start, because the must-match rule has no
-operator field to satisfy it; the other two stored values do not affect
-startup. Keep such a bucket on the shipped horizon and grace, or run
-maintenance outside the operator.
+stored protection horizon or grace was set to a non-default value with
+`gc-config set`, set `spec.gc.protectionHorizon` and `spec.gc.grace` to the
+stored values, which you read with `ravel-cli gc-config show`, and the operator
+renders `--gc-protection-horizon` and `--gc-grace` onto the maintain pods so
+they satisfy the must-match rule and start. Leave the block, or either field,
+unset to keep the shipped default; the other two stored values do not affect
+startup.
 
 ### Age-based retention
 

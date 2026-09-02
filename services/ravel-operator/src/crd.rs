@@ -94,6 +94,14 @@ pub struct RavelClusterSpec {
     #[serde(default)]
     pub maintain: MaintainSpec,
 
+    /// Garbage-collection horizons that must match the bucket's stored `sys/gc`
+    /// values. Only the maintain tier validates against `sys/gc`, so these
+    /// render onto the maintain Deployment. Omit the whole block, or either
+    /// field, to render no flag and let the server's compiled-in default apply,
+    /// byte-identical to a cluster that never set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gc: Option<GcSpec>,
+
     /// Age-based retention: a default window plus per-tenant overrides. Enforced
     /// only by the maintain tier, so these render onto the maintain Deployment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -599,6 +607,33 @@ impl Default for MaintainSpec {
             credentials_secret_ref: None,
         }
     }
+}
+
+/// Garbage-collection horizons rendered onto the maintain tier
+/// (`--gc-protection-horizon`, `--gc-grace`).
+///
+/// Both fields are humantime duration strings in the syntax the server flags
+/// accept (`24h`, `25h5m`). Each is validated at render time and rendered
+/// verbatim, so the operator never reinterprets a duration; an invalid or empty
+/// value is a render error naming the field, not a flag the server would reject
+/// at startup. The engine deadline (`--gc-max-query-duration`) is a different
+/// quantity and is deliberately absent here.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct GcSpec {
+    /// The GC protection horizon (`--gc-protection-horizon`). It must equal the
+    /// protection horizon stored in the bucket's `sys/gc` object, which you read
+    /// with `ravel-cli gc-config show`, or the maintain pod refuses to start.
+    /// Unset renders no flag and the server's compiled-in default applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protection_horizon: Option<String>,
+
+    /// The GC grace period (`--gc-grace`). It must equal the grace stored in the
+    /// bucket's `sys/gc` object, which you read with `ravel-cli gc-config show`,
+    /// or the maintain pod refuses to start. Unset renders no flag and the
+    /// server's compiled-in default applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grace: Option<String>,
 }
 
 /// Retention policy (`--retention-default`, repeatable `--retention-tenant`).
@@ -1670,6 +1705,65 @@ mod tests {
             overrides.lead_hours, MIN_RESHARD_LEAD_HOURS,
             "omitting leadHours must default to the minimum, not zero"
         );
+    }
+
+    #[test]
+    fn gc_block_is_optional_with_both_horizon_fields_optional() {
+        // #1083. The GC block is a new optional sibling of retention: an
+        // existing RavelCluster that never heard of it deserializes with None,
+        // so the maintain pod carries no --gc- flag and the server's compiled-in
+        // default applies (byte-identical to today). Both horizon fields inside
+        // it are optional too, so a spec may set one, both, or neither.
+        let crd = ravel_cluster_crd();
+        let gc = crd.spec.versions[0]
+            .schema
+            .as_ref()
+            .expect("schema")
+            .open_api_v3_schema
+            .as_ref()
+            .expect("root schema")
+            .properties
+            .as_ref()
+            .expect("root props")
+            .get("spec")
+            .expect("spec prop")
+            .properties
+            .as_ref()
+            .expect("spec props")
+            .get("gc")
+            .expect("gc prop")
+            .clone();
+        let gc_props = gc.properties.as_ref().expect("gc props");
+        assert!(
+            gc_props.contains_key("protectionHorizon"),
+            "gc must expose protectionHorizon in its schema"
+        );
+        assert!(
+            gc_props.contains_key("grace"),
+            "gc must expose grace in its schema"
+        );
+        // Neither field is required: the block may set one, both, or neither.
+        let required = gc.required.clone().unwrap_or_default();
+        assert!(
+            !required.contains(&"protectionHorizon".to_string())
+                && !required.contains(&"grace".to_string()),
+            "both gc horizon fields must be optional, required was {required:?}"
+        );
+
+        let base = serde_json::json!({
+            "image": "ravel:dev",
+            "shards": 4,
+            "storage": { "s3": { "bucket": "b", "credentialsSecretRef": { "name": "creds" } } }
+        });
+        let spec: RavelClusterSpec = serde_json::from_value(base.clone()).expect("deserialize");
+        assert_eq!(spec.gc, None, "omitting the block deserializes to None");
+
+        let mut with_gc = base;
+        with_gc["gc"] = serde_json::json!({ "protectionHorizon": "26h" });
+        let spec: RavelClusterSpec = serde_json::from_value(with_gc).expect("deserialize");
+        let gc = spec.gc.expect("gc present");
+        assert_eq!(gc.protection_horizon.as_deref(), Some("26h"));
+        assert_eq!(gc.grace, None, "grace may be set independently of horizon");
     }
 
     #[test]
