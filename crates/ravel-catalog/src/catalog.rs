@@ -1621,7 +1621,8 @@ impl Catalog {
             // decision and `list_window_by_prefix`'s shard loop must agree on
             // that wider bound so the decision stays consistent with what is
             // scanned.
-            let suffix_scan_shards = crate::provisioning::max_scan_count_over_range(
+            let suffix_scan_shards = crate::provisioning::scan_shards_over_range(
+                signal,
                 &generations,
                 listing_start_hour,
                 window_end_hour,
@@ -1881,7 +1882,7 @@ impl Catalog {
     /// costs 8 LISTs, not 24.
     ///
     /// The per-shard LIST bound is the union scan set over the suffix
-    /// ([`crate::provisioning::max_scan_count_over_range`]): a per-shard LIST
+    /// ([`crate::provisioning::scan_shards_over_range`]): a per-shard LIST
     /// cannot vary its shard bound per hour, so it lists up to the max seen
     /// over the range. A bucket whose shard index is outside its OWN hour's
     /// `scan_count` is then dropped before `process_bucket`, so the INCLUDED
@@ -1904,8 +1905,10 @@ impl Catalog {
         accounting: &QueryAccounting,
     ) -> Result<HashMap<String, SegmentRef>, CatalogError> {
         // Union scan set over the suffix: the widest per-shard bound any hour
-        // in the range needs (a per-shard LIST cannot vary per hour).
-        let scan_shards = crate::provisioning::max_scan_count_over_range(
+        // in the range needs (a per-shard LIST cannot vary per hour), floored
+        // at the signal's writer-pinned shards.
+        let scan_shards = crate::provisioning::scan_shards_over_range(
+            signal,
             generations,
             listing_start_hour,
             window_end_hour,
@@ -1936,7 +1939,12 @@ impl Catalog {
                 // retiring generation's higher shards past their slack window).
                 // Drop those buckets so the included set matches the
                 // per-(shard, hour) loop exactly, which never listed them.
-                let hour_scan = crate::provisioning::scan_count(
+                // Floored at the signal's writer-pinned shards (ADR-1101
+                // decision 2), the same floor the union bound above applies:
+                // an unfloored check here would list an alerts/audit writer's
+                // pinned shard and then discard it.
+                let hour_scan = crate::provisioning::scan_shards_for_hour(
+                    signal,
                     generations,
                     hour,
                     crate::provisioning::DEFAULT_SCAN_SLACK_HOURS,
@@ -2379,7 +2387,9 @@ impl Catalog {
         let tenant_prefix = format!("t/{}/", tenant.to_hex());
         // Shard bound is the union scan set over every hour in the listing
         // suffix (ADR-0052 section 4), not the static
-        // `self.config.shard_count`. `max_scan_count_over_range` keeps a
+        // `self.config.shard_count`, and floored at the signal's
+        // writer-pinned shards (ADR-1101 decision 2).
+        // `max_scan_count_over_range` keeps a
         // retiring larger generation's higher shard indices in scope for
         // `DEFAULT_SCAN_SLACK_HOURS` past its successor's activation, so on a
         // shard-count decrease a straggler routed under the old count into an
@@ -2387,7 +2397,8 @@ impl Catalog {
         // ([`Catalog::list_window_bounded`]) uses this same bound; a per-shard
         // recursive LIST cannot vary the bound per hour, so it takes the max
         // over the range.
-        let scan_shards = crate::provisioning::max_scan_count_over_range(
+        let scan_shards = crate::provisioning::scan_shards_over_range(
+            signal,
             generations,
             listing_start_hour,
             window_end_hour,
@@ -3621,6 +3632,8 @@ fn build_segment_ref(key: &str, record: &CommitRecord) -> Result<SegmentRef, Cat
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use bytes::Bytes;
     use ravel_commit::publish::{self, RetryPolicy};
     use ravel_commit::record::NewCommitRecord;
@@ -3649,9 +3662,35 @@ mod tests {
     }
 
     /// Build, PUT the data object, and publish a fully self-consistent
-    /// commit record for one segment. Each call uses a fresh writer id.
+    /// commit record for one segment under [`Signal::Metrics`]. Each call uses
+    /// a fresh writer id. [`publish_segment_for`] is the same for any signal.
     async fn publish_segment(
         store: &MemoryStore,
+        shard: u32,
+        seq: u64,
+        ingest_hour_bucket: u32,
+        created_unix_ns: i64,
+        min_event_ts_ns: i64,
+        max_event_ts_ns: i64,
+    ) -> CommitRecord {
+        publish_segment_for(
+            store,
+            Signal::Metrics,
+            shard,
+            seq,
+            ingest_hour_bucket,
+            created_unix_ns,
+            min_event_ts_ns,
+            max_event_ts_ns,
+        )
+        .await
+    }
+
+    /// [`publish_segment`] for an arbitrary signal.
+    #[allow(clippy::too_many_arguments)]
+    async fn publish_segment_for(
+        store: &MemoryStore,
+        signal: Signal,
         shard: u32,
         seq: u64,
         ingest_hour_bucket: u32,
@@ -3664,7 +3703,7 @@ mod tests {
         let content_hash = content_hash_for(&payload);
         let record = record::build(NewCommitRecord {
             tenant_hash: tenant(),
-            signal: Signal::Metrics,
+            signal,
             shard,
             writer_id,
             writer_epoch: 1,
@@ -3690,6 +3729,141 @@ mod tests {
             .await
             .expect("publish");
         record
+    }
+
+    /// ADR-1101 decision 2, the read-side shard floor: the audit writers pin
+    /// shards 0 (`AUDIT_HOLD_SHARD`) and 1 (`QUERY_AUDIT_SHARD`) by constant,
+    /// and audit is never provisioned, so a `--shards 1` process resolves it
+    /// through the implicit generation 0 at count 1. Without the floor the
+    /// scan set is shard 0 alone and every query-audit record is silently
+    /// missing from the snapshot. `resolve_pruned_with_admission` is the exact
+    /// entry point `ravel-sql`'s executor calls for every SQL query.
+    ///
+    /// FLIP (pre-fix demonstration): make `Signal::fixed_read_shards` return
+    /// `0` for `Signal::Audit` (crates/ravel-types/src/lib.rs, the
+    /// `Signal::Audit => 2` arm). The key-set assertion then sees only the
+    /// shard 0 key, and the LIST count drops from 3 to 2.
+    #[tokio::test]
+    async fn an_audit_resolve_under_one_configured_shard_lists_the_query_audit_shard() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let hour = 500_000u32;
+        let now = i64::from(hour) * NS_PER_HOUR + 30 * 60_000_000_000;
+
+        // One record on each shard the audit writers pin. Written as literals
+        // rather than the constants themselves: those live in ravel-maintain,
+        // which depends on this crate. `const _` assertions beside each
+        // constant pin them to this floor.
+        let hold =
+            publish_segment_for(&store, Signal::Audit, 0, 1, hour, now, now - 1_000, now).await;
+        let query_audit =
+            publish_segment_for(&store, Signal::Audit, 1, 1, hour, now, now - 1_000, now).await;
+
+        let range = TimeRange {
+            start_ns: now - 1_000,
+            end_ns: now,
+        };
+        let accounting = QueryAccounting::new();
+        let (snapshot, _origins) = catalog
+            .resolve_pruned_with_admission(
+                &tenant(),
+                Signal::Audit,
+                range,
+                &[],
+                now,
+                None,
+                &accounting,
+            )
+            .await
+            .expect("audit resolve");
+
+        let resolved: BTreeSet<String> = snapshot
+            .segments
+            .iter()
+            .map(|seg| seg.data_object_key.clone())
+            .collect();
+        let expected: BTreeSet<String> = [&hold, &query_audit]
+            .into_iter()
+            .map(|record| keys::reconstruct_data_key(record).expect("data key"))
+            .collect();
+        assert_eq!(resolved, expected);
+
+        // LIST derivation, config(1) with provisioning enforcement off:
+        //   - `read_scan_generations` issues no request (enforcement off, so
+        //     the single implicit generation 0 at shard_count 1 is synthesized
+        //     with no store read), and the snapshot window path only GETs.
+        //   - the window is hours 499998..=500000 (3 hours) and the floored
+        //     scan set is 2 shards, so 6 buckets, well under the 720-bucket
+        //     prefix crossover: `list_window_bounded` runs and issues one
+        //     bounded LIST per shard in `0..2`, one page each (MemoryStore's
+        //     default page size is 1000, and there are 2 objects total).
+        //   - `list_pending_erasure` drains the empty `del/` prefix in one
+        //     page: 1 LIST.
+        // Total: 2 + 1 = 3.
+        assert_eq!(accounting.snapshot().s3_requests(AccountedOp::List), 3);
+    }
+
+    /// The control for
+    /// `an_audit_resolve_under_one_configured_shard_lists_the_query_audit_shard`:
+    /// the floor is per signal, not a global widening. Logs has no pinned
+    /// writers, so the same store and the same `config(1)` scan shard 0 only,
+    /// leave a shard 1 record unlisted, and cost exactly one LIST less.
+    ///
+    /// FLIP (pre-fix demonstration): make `Signal::fixed_read_shards` return
+    /// `1` for `Signal::Logs` (add a `Signal::Logs => 1` arm in
+    /// crates/ravel-types/src/lib.rs). Nothing changes -- the floor 1 equals
+    /// the configured count. Returning `2` for `Signal::Logs` makes both
+    /// assertions fail (the shard 1 key appears and the LIST count rises to
+    /// 3), which is what pins the per-signal scoping.
+    #[tokio::test]
+    async fn a_logs_resolve_under_one_configured_shard_lists_only_shard_zero() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let hour = 500_000u32;
+        let now = i64::from(hour) * NS_PER_HOUR + 30 * 60_000_000_000;
+
+        let shard_zero =
+            publish_segment_for(&store, Signal::Logs, 0, 1, hour, now, now - 1_000, now).await;
+        let shard_one =
+            publish_segment_for(&store, Signal::Logs, 1, 1, hour, now, now - 1_000, now).await;
+
+        let range = TimeRange {
+            start_ns: now - 1_000,
+            end_ns: now,
+        };
+        let accounting = QueryAccounting::new();
+        let (snapshot, _origins) = catalog
+            .resolve_pruned_with_admission(
+                &tenant(),
+                Signal::Logs,
+                range,
+                &[],
+                now,
+                None,
+                &accounting,
+            )
+            .await
+            .expect("logs resolve");
+
+        let resolved: BTreeSet<String> = snapshot
+            .segments
+            .iter()
+            .map(|seg| seg.data_object_key.clone())
+            .collect();
+        let expected: BTreeSet<String> =
+            [keys::reconstruct_data_key(&shard_zero).expect("data key")]
+                .into_iter()
+                .collect();
+        assert_eq!(resolved, expected);
+        assert!(
+            !resolved.contains(&keys::reconstruct_data_key(&shard_one).expect("data key")),
+            "logs has no pinned writers, so shard 1 is outside a --shards 1 scan set"
+        );
+
+        // Same derivation as the audit case with an unfloored scan set of 1
+        // shard: 1 bounded LIST for shard 0, plus 1 for the empty `del/`
+        // prefix. Total 2, exactly one fewer than audit's 3.
+        assert_eq!(accounting.snapshot().s3_requests(AccountedOp::List), 2);
     }
 
     #[tokio::test]
