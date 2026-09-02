@@ -268,6 +268,14 @@ window would still call a Hit.
   subject was erased out of a particular set of inputs, so a record that
   disappeared while one of those inputs remained would leave that input
   present with nothing naming it as erased.
+- **The legal-hold gate decides a chain group as a whole, never part of
+  one.** Every key in the group, the raw inputs, each generation's parts, and
+  each generation's records, is checked against `LegalHoldCheck` before
+  anything is deleted; if the hold protects any one of them the whole group
+  is skipped for this pass and nothing in it is deleted. Hold scopes are per
+  prefix, so a hold covering a shard's data prefixes but not its commit
+  prefix would otherwise let one pass delete a chain's records while the
+  input bytes those records account for survive.
 - A held input costs storage until the fold reconciles its hour or an
   operator rebuilds HEAD; nothing else about the hour changes, and every
   query over it keeps resolving normally. That is the deliberate trade
@@ -383,39 +391,67 @@ every bound is measured.
   rebuilds HEAD (see "Scope and interactions" below for what a query sees
   meanwhile). The `.dreq` itself contains the subject
   identifier and is therefore not kept forever: a sweep rule deletes it once
-  its `.done` exists, `now >= done.completed_unix_ns + protection_horizon`, no
-  input any rewrite in that request's supersession chain superseded is still
-  in the store, and the legal-hold check passes. The horizon and the
-  outstanding-input check
+  its `.done` exists, `now >= done.completed_unix_ns + protection_horizon`,
+  the superseded-input sweep held nothing belonging to that request on this
+  pass, and the legal-hold check passes. The horizon and that hold
   together are what guarantee the query-time filter only disappears after no
   resolvable snapshot can still include a pre-rewrite input: the horizon
-  covers the ordinary case, and the check covers the two cases that outlive
+  covers the ordinary case, and the hold covers the two cases that outlive
   it, an input the HEAD gate is holding and an input a legal hold over the
   data prefixes preserves (such a hold does not cover the request keyspace,
   so it would otherwise retire the filter over data it is preserving). The
   `.done` record carries only a hash of the canonical
-  predicate, per-bucket dropped counts, and timestamps, no subject
+  predicate, timestamps, and optionally per-bucket dropped counts, no subject
   identifier, and is permanent, deny-delete audit evidence for every role
   (ADR-0055 amendment).
 
+- **The hold is read off the superseded-input sweep, not rediscovered.** That
+  sweep runs first in the same pass and already knows, per chain group, which
+  requests the chain applied and whether the group was deleted or held. It
+  reports two things: the request ids whose superseded inputs it held this
+  pass, for either reason the gate holds them, and the buckets in which it
+  held the inputs of a chain it could not walk back to a raw input. The
+  erasure rule holds a `.dreq` past its horizon when its request id is in the
+  first set, and also when the second set is non-empty and the request's
+  completion either names one of those buckets or names no buckets at all. No
+  part of the rule depends on the completion record enumerating buckets: a
+  completion that lists them narrows the second condition to buckets the
+  request could have touched, and a completion that lists none is treated as
+  covering every bucket where a chain was cut. The rule issues no store
+  requests of its own beyond the sweep's; it reads a verdict the sweep
+  produced while doing its own work.
+
 - **An erasure request's `.dreq` outlives every input any rewrite in its
-  supersession chain superseded.** The outstanding-input check does not look
-  only for the record that applied this request. It walks each touched
-  bucket's supersession chain from the live record back to the raw inputs at
-  its end, collecting the requests every generation applied, and holds the
-  `.dreq` when anything any generation on that chain superseded is still
-  present. A superseded generation's own parts count: they still carry
-  whatever the generation above them erased. If the walk hits a
-  generation whose record is already gone, the request that generation applied
-  is no longer named anywhere, so the check falls back to asking whether the
-  bucket still holds anything that generation could have superseded (a raw
-  input's commit record, or a part no surviving record references) and holds
-  the `.dreq` while it does. That fallback is what makes the check independent
-  of delete ordering: the filter outlives the data even on a store where an
-  older sweep already removed a record it would otherwise have needed. Both
-  conditions clear once the superseded-input and unreferenced-part rules have
-  finished the bucket, so the hold ends rather than pinning the request
-  forever.
+  supersession chain superseded.** The hold does not look only for the record
+  that applied this request. The superseded-input sweep gathers each live
+  record's whole chain, from the record back to the raw inputs at its end,
+  collecting the requests every generation applied, and reports every request
+  on a chain whose objects it held. A superseded generation's own parts count:
+  they still carry whatever the generation above them erased. When the walk
+  cannot reach a raw input because a generation's record is already gone, the
+  requests that generation applied are no longer named anywhere; the sweep
+  reports that bucket as one where a chain was cut, and every request whose
+  completion is consistent with that bucket is held with it. A chain group
+  the legal-hold gate skipped holds its requests' `.dreq`s the same way a
+  HEAD-held one does, which is what keeps a data-prefix-only hold from
+  retiring a filter over data it is preserving.
+
+- **Why the hold terminates.** The cut-chain hold counts only objects the
+  superseded-input sweep actually held on this pass, never the bare presence
+  of a commit record in the bucket: a bucket with a cut chain and no held
+  object releases the `.dreq`. Two properties make that reachable. First, the
+  delete order within a chain (inputs and each generation's parts before the
+  records that superseded them, oldest generation first) means a missing
+  generation record implies everything that generation superseded is already
+  gone, so a cut never outlives the data it stands in for; and a chain whose
+  predecessor record is absent forms no delete group at all, so it has
+  nothing to hold. Second, an object that lands in an already-swept hour
+  after the fact, a late L0 flush into a sealed bucket, is an input of no
+  record that has passed its horizon: it forms no group, is held by nothing,
+  and cannot pin any request's filter, however long it sits there. So each
+  hold is discharged by the event that released the objects behind it, the
+  fold reconciling the hour, an operator rebuilding HEAD, or a human clearing
+  the legal hold, and no state pins a request forever.
 
 ### Modifiers to the bound
 

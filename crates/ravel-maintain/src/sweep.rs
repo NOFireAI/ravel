@@ -102,7 +102,7 @@
 //! (L0 keys carry no ingest-hour component); see [`sweep_shard_zoned`]'s doc
 //! for that deviation.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use prost::Message;
 use ravel_commit::keys::{self, BucketEntry, KeyError, parse_ingest_hour_string};
@@ -117,7 +117,9 @@ use uuid::Uuid;
 use crate::clock::Clock;
 use crate::config::{CompactorConfig, NS_PER_HOUR};
 use crate::error::{MaintainError, Result};
-use crate::reachability::{SnapshotBlock, SnapshotGate, SnapshotObject, SnapshotReachability};
+use crate::reachability::{
+    SnapshotBlock, SnapshotGate, SnapshotObject, SnapshotReachability, catalog_head_key,
+};
 use crate::read::verify_commit_key;
 
 use ravel_ingest::{IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS, MARKER_SUFFIX};
@@ -198,8 +200,29 @@ pub async fn sweep_shard(
     signal: Signal,
     shard: u32,
 ) -> Result<SweepReport> {
+    let (report, _holds) =
+        sweep_shard_with_holds(store, clock, config, lease, tenant, signal, shard).await?;
+    Ok(report)
+}
+
+/// [`sweep_shard`], also returning what rule 2 held this pass in the form
+/// [`sweep_erasure_requests_with_holds`] consumes. A caller that sweeps several
+/// shards of one signal per tick unions these with [`SupersededHolds::absorb`]
+/// and passes the union to that function, so rule 6 decides from what rule 2
+/// actually held instead of walking the chains a second time.
+pub async fn sweep_shard_with_holds(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    lease: &dyn LeaseCheck,
+    tenant: &TenantHash,
+    signal: Signal,
+    shard: u32,
+) -> Result<(SweepReport, SupersededHolds)> {
     let superseded = sweep_superseded(store, clock, config, lease, tenant, signal, shard).await?;
     log_superseded_holds(tenant, signal, shard, &superseded);
+    let mut superseded_holds = SupersededHolds::default();
+    superseded_holds.absorb(&superseded);
     let unreferenced_parts_deleted =
         sweep_unreferenced_parts(store, clock, config, lease, tenant, signal, shard).await?;
     let (orphans_deleted, orphan_breaker_tripped, orphans_withheld, orphan_breaker_overridden) =
@@ -210,16 +233,19 @@ pub async fn sweep_shard(
             }
             Err(e) => return Err(e),
         };
-    Ok(SweepReport {
-        orphans_deleted,
-        superseded_records_deleted: superseded.records_deleted,
-        superseded_data_deleted: superseded.data_deleted,
-        unreferenced_parts_deleted,
-        orphan_breaker_tripped,
-        orphans_withheld,
-        orphan_breaker_overridden,
-        full_pass: true,
-    })
+    Ok((
+        SweepReport {
+            orphans_deleted,
+            superseded_records_deleted: superseded.records_deleted,
+            superseded_data_deleted: superseded.data_deleted,
+            unreferenced_parts_deleted,
+            orphan_breaker_tripped,
+            orphans_withheld,
+            orphan_breaker_overridden,
+            full_pass: true,
+        },
+        superseded_holds,
+    ))
 }
 
 /// Zone-scoped sweep pass (ADR-0065 decision 3): rules 2 and 3 list only the
@@ -251,6 +277,25 @@ pub async fn sweep_shard_zoned(
     shard: u32,
     hours: &[u32],
 ) -> Result<SweepReport> {
+    let (report, _holds) =
+        sweep_shard_zoned_with_holds(store, clock, config, lease, tenant, signal, shard, hours)
+            .await?;
+    Ok(report)
+}
+
+/// [`sweep_shard_zoned`], also returning what rule 2 held this pass, exactly as
+/// [`sweep_shard_with_holds`] does for the full pass.
+#[allow(clippy::too_many_arguments)]
+pub async fn sweep_shard_zoned_with_holds(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    lease: &dyn LeaseCheck,
+    tenant: &TenantHash,
+    signal: Signal,
+    shard: u32,
+    hours: &[u32],
+) -> Result<(SweepReport, SupersededHolds)> {
     let mut reach = SnapshotReachability::new();
     let superseded = sweep_superseded_impl(
         &mut reach,
@@ -262,9 +307,12 @@ pub async fn sweep_shard_zoned(
         signal,
         shard,
         Some(hours),
+        SweepMode::Delete,
     )
     .await?;
     log_superseded_holds(tenant, signal, shard, &superseded);
+    let mut superseded_holds = SupersededHolds::default();
+    superseded_holds.absorb(&superseded);
     let unreferenced_parts_deleted = sweep_unreferenced_parts_impl(
         store,
         clock,
@@ -284,21 +332,24 @@ pub async fn sweep_shard_zoned(
             }
             Err(e) => return Err(e),
         };
-    Ok(SweepReport {
-        orphans_deleted,
-        superseded_records_deleted: superseded.records_deleted,
-        superseded_data_deleted: superseded.data_deleted,
-        unreferenced_parts_deleted,
-        orphan_breaker_tripped,
-        orphans_withheld,
-        orphan_breaker_overridden,
-        full_pass: false,
-    })
+    Ok((
+        SweepReport {
+            orphans_deleted,
+            superseded_records_deleted: superseded.records_deleted,
+            superseded_data_deleted: superseded.data_deleted,
+            unreferenced_parts_deleted,
+            orphan_breaker_tripped,
+            orphans_withheld,
+            orphan_breaker_overridden,
+            full_pass: false,
+        },
+        superseded_holds,
+    ))
 }
 
 /// Surface a superseded-input hold to an operator running the combined
-/// [`sweep_shard`] / [`sweep_shard_zoned`] pass. [`SweepReport`] itself is
-/// unchanged: the structured counters live on [`SupersededSweepOutcome`], which
+/// [`sweep_shard`] / [`sweep_shard_zoned`] pass. [`SweepReport`] carries no
+/// hold counter: the structured counters live on [`SupersededSweepOutcome`], which
 /// [`sweep_superseded`] returns directly, and this log line is what a caller
 /// that only has the combined report sees. Silent on a pass that held nothing,
 /// which is every ordinary pass.
@@ -308,7 +359,7 @@ fn log_superseded_holds(
     shard: u32,
     outcome: &SupersededSweepOutcome,
 ) {
-    if outcome.held() == 0 {
+    if outcome.held() == 0 && outcome.chain_groups_held_by_legal_hold == 0 {
         return;
     }
     tracing::warn!(
@@ -317,9 +368,12 @@ fn log_superseded_holds(
         shard,
         held_by_snapshot = outcome.held_by_snapshot,
         held_by_unreadable_head = outcome.held_by_unreadable_head,
+        chain_groups_held_by_legal_hold = outcome.chain_groups_held_by_legal_hold,
+        held_requests = outcome.held_request_ids.len(),
+        held_truncated_buckets = outcome.held_truncated_buckets.len(),
         "superseded-input sweep: held inputs the live catalog HEAD snapshot still names \
-         (or could not be read); they are collected once the fold reconciles their hour or \
-         HEAD is rebuilt"
+         (or could not be read, or a legal hold protects); they are collected once the fold \
+         reconciles their hour, HEAD is rebuilt, or the hold is released"
     );
 }
 
@@ -468,6 +522,17 @@ async fn referenced_l0_identities(
 
 // --- Rule 2: superseded-input sweep (ADR-0018) -----------------------------
 
+/// One `(shard, ingest hour)` bucket in which a sweep pass held part of a
+/// supersession chain it could not walk to the end (a generation's record was
+/// already gone). The requests the missing generation applied are not
+/// discoverable from any surviving record, so the erasure-request sweep holds
+/// every `.dreq` that could name such a bucket.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct HeldBucket {
+    pub shard: u32,
+    pub ingest_hour_bucket: u32,
+}
+
 /// What one superseded-input sweep pass did.
 ///
 /// The two `held_*` counters are the object-granular counterpart of
@@ -475,7 +540,14 @@ async fn referenced_l0_identities(
 /// count plus the blocked reason, so an operator watching inputs pile up can
 /// tell the ordinary lagging-fold case ([`SnapshotBlock::Named`]) from an
 /// unreadable HEAD or snapshot part ([`SnapshotBlock::Unreadable`]).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+///
+/// `held_request_ids` and `held_truncated_buckets` are what the
+/// erasure-request sweep consumes: this pass is the only component that
+/// already knows, per chain group, both which erasure requests the group's
+/// generations applied and whether the group was held. Publishing that here
+/// is what lets rule 6 decide without a walk of its own, and without depending
+/// on a completion record's optional per-bucket drop list.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SupersededSweepOutcome {
     /// Superseded commit, compaction, and rewrite records deleted (or, under
     /// `dry_run`, that would have been).
@@ -495,12 +567,78 @@ pub struct SupersededSweepOutcome {
     /// lagging-fold case. Counter seam for
     /// `ravel_maintain_superseded_inputs_held_total{reason="unreadable_head"}`.
     pub held_by_unreadable_head: usize,
+    /// Chain groups skipped whole this pass because the [`LeaseCheck`] protects
+    /// at least one key in them. The unit is the group, not the object: a
+    /// group is one indivisible deletion unit, so a hold over any single key in
+    /// it stops all of it. Counter seam for
+    /// `ravel_maintain_superseded_groups_held_by_legal_hold_total`.
+    pub chain_groups_held_by_legal_hold: usize,
+    /// Every erasure request id applied anywhere on a chain group this pass
+    /// held, for any of the three reasons above. While a request is in this
+    /// set an object that predates its rewrite is still in the store, so its
+    /// `.dreq` (and with it the query-time exclusion filter) must survive.
+    pub held_request_ids: BTreeSet<String>,
+    /// The buckets in which this pass held a group whose supersession chain it
+    /// could not walk to the end. The requests the missing generation applied
+    /// are not in `held_request_ids`, because no surviving record names them,
+    /// so rule 6 falls back to the bucket.
+    pub held_truncated_buckets: BTreeSet<HeldBucket>,
 }
 
 impl SupersededSweepOutcome {
     /// Objects held this pass for any reason.
     pub fn held(&self) -> usize {
         self.held_by_snapshot + self.held_by_unreadable_head
+    }
+
+    /// Record what a held group means for rule 6: every request the group's
+    /// objects predate must keep its `.dreq`, and a group whose chain could
+    /// not be walked to the end names requests no surviving record does, so
+    /// its bucket is reported instead.
+    fn note_hold(&mut self, group: &SupersededGroup, shard: u32) {
+        self.held_request_ids
+            .extend(group.request_ids.iter().cloned());
+        if group.truncated {
+            self.held_truncated_buckets.insert(HeldBucket {
+                shard,
+                ingest_hour_bucket: group.ingest_hour_bucket,
+            });
+        }
+    }
+}
+
+/// What a superseded-input sweep held, in the form rule 6 consumes: the union
+/// over however many shards the caller swept.
+///
+/// This is the whole input to the erasure-request guard. Rule 6 asks no
+/// question of its own about supersession chains: rule 2 already walked them,
+/// already gated them, and already knows which requests the objects it held
+/// predate. A completion record's `bucket_drops` is used only to narrow which
+/// buckets rule 2 is asked about, never to decide a hold, because the field is
+/// optional on the wire and a completion written without it must still be
+/// safe.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SupersededHolds {
+    /// [`SupersededSweepOutcome::held_request_ids`], unioned across shards.
+    pub request_ids: BTreeSet<String>,
+    /// [`SupersededSweepOutcome::held_truncated_buckets`], unioned across
+    /// shards.
+    pub truncated_buckets: BTreeSet<HeldBucket>,
+}
+
+impl SupersededHolds {
+    /// Fold one shard's outcome into the union.
+    pub fn absorb(&mut self, outcome: &SupersededSweepOutcome) {
+        self.request_ids
+            .extend(outcome.held_request_ids.iter().cloned());
+        self.truncated_buckets
+            .extend(outcome.held_truncated_buckets.iter().copied());
+    }
+
+    /// `true` when nothing was held: every `.dreq` past its horizon is
+    /// collectable, which is the ordinary steady state.
+    pub fn is_empty(&self) -> bool {
+        self.request_ids.is_empty() && self.truncated_buckets.is_empty()
     }
 }
 
@@ -518,9 +656,32 @@ pub async fn sweep_superseded(
 ) -> Result<SupersededSweepOutcome> {
     let mut reach = SnapshotReachability::new();
     sweep_superseded_impl(
-        &mut reach, store, clock, config, lease, tenant, signal, shard, None,
+        &mut reach,
+        store,
+        clock,
+        config,
+        lease,
+        tenant,
+        signal,
+        shard,
+        None,
+        SweepMode::Delete,
     )
     .await
+}
+
+/// Whether a [`sweep_superseded_impl`] pass deletes what it cleared, or only
+/// computes the gate and the holds.
+///
+/// [`SweepMode::GateOnly`] is what makes the erasure-request guard reachable
+/// from a caller that has no rule-2 outcome to hand: the pass reads exactly
+/// what a deleting pass reads and reports exactly the same holds, and its
+/// `records_deleted` / `data_deleted` are always zero. It is not `dry_run`,
+/// which reports what it would have deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SweepMode {
+    Delete,
+    GateOnly,
 }
 
 /// Shared implementation behind [`sweep_superseded`] (whole-shard, `hours:
@@ -540,6 +701,7 @@ async fn sweep_superseded_impl(
     signal: Signal,
     shard: u32,
     hours: Option<&[u32]>,
+    mode: SweepMode,
 ) -> Result<SupersededSweepOutcome> {
     let now = clock.now_ns();
     let entries = list_commit_entries_scoped(store, tenant, signal, shard, hours).await?;
@@ -558,7 +720,14 @@ async fn sweep_superseded_impl(
         .filter(|k| !k.is_empty())
         .collect();
 
-    let mut outcome = SupersededSweepOutcome::default();
+    // Phase A: gather every group this pass could delete, deduplicated by
+    // chain identity across the whole pass. Two live rewrites naming the same
+    // `superseded_record_key` gather the identical chain, so without the
+    // dedup every key in it is gated twice and counted twice, and
+    // `records_deleted` / `data_deleted` exceed the number of distinct objects
+    // the pass removed.
+    let mut groups: Vec<SupersededGroup> = Vec::new();
+    let mut by_identity: HashMap<String, usize> = HashMap::new();
     for (key, entry) in &entries {
         if superseded_by_present.contains(key.as_str()) {
             continue;
@@ -569,7 +738,14 @@ async fn sweep_superseded_impl(
         // no superseded input. A compaction record is fetched NotFound-
         // tolerantly, and a rewrite absent from `rewrites` is skipped the same
         // way: a crash-interrupted prior pass can leave a listed key gone.
-        let groups = match entry {
+        //
+        // `applied` is the live record's own drops. Everything in the groups it
+        // gathers predates them: a group's L1 parts are the pre-image this
+        // record erased a subject out of, and its raw L0 inputs are the
+        // pre-image below that. So a hold on the group is a hold on those
+        // requests' `.dreq`s, on top of whatever the generations inside the
+        // group applied themselves.
+        let (gathered, applied) = match entry {
             BucketEntry::CompactionRecord(_) => {
                 let Some(record) = get_compaction_record_opt(store, key).await? else {
                     continue;
@@ -582,7 +758,10 @@ async fn sweep_superseded_impl(
                 {
                     continue;
                 }
-                gather_l0_inputs(store, tenant, signal, shard, &record).await?
+                (
+                    gather_l0_inputs(store, tenant, signal, shard, &record).await?,
+                    Vec::new(),
+                )
             }
             BucketEntry::RewriteRecord(_) => {
                 let Some(record) = rewrites.get(key) else {
@@ -599,105 +778,153 @@ async fn sweep_superseded_impl(
                 {
                     continue;
                 }
+                let applied: Vec<String> = record
+                    .drops
+                    .iter()
+                    .map(|d| d.request_id.clone())
+                    .filter(|id| !id.is_empty())
+                    .collect();
                 if !record.inputs.is_empty() {
                     // RawL0 rewrite: the same L0 commit records + data objects
                     // a compaction over the same inputs would supersede.
-                    gather_l0_inputs(store, tenant, signal, shard, record).await?
+                    (
+                        gather_l0_inputs(store, tenant, signal, shard, record).await?,
+                        applied,
+                    )
                 } else {
                     // Predecessor rewrite: the whole supersession chain behind
                     // it, down to the raw L0 inputs the oldest generation
                     // superseded. Rule 3 cannot collect a superseded
                     // generation's parts while its record still references
                     // them, so this rule removes records and parts together.
-                    gather_superseded_chain(
-                        store,
-                        tenant,
-                        signal,
-                        shard,
-                        &record.superseded_record_key,
+                    (
+                        gather_superseded_chain(
+                            store,
+                            tenant,
+                            signal,
+                            shard,
+                            &record.superseded_record_key,
+                        )
+                        .await?,
+                        applied,
                     )
-                    .await?
                 }
             }
             BucketEntry::CommitRecord(_) | BucketEntry::Tombstone(_) => continue,
         };
 
-        // HEAD-reachability gate (ADR-0020 delete blocker), object-granular
-        // because this rule deletes individual objects out of a bucket whose
-        // surviving compaction or rewrite outputs the snapshot legitimately
-        // still names. A group is indivisible: a predecessor record must
-        // outlive every part it names, or rule 3 would collect those parts on
-        // the next pass and undo the hold; and a whole supersession chain is
-        // one group so a HEAD that still names the oldest generation's raw
-        // inputs holds every record above them too.
-        let mut cleared: Vec<&SupersededGroup> = Vec::with_capacity(groups.len());
-        for group in &groups {
-            match reach
-                .object_gate(
-                    store,
-                    tenant,
-                    signal,
-                    group.ingest_hour_bucket,
-                    &group.objects,
-                )
-                .await?
-            {
-                SnapshotGate::Clear => cleared.push(group),
-                SnapshotGate::Blocked(SnapshotBlock::Named) => {
-                    outcome.held_by_snapshot += group.object_count();
-                }
-                SnapshotGate::Blocked(SnapshotBlock::Unreadable) => {
-                    outcome.held_by_unreadable_head += group.object_count();
+        for mut group in gathered {
+            group.request_ids.extend(applied.iter().cloned());
+            match by_identity.get(&group.identity) {
+                Some(&index) => groups[index].absorb_duplicate(group),
+                None => {
+                    by_identity.insert(group.identity.clone(), groups.len());
+                    groups.push(group);
                 }
             }
         }
+    }
 
-        // Every cleared group's superseded-input records first, then every
-        // cleared group's data objects (docs/consistency-model.md): a crash
-        // between the two phases leaves record-less data (orphan GC) or an
-        // unreferenced part (rule 3), never a record pointing at a deleted
-        // object. The gate runs entirely ahead of every phase so a held group
-        // never splits that order.
-        //
-        // The chain's own records go last of all, oldest generation first, so
-        // a rewrite record outlives every input it superseded: a crash inside
-        // this rule leaves the record still naming inputs that are already
-        // gone (harmless, and the next pass finishes the job), never a
-        // surviving input with the record that erased a subject out of it
-        // deleted, which would leave the erasure request's filter with nothing
-        // durable to discover it by.
-        for group in &cleared {
-            for k in &group.record_keys {
-                if lease.is_protected(k) {
-                    continue;
-                }
-                if !config.dry_run {
-                    store.delete(k).await?;
-                }
-                outcome.records_deleted += 1;
+    // Phase B: gate every group, once. Nothing is deleted before every group
+    // has an answer, so a held group never splits a delete phase.
+    //
+    // The lease/legal-hold check is per group, not per key: a group is one
+    // indivisible deletion unit, and its phase order exists so a record always
+    // outlives the objects it superseded. Skipping only the protected keys
+    // inside the phases breaks that order, and a prefix-scoped legal hold
+    // covering the data keys but not the commit prefix is exactly the shape
+    // that does it -- the records that erased a subject go while the bytes
+    // holding it stay.
+    //
+    // The HEAD-reachability gate (ADR-0020 delete blocker) is object-granular
+    // because this rule deletes individual objects out of a bucket whose
+    // surviving compaction or rewrite outputs the snapshot legitimately still
+    // names. A group is indivisible there too: a predecessor record must
+    // outlive every part it names, or rule 3 would collect those parts on the
+    // next pass and undo the hold; and a whole supersession chain is one group
+    // so a HEAD that still names the oldest generation's raw inputs holds
+    // every record above them too.
+    let mut outcome = SupersededSweepOutcome::default();
+    let mut cleared: Vec<&SupersededGroup> = Vec::with_capacity(groups.len());
+    for group in &groups {
+        if let Some(protected) = group.protected_key(lease) {
+            tracing::warn!(
+                tenant_hash = %tenant.to_hex(),
+                signal = signal.key_prefix(),
+                shard,
+                ingest_hour_bucket = group.ingest_hour_bucket,
+                protected_key = %protected,
+                group_objects = group.object_count(),
+                "superseded-input sweep: a lease or legal hold protects a key in a supersession \
+                 chain, so the whole chain is skipped this pass; deleting the unprotected part of \
+                 it would break the order that keeps a record alive until the objects it \
+                 superseded are gone"
+            );
+            outcome.chain_groups_held_by_legal_hold += 1;
+            outcome.note_hold(group, shard);
+            continue;
+        }
+        match reach
+            .object_gate(
+                store,
+                tenant,
+                signal,
+                group.ingest_hour_bucket,
+                &group.objects,
+            )
+            .await?
+        {
+            SnapshotGate::Clear => cleared.push(group),
+            SnapshotGate::Blocked(SnapshotBlock::Named) => {
+                outcome.held_by_snapshot += group.object_count();
+                outcome.note_hold(group, shard);
+            }
+            SnapshotGate::Blocked(SnapshotBlock::Unreadable) => {
+                outcome.held_by_unreadable_head += group.object_count();
+                outcome.note_hold(group, shard);
             }
         }
-        for group in &cleared {
-            for k in &group.data_keys {
-                if lease.is_protected(k) {
-                    continue;
-                }
-                if !config.dry_run {
-                    store.delete(k).await?;
-                }
-                outcome.data_deleted += 1;
+    }
+
+    if mode == SweepMode::GateOnly {
+        return Ok(outcome);
+    }
+
+    // Phase C: every cleared group's superseded-input records first, then every
+    // cleared group's data objects (docs/consistency-model.md): a crash
+    // between the two phases leaves record-less data (orphan GC) or an
+    // unreferenced part (rule 3), never a record pointing at a deleted
+    // object.
+    //
+    // The chains' own records go last of all, oldest generation first, so a
+    // rewrite record outlives every input it superseded: a crash inside this
+    // rule leaves the record still naming inputs that are already gone
+    // (harmless, and the next pass finishes the job), never a surviving input
+    // with the record that erased a subject out of it deleted, which would
+    // leave the erasure request's filter with nothing durable to discover it
+    // by.
+    for group in &cleared {
+        for k in &group.record_keys {
+            if !config.dry_run {
+                store.delete(k).await?;
             }
+            outcome.records_deleted += 1;
         }
-        for group in &cleared {
-            for k in &group.chain_record_keys {
-                if lease.is_protected(k) {
-                    continue;
-                }
-                if !config.dry_run {
-                    store.delete(k).await?;
-                }
-                outcome.records_deleted += 1;
+    }
+    for group in &cleared {
+        for k in &group.data_keys {
+            if !config.dry_run {
+                store.delete(k).await?;
             }
+            outcome.data_deleted += 1;
+        }
+    }
+    for group in &cleared {
+        for k in &group.chain_record_keys {
+            if !config.dry_run {
+                store.delete(k).await?;
+            }
+            outcome.records_deleted += 1;
         }
     }
     Ok(outcome)
@@ -743,12 +970,49 @@ struct SupersededGroup {
     /// generation first, deleted after every object they superseded.
     chain_record_keys: Vec<String>,
     objects: Vec<SnapshotObject>,
+    /// Every erasure request id the objects in this group predate: the drops of
+    /// the live record that superseded the group, plus the drops of every
+    /// generation inside it. A hold on the group is a hold on each of these
+    /// requests' `.dreq`s.
+    request_ids: BTreeSet<String>,
+    /// The chain walk stopped at a generation whose record was already gone,
+    /// so whatever requests that generation applied are named by no surviving
+    /// record and cannot appear in `request_ids`.
+    truncated: bool,
+    /// Dedup key: the oldest record this group deletes, which is the one thing
+    /// two live rewrites over the same predecessor gather identically.
+    identity: String,
 }
 
 impl SupersededGroup {
     /// Objects this group would delete, for the held counters.
     fn object_count(&self) -> usize {
         self.record_keys.len() + self.data_keys.len() + self.chain_record_keys.len()
+    }
+
+    /// Every key this group deletes, in delete order.
+    fn keys(&self) -> impl Iterator<Item = &String> {
+        self.record_keys
+            .iter()
+            .chain(self.data_keys.iter())
+            .chain(self.chain_record_keys.iter())
+    }
+
+    /// The first key in this group the `lease` protects, if any.
+    fn protected_key(&self, lease: &dyn LeaseCheck) -> Option<&str> {
+        self.keys()
+            .find(|k| lease.is_protected(k))
+            .map(String::as_str)
+    }
+
+    /// Fold in a second gather of the same group (a sibling live rewrite over
+    /// the same predecessor). Only the two facts a duplicate can add are
+    /// taken: the sibling's own applied requests, and a truncation either
+    /// gather saw. The keys and objects are identical by construction, since
+    /// both walks start from the same record.
+    fn absorb_duplicate(&mut self, other: SupersededGroup) {
+        self.request_ids.extend(other.request_ids);
+        self.truncated |= other.truncated;
     }
 }
 
@@ -793,6 +1057,7 @@ async fn gather_l0_inputs(
                 })?;
                 groups.push(SupersededGroup {
                     ingest_hour_bucket: rec.ingest_hour_bucket,
+                    identity: commit_key.clone(),
                     record_keys: vec![commit_key],
                     data_keys: vec![data_key],
                     chain_record_keys: Vec::new(),
@@ -803,6 +1068,8 @@ async fn gather_l0_inputs(
                         writer_epoch: rec.writer_epoch,
                         writer_seq: rec.writer_seq,
                     }],
+                    request_ids: BTreeSet::new(),
+                    truncated: false,
                 });
             }
             Err(StoreError::NotFound) => {}
@@ -1029,9 +1296,15 @@ async fn load_chain_link(store: &dyn ObjectStoreBackend, key: &str) -> Result<Op
 /// a HEAD naming anything in it holds all of it.
 ///
 /// A chain truncated by an absent record yields whatever it reached before the
-/// gap; an absent `predecessor_key` yields no group at all, and any surviving
-/// parts below it are unreferenced under the live record and collected by
-/// rule 3.
+/// gap, flagged [`SupersededGroup::truncated`] so a hold on it can be reported
+/// per bucket rather than per request; an absent `predecessor_key` yields no
+/// group at all, and any surviving parts below it are unreferenced under the
+/// live record and collected by rule 3.
+///
+/// The group also carries every erasure request the generations it covers
+/// applied. Those requests' `.dreq`s cannot be retired while the group is
+/// held, because the objects in it are the pre-image the requests erased a
+/// subject out of.
 async fn gather_superseded_chain(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
@@ -1045,6 +1318,8 @@ async fn gather_superseded_chain(
     let mut input_data_keys: Vec<String> = Vec::new();
     let mut objects: Vec<SnapshotObject> = Vec::new();
     let mut ingest_hour_bucket: Option<u32> = None;
+    let mut request_ids: BTreeSet<String> = BTreeSet::new();
+    let mut truncated = false;
     let mut seen: HashSet<String> = HashSet::new();
     let mut cursor = Some(predecessor_key.to_string());
 
@@ -1055,6 +1330,7 @@ async fn gather_superseded_chain(
             )));
         }
         let Some(link) = load_chain_link(store, &key).await? else {
+            truncated = true;
             break;
         };
         // The gate reads one hour's covering snapshot parts, so a chain that
@@ -1070,6 +1346,11 @@ async fn gather_superseded_chain(
                     "supersession chain from {predecessor_key} spans ingest hours {hour} and {}",
                     link.ingest_hour_bucket()
                 )));
+            }
+        }
+        for id in link.applied_request_ids() {
+            if !id.is_empty() {
+                request_ids.insert(id.to_string());
             }
         }
         for (part_key, object) in link.part_targets()? {
@@ -1098,12 +1379,21 @@ async fn gather_superseded_chain(
     // generations below it superseded, and after the generation it superseded.
     chain_record_keys.reverse();
     input_data_keys.extend(chain_part_keys);
+    // The oldest generation's record is the group's identity: it is what every
+    // live rewrite over this same predecessor walks down to.
+    let identity = chain_record_keys
+        .first()
+        .cloned()
+        .unwrap_or_else(|| predecessor_key.to_string());
     Ok(vec![SupersededGroup {
         ingest_hour_bucket,
         record_keys: input_record_keys,
         data_keys: input_data_keys,
         chain_record_keys,
         objects,
+        request_ids,
+        truncated,
+        identity,
     }])
 }
 
@@ -1691,14 +1981,6 @@ async fn read_head_reference(
     }
 }
 
-/// `t/<tenant_hash_hex>/catalog/<signal>/HEAD` -- the mutable head pointer for
-/// one `(tenant, signal)` (docs/catalog-and-mvcc.md key layout). No public
-/// builder is exported from ravel-catalog, so it is constructed here from the
-/// same pieces, matching `idem_prefix`'s local-reconstruction precedent.
-fn catalog_head_key(tenant: &TenantHash, signal: Signal) -> String {
-    format!("t/{}/catalog/{}/HEAD", tenant.to_hex(), signal.key_prefix())
-}
-
 /// `t/<tenant_hash_hex>/catalog/<signal>/snap/` -- the prefix covering every
 /// snapshot part for one `(tenant, signal)`, across every watermark.
 fn catalog_snap_prefix(tenant: &TenantHash, signal: Signal) -> String {
@@ -1757,26 +2039,28 @@ pub struct ErasureRequestSweepOutcome {
 ///   because after the horizon no resolvable snapshot can still reference a
 ///   pre-rewrite input (ADR-0064 §3.5 race window, closed durably). Deleting
 ///   the `.dreq` a nanosecond early would reopen exactly that window.
-/// - no input superseded by a rewrite anywhere on a supersession chain that
-///   applied this request is still physically present. The horizon on its own
-///   does not imply that: rule 2 holds an input the live HEAD snapshot still
-///   names, and a legal hold over the shard's data prefixes (which does not
-///   cover `del/`) holds it too. In both cases a snapshot can still resolve the
-///   pre-rewrite input, so retiring the filter would serve the erased subject
-///   again. The check reads the `.done`'s own `bucket_drops` for the buckets
-///   this request touched and walks each bucket's chains back through
-///   `superseded_record_key`, so it costs one LIST per touched bucket plus one
-///   GET per record on the chain, and runs only for a `.dreq` that has already
-///   cleared its horizon; in the ordinary case rule 2 collected the inputs long
-///   before, so the first such pass finds nothing and removes the request. It
-///   does not require the record that applied the request to still exist: see
-///   [`superseded_inputs_outstanding`] for the truncated-chain fallback. An
-///   input whose commit record and data object are both gone but whose chain is
-///   intact is not counted, and neither is a record-less L0 data object in a
-///   bucket whose chain is intact: that is a record-less orphan awaiting rule
-///   1, discovered from no durable record.
+/// - rule 2 did not hold anything this request's rewrites superseded. The
+///   horizon on its own does not imply that: rule 2 holds an input the live
+///   HEAD snapshot still names, an input under a snapshot part it cannot read,
+///   and a whole chain any legal hold over the shard's data prefixes touches
+///   (such a hold does not cover `del/`, so it does not pin the `.dreq`
+///   itself). In every one of those cases a snapshot can still resolve the
+///   pre-rewrite object, so retiring the filter would serve the erased subject
+///   again. The decision is read straight off [`SupersededHolds`], which rule
+///   2 fills while it gates: `request_ids` when a held group names the request,
+///   and `truncated_buckets` when a held group's chain could not be walked to
+///   the end, in which case the requests the missing generation applied are
+///   named by no surviving record and the bucket stands in for them. This
+///   costs no LIST and no GET of its own beyond rule 2's own pass.
 /// - the [`LeaseCheck`] passes: a legal hold over the `del/` keyspace pins the
 ///   request exactly as it pins any other object.
+///
+/// A completion's `bucket_drops` is a narrowing hint only, never the basis of a
+/// hold: the field is optional on the wire, has been written empty by a
+/// production writer, and a `.dreq` whose completion carries no drops is held
+/// by any truncated bucket in the signal rather than exempted. Where it is
+/// present it narrows which buckets rule 2 is asked about, and which truncated
+/// buckets can hold a given request.
 ///
 /// A completion whose `completed_unix_ns` is zero is treated fail-safe as "not
 /// yet a valid horizon anchor" and its `.dreq` is kept: a zero anchor would
@@ -1794,6 +2078,23 @@ pub struct ErasureRequestSweepOutcome {
 /// `del/` that is neither a `.dreq` nor a `.done` is layout drift and fails
 /// the pass loud, matching the resolver's and the rewrite pass's fail-loud
 /// discipline for this keyspace.
+/// Run rule 6 for a caller that has no rule-2 outcome to hand, observing the
+/// holds itself.
+///
+/// This is the production entry (`ravel-server`'s maintenance tick), and it is
+/// what makes the guard reachable there: it runs rule 2 in
+/// [`SweepMode::GateOnly`] over the buckets that matter and decides from the
+/// holds that pass reports, instead of from a completion field a production
+/// writer may leave empty. The observation costs one rule-2-shaped pass and
+/// nothing more; a caller that already swept the signal's shards this tick
+/// should sweep with [`sweep_shard_with_holds`], union the holds it returns,
+/// and call [`sweep_erasure_requests_with_holds`] instead, which costs nothing
+/// at all.
+///
+/// The observation runs only when there is a `.dreq` past its horizon to
+/// decide about. An ordinary pass, where every request is either incomplete or
+/// still inside its horizon, reads nothing but the `del/` listing and the
+/// completions.
 pub async fn sweep_erasure_requests(
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
@@ -1801,6 +2102,46 @@ pub async fn sweep_erasure_requests(
     lease: &dyn LeaseCheck,
     tenant: &TenantHash,
     signal: Signal,
+) -> Result<ErasureRequestSweepOutcome> {
+    sweep_erasure_requests_inner(store, clock, config, lease, tenant, signal, None).await
+}
+
+/// Run rule 6 against the holds a caller's own rule-2 passes already reported
+/// (`holds`), adding no request of its own.
+///
+/// This is the shape the per-tick maintenance loop wants: sweep the signal's
+/// shards with [`sweep_shard_with_holds`], union each returned
+/// [`SupersededHolds`], and pass the union here. Rule 2 walked every
+/// supersession chain in those shards while it gated them, so rule 6 needs no
+/// walk of its own.
+///
+/// `holds` must cover every shard of `signal` the caller swept, and the caller
+/// must have swept them with the same `config` horizon. A `holds` that omits a
+/// shard rule 2 held in is the one unsafe input to this function: it would let
+/// a `.dreq` retire while a pre-rewrite object in that shard is still
+/// resolvable. [`sweep_erasure_requests`] exists for callers that cannot make
+/// that guarantee.
+pub async fn sweep_erasure_requests_with_holds(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    lease: &dyn LeaseCheck,
+    tenant: &TenantHash,
+    signal: Signal,
+    holds: &SupersededHolds,
+) -> Result<ErasureRequestSweepOutcome> {
+    sweep_erasure_requests_inner(store, clock, config, lease, tenant, signal, Some(holds)).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn sweep_erasure_requests_inner(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    lease: &dyn LeaseCheck,
+    tenant: &TenantHash,
+    signal: Signal,
+    holds: Option<&SupersededHolds>,
 ) -> Result<ErasureRequestSweepOutcome> {
     let now = clock.now_ns();
     let prefix = keys::del_prefix(tenant, signal);
@@ -1825,12 +2166,11 @@ pub async fn sweep_erasure_requests(
         }
     }
 
-    let mut deleted = 0usize;
+    // Split the requests into the ones this pass could delete and the ones a
+    // cheaper condition already keeps, before any hold is observed: an
+    // ordinary pass has no candidate and does no further work.
+    let mut candidates: Vec<(&Uuid, &String, &ErasureCompletion)> = Vec::new();
     let mut kept = 0usize;
-    let mut held_by_superseded_inputs = 0usize;
-    // Every bucket's commit listing, its rewrite records, and its chain walks,
-    // read once for the pass: several requests routinely share one bucket.
-    let mut scans: HashMap<(u32, u32), BucketScan> = HashMap::new();
     for (request_id, dreq_key) in &dreq_keys {
         let Some(completion) = completions.get(request_id) else {
             // No `.done`: the erasure is not verified complete, so the request
@@ -1852,27 +2192,69 @@ pub async fn sweep_erasure_requests(
             kept += 1;
             continue;
         }
-        // The horizon has elapsed, but an input one of this request's rewrites
-        // superseded may still be in the store (held by rule 2's HEAD gate, or
-        // by a legal hold over the data prefixes that does not cover `del/`).
-        // A snapshot can still resolve such an input, so the filter stays.
-        if superseded_inputs_outstanding(
-            store,
-            tenant,
-            signal,
-            completion,
-            &request_id.to_string(),
-            &mut scans,
-        )
-        .await?
-        {
+        candidates.push((request_id, dreq_key, completion));
+    }
+
+    if candidates.is_empty() {
+        return Ok(ErasureRequestSweepOutcome {
+            deleted: 0,
+            kept,
+            held_by_superseded_inputs: 0,
+        });
+    }
+
+    let observed;
+    let holds = match holds {
+        Some(holds) => holds,
+        None => {
+            let narrow = narrowing_buckets(&candidates, signal);
+            observed = observe_superseded_holds(
+                store,
+                clock,
+                config,
+                lease,
+                tenant,
+                signal,
+                narrow.as_deref(),
+            )
+            .await?;
+            &observed
+        }
+    };
+
+    let mut deleted = 0usize;
+    let mut held_by_superseded_inputs = 0usize;
+    for (request_id, dreq_key, completion) in candidates {
+        // The horizon has elapsed, but rule 2 may have held an object one of
+        // this request's rewrites superseded: an input the live HEAD still
+        // names, one under an unreadable snapshot part, or a chain a legal
+        // hold over the data prefixes touches. A snapshot can still resolve
+        // such an object, so the filter stays.
+        let request_id_s = request_id.to_string();
+        let held = if holds.request_ids.contains(&request_id_s) {
+            true
+        } else {
+            // A held chain rule 2 could not walk to the end names requests no
+            // surviving record does, so the bucket stands in for them. The
+            // completion's own drops narrow which buckets can hold this
+            // request; a completion that carries none (the production shape
+            // today) is narrowed by nothing and any truncated bucket holds it.
+            let drops = completion_buckets(completion, signal);
+            match &drops {
+                Some(buckets) => buckets.iter().any(|b| holds.truncated_buckets.contains(b)),
+                None => !holds.truncated_buckets.is_empty(),
+            }
+        };
+        if held {
             tracing::warn!(
                 tenant_hash = %tenant.to_hex(),
                 signal = signal.key_prefix(),
                 request_id = %request_id,
-                "erasure-request sweep: holding a .dreq past its horizon because an input its \
-                 rewrite superseded is still in the store; the query-time exclusion filter must \
-                 outlive it"
+                held_requests = holds.request_ids.len(),
+                held_truncated_buckets = holds.truncated_buckets.len(),
+                "erasure-request sweep: holding a .dreq past its horizon because the \
+                 superseded-input sweep held an object its rewrite superseded; the query-time \
+                 exclusion filter must outlive it"
             );
             kept += 1;
             held_by_superseded_inputs += 1;
@@ -1891,287 +2273,145 @@ pub async fn sweep_erasure_requests(
     })
 }
 
-/// What one supersession chain, walked from a live record back to the raw L0
-/// inputs at its end, says about the requests applied along it.
-#[derive(Debug, Default, Clone)]
-struct ChainWalk {
-    /// Every erasure request id any generation on the chain applied.
-    request_ids: HashSet<String>,
-    /// A generation on the chain names a `superseded_record_key` whose record
-    /// is gone, so the walk could not reach the raw L0 inputs. The requests
-    /// that generation applied are no longer discoverable from any record.
-    truncated: bool,
-    /// Something a generation on this chain superseded is still physically
-    /// present: a deeper generation's own record and parts, or a raw L0 input.
-    inputs_outstanding: bool,
-}
-
-/// One (shard, ingest hour) bucket's commit listing, read once per sweep pass
-/// and shared by every request whose `.done` records a drop for that bucket.
-struct BucketScan {
-    entries: Vec<(String, BucketEntry)>,
-    rewrites: HashMap<String, RewriteRecord>,
-    /// The bucket's compaction/rewrite records no present rewrite supersedes:
-    /// the heads of its supersession chains.
-    live_heads: Vec<String>,
-    /// Chain walks by live head, filled on first use.
-    walks: HashMap<String, ChainWalk>,
-    /// The truncated-chain residue answer, computed at most once.
-    residue: Option<bool>,
-}
-
-impl BucketScan {
-    async fn load(
-        store: &dyn ObjectStoreBackend,
-        tenant: &TenantHash,
-        signal: Signal,
-        shard: u32,
-        hour: u32,
-    ) -> Result<Self> {
-        let entries =
-            list_commit_entries_scoped(store, tenant, signal, shard, Some(&[hour])).await?;
-        let rewrites = load_rewrite_records(store, &entries).await?;
-        let live_heads: Vec<String> = {
-            let superseded: HashSet<&str> = rewrites
-                .values()
-                .map(|r| r.superseded_record_key.as_str())
-                .filter(|k| !k.is_empty())
-                .collect();
-            entries
-                .iter()
-                .filter(|(key, entry)| {
-                    matches!(
-                        entry,
-                        BucketEntry::CompactionRecord(_) | BucketEntry::RewriteRecord(_)
-                    ) && !superseded.contains(key.as_str())
-                })
-                .map(|(key, _)| key.clone())
-                .collect()
-        };
-        Ok(Self {
-            entries,
-            rewrites,
-            live_heads,
-            walks: HashMap::new(),
-            residue: None,
-        })
-    }
-}
-
-/// Whether any input superseded by a rewrite on a supersession chain that
-/// applied `request_id` is still physically present, across every bucket the
-/// request's `.done` records a drop for in `signal`.
+/// The buckets one completion records a drop for in `signal`, or `None` when it
+/// records none.
 ///
-/// Anchored on durable records only: the `.done`'s `bucket_drops` name the
-/// buckets, each bucket's own listing names the heads of its supersession
-/// chains, and each chain is walked back through `superseded_record_key` to
-/// the raw L0 inputs at its end. Every generation past the head is itself an
-/// input the generation above it superseded, so a chain deeper than one
-/// generation holds the request whatever the raw inputs' state.
-///
-/// This walk does not assume rule 2 deletes a chain in any particular order,
-/// and it deliberately does not assume the record that applied `request_id` is
-/// still there. A chain truncated by a missing record leaves that request
-/// undiscoverable from any record, so the guard falls back to a residue check
-/// on the bucket ([`truncated_chain_residue`]) and holds the `.dreq` while
-/// anything the missing generation could have superseded survives. That is what
-/// makes the guard independent of deletion ordering: the filter outlives the
-/// data even if a record it depended on was already swept.
-async fn superseded_inputs_outstanding(
-    store: &dyn ObjectStoreBackend,
-    tenant: &TenantHash,
-    signal: Signal,
-    completion: &ErasureCompletion,
-    request_id: &str,
-    scans: &mut HashMap<(u32, u32), BucketScan>,
-) -> Result<bool> {
-    for drop in &completion.bucket_drops {
+/// `None` is not "no buckets": it is "this completion says nothing about which
+/// buckets it touched", which is what a completion written without
+/// `bucket_drops` says. The two are treated oppositely, since a completion that
+/// names its buckets can be exempted by a truncated bucket it does not name,
+/// and one that names none cannot.
+fn completion_buckets(completion: &ErasureCompletion, signal: Signal) -> Option<Vec<HeldBucket>> {
+    let buckets: Vec<HeldBucket> = completion
+        .bucket_drops
+        .iter()
         // A `.done` is per (tenant, signal); a drop for another signal cannot
         // appear, but the sweep never widens its own scope on a field it did
         // not write.
-        if ravel_commit::signal::from_proto(drop.signal) != Ok(signal) {
-            continue;
-        }
-        let cache_key = (drop.shard, drop.ingest_hour_bucket);
-        if let std::collections::hash_map::Entry::Vacant(e) = scans.entry(cache_key) {
-            let scan = BucketScan::load(store, tenant, signal, drop.shard, drop.ingest_hour_bucket)
-                .await?;
-            e.insert(scan);
-        }
-
-        let heads = match scans.get(&cache_key) {
-            Some(scan) => scan.live_heads.clone(),
-            None => continue,
-        };
-        for head in &heads {
-            let fresh = match scans.get(&cache_key) {
-                Some(scan) if scan.walks.contains_key(head) => None,
-                Some(scan) => Some(
-                    walk_supersession_chain(
-                        store,
-                        tenant,
-                        signal,
-                        drop.shard,
-                        head,
-                        &scan.rewrites,
-                    )
-                    .await?,
-                ),
-                None => None,
-            };
-            if let (Some(walk), Some(scan)) = (fresh, scans.get_mut(&cache_key)) {
-                scan.walks.insert(head.clone(), walk);
-            }
-        }
-
-        // The residue check costs one `l1/` LIST and one GET per compaction
-        // record, so it runs only when a chain in this bucket is truncated, and
-        // only once per bucket per pass.
-        let needs_residue = scans.get(&cache_key).is_some_and(|scan| {
-            scan.residue.is_none() && scan.walks.values().any(|walk| walk.truncated)
-        });
-        if needs_residue {
-            let residue = match scans.get(&cache_key) {
-                Some(scan) => {
-                    truncated_chain_residue(
-                        store,
-                        tenant,
-                        signal,
-                        drop.shard,
-                        drop.ingest_hour_bucket,
-                        scan,
-                    )
-                    .await?
-                }
-                None => false,
-            };
-            if let Some(scan) = scans.get_mut(&cache_key) {
-                scan.residue = Some(residue);
-            }
-        }
-
-        let Some(scan) = scans.get(&cache_key) else {
-            continue;
-        };
-        let residue = scan.residue.unwrap_or(false);
-        for walk in scan.walks.values() {
-            if walk.request_ids.contains(request_id) {
-                if walk.inputs_outstanding || (walk.truncated && residue) {
-                    return Ok(true);
-                }
-            } else if walk.truncated && (walk.inputs_outstanding || residue) {
-                // The request is not named anywhere on this chain, but the
-                // chain is cut: the generation that applied it may be the one
-                // that is missing. Hold while any of its possible inputs
-                // survive.
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
+        .filter(|drop| ravel_commit::signal::from_proto(drop.signal) == Ok(signal))
+        .map(|drop| HeldBucket {
+            shard: drop.shard,
+            ingest_hour_bucket: drop.ingest_hour_bucket,
+        })
+        .collect();
+    (!buckets.is_empty()).then_some(buckets)
 }
 
-/// Walk one supersession chain from `head_key` back to the raw L0 inputs at its
-/// end, collecting every erasure request applied along it and whether anything
-/// any generation superseded is still present.
-async fn walk_supersession_chain(
-    store: &dyn ObjectStoreBackend,
-    tenant: &TenantHash,
-    signal: Signal,
-    shard: u32,
-    head_key: &str,
-    rewrites: &HashMap<String, RewriteRecord>,
-) -> Result<ChainWalk> {
-    let mut walk = ChainWalk::default();
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut cursor = Some(head_key.to_string());
-    let mut generation = 0usize;
-
-    while let Some(key) = cursor {
-        if !seen.insert(key.clone()) {
-            return Err(MaintainError::Invariant(format!(
-                "supersession chain from {head_key} revisits {key}"
-            )));
-        }
-        // Every rewrite generation sits in the same bucket as the head, so it
-        // was already read for this pass; only a compaction record at the end
-        // of the chain needs its own GET.
-        let link = match rewrites.get(&key) {
-            Some(record) => Some(ChainLink::Rewrite(record.clone())),
-            None => load_chain_link(store, &key).await?,
-        };
-        let Some(link) = link else {
-            walk.truncated = true;
-            break;
-        };
-        for id in link.applied_request_ids() {
-            walk.request_ids.insert(id.to_string());
-        }
-        // Every generation past the head is an input the generation above it
-        // superseded: its parts still hold the subject that generation erased.
-        if generation > 0 {
-            walk.inputs_outstanding = true;
-        }
-        if link.names_raw_l0_inputs() {
-            if !link
-                .raw_l0_input_groups(store, tenant, signal, shard)
-                .await?
-                .is_empty()
-            {
-                walk.inputs_outstanding = true;
-            }
-            break;
-        }
-        cursor = link.superseded_record_key().map(str::to_string);
-        generation += 1;
-    }
-    Ok(walk)
-}
-
-/// Whether a bucket whose supersession chain is truncated still holds anything
-/// the missing generation could have superseded: a raw L0 commit record (a
-/// pre-rewrite input rule 2 has not collected), or an `l1/` part no surviving
-/// record in the bucket references (a superseded generation's output whose own
-/// record is gone). Either one can still be reached by a snapshot, so the
-/// query-time exclusion filter must stay.
+/// The `(shard, hour)` buckets a self-observing rule-6 pass can restrict its
+/// rule-2 observation to, or `None` to observe the whole signal.
 ///
-/// Both conditions clear once rules 2 and 3 have finished the bucket, so the
-/// hold this produces terminates rather than pinning the `.dreq` forever.
-async fn truncated_chain_residue(
+/// Narrowing is sound only when every candidate names its own buckets: one
+/// candidate whose completion carries no `bucket_drops` could have touched any
+/// bucket in the signal, so the observation must cover all of them. This is the
+/// only use `bucket_drops` has left, and dropping it entirely would cost
+/// request count, never safety.
+fn narrowing_buckets(
+    candidates: &[(&Uuid, &String, &ErasureCompletion)],
+    signal: Signal,
+) -> Option<Vec<HeldBucket>> {
+    let mut out: BTreeSet<HeldBucket> = BTreeSet::new();
+    for (_, _, completion) in candidates {
+        out.extend(completion_buckets(completion, signal)?);
+    }
+    Some(out.into_iter().collect())
+}
+
+/// Observe what rule 2 would hold, without deleting anything, for a rule-6
+/// caller that has no [`SupersededHolds`] of its own.
+///
+/// `narrow` restricts the observation to a set of `(shard, hour)` buckets; when
+/// it is `None` the signal's whole commit keyspace is listed once to enumerate
+/// its shards, and every shard is observed across every hour. Either way the
+/// pass reads what a deleting rule-2 pass over the same scope reads, and it
+/// runs only when there is a `.dreq` past its horizon to decide about.
+async fn observe_superseded_holds(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    lease: &dyn LeaseCheck,
+    tenant: &TenantHash,
+    signal: Signal,
+    narrow: Option<&[HeldBucket]>,
+) -> Result<SupersededHolds> {
+    // One pass, one reachability cache: HEAD is read at most once no matter how
+    // many shards are observed.
+    let mut reach = SnapshotReachability::new();
+    let mut holds = SupersededHolds::default();
+
+    let scoped: Vec<(u32, Option<Vec<u32>>)> = match narrow {
+        Some(buckets) => {
+            let mut by_shard: HashMap<u32, BTreeSet<u32>> = HashMap::new();
+            for bucket in buckets {
+                by_shard
+                    .entry(bucket.shard)
+                    .or_default()
+                    .insert(bucket.ingest_hour_bucket);
+            }
+            by_shard
+                .into_iter()
+                .map(|(shard, hours)| (shard, Some(hours.into_iter().collect())))
+                .collect()
+        }
+        None => signal_shards(store, tenant, signal)
+            .await?
+            .into_iter()
+            .map(|shard| (shard, None))
+            .collect(),
+    };
+
+    for (shard, hours) in scoped {
+        let outcome = sweep_superseded_impl(
+            &mut reach,
+            store,
+            clock,
+            config,
+            lease,
+            tenant,
+            signal,
+            shard,
+            hours.as_deref(),
+            SweepMode::GateOnly,
+        )
+        .await?;
+        holds.absorb(&outcome);
+    }
+    Ok(holds)
+}
+
+/// Every shard with at least one commit-prefix key for one `(tenant, signal)`,
+/// from one LIST of `t/<tenant_hash_hex>/<signal>/c/`.
+///
+/// A shard with no commit key holds no supersession chain and so can hold
+/// nothing, which is why key presence is the right enumeration and no shard
+/// count needs to be configured or guessed.
+async fn signal_shards(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
     signal: Signal,
-    shard: u32,
-    hour: u32,
-    scan: &BucketScan,
-) -> Result<bool> {
-    let mut referenced: HashSet<String> = HashSet::new();
-    for (key, entry) in &scan.entries {
-        match entry {
-            BucketEntry::CommitRecord(_) => return Ok(true),
-            BucketEntry::CompactionRecord(_) => {
-                if let Some(record) = get_compaction_record_opt(store, key).await? {
-                    for part in &record.parts {
-                        referenced.insert(keys::reconstruct_l1_part_key(&record, part)?);
-                    }
-                }
+) -> Result<Vec<u32>> {
+    let prefix = format!("t/{}/{}/c/", tenant.to_hex(), signal.key_prefix());
+    let mut shards: BTreeSet<u32> = BTreeSet::new();
+    for meta in list_all(store, &prefix).await? {
+        match keys::partition_bucket_entry(&meta.key) {
+            Ok(BucketEntry::CommitRecord(pk)) => {
+                shards.insert(pk.shard);
             }
-            BucketEntry::RewriteRecord(_) => {
-                if let Some(record) = scan.rewrites.get(key) {
-                    for part in &record.parts {
-                        referenced.insert(keys::reconstruct_rewrite_part_key(record, part)?);
-                    }
-                }
+            Ok(BucketEntry::CompactionRecord(pk)) => {
+                shards.insert(pk.shard);
             }
-            BucketEntry::Tombstone(_) => {}
+            Ok(BucketEntry::RewriteRecord(pk)) => {
+                shards.insert(pk.shard);
+            }
+            Ok(BucketEntry::Tombstone(pk)) => {
+                shards.insert(pk.shard);
+            }
+            Err(KeyError::UnknownBucketEntryShape(k)) => {
+                return Err(MaintainError::UnknownBucketEntry(k));
+            }
+            Err(e) => return Err(MaintainError::Key(e)),
         }
     }
-    for meta in list_l1_scoped(store, tenant, signal, shard, Some(&[hour])).await? {
-        if !referenced.contains(&meta.key) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    Ok(shards.into_iter().collect())
 }
 
 // --- shared helpers --------------------------------------------------------
