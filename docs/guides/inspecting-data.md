@@ -25,7 +25,11 @@ t/<tenant_hash>/m/l0/<shard>/<writer_id>.<epoch>.<seq>.<hash16>.rseg   segment (
 t/<tenant_hash>/m/c/<shard>/<ingest_hour>/<writer_id>.<epoch>.<seq>.cmt commit record
 ```
 
-`tenant_hash` is BLAKE3 of the tenant name, hex-encoded. `m` is the signal
+`tenant_hash` is a hex-encoded BLAKE3 hash of the tenant name. Under the
+default posture it is a keyed hash: a fresh bucket refuses to start unless the
+server either names a deployment key with `--tenant-hash-key-file` or opts out
+with `--tenant-hash-unkeyed`, which selects the plain unkeyed hash instead. The
+bucket pins the choice permanently on first use. `m` is the signal
 letter for metrics; logs use `l` and spans use `s`, and all three are
 implemented. Logs have their own RLOG object format and an `rlog inspect`
 walkthrough further down this guide; spans have the RSPAN format
@@ -230,8 +234,9 @@ field_dir (2 entry(ies)):
 Field by field:
 
 - `total_size`, `version`, `signal`: the byte length of the object, the
-  trailer format version (currently `4`; version 3 is still readable as the
-  N-1 half of the window, anything else gets a typed error), and the signal
+  trailer format version (currently `4`; the reader accepts exactly this one
+  version, and anything else, including a retired version 3, gets a typed
+  error), and the signal
   byte (`2` = logs). Like
   RSEG, the object is footer-first-readable. The 16-byte trailer at the end
   gives the footer's length and crc. A reader therefore validates the footer
@@ -248,7 +253,7 @@ Field by field:
 - `level`, `input_set_hash`, `part_index`: compaction provenance (ADR-0032),
   the same convention that RSEG uses. An L0 flush object (every object shown in
   this guide) stamps the sentinels `level=0`, empty `input_set_hash`, and
-  `part_index=0`. A future L1 compacted object carries real values.
+  `part_index=0`. An L1 compacted object carries real values.
 - `sections`: the mandatory sections and their byte ranges. `kind=1`
   `STREAM_DIR` (stream_id to canonical resource+scope blob and block range),
   `kind=2` `FIELD_DIR` (dynamic attribute columns), `kind=3` `BLOCKS` (the
@@ -330,7 +335,7 @@ min_event_ts_ns: 1732400000000000000
 max_event_ts_ns: 1732400059000000000
 min_ingest_ts_ns: 1732400060000000000
 max_ingest_ts_ns: 1732400060050000000
-segment_format_version: 5
+segment_format_version: 7
 created_unix_ns: 1732400060123456789
 ingest_hour_bucket: 2025112718
 ```
