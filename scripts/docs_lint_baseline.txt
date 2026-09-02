@@ -9,28 +9,6 @@
 # the epic closes.
 CHANGELOG.md	TERM	declared column
 CHANGELOG.md	TERM	robust
-docs/README.md	TERM	robust
-docs/README.md	TRACKER	ADR-0011
-docs/README.md	TRACKER	ADR-0027
-docs/README.md	TRACKER	ADR-0028
-docs/README.md	TRACKER	ADR-0029
-docs/README.md	TRACKER	ADR-0035
-docs/README.md	TRACKER	ADR-0035
-docs/README.md	TRACKER	ADR-0041
-docs/README.md	TRACKER	ADR-0045
-docs/README.md	TRACKER	ADR-0046
-docs/README.md	TRACKER	ADR-0052
-docs/README.md	TRACKER	ADR-0060
-docs/README.md	TRACKER	ADR-0065
-docs/README.md	TRACKER	ADR-0071
-docs/README.md	TRACKER	ADR-0076
-docs/README.md	TRACKER	ADR-0076
-docs/README.md	TRACKER	ADR-0076
-docs/README.md	TRACKER	ADR-0080
-docs/README.md	TRACKER	ADR-0091
-docs/README.md	TRACKER	ADR-0092
-docs/README.md	TRACKER	ADR-0904
-docs/README.md	TRACKER	ADR-0996
 docs/analytics.md	TERM	robust
 docs/analytics.md	TERM	robust
 docs/analytics.md	TERM	robust
@@ -57,76 +35,6 @@ docs/catalog-and-mvcc.md	TERM	l1 part
 docs/catalog-and-mvcc.md	TERM	l1 part
 docs/catalog-and-mvcc.md	TERM	l1 part
 docs/catalog-and-mvcc.md	TERM	strongly consistent
-docs/diagrams/README.md	ORPHAN	docs/diagrams/README.md
-docs/diagrams/README.md	PROVENANCE	Last verified against the code
-docs/diagrams/README.md	PROVENANCE	Last verified against the code
-docs/diagrams/README.md	PROVENANCE	Last verified against the code
-docs/diagrams/README.md	PROVENANCE	Last verified against the code
-docs/diagrams/README.md	PROVENANCE	Last verified against the code
-docs/guides/clickbench-aws-runbook.md	TERM	declared column
-docs/guides/clickbench-aws-runbook.md	TERM	declared column
-docs/guides/clickbench-aws-runbook.md	TRACKER	#913
-docs/guides/clickbench-aws-runbook.md	TRACKER	#913
-docs/guides/clickbench.md	SRCPATH	crates/ravel-bench/src/profiling.rs
-docs/guides/clickbench.md	SRCPATH	crates/ravel-bench/tests/clickbench_corpus.rs
-docs/guides/clickbench.md	SRCPATH	crates/ravel-sql/src/like_udf.rs
-docs/guides/clickbench.md	SUPERLATIVE	em-dash
-docs/guides/clickbench.md	SUPERLATIVE	em-dash
-docs/guides/clickbench.md	SUPERLATIVE	em-dash
-docs/guides/clickbench.md	SUPERLATIVE	em-dash
-docs/guides/clickbench.md	SUPERLATIVE	em-dash
-docs/guides/clickbench.md	TERM	declared column
-docs/guides/clickbench.md	TERM	declared column
-docs/guides/clickbench.md	TERM	declared column
-docs/guides/clickbench.md	TERM	declared column
-docs/guides/clickbench.md	TERM	declared column
-docs/guides/clickbench.md	TRACKER	#431
-docs/guides/clickbench.md	TRACKER	#432
-docs/guides/clickbench.md	TRACKER	#479
-docs/guides/clickbench.md	TRACKER	#480
-docs/guides/clickbench.md	TRACKER	#519
-docs/guides/clickbench.md	TRACKER	#519
-docs/guides/clickbench.md	TRACKER	#560
-docs/guides/clickbench.md	TRACKER	#616
-docs/guides/clickbench.md	TRACKER	#616
-docs/guides/clickbench.md	TRACKER	#677
-docs/guides/clickbench.md	TRACKER	#677
-docs/guides/clickbench.md	TRACKER	#680
-docs/guides/clickbench.md	TRACKER	#680
-docs/guides/clickbench.md	TRACKER	#680
-docs/guides/clickbench.md	TRACKER	#680
-docs/guides/clickbench.md	TRACKER	#680
-docs/guides/clickbench.md	TRACKER	#682
-docs/guides/clickbench.md	TRACKER	#693
-docs/guides/clickbench.md	TRACKER	#699
-docs/guides/clickbench.md	TRACKER	#741
-docs/guides/clickbench.md	TRACKER	#800
-docs/guides/clickbench.md	TRACKER	#800
-docs/guides/clickbench.md	TRACKER	#800
-docs/guides/clickbench.md	TRACKER	#801
-docs/guides/clickbench.md	TRACKER	#983
-docs/guides/clickbench.md	TRACKER	ADR-0046
-docs/guides/clickbench.md	TRACKER	ADR-0046
-docs/guides/clickbench.md	TRACKER	ADR-0046
-docs/guides/clickbench.md	TRACKER	ADR-0073
-docs/guides/clickbench.md	TRACKER	ADR-0088
-docs/guides/clickbench.md	TRACKER	ADR-0088
-docs/guides/clickbench.md	TRACKER	ADR-0088
-docs/guides/clickbench.md	TRACKER	ADR-0094
-docs/guides/clickbench.md	TRACKER	ADR-0094
-docs/guides/clickbench.md	TRACKER	ADR-0100
-docs/guides/clickbench.md	TRACKER	ADR-0100
-docs/guides/clickbench.md	TRACKER	ADR-0101
-docs/guides/coderabbit-runbook.md	SUPERLATIVE	simply
-docs/guides/coderabbit-runbook.md	TRACKER	#58
-docs/guides/coderabbit-runbook.md	TRACKER	#58
-docs/guides/coderabbit-runbook.md	TRACKER	#64
-docs/guides/coderabbit-runbook.md	TRACKER	../adrs/0091-maintainer-gated-coderabbit-reviews.md
-docs/guides/coderabbit-runbook.md	TRACKER	ADR-0091
-docs/guides/coderabbit-runbook.md	TRACKER	ADR-0091
-docs/guides/coderabbit-runbook.md	TRACKER	ADR-0091
-docs/guides/coderabbit-runbook.md	TRACKER	ADR-0091
-docs/guides/coderabbit-runbook.md	TRACKER	ADR-0091
 docs/ingest.md	SUPERLATIVE	em-dash
 docs/ingest.md	SUPERLATIVE	em-dash
 docs/ingest.md	SUPERLATIVE	em-dash

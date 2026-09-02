@@ -6,7 +6,7 @@ local iteration loop and how CI accelerates the same gates.
 ## Running Ravel from your own build (`make demo`)
 
 The container-first quickstart in the [README](../../README.md) and the
-[getting started guide](getting-started.md) runs a published image and needs no
+[getting started guide](../guides/getting-started.md) runs a published image and needs no
 toolchain. That is the right path for evaluating Ravel; it is the wrong path
 when you are changing Ravel's code, because it does not run your build.
 

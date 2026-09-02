@@ -236,7 +236,7 @@ tier. Neither tier holds durable state. See the
 Changing Ravel's code? `make demo` builds from source and runs the same round
 trip. It does not build the `sql` feature, so `POST /api/v1/sql` is unavailable
 on that path while PromQL and ingest behave the same. The
-[development guide](docs/guides/development.md) covers the source workflow.
+[development guide](docs/internal/development.md) covers the source workflow.
 
 ## How it fits together
 

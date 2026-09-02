@@ -223,7 +223,7 @@ safe. Delete that directory to start from an empty store.
 
 Everything above needs no toolchain. This section does, and it is for people
 changing Ravel's code rather than evaluating it. The
-[development guide](development.md) covers the workflow in depth.
+[development guide](../internal/development.md) covers the workflow in depth.
 
 ### Prerequisites for this section only
 
