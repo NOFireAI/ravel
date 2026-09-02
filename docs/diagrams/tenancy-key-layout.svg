@@ -2,7 +2,7 @@
   <rect x="0" y="0" width="1500" height="950" fill="#f4f5f7"/>
 
   <text x="30" y="30" font-size="20" font-weight="bold" fill="#17191c">Tenancy key layout: bucket key tree under t/&lt;tenant_hash&gt;/</text>
-  <text x="30" y="48" font-size="12" fill="#4a4f57">docs/catalog-and-mvcc.md key layout + ADR-0009 tenant isolation + ADR-0010 §3/§13</text>
+  <text x="30" y="48" font-size="12" fill="#4a4f57">docs/catalog-and-mvcc.md: the key layout, tenant isolation, and writer identity</text>
 
   <!-- legend -->
   <rect x="1200" y="15" width="270" height="92" rx="6" fill="#eceef1" stroke="#454b54" stroke-width="1.5"/>
@@ -24,7 +24,7 @@
   <rect x="150" y="150" width="260" height="40" rx="6" fill="#a9c9e6" stroke="#1f4e79" stroke-width="2"/>
   <text x="280" y="174" font-size="12" text-anchor="middle" fill="#17191c">&lt;tenant_hash&gt;/</text>
   <text x="150" y="204" font-size="9.5" fill="#4a4f57">32 hex chars. keyed BLAKE3 by default (enumeration resistance);</text>
-  <text x="150" y="216" font-size="9.5" fill="#4a4f57">a bucket refuses to start without a key file or explicit opt-out flag (ADR-0010 §13)</text>
+  <text x="150" y="216" font-size="9.5" fill="#4a4f57">a bucket refuses to start without a key file or explicit opt-out flag</text>
 
   <!-- R2 m/ -->
   <line x1="410" y1="170" x2="450" y2="170" stroke="#7a808a" stroke-width="1.5"/>
@@ -41,7 +41,7 @@
   <rect x="820" y="150" width="170" height="40" rx="6" fill="#a9c9e6" stroke="#1f4e79" stroke-width="2"/>
   <text x="905" y="174" font-size="12" text-anchor="middle" fill="#17191c">&lt;shard&gt;/</text>
   <text x="820" y="204" font-size="9.5" fill="#4a4f57">zero-padded 4-digit decimal. shard_count is fixed per generation;</text>
-  <text x="820" y="216" font-size="9.5" fill="#4a4f57">online resharding appends a new generation (ADR-0052)</text>
+  <text x="820" y="216" font-size="9.5" fill="#4a4f57">online resharding appends a new generation</text>
 
   <!-- R5 data leaf -->
   <line x1="990" y1="170" x2="1030" y2="170" stroke="#7a808a" stroke-width="1.5"/>
@@ -116,7 +116,7 @@
   <rect x="30" y="770" width="1440" height="150" rx="6" fill="#eceef1" stroke="#454b54" stroke-width="1.5"/>
   <text x="46" y="790" font-size="12" font-weight="bold" fill="#17191c">Notes</text>
   <text x="46" y="810" font-size="11" fill="#17191c">Readers never trust CommitRecord.object_key: the data key is reconstructed from (tenant_hash, signal, shard, writer_id, epoch, seq, content_hash);</text>
-  <text x="46" y="826" font-size="11" fill="#17191c">a mismatch with the stored object_key is a fatal invariant breach (ADR-0010 §7).</text>
+  <text x="46" y="826" font-size="11" fill="#17191c">a mismatch with the stored object_key is a fatal invariant breach.</text>
   <text x="46" y="846" font-size="11" fill="#17191c">Commit token v2 = base64url of "v2:&lt;shard&gt;:&lt;writer_id&gt;:&lt;epoch&gt;:&lt;seq&gt;:&lt;ingest_hour_bucket&gt;": it fully determines the commit-record key above,</text>
   <text x="46" y="862" font-size="11" fill="#17191c">so read-your-write resolves by exact GET, never by re-listing.</text>
   <text x="46" y="882" font-size="11" fill="#17191c">Logs (l/) and spans (s/) use the same l0/ + c/ skeleton as m/, with RLOG and RSPAN segment payloads; catalog/&lt;signal&gt;/ snapshot parts and HEAD are written by the fold task.</text>

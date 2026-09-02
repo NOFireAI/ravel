@@ -114,5 +114,5 @@
   <text x="455" y="837" font-size="11" text-anchor="middle" fill="#17191c">No crash of any Ravel process may lose acknowledged data (strict mode).</text>
 
   <text x="30" y="915" font-size="11" fill="#4a4f57">Duplicates from client retries after CRASH C are harmless if identical; differing values at the same timestamp are last-write-wins per evaluation order.</text>
-  <text x="30" y="932" font-size="11" fill="#4a4f57">A flush older than max_flush_lifetime is abandoned: its commit record is never published (GC interlock, ADR-0010 §11).</text>
+  <text x="30" y="932" font-size="11" fill="#4a4f57">A flush older than max_flush_lifetime is abandoned: its commit record is never published (the GC interlock).</text>
 </svg>

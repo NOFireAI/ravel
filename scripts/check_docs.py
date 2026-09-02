@@ -384,6 +384,7 @@ class Repo:
         self._text_cache = {}
         self._anchor_cache = {}
         self.svg_referenced = set()   # svg rel paths referenced by some markdown
+        self.svg_user_referenced = set()  # the subset a user page embeds
         self.link_graph = collections.defaultdict(set)  # md rel -> set(md rel reachable)
 
     def read(self, rel):
@@ -483,6 +484,8 @@ def _register_link(rel, absp, repo):
         repo.link_graph[rel].add(r)
     elif r.endswith(".svg") and r.startswith("docs/"):
         repo.svg_referenced.add(r)
+        if classify(rel) == "user":
+            repo.svg_user_referenced.add(r)
 
 
 def _resolve(src_dir, target):
@@ -849,6 +852,28 @@ def check_svg_references(repo):
     return findings
 
 
+def check_svg_citations(repo):
+    """A diagram a user page embeds is read as part of that page, so its text
+    and its aria-label carry no decision-record citation or issue number
+    either. A diagram only a decision record embeds may cite the record."""
+    findings = []
+    for rel in sorted(repo.svg_user_referenced):
+        absp = os.path.join(REPO_ROOT, rel)
+        try:
+            root = ET.parse(absp).getroot()
+        except ET.ParseError:
+            continue  # check_svg reports the parse error
+        texts = [v for k, v in root.attrib.items() if _localname(k) == "aria-label"]
+        for el in root.iter():
+            texts.append(el.text or "")
+            texts.append(el.tail or "")
+        for text in texts:
+            for pattern in (_ADR_CITE_RE, _ISSUE_HASH_RE):
+                for m in pattern.finditer(text):
+                    findings.append(Finding(rel, "SVG", f"{rel} (cites {m.group(0)})"))
+    return findings
+
+
 # --------------------------------------------------------------------------
 # Driver
 # --------------------------------------------------------------------------
@@ -866,6 +891,7 @@ def collect_findings(repo):
     for rel in repo.svg_files:
         findings.extend(check_svg(rel))
     findings.extend(check_svg_references(repo))
+    findings.extend(check_svg_citations(repo))
     findings.extend(check_orphan(repo))
     findings.extend(check_adrindex(repo))
     findings.extend(check_feature(repo))

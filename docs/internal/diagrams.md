@@ -27,7 +27,10 @@ rest:
 Every file declares a `viewBox` so it scales, `role="img"` with an
 `aria-label` that states what the drawing shows, embeds no raster image, and
 references nothing outside itself. The documentation gate checks all four,
-and that at least one page links each file.
+and that at least one page links each file. A diagram a user page embeds is
+read as part of that page, so its text and its label carry no
+decision-record citation or issue number; the gate checks that too, and a
+diagram only a decision record embeds may name the record.
 
 ## architecture.svg
 
