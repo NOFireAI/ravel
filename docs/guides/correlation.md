@@ -78,9 +78,13 @@ The ingest metrics hold two counters. The `exemplars_written_total` counter
 counts stored exemplars. The `exemplars_dropped_total` counter counts dropped
 exemplars. If the cap engages, the `exemplars_dropped_total` counter rises.
 
-`GET /metrics` does not expose these two counters, so an operator cannot see
-the cap engage from outside the process. The drop count appears in the flush
-logs.
+`GET /metrics` exposes both counters under the ingest family.
+`ravel_ingest_exemplars_written_total` counts the exemplars that Ravel stored
+on flushed objects. `ravel_ingest_exemplars_dropped_total` counts the
+exemplars that the cap discarded. Both carry the `mode` and `signal` labels,
+and both carry only the `signal="metrics"` series, because exemplars ride on
+metric points. A rising drop count means the cap is engaging, and an operator
+reads that from outside the process rather than from the flush logs.
 
 ## How to query exemplars
 
