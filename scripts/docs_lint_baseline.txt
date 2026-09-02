@@ -70,21 +70,6 @@ docs/diagrams/README.md	PROVENANCE	Last verified against the code
 docs/diagrams/README.md	PROVENANCE	Last verified against the code
 docs/diagrams/README.md	PROVENANCE	Last verified against the code
 docs/diagrams/README.md	PROVENANCE	Last verified against the code
-docs/guides/admission-limits.md	SRCPATH	crates/ravel-catalog/src/config.rs
-docs/guides/admission-limits.md	TRACKER	../adrs/0051-tenant-admission-control.md
-docs/guides/admission-limits.md	TRACKER	../adrs/0057-fleet-global-admission-reconciliation.md
-docs/guides/admission-limits.md	TRACKER	ADR-0009
-docs/guides/admission-limits.md	TRACKER	ADR-0051
-docs/guides/admission-limits.md	TRACKER	ADR-0051
-docs/guides/admission-limits.md	TRACKER	ADR-0051
-docs/guides/admission-limits.md	TRACKER	ADR-0051
-docs/guides/admission-limits.md	TRACKER	ADR-0051
-docs/guides/admission-limits.md	TRACKER	ADR-0057
-docs/guides/admission-limits.md	TRACKER	ADR-0057
-docs/guides/admission-limits.md	TRACKER	ADR-0057
-docs/guides/admission-limits.md	TRACKER	ADR-0057
-docs/guides/admission-limits.md	TRACKER	ADR-0061
-docs/guides/admission-limits.md	TRACKER	ADR-0061
 docs/guides/caching.md	SRCPATH	crates/ravel-bench/src/logs_scan_scaling.rs
 docs/guides/caching.md	TRACKER	ADR-0044
 docs/guides/caching.md	TRACKER	ADR-0046
