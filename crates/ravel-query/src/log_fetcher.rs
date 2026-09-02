@@ -6350,7 +6350,18 @@ mod plan_skip_decidable_span_tests {
     /// would route through and which this test's own sibling `plan_segment`
     /// tests, several of which also open `page_fetch` spans, would pollute.
     #[tokio::test]
+    // Holds the test_tracing serialization guard across `.await`; the
+    // current-thread test runtime runs this future to completion with no other
+    // task, so there is no deadlock risk the lint guards against.
+    #[allow(clippy::await_holding_lock)]
     async fn skip_decidable_branch_opens_page_fetch_span() {
+        // Counts a `debug_span!` `page_fetch` span, so it is subject to the same
+        // process-global max-level race as
+        // `a_carried_footer_is_counted_once_across_plan_and_scan`. The guard
+        // pins the global level floor at TRACE and serializes against any
+        // concurrent sub-DEBUG subscriber; see crate::test_tracing.
+        let _serial = crate::test_tracing::guard();
+
         let collector = PageFetchCollector::default();
         let subscriber = tracing_subscriber::registry().with(collector.clone());
         let _guard = subscriber.set_default();
@@ -6450,7 +6461,21 @@ mod plan_skip_decidable_span_tests {
     /// predicate-free half alone; hardcoding it to `false` (no gate at all)
     /// fails the NumRange half alone.
     #[tokio::test]
+    // Holds the test_tracing serialization guard across `.await`; the
+    // current-thread test runtime runs this future to completion with no other
+    // task, so there is no deadlock risk the lint guards against.
+    #[allow(clippy::await_holding_lock)]
     async fn a_carried_footer_is_counted_once_across_plan_and_scan() {
+        // The `page_fetch` spans this counts are `debug_span!`s, so they are
+        // enabled only while the process-global max-level hint is at least
+        // DEBUG. That hint is a single atomic recomputed by callsite churn on
+        // every thread, and a default-less thread lowers it to OFF, while a
+        // sibling INFO-only subscriber lowers it to INFO; either silently
+        // disables one of the two spans and drops the count to 1. The guard
+        // pins the floor at TRACE and serializes against the sub-DEBUG
+        // subscriber (see crate::test_tracing).
+        let _serial = crate::test_tracing::guard();
+
         // (query, plan-phase misses, scan-phase misses). The predicate-free
         // query takes `plan_segment_fast`, whose `fetch_footer` reads no tail
         // section and counts nothing, leaving both misses to the scan. The
