@@ -497,18 +497,43 @@ cargo run -p ravel-bench --features sql-latency --bin sql_latency_bench -- \
 #### CPU flamegraph pass (use `--runs 1`)
 
 To capture a CPU flamegraph of the corpus, build with `--features
-sql-latency,profiling` and set `RAVEL_BENCH_PROFILE_SVG` to the output path.
-For a profiled pass, run it with **`--runs 1`**, not `--runs 3`: with
-`RAVEL_BENCH_PROFILE_SVG` set, any `--runs` above 1 is REFUSED with an error
-rather than run (issue #616), so this is a rule the binary enforces, not advice.
+sql-latency,profiling` **and with frame pointers**, then set
+`RAVEL_BENCH_PROFILE_SVG` to the output path. For a profiled pass, run it with
+**`--runs 1`**, not `--runs 3`: with `RAVEL_BENCH_PROFILE_SVG` set, any `--runs`
+above 1 is REFUSED with an error rather than run (issue #616), so this is a rule
+the binary enforces, not advice.
 
 ```sh
+RUSTFLAGS="-C force-frame-pointers=yes" \
 RAVEL_BENCH_PROFILE_SVG=/tmp/sql_latency.svg \
-cargo run -p ravel-bench --features sql-latency,profiling --bin sql_latency_bench -- \
+cargo run --release -p ravel-bench --features sql-latency,profiling --bin sql_latency_bench -- \
   --tenant clickbench --store s3 \
   --corpus benchmarks/clickbench/hits.corpus.json \
   --runs 1 --compaction pre --window-hours 200000
 ```
+
+The `RUSTFLAGS` is not optional decoration. A release build omits frame
+pointers, and without them the unwinder cannot walk out of inlined generic code:
+Ravel's own hot path lands in `[unknown]`. One such profile put 33.95% of
+samples there and sent a merge after the wrong call site; the same workload
+rebuilt with the flag measured 0.00% and named the real hot frame (issue #884).
+From `crates/ravel-bench/` the cargo alias `cargo profile-build` sets the flag
+for you; from the workspace root, as above, pass it yourself.
+
+Two checks enforce this rather than trusting the operator to remember it, and
+both fail the run with a non-zero exit:
+
+- **Before sampling starts**, the binary counts x86-64 frame-pointer prologues
+  (`push %rbp; mov %rsp, %rbp`) in its own executable segments and refuses below
+  a measured floor (4,800; a build with the flag measures around 10,000, one
+  without it around 1,500). It reads the produced binary, not the build
+  configuration, because a flag that silently did nothing looks identical to one
+  that worked. On an architecture or executable format where that scan cannot
+  run it says so on stderr and continues, rather than skipping quietly.
+- **When the profile is summarised**, the share of samples that resolved to no
+  symbol (`[unknown]`) is printed and, above 2%, refused: no SVG is written and
+  the message names the measured share, the threshold, and the likely cause. A
+  healthy frame-pointer profile of this corpus measures 0.00%.
 
 The profiler is a signal sampler, and running each statement more than once
 under a live sampler has been observed to segfault the process (issue #616), so
