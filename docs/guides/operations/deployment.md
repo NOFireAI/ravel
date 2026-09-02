@@ -67,10 +67,12 @@ statement is
 [the object store contract](../../object-store-contract.md)'s required bucket
 configuration section; this is the operational summary.
 
-Object Lock in compliance mode on the control prefixes (`sys/*`, the
-provisioning records, commit records and the catalog HEAD history), plus the
-versioning and lifecycle-rule requirements that go with erasure obligations,
-are all bucket-layer settings.
+Object Lock enabled on the bucket, versioning, and the lifecycle rules that go
+with erasure obligations are bucket-layer settings. The compliance-mode
+retention on the control prefixes (`sys/*`, the provisioning records, commit
+records and the catalog HEAD history) is per-object retention that an
+operator-run mechanism applies, because Object Lock has no prefix scope of its
+own; the contract page describes the two shapes that mechanism can take.
 
 **One lifecycle rule is not optional for any bucket Ravel writes to.**
 Configure `AbortIncompleteMultipartUpload` with a cleanup period of seven days
