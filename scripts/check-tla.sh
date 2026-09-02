@@ -159,6 +159,49 @@ log_field() {
 
 # --- checks -----------------------------------------------------------------
 
+# check_bands <area> <cfg-name> <distinct> <depth>
+# Compares a PASS run's figures against the optional bands.tsv row for this cfg.
+# A missing bands.tsv, or a bands.tsv with no row for this cfg, is not an error
+# (bands are opt-in). A row that exists is enforced: the figure must be present
+# (not "-") and inside [min,max]. Returns non-zero on any violation.
+check_bands() {
+    local area="$1" cfg_name="$2" distinct="$3" depth="$4"
+    local bands="$FORMAL_DIR/$area/bands.tsv"
+    [ -f "$bands" ] || return 0
+    local row
+    row="$(awk -F'\t' -v c="$cfg_name" '$1==c {print; found=1} END{}' "$bands")"
+    [ -n "$row" ] || return 0
+    local n
+    n="$(awk -F'\t' -v c="$cfg_name" '$1==c' "$bands" | wc -l | tr -d ' ')"
+    if [ "$n" != 1 ]; then
+        note "$area bands: cfg '$cfg_name' appears $n times in bands.tsv (want exactly 1)"
+        return 1
+    fi
+    local mind maxd mindepth maxdepth
+    mind="$(echo "$row" | cut -f2)"
+    maxd="$(echo "$row" | cut -f3)"
+    mindepth="$(echo "$row" | cut -f4)"
+    maxdepth="$(echo "$row" | cut -f5)"
+    local rc=0
+    case "$distinct" in
+        ''|*[!0-9]*)
+            note "$area bands: $cfg_name distinct figure missing or non-numeric ('$distinct')"; rc=1 ;;
+        *)
+            if [ "$distinct" -lt "$mind" ] || [ "$distinct" -gt "$maxd" ]; then
+                note "$area bands: $cfg_name distinct=$distinct outside [$mind,$maxd]"; rc=1
+            fi ;;
+    esac
+    case "$depth" in
+        ''|*[!0-9]*)
+            note "$area bands: $cfg_name depth figure missing or non-numeric ('$depth')"; rc=1 ;;
+        *)
+            if [ "$depth" -lt "$mindepth" ] || [ "$depth" -gt "$maxdepth" ]; then
+                note "$area bands: $cfg_name depth=$depth outside [$mindepth,$maxdepth]"; rc=1
+            fi ;;
+    esac
+    return $rc
+}
+
 check_model() {
     # check_model <area> <kind: smoke|exhaustive>
     local area="$1" kind="$2"
@@ -189,6 +232,11 @@ check_model() {
         record_row "$area" "${kind}.cfg" "$states" "$distinct" "$depth" "$secs" "FAIL"
         note "$area ${kind}: TLC exit $code (log: $logfile)"
         grep -iE 'is violated|Error:' "$logfile" | head -3 >&2
+        return 1
+    fi
+    if ! check_bands "$area" "${kind}.cfg" "$distinct" "$depth"; then
+        record_row "$area" "${kind}.cfg" "$states" "$distinct" "$depth" "$secs" "BAND"
+        note "$area ${kind}: figures outside declared band (log: $logfile)"
         return 1
     fi
     record_row "$area" "${kind}.cfg" "$states" "$distinct" "$depth" "$secs" "PASS"
@@ -249,6 +297,36 @@ check_negative() {
     return $rc
 }
 
+# Resolve one Rust reference of the form crates/<path>.rs::Sym1::Sym2...
+# The path must exist and end in .rs (a .tla reference is rejected: a
+# traceability row cites the implementation, not the model), and every
+# ::-separated symbol must appear in the file. Sets rc=1 in the caller's scope
+# via echo of a diagnostic; returns non-zero on failure.
+resolve_rust_ref() {
+    local area="$1" ref="$2"
+    local path="${ref%%::*}"
+    case "$path" in
+        *.tla) note "$area traceability: ref '$ref' points at a .tla file, not Rust source"; return 1 ;;
+        *.rs) : ;;
+        *) note "$area traceability: ref '$ref' is not a Rust (.rs) path"; return 1 ;;
+    esac
+    if [ ! -e "$REPO_ROOT/$path" ]; then
+        note "$area traceability: missing source '$path'"; return 1
+    fi
+    # Walk each ::-separated symbol after the path.
+    local rest="${ref#"$path"}"
+    rest="${rest#::}"
+    local sym
+    while [ -n "$rest" ]; do
+        sym="${rest%%::*}"
+        if [ -n "$sym" ] && ! grep -qF "$sym" "$REPO_ROOT/$path"; then
+            note "$area traceability: symbol '$sym' not found in '$path'"; return 1
+        fi
+        if [ "$rest" = "$sym" ]; then rest=""; else rest="${rest#*::}"; fi
+    done
+    return 0
+}
+
 check_traceability() {
     local area="$1"
     local area_dir="$FORMAL_DIR/$area"
@@ -256,41 +334,41 @@ check_traceability() {
     [ -f "$tfile" ] || { note "$area: no traceability.md, skipping"; return 0; }
     local rc=0 count=0
 
-    # Table rows: | requirement | invariant | source-ref |. The source-ref is
-    # a repo-relative path, optionally path:Symbol (a symbol grepped in file).
+    # Five D8 columns:
+    #   | TLA+ action or property | meaning | Rust path and symbol
+    #   | existing test | new test needed |
+    # The "Rust path and symbol" column is required and resolved. The other
+    # columns may also carry Rust references (an existing test, or a symbol
+    # named in the "new test needed" note); any token that looks like a
+    # crates/... reference is resolved too, so a stale test path is caught.
     local line
     while IFS= read -r line; do
         case "$line" in
             \|*) : ;;            # a table row
             *) continue ;;
         esac
-        # skip header and separator rows
         case "$line" in
             *---*) continue ;;
-            *[Rr]equirement*) continue ;;
+            *[Aa]ction*[Pp]roperty*) continue ;;   # header row
         esac
-        local ref
-        ref="$(echo "$line" | awk -F'|' '{print $4}' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | tr -d '`')"
-        [ -n "$ref" ] || continue
-
-        local path symbol
-        path="${ref%%:*}"
-        symbol=""
-        [ "$ref" != "$path" ] && symbol="${ref#*:}"
-
-        if [ ! -e "$REPO_ROOT/$path" ]; then
-            note "$area traceability: missing source '$path'"
-            rc=1; continue
+        # The required source ref is column 3 (awk field 4 after the leading |).
+        local src
+        src="$(echo "$line" | awk -F'|' '{print $4}' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | tr -d '`')"
+        if [ -z "$src" ]; then
+            note "$area traceability: row has no Rust source ref: $line"; rc=1; continue
         fi
-        if [ -n "$symbol" ] && ! grep -qF "$symbol" "$REPO_ROOT/$path"; then
-            note "$area traceability: symbol '$symbol' not found in '$path'"
-            rc=1; continue
-        fi
+        resolve_rust_ref "$area" "$src" || { rc=1; continue; }
         count=$((count + 1))
+
+        # Resolve any further crates/... references in the remaining columns.
+        local extra
+        for extra in $(echo "$line" | tr '`|' '  ' | tr ' ' '\n' | grep '^crates/' || true); do
+            resolve_rust_ref "$area" "$extra" || rc=1
+        done
     done < "$tfile"
 
     if [ "$rc" -eq 0 ]; then
-        note "$area traceability: PASS ($count refs resolve)"
+        note "$area traceability: PASS ($count rows resolve)"
     fi
     return $rc
 }
