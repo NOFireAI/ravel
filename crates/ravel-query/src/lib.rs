@@ -11,6 +11,7 @@ mod error;
 mod fetcher;
 pub mod http;
 mod log_fetcher;
+pub mod log_series;
 mod phase_accounting;
 mod query_admission;
 mod segment_admission;

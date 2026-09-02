@@ -18,18 +18,9 @@ use datafusion::error::DataFusionError;
 use datafusion::error::Result as DFResult;
 use ravel_logseg::LogRecord;
 use ravel_query::erasure::ErasurePredicate;
-use ravel_types::logstream::{AttrValue, canonical_attr_bytes};
+use ravel_types::logstream::AttrValue;
 
 use crate::error::SqlError;
-
-/// Depth cap when walking a record's canonical resource/scope blob for the
-/// merged-`attrs` decode (mirrors the reader's `MAX_ATTR_DEPTH`), so hostile
-/// nesting cannot exhaust the stack.
-const MAX_ATTR_DEPTH: u32 = 32;
-
-/// Entry-count cap per attribute set when walking the blob, matching the
-/// reader's own cap so a corrupt count is rejected rather than allocated on.
-const MAX_ATTR_ENTRIES: u64 = 1 << 20;
 
 /// The `attrs` column contents for one record: its decoded stream-identity
 /// (resource + scope) attributes overlaid with its dynamic per-record
@@ -98,258 +89,36 @@ pub(crate) fn find_attr<'a>(merged: &'a [(String, AttrValue)], key: &str) -> Opt
 /// `attrs` column. Scalar values render to their natural text; `Bytes`, `List`,
 /// and `Map` render to the lowercase hex of their canonical encoding, a
 /// deterministic, injective form pending a richer typed column.
-pub(crate) fn attr_value_to_string(v: &AttrValue) -> String {
-    match v {
-        AttrValue::Str(s) => s.clone(),
-        AttrValue::I64(i) => i.to_string(),
-        AttrValue::F64(f) => f.to_string(),
-        AttrValue::Bool(b) => b.to_string(),
-        AttrValue::Bytes(b) => hex_lower(b),
-        AttrValue::List(_) | AttrValue::Map(_) => hex_lower(&canonical_attr_bytes(
-            std::slice::from_ref(&(String::new(), v.clone())),
-        )),
-    }
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        // Writing to a String never fails.
-        let _ = write!(out, "{b:02x}");
-    }
-    out
-}
+pub(crate) use ravel_logseg::record::attr_value_to_string;
 
 // --- `attrs` column contents: merged resource/scope + record attributes ---
 
 /// Decode the **top-level** resource and scope attribute entries of a
 /// `stream_attrs` blob (a record's [`ravel_logseg::LogRecord::stream_attrs`],
 /// the canonical `resource ++ scope-name ++ scope-version ++ scope-attrs`
-/// bytes) into `(key, value)` pairs, in blob order (resource set first, then the
-/// scope attribute set). The scope name and version are length-prefixed
-/// *positional* fields, not key-value entries, so they are skipped over and
-/// never become synthetic `scope.name`/`scope.version` keys.
+/// bytes) into `(key, value)` pairs, resource entries first, then scope
+/// entries. The scope name and version are length-prefixed *positional*
+/// fields, not key-value entries, so they never become synthetic
+/// `scope.name`/`scope.version` keys. Delegates the actual decode to
+/// [`ravel_logseg::record::decode_stream_attrs`], the structured, full-fidelity
+/// decoder shared with the reader.
 ///
-/// A top-level entry whose value is a nested `Map` or `List` is walked past
-/// (consumed, so decoding stays in frame) but **omitted** from the returned
-/// pairs: a resource/scope attribute whose value is itself a map or list is not
+/// A top-level entry whose value is itself a `Map` or `List` is decoded (so
+/// the underlying walk stays in frame) but **omitted** from the returned
+/// pairs: a resource/scope attribute whose value is a map or list is not
 /// projected into the map column (a richer typed representation is a v-next
 /// refinement). Per-record dynamic attributes with nested values are unaffected
 /// -- they are merged in verbatim by [`merged_attrs`] and rendered by
 /// [`attr_value_to_string`].
 pub(crate) fn decode_stream_attrs(blob: &[u8]) -> DFResult<Vec<(String, AttrValue)>> {
-    let mut pos = 0usize;
-    let mut out = Vec::new();
-    // Resource attribute set.
-    decode_attr_set(blob, &mut pos, 0, &mut out)?;
-    // Scope name and scope version, each a length-prefixed string (positional).
-    skip_len_prefixed(blob, &mut pos)?;
-    skip_len_prefixed(blob, &mut pos)?;
-    // Scope attribute set.
-    decode_attr_set(blob, &mut pos, 0, &mut out)?;
-    Ok(out)
-}
-
-/// Walk one canonical attribute set from `pos`, advancing `pos` to its end, and
-/// push every top-level scalar entry as a decoded `(key, value)` pair onto
-/// `out`. A nested `Map`/`List` value is consumed but not pushed (see
-/// [`decode_stream_attrs`]).
-fn decode_attr_set(
-    buf: &[u8],
-    pos: &mut usize,
-    depth: u32,
-    out: &mut Vec<(String, AttrValue)>,
-) -> DFResult<()> {
-    if depth > MAX_ATTR_DEPTH {
-        return Err(corrupt("stream_attrs nesting too deep"));
-    }
-    let count = read_uvarint(buf, pos)?;
-    if count > MAX_ATTR_ENTRIES {
-        return Err(corrupt("stream_attrs entry count over cap"));
-    }
-    for _ in 0..count {
-        let klen = usize_of(read_uvarint(buf, pos)?)?;
-        let kstart = *pos;
-        advance(buf, pos, klen)?;
-        let kbytes = &buf[kstart..*pos];
-        if let Some(value) = decode_value(buf, pos, depth + 1)? {
-            let key = std::str::from_utf8(kbytes)
-                .map_err(|_| corrupt("stream_attrs key not utf-8"))?
-                .to_string();
-            out.push((key, value));
-        }
-    }
-    Ok(())
-}
-
-/// Decode one encoded attribute value at `pos` (frozen grammar,
-/// `ravel_types::logstream`: 1=Str 2=I64 3=F64 4=Bool 5=Bytes 6=List 7=Map),
-/// advancing `pos` past it. Returns the decoded scalar, or `None` for a
-/// `List`/`Map`, which is consumed via the [`skip_value`]/[`walk_attr_set`]
-/// walkers but not decoded into an entry.
-fn decode_value(buf: &[u8], pos: &mut usize, depth: u32) -> DFResult<Option<AttrValue>> {
-    if depth > MAX_ATTR_DEPTH {
-        return Err(corrupt("stream_attrs nesting too deep"));
-    }
-    let tag = read_u8(buf, pos)?;
-    let value = match tag {
-        // Str: length-prefixed UTF-8 payload.
-        1 => {
-            let len = usize_of(read_uvarint(buf, pos)?)?;
-            let start = *pos;
-            advance(buf, pos, len)?;
-            let s = std::str::from_utf8(&buf[start..*pos])
-                .map_err(|_| corrupt("stream_attrs str not utf-8"))?
-                .to_string();
-            Some(AttrValue::Str(s))
-        }
-        // I64: a single zigzag varint.
-        2 => Some(AttrValue::I64(unzigzag(read_uvarint(buf, pos)?))),
-        // F64: eight little-endian bytes of `to_bits` (NaN payloads / -0.0
-        // preserved by decoding through the bit pattern).
-        3 => {
-            let start = *pos;
-            advance(buf, pos, 8)?;
-            let mut b = [0u8; 8];
-            b.copy_from_slice(&buf[start..*pos]);
-            Some(AttrValue::F64(f64::from_bits(u64::from_le_bytes(b))))
-        }
-        // Bool: one byte.
-        4 => Some(AttrValue::Bool(read_u8(buf, pos)? != 0)),
-        // Bytes: length-prefixed payload.
-        5 => {
-            let len = usize_of(read_uvarint(buf, pos)?)?;
-            let start = *pos;
-            advance(buf, pos, len)?;
-            Some(AttrValue::Bytes(buf[start..*pos].to_vec()))
-        }
-        // List: a count then each element; consumed, not decoded.
-        6 => {
-            let n = read_uvarint(buf, pos)?;
-            for _ in 0..n {
-                skip_value(buf, pos, depth + 1)?;
-            }
-            None
-        }
-        // Map: a nested canonical attribute set; consumed, not decoded.
-        7 => {
-            walk_attr_set(buf, pos, depth + 1)?;
-            None
-        }
-        _ => return Err(corrupt("bad stream_attrs value tag")),
-    };
-    Ok(value)
-}
-
-/// Inverse of the writer's zigzag mapping (`ravel_types::logstream`): recover a
-/// signed integer from its unsigned LEB128 zigzag form.
-fn unzigzag(n: u64) -> i64 {
-    ((n >> 1) as i64) ^ -((n & 1) as i64)
-}
-
-/// Walk one canonical attribute set from `pos`, advancing `pos` to its end,
-/// consuming every entry without decoding it. Used to skip past a nested `Map`
-/// value while staying byte-aligned.
-fn walk_attr_set(buf: &[u8], pos: &mut usize, depth: u32) -> DFResult<()> {
-    if depth > MAX_ATTR_DEPTH {
-        return Err(corrupt("stream_attrs nesting too deep"));
-    }
-    let count = read_uvarint(buf, pos)?;
-    if count > MAX_ATTR_ENTRIES {
-        return Err(corrupt("stream_attrs entry count over cap"));
-    }
-    for _ in 0..count {
-        let klen = usize_of(read_uvarint(buf, pos)?)?;
-        advance(buf, pos, klen)?;
-        skip_value(buf, pos, depth + 1)?;
-    }
-    Ok(())
-}
-
-/// Advance `pos` past one encoded attribute value (frozen grammar,
-/// `ravel_types::logstream`: 1=Str 2=I64 3=F64 4=Bool 5=Bytes 6=List 7=Map).
-fn skip_value(buf: &[u8], pos: &mut usize, depth: u32) -> DFResult<()> {
-    if depth > MAX_ATTR_DEPTH {
-        return Err(corrupt("stream_attrs nesting too deep"));
-    }
-    let tag = read_u8(buf, pos)?;
-    match tag {
-        // Str / Bytes: length-prefixed payload.
-        1 | 5 => {
-            let len = usize_of(read_uvarint(buf, pos)?)?;
-            advance(buf, pos, len)?;
-        }
-        // I64: a single zigzag varint.
-        2 => {
-            read_uvarint(buf, pos)?;
-        }
-        // F64: eight little-endian bytes.
-        3 => advance(buf, pos, 8)?,
-        // Bool: one byte.
-        4 => advance(buf, pos, 1)?,
-        // List: a count then each element.
-        6 => {
-            let n = read_uvarint(buf, pos)?;
-            for _ in 0..n {
-                skip_value(buf, pos, depth + 1)?;
-            }
-        }
-        // Map: a nested canonical attribute set.
-        7 => {
-            walk_attr_set(buf, pos, depth + 1)?;
-        }
-        _ => return Err(corrupt("bad stream_attrs value tag")),
-    }
-    Ok(())
-}
-
-/// Skip a length-prefixed string (the scope name / version fields).
-fn skip_len_prefixed(buf: &[u8], pos: &mut usize) -> DFResult<()> {
-    let len = usize_of(read_uvarint(buf, pos)?)?;
-    advance(buf, pos, len)
-}
-
-fn read_u8(buf: &[u8], pos: &mut usize) -> DFResult<u8> {
-    let b = *buf
-        .get(*pos)
-        .ok_or_else(|| corrupt("stream_attrs truncated"))?;
-    *pos += 1;
-    Ok(b)
-}
-
-fn advance(buf: &[u8], pos: &mut usize, n: usize) -> DFResult<()> {
-    let end = pos
-        .checked_add(n)
-        .ok_or_else(|| corrupt("stream_attrs length overflow"))?;
-    if end > buf.len() {
-        return Err(corrupt("stream_attrs truncated"));
-    }
-    *pos = end;
-    Ok(())
-}
-
-/// Read one unsigned LEB128 varint, rejecting an over-long encoding rather than
-/// looping or overflowing.
-fn read_uvarint(buf: &[u8], pos: &mut usize) -> DFResult<u64> {
-    let mut result = 0u64;
-    let mut shift = 0u32;
-    loop {
-        if shift >= 64 {
-            return Err(corrupt("stream_attrs varint overflow"));
-        }
-        let byte = read_u8(buf, pos)?;
-        result |= u64::from(byte & 0x7f) << shift;
-        if byte & 0x80 == 0 {
-            break;
-        }
-        shift += 7;
-    }
-    Ok(result)
-}
-
-fn usize_of(v: u64) -> DFResult<usize> {
-    usize::try_from(v).map_err(|_| corrupt("stream_attrs length exceeds usize"))
+    let attrs =
+        ravel_logseg::record::decode_stream_attrs(blob).map_err(|e| corrupt(&e.to_string()))?;
+    Ok(attrs
+        .resource
+        .into_iter()
+        .chain(attrs.scope_attrs)
+        .filter(|(_, v)| !matches!(v, AttrValue::Map(_) | AttrValue::List(_)))
+        .collect())
 }
 
 fn corrupt(what: &str) -> DataFusionError {
