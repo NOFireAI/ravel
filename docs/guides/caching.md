@@ -1,9 +1,16 @@
 # Read cache
 
 Ravel keeps every durable byte in object storage. Object storage is slower
-than local memory. The read cache (ADR-0046) keeps recently read bytes
-close to the query engine, so a repeat read of the same data does not go
-back to object storage.
+than local memory. The read cache keeps recently read bytes close to the query
+engine, so a repeat read of the same data does not go back to object storage.
+
+A process runs two of them, and every flag and metric on this page covers
+both:
+
+- the **fetcher cache**, holding byte ranges of the data objects a query
+  scans, reported under `cache="fetch"`;
+- the **catalog byte cache**, holding the catalog objects a resolve reads,
+  reported under `cache="catalog"`.
 
 The cache is an optimization only. It never changes a query result. A
 process with the cache off, or a process that just restarted with an empty
@@ -25,8 +32,8 @@ The cache stores byte ranges read from two kinds of objects:
   needs, and the candidate blocks (adjacent ones fetched together in one
   request). Each of those is cached separately, one entry per block, so a
   later query whose blocks partly overlap reuses what it can. Set the
-  threshold to `18446744073709551615` to read every log object whole, as
-  before this split existed.
+  threshold to `18446744073709551615` to read every log object whole
+  regardless of size.
 
   On default flags the whole-object read is what happens anyway:
   `--logs-fetch-policy` defaults to `cost-based`, and at the shipped
@@ -38,18 +45,18 @@ The cache stores byte ranges read from two kinds of objects:
 Both PromQL queries and SQL queries over the `samples` table use the
 metric path. SQL queries over the `logs` table use the log path.
 
-Two query surfaces do not use the cache today:
+Two things are not cached, for two different reasons:
 
-- **Spans (traces).** The `spans` SQL table is queryable on
-  `POST /api/v1/sql`, but its reads are uncached. The span scan fetches
-  each RSPAN segment straight from the object store on every query: the
-  fetch is accounted and tenant-checked, and the tenant identity the log
-  path uses to key its cache entries serves only as that tenant check
-  here. A repeated span query therefore re-reads the same objects. Wiring
-  spans into this cache is still open work.
-- **The `alerts` and `audit` SQL tables.** These tables exist in
-  `ravel-sql`, but nothing in production reaches them through a real SQL
-  query today, so they have no cached read path to speak of.
+- **Spans.** The `spans` SQL table is queryable on `POST /api/v1/sql`, but its
+  reads are uncached. The span scan fetches each RSPAN segment straight from
+  the object store on every query: the fetch is accounted and tenant-checked,
+  and the tenant identity the log path uses to key its cache entries serves
+  only as that tenant check here. A repeated span query therefore re-reads the
+  same objects. This is the one genuine cache gap.
+- **Alert transitions and audit records.** These are written durably, and
+  `ravel-sql` carries table providers for them, but the SQL session registers
+  exactly three tables: `samples`, `logs`, and `spans`. No query surface can
+  read alert or audit data at all, so there is no read path to cache.
 
 Each cache entry is keyed by tenant, the content hash of the object it
 came from, and the byte offset and length. Content is immutable once
@@ -60,10 +67,10 @@ or not present at all.
 
 The cache has a RAM tier and a local-disk tier. The RAM tier is always on
 (unless `--disable-cache`). The disk tier is opt-in: `--cache-dir <path>`
-attaches a local-disk tier at that directory to both the query fetcher cache
-and the catalog byte cache, so a RAM eviction is served from local disk instead
-of re-paying the S3 round trip. With no `--cache-dir`, only the RAM tier exists
-and behavior is exactly as before.
+attaches a local-disk tier at that directory to both the fetcher cache and the
+catalog byte cache, so a RAM eviction is served from local disk instead of
+re-paying the object-store round trip. With no `--cache-dir`, the process has
+a RAM tier only.
 
 The disk tier is disposable. Its directory is created lazily on first admission
 and is never required to exist; a missing, full, or corrupt cache directory
@@ -72,7 +79,7 @@ is deleted mid-flight answers every query correctly and only more slowly.
 Nothing durable is ever written there, and a cache directory from a previous
 release is discarded and rebuilt rather than repaired.
 
-**Encryption at rest (ADR-0046 decision 7).** Bytes written to the cache
+**Encryption at rest.** Bytes written to the cache
 directory are **not** encrypted by Ravel, even with SSE-KMS configured for
 object storage. SSE-KMS protects object bytes at rest in the store, not the
 local cache. If you need bytes-at-rest encryption for the cache directory,
@@ -83,20 +90,19 @@ provide it at the filesystem/volume layer (an encrypted volume mounted at
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--cache-max-bytes <n>` | `268435456` (256 MiB) | Maximum bytes the RAM tier holds. Bounds **every** ADR-0046 cache in the process from one number: the fetcher cache and the catalog's byte cache both. Read once at startup; there is no live resize. |
-| `--cache-dir <path>` | none | Directory for the local-disk tier. Set, both the fetcher cache and the catalog byte cache gain a disk tier at this path, each bounded by the same `--cache-max-bytes` number (there is no separate disk-tier capacity flag). Absent, only the RAM tier exists. Bytes written here are not SSE-KMS encrypted (see "Two tiers" above). |
-| `--disable-cache` | off | Turns **every** ADR-0046 cache off: the fetcher cache and the catalog's byte cache both. No cache is constructed at all, so query *results* are byte-for-byte the same as a build with no cache code, and the process holds no read-cache memory. This is the flag to set in a memory-constrained container. |
-| `--logs-block-range-threshold <bytes>` | `524288` (512 KiB) | Log-object size above which a `logs` query reads only the pruning-relevant blocks (a tail probe plus per-block ranges, cached per block) instead of the whole object. Set it to `18446744073709551615` to read every log object whole, the shape before this split existed; set it to `0` to use the block-range path for every object. Read once at startup. Under a resolved fetch policy that reads every object whole (`--logs-fetch-policy request-minimal`, or `cost-based` at a profile whose bytes are free) this flag is **overridden**, and startup logs a WARN naming the value it overrode. |
-| `--logs-fetch-policy <policy>` | `cost-based` | The logs read shape (ADR-0996). `request-minimal` reads every object whole in one covering GET, with no tail probe and no ranged read: the cost-preferring shape where transfer is free and the object-store bill is requests. `byte-minimal` is the older behaviour, ranged reads wherever they save more bytes than a request costs, for egress-billed and network-constrained deployments. `cost-based` derives the choice from `--store-cost-profile`; at the shipped reference profile (intra-region, transfer free) that resolves to request-minimal behaviour, so **a deployment on default flags reads log objects whole**. Read once at startup; the running process never changes its own policy. The resolved policy, profile, and byte quantities are logged at startup on the `logs fetch policy resolved` line. |
+| `--cache-max-bytes <n>` | `268435456` (256 MiB) | Maximum bytes the RAM tier holds. Bounds **both** caches in the process from one number: the fetcher cache and the catalog byte cache. Read once at startup; there is no live resize. |
+| `--cache-dir <path>` | none | Directory for the local-disk tier. Set, both the fetcher cache and the catalog byte cache gain a disk tier at this path, each bounded by the same `--cache-max-bytes` number (there is no separate disk-tier capacity flag). Absent, the process has a RAM tier only. Bytes written here are not SSE-KMS encrypted (see "Two tiers" above). |
+| `--disable-cache` | off | Turns **both** caches off. No cache is constructed at all, so query *results* are byte-for-byte the same as a build with no cache code, and the process holds no read-cache memory. This is the flag to set in a memory-constrained container. |
+| `--logs-block-range-threshold <bytes>` | `524288` (512 KiB) | Log-object size above which a `logs` query reads only the pruning-relevant blocks (a tail probe plus per-block ranges, cached per block) instead of the whole object. Set it to `18446744073709551615` to read every log object whole regardless of size; set it to `0` to use the block-range path for every object. Read once at startup. Under a resolved fetch policy that reads every object whole (`--logs-fetch-policy request-minimal`, or `cost-based` at a profile whose bytes are free) this flag is **overridden**, and startup logs a WARN naming the value it overrode. |
+| `--logs-fetch-policy <policy>` | `cost-based` | The logs read shape. `request-minimal` reads every object whole in one covering GET, with no tail probe and no ranged read: the cost-preferring shape where transfer is free and the object-store bill is requests. `byte-minimal` uses ranged reads wherever they save more bytes than a request costs, for egress-billed and network-constrained deployments. `cost-based` derives the choice from `--store-cost-profile`; at the shipped reference profile (intra-region, transfer free) that resolves to request-minimal behaviour, so **a deployment on default flags reads log objects whole**. Read once at startup; the running process never changes its own policy. The resolved policy, profile, and byte quantities are logged at startup on the `logs fetch policy resolved` line. |
 | `--store-cost-profile <path>` | reference profile (`s3-intra-region-2026`) | TOML file carrying this deployment's object-store prices in integer nanodollars: `name`, `put_class_nanodollars`, `get_class_nanodollars`, `transfer_nanodollars_per_gib`, `retrieval_nanodollars_per_gib`, and optionally `delete_class_nanodollars`. Only `--logs-fetch-policy cost-based` reads it, to derive how many transferred bytes one saved request is worth; no price reaches the fetch layer. An unreadable file, invalid TOML, an unknown key, or a blank `name` fails startup rather than falling back to the reference prices. |
 | `--logs-max-fetch-run-bytes <bytes>` | `67108864` (64 MiB) | The fetch bound: the maximum length of one covering GET on the log path, on every policy. An object at or under it is read in a single request; a larger one is read as sequential block-aligned covering sub-ranges of at most this many bytes each, so one oversized object cannot pull an unbounded response into memory. `0` is refused at startup. |
 
-### Disk-tier max-age sweep
+### The max-age sweep
 
-The disk tier bounds how long an entry's raw bytes may sit on local disk,
-so bytes of a subject erased by ADR-0064's rewrite pass cannot outlive the
-erasure sweep on a query node by more than a fixed window. Two knobs
-(`CacheLimits`) govern it:
+Both tiers bound how long an entry's raw bytes may persist, so bytes of an
+erased subject cannot outlive the erasure pass on a query node by more than a
+fixed window, in RAM as well as on local disk. Two knobs govern it:
 
 | Knob | Default | Meaning |
 |---|---|---|
@@ -104,17 +110,19 @@ erasure sweep on a query node by more than a fixed window. Two knobs
 | `sweep_interval_ns` | `3600000000000` (1 h) | Period of the background sweep that drops over-age idle entries nothing re-reads, so an entry that is never touched still ages out on its own. |
 
 The worst-case residue of an idle entry is `max_entry_age_ns +
-sweep_interval_ns`; the defaults (23 h + 1 h) are tuned so that sum meets
-ADR-0064's 24 h bound exactly. These are configuration on the disk tier
-(`CacheLimits`), not CLI flags: the disk tier is constructed with the shipped
-defaults, and there is no flag to override the max-age sweep from the command
-line today.
+sweep_interval_ns`. The defaults are set so that sum is 24 h exactly: the
+max-age sits one sweep interval below the bound rather than at it, so the
+default meets the bound instead of overshooting it by the sweep period.
+
+Neither knob is a command-line flag. Both tiers are constructed with the
+shipped defaults, and there is no way to override the max-age sweep from the
+command line.
 
 ## Startup warmup
 
 When the cache is on, `ravel-server` warms it before it reports ready
 (`/readyz`). For each tenant storage holds data for, it reads a small,
-bounded number of that tenant's most recent metric and log parts, so the
+bounded number of that tenant's most recent metric and log segments, so the
 first real query after a restart is not the one paying full cold cost.
 
 Warmup is best-effort:
@@ -122,20 +130,19 @@ Warmup is best-effort:
 - It has an overall time budget. If storage is slow or a tenant list is
   large, warmup stops early and the process still becomes ready; it just
   starts with a smaller warm set.
-- A failure warming one tenant or one part is logged and skipped. It
+- A failure warming one tenant or one segment is logged and skipped. It
   never fails startup.
 
 ## Metrics
 
 When a cache is on, `GET /metrics` reports these counters, labeled by
-`mode` and by `cache` (ADR-0044's label allowlist). The `cache` label names
-which ADR-0046 cache the sample belongs to: `cache="fetch"` for the fetcher
-cache, `cache="catalog"` for the catalog's byte cache. When a disk tier is
-configured (`--cache-dir`), each cache's samples additionally carry a
-`tier="ram"`/`tier="disk"` label so the two tiers' hit rates are reported
-separately; with no `--cache-dir` no `tier=` label appears and the exposition
-is byte-for-byte as before. Each cache renders its own series, so the hit-rate
-formulas below can be computed per cache or summed across both:
+`mode` and by `cache`. The `cache` label names which of the two the sample
+belongs to: `cache="fetch"` for the fetcher cache, `cache="catalog"` for the
+catalog byte cache. When a disk tier is configured (`--cache-dir`), each
+cache's samples additionally carry a `tier="ram"`/`tier="disk"` label so the
+two tiers' hit rates are reported separately; with a RAM tier only, no `tier=`
+label appears. Each cache renders its own series, so the hit-rate formulas
+below can be computed per cache or summed across both:
 
 - `ravel_cache_hits_total` / `ravel_cache_misses_total`: read outcomes.
 - `ravel_cache_bytes_served_total`: bytes returned from the cache on a
@@ -152,19 +159,22 @@ formulas below can be computed per cache or summed across both:
   found entries it could not trust, not merely that it was cold. A process with
   no `--cache-dir` never emits it.
 - `ravel_cache_disk_entries_expired_max_age_total`: disk-tier entries
-  dropped because they aged past the per-entry max-age (ADR-0064). Counts
+  dropped because they aged past the per-entry max-age. Counts
   every drop point: a hit that found an over-age entry, the startup scan, and
   the periodic background sweep that reaches idle entries nothing re-reads.
   Distinct from an eviction (which makes room under the byte or entry bound):
   this is a time bound, not a capacity bound.
 
   It is nonzero only when a disk tier is configured (`--cache-dir`); a process
-  with no disk tier never emits it.
+  with no disk tier never emits it. The RAM tier applies the same max-age but
+  has no counter of its own: an over-age RAM entry is reported as an ordinary
+  miss, so a workload whose entries routinely age out shows a hit rate lower
+  than its access pattern would suggest and nothing else.
 
-With every cache off (`--disable-cache`), none of these samples appear on
+With both caches off (`--disable-cache`), none of these samples appear on
 `/metrics` at all: neither `cache="fetch"` nor `cache="catalog"`.
 
-These counters cover every ADR-0046 cache in the process. Request hit rate is
+Request hit rate is
 `hits / (hits + misses)`; byte hit rate is `bytes_served / (bytes_served +
 bytes_admitted)`. Filter by the `cache` label for one cache's rate, or omit it
 (let PromQL sum the series) for the whole process.
@@ -172,7 +182,7 @@ bytes_admitted)`. Filter by the `cache` label for one cache's rate, or omit it
 ## Sizing for logs column-filtering waste
 
 A logs (RLOG) query's `QueryAccounting` carries two decode-time byte counters
-next to its wire-byte counters (ADR-0107 decision 4): `page_bytes_fetched`, the
+next to its wire-byte counters: `page_bytes_fetched`, the
 stored bytes of every page present in the blocks the query decoded, and
 `page_bytes_decoded`, the stored bytes of only the pages the query's column
 projection kept. These are a decode-time measurement, not a wire measurement:
@@ -196,20 +206,29 @@ how little of each a given query decodes. A small decoded fraction across a
 tenant's queries is the signal that its cache should be sized against block
 footprint, not against what its projections actually read.
 
-A concrete measured ratio for a representative workload is not quoted here: no
-`ravel-bench` logs run was executed in the environment this guidance was written
-in, so a fabricated number is deliberately avoided. Neither counter is exposed
-through the server's query-facing accounting today (`EXPLAIN ANALYZE` surfaces
-only the sibling page-count fields, `pages_decoded`/`pages_skipped`, not their
-byte-denominated equivalents), so to see the ratio for your own workload, drive
-the query through `QueryAccounting` in-process -- an in-process `ravel-bench`
-run against `crates/ravel-bench/src/logs_scan_scaling.rs` is the existing
-example -- rather than reading it off a running server.
+The ratio is workload-dependent: it is set by how wide the tenant's log schema
+is against how narrow its queries' projections are, so there is no
+representative figure to quote. Measure your own.
 
-## Known gaps
+Neither counter reaches a running server's query-facing accounting.
+`EXPLAIN ANALYZE` surfaces the sibling page-count fields,
+`pages_decoded`/`pages_skipped`, not their byte-denominated equivalents, so
+the ratio is available only to a caller that reads `QueryAccounting`
+in-process, which is what the `ravel-bench` logs scan does.
 
-- **Spans have no cache path**, because span reads are not wired into the
-  cache layer yet: the `spans` SQL table's fetcher has no `with_cache`
-  seam, unlike the RSEG/RLOG fetchers.
-- **The `alerts` and `audit` SQL tables are not reachable in
-  production**, so caching them is not meaningful yet.
+## What is not cached
+
+The one genuine gap is spans: RSPAN reads have no cache seam, so a repeated
+span query re-reads the same objects from the store every time. Alert
+transitions and audit records are not a cache gap, because they have no read
+path at all: neither is a registered SQL table.
+
+## Background
+
+The read cache is [ADR-0046](../adrs/0046-read-cache-tier.md); the max-age
+bound on cached bytes comes from the erasure guarantee in
+[ADR-0064](../adrs/0064-selective-subject-erasure.md); the logs block-range
+read shape is
+[ADR-0107](../adrs/0107-pruning-proportional-logs-fetch.md), and the fetch
+policy above it is
+[ADR-0996](../adrs/0996-request-cost-aware-fetching.md).

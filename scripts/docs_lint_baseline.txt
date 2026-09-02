@@ -70,19 +70,6 @@ docs/diagrams/README.md	PROVENANCE	Last verified against the code
 docs/diagrams/README.md	PROVENANCE	Last verified against the code
 docs/diagrams/README.md	PROVENANCE	Last verified against the code
 docs/diagrams/README.md	PROVENANCE	Last verified against the code
-docs/guides/caching.md	SRCPATH	crates/ravel-bench/src/logs_scan_scaling.rs
-docs/guides/caching.md	TRACKER	ADR-0044
-docs/guides/caching.md	TRACKER	ADR-0046
-docs/guides/caching.md	TRACKER	ADR-0046
-docs/guides/caching.md	TRACKER	ADR-0046
-docs/guides/caching.md	TRACKER	ADR-0046
-docs/guides/caching.md	TRACKER	ADR-0046
-docs/guides/caching.md	TRACKER	ADR-0046
-docs/guides/caching.md	TRACKER	ADR-0064
-docs/guides/caching.md	TRACKER	ADR-0064
-docs/guides/caching.md	TRACKER	ADR-0064
-docs/guides/caching.md	TRACKER	ADR-0107
-docs/guides/caching.md	TRACKER	ADR-0996
 docs/guides/clickbench-aws-runbook.md	TERM	declared column
 docs/guides/clickbench-aws-runbook.md	TERM	declared column
 docs/guides/clickbench-aws-runbook.md	TRACKER	#913
